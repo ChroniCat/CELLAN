@@ -128,6 +128,27 @@
   `StyleOp` / `MergeOp` / `SnapshotChunk` 的序列化往返单测。
 
 
+
+### v1.30 VBA 宏代码读取（不执行）✅ 2026-11-07
+
+**先把边界说清楚**：执行 VBA 需要 VBA 解释器（或装了 Excel 的 COM），本机两样都没有，
+所以这一项做到「读出来、能看、能复制」，不做执行。
+
+- `crates/core/src/cfb.rs`：OLE 复合文档读取（头、DIFAT/FAT、MiniFAT、
+  目录项、常规流与 mini 流两条路径）。真实 vbaProject.bin 里 PROJECT、dir、
+  模块源码都是小流，必须支持 mini 流才读得到。
+- `crates/core/src/vba_src.rs`：MS-OVBA 压缩容器解码（chunk 头 + 标志字节 + copy token），
+  再按记录格式取 `MODULENAME(0x0019)` / `MODULEOFFSET(0x0031)`，
+  从 `VBA/<模块名>` 流里解出源码；PROJECT 流里的 `Module=/Class=/Document=` 作为兜底。
+- 界面：审阅 → 查看宏代码…，左边列模块（名字 + 行数），右边只读代码，可一键复制。
+- 验证：未压缩 chunk、copy token 两个手工构造解码用例；
+  另外用**独立的 Python 实现**造了一个 OLE 容器（含 mini 流）放两个模块，
+  Rust 侧解出 `Sub Hello()` / `Function Add(a, b)`；再把这份 vbaProject.bin
+  塞进 xlsm，走界面路径读出来同样是 2 个模块 4 行。
+
+**没做的**：真 `vbaProject.bin` 的压缩流没实测过（本机没有任何带宏的真实文件），
+只验到「按格式说明实现 + 独立实现互相对齐」。拿到真实文件后要先跑一遍再交付。
+
 ### v1.27 图表数据标签与图例位置 ✅ 2026-11-07
 
 - `Chart.show_labels`：写入 `<c:dLbls><c:showVal val="1"/></c:dLbls>`，

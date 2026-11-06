@@ -67,6 +67,7 @@ struct SheetApp {
     probe_done: bool,
     style_done: bool,
     struct_done: bool,
+    macro_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -77,6 +78,8 @@ struct SheetApp {
     wb_epoch: u64,
     probe_at: std::time::Instant,
     lock_first_at: Option<std::time::Instant>,
+    /// 宏窗口：模块列表 + 选中项
+    macro_win: Option<(Vec<sheetcore::vba_src::VbaModule>, usize)>,
     /// 新建图表草稿
     chart_edit: Option<sheetcore::charts::Chart>,
     /// 图表管理窗口
@@ -181,12 +184,14 @@ impl SheetApp {
             probe_done: false,
             style_done: false,
             struct_done: false,
+            macro_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
             wb_epoch: 0,
             probe_at: std::time::Instant::now(),
             lock_first_at: None,
+            macro_win: None,
             chart_edit: None,
             chart_mgr: false,
             pivot_edit: None,
@@ -466,6 +471,28 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：打开宏窗口并打印读到的模块
+    fn macro_probe(&mut self) {
+        if std::env::var("SC_MACRO").is_err() || self.open_rx.is_some() || self.macro_done {
+            return;
+        }
+        self.macro_done = true;
+        self.open_macro_view();
+        if let Some((mods, _)) = &self.macro_win {
+            for m in mods {
+                eprintln!(
+                    "[macro] {} [{}] {} 行，首行={:?}",
+                    m.name,
+                    m.kind,
+                    m.lines,
+                    m.source.lines().next().unwrap_or("")
+                );
+            }
+        } else {
+            eprintln!("[macro] 没有读到模块（状态={}）", self.status);
+        }
     }
 
     /// 无界面自检：在顶部插两行，验证协作同步
@@ -1635,10 +1662,18 @@ impl SheetApp {
             ui.set_min_width(180.0);
             if ui
                 .add_enabled(self.wb.has_vba, egui::Button::new("导出宏部件…"))
-                .on_hover_text("把 vbaProject.bin 另存出来（不执行宏）")
+                .on_hover_text("把 vbaProject.bin 另存出来")
                 .clicked()
             {
                 self.export_macro_part();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(self.wb.has_vba, egui::Button::new("查看宏代码…"))
+                .on_hover_text("只读展示 VBA 源码，不执行")
+                .clicked()
+            {
+                self.open_macro_view();
                 ui.close_menu();
             }
             ui.separator();
@@ -2425,6 +2460,70 @@ impl SheetApp {
         } else {
             format!("{label}（表太大，本次不可撤销）")
         };
+    }
+
+    /// 读宏代码，开窗口
+    fn open_macro_view(&mut self) {
+        let Some(path) = self.wb.path.clone() else {
+            self.status = "先保存文件".into();
+            return;
+        };
+        let Some(bytes) = sheetcore::vba::read_vba(&path) else {
+            self.status = "这个文件里没有 VBA 宏".into();
+            return;
+        };
+        match sheetcore::vba_src::read_modules(&bytes) {
+            Ok(mods) => {
+                self.status = format!("读到 {} 个宏模块（只读）", mods.len());
+                self.macro_win = Some((mods, 0));
+            }
+            Err(e) => self.status = format!("解析宏失败：{e:#}"),
+        }
+    }
+
+    fn macro_window(&mut self, ctx: &egui::Context) {
+        let Some((mods, mut sel)) = self.macro_win.take() else { return };
+        let mut open = true;
+        egui::Window::new("宏代码（只读，不执行）")
+            .open(&mut open)
+            .default_size([720.0, 480.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, m) in mods.iter().enumerate() {
+                        if ui.selectable_label(sel == i, format!("{}（{} 行）", m.name, m.lines)).clicked() {
+                            sel = i;
+                        }
+                    }
+                });
+                ui.separator();
+                if let Some(m) = mods.get(sel) {
+                    ui.label(
+                        egui::RichText::new(format!("{} · {}", m.name, m.kind))
+                            .strong()
+                            .size(12.0),
+                    );
+                    egui::ScrollArea::both().auto_shrink([false, false]).max_height(360.0).show(
+                        ui,
+                        |ui: &mut egui::Ui| {
+                            let mut text = m.source.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY),
+                            );
+                        },
+                    );
+                    if ui.button("复制当前模块").clicked() {
+                        ctx.copy_text(m.source.clone());
+                        self.status = format!("已复制 {}", m.name);
+                    }
+                } else {
+                    ui.label("没有可显示的模块");
+                }
+            });
+        if open {
+            self.macro_win = Some((mods, sel));
+        }
     }
 
     /// 导出当前工作表为 PDF
@@ -3923,9 +4022,11 @@ impl eframe::App for SheetApp {
         self.undo_probe();
         self.style_probe();
         self.struct_probe();
+        self.macro_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
+        self.macro_window(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
