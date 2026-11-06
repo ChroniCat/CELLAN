@@ -111,6 +111,10 @@ pub struct Sheet {
     pub dv: Vec<crate::dv::DataValidation>,
     /// 数据验证被改过
     pub dv_dirty: bool,
+    /// 批注
+    pub notes: HashMap<CellRef, crate::notes::Note>,
+    /// 批注被改过
+    pub notes_dirty: bool,
 }
 
 impl Sheet {
@@ -130,6 +134,8 @@ impl Sheet {
             cf_dirty: false,
             dv: Vec::new(),
             dv_dirty: false,
+            notes: HashMap::new(),
+            notes_dirty: false,
         }
     }
 

@@ -61,6 +61,26 @@
 
 
 
+
+### v1.10 批注 ✅ 2026-11-06
+
+`crates/core/src/notes.rs`（读取）、umya 回写（它自带 comments + vml 绘图生成）。
+
+- 读：`sheet.xml` 里没有批注内容，要经 worksheet 的 rels 找到 `comments*.xml`，
+  作者按 `<authors>` + `authorId` 索引；富文本多段 `<t>` 要拼接。openpyxl 写在
+  `xl/comments/comment1.xml`，Excel 写在 `xl/comments1.xml`，两种路径都靠 rels 定位，不猜文件名。
+- 写：`notes_dirty` 时整表重写（先清空 umya 的 comments 再灌），新增/修改/删除都生效。
+- 界面：有批注的格子右上角红三角；鼠标悬停弹出「单元格 + 作者 + 内容」；
+  「审阅」菜单新建/编辑/删除，编辑窗口是多行文本框，清空文本等于删除。
+- 存储：`Sheet.notes: HashMap<CellRef, Note>`，不占 `Cell` 空间。
+
+**踩坑**：`ends_with("t")` 会把 `comment` 也当成 `<t>`（"comment" 以 t 结尾），
+导致批注解析始终为 0 条；改成取本地名后精确比较。这类短标签一律按本地名比较。
+
+**验证**：`notes.xlsx`（B2 张三、A3 李四两段文本），读到 2 条、换行保留；
+新增 C5 / 修改 B2 / 删除 A3 后另存，读回三条状态正确，openpyxl 也能看到 C5 的新批注。
+界面几何导出确认两个红三角与作者文字。
+
 ### v1.9 数据验证 ✅ 2026-11-06
 
 `crates/core/src/dv.rs`（模型 + 校验 + 解析）、`patch.rs`（保存）。

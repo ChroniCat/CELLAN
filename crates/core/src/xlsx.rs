@@ -95,6 +95,17 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    // 批注
+    if let Ok(all) = crate::notes::load_notes(path) {
+        for sheet in wb.sheets.iter_mut() {
+            if let Some(list) = all.get(&sheet.name) {
+                for n in list.iter() {
+                    sheet.notes.insert(crate::model::CellRef::new(n.r, n.c), n.clone());
+                }
+            }
+        }
+    }
+
     Ok(wb)
 }
 
@@ -247,6 +258,27 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
                     ws.get_cell_mut(coord).set_value_bool(*b);
                 }
             }
+        }
+    }
+
+    // 批注：直接走 umya（它会生成 comments 部件和 vml 绘图）
+    for (idx, sheet) in wb.sheets.iter().enumerate() {
+        if !sheet.notes_dirty {
+            continue;
+        }
+        if let Ok(ws) = book.get_sheet_by_name_mut(&sheet.name) {
+            // 整表重写：先清空再从模型里灌（批注数量通常很小）
+            ws.get_comments_mut().clear();
+            for n in sheet.notes.values() {
+                let mut nc = umya_spreadsheet::Comment::default();
+                let mut coord = umya_spreadsheet::Coordinate::default();
+                coord.set_coordinate(format!("{}{}", crate::model::col_label(n.c), n.r + 1));
+                *nc.coordinate_mut() = coord;
+                nc.set_author(if n.author.is_empty() { "Hermes" } else { &n.author });
+                nc.set_text_string(n.text.clone());
+                ws.add_comments(nc);
+            }
+            let _ = idx;
         }
     }
 

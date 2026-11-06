@@ -40,6 +40,8 @@ struct SheetApp {
     dv_edit: Option<sheetcore::dv::DataValidation>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
+    /// 批注编辑：(行, 列, 文本)
+    note_edit: Option<(u32, u32, String)>,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -117,6 +119,7 @@ impl SheetApp {
             cf_v2: "0".into(),
             dv_edit: None,
             dv_open: None,
+            note_edit: None,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -644,6 +647,10 @@ impl SheetApp {
                 });
             ui.separator();
 
+            // 审阅（批注）
+            self.toolbar_notes(ui);
+            ui.separator();
+
             // 数据验证
             self.toolbar_dv(ui);
             ui.separator();
@@ -1050,6 +1057,93 @@ impl SheetApp {
         }
     }
 
+
+    /// 审阅菜单：新建/编辑/删除批注
+    fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("审阅", |ui| {
+            ui.set_min_width(180.0);
+            let (r, c) = self.sel;
+            let cur = self
+                .wb
+                .sheet(self.sheet_idx)
+                .notes
+                .get(&sheetcore::model::CellRef::new(r, c))
+                .cloned();
+            let label = if cur.is_some() { "编辑批注…" } else { "新建批注…" };
+            if ui.button(label).clicked() {
+                let text = cur.as_ref().map(|n| n.text.clone()).unwrap_or_default();
+                self.note_edit = Some((r, c, text));
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(cur.is_some(), egui::Button::new("删除批注"))
+                .clicked()
+            {
+                let sheet = self.wb.sheet_mut(self.sheet_idx);
+                sheet.notes.remove(&sheetcore::model::CellRef::new(r, c));
+                sheet.notes_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已删除批注".into();
+                ui.close_menu();
+            }
+            ui.separator();
+            let n = self.wb.sheet(self.sheet_idx).notes.len();
+            ui.label(format!("本表 {n} 条批注"));
+        });
+    }
+
+    /// 批注编辑窗口
+    fn note_dialog(&mut self, ctx: &egui::Context) {
+        let Some((r, c, mut text)) = self.note_edit.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let name = format!("批注 {}{}", cell_name(r, c), "");
+        egui::Window::new(name)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(280.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("写点什么…"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            let key = sheetcore::model::CellRef::new(r, c);
+            if text.trim().is_empty() {
+                sheet.notes.remove(&key);
+            } else {
+                sheet.notes.insert(
+                    key,
+                    sheetcore::notes::Note {
+                        r,
+                        c,
+                        text: text.clone(),
+                        author: "Hermes".into(),
+                    },
+                );
+            }
+            sheet.notes_dirty = true;
+            self.wb.dirty = true;
+            self.status = "已保存批注".into();
+        } else if !cancel && open {
+            self.note_edit = Some((r, c, text));
+        }
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -1197,6 +1291,7 @@ impl SheetApp {
 
         // 单元格
         let merges = self.wb.sheet(self.sheet_idx).merges.clone();
+        let notes = self.wb.sheet(self.sheet_idx).notes.clone();
         let mut r = first_row;
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
@@ -1304,6 +1399,23 @@ impl SheetApp {
                         }
                     }
                 }
+                // 批注标记：右上角小红三角
+                if let Some(n) = notes.get(&sheetcore::model::CellRef::new(r, c)) {
+                    let (rx, ry) = (rect.right(), rect.top());
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(rx - 7.0, ry),
+                            egui::pos2(rx, ry),
+                            egui::pos2(rx, ry + 7.0),
+                        ],
+                        Color32::from_rgb(192, 0, 0),
+                        egui::Stroke::NONE,
+                    ));
+                    if dumping {
+                        dump.push(format!("note ({},{}) 作者={} 文字={:?}", r, c, n.author, n.text));
+                    }
+                }
+
                 // 边框（合并区域按整块画）
                 let bd = &st.border;
                 if bd[0].style != 0 || bd[1].style != 0 || bd[2].style != 0 || bd[3].style != 0 {
@@ -1538,6 +1650,26 @@ impl SheetApp {
             }
         }
 
+        // 悬停显示批注
+        if let Some(pos) = resp.hover_pos() {
+            if pos.x > origin.x + HEAD_W && pos.y > origin.y + HEAD_H {
+                let hc = cols.index_at(off_x + pos.x - (origin.x + HEAD_W));
+                let hr = rows.index_at(off_y + pos.y - (origin.y + HEAD_H));
+                if let Some(n) = notes.get(&sheetcore::model::CellRef::new(hr, hc)) {
+                    egui::show_tooltip_at_pointer(
+                        ctx,
+                        egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("note_tip")),
+                        egui::Id::new("note_tip_body"),
+                        |ui| {
+                            ui.set_max_width(260.0);
+                            ui.label(egui::RichText::new(format!("{}（{}）", cell_name(hr, hc), n.author)).strong());
+                            ui.label(&n.text);
+                        },
+                    );
+                }
+            }
+        }
+
         if !dump.is_empty() {
             if let Ok(path) = std::env::var("SC_DUMP") {
                 let _ = std::fs::write(path, dump.join("
@@ -1749,6 +1881,7 @@ impl eframe::App for SheetApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.dv_dialog(ctx);
+        self.note_dialog(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
