@@ -44,6 +44,8 @@ struct SheetApp {
     note_edit: Option<(u32, u32, String)>,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
+    /// 显示分页虚线
+    show_pages: bool,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -123,6 +125,7 @@ impl SheetApp {
             dv_open: None,
             note_edit: None,
             filter_popup: None,
+            show_pages: false,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -655,6 +658,10 @@ impl SheetApp {
                         self.outer_border(3, [0, 0, 0]);
                     }
                 });
+            ui.separator();
+
+            // 页面布局
+            self.toolbar_page(ui);
             ui.separator();
 
             // 数据（排序筛选）
@@ -1476,6 +1483,116 @@ impl SheetApp {
         }
     }
 
+
+    /// 页面布局菜单
+    fn toolbar_page(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("页面布局", |ui| {
+            ui.set_min_width(220.0);
+            let ps0 = self.wb.sheet(self.sheet_idx).page.clone();
+            ui.menu_button(format!("纸张：{}", ps0.paper_label()), |ui| {
+                for (code, name) in [(9u16, "A4"), (8, "A3"), (10, "A5"), (1, "Letter"), (4, "Legal")] {
+                    if ui.selectable_label(ps0.paper == code, name).clicked() {
+                        self.set_page(|p| p.paper = code);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button(if ps0.landscape { "方向：横向" } else { "方向：纵向" }, |ui| {
+                if ui.selectable_label(!ps0.landscape, "纵向").clicked() {
+                    self.set_page(|p| p.landscape = false);
+                    ui.close_menu();
+                }
+                if ui.selectable_label(ps0.landscape, "横向").clicked() {
+                    self.set_page(|p| p.landscape = true);
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button(format!("缩放：{}", if ps0.fit_to_page { "调整为 1 页宽".to_string() } else { format!("{}%", ps0.scale) }), |ui| {
+                if ui.selectable_label(ps0.fit_to_page, "调整为 1 页宽").clicked() {
+                    self.set_page(|p| {
+                        p.fit_to_page = true;
+                        p.fit_width = 1;
+                        p.fit_height = 0;
+                    });
+                    ui.close_menu();
+                }
+                for pct in [100u16, 85, 75, 50] {
+                    if ui.selectable_label(!ps0.fit_to_page && ps0.scale == pct, format!("{pct}%")).clicked() {
+                        self.set_page(move |p| {
+                            p.fit_to_page = false;
+                            p.scale = pct;
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("边距", |ui| {
+                for (name, m) in [
+                    ("常规", [0.7f32, 0.7, 0.75, 0.75, 0.3, 0.3]),
+                    ("窄", [0.25, 0.25, 0.75, 0.75, 0.3, 0.3]),
+                    ("宽", [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]),
+                ] {
+                    if ui.button(name).clicked() {
+                        self.set_page(move |p| p.margins = m);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.checkbox(&mut { ps0.gridlines }, "打印网格线").clicked() {
+                let v = !ps0.gridlines;
+                self.set_page(move |p| p.gridlines = v);
+                ui.close_menu();
+            }
+            if ui.checkbox(&mut { ps0.headings }, "打印行号列标").clicked() {
+                let v = !ps0.headings;
+                self.set_page(move |p| p.headings = v);
+                ui.close_menu();
+            }
+            ui.separator();
+            let (r1, c1, r2, c2) = self.sel_rect();
+            if ui.button("把选区设为打印区域").clicked() {
+                self.set_page(move |p| p.print_area = Some((r1, c1, r2, c2)));
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(ps0.print_area.is_some(), egui::Button::new("取消打印区域"))
+                .clicked()
+            {
+                self.set_page(|p| p.print_area = None);
+                ui.close_menu();
+            }
+            let (sr, _sc) = self.sel;
+            if ui.button(format!("把第 {} 行设为顶端标题行", sr + 1)).clicked() {
+                self.set_page(move |p| p.title_rows = Some((0, sr)));
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(ps0.title_rows.is_some(), egui::Button::new("取消标题行"))
+                .clicked()
+            {
+                self.set_page(|p| p.title_rows = None);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.checkbox(&mut self.show_pages, "显示分页虚线").clicked() {
+                ui.close_menu();
+            }
+            ui.label(format!(
+                "页数约 {}×{}",
+                sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx)).0.len() + 1,
+                sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx)).1.len() + 1
+            ));
+        });
+    }
+
+    fn set_page<F: Fn(&mut sheetcore::page::PageSetup)>(&mut self, f: F) {
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        f(&mut sheet.page);
+        sheet.page_dirty = true;
+        self.wb.dirty = true;
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -1898,6 +2015,53 @@ impl SheetApp {
             }
             if dumping {
                 dump.push(format!("freeze rows={fy} cols={fx} body=({:.0},{:.0})", body_x, body_y));
+            }
+        }
+
+        // 分页虚线（打印预览用）
+        if self.show_pages {
+            let (xs, ys) = sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx));
+            let dash = Color32::from_rgb(120, 140, 180);
+            let (r0, c0) = (first_row, first_col);
+            let (pr1, pc1, pr2, pc2) = self
+                .wb
+                .sheet(self.sheet_idx)
+                .page
+                .print_area
+                .unwrap_or((r0, c0, r0 + 500, c0 + 40));
+            let x_off = cols.pos(pc1);
+            let y_off = rows.pos(pr1);
+            for x in xs.iter() {
+                let px = gx(pc1) + x;
+                if px >= body_x && px <= origin.x + avail.x {
+                    let mut y = py_of(pr1).max(origin.y + HEAD_H) + 0.0;
+                    while y < origin.y + avail.y {
+                        let y2 = (y + 4.0).min(origin.y + avail.y);
+                        painter.line_segment(
+                            [egui::pos2(px, y), egui::pos2(px, y2)],
+                            Stroke::new(1.0, dash),
+                        );
+                        y += 7.0;
+                    }
+                }
+            }
+            for y in ys.iter() {
+                let py = gy(pr1) + y;
+                if py >= body_y && py <= origin.y + avail.y {
+                    let mut x = px_of(pc1).max(origin.x + HEAD_W);
+                    while x < origin.x + avail.x {
+                        let x2 = (x + 4.0).min(origin.x + avail.x);
+                        painter.line_segment(
+                            [egui::pos2(x, py), egui::pos2(x2, py)],
+                            Stroke::new(1.0, dash),
+                        );
+                        x += 7.0;
+                    }
+                }
+            }
+            let _ = (pr2, pc2, x_off, y_off);
+            if dumping {
+                dump.push(format!("page-breaks x={} y={}", xs.len(), ys.len()));
             }
         }
 

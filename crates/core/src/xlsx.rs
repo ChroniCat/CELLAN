@@ -100,6 +100,34 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    // 页面设置（表级 + 定义名里的打印区域/标题）
+    {
+        let names = crate::page::load_defined_names(path);
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(mut zip) = zip::ZipArchive::new(file) {
+                let targets = crate::patch::sheet_targets(path).unwrap_or_default();
+                for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+                    let mut ps = targets
+                        .get(&sheet.name)
+                        .and_then(|t| {
+                            use std::io::Read;
+                            let mut f = zip.by_name(t).ok()?;
+                            let mut xml = String::new();
+                            f.read_to_string(&mut xml).ok()?;
+                            Some(crate::page::parse_page_setup(&xml))
+                        })
+                        .unwrap_or_default();
+                    if let Some((a, r, c)) = names.get(&(idx as u32)) {
+                        ps.print_area = *a;
+                        ps.title_rows = *r;
+                        ps.title_cols = *c;
+                    }
+                    sheet.page = ps;
+                }
+            }
+        }
+    }
+
     // 批注
     if let Ok(all) = crate::notes::load_notes(path) {
         for sheet in wb.sheets.iter_mut() {
@@ -302,8 +330,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     let any_dv = wb.sheets.iter().any(|s| s.dv_dirty);
     let any_freeze = wb.sheets.iter().any(|s| s.freeze_dirty);
     let any_filter = wb.sheets.iter().any(|s| s.filter_dirty);
-    if any_cf || any_dv || any_freeze || any_filter {
-        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter) {
+    let any_page = wb.sheets.iter().any(|s| s.page_dirty);
+    if any_cf || any_dv || any_freeze || any_filter || any_page {
+        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter, any_page) {
             eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
     }
@@ -318,12 +347,23 @@ fn apply_cf_patch(
     do_dv: bool,
     do_freeze: bool,
     do_filter: bool,
+    do_page: bool,
 ) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     // 先把每张表要写的块算出来
     let mut per_sheet: std::collections::HashMap<
         String,
-        (String, String, Option<(u32, u32)>, bool, String, std::collections::HashSet<u32>, bool),
+        (
+            String,
+            String,
+            Option<(u32, u32)>,
+            bool,
+            String,
+            std::collections::HashSet<u32>,
+            bool,
+            crate::page::PageSetup,
+            bool,
+        ),
     > = std::collections::HashMap::new();
     for sheet in wb.sheets.iter() {
         if let Some(t) = targets.get(&sheet.name) {
@@ -340,10 +380,21 @@ fn apply_cf_patch(
                 || sheet.dv_dirty
                 || sheet.freeze_dirty
                 || sheet.filter_dirty
+                || sheet.page_dirty
             {
                 per_sheet.insert(
                     t.clone(),
-                    (cf, dv, sheet.freeze, sheet.freeze_dirty, af, sheet.hidden_rows.clone(), sheet.filter_dirty),
+                    (
+                        cf,
+                        dv,
+                        sheet.freeze,
+                        sheet.freeze_dirty,
+                        af,
+                        sheet.hidden_rows.clone(),
+                        sheet.filter_dirty,
+                        sheet.page.clone(),
+                        sheet.page_dirty,
+                    ),
                 );
             }
         }
@@ -355,7 +406,9 @@ fn apply_cf_patch(
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     crate::patch::rewrite_zip(path, |name, buf| {
-        if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty)) = per_sheet.get(name) {
+        if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty, page, page_dirty)) =
+            per_sheet.get(name)
+        {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = xml;
                 if do_cf {
@@ -370,6 +423,20 @@ fn apply_cf_patch(
                 if do_filter && *f_dirty {
                     x = crate::patch::insert_auto_filter(&x, af);
                     x = crate::patch::set_hidden_rows(&x, hidden);
+                }
+                if do_page && *page_dirty {
+                    x = crate::patch::set_page_xml(&x, page);
+                }
+                return x.into_bytes();
+            }
+        }
+        if do_page && name == "xl/workbook.xml" {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                let mut x = xml;
+                for (idx, sheet) in wb.sheets.iter().enumerate() {
+                    if sheet.page_dirty {
+                        x = crate::patch::set_print_names(&x, idx as u32, &sheet.name, &sheet.page);
+                    }
                 }
                 return x.into_bytes();
             }

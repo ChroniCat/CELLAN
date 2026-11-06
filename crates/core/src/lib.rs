@@ -4,6 +4,7 @@ pub mod dv;
 pub mod layout;
 pub mod merges;
 pub mod notes;
+pub mod page;
 pub mod patch;
 pub mod model;
 pub mod style;

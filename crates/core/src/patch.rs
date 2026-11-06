@@ -114,7 +114,10 @@ where
         zw.finish()?;
     }
     drop(zip);
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -787,5 +790,200 @@ mod filter_tests {
         let cleared = set_hidden_rows(&out, &HashSet::new());
         assert_eq!(cleared.matches("hidden=\"1\"").count(), 0, "{cleared}");
         assert!(cleared.contains("<row r=\"1\" spans=\"1:3\">"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 页面设置
+// ---------------------------------------------------------------------------
+
+fn strip_tag(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        out.push_str(&rest[..i]);
+        if let Some(e) = rest[i..].find(&close) {
+            rest = &rest[i + e + close.len()..];
+        } else if let Some(e) = rest[i..].find("/>") {
+            rest = &rest[i + e + 2..];
+        } else {
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 改工作表里的页面设置：四段一起重写，插在 </worksheet> 前（顺序按 schema）
+pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
+    let mut x = xml.to_string();
+    for t in ["printOptions", "pageMargins", "pageSetup", "headerFooter"] {
+        x = strip_tag(&x, t);
+    }
+    let mut body = String::new();
+    if ps.gridlines || ps.headings || ps.center_h || ps.center_v {
+        body.push_str(&format!(
+            "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>",
+            if ps.gridlines { 1 } else { 0 },
+            if ps.headings { 1 } else { 0 },
+            if ps.center_h { 1 } else { 0 },
+            if ps.center_v { 1 } else { 0 }
+        ));
+    }
+    body.push_str(&format!(
+        "<pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>",
+        ps.margins[0], ps.margins[1], ps.margins[2], ps.margins[3], ps.margins[4], ps.margins[5]
+    ));
+    body.push_str(&format!(
+        "<pageSetup paperSize=\"{}\" orientation=\"{}\" {} fitToWidth=\"{}\" fitToHeight=\"{}\" scale=\"{}\"/>",
+        ps.paper,
+        if ps.landscape { "landscape" } else { "portrait" },
+        "",
+        if ps.fit_to_page { ps.fit_width } else { 0 },
+        if ps.fit_to_page { ps.fit_height } else { 0 },
+        if ps.fit_to_page { 100 } else { ps.scale }
+    ));
+    if !ps.header.is_empty() || !ps.footer.is_empty() {
+        body.push_str("<headerFooter>");
+        if !ps.header.is_empty() {
+            body.push_str(&format!("<oddHeader>{}</oddHeader>", esc(&ps.header)));
+        }
+        if !ps.footer.is_empty() {
+            body.push_str(&format!("<oddFooter>{}</oddFooter>", esc(&ps.footer)));
+        }
+        body.push_str("</headerFooter>");
+    }
+    if let Some(i) = x.find("</worksheet>") {
+        let mut out = String::with_capacity(x.len() + body.len());
+        out.push_str(&x[..i]);
+        out.push_str(&body);
+        out.push_str(&x[i..]);
+        return out;
+    }
+    x.push_str(&body);
+    x
+}
+
+/// 更新 workbook.xml 里某张表的 Print_Area / Print_Titles
+pub fn set_print_names(xml: &str, sheet_index: u32, sheet_name: &str, ps: &crate::page::PageSetup) -> String {
+    let mut x = strip_defined_name(xml, "_xlnm.Print_Area", sheet_index);
+    x = strip_defined_name(&x, "_xlnm.Print_Titles", sheet_index);
+    let quoted = format!("'{}'", sheet_name.replace('\'', "''"));
+    let mut defs = String::new();
+    if let Some((r1, c1, r2, c2)) = ps.print_area {
+        defs.push_str(&format!(
+            "<definedName name=\"_xlnm.Print_Area\" localSheetId=\"{sheet_index}\">{}!${}${}:${}${}</definedName>",
+            quoted,
+            crate::model::col_label(c1),
+            r1 + 1,
+            crate::model::col_label(c2),
+            r2 + 1
+        ));
+    }
+    let mut titles = Vec::new();
+    if let Some((r1, r2)) = ps.title_rows {
+        titles.push(format!("{}!${}:${}", quoted, r1 + 1, r2 + 1));
+    }
+    if let Some((c1, c2)) = ps.title_cols {
+        titles.push(format!(
+            "{}!${}:${}",
+            quoted,
+            crate::model::col_label(c1),
+            crate::model::col_label(c2)
+        ));
+    }
+    if !titles.is_empty() {
+        defs.push_str(&format!(
+            "<definedName name=\"_xlnm.Print_Titles\" localSheetId=\"{sheet_index}\">{}</definedName>",
+            titles.join(",")
+        ));
+    }
+    if defs.is_empty() {
+        return x;
+    }
+    // 已有 definedNames 就插进去，没有就建一个（位置在 sheet 定义之后、calcPr 之前都合法）
+    if let Some(i) = x.find("</definedNames>") {
+        let mut out = String::with_capacity(x.len() + defs.len());
+        out.push_str(&x[..i]);
+        out.push_str(&defs);
+        out.push_str(&x[i..]);
+        out
+    } else if let Some(i) = x.find("</sheets>") {
+        let mut out = String::with_capacity(x.len() + defs.len() + 40);
+        out.push_str(&x[..i + "</sheets>".len()]);
+        out.push_str("<definedNames>");
+        out.push_str(&defs);
+        out.push_str("</definedNames>");
+        out.push_str(&x[i + "</sheets>".len()..]);
+        out
+    } else {
+        x
+    }
+}
+
+fn strip_defined_name(xml: &str, name: &str, sheet_index: u32) -> String {
+    let key = format!("name=\"{name}\"");
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find("<definedName") {
+        // 别把容器 <definedNames> 当成元素
+        let after = rest[i + "<definedName".len()..].chars().next();
+        if !matches!(after, Some(' ') | Some('>')) {
+            out.push_str(&rest[..i + "<definedName".len()]);
+            rest = &rest[i + "<definedName".len()..];
+            continue;
+        }
+        let Some(end) = rest[i..].find("</definedName>") else { break };
+        let whole = &rest[i..i + end + "</definedName>".len()];
+        let matches = whole.contains(&key)
+            && (whole.contains(&format!("localSheetId=\"{sheet_index}\"")) || !whole.contains("localSheetId"));
+        out.push_str(&rest[..i]);
+        if !matches {
+            out.push_str(whole);
+        }
+        rest = &rest[i + end + "</definedName>".len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::page::PageSetup;
+
+    #[test]
+    fn rewrites_sheet_page_elements() {
+        let xml = "<worksheet><sheetData/><pageMargins left=\"0.7\"/><pageSetup orientation=\"portrait\" paperSize=\"9\" scale=\"100\"/></worksheet>";
+        let mut ps = PageSetup::default();
+        ps.landscape = true;
+        ps.paper = 8;
+        ps.scale = 85;
+        ps.gridlines = true;
+        ps.header = "&C报表".into();
+        let out = set_page_xml(xml, &ps);
+        assert_eq!(out.matches("<pageSetup").count(), 1);
+        assert_eq!(out.matches("<pageMargins").count(), 1);
+        assert!(out.contains("orientation=\"landscape\""));
+        assert!(out.contains("paperSize=\"8\""));
+        assert!(out.contains("scale=\"85\""));
+        assert!(out.contains("gridLines=\"1\""));
+        assert!(out.contains("<oddHeader>&amp;C报表</oddHeader>"));
+        assert!(out.find("<pageSetup").unwrap() < out.find("</worksheet>").unwrap());
+    }
+
+    #[test]
+    fn writes_print_area_names() {
+        let xml = "<workbook><sheets><sheet name=\"数据\" sheetId=\"1\"/></sheets><definedNames><definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\">old</definedName></definedNames></workbook>";
+        let mut ps = PageSetup::default();
+        ps.print_area = Some((0, 0, 19, 5));
+        ps.title_rows = Some((0, 1));
+        let out = set_print_names(xml, 0, "数据", &ps);
+        assert_eq!(out.matches("Print_Area").count(), 1);
+        assert!(out.contains("'数据'!$A$1:$F$20"));
+        assert!(out.contains("Print_Titles"));
+        assert!(out.contains("$1:$2"));
     }
 }

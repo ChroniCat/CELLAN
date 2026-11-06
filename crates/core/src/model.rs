@@ -125,6 +125,10 @@ pub struct Sheet {
     pub hidden_rows: std::collections::HashSet<u32>,
     /// 筛选状态被改过
     pub filter_dirty: bool,
+    /// 页面设置
+    pub page: crate::page::PageSetup,
+    /// 页面设置被改过
+    pub page_dirty: bool,
 }
 
 impl Sheet {
@@ -151,6 +155,8 @@ impl Sheet {
             filter: None,
             hidden_rows: std::collections::HashSet::new(),
             filter_dirty: false,
+            page: crate::page::PageSetup::default(),
+            page_dirty: false,
         }
     }
 
@@ -382,4 +388,28 @@ pub fn xml_unescape(s: &str) -> String {
         .replace("&#10;", "
 ")
         .replace("&amp;", "&")
+}
+
+/// 解析 XML 实体引用（quick-xml 把 &amp; 单独发成 GeneralRef 事件）
+pub fn resolve_entity(name: &str) -> String {
+    match name {
+        "amp" => "&".into(),
+        "lt" => "<".into(),
+        "gt" => ">".into(),
+        "quot" => "\"".into(),
+        "apos" => "'".into(),
+        _ => {
+            if let Some(num) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                if let Ok(v) = u32::from_str_radix(num, 16) {
+                    return char::from_u32(v).map(|c| c.to_string()).unwrap_or_default();
+                }
+            }
+            if let Some(num) = name.strip_prefix('#') {
+                if let Ok(v) = num.parse::<u32>() {
+                    return char::from_u32(v).map(|c| c.to_string()).unwrap_or_default();
+                }
+            }
+            String::new()
+        }
+    }
 }
