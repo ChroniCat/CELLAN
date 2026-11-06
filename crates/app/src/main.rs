@@ -445,8 +445,8 @@ impl SheetApp {
             );
         }
 
-        // 单元格
-        let sheet = self.wb.sheet(self.sheet_idx);
+        // 单元格（不长期持有表引用，避免和后面的可变借用冲突）
+        let merges = self.wb.sheet(self.sheet_idx).merges.clone();
         for i in 0..n_rows {
             let r = first_row + i;
             let y = origin.y + HEAD_H + off_y + i as f32 * ROW_H;
@@ -459,42 +459,72 @@ impl SheetApp {
                 if x + COL_W < origin.x + HEAD_W || x > origin.x + avail.x {
                     continue;
                 }
-                let rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(COL_W, ROW_H));
-                if self.sel == (r, c) {
-                    painter.rect_filled(rect, 0.0, Color32::from_rgb(224, 238, 252));
+                let mut rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(COL_W, ROW_H));
+                // 合并区域：只画左上角那格，整块按合并尺寸绘制
+                let merge = merges
+                    .iter()
+                    .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+                    .copied();
+                if let Some((mr1, mc1, mr2, mc2)) = merge {
+                    if (r, c) != (mr1, mc1) {
+                        continue;
+                    }
+                    rect.set_width(COL_W * (mc2 - mc1 + 1) as f32);
+                    rect.set_height(ROW_H * (mr2 - mr1 + 1) as f32);
                 }
-                if let Some(cell) = sheet.get(r, c) {
-                    let txt = cell.value.display();
+                let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
+                let st = self.wb.styles.get(sid);
+                // 选中底色先画，单元格自带填充后画（否则会把真实颜色染偏）
+                if self.sel == (r, c) && st.fill.is_none() {
+                    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(26, 115, 232, 40));
+                }
+                if let Some(fill) = st.fill {
+                    painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
+                }
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
+                    let txt = sheetcore::style::format_value(&cell.value, &st.format);
                     if !txt.is_empty() {
                         let is_num = matches!(cell.value, Value::Number(_));
-                        if is_num {
-                            painter.text(
-                                egui::pos2(x + COL_W - 4.0, y + ROW_H / 2.0),
-                                Align2::RIGHT_CENTER,
-                                txt,
-                                FontId::proportional(13.0),
-                                text_color,
-                            );
+                        let font = FontId::proportional(if st.bold { st.size + 0.6 } else { st.size });
+                        let color = Color32::from_rgb(st.color[0], st.color[1], st.color[2]);
+                        let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
+                            Align2::CENTER_CENTER
+                        } else if st.halign == 3 || (st.halign == 0 && is_num) {
+                            Align2::RIGHT_CENTER
                         } else {
-                            painter.text(
-                                egui::pos2(x + 4.0, y + ROW_H / 2.0),
-                                Align2::LEFT_CENTER,
-                                txt,
-                                FontId::proportional(13.0),
-                                text_color,
-                            );
-                        }
+                            Align2::LEFT_CENTER
+                        };
+                        let tx = match align {
+                            Align2::CENTER_CENTER => rect.center().x,
+                            Align2::RIGHT_CENTER => rect.max.x - 4.0,
+                            _ => rect.min.x + 4.0,
+                        };
+                        let ty = if st.valign == 1 {
+                            rect.min.y + 4.0
+                        } else if st.valign == 3 {
+                            rect.max.y - 4.0
+                        } else {
+                            rect.center().y
+                        };
+                        painter.text(egui::pos2(tx, ty), align, txt, font, color);
                     }
                 }
             }
         }
 
-        // 选区边框
-        let sx = origin.x + HEAD_W + off_x + (self.sel.1 - first_col) as f32 * COL_W;
-        let sy = origin.y + HEAD_H + off_y + (self.sel.0 - first_row) as f32 * ROW_H;
+        // 选区边框（合并区域按整块画）
+        let (sr1, sc1, sr2, sc2) = merges
+            .iter()
+            .find(|(r1, c1, r2, c2)| self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2)
+            .copied()
+            .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
+        let sx = origin.x + HEAD_W + off_x + (sc1 - first_col) as f32 * COL_W;
+        let sy = origin.y + HEAD_H + off_y + (sr1 - first_row) as f32 * ROW_H;
+        let sw = COL_W * (sc2 - sc1 + 1) as f32;
+        let sh = ROW_H * (sr2 - sr1 + 1) as f32;
         if sx >= origin.x + HEAD_W - COL_W && sy >= origin.y + HEAD_H - ROW_H {
             painter.rect_stroke(
-                Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(COL_W, ROW_H)),
+                Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(sw, sh)),
                 0.0,
                 Stroke::new(2.0, Color32::from_rgb(26, 115, 232)),
                 egui::StrokeKind::Inside,
@@ -543,7 +573,13 @@ impl SheetApp {
                     if self.editing.is_some() {
                         self.commit_edit(None);
                     }
-                    self.sel = (r, c);
+                    self.sel = match merges
+                        .iter()
+                        .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+                    {
+                        Some((mr1, mc1, _, _)) => (*mr1, *mc1),
+                        None => (r, c),
+                    };
                 }
             }
         }
@@ -927,7 +963,7 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("Sheets Native (v1.5)"),
+            .with_title("Sheets Native (v1.6)"),
         ..Default::default()
     };
     eframe::run_native(

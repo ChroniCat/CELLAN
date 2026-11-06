@@ -27,6 +27,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         dirty: false,
+        styles: crate::style::StyleTable::new(),
     };
 
     for name in names {
@@ -39,6 +40,17 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 let v = data_to_value(data);
                 if !v.is_empty() {
                     sheet.set(r0 + row as u32, c0 + col as u32, Cell { value: v, formula: None });
+                }
+            }
+        }
+
+        // 样式：calamine 已解析好样式表，折算成我们的紧凑结构
+        if let Ok(st) = reader.worksheet_style(&name) {
+            for (row, col, style) in st.cells() {
+                let cs = convert_style(style);
+                let id = wb.styles.intern(cs);
+                if id != 0 {
+                    sheet.set_style(row, col, id);
                 }
             }
         }
@@ -65,6 +77,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
+    // 合并单元格（calamine 不提供，单独解析一次）
+    if let Ok(merges) = crate::merges::load_merges(path) {
+        for sheet in wb.sheets.iter_mut() {
+            if let Some(list) = merges.get(&sheet.name) {
+                sheet.merges = list.clone();
+            }
+        }
+    }
+
     Ok(wb)
 }
 
@@ -75,8 +96,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 
     let prof = std::env::var("SC_SAVE_PROF").is_ok();
     let t_read = std::time::Instant::now();
-    let mut book = if path.exists() {
-        read(path).with_context(|| format!("读取现有文件失败 {}", path.display()))?
+    // 基准文件必须用「打开时的原文件」，不能用另存的目标路径：
+    // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等
+    // 我们不解析也不重建的结构（umya 从零建表只会写单元格）。
+    let base = match wb.path.as_ref().filter(|p| p.exists()) {
+        Some(p) => p.clone(),
+        None => path.to_path_buf(),
+    };
+    let mut book = if base.exists() {
+        read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
     } else {
         new_file()
     };
@@ -87,7 +115,7 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     let t_build = std::time::Instant::now();
     for (idx, sheet) in wb.sheets.iter().enumerate() {
         // 新建文件默认带一个 Sheet1：名字不同时直接改名，避免多出一张空表
-        let needs_rename = !path.exists()
+        let needs_rename = !base.exists()
             && idx == 0
             && book.get_sheet(&0).ok().map(|s| s.get_name().to_string()) != Some(sheet.name.clone());
 
@@ -244,4 +272,49 @@ mod tests {
         let _ = CellRef::new(0, 0);
         let _ = Sheet::new("x");
     }
+}
+
+/// 把 calamine 的 Style 折成我们的 CellStyle（只保留看得见的部分）
+fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
+    let mut out = crate::style::CellStyle { size: 11.0, color: [0, 0, 0], ..Default::default() };
+    if let Some(f) = &st.font {
+        out.bold = matches!(f.weight, calamine::FontWeight::Bold);
+        out.italic = matches!(f.style, calamine::FontStyle::Italic);
+        if let Some(sz) = f.size {
+            out.size = sz as f32;
+        }
+        if let Some(c) = &f.color {
+            out.color = [c.red, c.green, c.blue];
+        }
+    }
+    if let Some(fill) = &st.fill {
+        if !matches!(fill.pattern, calamine::FillPattern::None) {
+            if let Some(c) = &fill.foreground_color {
+                if !(c.red == 0 && c.green == 0 && c.blue == 0 && c.alpha == 0) {
+                    out.fill = Some([c.red, c.green, c.blue]);
+                }
+            }
+        }
+    }
+    if let Some(a) = &st.alignment {
+        out.halign = match a.horizontal {
+            calamine::HorizontalAlignment::Left => 1,
+            calamine::HorizontalAlignment::Center => 2,
+            calamine::HorizontalAlignment::Right => 3,
+            _ => 0,
+        };
+        out.valign = match a.vertical {
+            calamine::VerticalAlignment::Top => 1,
+            calamine::VerticalAlignment::Center => 2,
+            calamine::VerticalAlignment::Bottom => 3,
+            _ => 0,
+        };
+        out.wrap = a.wrap_text;
+    }
+    if let Some(nf) = &st.number_format {
+        if !nf.format_code.is_empty() && nf.format_code != "General" {
+            out.format = nf.format_code.clone();
+        }
+    }
+    out
 }

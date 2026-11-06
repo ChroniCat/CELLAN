@@ -91,6 +91,10 @@ pub struct Sheet {
     pub cleared: std::collections::HashSet<CellRef>,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
     pub spilled: std::collections::HashSet<CellRef>,
+    /// 合并单元格区域 (r1, c1, r2, c2)
+    pub merges: Vec<(u32, u32, u32, u32)>,
+    /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
+    pub styles: HashMap<CellRef, u16>,
 }
 
 impl Sheet {
@@ -100,6 +104,8 @@ impl Sheet {
             cells: Store::default(),
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
+            merges: Vec::new(),
+            styles: HashMap::new(),
         }
     }
 
@@ -156,6 +162,27 @@ impl Sheet {
         self.cells.iter_values()
     }
 
+    pub fn style_of(&self, r: u32, c: u32) -> u16 {
+        self.styles.get(&CellRef::new(r, c)).copied().unwrap_or(0)
+    }
+
+    pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
+        let key = CellRef::new(r, c);
+        if id == 0 {
+            self.styles.remove(&key);
+        } else {
+            self.styles.insert(key, id);
+        }
+    }
+
+    /// 命中合并区域时返回该区域（含锚点）
+    pub fn merge_at(&self, r: u32, c: u32) -> Option<(u32, u32, u32, u32)> {
+        self.merges
+            .iter()
+            .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+            .copied()
+    }
+
     /// 已用区域 (r1, c1, r2, c2)，0-based
     pub fn used_bounds(&self) -> Option<(u32, u32, u32, u32)> {
         self.cells.used_bounds()
@@ -174,6 +201,8 @@ impl Sheet {
 
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
+    /// 样式表（单元格只存索引，见 Sheet.styles）
+    pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
     pub path: Option<PathBuf>,
     pub dirty: bool,
@@ -181,7 +210,12 @@ pub struct Workbook {
 
 impl Workbook {
     pub fn new_blank() -> Self {
-        Self { sheets: vec![Sheet::new("Sheet1")], path: None, dirty: false }
+        Self {
+            sheets: vec![Sheet::new("Sheet1")],
+            path: None,
+            dirty: false,
+            styles: crate::style::StyleTable::new(),
+        }
     }
 
     pub fn sheet(&self, idx: usize) -> &Sheet {
