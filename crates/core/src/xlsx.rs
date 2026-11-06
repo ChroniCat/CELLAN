@@ -90,6 +90,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 }
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
+                sheet.dv = lay.dv.clone();
             }
         }
     }
@@ -261,22 +262,28 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 
     // umya 不管条件格式的 dxf 细节，保存完直接补 XML
     let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);
-    if any_cf {
-        if let Err(e) = apply_cf_patch(path, wb) {
-            eprintln!("[save] 条件格式补丁失败: {e}");
+    let any_dv = wb.sheets.iter().any(|s| s.dv_dirty);
+    if any_cf || any_dv {
+        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv) {
+            eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
     }
     Ok(())
 }
 
 /// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
-fn apply_cf_patch(path: &Path, wb: &Workbook) -> Result<()> {
+fn apply_cf_patch(path: &Path, wb: &Workbook, do_cf: bool, do_dv: bool) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     // 先把每张表要写的块算出来
-    let mut per_sheet: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut per_sheet: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     for sheet in wb.sheets.iter() {
         if let Some(t) = targets.get(&sheet.name) {
-            per_sheet.insert(t.clone(), crate::patch::cf_blocks_xml(&sheet.cf.blocks));
+            let cf = if do_cf { crate::patch::cf_blocks_xml(&sheet.cf.blocks) } else { String::new() };
+            let dv = if do_dv { crate::patch::dv_xml(&sheet.dv) } else { String::new() };
+            if !cf.is_empty() || !dv.is_empty() || sheet.cf_dirty || sheet.dv_dirty {
+                per_sheet.insert(t.clone(), (cf, dv));
+            }
         }
     }
     let dxfs: Vec<crate::cf::Dxf> = wb
@@ -286,9 +293,16 @@ fn apply_cf_patch(path: &Path, wb: &Workbook) -> Result<()> {
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     crate::patch::rewrite_zip(path, |name, buf| {
-        if let Some(blocks) = per_sheet.get(name) {
+        if let Some((blocks, dv)) = per_sheet.get(name) {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return crate::patch::insert_cf(&xml, blocks).into_bytes();
+                let mut x = xml;
+                if do_cf {
+                    x = crate::patch::insert_cf(&x, blocks);
+                }
+                if do_dv {
+                    x = crate::patch::insert_dv(&x, dv);
+                }
+                return x.into_bytes();
             }
         }
         if name == "xl/styles.xml" {

@@ -107,6 +107,10 @@ pub struct Sheet {
     pub cf: crate::cf::CfSheet,
     /// 条件格式被改过，保存时要同步
     pub cf_dirty: bool,
+    /// 数据验证
+    pub dv: Vec<crate::dv::DataValidation>,
+    /// 数据验证被改过
+    pub dv_dirty: bool,
 }
 
 impl Sheet {
@@ -124,6 +128,8 @@ impl Sheet {
             merges_dirty: false,
             cf: crate::cf::CfSheet::default(),
             cf_dirty: false,
+            dv: Vec::new(),
+            dv_dirty: false,
         }
     }
 
@@ -341,4 +347,18 @@ mod tests {
         assert_eq!(Value::Number(3.5).display(), "3.5");
         assert_eq!(Value::Number(0.1 + 0.2).display(), "0.3");
     }
+}
+
+/// XML 属性/文本里的实体还原（够用即可）
+pub fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "
+")
+        .replace("&amp;", "&")
 }

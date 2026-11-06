@@ -20,6 +20,8 @@ pub struct SheetLayout {
     pub cf: Vec<crate::cf::CfBlock>,
     /// 差异格式表
     pub dxfs: Vec<crate::cf::Dxf>,
+    /// 数据验证
+    pub dv: Vec<crate::dv::DataValidation>,
 }
 
 /// 返回 表名 → 版式
@@ -40,7 +42,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
                     let mut rid = String::new();
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
-                        let val = a.value.to_string();
+                        let val = crate::model::xml_unescape(&a.value.to_string());
                         if key.ends_with("name") {
                             name = val;
                         } else if key == "r:id" || key.ends_with(":id") {
@@ -71,7 +73,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
                     let mut target = String::new();
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
-                        let val = a.value.to_string();
+                        let val = crate::model::xml_unescape(&a.value.to_string());
                         if key == "Id" {
                             id = val;
                         } else if key == "Target" {
@@ -114,7 +116,8 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         let mut lay = parse_layout(&xml);
         lay.cf = crate::cf::parse_cf_blocks(&xml);
         lay.dxfs = dxfs.clone();
-        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() || !lay.cf.is_empty() {
+        lay.dv = crate::dv::parse_validations(&xml);
+        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() || !lay.cf.is_empty() || !lay.dv.is_empty() {
             out.insert(name.clone(), lay);
         }
     }
@@ -146,7 +149,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let mut custom = false;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
-                        let val = a.value.to_string();
+                        let val = crate::model::xml_unescape(&a.value.to_string());
                         match key {
                             k if k.ends_with("min") => min = val.parse().unwrap_or(0),
                             k if k.ends_with("max") => max = val.parse().unwrap_or(0),
@@ -172,7 +175,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let mut custom = false;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
-                        let val = a.value.to_string();
+                        let val = crate::model::xml_unescape(&a.value.to_string());
                         match key {
                             "r" => idx = val.parse().unwrap_or(0),
                             "ht" => ht = val.parse().unwrap_or(0.0),
@@ -204,7 +207,7 @@ fn parse_merges(xml: &str) -> Vec<(u32, u32, u32, u32)> {
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.name().as_ref().ends_with("mergeCell") => {
                 for a in e.attributes().flatten() {
                     if a.key.as_ref().ends_with("ref") {
-                        let v = a.value.to_string();
+                        let v = crate::model::xml_unescape(&a.value.to_string());
                         if let Some(rect) = parse_range(&v) {
                             out.push(rect);
                         }

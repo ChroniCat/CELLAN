@@ -14,7 +14,7 @@ const COL_W: f32 = 104.0;
 const HEAD_W: f32 = 52.0;
 const HEAD_H: f32 = 22.0;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct EditState {
     buf: String,
 }
@@ -36,6 +36,10 @@ struct SheetApp {
     /// 条件格式对话框输入
     cf_v1: String,
     cf_v2: String,
+    /// 数据验证对话框草稿（Some 时显示）
+    dv_edit: Option<sheetcore::dv::DataValidation>,
+    /// 序列下拉：正在展开的单元格
+    dv_open: Option<(u32, u32)>,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -82,15 +86,37 @@ impl SheetApp {
         let mut app = Self {
             wb: Workbook::new_blank(),
             sheet_idx: 0,
-            sel: (0, 0),
+            sel: {
+                let mut se = (0u32, 0u32);
+                if let Ok(v) = std::env::var("SC_SEL") {
+                    if let Some((a, b)) = v.split_once(',') {
+                        if let (Ok(r), Ok(c)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                            se = (r, c);
+                        }
+                    }
+                }
+                se
+            },
             scroll: Vec2::ZERO,
-            sel_end: (0, 0),
+            sel_end: {
+                let mut se = (0u32, 0u32);
+                if let Ok(v) = std::env::var("SC_SEL") {
+                    if let Some((a, b)) = v.split_once(',') {
+                        if let (Ok(r), Ok(c)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                            se = (r, c);
+                        }
+                    }
+                }
+                se
+            },
             last_view: Vec2::new(800.0, 600.0),
             dump_once: true,
             cf_stats: sheetcore::cf::CfStats::default(),
             cf_stats_gen: u64::MAX,
             cf_v1: "100".into(),
             cf_v2: "0".into(),
+            dv_edit: None,
+            dv_open: None,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -165,7 +191,10 @@ impl SheetApp {
                     self.wb = *wb;
                     self.deps = sheetcore::formula::deps::Deps::empty();
                     self.sheet_idx = 0;
-                    self.sel = (0, 0);
+                    // 调试：SC_SEL=r,c 时保留启动时的选区，便于无界面验证
+                    if std::env::var("SC_SEL").is_err() {
+                        self.sel = (0, 0);
+                    }
                     self.scroll = Vec2::ZERO;
                     self.editing = None;
                     self.doc_gen = 0;
@@ -281,6 +310,39 @@ impl SheetApp {
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) {
         if let Some(ed) = self.editing.take() {
             let (r, c) = self.sel;
+            // 数据验证：不合规就不写入，编辑框留着让用户改（Excel 的「重试」）
+            let mut rejected: Option<String> = None;
+            {
+                let sheet = self.wb.sheet(self.sheet_idx);
+                if let Some(dv) = sheetcore::dv::find(&sheet.dv, r, c) {
+                    let probe = if ed.buf.starts_with('=') {
+                        Value::Text(ed.buf.as_str().into())
+                    } else {
+                        Value::parse_input(&ed.buf)
+                    };
+                    let mut calc = sheetcore::formula::Calc::new(&self.wb);
+                    let ok = sheetcore::dv::validate(dv, &probe, sheet, r, c, |f, rr, cc| {
+                        let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+                        match sheetcore::formula::parse(&shifted) {
+                            Ok(node) => matches!(
+                                calc.eval_node(&node, self.sheet_idx),
+                                sheetcore::formula::FValue::Bool(true)
+                            ),
+                            Err(_) => true,
+                        }
+                    });
+                    if !ok {
+                        rejected = Some(sheetcore::dv::error_text(dv));
+                    }
+                }
+            }
+            if let Some(msg) = rejected {
+                self.status = msg;
+                let mut again = ed.clone();
+                again.buf = ed.buf.clone();
+                self.editing = Some(again);
+                return;
+            }
             let cell = if ed.buf.starts_with('=') {
                 Cell { value: Value::Text(ed.buf.as_str().into()), formula: Some(ed.buf.as_str().into()) }
             } else {
@@ -582,6 +644,10 @@ impl SheetApp {
                 });
             ui.separator();
 
+            // 数据验证
+            self.toolbar_dv(ui);
+            ui.separator();
+
             // 条件格式
             self.toolbar_cf(ui);
             ui.separator();
@@ -819,6 +885,171 @@ impl SheetApp {
         });
     }
 
+
+    /// 数据验证菜单
+    fn toolbar_dv(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("数据验证", |ui| {
+            ui.set_min_width(200.0);
+            if ui.button("设置…").clicked() {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let cur = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, r1, c1).cloned();
+                let mut draft = cur.unwrap_or_default();
+                draft.ranges = vec![(r1, c1, r2, c2)];
+                self.dv_edit = Some(draft);
+                ui.close_menu();
+            }
+            if ui.button("清除所选范围的验证").clicked() {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let sheet = self.wb.sheet_mut(self.sheet_idx);
+                let before = sheet.dv.len();
+                sheet.dv.retain(|d| {
+                    !d.ranges
+                        .iter()
+                        .any(|(a, b, cc, d2)| *a <= r2 && *cc >= r1 && *b <= c2 && *d2 >= c1)
+                });
+                if sheet.dv.len() != before {
+                    sheet.dv_dirty = true;
+                    self.wb.dirty = true;
+                    self.status = "已清除数据验证".into();
+                }
+                ui.close_menu();
+            }
+            ui.separator();
+            let n = self.wb.sheet(self.sheet_idx).dv.len();
+            ui.label(format!("当前工作表 {n} 条验证"));
+        });
+    }
+
+    /// 数据验证对话框
+    fn dv_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.dv_edit.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("数据验证")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("dv_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("允许");
+                    egui::ComboBox::from_id_salt("dv_kind")
+                        .selected_text(draft.kind.label())
+                        .show_ui(ui, |ui| {
+                            for k in [
+                                sheetcore::dv::DvKind::Any,
+                                sheetcore::dv::DvKind::Whole,
+                                sheetcore::dv::DvKind::Decimal,
+                                sheetcore::dv::DvKind::List,
+                                sheetcore::dv::DvKind::Date,
+                                sheetcore::dv::DvKind::Time,
+                                sheetcore::dv::DvKind::TextLength,
+                                sheetcore::dv::DvKind::Custom,
+                            ] {
+                                if ui.selectable_label(draft.kind == k, k.label()).clicked() {
+                                    draft.kind = k;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    if matches!(
+                        draft.kind,
+                        sheetcore::dv::DvKind::Whole
+                            | sheetcore::dv::DvKind::Decimal
+                            | sheetcore::dv::DvKind::Date
+                            | sheetcore::dv::DvKind::Time
+                            | sheetcore::dv::DvKind::TextLength
+                    ) {
+                        ui.label("数据");
+                        egui::ComboBox::from_id_salt("dv_op")
+                            .selected_text(draft.op.label())
+                            .show_ui(ui, |ui| {
+                                for op in [
+                                    sheetcore::dv::DvOp::Between,
+                                    sheetcore::dv::DvOp::NotBetween,
+                                    sheetcore::dv::DvOp::Equal,
+                                    sheetcore::dv::DvOp::NotEqual,
+                                    sheetcore::dv::DvOp::Greater,
+                                    sheetcore::dv::DvOp::Less,
+                                    sheetcore::dv::DvOp::GreaterEq,
+                                    sheetcore::dv::DvOp::LessEq,
+                                ] {
+                                    if ui.selectable_label(draft.op == op, op.label()).clicked() {
+                                        draft.op = op;
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                        ui.label(if draft.op.needs_pair() { "最小值" } else { "值" });
+                        ui.add(egui::TextEdit::singleline(&mut draft.f1).desired_width(160.0));
+                        ui.end_row();
+                        if draft.op.needs_pair() {
+                            ui.label("最大值");
+                            ui.add(egui::TextEdit::singleline(&mut draft.f2).desired_width(160.0));
+                            ui.end_row();
+                        }
+                    } else if draft.kind == sheetcore::dv::DvKind::List {
+                        ui.label("来源");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.f1)
+                                .hint_text("甲,乙,丙 或 $A$1:$A$5")
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut draft.show_dropdown, "显示下拉箭头");
+                        ui.end_row();
+                    } else if draft.kind == sheetcore::dv::DvKind::Custom {
+                        ui.label("公式");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.f1)
+                                .hint_text("例如 MOD(A1,2)=0")
+                                .desired_width(220.0),
+                        );
+                        ui.end_row();
+                    }
+
+                    ui.label("忽略空值");
+                    ui.checkbox(&mut draft.allow_blank, "");
+                    ui.end_row();
+                    ui.label("出错标题");
+                    ui.add(egui::TextEdit::singleline(&mut draft.error_title).desired_width(200.0));
+                    ui.end_row();
+                    ui.label("出错说明");
+                    ui.add(egui::TextEdit::singleline(&mut draft.error_msg).desired_width(200.0));
+                    ui.end_row();
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            let (r1, c1, r2, c2) = (draft.ranges[0].0, draft.ranges[0].1, draft.ranges[0].2, draft.ranges[0].3);
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            sheet.dv.retain(|d| {
+                !d.ranges
+                    .iter()
+                    .any(|(a, b, cc, d2)| *a <= r2 && *cc >= r1 && *b <= c2 && *d2 >= c1)
+            });
+            if draft.kind != sheetcore::dv::DvKind::Any {
+                draft.ranges = vec![(r1, c1, r2, c2)];
+                sheet.dv.push(draft.clone());
+            }
+            sheet.dv_dirty = true;
+            self.wb.dirty = true;
+            self.status = "已设置数据验证".into();
+        } else if !cancel && open {
+            self.dv_edit = Some(draft);
+        }
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -860,7 +1091,7 @@ impl SheetApp {
         let dumping = std::env::var("SC_DUMP").is_ok() && self.dump_once;
         if dumping {
             self.dump_once = false;
-            dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{})", avail, off_x, off_y, first_col, first_row));
+            dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{}) sel={:?} dv={} cf={}", avail, off_x, off_y, first_col, first_row, self.sel, self.wb.sheet(self.sheet_idx).dv.len(), self.wb.sheet(self.sheet_idx).cf.blocks.len()));
         }
 
         let text_color = Color32::from_rgb(24, 24, 24);
@@ -1199,10 +1430,92 @@ impl SheetApp {
             }
         }
 
-        if !dump.is_empty() {
-            if let Ok(path) = std::env::var("SC_DUMP") {
-                let _ = std::fs::write(path, dump.join("
-"));
+        // 序列下拉：选中格有 list 验证时画箭头
+        let sel_dv = {
+            let sheet = self.wb.sheet(self.sheet_idx);
+            sheetcore::dv::find(&sheet.dv, self.sel.0, self.sel.1).cloned()
+        };
+        let mut open_list = false;
+        if let Some(dv) = &sel_dv {
+            if dv.kind == sheetcore::dv::DvKind::List && dv.show_dropdown {
+                let bx = sx + sw - 16.0;
+                let by = sy + sh / 2.0;
+                let btn = Rect::from_center_size(egui::pos2(bx, by), Vec2::new(14.0, 16.0));
+                painter.rect_filled(btn, 2.0, Color32::from_rgb(236, 239, 244));
+                painter.text(
+                    btn.center(),
+                    Align2::CENTER_CENTER,
+                    "▾",
+                    FontId::proportional(11.0),
+                    Color32::from_rgb(70, 70, 70),
+                );
+                if dumping {
+                    dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items(dv, self.wb.sheet(self.sheet_idx)).len()));
+                }
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if btn.contains(pos) {
+                            open_list = true;
+                        }
+                    }
+                }
+            }
+        }
+        if open_list {
+            self.dv_open = Some(self.sel);
+        }
+
+        // 序列下拉列表
+        if let Some((dr, dc)) = self.dv_open {
+            if let Some(dv) = {
+                let sheet = self.wb.sheet(self.sheet_idx);
+                sheetcore::dv::find(&sheet.dv, dr, dc).cloned()
+            } {
+                let items = {
+                    let sheet = self.wb.sheet(self.sheet_idx);
+                    sheetcore::dv::list_items(&dv, sheet)
+                };
+                if !items.is_empty() {
+                    let pos = egui::pos2(gx(dc), gy(dr) + rows.size(dr));
+                    let mut picked: Option<String> = None;
+                    let mut close = false;
+                    egui::Area::new(egui::Id::new("dv_list"))
+                        .fixed_pos(pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(120.0);
+                                for it in items.iter() {
+                                    if ui.button(it).clicked() {
+                                        picked = Some(it.clone());
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(v) = picked {
+                        let cell = Cell {
+                            value: Value::parse_input(&v),
+                            formula: None,
+                        };
+                        let key = (self.sheet_idx, dr, dc);
+                        self.wb.sheet_mut(self.sheet_idx).set(dr, dc, cell.clone());
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.deps.update_cell(&self.wb, key);
+                        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
+                        close = true;
+                    }
+                    if ctx.input(|i| i.pointer.any_click()) && !ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < pos.y + 200.0).unwrap_or(false)) {
+                        close = true;
+                    }
+                    if close {
+                        self.dv_open = None;
+                    }
+                } else {
+                    self.dv_open = None;
+                }
+            } else {
+                self.dv_open = None;
             }
         }
 
@@ -1222,6 +1535,13 @@ impl SheetApp {
                 self.commit_edit(Some((0, 1)));
             } else {
                 self.editing = Some(ed);
+            }
+        }
+
+        if !dump.is_empty() {
+            if let Ok(path) = std::env::var("SC_DUMP") {
+                let _ = std::fs::write(path, dump.join("
+"));
             }
         }
     }
@@ -1428,6 +1748,8 @@ impl eframe::App for SheetApp {
         if self.net.is_some() || self.busy || self.save_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        self.dv_dialog(ctx);
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("打开").clicked() {

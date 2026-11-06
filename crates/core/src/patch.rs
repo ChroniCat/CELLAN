@@ -28,7 +28,7 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
                     let mut rid = String::new();
                     for a in e.attributes().flatten() {
                         let k = a.key.as_ref();
-                        let v = a.value.to_string();
+                        let v = crate::model::xml_unescape(&a.value.to_string());
                         if k.ends_with("name") {
                             name = v;
                         } else if k == "r:id" || k.ends_with(":id") {
@@ -57,7 +57,7 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
                     let mut t = String::new();
                     for a in e.attributes().flatten() {
                         let k = a.key.as_ref();
-                        let v = a.value.to_string();
+                        let v = crate::model::xml_unescape(&a.value.to_string());
                         if k == "Id" {
                             id = v;
                         } else if k == "Target" {
@@ -384,5 +384,159 @@ mod tests {
         assert!(out.contains("FF010203"));
         assert_eq!(out.matches("<dxfs").count(), 1);
         assert!(out.find("<dxfs").unwrap() < out.find("<tableStyles").unwrap());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 数据验证
+// ---------------------------------------------------------------------------
+
+pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
+    use crate::dv::DvKind;
+    let list: Vec<&crate::dv::DataValidation> = list
+        .iter()
+        .filter(|d| d.kind != DvKind::Any && !d.ranges.is_empty())
+        .collect();
+    if list.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("<dataValidations count=\"{}\">", list.len());
+    for d in list {
+        let sqref: Vec<String> = d.ranges.iter().map(range_sqref).collect();
+        out.push_str(&format!(
+            "<dataValidation type=\"{}\" allowBlank=\"{}\" sqref=\"{}\"",
+            d.kind.to_xml(),
+            if d.allow_blank { 1 } else { 0 },
+            sqref.join(" ")
+        ));
+        if d.kind != DvKind::List && d.kind != DvKind::Custom {
+            out.push_str(&format!(" operator=\"{}\"", d.op.to_xml()));
+        }
+        if d.kind == DvKind::List && !d.show_dropdown {
+            // Excel 语义：showDropDown=1 表示隐藏箭头
+            out.push_str(" showDropDown=\"1\"");
+        }
+        if !d.error_title.is_empty() {
+            out.push_str(&format!(" errorTitle=\"{}\"", esc(&d.error_title)));
+        }
+        if !d.error_msg.is_empty() {
+            out.push_str(&format!(" error=\"{}\"", esc(&d.error_msg)));
+        }
+        if !d.prompt_title.is_empty() {
+            out.push_str(&format!(" promptTitle=\"{}\"", esc(&d.prompt_title)));
+        }
+        if !d.prompt_msg.is_empty() {
+            out.push_str(&format!(" prompt=\"{}\"", esc(&d.prompt_msg)));
+        }
+        let f1 = match d.kind {
+            DvKind::List if !d.f1.trim_start().starts_with('"') && !d.f1.contains('!') && !d.f1.contains(':') => {
+                format!("\"{}\"", d.f1)
+            }
+            _ => d.f1.clone(),
+        };
+        out.push_str(&format!(" formula1=\"{}\"", esc(&f1)));
+        if d.op.needs_pair() || (d.kind == DvKind::Custom && !d.f2.is_empty()) {
+            if !d.f2.is_empty() {
+                out.push_str(&format!(" formula2=\"{}\"", esc(&d.f2)));
+            }
+        }
+        out.push_str("/>");
+    }
+    out.push_str("</dataValidations>");
+    out
+}
+
+pub fn strip_dv(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<dataValidations") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("</dataValidations>") {
+            rest = &rest[start + end + "</dataValidations>".len()..];
+        } else if let Some(end) = rest[start..].find("/>") {
+            rest = &rest[start + end + 2..];
+        } else {
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+pub fn insert_dv(xml: &str, dv: &str) -> String {
+    let xml = strip_dv(xml);
+    if dv.is_empty() {
+        return xml;
+    }
+    const ANCHORS: [&str; 8] = [
+        "<hyperlinks",
+        "<printOptions",
+        "<pageMargins",
+        "<pageSetup",
+        "<headerFooter",
+        "<drawing",
+        "<legacyDrawing",
+        "</worksheet>",
+    ];
+    let mut at = xml.len();
+    for a in ANCHORS {
+        if let Some(i) = xml.find(a) {
+            if i < at {
+                at = i;
+            }
+        }
+    }
+    let mut out = String::with_capacity(xml.len() + dv.len());
+    out.push_str(&xml[..at]);
+    out.push_str(dv);
+    out.push_str(&xml[at..]);
+    out
+}
+
+#[cfg(test)]
+mod dv_tests {
+    use super::*;
+    use crate::dv::{DataValidation, DvKind, DvOp};
+
+    #[test]
+    fn writes_and_replaces() {
+        let dv = DataValidation {
+            ranges: vec![(1, 1, 9, 1)],
+            kind: DvKind::List,
+            f1: "甲,乙".into(),
+            ..Default::default()
+        };
+        let xml = dv_xml(&[dv]);
+        assert!(xml.contains("type=\"list\""));
+        assert!(xml.contains("formula1=\"&quot;甲,乙&quot;\""), "{xml}");
+        let sheet = r#"<worksheet><sheetData/></worksheet>"#;
+        let out = insert_dv(sheet, &xml);
+        assert!(out.contains("<dataValidations"));
+        assert!(out.find("<dataValidations").unwrap() < out.find("</worksheet>").unwrap());
+
+        // 再插一次应替换而不是叠加
+        let out2 = insert_dv(&out, &xml);
+        assert_eq!(out2.matches("<dataValidations").count(), 1);
+    }
+
+    #[test]
+    fn whole_with_pair() {
+        let dv = DataValidation {
+            ranges: vec![(0, 0, 0, 0)],
+            kind: DvKind::Whole,
+            op: DvOp::Between,
+            f1: "1".into(),
+            f2: "100".into(),
+            ..Default::default()
+        };
+        let xml = dv_xml(&[dv]);
+        assert!(xml.contains("operator=\"between\""));
+        assert!(xml.contains("formula2=\"100\""));
+    }
+
+    #[test]
+    fn skips_any_kind() {
+        let dv = DataValidation { ranges: vec![(0, 0, 0, 0)], kind: DvKind::Any, ..Default::default() };
+        assert!(dv_xml(&[dv]).is_empty());
     }
 }

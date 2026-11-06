@@ -657,7 +657,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                 } else if name.ends_with("cfRule") {
                     let mut attrs = HashMap::new();
                     for a in e.attributes().flatten() {
-                        attrs.insert(a.key.as_ref().to_string(), a.value.to_string());
+                        attrs.insert(a.key.as_ref().to_string(), crate::model::xml_unescape(&a.value.to_string()));
                     }
                     formulas.clear();
                     scale_colors.clear();
@@ -692,7 +692,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                         let mut is_max = false;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
-                            let v = a.value.to_string();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
                                 val = v.parse::<f64>().ok();
                             } else if k.ends_with("type") {
@@ -728,7 +728,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                         let mut is_edge = false;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
-                            let v = a.value.to_string();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
                                 val = v.parse::<f64>().ok();
                             } else if k.ends_with("type") {
