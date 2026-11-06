@@ -92,6 +92,10 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.dv = lay.dv.clone();
                 sheet.freeze = lay.freeze;
+                sheet.filter = lay.filter.clone();
+                if let Some(f) = &sheet.filter {
+                    sheet.hidden_rows = f.hidden_rows(sheet);
+                }
             }
         }
     }
@@ -297,8 +301,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);
     let any_dv = wb.sheets.iter().any(|s| s.dv_dirty);
     let any_freeze = wb.sheets.iter().any(|s| s.freeze_dirty);
-    if any_cf || any_dv || any_freeze {
-        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze) {
+    let any_filter = wb.sheets.iter().any(|s| s.filter_dirty);
+    if any_cf || any_dv || any_freeze || any_filter {
+        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter) {
             eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
     }
@@ -306,17 +311,40 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 }
 
 /// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
-fn apply_cf_patch(path: &Path, wb: &Workbook, do_cf: bool, do_dv: bool, do_freeze: bool) -> Result<()> {
+fn apply_cf_patch(
+    path: &Path,
+    wb: &Workbook,
+    do_cf: bool,
+    do_dv: bool,
+    do_freeze: bool,
+    do_filter: bool,
+) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     // 先把每张表要写的块算出来
-    let mut per_sheet: std::collections::HashMap<String, (String, String, Option<(u32, u32)>, bool)> =
-        std::collections::HashMap::new();
+    let mut per_sheet: std::collections::HashMap<
+        String,
+        (String, String, Option<(u32, u32)>, bool, String, std::collections::HashSet<u32>, bool),
+    > = std::collections::HashMap::new();
     for sheet in wb.sheets.iter() {
         if let Some(t) = targets.get(&sheet.name) {
             let cf = if do_cf { crate::patch::cf_blocks_xml(&sheet.cf.blocks) } else { String::new() };
             let dv = if do_dv { crate::patch::dv_xml(&sheet.dv) } else { String::new() };
-            if !cf.is_empty() || !dv.is_empty() || sheet.cf_dirty || sheet.dv_dirty || sheet.freeze_dirty {
-                per_sheet.insert(t.clone(), (cf, dv, sheet.freeze, sheet.freeze_dirty));
+            let af = if do_filter {
+                sheet.filter.as_ref().map(crate::patch::auto_filter_xml).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if !cf.is_empty()
+                || !dv.is_empty()
+                || sheet.cf_dirty
+                || sheet.dv_dirty
+                || sheet.freeze_dirty
+                || sheet.filter_dirty
+            {
+                per_sheet.insert(
+                    t.clone(),
+                    (cf, dv, sheet.freeze, sheet.freeze_dirty, af, sheet.hidden_rows.clone(), sheet.filter_dirty),
+                );
             }
         }
     }
@@ -327,7 +355,7 @@ fn apply_cf_patch(path: &Path, wb: &Workbook, do_cf: bool, do_dv: bool, do_freez
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     crate::patch::rewrite_zip(path, |name, buf| {
-        if let Some((blocks, dv, freeze, freeze_dirty)) = per_sheet.get(name) {
+        if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty)) = per_sheet.get(name) {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = xml;
                 if do_cf {
@@ -338,6 +366,10 @@ fn apply_cf_patch(path: &Path, wb: &Workbook, do_cf: bool, do_dv: bool, do_freez
                 }
                 if do_freeze && *freeze_dirty {
                     x = crate::patch::set_freeze_xml(&x, *freeze);
+                }
+                if do_filter && *f_dirty {
+                    x = crate::patch::insert_auto_filter(&x, af);
+                    x = crate::patch::set_hidden_rows(&x, hidden);
                 }
                 return x.into_bytes();
             }

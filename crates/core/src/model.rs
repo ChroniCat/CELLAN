@@ -119,6 +119,12 @@ pub struct Sheet {
     pub freeze: Option<(u32, u32)>,
     /// 冻结设置被改过
     pub freeze_dirty: bool,
+    /// 自动筛选
+    pub filter: Option<crate::sort_filter::Filter>,
+    /// 被筛选隐藏的行（渲染时按高度 0 处理）
+    pub hidden_rows: std::collections::HashSet<u32>,
+    /// 筛选状态被改过
+    pub filter_dirty: bool,
 }
 
 impl Sheet {
@@ -142,6 +148,9 @@ impl Sheet {
             notes_dirty: false,
             freeze: None,
             freeze_dirty: false,
+            filter: None,
+            hidden_rows: std::collections::HashSet::new(),
+            filter_dirty: false,
         }
     }
 

@@ -628,3 +628,164 @@ mod freeze_tests {
         assert!(cleared.contains("<sheetView"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// 自动筛选
+// ---------------------------------------------------------------------------
+
+pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
+    let (r1, c1, r2, c2) = f.range;
+    let mut out = format!(
+        "<autoFilter ref=\"{}{}:{}{}\">",
+        crate::model::col_label(c1),
+        r1 + 1,
+        crate::model::col_label(c2),
+        r2 + 1
+    );
+    let mut cols: Vec<&u32> = f.allows.keys().collect();
+    cols.sort();
+    for col in cols {
+        if *col < c1 || *col > c2 {
+            continue;
+        }
+        let col_id = col - c1;
+        out.push_str(&format!("<filterColumn colId=\"{col_id}\"><filters>"));
+        let mut vals: Vec<&String> = f.allows[col].iter().collect();
+        vals.sort();
+        for v in vals {
+            out.push_str(&format!("<filter val=\"{}\"/>", esc(v)));
+        }
+        out.push_str("</filters></filterColumn>");
+    }
+    out.push_str("</autoFilter>");
+    out
+}
+
+pub fn strip_auto_filter(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find("<autoFilter") {
+        out.push_str(&rest[..i]);
+        if let Some(e) = rest[i..].find("</autoFilter>") {
+            rest = &rest[i + e + "</autoFilter>".len()..];
+        } else if let Some(e) = rest[i..].find("/>") {
+            rest = &rest[i + e + 2..];
+        } else {
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// autoFilter 在 schema 里紧跟 sheetData（在 mergeCells 之前）
+pub fn insert_auto_filter(xml: &str, af: &str) -> String {
+    let xml = strip_auto_filter(xml);
+    if af.is_empty() {
+        return xml;
+    }
+    let mut at = xml.len();
+    for a in [
+        "<mergeCells",
+        "<conditionalFormatting",
+        "<dataValidations",
+        "<hyperlinks",
+        "<pageMargins",
+        "</worksheet>",
+    ] {
+        if let Some(i) = xml.find(a) {
+            if i < at {
+                at = i;
+            }
+        }
+    }
+    let mut out = String::with_capacity(xml.len() + af.len());
+    out.push_str(&xml[..at]);
+    out.push_str(af);
+    out.push_str(&xml[at..]);
+    out
+}
+
+/// 给 <row r="N"> 加/去 hidden 属性
+pub fn set_hidden_rows(xml: &str, hidden: &std::collections::HashSet<u32>) -> String {
+    let mut out = String::with_capacity(xml.len() + hidden.len() * 12);
+    let mut rest = xml;
+    while let Some(i) = rest.find("<row ") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(gt) = tail.find('>') else {
+            out.push_str(tail);
+            return out;
+        };
+        let tag = &tail[..gt];
+        // 取 r 属性
+        let mut row_no = 0u32;
+        if let Some(pos) = tag.find(" r=\"") {
+            let after = &tag[pos + 4..];
+            if let Some(endq) = after.find('"') {
+                row_no = after[..endq].parse().unwrap_or(0);
+            }
+        }
+        let want_hidden = row_no > 0 && hidden.contains(&(row_no - 1));
+        let mut new_tag = String::from(tag);
+        // 先去掉已有的 hidden 属性
+        while let Some(hp) = new_tag.find(" hidden=\"") {
+            if let Some(eq) = new_tag[hp + 9..].find('"') {
+                new_tag.replace_range(hp..hp + 9 + eq + 1, "");
+            } else {
+                break;
+            }
+        }
+        if want_hidden {
+            // 自闭合标签要把属性插在 "/" 前面
+            if new_tag.ends_with('/') {
+                new_tag.pop();
+                new_tag.push_str(" hidden=\"1\"/");
+            } else {
+                new_tag.push_str(" hidden=\"1\"");
+            }
+        }
+        out.push_str(&new_tag);
+        out.push('>');
+        rest = &tail[gt + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn writes_auto_filter() {
+        let mut f = crate::sort_filter::Filter::new(0, 0, 9, 2);
+        let mut allow = HashSet::new();
+        allow.insert("研发".to_string());
+        f.allows.insert(1, allow);
+        let xml = auto_filter_xml(&f);
+        assert!(xml.contains("ref=\"A1:C10\""));
+        assert!(xml.contains("<filterColumn colId=\"1\">"));
+        assert!(xml.contains("<filter val=\"研发\"/>"));
+        let sheet = r#"<worksheet><sheetData/><mergeCells count="0"/></worksheet>"#;
+        let out = insert_auto_filter(sheet, &xml);
+        assert!(out.find("<autoFilter").unwrap() < out.find("<mergeCells").unwrap());
+        assert_eq!(insert_auto_filter(&out, &xml).matches("<autoFilter").count(), 1);
+    }
+
+    #[test]
+    fn toggles_hidden_rows() {
+        let xml = r#"<worksheet><sheetData><row r="1" spans="1:3"><c r="A1"/></row><row r="5" hidden="1"><c r="A5"/></row><row r="7"/></sheetData></worksheet>"#;
+        let mut hidden = HashSet::new();
+        hidden.insert(4u32); // 第 5 行
+        hidden.insert(6u32); // 第 7 行
+        let out = set_hidden_rows(xml, &hidden);
+        assert_eq!(out.matches("hidden=\"1\"").count(), 2, "{out}");
+        assert!(out.contains("<row r=\"7\" hidden=\"1\"/>"));
+        // 清空后应全部去掉 hidden
+        let cleared = set_hidden_rows(&out, &HashSet::new());
+        assert_eq!(cleared.matches("hidden=\"1\"").count(), 0, "{cleared}");
+        assert!(cleared.contains("<row r=\"1\" spans=\"1:3\">"));
+    }
+}

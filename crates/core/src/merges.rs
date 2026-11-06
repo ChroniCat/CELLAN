@@ -24,6 +24,8 @@ pub struct SheetLayout {
     pub dv: Vec<crate::dv::DataValidation>,
     /// 冻结窗格（行, 列），None 表示没冻结
     pub freeze: Option<(u32, u32)>,
+    /// 自动筛选区域 + 每列允许值
+    pub filter: Option<crate::sort_filter::Filter>,
 }
 
 /// 返回 表名 → 版式
@@ -125,6 +127,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || !lay.cf.is_empty()
             || !lay.dv.is_empty()
             || lay.freeze.is_some()
+            || lay.filter.is_some()
         {
             out.insert(name.clone(), lay);
         }
@@ -135,6 +138,10 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 /// 一次扫描拿到合并区域、列宽、行高、冻结窗格
 fn parse_layout(xml: &str) -> SheetLayout {
     let mut out = SheetLayout::default();
+    let mut af_range: Option<(u32, u32, u32, u32)> = None;
+    let mut cur_col: Option<u32> = None;
+    let mut af_allows: std::collections::HashMap<u32, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     let mut freeze_y = 0u32;
     let mut freeze_x = 0u32;
     let mut saw_pane = false;
@@ -197,6 +204,33 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             out.row_heights.push((idx - 1, px));
                         }
                     }
+                } else if name.ends_with("autoFilter") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("ref") {
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if let Some(rect) = crate::cf::parse_sqref(&v).into_iter().next() {
+                                af_range = Some(rect);
+                            }
+                        }
+                    }
+                } else if name.ends_with("filterColumn") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("colId") {
+                            cur_col = crate::model::xml_unescape(&a.value.to_string()).parse().ok();
+                        }
+                    }
+                } else if name == "filter" || name.ends_with(":filter") {
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref().ends_with("val") {
+                                let v = crate::model::xml_unescape(&a.value.to_string());
+                                af_allows
+                                    .entry(range.1 + col)
+                                    .or_default()
+                                    .insert(v);
+                            }
+                        }
+                    }
                 } else if name.ends_with("pane") {
                     let mut x = 0u32;
                     let mut y = 0u32;
@@ -225,6 +259,11 @@ fn parse_layout(xml: &str) -> SheetLayout {
     }
     if saw_pane && (freeze_x > 0 || freeze_y > 0) {
         out.freeze = Some((freeze_y, freeze_x));
+    }
+    if let Some(range) = af_range {
+        let mut f = crate::sort_filter::Filter::new(range.0, range.1, range.2, range.3);
+        f.allows = af_allows;
+        out.filter = Some(f);
     }
     out
 }

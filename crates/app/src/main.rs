@@ -42,6 +42,8 @@ struct SheetApp {
     dv_open: Option<(u32, u32)>,
     /// 批注编辑：(行, 列, 文本)
     note_edit: Option<(u32, u32, String)>,
+    /// 筛选下拉：列号 + 各选项是否勾选
+    filter_popup: Option<(u32, Vec<(String, bool)>)>,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -120,6 +122,7 @@ impl SheetApp {
             dv_edit: None,
             dv_open: None,
             note_edit: None,
+            filter_popup: None,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -375,10 +378,17 @@ impl SheetApp {
     /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
     fn ensure_visible(&mut self) {
         let (r, c) = self.sel;
-        let (cols, rows) = {
+        let (cols, mut rows) = {
             let s = self.wb.sheet(self.sheet_idx);
             (s.cols.clone(), s.rows.clone())
         };
+        // 被筛选隐藏的行 = 行高 0（和 Excel 一样，不是删数据）
+        {
+            let s = self.wb.sheet(self.sheet_idx);
+            for r in s.hidden_rows.iter() {
+                rows.set(*r, 0.0);
+            }
+        }
         let view_w = (self.last_view.x - HEAD_W).max(64.0);
         let view_h = (self.last_view.y - HEAD_H).max(44.0);
         let top = rows.pos(r);
@@ -645,6 +655,10 @@ impl SheetApp {
                         self.outer_border(3, [0, 0, 0]);
                     }
                 });
+            ui.separator();
+
+            // 数据（排序筛选）
+            self.toolbar_data(ui);
             ui.separator();
 
             // 视图（冻结窗格）
@@ -1311,6 +1325,157 @@ impl SheetApp {
         };
     }
 
+
+    /// 数据菜单：排序与筛选
+    fn toolbar_data(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("数据", |ui| {
+            ui.set_min_width(200.0);
+            let (r, c) = self.sel;
+            if ui.button("升序排序").clicked() {
+                self.do_sort(c, true);
+                ui.close_menu();
+            }
+            if ui.button("降序排序").clicked() {
+                self.do_sort(c, false);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("筛选（当前区域）").clicked() {
+                self.start_filter();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.wb.sheet(self.sheet_idx).filter.is_some(),
+                    egui::Button::new("清除筛选"),
+                )
+                .clicked()
+            {
+                let sheet = self.wb.sheet_mut(self.sheet_idx);
+                sheet.filter = None;
+                sheet.hidden_rows.clear();
+                sheet.filter_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已清除筛选".into();
+                ui.close_menu();
+            }
+            ui.separator();
+            let n = match self.wb.sheet(self.sheet_idx).filter.as_ref() {
+                Some(f) => {
+                    let (a, b, c2, d) = f.range;
+                    format!(
+                        "筛选区域 {}-{}，隐藏 {} 行",
+                        format!("{}{}", cell_name(a, b), ""),
+                        format!("{}{}", cell_name(c2, d), ""),
+                        self.wb.sheet(self.sheet_idx).hidden_rows.len()
+                    )
+                }
+                None => "未启用筛选".into(),
+            };
+            ui.label(n);
+        });
+    }
+
+    fn do_sort(&mut self, col: u32, asc: bool) {
+        let (r, c) = self.sel;
+        let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+        let res = sheetcore::sort_filter::sort_region(
+            self.wb.sheet_mut(self.sheet_idx),
+            (r1, c1, r2, c2),
+            col,
+            asc,
+        );
+        match res {
+            Ok(()) => {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已按 {} 列{}排序", cell_name(0, col), if asc { "升序" } else { "降序" });
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn start_filter(&mut self) {
+        let (r, c) = self.sel;
+        let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+        if r2 <= r1 {
+            self.status = "区域太小，无法筛选".into();
+            return;
+        }
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        sheet.filter = Some(sheetcore::sort_filter::Filter::new(r1, c1, r2, c2));
+        sheet.filter_dirty = true;
+        self.wb.dirty = true;
+        self.status = "已启用筛选：点表头的箭头选择要显示的值".into();
+    }
+
+    /// 表头筛选下拉
+    fn filter_dialog(&mut self, ctx: &egui::Context) {
+        let Some((col, mut items)) = self.filter_popup.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new(format!("筛选 {} 列", cell_name(0, col)))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(220.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("全选").clicked() {
+                        for it in items.iter_mut() {
+                            it.1 = true;
+                        }
+                    }
+                    if ui.small_button("全不选").clicked() {
+                        for it in items.iter_mut() {
+                            it.1 = false;
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    for it in items.iter_mut() {
+                        ui.checkbox(&mut it.1, if it.0.is_empty() { "（空白）" } else { it.0.as_str() });
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            let allowed: std::collections::HashSet<String> =
+                items.iter().filter(|(_, on)| *on).map(|(v, _)| v.clone()).collect();
+            // 先改规则，再（不可变借用下）重算隐藏行，最后写回
+            if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
+                f.allows.insert(col, allowed.clone());
+            }
+            let hidden = {
+                let sheet = self.wb.sheet(self.sheet_idx);
+                sheet
+                    .filter
+                    .as_ref()
+                    .map(|f| f.hidden_rows(sheet))
+                    .unwrap_or_default()
+            };
+            {
+                let sheet = self.wb.sheet_mut(self.sheet_idx);
+                sheet.hidden_rows = hidden;
+                sheet.filter_dirty = true;
+            }
+            self.wb.dirty = true;
+            self.status = format!("{} 列已筛选", cell_name(0, col));
+        } else if !cancel && open {
+            self.filter_popup = Some((col, items));
+        }
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -1325,10 +1490,17 @@ impl SheetApp {
         }
 
         // 版式快照：列宽/行高随文件而变，位置不能再按「等宽 × 索引」算
-        let (cols, rows) = {
+        let (cols, mut rows) = {
             let s = self.wb.sheet(self.sheet_idx);
             (s.cols.clone(), s.rows.clone())
         };
+        // 被筛选隐藏的行 = 行高 0（和 Excel 一样，不是删数据）
+        {
+            let s = self.wb.sheet(self.sheet_idx);
+            for r in s.hidden_rows.iter() {
+                rows.set(*r, 0.0);
+            }
+        }
         let max_x = (cols.pos(16_384) - avail.x).max(0.0);
         let max_y = (rows.pos(1_048_576) - avail.y).max(0.0);
         self.scroll.x = self.scroll.x.clamp(0.0, max_x);
@@ -1447,6 +1619,10 @@ impl SheetApp {
             guard += 1;
             let y = gy(r);
             let h = rows.size(r);
+            if h < 1.0 {
+                r += 1;
+                continue;
+            }
             if y + h > origin.y + HEAD_H {
                 painter.text(
                     egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
@@ -1512,12 +1688,17 @@ impl SheetApp {
         // 单元格
         let merges = self.wb.sheet(self.sheet_idx).merges.clone();
         let notes = self.wb.sheet(self.sheet_idx).notes.clone();
+        let mut pending_filter: Option<(u32, Vec<(String, bool)>)> = None;
         let mut r = first_row;
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
             guard += 1;
             let y = gy(r);
             let rh = rows.size(r);
+            if rh < 1.0 {
+                r += 1;
+                continue;
+            }
             if y + rh < origin.y + HEAD_H {
                 r += 1;
                 continue;
@@ -1556,9 +1737,51 @@ impl SheetApp {
                     dumping,
                     &mut dump,
                 );
+                // 筛选区域表头上的下拉箭头
+                if let Some(f) = self.wb.sheet(self.sheet_idx).filter.clone() {
+                    let (fr1, fc1, _, fc2) = f.range;
+                    if r == fr1 && c >= fc1 && c <= fc2 {
+                        let btn = Rect::from_center_size(
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            Vec2::new(14.0, 14.0),
+                        );
+                        painter.rect_filled(btn, 2.0, Color32::from_rgb(236, 239, 244));
+                        painter.text(
+                            btn.center(),
+                            Align2::CENTER_CENTER,
+                            "▾",
+                            FontId::proportional(10.0),
+                            Color32::from_rgb(70, 70, 70),
+                        );
+                        if dumping {
+                            dump.push(format!("filter-arrow ({},{})", r, c));
+                        }
+                        if resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                if btn.contains(pos) {
+                                    let sheet = self.wb.sheet(self.sheet_idx);
+                                    let vals = sheetcore::sort_filter::unique_values(sheet, f.range, c);
+                                    let allowed = f.allows.get(&c).cloned();
+                                    let items: Vec<(String, bool)> = vals
+                                        .into_iter()
+                                        .map(|v| {
+                                            let on = allowed.as_ref().map(|a| a.contains(&v)).unwrap_or(true);
+                                            (v, on)
+                                        })
+                                        .collect();
+                                    pending_filter = Some((c, items));
+                                }
+                            }
+                        }
+                    }
+                }
                 c += 1;
             }
             r += 1;
+        }
+
+        if let Some(pf) = pending_filter.take() {
+            self.filter_popup = Some(pf);
         }
 
         // 冻结区单元格（覆盖在主体之上）
@@ -1583,7 +1806,7 @@ impl SheetApp {
                     g += 1;
                     let y = gy(rr);
                     let h = rows.size(rr);
-                    if y + h > origin.y + HEAD_H {
+                    if h >= 1.0 && y + h > origin.y + HEAD_H {
                         for cc in 0..fx {
                             let rect = Rect::from_min_size(
                                 egui::pos2(origin.x + HEAD_W + cols.pos(cc), y),
@@ -2143,6 +2366,7 @@ impl eframe::App for SheetApp {
         }
         self.dv_dialog(ctx);
         self.note_dialog(ctx);
+        self.filter_dialog(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
