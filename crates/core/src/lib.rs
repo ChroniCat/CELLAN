@@ -1,5 +1,7 @@
 pub mod formula;
 pub mod cf;
+pub mod chart_write;
+pub mod charts;
 pub mod dv;
 pub mod layout;
 pub mod merges;

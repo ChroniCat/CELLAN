@@ -129,6 +129,8 @@ pub struct Sheet {
     pub page: crate::page::PageSetup,
     /// 页面设置被改过
     pub page_dirty: bool,
+    /// 图表（只读展示，原样保留）
+    pub charts: Vec<crate::charts::Chart>,
 }
 
 impl Sheet {
@@ -157,6 +159,7 @@ impl Sheet {
             filter_dirty: false,
             page: crate::page::PageSetup::default(),
             page_dirty: false,
+            charts: Vec::new(),
         }
     }
 

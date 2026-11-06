@@ -2,6 +2,8 @@ mod files;
 mod net;
 
 use eframe::egui;
+
+mod chart_view;
 use files::FileTree;
 use sheetcore::sync::{Cursor, Peer};
 use egui::{Align2, Color32, FontId, Key, Rect, Sense, Stroke, Vec2};
@@ -658,6 +660,17 @@ impl SheetApp {
                         self.outer_border(3, [0, 0, 0]);
                     }
                 });
+            ui.separator();
+
+            // 插入
+            ui.menu_button("插入", |ui| {
+                ui.set_min_width(150.0);
+                if ui.button("柱状图（按选区）").clicked() {
+                    self.insert_chart_from_selection();
+                    ui.close_menu();
+                }
+                ui.label(egui::RichText::new("首行=系列名，首列=分类").weak());
+            });
             ui.separator();
 
             // 页面布局
@@ -1586,6 +1599,41 @@ impl SheetApp {
         });
     }
 
+    /// 用选区插入一张柱状图（首行标题、首列分类），写进文件后重新读图表
+    fn insert_chart_from_selection(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if r2 <= r1 || c2 <= c1 {
+            self.status = "先选中一块数据（首行为系列名，首列为分类）".into();
+            return;
+        }
+        let Some(path) = self.wb.path.clone() else {
+            self.status = "请先保存文件再插入图表".into();
+            return;
+        };
+        let name = self.wb.sheet(self.sheet_idx).name.clone();
+        let ch = sheetcore::chart_write::chart_from_selection(
+            self.wb.sheet(self.sheet_idx),
+            &name,
+            (r1, c1, r2, c2),
+            "图表",
+        );
+        if let Err(e) = sheetcore::xlsx::save(&path, &self.wb) {
+            self.status = format!("保存失败：{e}");
+            return;
+        }
+        match sheetcore::chart_write::insert_chart(&path, &name, &ch) {
+            Ok(()) => {
+                if let Ok(all) = sheetcore::charts::load_charts_all(&path, &self.wb.sheets) {
+                    for (idx, sh) in self.wb.sheets.iter_mut().enumerate() {
+                        sh.charts = all.get(&(idx as u32)).cloned().unwrap_or_default();
+                    }
+                }
+                self.status = format!("已插入图表（{} 个系列）", ch.series.len());
+            }
+            Err(e) => self.status = format!("插入图表失败：{e}"),
+        }
+    }
+
     fn set_page<F: Fn(&mut sheetcore::page::PageSetup)>(&mut self, f: F) {
         let sheet = self.wb.sheet_mut(self.sheet_idx);
         f(&mut sheet.page);
@@ -1660,7 +1708,9 @@ impl SheetApp {
         };
 
         let mut dump: Vec<String> = Vec::new();
-        let dumping = std::env::var("SC_DUMP").is_ok() && self.dump_once;
+        let dumping = std::env::var("SC_DUMP").is_ok()
+            && self.dump_once
+            && self.wb.sheets.iter().any(|s| s.len() > 0);
         if dumping {
             self.dump_once = false;
             dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{}) sel={:?} dv={} cf={}", avail, off_x, off_y, first_col, first_row, self.sel, self.wb.sheet(self.sheet_idx).dv.len(), self.wb.sheet(self.sheet_idx).cf.blocks.len()));
@@ -2015,6 +2065,29 @@ impl SheetApp {
             }
             if dumping {
                 dump.push(format!("freeze rows={fy} cols={fx} body=({:.0},{:.0})", body_x, body_y));
+            }
+        }
+
+        // 图表（浮在单元格之上）
+        let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+        for ch in charts.iter() {
+            let (r1, c1, r2, c2) = ch.anchor;
+            let top_left = egui::pos2(px_of(c1), py_of(r1));
+            let bottom_right = egui::pos2(px_of(c2), py_of(r2));
+            let rect = egui::Rect::from_min_max(top_left, bottom_right);
+            let clip = egui::Rect::from_min_max(
+                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + avail.x, origin.y + avail.y),
+            );
+            if rect.intersects(clip) {
+                let p2 = painter.with_clip_rect(clip);
+                chart_view::paint_chart(&p2, rect, ch);
+                if dumping {
+                    dump.push(format!(
+                        "chart {:?} 标题={:?} 系列={} 锚点=({},{},{},{})",
+                        ch.kind, ch.title, ch.series.len(), r1, c1, r2, c2
+                    ));
+                }
             }
         }
 

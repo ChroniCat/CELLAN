@@ -128,6 +128,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    // 图表
+    if let Ok(all) = crate::charts::load_charts_all(path, &wb.sheets) {
+        for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+            if let Some(list) = all.get(&(idx as u32)) {
+                sheet.charts = list.clone();
+            }
+        }
+    }
+
     // 批注
     if let Ok(all) = crate::notes::load_notes(path) {
         for sheet in wb.sheets.iter_mut() {
