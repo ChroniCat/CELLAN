@@ -88,6 +88,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 for (r, h) in lay.row_heights.iter() {
                     sheet.rows.set(*r, *h);
                 }
+                sheet.cf.blocks = lay.cf.clone();
+                sheet.cf.dxfs = lay.dxfs.clone();
             }
         }
     }
@@ -256,6 +258,46 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         eprintln!("  [save] 序列化+压缩 {:.2}s", t_write.elapsed().as_secs_f64());
     }
     out?;
+
+    // umya 不管条件格式的 dxf 细节，保存完直接补 XML
+    let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);
+    if any_cf {
+        if let Err(e) = apply_cf_patch(path, wb) {
+            eprintln!("[save] 条件格式补丁失败: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
+fn apply_cf_patch(path: &Path, wb: &Workbook) -> Result<()> {
+    let targets = crate::patch::sheet_targets(path)?;
+    // 先把每张表要写的块算出来
+    let mut per_sheet: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for sheet in wb.sheets.iter() {
+        if let Some(t) = targets.get(&sheet.name) {
+            per_sheet.insert(t.clone(), crate::patch::cf_blocks_xml(&sheet.cf.blocks));
+        }
+    }
+    let dxfs: Vec<crate::cf::Dxf> = wb
+        .sheets
+        .iter()
+        .find(|s| s.cf_dirty)
+        .map(|s| s.cf.dxfs.clone())
+        .unwrap_or_default();
+    crate::patch::rewrite_zip(path, |name, buf| {
+        if let Some(blocks) = per_sheet.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return crate::patch::insert_cf(&xml, blocks).into_bytes();
+            }
+        }
+        if name == "xl/styles.xml" {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return crate::patch::replace_dxfs(&xml, &dxfs).into_bytes();
+            }
+        }
+        buf
+    })?;
     Ok(())
 }
 

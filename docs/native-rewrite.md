@@ -59,6 +59,27 @@
 
 
 
+
+### v1.8 条件格式 ✅ 2026-11-06
+
+`crates/core/src/cf.rs`（模型 + 解析 + 求值）、`crates/core/src/patch.rs`（保存时补 XML）。
+
+- 读：`<conditionalFormatting>` + `styles.xml` 的 `<dxfs>`。支持比较类、包含文本、
+  重复/唯一值、前/后 N 项、高于/低于平均值、公式规则、色阶、数据条。
+- 算：`overlay_at()` 按块求叠加（填充/字色/加粗/数据条比例），色阶按块内 min/max 插值；
+  公式规则的相对引用按**块左上角**平移（Excel 语义），走完整公式引擎。
+- 画：填充画在底色之上、文字之下；数据条按比例画半透明条；字色/加粗按叠加生效。
+- 改：工具栏「条件格式」菜单——大于/小于/等于/介于、前后 10 项、平均值、数据条 4 色、
+  色阶 3 套、清除所选范围。
+- 存：umya 的 dxfId 处理不可靠，改成保存后重写 zip：
+  剥掉原有 `<conditionalFormatting>` 再按 schema 顺序插回（mergeCells 之后、dataValidations 之前），
+  同时整体替换 `styles.xml` 的 `<dxfs>`，索引对得上。
+
+**验证**：`cf.xlsx`（openpyxl 生成：大于100红底、三色色阶、数据条、包含"急"黄底）。
+无界面几何导出显示：B3=180 命中 `#FFC7CE`、B5=320 数据条宽度 104px（满格）、
+C2/C3/C4 色阶分别取红/插值黄/绿、D3/D4 命中黄底、D2/D5 不命中。
+改完保存后 openpyxl 复核：5 条规则全在，新增的 containsText 规则 dxfId=2 正确。
+
 ### v1.7 列宽行高 + 格式工具栏 + 边框 ✅ 2026-11-06
 
 **列宽行高**（`crates/core/src/layout.rs`）

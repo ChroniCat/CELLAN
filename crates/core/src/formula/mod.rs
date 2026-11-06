@@ -1815,6 +1815,11 @@ pub fn prof_dump() -> Vec<(String, u64, f64)> {
     })
 }
 
+/// 供条件格式解析 DATE(y,m,d) 用
+pub fn date_to_serial_pub(y: i32, m: u32, d: u32) -> Option<f64> {
+    functions::date_to_serial(y, m, d)
+}
+
 /// 供样式模块格式化日期
 pub fn serial_to_date_pub(serial: f64) -> Option<(i32, u32, u32)> {
     functions::serial_to_date(serial)

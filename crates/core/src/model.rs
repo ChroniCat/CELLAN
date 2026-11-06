@@ -103,6 +103,10 @@ pub struct Sheet {
     pub style_edits: std::collections::HashSet<CellRef>,
     /// 合并区域被改过，保存时要同步
     pub merges_dirty: bool,
+    /// 条件格式
+    pub cf: crate::cf::CfSheet,
+    /// 条件格式被改过，保存时要同步
+    pub cf_dirty: bool,
 }
 
 impl Sheet {
@@ -118,6 +122,8 @@ impl Sheet {
             styles: HashMap::new(),
             style_edits: std::collections::HashSet::new(),
             merges_dirty: false,
+            cf: crate::cf::CfSheet::default(),
+            cf_dirty: false,
         }
     }
 

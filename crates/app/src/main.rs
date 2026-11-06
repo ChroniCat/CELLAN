@@ -30,6 +30,12 @@ struct SheetApp {
     last_view: Vec2,
     /// 只 dump 一帧
     dump_once: bool,
+    /// 条件格式统计缓存（按 doc_gen 失效）
+    cf_stats: sheetcore::cf::CfStats,
+    cf_stats_gen: u64,
+    /// 条件格式对话框输入
+    cf_v1: String,
+    cf_v2: String,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -81,6 +87,10 @@ impl SheetApp {
             sel_end: (0, 0),
             last_view: Vec2::new(800.0, 600.0),
             dump_once: true,
+            cf_stats: sheetcore::cf::CfStats::default(),
+            cf_stats_gen: u64::MAX,
+            cf_v1: "100".into(),
+            cf_v2: "0".into(),
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -572,6 +582,10 @@ impl SheetApp {
                 });
             ui.separator();
 
+            // 条件格式
+            self.toolbar_cf(ui);
+            ui.separator();
+
             // 合并
             let (r1, c1, r2, c2) = self.sel_rect();
             let multi = r1 != r2 || c1 != c2;
@@ -600,6 +614,208 @@ impl SheetApp {
                 ui.separator();
                 ui.weak(format!("选中 {n} 格"));
             }
+        });
+    }
+
+
+    /// 取（或新建）一个 dxf 索引；所有表保持同一份 dxfs，保证索引一致
+    fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
+        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill };
+        let mut idx = None;
+        if let Some(s0) = self.wb.sheets.first() {
+            if let Some(i) = s0.cf.dxfs.iter().position(|d| *d == want) {
+                idx = Some(i);
+            }
+        }
+        match idx {
+            Some(i) => i,
+            None => {
+                let i = self.wb.sheets.first().map(|s| s.cf.dxfs.len()).unwrap_or(0);
+                for sh in self.wb.sheets.iter_mut() {
+                    sh.cf.dxfs.push(want.clone());
+                }
+                i
+            }
+        }
+    }
+
+    /// 给选区加一条条件格式规则
+    fn add_cf(&mut self, kind: sheetcore::cf::CfKind) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        sheet.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(r1, c1, r2, c2)],
+            rules: vec![sheetcore::cf::CfRule { kind, stop: false }],
+        });
+        sheet.cf_dirty = true;
+        self.wb.dirty = true;
+        self.cf_stats_gen = u64::MAX;
+        self.status = "已添加条件格式".into();
+    }
+
+    /// 清除与选区相交的条件格式
+    fn clear_cf(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        let before = sheet.cf.blocks.len();
+        sheet.cf.blocks.retain(|b| {
+            !b.ranges
+                .iter()
+                .any(|(a, bb, cc, d)| *a <= r2 && *cc >= r1 && *bb <= c2 && *d >= c1)
+        });
+        if sheet.cf.blocks.len() != before {
+            sheet.cf_dirty = true;
+            self.wb.dirty = true;
+            self.cf_stats_gen = u64::MAX;
+            self.status = "已清除所选范围的条件格式".into();
+        } else {
+            self.status = "所选范围没有条件格式".into();
+        }
+    }
+
+    /// 条件格式菜单
+    fn toolbar_cf(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("条件格式", |ui| {
+            ui.set_min_width(260.0);
+            ui.menu_button("突出显示单元格规则", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("大于");
+                    ui.add(egui::TextEdit::singleline(&mut self.cf_v1).desired_width(60.0));
+                    if ui.button("应用").clicked() {
+                        let v = self.cf_v1.clone();
+                        let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                        self.add_cf(sheetcore::cf::CfKind::CellIs {
+                            op: sheetcore::cf::CfOp::Greater,
+                            a: v,
+                            b: String::new(),
+                            dxf: d,
+                        });
+                        ui.close_menu();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("小于");
+                    ui.add(egui::TextEdit::singleline(&mut self.cf_v1).desired_width(60.0));
+                    if ui.button("应用").clicked() {
+                        let v = self.cf_v1.clone();
+                        let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                        self.add_cf(sheetcore::cf::CfKind::CellIs {
+                            op: sheetcore::cf::CfOp::Less,
+                            a: v,
+                            b: String::new(),
+                            dxf: d,
+                        });
+                        ui.close_menu();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("等于");
+                    ui.add(egui::TextEdit::singleline(&mut self.cf_v1).desired_width(60.0));
+                    if ui.button("应用").clicked() {
+                        let v = self.cf_v1.clone();
+                        let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                        self.add_cf(sheetcore::cf::CfKind::CellIs {
+                            op: sheetcore::cf::CfOp::Equal,
+                            a: v,
+                            b: String::new(),
+                            dxf: d,
+                        });
+                        ui.close_menu();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("介于");
+                    ui.add(egui::TextEdit::singleline(&mut self.cf_v1).desired_width(50.0));
+                    ui.label("与");
+                    ui.add(egui::TextEdit::singleline(&mut self.cf_v2).desired_width(50.0));
+                    if ui.button("应用").clicked() {
+                        let (a, b) = (self.cf_v1.clone(), self.cf_v2.clone());
+                        let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                        self.add_cf(sheetcore::cf::CfKind::CellIs {
+                            op: sheetcore::cf::CfOp::Between,
+                            a,
+                            b,
+                            dxf: d,
+                        });
+                        ui.close_menu();
+                    }
+                });
+            });
+            ui.menu_button("项目选取规则", |ui| {
+                if ui.button("前 10 项").clicked() {
+                    let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                    self.add_cf(sheetcore::cf::CfKind::Top { top: true, n: 10, percent: false, dxf: d });
+                    ui.close_menu();
+                }
+                if ui.button("后 10 项").clicked() {
+                    let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                    self.add_cf(sheetcore::cf::CfKind::Top { top: false, n: 10, percent: false, dxf: d });
+                    ui.close_menu();
+                }
+                if ui.button("高于平均值").clicked() {
+                    let d = self.cf_dxf(false, Some([0, 97, 0]), Some([198, 239, 206]));
+                    self.add_cf(sheetcore::cf::CfKind::Avg { above: true, dxf: d });
+                    ui.close_menu();
+                }
+                if ui.button("低于平均值").clicked() {
+                    let d = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+                    self.add_cf(sheetcore::cf::CfKind::Avg { above: false, dxf: d });
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("数据条", |ui| {
+                for (label, rgb) in [
+                    ("蓝色", [99u8, 142u8, 198u8]),
+                    ("绿色", [99, 190, 123]),
+                    ("红色", [248, 105, 107]),
+                    ("橙色", [255, 166, 76]),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.add_cf(sheetcore::cf::CfKind::Bar { color: rgb });
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("色阶", |ui| {
+                if ui.button("绿-黄-红").clicked() {
+                    self.add_cf(sheetcore::cf::CfKind::Scale {
+                        points: vec![
+                            (None, [99, 190, 123]),
+                            (Some(50.0), [255, 235, 132]),
+                            (None, [248, 105, 107]),
+                        ],
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("红-黄-绿").clicked() {
+                    self.add_cf(sheetcore::cf::CfKind::Scale {
+                        points: vec![
+                            (None, [248, 105, 107]),
+                            (Some(50.0), [255, 235, 132]),
+                            (None, [99, 190, 123]),
+                        ],
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("蓝-白-红").clicked() {
+                    self.add_cf(sheetcore::cf::CfKind::Scale {
+                        points: vec![
+                            (None, [93, 135, 202]),
+                            (Some(50.0), [255, 255, 255]),
+                            (None, [248, 105, 107]),
+                        ],
+                    });
+                    ui.close_menu();
+                }
+            });
+            ui.separator();
+            if ui.button("清除所选范围的条件格式").clicked() {
+                self.clear_cf();
+                ui.close_menu();
+            }
+            ui.separator();
+            let n = self.wb.sheet(self.sheet_idx).cf.blocks.len();
+            ui.label(format!("当前工作表有 {n} 条规则"));
         });
     }
 
@@ -702,6 +918,52 @@ impl SheetApp {
             r += 1;
         }
 
+        // 条件格式叠加（只算可视范围）
+        let si = self.sheet_idx;
+        if self.cf_stats_gen != self.doc_gen {
+            let mut st = sheetcore::cf::CfStats::default();
+            {
+                let sheet = self.wb.sheet(si);
+                sheetcore::cf::compute_stats(&sheet.cf, sheet, &mut st);
+            }
+            self.cf_stats = st;
+            self.cf_stats_gen = self.doc_gen;
+        }
+        let mut cf_map: std::collections::HashMap<(u32, u32), sheetcore::cf::Overlay> =
+            std::collections::HashMap::new();
+        if !self.wb.sheet(si).cf.blocks.is_empty() {
+            let sheet = self.wb.sheet(si);
+            let stats = &self.cf_stats;
+            let cf = &sheet.cf;
+            let mut calc = sheetcore::formula::Calc::new(&self.wb);
+            let mut rr = first_row;
+            let mut g1 = 0;
+            while g1 < 200 {
+                g1 += 1;
+                let mut cc = first_col;
+                let mut g2 = 0;
+                while g2 < 60 {
+                    g2 += 1;
+                    let ov = sheetcore::cf::overlay_at(cf, stats, sheet, rr, cc, |f, r0, c0| {
+                        let shifted =
+                            sheetcore::cf::shift_formula(f.trim_start_matches('='), r0, c0);
+                        match sheetcore::formula::parse(&shifted) {
+                            Ok(node) => matches!(
+                                calc.eval_node(&node, si),
+                                sheetcore::formula::FValue::Bool(true)
+                            ),
+                            Err(_) => false,
+                        }
+                    });
+                    if !ov.is_empty() {
+                        cf_map.insert((rr, cc), ov);
+                    }
+                    cc += 1;
+                }
+                rr += 1;
+            }
+        }
+
         // 单元格
         let merges = self.wb.sheet(self.sheet_idx).merges.clone();
         let mut r = first_row;
@@ -750,12 +1012,42 @@ impl SheetApp {
                         dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
                     }
                 }
+                // 条件格式：填充、数据条（画在文字下面）
+                let ov = cf_map.get(&(r, c));
+                if let Some(ov) = ov {
+                    if let Some(f) = ov.fill {
+                        painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
+                        if dumping {
+                            dump.push(format!("cf-fill ({},{}) rgb={:?}", r, c, f));
+                        }
+                    }
+                    if let Some((t, col)) = ov.bar {
+                        let w = (rect.width() * t).max(0.0);
+                        if w > 0.5 {
+                            painter.rect_filled(
+                                Rect::from_min_size(rect.min, Vec2::new(w, rect.height())),
+                                0.0,
+                                Color32::from_rgba_unmultiplied(col[0], col[1], col[2], 150),
+                            );
+                            if dumping {
+                                dump.push(format!("cf-bar ({},{}) w={:.0} rgb={:?}", r, c, w, col));
+                            }
+                        }
+                    }
+                }
                 if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
                     let txt = sheetcore::style::format_value(&cell.value, &st.format);
                     if !txt.is_empty() {
                         let is_num = matches!(cell.value, Value::Number(_));
-                        let font = FontId::proportional(if st.bold { st.size + 0.6 } else { st.size });
-                        let color = Color32::from_rgb(st.color[0], st.color[1], st.color[2]);
+                        let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
+                        let base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
+                        let font = FontId::proportional(if st.bold || cf_bold {
+                            st.size + 0.6
+                        } else {
+                            st.size
+                        });
+                        let color =
+                            Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
                         let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
                             Align2::CENTER_CENTER
                         } else if st.halign == 3 || (st.halign == 0 && is_num) {
@@ -777,7 +1069,7 @@ impl SheetApp {
                         };
                         painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
                         if dumping {
-                            dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, st.color, st.size));
+                            dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
                         }
                     }
                 }

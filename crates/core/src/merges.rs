@@ -16,6 +16,10 @@ pub struct SheetLayout {
     pub col_widths: Vec<(u32, f32)>,
     /// 行号（0-based）→ 像素高
     pub row_heights: Vec<(u32, f32)>,
+    /// 条件格式
+    pub cf: Vec<crate::cf::CfBlock>,
+    /// 差异格式表
+    pub dxfs: Vec<crate::cf::Dxf>,
 }
 
 /// 返回 表名 → 版式
@@ -85,6 +89,14 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         }
     }
 
+    // dxf 格式表（styles.xml，全局一份，挂到每张表上）
+    let mut dxfs: Vec<crate::cf::Dxf> = Vec::new();
+    if let Ok(mut f) = zip.by_name("xl/styles.xml") {
+        let mut xml = String::new();
+        let _ = f.read_to_string(&mut xml);
+        dxfs = crate::cf::parse_dxfs(&xml);
+    }
+
     let mut out: HashMap<String, SheetLayout> = HashMap::new();
     for (idx, (name, rid)) in order.iter().enumerate() {
         let target = targets
@@ -99,8 +111,10 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         let Ok(mut f) = zip.by_name(&entry) else { continue };
         let mut xml = String::new();
         let _ = f.read_to_string(&mut xml);
-        let lay = parse_layout(&xml);
-        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() {
+        let mut lay = parse_layout(&xml);
+        lay.cf = crate::cf::parse_cf_blocks(&xml);
+        lay.dxfs = dxfs.clone();
+        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() || !lay.cf.is_empty() {
             out.insert(name.clone(), lay);
         }
     }
