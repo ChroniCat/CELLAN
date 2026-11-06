@@ -8,8 +8,18 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-/// 返回 表名 → [(r1, c1, r2, c2)]
-pub fn load_merges(path: &Path) -> Result<HashMap<String, Vec<(u32, u32, u32, u32)>>> {
+/// 一张表除单元格之外的版式信息
+#[derive(Default, Clone, Debug)]
+pub struct SheetLayout {
+    pub merges: Vec<(u32, u32, u32, u32)>,
+    /// 列号（0-based）→ 像素宽
+    pub col_widths: Vec<(u32, f32)>,
+    /// 行号（0-based）→ 像素高
+    pub row_heights: Vec<(u32, f32)>,
+}
+
+/// 返回 表名 → 版式
+pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
     let file = std::fs::File::open(path).with_context(|| format!("打开 {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("不是有效的 xlsx（zip 打不开）")?;
 
@@ -75,7 +85,7 @@ pub fn load_merges(path: &Path) -> Result<HashMap<String, Vec<(u32, u32, u32, u3
         }
     }
 
-    let mut out: HashMap<String, Vec<(u32, u32, u32, u32)>> = HashMap::new();
+    let mut out: HashMap<String, SheetLayout> = HashMap::new();
     for (idx, (name, rid)) in order.iter().enumerate() {
         let target = targets
             .get(rid)
@@ -89,12 +99,87 @@ pub fn load_merges(path: &Path) -> Result<HashMap<String, Vec<(u32, u32, u32, u3
         let Ok(mut f) = zip.by_name(&entry) else { continue };
         let mut xml = String::new();
         let _ = f.read_to_string(&mut xml);
-        let merges = parse_merges(&xml);
-        if !merges.is_empty() {
-            out.insert(name.clone(), merges);
+        let lay = parse_layout(&xml);
+        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() {
+            out.insert(name.clone(), lay);
         }
     }
     Ok(out)
+}
+
+/// 一次扫描拿到合并区域、列宽、行高
+fn parse_layout(xml: &str) -> SheetLayout {
+    let mut out = SheetLayout::default();
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
+                let name = e.name();
+                let name = name.as_ref();
+                if name.ends_with("mergeCell") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("ref") {
+                            if let Some(rect) = parse_range(&a.value) {
+                                out.merges.push(rect);
+                            }
+                        }
+                    }
+                } else if name.ends_with("col") {
+                    // <col min="1" max="3" width="16.7" customWidth="1"/>
+                    let mut min = 0u32;
+                    let mut max = 0u32;
+                    let mut width = 0f32;
+                    let mut custom = false;
+                    for a in e.attributes().flatten() {
+                        let key = a.key.as_ref();
+                        let val = a.value.to_string();
+                        match key {
+                            k if k.ends_with("min") => min = val.parse().unwrap_or(0),
+                            k if k.ends_with("max") => max = val.parse().unwrap_or(0),
+                            k if k.ends_with("width") => width = val.parse().unwrap_or(0.0),
+                            k if k.ends_with("customWidth") => custom = val == "1" || val == "true",
+                            _ => {}
+                        }
+                    }
+                    // Excel 默认列宽 8.43 字符；没写 customWidth 又是默认宽的，不必记
+                    let is_default = (width - 8.43).abs() < 0.05;
+                    if min >= 1 && max >= min && width > 0.0 && (custom || !is_default) {
+                        let px = crate::layout::excel_width_to_px(width);
+                        if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
+                            for c in (min - 1)..max {
+                                out.col_widths.push((c, px));
+                            }
+                        }
+                    }
+                } else if name.ends_with("row") {
+                    // <row r="1" ht="30" customHeight="1">
+                    let mut idx = 0u32;
+                    let mut ht = 0f32;
+                    let mut custom = false;
+                    for a in e.attributes().flatten() {
+                        let key = a.key.as_ref();
+                        let val = a.value.to_string();
+                        match key {
+                            "r" => idx = val.parse().unwrap_or(0),
+                            "ht" => ht = val.parse().unwrap_or(0.0),
+                            "customHeight" => custom = val == "1" || val == "true",
+                            _ => {}
+                        }
+                    }
+                    if idx >= 1 && ht > 0.0 && custom {
+                        let px = crate::layout::pt_to_px(ht);
+                        if (px - crate::layout::DEFAULT_ROW_H).abs() > 0.5 {
+                            out.row_heights.push((idx - 1, px));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 fn parse_merges(xml: &str) -> Vec<(u32, u32, u32, u32)> {
@@ -159,6 +244,17 @@ mod tests {
         assert_eq!(parse_range("C3:C10"), Some((2, 2, 9, 2)));
         assert_eq!(parse_range("$AA$1:$AB$5"), Some((0, 26, 4, 27)));
         assert_eq!(parse_range("bad"), None);
+    }
+
+    #[test]
+    fn parses_cols_and_rows() {
+        let xml = r#"<worksheet><cols><col min="1" max="3" width="16.0" customWidth="1"/><col min="5" max="5" width="8.43"/></cols><sheetData><row r="2" ht="30" customHeight="1"><c r="A2" s="1"/></row></sheetData></worksheet>"#;
+        let lay = parse_layout(xml);
+        assert_eq!(lay.col_widths.len(), 3, "第 1-3 列应为自定义宽度");
+        assert_eq!(lay.col_widths[0].0, 0);
+        assert!((lay.col_widths[0].1 - 117.0).abs() < 1.0);
+        assert_eq!(lay.row_heights, vec![(1, 40.0)]);
+        assert!(lay.merges.is_empty());
     }
 
     #[test]

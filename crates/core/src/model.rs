@@ -93,8 +93,16 @@ pub struct Sheet {
     pub spilled: std::collections::HashSet<CellRef>,
     /// 合并单元格区域 (r1, c1, r2, c2)
     pub merges: Vec<(u32, u32, u32, u32)>,
+    /// 列宽（只有被设置过的列才有条目）
+    pub cols: crate::layout::Axis,
+    /// 行高
+    pub rows: crate::layout::Axis,
     /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
     pub styles: HashMap<CellRef, u16>,
+    /// 用户改过样式的格子（保存时只需要回写这些，不必重写整表样式）
+    pub style_edits: std::collections::HashSet<CellRef>,
+    /// 合并区域被改过，保存时要同步
+    pub merges_dirty: bool,
 }
 
 impl Sheet {
@@ -105,7 +113,11 @@ impl Sheet {
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
             merges: Vec::new(),
+            cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
+            rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
             styles: HashMap::new(),
+            style_edits: std::collections::HashSet::new(),
+            merges_dirty: false,
         }
     }
 
@@ -166,12 +178,51 @@ impl Sheet {
         self.styles.get(&CellRef::new(r, c)).copied().unwrap_or(0)
     }
 
+    /// 用户改样式（标记脏，保存时回写）
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
         let key = CellRef::new(r, c);
         if id == 0 {
             self.styles.remove(&key);
         } else {
             self.styles.insert(key, id);
+        }
+        self.style_edits.insert(key);
+    }
+
+    /// 从文件载入样式（不算用户修改）
+    pub fn set_style_loaded(&mut self, r: u32, c: u32, id: u16) {
+        let key = CellRef::new(r, c);
+        if id == 0 {
+            self.styles.remove(&key);
+        } else {
+            self.styles.insert(key, id);
+        }
+    }
+
+    /// 合并一个矩形区域（与区域内已有合并冲突的先拆掉）
+    pub fn merge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        if r1 == r2 && c1 == c2 {
+            return;
+        }
+        // 拆掉所有与新区域相交的旧合并
+        self.merges
+            .retain(|(a, b, cc, d)| *a > r2 || *cc < r1 || *b > c2 || *d < c1);
+        self.merges.push((r1, c1, r2, c2));
+        self.merges.sort();
+        self.merges_dirty = true;
+    }
+
+    /// 拆掉与给定区域相交的所有合并
+    pub fn unmerge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        let before = self.merges.len();
+        self.merges
+            .retain(|(a, b, cc, d)| *a > r2 || *cc < r1 || *b > c2 || *d < c1);
+        if self.merges.len() != before {
+            self.merges_dirty = true;
         }
     }
 

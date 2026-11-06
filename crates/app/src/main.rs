@@ -24,6 +24,12 @@ struct SheetApp {
     sheet_idx: usize,
     sel: (u32, u32), // row, col
     scroll: Vec2,
+    /// 选区右下角（拖选/Shift 点选用；普通点击时等于 sel）
+    sel_end: (u32, u32),
+    /// 上一帧表格可视尺寸，供 ensure_visible 用
+    last_view: Vec2,
+    /// 只 dump 一帧
+    dump_once: bool,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -72,6 +78,9 @@ impl SheetApp {
             sheet_idx: 0,
             sel: (0, 0),
             scroll: Vec2::ZERO,
+            sel_end: (0, 0),
+            last_view: Vec2::new(800.0, 600.0),
+            dump_once: true,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -288,22 +297,28 @@ impl SheetApp {
         }
     }
 
-    /// 让选区留在可视范围内
+    /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
     fn ensure_visible(&mut self) {
         let (r, c) = self.sel;
-        let top = (self.scroll.y / ROW_H) as u32;
-        let left = (self.scroll.x / COL_W) as u32;
-        let rows_on_screen = 30u32;
-        let cols_on_screen = 10u32;
-        if r < top {
-            self.scroll.y = r as f32 * ROW_H;
-        } else if r >= top + rows_on_screen {
-            self.scroll.y = (r + 1 - rows_on_screen) as f32 * ROW_H;
+        let (cols, rows) = {
+            let s = self.wb.sheet(self.sheet_idx);
+            (s.cols.clone(), s.rows.clone())
+        };
+        let view_w = (self.last_view.x - HEAD_W).max(64.0);
+        let view_h = (self.last_view.y - HEAD_H).max(44.0);
+        let top = rows.pos(r);
+        let bot = top + rows.size(r);
+        if top < self.scroll.y {
+            self.scroll.y = top;
+        } else if bot > self.scroll.y + view_h {
+            self.scroll.y = bot - view_h;
         }
-        if c < left {
-            self.scroll.x = c as f32 * COL_W;
-        } else if c >= left + cols_on_screen {
-            self.scroll.x = (c + 1 - cols_on_screen) as f32 * COL_W;
+        let left = cols.pos(c);
+        let right = left + cols.size(c);
+        if left < self.scroll.x {
+            self.scroll.x = left;
+        } else if right > self.scroll.x + view_w {
+            self.scroll.x = right - view_w;
         }
     }
 
@@ -373,29 +388,264 @@ impl SheetApp {
     }
 
     /// 画表格：行列标题、单元格、选区、远端光标
+
+    /// 规范化后的选区 (r1, c1, r2, c2)
+    fn sel_rect(&self) -> (u32, u32, u32, u32) {
+        let (r1, r2) = (self.sel.0.min(self.sel_end.0), self.sel.0.max(self.sel_end.0));
+        let (c1, c2) = (self.sel.1.min(self.sel_end.1), self.sel.1.max(self.sel_end.1));
+        (r1, c1, r2, c2)
+    }
+
+    /// 选区左上角的样式（工具栏按钮显示当前状态）
+    fn current_style(&self) -> sheetcore::style::CellStyle {
+        let id = self.wb.sheet(self.sheet_idx).style_of(self.sel.0, self.sel.1);
+        self.wb.styles.get(id).clone()
+    }
+
+    /// 对选区每个格子套用样式改动；只影响显示，不触发重算
+    fn apply_style<F: Fn(&mut sheetcore::style::CellStyle)>(&mut self, f: F) {
+        self.apply_style_xy(move |st, _r, _c| f(st));
+    }
+
+    /// 同上，但闭包能拿到格子坐标（画边框要用）
+    fn apply_style_xy<F: Fn(&mut sheetcore::style::CellStyle, u32, u32)>(&mut self, f: F) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+            self.status = "选区太大（超过 20 万格），不给整块刷格式".into();
+            return;
+        }
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                let old = self.wb.sheet(self.sheet_idx).style_of(r, c);
+                let mut st = self.wb.styles.get(old).clone();
+                f(&mut st, r, c);
+                let id = self.wb.styles.intern(st);
+                self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
+            }
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+    }
+
+    /// 只给选区外沿加边框（内部各格不重复画）
+    fn outer_border(&mut self, style: u8, color: [u8; 3]) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        self.apply_style_xy(move |st, r, c| {
+            let mut b = st.border;
+            // 左 右 上 下
+            if c == c1 {
+                b[0] = sheetcore::style::Border { style, color };
+            }
+            if c == c2 {
+                b[1] = sheetcore::style::Border { style, color };
+            }
+            if r == r1 {
+                b[2] = sheetcore::style::Border { style, color };
+            }
+            if r == r2 {
+                b[3] = sheetcore::style::Border { style, color };
+            }
+            st.border = b;
+        });
+    }
+
+    fn toggle_merge(&mut self, on: bool) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        {
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            if on {
+                sheet.merge_range(r1, c1, r2, c2);
+            } else {
+                sheet.unmerge_range(r1, c1, r2, c2);
+            }
+        }
+        self.wb.dirty = true;
+        self.status = if on { "已合并选区".into() } else { "已取消合并".into() };
+    }
+
+    /// 格式工具栏（第二行）
+    fn toolbar_format(&mut self, ui: &mut egui::Ui) {
+        let cur = self.current_style();
+        ui.horizontal_wrapped(|ui| {
+            // 加粗 / 斜体
+            if ui
+                .selectable_label(cur.bold, egui::RichText::new("B").strong())
+                .on_hover_text("加粗")
+                .clicked()
+            {
+                let v = !cur.bold;
+                self.apply_style(move |s| s.bold = v);
+            }
+            if ui
+                .selectable_label(cur.italic, egui::RichText::new("I").italics())
+                .on_hover_text("斜体")
+                .clicked()
+            {
+                let v = !cur.italic;
+                self.apply_style(move |s| s.italic = v);
+            }
+            ui.separator();
+
+            // 字号
+            let mut size = cur.size;
+            ui.label("字号");
+            if ui
+                .add(egui::DragValue::new(&mut size).speed(0.5).range(6.0..=72.0))
+                .changed()
+            {
+                self.apply_style(move |s| s.size = size);
+            }
+            ui.separator();
+
+            // 字色
+            let mut fg = cur.color;
+            if ui.color_edit_button_srgb(&mut fg).on_hover_text("字体颜色").changed() {
+                self.apply_style(move |s| s.color = fg);
+            }
+            // 填充色（None 时用白色占位，点"无填充"清掉）
+            let mut bg = cur.fill.unwrap_or([255, 255, 255]);
+            if ui
+                .color_edit_button_srgb(&mut bg)
+                .on_hover_text("填充颜色")
+                .changed()
+            {
+                self.apply_style(move |s| s.fill = Some(bg));
+            }
+            if ui.small_button("无填充").clicked() {
+                self.apply_style(|s| s.fill = None);
+            }
+            ui.separator();
+
+            // 对齐
+            for (label, val, tip) in [("左", 1u8, "左对齐"), ("中", 2, "居中"), ("右", 3, "右对齐")] {
+                if ui.selectable_label(cur.halign == val, label).on_hover_text(tip).clicked() {
+                    self.apply_style(move |s| s.halign = val);
+                }
+            }
+            ui.separator();
+
+            // 数字格式
+            let fmt_label = match cur.format.as_str() {
+                "" => "常规",
+                "#,##0.00" => "数值",
+                "¥#,##0.00" => "货币",
+                "0.0%" => "百分比",
+                "yyyy-mm-dd" => "日期",
+                other => other,
+            };
+            egui::ComboBox::from_id_salt("numfmt")
+                .selected_text(fmt_label.to_string())
+                .width(84.0)
+                .show_ui(ui, |ui| {
+                    for (label, code) in [
+                        ("常规", ""),
+                        ("数值", "#,##0.00"),
+                        ("货币", "¥#,##0.00"),
+                        ("百分比", "0.0%"),
+                        ("日期", "yyyy-mm-dd"),
+                    ] {
+                        if ui.selectable_label(cur.format == code, label).clicked() {
+                            let c = code.to_string();
+                            self.apply_style(move |s| s.format = c.clone());
+                        }
+                    }
+                });
+            ui.separator();
+
+            // 边框
+            egui::ComboBox::from_id_salt("borders")
+                .selected_text("边框")
+                .width(64.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(false, "无边框").clicked() {
+                        self.apply_style(|s| s.clear_borders());
+                    }
+                    if ui.selectable_label(false, "全部框线").clicked() {
+                        self.apply_style(|s| s.set_all_borders(1, [128, 128, 128]));
+                    }
+                    if ui.selectable_label(false, "外边框").clicked() {
+                        self.outer_border(1, [0, 0, 0]);
+                    }
+                    if ui.selectable_label(false, "粗外框").clicked() {
+                        self.outer_border(3, [0, 0, 0]);
+                    }
+                });
+            ui.separator();
+
+            // 合并
+            let (r1, c1, r2, c2) = self.sel_rect();
+            let multi = r1 != r2 || c1 != c2;
+            let merged = self
+                .wb
+                .sheet(self.sheet_idx)
+                .merge_at(r1, c1)
+                .is_some();
+            if ui
+                .add_enabled(multi, egui::Button::new("合并"))
+                .on_hover_text("合并选中区域")
+                .clicked()
+            {
+                self.toggle_merge(true);
+            }
+            if ui
+                .add_enabled(merged, egui::Button::new("拆分"))
+                .on_hover_text("取消合并")
+                .clicked()
+            {
+                self.toggle_merge(false);
+            }
+
+            if multi {
+                let n = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+                ui.separator();
+                ui.weak(format!("选中 {n} 格"));
+            }
+        });
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
+        self.last_view = avail;
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let origin = resp.rect.min;
         painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
-
-        let grid_w = HEAD_W + avail.x;
-        let grid_h = HEAD_H + avail.y;
 
         // 滚轮
         if resp.hovered() {
             let d = ui.input(|i| i.raw_scroll_delta);
             self.scroll -= d;
         }
-        self.scroll.x = self.scroll.x.clamp(0.0, 4000.0 * COL_W);
-        self.scroll.y = self.scroll.y.clamp(0.0, 1_048_576.0 * ROW_H);
 
-        let first_col = (self.scroll.x / COL_W).floor().max(0.0) as u32;
-        let first_row = (self.scroll.y / ROW_H).floor().max(0.0) as u32;
-        let off_x = first_col as f32 * COL_W - self.scroll.x;
-        let off_y = first_row as f32 * ROW_H - self.scroll.y;
-        let n_cols = ((avail.x - HEAD_W) / COL_W).ceil().max(1.0) as u32 + 1;
-        let n_rows = ((avail.y - HEAD_H) / ROW_H).ceil().max(1.0) as u32 + 1;
+        // 版式快照：列宽/行高随文件而变，位置不能再按「等宽 × 索引」算
+        let (cols, rows) = {
+            let s = self.wb.sheet(self.sheet_idx);
+            (s.cols.clone(), s.rows.clone())
+        };
+        let max_x = (cols.pos(16_384) - avail.x).max(0.0);
+        let max_y = (rows.pos(1_048_576) - avail.y).max(0.0);
+        self.scroll.x = self.scroll.x.clamp(0.0, max_x);
+        self.scroll.y = self.scroll.y.clamp(0.0, max_y);
+
+        let (off_x, off_y) = (self.scroll.x, self.scroll.y);
+        let first_col = cols.index_at(off_x);
+        let first_row = rows.index_at(off_y);
+        if std::env::var("SC_DBG_GRID").is_ok() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 || n % 120 == 0 {
+                eprintln!("[grid] f={n} avail={:?} scroll={:?} cols.custom={} rows.custom={} first=({},{})",
+                    avail, (off_x, off_y), cols.len(), rows.len(), first_col, first_row);
+            }
+        }
+        let gx = |c: u32| origin.x + HEAD_W + cols.pos(c) - off_x;
+        let gy = |r: u32| origin.y + HEAD_H + rows.pos(r) - off_y;
+
+        let mut dump: Vec<String> = Vec::new();
+        let dumping = std::env::var("SC_DUMP").is_ok() && self.dump_once;
+        if dumping {
+            self.dump_once = false;
+            dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{})", avail, off_x, off_y, first_col, first_row));
+        }
 
         let text_color = Color32::from_rgb(24, 24, 24);
         let grid_line = Color32::from_rgb(228, 228, 228);
@@ -407,79 +657,98 @@ impl SheetApp {
             0.0,
             head_bg,
         );
-        for i in 0..n_cols {
-            let c = first_col + i;
-            let x = origin.x + HEAD_W + off_x + i as f32 * COL_W;
-            if x + COL_W < origin.x {
-                continue;
+        let mut c = first_col;
+        let mut guard = 0;
+        while gx(c) < origin.x + avail.x && guard < 4096 {
+            guard += 1;
+            let x = gx(c);
+            let w = cols.size(c);
+            if x + w > origin.x + HEAD_W {
+                painter.text(
+                    egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
+                    Align2::CENTER_CENTER,
+                    col_label(c),
+                    FontId::proportional(12.0),
+                    Color32::from_rgb(90, 90, 90),
+                );
+                painter.line_segment(
+                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
+                    Stroke::new(1.0, grid_line),
+                );
             }
-            painter.text(
-                egui::pos2(x + COL_W / 2.0, origin.y + HEAD_H / 2.0),
-                Align2::CENTER_CENTER,
-                col_label(c),
-                FontId::proportional(12.0),
-                Color32::from_rgb(90, 90, 90),
-            );
-            painter.line_segment(
-                [egui::pos2(x, origin.y), egui::pos2(x, origin.y + grid_h)],
-                Stroke::new(1.0, grid_line),
-            );
+            c += 1;
         }
 
         // 行标题
-        for i in 0..n_rows {
-            let r = first_row + i;
-            let y = origin.y + HEAD_H + off_y + i as f32 * ROW_H;
-            if y + ROW_H > origin.y + HEAD_H {
+        let mut r = first_row;
+        guard = 0;
+        while gy(r) < origin.y + avail.y && guard < 8192 {
+            guard += 1;
+            let y = gy(r);
+            let h = rows.size(r);
+            if y + h > origin.y + HEAD_H {
                 painter.text(
-                    egui::pos2(origin.x + HEAD_W / 2.0, y + ROW_H / 2.0),
+                    egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
                     FontId::proportional(12.0),
                     Color32::from_rgb(90, 90, 90),
                 );
+                painter.line_segment(
+                    [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
+                    Stroke::new(1.0, grid_line),
+                );
             }
-            painter.line_segment(
-                [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
-                Stroke::new(1.0, grid_line),
-            );
+            r += 1;
         }
 
-        // 单元格（不长期持有表引用，避免和后面的可变借用冲突）
+        // 单元格
         let merges = self.wb.sheet(self.sheet_idx).merges.clone();
-        for i in 0..n_rows {
-            let r = first_row + i;
-            let y = origin.y + HEAD_H + off_y + i as f32 * ROW_H;
-            if y + ROW_H < origin.y + HEAD_H || y > origin.y + avail.y {
+        let mut r = first_row;
+        guard = 0;
+        while gy(r) < origin.y + avail.y && guard < 8192 {
+            guard += 1;
+            let y = gy(r);
+            let rh = rows.size(r);
+            if y + rh < origin.y + HEAD_H {
+                r += 1;
                 continue;
             }
-            for j in 0..n_cols {
-                let c = first_col + j;
-                let x = origin.x + HEAD_W + off_x + j as f32 * COL_W;
-                if x + COL_W < origin.x + HEAD_W || x > origin.x + avail.x {
+            let mut c = first_col;
+            let mut cguard = 0;
+            while gx(c) < origin.x + avail.x && cguard < 4096 {
+                cguard += 1;
+                let x = gx(c);
+                let cw = cols.size(c);
+                if x + cw < origin.x + HEAD_W {
+                    c += 1;
                     continue;
                 }
-                let mut rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(COL_W, ROW_H));
-                // 合并区域：只画左上角那格，整块按合并尺寸绘制
+                let mut rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(cw, rh));
+                // 合并区域：只画左上角，整块按合并尺寸绘制
                 let merge = merges
                     .iter()
                     .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
                     .copied();
                 if let Some((mr1, mc1, mr2, mc2)) = merge {
                     if (r, c) != (mr1, mc1) {
+                        c += 1;
                         continue;
                     }
-                    rect.set_width(COL_W * (mc2 - mc1 + 1) as f32);
-                    rect.set_height(ROW_H * (mr2 - mr1 + 1) as f32);
+                    rect.set_width((cols.pos(mc2 + 1) - cols.pos(mc1)).max(cw));
+                    rect.set_height((rows.pos(mr2 + 1) - rows.pos(mr1)).max(rh));
                 }
                 let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
                 let st = self.wb.styles.get(sid);
-                // 选中底色先画，单元格自带填充后画（否则会把真实颜色染偏）
+                // 选中底色先画，自带填充后画（否则会把真实颜色染偏）
                 if self.sel == (r, c) && st.fill.is_none() {
                     painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(26, 115, 232, 40));
                 }
                 if let Some(fill) = st.fill {
                     painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
+                    if dumping {
+                        dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
+                    }
                 }
                 if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
                     let txt = sheetcore::style::format_value(&cell.value, &st.format);
@@ -506,10 +775,47 @@ impl SheetApp {
                         } else {
                             rect.center().y
                         };
-                        painter.text(egui::pos2(tx, ty), align, txt, font, color);
+                        painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
+                        if dumping {
+                            dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, st.color, st.size));
+                        }
                     }
                 }
+                // 边框（合并区域按整块画）
+                let bd = &st.border;
+                if bd[0].style != 0 || bd[1].style != 0 || bd[2].style != 0 || bd[3].style != 0 {
+                    let (l, t, rr, bb) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+                    if dumping {
+                        dump.push(format!("border ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) 左{:?} 右{:?} 上{:?} 下{:?}", r, c, l, t, rr, bb, bd[0].style, bd[1].style, bd[2].style, bd[3].style));
+                    }
+                    draw_edge(&painter, egui::pos2(l, t), egui::pos2(l, bb), &bd[0]);
+                    draw_edge(&painter, egui::pos2(rr, t), egui::pos2(rr, bb), &bd[1]);
+                    draw_edge(&painter, egui::pos2(l, t), egui::pos2(rr, t), &bd[2]);
+                    draw_edge(&painter, egui::pos2(l, bb), egui::pos2(rr, bb), &bd[3]);
+                }
+                c += 1;
             }
+            r += 1;
+        }
+
+        // 框选范围底色
+        let (qr1, qc1, qr2, qc2) = self.sel_rect();
+        if (qr1, qc1) != (qr2, qc2) {
+            let x0 = gx(qc1);
+            let y0 = gy(qr1);
+            let w = cols.pos(qc2 + 1) - cols.pos(qc1);
+            let h = rows.pos(qr2 + 1) - rows.pos(qr1);
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
+                0.0,
+                Color32::from_rgba_unmultiplied(26, 115, 232, 28),
+            );
+            painter.rect_stroke(
+                Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
+                0.0,
+                Stroke::new(1.5, Color32::from_rgb(26, 115, 232)),
+                egui::StrokeKind::Inside,
+            );
         }
 
         // 选区边框（合并区域按整块画）
@@ -518,11 +824,11 @@ impl SheetApp {
             .find(|(r1, c1, r2, c2)| self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2)
             .copied()
             .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
-        let sx = origin.x + HEAD_W + off_x + (sc1 - first_col) as f32 * COL_W;
-        let sy = origin.y + HEAD_H + off_y + (sr1 - first_row) as f32 * ROW_H;
-        let sw = COL_W * (sc2 - sc1 + 1) as f32;
-        let sh = ROW_H * (sr2 - sr1 + 1) as f32;
-        if sx >= origin.x + HEAD_W - COL_W && sy >= origin.y + HEAD_H - ROW_H {
+        let sx = gx(sc1);
+        let sy = gy(sr1);
+        let sw = cols.pos(sc2 + 1) - cols.pos(sc1);
+        let sh = rows.pos(sr2 + 1) - rows.pos(sr1);
+        if sx + sw > origin.x + HEAD_W && sy + sh > origin.y + HEAD_H {
             painter.rect_stroke(
                 Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(sw, sh)),
                 0.0,
@@ -532,12 +838,15 @@ impl SheetApp {
         }
 
         // 远端光标
-        for (name, color, r, c) in self.remote.values() {
-            if *r < first_row || *c < first_col {
+        for (name, color, rr, cc) in self.remote.values() {
+            let x = gx(*cc);
+            let y = gy(*rr);
+            if x + cols.size(*cc) < origin.x + HEAD_W || y + rows.size(*rr) < origin.y + HEAD_H {
                 continue;
             }
-            let x = origin.x + HEAD_W + off_x + (*c - first_col) as f32 * COL_W;
-            let y = origin.y + HEAD_H + off_y + (*r - first_row) as f32 * ROW_H;
+            if x > origin.x + avail.x || y > origin.y + avail.y {
+                continue;
+            }
             let col = match color % 7 {
                 0 => Color32::from_rgb(230, 81, 0),
                 1 => Color32::from_rgb(0, 121, 107),
@@ -548,7 +857,7 @@ impl SheetApp {
                 _ => Color32::from_rgb(255, 143, 0),
             };
             painter.rect_stroke(
-                Rect::from_min_size(egui::pos2(x, y), Vec2::new(COL_W, ROW_H)),
+                Rect::from_min_size(egui::pos2(x, y), Vec2::new(cols.size(*cc), rows.size(*rr))),
                 0.0,
                 Stroke::new(2.0, col),
                 egui::StrokeKind::Inside,
@@ -562,14 +871,27 @@ impl SheetApp {
             );
         }
 
+        // 拖拽框选
+        if resp.dragged() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let dx = pos.x - (origin.x + HEAD_W);
+                let dy = pos.y - (origin.y + HEAD_H);
+                if dx >= 0.0 && dy >= 0.0 {
+                    let c = cols.index_at(off_x + dx);
+                    let r = rows.index_at(off_y + dy);
+                    self.sel_end = (r, c);
+                }
+            }
+        }
+
         // 点击选中
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let dx = pos.x - (origin.x + HEAD_W + off_x);
-                let dy = pos.y - (origin.y + HEAD_H + off_y);
+                let dx = pos.x - (origin.x + HEAD_W);
+                let dy = pos.y - (origin.y + HEAD_H);
                 if dx >= 0.0 && dy >= 0.0 {
-                    let c = first_col + (dx / COL_W).floor() as u32;
-                    let r = first_row + (dy / ROW_H).floor() as u32;
+                    let c = cols.index_at(off_x + dx);
+                    let r = rows.index_at(off_y + dy);
                     if self.editing.is_some() {
                         self.commit_edit(None);
                     }
@@ -580,13 +902,24 @@ impl SheetApp {
                         Some((mr1, mc1, _, _)) => (*mr1, *mc1),
                         None => (r, c),
                     };
+                    self.sel_end = self.sel;
                 }
+            }
+        }
+
+        if !dump.is_empty() {
+            if let Ok(path) = std::env::var("SC_DUMP") {
+                let _ = std::fs::write(path, dump.join("
+"));
             }
         }
 
         // 编辑框
         if let Some(mut ed) = self.editing.take() {
-            let rect = Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(COL_W.max(160.0), ROW_H));
+            let rect = Rect::from_min_size(
+                egui::pos2(sx, sy),
+                Vec2::new(sw.max(160.0), sh.max(rows.size(sr1))),
+            );
             let out = ui.put(rect, egui::TextEdit::singleline(&mut ed.buf));
             out.request_focus();
             if ctx.input(|i| i.key_pressed(Key::Enter)) {
@@ -844,6 +1177,7 @@ impl eframe::App for SheetApp {
                 ui.separator();
                 ui.label(self.status.clone());
             });
+            self.toolbar_format(ui);
         });
 
         egui::TopBottomPanel::top("formula").show(ctx, |ui| {
@@ -992,4 +1326,39 @@ fn main() -> eframe::Result<()> {
             })
         },
     )
+}
+
+/// 画一条边框线（支持双线/虚线/点线）
+fn draw_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, bd: &sheetcore::style::Border) {
+    if bd.style == 0 {
+        return;
+    }
+    let color = egui::Color32::from_rgb(bd.color[0], bd.color[1], bd.color[2]);
+    let w = bd.px().max(0.8);
+    let len = (b - a).length();
+    if len < 0.5 {
+        return;
+    }
+    match bd.style {
+        4 => {
+            // 双线：两条细线
+            let off = egui::vec2(0.0, 1.2);
+            painter.line_segment([a - off, b - off], egui::Stroke::new(1.0, color));
+            painter.line_segment([a + off, b + off], egui::Stroke::new(1.0, color));
+        }
+        5 | 6 => {
+            // 虚线/点线：等距短段（返回 ()，与其它分支一致）
+            let (dash, gap) = if bd.style == 5 { (4.0, 3.0) } else { (1.5, 2.5) };
+            let dir = (b - a) / len;
+            let mut t = 0.0;
+            while t < len {
+                let e = (t + dash).min(len);
+                painter.line_segment([a + dir * t, a + dir * e], egui::Stroke::new(w, color));
+                t = e + gap;
+            }
+        }
+        _ => {
+            painter.line_segment([a, b], egui::Stroke::new(w, color));
+        }
+    }
 }

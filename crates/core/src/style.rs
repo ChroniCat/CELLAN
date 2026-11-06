@@ -6,6 +6,30 @@
 
 use std::collections::HashMap;
 
+/// 一条边：0 无，1 细，2 中，3 粗，4 双线，5 虚线，6 点线
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub struct Border {
+    pub style: u8,
+    pub color: [u8; 3],
+}
+
+impl Border {
+    pub fn is_none(&self) -> bool {
+        self.style == 0
+    }
+    pub fn px(&self) -> f32 {
+        match self.style {
+            1 => 1.0,
+            2 => 1.6,
+            3 => 2.4,
+            4 => 1.0,
+            5 => 1.0,
+            6 => 1.0,
+            _ => 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CellStyle {
     pub bold: bool,
@@ -22,11 +46,26 @@ pub struct CellStyle {
     pub wrap: bool,
     /// 数字格式代码，空串表示常规
     pub format: String,
+    /// 左、右、上、下
+    pub border: [Border; 4],
 }
 
 impl CellStyle {
     pub fn default_dark() -> Self {
         Self { size: 11.0, color: [0, 0, 0], ..Default::default() }
+    }
+}
+
+impl CellStyle {
+    pub fn set_all_borders(&mut self, style: u8, color: [u8; 3]) {
+        for b in self.border.iter_mut() {
+            *b = Border { style, color };
+        }
+    }
+    pub fn clear_borders(&mut self) {
+        for b in self.border.iter_mut() {
+            *b = Border::default();
+        }
     }
 }
 
@@ -48,6 +87,7 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.valign.hash(&mut h);
     s.wrap.hash(&mut h);
     s.format.hash(&mut h);
+    s.border.hash(&mut h);
     h.finish()
 }
 

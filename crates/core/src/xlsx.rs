@@ -50,7 +50,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 let cs = convert_style(style);
                 let id = wb.styles.intern(cs);
                 if id != 0 {
-                    sheet.set_style(row, col, id);
+                    sheet.set_style_loaded(row, col, id);
                 }
             }
         }
@@ -78,10 +78,16 @@ pub fn load(path: &Path) -> Result<Workbook> {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
     // 合并单元格（calamine 不提供，单独解析一次）
-    if let Ok(merges) = crate::merges::load_merges(path) {
+    if let Ok(layouts) = crate::merges::load_layout(path) {
         for sheet in wb.sheets.iter_mut() {
-            if let Some(list) = merges.get(&sheet.name) {
-                sheet.merges = list.clone();
+            if let Some(lay) = layouts.get(&sheet.name) {
+                sheet.merges = lay.merges.clone();
+                for (c, w) in lay.col_widths.iter() {
+                    sheet.cols.set(*c, *w);
+                }
+                for (r, h) in lay.row_heights.iter() {
+                    sheet.rows.set(*r, *h);
+                }
             }
         }
     }
@@ -137,6 +143,83 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 
         for cref in sheet.cleared.iter() {
             ws.remove_cell((cref.col + 1, cref.row + 1));
+        }
+
+        // 样式：只回写用户改过的格子（整表重写样式在 10 万格级别会拖慢保存）
+        for cref in sheet.style_edits.iter() {
+            let sid = sheet.style_of(cref.row, cref.col);
+            let st = wb.styles.get(sid);
+            let cell = ws.get_cell_mut((cref.col + 1, cref.row + 1));
+            let s = cell.get_style_mut();
+            {
+                let f = s.get_font_mut();
+                f.set_bold(st.bold);
+                f.set_italic(st.italic);
+                f.set_size(st.size as f64);
+                let mut col = umya_spreadsheet::Color::default();
+                col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", st.color[0], st.color[1], st.color[2]));
+                f.set_color(col);
+            }
+            if let Some(rgb) = st.fill {
+                s.set_background_color_solid(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+            }
+            let a = s.get_alignment_mut();
+            a.set_horizontal(match st.halign {
+                1 => umya_spreadsheet::HorizontalAlignmentValues::Left,
+                2 => umya_spreadsheet::HorizontalAlignmentValues::Center,
+                3 => umya_spreadsheet::HorizontalAlignmentValues::Right,
+                _ => umya_spreadsheet::HorizontalAlignmentValues::General,
+            });
+            a.set_vertical(match st.valign {
+                1 => umya_spreadsheet::VerticalAlignmentValues::Top,
+                2 => umya_spreadsheet::VerticalAlignmentValues::Center,
+                3 => umya_spreadsheet::VerticalAlignmentValues::Bottom,
+                _ => umya_spreadsheet::VerticalAlignmentValues::Bottom,
+            });
+            if !st.format.is_empty() {
+                let mut nf = umya_spreadsheet::NumberingFormat::default();
+                nf.set_format_code(st.format.clone());
+                s.set_number_format(nf);
+            }
+            // 边框：四个边逐条写
+            let sides = ["thin", "medium", "thick", "double", "dashed", "dotted"];
+            let bs = s.get_borders_mut();
+            let mut make = |b: &crate::style::Border| {
+                let mut ub = umya_spreadsheet::Border::default();
+                if b.style == 0 {
+                    ub.set_border_style("none");
+                } else {
+                    ub.set_border_style(*sides.get(b.style as usize - 1).unwrap_or(&"thin"));
+                    let mut col = umya_spreadsheet::Color::default();
+                    col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", b.color[0], b.color[1], b.color[2]));
+                    ub.set_color(col);
+                }
+                ub
+            };
+            bs.set_left(make(&st.border[0]));
+            bs.set_right(make(&st.border[1]));
+            bs.set_top(make(&st.border[2]));
+            bs.set_bottom(make(&st.border[3]));
+        }
+
+        // 合并区域：只有被改过才同步，没动过就沿用文件里原有的
+        if sheet.merges_dirty {
+            let refs: Vec<umya_spreadsheet::Range> = sheet
+                .merges
+                .iter()
+                .map(|(r1, c1, r2, c2)| {
+                    let mut rg = umya_spreadsheet::Range::default();
+                    rg.set_range(format!(
+                        "{}{}:{}{}",
+                        col_name(*c1),
+                        r1 + 1,
+                        col_name(*c2),
+                        r2 + 1
+                    ));
+                    rg
+                })
+                .collect();
+            *ws.get_merge_cells_mut() = refs;
         }
 
         for (cref, cell) in sheet.iter() {
@@ -311,10 +394,39 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         };
         out.wrap = a.wrap_text;
     }
+    if let Some(bs) = &st.borders {
+        let map = |b: &calamine::Border| crate::style::Border {
+            style: match b.style {
+                calamine::BorderStyle::None => 0,
+                calamine::BorderStyle::Thin | calamine::BorderStyle::Hair => 1,
+                calamine::BorderStyle::Medium => 2,
+                calamine::BorderStyle::Thick => 3,
+                calamine::BorderStyle::Double => 4,
+                calamine::BorderStyle::Dashed => 5,
+                calamine::BorderStyle::Dotted => 6,
+                _ => 1,
+            },
+            color: b.color.map(|c| [c.red, c.green, c.blue]).unwrap_or([0, 0, 0]),
+        };
+        out.border = [map(&bs.left), map(&bs.right), map(&bs.top), map(&bs.bottom)];
+    }
     if let Some(nf) = &st.number_format {
         if !nf.format_code.is_empty() && nf.format_code != "General" {
             out.format = nf.format_code.clone();
         }
+    }
+    out
+}
+
+/// 列号 → 字母（0 → A）
+fn col_name(mut c: u32) -> String {
+    let mut out = String::new();
+    loop {
+        out.insert(0, (b'A' + (c % 26) as u8) as char);
+        if c < 26 {
+            break;
+        }
+        c = c / 26 - 1;
     }
     out
 }

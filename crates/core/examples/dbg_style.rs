@@ -7,6 +7,12 @@ fn main() {
         let s = wb.styles.get(si as u16);
         println!("  #{si}: bold={} italic={} size={} color={:?} fill={:?} halign={} valign={} fmt={:?}",
             s.bold, s.italic, s.size, s.color, s.fill, s.halign, s.valign, s.format);
+        let b = &s.border;
+        if b.iter().any(|x| x.style != 0) {
+            println!("      边框 左{:?} 右{:?} 上{:?} 下{:?}",
+                (b[0].style, b[0].color), (b[1].style, b[1].color),
+                (b[2].style, b[2].color), (b[3].style, b[3].color));
+        }
     }
     for sh in &wb.sheets {
         println!("表 {} 合并 {} 处 有样式格 {}", sh.name, sh.merges.len(), sh.styles.len());
