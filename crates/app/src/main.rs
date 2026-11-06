@@ -51,6 +51,8 @@ struct SheetApp {
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
     show_pages: bool,
+    /// 撤销/重做
+    undo: sheetcore::undo::UndoStack,
     /// 编辑租约（客户端看到的）
     locks: sheetcore::sync::LockTable,
     /// 等待授权中的编辑（初始输入）
@@ -63,6 +65,7 @@ struct SheetApp {
     t0: std::time::Instant,
     /// 测试钩子用过没有
     probe_done: bool,
+    style_done: bool,
     probe_at: std::time::Instant,
     lock_first_at: Option<std::time::Instant>,
     /// 新建图表草稿
@@ -160,12 +163,14 @@ impl SheetApp {
             note_edit: None,
             filter_popup: None,
             show_pages: false,
+            undo: sheetcore::undo::UndoStack::new(),
             locks: sheetcore::sync::LockTable::new(20_000),
             pending_edit: None,
             my_lock: None,
             lock_renew: std::time::Instant::now(),
             t0: std::time::Instant::now(),
             probe_done: false,
+            style_done: false,
             probe_at: std::time::Instant::now(),
             lock_first_at: None,
             chart_edit: None,
@@ -447,6 +452,74 @@ impl SheetApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
+    /// 无界面自检：给 B2 加粗并广播，用来验格式同步
+    fn style_probe(&mut self) {
+        if std::env::var("SC_STYLE_TEST").is_err() || self.open_rx.is_some() || self.style_done {
+            return;
+        }
+        self.style_done = true;
+        self.sel = (1, 1);
+        self.sel_end = (1, 1);
+        self.apply_style(|st| st.bold = true);
+        eprintln!("[style] 已加粗 B2 并广播");
+    }
+
+    /// 无界面自检：编辑 → 撤销 → 重做 → 格式撤销
+    fn undo_probe(&mut self) {
+        if std::env::var("SC_UNDO_TEST").is_err() || self.open_rx.is_some() || self.probe_done {
+            return;
+        }
+        self.probe_done = true;
+        let (r, c) = (1u32, 1u32);
+        let orig = self
+            .wb
+            .sheet(self.sheet_idx)
+            .get(r, c)
+            .map(|x| x.value.display())
+            .unwrap_or_default();
+        // 1) 编辑
+        self.sel = (r, c);
+        self.editing = Some(EditState { buf: "999".into() });
+        self.commit_edit(None);
+        let after_edit = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
+        // 2) 撤销
+        self.do_undo(false);
+        let after_undo = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
+        // 3) 重做
+        self.do_undo(true);
+        let after_redo = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
+        // 4) 格式：加粗后撤销
+        self.sel = (r, c);
+        self.apply_style(|st| st.bold = !st.bold);
+        let bold_after = self.wb.styles.get(self.wb.sheet(self.sheet_idx).style_of(r, c)).bold;
+        self.do_undo(false);
+        let bold_undo = self.wb.styles.get(self.wb.sheet(self.sheet_idx).style_of(r, c)).bold;
+        // 5) 清除后撤销
+        self.sel = (r, c);
+        self.wb
+            .sheet_mut(self.sheet_idx)
+            .set(r, c, Cell { value: Value::Empty, formula: None });
+        self.undo.push(sheetcore::undo::Action {
+            label: "清除".into(),
+            deltas: vec![sheetcore::undo::CellDelta {
+                sheet: self.sheet_idx,
+                row: r,
+                col: c,
+                before: Cell { value: Value::Number(7.0), formula: None },
+                after: Cell { value: Value::Empty, formula: None },
+                before_style: 0,
+                after_style: 0,
+            }],
+            focus: (self.sheet_idx, r, c),
+        });
+        self.do_undo(false);
+        let clear_undo = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
+        eprintln!(
+            "[undo] 原值={orig} 编辑后={after_edit} 撤销后={after_undo} 重做后={after_redo} 加粗={bold_after} 撤销后={bold_undo} 清除撤销={clear_undo} 深度={:?}",
+            self.undo.depth()
+        );
+    }
+
     fn lock_now(&self) -> u64 {
         self.t0.elapsed().as_millis() as u64
     }
@@ -518,6 +591,92 @@ impl SheetApp {
         }
     }
 
+
+    /// 记一步撤销：先 capture，改完 finish
+    fn txn_begin(&self, keys: &[(u32, u32)]) -> Vec<sheetcore::undo::CellDelta> {
+        sheetcore::undo::capture(self.wb.sheet(self.sheet_idx), self.sheet_idx, keys)
+    }
+
+    fn txn_end(&mut self, label: &str, before: Vec<sheetcore::undo::CellDelta>) {
+        let deltas = sheetcore::undo::finish(before, self.wb.sheet(self.sheet_idx));
+        if deltas.is_empty() {
+            return;
+        }
+        let focus = (self.sheet_idx, self.sel.0, self.sel.1);
+        self.undo.push(sheetcore::undo::Action {
+            label: label.to_string(),
+            deltas,
+            focus,
+        });
+    }
+
+    /// 撤销 / 重做
+    fn do_undo(&mut self, redo: bool) {
+        if self.editing.is_some() {
+            return;
+        }
+        // 协作时：只回退仍然是我改成的样子的格子
+        let mut mine: std::collections::HashSet<(usize, u32, u32)> = std::collections::HashSet::new();
+        let site = self.net.as_ref().map(|n| n.site);
+        if let Some(_site) = site {
+            if let Some(peer) = self.peer.as_ref() {
+                for (k, op) in peer.cells.iter() {
+                    if op.site == site.unwrap() {
+                        mine.insert(*k);
+                    }
+                }
+            }
+        }
+        let guard = |sheet: usize, row: u32, col: u32, _cur: &sheetcore::model::Cell| {
+            mine.is_empty() || mine.contains(&(sheet, row, col))
+        };
+        let applied = if redo {
+            self.undo.redo(&mut self.wb.sheets, guard)
+        } else {
+            self.undo.undo(&mut self.wb.sheets, guard)
+        };
+        let Some(applied) = applied else {
+            self.status = if redo { "没有可重做的操作".into() } else { "没有可撤销的操作".into() };
+            return;
+        };
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        // 重算受影响格子
+        let mut keys: Vec<(usize, u32, u32)> = applied.touched.clone();
+        keys.sort();
+        keys.dedup();
+        for k in keys.iter() {
+            self.deps.update_cell(&self.wb, *k);
+        }
+        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &keys);
+        // 协作广播
+        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+            for (sheet, row, col) in applied.touched.iter() {
+                if *sheet != self.sheet_idx {
+                    continue;
+                }
+                if let Some(cell) = self.wb.sheet(*sheet).get(*row, *col).cloned() {
+                    let op = peer.local_set(*sheet, *row, *col, &cell);
+                    net.broadcast_op(op);
+                }
+            }
+        }
+        // 回到出事的格
+        let (sheet, row, col) = applied.focus;
+        self.sheet_idx = sheet.min(self.wb.sheets.len().saturating_sub(1));
+        self.sel = (row, col);
+        self.sel_end = (row, col);
+        self.ensure_visible();
+        self.status = if redo {
+            format!("重做：{}", applied.label)
+        } else {
+            format!("撤销：{}", applied.label)
+        };
+        if applied.skipped > 0 {
+            self.status.push_str(&format!("（{} 格已被别人改动，跳过）", applied.skipped));
+        }
+    }
+
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) {
         if let Some(ed) = self.editing.take() {
             self.release_lock();
@@ -561,7 +720,9 @@ impl SheetApp {
                 Cell { value: Value::parse_input(&ed.buf), formula: None }
             };
             let cell_clone = cell.clone();
+            let txn = self.txn_begin(&[(r, c)]);
             self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
+            self.txn_end("编辑单元格", txn);
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
             self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -623,6 +784,16 @@ impl SheetApp {
             }
             return;
         }
+        let (redo_key, undo_key) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::Y),
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
+            )
+        });
+        if undo_key || redo_key {
+            self.do_undo(redo_key);
+            return;
+        }
         let (mut dr, mut dc) = (0i64, 0i64);
         let (mut commit, mut start_edit, mut clear) = (false, false, false);
         ctx.input(|i| {
@@ -642,7 +813,18 @@ impl SheetApp {
                 self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
                 return;
             }
-            self.wb.sheet_mut(self.sheet_idx).set(r, c, Cell { value: Value::Empty, formula: None });
+            let (r1, c1, r2, c2) = self.sel_rect();
+            let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+            let txn = self.txn_begin(&keys);
+            for rr in r1..=r2 {
+                for cc in c1..=c2 {
+                    self.wb.sheet_mut(self.sheet_idx)
+                        .set(rr, cc, Cell { value: Value::Empty, formula: None });
+                }
+            }
+            self.txn_end("清除内容", txn);
+            let (r, c) = self.sel;
+            let _ = (r, c);
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
             self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -705,15 +887,23 @@ impl SheetApp {
             self.status = "选区太大（超过 20 万格），不给整块刷格式".into();
             return;
         }
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
+        let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
                 let old = self.wb.sheet(self.sheet_idx).style_of(r, c);
                 let mut st = self.wb.styles.get(old).clone();
                 f(&mut st, r, c);
-                let id = self.wb.styles.intern(st);
+                let id = self.wb.styles.intern(st.clone());
                 self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
+                wire.push((r, c, st));
             }
         }
+        if let Some(net) = self.net.as_ref() {
+            net.broadcast_style(self.sheet_idx, wire);
+        }
+        self.txn_end("设置格式", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
     }
@@ -749,6 +939,9 @@ impl SheetApp {
             } else {
                 sheet.unmerge_range(r1, c1, r2, c2);
             }
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.broadcast_merge(self.sheet_idx, (r1, c1, r2, c2), on);
         }
         self.wb.dirty = true;
         self.status = if on { "已合并选区".into() } else { "已取消合并".into() };
@@ -1525,7 +1718,7 @@ impl SheetApp {
                 };
                 painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
                 if dumping {
-                    dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
+                    dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1} bold={}", r, c, txt, tx, ty, base_color, st.size, st.bold));
                 }
             }
         }
@@ -1697,6 +1890,8 @@ impl SheetApp {
     fn do_sort(&mut self, col: u32, asc: bool) {
         let (r, c) = self.sel;
         let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
         let res = sheetcore::sort_filter::sort_region(
             self.wb.sheet_mut(self.sheet_idx),
             (r1, c1, r2, c2),
@@ -1705,6 +1900,7 @@ impl SheetApp {
         );
         match res {
             Ok(()) => {
+                self.txn_end("排序", txn);
                 self.wb.dirty = true;
                 self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.status = format!("已按 {} 列{}排序", cell_name(0, col), if asc { "升序" } else { "降序" });
@@ -3324,6 +3520,27 @@ impl SheetApp {
                         self.status = format!("{} 开始编辑 {}", name, cell_name(row, col));
                     }
                 }
+                crate::net::NetEvent::Styles(items) => {
+                    for (sheet, row, col, st) in items {
+                        if sheet >= self.wb.sheets.len() {
+                            continue;
+                        }
+                        let id = self.wb.styles.intern(st);
+                        self.wb.sheet_mut(sheet).set_style(row, col, id);
+                    }
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                }
+                crate::net::NetEvent::Merge { sheet, rect, on, .. } => {
+                    if sheet < self.wb.sheets.len() {
+                        let sh = self.wb.sheet_mut(sheet);
+                        if on {
+                            sh.merge_range(rect.0, rect.1, rect.2, rect.3);
+                        } else {
+                            sh.unmerge_range(rect.0, rect.1, rect.2, rect.3);
+                        }
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
+                }
                 crate::net::NetEvent::LockDeny { holder_name, row, col, .. } => {
                     self.pending_edit = None;
                     if std::env::var("SC_LOCK").is_ok() || std::env::var("SC_LOCK_TRY").is_ok() {
@@ -3496,6 +3713,8 @@ impl eframe::App for SheetApp {
         self.pivot_dialog(ctx);
         self.renew_lock_if_needed();
         self.lock_probe(ctx);
+        self.undo_probe();
+        self.style_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
@@ -3510,6 +3729,31 @@ impl eframe::App for SheetApp {
                 }
                 if ui.button("另存为").clicked() {
                     self.save(true);
+                }
+                let (cu, cr) = (self.undo.can_undo(), self.undo.can_redo());
+                if ui
+                    .add_enabled(cu, egui::Button::new("↶").small())
+                    .on_hover_text(
+                        self.undo
+                            .undo_label()
+                            .map(|l| format!("撤销 {l}（Ctrl+Z）"))
+                            .unwrap_or_else(|| "撤销（Ctrl+Z）".into()),
+                    )
+                    .clicked()
+                {
+                    self.do_undo(false);
+                }
+                if ui
+                    .add_enabled(cr, egui::Button::new("↷").small())
+                    .on_hover_text(
+                        self.undo
+                            .redo_label()
+                            .map(|l| format!("重做 {l}（Ctrl+Y）"))
+                            .unwrap_or_else(|| "重做（Ctrl+Y）".into()),
+                    )
+                    .clicked()
+                {
+                    self.do_undo(true);
                 }
                 ui.separator();
                 if self.net.is_none() {

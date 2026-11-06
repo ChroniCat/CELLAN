@@ -59,3 +59,30 @@ fn lock_survives_ops_and_only_one_holder_per_cell() {
     // 同一时刻只有一个人
     assert_eq!(t.holder(2, 9, 9).map(|h| h.site), Some(0));
 }
+
+#[test]
+fn style_and_merge_messages_round_trip() {
+    use sheetcore::style::{Border, CellStyle};
+    use sheetcore::sync::Msg;
+    let mut st = CellStyle::default();
+    st.bold = true;
+    st.border[0] = Border { style: 1, color: [255, 0, 0] };
+    let msg = Msg::StyleOp { site: 3, sheet: 1, ts: 5, items: vec![(2, 3, st.clone())] };
+    let line = serde_json::to_string(&msg).unwrap();
+    match serde_json::from_str::<Msg>(&line).unwrap() {
+        Msg::StyleOp { sheet, items, .. } => {
+            assert_eq!(sheet, 1);
+            assert_eq!(items.len(), 1);
+            assert!(items[0].2.bold);
+            assert_eq!(items[0].2.border[0].color, [255, 0, 0]);
+        }
+        _ => panic!("解析成了别的消息"),
+    }
+    let m = Msg::MergeOp { site: 1, sheet: 0, ts: 1, r1: 0, c1: 0, r2: 2, c2: 3, on: true };
+    let line = serde_json::to_string(&m).unwrap();
+    assert!(line.contains("\"t\":\"MergeOp\""), "标签不对: {line}");
+    // 分片消息
+    let c = Msg::SnapshotChunk { ops: vec![], last: true };
+    let line = serde_json::to_string(&c).unwrap();
+    assert!(serde_json::from_str::<Msg>(&line).is_ok());
+}

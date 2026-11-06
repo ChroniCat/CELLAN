@@ -26,6 +26,10 @@ pub enum NetEvent {
     Cursor(Cursor),
     /// 某格被批准编辑（含自己）
     LockOk { site: u32, name: String, sheet: usize, row: u32, col: u32 },
+    /// 远端格式变更
+    Styles(Vec<(usize, u32, u32, sheetcore::style::CellStyle)>),
+    /// 远端合并变更
+    Merge { site: u32, sheet: usize, rect: (u32, u32, u32, u32), on: bool },
     /// 自己被拒绝
     LockDeny { holder: u32, holder_name: String, sheet: usize, row: u32, col: u32 },
     /// 某格释放
@@ -50,6 +54,8 @@ pub struct Net {
     state: Option<Arc<Mutex<Vec<Op>>>>,
     /// 宿主自己也是参与者：本地租约表 + 事件入口
     host_locks: Option<Arc<Mutex<sheetcore::sync::LockTable>>>,
+    host_styles:
+        Option<Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>>>,
     evt_tx: Sender<NetEvent>,
     t0: std::time::Instant,
 }
@@ -65,6 +71,24 @@ fn write_line(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {
     stream.write_all(s.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
+}
+
+
+/// 加密通道的写：有会话就封包
+fn write_frame(stream: &mut TcpStream, sess: &mut Option<sheetcore::wire::Session>, s: &str) -> std::io::Result<()> {
+    let frame = match sess {
+        Some(se) => se.seal(s),
+        None => s.to_string(),
+    };
+    write_line(stream, &frame)
+}
+
+/// 加密通道的读：有会话就解包，解不开直接返回错误（视为断线/被篡改）
+fn open_frame(sess: &mut Option<sheetcore::wire::Session>, line: &str) -> Option<String> {
+    match sess {
+        Some(se) => se.open(line),
+        None => Some(line.to_string()),
+    }
 }
 
 pub fn proof(nonce: u64, password: &str) -> String {
@@ -157,6 +181,42 @@ impl Net {
         }
     }
 
+    /// 广播格式变更（宿主顺手记进样式表，供后来的人补）
+    pub fn broadcast_style(&self, sheet: usize, items: Vec<(u32, u32, sheetcore::style::CellStyle)>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(st) = &self.host_styles {
+            let mut m = st.lock().unwrap();
+            for (r, c, s) in items.iter() {
+                m.insert((sheet, *r, *c), s.clone());
+            }
+        }
+        let msg = Msg::StyleOp { site: self.site, sheet, ts: 0, items };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
+        }
+    }
+
+    /// 广播合并/取消合并
+    pub fn broadcast_merge(&self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) {
+        let msg = Msg::MergeOp {
+            site: self.site,
+            sheet,
+            ts: 0,
+            r1: rect.0,
+            c1: rect.1,
+            r2: rect.2,
+            c2: rect.3,
+            on,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
+        }
+    }
+
     pub fn broadcast_cursor(&self, cur: Cursor) {
         if let Ok(s) = serde_json::to_string(&Msg::CursorMsg(cur)) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
@@ -209,9 +269,13 @@ pub fn host(
     }
 
     // 编辑租约（宿主仲裁，同一格只批一个）
+    // 样式表：新加入的人要靠它补齐格式（Op 里只有值）
+    let styles: Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
     let locks: Arc<Mutex<sheetcore::sync::LockTable>> =
         Arc::new(Mutex::new(sheetcore::sync::LockTable::new(20_000)));
     let locks_for_self = locks.clone();
+    let styles_for_self = styles.clone();
     let evt_tx_self = evt_tx.clone();
     let t0 = std::time::Instant::now();
     let now_ms = {
@@ -252,6 +316,7 @@ pub fn host(
         let password = password.clone();
         let alive = alive.clone();
         let locks_outer = locks.clone();
+        let styles_outer = styles.clone();
         let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -265,6 +330,7 @@ pub fn host(
                 let doc_name = doc_name.clone();
                 let password = password.clone();
                 let locks = locks_outer.clone();
+                let styles = styles_outer.clone();
                 let now_ms = now_ms_outer;
                 let my_site = host_site;
                 std::thread::spawn(move || {
@@ -274,22 +340,63 @@ pub fn host(
                     };
                     let reader = BufReader::new(stream);
                     let (tx, rx) = channel::<String>();
+                    let (tx_key, rx_key) = channel::<Option<sheetcore::wire::Session>>();
+                    let mut write_sess: Option<sheetcore::wire::Session> = None;
                     std::thread::spawn(move || {
+                        // 第一帧恒为明文（Challenge）——密钥可能比它先到队列里，
+                        // 不能靠「有没有会话」来判断该不该加密
+                        let mut sent_first = false;
                         while let Ok(s) = rx.recv() {
-                            if write_line(&mut write_half, &s).is_err() {
+                            while let Ok(k) = rx_key.try_recv() {
+                                write_sess = k;
+                            }
+                            // 前缀 \x01 = 这一帧强制明文（挑战、错误口令提示）
+                            let (plain, body) = match s.strip_prefix('\u{1}') {
+                                Some(rest) => (true, rest.to_string()),
+                                None => (false, s),
+                            };
+                            if plain || !sent_first {
+                                sent_first = true;
+                                if write_line(&mut write_half, &body).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if write_frame(&mut write_half, &mut write_sess, &body).is_err() {
                                 break;
                             }
                         }
                     });
 
-                    // 1) 挑战
+                    // 1) 挑战（口令非空时带 salt，双方据此派生密钥）
                     let nonce = random_nonce();
-                    let _ =
-                        tx.send(serde_json::to_string(&Msg::Challenge { nonce }).unwrap());
+                    let salt: Vec<u8> = (0..16).map(|i| (nonce.rotate_left(i as u32) & 0xff) as u8).collect();
+                    let mut sess: Option<sheetcore::wire::Session> = None;
+                    let challenge = if password.is_empty() {
+                        Msg::Challenge { nonce }
+                    } else {
+                        sess = Some(sheetcore::wire::Session::host_side(&password, &salt));
+                        Msg::ChallengeSalt { nonce, salt: sheetcore::wire::b64_encode(&salt) }
+                    };
+                    let _ = tx.send(serde_json::to_string(&challenge).unwrap());
+                    let _ = tx_key.send(sess.as_ref().map(|x| x.fork_sender()));
 
                     let mut hello_site: Option<u32> = None;
                     for line in reader.lines() {
                         let Ok(line) = line else { break };
+                        let Some(line) = open_frame(&mut sess, &line) else {
+                            // 解不开 = 口令不对或帧被改过。明文回一句再断，
+                            // 让对方看到「口令不正确」而不是只有「连接中断」
+                            if sess.is_some() {
+                                let deny = serde_json::to_string(&Msg::Denied {
+                                    reason: "口令不正确".into(),
+                                })
+                                .unwrap();
+                                let _ = tx.send(format!("\u{1}{deny}"));
+                                std::thread::sleep(Duration::from_millis(150));
+                            }
+                            break;
+                        };
                         let Ok(msg) = serde_json::from_str::<Msg>(&line) else { continue };
                         match msg {
                             Msg::Hello { site, name, proof: got, doc: _ } => {
@@ -318,10 +425,48 @@ pub fn host(
                                     })
                                     .unwrap(),
                                 );
-                                let snap = state.lock().unwrap().clone();
-                                let _ = tx.send(
-                                    serde_json::to_string(&Msg::Snapshot { ops: snap }).unwrap(),
-                                );
+                                {
+                                    // 样式先补（新人有格式，后面再收值）
+                                    let items: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
+                                        styles
+                                            .lock()
+                                            .unwrap()
+                                            .iter()
+                                            .map(|((sh, r, c), st)| (*sh, *r, *c, st.clone()))
+                                            .collect();
+                                    if !items.is_empty() {
+                                        let _ = tx.send(
+                                            serde_json::to_string(&Msg::StyleSnapshot { items })
+                                                .unwrap(),
+                                        );
+                                    }
+                                }
+                                {
+                                    // 快照分片：15 万条操作一次发，单帧几 MB，
+                                    // 客户端要一次性反序列化；分 4000 条一片更稳
+                                    let snap = state.lock().unwrap().clone();
+                                    let chunk = 4000;
+                                    if snap.is_empty() {
+                                        let _ = tx.send(
+                                            serde_json::to_string(&Msg::Snapshot { ops: snap })
+                                                .unwrap(),
+                                        );
+                                    } else {
+                                        let n = snap.len();
+                                        let mut i = 0;
+                                        while i < n {
+                                            let end = (i + chunk).min(n);
+                                            let part = snap[i..end].to_vec();
+                                            let msg = if end == n {
+                                                Msg::Snapshot { ops: part }
+                                            } else {
+                                                Msg::SnapshotChunk { ops: part, last: false }
+                                            };
+                                            let _ = tx.send(serde_json::to_string(&msg).unwrap());
+                                            i = end;
+                                        }
+                                    }
+                                }
                                 peers.lock().unwrap().insert(site, tx.clone());
                                 peer_names.lock().unwrap().insert(site, (name.clone(), color));
                                 let _ = evt_tx.send(NetEvent::PeerJoined(site, name.clone(), color));
@@ -357,6 +502,53 @@ pub fn host(
                                     }
                                 }
                                 let _ = evt_tx.send(NetEvent::Cursor(c));
+                            }
+                            Msg::StyleOp { site: _site, sheet, ts: _ts, items } => {
+                                {
+                                    let mut st = styles.lock().unwrap();
+                                    for (r, c, s) in items.iter() {
+                                        st.insert((sheet, *r, *c), s.clone());
+                                    }
+                                }
+                                let line = serde_json::to_string(&Msg::StyleOp {
+                                    site: 0,
+                                    sheet,
+                                    ts: 0,
+                                    items: items.clone(),
+                                })
+                                .unwrap();
+                                for (s, ptx) in peers.lock().unwrap().iter() {
+                                    if Some(*s) != hello_site {
+                                        let _ = ptx.send(line.clone());
+                                    }
+                                }
+                                let ev: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
+                                    items.iter().map(|(r, c, s)| (sheet, *r, *c, s.clone())).collect();
+                                let _ = evt_tx.send(NetEvent::Styles(ev));
+                            }
+                            Msg::MergeOp { site: _site, sheet, ts: _ts, r1, c1, r2, c2, on } => {
+                                let line = serde_json::to_string(&Msg::MergeOp {
+                                    site: 0,
+                                    sheet,
+                                    ts: 0,
+                                    r1,
+                                    c1,
+                                    r2,
+                                    c2,
+                                    on,
+                                })
+                                .unwrap();
+                                for (s, ptx) in peers.lock().unwrap().iter() {
+                                    if Some(*s) != hello_site {
+                                        let _ = ptx.send(line.clone());
+                                    }
+                                }
+                                let _ = evt_tx.send(NetEvent::Merge {
+                                    site: 0,
+                                    sheet,
+                                    rect: (r1, c1, r2, c2),
+                                    on,
+                                });
                             }
                             Msg::LockReq { site, name, sheet, row, col } => {
                                 let outcome = locks.lock().unwrap().request(
@@ -477,6 +669,7 @@ pub fn host(
         alive,
         state: Some(state),
         host_locks: Some(locks_for_self),
+        host_styles: Some(styles_for_self),
         evt_tx: evt_tx_self,
         t0,
     })
@@ -499,11 +692,14 @@ pub fn join(
     let evt_tx_clone = evt_tx.clone();
     let alive = Arc::new(AtomicBool::new(true));
     let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    // 加密会话（客户端侧）：读写共用一份，方向位/计数器已区分
+    let sess_shared: Arc<Mutex<Option<sheetcore::wire::Session>>> = Arc::new(Mutex::new(None));
 
     // 写线程
     {
         let writer = writer.clone();
         let alive = alive.clone();
+        let sess_shared = sess_shared.clone();
         std::thread::spawn(move || {
             while let Ok(cmd) = cmd_rx.recv() {
                 if !alive.load(Ordering::SeqCst) {
@@ -511,8 +707,15 @@ pub fn join(
                 }
                 match cmd {
                     Cmd::Broadcast(s) => {
+                        let frame = {
+                            let mut g = sess_shared.lock().unwrap();
+                            match g.as_mut() {
+                                Some(se) => se.seal(&s),
+                                None => s.clone(),
+                            }
+                        };
                         if let Some(w) = writer.lock().unwrap().as_mut() {
-                            let _ = write_line(w, &s);
+                            let _ = write_line(w, &frame);
                         }
                     }
                     Cmd::Stop => break,
@@ -552,11 +755,49 @@ pub fn join(
                 };
                 let reader = BufReader::new(connected);
                 let mut denied = false;
+                let mut got_welcome = false;
 
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
+                    let opened = {
+                        let mut g = sess_shared.lock().unwrap();
+                        match g.as_mut() {
+                            Some(se) => se.open(&line),
+                            None => Some(line.clone()),
+                        }
+                    };
+                    let line = match opened {
+                        Some(l) => l,
+                        None => {
+                            // 明文帧（例如「口令不正确」的提示）解不开，直接当 JSON 认
+                            if serde_json::from_str::<Msg>(&line).is_ok() {
+                                line
+                            } else {
+                                break;
+                            }
+                        }
+                    };
                     let Ok(msg) = serde_json::from_str::<Msg>(&line) else { continue };
                     match msg {
+                        Msg::ChallengeSalt { nonce, salt } => {
+                            let raw = sheetcore::wire::b64_decode(&salt).unwrap_or_default();
+                            *sess_shared.lock().unwrap() =
+                                Some(sheetcore::wire::Session::client_side(&password, &raw));
+                            let hello = Msg::Hello {
+                                site,
+                                name: name.clone(),
+                                doc: doc.clone(),
+                                proof: proof(nonce, &password),
+                            };
+                            {
+                                let mut g = sess_shared.lock().unwrap();
+                                let _ = write_frame(
+                                    &mut write_half,
+                                    &mut g,
+                                    &serde_json::to_string(&hello).unwrap(),
+                                );
+                            }
+                        }
                         Msg::Challenge { nonce } => {
                             let hello = Msg::Hello {
                                 site,
@@ -564,10 +805,16 @@ pub fn join(
                                 doc: doc.clone(),
                                 proof: proof(nonce, &password),
                             };
-                            let _ =
-                                write_line(&mut write_half, &serde_json::to_string(&hello).unwrap());
+                            let mut g = sess_shared.lock().unwrap();
+                            let _ = write_frame(
+                                &mut write_half,
+                                &mut g,
+                                &serde_json::to_string(&hello).unwrap(),
+                            );
+                            drop(g);
                         }
                         Msg::Welcome { peers, .. } => {
+                            got_welcome = true;
                             if let Ok(clone) = write_half.try_clone() {
                                 *writer.lock().unwrap() = Some(clone);
                             }
@@ -579,11 +826,33 @@ pub fn join(
                             denied = true;
                             break;
                         }
+                        Msg::SnapshotChunk { ops, last } => {
+                            let _ = evt_tx.send(NetEvent::Ops(ops));
+                            if last {
+                                // 收尾片其实用 Snapshot 发，这里兜底
+                            }
+                        }
                         Msg::Snapshot { ops } => {
                             let _ = evt_tx.send(NetEvent::Ops(ops));
                         }
                         Msg::Op(op) => {
                             let _ = evt_tx.send(NetEvent::Ops(vec![op]));
+                        }
+                        Msg::StyleOp { sheet, items, .. } => {
+                            let ev: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
+                                items.iter().map(|(r, c, s)| (sheet, *r, *c, s.clone())).collect();
+                            let _ = evt_tx.send(NetEvent::Styles(ev));
+                        }
+                        Msg::StyleSnapshot { items } => {
+                            let _ = evt_tx.send(NetEvent::Styles(items));
+                        }
+                        Msg::MergeOp { site, sheet, ts: _, r1, c1, r2, c2, on } => {
+                            let _ = evt_tx.send(NetEvent::Merge {
+                                site,
+                                sheet,
+                                rect: (r1, c1, r2, c2),
+                                on,
+                            });
                         }
                         Msg::LockOk { site, name, sheet, row, col } => {
                             let _ = evt_tx.send(NetEvent::LockOk { site, name, sheet, row, col });
@@ -613,10 +882,16 @@ pub fn join(
                     }
                 }
                 *writer.lock().unwrap() = None;
+                *sess_shared.lock().unwrap() = None;
                 if denied {
                     break;
                 }
-                let _ = evt_tx.send(NetEvent::Disconnected("连接中断".into()));
+                let hint = if password.is_empty() || got_welcome {
+                    "连接中断".to_string()
+                } else {
+                    "连接中断（房间有口令，先确认口令是否正确）".to_string()
+                };
+                let _ = evt_tx.send(NetEvent::Disconnected(hint));
                 if !alive.load(Ordering::SeqCst) {
                     break;
                 }
@@ -635,6 +910,7 @@ pub fn join(
         alive,
         state: None,
         host_locks: None,
+        host_styles: None,
         evt_tx: evt_tx_clone,
         t0: std::time::Instant::now(),
     })

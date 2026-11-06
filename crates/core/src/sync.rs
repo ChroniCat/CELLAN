@@ -185,12 +185,38 @@ impl LockTable {
 pub enum Msg {
     /// 连上后宿主先发挑战码，客户端回 Hello 时带上 sha256(nonce + 口令)
     Challenge { nonce: u64 },
+    /// 带 salt 的挑战：口令非空时用，双方据此派生 ChaCha20 密钥
+    ChallengeSalt { nonce: u64, salt: String },
     Denied { reason: String },
     Hello { site: u32, name: String, doc: String, proof: String },
     Welcome { site: u32, doc: String, peers: Vec<(u32, String, u8)> },
     Snapshot { ops: Vec<Op> },
+    /// 大文件分片下发（last=1 表示这是最后一片）
+    SnapshotChunk { ops: Vec<Op>, #[serde(default)] last: bool },
     Op(Op),
     CursorMsg(Cursor),
+    /// 格式变更（一批格子 + 每个格子的样式内容）
+    StyleOp {
+        site: u32,
+        sheet: usize,
+        ts: u64,
+        items: Vec<(u32, u32, crate::style::CellStyle)>,
+    },
+    /// 合并 / 取消合并
+    MergeOp {
+        site: u32,
+        sheet: usize,
+        ts: u64,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+        on: bool,
+    },
+    /// 加入后补一份现有样式（key: (sheet,row,col)）
+    StyleSnapshot {
+        items: Vec<(usize, u32, u32, crate::style::CellStyle)>,
+    },
     /// 请求编辑某格（同一格同时只允许一个人）
     LockReq { site: u32, name: String, sheet: usize, row: u32, col: u32 },
     /// 宿主批准（广播）

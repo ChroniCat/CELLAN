@@ -4,10 +4,11 @@
 //! 只保留「看得见且常用」的部分：粗斜体、字号、字色、底色、对齐、自动换行、数字格式。
 //! 每格只存一个 u16 索引，相同样式去重后共享一份。
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 一条边：0 无，1 细，2 中，3 粗，4 双线，5 虚线，6 点线
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 pub struct Border {
     pub style: u8,
     pub color: [u8; 3],
@@ -30,7 +31,7 @@ impl Border {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
