@@ -1,0 +1,316 @@
+# 原生重写：路线与里程碑
+
+目标：不基于 Chromium 的桌面表格客户端，直接读写内网共享盘（SMB/UNC）上的 `.xlsx`，同一文件多人同时编辑、实时同步。
+
+## 技术栈（已定）
+
+| 层 | 选型 | 理由 |
+|---|---|---|
+| 语言 | Rust | 内存占用低、无 GC、单二进制分发 |
+| 界面 | `egui` + `eframe`（wgpu 后端） | 原生绘制，无 Chromium；实测内存见下方"实测数字" |
+| 表格渲染 | 自绘虚拟化网格（只画可见区） | 100 万单元格不卡 |
+| 单元格模型 | 稀疏存储 `HashMap<CellRef, Cell>` | 空表不占内存 |
+| xlsx 读写 | `calamine`（读）+ `umya-spreadsheet`（写，保留样式） | 先求能打开/保存不损坏 |
+| 公式 | 自研解析器 + 求值器，先 30 个函数 | 可控、可对拍 |
+| 协作 | `yrs`（Yjs 的 Rust 实现）+ 自建传输 | CRDT，断线合并 |
+| 传输 | TCP/WebSocket，局域网直连 | 一个进程既当客户端也能当宿主 |
+
+## 里程碑
+
+### v0.1 能打开、能改、能存（本次）
+- 启动窗口，虚拟化网格
+- 打开 xlsx（UNC 路径直接读）
+- 单元格编辑、方向键导航、Enter 提交
+- 保存回原文件
+- 验收：用 Excel 打开保存后的文件，内容正确
+
+### v0.2 本地文件树
+- 左侧目录树，直接浏览 `\\192.0.2.41\shared`
+- 双击打开、最近文件
+
+### v0.3 公式引擎 ✅ 2026-11-06
+- 词法/语法：完整运算符优先级（比较 < & < +- < */ < ^ < 一元 < % < :）、区域、跨表引用、绝对引用、错误字面量
+- 求值：短路 IF / IFERROR / IFS；循环引用检测；打开与每次编辑后自动重算
+- 函数：**174 → 345 个**（第二轮加 171：统计分布 40+、工程 30+、高级财务 16、数据库 12、杂项 30+）（数学三角 55、统计 40、文本 26、逻辑 11、查找 12、日期 21、财务 12、信息 13，含别名）
+- 覆盖测试：21 个用例，含 470/90/560/632.8 这类真实算式、日期序列（1900 闰年 bug）、跨表、循环引用
+- 已修 bug：calamine 的 `cells()` 返回的是相对 Range 左上角的坐标，之前没加偏移，导致所有公式被挪格；已加回归测试
+- 已修 bug：删除单元格后保存不会从文件里消失；改为记录 `cleared` 集合并真正删除
+- **动态数组（第三轮）**：值类型扩展 `FValue::Array`；溢出写入相邻单元格（`#SPILL!` 占用检测、重算前清理）；落盘只存锚点公式，溢出值不写入文件
+  - 函数：SEQUENCE / RANDARRAY / TRANSPOSE / UNIQUE / SORT / SORTBY / FILTER / TAKE / DROP / HSTACK / VSTACK / CHOOSECOLS / CHOOSEROWS / TOROW / TOCOL / EXPAND / MMULT
+  - 比较运算支持区域广播（`B1:B4>10` 得到 4 个布尔值）
+  - `LET` 用局部环境实现（标识符解析 → Node::Name → env_stack）
+- 尚未支持：LAMBDA/MAP/REDUCE/BYROW（需要函数值）、T.TEST/F.TEST/CHISQ.TEST、LINEST/TREND、OFFSET/INDIRECT、CONVERT（单位换算）
+- 第二轮修的两个 bug：① `numbers(args,0)` 会把 k/p 这类标量参数当数据（LARGE/TRIMMEAN/PERCENTILE 全错），新增 `first_numbers`；② erf 近似在 0 附近有 1.5e-8 误差，改为 |x|<2 用级数展开
+
+### v0.3 公式
+- 30 个常用函数 + 单元格引用 + 区间
+- 与 Excel 对拍（同一批公式，结果逐格比较）
+
+
+
+
+
+
+
+
+
+### v1.2 多表协作 + 异步保存 ✅ 2026-11-06
+
+**多表协作**：`Op` 和 `Cursor` 增加 `sheet` 字段，冲突键从 `(row,col)` 改成 `(sheet,row,col)`。
+- 宿主快照改成遍历所有工作表（原来只塞当前表）
+- 客户端按 op 里的表号写回对应工作表
+- 实测：宿主打开 152MB/6 表文件 → 客户端收到 **431,652 条操作**（修之前只有 160,008，即当前一张表）
+- 新增测试：同 (row,col) 不同表不冲突；同表同格仍按 (ts,site) 收敛
+
+**保存路径**：先量了一下 152MB 文件（431,652 格）的保存耗时：
+
+| 阶段 | 耗时 |
+|---|---|
+| 读入原文件（保留样式的前提） | 0.72 s |
+| 组装 umya DOM | 0.42 s |
+| 序列化 + 压缩 | 0.59 s |
+| 合计 | ~1.7 s |
+
+250 万格的文件是 3.86 s + 4.58 s = 9.94 s。
+
+结论：**没有重写 writer**。原因——重新生成 sheet XML 会丢掉合并单元格、条件格式、数据验证、批注、图片锚点
+（这些全在 `<sheetData>` 之外的同一份 XML 里）；要保留就得做「只替换改动单元格」的 XML 级补丁，
+工作量和风险都远超收益（对真实文件 1.7 s 已经可接受）。
+
+实际做的是**异步保存**：克隆一份工作簿到后台线程 → 写 `.tmp` → 成功后 `rename` 原子替换。
+保存期间界面不卡，状态栏显示「正在保存…/已保存」。
+
+**意外事故与修复**：打异步保存补丁时，替换区间算错，把 `commit_edit` / `handle_keys` / `draw_grid`
+三个函数误删了（约 150 行）。已重写，并用截图验证界面正常：表格、行列表头、选区、公式栏、
+6 张表标签、文件树都在。教训：改 Rust 源码必须按函数边界定位，不能用「从 A 到 B」的粗略切片。
+
+**测试** 67 → **69**（新增多表不冲突、保存读回一致性）
+
+### v1.1 协作增量重算 ✅ 2026-11-06
+
+**问题**：协作收到远端操作时，`poll_net` 里用「远端光标位置」当种子，取不到就退化成 `recalc_all` + 重建依赖图 —— 一次编辑卡 17 秒。
+
+**改动**：
+1. `sync::Peer::apply_list_to_sheet`：只写这批被接受的操作所涉及的格子，不再整表重写（原来每条 op 都调用 `apply_to_sheet` 全表刷一遍）
+2. `deps::Deps::update_cell`：新增 `cols_of` 记录每个公式登记过的列，删除时精确移除（原来是 `by_col.retain` 扫全部列索引）
+3. `poll_net`：按**实际被接受的 op** 收集 `touched`，只对这些格子做 `update_cell` + `recalc_dirty`
+4. 只有「加入房间时收到的第一包全量快照」才走全量重算 + 重建依赖图
+
+**实测**（real100.xlsx，152 MB，22.6 万公式）：
+
+| 远端批量 | 重算格数 | 耗时 | 对比全量 |
+|---|---|---|---|
+| 50 条 | 15,098 | 57 ms | 17,000 ms |
+| 500 条 | 15,998 | 66 ms | 17,000 ms |
+| 5000 条 | 24,998 | 88 ms | 17,000 ms |
+
+**顺带修的回归**：打开改成异步后，`--host` 在文件还没读进来时就执行了，宿主快照是空的，
+客户端只收到 `ops: 0`。现在把共享/加入动作挂起到 `Loaded` 之后再执行。
+实测：宿主 43 万格文件 → 客户端收到 160,008 条操作（当前只同步打开的那张表）。
+
+**已知限制**：协作只同步当前打开的那张工作表，多表文档的其他表不同步。
+
+### v1.0 打开不再卡界面 ✅ 2026-11-06
+
+`open_path` 原来在 UI 线程里同步 `load` + `recalc_all`，打开 152MB 文件要卡 18 秒白屏。
+改成两段式：
+
+1. 后台线程 `load` → 把读到的表发给 UI（带的是 Excel 上次保存的计算结果）→ 界面立刻可画
+2. 同一线程继续 `recalc_all` + 建依赖图 → 算完再整体换掉
+
+细节：
+- `doc_gen` 代次号：后台算完时如果用户已经改过格子，结果**丢弃**，避免覆盖用户输入
+- 丢弃后不立刻重算（否则连续输入会反复克隆整本工作簿），而是标记 `needs_full`，
+  等用户停手 3 秒再补一次
+- 后台任务期间每 100ms 重绘，状态栏显示进度
+
+**实测**（152MB / 431,652 格 / 226,036 条公式）：
+
+| 指标 | 之前 | 现在 |
+|---|---|---|
+| 首屏可用 | 18–20 s（白屏） | **1.22 s** |
+| 后台重算完成 | — | 17.2 s |
+| 稳态工作集 | 174.7 MB | 182.3 MB |
+| 峰值（重算时两份副本） | — | ~577 MB |
+
+代价：后台重算期间内存翻倍（要克隆一份工作簿给子线程）。用 400MB 换 17 秒白屏，值得。
+
+### v0.9 增量重算 ✅ 2026-11-06
+
+**问题**：`commit_edit` 每次编辑都调 `recalc_all`，在 22.6 万条公式的表里等于每次回车卡 20 秒。
+
+**做法**：
+1. 打开文件时建依赖图（`formula::deps::Deps`）：每条公式记录它引用的矩形区域
+   - 不展开成逐格边（A1:A20000 会变成 2 万条边 × 22 万公式），只存矩形
+   - 另建「列号 → 公式列表」索引，某格变化时只查这一列
+2. 编辑后 `recalc_dirty(wb, deps, seeds)`：求出依赖闭包，只重算这些格子
+3. `Calc.scope`：不在本次范围内的公式单元格直接返回缓存值，不再求值
+4. 不需要拓扑排序——求值时递归拉取依赖，memo 保证每格只算一次
+
+**实测**（`work/stress/real100.xlsx`，152 MB / 43 万格 / 22.6 万公式）：
+
+| 操作 | 耗时 |
+|---|---|
+| 打开 + 首次全量重算 | 18.4 s（一次性） |
+| 建依赖图（126,011 条公式） | 0.35 s |
+| 改「明细!D」一行（触发 15,002 格重算） | **60 ms** |
+| 改「基础数据!D101」（只影响 1 格） | **0.2 ms** |
+| 无依赖的格子（表头） | 0.0 ms |
+
+**正确性**：改完 21 处后，把增量结果与「整表全量重算」逐格对比 → **0 处差异**。
+
+**遗留**：
+- 打开文件仍是同步重算（18 秒卡住窗口），需要改成后台算 + 进度提示
+- 依赖图在协作收到远端批量操作时没有增量更新，会退化成全量重建
+
+### v0.8 真实大文件压测 + 重算提速 ✅ 2026-11-06
+
+**测试文件** `work/stress/real100.xlsx`（openpyxl 生成，模拟真实业务表）：
+- 6 张表：基础数据(2万行×8) / 明细(1.5万行×10) / 汇总(500行) / 历史(2万行×5) / 透视(5000行×4) / 图片
+- 431,652 个单元格，**226,036 条公式**（VLOOKUP/SUMIF/SUMIFS/COUNTIFS/INDEX+MATCH/SUMPRODUCT/跨表引用）
+- 70 张 1600×1200 高熵 JPEG，文件 **152.7 MB**
+
+**结果**（release，单线程）：
+
+| 阶段 | 优化前 | 优化后 |
+|---|---|---|
+| 打开 | 0.29 s | 0.29 s |
+| 重算 | **115.4 s** | **19.1 s** |
+| 另存 | 1.9 s | 1.9 s |
+| CLI 峰值内存 | 233 MB | 481 MB |
+| GUI 工作集 | 138 MB | 138 MB |
+
+**做了什么**：
+1. 整列引用（`基础数据!A:A`）按表的实际使用范围裁剪，不再展开 104 万空单元格
+2. `Arg::Range` 改为 `Rc<Vec<FValue>>`，同一区域一轮重算只物化一次
+3. 区域缓存加 LRU（上限 1600 万格 ≈ 400 MB），避免逐行累积区间把内存吃穿
+   - 无上限时：23 s / 4.6 GB；加上限后：19 s / 481 MB
+4. 条件聚合（SUMIF/COUNTIF）的 criteria 预编译，逐格比较不再 `display().to_lowercase()`
+5. 精确匹配的 VLOOKUP/MATCH 建哈希索引，O(n) → O(1)
+6. 区域聚合结果缓存（SUM/SUMIF/COUNTIF/COUNTA/AVERAGE/MAX/MIN）
+
+**压测暴露的两个体验问题（尚未修）**：
+- `open_path` 同步调用 `recalc_all`，打开这个 152MB 文件时窗口会卡 19 秒
+- **每次编辑单元格都触发全量重算**（`commit_edit` 里直接 `recalc_all`），在 22.6 万条公式的表里等于每次回车卡 19 秒
+- 需要做增量重算（脏区 + 依赖追踪），否则大文件基本没法编辑
+
+### v0.7 函数补完 + 大文件压测 ✅ 2026-11-06
+- 函数 463 → **475**：新增 ODDFPRICE/ODDFYIELD/ODDLPRICE/ODDLYIELD（不规则首末期）、
+  BESSELI/J/K/Y（J/I 走级数，K/Y 走积分表示 + Simpson 求积）、
+  FORECAST.ETS 家族（ETS/CONFINT/SEASONALITY/STAT，Holt-Winters + 网格搜索平滑系数）
+- 测试 60 → **62**
+- 剩余 8 个函数需要外部世界，暂不做：WEBSERVICE、FILTERXML、IMAGE、STOCKHISTORY、RTD、GETPIVOTDATA、FIELDVALUE、BAHTTEXT
+- **大文件压测**（release，单线程）：
+
+| 文件 | 单元格 | 打开 | 重算 | 另存 | CLI 峰值内存 | GUI 工作集 |
+|---|---|---|---|---|---|---|
+| 5 万行 | 25 万 | 0.13 s | — | 0.69 s | 133 MB | — |
+| 20 万行 | 100 万 | 0.52 s | 0.01 s | 3.21 s | 471 MB | 208 MB |
+| 10 万行 / 20 万公式 | 60 万 | 0.36 s | 0.76 s | 1.85 s | 312 MB | — |
+| 50 万行 | 250 万 | 1.29 s | 0.03 s | 10.57 s | 1082 MB | 321 MB |
+
+- **瓶颈**：另存（10.57 s / 250 万格）和 CLI 峰值内存（1 GB）。原因：`xlsx::save` 走 umya-spreadsheet，
+  要在内存里重建整棵 DOM 再序列化。GUI 的工作集低得多（321 MB），因为它提前释放了 umya 的中间结构。
+- 下一步优化方向：自己写流式 sheet XML + zip，跳过 umya 的 DOM
+
+### v0.6 函数扩容 + 查找性能修复 ✅ 2026-11-06
+- 函数 419 → **463**
+- 新增：债券（PRICE/YIELD/DISC/INTRATE/RECEIVED/PRICEDISC/YIELDDISC/PRICEMAT/YIELDMAT）、
+  票息日（COUPNUM/COUPPCD/COUPNCD/COUPDAYS/COUPDAYBS/COUPDAYSNC）、
+  正则（REGEXTEST/REGEXEXTRACT/REGEXREPLACE，走 Rust regex crate）、
+  国际化工作日（NETWORKDAYS.INTL/WORKDAY.INTL，支持 1-17 周末码与 7 位字符串掩码）、
+  矩阵（MDETERM/MINVERSE）、财务补充（COVAR/PERCENTOF/LOGEST/BINOM.DIST.RANGE）、
+  数学（GAMMA/GAUSS/PHI/ACOTH/PERMUTATIONA/TDIST）、文本（CLEAN/ASC/DOLLAR/FIXED/NUMBERVALUE）、
+  日期（DATEVALUE/TIMEVALUE/DAYS360/ISOWEEKNUM）、信息（CELL/AREAS/INFO）
+- **性能修复**：VLOOKUP/HLOOKUP/MATCH/XMATCH/XLOOKUP 改为「区域只物化一次 + 直接读结果格」
+  - 1 万行 × 1 万次查找：37.68 s → **0.27 s**（140×），265 格/秒 → 36,698 格/秒
+- 顺带修：`INDIRECT` 返回的数组恒为 1×N（丢失行列），`range_dims/range_get` 不认数组参数，
+  导致 `VLOOKUP(x,INDIRECT("A1:B9"),2,FALSE)` 报 #REF!
+- 基准（release，单线程）：
+  - 简单引用 10 万格：0.29 s（34 万格/秒）
+  - SUM 滚动窗口 2 万格：0.14 s（14 万格/秒）
+  - VLOOKUP 1 万次：0.27 s（3.7 万格/秒）
+- 测试 57 → **60**
+
+### v0.5 公式扩充 + 协作加固 ✅ 2026-11-06
+- 函数 363 → **419**，覆盖 Excel 365 约 **85%**
+- 新增：假设检验（T.TEST/F.TEST/CHISQ.TEST）、回归（RSQ/FORECAST/STEYX/TREND/GROWTH/LINEST）、
+  百分位补充（PERCENTRANK/PERCENTILE.EXC/QUARTILE.EXC/RANK.AVG）、CONVERT（长度/质量/时间/体积/面积/温度）、
+  财务（VDB/DURATION/MDURATION/TBILLPRICE/TBILLYIELD/TBILLEQ/AMORLINC/AMORDEGRC）、
+  条件聚合（AVERAGEIFS/AGGREGATE/FREQUENCY/PROB/STDEVA/VARA/MODE.SNGL/MODE.MULT/COVARIANCE/PEARSON）、
+  文本数组（TEXTSPLIT/WRAPROWS/WRAPCOLS/ENCODEURL/HYPERLINK）、引用元信息（ISFORMULA/FORMULATEXT/SHEET/SHEETS）、
+  引用运算（INDIRECT/OFFSET/ADDRESS，修正 ROW()/COLUMN() 无参返回当前格）、
+  **LAMBDA 家族**（LAMBDA/MAP/REDUCE/SCAN/BYROW/BYCOL/MAKEARRAY/ISOMITTED）
+- 数组常量 `{1,2;3,4}` 进入词法/语法层（此前 `=SUM({1,2,3})` 直接 #VALUE!）
+- 测试 47 → **57**
+- 已知限制：`LET(f,LAMBDA(x,x+1),f(1))` 这种「把 LAMBDA 存进名字再调用」不支持，因为函数值没有类型；
+  LAMBDA 只能作为 MAP/REDUCE/BYROW 等函数的实参内联使用
+
+### v0.4 协作 ✅ 2026-11-06
+- 同步模型：每格「最后写入者胜出」，全序 = (Lamport 时间戳, 站点号)；可证明收敛
+- 拓扑：星形。谁开文档谁当宿主（TCP 7878），其他人连他；宿主转发并保存全量快照
+- 协议：行分隔 JSON（Hello / Welcome / Snapshot / Op / Cursor / Bye）
+- 客户端：`共享` 按钮启动宿主、填写 `IP:端口` 加入；在线人数、远端光标（带颜色与名字）实时显示
+- 采纳远端快照时清空本地残留，避免两边的旧内容混在一起
+- 测试：5 个同步内核用例 + 2 个真实 TCP 用例（含两端各改一格后收敛）
+- 双进程实测：A `--host` 启动宿主（192.0.2.232:7878），B `--join=127.0.0.1:7878` 加入，B 收到 50 条快照操作，A 记录到 `peer joined: example-user#76601`
+- 修：窗口静止时不重绘会导致收不到远端更新 → 协作中每 100ms 主动重绘
+- **口令**：宿主发 challenge，客户端回 sha256(nonce||口令)，口令不上线；空口令=开放
+- **断线重连**：客户端监督线程指数退避（1→10 秒），重连后自动拉新快照
+- 实测：宿主重启后客户端 2 次失败重试 → `ops: 50` 重新同步；错口令 `denied: 口令不正确`，对口令 `connected`
+
+### v0.4 协作
+- 宿主模式：一人开文件即监听，其他人按 IP 加入
+- CRDT 同步单元格变更、光标位置、在线名单
+- 断线重连、离线编辑后合并
+
+### v0.5 打包
+- Windows 安装包（MSI）、文件关联、开机自启
+- 绿色版单 exe
+
+## 明确不做的（第一年）
+
+- VBA 宏
+- 数据透视表编辑
+- 图表编辑（只显示）
+- Power Query
+- 打印排版精确对齐
+
+这些是 Excel 四十年积累的部分；先把“打开、编辑、协作、保存”做到可靠。
+
+## 与 ONLYOFFICE 路线的关系
+
+两条路并行不冲突：
+- ONLYOFFICE 路线：3 周可交付，功能全，但是 Chromium
+- 原生路线：从零开始，但内存小、可控、无 AGPL 约束
+
+原生版本达到可用（v0.4）之前，ONLYOFFICE 那套可以作为内部过渡工具。
+
+## 实测数字（v0.1，2026-11-06）
+
+同一台机器、同一个文件（sample.xlsx，14 个非空格）、启动后静置 7 秒测量。
+
+| 配置 | working set | private | exe |
+|---|---:|---:|---:|
+| wgpu + 全量中文字体（16 MB） | 308.8 MB | 353.0 MB | 14.07 MB |
+| glow(OpenGL) + 全量中文字体 | 105.0 MB | 113.0 MB | 10.12 MB |
+| **glow + 内嵌子集字体（2.8 MB）** | **74.0 MB** | **80.9 MB** | **12.76 MB** |
+
+结论：
+1. **后端比字体重要得多**。wgpu/DX12 在这台机器上多占 200 MB 以上（显存驻留计入 working set）；换 glow(OpenGL) 直接降到 105 MB。
+2. **字体子集再省 31 MB**：用 fontTools 把 `Deng.ttf` 裁成 GB2312 常用字（7,542 字，2.78 MB）并 `include_bytes!` 进二进制，内存 105 → 74 MB，中文渲染无缺字。
+3. 最终 v0.1 形态：**74 MB / 12.76 MB exe**，是同场景 wgpu 版的 1/4。
+
+注意：glow 依赖显卡 OpenGL 驱动；在某些远程桌面/无 GPU 环境会白屏（本项目在 RDP 会话里遇到过），需要探测失败时回退 wgpu 或软件渲染。
+
+## 与 ONLYOFFICE 桌面版对照（同机同文件）
+
+ONLYOFFICE Desktop Editors 10.0.0（官方安装包，2026-11），打开同一个 `sample.xlsx`，静置 30 秒后测量：
+
+| | 进程数 | working set | private |
+|---|---:|---:|---:|
+| ONLYOFFICE 桌面版 10.0 | 8 | **918.8 MB** | 819.6 MB |
+| 本项目 原生 v0.1 | 1 | **74.0 MB** | 80.9 MB |
+| 倍数 | 8× | **12.4×** | 10.1× |
+
+同一份数据、同一个测量方式（all processes sum, working set）。原生版约为其 1/12。
