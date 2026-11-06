@@ -8,6 +8,7 @@ pub mod merges;
 pub mod notes;
 pub mod page;
 pub mod patch;
+pub mod pivot;
 pub mod model;
 pub mod style;
 pub mod sort_filter;

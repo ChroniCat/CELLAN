@@ -65,6 +65,40 @@
 
 
 
+
+### v1.14 图表 ✅ 2026-11-06
+
+- 读：sheet 的 rels → `<drawing r:id>` → `xl/drawings/drawingN.xml`，
+  anchor 支持 `twoCellAnchor`（from/to）和 `oneCellAnchor`（from + ext，
+  EMU ÷ 9525 换算成像素再折成行列跨度）；drawing 的 rels 再定位 `chartN.xml`。
+- 解析：柱状/条形/折线/面积/饼/圆环/散点，标题、图例、系列名、分类、数值。
+  openpyxl 生成的图表只有 `<c:f>` 区间引用、没有缓存值时，按引用回表里读值。
+- 画：`chart_view.rs` 负责绘制——标题居中、图例色块+名字、纵轴 4 档刻度、
+  横轴分类标签（超过 12 个自动抽稀）、柱/线/面积/饼（圆环带内孔）。
+- 插入：`chart_write.rs` 从选区生成柱状图（首行系列名、首列分类），
+  新建 `chartN.xml` + `drawingN.xml` + 两处 rels + `[Content_Types]` 条目，
+  并在 sheet 里挂 `<drawing r:id>`；工作表原本没有 rels 文件时自动新建。
+- 验证：`chart.xlsx`（openpyxl 柱状+饼图）读出 2 张图、锚点 (1,4)-(14,9)/(19,4)-(32,9)、
+  系列值与类别齐全；插入的图表用 openpyxl 复核可识别（BarChart、2 系列）。
+
+**踩坑**：`extract_cell` 取 `<from>` 内容时用 `find('<')` 当结束位置，
+结果切到第一个子元素 `<col>` 上，body 为空；要按 `</from>` 配对。
+另外 `"f"` 的 End 分支里同时写了 `in_f = false` 和记录引用两个 arm，
+前一个把后一个挡住了，导致引用永远为空。
+
+### v1.15 数据透视表 ✅ 2026-11-06
+
+`crates/core/src/pivot.rs` + 插入菜单对话框。
+
+- 归集：按行字段分组，可选列字段交叉，值字段做求和/计数/平均/最大/最小，
+  末行自动加「总计」。
+- 输出：写成普通单元格块（Excel 的「粘贴为值」），任何工具都能读到数字。
+- 界面：源区域取「当前区域」，行/列/值字段按表头名字选，汇总方式五种，输出到当前选中格。
+- 取舍：不生成真正的 pivotTable 部件（需要 pivotCacheDefinition + pivotTableDefinition
+  两套结构），因此结果不能在 Excel 里拖字段重组——这是刻意的，投入产出不划算。
+- 验证：`table.xlsx` 按部门透视，研发 500、销售 500、行政 50、总计 1050；
+  计数/平均也核对过；写回并存盘后再读，G1 起的那块数据完整。
+
 ### v1.13 LET 与嵌套 LAMBDA ✅ 2026-11-06
 
 `FValue` 增加 `Lambda(Rc<LambdaVal>)`，函数成了一等公民：

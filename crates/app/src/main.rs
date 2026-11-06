@@ -48,6 +48,8 @@ struct SheetApp {
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
     show_pages: bool,
+    /// 透视表草稿
+    pivot_edit: Option<sheetcore::pivot::PivotSpec>,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -128,6 +130,7 @@ impl SheetApp {
             note_edit: None,
             filter_popup: None,
             show_pages: false,
+            pivot_edit: None,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -670,6 +673,24 @@ impl SheetApp {
                     ui.close_menu();
                 }
                 ui.label(egui::RichText::new("首行=系列名，首列=分类").weak());
+                ui.separator();
+                if ui.button("数据透视表…").clicked() {
+                    let (r, c) = self.sel;
+                    let (r1, c1, r2, c2) =
+                        sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+                    if c2 <= c1 || r2 <= r1 {
+                        self.status = "当前区域太小，选一个带表头的表格".into();
+                    } else {
+                        self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
+                            source: (r1, c1, r2, c2),
+                            row_field: c1,
+                            col_field: None,
+                            value_field: c2,
+                            agg: sheetcore::pivot::Agg::Sum,
+                        });
+                    }
+                    ui.close_menu();
+                }
             });
             ui.separator();
 
@@ -1641,6 +1662,142 @@ impl SheetApp {
         self.wb.dirty = true;
     }
 
+
+    /// 数据透视表对话框
+    fn pivot_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut spec) = self.pivot_edit.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        // 源区域表头
+        let (sr1, sc1, _, sc2) = spec.source;
+        let fields: Vec<(u32, String)> = (sc1..=sc2)
+            .map(|c| {
+                (
+                    c,
+                    self.wb
+                        .sheet(self.sheet_idx)
+                        .get(sr1, c)
+                        .map(|x| x.value.display())
+                        .unwrap_or_else(|| cell_name(0, c)),
+                )
+            })
+            .collect();
+        let fname = |c: u32| {
+            fields
+                .iter()
+                .find(|(cc, _)| *cc == c)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default()
+        };
+        egui::Window::new("数据透视表")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("pivot_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("源区域");
+                    ui.label(format!(
+                        "{}-{}（{} 行）",
+                        cell_name(spec.source.0, spec.source.1),
+                        cell_name(spec.source.2, spec.source.3),
+                        spec.source.2 - spec.source.0
+                    ));
+                    ui.end_row();
+
+                    ui.label("行字段");
+                    egui::ComboBox::from_id_salt("pivot_row")
+                        .selected_text(fname(spec.row_field))
+                        .show_ui(ui, |ui| {
+                            for (c, n) in fields.iter() {
+                                if ui.selectable_label(spec.row_field == *c, n).clicked() {
+                                    spec.row_field = *c;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("列字段");
+                    egui::ComboBox::from_id_salt("pivot_col")
+                        .selected_text(match spec.col_field {
+                            Some(c) => fname(c),
+                            None => "（无）".into(),
+                        })
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(spec.col_field.is_none(), "（无）").clicked() {
+                                spec.col_field = None;
+                            }
+                            for (c, n) in fields.iter() {
+                                if ui.selectable_label(spec.col_field == Some(*c), n).clicked() {
+                                    spec.col_field = Some(*c);
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("值字段");
+                    egui::ComboBox::from_id_salt("pivot_val")
+                        .selected_text(fname(spec.value_field))
+                        .show_ui(ui, |ui| {
+                            for (c, n) in fields.iter() {
+                                if ui.selectable_label(spec.value_field == *c, n).clicked() {
+                                    spec.value_field = *c;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("汇总方式");
+                    egui::ComboBox::from_id_salt("pivot_agg")
+                        .selected_text(spec.agg.label())
+                        .show_ui(ui, |ui| {
+                            for a in [
+                                sheetcore::pivot::Agg::Sum,
+                                sheetcore::pivot::Agg::Count,
+                                sheetcore::pivot::Agg::Avg,
+                                sheetcore::pivot::Agg::Max,
+                                sheetcore::pivot::Agg::Min,
+                            ] {
+                                if ui.selectable_label(spec.agg == a, a.label()).clicked() {
+                                    spec.agg = a;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("输出到");
+                    let (r, c) = self.sel;
+                    ui.label(format!("{}（当前选中格）", cell_name(r, c)));
+                    ui.end_row();
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("生成").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), &spec);
+            let at = self.sel;
+            let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = format!(
+                "透视表已生成：{} 行 × {} 列（{}）",
+                rect.2 - rect.0 + 1,
+                rect.3 - rect.1 + 1,
+                spec.agg.label()
+            );
+        } else if !cancel && open {
+            self.pivot_edit = Some(spec);
+        }
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -2604,6 +2761,7 @@ impl eframe::App for SheetApp {
         self.dv_dialog(ctx);
         self.note_dialog(ctx);
         self.filter_dialog(ctx);
+        self.pivot_dialog(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
