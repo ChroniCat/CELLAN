@@ -1011,3 +1011,43 @@ mod page_tests {
         assert!(out.contains("$1:$2"));
     }
 }
+
+/// 往 zip 里追加一个条目（同名已存在则替换）
+pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("addtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        let mut replaced = false;
+        for i in 0..zip.len() {
+            let (n, buf) = {
+                let mut e = zip.by_index(i)?;
+                let n = e.name().to_string();
+                let mut b = Vec::new();
+                e.read_to_end(&mut b)?;
+                (n, b)
+            };
+            zw.start_file(n.clone(), opts())?;
+            if n == name {
+                zw.write_all(body)?;
+                replaced = true;
+            } else {
+                zw.write_all(&buf)?;
+            }
+        }
+        if !replaced {
+            zw.start_file(name.to_string(), opts())?;
+            zw.write_all(body)?;
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}

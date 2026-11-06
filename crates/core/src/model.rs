@@ -294,6 +294,8 @@ impl Sheet {
 
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
+    /// 文件里是否带 VBA 宏（只保留，不执行）
+    pub has_vba: bool,
     /// 样式表（单元格只存索引，见 Sheet.styles）
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
@@ -304,6 +306,7 @@ pub struct Workbook {
 impl Workbook {
     pub fn new_blank() -> Self {
         Self {
+            has_vba: false,
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
             dirty: false,

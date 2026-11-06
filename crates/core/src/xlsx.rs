@@ -24,6 +24,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
     let names = reader.sheet_names().to_owned();
 
     let mut wb = Workbook {
+        has_vba: crate::vba::has_macros(path),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         dirty: false,
@@ -165,6 +166,8 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         Some(p) => p.clone(),
         None => path.to_path_buf(),
     };
+    // 宏部件：umya 写不出来，先留一份，写完塞回去
+    let vba = crate::vba::read_vba(&base);
     let mut book = if base.exists() {
         read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
     } else {

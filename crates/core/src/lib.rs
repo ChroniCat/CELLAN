@@ -13,6 +13,7 @@ pub mod model;
 pub mod style;
 pub mod sort_filter;
 pub mod store;
+pub mod vba;
 pub mod sync;
 pub mod xlsx;
 

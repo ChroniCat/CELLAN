@@ -33,6 +33,8 @@ struct SheetApp {
     last_view: Vec2,
     /// 只 dump 一帧
     dump_once: bool,
+    /// 一帧里多个面板的绘制记录
+    dump_accum: String,
     /// 条件格式统计缓存（按 doc_gen 失效）
     cf_stats: sheetcore::cf::CfStats,
     cf_stats_gen: u64,
@@ -51,6 +53,10 @@ struct SheetApp {
     show_pages: bool,
     /// 透视表草稿
     pivot_edit: Option<sheetcore::pivot::PivotSpec>,
+    /// 并排比较的第二个工作簿 + 表序号 + 滚动
+    compare: Option<(sheetcore::model::Workbook, usize, Vec2)>,
+    /// 同步滚动
+    compare_sync: bool,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -122,6 +128,7 @@ impl SheetApp {
             },
             last_view: Vec2::new(800.0, 600.0),
             dump_once: true,
+            dump_accum: String::new(),
             cf_stats: sheetcore::cf::CfStats::default(),
             cf_stats_gen: u64::MAX,
             cf_v1: "100".into(),
@@ -132,6 +139,16 @@ impl SheetApp {
             filter_popup: None,
             show_pages: false,
             pivot_edit: None,
+            compare: {
+                let mut c = None;
+                if let Ok(p) = std::env::var("SC_COMPARE") {
+                    if let Ok(wb) = sheetcore::xlsx::load(std::path::Path::new(&p)) {
+                        c = Some((wb, 0, Vec2::ZERO));
+                    }
+                }
+                c
+            },
+            compare_sync: true,
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -1653,6 +1670,22 @@ impl SheetApp {
             if ui.checkbox(&mut self.show_pages, "显示分页虚线").clicked() {
                 ui.close_menu();
             }
+            ui.separator();
+            if ui.button("并排比较…").clicked() {
+                self.open_compare();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(self.compare.is_some(), egui::Button::new("关闭并排比较"))
+                .clicked()
+            {
+                self.compare = None;
+                self.status = "已关闭并排比较".into();
+                ui.close_menu();
+            }
+            if self.compare.is_some() {
+                ui.checkbox(&mut self.compare_sync, "同步纵向滚动");
+            }
             ui.label(format!(
                 "页数约 {}×{}",
                 sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx)).0.len() + 1,
@@ -1693,6 +1726,23 @@ impl SheetApp {
                 self.status = format!("已插入图表（{} 个系列）", ch.series.len());
             }
             Err(e) => self.status = format!("插入图表失败：{e}"),
+        }
+    }
+
+    /// 选一个文件放到右半边
+    fn open_compare(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Excel 文件", &["xlsx", "xlsm", "xls"])
+            .set_title("选择要并排比较的文件")
+            .pick_file();
+        let Some(path) = picked else { return };
+        match sheetcore::xlsx::load(&path) {
+            Ok(wb) => {
+                let n = wb.sheets.len();
+                self.compare = Some((wb, 0, Vec2::ZERO));
+                self.status = format!("并排比较：{}（{n} 张表，只读）", path.display());
+            }
+            Err(e) => self.status = format!("打开失败：{e}"),
         }
     }
 
@@ -1839,7 +1889,69 @@ impl SheetApp {
         }
     }
 
+
+    /// 主入口：没有比较对象时整块画；有就左右各一半
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.compare.is_none() {
+            self.draw_grid_pane(ui, ctx, false);
+            self.flush_dump();
+            return;
+        }
+        let avail = ui.available_size();
+        let half = (avail.x - 8.0) / 2.0;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui(Vec2::new(half, avail.y), |ui| {
+                self.draw_grid_pane(ui, ctx, false);
+            });
+            ui.separator();
+            ui.allocate_ui(Vec2::new(half, avail.y), |ui| {
+                // 把状态临时换成「第二个工作簿」，画完再换回来
+                let mut cmp = self.compare.take().unwrap();
+                let (cmp_wb, cmp_sheet, cmp_scroll) = (std::mem::take(&mut cmp.0), cmp.1, cmp.2);
+                let saved_wb = std::mem::replace(&mut self.wb, cmp_wb);
+                let saved_sheet = self.sheet_idx;
+                let saved_scroll = self.scroll;
+                let saved_sel = self.sel;
+                let saved_sel_end = self.sel_end;
+                self.sheet_idx = cmp_sheet;
+                self.scroll = cmp_scroll;
+                self.sel = (0, 0);
+                self.sel_end = (0, 0);
+                if self.compare_sync {
+                    self.scroll.y = saved_scroll.y;
+                }
+                if std::env::var("SC_DUMP").is_ok() {
+                    eprintln!("[cmp] 第二个面板 avail={:?} sheet={}", ui.available_size(), self.wb.sheets.len());
+                }
+                self.draw_grid_pane(ui, ctx, true);
+                // 收回滚动位置与工作簿
+                let used_scroll = self.scroll;
+                cmp.0 = std::mem::replace(&mut self.wb, saved_wb);
+                cmp.2 = used_scroll;
+                self.sheet_idx = saved_sheet;
+                self.scroll = saved_scroll;
+                self.sel = saved_sel;
+                self.sel_end = saved_sel_end;
+                self.cf_stats_gen = u64::MAX; // 换回来要重算条件格式统计
+                self.compare = Some(cmp);
+            });
+        });
+        self.flush_dump();
+    }
+
+    /// 把这一帧两个面板的绘制记录写出去（只写一次）
+    fn flush_dump(&mut self) {
+        if self.dump_accum.is_empty() {
+            return;
+        }
+        if let Ok(path) = std::env::var("SC_DUMP") {
+            let _ = std::fs::write(path, &self.dump_accum);
+            self.dump_once = false;
+            self.dump_accum.clear();
+        }
+    }
+
+    fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
         self.last_view = avail;
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
@@ -1908,9 +2020,10 @@ impl SheetApp {
         let mut dump: Vec<String> = Vec::new();
         let dumping = std::env::var("SC_DUMP").is_ok()
             && self.dump_once
+            && self.open_rx.is_none()
             && self.wb.sheets.iter().any(|s| s.len() > 0);
         if dumping {
-            self.dump_once = false;
+            dump.push(format!("pane readonly={readonly} rect=({:.0},{:.0},{:.0},{:.0})", resp.rect.min.x, resp.rect.min.y, resp.rect.max.x, resp.rect.max.y));
             dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{}) sel={:?} dv={} cf={}", avail, off_x, off_y, first_col, first_row, self.sel, self.wb.sheet(self.sheet_idx).dv.len(), self.wb.sheet(self.sheet_idx).cf.blocks.len()));
         }
 
@@ -2414,7 +2527,7 @@ impl SheetApp {
         }
 
         // 拖拽框选
-        if resp.dragged() {
+        if !readonly && resp.dragged() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let dx = pos.x - (origin.x + HEAD_W);
                 let dy = pos.y - (origin.y + HEAD_H);
@@ -2435,7 +2548,7 @@ impl SheetApp {
         }
 
         // 点击选中
-        if resp.clicked() {
+        if !readonly && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let dx = pos.x - (origin.x + HEAD_W);
                 let dy = pos.y - (origin.y + HEAD_H);
@@ -2487,7 +2600,7 @@ impl SheetApp {
                 if dumping {
                     dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items(dv, self.wb.sheet(self.sheet_idx)).len()));
                 }
-                if resp.clicked() {
+                if !readonly && resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         if btn.contains(pos) {
                             open_list = true;
@@ -2554,8 +2667,8 @@ impl SheetApp {
             }
         }
 
-        // 编辑框
-        if let Some(mut ed) = self.editing.take() {
+        // 编辑框（只读面板不画）
+        if let Some(mut ed) = if readonly { None } else { self.editing.take() } {
             let rect = Rect::from_min_size(
                 egui::pos2(sx, sy),
                 Vec2::new(sw.max(160.0), sh.max(rows.size(sr1))),
@@ -2594,10 +2707,10 @@ impl SheetApp {
         }
 
         if !dump.is_empty() {
-            if let Ok(path) = std::env::var("SC_DUMP") {
-                let _ = std::fs::write(path, dump.join("
+            self.dump_accum.push_str(&dump.join("
 "));
-            }
+            self.dump_accum.push_str("
+");
         }
     }
 
@@ -2846,6 +2959,12 @@ impl eframe::App for SheetApp {
                 }
                 ui.separator();
                 ui.label(format!("{}{}", self.wb.title(), if self.wb.dirty { " *" } else { "" }));
+                if self.wb.has_vba {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 110, 0),
+                        "含宏（保留不执行）",
+                    );
+                }
                 ui.separator();
                 ui.label(self.status.clone());
             });
