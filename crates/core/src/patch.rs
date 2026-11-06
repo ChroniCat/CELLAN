@@ -540,3 +540,91 @@ mod dv_tests {
         assert!(dv_xml(&[dv]).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// 冻结窗格
+// ---------------------------------------------------------------------------
+
+/// 写入/清除 <pane>：没有就建成 <sheetView>…</sheetView>，有就先删掉旧的
+pub fn set_freeze_xml(xml: &str, freeze: Option<(u32, u32)>) -> String {
+    // 先去掉已有的 pane
+    let mut base = String::with_capacity(xml.len());
+    {
+        let mut rest = xml;
+        while let Some(i) = rest.find("<pane") {
+            base.push_str(&rest[..i]);
+            if let Some(e) = rest[i..].find("/>") {
+                rest = &rest[i + e + 2..];
+            } else if let Some(e) = rest[i..].find("</pane>") {
+                rest = &rest[i + e + 7..];
+            } else {
+                rest = "";
+            }
+        }
+        base.push_str(rest);
+    }
+    let Some((rows, cols)) = freeze else { return base };
+    if rows == 0 && cols == 0 {
+        return base;
+    }
+    let pane = format!(
+        "<pane xSplit=\"{cols}\" ySplit=\"{rows}\" topLeftCell=\"{}{}\" activePane=\"bottomRight\" state=\"frozen\"/>",
+        crate::model::col_label(cols),
+        rows + 1
+    );
+    // 找第一个 <sheetView（注意别匹配到 <sheetViews>）
+    let mut found = None;
+    let mut from = 0;
+    while let Some(rel) = base[from..].find("<sheetView") {
+        let i = from + rel;
+        let after = base[i + "<sheetView".len()..].chars().next();
+        if matches!(after, Some(' ') | Some('>') | Some('/')) {
+            found = Some(i);
+            break;
+        }
+        from = i + 1;
+    }
+    let Some(i) = found else { return base };
+    let Some(gt_rel) = base[i..].find('>') else { return base };
+    let gt = i + gt_rel;
+    let self_closing = gt > i && base[..gt].ends_with('/');
+    if self_closing {
+        let mut out = String::with_capacity(base.len() + pane.len() + 20);
+        out.push_str(&base[..gt - 1]);
+        out.push('>');
+        out.push_str(&pane);
+        out.push_str("</sheetView>");
+        out.push_str(&base[gt + 1..]);
+        return out;
+    }
+    let mut out = String::with_capacity(base.len() + pane.len());
+    out.push_str(&base[..gt + 1]);
+    out.push_str(&pane);
+    out.push_str(&base[gt + 1..]);
+    out
+}
+
+#[cfg(test)]
+mod freeze_tests {
+    use super::*;
+
+    #[test]
+    fn adds_pane_to_self_closing_view() {
+        let xml = r#"<worksheet><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetData/></worksheet>"#;
+        let out = set_freeze_xml(xml, Some((1, 2)));
+        assert!(out.contains("<pane xSplit=\"2\" ySplit=\"1\" topLeftCell=\"C2\""));
+        assert!(out.contains("</sheetView>"));
+        assert!(out.contains("<sheetData/>"));
+    }
+
+    #[test]
+    fn replaces_existing_and_clears() {
+        let xml = r#"<worksheet><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" state="frozen"/></sheetView></sheetViews></worksheet>"#;
+        let out = set_freeze_xml(xml, Some((3, 1)));
+        assert_eq!(out.matches("<pane").count(), 1, "旧 pane 应被替换");
+        assert!(out.contains("ySplit=\"3\""));
+        let cleared = set_freeze_xml(&out, None);
+        assert!(!cleared.contains("<pane"));
+        assert!(cleared.contains("<sheetView"));
+    }
+}

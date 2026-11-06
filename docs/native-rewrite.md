@@ -62,6 +62,25 @@
 
 
 
+
+### v1.11 冻结窗格 ✅ 2026-11-06
+
+- 读：`<sheetView><pane xSplit/ySplit state="frozen"/>`；只认 `frozen`/`frozenSplit`，
+  普通拆分窗格（split）不当作冻结。
+- 存：`patch.rs::set_freeze_xml` 改 `<sheetView>`——自闭合形式展开成带 `<pane>` 的子节点，
+  取消冻结就是删掉 pane。注意别把 `<sheetViews>` 当成 `<sheetView>`（差一个 s）。
+- 画：整个绘制拆成四块——主体（行≥fy、列≥fx）、冻结列（列<fx，横向不动）、
+  冻结行（行<fy，纵向不动）、左上角（都不动）。每块各自 `with_clip_rect`，
+  单元格绘制抽成 `paint_cell()` 复用，批注红三角、条件格式、边框一视同仁。
+- 表头跟着冻结：冻结列的列字母、冻结行的行号固定不滚；冻结边界画一条深一点的线区分。
+- 交互：视图菜单 → 冻结首行 / 冻结首列 / 冻结到当前单元格 / 取消冻结；点击命中会先判断
+  落在冻结区还是主体区，再换算行列。
+
+**验证**：`freeze.xlsx`（openpyxl `freeze_panes="C2"`）读回 `(1, 2)`；
+改成 `(3,1)` 另存后读回一致；再取消冻结另存，读回 `None`。
+几何导出：`freeze rows=1 cols=2 body=(540,111)`，冻结标题「姓名」画在 y=100 固定带内，
+主体首格 `(1,2)` 落在 y=144，两列宽的偏移量 208px 与列宽一致。
+
 ### v1.10 批注 ✅ 2026-11-06
 
 `crates/core/src/notes.rs`（读取）、umya 回写（它自带 comments + vml 绘图生成）。

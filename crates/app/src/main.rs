@@ -647,6 +647,10 @@ impl SheetApp {
                 });
             ui.separator();
 
+            // 视图（冻结窗格）
+            self.toolbar_view(ui);
+            ui.separator();
+
             // 审阅（批注）
             self.toolbar_notes(ui);
             ui.separator();
@@ -1144,6 +1148,169 @@ impl SheetApp {
         }
     }
 
+    /// 画一个单元格：底色、条件格式、文字、边框、批注标记。
+    /// 冻结窗格要复用它，所以单独拎出来。
+    fn paint_cell(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        r: u32,
+        c: u32,
+        note: Option<&sheetcore::notes::Note>,
+        ov: Option<&sheetcore::cf::Overlay>,
+        dumping: bool,
+        dump: &mut Vec<String>,
+    ) {
+        let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
+        let st = self.wb.styles.get(sid);
+        if self.sel == (r, c) && st.fill.is_none() {
+            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(26, 115, 232, 40));
+        }
+        if let Some(fill) = st.fill {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
+            if dumping {
+                dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
+            }
+        }
+        if let Some(ov) = ov {
+            if let Some(f) = ov.fill {
+                painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
+                if dumping {
+                    dump.push(format!("cf-fill ({},{}) rgb={:?}", r, c, f));
+                }
+            }
+            if let Some((t, col)) = ov.bar {
+                let w = (rect.width() * t).max(0.0);
+                if w > 0.5 {
+                    painter.rect_filled(
+                        Rect::from_min_size(rect.min, Vec2::new(w, rect.height())),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(col[0], col[1], col[2], 150),
+                    );
+                    if dumping {
+                        dump.push(format!("cf-bar ({},{}) w={:.0} rgb={:?}", r, c, w, col));
+                    }
+                }
+            }
+        }
+        if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
+            let txt = sheetcore::style::format_value(&cell.value, &st.format);
+            if !txt.is_empty() {
+                let is_num = matches!(cell.value, Value::Number(_));
+                let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
+                let base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
+                let font = FontId::proportional(if st.bold || cf_bold {
+                    st.size + 0.6
+                } else {
+                    st.size
+                });
+                let color = Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
+                let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
+                    Align2::CENTER_CENTER
+                } else if st.halign == 3 || (st.halign == 0 && is_num) {
+                    Align2::RIGHT_CENTER
+                } else {
+                    Align2::LEFT_CENTER
+                };
+                let tx = match align {
+                    Align2::CENTER_CENTER => rect.center().x,
+                    Align2::RIGHT_CENTER => rect.max.x - 4.0,
+                    _ => rect.min.x + 4.0,
+                };
+                let ty = if st.valign == 1 {
+                    rect.min.y + 4.0
+                } else if st.valign == 3 {
+                    rect.max.y - 4.0
+                } else {
+                    rect.center().y
+                };
+                painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
+                if dumping {
+                    dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
+                }
+            }
+        }
+        if let Some(n) = note {
+            let (rx, ry) = (rect.right(), rect.top());
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(rx - 7.0, ry),
+                    egui::pos2(rx, ry),
+                    egui::pos2(rx, ry + 7.0),
+                ],
+                Color32::from_rgb(192, 0, 0),
+                egui::Stroke::NONE,
+            ));
+            if dumping {
+                dump.push(format!("note ({},{}) 作者={} 文字={:?}", r, c, n.author, n.text));
+            }
+        }
+        let bd = &st.border;
+        if bd[0].style != 0 || bd[1].style != 0 || bd[2].style != 0 || bd[3].style != 0 {
+            let (l, t, rr, bb) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+            if dumping {
+                dump.push(format!("border ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) 左{:?} 右{:?} 上{:?} 下{:?}", r, c, l, t, rr, bb, bd[0].style, bd[1].style, bd[2].style, bd[3].style));
+            }
+            draw_edge(painter, egui::pos2(l, t), egui::pos2(l, bb), &bd[0]);
+            draw_edge(painter, egui::pos2(rr, t), egui::pos2(rr, bb), &bd[1]);
+            draw_edge(painter, egui::pos2(l, t), egui::pos2(rr, t), &bd[2]);
+            draw_edge(painter, egui::pos2(l, bb), egui::pos2(rr, bb), &bd[3]);
+        }
+    }
+
+
+    /// 视图菜单：冻结窗格
+    fn toolbar_view(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("视图", |ui| {
+            ui.set_min_width(190.0);
+            let cur = self.wb.sheet(self.sheet_idx).freeze;
+            if ui.button("冻结首行").clicked() {
+                self.set_freeze(Some((1, 0)));
+                ui.close_menu();
+            }
+            if ui.button("冻结首列").clicked() {
+                self.set_freeze(Some((0, 1)));
+                ui.close_menu();
+            }
+            let (r, c) = self.sel;
+            if ui
+                .button(format!("冻结到当前单元格（{}{}）", cell_name(r, c), ""))
+                .clicked()
+            {
+                self.set_freeze(Some((r, c)));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(cur.is_some(), egui::Button::new("取消冻结"))
+                .clicked()
+            {
+                self.set_freeze(None);
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.label(match cur {
+                Some((r, c)) => format!("当前冻结 {r} 行 / {c} 列"),
+                None => "未冻结".into(),
+            });
+        });
+    }
+
+    fn set_freeze(&mut self, v: Option<(u32, u32)>) {
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        sheet.freeze = match v {
+            Some((r, c)) if r == 0 && c == 0 => None,
+            other => other,
+        };
+        sheet.freeze_dirty = true;
+        self.wb.dirty = true;
+        self.scroll = Vec2::ZERO;
+        self.status = match v {
+            Some((r, c)) if r > 0 || c > 0 => format!("已冻结 {r} 行 / {c} 列"),
+            _ => "已取消冻结".to_string(),
+        };
+    }
+
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -1168,8 +1335,15 @@ impl SheetApp {
         self.scroll.y = self.scroll.y.clamp(0.0, max_y);
 
         let (off_x, off_y) = (self.scroll.x, self.scroll.y);
-        let first_col = cols.index_at(off_x);
-        let first_row = rows.index_at(off_y);
+        // 冻结窗格：滚动区域整体平移出冻结条
+        let (fy, fx) = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
+        let (fy, fx) = (fy.min(200), fx.min(50));
+        let frozen_w = cols.pos(fx);
+        let frozen_h = rows.pos(fy);
+        let body_x = origin.x + HEAD_W + frozen_w;
+        let body_y = origin.y + HEAD_H + frozen_h;
+        let first_col = cols.index_at(off_x).max(fx);
+        let first_row = rows.index_at(off_y).max(fy);
         if std::env::var("SC_DBG_GRID").is_ok() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1178,8 +1352,23 @@ impl SheetApp {
                     avail, (off_x, off_y), cols.len(), rows.len(), first_col, first_row);
             }
         }
-        let gx = |c: u32| origin.x + HEAD_W + cols.pos(c) - off_x;
-        let gy = |r: u32| origin.y + HEAD_H + rows.pos(r) - off_y;
+        let gx = |c: u32| body_x + cols.pos(c) - off_x;
+        let gy = |r: u32| body_y + rows.pos(r) - off_y;
+        // 冻结区里的格子用固定坐标
+        let px_of = |c: u32| {
+            if c < fx {
+                origin.x + HEAD_W + cols.pos(c)
+            } else {
+                gx(c)
+            }
+        };
+        let py_of = |r: u32| {
+            if r < fy {
+                origin.y + HEAD_H + rows.pos(r)
+            } else {
+                gy(r)
+            }
+        };
 
         let mut dump: Vec<String> = Vec::new();
         let dumping = std::env::var("SC_DUMP").is_ok() && self.dump_once;
@@ -1198,6 +1387,22 @@ impl SheetApp {
             0.0,
             head_bg,
         );
+        // 冻结列的标题（固定不动）
+        for c in 0..fx {
+            let x = origin.x + HEAD_W + cols.pos(c);
+            let w = cols.size(c);
+            painter.text(
+                egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
+                Align2::CENTER_CENTER,
+                col_label(c),
+                FontId::proportional(12.0),
+                Color32::from_rgb(90, 90, 90),
+            );
+            painter.line_segment(
+                [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
+                Stroke::new(1.0, grid_line),
+            );
+        }
         let mut c = first_col;
         let mut guard = 0;
         while gx(c) < origin.x + avail.x && guard < 4096 {
@@ -1221,6 +1426,21 @@ impl SheetApp {
         }
 
         // 行标题
+        for r in 0..fy {
+            let y = origin.y + HEAD_H + rows.pos(r);
+            let h = rows.size(r);
+            painter.text(
+                egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
+                Align2::CENTER_CENTER,
+                (r + 1).to_string(),
+                FontId::proportional(12.0),
+                Color32::from_rgb(90, 90, 90),
+            );
+            painter.line_segment(
+                [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
+                Stroke::new(1.0, grid_line),
+            );
+        }
         let mut r = first_row;
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
@@ -1326,111 +1546,136 @@ impl SheetApp {
                     rect.set_width((cols.pos(mc2 + 1) - cols.pos(mc1)).max(cw));
                     rect.set_height((rows.pos(mr2 + 1) - rows.pos(mr1)).max(rh));
                 }
-                let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
-                let st = self.wb.styles.get(sid);
-                // 选中底色先画，自带填充后画（否则会把真实颜色染偏）
-                if self.sel == (r, c) && st.fill.is_none() {
-                    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(26, 115, 232, 40));
-                }
-                if let Some(fill) = st.fill {
-                    painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
-                    if dumping {
-                        dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
-                    }
-                }
-                // 条件格式：填充、数据条（画在文字下面）
-                let ov = cf_map.get(&(r, c));
-                if let Some(ov) = ov {
-                    if let Some(f) = ov.fill {
-                        painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
-                        if dumping {
-                            dump.push(format!("cf-fill ({},{}) rgb={:?}", r, c, f));
-                        }
-                    }
-                    if let Some((t, col)) = ov.bar {
-                        let w = (rect.width() * t).max(0.0);
-                        if w > 0.5 {
-                            painter.rect_filled(
-                                Rect::from_min_size(rect.min, Vec2::new(w, rect.height())),
-                                0.0,
-                                Color32::from_rgba_unmultiplied(col[0], col[1], col[2], 150),
-                            );
-                            if dumping {
-                                dump.push(format!("cf-bar ({},{}) w={:.0} rgb={:?}", r, c, w, col));
-                            }
-                        }
-                    }
-                }
-                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
-                    let txt = sheetcore::style::format_value(&cell.value, &st.format);
-                    if !txt.is_empty() {
-                        let is_num = matches!(cell.value, Value::Number(_));
-                        let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
-                        let base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
-                        let font = FontId::proportional(if st.bold || cf_bold {
-                            st.size + 0.6
-                        } else {
-                            st.size
-                        });
-                        let color =
-                            Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
-                        let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
-                            Align2::CENTER_CENTER
-                        } else if st.halign == 3 || (st.halign == 0 && is_num) {
-                            Align2::RIGHT_CENTER
-                        } else {
-                            Align2::LEFT_CENTER
-                        };
-                        let tx = match align {
-                            Align2::CENTER_CENTER => rect.center().x,
-                            Align2::RIGHT_CENTER => rect.max.x - 4.0,
-                            _ => rect.min.x + 4.0,
-                        };
-                        let ty = if st.valign == 1 {
-                            rect.min.y + 4.0
-                        } else if st.valign == 3 {
-                            rect.max.y - 4.0
-                        } else {
-                            rect.center().y
-                        };
-                        painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
-                        if dumping {
-                            dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
-                        }
-                    }
-                }
-                // 批注标记：右上角小红三角
-                if let Some(n) = notes.get(&sheetcore::model::CellRef::new(r, c)) {
-                    let (rx, ry) = (rect.right(), rect.top());
-                    painter.add(egui::Shape::convex_polygon(
-                        vec![
-                            egui::pos2(rx - 7.0, ry),
-                            egui::pos2(rx, ry),
-                            egui::pos2(rx, ry + 7.0),
-                        ],
-                        Color32::from_rgb(192, 0, 0),
-                        egui::Stroke::NONE,
-                    ));
-                    if dumping {
-                        dump.push(format!("note ({},{}) 作者={} 文字={:?}", r, c, n.author, n.text));
-                    }
-                }
-
-                // 边框（合并区域按整块画）
-                let bd = &st.border;
-                if bd[0].style != 0 || bd[1].style != 0 || bd[2].style != 0 || bd[3].style != 0 {
-                    let (l, t, rr, bb) = (rect.left(), rect.top(), rect.right(), rect.bottom());
-                    if dumping {
-                        dump.push(format!("border ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) 左{:?} 右{:?} 上{:?} 下{:?}", r, c, l, t, rr, bb, bd[0].style, bd[1].style, bd[2].style, bd[3].style));
-                    }
-                    draw_edge(&painter, egui::pos2(l, t), egui::pos2(l, bb), &bd[0]);
-                    draw_edge(&painter, egui::pos2(rr, t), egui::pos2(rr, bb), &bd[1]);
-                    draw_edge(&painter, egui::pos2(l, t), egui::pos2(rr, t), &bd[2]);
-                    draw_edge(&painter, egui::pos2(l, bb), egui::pos2(rr, bb), &bd[3]);
-                }
+                self.paint_cell(
+                    &painter,
+                    rect,
+                    r,
+                    c,
+                    notes.get(&sheetcore::model::CellRef::new(r, c)),
+                    cf_map.get(&(r, c)),
+                    dumping,
+                    &mut dump,
+                );
                 c += 1;
             }
             r += 1;
+        }
+
+        // 冻结区单元格（覆盖在主体之上）
+        if fx > 0 || fy > 0 {
+            let clip_left = Rect::from_min_max(
+                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(body_x, origin.y + avail.y),
+            );
+            let clip_top = Rect::from_min_max(
+                egui::pos2(body_x, origin.y + HEAD_H),
+                egui::pos2(origin.x + avail.x, body_y),
+            );
+            let clip_corner = Rect::from_min_max(
+                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(body_x, body_y),
+            );
+            if fx > 0 {
+                let p2 = painter.with_clip_rect(clip_left);
+                let mut rr = first_row;
+                let mut g = 0;
+                while gy(rr) < origin.y + avail.y && g < 4000 {
+                    g += 1;
+                    let y = gy(rr);
+                    let h = rows.size(rr);
+                    if y + h > origin.y + HEAD_H {
+                        for cc in 0..fx {
+                            let rect = Rect::from_min_size(
+                                egui::pos2(origin.x + HEAD_W + cols.pos(cc), y),
+                                Vec2::new(cols.size(cc), h),
+                            );
+                            self.paint_cell(
+                                &p2,
+                                rect,
+                                rr,
+                                cc,
+                                notes.get(&sheetcore::model::CellRef::new(rr, cc)),
+                                cf_map.get(&(rr, cc)),
+                                dumping,
+                                &mut dump,
+                            );
+                        }
+                    }
+                    rr += 1;
+                }
+            }
+            if fy > 0 {
+                let p2 = painter.with_clip_rect(clip_top);
+                let mut cc = first_col;
+                let mut g = 0;
+                while gx(cc) < origin.x + avail.x && g < 2000 {
+                    g += 1;
+                    let x = gx(cc);
+                    let w = cols.size(cc);
+                    for rr in 0..fy {
+                        let rect = Rect::from_min_size(
+                            egui::pos2(x, origin.y + HEAD_H + rows.pos(rr)),
+                            Vec2::new(w, rows.size(rr)),
+                        );
+                        self.paint_cell(
+                            &p2,
+                            rect,
+                            rr,
+                            cc,
+                            notes.get(&sheetcore::model::CellRef::new(rr, cc)),
+                            cf_map.get(&(rr, cc)),
+                            dumping,
+                            &mut dump,
+                        );
+                    }
+                    cc += 1;
+                }
+            }
+            let p3 = painter.with_clip_rect(clip_corner);
+            for rr in 0..fy {
+                for cc in 0..fx {
+                    let rect = Rect::from_min_size(
+                        egui::pos2(
+                            origin.x + HEAD_W + cols.pos(cc),
+                            origin.y + HEAD_H + rows.pos(rr),
+                        ),
+                        Vec2::new(cols.size(cc), rows.size(rr)),
+                    );
+                    self.paint_cell(
+                        &p3,
+                        rect,
+                        rr,
+                        cc,
+                        notes.get(&sheetcore::model::CellRef::new(rr, cc)),
+                        cf_map.get(&(rr, cc)),
+                        dumping,
+                        &mut dump,
+                    );
+                }
+            }
+            // 冻结边界加一条深一点的线，和普通网格线区分开
+            let edge = Color32::from_rgb(160, 160, 160);
+            if fx > 0 {
+                painter.line_segment(
+                    [
+                        egui::pos2(body_x - 0.5, origin.y + HEAD_H),
+                        egui::pos2(body_x - 0.5, origin.y + avail.y),
+                    ],
+                    Stroke::new(1.6, edge),
+                );
+            }
+            if fy > 0 {
+                painter.line_segment(
+                    [
+                        egui::pos2(origin.x + HEAD_W, body_y - 0.5),
+                        egui::pos2(origin.x + avail.x, body_y - 0.5),
+                    ],
+                    Stroke::new(1.6, edge),
+                );
+            }
+            if dumping {
+                dump.push(format!("freeze rows={fy} cols={fx} body=({:.0},{:.0})", body_x, body_y));
+            }
         }
 
         // 框选范围底色
@@ -1459,8 +1704,8 @@ impl SheetApp {
             .find(|(r1, c1, r2, c2)| self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2)
             .copied()
             .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
-        let sx = gx(sc1);
-        let sy = gy(sr1);
+        let sx = px_of(sc1);
+        let sy = py_of(sr1);
         let sw = cols.pos(sc2 + 1) - cols.pos(sc1);
         let sh = rows.pos(sr2 + 1) - rows.pos(sr1);
         if sx + sw > origin.x + HEAD_W && sy + sh > origin.y + HEAD_H {
@@ -1512,8 +1757,16 @@ impl SheetApp {
                 let dx = pos.x - (origin.x + HEAD_W);
                 let dy = pos.y - (origin.y + HEAD_H);
                 if dx >= 0.0 && dy >= 0.0 {
-                    let c = cols.index_at(off_x + dx);
-                    let r = rows.index_at(off_y + dy);
+                    let c = if fx > 0 && pos.x < body_x {
+                        cols.index_at(pos.x - (origin.x + HEAD_W))
+                    } else {
+                        cols.index_at(off_x + dx)
+                    };
+                    let r = if fy > 0 && pos.y < body_y {
+                        rows.index_at(pos.y - (origin.y + HEAD_H))
+                    } else {
+                        rows.index_at(off_y + dy)
+                    };
                     self.sel_end = (r, c);
                 }
             }
@@ -1525,8 +1778,16 @@ impl SheetApp {
                 let dx = pos.x - (origin.x + HEAD_W);
                 let dy = pos.y - (origin.y + HEAD_H);
                 if dx >= 0.0 && dy >= 0.0 {
-                    let c = cols.index_at(off_x + dx);
-                    let r = rows.index_at(off_y + dy);
+                    let c = if fx > 0 && pos.x < body_x {
+                        cols.index_at(pos.x - (origin.x + HEAD_W))
+                    } else {
+                        cols.index_at(off_x + dx)
+                    };
+                    let r = if fy > 0 && pos.y < body_y {
+                        rows.index_at(pos.y - (origin.y + HEAD_H))
+                    } else {
+                        rows.index_at(off_y + dy)
+                    };
                     if self.editing.is_some() {
                         self.commit_edit(None);
                     }

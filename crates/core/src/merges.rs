@@ -22,6 +22,8 @@ pub struct SheetLayout {
     pub dxfs: Vec<crate::cf::Dxf>,
     /// 数据验证
     pub dv: Vec<crate::dv::DataValidation>,
+    /// 冻结窗格（行, 列），None 表示没冻结
+    pub freeze: Option<(u32, u32)>,
 }
 
 /// 返回 表名 → 版式
@@ -117,32 +119,40 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         lay.cf = crate::cf::parse_cf_blocks(&xml);
         lay.dxfs = dxfs.clone();
         lay.dv = crate::dv::parse_validations(&xml);
-        if !lay.merges.is_empty() || !lay.col_widths.is_empty() || !lay.row_heights.is_empty() || !lay.cf.is_empty() || !lay.dv.is_empty() {
+        if !lay.merges.is_empty()
+            || !lay.col_widths.is_empty()
+            || !lay.row_heights.is_empty()
+            || !lay.cf.is_empty()
+            || !lay.dv.is_empty()
+            || lay.freeze.is_some()
+        {
             out.insert(name.clone(), lay);
         }
     }
     Ok(out)
 }
 
-/// 一次扫描拿到合并区域、列宽、行高
+/// 一次扫描拿到合并区域、列宽、行高、冻结窗格
 fn parse_layout(xml: &str) -> SheetLayout {
     let mut out = SheetLayout::default();
+    let mut freeze_y = 0u32;
+    let mut freeze_x = 0u32;
+    let mut saw_pane = false;
     let mut r = Reader::from_str(xml);
     loop {
         match r.read_event() {
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
-                let name = e.name();
-                let name = name.as_ref();
+                let nm = e.name();
+                let name = nm.as_ref();
                 if name.ends_with("mergeCell") {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("ref") {
-                            if let Some(rect) = parse_range(&a.value) {
+                            if let Some(rect) = parse_range(&crate::model::xml_unescape(&a.value.to_string())) {
                                 out.merges.push(rect);
                             }
                         }
                     }
                 } else if name.ends_with("col") {
-                    // <col min="1" max="3" width="16.7" customWidth="1"/>
                     let mut min = 0u32;
                     let mut max = 0u32;
                     let mut width = 0f32;
@@ -158,7 +168,6 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             _ => {}
                         }
                     }
-                    // Excel 默认列宽 8.43 字符；没写 customWidth 又是默认宽的，不必记
                     let is_default = (width - 8.43).abs() < 0.05;
                     if min >= 1 && max >= min && width > 0.0 && (custom || !is_default) {
                         let px = crate::layout::excel_width_to_px(width);
@@ -168,8 +177,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             }
                         }
                     }
-                } else if name.ends_with("row") {
-                    // <row r="1" ht="30" customHeight="1">
+                } else if name == "row" || name.ends_with(":row") {
                     let mut idx = 0u32;
                     let mut ht = 0f32;
                     let mut custom = false;
@@ -189,12 +197,34 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             out.row_heights.push((idx - 1, px));
                         }
                     }
+                } else if name.ends_with("pane") {
+                    let mut x = 0u32;
+                    let mut y = 0u32;
+                    let mut state = String::new();
+                    for a in e.attributes().flatten() {
+                        let k = a.key.as_ref();
+                        let v = crate::model::xml_unescape(&a.value.to_string());
+                        match k {
+                            "xSplit" => x = v.parse::<f32>().unwrap_or(0.0) as u32,
+                            "ySplit" => y = v.parse::<f32>().unwrap_or(0.0) as u32,
+                            "state" => state = v,
+                            _ => {}
+                        }
+                    }
+                    if state.starts_with("frozen") {
+                        saw_pane = true;
+                        freeze_x = x;
+                        freeze_y = y;
+                    }
                 }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
         }
+    }
+    if saw_pane && (freeze_x > 0 || freeze_y > 0) {
+        out.freeze = Some((freeze_y, freeze_x));
     }
     out
 }

@@ -115,6 +115,10 @@ pub struct Sheet {
     pub notes: HashMap<CellRef, crate::notes::Note>,
     /// 批注被改过
     pub notes_dirty: bool,
+    /// 冻结窗格：(冻结行数, 冻结列数)
+    pub freeze: Option<(u32, u32)>,
+    /// 冻结设置被改过
+    pub freeze_dirty: bool,
 }
 
 impl Sheet {
@@ -136,6 +140,8 @@ impl Sheet {
             dv_dirty: false,
             notes: HashMap::new(),
             notes_dirty: false,
+            freeze: None,
+            freeze_dirty: false,
         }
     }
 
