@@ -65,6 +65,56 @@ pub enum CfKind {
     Expr { formula: String, dxf: usize },
     Scale { points: Vec<(Option<f64>, [u8; 3])> },
     Bar { color: [u8; 3] },
+    /// 图标集：set 是 OOXML 的 iconSet 名，thresholds 是分级下限（None = 区间最小值）
+    IconSet { set: String, reverse: bool, thresholds: Vec<Option<f64>>, show_value: bool },
+}
+
+/// 图标集按「形状 + 级数」归类，渲染时据此画
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconStyle {
+    Arrows,
+    TrafficLights,
+    Rating,
+    Flags,
+    Symbols,
+    Quarters,
+    RedToBlack,
+    Boxes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IconMark {
+    pub style: IconStyle,
+    pub levels: u8,
+    /// 0 = 最低档
+    pub idx: u8,
+}
+
+impl IconMark {
+    /// 把 iconSet 名字拆成 (样式, 级数)
+    pub fn from_set(name: &str) -> Option<(IconStyle, u8)> {
+        let n = name.trim();
+        let levels = n.chars().next()?.to_digit(10)? as u8;
+        let rest = &n[1..];
+        let style = if rest.starts_with("Arrows") {
+            IconStyle::Arrows
+        } else if rest.starts_with("TrafficLights") {
+            IconStyle::TrafficLights
+        } else if rest.starts_with("Rating") {
+            IconStyle::Rating
+        } else if rest.starts_with("Flags") {
+            IconStyle::Flags
+        } else if rest.starts_with("Symbols") || rest.starts_with("Signs") {
+            IconStyle::Symbols
+        } else if rest.starts_with("Quarters") {
+            IconStyle::Quarters
+        } else if rest.starts_with("RedToBlack") {
+            IconStyle::RedToBlack
+        } else {
+            IconStyle::Boxes
+        };
+        Some((style, levels.max(2)))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,11 +144,17 @@ pub struct Overlay {
     pub bold: bool,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
+    /// 图标集
+    pub icon: Option<IconMark>,
 }
 
 impl Overlay {
     pub fn is_empty(&self) -> bool {
-        self.fill.is_none() && self.color.is_none() && !self.bold && self.bar.is_none()
+        self.fill.is_none()
+            && self.color.is_none()
+            && !self.bold
+            && self.bar.is_none()
+            && self.icon.is_none()
     }
 }
 
@@ -332,6 +388,31 @@ where
                             if out.fill.is_none() {
                                 out.fill = Some(rgb);
                             }
+                        }
+                    }
+                }
+                CfKind::IconSet { set, reverse, thresholds, .. } => {
+                    if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
+                        let (min, max) = (*min, *max);
+                        if let Some((style, levels)) = IconMark::from_set(set) {
+                            // 阈值是「各档下限」；第一档通常是最小值
+                            let mut idx = 0u8;
+                            for (i, th) in thresholds.iter().enumerate().skip(1) {
+                                if let Some(t) = th {
+                                    if *v >= *t {
+                                        idx = i as u8;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = (min, max);
+                            let idx = if *reverse { levels.saturating_sub(1 + idx) } else { idx };
+                            out.icon = Some(IconMark {
+                                style,
+                                levels,
+                                idx: idx.min(levels.saturating_sub(1)),
+                            });
                         }
                     }
                 }
@@ -637,6 +718,9 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
     let mut scale_colors: Vec<[u8; 3]> = Vec::new();
     let mut cfvo: Vec<Option<f64>> = Vec::new();
     let mut bar_color: Option<[u8; 3]> = None;
+    let mut icon_set_name = String::new();
+    let mut icon_reverse = false;
+    let mut icon_show = true;
     let mut last_color: Option<[u8; 3]> = None;
     let mut text_buf = String::new();
     let mut depth_rule = 0usize;
@@ -664,8 +748,24 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                     cfvo.clear();
                     bar_color = None;
                     last_color = None;
+                    icon_set_name.clear();
+                    icon_reverse = false;
+                    icon_show = true;
                     cur_rule = Some((String::new(), attrs));
                     depth_rule = 1;
+                } else if depth_rule > 0 && name.ends_with("iconSet") {
+                    depth_rule += 1;
+                    for a in e.attributes().flatten() {
+                        let k = a.key.as_ref();
+                        let v = crate::model::xml_unescape(&a.value.to_string());
+                        if k == "iconSet" {
+                            icon_set_name = v;
+                        } else if k == "reverse" {
+                            icon_reverse = v == "1" || v == "true";
+                        } else if k == "showValue" {
+                            icon_show = v != "0" && v != "false";
+                        }
+                    }
                 } else if depth_rule > 0 {
                     depth_rule += 1;
                     if name.ends_with("formula") {
@@ -751,7 +851,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                 let name = name.as_ref();
                 if name.ends_with("cfRule") {
                     if let (Some((_, attrs)), Some(block)) = (cur_rule.take(), cur_block.as_mut()) {
-                        if let Some(mut kind) = build_rule(&attrs, &formulas, &cfvo, &last_color, bar_color) {
+                        if let Some(mut kind) = build_rule(&attrs, &formulas, &cfvo, &last_color, bar_color, &icon_set_name, icon_reverse, icon_show) {
                             if let CfKind::Scale { points } = &mut kind {
                                 if points.is_empty() {
                                     *points = cfvo
@@ -796,6 +896,9 @@ fn build_rule(
     cfvo: &[Option<f64>],
     last_color: &Option<[u8; 3]>,
     bar_color: Option<[u8; 3]>,
+    icon_set: &str,
+    icon_reverse: bool,
+    icon_show: bool,
 ) -> Option<CfKind> {
     let ty = attrs.get("type").map(|s| s.as_str()).unwrap_or("");
     let dxf = attrs.get("dxfId").and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
@@ -832,6 +935,16 @@ fn build_rule(
             CfKind::Scale { points: Vec::new() }
         }
         "dataBar" => CfKind::Bar { color: bar_color.or(*last_color).unwrap_or([99, 142, 198]) },
+        "iconSet" => CfKind::IconSet {
+            set: if icon_set.is_empty() {
+                "3Arrows".to_string()
+            } else {
+                icon_set.to_string()
+            },
+            reverse: icon_reverse,
+            thresholds: cfvo.to_vec(),
+            show_value: icon_show,
+        },
         _ => return None,
     })
 }

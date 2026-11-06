@@ -256,6 +256,30 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                     }
                     out.push_str("</colorScale></cfRule>");
                 }
+                CfKind::IconSet { set, reverse, thresholds, show_value } => {
+                    out.push_str(&format!(
+                        "<cfRule type=\"iconSet\" priority=\"{prio}\"{stop}><iconSet iconSet=\"{}\"{} showValue=\"{}\">",
+                        esc(set),
+                        if *reverse { " reverse=\"1\"" } else { "" },
+                        if *show_value { 1 } else { 0 }
+                    ));
+                    for (i, t) in thresholds.iter().enumerate() {
+                        let ty = if i == 0 {
+                            "min"
+                        } else if t.is_none() {
+                            "max"
+                        } else {
+                            "percent"
+                        };
+                        match (ty, t) {
+                            ("percent", Some(v)) => out.push_str(&format!(
+                                "<cfvo type=\"percent\" val=\"{v}\"/>"
+                            )),
+                            _ => out.push_str(&format!("<cfvo type=\"{ty}\"/>")),
+                        }
+                    }
+                    out.push_str("</iconSet></cfRule>");
+                }
                 CfKind::Bar { color } => {
                     out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar>"));
                     out.push_str("<cfvo type=\"min\"/><cfvo type=\"max\"/>");

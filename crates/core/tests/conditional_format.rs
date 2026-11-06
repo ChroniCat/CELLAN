@@ -128,3 +128,41 @@ fn write_new_rules_and_save() {
         .iter()
         .any(|b| b.rules.iter().any(|r| matches!(r.kind, CfKind::CellIs { .. }))));
 }
+
+#[test]
+fn icon_sets_resolve_levels() {
+    let p = std::path::Path::new("F:/Finance/work/icons.xlsx");
+    if !p.exists() {
+        eprintln!("跳过：缺少 {}", p.display());
+        return;
+    }
+    let wb = sheetcore::xlsx::load(p).expect("读入");
+    let sheet = wb.sheet(0);
+    let cf = &sheet.cf;
+    let mut st = CfStats::default();
+    compute_stats(cf, sheet, &mut st);
+    // A 列是红绿灯，B 列是箭头
+    let a10 = overlay_at(cf, &st, sheet, 1, 0, |_, _, _| false).icon.expect("A2 应有图标");
+    assert_eq!(a10.style, sheetcore::cf::IconStyle::TrafficLights);
+    assert_eq!(a10.idx, 0);
+    let a55 = overlay_at(cf, &st, sheet, 2, 0, |_, _, _| false).icon.unwrap();
+    assert_eq!(a55.idx, 1);
+    let a90 = overlay_at(cf, &st, sheet, 3, 0, |_, _, _| false).icon.unwrap();
+    assert_eq!(a90.idx, 2);
+    let b10 = overlay_at(cf, &st, sheet, 1, 1, |_, _, _| false).icon.unwrap();
+    assert_eq!(b10.style, sheetcore::cf::IconStyle::Arrows);
+    assert_eq!(b10.idx, 0);
+    let b90 = overlay_at(cf, &st, sheet, 3, 1, |_, _, _| false).icon.unwrap();
+    assert_eq!(b90.idx, 2);
+}
+
+#[test]
+fn icon_set_names_parse() {
+    use sheetcore::cf::{IconMark, IconStyle};
+    assert_eq!(IconMark::from_set("3TrafficLights1"), Some((IconStyle::TrafficLights, 3)));
+    assert_eq!(IconMark::from_set("5Arrows"), Some((IconStyle::Arrows, 5)));
+    assert_eq!(IconMark::from_set("4Rating"), Some((IconStyle::Rating, 4)));
+    assert_eq!(IconMark::from_set("3Flags"), Some((IconStyle::Flags, 3)));
+    assert_eq!(IconMark::from_set("5Quarters"), Some((IconStyle::Quarters, 5)));
+    assert_eq!(IconMark::from_set("3Symbols"), Some((IconStyle::Symbols, 3)));
+}

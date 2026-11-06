@@ -4,6 +4,7 @@ mod net;
 use eframe::egui;
 
 mod chart_view;
+mod icons;
 use files::FileTree;
 use sheetcore::sync::{Cursor, Peer};
 use egui::{Align2, Color32, FontId, Key, Rect, Sense, Stroke, Vec2};
@@ -908,6 +909,33 @@ impl SheetApp {
                     }
                 }
             });
+            ui.menu_button("图标集", |ui| {
+                for (label, set) in [
+                    ("三色交通灯", "3TrafficLights1"),
+                    ("三色箭头", "3Arrows"),
+                    ("五色箭头", "5Arrows"),
+                    ("四色等级", "4Rating"),
+                    ("五色等级", "5Rating"),
+                    ("三色旗帜", "3Flags"),
+                    ("三色符号", "3Symbols"),
+                    ("四分之一圆", "5Quarters"),
+                ] {
+                    if ui.button(label).clicked() {
+                        let levels = set.chars().next().unwrap().to_digit(10).unwrap_or(3) as usize;
+                        let mut th = vec![None];
+                        for i in 1..levels {
+                            th.push(Some((i as f64) * 100.0 / levels as f64));
+                        }
+                        self.add_cf(sheetcore::cf::CfKind::IconSet {
+                            set: set.to_string(),
+                            reverse: false,
+                            thresholds: th,
+                            show_value: true,
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
             ui.menu_button("色阶", |ui| {
                 if ui.button("绿-黄-红").clicked() {
                     self.add_cf(sheetcore::cf::CfKind::Scale {
@@ -1267,10 +1295,15 @@ impl SheetApp {
                 } else {
                     Align2::LEFT_CENTER
                 };
+                let icon_shift = if ov.and_then(|o| o.icon.as_ref()).is_some() {
+                    18.0
+                } else {
+                    0.0
+                };
                 let tx = match align {
-                    Align2::CENTER_CENTER => rect.center().x,
+                    Align2::CENTER_CENTER => rect.center().x + icon_shift / 2.0,
                     Align2::RIGHT_CENTER => rect.max.x - 4.0,
-                    _ => rect.min.x + 4.0,
+                    _ => rect.min.x + 4.0 + icon_shift,
                 };
                 let ty = if st.valign == 1 {
                     rect.min.y + 4.0
@@ -1282,6 +1315,14 @@ impl SheetApp {
                 painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
                 if dumping {
                     dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
+                }
+            }
+        }
+        if let Some(ov) = ov {
+            if let Some(mark) = &ov.icon {
+                icons::draw_icon(painter, rect, mark);
+                if dumping {
+                    dump.push(format!("icon ({},{}) {:?} idx={}/{}", r, c, mark.style, mark.idx, mark.levels));
                 }
             }
         }
@@ -2007,6 +2048,10 @@ impl SheetApp {
                 }
                 rr += 1;
             }
+        }
+
+        if dumping {
+            dump.push(format!("cfmap {} 项", cf_map.len()));
         }
 
         // 单元格
