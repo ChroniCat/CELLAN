@@ -53,6 +53,8 @@ struct SheetApp {
     show_pages: bool,
     /// 透视表草稿
     pivot_edit: Option<sheetcore::pivot::PivotSpec>,
+    /// 透视表是否生成真正的 pivotTable 部件
+    pivot_real: bool,
     /// 并排比较的第二个工作簿 + 表序号 + 滚动
     compare: Option<(sheetcore::model::Workbook, usize, Vec2)>,
     /// 同步滚动
@@ -139,6 +141,7 @@ impl SheetApp {
             filter_popup: None,
             show_pages: false,
             pivot_edit: None,
+            pivot_real: true,
             compare: {
                 let mut c = None;
                 if let Ok(p) = std::env::var("SC_COMPARE") {
@@ -1857,6 +1860,16 @@ impl SheetApp {
                         });
                     ui.end_row();
 
+                    ui.checkbox(&mut self.pivot_real, "生成可刷新的透视表");
+                    ui.end_row();
+                    ui.label("");
+                    ui.label(
+                        egui::RichText::new("关掉则只粘贴数值；打开后 Excel 里能拖字段")
+                            .weak()
+                            .size(10.0),
+                    );
+                    ui.end_row();
+
                     ui.label("输出到");
                     let (r, c) = self.sel;
                     ui.label(format!("{}（当前选中格）", cell_name(r, c)));
@@ -1876,6 +1889,15 @@ impl SheetApp {
             let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), &spec);
             let at = self.sel;
             let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
+            if self.pivot_real {
+                let vname = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .get(spec.source.0, spec.value_field)
+                    .map(|c| c.value.display())
+                    .unwrap_or_default();
+                self.wb.pivots_pending.push((self.sheet_idx, spec.clone(), res.clone(), rect, vname));
+            }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.status = format!(

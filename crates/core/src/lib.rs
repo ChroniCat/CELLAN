@@ -9,6 +9,7 @@ pub mod notes;
 pub mod page;
 pub mod patch;
 pub mod pivot;
+pub mod pivot_xml;
 pub mod model;
 pub mod style;
 pub mod sort_filter;

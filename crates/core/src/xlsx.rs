@@ -25,6 +25,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
 
     let mut wb = Workbook {
         has_vba: crate::vba::has_macros(path),
+        pivots_pending: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         dirty: false,
@@ -336,6 +337,25 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         eprintln!("  [save] 序列化+压缩 {:.2}s", t_write.elapsed().as_secs_f64());
     }
     out?;
+
+    // 宏部件：umya 写不出来，塞回去
+    if let Some(v) = vba {
+        if let Err(e) = crate::vba::restore_vba(path, &v) {
+            eprintln!("[save] 宏恢复失败: {e:#}");
+        }
+    }
+
+    // 透视表部件（必须等主体写完）
+    for (si, spec, res, rect, label) in wb.pivots_pending.iter() {
+        let name = wb
+            .sheets
+            .get(*si)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Sheet1".to_string());
+        if let Err(e) = crate::pivot_xml::attach(path, &name, spec, res, *rect, label) {
+            eprintln!("[save] 透视表部件写入失败: {e:#}");
+        }
+    }
 
     // umya 不管条件格式的 dxf 细节，保存完直接补 XML
     let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);

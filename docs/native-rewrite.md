@@ -66,6 +66,76 @@
 
 
 
+
+### v1.16 图标集 ✅ 2026-11-06
+
+- `CfKind::IconSet { set, reverse, thresholds, show_value }`；`IconMark` 把
+  `3TrafficLights1` 这类名字拆成（形状, 级数），共 8 类形状：箭头/红绿灯/等级/旗帜/符号/
+  四分之一圆/红黑/方块。
+- 读的时候**属性在子元素上**：`<cfRule type="iconSet">` 里面才是
+  `<iconSet iconSet="3TrafficLights1" reverse="1" showValue="0">`，一开始照着 cfRule 的属性读，
+  结果所有列都被当成默认的 3Arrows。
+- 求值：阈值是各档下限，逐档比较；`reverse` 把档位翻转。
+- 绘制：图标画在单元格左侧（8–14px 自适应行高），文字自动右移 18px 不重叠。
+- 工具条「条件格式 → 图标集」可新建 8 种常用集，阈值按等分百分比。
+
+**顺带修掉一个真 bug**：换文件时 `doc_gen` 归零，而 `cf_stats_gen` 也是 0，
+于是「统计已经算过」的判断成立，条件格式统计一直是空的——换文件后色阶、数据条、
+图标全都出不来。修法是在 `OpenMsg::Loaded` 里把 `cf_stats_gen` 置 `u64::MAX`。
+
+### v1.17 VBA 宏保留 ✅ 2026-11-06
+
+不执行宏，但不能把宏弄丢：umya 写出的永远是普通 xlsx，`vbaProject.bin`、
+macroEnabled 的 content type、workbook 关系全都没了。
+
+- 保存前从基准文件里读出 `xl/vbaProject.bin`；
+- 保存后塞回部件，补 `[Content_Types]` 的 Override，把 workbook 类型换成
+  `application/vnd.ms-excel.sheet.macroEnabled.main+xml`，再补 workbook rels；
+- `Workbook.has_vba` 供状态栏显示「含宏（保留不执行）」。
+- 测试造了一个带假 vbaProject 的 .xlsm，走一遍「读 → 改 → 存」，
+  宏部件、content type、改后的单元格三者都在。
+
+### v1.18 并排比较 ✅ 2026-11-06
+
+- `draw_grid` 拆成 `draw_grid_pane(ui, ctx, readonly)`，外层 `draw_grid` 负责分栏：
+  没有比较对象时整幅画，有就左右各半（中间分隔条）。
+- 「视图 → 并排比较…」选第二个文件；右侧面板**只读**：点击、拖选、下拉箭头、
+  单元格编辑全部屏蔽。
+- 右侧画之前把 `wb / sheet_idx / scroll / sel` 临时换过去，画完再换回来——
+  用 `mem::replace` 搬移，不克隆工作簿（大文件克隆一帧都受不了）。
+- 「同步纵向滚动」勾上时右侧跟随左侧的滚动量。
+- 验证靠 `SC_DUMP` 的整帧累积：一帧里两个面板的几何都落盘，
+  左 `rect=(280,67,776,778)` 出「产品」、右 `rect=(798,67,1294,778)` 出「姓名」。
+
+**踩坑**：`dump_once` 原来在面板内部就置 false，第二个面板永远不 dump；
+改成面板只往 `dump_accum` 追加，由外层 `flush_dump()` 统一写盘。另外加了
+`open_rx.is_none()` 条件，否则异步加载还没完成就 dump 了空表。
+
+### v1.19 真 pivotTable ✅ 2026-11-06
+
+`crates/core/src/pivot_xml.rs`。前面 v1.15 的透视是「值化」，这一版补上真正的
+OOXML 透视表，Excel 里可以拖字段、刷新。
+
+四个部件：
+- `xl/pivotCache/pivotCacheDefinitionN.xml`：`cacheSource` 指向源区域（`A1:C6` + 表名），
+  `cacheFields` 逐列写，数值列带 `minValue/maxValue`，`refreshOnLoad="1"`；
+- `xl/pivotCache/pivotCacheRecordsN.xml` + 它的 rels（空记录，交给 Excel 刷新时生成）；
+- `xl/pivotTables/pivotTableN.xml`：`location` 是输出矩形，`pivotFields` 标出
+  `axisRow`/`axisCol`/`dataField`，`rowItems` 含 `t="grand"` 总计行，
+  `dataFields` 名字用 Excel 的「求和项:金额」格式；
+- 关系与内容类型：workbook 的 `<pivotCaches>`（插在 `<calcPr>` 之前，符合 schema 顺序）、
+  workbook rels、工作表 rels、`[Content_Types]` 三条 Override。
+
+工作表的 rels 文件原本可能不存在（umya 生成的文件就没有），这种情况直接新建一个，
+否则 Excel 不会把这个 pivotTable 认到某张表上。
+
+`Workbook.pivots_pending` 里存待挂的透视表，`xlsx::save` 写完主体后逐个 attach；
+对话框里有「生成可刷新的透视表」开关，关掉就只粘贴数值。
+
+验证：生成的 `pivot_real_*.xlsx` 四个部件齐全、XML 全部可解析、`cacheSource` 的
+`ref="A1:C6" sheet="表格"` 正确、`location ref="H1:I5"`、`dataField name="求和项:金额"`；
+openpyxl 能打开且 H1/H2 读到「部门/研发」；我们自己的应用也能打开并画出这块数据。
+
 ### v1.14 图表 ✅ 2026-11-06
 
 - 读：sheet 的 rels → `<drawing r:id>` → `xl/drawings/drawingN.xml`，

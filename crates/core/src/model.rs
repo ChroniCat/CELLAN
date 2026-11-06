@@ -296,6 +296,14 @@ impl Sheet {
 pub struct Workbook {
     /// 文件里是否带 VBA 宏（只保留，不执行）
     pub has_vba: bool,
+    /// 保存时要挂上的透视表部件：(表序号, 规格, 结果, 输出矩形, 值字段名)
+    pub pivots_pending: Vec<(
+        usize,
+        crate::pivot::PivotSpec,
+        crate::pivot::PivotResult,
+        (u32, u32, u32, u32),
+        String,
+    )>,
     /// 样式表（单元格只存索引，见 Sheet.styles）
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
@@ -307,6 +315,7 @@ impl Workbook {
     pub fn new_blank() -> Self {
         Self {
             has_vba: false,
+            pivots_pending: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
             dirty: false,
