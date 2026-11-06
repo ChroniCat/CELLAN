@@ -51,6 +51,20 @@ struct SheetApp {
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
     show_pages: bool,
+    /// 编辑租约（客户端看到的）
+    locks: sheetcore::sync::LockTable,
+    /// 等待授权中的编辑（初始输入）
+    pending_edit: Option<String>,
+    /// 我当前持有的格
+    my_lock: Option<(usize, u32, u32)>,
+    /// 上次续期
+    lock_renew: std::time::Instant,
+    /// 单调时钟原点
+    t0: std::time::Instant,
+    /// 测试钩子用过没有
+    probe_done: bool,
+    probe_at: std::time::Instant,
+    lock_first_at: Option<std::time::Instant>,
     /// 新建图表草稿
     chart_edit: Option<sheetcore::charts::Chart>,
     /// 图表管理窗口
@@ -146,6 +160,14 @@ impl SheetApp {
             note_edit: None,
             filter_popup: None,
             show_pages: false,
+            locks: sheetcore::sync::LockTable::new(20_000),
+            pending_edit: None,
+            my_lock: None,
+            lock_renew: std::time::Instant::now(),
+            t0: std::time::Instant::now(),
+            probe_done: false,
+            probe_at: std::time::Instant::now(),
+            lock_first_at: None,
             chart_edit: None,
             chart_mgr: false,
             pivot_edit: None,
@@ -368,8 +390,137 @@ impl SheetApp {
     }
 
     /// 提交当前编辑：写回单元格、增量重算、广播给协作者
+
+    /// 无界面测试钩子：SC_LOCK=r,c 占住某格；SC_LOCK_TRY=r,c 反复尝试
+    fn lock_probe(&mut self, ctx: &egui::Context) {
+        let (Ok(kind), Ok(cell)) = (
+            std::env::var("SC_LOCK").or_else(|_| std::env::var("SC_LOCK_TRY")),
+            std::env::var("SC_LOCK_CELL"),
+        ) else {
+            return;
+        };
+        let _ = kind;
+        let parts: Vec<u32> = cell.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if parts.len() != 2 {
+            return;
+        }
+        if self.net.is_none() || self.open_rx.is_some() {
+            return;
+        }
+        if let Some(_) = self.my_lock {
+            // 测试钩子：占住 N 秒后主动放锁
+            let hold: u64 = std::env::var("SC_LOCK_RELEASE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX);
+            if self.lock_first_at.unwrap().elapsed().as_secs() >= hold {
+                self.release_lock();
+                if std::env::var("SC_LOCK").is_ok() {
+                    eprintln!("[lock] released");
+                    self.probe_done = true;
+                }
+            }
+            return;
+        }
+        if self.probe_done {
+            return;
+        }
+        if self.lock_first_at.is_none() {
+            self.lock_first_at = Some(std::time::Instant::now());
+        }
+        let delay: u64 = std::env::var("SC_LOCK_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if self.lock_first_at.unwrap().elapsed().as_secs() < delay {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            return;
+        }
+        if self.probe_at.elapsed().as_secs() < 2 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            return;
+        }
+        self.probe_at = std::time::Instant::now();
+        self.sel = (parts[0], parts[1]);
+        self.begin_edit(None);
+        self.editing = None; // 只验租约，不开编辑框
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    fn lock_now(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
+
+    /// 这个格子现在能不能由我编辑
+    fn lock_holder(&self, row: u32, col: u32) -> Option<String> {
+        let site = self.net.as_ref().map(|n| n.site);
+        let Some(site) = site else { return None };
+        if self.locks.is_locked_by_other(self.sheet_idx, row, col, site) {
+            self.locks
+                .holder(self.sheet_idx, row, col)
+                .map(|h| h.name.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 开始编辑：没联网直接开；联网先申请租约，批准后才开
+    fn begin_edit(&mut self, initial: Option<String>) {
+        let (r, c) = self.sel;
+        if let Some(holder) = self.lock_holder(r, c) {
+            self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
+            return;
+        }
+        let Some(net) = self.net.as_ref() else {
+            let buf = initial.unwrap_or_else(|| {
+                match self.wb.sheet(self.sheet_idx).get(r, c) {
+                    Some(cell) => cell
+                        .formula
+                        .as_deref()
+                        .map(|f| f.to_string())
+                        .unwrap_or_else(|| cell.value.display()),
+                    None => String::new(),
+                }
+            });
+            self.editing = Some(EditState { buf });
+            return;
+        };
+        let name = self.my_name.clone();
+        net.request_lock(self.sheet_idx, r, c, &name);
+        self.pending_edit = Some(initial.unwrap_or_default());
+        self.status = format!("正在申请编辑 {}…", cell_name(r, c));
+    }
+
+    /// 编辑结束/放弃，交还租约
+    fn release_lock(&mut self) {
+        if let Some((sheet, row, col)) = self.my_lock.take() {
+            if let Some(net) = self.net.as_ref() {
+                net.release_lock(sheet, row, col);
+            }
+            let site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+            self.locks.release(sheet, row, col, site);
+        }
+        self.pending_edit = None;
+    }
+
+    /// 编辑中定期续期，防止长时间思考时被判定超时
+    fn renew_lock_if_needed(&mut self) {
+        if self.my_lock.is_none() {
+            return;
+        }
+        if self.lock_renew.elapsed().as_secs() < 8 {
+            return;
+        }
+        self.lock_renew = std::time::Instant::now();
+        if let (Some(net), Some((sheet, row, col))) = (self.net.as_ref(), self.my_lock) {
+            let name = self.my_name.clone();
+            net.request_lock(sheet, row, col, &name);
+        }
+    }
+
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) {
         if let Some(ed) = self.editing.take() {
+            self.release_lock();
             let (r, c) = self.sel;
             // 数据验证：不合规就不写入，编辑框留着让用户改（Excel 的「重试」）
             let mut rejected: Option<String> = None;
@@ -468,6 +619,7 @@ impl SheetApp {
             // 编辑框内的按键交给 TextEdit 自己处理
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.editing = None;
+                self.release_lock();
             }
             return;
         }
@@ -486,6 +638,10 @@ impl SheetApp {
 
         if clear {
             let (r, c) = self.sel;
+            if let Some(holder) = self.lock_holder(r, c) {
+                self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
+                return;
+            }
             self.wb.sheet_mut(self.sheet_idx).set(r, c, Cell { value: Value::Empty, formula: None });
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
@@ -504,12 +660,7 @@ impl SheetApp {
             self.ensure_visible();
         }
         if start_edit {
-            let (r, c) = self.sel;
-            let buf = match self.wb.sheet(self.sheet_idx).get(r, c) {
-                Some(cell) => cell.formula.as_deref().map(|f| f.to_string()).unwrap_or_else(|| cell.value.display()),
-                None => String::new(),
-            };
-            self.editing = Some(EditState { buf });
+            self.begin_edit(None);
         }
         // 直接打字就开始编辑
         if self.editing.is_none() {
@@ -522,7 +673,7 @@ impl SheetApp {
                 })
             });
             if let Some(t) = typed {
-                self.editing = Some(EditState { buf: t });
+                self.begin_edit(Some(t));
             }
         }
     }
@@ -1375,6 +1526,31 @@ impl SheetApp {
                 painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
                 if dumping {
                     dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1}", r, c, txt, tx, ty, base_color, st.size));
+                }
+            }
+        }
+        // 别人正在编辑：虚线框 + 角标
+        if let Some(site) = self.net.as_ref().map(|n| n.site) {
+            if self.locks.is_locked_by_other(self.sheet_idx, r, c, site) {
+                let color = egui::Color32::from_rgb(230, 120, 30);
+                let dash = egui::Stroke::new(1.5, color);
+                painter.add(egui::Shape::dashed_line(
+                    &[
+                        rect.left_top(),
+                        rect.right_top(),
+                        rect.right_bottom(),
+                        rect.left_bottom(),
+                        rect.left_top(),
+                    ],
+                    dash,
+                    5.0,
+                    3.0,
+                ));
+                if dumping {
+                    dump.push(format!(
+                        "locked ({r},{c}) by={:?}",
+                        self.locks.holder(self.sheet_idx, r, c).map(|h| h.name.clone())
+                    ));
                 }
             }
         }
@@ -2263,6 +2439,14 @@ impl SheetApp {
         if self.dump_accum.is_empty() {
             return;
         }
+        // 可选：等到第 N 秒再落盘（验证「运行一段时间后」的状态）
+        if let Ok(v) = std::env::var("SC_DUMP_AT") {
+            if let Ok(secs) = v.parse::<u64>() {
+                if self.t0.elapsed().as_secs() < secs {
+                    return;
+                }
+            }
+        }
         if let Ok(path) = std::env::var("SC_DUMP") {
             let _ = std::fs::write(path, &self.dump_accum);
             self.dump_once = false;
@@ -2868,6 +3052,20 @@ impl SheetApp {
 
         // 点击选中
         if !readonly && resp.clicked() {
+            // 点到别人正在编辑的格子，直接告诉他
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if pos.x > origin.x + HEAD_W && pos.y > origin.y + HEAD_H {
+                    let cc = cols.index_at(off_x + pos.x - (origin.x + HEAD_W));
+                    let rr = rows.index_at(off_y + pos.y - (origin.y + HEAD_H));
+                    if let Some(holder) = self.lock_holder(rr, cc) {
+                        self.status = format!(
+                            "{} 正在编辑 {}，同一格只能一个人改",
+                            holder,
+                            cell_name(rr, cc)
+                        );
+                    }
+                }
+            }
             if let Some(pos) = resp.interact_pointer_pos() {
                 let dx = pos.x - (origin.x + HEAD_W);
                 let dy = pos.y - (origin.y + HEAD_H);
@@ -3093,6 +3291,63 @@ impl SheetApp {
         }
         for e in events {
             match e {
+                crate::net::NetEvent::LockOk { site, name, sheet, row, col } => {
+                    let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+                    self.locks
+                        .request(sheet, row, col, site, &name, self.lock_now());
+                    if site == my_site {
+                        self.my_lock = Some((sheet, row, col));
+                        if std::env::var("SC_LOCK").is_ok() || std::env::var("SC_LOCK_TRY").is_ok() {
+                            eprintln!("[lock] granted site={site} cell=({row},{col})");
+                            self.probe_done = true;
+                        }
+                        self.lock_renew = std::time::Instant::now();
+                        // 等到授权了才真正开编辑框
+                        if let Some(initial) = self.pending_edit.take() {
+                            let (r, c) = (row, col);
+                            let buf = if initial.is_empty() {
+                                match self.wb.sheet(sheet).get(r, c) {
+                                    Some(cell) => cell
+                                        .formula
+                                        .as_deref()
+                                        .map(|f| f.to_string())
+                                        .unwrap_or_else(|| cell.value.display()),
+                                    None => String::new(),
+                                }
+                            } else {
+                                initial
+                            };
+                            self.editing = Some(EditState { buf });
+                            self.status = format!("正在编辑 {}", cell_name(r, c));
+                        }
+                    } else {
+                        self.status = format!("{} 开始编辑 {}", name, cell_name(row, col));
+                    }
+                }
+                crate::net::NetEvent::LockDeny { holder_name, row, col, .. } => {
+                    self.pending_edit = None;
+                    if std::env::var("SC_LOCK").is_ok() || std::env::var("SC_LOCK_TRY").is_ok() {
+                        eprintln!("[lock] denied by {holder_name} cell=({row},{col})");
+                        if std::env::var("SC_LOCK_RETRY").is_err() {
+                            self.probe_done = true;
+                        } else {
+                            self.probe_at = std::time::Instant::now()
+                                - std::time::Duration::from_secs(2);
+                        }
+                    }
+                    self.status = format!(
+                        "{} 正在编辑 {}，同一格只能一个人改",
+                        holder_name,
+                        cell_name(row, col)
+                    );
+                }
+                crate::net::NetEvent::LockRelease { site, sheet, row, col } => {
+                    self.locks.release(sheet, row, col, site);
+                    let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+                    if site == my_site {
+                        self.my_lock = None;
+                    }
+                }
                 net::NetEvent::Connected => {
                     eprintln!("[net] connected");
                     self.status = "已连接".into();
@@ -3239,6 +3494,8 @@ impl eframe::App for SheetApp {
         self.note_dialog(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
+        self.renew_lock_if_needed();
+        self.lock_probe(ctx);
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);

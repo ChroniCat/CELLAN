@@ -72,6 +72,114 @@ pub struct Cursor {
     pub col: u32,
 }
 
+/// 单元格编辑租约：同一格同一时刻只允许一个站点在编辑。
+///
+/// 时间用毫秒（调用方传单调时钟），过期由宿主清理——断线/崩溃的人不会把格子永久锁死。
+#[derive(Clone, Debug, Default)]
+pub struct LockTable {
+    map: HashMap<(usize, u32, u32), Holder>,
+    /// 租约时长（毫秒）
+    pub ttl_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Holder {
+    pub site: u32,
+    pub name: String,
+    pub at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LockOutcome {
+    /// 拿到了
+    Granted,
+    /// 原本就是自己，续期
+    Refreshed,
+    /// 被别人占着
+    Denied { holder: u32, name: String },
+}
+
+impl LockTable {
+    pub fn new(ttl_ms: u64) -> Self {
+        Self { map: HashMap::new(), ttl_ms }
+    }
+
+    pub fn request(
+        &mut self,
+        sheet: usize,
+        row: u32,
+        col: u32,
+        site: u32,
+        name: &str,
+        now_ms: u64,
+    ) -> LockOutcome {
+        let key = (sheet, row, col);
+        match self.map.get_mut(&key) {
+            Some(h) if h.site == site => {
+                h.at_ms = now_ms;
+                LockOutcome::Refreshed
+            }
+            Some(h) if now_ms.saturating_sub(h.at_ms) < self.ttl_ms => LockOutcome::Denied {
+                holder: h.site,
+                name: h.name.clone(),
+            },
+            // 过期：直接顶掉
+            _ => {
+                self.map.insert(
+                    key,
+                    Holder { site, name: name.to_string(), at_ms: now_ms },
+                );
+                LockOutcome::Granted
+            }
+        }
+    }
+
+    pub fn release(&mut self, sheet: usize, row: u32, col: u32, site: u32) -> bool {
+        let key = (sheet, row, col);
+        if self.map.get(&key).map(|h| h.site) == Some(site) {
+            self.map.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 清掉过期租约，返回被清掉的格子
+    pub fn expire(&mut self, now_ms: u64) -> Vec<(usize, u32, u32, u32)> {
+        let ttl = self.ttl_ms;
+        let dead: Vec<((usize, u32, u32), u32)> = self
+            .map
+            .iter()
+            .filter(|(_, h)| now_ms.saturating_sub(h.at_ms) >= ttl)
+            .map(|(k, h)| (*k, h.site))
+            .collect();
+        for (k, _) in &dead {
+            self.map.remove(k);
+        }
+        dead.into_iter().map(|((s, r, c), site)| (s, r, c, site)).collect()
+    }
+
+    pub fn holder(&self, sheet: usize, row: u32, col: u32) -> Option<&Holder> {
+        self.map.get(&(sheet, row, col))
+    }
+
+    pub fn is_locked_by_other(&self, sheet: usize, row: u32, col: u32, site: u32) -> bool {
+        self.map.get(&(sheet, row, col)).map(|h| h.site != site).unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ((usize, u32, u32), &Holder)> {
+        self.map.iter().map(|(k, h)| (*k, h))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -83,6 +191,14 @@ pub enum Msg {
     Snapshot { ops: Vec<Op> },
     Op(Op),
     CursorMsg(Cursor),
+    /// 请求编辑某格（同一格同时只允许一个人）
+    LockReq { site: u32, name: String, sheet: usize, row: u32, col: u32 },
+    /// 宿主批准（广播）
+    LockOk { site: u32, name: String, sheet: usize, row: u32, col: u32 },
+    /// 宿主拒绝（只回请求者）
+    LockDeny { site: u32, sheet: usize, row: u32, col: u32, holder: u32, holder_name: String },
+    /// 释放（编辑结束/取消/断线）
+    LockRelease { site: u32, sheet: usize, row: u32, col: u32 },
     Bye { site: u32 },
 }
 

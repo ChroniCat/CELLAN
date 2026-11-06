@@ -24,6 +24,12 @@ pub enum NetEvent {
     PeerLeft(u32),
     Ops(Vec<Op>),
     Cursor(Cursor),
+    /// 某格被批准编辑（含自己）
+    LockOk { site: u32, name: String, sheet: usize, row: u32, col: u32 },
+    /// 自己被拒绝
+    LockDeny { holder: u32, holder_name: String, sheet: usize, row: u32, col: u32 },
+    /// 某格释放
+    LockRelease { site: u32, sheet: usize, row: u32, col: u32 },
     Disconnected(String),
     Denied(String),
     Error(String),
@@ -42,6 +48,10 @@ pub struct Net {
     pub addr: String,
     alive: Arc<AtomicBool>,
     state: Option<Arc<Mutex<Vec<Op>>>>,
+    /// 宿主自己也是参与者：本地租约表 + 事件入口
+    host_locks: Option<Arc<Mutex<sheetcore::sync::LockTable>>>,
+    evt_tx: Sender<NetEvent>,
+    t0: std::time::Instant,
 }
 
 impl Drop for Net {
@@ -81,6 +91,69 @@ impl Net {
         }
         if let Ok(s) = serde_json::to_string(&Msg::Op(op)) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
+    /// 请求编辑某格
+    pub fn request_lock(&self, sheet: usize, row: u32, col: u32, name: &str) {
+        // 宿主自己也是参与者：走本地租约表，否则「自己锁不住自己」
+        if let Some(locks) = &self.host_locks {
+            let now = self.t0.elapsed().as_millis() as u64;
+            let outcome = locks.lock().unwrap().request(sheet, row, col, self.site, name, now);
+            match outcome {
+                sheetcore::sync::LockOutcome::Denied { holder, name: hn } => {
+                    let _ = self.evt_tx.send(NetEvent::LockDeny {
+                        holder,
+                        holder_name: hn,
+                        sheet,
+                        row,
+                        col,
+                    });
+                }
+                _ => {
+                    let msg = Msg::LockOk {
+                        site: self.site,
+                        name: name.to_string(),
+                        sheet,
+                        row,
+                        col,
+                    };
+                    if let Ok(s) = serde_json::to_string(&msg) {
+                        let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
+                    }
+                    let _ = self.evt_tx.send(NetEvent::LockOk {
+                        site: self.site,
+                        name: name.to_string(),
+                        sheet,
+                        row,
+                        col,
+                    });
+                }
+            }
+            return;
+        }
+        let msg = Msg::LockReq {
+            site: self.site,
+            name: name.to_string(),
+            sheet,
+            row,
+            col,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
+        }
+    }
+
+    pub fn release_lock(&self, sheet: usize, row: u32, col: u32) {
+        if let Some(locks) = &self.host_locks {
+            locks.lock().unwrap().release(sheet, row, col, self.site);
+        }
+        let msg = Msg::LockRelease { site: self.site, sheet, row, col };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
         }
     }
 
@@ -135,6 +208,40 @@ pub fn host(
         });
     }
 
+    // 编辑租约（宿主仲裁，同一格只批一个）
+    let locks: Arc<Mutex<sheetcore::sync::LockTable>> =
+        Arc::new(Mutex::new(sheetcore::sync::LockTable::new(20_000)));
+    let locks_for_self = locks.clone();
+    let evt_tx_self = evt_tx.clone();
+    let t0 = std::time::Instant::now();
+    let now_ms = {
+        let t0 = t0;
+        move || t0.elapsed().as_millis() as u64
+    };
+
+    // 租约巡检：断线/崩溃的人 20 秒后自动放锁
+    {
+        let locks = locks.clone();
+        let peers = peers.clone();
+        let alive = alive.clone();
+        let now_ms = now_ms;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if !alive.load(Ordering::SeqCst) {
+                break;
+            }
+            let dead = locks.lock().unwrap().expire(now_ms());
+            for (sheet, row, col, site) in dead {
+                let line = serde_json::to_string(&Msg::LockRelease { site, sheet, row, col })
+                    .unwrap();
+                for ptx in peers.lock().unwrap().values() {
+                    let _ = ptx.send(line.clone());
+                }
+            }
+        });
+    }
+
+    let host_site = site;
     // accept 循环
     {
         let peers = peers.clone();
@@ -144,6 +251,8 @@ pub fn host(
         let doc_name = doc.clone();
         let password = password.clone();
         let alive = alive.clone();
+        let locks_outer = locks.clone();
+        let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 if !alive.load(Ordering::SeqCst) {
@@ -155,6 +264,9 @@ pub fn host(
                 let evt_tx = evt_tx.clone();
                 let doc_name = doc_name.clone();
                 let password = password.clone();
+                let locks = locks_outer.clone();
+                let now_ms = now_ms_outer;
+                let my_site = host_site;
                 std::thread::spawn(move || {
                     let mut write_half = match stream.try_clone() {
                         Ok(s) => s,
@@ -246,6 +358,79 @@ pub fn host(
                                 }
                                 let _ = evt_tx.send(NetEvent::Cursor(c));
                             }
+                            Msg::LockReq { site, name, sheet, row, col } => {
+                                let outcome = locks.lock().unwrap().request(
+                                    sheet, row, col, site, &name, now_ms(),
+                                );
+                                match outcome {
+                                    sheetcore::sync::LockOutcome::Denied { holder, name: hn } => {
+                                        let line = serde_json::to_string(&Msg::LockDeny {
+                                            site,
+                                            sheet,
+                                            row,
+                                            col,
+                                            holder,
+                                            holder_name: hn,
+                                        })
+                                        .unwrap();
+                                        let _ = tx.send(line);
+                                        if site == my_site {
+                                            let _ = evt_tx.send(NetEvent::LockDeny {
+                                                holder,
+                                                holder_name: name,
+                                                sheet,
+                                                row,
+                                                col,
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        let line = serde_json::to_string(&Msg::LockOk {
+                                            site,
+                                            name,
+                                            sheet,
+                                            row,
+                                            col,
+                                        })
+                                        .unwrap();
+                                        for (s, ptx) in peers.lock().unwrap().iter() {
+                                            if Some(*s) != hello_site {
+                                                let _ = ptx.send(line.clone());
+                                            }
+                                        }
+                                        let _ = tx.send(line);
+                                        let _ = evt_tx.send(NetEvent::LockOk {
+                                            site,
+                                            name: locks
+                                                .lock()
+                                                .unwrap()
+                                                .holder(sheet, row, col)
+                                                .map(|h| h.name.clone())
+                                                .unwrap_or_default(),
+                                            sheet,
+                                            row,
+                                            col,
+                                        });
+                                    }
+                                }
+                            }
+                            Msg::LockRelease { site, sheet, row, col } => {
+                                let ok = locks.lock().unwrap().release(sheet, row, col, site);
+                                if ok {
+                                    let line = serde_json::to_string(&Msg::LockRelease {
+                                        site, sheet, row, col,
+                                    })
+                                    .unwrap();
+                                    for (s, ptx) in peers.lock().unwrap().iter() {
+                                        if Some(*s) != hello_site {
+                                            let _ = ptx.send(line.clone());
+                                        }
+                                    }
+                                    let _ = evt_tx.send(NetEvent::LockRelease {
+                                        site, sheet, row, col,
+                                    });
+                                }
+                            }
                             Msg::Bye { site } => {
                                 peers.lock().unwrap().remove(&site);
                                 peer_names.lock().unwrap().remove(&site);
@@ -258,6 +443,24 @@ pub fn host(
                     if let Some(site) = hello_site {
                         peers.lock().unwrap().remove(&site);
                         peer_names.lock().unwrap().remove(&site);
+                        // 人走了，锁必须放掉，否则格子会一直灰着
+                        let mine: Vec<(usize, u32, u32)> = locks
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(_, h)| h.site == site)
+                            .map(|(k, _)| k)
+                            .collect();
+                        for (sheet, row, col) in mine {
+                            locks.lock().unwrap().release(sheet, row, col, site);
+                            let line = serde_json::to_string(&Msg::LockRelease {
+                                site, sheet, row, col,
+                            })
+                            .unwrap();
+                            for ptx in peers.lock().unwrap().values() {
+                                let _ = ptx.send(line.clone());
+                            }
+                        }
                         let _ = evt_tx.send(NetEvent::PeerLeft(site));
                     }
                 });
@@ -273,6 +476,9 @@ pub fn host(
         addr: format!("0.0.0.0:{port}"),
         alive,
         state: Some(state),
+        host_locks: Some(locks_for_self),
+        evt_tx: evt_tx_self,
+        t0,
     })
 }
 
@@ -290,6 +496,7 @@ pub fn join(
 
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (evt_tx, evt_rx) = channel::<NetEvent>();
+    let evt_tx_clone = evt_tx.clone();
     let alive = Arc::new(AtomicBool::new(true));
     let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
 
@@ -378,6 +585,21 @@ pub fn join(
                         Msg::Op(op) => {
                             let _ = evt_tx.send(NetEvent::Ops(vec![op]));
                         }
+                        Msg::LockOk { site, name, sheet, row, col } => {
+                            let _ = evt_tx.send(NetEvent::LockOk { site, name, sheet, row, col });
+                        }
+                        Msg::LockDeny { holder, holder_name, sheet, row, col, .. } => {
+                            let _ = evt_tx.send(NetEvent::LockDeny {
+                                holder,
+                                holder_name,
+                                sheet,
+                                row,
+                                col,
+                            });
+                        }
+                        Msg::LockRelease { site, sheet, row, col } => {
+                            let _ = evt_tx.send(NetEvent::LockRelease { site, sheet, row, col });
+                        }
                         Msg::CursorMsg(c) => {
                             let _ = evt_tx.send(NetEvent::Cursor(c));
                         }
@@ -412,6 +634,9 @@ pub fn join(
         addr: addr.to_string(),
         alive,
         state: None,
+        host_locks: None,
+        evt_tx: evt_tx_clone,
+        t0: std::time::Instant::now(),
     })
 }
 
