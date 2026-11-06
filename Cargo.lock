@@ -2638,6 +2638,7 @@ dependencies = [
  "serde",
  "serde_json",
  "umya-spreadsheet",
+ "windows-sys 0.52.0",
  "zip 8.6.0",
 ]
 

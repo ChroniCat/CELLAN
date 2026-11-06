@@ -1,3 +1,4 @@
+use crate::store::Store;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -84,9 +85,8 @@ impl Cell {
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
     pub name: String,
-    /// 行号 → 该行的单元格，按列号升序存放。
-    /// 每格只有 4（列号）+ 40（Cell）字节，没有哈希槽位开销。
-    rows: HashMap<u32, Vec<(u32, Cell)>>,
+    /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
+    cells: Store,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: std::collections::HashSet<CellRef>,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
@@ -97,115 +97,78 @@ impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            rows: HashMap::new(),
+            cells: Store::default(),
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
         }
     }
 
-    #[inline]
-    fn row_get(row: &[(u32, Cell)], c: u32) -> Option<usize> {
-        row.binary_search_by_key(&c, |(cc, _)| *cc).ok()
-    }
-
     pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {
-        let row = self.rows.get(&r)?;
-        Self::row_get(row, c).map(|i| &row[i].1)
+        self.cells.get(r, c)
     }
 
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
-        let row = self.rows.get_mut(&r)?;
-        let i = Self::row_get(row, c)?;
-        Some(&mut row[i].1)
+        self.cells.get_mut(r, c)
     }
 
     pub fn value(&self, r: u32, c: u32) -> Value {
-        self.get(r, c).map(|x| x.value.clone()).unwrap_or_default()
+        self.cells.get(r, c).map(|x| x.value.clone()).unwrap_or_default()
     }
 
     pub fn contains(&self, r: u32, c: u32) -> bool {
-        self.get(r, c).is_some()
+        self.cells.contains(r, c)
     }
 
     pub fn set(&mut self, r: u32, c: u32, cell: Cell) {
         let key = CellRef::new(r, c);
         if cell.is_blank() {
-            if self.remove(r, c).is_some() {
+            if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
             }
             return;
         }
         self.cleared.remove(&key);
-        let row = self.rows.entry(r).or_default();
-        match Self::row_get(row, c) {
-            Some(i) => row[i].1 = cell,
-            None => {
-                let pos = row.partition_point(|(cc, _)| *cc < c);
-                row.insert(pos, (c, cell));
-            }
-        }
+        self.cells.set(r, c, cell);
     }
 
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
-        let row = self.rows.get_mut(&r)?;
-        let i = Self::row_get(row, c)?;
-        let cell = row.remove(i).1;
-        if row.is_empty() {
-            self.rows.remove(&r);
-        }
-        Some(cell)
+        self.cells.remove(r, c)
     }
 
     pub fn len(&self) -> usize {
-        self.rows.values().map(|r| r.len()).sum()
+        self.cells.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.cells.is_empty()
     }
 
     pub fn clear(&mut self) {
-        self.rows.clear();
+        self.cells.clear();
     }
 
     /// 按行、列升序遍历所有单元格
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        let mut rows: Vec<(&u32, &Vec<(u32, Cell)>)> = self.rows.iter().collect();
-        rows.sort_by_key(|(r, _)| **r);
-        rows.into_iter().flat_map(|(r, row)| {
-            row.iter().map(move |(c, cell)| (CellRef::new(*r, *c), cell))
-        })
+        self.cells.iter()
     }
 
-    /// 只需要单元格引用时用这个（避免每行一次 Vec 分配）
     pub fn values(&self) -> impl Iterator<Item = &Cell> {
-        self.rows.values().flat_map(|row| row.iter().map(|(_, c)| c))
+        self.cells.iter_values()
     }
 
-    /// 已用区域的最大行列（0-based，含）
+    /// 已用区域 (r1, c1, r2, c2)，0-based
     pub fn used_bounds(&self) -> Option<(u32, u32, u32, u32)> {
-        let mut r1 = u32::MAX;
-        let mut c1 = u32::MAX;
-        let mut r2 = 0u32;
-        let mut c2 = 0u32;
-        let mut any = false;
-        for (r, row) in self.rows.iter() {
-            for (c, cell) in row.iter() {
-                if cell.is_blank() {
-                    continue;
-                }
-                any = true;
-                r1 = r1.min(*r);
-                r2 = r2.max(*r);
-                c1 = c1.min(*c);
-                c2 = c2.max(*c);
-            }
-        }
-        if any {
-            Some((r1, c1, r2, c2))
-        } else {
-            None
-        }
+        self.cells.used_bounds()
+    }
+
+    /// 单列连续访问（范围求值的快路径）
+    pub fn column_span(&self, r1: u32, r2: u32, c: u32) -> Vec<&Cell> {
+        self.cells.column_span(r1, r2, c)
+    }
+
+    /// 存储层实际占用字节（调试用）
+    pub fn allocated_bytes(&self) -> usize {
+        self.cells.allocated_bytes()
     }
 }
 
