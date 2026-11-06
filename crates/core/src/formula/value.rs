@@ -65,6 +65,15 @@ impl Array {
     }
 }
 
+/// 一等公民的 LAMBDA：LET(f, LAMBDA(x, x+1), f(1)) 需要把函数当值传
+#[derive(Clone, Debug, PartialEq)]
+pub struct LambdaVal {
+    pub params: Vec<String>,
+    pub body: crate::formula::Node,
+    /// 定义时捕获的环境（词法闭包：内层 LAMBDA 要能看见外层的参数）
+    pub env: Vec<std::collections::HashMap<String, FValue>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FValue {
     Empty,
@@ -73,6 +82,7 @@ pub enum FValue {
     Bool(bool),
     Error(ErrKind),
     Array(std::rc::Rc<Array>),
+    Lambda(std::rc::Rc<LambdaVal>),
 }
 
 impl FValue {
@@ -116,6 +126,7 @@ impl FValue {
             FValue::Text(s) => s.clone(),
             FValue::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
             FValue::Error(e) => e.text().to_string(),
+            FValue::Lambda(_) => "#FUNC!".into(),
         }
     }
 
@@ -134,6 +145,7 @@ impl FValue {
                 t.parse::<f64>().map_err(|_| ErrKind::Value)
             }
             FValue::Error(e) => Err(*e),
+            FValue::Lambda(_) => Err(ErrKind::Value),
         }
     }
 
@@ -159,6 +171,7 @@ impl FValue {
                 _ => Err(ErrKind::Value),
             },
             FValue::Error(e) => Err(*e),
+            FValue::Lambda(_) => Err(ErrKind::Value),
         }
     }
 
@@ -173,6 +186,7 @@ impl FValue {
                 FValue::Bool(_) => 3,
                 FValue::Error(_) => 4,
                 FValue::Array(_) => 5,
+                FValue::Lambda(_) => 6,
             }
         }
         if let (FValue::Error(e), _) = (self, other) {

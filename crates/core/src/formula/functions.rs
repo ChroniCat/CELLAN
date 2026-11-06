@@ -1684,6 +1684,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             FValue::Number(_) => 1.0,
             FValue::Text(_) => 2.0,
             FValue::Bool(_) => 4.0,
+            FValue::Lambda(_) => 128.0,
             FValue::Error(_) => 16.0,
             FValue::Empty => 1.0,
         }),

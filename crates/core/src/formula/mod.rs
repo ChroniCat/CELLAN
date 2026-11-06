@@ -852,9 +852,16 @@ impl<'a> Calc<'a> {
                 match name.as_str() {
                     "MAP" => {
                         let vals = self.operand_values(&nodes[0], si);
+                        let lam_val = match self.eval_node(lam, si) {
+                            FValue::Lambda(l) => Some(l),
+                            _ => None,
+                        };
                         let out: Vec<FValue> = vals
                             .iter()
-                            .map(|v| self.apply_lambda(lam, vec![v.clone()], si))
+                            .map(|v| match &lam_val {
+                                Some(l) => self.apply_lambda_val(l, vec![v.clone()], si),
+                                None => self.apply_lambda(lam, vec![v.clone()], si),
+                            })
                             .collect();
                         FValue::Array(std::rc::Rc::new(value::Array::new(1, out.len(), out)))
                     }
@@ -930,8 +937,22 @@ impl<'a> Calc<'a> {
                     }
                 }
             }
-            // 单独的 LAMBDA：没有被调用，Excel 返回 #CALC!
-            Node::Func(name, _) if name == "LAMBDA" => FValue::Error(ErrKind::Value),
+            // LAMBDA 作为值出现（LET 绑定、或者传参）：包成一等公民
+            Node::Func(name, parts) if name == "LAMBDA" && !parts.is_empty() => {
+                let params = parts[..parts.len() - 1]
+                    .iter()
+                    .filter_map(|p| match p {
+                        Node::Name(n) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let body = parts[parts.len() - 1].clone();
+                FValue::Lambda(std::rc::Rc::new(crate::formula::value::LambdaVal {
+                    params,
+                    body,
+                    env: self.env_stack.clone(),
+                }))
+            }
             Node::Func(name, nodes) if name == "ISOMITTED" => match nodes.first() {
                 Some(Node::Name(n)) => FValue::Bool(
                     self.env_stack
@@ -1445,6 +1466,25 @@ impl<'a> Calc<'a> {
                 self.call_generic(name, nodes, si)
             }
             Node::Func(name, nodes) => {
+                // 名字被 LET 绑定成函数时优先当函数调用
+                let bound = self
+                    .env_stack
+                    .iter()
+                    .rev()
+                    .find_map(|m| {
+                        m.get(name).cloned().or_else(|| {
+                            m.iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                                .map(|(_, v)| v.clone())
+                        })
+                    });
+                if let Some(FValue::Lambda(lam)) = bound {
+                    let mut vals = Vec::with_capacity(nodes.len());
+                    for n in nodes.iter() {
+                        vals.push(self.eval_node(n, si));
+                    }
+                    return self.apply_lambda_val(&lam, vals, si);
+                }
                 let mut args = Vec::with_capacity(nodes.len());
                 for n in nodes {
                     // 区域参数保留结构（SUM/COUNTIF 等需要）
@@ -1630,6 +1670,31 @@ impl<'a> Calc<'a> {
         }
     }
 
+    /// 应用一等公民 lambda
+    fn apply_lambda_val(
+        &mut self,
+        lam: &crate::formula::value::LambdaVal,
+        vals: Vec<FValue>,
+        si: usize,
+    ) -> FValue {
+        let mut env: HashMap<String, FValue> = HashMap::new();
+        for (p, v) in lam.params.iter().zip(vals.into_iter()) {
+            env.insert(p.clone(), v);
+        }
+        for p in lam.params.iter() {
+            env.entry(p.clone()).or_insert(FValue::Empty);
+        }
+        // 先把定义时捕获的环境铺上，再压参数帧
+        let base = self.env_stack.len();
+        for frame in lam.env.iter() {
+            self.env_stack.push(frame.clone());
+        }
+        self.env_stack.push(env);
+        let out = self.eval_node(&lam.body, si);
+        self.env_stack.truncate(base);
+        out
+    }
+
     /// 应用 LAMBDA：把实参绑定到形参后求值函数体
     fn apply_lambda(&mut self, lam: &Node, vals: Vec<FValue>, si: usize) -> FValue {
         if let Node::Func(n, parts) = lam {
@@ -1663,7 +1728,12 @@ impl<'a> Calc<'a> {
                 return (*values).clone();
             }
         }
-        vec![self.eval_node(n, si)]
+        let v = self.eval_node(n, si);
+        // MAP/BYROW 这类返回数组的函数，聚合时需要摊平
+        if let FValue::Array(a) = &v {
+            return a.data.clone();
+        }
+        vec![v]
     }
 
     fn eval_binary(&mut self, op: BinOp, l: &Node, r: &Node, si: usize) -> FValue {
@@ -1769,6 +1839,8 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
         FValue::Bool(b) => V::Bool(*b),
         FValue::Error(e) => V::Text(e.text().into()),
         FValue::Array(a) => from_fvalue(&a.get(0, 0)),
+        // 函数值落盘没有对应类型，Excel 里显示 #CALC!
+        FValue::Lambda(_) => V::Text("#CALC!".into()),
     }
 }
 

@@ -64,6 +64,22 @@
 
 
 
+
+### v1.13 LET 与嵌套 LAMBDA ✅ 2026-11-06
+
+`FValue` 增加 `Lambda(Rc<LambdaVal>)`，函数成了一等公民：
+
+- `LET(f,LAMBDA(x,x+1),f(1))` = 2；`LET(add,LAMBDA(a,b,a+b),add(3,4))` = 7。
+- 词法闭包：`LambdaVal.env` 保存定义时的环境快照，所以
+  `LET(mk,LAMBDA(a,LAMBDA(b,a+b)),LET(f,mk(2),f(3)))` = 5，内层函数能看见外层参数。
+- 函数可以当参数传：`LET(apply,LAMBDA(g,v,g(v)),apply(LAMBDA(x,x*x),9))` = 81。
+- 解析器会把函数名大写，所以环境查找按大小写不敏感匹配。
+- 数组结果参与聚合时摊平：`SUM(MAP({1,2,3},LAMBDA(x,x*2)))` = 12（之前只取第一个元素）。
+- 直接算一个没调用的 LAMBDA 得到函数值，显示 `#FUNC!`（Excel 是 `#CALC!`）。
+
+**踩坑**：`Node::Func(name,args)` 的通用分支没有做环境查找，第一版只改了 LET 绑定，
+`f(1)` 依然报 `#NAME?`——必须在通用调用分支最前面拦一道。
+
 ### v1.12 排序与筛选 ✅ 2026-11-06
 
 `crates/core/src/sort_filter.rs`。
