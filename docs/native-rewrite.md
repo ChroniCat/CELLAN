@@ -67,6 +67,43 @@
 
 
 
+
+### v1.20 图表类型与编辑 ✅ 2026-11-06
+
+- 八种类型全支持：簇状柱形、条形、堆积柱形、折线、面积、饼图、圆环、散点。
+  写入时按类型换 plotArea 容器（barChart/lineChart/areaChart/pieChart/doughnutChart/scatterChart），
+  饼图只取第一个系列，散点把分类当 X（非数字用序号），系列颜色走 8 色板。
+- 插入前弹对话框：选类型、填标题。
+- 「图表管理…」列出本表所有图表（标题/类型/系列数/锚点），可直接换类型或删除。
+- 换类型 = 用图表里已有的区间引用重新生成 XML 覆盖原部件，锚点不动。
+- 删除 = 摘掉 drawing 里的锚点、drawing rels 的条目、chart 部件本身，
+  并把 `[Content_Types]` 里对应的 Override 去掉（留着会让 Excel 认为包坏了）。
+- 验证：八种类型各自插入 → 读回类型一致 → 删除后图表数为 0 且文件仍能打开；
+  openpyxl 侧交叉确认类名分别是 BarChart / LineChart / AreaChart / PieChart /
+  DoughnutChart / ScatterChart。
+
+**踩坑**：解析器只在 `Event::Start` 里认 `stacked`，而我们写的 `<c:grouping val="stacked"/>`
+是自闭合的 `Event::Empty`，于是堆积柱形读回来变成普通柱形——改成在 Empty 分支里看 `val`。
+
+### v1.21 独立比较窗口 ✅ 2026-11-06
+
+- 「视图 → 并排比较…」选文件后，可以勾「在独立窗口中显示」，用 egui viewport
+  开一个真正的顶层窗口（`show_viewport_immediate`），不是同窗分栏。
+- 窗口有自己的标题（`比较 - 文件名`）、自己的滚动位置、表切换下拉、同步滚动开关。
+- 关窗口时清掉比较对象；主窗口回到单栏。
+- 验证：Enumerator 枚举该进程的可见顶层窗口，得到
+  `Sheets Native (v1.6) | 比较 - table.xlsx` 两个窗口；dump 里比较面板的几何
+  `rect=(8,30,992,712)` 正是那个 1000×720 视口，内容为 table.xlsx 的「姓名/部门」。
+
+### v1.22 宏相关收尾 ✅ 2026-11-06
+
+- 保存对话框加 `.xlsm` 过滤；含宏文件默认文件名带 `.xlsm`。
+- 含宏却另存为 `.xlsx` 时自动改存 `.xlsm` 并提示，避免静默丢宏。
+- 「审阅 → 导出宏部件…」把 `vbaProject.bin` 另存出来供人工分析（我们不执行宏）。
+- **说明**：不执行 VBA，也不解析 VBA 源码。解析需要 CFB 复合文档 + MS-OVBA 压缩容器
+  两套解码，且本机没有任何真实宏文件可用于验证，做出来只能是「猜着能跑」——
+  按「不能给你没法验证的东西」的原则，这里只做保留与导出。
+
 ### v1.16 图标集 ✅ 2026-11-06
 
 - `CfKind::IconSet { set, reverse, thresholds, show_value }`；`IconMark` 把

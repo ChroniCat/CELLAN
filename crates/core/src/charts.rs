@@ -58,6 +58,10 @@ pub struct Chart {
     pub anchor: (u32, u32, u32, u32),
     /// 图例位置："r" 右侧等；空表示无
     pub legend_pos: String,
+    /// 图表部件路径（xl/charts/chartN.xml），删除/改类型要用
+    pub part: String,
+    /// 所属 drawing 部件路径
+    pub drawing: String,
 }
 
 /// 解析某张表的图表
@@ -153,6 +157,8 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
             }
             if let Some(mut ch) = parse_chart(&cx) {
                 ch.anchor = anchor;
+                ch.part = cp.clone();
+                ch.drawing = drawing_path.clone();
                 out.push(ch);
             }
         }
@@ -410,7 +416,15 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
             Ok(Event::Empty(e)) => {
                 let nm = e.name();
                 let name = local(nm.as_ref()).to_string();
-                if name == "barDir" {
+                if name == "grouping" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("val")
+                            && crate::model::xml_unescape(&a.value.to_string()) == "stacked"
+                        {
+                            stacked = true;
+                        }
+                    }
+                } else if name == "barDir" {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("val") {
                             bar_dir = crate::model::xml_unescape(&a.value.to_string());
@@ -502,6 +516,8 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         legend,
         anchor: (0, 0, 8, 12),
         legend_pos,
+        part: String::new(),
+        drawing: String::new(),
     })
 }
 

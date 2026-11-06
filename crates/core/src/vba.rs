@@ -66,7 +66,6 @@ pub fn has_macros(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn make_xlsm(path: &Path) {
         // 造一个带「宏部件」的最小 xlsm：xlsx 结构 + vbaProject.bin

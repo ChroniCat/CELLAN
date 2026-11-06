@@ -1051,3 +1051,36 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+/// 从 zip 里删掉一个条目
+pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("rmtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        for i in 0..zip.len() {
+            let (n, buf) = {
+                let mut e = zip.by_index(i)?;
+                let n = e.name().to_string();
+                if n == name {
+                    continue;
+                }
+                let mut b = Vec::new();
+                e.read_to_end(&mut b)?;
+                (n, b)
+            };
+            zw.start_file(n, opts())?;
+            zw.write_all(&buf)?;
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}

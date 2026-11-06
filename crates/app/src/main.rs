@@ -51,6 +51,10 @@ struct SheetApp {
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
     show_pages: bool,
+    /// 新建图表草稿
+    chart_edit: Option<sheetcore::charts::Chart>,
+    /// 图表管理窗口
+    chart_mgr: bool,
     /// 透视表草稿
     pivot_edit: Option<sheetcore::pivot::PivotSpec>,
     /// 透视表是否生成真正的 pivotTable 部件
@@ -59,6 +63,8 @@ struct SheetApp {
     compare: Option<(sheetcore::model::Workbook, usize, Vec2)>,
     /// 同步滚动
     compare_sync: bool,
+    /// 用独立窗口显示比较文件（否则同窗左右分栏）
+    compare_window: bool,
     editing: Option<EditState>,
     status: String,
     tree: FileTree,
@@ -140,6 +146,8 @@ impl SheetApp {
             note_edit: None,
             filter_popup: None,
             show_pages: false,
+            chart_edit: None,
+            chart_mgr: false,
             pivot_edit: None,
             pivot_real: true,
             compare: {
@@ -152,6 +160,7 @@ impl SheetApp {
                 c
             },
             compare_sync: true,
+            compare_window: std::env::var("SC_WIN").is_ok(),
             editing: None,
             status: "就绪".into(),
             tree: FileTree::new(),
@@ -284,12 +293,29 @@ impl SheetApp {
         let path = match (&self.wb.path, force_dialog) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new()
-                .add_filter("Excel", &["xlsx"])
-                .set_file_name(self.wb.title())
+                .add_filter("Excel 工作簿", &["xlsx"])
+                .add_filter("Excel 启用宏的工作簿", &["xlsm"])
+                .set_file_name(if self.wb.has_vba {
+                    format!("{}.xlsm", self.wb.title())
+                } else {
+                    format!("{}.xlsx", self.wb.title())
+                })
                 .save_file(),
         };
         let Some(path) = path else { return };
 
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if self.wb.has_vba && ext == "xlsx" {
+            self.status = "该文件含 VBA 宏，存成 .xlsx 会丢掉宏；已改存为 .xlsm".into();
+        }
+        let path = if self.wb.has_vba && ext == "xlsx" {
+            path.with_extension("xlsm")
+        } else {
+            path
+        };
         let mut wb = self.wb.clone();
         wb.path = Some(path.clone());
         let shown = path.display().to_string();
@@ -695,6 +721,11 @@ impl SheetApp {
                 }
                 ui.label(egui::RichText::new("首行=系列名，首列=分类").weak());
                 ui.separator();
+                if ui.button("图表管理…").clicked() {
+                    self.chart_mgr = true;
+                    self.reload_charts();
+                    ui.close_menu();
+                }
                 if ui.button("数据透视表…").clicked() {
                     let (r, c) = self.sel;
                     let (r1, c1, r2, c2) =
@@ -1169,6 +1200,15 @@ impl SheetApp {
     fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("审阅", |ui| {
             ui.set_min_width(180.0);
+            if ui
+                .add_enabled(self.wb.has_vba, egui::Button::new("导出宏部件…"))
+                .on_hover_text("把 vbaProject.bin 另存出来（不执行宏）")
+                .clicked()
+            {
+                self.export_macro_part();
+                ui.close_menu();
+            }
+            ui.separator();
             let (r, c) = self.sel;
             let cur = self
                 .wb
@@ -1683,11 +1723,18 @@ impl SheetApp {
                 .clicked()
             {
                 self.compare = None;
+                self.compare_window = false;
                 self.status = "已关闭并排比较".into();
                 ui.close_menu();
             }
             if self.compare.is_some() {
                 ui.checkbox(&mut self.compare_sync, "同步纵向滚动");
+                if ui
+                    .checkbox(&mut self.compare_window, "在独立窗口中显示")
+                    .changed()
+                {
+                    ui.close_menu();
+                }
             }
             ui.label(format!(
                 "页数约 {}×{}",
@@ -1704,31 +1751,141 @@ impl SheetApp {
             self.status = "先选中一块数据（首行为系列名，首列为分类）".into();
             return;
         }
-        let Some(path) = self.wb.path.clone() else {
+        if self.wb.path.is_none() {
             self.status = "请先保存文件再插入图表".into();
             return;
-        };
+        }
         let name = self.wb.sheet(self.sheet_idx).name.clone();
         let ch = sheetcore::chart_write::chart_from_selection(
             self.wb.sheet(self.sheet_idx),
             &name,
             (r1, c1, r2, c2),
             "图表",
+            sheetcore::charts::ChartKind::Column,
         );
+        self.chart_edit = Some(ch);
+    }
+
+    /// 真的写文件
+    fn commit_chart(&mut self, ch: sheetcore::charts::Chart) {
+        let Some(path) = self.wb.path.clone() else {
+            self.status = "请先保存文件再插入图表".into();
+            return;
+        };
+        let name = self.wb.sheet(self.sheet_idx).name.clone();
         if let Err(e) = sheetcore::xlsx::save(&path, &self.wb) {
             self.status = format!("保存失败：{e}");
             return;
         }
         match sheetcore::chart_write::insert_chart(&path, &name, &ch) {
             Ok(()) => {
-                if let Ok(all) = sheetcore::charts::load_charts_all(&path, &self.wb.sheets) {
-                    for (idx, sh) in self.wb.sheets.iter_mut().enumerate() {
-                        sh.charts = all.get(&(idx as u32)).cloned().unwrap_or_default();
-                    }
-                }
-                self.status = format!("已插入图表（{} 个系列）", ch.series.len());
+                self.reload_charts();
+                self.status = format!("已插入{}（{} 个系列）", ch.kind.label(), ch.series.len());
             }
             Err(e) => self.status = format!("插入图表失败：{e}"),
+        }
+    }
+
+    fn reload_charts(&mut self) {
+        if let Some(path) = self.wb.path.clone() {
+            if let Ok(all) = sheetcore::charts::load_charts_all(&path, &self.wb.sheets) {
+                for (idx, sh) in self.wb.sheets.iter_mut().enumerate() {
+                    sh.charts = all.get(&(idx as u32)).cloned().unwrap_or_default();
+                }
+            }
+        }
+    }
+
+
+    /// 把比较工作簿临时换进状态里画一帧，再换回来
+    fn draw_compare_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(mut cmp) = self.compare.take() else { return };
+        let (cmp_wb, cmp_sheet, cmp_scroll) = (std::mem::take(&mut cmp.0), cmp.1, cmp.2);
+        let saved_wb = std::mem::replace(&mut self.wb, cmp_wb);
+        let saved_sheet = self.sheet_idx;
+        let saved_scroll = self.scroll;
+        let saved_sel = self.sel;
+        let saved_sel_end = self.sel_end;
+        self.sheet_idx = cmp_sheet;
+        self.scroll = cmp_scroll;
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        if self.compare_sync {
+            self.scroll.y = saved_scroll.y;
+        }
+        self.draw_grid_pane(ui, ctx, true);
+        let used_scroll = self.scroll;
+        cmp.0 = std::mem::replace(&mut self.wb, saved_wb);
+        cmp.2 = used_scroll;
+        self.sheet_idx = saved_sheet;
+        self.scroll = saved_scroll;
+        self.sel = saved_sel;
+        self.sel_end = saved_sel_end;
+        self.cf_stats_gen = u64::MAX;
+        self.compare = Some(cmp);
+    }
+
+    /// 独立窗口里的比较视图
+    fn show_compare_window(&mut self, ctx: &egui::Context) {
+        if self.compare.is_none() || !self.compare_window {
+            return;
+        }
+        let title = format!(
+            "比较 - {}",
+            self.compare.as_ref().map(|c| c.0.title()).unwrap_or_default()
+        );
+        let vp = egui::ViewportId::from_hash_of("sheet_compare");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([1000.0, 720.0])
+            .with_min_inner_size([420.0, 300.0]);
+        let mut closed = false;
+        if std::env::var("SC_DUMP").is_ok() {
+            eprintln!("[win] 打开独立比较窗口");
+        }
+        ctx.show_viewport_immediate(vp, builder, |ctx, _class| {
+            egui::TopBottomPanel::top("cmp_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("只读视图").small(),
+                    );
+                    if self.compare.as_ref().map(|c| c.0.sheets.len() > 1).unwrap_or(false) {
+                        let mut pick = self.compare.as_ref().map(|c| c.1).unwrap_or(0);
+                        let names: Vec<String> = self
+                            .compare
+                            .as_ref()
+                            .map(|c| c.0.sheets.iter().map(|s| s.name.clone()).collect())
+                            .unwrap_or_default();
+                        egui::ComboBox::from_id_salt("cmp_sheet")
+                            .selected_text(names.get(pick).cloned().unwrap_or_default())
+                            .show_ui(ui, |ui| {
+                                for (i, n) in names.iter().enumerate() {
+                                    if ui.selectable_label(pick == i, n).clicked() {
+                                        pick = i;
+                                    }
+                                }
+                            });
+                        if let Some(c) = self.compare.as_mut() {
+                            c.1 = pick;
+                        }
+                    }
+                    let mut sync = self.compare_sync;
+                    if ui.checkbox(&mut sync, "同步纵向滚动").changed() {
+                        self.compare_sync = sync;
+                    }
+                });
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                self.draw_compare_pane(ui, ctx);
+            });
+            if ctx.input(|i| i.viewport().close_requested()) {
+                closed = true;
+            }
+        });
+        if closed {
+            self.compare_window = false;
+            self.compare = None;
+            self.status = "已关闭比较窗口".into();
         }
     }
 
@@ -1756,6 +1913,174 @@ impl SheetApp {
         self.wb.dirty = true;
     }
 
+
+
+    /// 把 vbaProject.bin 导出来
+    fn export_macro_part(&mut self) {
+        let Some(src) = self.wb.path.clone() else {
+            self.status = "先保存文件".into();
+            return;
+        };
+        let Some(bytes) = sheetcore::vba::read_vba(&src) else {
+            self.status = "这个文件里没有 VBA 宏".into();
+            return;
+        };
+        let Some(out) = rfd::FileDialog::new()
+            .set_file_name("vbaProject.bin")
+            .add_filter("VBA 工程", &["bin"])
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&out, &bytes) {
+            Ok(()) => {
+                self.status = format!("已导出 {} 字节到 {}", bytes.len(), out.display());
+            }
+            Err(e) => self.status = format!("导出失败：{e}"),
+        }
+    }
+
+    /// 新建/编辑图表的对话框
+    fn chart_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut ch) = self.chart_edit.take() else { return };
+        let mut open = true;
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("插入图表")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(280.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("chart_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("图表类型");
+                    egui::ComboBox::from_id_salt("chart_kind")
+                        .selected_text(ch.kind.label())
+                        .show_ui(ui, |ui| {
+                            for k in [
+                                sheetcore::charts::ChartKind::Column,
+                                sheetcore::charts::ChartKind::Bar,
+                                sheetcore::charts::ChartKind::BarStacked,
+                                sheetcore::charts::ChartKind::Line,
+                                sheetcore::charts::ChartKind::Area,
+                                sheetcore::charts::ChartKind::Pie,
+                                sheetcore::charts::ChartKind::Doughnut,
+                                sheetcore::charts::ChartKind::Scatter,
+                            ] {
+                                if ui.selectable_label(ch.kind == k, k.label()).clicked() {
+                                    ch.kind = k;
+                                }
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("标题");
+                    ui.text_edit_singleline(&mut ch.title);
+                    ui.end_row();
+                    ui.label("系列");
+                    ui.label(format!("{} 个", ch.series.len()));
+                    ui.end_row();
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("插入").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if ok {
+            self.commit_chart(ch);
+        } else if !cancel && open {
+            self.chart_edit = Some(ch);
+        }
+    }
+
+    /// 图表管理：改类型、删除
+    fn chart_manager(&mut self, ctx: &egui::Context) {
+        if !self.chart_mgr {
+            return;
+        }
+        let mut open = true;
+        let mut del: Option<usize> = None;
+        let mut retype: Option<(usize, sheetcore::charts::ChartKind)> = None;
+        let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+        egui::Window::new("图表管理")
+            .collapsible(false)
+            .default_width(340.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if charts.is_empty() {
+                    ui.label("这张表还没有图表");
+                }
+                for (i, ch) in charts.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{}. {}（{} 系列，锚点 {}-{}）",
+                            i + 1,
+                            if ch.title.is_empty() { "图表" } else { &ch.title },
+                            ch.series.len(),
+                            cell_name(ch.anchor.0, ch.anchor.1),
+                            cell_name(ch.anchor.2, ch.anchor.3)
+                        ));
+                        egui::ComboBox::from_id_salt(format!("ret{i}"))
+                            .selected_text(ch.kind.label())
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for k in [
+                                    sheetcore::charts::ChartKind::Column,
+                                    sheetcore::charts::ChartKind::Bar,
+                                    sheetcore::charts::ChartKind::BarStacked,
+                                    sheetcore::charts::ChartKind::Line,
+                                    sheetcore::charts::ChartKind::Area,
+                                    sheetcore::charts::ChartKind::Pie,
+                                    sheetcore::charts::ChartKind::Doughnut,
+                                    sheetcore::charts::ChartKind::Scatter,
+                                ] {
+                                    if ui.selectable_label(ch.kind == k, k.label()).clicked() {
+                                        retype = Some((i, k));
+                                    }
+                                }
+                            });
+                        if ui.button("删除").clicked() {
+                            del = Some(i);
+                        }
+                    });
+                }
+            });
+        if let Some((i, k)) = retype {
+            if let Some(ch) = charts.get(i) {
+                let mut nc = ch.clone();
+                nc.kind = k;
+                if let Some(path) = self.wb.path.clone() {
+                    match sheetcore::chart_write::replace_chart(&path, &ch.part, &nc) {
+                        Ok(()) => {
+                            self.reload_charts();
+                            self.status = format!("已改成{}", k.label());
+                        }
+                        Err(e) => self.status = format!("改类型失败：{e}"),
+                    }
+                }
+            }
+        }
+        if let Some(i) = del {
+            if let Some(ch) = charts.get(i) {
+                if let Some(path) = self.wb.path.clone() {
+                    match sheetcore::chart_write::delete_chart(&path, &ch.drawing, &ch.part) {
+                        Ok(()) => {
+                            self.reload_charts();
+                            self.status = "已删除图表".into();
+                        }
+                        Err(e) => self.status = format!("删除失败：{e}"),
+                    }
+                }
+            }
+        }
+        if !open {
+            self.chart_mgr = false;
+        }
+    }
 
     /// 数据透视表对话框
     fn pivot_dialog(&mut self, ctx: &egui::Context) {
@@ -1914,7 +2239,7 @@ impl SheetApp {
 
     /// 主入口：没有比较对象时整块画；有就左右各一半
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.compare.is_none() {
+        if self.compare.is_none() || self.compare_window {
             self.draw_grid_pane(ui, ctx, false);
             self.flush_dump();
             return;
@@ -1927,35 +2252,7 @@ impl SheetApp {
             });
             ui.separator();
             ui.allocate_ui(Vec2::new(half, avail.y), |ui| {
-                // 把状态临时换成「第二个工作簿」，画完再换回来
-                let mut cmp = self.compare.take().unwrap();
-                let (cmp_wb, cmp_sheet, cmp_scroll) = (std::mem::take(&mut cmp.0), cmp.1, cmp.2);
-                let saved_wb = std::mem::replace(&mut self.wb, cmp_wb);
-                let saved_sheet = self.sheet_idx;
-                let saved_scroll = self.scroll;
-                let saved_sel = self.sel;
-                let saved_sel_end = self.sel_end;
-                self.sheet_idx = cmp_sheet;
-                self.scroll = cmp_scroll;
-                self.sel = (0, 0);
-                self.sel_end = (0, 0);
-                if self.compare_sync {
-                    self.scroll.y = saved_scroll.y;
-                }
-                if std::env::var("SC_DUMP").is_ok() {
-                    eprintln!("[cmp] 第二个面板 avail={:?} sheet={}", ui.available_size(), self.wb.sheets.len());
-                }
-                self.draw_grid_pane(ui, ctx, true);
-                // 收回滚动位置与工作簿
-                let used_scroll = self.scroll;
-                cmp.0 = std::mem::replace(&mut self.wb, saved_wb);
-                cmp.2 = used_scroll;
-                self.sheet_idx = saved_sheet;
-                self.scroll = saved_scroll;
-                self.sel = saved_sel;
-                self.sel_end = saved_sel_end;
-                self.cf_stats_gen = u64::MAX; // 换回来要重算条件格式统计
-                self.compare = Some(cmp);
+                self.draw_compare_pane(ui, ctx);
             });
         });
         self.flush_dump();
@@ -2942,6 +3239,9 @@ impl eframe::App for SheetApp {
         self.note_dialog(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
+        self.chart_dialog(ctx);
+        self.show_compare_window(ctx);
+        self.chart_manager(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {

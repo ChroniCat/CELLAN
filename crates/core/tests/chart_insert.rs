@@ -15,7 +15,13 @@ fn insert_column_chart() {
     sheetcore::xlsx::save(&out, &wb).expect("先存一份");
 
     // 用 A1:C6 造图表：首行是系列名，首列是分类
-    let chart = sheetcore::chart_write::chart_from_selection(wb.sheet(0), "表格", (0, 0, 5, 2), "部门销售额");
+    let chart = sheetcore::chart_write::chart_from_selection(
+        wb.sheet(0),
+        "表格",
+        (0, 0, 5, 2),
+        "部门销售额",
+        sheetcore::charts::ChartKind::Column,
+    );
     assert_eq!(chart.series.len(), 2, "两列数据 → 两个系列");
     assert_eq!(chart.series[0].cats, vec!["张三", "李四", "王五", "赵六", "钱七"]);
     assert_eq!(chart.series[1].vals, vec![300.0, 100.0, 200.0, 50.0, 400.0]);
