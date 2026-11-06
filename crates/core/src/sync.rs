@@ -23,7 +23,7 @@ impl From<&Value> for ValueWire {
         match v {
             Value::Empty => ValueWire::Empty,
             Value::Number(n) => ValueWire::Number(*n),
-            Value::Text(s) => ValueWire::Text(s.clone()),
+            Value::Text(s) => ValueWire::Text(s.to_string()),
             Value::Bool(b) => ValueWire::Bool(*b),
         }
     }
@@ -34,7 +34,7 @@ impl From<&ValueWire> for Value {
         match v {
             ValueWire::Empty => Value::Empty,
             ValueWire::Number(n) => Value::Number(*n),
-            ValueWire::Text(s) => Value::Text(s.clone()),
+            ValueWire::Text(s) => Value::Text(s.as_str().into()),
             ValueWire::Bool(b) => Value::Bool(*b),
         }
     }
@@ -109,7 +109,7 @@ impl Peer {
             row,
             col,
             value: ValueWire::from(&cell.value),
-            formula: cell.formula.clone(),
+            formula: cell.formula.as_deref().map(|f| f.to_string()),
             ts: self.clock,
             site: self.site,
         };
@@ -150,7 +150,7 @@ impl Peer {
         for (si, r, c) in keys {
             if let Some(op) = self.cells.get(&(*si, *r, *c)) {
                 if let Some(sheet) = wb.sheets.get_mut(*si) {
-                    let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
+                    let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
                     sheet.set(*r, *c, cell);
                 }
             }
@@ -161,7 +161,7 @@ impl Peer {
     pub fn apply_all_to_workbook(&self, wb: &mut crate::model::Workbook) {
         for ((si, r, c), op) in self.cells.iter() {
             if let Some(sheet) = wb.sheets.get_mut(*si) {
-                let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
+                let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
                 sheet.set(*r, *c, cell);
             }
         }
@@ -173,7 +173,7 @@ impl Peer {
             if *si != 0 {
                 continue;
             }
-            let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
+            let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
             sheet.set(*r, *c, cell);
         }
     }

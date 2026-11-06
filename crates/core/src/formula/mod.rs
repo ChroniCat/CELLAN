@@ -742,7 +742,7 @@ impl<'a> Calc<'a> {
                 .find_map(|m| m.get(n).cloned())
                 .unwrap_or(FValue::Error(ErrKind::Name)),
             Node::Number(n) => FValue::Number(*n),
-            Node::Text(s) => FValue::Text(s.clone()),
+            Node::Text(s) => FValue::Text(s.as_str().into()),
             Node::Bool(b) => FValue::Bool(*b),
             Node::Err(e) => FValue::Error(*e),
             Node::Ref(r) => match self.sheet_index(r.sheet.as_deref(), si) {
@@ -959,7 +959,7 @@ impl<'a> Calc<'a> {
                     Err(e) => return FValue::Error(e),
                 };
                 match info.as_str() {
-                    "address" => FValue::Text(format!("${}${}", crate::model::col_label(c), r + 1)),
+                    "address" => FValue::Text(format!("${}${}", crate::model::col_label(c), r + 1).into()),
                     "row" => FValue::number((r + 1) as f64),
                     "col" => FValue::number((c + 1) as f64),
                     "contents" => self.cell_value(idx, r, c),
@@ -1755,13 +1755,7 @@ pub fn to_fvalue(v: &crate::model::Value) -> FValue {
     match v {
         V::Empty => FValue::Empty,
         V::Number(n) => FValue::Number(*n),
-        V::Text(s) => {
-            if s.starts_with('#') && s.ends_with('!') || s == "#N/A" {
-                FValue::Text(s.clone())
-            } else {
-                FValue::Text(s.clone())
-            }
-        }
+        V::Text(s) => FValue::Text(s.to_string()),
         V::Bool(b) => FValue::Bool(*b),
     }
 }
@@ -1771,9 +1765,9 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
     match v {
         FValue::Empty => V::Empty,
         FValue::Number(n) => V::Number(*n),
-        FValue::Text(s) => V::Text(s.clone()),
+        FValue::Text(s) => V::Text(s.as_str().into()),
         FValue::Bool(b) => V::Bool(*b),
-        FValue::Error(e) => V::Text(e.text().to_string()),
+        FValue::Error(e) => V::Text(e.text().into()),
         FValue::Array(a) => from_fvalue(&a.get(0, 0)),
     }
 }
@@ -1964,7 +1958,7 @@ pub fn recalc_all(wb: &mut Workbook) {
                         c,
                         wb.sheets[si]
                             .get(r, c)
-                            .and_then(|x| x.formula.clone())
+                            .and_then(|x| x.formula.as_deref().map(|f| f.to_string()))
                             .unwrap_or_default(),
                     ));
                 }
@@ -2017,7 +2011,11 @@ pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
 pub fn set_formula(sheet: &mut Sheet, r: u32, c: u32, formula: &str, cached: FValue) {
     let cell = Cell {
         value: from_fvalue(&cached),
-        formula: Some(if formula.starts_with('=') { formula.to_string() } else { format!("={formula}") }),
+        formula: Some(if formula.starts_with('=') {
+            formula.into()
+        } else {
+            format!("={formula}").into()
+        }),
     };
     sheet.set(r, c, cell);
 }

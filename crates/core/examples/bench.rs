@@ -10,7 +10,7 @@ fn build(n: usize) -> Workbook {
         wb.sheets[0].set(r, 1, Cell { value: Value::Number((r % 97) as f64), formula: None });
         wb.sheets[0].set(r, 2, Cell {
             value: Value::Number(0.0),
-            formula: Some(format!("=A{}+B{}", r + 1, r + 1)),
+            formula: Some(format!("=A{}+B{}", r + 1, r + 1).into()),
         });
     }
     wb
@@ -23,7 +23,7 @@ fn build_sum_slices(rows: usize, window: usize) -> Workbook {
         let end = (r as usize).saturating_sub(window) + 1;
         wb.sheets[0].set(r, 3, Cell {
             value: Value::Number(0.0),
-            formula: Some(format!("=SUM(A{}:A{})", end.max(1), r + 1)),
+            formula: Some(format!("=SUM(A{}:A{})", end.max(1), r + 1).into()),
         });
     }
     wb
@@ -33,12 +33,12 @@ fn build_lookup(rows: usize, probes: usize) -> Workbook {
     let mut wb = Workbook::new_blank();
     for r in 0..rows as u32 {
         wb.sheets[0].set(r, 5, Cell { value: Value::Number((r * 3) as f64), formula: None });
-        wb.sheets[0].set(r, 6, Cell { value: Value::Text(format!("name{r}")), formula: None });
+        wb.sheets[0].set(r, 6, Cell { value: Value::Text(format!("name{r}").into()), formula: None });
     }
     for i in 0..probes as u32 {
         wb.sheets[0].set(i, 8, Cell {
             value: Value::Number(0.0),
-            formula: Some(format!("=VLOOKUP({},F1:G{},2,FALSE)", (i * 3) % (rows as u32), rows)),
+            formula: Some(format!("=VLOOKUP({},F1:G{},2,FALSE)", (i * 3) % (rows as u32), rows).into()),
         });
     }
     wb

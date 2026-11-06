@@ -5,10 +5,10 @@ fn num(n: f64) -> Cell {
     Cell { value: Value::Number(n), formula: None }
 }
 fn txt(s: &str) -> Cell {
-    Cell { value: Value::Text(s.to_string()), formula: None }
+    Cell { value: Value::Text(s.into()), formula: None }
 }
 fn fx(f: &str) -> Cell {
-    Cell { value: Value::Number(0.0), formula: Some(f.to_string()) }
+    Cell { value: Value::Number(0.0), formula: Some(f.into()) }
 }
 
 #[test]
@@ -39,17 +39,17 @@ fn roundtrip_all_sheets() {
         assert_eq!(back.sheets[0].get(r, 0).map(|c| c.value.clone()), Some(Value::Number(r as f64 + 1.0)));
         assert_eq!(
             back.sheets[0].get(r, 1).map(|c| c.value.clone()),
-            Some(Value::Text(format!("客户{r}")))
+            Some(Value::Text(format!("客户{r}").into()))
         );
         assert_eq!(
             back.sheets[0].get(r, 2).and_then(|c| c.formula.clone()),
-            Some(format!("=A{}*2", r + 1)),
+            Some(format!("=A{}*2", r + 1).into()),
             "第 {r} 行公式应保留"
         );
     }
     assert_eq!(
         back.sheets[1].get(0, 1).and_then(|c| c.formula.clone()),
-        Some("=SUM(数据!C1:C200)".to_string())
+        Some("=SUM(数据!C1:C200)".into())
     );
     // 重算后合计应为 1..200 的两倍
     let mut back2 = back;

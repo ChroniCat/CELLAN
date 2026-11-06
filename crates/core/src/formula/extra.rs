@@ -1498,7 +1498,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                     _ => out.push_str(&format!("%{b:02X}")),
                 }
             }
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "TEXTSPLIT" => r(|| {
             let s = text(args, 0)?;
@@ -1760,7 +1760,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                     }
                 })
                 .collect();
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "DOLLAR" | "FIXED" => r(|| {
             let v = num(args, 0)?;
@@ -1797,7 +1797,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                 out.push('.');
                 out.push_str(&f);
             }
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "NUMBERVALUE" => r(|| {
             let s = text(args, 0)?;

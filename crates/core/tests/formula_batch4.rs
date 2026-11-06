@@ -175,7 +175,7 @@ fn lookup_fast_path_matches_generic() {
     let mut wb = Workbook::new_blank();
     for r in 0..50u32 {
         wb.sheets[0].set(r, 5, Cell { value: Value::Number((r * 3) as f64), formula: None });
-        wb.sheets[0].set(r, 6, Cell { value: Value::Text(format!("n{r}")), formula: None });
+        wb.sheets[0].set(r, 6, Cell { value: Value::Text(format!("n{r}").into()), formula: None });
     }
     // 字面区域 → 快速路径
     assert_eq!(formula::eval_formula(&wb, 0, "=VLOOKUP(9,F1:G50,2,FALSE)").display(), "n3");
@@ -193,7 +193,7 @@ fn lookup_fast_path_matches_generic() {
         wb.sheets[0].set(0, 7 + i as u32, Cell { value: Value::Number(*h), formula: None });
     }
     for (i, t) in ["a", "b", "c"].iter().enumerate() {
-        wb.sheets[0].set(1, 7 + i as u32, Cell { value: Value::Text((*t).to_string()), formula: None });
+        wb.sheets[0].set(1, 7 + i as u32, Cell { value: Value::Text((**t).into()), formula: None });
     }
     assert_eq!(formula::eval_formula(&wb, 0, "=HLOOKUP(2,H1:J2,2,FALSE)").display(), "b");
 }

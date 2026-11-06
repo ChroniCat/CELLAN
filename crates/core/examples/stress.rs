@@ -15,17 +15,17 @@ fn main() {
         let mut wb = Workbook::new_blank();
         for r in 0..rows {
             wb.sheets[0].set(r, 0, Cell { value: Value::Number(r as f64 + 1.0), formula: None });
-            wb.sheets[0].set(r, 1, Cell { value: Value::Text(format!("客户{}", r % 1000)), formula: None });
+            wb.sheets[0].set(r, 1, Cell { value: Value::Text(format!("客户{}", r % 1000).into()), formula: None });
             wb.sheets[0].set(r, 2, Cell { value: Value::Number((r % 500) as f64 * 1.5), formula: None });
             wb.sheets[0].set(r, 3, Cell { value: Value::Number((r % 37) as f64), formula: None });
             if with_formula {
                 wb.sheets[0].set(r, 4, Cell {
                     value: Value::Number(0.0),
-                    formula: Some(format!("=C{0}*D{0}", r + 1)),
+                    formula: Some(format!("=C{0}*D{0}", r + 1).into()),
                 });
                 wb.sheets[0].set(r, 5, Cell {
                     value: Value::Number(0.0),
-                    formula: Some(format!("=IF(E{0}>100,E{0}*0.9,E{0})", r + 1)),
+                    formula: Some(format!("=IF(E{0}>100,E{0}*0.9,E{0})", r + 1).into()),
                 });
             } else {
                 wb.sheets[0].set(r, 4, Cell { value: Value::Number(r as f64 * 0.5), formula: None });

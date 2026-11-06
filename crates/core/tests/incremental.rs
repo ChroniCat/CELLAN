@@ -82,7 +82,7 @@ fn remote_batch_uses_incremental_recalc() {
     let mut wb = Workbook::new_blank();
     for r in 0..20u32 {
         wb.sheets[0].set(r, 0, Cell { value: Value::Number(r as f64 + 1.0), formula: None });
-        wb.sheets[0].set(r, 1, Cell { value: Value::Number(0.0), formula: Some(format!("=A{}*10", r + 1)) });
+        wb.sheets[0].set(r, 1, Cell { value: Value::Number(0.0), formula: Some(format!("=A{}*10", r + 1).into()) });
     }
     wb.sheets[0].set(0, 2, Cell { value: Value::Number(0.0), formula: Some("=SUM(B1:B20)".into()) });
     formula::recalc_all(&mut wb);

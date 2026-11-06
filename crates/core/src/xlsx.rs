@@ -6,14 +6,14 @@ use std::path::Path;
 fn data_to_value(d: &Data) -> Value {
     match d {
         Data::Empty => Value::Empty,
-        Data::String(s) => Value::Text(s.clone()),
+        Data::String(s) => Value::Text(s.as_str().into()),
         Data::Float(f) => Value::Number(*f),
         Data::Int(i) => Value::Number(*i as f64),
         Data::Bool(b) => Value::Bool(*b),
         Data::DateTime(dt) => Value::Number(dt.as_f64()),
-        Data::DateTimeIso(s) => Value::Text(s.clone()),
-        Data::DurationIso(s) => Value::Text(s.clone()),
-        Data::Error(e) => Value::Text(format!("#{:?}", e)),
+        Data::DateTimeIso(s) => Value::Text(s.as_str().into()),
+        Data::DurationIso(s) => Value::Text(s.as_str().into()),
+        Data::Error(e) => Value::Text(format!("#{:?}", e).into()),
     }
 }
 
@@ -55,7 +55,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     .cells
                     .entry(crate::model::CellRef::new(fr0 + row as u32, fc0 + col as u32))
                     .or_insert_with(Cell::default);
-                entry.formula = Some(text);
+                entry.formula = Some(text.into());
             }
         }
 

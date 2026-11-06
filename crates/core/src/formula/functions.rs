@@ -1027,7 +1027,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                     cap = true;
                 }
             }
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "TRIM" => r(|| {
             let s = text(args, 0)?;
@@ -1041,7 +1041,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                     out.push_str(&v.display());
                 }
             }
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "TEXTJOIN" => r(|| {
             let sep = text(args, 0)?;
@@ -1087,13 +1087,13 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                             out.push_str(&new);
                             rest = &rest[pos + old.len()..];
                             out.push_str(rest);
-                            return Ok(FValue::Text(out));
+                            return Ok(FValue::Text(out.as_str().into()));
                         }
                         out.push_str(&old);
                         rest = &rest[pos + old.len()..];
                     }
                     out.push_str(rest);
-                    Ok(FValue::Text(out))
+                    Ok(FValue::Text(out.as_str().into()))
                 }
             }
         }),
@@ -1106,7 +1106,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             let mut out: String = chars.iter().take(start - 1).collect();
             out.push_str(&new);
             out.extend(chars.iter().skip((start - 1 + count).min(chars.len())));
-            Ok(FValue::Text(out))
+            Ok(FValue::Text(out.as_str().into()))
         }),
         "FIND" | "SEARCH" => r(|| {
             let needle = text(args, 0)?;

@@ -18,7 +18,7 @@ pub enum Value {
     #[default]
     Empty,
     Number(f64),
-    Text(String),
+    Text(Box<str>),
     Bool(bool),
 }
 
@@ -41,7 +41,7 @@ impl Value {
         match self {
             Value::Empty => String::new(),
             Value::Number(n) => format_number(*n),
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
         }
     }
@@ -58,7 +58,7 @@ impl Value {
         match t.to_ascii_uppercase().as_str() {
             "TRUE" => Value::Bool(true),
             "FALSE" => Value::Bool(false),
-            _ => Value::Text(s.to_string()),
+            _ => Value::Text(s.into()),
         }
     }
 
@@ -70,8 +70,9 @@ impl Value {
 #[derive(Clone, Debug, Default)]
 pub struct Cell {
     pub value: Value,
-    /// 公式原文（以 = 开头），v0.1 只保存不计算
-    pub formula: Option<String>,
+    /// 公式原文（以 = 开头）。用 Box<str> 而不是 String：省 8 字节/格，
+    /// 而且公式一旦写入就不再变长，不需要容量字段
+    pub formula: Option<Box<str>>,
 }
 
 impl Cell {

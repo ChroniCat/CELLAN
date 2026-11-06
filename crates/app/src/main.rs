@@ -263,7 +263,7 @@ impl SheetApp {
         if let Some(ed) = self.editing.take() {
             let (r, c) = self.sel;
             let cell = if ed.buf.starts_with('=') {
-                Cell { value: Value::Text(ed.buf.clone()), formula: Some(ed.buf.clone()) }
+                Cell { value: Value::Text(ed.buf.as_str().into()), formula: Some(ed.buf.as_str().into()) }
             } else {
                 Cell { value: Value::parse_input(&ed.buf), formula: None }
             };
@@ -351,7 +351,7 @@ impl SheetApp {
         if start_edit {
             let (r, c) = self.sel;
             let buf = match self.wb.sheet(self.sheet_idx).get(r, c) {
-                Some(cell) => cell.formula.clone().unwrap_or_else(|| cell.value.display()),
+                Some(cell) => cell.formula.as_deref().map(|f| f.to_string()).unwrap_or_else(|| cell.value.display()),
                 None => String::new(),
             };
             self.editing = Some(EditState { buf });
@@ -816,7 +816,7 @@ impl eframe::App for SheetApp {
                 ui.add_sized([64.0, 20.0], egui::Label::new(cell_name(r, c)));
                 ui.separator();
                 let cur = match self.wb.sheet(self.sheet_idx).get(r, c) {
-                    Some(cell) => cell.formula.clone().unwrap_or_else(|| cell.value.display()),
+                    Some(cell) => cell.formula.as_deref().map(|f| f.to_string()).unwrap_or_else(|| cell.value.display()),
                     None => String::new(),
                 };
                 ui.label(if cur.is_empty() { " ".to_string() } else { cur });

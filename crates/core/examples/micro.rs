@@ -5,7 +5,7 @@ fn main() {
     let mut wb = Workbook::new_blank();
     for r in 0..20000u32 {
         wb.sheets[0].set(r, 0, Cell { value: Value::Number(r as f64), formula: None });
-        wb.sheets[0].set(r, 7, Cell { value: Value::Text(format!("华东{}", r % 5)), formula: None });
+        wb.sheets[0].set(r, 7, Cell { value: Value::Text(format!("华东{}", r % 5).into()), formula: None });
         wb.sheets[0].set(r, 5, Cell { value: Value::Number(r as f64 * 1.5), formula: None });
     }
     let f = "=SUMIF($H$1:$H$20000,\"华东0\",$F$1:$F$20000)";
