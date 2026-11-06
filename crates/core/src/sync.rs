@@ -217,6 +217,14 @@ pub enum Msg {
     StyleSnapshot {
         items: Vec<(usize, u32, u32, crate::style::CellStyle)>,
     },
+    /// 新加入的人先收到结构改动历史，把本地表格挪到位再收快照
+    StructuralLog { items: Vec<(usize, crate::structural::Structural)> },
+    /// 插行/删行/插列/删列
+    Structural {
+        site: u32,
+        sheet: usize,
+        op: crate::structural::Structural,
+    },
     /// 请求编辑某格（同一格同时只允许一个人）
     LockReq { site: u32, name: String, sheet: usize, row: u32, col: u32 },
     /// 宿主批准（广播）

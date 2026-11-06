@@ -21,6 +21,35 @@ pub struct CellDelta {
     pub after_style: u16,
 }
 
+/// 整表快照（结构性改动用：删行之后没法靠「逐格回填」还原）
+#[derive(Clone, Debug, Default)]
+pub struct SheetSnapshot {
+    pub sheet: usize,
+    pub cells: Vec<(u32, u32, Cell, u16)>,
+    pub merges: Vec<(u32, u32, u32, u32)>,
+}
+
+pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
+    SheetSnapshot {
+        sheet: idx,
+        cells: sheet
+            .iter()
+            .map(|(k, c)| (k.row, k.col, c.clone(), sheet.style_of(k.row, k.col)))
+            .collect(),
+        merges: sheet.merges.clone(),
+    }
+}
+
+pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
+    sheet.clear();
+    for (r, c, cell, st) in snap.cells.iter() {
+        sheet.set(*r, *c, cell.clone());
+        sheet.set_style(*r, *c, *st);
+    }
+    sheet.merges = snap.merges.clone();
+    sheet.merges_dirty = true;
+}
+
 /// 一个可撤销的动作
 #[derive(Clone, Debug)]
 pub struct Action {
@@ -28,15 +57,23 @@ pub struct Action {
     pub deltas: Vec<CellDelta>,
     /// 动作发生前，选区/活动格在哪（撤销后把用户送回现场）
     pub focus: (usize, u32, u32),
+    /// 结构性改动：整表前后快照（表太大时留空，表示不可撤销）
+    pub snap_before: Option<SheetSnapshot>,
+    pub snap_after: Option<SheetSnapshot>,
 }
 
 impl Action {
     pub fn len(&self) -> usize {
-        self.deltas.len()
+        self.deltas.len().max(
+            self.snap_before
+                .as_ref()
+                .map(|s| s.cells.len())
+                .unwrap_or(0),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
-        self.deltas.is_empty()
+        self.deltas.is_empty() && self.snap_before.is_none()
     }
 }
 
@@ -111,6 +148,20 @@ impl UndoStack {
         let action = self.done.pop()?;
         let mut touched = Vec::new();
         let mut skipped = 0;
+        if let Some(snap) = action.snap_before.clone() {
+            if let Some(sheet) = sheets.get_mut(snap.sheet) {
+                restore_sheet(sheet, &snap);
+            }
+            touched.extend(snap.cells.iter().map(|(r, c, _, _)| (snap.sheet, *r, *c)));
+            let applied = Applied {
+                touched,
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped,
+            };
+            self.undone.push(action);
+            return Some(applied);
+        }
         for d in action.deltas.iter().rev() {
             let Some(sheet) = sheets.get_mut(d.sheet) else { continue };
             let cur = sheet.get(d.row, d.col).cloned().unwrap_or(Cell {
@@ -144,6 +195,20 @@ impl UndoStack {
         let action = self.undone.pop()?;
         let mut touched = Vec::new();
         let mut skipped = 0;
+        if let Some(snap) = action.snap_after.clone() {
+            if let Some(sheet) = sheets.get_mut(snap.sheet) {
+                restore_sheet(sheet, &snap);
+            }
+            touched.extend(snap.cells.iter().map(|(r, c, _, _)| (snap.sheet, *r, *c)));
+            let applied = Applied {
+                touched,
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped,
+            };
+            self.done.push(action);
+            return Some(applied);
+        }
         for d in action.deltas.iter() {
             let Some(sheet) = sheets.get_mut(d.sheet) else { continue };
             let cur = sheet.get(d.row, d.col).cloned().unwrap_or(Cell {
@@ -213,6 +278,8 @@ mod tests {
         let after = wb.sheets[0].get(r, c).cloned().unwrap();
         Action {
             label: "编辑".into(),
+            snap_before: None,
+            snap_after: None,
             deltas: vec![CellDelta {
                 sheet: 0,
                 row: r,

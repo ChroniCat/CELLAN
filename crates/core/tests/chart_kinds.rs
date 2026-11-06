@@ -39,12 +39,15 @@ fn every_kind_inserts_and_deletes() {
             &format!("{k:?} 图"),
             k,
         );
+        let mut ch = ch;
+        ch.show_labels = true;
         sheetcore::chart_write::insert_chart(&out, &name, &ch).unwrap_or_else(|e| panic!("{k:?} 插入失败: {e}"));
 
         let list = sheetcore::charts::load_charts(&out, &name).expect("读图表");
         assert_eq!(list.len(), 1, "{k:?} 应有 1 张图");
         assert_eq!(list[0].kind, k, "{k:?} 读回来的类型不对: {:?}", list[0].kind);
         assert!(!list[0].part.is_empty(), "没记下部件路径");
+        assert!(list[0].show_labels, "{k:?} 数据标签没读回来");
 
         if std::env::var("KEEP_CHARTS").is_ok() {
             continue;

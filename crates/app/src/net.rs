@@ -26,6 +26,10 @@ pub enum NetEvent {
     Cursor(Cursor),
     /// 某格被批准编辑（含自己）
     LockOk { site: u32, name: String, sheet: usize, row: u32, col: u32 },
+    /// 结构改动历史（加入时补）
+    StructuralHistory(Vec<(usize, sheetcore::structural::Structural)>),
+    /// 远端结构性改动
+    Structural { sheet: usize, op: sheetcore::structural::Structural },
     /// 远端格式变更
     Styles(Vec<(usize, u32, u32, sheetcore::style::CellStyle)>),
     /// 远端合并变更
@@ -56,6 +60,7 @@ pub struct Net {
     host_locks: Option<Arc<Mutex<sheetcore::sync::LockTable>>>,
     host_styles:
         Option<Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>>>,
+    host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
     evt_tx: Sender<NetEvent>,
     t0: std::time::Instant,
 }
@@ -73,6 +78,71 @@ fn write_line(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {
     stream.flush()
 }
 
+
+
+/// 结构改动后，宿主的操作日志与样式表也要跟着搬家，
+/// 否则后来加入的人会收到「旧坐标」的快照——插行后表头又跑回第 1 行。
+fn shift_state(
+    state: &Arc<Mutex<Vec<Op>>>,
+    styles: &Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>>,
+    sheet: usize,
+    op: &sheetcore::structural::Structural,
+) {
+    let map = |r: u32, c: u32| -> Option<(u32, u32)> {
+        use sheetcore::structural::Structural as S;
+        let axis = |v: u32, at: u32, n: u32, del: bool| -> Option<u32> {
+            if del {
+                if v < at {
+                    Some(v)
+                } else if v < at + n {
+                    None
+                } else {
+                    Some(v - n)
+                }
+            } else if v >= at {
+                Some(v + n)
+            } else {
+                Some(v)
+            }
+        };
+        match op {
+            S::InsertRows { at, n } => axis(r, *at, *n, false).map(|nr| (nr, c)),
+            S::DeleteRows { at, n } => axis(r, *at, *n, true).map(|nr| (nr, c)),
+            S::InsertCols { at, n } => axis(c, *at, *n, false).map(|nc| (r, nc)),
+            S::DeleteCols { at, n } => axis(c, *at, *n, true).map(|nc| (r, nc)),
+        }
+    };
+    {
+        let mut st = state.lock().unwrap();
+        let mut out = Vec::with_capacity(st.len());
+        for o in st.iter() {
+            if o.sheet == sheet {
+                if let Some((nr, nc)) = map(o.row, o.col) {
+                    let mut o2 = o.clone();
+                    o2.row = nr;
+                    o2.col = nc;
+                    out.push(o2);
+                }
+            } else {
+                out.push(o.clone());
+            }
+        }
+        *st = out;
+    }
+    {
+        let mut sm = styles.lock().unwrap();
+        let old = std::mem::take(&mut *sm);
+        for ((sh, r, c), v) in old {
+            if sh == sheet {
+                if let Some((nr, nc)) = map(r, c) {
+                    sm.insert((sh, nr, nc), v);
+                }
+            } else {
+                sm.insert((sh, r, c), v);
+            }
+        }
+    }
+}
 
 /// 加密通道的写：有会话就封包
 fn write_frame(stream: &mut TcpStream, sess: &mut Option<sheetcore::wire::Session>, s: &str) -> std::io::Result<()> {
@@ -217,6 +287,28 @@ impl Net {
         }
     }
 
+    /// 广播结构性改动（宿主顺手把本地快照日志也搬家）
+    pub fn broadcast_structural(&self, sheet: usize, op: &sheetcore::structural::Structural) {
+        if let (Some(state), Some(st)) = (&self.state, &self.host_styles) {
+            let before = state.lock().unwrap().len();
+            shift_state(state, st, sheet, op);
+            if std::env::var("SC_DBG").is_ok() {
+                let g = state.lock().unwrap();
+                let r0 = g.iter().filter(|o| o.row == 0).count();
+                let r2 = g.iter().filter(|o| o.row == 2).count();
+                eprintln!("[dbg] shift_state: {before} 条，row0={r0} row2={r2}");
+            }
+        }
+        if let Some(h) = &self.host_structs {
+            h.lock().unwrap().push((sheet, op.clone()));
+        }
+        let msg = Msg::Structural { site: self.site, sheet, op: op.clone() };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(format!("{s}
+")));
+        }
+    }
+
     pub fn broadcast_cursor(&self, cur: Cursor) {
         if let Ok(s) = serde_json::to_string(&Msg::CursorMsg(cur)) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
@@ -272,6 +364,9 @@ pub fn host(
     // 样式表：新加入的人要靠它补齐格式（Op 里只有值）
     let styles: Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let structs: Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let structs_for_self = structs.clone();
     let locks: Arc<Mutex<sheetcore::sync::LockTable>> =
         Arc::new(Mutex::new(sheetcore::sync::LockTable::new(20_000)));
     let locks_for_self = locks.clone();
@@ -317,6 +412,7 @@ pub fn host(
         let alive = alive.clone();
         let locks_outer = locks.clone();
         let styles_outer = styles.clone();
+        let structs_outer = structs.clone();
         let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -331,6 +427,7 @@ pub fn host(
                 let password = password.clone();
                 let locks = locks_outer.clone();
                 let styles = styles_outer.clone();
+                let structs = structs_outer.clone();
                 let now_ms = now_ms_outer;
                 let my_site = host_site;
                 std::thread::spawn(move || {
@@ -426,6 +523,20 @@ pub fn host(
                                     .unwrap(),
                                 );
                                 {
+                                    let hist = structs.lock().unwrap().clone();
+                                    if std::env::var("SC_DBG").is_ok() {
+                                        eprintln!("[dbg] 下发结构历史 {} 条", hist.len());
+                                    }
+                                    if !hist.is_empty() {
+                                        let _ = tx.send(
+                                            serde_json::to_string(&Msg::StructuralLog {
+                                                items: hist,
+                                            })
+                                            .unwrap(),
+                                        );
+                                    }
+                                }
+                                {
                                     // 样式先补（新人有格式，后面再收值）
                                     let items: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
                                         styles
@@ -502,6 +613,22 @@ pub fn host(
                                     }
                                 }
                                 let _ = evt_tx.send(NetEvent::Cursor(c));
+                            }
+                            Msg::Structural { site: _site, sheet, op } => {
+                                shift_state(&state, &styles, sheet, &op);
+                                structs.lock().unwrap().push((sheet, op.clone()));
+                                let line = serde_json::to_string(&Msg::Structural {
+                                    site: 0,
+                                    sheet,
+                                    op: op.clone(),
+                                })
+                                .unwrap();
+                                for (s, ptx) in peers.lock().unwrap().iter() {
+                                    if Some(*s) != hello_site {
+                                        let _ = ptx.send(line.clone());
+                                    }
+                                }
+                                let _ = evt_tx.send(NetEvent::Structural { sheet, op });
                             }
                             Msg::StyleOp { site: _site, sheet, ts: _ts, items } => {
                                 {
@@ -670,6 +797,7 @@ pub fn host(
         state: Some(state),
         host_locks: Some(locks_for_self),
         host_styles: Some(styles_for_self),
+        host_structs: Some(structs_for_self),
         evt_tx: evt_tx_self,
         t0,
     })
@@ -838,6 +966,12 @@ pub fn join(
                         Msg::Op(op) => {
                             let _ = evt_tx.send(NetEvent::Ops(vec![op]));
                         }
+                        Msg::StructuralLog { items } => {
+                            let _ = evt_tx.send(NetEvent::StructuralHistory(items));
+                        }
+                        Msg::Structural { sheet, op, .. } => {
+                            let _ = evt_tx.send(NetEvent::Structural { sheet, op });
+                        }
                         Msg::StyleOp { sheet, items, .. } => {
                             let ev: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
                                 items.iter().map(|(r, c, s)| (sheet, *r, *c, s.clone())).collect();
@@ -911,6 +1045,7 @@ pub fn join(
         state: None,
         host_locks: None,
         host_styles: None,
+        host_structs: None,
         evt_tx: evt_tx_clone,
         t0: std::time::Instant::now(),
     })

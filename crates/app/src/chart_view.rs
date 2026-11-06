@@ -194,6 +194,15 @@ fn paint_bars(painter: &egui::Painter, plot: Rect, chart: &Chart) {
                     0.0,
                     color,
                 );
+                if chart.show_labels && bar_w > 14.0 {
+                    painter.text(
+                        Pos2::new(x + bar_w / 2.0, plot.max.y - h - 2.0),
+                        Align2::CENTER_BOTTOM,
+                        format_num(*v),
+                        FontId::proportional(9.0),
+                        Color32::from_rgb(60, 60, 60),
+                    );
+                }
             }
         }
     }
@@ -220,6 +229,15 @@ fn paint_line(painter: &egui::Painter, plot: Rect, chart: &Chart) {
                 painter.line_segment([p, Pos2::new(x, y)], Stroke::new(1.8, color));
             }
             painter.circle_filled(Pos2::new(x, y), 2.2, color);
+            if chart.show_labels && s.vals.len() <= 12 {
+                painter.text(
+                    Pos2::new(x, y - 4.0),
+                    Align2::CENTER_BOTTOM,
+                    format_num(*v),
+                    FontId::proportional(9.0),
+                    Color32::from_rgb(60, 60, 60),
+                );
+            }
             prev = Some(Pos2::new(x, y));
         }
     }

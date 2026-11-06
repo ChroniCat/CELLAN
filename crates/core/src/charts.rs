@@ -62,6 +62,8 @@ pub struct Chart {
     pub part: String,
     /// 所属 drawing 部件路径
     pub drawing: String,
+    /// 显示数据标签
+    pub show_labels: bool,
 }
 
 /// 解析某张表的图表
@@ -346,6 +348,8 @@ fn local(name: &str) -> &str {
 pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut kind: Option<ChartKind> = None;
     let mut stacked = false;
+    let mut in_dlbls = false;
+    let mut show_labels = false;
     let mut bar_dir = String::new();
     let mut title = String::new();
     let mut series: Vec<Series> = Vec::new();
@@ -405,6 +409,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                     "f" => in_f = true,
                     "cat" => in_cat = true,
                     "val" | "yVal" => in_val = true,
+                    "dLbls" => in_dlbls = true,
                     "title" => in_title = true,
                     "legend" => legend = true,
                     "grouping" => {}
@@ -416,7 +421,15 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
             Ok(Event::Empty(e)) => {
                 let nm = e.name();
                 let name = local(nm.as_ref()).to_string();
-                if name == "grouping" {
+                if name == "showVal" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("val")
+                            && crate::model::xml_unescape(&a.value.to_string()) == "1"
+                        {
+                            show_labels = true;
+                        }
+                    }
+                } else if name == "grouping" {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("val")
                             && crate::model::xml_unescape(&a.value.to_string()) == "stacked"
@@ -518,6 +531,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         legend_pos,
         part: String::new(),
         drawing: String::new(),
+        show_labels,
     })
 }
 

@@ -59,6 +59,7 @@ pub fn chart_from_selection(
         legend_pos: "r".into(),
         part: String::new(),
         drawing: String::new(),
+        show_labels: false,
     }
 }
 
@@ -94,6 +95,9 @@ fn series_body(ch: &crate::charts::Chart) -> String {
             out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
         }
         out.push_str("</c:numCache></c:numRef></c:val>");
+        if ch.show_labels {
+            out.push_str("<c:dLbls><c:showVal val=\"1\"/><c:showSerName val=\"0\"/><c:showCatName val=\"0\"/><c:showLegendKey val=\"0\"/></c:dLbls>");
+        }
         if matches!(ch.kind, crate::charts::ChartKind::Line) {
             out.push_str("<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/></c:marker>");
             out.push_str(&format!(
@@ -138,6 +142,9 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
             out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
         }
         out.push_str("</c:numCache></c:numRef></c:yVal>");
+        if ch.show_labels {
+            out.push_str("<c:dLbls><c:showVal val=\"1\"/></c:dLbls>");
+        }
         out.push_str(&format!(
             "<c:spPr><a:ln w=\"19050\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
         ));
@@ -206,7 +213,15 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
     }
     out.push_str("</c:plotArea>");
     if ch.legend && !matches!(ch.kind, Pie) {
-        out.push_str("<c:legend><c:legendPos val=\"r\"/><c:overlay val=\"0\"/></c:legend>");
+        let pos = match ch.legend_pos.as_str() {
+            "t" => "t",
+            "b" => "b",
+            "l" => "l",
+            _ => "r",
+        };
+        out.push_str(&format!(
+            "<c:legend><c:legendPos val=\"{pos}\"/><c:overlay val=\"0\"/></c:legend>"
+        ));
     }
     out.push_str("<c:plotVisOnly val=\"1\"/></c:chart></c:chartSpace>");
     out

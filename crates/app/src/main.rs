@@ -66,6 +66,15 @@ struct SheetApp {
     /// 测试钩子用过没有
     probe_done: bool,
     style_done: bool,
+    struct_done: bool,
+    /// 远端做过的结构改动（本地换文件后要重新套用）
+    struct_history: Vec<(usize, sheetcore::structural::Structural)>,
+    /// 已套用到当前工作簿的历史条数
+    history_planted: usize,
+    /// 上次套用时工作簿的 epoch
+    history_last_epoch: u64,
+    /// 工作簿被整体替换的次数（Loaded/Recalced 各算一次）
+    wb_epoch: u64,
     probe_at: std::time::Instant,
     lock_first_at: Option<std::time::Instant>,
     /// 新建图表草稿
@@ -171,6 +180,11 @@ impl SheetApp {
             t0: std::time::Instant::now(),
             probe_done: false,
             style_done: false,
+            struct_done: false,
+            struct_history: Vec::new(),
+            history_planted: 0,
+            history_last_epoch: u64::MAX,
+            wb_epoch: 0,
             probe_at: std::time::Instant::now(),
             lock_first_at: None,
             chart_edit: None,
@@ -260,6 +274,7 @@ impl SheetApp {
             match msg {
                 OpenMsg::Loaded(wb) => {
                     self.wb = *wb;
+                    self.wb_epoch += 1;
                     self.deps = sheetcore::formula::deps::Deps::empty();
                     self.sheet_idx = 0;
                     // 调试：SC_SEL=r,c 时保留启动时的选区，便于无界面验证
@@ -281,6 +296,7 @@ impl SheetApp {
                     }
                 }
                 OpenMsg::Recalced(wb, deps) => {
+                    self.wb_epoch += 1;
                     if self.doc_gen != 0 {
                         // 期间用户改过：保留用户结果，等空闲再补一次全量
                         self.needs_full = true;
@@ -452,6 +468,16 @@ impl SheetApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
+    /// 无界面自检：在顶部插两行，验证协作同步
+    fn struct_probe(&mut self) {
+        if std::env::var("SC_STRUCT_TEST").is_err() || self.open_rx.is_some() || self.struct_done {
+            return;
+        }
+        self.struct_done = true;
+        self.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 2 });
+        eprintln!("[struct] 已插入 2 行");
+    }
+
     /// 无界面自检：给 B2 加粗并广播，用来验格式同步
     fn style_probe(&mut self) {
         if std::env::var("SC_STYLE_TEST").is_err() || self.open_rx.is_some() || self.style_done {
@@ -501,6 +527,8 @@ impl SheetApp {
             .set(r, c, Cell { value: Value::Empty, formula: None });
         self.undo.push(sheetcore::undo::Action {
             label: "清除".into(),
+            snap_before: None,
+            snap_after: None,
             deltas: vec![sheetcore::undo::CellDelta {
                 sheet: self.sheet_idx,
                 row: r,
@@ -518,6 +546,34 @@ impl SheetApp {
             "[undo] 原值={orig} 编辑后={after_edit} 撤销后={after_undo} 重做后={after_redo} 加粗={bold_after} 撤销后={bold_undo} 清除撤销={clear_undo} 深度={:?}",
             self.undo.depth()
         );
+    }
+
+    /// 把远端做过的结构改动套到当前工作簿上。
+    /// 文件每次重新读入（Loaded/Recalced）都会得到「未改结构」的版本，
+    /// 所以换过一次就要从头再套一遍。
+    fn sync_history(&mut self) {
+        if self.struct_history.is_empty() {
+            return;
+        }
+        if self.wb_epoch != self.history_last_epoch {
+            self.history_planted = 0;
+            self.history_last_epoch = self.wb_epoch;
+        }
+        if self.history_planted >= self.struct_history.len() {
+            return;
+        }
+        let items: Vec<(usize, sheetcore::structural::Structural)> =
+            self.struct_history[self.history_planted..].to_vec();
+        for (sheet, op) in items.iter() {
+            if *sheet < self.wb.sheets.len() {
+                // 格子由快照给（已经是新坐标），这里只搬合并/条件格式等结构
+                self.wb
+                    .sheet_mut(*sheet)
+                    .apply_structural_structure_only(op);
+            }
+        }
+        self.history_planted = self.struct_history.len();
+        self.doc_gen = self.doc_gen.wrapping_add(1);
     }
 
     fn lock_now(&self) -> u64 {
@@ -607,6 +663,8 @@ impl SheetApp {
             label: label.to_string(),
             deltas,
             focus,
+            snap_before: None,
+            snap_after: None,
         });
     }
 
@@ -1059,6 +1117,37 @@ impl SheetApp {
             // 插入
             ui.menu_button("插入", |ui| {
                 ui.set_min_width(150.0);
+                let (r1, _c1, r2, _c2) = self.sel_rect();
+                let (rr, cc) = self.sel;
+                if ui.button(format!("在上方插入 {} 行", r2 - r1 + 1)).clicked() {
+                    self.structural(sheetcore::structural::Structural::InsertRows { at: r1, n: r2 - r1 + 1 });
+                    ui.close_menu();
+                }
+                if ui.button(format!("在下方插入 {} 行", r2 - r1 + 1)).clicked() {
+                    self.structural(sheetcore::structural::Structural::InsertRows { at: r2 + 1, n: r2 - r1 + 1 });
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(r2 > r1 || r1 > 0, egui::Button::new(format!("删除 {} 行", r2 - r1 + 1)))
+                    .clicked()
+                {
+                    self.structural(sheetcore::structural::Structural::DeleteRows { at: r1, n: r2 - r1 + 1 });
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("在左侧插入 1 列").clicked() {
+                    self.structural(sheetcore::structural::Structural::InsertCols { at: cc, n: 1 });
+                    ui.close_menu();
+                }
+                if ui.button("在右侧插入 1 列").clicked() {
+                    self.structural(sheetcore::structural::Structural::InsertCols { at: cc + 1, n: 1 });
+                    ui.close_menu();
+                }
+                if ui.button(format!("删除 {} 列", cc + 1)).clicked() {
+                    self.structural(sheetcore::structural::Structural::DeleteCols { at: cc, n: 1 });
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("柱状图（按选区）").clicked() {
                     self.insert_chart_from_selection();
                     ui.close_menu();
@@ -2086,6 +2175,16 @@ impl SheetApp {
                 ui.close_menu();
             }
             ui.separator();
+            ui.separator();
+            if ui.button("导出 PDF…").clicked() {
+                self.export_pdf();
+                ui.close_menu();
+            }
+            if ui.button("打印预览").clicked() {
+                self.show_pages = true;
+                self.status = "分页虚线已显示（按当前页面设置）".into();
+                ui.close_menu();
+            }
             if ui.button("并排比较…").clicked() {
                 self.open_compare();
                 ui.close_menu();
@@ -2287,6 +2386,67 @@ impl SheetApp {
 
 
 
+    /// 插入/删除行列：结构 + 撤销 + 协作广播
+    fn structural(&mut self, op: sheetcore::structural::Structural) {
+        let idx = self.sheet_idx;
+        let cell_count = self.wb.sheet(idx).len();
+        // 表太大就不记快照（记了也没内存），明确告诉用户不能撤销
+        let snapshot = if cell_count <= 200_000 {
+            Some(sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx))
+        } else {
+            None
+        };
+        self.wb.sheet_mut(idx).apply_structural(&op);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let after = if snapshot.is_some() {
+            Some(sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx))
+        } else {
+            None
+        };
+        let label = op.label();
+        if let (Some(before), Some(after)) = (snapshot, after) {
+            self.undo.push(sheetcore::undo::Action {
+                label: label.clone(),
+                deltas: Vec::new(),
+                focus: (idx, self.sel.0, self.sel.1),
+                snap_before: Some(before),
+                snap_after: Some(after),
+            });
+        }
+        // 整表重算（结构变了，依赖图也得重建）
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        if let Some(net) = self.net.as_ref() {
+            net.broadcast_structural(idx, &op);
+        }
+        self.status = if self.undo.can_undo() {
+            format!("{label}（可 Ctrl+Z 撤销）")
+        } else {
+            format!("{label}（表太大，本次不可撤销）")
+        };
+    }
+
+    /// 导出当前工作表为 PDF
+    fn export_pdf(&mut self) {
+        let Some(out) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(format!("{}.pdf", self.wb.sheet(self.sheet_idx).name))
+            .save_file()
+        else {
+            return;
+        };
+        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
+        if !font.exists() {
+            self.status = "找不到 C:/Windows/Fonts/simhei.ttf，无法导出 PDF".into();
+            return;
+        }
+        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &out, font) {
+            Ok(n) => self.status = format!("已导出 {n} 页到 {}", out.display()),
+            Err(e) => self.status = format!("导出失败：{e:#}"),
+        }
+    }
+
     /// 把 vbaProject.bin 导出来
     fn export_macro_part(&mut self) {
         let Some(src) = self.wb.path.clone() else {
@@ -2348,6 +2508,29 @@ impl SheetApp {
                     ui.label("标题");
                     ui.text_edit_singleline(&mut ch.title);
                     ui.end_row();
+                    ui.label("数据标签");
+                    ui.checkbox(&mut ch.show_labels, "显示数值");
+                    ui.end_row();
+
+                    ui.label("图例");
+                    egui::ComboBox::from_id_salt("legend_pos")
+                        .selected_text(match ch.legend_pos.as_str() {
+                            "t" => "顶部",
+                            "b" => "底部",
+                            "l" => "左侧",
+                            "r" => "右侧",
+                            _ => "无",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (k, label) in [("r", "右侧"), ("t", "顶部"), ("b", "底部"), ("l", "左侧")] {
+                                if ui.selectable_label(ch.legend_pos == k, label).clicked() {
+                                    ch.legend_pos = k.to_string();
+                                    ch.legend = true;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
                     ui.label("系列");
                     ui.label(format!("{} 个", ch.series.len()));
                     ui.end_row();
@@ -2639,11 +2822,20 @@ impl SheetApp {
         if let Ok(v) = std::env::var("SC_DUMP_AT") {
             if let Ok(secs) = v.parse::<u64>() {
                 if self.t0.elapsed().as_secs() < secs {
+                    // 还没到时候：丢掉这一帧的记录，否则文件里会混进历史帧
+                    self.dump_accum.clear();
                     return;
                 }
             }
         }
         if let Ok(path) = std::env::var("SC_DUMP") {
+            eprintln!(
+                "[dbg] t={}s 写 dump: (0,0)={:?} (2,0)={:?} 格数={}",
+                self.t0.elapsed().as_secs(),
+                self.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+                self.wb.sheet(0).get(2, 0).map(|c| c.value.display()),
+                self.wb.sheet(0).len()
+            );
             let _ = std::fs::write(path, &self.dump_accum);
             self.dump_once = false;
             self.dump_accum.clear();
@@ -3520,6 +3712,20 @@ impl SheetApp {
                         self.status = format!("{} 开始编辑 {}", name, cell_name(row, col));
                     }
                 }
+                crate::net::NetEvent::StructuralHistory(items) => {
+                    // 先存着：文件还在后台读/重算，这会儿改会被随后的整份替换冲掉
+                    self.struct_history.extend(items);
+                }
+                crate::net::NetEvent::Structural { sheet, op } => {
+                    if sheet < self.wb.sheets.len() {
+                        self.wb.sheet_mut(sheet).apply_structural(&op);
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        sheetcore::formula::recalc_all(&mut self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.status = format!("收到远端改动：{}", op.label());
+                    }
+                }
                 crate::net::NetEvent::Styles(items) => {
                     for (sheet, row, col, st) in items {
                         if sheet >= self.wb.sheets.len() {
@@ -3680,6 +3886,7 @@ impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_net();
         self.poll_open();
+        self.sync_history();
         self.poll_save();
         // 打开期间被编辑打断的全量重算，等用户停手 3 秒后补上
         if self.needs_full
@@ -3715,6 +3922,7 @@ impl eframe::App for SheetApp {
         self.lock_probe(ctx);
         self.undo_probe();
         self.style_probe();
+        self.struct_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);

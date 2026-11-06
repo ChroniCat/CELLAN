@@ -91,6 +91,17 @@ impl Axis {
         self.sizes.is_empty()
     }
 
+    /// 所有自定义尺寸（(索引, 大小)）
+    pub fn custom_pairs(&self) -> Vec<(u32, f32)> {
+        self.sizes.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// 清掉所有自定义尺寸
+    pub fn clear_custom(&mut self) {
+        self.sizes.clear();
+        self.rebuild();
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (&u32, &f32)> {
         self.sizes.iter()
     }

@@ -208,6 +208,10 @@ impl Sheet {
     }
 
     /// 按行、列升序遍历所有单元格
+    pub(crate) fn cells_mut(&mut self) -> &mut Store {
+        &mut self.cells
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter()
     }
