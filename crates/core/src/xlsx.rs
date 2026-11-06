@@ -51,11 +51,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     continue;
                 }
                 let text = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
-                let entry = sheet
-                    .cells
-                    .entry(crate::model::CellRef::new(fr0 + row as u32, fc0 + col as u32))
-                    .or_insert_with(Cell::default);
-                entry.formula = Some(text.into());
+                let rr = fr0 + row as u32;
+                let cc = fc0 + col as u32;
+                let mut cell = sheet.get(rr, cc).cloned().unwrap_or_default();
+                cell.formula = Some(text.into());
+                sheet.set(rr, cc, cell);
             }
         }
 
@@ -111,9 +111,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             ws.remove_cell((cref.col + 1, cref.row + 1));
         }
 
-        for (cref, cell) in sheet.cells.iter() {
+        for (cref, cell) in sheet.iter() {
             // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
-            if sheet.spilled.contains(cref) {
+            if sheet.spilled.contains(&cref) {
                 continue;
             }
             let coord = (cref.col + 1, cref.row + 1);

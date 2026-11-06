@@ -150,7 +150,7 @@ impl SheetApp {
                     self.scroll = Vec2::ZERO;
                     self.editing = None;
                     self.doc_gen = 0;
-                    let n: usize = self.wb.sheets.iter().map(|s| s.cells.len()).sum();
+                    let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
                     eprintln!("[open] 已显示缓存值 {n} 格");
                     if self.pending_host {
@@ -177,7 +177,7 @@ impl SheetApp {
                     self.busy = false;
                     self.needs_full = false;
                     finished = true;
-                    let n: usize = self.wb.sheets.iter().map(|s| s.cells.len()).sum();
+                    let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开并重算完成（{n} 个非空格）");
                     eprintln!("[open] 后台重算完成 {n} 格");
                 }
@@ -574,7 +574,7 @@ impl SheetApp {
                 // 把所有工作表的内容都放进初始快照
                 let mut all: Vec<(usize, u32, u32, sheetcore::Cell)> = Vec::new();
                 for (si, sheet) in self.wb.sheets.iter().enumerate() {
-                    for (k, v) in sheet.cells.iter() {
+                    for (k, v) in sheet.iter() {
                         all.push((si, k.row, k.col, v.clone()));
                     }
                 }
@@ -656,7 +656,7 @@ impl SheetApp {
                     if is_snapshot {
                         // 第一次收到的是宿主全量快照，本地旧内容要清掉
                         self.joined_doc = true;
-                        self.wb.sheet_mut(self.sheet_idx).cells.clear();
+                        self.wb.sheet_mut(self.sheet_idx).clear();
                     }
                     let mut touched: Vec<(usize, u32, u32)> = Vec::new();
                     if let Some(peer) = self.peer.as_mut() {

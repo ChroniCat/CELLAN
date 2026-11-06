@@ -1500,7 +1500,7 @@ impl<'a> Calc<'a> {
         let mut mr = 0u32;
         let mut mc = 0u32;
         if let Some(sheet) = self.wb.sheets.get(si) {
-            for cref in sheet.cells.keys() {
+            for cref in sheet.iter().map(|(k, _)| k) {
                 if cref.row > mr {
                     mr = cref.row;
                 }
@@ -1841,7 +1841,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                                 continue;
                             }
                             let key = CellRef::new(r + i as u32, c + j as u32);
-                            if let Some(cell) = wb.sheets[si].cells.get(&key) {
+                            if let Some(cell) = wb.sheets[si].get(key.row, key.col) {
                                 if !cell.is_blank() && !wb.sheets[si].spilled.contains(&key) {
                                     blocked = true;
                                 }
@@ -1849,7 +1849,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                         }
                     }
                     if blocked {
-                        if let Some(cell) = wb.sheets[si].cells.get_mut(&CellRef::new(r, c)) {
+                        if let Some(cell) = wb.sheets[si].get_mut(r, c) {
                             cell.value = from_fvalue(&FValue::Error(ErrKind::Spill));
                         }
                         continue;
@@ -1859,18 +1859,18 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                             let key = CellRef::new(r + i as u32, c + j as u32);
                             let val = from_fvalue(&a.get(i, j));
                             if i == 0 && j == 0 {
-                                if let Some(cell) = wb.sheets[si].cells.get_mut(&key) {
+                                if let Some(cell) = wb.sheets[si].get_mut(key.row, key.col) {
                                     cell.value = val;
                                 }
                             } else {
-                                wb.sheets[si].cells.insert(key, Cell { value: val, formula: None });
+                                wb.sheets[si].set(key.row, key.col, Cell { value: val, formula: None });
                                 wb.sheets[si].spilled.insert(key);
                             }
                         }
                     }
                 }
                 other => {
-                    if let Some(cell) = wb.sheets[si].cells.get_mut(&CellRef::new(r, c)) {
+                    if let Some(cell) = wb.sheets[si].get_mut(r, c) {
                         cell.value = from_fvalue(&other);
                     }
                 }
@@ -1923,7 +1923,7 @@ pub fn recalc_all(wb: &mut Workbook) {
     for si in 0..wb.sheets.len() {
         let old: Vec<CellRef> = wb.sheets[si].spilled.drain().collect();
         for k in old {
-            wb.sheets[si].cells.remove(&k);
+            wb.sheets[si].remove(k.row, k.col);
         }
     }
 
@@ -1934,8 +1934,7 @@ pub fn recalc_all(wb: &mut Workbook) {
             .iter()
             .enumerate()
             .flat_map(|(si, s)| {
-                s.cells
-                    .iter()
+                s.iter()
                     .filter(|(_, c)| c.formula.is_some())
                     .map(move |(r, _)| (si, r.row, r.col))
             })

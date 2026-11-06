@@ -119,7 +119,7 @@ impl Deps {
     pub fn build(wb: &crate::Workbook) -> Deps {
         let mut deps = Deps::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
-            for (cref, cell) in sheet.cells.iter() {
+            for (cref, cell) in sheet.iter() {
                 if let Some(f) = cell.formula.as_deref() {
                     let rects = refs_of(wb, si, f);
                     if !rects.is_empty() {

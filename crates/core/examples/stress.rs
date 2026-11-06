@@ -85,12 +85,12 @@ fn main() {
         let snapshot: Vec<Vec<(u32, u32, String)>> = wb
             .sheets
             .iter()
-            .map(|s| s.cells.iter().map(|(k, c)| (k.row, k.col, format!("{:?}", c.value))).collect())
+            .map(|s| s.iter().map(|(k, c)| (k.row, k.col, format!("{:?}", c.value))).collect())
             .collect();
         sheetcore::formula::recalc_all(&mut wb);
         let mut diffs = 0usize;
         for (si, sheet) in wb.sheets.iter().enumerate() {
-            for (k, c) in sheet.cells.iter() {
+            for (k, c) in sheet.iter() {
                 let before = snapshot[si]
                     .iter()
                     .find(|(r, col, _)| *r == k.row && *col == k.col)
@@ -164,7 +164,7 @@ fn main() {
         }
     };
     let open_time = t.elapsed().as_secs_f64();
-    let cells: usize = wb.sheets.iter().map(|s| s.cells.len()).sum();
+    let cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
 
     let t2 = Instant::now();
     sheetcore::formula::recalc_all(&mut wb);

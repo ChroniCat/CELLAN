@@ -5,8 +5,8 @@ fn main() {
     let mut wb: Workbook = sheetcore::xlsx::load(std::path::Path::new(&path)).expect("加载失败");
     println!("sheets: {}", wb.sheets.len());
     for (si, s) in wb.sheets.iter().enumerate() {
-        println!("[{si}] {} : {} cells", s.name, s.cells.len());
-        let mut keys: Vec<_> = s.cells.iter().map(|(k, v)| (*k, v.clone())).collect();
+        println!("[{si}] {} : {} cells", s.name, s.len());
+        let mut keys: Vec<_> = s.iter().map(|(k, v)| (k, v.clone())).collect();
         keys.sort_by_key(|(k, _)| (k.row, k.col));
         for (k, cell) in keys.iter().take(40) {
             println!(
@@ -20,7 +20,7 @@ fn main() {
     sheetcore::formula::recalc_all(&mut wb);
     println!("--- after recalc ---");
     let s = &wb.sheets[0];
-    let mut keys: Vec<_> = s.cells.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let mut keys: Vec<_> = s.iter().map(|(k, v)| (k, v.clone())).collect();
     keys.sort_by_key(|(k, _)| (k.row, k.col));
     for (k, cell) in keys.iter().take(40) {
         if cell.formula.is_some() {
