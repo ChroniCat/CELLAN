@@ -54,6 +54,27 @@
 
 
 
+
+### v1.3 入 git + 单元格模型紧凑化 ✅ 2026-11-06
+
+**仓库**：`<workspace>` 已 `git init` 并推送到
+https://github.com/ChroniCat/finance-collab-site 的 `native-rust-sheets` 分支
+（该仓库默认分支是 `codex/finance-web-mvp`，是另一套 Web 实现，所以没动主干）。
+`.gitignore` 排除 `vendor/`、`vendor-web/`、`site*/`、`.local/`（19 GB）、`native/target/`（15 GB）、`work/`。
+
+**模型紧凑化第一步**：
+| 类型 | 之前 | 现在 |
+|---|---|---|
+| `Value` | 32 字节（String 24 + tag） | **24 字节**（Box<str> 16 + tag） |
+| `Cell` | 56 字节 | **40 字节** |
+
+实测（100 万格：数字/文本/公式混合）：私有内存 +118 MB = **124 字节/格**。
+其中 40 字节是 Cell 本体，其余是 HashMap 条目（约 16 字节/条）与字符串堆分配。
+
+**下一步（未做）**：真正的紧凑化需要字符串 arena + 16 字节 Cell：
+`{ kind: u8, num: f64, idx: u32 }`，文本与公式都存进每表一个 `Vec<u8>`。
+预计能到 **60–70 字节/格**，但要改 model、xlsx 读写、公式解析、协作序列化四处，风险高。
+
 ### v1.2 多表协作 + 异步保存 ✅ 2026-11-06
 
 **多表协作**：`Op` 和 `Cursor` 增加 `sheet` 字段，冲突键从 `(row,col)` 改成 `(sheet,row,col)`。
