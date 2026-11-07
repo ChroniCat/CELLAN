@@ -100,6 +100,29 @@ fn saving_keeps_chart_parts() {
     use std::io::Read;
     z.by_name("xl/drawings/drawing1.xml").unwrap().read_to_string(&mut drawing).unwrap();
     assert!(drawing.contains("CellAnchor"), "锚点丢了: {drawing}");
-    // 已知问题：umya 重写 drawing 后，我们自己的解析器读不回图表（见 docs）
+    // 读回来时图表还在（曾经因为 drawing 被写成空壳而丢失）
+    let back = sheetcore::xlsx::load(&out).unwrap();
+    assert!(
+        !back.sheet(0).charts.is_empty(),
+        "保存后重开应该还能读到图表"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn foreign_charts_survive_round_trip() {
+    // 别人做的图表（openpyxl 两个图）保存后必须还在，且能读回来
+    let src = std::path::Path::new("F:/Finance/work/chart.xlsx");
+    if !src.exists() {
+        return;
+    }
+    let wb = sheetcore::xlsx::load(src).unwrap();
+    let n_before = wb.sheet(0).charts.len();
+    assert!(n_before > 0);
+    let out = std::path::PathBuf::from(format!("F:/Finance/work/foreign_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &wb).unwrap();
+    let back = sheetcore::xlsx::load(&out).unwrap();
+    assert_eq!(back.sheet(0).charts.len(), n_before, "保存后图表数量变了");
     let _ = std::fs::remove_file(&out);
 }

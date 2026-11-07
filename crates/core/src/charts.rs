@@ -70,8 +70,9 @@ pub struct Chart {
 
 /// 解析某张表的图表
 pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
+    let dbg = std::env::var("SC_CHART_DBG").is_ok();
     let targets = crate::patch::sheet_targets(path)?;
-    let Some(sheet_path) = targets.get(sheet_name) else { return Ok(Vec::new()) };
+    let Some(sheet_path) = targets.get(sheet_name) else { if dbg { eprintln!("[chart] 没有工作表路径") } return Ok(Vec::new()) };
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
 
@@ -83,10 +84,10 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
     let mut rels_xml = String::new();
     {
         use std::io::Read;
-        let Ok(mut f) = zip.by_name(&rels_path) else { return Ok(Vec::new()) };
+        let Ok(mut f) = zip.by_name(&rels_path) else { if dbg { eprintln!("[chart] 没有 sheet rels {rels_path}") } return Ok(Vec::new()) };
         let _ = f.read_to_string(&mut rels_xml);
     }
-    let Some(drawing_target) = find_rel_target(&rels_xml, "/drawing") else { return Ok(Vec::new()) };
+    let Some(drawing_target) = find_rel_target(&rels_xml, "/drawing") else { if dbg { eprintln!("[chart] sheet rels 里没有 drawing 关系") } return Ok(Vec::new()) };
     // rels 里的路径相对于 sheet 所在目录
     let sheet_dir = match sheet_path.rsplit_once('/') {
         Some((d, _)) => format!("{d}/"),
@@ -97,7 +98,7 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
     let mut drawing_xml = String::new();
     {
         use std::io::Read;
-        let Ok(mut f) = zip.by_name(&drawing_path) else { return Ok(Vec::new()) };
+        let Ok(mut f) = zip.by_name(&drawing_path) else { if dbg { eprintln!("[chart] 打不开 drawing {drawing_path}") } return Ok(Vec::new()) };
         let _ = f.read_to_string(&mut drawing_xml);
     }
 
@@ -148,6 +149,10 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
         }
     }
 
+    if dbg {
+        eprintln!("[chart] drawing={drawing_path} 关系={:?}", chart_targets);
+        eprintln!("[chart] 锚点={:?}", parse_drawing_anchors(&drawing_xml));
+    }
     // 每个 anchor 里的 chart r:id
     let mut out = Vec::new();
     for (anchor, rid) in parse_drawing_anchors(&drawing_xml) {

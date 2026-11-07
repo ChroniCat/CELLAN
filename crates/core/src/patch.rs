@@ -1333,6 +1333,9 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
             base_entries.push((n, buf));
         }
     }
+    if std::env::var("SC_SAVE_PROF").is_ok() {
+        eprintln!("[restore] 基准 {} 个非托管部件", base_entries.len());
+    }
     let existing: Vec<String> = {
         let zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         (0..zip.len())
@@ -1348,17 +1351,29 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
             if !name.starts_with("xl/drawings/") || name.ends_with(".rels") {
                 continue;
             }
-            let base_has_anchor = body.windows(7).any(|w| w == b"CellAnch");
+            // 注意：windows(n) 必须和字面量长度一致，否则永远不相等
+            let base_has_anchor = body.windows(10).any(|w| w == b"CellAnchor");
             if !base_has_anchor {
                 continue;
             }
+            // 图表挂在 graphicFrame 里：umya 会保留锚点却把 graphicFrame 删掉，
+            // 结果就是「锚点在、图没了」——这种情况也要用基准覆盖
+            let base_has_frame = body.windows(12).any(|w| w == b"graphicFrame");
             let mut cur = String::new();
             if let Ok(mut zip) = zip::ZipArchive::new(std::fs::File::open(path)?) {
                 if let Ok(mut f) = zip.by_name(name) {
                     let _ = f.read_to_string(&mut cur);
                 }
             }
-            if cur.is_empty() || !cur.contains("CellAnch") {
+            let cur_has_frame = cur.contains("graphicFrame");
+            if std::env::var("SC_SAVE_PROF").is_ok() {
+                eprintln!(
+                    "[restore] {name}: 基准{}字节 现有{}字节 base_frame={base_has_frame} cur_frame={cur_has_frame}",
+                    body.len(),
+                    cur.len()
+                );
+            }
+            if cur.is_empty() || !cur.contains("CellAnch") || (base_has_frame && !cur_has_frame) {
                 replacements.push((name.clone(), body.clone()));
             }
         }
