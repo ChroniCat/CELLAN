@@ -6235,7 +6235,7 @@ fn main() -> eframe::Result<()> {
     let mut attempt = 0usize;
     let result = loop {
         let which = candidates[attempt.min(candidates.len() - 1)];
-        #[cfg(feature = "wgpu")]
+        #[cfg(all(feature = "wgpu", feature = "glow"))]
         {
             opts.renderer = if which == "wgpu" {
                 eframe::Renderer::Wgpu
@@ -6243,7 +6243,17 @@ fn main() -> eframe::Result<()> {
                 eframe::Renderer::Glow
             };
         }
-        #[cfg(not(feature = "wgpu"))]
+        #[cfg(all(feature = "wgpu", not(feature = "glow")))]
+        {
+            let _ = which;
+            opts.renderer = eframe::Renderer::Wgpu;
+        }
+        #[cfg(all(not(feature = "wgpu"), feature = "glow"))]
+        {
+            let _ = which;
+            opts.renderer = eframe::Renderer::Glow;
+        }
+        #[cfg(not(any(feature = "wgpu", feature = "glow")))]
         {
             let _ = which;
         }
