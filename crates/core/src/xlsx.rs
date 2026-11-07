@@ -461,8 +461,10 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
     // umya 不管条件格式的 dxf 细节，保存完直接补 XML
-    let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);
-    let any_dv = wb.sheets.iter().any(|s| s.dv_dirty);
+    // 只要表里还有规则就重写：umya 自己写条件格式会把图标集写成数据条、
+    // 数据验证也会丢输入提示，所以不能只在 dirty 时接管
+    let any_cf = wb.sheets.iter().any(|s| s.cf_dirty || !s.cf.blocks.is_empty());
+    let any_dv = wb.sheets.iter().any(|s| s.dv_dirty || !s.dv.is_empty());
     let any_freeze = wb.sheets.iter().any(|s| s.freeze_dirty);
     let any_filter = wb.sheets.iter().any(|s| s.filter_dirty);
     let any_page = wb.sheets.iter().any(|s| s.page_dirty);
@@ -566,10 +568,12 @@ fn apply_cf_patch(
             }
         }
     }
+    // dxfs 必须和实际写出的 cfRule 对得上：以前只在 dirty 时取，
+    // 现在只要重写条件格式就用「有 dxfs 的那张表」，否则 dxfId 会越界
     let dxfs: Vec<crate::cf::Dxf> = wb
         .sheets
         .iter()
-        .find(|s| s.cf_dirty)
+        .find(|s| s.cf_dirty || !s.cf.dxfs.is_empty())
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     crate::patch::rewrite_zip(path, |name, buf| {
