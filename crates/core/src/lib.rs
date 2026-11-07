@@ -13,6 +13,7 @@ pub mod patch;
 pub mod pdf;
 pub mod print;
 pub mod pivot;
+pub mod refs;
 pub mod pivot_xml;
 pub mod model;
 pub mod style;

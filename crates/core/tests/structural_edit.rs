@@ -78,3 +78,57 @@ fn structure_only_leaves_cells_alone() {
     assert_eq!(s.get(0, 0).unwrap().value.display(), "R0", "格子不该被搬");
     assert_eq!(s.merges, vec![(3, 0, 3, 1)], "合并要跟着挪两行");
 }
+
+#[test]
+fn formulas_are_rewritten_on_insert() {
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    for r in 0..3u32 {
+        wb.sheet_mut(0).set(r, 0, Cell { value: Value::Number((r + 1) as f64), formula: None });
+    }
+    wb.sheet_mut(0).set(
+        0,
+        1,
+        Cell { value: Value::Number(0.0), formula: Some("=SUM(A1:A3)".into()) },
+    );
+    sheetcore::structural::apply_structural_wb(
+        &mut wb,
+        0,
+        &Structural::InsertRows { at: 0, n: 1 },
+    );
+    // 公式本身跟着走：B1 → B2，区间 A1:A3 → A2:A4
+    let f = wb.sheet(0).get(1, 1).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("=SUM(A2:A4)"), "引用没改写");
+    assert!(wb.sheet(0).get(1, 0).unwrap().value.display() == "1");
+}
+
+#[test]
+fn delete_turns_reference_into_ref_error() {
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(5.0), formula: None });
+    wb.sheet_mut(0).set(1, 1, Cell { value: Value::Number(0.0), formula: Some("=A1*2".into()) });
+    sheetcore::structural::apply_structural_wb(&mut wb, 0, &Structural::DeleteRows { at: 0, n: 1 });
+    // A1 被删 → 公式变成 #REF!*2，且公式自己也上移到 B1
+    let f = wb.sheet(0).get(0, 1).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("=#REF!*2"), "应变成 #REF!，实际 {f:?}");
+}
+
+#[test]
+fn cross_sheet_references_follow() {
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].name = "数据".into();
+    wb.sheets.push(sheetcore::model::Sheet::new("汇总"));
+    wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(9.0), formula: None });
+    wb.sheet_mut(1).set(0, 0, Cell {
+        value: Value::Number(0.0),
+        formula: Some("=数据!A1+1".into()),
+    });
+    sheetcore::structural::apply_structural_wb(
+        &mut wb,
+        0,
+        &Structural::InsertRows { at: 0, n: 2 },
+    );
+    let f = wb.sheet(1).get(0, 0).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("=数据!A3+1"), "跨表引用应跟着改");
+}

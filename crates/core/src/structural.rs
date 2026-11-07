@@ -46,6 +46,32 @@ fn shift_axis(v: u32, at: u32, n: u32, del: bool) -> Option<u32> {
 }
 
 impl Sheet {
+    /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
+    pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
+        let keys: Vec<crate::model::CellRef> = self
+            .iter()
+            .filter(|(_, c)| c.formula.is_some())
+            .map(|(k, _)| k)
+            .collect();
+        for k in keys {
+            let Some(cell) = self.get_mut(k.row, k.col) else { continue };
+            if let Some(f) = cell.formula.as_mut() {
+                *f = crate::refs::rewrite(f, shift).into_boxed_str();
+            }
+        }
+        for blk in self.cf.blocks.iter_mut() {
+            for rule in blk.rules.iter_mut() {
+                if let crate::cf::CfKind::Expr { formula, .. } = &mut rule.kind {
+                    *formula = crate::refs::rewrite(formula, shift);
+                }
+            }
+        }
+        for dv in self.dv.iter_mut() {
+            dv.f1 = crate::refs::rewrite(&dv.f1, shift);
+            dv.f2 = crate::refs::rewrite(&dv.f2, shift);
+        }
+    }
+
     /// 只搬结构（合并/条件格式/数据验证/冻结/行列尺寸），不动格子。
     /// 加入房间时用：格子由宿主的快照给出（已经是新坐标），
     /// 再按历史搬一次就会搬两遍。
@@ -348,6 +374,35 @@ impl crate::layout::Axis {
                 self.set(i - n, w);
             }
         }
+    }
+}
+
+/// 整个工作簿层面的结构改动：搬格子 + 改写所有表里的公式引用
+pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op: &Structural) {
+    let Some(name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
+        return;
+    };
+    wb.sheets[sheet_idx].apply_structural(op);
+    let (axis, at, n, delete) = match op {
+        Structural::InsertRows { at, n } => (crate::refs::Axis::Row, *at, *n, false),
+        Structural::DeleteRows { at, n } => (crate::refs::Axis::Row, *at, *n, true),
+        Structural::InsertCols { at, n } => (crate::refs::Axis::Col, *at, *n, false),
+        Structural::DeleteCols { at, n } => (crate::refs::Axis::Col, *at, *n, true),
+    };
+    for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+        let shift = crate::refs::Shift {
+            axis,
+            at,
+            n,
+            delete,
+            target_sheet: name.clone(),
+            own_sheet: if idx == sheet_idx {
+                name.clone()
+            } else {
+                sheet.name.clone()
+            },
+        };
+        sheet.rewrite_references(&shift);
     }
 }
 

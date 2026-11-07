@@ -2431,7 +2431,7 @@ impl SheetApp {
         } else {
             None
         };
-        self.wb.sheet_mut(idx).apply_structural(&op);
+        sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         let after = if snapshot.is_some() {
@@ -3817,7 +3817,7 @@ impl SheetApp {
                 }
                 crate::net::NetEvent::Structural { sheet, op } => {
                     if sheet < self.wb.sheets.len() {
-                        self.wb.sheet_mut(sheet).apply_structural(&op);
+                        sheetcore::structural::apply_structural_wb(&mut self.wb, sheet, &op);
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         sheetcore::formula::recalc_all(&mut self.wb);
@@ -4008,6 +4008,10 @@ impl eframe::App for SheetApp {
                 let d = sheetcore::formula::deps::Deps::build(&wb2);
                 let _ = tx.send(OpenMsg::Recalced(Box::new(wb2), Box::new(d)));
             });
+        }
+        // 有 dump 待写时也要保持刷新，否则窗口静止就永远等不到那一帧
+        if std::env::var("SC_DUMP").is_ok() && self.dump_once {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // 协作或后台重算时保持刷新
         if self.net.is_some() || self.busy || self.save_rx.is_some() {
