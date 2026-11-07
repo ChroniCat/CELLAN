@@ -472,6 +472,16 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
     }
+    // 收尾：umya 会改坏 drawing rels 的图表关系，并留下旧的表格/批注部件
+    if restore_base.exists() {
+        if let Err(e) = crate::fixups::fix_drawing_rels(path, &restore_base) {
+            eprintln!("[save] 修复 drawing 关系失败: {e:#}");
+        }
+        if let Err(e) = crate::fixups::prune_orphans(path) {
+            eprintln!("[save] 清理孤儿部件失败: {e:#}");
+        }
+    }
+
     Ok(())
 }
 
