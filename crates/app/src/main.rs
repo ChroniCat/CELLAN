@@ -148,6 +148,10 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// 打印预览窗口
+    print_preview: bool,
+    /// 预览第几页（0 起）
+    preview_page: usize,
     /// 图片纹理缓存（部件名 → 纹理；None 表示解不出来）
     img_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     /// 成员列表窗口
@@ -286,6 +290,8 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             cf_mgr: false,
+            print_preview: false,
+            preview_page: 0,
             img_cache: std::collections::HashMap::new(),
             members_open: false,
             cse_pending: false,
@@ -1415,6 +1421,238 @@ impl SheetApp {
         };
     }
 
+    /// 打印预览：按页面设置分页，把每一页画成一张纸
+    fn print_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.print_preview {
+            return;
+        }
+        let mut open = true;
+        let mut goto_page: Option<usize> = None;
+        let mut do_print = false;
+        let mut do_export = false;
+        // 先把要画的东西取出来，别在闭包里借 self
+        let (layout, cols, rows, texts, page_no, total) = {
+            let sheet = self.wb.sheet(self.sheet_idx);
+            let layout = sheetcore::print::paginate(sheet, &sheet.page);
+            let total = layout.pages.len().max(1);
+            let page_no = self.preview_page.min(total - 1);
+            let span = layout
+                .pages
+                .get(page_no)
+                .cloned()
+                .unwrap_or(sheetcore::print::PageSpan { rows: (0, 0), cols: (0, 0) });
+            let mut texts: Vec<(u32, u32, String)> = Vec::new();
+            for r in span.rows.0..=span.rows.1 {
+                for c in span.cols.0..=span.cols.1 {
+                    if let Some(cell) = sheet.get(r, c) {
+                        let t = cell.value.display();
+                        if !t.is_empty() {
+                            texts.push((r, c, t));
+                        }
+                    }
+                }
+            }
+            (
+                layout,
+                sheet.cols.clone(),
+                sheet.rows.clone(),
+                texts,
+                page_no,
+                total,
+            )
+        };
+        let span = layout
+            .pages
+            .get(page_no)
+            .cloned()
+            .unwrap_or(sheetcore::print::PageSpan { rows: (0, 0), cols: (0, 0) });
+        let (pw, ph) = layout.page_size;
+        let (print_w, print_h) = layout.printable;
+        let page_h = 560.0f32;
+        let page_w = page_h * pw / ph;
+        let scale_preview = page_h / ph;
+        let margins = self.wb.sheet(self.sheet_idx).page.margins;
+        let scale_txt = layout.scale;
+
+        egui::Window::new("打印预览")
+            .open(&mut open)
+            .default_width(page_w + 280.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("◀").clicked() && page_no > 0 {
+                        goto_page = Some(page_no - 1);
+                    }
+                    ui.label(format!("第 {} / {} 页", page_no + 1, total));
+                    if ui.button("▶").clicked() && page_no + 1 < total {
+                        goto_page = Some(page_no + 1);
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "纸张 {pw:.0}×{ph:.0}pt 缩放 {:.0}%",
+                        scale_txt * 100.0
+                    ));
+                    ui.separator();
+                    if ui.button("打印…").clicked() {
+                        do_print = true;
+                    }
+                    if ui.button("导出 PDF…").clicked() {
+                        do_export = true;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let (resp, painter) =
+                        ui.allocate_painter(egui::vec2(page_w, page_h), egui::Sense::hover());
+                    let page_rect = resp.rect;
+                    painter.rect_filled(page_rect, 2.0, egui::Color32::WHITE);
+                    painter.rect_stroke(
+                        page_rect,
+                        2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let inner = egui::Rect::from_min_max(
+                        page_rect.min
+                            + egui::vec2(
+                                margins[0] * 72.0 * scale_preview,
+                                margins[2] * 72.0 * scale_preview,
+                            ),
+                        page_rect.max
+                            - egui::vec2(
+                                margins[1] * 72.0 * scale_preview,
+                                margins[3] * 72.0 * scale_preview,
+                            ),
+                    );
+                    painter.rect_stroke(
+                        inner,
+                        0.0,
+                        egui::Stroke::new(0.8, egui::Color32::from_gray(205)),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    // 一页内容的原始尺寸（96 DPI 像素）
+                    let mut content_w = 0.0f32;
+                    for c in span.cols.0..=span.cols.1 {
+                        content_w += cols.size(c);
+                    }
+                    let mut content_h = 0.0f32;
+                    for r in span.rows.0..=span.rows.1 {
+                        content_h += rows.size(r);
+                    }
+                    let fit = (print_w * scale_preview / content_w.max(1.0))
+                        .min(print_h * scale_preview / content_h.max(1.0));
+                    let cell_scale = fit * scale_txt;
+
+                    let mut y = inner.min.y;
+                    for r in span.rows.0..=span.rows.1 {
+                        let h = rows.size(r) * cell_scale;
+                        if y > inner.max.y + 1.0 {
+                            break;
+                        }
+                        let mut x = inner.min.x;
+                        painter.line_segment(
+                            [egui::pos2(inner.min.x, y), egui::pos2(inner.max.x, y)],
+                            egui::Stroke::new(0.4, egui::Color32::from_gray(225)),
+                        );
+                        for c in span.cols.0..=span.cols.1 {
+                            let w = cols.size(c) * cell_scale;
+                            if x > inner.max.x + 1.0 {
+                                break;
+                            }
+                            if let Some((_, _, t)) =
+                                texts.iter().find(|(rr, cc, _)| *rr == r && *cc == c)
+                            {
+                                let fs = (11.0 * cell_scale * 1.05).clamp(4.0, 15.0);
+                                let per = (fs * 0.62).max(1.0);
+                                let max_chars = ((w - 2.0).max(1.0) / per) as usize + 1;
+                                let clipped: String = t.chars().take(max_chars).collect();
+                                painter.text(
+                                    egui::pos2(x + 1.0, y + 1.0),
+                                    egui::Align2::LEFT_TOP,
+                                    clipped,
+                                    egui::FontId::proportional(fs),
+                                    egui::Color32::BLACK,
+                                );
+                            }
+                            painter.line_segment(
+                                [egui::pos2(x, y), egui::pos2(x, (y + h).min(inner.max.y))],
+                                egui::Stroke::new(0.4, egui::Color32::from_gray(225)),
+                            );
+                            x += w;
+                        }
+                        y += h;
+                    }
+                    if std::env::var("SC_PREVIEW").is_ok() {
+                        eprintln!(
+                            "[preview] page={}/{} rows={:?} cols={:?} scale={:.2} paper={:.0}x{:.0} cells={}",
+                            page_no + 1,
+                            total,
+                            span.rows,
+                            span.cols,
+                            scale_txt,
+                            pw,
+                            ph,
+                            texts.len()
+                        );
+                    }
+                });
+            });
+        if let Some(p) = goto_page {
+            self.preview_page = p;
+        }
+        if do_export {
+            self.export_pdf_dialog();
+        }
+        if do_print {
+            self.print_to_printer();
+        }
+        self.print_preview = open;
+    }
+
+    /// 真打印：先导出 PDF，再交给系统默认处理程序打印
+    fn print_to_printer(&mut self) {
+        let path = std::env::temp_dir().join(format!(
+            "sheetcore-print-{}.pdf",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
+        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &path, font) {
+            Ok(_) => {
+                let p = path.to_string_lossy().to_string();
+                let r = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!("Start-Process -FilePath '{p}' -Verb Print"),
+                    ])
+                    .spawn();
+                self.status = match r {
+                    Ok(_) => format!("已交给系统打印：{p}"),
+                    Err(e) => format!("打印失败：{e}"),
+                };
+            }
+            Err(e) => self.status = format!("生成打印文件失败：{e:#}"),
+        }
+    }
+
+    fn export_pdf_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.pdf", self.wb.title()))
+            .add_filter("PDF", &["pdf"])
+            .save_file()
+        else {
+            return;
+        };
+        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
+        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &path, font) {
+            Ok(_) => self.status = format!("已导出 {}", path.display()),
+            Err(e) => self.status = format!("导出失败：{e:#}"),
+        }
+    }
+
     /// 解一张图片并缓存纹理（解不出来就记 None，不反复重试）
     fn img_texture(
         &mut self,
@@ -2453,6 +2691,18 @@ impl SheetApp {
             ui.separator();
 
             // 插入
+            ui.menu_button("文件", |ui| {
+                ui.set_min_width(150.0);
+                if ui.button("打印预览").clicked() {
+                    self.preview_page = 0;
+                    self.print_preview = true;
+                    ui.close_menu();
+                }
+                if ui.button("导出 PDF…").clicked() {
+                    self.export_pdf_dialog();
+                    ui.close_menu();
+                }
+            });
             ui.menu_button("数据", |ui| {
                 ui.set_min_width(150.0);
                 if ui.button("多级排序…").clicked() {
@@ -5689,6 +5939,10 @@ impl eframe::App for SheetApp {
         self.find_dialog(ctx);
         self.data_dialog(ctx);
         self.cf_manager(ctx);
+        if std::env::var("SC_PREVIEW").is_ok() && self.open_rx.is_none() {
+            self.print_preview = true;
+        }
+        self.print_preview_window(ctx);
         self.members_window(ctx);
         if self.circle_invalid {
             self.compute_invalid();
