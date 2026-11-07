@@ -5292,6 +5292,8 @@ impl SheetApp {
                     self.status = "已连接".into();
                 }
                 net::NetEvent::Welcome { peers } => {
+                    // 握手完成前发出去的光标会被丢掉；清一下，下一帧重发
+                    self.last_cursor = None;
                     let me = self.peer.as_ref().map(|p| p.site).unwrap_or(0);
                     self.peers_list = peers
                         .into_iter()
