@@ -60,6 +60,8 @@ pub struct Action {
     /// 结构性改动：整表前后快照（表太大时留空，表示不可撤销）
     pub snap_before: Option<SheetSnapshot>,
     pub snap_after: Option<SheetSnapshot>,
+    /// 这个动作是谁做的（协作站点号）；0 表示单人/未知
+    pub by_site: u32,
 }
 
 impl Action {
@@ -82,6 +84,8 @@ pub struct UndoStack {
     undone: Vec<Action>,
     /// 最多保留多少步
     pub limit: usize,
+    /// 我是谁（协作站点号）；0 表示单人。撤销只退自己的动作
+    pub site: u32,
 }
 
 /// 撤销/重做实际改了哪些格子
@@ -96,7 +100,7 @@ pub struct Applied {
 
 impl Default for UndoStack {
     fn default() -> Self {
-        Self { done: Vec::new(), undone: Vec::new(), limit: 200 }
+        Self { done: Vec::new(), undone: Vec::new(), limit: 200, site: 0 }
     }
 }
 
@@ -106,9 +110,23 @@ impl UndoStack {
     }
 
     /// 记一步。相同格子在一步里只记第一次（后写的 after 覆盖）
+    /// 换站点（进/退协作房间）：历史属于上一个人，清掉
+    pub fn set_site(&mut self, site: u32) {
+        if site != self.site {
+            self.done.clear();
+            self.undone.clear();
+        }
+        self.site = site;
+    }
+
     pub fn push(&mut self, action: Action) {
         if action.is_empty() {
             return;
+        }
+        // 记下是谁做的：协作时撤销只退自己的
+        let mut action = action;
+        if action.by_site == 0 {
+            action.by_site = self.site;
         }
         self.done.push(action);
         // 新动作让「重做」失效
@@ -145,6 +163,15 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        // 只撤自己的：栈顶不是我的动作就不动（也不丢，免得误删历史）
+        if self
+            .done
+            .last()
+            .map(|a| a.by_site != 0 && self.site != 0 && a.by_site != self.site)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         let action = self.done.pop()?;
         let mut touched = Vec::new();
         let mut skipped = 0;
@@ -192,6 +219,14 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        if self
+            .undone
+            .last()
+            .map(|a| a.by_site != 0 && self.site != 0 && a.by_site != self.site)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         let action = self.undone.pop()?;
         let mut touched = Vec::new();
         let mut skipped = 0;
@@ -280,6 +315,7 @@ mod tests {
             label: "编辑".into(),
             snap_before: None,
             snap_after: None,
+            by_site: 0,
             deltas: vec![CellDelta {
                 sheet: 0,
                 row: r,

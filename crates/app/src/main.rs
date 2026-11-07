@@ -873,6 +873,7 @@ impl SheetApp {
             label: "清除".into(),
             snap_before: None,
             snap_after: None,
+            by_site: 0,
             deltas: vec![sheetcore::undo::CellDelta {
                 sheet: self.sheet_idx,
                 row: r,
@@ -1009,6 +1010,7 @@ impl SheetApp {
             focus,
             snap_before: None,
             snap_after: None,
+            by_site: 0,
         });
     }
 
@@ -3765,6 +3767,7 @@ impl SheetApp {
                 focus: (idx, self.sel.0, self.sel.1),
                 snap_before: Some(before),
                 snap_after: Some(after),
+                by_site: 0,
             });
         }
         // 整表重算（结构变了，依赖图也得重建）
@@ -5311,6 +5314,7 @@ impl SheetApp {
                 }
                 self.peer = Some(peer);
                 self.net = Some(n);
+                self.undo.set_site(site);
                 self.status = format!("已共享，同事可加入：{}:{}", local_ip_hint(), port);
             eprintln!("[net] {}", self.status);
             }
@@ -5330,6 +5334,7 @@ impl SheetApp {
                 self.peer = Some(Peer::new(site));
                 self.peers_list = vec![(site, self.my_name.clone(), (site % 7) as u8)];
                 self.net = Some(n);
+                self.undo.set_site(site);
                 self.status = format!("正在连接 {addr} …");
             }
             Err(e) => self.status = format!("连接失败: {e}"),
