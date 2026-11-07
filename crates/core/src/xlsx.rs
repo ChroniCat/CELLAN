@@ -82,6 +82,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
+    // 表格对象（ListObject）：独立的 tableN.xml 部件
+    {
+        let tables = crate::table::load(path);
+        for sheet in wb.sheets.iter_mut() {
+            if let Some(list) = tables.get(&sheet.name) {
+                sheet.tables = list.clone();
+            }
+        }
+    }
     // 数组公式：calamine 只给公式文本，t="array"/ref 得从原始 XML 拿
     if let Ok(arrays) = std::fs::metadata(path) {
         if arrays.len() > 0 {
@@ -434,6 +443,14 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
+    // 表格对象：umya 会丢掉 tableParts，保存后自己挂回去
+    for sheet in wb.sheets.iter() {
+        if !sheet.tables.is_empty() {
+            if let Err(e) = crate::table::attach(path, &sheet.name, &sheet.tables) {
+                eprintln!("[save] 表格对象写入失败: {e:#}");
+            }
+        }
+    }
     // umya 不管条件格式的 dxf 细节，保存完直接补 XML
     let any_cf = wb.sheets.iter().any(|s| s.cf_dirty);
     let any_dv = wb.sheets.iter().any(|s| s.dv_dirty);

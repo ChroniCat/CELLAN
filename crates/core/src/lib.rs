@@ -5,6 +5,7 @@ pub mod charts;
 pub mod cfb;
 pub mod vba_src;
 pub mod arr;
+pub mod table;
 pub mod data_tools;
 pub mod dv;
 pub mod layout;

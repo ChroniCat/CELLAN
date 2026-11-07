@@ -93,6 +93,8 @@ pub struct Sheet {
     pub spilled: std::collections::HashSet<CellRef>,
     /// 老式 CSE 数组公式：锚点 → 覆盖区域（保存时要写回 t="array" ref）
     pub arrays: Vec<(CellRef, (u32, u32, u32, u32))>,
+    /// Excel 表格对象（ListObject）
+    pub tables: Vec<crate::table::Table>,
     /// 合并单元格区域 (r1, c1, r2, c2)
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// 列宽（只有被设置过的列才有条目）
@@ -145,6 +147,7 @@ impl Sheet {
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
             arrays: Vec::new(),
+            tables: Vec::new(),
             merges: Vec::new(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),

@@ -123,6 +123,7 @@ struct SheetApp {
     b6_done: bool,
     c2_done: bool,
     b3_done: bool,
+    b1_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -269,6 +270,7 @@ impl SheetApp {
             b6_done: false,
             c2_done: false,
             b3_done: false,
+            b1_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -569,6 +571,30 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：选区转表格 + 结构化引用 + 存盘
+    fn b1_probe(&mut self) {
+        if std::env::var("SC_B1").is_err() || self.open_rx.is_some() || self.b1_done {
+            return;
+        }
+        self.b1_done = true;
+        self.sel = (0, 0);
+        self.sel_end = (5, 2);
+        self.make_table();
+        eprintln!("[B1] {}", self.status);
+        let t = self.wb.sheet(self.sheet_idx).tables.first().cloned();
+        eprintln!("[B1] 表格={:?}", t.as_ref().map(|x| (x.name.clone(), x.range, x.columns.clone())));
+        let name = t.map(|x| x.name).unwrap_or_else(|| "Table1".into());
+        let si = self.sheet_idx;
+        let v = sheetcore::formula::eval_formula(&self.wb, si, &format!("=SUM({name}[金额])"));
+        eprintln!("[B1] SUM({name}[金额]) = {v:?}");
+        let out = std::path::PathBuf::from("F:/Finance/work/b1_out.xlsx");
+        let _ = std::fs::remove_file(&out);
+        match sheetcore::xlsx::save(&out, &self.wb) {
+            Ok(_) => eprintln!("[B1] 存盘后表格={:?}", sheetcore::table::load(&out)),
+            Err(e) => eprintln!("[B1] 保存失败 {e:#}"),
+        }
     }
 
     /// 无界面自检：Ctrl+Shift+Enter 数组公式 → 存盘带 t="array"
@@ -1382,6 +1408,65 @@ impl SheetApp {
         } else {
             format!("已分成 {n} 列")
         };
+    }
+
+    /// 把选区转成 Excel 表格对象（ListObject），首行当列名
+    fn make_table(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if r2 - r1 < 1 || c2 == c1 {
+            self.status = "表格至少要两行两列（首行是列名）".into();
+            return;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for c in c1..=c2 {
+            let v = self
+                .wb
+                .sheet(self.sheet_idx)
+                .get(r1, c)
+                .map(|x| x.value.display())
+                .unwrap_or_default();
+            names.push(if v.trim().is_empty() {
+                format!("列{}", c - c1 + 1)
+            } else {
+                v
+            });
+        }
+        // 名字不能重复，Excel 也不允许
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..names.len() {
+            let mut base = names[i].clone();
+            let mut k = 2;
+            while seen.contains(&base.to_lowercase()) {
+                base = format!("{}_{k}", names[i]);
+                k += 1;
+            }
+            seen.insert(base.to_lowercase());
+            names[i] = base;
+        }
+        let existing: std::collections::HashSet<String> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .tables
+            .iter()
+            .map(|t| t.name.to_lowercase())
+            .collect();
+        let mut n = 1usize;
+        while existing.contains(&format!("table{n}")) {
+            n += 1;
+        }
+        let name = format!("Table{n}");
+        let t = sheetcore::table::Table {
+            name: name.clone(),
+            display: name.clone(),
+            range: (r1, c1, r2, c2),
+            columns: names,
+            header_row: true,
+            totals_row: false,
+        };
+        self.wb.sheet_mut(self.sheet_idx).tables.push(t);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已创建表格 {}（{}）", name, sheetcore::table::a1((r1, c1, r2, c2)));
     }
 
     /// 在线成员：谁在哪儿，点一下跳过去
@@ -2357,6 +2442,12 @@ impl SheetApp {
                 }
             });
             ui.menu_button("插入", |ui| {
+                ui.set_min_width(180.0);
+                if ui.button("表格（把选区转成表格）").clicked() {
+                    self.make_table();
+                    ui.close_menu();
+                }
+                ui.separator();
                 ui.set_min_width(150.0);
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 let (rr, cc) = self.sel;
@@ -5516,6 +5607,7 @@ impl eframe::App for SheetApp {
         self.b6_probe(ctx);
         self.c2_probe();
         self.b3_probe();
+        self.b1_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);

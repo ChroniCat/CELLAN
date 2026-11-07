@@ -680,7 +680,10 @@ impl<'a> Calc<'a> {
                 }
             }
             self.cur = (r, c);
-            let body = f.strip_prefix('=').unwrap_or(f);
+            let raw = f.strip_prefix('=').unwrap_or(f).to_string();
+            // 结构化引用：Table1[列] → A1 区域
+            let expanded = crate::table::expand_structured(self.wb, si, &raw).unwrap_or(raw);
+            let body = expanded.as_str();
             if !self.visiting.insert(key) {
                 return FValue::Error(ErrKind::Circular);
             }
@@ -2079,7 +2082,9 @@ pub fn eval_cell(wb: &Workbook, si: usize, r: u32, c: u32) -> FValue {
 
 /// 直接求一段公式文本（测试用）
 pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
-    let body = formula.strip_prefix('=').unwrap_or(formula);
+    let raw = formula.strip_prefix('=').unwrap_or(formula).to_string();
+    let expanded = crate::table::expand_structured(wb, si, &raw).unwrap_or(raw);
+    let body = expanded.as_str();
     match parse(body) {
         Ok(node) => {
             let mut calc = Calc::new(wb);
