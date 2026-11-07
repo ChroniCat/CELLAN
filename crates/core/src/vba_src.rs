@@ -12,7 +12,8 @@ use crate::cfb::Compound;
 /// 解 MS-OVBA 压缩容器
 pub fn decompress(src: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len() * 4);
-    let mut i = 0usize;
+    // 容器第一个字节固定是 0x01（CompressedContainer 签名），不是 chunk 头
+    let mut i = if src.first() == Some(&0x01) { 1 } else { 0 };
     while i + 2 <= src.len() {
         let header = u16::from_le_bytes([src[i], src[i + 1]]);
         i += 2;
