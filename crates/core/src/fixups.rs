@@ -124,6 +124,230 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 }
 
 
+
+
+
+/// 取出某个标签对应的完整片段（含自闭合）
+fn take_element(xml: &str, tag: &str) -> Option<String> {
+    let start = xml.find(&format!("<{tag}"))?;
+    let rest = &xml[start..];
+    let head_end = rest.find('>')?;
+    if rest[..=head_end].ends_with("/>") {
+        return Some(rest[..=head_end].to_string());
+    }
+    let close = format!("</{tag}>");
+    let end = rest.find(&close)?;
+    Some(rest[..end + close.len()].to_string())
+}
+
+/// umya 重写工作表时会丢掉 <drawing>/<tableParts>/<pivotTable> 这些「引用元素」，
+/// 部件和关系都在、表里却没指过去 —— Excel 直接判包损坏。这里按基准补回来。
+pub fn restore_sheet_refs(path: &Path, base: &Path) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let base_targets = crate::patch::sheet_targets(base)?;
+    let new_targets = crate::patch::sheet_targets(path)?;
+    let order = [
+        "drawing",
+        "legacyDrawing",
+        "legacyDrawingHF",
+        "picture",
+        "oleObjects",
+        "controls",
+        "tableParts",
+        "extLst",
+    ];
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut log = Vec::new();
+
+    for (sheet, base_part) in base_targets.iter() {
+        let Some(new_part) = new_targets.get(sheet) else { continue };
+        let Some(base_xml) = read_entry(base, base_part).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        let Some(mut new_xml) = read_entry(path, new_part).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        // pivotTable 元素不是尾部元素，单独处理
+        let mut add = String::new();
+        let mut added = 0usize;
+        for tag in order {
+            if new_xml.contains(&format!("<{tag}")) {
+                continue;
+            }
+            if let Some(frag) = take_element(&base_xml, tag) {
+                add.push_str(&frag);
+                added += 1;
+            }
+        }
+        if let Some(close) = new_xml.rfind("</worksheet>") {
+            if added > 0 {
+                new_xml.insert_str(close, &add);
+            }
+        }
+        // pivotTable：基准里每个 <pivotTable r:id> 都补回去（放在 tableParts 之前）
+        let mut piv = String::new();
+        let mut rest = base_xml.as_str();
+        while let Some(pos) = rest.find("<pivotTable ") {
+            let end = rest[pos..].find("/>").map(|e| pos + e + 2).unwrap_or(rest.len());
+            let frag = &rest[pos..end];
+            let id = frag
+                .find("r:id=\"")
+                .and_then(|i| frag[i + 6..].find('"').map(|q| frag[i + 6..i + 6 + q].to_string()));
+            if let Some(id) = id {
+                if !new_xml.contains(&format!("r:id=\"{id}\"")) {
+                    piv.push_str(frag);
+                    added += 1;
+                }
+            }
+            rest = &rest[end.min(rest.len())..];
+        }
+        if !piv.is_empty() {
+            if let Some(pos) = new_xml.find("<tableParts")
+                .or_else(|| new_xml.rfind("</worksheet>"))
+            {
+                new_xml.insert_str(pos, &piv);
+            }
+        }
+        if added > 0 {
+            pending.push((new_part.clone(), new_xml.into_bytes()));
+            log.push(format!("{sheet}: 补回 {added} 个引用元素"));
+        }
+    }
+    crate::patch::append_entries(path, &pending)?;
+    Ok(log)
+}
+
+/// workbook 级关系与 <pivotCaches>：umya 会把透视缓存的登记整段删掉，
+/// 但工作表里还指着 pivotTable 部件 —— Excel 认为包损坏（WPS 不校验）。
+pub fn migrate_workbook_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let Some(base_rels) = read_entry(base, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let Some(new_rels) = read_entry(path, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let Some(base_wb) = read_entry(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let Some(new_wb) = read_entry(path, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let parts = entries(path);
+    let have = parse_rels(&new_rels);
+    let mut add = String::new();
+    let mut added = 0usize;
+
+    for (id, (ty, target)) in parse_rels(&base_rels) {
+        if have.contains_key(&id) {
+            continue;
+        }
+        // 工作表/样式/共享字符串由 umya 管，别的（透视缓存、切片器…）缺了就补
+        if ty.ends_with("/worksheet") || ty.ends_with("/styles") || ty.ends_with("/sharedStrings")
+            || ty.ends_with("/theme") || ty.ends_with("/calcChain")
+        {
+            continue;
+        }
+        let abs = resolve_target("xl/_rels/workbook.xml.rels", &target);
+        if !parts.iter().any(|p| p == &abs) {
+            continue;
+        }
+        let rel = relative_to("xl/_rels/workbook.xml.rels", &abs);
+        add.push_str(&format!("<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{rel}\"/>"));
+        added += 1;
+    }
+
+    let mut log = Vec::new();
+    if added > 0 {
+        let merged = new_rels.replacen("</Relationships>", &format!("{add}</Relationships>"), 1);
+        crate::patch::append_entry(path, "xl/_rels/workbook.xml.rels", merged.as_bytes())?;
+        log.push(format!("workbook rels 补 {added} 条"));
+    }
+
+    // <pivotCaches> 整段照抄（r:id 与上面补的关系一致）
+    if !new_wb.contains("<pivotCaches") {
+        if let Some(start) = base_wb.find("<pivotCaches") {
+            if let Some(endrel) = base_wb[start..].find("</pivotCaches>") {
+                let block = &base_wb[start..start + endrel + "</pivotCaches>".len()];
+                let mut wb2 = new_wb.clone();
+                let pos = wb2
+                    .find("<calcPr")
+                    .or_else(|| wb2.find("</workbook>"))
+                    .unwrap_or(wb2.len());
+                wb2.insert_str(pos, block);
+                crate::patch::append_entry(path, "xl/workbook.xml", wb2.as_bytes())?;
+                log.push("workbook.xml 补回 pivotCaches".to_string());
+            }
+        }
+    }
+    Ok(log)
+}
+
+/// 补齐内容类型：从基准文件把缺的 Default（按扩展名）和 Override（按部件）抄过来。
+/// 少一条 Excel 就判整个包损坏（WPS 不校验，所以能开）。
+pub fn ensure_content_types(path: &Path, base: &Path) -> Result<Vec<String>> {
+    let Some(base_ct) = read_entry(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let Some(new_ct) = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(Vec::new());
+    };
+    let parts = entries(path);
+    let mut add = String::new();
+    let mut added = 0usize;
+
+    // 1) Default：按扩展名
+    let mut rest = base_ct.as_str();
+    while let Some(pos) = rest.find("<Default") {
+        let end = rest[pos..].find("/>").map(|e| pos + e + 2).unwrap_or(rest.len());
+        let tag = &rest[pos..end];
+        if let Some(ext) = tag
+            .find("Extension=\"")
+            .and_then(|i| tag[i + 11..].find('"').map(|q| tag[i + 11..i + 11 + q].to_string()))
+        {
+            let pat = format!("Extension=\"{ext}\"");
+            if !new_ct.contains(&pat) && !add.contains(&pat) {
+                add.push_str(tag);
+                added += 1;
+            }
+        }
+        rest = &rest[end.min(rest.len())..];
+    }
+
+    // 2) Override：只补「新包里存在但没声明」的部件
+    let mut rest = base_ct.as_str();
+    while let Some(pos) = rest.find("<Override") {
+        let end = rest[pos..].find("/>").map(|e| pos + e + 2).unwrap_or(rest.len());
+        let tag = &rest[pos..end];
+        if let Some(part) = tag
+            .find("PartName=\"")
+            .and_then(|i| tag[i + 10..].find('"').map(|q| tag[i + 10..i + 10 + q].to_string()))
+        {
+            let name = part.trim_start_matches('/').to_string();
+            let exists = parts.iter().any(|p| p == &name);
+            let declared = new_ct.contains(&format!("PartName=\"{part}\""));
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            let has_default = new_ct.contains(&format!("Extension=\"{ext}\""));
+            if exists && !declared && !has_default {
+                add.push_str(tag);
+                added += 1;
+            }
+        }
+        rest = &rest[end.min(rest.len())..];
+    }
+
+    if added == 0 {
+        return Ok(Vec::new());
+    }
+    let merged = new_ct.replacen("</Types>", &format!("{add}</Types>"), 1);
+    crate::patch::append_entry(path, "[Content_Types].xml", merged.as_bytes())?;
+    Ok(vec![format!("[Content_Types] 补 {added} 条声明")])
+}
+
 /// 一张表只能有一条 comments / vmlDrawing 关系：迁移时可能和 umya 写的重复，
 /// 这里保留第一条（umya 写的），把多余的删掉，随后 prune 会清掉孤儿部件。
 pub fn dedupe_singleton_rels(path: &Path) -> Result<Vec<String>> {

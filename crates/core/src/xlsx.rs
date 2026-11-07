@@ -519,6 +519,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         if let Err(e) = crate::fixups::prune_orphans(path) {
             eprintln!("[save] 清理孤儿部件失败: {e:#}");
         }
+        if let Err(e) = crate::fixups::restore_sheet_refs(path, &restore_base) {
+            eprintln!("[save] 补回工作表引用元素失败: {e:#}");
+        }
+        if let Err(e) = crate::fixups::migrate_workbook_rels(path, &restore_base) {
+            eprintln!("[save] 迁移 workbook 关系失败: {e:#}");
+        }
+        if let Err(e) = crate::fixups::ensure_content_types(path, &restore_base) {
+            eprintln!("[save] 补齐内容类型失败: {e:#}");
+        }
     }
 
     if prof {
