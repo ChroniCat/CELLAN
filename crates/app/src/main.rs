@@ -149,6 +149,8 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// 房间断了（可以接任宿主）
+    room_lost: bool,
     /// 打印预览窗口
     print_preview: bool,
     /// 预览第几页（0 起）
@@ -296,6 +298,7 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             cf_mgr: false,
+            room_lost: false,
             print_preview: false,
             preview_page: 0,
             img_cache: std::collections::HashMap::new(),
@@ -5747,6 +5750,30 @@ impl SheetApp {
         }
     }
 
+    /// 宿主没了：以当前手里的数据接任，同事用新地址重新加入
+    fn promote_to_host(&mut self) {
+        // 只有客户端能接任；先彻底丢掉旧连接（含重连线程）
+        if self.join_addr.is_empty() {
+            return;
+        }
+        self.net = None;
+        self.peer = None;
+        self.remote.clear();
+        self.locks = sheetcore::sync::LockTable::default();
+        self.pending_edit = None;
+        self.my_lock = None;
+        self.room_lost = false;
+        self.start_host();
+        if self.net.is_some() {
+            self.status = format!(
+                "已接任宿主，同事请用这个地址重新加入：{}:{}",
+                local_ip_hint(),
+                net::DEFAULT_PORT
+            );
+            eprintln!("[net] {}{}", "接任宿主 ", self.status);
+        }
+    }
+
     fn start_host(&mut self) {
         let site = rand_site();
         let port = net::DEFAULT_PORT;
@@ -5978,8 +6005,12 @@ impl SheetApp {
                     }
                 }
                 net::NetEvent::Disconnected(msg) => {
-                    self.status = format!("{msg}，正在自动重连…");
+                    self.status = format!("{msg}，正在自动重连…（也可以点「接任宿主」继续协作）");
+                    self.room_lost = true;
                     eprintln!("[net] disconnected: {msg}");
+                    if std::env::var("SC_PROMOTE").is_ok() {
+                        self.promote_to_host();
+                    }
                 }
                 net::NetEvent::Denied(reason) => {
                     eprintln!("[net] denied: {reason}");
@@ -6152,6 +6183,15 @@ impl eframe::App for SheetApp {
                         self.join_shared();
                     }
                 } else {
+                    if self.room_lost && self.net.is_none() {
+                        if ui
+                            .button("接任宿主")
+                            .on_hover_text("宿主已离线：用我手里这份数据继续开着房间，同事用新地址重新加入")
+                            .clicked()
+                        {
+                            self.promote_to_host();
+                        }
+                    }
                     let online = ui.colored_label(
                         egui::Color32::from_rgb(46, 125, 50),
                         format!("协作中 · 在线 {} ▾", self.peers_list.len()),
