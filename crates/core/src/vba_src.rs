@@ -172,6 +172,7 @@ pub fn read_modules(data: &[u8]) -> Result<Vec<VbaModule>> {
             .or_else(|| cfb.stream_by_path(&stream_name))
             .or_else(|| cfb.stream_by_path(&format!("VBA/{disp}")))
             .or_else(|| cfb.stream_by_path(&disp));
+        let mut usable = true;
         let source = match raw {
             Some(bytes) => {
                 let off = offsets
@@ -196,12 +197,27 @@ pub fn read_modules(data: &[u8]) -> Result<Vec<VbaModule>> {
                 };
                 let text = decompress(slice);
                 let s = String::from_utf8_lossy(&text).to_string();
+                // 真实文件里如果压缩 token 解错，会出来一堆控制字符/重复串；
+                // 宁可说"解不出来"，也不要把乱码当源码显示出去
                 // 去掉压缩容器前面可能带的版本字节
-                s.trim_start_matches('\u{1}')
+                let clean = s
+                    .trim_start_matches(char::from(1))
                     .trim_start_matches('\u{feff}')
-                    .to_string()
+                    .to_string();
+                usable = looks_like_source(&clean);
+                clean
             }
-            None => String::new(),
+            None => {
+                usable = false;
+                String::new()
+            }
+        };
+        let (source, kind) = if usable {
+            (source, kind)
+        } else if source.is_empty() {
+            (String::new(), "无法解析".to_string())
+        } else {
+            (String::new(), "无法解析（压缩形式不支持）".to_string())
         };
         out.push(VbaModule {
             name: disp,
@@ -228,6 +244,39 @@ fn find_container(b: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+
+/// 源码是否像样：得有 Attribute VB_Name，且可打印字符占绝大多数
+fn looks_like_source(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if !s.contains("Attribute VB_Name") && !s.contains("Attribute VB_") {
+        // 有的模块（如 ThisWorkbook）也可能只有代码没属性行，用可打印比例兜底
+        if s.len() < 8 {
+            return false;
+        }
+    }
+    // 解错时典型症状：同一行反复出现，且没有任何过程定义
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut worst = 0usize;
+    for line in s.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        let c = counts.entry(line).or_insert(0);
+        *c += 1;
+        worst = worst.max(*c);
+    }
+    let has_proc = s.contains("Sub ") || s.contains("Function ") || s.contains("Dim ");
+    if worst >= 2 && !has_proc {
+        return false;
+    }
+    let total = s.chars().count();
+    // 可打印字符（含换行/制表）占比
+    let ok = s
+        .chars()
+        .filter(|c| c.is_whitespace() || !c.is_control())
+        .count();
+    (ok as f64) / (total as f64) > 0.97
 }
 
 /// 是否有宏（能读出模块即算有）
