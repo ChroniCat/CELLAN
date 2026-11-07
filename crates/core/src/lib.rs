@@ -8,6 +8,7 @@ pub mod arr;
 pub mod pic;
 pub mod table;
 pub mod data_tools;
+pub mod csv;
 pub mod dv;
 pub mod layout;
 pub mod merges;

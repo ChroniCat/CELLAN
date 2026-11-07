@@ -125,6 +125,7 @@ struct SheetApp {
     b3_done: bool,
     b1_done: bool,
     d3_done: bool,
+    b4_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -149,6 +150,8 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
+    last_import: Option<(std::path::PathBuf, u32, u32)>,
     /// 房间断了（可以接任宿主）
     room_lost: bool,
     /// 打印预览窗口
@@ -285,6 +288,7 @@ impl SheetApp {
             b3_done: false,
             b1_done: false,
             d3_done: false,
+            b4_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -298,6 +302,7 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             cf_mgr: false,
+            last_import: None,
             room_lost: false,
             print_preview: false,
             preview_page: 0,
@@ -591,6 +596,31 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：导入 CSV + 刷新
+    fn b4_probe(&mut self) {
+        if std::env::var("SC_B4").is_err() || self.open_rx.is_some() || self.b4_done {
+            return;
+        }
+        self.b4_done = true;
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        self.import_csv_from(std::path::Path::new("F:/Finance/work/import.csv"));
+        eprintln!("[B4] {}", self.status);
+        for r in 0..4 {
+            let row: Vec<String> = (0..3)
+                .map(|c| self.wb.sheet(self.sheet_idx).get(r, c).map(|x| x.value.display()).unwrap_or_default())
+                .collect();
+            eprintln!("[B4] 第{}行 {:?}", r + 1, row);
+        }
+        // 改文件再刷新
+        let _ = std::fs::write("F:/Finance/work/import.csv", "姓名,部门,金额
+赵六,财务,900
+");
+        self.refresh_import();
+        let v = self.wb.sheet(self.sheet_idx).get(1, 0).map(|x| x.value.display()).unwrap_or_default();
+        eprintln!("[B4] 刷新后 A2={v} 状态={}", self.status);
     }
 
     /// 无界面自检：图表改颜色/轴标题 → 写盘 → 重读
@@ -1723,6 +1753,80 @@ impl SheetApp {
         loaded
     }
 
+    /// 导入 CSV/TSV 到当前选区左上角
+    fn import_csv(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV / TSV", &["csv", "tsv", "txt"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_csv_from(&path);
+    }
+
+    fn import_csv_from(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(e) => {
+                self.status = format!("读不了 {}：{e}", path.display());
+                return;
+            }
+        };
+        let rows = sheetcore::csv::parse_auto(&text);
+        if rows.is_empty() {
+            self.status = "这个文件里没有可导入的内容".into();
+            return;
+        }
+        let (r0, c0) = self.sel;
+        let max_r = rows.len() as u32;
+        let max_c = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        for r in 0..max_r {
+            for c in 0..max_c {
+                keys.push((r0 + r, c0 + c));
+            }
+        }
+        let txn = self.txn_begin(&keys);
+        for (i, row) in rows.iter().enumerate() {
+            for (j, val) in row.iter().enumerate() {
+                let cell = if val.is_empty() {
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Empty,
+                        formula: None,
+                    }
+                } else {
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::parse_input(val),
+                        formula: None,
+                    }
+                };
+                self.wb.sheet_mut(self.sheet_idx).set(r0 + i as u32, c0 + j as u32, cell);
+            }
+        }
+        self.txn_end("导入 CSV", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.last_import = Some((path.to_path_buf(), r0, c0));
+        self.status = format!(
+            "已导入 {} 行 × {} 列（{}）",
+            rows.len(),
+            max_c,
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    /// 重新读一次上次导入的文件（文件变了就同步过来）
+    fn refresh_import(&mut self) {
+        match self.last_import.clone() {
+            Some((path, r, c)) => {
+                self.sel = (r, c);
+                self.sel_end = (r, c);
+                self.import_csv_from(&path);
+            }
+            None => self.status = "还没有导入过外部数据".into(),
+        }
+    }
+
     /// 把选区转成 Excel 表格对象（ListObject），首行当列名
     fn make_table(&mut self) {
         let (r1, c1, r2, c2) = self.sel_rect();
@@ -2761,6 +2865,15 @@ impl SheetApp {
                     self.run_dedup();
                     ui.close_menu();
                 }
+                if ui.button("导入 CSV/TSV…").clicked() {
+                    self.import_csv();
+                    ui.close_menu();
+                }
+                if ui.button("刷新导入").clicked() {
+                    self.refresh_import();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("分列…").clicked() {
                     self.open_data_dlg(1);
                     ui.close_menu();
@@ -6101,6 +6214,7 @@ impl eframe::App for SheetApp {
         self.b3_probe();
         self.b1_probe();
         self.d3_probe();
+        self.b4_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
