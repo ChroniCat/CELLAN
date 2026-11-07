@@ -111,6 +111,18 @@ fn compare_mode_splits_into_two_panes() {
 }
 
 #[test]
+fn pictures_are_drawn_at_anchor() {
+    let Some(dump) = dump_for("F:/Finance/work/pic.xlsx", &[], Duration::from_secs(30)) else {
+        return;
+    };
+    let pics: Vec<&str> = dump.lines().filter(|l| l.starts_with("pic ")).collect();
+    assert_eq!(pics.len(), 1, "图片没画出来：
+{dump}");
+    assert!(pics[0].contains("xl/media/"), "部件名丢了: {}", pics[0]);
+    assert!(pics[0].contains("at=(2,1,7,3)"), "位置不对: {}", pics[0]);
+}
+
+#[test]
 fn locked_cell_is_marked() {
     // 单机时锁不会出现；用 SC_LOCK 让宿主自己占一格，应能看到标记
     let Some(dump) = dump_for(

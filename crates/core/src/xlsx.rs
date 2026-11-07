@@ -82,6 +82,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
+    // 图片：drawing → pic → media
+    {
+        let pics = crate::pic::load(path);
+        for sheet in wb.sheets.iter_mut() {
+            if let Some(list) = pics.get(&sheet.name) {
+                sheet.pictures = list.clone();
+            }
+        }
+    }
     // 表格对象（ListObject）：独立的 tableN.xml 部件
     {
         let tables = crate::table::load(path);

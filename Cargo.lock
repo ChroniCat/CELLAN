@@ -103,6 +103,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "hex",
+ "image",
  "rfd",
  "serde_json",
  "sha2",
@@ -1372,6 +1373,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

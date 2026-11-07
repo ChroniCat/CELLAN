@@ -148,6 +148,8 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// 图片纹理缓存（部件名 → 纹理；None 表示解不出来）
+    img_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     /// 成员列表窗口
     members_open: bool,
     /// Ctrl+Shift+Enter 的下一次提交按数组公式处理
@@ -284,6 +286,7 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             cf_mgr: false,
+            img_cache: std::collections::HashMap::new(),
             members_open: false,
             cse_pending: false,
             circle_invalid: false,
@@ -1410,6 +1413,28 @@ impl SheetApp {
         } else {
             format!("已分成 {n} 列")
         };
+    }
+
+    /// 解一张图片并缓存纹理（解不出来就记 None，不反复重试）
+    fn img_texture(
+        &mut self,
+        key: &str,
+        part: &str,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(v) = self.img_cache.get(key) {
+            return v.clone();
+        }
+        let loaded = (|| {
+            let path = self.wb.path.as_ref()?;
+            let bytes = sheetcore::pic::read_part(path, part)?;
+            let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+            Some(ctx.load_texture(key.to_string(), color, egui::TextureOptions::LINEAR))
+        })();
+        self.img_cache.insert(key.to_string(), loaded.clone());
+        loaded
     }
 
     /// 把选区转成 Excel 表格对象（ListObject），首行当列名
@@ -4784,6 +4809,50 @@ impl SheetApp {
             }
             if dumping {
                 dump.push(format!("freeze rows={fy} cols={fx} body=({:.0},{:.0})", body_x, body_y));
+            }
+        }
+
+        // 图片（在单元格之上、图表之下）
+        let pics = self.wb.sheet(self.sheet_idx).pictures.clone();
+        for (i, pic) in pics.iter().enumerate() {
+            let (r1, c1, r2, c2) = pic.rect;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(px_of(c1), py_of(r1)),
+                egui::pos2(px_of(c2), py_of(r2)),
+            );
+            let clip = egui::Rect::from_min_max(
+                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + avail.x, origin.y + avail.y),
+            );
+            if !rect.intersects(clip) {
+                continue;
+            }
+            let key = format!("{}#{i}", pic.part);
+            let tex = self.img_texture(&key, &pic.part, ctx);
+            let p2 = painter.with_clip_rect(clip);
+            match tex {
+                Some(t) => {
+                    p2.image(
+                        t.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    if dumping {
+                        dump.push(format!("pic {} at=({},{},{},{})", pic.part, r1, c1, r2, c2));
+                    }
+                }
+                None => {
+                    p2.rect_stroke(
+                        rect,
+                        0.0,
+                        Stroke::new(1.0, Color32::from_rgb(180, 120, 120)),
+                        egui::StrokeKind::Inside,
+                    );
+                    if dumping {
+                        dump.push(format!("pic-broken {} at=({},{},{},{})", pic.part, r1, c1, r2, c2));
+                    }
+                }
             }
         }
 

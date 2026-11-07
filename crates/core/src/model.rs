@@ -95,6 +95,8 @@ pub struct Sheet {
     pub arrays: Vec<(CellRef, (u32, u32, u32, u32))>,
     /// Excel 表格对象（ListObject）
     pub tables: Vec<crate::table::Table>,
+    /// 图片（只记位置和部件路径；保存时原样不动）
+    pub pictures: Vec<crate::pic::Picture>,
     /// 合并单元格区域 (r1, c1, r2, c2)
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// 列宽（只有被设置过的列才有条目）
@@ -148,6 +150,7 @@ impl Sheet {
             spilled: std::collections::HashSet::new(),
             arrays: Vec::new(),
             tables: Vec::new(),
+            pictures: Vec::new(),
             merges: Vec::new(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
