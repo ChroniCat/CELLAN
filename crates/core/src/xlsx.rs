@@ -35,8 +35,34 @@ pub fn load(path: &Path) -> Result<Workbook> {
         styles: crate::style::StyleTable::new(),
     };
 
+    // 稀疏表旁路：声明区域大到离谱的表（有人在 A1048576/XFD1048576 留了格子），
+    // calamine 会按稠密网格分配内存，直接 OOM
+    let targets = crate::patch::sheet_targets(path).unwrap_or_default();
+    let shared = crate::sparse::shared_strings(path);
+
     for name in names {
         let mut sheet = Sheet::new(name.clone());
+
+        let sparse_part = targets.get(&name).filter(|p| {
+            crate::sparse::declared_area_of(path, p) > crate::sparse::DENSE_LIMIT
+        });
+        if let Some(part) = sparse_part {
+            match crate::sparse::read_sheet(path, part, &shared) {
+                Ok(cells) => {
+                    for ((r, c), cell) in cells {
+                        sheet.set(r, c, cell);
+                    }
+                    eprintln!(
+                        "[load] {} 声明区域过大，走稀疏读取（{} 格）",
+                        name,
+                        sheet.iter().count()
+                    );
+                    wb.sheets.push(sheet);
+                    continue;
+                }
+                Err(e) => eprintln!("[load] {} 稀疏读取失败，退回 calamine: {e:#}", name),
+            }
+        }
 
         if let Ok(range) = reader.worksheet_range(&name) {
             // calamine 的 cells() 给的是相对 Range 左上角的坐标，必须加上 start 偏移

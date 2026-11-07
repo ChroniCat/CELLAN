@@ -1314,7 +1314,10 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
             || n == "xl/workbook.xml"
             || n == "xl/styles.xml"
             || n == "xl/sharedStrings.xml"
-            || n.starts_with("xl/worksheets/sheet")
+            // 工作表可能放在非标准目录（例如 xl/stress/worksheets/sheet1.xml），
+            // 这类部件由 umya 重写，不能从旧文件搬回来，否则会留下重复的一整份
+            || n.contains("/worksheets/")
+            || n.starts_with("xl/worksheets/")
             || n.starts_with("docProps/")
             || n == "_rels/.rels"
             || n == "xl/_rels/workbook.xml.rels"

@@ -6,6 +6,7 @@ pub mod cfb;
 pub mod vba_src;
 pub mod arr;
 pub mod pic;
+pub mod sparse;
 pub mod table;
 pub mod data_tools;
 pub mod csv;

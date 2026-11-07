@@ -1,15 +1,29 @@
 fn main() {
-    let src = std::path::Path::new("F:/Finance/work/compat_in.xlsx");
-    let out = std::path::Path::new("F:/Finance/work/compat_out.xlsx");
-    let _ = std::fs::remove_file(out);
+    let args: Vec<String> = std::env::args().collect();
+    let src = std::path::PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "F:/Finance/work/compat_in.xlsx".into()));
+    let out = std::path::PathBuf::from(args.get(2).cloned().unwrap_or_else(|| "F:/Finance/work/compat_out.xlsx".into()));
+    let _ = std::fs::remove_file(&out);
+
     let t0 = std::time::Instant::now();
-    let wb = sheetcore::xlsx::load(src).expect("load");
-    println!("读入 {:.2}s 表数={}", t0.elapsed().as_secs_f64(), wb.sheets.len());
-    let s = &wb.sheets[0];
-    println!("合并={} 表对象={} 图片={} 图表={} 条件格式块={} 验证={} 公式格={}",
-        s.merges.len(), s.tables.len(), s.pictures.len(), s.charts.len(),
-        s.cf.blocks.len(), s.dv.len(), s.iter().filter(|(_,c)| c.formula.is_some()).count());
+    let wb = sheetcore::xlsx::load(&src).expect("load");
+    let load = t0.elapsed().as_secs_f64();
+
+    let mut cells = 0usize;
+    let mut formulas = 0usize;
+    for s in wb.sheets.iter() {
+        for (_, c) in s.iter() {
+            cells += 1;
+            if c.formula.is_some() { formulas += 1 }
+        }
+    }
+    println!("读入 {load:.2}s  表 {}  非空格 {cells}  公式 {formulas}", wb.sheets.len());
+    for s in wb.sheets.iter().take(8) {
+        println!("  {} 图表{} 图片{} 表对象{} 条件格式{} 验证{}",
+            s.name, s.charts.len(), s.pictures.len(), s.tables.len(), s.cf.blocks.len(), s.dv.len());
+    }
+
     let t1 = std::time::Instant::now();
-    sheetcore::xlsx::save(out, &wb).expect("save");
-    println!("保存 {:.2}s -> {}", t1.elapsed().as_secs_f64(), out.display());
+    sheetcore::xlsx::save(&out, &wb).expect("save");
+    println!("保存 {:.2}s -> {} ({} MB)", t1.elapsed().as_secs_f64(), out.display(),
+        std::fs::metadata(&out).map(|m| m.len()/1048576).unwrap_or(0));
 }
