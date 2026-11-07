@@ -82,6 +82,22 @@ pub fn load(path: &Path) -> Result<Workbook> {
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
+    // 数组公式：calamine 只给公式文本，t="array"/ref 得从原始 XML 拿
+    if let Ok(arrays) = std::fs::metadata(path) {
+        if arrays.len() > 0 {
+            let found = crate::arr::scan(path);
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(list) = found.get(&sheet.name) {
+                    for a in list {
+                        sheet.arrays.push((
+                            crate::model::CellRef::new(a.anchor.0, a.anchor.1),
+                            a.range,
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // 合并单元格（calamine 不提供，单独解析一次）
     if let Ok(layouts) = crate::merges::load_layout(path) {
         for sheet in wb.sheets.iter_mut() {
@@ -303,7 +319,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             }
             let coord = (cref.col + 1, cref.row + 1);
             if let Some(f) = &cell.formula {
-                ws.get_cell_mut(coord).set_formula(f.clone());
+                // OOXML 里 <f> 不带等号；内部统一带，写盘时去掉
+                let text = f.strip_prefix('=').unwrap_or(f);
+                ws.get_cell_mut(coord).set_formula(text.to_string());
                 continue;
             }
             match &cell.value {
@@ -422,7 +440,8 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     let any_freeze = wb.sheets.iter().any(|s| s.freeze_dirty);
     let any_filter = wb.sheets.iter().any(|s| s.filter_dirty);
     let any_page = wb.sheets.iter().any(|s| s.page_dirty);
-    if any_cf || any_dv || any_freeze || any_filter || any_page {
+    let any_arr = wb.sheets.iter().any(|s| !s.arrays.is_empty());
+    if any_cf || any_dv || any_freeze || any_filter || any_page || any_arr {
         if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter, any_page) {
             eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
@@ -441,6 +460,24 @@ fn apply_cf_patch(
     do_page: bool,
 ) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
+    // 数组公式：给锚点补 t="array" ref
+    let arrays_by_sheet: std::collections::HashMap<String, Vec<crate::arr::ArrayFml>> = wb
+        .sheets
+        .iter()
+        .filter(|s| !s.arrays.is_empty())
+        .map(|s| {
+            (
+                s.name.clone(),
+                s.arrays
+                    .iter()
+                    .map(|(a, r)| crate::arr::ArrayFml {
+                        range: *r,
+                        anchor: (a.row, a.col),
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
     // 先把每张表要写的块算出来
     let mut per_sheet: std::collections::HashMap<
         String,
@@ -454,6 +491,7 @@ fn apply_cf_patch(
             bool,
             crate::page::PageSetup,
             bool,
+            Vec<crate::arr::ArrayFml>,
         ),
     > = std::collections::HashMap::new();
     for sheet in wb.sheets.iter() {
@@ -472,6 +510,7 @@ fn apply_cf_patch(
                 || sheet.freeze_dirty
                 || sheet.filter_dirty
                 || sheet.page_dirty
+                || arrays_by_sheet.contains_key(&sheet.name)
             {
                 per_sheet.insert(
                     t.clone(),
@@ -485,6 +524,7 @@ fn apply_cf_patch(
                         sheet.filter_dirty,
                         sheet.page.clone(),
                         sheet.page_dirty,
+                        arrays_by_sheet.get(&sheet.name).cloned().unwrap_or_default(),
                     ),
                 );
             }
@@ -497,7 +537,7 @@ fn apply_cf_patch(
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     crate::patch::rewrite_zip(path, |name, buf| {
-        if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty, page, page_dirty)) =
+        if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty, page, page_dirty, arrs)) =
             per_sheet.get(name)
         {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
@@ -517,6 +557,9 @@ fn apply_cf_patch(
                 }
                 if do_page && *page_dirty {
                     x = crate::patch::set_page_xml(&x, page);
+                }
+                if !arrs.is_empty() {
+                    x = crate::arr::apply_xml(&x, arrs);
                 }
                 return x.into_bytes();
             }

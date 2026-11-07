@@ -122,6 +122,7 @@ struct SheetApp {
     b5_done: bool,
     b6_done: bool,
     c2_done: bool,
+    b3_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -148,6 +149,8 @@ struct SheetApp {
     cf_mgr: bool,
     /// 成员列表窗口
     members_open: bool,
+    /// Ctrl+Shift+Enter 的下一次提交按数组公式处理
+    cse_pending: bool,
     /// 圈释无效数据
     circle_invalid: bool,
     /// 无效格集合（(行,列)）
@@ -265,6 +268,7 @@ impl SheetApp {
             b5_done: false,
             b6_done: false,
             c2_done: false,
+            b3_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -279,6 +283,7 @@ impl SheetApp {
             data_dlg: None,
             cf_mgr: false,
             members_open: false,
+            cse_pending: false,
             circle_invalid: false,
             invalid_cells: std::collections::HashSet::new(),
             invalid_gen: u64::MAX,
@@ -564,6 +569,32 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：Ctrl+Shift+Enter 数组公式 → 存盘带 t="array"
+    fn b3_probe(&mut self) {
+        if std::env::var("SC_B3").is_err() || self.open_rx.is_some() || self.b3_done {
+            return;
+        }
+        self.b3_done = true;
+        self.sel = (1, 1);
+        self.sel_end = (1, 3);
+        self.begin_edit(Some("=SUM(A1:A3*C1:C3)".to_string()));
+        self.cse_pending = true;
+        self.commit_edit(None);
+        eprintln!("[B3] 状态={} 数组={:?}", self.status, self.wb.sheet(self.sheet_idx).arrays);
+        let out = std::path::PathBuf::from("F:/Finance/work/b3_out.xlsx");
+        let _ = std::fs::remove_file(&out);
+        match sheetcore::xlsx::save(&out, &self.wb) {
+            Ok(_) => {
+                let found = sheetcore::arr::scan(&out);
+                eprintln!("[B3] 存盘后数组={found:?}");
+                let b2 = self.wb.sheet(self.sheet_idx).get(1, 1).map(|c| c.value.display());
+                let c2 = self.wb.sheet(self.sheet_idx).get(1, 2).map(|c| c.value.display());
+                eprintln!("[B3] B2={b2:?} C2={c2:?}");
+            }
+            Err(e) => eprintln!("[B3] 保存失败 {e:#}"),
+        }
     }
 
     /// 无界面自检：成员列表内容（谁在线、在哪个格）
@@ -1917,6 +1948,28 @@ impl SheetApp {
             self.last_edit = Some(std::time::Instant::now());
             self.deps.update_cell(&self.wb, key);
             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
+            // Ctrl+Shift+Enter：按选区把这条公式登记成数组公式（保存时写 t="array" ref）
+            if self.cse_pending {
+                self.cse_pending = false;
+                let (r1, c1, r2, c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 1 && ed.buf.starts_with('=') {
+                    let sheet = self.wb.sheet_mut(self.sheet_idx);
+                    sheet.arrays.retain(|(a, _)| *a != sheetcore::model::CellRef::new(r1, c1));
+                    sheet.arrays.push((
+                        sheetcore::model::CellRef::new(r1, c1),
+                        (r1, c1, r2, c2),
+                    ));
+                    let rect = (r1, c1, r2, c2);
+                    self.status = format!(
+                        "已按数组公式写入 {}{}:{}{}",
+                        sheetcore::model::col_label(c1),
+                        r1 + 1,
+                        sheetcore::model::col_label(c2),
+                        r2 + 1
+                    );
+                    let _ = rect;
+                }
+            }
             if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
                 let op = peer.local_set(self.sheet_idx, r, c, &cell_clone);
                 net.broadcast_op(op);
@@ -2019,18 +2072,25 @@ impl SheetApp {
             return;
         }
         let (mut dr, mut dc) = (0i64, 0i64);
-        let (mut commit, mut start_edit, mut clear) = (false, false, false);
+        let (mut commit, mut start_edit, mut clear, mut cse) = (false, false, false, false);
         ctx.input(|i| {
             if i.key_pressed(Key::ArrowDown) { dr += 1 }
             if i.key_pressed(Key::ArrowUp) { dr -= 1 }
             if i.key_pressed(Key::ArrowRight) { dc += 1 }
             if i.key_pressed(Key::ArrowLeft) { dc -= 1 }
-            if i.key_pressed(Key::Enter) { commit = true; dr = 1 }
+            if i.key_pressed(Key::Enter) {
+                commit = true;
+                dr = 1;
+                cse = i.modifiers.command && i.modifiers.shift;
+            }
             if i.key_pressed(Key::Tab) { commit = true; dc = 1 }
             if i.key_pressed(Key::F2) { start_edit = true }
             if i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) { clear = true }
         });
 
+        if commit && cse {
+            self.cse_pending = true;
+        }
         if clear {
             let (r, c) = self.sel;
             if let Some(holder) = self.lock_holder(r, c) {
@@ -5455,6 +5515,7 @@ impl eframe::App for SheetApp {
         self.b5_probe();
         self.b6_probe(ctx);
         self.c2_probe();
+        self.b3_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
