@@ -46,6 +46,8 @@ pub struct Series {
     pub name_ref: String,
     pub cat_ref: String,
     pub val_ref: String,
+    /// 系列颜色（None = 用默认调色板）
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +68,13 @@ pub struct Chart {
     pub show_labels: bool,
     /// 引用被改写后要回写到 chart 部件里的 (旧, 新) 对
     pub ref_fixes: Vec<(String, String)>,
+    /// X 轴标题
+    pub axis_x: String,
+    /// Y 轴标题
+    pub axis_y: String,
+    /// Y 轴范围（None = 自动）
+    pub y_min: Option<f64>,
+    pub y_max: Option<f64>,
 }
 
 /// 解析某张表的图表
@@ -540,6 +549,10 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         drawing: String::new(),
         show_labels,
         ref_fixes: Vec::new(),
+        axis_x: String::new(),
+        axis_y: String::new(),
+        y_min: None,
+        y_max: None,
     })
 }
 

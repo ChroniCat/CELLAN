@@ -48,6 +48,7 @@ pub fn chart_from_selection(
             name_ref: format!("'{}'!${}${}", sheet_name, range_col, r1 + 1),
             cat_ref: format!("'{}'!${}${}:${}${}", sheet_name, cat_col, r1 + 2, cat_col, r2 + 1),
             val_ref: format!("'{}'!${}${}:${}${}", sheet_name, range_col, r1 + 2, range_col, r2 + 1),
+            color: None,
         });
     }
     crate::charts::Chart {
@@ -61,6 +62,10 @@ pub fn chart_from_selection(
         drawing: String::new(),
         show_labels: false,
         ref_fixes: Vec::new(),
+        axis_x: String::new(),
+        axis_y: String::new(),
+        y_min: None,
+        y_max: None,
     }
 }
 
@@ -71,7 +76,10 @@ const PALETTE: [&str; 8] = [
 fn series_body(ch: &crate::charts::Chart) -> String {
     let mut out = String::new();
     for (i, s) in ch.series.iter().enumerate() {
-        let color = PALETTE[i % PALETTE.len()];
+        let color: String = match s.color {
+            Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
+            None => PALETTE[i % PALETTE.len()].to_string(),
+        };
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
         out.push_str(&format!(
             "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
@@ -117,7 +125,10 @@ fn series_body(ch: &crate::charts::Chart) -> String {
 fn scatter_body(ch: &crate::charts::Chart) -> String {
     let mut out = String::new();
     for (i, s) in ch.series.iter().enumerate() {
-        let color = PALETTE[i % PALETTE.len()];
+        let color: String = match s.color {
+            Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
+            None => PALETTE[i % PALETTE.len()].to_string(),
+        };
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
         out.push_str(&format!(
             "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
@@ -152,6 +163,51 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
         out.push_str("</c:ser>");
     }
     out
+}
+
+
+/// 坐标轴标题与 Y 轴范围的补丁：在生成好的 XML 上做替换，避免改动大段字面量
+fn axis_fix(mut xml: String, ch: &crate::charts::Chart) -> String {
+    let title = |t: &str| -> String {
+        if t.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>",
+                esc(t)
+            )
+        }
+    };
+    // Y 轴：min/max
+    if ch.y_min.is_some() || ch.y_max.is_some() {
+        let mut sc = String::from("<c:scaling><c:orientation val=\"minMax\"/>");
+        if let Some(v) = ch.y_min {
+            sc.push_str(&format!("<c:max val=\"{}\" min=\"{}\"/>", ch.y_max.unwrap_or(0.0), v));
+        } else if let Some(v) = ch.y_max {
+            sc.push_str(&format!("<c:max val=\"{}\"/>", v));
+        }
+        sc.push_str("</c:scaling>");
+        // 只替换值轴那一段（图表里最后出现的 scaling）
+        if let Some(pos) = xml.rfind("<c:scaling><c:orientation val=\"minMax\"/></c:scaling>") {
+            xml.replace_range(
+                pos..pos + "<c:scaling><c:orientation val=\"minMax\"/></c:scaling>".len(),
+                &sc,
+            );
+        }
+    }
+    if !ch.axis_x.is_empty() {
+        xml = xml.replace(
+            "<c:axPos val=\"b\"/>",
+            &format!("<c:axPos val=\"b\"/>{}", title(&ch.axis_x)),
+        );
+    }
+    if !ch.axis_y.is_empty() {
+        xml = xml.replace(
+            "<c:axPos val=\"l\"/>",
+            &format!("<c:axPos val=\"l\"/>{}", title(&ch.axis_y)),
+        );
+    }
+    xml
 }
 
 fn chart_xml(ch: &crate::charts::Chart) -> String {
@@ -225,7 +281,7 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
         ));
     }
     out.push_str("<c:plotVisOnly val=\"1\"/></c:chart></c:chartSpace>");
-    out
+    axis_fix(out, ch)
 }
 
 fn drawing_xml(ch: &crate::charts::Chart, rid: &str) -> String {
