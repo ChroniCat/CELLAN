@@ -6203,15 +6203,86 @@ fn main() -> eframe::Result<()> {
             initial = Some(PathBuf::from(a));
         }
     }
-    let opts = eframe::NativeOptions {
+    // 渲染后端：--renderer=wgpu|glow|auto，默认 auto（先 wgpu，失败退 glow）
+    let mut want = std::env::var("SC_RENDERER").unwrap_or_else(|_| "auto".into());
+    for a in std::env::args().skip(1) {
+        if let Some(v) = a.strip_prefix("--renderer=") {
+            want = v.to_string();
+        }
+    }
+    let mut opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("Sheets Native (v1.6)"),
         ..Default::default()
     };
+    // 候选顺序：auto 先试 wgpu（无 GPU 的远程桌面也能走 WARP 软件适配器），不行再退 glow
+    let mut candidates: Vec<&str> = match want.as_str() {
+        "glow" => vec!["glow"],
+        "wgpu" => vec!["wgpu"],
+        _ => vec!["wgpu", "glow"],
+    };
+    // 没编进来的后端直接跳过
+    candidates.retain(|c| match *c {
+        "wgpu" => cfg!(feature = "wgpu"),
+        "glow" => cfg!(feature = "glow"),
+        _ => false,
+    });
+    if candidates.is_empty() {
+        candidates.push("glow");
+    }
+    eprintln!("[renderer] 候选 {:?}（请求 {want}）", candidates);
+    let mut attempt = 0usize;
+    let result = loop {
+        let which = candidates[attempt.min(candidates.len() - 1)];
+        #[cfg(feature = "wgpu")]
+        {
+            opts.renderer = if which == "wgpu" {
+                eframe::Renderer::Wgpu
+            } else {
+                eframe::Renderer::Glow
+            };
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = which;
+        }
+        eprintln!("[renderer] 尝试 {which}");
+        // 自检用：强制某个后端失败，验证回退路径
+        if std::env::var("SC_FORCE_FAIL").map(|v| v == which).unwrap_or(false) {
+            let e = eframe::Error::AppCreation(Box::new(std::io::Error::other("forced")));
+            eprintln!("[renderer] {which} 启动失败: forced");
+            if attempt + 1 >= candidates.len() {
+                break Err(e);
+            }
+            attempt += 1;
+            continue;
+        }
+        let r = run_app(&mut opts, initial.clone(), auto_host, auto_join.clone(), auto_pass.clone());
+        match r {
+            Ok(()) => break Ok(()),
+            Err(e) => {
+                eprintln!("[renderer] {which} 启动失败: {e}");
+                if attempt + 1 >= candidates.len() {
+                    break Err(e);
+                }
+                attempt += 1;
+            }
+        }
+    };
+    result
+}
+
+fn run_app(
+    opts: &mut eframe::NativeOptions,
+    initial: Option<PathBuf>,
+    auto_host: bool,
+    auto_join: Option<String>,
+    auto_pass: Option<String>,
+) -> Result<(), eframe::Error> {
     eframe::run_native(
         "sheets-native",
-        opts,
+        opts.clone(),
         {
             let initial = initial.clone();
             let auto_join = auto_join.clone();
