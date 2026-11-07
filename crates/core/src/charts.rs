@@ -361,6 +361,75 @@ fn local(name: &str) -> &str {
 }
 
 /// 解析 chart XML
+
+/// 从已生成的 chart XML 里补读：系列颜色、坐标轴标题、Y 轴 min/max
+fn post_fill(ch: &mut Chart, xml: &str) {
+    // 每个 <c:ser> 块里的第一个 srgbClr
+    let mut rest = xml;
+    let mut idx = 0usize;
+    while let Some(pos) = rest.find("<c:ser>") {
+        let chunk_rest = &rest[pos..];
+        let end = chunk_rest.find("</c:ser>").unwrap_or(chunk_rest.len());
+        let chunk = &chunk_rest[..end];
+        if let Some(cpos) = chunk.find("srgbClr val=\"") {
+            let v = &chunk[cpos + 13..];
+            if let Some(q) = v.find('"') {
+                let hex = &v[..q];
+                if hex.len() == 6 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&hex[0..2], 16),
+                        u8::from_str_radix(&hex[2..4], 16),
+                        u8::from_str_radix(&hex[4..6], 16),
+                    ) {
+                        if let Some(s) = ch.series.get_mut(idx) {
+                            s.color = Some([r, g, b]);
+                        }
+                    }
+                }
+            }
+        }
+        idx += 1;
+        rest = &chunk_rest[end.min(chunk_rest.len())..];
+    }
+
+    let axis_title = |xml: &str, tag: &str| -> String {
+        let Some(pos) = xml.find(&format!("<c:{tag}")) else {
+            return String::new();
+        };
+        let seg = &xml[pos..];
+        let end = seg.find(&format!("</c:{tag}>")).unwrap_or(seg.len());
+        let body = &seg[..end];
+        match body.find("<a:t>") {
+            Some(t) => {
+                let v = &body[t + 5..];
+                match v.find("</a:t>") {
+                    Some(q) => crate::model::xml_unescape(&v[..q]),
+                    None => String::new(),
+                }
+            }
+            None => String::new(),
+        }
+    };
+    ch.axis_x = axis_title(xml, "catAx");
+    ch.axis_y = axis_title(xml, "valAx");
+
+    // Y 轴 max/min：在 valAx 段里找 <c:max val=".." min=".."/>
+    if let Some(pos) = xml.find("<c:valAx") {
+        let body = &xml[pos..];
+        let end = body.find("</c:valAx>").unwrap_or(body.len());
+        let seg = &body[..end];
+        let num = |key: &str| -> Option<f64> {
+            let pat = format!("<c:{key} val=\"");
+            let i = seg.find(&pat)? + pat.len();
+            let rest = &seg[i..];
+            let q = rest.find('"')?;
+            rest[..q].parse().ok()
+        };
+        ch.y_max = num("max");
+        ch.y_min = num("min");
+    }
+}
+
 pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut kind: Option<ChartKind> = None;
     let mut stacked = false;
@@ -538,7 +607,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
             k = ChartKind::BarStacked;
         }
     }
-    Some(Chart {
+    let mut chart = Chart {
         kind: k,
         title,
         series,
@@ -553,7 +622,9 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         axis_y: String::new(),
         y_min: None,
         y_max: None,
-    })
+    };
+    post_fill(&mut chart, xml);
+    Some(chart)
 }
 
 impl Chart {

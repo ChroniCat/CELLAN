@@ -124,6 +124,7 @@ struct SheetApp {
     c2_done: bool,
     b3_done: bool,
     b1_done: bool,
+    d3_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -168,6 +169,10 @@ struct SheetApp {
     macro_win: Option<(Vec<sheetcore::vba_src::VbaModule>, usize)>,
     /// 新建图表草稿
     chart_edit: Option<sheetcore::charts::Chart>,
+    /// 图表数据区域文本（如 A1:C10）
+    chart_src: String,
+    /// 点了「重新读取」
+    chart_reload_src: bool,
     /// 图表管理窗口
     chart_mgr: bool,
     /// 透视表草稿
@@ -277,6 +282,7 @@ impl SheetApp {
             c2_done: false,
             b3_done: false,
             b1_done: false,
+            d3_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -300,6 +306,8 @@ impl SheetApp {
             invalid_gen: u64::MAX,
             macro_win: None,
             chart_edit: None,
+            chart_src: String::new(),
+            chart_reload_src: false,
             chart_mgr: false,
             pivot_edit: None,
             pivot_real: true,
@@ -580,6 +588,43 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：图表改颜色/轴标题 → 写盘 → 重读
+    fn d3_probe(&mut self) {
+        if std::env::var("SC_D3").is_err() || self.open_rx.is_some() || self.d3_done {
+            return;
+        }
+        self.d3_done = true;
+        let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+        let Some(mut ch) = charts.first().cloned() else {
+            eprintln!("[D3] 当前表没有图表");
+            return;
+        };
+        ch.axis_x = "季度".into();
+        ch.axis_y = "销量".into();
+        if let Some(s0) = ch.series.first_mut() {
+            s0.color = Some([0xE0, 0x4A, 0x2F]);
+        }
+        ch.y_min = Some(0.0);
+        ch.y_max = Some(600.0);
+        eprintln!("[D3] 改前 part={:?} 系列={}", ch.part, ch.series.len());
+        self.commit_chart(ch);
+        eprintln!("[D3] 提交状态={}", self.status);
+        if let Some(path) = self.wb.path.clone() {
+            match sheetcore::charts::load_charts(&path, &self.wb.sheet(self.sheet_idx).name) {
+                Ok(list) => {
+                    for c in list.iter().take(1) {
+                        eprintln!(
+                            "[D3] 重读 轴X={:?} 轴Y={:?} ymax={:?} 首色={:?}",
+                            c.axis_x, c.axis_y, c.y_max,
+                            c.series.first().and_then(|s| s.color)
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[D3] 重读失败 {e:#}"),
+            }
+        }
     }
 
     /// 无界面自检：选区转表格 + 结构化引用 + 存盘
@@ -3864,6 +3909,7 @@ impl SheetApp {
             "图表",
             sheetcore::charts::ChartKind::Column,
         );
+        self.chart_src = sheetcore::table::a1((r1, c1, r2, c2));
         self.chart_edit = Some(ch);
     }
 
@@ -3878,12 +3924,22 @@ impl SheetApp {
             self.status = format!("保存失败：{e}");
             return;
         }
-        match sheetcore::chart_write::insert_chart(&path, &name, &ch) {
+        // 已有部件就替换，否则新建（改图表不能变成又插一个）
+        let res = if ch.part.is_empty() {
+            sheetcore::chart_write::insert_chart(&path, &name, &ch)
+        } else {
+            sheetcore::chart_write::replace_chart(&path, &ch.part, &ch)
+        };
+        match res {
             Ok(()) => {
                 self.reload_charts();
-                self.status = format!("已插入{}（{} 个系列）", ch.kind.label(), ch.series.len());
+                self.status = if ch.part.is_empty() {
+                    format!("已插入{}（{} 个系列）", ch.kind.label(), ch.series.len())
+                } else {
+                    format!("已更新{}（{} 个系列）", ch.kind.label(), ch.series.len())
+                };
             }
-            Err(e) => self.status = format!("插入图表失败：{e}"),
+            Err(e) => self.status = format!("写图表失败：{e}"),
         }
     }
 
@@ -4319,10 +4375,61 @@ impl SheetApp {
                         });
                     ui.end_row();
 
+                    ui.label("X 轴标题");
+                    ui.text_edit_singleline(&mut ch.axis_x);
+                    ui.end_row();
+                    ui.label("Y 轴标题");
+                    ui.text_edit_singleline(&mut ch.axis_y);
+                    ui.end_row();
+                    ui.label("Y 轴范围");
+                    ui.horizontal(|ui| {
+                        let mut auto = ch.y_min.is_none() && ch.y_max.is_none();
+                        if ui.checkbox(&mut auto, "自动").changed() {
+                            if auto {
+                                ch.y_min = None;
+                                ch.y_max = None;
+                            } else {
+                                ch.y_min = Some(0.0);
+                                ch.y_max = Some(100.0);
+                            }
+                        }
+                        if !auto {
+                            let mut lo = ch.y_min.unwrap_or(0.0);
+                            let mut hi = ch.y_max.unwrap_or(0.0);
+                            ui.add(egui::DragValue::new(&mut lo).speed(1.0));
+                            ui.label("到");
+                            ui.add(egui::DragValue::new(&mut hi).speed(1.0));
+                            ch.y_min = Some(lo);
+                            ch.y_max = Some(hi);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("数据区域");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.chart_src);
+                        if ui.small_button("重新读取").clicked() {
+                            self.chart_reload_src = true;
+                        }
+                    });
+                    ui.end_row();
+
                     ui.label("系列");
                     ui.label(format!("{} 个", ch.series.len()));
                     ui.end_row();
                 });
+                if !ch.series.is_empty() {
+                    ui.separator();
+                    ui.label("系列颜色");
+                    for srs in ch.series.iter_mut() {
+                        ui.horizontal(|ui| {
+                            let mut c = srs.color.unwrap_or([0x4F, 0x81, 0xBD]);
+                            if ui.color_edit_button_srgb(&mut c).changed() {
+                                srs.color = Some(c);
+                            }
+                            ui.label(&srs.name);
+                        });
+                    }
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("插入").clicked() {
@@ -4333,6 +4440,36 @@ impl SheetApp {
                     }
                 });
             });
+        if self.chart_reload_src {
+            self.chart_reload_src = false;
+            if let Some(rect) = sheetcore::table::parse_a1(&self.chart_src) {
+                let name = self.wb.sheet(self.sheet_idx).name.clone();
+                let mut fresh = sheetcore::chart_write::chart_from_selection(
+                    self.wb.sheet(self.sheet_idx),
+                    &name,
+                    rect,
+                    &ch.title,
+                    ch.kind,
+                );
+                fresh.anchor = ch.anchor;
+                fresh.legend = ch.legend;
+                fresh.legend_pos = ch.legend_pos.clone();
+                fresh.show_labels = ch.show_labels;
+                fresh.axis_x = ch.axis_x.clone();
+                fresh.axis_y = ch.axis_y.clone();
+                fresh.y_min = ch.y_min;
+                fresh.y_max = ch.y_max;
+                fresh.part = ch.part.clone();
+                fresh.drawing = ch.drawing.clone();
+                fresh.series.iter_mut().enumerate().for_each(|(i, s2)| {
+                    s2.color = ch.series.get(i).and_then(|x| x.color);
+                });
+                ch = fresh;
+                self.status = format!("已按 {} 重新读取数据", self.chart_src);
+            } else {
+                self.status = "数据区域格式不对，写 A1:C10 这样".into();
+            }
+        }
         if ok {
             self.commit_chart(ch);
         } else if !cancel && open {
@@ -5932,6 +6069,7 @@ impl eframe::App for SheetApp {
         self.c2_probe();
         self.b3_probe();
         self.b1_probe();
+        self.d3_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);

@@ -210,6 +210,11 @@ fn axis_fix(mut xml: String, ch: &crate::charts::Chart) -> String {
     xml
 }
 
+/// 测试用：直接拿到整段 chart XML
+pub fn chart_xml_for_test(ch: &crate::charts::Chart) -> String {
+    chart_xml(ch)
+}
+
 fn chart_xml(ch: &crate::charts::Chart) -> String {
     use crate::charts::ChartKind::*;
     let mut out = String::from(
