@@ -26,6 +26,8 @@ pub struct Shift {
     pub target_sheet: String,
     /// 公式所在的工作表名
     pub own_sheet: String,
+    /// 平移模式（复制粘贴用）：(行偏移, 列偏移)，设了就忽略 at/n/delete
+    pub translate: Option<(i64, i64)>,
 }
 
 impl Shift {
@@ -154,9 +156,18 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                     if sh.axis != Axis::Col || !shift_applies(sh, qualified_sheet) {
                         return None;
                     }
-                    let text = match sh.map_range(c1, c2) {
-                        Some((x, y)) => format!("{}:{}", col_label(x), col_label(y)),
-                        None => "#REF!".to_string(),
+                    let text = if sh.translate.is_some() {
+                        match (apply(sh, 0, c1), apply(sh, 0, c2)) {
+                            ((Some(_), Some(x)), (Some(_), Some(y))) => {
+                                format!("{}:{}", col_label(x), col_label(y))
+                            }
+                            _ => "#REF!".to_string(),
+                        }
+                    } else {
+                        match sh.map_range(c1, c2) {
+                            Some((x, y)) => format!("{}:{}", col_label(x), col_label(y)),
+                            None => "#REF!".to_string(),
+                        }
                     };
                     return Some(Ref { end: j, text });
                 }
@@ -208,20 +219,23 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                 if !shift_applies(sh, qualified_sheet) {
                     return None;
                 }
-                let (nr1, nr2) = match sh.axis {
-                    Axis::Row => match sh.map_range(r1, r2) {
-                        Some((x, y)) => (Some(x), Some(y)),
-                        None => (None, None),
-                    },
-                    Axis::Col => (Some(r1), Some(r2)),
+                let none2 = (None::<u32>, None::<u32>);
+                let (p1, p2) = if sh.translate.is_some() {
+                    (apply(sh, r1, c1), apply(sh, r2, c2))
+                } else if sh.axis == Axis::Row {
+                    // 已经 map 过了，不能再走 apply（否则平移两次）
+                    match sh.map_range(r1, r2) {
+                        Some((x, y)) => ((Some(x), Some(c1)), (Some(y), Some(c2))),
+                        None => (none2, none2),
+                    }
+                } else {
+                    match sh.map_range(c1, c2) {
+                        Some((x, y)) => ((Some(r1), Some(x)), (Some(r2), Some(y))),
+                        None => (none2, none2),
+                    }
                 };
-                let (nc1, nc2) = match sh.axis {
-                    Axis::Col => match sh.map_range(c1, c2) {
-                        Some((x, y)) => (Some(x), Some(y)),
-                        None => (None, None),
-                    },
-                    Axis::Row => (Some(c1), Some(c2)),
-                };
+                let (nr1, nc1) = p1;
+                let (nr2, nc2) = p2;
                 let text = match (nr1, nc1, nr2, nc2) {
                     (Some(a), Some(b1), Some(c), Some(d)) => format!(
                         "{}{}{}:{}{}{}",
@@ -243,10 +257,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
     if !shift_applies(sh, qualified_sheet) {
         return None;
     }
-    let (nr, nc) = match sh.axis {
-        Axis::Row => (sh.map(r1), Some(c1)),
-        Axis::Col => (Some(r1), sh.map(c1)),
-    };
+    let (nr, nc) = apply(sh, r1, c1);
     let text = match (nr, nc) {
         (Some(r), Some(c)) => format!(
             "{}{}{}{}",
@@ -260,11 +271,41 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
     Some(Ref { end: i, text })
 }
 
+/// 平移或结构位移的统一出口
+fn apply(sh: &Shift, r: u32, c: u32) -> (Option<u32>, Option<u32>) {
+    if let Some((dr, dc)) = sh.translate {
+        let nr = r as i64 + dr;
+        let nc = c as i64 + dc;
+        if nr < 0 || nc < 0 || nr >= 1_048_576 || nc >= 16_384 {
+            return (None, None);
+        }
+        return (Some(nr as u32), Some(nc as u32));
+    }
+    match sh.axis {
+        Axis::Row => (sh.map(r), Some(c)),
+        Axis::Col => (Some(r), sh.map(c)),
+    }
+}
+
 fn shift_applies(sh: &Shift, qualified: Option<&str>) -> bool {
     match qualified {
         Some(s) => s.eq_ignore_ascii_case(&sh.target_sheet),
         None => sh.own_sheet.eq_ignore_ascii_case(&sh.target_sheet),
     }
+}
+
+/// 复制粘贴时按 (dr, dc) 平移公式里的相对引用（绝对引用也平移，和处理插删一致）
+pub fn translate(formula: &str, dr: i64, dc: i64, sheet: &str) -> String {
+    let sh = Shift {
+        axis: Axis::Row,
+        at: 0,
+        n: 0,
+        delete: false,
+        target_sheet: sheet.to_string(),
+        own_sheet: sheet.to_string(),
+        translate: Some((dr, dc)),
+    };
+    rewrite(formula, &sh)
 }
 
 /// 改写一条公式（不带前导 `=` 也可以）
@@ -381,6 +422,7 @@ mod tests {
             delete: false,
             target_sheet: "S".into(),
             own_sheet: "S".into(),
+            translate: None,
         }
     }
     fn delete_row(at: u32, n: u32) -> Shift {
@@ -448,6 +490,7 @@ mod tests {
             delete: false,
             target_sheet: "数据".into(),
             own_sheet: "汇总".into(),
+            translate: None,
         };
         // 指着被改的表 → 跟着动
         assert_eq!(rewrite("=数据!A1", &sh), "=数据!A2");

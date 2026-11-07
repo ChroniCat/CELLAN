@@ -1266,6 +1266,7 @@ pub fn shift_pivot_caches(
                             delete: *delete,
                             target_sheet: sheet.clone(),
                             own_sheet: sheet.clone(),
+                            translate: None,
                         };
                         let (nr1, nc1, nr2, nc2) = if *axis == 0 {
                             match sh.map_range(r1, r2) {

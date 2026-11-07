@@ -401,6 +401,7 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
             } else {
                 sheet.name.clone()
             },
+            translate: None,
         };
         sheet.rewrite_references(&shift);
         // 图表系列引用
@@ -432,6 +433,7 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
             delete,
             target_sheet: name.clone(),
             own_sheet: own,
+            translate: None,
         };
         let nt = crate::refs::rewrite(text, &sh);
         if nt != *text {
@@ -448,6 +450,7 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         delete,
         target_sheet: name.clone(),
         own_sheet: name.clone(),
+            translate: None,
     };
     for (idx, spec, _, _, _) in wb.pivots_pending.iter_mut() {
         if *idx != sheet_idx {
