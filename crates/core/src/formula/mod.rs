@@ -1995,6 +1995,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
 
 pub fn recalc_all(wb: &mut Workbook) {
     let phase = std::env::var("SC_PHASE").is_ok();
+    let t_all = std::time::Instant::now();
     let mut t_phase = std::time::Instant::now();
     macro_rules! mark {
         ($name:expr) => {
@@ -2013,7 +2014,27 @@ pub fn recalc_all(wb: &mut Workbook) {
     }
 
     mark!("清溢出");
-    for _pass in 0..2 {
+    // 遍数：默认一遍。cell_value 会按依赖递归求值，顺序问题由 memo 解决；
+    // 只有含易变函数（NOW/TODAY/RAND/OFFSET/INDIRECT…）或第一遍出错的表才跑第二遍。
+    let volatile = wb.sheets.iter().any(|sh| {
+        sh.iter().any(|(_, c)| {
+            c.formula
+                .as_ref()
+                .map(|f| {
+                    const VOL: [&str; 8] = [
+                        "NOW(", "TODAY(", "RAND(", "RANDBETWEEN(", "OFFSET(", "INDIRECT(", "CELL(",
+                        "INFO(",
+                    ];
+                    let up = f.to_ascii_uppercase();
+                    VOL.iter().any(|v| up.contains(v))
+                })
+                .unwrap_or(false)
+        })
+    });
+    let mut passes = if volatile || std::env::var("SC_TWOPASS").is_ok() { 2 } else { 1 };
+    let mut pass_done = 0usize;
+    for _pass in 0..passes {
+        pass_done += 1;
         let formulas: Vec<(usize, u32, u32)> = wb
             .sheets
             .iter()
@@ -2068,10 +2089,30 @@ pub fn recalc_all(wb: &mut Workbook) {
         }
 
         mark!("求值");
+        // 第一遍就出现错误值（可能是求值顺序导致的），补一遍
+        if _pass == 0 && passes == 1 && results.iter().any(|r| matches!(r.3, FValue::Error(_))) {
+            passes = 2;
+        }
         write_back(wb, results);
         mark!("写回");
+        if std::env::var("SC_CHECKSUM").is_ok() {
+            let mut sum = 0.0f64;
+            let mut cnt = 0usize;
+            for sh in wb.sheets.iter() {
+                for (_, cell) in sh.iter() {
+                    if let crate::model::Value::Number(n) = cell.value {
+                        sum += n;
+                        cnt += 1;
+                    }
+                }
+            }
+            eprintln!("[checksum] pass {} 数值格 {} 合计 {:.6}", _pass + 1, cnt, sum);
+        }
     }
     mark!("结束");
+    if phase {
+        eprintln!("[recalc] 总耗时 {:.2}s（{} 遍）", t_all.elapsed().as_secs_f64(), pass_done);
+    }
 }
 
 /// 求单个单元格的值（测试与 UI 用）
