@@ -69,6 +69,50 @@ pub enum CfKind {
     IconSet { set: String, reverse: bool, thresholds: Vec<Option<f64>>, show_value: bool },
 }
 
+impl CfKind {
+    /// 管理窗口里显示的一句话说明
+    pub fn describe(&self) -> String {
+        match self {
+            CfKind::CellIs { op, a, b, .. } => {
+                let name = match op {
+                    CfOp::Greater => "大于",
+                    CfOp::Less => "小于",
+                    CfOp::GreaterEq => "大于等于",
+                    CfOp::LessEq => "小于等于",
+                    CfOp::Equal => "等于",
+                    CfOp::NotEqual => "不等于",
+                    CfOp::Between => "介于",
+                    CfOp::NotBetween => "不介于",
+                };
+                if matches!(op, CfOp::Between | CfOp::NotBetween) {
+                    format!("{name} {a} 和 {b}")
+                } else {
+                    format!("{name} {a}")
+                }
+            }
+            CfKind::Text { contains, .. } => format!("文本包含\"{contains}\""),
+            CfKind::Dup { unique, .. } => {
+                if *unique { "唯一值".into() } else { "重复值".into() }
+            }
+            CfKind::Top { top, n, percent, .. } => {
+                let dir = if *top { "前" } else { "后" };
+                if *percent {
+                    format!("{dir} {n}%")
+                } else {
+                    format!("{dir} {n} 项")
+                }
+            }
+            CfKind::Avg { above, .. } => {
+                if *above { "高于平均值".into() } else { "低于平均值".into() }
+            }
+            CfKind::Expr { formula, .. } => format!("公式 {formula}"),
+            CfKind::Scale { .. } => "色阶".into(),
+            CfKind::Bar { .. } => "数据条".into(),
+            CfKind::IconSet { set, .. } => format!("图标集 {set}"),
+        }
+    }
+}
+
 /// 图标集按「形状 + 级数」归类，渲染时据此画
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconStyle {

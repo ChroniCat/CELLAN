@@ -119,6 +119,8 @@ struct SheetApp {
     struct_done: bool,
     macro_done: bool,
     a_done: bool,
+    b5_done: bool,
+    b6_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -141,6 +143,14 @@ struct SheetApp {
     fill_drag: Option<(usize, u32, u32)>,
     /// 数据工具对话框：0=排序 1=分列
     data_dlg: Option<DataDlg>,
+    /// 条件格式管理窗口
+    cf_mgr: bool,
+    /// 圈释无效数据
+    circle_invalid: bool,
+    /// 无效格集合（(行,列)）
+    invalid_cells: std::collections::HashSet<(u32, u32)>,
+    /// 无效集合是按哪一版算的
+    invalid_gen: u64,
     /// 宏窗口：模块列表 + 选中项
     macro_win: Option<(Vec<sheetcore::vba_src::VbaModule>, usize)>,
     /// 新建图表草稿
@@ -249,6 +259,8 @@ impl SheetApp {
             struct_done: false,
             macro_done: false,
             a_done: false,
+            b5_done: false,
+            b6_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -261,6 +273,10 @@ impl SheetApp {
             rename_sheet: None,
             fill_drag: None,
             data_dlg: None,
+            cf_mgr: false,
+            circle_invalid: false,
+            invalid_cells: std::collections::HashSet::new(),
+            invalid_gen: u64::MAX,
             macro_win: None,
             chart_edit: None,
             chart_mgr: false,
@@ -541,6 +557,74 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：圈释无效 + 输入提示
+    fn b6_probe(&mut self, ctx: &egui::Context) {
+        if std::env::var("SC_B6").is_err() || self.open_rx.is_some() || self.b6_done {
+            return;
+        }
+        self.b6_done = true;
+        self.circle_invalid = true;
+        self.invalid_gen = u64::MAX;
+        self.compute_invalid();
+        let mut cells: Vec<(u32, u32)> = self.invalid_cells.iter().copied().collect();
+        cells.sort();
+        eprintln!("[B6] 无效格 {:?}", cells);
+        // 选中 A2 看提示
+        self.sel = (1, 0);
+        self.sel_end = (1, 0);
+        let dv = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, 1, 0);
+        eprintln!(
+            "[B6] A2 提示 = {:?} / {:?}",
+            dv.as_ref().map(|d| d.prompt_title.clone()),
+            dv.as_ref().map(|d| d.prompt_msg.clone())
+        );
+        let _ = ctx;
+    }
+
+    /// 无界面自检：条件格式管理器（描述文本 + 删规则 + 调顺序）
+    fn b5_probe(&mut self) {
+        if std::env::var("SC_B5").is_err() || self.open_rx.is_some() || self.b5_done {
+            return;
+        }
+        self.b5_done = true;
+        let sheet = self.wb.sheet(self.sheet_idx);
+        let before: Vec<String> = sheet
+            .cf
+            .blocks
+            .iter()
+            .flat_map(|b| b.rules.iter().map(|r| r.kind.describe()))
+            .collect();
+        eprintln!("[B5] 原有 {} 条规则: {:?}", before.len(), before);
+        // 删第一条规则
+        {
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            if let Some(b) = sheet.cf.blocks.first_mut() {
+                if !b.rules.is_empty() {
+                    b.rules.remove(0);
+                }
+            }
+            sheet.cf.blocks.retain(|b| !b.rules.is_empty());
+            sheet.cf_dirty = true;
+        }
+        let after: Vec<String> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .cf
+            .blocks
+            .iter()
+            .flat_map(|b| b.rules.iter().map(|r| r.kind.describe()))
+            .collect();
+        eprintln!("[B5] 删除后 {} 条: {:?}", after.len(), after);
+        // 调顺序
+        let n = self.wb.sheet(self.sheet_idx).cf.blocks.len();
+        if n >= 2 {
+            let first_range = self.wb.sheet(self.sheet_idx).cf.blocks[0].ranges.clone();
+            self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(0, 1);
+            let new_first = self.wb.sheet(self.sheet_idx).cf.blocks[0].ranges.clone();
+            eprintln!("[B5] 交换后首块区域 {:?} -> 原第二块 {:?}", first_range, new_first);
+        }
     }
 
     /// 无界面自检：A 组（剪贴板/查找替换/工作表）
@@ -1243,6 +1327,153 @@ impl SheetApp {
         } else {
             format!("已分成 {n} 列")
         };
+    }
+
+    /// 算出当前表里不符合数据验证的格子（上限 5 万格，避免卡死）
+    fn compute_invalid(&mut self) {
+        if self.invalid_gen == self.doc_gen {
+            return;
+        }
+        self.invalid_gen = self.doc_gen;
+        self.invalid_cells.clear();
+        let si = self.sheet_idx;
+        let dv_list = self.wb.sheet(si).dv.clone();
+        if dv_list.is_empty() {
+            return;
+        }
+        let mut budget = 50_000usize;
+        let mut calc = sheetcore::formula::Calc::new(&self.wb);
+        for dv in dv_list.iter() {
+            for (r1, c1, r2, c2) in dv.ranges.iter().copied() {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        if budget == 0 {
+                            return;
+                        }
+                        budget -= 1;
+                        let sheet = self.wb.sheet(si);
+                        let Some(cell) = sheet.get(r, c) else { continue };
+                        if matches!(cell.value, sheetcore::model::Value::Empty) {
+                            continue;
+                        }
+                        let ok = sheetcore::dv::validate(dv, &cell.value, sheet, r, c, |f, rr, cc| {
+                            let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+                            match sheetcore::formula::parse(&shifted) {
+                                Ok(node) => matches!(
+                                    calc.eval_node(&node, si),
+                                    sheetcore::formula::FValue::Bool(true)
+                                ),
+                                Err(_) => true,
+                            }
+                        });
+                        if !ok {
+                            self.invalid_cells.insert((r, c));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 条件格式管理器：看规则、调顺序、删除、定位
+    fn cf_manager(&mut self, ctx: &egui::Context) {
+        if !self.cf_mgr {
+            return;
+        }
+        let mut open = true;
+        let mut del: Option<(usize, usize)> = None;
+        let mut up: Option<usize> = None;
+        let mut down: Option<usize> = None;
+        let mut goto: Option<(u32, u32, u32, u32)> = None;
+        let blocks = self.wb.sheet(self.sheet_idx).cf.blocks.clone();
+        egui::Window::new("条件格式管理")
+            .open(&mut open)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                if blocks.is_empty() {
+                    ui.label("这张表还没有条件格式规则");
+                }
+                for (bi, blk) in blocks.iter().enumerate() {
+                    let range_text = blk
+                        .ranges
+                        .iter()
+                        .map(|(r1, c1, r2, c2)| {
+                            format!(
+                                "{}{}:{}{}",
+                                sheetcore::model::col_label(*c1),
+                                r1 + 1,
+                                sheetcore::model::col_label(*c2),
+                                r2 + 1
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("区域 {range_text}")).strong());
+                        if ui.small_button("定位").clicked() {
+                            if let Some(r) = blk.ranges.first() {
+                                goto = Some(*r);
+                            }
+                        }
+                        if ui.small_button("上移").clicked() {
+                            up = Some(bi);
+                        }
+                        if ui.small_button("下移").clicked() {
+                            down = Some(bi);
+                        }
+                    });
+                    for (ri, rule) in blk.rules.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("  · {}", rule.kind.describe()));
+                            if rule.stop {
+                                ui.label(egui::RichText::new("(命中即停)").weak());
+                            }
+                            if ui.small_button("删除").clicked() {
+                                del = Some((bi, ri));
+                            }
+                        });
+                    }
+                    ui.separator();
+                }
+            });
+        if let Some((bi, ri)) = del {
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            if let Some(blk) = sheet.cf.blocks.get_mut(bi) {
+                if ri < blk.rules.len() {
+                    blk.rules.remove(ri);
+                }
+                if blk.rules.is_empty() {
+                    sheet.cf.blocks.remove(bi);
+                }
+            }
+            sheet.cf_dirty = true;
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = "已删除一条条件格式规则".into();
+        }
+        if let Some(bi) = up {
+            if bi > 0 {
+                self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi - 1);
+                self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = "规则已上移（优先级更高）".into();
+            }
+        }
+        if let Some(bi) = down {
+            let n = self.wb.sheet(self.sheet_idx).cf.blocks.len();
+            if bi + 1 < n {
+                self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi + 1);
+                self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = "规则已下移".into();
+            }
+        }
+        if let Some((r1, c1, _, _)) = goto {
+            self.sel = (r1, c1);
+            self.sel_end = (r1, c1);
+            self.ensure_visible();
+        }
+        self.cf_mgr = open;
     }
 
     fn data_dialog(&mut self, ctx: &egui::Context) {
@@ -2320,6 +2551,19 @@ impl SheetApp {
     /// 数据验证菜单
     fn toolbar_dv(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("数据验证", |ui| {
+            if ui.button("圈释无效数据").clicked() {
+                self.circle_invalid = true;
+                self.invalid_gen = u64::MAX;
+                self.compute_invalid();
+                self.status = format!("已圈出 {} 个不合规的格子", self.invalid_cells.len());
+                ui.close_menu();
+            }
+            if ui.button("清除圈释").clicked() {
+                self.circle_invalid = false;
+                self.invalid_cells.clear();
+                ui.close_menu();
+            }
+            ui.separator();
             ui.set_min_width(200.0);
             if ui.button("设置…").clicked() {
                 let (r1, c1, r2, c2) = self.sel_rect();
@@ -4401,6 +4645,76 @@ impl SheetApp {
             );
         }
 
+        // 圈释无效数据：红椭圆
+        if self.circle_invalid && !self.invalid_cells.is_empty() {
+            let cells: Vec<(u32, u32)> = self
+                .invalid_cells
+                .iter()
+                .copied()
+                .filter(|(r, c)| {
+                    let x = gx(*c);
+                    let y = gy(*r);
+                    x + cols.size(*c) > origin.x + HEAD_W
+                        && y + rows.size(*r) > origin.y + HEAD_H
+                        && x < origin.x + avail.x
+                        && y < origin.y + avail.y
+                })
+                .collect();
+            for (r, c) in cells {
+                let rect = Rect::from_min_size(
+                    egui::pos2(gx(c) + 1.0, gy(r) + 1.0),
+                    Vec2::new(cols.size(c) - 2.0, rows.size(r) - 2.0),
+                );
+                let center = rect.center();
+                let radius = Vec2::new(rect.width() * 0.52, rect.height() * 0.46);
+                let mut pts = Vec::new();
+                for i in 0..=24 {
+                    let a = i as f32 / 24.0 * std::f32::consts::TAU;
+                    pts.push(egui::pos2(
+                        center.x + radius.x * a.cos(),
+                        center.y + radius.y * a.sin(),
+                    ));
+                }
+                painter.add(egui::Shape::line(
+                    pts,
+                    Stroke::new(1.5, Color32::from_rgb(214, 48, 49)),
+                ));
+            }
+        }
+
+        // 输入提示：选中带提示的验证格时，弹一个黄框
+        if let Some(dv) = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, self.sel.0, self.sel.1) {
+            if !dv.prompt_msg.is_empty() || !dv.prompt_title.is_empty() {
+                let text = if dv.prompt_title.is_empty() {
+                    dv.prompt_msg.clone()
+                } else if dv.prompt_msg.is_empty() {
+                    dv.prompt_title.clone()
+                } else {
+                    format!("{}\n{}", dv.prompt_title, dv.prompt_msg)
+                };
+                let w = 190.0f32.min(text.chars().count() as f32 * 12.0 + 16.0).max(80.0);
+                let top = sy + sh + 4.0;
+                let box_rect = Rect::from_min_size(egui::pos2(sx, top), Vec2::new(w, 34.0));
+                painter.rect_filled(box_rect, 3.0, Color32::from_rgb(255, 249, 196));
+                painter.rect_stroke(
+                    box_rect,
+                    3.0,
+                    Stroke::new(1.0, Color32::from_rgb(214, 190, 90)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    box_rect.min + Vec2::new(6.0, 5.0),
+                    Align2::LEFT_TOP,
+                    text,
+                    FontId::proportional(11.0),
+                    Color32::from_rgb(80, 70, 20),
+                );
+                if dumping {
+                    dump.push(format!("dv-prompt at ({},{})", self.sel.0, self.sel.1));
+                }
+            }
+        }
+
         // 填充柄：选区右下角的小方块，拖到底就填充
         {
             let hx = sx + sw;
@@ -5036,12 +5350,18 @@ impl eframe::App for SheetApp {
         self.struct_probe();
         self.macro_probe();
         self.a_group_probe(ctx);
+        self.b5_probe();
+        self.b6_probe(ctx);
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
         self.macro_window(ctx);
         self.find_dialog(ctx);
         self.data_dialog(ctx);
+        self.cf_manager(ctx);
+        if self.circle_invalid {
+            self.compute_invalid();
+        }
         self.rename_dialog(ctx);
         // 缩放：Ctrl+滚轮
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
