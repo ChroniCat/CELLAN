@@ -393,6 +393,8 @@ impl SheetApp {
                 }
                 OpenMsg::Recalced(wb, deps) => {
                     self.wb_epoch += 1;
+                    // 整份替换后条件格式统计必须重算，否则色阶/图标/数据条全空
+                    self.cf_stats_gen = u64::MAX;
                     if self.doc_gen != 0 {
                         // 期间用户改过：保留用户结果，等空闲再补一次全量
                         self.needs_full = true;
