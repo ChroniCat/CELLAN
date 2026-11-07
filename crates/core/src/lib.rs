@@ -4,6 +4,7 @@ pub mod chart_write;
 pub mod charts;
 pub mod cfb;
 pub mod vba_src;
+pub mod data_tools;
 pub mod dv;
 pub mod layout;
 pub mod merges;

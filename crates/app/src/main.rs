@@ -48,6 +48,15 @@ struct Clip {
     cut: bool,
 }
 
+#[derive(Clone)]
+struct DataDlg {
+    tab: u8,
+    /// (列, 是否升序, 是否启用)
+    keys: Vec<(u32, bool, bool)>,
+    header: bool,
+    delim: String,
+}
+
 #[derive(Clone, Default)]
 struct FindState {
     open: bool,
@@ -130,6 +139,8 @@ struct SheetApp {
     rename_sheet: Option<(usize, String)>,
     /// 填充柄拖拽的终点（行或列，取决于方向）
     fill_drag: Option<(usize, u32, u32)>,
+    /// 数据工具对话框：0=排序 1=分列
+    data_dlg: Option<DataDlg>,
     /// 宏窗口：模块列表 + 选中项
     macro_win: Option<(Vec<sheetcore::vba_src::VbaModule>, usize)>,
     /// 新建图表草稿
@@ -249,6 +260,7 @@ impl SheetApp {
             zoom: 1.0,
             rename_sheet: None,
             fill_drag: None,
+            data_dlg: None,
             macro_win: None,
             chart_edit: None,
             chart_mgr: false,
@@ -564,7 +576,39 @@ impl SheetApp {
         self.wb.sheets.last_mut().unwrap().name = "新表".into();
         self.move_sheet(self.wb.sheets.len() - 1, -1);
         let moved_to = self.sheet_idx;
-        self.delete_sheet(self.wb.sheets.len() - 1);
+        // 删掉刚建的那张（按名字找），别把原表删了
+        if let Some(i) = self.wb.sheets.iter().position(|s| s.name == "新表") {
+            self.delete_sheet(i);
+        }
+        // 数据工具：排序 / 删除重复 / 分列（先回到第一张表，前面动过工作表）
+        self.sheet_idx = 0;
+        {
+            let (r1, c1, r2, c2) = (0u32, 0u32, 5u32, 2u32);
+            self.sel = (r1, c1);
+            self.sel_end = (r2, c2);
+            let dlg = DataDlg {
+                tab: 0,
+                keys: vec![(1, true, true), (2, false, true)],
+                header: true,
+                delim: ",".into(),
+            };
+            self.run_sort(&dlg);
+            let order: Vec<String> = (1..=5)
+                .map(|r| self.wb.sheet(self.sheet_idx).get(r, 1).map(|c| c.value.display()).unwrap_or_default())
+                .collect();
+            eprintln!("[B2] 排序后部门列={order:?}");
+            self.run_dedup();
+            eprintln!("[B2] 去重状态={}", self.status);
+            // 分列：D 列写 "甲,1" 再拆
+            self.wb.sheet_mut(self.sheet_idx).set(0, 3, sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text("甲,1".into()), formula: None });
+            self.sel = (0, 3);
+            self.sel_end = (0, 3);
+            self.run_split(',');
+            let a = self.wb.sheet(self.sheet_idx).get(0, 3).map(|c| c.value.display()).unwrap_or_default();
+            let b = self.wb.sheet(self.sheet_idx).get(0, 4).map(|c| c.value.display()).unwrap_or_default();
+            eprintln!("[B2] 分列后 D1={a} E1={b}");
+        }
         // 填充：1,2 拉到第 6 行应为 3,4,5,6
         self.wb.sheet_mut(self.sheet_idx).set(8, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
         self.wb.sheet_mut(self.sheet_idx).set(9, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
@@ -1124,6 +1168,131 @@ impl SheetApp {
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("{} 列宽已自适应：{:.0}px", cell_name(0, col).trim_end_matches('1'), width);
+    }
+
+    // ===== 数据工具 =====
+    fn open_data_dlg(&mut self, tab: u8) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
+        let keys = (c1..=c2).map(|c| (c, true, c == c1)).collect();
+        self.data_dlg = Some(DataDlg { tab, keys, header, delim: ",".into() });
+    }
+
+    fn run_sort(&mut self, dlg: &DataDlg) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let keys: Vec<sheetcore::data_tools::SortKey> = dlg
+            .keys
+            .iter()
+            .filter(|(_, _, on)| *on)
+            .map(|(c, asc, _)| sheetcore::data_tools::SortKey {
+                col: *c,
+                asc: *asc,
+                ignore_case: true,
+            })
+            .collect();
+        if keys.is_empty() {
+            self.status = "至少选一列排序".into();
+            return;
+        }
+        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let moved = sheetcore::data_tools::sort_multi(
+            self.wb.sheet_mut(self.sheet_idx),
+            (r1, c1, r2, c2),
+            &keys,
+            dlg.header,
+        );
+        self.txn_end("多级排序", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已按 {} 个键排序（{} 行移动）", keys.len(), moved);
+    }
+
+    fn run_dedup(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
+        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let removed = sheetcore::data_tools::remove_duplicates(
+            self.wb.sheet_mut(self.sheet_idx),
+            (r1, c1, r2, c2),
+            &[],
+            header,
+        );
+        self.txn_end("删除重复", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = if removed == 0 {
+            "没有重复行".into()
+        } else {
+            format!("删除了 {removed} 行重复")
+        };
+    }
+
+    fn run_split(&mut self, delim: char) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let n = sheetcore::data_tools::text_to_columns(
+            self.wb.sheet_mut(self.sheet_idx),
+            (r1, c1, r2, c2),
+            delim,
+        );
+        self.txn_end("分列", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = if n <= 1 {
+            "没有找到分隔符".into()
+        } else {
+            format!("已分成 {n} 列")
+        };
+    }
+
+    fn data_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.data_dlg.take() else { return };
+        let mut open = true;
+        let mut run = false;
+        let title = if dlg.tab == 0 { "多级排序" } else { "分列" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if dlg.tab == 0 {
+                    ui.checkbox(&mut dlg.header, "首行是标题");
+                    ui.separator();
+                    ui.label("按顺序勾选排序列（靠前的优先）：");
+                    for (c, asc, on) in dlg.keys.iter_mut() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(on, format!("{} 列", cell_name(0, *c).trim_end_matches('1')));
+                            egui::ComboBox::from_id_salt(format!("ord{c}"))
+                                .selected_text(if *asc { "升序" } else { "降序" })
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(asc, true, "升序");
+                                    ui.selectable_value(asc, false, "降序");
+                                });
+                        });
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("分隔符");
+                        ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(60.0));
+                    });
+                    ui.label(egui::RichText::new("按分隔符拆到右边相邻列，右侧内容整体右移").weak());
+                }
+                ui.separator();
+                if ui.button("执行").clicked() {
+                    run = true;
+                }
+            });
+        if run {
+            if dlg.tab == 0 {
+                self.run_sort(&dlg);
+            } else {
+                let ch = dlg.delim.chars().next().unwrap_or(',');
+                self.run_split(ch);
+            }
+        } else if open {
+            self.data_dlg = Some(dlg);
+        }
     }
 
     // ===== 查找替换 =====
@@ -1784,6 +1953,21 @@ impl SheetApp {
             ui.separator();
 
             // 插入
+            ui.menu_button("数据", |ui| {
+                ui.set_min_width(150.0);
+                if ui.button("多级排序…").clicked() {
+                    self.open_data_dlg(0);
+                    ui.close_menu();
+                }
+                if ui.button("删除重复…").clicked() {
+                    self.run_dedup();
+                    ui.close_menu();
+                }
+                if ui.button("分列…").clicked() {
+                    self.open_data_dlg(1);
+                    ui.close_menu();
+                }
+            });
             ui.menu_button("插入", |ui| {
                 ui.set_min_width(150.0);
                 let (r1, _c1, r2, _c2) = self.sel_rect();
@@ -4857,6 +5041,7 @@ impl eframe::App for SheetApp {
         self.chart_manager(ctx);
         self.macro_window(ctx);
         self.find_dialog(ctx);
+        self.data_dialog(ctx);
         self.rename_dialog(ctx);
         // 缩放：Ctrl+滚轮
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
