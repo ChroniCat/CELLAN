@@ -64,6 +64,8 @@ pub struct Chart {
     pub drawing: String,
     /// 显示数据标签
     pub show_labels: bool,
+    /// 引用被改写后要回写到 chart 部件里的 (旧, 新) 对
+    pub ref_fixes: Vec<(String, String)>,
 }
 
 /// 解析某张表的图表
@@ -532,7 +534,26 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         part: String::new(),
         drawing: String::new(),
         show_labels,
+        ref_fixes: Vec::new(),
     })
+}
+
+impl Chart {
+    /// 插删行列后改写系列引用
+    pub fn rewrite_refs(&mut self, shift: &crate::refs::Shift) -> bool {
+        let mut changed = false;
+        for s in self.series.iter_mut() {
+            for r in [&mut s.name_ref, &mut s.cat_ref, &mut s.val_ref] {
+                let nf = crate::refs::rewrite(r, shift);
+                if nf != *r {
+                    self.ref_fixes.push((r.clone(), nf.clone()));
+                    *r = nf;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
 }
 
 /// 用表里的实际值回填（图表只写了区间引用、没有缓存值的时候）

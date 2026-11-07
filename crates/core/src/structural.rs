@@ -403,6 +403,67 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
             },
         };
         sheet.rewrite_references(&shift);
+        // 图表系列引用
+        for ch in sheet.charts.iter_mut() {
+            if ch.rewrite_refs(&shift) {
+                sheet.charts_dirty = true;
+            }
+        }
+    }
+    // 记一笔，保存时搬透视表缓存
+    wb.pivot_shifts.push((
+        name.clone(),
+        if axis == crate::refs::Axis::Row { 0 } else { 1 },
+        at,
+        n,
+        delete,
+    ));
+
+    // 自定义名称
+    for (_, local, text) in wb.names.iter_mut() {
+        let own = match local {
+            Some(i) => wb.sheets.get(*i).map(|s| s.name.clone()).unwrap_or_default(),
+            None => String::new(),
+        };
+        let sh = crate::refs::Shift {
+            axis,
+            at,
+            n,
+            delete,
+            target_sheet: name.clone(),
+            own_sheet: own,
+        };
+        let nt = crate::refs::rewrite(text, &sh);
+        if nt != *text {
+            *text = nt;
+            wb.names_dirty = true;
+        }
+    }
+
+    // 待挂的透视表：源区域直接跟着搬
+    let sh = crate::refs::Shift {
+        axis,
+        at,
+        n,
+        delete,
+        target_sheet: name.clone(),
+        own_sheet: name.clone(),
+    };
+    for (idx, spec, _, _, _) in wb.pivots_pending.iter_mut() {
+        if *idx != sheet_idx {
+            continue;
+        }
+        let (r1, c1, r2, c2) = spec.source;
+        spec.source = match axis {
+            crate::refs::Axis::Row => match sh.map_range(r1, r2) {
+                Some((a, b)) => (a, c1, b, c2),
+                None => spec.source,
+            },
+            crate::refs::Axis::Col => match sh.map_range(c1, c2) {
+                Some((a, b)) => (r1, a, r2, b),
+                None => spec.source,
+            },
+        };
     }
 }
 

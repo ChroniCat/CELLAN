@@ -1084,3 +1084,334 @@ pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+/// 读 workbook.xml 里的自定义名称（不含 _xlnm.* 这些内置名）
+pub fn read_defined_names(path: &Path) -> Vec<(String, Option<usize>, String)> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let Ok(mut zip) = zip::ZipArchive::new(std::fs::File::open(path).unwrap_or_else(|_| std::fs::File::open("nul").unwrap())) else {
+        return out;
+    };
+    let mut xml = String::new();
+    if zip.by_name("xl/workbook.xml").map(|mut f| f.read_to_string(&mut xml)).is_err() {
+        return out;
+    }
+    let mut rest = xml.as_str();
+    while let Some(i) = rest.find("<definedName ") {
+        let head_end = match rest[i..].find('>') {
+            Some(e) => i + e,
+            None => break,
+        };
+        let head = &rest[i..head_end];
+        let tail = match rest[head_end..].find("</definedName>") {
+            Some(e) => head_end + e,
+            None => break,
+        };
+        let text = rest[head_end + 1..tail].to_string();
+        let name = head
+            .split("name=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        let local = head
+            .split("localSheetId=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse::<usize>().ok());
+        if !name.is_empty() && !name.starts_with("_xlnm.") {
+            out.push((name, local, text));
+        }
+        rest = &rest[tail + "</definedName>".len()..];
+    }
+    out
+}
+
+/// 覆盖写自定义名称：先按名字删掉旧的，再整体插回
+pub fn write_user_names(path: &Path, names: &[(String, Option<usize>, String)]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |n, buf| {
+        if n != "xl/workbook.xml" {
+            return buf;
+        }
+        let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+        let mut x = xml;
+        for (name, _, _) in names {
+            x = strip_name_everywhere(&x, name);
+        }
+        let mut defs = String::new();
+        for (name, local, text) in names {
+            match local {
+                Some(i) => defs.push_str(&format!(
+                    "<definedName name=\"{}\" localSheetId=\"{i}\">{}</definedName>",
+                    esc(name),
+                    esc(text)
+                )),
+                None => defs.push_str(&format!(
+                    "<definedName name=\"{}\">{}</definedName>",
+                    esc(name),
+                    esc(text)
+                )),
+            }
+        }
+        if let Some(i) = x.find("</definedNames>") {
+            x.insert_str(i, &defs);
+        } else if let Some(i) = x.find("</sheets>") {
+            x.insert_str(i + "</sheets>".len(), &format!("<definedNames>{defs}</definedNames>"));
+        }
+        x.into_bytes()
+    })
+}
+
+fn strip_name_everywhere(xml: &str, name: &str) -> String {
+    let key = format!("name=\"{}\"", esc(name));
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find("<definedName ") {
+        let head_end = match rest[i..].find('>') {
+            Some(e) => i + e,
+            None => break,
+        };
+        let tail = match rest[head_end..].find("</definedName>") {
+            Some(e) => head_end + e + "</definedName>".len(),
+            None => break,
+        };
+        if rest[i..head_end].contains(&key) {
+            out.push_str(&rest[..i]);
+        } else {
+            out.push_str(&rest[..tail]);
+        }
+        rest = &rest[tail..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 把透视表缓存里的 worksheetSource ref 按结构改动搬一下
+pub fn shift_pivot_caches(
+    path: &Path,
+    shifts: &[(String, u8, u32, u32, bool)],
+) -> Result<()> {
+    use std::io::Read;
+    let mut targets: Vec<String> = Vec::new();
+    {
+        let zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        for i in 0..zip.len() {
+            let n = zip.name_for_index(i).unwrap_or("").to_string();
+            if n.starts_with("xl/pivotCache/pivotCacheDefinition") && n.ends_with(".xml") {
+                targets.push(n);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut bodies: Vec<(String, String)> = Vec::new();
+    {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        for t in targets.iter() {
+            let mut s = String::new();
+            if let Ok(mut f) = zip.by_name(t) {
+                let _ = f.read_to_string(&mut s);
+            }
+            if s.is_empty() {
+                continue;
+            }
+            // <worksheetSource ref="A1:C6" sheet="表格"/>
+            let mut xml = s;
+            for (sheet, axis, at, n, delete) in shifts {
+                if let Some(pos) = xml.find("<worksheetSource") {
+                    let end = xml[pos..].find("/>").map(|e| pos + e).unwrap_or(xml.len());
+                    let block = xml[pos..end].to_string();
+                    let sheet_ok = block
+                        .split("sheet=\"")
+                        .nth(1)
+                        .and_then(|s| s.split('"').next())
+                        .map(|s| s.eq_ignore_ascii_case(sheet))
+                        .unwrap_or(false);
+                    if !sheet_ok {
+                        continue;
+                    }
+                    let Some(rtext) = block.split("ref=\"").nth(1).and_then(|s| s.split('"').next()) else {
+                        continue;
+                    };
+                    if let Some((a, b)) = rtext.split_once(':') {
+                        let parse = |s: &str| -> Option<(u32, u32)> {
+                            let mut col = 0u32;
+                            let mut i = 0usize;
+                            let bs = s.as_bytes();
+                            while i < bs.len() && bs[i].is_ascii_alphabetic() {
+                                col = col * 26 + (bs[i].to_ascii_uppercase() - b'A') as u32 + 1;
+                                i += 1;
+                            }
+                            let row: u32 = s[i..].parse().ok()?;
+                            if col == 0 || row == 0 {
+                                return None;
+                            }
+                            Some((row - 1, col - 1))
+                        };
+                        let (Some((r1, c1)), Some((r2, c2))) = (parse(a), parse(b)) else {
+                            continue;
+                        };
+                        let sh = crate::refs::Shift {
+                            axis: if *axis == 0 {
+                                crate::refs::Axis::Row
+                            } else {
+                                crate::refs::Axis::Col
+                            },
+                            at: *at,
+                            n: *n,
+                            delete: *delete,
+                            target_sheet: sheet.clone(),
+                            own_sheet: sheet.clone(),
+                        };
+                        let (nr1, nc1, nr2, nc2) = if *axis == 0 {
+                            match sh.map_range(r1, r2) {
+                                Some((x, y)) => (x, c1, y, c2),
+                                None => continue,
+                            }
+                        } else {
+                            match sh.map_range(c1, c2) {
+                                Some((x, y)) => (r1, x, r2, y),
+                                None => continue,
+                            }
+                        };
+                        let newr = format!(
+                            "{}{}:{}{}",
+                            crate::model::col_label(nc1),
+                            nr1 + 1,
+                            crate::model::col_label(nc2),
+                            nr2 + 1
+                        );
+                        let nb = block.replace(&format!("ref=\"{rtext}\""), &format!("ref=\"{newr}\""));
+                        xml.replace_range(pos..end, &nb);
+                    }
+                }
+            }
+            bodies.push((t.clone(), xml));
+        }
+    }
+    for (name, body) in bodies {
+        append_entry(path, &name, body.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// umya 只写它理解的部件：图表、drawing 关系、透视表缓存这些会被整份丢掉，
+/// 存回去就变成「drawing 指着一个不存在的 chart」——Excel 打开直接报修复。
+/// 这里把基准文件里有、新文件里没有的部件原样搬回来，并把内容类型补齐。
+pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
+    use std::io::Read;
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    // umya 自己会重写的部件，缺了也不能从旧文件搬（会覆盖新数据）
+    let managed = |n: &str| -> bool {
+        n == "[Content_Types].xml"
+            || n == "xl/workbook.xml"
+            || n == "xl/styles.xml"
+            || n == "xl/sharedStrings.xml"
+            || n.starts_with("xl/worksheets/sheet")
+            || n.starts_with("docProps/")
+            || n == "_rels/.rels"
+            || n == "xl/_rels/workbook.xml.rels"
+    };
+
+    let mut base_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i)?;
+            let n = e.name().to_string();
+            if managed(&n) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf)?;
+            base_entries.push((n, buf));
+        }
+    }
+    let existing: Vec<String> = {
+        let zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        (0..zip.len())
+            .map(|i| zip.name_for_index(i).unwrap_or("").to_string())
+            .collect()
+    };
+    // 情况特殊：umya 会写出一个「空的」drawing（只有 wsDr 壳，没有锚点），
+    // 图表部件虽然找回了，但没有锚点照样显示不出来——空壳就用基准的覆盖
+    {
+        use std::io::Read;
+        let mut replacements: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, body) in base_entries.iter() {
+            if !name.starts_with("xl/drawings/") || name.ends_with(".rels") {
+                continue;
+            }
+            let base_has_anchor = body.windows(7).any(|w| w == b"CellAnch");
+            if !base_has_anchor {
+                continue;
+            }
+            let mut cur = String::new();
+            if let Ok(mut zip) = zip::ZipArchive::new(std::fs::File::open(path)?) {
+                if let Ok(mut f) = zip.by_name(name) {
+                    let _ = f.read_to_string(&mut cur);
+                }
+            }
+            if cur.is_empty() || !cur.contains("CellAnch") {
+                replacements.push((name.clone(), body.clone()));
+            }
+        }
+        for (name, body) in replacements {
+            append_entry(path, &name, &body)?;
+        }
+    }
+
+    let mut restored = Vec::new();
+    let mut ct_additions = Vec::new();
+    for (name, body) in base_entries {
+        if existing.iter().any(|n| n == &name) {
+            continue;
+        }
+        append_entry(path, &name, &body)?;
+        restored.push(name.clone());
+        // 记录内容类型（从基准文件的 [Content_Types].xml 里抄）
+        if let Some(ct) = content_type_of(base, &name) {
+            ct_additions.push((name, ct));
+        }
+    }
+    if !ct_additions.is_empty() {
+        rewrite_zip(path, |n, buf| {
+            if n != "[Content_Types].xml" {
+                return buf;
+            }
+            let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+            let mut x = xml;
+            for (part, ct) in ct_additions.iter() {
+                let marker = format!("/{part}");
+                if x.contains(&marker) {
+                    continue;
+                }
+                let line = format!("<Override PartName=\"{marker}\" ContentType=\"{ct}\"/>");
+                if let Some(i) = x.rfind("</Types>") {
+                    x.insert_str(i, &line);
+                }
+            }
+            x.into_bytes()
+        })?;
+    }
+    Ok(restored)
+}
+
+fn content_type_of(path: &Path, part: &str) -> Option<String> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
+    let mut xml = String::new();
+    zip.by_name("[Content_Types].xml").ok()?.read_to_string(&mut xml).ok()?;
+    let marker = format!("PartName=\"/{part}\"");
+    let i = xml.find(&marker)?;
+    let head_start = xml[..i].rfind('<')?;
+    let head_end = xml[i..].find('>')? + i;
+    let head = &xml[head_start..head_end];
+    head.split("ContentType=\"").nth(1).map(|s| s.split('"').next().unwrap_or("").to_string())
+}

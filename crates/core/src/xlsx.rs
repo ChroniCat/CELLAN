@@ -24,6 +24,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
     let names = reader.sheet_names().to_owned();
 
     let mut wb = Workbook {
+        names: crate::patch::read_defined_names(path),
+        names_dirty: false,
+        pivot_shifts: Vec::new(),
         has_vba: crate::vba::has_macros(path),
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
@@ -169,6 +172,17 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     };
     // 宏部件：umya 写不出来，先留一份，写完塞回去
     let vba = crate::vba::read_vba(&base);
+    // 原地保存时，写盘会把 base 覆盖掉——先把「要保住的那部分」复制一份出来
+    let restore_src = if base == path {
+        let tmp = path.with_extension("preserve.tmp");
+        match std::fs::copy(&base, &tmp) {
+            Ok(_) => Some(tmp),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let restore_base = restore_src.clone().unwrap_or_else(|| base.clone());
     let mut book = if base.exists() {
         read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
     } else {
@@ -343,6 +357,51 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         if let Err(e) = crate::vba::restore_vba(path, &v) {
             eprintln!("[save] 宏恢复失败: {e:#}");
         }
+    }
+
+    // 透视表缓存里的源区域
+    if !wb.pivot_shifts.is_empty() {
+        if let Err(e) = crate::patch::shift_pivot_caches(path, &wb.pivot_shifts) {
+            eprintln!("[save] 透视表源区域回写失败: {e:#}");
+        }
+    }
+
+    // 自定义名称
+    if wb.names_dirty && !wb.names.is_empty() {
+        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
+            eprintln!("[save] 名称回写失败: {e:#}");
+        }
+    }
+
+    // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来
+    if restore_base.exists() {
+        match crate::patch::restore_missing_parts(path, &restore_base) {
+            Ok(v) if !v.is_empty() => {
+                if std::env::var("SC_SAVE_PROF").is_ok() {
+                    eprintln!("[save] 找回丢失部件 {} 个: {:?}", v.len(), v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 图表引用改写（插删行列后）
+    for sheet in wb.sheets.iter() {
+        if !sheet.charts_dirty {
+            continue;
+        }
+        for ch in sheet.charts.iter() {
+            if ch.part.is_empty() || ch.ref_fixes.is_empty() {
+                continue;
+            }
+            if let Err(e) = crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes) {
+                eprintln!("[save] 图表引用回写失败: {e:#}");
+            }
+        }
+    }
+
+    if let Some(t) = restore_src {
+        let _ = std::fs::remove_file(t);
     }
 
     // 透视表部件（必须等主体写完）

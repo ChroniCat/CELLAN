@@ -60,6 +60,7 @@ pub fn chart_from_selection(
         part: String::new(),
         drawing: String::new(),
         show_labels: false,
+        ref_fixes: Vec::new(),
     }
 }
 
@@ -418,6 +419,23 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         }
         buf
     })?;
+    Ok(())
+}
+
+/// 只把 chart 部件里的引用字符串换掉，其它内容原样保留
+pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -> Result<()> {
+    use std::io::Read;
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut xml = String::new();
+    zip.by_name(chart_part)?.read_to_string(&mut xml)?;
+    drop(zip);
+    for (old, new) in pairs {
+        xml = xml.replace(old.as_str(), new.as_str());
+    }
+    crate::patch::append_entry(path, chart_part, xml.as_bytes())?;
     Ok(())
 }
 

@@ -131,6 +131,8 @@ pub struct Sheet {
     pub page_dirty: bool,
     /// 图表（只读展示，原样保留）
     pub charts: Vec<crate::charts::Chart>,
+    /// 图表引用被改过：保存时要重写 chart 部件
+    pub charts_dirty: bool,
 }
 
 impl Sheet {
@@ -160,6 +162,7 @@ impl Sheet {
             page: crate::page::PageSetup::default(),
             page_dirty: false,
             charts: Vec::new(),
+            charts_dirty: false,
         }
     }
 
@@ -300,6 +303,13 @@ impl Sheet {
 pub struct Workbook {
     /// 文件里是否带 VBA 宏（只保留，不执行）
     pub has_vba: bool,
+    /// 自定义名称（名称管理器里的东西）：(名字, 作用表, 公式文本)
+    pub names: Vec<(String, Option<usize>, String)>,
+    /// 名称被改过
+    pub names_dirty: bool,
+    /// 结构改动记录：保存时用来搬透视表缓存里的源区域
+    /// (表名, 0=行 1=列, at, n, 是否删除)
+    pub pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
     /// 保存时要挂上的透视表部件：(表序号, 规格, 结果, 输出矩形, 值字段名)
     pub pivots_pending: Vec<(
         usize,
@@ -319,6 +329,9 @@ impl Workbook {
     pub fn new_blank() -> Self {
         Self {
             has_vba: false,
+            names: Vec::new(),
+            pivot_shifts: Vec::new(),
+            names_dirty: false,
             pivots_pending: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
