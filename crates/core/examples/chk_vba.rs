@@ -1,5 +1,6 @@
 fn main() {
-    let p = std::path::Path::new("F:/Finance/work/macro.xlsm");
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "F:/Finance/work/macro.xlsm".into());
+    let p = std::path::Path::new(&arg);
     let bytes = match sheetcore::vba::read_vba(p) {
         Some(b) => b,
         None => { println!("没有宏部件"); return; }

@@ -158,20 +158,40 @@ pub fn read_modules(data: &[u8]) -> Result<Vec<VbaModule>> {
 
     let mut out = Vec::new();
     for (name, kind) in listed {
+        // dir 里解析出来的名字可能是「模块名/流名」，流名才是容器里的条目
+        let (disp, stream_name) = match name.split_once('/') {
+            Some((a, b)) => {
+                let b = b.split("&H").next().unwrap_or(b).trim();
+                (a.to_string(), b.to_string())
+            }
+            None => (name.clone(), name.clone()),
+        };
         let raw = cfb
-            .stream_by_path(&format!("VBA/{name}"))
-            .or_else(|| cfb.stream_by_path(&name));
+            .stream_by_path(&format!("VBA/{stream_name}"))
+            .or_else(|| cfb.stream_by_path(&stream_name))
+            .or_else(|| cfb.stream_by_path(&format!("VBA/{disp}")))
+            .or_else(|| cfb.stream_by_path(&disp));
         let source = match raw {
             Some(bytes) => {
                 let off = offsets
                     .iter()
-                    .find(|(n, _)| n == &name)
+                    .find(|(n, _)| n == &name || n == &disp || n == &stream_name)
                     .map(|(_, o)| *o as usize)
                     .unwrap_or(0);
                 let slice = if off > 0 && off < bytes.len() {
                     &bytes[off..]
                 } else {
                     &bytes[..]
+                };
+                // 真文件的模块流前面有 PerformanceCache，源码容器不一定从 MODULEOFFSET 开始；
+                // 先按记录的偏移试，签名不对就在流里找第一个合法压缩块
+                let slice = if is_container(slice) {
+                    slice
+                } else {
+                    match find_container(&bytes) {
+                        Some(p) => &bytes[p..],
+                        None => slice,
+                    }
                 };
                 let text = decompress(slice);
                 let s = String::from_utf8_lossy(&text).to_string();
@@ -183,13 +203,30 @@ pub fn read_modules(data: &[u8]) -> Result<Vec<VbaModule>> {
             None => String::new(),
         };
         out.push(VbaModule {
-            name,
+            name: disp,
             kind,
             lines: source.lines().count(),
             source,
         });
     }
     Ok(out)
+}
+
+
+/// 压缩容器：首字节 0x01，紧跟的 chunk header 的 signature 必须是 0b011
+fn is_container(b: &[u8]) -> bool {
+    b.len() >= 3 && b[0] == 0x01 && ((u16::from_le_bytes([b[1], b[2]]) >> 12) & 0x7) == 3
+}
+
+fn find_container(b: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i + 3 <= b.len() {
+        if b[i] == 0x01 && is_container(&b[i..]) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 是否有宏（能读出模块即算有）
