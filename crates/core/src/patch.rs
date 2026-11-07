@@ -1052,6 +1052,88 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+
+/// 一次重写搞定「写入/替换多个部件」——逐条 append_entry 会把整个包重写 N 遍
+pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
+    use std::io::{Read, Write};
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut left: std::collections::HashMap<&str, &[u8]> =
+        items.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("addtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        for i in 0..zip.len() {
+            let (n, buf) = {
+                let mut e = zip.by_index(i)?;
+                let n = e.name().to_string();
+                let mut b = Vec::new();
+                e.read_to_end(&mut b)?;
+                (n, b)
+            };
+            zw.start_file(n.clone(), opts())?;
+            match left.remove(n.as_str()) {
+                Some(body) => zw.write_all(body)?,
+                None => zw.write_all(&buf)?,
+            }
+        }
+        for (n, body) in items.iter() {
+            if left.contains_key(n.as_str()) {
+                zw.start_file(n.clone(), opts())?;
+                zw.write_all(body)?;
+            }
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 一次重写删掉多个条目
+pub fn remove_entries(path: &Path, names: &[String]) -> Result<()> {
+    use std::io::{Read, Write};
+    if names.is_empty() {
+        return Ok(());
+    }
+    let to_drop: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("rmtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        for i in 0..zip.len() {
+            let (n, buf) = {
+                let mut e = zip.by_index(i)?;
+                let n = e.name().to_string();
+                let mut b = Vec::new();
+                e.read_to_end(&mut b)?;
+                (n, b)
+            };
+            if to_drop.contains(n.as_str()) {
+                continue;
+            }
+            zw.start_file(n.clone(), opts())?;
+            zw.write_all(&buf)?;
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// 从 zip 里删掉一个条目
 pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
     use std::io::{Read, Write};
@@ -1381,24 +1463,24 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
                 replacements.push((name.clone(), body.clone()));
             }
         }
-        for (name, body) in replacements {
-            append_entry(path, &name, &body)?;
-        }
+        append_entries(path, &replacements)?;
     }
 
     let mut restored = Vec::new();
     let mut ct_additions = Vec::new();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, body) in base_entries {
         if existing.iter().any(|n| n == &name) {
             continue;
         }
-        append_entry(path, &name, &body)?;
         restored.push(name.clone());
         // 记录内容类型（从基准文件的 [Content_Types].xml 里抄）
         if let Some(ct) = content_type_of(base, &name) {
-            ct_additions.push((name, ct));
+            ct_additions.push((name.clone(), ct));
         }
+        pending.push((name, body));
     }
+    append_entries(path, &pending)?;
     if !ct_additions.is_empty() {
         rewrite_zip(path, |n, buf| {
             if n != "[Content_Types].xml" {

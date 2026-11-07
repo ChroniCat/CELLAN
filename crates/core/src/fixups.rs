@@ -123,6 +123,51 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
     Ok(fixed)
 }
 
+
+/// 一张表只能有一条 comments / vmlDrawing 关系：迁移时可能和 umya 写的重复，
+/// 这里保留第一条（umya 写的），把多余的删掉，随后 prune 会清掉孤儿部件。
+pub fn dedupe_singleton_rels(path: &Path) -> Result<Vec<String>> {
+    let mut log = Vec::new();
+    for name in entries(path) {
+        if !name.ends_with(".rels") {
+            continue;
+        }
+        let Some(xml) = read_entry(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = String::new();
+        let mut dropped = 0usize;
+        let mut rest = xml.as_str();
+        let head_end = xml.find("<Relationship").unwrap_or(xml.len());
+        out.push_str(&xml[..head_end]);
+        while let Some(pos) = rest.find("<Relationship") {
+            let end = rest[pos..].find("/>").map(|e| pos + e + 2).unwrap_or(rest.len());
+            let tag = &rest[pos..end];
+            let ty = tag
+                .find("Type=\"")
+                .and_then(|i| tag[i + 6..].find('"').map(|q| &tag[i + 6..i + 6 + q]))
+                .unwrap_or("");
+            let singleton = ty.contains("/comments") || ty.contains("/vmlDrawing");
+            if singleton && !seen.insert(ty.to_string()) {
+                dropped += 1;
+            } else {
+                out.push_str(tag);
+            }
+            rest = &rest[end.min(rest.len())..];
+        }
+        if dropped == 0 {
+            continue;
+        }
+        if let Some(close) = xml.rfind("</Relationships>") {
+            out.push_str(&xml[close..]);
+        }
+        crate::patch::append_entry(path, &name, out.as_bytes())?;
+        log.push(format!("{name}: 去掉 {dropped} 条重复关系"));
+    }
+    Ok(log)
+}
+
 /// 删掉没有任何关系指向的部件（umya 每次保存都会留下旧的表格/批注部件）
 pub fn prune_orphans(path: &Path) -> Result<Vec<String>> {
     let all = entries(path);
@@ -164,16 +209,12 @@ pub fn prune_orphans(path: &Path) -> Result<Vec<String>> {
     };
     let mut removed = Vec::new();
     for n in all.iter() {
-        if !prunable(n) {
+        if !prunable(n) || referenced.contains(n) {
             continue;
         }
-        if referenced.contains(n) {
-            continue;
-        }
-        if crate::patch::remove_entry(path, n).is_ok() {
-            removed.push(n.clone());
-        }
+        removed.push(n.clone());
     }
+    crate::patch::remove_entries(path, &removed)?;
     // Content_Types 里的 Override 也要清掉，否则校验会报“声明了不存在的部件”
     if !removed.is_empty() {
         if let Some(xml) = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
@@ -198,4 +239,151 @@ pub fn prune_orphans(path: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(removed)
+}
+
+// ---------------- 工作表关系迁移 ----------------
+
+fn split_path(p: &str) -> Vec<String> {
+    p.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+}
+
+/// 把 rels 里的相对 Target 解析成包内绝对路径
+pub fn resolve_target(rels_name: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        return target.trim_start_matches('/').to_string();
+    }
+    let dir = rels_name.rsplit_once("_rels/").map(|(d, _)| d).unwrap_or("");
+    let mut parts = split_path(dir);
+    for seg in split_path(target) {
+        match seg.as_str() {
+            ".." => {
+                parts.pop();
+            }
+            "." => {}
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join("/")
+}
+
+/// 从某个目录出发，算出到目标部件的相对路径
+fn relative_to(from_rels: &str, abs: &str) -> String {
+    let dir = from_rels.rsplit_once("_rels/").map(|(d, _)| d).unwrap_or("");
+    let from: Vec<String> = split_path(dir);
+    let to: Vec<String> = split_path(abs);
+    let mut common = 0;
+    while common < from.len() && common < to.len() && from[common] == to[common] {
+        common += 1;
+    }
+    let mut out: Vec<String> = vec!["..".to_string(); from.len() - common];
+    out.extend(to[common..].iter().cloned());
+    if out.is_empty() {
+        ".".to_string()
+    } else {
+        out.join("/")
+    }
+}
+
+/// umya 把工作表从原目录挪到 xl/worksheets/ 时不会搬 rels，
+/// 结果图表/图片/表格的关系全丢。这里按基准文件把关系补到新位置，
+/// 相对路径按新目录重算，并顺带把 Content_Types 里缺的 Override 补上。
+pub fn migrate_sheet_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let base_targets = crate::patch::sheet_targets(base)?;
+    let new_targets = crate::patch::sheet_targets(path)?;
+    let mut log = Vec::new();
+    let mut need_override: Vec<String> = Vec::new();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for (sheet, base_part) in base_targets.iter() {
+        let Some(new_part) = new_targets.get(sheet) else { continue };
+        // 路径没变也要检查：umya 偶尔会把表的 rels 整个漏掉（S4 的 30 张图就这样丢的）
+        let base_rels = base_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+        let Some(old_xml) = read_entry(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        let new_rels = new_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+        let existing = read_entry(path, &new_rels)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        // 已经存在的按「类型 + 目标（解析成绝对路径）」判重，避免换了个 rId 就重复加
+        let have: HashSet<String> = parse_rels(&existing)
+            .values()
+            .map(|(t, target)| format!("{t}|{}", resolve_target(&new_rels, target)))
+            .collect();
+
+        let mut add = String::new();
+        let mut added = 0usize;
+        // 这些类型一张表只能有一条：umya 已经写了自己的版本，就别再塞基准的旧版本
+        let singleton = |ty: &str| ty.contains("/comments\"") || ty.contains("/vmlDrawing\"");
+        let have_singleton: HashSet<String> = parse_rels(&existing)
+            .values()
+            .filter(|(t, _)| singleton(t))
+            .map(|(t, _)| t.clone())
+            .collect();
+
+        for (id, (ty, target)) in parse_rels(&old_xml) {
+            let abs = resolve_target(&base_rels, &target);
+            if have.contains(&format!("{ty}|{abs}")) {
+                continue;
+            }
+            if singleton(&ty) && have_singleton.contains(&ty) {
+                continue;
+            }
+            let rel = relative_to(&new_rels, &abs);
+            add.push_str(&format!(
+                "<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{rel}\"/>"
+            ));
+            need_override.push(abs);
+            added += 1;
+        }
+        if add.is_empty() {
+            continue;
+        }
+        let merged = if existing.trim().is_empty() {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{add}</Relationships>"
+            )
+        } else {
+            existing.replacen(
+                "</Relationships>",
+                &format!("{add}</Relationships>"),
+                1,
+            )
+        };
+        pending.push((new_rels.clone(), merged.into_bytes()));
+        log.push(format!("{sheet}: {base_part} → {new_part}，补 {added} 条关系"));
+    }
+
+    // Content_Types：引用了原来目录下的部件，就要有对应的 Override
+    if !need_override.is_empty() {
+        let base_ct = read_entry(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
+        let new_ct = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
+        if let (Some(base_ct), Some(new_ct)) = (base_ct, new_ct) {
+            let mut add = String::new();
+            for abs in need_override.iter() {
+                let pat = format!("PartName=\"/{abs}\"");
+                if new_ct.contains(&pat) || add.contains(&pat) {
+                    continue;
+                }
+                // 从基准里把这条 Override 原样捞出来
+                if let Some(pos) = base_ct.find(&pat) {
+                    let start = base_ct[..pos].rfind("<Override").unwrap_or(pos);
+                    if let Some(endrel) = base_ct[start..].find("/>") {
+                        add.push_str(&base_ct[start..start + endrel + 2]);
+                    }
+                }
+            }
+            if !add.is_empty() {
+                let merged = new_ct.replacen("</Types>", &format!("{add}</Types>"), 1);
+                pending.push(("[Content_Types].xml".to_string(), merged.into_bytes()));
+                log.push(format!("[Content_Types] 补 {} 条", add.matches("<Override").count()));
+            }
+        }
+    }
+    // 一次重写把所有关系写进去（逐条写会把 100MB 的包重写十几遍）
+    crate::patch::append_entries(path, &pending)?;
+    Ok(log)
 }

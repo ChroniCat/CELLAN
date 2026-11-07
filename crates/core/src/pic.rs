@@ -106,13 +106,7 @@ fn rels_map(xml: &str) -> HashMap<String, String> {
         let end = rest[pos..].find("/>").map(|e| pos + e).unwrap_or(rest.len());
         let tag = &rest[pos..end];
         if let (Some(id), Some(target)) = (attr(tag, "Id"), attr(tag, "Target")) {
-            let t = target.trim_start_matches("../").to_string();
-            let part = if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("xl/{t}")
-            };
-            m.insert(id, part);
+            m.insert(id, target);
         }
         rest = &rest[end.min(rest.len())..];
     }
@@ -150,12 +144,8 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
             let tag = &rest[pos..end];
             if tag.contains("/drawing\"") {
                 if let Some(target) = attr(tag, "Target") {
-                    let t = target.trim_start_matches("../").to_string();
-                    drawing_part = Some(if t.starts_with('/') {
-                        t.trim_start_matches('/').to_string()
-                    } else {
-                        format!("xl/{t}")
-                    });
+                    // 相对路径要按 rels 所在目录解析（表可能不在 xl/worksheets/）
+                    drawing_part = Some(crate::fixups::resolve_target(&rels_path, &target));
                 }
             }
             rest = &rest[end.min(rest.len())..];
@@ -179,12 +169,7 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
             if f.read_to_string(&mut xml).is_ok() {
                 // Target 是相对 drawing 所在目录的
                 for (k, v) in rels_map(&xml) {
-                    let p = if let Some(stripped) = v.strip_prefix("xl/drawings/") {
-                        format!("xl/media/{stripped}")
-                    } else {
-                        v
-                    };
-                    draw_rels.insert(k, p);
+                    draw_rels.insert(k, crate::fixups::resolve_target(&drawing_rels_path, &v));
                 }
             }
         }

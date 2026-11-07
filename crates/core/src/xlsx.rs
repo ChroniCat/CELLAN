@@ -500,16 +500,30 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
         }
     }
+    if prof {
+        eprintln!("  [save] 其余补丁 {:.2}s", t_write.elapsed().as_secs_f64());
+    }
+    let t_fix = std::time::Instant::now();
     // 收尾：umya 会改坏 drawing rels 的图表关系，并留下旧的表格/批注部件
     if restore_base.exists() {
+        // 工作表被挪目录时，关系要跟着搬过去
+        if let Err(e) = crate::fixups::migrate_sheet_rels(path, &restore_base) {
+            eprintln!("[save] 迁移工作表关系失败: {e:#}");
+        }
         if let Err(e) = crate::fixups::fix_drawing_rels(path, &restore_base) {
             eprintln!("[save] 修复 drawing 关系失败: {e:#}");
+        }
+        if let Err(e) = crate::fixups::dedupe_singleton_rels(path) {
+            eprintln!("[save] 去重关系失败: {e:#}");
         }
         if let Err(e) = crate::fixups::prune_orphans(path) {
             eprintln!("[save] 清理孤儿部件失败: {e:#}");
         }
     }
 
+    if prof {
+        eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());
+    }
     Ok(())
 }
 
