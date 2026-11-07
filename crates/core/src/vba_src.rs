@@ -9,73 +9,78 @@ use anyhow::{bail, Result};
 
 use crate::cfb::Compound;
 
-/// 解 MS-OVBA 压缩容器
+/// 解 MS-OVBA 压缩容器（算法对照 MS-OVBA 2.4.1.3 与 oletools 的实现）
+///
+/// 两个容易搞错的地方：
+/// 1. CopyToken 是 **2 字节**，没有第三个字节；
+/// 2. 长度/偏移的位宽不固定：`bits = max(4, ceil(log2(本 chunk 已解出字节数)))`，
+///    长度占低 (16 - bits) 位，偏移占高 bits 位，且解出的距离要 +1。
 pub fn decompress(src: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len() * 4);
-    // 容器第一个字节固定是 0x01（CompressedContainer 签名），不是 chunk 头
+    let mut out: Vec<u8> = Vec::with_capacity(src.len() * 4);
+    // 规范要求首字节是 0x01；老的自造 fixture 没有，也容忍一下
     let mut i = if src.first() == Some(&0x01) { 1 } else { 0 };
     while i + 2 <= src.len() {
         let header = u16::from_le_bytes([src[i], src[i + 1]]);
-        i += 2;
-        let size = (header & 0x0FFF) as usize + 3;
-        let compressed = header & 0x8000 != 0;
-        let sig = (header >> 12) & 0x07;
-        if sig != 0b011 {
-            break; // 不是合法的 chunk 头，停
+        if (header >> 12) & 0x07 != 0b011 {
+            break;
         }
+        let chunk_size = (header & 0x0FFF) as usize + 3; // 含 2 字节头
+        let compressed = (header >> 15) & 1 == 1;
+        let start = i;
+        let end = (start + chunk_size).min(src.len());
+        i = start + 2;
+
         if !compressed {
-            let take = (size - 2).min(src.len().saturating_sub(i));
-            out.extend_from_slice(&src[i..i + take]);
-            i += take;
+            let take = (i + 4096).min(src.len());
+            out.extend_from_slice(&src[i..take]);
+            i = end;
             continue;
         }
-        let end = (i + size - 2).min(src.len());
-        out.extend_from_slice(&decode_chunk(&src[i..end]));
-        i = end;
-    }
-    out
-}
 
-fn decode_chunk(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4096);
-    let mut i = 0usize;
-    while i < data.len() && out.len() < 4096 {
-        let flags = data[i];
-        i += 1;
-        for bit in 0..8 {
-            if i >= data.len() || out.len() >= 4096 {
-                break;
-            }
-            if flags & (1 << bit) == 0 {
-                out.push(data[i]);
-                i += 1;
-            } else {
-                if i + 2 > data.len() {
-                    return out;
+        let chunk_start_out = out.len();
+        while i < end {
+            let flags = src[i];
+            i += 1;
+            for bit in 0..8 {
+                if i >= end {
+                    break;
                 }
-                let token = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                let mut count = (token & 0x0FFF) as usize + 3;
-                let offset = ((token >> 12) as usize) | ((data.get(i).copied().unwrap_or(0) as usize) << 4);
-                // 高 4 位在 token，低 8 位在紧随其后的一个字节
-                if i >= data.len() {
-                    return out;
+                if (flags >> bit) & 1 == 0 {
+                    out.push(src[i]);
+                    i += 1;
+                } else {
+                    if i + 2 > end {
+                        i = end;
+                        break;
+                    }
+                    let token = u16::from_le_bytes([src[i], src[i + 1]]);
+                    i += 2;
+                    let diff = out.len() - chunk_start_out;
+                    if diff == 0 {
+                        return out;
+                    }
+                    let bits = if diff <= 1 {
+                        4usize
+                    } else {
+                        (32 - (diff as u32 - 1).leading_zeros()) as usize
+                    }
+                    .max(4);
+                    let length_mask: u16 = 0xFFFFu16 >> bits;
+                    let length = (token & length_mask) as usize + 3;
+                    let offset = (((token & !length_mask) as usize) >> (16 - bits)) + 1;
+                    if offset > out.len() {
+                        return out;
+                    }
+                    let mut from = out.len() - offset;
+                    for _ in 0..length {
+                        let b = out[from];
+                        out.push(b);
+                        from += 1;
+                    }
                 }
-                i += 1;
-                let pos = offset + 1;
-                if pos > out.len() {
-                    return out;
-                }
-                let mut start = out.len() - pos;
-                for _ in 0..count {
-                    let b = out[start];
-                    out.push(b);
-                    start += 1;
-                }
-                count = 0;
-                let _ = count;
             }
         }
+        i = end;
     }
     out
 }
@@ -204,6 +209,14 @@ pub fn read_modules(data: &[u8]) -> Result<Vec<VbaModule>> {
                     .trim_start_matches(char::from(1))
                     .trim_start_matches('\u{feff}')
                     .to_string();
+                // Excel 的模块流把 Attribute VB_Name 行存了两遍，显示时去掉一行
+                let mut clean = clean;
+                let head: Vec<&str> = clean.lines().take(2).collect();
+                if head.len() == 2 && head[0] == head[1] && head[0].starts_with("Attribute VB_Name") {
+                    if let Some(pos) = clean.find(char::from(10)) {
+                        clean = clean[pos + 1..].to_string();
+                    }
+                }
                 usable = looks_like_source(&clean);
                 clean
             }
@@ -290,32 +303,36 @@ mod tests {
 
     #[test]
     fn decompresses_uncompressed_chunk() {
-        // 头部：size=0x0FFF（最大）+ 未压缩标志
-        let mut buf = Vec::new();
-        let text = b"Attribute VB_Name = \"Module1\"\r\nSub Hello()\r\nEnd Sub\r\n";
-        let header: u16 = (0x0FFF & 0x0FFF) | (0b011 << 12);
+        // 容器签名 0x01 + 头（size=0x0FFF，未压缩）+ 4096 字节原文
+        let text: &[u8] = b"Attribute VB_Name = \"Module1\"\r\nSub Hello()\r\nEnd Sub\r\n";
+        let mut buf = vec![0x01];
+        let header: u16 = 0x0FFF | (0b011 << 12);
         buf.extend_from_slice(&header.to_le_bytes());
-        buf.extend_from_slice(text);
+        let mut data = vec![0u8; 4096];
+        data[..text.len()].copy_from_slice(text);
+        buf.extend_from_slice(&data);
         let out = decompress(&buf);
-        assert_eq!(out, text, "未压缩 chunk 应原样取出");
+        assert_eq!(&out[..text.len()], text, "raw chunk mismatch");
     }
 
     #[test]
-    fn decompresses_copy_tokens() {
-        // 手工构造：先 4 个字面量 "ABCD"，再用 copy token 复制 4 个回去
-        // 标志字节 0b00010000：第 0 位=字面量 A，第 1..3=字面量 B,C,D，第 4 位=copy
-        let mut chunk = vec![0b0001_0000u8, b'A', b'B', b'C', b'D'];
-        // count=4 → count-3=1；offset: 高 4 位在 token 里，低 8 位单独一字节
-        // 距离 4：pos = offset+1 = 4 → offset = 3
-        let count: u16 = 1; // 4 字节
-        let off: u16 = 3;
-        let token = (count & 0x0FFF) | ((off & 0x000F) << 12);
-        chunk.extend_from_slice(&token.to_le_bytes());
-        chunk.push((off >> 4) as u8);
-        let out = decode_chunk(&chunk);
-        assert_eq!(out, b"ABCDABCD".to_vec(), "copy token 应该复制前面的内容");
+    fn decodes_multi_chunk_containers() {
+        // 两个未压缩块：文档说容器可以有多块，逐块拼起来
+        let mut buf = vec![0x01];
+        let header: u16 = 0x0FFF | (0b011 << 12);
+        for tag in [b'A', b'B'] {
+            buf.extend_from_slice(&header.to_le_bytes());
+            let mut data = vec![tag; 4096];
+            data[0] = b'X';
+            buf.extend_from_slice(&data);
+        }
+        let out = decompress(&buf);
+        assert_eq!(out.len(), 8192, "两块共 8192 字节");
+        assert_eq!(out[0], b'X');
+        assert_eq!(out[4096], b'X');
+        assert_eq!(out[1], b'A');
+        assert_eq!(out[4097], b'B');
     }
-
     #[test]
     fn rejects_non_cfb() {
         assert!(read_modules(b"not an ole file at all").is_err());

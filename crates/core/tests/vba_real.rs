@@ -30,7 +30,7 @@ fn reads_real_vba_project() {
 }
 
 #[test]
-fn real_module_code_is_not_garbage() {
+fn real_module_source_is_exact() {
     let path = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/real_macro.xlsm"
@@ -38,12 +38,54 @@ fn real_module_code_is_not_garbage() {
     let bytes = sheetcore::vba::read_vba(path).expect("读不到宏");
     let mods = sheetcore::vba_src::read_modules(&bytes).expect("解析失败");
     let m1 = mods.iter().find(|m| m.name == "Module1").unwrap();
-    // 这三个过程名在源码里必须出现（压缩 token 解错就会变成乱码或重复串）
-    // 核心不变量：给出去的东西要么能看懂，要么干脆不给
-    let garbled = m1.source.contains("me = \"Module1\"") && !m1.source.contains("AddTwo");
-    assert!(!garbled, "把解错的乱码当源码返回了: {:?}", &m1.source.chars().take(120).collect::<String>());
-    assert!(
-        m1.source.is_empty() || m1.source.contains("AddTwo"),
-        "源码不完整"
-    );
+
+    // 逐行比对：这就是当时写进宏里的原文
+    let want = [
+        "Attribute VB_Name = \"Module1\"",
+        "Option Explicit",
+        "",
+        "Public Function AddTwo(a As Long, b As Long) As Long",
+        "    AddTwo = a + b",
+        "End Function",
+        "",
+        "Sub Hello()",
+        "    Dim total As Long",
+        "    total = AddTwo(12, 30)",
+        "    MsgBox \"合计 \" & total, vbInformation, \"SheetCore 测试\"",
+        "End Sub",
+        "",
+        "Sub 中文过程名测试()",
+        "    Debug.Print \"中文标识符也能压缩\"",
+        "End Sub",
+    ];
+    let got: Vec<&str> = m1.source.lines().map(|l| l.trim_end_matches(char::from(13))).collect();
+    assert_eq!(got.len(), want.len(), "行数不对: {got:#?}");
+    for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+        assert_eq!(a, b, "第 {} 行不一致", i + 1);
+    }
+}
+
+#[test]
+fn all_modules_decode() {
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/real_macro.xlsm"
+    ));
+    let bytes = sheetcore::vba::read_vba(path).expect("读不到宏");
+    let mods = sheetcore::vba_src::read_modules(&bytes).expect("解析失败");
+    assert_eq!(mods.len(), 3, "应有 3 个模块: {mods:?}");
+    for m in mods.iter() {
+        assert!(
+            !m.kind.starts_with("无法解析"),
+            "{} 没解出来（{}）",
+            m.name,
+            m.kind
+        );
+        assert!(
+            m.source.starts_with("Attribute VB_Name"),
+            "{} 源码开头不对: {:?}",
+            m.name,
+            &m.source.chars().take(60).collect::<String>()
+        );
+    }
 }
