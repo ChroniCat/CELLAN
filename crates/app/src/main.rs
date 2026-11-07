@@ -121,6 +121,7 @@ struct SheetApp {
     a_done: bool,
     b5_done: bool,
     b6_done: bool,
+    c2_done: bool,
     /// 远端做过的结构改动（本地换文件后要重新套用）
     struct_history: Vec<(usize, sheetcore::structural::Structural)>,
     /// 已套用到当前工作簿的历史条数
@@ -145,6 +146,8 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// 成员列表窗口
+    members_open: bool,
     /// 圈释无效数据
     circle_invalid: bool,
     /// 无效格集合（(行,列)）
@@ -261,6 +264,7 @@ impl SheetApp {
             a_done: false,
             b5_done: false,
             b6_done: false,
+            c2_done: false,
             struct_history: Vec::new(),
             history_planted: 0,
             history_last_epoch: u64::MAX,
@@ -274,6 +278,7 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             cf_mgr: false,
+            members_open: false,
             circle_invalid: false,
             invalid_cells: std::collections::HashSet::new(),
             invalid_gen: u64::MAX,
@@ -557,6 +562,23 @@ impl SheetApp {
         self.begin_edit(None);
         self.editing = None; // 只验租约，不开编辑框
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
+    /// 无界面自检：成员列表内容（谁在线、在哪个格）
+    fn c2_probe(&mut self) {
+        if std::env::var("SC_C2").is_err() || self.net.is_none() {
+            return;
+        }
+        if self.t0.elapsed().as_secs() < 6 || self.c2_done {
+            return;
+        }
+        self.c2_done = true;
+        let mut members: Vec<String> = Vec::new();
+        for (site, name, _) in self.peers_list.iter() {
+            let pos = self.remote.get(site).map(|(_, _, r, c)| format!("({r},{c})"));
+            members.push(format!("{name}#{site}@{pos:?}"));
+        }
+        eprintln!("[C2] 成员 {} 人: {:?}", members.len(), members);
     }
 
     /// 无界面自检：圈释无效 + 输入提示
@@ -1327,6 +1349,79 @@ impl SheetApp {
         } else {
             format!("已分成 {n} 列")
         };
+    }
+
+    /// 在线成员：谁在哪儿，点一下跳过去
+    fn members_window(&mut self, ctx: &egui::Context) {
+        if !self.members_open {
+            return;
+        }
+        let mut open = true;
+        let mut jump: Option<(u32, u32)> = None;
+        egui::Window::new("在线成员")
+            .open(&mut open)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                let me = self.net.as_ref().map(|n| n.site);
+                if self.peers_list.is_empty() && self.net.is_none() {
+                    ui.label("当前没有共享");
+                }
+                for (site, name, color) in self.peers_list.clone() {
+                    let is_me = Some(site) == me;
+                    ui.horizontal(|ui| {
+                        let c = match color % 7 {
+                            0 => egui::Color32::from_rgb(230, 81, 0),
+                            1 => egui::Color32::from_rgb(0, 121, 107),
+                            2 => egui::Color32::from_rgb(106, 27, 154),
+                            3 => egui::Color32::from_rgb(2, 119, 189),
+                            4 => egui::Color32::from_rgb(198, 40, 40),
+                            5 => egui::Color32::from_rgb(46, 125, 50),
+                            _ => egui::Color32::from_rgb(255, 143, 0),
+                        };
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.5, c);
+                        let label = if is_me {
+                            format!("{name}（我）")
+                        } else {
+                            name.clone()
+                        };
+                        ui.label(label);
+                        // 远端光标位置
+                        let pos = self
+                            .remote
+                            .get(&site)
+                            .map(|(_, _, r, c)| (*r, *c))
+                            .or(if is_me { Some(self.sel) } else { None });
+                        if let Some((r, c)) = pos {
+                            if !is_me {
+                                if ui
+                                    .small_button(format!("{}", cell_name(r, c)))
+                                    .on_hover_text("跳到他所在的位置")
+                                    .clicked()
+                                {
+                                    jump = Some((r, c));
+                                }
+                            } else {
+                                ui.label(egui::RichText::new(cell_name(r, c)).weak());
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("位置来自对方的选区广播，没动过的人不显示")
+                        .weak()
+                        .size(10.0),
+                );
+            });
+        if let Some((r, c)) = jump {
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+            self.status = format!("已跳到 {}", cell_name(r, c));
+        }
+        self.members_open = open;
     }
 
     /// 算出当前表里不符合数据验证的格子（上限 5 万格，避免卡死）
@@ -5259,6 +5354,9 @@ impl SheetApp {
                 }
                 net::NetEvent::Cursor(c) => {
                     let me = self.peer.as_ref().map(|p| p.site).unwrap_or(0);
+                    if std::env::var("SC_C2").is_ok() {
+                        eprintln!("[C2] 收到光标 site={} sheet={} ({},{}) 我={} 当前表={}", c.site, c.sheet, c.row, c.col, me, self.sheet_idx);
+                    }
                     if c.site != me && c.sheet == self.sheet_idx {
                         self.remote.insert(c.site, (c.name, c.color, c.row, c.col));
                     }
@@ -5352,6 +5450,7 @@ impl eframe::App for SheetApp {
         self.a_group_probe(ctx);
         self.b5_probe();
         self.b6_probe(ctx);
+        self.c2_probe();
         self.chart_dialog(ctx);
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
@@ -5359,6 +5458,7 @@ impl eframe::App for SheetApp {
         self.find_dialog(ctx);
         self.data_dialog(ctx);
         self.cf_manager(ctx);
+        self.members_window(ctx);
         if self.circle_invalid {
             self.compute_invalid();
         }
@@ -5429,10 +5529,13 @@ impl eframe::App for SheetApp {
                         self.join_shared();
                     }
                 } else {
-                    ui.colored_label(
+                    let online = ui.colored_label(
                         egui::Color32::from_rgb(46, 125, 50),
-                        format!("协作中 · 在线 {}", self.peers_list.len()),
+                        format!("协作中 · 在线 {} ▾", self.peers_list.len()),
                     );
+                    if online.interact(egui::Sense::click()).clicked() {
+                        self.members_open = true;
+                    }
                 }
                 ui.separator();
                 ui.label(format!("{}{}", self.wb.title(), if self.wb.dirty { " *" } else { "" }));
