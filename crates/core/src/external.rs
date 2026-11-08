@@ -94,6 +94,49 @@ impl Source {
     }
 }
 
+/// 把存的路径解析成真实路径：
+/// - 绝对路径且存在 → 直接用
+/// - 否则按工作簿所在目录解析（换机器、换盘符也能找到同一个盘上的文件）
+pub fn resolve_path(wb: &crate::model::Workbook, stored: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(stored);
+    if p.is_absolute() && p.exists() {
+        return p.to_path_buf();
+    }
+    if let Some(dir) = wb.path.as_ref().and_then(|x| x.parent()) {
+        let joined = if p.is_absolute() {
+            // 绝对路径失效了：退而求其次，按文件名在同一个目录下找
+            match p.file_name() {
+                Some(f) => dir.join(f),
+                None => dir.join(stored),
+            }
+        } else {
+            dir.join(p)
+        };
+        if joined.exists() {
+            return joined;
+        }
+        return joined;
+    }
+    p.to_path_buf()
+}
+
+/// 能不能存成相对路径（和文件放一起时就存相对的，换机器还能用）
+pub fn store_path(wb: &crate::model::Workbook, path: &std::path::Path) -> String {
+    if let (Some(dir), Ok(rel)) = (
+        wb.path.as_ref().and_then(|x| x.parent()),
+        path.strip_prefix(
+            wb.path
+                .as_ref()
+                .and_then(|x| x.parent())
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        ),
+    ) {
+        let _ = dir;
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    path.to_string_lossy().to_string()
+}
+
 /// 每行按分隔符切分，支持双引号包裹（`""` 是转义的双引号）
 pub fn split_line(line: &str, delim: char) -> Vec<String> {
     let mut out = Vec::new();
@@ -178,11 +221,21 @@ pub fn copy_from_sheet(
     let (r1, c1, r2, c2) = rect;
     let mut rows = 0;
     let mut cols = 0;
+    // 表名带空格或特殊字符时要加单引号，跟 Excel 一致
+    let quoted = if src.name.chars().any(|c| !c.is_alphanumeric() && c != '_') {
+        format!("'{}'", src.name.replace('\'', "''"))
+    } else {
+        src.name.clone()
+    };
     for r in r1..=r2 {
         for c in c1..=c2 {
-            if let Some(cell) = src.get(r, c) {
-                dst.set(at.0 + (r - r1), at.1 + (c - c1), cell.clone());
-            }
+            let formula = Some(format!("={quoted}!{}", crate::model::cell_name(r, c)).into());
+            let value = src.get(r, c).map(|x| x.value.clone()).unwrap_or_default();
+            dst.set(
+                at.0 + (r - r1),
+                at.1 + (c - c1),
+                Cell { value: value.clone(), formula },
+            );
             cols = cols.max(c - c1 + 1);
         }
         rows = rows.max(r - r1 + 1);
@@ -194,7 +247,8 @@ pub fn copy_from_sheet(
 pub fn refresh(wb: &mut crate::model::Workbook, sheet_idx: usize, src: &Source) -> std::io::Result<(u32, u32)> {
     match &src.kind {
         Kind::Csv { path, delim, header } => {
-            import_csv(&mut wb.sheets[sheet_idx], path, *delim, *header, src.at)
+            let real = resolve_path(wb, path);
+            import_csv(&mut wb.sheets[sheet_idx], &real.to_string_lossy(), *delim, *header, src.at)
         }
         Kind::Internal { sheet, rect } => {
             let Some(si) = wb.sheets.iter().position(|s| &s.name == sheet) else {

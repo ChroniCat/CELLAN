@@ -99,6 +99,9 @@ struct SheetApp {
     note_edit: Option<(u32, u32, String)>,
     /// 跨表取数对话框：输入文本
     link_dlg: Option<String>,
+    /// 运行宏对话框：宏名
+    macro_run_dlg: Option<String>,
+    macro_ran: bool,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -272,6 +275,8 @@ impl SheetApp {
             dv_open: None,
             note_edit: None,
             link_dlg: None,
+            macro_run_dlg: None,
+            macro_ran: false,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -1829,7 +1834,8 @@ impl SheetApp {
         self.doc_gen = self.doc_gen.wrapping_add(1);
         // 登记成数据源：换台机器/重开文件还能刷新
         let size = (rows.len() as u32, max_c);
-        let key = (path.to_string_lossy().to_string(), r0, c0);
+        let stored_path = sheetcore::external::store_path(&self.wb, path);
+        let key = (stored_path.clone(), r0, c0);
         let existing = self.wb.sources.iter_mut().find(|src| match &src.kind {
             sheetcore::external::Kind::Csv { path: p, .. } => {
                 (p.clone(), src.at.0, src.at.1) == key
@@ -1839,7 +1845,8 @@ impl SheetApp {
         let src = sheetcore::external::Source {
             name: String::new(),
             kind: sheetcore::external::Kind::Csv {
-                path: path.to_string_lossy().to_string(),
+                // 和文件放一起就存相对路径，换机器也能刷新
+                path: stored_path.clone(),
                 delim: ',',
                 header: false,
             },
@@ -3511,10 +3518,18 @@ impl SheetApp {
             }
             if ui
                 .add_enabled(self.wb.has_vba, egui::Button::new("查看宏代码…"))
-                .on_hover_text("只读展示 VBA 源码，不执行")
+                .on_hover_text("只读展示 VBA 源码")
                 .clicked()
             {
                 self.open_macro_view();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(self.wb.has_vba, egui::Button::new("运行宏…"))
+                .on_hover_text("交给本机 Excel 执行（需要装了 Excel），跑完结果存回文件")
+                .clicked()
+            {
+                self.macro_run_dlg = Some(String::new());
                 ui.close_menu();
             }
             ui.separator();
@@ -3877,6 +3892,104 @@ impl SheetApp {
         }
         if open && !apply {
             self.link_dlg = Some(text);
+        }
+    }
+
+
+    /// 用本机 Excel 跑宏。
+    ///
+    /// 我们不做 VBA 解释器（那是一个编译器的工程量），但用户的宏本来就在 Excel 里
+    /// 能跑：这里把文件交给本机 Excel 的 COM 接口执行，跑完把结果存回同一个文件。
+    fn run_macro_via_excel(&mut self, macro_name: &str) {
+        let Some(path) = self.wb.path.clone() else {
+            self.status = "先保存文件，再运行宏".into();
+            return;
+        };
+        if macro_name.trim().is_empty() {
+            self.status = "宏名不能为空（形如 Module1.MyMacro）".into();
+            return;
+        }
+        let ps = format!(
+            "$ErrorActionPreference='Stop'; $xl=New-Object -ComObject Excel.Application; \
+             $xl.Visible=$false; $xl.DisplayAlerts=$false; \
+             try {{ $wb=$xl.Workbooks.Open('{p}'); $xl.Run('{m}'); $wb.Save(); $wb.Close($false); \
+             Write-Output 'OK' }} finally {{ $xl.Quit() }}",
+            p = path.to_string_lossy().replace('\'', "''"),
+            m = macro_name.replace('\'', "''")
+        );
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+        {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                if text.contains("OK") {
+                    self.status = format!("宏 {macro_name} 执行完毕");
+                    if let Ok(fresh) = sheetcore::xlsx::load(&path) {
+                        self.wb = fresh;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    self.status = format!("宏执行失败：{}", err.lines().next().unwrap_or("未知错误"));
+                }
+            }
+            Err(e) => self.status = format!("调不起 PowerShell：{e}"),
+        }
+    }
+
+    /// 运行宏的输入框
+    fn macro_run_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut text) = self.macro_run_dlg.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("运行宏（借助本机 Excel）")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("填宏名，例如 Module1.MyMacro");
+                ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Module1.MyMacro"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("运行").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        ui.close_menu();
+                    }
+                });
+            });
+        if apply {
+            self.run_macro_via_excel(&text);
+            return;
+        }
+        if open {
+            self.macro_run_dlg = Some(text);
+        }
+    }
+
+
+    /// 自检：用本机 Excel 跑一个宏
+    fn macro_run_probe(&mut self) {
+        let Ok(name) = std::env::var("SC_RUNMACRO") else { return };
+        if self.open_rx.is_some() || self.macro_ran {
+            return;
+        }
+        self.macro_ran = true;
+        self.run_macro_via_excel(&name);
+        eprintln!("[MACRO] {}", self.status);
+        if let Some(p) = self.wb.path.clone() {
+            if let Ok(back) = sheetcore::xlsx::load(&p) {
+                eprintln!(
+                    "[MACRO] A1={}",
+                    back.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -4508,7 +4621,7 @@ impl SheetApp {
     fn macro_window(&mut self, ctx: &egui::Context) {
         let Some((mods, mut sel)) = self.macro_win.take() else { return };
         let mut open = true;
-        egui::Window::new("宏代码（只读，不执行）")
+        egui::Window::new("宏代码（只读）")
             .open(&mut open)
             .default_size([720.0, 480.0])
             .show(ctx, |ui| {
@@ -6363,6 +6476,8 @@ impl eframe::App for SheetApp {
         self.dv_dialog(ctx);
         self.note_dialog(ctx);
         self.link_dialog(ctx);
+        self.macro_run_dialog(ctx);
+        self.macro_run_probe();
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
         self.renew_lock_if_needed();

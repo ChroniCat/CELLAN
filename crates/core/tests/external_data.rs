@@ -78,6 +78,57 @@ fn cross_sheet_copy() {
 }
 
 #[test]
+fn cross_sheet_writes_linked_formula() {
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        1,
+        sheetcore::model::Cell { value: sheetcore::model::Value::Number(7.0), formula: None },
+    );
+    wb.sheets.push(sheetcore::model::Sheet::new("销售 表"));
+    let src = Source {
+        name: "_sc_src_1".into(),
+        kind: Kind::Internal { sheet: "Sheet1".into(), rect: (0, 1, 0, 1) },
+        at: (0, 0),
+        rows: 0,
+        cols: 0,
+    };
+    external::refresh(&mut wb, 1, &src).unwrap();
+    let cell = wb.sheets[1].get(0, 0).unwrap();
+    assert_eq!(cell.formula.as_deref(), Some("=Sheet1!B1"), "要写成跨表公式，不是死值");
+    assert_eq!(cell.value.display(), "7", "同时带上缓存值");
+}
+
+#[test]
+fn relative_csv_path_resolves_next_to_workbook() {
+    let dir = std::env::temp_dir().join("sheets_native_rel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("data.csv");
+    std::fs::write(&csv, "v
+5
+").unwrap();
+    let book = dir.join("book.xlsx");
+    let _ = std::fs::remove_file(&book);
+
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.path = Some(book.clone());
+    let stored = external::store_path(&wb, &csv);
+    assert_eq!(stored, "data.csv", "同目录下存相对路径");
+
+    wb.sources.push(Source {
+        name: "_sc_src_1".into(),
+        kind: Kind::Csv { path: stored, delim: ',', header: true },
+        at: (0, 0),
+        rows: 0,
+        cols: 0,
+    });
+    let src0 = wb.sources[0].clone();
+    external::refresh(&mut wb, 0, &src0).unwrap();
+    assert_eq!(wb.sheets[0].get(1, 0).unwrap().value.display(), "5");
+    let _ = std::fs::remove_file(&book);
+}
+
+#[test]
 fn source_survives_save_and_load() {
     let csv = tmp("s.csv");
     std::fs::write(&csv, "k,v\n甲,1\n").unwrap();
