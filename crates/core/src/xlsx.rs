@@ -505,7 +505,7 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
     let t_fix = std::time::Instant::now();
     // 收尾：umya 会改坏 drawing rels 的图表关系，并留下旧的表格/批注部件
-    if restore_base.exists() {
+    if restore_base.exists() && std::env::var("SC_NO_FIXUPS").is_err() {
         // 工作表被挪目录时，关系要跟着搬过去
         if let Err(e) = crate::fixups::migrate_sheet_rels(path, &restore_base) {
             eprintln!("[save] 迁移工作表关系失败: {e:#}");
@@ -665,6 +665,10 @@ fn apply_cf_patch(
             }
         }
         if name == "xl/styles.xml" {
+            // 没有 dxfs 就别碰 styles.xml：改写反而会写坏（Excel 直接判损坏）
+            if dxfs.is_empty() {
+                return buf;
+            }
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 return crate::patch::replace_dxfs(&xml, &dxfs).into_bytes();
             }

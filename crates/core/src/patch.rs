@@ -238,7 +238,8 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                 }
                 CfKind::Scale { points } => {
                     out.push_str(&format!("<cfRule type=\"colorScale\" priority=\"{prio}\"{stop}><colorScale>"));
-                    for (i, (v, c)) in points.iter().enumerate() {
+                    // schema：先全部 <cfvo>，再全部 <color>，不能交错
+                    for (i, (v, _)) in points.iter().enumerate() {
                         let ty = if i == 0 {
                             "min"
                         } else if i == points.len() - 1 {
@@ -252,7 +253,12 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                             )),
                             _ => out.push_str(&format!("<cfvo type=\"{ty}\"/>")),
                         }
-                        out.push_str(&format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
+                    }
+                    for (_, c) in points.iter() {
+                        out.push_str(&format!(
+                            "<color rgb=\"FF{:02X}{:02X}{:02X}\"/>",
+                            c[0], c[1], c[2]
+                        ));
                     }
                     out.push_str("</colorScale></cfRule>");
                 }
@@ -461,13 +467,20 @@ pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
             }
             _ => d.f1.clone(),
         };
-        out.push_str(&format!(" formula1=\"{}\"", esc(&f1)));
-        if d.op.needs_pair() || (d.kind == DvKind::Custom && !d.f2.is_empty()) {
-            if !d.f2.is_empty() {
-                out.push_str(&format!(" formula2=\"{}\"", esc(&d.f2)));
-            }
+        // formula1/formula2 必须是子元素，写成属性 Excel 判损坏
+        let f2 = if (d.op.needs_pair() || (d.kind == DvKind::Custom && !d.f2.is_empty()))
+            && !d.f2.is_empty()
+        {
+            Some(d.f2.clone())
+        } else {
+            None
+        };
+        out.push('>');
+        out.push_str(&format!("<formula1>{}</formula1>", esc(&f1)));
+        if let Some(f2) = f2 {
+            out.push_str(&format!("<formula2>{}</formula2>", esc(&f2)));
         }
-        out.push_str("/>");
+        out.push_str("</dataValidation>");
     }
     out.push_str("</dataValidations>");
     out
@@ -535,7 +548,7 @@ mod dv_tests {
         };
         let xml = dv_xml(&[dv]);
         assert!(xml.contains("type=\"list\""));
-        assert!(xml.contains("formula1=\"&quot;甲,乙&quot;\""), "{xml}");
+        assert!(xml.contains("<formula1>&quot;甲,乙&quot;</formula1>"), "{xml}");
         let sheet = r#"<worksheet><sheetData/></worksheet>"#;
         let out = insert_dv(sheet, &xml);
         assert!(out.contains("<dataValidations"));
