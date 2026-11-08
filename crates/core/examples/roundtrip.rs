@@ -5,7 +5,13 @@ fn main() {
     let _ = std::fs::remove_file(&out);
 
     let t0 = std::time::Instant::now();
-    let wb = sheetcore::xlsx::load(&src).expect("load");
+    let mut wb = sheetcore::xlsx::load(&src).expect("load");
+    if let Ok(spec) = std::env::var("SC_ONLY") {
+        let keep: Vec<String> = spec.split(',').map(|x| x.trim().to_string()).collect();
+        let before = wb.sheets.len();
+        wb.sheets.retain(|sh| keep.iter().any(|k| sh.name.contains(k.as_str())));
+        eprintln!("[SC_ONLY] 保留 {} / {} 张表", wb.sheets.len(), before);
+    }
     let load = t0.elapsed().as_secs_f64();
 
     let mut cells = 0usize;
