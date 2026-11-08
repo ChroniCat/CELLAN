@@ -329,7 +329,8 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
 /// umya 重写工作簿骨架时会丢掉 definedNames、pivotCaches、外部连接这些东西，
 /// 而透视表、打印区域都靠它们；丢一个 Excel 就拒收整个文件。
 pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Workbook) -> Result<bool> {
-    if !base.exists() || wb.names_dirty {
+    // 名称/数据源动过就不能整段沿用：它们都写在 workbook.xml 的 definedNames 里
+    if !base.exists() || wb.names_dirty || !wb.sources.is_empty() {
         return Ok(false);
     }
     // 有任何一处改动就不动骨架：打印区域、名称、透视缓存都挂在 workbook.xml 上

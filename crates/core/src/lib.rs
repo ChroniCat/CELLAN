@@ -9,6 +9,7 @@ pub mod pic;
 pub mod sparse;
 pub mod table;
 pub mod data_tools;
+pub mod external;
 pub mod csv;
 pub mod fixups;
 pub mod dv;

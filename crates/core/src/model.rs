@@ -333,6 +333,8 @@ pub struct Workbook {
     pub has_vba: bool,
     /// 自定义名称（名称管理器里的东西）：(名字, 作用表, 公式文本)
     pub names: Vec<(String, Option<usize>, String)>,
+    /// 外部数据源（导入的 CSV、跨表取数），刷新用
+    pub sources: Vec<crate::external::Source>,
     /// 名称被改过
     pub names_dirty: bool,
     /// 结构改动记录：保存时用来搬透视表缓存里的源区域
@@ -358,6 +360,7 @@ impl Workbook {
         Self {
             has_vba: false,
             names: Vec::new(),
+            sources: Vec::new(),
             pivot_shifts: Vec::new(),
             names_dirty: false,
             pivots_pending: Vec::new(),

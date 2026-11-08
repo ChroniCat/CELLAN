@@ -97,6 +97,8 @@ struct SheetApp {
     dv_open: Option<(u32, u32)>,
     /// 批注编辑：(行, 列, 文本)
     note_edit: Option<(u32, u32, String)>,
+    /// 跨表取数对话框：输入文本
+    link_dlg: Option<String>,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -269,6 +271,7 @@ impl SheetApp {
             dv_edit: None,
             dv_open: None,
             note_edit: None,
+            link_dlg: None,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -621,6 +624,23 @@ impl SheetApp {
         self.refresh_import();
         let v = self.wb.sheet(self.sheet_idx).get(1, 0).map(|x| x.value.display()).unwrap_or_default();
         eprintln!("[B4] 刷新后 A2={v} 状态={}", self.status);
+        eprintln!("[B4] 数据源 {} 个", self.wb.sources.len());
+
+        // 存盘再重开：数据源应当还在，刷新能力才谈得上"持久"
+        let out = std::path::PathBuf::from("F:/Finance/work/b4_out.xlsx");
+        let _ = std::fs::remove_file(&out);
+        if let Err(e) = sheetcore::xlsx::save(&out, &self.wb) {
+            eprintln!("[B4] 存盘失败: {e:#}");
+            return;
+        }
+        match sheetcore::xlsx::load(&out) {
+            Ok(back) => eprintln!(
+                "[B4] 重开后数据源={} 首个={:?}",
+                back.sources.len(),
+                back.sources.first().map(|s| format!("{:?} {}", s.kind, s.rows * s.cols))
+            ),
+            Err(e) => eprintln!("[B4] 重开失败: {e:#}"),
+        }
     }
 
     /// 无界面自检：图表改颜色/轴标题 → 写盘 → 重读
@@ -683,6 +703,7 @@ impl SheetApp {
             Err(e) => eprintln!("[B1] 保存失败 {e:#}"),
         }
     }
+
 
     /// 无界面自检：Ctrl+Shift+Enter 数组公式 → 存盘带 t="array"
     fn b3_probe(&mut self) {
@@ -1806,6 +1827,38 @@ impl SheetApp {
         self.txn_end("导入 CSV", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        // 登记成数据源：换台机器/重开文件还能刷新
+        let size = (rows.len() as u32, max_c);
+        let key = (path.to_string_lossy().to_string(), r0, c0);
+        let existing = self.wb.sources.iter_mut().find(|src| match &src.kind {
+            sheetcore::external::Kind::Csv { path: p, .. } => {
+                (p.clone(), src.at.0, src.at.1) == key
+            }
+            _ => false,
+        });
+        let src = sheetcore::external::Source {
+            name: String::new(),
+            kind: sheetcore::external::Kind::Csv {
+                path: path.to_string_lossy().to_string(),
+                delim: ',',
+                header: false,
+            },
+            at: (r0, c0),
+            rows: size.0,
+            cols: size.1,
+        };
+        match existing {
+            Some(slot) => {
+                slot.rows = size.0;
+                slot.cols = size.1;
+            }
+            None => {
+                let n = self.wb.sources.len() + 1;
+                let mut src = src;
+                src.name = format!("_sc_src_{n}");
+                self.wb.sources.push(src);
+            }
+        }
         self.last_import = Some((path.to_path_buf(), r0, c0));
         self.status = format!(
             "已导入 {} 行 × {} 列（{}）",
@@ -1815,16 +1868,44 @@ impl SheetApp {
         );
     }
 
-    /// 重新读一次上次导入的文件（文件变了就同步过来）
+    /// 刷新数据：优先按登记过的数据源重读，没有就退回"上次导入"
     fn refresh_import(&mut self) {
-        match self.last_import.clone() {
-            Some((path, r, c)) => {
-                self.sel = (r, c);
-                self.sel_end = (r, c);
-                self.import_csv_from(&path);
+        if self.wb.sources.is_empty() {
+            match self.last_import.clone() {
+                Some((path, r, c)) => {
+                    self.sel = (r, c);
+                    self.sel_end = (r, c);
+                    self.import_csv_from(&path);
+                }
+                None => self.status = "还没有导入过外部数据".into(),
             }
-            None => self.status = "还没有导入过外部数据".into(),
+            return;
         }
+        let idx = self.sheet_idx;
+        let sources = self.wb.sources.clone();
+        let mut ok = 0;
+        let mut fail = 0;
+        for mut src in sources {
+            match sheetcore::external::refresh(&mut self.wb, idx, &src) {
+                Ok((rows, cols)) => {
+                    ok += 1;
+                    // 行数变了就更新记录，下次保存写回去
+                    if let Some(slot) = self.wb.sources.iter_mut().find(|s| s.name == src.name) {
+                        slot.rows = rows;
+                        slot.cols = cols;
+                    }
+                    src.rows = rows;
+                }
+                Err(_) => fail += 1,
+            }
+        }
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.wb.dirty = true;
+        self.status = if fail == 0 {
+            format!("已刷新 {ok} 个数据源")
+        } else {
+            format!("刷新完成：成功 {ok}，失败 {fail}")
+        };
     }
 
     /// 把选区转成 Excel 表格对象（ListObject），首行当列名
@@ -2869,6 +2950,10 @@ impl SheetApp {
                     self.import_csv();
                     ui.close_menu();
                 }
+                if ui.button("从另一张表取数…").clicked() {
+                    self.link_dlg = Some(String::new());
+                    ui.close_menu();
+                }
                 if ui.button("刷新导入").clicked() {
                     self.refresh_import();
                     ui.close_menu();
@@ -3716,6 +3801,84 @@ impl SheetApp {
         };
     }
 
+
+
+    /// 从另一张表取数：输入 "表名!A1:C10"，结果贴到当前选区左上角，
+    /// 并登记成可刷新的数据源
+    fn link_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut text) = self.link_dlg.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("从另一张表取数")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("格式：表名!A1:C10");
+                ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("销售!A1:C100"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        ui.close_menu();
+                    }
+                });
+            });
+        if apply {
+            let spec = text.trim().to_string();
+            if let Some((sheet_name, range)) = spec.split_once('!') {
+                if let (Some(r1c1), Some(r2c2)) = (
+                    sheetcore::sparse::parse_ref(range.split(':').next().unwrap_or("A1")),
+                    sheetcore::sparse::parse_ref(range.split(':').nth(1).unwrap_or(range)),
+                ) {
+                    let rect = (r1c1.0, r1c1.1, r2c2.0, r2c2.1);
+                    let at = self.sel;
+                    let n = self.wb.sources.len() + 1;
+                    let src = sheetcore::external::Source {
+                        name: format!("_sc_src_{n}"),
+                        kind: sheetcore::external::Kind::Internal {
+                            sheet: sheet_name.trim().to_string(),
+                            rect,
+                        },
+                        at,
+                        rows: 0,
+                        cols: 0,
+                    };
+                    let idx = self.sheet_idx;
+                    match sheetcore::external::refresh(&mut self.wb, idx, &src) {
+                        Ok((rows, cols)) => {
+                            self.wb.sources.push(sheetcore::external::Source {
+                                rows,
+                                cols,
+                                ..src
+                            });
+                            self.wb.dirty = true;
+                            self.doc_gen = self.doc_gen.wrapping_add(1);
+                            self.status = format!(
+                                "已从 {} 取数 {} 行 × {} 列（可刷新）",
+                                sheet_name.trim(), rows, cols
+                            );
+                        }
+                        Err(e) => self.status = format!("取数失败：{e}"),
+                    }
+                } else {
+                    self.status = "区间写法看不懂，像 A1:C10".into();
+                }
+            } else {
+                self.status = "格式要写成 表名!A1:C10".into();
+            }
+            return;
+        }
+        if open && !apply {
+            self.link_dlg = Some(text);
+        }
+    }
 
     /// 数据菜单：排序与筛选
     fn toolbar_data(&mut self, ui: &mut egui::Ui) {
@@ -6199,6 +6362,7 @@ impl eframe::App for SheetApp {
         }
         self.dv_dialog(ctx);
         self.note_dialog(ctx);
+        self.link_dialog(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
         self.renew_lock_if_needed();

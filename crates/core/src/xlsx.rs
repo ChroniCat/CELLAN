@@ -25,6 +25,17 @@ pub fn load(path: &Path) -> Result<Workbook> {
 
     let mut wb = Workbook {
         names: crate::patch::read_defined_names(path),
+        // 数据源存在 `_sc_src_*` 名称里，读出来重建
+        sources: crate::patch::read_defined_names(path)
+            .iter()
+            .filter_map(|(n, _, t)| {
+                if n.starts_with("_sc_src_") {
+                    crate::external::Source::from_name_text(n, t)
+                } else {
+                    None
+                }
+            })
+            .collect(),
         names_dirty: false,
         pivot_shifts: Vec::new(),
         has_vba: crate::vba::has_macros(path),
@@ -466,8 +477,13 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
 
     // 自定义名称
-    if wb.names_dirty && !wb.names.is_empty() {
-        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
+    // 自定义名称 + 数据源（_sc_src_N）一起写
+    let mut all_names = wb.names.clone();
+    for (i, src) in wb.sources.iter().enumerate() {
+        all_names.push((format!("_sc_src_{}", i + 1), None, src.to_name_text()));
+    }
+    if (wb.names_dirty || !wb.sources.is_empty()) && !all_names.is_empty() {
+        if let Err(e) = crate::patch::write_user_names(path, &all_names) {
             eprintln!("[save] 名称回写失败: {e:#}");
         }
     }
