@@ -248,6 +248,12 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         None
     };
     let restore_base = restore_src.clone().unwrap_or_else(|| base.clone());
+    // 样式表在写之前先留一份：base 可能就是目标文件，写完再读就变味了
+    let base_styles: Option<Vec<u8>> = if restore_base.exists() {
+        crate::fixups::read_part(&restore_base, "xl/styles.xml")
+    } else {
+        None
+    };
     let mut book = if base.exists() {
         read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
     } else {
@@ -419,6 +425,22 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
     out?;
 
+    // 样式表原样沿用基准：umya 重建的样式表和原文件对不上（字体/填充被裁、dxfs 被压）
+    let untouched = wb
+        .sheets
+        .iter()
+        .all(|s| !s.edited && !s.merges_dirty && !s.notes_dirty && !s.charts_dirty);
+    if let Some(xml) = base_styles.as_ref().filter(|_| untouched) {
+        match crate::patch::append_entry(path, "xl/styles.xml", xml) {
+            Ok(()) => {
+                if prof {
+                    eprintln!("  [save] 样式表沿用基准");
+                }
+            }
+            Err(e) => eprintln!("[save] 恢复样式表失败: {e:#}"),
+        }
+    }
+
     // 宏部件：umya 写不出来，塞回去
     if let Some(v) = vba {
         if let Err(e) = crate::vba::restore_vba(path, &v) {
@@ -549,8 +571,47 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             Err(e) => eprintln!("[save] 恢复未编辑工作表失败: {e:#}"),
             _ => {}
         }
+        // umya 会把工作表搬到 xl/worksheets/，搬回去（绘图/图表/透视表的相对路径才成立）
+        match crate::fixups::rehome_sheets(path, &restore_base) {
+            Ok(v) if !v.is_empty() => {
+                if prof {
+                    eprintln!("  [save] 工作表放回原位 {} 张", v.len());
+                }
+            }
+            Err(e) => eprintln!("[save] 工作表归位失败: {e:#}"),
+            _ => {}
+        }
+        match crate::fixups::restore_workbook_skeleton(path, &restore_base, wb) {
+            Ok(true) => {
+                if prof {
+                    eprintln!("  [save] 工作簿骨架沿用基准（definedNames/pivotCaches 保住）");
+                }
+            }
+            Err(e) => eprintln!("[save] 恢复工作簿骨架失败: {e:#}"),
+            _ => {}
+        }
+        let _ = crate::fixups::ensure_content_types(path, &restore_base);
         // 恢复后清一遍孤儿部件（基准部件另有一份同类型副本时会重复）
         let _ = crate::fixups::prune_orphans(path);
+        if std::env::var("SC_NO_NORM_STYLES").is_err() {
+        match crate::fixups::normalize_styles_counts(path) {
+            Ok(true) => {
+                if prof {
+                    eprintln!("  [save] 重算 styles.xml 的 count");
+                }
+            }
+            Err(e) => eprintln!("[save] 重算 styles count 失败: {e:#}"),
+            _ => {}
+        }
+        }
+        match crate::fixups::prune_content_types(path) {
+            Ok(n) if n > 0 => {
+                if prof {
+                    eprintln!("  [save] 清掉 {n} 条悬空内容类型");
+                }
+            }
+            _ => {}
+        }
     }
     if prof {
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());

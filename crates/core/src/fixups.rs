@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
-fn read_entry(path: &Path, name: &str) -> Option<Vec<u8>> {
+pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let mut f = zip.by_name(name).ok()?;
     let mut buf = Vec::new();
@@ -65,12 +65,12 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
         if !name.starts_with("xl/drawings/_rels/") || !name.ends_with(".rels") {
             continue;
         }
-        let Some(old_xml) = read_entry(base, &name).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(old_xml) = read_part(base, &name).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
-        let Some(new_xml) = read_entry(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(new_xml) = read_part(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
             // 新文件里整个 rels 都没了：直接把基准的搬过来
-            if let Some(raw) = read_entry(base, &name) {
+            if let Some(raw) = read_part(base, &name) {
                 crate::patch::append_entry(path, &name, &raw)?;
                 fixed.push(format!("{name}（整体恢复）"));
             }
@@ -162,7 +162,7 @@ pub fn restore_unedited_sheets(
         let Some(base_part) = base_targets.get(&sheet.name) else { continue };
         let Some(new_part) = new_targets.get(&sheet.name) else { continue };
 
-        let Some(xml) = read_entry(base, base_part) else { continue };
+        let Some(xml) = read_part(base, base_part) else { continue };
         pending.push((new_part.clone(), xml));
 
         // 关系表：路径可能变了，Target 要按新目录重算
@@ -170,11 +170,11 @@ pub fn restore_unedited_sheets(
         let new_rels = new_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
         if base_part == new_part {
             // 路径没变：rels 原样照抄，一个字节都不改
-            if let Some(raw) = read_entry(base, &base_rels) {
+            if let Some(raw) = read_part(base, &base_rels) {
                 if let Ok(text) = String::from_utf8(raw.clone()) {
                     for (_, (_, target)) in parse_rels(&text) {
                         let abs = resolve_target(&base_rels, &target);
-                        if let Some(body) = read_entry(base, &abs) {
+                        if let Some(body) = read_part(base, &abs) {
                             pending.push((abs.clone(), body));
                         }
                     }
@@ -184,14 +184,14 @@ pub fn restore_unedited_sheets(
                 continue;
             }
         }
-        if let Some(rels) = read_entry(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) {
+        if let Some(rels) = read_part(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) {
             let mut out = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
             );
             for (id, (ty, target)) in parse_rels(&rels) {
                 let abs = resolve_target(&base_rels, &target);
                 // 被引用的部件也按基准恢复（表格定义、绘图、VML、批注…）
-                if let Some(body) = read_entry(base, &abs) {
+                if let Some(body) = read_part(base, &abs) {
                     pending.push((abs.clone(), body));
                 }
                 let rel = relative_to(&new_rels, &abs);
@@ -211,6 +211,285 @@ pub fn restore_unedited_sheets(
     Ok(log)
 }
 
+
+/// rels 路径：xl/worksheets/sheet1.xml -> xl/worksheets/_rels/sheet1.xml.rels
+fn rels_of(part: &str) -> String {
+    match part.rfind('/') {
+        Some(i) => format!("{}/_rels/{}.rels", &part[..i], &part[i + 1..]),
+        None => format!("_rels/{part}.rels"),
+    }
+}
+
+/// 把 umya 搬家后的工作表放回原位。
+///
+/// umya 一律把工作表写到 xl/worksheets/，而真实工作簿可能把它们放在
+/// xl/任意子目录/worksheets/ 下。搬家会让所有相对引用（绘图、图表、透视表）
+/// 全部对不上，Excel 直接拒收。这里把部件挪回基准路径，并把
+/// workbook.xml.rels 与各表 rels 的目标改回去。
+pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let base_targets = crate::patch::sheet_targets(base)?;
+    let new_targets = crate::patch::sheet_targets(path)?;
+
+    let mut moves: Vec<(String, String)> = Vec::new(); // (新路径, 基准路径)
+    for (name, bpart) in base_targets.iter() {
+        if let Some(npart) = new_targets.get(name) {
+            if npart != bpart {
+                moves.push((npart.clone(), bpart.clone()));
+            }
+        }
+    }
+    if moves.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut removes: Vec<String> = Vec::new();
+
+    // 先把内容全部读出来再写：两个基准目录下的同名文件会撞车，
+    // 边读边写会让后一个把前一个覆盖掉。
+    let snapshot: Vec<(String, String, Option<Vec<u8>>, Option<Vec<u8>>)> = moves
+        .iter()
+        .map(|(npart, bpart)| {
+            let body = read_part(path, npart);
+            let rels = read_part(path, &rels_of(npart));
+            (npart.clone(), bpart.clone(), body, rels)
+        })
+        .collect();
+    for (npart, bpart, body, rels_raw) in snapshot.iter() {
+        if let Some(body) = body {
+            pending.push((bpart.clone(), body.clone()));
+        }
+        removes.push(npart.clone());
+
+        let nrels = rels_of(npart);
+        let brels = rels_of(bpart);
+        if let Some(raw) = rels_raw.clone().and_then(|b| String::from_utf8(b).ok()) {
+            let mut out = String::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            );
+            for (id, (ty, target)) in parse_rels(&raw) {
+                let abs = resolve_target(&nrels, &target);
+                let rel = relative_to(&brels, &abs);
+                out.push_str(&format!(
+                    "<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{rel}\"/>"
+                ));
+            }
+            out.push_str("</Relationships>");
+            pending.push((brels, out.into_bytes()));
+            removes.push(nrels);
+        }
+    }
+
+    // workbook.xml.rels 指向新的工作表路径
+    let wrels = "xl/_rels/workbook.xml.rels";
+    if let Some(raw) = read_part(path, wrels).and_then(|b| String::from_utf8(b).ok()) {
+        let mut out = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+        );
+        for (id, (ty, target)) in parse_rels(&raw) {
+            let abs = resolve_target(wrels, &target);
+            let fixed = moves
+                .iter()
+                .find(|(n, _)| *n == abs)
+                .map(|(_, b)| b.clone())
+                .unwrap_or(abs);
+            let rel = relative_to(wrels, &fixed);
+            out.push_str(&format!(
+                "<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{rel}\"/>"
+            ));
+        }
+        out.push_str("</Relationships>");
+        pending.push((wrels.to_string(), out.into_bytes()));
+    }
+
+    crate::patch::append_entries(path, &pending)?;
+    // 别删掉刚好是别人目的地的路径
+    let dests: std::collections::HashSet<String> = moves.iter().map(|(_, b)| b.clone()).collect();
+    for r in removes {
+        if dests.contains(&r) {
+            continue;
+        }
+        let _ = crate::patch::remove_entry(path, &r);
+    }
+    Ok(moves.into_iter().map(|(_, b)| b).collect())
+}
+
+
+/// 工作表名字与顺序没变时，workbook.xml / workbook.xml.rels 整段用基准的。
+///
+/// umya 重写工作簿骨架时会丢掉 definedNames、pivotCaches、外部连接这些东西，
+/// 而透视表、打印区域都靠它们；丢一个 Excel 就拒收整个文件。
+pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Workbook) -> Result<bool> {
+    if !base.exists() || wb.names_dirty {
+        return Ok(false);
+    }
+    // 有任何一处改动就不动骨架：打印区域、名称、透视缓存都挂在 workbook.xml 上
+    let touched = wb.sheets.iter().any(|s| {
+        s.edited
+            || s.merges_dirty
+            || s.cf_dirty
+            || s.dv_dirty
+            || s.notes_dirty
+            || s.freeze_dirty
+            || s.filter_dirty
+            || s.page_dirty
+            || s.charts_dirty
+    });
+    if touched {
+        return Ok(false);
+    }
+    let base_xml = match read_part(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let mut base_names: Vec<String> = Vec::new();
+    let mut rest = base_xml.as_str();
+    while let Some(i) = rest.find("<sheet ") {
+        rest = &rest[i + 7..];
+        let end = match rest.find('>') {
+            Some(e) => e,
+            None => break,
+        };
+        let tag = &rest[..end];
+        if let Some(p) = tag.find("name=\"") {
+            let after = &tag[p + 6..];
+            if let Some(q) = after.find('"') {
+                base_names.push(after[..q].to_string());
+            }
+        }
+    }
+    let here: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
+    if here != base_names {
+        return Ok(false);
+    }
+    let mut pending: Vec<(String, Vec<u8>)> = vec![("xl/workbook.xml".to_string(), base_xml.into_bytes())];
+    if let Some(rels) = read_part(base, "xl/_rels/workbook.xml.rels") {
+        pending.push(("xl/_rels/workbook.xml.rels".to_string(), rels));
+    }
+    crate::patch::append_entries(path, &pending)?;
+    Ok(true)
+}
+
+
+/// 去掉 [Content_Types].xml 里指向已不存在部件的 Override。
+///
+/// 部件被搬走/删除后 Override 会悬空，Excel 见到就判文件损坏。
+pub fn prune_content_types(path: &Path) -> Result<usize> {
+    let names: std::collections::HashSet<String> = entries(path)
+        .into_iter()
+        .map(|n| n.trim_start_matches('/').to_string())
+        .collect();
+    let Some(ct) = read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok())
+    else {
+        return Ok(0);
+    };
+    let mut out = String::with_capacity(ct.len());
+    let mut rest = ct.as_str();
+    let mut removed = 0usize;
+    while let Some(i) = rest.find("<Override ") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find("/>").map(|e| e + 2).or_else(|| tail.find('>').map(|e| e + 1));
+        let Some(end) = end else {
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let tag = &tail[..end];
+        let gone = tag
+            .find("PartName=\"")
+            .map(|p| {
+                let after = &tag[p + 10..];
+                let name = after.split('"').next().unwrap_or("");
+                !names.contains(name.trim_start_matches('/'))
+            })
+            .unwrap_or(false);
+        if gone {
+            removed += 1;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    if removed > 0 {
+        crate::patch::append_entry(path, "[Content_Types].xml", out.as_bytes())?;
+    }
+    Ok(removed)
+}
+
+
+/// 重算 styles.xml 里各容器的 count 属性。
+///
+/// 我们补 dxf 时是往后追加的，count 没跟着变；Excel 对不上就判文件损坏。
+pub fn normalize_styles_counts(path: &Path) -> Result<bool> {
+    let Some(xml) = read_part(path, "xl/styles.xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(false);
+    };
+    let groups: [(&str, &[&str]); 9] = [
+        ("numFmts", &["numFmt"]),
+        ("fonts", &["font"]),
+        ("fills", &["fill"]),
+        ("borders", &["border"]),
+        ("cellStyleXfs", &["xf"]),
+        ("cellXfs", &["xf"]),
+        ("cellStyles", &["cellStyle"]),
+        ("dxfs", &["dxf"]),
+        ("tableStyles", &["tableStyle"]),
+    ];
+    let mut out = xml;
+    let mut changed = false;
+    for (group, kids) in groups {
+        let open = format!("<{group}");
+        let Some(start) = out.find(&open) else { continue };
+        let Some(gt) = out[start..].find('>').map(|i| start + i) else { continue };
+        let open_tag = out[start..gt + 1].to_string();
+        if open_tag.ends_with("/>") {
+            continue;
+        }
+        let close = format!("</{group}>");
+        let Some(cend) = out[start..].find(&close).map(|i| start + i) else { continue };
+        let body = out[gt + 1..cend].to_string();
+        let mut n = 0usize;
+        for k in kids {
+            let pat = format!("<{k}");
+            let mut from = 0usize;
+            while let Some(i) = body[from..].find(&pat) {
+                let idx = from + i;
+                let next = body[idx + pat.len()..].chars().next().unwrap_or(' ');
+                if matches!(next, '>' | ' ' | '/' | '\r' | '\n') {
+                    n += 1;
+                }
+                from = idx + pat.len();
+            }
+        }
+        let new_tag = match open_tag.find("count=\"") {
+            Some(p) => {
+                let after = &open_tag[p + 7..];
+                let q = after.find('"').unwrap_or(after.len());
+                format!("{}count=\"{}\"{}", &open_tag[..p], n, &after[(q + 1).min(after.len())..])
+            }
+            None => {
+                let mut t = open_tag.clone();
+                let at = t.len() - 1;
+                t.insert_str(at, &format!(" count=\"{n}\""));
+                t
+            }
+        };
+        if new_tag != open_tag {
+            out = format!("{}{}{}", &out[..start], new_tag, &out[gt + 1..]);
+            changed = true;
+        }
+    }
+    if changed {
+        crate::patch::append_entry(path, "xl/styles.xml", out.as_bytes())?;
+    }
+    Ok(changed)
+}
+
 /// 绘图里的非法属性值清理：umya 会写出 prst=""（空预设形状），Excel 判非法。
 pub fn sanitize_drawings(path: &Path) -> Result<Vec<String>> {
     let mut fixed = Vec::new();
@@ -218,7 +497,7 @@ pub fn sanitize_drawings(path: &Path) -> Result<Vec<String>> {
         if !name.starts_with("xl/") || !name.contains("/drawings/") || !name.ends_with(".xml") {
             continue;
         }
-        let Some(xml) = read_entry(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(xml) = read_part(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
         if !xml.contains("prst=\"\"") && !xml.contains("prstGeom prst=\"\"") {
@@ -267,10 +546,10 @@ pub fn restore_sheet_refs(path: &Path, base: &Path) -> Result<Vec<String>> {
 
     for (sheet, base_part) in base_targets.iter() {
         let Some(new_part) = new_targets.get(sheet) else { continue };
-        let Some(base_xml) = read_entry(base, base_part).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(base_xml) = read_part(base, base_part).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
-        let Some(mut new_xml) = read_entry(path, new_part).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(mut new_xml) = read_part(path, new_part).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
         // pivotTable 元素不是尾部元素，单独处理
@@ -329,16 +608,16 @@ pub fn migrate_workbook_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
     if !base.exists() {
         return Ok(Vec::new());
     }
-    let Some(base_rels) = read_entry(base, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(base_rels) = read_part(base, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
-    let Some(new_rels) = read_entry(path, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(new_rels) = read_part(path, "xl/_rels/workbook.xml.rels").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
-    let Some(base_wb) = read_entry(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(base_wb) = read_part(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
-    let Some(new_wb) = read_entry(path, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(new_wb) = read_part(path, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
     let parts = entries(path);
@@ -394,10 +673,10 @@ pub fn migrate_workbook_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 /// 补齐内容类型：从基准文件把缺的 Default（按扩展名）和 Override（按部件）抄过来。
 /// 少一条 Excel 就判整个包损坏（WPS 不校验，所以能开）。
 pub fn ensure_content_types(path: &Path, base: &Path) -> Result<Vec<String>> {
-    let Some(base_ct) = read_entry(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(base_ct) = read_part(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
-    let Some(new_ct) = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(new_ct) = read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) else {
         return Ok(Vec::new());
     };
     let parts = entries(path);
@@ -460,7 +739,7 @@ pub fn dedupe_singleton_rels(path: &Path) -> Result<Vec<String>> {
         if !name.ends_with(".rels") {
             continue;
         }
-        let Some(xml) = read_entry(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(xml) = read_part(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
         let mut seen: HashSet<String> = HashSet::new();
@@ -505,7 +784,7 @@ pub fn prune_orphans(path: &Path) -> Result<Vec<String>> {
         if !n.ends_with(".rels") {
             continue;
         }
-        let Some(xml) = read_entry(path, n).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(xml) = read_part(path, n).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
         let dir = n.rsplit_once("_rels/").map(|(d, _)| d).unwrap_or("xl/");
@@ -545,7 +824,7 @@ pub fn prune_orphans(path: &Path) -> Result<Vec<String>> {
     crate::patch::remove_entries(path, &removed)?;
     // Content_Types 里的 Override 也要清掉，否则校验会报“声明了不存在的部件”
     if !removed.is_empty() {
-        if let Some(xml) = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
+        if let Some(xml) = read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
             let mut out = String::new();
             let mut rest = xml.as_str();
             while let Some(pos) = rest.find("<Override") {
@@ -629,11 +908,11 @@ pub fn migrate_sheet_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
         let Some(new_part) = new_targets.get(sheet) else { continue };
         // 路径没变也要检查：umya 偶尔会把表的 rels 整个漏掉（S4 的 30 张图就这样丢的）
         let base_rels = base_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
-        let Some(old_xml) = read_entry(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) else {
+        let Some(old_xml) = read_part(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) else {
             continue;
         };
         let new_rels = new_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
-        let existing = read_entry(path, &new_rels)
+        let existing = read_part(path, &new_rels)
             .and_then(|b| String::from_utf8(b).ok())
             .unwrap_or_default();
         // 已经存在的按「类型 + 目标（解析成绝对路径）」判重，避免换了个 rId 就重复加
@@ -687,8 +966,8 @@ pub fn migrate_sheet_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 
     // Content_Types：引用了原来目录下的部件，就要有对应的 Override
     if !need_override.is_empty() {
-        let base_ct = read_entry(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
-        let new_ct = read_entry(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
+        let base_ct = read_part(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
+        let new_ct = read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok());
         if let (Some(base_ct), Some(new_ct)) = (base_ct, new_ct) {
             let mut add = String::new();
             for abs in need_override.iter() {
