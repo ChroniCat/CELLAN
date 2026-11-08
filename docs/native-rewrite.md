@@ -1007,3 +1007,35 @@ Excel 拒绝这类表名；换成 `SalesTable` 即正常。
 读入 9.9s  组装 DOM 2.1s  序列化 8.4s  其余补丁 17.7s  收尾 6.9s
 总计 48.0s（未编辑）/ 48.0s（改一格）
 ```
+
+## B4 升级：真·Excel 查询表（v1.30）
+
+之前只把 CSV 读进单元格，数据源信息存在自定义属性里。现在导入的 CSV 会同时挂成
+**Excel 原生 QueryTable**——打开「数据 → 查询和连接」能看到这条查询，右键就能刷新，
+刷新走的是 Excel 自己的文本驱动，不经过我们的代码。
+
+实现要点（照着 Excel 2016 实际写出的文件对齐）：
+
+| 部件 | 作用 |
+|---|---|
+| `xl/connections.xml` | 连接定义：`type="6"`（文本文件）、`textPr@sourceFile`、`codePage="65001"` |
+| `xl/queryTables/queryTableN.xml` | 查询表本体，靠 `connectionId` 挂到连接 |
+| 工作表 rels | 一条 `queryTable` 关系（工作表 XML 里**没有**对应元素，Excel 只认 rels） |
+| `xl/_rels/workbook.xml.rels` | 必须有一条 `connections` 关系，缺了 Excel 直接打不开 |
+| workbook.xml | 一条同名定义名称指向目标区域（`localSheetId` 必填） |
+
+踩到的三个坑：
+
+1. **`<textFields>` 不能省**：没有表头时我以为可以省略，结果 Excel 判文件损坏。
+   实测 Excel 无论有没有表头都写 `<textFields><textField/></textFields>`。
+2. **数据源不能塞进 definedNames**：和查询表自己的同名定义名称冲突，Excel 拒收。
+   改存 `docProps/custom.xml`（自定义文档属性，Excel 规范位置）。
+3. **`workbook.xml.rels` 缺 connections 关系**：部件齐全但 Excel 打不开。
+
+验证（Excel COM）：
+
+```
+Open OK QueryTables=1 A2=赵六
+  connection=TEXT;<workspace>\work\import.csv
+  Refresh OK A2=赵六     # 改 CSV 后刷新，Excel 自己拉到新值
+```

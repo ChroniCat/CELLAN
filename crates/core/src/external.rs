@@ -137,6 +137,147 @@ pub fn store_path(wb: &crate::model::Workbook, path: &std::path::Path) -> String
     path.to_string_lossy().to_string()
 }
 
+
+/// 从包里读数据源：优先新部件 `xl/sheetcore/sources.xml`，
+/// 老文件里存在 definedNames 的 `_sc_src_*` 也认。
+pub fn read_sources(path: &std::path::Path) -> Vec<Source> {
+    let props = read_sources_from_props(path);
+    if !props.is_empty() {
+        return props;
+    }
+    let mut out = Vec::new();
+    if let Some(xml) = crate::fixups::read_part_file(path, "xl/sheetcore/sources.xml")
+        .and_then(|b| String::from_utf8(b).ok())
+    {
+        let mut rest = xml.as_str();
+        while let Some(i) = rest.find("<source ") {
+            rest = &rest[i..];
+            let Some(gt) = rest.find('>') else { break };
+            let head = &rest[..gt];
+            let name = head
+                .find("name=\"")
+                .map(|p| {
+                    let after = &head[p + 6..];
+                    after.split('"').next().unwrap_or("").to_string()
+                })
+                .unwrap_or_default();
+            let Some(close) = rest.find("</source>") else { break };
+            let text = &rest[gt + 1..close];
+            if let Some(src) = Source::from_name_text(&name, text) {
+                out.push(src);
+            }
+            rest = &rest[close + 9..];
+        }
+    }
+    if out.is_empty() {
+        for (n, _, t) in crate::patch::read_defined_names(path) {
+            if n.starts_with("_sc_src_") {
+                if let Some(src) = Source::from_name_text(&n, &t) {
+                    out.push(src);
+                }
+            }
+        }
+    }
+    out
+}
+
+
+/// 把数据源写进 `docProps/custom.xml`（Excel 的自定义文档属性）。
+pub fn write_sources(path: &std::path::Path, sources: &[Source]) -> anyhow::Result<()> {
+    let mut body = String::new();
+    for (i, src) in sources.iter().enumerate() {
+        let name = if src.name.is_empty() { format!("_sc_src_{}", i + 1) } else { src.name.clone() };
+        let text = src.to_name_text().trim_matches('"').replace('&', "&amp;").replace('<', "&lt;");
+        body.push_str(&format!(
+            "<property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"{}\" name=\"{}\"><vt:lpwstr>{}</vt:lpwstr></property>",
+            i + 2,
+            name,
+            text
+        ));
+    }
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" \
+xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">{body}</Properties>"
+    );
+
+    let mut parts: Vec<(String, Vec<u8>)> = vec![("docProps/custom.xml".into(), xml.into_bytes())];
+
+    // 关系：包级 _rels/.rels 要指向它
+    let rels = crate::fixups::read_part(path, "_rels/.rels")
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    if !rels.contains("custom-properties") && !rels.is_empty() {
+        let max_id = rels
+            .match_indices("Id=\"rId")
+            .filter_map(|(i, _)| {
+                let after = &rels[i + 7..];
+                after.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        let rel = format!(
+            "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties\" Target=\"docProps/custom.xml\"/>",
+            max_id + 1
+        );
+        if let Some(i) = rels.rfind("</Relationships>") {
+            parts.push(("_rels/.rels".into(), format!("{}{}{}", &rels[..i], rel, &rels[i..]).into_bytes()));
+        }
+    }
+
+    // 内容类型
+    if let Some(ct) = crate::fixups::read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
+        if !ct.contains("/docProps/custom.xml") {
+            if let Some(i) = ct.rfind("</Types>") {
+                let mut out = ct.clone();
+                out.insert_str(
+                    i,
+                    "<Override PartName=\"/docProps/custom.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.custom-properties+xml\"/>",
+                );
+                parts.push(("[Content_Types].xml".into(), out.into_bytes()));
+            }
+        }
+    }
+    crate::fixups::write_parts(path, &parts)?;
+    Ok(())
+}
+
+/// 从 `docProps/custom.xml` 里读数据源
+fn read_sources_from_props(path: &std::path::Path) -> Vec<Source> {
+    let Some(xml) = crate::fixups::read_part_file(path, "docProps/custom.xml").and_then(|b| String::from_utf8(b).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut rest = xml.as_str();
+    while let Some(i) = rest.find("<property ") {
+        rest = &rest[i..];
+        let Some(gt) = rest.find('>') else { break };
+        let head = &rest[..gt];
+        let name = head
+            .find("name=\"")
+            .map(|p| {
+                let after = &head[p + 6..];
+                after.split('"').next().unwrap_or("").to_string()
+            })
+            .unwrap_or_default();
+        let Some(close) = rest.find("</property>") else { break };
+        let body = &rest[gt + 1..close];
+        if name.starts_with("_sc_src_") {
+            let text = body
+                .trim_start_matches("<vt:lpwstr>")
+                .trim_end_matches("</vt:lpwstr>")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<");
+            if let Some(src) = Source::from_name_text(&name, &text) {
+                out.push(src);
+            }
+        }
+        rest = &rest[close + 11..];
+    }
+    out
+}
+
 /// 每行按分隔符切分，支持双引号包裹（`""` 是转义的双引号）
 pub fn split_line(line: &str, delim: char) -> Vec<String> {
     let mut out = Vec::new();

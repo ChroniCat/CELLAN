@@ -23,6 +23,7 @@ pub mod print;
 pub mod pivot;
 pub mod refs;
 pub mod pivot_xml;
+pub mod qtable;
 pub mod model;
 pub mod style;
 pub mod sort_filter;

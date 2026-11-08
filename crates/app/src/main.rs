@@ -638,6 +638,10 @@ impl SheetApp {
             eprintln!("[B4] 存盘失败: {e:#}");
             return;
         }
+        // 挂查询表（必须在文件写完之后，和手动流程一致）
+        self.wb.path = Some(out.clone());
+        self.attach_query_tables();
+        eprintln!("[B4] {}", self.status);
         match sheetcore::xlsx::load(&out) {
             Ok(back) => eprintln!(
                 "[B4] 重开后数据源={} 首个={:?}",
@@ -2957,6 +2961,10 @@ impl SheetApp {
                     self.import_csv();
                     ui.close_menu();
                 }
+                if ui.button("挂成 Excel 查询表").clicked() {
+                    self.attach_query_tables();
+                    ui.close_menu();
+                }
                 if ui.button("从另一张表取数…").clicked() {
                     self.link_dlg = Some(String::new());
                     ui.close_menu();
@@ -3991,6 +3999,42 @@ impl SheetApp {
                 );
             }
         }
+    }
+
+
+    /// 把导入的 CSV 挂成 Excel 原生查询表（数据 → 查询和连接 里能看到）
+    fn attach_query_tables(&mut self) {
+        let Some(path) = self.wb.path.clone() else {
+            self.status = "先保存文件，才能挂查询表".into();
+            return;
+        };
+        let mut ok = 0;
+        let mut fail = 0;
+        for src in self.wb.sources.clone() {
+            if let sheetcore::external::Kind::Csv { path: csv, header, .. } = &src.kind {
+                let real = sheetcore::external::resolve_path(&self.wb, csv);
+                if sheetcore::qtable::attach_csv(
+                    &path,
+                    &self.wb.sheet(self.sheet_idx).name,
+                    src.at,
+                    src.rows.max(1),
+                    src.cols.max(1),
+                    &real,
+                    *header,
+                )
+                .is_ok()
+                {
+                    ok += 1;
+                } else {
+                    fail += 1;
+                }
+            }
+        }
+        self.status = if fail == 0 {
+            format!("已挂 {ok} 个 Excel 查询表（数据 → 查询和连接）")
+        } else {
+            format!("挂查询表：成功 {ok}，失败 {fail}")
+        };
     }
 
     /// 数据菜单：排序与筛选

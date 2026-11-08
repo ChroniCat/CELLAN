@@ -10,6 +10,17 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
+
+/// 包里有哪些部件（含暂存中的改动）
+pub fn parts(path: &Path) -> Vec<String> {
+    entries(path)
+}
+
+/// 一次写入多个部件
+pub fn write_parts(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
+    crate::patch::append_entries(path, items)
+}
+
 /// 只读磁盘上的包，不看暂存（用于读"基准文件"，那是另一个文件）
 pub fn read_part_file(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
@@ -349,7 +360,7 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
 /// 而透视表、打印区域都靠它们；丢一个 Excel 就拒收整个文件。
 pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Workbook) -> Result<bool> {
     // 名称/数据源动过就不能整段沿用：它们都写在 workbook.xml 的 definedNames 里
-    if !base.exists() || wb.names_dirty || !wb.sources.is_empty() {
+    if !base.exists() || wb.names_dirty {
         return Ok(false);
     }
     // 有任何一处改动就不动骨架：打印区域、名称、透视缓存都挂在 workbook.xml 上

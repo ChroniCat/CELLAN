@@ -26,16 +26,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
     let mut wb = Workbook {
         names: crate::patch::read_defined_names(path),
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
-        sources: crate::patch::read_defined_names(path)
-            .iter()
-            .filter_map(|(n, _, t)| {
-                if n.starts_with("_sc_src_") {
-                    crate::external::Source::from_name_text(n, t)
-                } else {
-                    None
-                }
-            })
-            .collect(),
+        sources: crate::external::read_sources(path),
         names_dirty: false,
         pivot_shifts: Vec::new(),
         has_vba: crate::vba::has_macros(path),
@@ -477,17 +468,32 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
 
     // 自定义名称
-    // 自定义名称 + 数据源（_sc_src_N）一起写
-    let mut all_names = wb.names.clone();
-    for (i, src) in wb.sources.iter().enumerate() {
-        all_names.push((format!("_sc_src_{}", i + 1), None, src.to_name_text()));
-    }
-    if (wb.names_dirty || !wb.sources.is_empty()) && !all_names.is_empty() {
-        if let Err(e) = crate::patch::write_user_names(path, &all_names) {
+    if wb.names_dirty && !wb.names.is_empty() {
+        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
             eprintln!("[save] 名称回写失败: {e:#}");
         }
     }
+    // 数据源存成"自定义文档属性"：这是 Excel 自己的规范位置，
+    // 塞进 definedNames 会和查询表打架，单独加未知部件又会被拒收
+    if !wb.sources.is_empty() && std::env::var("SC_NO_SRC_PROP").is_err() {
+        if let Err(e) = crate::external::write_sources(path, &wb.sources) {
+            eprintln!("[save] 数据源写入失败: {e:#}");
+        }
+    }
 
+    // 透视表缓存里的源区域
+    if !wb.pivot_shifts.is_empty() {
+        if let Err(e) = crate::patch::shift_pivot_caches(path, &wb.pivot_shifts) {
+            eprintln!("[save] 透视表源区域回写失败: {e:#}");
+        }
+    }
+
+    // 自定义名称
+    if wb.names_dirty && !wb.names.is_empty() {
+        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
+            eprintln!("[save] 名称回写失败: {e:#}");
+        }
+    }
     // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来
     if restore_base.exists() {
         match crate::patch::restore_missing_parts(path, &restore_base) {
