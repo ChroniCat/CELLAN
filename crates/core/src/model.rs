@@ -97,6 +97,10 @@ pub struct Sheet {
     pub tables: Vec<crate::table::Table>,
     /// 图片（只记位置和部件路径；保存时原样不动）
     pub pictures: Vec<crate::pic::Picture>,
+    /// 正在从文件加载（加载期间的 set 不算编辑）
+    pub loading: bool,
+    /// 这张表被改过没有：没改过就整段沿用原文件的 XML，别让 umya 重写
+    pub edited: bool,
     /// 合并单元格区域 (r1, c1, r2, c2)
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// 列宽（只有被设置过的列才有条目）
@@ -151,6 +155,8 @@ impl Sheet {
             arrays: Vec::new(),
             tables: Vec::new(),
             pictures: Vec::new(),
+            loading: false,
+            edited: false,
             merges: Vec::new(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
@@ -192,6 +198,9 @@ impl Sheet {
     }
 
     pub fn set(&mut self, r: u32, c: u32, cell: Cell) {
+        if !self.loading {
+            self.edited = true;
+        }
         let key = CellRef::new(r, c);
         if cell.is_blank() {
             if self.cells.remove(r, c).is_some() {
@@ -204,6 +213,9 @@ impl Sheet {
     }
 
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
+        if !self.loading {
+            self.edited = true;
+        }
         self.cells.remove(r, c)
     }
 
@@ -238,6 +250,9 @@ impl Sheet {
 
     /// 用户改样式（标记脏，保存时回写）
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
+        if !self.loading {
+            self.edited = true;
+        }
         let key = CellRef::new(r, c);
         if id == 0 {
             self.styles.remove(&key);

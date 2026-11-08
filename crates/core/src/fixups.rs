@@ -128,6 +128,89 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 
 
 
+
+/// 没被编辑过的表：整段沿用原文件的 XML 和它引用的部件。
+///
+/// umya 重写工作表时会丢三落四（表对象、批注、绘图、图形属性…），
+/// 凡是我们没动过的表，直接按基准文件覆盖回去最稳，也最保真。
+pub fn restore_unedited_sheets(
+    path: &Path,
+    base: &Path,
+    wb: &crate::model::Workbook,
+) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let base_targets = crate::patch::sheet_targets(base)?;
+    let new_targets = crate::patch::sheet_targets(path)?;
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut log = Vec::new();
+
+    for sheet in wb.sheets.iter() {
+        let dirty = sheet.edited
+            || sheet.merges_dirty
+            || sheet.cf_dirty
+            || sheet.dv_dirty
+            || sheet.notes_dirty
+            || sheet.freeze_dirty
+            || sheet.filter_dirty
+            || sheet.page_dirty
+            || sheet.charts_dirty;
+        if dirty {
+            continue;
+        }
+        let Some(base_part) = base_targets.get(&sheet.name) else { continue };
+        let Some(new_part) = new_targets.get(&sheet.name) else { continue };
+
+        let Some(xml) = read_entry(base, base_part) else { continue };
+        pending.push((new_part.clone(), xml));
+
+        // 关系表：路径可能变了，Target 要按新目录重算
+        let base_rels = base_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+        let new_rels = new_part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+        if base_part == new_part {
+            // 路径没变：rels 原样照抄，一个字节都不改
+            if let Some(raw) = read_entry(base, &base_rels) {
+                if let Ok(text) = String::from_utf8(raw.clone()) {
+                    for (_, (_, target)) in parse_rels(&text) {
+                        let abs = resolve_target(&base_rels, &target);
+                        if let Some(body) = read_entry(base, &abs) {
+                            pending.push((abs.clone(), body));
+                        }
+                    }
+                }
+                pending.push((base_rels.clone(), raw));
+                log.push(sheet.name.clone());
+                continue;
+            }
+        }
+        if let Some(rels) = read_entry(base, &base_rels).and_then(|b| String::from_utf8(b).ok()) {
+            let mut out = String::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            );
+            for (id, (ty, target)) in parse_rels(&rels) {
+                let abs = resolve_target(&base_rels, &target);
+                // 被引用的部件也按基准恢复（表格定义、绘图、VML、批注…）
+                if let Some(body) = read_entry(base, &abs) {
+                    pending.push((abs.clone(), body));
+                }
+                let rel = relative_to(&new_rels, &abs);
+                out.push_str(&format!(
+                    "<Relationship Id=\"{id}\" Type=\"{ty}\" Target=\"{rel}\"/>"
+                ));
+            }
+            out.push_str("</Relationships>");
+            pending.push((new_rels, out.into_bytes()));
+        }
+        log.push(sheet.name.clone());
+    }
+
+    if !pending.is_empty() {
+        crate::patch::append_entries(path, &pending)?;
+    }
+    Ok(log)
+}
+
 /// 绘图里的非法属性值清理：umya 会写出 prst=""（空预设形状），Excel 判非法。
 pub fn sanitize_drawings(path: &Path) -> Result<Vec<String>> {
     let mut fixed = Vec::new();

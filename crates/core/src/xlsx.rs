@@ -42,6 +42,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
 
     for name in names {
         let mut sheet = Sheet::new(name.clone());
+        sheet.loading = true;
 
         let sparse_part = targets.get(&name).filter(|p| {
             crate::sparse::declared_area_of(path, p) > crate::sparse::DENSE_LIMIT
@@ -57,7 +58,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
                         name,
                         sheet.iter().count()
                     );
-                    wb.sheets.push(sheet);
+                    sheet.loading = false;
+        sheet.edited = false;
+        wb.sheets.push(sheet);
                     continue;
                 }
                 Err(e) => eprintln!("[load] {} 稀疏读取失败，退回 calamine: {e:#}", name),
@@ -102,6 +105,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
             }
         }
 
+        sheet.loading = false;
+        sheet.edited = false;
         wb.sheets.push(sheet);
     }
 
@@ -533,6 +538,20 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
+    // 最后一步：没编辑过的表整段按基准恢复（放在所有补丁之后，覆盖 umya 的改写）
+    if restore_base.exists() {
+        match crate::fixups::restore_unedited_sheets(path, &restore_base, wb) {
+            Ok(v) if !v.is_empty() => {
+                if prof {
+                    eprintln!("  [save] 原样沿用 {} 张表: {:?}", v.len(), v);
+                }
+            }
+            Err(e) => eprintln!("[save] 恢复未编辑工作表失败: {e:#}"),
+            _ => {}
+        }
+        // 恢复后清一遍孤儿部件（基准部件另有一份同类型副本时会重复）
+        let _ = crate::fixups::prune_orphans(path);
+    }
     if prof {
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());
     }
