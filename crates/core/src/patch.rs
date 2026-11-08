@@ -571,7 +571,7 @@ mod dv_tests {
         };
         let xml = dv_xml(&[dv]);
         assert!(xml.contains("operator=\"between\""));
-        assert!(xml.contains("formula2=\"100\""));
+        assert!(xml.contains("<formula2>100</formula2>"));
     }
 
     #[test]
