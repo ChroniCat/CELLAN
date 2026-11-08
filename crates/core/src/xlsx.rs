@@ -42,13 +42,36 @@ pub fn load(path: &Path) -> Result<Workbook> {
     let targets = crate::patch::sheet_targets(path).unwrap_or_default();
     let shared = crate::sparse::shared_strings(path);
 
+    let prof_load = std::env::var("SC_LOAD_PROF").is_ok();
+    let t_all_load = std::time::Instant::now();
+    // 版面/合并/数组公式/图片/表格这几趟扫描跟单元格数据无关，
+    // 和下面的逐表解析并行跑，省掉串行等待
+    let (side_tx, side_rx) = std::sync::mpsc::channel();
+    {
+        let p = path.to_path_buf();
+        std::thread::spawn(move || {
+            let out = (
+                crate::arr::scan(&p),
+                crate::merges::load_layout(&p),
+                crate::pic::load(&p),
+                crate::table::load(&p),
+            );
+            let _ = side_tx.send(out);
+        });
+    }
+    let t_all = std::time::Instant::now();
     for name in names {
+        let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(name.clone());
         sheet.loading = true;
 
-        let sparse_part = targets.get(&name).filter(|p| {
-            crate::sparse::declared_area_of(path, p) > crate::sparse::DENSE_LIMIT
-        });
+        let limit = std::env::var("SC_DENSE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(crate::sparse::DENSE_LIMIT);
+        let sparse_part = targets
+            .get(&name)
+            .filter(|p| crate::sparse::declared_area_of(path, p) > limit);
         if let Some(part) = sparse_part {
             match crate::sparse::read_sheet(path, part, &shared) {
                 Ok(cells) => {
@@ -109,15 +132,29 @@ pub fn load(path: &Path) -> Result<Workbook> {
 
         sheet.loading = false;
         sheet.edited = false;
+        if prof_load {
+            eprintln!(
+                "[load] {:<16} {:>7.0}ms  {:>7} 格",
+                sheet.name,
+                t_sheet.elapsed().as_secs_f64() * 1000.0,
+                sheet.iter().count()
+            );
+        }
         wb.sheets.push(sheet);
     }
+    if prof_load {
+        eprintln!("[load] 工作表合计 {:.2}s", t_all.elapsed().as_secs_f64());
+    }
+    let (found, layouts_raw, pics, tables) = side_rx
+        .recv()
+        .unwrap_or_else(|_| (Default::default(), Ok(Default::default()), Default::default(), Default::default()));
+    let layouts = layouts_raw.unwrap_or_default();
 
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
     }
     // 图片：drawing → pic → media
     {
-        let pics = crate::pic::load(path);
         for sheet in wb.sheets.iter_mut() {
             if let Some(list) = pics.get(&sheet.name) {
                 sheet.pictures = list.clone();
@@ -126,17 +163,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
     }
     // 表格对象（ListObject）：独立的 tableN.xml 部件
     {
-        let tables = crate::table::load(path);
         for sheet in wb.sheets.iter_mut() {
             if let Some(list) = tables.get(&sheet.name) {
                 sheet.tables = list.clone();
             }
         }
     }
-    // 数组公式：calamine 只给公式文本，t="array"/ref 得从原始 XML 拿
-    if let Ok(arrays) = std::fs::metadata(path) {
-        if arrays.len() > 0 {
-            let found = crate::arr::scan(path);
+    // 数组公式：calamine 只给公式文本，t="array"/ref 得从原始 XML 拿（已并行取到）
+    {
+        {
             for sheet in wb.sheets.iter_mut() {
                 if let Some(list) = found.get(&sheet.name) {
                     for a in list {
@@ -149,8 +184,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
             }
         }
     }
-    // 合并单元格（calamine 不提供，单独解析一次）
-    if let Ok(layouts) = crate::merges::load_layout(path) {
+    // 合并单元格（已并行取到）
+    {
         for sheet in wb.sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
                 sheet.merges = lay.merges.clone();
@@ -172,6 +207,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    if prof_load {
+        eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
+    }
     // 页面设置（表级 + 定义名里的打印区域/标题）
     {
         let names = crate::page::load_defined_names(path);
