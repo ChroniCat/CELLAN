@@ -480,7 +480,7 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 
     // 表格对象：umya 会丢掉 tableParts，保存后自己挂回去
     for sheet in wb.sheets.iter() {
-        if !sheet.tables.is_empty() {
+        if !sheet.tables.is_empty() && std::env::var("SC_NO_TABLE_ATTACH").is_err() {
             if let Err(e) = crate::table::attach(path, &sheet.name, &sheet.tables) {
                 eprintln!("[save] 表格对象写入失败: {e:#}");
             }
@@ -524,6 +524,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
         if let Err(e) = crate::fixups::migrate_workbook_rels(path, &restore_base) {
             eprintln!("[save] 迁移 workbook 关系失败: {e:#}");
+        }
+        if let Err(e) = crate::fixups::sanitize_drawings(path) {
+            eprintln!("[save] 清理绘图属性失败: {e:#}");
         }
         if let Err(e) = crate::fixups::ensure_content_types(path, &restore_base) {
             eprintln!("[save] 补齐内容类型失败: {e:#}");

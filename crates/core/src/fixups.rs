@@ -127,6 +127,27 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 
 
 
+
+/// 绘图里的非法属性值清理：umya 会写出 prst=""（空预设形状），Excel 判非法。
+pub fn sanitize_drawings(path: &Path) -> Result<Vec<String>> {
+    let mut fixed = Vec::new();
+    for name in entries(path) {
+        if !name.starts_with("xl/") || !name.contains("/drawings/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Some(xml) = read_entry(path, &name).and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        if !xml.contains("prst=\"\"") && !xml.contains("prstGeom prst=\"\"") {
+            continue;
+        }
+        let fixed_xml = xml.replace("prst=\"\"", "prst=\"rect\"");
+        crate::patch::append_entry(path, &name, fixed_xml.as_bytes())?;
+        fixed.push(name);
+    }
+    Ok(fixed)
+}
+
 /// 取出某个标签对应的完整片段（含自闭合）
 fn take_element(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&format!("<{tag}"))?;
