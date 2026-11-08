@@ -11,7 +11,7 @@ fn main() {
     sheetcore::external::import_csv(&mut wb.sheets[0], csv, ',', true, (0, 0)).expect("csv");
     wb.dirty = true;
     sheetcore::xlsx::save(Path::new(out), &wb).expect("save");
-    match sheetcore::qtable::attach_csv(Path::new(out), &sheet, (0, 0), rows, cols, Path::new(csv), hdr) {
+    match sheetcore::qtable::attach_csv(Path::new(out), &sheet, (0, 0), rows, cols, Path::new(csv), hdr, ',') {
         Ok(_) => println!("挂上查询表"),
         Err(e) => println!("失败: {e:#}"),
     }

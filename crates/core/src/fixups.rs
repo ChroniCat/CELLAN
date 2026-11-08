@@ -192,6 +192,12 @@ pub fn restore_unedited_sheets(
         let Some(base_part) = base_targets.get(&sheet.name) else { continue };
         let Some(new_part) = new_targets.get(&sheet.name) else { continue };
 
+        if base_part == new_part && crate::patch::entry_size(base, base_part) > 4 * 1024 * 1024 {
+            // 大表直接搬压缩后的字节，省掉解压 + 重压缩（215 MB 的表很值）
+            crate::patch::stage_raw_copy(base_part, new_part);
+            log.push(sheet.name.clone());
+            continue;
+        }
         let Some(xml) = read_part_file(base, base_part) else { continue };
         pending.push((new_part.clone(), xml));
 
@@ -221,8 +227,12 @@ pub fn restore_unedited_sheets(
             for (id, (ty, target)) in parse_rels(&rels) {
                 let abs = resolve_target(&base_rels, &target);
                 // 被引用的部件也按基准恢复（表格定义、绘图、VML、批注…）
-                if let Some(body) = read_part_file(base, &abs) {
-                    pending.push((abs.clone(), body));
+                if base_part != new_part {
+                    if let Some(body) = read_part_file(base, &abs) {
+                        pending.push((abs.clone(), body));
+                    }
+                } else if crate::patch::entry_size(base, &abs) > 4 * 1024 * 1024 {
+                    crate::patch::stage_raw_copy(&abs, &abs);
                 }
                 let rel = relative_to(&new_rels, &abs);
                 out.push_str(&format!(

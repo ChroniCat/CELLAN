@@ -1128,6 +1128,85 @@ pub fn commit_stage(path: &Path) -> Result<usize> {
     Ok(n)
 }
 
+
+// ---------------------------------------------------------------------------
+// 原样搬运：从另一个包里直接拷压缩后的字节，不解压也不重压。
+// 大文件里 215 MB 的工作表 XML 省掉「解压 → 再压缩」能省十几秒。
+// ---------------------------------------------------------------------------
+thread_local! {
+    static RAW_QUEUE: std::cell::RefCell<Vec<(String, String)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// 记一条「从 src 的 A 部件搬到 dst 的 B 部件」
+pub fn stage_raw_copy(src_name: &str, dst_name: &str) {
+    RAW_QUEUE.with(|q| q.borrow_mut().push((src_name.to_string(), dst_name.to_string())));
+}
+
+pub fn raw_pending() -> bool {
+    RAW_QUEUE.with(|q| !q.borrow().is_empty())
+}
+
+/// 一次性把排队的部件从 `src` 搬到 `dst`（只重写一次 dst）
+pub fn apply_raw_copies(dst: &Path, src: &Path) -> Result<usize> {
+    let items: Vec<(String, String)> = RAW_QUEUE.with(|q| q.borrow_mut().drain(..).collect());
+    if items.is_empty() {
+        return Ok(0);
+    }
+    use std::io::Write;
+    let map: std::collections::HashMap<String, String> =
+        items.iter().map(|(s, d)| (d.clone(), s.clone())).collect();
+    let mut src_zip = zip::ZipArchive::new(std::fs::File::open(src)?)?;
+    // 先建名字 → 序号索引（zip 只提供按序号的原样读）
+    let mut src_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for i in 0..src_zip.len() {
+        if let Ok(e) = src_zip.by_index_raw(i) {
+            src_index.insert(e.name().to_string(), i);
+        }
+    }
+    let dst_file = std::fs::File::open(dst)?;
+    let mut dst_zip = zip::ZipArchive::new(dst_file)?;
+    let tmp = dst.with_extension("rawtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        for i in 0..dst_zip.len() {
+            let name = dst_zip.by_index_raw(i)?.name().to_string();
+            if let Some(src_name) = map.get(&name) {
+                let idx = *src_index.get(src_name.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("源包里没有 {src_name}")
+                })?;
+                let e = src_zip.by_index_raw(idx)?;
+                zw.raw_copy_file_rename(e, name.clone())?;
+            } else {
+                let e = dst_zip.by_index_raw(i)?;
+                zw.raw_copy_file(e)?;
+            }
+        }
+        // 目标包里没有的，补在末尾
+        let existing: std::collections::HashSet<String> =
+            (0..dst_zip.len()).filter_map(|i| dst_zip.by_index_raw(i).ok().map(|e| e.name().to_string())).collect();
+        for (_, d) in items.iter() {
+            if existing.contains(d) {
+                continue;
+            }
+            if let Some(idx) = src_index.get(d.as_str()).copied() {
+                if let Ok(e) = src_zip.by_index_raw(idx) {
+                    zw.raw_copy_file_rename(e, d.clone())?;
+                }
+            }
+        }
+        zw.finish()?;
+    }
+    drop(dst_zip);
+    drop(src_zip);
+    std::fs::rename(&tmp, dst)?;
+    Ok(items.len())
+}
+
 pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
     if stage_active() {
         stage_put(name, body.to_vec());
@@ -1254,6 +1333,21 @@ pub fn remove_entries(path: &Path, names: &[String]) -> Result<()> {
 }
 
 /// 从 zip 里删掉一个条目
+/// 部件解压后的大小（读不到就当 0）
+pub fn entry_size(path: &Path, name: &str) -> u64 {
+    let Ok(file) = std::fs::File::open(path) else { return 0 };
+    let Ok(mut z) = zip::ZipArchive::new(file) else { return 0 };
+    z.by_name(name).map(|e| e.size()).unwrap_or(0)
+}
+
+/// 包里有没有这个部件
+pub fn has_entry(path: &Path, name: &str) -> bool {
+    match zip::ZipArchive::new(std::fs::File::open(path).unwrap_or_else(|_| std::fs::File::open(".").unwrap())) {
+        Ok(mut z) => z.by_name(name).is_ok(),
+        Err(_) => false,
+    }
+}
+
 pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
     if stage_active() {
         stage_del(name);

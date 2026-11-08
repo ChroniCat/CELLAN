@@ -1039,3 +1039,25 @@ Open OK QueryTables=1 A2=赵六
   connection=TEXT;<workspace>\work\import.csv
   Refresh OK A2=赵六     # 改 CSV 后刷新，Excel 自己拉到新值
 ```
+
+## 边界收尾（v1.31）
+
+| 限制 | 处理 |
+|---|---|
+| 查询表只认逗号 | 按源文件实际分隔符写 `comma`/`tab`/`semicolon`/`space`/`customDelimiter`；导入时自动判别（首行里 tab 多于逗号就按 TSV 记） |
+| 没装 Excel 时宏报错看不懂 | COM 起不来（`80040154` / `Class not registered`）时明确提示"这台机器没有装 Excel"，不再甩 HRESULT |
+| 另存 47.6 s | **41.7 s**：路径相同的超大工作表直接搬压缩字节（`raw_copy_file_rename`），不再解压 + 重压缩 |
+
+验证：
+
+```
+connections.xml → <textPr prompt="0" codePage="65001" sourceFile="...\import.csv" tab="1">
+Excel: Open OK QueryTables=1，Refresh OK
+```
+
+剩下两条是设计选择，不是缺陷：
+
+- **跨表取数不走查询表**：Excel 没有"从另一张工作表取数"的 QueryTable 类型，只有公式链接。
+  我们写 `=Sheet!A1`，改来源就重算，这本来就是 Excel 的做法。
+- **超大文件首开 ~8 s**：单线程解析 215 MB 的 sheet XML。界面打开走后台线程，
+  不阻塞操作；要再压需要按工作表并行解析，改动面较大，暂列后续。

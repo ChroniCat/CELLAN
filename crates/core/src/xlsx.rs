@@ -668,6 +668,17 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             _ => {}
         }
     }
+    // 原样搬过来的部件（从基准包里 direct copy，不解压）
+    if crate::patch::raw_pending() {
+        match crate::patch::apply_raw_copies(path, &restore_base) {
+            Ok(n) => {
+                if prof {
+                    eprintln!("  [save] 原样搬运 {n} 个部件");
+                }
+            }
+            Err(e) => eprintln!("[save] 原样搬运失败: {e:#}"),
+        }
+    }
     match crate::patch::commit_stage(path) {
         Ok(n) if n > 0 => {
             if prof {

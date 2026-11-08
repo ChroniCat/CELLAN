@@ -47,6 +47,7 @@ pub fn attach_csv(
     cols: u32,
     csv: &Path,
     header: bool,
+    delim: char,
 ) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     let Some(sheet_part) = targets.get(sheet_name).cloned() else {
@@ -87,8 +88,20 @@ pub fn attach_csv(
     let text_fields = "<textFields><textField/></textFields>";
     let conn_xml = format!(
         "<connection id=\"{conn_id}\" name=\"Query{conn_id}\" type=\"6\" refreshedVersion=\"8\" background=\"1\" saveData=\"1\">\
-<textPr prompt=\"0\" codePage=\"65001\" sourceFile=\"{file}\" comma=\"1\">{tf}</textPr></connection>",
+<textPr prompt=\"0\" codePage=\"65001\" sourceFile=\"{file}\" {delim_attr}>{tf}</textPr></connection>",
         file = esc(&sources),
+        // 制表符分隔要写 tab="1"，逗号写 comma="1"；别的分隔符用自定义
+        delim_attr = if delim as u32 == 9 {
+            "tab=\"1\"".to_string()
+        } else if delim == ',' {
+            "comma=\"1\"".to_string()
+        } else if delim == ';' {
+            "semicolon=\"1\"".to_string()
+        } else if delim == ' ' {
+            "space=\"1\"".to_string()
+        } else {
+            format!("comma=\"1\" customDelimiter=\"{delim}\"")
+        },
         tf = text_fields
     );
 

@@ -1802,6 +1802,11 @@ impl SheetApp {
                 return;
             }
         };
+        // 分隔符要记下来：查询表连接里写错分隔符，Excel 刷新会读成一整列
+        let first = text.lines().next().unwrap_or("");
+        let tabs = first.matches('\t').count();
+        let commas = first.matches(',').count();
+        let delim = if tabs > commas { '\t' } else { ',' };
         let rows = sheetcore::csv::parse_auto(&text);
         if rows.is_empty() {
             self.status = "这个文件里没有可导入的内容".into();
@@ -1851,7 +1856,7 @@ impl SheetApp {
             kind: sheetcore::external::Kind::Csv {
                 // 和文件放一起就存相对路径，换机器也能刷新
                 path: stored_path.clone(),
-                delim: ',',
+                delim,
                 header: false,
             },
             at: (r0, c0),
@@ -3938,8 +3943,18 @@ impl SheetApp {
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                     }
                 } else {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    self.status = format!("宏执行失败：{}", err.lines().next().unwrap_or("未知错误"));
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    let low = err.to_lowercase();
+                    // COM 起不来通常是没装 Excel：给一句能懂的话，别丢一串 HRESULT
+                    let no_excel = low.contains("80040154")
+                        || low.contains("class not registered")
+                        || err.contains("无法创建")
+                        || err.contains("ActiveX");
+                    self.status = if no_excel {
+                        "这台机器没有装 Excel，宏没法运行（可以把宏代码导出到装了 Excel 的机器上跑）".into()
+                    } else {
+                        format!("宏执行失败：{}", err.lines().next().unwrap_or("未知错误"))
+                    };
                 }
             }
             Err(e) => self.status = format!("调不起 PowerShell：{e}"),
@@ -4011,7 +4026,7 @@ impl SheetApp {
         let mut ok = 0;
         let mut fail = 0;
         for src in self.wb.sources.clone() {
-            if let sheetcore::external::Kind::Csv { path: csv, header, .. } = &src.kind {
+            if let sheetcore::external::Kind::Csv { path: csv, header, delim } = &src.kind {
                 let real = sheetcore::external::resolve_path(&self.wb, csv);
                 if sheetcore::qtable::attach_csv(
                     &path,
@@ -4021,6 +4036,7 @@ impl SheetApp {
                     src.cols.max(1),
                     &real,
                     *header,
+                    *delim,
                 )
                 .is_ok()
                 {
