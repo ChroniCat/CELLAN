@@ -6,6 +6,20 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let mut wb = sheetcore::xlsx::load(&src).expect("load");
+    if let Ok(spec) = std::env::var("SC_EDIT") {
+        // 形如 "表名!A1=值"
+        if let Some((left, val)) = spec.split_once('=') {
+            if let Some((sheet, addr)) = left.split_once('!') {
+                let idx = wb.sheets.iter().position(|s| s.name == sheet).unwrap_or(0);
+                let rc = sheetcore::sparse::parse_ref(addr.trim()).expect("地址");
+                let mut cell = wb.sheets[idx].get(rc.0, rc.1).cloned().unwrap_or_default();
+                cell.value = sheetcore::model::Value::Text(val.trim().into());
+                cell.formula = None;
+                wb.sheets[idx].set(rc.0, rc.1, cell);
+                eprintln!("[SC_EDIT] {sheet}!{} = {}", addr.trim(), val.trim());
+            }
+        }
+    }
     if let Ok(spec) = std::env::var("SC_ONLY") {
         let keep: Vec<String> = spec.split(',').map(|x| x.trim().to_string()).collect();
         let before = wb.sheets.len();

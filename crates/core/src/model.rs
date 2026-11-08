@@ -101,6 +101,8 @@ pub struct Sheet {
     pub loading: bool,
     /// 这张表被改过没有：没改过就整段沿用原文件的 XML，别让 umya 重写
     pub edited: bool,
+    /// 格式动过没有（动过就不能整段沿用基准的样式表）
+    pub styles_dirty: bool,
     /// 合并单元格区域 (r1, c1, r2, c2)
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// 列宽（只有被设置过的列才有条目）
@@ -157,6 +159,7 @@ impl Sheet {
             pictures: Vec::new(),
             loading: false,
             edited: false,
+            styles_dirty: false,
             merges: Vec::new(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
@@ -252,6 +255,7 @@ impl Sheet {
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
         if !self.loading {
             self.edited = true;
+            self.styles_dirty = true;
         }
         let key = CellRef::new(r, c);
         if id == 0 {

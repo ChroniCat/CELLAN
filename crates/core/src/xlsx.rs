@@ -425,11 +425,21 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
     out?;
 
+    // 只把 sheetData 换进去，工作表骨架沿用基准
+    if restore_base.exists() {
+        match crate::fixups::merge_sheet_data(path, &restore_base, wb) {
+            Ok(v) if !v.is_empty() => {
+                if prof {
+                    eprintln!("  [save] 合并单元格数据到基准骨架: {:?}", v);
+                }
+            }
+            Err(e) => eprintln!("[save] 合并工作表骨架失败: {e:#}"),
+            _ => {}
+        }
+    }
+
     // 样式表原样沿用基准：umya 重建的样式表和原文件对不上（字体/填充被裁、dxfs 被压）
-    let untouched = wb
-        .sheets
-        .iter()
-        .all(|s| !s.edited && !s.merges_dirty && !s.notes_dirty && !s.charts_dirty);
+    let untouched = wb.sheets.iter().all(|s| !s.styles_dirty);
     if let Some(xml) = base_styles.as_ref().filter(|_| untouched) {
         match crate::patch::append_entry(path, "xl/styles.xml", xml) {
             Ok(()) => {
@@ -590,6 +600,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             Err(e) => eprintln!("[save] 恢复工作簿骨架失败: {e:#}"),
             _ => {}
         }
+        match crate::fixups::restore_base_sheet_rels(path, &restore_base, wb) {
+            Ok(n) if n > 0 => {
+                if prof {
+                    eprintln!("  [save] 工作表 rels 沿用基准 {n} 份");
+                }
+            }
+            Err(e) => eprintln!("[save] 恢复工作表 rels 失败: {e:#}"),
+            _ => {}
+        }
         let _ = crate::fixups::ensure_content_types(path, &restore_base);
         // 恢复后清一遍孤儿部件（基准部件另有一份同类型副本时会重复）
         let _ = crate::fixups::prune_orphans(path);
@@ -603,6 +622,18 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             Err(e) => eprintln!("[save] 重算 styles count 失败: {e:#}"),
             _ => {}
         }
+        }
+        match crate::fixups::ensure_shared_strings_rel(path) {
+            Ok(true) => {
+                if prof {
+                    eprintln!("  [save] 补上 sharedStrings 关系");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[save] 补 sharedStrings 关系失败: {e:#}"),
+        }
+        if let Err(e) = crate::fixups::rebuild_content_types(path, &restore_base) {
+            eprintln!("[save] 重建内容类型失败: {e:#}");
         }
         match crate::fixups::prune_content_types(path) {
             Ok(n) if n > 0 => {

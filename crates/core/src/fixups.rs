@@ -266,6 +266,12 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
 
         let nrels = rels_of(npart);
         let brels = rels_of(bpart);
+        // 搬过来的部件本身没 rels，但基准有（打印机设置之类）：把基准的补回去
+        if rels_raw.is_none() {
+            if let Some(raw) = read_part(base, &brels) {
+                pending.push((brels.clone(), raw));
+            }
+        }
         if let Some(raw) = rels_raw.clone().and_then(|b| String::from_utf8(b).ok()) {
             let mut out = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
@@ -327,17 +333,8 @@ pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Wo
         return Ok(false);
     }
     // 有任何一处改动就不动骨架：打印区域、名称、透视缓存都挂在 workbook.xml 上
-    let touched = wb.sheets.iter().any(|s| {
-        s.edited
-            || s.merges_dirty
-            || s.cf_dirty
-            || s.dv_dirty
-            || s.notes_dirty
-            || s.freeze_dirty
-            || s.filter_dirty
-            || s.page_dirty
-            || s.charts_dirty
-    });
+    // 打印区域、自定义名称都挂在 workbook.xml 上，动过就不能沿用
+    let touched = wb.sheets.iter().any(|s| s.page_dirty);
     if touched {
         return Ok(false);
     }
@@ -488,6 +485,233 @@ pub fn normalize_styles_counts(path: &Path) -> Result<bool> {
         crate::patch::append_entry(path, "xl/styles.xml", out.as_bytes())?;
     }
     Ok(changed)
+}
+
+
+/// 所有工作表 rels 一律用基准的（部件已经归位，路径对得上）。
+///
+/// 归位过程中两个目录下的同名表会抢同一个 rels 路径，谁后写谁赢；
+/// 统一以基准为准最稳，也顺带修好"表里有 r:id 但 rels 丢了"。
+pub fn restore_base_sheet_rels(
+    path: &Path,
+    base: &Path,
+    wb: &crate::model::Workbook,
+) -> Result<usize> {
+    if !base.exists() {
+        return Ok(0);
+    }
+    // 动过批注/绘图/图表的表不能覆盖 rels，否则新加的关系会被抹掉
+    let dirty: std::collections::HashSet<String> = wb
+        .sheets
+        .iter()
+        .filter(|s| s.notes_dirty || s.charts_dirty || s.merges_dirty)
+        .map(|s| s.name.clone())
+        .collect();
+    let clean_parts: std::collections::HashSet<String> = crate::patch::sheet_targets(path)?
+        .into_iter()
+        .filter(|(name, _)| !dirty.contains(name))
+        .map(|(_, part)| part)
+        .collect();
+    let now: std::collections::HashSet<String> = entries(path).into_iter().collect();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in entries(base) {
+        if !name.ends_with(".rels") || !name.contains("/worksheets/_rels/") {
+            continue;
+        }
+        let sheet_part = name.replace("/_rels/", "/").trim_end_matches(".rels").to_string();
+        if !now.contains(&sheet_part) || !clean_parts.contains(&sheet_part) {
+            continue;
+        }
+        if let Some(raw) = read_part(base, &name) {
+            pending.push((name, raw));
+        }
+    }
+    let n = pending.len();
+    if n > 0 {
+        crate::patch::append_entries(path, &pending)?;
+    }
+    Ok(n)
+}
+
+
+/// 只把单元格数据换进去，工作表其余骨架沿用基准。
+///
+/// umya 重写整张表时会丢 <sheetPr>、绘图引用、扩展区等；这里保留基准的
+/// 头尾，只替换 <sheetData>，改动最小、保真度最高。
+pub fn merge_sheet_data(path: &Path, base: &Path, wb: &crate::model::Workbook) -> Result<Vec<String>> {
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let base_targets = crate::patch::sheet_targets(base)?;
+    let new_targets = crate::patch::sheet_targets(path)?;
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut done = Vec::new();
+
+    for sheet in wb.sheets.iter() {
+        // 只处理"单纯改了单元格"的表；批注/条件格式/合并等改动由各自的补丁负责，
+        // 混在一起会被基准骨架覆盖掉
+        let plain_edit = sheet.edited
+            && !sheet.notes_dirty
+            && !sheet.cf_dirty
+            && !sheet.dv_dirty
+            && !sheet.merges_dirty
+            && !sheet.charts_dirty;
+        if !plain_edit {
+            continue;
+        }
+        let (Some(bpart), Some(npart)) = (base_targets.get(&sheet.name), new_targets.get(&sheet.name))
+        else {
+            continue;
+        };
+        let (Some(bxml), Some(nxml)) = (
+            read_part(base, bpart).and_then(|b| String::from_utf8(b).ok()),
+            read_part(path, npart).and_then(|b| String::from_utf8(b).ok()),
+        ) else {
+            continue;
+        };
+        let (Some(b_start), Some(b_end)) = (bxml.find("<sheetData"), bxml.find("</sheetData>")) else {
+            continue;
+        };
+        let (Some(n_start), Some(n_end)) = (nxml.find("<sheetData"), nxml.find("</sheetData>")) else {
+            continue;
+        };
+        let b_end = b_end + "</sheetData>".len();
+        let n_end = n_end + "</sheetData>".len();
+        let mut head = bxml[..b_start].to_string();
+        // dimension 用新算出来的（行列范围可能变了）
+        if let (Some(ns), Some(ne)) = (nxml.find("<dimension"), nxml.find("/>").filter(|_| false)) {
+            let _ = (ns, ne);
+        }
+        if let Some(nd) = nxml[n_start.saturating_sub(200)..n_start].rfind("<dimension") {
+            let abs = n_start.saturating_sub(200) + nd;
+            let tag_end = nxml[abs..].find("/>").map(|i| abs + i + 2);
+            if let Some(te) = tag_end {
+                if let Some(hs) = head.find("<dimension") {
+                    let he = head[hs..].find("/>").map(|i| hs + i + 2);
+                    if let Some(he) = he {
+                        head.replace_range(hs..he, &nxml[abs..te]);
+                    }
+                }
+            }
+        }
+        let merged = format!("{}{}{}", head, &nxml[n_start..n_end], &bxml[b_end..]);
+        pending.push((npart.clone(), merged.into_bytes()));
+        done.push(sheet.name.clone());
+    }
+
+    if !pending.is_empty() {
+        crate::patch::append_entries(path, &pending)?;
+    }
+    Ok(done)
+}
+
+
+/// 内容类型以基准为准重建：只保留实际存在的部件。
+///
+/// 归位后部件路径和 umya 写的那套对不上，CT 里就会缺 Override，
+/// 工作表退回 Default(xml) → Excel 认为类型非法、拒收。
+pub fn rebuild_content_types(path: &Path, base: &Path) -> Result<bool> {
+    if !base.exists() {
+        return Ok(false);
+    }
+    let (Some(bct), Some(oct)) = (
+        read_part(base, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()),
+        read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()),
+    ) else {
+        return Ok(false);
+    };
+    let names: std::collections::HashSet<String> = entries(path).into_iter().collect();
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+    );
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_overrides = |src: &str, out: &mut String, seen: &mut std::collections::HashSet<String>| {
+        let mut rest = src;
+        while let Some(i) = rest.find("<Override ") {
+            rest = &rest[i..];
+            let end = match rest.find("/>") {
+                Some(e) => e + 2,
+                None => break,
+            };
+            let tag = &rest[..end];
+            let name = tag
+                .find("PartName=\"")
+                .map(|p| {
+                    let after = &tag[p + 10..];
+                    after.split('"').next().unwrap_or("").trim_start_matches('/').to_string()
+                })
+                .unwrap_or_default();
+            let ct = tag
+                .find("ContentType=\"")
+                .map(|p| {
+                    let after = &tag[p + 13..];
+                    after.split('"').next().unwrap_or("").to_string()
+                })
+                .unwrap_or_default();
+            if !name.is_empty() && names.contains(&name) && seen.insert(name.clone()) {
+                out.push_str(&format!(
+                    "<Override PartName=\"/{name}\" ContentType=\"{ct}\"/>"
+                ));
+            }
+            rest = &rest[end..];
+        }
+    };
+    // 默认项：以基准为主，补上输出里独有扩展名
+    for tag in ["Default"] {
+        let mut rest = bct.as_str();
+        while let Some(i) = rest.find(&format!("<{tag} ")) {
+            rest = &rest[i..];
+            let end = match rest.find("/>") {
+                Some(e) => e + 2,
+                None => break,
+            };
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    push_overrides(&bct, &mut out, &mut seen);
+    push_overrides(&oct, &mut out, &mut seen);
+    out.push_str("</Types>");
+    crate::patch::append_entry(path, "[Content_Types].xml", out.as_bytes())?;
+    Ok(true)
+}
+
+
+/// 工作表用了共享字符串（t="s"）就必须有 sharedStrings 关系。
+///
+/// 骨架沿用基准时，基准用的是内联字符串、没有这条关系；
+/// 而改写过的表按共享字符串写，缺关系 Excel 解析不出来，整包拒收。
+pub fn ensure_shared_strings_rel(path: &Path) -> Result<bool> {
+    let names: std::collections::HashSet<String> = entries(path).into_iter().collect();
+    if !names.contains("xl/sharedStrings.xml") {
+        return Ok(false);
+    }
+    let wrels = "xl/_rels/workbook.xml.rels";
+    let Some(raw) = read_part(path, wrels).and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(false);
+    };
+    if raw.contains("/sharedStrings") {
+        return Ok(false);
+    }
+    let mut max_id = 0u32;
+    let mut rest = raw.as_str();
+    while let Some(i) = rest.find("Id=\"rId") {
+        rest = &rest[i + 7..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(v) = num.parse::<u32>() {
+            max_id = max_id.max(v);
+        }
+    }
+    let id = format!("rId{}", max_id + 1);
+    let rel = format!(
+        "<Relationship Id=\"{id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+    );
+    let out = match raw.rfind("</Relationships>") {
+        Some(i) => format!("{}{}{}", &raw[..i], rel, &raw[i..]),
+        None => return Ok(false),
+    };
+    crate::patch::append_entry(path, wrels, out.as_bytes())?;
+    Ok(true)
 }
 
 /// 绘图里的非法属性值清理：umya 会写出 prst=""（空预设形状），Excel 判非法。
