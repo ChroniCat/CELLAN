@@ -588,6 +588,8 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 
     // 最后一步：没编辑过的表整段按基准恢复（放在所有补丁之后，覆盖 umya 的改写）
     if restore_base.exists() {
+        // 这一步要复制二十几张表的 XML（几百 MB），攒成一次落盘
+        crate::patch::begin_stage();
         match crate::fixups::restore_unedited_sheets(path, &restore_base, wb) {
             Ok(v) if !v.is_empty() => {
                 if prof {
@@ -659,6 +661,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             }
             _ => {}
         }
+    }
+    match crate::patch::commit_stage(path) {
+        Ok(n) if n > 0 => {
+            if prof {
+                eprintln!("  [save] 一次落盘 {n} 个部件");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[save] 落盘失败: {e:#}"),
     }
     if prof {
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());

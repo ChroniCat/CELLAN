@@ -1026,8 +1026,114 @@ mod page_tests {
 }
 
 /// 往 zip 里追加一个条目（同名已存在则替换）
+
+// ---------------------------------------------------------------------------
+// 暂存模式：把一批部件改动攒在内存里，最后一次重写打包。
+// 100 MB 的包每重写一次要解压+压缩几十万行 XML，八次就是上百秒。
+// ---------------------------------------------------------------------------
+thread_local! {
+    static STAGE: std::cell::RefCell<Option<std::collections::HashMap<String, Option<Vec<u8>>>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 开始攒改动（嵌套调用只认最外层）
+pub fn begin_stage() {
+    STAGE.with(|s| {
+        let mut b = s.borrow_mut();
+        if b.is_none() {
+            *b = Some(std::collections::HashMap::new());
+        }
+    });
+}
+
+pub fn stage_active() -> bool {
+    STAGE.with(|s| s.borrow().is_some())
+}
+
+fn stage_put(name: &str, body: Vec<u8>) {
+    STAGE.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.insert(name.to_string(), Some(body));
+        }
+    });
+}
+
+fn stage_del(name: &str) {
+    STAGE.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.insert(name.to_string(), None);
+        }
+    });
+}
+
+/// 暂存里有没有这个部件（读的时候要先看这里，否则读到旧内容）
+pub fn staged(name: &str) -> Option<Option<Vec<u8>>> {
+    STAGE.with(|s| s.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+}
+
+pub fn staged_names() -> Vec<String> {
+    STAGE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|m| m.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// 一次性落盘：写入/替换/删除都在这一遍里完成
+pub fn commit_stage(path: &Path) -> Result<usize> {
+    use std::io::Write;
+    let Some(map) = STAGE.with(|s| s.borrow_mut().take()) else {
+        return Ok(0);
+    };
+    if map.is_empty() {
+        return Ok(0);
+    }
+    let mut left = map;
+    let n = left.len();
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("stgtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        let opts = || {
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+        };
+        for i in 0..zip.len() {
+            let name = zip.by_index_raw(i)?.name().to_string();
+            match left.remove(name.as_str()) {
+                Some(Some(body)) => {
+                    let _ = zip.by_index_raw(i)?;
+                    zw.start_file(name, opts())?;
+                    zw.write_all(&body)?;
+                }
+                Some(None) => { /* 删除：跳过不写 */ }
+                None => {
+                    let e = zip.by_index_raw(i)?;
+                    zw.raw_copy_file(e)?;
+                }
+            }
+        }
+        for (name, body) in left.into_iter() {
+            if let Some(body) = body {
+                zw.start_file(name, opts())?;
+                zw.write_all(&body)?;
+            }
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    std::fs::rename(&tmp, path)?;
+    Ok(n)
+}
+
 pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
-    use std::io::{Read, Write};
+    if stage_active() {
+        stage_put(name, body.to_vec());
+        return Ok(());
+    }
+    use std::io::Write;
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let tmp = path.with_extension("addtmp");
@@ -1039,20 +1145,17 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
         };
         let mut replaced = false;
         for i in 0..zip.len() {
-            let (n, buf) = {
-                let mut e = zip.by_index(i)?;
-                let n = e.name().to_string();
-                let mut b = Vec::new();
-                e.read_to_end(&mut b)?;
-                (n, b)
-            };
-            zw.start_file(n.clone(), opts())?;
-            if n == name {
+            let same = zip.by_index_raw(i)?.name().to_string();
+            if same == name {
+                // 目标条目：用新内容覆盖，其余条目原样搬运（不重新压缩）
+                let _ = zip.by_index_raw(i)?;
+                zw.start_file(same, opts())?;
                 zw.write_all(body)?;
                 replaced = true;
-            } else {
-                zw.write_all(&buf)?;
+                continue;
             }
+            let e = zip.by_index_raw(i)?;
+            zw.raw_copy_file(e)?;
         }
         if !replaced {
             zw.start_file(name.to_string(), opts())?;
@@ -1068,7 +1171,13 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
 
 /// 一次重写搞定「写入/替换多个部件」——逐条 append_entry 会把整个包重写 N 遍
 pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
-    use std::io::{Read, Write};
+    if stage_active() {
+        for (n, b) in items {
+            stage_put(n, b.clone());
+        }
+        return Ok(());
+    }
+    use std::io::Write;
     if items.is_empty() {
         return Ok(());
     }
@@ -1084,22 +1193,19 @@ pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
         };
         for i in 0..zip.len() {
-            let (n, buf) = {
-                let mut e = zip.by_index(i)?;
-                let n = e.name().to_string();
-                let mut b = Vec::new();
-                e.read_to_end(&mut b)?;
-                (n, b)
-            };
-            zw.start_file(n.clone(), opts())?;
-            match left.remove(n.as_str()) {
-                Some(body) => zw.write_all(body)?,
-                None => zw.write_all(&buf)?,
+            let name = zip.by_index_raw(i)?.name().to_string();
+            if let Some(body) = left.remove(name.as_str()) {
+                let _ = zip.by_index_raw(i)?;
+                zw.start_file(name, opts())?;
+                zw.write_all(body)?;
+            } else {
+                let e = zip.by_index_raw(i)?;
+                zw.raw_copy_file(e)?;
             }
         }
-        for (n, body) in items.iter() {
-            if left.contains_key(n.as_str()) {
-                zw.start_file(n.clone(), opts())?;
+        for (name, body) in items.iter() {
+            if left.contains_key(name.as_str()) {
+                zw.start_file(name.clone(), opts())?;
                 zw.write_all(body)?;
             }
         }
@@ -1149,6 +1255,10 @@ pub fn remove_entries(path: &Path, names: &[String]) -> Result<()> {
 
 /// 从 zip 里删掉一个条目
 pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
+    if stage_active() {
+        stage_del(name);
+        return Ok(());
+    }
     use std::io::{Read, Write};
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
