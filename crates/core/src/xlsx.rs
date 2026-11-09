@@ -462,6 +462,10 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
                 f.set_bold(st.bold);
                 f.set_italic(st.italic);
                 f.set_size(st.size as f64);
+                // 字体名：空串表示默认字体，不碰原文件的字体（避免把 Calibri 写成别的）
+                if !st.font.is_empty() {
+                    f.set_name(st.font.clone());
+                }
                 let mut col = umya_spreadsheet::Color::default();
                 col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", st.color[0], st.color[1], st.color[2]));
                 f.set_color(col);
@@ -1099,6 +1103,9 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
     if let Some(f) = &st.font {
         out.bold = matches!(f.weight, calamine::FontWeight::Bold);
         out.italic = matches!(f.style, calamine::FontStyle::Italic);
+        if let Some(n) = &f.name {
+            out.font = crate::style::normalize_font(n);
+        }
         if let Some(sz) = f.size {
             out.size = sz as f32;
         }

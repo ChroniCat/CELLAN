@@ -99,7 +99,7 @@ fn write_new_rules_and_save() {
         wb.sheets[0]
             .cf
             .dxfs
-            .push(sheetcore::cf::Dxf { bold: true, color: None, fill: Some([198, 239, 206]), italic: false });
+            .push(sheetcore::cf::Dxf { bold: true, color: None, fill: Some([198, 239, 206]), italic: false, font: None });
         let sheet = &mut wb.sheets[0];
         sheet.cf.blocks.push(sheetcore::cf::CfBlock {
             ranges: vec![(1, 0, 4, 0)],

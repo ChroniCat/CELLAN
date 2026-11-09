@@ -1360,3 +1360,63 @@ Excel 复制单元格时，剪贴板上同时放了纯文本(TSV)、HTML 和几�
 量化工具因此多一个口径：`超出本机Excel` —— 公式用了 LAMBDA 家族、本机 Excel 报 #NAME?、我们能算出值。这类单独计数，不压低一致率。
 
 最终：**压力样本 100.0000%**，184.3 万公式格可比部分全对。
+
+### v1.46 内嵌字体三层（2026-11）
+
+以前只有「粗体/字号/字色」，字体名进不了模型，存盘必然丢。这轮把字体做成引擎里的一等字段，
+配内嵌字形，界面可选可改，三层都对得上。
+
+**引擎（crates/core）**
+
+- `CellStyle.font`（空串 = 默认字体）。`StyleTable` 的哈希是手写的，font 也算进去；
+  `PartialEq` 是 derive 的，自然覆盖新字段——两者一起保证宋体/黑体不会被 intern 成同一个样式号。
+- 读：`<font><name val="…"/>` 经 `normalize_font` 落进 `CellStyle.font`。
+- 写：`font.set_name()`，umya 按字体分组生成 `<font>` 条目（同名同字号同色只留一条），
+  同时把 `scheme` 置成 `none`——留着 `scheme="minor"` 的话 Excel 会拿主题字体盖掉名字。
+- 归一表（中英双名互认）：宋体↔SimSun、黑体↔SimHei、微软雅黑↔Microsoft YaHei、
+  等线↔DengXian、思源黑体↔Noto Sans SC、思源宋体↔Noto Serif SC、Inter、JetBrains Mono。
+  认不出来的名字原样保留：渲染回退默认，写盘不改用户的选择。
+- 条件格式 dxf 的 `<font><name val>` 双向都通了，命中时经 `Overlay.font` 交给渲染。
+- 合并区域只画锚点那一格，整块跟着锚点样式（含字体）走；协作的 `StyleOp` 是整份
+  `CellStyle` 的 JSON，font 自动带上；撤销记的是样式号，字体一起回滚。
+
+**渲染（crates/app）**
+
+- 内嵌四套子集注册成 `noto-sans / noto-serif / inter / mono`；
+  自定义 family 有 `default / cjk-sans / cjk-serif / latin / mono`。
+  界面默认 = Inter + 思源黑体（中文回退）；宋体族只挂思源宋体，连拉丁也用衬线，
+  和黑体一眼能分开。
+- 单元格按 `FontClass::key()` 选 family，未知字体回退 `default`；
+  名称框与编辑栏用等宽，行号列标用 Inter。
+- 原来那份 2.8 MB 的单套子集（`assets/cjk-subset.ttf`）退休，四套子集合计 5.4 MB。
+
+**界面**
+
+- 「开始」页与 Ctrl+1 对话框各一个字体下拉：内嵌四款 + 宋体/黑体/微软雅黑/等线
+  （后四款映射到最接近的内嵌子集，选了一定有字形）。选中即走既有 `apply_style`：
+  可撤销、能协作同步、下一帧就换字形。
+
+**顺手修掉的「另存为丢样式」**
+
+`save()` 原来先把 `wb.path` 改成目标路径，再让 `save(path, wb)` 拿它当基准文件。
+目标是新路径时基准不存在，umya 从空白建表——整份文件只剩值，样式/字体/合并全丢。
+现在基准固定指向打开时的原文件，写成功后把文档路径切到新文件（下次 Ctrl+S 才是新文件）。
+
+**验收（本机 Excel 16.0，COM 回读）**
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --offline` | **286 个全绿**（基线 274 + 12） |
+| 应用内设字体 → 存盘 → COM 读 | `B10 = 黑体` |
+| 同一文件里没动过的 A1（原宋体 18 粗体） | `宋体 / 18 / 粗体 True`，没被冲掉 |
+| 106 MB / 21 表文件设宋体 → Excel 打开 | 正常打开，33 个形状还在，`B3 = 宋体`，`A1` 保留 `Microsoft YaHei` |
+| 重开再画（SC_DUMP） | `font="宋体" family=cjk-serif`；合并区锚点同样 `cjk-serif` |
+| 同一句话（`FontTest 宋体`，11pt）三种字体的排版宽度 | default 70.1 / 宋体 72.1 / 等宽 85.1 px——真的换了字形数据，不只是换标签 |
+
+无界面钩子：`SC_FONT=宋体` 把字体套到 `SC_SEL` 选区（走真实 `apply_style`），
+`SC_SAVE=路径` 立刻另存；`SC_DUMP` 的 text 行多了 `font=` 与 `family=` 两个字段。
+`examples/font_set.rs` 可以直接给任意文件的某一格改字体再另存：
+
+```
+cargo run --release -p sheetcore --example font_set -- in.xlsx out.xlsx B3 宋体
+```

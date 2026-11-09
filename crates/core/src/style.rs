@@ -31,10 +31,87 @@ impl Border {
     }
 }
 
+/// 字体下拉的候选：内嵌四款 + 系统四款。
+///
+/// 系统那四款（宋体/黑体/微软雅黑/等线）没有内嵌字形，绘制时按 `font_class`
+/// 映射到内嵌子集，保证「选了就有字形」；写盘时仍写用户选的原名。
+pub const FONT_CHOICES: &[&str] = &[
+    "",
+    "宋体",
+    "黑体",
+    "微软雅黑",
+    "等线",
+    "思源黑体",
+    "思源宋体",
+    "Inter",
+    "JetBrains Mono",
+];
+
+/// 字体名归一：Excel 里中英文名混用（宋体 / SimSun），统一折成列表里的写法。
+///
+/// 认不出来的名字原样保留——渲染时按未知字体回退默认，写盘时也不改用户的选择。
+pub fn normalize_font(name: &str) -> String {
+    let t = name.trim().trim_matches('"').trim();
+    match t.to_lowercase().as_str() {
+        "" => String::new(),
+        "simsun" | "宋体" => "宋体".into(),
+        "simhei" | "黑体" => "黑体".into(),
+        "microsoft yahei" | "微软雅黑" => "微软雅黑".into(),
+        "dengxian" | "等线" => "等线".into(),
+        "noto sans sc" | "source han sans sc" | "思源黑体" => "思源黑体".into(),
+        "noto serif sc" | "source han serif sc" | "思源宋体" => "思源宋体".into(),
+        "inter" => "Inter".into(),
+        "jetbrains mono" => "JetBrains Mono".into(),
+        _ => t.to_string(),
+    }
+}
+
+/// 渲染用的字体族归类。`key()` 就是 egui 里注册的 family 名。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontClass {
+    /// 默认：跟随界面字体（内嵌 Inter + 思源黑体）
+    Default,
+    /// 黑体系：思源黑体 / 黑体 / 微软雅黑 / 等线
+    Sans,
+    /// 宋体系：思源宋体 / 宋体
+    Serif,
+    /// 英文正文：Inter
+    Latin,
+    /// 等宽：JetBrains Mono
+    Mono,
+}
+
+impl FontClass {
+    pub fn key(self) -> &'static str {
+        match self {
+            FontClass::Default => "default",
+            FontClass::Sans => "cjk-sans",
+            FontClass::Serif => "cjk-serif",
+            FontClass::Latin => "latin",
+            FontClass::Mono => "mono",
+        }
+    }
+}
+
+/// 名字 → 字体族：四款系统字体映射到最接近的内嵌子集，未知字体回退默认。
+pub fn font_class(name: &str) -> FontClass {
+    match normalize_font(name).as_str() {
+        "" => FontClass::Default,
+        "宋体" | "思源宋体" => FontClass::Serif,
+        "黑体" | "微软雅黑" | "等线" | "思源黑体" => FontClass::Sans,
+        "Inter" => FontClass::Latin,
+        "JetBrains Mono" => FontClass::Mono,
+        _ => FontClass::Default,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
+    /// 字体名（见 `normalize_font`；空串 = 默认字体）
+    #[serde(default)]
+    pub font: String,
     pub size: f32,
     /// 字体颜色 RGB
     pub color: [u8; 3],
@@ -81,6 +158,7 @@ fn hash_of(s: &CellStyle) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.bold.hash(&mut h);
     s.italic.hash(&mut h);
+    s.font.hash(&mut h);
     s.size.to_bits().hash(&mut h);
     s.color.hash(&mut h);
     s.fill.hash(&mut h);
@@ -262,5 +340,47 @@ mod tests {
         assert_eq!(id1, id2);
         let b = CellStyle { bold: false, size: 12.0, ..Default::default() };
         assert_ne!(t.intern(b), id1);
+    }
+
+    #[test]
+    fn font_name_normalized_both_ways() {
+        assert_eq!(normalize_font("SimSun"), "宋体");
+        assert_eq!(normalize_font(" 宋体 "), "宋体");
+        assert_eq!(normalize_font("SimHei"), "黑体");
+        assert_eq!(normalize_font("Microsoft YaHei"), "微软雅黑");
+        assert_eq!(normalize_font("DengXian"), "等线");
+        assert_eq!(normalize_font("Noto Sans SC"), "思源黑体");
+        assert_eq!(normalize_font("Noto Serif SC"), "思源宋体");
+        assert_eq!(normalize_font("inter"), "Inter");
+        assert_eq!(normalize_font("JetBrains Mono"), "JetBrains Mono");
+        // 认不出来的原样保留，空串保持空
+        assert_eq!(normalize_font("Calibri"), "Calibri");
+        assert_eq!(normalize_font(""), "");
+    }
+
+    #[test]
+    fn font_family_mapping() {
+        assert_eq!(font_class(""), FontClass::Default);
+        assert_eq!(font_class("宋体"), FontClass::Serif);
+        assert_eq!(font_class("SimSun"), FontClass::Serif);
+        assert_eq!(font_class("黑体"), FontClass::Sans);
+        assert_eq!(font_class("微软雅黑"), FontClass::Sans);
+        assert_eq!(font_class("等线"), FontClass::Sans);
+        assert_eq!(font_class("Inter"), FontClass::Latin);
+        assert_eq!(font_class("JetBrains Mono"), FontClass::Mono);
+        // 未知字体回退默认
+        assert_eq!(font_class("Comic Sans MS"), FontClass::Default);
+    }
+
+    #[test]
+    fn styles_dedup_separates_fonts() {
+        let mut t = StyleTable::new();
+        let plain = CellStyle { size: 11.0, ..Default::default() };
+        let song = CellStyle { size: 11.0, font: "宋体".into(), ..Default::default() };
+        let hei = CellStyle { size: 11.0, font: "黑体".into(), ..Default::default() };
+        let a = t.intern(plain.clone());
+        assert_ne!(t.intern(song.clone()), a, "换了字体必须是另一个样式");
+        assert_ne!(t.intern(hei), a);
+        assert_eq!(t.intern(song), t.intern(CellStyle { font: "宋体".into(), size: 11.0, ..Default::default() }));
     }
 }

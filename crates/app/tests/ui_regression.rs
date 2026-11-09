@@ -135,3 +135,150 @@ fn locked_cell_is_marked() {
     // 单机无网络时不产生锁，dump 里没有 locked 行是正常的；这里只要求能正常渲染
     assert!(has_cell(&dump, 1, 1, "研发"), "内容没画出来");
 }
+
+/// 造一个只有 A1 的小文件，可选地带上字体（走真实的 xlsx 写盘）
+fn make_font_fixture(name: &str, font: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join("sheet_ui_font");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(name);
+    let _ = std::fs::remove_file(&p);
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            // 混着拉丁和汉字：不同字体的排版宽度才拉得开
+            value: sheetcore::model::Value::Text("FontTest 宋体".into()),
+            formula: None,
+        },
+    );
+    if !font.is_empty() {
+        let id = wb.styles.intern(sheetcore::style::CellStyle {
+            font: font.into(),
+            size: 11.0,
+            ..Default::default()
+        });
+        wb.sheets[0].set_style(0, 0, id);
+    }
+    sheetcore::xlsx::save(&p, &wb).expect("造样本");
+    p
+}
+
+fn cell_line<'a>(dump: &'a str, r: u32, c: u32) -> &'a str {
+    dump.lines()
+        .find(|l| l.starts_with(&format!("text ({r},{c})")))
+        .unwrap_or_else(|| panic!("({r},{c}) 没有文字绘制记录：
+{dump}"))
+}
+
+/// dump 行里的排版宽度（同一字符串换字体后宽度会变）
+fn cell_width(line: &str) -> f32 {
+    line.split("w=")
+        .nth(1)
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or_else(|| panic!("这行没有 w=：{line}"))
+}
+
+#[test]
+fn cell_font_picks_embedded_family() {
+    let plain = make_font_fixture("plain.xlsx", "");
+    let song = make_font_fixture("song.xlsx", "宋体");
+    let mono = make_font_fixture("mono.xlsx", "JetBrains Mono");
+
+    let d1 = dump_for(plain.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump plain");
+    assert!(cell_line(&d1, 0, 0).contains("family=default"), "默认字体应该走 default：{}", cell_line(&d1, 0, 0));
+
+    let d2 = dump_for(song.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump song");
+    let l2 = cell_line(&d2, 0, 0);
+    assert!(l2.contains("family=cjk-serif"), "宋体应选 cjk-serif：{l2}");
+    assert!(l2.contains("font=\"宋体\""), "dump 里应带字体名：{l2}");
+
+    let d3 = dump_for(mono.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump mono");
+    let l3 = cell_line(&d3, 0, 0);
+    assert!(l3.contains("family=mono"), "等宽字体应选 mono");
+
+    // 宽度不同 = 真的换了字形数据，不只是换了个 family 标签
+    let w1 = cell_width(cell_line(&d1, 0, 0));
+    let w2 = cell_width(l2);
+    let w3 = cell_width(l3);
+    eprintln!("[font] 排版宽度 default={w1:.1} 宋体={w2:.1} 等宽={w3:.1}");
+    assert!(
+        (w1 - w2).abs() > 0.5,
+        "宋体和默认字体排版宽度一样（{w1} vs {w2}），说明没换字形"
+    );
+    assert!((w1 - w3).abs() > 0.5, "等宽和默认宽度一样（{w1} vs {w3}）");
+}
+
+#[test]
+fn font_change_applies_and_saves() {
+    let src = make_font_fixture("apply_src.xlsx", "");
+    let out = src.with_file_name("apply_out.xlsx");
+    let _ = std::fs::remove_file(&out);
+
+    let dump = dump_for(
+        src.to_str().unwrap(),
+        &[
+            ("SC_SEL", "0,0"),
+            ("SC_FONT", "宋体"),
+            ("SC_SAVE", out.to_str().unwrap()),
+        ],
+        Duration::from_secs(30),
+    )
+    .expect("dump apply");
+    // 渲染立刻换了族
+    assert!(
+        cell_line(&dump, 0, 0).contains("family=cjk-serif"),
+        "选了宋体后渲染没换族：{}",
+        cell_line(&dump, 0, 0)
+    );
+
+    // 存盘后重开还能读到字体名
+    assert!(out.exists(), "SC_SAVE 没写出文件");
+    let back = sheetcore::xlsx::load(&out).expect("重开");
+    let st = back.styles.get(back.sheets[0].style_of(0, 0));
+    assert_eq!(st.font, "宋体", "存盘后字体丢了");
+
+    // 关掉重开：这一份文件再画一遍，仍然是宋体族（不是只有内存里那一刻对）
+    let again = dump_for(out.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump reopen");
+    assert!(
+        cell_line(&again, 0, 0).contains("family=cjk-serif"),
+        "重开后字体没恢复：{}",
+        cell_line(&again, 0, 0)
+    );
+}
+
+#[test]
+fn merged_range_uses_anchor_font() {
+    // 合并区域只画左上角，整块应该按锚点那格的样式（含字体）来画
+    let dir = std::env::temp_dir().join("sheet_ui_font");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("merged_font.xlsx");
+    let _ = std::fs::remove_file(&p);
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Text("合并宋体".into()),
+            formula: None,
+        },
+    );
+    let id = wb.styles.intern(sheetcore::style::CellStyle {
+        font: "宋体".into(),
+        size: 11.0,
+        ..Default::default()
+    });
+    wb.sheets[0].set_style(0, 0, id);
+    wb.sheets[0].merge_range(0, 0, 1, 1);
+    sheetcore::xlsx::save(&p, &wb).expect("造样本");
+
+    let dump = dump_for(p.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump merged");
+    let line = cell_line(&dump, 0, 0);
+    assert!(line.contains("family=cjk-serif"), "合并区没按锚点字体画：{line}");
+    // 右下角那格不该单独出文字
+    assert!(
+        !dump.lines().any(|l| l.starts_with("text (1,1)")),
+        "合并区里不该再画一格"
+    );
+}
+

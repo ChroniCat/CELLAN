@@ -75,6 +75,7 @@ struct FindState {
 #[derive(Default, Clone)]
 
 struct FmtState {
+    font: String,
     bold: bool,
     italic: bool,
     size: f32,
@@ -274,6 +275,8 @@ struct SheetApp {
     last_edit: Option<std::time::Instant>,
     /// 后台保存的通道
     save_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 正在写出的目标路径（保存成功后把文档路径切过去）
+    save_target: Option<PathBuf>,
     /// 等文件加载完再执行的共享/加入动作
     pending_host: bool,
     pending_join: Option<String>,
@@ -310,7 +313,7 @@ enum OpenMsg {
 
 impl SheetApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        install_cjk_font(&cc.egui_ctx);
+        install_fonts(&cc.egui_ctx);
         let mut app = Self {
             wb: Workbook::new_blank(),
             sheet_idx: 0,
@@ -451,6 +454,7 @@ impl SheetApp {
             needs_full: false,
             last_edit: None,
             save_rx: None,
+            save_target: None,
             pending_host: false,
             pending_join: None,
         };
@@ -520,6 +524,22 @@ impl SheetApp {
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
                     eprintln!("[open] 已显示缓存值 {n} 格");
+                    // 无界面验收钩子：SC_FONT=字体名 把字体套到当前选区（走真实的 apply_style，
+                    // 含样式去重、撤销事务、协作广播），SC_SAVE=路径 立刻另存一份
+                    if let Ok(font) = std::env::var("SC_FONT") {
+                        let font = font.trim().to_string();
+                        self.apply_style(move |s| s.font = font.clone());
+                        eprintln!("[font] 选区已套用字体 {:?}", self.current_style().font);
+                    }
+                    if let Ok(out) = std::env::var("SC_SAVE") {
+                        let target = PathBuf::from(&out);
+                        // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
+                        let wb = self.wb.clone();
+                        match sheetcore::xlsx::save_atomic(&target, &wb) {
+                            Ok(()) => eprintln!("[save] 测试钩子已存 {}", target.display()),
+                            Err(e) => eprintln!("[save] 测试钩子失败 {e:#}"),
+                        }
+                    }
                     if self.pending_host {
                         self.pending_host = false;
                         self.start_host();
@@ -598,8 +618,12 @@ impl SheetApp {
             path
         };
         let mut wb = self.wb.clone();
-        wb.path = Some(path.clone());
+        // 基准路径必须指向「打开时的原文件」：umya 从它继承样式、合并、数据验证、
+        // 图片这些我们不在模型里重建的结构。另存到新路径时把 path 改成目标路径，
+        // 就会写出一份只剩单元格值的文件（字体/格式全丢）。
+        wb.path = self.wb.path.clone().filter(|p| p.exists());
         let shown = path.display().to_string();
+        self.save_target = Some(path.clone());
         self.status = format!("正在保存 {shown}…");
         self.wb.dirty = false;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -636,10 +660,14 @@ impl SheetApp {
             self.save_rx = None;
             match r {
                 Ok(p) => {
+                    if let Some(t) = self.save_target.take() {
+                        self.wb.path = Some(t);
+                    }
                     self.status = format!("已保存 {p}");
                     eprintln!("[save] 完成 {p}");
                 }
                 Err(e) => {
+                    self.save_target = None;
                     self.status = e.clone();
                     self.wb.dirty = true;
                     eprintln!("[save] {e}");
@@ -2772,6 +2800,7 @@ impl SheetApp {
         let id = self.wb.sheet(self.sheet_idx).style_of(r, c);
         let st = self.wb.styles.get(id).clone();
         self.fmt_state = FmtState {
+            font: st.font.clone(),
             bold: st.bold,
             italic: st.italic,
             size: st.size,
@@ -3249,6 +3278,24 @@ impl SheetApp {
     fn toolbar_format(&mut self, ui: &mut egui::Ui) {
         let cur = self.current_style();
         ui.horizontal_wrapped(|ui| {
+            // 字体：内嵌四款 + 宋体/黑体/微软雅黑/等线（映射到内嵌子集）
+            egui::ComboBox::from_id_salt("font_pick")
+                .selected_text(if cur.font.is_empty() {
+                    "默认".to_string()
+                } else {
+                    cur.font.clone()
+                })
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for name in sheetcore::style::FONT_CHOICES {
+                        let label = if name.is_empty() { "默认" } else { *name };
+                        if ui.selectable_label(cur.font == *name, label).clicked() {
+                            let pick = name.to_string();
+                            self.apply_style(move |s| s.font = pick.clone());
+                        }
+                    }
+                });
+            ui.separator();
             // 加粗 / 斜体
             if ui
                 .selectable_label(cur.bold, egui::RichText::new("B").strong())
@@ -3606,7 +3653,7 @@ impl SheetApp {
 
     /// 取（或新建）一个 dxf 索引；所有表保持同一份 dxfs，保证索引一致
     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
-        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill };
+        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill, font: None };
         let mut idx = None;
         if let Some(s0) = self.wb.sheets.first() {
             if let Some(i) = s0.cf.dxfs.iter().position(|d| *d == want) {
@@ -4173,11 +4220,17 @@ impl SheetApp {
                 let is_num = matches!(cell.value, Value::Number(_));
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
                 let base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
-                let font = FontId::proportional(if st.bold || cf_bold {
-                    st.size + 0.6
-                } else {
-                    st.size
-                });
+                // 条件格式里指定的字体优先，其次单元格样式；未知字体回退默认
+                let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
+                let family = cell_family(font_name);
+                let font = FontId::new(
+                    if st.bold || cf_bold {
+                        st.size + 0.6
+                    } else {
+                        st.size
+                    },
+                    family.clone(),
+                );
                 let color = Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
                 let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
                     Align2::CENTER_CENTER
@@ -4203,10 +4256,29 @@ impl SheetApp {
                 } else {
                     rect.center().y
                 };
-                painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
                 if dumping {
-                    dump.push(format!("text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1} bold={}", r, c, txt, tx, ty, base_color, st.size, st.bold));
+                    // 同一个字符串在不同 family 下的排版宽度不同：这是「真的换了字体数据，
+                    // 不只是换了个标签」的直接证据
+                    let w = painter
+                        .layout_no_wrap(txt.clone(), font.clone(), color)
+                        .size()
+                        .x;
+                    dump.push(format!(
+                        "text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1} bold={} font={:?} family={} w={:.1}",
+                        r,
+                        c,
+                        txt,
+                        tx,
+                        ty,
+                        base_color,
+                        st.size,
+                        st.bold,
+                        font_name,
+                        sheetcore::style::font_class(font_name).key(),
+                        w
+                    ));
                 }
+                painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
             }
         }
         // 别人正在编辑：虚线框 + 角标
@@ -5093,6 +5165,27 @@ impl SheetApp {
             .default_width(320.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label("字体");
+                    egui::ComboBox::from_id_salt("fmt_dlg_font")
+                        .selected_text(if self.fmt_state.font.is_empty() {
+                            "默认".to_string()
+                        } else {
+                            self.fmt_state.font.clone()
+                        })
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for name in sheetcore::style::FONT_CHOICES {
+                                let label = if name.is_empty() { "默认" } else { *name };
+                                if ui
+                                    .selectable_label(self.fmt_state.font == *name, label)
+                                    .clicked()
+                                {
+                                    self.fmt_state.font = name.to_string();
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
                     ui.checkbox(&mut self.fmt_state.bold, "粗体");
                     ui.checkbox(&mut self.fmt_state.italic, "斜体");
                     ui.checkbox(&mut self.fmt_state.wrap, "自动换行");
@@ -5220,6 +5313,7 @@ impl SheetApp {
                 }
             });
             self.apply_style(move |s| {
+                s.font = st.font.clone();
                 s.bold = st.bold;
                 s.italic = st.italic;
                 s.size = st.size;
@@ -6009,7 +6103,7 @@ impl SheetApp {
                 egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
                 Align2::CENTER_CENTER,
                 col_label(c),
-                FontId::proportional(12.0),
+                FontId::new(12.0, family_named("latin")),
                 Color32::from_rgb(90, 90, 90),
             );
             painter.line_segment(
@@ -6028,7 +6122,7 @@ impl SheetApp {
                     egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
                     Align2::CENTER_CENTER,
                     col_label(c),
-                    FontId::proportional(12.0),
+                    FontId::new(12.0, family_named("latin")),
                     Color32::from_rgb(90, 90, 90),
                 );
                 painter.line_segment(
@@ -6047,7 +6141,7 @@ impl SheetApp {
                 egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
                 Align2::CENTER_CENTER,
                 (r + 1).to_string(),
-                FontId::proportional(12.0),
+                FontId::new(12.0, family_named("latin")),
                 Color32::from_rgb(90, 90, 90),
             );
             painter.line_segment(
@@ -6070,7 +6164,7 @@ impl SheetApp {
                     egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
-                    FontId::proportional(12.0),
+                    FontId::new(12.0, family_named("latin")),
                     Color32::from_rgb(90, 90, 90),
                 );
                 painter.line_segment(
@@ -8091,7 +8185,9 @@ impl eframe::App for SheetApp {
                 }
                 let nb = ui.add_sized(
                     [78.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.name_buf).hint_text("A1"),
+                    egui::TextEdit::singleline(&mut self.name_buf)
+                        .hint_text("A1")
+                        .font(egui::TextStyle::Monospace),
                 );
                 if nb.gained_focus() {
                     self.name_edit = true;
@@ -8111,7 +8207,7 @@ impl eframe::App for SheetApp {
                     if let Some(ed) = self.editing.as_mut() {
                         let te = ui.add_sized(
                             [ui.available_width(), 20.0],
-                            egui::TextEdit::singleline(&mut ed.buf),
+                            egui::TextEdit::singleline(&mut ed.buf).font(egui::TextStyle::Monospace),
                         );
                         if te.lost_focus() {
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -8138,7 +8234,10 @@ impl eframe::App for SheetApp {
                     };
                     let resp = ui.add_sized(
                         [ui.available_width(), 20.0],
-                        egui::Label::new(cur).sense(egui::Sense::click()),
+                        egui::Label::new(
+                            egui::RichText::new(cur).family(egui::FontFamily::Monospace),
+                        )
+                        .sense(egui::Sense::click()),
                     );
                     if resp.clicked() {
                         self.begin_edit(None);
@@ -8315,40 +8414,73 @@ impl eframe::App for SheetApp {
     }
 }
 
-fn install_cjk_font(ctx: &egui::Context) {
-    if std::env::var("SHEETS_NO_CJK").is_ok() {
-        return;
-    }
-    // egui 自带字体没有中文，加载系统字体，否则界面上的中文是方块
-    const CANDIDATES: &[&str] = &[
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-    // 优先用内置子集字体（GB2312 常用字，约 2.8 MB），避免加载 16 MB 全量字体
-    const EMBEDDED: &[u8] = include_bytes!("../../../assets/cjk-subset.ttf");
-    {
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_static(EMBEDDED).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().insert(0, "cjk".to_owned());
-        }
-        ctx.set_fonts(fonts);
-        return;
-    }
+/// 内嵌字体（SIL OFL 1.1）：思源黑体、思源宋体、Inter、JetBrains Mono。
+///
+/// 原始 ttf 不入库，子集由 scripts/subset_fonts.py 重建（GB2312 + 拉丁 + 常用符号）。
+const FONT_SANS: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSansSC-Regular.subset.ttf");
+const FONT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Regular.subset.ttf");
+const FONT_LATIN: &[u8] = include_bytes!("../../../assets/fonts/subset/Inter-Regular.subset.ttf");
+const FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/subset/JetBrainsMono-Regular.subset.ttf");
 
-    #[allow(unreachable_code)]
-    for path in CANDIDATES {
-        let Ok(data) = std::fs::read(path) else { continue };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().insert(0, "cjk".to_owned());
-        }
-        ctx.set_fonts(fonts);
-        return;
-    }
+/// 自定义 family 名（和 `sheetcore::style::FontClass::key()` 一一对应）
+fn family_named(key: &str) -> egui::FontFamily {
+    egui::FontFamily::Name(key.into())
+}
+
+/// 单元格字体族：按 style.font 选内嵌 family，未知字体回退默认
+fn cell_family(name: &str) -> egui::FontFamily {
+    family_named(sheetcore::style::font_class(name).key())
+}
+
+/// 注册四套内嵌字体，并把自定义 family 都绑上——
+/// 少绑一个，遇到该字体的格子 egui 会直接 panic（FontFamily not bound）。
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("noto-sans".to_owned(), egui::FontData::from_static(FONT_SANS).into());
+    fonts
+        .font_data
+        .insert("noto-serif".to_owned(), egui::FontData::from_static(FONT_SERIF).into());
+    fonts
+        .font_data
+        .insert("inter".to_owned(), egui::FontData::from_static(FONT_LATIN).into());
+    fonts
+        .font_data
+        .insert("mono".to_owned(), egui::FontData::from_static(FONT_MONO).into());
+
+    // 界面默认：拉丁走 Inter，中文回退思源黑体，再往后是 egui 自带的字体/emoji
+    let prop = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    prop.insert(0, "noto-sans".to_owned());
+    prop.insert(0, "inter".to_owned());
+    let mono = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    mono.insert(0, "noto-sans".to_owned());
+    mono.insert(0, "mono".to_owned());
+
+    // 单元格可选的 family
+    let sans = vec!["inter".to_owned(), "noto-sans".to_owned()];
+    fonts.families.insert(family_named("default"), sans.clone());
+    fonts.families.insert(family_named("cjk-sans"), sans);
+    // 宋体连拉丁也用宋体字形，和黑体一眼能分开
+    fonts
+        .families
+        .insert(family_named("cjk-serif"), vec!["noto-serif".to_owned()]);
+    fonts.families.insert(
+        family_named("latin"),
+        vec!["inter".to_owned(), "noto-sans".to_owned()],
+    );
+    fonts.families.insert(
+        family_named("mono"),
+        vec!["mono".to_owned(), "noto-sans".to_owned()],
+    );
+
+    ctx.set_fonts(fonts);
 }
 
 fn main() -> eframe::Result<()> {

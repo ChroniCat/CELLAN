@@ -13,6 +13,8 @@ pub struct Dxf {
     pub italic: bool,
     pub color: Option<[u8; 3]>,
     pub fill: Option<[u8; 3]>,
+    /// 字体名（dxf 的 <font><name val="…"/>），None 表示不改字体
+    pub font: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +188,8 @@ pub struct Overlay {
     pub fill: Option<[u8; 3]>,
     pub color: Option<[u8; 3]>,
     pub bold: bool,
+    /// 条件格式里指定的字体名（dxf 的 <font>）
+    pub font: Option<String>,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
     /// 图标集
@@ -197,6 +201,7 @@ impl Overlay {
         self.fill.is_none()
             && self.color.is_none()
             && !self.bold
+            && self.font.is_none()
             && self.bar.is_none()
             && self.icon.is_none()
     }
@@ -488,6 +493,11 @@ fn apply_dxf(cf: &CfSheet, idx: usize, out: &mut Overlay) {
                 out.color = Some(c);
             }
         }
+        if let Some(f) = &d.font {
+            if out.font.is_none() {
+                out.font = Some(f.clone());
+            }
+        }
         out.bold |= d.bold;
     }
 }
@@ -737,6 +747,14 @@ fn parse_a1(s: &str) -> Option<(u32, u32)> {
         return None;
     }
     Some((row - 1, col - 1))
+}
+
+/// 取元素属性（quick-xml 给的名字可能带命名空间前缀，按后缀匹配）
+fn attr_val(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.as_ref().ends_with(key))
+        .map(|a| a.value.to_string())
 }
 
 fn hex_rgb(s: &str) -> Option<[u8; 3]> {
@@ -1028,6 +1046,10 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                         d.bold = true;
                     } else if name.ends_with("i") {
                         d.italic = true;
+                    } else if in_font && name.ends_with("name") {
+                        if let Some(v) = attr_val(&e, "val") {
+                            d.font = Some(crate::style::normalize_font(&v));
+                        }
                     }
                 }
             }
@@ -1051,6 +1073,10 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                         d.bold = true;
                     } else if name == "i" || name.ends_with(":i") {
                         d.italic = true;
+                    } else if in_font && name.ends_with("name") {
+                        if let Some(v) = attr_val(&e, "val") {
+                            d.font = Some(crate::style::normalize_font(&v));
+                        }
                     }
                 }
             }

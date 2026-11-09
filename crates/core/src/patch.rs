@@ -131,7 +131,7 @@ fn esc(s: &str) -> String {
 
 pub fn dxf_xml(d: &crate::cf::Dxf) -> String {
     let mut out = String::from("<dxf>");
-    if d.bold || d.italic || d.color.is_some() {
+    if d.bold || d.italic || d.color.is_some() || d.font.is_some() {
         out.push_str("<font>");
         if d.bold {
             out.push_str("<b/>");
@@ -141,6 +141,9 @@ pub fn dxf_xml(d: &crate::cf::Dxf) -> String {
         }
         if let Some(c) = d.color {
             out.push_str(&format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]));
+        }
+        if let Some(f) = &d.font {
+            out.push_str(&format!("<name val=\"{}\"/>", esc(f)));
         }
         out.push_str("</font>");
     }
