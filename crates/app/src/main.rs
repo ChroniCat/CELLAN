@@ -4624,6 +4624,23 @@ impl SheetApp {
                 dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
             }
         }
+        // 边框：在填充之上、文字之下。每格画自己四条边，相邻格共享边重画一次也无妨。
+        for (i, b) in st.border.iter().enumerate() {
+            if b.is_none() {
+                continue;
+            }
+            let col = Color32::from_rgb(b.color[0], b.color[1], b.color[2]);
+            let (a, z) = match i {
+                0 => (rect.left_top(), rect.left_bottom()),
+                1 => (rect.right_top(), rect.right_bottom()),
+                2 => (rect.left_top(), rect.right_top()),
+                _ => (rect.left_bottom(), rect.right_bottom()),
+            };
+            painter.line_segment([a, z], Stroke::new(b.px(), col));
+            if dumping {
+                dump.push(format!("border ({},{}) i={} w={:.1} rgb={:?}", r, c, i, b.px(), b.color));
+            }
+        }
         if let Some(ov) = ov {
             if let Some(f) = ov.fill {
                 painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
@@ -4709,7 +4726,31 @@ impl SheetApp {
                         w
                     ));
                 }
-                painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
+                // 多行/自动换行要按单元格宽度排版并裁到格子里，
+                // 否则长地址会溢出到右边的发票号上（Excel 会裁掉）。
+                let multiline = st.wrap || txt.contains("
+");
+                if multiline {
+                    let max_w = (rect.width() - 8.0).max(8.0);
+                    let galley = painter.layout(txt.clone(), font.clone(), color, max_w);
+                    let h = galley.size().y;
+                    let top = if st.valign == 1 {
+                        rect.min.y + 3.0
+                    } else if st.valign == 3 {
+                        (rect.max.y - 3.0 - h).max(rect.min.y + 2.0)
+                    } else {
+                        (rect.center().y - h / 2.0).max(rect.min.y + 2.0)
+                    };
+                    let x = match align {
+                        Align2::CENTER_CENTER => rect.center().x - galley.size().x / 2.0,
+                        Align2::RIGHT_CENTER => rect.max.x - 4.0 - galley.size().x,
+                        _ => rect.min.x + 4.0,
+                    };
+                    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+                    clipped.galley(egui::pos2(x, top), galley, color);
+                } else {
+                    painter.text(egui::pos2(tx, ty), align, txt.clone(), font, color);
+                }
             }
         }
         // 别人正在编辑：虚线框 + 角标

@@ -37,6 +37,7 @@ pub mod clipboard_xmlss;
 pub mod revision;
 pub mod xlinks;
 pub mod xls_layout;
+pub mod xls_style;
 pub mod wire;
 pub mod sync;
 pub mod xlsx;

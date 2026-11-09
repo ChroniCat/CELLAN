@@ -294,6 +294,19 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     }
                 }
             }
+            if let Some(sty) = crate::xls_style::read(path) {
+                let mut ids: Vec<(usize, u32, u32, u16)> = Vec::new();
+                for (i, sh) in sty.sheets.iter().enumerate() {
+                    for (r, c, st) in sh.cells.iter() {
+                        ids.push((i, *r, *c, wb.styles.intern(st.clone())));
+                    }
+                }
+                for (i, r, c, id) in ids {
+                    if let Some(sh) = wb.sheets.get_mut(i) {
+                        sh.set_style(r, c, id);
+                    }
+                }
+            }
             if let Ok(calamine::Sheets::Xls(x)) = open_workbook_auto(path) {
                 for (i, name) in names.iter().enumerate() {
                     if i >= wb.sheets.len() {
