@@ -1,5 +1,6 @@
 mod files;
 mod net;
+mod office_clipboard;
 mod recent;
 mod update;
 mod session_lock;
@@ -120,6 +121,7 @@ struct SheetApp {
     show_start: bool,
     confirm_close_once: bool,
     tabs_done: bool,
+    paste_done: bool,
     pending_tab_switch: Option<usize>,
     update_done: bool,
     /// 历史版本窗口：(工作簿路径, 版本列表)
@@ -332,6 +334,7 @@ impl SheetApp {
             show_start: false,
             confirm_close_once: false,
             tabs_done: false,
+            paste_done: false,
             pending_tab_switch: None,
             update_done: false,
             history_view: None,
@@ -1990,6 +1993,108 @@ impl SheetApp {
         };
     }
 
+
+    /// 把从 Excel 复制来的块贴进来：值 + 格式 + 合并
+    fn paste_office_block(&mut self, block: &office_clipboard::OfficeBlock) -> bool {
+        if block.is_empty() {
+            return false;
+        }
+        let (r0, c0) = self.sel;
+        let cols = block.cols() as u32;
+        let rows = block.rows.len() as u32;
+        if (rows as u64) * (cols as u64) > 200_000 {
+            self.status = "粘贴区域太大（超过 20 万格），改用纯文本粘贴".into();
+            return false;
+        }
+
+        let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
+        let txn = self.txn_begin(&keys);
+        let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let si = self.sheet_idx;
+
+        for (ri, row) in block.rows.iter().enumerate() {
+            let mut ci: u32 = 0;
+            for cell in row {
+                let r = r0 + ri as u32;
+                let c = c0 + ci;
+                // 值
+                let text = cell.text.trim();
+                let value = if text.is_empty() {
+                    Value::Empty
+                } else if let Ok(n) = text.replace(',', "").parse::<f64>() {
+                    Value::Number(n)
+                } else {
+                    Value::Text(text.into())
+                };
+                self.wb
+                    .sheet_mut(si)
+                    .set(r, c, Cell { value, formula: None });
+
+                // 格式
+                let base_id = self.wb.sheet(si).style_of(r, c);
+                let mut st = self.wb.styles.get(base_id).clone();
+                let mut touched = false;
+                if cell.bold != st.bold {
+                    st.bold = cell.bold;
+                    touched = true;
+                }
+                if cell.italic != st.italic {
+                    st.italic = cell.italic;
+                    touched = true;
+                }
+                if let Some(fill) = cell.fill {
+                    st.fill = Some(fill);
+                    touched = true;
+                }
+                if let Some(color) = cell.color {
+                    st.color = color;
+                    touched = true;
+                }
+                if cell.halign != 0 && cell.halign != st.halign {
+                    st.halign = cell.halign;
+                    touched = true;
+                }
+                if let Some(bc) = cell.border {
+                    for side in st.border.iter_mut() {
+                        if side.style == 0 {
+                            side.style = 1;
+                            side.color = bc;
+                        }
+                    }
+                    touched = true;
+                }
+                if touched {
+                    let id = self.wb.styles.intern(st.clone());
+                    self.wb.sheet_mut(si).set_style(r, c, id);
+                }
+
+                // 合并
+                if cell.colspan > 1 || cell.rowspan > 1 {
+                    merges.push((r, c, r + cell.rowspan - 1, c + cell.colspan - 1));
+                }
+                ci += cell.colspan.max(1);
+            }
+        }
+
+        if !merges.is_empty() {
+            let sheet = self.wb.sheet_mut(si);
+            for m in merges {
+                if !sheet.merges.iter().any(|x| x.0 == m.0 && x.1 == m.1 && x.2 == m.2 && x.3 == m.3) {
+                    sheet.merges.push(m);
+                }
+            }
+            sheet.merges_dirty = true;
+        }
+
+        self.txn_end("从 Excel 粘贴", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.sel_end = (r0 + rows - 1, c0 + cols - 1);
+        self.status = format!("已粘贴 Excel 区域 {rows} 行 × {cols} 列（含格式与合并）");
+        eprintln!("[paste] office 块 {rows}x{cols}");
+        true
+    }
+
     /// 把选区转成 Excel 表格对象（ListObject），首行当列名
     fn make_table(&mut self) {
         let (r1, c1, r2, c2) = self.sel_rect();
@@ -2715,6 +2820,14 @@ impl SheetApp {
             return;
         }
         if paste_k || paste_v_k {
+            // 从 Excel 复制过来的块：HTML 里有格式与合并，优先走这条
+            if paste_k && !paste_v_k {
+                if let Some(block) = office_clipboard::read_table() {
+                    if self.paste_office_block(&block) {
+                        return;
+                    }
+                }
+            }
             let text = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Paste(t) => Some(t.clone()),
@@ -6626,6 +6739,34 @@ impl SheetApp {
         }
     }
 
+
+    /// 自检：读系统剪贴板里的 HTML 表格并粘贴
+    fn paste_probe(&mut self) {
+        if std::env::var("SC_PASTE_HTML").is_err() || self.paste_done || self.open_rx.is_some() {
+            return;
+        }
+        self.paste_done = true;
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        match office_clipboard::read_table() {
+            Some(block) => {
+                eprintln!("[paste] 读到表格 {} 行 × {} 列", block.rows.len(), block.cols());
+                let ok = self.paste_office_block(&block);
+                let sh = self.wb.sheet(self.sheet_idx);
+                let a1 = sh.get(0, 0).map(|c| c.value.display()).unwrap_or_default();
+                let st = sh.style_of(0, 0);
+                let cs = self.wb.styles.get(st);
+                eprintln!(
+                    "[paste] 成功={ok} A1={a1:?} 粗体={} 填充={:?} 合并数={}",
+                    cs.bold,
+                    cs.fill,
+                    sh.merges.len()
+                );
+            }
+            None => eprintln!("[paste] 剪贴板里没有 HTML 表格"),
+        }
+    }
+
     /// 启动页：没指定文件时列出最近打开的
     fn start_page(&mut self, ctx: &egui::Context) {
         if !self.show_start {
@@ -7240,6 +7381,7 @@ impl eframe::App for SheetApp {
         self.tick_session();
         self.poll_open_requests();
         self.tabs_probe();
+        self.paste_probe();
         self.update_probe();
         self.start_page(ctx);
         self.history_window(ctx);

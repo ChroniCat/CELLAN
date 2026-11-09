@@ -1250,3 +1250,29 @@ updates 目录：pending-99.0.exe
 [tabs] 切回前 标签数=2 活动=1
 [tabs] 切回后 活动=0 文档=Some(".../share_test.xlsx") 标题=share_test.xlsx
 ```
+
+## 从 Excel 粘贴：带格式和合并（v1.39）
+
+Excel 复制单元格时，剪贴板上同时放了纯文本(TSV)、HTML 和几种二进制格式。
+之前只读 TSV，所以值对了、格式没了。现在优先读 **HTML Format**：
+
+- 解析 `<table>` 的 `<tr>/<td>`，认 `colspan/rowspan` → 合并单元格
+- 内联样式映射到我们的格式：`font-weight:700/bold` → 粗体、`font-style:italic` → 斜体、
+  `background-color` / `background` → 填充、`color` → 字色、`text-align` → 水平对齐、
+  `border` → 细实线边框（颜色取 `border-color`，缺省黑）
+- 颜色支持 `#rrggbb`、`rgb(r,g,b)` 和几种命名色
+- 一次粘贴 = 一个撤销事务；超过 20 万格自动退回纯文本粘贴
+- 纯文本粘贴（Ctrl+Shift+V）仍走原来的 TSV 路径
+
+直接调 Win32（`OpenClipboard` / `GetClipboardData` / `GlobalLock`），
+没有为几十行 API 引入 windows crate。
+
+实测（真实系统剪贴板，从 PowerShell 写入 Excel 风格的 HTML）：
+
+```
+[paste] 读到表格 2 行 × 3 列
+[paste] 成功=true A1="合计" 粗体=true 填充=Some([255, 255, 0]) 合并数=1
+```
+
+**公式不在可读格式里**：Excel 的 HTML 只有显示值，二进制格式才带公式。
+所以从 Excel 粘过来是"值 + 格式 + 合并"，公式保留要等以后做 Biff 解析。
