@@ -760,12 +760,34 @@ impl<'a> Calc<'a> {
 
     pub fn eval_node(&mut self, node: &Node, si: usize) -> FValue {
         match node {
-            Node::Name(n) => self
-                .env_stack
-                .iter()
-                .rev()
-                .find_map(|m| m.get(n).cloned())
-                .unwrap_or(FValue::Error(ErrKind::Name)),
+            Node::Name(n) => {
+                if let Some(v) = self.env_stack.iter().rev().find_map(|m| m.get(n).cloned()) {
+                    return v;
+                }
+                // 工作簿定义名称：底层存的是定义式（区域、常量或公式）
+                let hit = {
+                    let mut found = None;
+                    for (nm, sh, body) in self.wb.names.iter() {
+                        if nm.eq_ignore_ascii_case(n) {
+                            found = Some((*sh, body.clone()));
+                            break;
+                        }
+                    }
+                    found
+                };
+                if let Some((sh, body)) = hit {
+                    let si2 = sh.unwrap_or(si);
+                    let text = body.trim_start_matches('=').to_string();
+                    if !text.is_empty() && !text.eq_ignore_ascii_case(n) {
+                        let expanded =
+                            crate::table::expand_structured(self.wb, si2, &text).unwrap_or(text);
+                        if let Ok(node) = parse(&expanded) {
+                            return self.eval_node(&node, si2);
+                        }
+                    }
+                }
+                FValue::Error(ErrKind::Name)
+            }
             Node::Number(n) => FValue::Number(*n),
             Node::Text(s) => FValue::Text(s.as_str().into()),
             Node::Bool(b) => FValue::Bool(*b),
