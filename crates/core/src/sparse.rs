@@ -146,7 +146,107 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
     let mut f = zip.by_name(part)?;
     let mut xml = String::new();
     f.read_to_string(&mut xml)?;
+    Ok(parse_sheet_xml(&xml, ss))
+}
 
+
+/// 把公式里的 A1 引用按 (dr, dc) 平移；$ 锁定的部分不动。
+/// 共享公式的子格没有自己的文本，靠这个从主格文本推出来。
+pub fn shift_refs(formula: &str, dr: i64, dc: i64) -> String {
+    if dr == 0 && dc == 0 {
+        return formula.to_string();
+    }
+    let chars: Vec<char> = formula.chars().collect();
+    let mut out = String::with_capacity(formula.len() + 8);
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            in_str = !in_str;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_str {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 解析一个可能的引用：[$]字母{1,3}[$]数字{1,7}
+        let start = i;
+        let mut j = i;
+        let col_abs = chars[j] == '$';
+        if col_abs {
+            j += 1;
+        }
+        let ls = j;
+        while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls < 3 {
+            j += 1;
+        }
+        if j == ls {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let letters: String = chars[ls..j].iter().collect();
+        let row_abs = j < chars.len() && chars[j] == '$';
+        if row_abs {
+            j += 1;
+        }
+        let ds = j;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        let too_long = j - ds > 7;
+        let is_ref = j > ds && !too_long
+            && !(j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '(' || chars[j] == '_'))
+            && !(start > 0 && (chars[start - 1].is_ascii_alphanumeric() || chars[start - 1] == '_' || chars[start - 1] == '$' || chars[start - 1] == '.'));
+        if !is_ref {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut col = 0i64;
+        for ch in letters.chars() {
+            col = col * 26 + (ch.to_ascii_uppercase() as i64 - 'A' as i64 + 1);
+        }
+        col -= 1;
+        let row: i64 = chars[ds..j].iter().collect::<String>().parse().unwrap_or(1) - 1;
+        let nc = if col_abs { col } else { col + dc };
+        let nr = if row_abs { row } else { row + dr };
+        if nc < 0 || nr < 0 {
+            out.extend(&chars[start..j]);
+        } else {
+            if col_abs {
+                out.push('$');
+            }
+            out.push_str(&crate::col_label(nc as u32));
+            if row_abs {
+                out.push('$');
+            }
+            out.push_str(&(nr + 1).to_string());
+        }
+        i = j;
+    }
+    out
+}
+
+
+/// XML 实体还原：Excel 把公式里的 > < 写成 &gt; &lt;
+fn unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// 工作表 XML → 单元格表。单拎出来是为了能直接用字符串写测试。
+pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
     let mut out: HashMap<(u32, u32), Cell> = HashMap::new();
     let mut reader = Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
@@ -159,6 +259,9 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
     let mut in_is = false;
     let mut val = String::new();
     let mut formula: Option<String> = None;
+    // 共享公式：主格存文本，子格只有 si，需要按位移推出来
+    let mut masters: HashMap<String, (String, (u32, u32))> = HashMap::new();
+    let mut f_si: Option<String> = None;
 
     macro_rules! flush {
         () => {
@@ -232,6 +335,18 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
                 "v" => in_v = true,
                 "f" => {
                     in_t = false;
+                    f_si = None;
+                    let mut is_shared = false;
+                    for a in e.attributes().flatten() {
+                        match a.key.as_ref() {
+                            "t" => is_shared = a.value.as_ref() == "shared",
+                            "si" => f_si = Some(a.value.as_ref().to_string()),
+                            _ => {}
+                        }
+                    }
+                    if !is_shared {
+                        f_si = None;
+                    }
                     // 公式文本在紧随的 Text 事件里
                     formula = Some(String::new());
                 }
@@ -251,13 +366,58 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
                     }
                 }
             }
+            Ok(Event::Empty(e)) => {
+                if tag_start(&e) == "f" {
+                    let mut shared = false;
+                    let mut si = String::new();
+                    for a in e.attributes().flatten() {
+                        match a.key.as_ref() {
+                            "t" => shared = a.value.as_ref() == "shared",
+                            "si" => si = a.value.as_ref().to_string(),
+                            _ => {}
+                        }
+                    }
+                    if shared && !si.is_empty() {
+                        if let Some((r, c)) = cell_ref {
+                            if let Some((text, anchor)) = masters.get(&si) {
+                                let dr = r as i64 - anchor.0 as i64;
+                                let dc = c as i64 - anchor.1 as i64;
+                                formula = Some(format!("={}", shift_refs(text, dr, dc)));
+                            }
+                        }
+                    }
+                }
+            }
             Ok(Event::End(e)) => match tag_end(&e).as_str() {
                 "v" => in_v = false,
                 "t" => in_t = false,
                 "is" => in_is = false,
                 "f" => {
-                    if let Some(f) = formula.as_mut() {
-                        let t = f.trim();
+                    let here = cell_ref;
+                    if let Some(si) = f_si.take() {
+                        let body = formula
+                        .as_ref()
+                        .map(|x| unescape(x.trim()))
+                        .unwrap_or_default();
+                        if !body.is_empty() {
+                            if let Some(pos) = here {
+                                masters.insert(si.clone(), (body.clone(), pos));
+                            }
+                            if let Some(f) = formula.as_mut() {
+                                *f = format!("={body}");
+                            }
+                        } else {
+                            let derived = here
+                                .and_then(|pos| masters.get(&si).map(|(t, a)| {
+                                    let dr = pos.0 as i64 - a.0 as i64;
+                                    let dc = pos.1 as i64 - a.1 as i64;
+                                    format!("={}", shift_refs(t, dr, dc))
+                                }))
+                                .unwrap_or_default();
+                            formula = Some(derived);
+                        }
+                    } else if let Some(f) = formula.as_mut() {
+                        let t = unescape(f.trim());
                         if !t.is_empty() {
                             *f = format!("={t}");
                         }
@@ -267,11 +427,11 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => return Err(anyhow::anyhow!("解析 {part} 失败: {e}")),
+            Err(e) => { eprintln!("[sparse] 解析出错: {e}"); break; }
             _ => {}
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -284,6 +444,38 @@ mod tests {
         assert_eq!(parse_ref("B12"), Some((11, 1)));
         assert_eq!(parse_ref("XFD1048576"), Some((1048575, 16383)));
         assert_eq!(parse_ref("12"), None);
+    }
+
+
+    #[test]
+    fn shift_moves_relative_refs_only() {
+        assert_eq!(shift_refs("SUM(A1:B2)", 1, 0), "SUM(A2:B3)");
+        assert_eq!(shift_refs("$A$1+A1", 2, 3), "$A$1+D3");
+        assert_eq!(shift_refs("$A1+A$1", 1, 1), "$A2+B$1");
+        assert_eq!(shift_refs("'参数与字典'!$B$7", 0, 0), "'参数与字典'!$B$7");
+        assert_eq!(shift_refs("'参数 表'!B7", 1, 0), "'参数 表'!B8");
+        assert_eq!(shift_refs("LOG10(A1)", 1, 0), "LOG10(A2)", "函数名不能被当成引用");
+        assert_eq!(shift_refs("\"A1\"&A1", 1, 0), "\"A1\"&A2", "字符串里的不动");
+    }
+
+    #[test]
+    fn shared_formula_children_are_derived() {
+        // G6 是主格，G7 是带结束标签的空 f，G8 是自闭合 f
+        let xml = r#"<worksheet><sheetData>
+            <row r="6"><c r="G6"><f t="shared" ref="G6:G8" si="0">IF(ISNUMBER(E6),D6*2,0)</f><v>1</v></c></row>
+            <row r="7"><c r="G7"><f t="shared" si="0"></f><v>2</v></c></row>
+            <row r="8"><c r="G8"><f t="shared" si="0"/><v>3</v></c></row>
+        </sheetData></worksheet>"#;
+        let cells = parse_sheet_xml(xml, &[]);
+        let f = |r: u32| {
+            cells
+                .get(&(r, 6))
+                .and_then(|c| c.formula.as_ref().map(|x| x.to_string()))
+                .unwrap_or_default()
+        };
+        assert_eq!(f(5), "=IF(ISNUMBER(E6),D6*2,0)");
+        assert_eq!(f(6), "=IF(ISNUMBER(E7),D7*2,0)", "第 7 行要按 +1 平移");
+        assert_eq!(f(7), "=IF(ISNUMBER(E8),D8*2,0)", "自闭合子格也要平移");
     }
 
     #[test]
