@@ -245,6 +245,86 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+
+/// 共享公式：calamine 交给子格的是主格原文（没按位移改），
+/// 这里按 XML 里的 si 组重新推导，返回需要覆盖的 (行, 列, 公式)。
+pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
+    use quick_xml::events::Event;
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut out: Vec<(u32, u32, String)> = Vec::new();
+    let mut masters: HashMap<String, (String, (u32, u32))> = HashMap::new();
+    let mut cell_ref: Option<(u32, u32)> = None;
+    let mut si: Option<String> = None;
+    let mut body = String::new();
+    let mut in_f = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match tag_start(&e).as_str() {
+                "c" => {
+                    cell_ref = None;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "r" {
+                            cell_ref = parse_ref(a.value.as_ref());
+                        }
+                    }
+                }
+                "f" => {
+                    in_f = true;
+                    body.clear();
+                    si = None;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "si" {
+                            si = Some(a.value.as_ref().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => {
+                if tag_end(&e).as_str() == "f" {
+                    in_f = false;
+                    if let (Some(si), Some(pos)) = (si.clone(), cell_ref) {
+                        let text = body.trim().to_string();
+                        if !text.is_empty() {
+                            masters.insert(si, (text, pos));
+                        } else if let Some((mt, anchor)) = masters.get(&si) {
+                            let dr = pos.0 as i64 - anchor.0 as i64;
+                            let dc = pos.1 as i64 - anchor.1 as i64;
+                            out.push((pos.0, pos.1, format!("={}", shift_refs(mt, dr, dc))));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_f {
+                    body.push_str(t.as_ref());
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if in_f {
+                    let name = String::from_utf8_lossy(r.as_ref().as_ref()).to_string();
+                    let ch = match name.as_str() {
+                        "gt" => Some('>'),
+                        "lt" => Some('<'),
+                        "amp" => Some('&'),
+                        "quot" => Some('"'),
+                        "apos" => Some('\''),
+                        _ => None,
+                    };
+                    if let Some(c) = ch {
+                        body.push(c);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
 /// 工作表 XML → 单元格表。单拎出来是为了能直接用字符串写测试。
 pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
     let mut out: HashMap<(u32, u32), Cell> = HashMap::new();

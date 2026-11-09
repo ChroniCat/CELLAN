@@ -174,6 +174,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         all
     });
 
+    let mut shared_zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     for raw in raws {
         let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(raw.name.clone());
@@ -191,6 +192,21 @@ pub fn load(path: &Path) -> Result<Workbook> {
             let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
             cell.formula = Some(text.into());
             sheet.set(r, c, cell);
+        }
+        // 共享公式：解析库给子格的是主格原文，没按位移改，这里按 si 组重新推
+        if !raw.sparse {
+            if let Some(part) = targets.get(&raw.name) {
+                if let Ok(mut f) = shared_zip.by_name(part) {
+                    let mut xml = String::new();
+                    if std::io::Read::read_to_string(&mut f, &mut xml).is_ok() {
+                        for (r, c, text) in crate::sparse::fix_shared_children(&xml) {
+                            let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
+                            cell.formula = Some(text.into());
+                            sheet.set(r, c, cell);
+                        }
+                    }
+                }
+            }
         }
         sheet.loading = false;
         sheet.edited = false;

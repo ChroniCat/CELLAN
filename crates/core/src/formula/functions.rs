@@ -1850,6 +1850,26 @@ fn format_value(v: &FValue, fmt: &str) -> String {
         .unwrap_or(0);
     let thousand = fmt.contains('#') && fmt.contains(',');
     let mut s = format!("{val:.decimals$}");
+    // 整数格式里的 0 是"至少几位"：TEXT(12.3,"000.00") = "012.30"
+    let min_int = fmt
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| *c == '0')
+        .count();
+    if min_int > 0 {
+        let (ip, rest) = match s.find('.') {
+            Some(i) => (s[..i].to_string(), s[i..].to_string()),
+            None => (s.clone(), String::new()),
+        };
+        let neg = ip.starts_with('-');
+        let digits = ip.trim_start_matches('-');
+        if digits.len() < min_int {
+            let padded = format!("{}{}", "0".repeat(min_int - digits.len()), digits);
+            s = format!("{}{}{}", if neg { "-" } else { "" }, padded, rest);
+        }
+    }
     if thousand {
         let int_part = s.split('.').next().unwrap_or("").to_string();
         let neg = int_part.starts_with('-');

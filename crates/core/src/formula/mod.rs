@@ -282,6 +282,24 @@ impl Parser {
         self.pos += 1;
         t
     }
+    /// 空格在 Excel 里是交集运算符：A1:A2 B1:B2。
+    /// 我们的求值器不做区域相交，直接按 Excel 的"无重叠"结果返回 #NULL!。
+    fn eats_intersection(&mut self) -> bool {
+        if let Some(Tok::Ident(name)) = self.peek() {
+            if parse_a1(name).is_some() {
+                self.pos += 1;
+                if self.peek() == Some(&Tok::Colon) {
+                    self.pos += 1;
+                    if matches!(self.peek(), Some(Tok::Ident(_))) {
+                        self.pos += 1;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn eat(&mut self, t: &Tok) -> bool {
         if self.peek() == Some(t) {
             self.pos += 1;
@@ -465,7 +483,26 @@ impl Parser {
                             return Err(ErrKind::Value);
                         }
                     }
-                    return Ok(Node::Func(name.to_ascii_uppercase(), args));
+                    let mut node = Node::Func(name.to_ascii_uppercase(), args);
+                    // LAMBDA(x,x*x)(7)：函数值后面直接跟实参
+                    while matches!(self.peek(), Some(Tok::LParen)) {
+                        self.pos += 1;
+                        let mut call = vec![node];
+                        if !self.eat(&Tok::RParen) {
+                            loop {
+                                call.push(self.parse_expr()?);
+                                if self.eat(&Tok::Comma) {
+                                    continue;
+                                }
+                                if self.eat(&Tok::RParen) {
+                                    break;
+                                }
+                                return Err(ErrKind::Value);
+                            }
+                        }
+                        node = Node::Func("__CALL__".to_string(), call);
+                    }
+                    return Ok(node);
                 }
                 // TRUE / FALSE
                 let up = name.to_ascii_uppercase();
@@ -500,6 +537,9 @@ impl Parser {
                 end.sheet = re.sheet.clone();
                 return Ok(Node::Range(re, end));
             }
+            if self.eats_intersection() {
+                return Ok(Node::Err(ErrKind::Null));
+            }
             return Ok(Node::Ref(re));
         }
 
@@ -513,7 +553,13 @@ impl Parser {
                 return Err(ErrKind::Ref);
             };
             let end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
+            if self.eats_intersection() {
+                return Ok(Node::Err(ErrKind::Null));
+            }
             return Ok(Node::Range(start, end));
+        }
+        if self.eats_intersection() {
+            return Ok(Node::Err(ErrKind::Null));
         }
         Ok(Node::Ref(start))
     }
@@ -1010,6 +1056,31 @@ impl<'a> Calc<'a> {
                     body,
                     env: self.env_stack.clone(),
                 }))
+            }
+            // 立即调用：LAMBDA(x, x*x)(7)
+            Node::Func(name, nodes) if name == "__CALL__" && !nodes.is_empty() => {
+                let target = self.eval_node(&nodes[0], si);
+                match target {
+                    FValue::Lambda(l) => {
+                        let params = l.params.clone();
+                        let body = l.body.clone();
+                        let captured = l.env.clone();
+                        let mut bound: HashMap<String, FValue> = HashMap::new();
+                        for (i, p) in params.iter().enumerate() {
+                            let v = match nodes.get(i + 1) {
+                                Some(n) => self.eval_node(n, si),
+                                None => FValue::Empty,
+                            };
+                            bound.insert(p.clone(), v);
+                        }
+                        let saved = std::mem::replace(&mut self.env_stack, captured);
+                        self.env_stack.push(bound);
+                        let out = self.eval_node(&body, si);
+                        self.env_stack = saved;
+                        out
+                    }
+                    _ => FValue::Error(ErrKind::Value),
+                }
             }
             Node::Func(name, nodes) if name == "ISOMITTED" => match nodes.first() {
                 Some(Node::Name(n)) => FValue::Bool(
