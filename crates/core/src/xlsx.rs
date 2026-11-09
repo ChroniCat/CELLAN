@@ -18,6 +18,82 @@ fn data_to_value(d: &Data) -> Value {
 }
 
 /// 读取 xlsx/xls/ods（按扩展名自动识别）
+
+/// 并行解析的中间结果：只存原始数据，样式留给主线程 intern
+struct RawSheet {
+    name: String,
+    cells: Vec<((u32, u32), Cell)>,
+    styles: Vec<((u32, u32), crate::style::CellStyle)>,
+    formulas: Vec<((u32, u32), String)>,
+    sparse: bool,
+}
+
+/// 一个线程负责一组工作表：自己开 reader，避免共享状态
+fn load_chunk(
+    path: &Path,
+    names: &[String],
+    targets: &std::collections::HashMap<String, String>,
+    shared: &[String],
+    limit: u64,
+) -> Vec<RawSheet> {
+    let mut out = Vec::new();
+    let Ok(mut reader) = crate::xlsx::open_workbook_auto(path) else {
+        return out;
+    };
+    for name in names {
+        let mut raw = RawSheet {
+            name: name.clone(),
+            cells: Vec::new(),
+            styles: Vec::new(),
+            formulas: Vec::new(),
+            sparse: false,
+        };
+        let sparse_part = targets
+            .get(name)
+            .filter(|p| crate::sparse::declared_area_of(path, p) > limit);
+        if let Some(part) = sparse_part {
+            match crate::sparse::read_sheet(path, part, shared) {
+                Ok(cells) => {
+                    raw.cells = cells.into_iter().collect();
+                    raw.sparse = true;
+                    out.push(raw);
+                    continue;
+                }
+                Err(e) => eprintln!("[load] {name} 稀疏读取失败，退回 calamine: {e:#}"),
+            }
+        }
+        if let Ok(range) = reader.worksheet_range(name) {
+            let (r0, c0) = range.start().unwrap_or((0, 0));
+            for (row, col, data) in range.cells() {
+                let v = data_to_value(data);
+                if !v.is_empty() {
+                    raw.cells.push((
+                        (r0 + row as u32, c0 + col as u32),
+                        Cell { value: v, formula: None },
+                    ));
+                }
+            }
+        }
+        if let Ok(st) = reader.worksheet_style(name) {
+            for (row, col, style) in st.cells() {
+                raw.styles.push(((row, col), convert_style(style)));
+            }
+        }
+        if let Ok(forms) = reader.worksheet_formula(name) {
+            let (fr0, fc0) = forms.start().unwrap_or((0, 0));
+            for (row, col, f) in forms.cells() {
+                if f.is_empty() {
+                    continue;
+                }
+                let text = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
+                raw.formulas.push(((fr0 + row as u32, fc0 + col as u32), text));
+            }
+        }
+        out.push(raw);
+    }
+    out
+}
+
 pub fn load(path: &Path) -> Result<Workbook> {
     let mut reader =
         open_workbook_auto(path).with_context(|| format!("无法打开 {}", path.display()))?;
@@ -60,94 +136,85 @@ pub fn load(path: &Path) -> Result<Workbook> {
         });
     }
     let t_all = std::time::Instant::now();
-    for name in names {
+    // 逐表解析并行：每线程自己开一个 reader，样式回主线程再 intern
+    let limit = std::env::var("SC_DENSE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(crate::sparse::DENSE_LIMIT);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 6)
+        .min(names.len().max(1));
+    let chunk = names.len().div_ceil(nthreads).max(1);
+    let raws: Vec<RawSheet> = std::thread::scope(|sc| {
+        let mut handles = Vec::new();
+        for t in 0..nthreads {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(names.len());
+            if lo >= hi {
+                continue;
+            }
+            let slice = &names[lo..hi];
+            let p = path.to_path_buf();
+            let targets_ref = &targets;
+            let shared_ref = &shared;
+            handles.push(sc.spawn(move || load_chunk(&p, slice, targets_ref, shared_ref, limit)));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(v) => all.extend(v),
+                Err(_) => eprintln!("[load] 并行解析线程异常退出"),
+            }
+        }
+        all
+    });
+
+    for raw in raws {
         let t_sheet = std::time::Instant::now();
-        let mut sheet = Sheet::new(name.clone());
+        let mut sheet = Sheet::new(raw.name.clone());
         sheet.loading = true;
-
-        let limit = std::env::var("SC_DENSE_LIMIT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(crate::sparse::DENSE_LIMIT);
-        let sparse_part = targets
-            .get(&name)
-            .filter(|p| crate::sparse::declared_area_of(path, p) > limit);
-        if let Some(part) = sparse_part {
-            match crate::sparse::read_sheet(path, part, &shared) {
-                Ok(cells) => {
-                    for ((r, c), cell) in cells {
-                        sheet.set(r, c, cell);
-                    }
-                    eprintln!(
-                        "[load] {} 声明区域过大，走稀疏读取（{} 格）",
-                        name,
-                        sheet.iter().count()
-                    );
-                    sheet.loading = false;
-        sheet.edited = false;
-        wb.sheets.push(sheet);
-                    continue;
-                }
-                Err(e) => eprintln!("[load] {} 稀疏读取失败，退回 calamine: {e:#}", name),
+        for ((r, c), cell) in raw.cells {
+            sheet.set(r, c, cell);
+        }
+        for ((r, c), cs) in raw.styles {
+            let id = wb.styles.intern(cs);
+            if id != 0 {
+                sheet.set_style_loaded(r, c, id);
             }
         }
-
-        if let Ok(range) = reader.worksheet_range(&name) {
-            // calamine 的 cells() 给的是相对 Range 左上角的坐标，必须加上 start 偏移
-            let (r0, c0) = range.start().unwrap_or((0, 0));
-            for (row, col, data) in range.cells() {
-                let v = data_to_value(data);
-                if !v.is_empty() {
-                    sheet.set(r0 + row as u32, c0 + col as u32, Cell { value: v, formula: None });
-                }
-            }
+        for ((r, c), text) in raw.formulas {
+            let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
+            cell.formula = Some(text.into());
+            sheet.set(r, c, cell);
         }
-
-        // 样式：calamine 已解析好样式表，折算成我们的紧凑结构
-        if let Ok(st) = reader.worksheet_style(&name) {
-            for (row, col, style) in st.cells() {
-                let cs = convert_style(style);
-                let id = wb.styles.intern(cs);
-                if id != 0 {
-                    sheet.set_style_loaded(row, col, id);
-                }
-            }
-        }
-
-        // 公式与值分开返回，补上公式原文
-        if let Ok(forms) = reader.worksheet_formula(&name) {
-            let (fr0, fc0) = forms.start().unwrap_or((0, 0));
-            for (row, col, f) in forms.cells() {
-                if f.is_empty() {
-                    continue;
-                }
-                let text = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
-                let rr = fr0 + row as u32;
-                let cc = fc0 + col as u32;
-                let mut cell = sheet.get(rr, cc).cloned().unwrap_or_default();
-                cell.formula = Some(text.into());
-                sheet.set(rr, cc, cell);
-            }
-        }
-
         sheet.loading = false;
         sheet.edited = false;
         if prof_load {
             eprintln!(
-                "[load] {:<16} {:>7.0}ms  {:>7} 格",
+                "[load] {:<16} {:>7} 格  {}{}",
                 sheet.name,
-                t_sheet.elapsed().as_secs_f64() * 1000.0,
-                sheet.iter().count()
+                sheet.iter().count(),
+                "",
+                if raw.sparse { "（稀疏）" } else { "" }
             );
         }
+        let _ = t_sheet;
         wb.sheets.push(sheet);
     }
     if prof_load {
-        eprintln!("[load] 工作表合计 {:.2}s", t_all.elapsed().as_secs_f64());
+        eprintln!("[load] 物化合计 {:.2}s（并行解析已完成）", t_all.elapsed().as_secs_f64());
     }
-    let (found, layouts_raw, pics, tables) = side_rx
-        .recv()
-        .unwrap_or_else(|_| (Default::default(), Ok(Default::default()), Default::default(), Default::default()));
+
+    let (found, layouts_raw, pics, tables) = side_rx.recv().unwrap_or_else(|_| {
+        (
+            Default::default(),
+            Ok(Default::default()),
+            Default::default(),
+            Default::default(),
+        )
+    });
     let layouts = layouts_raw.unwrap_or_default();
 
     if wb.sheets.is_empty() {
