@@ -329,6 +329,37 @@ pub fn load(path: &Path) -> Result<Workbook> {
 }
 
 /// 写回 xlsx。文件已存在时先读入，以保留样式、列宽等未改动的部分。
+
+/// 原子保存：先写同目录的临时文件，再 rename 覆盖目标。
+///
+/// 网盘（SMB）上直接写目标路径，断网或对方锁定会留下半截文件；
+/// 同一卷内 rename 是原子的，别人要么看到旧文件、要么看到完整的新文件。
+pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "workbook.xlsx".into());
+    let tmp = dir.join(format!(".~{name}.saving-{}", std::process::id()));
+    if let Err(e) = save(&tmp, wb) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 目标被 Office 打开时 rename 会失败：留下临时文件并如实报错
+            let keep = tmp.display().to_string();
+            Err(anyhow::anyhow!(
+                "写入临时文件成功，但替换 {} 失败（{}）；新内容留在 {}",
+                path.display(),
+                e,
+                keep
+            ))
+        }
+    }
+}
+
 pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};

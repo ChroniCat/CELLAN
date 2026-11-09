@@ -107,6 +107,9 @@ struct SheetApp {
     lock_beat: Option<std::time::Instant>,
     /// 已经为哪个文件尝试过自动发现（避免反复重连）
     auto_join_tried: Option<PathBuf>,
+    /// 占用卡上写着的编辑者（没连上时显示在标题栏）
+    remote_editor: Option<String>,
+    last_title: String,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -284,6 +287,8 @@ impl SheetApp {
             macro_ran: false,
             lock_beat: None,
             auto_join_tried: None,
+            remote_editor: None,
+            last_title: String::new(),
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -517,7 +522,7 @@ impl SheetApp {
         std::thread::spawn(move || {
             // 先写临时文件，成功再替换，避免写一半断电把原文件毁了
             let tmp = path.with_extension("xlsx.tmp");
-            let res = match sheetcore::xlsx::save(&tmp, &wb) {
+            let res = match sheetcore::xlsx::save_atomic(&tmp, &wb) {
                 Ok(()) => match std::fs::rename(&tmp, &path) {
                     Ok(()) => Ok(shown),
                     Err(e) => {
@@ -644,7 +649,7 @@ impl SheetApp {
         // 存盘再重开：数据源应当还在，刷新能力才谈得上"持久"
         let out = std::path::PathBuf::from("F:/Finance/work/b4_out.xlsx");
         let _ = std::fs::remove_file(&out);
-        if let Err(e) = sheetcore::xlsx::save(&out, &self.wb) {
+        if let Err(e) = sheetcore::xlsx::save_atomic(&out, &self.wb) {
             eprintln!("[B4] 存盘失败: {e:#}");
             return;
         }
@@ -717,7 +722,7 @@ impl SheetApp {
         eprintln!("[B1] SUM({name}[金额]) = {v:?}");
         let out = std::path::PathBuf::from("F:/Finance/work/b1_out.xlsx");
         let _ = std::fs::remove_file(&out);
-        match sheetcore::xlsx::save(&out, &self.wb) {
+        match sheetcore::xlsx::save_atomic(&out, &self.wb) {
             Ok(_) => eprintln!("[B1] 存盘后表格={:?}", sheetcore::table::load(&out)),
             Err(e) => eprintln!("[B1] 保存失败 {e:#}"),
         }
@@ -738,7 +743,7 @@ impl SheetApp {
         eprintln!("[B3] 状态={} 数组={:?}", self.status, self.wb.sheet(self.sheet_idx).arrays);
         let out = std::path::PathBuf::from("F:/Finance/work/b3_out.xlsx");
         let _ = std::fs::remove_file(&out);
-        match sheetcore::xlsx::save(&out, &self.wb) {
+        match sheetcore::xlsx::save_atomic(&out, &self.wb) {
             Ok(_) => {
                 let found = sheetcore::arr::scan(&out);
                 eprintln!("[B3] 存盘后数组={found:?}");
@@ -4382,7 +4387,7 @@ impl SheetApp {
             return;
         };
         let name = self.wb.sheet(self.sheet_idx).name.clone();
-        if let Err(e) = sheetcore::xlsx::save(&path, &self.wb) {
+        if let Err(e) = sheetcore::xlsx::save_atomic(&path, &self.wb) {
             self.status = format!("保存失败：{e}");
             return;
         }
@@ -6329,6 +6334,82 @@ impl SheetApp {
         self.lock_beat = Some(std::time::Instant::now());
     }
 
+
+    /// 每 2 秒做的事：宿主刷心跳；客户端找一找"谁在编辑"
+    fn tick_session(&mut self) {
+        let due = self
+            .lock_beat
+            .map(|t| t.elapsed().as_secs() >= 2)
+            .unwrap_or(true);
+        if !due && self.remote_editor.is_some() {
+            return;
+        }
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if hosting {
+            self.beat_lock();
+            self.remote_editor = None;
+            return;
+        }
+        // 没连上时，读一眼占用卡：让别人看见"谁在编辑"
+        let Some(path) = self.wb.path.clone() else {
+            self.remote_editor = None;
+            return;
+        };
+        self.remote_editor = session_lock::read(&path).and_then(|info| {
+            if session_lock::is_mine(&info) || !session_lock::is_fresh(&info) {
+                None
+            } else if info.user.is_empty() {
+                Some(info.machine)
+            } else {
+                Some(info.user)
+            }
+        });
+        self.lock_beat = Some(std::time::Instant::now());
+    }
+
+    /// 窗口标题：文件名 + 未保存 + 谁在编辑
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let name = self
+            .wb
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未命名.xlsx".into());
+        let mut title = name;
+        if self.wb.dirty {
+            title.push_str(" *");
+        }
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        let connected = self.net.is_some();
+        if connected {
+            let total = self.peers_list.len().max(1);
+            // 同一台机器上两个进程名字一样，按站点号区分才靠得住
+            let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+            let names: Vec<String> = self
+                .peers_list
+                .iter()
+                .filter(|(site, _, _)| *site != my_site)
+                .map(|(_, n, _)| n.clone())
+                .collect();
+            if total > 1 {
+                title.push_str(&format!(" · {} 人协作（{}）", total, names.join("、")));
+            } else if hosting {
+                title.push_str(" · 已共享，等待同事加入");
+            } else {
+                title.push_str(" · 已加入协作会话");
+            }
+        } else if let Some(who) = &self.remote_editor {
+            title.push_str(&format!(" · {who} 正在编辑"));
+        }
+        title.push_str(" - Sheets Native");
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            eprintln!("[title] {title}");
+            self.last_title = title;
+        }
+    }
+
     fn join_shared(&mut self) {
         let site = rand_site();
         let addr = self.join_addr.trim().to_string();
@@ -6626,6 +6707,8 @@ impl eframe::App for SheetApp {
         self.link_dialog(ctx);
         self.macro_run_dialog(ctx);
         self.macro_run_probe();
+        self.tick_session();
+        self.update_window_title(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
         self.renew_lock_if_needed();
