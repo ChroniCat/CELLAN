@@ -174,6 +174,8 @@ struct SheetApp {
     find: FindState,
     /// 缩放
     zoom: f32,
+    /// 功能区当前页签：0 文件 1 开始 2 插入 3 公式 4 数据 5 视图
+    ribbon_tab: usize,
     /// 工作表重命名对话框
     rename_sheet: Option<(usize, String)>,
     /// 填充柄拖拽的终点（行或列，取决于方向）
@@ -369,6 +371,7 @@ impl SheetApp {
             clip: None,
             find: FindState::default(),
             zoom: 1.0,
+            ribbon_tab: 1,
             rename_sheet: None,
             fill_drag: None,
             data_dlg: None,
@@ -7429,7 +7432,23 @@ impl eframe::App for SheetApp {
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, name) in ["文件", "开始", "插入", "公式", "数据", "视图"].iter().enumerate() {
+                    if ui.selectable_label(self.ribbon_tab == i, *name).clicked() {
+                        self.ribbon_tab = i;
+                    }
+                }
+                ui.separator();
+                ui.label(format!("{}{}", self.wb.title(), if self.wb.dirty { " *" } else { "" }));
+                if self.wb.has_vba {
+                    ui.colored_label(egui::Color32::from_rgb(180, 110, 0), "含宏（保留不执行）");
+                }
+                ui.separator();
+                ui.label(self.status.clone());
+            });
+            ui.separator();
+            if self.ribbon_tab == 0 {
             ui.horizontal(|ui| {
                 if ui.button("打开").clicked() {
                     self.open();
@@ -7511,9 +7530,48 @@ impl eframe::App for SheetApp {
                     );
                 }
                 ui.separator();
-                ui.label(self.status.clone());
             });
-            self.toolbar_format(ui);
+            }
+            if self.ribbon_tab == 1 {
+                ui.horizontal(|ui| {
+                    self.toolbar_format(ui);
+                });
+            }
+            if self.ribbon_tab == 2 {
+                ui.label("插入：图表、批注、图片、表格、透视表");
+            }
+            if self.ribbon_tab == 3 {
+                ui.horizontal(|ui| {
+                    if ui.button("查找与替换").clicked() {
+                        self.find.open = true;
+                    }
+                    if ui.button("重算全部").clicked() {
+                        sheetcore::formula::recalc_all(&mut self.wb);
+                        self.status = "已重算".to_string();
+                    }
+                });
+            }
+            if self.ribbon_tab == 4 {
+                ui.horizontal(|ui| {
+                    if ui.button("条件格式").clicked() {
+                        self.cf_mgr = true;
+                    }
+                });
+            }
+            if self.ribbon_tab == 5 {
+                ui.horizontal(|ui| {
+                    if ui.button("打印预览").clicked() {
+                        self.print_preview = true;
+                    }
+                    ui.label("缩放");
+                    let mut z = self.zoom;
+                    if ui.add(egui::Slider::new(&mut z, 0.5..=2.5).show_value(false)).changed() {
+                        self.zoom = z;
+                        ctx.set_zoom_factor(z);
+                    }
+                    ui.label(format!("{:.0}%", self.zoom * 100.0));
+                });
+            }
         });
 
         egui::TopBottomPanel::top("formula").show(ctx, |ui| {
