@@ -7,6 +7,21 @@ fn main() {
     let inp = args.next().expect("用法: ext_probe <in.xlsx> [out.xlsx]");
     let outp = args.next();
     let mut wb = sheetcore::xlsx::load(std::path::Path::new(&inp)).expect("读入失败");
+    println!("外部链接 {} 个", wb.links.len());
+    for l in &wb.links {
+        println!(
+            "  [{}] {} → 表 {:?} 缓存 {} 格{}",
+            l.index,
+            l.target,
+            l.sheets,
+            l.cache.len(),
+            if l.abs.is_some() { "（有绝对路径）" } else { "" }
+        );
+    }
+    if std::env::var("SC_XLINK_REFRESH").is_ok() {
+        let rep = sheetcore::xlinks::refresh(&mut wb);
+        println!("刷新：成功 {} 个，失败 {:?}", rep.ok, rep.failed);
+    }
     println!("表数={} 表名={:?}", wb.sheets.len(), wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>());
     for r in 0..6u32 {
         if let Some(c) = wb.sheets[0].get(r, 0) {

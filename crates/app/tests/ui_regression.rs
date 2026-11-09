@@ -282,3 +282,63 @@ fn merged_range_uses_anchor_font() {
     );
 }
 
+#[test]
+fn external_link_values_render_and_refresh() {
+    let dir = std::env::temp_dir().join("sheet_ui_xlink");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 源工作簿
+    let src = dir.join("预算.xlsx");
+    let mut s = sheetcore::model::Workbook::new_blank();
+    s.sheets[0].name = "预算".into();
+    s.sheets[0].set(0, 0, sheetcore::model::Cell {
+        value: sheetcore::model::Value::Number(10.0),
+        formula: None,
+    });
+    sheetcore::xlsx::save(&src, &s).unwrap();
+
+    // 引用方：链接 + 缓存 + [1] 公式（save 会把 externalLink 部件补齐）
+    let main = dir.join("汇总.xlsx");
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.path = Some(main.clone());
+    wb.sheets[0].name = "汇总".into();
+    let mut link = sheetcore::xlinks::ExternalBook {
+        index: 1,
+        target: "预算.xlsx".into(),
+        sheets: vec!["预算".into()],
+        ..Default::default()
+    };
+    link.cache.insert((0, 0, 0), sheetcore::model::Value::Number(10.0));
+    wb.links.push(link);
+    wb.sheets[0].set(0, 0, sheetcore::model::Cell {
+        value: sheetcore::model::Value::Number(10.0),
+        formula: Some("=[1]预算!A1".into()),
+    });
+    sheetcore::xlsx::save(&main, &wb).expect("写样本");
+
+    // 打开就能画出来（用文件里的缓存）
+    let dump = dump_for(main.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump link");
+    assert!(cell_line(&dump, 0, 0).contains("\"10\""), "缓存值没画出来：{}", cell_line(&dump, 0, 0));
+
+    // 源文件改成 77 → 更新链接 → 画面跟着变
+    let mut s2 = sheetcore::model::Workbook::new_blank();
+    s2.sheets[0].name = "预算".into();
+    s2.sheets[0].set(0, 0, sheetcore::model::Cell {
+        value: sheetcore::model::Value::Number(77.0),
+        formula: None,
+    });
+    sheetcore::xlsx::save(&src, &s2).unwrap();
+    let dump2 = dump_for(
+        main.to_str().unwrap(),
+        &[("SC_XLINK_REFRESH", "1")],
+        Duration::from_secs(30),
+    )
+    .expect("dump refresh");
+    assert!(
+        cell_line(&dump2, 0, 0).contains("\"77\""),
+        "更新链接后没换成新值：{}",
+        cell_line(&dump2, 0, 0)
+    );
+}
+

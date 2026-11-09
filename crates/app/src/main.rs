@@ -195,6 +195,8 @@ struct SheetApp {
     /// 单元格格式对话框
     fmt_dlg: bool,
     fmt_state: FmtState,
+    /// 外部链接对话框
+    xlink_dlg: bool,
     /// 标签拖拽排序
     tab_drag: Option<usize>,
     /// 名称框
@@ -400,6 +402,7 @@ impl SheetApp {
             ribbon_tab: 1,
             fmt_dlg: false,
             fmt_state: FmtState::default(),
+            xlink_dlg: false,
             tab_drag: None,
             name_buf: String::new(),
             name_edit: false,
@@ -526,6 +529,19 @@ impl SheetApp {
                     eprintln!("[open] 已显示缓存值 {n} 格");
                     // 无界面验收钩子：SC_FONT=字体名 把字体套到当前选区（走真实的 apply_style，
                     // 含样式去重、撤销事务、协作广播），SC_SAVE=路径 立刻另存一份
+                    // 无界面验收：SC_XLINK_REFRESH=1 打开后立刻更新外部链接并重算
+                    if std::env::var("SC_XLINK_REFRESH").is_ok() && !self.wb.links.is_empty() {
+                        let rep = sheetcore::xlinks::refresh(&mut self.wb);
+                        sheetcore::formula::recalc_all(&mut self.wb);
+                        // 让还在路上的后台重算作废，别拿旧快照盖掉刷新结果
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        eprintln!(
+                            "[xlink] 更新 {} 个，失败 {:?}，A1={:?}",
+                            rep.ok,
+                            rep.failed,
+                            self.wb.sheets[0].get(0, 0).map(|c| c.value.display())
+                        );
+                    }
                     if let Ok(font) = std::env::var("SC_FONT") {
                         let font = font.trim().to_string();
                         self.apply_style(move |s| s.font = font.clone());
@@ -1196,7 +1212,7 @@ impl SheetApp {
                     Some(cell) => cell
                         .formula
                         .as_deref()
-                        .map(|f| f.to_string())
+                        .map(|f| sheetcore::xlinks::display_formula(&self.wb, f))
                         .unwrap_or_else(|| cell.value.display()),
                     None => String::new(),
                 }
@@ -2915,7 +2931,17 @@ impl SheetApp {
                 return;
             }
             let cell = if ed.buf.starts_with('=') {
-                Cell { value: Value::Text(ed.buf.as_str().into()), formula: Some(ed.buf.as_str().into()) }
+                // 手输的 [预算.xlsx]Sheet!A1：先把工作簿登记成链接（能读到就带缓存），
+                // 再折回 Excel 认的 [N] 形式
+                let mut text = ed.buf.trim().to_string();
+                if sheetcore::xlinks::is_external_formula(&text) {
+                    let added = sheetcore::xlinks::absorb_formula(&mut self.wb, &text);
+                    if added > 0 {
+                        self.status = format!("已登记 {added} 个外部工作簿");
+                    }
+                    text = sheetcore::xlinks::raw_formula(&self.wb, &text);
+                }
+                Cell { value: Value::Text(text.as_str().into()), formula: Some(text.as_str().into()) }
             } else {
                 Cell { value: Value::parse_input(&ed.buf), formula: None }
             };
@@ -5152,6 +5178,98 @@ impl SheetApp {
     }
 
     /// 工作表重命名
+    /// 外部链接：看看有哪些、缓存多少格、需不需要更新
+    fn xlink_dialog(&mut self, ctx: &egui::Context) {
+        if !self.xlink_dlg {
+            return;
+        }
+        let mut open = self.xlink_dlg;
+        let mut do_refresh = false;
+        let mut forget: Option<usize> = None;
+        egui::Window::new("外部链接")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                if self.wb.links.is_empty() {
+                    ui.label("这个工作簿没有跨工作簿引用。");
+                    ui.weak("在单元格里写 =[预算.xlsx]Sheet1!A1 会自动登记成链接。");
+                } else {
+                    egui::Grid::new("xlink_grid")
+                        .striped(true)
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            ui.strong("文件");
+                            ui.strong("表");
+                            ui.strong("缓存");
+                            ui.strong("");
+                            ui.end_row();
+                            for (i, l) in self.wb.links.iter().enumerate() {
+                                ui.label(sheetcore::xlinks::label(l))
+                                    .on_hover_text(if l.target.is_empty() {
+                                        l.abs.clone().unwrap_or_default()
+                                    } else {
+                                        l.target.clone()
+                                    });
+                                ui.label(if l.sheets.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    l.sheets.join("、")
+                                });
+                                ui.label(format!("{} 格", l.cache.len()));
+                                if ui.small_button("断开").clicked() {
+                                    forget = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("全部更新")
+                        .on_hover_text("按相对路径（其次绝对路径）重读目标文件，并重算")
+                        .clicked()
+                    {
+                        do_refresh = true;
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.xlink_dlg = false;
+                    }
+                });
+                ui.weak("更新后保存，缓存值会写回文件；别人打开时即使不更新链接也看到新数字。");
+            });
+        if let Some(i) = forget {
+            if i < self.wb.links.len() {
+                let name = sheetcore::xlinks::label(&self.wb.links[i]);
+                self.wb.links.remove(i);
+                for (k, l) in self.wb.links.iter_mut().enumerate() {
+                    l.index = k + 1;
+                }
+                self.status = format!("已断开 {name}（公式保留，取不到值会显示 #REF!）");
+            }
+        }
+        if do_refresh {
+            let rep = sheetcore::xlinks::refresh(&mut self.wb);
+            sheetcore::formula::recalc_all(&mut self.wb);
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.wb.dirty = true;
+            self.status = if rep.failed.is_empty() {
+                format!("已更新 {} 个外部链接", rep.ok)
+            } else {
+                format!(
+                    "更新 {} 个，失败 {} 个：{}",
+                    rep.ok,
+                    rep.failed.len(),
+                    rep.failed.iter().map(|(n, e)| format!("{n}（{e}）")).collect::<Vec<_>>().join("，")
+                )
+            };
+        }
+        if !open {
+            self.xlink_dlg = false;
+        }
+    }
+
     fn format_dialog(&mut self, ctx: &egui::Context) {
         if !self.fmt_dlg {
             return;
@@ -7906,6 +8024,7 @@ impl eframe::App for SheetApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.dv_dialog(ctx);
+        self.xlink_dialog(ctx);
         self.note_dialog(ctx);
         self.link_dialog(ctx);
         self.macro_run_dialog(ctx);
@@ -8159,6 +8278,15 @@ impl eframe::App for SheetApp {
                     if ui.button("条件格式").clicked() {
                         self.cf_mgr = true;
                     }
+                    let links = self.wb.links.len();
+                    let label = if links > 0 {
+                        format!("编辑链接…（{links}）")
+                    } else {
+                        "编辑链接…".to_string()
+                    };
+                    if ui.button(label).on_hover_text("跨工作簿引用：查看、更新缓存").clicked() {
+                        self.xlink_dlg = true;
+                    }
                 });
             }
             if self.ribbon_tab == 5 {
@@ -8228,7 +8356,7 @@ impl eframe::App for SheetApp {
                         Some(cell) => cell
                             .formula
                             .as_deref()
-                            .map(|f| f.to_string())
+                            .map(|f| sheetcore::xlinks::display_formula(&self.wb, f))
                             .unwrap_or_else(|| cell.value.display()),
                         None => String::new(),
                     };
@@ -8251,6 +8379,11 @@ impl eframe::App for SheetApp {
                 let (r1, c1, r2, c2) = self.sel_rect();
                 let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
                 ui.label(format!("{cells} 格"));
+                if !self.wb.links.is_empty() {
+                    ui.separator();
+                    ui.label(format!("外部链接 {}", self.wb.links.len()))
+                        .on_hover_text("数据 → 编辑链接…");
+                }
                 if cells > 1 && cells <= 200_000 {
                     let (mut count, mut sum, mut num) = (0u64, 0f64, 0u64);
                     let sheet = self.wb.sheet(self.sheet_idx);

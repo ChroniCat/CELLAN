@@ -33,6 +33,7 @@ pub mod store;
 pub mod structural;
 pub mod undo;
 pub mod vba;
+pub mod xlinks;
 pub mod wire;
 pub mod sync;
 pub mod xlsx;

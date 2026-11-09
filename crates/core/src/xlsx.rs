@@ -106,6 +106,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         names: crate::patch::read_defined_names(path),
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
         sources: crate::external::read_sources(path),
+        links: crate::xlinks::read(path),
         names_dirty: false,
         pivot_shifts: Vec::new(),
         has_vba: crate::vba::has_macros(path),
@@ -541,7 +542,23 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             if let Some(f) = &cell.formula {
                 // OOXML 里 <f> 不带等号；内部统一带，写盘时去掉
                 let text = f.strip_prefix('=').unwrap_or(f);
-                ws.get_cell_mut(coord).set_formula(text.to_string());
+                let target = ws.get_cell_mut(coord);
+                target.set_formula(text.to_string());
+                // 外部引用刷新过之后，把新的缓存值一起写进去：否则别人打开看到的还是旧数字
+                if crate::xlinks::is_external_formula(f) {
+                    match &cell.value {
+                        Value::Number(n) => {
+                            target.set_formula_result_number(*n);
+                        }
+                        Value::Text(t) if !t.starts_with('#') => {
+                            target.set_formula_result_string(t.to_string());
+                        }
+                        Value::Bool(v) => {
+                            target.set_formula_result_bool(*v);
+                        }
+                        _ => {}
+                    }
+                }
                 continue;
             }
             match &cell.value {
@@ -840,6 +857,23 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
                 }
             }
             Err(e) => eprintln!("[save] 原样搬运失败: {e:#}"),
+        }
+    }
+    // 跨工作簿引用：先把缺的部件补齐（用户新加的工作簿），再写缓存
+    if !wb.links.is_empty() && std::env::var("SC_NO_XLINKS").is_err() {
+        if let Err(e) = crate::xlinks::ensure_parts(path, &wb.links) {
+            eprintln!("[save] 补外部链接部件失败: {e:#}");
+        }
+    }
+    if !wb.links.is_empty() && std::env::var("SC_NO_XLINKS").is_err() {
+        match crate::xlinks::write_cache(path, &wb.links) {
+            Ok(n) if n > 0 => {
+                if prof {
+                    eprintln!("  [save] 刷新 {n} 个外部链接缓存");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[save] 外部链接缓存写回失败: {e:#}"),
         }
     }
     match crate::patch::commit_stage(path) {

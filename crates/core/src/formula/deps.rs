@@ -77,12 +77,19 @@ fn sheet_index(wb: &crate::Workbook, name: Option<&str>, cur: usize) -> usize {
 fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
     match node {
         Node::Ref(re) => {
+            // 外部工作簿的引用不参与本簿依赖图
+            if re.book.is_some() {
+                return;
+            }
             let sheet = sheet_index(wb, re.sheet.as_deref(), si);
             let r = re.row.max(0);
             let c = re.col.max(0);
             out.push(Rect { sheet, r1: r, c1: c, r2: r, c2: c });
         }
         Node::Range(a, b) => {
+            if a.book.is_some() || b.book.is_some() {
+                return;
+            }
             let sheet = sheet_index(wb, a.sheet.as_deref().or(b.sheet.as_deref()), si);
             out.push(Rect {
                 sheet,

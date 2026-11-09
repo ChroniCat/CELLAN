@@ -335,6 +335,8 @@ pub struct Workbook {
     pub names: Vec<(String, Option<usize>, String)>,
     /// 外部数据源（导入的 CSV、跨表取数），刷新用
     pub sources: Vec<crate::external::Source>,
+    /// 跨工作簿引用（xl/externalLinks）；`[N]` 里的 N 就是这里的 index - 1
+    pub links: Vec<crate::xlinks::ExternalBook>,
     /// 名称被改过
     pub names_dirty: bool,
     /// 结构改动记录：保存时用来搬透视表缓存里的源区域
@@ -361,6 +363,7 @@ impl Workbook {
             has_vba: false,
             names: Vec::new(),
             sources: Vec::new(),
+            links: Vec::new(),
             pivot_shifts: Vec::new(),
             names_dirty: false,
             pivots_pending: Vec::new(),

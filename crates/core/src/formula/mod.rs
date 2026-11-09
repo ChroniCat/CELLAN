@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefExpr {
+    /// 外部工作簿：`[1]` 或 `[预算.xlsx]` 里的那段；None 表示本簿
+    pub book: Option<String>,
     pub sheet: Option<String>,
     pub row: i64, // 0-based
     pub col: i64,
@@ -68,6 +70,8 @@ enum Tok {
     Num(f64),
     Str(String),
     Ident(String),
+    /// `[1]` / `[预算.xlsx]` 里的书名
+    Book(String),
     Op(&'static str),
     LParen,
     RParen,
@@ -119,6 +123,20 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
             '!' => {
                 out.push(Tok::Bang);
                 i += 1;
+            }
+            // 外部工作簿：[1]预算!A1、[预算.xlsx]Sheet1!A1
+            '[' => {
+                let mut name = String::new();
+                i += 1;
+                while i < b.len() && b[i] != ']' {
+                    name.push(b[i]);
+                    i += 1;
+                }
+                if i >= b.len() {
+                    return Err(ErrKind::Value);
+                }
+                i += 1;
+                out.push(Tok::Book(name));
             }
             // 带引号的表名：'参数与字典'!A1，里面的 '' 是转义的引号
             '\'' => {
@@ -448,6 +466,34 @@ impl Parser {
                 }
                 Ok(Node::Array(nrows, cols, data))
             }
+            Some(Tok::Book(book)) => {
+                // [1]预算!A1 / [1]预算!A1:B2 / [预算.xlsx]Sheet1!A1
+                let Some(Tok::Ident(sheet)) = self.next() else {
+                    return Err(ErrKind::Ref);
+                };
+                if !self.eat(&Tok::Bang) {
+                    return Err(ErrKind::Ref);
+                }
+                let Some(Tok::Ident(cell)) = self.next() else {
+                    return Err(ErrKind::Ref);
+                };
+                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
+                start.book = Some(book);
+                start.sheet = Some(sheet);
+                if self.eat(&Tok::Colon) {
+                    let Some(Tok::Ident(cell2)) = self.next() else {
+                        return Err(ErrKind::Ref);
+                    };
+                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
+                    end.book = start.book.clone();
+                    end.sheet = start.sheet.clone();
+                    return Ok(Node::Range(start, end));
+                }
+                if self.eats_intersection() {
+                    return Ok(Node::Err(ErrKind::Null));
+                }
+                return Ok(Node::Ref(start));
+            }
             Some(Tok::Ident(name)) => {
                 // 错误字面量
                 if let Some(rest) = name.strip_prefix('\u{0}') {
@@ -535,13 +581,16 @@ impl Parser {
             };
             let start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
             let mut re = start;
-            re.sheet = Some(name);
+            let (book, sheet) = split_book_sheet(&name);
+            re.book = book;
+            re.sheet = Some(sheet);
             if self.eat(&Tok::Colon) {
                 let Some(Tok::Ident(cell2)) = self.next() else {
                     return Err(ErrKind::Ref);
                 };
                 let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
                 end.sheet = re.sheet.clone();
+                end.book = re.book.clone();
                 return Ok(Node::Range(re, end));
             }
             if self.eats_intersection() {
@@ -570,6 +619,20 @@ impl Parser {
         }
         Ok(Node::Ref(start))
     }
+}
+
+/// `'[预算.xlsx]Sheet1'` → (Some("预算.xlsx"), "Sheet1")；没有书名就原样返回
+fn split_book_sheet(name: &str) -> (Option<String>, String) {
+    if let Some(close) = name.rfind(']') {
+        if let Some(open) = name[..close].rfind('[') {
+            let book = name[open + 1..close].to_string();
+            let sheet = name[close + 1..].to_string();
+            if !book.is_empty() && !sheet.is_empty() {
+                return (Some(book), sheet);
+            }
+        }
+    }
+    (None, name.to_string())
 }
 
 /// "A1" / "$B$12" → RefExpr
@@ -611,7 +674,7 @@ pub fn parse_a1(s: &str) -> Option<RefExpr> {
     if row < 0 {
         return None;
     }
-    Some(RefExpr { sheet: None, row, col, row_abs, col_abs })
+    Some(RefExpr { book: None, sheet: None, row, col, row_abs, col_abs })
 }
 
 // ---------------------------------------------------------------- 求值
@@ -751,6 +814,90 @@ impl<'a> Calc<'a> {
         }
     }
 
+    /// 外部引用单格：从 links 的缓存里取；没有缓存（链接没解析过）就是 #REF!
+    fn link_cell(&self, r: &RefExpr) -> FValue {
+        if r.row < 0 || r.col < 0 {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let Some(li) = crate::xlinks::resolve_book(self.wb, r.book.as_deref().unwrap_or("")) else {
+            return FValue::Error(ErrKind::Ref);
+        };
+        let link = &self.wb.links[li];
+        if link.cache.is_empty() {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let Some(slot) = crate::xlinks::sheet_slot(link, r.sheet.as_deref()) else {
+            return FValue::Error(ErrKind::Ref);
+        };
+        match link.cache.get(&(slot, r.row as u32, r.col as u32)) {
+            Some(v) => to_fvalue(v),
+            None => FValue::Empty,
+        }
+    }
+
+    /// 外部引用区域：按缓存矩形取，缺的格当空
+    fn link_range(&mut self, a: &RefExpr, b: &RefExpr) -> Result<Arg, ErrKind> {
+        let book = a.book.as_ref().or(b.book.as_ref()).cloned().unwrap_or_default();
+        let Some(li) = crate::xlinks::resolve_book(self.wb, &book) else {
+            return Err(ErrKind::Ref);
+        };
+        let link = &self.wb.links[li];
+        if link.cache.is_empty() {
+            return Err(ErrKind::Ref);
+        }
+        let sheet = a.sheet.clone().or_else(|| b.sheet.clone());
+        let Some(slot) = crate::xlinks::sheet_slot(link, sheet.as_deref()) else {
+            return Err(ErrKind::Ref);
+        };
+        let mut r1 = a.row.min(b.row).max(0) as u32;
+        let mut c1 = a.col.min(b.col).max(0) as u32;
+        let mut r2 = a.row.max(b.row).max(0) as u32;
+        let mut c2 = a.col.max(b.col).max(0) as u32;
+        // 整列引用（A:A）按缓存边界裁剪，别展开 104 万格
+        if (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1) > 200_000 {
+            let max_r = link
+                .cache
+                .keys()
+                .filter(|(s, _, _)| *s == slot)
+                .map(|(_, r, _)| *r)
+                .max()
+                .unwrap_or(0);
+            let max_c = link
+                .cache
+                .keys()
+                .filter(|(s, _, _)| *s == slot)
+                .map(|(_, _, c)| *c)
+                .max()
+                .unwrap_or(0);
+            r2 = r2.min(max_r);
+            c2 = c2.min(max_c);
+            if r1 > r2 || c1 > c2 {
+                r1 = 0;
+                c1 = 0;
+                r2 = 0;
+                c2 = 0;
+            }
+        }
+        let rows = (r2 - r1 + 1) as usize;
+        let cols = (c2 - c1 + 1) as usize;
+        let mut vals = Vec::with_capacity(rows * cols);
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                let v = link
+                    .cache
+                    .get(&(slot, r, c))
+                    .cloned()
+                    .unwrap_or(crate::model::Value::Empty);
+                vals.push(to_fvalue(&v));
+            }
+        }
+        Ok(Arg::Range {
+            values: std::rc::Rc::new(vals),
+            rows,
+            cols,
+        })
+    }
+
     pub fn cell_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
         if self.depth >= 200 {
             CYCLE_CELLS.with(|cells| {
@@ -805,6 +952,9 @@ impl<'a> Calc<'a> {
     }
 
     fn range_values(&mut self, a: &RefExpr, b: &RefExpr, cur: usize) -> Result<Arg, ErrKind> {
+        if a.book.is_some() || b.book.is_some() {
+            return self.link_range(a, b);
+        }
         let si = self.sheet_index(a.sheet.as_deref(), cur)?;
         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
         let (mut r2, mut c2) = (a.row.max(b.row).max(0) as u32, a.col.max(b.col).max(0) as u32);
@@ -876,12 +1026,17 @@ impl<'a> Calc<'a> {
             Node::Text(s) => FValue::Text(s.as_str().into()),
             Node::Bool(b) => FValue::Bool(*b),
             Node::Err(e) => FValue::Error(*e),
-            Node::Ref(r) => match self.sheet_index(r.sheet.as_deref(), si) {
-                Ok(idx) if r.row >= 0 && r.col >= 0 => {
-                    self.cell_value(idx, r.row as u32, r.col as u32)
+            Node::Ref(r) => {
+                if r.book.is_some() {
+                    return self.link_cell(r);
                 }
-                _ => FValue::Error(ErrKind::Ref),
-            },
+                match self.sheet_index(r.sheet.as_deref(), si) {
+                    Ok(idx) if r.row >= 0 && r.col >= 0 => {
+                        self.cell_value(idx, r.row as u32, r.col as u32)
+                    }
+                    _ => FValue::Error(ErrKind::Ref),
+                }
+            }
             Node::Range(a, b) => match self.range_values(a, b, si) {
                 Ok(Arg::Range { values, .. }) => values.first().cloned().unwrap_or(FValue::Empty),
                 Ok(_) => FValue::Error(ErrKind::Value),
@@ -1266,8 +1421,9 @@ impl<'a> Calc<'a> {
                 if r0 < 0 || c0 < 0 || h <= 0 || w <= 0 {
                     return FValue::Error(ErrKind::Ref);
                 }
-                let a = RefExpr { sheet: base.0.clone(), row: r0, col: c0, row_abs: false, col_abs: false };
+                let a = RefExpr { book: None, sheet: base.0.clone(), row: r0, col: c0, row_abs: false, col_abs: false };
                 let b = RefExpr {
+                    book: None,
                     sheet: base.0,
                     row: r0 + h - 1,
                     col: c0 + w - 1,
@@ -1497,6 +1653,10 @@ impl<'a> Calc<'a> {
                 let ok_arity = if simple { nodes.len() == 1 } else { nodes.len() >= 2 };
                 if ok_arity {
                     if let Some((ra, rb)) = literal(&nodes[0]) {
+                        // 外部引用不走这块区域缓存：交给通用路径按 links 求值
+                        if ra.book.is_some() || rb.book.is_some() {
+                            return self.call_generic(name, nodes, si);
+                        }
                         let si2 = match self.sheet_index(ra.sheet.as_deref(), si) {
                             Ok(i) => i,
                             Err(e) => return FValue::Error(e),
@@ -1774,8 +1934,8 @@ impl<'a> Calc<'a> {
             br = br.min(max_r as i64);
             bc = bc.min(max_c as i64);
         }
-        let a = &RefExpr { sheet: a.sheet.clone(), row: a.row.min(b.row), col: a.col.min(b.col), row_abs: false, col_abs: false };
-        let b = &RefExpr { sheet: b.sheet.clone(), row: br, col: bc, row_abs: false, col_abs: false };
+        let a = &RefExpr { book: None, sheet: a.sheet.clone(), row: a.row.min(b.row), col: a.col.min(b.col), row_abs: false, col_abs: false };
+        let b = &RefExpr { book: None, sheet: b.sheet.clone(), row: br, col: bc, row_abs: false, col_abs: false };
         let key = (
             si,
             a.row.min(b.row),
