@@ -7,6 +7,7 @@ pub mod vba_src;
 pub mod arr;
 pub mod backup;
 pub mod pic;
+pub mod pic_write;
 pub mod sparse;
 pub mod table;
 pub mod data_tools;

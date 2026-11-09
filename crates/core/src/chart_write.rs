@@ -325,7 +325,7 @@ fn next_index(zip: &mut zip::ZipArchive<std::fs::File>, prefix: &str) -> u32 {
 }
 
 /// 重写 zip：既能改已有条目，也能追加新条目
-fn rewrite_with_additions<F>(path: &Path, additions: Vec<(String, Vec<u8>)>, mut f: F) -> Result<()>
+pub(crate) fn rewrite_with_additions_pub<F>(path: &Path, additions: Vec<(String, Vec<u8>)>, mut f: F) -> Result<()>
 where
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
@@ -434,7 +434,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
     let chart_name = format!("chart{chart_no}.xml");
-    rewrite_with_additions(path, additions, move |name, buf| {
+    rewrite_with_additions_pub(path, additions, move |name, buf| {
         if name == sheet_rels2 {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 if !xml.contains(&drawing_name) {

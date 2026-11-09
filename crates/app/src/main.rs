@@ -7982,6 +7982,41 @@ impl eframe::App for SheetApp {
                         self.chart_mgr = true;
                         self.reload_charts();
                     }
+                    if ui.button("插入图片…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("图片", &["png", "jpg", "jpeg", "gif", "bmp"])
+                            .pick_file()
+                        {
+                            match (self.wb.path.clone(), std::fs::read(&p)) {
+                                (Some(out), Ok(bytes)) => {
+                                    let ext = p
+                                        .extension()
+                                        .map(|e| e.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "png".into());
+                                    let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+                                    let (r, c) = self.sel;
+                                    match sheetcore::pic_write::insert_picture(
+                                        &out, &sheet_name, &bytes, &ext, c, r,
+                                    ) {
+                                        Ok(_) => {
+                                            // 从磁盘读回，界面立刻能看到
+                                            if let Some(list) =
+                                                sheetcore::pic::load(&out).remove(&sheet_name)
+                                            {
+                                                self.wb.sheet_mut(self.sheet_idx).pictures = list;
+                                            }
+                                            self.status = "已插入图片".into();
+                                        }
+                                        Err(e) => self.status = format!("插入图片失败：{e:#}"),
+                                    }
+                                }
+                                (None, _) => {
+                                    self.status = "请先保存文件，再插入图片".into();
+                                }
+                                (_, Err(e)) => self.status = format!("读图片失败：{e}"),
+                            }
+                        }
+                    }
                     if ui.button("插入表格").clicked() {
                         self.make_table();
                     }
