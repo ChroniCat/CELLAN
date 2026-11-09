@@ -1,5 +1,6 @@
 mod files;
 mod net;
+mod session_lock;
 
 use eframe::egui;
 
@@ -102,6 +103,10 @@ struct SheetApp {
     /// 运行宏对话框：宏名
     macro_run_dlg: Option<String>,
     macro_ran: bool,
+    /// 占用卡心跳时间
+    lock_beat: Option<std::time::Instant>,
+    /// 已经为哪个文件尝试过自动发现（避免反复重连）
+    auto_join_tried: Option<PathBuf>,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -277,6 +282,8 @@ impl SheetApp {
             link_dlg: None,
             macro_run_dlg: None,
             macro_ran: false,
+            lock_beat: None,
+            auto_join_tried: None,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -429,6 +436,9 @@ impl SheetApp {
                     } else if let Some(addr) = self.pending_join.take() {
                         self.join_addr = addr;
                         self.join_shared();
+                    } else {
+                        // 没指定角色：看看文件旁边有没有同事留下的占用卡
+                        self.try_auto_join();
                     }
                 }
                 OpenMsg::Recalced(wb, deps) => {
@@ -6247,11 +6257,76 @@ impl SheetApp {
                 self.peer = Some(peer);
                 self.net = Some(n);
                 self.undo.set_site(site);
+                // 在文件旁边放占用卡：同事打开同一个文件就能自动找到我
+                if let Some(p) = self.wb.path.clone() {
+                    let addr = format!("{}:{}", local_ip_hint(), port);
+                    let _ = session_lock::write(&p, &addr, &self.my_name);
+                    self.lock_beat = Some(std::time::Instant::now());
+                }
                 self.status = format!("已共享，同事可加入：{}:{}", local_ip_hint(), port);
             eprintln!("[net] {}", self.status);
             }
             Err(e) => self.status = format!("共享失败: {e}"),
         }
+    }
+
+
+    /// 打开文件后自动发现同编人：读文件旁边的占用卡，新鲜就加入
+    fn try_auto_join(&mut self) {
+        let Some(path) = self.wb.path.clone() else { return };
+        if self.net.is_some() || self.auto_join_tried.as_ref() == Some(&path) {
+            return;
+        }
+        self.auto_join_tried = Some(path.clone());
+
+        let Some(info) = session_lock::read(&path) else { return };
+        if session_lock::is_mine(&info) {
+            return;
+        }
+        if !session_lock::is_fresh(&info) {
+            // 上一任编辑者已经不在了：我接管，把卡换成我的地址
+            let who = if info.user.is_empty() { info.machine.clone() } else { info.user.clone() };
+            eprintln!("[net] 占用卡已过期（{}），接管共享", who);
+            self.status = format!("{} 已退出，已接管共享", who);
+            self.start_host();
+            return;
+        }
+        let who = if info.user.is_empty() { info.machine.clone() } else { info.user.clone() };
+        self.status = format!("发现 {} 正在编辑这个文件，正在加入…", who);
+        eprintln!("[net] 发现占用卡：{} @ {}", who, info.host);
+        let site = rand_site();
+        match net::join(site, self.my_name.clone(), self.wb.title(), &info.host, self.room_password.clone()) {
+            Ok(n) => {
+                self.peer = Some(Peer::new(site));
+                self.peers_list = vec![(site, self.my_name.clone(), (site % 7) as u8)];
+                self.net = Some(n);
+                self.undo.set_site(site);
+                self.status = format!("已加入 {} 的编辑会话（{}）", who, info.host);
+                eprintln!("[net] {}", self.status);
+            }
+            Err(e) => {
+                self.status = format!(
+                    "{} 正在编辑，但连不上 {}（{}）。可能不在同一网段，或对方已退出",
+                    who, info.host, e
+                );
+            }
+        }
+    }
+
+    /// 宿主心跳：每 5 秒刷新占用卡
+    fn beat_lock(&mut self) {
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if !hosting {
+            return;
+        }
+        let Some(path) = self.wb.path.clone() else { return };
+        let due = self.lock_beat.map(|t| t.elapsed().as_secs() >= 5).unwrap_or(true);
+        if !due {
+            return;
+        }
+        let addr = format!("{}:{}", local_ip_hint(), net::DEFAULT_PORT);
+        let _ = session_lock::write(&path, &addr, &self.my_name);
+        self.lock_beat = Some(std::time::Instant::now());
     }
 
     fn join_shared(&mut self) {
@@ -6497,6 +6572,19 @@ fn local_ip_hint() -> String {
     "本机IP".into()
 }
 
+impl Drop for SheetApp {
+    fn drop(&mut self) {
+        // 退出时把占用卡撤掉，同事下次打开就不会去找一个已经消失的地址
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if hosting {
+            if let Some(p) = self.wb.path.clone() {
+                session_lock::remove(&p);
+                eprintln!("[net] 已撤下占用卡");
+            }
+        }
+    }
+}
+
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_net();
@@ -6541,6 +6629,7 @@ impl eframe::App for SheetApp {
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
         self.renew_lock_if_needed();
+        self.beat_lock();
         self.lock_probe(ctx);
         self.undo_probe();
         self.style_probe();
