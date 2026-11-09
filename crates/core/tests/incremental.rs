@@ -3,8 +3,9 @@ use sheetcore::formula::{self, deps::Deps};
 use sheetcore::{Cell, Value, Workbook};
 
 fn num(wb: &Workbook, si: usize, r: u32, c: u32) -> f64 {
-    match formula::eval_cell(wb, si, r, c) {
-        formula::FValue::Number(n) => n,
+    // 验证实际写回、供 UI 和保存使用的缓存；重新 eval 会掩盖漏算。
+    match wb.sheets[si].value(r, c) {
+        Value::Number(n) => n,
         other => panic!("({si},{r},{c}) 期望数字，得到 [{}]", other.display()),
     }
 }

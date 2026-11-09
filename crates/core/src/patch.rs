@@ -1409,13 +1409,14 @@ pub fn read_defined_names(path: &Path) -> Vec<(String, Option<usize>, String)> {
             Some(e) => head_end + e,
             None => break,
         };
-        let text = rest[head_end + 1..tail].to_string();
+        let text = crate::model::xml_unescape(&rest[head_end + 1..tail]);
         let name = head
             .split("name=\"")
             .nth(1)
             .and_then(|s| s.split('"').next())
             .unwrap_or("")
             .to_string();
+        let name = crate::model::xml_unescape(&name);
         let local = head
             .split("localSheetId=\"")
             .nth(1)
@@ -1429,18 +1430,16 @@ pub fn read_defined_names(path: &Path) -> Vec<(String, Option<usize>, String)> {
     out
 }
 
-/// 覆盖写自定义名称：先按名字删掉旧的，再整体插回
+/// 覆盖写全部自定义名称，保留 _xlnm.* 内置打印/筛选名称。
 pub fn write_user_names(path: &Path, names: &[(String, Option<usize>, String)]) -> Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
+    let previous = read_defined_names(path);
     rewrite_zip(path, |n, buf| {
         if n != "xl/workbook.xml" {
             return buf;
         }
         let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
         let mut x = xml;
-        for (name, _, _) in names {
+        for (name, _, _) in &previous {
             x = strip_name_everywhere(&x, name);
         }
         let mut defs = String::new();
@@ -1457,6 +1456,9 @@ pub fn write_user_names(path: &Path, names: &[(String, Option<usize>, String)]) 
                     esc(text)
                 )),
             }
+        }
+        if defs.is_empty() {
+            return x.into_bytes();
         }
         if let Some(i) = x.find("</definedNames>") {
             x.insert_str(i, &defs);

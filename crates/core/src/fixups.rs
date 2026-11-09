@@ -274,11 +274,25 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
     let new_targets = crate::patch::sheet_targets(path)?;
 
     let mut moves: Vec<(String, String)> = Vec::new(); // (新路径, 基准路径)
-    for (name, bpart) in base_targets.iter() {
-        if let Some(npart) = new_targets.get(name) {
-            if npart != bpart {
-                moves.push((npart.clone(), bpart.clone()));
+    let mut reserved: HashSet<String> = base_targets.values().cloned().collect();
+    reserved.extend(new_targets.values().cloned());
+    for (name, npart) in &new_targets {
+        let destination = if let Some(bpart) = base_targets.get(name) {
+            bpart.clone()
+        } else if base_targets.values().any(|part| part == npart) {
+            // A newly added sheet may occupy a retained sheet's original path
+            // after umya renumbers everything. Give it its own stable part.
+            let mut n = 1;
+            loop {
+                let candidate = format!("xl/worksheets/native-sheet-{n}.xml");
+                if reserved.insert(candidate.clone()) { break candidate; }
+                n += 1;
             }
+        } else {
+            npart.clone()
+        };
+        if npart != &destination {
+            moves.push((npart.clone(), destination));
         }
     }
     if moves.is_empty() {
@@ -353,7 +367,8 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
 
     crate::patch::append_entries(path, &pending)?;
     // 别删掉刚好是别人目的地的路径
-    let dests: std::collections::HashSet<String> = moves.iter().map(|(_, b)| b.clone()).collect();
+    let dests: std::collections::HashSet<String> = moves.iter()
+        .flat_map(|(_, b)| [b.clone(), rels_of(b)]).collect();
     for r in removes {
         if dests.contains(&r) {
             continue;
@@ -369,17 +384,10 @@ pub fn rehome_sheets(path: &Path, base: &Path) -> Result<Vec<String>> {
 /// umya 重写工作簿骨架时会丢掉 definedNames、pivotCaches、外部连接这些东西，
 /// 而透视表、打印区域都靠它们；丢一个 Excel 就拒收整个文件。
 pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Workbook) -> Result<bool> {
-    // 名称/数据源动过就不能整段沿用：它们都写在 workbook.xml 的 definedNames 里
-    if !base.exists() || wb.names_dirty {
+    if !base.exists() {
         return Ok(false);
     }
-    // 有任何一处改动就不动骨架：打印区域、名称、透视缓存都挂在 workbook.xml 上
-    // 打印区域、自定义名称都挂在 workbook.xml 上，动过就不能沿用
-    let touched = wb.sheets.iter().any(|s| s.page_dirty);
-    if touched {
-        return Ok(false);
-    }
-    let base_xml = match read_part_file(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) {
+    let mut base_xml = match read_part_file(base, "xl/workbook.xml").and_then(|b| String::from_utf8(b).ok()) {
         Some(v) => v,
         None => return Ok(false),
     };
@@ -395,7 +403,7 @@ pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Wo
         if let Some(p) = tag.find("name=\"") {
             let after = &tag[p + 6..];
             if let Some(q) = after.find('"') {
-                base_names.push(after[..q].to_string());
+                base_names.push(crate::model::xml_unescape(&after[..q]));
             }
         }
     }
@@ -403,12 +411,38 @@ pub fn restore_workbook_skeleton(path: &Path, base: &Path, wb: &crate::model::Wo
     if here != base_names {
         return Ok(false);
     }
+    // Name/page edits affect only definedNames. Overlay that section while
+    // retaining unrelated workbook extensions, pivot caches and properties.
+    if wb.names_dirty || wb.sheets.iter().any(|s| s.page_dirty) {
+        let current = read_part(path, "xl/workbook.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| anyhow::anyhow!("无法读取已修改的工作簿名称"))?;
+        let names = defined_names_span(&current).map(|(a, b)| &current[a..b]).unwrap_or("");
+        if let Some((a, b)) = defined_names_span(&base_xml) {
+            base_xml.replace_range(a..b, names);
+        } else if !names.is_empty() {
+            if let Some(i) = base_xml.find("</sheets>") {
+                base_xml.insert_str(i + "</sheets>".len(), names);
+            }
+        }
+    }
     let mut pending: Vec<(String, Vec<u8>)> = vec![("xl/workbook.xml".to_string(), base_xml.into_bytes())];
     if let Some(rels) = read_part_file(base, "xl/_rels/workbook.xml.rels") {
         pending.push(("xl/_rels/workbook.xml.rels".to_string(), rels));
     }
     crate::patch::append_entries(path, &pending)?;
     Ok(true)
+}
+
+fn defined_names_span(xml: &str) -> Option<(usize, usize)> {
+    let start = xml.find("<definedNames")?;
+    let head_end = start + xml[start..].find('>')? + 1;
+    let end = if xml[start..head_end].ends_with("/>") {
+        head_end
+    } else {
+        head_end + xml[head_end..].find("</definedNames>")? + "</definedNames>".len()
+    };
+    Some((start, end))
 }
 
 

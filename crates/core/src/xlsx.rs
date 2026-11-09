@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
 use std::path::Path;
 
+#[path = "xlsx_structure.rs"]
+mod structure;
+
 fn data_to_value(d: &Data) -> Value {
     match d {
         Data::Empty => Value::Empty,
@@ -179,6 +182,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
     for raw in raws {
         let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(raw.name.clone());
+        sheet.source_part = targets.get(&raw.name).cloned();
         sheet.loading = true;
         for ((r, c), cell) in raw.cells {
             sheet.set(r, c, cell);
@@ -404,9 +408,8 @@ pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
         .unwrap_or_else(|| "workbook.xlsx".into());
     let tmp = dir.join(format!(".~{name}.saving-{}", std::process::id()));
     // 覆盖前把旧版本留一份（第一次保存时什么都不做）
-    if let Err(e) = std::panic::catch_unwind(|| crate::backup::keep_previous(path)) {
-        eprintln!("[save] 历史版本失败: {e:?}");
-    }
+    crate::backup::keep_previous(path)
+        .with_context(|| format!("无法备份旧版本，未覆盖 {}", path.display()))?;
     if let Err(e) = save(&tmp, wb) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -435,10 +438,14 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // 基准文件必须用「打开时的原文件」，不能用另存的目标路径：
     // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等
     // 我们不解析也不重建的结构（umya 从零建表只会写单元格）。
-    let base = match wb.path.as_ref().filter(|p| p.exists()) {
+    let original_base = match wb.path.as_ref().filter(|p| p.exists()) {
         Some(p) => p.clone(),
         None => path.to_path_buf(),
     };
+    // Reconcile the package manifest before umya reads it. This retains the
+    // original worksheet parts even when their visible names/order have changed.
+    let prepared_base = structure::prepare_base(&original_base, path, wb)?;
+    let base = prepared_base.path.clone();
     // 宏部件：umya 写不出来，先留一份，写完塞回去
     let vba = crate::vba::read_vba(&base);
     // 原地保存时，写盘会把 base 覆盖掉——先把「要保住的那部分」复制一份出来
@@ -618,6 +625,14 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
+    // New sheets may have been inserted between retained sheets. The serializer
+    // must follow the model's order, not the order in the base package.
+    let order: std::collections::HashMap<&str, usize> = wb.sheets.iter()
+        .enumerate().map(|(i, sheet)| (sheet.name.as_str(), i)).collect();
+    book.sheet_collection_mut().sort_by_key(|sheet| {
+        order.get(sheet.get_name()).copied().unwrap_or(usize::MAX)
+    });
+
     // 批注：直接走 umya（它会生成 comments 部件和 vml 绘图）
     for (idx, sheet) in wb.sheets.iter().enumerate() {
         if !sheet.notes_dirty {
@@ -682,6 +697,20 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
+    // umya may emit an empty cacheSource/cacheFields for an imported pivot.
+    // Restore its definition even when the part still exists, then apply our
+    // explicit source changes. Missing-part recovery alone cannot detect this.
+    if restore_base.exists() {
+        let definitions: Vec<(String, Vec<u8>)> = crate::fixups::parts(&restore_base)
+            .into_iter()
+            .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
+            .filter_map(|name| crate::fixups::read_part_file(&restore_base, &name).map(|body| (name, body)))
+            .collect();
+        if !definitions.is_empty() {
+            crate::patch::append_entries(path, &definitions).context("保留透视表缓存定义失败")?;
+        }
+    }
+
     // 透视表缓存里的源区域
     if !wb.pivot_shifts.is_empty() {
         if let Err(e) = crate::patch::shift_pivot_caches(path, &wb.pivot_shifts) {
@@ -690,10 +719,8 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
 
     // 自定义名称
-    if wb.names_dirty && !wb.names.is_empty() {
-        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
-            eprintln!("[save] 名称回写失败: {e:#}");
-        }
+    if wb.names_dirty {
+        crate::patch::write_user_names(path, &wb.names).context("名称回写失败")?;
     }
     // 数据源存成"自定义文档属性"：这是 Excel 自己的规范位置，
     // 塞进 definedNames 会和查询表打架，单独加未知部件又会被拒收
@@ -703,19 +730,6 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
-    // 透视表缓存里的源区域
-    if !wb.pivot_shifts.is_empty() {
-        if let Err(e) = crate::patch::shift_pivot_caches(path, &wb.pivot_shifts) {
-            eprintln!("[save] 透视表源区域回写失败: {e:#}");
-        }
-    }
-
-    // 自定义名称
-    if wb.names_dirty && !wb.names.is_empty() {
-        if let Err(e) = crate::patch::write_user_names(path, &wb.names) {
-            eprintln!("[save] 名称回写失败: {e:#}");
-        }
-    }
     // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来
     if restore_base.exists() {
         match crate::patch::restore_missing_parts(path, &restore_base) {
