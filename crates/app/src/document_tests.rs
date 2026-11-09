@@ -375,18 +375,25 @@ fn xls_save_as_uses_native_format_history_and_its_owning_tab() {
 }
 
 #[test]
-fn rejected_xls_formula_save_keeps_original_file_and_unsaved_state() {
+fn xls_save_with_formula_succeeds() {
     let dir = std::env::temp_dir().join(format!(
-        "sheetflow-app-xls-reject-{}-{}", std::process::id(),
+        "sheetflow-app-xls-formula-{}-{}",
+        std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let target = dir.join("book.xls");
     sheetcore::xls_write::write(&target, &book(11.0)).unwrap();
-    let original = std::fs::read(&target).unwrap();
     let mut app = app();
     app.wb = sheetcore::xlsx::load(&target).unwrap();
-    app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(3.0), formula: Some("=1+2".into()) });
+    app.wb.sheets[0].set(
+        0,
+        0,
+        Cell {
+            value: Value::Number(3.0),
+            formula: Some("=1+2".into()),
+        },
+    );
     app.wb.dirty = true;
     app.save(false);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -395,8 +402,13 @@ fn rejected_xls_formula_save_keeps_original_file_and_unsaved_state() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!app.has_pending_save(), "save did not complete");
-    assert!(app.wb.dirty);
+    assert!(!app.wb.dirty, "存成功后应清掉脏位：{}", app.status);
     assert_eq!(app.wb.path.as_ref(), Some(&target));
-    assert!(app.status.contains("公式"), "{}", app.status);
-    assert_eq!(std::fs::read(&target).unwrap(), original);
+    // 写出来的 .xls 必须还能被我们自己读回来，且值是公式算出来的那个
+    let back = sheetcore::xlsx::load(&target).unwrap();
+    match &back.sheets[0].get(0, 0).unwrap().value {
+        Value::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+        v => panic!("A1 应为数字 3，得到 {v:?}"),
+    }
 }
+

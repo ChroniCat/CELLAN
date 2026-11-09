@@ -29,6 +29,10 @@ const LABEL: u16 = 0x0204;
 const NUMBER: u16 = 0x0203;
 const BOOLERR: u16 = 0x0205;
 const MERGEDCELLS: u16 = 0x00E5;
+const FORMULA: u16 = 0x0006;
+const STRING: u16 = 0x0207;
+const SUPBOOK: u16 = 0x01AE;
+const EXTERNSHEET: u16 = 0x0017;
 const WINDOW1: u16 = 0x003D;
 const STYLE: u16 = 0x0293;
 
@@ -130,6 +134,34 @@ struct XfKey {
     wrap: bool,
     borders: [u8; 4],
     fill: Option<u8>,
+}
+
+/// FORMULA 记录里的 8 字节缓存值；文本还要跟一条 STRING 记录
+fn cached_value(v: &Value) -> ([u8; 8], Option<Vec<u8>>) {
+    let mut b = [0u8; 8];
+    match v {
+        Value::Number(n) => b.copy_from_slice(&n.to_le_bytes()),
+        Value::Text(t) => {
+            b[0] = 0xFF;
+            b[1] = 0xFF; // 类型标号：0=字符串
+            b[2] = 0;
+            let mut sb = Vec::new();
+            sb.extend_from_slice(&unicode_str(t));
+            return (b, Some(sb));
+        }
+        Value::Bool(x) => {
+            b[0] = 0xFF;
+            b[1] = 0xFF;
+            b[2] = 1;
+            b[3] = if *x { 1 } else { 0 };
+        }
+        Value::Empty => {
+            b[0] = 0xFF;
+            b[1] = 0xFF;
+            b[2] = 3;
+        }
+    }
+    (b, None)
 }
 
 fn builtin_id(code: &str) -> Option<u16> {
@@ -287,36 +319,36 @@ fn xf_record(x: &XfKey) -> Vec<u8> {
     // 线型：byte10 低四位=左、高四位=下；byte11 低四位=右、高四位=上
     b[10] = (x.borders[0] & 0x0F) | ((x.borders[3] & 0x0F) << 4);
     b[11] = (x.borders[1] & 0x0F) | ((x.borders[2] & 0x0F) << 4);
-    if x.borders.iter().any(|c| *c != 0) {
-        // 颜色：跟 Excel 一样用自动色（64）
-        b[12] = 0x40;
-        b[13] = 0x40;
-        b[14] = 0x40;
-        b[15] = 0x40;
-    }
+    // 边框颜色：Excel 的"自动"色是 40/20 交替（照它自己的样）
+    b[12] = 0x40;
+    b[13] = 0x20;
+    b[14] = 0x40;
+    b[15] = 0x20;
+    // 填充：Excel 用 17=0x06 表示实心、0x02 表示无填充（实测字节，不是教科书）
+    b[16] = 0x00;
     match x.fill {
         Some(idx) => {
-            b[16] = 0x01; // 实心填充
-            b[17] = 0x00;
-            b[18] = 0x40;
-            b[19] = idx;
+            b[17] = 0x06;
+            b[18] = idx;
         }
         None => {
-            b[16] = 0x00;
-            b[17] = 0x00;
+            b[17] = 0x02;
             b[18] = 0xC0;
-            b[19] = 0x20;
         }
     }
+    b[19] = 0x20;
     rec_body(XF, b)
 }
 
 fn sheet_stream(
     sheet: &Sheet,
+    sheet_index: usize,
+    all_sheets: &[String],
+    externs: &mut crate::xls_formula::Externs,
     style_table: &crate::style::StyleTable,
     tables: &mut Tables,
     styles_cache: &mut HashMap<u16, u16>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut bof = Vec::new();
     bof.extend_from_slice(&w16(0x0600));
@@ -364,9 +396,8 @@ fn sheet_stream(
         b.extend_from_slice(&w16((h * 15.0).round().min(65535.0) as u16)); // px → twips (px*15 = pt*20)
         b.extend_from_slice(&w16(0));
         b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16(0x0100));
+        b.extend_from_slice(&w16(0x0140)); // 自定义行高（照 Excel 自己的样）
         b.extend_from_slice(&w16(0x0F));
-        b.extend_from_slice(&w32(0));
         rec(&mut out, ROW, &b);
     }
 
@@ -393,6 +424,37 @@ fn sheet_stream(
         b.extend_from_slice(&w16(r as u16));
         b.extend_from_slice(&w16(c as u16));
         b.extend_from_slice(&w16(xf));
+        if let Some(text) = cell.formula.as_deref() {
+            let node = crate::formula::parse(text.trim_start_matches('='))
+                .map_err(|e| anyhow::anyhow!(
+                    "{}!{} 的公式 {text} 解析失败（{e:?}），无法写入 .xls",
+                    sheet.name,
+                    crate::model::cell_name(r, c)
+                ))?;
+            let mut comp = crate::xls_formula::Compiler {
+                sheets: all_sheets,
+                cur_sheet: sheet_index,
+                externs,
+            };
+            let tokens = comp.compile(&node).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}!{} 的公式 {text} 写不进 .xls：{e}",
+                    sheet.name,
+                    crate::model::cell_name(r, c)
+                )
+            })?;
+            let (cached, follow) = cached_value(&cell.value);
+            b.extend_from_slice(&cached);
+            b.extend_from_slice(&w16(0)); // grbit
+            b.extend_from_slice(&w32(0)); // chn
+            b.extend_from_slice(&w16(tokens.len() as u16));
+            b.extend_from_slice(&tokens);
+            rec(&mut out, FORMULA, &b);
+            if let Some(sr) = follow {
+                rec(&mut out, STRING, &sr);
+            }
+            continue;
+        }
         match &cell.value {
             Value::Number(n) => {
                 b.extend_from_slice(&n.to_le_bytes());
@@ -426,21 +488,10 @@ fn sheet_stream(
     }
 
     rec(&mut out, EOF, &[]);
-    out
+    Ok(out)
 }
 
 pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
-    for s in &wb.sheets {
-        for (cref, cell) in s.iter() {
-            if cell.formula.is_some() {
-                bail!(
-                    "「{}」!{} 带公式，.xls 只写值不写公式；请用「另存为 xlsx」保留公式",
-                    s.name,
-                    crate::model::cell_name(cref.row, cref.col)
-                );
-            }
-        }
-    }
     if wb.sheets.len() > 255 {
         bail!(".xls 最多 255 张工作表");
     }
@@ -451,8 +502,18 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
 
     let mut cache: HashMap<u16, u16> = HashMap::new();
     let mut sheets: Vec<Vec<u8>> = Vec::new();
-    for s in &wb.sheets {
-        sheets.push(sheet_stream(s, &wb.styles, &mut tables, &mut cache));
+    let sheet_names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
+    let mut externs = crate::xls_formula::Externs::default();
+    for (i, s) in wb.sheets.iter().enumerate() {
+        sheets.push(sheet_stream(
+            s,
+            i,
+            &sheet_names,
+            &mut externs,
+            &wb.styles,
+            &mut tables,
+            &mut cache,
+        )?);
     }
 
     // 全局流：前缀、标准字体/XF 块都来自内嵌的合法骨架（Excel 生成），
@@ -488,6 +549,22 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         }
         patch_at.push(g.len() + 4);
         rec(&mut g, BOUNDSHEET, &b);
+    }
+    // 跨表引用要先有 SUPBOOK（本簿自引用）和 EXTERNSHEET 条目表
+    if !externs.is_empty() {
+        let mut sb = Vec::new();
+        sb.extend_from_slice(&w16(wb.sheets.len().min(65535) as u16));
+        sb.extend_from_slice(&w16(0x0401)); // 自引用标记
+        rec(&mut g, SUPBOOK, &sb);
+
+        let mut es = Vec::new();
+        es.extend_from_slice(&w16(externs.entries.len() as u16));
+        for (sup, first, last) in externs.entries.iter() {
+            es.extend_from_slice(&w16(*sup));
+            es.extend_from_slice(&w16(*first));
+            es.extend_from_slice(&w16(*last));
+        }
+        rec(&mut g, EXTERNSHEET, &es);
     }
     rec(&mut g, EOF, &[]);
 
@@ -567,15 +644,43 @@ mod tests {
     }
 
     #[test]
-    fn refuses_formulas() {
+    fn writes_formula_records() {
         let mut wb = sample();
         wb.sheets[0].set(2, 0, crate::model::Cell {
-            value: Value::Number(1.0),
-            formula: Some("=1+1".into()),
+            value: Value::Number(3.0),
+            formula: Some("=1+2".into()),
         });
         let dir = std::env::temp_dir().join("sc_xls_write");
         let _ = std::fs::create_dir_all(&dir);
-        let e = write(&dir.join("f.xls"), &wb).unwrap_err();
-        assert!(format!("{e}").contains("公式"), "错误信息应说明公式：{e}");
+        let p = dir.join("f.xls");
+        write(&p, &wb).unwrap();
+
+        // 文件里必须真的有一条 FORMULA 记录（0x0006），而不是把公式降级成值
+        let cf = crate::cfb::Compound::open(std::fs::read(&p).unwrap()).unwrap();
+        let stream = cf.stream_by_path("Workbook").unwrap();
+        let mut i = 0usize;
+        let mut found = false;
+        while i + 4 <= stream.len() {
+            let t = u16::from_le_bytes([stream[i], stream[i + 1]]);
+            let l = u16::from_le_bytes([stream[i + 2], stream[i + 3]]) as usize;
+            if t == 0x0006 {
+                found = true;
+                break;
+            }
+            let n = (i + 4 + l).min(stream.len());
+            if n <= i {
+                break;
+            }
+            i = n;
+        }
+        assert!(found, "应写出 FORMULA 记录");
+
+        // 再读回来：值仍是公式算出来的 3
+        let back = crate::xlsx::load(&p).unwrap();
+        match &back.sheets[0].get(2, 0).unwrap().value {
+            Value::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            v => panic!("应为 3，得到 {v:?}"),
+        }
     }
+
 }

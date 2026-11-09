@@ -40,6 +40,7 @@ pub mod xlinks;
 pub mod xls_layout;
 pub mod xls_style;
 pub mod ole_write;
+pub mod xls_formula;
 pub mod xls_read;
 pub mod xls_write;
 pub mod wire;
