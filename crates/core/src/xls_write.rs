@@ -33,6 +33,7 @@ const FORMULA: u16 = 0x0006;
 const STRING: u16 = 0x0207;
 const SUPBOOK: u16 = 0x01AE;
 const EXTERNSHEET: u16 = 0x0017;
+const NAME: u16 = 0x0018;
 const WINDOW1: u16 = 0x003D;
 const STYLE: u16 = 0x0293;
 
@@ -345,6 +346,8 @@ fn sheet_stream(
     sheet_index: usize,
     all_sheets: &[String],
     externs: &mut crate::xls_formula::Externs,
+    names: &mut crate::xls_formula::NameSpace,
+    books: &[crate::xls_formula::BookSheets],
     style_table: &crate::style::StyleTable,
     tables: &mut Tables,
     styles_cache: &mut HashMap<u16, u16>,
@@ -435,6 +438,9 @@ fn sheet_stream(
                 sheets: all_sheets,
                 cur_sheet: sheet_index,
                 externs,
+                names,
+                books,
+                extra: Vec::new(),
             };
             let tokens = comp.compile(&node).map_err(|e| {
                 anyhow::anyhow!(
@@ -449,6 +455,8 @@ fn sheet_stream(
             b.extend_from_slice(&w32(0)); // chn
             b.extend_from_slice(&w16(tokens.len() as u16));
             b.extend_from_slice(&tokens);
+            // 数组常量的值跟在记号流后面（rgcb）
+            b.extend_from_slice(&comp.extra);
             rec(&mut out, FORMULA, &b);
             if let Some(sr) = follow {
                 rec(&mut out, STRING, &sr);
@@ -504,12 +512,54 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     let mut sheets: Vec<Vec<u8>> = Vec::new();
     let sheet_names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let mut externs = crate::xls_formula::Externs::default();
+
+    // 外部簿的表清单：跨簿引用要靠它写 SUPBOOK 和表号
+    let books: Vec<crate::xls_formula::BookSheets> = wb
+        .links
+        .iter()
+        .map(|l| crate::xls_formula::BookSheets {
+            file: l.file_name(),
+            sheets: l.sheets.clone(),
+        })
+        .collect();
+
+    // 定义名称：先把索引排好（1 起），再编译各自的定义
+    let mut names = crate::xls_formula::NameSpace::default();
+    let mut order: Vec<(u16, String)> = Vec::new();
+    for (name, scope, text) in &wb.names {
+        let idx = names.push_user(name.clone(), *scope);
+        order.push((idx, text.clone()));
+    }
+    for (idx, text) in order {
+        let node = match crate::formula::parse(text.trim_start_matches('=')) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[xls] 名称定义 {text} 解析失败（{e:?}），跳过");
+                continue;
+            }
+        };
+        let rgce = {
+            let mut c = crate::xls_formula::Compiler {
+                sheets: &sheet_names,
+                cur_sheet: 0,
+                externs: &mut externs,
+                names: &mut names,
+                books: &books,
+                extra: Vec::new(),
+            };
+            c.compile(&node)?
+        };
+        names.set_rgce(idx, rgce);
+    }
+
     for (i, s) in wb.sheets.iter().enumerate() {
         sheets.push(sheet_stream(
             s,
             i,
             &sheet_names,
             &mut externs,
+            &mut names,
+            &books,
             &wb.styles,
             &mut tables,
             &mut cache,
@@ -552,10 +602,30 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     }
     // 跨表引用要先有 SUPBOOK（本簿自引用）和 EXTERNSHEET 条目表
     if !externs.is_empty() {
+        // 0 = 本簿自引用
         let mut sb = Vec::new();
         sb.extend_from_slice(&w16(wb.sheets.len().min(65535) as u16));
         sb.extend_from_slice(&w16(0x0401)); // 自引用标记
         rec(&mut g, SUPBOOK, &sb);
+
+        // 1.. 外部簿：ctab + 文件名 + 各表名
+        for b in &externs.books {
+            let mut sb = Vec::new();
+            sb.extend_from_slice(&w16(b.sheets.len().min(65535) as u16));
+            sb.extend_from_slice(&unicode_str(&b.file));
+            for s in &b.sheets {
+                sb.extend_from_slice(&unicode_str(s));
+            }
+            rec(&mut g, SUPBOOK, &sb);
+        }
+        // 末尾是 add-in（2007+ 的 _xlfn 函数名靠它挂）
+        if externs.addin {
+            let mut sb = Vec::new();
+            sb.extend_from_slice(&w16(1));
+            // 加插件 SUPBOOK 的标记字节是 0x3A01（实测，不是 0x013A）
+            sb.extend_from_slice(&w16(0x3A01));
+            rec(&mut g, SUPBOOK, &sb);
+        }
 
         let mut es = Vec::new();
         es.extend_from_slice(&w16(externs.entries.len() as u16));
@@ -565,6 +635,16 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
             es.extend_from_slice(&w16(*last));
         }
         rec(&mut g, EXTERNSHEET, &es);
+    }
+
+    // 定义名称 + _xlfn 名（索引必须与 ptgName 一致：先用户名称，再未来函数）
+    for (name, scope, rgce) in names.user.iter() {
+        let body = crate::xls_formula::name_record(name, *scope, rgce, false);
+        rec(&mut g, NAME, &body);
+    }
+    for f in names.future.iter() {
+        let body = crate::xls_formula::name_record(f, None, &crate::xls_formula::future_rgce(), true);
+        rec(&mut g, NAME, &body);
     }
     rec(&mut g, EOF, &[]);
 
