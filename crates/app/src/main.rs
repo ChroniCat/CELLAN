@@ -5590,47 +5590,96 @@ impl SheetApp {
         egui::Window::new("修订记录")
             .open(&mut open)
             .resizable(true)
-            .default_width(640.0)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
+            .default_width(720.0)
+            .min_width(560.0)
+            .frame(
+                egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 8,
+                    bottom: 10,
+                }),
+            )
             .show(ctx, |ui| {
+                ui.set_width(700.0);
                 ui.horizontal(|ui| {
-                    ui.weak(format!("{} 条", entries.len()));
+                    ui.label(egui::RichText::new(format!("{} 条", entries.len())).strong());
                     if ui.small_button("重新读取").clicked() {
                         reload = true;
                     }
-                    ui.separator();
-                    ui.weak("日志随文件走：.~sheetflow-history/<文件名>/revisions.jsonl");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(".~sheetflow-history/<文件名>/revisions.jsonl")
+                                .size(10.0)
+                                .weak(),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+                // 表头
+                ui.horizontal(|ui| {
+                    dlg_col(ui, 62.0, |ui| {
+                        ui.label(egui::RichText::new("时间").size(10.5).weak());
+                    });
+                    dlg_col(ui, 92.0, |ui| {
+                        ui.label(egui::RichText::new("用户").size(10.5).weak());
+                    });
+                    dlg_col(ui, 76.0, |ui| {
+                        ui.label(egui::RichText::new("动作").size(10.5).weak());
+                    });
+                    dlg_col(ui, 132.0, |ui| {
+                        ui.label(egui::RichText::new("位置").size(10.5).weak());
+                    });
+                    dlg_col(ui, 240.0, |ui| {
+                        ui.label(egui::RichText::new("改动").size(10.5).weak());
+                    });
                 });
                 ui.separator();
                 if entries.is_empty() {
-                    ui.label("还没有记录。改几格再回来看。");
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("还没有记录。改几格再回来看。").weak());
+                    ui.add_space(10.0);
                 }
                 egui::ScrollArea::vertical()
-                    .max_height(380.0)
+                    .max_height(400.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for (i, e) in entries.iter().enumerate().rev() {
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(rel_time(e.ts))
-                                        .monospace()
-                                        .weak()
-                                        .size(11.0),
-                                );
-                                ui.label(egui::RichText::new(&e.who).strong());
-                                ui.label(&e.label);
-                                let pos = format!("{}!{}", e.sheet, e.range());
-                                if ui.link(pos).clicked() {
-                                    if let Some(ch) = e.cells.first() {
-                                        jump = Some((e.sheet.clone(), ch.r, ch.c));
+                                dlg_col(ui, 62.0, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(rel_time(e.ts)).size(11.0).weak(),
+                                    );
+                                });
+                                dlg_col(ui, 92.0, |ui| {
+                                    ui.label(egui::RichText::new(&e.who).strong().size(12.0));
+                                });
+                                dlg_col(ui, 76.0, |ui| {
+                                    ui.label(egui::RichText::new(&e.label).size(12.0));
+                                });
+                                dlg_col(ui, 132.0, |ui| {
+                                    let pos = format!("{}!{}", e.sheet, e.range());
+                                    if ui.link(pos).clicked() {
+                                        if let Some(ch) = e.cells.first() {
+                                            jump = Some((e.sheet.clone(), ch.r, ch.c));
+                                        }
                                     }
-                                }
+                                });
+                                dlg_col(ui, 240.0, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(e.delta_text())
+                                            .size(11.0)
+                                            .weak(),
+                                    );
+                                });
                                 if !e.remote && !e.cells.is_empty() {
                                     if ui.small_button("撤回").clicked() {
                                         revert = Some(i);
                                     }
                                 }
                             });
-                            ui.label(egui::RichText::new(e.delta_text()).small().weak());
                             ui.separator();
                         }
                     });
@@ -9116,6 +9165,15 @@ impl eframe::App for SheetApp {
             }
         }
     }
+}
+
+/// 对话框里定宽的一列（时间/用户/位置这类需要对齐）
+fn dlg_col(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::Vec2::new(w, 20.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add,
+    );
 }
 
 /// 对话框的小节标题（细线 + 强调色小字）

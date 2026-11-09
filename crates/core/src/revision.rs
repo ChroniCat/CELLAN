@@ -156,7 +156,35 @@ impl Entry {
             return self.note.clone();
         };
         if self.cells.len() == 1 {
-            format!("{} → {}", ch.before.summary(), ch.after.summary())
+            let same_value = ch.before.summary() == ch.after.summary();
+            if same_value {
+                // 值没变，那就是格式变了：把字体变化说出来，否则一行"x → x"看不出改了什么
+                if let (Some(b), Some(a)) = (&ch.before_style, &ch.after_style) {
+                    let name = |f: &str| if f.is_empty() { "默认".to_string() } else { f.to_string() };
+                    let mut bits = Vec::new();
+                    if b.font != a.font {
+                        bits.push(format!("字体 {} → {}", name(&b.font), name(&a.font)));
+                    }
+                    if b.size != a.size {
+                        bits.push(format!("字号 {} → {}", b.size, a.size));
+                    }
+                    if (b.bold, b.italic) != (a.bold, a.italic) {
+                        bits.push("字形变化".into());
+                    }
+                    if b.fill != a.fill {
+                        bits.push("底色变化".into());
+                    }
+                    if b.format != a.format {
+                        bits.push(format!("格式 {} → {}", b.format, a.format));
+                    }
+                    if !bits.is_empty() {
+                        return format!("格式：{}", bits.join("，"));
+                    }
+                }
+                format!("{}（无变化）", ch.after.summary())
+            } else {
+                format!("{} → {}", ch.before.summary(), ch.after.summary())
+            }
         } else {
             format!("{} 格（{}）", self.cells.len(), self.note)
         }
