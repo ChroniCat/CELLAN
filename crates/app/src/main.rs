@@ -118,6 +118,9 @@ struct SheetApp {
     shared_current_file: Option<std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>>,
     /// 没带文件启动时显示最近文件
     show_start: bool,
+    confirm_close_once: bool,
+    tabs_done: bool,
+    pending_tab_switch: Option<usize>,
     update_done: bool,
     /// 历史版本窗口：(工作簿路径, 版本列表)
     history_view: Option<(PathBuf, Vec<sheetcore::backup::Version>)>,
@@ -127,6 +130,9 @@ struct SheetApp {
     show_pages: bool,
     /// 撤销/重做
     undo: sheetcore::undo::UndoStack,
+    /// 标签页：与 active_tab 一一对应，Active 那个的数据在 self 上
+    tabs: Vec<TabSlot>,
+    active_tab: usize,
     /// 编辑租约（客户端看到的）
     locks: sheetcore::sync::LockTable,
     /// 等待授权中的编辑（初始输入）
@@ -246,6 +252,27 @@ struct SheetApp {
     pending_join: Option<String>,
 }
 
+/// 一个被挂起（非活动）的文档：切走时把它整份存这里，切回来再装回去
+struct ParkedDoc {
+    title: String,
+    wb: Workbook,
+    undo: sheetcore::undo::UndoStack,
+    deps: sheetcore::formula::deps::Deps,
+    sel: (u32, u32),
+    sel_end: (u32, u32),
+    sheet_idx: usize,
+    scroll: Vec2,
+    zoom: f32,
+    doc_gen: u64,
+    cf_stats_gen: u64,
+}
+
+/// 标签页槽位：一个是当前活动的，其余挂起
+enum TabSlot {
+    Active,
+    Parked(Box<ParkedDoc>),
+}
+
 enum OpenMsg {
     /// 文件已读入（带的是上次保存的计算结果，先显示）
     Loaded(Box<Workbook>),
@@ -303,11 +330,16 @@ impl SheetApp {
             open_requests: None,
             shared_current_file: None,
             show_start: false,
+            confirm_close_once: false,
+            tabs_done: false,
+            pending_tab_switch: None,
             update_done: false,
             history_view: None,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
+            tabs: vec![TabSlot::Active],
+            active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
             pending_edit: None,
             my_lock: None,
@@ -2973,9 +3005,58 @@ impl SheetApp {
                 });
             ui.separator();
 
+            // 标签页
+            if self.tabs.len() > 1 {
+                let mut switch_to: Option<usize> = None;
+                let mut close_one: Option<usize> = None;
+                ui.horizontal(|ui| {
+                    for i in 0..self.tabs.len() {
+                        let title = self.tab_title(i);
+                        let active = i == self.active_tab;
+                        let dirty = match self.tabs[i] {
+                            TabSlot::Active => self.wb.dirty,
+                            TabSlot::Parked(_) => false,
+                        };
+                        let label = if dirty { format!("{title} *") } else { title };
+                        if ui.selectable_label(active, label).clicked() && !active {
+                            switch_to = Some(i);
+                        }
+                        if ui.small_button("×").clicked() {
+                            close_one = Some(i);
+                        }
+                        ui.separator();
+                    }
+                });
+                if let Some(i) = switch_to {
+                    self.switch_tab(i);
+                }
+                if let Some(i) = close_one {
+                    self.close_tab(i);
+                }
+            }
+
             // 插入
             ui.menu_button("文件", |ui| {
                 ui.set_min_width(150.0);
+                if ui.button("新建标签").clicked() {
+                    self.open_in_new_tab(PathBuf::new());
+                    ui.close_menu();
+                }
+                if ui.button("打开到新标签…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
+                        .pick_file()
+                    {
+                        self.open_in_new_tab(p);
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("关闭当前标签").clicked() {
+                    let idx = self.active_tab;
+                    self.close_tab(idx);
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("打印预览").clicked() {
                     self.preview_page = 0;
                     self.print_preview = true;
@@ -6502,6 +6583,49 @@ impl SheetApp {
     }
 
 
+
+    /// 自检：多标签
+    fn tabs_probe(&mut self) {
+        if let Some(idx) = self.pending_tab_switch {
+            if self.open_rx.is_none() {
+                self.pending_tab_switch = None;
+                eprintln!("[tabs] 切回前 标签数={} 活动={}", self.tabs.len(), self.active_tab);
+                self.switch_tab(idx);
+                eprintln!(
+                    "[tabs] 切回后 活动={} 文档={:?} 标题={}",
+                    self.active_tab,
+                    self.wb.path,
+                    self.tab_title(self.active_tab)
+                );
+            }
+        }
+        if self.tabs_done {
+            return;
+        }
+        if let Ok(p) = std::env::var("SC_TABS") {
+            if self.open_rx.is_some() || p.is_empty() {
+                return;
+            }
+            self.tabs_done = true;
+            eprintln!("[tabs] 当前标签 {} 文档 {:?}", self.active_tab, self.wb.path);
+            self.open_in_new_tab(PathBuf::from(p));
+            if let Ok(idx) = std::env::var("SC_SWITCH_TAB") {
+                self.pending_tab_switch = idx.parse().ok();
+            }
+            return;
+        }
+        if let Ok(idx) = std::env::var("SC_SWITCH_TAB") {
+            if self.open_rx.is_some() {
+                return;
+            }
+            self.tabs_done = true;
+            let i: usize = idx.parse().unwrap_or(0);
+            eprintln!("[tabs] 切换前 标签数={} 活动={} 文档={:?}", self.tabs.len(), self.active_tab, self.wb.path);
+            self.switch_tab(i);
+            eprintln!("[tabs] 切换后 活动={} 文档={:?} 标题={}", self.active_tab, self.wb.path, self.tab_title(self.active_tab));
+        }
+    }
+
     /// 启动页：没指定文件时列出最近打开的
     fn start_page(&mut self, ctx: &egui::Context) {
         if !self.show_start {
@@ -6664,6 +6788,156 @@ impl SheetApp {
         }
         self.update_done = true;
         self.check_update();
+    }
+
+
+    /// 把当前文档从 self 上"取下来"
+    fn park_current(&mut self) -> Box<ParkedDoc> {
+        let title = self
+            .wb
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未命名".into());
+        Box::new(ParkedDoc {
+            title,
+            wb: std::mem::replace(&mut self.wb, Workbook::new_blank()),
+            undo: std::mem::replace(&mut self.undo, sheetcore::undo::UndoStack::new()),
+            deps: std::mem::replace(&mut self.deps, sheetcore::formula::deps::Deps::empty()),
+            sel: self.sel,
+            sel_end: self.sel_end,
+            sheet_idx: self.sheet_idx,
+            scroll: self.scroll,
+            zoom: self.zoom,
+            doc_gen: self.doc_gen,
+            cf_stats_gen: self.cf_stats_gen,
+        })
+    }
+
+    /// 把一份挂起的文档装到 self 上
+    fn activate_parked(&mut self, doc: Box<ParkedDoc>) {
+        self.wb = doc.wb;
+        self.undo = doc.undo;
+        self.deps = doc.deps;
+        self.sel = doc.sel;
+        self.sel_end = doc.sel_end;
+        self.sheet_idx = doc.sheet_idx;
+        self.scroll = doc.scroll;
+        self.zoom = doc.zoom;
+        self.doc_gen = doc.doc_gen;
+        self.cf_stats_gen = doc.cf_stats_gen;
+        self.wb_epoch = self.wb_epoch.wrapping_add(1);
+        self.editing = None;
+        self.cf_stats_gen = u64::MAX;
+        self.needs_full = false;
+    }
+
+    /// 切到某个标签
+    fn switch_tab(&mut self, idx: usize) {
+        if idx == self.active_tab || idx >= self.tabs.len() {
+            return;
+        }
+        if self.net.is_some() {
+            self.status = "这个标签正在协作中，先断开（或等同事改完）再切换".into();
+            return;
+        }
+        let parked = self.park_current();
+        self.tabs[self.active_tab] = TabSlot::Parked(parked);
+        let target = std::mem::replace(&mut self.tabs[idx], TabSlot::Active);
+        self.active_tab = idx;
+        if let TabSlot::Parked(doc) = target {
+            self.activate_parked(doc);
+        }
+        let title = self.tab_title(idx);
+        self.status = format!("已切到 {title}");
+    }
+
+    fn tab_title(&self, idx: usize) -> String {
+        match self.tabs.get(idx) {
+            Some(TabSlot::Active) => self
+                .wb
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "未命名".into()),
+            Some(TabSlot::Parked(p)) => p.title.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// 在新标签里打开文件
+    fn open_in_new_tab(&mut self, path: PathBuf) {
+        if self.net.is_some() {
+            self.status = "当前标签正在协作中，先断开再开新标签".into();
+            return;
+        }
+        let parked = self.park_current();
+        self.tabs[self.active_tab] = TabSlot::Parked(parked);
+        self.tabs.push(TabSlot::Active);
+        self.active_tab = self.tabs.len() - 1;
+        self.reset_editor_state();
+        if path.as_os_str().is_empty() {
+            self.wb = Workbook::new_blank();
+            self.status = "已新建标签".into();
+        } else {
+            self.open_path(path);
+        }
+    }
+
+    /// 关掉某个标签
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || self.tabs.len() == 1 {
+            return;
+        }
+        if idx == self.active_tab {
+            if self.net.is_some() {
+                self.status = "这个标签正在协作中，先断开再关闭".into();
+                return;
+            }
+            if self.wb.dirty && !self.confirm_discard() {
+                return;
+            }
+            self.tabs.remove(idx);
+            if self.active_tab > idx || self.active_tab >= self.tabs.len() {
+                self.active_tab = self.active_tab.saturating_sub(1);
+            }
+            // 装载新活动标签
+            let target = std::mem::replace(&mut self.tabs[self.active_tab], TabSlot::Active);
+            if let TabSlot::Parked(doc) = target {
+                self.activate_parked(doc);
+            }
+        } else {
+            self.tabs.remove(idx);
+            if self.active_tab > idx {
+                self.active_tab -= 1;
+            }
+        }
+    }
+
+    /// 关标签前的未保存确认（暂时用状态栏提示 + 二次点击）
+    fn confirm_discard(&mut self) -> bool {
+        if self.confirm_close_once {
+            self.confirm_close_once = false;
+            return true;
+        }
+        self.confirm_close_once = true;
+        self.status = "这个文件有未保存的改动，再点一次 × 确认丢弃".into();
+        false
+    }
+
+    /// 打开一个新文档时把编辑态清干净
+    fn reset_editor_state(&mut self) {
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        self.sheet_idx = 0;
+        self.scroll = Vec2::ZERO;
+        self.editing = None;
+        self.doc_gen = 0;
+        self.cf_stats_gen = u64::MAX;
+        self.undo = sheetcore::undo::UndoStack::new();
+        self.deps = sheetcore::formula::deps::Deps::empty();
     }
 
     fn join_shared(&mut self) {
@@ -6965,6 +7239,7 @@ impl eframe::App for SheetApp {
         self.macro_run_probe();
         self.tick_session();
         self.poll_open_requests();
+        self.tabs_probe();
         self.update_probe();
         self.start_page(ctx);
         self.history_window(ctx);
