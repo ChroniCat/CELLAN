@@ -689,6 +689,12 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         "COUNT" => r(|| {
             let mut n = 0usize;
             for a in args {
+                // 直接写在参数里的 TRUE/FALSE 要计数；引用区域里的逻辑值不计数
+                let scalar_bool = matches!(a, Arg::Val(FValue::Bool(_)));
+                if scalar_bool {
+                    n += 1;
+                    continue;
+                }
                 for v in a.slice() {
                     if matches!(v, FValue::Number(_)) {
                         n += 1;
@@ -1539,8 +1545,9 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let mut n = 0;
             for d in lo..=hi {
-                let wd = (d + 6) % 7; // 0=周日
-                if wd != 5 && wd != 6 {
+                // (d+6)%7：0=周日 1=周一 … 6=周六
+                let wd = (d + 6) % 7;
+                if wd != 0 && wd != 6 {
                     n += 1;
                 }
             }
@@ -1555,7 +1562,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             while left > 0 {
                 d += step;
                 let wd = (d + 6) % 7;
-                if wd != 5 && wd != 6 {
+                if wd != 0 && wd != 6 {
                     left -= 1;
                 }
             }

@@ -118,6 +118,28 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                 out.push(Tok::Bang);
                 i += 1;
             }
+            // 带引号的表名：'参数与字典'!A1，里面的 '' 是转义的引号
+            '\'' => {
+                let mut name = String::new();
+                i += 1;
+                loop {
+                    if i >= b.len() {
+                        return Err(ErrKind::Value);
+                    }
+                    if b[i] == '\'' {
+                        if i + 1 < b.len() && b[i + 1] == '\'' {
+                            name.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    name.push(b[i]);
+                    i += 1;
+                }
+                out.push(Tok::Ident(name));
+            }
             '%' => {
                 out.push(Tok::Percent);
                 i += 1;
