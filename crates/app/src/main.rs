@@ -461,7 +461,12 @@ impl SheetApp {
             compare_window: std::env::var("SC_WIN").is_ok(),
             editing: None,
             status: "就绪".into(),
-            tree: FileTree::new(),
+            // 文件树：最近列表只在启动和打开/保存时读，别每帧读盘
+            tree: {
+                let mut t = FileTree::new();
+                t.set_recent(recent::load());
+                t
+            },
             net: None,
             peer: None,
             remote: HashMap::new(),
@@ -544,6 +549,11 @@ impl SheetApp {
                     self.doc_gen = 0;
                     if let Some(p) = self.wb.path.clone() {
                         recent::touch(&p);
+                        self.tree.set_recent(recent::load());
+                        // 命令行可能给的是相对路径，文件树要用绝对路径才能挂到盘符下面
+                        let abs = plain_path(&p);
+                        self.tree.set_current(Some(abs.clone()));
+                        self.tree.locate(&abs);
                     }
                     self.rev = self
                         .wb
@@ -9376,6 +9386,16 @@ impl eframe::App for SheetApp {
         }
         self.defer_close_while_saving(ctx, was_saving);
     }
+}
+
+/// 绝对路径，并且去掉 Windows 的 `\?\` 前缀（`canonicalize` 会加，加了就和盘符根对不上）
+fn plain_path(p: &std::path::Path) -> std::path::PathBuf {
+    let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = c.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        return std::path::PathBuf::from(rest);
+    }
+    c
 }
 
 /// 对话框里定宽的一列（时间/用户/位置这类需要对齐）
