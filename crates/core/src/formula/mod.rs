@@ -828,7 +828,18 @@ impl<'a> Calc<'a> {
                 let mut i = 0;
                 while i + 2 < nodes.len() {
                     if let Node::Name(nm) = &nodes[i] {
-                        let v = self.eval_node(&nodes[i + 1], si);
+                        // LET(x, A6:A11, SUM(x*x)) 里的 x 是整块区域，
+                        // 只取左上角会让 SUM(x*x) 得到一个数
+                        let v = match &nodes[i + 1] {
+                            Node::Range(a, b) => match self.range_values(a, b, si) {
+                                Ok(Arg::Range { values, rows, cols }) => FValue::Array(
+                                    std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                                ),
+                                Ok(Arg::Val(v)) => v,
+                                Err(e) => FValue::Error(e),
+                            },
+                            other => self.eval_node(other, si),
+                        };
                         self.env_stack.last_mut().unwrap().insert(nm.clone(), v);
                     }
                     i += 2;
@@ -2026,6 +2037,20 @@ pub fn recalc_all(wb: &mut Workbook) {
                 t_phase = std::time::Instant::now();
             }
         };
+    }
+    // 文件里带 t="array" ref 的公式，覆盖区域里存的是上次的结果值；
+    // 先把这些格子登记成溢出区，否则重算时会被自己上次的结果挡住（#SPILL!）
+    for sheet in wb.sheets.iter_mut() {
+        for (anchor, (r1, c1, r2, c2)) in sheet.arrays.clone() {
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let k = CellRef::new(r, c);
+                    if k != anchor {
+                        sheet.spilled.insert(k);
+                    }
+                }
+            }
+        }
     }
     // 先清掉上一轮的溢出单元格
     for si in 0..wb.sheets.len() {

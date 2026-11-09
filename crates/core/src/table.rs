@@ -119,6 +119,25 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
 }
 
 /// 读整本文件：表名 → 该表上的表格对象
+/// 关系里的 Target 是相对工作表部件所在目录的：
+/// xl/stress/worksheets/sheet5.xml + ../tables/table1.xml → xl/stress/tables/table1.xml
+fn resolve_rel(base_dir: &str, target: &str) -> String {
+    if let Some(abs) = target.strip_prefix('/') {
+        return abs.to_string();
+    }
+    let mut segs: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for p in target.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other),
+        }
+    }
+    segs.join("/")
+}
+
 pub fn load(path: &Path) -> HashMap<String, Vec<Table>> {
     let mut out: HashMap<String, Vec<Table>> = HashMap::new();
     let Ok(targets) = crate::patch::sheet_targets(path) else {
@@ -148,12 +167,9 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Table>> {
                 if let Some(tpos) = tag.find("Target=\"") {
                     let v = &tag[tpos + 8..];
                     if let Some(q) = v.find('"') {
-                        let target = v[..q].trim_start_matches("../").to_string();
-                        let full = if target.starts_with('/') {
-                            target.trim_start_matches('/').to_string()
-                        } else {
-                            format!("xl/{target}")
-                        };
+                        let target = v[..q].to_string();
+                        let base_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or("xl/worksheets");
+                        let full = resolve_rel(base_dir, &target);
                         if let Ok(mut tf) = zip.by_name(&full) {
                             let mut tx = String::new();
                             if tf.read_to_string(&mut tx).is_ok() {
