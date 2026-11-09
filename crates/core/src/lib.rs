@@ -24,6 +24,7 @@ pub mod pdf;
 pub mod print;
 pub mod pivot;
 pub mod refs;
+pub mod sheet_ops;
 pub mod pivot_xml;
 pub mod qtable;
 pub mod model;

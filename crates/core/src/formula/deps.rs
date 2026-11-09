@@ -35,7 +35,13 @@ pub struct Deps {
     /// (表, 列) → [(公式单元格, 起始行, 结束行)]
     by_col: HashMap<(usize, i64), Vec<(CellKey, i64, i64)>>,
     /// 公式单元格 → 它登记过的列，删除时可以精确定位
-    cols_of: HashMap<CellKey, Vec<i64>>,
+    cols_of: HashMap<CellKey, Vec<(usize, i64)>>,
+    /// 宽区域保留完整矩形，避免每条整行引用展开成上万列。
+    wide: HashMap<CellKey, Vec<Rect>>,
+    /// 名称和动态引用不能仅靠静态 AST 确定依赖，编辑时保守全量重算。
+    dynamic: HashSet<CellKey>,
+    /// 真正无法静态确定的依赖；易变的 RAND/NOW 本身不属于此集合。
+    runtime_refs: HashSet<CellKey>,
     pub rect_count: usize,
 }
 
@@ -45,15 +51,27 @@ impl Deps {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.refs.is_empty()
+        self.refs.is_empty() && self.dynamic.is_empty()
+    }
+
+    pub fn requires_full_recalc(&self) -> bool {
+        !self.dynamic.is_empty()
+    }
+
+    pub(crate) fn dynamic_cells(&self) -> impl Iterator<Item = CellKey> + '_ {
+        self.runtime_refs.iter().copied()
     }
 
     fn index_rect(&mut self, fk: CellKey, rect: Rect) {
-        // 按列登记；整行引用（A1:Z1）也就几十列
+        if rect.c2 - rect.c1 > 512 {
+            self.wide.entry(fk).or_default().push(rect);
+            return;
+        }
         let entry = self.cols_of.entry(fk).or_default();
-        for c in rect.c1..=rect.c2.min(rect.c1 + 512) {
-            if !entry.contains(&c) {
-                entry.push(c);
+        for c in rect.c1..=rect.c2 {
+            let column = (rect.sheet, c);
+            if !entry.contains(&column) {
+                entry.push(column);
             }
             self.by_col
                 .entry((rect.sheet, c))
@@ -114,12 +132,33 @@ fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
 }
 
 pub fn refs_of(wb: &crate::Workbook, si: usize, formula: &str) -> Vec<Rect> {
-    let body = formula.strip_prefix('=').unwrap_or(formula);
-    let mut out = Vec::new();
-    if let Ok(node) = super::parse(body) {
-        walk(&node, si, wb, &mut out);
+    dependencies(wb, si, formula).0
+}
+
+fn dynamic(node: &Node, include_volatile: bool) -> bool {
+    match node {
+        Node::Name(_) => true,
+        Node::Func(name, args) => matches!(name.as_str(), "INDIRECT" | "OFFSET")
+            || (include_volatile && matches!(name.as_str(), "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"))
+            || args.iter().any(|n| dynamic(n, include_volatile)),
+        Node::Unary(_, n) | Node::Percent(n) => dynamic(n, include_volatile),
+        Node::Binary(_, a, b) => dynamic(a, include_volatile) || dynamic(b, include_volatile),
+        _ => false,
     }
-    out
+}
+
+fn dependencies(wb: &crate::Workbook, si: usize, formula: &str) -> (Vec<Rect>, bool, bool) {
+    let raw = formula.strip_prefix('=').unwrap_or(formula);
+    // 与求值入口保持相同的结构化引用展开和 OOXML/整列规范化。
+    let expanded = crate::table::expand_structured(wb, si, raw).unwrap_or_else(|| raw.to_owned());
+    let body = crate::normalize_formula(&expanded);
+    let mut out = Vec::new();
+    if let Ok(node) = super::parse(&body) {
+        walk(&node, si, wb, &mut out);
+        (out, dynamic(&node, true), dynamic(&node, false))
+    } else {
+        (out, true, true)
+    }
 }
 
 impl Deps {
@@ -128,9 +167,15 @@ impl Deps {
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (cref, cell) in sheet.iter() {
                 if let Some(f) = cell.formula.as_deref() {
-                    let rects = refs_of(wb, si, f);
+                    let key = (si, cref.row, cref.col);
+                    let (rects, dynamic, runtime) = dependencies(wb, si, f);
+                    if dynamic {
+                        deps.dynamic.insert(key);
+                    }
+                    if runtime {
+                        deps.runtime_refs.insert(key);
+                    }
                     if !rects.is_empty() {
-                        let key = (si, cref.row, cref.col);
                         deps.rect_count += rects.len();
                         for r in &rects {
                             deps.index_rect(key, *r);
@@ -149,20 +194,30 @@ impl Deps {
             .get(key.0)
             .and_then(|s| s.get(key.1, key.2))
             .and_then(|c| c.formula.clone());
-        self.refs.remove(&key);
+        if let Some(old) = self.refs.remove(&key) {
+            self.rect_count -= old.len();
+        }
+        self.wide.remove(&key);
+        self.dynamic.remove(&key);
+        self.runtime_refs.remove(&key);
         if let Some(cols) = self.cols_of.remove(&key) {
-            let sheet = key.0;
-            for c in cols {
-                if let Some(list) = self.by_col.get_mut(&(sheet, c)) {
+            for column in cols {
+                if let Some(list) = self.by_col.get_mut(&column) {
                     list.retain(|(k, _, _)| *k != key);
                     if list.is_empty() {
-                        self.by_col.remove(&(sheet, c));
+                        self.by_col.remove(&column);
                     }
                 }
             }
         }
         if let Some(f) = f {
-            let rects = refs_of(wb, key.0, &f);
+            let (rects, dynamic, runtime) = dependencies(wb, key.0, &f);
+            if dynamic {
+                self.dynamic.insert(key);
+            }
+            if runtime {
+                self.runtime_refs.insert(key);
+            }
             if !rects.is_empty() {
                 self.rect_count += rects.len();
                 for r in &rects {
@@ -182,24 +237,25 @@ impl Deps {
             frontier.entry((*si, *c as i64)).or_default().push(*r);
         }
 
-        let mut rounds = 0;
-        while !frontier.is_empty() && rounds < 128 {
-            rounds += 1;
+        // dirty 保证每个公式最多入队一次，循环依赖也会自然终止。
+        while !frontier.is_empty() {
             let mut next: HashMap<(usize, i64), Vec<u32>> = HashMap::new();
             for ((sheet, col), mut rows) in frontier {
                 rows.sort_unstable();
                 rows.dedup();
-                let Some(list) = self.by_col.get(&(sheet, col)) else {
-                    continue;
-                };
-                for (fk, r1, r2) in list {
-                    if dirty.contains(fk) {
+                let narrow = self.by_col.get(&(sheet, col)).into_iter().flatten();
+                let wide = self.wide.iter().flat_map(|(fk, rects)| {
+                    rects.iter().filter(move |r| r.sheet == sheet && col >= r.c1 && col <= r.c2)
+                        .map(move |r| (*fk, r.r1, r.r2))
+                });
+                for (fk, r1, r2) in narrow.copied().chain(wide) {
+                    if dirty.contains(&fk) {
                         continue;
                     }
                     // rows 有序：二分找到 >= r1 的位置，看是否 <= r2
-                    let idx = rows.partition_point(|x| (*x as i64) < *r1);
-                    if idx < rows.len() && (rows[idx] as i64) <= *r2 {
-                        dirty.insert(*fk);
+                    let idx = rows.partition_point(|x| (*x as i64) < r1);
+                    if idx < rows.len() && (rows[idx] as i64) <= r2 {
+                        dirty.insert(fk);
                         next.entry((fk.0, fk.2 as i64)).or_default().push(fk.1);
                     }
                 }

@@ -85,6 +85,10 @@ impl Cell {
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
     pub name: String,
+    /// Stable worksheet part in the loaded OOXML package. Renaming/reordering a
+    /// sheet must retain its original relationships and other unmodeled content.
+    /// A duplicated/new sheet has no source part.
+    pub source_part: Option<String>,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
     cells: Store,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
@@ -151,6 +155,7 @@ impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            source_part: None,
             cells: Store::default(),
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),

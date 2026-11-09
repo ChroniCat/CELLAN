@@ -3,8 +3,7 @@
 //! 存储是「分页列式」，没有真正的行插入原语：这里把受影响的格子整体搬到新位置，
 //! 再重建存储。对 40 万格的表是一次性 O(n)，实测在百毫秒级。
 //!
-//! 公式引用不做 Excel 那种自动改写（相对/绝对引用、跨表、区域边界），
-//! 这一点在文档里写明：插行删行后 #REF 之类的结果需要用户自己确认。
+//! 工作簿级入口同时改写本表、跨表公式和名称引用。
 
 use crate::model::{Cell, CellRef, Sheet};
 use std::collections::HashSet;
@@ -53,22 +52,29 @@ impl Sheet {
             .filter(|(_, c)| c.formula.is_some())
             .map(|(k, _)| k)
             .collect();
+        let mut formulas_changed = false;
         for k in keys {
             let Some(cell) = self.get_mut(k.row, k.col) else { continue };
             if let Some(f) = cell.formula.as_mut() {
-                *f = crate::refs::rewrite(f, shift).into_boxed_str();
+                let rewritten = crate::refs::rewrite(f, shift).into_boxed_str();
+                formulas_changed |= *f != rewritten;
+                *f = rewritten;
             }
         }
+        self.edited |= formulas_changed;
         for blk in self.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
                 if let crate::cf::CfKind::Expr { formula, .. } = &mut rule.kind {
-                    *formula = crate::refs::rewrite(formula, shift);
+                    let rewritten = crate::refs::rewrite(formula, shift);
+                    self.cf_dirty |= *formula != rewritten;
+                    *formula = rewritten;
                 }
             }
         }
         for dv in self.dv.iter_mut() {
-            dv.f1 = crate::refs::rewrite(&dv.f1, shift);
-            dv.f2 = crate::refs::rewrite(&dv.f2, shift);
+            let (f1, f2) = (crate::refs::rewrite(&dv.f1, shift), crate::refs::rewrite(&dv.f2, shift));
+            self.dv_dirty |= dv.f1 != f1 || dv.f2 != f2;
+            (dv.f1, dv.f2) = (f1, f2);
         }
     }
 
@@ -159,6 +165,7 @@ impl Sheet {
 
     fn rebuild(&mut self, map: impl Fn(u32, u32) -> Option<(u32, u32)>) {
         let mut items: Vec<(u32, u32, Cell)> = Vec::new();
+        let old_keys: Vec<CellRef> = self.iter().map(|(key, _)| key).collect();
         for (cref, cell) in self.iter() {
             if let Some((r, c)) = map(cref.row, cref.col) {
                 items.push((r, c, cell.clone()));
@@ -171,7 +178,20 @@ impl Sheet {
                 cells.set(r, c, cell);
             }
         }
-        self.cleared.clear();
+        // Save overlays the original package. Remember every old coordinate;
+        // writing the moved cells below will repopulate coordinates still used.
+        self.cleared.extend(old_keys);
+        let styles = std::mem::take(&mut self.styles);
+        self.style_edits.extend(styles.keys().copied());
+        for (key, style) in styles {
+            if let Some((r, c)) = map(key.row, key.col) {
+                let target = CellRef::new(r, c);
+                self.styles.insert(target, style);
+                self.style_edits.insert(target);
+            }
+        }
+        self.edited = true;
+        self.styles_dirty |= !self.style_edits.is_empty();
         self.spilled.clear();
     }
 
@@ -201,6 +221,7 @@ impl Sheet {
         }
         self.rows.insert_at(at, n);
         self.merges_dirty = true;
+        self.freeze_dirty = true;
     }
 
     pub fn delete_rows(&mut self, at: u32, n: u32) {
@@ -226,6 +247,7 @@ impl Sheet {
         }
         self.rows.delete_at(at, n);
         self.merges_dirty = true;
+        self.freeze_dirty = true;
     }
 
     pub fn insert_cols(&mut self, at: u32, n: u32) {
@@ -252,6 +274,7 @@ impl Sheet {
         }
         self.cols.insert_at(at, n);
         self.merges_dirty = true;
+        self.freeze_dirty = true;
     }
 
     pub fn delete_cols(&mut self, at: u32, n: u32) {
@@ -277,12 +300,14 @@ impl Sheet {
         }
         self.cols.delete_at(at, n);
         self.merges_dirty = true;
+        self.freeze_dirty = true;
     }
 
     fn shift_notes(&mut self, at: u32, n: u32, rows: bool, del: bool) {
         let old = std::mem::take(&mut self.notes);
         let mut out = std::collections::HashMap::new();
-        for (k, v) in old {
+        self.notes_dirty |= !old.is_empty();
+        for (k, mut v) in old {
             let pos = if rows { k.row } else { k.col };
             if let Some(np) = shift_axis(pos, at, n, del) {
                 let key = if rows {
@@ -290,6 +315,8 @@ impl Sheet {
                 } else {
                     CellRef::new(k.row, np)
                 };
+                v.r = key.row;
+                v.c = key.col;
                 out.insert(key, v);
             }
         }
@@ -297,6 +324,7 @@ impl Sheet {
     }
 
     fn shift_cf(&mut self, at: u32, n: u32, rows: bool, del: bool) {
+        self.cf_dirty |= !self.cf.blocks.is_empty();
         for blk in self.cf.blocks.iter_mut() {
             let mut keep: Vec<(u32, u32, u32, u32)> = Vec::new();
             for (r1, c1, r2, c2) in blk.ranges.iter().copied() {
@@ -328,6 +356,7 @@ impl Sheet {
     }
 
     fn shift_dv(&mut self, at: u32, n: u32, rows: bool, del: bool) {
+        self.dv_dirty |= !self.dv.is_empty();
         for dv in self.dv.iter_mut() {
             let mut keep: Vec<(u32, u32, u32, u32)> = Vec::new();
             for (r1, c1, r2, c2) in dv.ranges.iter().copied() {

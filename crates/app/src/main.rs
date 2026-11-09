@@ -1,4 +1,10 @@
 mod files;
+mod document_tasks;
+
+use document_tasks::DocumentTasks;
+
+#[cfg(test)]
+mod document_tests;
 mod net;
 mod office_clipboard;
 mod recent;
@@ -277,23 +283,10 @@ struct SheetApp {
     joined_doc: bool,
     /// 依赖图：编辑后只重算受影响的公式
     deps: sheetcore::formula::deps::Deps,
-    /// 后台打开/重算的通道
-    open_rx: Option<std::sync::mpsc::Receiver<OpenMsg>>,
+    /// Background channels move with their owning document when switching tabs.
+    tasks: DocumentTasks,
     /// 文档代次：后台算完时如果有编辑，就丢弃结果
     doc_gen: u64,
-    /// 后台重算进行中
-    busy: bool,
-    /// 打开期间有编辑，需要找个空闲时刻补一次全量重算
-    needs_full: bool,
-    /// 最后一次编辑的时间，用于判断是否空闲
-    last_edit: Option<std::time::Instant>,
-    /// 后台保存的通道
-    save_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// 正在写出的目标路径（保存成功后把文档路径切过去）
-    save_target: Option<PathBuf>,
-    /// 等文件加载完再执行的共享/加入动作
-    pending_host: bool,
-    pending_join: Option<String>,
 }
 
 /// 一个被挂起（非活动）的文档：切走时把它整份存这里，切回来再装回去
@@ -309,6 +302,8 @@ struct ParkedDoc {
     zoom: f32,
     doc_gen: u64,
     cf_stats_gen: u64,
+    tasks: DocumentTasks,
+    revisions: Vec<sheetcore::revision::Entry>,
 }
 
 /// 标签页槽位：一个是当前活动的，其余挂起
@@ -327,11 +322,15 @@ enum OpenMsg {
 
 impl SheetApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        install_fonts(&cc.egui_ctx);
-        ui_kit::apply_theme(&cc.egui_ctx);
+        Self::new_with_context(&cc.egui_ctx, initial)
+    }
+
+    fn new_with_context(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
+        install_fonts(ctx);
+        ui_kit::apply_theme(ctx);
         // 截图时关掉淡入动画，否则会抓到窗口半透明的中间帧
         if std::env::var("SC_SHOT").is_ok() {
-            cc.egui_ctx.style_mut(|s| s.animation_time = 0.0);
+            ctx.style_mut(|s| s.animation_time = 0.0);
         }
         let mut app = Self {
             wb: Workbook::new_blank(),
@@ -473,15 +472,8 @@ impl SheetApp {
             last_cursor: None,
             joined_doc: false,
             deps: sheetcore::formula::deps::Deps::empty(),
-            open_rx: None,
+            tasks: DocumentTasks::default(),
             doc_gen: 0,
-            busy: false,
-            needs_full: false,
-            last_edit: None,
-            save_rx: None,
-            save_target: None,
-            pending_host: false,
-            pending_join: None,
         };
         if let Some(p) = initial {
             app.open_path(p);
@@ -499,9 +491,16 @@ impl SheetApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        // Keep the saving document alive, including its result/error channel.
+        if self.tasks.saving.is_some() {
+            self.open_in_new_tab(path);
+            return;
+        }
+        self.reset_editor_state();
+        self.tasks = DocumentTasks::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        self.open_rx = Some(rx);
-        self.busy = true;
+        self.tasks.open_rx = Some(rx);
+        self.tasks.busy = true;
         self.status = format!("正在打开 {}…", path.display());
         std::thread::spawn(move || {
             match sheetcore::xlsx::load(&path) {
@@ -523,7 +522,7 @@ impl SheetApp {
     /// 处理后台打开/重算的结果
     fn poll_open(&mut self) {
         let mut msgs: Vec<OpenMsg> = Vec::new();
-        if let Some(rx) = &self.open_rx {
+        if let Some(rx) = &self.tasks.open_rx {
             while let Ok(m) = rx.try_recv() {
                 msgs.push(m);
             }
@@ -600,24 +599,15 @@ impl SheetApp {
                         let target = PathBuf::from(&out);
                         // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
                         let wb = self.wb.clone();
-                        let is_xls = target
-                            .extension()
-                            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
-                            .unwrap_or(false);
-                        let written = if is_xls {
-                            sheetcore::xls_write::write(&target, &wb)
-                        } else {
-                            sheetcore::xlsx::save_atomic(&target, &wb)
-                        };
-                        match written {
+                        match sheetcore::xlsx::save_atomic(&target, &wb) {
                             Ok(()) => eprintln!("[save] 测试钩子已存 {}", target.display()),
                             Err(e) => eprintln!("[save] 测试钩子失败 {e:#}"),
                         }
                     }
-                    if self.pending_host {
-                        self.pending_host = false;
+                    if self.tasks.pending_host {
+                        self.tasks.pending_host = false;
                         self.start_host();
-                    } else if let Some(addr) = self.pending_join.take() {
+                    } else if let Some(addr) = self.tasks.pending_join.take() {
                         self.join_addr = addr;
                         self.join_shared();
                     } else {
@@ -631,18 +621,24 @@ impl SheetApp {
                     self.cf_stats_gen = u64::MAX;
                     if self.doc_gen != 0 {
                         // 期间用户改过：保留用户结果，等空闲再补一次全量
-                        self.needs_full = true;
-                        self.busy = false;
+                        self.tasks.needs_full = true;
+                        self.tasks.busy = false;
                         self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
                         self.status = "已打开；因期间有编辑，稍后会自动补算一次".into();
                         eprintln!("[open] 丢弃后台结果（期间有编辑），等空闲补算");
                         finished = true;
                         continue;
                     }
+                    // Calculation owns values, not the live document's identity
+                    // or save state (Save As may have completed meanwhile).
+                    let path = self.wb.path.clone();
+                    let dirty = self.wb.dirty;
                     self.wb = *wb;
+                    self.wb.path = path;
+                    self.wb.dirty = dirty;
                     self.deps = *deps;
-                    self.busy = false;
-                    self.needs_full = false;
+                    self.tasks.busy = false;
+                    self.tasks.needs_full = false;
                     finished = true;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开并重算完成（{n} 个非空格）");
@@ -650,19 +646,29 @@ impl SheetApp {
                 }
                 OpenMsg::Failed(e) => {
                     self.status = e;
-                    self.busy = false;
+                    self.tasks.busy = false;
+                    // A failed replacement leaves the previous workbook visible.
+                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
                     finished = true;
                 }
             }
         }
         if finished {
-            self.open_rx = None;
+            self.tasks.open_rx = None;
         }
     }
 
     fn save(&mut self, force_dialog: bool) {
-        if self.save_rx.is_some() {
+        if self.tasks.saving.is_some() {
             self.status = "上一次保存还没完成…".into();
+            return;
+        }
+        if self.tasks.open_rx.is_some() {
+            self.status = "正在加载或重算，完成后再保存".into();
+            return;
+        }
+        self.commit_edit(None);
+        if self.editing.is_some() {
             return;
         }
         let path = match (&self.wb.path, force_dialog) {
@@ -692,70 +698,48 @@ impl SheetApp {
         } else {
             path
         };
-        let mut wb = self.wb.clone();
-        // 基准路径必须指向「打开时的原文件」：umya 从它继承样式、合并、数据验证、
-        // 图片这些我们不在模型里重建的结构。另存到新路径时把 path 改成目标路径，
-        // 就会写出一份只剩单元格值的文件（字体/格式全丢）。
-        wb.path = self.wb.path.clone().filter(|p| p.exists());
-        let shown = path.display().to_string();
-        self.save_target = Some(path.clone());
-        self.status = format!("正在保存 {shown}…");
-        self.wb.dirty = false;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.save_rx = Some(rx);
-        std::thread::spawn(move || {
-            // 先写临时文件，成功再替换，避免写一半断电把原文件毁了
-            let is_xls = path
-                .extension()
-                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
-                .unwrap_or(false);
-            let tmp = path.with_extension(if is_xls { "xls.tmp" } else { "xlsx.tmp" });
-            let written = if is_xls {
-                sheetcore::xls_write::write(&tmp, &wb)
-            } else {
-                sheetcore::xlsx::save_atomic(&tmp, &wb)
-            };
-            let res = match written {
-                Ok(()) => match std::fs::rename(&tmp, &path) {
-                    Ok(()) => Ok(shown),
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        Err(format!("替换文件失败: {e}"))
-                    }
-                },
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(format!("保存失败: {e:#}"))
-                }
-            };
-            let _ = tx.send(res);
-        });
+        self.status = format!("正在保存 {}…", path.display());
+        self.tasks.start_save(&mut self.wb, path);
     }
 
-    /// 轮询后台保存结果
+    /// Poll each save against the workbook that owns its channel, even off-screen.
     fn poll_save(&mut self) {
-        let mut done = None;
-        if let Some(rx) = &self.save_rx {
-            if let Ok(r) = rx.try_recv() {
-                done = Some(r);
+        if let Some(result) = self.tasks.poll_save(&mut self.wb) {
+            self.status = match result {
+                Ok(path) => format!("已保存 {}", path.display()),
+                Err(error) => error,
+            };
+            eprintln!("[save] {}", self.status);
+        }
+        for tab in &mut self.tabs {
+            let TabSlot::Parked(doc) = tab else { continue };
+            if let Some(result) = doc.tasks.poll_save(&mut doc.wb) {
+                match result {
+                    Ok(path) => {
+                        doc.title = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        self.status = format!("已保存 {}", path.display());
+                    }
+                    Err(error) => self.status = format!("{}：{error}", doc.title),
+                }
+                eprintln!("[save] {}", self.status);
             }
         }
-        if let Some(r) = done {
-            self.save_rx = None;
-            match r {
-                Ok(p) => {
-                    if let Some(t) = self.save_target.take() {
-                        self.wb.path = Some(t);
-                    }
-                    self.status = format!("已保存 {p}");
-                    eprintln!("[save] 完成 {p}");
-                }
-                Err(e) => {
-                    self.save_target = None;
-                    self.status = e.clone();
-                    self.wb.dirty = true;
-                    eprintln!("[save] {e}");
-                }
+    }
+
+    fn has_pending_save(&self) -> bool {
+        self.tasks.saving.is_some() || self.tabs.iter().any(|tab| {
+            matches!(tab, TabSlot::Parked(doc) if doc.tasks.saving.is_some())
+        })
+    }
+
+    fn defer_close_while_saving(&mut self, ctx: &egui::Context, was_saving: bool) {
+        if (was_saving || self.has_pending_save())
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // A failed save may have completed in this frame. Keep its error.
+            if self.has_pending_save() {
+                self.status = "文件仍在保存，完成后再关闭窗口".into();
             }
         }
     }
@@ -775,7 +759,7 @@ impl SheetApp {
         if parts.len() != 2 {
             return;
         }
-        if self.net.is_none() || self.open_rx.is_some() {
+        if self.net.is_none() || self.tasks.open_rx.is_some() {
             return;
         }
         if let Some(_) = self.my_lock {
@@ -820,7 +804,7 @@ impl SheetApp {
 
     /// 无界面自检：导入 CSV + 刷新
     fn b4_probe(&mut self) {
-        if std::env::var("SC_B4").is_err() || self.open_rx.is_some() || self.b4_done {
+        if std::env::var("SC_B4").is_err() || self.tasks.open_rx.is_some() || self.b4_done {
             return;
         }
         self.b4_done = true;
@@ -866,7 +850,7 @@ impl SheetApp {
 
     /// 无界面自检：图表改颜色/轴标题 → 写盘 → 重读
     fn d3_probe(&mut self) {
-        if std::env::var("SC_D3").is_err() || self.open_rx.is_some() || self.d3_done {
+        if std::env::var("SC_D3").is_err() || self.tasks.open_rx.is_some() || self.d3_done {
             return;
         }
         self.d3_done = true;
@@ -903,7 +887,7 @@ impl SheetApp {
 
     /// 无界面自检：选区转表格 + 结构化引用 + 存盘
     fn b1_probe(&mut self) {
-        if std::env::var("SC_B1").is_err() || self.open_rx.is_some() || self.b1_done {
+        if std::env::var("SC_B1").is_err() || self.tasks.open_rx.is_some() || self.b1_done {
             return;
         }
         self.b1_done = true;
@@ -928,7 +912,7 @@ impl SheetApp {
 
     /// 无界面自检：Ctrl+Shift+Enter 数组公式 → 存盘带 t="array"
     fn b3_probe(&mut self) {
-        if std::env::var("SC_B3").is_err() || self.open_rx.is_some() || self.b3_done {
+        if std::env::var("SC_B3").is_err() || self.tasks.open_rx.is_some() || self.b3_done {
             return;
         }
         self.b3_done = true;
@@ -971,7 +955,7 @@ impl SheetApp {
 
     /// 无界面自检：圈释无效 + 输入提示
     fn b6_probe(&mut self, ctx: &egui::Context) {
-        if std::env::var("SC_B6").is_err() || self.open_rx.is_some() || self.b6_done {
+        if std::env::var("SC_B6").is_err() || self.tasks.open_rx.is_some() || self.b6_done {
             return;
         }
         self.b6_done = true;
@@ -995,7 +979,7 @@ impl SheetApp {
 
     /// 无界面自检：条件格式管理器（描述文本 + 删规则 + 调顺序）
     fn b5_probe(&mut self) {
-        if std::env::var("SC_B5").is_err() || self.open_rx.is_some() || self.b5_done {
+        if std::env::var("SC_B5").is_err() || self.tasks.open_rx.is_some() || self.b5_done {
             return;
         }
         self.b5_done = true;
@@ -1039,7 +1023,7 @@ impl SheetApp {
 
     /// 无界面自检：A 组（剪贴板/查找替换/工作表）
     fn a_group_probe(&mut self, ctx: &egui::Context) {
-        if std::env::var("SC_A_TEST").is_err() || self.open_rx.is_some() || self.a_done {
+        if std::env::var("SC_A_TEST").is_err() || self.tasks.open_rx.is_some() || self.a_done {
             return;
         }
         self.a_done = true;
@@ -1121,7 +1105,7 @@ impl SheetApp {
 
     /// 无界面自检：打开宏窗口并打印读到的模块
     fn macro_probe(&mut self) {
-        if std::env::var("SC_MACRO").is_err() || self.open_rx.is_some() || self.macro_done {
+        if std::env::var("SC_MACRO").is_err() || self.tasks.open_rx.is_some() || self.macro_done {
             return;
         }
         self.macro_done = true;
@@ -1143,7 +1127,7 @@ impl SheetApp {
 
     /// 无界面自检：在顶部插两行，验证协作同步
     fn struct_probe(&mut self) {
-        if std::env::var("SC_STRUCT_TEST").is_err() || self.open_rx.is_some() || self.struct_done {
+        if std::env::var("SC_STRUCT_TEST").is_err() || self.tasks.open_rx.is_some() || self.struct_done {
             return;
         }
         self.struct_done = true;
@@ -1153,7 +1137,7 @@ impl SheetApp {
 
     /// 无界面自检：给 B2 加粗并广播，用来验格式同步
     fn style_probe(&mut self) {
-        if std::env::var("SC_STYLE_TEST").is_err() || self.open_rx.is_some() || self.style_done {
+        if std::env::var("SC_STYLE_TEST").is_err() || self.tasks.open_rx.is_some() || self.style_done {
             return;
         }
         self.style_done = true;
@@ -1165,7 +1149,7 @@ impl SheetApp {
 
     /// 无界面自检：编辑 → 撤销 → 重做 → 格式撤销
     fn undo_probe(&mut self) {
-        if std::env::var("SC_UNDO_TEST").is_err() || self.open_rx.is_some() || self.probe_done {
+        if std::env::var("SC_UNDO_TEST").is_err() || self.tasks.open_rx.is_some() || self.probe_done {
             return;
         }
         self.probe_done = true;
@@ -2847,29 +2831,86 @@ impl SheetApp {
     }
 
     // ===== 工作表 =====
+    fn can_change_sheets(&mut self) -> bool {
+        if self.net.is_some() {
+            self.status = "协作期间暂不支持增删、改名或移动工作表，请先断开协作".into();
+            return false;
+        }
+        if self.tasks.open_rx.is_some() {
+            self.status = "正在加载或重算，完成后再调整工作表".into();
+            return false;
+        }
+        self.commit_edit(None);
+        self.editing.is_none()
+    }
+
+    fn finish_sheet_change(&mut self) {
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.tasks.last_edit = Some(std::time::Instant::now());
+        // These records contain sheet indices or old formula qualifiers.
+        self.undo = sheetcore::undo::UndoStack::new();
+        self.clip = None;
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+    }
+
+    fn set_sheet_name(&mut self, idx: usize, name: &str) -> bool {
+        if !self.can_change_sheets() {
+            return false;
+        }
+        if self.wb.sheets.get(idx).is_some_and(|sheet| sheet.name == name) {
+            return true;
+        }
+        if !sheetcore::sheet_ops::rename_sheet(&mut self.wb, idx, name) {
+            self.status = "工作表名称无效或已存在".into();
+            return false;
+        }
+        self.finish_sheet_change();
+        self.status = format!("已重命名为 {name}");
+        true
+    }
+
     fn add_sheet(&mut self) {
+        if !self.can_change_sheets() {
+            return;
+        }
         let n = self.wb.sheets.len() + 1;
         let mut name = format!("Sheet{n}");
         let mut k = n;
-        while self.wb.sheets.iter().any(|s| s.name == name) {
+        while self.wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
             k += 1;
             name = format!("Sheet{k}");
         }
-        self.wb.sheets.push(sheetcore::model::Sheet::new(&name));
-        self.wb.dirty = true;
-        self.sheet_idx = self.wb.sheets.len() - 1;
+        let index = self.wb.sheets.len();
+        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, index, sheetcore::model::Sheet::new(&name)) {
+            self.status = "无法创建工作表：名称无效或已存在".into();
+            return;
+        }
+        self.sheet_idx = index;
+        self.finish_sheet_change();
         self.status = format!("已新建 {name}");
     }
 
     fn delete_sheet(&mut self, idx: usize) {
+        if idx >= self.wb.sheets.len() || !self.can_change_sheets() {
+            return;
+        }
         if self.wb.sheets.len() <= 1 {
             self.status = "至少保留一张工作表".into();
             return;
         }
         let name = self.wb.sheets[idx].name.clone();
-        self.wb.sheets.remove(idx);
-        self.wb.dirty = true;
+        if !sheetcore::sheet_ops::delete_sheet(&mut self.wb, idx) {
+            return;
+        }
+        if self.sheet_idx > idx {
+            self.sheet_idx -= 1;
+        }
         self.sheet_idx = self.sheet_idx.min(self.wb.sheets.len() - 1);
+        self.finish_sheet_change();
         self.status = format!("已删除 {name}");
     }
 
@@ -2878,9 +2919,27 @@ impl SheetApp {
         if to < 0 || to as usize >= self.wb.sheets.len() {
             return;
         }
-        self.wb.sheets.swap(idx, to as usize);
-        self.wb.dirty = true;
-        self.sheet_idx = to as usize;
+        if self.swap_sheet_positions(idx, to as usize) {
+            self.sheet_idx = to as usize;
+        }
+    }
+
+    fn swap_sheet_positions(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.wb.sheets.len() || to >= self.wb.sheets.len()
+            || !self.can_change_sheets()
+        {
+            return false;
+        }
+        if !sheetcore::sheet_ops::move_sheet(&mut self.wb, from, to) {
+            return false;
+        }
+        if self.sheet_idx == from {
+            self.sheet_idx = to;
+        } else if self.sheet_idx == to {
+            self.sheet_idx = from;
+        }
+        self.finish_sheet_change();
+        true
     }
 
     /// 撤销 / 重做
@@ -2952,19 +3011,30 @@ impl SheetApp {
 
     /// 复制工作表：插到原表后面，名字自动去重
     fn duplicate_sheet(&mut self, i: usize) {
+        if i >= self.wb.sheets.len() || !self.can_change_sheets() {
+            return;
+        }
         let mut copy = self.wb.sheets[i].clone();
         let base = copy.name.clone();
+        let copy_name = |n| {
+            let suffix = format!(" ({n})");
+            let prefix: String = base.chars().take(31usize.saturating_sub(suffix.chars().count())).collect();
+            format!("{prefix}{suffix}")
+        };
         let mut n = 2;
-        let mut name = format!("{base} ({n})");
-        while self.wb.sheets.iter().any(|s| s.name == name) {
+        let mut name = copy_name(n);
+        while self.wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
             n += 1;
-            name = format!("{base} ({n})");
+            name = copy_name(n);
         }
         copy.name = name;
-        copy.spilled.clear();
-        self.wb.sheets.insert(i + 1, copy);
-        self.sheet_idx = i + 1;
-        self.wb.dirty = true;
+        copy.source_part = None;
+        copy.edited = true;
+        // Keep spill ownership so the next recalc clears and rebuilds its tail.
+        if sheetcore::sheet_ops::insert_sheet(&mut self.wb, i + 1, copy) {
+            self.sheet_idx = i + 1;
+            self.finish_sheet_change();
+        }
     }
 
     /// 已用区域的右下角
@@ -3161,7 +3231,7 @@ impl SheetApp {
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
             self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.last_edit = Some(std::time::Instant::now());
+            self.tasks.last_edit = Some(std::time::Instant::now());
             self.deps.update_cell(&self.wb, key);
             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
             // Ctrl+Shift+Enter：按选区把这条公式登记成数组公式（保存时写 t="array" ref）
@@ -5055,7 +5125,7 @@ impl SheetApp {
     /// 自检：用本机 Excel 跑一个宏
     fn macro_run_probe(&mut self) {
         let Ok(name) = std::env::var("SC_RUNMACRO") else { return };
-        if self.open_rx.is_some() || self.macro_ran {
+        if self.tasks.open_rx.is_some() || self.macro_ran {
             return;
         }
         self.macro_ran = true;
@@ -6209,11 +6279,10 @@ impl SheetApp {
                     ok = true;
                 }
             });
-        if ok && !name.trim().is_empty() && idx < self.wb.sheets.len() {
-            self.wb.sheets[idx].name = name.trim().to_string();
-            self.wb.dirty = true;
-            self.status = format!("已重命名为 {}", name.trim());
-        } else if open {
+        if ok && self.set_sheet_name(idx, name.trim()) {
+            return;
+        }
+        if open {
             self.rename_sheet = Some((idx, name));
         }
     }
@@ -6951,7 +7020,7 @@ impl SheetApp {
         let mut dump: Vec<String> = Vec::new();
         let dumping = std::env::var("SC_DUMP").is_ok()
             && self.dump_once
-            && self.open_rx.is_none()
+            && self.tasks.open_rx.is_none()
             && self.wb.sheets.iter().any(|s| s.len() > 0);
         if dumping {
             dump.push(format!("pane readonly={readonly} rect=({:.0},{:.0},{:.0},{:.0})", resp.rect.min.x, resp.rect.min.y, resp.rect.max.x, resp.rect.max.y));
@@ -8140,7 +8209,7 @@ impl SheetApp {
     /// 自检：多标签
     fn tabs_probe(&mut self) {
         if let Some(idx) = self.pending_tab_switch {
-            if self.open_rx.is_none() {
+            if self.tasks.open_rx.is_none() {
                 self.pending_tab_switch = None;
                 eprintln!("[tabs] 切回前 标签数={} 活动={}", self.tabs.len(), self.active_tab);
                 self.switch_tab(idx);
@@ -8156,7 +8225,7 @@ impl SheetApp {
             return;
         }
         if let Ok(p) = std::env::var("SC_TABS") {
-            if self.open_rx.is_some() || p.is_empty() {
+            if self.tasks.open_rx.is_some() || p.is_empty() {
                 return;
             }
             self.tabs_done = true;
@@ -8168,7 +8237,7 @@ impl SheetApp {
             return;
         }
         if let Ok(idx) = std::env::var("SC_SWITCH_TAB") {
-            if self.open_rx.is_some() {
+            if self.tasks.open_rx.is_some() {
                 return;
             }
             self.tabs_done = true;
@@ -8182,7 +8251,7 @@ impl SheetApp {
 
     /// 自检：读系统剪贴板里的 HTML 表格并粘贴
     fn paste_probe(&mut self) {
-        if std::env::var("SC_PASTE_HTML").is_err() || self.paste_done || self.open_rx.is_some() {
+        if std::env::var("SC_PASTE_HTML").is_err() || self.paste_done || self.tasks.open_rx.is_some() {
             return;
         }
         self.paste_done = true;
@@ -8425,6 +8494,8 @@ impl SheetApp {
             zoom: self.zoom,
             doc_gen: self.doc_gen,
             cf_stats_gen: self.cf_stats_gen,
+            tasks: std::mem::take(&mut self.tasks),
+            revisions: std::mem::take(&mut self.rev),
         })
     }
 
@@ -8439,11 +8510,13 @@ impl SheetApp {
         self.scroll = doc.scroll;
         self.zoom = doc.zoom;
         self.doc_gen = doc.doc_gen;
+        self.tasks = doc.tasks;
+        self.rev = doc.revisions;
         self.cf_stats_gen = doc.cf_stats_gen;
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
         self.editing = None;
         self.cf_stats_gen = u64::MAX;
-        self.needs_full = false;
+        self.confirm_close_once = false;
     }
 
     /// 切到某个标签
@@ -8453,6 +8526,10 @@ impl SheetApp {
         }
         if self.net.is_some() {
             self.status = "这个标签正在协作中，先断开（或等同事改完）再切换".into();
+            return;
+        }
+        self.commit_edit(None);
+        if self.editing.is_some() {
             return;
         }
         let parked = self.park_current();
@@ -8486,6 +8563,10 @@ impl SheetApp {
             self.status = "当前标签正在协作中，先断开再开新标签".into();
             return;
         }
+        self.commit_edit(None);
+        if self.editing.is_some() {
+            return;
+        }
         let parked = self.park_current();
         self.tabs[self.active_tab] = TabSlot::Parked(parked);
         self.tabs.push(TabSlot::Active);
@@ -8502,6 +8583,15 @@ impl SheetApp {
     /// 关掉某个标签
     fn close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() || self.tabs.len() == 1 {
+            return;
+        }
+        let saving = if idx == self.active_tab {
+            self.tasks.saving.is_some()
+        } else {
+            matches!(&self.tabs[idx], TabSlot::Parked(doc) if doc.tasks.saving.is_some())
+        };
+        if saving {
+            self.status = "此文件仍在保存，完成后再关闭标签".into();
             return;
         }
         if idx == self.active_tab {
@@ -8840,23 +8930,25 @@ impl Drop for SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let was_saving = self.has_pending_save();
         self.poll_net();
         self.poll_open();
         self.sync_history();
         self.poll_save();
         // 打开期间被编辑打断的全量重算，等用户停手 3 秒后补上
-        if self.needs_full
-            && !self.busy
-            && self
+        if self.tasks.needs_full
+            && !self.tasks.busy
+            && self.tasks.saving.is_none()
+            && self.tasks
                 .last_edit
                 .map(|t| t.elapsed().as_secs_f32() > 3.0)
                 .unwrap_or(true)
         {
             let wb_now = self.wb.clone();
             let (tx, rx) = std::sync::mpsc::channel();
-            self.open_rx = Some(rx);
-            self.busy = true;
-            self.needs_full = false;
+            self.tasks.open_rx = Some(rx);
+            self.tasks.busy = true;
+            self.tasks.needs_full = false;
             self.doc_gen = 0;
             self.status = "空闲，正在后台补算…".into();
             std::thread::spawn(move || {
@@ -8871,7 +8963,10 @@ impl eframe::App for SheetApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // 协作或后台重算时保持刷新
-        if self.net.is_some() || self.busy || self.save_rx.is_some() {
+        let parked_save = self.tabs.iter().any(|tab| {
+            matches!(tab, TabSlot::Parked(doc) if doc.tasks.saving.is_some())
+        });
+        if self.net.is_some() || self.tasks.busy || self.tasks.saving.is_some() || parked_save {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.dv_dialog(ctx);
@@ -8913,7 +9008,7 @@ impl eframe::App for SheetApp {
         self.find_dialog(ctx);
         self.data_dialog(ctx);
         self.cf_manager(ctx);
-        if std::env::var("SC_PREVIEW").is_ok() && self.open_rx.is_none() {
+        if std::env::var("SC_PREVIEW").is_ok() && self.tasks.open_rx.is_none() {
             self.print_preview = true;
         }
         self.print_preview_window(ctx);
@@ -9122,13 +9217,9 @@ impl eframe::App for SheetApp {
                         self.tab_drag = Some(i);
                     }
                     if let Some(from) = self.tab_drag {
-                        if from != i && resp.hovered() && ui.input(|i| i.pointer.any_down()) {
-                            self.wb.sheets.swap(from, i);
-                            if self.sheet_idx == from {
-                                self.sheet_idx = i;
-                            } else if self.sheet_idx == i {
-                                self.sheet_idx = from;
-                            }
+                        if from != i && resp.hovered() && ui.input(|i| i.pointer.any_down())
+                            && self.swap_sheet_positions(from, i)
+                        {
                             self.tab_drag = Some(i);
                         }
                     }
@@ -9283,6 +9374,7 @@ impl eframe::App for SheetApp {
                 ctx.request_repaint();
             }
         }
+        self.defer_close_while_saving(ctx, was_saving);
     }
 }
 
@@ -9565,8 +9657,8 @@ fn run_app(
                 // 打开文件是异步的：共享/加入要等表读进来再执行，
                 // 否则宿主快照是空的（客户端只会收到 0 条操作）
                 if initial.is_some() {
-                    app.pending_host = auto_host;
-                    app.pending_join = auto_join.clone();
+                    app.tasks.pending_host = auto_host;
+                    app.tasks.pending_join = auto_join.clone();
                 } else if auto_host {
                     app.start_host();
                 } else if let Some(addr) = auto_join.clone() {

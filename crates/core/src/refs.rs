@@ -3,8 +3,8 @@
 //! 这不是简单的字符串替换——必须跳过字符串字面量（`"A1"` 不能动）、
 //! 跳过函数名（`LOG10(` 不是单元格）、认出引号包着的表名（`'我的 表'!A1`）。
 //!
-//! 规则和 Excel 一致：**绝对引用也照样平移**（`$A$1` 插行后变 `$A$2`），
-//! 只有引用落进被删掉的那一块才变成 `#REF!`。
+//! 插删行列时绝对引用也平移（`$A$1` 插行后变 `$A$2`）；复制时则分别遵守
+//! 行、列的 `$` 锁定。引用落进被删掉的区域或复制后越界时变成 `#REF!`。
 
 use crate::model::col_label;
 
@@ -46,12 +46,13 @@ impl Shift {
         if a >= del_end {
             return Some((a - self.n, b - self.n));
         }
+        // at=0 时不能靠 at-1 判断是否还有剩余：饱和减法会把空区间变成第 1 行。
+        if a >= self.at && b < del_end {
+            return None;
+        }
         // 被删掉之后剩下的最小/最大下标
         let new_a = if a < self.at { a } else { self.at };
         let new_b = if b >= del_end { b - self.n } else { self.at.saturating_sub(1) };
-        if b < self.at || new_a > new_b {
-            return None;
-        }
         if new_a > new_b {
             return None;
         }
@@ -77,7 +78,7 @@ impl Shift {
 }
 
 fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b >= 0x80
 }
 
 fn col_index(letters: &[u8]) -> Option<u32> {
@@ -111,7 +112,58 @@ struct Ref {
     text: String,
 }
 
-/// 解析一个单元格引用或区域，返回替换后的文本（不需要改就返回 None）
+fn unchanged_ref(b: &[u8], start: usize, end: usize) -> Ref {
+    Ref { end, text: String::from_utf8_lossy(&b[start..end]).into_owned() }
+}
+
+fn translated_axis(value: u32, offset: i64, absolute: bool, limit: i64) -> Option<u32> {
+    let value = (value as i64).checked_add(if absolute { 0 } else { offset })?;
+    (0..limit).contains(&value).then_some(value as u32)
+}
+
+/// 整行引用也保留每一端自己的锁定标记；列方向偏移不影响它。
+fn parse_row_ref(b: &[u8], start: usize, sh: &Shift, qualified: Option<&str>) -> Option<Ref> {
+    let mut i = start;
+    let abs1 = b.get(i) == Some(&b'$');
+    i += usize::from(abs1);
+    let first = i;
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    let r1 = row_index(&b[first..i])?;
+    if b.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    let abs2 = b.get(i) == Some(&b'$');
+    i += usize::from(abs2);
+    let second = i;
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    let r2 = row_index(&b[second..i])?;
+    if b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+        return None;
+    }
+    if !shift_applies(sh, qualified) || (sh.translate.is_none() && sh.axis != Axis::Row) {
+        return Some(unchanged_ref(b, start, i));
+    }
+    let mapped = match sh.translate {
+        Some((dr, _)) => translated_axis(r1, dr, abs1, 1_048_576)
+            .zip(translated_axis(r2, dr, abs2, 1_048_576)),
+        None => sh.map_range(r1, r2),
+    };
+    let text = match mapped {
+        Some((r1, r2)) => format!(
+            "{}{}:{}{}", if abs1 { "$" } else { "" }, r1 + 1,
+            if abs2 { "$" } else { "" }, r2 + 1,
+        ),
+        None => "#REF!".into(),
+    };
+    Some(Ref { end: i, text })
+}
+
+/// 解析一个单元格引用或区域；识别但不需改动的引用也返回原文，以消费表名限定符。
 fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) -> Option<Ref> {
     let mut i = start;
     let d1 = if b.get(i) == Some(&b'$') {
@@ -125,7 +177,10 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
         i += 1;
     }
     let letters = &b[ls..i];
-    if letters.is_empty() || letters.len() > 3 {
+    if letters.is_empty() {
+        return parse_row_ref(b, start, sh, qualified_sheet);
+    }
+    if letters.len() > 3 {
         return None;
     }
     let d2 = if b.get(i) == Some(&b'$') {
@@ -144,30 +199,33 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
     if digits.is_empty() {
         if b.get(i) == Some(&b':') {
             let mut j = i + 1;
-            while j < b.len() && (b[j] == b'$') {
-                j += 1;
-            }
+            let d3 = b.get(j) == Some(&b'$');
+            j += usize::from(d3);
             let ls2 = j;
             while j < b.len() && b[j].is_ascii_alphabetic() {
                 j += 1;
             }
             if j > ls2 && j - ls2 <= 3 {
+                if b.get(j).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+                    return None;
+                }
                 if let (Some(c1), Some(c2)) = (col_index(letters), col_index(&b[ls2..j])) {
-                    if sh.axis != Axis::Col || !shift_applies(sh, qualified_sheet) {
-                        return None;
+                    if (sh.translate.is_none() && sh.axis != Axis::Col)
+                        || !shift_applies(sh, qualified_sheet)
+                    {
+                        return Some(unchanged_ref(b, start, j));
                     }
-                    let text = if sh.translate.is_some() {
-                        match (apply(sh, 0, c1), apply(sh, 0, c2)) {
-                            ((Some(_), Some(x)), (Some(_), Some(y))) => {
-                                format!("{}:{}", col_label(x), col_label(y))
-                            }
-                            _ => "#REF!".to_string(),
-                        }
-                    } else {
-                        match sh.map_range(c1, c2) {
-                            Some((x, y)) => format!("{}:{}", col_label(x), col_label(y)),
-                            None => "#REF!".to_string(),
-                        }
+                    let mapped = match sh.translate {
+                        Some((_, dc)) => translated_axis(c1, dc, d1, 16_384)
+                            .zip(translated_axis(c2, dc, d3, 16_384)),
+                        None => sh.map_range(c1, c2),
+                    };
+                    let text = match mapped {
+                        Some((x, y)) => format!(
+                            "{}{}:{}{}", if d1 { "$" } else { "" }, col_label(x),
+                            if d3 { "$" } else { "" }, col_label(y),
+                        ),
+                        None => "#REF!".to_string(),
                     };
                     return Some(Ref { end: j, text });
                 }
@@ -177,7 +235,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
     }
 
     // 函数名（LOG10( 之类）不是引用
-    if b.get(i) == Some(&b'(') {
+    if b.get(i).is_some_and(|c| *c == b'(' || is_ident_byte(*c) || *c == b'$') {
         return None;
     }
     // 前面紧挨着字母/数字说明是更长标识符的一部分
@@ -213,15 +271,15 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
         }
         if !letters2.is_empty() && !b[ds2..j].is_empty() {
             if let (Some(c2), Some(r2)) = (col_index(letters2), row_index(&b[ds2..j])) {
-                if b.get(j) == Some(&b'(') {
+                if b.get(j).is_some_and(|c| *c == b'(' || is_ident_byte(*c) || *c == b'$') {
                     return None;
                 }
                 if !shift_applies(sh, qualified_sheet) {
-                    return None;
+                    return Some(unchanged_ref(b, start, j));
                 }
                 let none2 = (None::<u32>, None::<u32>);
                 let (p1, p2) = if sh.translate.is_some() {
-                    (apply(sh, r1, c1), apply(sh, r2, c2))
+                    (apply(sh, r1, c1, d2, d1), apply(sh, r2, c2, d4, d3))
                 } else if sh.axis == Axis::Row {
                     // 已经 map 过了，不能再走 apply（否则平移两次）
                     match sh.map_range(r1, r2) {
@@ -255,9 +313,9 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
     }
 
     if !shift_applies(sh, qualified_sheet) {
-        return None;
+        return Some(unchanged_ref(b, start, i));
     }
-    let (nr, nc) = apply(sh, r1, c1);
+    let (nr, nc) = apply(sh, r1, c1, d2, d1);
     let text = match (nr, nc) {
         (Some(r), Some(c)) => format!(
             "{}{}{}{}",
@@ -272,14 +330,12 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
 }
 
 /// 平移或结构位移的统一出口
-fn apply(sh: &Shift, r: u32, c: u32) -> (Option<u32>, Option<u32>) {
+fn apply(sh: &Shift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
     if let Some((dr, dc)) = sh.translate {
-        let nr = r as i64 + dr;
-        let nc = c as i64 + dc;
-        if nr < 0 || nc < 0 || nr >= 1_048_576 || nc >= 16_384 {
-            return (None, None);
-        }
-        return (Some(nr as u32), Some(nc as u32));
+        return (
+            translated_axis(r, dr, row_absolute, 1_048_576),
+            translated_axis(c, dc, col_absolute, 16_384),
+        );
     }
     match sh.axis {
         Axis::Row => (sh.map(r), Some(c)),
@@ -288,13 +344,17 @@ fn apply(sh: &Shift, r: u32, c: u32) -> (Option<u32>, Option<u32>) {
 }
 
 fn shift_applies(sh: &Shift, qualified: Option<&str>) -> bool {
+    // 复制时带表名的相对引用也要移动；只有结构编辑才受目标表限制。
+    if sh.translate.is_some() {
+        return true;
+    }
     match qualified {
         Some(s) => s.eq_ignore_ascii_case(&sh.target_sheet),
         None => sh.own_sheet.eq_ignore_ascii_case(&sh.target_sheet),
     }
 }
 
-/// 复制粘贴时按 (dr, dc) 平移公式里的相对引用（绝对引用也平移，和处理插删一致）
+/// 复制粘贴时按 (dr, dc) 平移相对引用，分别保留被 `$` 锁定的行和列。
 pub fn translate(formula: &str, dr: i64, dc: i64, sheet: &str) -> String {
     let sh = Shift {
         axis: Axis::Row,
@@ -339,7 +399,14 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
             let start = i;
             i += 1;
             let ns = i;
-            while i < b.len() && b[i] != b'\'' {
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
                 i += 1;
             }
             let name = &formula[ns..i];
@@ -354,6 +421,24 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
                 out.push(b'!');
                 i += 1;
             }
+            continue;
+        }
+        // 表格列名和外部工作簿名中的 A1 等字样不是单元格引用。
+        if c == b'[' {
+            let start = i;
+            let mut depth = 0usize;
+            while i < b.len() {
+                match b[i] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(&b[start..i]);
             continue;
         }
         // 裸表名：Sheet2!A1 / 数据!A1（表名可以是中文）
@@ -384,13 +469,104 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
                 }
             }
         }
-        if c == b'!' {
+        if matches!(c, b'!' | b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b',' | b';' | b'(' | b')' | b'=' | b'<' | b'>') {
             qual = None;
         }
         out.push(c);
         i += 1;
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// Rename a local sheet qualifier, or replace a deleted sheet reference with
+/// `#REF!`. Strings, structured column names and external workbook references
+/// are copied intact. Coordinates keep their original spelling and `$` flags.
+pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
+    let b = formula.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let identity = Shift {
+        axis: Axis::Row, at: 0, n: 0, delete: false,
+        target_sheet: String::new(), own_sheet: String::new(), translate: None,
+    };
+    while i < b.len() {
+        let start = i;
+        if b[i] == b'"' {
+            i = quoted_end(b, i, b'"');
+            out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        if b[i] == b'[' {
+            // A nested table selector, or the workbook part of [Book]Sheet!A1.
+            let mut depth = 0;
+            while i < b.len() {
+                if b[i] == b'[' { depth += 1; }
+                if b[i] == b']' { depth -= 1; }
+                i += 1;
+                if depth == 0 { break; }
+            }
+            // Consume an external sheet qualifier too, so it cannot be renamed
+            // merely because it shares the local sheet's name.
+            let mut end = i;
+            if b.get(end) == Some(&b'\'') {
+                end = quoted_end(b, end, b'\'');
+            } else {
+                while b.get(end).is_some_and(|c| is_ident_byte(*c)) { end += 1; }
+            }
+            if b.get(end) == Some(&b'!') { i = end + 1; }
+            out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        let name = if b[i] == b'\'' {
+            i = quoted_end(b, i, b'\'');
+            if i > start + 1 && b[i - 1] == b'\'' {
+                Some(formula[start + 1..i - 1].replace("''", "'"))
+            } else { None }
+        } else if is_ident_byte(b[i]) {
+            while b.get(i).is_some_and(|c| is_ident_byte(*c)) { i += 1; }
+            Some(formula[start..i].to_owned())
+        } else {
+            i += 1;
+            None
+        };
+        if b.get(i) == Some(&b'!') && name.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(old))
+            // Do not partially rewrite unsupported unquoted 3D qualifiers.
+            && (start == 0 || !matches!(b[start - 1], b':' | b'#'))
+        {
+            if let Some(new) = new {
+                out.extend_from_slice(format!("'{}'!", new.replace('\'', "''")).as_bytes());
+                i += 1;
+            } else {
+                i += 1;
+                // Consume a complete A1/range reference (including whole rows
+                // and columns), or a sheet-scoped name after the qualifier.
+                if b[i..].starts_with(b"#REF!") {
+                    i += 5;
+                } else if let Some(reference) = parse_ref(b, i, &identity, None) {
+                    i = reference.end;
+                } else {
+                    while b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$') { i += 1; }
+                }
+                if b.get(i) == Some(&b'#') { i += 1; }
+                out.extend_from_slice(b"#REF!");
+            }
+        } else {
+            out.extend_from_slice(&b[start..i]);
+        }
+    }
+    String::from_utf8(out).expect("reference rewriting preserves UTF-8")
+}
+
+fn quoted_end(b: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == quote {
+            i += 1;
+            if b.get(i) != Some(&quote) { return i; }
+        }
+        i += 1;
+    }
+    i
 }
 
 /// 整行引用 1:3
