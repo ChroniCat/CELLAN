@@ -394,3 +394,92 @@ fn revision_revert_restores_font() {
     assert_eq!(log[1].label, "撤回修订");
 }
 
+/// 跑一次 app，把 stderr 收回来（功能区几何日志走 stderr）
+fn ui_log_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> String {
+    let out = std::env::temp_dir().join(format!("ui_log_{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let f = std::fs::File::create(&out).unwrap();
+    let exe = env!("CARGO_BIN_EXE_app");
+    let mut cmd = Command::new(exe);
+    cmd.arg(file)
+        .env("SC_NO_OPEN_DIALOG", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(f));
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("启动 app 失败");
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(120));
+        if out.exists() {
+            if let Ok(t) = std::fs::read_to_string(&out) {
+                if t.matches("[ui] 组").count() >= 14 {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::read_to_string(&out).unwrap_or_default()
+}
+
+#[test]
+fn ribbon_groups_aligned_and_fit() {
+    let dir = std::env::temp_dir().join("sheet_ui_ribbon");
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join("空白.xlsx");
+    let wb = sheetcore::model::Workbook::new_blank();
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+
+    let log = ui_log_for(p.to_str().unwrap(), &[("SC_UI_LOG", "1")], Duration::from_secs(20));
+    // 取最后一帧：从最后一次出现"剪贴板"开始，读满 7 个组
+    let mut groups: Vec<(String, f32, f32, f32, f32)> = Vec::new();
+    let mut started = false;
+    for line in log.lines().filter(|l| l.contains("[ui] 组")) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // [ui] 组 剪贴板 x= 8.0 y= 39.0 w= 96.0 h= 73.0
+        if parts.len() < 8 {
+            continue;
+        }
+        let title = parts[2].to_string();
+        let num = |k: &str| -> f32 {
+            for (i, s) in parts.iter().enumerate() {
+                if let Some(v) = s.strip_prefix(k) {
+                    if !v.is_empty() {
+                        return v.parse::<f32>().unwrap_or(0.0);
+                    }
+                    if let Some(n) = parts.get(i + 1) {
+                        return n.parse::<f32>().unwrap_or(0.0);
+                    }
+                }
+            }
+            0.0
+        };
+        if title == "剪贴板" {
+            groups.clear();
+            started = true;
+        }
+        if !started {
+            continue;
+        }
+        groups.push((title, num("x="), num("y="), num("w="), num("h=")));
+    }
+    let names: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
+    assert_eq!(
+        names,
+        ["剪贴板", "字体", "对齐", "数字", "样式", "单元格", "编辑"],
+        "开始页应显示 7 个分组"
+    );
+    let y0 = groups[0].2;
+    let h0 = groups[0].4;
+    for g in &groups {
+        assert!((g.2 - y0).abs() < 0.5, "分组 {} 的 y={} 与其它组不齐", g.0, g.2);
+        assert!((g.4 - h0).abs() < 0.5, "分组 {} 的 h={} 与其它组不一致", g.0, g.4);
+        assert!(g.3 > 40.0 && g.3 < 420.0, "分组 {} 宽度异常：{}", g.0, g.3);
+    }
+    let end = groups.last().unwrap().1 + groups.last().unwrap().3;
+    assert!(end < 1440.0, "分组总宽 {end} 超出一屏，用户得横向滚动");
+}
+
