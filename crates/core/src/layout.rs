@@ -109,6 +109,16 @@ impl Axis {
     pub fn default_size(&self) -> f32 {
         self.default
     }
+
+    /// 改默认尺寸（Excel 的 `<col min="1" max="16384">` 就是改整表默认列宽）。
+    /// 已记下的绝对尺寸不受影响。
+    pub fn set_default(&mut self, size: f32) {
+        if (size - self.default).abs() > 0.01 {
+            self.default = size;
+            // 原来的自定义项相对旧默认的"额外偏移"要重算
+            self.rebuild();
+        }
+    }
 }
 
 /// Excel 列宽单位（字符数）→ 像素。默认字体 11pt 时 1 字符 ≈ 7px，再加 5px 内边距。

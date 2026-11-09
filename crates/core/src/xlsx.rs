@@ -271,11 +271,53 @@ pub fn load(path: &Path) -> Result<Workbook> {
             }
         }
     }
+    // 老式 .xls：calamine 不给行列尺寸，也从 XML 里取不到合并区，单独补一遍
+    {
+        let is_xls = std::fs::read(path)
+            .map(|b| !b.starts_with(b"PK"))
+            .unwrap_or(false);
+        if is_xls {
+            if let Some(sizes) = crate::xls_layout::read(path) {
+                for (i, sheet) in wb.sheets.iter_mut().enumerate() {
+                    let Some(sz) = sizes.sheets.get(i) else { continue };
+                    for (a, b, w) in sz.cols.iter() {
+                        if b.saturating_sub(*a) < 1024 {
+                            for c in *a..=*b {
+                                sheet.cols.set(c, *w);
+                            }
+                        } else {
+                            sheet.cols.set_default(*w);
+                        }
+                    }
+                    for (r, h) in sz.rows.iter() {
+                        sheet.rows.set(*r, *h);
+                    }
+                }
+            }
+            if let Ok(calamine::Sheets::Xls(x)) = open_workbook_auto(path) {
+                for (i, name) in names.iter().enumerate() {
+                    if i >= wb.sheets.len() {
+                        break;
+                    }
+                    if let Some(regions) = x.worksheet_merge_cells(name) {
+                        wb.sheets[i].merges = regions
+                            .iter()
+                            .map(|d| (d.start.0, d.start.1, d.end.0, d.end.1))
+                            .collect();
+                    }
+                }
+            }
+        }
+    }
+
     // 合并单元格（已并行取到）
     {
         for sheet in wb.sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
                 sheet.merges = lay.merges.clone();
+                if let Some(w) = lay.col_default {
+                    sheet.cols.set_default(w);
+                }
                 for (c, w) in lay.col_widths.iter() {
                     sheet.cols.set(*c, *w);
                 }

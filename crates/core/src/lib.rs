@@ -36,6 +36,7 @@ pub mod vba;
 pub mod clipboard_xmlss;
 pub mod revision;
 pub mod xlinks;
+pub mod xls_layout;
 pub mod wire;
 pub mod sync;
 pub mod xlsx;

@@ -14,6 +14,8 @@ pub struct SheetLayout {
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// 列号（0-based）→ 像素宽
     pub col_widths: Vec<(u32, f32)>,
+    /// `<col min=1 max=16384>` 这种整表默认宽度（按列展开会变成上万条，改用默认值）
+    pub col_default: Option<f32>,
     /// 行号（0-based）→ 像素高
     pub row_heights: Vec<(u32, f32)>,
     /// 条件格式
@@ -122,6 +124,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         lay.dxfs = dxfs.clone();
         lay.dv = crate::dv::parse_validations(&xml);
         if !lay.merges.is_empty()
+            || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
             || !lay.row_heights.is_empty()
             || !lay.cf.is_empty()
@@ -178,7 +181,11 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let is_default = (width - 8.43).abs() < 0.05;
                     if min >= 1 && max >= min && width > 0.0 && (custom || !is_default) {
                         let px = crate::layout::excel_width_to_px(width);
-                        if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
+                        let span = max - min + 1;
+                        if span > 1024 {
+                            // 整表级别的列宽：当成默认宽度，不能按列展开
+                            out.col_default = Some(px);
+                        } else if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
                             for c in (min - 1)..max {
                                 out.col_widths.push((c, px));
                             }

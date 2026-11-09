@@ -9164,7 +9164,11 @@ impl eframe::App for SheetApp {
         // 自截图：等界面稳定两帧再抓，避免抓到第一帧的半成品
         if let Some(path) = self.shot_path.clone() {
             self.shot_frames += 1;
-            if self.shot_frames == 8 {
+            let at = std::env::var("SC_SHOT_FRAMES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(8);
+            if self.shot_frames == at {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             let shot = ctx.input(|i| {
