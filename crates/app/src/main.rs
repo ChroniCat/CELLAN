@@ -5717,7 +5717,9 @@ impl SheetApp {
         } else {
             None
         };
+        let pending_pivots_before = self.wb.pivots_pending.len();
         sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
+        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         let after = snapshot.as_ref().map(|before| before.capture_after(&self.wb));
@@ -5739,6 +5741,9 @@ impl SheetApp {
         } else {
             format!("{label}（表太大，本次不可撤销）")
         };
+        if removed_pivots > 0 {
+            self.status.push_str(&format!("；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"));
+        }
     }
 
     /// 读宏代码，开窗口
@@ -6881,29 +6886,32 @@ impl SheetApp {
                 });
             });
         if apply {
-            let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), &spec);
-            let at = self.sel;
-            let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
-            if self.pivot_real {
-                let vname = self
-                    .wb
-                    .sheet(self.sheet_idx)
-                    .get(spec.source.0, spec.value_field)
-                    .map(|c| c.value.display())
-                    .unwrap_or_default();
-                self.wb.pivots_pending.push((self.sheet_idx, spec.clone(), res.clone(), rect, vname));
-            }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.status = format!(
-                "透视表已生成：{} 行 × {} 列（{}）",
-                rect.2 - rect.0 + 1,
-                rect.3 - rect.1 + 1,
-                spec.agg.label()
-            );
+            self.generate_pivot(&spec);
         } else if !cancel && open {
             self.pivot_edit = Some(spec);
         }
+    }
+
+    fn generate_pivot(&mut self, spec: &sheetcore::pivot::PivotSpec) {
+        let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), spec);
+        let at = self.sel;
+        let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
+        if self.pivot_real {
+            let vname = self.wb.sheet(self.sheet_idx).get(spec.source.0, spec.value_field)
+                .map(|c| c.value.display()).unwrap_or_default();
+            self.wb.pivots_pending.push((self.sheet_idx, spec.clone(), res.clone(), rect, vname));
+            // Creating a refreshable pivot is not an undoable cell transaction.
+            // An older structural snapshot must not erase its result cells while
+            // leaving the newly-created attachment in a different coordinate space.
+            self.undo.clear();
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "透视表已生成：{} 行 × {} 列（{}）{}",
+            rect.2 - rect.0 + 1, rect.3 - rect.1 + 1, spec.agg.label(),
+            if self.pivot_real { "；生成操作不可撤销，已清空旧撤销记录" } else { "" },
+        );
     }
 
 

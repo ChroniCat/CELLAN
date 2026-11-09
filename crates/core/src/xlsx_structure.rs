@@ -82,7 +82,9 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
     if !base.exists() {
         return Ok(original());
     }
-    let xml = crate::fixups::read_part_file(base, "xl/workbook.xml")
+    let owned = super::pivots::strip_plan(base, wb.pivot_session.token())?;
+    let xml = owned.replacements.get("xl/workbook.xml").cloned()
+        .or_else(|| crate::fixups::read_part_file(base, "xl/workbook.xml"))
         .context("读取基准工作簿目录失败")?;
     let mut reader = Reader::from_reader(xml.as_slice());
     let mut old = Vec::new();
@@ -118,7 +120,7 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
         && selected.iter().enumerate().all(|(i, (old_i, new_i, tag))| {
             i == *old_i && i == *new_i && attr(tag, "name").as_ref() == Some(&old_names[i])
         });
-    if unchanged {
+    if unchanged && owned.removed.is_empty() {
         return Ok(original());
     }
 
@@ -129,7 +131,7 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
 
     let local_indices: HashMap<usize, usize> = selected.iter().map(|(a, b, _)| (*a, *b)).collect();
     let kept_ids: HashSet<String> = selected.iter().filter_map(|(_, _, e)| attr(e, "r:id")).collect();
-    let mut removed_parts = HashSet::new();
+    let mut removed_parts = owned.removed.clone();
     for (i, name) in old_names.iter().enumerate() {
         if !used.contains(&i) {
             if let Some(part) = targets.get(name) {
@@ -144,7 +146,8 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
     // Include new sheets in the prepared manifest, not only in umya's output.
     // Otherwise localSheetId values refer to a shorter list here, and restoring
     // the original workbook skeleton would drop the new sheets/relationships.
-    let rels = crate::fixups::read_part_file(base, "xl/_rels/workbook.xml.rels")
+    let rels = owned.replacements.get("xl/_rels/workbook.xml.rels").cloned()
+        .or_else(|| crate::fixups::read_part_file(base, "xl/_rels/workbook.xml.rels"))
         .context("读取基准工作簿关系失败")?;
     let mut relationship_ids = HashSet::new();
     let mut reader = Reader::from_reader(rels.as_slice());
@@ -248,7 +251,8 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
         }
     }
     let relationships = writer.into_inner();
-    let types = crate::fixups::read_part_file(base, "[Content_Types].xml")
+    let types = owned.replacements.get("[Content_Types].xml").cloned()
+        .or_else(|| crate::fixups::read_part_file(base, "[Content_Types].xml"))
         .context("读取基准工作簿内容类型失败")?;
     let mut writer = Writer::new(Vec::new());
     let mut reader = Reader::from_reader(types.as_slice());
@@ -292,7 +296,7 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
             "xl/workbook.xml" => Some(&workbook),
             "xl/_rels/workbook.xml.rels" => Some(&relationships),
             "[Content_Types].xml" => Some(&content_types),
-            _ => pivot.as_ref(),
+            _ => pivot.as_ref().or_else(|| owned.replacements.get(&name)),
         };
         if let Some(bytes) = replacement {
             out.start_file(name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated))?;

@@ -360,6 +360,24 @@ pub struct PivotCacheBase {
     pub sheets: Vec<(u64, String)>,
 }
 
+/// Marks pivot attachments produced by this open document. Cloning a save or
+/// undo snapshot preserves ownership; opening the file creates a new session,
+/// so previously persisted attachments become imported parts.
+#[derive(Clone, Debug)]
+pub struct PivotSession(String);
+
+impl PivotSession {
+    pub fn token(&self) -> &str { &self.0 }
+}
+
+impl Default for PivotSession {
+    fn default() -> Self {
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos();
+        Self(format!("{time:x}-{:x}-{:x}", std::process::id(), next_sheet_identity()))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     /// 文件里是否带 VBA 宏（只保留，不执行）
@@ -376,6 +394,7 @@ pub struct Workbook {
     /// (表名, 0=行 1=列, at, n, 是否删除)
     pub pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
     pub pivot_cache_base: std::sync::Arc<PivotCacheBase>,
+    pub pivot_session: PivotSession,
     /// 保存时要挂上的透视表部件：(表序号, 规格, 结果, 输出矩形, 值字段名)
     pub pivots_pending: Vec<(
         usize,
@@ -400,6 +419,7 @@ impl Workbook {
             links: Vec::new(),
             pivot_shifts: Vec::new(),
             pivot_cache_base: Default::default(),
+            pivot_session: Default::default(),
             names_dirty: false,
             pivots_pending: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],

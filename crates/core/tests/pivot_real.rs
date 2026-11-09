@@ -76,7 +76,26 @@ fn writes_real_pivot_table() {
         let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
         let mut w = String::new();
         std::io::Read::read_to_string(&mut z.by_name("xl/workbook.xml").unwrap(), &mut w).unwrap();
-        assert!(w.contains("<pivotCaches><pivotCache cacheId="), "workbook 没挂 pivotCaches: {w}");
+        let mut reader = quick_xml::Reader::from_str(&w);
+        let mut in_caches = false;
+        let mut registered = false;
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Start(e) if e.local_name().as_ref() == "pivotCaches" => in_caches = true,
+                quick_xml::events::Event::End(e) if e.local_name().as_ref() == "pivotCaches" => in_caches = false,
+                quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e)
+                    if in_caches && e.local_name().as_ref() == "pivotCache" => {
+                    registered |= e.attributes().any(|a| {
+                        let a = a.unwrap();
+                        a.key.as_ref() == "cacheId"
+                            && a.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap().parse::<u32>().ok() == Some(cache_id)
+                    });
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert!(registered, "workbook 没登记 cacheId={cache_id}: {w}");
     }
     // 自己还能读回来
     let back = sheetcore::xlsx::load(&out).expect("重新读入");

@@ -15,6 +15,36 @@ fn formula(text: &str) -> Cell {
 }
 
 #[test]
+fn creating_a_refreshable_pivot_prevents_older_structure_undo_from_erasing_it() {
+    let mut app = app();
+    for (r, c, text) in [(0, 0, "Group"), (0, 1, "Amount"), (1, 0, "A")] {
+        app.wb.sheets[0].set(r, c, Cell { value: Value::Text(text.into()), formula: None });
+    }
+    app.wb.sheets[0].set(1, 1, number(5.0));
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.undo.depth(), (1, 0));
+    app.pivot_real = true;
+    app.sel = (5, 0);
+    app.generate_pivot(&sheetcore::pivot::PivotSpec {
+        source: (1, 0, 2, 1), row_field: 0, col_field: None,
+        value_field: 1, agg: sheetcore::pivot::Agg::Sum,
+    });
+    assert_eq!(app.undo.depth(), (0, 0));
+    assert_eq!(app.wb.pivots_pending.len(), 1);
+    assert!(app.status.contains("不可撤销"));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].value(5, 0).display(), "Group");
+    assert_eq!(app.wb.sheets[0].value(6, 1), Value::Number(5.0));
+    assert_eq!(app.wb.pivots_pending[0].1.source, (1, 0, 2, 1));
+    app.structural(sheetcore::structural::Structural::DeleteCols { at: 1, n: 1 });
+    assert!(app.wb.pivots_pending.is_empty());
+    assert!(app.status.contains("已移除 1 个"));
+    app.do_undo(false);
+    assert_eq!(app.wb.pivots_pending.len(), 1);
+    assert_eq!(app.wb.sheets[0].value(6, 1), Value::Number(5.0));
+}
+
+#[test]
 fn chart_save_acknowledges_a_new_sheet_before_the_next_save() {
     let dir = std::env::temp_dir().join(format!("native_chart_receipt_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

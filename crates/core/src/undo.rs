@@ -133,6 +133,9 @@ struct ForeignReferences {
     charts: Option<Vec<crate::charts::Chart>>,
 }
 
+type PendingPivot = (usize, crate::pivot::PivotSpec, crate::pivot::PivotResult,
+    (u32, u32, u32, u32), String);
+
 /// A structural edit owns one complete sheet, plus only the foreign formulas
 /// and reference metadata that the edit changes. Unrelated sheets' value cells
 /// are never copied. File paths and source-part identities remain live state.
@@ -143,7 +146,7 @@ pub struct StructureSnapshot {
     foreign: Vec<ForeignReferences>,
     names: Vec<(String, Option<usize>, String)>,
     pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
-    pending_specs: Vec<(usize, crate::pivot::PivotSpec)>,
+    pending_pivots: Vec<PendingPivot>,
 }
 
 pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::Structural) -> StructureSnapshot {
@@ -176,7 +179,7 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
     }
     StructureSnapshot {
         sheet, target, foreign, names: wb.names.clone(), pivot_shifts: wb.pivot_shifts.clone(),
-        pending_specs: wb.pivots_pending.iter().map(|(si, spec, ..)| (*si, spec.clone())).collect(),
+        pending_pivots: wb.pivots_pending.clone(),
     }
 }
 
@@ -200,7 +203,7 @@ impl StructureSnapshot {
             }).collect(),
             names: wb.names.clone(),
             pivot_shifts: wb.pivot_shifts.clone(),
-            pending_specs: wb.pivots_pending.iter().map(|(si, spec, ..)| (*si, spec.clone())).collect(),
+            pending_pivots: wb.pivots_pending.clone(),
         }
     }
 }
@@ -269,12 +272,9 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot) -> Vec<(usize,
         wb.names_dirty = true;
     }
     wb.pivot_shifts = snap.pivot_shifts.clone();
-    // A completed save may already have attached a pending pivot. Never revive
-    // consumed attachment work; update specifications only for still-pending
-    // entries, whose result data is unaffected by a coordinate shift.
-    for ((si, spec, ..), (saved_si, saved_spec)) in wb.pivots_pending.iter_mut().zip(&snap.pending_specs) {
-        if si == saved_si { *spec = saved_spec.clone(); }
-    }
+    // A deleted source/field/output removes its refreshable definition. Restore
+    // the full entry on undo; save keeps this session-owned list authoritative.
+    wb.pivots_pending = snap.pending_pivots.clone();
     wb.dirty = true;
     let mut touched: Vec<_> = touched.into_iter().collect();
     touched.sort_unstable();

@@ -525,7 +525,9 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         }
     }
 
-    // 待挂的透视表：源区域直接跟着搬
+    // Session-created pivots keep absolute source-field and output coordinates.
+    // If an essential field or either complete region disappears, keep any
+    // remaining summary values but remove the now-invalid refreshable object.
     let sh = crate::refs::Shift {
         axis,
         at,
@@ -535,22 +537,42 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         own_sheet: name.clone(),
             translate: None,
     };
-    for (idx, spec, _, _, _) in wb.pivots_pending.iter_mut() {
-        if *idx != sheet_idx {
-            continue;
+    let map_rect = |rect: (u32, u32, u32, u32)| {
+        let (r1, c1, r2, c2) = rect;
+        if r1 > r2 || c1 > c2 { return None; }
+        match axis {
+            crate::refs::Axis::Row => sh.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2)),
+            crate::refs::Axis::Col => sh.map_range(c1, c2).map(|(a, b)| (r1, a, r2, b)),
         }
-        let (r1, c1, r2, c2) = spec.source;
-        spec.source = match axis {
-            crate::refs::Axis::Row => match sh.map_range(r1, r2) {
-                Some((a, b)) => (a, c1, b, c2),
-                None => spec.source,
-            },
-            crate::refs::Axis::Col => match sh.map_range(c1, c2) {
-                Some((a, b)) => (r1, a, r2, b),
-                None => spec.source,
-            },
+    };
+    wb.pivots_pending.retain_mut(|(idx, spec, _, rect, _)| {
+        if *idx != sheet_idx {
+            return true;
+        }
+        let mapped = (|| {
+            let source = map_rect(spec.source)?;
+            let output = map_rect(*rect)?;
+            let (row_field, col_field, value_field) = if axis == crate::refs::Axis::Col {
+                let col_field = match spec.col_field {
+                    Some(c) => Some(sh.map(c)?),
+                    None => None,
+                };
+                (sh.map(spec.row_field)?, col_field, sh.map(spec.value_field)?)
+            } else {
+                (spec.row_field, spec.col_field, spec.value_field)
+            };
+            Some((source, output, row_field, col_field, value_field))
+        })();
+        let Some((source, output, row_field, col_field, value_field)) = mapped else {
+            return false;
         };
-    }
+        spec.source = source;
+        spec.row_field = row_field;
+        spec.col_field = col_field;
+        spec.value_field = value_field;
+        *rect = output;
+        true
+    });
 }
 
 /// 供撤销用：一行/一列里有哪些格子

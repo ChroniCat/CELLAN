@@ -58,6 +58,8 @@ fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
 }
 #[path = "xlsx_structure.rs"]
 mod structure;
+#[path = "xlsx_pivots.rs"]
+mod pivots;
 
 fn data_to_value(d: &Data) -> Value {
     match d {
@@ -184,6 +186,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         names_dirty: false,
         pivot_shifts: Vec::new(),
         pivot_cache_base: Default::default(),
+        pivot_session: Default::default(),
         has_vba: crate::vba::has_macros(path),
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
@@ -464,6 +467,13 @@ pub struct SaveReceipt {
     sheets: Vec<(u64, String)>,
 }
 
+struct RestoreFile(Option<std::path::PathBuf>);
+impl Drop for RestoreFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 { let _ = std::fs::remove_file(path); }
+    }
+}
+
 impl SaveReceipt {
     pub fn apply_to(&self, wb: &mut Workbook) {
         for sheet in &mut wb.sheets {
@@ -552,16 +562,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // 宏部件：umya 写不出来，先留一份，写完塞回去
     let vba = crate::vba::read_vba(&base);
     // 原地保存时，写盘会把 base 覆盖掉——先把「要保住的那部分」复制一份出来
-    let restore_src = if base == path {
+    let restore_src = if base == path && base.exists() {
         let tmp = path.with_extension("preserve.tmp");
-        match std::fs::copy(&base, &tmp) {
-            Ok(_) => Some(tmp),
-            Err(_) => None,
-        }
+        std::fs::copy(&base, &tmp).context("无法保留原地保存基准")?;
+        Some(tmp)
     } else {
         None
     };
     let restore_base = restore_src.clone().unwrap_or_else(|| base.clone());
+    let _restore_cleanup = RestoreFile(restore_src);
     // 样式表在写之前先留一份：base 可能就是目标文件，写完再读就变味了
     let base_styles: Option<Vec<u8>> = if restore_base.exists() {
         crate::fixups::read_part(&restore_base, "xl/styles.xml")
@@ -871,22 +880,6 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
-    if let Some(t) = restore_src {
-        let _ = std::fs::remove_file(t);
-    }
-
-    // 透视表部件（必须等主体写完）
-    for (si, spec, res, rect, label) in wb.pivots_pending.iter() {
-        let name = wb
-            .sheets
-            .get(*si)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "Sheet1".to_string());
-        if let Err(e) = crate::pivot_xml::attach(path, &name, spec, res, *rect, label) {
-            eprintln!("[save] 透视表部件写入失败: {e:#}");
-        }
-    }
-
     // 表格对象：umya 会丢掉 tableParts，保存后自己挂回去
     for sheet in wb.sheets.iter() {
         if !sheet.tables.is_empty() && std::env::var("SC_NO_TABLE_ATTACH").is_err() {
@@ -1053,10 +1046,20 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             }
         }
         Ok(_) => {}
-        Err(e) => eprintln!("[save] 落盘失败: {e:#}"),
+        Err(e) => return Err(e).context("保存补丁落盘失败"),
     }
     if prof {
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());
+    }
+    // Session attachments were stripped from the private base. Rebuild them
+    // from the complete current model after all skeleton/relationship fixups,
+    // which must not overwrite the new registrations. No pending work is
+    // consumed: structural undo can still restore its specifications.
+    pivots::restore_imported_parts(path, &restore_base)?;
+    for (si, spec, res, rect, label) in &wb.pivots_pending {
+        let sheet = wb.sheets.get(*si).context("透视表所属工作表不存在")?;
+        crate::pivot_xml::attach_for_session(path, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
+            .context("透视表部件写入失败")?;
     }
     Ok(())
 }
