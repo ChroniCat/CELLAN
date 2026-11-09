@@ -8,6 +8,21 @@
 use std::collections::HashMap;
 use std::io::Write;
 
+/// Excel 缓存里的错误值是内部短名：#Div0/#NA/#Value/#Name/#Ref/#Num/#Null
+fn canon_err(s: &str) -> &str {
+    match s.trim() {
+        "#Div0" => "#DIV/0!",
+        "#NA" => "#N/A",
+        "#Value" => "#VALUE!",
+        "#Name" => "#NAME?",
+        "#Ref" => "#REF!",
+        "#Num" => "#NUM!",
+        "#Null" => "#NULL!",
+        "#GettingData" => "#GETTING_DATA",
+        other => other,
+    }
+}
+
 fn is_number(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
@@ -109,7 +124,10 @@ fn main() {
                 missing += 1;
                 continue;
             };
-            let got = cell.value.display();
+            let got_raw = cell.value.display();
+            let expect_x = canon_err(expect).to_string();
+            let got_x = canon_err(&got_raw).to_string();
+            let (expect, got) = (&expect_x, &got_x);
             // 文件里没写缓存值（常见于脚本生成的工作簿）就没法对照，单独计数
             if expect.trim().is_empty() && !got.trim().is_empty() {
                 no_cache += 1;
@@ -118,7 +136,7 @@ fn main() {
             let ok = match (is_number(expect), is_number(&got)) {
                 (Some(a), Some(b)) => {
                     if num_close(a, b) {
-                        if *expect == got {
+                        if expect == got {
                             same += 1;
                         } else {
                             close += 1;
@@ -129,7 +147,7 @@ fn main() {
                     }
                 }
                 _ => {
-                    if *expect == got {
+                    if expect == got {
                         same += 1;
                         true
                     } else {

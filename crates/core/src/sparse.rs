@@ -402,7 +402,7 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                             if let Some((text, anchor)) = masters.get(&si) {
                                 let dr = r as i64 - anchor.0 as i64;
                                 let dc = c as i64 - anchor.1 as i64;
-                                formula = Some(format!("={}", shift_refs(text, dr, dc)));
+                                formula = Some(crate::normalize_formula(&format!("={}", shift_refs(text, dr, dc))));
                             }
                         }
                     }
@@ -424,14 +424,14 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                                 masters.insert(si.clone(), (body.clone(), pos));
                             }
                             if let Some(f) = formula.as_mut() {
-                                *f = format!("={body}");
+                                *f = crate::normalize_formula(&format!("={body}"));
                             }
                         } else {
                             let derived = here
                                 .and_then(|pos| masters.get(&si).map(|(t, a)| {
                                     let dr = pos.0 as i64 - a.0 as i64;
                                     let dc = pos.1 as i64 - a.1 as i64;
-                                    format!("={}", shift_refs(t, dr, dc))
+                                    crate::normalize_formula(&format!("={}", shift_refs(t, dr, dc)))
                                 }))
                                 .unwrap_or_default();
                             formula = Some(derived);
@@ -439,7 +439,7 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                     } else if let Some(f) = formula.as_mut() {
                         let t = unescape(f.trim());
                         if !t.is_empty() {
-                            *f = format!("={t}");
+                            *f = crate::normalize_formula(&format!("={t}"));
                         }
                     }
                 }

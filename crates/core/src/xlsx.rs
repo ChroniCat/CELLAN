@@ -85,7 +85,10 @@ fn load_chunk(
                 if f.is_empty() {
                     continue;
                 }
-                let text = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
+                let text = {
+                    let raw = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
+                    crate::normalize_formula(&raw)
+                };
                 raw.formulas.push(((fr0 + row as u32, fc0 + col as u32), text));
             }
         }

@@ -37,3 +37,16 @@ pub mod sync;
 pub mod xlsx;
 
 pub use model::*;
+
+/// OOXML 把新函数写成 _xlfn.XLOOKUP、_xlfn._xlws.FILTER，LAMBDA 参数写成 _xlpm.x。
+/// 我们的函数表里没有这些前缀，统一剥掉。
+pub fn normalize_formula(text: &str) -> String {
+    if !text.contains("_xl") {
+        return text.to_string();
+    }
+    text.replace("_xlfn._xlws.", "")
+        .replace("_xlfn.", "")
+        .replace("_xlws.", "")
+        .replace("_xlpm.", "")
+        .replace("_xludf.", "")
+}
