@@ -84,8 +84,8 @@ struct FmtState {
     valign: u8,
     wrap: bool,
     format: String,
+    border: [bool; 4],
 }
-
 
 #[derive(Default, Clone)]
 struct EditState {
@@ -2781,6 +2781,12 @@ impl SheetApp {
             valign: st.valign,
             wrap: st.wrap,
             format: st.format,
+            border: [
+                st.border[0].style != 0,
+                st.border[1].style != 0,
+                st.border[2].style != 0,
+                st.border[3].style != 0,
+            ],
         };
         self.fmt_dlg = true;
     }
@@ -5159,6 +5165,22 @@ impl SheetApp {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
+                    ui.label("边框");
+                    for (label, idx) in [("左", 0usize), ("右", 1), ("上", 2), ("下", 3)] {
+                        let on = self.fmt_state.border[idx];
+                        if ui.selectable_label(on, label).clicked() {
+                            self.fmt_state.border[idx] = !on;
+                        }
+                    }
+                    if ui.button("外框").clicked() {
+                        self.fmt_state.border = [true; 4];
+                    }
+                    if ui.button("无").clicked() {
+                        self.fmt_state.border = [false; 4];
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
                     if ui.button("合并单元格").clicked() {
                         self.toggle_merge(true);
                     }
@@ -5177,6 +5199,26 @@ impl SheetApp {
                 });
             });
         if apply {
+            let borders = st.border;
+            let (r1, c1, r2, c2) = self.sel_rect();
+            self.apply_style_xy(move |s, r, c| {
+                for (i, on) in borders.iter().enumerate() {
+                    s.border[i].style = if *on { 1 } else { 0 };
+                }
+                // 外框：内部边不画
+                if borders[0] && c > c1 {
+                    s.border[0].style = 0;
+                }
+                if borders[1] && c < c2 {
+                    s.border[1].style = 0;
+                }
+                if borders[2] && r > r1 {
+                    s.border[2].style = 0;
+                }
+                if borders[3] && r < r2 {
+                    s.border[3].style = 0;
+                }
+            });
             self.apply_style(move |s| {
                 s.bold = st.bold;
                 s.italic = st.italic;
@@ -7939,6 +7981,9 @@ impl eframe::App for SheetApp {
                     if ui.button("图表管理").clicked() {
                         self.chart_mgr = true;
                         self.reload_charts();
+                    }
+                    if ui.button("插入表格").clicked() {
+                        self.make_table();
                     }
                     if ui.button("批注").clicked() {
                         let (r, c) = self.sel;
