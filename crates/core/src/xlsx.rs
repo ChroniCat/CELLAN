@@ -341,6 +341,10 @@ pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook.xlsx".into());
     let tmp = dir.join(format!(".~{name}.saving-{}", std::process::id()));
+    // 覆盖前把旧版本留一份（第一次保存时什么都不做）
+    if let Err(e) = std::panic::catch_unwind(|| crate::backup::keep_previous(path)) {
+        eprintln!("[save] 历史版本失败: {e:?}");
+    }
     if let Err(e) = save(&tmp, wb) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);

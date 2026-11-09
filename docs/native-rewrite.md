@@ -1185,3 +1185,43 @@ share_test.xlsx · 张三 正在编辑 - Sheets Native     ← 没连上，但�
 reg query HKCU\Software\Classes\SheetFlow.Native.Sheet\shell\open\command
   (Default)  REG_SZ  "<workspace>\native\target\debug\app.exe" "%1"
 ```
+
+## 保存历史 / 自动更新 / 最近文件（v1.37）
+
+**1. 历史版本**（`sheetcore::backup`）
+
+每次 `save_atomic` 覆盖前，把旧文件复制到工作簿旁边的
+`.~sheetflow-history/<文件名>/<时间戳>-<文件名>`，默认保留 10 份，超出删最旧。
+
+- 放同目录而不是本机：网盘上的工作簿换个人打开也能翻到历史
+- 同一秒内保存两次会加序号，不会互相覆盖
+- 菜单「文件 → 历史版本…」列出可用版本，点一下就在编辑器里打开（另存为新文件即保留）
+- 单测覆盖：首次保存不留空历史、留存的字节与原文件一致、只保留最近 N 份
+
+**2. 自动更新**（`app::update`）
+
+共享目录发版，不需要更新服务器：
+
+```
+Z:\软件\Sheets\
+  manifest.txt        version=1.38 / exe=SheetsNative-1.38.exe / sha256=...
+  SheetsNative-1.38.exe
+```
+
+启动时或菜单「文件 → 检查更新…」比对版本号；有新版就复制到
+`%LOCALAPPDATA%\SheetsNative\updates\pending-<版本>.exe`，**校验 SHA-256**，
+通过后写一个 `apply-update.cmd`，等本进程退出再替换 exe 并重启。
+哈希不符直接丢弃并报错——共享盘上半截复制很常见，宁可装不上也不装坏的。
+
+实测：
+
+```
+[update] 发现新版本 99.0，已下载并校验；关闭窗口后自动替换并重启
+updates 目录：pending-99.0.exe
+```
+
+**3. 最近文件 / 启动页**（`app::recent`）
+
+`%LOCALAPPDATA%\SheetsNative\recent.txt` 存最近 12 个路径（新的在上，去重）。
+不带文件参数启动时显示启动页：最近文件列表（文件名 + 所在目录）、打开文件、新建空白。
+列表只显示仍然存在的文件，网盘断开或文件被删会自动剔除。

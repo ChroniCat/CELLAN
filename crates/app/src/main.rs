@@ -1,5 +1,7 @@
 mod files;
 mod net;
+mod recent;
+mod update;
 mod session_lock;
 mod single_instance;
 
@@ -114,6 +116,11 @@ struct SheetApp {
     /// 别的进程问"你开的是不是这个文件"
     open_requests: Option<std::sync::mpsc::Receiver<PathBuf>>,
     shared_current_file: Option<std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>>,
+    /// 没带文件启动时显示最近文件
+    show_start: bool,
+    update_done: bool,
+    /// 历史版本窗口：(工作簿路径, 版本列表)
+    history_view: Option<(PathBuf, Vec<sheetcore::backup::Version>)>,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -295,6 +302,9 @@ impl SheetApp {
             last_title: String::new(),
             open_requests: None,
             shared_current_file: None,
+            show_start: false,
+            update_done: false,
+            history_view: None,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -438,6 +448,9 @@ impl SheetApp {
                     self.scroll = Vec2::ZERO;
                     self.editing = None;
                     self.doc_gen = 0;
+                    if let Some(p) = self.wb.path.clone() {
+                        recent::touch(&p);
+                    }
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
                     eprintln!("[open] 已显示缓存值 {n} 格");
@@ -2970,6 +2983,19 @@ impl SheetApp {
                 }
                 if ui.button("导出 PDF…").clicked() {
                     self.export_pdf_dialog();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("历史版本…").clicked() {
+                    if let Some(p) = self.wb.path.clone() {
+                        self.history_view = Some((p.clone(), sheetcore::backup::list(&p)));
+                    } else {
+                        self.status = "先保存文件，才有历史版本".into();
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("检查更新…").clicked() {
+                    self.check_update();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -6475,6 +6501,171 @@ impl SheetApp {
         eprintln!("[assoc] {}", self.status);
     }
 
+
+    /// 启动页：没指定文件时列出最近打开的
+    fn start_page(&mut self, ctx: &egui::Context) {
+        if !self.show_start {
+            return;
+        }
+        let mut open_wanted: Option<PathBuf> = None;
+        let mut close = false;
+        egui::Window::new("开始")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("Sheets Native");
+                ui.label(
+                    egui::RichText::new(format!("版本 {}", update::VERSION)).weak(),
+                );
+                ui.separator();
+                let list = recent::load();
+                if list.is_empty() {
+                    ui.label("还没有打开过文件。");
+                } else {
+                    ui.label(egui::RichText::new("最近打开").strong());
+                    for p in list {
+                        let name = p
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("{name}\n{dir}")).size(13.0),
+                                )
+                                .min_size(egui::vec2(420.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            open_wanted = Some(p.clone());
+                        }
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("打开文件…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
+                            .pick_file()
+                        {
+                            open_wanted = Some(p);
+                        }
+                    }
+                    if ui.button("新建空白").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(p) = open_wanted {
+            self.show_start = false;
+            self.open_path(p);
+        } else if close {
+            self.show_start = false;
+        }
+    }
+
+    /// 历史版本窗口
+    fn history_window(&mut self, ctx: &egui::Context) {
+        let Some((file, versions)) = self.history_view.clone() else { return };
+        let mut open = true;
+        let mut restore: Option<PathBuf> = None;
+        let mut close = false;
+        egui::Window::new("历史版本")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}（最多保留 {} 份，每次覆盖前自动留存）",
+                        file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                        sheetcore::backup::KEEP
+                    ))
+                    .weak(),
+                );
+                ui.separator();
+                if versions.is_empty() {
+                    ui.label("还没有历史版本——先保存一次试试。");
+                }
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for v in &versions {
+                        ui.horizontal(|ui| {
+                            let kb = v.bytes as f64 / 1024.0;
+                            ui.label(
+                                egui::RichText::new(format!("{}  ·  {kb:.0} KB", v.stamp)).monospace(),
+                            );
+                            if ui.button("打开这一版").clicked() {
+                                restore = Some(v.path.clone());
+                            }
+                        });
+                    }
+                });
+                ui.separator();
+                if ui.button("关闭").clicked() {
+                    close = true;
+                }
+            });
+        if let Some(p) = restore {
+            self.status = "已打开历史版本（另存为新文件即可保留）".into();
+            self.open_path(p);
+            self.history_view = None;
+            return;
+        }
+        if !open || close {
+            self.history_view = None;
+        }
+    }
+
+
+    /// 从共享目录检查更新：有新版就下到本地，关窗时替换
+    fn check_update(&mut self) {
+        let dir = match update::dir() {
+            Some(d) => d,
+            None => {
+                let Some(p) = rfd::FileDialog::new()
+                    .set_title("选择发版目录（放 manifest.txt 和新版 exe）")
+                    .pick_folder()
+                else {
+                    return;
+                };
+                if let Err(e) = update::set_dir(&p) {
+                    self.status = format!("记住发版目录失败：{e}");
+                    return;
+                }
+                p
+            }
+        };
+        match update::check(&dir) {
+            Ok(None) => self.status = format!("已是最新版本（{}）", update::VERSION),
+            Ok(Some(remote)) => match update::stage(&remote) {
+                Ok(staged) => match update::apply_on_exit(&staged) {
+                    Ok(_) => {
+                        self.status = format!(
+                            "发现新版本 {}，已下载并校验；关闭窗口后自动替换并重启",
+                            remote.version
+                        );
+                    }
+                    Err(e) => self.status = format!("准备替换脚本失败：{e}"),
+                },
+                Err(e) => self.status = format!("下载更新失败：{e}"),
+            },
+            Err(e) => self.status = format!("检查更新失败：{e}"),
+        }
+        eprintln!("[update] {}", self.status);
+    }
+
+
+    /// 自检：启动后跑一次检查更新
+    fn update_probe(&mut self) {
+        if std::env::var("SC_UPDATE_CHECK").is_err() || self.update_done {
+            return;
+        }
+        self.update_done = true;
+        self.check_update();
+    }
+
     fn join_shared(&mut self) {
         let site = rand_site();
         let addr = self.join_addr.trim().to_string();
@@ -6774,6 +6965,9 @@ impl eframe::App for SheetApp {
         self.macro_run_probe();
         self.tick_session();
         self.poll_open_requests();
+        self.update_probe();
+        self.start_page(ctx);
+        self.history_window(ctx);
         self.update_window_title(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
@@ -7212,6 +7406,7 @@ fn run_app(
             Box::new(move |cc| {
                 let mut app = SheetApp::new(cc, initial.clone());
                 app.open_requests = open_requests.borrow_mut().take();
+                app.show_start = initial.is_none();
                 app.shared_current_file = Some(current_file.clone());
                 if let Some(pw) = auto_pass.clone() {
                     app.room_password = pw;
