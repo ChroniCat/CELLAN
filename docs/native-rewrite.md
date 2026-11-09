@@ -1420,3 +1420,50 @@ Excel 复制单元格时，剪贴板上同时放了纯文本(TSV)、HTML 和几�
 ```
 cargo run --release -p sheetcore --example font_set -- in.xlsx out.xlsx B3 宋体
 ```
+
+### v1.47 三项补齐：跨工作簿引用 / 带公式粘贴 / 修订日志
+
+**跨工作簿引用**
+
+- 文件里的写法是 `[1]预算!A1`——方括号里是**链接序号**，不是文件名；文件名在
+  `xl/externalLinks/externalLink1.xml` 的 rels 里，缓存是同部件的 `<sheetDataSet>`。
+- 新模块 `xlinks`：解析 `externalReferences → rels → sheetNames + 缓存`；写回只重写
+  刷新过的 `sheetDataSet`，没刷新一个字节都不动。
+- 公式：词法认 `[book]`，语法覆盖 `[1]Sheet!A1`、`[书名]Sheet!A1`、`'[书名]Sheet'!A1` 和区域；
+  求值从缓存取，整列引用按缓存边界裁剪；SUM 那批聚合快路径遇到外部引用改走通用路径。
+- 手输 `=[预算.xlsx]Sheet1!A1`：自动登记链接、读源文件填缓存，保存时补齐
+  `externalLink` 部件 + `workbook.xml` 的 `<externalReferences>` + rels + Content_Types。
+- 「数据 → 编辑链接…」列出文件/表/缓存格数，可全部更新或断开；更新后重算，
+  存盘时把新缓存同时写进 `<sheetDataSet>` 和单元格的 `<v>`（别人不更新链接也看到新数字）。
+- 公式栏与编辑框把 `[1]` 显示成文件名，提交时折回 `[N]`（Excel 只认序号形式）。
+
+验收（Excel 16.0）：改源文件 A1=100 → 应用里更新链接 → 存盘 → Excel 打开：
+`链接=1`，A1=100 A2=150 A3=201 A5=120，公式仍是 `SUM('…[ext_plan_src2.xlsx]预算'!A1:A3)`。
+
+**带公式粘贴**
+
+- 实测剪贴板 21 种格式，真正需要的是 **XML Spreadsheet**（1.3 KB）：
+  `<Cell ss:Formula="=RC[-1]+R[1]C[-1]"><Data ss:Type="Number">3</Data></Cell>`，
+  连字体名/字号/边框/数字格式都带。Embed Source（OLE/CFB，BIFF8）和 Biff12（.xlsb 的 zip）
+  不需要碰。
+- 新模块 `clipboard_xmlss`：解析 Styles/Cell（`ss:Index` 补空、`MergeAcross/Down` 合并）+
+  **R1C1→A1**（`R[±n]C[±n]`、`RnCn`、`RC`，字符串里的 R/C 不误伤）；内置格式名翻译
+  （Fixed→0.00、Standard→#,##0.00、Percent、Currency、日期/时间）。
+- 粘贴：XML Spreadsheet 优先，没有才退回 HTML（原行为不变）；公式按 A1 写入 + 缓存值按类型
+  回填，粘完只重算粘进来的格子。
+
+验收：从 Excel 复制 A1=1、A2=2、B1=`=A1+A2`、B2=`=A1*10`（宋体 12、0.00）→
+粘到我们这：B1/B2 是公式，A1 改成 5 后 B1=7，字体字号格式都对。
+
+**修订日志**
+
+- 不做 Excel 的 Track Changes（共享工作簿 + `<revisions>` 部件，365 已弃用、LibreOffice 不认）；
+  改成随文件走的 JSONL：`<同目录>/.~sheetflow-history/<文件名>/revisions.jsonl`。
+- 所有本地编辑都汇聚在 `txn_end`，自动记一条（值/公式/整份 CellStyle）；远端 Op 记
+  "远端编辑"，只展示不撤回。日志 8 MB 轮转。
+- 审阅 →「修订记录…」：倒序列出（谁/多久前/动作/位置/前后值），点位置跳过去；
+  撤回前逐格比对"当前值是否还等于 after"，被改过就拒绝，撤回本身再记一条。
+
+验收：改字体 → 日志两条（设置格式 宋体→黑体 / 撤回修订 黑体→宋体），单元格回到黑体。
+
+**测试**：274 → **307**（新增外部链接 6 + 剪贴板 4 + 修订 4 + 界面 3）。
