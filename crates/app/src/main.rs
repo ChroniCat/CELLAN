@@ -74,6 +74,20 @@ struct FindState {
 
 #[derive(Default, Clone)]
 
+struct FmtState {
+    bold: bool,
+    italic: bool,
+    size: f32,
+    color: [u8; 3],
+    fill: Option<[u8; 3]>,
+    halign: u8,
+    valign: u8,
+    wrap: bool,
+    format: String,
+}
+
+
+#[derive(Default, Clone)]
 struct EditState {
     buf: String,
 }
@@ -177,6 +191,11 @@ struct SheetApp {
     zoom: f32,
     /// 功能区当前页签：0 文件 1 开始 2 插入 3 公式 4 数据 5 视图
     ribbon_tab: usize,
+    /// 单元格格式对话框
+    fmt_dlg: bool,
+    fmt_state: FmtState,
+    /// 标签拖拽排序
+    tab_drag: Option<usize>,
     /// 名称框
     name_buf: String,
     name_edit: bool,
@@ -376,6 +395,9 @@ impl SheetApp {
             find: FindState::default(),
             zoom: 1.0,
             ribbon_tab: 1,
+            fmt_dlg: false,
+            fmt_state: FmtState::default(),
+            tab_drag: None,
             name_buf: String::new(),
             name_edit: false,
             rename_sheet: None,
@@ -2744,6 +2766,25 @@ impl SheetApp {
         (r.max(0) as u32, c.max(0) as u32)
     }
 
+    /// 打开单元格格式对话框，先读选区左上角的样式
+    fn open_format_dialog(&mut self) {
+        let (r, c) = self.sel;
+        let id = self.wb.sheet(self.sheet_idx).style_of(r, c);
+        let st = self.wb.styles.get(id).clone();
+        self.fmt_state = FmtState {
+            bold: st.bold,
+            italic: st.italic,
+            size: st.size,
+            color: st.color,
+            fill: st.fill,
+            halign: st.halign,
+            valign: st.valign,
+            wrap: st.wrap,
+            format: st.format,
+        };
+        self.fmt_dlg = true;
+    }
+
     /// 名称框：支持 A1、A1:B2、以及定义名称
     fn goto_name(&mut self) {
         let text = self.name_buf.trim().to_string();
@@ -3032,6 +3073,10 @@ impl SheetApp {
             self.sel = (r, c);
             self.sel_end = (r, c);
             self.ensure_visible();
+            return;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Num1)) {
+            self.open_format_dialog();
             return;
         }
         let (mut dr, mut dc) = (0i64, 0i64);
@@ -5029,6 +5074,128 @@ impl SheetApp {
     }
 
     /// 工作表重命名
+    fn format_dialog(&mut self, ctx: &egui::Context) {
+        if !self.fmt_dlg {
+            return;
+        }
+        let mut open = self.fmt_dlg;
+        let mut apply = false;
+        let st = self.fmt_state.clone();
+        egui::Window::new("设置单元格格式")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.fmt_state.bold, "粗体");
+                    ui.checkbox(&mut self.fmt_state.italic, "斜体");
+                    ui.checkbox(&mut self.fmt_state.wrap, "自动换行");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("字号");
+                    ui.add(egui::DragValue::new(&mut self.fmt_state.size).range(6.0..=72.0));
+                    ui.label("字色");
+                    ui.color_edit_button_srgb(&mut self.fmt_state.color);
+                    let mut has_fill = self.fmt_state.fill.is_some();
+                    if ui.checkbox(&mut has_fill, "填充").changed() {
+                        self.fmt_state.fill = if has_fill { Some([255, 255, 0]) } else { None };
+                    }
+                    if let Some(f) = self.fmt_state.fill.as_mut() {
+                        ui.color_edit_button_srgb(f);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("水平");
+                    for (label, v) in [("常规", 0u8), ("左", 1), ("中", 2), ("右", 3)] {
+                        if ui
+                            .selectable_label(self.fmt_state.halign == v, label)
+                            .clicked()
+                        {
+                            self.fmt_state.halign = v;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("垂直");
+                    for (label, v) in [("常规", 0u8), ("上", 1), ("中", 2), ("下", 3)] {
+                        if ui
+                            .selectable_label(self.fmt_state.valign == v, label)
+                            .clicked()
+                        {
+                            self.fmt_state.valign = v;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("数字格式");
+                    egui::ComboBox::from_id_salt("fmt_dlg_num")
+                        .selected_text(if self.fmt_state.format.is_empty() {
+                            "常规".to_string()
+                        } else {
+                            self.fmt_state.format.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            for (label, code) in [
+                                ("常规", ""),
+                                ("0", "0"),
+                                ("0.00", "0.00"),
+                                ("#,##0", "#,##0"),
+                                ("#,##0.00", "#,##0.00"),
+                                ("0%", "0%"),
+                                ("0.00%", "0.00%"),
+                                ("yyyy-mm-dd", "yyyy-mm-dd"),
+                                ("yyyy/mm/dd", "yyyy/mm/dd"),
+                            ] {
+                                if ui
+                                    .selectable_label(self.fmt_state.format == code, label)
+                                    .clicked()
+                                {
+                                    self.fmt_state.format = code.to_string();
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("合并单元格").clicked() {
+                        self.toggle_merge(true);
+                    }
+                    if ui.button("取消合并").clicked() {
+                        self.toggle_merge(false);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.fmt_dlg = false;
+                    }
+                });
+            });
+        if apply {
+            self.apply_style(move |s| {
+                s.bold = st.bold;
+                s.italic = st.italic;
+                s.size = st.size;
+                s.color = st.color;
+                s.fill = st.fill;
+                s.halign = st.halign;
+                s.valign = st.valign;
+                s.wrap = st.wrap;
+                s.format = st.format.clone();
+            });
+            self.fmt_dlg = false;
+            self.status = "已应用格式".into();
+        }
+        if !open {
+            self.fmt_dlg = false;
+        }
+    }
+
     fn rename_dialog(&mut self, ctx: &egui::Context) {
         let Some((idx, mut name)) = self.rename_sheet.take() else { return };
         let mut open = true;
@@ -7648,6 +7815,7 @@ impl eframe::App for SheetApp {
             self.compute_invalid();
         }
         self.rename_dialog(ctx);
+        self.format_dialog(ctx);
         // 缩放：Ctrl+滚轮
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if ctrl && wheel.abs() > 0.5 {
@@ -7771,6 +7939,17 @@ impl eframe::App for SheetApp {
                     if ui.button("图表管理").clicked() {
                         self.chart_mgr = true;
                         self.reload_charts();
+                    }
+                    if ui.button("批注").clicked() {
+                        let (r, c) = self.sel;
+                        let cur = self
+                            .wb
+                            .sheet(self.sheet_idx)
+                            .notes
+                            .get(&sheetcore::model::CellRef::new(r, c))
+                            .map(|n| n.text.clone())
+                            .unwrap_or_default();
+                        self.note_edit = Some((r, c, cur));
                     }
                     if ui.button("数据透视表").clicked() {
                         let (r, c) = self.sel;
@@ -7938,6 +8117,23 @@ impl eframe::App for SheetApp {
                 for i in 0..self.wb.sheets.len() {
                     let name = self.wb.sheets[i].name.clone();
                     let resp = ui.selectable_label(self.sheet_idx == i, name.clone());
+                    if resp.drag_started() {
+                        self.tab_drag = Some(i);
+                    }
+                    if let Some(from) = self.tab_drag {
+                        if from != i && resp.hovered() && ui.input(|i| i.pointer.any_down()) {
+                            self.wb.sheets.swap(from, i);
+                            if self.sheet_idx == from {
+                                self.sheet_idx = i;
+                            } else if self.sheet_idx == i {
+                                self.sheet_idx = from;
+                            }
+                            self.tab_drag = Some(i);
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.tab_drag = None;
+                    }
                     if resp.clicked() {
                         self.commit_edit(None);
                         goto = Some(i);
