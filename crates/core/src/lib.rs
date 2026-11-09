@@ -43,6 +43,39 @@ pub use model::*;
 
 /// 整列/整行引用在 OOXML 里写作 `Sheet!A:C`，解析器要求带行号。
 /// 加载时直接改写成 `Sheet!$A$1:$C$1048576`，省得词法再分一套规则。
+fn match_cols(chars: &[char], i: usize) -> Option<(usize, String, String)> {
+    let mut j = i;
+    if j < chars.len() && chars[j] == '$' {
+        j += 1;
+    }
+    let ls = j;
+    while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls < 3 {
+        j += 1;
+    }
+    if j == ls || j >= chars.len() || chars[j] != ':' {
+        return None;
+    }
+    let first: String = chars[ls..j].iter().collect();
+    j += 1;
+    if j < chars.len() && chars[j] == '$' {
+        j += 1;
+    }
+    let ls2 = j;
+    while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls2 < 3 {
+        j += 1;
+    }
+    if j == ls2 {
+        return None;
+    }
+    let second: String = chars[ls2..j].iter().collect();
+    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(') {
+        return None;
+    }
+    Some((j, first, second))
+}
+
+/// 整列引用 `A:C`（可带表名前缀）在 OOXML 里不带行号，
+/// 加载时改写成 `$A$1:$C$1048576`，求值时再按实际使用范围裁剪。
 fn expand_whole_cols(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len() + 24);
@@ -56,54 +89,19 @@ fn expand_whole_cols(text: &str) -> String {
             i += 1;
             continue;
         }
-        if c == '!' && !in_str {
-            out.push('!');
-            i += 1;
-            let start = i;
-            // [$]字母{1,3} : [$]字母{1,3}
-            let mut j = i;
-            let mut ok = true;
-            // 第一段：[$]字母{1,3}
-            if j < chars.len() && chars[j] == '$' {
-                j += 1;
-            }
-            let ls = j;
-            while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls < 3 {
-                j += 1;
-            }
-            if j == ls || j >= chars.len() || chars[j] != ':' {
-                ok = false;
-            } else {
-                j += 1;
-                // 第二段：[$]字母{1,3}
-                if j < chars.len() && chars[j] == '$' {
-                    j += 1;
-                }
-                let ls2 = j;
-                while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls2 < 3 {
-                    j += 1;
-                }
-                if j == ls2 {
-                    ok = false;
+        if !in_str {
+            let boundary = i == 0
+                || !(chars[i - 1].is_ascii_alphanumeric()
+                    || chars[i - 1] == '$'
+                    || chars[i - 1] == '.'
+                    || chars[i - 1] == '_');
+            if boundary {
+                if let Some((end, a, b)) = match_cols(&chars, i) {
+                    out.push_str(&format!("${a}$1:${b}$1048576"));
+                    i = end;
+                    continue;
                 }
             }
-            let tail_ok = j >= chars.len() || !(chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(');
-            if ok && tail_ok && j > start {
-                let raw: String = chars[start..j].iter().collect();
-                let raw = raw.trim_end_matches(':');
-                if let Some((a, b)) = raw.split_once(':') {
-                    let a = a.trim_start_matches('$');
-                    let b = b.trim_start_matches('$');
-                    if a.chars().all(|x| x.is_ascii_alphabetic())
-                        && b.chars().all(|x| x.is_ascii_alphabetic())
-                    {
-                        out.push_str(&format!("${a}$1:${b}$1048576"));
-                        i = j;
-                        continue;
-                    }
-                }
-            }
-            continue;
         }
         out.push(c);
         i += 1;

@@ -44,6 +44,8 @@ pub enum BinOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
+    /// 省略的实参：`VLOOKUP(x, r, 3, )` 里的空位
+    Empty,
     Name(String),
     Number(f64),
     Text(String),
@@ -470,7 +472,12 @@ impl Parser {
                         loop {
                             // 允许省略参数（如 IF(A1,,1)）
                             if matches!(self.peek(), Some(Tok::Comma)) {
-                                args.push(Node::Err(ErrKind::Value));
+                                args.push(Node::Empty);
+                            } else if matches!(self.peek(), Some(Tok::RParen)) {
+                                // 末尾省略：VLOOKUP(x, r, 3, )
+                                args.push(Node::Empty);
+                                self.pos += 1;
+                                break;
                             } else {
                                 args.push(self.parse_expr()?);
                             }
@@ -777,7 +784,8 @@ impl<'a> Calc<'a> {
             let raw = f.strip_prefix('=').unwrap_or(f).to_string();
             // 结构化引用：Table1[列] → A1 区域
             let expanded = crate::table::expand_structured(self.wb, si, &raw).unwrap_or(raw);
-            let body = expanded.as_str();
+            let normalized = crate::normalize_formula(&expanded);
+            let body = normalized.as_str();
             if !self.visiting.insert(key) {
                 CYCLE_CELLS.with(|cells| {
                     cells.borrow_mut().insert(key);
@@ -835,6 +843,7 @@ impl<'a> Calc<'a> {
 
     pub fn eval_node(&mut self, node: &Node, si: usize) -> FValue {
         match node {
+            Node::Empty => FValue::Empty,
             Node::Name(n) => {
                 if let Some(v) = self.env_stack.iter().rev().find_map(|m| m.get(n).cloned()) {
                     return v;
@@ -2294,7 +2303,8 @@ pub fn eval_cell(wb: &Workbook, si: usize, r: u32, c: u32) -> FValue {
 pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
     let raw = formula.strip_prefix('=').unwrap_or(formula).to_string();
     let expanded = crate::table::expand_structured(wb, si, &raw).unwrap_or(raw);
-    let body = expanded.as_str();
+    let normalized = crate::normalize_formula(&expanded);
+    let body = normalized.as_str();
     match parse(body) {
         Ok(node) => {
             let mut calc = Calc::new(wb);
