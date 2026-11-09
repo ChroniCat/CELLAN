@@ -2092,18 +2092,36 @@ impl SheetApp {
             for cell in row {
                 let r = r0 + ri as u32;
                 let c = c0 + ci;
-                // 值
+                // 值：带公式的按缓存值类型走，之后统一重算
                 let text = cell.text.trim();
-                let value = if text.is_empty() {
+                let value = if cell.formula.is_some() {
+                    match cell.kind {
+                        0 => text
+                            .replace(',', "")
+                            .parse::<f64>()
+                            .map(Value::Number)
+                            .unwrap_or(Value::Empty),
+                        2 => Value::Bool(text == "1" || text.eq_ignore_ascii_case("true")),
+                        _ => {
+                            if text.is_empty() {
+                                Value::Empty
+                            } else {
+                                Value::Text(text.into())
+                            }
+                        }
+                    }
+                } else if text.is_empty() {
                     Value::Empty
                 } else if let Ok(n) = text.replace(',', "").parse::<f64>() {
                     Value::Number(n)
                 } else {
                     Value::Text(text.into())
                 };
-                self.wb
-                    .sheet_mut(si)
-                    .set(r, c, Cell { value, formula: None });
+                self.wb.sheet_mut(si).set(
+                    r,
+                    c,
+                    Cell { value, formula: cell.formula.as_deref().map(|f| f.into()) },
+                );
 
                 // 格式
                 let base_id = self.wb.sheet(si).style_of(r, c);
@@ -2138,6 +2156,22 @@ impl SheetApp {
                     }
                     touched = true;
                 }
+                // XML Spreadsheet 还带了字体名/字号/数字格式，HTML 那条路没有
+                if !cell.font.is_empty() {
+                    let f = sheetcore::style::normalize_font(&cell.font);
+                    if f != st.font {
+                        st.font = f;
+                        touched = true;
+                    }
+                }
+                if cell.size > 0.0 && (cell.size - st.size).abs() > 0.01 {
+                    st.size = cell.size;
+                    touched = true;
+                }
+                if !cell.num_format.is_empty() && cell.num_format != st.format {
+                    st.format = cell.num_format.clone();
+                    touched = true;
+                }
                 if touched {
                     let id = self.wb.styles.intern(st.clone());
                     self.wb.sheet_mut(si).set_style(r, c, id);
@@ -2159,6 +2193,25 @@ impl SheetApp {
                 }
             }
             sheet.merges_dirty = true;
+        }
+
+        // 公式要立刻算出来（Excel 复制过来的是 R1C1 折算后的 A1）
+        let fkeys: Vec<(usize, u32, u32)> = (0..rows)
+            .flat_map(|ri| (0..cols).map(move |ci| (r0 + ri, c0 + ci)))
+            .filter(|(r, c)| {
+                self.wb
+                    .sheet(si)
+                    .get(*r, *c)
+                    .map(|x| x.formula.is_some())
+                    .unwrap_or(false)
+            })
+            .map(|(r, c)| (si, r, c))
+            .collect();
+        if !fkeys.is_empty() {
+            for k in &fkeys {
+                self.deps.update_cell(&self.wb, *k);
+            }
+            sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
         }
 
         self.txn_end("从 Excel 粘贴", txn);
@@ -7412,8 +7465,40 @@ impl SheetApp {
                     cs.fill,
                     sh.merges.len()
                 );
+                for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+                    if let Some(x) = sh.get(r, c) {
+                        let sid = sh.style_of(r, c);
+                        let st = self.wb.styles.get(sid);
+                        eprintln!(
+                            "[paste] ({r},{c}) 值={:?} 公式={:?} 字体={:?} 字号={} 格式={:?}",
+                            x.value.display(),
+                            x.formula,
+                            st.font,
+                            st.size,
+                            st.format
+                        );
+                    }
+                }
             }
             None => eprintln!("[paste] 剪贴板里没有 HTML 表格"),
+        }
+        if std::env::var("SC_PASTE_CHECK").is_ok() {
+            // 改一下被引用的格子，看粘进来的公式是不是活的
+            let key = (self.sheet_idx, 0u32, 0u32);
+            if let Some(c) = self.wb.sheet(self.sheet_idx).get(0, 0).cloned() {
+                let mut c2 = c;
+                c2.value = Value::Number(5.0);
+                self.wb.sheet_mut(self.sheet_idx).set(0, 0, c2);
+                self.deps.update_cell(&self.wb, key);
+                sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
+                let b1 = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .get(0, 1)
+                    .map(|x| x.value.display())
+                    .unwrap_or_default();
+                eprintln!("[paste] A1=5 后 B1={b1:?}（应 7）");
+            }
         }
     }
 

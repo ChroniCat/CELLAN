@@ -77,6 +77,13 @@ pub struct OfficeCell {
     pub rowspan: u32,
     /// 有边框（简化为细实线，颜色取解析到的或黑）
     pub border: Option<[u8; 3]>,
+    /// 公式（A1 形式、带 `=`）；来自 XML Spreadsheet 那条路径
+    pub formula: Option<String>,
+    /// 缓存值类型：0 数字 1 文本 2 布尔 3 日期
+    pub kind: u8,
+    pub font: String,
+    pub size: f32,
+    pub num_format: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,8 +100,16 @@ impl OfficeBlock {
     }
 }
 
-/// 从系统剪贴板读 Excel 区域；没有 HTML 表格就返回 None
+/// 从系统剪贴板读 Excel 区域。
+///
+/// 优先 **XML Spreadsheet**：它带公式（R1C1）、值类型、字体名/字号/数字格式；
+/// 没有这个格式（非 Excel 来源）才退回 HTML（带合并和底色，但没有公式）。
 pub fn read_table() -> Option<OfficeBlock> {
+    if let Some(b) = read_xmlss() {
+        if !b.is_empty() {
+            return Some(b);
+        }
+    }
     unsafe {
         let fmt = {
             let name = wide("HTML Format");
@@ -317,5 +332,89 @@ mod tests {
     #[test]
     fn rgb_notation() {
         assert_eq!(style_color("background-color:rgb(1,2,3)", "background-color"), Some([1, 2, 3]));
+    }
+}
+
+/// 读 "XML Spreadsheet"（Excel 复制时总会放一份），解析成我们的块
+fn read_xmlss() -> Option<OfficeBlock> {
+    unsafe {
+        let name = wide("XML Spreadsheet");
+        let fmt = RegisterClipboardFormatW(name.as_ptr());
+        if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
+            return None;
+        }
+        let raw = read_format_raw(fmt)?;
+        let text = String::from_utf8_lossy(&raw);
+        let xml = text.trim_end_matches(' ');
+        let parsed = sheetcore::clipboard_xmlss::parse(xml);
+        if parsed.is_empty() {
+            return None;
+        }
+        Some(convert_block(parsed))
+    }
+}
+
+fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock {
+    use sheetcore::clipboard_xmlss::Kind;
+    let mut rows = Vec::with_capacity(b.rows.len());
+    for row in b.rows {
+        let mut out = Vec::with_capacity(row.len());
+        for c in row {
+            let kind = match c.kind {
+                Kind::Number => 0,
+                Kind::Text => 1,
+                Kind::Bool => 2,
+                Kind::DateTime => 3,
+                Kind::Error => 0,
+            };
+            out.push(OfficeCell {
+                text: c.text,
+                bold: c.style.bold,
+                italic: c.style.italic,
+                fill: c.style.fill,
+                color: c.style.color,
+                halign: c.style.halign,
+                colspan: c.colspan.max(1),
+                rowspan: c.rowspan.max(1),
+                border: c.style.border,
+                formula: c.formula,
+                kind,
+                font: c.style.font,
+                size: c.style.size,
+                num_format: c.style.num_format,
+            });
+        }
+        rows.push(out);
+    }
+    OfficeBlock { rows }
+}
+
+/// 读整块内存（二进制格式不能按 NUL 截断）
+fn read_format_raw(fmt: u32) -> Option<Vec<u8>> {
+    if fmt == 0 {
+        return None;
+    }
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(fmt);
+        if handle.is_null() {
+            CloseClipboard();
+            return None;
+        }
+        let ptr = GlobalLock(handle) as *const u8;
+        if ptr.is_null() {
+            CloseClipboard();
+            return None;
+        }
+        let size = GlobalSize(handle);
+        let mut buf = Vec::with_capacity(size);
+        for i in 0..size {
+            buf.push(*ptr.add(i));
+        }
+        GlobalUnlock(handle);
+        CloseClipboard();
+        Some(buf)
     }
 }
