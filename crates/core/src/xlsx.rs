@@ -201,7 +201,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     if std::io::Read::read_to_string(&mut f, &mut xml).is_ok() {
                         for (r, c, text) in crate::sparse::fix_shared_children(&xml) {
                             let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
-                            cell.formula = Some(text.into());
+                            cell.formula = Some(crate::normalize_formula(&text).into());
                             sheet.set(r, c, cell);
                         }
                     }

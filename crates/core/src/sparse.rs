@@ -296,6 +296,23 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
                     }
                 }
             }
+            Ok(Event::Empty(e)) => {
+                if tag_start(&e) == "f" {
+                    let mut si2: Option<String> = None;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "si" {
+                            si2 = Some(a.value.as_ref().to_string());
+                        }
+                    }
+                    if let (Some(si), Some(pos)) = (si2, cell_ref) {
+                        if let Some((mt, anchor)) = masters.get(&si) {
+                            let dr = pos.0 as i64 - anchor.0 as i64;
+                            let dc = pos.1 as i64 - anchor.1 as i64;
+                            out.push((pos.0, pos.1, format!("={}", shift_refs(mt, dr, dc))));
+                        }
+                    }
+                }
+            }
             Ok(Event::Text(t)) => {
                 if in_f {
                     body.push_str(t.as_ref());

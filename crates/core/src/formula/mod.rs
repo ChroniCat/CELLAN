@@ -621,6 +621,8 @@ pub struct Calc<'a> {
     range_cache: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<Vec<FValue>>>,
     /// 每张表的实际使用范围（最大行、最大列）
     bounds: HashMap<usize, (u32, u32)>,
+    /// 递归深度：整列引用会把循环引用放大成深递归，超过就返回错误而不是爆栈
+    depth: usize,
     /// 精确匹配用的哈希索引：key → 首次出现的行下标
     lookup_index: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<HashMap<String, usize>>>,
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
@@ -715,7 +717,7 @@ impl Arg {
 impl<'a> Calc<'a> {
     pub fn new(wb: &'a Workbook) -> Self {
         Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), scope: None,
-            agg_cache: HashMap::new(), cache_vals: 0,
+            agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
             cache_order: std::collections::VecDeque::new(), agg_hits: 0, agg_miss: 0 }
     }
 
@@ -732,6 +734,16 @@ impl<'a> Calc<'a> {
     }
 
     pub fn cell_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
+        if self.depth >= 200 {
+            return FValue::Error(ErrKind::Ref);
+        }
+        self.depth += 1;
+        let out = self.cell_value_inner(si, r, c);
+        self.depth -= 1;
+        out
+    }
+
+    fn cell_value_inner(&mut self, si: usize, r: u32, c: u32) -> FValue {
         let key = (si, r, c);
         if let Some(v) = self.memo.get(&key) {
             return v.clone();
