@@ -3,6 +3,60 @@ use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
 use std::path::Path;
 
+/// .xls 的样式/列宽/行高/合并区（calamine 只给值）
+fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
+    let is_xls = std::fs::read(path)
+        .map(|b| !b.starts_with(b"PK"))
+        .unwrap_or(false);
+    if !is_xls {
+        return;
+    }
+    if let Some(sizes) = crate::xls_layout::read(path) {
+        for (i, sheet) in wb.sheets.iter_mut().enumerate() {
+            let Some(sz) = sizes.sheets.get(i) else { continue };
+            for (a, b, w) in sz.cols.iter() {
+                if b.saturating_sub(*a) < 1024 {
+                    for c in *a..=*b {
+                        sheet.cols.set(c, *w);
+                    }
+                } else {
+                    sheet.cols.set_default(*w);
+                }
+            }
+            for (r, h) in sz.rows.iter() {
+                sheet.rows.set(*r, *h);
+            }
+        }
+    }
+    if let Some(sty) = crate::xls_style::read(path) {
+        let mut ids: Vec<(usize, u32, u32, u16)> = Vec::new();
+        for (i, sh) in sty.sheets.iter().enumerate() {
+            for (r, c, st) in sh.cells.iter() {
+                ids.push((i, *r, *c, wb.styles.intern(st.clone())));
+            }
+        }
+        for (i, r, c, id) in ids {
+            if let Some(sh) = wb.sheets.get_mut(i) {
+                sh.set_style(r, c, id);
+            }
+        }
+    }
+    if let Ok(calamine::Sheets::Xls(x)) = open_workbook_auto(path) {
+        let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
+        for (i, name) in names.iter().enumerate() {
+            if i >= wb.sheets.len() {
+                break;
+            }
+            if let Some(regions) = x.worksheet_merge_cells(name) {
+                wb.sheets[i].merges = regions
+                    .iter()
+                    .map(|d| (d.start.0, d.start.1, d.end.0, d.end.1))
+                    .collect();
+            }
+        }
+    }
+}
+
 fn data_to_value(d: &Data) -> Value {
     match d {
         Data::Empty => Value::Empty,
@@ -98,10 +152,28 @@ fn load_chunk(
 }
 
 pub fn load(path: &Path) -> Result<Workbook> {
-    let mut reader =
-        open_workbook_auto(path).with_context(|| format!("无法打开 {}", path.display()))?;
+    // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
+    //（我们自己写出的容器就属于后一种）。
+    let mut reader = match open_workbook_auto(path) {
+        Ok(r) => r,
+        Err(e) => {
+            let is_cfb = std::fs::read(path)
+                .map(|b| b.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]))
+                .unwrap_or(false);
+            if !is_cfb {
+                return Err(e).with_context(|| format!("无法打开 {}", path.display()));
+            }
+            eprintln!("[load] calamine 打不开，改用内置 BIFF 读取器：{e}");
+            let mut wb = crate::xls_read::load(path)?;
+            apply_xls_meta(path, &mut wb);
+            return Ok(wb);
+        }
+    };
     let names = reader.sheet_names().to_owned();
 
+    let is_cfb = std::fs::read(path)
+        .map(|b| b.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]))
+        .unwrap_or(false);
     let mut wb = Workbook {
         names: crate::patch::read_defined_names(path),
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
@@ -175,7 +247,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
         all
     });
 
-    let mut shared_zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    // .xls 不是 zip：这条只给 ooXML 用
+    let is_ooxml = std::fs::read(path)
+        .map(|b| b.starts_with(b"PK"))
+        .unwrap_or(false);
+    let mut shared_zip = if is_ooxml {
+        Some(zip::ZipArchive::new(std::fs::File::open(path)?)?)
+    } else {
+        None
+    };
     for raw in raws {
         let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(raw.name.clone());
@@ -197,7 +277,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
         // 共享公式：解析库给子格的是主格原文，没按位移改，这里按 si 组重新推
         if !raw.sparse {
             if let Some(part) = targets.get(&raw.name) {
-                if let Ok(mut f) = shared_zip.by_name(part) {
+                let opened = shared_zip
+                    .as_mut()
+                    .map(|z| z.by_name(part))
+                    .unwrap_or_else(|| Err(zip::result::ZipError::FileNotFound));
+                if let Ok(mut f) = opened {
                     let mut xml = String::new();
                     if std::io::Read::read_to_string(&mut f, &mut xml).is_ok() {
                         for (r, c, text) in crate::sparse::fix_shared_children(&xml) {
@@ -271,63 +355,16 @@ pub fn load(path: &Path) -> Result<Workbook> {
             }
         }
     }
-    // 老式 .xls：calamine 不给行列尺寸，也从 XML 里取不到合并区，单独补一遍
-    {
-        let is_xls = std::fs::read(path)
-            .map(|b| !b.starts_with(b"PK"))
-            .unwrap_or(false);
-        if is_xls {
-            if let Some(sizes) = crate::xls_layout::read(path) {
-                for (i, sheet) in wb.sheets.iter_mut().enumerate() {
-                    let Some(sz) = sizes.sheets.get(i) else { continue };
-                    for (a, b, w) in sz.cols.iter() {
-                        if b.saturating_sub(*a) < 1024 {
-                            for c in *a..=*b {
-                                sheet.cols.set(c, *w);
-                            }
-                        } else {
-                            sheet.cols.set_default(*w);
-                        }
-                    }
-                    for (r, h) in sz.rows.iter() {
-                        sheet.rows.set(*r, *h);
-                    }
-                }
-            }
-            if let Some(sty) = crate::xls_style::read(path) {
-                let mut ids: Vec<(usize, u32, u32, u16)> = Vec::new();
-                for (i, sh) in sty.sheets.iter().enumerate() {
-                    for (r, c, st) in sh.cells.iter() {
-                        ids.push((i, *r, *c, wb.styles.intern(st.clone())));
-                    }
-                }
-                for (i, r, c, id) in ids {
-                    if let Some(sh) = wb.sheets.get_mut(i) {
-                        sh.set_style(r, c, id);
-                    }
-                }
-            }
-            if let Ok(calamine::Sheets::Xls(x)) = open_workbook_auto(path) {
-                for (i, name) in names.iter().enumerate() {
-                    if i >= wb.sheets.len() {
-                        break;
-                    }
-                    if let Some(regions) = x.worksheet_merge_cells(name) {
-                        wb.sheets[i].merges = regions
-                            .iter()
-                            .map(|d| (d.start.0, d.start.1, d.end.0, d.end.1))
-                            .collect();
-                    }
-                }
-            }
-        }
-    }
+    apply_xls_meta(path, &mut wb);
 
     // 合并单元格（已并行取到）
     {
         for sheet in wb.sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
-                sheet.merges = lay.merges.clone();
+                // .xls 没有 XML 版面，合并区来自 apply_xls_meta，别被空值覆盖
+                if !lay.merges.is_empty() || !is_cfb {
+                    sheet.merges = lay.merges.clone();
+                }
                 if let Some(w) = lay.col_default {
                     sheet.cols.set_default(w);
                 }

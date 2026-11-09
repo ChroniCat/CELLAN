@@ -600,7 +600,16 @@ impl SheetApp {
                         let target = PathBuf::from(&out);
                         // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
                         let wb = self.wb.clone();
-                        match sheetcore::xlsx::save_atomic(&target, &wb) {
+                        let is_xls = target
+                            .extension()
+                            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
+                            .unwrap_or(false);
+                        let written = if is_xls {
+                            sheetcore::xls_write::write(&target, &wb)
+                        } else {
+                            sheetcore::xlsx::save_atomic(&target, &wb)
+                        };
+                        match written {
                             Ok(()) => eprintln!("[save] 测试钩子已存 {}", target.display()),
                             Err(e) => eprintln!("[save] 测试钩子失败 {e:#}"),
                         }
@@ -661,6 +670,7 @@ impl SheetApp {
             _ => rfd::FileDialog::new()
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .add_filter("Excel 启用宏的工作簿", &["xlsm"])
+                .add_filter("Excel 97-2003 工作簿", &["xls"])
                 .set_file_name(if self.wb.has_vba {
                     format!("{}.xlsm", self.wb.title())
                 } else {
@@ -695,8 +705,17 @@ impl SheetApp {
         self.save_rx = Some(rx);
         std::thread::spawn(move || {
             // 先写临时文件，成功再替换，避免写一半断电把原文件毁了
-            let tmp = path.with_extension("xlsx.tmp");
-            let res = match sheetcore::xlsx::save_atomic(&tmp, &wb) {
+            let is_xls = path
+                .extension()
+                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
+                .unwrap_or(false);
+            let tmp = path.with_extension(if is_xls { "xls.tmp" } else { "xlsx.tmp" });
+            let written = if is_xls {
+                sheetcore::xls_write::write(&tmp, &wb)
+            } else {
+                sheetcore::xlsx::save_atomic(&tmp, &wb)
+            };
+            let res = match written {
                 Ok(()) => match std::fs::rename(&tmp, &path) {
                     Ok(()) => Ok(shown),
                     Err(e) => {
@@ -4615,9 +4634,7 @@ impl SheetApp {
     ) {
         let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
         let st = self.wb.styles.get(sid);
-        if self.sel == (r, c) && st.fill.is_none() {
-            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(26, 115, 232, 40));
-        }
+        // 选中不再用整格浅蓝填充（会和真实底色混淆），改成外描边，见选区绘制
         if let Some(fill) = st.fill {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
             if dumping {
@@ -6942,8 +6959,11 @@ impl SheetApp {
         }
 
         let text_color = Color32::from_rgb(24, 24, 24);
-        let grid_line = Color32::from_rgb(228, 228, 228);
-        let head_bg = Color32::from_rgb(244, 245, 247);
+        // 和 Excel 一致的浅灰网格线 / 表头底色
+        let grid_line = Color32::from_rgb(217, 217, 217);
+        let head_bg = Color32::from_rgb(246, 246, 246);
+        let head_fg = Color32::from_rgb(60, 64, 70);
+        let head_sel = Color32::from_rgb(226, 233, 244);
 
         // 列标题
         painter.rect_filled(
@@ -6960,7 +6980,7 @@ impl SheetApp {
                 Align2::CENTER_CENTER,
                 col_label(c),
                 FontId::new(12.0, family_named("latin")),
-                Color32::from_rgb(90, 90, 90),
+                head_fg,
             );
             painter.line_segment(
                 [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
@@ -6974,12 +6994,19 @@ impl SheetApp {
             let x = gx(c);
             let w = cols.size(c);
             if x + w > origin.x + HEAD_W {
+                if c == self.sel.1 {
+                    painter.rect_filled(
+                        Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, HEAD_H)),
+                        0.0,
+                        head_sel,
+                    );
+                }
                 painter.text(
                     egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
                     Align2::CENTER_CENTER,
                     col_label(c),
                     FontId::new(12.0, family_named("latin")),
-                    Color32::from_rgb(90, 90, 90),
+                    head_fg,
                 );
                 painter.line_segment(
                     [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
@@ -6998,7 +7025,7 @@ impl SheetApp {
                 Align2::CENTER_CENTER,
                 (r + 1).to_string(),
                 FontId::new(12.0, family_named("latin")),
-                Color32::from_rgb(90, 90, 90),
+                head_fg,
             );
             painter.line_segment(
                 [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
@@ -7016,12 +7043,19 @@ impl SheetApp {
                 continue;
             }
             if y + h > origin.y + HEAD_H {
+                if r == self.sel.0 {
+                    painter.rect_filled(
+                        Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(HEAD_W, h)),
+                        0.0,
+                        head_sel,
+                    );
+                }
                 painter.text(
                     egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
                     FontId::new(12.0, family_named("latin")),
-                    Color32::from_rgb(90, 90, 90),
+                    head_fg,
                 );
                 painter.line_segment(
                     [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
@@ -7083,6 +7117,24 @@ impl SheetApp {
 
         // 单元格
         let merges = self.wb.sheet(self.sheet_idx).merges.clone();
+        // 合并区内部的网格线要抹掉（Excel 只画合并块外沿）
+        for (mr1, mc1, mr2, mc2) in merges.iter() {
+            let x = gx(*mc1);
+            let y = gy(*mr1);
+            let w = gx(*mc2 + 1) - x;
+            let h = gy(*mr2 + 1) - y;
+            if w < 1.0 || h < 1.0 {
+                continue;
+            }
+            if x > origin.x + avail.x || y > origin.y + avail.y {
+                continue;
+            }
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, h)),
+                0.0,
+                Color32::WHITE,
+            );
+        }
         let notes = self.wb.sheet(self.sheet_idx).notes.clone();
         let mut pending_filter: Option<(u32, Vec<(String, bool)>)> = None;
         let mut r = first_row;
