@@ -9,6 +9,13 @@ use std::collections::HashMap;
 use std::io::Write;
 
 /// Excel 缓存里的错误值是内部短名：#Div0/#NA/#Value/#Name/#Ref/#Num/#Null
+/// 本机 Excel 不支持的函数族
+fn uses_lambda_family(f: &str) -> bool {
+    const NAMES: [&str; 8] = ["LAMBDA", "MAP(", "REDUCE(", "SCAN(", "BYROW(", "BYCOL(", "MAKEARRAY(", "ISOMITTED("];
+    let up = f.to_ascii_uppercase();
+    NAMES.iter().any(|n| up.contains(n))
+}
+
 fn canon_err(s: &str) -> &str {
     match s.trim() {
         "#Div0" => "#DIV/0!",
@@ -104,6 +111,7 @@ fn main() {
     // 循环引用的格子：Excel 缓存值是历史快照，本引擎按循环处理，不参与比对
     let cycles = sheetcore::formula::take_cycle_cells();
     let mut circular = 0usize;
+    let mut beyond = 0usize;
     let mut same = 0usize;
     let mut close = 0usize;
     let mut diff = 0usize;
@@ -129,6 +137,12 @@ fn main() {
             };
             if cycles.contains(&(si, k.row, k.col)) {
                 circular += 1;
+                continue;
+            }
+            // 本机 Excel 不支持 LAMBDA 家族（实测 16.0 Build 20326 全部 #NAME?），
+            // 我们能算出来是能力更强，不算不一致
+            if canon_err(expect).eq_ignore_ascii_case("#NAME?") && uses_lambda_family(f) {
+                beyond += 1;
                 continue;
             }
             let got_raw = cell.value.display();
@@ -201,6 +215,7 @@ fn main() {
     println!("数值一致(容差) {close}");
     println!("不一致         {diff}");
     println!("循环引用       {circular}（Excel 缓存是历史快照，单列不参与比例）");
+    println!("超出本机Excel  {beyond}（LAMBDA 家族，本机 Excel 不支持，我们能算）");
     if total > 0 {
         println!(
             "一致率         {:.4}%",
