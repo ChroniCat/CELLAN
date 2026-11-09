@@ -5,6 +5,8 @@ use document_tasks::DocumentTasks;
 
 #[cfg(test)]
 mod document_tests;
+#[cfg(test)]
+mod edit_regression_tests;
 mod net;
 mod office_clipboard;
 mod recent;
@@ -145,7 +147,7 @@ struct SheetApp {
     shared_current_file: Option<std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>>,
     /// 没带文件启动时显示最近文件
     show_start: bool,
-    confirm_close_once: bool,
+    confirm_close_target: Option<(usize, u64)>,
     tabs_done: bool,
     paste_done: bool,
     pending_tab_switch: Option<usize>,
@@ -378,7 +380,7 @@ impl SheetApp {
             open_requests: None,
             shared_current_file: None,
             show_start: false,
-            confirm_close_once: false,
+            confirm_close_target: None,
             tabs_done: false,
             paste_done: false,
             pending_tab_switch: None,
@@ -1376,7 +1378,8 @@ impl SheetApp {
         let Some(path) = self.wb.path.clone() else {
             return; // 没保存过的新文件还不知道日志放哪
         };
-        let sheet = self.wb.sheet(self.sheet_idx).name.clone();
+        let sheet_idx = deltas.first().map(|d| d.sheet).unwrap_or(self.sheet_idx);
+        let sheet = self.wb.sheet(sheet_idx).name.clone();
         let mut e = sheetcore::revision::Entry::new(&self.my_name, 0, label, &sheet);
         let total = deltas.len();
         let mut only_style = true;
@@ -1508,11 +1511,38 @@ impl SheetApp {
             return;
         }
 
-        // 写回去（可撤销）
+        // One transaction covers both sides of a cut, including overlapping cells.
         let h = rows.len() as u32;
         let w = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
-        let keys = sheetcore::undo::rect_keys(r, c, r + h.saturating_sub(1), c + w.saturating_sub(1));
-        let txn = self.txn_begin(&keys);
+        let mut touched = std::collections::BTreeSet::new();
+        for (i, row) in rows.iter().enumerate() {
+            for j in 0..row.len() {
+                touched.insert((si, r + i as u32, c + j as u32));
+            }
+        }
+        if let Some((source, (sr1, sc1, sr2, sc2))) = cut_src {
+            for rr in sr1..=sr2 {
+                for cc in sc1..=sc2 {
+                    touched.insert((source, rr, cc));
+                }
+            }
+        }
+        let mut transactions = std::collections::BTreeMap::new();
+        for &(sheet, rr, cc) in &touched {
+            transactions.entry(sheet).or_insert_with(Vec::new).push((rr, cc));
+        }
+        let before: Vec<_> = transactions.into_iter().map(|(sheet, keys)| {
+            (sheet, sheetcore::undo::capture(self.wb.sheet(sheet), sheet, &keys))
+        }).collect();
+        // Clear before writing: the clipboard already holds a source snapshot.
+        if let Some((source, (sr1, sc1, sr2, sc2))) = cut_src {
+            for rr in sr1..=sr2 {
+                for cc in sc1..=sc2 {
+                    self.wb.sheet_mut(source).set(rr, cc, Cell::default());
+                    self.wb.sheet_mut(source).set_style(rr, cc, 0);
+                }
+            }
+        }
         for (i, row) in rows.iter().enumerate() {
             for (j, (cell, st)) in row.iter().enumerate() {
                 let rr = r + i as u32;
@@ -1523,28 +1553,28 @@ impl SheetApp {
                 }
             }
         }
-        self.txn_end(if values_only { "粘贴数值" } else { "粘贴" }, txn);
-        // 剪切：清空源区域
-        if let Some((src_sheet, (sr1, sc1, sr2, sc2))) = cut_src {
-            for rr in sr1..=sr2 {
-                for cc in sc1..=sc2 {
-                    self.wb.sheet_mut(src_sheet).set(rr, cc, sheetcore::model::Cell {
-                        value: sheetcore::model::Value::Empty,
-                        formula: None,
-                    });
-                }
+        let label = if cut_src.is_some() { "剪切粘贴" } else if values_only { "粘贴数值" } else { "粘贴" };
+        let mut deltas = Vec::new();
+        for (sheet, captured) in before {
+            let changes = sheetcore::undo::finish(captured, self.wb.sheet(sheet));
+            if !changes.is_empty() {
+                self.record_revision(label, &changes);
+                deltas.extend(changes);
             }
+        }
+        self.undo.push(sheetcore::undo::Action {
+            label: label.into(), deltas, focus: (si, r, c),
+            snap_before: None, snap_after: None, by_site: 0,
+        });
+        if cut_src.is_some() {
             self.clip = None;
         }
         // 重算 + 广播
-        let mut touched: Vec<(usize, u32, u32)> = Vec::new();
-        for rr in r..r + h {
-            for cc in c..c + w {
-                touched.push((si, rr, cc));
-            }
-        }
+        let touched: Vec<_> = touched.into_iter().collect();
         self.recalc_and_broadcast(&touched);
+        self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = format!("已粘贴 {h} 行 × {w} 列");
     }
 
@@ -1596,10 +1626,9 @@ impl SheetApp {
         self.deps = deps;
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
             for (si, r, c) in keys.iter() {
-                if let Some(cell) = self.wb.sheet(*si).get(*r, *c).cloned() {
-                    let op = peer.local_set(*si, *r, *c, &cell);
-                    net.broadcast_op(op);
-                }
+                let cell = self.wb.sheet(*si).get(*r, *c).cloned().unwrap_or_default();
+                let op = peer.local_set(*si, *r, *c, &cell);
+                net.broadcast_op(op);
             }
         }
     }
@@ -1748,6 +1777,12 @@ impl SheetApp {
 
     fn run_sort(&mut self, dlg: &DataDlg) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        if let Err(error) = sheetcore::sort_filter::validate_sort_region(
+            self.wb.sheet(self.sheet_idx), (r1, c1, r2, c2),
+        ) {
+            self.status = error;
+            return;
+        }
         let keys: Vec<sheetcore::data_tools::SortKey> = dlg
             .keys
             .iter()
@@ -1772,6 +1807,8 @@ impl SheetApp {
         self.txn_end("多级排序", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
         self.status = format!("已按 {} 个键排序（{} 行移动）", keys.len(), moved);
     }
 
@@ -2947,6 +2984,10 @@ impl SheetApp {
         if self.editing.is_some() {
             return;
         }
+        if self.net.is_some() && if redo { self.undo.redo_is_structure() } else { self.undo.undo_is_structure() } {
+            self.status = "协作期间不能撤销或重做整表结构，请先断开协作".into();
+            return;
+        }
         // 协作时：只回退仍然是我改成的样子的格子
         let mut mine: std::collections::HashSet<(usize, u32, u32)> = std::collections::HashSet::new();
         let site = self.net.as_ref().map(|n| n.site);
@@ -2963,9 +3004,9 @@ impl SheetApp {
             mine.is_empty() || mine.contains(&(sheet, row, col))
         };
         let applied = if redo {
-            self.undo.redo(&mut self.wb.sheets, guard)
+            self.undo.redo_workbook(&mut self.wb, guard)
         } else {
-            self.undo.undo(&mut self.wb.sheets, guard)
+            self.undo.undo_workbook(&mut self.wb, guard)
         };
         let Some(applied) = applied else {
             self.status = if redo { "没有可重做的操作".into() } else { "没有可撤销的操作".into() };
@@ -2977,20 +3018,24 @@ impl SheetApp {
         let mut keys: Vec<(usize, u32, u32)> = applied.touched.clone();
         keys.sort();
         keys.dedup();
-        for k in keys.iter() {
-            self.deps.update_cell(&self.wb, *k);
+        if applied.structural {
+            sheetcore::formula::recalc_all(&mut self.wb);
+            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        } else {
+            for k in keys.iter() {
+                self.deps.update_cell(&self.wb, *k);
+            }
+            sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &keys);
         }
-        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &keys);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
             for (sheet, row, col) in applied.touched.iter() {
-                if *sheet != self.sheet_idx {
-                    continue;
-                }
-                if let Some(cell) = self.wb.sheet(*sheet).get(*row, *col).cloned() {
-                    let op = peer.local_set(*sheet, *row, *col, &cell);
-                    net.broadcast_op(op);
-                }
+                let cell = self.wb.sheet(*sheet).get(*row, *col).cloned().unwrap_or_default();
+                let op = peer.local_set(*sheet, *row, *col, &cell);
+                net.broadcast_op(op);
             }
         }
         // 回到出事的格
@@ -3119,6 +3164,10 @@ impl SheetApp {
     fn goto_name(&mut self) {
         let text = self.name_buf.trim().to_string();
         if text.is_empty() {
+            return;
+        }
+        self.commit_edit(None);
+        if self.editing.is_some() {
             return;
         }
         let up = text.to_ascii_uppercase();
@@ -5244,6 +5293,8 @@ impl SheetApp {
                 self.txn_end("排序", txn);
                 self.wb.dirty = true;
                 self.doc_gen = self.doc_gen.wrapping_add(1);
+                sheetcore::formula::recalc_all(&mut self.wb);
+                self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
                 self.status = format!("已按 {} 列{}排序", cell_name(0, col), if asc { "升序" } else { "降序" });
             }
             Err(e) => self.status = e,
@@ -5497,9 +5548,12 @@ impl SheetApp {
             return;
         };
         let name = self.wb.sheet(self.sheet_idx).name.clone();
-        if let Err(e) = sheetcore::xlsx::save_atomic(&path, &self.wb) {
-            self.status = format!("保存失败：{e}");
-            return;
+        match sheetcore::xlsx::save_atomic_with_receipt(&path, &self.wb) {
+            Ok(receipt) => receipt.apply_to(&mut self.wb),
+            Err(e) => {
+                self.status = format!("保存失败：{e}");
+                return;
+            }
         }
         // 已有部件就替换，否则新建（改图表不能变成又插一个）
         let res = if ch.part.is_empty() {
@@ -5651,32 +5705,28 @@ impl SheetApp {
 
     /// 插入/删除行列：结构 + 撤销 + 协作广播
     fn structural(&mut self, op: sheetcore::structural::Structural) {
+        self.commit_edit(None);
+        if self.editing.is_some() {
+            return;
+        }
         let idx = self.sheet_idx;
         let cell_count = self.wb.sheet(idx).len();
         // 表太大就不记快照（记了也没内存），明确告诉用户不能撤销
         let snapshot = if cell_count <= 200_000 {
-            Some(sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx))
+            Some(sheetcore::undo::snapshot_structure(&self.wb, idx, &op))
         } else {
             None
         };
         sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        let after = if snapshot.is_some() {
-            Some(sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx))
-        } else {
-            None
-        };
+        let after = snapshot.as_ref().map(|before| before.capture_after(&self.wb));
         let label = op.label();
         if let (Some(before), Some(after)) = (snapshot, after) {
-            self.undo.push(sheetcore::undo::Action {
-                label: label.clone(),
-                deltas: Vec::new(),
-                focus: (idx, self.sel.0, self.sel.1),
-                snap_before: Some(before),
-                snap_after: Some(after),
-                by_site: 0,
-            });
+            self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
+        } else {
+            // Older coordinates cannot be safely applied after an unrecorded edit.
+            self.undo.clear();
         }
         // 整表重算（结构变了，依赖图也得重建）
         sheetcore::formula::recalc_all(&mut self.wb);
@@ -7732,6 +7782,14 @@ impl SheetApp {
             );
         }
 
+        // A rejected draft must keep its original cell and sheet coordinates.
+        if !readonly && (resp.clicked() || resp.drag_started() || resp.dragged()) && self.editing.is_some() {
+            self.commit_edit(None);
+            if self.editing.is_some() {
+                return;
+            }
+        }
+
         // 拖拽框选
         if !readonly && resp.dragged() {
             if let Some(pos) = resp.interact_pointer_pos() {
@@ -8516,7 +8574,7 @@ impl SheetApp {
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
         self.editing = None;
         self.cf_stats_gen = u64::MAX;
-        self.confirm_close_once = false;
+        self.confirm_close_target = None;
     }
 
     /// 切到某个标签
@@ -8594,14 +8652,24 @@ impl SheetApp {
             self.status = "此文件仍在保存，完成后再关闭标签".into();
             return;
         }
+        if idx == self.active_tab && self.net.is_some() {
+            self.status = "这个标签正在协作中，先断开再关闭".into();
+            return;
+        }
         if idx == self.active_tab {
-            if self.net.is_some() {
-                self.status = "这个标签正在协作中，先断开再关闭".into();
+            self.commit_edit(None);
+            if self.editing.is_some() {
                 return;
             }
-            if self.wb.dirty && !self.confirm_discard() {
-                return;
-            }
+        }
+        let (dirty, generation) = match &self.tabs[idx] {
+            TabSlot::Active => (self.wb.dirty, self.doc_gen),
+            TabSlot::Parked(doc) => (doc.wb.dirty, doc.doc_gen),
+        };
+        if dirty && !self.confirm_discard(idx, generation) {
+            return;
+        }
+        if idx == self.active_tab {
             self.tabs.remove(idx);
             if self.active_tab > idx || self.active_tab >= self.tabs.len() {
                 self.active_tab = self.active_tab.saturating_sub(1);
@@ -8617,16 +8685,17 @@ impl SheetApp {
                 self.active_tab -= 1;
             }
         }
+        self.confirm_close_target = None;
     }
 
     /// 关标签前的未保存确认（暂时用状态栏提示 + 二次点击）
-    fn confirm_discard(&mut self) -> bool {
-        if self.confirm_close_once {
-            self.confirm_close_once = false;
+    fn confirm_discard(&mut self, idx: usize, generation: u64) -> bool {
+        if self.confirm_close_target == Some((idx, generation)) {
+            self.confirm_close_target = None;
             return true;
         }
-        self.confirm_close_once = true;
-        self.status = "这个文件有未保存的改动，再点一次 × 确认丢弃".into();
+        self.confirm_close_target = Some((idx, generation));
+        self.status = format!("{} 有未保存的改动，再点一次此标签的 × 确认丢弃", self.tab_title(idx));
         false
     }
 
@@ -8637,6 +8706,7 @@ impl SheetApp {
         self.sheet_idx = 0;
         self.scroll = Vec2::ZERO;
         self.editing = None;
+        self.confirm_close_target = None;
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
         self.undo = sheetcore::undo::UndoStack::new();
@@ -9228,7 +9298,9 @@ impl eframe::App for SheetApp {
                     }
                     if resp.clicked() {
                         self.commit_edit(None);
-                        goto = Some(i);
+                        if self.editing.is_none() {
+                            goto = Some(i);
+                        }
                     }
                     resp.context_menu(|ui| {
                         if ui.button("新建工作表").clicked() {

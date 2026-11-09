@@ -183,6 +183,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         links: crate::xlinks::read(path),
         names_dirty: false,
         pivot_shifts: Vec::new(),
+        pivot_cache_base: Default::default(),
         has_vba: crate::vba::has_macros(path),
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
@@ -440,7 +441,53 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    if is_ooxml {
+        wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
+            definitions: pivot_definitions(path),
+            sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
+        });
+    }
     Ok(wb)
+}
+
+fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
+    crate::fixups::parts(path).into_iter()
+        .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
+        .filter_map(|name| crate::fixups::read_part_file(path, &name).map(|body| (name, body)))
+        .collect()
+}
+
+/// Metadata produced by one successfully replaced OOXML package. It can be
+/// applied to a newer live document without resetting edits made during save.
+#[derive(Debug, Default)]
+pub struct SaveReceipt {
+    sheets: Vec<(u64, String)>,
+}
+
+impl SaveReceipt {
+    pub fn apply_to(&self, wb: &mut Workbook) {
+        for sheet in &mut wb.sheets {
+            if let Some((_, part)) = self.sheets.iter().find(|(id, _)| *id == sheet.identity) {
+                sheet.source_part = Some(part.clone());
+            }
+        }
+    }
+}
+
+/// Save a snapshot, then acknowledge only its sheet identities in the live
+/// workbook. Callers retaining the workbook should apply the returned receipt.
+pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
+    save_atomic(path, wb)?;
+    if path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("xls")) {
+        return Ok(SaveReceipt::default());
+    }
+    let targets = crate::patch::sheet_targets(path).context("读取已保存的工作表身份失败")?;
+    let sheets = wb.sheets.iter().map(|sheet| {
+        let part = targets.get(&sheet.name)
+            .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
+        Ok((sheet.identity, part.clone()))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(SaveReceipt { sheets })
 }
 
 /// 写回 xlsx。文件已存在时先读入，以保留样式、列宽等未改动的部分。
@@ -641,6 +688,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         for (cref, cell) in sheet.iter() {
             // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
             if sheet.spilled.contains(&cref) {
+                // A moved spill may cover a previously persisted ordinary cell.
+                // Its old value must not become a blocker when reopening.
+                ws.remove_cell((cref.col + 1, cref.row + 1));
                 continue;
             }
             let coord = (cref.col + 1, cref.row + 1);
@@ -757,11 +807,19 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // Restore its definition even when the part still exists, then apply our
     // explicit source changes. Missing-part recovery alone cannot detect this.
     if restore_base.exists() {
-        let definitions: Vec<(String, Vec<u8>)> = crate::fixups::parts(&restore_base)
-            .into_iter()
-            .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
-            .filter_map(|name| crate::fixups::read_part_file(&restore_base, &name).map(|body| (name, body)))
-            .collect();
+        let mut definitions = pivot_definitions(&restore_base);
+        let changes: Vec<_> = wb.pivot_cache_base.sheets.iter().filter_map(|(id, old)| {
+            let new = wb.sheets.iter().find(|s| s.identity == *id).map(|s| s.name.clone());
+            (new.as_ref() != Some(old)).then(|| (old.clone(), new))
+        }).collect();
+        for (name, body) in &wb.pivot_cache_base.definitions {
+            let body = structure::rewrite_pivot_source(body, &changes)?;
+            if let Some((_, old)) = definitions.iter_mut().find(|(part, _)| part == name) {
+                *old = body;
+            } else {
+                definitions.push((name.clone(), body));
+            }
+        }
         if !definitions.is_empty() {
             crate::patch::append_entries(path, &definitions).context("保留透视表缓存定义失败")?;
         }

@@ -82,9 +82,12 @@ impl Cell {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Sheet {
     pub name: String,
+    /// Runtime identity survives snapshots, renames and reordering. Save
+    /// acknowledgements must never identify a sheet by its current index/name.
+    pub identity: u64,
     /// Stable worksheet part in the loaded OOXML package. Renaming/reordering a
     /// sheet must retain its original relationships and other unmodeled content.
     /// A duplicated/new sheet has no source part.
@@ -155,6 +158,7 @@ impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            identity: next_sheet_identity(),
             source_part: None,
             cells: Store::default(),
             cleared: std::collections::HashSet::new(),
@@ -187,6 +191,12 @@ impl Sheet {
             charts: Vec::new(),
             charts_dirty: false,
         }
+    }
+
+    /// A copy inserted as a new sheet must not inherit the original identity.
+    pub fn renew_identity(&mut self) {
+        self.identity = next_sheet_identity();
+        self.source_part = None;
     }
 
     pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {
@@ -332,6 +342,24 @@ impl Sheet {
     }
 }
 
+fn next_sheet_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Default for Sheet {
+    fn default() -> Self { Self::new("") }
+}
+
+/// Imported pivot definitions are replayed from this immutable baseline.
+/// Keeping it independent of the last saved file makes the structural journal
+/// repeatable, including undo after a successful save.
+#[derive(Clone, Debug, Default)]
+pub struct PivotCacheBase {
+    pub definitions: Vec<(String, Vec<u8>)>,
+    pub sheets: Vec<(u64, String)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     /// 文件里是否带 VBA 宏（只保留，不执行）
@@ -347,6 +375,7 @@ pub struct Workbook {
     /// 结构改动记录：保存时用来搬透视表缓存里的源区域
     /// (表名, 0=行 1=列, at, n, 是否删除)
     pub pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
+    pub pivot_cache_base: std::sync::Arc<PivotCacheBase>,
     /// 保存时要挂上的透视表部件：(表序号, 规格, 结果, 输出矩形, 值字段名)
     pub pivots_pending: Vec<(
         usize,
@@ -370,6 +399,7 @@ impl Workbook {
             sources: Vec::new(),
             links: Vec::new(),
             pivot_shifts: Vec::new(),
+            pivot_cache_base: Default::default(),
             names_dirty: false,
             pivots_pending: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],

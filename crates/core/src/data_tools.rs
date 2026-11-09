@@ -38,7 +38,8 @@ fn cmp_cell(a: &Option<Cell>, b: &Option<Cell>, ignore_case: bool) -> std::cmp::
     }
 }
 
-/// 多级排序；返回实际移动的行数
+/// 多级排序；返回实际移动的行数。调用方须重建依赖图并重算工作簿。
+/// 不可排序的数组/合并区保持原样并返回 0；UI 可先调用 validate_sort_region 显示原因。
 pub fn sort_multi(
     sheet: &mut Sheet,
     region: (u32, u32, u32, u32),
@@ -48,6 +49,9 @@ pub fn sort_multi(
     let (r1, c1, r2, c2) = region;
     let r1 = if header { r1 + 1 } else { r1 };
     if r2 <= r1 || keys.is_empty() {
+        return 0;
+    }
+    if crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2)).is_err() {
         return 0;
     }
     // 整块备份（原样，含样式）
@@ -98,7 +102,7 @@ pub fn sort_multi(
         let r = r1 + target_r as u32;
         for (k, (cell, st)) in before[src_i].iter().enumerate() {
             let c = c1 + k as u32;
-            sheet.set(r, c, cell.clone());
+            sheet.set(r, c, crate::sort_filter::sorted_cell(cell, rows[src_i].0, r, &sheet.name));
             sheet.set_style(r, c, *st);
         }
         if order[target_r] != target_r {

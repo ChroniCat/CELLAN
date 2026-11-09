@@ -4,7 +4,7 @@
 //! 数字按大小、文本按不区分大小写的字典序、布尔按真假。
 //! 筛选不删数据，只把不匹配的行隐藏起来（隐藏 = 行高 0，和 Excel 一致）。
 
-use crate::model::{Cell, CellRef, Sheet, Value};
+use crate::model::{Cell, Sheet, Value};
 use std::collections::{HashMap, HashSet};
 
 /// 排序键：数字 < 文本 < 布尔，空格单独处理
@@ -17,7 +17,40 @@ fn key_of(v: &Value) -> Option<(u8, f64, String)> {
     }
 }
 
-/// 在一个矩形区域里按 `col` 列排序（col 必须是区域内的一列）
+/// 排序中的相对引用随记录移动，绝对行列保持固定。
+pub(crate) fn sorted_cell(cell: &Cell, source_row: u32, target_row: u32, sheet: &str) -> Cell {
+    let mut out = cell.clone();
+    if source_row != target_row {
+        if let Some(formula) = cell.formula.as_deref() {
+            out.formula = Some(crate::refs::translate(
+                formula, target_row as i64 - source_row as i64, 0, sheet,
+            ).into_boxed_str());
+        }
+    }
+    out
+}
+
+/// 排序不能拆开合并格或数组。动态数组目前没有独立的锚点索引，
+/// 因此也保护选区中紧邻已登记溢出尾格的公式，避免只搬走锚点。
+pub fn validate_sort_region(sheet: &Sheet, region: (u32, u32, u32, u32)) -> Result<(), String> {
+    let (r1, c1, r2, c2) = region;
+    let inside = |r: u32, c: u32| r >= r1 && r <= r2 && c >= c1 && c <= c2;
+    if sheet.merges.iter().any(|&(a, b, c, d)| a <= r2 && c >= r1 && b <= c2 && d >= c1) {
+        return Err("选区里有合并单元格，先取消合并再排序".into());
+    }
+    let array_range = sheet.arrays.iter().any(|&(_, (a, b, c, d))| a <= r2 && c >= r1 && b <= c2 && d >= c1);
+    let spill_tail = sheet.spilled.iter().any(|key| inside(key.row, key.col));
+    let spill_anchor = sheet.iter().any(|(key, cell)| inside(key.row, key.col) && cell.formula.is_some()
+        && (sheet.spilled.contains(&crate::CellRef::new(key.row.saturating_add(1), key.col))
+            || sheet.spilled.contains(&crate::CellRef::new(key.row, key.col.saturating_add(1)))));
+    if array_range || spill_tail || spill_anchor {
+        return Err("选区涉及数组公式或溢出结果，先将数组转换为数值再排序".into());
+    }
+    Ok(())
+}
+
+/// 在一个矩形区域里按 `col` 列排序（col 必须是区域内的一列）。
+/// 调用方须在完成后重建工作簿依赖图并重算，更新移动公式的缓存及跨表下游。
 pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u32, asc: bool) -> Result<(), String> {
     if r2 <= r1 {
         return Ok(());
@@ -25,14 +58,7 @@ pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u3
     if col < c1 || col > c2 {
         return Err("排序列不在选区里".into());
     }
-    // 区域里有合并单元格时 Excel 会拒绝排序，这里也一样
-    if sheet
-        .merges
-        .iter()
-        .any(|(a, b, c, d)| *a <= r2 && *c >= r1 && *b <= c2 && *d >= c1)
-    {
-        return Err("选区里有合并单元格，先取消合并再排序".into());
-    }
+    validate_sort_region(sheet, (r1, c1, r2, c2))?;
 
     // 取每行的键与整行内容
     let mut rows: Vec<(Option<(u8, f64, String)>, u32)> = Vec::new();
@@ -76,17 +102,12 @@ pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u3
         let (line, st) = &base[(*src - r1) as usize];
         for (j, c) in (c1..=c2).enumerate() {
             match &line[j] {
-                Some(cell) => sheet.set(dst, c, cell.clone()),
+                Some(cell) => sheet.set(dst, c, sorted_cell(cell, *src, dst, &sheet.name)),
                 None => {
-                    sheet.remove(dst, c);
+                    sheet.set(dst, c, Cell::default());
                 }
             }
-            let key = CellRef::new(dst, c);
-            if st[j] != 0 {
-                sheet.set_style_loaded(dst, c, st[j]);
-            } else {
-                sheet.styles.remove(&key);
-            }
+            sheet.set_style(dst, c, st[j]);
         }
     }
     Ok(())
