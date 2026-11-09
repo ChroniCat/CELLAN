@@ -609,6 +609,17 @@ pub fn parse_a1(s: &str) -> Option<RefExpr> {
 
 // ---------------------------------------------------------------- 求值
 
+thread_local! {
+    /// 本线程这一轮重算里遇到过循环引用的格子
+    static CYCLE_CELLS: std::cell::RefCell<HashSet<(usize, u32, u32)>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// 取走并清空本轮记录的循环引用格子
+pub fn take_cycle_cells() -> HashSet<(usize, u32, u32)> {
+    CYCLE_CELLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 pub struct Calc<'a> {
     wb: &'a Workbook,
     memo: HashMap<(usize, u32, u32), FValue>,
@@ -735,6 +746,9 @@ impl<'a> Calc<'a> {
 
     pub fn cell_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
         if self.depth >= 200 {
+            CYCLE_CELLS.with(|cells| {
+                cells.borrow_mut().insert((si, r, c));
+            });
             return FValue::Error(ErrKind::Ref);
         }
         self.depth += 1;
@@ -765,6 +779,9 @@ impl<'a> Calc<'a> {
             let expanded = crate::table::expand_structured(self.wb, si, &raw).unwrap_or(raw);
             let body = expanded.as_str();
             if !self.visiting.insert(key) {
+                CYCLE_CELLS.with(|cells| {
+                    cells.borrow_mut().insert(key);
+                });
                 return FValue::Error(ErrKind::Circular);
             }
             let v = match parse(body) {

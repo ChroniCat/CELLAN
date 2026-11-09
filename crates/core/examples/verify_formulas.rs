@@ -101,6 +101,9 @@ fn main() {
     eprintln!("重算 {:.2}s", t1.elapsed().as_secs_f64());
 
     // 3) 逐格对比
+    // 循环引用的格子：Excel 缓存值是历史快照，本引擎按循环处理，不参与比对
+    let cycles = sheetcore::formula::take_cycle_cells();
+    let mut circular = 0usize;
     let mut same = 0usize;
     let mut close = 0usize;
     let mut diff = 0usize;
@@ -124,6 +127,10 @@ fn main() {
                 missing += 1;
                 continue;
             };
+            if cycles.contains(&(si, k.row, k.col)) {
+                circular += 1;
+                continue;
+            }
             let got_raw = cell.value.display();
             let expect_x = canon_err(expect).to_string();
             let got_x = canon_err(&got_raw).to_string();
@@ -193,6 +200,7 @@ fn main() {
     println!("完全一致       {same}");
     println!("数值一致(容差) {close}");
     println!("不一致         {diff}");
+    println!("循环引用       {circular}（Excel 缓存是历史快照，单列不参与比例）");
     if total > 0 {
         println!(
             "一致率         {:.4}%",
