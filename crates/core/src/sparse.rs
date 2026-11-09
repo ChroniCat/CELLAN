@@ -354,6 +354,26 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                 "t" if in_is => in_t = true,
                 _ => {}
             },
+            // quick_xml 把 &gt; 这类实体单独发成 GeneralRef 事件；
+            // 不处理就会把比较运算符整个丢掉（"A1&gt;5" 变成 "A15"）
+            Ok(Event::GeneralRef(r)) => {
+                let name = String::from_utf8_lossy(r.as_ref().as_ref()).to_string();
+                let ch = match name.as_str() {
+                    "gt" => Some('>'),
+                    "lt" => Some('<'),
+                    "amp" => Some('&'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => None,
+                };
+                if let Some(c) = ch {
+                    if in_v || in_t {
+                        val.push(c);
+                    } else if let Some(f) = formula.as_mut() {
+                        f.push(c);
+                    }
+                }
+            }
             Ok(Event::Text(t)) => {
                 let s = t.as_ref().to_string();
                 if in_v {
@@ -456,6 +476,27 @@ mod tests {
         assert_eq!(shift_refs("'参数 表'!B7", 1, 0), "'参数 表'!B8");
         assert_eq!(shift_refs("LOG10(A1)", 1, 0), "LOG10(A2)", "函数名不能被当成引用");
         assert_eq!(shift_refs("\"A1\"&A1", 1, 0), "\"A1\"&A2", "字符串里的不动");
+    }
+
+
+    #[test]
+    fn formula_entities_are_unescaped() {
+        // Excel 把 > < 写成实体；不还原的话比较运算会整条丢掉
+        let xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="B1"><f>IF(A1&gt;5,1,0)</f><v>1</v></c></row>
+            <row r="2"><c r="B2"><f>IF(A2&lt;=3,"小","大")</f><v>2</v></c></row>
+            <row r="3"><c r="B3"><f>IF(AND(A3&gt;=1,A3&lt;9),"中","外")</f><v>3</v></c></row>
+        </sheetData></worksheet>"#;
+        let cells = parse_sheet_xml(xml, &[]);
+        let f = |r: u32| {
+            cells
+                .get(&(r, 1))
+                .and_then(|c| c.formula.as_ref().map(|x| x.to_string()))
+                .unwrap_or_default()
+        };
+        assert_eq!(f(0), "=IF(A1>5,1,0)");
+        assert_eq!(f(1), "=IF(A2<=3,\"小\",\"大\")");
+        assert_eq!(f(2), "=IF(AND(A3>=1,A3<9),\"中\",\"外\")");
     }
 
     #[test]
