@@ -392,3 +392,42 @@ pub fn sheet_tab(ui: &mut egui::Ui, name: &str, active: bool) -> Response {
     }
     resp
 }
+
+/// 统一样式的对话框窗口：固定内边距、首次出现在屏幕中间、可拖动、
+/// 不折叠。宽度由调用方给（同一类对话框用同一个宽度）。
+pub fn window<'a>(
+    ctx: &egui::Context,
+    title: impl Into<String>,
+    width: f32,
+) -> egui::Window<'a> {
+    let title = title.into();
+    let screen = ctx.screen_rect();
+    let pos = screen.center() - egui::vec2(width / 2.0, 200.0);
+    egui::Window::new(title.clone())
+        .id(egui::Id::new(("dlg", title)))
+        .collapsible(false)
+        .default_width(width)
+        .default_pos(pos)
+        .frame(
+            egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 8,
+                bottom: 12,
+            }),
+        )
+}
+
+/// 表单的一行：定宽字段名 + 内容
+pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(64.0, 22.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.label(RichText::new(label).size(11.5).weak());
+            },
+        );
+        add(ui);
+    });
+}

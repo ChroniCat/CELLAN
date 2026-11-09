@@ -575,6 +575,12 @@ impl SheetApp {
                         Ok("format") => self.open_format_dialog(),
                         Ok("revision") => self.rev_open = true,
                         Ok("xlink") => self.xlink_dlg = true,
+                        Ok("find") => self.find.open = true,
+                        Ok("cf") => self.cf_mgr = true,
+                        Ok("chart") => {
+                            self.chart_mgr = true;
+                            self.reload_charts();
+                        }
                         _ => {}
                     }
                     // 无界面验收：SC_REV_REVERT=N 撤回倒数第 N 条修订
@@ -1857,7 +1863,7 @@ impl SheetApp {
         let margins = self.wb.sheet(self.sheet_idx).page.margins;
         let scale_txt = layout.scale;
 
-        egui::Window::new("打印预览")
+        ui_kit::window(ctx, "打印预览", 420.0)
             .open(&mut open)
             .default_width(page_w + 280.0)
             .show(ctx, |ui| {
@@ -2420,7 +2426,7 @@ impl SheetApp {
         }
         let mut open = true;
         let mut jump: Option<(u32, u32)> = None;
-        egui::Window::new("在线成员")
+        ui_kit::window(ctx, "在线成员", 260.0)
             .open(&mut open)
             .default_width(260.0)
             .show(ctx, |ui| {
@@ -2543,7 +2549,7 @@ impl SheetApp {
         let mut down: Option<usize> = None;
         let mut goto: Option<(u32, u32, u32, u32)> = None;
         let blocks = self.wb.sheet(self.sheet_idx).cf.blocks.clone();
-        egui::Window::new("条件格式管理")
+        ui_kit::window(ctx, "条件格式管理", 460.0)
             .open(&mut open)
             .default_width(460.0)
             .show(ctx, |ui| {
@@ -2638,7 +2644,7 @@ impl SheetApp {
         let mut open = true;
         let mut run = false;
         let title = if dlg.tab == 0 { "多级排序" } else { "分列" };
-        egui::Window::new(title)
+        ui_kit::window(ctx, title, 420.0)
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -4353,7 +4359,7 @@ impl SheetApp {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new("数据验证")
+        ui_kit::window(ctx, "数据验证", 420.0)
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -4549,7 +4555,7 @@ impl SheetApp {
         let mut apply = false;
         let mut cancel = false;
         let name = format!("批注 {}{}", cell_name(r, c), "");
-        egui::Window::new(name)
+        ui_kit::window(ctx, name, 280.0)
             .collapsible(false)
             .resizable(true)
             .default_width(280.0)
@@ -4828,7 +4834,7 @@ impl SheetApp {
         let Some(mut text) = self.link_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        egui::Window::new("从另一张表取数")
+        ui_kit::window(ctx, "从另一张表取数", 320.0)
             .collapsible(false)
             .resizable(false)
             .default_width(320.0)
@@ -4957,7 +4963,7 @@ impl SheetApp {
         let Some(mut text) = self.macro_run_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        egui::Window::new("运行宏（借助本机 Excel）")
+        ui_kit::window(ctx, "运行宏（借助本机 Excel）", 320.0)
             .collapsible(false)
             .resizable(false)
             .default_width(320.0)
@@ -5136,7 +5142,7 @@ impl SheetApp {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new(format!("筛选 {} 列", cell_name(0, col)))
+        ui_kit::window(ctx, format!("筛选 {} 列", cell_name(0, col)), 220.0)
             .collapsible(false)
             .resizable(true)
             .default_width(220.0)
@@ -5587,7 +5593,7 @@ impl SheetApp {
         let mut revert: Option<usize> = None;
         let mut reload = false;
         let entries = self.rev.clone();
-        egui::Window::new("修订记录")
+        ui_kit::window(ctx, "修订记录", 720.0)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -5757,7 +5763,7 @@ impl SheetApp {
         let mut open = self.xlink_dlg;
         let mut do_refresh = false;
         let mut forget: Option<usize> = None;
-        egui::Window::new("外部链接")
+        ui_kit::window(ctx, "外部链接", 460.0)
             .open(&mut open)
             .resizable(true)
             .default_width(460.0)
@@ -5849,7 +5855,7 @@ impl SheetApp {
         let mut apply = false;
         let mut cancel = false;
         let st = self.fmt_state.clone();
-        egui::Window::new("设置单元格格式")
+        ui_kit::window(ctx, "设置单元格格式", 420.0)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -6129,7 +6135,7 @@ impl SheetApp {
         let Some((idx, mut name)) = self.rename_sheet.take() else { return };
         let mut open = true;
         let mut ok = false;
-        egui::Window::new("重命名工作表")
+        ui_kit::window(ctx, "重命名工作表", 420.0)
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -6164,43 +6170,59 @@ impl SheetApp {
         let mut do_prev = false;
         let mut do_repl = false;
         let mut do_all = false;
-        egui::Window::new("查找与替换")
+        ui_kit::window(ctx, "查找与替换", 380.0)
             .open(&mut open)
-            .collapsible(false)
             .resizable(false)
-            .default_width(320.0)
             .show(ctx, |ui| {
-                egui::Grid::new("find_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("查找");
-                    let r = ui.text_edit_singleline(&mut self.find.find);
+                ui_kit::field(ui, "查找", |ui| {
+                    let r = ui.add_sized(
+                        [ui.available_width(), 22.0],
+                        egui::TextEdit::singleline(&mut self.find.find),
+                    );
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         do_find = true;
                     }
-                    ui.end_row();
-                    ui.label("替换为");
-                    ui.text_edit_singleline(&mut self.find.replace);
-                    ui.end_row();
+                });
+                ui_kit::field(ui, "替换为", |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 22.0],
+                        egui::TextEdit::singleline(&mut self.find.replace),
+                    );
                 });
                 ui.horizontal(|ui| {
+                    ui.add_space(68.0);
                     ui.checkbox(&mut self.find.match_case, "区分大小写");
                     ui.checkbox(&mut self.find.whole_cell, "整格匹配");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("命中 {} 处", self.find.hits))
+                                .size(11.0)
+                                .weak(),
+                        );
+                    });
                 });
+                ui.add_space(6.0);
                 ui.separator();
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("查找下一个").clicked() {
-                        do_find = true;
-                    }
-                    if ui.button("上一个").clicked() {
-                        do_prev = true;
+                    if ui.button("全部替换").clicked() {
+                        do_all = true;
                     }
                     if ui.button("替换").clicked() {
                         do_repl = true;
                     }
-                    if ui.button("全部替换").clicked() {
-                        do_all = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("关闭").clicked() {
+                            self.find.open = false;
+                        }
+                        if ui_kit::primary_button(ui, "查找下一个").clicked() {
+                            do_find = true;
+                        }
+                        if ui.button("上一个").clicked() {
+                            do_prev = true;
+                        }
+                    });
                 });
-                ui.label(egui::RichText::new(format!("已命中 {} 处", self.find.hits)).weak());
             });
         if do_find {
             self.find_next(false);
@@ -6220,7 +6242,7 @@ impl SheetApp {
     fn macro_window(&mut self, ctx: &egui::Context) {
         let Some((mods, mut sel)) = self.macro_win.take() else { return };
         let mut open = true;
-        egui::Window::new("宏代码（只读）")
+        ui_kit::window(ctx, "宏代码（只读）", 420.0)
             .open(&mut open)
             .default_size([720.0, 480.0])
             .show(ctx, |ui| {
@@ -6313,7 +6335,7 @@ impl SheetApp {
         let mut open = true;
         let mut ok = false;
         let mut cancel = false;
-        egui::Window::new("插入图表")
+        ui_kit::window(ctx, "插入图表", 280.0)
             .collapsible(false)
             .resizable(false)
             .default_width(280.0)
@@ -6477,7 +6499,7 @@ impl SheetApp {
         let mut del: Option<usize> = None;
         let mut retype: Option<(usize, sheetcore::charts::ChartKind)> = None;
         let charts = self.wb.sheet(self.sheet_idx).charts.clone();
-        egui::Window::new("图表管理")
+        ui_kit::window(ctx, "图表管理", 340.0)
             .collapsible(false)
             .default_width(340.0)
             .open(&mut open)
@@ -6580,7 +6602,7 @@ impl SheetApp {
                 .map(|(_, n)| n.clone())
                 .unwrap_or_default()
         };
-        egui::Window::new("数据透视表")
+        ui_kit::window(ctx, "数据透视表", 300.0)
             .collapsible(false)
             .resizable(false)
             .default_width(300.0)
@@ -8131,7 +8153,7 @@ impl SheetApp {
         }
         let mut open_wanted: Option<PathBuf> = None;
         let mut close = false;
-        egui::Window::new("开始")
+        ui_kit::window(ctx, "开始", 460.0)
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
@@ -8195,7 +8217,7 @@ impl SheetApp {
         let mut open = true;
         let mut restore: Option<PathBuf> = None;
         let mut close = false;
-        egui::Window::new("历史版本")
+        ui_kit::window(ctx, "历史版本", 560.0)
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
