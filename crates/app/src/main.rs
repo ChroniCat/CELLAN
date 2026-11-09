@@ -1,6 +1,7 @@
 mod files;
 mod net;
 mod session_lock;
+mod single_instance;
 
 use eframe::egui;
 
@@ -110,6 +111,9 @@ struct SheetApp {
     /// 占用卡上写着的编辑者（没连上时显示在标题栏）
     remote_editor: Option<String>,
     last_title: String,
+    /// 别的进程问"你开的是不是这个文件"
+    open_requests: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    shared_current_file: Option<std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>>,
     /// 筛选下拉：列号 + 各选项是否勾选
     filter_popup: Option<(u32, Vec<(String, bool)>)>,
     /// 显示分页虚线
@@ -289,6 +293,8 @@ impl SheetApp {
             auto_join_tried: None,
             remote_editor: None,
             last_title: String::new(),
+            open_requests: None,
+            shared_current_file: None,
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -2964,6 +2970,23 @@ impl SheetApp {
                 }
                 if ui.button("导出 PDF…").clicked() {
                     self.export_pdf_dialog();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui
+                    .button("加入“打开方式”列表")
+                    .on_hover_text("注册 .xlsx/.xlsm，右键“打开方式”里就能选本程序（当前用户，无需管理员）")
+                    .clicked()
+                {
+                    self.register_file_association(false);
+                    ui.close_menu();
+                }
+                if ui
+                    .button("设为默认打开方式")
+                    .on_hover_text("把 .xlsx/.xlsm 直接指向本程序；Windows 可能还会问一次")
+                    .clicked()
+                {
+                    self.register_file_association(true);
                     ui.close_menu();
                 }
             });
@@ -6410,6 +6433,48 @@ impl SheetApp {
         }
     }
 
+
+    /// 别的进程重复打开了同一个文件：后台线程已经比对过并让它退出，
+    /// 这里只负责给用户一个提示
+    fn poll_open_requests(&mut self) {
+        if let Some(cur) = &self.shared_current_file {
+            if let Ok(mut slot) = cur.lock() {
+                *slot = self.wb.path.clone();
+            }
+        }
+        let Some(rx) = &self.open_requests else { return };
+        while let Ok(path) = rx.try_recv() {
+            self.status = format!(
+                "{} 已经在这个窗口打开了",
+                path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            eprintln!("[single] 同一文件重复打开，已切到现有窗口");
+        }
+    }
+
+    /// 注册文件关联（当前用户）
+    fn register_file_association(&mut self, make_default: bool) {
+        let Ok(exe) = std::env::current_exe() else {
+            self.status = "拿不到自己的路径，没法注册关联".into();
+            return;
+        };
+        let res = if make_default {
+            single_instance::set_default(&exe)
+        } else {
+            single_instance::register_association(&exe)
+        };
+        self.status = match res {
+            Ok(_) if make_default => {
+                "已登记为 .xlsx/.xlsm 的默认打开方式；Windows 可能还会问你一次是否允许".into()
+            }
+            Ok(_) => "已加入 .xlsx/.xlsm 的“打开方式”列表，右键即可选本程序".into(),
+            Err(e) => format!("注册关联失败：{e}"),
+        };
+        eprintln!("[assoc] {}", self.status);
+    }
+
     fn join_shared(&mut self) {
         let site = rand_site();
         let addr = self.join_addr.trim().to_string();
@@ -6708,6 +6773,7 @@ impl eframe::App for SheetApp {
         self.macro_run_dialog(ctx);
         self.macro_run_probe();
         self.tick_session();
+        self.poll_open_requests();
         self.update_window_title(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
@@ -7006,6 +7072,39 @@ fn main() -> eframe::Result<()> {
             initial = Some(PathBuf::from(a));
         }
     }
+    // 命令行注册关联：打包脚本/安装器可以直接调用
+    if std::env::args().any(|a| a == "--register-assoc") {
+        let Ok(exe) = std::env::current_exe() else { return Ok(()) };
+        match single_instance::register_association(&exe) {
+            Ok(_) => println!("已加入“打开方式”列表"),
+            Err(e) => println!("注册失败：{e}"),
+        }
+        return Ok(());
+    }
+    if std::env::args().any(|a| a == "--set-default") {
+        let Ok(exe) = std::env::current_exe() else { return Ok(()) };
+        match single_instance::set_default(&exe) {
+            Ok(_) => println!("已设为默认打开方式"),
+            Err(e) => println!("设置失败：{e}"),
+        }
+        return Ok(());
+    }
+
+    // 单实例：同一个文件重复双击时，把注意力交给已经打开的窗口
+    // 用 Rc<RefCell<..>> 是因为渲染后端重试时闭包会被构造多次
+    let current_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let role = single_instance::claim(initial.clone(), current_file.clone());
+    let open_requests = match role {
+        single_instance::Role::FocusedExisting => {
+            println!("已在此窗口中打开");
+            return Ok(());
+        }
+        single_instance::Role::Primary(rx) => Some(rx),
+        single_instance::Role::Standalone => None,
+    };
+    let open_requests = std::rc::Rc::new(std::cell::RefCell::new(open_requests));
+
     // 渲染后端：--renderer=wgpu|glow|auto，默认 auto（先 wgpu，失败退 glow）
     let mut want = std::env::var("SC_RENDERER").unwrap_or_else(|_| "auto".into());
     for a in std::env::args().skip(1) {
@@ -7071,7 +7170,15 @@ fn main() -> eframe::Result<()> {
             attempt += 1;
             continue;
         }
-        let r = run_app(&mut opts, initial.clone(), auto_host, auto_join.clone(), auto_pass.clone());
+        let r = run_app(
+            &mut opts,
+            initial.clone(),
+            auto_host,
+            auto_join.clone(),
+            auto_pass.clone(),
+            open_requests.clone(),
+            current_file.clone(),
+        );
         match r {
             Ok(()) => break Ok(()),
             Err(e) => {
@@ -7092,6 +7199,8 @@ fn run_app(
     auto_host: bool,
     auto_join: Option<String>,
     auto_pass: Option<String>,
+    open_requests: std::rc::Rc<std::cell::RefCell<Option<std::sync::mpsc::Receiver<PathBuf>>>>,
+    current_file: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 ) -> Result<(), eframe::Error> {
     eframe::run_native(
         "sheets-native",
@@ -7099,8 +7208,11 @@ fn run_app(
         {
             let initial = initial.clone();
             let auto_join = auto_join.clone();
+            let open_requests = open_requests.clone();
             Box::new(move |cc| {
                 let mut app = SheetApp::new(cc, initial.clone());
+                app.open_requests = open_requests.borrow_mut().take();
+                app.shared_current_file = Some(current_file.clone());
                 if let Some(pw) = auto_pass.clone() {
                     app.room_password = pw;
                 }
