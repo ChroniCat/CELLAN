@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
-use sheetcore::Workbook;
+use sheetcore::{Workbook, xlsx::SaveReceipt};
 
 use super::OpenMsg;
 
@@ -21,7 +21,7 @@ pub(crate) struct DocumentTasks {
 
 pub(crate) struct PendingSave {
     pub target: PathBuf,
-    pub rx: Receiver<Result<(), String>>,
+    pub rx: Receiver<Result<SaveReceipt, String>>,
 }
 
 impl DocumentTasks {
@@ -36,7 +36,7 @@ impl DocumentTasks {
         wb.dirty = false;
         std::thread::spawn(move || {
             // The core owns the temporary write, history, and atomic replacement.
-            let result = sheetcore::xlsx::save_atomic(&target, &snapshot)
+            let result = sheetcore::xlsx::save_atomic_with_receipt(&target, &snapshot)
                 .map_err(|e| format!("保存失败: {e:#}"));
             let _ = tx.send(result);
         });
@@ -51,7 +51,8 @@ impl DocumentTasks {
         };
         let pending = self.saving.take().unwrap();
         Some(match result {
-            Ok(()) => {
+            Ok(receipt) => {
+                receipt.apply_to(wb);
                 wb.path = Some(pending.target.clone());
                 Ok(pending.target)
             }
@@ -62,3 +63,7 @@ impl DocumentTasks {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "save_receipt_tests.rs"]
+mod tests;

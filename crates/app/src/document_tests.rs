@@ -20,7 +20,7 @@ fn book(number: f64) -> Workbook {
     wb
 }
 
-fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<(), String>> {
+fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<sheetcore::xlsx::SaveReceipt, String>> {
     let (tx, rx) = mpsc::channel();
     app.tasks.saving = Some(document_tasks::PendingSave { target: target.into(), rx });
     app.wb.dirty = false;
@@ -41,7 +41,7 @@ fn save_completion_updates_its_parked_document_only() {
     let tx = delayed_save(&mut app, "a-saved.xlsx");
     app.open_in_new_tab(PathBuf::new());
     put(&mut app.wb, 22.0);
-    tx.send(Ok(())).unwrap();
+    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
 
     assert_eq!(app.wb.path, None, "A must not assign its save path to B");
@@ -60,12 +60,12 @@ fn saves_completing_out_of_order_keep_their_own_paths() {
     let a = delayed_save(&mut app, "a.xlsx");
     app.open_in_new_tab(PathBuf::new());
     let b = delayed_save(&mut app, "b.xlsx");
-    b.send(Ok(())).unwrap();
+    b.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, Some(PathBuf::from("b.xlsx")));
     assert!(parked(&app, 0).tasks.saving.is_some());
     app.switch_tab(0);
-    a.send(Ok(())).unwrap();
+    a.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, Some(PathBuf::from("a.xlsx")));
     assert_eq!(parked(&app, 1).wb.path, Some(PathBuf::from("b.xlsx")));
@@ -138,7 +138,7 @@ fn recalculation_cannot_restore_the_path_from_before_save_as() {
     app.wb.dirty = true;
     let old_snapshot = app.wb.clone();
     let save = delayed_save(&mut app, "new.xlsx");
-    save.send(Ok(())).unwrap();
+    save.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
     let (tx, rx) = mpsc::channel();
     app.tasks.open_rx = Some(rx);
@@ -158,7 +158,7 @@ fn opening_another_file_while_saving_preserves_the_saving_tab() {
     app.open_path(std::env::temp_dir().join("sheetflow-no-such-doc-for-save-test.xlsx"));
     assert_eq!(app.tabs.len(), 2);
     assert_eq!(app.active_tab, 1);
-    tx.send(Ok(())).unwrap();
+    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, None);
     assert_eq!(parked(&app, 0).wb.path, Some(PathBuf::from("a.xlsx")));
@@ -174,7 +174,7 @@ fn closing_a_saving_tab_waits_for_its_result() {
     app.switch_tab(0);
     app.close_tab(0);
     assert_eq!(app.tabs.len(), 2);
-    tx.send(Ok(())).unwrap();
+    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
     app.poll_save();
     app.close_tab(0);
     assert_eq!(app.tabs.len(), 1);

@@ -58,6 +58,8 @@ fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
 }
 #[path = "xlsx_structure.rs"]
 mod structure;
+#[path = "xlsx_pivots.rs"]
+mod pivots;
 
 fn data_to_value(d: &Data) -> Value {
     match d {
@@ -183,6 +185,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
         links: crate::xlinks::read(path),
         names_dirty: false,
         pivot_shifts: Vec::new(),
+        pivot_cache_base: Default::default(),
+        pivot_session: Default::default(),
         has_vba: crate::vba::has_macros(path),
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
@@ -440,7 +444,60 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    if is_ooxml {
+        wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
+            definitions: pivot_definitions(path),
+            sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
+        });
+    }
     Ok(wb)
+}
+
+fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
+    crate::fixups::parts(path).into_iter()
+        .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
+        .filter_map(|name| crate::fixups::read_part_file(path, &name).map(|body| (name, body)))
+        .collect()
+}
+
+/// Metadata produced by one successfully replaced OOXML package. It can be
+/// applied to a newer live document without resetting edits made during save.
+#[derive(Debug, Default)]
+pub struct SaveReceipt {
+    sheets: Vec<(u64, String)>,
+}
+
+struct RestoreFile(Option<std::path::PathBuf>);
+impl Drop for RestoreFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 { let _ = std::fs::remove_file(path); }
+    }
+}
+
+impl SaveReceipt {
+    pub fn apply_to(&self, wb: &mut Workbook) {
+        for sheet in &mut wb.sheets {
+            if let Some((_, part)) = self.sheets.iter().find(|(id, _)| *id == sheet.identity) {
+                sheet.source_part = Some(part.clone());
+            }
+        }
+    }
+}
+
+/// Save a snapshot, then acknowledge only its sheet identities in the live
+/// workbook. Callers retaining the workbook should apply the returned receipt.
+pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
+    save_atomic(path, wb)?;
+    if path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("xls")) {
+        return Ok(SaveReceipt::default());
+    }
+    let targets = crate::patch::sheet_targets(path).context("读取已保存的工作表身份失败")?;
+    let sheets = wb.sheets.iter().map(|sheet| {
+        let part = targets.get(&sheet.name)
+            .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
+        Ok((sheet.identity, part.clone()))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(SaveReceipt { sheets })
 }
 
 /// 写回 xlsx。文件已存在时先读入，以保留样式、列宽等未改动的部分。
@@ -505,16 +562,15 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // 宏部件：umya 写不出来，先留一份，写完塞回去
     let vba = crate::vba::read_vba(&base);
     // 原地保存时，写盘会把 base 覆盖掉——先把「要保住的那部分」复制一份出来
-    let restore_src = if base == path {
+    let restore_src = if base == path && base.exists() {
         let tmp = path.with_extension("preserve.tmp");
-        match std::fs::copy(&base, &tmp) {
-            Ok(_) => Some(tmp),
-            Err(_) => None,
-        }
+        std::fs::copy(&base, &tmp).context("无法保留原地保存基准")?;
+        Some(tmp)
     } else {
         None
     };
     let restore_base = restore_src.clone().unwrap_or_else(|| base.clone());
+    let _restore_cleanup = RestoreFile(restore_src);
     // 样式表在写之前先留一份：base 可能就是目标文件，写完再读就变味了
     let base_styles: Option<Vec<u8>> = if restore_base.exists() {
         crate::fixups::read_part(&restore_base, "xl/styles.xml")
@@ -641,6 +697,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         for (cref, cell) in sheet.iter() {
             // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
             if sheet.spilled.contains(&cref) {
+                // A moved spill may cover a previously persisted ordinary cell.
+                // Its old value must not become a blocker when reopening.
+                ws.remove_cell((cref.col + 1, cref.row + 1));
                 continue;
             }
             let coord = (cref.col + 1, cref.row + 1);
@@ -757,11 +816,19 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // Restore its definition even when the part still exists, then apply our
     // explicit source changes. Missing-part recovery alone cannot detect this.
     if restore_base.exists() {
-        let definitions: Vec<(String, Vec<u8>)> = crate::fixups::parts(&restore_base)
-            .into_iter()
-            .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
-            .filter_map(|name| crate::fixups::read_part_file(&restore_base, &name).map(|body| (name, body)))
-            .collect();
+        let mut definitions = pivot_definitions(&restore_base);
+        let changes: Vec<_> = wb.pivot_cache_base.sheets.iter().filter_map(|(id, old)| {
+            let new = wb.sheets.iter().find(|s| s.identity == *id).map(|s| s.name.clone());
+            (new.as_ref() != Some(old)).then(|| (old.clone(), new))
+        }).collect();
+        for (name, body) in &wb.pivot_cache_base.definitions {
+            let body = structure::rewrite_pivot_source(body, &changes)?;
+            if let Some((_, old)) = definitions.iter_mut().find(|(part, _)| part == name) {
+                *old = body;
+            } else {
+                definitions.push((name.clone(), body));
+            }
+        }
         if !definitions.is_empty() {
             crate::patch::append_entries(path, &definitions).context("保留透视表缓存定义失败")?;
         }
@@ -810,22 +877,6 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             if let Err(e) = crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes) {
                 eprintln!("[save] 图表引用回写失败: {e:#}");
             }
-        }
-    }
-
-    if let Some(t) = restore_src {
-        let _ = std::fs::remove_file(t);
-    }
-
-    // 透视表部件（必须等主体写完）
-    for (si, spec, res, rect, label) in wb.pivots_pending.iter() {
-        let name = wb
-            .sheets
-            .get(*si)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "Sheet1".to_string());
-        if let Err(e) = crate::pivot_xml::attach(path, &name, spec, res, *rect, label) {
-            eprintln!("[save] 透视表部件写入失败: {e:#}");
         }
     }
 
@@ -995,10 +1046,20 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
             }
         }
         Ok(_) => {}
-        Err(e) => eprintln!("[save] 落盘失败: {e:#}"),
+        Err(e) => return Err(e).context("保存补丁落盘失败"),
     }
     if prof {
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());
+    }
+    // Session attachments were stripped from the private base. Rebuild them
+    // from the complete current model after all skeleton/relationship fixups,
+    // which must not overwrite the new registrations. No pending work is
+    // consumed: structural undo can still restore its specifications.
+    pivots::restore_imported_parts(path, &restore_base)?;
+    for (si, spec, res, rect, label) in &wb.pivots_pending {
+        let sheet = wb.sheets.get(*si).context("透视表所属工作表不存在")?;
+        crate::pivot_xml::attach_for_session(path, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
+            .context("透视表部件写入失败")?;
     }
     Ok(())
 }

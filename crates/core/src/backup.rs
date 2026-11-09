@@ -26,16 +26,40 @@ fn stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    format_stamp(now)
+}
+
+fn format_stamp(now: u64) -> String {
     let secs = now % 86_400;
     let days = now / 86_400;
     // 简化：用天数偏移算日期（从 1970 起），只用于生成有序名字，不要求日历精确到闰秒
-    let (y, m, d) = civil_from_days(days as i64 + 719_468);
+    let (y, m, d) = civil_from_days(days as i64);
     format!(
         "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
         secs / 3600,
         (secs % 3600) / 60,
         secs % 60
     )
+}
+
+// Older builds applied the civil-date offset twice (e.g. 2026 became 3996).
+// Normalize those names when ordering existing history; otherwise every new
+// correctly dated backup would be pruned before the old versions.
+fn normalized_date(date: &str) -> String {
+    let year = date[..4].parse::<i64>().unwrap_or(0);
+    let month = date[4..6].parse::<i64>().unwrap_or(0);
+    let day = date[6..8].parse::<i64>().unwrap_or(0);
+    if year < 3900 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return date.to_owned();
+    }
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let (y, m, d) = civil_from_days(days - 719_468);
+    format!("{y:04}{m:02}{d:02}")
 }
 
 /// 从 1970-01-01 起的天数换算成年月日（Howard Hinnant 的算法）
@@ -72,12 +96,19 @@ pub fn keep_previous(file: &Path) -> std::io::Result<Option<PathBuf>> {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook.xlsx".into());
-    let mut target = dir.join(format!("{}-{name}", stamp()));
+    let stamp = stamp();
+    // Pruning may have removed the unsuffixed version already. Continue past
+    // the highest sequence instead of reusing a hole that would sort oldest.
+    let mut n = list(file).iter().filter_map(|v| {
+        let suffix = v.stamp.strip_prefix(&stamp)?;
+        if suffix.is_empty() { Some(0) } else { suffix.strip_prefix('-')?.parse::<u64>().ok() }
+    }).max().map_or(0, |n| n + 1);
+    let target_for = |n| dir.join(if n == 0 { format!("{stamp}-{name}") } else { format!("{stamp}-{n}-{name}") });
+    let mut target = target_for(n);
     // 同一秒保存两次：加序号，别互相覆盖
-    let mut n = 1;
     while target.exists() {
-        target = dir.join(format!("{}-{n}-{name}", stamp()));
         n += 1;
+        target = target_for(n);
     }
     std::fs::copy(file, &target)?;
     let _ = prune(file, KEEP);
@@ -90,7 +121,8 @@ pub fn list(file: &Path) -> Vec<Version> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out: Vec<Version> = entries
+    let original_name = file.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut out: Vec<(Version, u64)> = entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
@@ -98,13 +130,23 @@ pub fn list(file: &Path) -> Vec<Version> {
                 return None;
             }
             let name = path.file_name()?.to_string_lossy().to_string();
-            let stamp = name.split('-').next()?.to_string();
+            let prefix = name.strip_suffix(&format!("-{original_name}"))?;
+            let mut pieces = prefix.split('-');
+            let date = pieces.next()?;
+            let time = pieces.next()?;
+            if date.len() != 8 || time.len() != 6 || !date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let sequence = pieces.next().map(str::parse::<u64>).transpose().ok()?.unwrap_or(0);
+            if pieces.next().is_some() { return None; }
+            let date = normalized_date(date);
+            let stamp = if sequence == 0 { format!("{date}-{time}") } else { format!("{date}-{time}-{sequence}") };
             let bytes = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
-            Some(Version { path, stamp, bytes })
+            Some((Version { path, stamp, bytes }, sequence))
         })
         .collect();
-    out.sort_by(|a, b| b.stamp.cmp(&a.stamp));
-    out
+    out.sort_by(|(a, a_seq), (b, b_seq)| b.stamp[..15].cmp(&a.stamp[..15]).then_with(|| b_seq.cmp(a_seq)));
+    out.into_iter().map(|(version, _)| version).collect()
 }
 
 /// 只保留最近 `keep` 份
@@ -189,5 +231,9 @@ mod tests {
     fn civil_dates_are_sane() {
         let (y, m, d) = civil_from_days(0);
         assert_eq!((y, m, d), (1970, 1, 1));
+        assert_eq!(format_stamp(0), "19700101-000000");
+        assert_eq!(format_stamp(86_401), "19700102-000001");
+        let (y, m, d) = civil_from_days(20_767 + 719_468);
+        assert_eq!(normalized_date(&format!("{y:04}{m:02}{d:02}")), format_stamp(20_767 * 86_400)[..8]);
     }
 }

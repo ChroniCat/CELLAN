@@ -6,7 +6,8 @@
 //! 协作场景：撤销时如果某格当前值已经不是「我改成的样子」，说明别人后来动过，
 //! 跳过它——不拿旧值盖掉别人的新编辑。
 
-use crate::model::{Cell, Sheet};
+use crate::model::{Cell, CellRef, Sheet, Workbook};
+use std::collections::HashSet;
 
 /// 一格的前后状态
 #[derive(Clone, Debug)]
@@ -80,8 +81,8 @@ impl Action {
 }
 
 pub struct UndoStack {
-    done: Vec<Action>,
-    undone: Vec<Action>,
+    done: Vec<Entry>,
+    undone: Vec<Entry>,
     /// 最多保留多少步
     pub limit: usize,
     /// 我是谁（协作站点号）；0 表示单人。撤销只退自己的动作
@@ -96,6 +97,188 @@ pub struct Applied {
     pub focus: (usize, u32, u32),
     /// 因为别人改过而跳过的格子数
     pub skipped: usize,
+    /// Structural restoration changes coordinates and references across sheets.
+    /// Rebuild dependencies and recalculate the workbook after applying it.
+    pub structural: bool,
+}
+
+enum Entry {
+    Cells(Action),
+    Structure(StructureAction),
+}
+
+impl Entry {
+    fn label(&self) -> &str {
+        match self { Self::Cells(a) => &a.label, Self::Structure(a) => &a.label }
+    }
+    fn by_site(&self) -> u32 {
+        match self { Self::Cells(a) => a.by_site, Self::Structure(a) => a.by_site }
+    }
+}
+
+struct StructureAction {
+    label: String,
+    before: StructureSnapshot,
+    after: StructureSnapshot,
+    focus: (usize, u32, u32),
+    by_site: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ForeignReferences {
+    sheet: usize,
+    cells: Vec<(CellRef, Cell)>,
+    cf: Option<crate::cf::CfSheet>,
+    dv: Option<Vec<crate::dv::DataValidation>>,
+    charts: Option<Vec<crate::charts::Chart>>,
+}
+
+type PendingPivot = (usize, crate::pivot::PivotSpec, crate::pivot::PivotResult,
+    (u32, u32, u32, u32), String);
+
+/// A structural edit owns one complete sheet, plus only the foreign formulas
+/// and reference metadata that the edit changes. Unrelated sheets' value cells
+/// are never copied. File paths and source-part identities remain live state.
+#[derive(Clone, Debug)]
+pub struct StructureSnapshot {
+    sheet: usize,
+    target: Sheet,
+    foreign: Vec<ForeignReferences>,
+    names: Vec<(String, Option<usize>, String)>,
+    pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
+    pending_pivots: Vec<PendingPivot>,
+}
+
+pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::Structural) -> StructureSnapshot {
+    use crate::{refs::{Axis, Shift}, structural::Structural};
+    let (axis, at, n, delete) = match op {
+        Structural::InsertRows { at, n } => (Axis::Row, *at, *n, false),
+        Structural::DeleteRows { at, n } => (Axis::Row, *at, *n, true),
+        Structural::InsertCols { at, n } => (Axis::Col, *at, *n, false),
+        Structural::DeleteCols { at, n } => (Axis::Col, *at, *n, true),
+    };
+    let target = wb.sheets[sheet].clone();
+    let mut foreign = Vec::new();
+    for (si, other) in wb.sheets.iter().enumerate().filter(|(si, _)| *si != sheet) {
+        let shift = Shift { axis, at, n, delete, target_sheet: target.name.clone(), own_sheet: other.name.clone(), translate: None };
+        let changes = |f: &str| crate::refs::rewrite(f, &shift) != f;
+        let cells: Vec<_> = other.iter().filter(|(_, c)| c.formula.as_deref().is_some_and(changes))
+            .map(|(key, c)| (key, c.clone())).collect();
+        let cf = other.cf.blocks.iter().any(|block| block.rules.iter().any(|rule| match &rule.kind {
+            crate::cf::CfKind::Expr { formula, .. } => changes(formula),
+            crate::cf::CfKind::CellIs { a, b, .. } => changes(a) || changes(b),
+            _ => false,
+        })).then(|| other.cf.clone());
+        let dv = other.dv.iter().any(|rule| changes(&rule.f1) || changes(&rule.f2)).then(|| other.dv.clone());
+        let charts = other.charts.iter().any(|chart| chart.series.iter().any(|series| {
+            changes(&series.name_ref) || changes(&series.cat_ref) || changes(&series.val_ref)
+        })).then(|| other.charts.clone());
+        if !cells.is_empty() || cf.is_some() || dv.is_some() || charts.is_some() {
+            foreign.push(ForeignReferences { sheet: si, cells, cf, dv, charts });
+        }
+    }
+    StructureSnapshot {
+        sheet, target, foreign, names: wb.names.clone(), pivot_shifts: wb.pivot_shifts.clone(),
+        pending_pivots: wb.pivots_pending.clone(),
+    }
+}
+
+impl StructureSnapshot {
+    /// Capture the same locations after applying the structural edit. In
+    /// particular, a deleted reference is now #REF! and cannot be rediscovered
+    /// by running the original reference matcher against the new workbook.
+    pub fn capture_after(&self, wb: &Workbook) -> Self {
+        Self {
+            sheet: self.sheet,
+            target: wb.sheets[self.sheet].clone(),
+            foreign: self.foreign.iter().map(|scope| {
+                let sheet = &wb.sheets[scope.sheet];
+                ForeignReferences {
+                    sheet: scope.sheet,
+                    cells: scope.cells.iter().map(|(key, _)| (*key, sheet.get(key.row, key.col).cloned().unwrap_or_default())).collect(),
+                    cf: scope.cf.as_ref().map(|_| sheet.cf.clone()),
+                    dv: scope.dv.as_ref().map(|_| sheet.dv.clone()),
+                    charts: scope.charts.as_ref().map(|_| sheet.charts.clone()),
+                }
+            }).collect(),
+            names: wb.names.clone(),
+            pivot_shifts: wb.pivot_shifts.clone(),
+            pending_pivots: wb.pivots_pending.clone(),
+        }
+    }
+}
+
+/// Keep the chart write journal relative to the current disk baseline, while
+/// appending a reference change for the state we are restoring.
+fn restored_charts(current: &[crate::charts::Chart], desired: &[crate::charts::Chart]) -> Vec<crate::charts::Chart> {
+    let mut restored = desired.to_vec();
+    for (i, chart) in restored.iter_mut().enumerate() {
+        let old = current.iter().find(|candidate| !chart.part.is_empty() && candidate.part == chart.part)
+            .or_else(|| current.get(i));
+        let Some(old) = old else { continue };
+        chart.ref_fixes = old.ref_fixes.clone();
+        for (old, new) in old.series.iter().zip(&chart.series) {
+            for (from, to) in [(&old.name_ref, &new.name_ref), (&old.cat_ref, &new.cat_ref), (&old.val_ref, &new.val_ref)] {
+                if from != to { chart.ref_fixes.push((from.clone(), to.clone())); }
+            }
+        }
+    }
+    restored
+}
+
+fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot) -> Vec<(usize, u32, u32)> {
+    let Some(current) = wb.sheets.get(snap.sheet) else { return Vec::new() };
+    let mut touched: HashSet<_> = current.iter().map(|(key, _)| (snap.sheet, key.row, key.col)).collect();
+    touched.extend(snap.target.iter().map(|(key, _)| (snap.sheet, key.row, key.col)));
+    let mut target = snap.target.clone();
+    // Saving may have assigned a part to a previously new sheet. Undo changes
+    // its content, not its identity or the current save baseline.
+    target.identity = current.identity;
+    target.source_part = current.source_part.clone();
+    target.cleared.extend(current.cleared.iter().copied());
+    target.cleared.extend(current.iter().filter(|(key, _)| !target.contains(key.row, key.col)).map(|(key, _)| key).collect::<Vec<_>>());
+    target.style_edits.extend(current.style_edits.iter().copied());
+    target.style_edits.extend(current.styles.keys().copied());
+    target.style_edits.extend(target.styles.keys().copied());
+    target.charts = restored_charts(&current.charts, &target.charts);
+    target.loading = false;
+    target.edited = true;
+    target.styles_dirty = !target.style_edits.is_empty();
+    target.merges_dirty = true;
+    target.cf_dirty = true;
+    target.dv_dirty = true;
+    target.notes_dirty = true;
+    target.freeze_dirty = true;
+    target.filter_dirty = true;
+    target.page_dirty = true;
+    target.charts_dirty = true;
+    wb.sheets[snap.sheet] = target;
+    for foreign in &snap.foreign {
+        let Some(sheet) = wb.sheets.get_mut(foreign.sheet) else { continue };
+        for (key, cell) in &foreign.cells {
+            sheet.set(key.row, key.col, cell.clone());
+            touched.insert((foreign.sheet, key.row, key.col));
+        }
+        if let Some(cf) = &foreign.cf { sheet.cf = cf.clone(); sheet.cf_dirty = true; }
+        if let Some(dv) = &foreign.dv { sheet.dv = dv.clone(); sheet.dv_dirty = true; }
+        if let Some(charts) = &foreign.charts {
+            sheet.charts = restored_charts(&sheet.charts, charts);
+            sheet.charts_dirty = true;
+        }
+        sheet.edited = true;
+    }
+    if wb.names != snap.names {
+        wb.names = snap.names.clone();
+        wb.names_dirty = true;
+    }
+    wb.pivot_shifts = snap.pivot_shifts.clone();
+    // A deleted source/field/output removes its refreshable definition. Restore
+    // the full entry on undo; save keeps this session-owned list authoritative.
+    wb.pivots_pending = snap.pending_pivots.clone();
+    wb.dirty = true;
+    let mut touched: Vec<_> = touched.into_iter().collect();
+    touched.sort_unstable();
+    touched
 }
 
 impl Default for UndoStack {
@@ -128,7 +311,7 @@ impl UndoStack {
         if action.by_site == 0 {
             action.by_site = self.site;
         }
-        self.done.push(action);
+        self.done.push(Entry::Cells(action));
         // 新动作让「重做」失效
         self.undone.clear();
         let limit = if self.limit == 0 { 200 } else { self.limit };
@@ -146,15 +329,50 @@ impl UndoStack {
     }
 
     pub fn undo_label(&self) -> Option<&str> {
-        self.done.last().map(|a| a.label.as_str())
+        self.done.last().map(Entry::label)
     }
 
     pub fn redo_label(&self) -> Option<&str> {
-        self.undone.last().map(|a| a.label.as_str())
+        self.undone.last().map(Entry::label)
     }
 
     pub fn depth(&self) -> (usize, usize) {
         (self.done.len(), self.undone.len())
+    }
+
+    pub fn undo_is_structure(&self) -> bool {
+        matches!(self.done.last(), Some(Entry::Structure(_)))
+    }
+
+    pub fn redo_is_structure(&self) -> bool {
+        matches!(self.undone.last(), Some(Entry::Structure(_)))
+    }
+
+    pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
+        self.done.push(Entry::Structure(StructureAction { label: label.into(), before, after, focus, by_site: self.site }));
+        self.undone.clear();
+        let limit = if self.limit == 0 { 200 } else { self.limit };
+        if self.done.len() > limit { self.done.remove(0); }
+    }
+
+    pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+        if !self.undo_is_structure() { return self.undo(&mut wb.sheets, guard); }
+        if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
+        let Entry::Structure(action) = self.done.pop()? else { unreachable!() };
+        let touched = restore_structure(wb, &action.before);
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true };
+        self.undone.push(Entry::Structure(action));
+        Some(applied)
+    }
+
+    pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+        if !self.redo_is_structure() { return self.redo(&mut wb.sheets, guard); }
+        if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
+        let Entry::Structure(action) = self.undone.pop()? else { unreachable!() };
+        let touched = restore_structure(wb, &action.after);
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true };
+        self.done.push(Entry::Structure(action));
+        Some(applied)
     }
 
     /// 撤销一步。`guard` 返回 false 的格子会被跳过（协作时不覆盖别人的新改动）。
@@ -163,16 +381,17 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        if self.undo_is_structure() { return None; }
         // 只撤自己的：栈顶不是我的动作就不动（也不丢，免得误删历史）
         if self
             .done
             .last()
-            .map(|a| a.by_site != 0 && self.site != 0 && a.by_site != self.site)
+            .map(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site)
             .unwrap_or(false)
         {
             return None;
         }
-        let action = self.done.pop()?;
+        let Entry::Cells(action) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         if let Some(snap) = action.snap_before.clone() {
@@ -185,8 +404,9 @@ impl UndoStack {
                 label: action.label.clone(),
                 focus: action.focus,
                 skipped,
+                structural: true,
             };
-            self.undone.push(action);
+            self.undone.push(Entry::Cells(action));
             return Some(applied);
         }
         for d in action.deltas.iter().rev() {
@@ -208,8 +428,9 @@ impl UndoStack {
             label: action.label.clone(),
             focus: action.focus,
             skipped,
+            structural: false,
         };
-        self.undone.push(action);
+        self.undone.push(Entry::Cells(action));
         Some(applied)
     }
 
@@ -219,15 +440,16 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        if self.redo_is_structure() { return None; }
         if self
             .undone
             .last()
-            .map(|a| a.by_site != 0 && self.site != 0 && a.by_site != self.site)
+            .map(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site)
             .unwrap_or(false)
         {
             return None;
         }
-        let action = self.undone.pop()?;
+        let Entry::Cells(action) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         if let Some(snap) = action.snap_after.clone() {
@@ -240,8 +462,9 @@ impl UndoStack {
                 label: action.label.clone(),
                 focus: action.focus,
                 skipped,
+                structural: true,
             };
-            self.done.push(action);
+            self.done.push(Entry::Cells(action));
             return Some(applied);
         }
         for d in action.deltas.iter() {
@@ -263,8 +486,9 @@ impl UndoStack {
             label: action.label.clone(),
             focus: action.focus,
             skipped,
+            structural: false,
         };
-        self.done.push(action);
+        self.done.push(Entry::Cells(action));
         Some(applied)
     }
 

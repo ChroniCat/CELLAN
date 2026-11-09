@@ -13,8 +13,11 @@ fn valid_name(wb: &Workbook, except: Option<usize>, name: &str) -> bool {
 
 /// Insert a new sheet while keeping existing local names and pending pivot
 /// attachments associated with their original sheets.
-pub fn insert_sheet(wb: &mut Workbook, idx: usize, sheet: Sheet) -> bool {
+pub fn insert_sheet(wb: &mut Workbook, idx: usize, mut sheet: Sheet) -> bool {
     if idx > wb.sheets.len() || !valid_name(wb, None, &sheet.name) { return false; }
+    if wb.sheets.iter().any(|existing| existing.identity == sheet.identity) {
+        sheet.renew_identity();
+    }
     for (_, local, _) in &mut wb.names {
         if let Some(i) = local.as_mut() {
             if *i >= idx { *i += 1; wb.names_dirty = true; }

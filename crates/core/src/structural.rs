@@ -82,6 +82,13 @@ impl Sheet {
     /// 加入房间时用：格子由宿主的快照给出（已经是新坐标），
     /// 再按历史搬一次就会搬两遍。
     pub fn apply_structural_structure_only(&mut self, op: &Structural) {
+        let (rows, at, n, delete) = match *op {
+            Structural::InsertRows { at, n } => (true, at, n, false),
+            Structural::DeleteRows { at, n } => (true, at, n, true),
+            Structural::InsertCols { at, n } => (false, at, n, false),
+            Structural::DeleteCols { at, n } => (false, at, n, true),
+        };
+        self.shift_array_metadata(rows, at, n, delete);
         match op {
             Structural::InsertRows { at, n } => {
                 self.merges = self
@@ -163,6 +170,50 @@ impl Sheet {
         }
     }
 
+    /// 数组元数据与单元格使用同一坐标变换。旧溢出尾格仍需登记，
+    /// 后续重算才能清除它们，而不会把它们误当成用户输入的阻塞项。
+    fn shift_array_metadata(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
+        if n == 0 {
+            return;
+        }
+        // 刚从 OOXML 读入、尚未重算时，CSE 尾格还没有 spilled 标记。
+        // 先登记旧范围；即使本次删掉了锚点，剩余的缓存尾格也能被清理。
+        for &(anchor, (r1, c1, r2, c2)) in &self.arrays {
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let key = CellRef::new(r, c);
+                    if key != anchor && self.get(r, c).is_none_or(|cell| cell.formula.is_none()) {
+                        self.spilled.insert(key);
+                    }
+                }
+            }
+        }
+        self.spilled = self.spilled.iter().filter_map(|key| {
+            let (r, c) = if rows {
+                (shift_axis(key.row, at, n, delete)?, key.col)
+            } else {
+                (key.row, shift_axis(key.col, at, n, delete)?)
+            };
+            Some(CellRef::new(r, c))
+        }).collect();
+        let shift = crate::refs::Shift {
+            axis: if rows { crate::refs::Axis::Row } else { crate::refs::Axis::Col },
+            at, n, delete, target_sheet: self.name.clone(), own_sheet: self.name.clone(),
+            translate: None,
+        };
+        self.arrays = self.arrays.iter().filter_map(|&(anchor, (r1, c1, r2, c2))| {
+            if rows {
+                let row = shift.map(anchor.row)?;
+                let (r1, r2) = shift.map_range(r1, r2)?;
+                Some((CellRef::new(row, anchor.col), (r1, c1, r2, c2)))
+            } else {
+                let col = shift.map(anchor.col)?;
+                let (c1, c2) = shift.map_range(c1, c2)?;
+                Some((CellRef::new(anchor.row, col), (r1, c1, r2, c2)))
+            }
+        }).collect();
+    }
+
     fn rebuild(&mut self, map: impl Fn(u32, u32) -> Option<(u32, u32)>) {
         let mut items: Vec<(u32, u32, Cell)> = Vec::new();
         let old_keys: Vec<CellRef> = self.iter().map(|(key, _)| key).collect();
@@ -192,13 +243,13 @@ impl Sheet {
         }
         self.edited = true;
         self.styles_dirty |= !self.style_edits.is_empty();
-        self.spilled.clear();
     }
 
     pub fn insert_rows(&mut self, at: u32, n: u32) {
         if n == 0 {
             return;
         }
+        self.shift_array_metadata(true, at, n, false);
         self.rebuild(|r, c| Some((if r >= at { r + n } else { r }, c)));
         self.merges = self
             .merges
@@ -228,6 +279,7 @@ impl Sheet {
         if n == 0 {
             return;
         }
+        self.shift_array_metadata(true, at, n, true);
         self.rebuild(|r, c| shift_axis(r, at, n, true).map(|nr| (nr, c)));
         self.merges = self
             .merges
@@ -254,6 +306,7 @@ impl Sheet {
         if n == 0 {
             return;
         }
+        self.shift_array_metadata(false, at, n, false);
         self.rebuild(|r, c| Some((r, if c >= at { c + n } else { c })));
         self.merges = self
             .merges
@@ -281,6 +334,7 @@ impl Sheet {
         if n == 0 {
             return;
         }
+        self.shift_array_metadata(false, at, n, true);
         self.rebuild(|r, c| shift_axis(c, at, n, true).map(|nc| (r, nc)));
         self.merges = self
             .merges
@@ -471,7 +525,9 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         }
     }
 
-    // 待挂的透视表：源区域直接跟着搬
+    // Session-created pivots keep absolute source-field and output coordinates.
+    // If an essential field or either complete region disappears, keep any
+    // remaining summary values but remove the now-invalid refreshable object.
     let sh = crate::refs::Shift {
         axis,
         at,
@@ -481,22 +537,42 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         own_sheet: name.clone(),
             translate: None,
     };
-    for (idx, spec, _, _, _) in wb.pivots_pending.iter_mut() {
-        if *idx != sheet_idx {
-            continue;
+    let map_rect = |rect: (u32, u32, u32, u32)| {
+        let (r1, c1, r2, c2) = rect;
+        if r1 > r2 || c1 > c2 { return None; }
+        match axis {
+            crate::refs::Axis::Row => sh.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2)),
+            crate::refs::Axis::Col => sh.map_range(c1, c2).map(|(a, b)| (r1, a, r2, b)),
         }
-        let (r1, c1, r2, c2) = spec.source;
-        spec.source = match axis {
-            crate::refs::Axis::Row => match sh.map_range(r1, r2) {
-                Some((a, b)) => (a, c1, b, c2),
-                None => spec.source,
-            },
-            crate::refs::Axis::Col => match sh.map_range(c1, c2) {
-                Some((a, b)) => (r1, a, r2, b),
-                None => spec.source,
-            },
+    };
+    wb.pivots_pending.retain_mut(|(idx, spec, _, rect, _)| {
+        if *idx != sheet_idx {
+            return true;
+        }
+        let mapped = (|| {
+            let source = map_rect(spec.source)?;
+            let output = map_rect(*rect)?;
+            let (row_field, col_field, value_field) = if axis == crate::refs::Axis::Col {
+                let col_field = match spec.col_field {
+                    Some(c) => Some(sh.map(c)?),
+                    None => None,
+                };
+                (sh.map(spec.row_field)?, col_field, sh.map(spec.value_field)?)
+            } else {
+                (spec.row_field, spec.col_field, spec.value_field)
+            };
+            Some((source, output, row_field, col_field, value_field))
+        })();
+        let Some((source, output, row_field, col_field, value_field)) = mapped else {
+            return false;
         };
-    }
+        spec.source = source;
+        spec.row_field = row_field;
+        spec.col_field = col_field;
+        spec.value_field = value_field;
+        *rect = output;
+        true
+    });
 }
 
 /// 供撤销用：一行/一列里有哪些格子
