@@ -73,6 +73,7 @@ struct FindState {
 }
 
 #[derive(Default, Clone)]
+
 struct EditState {
     buf: String,
 }
@@ -176,6 +177,9 @@ struct SheetApp {
     zoom: f32,
     /// 功能区当前页签：0 文件 1 开始 2 插入 3 公式 4 数据 5 视图
     ribbon_tab: usize,
+    /// 名称框
+    name_buf: String,
+    name_edit: bool,
     /// 工作表重命名对话框
     rename_sheet: Option<(usize, String)>,
     /// 填充柄拖拽的终点（行或列，取决于方向）
@@ -372,6 +376,8 @@ impl SheetApp {
             find: FindState::default(),
             zoom: 1.0,
             ribbon_tab: 1,
+            name_buf: String::new(),
+            name_edit: false,
             rename_sheet: None,
             fill_drag: None,
             data_dlg: None,
@@ -2669,6 +2675,132 @@ impl SheetApp {
         }
     }
 
+    /// 复制工作表：插到原表后面，名字自动去重
+    fn duplicate_sheet(&mut self, i: usize) {
+        let mut copy = self.wb.sheets[i].clone();
+        let base = copy.name.clone();
+        let mut n = 2;
+        let mut name = format!("{base} ({n})");
+        while self.wb.sheets.iter().any(|s| s.name == name) {
+            n += 1;
+            name = format!("{base} ({n})");
+        }
+        copy.name = name;
+        copy.spilled.clear();
+        self.wb.sheets.insert(i + 1, copy);
+        self.sheet_idx = i + 1;
+        self.wb.dirty = true;
+    }
+
+    /// 已用区域的右下角
+    fn used_end(&self) -> (u32, u32) {
+        let sheet = self.wb.sheet(self.sheet_idx);
+        let (mut mr, mut mc) = (0u32, 0u32);
+        for (k, cell) in sheet.iter() {
+            if cell.is_blank() {
+                continue;
+            }
+            mr = mr.max(k.row);
+            mc = mc.max(k.col);
+        }
+        (mr, mc)
+    }
+
+    /// Ctrl+方向：沿方向跳过空白，停在连续数据块的边缘（Excel 语义）
+    fn jump_edge(&self, dr: i64, dc: i64) -> (u32, u32) {
+        let sheet = self.wb.sheet(self.sheet_idx);
+        let (mut r, mut c) = (self.sel.0 as i64, self.sel.1 as i64);
+        let occupied = |r: i64, c: i64| -> bool {
+            r >= 0
+                && c >= 0
+                && sheet
+                    .get(r as u32, c as u32)
+                    .map(|x| !x.is_blank())
+                    .unwrap_or(false)
+        };
+        // 先跳过空白
+        for _ in 0..4096 {
+            let (nr, nc) = (r + dr, c + dc);
+            if nr < 0 || nc < 0 {
+                break;
+            }
+            if occupied(nr, nc) {
+                break;
+            }
+            r = nr;
+            c = nc;
+        }
+        // 再走到数据块末尾
+        if occupied(r + dr, c + dc) {
+            for _ in 0..4096 {
+                let (nr, nc) = (r + dr, c + dc);
+                if !occupied(nr, nc) {
+                    break;
+                }
+                r = nr;
+                c = nc;
+            }
+        }
+        (r.max(0) as u32, c.max(0) as u32)
+    }
+
+    /// 名称框：支持 A1、A1:B2、以及定义名称
+    fn goto_name(&mut self) {
+        let text = self.name_buf.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let up = text.to_ascii_uppercase();
+        let parts: Vec<&str> = up.split(':').collect();
+        if parts.len() == 2 {
+            if let (Some(a), Some(b)) = (
+                sheetcore::sparse::parse_ref(parts[0]),
+                sheetcore::sparse::parse_ref(parts[1]),
+            ) {
+                self.commit_edit(None);
+                self.sel = a;
+                self.sel_end = b;
+                self.ensure_visible();
+                return;
+            }
+        } else if let Some(a) = sheetcore::sparse::parse_ref(parts[0]) {
+            self.commit_edit(None);
+            self.sel = a;
+            self.sel_end = a;
+            self.ensure_visible();
+            return;
+        }
+        let hit = self
+            .wb
+            .names
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(&text))
+            .map(|(_, sh, body)| (*sh, body.clone()));
+        if let Some((_sh, body)) = hit {
+            let body = body.trim_start_matches('=').to_string();
+            let tail = body.rsplit('!').next().unwrap_or(&body).replace('$', "");
+            if let Some(pos) = sheetcore::sparse::parse_ref(&tail) {
+                if let Some((sheet, _)) = body.rsplit_once('!') {
+                    let nm = sheet.trim_matches(|c| c == '\'');
+                    if let Some(idx) = self
+                        .wb
+                        .sheets
+                        .iter()
+                        .position(|s| s.name.eq_ignore_ascii_case(nm))
+                    {
+                        self.sheet_idx = idx;
+                    }
+                }
+                self.commit_edit(None);
+                self.sel = pos;
+                self.sel_end = pos;
+                self.ensure_visible();
+                return;
+            }
+        }
+        self.status = format!("找不到名称：{text}");
+    }
+
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) {
         if let Some(ed) = self.editing.take() {
             self.release_lock();
@@ -2850,6 +2982,56 @@ impl SheetApp {
         }
         if undo_key || redo_key {
             self.do_undo(redo_key);
+            return;
+        }
+        // Ctrl+方向：跳到数据边缘；Ctrl+Home/End：回到 A1 / 已用区域末尾
+        let (ctrl, home, end, pgup, pgdn) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.key_pressed(Key::Home),
+                i.key_pressed(Key::End),
+                i.key_pressed(Key::PageUp),
+                i.key_pressed(Key::PageDown),
+            )
+        });
+        if ctrl && (home || end) {
+            self.commit_edit(None);
+            let (r, c) = if home {
+                (0u32, 0u32)
+            } else {
+                self.used_end()
+            };
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+            return;
+        }
+        if pgup || pgdn {
+            self.commit_edit(None);
+            let step = 20u32;
+            let (r, c) = self.sel;
+            let r = if pgdn { r.saturating_add(step) } else { r.saturating_sub(step) };
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+            return;
+        }
+        if ctrl && (ctx.input(|i| i.key_pressed(Key::ArrowUp))
+            || ctx.input(|i| i.key_pressed(Key::ArrowDown))
+            || ctx.input(|i| i.key_pressed(Key::ArrowLeft))
+            || ctx.input(|i| i.key_pressed(Key::ArrowRight)))
+        {
+            let (dr, dc) = ctx.input(|i| {
+                (
+                    if i.key_pressed(Key::ArrowDown) { 1i64 } else if i.key_pressed(Key::ArrowUp) { -1 } else { 0 },
+                    if i.key_pressed(Key::ArrowRight) { 1i64 } else if i.key_pressed(Key::ArrowLeft) { -1 } else { 0 },
+                )
+            });
+            self.commit_edit(None);
+            let (r, c) = self.jump_edge(dr, dc);
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
             return;
         }
         let (mut dr, mut dc) = (0i64, 0i64);
@@ -5485,6 +5667,50 @@ impl SheetApp {
         self.last_view = avail;
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let origin = resp.rect.min;
+
+        // 右键菜单（选区操作）
+        resp.context_menu(|ui| {
+            let (r1, c1, r2, c2) = self.sel_rect();
+            let rows = r2 - r1 + 1;
+            if ui.button("剪切").clicked() {
+                self.clip_copy(true, ui.ctx());
+                ui.close_menu();
+            }
+            if ui.button("复制").clicked() {
+                self.clip_copy(false, ui.ctx());
+                ui.close_menu();
+            }
+            if ui.button("粘贴").clicked() {
+                self.clip_paste(false, None);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(format!("插入 {rows} 行")).clicked() {
+                self.structural(sheetcore::structural::Structural::InsertRows { at: r1, n: rows });
+                ui.close_menu();
+            }
+            if ui.button(format!("删除 {rows} 行")).clicked() {
+                self.structural(sheetcore::structural::Structural::DeleteRows { at: r1, n: rows });
+                ui.close_menu();
+            }
+            if ui.button("插入列").clicked() {
+                self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: 1 });
+                ui.close_menu();
+            }
+            if ui.button("删除列").clicked() {
+                self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: 1 });
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("冻结到当前单元格").clicked() {
+                self.set_freeze(Some((r1, c1)));
+                ui.close_menu();
+            }
+            if ui.button("取消冻结").clicked() {
+                self.set_freeze(None);
+                ui.close_menu();
+            }
+        });
         painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
 
         // 滚轮
@@ -7538,7 +7764,31 @@ impl eframe::App for SheetApp {
                 });
             }
             if self.ribbon_tab == 2 {
-                ui.label("插入：图表、批注、图片、表格、透视表");
+                ui.horizontal(|ui| {
+                    if ui.button("柱状图（按选区）").clicked() {
+                        self.insert_chart_from_selection();
+                    }
+                    if ui.button("图表管理").clicked() {
+                        self.chart_mgr = true;
+                        self.reload_charts();
+                    }
+                    if ui.button("数据透视表").clicked() {
+                        let (r, c) = self.sel;
+                        let (r1, c1, r2, c2) =
+                            sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+                        if c2 <= c1 || r2 <= r1 {
+                            self.status = "当前区域太小，选一个带表头的表格".into();
+                        } else {
+                            self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
+                                source: (r1, c1, r2, c2),
+                                row_field: c1,
+                                col_field: None,
+                                value_field: c2,
+                                agg: sheetcore::pivot::Agg::Sum,
+                            });
+                        }
+                    }
+                });
             }
             if self.ribbon_tab == 3 {
                 ui.horizontal(|ui| {
@@ -7577,13 +7827,105 @@ impl eframe::App for SheetApp {
         egui::TopBottomPanel::top("formula").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let (r, c) = self.sel;
-                ui.add_sized([64.0, 20.0], egui::Label::new(cell_name(r, c)));
+                if !self.name_edit {
+                    self.name_buf = cell_name(r, c);
+                }
+                let nb = ui.add_sized(
+                    [78.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.name_buf).hint_text("A1"),
+                );
+                if nb.gained_focus() {
+                    self.name_edit = true;
+                }
+                if nb.lost_focus() {
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    self.name_edit = false;
+                    if enter {
+                        self.goto_name();
+                    }
+                }
+                ui.label(egui::RichText::new("fx").italics());
                 ui.separator();
-                let cur = match self.wb.sheet(self.sheet_idx).get(r, c) {
-                    Some(cell) => cell.formula.as_deref().map(|f| f.to_string()).unwrap_or_else(|| cell.value.display()),
-                    None => String::new(),
-                };
-                ui.label(if cur.is_empty() { " ".to_string() } else { cur });
+                if self.editing.is_some() {
+                    let mut commit = false;
+                    let mut cancel = false;
+                    if let Some(ed) = self.editing.as_mut() {
+                        let te = ui.add_sized(
+                            [ui.available_width(), 20.0],
+                            egui::TextEdit::singleline(&mut ed.buf),
+                        );
+                        if te.lost_focus() {
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                commit = true;
+                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                cancel = true;
+                            }
+                        }
+                    }
+                    if commit {
+                        self.commit_edit(Some((1, 0)));
+                    } else if cancel {
+                        self.editing = None;
+                        self.release_lock();
+                    }
+                } else {
+                    let cur = match self.wb.sheet(self.sheet_idx).get(r, c) {
+                        Some(cell) => cell
+                            .formula
+                            .as_deref()
+                            .map(|f| f.to_string())
+                            .unwrap_or_else(|| cell.value.display()),
+                        None => String::new(),
+                    };
+                    let resp = ui.add_sized(
+                        [ui.available_width(), 20.0],
+                        egui::Label::new(cur).sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        self.begin_edit(None);
+                    }
+                }
+            });
+        });
+
+        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+                ui.label(format!("{cells} 格"));
+                if cells > 1 && cells <= 200_000 {
+                    let (mut count, mut sum, mut num) = (0u64, 0f64, 0u64);
+                    let sheet = self.wb.sheet(self.sheet_idx);
+                    for rr in r1..=r2 {
+                        for cc in c1..=c2 {
+                            if let Some(cell) = sheet.get(rr, cc) {
+                                if !cell.is_blank() {
+                                    count += 1;
+                                    if let sheetcore::model::Value::Number(v) = &cell.value {
+                                        sum += *v;
+                                        num += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ui.separator();
+                    ui.label(format!("计数 {count}"));
+                    if num > 0 {
+                        ui.separator();
+                        ui.label(format!("求和 {sum:.2}"));
+                        ui.separator();
+                        ui.label(format!("平均 {:.2}", sum / num as f64));
+                    }
+                }
+                ui.separator();
+                ui.label(format!("就绪 · {} 张表", self.wb.sheets.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.net.is_some() {
+                        ui.label("协作中");
+                    }
+                    ui.label(self.status.clone());
+                });
             });
         });
 
@@ -7601,6 +7943,15 @@ impl eframe::App for SheetApp {
                         goto = Some(i);
                     }
                     resp.context_menu(|ui| {
+                        if ui.button("新建工作表").clicked() {
+                            self.add_sheet();
+                            ui.close_menu();
+                        }
+                        if ui.button("复制本表").clicked() {
+                            self.duplicate_sheet(i);
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("重命名…").clicked() {
                             ren = Some((i, name.clone()));
                             ui.close_menu();
