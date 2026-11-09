@@ -197,6 +197,9 @@ struct SheetApp {
     fmt_state: FmtState,
     /// 外部链接对话框
     xlink_dlg: bool,
+    /// 修订记录（新的在后）
+    rev: Vec<sheetcore::revision::Entry>,
+    rev_open: bool,
     /// 标签拖拽排序
     tab_drag: Option<usize>,
     /// 名称框
@@ -403,6 +406,8 @@ impl SheetApp {
             fmt_dlg: false,
             fmt_state: FmtState::default(),
             xlink_dlg: false,
+            rev: Vec::new(),
+            rev_open: false,
             tab_drag: None,
             name_buf: String::new(),
             name_edit: false,
@@ -524,6 +529,12 @@ impl SheetApp {
                     if let Some(p) = self.wb.path.clone() {
                         recent::touch(&p);
                     }
+                    self.rev = self
+                        .wb
+                        .path
+                        .as_ref()
+                        .map(|p| sheetcore::revision::load(p, 300))
+                        .unwrap_or_default();
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
                     eprintln!("[open] 已显示缓存值 {n} 格");
@@ -541,6 +552,14 @@ impl SheetApp {
                             rep.failed,
                             self.wb.sheets[0].get(0, 0).map(|c| c.value.display())
                         );
+                    }
+                    // 无界面验收：SC_REV_REVERT=N 撤回倒数第 N 条修订
+                    if let Ok(v) = std::env::var("SC_REV_REVERT") {
+                        if let Ok(n) = v.parse::<usize>() {
+                            let idx = self.rev.len().saturating_sub(n.max(1));
+                            self.revert_revision(idx);
+                            eprintln!("[rev] 撤回倒数第 {n} 条（索引 {idx}），共 {} 条", self.rev.len());
+                        }
                     }
                     if let Ok(font) = std::env::var("SC_FONT") {
                         let font = font.trim().to_string();
@@ -1264,6 +1283,7 @@ impl SheetApp {
         if deltas.is_empty() {
             return;
         }
+        self.record_revision(label, &deltas);
         let focus = (self.sheet_idx, self.sel.0, self.sel.1);
         self.undo.push(sheetcore::undo::Action {
             label: label.to_string(),
@@ -1275,6 +1295,93 @@ impl SheetApp {
         });
     }
 
+
+    /// 远端改动也进日志（只展示，不给撤回）
+    fn record_remote_ops(
+        &mut self,
+        ops: &[sheetcore::sync::Op],
+        befores: Vec<Option<sheetcore::model::Cell>>,
+    ) {
+        let Some(path) = self.wb.path.clone() else {
+            return;
+        };
+        for (op, before) in ops.iter().zip(befores.into_iter()) {
+            let Some(sheet) = self.wb.sheets.get(op.sheet) else {
+                continue;
+            };
+            let sheet_name = sheet.name.clone();
+            let after = sheet.get(op.row, op.col).cloned();
+            let (Some(b), Some(a)) = (before, after) else {
+                continue;
+            };
+            let who = self
+                .peers_list
+                .iter()
+                .find(|(s, _, _)| *s == op.site)
+                .map(|(_, n, _)| n.clone())
+                .unwrap_or_else(|| format!("同事#{}", op.site));
+            let mut e = sheetcore::revision::Entry::new(&who, op.site, "远端编辑", &sheet_name);
+            e.remote = true;
+            e.cells.push(sheetcore::revision::Change {
+                r: op.row,
+                c: op.col,
+                before: sheetcore::revision::Snap::from_cell(&b),
+                after: sheetcore::revision::Snap::from_cell(&a),
+                before_style: None,
+                after_style: None,
+            });
+            let _ = sheetcore::revision::append(&path, &e);
+            self.rev.push(e);
+            if self.rev.len() > 600 {
+                self.rev.remove(0);
+            }
+        }
+    }
+
+    /// 把一次动作写进修订日志（本地动作）
+    fn record_revision(&mut self, label: &str, deltas: &[sheetcore::undo::CellDelta]) {
+        let Some(path) = self.wb.path.clone() else {
+            return; // 没保存过的新文件还不知道日志放哪
+        };
+        let sheet = self.wb.sheet(self.sheet_idx).name.clone();
+        let mut e = sheetcore::revision::Entry::new(&self.my_name, 0, label, &sheet);
+        let total = deltas.len();
+        let mut only_style = true;
+        for d in deltas.iter().take(sheetcore::revision::MAX_CELLS) {
+            if d.before.value != d.after.value || d.before.formula != d.after.formula {
+                only_style = false;
+            }
+            let (bs, as_) = if d.before_style != d.after_style {
+                (
+                    Some(self.wb.styles.get(d.before_style).clone()),
+                    Some(self.wb.styles.get(d.after_style).clone()),
+                )
+            } else {
+                (None, None)
+            };
+            e.cells.push(sheetcore::revision::Change {
+                r: d.row,
+                c: d.col,
+                before: sheetcore::revision::Snap::from_cell(&d.before),
+                after: sheetcore::revision::Snap::from_cell(&d.after),
+                before_style: bs,
+                after_style: as_,
+            });
+        }
+        if only_style && total > 0 {
+            e.note = "格式变更".into();
+        }
+        if total > sheetcore::revision::MAX_CELLS {
+            e.note = format!("共 {total} 格，只记前 {} 格", sheetcore::revision::MAX_CELLS);
+        }
+        if let Err(err) = sheetcore::revision::append(&path, &e) {
+            eprintln!("[rev] 写日志失败: {err}");
+        }
+        self.rev.push(e);
+        if self.rev.len() > 600 {
+            self.rev.remove(0);
+        }
+    }
 
     // ===== 剪贴板 =====
     fn clip_copy(&mut self, cut: bool, ctx: &egui::Context) {
@@ -4141,6 +4248,11 @@ impl SheetApp {
     fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("审阅", |ui| {
             ui.set_min_width(180.0);
+            if ui.button("修订记录…").on_hover_text("谁在什么时候改了哪格，可撤回").clicked() {
+                self.rev_open = true;
+                ui.close_menu();
+            }
+            ui.separator();
             if ui
                 .add_enabled(self.wb.has_vba, egui::Button::new("导出宏部件…"))
                 .on_hover_text("把 vbaProject.bin 另存出来")
@@ -5231,6 +5343,129 @@ impl SheetApp {
     }
 
     /// 工作表重命名
+    /// 修订记录：谁、什么时候、改了哪格；点一条能跳过去或者撤回
+    fn revision_panel(&mut self, ctx: &egui::Context) {
+        if !self.rev_open {
+            return;
+        }
+        let mut open = self.rev_open;
+        let mut jump: Option<(String, u32, u32)> = None;
+        let mut revert: Option<usize> = None;
+        let mut reload = false;
+        let entries = self.rev.clone();
+        egui::Window::new("修订记录")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{} 条", entries.len()));
+                    if ui.small_button("重新读取").clicked() {
+                        reload = true;
+                    }
+                    ui.separator();
+                    ui.weak("日志随文件走：.~sheetflow-history/<文件名>/revisions.jsonl");
+                });
+                ui.separator();
+                if entries.is_empty() {
+                    ui.label("还没有记录。改几格再回来看。");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (i, e) in entries.iter().enumerate().rev() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(rel_time(e.ts))
+                                        .monospace()
+                                        .weak()
+                                        .size(11.0),
+                                );
+                                ui.label(egui::RichText::new(&e.who).strong());
+                                ui.label(&e.label);
+                                let pos = format!("{}!{}", e.sheet, e.range());
+                                if ui.link(pos).clicked() {
+                                    if let Some(ch) = e.cells.first() {
+                                        jump = Some((e.sheet.clone(), ch.r, ch.c));
+                                    }
+                                }
+                                if !e.remote && !e.cells.is_empty() {
+                                    if ui.small_button("撤回").clicked() {
+                                        revert = Some(i);
+                                    }
+                                }
+                            });
+                            ui.label(egui::RichText::new(e.delta_text()).small().weak());
+                            ui.separator();
+                        }
+                    });
+            });
+        if reload {
+            if let Some(p) = self.wb.path.clone() {
+                self.rev = sheetcore::revision::load(&p, 300);
+            }
+        }
+        if let Some((sheet, r, c)) = jump {
+            if let Some(si) = self.wb.sheets.iter().position(|s| s.name == sheet) {
+                self.sheet_idx = si;
+                self.sel = (r, c);
+                self.sel_end = (r, c);
+                self.ensure_visible();
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+            }
+        }
+        if let Some(i) = revert {
+            self.revert_revision(i);
+        }
+        if !open {
+            self.rev_open = false;
+        }
+    }
+
+    /// 撤回一条本地修订：先确认这些格子还是它改成的样子，再按 before 写回
+    fn revert_revision(&mut self, idx: usize) {
+        let Some(e) = self.rev.get(idx).cloned() else {
+            return;
+        };
+        let Some(si) = self.wb.sheets.iter().position(|s| s.name == e.sheet) else {
+            self.status = "那张工作表已经不在了".into();
+            return;
+        };
+        if e.cells.is_empty() {
+            self.status = "这条没有可撤回的格子".into();
+            return;
+        }
+        let conflict = e
+            .cells
+            .iter()
+            .filter(|ch| !ch.after.same(self.wb.sheet(si).get(ch.r, ch.c)))
+            .count();
+        if conflict > 0 {
+            self.status = format!("有 {conflict} 格之后又被改过，不能整条撤回");
+            return;
+        }
+        self.sheet_idx = si;
+        let keys: Vec<(u32, u32)> = e.cells.iter().map(|c| (c.r, c.c)).collect();
+        let txn = self.txn_begin(&keys);
+        for ch in &e.cells {
+            self.wb.sheet_mut(si).set(ch.r, ch.c, ch.before.to_cell());
+            if let Some(st) = ch.before_style.clone() {
+                let id = self.wb.styles.intern(st);
+                self.wb.sheet_mut(si).set_style(ch.r, ch.c, id);
+            }
+        }
+        self.txn_end("撤回修订", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let fkeys: Vec<(usize, u32, u32)> = keys.iter().map(|(r, c)| (si, *r, *c)).collect();
+        for k in &fkeys {
+            self.deps.update_cell(&self.wb, *k);
+        }
+        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
+        self.status = format!("已撤回 {} 的「{}」", e.who, e.label);
+    }
+
     /// 外部链接：看看有哪些、缓存多少格、需不需要更新
     fn xlink_dialog(&mut self, ctx: &egui::Context) {
         if !self.xlink_dlg {
@@ -7974,6 +8209,20 @@ impl SheetApp {
                         self.joined_doc = true;
                         self.wb.sheet_mut(self.sheet_idx).clear();
                     }
+                    let before_ops: Vec<Option<sheetcore::model::Cell>> = if is_snapshot {
+                        Vec::new()
+                    } else {
+                        ops.iter()
+                            .map(|op| {
+                                self.wb
+                                    .sheets
+                                    .get(op.sheet)
+                                    .and_then(|s| s.get(op.row, op.col))
+                                    .cloned()
+                            })
+                            .collect()
+                    };
+                    let ops_snapshot = if is_snapshot { Vec::new() } else { ops.clone() };
                     let mut touched: Vec<(usize, u32, u32)> = Vec::new();
                     if let Some(peer) = self.peer.as_mut() {
                         for op in ops {
@@ -7982,6 +8231,9 @@ impl SheetApp {
                                 touched.push(key);
                             }
                         }
+                    }
+                    if !ops_snapshot.is_empty() {
+                        self.record_remote_ops(&ops_snapshot, before_ops);
                     }
                     if !touched.is_empty() {
                         if is_snapshot {
@@ -8040,6 +8292,18 @@ fn rand_site() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1);
     (nanos % 90_000) + 1
+}
+
+/// 修订记录里的时间：只显示相对量，省掉时区换算
+fn rel_time(ts: u64) -> String {
+    let now = sheetcore::revision::now_ms();
+    let d = now.saturating_sub(ts) / 1000;
+    match d {
+        0..=59 => "刚刚".to_string(),
+        60..=3599 => format!("{} 分钟前", d / 60),
+        3600..=86399 => format!("{} 小时前", d / 3600),
+        _ => format!("{} 天前", d / 86400),
+    }
 }
 
 fn default_name() -> String {
@@ -8110,6 +8374,7 @@ impl eframe::App for SheetApp {
         }
         self.dv_dialog(ctx);
         self.xlink_dialog(ctx);
+        self.revision_panel(ctx);
         self.note_dialog(ctx);
         self.link_dialog(ctx);
         self.macro_run_dialog(ctx);

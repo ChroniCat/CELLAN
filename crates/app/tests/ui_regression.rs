@@ -341,4 +341,56 @@ fn external_link_values_render_and_refresh() {
         cell_line(&dump2, 0, 0)
     );
 }
+#[test]
+fn revision_revert_restores_font() {
+    let dir = std::env::temp_dir().join("sheet_ui_rev");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("修订.xlsx");
+
+    // A1 现在是宋体
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(0, 0, sheetcore::model::Cell {
+        value: sheetcore::model::Value::Text("x".into()),
+        formula: None,
+    });
+    let song = wb.styles.intern(sheetcore::style::CellStyle {
+        font: "宋体".into(),
+        size: 11.0,
+        ..Default::default()
+    });
+    wb.sheets[0].set_style(0, 0, song);
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+
+    // 造一条"把黑体改成宋体"的修订（当前值必须等于 after 才能撤回）
+    let mut e = sheetcore::revision::Entry::new("测试", 0, "设置格式", "Sheet1");
+    let mut before_style = sheetcore::style::CellStyle::default();
+    before_style.font = "黑体".into();
+    before_style.size = 11.0;
+    let mut after_style = before_style.clone();
+    after_style.font = "宋体".into();
+    e.cells.push(sheetcore::revision::Change {
+        r: 0,
+        c: 0,
+        before: sheetcore::revision::Snap { v: "x".into(), f: None, t: "s".into() },
+        after: sheetcore::revision::Snap { v: "x".into(), f: None, t: "s".into() },
+        before_style: Some(before_style),
+        after_style: Some(after_style),
+    });
+    sheetcore::revision::append(&p, &e).unwrap();
+
+    let dump = dump_for(
+        p.to_str().unwrap(),
+        &[("SC_REV_REVERT", "1")],
+        Duration::from_secs(30),
+    )
+    .expect("dump revert");
+    let line = cell_line(&dump, 0, 0);
+    assert!(line.contains("family=cjk-sans"), "撤回后应回到黑体：{line}");
+
+    // 日志里应多一条"撤回修订"，且能重开读到两条
+    let log = sheetcore::revision::load(&p, 10);
+    assert_eq!(log.len(), 2, "撤回本身也要记一条");
+    assert_eq!(log[1].label, "撤回修订");
+}
 
