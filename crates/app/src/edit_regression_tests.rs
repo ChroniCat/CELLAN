@@ -694,3 +694,211 @@ fn making_a_table_enables_filter_and_second_click_clears_it() {
     app.start_filter();
     assert!(app.wb.sheet(0).filter.is_none(), "再点一次筛选应取消");
 }
+
+fn run_keys(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    // egui 的 RawInput.modifiers 才是 i.modifiers 的来源，Key 事件里的不算
+    input.modifiers = events
+        .iter()
+        .find_map(|e| match e {
+            egui::Event::Key { modifiers, .. } => Some(*modifiers),
+            _ => None,
+        })
+        .unwrap_or_default();
+    input.events = events;
+    let _ = ctx.run(input, |ctx| app.handle_keys(ctx));
+}
+
+fn key_event(key: egui::Key, shift: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            shift,
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn shift_arrows_extend_selection_and_plain_arrow_collapses() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, true)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 0)), "Shift+→ 应从 A1 扩到 B1");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, true)]);
+    assert_eq!((app.sel, app.sel_end), ((1, 1), (0, 0)), "继续 Shift+↓ 应扩到 B2");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowLeft, false)]);
+    assert_eq!((app.sel, app.sel_end), ((1, 0), (1, 0)), "普通方向键应收起选区");
+}
+
+#[test]
+fn shift_enter_and_shift_tab_move_backwards() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (2, 2);
+    app.sel_end = (2, 2);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, true)]);
+    assert_eq!(app.sel, (1, 2), "Shift+Enter 应向上");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, true)]);
+    assert_eq!(app.sel, (1, 1), "Shift+Tab 应向左");
+}
+
+#[test]
+fn ctrl_d_fills_down_and_ctrl_r_fills_right() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Number(7.0),
+            formula: None,
+        },
+    );
+    app.sel = (0, 0);
+    app.sel_end = (3, 0);
+    app.fill_cmd(true);
+    for r in 0..4 {
+        assert_eq!(app.wb.sheet(0).value(r, 0), sheetcore::model::Value::Number(7.0));
+    }
+    app.sel = (5, 0);
+    app.sel_end = (5, 2);
+    app.wb.sheet_mut(0).set(
+        5,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Number(9.0),
+            formula: None,
+        },
+    );
+    app.fill_cmd(false);
+    assert_eq!(app.wb.sheet(0).value(5, 1), sheetcore::model::Value::Number(9.0));
+    assert_eq!(app.wb.sheet(0).value(5, 2), sheetcore::model::Value::Number(9.0));
+}
+
+#[test]
+fn fill_down_limit_follows_neighbour_column() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..5u32 {
+        app.wb.sheet_mut(0).set(
+            r,
+            1,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text(format!("x{r}").into()),
+                formula: None,
+            },
+        );
+    }
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    assert_eq!(app.fill_down_limit(0, 0), 4, "应按 B 列的数据长度填到第 5 行");
+}
+
+fn run_grid_frame_mods(
+    app: &mut SheetApp,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    mods: egui::Modifiers,
+) {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    input.modifiers = mods;
+    input.events = events;
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+    });
+}
+
+#[test]
+fn shift_click_extends_selection() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    run_grid_frame(&mut app, &ctx, vec![]);
+    let p = egui::pos2(HEAD_W + 72.0 + 10.0, HEAD_H + 9.5);
+    let press = egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers { shift: true, ..Default::default() },
+    };
+    let release = egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers { shift: true, ..Default::default() },
+    };
+    let mods = egui::Modifiers { shift: true, ..Default::default() };
+    run_grid_frame_mods(&mut app, &ctx, vec![press], mods);
+    run_grid_frame_mods(&mut app, &ctx, vec![release], mods);
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 0)), "Shift+点击应扩选到 B1");
+}
+
+#[test]
+fn alt_enter_inserts_a_newline_in_the_cell_editor() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState { buf: "第一行".into() });
+    run_grid_frame(&mut app, &ctx, vec![]);
+    let ev = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers { alt: true, ..Default::default() },
+    };
+    let mods = egui::Modifiers { alt: true, ..Default::default() };
+    run_grid_frame_mods(&mut app, &ctx, vec![ev], mods);
+    let ed = app.editing.as_ref().expect("Alt+Enter 不应结束编辑");
+    assert!(ed.buf.contains('\n'), "应插入换行：{:?}", ed.buf);
+}
+
+#[test]
+fn typing_below_a_table_extends_its_range() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        for c in 0..2u32 {
+            sh.set(0, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text(format!("h{c}").into()), formula: None });
+            sh.set(1, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text("a".into()), formula: None });
+            sh.set(2, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text("b".into()), formula: None });
+        }
+    }
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.make_table();
+    // 在表格正下方输入
+    app.sel = (3, 0);
+    app.sel_end = (3, 0);
+    app.editing = Some(EditState { buf: "c".into() });
+    app.commit_edit(None);
+    assert_eq!(app.wb.sheet(0).tables[0].range.2, 3, "表格应自动向下扩一行");
+    assert_eq!(
+        app.wb.sheet(0).filter.as_ref().map(|f| f.range.2),
+        Some(3),
+        "筛选区域应一起扩大"
+    );
+}

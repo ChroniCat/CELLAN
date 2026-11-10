@@ -1857,6 +1857,78 @@ impl SheetApp {
         }
     }
 
+    /// 双击填充柄时的终点：看左右相邻列谁有连续数据
+    fn fill_down_limit(&self, c1: u32, c2: u32) -> u32 {
+        let (_, _, r2, _) = self.sel_rect();
+        let sh = self.wb.sheet(self.sheet_idx);
+        let neighbour = if c1 > 0 && sh.get(r2 + 1, c1 - 1).is_some() {
+            Some(c1 - 1)
+        } else if sh.get(r2 + 1, c2 + 1).is_some() {
+            Some(c2 + 1)
+        } else {
+            None
+        };
+        let Some(nc) = neighbour else {
+            return r2;
+        };
+        let mut r = r2 + 1;
+        while r < 1_048_576 && sh.get(r, nc).is_some() {
+            r += 1;
+        }
+        r.saturating_sub(1)
+    }
+
+    /// Ctrl+D / Ctrl+R：用选区首行（首列）填满整个选区，公式按位移调整
+    fn fill_cmd(&mut self, down: bool) {
+        self.commit_edit(None);
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if down && r2 == r1 {
+            return;
+        }
+        if !down && c2 == c1 {
+            return;
+        }
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
+        if down {
+            for c in c1..=c2 {
+                let Some(src) = self.wb.sheet(self.sheet_idx).get(r1, c).cloned() else {
+                    continue;
+                };
+                for r in (r1 + 1)..=r2 {
+                    let mut cell = src.clone();
+                    if let Some(f) = &src.formula {
+                        cell.formula = Some(sheetcore::cf::shift_formula(f, r - r1, 0).into());
+                    }
+                    self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
+                }
+            }
+        } else {
+            for r in r1..=r2 {
+                let Some(src) = self.wb.sheet(self.sheet_idx).get(r, c1).cloned() else {
+                    continue;
+                };
+                for c in (c1 + 1)..=c2 {
+                    let mut cell = src.clone();
+                    if let Some(f) = &src.formula {
+                        cell.formula = Some(sheetcore::cf::shift_formula(f, 0, c - c1).into());
+                    }
+                    self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
+                }
+            }
+        }
+        self.txn_end(if down { "向下填充" } else { "向右填充" }, txn);
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.wb.dirty = true;
+        self.status = if down {
+            format!("已用首行填充 {}-{} 行", r1 + 1, r2 + 1)
+        } else {
+            format!("已用首列填充到第 {} 列", c2 + 1)
+        };
+    }
+
     /// 填充柄：把源区域按线性序列/复制的方式填到目标区域
     fn fill_to(&mut self, target_row: u32, vertical: bool) {
         let (r1, c1, r2, c2) = self.sel_rect();
@@ -3619,6 +3691,47 @@ impl SheetApp {
                 net.broadcast_op(op);
             }
         }
+        // 表格对象：在表格正下方继续输入时自动扩一行（Excel 的行为）；
+        // 在右侧一列输入时扩一列。汇总行不自动越过。
+        {
+            let (rr, cc) = self.sel;
+            let mut grew: Option<(String, (u32, u32, u32, u32))> = None;
+            {
+                let sheet = self.wb.sheet(self.sheet_idx);
+                for t in sheet.tables.iter() {
+                    if t.totals_row || !t.header_row {
+                        continue;
+                    }
+                    let (r1, c1, r2, c2) = t.range;
+                    if cc >= c1 && cc <= c2 && rr == r2 + 1 {
+                        grew = Some((t.name.clone(), (r1, c1, r2 + 1, c2)));
+                        break;
+                    }
+                    if rr >= r1 && rr <= r2 && cc == c2 + 1 {
+                        grew = Some((t.name.clone(), (r1, c1, r2, c2 + 1)));
+                        break;
+                    }
+                }
+            }
+            if let Some((name, range)) = grew {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                if let Some(t) = sh.tables.iter_mut().find(|t| t.name == name) {
+                    t.range = range;
+                    if range.3 as usize >= t.columns.len() {
+                        let n = t.columns.len() + 1;
+                        t.columns.push(format!("列{n}"));
+                    }
+                }
+                sh.tables_dirty = true;
+                // 表格带筛选时，筛选区域跟着扩大
+                if let Some(f) = sh.filter.as_mut() {
+                    if f.range.0 == range.0 && f.range.1 == range.1 {
+                        f.range = range;
+                    }
+                }
+                self.wb.dirty = true;
+            }
+        }
         // 文本被改写后旧的富文本段就失效了（避免保存时把旧分段盖回去）
         {
             let (rr, cc) = self.sel;
@@ -3668,6 +3781,10 @@ impl SheetApp {
             self.ribbon_collapsed = !self.ribbon_collapsed;
         }
 
+        if self.editing.is_none() && ctx.wants_keyboard_input() {
+            // 对话框/查找框有焦点时不要把按键当成网格快捷键
+            return;
+        }
         if self.editing.is_some() {
             // 编辑框内的按键交给 TextEdit 自己处理
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -3794,6 +3911,15 @@ impl SheetApp {
             self.ensure_visible();
             return;
         }
+        if !ctrl && home {
+            // Excel 的 Home：回到本行 A 列
+            self.commit_edit(None);
+            let r = self.sel.0;
+            self.sel = (r, 0);
+            self.sel_end = (r, 0);
+            self.ensure_visible();
+            return;
+        }
         if pgup || pgdn {
             self.commit_edit(None);
             let step = 20u32;
@@ -3817,13 +3943,24 @@ impl SheetApp {
             });
             self.commit_edit(None);
             let (r, c) = self.jump_edge(dr, dc);
+            let shift = ctx.input(|i| i.modifiers.shift);
             self.sel = (r, c);
-            self.sel_end = (r, c);
+            if !shift {
+                self.sel_end = (r, c);
+            }
             self.ensure_visible();
             return;
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Num1)) {
             self.open_format_dialog();
+            return;
+        }
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::D)) {
+            self.fill_cmd(true);
+            return;
+        }
+        if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::R)) {
+            self.fill_cmd(false);
             return;
         }
         let (mut dr, mut dc) = (0i64, 0i64);
@@ -3835,10 +3972,13 @@ impl SheetApp {
             if i.key_pressed(Key::ArrowLeft) { dc -= 1 }
             if i.key_pressed(Key::Enter) {
                 commit = true;
-                dr = 1;
+                dr = if i.modifiers.shift { -1 } else { 1 };
                 cse = i.modifiers.command && i.modifiers.shift;
             }
-            if i.key_pressed(Key::Tab) { commit = true; dc = 1 }
+            if i.key_pressed(Key::Tab) {
+                commit = true;
+                dc = if i.modifiers.shift { -1 } else { 1 };
+            }
             if i.key_pressed(Key::F2) { start_edit = true }
             if i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) { clear = true }
         });
@@ -3877,7 +4017,16 @@ impl SheetApp {
         if commit || dr != 0 || dc != 0 {
             let nr = (self.sel.0 as i64 + dr).max(0) as u32;
             let nc = (self.sel.1 as i64 + dc).max(0) as u32;
-            self.sel = (nr, nc);
+            let extend = !commit
+                && (dr != 0 || dc != 0)
+                && ctx.input(|i| i.modifiers.shift);
+            if extend {
+                // Shift+方向：锚点留在 sel_end，只移动活动格
+                self.sel = (nr, nc);
+            } else {
+                self.sel = (nr, nc);
+                self.sel_end = (nr, nc);
+            }
             self.ensure_visible();
         }
         if start_edit {
@@ -9915,8 +10064,18 @@ impl SheetApp {
                 let resp = ui.interact(
                     grab,
                     egui::Id::new(("fill_handle", self.sheet_idx)),
-                    egui::Sense::drag(),
+                    egui::Sense::click_and_drag(),
                 );
+                if !readonly && resp.double_clicked() {
+                    // Excel：双击填充柄，按相邻列的数据长度向下填
+                    let (sr1, sc1, sr2, sc2) = self.sel_rect();
+                    let last = self.fill_down_limit(sc1, sc2);
+                    if last > sr2 {
+                        self.fill_to(last, true);
+                        self.status = format!("已填充到第 {} 行", last + 1);
+                    }
+                    let _ = sr1;
+                }
                 if !readonly && resp.dragged() {
                     if let Some(p) = resp.interact_pointer_pos() {
                         let rr = rows.index_at(off_y + p.y - (origin.y + hh));
@@ -10190,14 +10349,19 @@ impl SheetApp {
                     if self.editing.is_some() {
                         self.commit_edit(None);
                     }
-                    self.sel = match merges
+                    let hit = match merges
                         .iter()
                         .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
                     {
                         Some((mr1, mc1, _, _)) => (*mr1, *mc1),
                         None => (r, c),
                     };
-                    self.sel_end = self.sel;
+                    // Shift+点击：从原选区锚点扩到点中的格子（Excel 的基本框选）
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    self.sel = hit;
+                    if !shift {
+                        self.sel_end = hit;
+                    }
                     if let Some(st) = self.format_painter.take() {
                         self.apply_style(move |s| *s = st.clone());
                         self.status = "已套用格式".into();
@@ -10304,19 +10468,41 @@ impl SheetApp {
 
         // 编辑框（只读面板不画）
         if let Some(mut ed) = if readonly { None } else { self.editing.take() } {
+            // 单元格里有换行（Alt+Enter 输入）时按多行编辑框画
+            let lines = ed.buf.lines().count().max(1) as f32;
+            let h = if ed.buf.contains('\n') {
+                (sh.max(rows.size(sr1)) * lines).max(38.0)
+            } else {
+                sh.max(rows.size(sr1))
+            };
             let rect = Rect::from_min_size(
                 egui::pos2(sx, sy),
                 // 编辑框和 Excel 一样只盖住单元格本身，不再横向撑到 160px
-                Vec2::new(sw.max(72.0), sh.max(rows.size(sr1))),
+                Vec2::new(sw.max(72.0), h),
             );
-            let out = ui.put(rect, egui::TextEdit::singleline(&mut ed.buf));
+            let multiline = ed.buf.contains('\n');
+            let out = if multiline {
+                ui.put(rect, egui::TextEdit::multiline(&mut ed.buf))
+            } else {
+                ui.put(rect, egui::TextEdit::singleline(&mut ed.buf))
+            };
             out.request_focus();
-            if ctx.input(|i| i.key_pressed(Key::Enter)) {
-                self.commit_edit(Some((1, 0)));
+            let (alt_enter, shift) = ctx.input(|i| {
+                (
+                    i.modifiers.alt && i.key_pressed(Key::Enter),
+                    i.modifiers.shift,
+                )
+            });
+            if alt_enter {
+                // Excel 的 Alt+Enter：单元格内换行
+                ed.buf.push('\n');
+                self.editing = Some(ed);
+            } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                self.commit_edit(Some((if shift { -1 } else { 1 }, 0)));
             } else if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 // 放弃编辑
             } else if ctx.input(|i| i.key_pressed(Key::Tab)) {
-                self.commit_edit(Some((0, 1)));
+                self.commit_edit(Some((0, if shift { -1 } else { 1 })));
             } else {
                 self.editing = Some(ed);
             }
@@ -12038,7 +12224,12 @@ impl eframe::App for SheetApp {
                 );
                 let (r, c) = self.sel;
                 if !self.name_edit {
-                    self.name_buf = cell_name(r, c);
+                    let (r1, c1, r2, c2) = self.sel_rect();
+                    self.name_buf = if (r1, c1) == (r2, c2) {
+                        cell_name(r, c)
+                    } else {
+                        format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                    };
                 }
                 // 名称框
                 let nb = Rect::from_min_size(
