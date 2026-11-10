@@ -111,6 +111,73 @@ pub fn is_mine(info: &LockInfo) -> bool {
     info.machine == machine_name() && info.pid == std::process::id()
 }
 
+/// 选主文件：谁先创建成功谁当宿主，避免两个人同时打开时开出两个房间
+pub fn elect_path(file: &Path) -> PathBuf {
+    let name = file
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "workbook".into());
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!(".~sheetflow-{name}.elect"))
+}
+
+/// 尝试当选宿主；已有新鲜的选主文件就返回 false
+pub fn claim_election(file: &Path) -> bool {
+    let p = elect_path(file);
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+            .map(|mut f| {
+                let _ = f.write_all(
+                    format!("machine={}\npid={}\nbeat={}\n", machine_name(), std::process::id(), now_secs())
+                        .as_bytes(),
+                );
+            })
+    };
+    if create().is_ok() {
+        return true;
+    }
+    // 上一次异常退出留下的选主文件：超过 15 秒就清掉重试
+    if let Ok(md) = std::fs::metadata(&p) {
+        let age = md.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs()).unwrap_or(0);
+        if age > 15 {
+            let _ = std::fs::remove_file(&p);
+            return create().is_ok();
+        }
+    }
+    false
+}
+
+pub fn release_election(file: &Path) {
+    let _ = std::fs::remove_file(elect_path(file));
+}
+
+/// 路径是不是网盘/共享目录：UNC 或映射的网络驱动器
+pub fn is_network_path(file: &Path) -> bool {
+    let text = file.to_string_lossy();
+    if text.starts_with("\\\\") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let Some(root) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
+            return false;
+        };
+        let root = format!("{root}:\\");
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        }
+        // DRIVE_REMOTE = 4
+        return unsafe { GetDriveTypeW(wide.as_ptr()) == 4 };
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +229,18 @@ beat={}
         let info = read(&f).unwrap();
         assert!(!is_fresh(&info), "超过 {} 秒就不该再去找这个地址", STALE_SECS);
         remove(&f);
+    }
+
+    #[test]
+    fn election_is_exclusive_and_releasable() {
+        let f = tmp("elect.xlsx");
+        std::fs::write(&f, b"x").unwrap();
+        let _ = release_election(&f);
+        assert!(claim_election(&f), "第一个客户端应抢到选主");
+        assert!(!claim_election(&f), "第二个客户端不应再抢到");
+        release_election(&f);
+        assert!(claim_election(&f), "释放后可以重新抢");
+        release_election(&f);
     }
+
 }

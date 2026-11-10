@@ -482,6 +482,8 @@ struct SheetApp {
     peers_list: Vec<(u32, String, u8)>,
     join_addr: String,
     room_password: String,
+    /// 网盘文件打开后自动开房/加入（静默，不必点共享）
+    auto_share: bool,
     my_name: String,
     last_cursor: Option<(u32, u32)>,
     joined_doc: bool,
@@ -730,6 +732,7 @@ impl SheetApp {
             peers_list: Vec::new(),
             join_addr: String::new(),
             room_password: String::new(),
+            auto_share: true,
             my_name: default_name(),
             last_cursor: None,
             joined_doc: false,
@@ -6620,9 +6623,23 @@ impl SheetApp {
         });
         ui_kit::group(ui, "共享", |ui| {
             if self.net.is_none() {
-                if ui_kit::big(ui, Icon::Share, "共享").clicked() {
-                    self.start_host();
-                }
+                ui.vertical(|ui| {
+                    if ui_kit::labeled_w_on(
+                        ui,
+                        Icon::Share,
+                        "自动共享",
+                        100.0,
+                        self.auto_share,
+                        "网盘上的文件打开后自动开房；别人打开同一文件自动加入",
+                    )
+                    .clicked()
+                    {
+                        self.auto_share = !self.auto_share;
+                    }
+                    if ui_kit::big(ui, Icon::Share, "共享").clicked() {
+                        self.start_host();
+                    }
+                });
             } else if ui_kit::big_sized(ui, Icon::Share, &format!("在线 {}", self.peers_list.len()), Vec2::new(66.0, 76.0)).clicked() {
                 self.members_open = true;
             }
@@ -12242,25 +12259,8 @@ impl SheetApp {
 
 
     /// 打开文件后自动发现同编人：读文件旁边的占用卡，新鲜就加入
-    fn try_auto_join(&mut self) {
-        let Some(path) = self.wb.path.clone() else { return };
-        if self.net.is_some() || self.auto_join_tried.as_ref() == Some(&path) {
-            return;
-        }
-        self.auto_join_tried = Some(path.clone());
-
-        let Some(info) = session_lock::read(&path) else { return };
-        if session_lock::is_mine(&info) {
-            return;
-        }
-        if !session_lock::is_fresh(&info) {
-            // 上一任编辑者已经不在了：我接管，把卡换成我的地址
-            let who = if info.user.is_empty() { info.machine.clone() } else { info.user.clone() };
-            eprintln!("[net] 占用卡已过期（{}），接管共享", who);
-            self.status = format!("{} 已退出，已接管共享", who);
-            self.start_host();
-            return;
-        }
+    /// 加入占用卡指向的房间（自动/手动共用）
+    fn join_lock(&mut self, info: &session_lock::LockInfo) {
         let who = if info.user.is_empty() { info.machine.clone() } else { info.user.clone() };
         self.status = format!("发现 {} 正在编辑这个文件，正在加入…", who);
         eprintln!("[net] 发现占用卡：{} @ {}", who, info.host);
@@ -12271,7 +12271,7 @@ impl SheetApp {
                 self.peers_list = vec![(site, self.my_name.clone(), (site % 7) as u8)];
                 self.net = Some(n);
                 self.undo.set_site(site);
-                self.status = format!("已加入 {} 的编辑会话（{}）", who, info.host);
+                self.status = format!("已自动加入 {} 的编辑会话（{}）", who, info.host);
                 eprintln!("[net] {}", self.status);
             }
             Err(e) => {
@@ -12281,6 +12281,70 @@ impl SheetApp {
                 );
             }
         }
+    }
+
+    /// 自动当选宿主：先抢选主文件，避免两人同时打开时开出两个房间
+    fn start_host_auto(&mut self, path: &std::path::Path) {
+        if !session_lock::claim_election(path) {
+            for _ in 0..8 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if let Some(info) = session_lock::read(path) {
+                    if session_lock::is_fresh(&info) && !session_lock::is_mine(&info) {
+                        self.join_lock(&info);
+                        return;
+                    }
+                }
+            }
+            if !session_lock::claim_election(path) {
+                self.status = "另一个窗口正在建立共享，稍后重开这个文件再加入".into();
+                return;
+            }
+        }
+        self.start_host();
+        if let Some(info) = session_lock::read(path) {
+            let mine = format!("{}:{}", local_ip_hint(), net::DEFAULT_PORT);
+            if info.host != mine && session_lock::is_fresh(&info) && !session_lock::is_mine(&info) {
+                eprintln!("[net] 检测到另一个宿主，改加入 {}", info.host);
+                self.net = None;
+                self.peer = None;
+                self.peers_list.clear();
+                self.join_lock(&info);
+            }
+        }
+    }
+
+    fn try_auto_join(&mut self) {
+        let Some(path) = self.wb.path.clone() else { return };
+        if self.net.is_some() || self.auto_join_tried.as_ref() == Some(&path) {
+            return;
+        }
+        self.auto_join_tried = Some(path.clone());
+        // 静默共享只对网盘/共享目录生效；有口令就没法无提示加入
+        let force = std::env::var("SC_AUTO_SHARE").map(|v| v != "0").unwrap_or(false);
+        let auto = self.auto_share
+            && self.room_password.is_empty()
+            && (force || session_lock::is_network_path(&path));
+
+        let Some(info) = session_lock::read(&path) else {
+            if auto {
+                self.start_host_auto(&path);
+            }
+            return;
+        };
+        if session_lock::is_mine(&info) {
+            return;
+        }
+        if !session_lock::is_fresh(&info) {
+            // 上一任编辑者已经不在了：我接管，把卡换成我的地址
+            let who = if info.user.is_empty() { info.machine.clone() } else { info.user.clone() };
+            if auto {
+                eprintln!("[net] 占用卡已过期（{}），接管共享", who);
+                self.status = format!("{} 已退出，已接管共享", who);
+                self.start_host_auto(&path);
+            }
+            return;
+        }
+        self.join_lock(&info);
     }
 
     /// 宿主心跳：每 5 秒刷新占用卡
@@ -13147,6 +13211,7 @@ impl Drop for SheetApp {
         if hosting {
             if let Some(p) = self.wb.path.clone() {
                 session_lock::remove(&p);
+                session_lock::release_election(&p);
                 eprintln!("[net] 已撤下占用卡");
             }
         }
