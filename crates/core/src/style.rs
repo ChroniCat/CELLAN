@@ -209,6 +209,10 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
         return v.display();
     }
+    // Excel 的内建 14 号格式是「系统区域短日期」，不同机器显示不同；
+    // 读盘时它被还原成 mm-dd-yy，这里按系统设置换成本机的写法（和 Excel 一致）。
+    let localized = localize_builtin_date(fmt);
+    let fmt: &str = localized.as_deref().unwrap_or(fmt);
     let sections = split_sections(fmt);
     match v {
         Value::Number(n) => {
@@ -241,6 +245,54 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
         }
         _ => v.display(),
     }
+}
+
+/// 内建短日期（14 号）在本机的写法；其它格式原样返回 None。
+/// Excel 在中文/欧洲区域显示 29/11/2025，在美式区域显示 11-29-25——
+/// 我们按系统的 LOCALE_SSHORTDATE 走，打开同一份文件才和 Excel 一致。
+fn localize_builtin_date(fmt: &str) -> Option<String> {
+    let t = fmt.trim();
+    let is_short_date = t.eq_ignore_ascii_case("mm-dd-yy")
+        || t.eq_ignore_ascii_case("m/d/yy")
+        || t.eq_ignore_ascii_case("m-d-yy")
+        || t.eq_ignore_ascii_case("mm-dd-yyyy");
+    if !is_short_date {
+        return None;
+    }
+    Some(system_short_date())
+}
+
+#[cfg(windows)]
+fn system_short_date() -> String {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocaleInfoW(locale: u32, lctype: u32, buf: *mut u16, cch: i32) -> i32;
+    }
+    const LOCALE_USER_DEFAULT: u32 = 0x0400;
+    const LOCALE_SSHORTDATE: u32 = 0x1F;
+    let mut buf = [0u16; 80];
+    let n = unsafe {
+        GetLocaleInfoW(
+            LOCALE_USER_DEFAULT,
+            LOCALE_SSHORTDATE,
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+        )
+    };
+    if n > 1 {
+        let s: std::ffi::OsString = std::ffi::OsString::from_wide(&buf[..(n as usize - 1)]);
+        let s = s.to_string_lossy().to_lowercase();
+        if !s.trim().is_empty() {
+            return s;
+        }
+    }
+    "yyyy-mm-dd".into()
+}
+
+#[cfg(not(windows))]
+fn system_short_date() -> String {
+    "yyyy-mm-dd".into()
 }
 
 /// 格式代码里指定的文字颜色（[Red] / [Color3] 这类）；没有就返回 None

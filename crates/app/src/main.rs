@@ -6044,12 +6044,16 @@ impl SheetApp {
         let ctx = ui.ctx().clone();
         let cur = self.current_style();
 
+        // 剪贴板组带对话框启动器（Excel 的右下角小箭头，打开剪贴板窗格）
         ui_kit::group(ui, "剪贴板", |ui| {
-            let paste = ui_kit::big(ui, Icon::Paste, "粘贴");
+            // 粘贴是 split button：主区直接粘贴，右侧箭头给选择性粘贴
+            let (paste, paste_menu) = ui_kit::big_split(ui, Icon::Paste, "粘贴");
             if paste.clicked() {
                 self.clip_paste(false, None);
             }
-            // Excel 的粘贴是 split button：右键给出选择性粘贴，省掉按钮旁那个 ▾
+            if paste_menu.clicked() {
+                self.paste_special = true;
+            }
             paste.context_menu(|ui| {
                 if ui.button("选择性粘贴…").clicked() {
                     self.paste_special = true;
@@ -6057,6 +6061,8 @@ impl SheetApp {
                 }
             });
             ui.vertical(|ui| {
+                // Excel 的三行小按钮相对 76 高的命令区垂直居中（72 高，上 2 下 2）
+                ui.add_space(2.0);
                 if ui_kit::labeled_w(ui, Icon::Cut, "剪切", 81.0, "剪切（Ctrl+X）").clicked() {
                     self.clip_copy(true, &ctx);
                 }
@@ -6307,17 +6313,23 @@ impl SheetApp {
             });
         }) { self.fmt_pending = true; }
 
-        ui_kit::group(ui, "样式", |ui| {
-            if ui_kit::big_sized(ui, Icon::Cf, "条件格式", Vec2::new(66.0, 76.0)).clicked() {
+        if ui_kit::group_l(ui, "样式", "style", |ui| {
+            // Excel 的三个样式按钮都是 split（右侧带下拉箭头）
+            let (a, am) = ui_kit::big_sized_split(ui, Icon::Cf, "条件格式", Vec2::new(66.0, 76.0));
+            if a.clicked() || am.clicked() {
                 self.cf_mgr = true;
             }
-            if ui_kit::big_sized(ui, Icon::Table, "套用表格格式", Vec2::new(66.0, 76.0)).clicked() {
+            let (b, bm) = ui_kit::big_sized_split(ui, Icon::Table, "套用表格格式", Vec2::new(66.0, 76.0));
+            if b.clicked() || bm.clicked() {
                 self.make_table();
             }
-            if ui_kit::big_sized(ui, Icon::Grid, "单元格样式", Vec2::new(66.0, 76.0)).clicked() {
+            let (c, cm) = ui_kit::big_sized_split(ui, Icon::Grid, "单元格样式", Vec2::new(66.0, 76.0));
+            if c.clicked() || cm.clicked() {
                 self.fmt_dlg = true;
             }
-        });
+        }) {
+            self.fmt_dlg = true;
+        }
 
         ui_kit::group(ui, "单元格", |ui| {
             ui.vertical(|ui| {
@@ -6373,7 +6385,7 @@ impl SheetApp {
                 if ui_kit::labeled_w(ui, Icon::Fill, "填充", 81.0, "把选区第一行填到下面").clicked() {
                     self.fill_down();
                 }
-                if ui_kit::labeled_w(ui, Icon::Close, "清除", 81.0, "清除内容与格式").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Eraser, "清除", 81.0, "清除内容与格式").clicked() {
                     self.clear_selection();
                 }
             });
@@ -10572,7 +10584,7 @@ impl SheetApp {
                     egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
                     Align2::CENTER_CENTER,
                     col_label(c),
-                    FontId::new(11.0, family_named("latin")),
+                    FontId::new(12.0, family_named("latin")),
                     head_fg,
                 );
             }
@@ -10604,7 +10616,7 @@ impl SheetApp {
                                     egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
                                     Align2::CENTER_CENTER,
                                     col_label(c),
-                                    FontId::new(11.0, family_named("latin")),
+                                    FontId::new(12.0, family_named("latin")),
                                     head_fg,
                                 );
                 }
@@ -10628,7 +10640,7 @@ impl SheetApp {
                     egui::pos2(origin.x + head_w / 2.0, y + h / 2.0),
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
-                    FontId::new(11.0, family_named("latin")),
+                    FontId::new(12.0, family_named("latin")),
                     head_fg,
                 );
             }
@@ -10660,7 +10672,7 @@ impl SheetApp {
                                     egui::pos2(origin.x + head_w / 2.0, y + h / 2.0),
                                     Align2::CENTER_CENTER,
                                     (r + 1).to_string(),
-                                    FontId::new(11.0, family_named("latin")),
+                                    FontId::new(12.0, family_named("latin")),
                                     head_fg,
                                 );
                 }
@@ -11467,7 +11479,7 @@ impl SheetApp {
             let hx = sx + sw;
             let hy = sy + sh;
             if hx > origin.x + head_w && hy > origin.y + hh {
-                let handle = Rect::from_min_size(egui::pos2(hx - 4.0, hy - 4.0), Vec2::splat(7.0));
+                let handle = Rect::from_min_size(egui::pos2(hx - 3.0, hy - 3.0), Vec2::splat(6.0));
                 painter.rect_filled(handle, 0.0, ui_kit::ACCENT);
                 let grab = Rect::from_min_size(egui::pos2(hx - 7.0, hy - 7.0), Vec2::splat(14.0));
                 let resp = ui.interact(

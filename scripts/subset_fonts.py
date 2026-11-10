@@ -30,6 +30,8 @@ def charset() -> str:
     for c in range(0x20, 0x7F):
         chars.add(chr(c))
     chars.update("　、。〈〉《》「」『』【】〔〕・…—～￥·×÷±≤≥≠∞√∑∏∫≈°′″℃№")
+    # 不换行空格：Excel 常用   做对齐，字体缺了会显示成问号
+    chars.update("     ")
     chars.update("①②③④⑤⑥⑦⑧⑨⑩ⅠⅡⅢⅣⅤ")
     return "".join(sorted(chars))
 

@@ -160,8 +160,9 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
         ui.add_space(5.0);
         let v = ui.visuals().clone();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, GROUP_BODY_H), Sense::hover());
+        // 分隔线从命令区顶（+4）画到命令区底，和 Excel 一样不顶到功能区边
         ui.painter().rect_filled(
-            rect,
+            rect.translate(Vec2::new(0.0, 4.0)),
             0.0,
             if v.dark_mode {
                 Color32::from_rgb(58, 64, 74)
@@ -184,7 +185,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
             });
             let w = row.response.rect.width().max(24.0);
             // Excel 的组名紧贴功能区底边：4(顶) + 76(命令) + 8(间隙) + 14(字) = 102
-            ui.add_space(8.0);
+            ui.add_space(7.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(w, GROUP_LABEL_H),
                 egui::Layout::top_down(egui::Align::Center),
@@ -194,7 +195,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
                     } else {
                         Color32::from_rgb(102, 102, 102)
                     };
-                    ui.label(RichText::new(title).size(11.5).color(c));
+                    ui.label(RichText::new(title).size(12.0).color(c));
                 },
             );
         })
@@ -279,7 +280,7 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 2.0, bg);
+        ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = if enabled {
         text_color(&v)
@@ -296,10 +297,80 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
         egui::pos2(rect.center().x, rect.bottom() - 7.0),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(11.5),
+        FontId::proportional(12.0),
         col,
     );
     resp
+}
+
+/// 大按钮的 split 形态：主区执行命令，右侧 9px 条是下拉箭头（Excel 的粘贴/合并/边框）。
+/// 宽度仍是 42，箭头画在按钮内部，不额外占位。
+pub fn big_split(ui: &mut egui::Ui, icon: Icon, label: &str) -> (Response, Response) {
+    big_sized_split(ui, icon, label, Vec2::new(42.0, 76.0))
+}
+
+/// 同上，可指定按钮尺寸（样式组的 66×76 也用 split）
+pub fn big_sized_split(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    size: Vec2,
+) -> (Response, Response) {
+    let v = ui.visuals().clone();
+    let enabled = ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let arrow_rect = Rect::from_min_size(
+        egui::pos2(rect.right() - 9.0, rect.top()),
+        Vec2::new(9.0, rect.height()),
+    );
+    let aresp = ui.interact(
+        arrow_rect,
+        egui::Id::new(("bigsplit", rect.left().to_bits(), rect.top().to_bits())),
+        Sense::click(),
+    );
+    let hover = resp.hovered() && !arrow_rect.contains(resp.hover_pos().unwrap_or(rect.center()));
+    let bg = if !enabled {
+        Color32::TRANSPARENT
+    } else if resp.is_pointer_button_down_on() || aresp.is_pointer_button_down_on() {
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
+    } else if hover || aresp.hovered() {
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 3.0, bg);
+    }
+    let col = if enabled {
+        text_color(&v)
+    } else {
+        v.weak_text_color().gamma_multiply(0.6)
+    };
+    // 图标和文字居中于「主区」（去掉右侧箭头条），否则整体重心向右偏
+    let main_cx = rect.left() + (rect.width() - 9.0) / 2.0;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(main_cx, rect.top() + 6.0 + 16.0),
+        Vec2::splat(32.0),
+    );
+    ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
+    ui.painter().text(
+        egui::pos2(main_cx, rect.bottom() - 7.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.0),
+        col,
+    );
+    // 右侧分隔条 + 下拉箭头：箭头在按钮垂直中线，像 Excel 的 split
+    ui.painter().line_segment(
+        [
+            egui::pos2(arrow_rect.left(), rect.top() + 6.0),
+            egui::pos2(arrow_rect.left(), rect.bottom() - 6.0),
+        ],
+        Stroke::new(1.0, BORDER),
+    );
+    let ac = egui::pos2(arrow_rect.center().x, rect.center().y);
+    caret(ui, ac, col);
+    (resp, aresp)
 }
 
 /// 只有图标的小按钮（撤销、对齐这类）。Excel：24×24，图标 16
@@ -321,7 +392,7 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 2.0, bg);
+        ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = if !enabled {
         v.weak_text_color().gamma_multiply(0.6)
@@ -334,7 +405,7 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
 
 /// 图标 + 文字的窄按钮（剪切、复制、格式刷）
 pub fn labeled(ui: &mut egui::Ui, icon: Icon, label: &str, tip: &str) -> Response {
-    let font = FontId::proportional(11.5);
+    let font = FontId::proportional(12.0);
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
@@ -363,7 +434,7 @@ pub fn labeled_w_on(
 ) -> Response {
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
-    let font = FontId::proportional(11.5);
+    let font = FontId::proportional(12.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
     let bg = if !enabled {
         Color32::TRANSPARENT
@@ -375,7 +446,7 @@ pub fn labeled_w_on(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 2.0, bg);
+        ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = if enabled {
         text_color(&v)
@@ -424,7 +495,7 @@ pub fn labeled_tint(
         egui::pos2(rect.left() + 24.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.5),
+        FontId::proportional(12.0),
         tint,
     );
     resp.on_hover_text(tip)
@@ -496,7 +567,7 @@ pub fn text_toggle(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 2.0, bg);
+        ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = text_color(&v);
     let _ = italic;
@@ -604,7 +675,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> Response {
 /// 紧凑文字按钮（组里放"插入行"这种短命令）
 pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(11.5);
+    let font = FontId::proportional(12.0);
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER);
@@ -617,7 +688,7 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, 2.0, bg);
+    ui.painter().rect_filled(rect, 3.0, bg);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -720,7 +791,7 @@ pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
             egui::Vec2::new(64.0, 22.0),
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                ui.label(RichText::new(label).size(11.5).weak());
+                ui.label(RichText::new(label).size(12.0).weak());
             },
         );
         add(ui);
