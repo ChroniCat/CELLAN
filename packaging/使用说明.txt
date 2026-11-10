@@ -1,0 +1,33 @@
+Sheets Native 使用说明
+=====================
+
+版本：1.37（内部测试版）
+
+系统要求
+--------
+- Windows 10 / 11，64 位（x64）。
+- 需要 OpenGL 3.3 及以上。普通台式机/笔记本的显卡驱动都满足；精简版系统、
+  部分虚拟机或远程桌面如果没有 3D 加速，可能打不开，请先在本机确认。
+- 无需安装 Office，也不需要 .NET / VC++ 运行库（已静态链接）。
+
+使用
+----
+- 双击 SheetsNative.exe 即可，免安装、单文件；设置和最近文件写在
+  %LOCALAPPDATA%\SheetsNative，不会在 exe 旁边生成东西。
+- 支持 .xlsx / .xlsm / .xls / .csv；保存保持 Excel 兼容格式。
+- 协作走共享盘或局域网，不需要服务器；同一单元格同一时间只允许一个人编辑。
+
+首次运行提示
+------------
+- exe 没有代码签名，Windows SmartScreen 可能提示“Windows 已保护你的电脑”，
+  点“更多信息 → 仍要运行”即可。杀毒软件误报时添加信任。
+
+更新（可选）
+------------
+默认不联网检查更新。要用共享目录自动更新，在
+%LOCALAPPDATA%\SheetsNative\update.txt 写共享目录路径，并在目录里放
+manifest.txt（version / exe / sha256 三行）。不配就完全离线。
+
+许可
+----
+内嵌字体为 SIL OFL 1.1；Rust 依赖的许可证清单和全文见 THIRD_PARTY_NOTICES.txt。
