@@ -767,6 +767,13 @@ impl SheetApp {
                             self.wb.sheets[0].get(0, 0).map(|c| c.value.display())
                         );
                     }
+                    // 无界面验收：SC_FILTER=1 打开后按当前区域启用筛选
+                    if std::env::var("SC_FILTER").is_ok()
+                        && self.wb.sheet(self.sheet_idx).filter.is_none()
+                    {
+                        self.start_filter();
+                        eprintln!("[filter] range={:?}", self.wb.sheet(self.sheet_idx).filter.as_ref().map(|f| f.range));
+                    }
                     // 无界面验收：SC_OPEN_DIALOG=format/revision/xlink 直接开对话框截图
                     match std::env::var("SC_OPEN_DIALOG").as_deref() {
                         Ok("format") => self.open_format_dialog(),
@@ -841,6 +848,11 @@ impl SheetApp {
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开并重算完成（{n} 个非空格）");
                     eprintln!("[open] 后台重算完成 {n} 格");
+                    if std::env::var("SC_FILTER").is_ok()
+                        && self.wb.sheet(self.sheet_idx).filter.is_none()
+                    {
+                        self.start_filter();
+                    }
                 }
                 OpenMsg::Failed(e) => {
                     self.status = e;
@@ -2747,6 +2759,9 @@ impl SheetApp {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             sh.tables.push(t);
             sh.tables_dirty = true;
+            // Excel 建表默认带筛选按钮
+            sh.filter = Some(sheetcore::sort_filter::Filter::new(r1, c1, r2, c2));
+            sh.filter_dirty = true;
         }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -5371,7 +5386,9 @@ impl SheetApp {
                     let c = self.sel.1;
                     self.do_sort(c, false);
                 }
-                if ui_kit::labeled_w(ui, Icon::Filter, "筛选", 100.0, "").clicked() {
+                let filtering = self.wb.sheet(self.sheet_idx).filter.is_some();
+                let tip = if filtering { "筛选已启用：再点一次取消" } else { "按当前区域启用筛选" };
+                if ui_kit::labeled_w_on(ui, Icon::Filter, "筛选", 100.0, filtering, tip).clicked() {
                     self.start_filter();
                 }
                 if ui_kit::labeled_w(ui, Icon::Grid, "多级排序", 100.0, "").clicked() {
@@ -6841,6 +6858,27 @@ impl SheetApp {
     }
 
     fn start_filter(&mut self) {
+        // 已在这个筛选区域内：再点一次就取消（Excel 的“筛选”是开关）
+        let inside = {
+            let sh = self.wb.sheet(self.sheet_idx);
+            let (r, c) = self.sel;
+            sh.filter
+                .as_ref()
+                .map(|f| {
+                    let (fr1, fc1, fr2, fc2) = f.range;
+                    r >= fr1 && r <= fr2 && c >= fc1 && c <= fc2
+                })
+                .unwrap_or(false)
+        };
+        if inside {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.filter = None;
+            sh.hidden_rows.clear();
+            sh.filter_dirty = true;
+            self.wb.dirty = true;
+            self.status = "已取消筛选".into();
+            return;
+        }
         let (r, c) = self.sel;
         let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
         if r2 <= r1 {

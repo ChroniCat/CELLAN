@@ -630,3 +630,67 @@ fn pivot_refresh_recomputes_in_place() {
     assert_eq!(rect2, rect, "刷新应写回同一块区域");
     assert_eq!(app.wb.sheet(0).value(rect2.2, rect2.1 + 1).display(), "115");
 }
+
+#[test]
+fn plain_range_filter_opens_from_header_arrow() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("k".into()), formula: None });
+        sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Text("v".into()), formula: None });
+        sh.set(1, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("a".into()), formula: None });
+        sh.set(1, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
+        sh.set(2, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("b".into()), formula: None });
+        sh.set(2, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
+    }
+    app.sel = (0, 0);
+    app.start_filter();
+    assert_eq!(
+        app.wb.sheet(0).filter.as_ref().map(|f| f.range),
+        Some((0, 0, 2, 1)),
+        "普通区域点筛选应建立 A1:B3 的筛选"
+    );
+    run_grid_frame(&mut app, &ctx, vec![]);
+    let p = egui::pos2(HEAD_W + 64.0, HEAD_H + 9.5);
+    let press = egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    };
+    let release = egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    };
+    run_grid_frame(&mut app, &ctx, vec![press]);
+    run_grid_frame(&mut app, &ctx, vec![release]);
+    assert!(app.filter_popup.is_some(), "点表头漏斗应弹出筛选面板");
+}
+
+#[test]
+fn making_a_table_enables_filter_and_second_click_clears_it() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        for c in 0..2u32 {
+            sh.set(0, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text(format!("h{c}").into()), formula: None });
+            sh.set(1, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text("a".into()), formula: None });
+            sh.set(2, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text("b".into()), formula: None });
+        }
+    }
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.make_table();
+    assert_eq!(app.wb.sheet(0).tables.len(), 1);
+    assert_eq!(
+        app.wb.sheet(0).filter.as_ref().map(|f| f.range),
+        Some((0, 0, 2, 1)),
+        "建表应自动带筛选"
+    );
+    app.start_filter();
+    assert!(app.wb.sheet(0).filter.is_none(), "再点一次筛选应取消");
+}

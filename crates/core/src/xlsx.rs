@@ -385,6 +385,18 @@ pub fn load(path: &Path) -> Result<Workbook> {
         for sheet in wb.sheets.iter_mut() {
             if let Some(list) = tables.get(&sheet.name) {
                 sheet.tables = list.clone();
+                // Excel 表格对象自带筛选；表格 XML 里的 autoFilter 不落到工作表节点，
+                // 这里补成区域筛选，否则打开文件看不到漏斗按钮。
+                if sheet.filter.is_none() {
+                    if let Some(tb) = list.iter().find(|tb| tb.header_row) {
+                        let (r1, c1, r2, c2) = tb.range;
+                        let last = if tb.totals_row { r2.saturating_sub(1) } else { r2 };
+                        if last > r1 {
+                            sheet.filter =
+                                Some(crate::sort_filter::Filter::new(r1, c1, last, c2));
+                        }
+                    }
+                }
             }
         }
     }
@@ -434,7 +446,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.dv = lay.dv.clone();
                 sheet.freeze = lay.freeze;
-                sheet.filter = lay.filter.clone();
+                // 表格对象已经在上面补过筛选；工作表的 autoFilter 只在存在时覆盖，
+                // 否则会把表格自带的筛选清成 None（打开后没有漏斗）。
+                if lay.filter.is_some() {
+                    sheet.filter = lay.filter.clone();
+                }
                 if let Some(f) = &sheet.filter {
                     sheet.hidden_rows = f.hidden_rows(sheet);
                 }
@@ -1236,7 +1252,19 @@ fn apply_cf_patch(
             let cf = if do_cf { crate::patch::cf_blocks_xml(&sheet.cf.blocks) } else { String::new() };
             let dv = if do_dv { crate::patch::dv_xml(&sheet.dv) } else { String::new() };
             let af = if do_filter {
-                sheet.filter.as_ref().map(crate::patch::auto_filter_xml).unwrap_or_default()
+                // 表格对象的 autoFilter 写在 tableN.xml 里；工作表上再写一份会重复，
+                // 打开时 Excel 会看到两个筛选源。
+                match sheet.filter.as_ref() {
+                    Some(f)
+                        if !sheet
+                            .tables
+                            .iter()
+                            .any(|t| t.header_row && t.range == f.range) =>
+                    {
+                        crate::patch::auto_filter_xml(f)
+                    }
+                    _ => String::new(),
+                }
             } else {
                 String::new()
             };
@@ -1332,6 +1360,49 @@ fn apply_cf_patch(
 mod tests {
     use super::*;
     use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn table_filter_survives_save_without_duplicate_autofilter() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("tbl_filter_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        {
+            let sh = &mut wb.sheets[0];
+            for c in 0..2u32 {
+                sh.set(0, c, Cell { value: Value::Text(format!("h{c}").into()), formula: None });
+                sh.set(1, c, Cell { value: Value::Text("a".into()), formula: None });
+                sh.set(2, c, Cell { value: Value::Text("b".into()), formula: None });
+            }
+            sh.tables.push(crate::table::Table {
+                name: "Table1".into(),
+                display: "Table1".into(),
+                range: (0, 0, 2, 1),
+                columns: vec!["h0".into(), "h1".into()],
+                header_row: true,
+                totals_row: false,
+            });
+            sh.tables_dirty = true;
+            sh.filter = Some(crate::sort_filter::Filter::new(0, 0, 2, 1));
+            sh.filter_dirty = true;
+        }
+        save(&path, &wb).expect("save");
+        let xml = crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        assert!(
+            !xml.contains("<autoFilter"),
+            "表格范围不应再写工作表级 autoFilter"
+        );
+        let back = load(&path).expect("load");
+        assert_eq!(back.sheets[0].tables.len(), 1);
+        assert_eq!(
+            back.sheets[0].filter.as_ref().map(|f| f.range),
+            Some((0, 0, 2, 1)),
+            "表格自带筛选，载入后应有漏斗"
+        );
+    }
 
     #[test]
     fn sheet_protection_survives_save_and_verifies() {
