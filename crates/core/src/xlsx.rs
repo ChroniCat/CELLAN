@@ -232,6 +232,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
+        decrypted: None,
+        encryption: None,
         dirty: false,
         styles: crate::style::StyleTable::new(),
     };
@@ -568,6 +570,39 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 }
             }
         }
+        // Excel 写在 sharedStrings.xml 里的富文本：按整段文字回填
+        if let Some(bytes) = crate::fixups::read_part_file(path, "xl/sharedStrings.xml") {
+            if let Ok(xml) = String::from_utf8(bytes) {
+                let table = crate::richtext::sst_runs(&xml);
+                if !table.is_empty() {
+                    let mut map: std::collections::HashMap<String, Vec<crate::richtext::RichRun>> =
+                        std::collections::HashMap::new();
+                    for (text, runs) in table {
+                        if runs.iter().any(|r| !r.is_plain()) {
+                            map.entry(text).or_insert(runs);
+                        }
+                    }
+                    if !map.is_empty() {
+                        for sheet in wb.sheets.iter_mut() {
+                            let hits: Vec<(u32, u32, Vec<crate::richtext::RichRun>)> = sheet
+                                .iter()
+                                .filter_map(|(cref, cell)| {
+                                    if let crate::model::Value::Text(t) = &cell.value {
+                                        map.get(&**t)
+                                            .map(|r| (cref.row, cref.col, r.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            for (r, c, runs) in hits {
+                                sheet.rich.insert((r, c), runs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
             definitions: pivot_definitions(path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
@@ -677,7 +712,68 @@ pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
     }
 }
 
+/// 保存：原文件带打开密码时，先写明文到临时文件，再加密回目标路径。
 pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
+    let Some(enc) = wb.encryption.as_ref() else {
+        return save_plain(path, wb);
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".~plain-{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    // 基准必须是明文：加密文件不能直接给 umya 读。用完立即删。
+    let base = if let Some(src) = wb.path.as_ref().filter(|p| p.exists()) {
+        let bytes = crate::crypto::decrypt(src, &enc.password)?;
+        let b = dir.join(format!(".~base-{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&b);
+        std::fs::write(&b, &bytes).with_context(|| "写临时明文基准失败")?;
+        Some(b)
+    } else {
+        None
+    };
+    let res = save_plain_base(&tmp, wb, base.as_deref());
+    if let Some(b) = base.as_ref() {
+        let _ = std::fs::remove_file(b);
+    }
+    let out = res.and_then(|()| {
+        let bytes = std::fs::read(&tmp).with_context(|| "读取临时明文失败")?;
+        crate::crypto::encrypt(path, &bytes, enc)
+    });
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+/// 带打开密码的文件：解密到临时文件后按普通 xlsx 加载。
+/// 工作簿记住原路径与密码，另存时继续加密。
+pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
+    let plain = crate::crypto::decrypt(path, password)?;
+    let tmp = std::env::temp_dir().join(format!(
+        "sheets-native-dec-{}-{}.xlsx",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, &plain).with_context(|| "写入解密临时文件失败")?;
+    let mut wb = match load(&tmp) {
+        Ok(wb) => wb,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    wb.path = Some(path.to_path_buf());
+    wb.decrypted = None;
+    wb.encryption = Some(crate::crypto::EncryptionSettings::new(password));
+    Ok(wb)
+}
+
+fn save_plain(path: &Path, wb: &Workbook) -> Result<()> {
+    save_plain_base(path, wb, None)
+}
+
+fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<()> {
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
 
@@ -686,8 +782,13 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     // 基准文件必须用「打开时的原文件」，不能用另存的目标路径：
     // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等
     // 我们不解析也不重建的结构（umya 从零建表只会写单元格）。
-    let original_base = match wb.path.as_ref().filter(|p| p.exists()) {
-        Some(p) => p.clone(),
+    let original_base = match base_override
+        .filter(|p| p.exists())
+        .map(|p| p.to_path_buf())
+        .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists()).cloned())
+        .or_else(|| wb.path.as_ref().filter(|p| p.exists()).cloned())
+    {
+        Some(p) => p,
         None => path.to_path_buf(),
     };
     // Reconcile the package manifest before umya reads it. This retains the

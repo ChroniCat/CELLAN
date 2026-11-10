@@ -200,6 +200,8 @@ impl Sheet {
             axis: if rows { crate::refs::Axis::Row } else { crate::refs::Axis::Col },
             at, n, delete, target_sheet: self.name.clone(), own_sheet: self.name.clone(),
             translate: None,
+            row_filter: None,
+            col_filter: None,
         };
         self.arrays = self.arrays.iter().filter_map(|&(anchor, (r1, c1, r2, c2))| {
             if rows {
@@ -461,6 +463,44 @@ impl crate::layout::Axis {
 }
 
 /// 整个工作簿层面的结构改动：搬格子 + 改写所有表里的公式引用
+/// 插入/删除单元格（局部区域）：按区域改写公式引用。
+/// horizontal=true 表示右移/左移（列位移），false 表示下移/上移（行位移）。
+pub fn apply_cell_shift_wb(
+    wb: &mut crate::model::Workbook,
+    sheet_idx: usize,
+    rect: (u32, u32, u32, u32),
+    horizontal: bool,
+    insert: bool,
+) {
+    let Some(name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
+        return;
+    };
+    let (r1, c1, r2, c2) = rect;
+    let (axis, at, n) = if horizontal {
+        (crate::refs::Axis::Col, c1, c2.saturating_sub(c1) + 1)
+    } else {
+        (crate::refs::Axis::Row, r1, r2.saturating_sub(r1) + 1)
+    };
+    for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+        let shift = crate::refs::Shift {
+            axis,
+            at,
+            n,
+            delete: !insert,
+            target_sheet: name.clone(),
+            own_sheet: if idx == sheet_idx {
+                name.clone()
+            } else {
+                sheet.name.clone()
+            },
+            translate: None,
+            row_filter: if horizontal { Some((r1, r2)) } else { None },
+            col_filter: if horizontal { None } else { Some((c1, c2)) },
+        };
+        sheet.rewrite_references(&shift);
+    }
+}
+
 pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op: &Structural) {
     let Some(name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
         return;
@@ -485,6 +525,8 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
                 sheet.name.clone()
             },
             translate: None,
+            row_filter: None,
+            col_filter: None,
         };
         sheet.rewrite_references(&shift);
         // 图表系列引用
@@ -517,6 +559,8 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
             target_sheet: name.clone(),
             own_sheet: own,
             translate: None,
+            row_filter: None,
+            col_filter: None,
         };
         let nt = crate::refs::rewrite(text, &sh);
         if nt != *text {
@@ -536,6 +580,8 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
         target_sheet: name.clone(),
         own_sheet: name.clone(),
             translate: None,
+            row_filter: None,
+            col_filter: None,
     };
     let map_rect = |rect: (u32, u32, u32, u32)| {
         let (r1, c1, r2, c2) = rect;

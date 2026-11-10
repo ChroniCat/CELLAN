@@ -177,6 +177,61 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// 解析 sharedStrings.xml：返回 (整段文字, runs) 列表。
+/// Excel 自己的富文本都在这里，加载时按文字回填 `Sheet.rich`。
+pub fn sst_runs(xml: &str) -> Vec<(String, Vec<RichRun>)> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = xml[from..].find("<si") {
+        let i = from + rel;
+        // <si> 或 <si ...>，排除 <silly
+        let after = xml[i + 3..].chars().next();
+        if !matches!(after, Some('>') | Some(' ') | Some('/')) {
+            from = i + 3;
+            continue;
+        }
+        let Some(close) = xml[i..].find("</si>").map(|e| i + e + 5) else {
+            break;
+        };
+        let body = &xml[i + 3..close - 5];
+        let wrapped = format!("<is>{body}</is>");
+        if let Some(runs) = parse_inline(&wrapped) {
+            let text = runs_text(&runs);
+            if !text.is_empty() {
+                out.push((text, runs));
+            }
+        }
+        from = close;
+    }
+    out
+}
+
+#[cfg(test)]
+mod sst_tests {
+    use super::*;
+
+    #[test]
+    fn parses_shared_string_runs() {
+        let xml = r#"<sst count="1"><si><r><rPr><b/><color rgb="FFFF0000"/><sz val="14"/><rFont val="黑体"/></rPr><t>加粗</t></r><r><t xml:space="preserve">普通</t></r></si></sst>"#;
+        let all = sst_runs(xml);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "加粗普通");
+        assert_eq!(all[0].1.len(), 2);
+        assert!(all[0].1[0].bold);
+        assert_eq!(all[0].1[0].color, Some([255, 0, 0]));
+        assert_eq!(all[0].1[0].font.as_deref(), Some("黑体"));
+        assert!(!all[0].1[1].bold);
+    }
+
+    #[test]
+    fn plain_shared_string_is_single_run() {
+        let xml = r#"<sst><si><t>纯文本</t></si></sst>"#;
+        let all = sst_runs(xml);
+        assert_eq!(all[0].0, "纯文本");
+        assert!(all[0].1.iter().all(|r| r.is_plain()));
+    }
+}
+
 /// 把工作表 XML 里指定单元格改成 inlineStr 富文本。
 /// 只处理 `<c r="A1" ...>…</c>` 或自闭合的 `<c r="A1" .../>`。
 pub fn patch_sheet_rich(

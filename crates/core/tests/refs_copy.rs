@@ -10,6 +10,8 @@ fn shift(axis: Axis, at: u32, n: u32, delete: bool) -> Shift {
         target_sheet: "Sheet1".into(),
         own_sheet: "Sheet1".into(),
         translate: None,
+        row_filter: None,
+        col_filter: None,
     }
 }
 

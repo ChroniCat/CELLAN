@@ -442,6 +442,10 @@ pub struct Workbook {
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
     pub path: Option<PathBuf>,
+    /// 原文件有打开密码时：解密到临时文件的路径（保存时当基准）
+    pub decrypted: Option<PathBuf>,
+    /// 打开密码设置；另存时继续加密
+    pub encryption: Option<crate::crypto::EncryptionSettings>,
     pub dirty: bool,
 }
 
@@ -459,6 +463,8 @@ impl Workbook {
             pivots_pending: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
+            decrypted: None,
+            encryption: None,
             dirty: false,
             styles: crate::style::StyleTable::new(),
         }

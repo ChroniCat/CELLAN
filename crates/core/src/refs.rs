@@ -28,6 +28,26 @@ pub struct Shift {
     pub own_sheet: String,
     /// 平移模式（复制粘贴用）：(行偏移, 列偏移)，设了就忽略 at/n/delete
     pub translate: Option<(i64, i64)>,
+    /// 只影响这些行（插入/删除单元格用）
+    pub row_filter: Option<(u32, u32)>,
+    /// 只影响这些列（插入/删除单元格用）
+    pub col_filter: Option<(u32, u32)>,
+}
+
+impl Default for Shift {
+    fn default() -> Self {
+        Self {
+            axis: Axis::Row,
+            at: 0,
+            n: 0,
+            delete: false,
+            target_sheet: String::new(),
+            own_sheet: String::new(),
+            translate: None,
+            row_filter: None,
+            col_filter: None,
+        }
+    }
 }
 
 impl Shift {
@@ -278,6 +298,9 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                     return Some(unchanged_ref(b, start, j));
                 }
                 let none2 = (None::<u32>, None::<u32>);
+                if !allowed(sh, r1, c1) && !allowed(sh, r2, c2) {
+                    return Some(unchanged_ref(b, start, j));
+                }
                 let (p1, p2) = if sh.translate.is_some() {
                     (apply(sh, r1, c1, d2, d1), apply(sh, r2, c2, d4, d3))
                 } else if sh.axis == Axis::Row {
@@ -312,7 +335,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
         return None;
     }
 
-    if !shift_applies(sh, qualified_sheet) {
+    if !shift_applies(sh, qualified_sheet) || !allowed(sh, r1, c1) {
         return Some(unchanged_ref(b, start, i));
     }
     let (nr, nc) = apply(sh, r1, c1, d2, d1);
@@ -330,6 +353,11 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
 }
 
 /// 平移或结构位移的统一出口
+fn allowed(sh: &Shift, r: u32, c: u32) -> bool {
+    sh.row_filter.is_none_or(|(a, b)| r >= a && r <= b)
+        && sh.col_filter.is_none_or(|(a, b)| c >= a && c <= b)
+}
+
 fn apply(sh: &Shift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
     if let Some((dr, dc)) = sh.translate {
         return (
@@ -364,6 +392,8 @@ pub fn translate(formula: &str, dr: i64, dc: i64, sheet: &str) -> String {
         target_sheet: sheet.to_string(),
         own_sheet: sheet.to_string(),
         translate: Some((dr, dc)),
+        row_filter: None,
+        col_filter: None,
     };
     rewrite(formula, &sh)
 }
@@ -488,6 +518,8 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
     let identity = Shift {
         axis: Axis::Row, at: 0, n: 0, delete: false,
         target_sheet: String::new(), own_sheet: String::new(), translate: None,
+        row_filter: None,
+        col_filter: None,
     };
     while i < b.len() {
         let start = i;
@@ -599,6 +631,8 @@ mod tests {
             target_sheet: "S".into(),
             own_sheet: "S".into(),
             translate: None,
+            row_filter: None,
+            col_filter: None,
         }
     }
     fn delete_row(at: u32, n: u32) -> Shift {
@@ -667,6 +701,8 @@ mod tests {
             target_sheet: "数据".into(),
             own_sheet: "汇总".into(),
             translate: None,
+            row_filter: None,
+            col_filter: None,
         };
         // 指着被改的表 → 跟着动
         assert_eq!(rewrite("=数据!A1", &sh), "=数据!A2");
@@ -681,5 +717,42 @@ mod tests {
     fn leaves_plain_numbers_alone() {
         assert_eq!(rewrite("=1+2*3", &insert_row(0, 1)), "=1+2*3");
         assert_eq!(rewrite("=SUM(1,2)", &insert_row(0, 1)), "=SUM(1,2)");
+    }
+}
+
+#[cfg(test)]
+mod cell_shift_tests {
+    use super::*;
+
+    #[test]
+    fn cell_insert_only_moves_refs_in_the_selected_columns() {
+        let sh = Shift {
+            axis: Axis::Row,
+            at: 2,
+            n: 1,
+            delete: false,
+            target_sheet: "Sheet1".into(),
+            own_sheet: "Sheet1".into(),
+            col_filter: Some((0, 0)),
+            ..Default::default()
+        };
+        assert_eq!(rewrite("A5+A1+B5", &sh), "A6+A1+B5");
+        let del = Shift { delete: true, ..sh };
+        assert_eq!(rewrite("A1+A3+A9", &del), "A1+#REF!+A8");
+    }
+
+    #[test]
+    fn cell_insert_horizontal_moves_refs_in_the_selected_rows() {
+        let sh = Shift {
+            axis: Axis::Col,
+            at: 1,
+            n: 1,
+            delete: false,
+            target_sheet: "Sheet1".into(),
+            own_sheet: "Sheet1".into(),
+            row_filter: Some((0, 0)),
+            ..Default::default()
+        };
+        assert_eq!(rewrite("B1+C1+B2", &sh), "C1+D1+B2");
     }
 }

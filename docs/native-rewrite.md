@@ -1952,3 +1952,35 @@ Excel 实测（compat1.xlsx）：`ShowTotals=True`、`h=1 hrow=3`、`v=1 vcol=3`
 合并下拉（合并后居中/合并单元格/取消合并）、边框下拉（所有框线/外边框/粗外框/无）、名称管理器（新建/改/删）。
 
 打印预览/打印在“文件→打印”里已有：预览窗口 + “打印”按钮（导出临时 PDF 后交给系统默认处理程序）。至此本轮审计出的基础操作缺口全部闭合。
+### 第八轮：三个已知限制的处理（2026-11-10 晚）
+
+**1. 打开密码（ECMA-376 Agile）**
+
+- 新增 `crates/core/src/crypto.rs`：AES-256-CBC + SHA-512，CFB 容器里写
+  `EncryptionInfo` / `EncryptedPackage`，并补 Excel 必需的 `\x06DataSpaces`
+  （Version / DataSpaceMap / StrongEncryptionDataSpace / Primary）。
+- 派生细节：`H0 = SHA512(salt || UTF-16LE(pw))`，迭代 `H_i = SHA512(LE32(i) || H(i-1))`
+  （序号在前，和 msoffcrypto 对齐）；三段 blockKey 分别派生验证器输入/验证器哈希/包密钥。
+- 包分段 IV = `SHA512(keyDataSalt || LE32(block))[..16]`；`dataIntegrity` 写真实
+  HMAC-SHA512（否则 Excel 判“加密类型不可用”）。
+- 打开：`xlsx::load_with_password` 解密到临时文件加载，加载完立即删除；密码只留在内存。
+- 保存：另存时先解密原文件当基准 → 写明文临时文件 → 加密回目标；没有长期明文落盘。
+- UI：打开加密文件弹“需要打开密码”；文件→信息有“用密码加密…”/“取消打开密码”。
+- Excel 实测：本程序生成的加密文件用 Excel+密码可打开（`A1=加密测试`），Excel 生成的
+  加密文件本程序可解密；改一格另存后 Excel 仍能打开且 `A2` 保留。
+
+**2. 插入/删除单元格改写公式引用**
+
+- `refs::Shift` 增加 `row_filter`/`col_filter`，`allow()` 只在引用落在被移动的行/列范围内才改写。
+- 新增 `structural::apply_cell_shift_wb`，`shift_cells` 在搬完值/样式后调用它；
+  撤销键里补上全表公式格，撤销能一起还原引用。
+- 测试：A1 插入下移后 `A3+1` → `A4+1`，删除后回到 `A3+1`；水平插删只动选中行。
+
+**3. sharedStrings 富文本**
+
+- `richtext::sst_runs` 解析 `<si><r><rPr>…</rPr><t>…</t></r></si>`，加载时按整段文字回填
+  `Sheet.rich`（首见优先）；写入仍用 inlineStr，Excel 逐段格式可读。
+- 实测：Excel 生成的 `sst_rich.xlsx` 载入为 2 段（第二段 16pt）；另存后 Excel 读
+  `A1=红色加粗普通`、第 5 字 `16pt`，无修复提示。
+
+仍不支持的：BIFF8（.xls）打开密码、证书加密（keyEncryptor=certificate）。

@@ -365,6 +365,10 @@ struct SheetApp {
     chart_drag: Option<ChartDrag>,
     /// 工作表保护对话框
     protect_dlg: Option<ProtectDlg>,
+    /// 打开加密工作簿的口令框：(路径, 口令, 错误)
+    pw_prompt: Option<(PathBuf, String, String)>,
+    /// 设置打开密码：(口令, 确认, 错误)
+    enc_dlg: Option<(String, String, String)>,
     rich_dlg: Option<RichDlg>,
     /// 名称管理器
     name_mgr: bool,
@@ -625,6 +629,8 @@ impl SheetApp {
             chart_sel: None,
             chart_drag: None,
             protect_dlg: None,
+            pw_prompt: None,
+            enc_dlg: None,
             rich_dlg: None,
             name_mgr: false,
             paste_special: false,
@@ -733,6 +739,18 @@ impl SheetApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        if sheetcore::crypto::needs_password(&path) {
+            if let Ok(pw) = std::env::var("SC_PASSWORD") {
+                self.open_path_with_password(path, pw);
+                return;
+            }
+            self.pw_prompt = Some((path, String::new(), String::new()));
+            return;
+        }
+        self.open_path_plain(path);
+    }
+
+    fn open_path_plain(&mut self, path: PathBuf) {
         // Keep the saving document alive, including its result/error channel.
         if self.tasks.saving.is_some() {
             self.open_in_new_tab(path);
@@ -759,6 +777,165 @@ impl SheetApp {
                 }
             }
         });
+    }
+
+    fn open_path_with_password(&mut self, path: PathBuf, pw: String) {
+        self.reset_editor_state();
+        self.tasks = DocumentTasks::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tasks.open_rx = Some(rx);
+        self.tasks.busy = true;
+        self.status = format!("正在解密 {}…", path.display());
+        std::thread::spawn(move || {
+            match sheetcore::xlsx::load_with_password(&path, &pw) {
+                Ok(wb) => {
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone())));
+                    let mut wb2 = wb;
+                    sheetcore::formula::recalc_all(&mut wb2);
+                    let deps = sheetcore::formula::deps::Deps::build(&wb2);
+                    let _ = tx.send(OpenMsg::Recalced(Box::new(wb2), Box::new(deps)));
+                }
+                Err(e) => {
+                    let _ = tx.send(OpenMsg::Failed(format!("打开失败: {e:#}")));
+                }
+            }
+        });
+    }
+
+    /// 打开密码框：验证后走解密加载
+    fn password_prompt_ui(&mut self, ctx: &egui::Context) {
+        if self.pw_prompt.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        let mut close = false;
+        let path_name = self
+            .pw_prompt
+            .as_ref()
+            .and_then(|(p, _, _)| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let err = self.pw_prompt.as_ref().map(|v| v.2.clone()).unwrap_or_default();
+        ui_kit::window(ctx, "需要打开密码", 360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("{path_name} 设置了打开密码。"));
+                ui.add_space(4.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.pw_prompt.as_mut().unwrap().1)
+                        .password(true),
+                );
+                if !err.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&err)
+                            .color(Color32::from_rgb(196, 43, 28))
+                            .size(12.0),
+                    );
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        go = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if go {
+            let (path, pw, _) = self.pw_prompt.clone().unwrap();
+            match sheetcore::crypto::decrypt(&path, &pw) {
+                Ok(_) => {
+                    self.pw_prompt = None;
+                    self.open_path_with_password(path, pw);
+                    return;
+                }
+                Err(e) => {
+                    if let Some(v) = self.pw_prompt.as_mut() {
+                        v.2 = format!("{e:#}");
+                    }
+                }
+            }
+        }
+        if close {
+            open = false;
+        }
+        if !open {
+            self.pw_prompt = None;
+        }
+    }
+
+    /// 文件→信息：设置打开密码
+    fn encrypt_dialog_ui(&mut self, ctx: &egui::Context) {
+        if self.enc_dlg.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut close = false;
+        let err = self.enc_dlg.as_ref().map(|v| v.2.clone()).unwrap_or_default();
+        ui_kit::window(ctx, "用密码加密", 380.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("打开这个工作簿时需要输入密码；保存时写成 Office 加密文件。");
+                ui.add_space(6.0);
+                ui.label("密码");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.enc_dlg.as_mut().unwrap().0)
+                        .password(true),
+                );
+                ui.label("确认密码");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.enc_dlg.as_mut().unwrap().1)
+                        .password(true),
+                );
+                if !err.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&err)
+                            .color(Color32::from_rgb(196, 43, 28))
+                            .size(12.0),
+                    );
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if apply {
+            let (pw, confirm, _) = self.enc_dlg.clone().unwrap();
+            if pw.is_empty() {
+                if let Some(v) = self.enc_dlg.as_mut() {
+                    v.2 = "密码不能为空".into();
+                }
+            } else if pw != confirm {
+                if let Some(v) = self.enc_dlg.as_mut() {
+                    v.2 = "两次输入的密码不一致".into();
+                }
+            } else {
+                self.wb.encryption = Some(sheetcore::crypto::EncryptionSettings::new(pw));
+                self.wb.dirty = true;
+                self.status = "已设置打开密码，保存后生效".into();
+                self.enc_dlg = None;
+                self.backstage = false;
+                return;
+            }
+        }
+        if close {
+            open = false;
+        }
+        if !open {
+            self.enc_dlg = None;
+        }
     }
 
     /// 处理后台打开/重算的结果
@@ -4403,7 +4580,7 @@ impl SheetApp {
         self.commit_edit(None);
         let rect = self.sel_rect();
         let used = self.wb.sheet(self.sheet_idx).used_bounds();
-        let keys = match used {
+        let mut keys = match used {
             Some((_, _, r2, c2)) => sheetcore::undo::rect_keys(
                 rect.0,
                 rect.1,
@@ -4412,6 +4589,12 @@ impl SheetApp {
             ),
             None => sheetcore::undo::rect_keys(rect.0, rect.1, rect.2, rect.3),
         };
+        // 公式引用可能被改到选区外，撤销要能一起还原
+        for (cref, cell) in self.wb.sheet(self.sheet_idx).iter() {
+            if cell.formula.is_some() {
+                keys.push((cref.row, cref.col));
+            }
+        }
         let txn = self.txn_begin(&keys);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -4426,6 +4609,7 @@ impl SheetApp {
                 sheetcore::cells::delete(sh, rect, shift, 1);
             }
         }
+        sheetcore::structural::apply_cell_shift_wb(&mut self.wb, self.sheet_idx, rect, horizontal, insert);
         self.txn_end(if insert { "插入单元格" } else { "删除单元格" }, txn);
         sheetcore::formula::recalc_all(&mut self.wb);
         self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
@@ -5438,6 +5622,23 @@ impl SheetApp {
                                                 .size(12.0),
                                         );
                                     }
+                                }
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                if self.wb.encryption.is_some() {
+                                    ui.label(
+                                        egui::RichText::new("已设置打开密码（保存后为加密文件）")
+                                            .size(12.5)
+                                            .color(ui_kit::ACCENT),
+                                    );
+                                    if ui.button("取消打开密码").clicked() {
+                                        self.wb.encryption = None;
+                                        self.wb.dirty = true;
+                                        self.status = "已取消打开密码，保存后生效".into();
+                                    }
+                                } else if ui.button("用密码加密…").clicked() {
+                                    self.enc_dlg = Some((String::new(), String::new(), String::new()));
                                 }
 
                             }
@@ -13049,6 +13250,8 @@ impl eframe::App for SheetApp {
         self.paste_special_dialog(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
+        self.password_prompt_ui(ctx);
+        self.encrypt_dialog_ui(ctx);
         self.size_dialog(ctx);
         self.color_popup_window(ctx);
         // 缩放：Ctrl+滚轮

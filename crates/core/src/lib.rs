@@ -24,6 +24,7 @@ pub mod pdf;
 pub mod print;
 pub mod protection;
 pub mod cells;
+pub mod crypto;
 pub mod hyperlinks;
 pub mod richtext;
 pub mod pivot;

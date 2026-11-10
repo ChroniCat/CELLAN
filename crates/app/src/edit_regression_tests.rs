@@ -1043,3 +1043,25 @@ fn move_selection_by_shifts_values_and_formulas() {
     assert_eq!(f.as_deref(), Some("A2+1"), "公式应跟着移动");
     assert_eq!(app.wb.sheet(0).value(1, 1), sheetcore::model::Value::Number(6.0));
 }
+
+#[test]
+fn insert_cells_rewrites_formula_refs() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
+        sh.set(2, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(5.0), formula: None });
+        sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(0.0), formula: Some("A3+1".into()) });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.shift_cells(true, false);
+    let f = app.wb.sheet(0).get(0, 1).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("A4+1"), "下移后引用应跟着走");
+    assert_eq!(app.wb.sheet(0).value(3, 0), sheetcore::model::Value::Number(5.0));
+    // 再删掉刚插入的格子，引用回来
+    app.shift_cells(false, false);
+    let f = app.wb.sheet(0).get(0, 1).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("A3+1"));
+}

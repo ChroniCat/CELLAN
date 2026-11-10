@@ -160,7 +160,7 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
     let target = wb.sheets[sheet].clone();
     let mut foreign = Vec::new();
     for (si, other) in wb.sheets.iter().enumerate().filter(|(si, _)| *si != sheet) {
-        let shift = Shift { axis, at, n, delete, target_sheet: target.name.clone(), own_sheet: other.name.clone(), translate: None };
+        let shift = Shift { axis, at, n, delete, target_sheet: target.name.clone(), own_sheet: other.name.clone(), translate: None, row_filter: None, col_filter: None };
         let changes = |f: &str| crate::refs::rewrite(f, &shift) != f;
         let cells: Vec<_> = other.iter().filter(|(_, c)| c.formula.as_deref().is_some_and(changes))
             .map(|(key, c)| (key, c.clone())).collect();
