@@ -142,6 +142,12 @@ pub struct Sheet {
     pub filter: Option<crate::sort_filter::Filter>,
     /// 被筛选隐藏的行（渲染时按高度 0 处理）
     pub hidden_rows: std::collections::HashSet<u32>,
+    /// 用户手动隐藏的行（和筛选隐藏分开，筛选重算不会清掉）
+    pub hidden_rows_user: std::collections::HashSet<u32>,
+    /// 用户手动隐藏的列
+    pub hidden_cols: std::collections::HashSet<u32>,
+    /// 列宽/行高/隐藏状态被改过：保存时要重写 <cols> 和行属性
+    pub layout_dirty: bool,
     /// 筛选状态被改过
     pub filter_dirty: bool,
     /// 页面设置
@@ -152,6 +158,12 @@ pub struct Sheet {
     pub charts: Vec<crate::charts::Chart>,
     /// 图表引用被改过：保存时要重写 chart 部件
     pub charts_dirty: bool,
+    /// 工作表标签颜色（RGB）
+    pub tab_color: Option<[u8; 3]>,
+    /// 标签颜色被改过：保存时要写 <sheetPr><tabColor>
+    pub tab_color_dirty: bool,
+    /// 表格对象被改过（新建/删除/转换）：保存时要同步 table 部件
+    pub tables_dirty: bool,
 }
 
 impl Sheet {
@@ -185,11 +197,17 @@ impl Sheet {
             freeze_dirty: false,
             filter: None,
             hidden_rows: std::collections::HashSet::new(),
+            hidden_rows_user: std::collections::HashSet::new(),
+            hidden_cols: std::collections::HashSet::new(),
+            layout_dirty: false,
             filter_dirty: false,
             page: crate::page::PageSetup::default(),
             page_dirty: false,
             charts: Vec::new(),
             charts_dirty: false,
+            tab_color: None,
+            tab_color_dirty: false,
+            tables_dirty: false,
         }
     }
 

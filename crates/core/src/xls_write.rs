@@ -381,8 +381,8 @@ fn sheet_stream(
         let mut b = Vec::new();
         b.extend_from_slice(&w16(c as u16));
         b.extend_from_slice(&w16(c as u16));
-        // 像素 → 字符数（excel_width_to_px 的逆运算：(w-5)/7）
-        let chars = ((w - 5.0) / 7.0).max(0.0);
+        // 像素 → 字符数（BIFF 的 ColumnWidth 没有 5px 内边距：w/8）
+        let chars = (w / 8.0).max(0.0);
         b.extend_from_slice(&w16((chars * 256.0).round().min(65535.0) as u16));
         b.extend_from_slice(&w16(0x0F));
         b.extend_from_slice(&w16(0));

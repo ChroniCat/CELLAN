@@ -1738,3 +1738,429 @@ fn content_type_of(path: &Path, part: &str) -> Option<String> {
     let head = &xml[head_start..head_end];
     head.split("ContentType=\"").nth(1).map(|s| s.split('"').next().unwrap_or("").to_string())
 }
+
+/// 解析一个 XML 标签里的属性（值可能有引号、允许 `/>` 结尾）
+fn xml_attrs(tag: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = tag.as_bytes();
+    // 跳过元素名（`<row r="1"` → 从第一个空格开始）
+    let mut i = tag.find(char::is_whitespace).unwrap_or(0);
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let ks = i;
+        while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b'/' && bytes[i] != b'>' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            break;
+        }
+        let key = tag[ks..i].trim().to_string();
+        i += 1;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let quote = bytes[i];
+        if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let vs = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            out.push((key, tag[vs..i].to_string()));
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn with_attrs(base: &[(String, String)], set: &[(&str, String)]) -> String {
+    let mut v: Vec<(String, String)> = base
+        .iter()
+        .filter(|(k, _)| !set.iter().any(|(n, _)| n == k))
+        .cloned()
+        .collect();
+    for (k, val) in set {
+        v.push((k.to_string(), val.clone()));
+    }
+    v.iter()
+        .map(|(k, val)| format!(" {k}=\"{val}\""))
+        .collect()
+}
+
+/// 把列宽/隐藏列写回 `<cols>`：保留原有的 col 属性（样式等），只改涉及到的列。
+/// 目标列如果落在多列的 `<col min..max>` 里，会拆成左/中/右三段。
+pub fn set_cols_xml(xml: &str, wanted: &[(u32, f32, bool)]) -> String {
+    if wanted.is_empty() {
+        return xml.to_string();
+    }
+    let mut tags: Vec<(u32, u32, Vec<(String, String)>)> = Vec::new();
+    let existing = xml.find("<cols").and_then(|s| {
+        xml[s..].find("</cols>").map(|e| (s, s + e))
+    });
+    if let Some((start, end)) = existing {
+        let body = &xml[start..end];
+        let mut rest = body;
+        while let Some(i) = rest.find("<col ") {
+            let tail = &rest[i..];
+            let Some(gt) = tail.find('>') else { break };
+            let tag = &tail[..gt];
+            let attrs = xml_attrs(tag);
+            let mut min = 0u32;
+            let mut max = 0u32;
+            for (k, v) in &attrs {
+                if k == "min" {
+                    min = v.parse().unwrap_or(0);
+                }
+                if k == "max" {
+                    max = v.parse().unwrap_or(0);
+                }
+            }
+            if min >= 1 && max >= min {
+                tags.push((min, max, attrs));
+            }
+            rest = &tail[gt + 1..];
+        }
+    }
+    for &(c, px, hidden) in wanted {
+        let idx = c + 1;
+        // Excel 的 ColumnWidth 与 Range.Width 差 5px 内边距：写文件用 px/8
+        let width = (px / 8.0 * 100.0).round() / 100.0;
+        let width = width.max(0.0);
+        if let Some(pos) = tags.iter().position(|(a, b, _)| *a <= idx && idx <= *b) {
+            let (a, b, attrs) = tags[pos].clone();
+            let mut pieces = Vec::new();
+            if a < idx {
+                pieces.push((a, idx - 1, attrs.clone()));
+            }
+            let mut set = vec![("width", format!("{width:.2}")), ("customWidth", "1".into())];
+            if hidden {
+                set.push(("hidden", "1".into()));
+            }
+            pieces.push((idx, idx, {
+                // min/max 由输出阶段统一加；隐藏状态和宽度重新算
+                let mut v: Vec<(String, String)> = attrs
+                    .iter()
+                    .filter(|(k, _)| k != "min" && k != "max" && k != "hidden")
+                    .cloned()
+                    .collect();
+                if !hidden {
+                    // 取消隐藏时不能留着原来的 hidden
+                }
+                let rendered = with_attrs(&v, &set);
+                v = xml_attrs(&rendered);
+                v
+            }));
+            if idx < b {
+                pieces.push((idx + 1, b, attrs));
+            }
+            tags.splice(pos..pos + 1, pieces);
+        } else {
+            let mut set = vec![("width", format!("{width:.2}")), ("customWidth", "1".into())];
+            if hidden {
+                set.push(("hidden", "1".into()));
+            }
+            tags.push((idx, idx, xml_attrs(&with_attrs(&[], &set))));
+        }
+    }
+    if tags.is_empty() {
+        return xml.to_string();
+    }
+    tags.sort_by_key(|t| t.0);
+    let mut block = String::from("<cols>");
+    for (min, max, attrs) in &tags {
+        block.push_str(&format!("<col min=\"{min}\" max=\"{max}\""));
+        let mut a: Vec<(String, String)> = attrs
+            .iter()
+            .filter(|(k, _)| k != "min" && k != "max")
+            .cloned()
+            .collect();
+        // 取消隐藏后不能保留旧的 hidden 属性
+        if !attrs.iter().any(|(k, v)| k == "hidden" && v == "1") {
+            a.retain(|(k, _)| k != "hidden");
+        }
+        block.push_str(&with_attrs(&a, &[]));
+        block.push_str("/>");
+    }
+    block.push_str("</cols>");
+    if let Some((start, end)) = existing {
+        let mut out = String::with_capacity(xml.len() + block.len());
+        out.push_str(&xml[..start]);
+        out.push_str(&block);
+        out.push_str(&xml[end + "</cols>".len()..]);
+        out
+    } else {
+        // 没有 <cols>：插在 sheetFormatPr 或 dimension 后面
+        let anchor = xml.find("<sheetFormatPr").and_then(|i| {
+            xml[i..].find('>').map(|g| i + g + 1)
+        });
+        let at = anchor.unwrap_or_else(|| xml.find("<sheetData").unwrap_or(xml.len()));
+        let mut out = String::with_capacity(xml.len() + block.len());
+        out.push_str(&xml[..at]);
+        out.push_str(&block);
+        out.push_str(&xml[at..]);
+        out
+    }
+}
+
+/// 行高/手动隐藏行写回 `<row>`；数据区里没有的行会补一个空 `<row>` 占位
+pub fn set_row_sizes(xml: &str, wanted: &[(u32, Option<f32>, bool)]) -> String {
+    if wanted.is_empty() {
+        return xml.to_string();
+    }
+    fn stub(r: u32, ht: Option<f32>, hidden: bool) -> String {
+        let mut tag = format!("<row r=\"{}\"", r + 1);
+        if let Some(h) = ht {
+            tag.push_str(&format!(
+                " ht=\"{:.2}\" customHeight=\"1\" x14ac:dyDescent=\"0.15\"",
+                h * 72.0 / 96.0
+            ));
+        }
+        if hidden {
+            tag.push_str(" hidden=\"1\"");
+        }
+        tag.push_str("/>");
+        tag
+    }
+    let mut pending: Vec<(u32, Option<f32>, bool)> = wanted.to_vec();
+    pending.sort_by_key(|x| x.0);
+    let mut out = String::with_capacity(xml.len() + wanted.len() * 48);
+    let mut rest = xml;
+    while let Some(i) = rest.find("<row ") {
+        let tail = &rest[i..];
+        let Some(gt) = tail.find('>') else {
+            out.push_str(tail);
+            break;
+        };
+        let tag = &tail[..gt];
+        let attrs = xml_attrs(tag);
+        let mut row_no = 0u32;
+        for (k, v) in &attrs {
+            if k == "r" {
+                row_no = v.parse().unwrap_or(0);
+            }
+        }
+        out.push_str(&rest[..i]);
+        // 这一行之前的缺行先补上（按行号顺序）
+        while let Some(front) = pending.first().cloned() {
+            if front.0 + 1 < row_no {
+                out.push_str(&stub(front.0, front.1, front.2));
+                pending.remove(0);
+            } else {
+                break;
+            }
+        }
+        let hit = pending.iter().position(|(r, _, _)| r + 1 == row_no);
+        if let Some(p) = hit {
+            let (_, ht, hidden) = pending.remove(p);
+            let mut set: Vec<(&str, String)> = Vec::new();
+            if let Some(h) = ht {
+                set.push(("ht", format!("{:.2}", h * 72.0 / 96.0)));
+                set.push(("customHeight", "1".into()));
+                set.push(("x14ac:dyDescent", "0.15".into()));
+            }
+            let base: Vec<(String, String)> = attrs
+                .iter()
+                .filter(|(k, _)| k != "hidden")
+                .cloned()
+                .collect();
+            if hidden {
+                set.push(("hidden", "1".to_string()));
+            }
+            let rendered = with_attrs(&base, &set);
+            out.push_str("<row");
+            out.push_str(&rendered);
+            if tag.trim_end().ends_with('/') {
+                out.push_str("/>");
+            } else {
+                out.push('>');
+            }
+        } else {
+            out.push_str(tag);
+            if !tag.trim_end().ends_with('/') {
+                out.push('>');
+            }
+        }
+        rest = &tail[gt + 1..];
+    }
+    // 剩下的缺行插在 </sheetData> 前
+    if let Some(i) = rest.find("</sheetData>") {
+        out.push_str(&rest[..i]);
+        for (r, ht, hidden) in &pending {
+            out.push_str(&stub(*r, *ht, *hidden));
+        }
+        out.push_str(&rest[i..]);
+    } else {
+        out.push_str(rest);
+        for (r, ht, hidden) in &pending {
+            out.push_str(&stub(*r, *ht, *hidden));
+        }
+    }
+    out
+}
+
+/// 保存收尾：把列宽/行高/隐藏状态补进 sheet XML
+pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, (Vec<(u32, f32, bool)>, Vec<(u32, Option<f32>, bool)>)> =
+        std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if !s.layout_dirty {
+            continue;
+        }
+        let Some(part) = targets.get(&s.name) else { continue };
+        let mut cols: Vec<(u32, f32, bool)> = s
+            .cols
+            .entries()
+            .map(|(c, w)| (*c, *w, s.hidden_cols.contains(c)))
+            .collect();
+        // 隐藏但没自定义宽度的列也要写进去
+        for c in s.hidden_cols.iter() {
+            if !cols.iter().any(|(x, _, _)| x == c) {
+                cols.push((*c, s.cols.size(*c), true));
+            }
+        }
+        let mut rows: Vec<(u32, Option<f32>, bool)> = s
+            .rows
+            .entries()
+            .map(|(r, h)| (*r, Some(*h), s.hidden_rows_user.contains(r)))
+            .collect();
+        for r in s.hidden_rows_user.iter() {
+            if !rows.iter().any(|(x, _, _)| x == r) {
+                rows.push((*r, None, true));
+            }
+        }
+        map.insert(part.clone(), (cols, rows));
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some((cols, rows)) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                let mut x = set_cols_xml(&xml, cols);
+                x = set_row_sizes(&x, rows);
+                return x.into_bytes();
+            }
+        }
+        buf
+    })
+}
+
+/// 写工作表标签颜色；None 表示删除颜色
+pub fn set_tab_color(xml: &str, rgb: Option<[u8; 3]>) -> String {
+    // 先删掉已有的 tabColor
+    let mut x = xml.to_string();
+    while let Some(i) = x.find("<tabColor") {
+        if let Some(gt) = x[i..].find('>') {
+            x.replace_range(i..i + gt + 1, "");
+        } else {
+            break;
+        }
+    }
+    let Some(c) = rgb else { return x };
+    let tag = format!(
+        "<tabColor rgb=\"FF{:02X}{:02X}{:02X}\"/>",
+        c[0], c[1], c[2]
+    );
+    if let Some(i) = x.find("<sheetPr") {
+        let Some(gt) = x[i..].find('>') else {
+            return x;
+        };
+        let end = i + gt;
+        if x[i..end].trim_end().ends_with('/') {
+            // <sheetPr .../> → <sheetPr ...><tabColor/></sheetPr>
+            let slash = match x[i..end].rfind('/') {
+                Some(v) => i + v,
+                None => return x,
+            };
+            x.replace_range(slash..slash + 1, "");
+            x.insert_str(slash + 1, &format!("{tag}</sheetPr>"));
+        } else {
+            x.insert_str(end + 1, &tag);
+        }
+        x
+    } else if let Some(ws) = x.find("<worksheet") {
+        // schema 要求 sheetPr 是 worksheet 的第一个子元素
+        let Some(gt) = x[ws..].find('>') else {
+            return x;
+        };
+        let at = ws + gt + 1;
+        x.insert_str(at, &format!("<sheetPr>{tag}</sheetPr>"));
+        x
+    } else {
+        x
+    }
+}
+
+/// 保存收尾：只给改过颜色的表写 <sheetPr><tabColor>
+pub fn apply_tab_colors(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, Option<[u8; 3]>> = std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if s.tab_color_dirty {
+            if let Some(part) = targets.get(&s.name) {
+                map.insert(part.clone(), s.tab_color);
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(c) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return set_tab_color(&xml, *c).into_bytes();
+            }
+        }
+        buf
+    })
+}
+
+/// 和 rewrite_zip 一样，但可以丢弃指定的部件（删除表格/图片等用）
+pub fn rewrite_zip_skip<F>(
+    path: &Path,
+    skip: &std::collections::HashSet<String>,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(&str, Vec<u8>) -> Vec<u8>,
+{
+    let file = std::fs::File::open(path).with_context(|| format!("打开 {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let tmp = path.with_extension("patchtmp");
+    {
+        let out = std::fs::File::create(&tmp)?;
+        let mut zw = zip::ZipWriter::new(out);
+        for i in 0..zip.len() {
+            let (name, mut buf) = {
+                let mut e = zip.by_index(i)?;
+                let name = e.name().to_string();
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf)?;
+                (name, buf)
+            };
+            if skip.contains(&name) {
+                continue;
+            }
+            buf = f(&name, buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(name, opts)?;
+            zw.write_all(&buf)?;
+        }
+        zw.finish()?;
+    }
+    drop(zip);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}

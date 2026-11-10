@@ -5,8 +5,10 @@
 
 use std::collections::BTreeMap;
 
-pub const DEFAULT_COL_W: f32 = 104.0;
-pub const DEFAULT_ROW_H: f32 = 22.0;
+/// Excel 96 DPI 的默认列宽（54 pt = 72 px）
+pub const DEFAULT_COL_W: f32 = 72.0;
+/// Excel 96 DPI 的默认行高（14.25 pt = 19 px）
+pub const DEFAULT_ROW_H: f32 = 19.0;
 
 #[derive(Clone, Debug)]
 pub struct Axis {
@@ -123,7 +125,14 @@ impl Axis {
 
 /// Excel 列宽单位（字符数）→ 像素。默认字体 11pt 时 1 字符 ≈ 7px，再加 5px 内边距。
 pub fn excel_width_to_px(w: f32) -> f32 {
-    (w * 7.0 + 5.0).round().max(8.0)
+    // 默认列宽 / StandardWidth：8.38 字符 = 72px（含 5px 内边距）
+    (w * 8.0 + 5.0).round().max(8.0)
+}
+
+/// `<col width="21.25">` → 170px。OOXML 里显式列宽不含 5px 内边距，
+/// 和 Excel 的 Range.Width 实测一致（8.38 是默认宽度，走上面的函数）。
+pub fn col_width_to_px(w: f32) -> f32 {
+    (w * 8.0).round().max(0.0)
 }
 
 /// 行高单位是磅（pt）→ 像素（96 DPI）
@@ -186,8 +195,9 @@ mod tests {
 
     #[test]
     fn excel_units() {
-        assert_eq!(excel_width_to_px(8.43), 64.0);
-        assert_eq!(excel_width_to_px(16.0), 117.0);
+        assert_eq!(excel_width_to_px(8.43), 72.0);
+        assert_eq!(col_width_to_px(21.25), 170.0);
+        assert_eq!(col_width_to_px(9.0), 72.0);
         assert_eq!(pt_to_px(15.0), 20.0);
         assert_eq!(pt_to_px(30.0), 40.0);
     }

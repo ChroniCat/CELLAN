@@ -18,6 +18,10 @@ pub struct SheetLayout {
     pub col_default: Option<f32>,
     /// 行号（0-based）→ 像素高
     pub row_heights: Vec<(u32, f32)>,
+    /// 隐藏的列（0-based）
+    pub hidden_cols: Vec<u32>,
+    /// 手动隐藏的行（0-based）
+    pub hidden_rows: Vec<u32>,
     /// 条件格式
     pub cf: Vec<crate::cf::CfBlock>,
     /// 差异格式表
@@ -28,6 +32,8 @@ pub struct SheetLayout {
     pub freeze: Option<(u32, u32)>,
     /// 自动筛选区域 + 每列允许值
     pub filter: Option<crate::sort_filter::Filter>,
+    /// 工作表标签颜色
+    pub tab_color: Option<[u8; 3]>,
 }
 
 /// 返回 表名 → 版式
@@ -131,6 +137,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || !lay.dv.is_empty()
             || lay.freeze.is_some()
             || lay.filter.is_some()
+            || lay.tab_color.is_some()
         {
             out.insert(name.clone(), lay);
         }
@@ -162,11 +169,29 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             }
                         }
                     }
+                } else if name.ends_with("tabColor") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("rgb") {
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            let hex = v.trim_start_matches('#');
+                            let hex = if hex.len() == 8 { &hex[2..] } else { hex };
+                            if hex.len() == 6 {
+                                if let (Ok(r), Ok(g), Ok(b)) = (
+                                    u8::from_str_radix(&hex[0..2], 16),
+                                    u8::from_str_radix(&hex[2..4], 16),
+                                    u8::from_str_radix(&hex[4..6], 16),
+                                ) {
+                                    out.tab_color = Some([r, g, b]);
+                                }
+                            }
+                        }
+                    }
                 } else if name.ends_with("col") {
                     let mut min = 0u32;
                     let mut max = 0u32;
                     let mut width = 0f32;
                     let mut custom = false;
+                    let mut hidden = false;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
                         let val = crate::model::xml_unescape(&a.value.to_string());
@@ -175,12 +200,18 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             k if k.ends_with("max") => max = val.parse().unwrap_or(0),
                             k if k.ends_with("width") => width = val.parse().unwrap_or(0.0),
                             k if k.ends_with("customWidth") => custom = val == "1" || val == "true",
+                            "hidden" => hidden = val == "1" || val == "true",
                             _ => {}
+                        }
+                    }
+                    if hidden && min >= 1 && max >= min && (max - min) < 1024 {
+                        for c in (min - 1)..max {
+                            out.hidden_cols.push(c);
                         }
                     }
                     let is_default = (width - 8.43).abs() < 0.05;
                     if min >= 1 && max >= min && width > 0.0 && (custom || !is_default) {
-                        let px = crate::layout::excel_width_to_px(width);
+                        let px = crate::layout::col_width_to_px(width);
                         let span = max - min + 1;
                         if span > 1024 {
                             // 整表级别的列宽：当成默认宽度，不能按列展开
@@ -195,6 +226,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let mut idx = 0u32;
                     let mut ht = 0f32;
                     let mut custom = false;
+                    let mut hidden = false;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
                         let val = crate::model::xml_unescape(&a.value.to_string());
@@ -202,8 +234,12 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             "r" => idx = val.parse().unwrap_or(0),
                             "ht" => ht = val.parse().unwrap_or(0.0),
                             "customHeight" => custom = val == "1" || val == "true",
+                            "hidden" => hidden = val == "1" || val == "true",
                             _ => {}
                         }
+                    }
+                    if hidden && idx >= 1 {
+                        out.hidden_rows.push(idx - 1);
                     }
                     if idx >= 1 && ht > 0.0 && custom {
                         let px = crate::layout::pt_to_px(ht);
@@ -339,13 +375,20 @@ mod tests {
         assert_eq!(parse_range("bad"), None);
     }
 
-    #[test]
+        #[test]
+    fn parses_tab_color() {
+        let xml = r#"<worksheet><sheetPr><tabColor rgb="0070AD47" /><outlinePr/><pageSetUpPr /></sheetPr><cols/><sheetData/></worksheet>"#;
+        let lay = parse_layout(xml);
+        assert_eq!(lay.tab_color, Some([0x70, 0xAD, 0x47]));
+    }
+
+#[test]
     fn parses_cols_and_rows() {
         let xml = r#"<worksheet><cols><col min="1" max="3" width="16.0" customWidth="1"/><col min="5" max="5" width="8.43"/></cols><sheetData><row r="2" ht="30" customHeight="1"><c r="A2" s="1"/></row></sheetData></worksheet>"#;
         let lay = parse_layout(xml);
         assert_eq!(lay.col_widths.len(), 3, "第 1-3 列应为自定义宽度");
         assert_eq!(lay.col_widths[0].0, 0);
-        assert!((lay.col_widths[0].1 - 117.0).abs() < 1.0);
+        assert!((lay.col_widths[0].1 - 128.0).abs() < 1.0);
         assert_eq!(lay.row_heights, vec![(1, 40.0)]);
         assert!(lay.merges.is_empty());
     }

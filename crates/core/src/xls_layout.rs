@@ -97,7 +97,7 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
                     let last = u16le(body, 2).unwrap() as u32;
                     let chars = u16le(body, 4).unwrap() as f32 / 256.0;
                     if last >= first && chars > 0.0 {
-                        let px = crate::layout::excel_width_to_px(chars);
+                        let px = crate::layout::col_width_to_px(chars);
                         if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
                             out.sheets[si].cols.push((first, last, px));
                         }
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(out.sheets[0].cols.len(), 1);
         assert_eq!(out.sheets[0].cols[0].0, 0);
         assert_eq!(out.sheets[0].cols[0].1, 2);
-        assert!((out.sheets[0].cols[0].2 - 117.0).abs() < 2.0);
+        assert!((out.sheets[0].cols[0].2 - 128.0).abs() < 2.0);
         assert_eq!(out.sheets[0].rows.len(), 1);
         assert!((out.sheets[0].rows[0].1 - 40.0).abs() < 1.5);
         assert!(out.sheets[1].cols.is_empty());

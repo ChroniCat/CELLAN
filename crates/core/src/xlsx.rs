@@ -381,6 +381,13 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 for (r, h) in lay.row_heights.iter() {
                     sheet.rows.set(*r, *h);
                 }
+                for c in lay.hidden_cols.iter() {
+                    sheet.hidden_cols.insert(*c);
+                }
+                for r in lay.hidden_rows.iter() {
+                    sheet.hidden_rows_user.insert(*r);
+                }
+                sheet.tab_color = lay.tab_color;
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.dv = lay.dv.clone();
@@ -805,6 +812,16 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         }
     }
 
+    // 自定义文档属性：umya 解析时会把不认识的 vt:r8 之类的值写成空 <property/>，
+    // Excel 会判「内容有问题」并要求修复。没有数据源改动时原样搬回基准的 custom.xml。
+    if wb.sources.is_empty() {
+        if let Some(xml) = crate::fixups::read_part(&restore_base, "docProps/custom.xml") {
+            if let Err(e) = crate::patch::append_entry(path, "docProps/custom.xml", &xml) {
+                eprintln!("[save] 自定义属性沿用基准失败: {e:#}");
+            }
+        }
+    }
+
     // 宏部件：umya 写不出来，塞回去
     if let Some(v) = vba {
         if let Err(e) = crate::vba::restore_vba(path, &v) {
@@ -1061,6 +1078,21 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         crate::pivot_xml::attach_for_session(path, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
             .context("透视表部件写入失败")?;
     }
+    // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
+    if let Err(e) = crate::patch::apply_layout(path, wb) {
+        eprintln!("[save] 列宽/行高写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_tab_colors(path, wb) {
+        eprintln!("[save] 标签颜色写回失败: {e:#}");
+    }
+    // 表格对象：删除/转换/新建后同步 table 部件
+    for sheet in &wb.sheets {
+        if sheet.tables_dirty {
+            if let Err(e) = crate::table::sync(path, &sheet.name, &sheet.tables) {
+                eprintln!("[save] 表格部件同步失败: {e:#}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1210,6 +1242,70 @@ fn apply_cf_patch(
 mod tests {
     use super::*;
     use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn tab_color_survives_save() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("tabcolor_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+        save(&path, &wb).expect("first save");
+        let mut wb = load(&path).expect("load");
+        {
+            let s = &mut wb.sheets[0];
+            s.tab_color = Some([0x70, 0xAD, 0x47]);
+            s.tab_color_dirty = true;
+        }
+        save(&path, &wb).expect("second save");
+        let back = load(&path).expect("reload");
+        assert_eq!(back.sheets[0].tab_color, Some([0x70, 0xAD, 0x47]));
+        // 再改回无颜色
+        let mut wb = back;
+        {
+            let s = &mut wb.sheets[0];
+            s.tab_color = None;
+            s.tab_color_dirty = true;
+        }
+        save(&path, &wb).expect("third save");
+        let back = load(&path).expect("reload2");
+        assert_eq!(back.sheets[0].tab_color, None);
+    }
+
+    #[test]
+    fn column_widths_heights_and_hidden_state_survive_save() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("layout_rt_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("a".into()), formula: None });
+        wb.sheets[0].set(4, 0, Cell { value: Value::Text("e5".into()), formula: None });
+        save(&path, &wb).expect("first save");
+
+        let mut wb = load(&path).expect("load");
+        {
+            let s = &mut wb.sheets[0];
+            s.cols.set(0, 170.0);
+            s.cols.set(2, 40.0);
+            s.rows.set(4, 44.0);
+            s.hidden_cols.insert(1);
+            s.hidden_rows_user.insert(2);
+            s.layout_dirty = true;
+        }
+        save(&path, &wb).expect("second save");
+
+        let back = load(&path).expect("reload");
+        let s = &back.sheets[0];
+        assert!((s.cols.size(0) - 170.0).abs() < 1.0, "A 列宽 {}", s.cols.size(0));
+        assert!((s.cols.size(2) - 40.0).abs() < 1.0, "C 列宽 {}", s.cols.size(2));
+        assert!((s.rows.size(4) - 44.0).abs() < 1.0, "第 5 行高 {}", s.rows.size(4));
+        assert!(s.hidden_cols.contains(&1), "B 列应隐藏: {:?}", s.hidden_cols);
+        assert!(s.hidden_rows_user.contains(&2), "第 3 行应隐藏: {:?}", s.hidden_rows_user);
+        assert_eq!(s.value(4, 0), Value::Text("e5".into()));
+    }
     use std::collections::HashMap;
 
     #[test]

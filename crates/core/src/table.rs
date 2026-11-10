@@ -437,3 +437,199 @@ mod tests {
         assert_eq!(parse_a1("A1:C4"), Some((0, 0, 3, 2)));
     }
 }
+
+fn attr_of(tag: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let i = tag.find(&pat)? + pat.len();
+    let rest = &tag[i..];
+    let j = rest.find('"')?;
+    Some(rest[..j].to_string())
+}
+
+/// 把 sheet 的表格部件同步成 `tables`：删除旧的 tableN.xml / rels / tableParts，
+/// 再按当前模型重新生成（`tables` 为空就是“转换为区域”）。
+pub fn sync(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result<()> {
+    let targets = crate::patch::sheet_targets(path)?;
+    let Some(part) = targets.get(sheet_name).cloned() else {
+        return Ok(());
+    };
+    let rels_path = part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+
+    let mut rels_xml = String::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            if let Ok(mut f) = zip.by_name(&rels_path) {
+                let _ = f.read_to_string(&mut rels_xml);
+            }
+        }
+    }
+    let mut old_parts: Vec<String> = Vec::new();
+    for chunk in rels_xml.split("<Relationship").skip(1) {
+        let end = chunk.find("/>").map(|i| i + 2).unwrap_or(chunk.len());
+        let tag = &chunk[..end];
+        if tag.contains("relationships/table") {
+            if let Some(t) = attr_of(tag, "Target") {
+                let p = if let Some(rest) = t.strip_prefix("../") {
+                    // 相对 xl/worksheets/ 的上级是 xl/
+                    let dir = part.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                    let parent = dir.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                    format!("{parent}/{rest}")
+                } else if let Some(rest) = t.strip_prefix('/') {
+                    rest.to_string()
+                } else {
+                    t
+                };
+                old_parts.push(p);
+            }
+        }
+    }
+    if old_parts.is_empty() && tables.is_empty() {
+        return Ok(());
+    }
+    let skip: std::collections::HashSet<String> = old_parts.iter().cloned().collect();
+    let originals = old_parts.clone();
+    crate::patch::rewrite_zip_skip(path, &skip, |name, buf| {
+        if name == rels_path {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                let mut out = String::with_capacity(xml.len());
+                let mut rest = xml.as_str();
+                while let Some(i) = rest.find("<Relationship") {
+                    out.push_str(&rest[..i]);
+                    let tail = &rest[i..];
+                    // 结束位置取第一个 '>'：根元素 <Relationships ...> 和自闭合 <Relationship .../> 都适用
+                    let end = tail.find('>').map(|v| v + 1).unwrap_or(tail.len());
+                    let tag = &tail[..end];
+                    // 注意 <Relationships> 根元素也以 "<Relationship" 开头，不能删
+                    if tag.starts_with("<Relationships") || !tag.contains("relationships/table") {
+                        out.push_str(tag);
+                    }
+                    rest = &tail[end..];
+                }
+                out.push_str(rest);
+                return out.into_bytes();
+            }
+        }
+        if name == "[Content_Types].xml" {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                let mut out = String::with_capacity(xml.len());
+                let mut rest = xml.as_str();
+                while let Some(i) = rest.find("<Override") {
+                    out.push_str(&rest[..i]);
+                    let tail = &rest[i..];
+                    let end = tail.find("/>").map(|v| v + 2).unwrap_or(tail.len());
+                    let tag = &tail[..end];
+                    let drop = originals.iter().any(|p| tag.contains(&format!("\"/{p}\"")));
+                    if !drop {
+                        out.push_str(tag);
+                    }
+                    rest = &tail[end..];
+                }
+                out.push_str(rest);
+                return out.into_bytes();
+            }
+        }
+        if name == part {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                if let Some(i) = xml.find("<tableParts") {
+                    let tail = &xml[i..];
+                    let first_gt = tail.find('>').unwrap_or(tail.len() - 1);
+                    let self_closing = tail[..first_gt].trim_end().ends_with('/');
+                    let end = if self_closing {
+                        first_gt + 1
+                    } else {
+                        tail.find("</tableParts>")
+                            .map(|c| c + "</tableParts>".len())
+                            .unwrap_or(first_gt + 1)
+                    };
+                    let mut out = String::with_capacity(xml.len());
+                    out.push_str(&xml[..i]);
+                    out.push_str(&xml[i + end..]);
+                    return out.into_bytes();
+                }
+            }
+        }
+        buf
+    })?;
+    if !tables.is_empty() {
+        attach(path, sheet_name, tables)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use crate::model::{Cell, Value};
+
+    fn zip_has(path: &Path, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(mut zip) = zip::ZipArchive::new(file) {
+                for i in 0..zip.len() {
+                    if let Ok(e) = zip.by_index(i) {
+                        if e.name().starts_with(prefix) {
+                            out.push(e.name().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn zip_text(path: &Path, name: &str) -> String {
+        let mut s = String::new();
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(mut zip) = zip::ZipArchive::new(file) {
+                if let Ok(mut f) = zip.by_name(name) {
+                    use std::io::Read;
+                    let _ = f.read_to_string(&mut s);
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn sync_removes_and_reattaches_table_parts() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("table_sync_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = crate::model::Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("产品".into()), formula: None });
+        wb.sheets[0].set(0, 1, Cell { value: Value::Text("数量".into()), formula: None });
+        wb.sheets[0].set(1, 0, Cell { value: Value::Text("笔".into()), formula: None });
+        wb.sheets[0].set(1, 1, Cell { value: Value::Number(3.0), formula: None });
+        crate::xlsx::save(&path, &wb).unwrap();
+
+        let t = Table {
+            name: "表1".into(),
+            display: "表1".into(),
+            range: (0, 0, 1, 1),
+            columns: vec!["产品".into(), "数量".into()],
+            header_row: true,
+            totals_row: false,
+        };
+        attach(&path, &wb.sheets[0].name, std::slice::from_ref(&t)).unwrap();
+        assert!(!zip_has(&path, "xl/tables/table").is_empty(), "attach 后应有 table 部件");
+        let sheet = &wb.sheets[0].name;
+        let targets = crate::patch::sheet_targets(&path).unwrap();
+        let part = targets.get(sheet).unwrap().clone();
+        assert!(zip_text(&path, &part).contains("<tableParts"), "应有 tableParts");
+
+        sync(&path, sheet, &[]).unwrap();
+        assert!(zip_has(&path, "xl/tables/table").is_empty(), "转换后 table 部件应删除");
+        assert!(!zip_text(&path, &part).contains("<tableParts"), "转换后不应有 tableParts");
+        let rels = part.replace("worksheets/", "worksheets/_rels/") + ".rels";
+        assert!(!zip_text(&path, &rels).contains("relationships/table"), "rels 里不应再有 table");
+        assert!(!zip_text(&path, "[Content_Types].xml").contains("/xl/tables/"), "CT 里不应再有 table");
+
+        // 再挂回去也要能用
+        attach(&path, sheet, std::slice::from_ref(&t)).unwrap();
+        assert!(!zip_has(&path, "xl/tables/table").is_empty());
+        let back = crate::xlsx::load(&path).unwrap();
+        assert_eq!(back.sheets[0].tables.len(), 1, "重新 attach 后能读回表格");
+        assert_eq!(back.sheets[0].value(1, 1), Value::Number(3.0), "内容不能丢");
+    }
+}
