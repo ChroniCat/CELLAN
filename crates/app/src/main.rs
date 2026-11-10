@@ -411,6 +411,8 @@ struct SheetApp {
     /// 修订记录（新的在后）
     rev: Vec<sheetcore::revision::Entry>,
     rev_open: bool,
+    /// 修订记录窗口里的操作结果（撤回成功/失败原因），显示在窗口内
+    rev_msg: String,
     /// 文件列表（左侧）
     tree_open: bool,
     /// 自截图：SC_SHOT=<png>，抓自己的 framebuffer（RDP 断着也能出图）
@@ -674,6 +676,7 @@ impl SheetApp {
             xlink_dlg: false,
             rev: Vec::new(),
             rev_open: false,
+            rev_msg: String::new(),
             tree_open: false,
             shot_path: std::env::var("SC_SHOT").ok().map(PathBuf::from),
             shot_frames: 0,
@@ -7432,6 +7435,7 @@ impl SheetApp {
             ui.set_min_width(180.0);
             if ui.button("修订记录…").on_hover_text("谁在什么时候改了哪格，可撤回").clicked() {
                 self.rev_open = true;
+                self.rev_msg.clear();
                 ui.close_menu();
             }
             ui.separator();
@@ -8758,6 +8762,18 @@ impl SheetApp {
                     });
                 });
                 ui.add_space(4.0);
+                if !self.rev_msg.is_empty() {
+                    let ok = self.rev_msg.starts_with("已撤回");
+                    ui.label(
+                        egui::RichText::new(&self.rev_msg)
+                            .size(11.5)
+                            .color(if ok {
+                                Color32::from_rgb(16, 124, 65)
+                            } else {
+                                Color32::from_rgb(196, 43, 28)
+                            }),
+                    );
+                }
                 // 表头
                 ui.horizontal(|ui| {
                     dlg_col(ui, 62.0, |ui| {
@@ -8849,23 +8865,45 @@ impl SheetApp {
     /// 撤回一条本地修订：先确认这些格子还是它改成的样子，再按 before 写回
     fn revert_revision(&mut self, idx: usize) {
         let Some(e) = self.rev.get(idx).cloned() else {
+            self.rev_msg = "这条记录已经不在列表里了，点「重新读取」再看".into();
             return;
         };
         let Some(si) = self.wb.sheets.iter().position(|s| s.name == e.sheet) else {
             self.status = "那张工作表已经不在了".into();
+            self.rev_msg = self.status.clone();
             return;
         };
         if e.cells.is_empty() {
             self.status = "这条没有可撤回的格子".into();
+            self.rev_msg = self.status.clone();
             return;
         }
+        // 值和格式都要对得上：只看值会让“只改格式”的记录在文件重开后静默空转
         let conflict = e
             .cells
             .iter()
-            .filter(|ch| !ch.after.same(self.wb.sheet(si).get(ch.r, ch.c)))
+            .filter(|ch| {
+                let sheet = self.wb.sheet(si);
+                if !ch.after.same(sheet.get(ch.r, ch.c)) {
+                    return true;
+                }
+                if let Some(after_style) = &ch.after_style {
+                    let sid = sheet.style_of(ch.r, ch.c);
+                    if !style_visual_eq(self.wb.styles.get(sid), after_style) {
+                        if std::env::var("SC_REV_DEBUG").is_ok() {
+                            eprintln!("[rev] style mismatch current={:?} after={:?}", self.wb.styles.get(sid), after_style);
+                        }
+                        return true;
+                    }
+                }
+                false
+            })
             .count();
         if conflict > 0 {
             self.status = format!("有 {conflict} 格之后又被改过，不能整条撤回");
+            self.rev_msg = format!(
+                "这条不能撤回：有 {conflict} 格在它之后又被改过。先撤回更新的记录，或手动改回。"
+            );
             return;
         }
         self.sheet_idx = si;
@@ -8887,6 +8925,10 @@ impl SheetApp {
         }
         sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
         self.status = format!("已撤回 {} 的「{}」", e.who, e.label);
+        self.rev_msg = format!("已撤回 {} 的「{}」（记录已刷新）", e.who, e.label);
+        if let Some(p) = self.wb.path.clone() {
+            self.rev = sheetcore::revision::load(&p, 300);
+        }
     }
 
     /// 外部链接：看看有哪些、缓存多少格、需不需要更新
@@ -14466,6 +14508,20 @@ fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
 }
 
 /// 绝对路径，并且去掉 Windows 的 `\?\` 前缀（`canonicalize` 会加，加了就和盘符根对不上）
+/// 两套样式在屏幕上是否等价（空字体名表示“用默认字体”，读盘后可能是空）
+fn style_visual_eq(a: &sheetcore::style::CellStyle, b: &sheetcore::style::CellStyle) -> bool {
+    (a.font == b.font || a.font.is_empty() || b.font.is_empty())
+        && a.size == b.size
+        && a.bold == b.bold
+        && a.italic == b.italic
+        && a.color == b.color
+        && a.fill == b.fill
+        && a.halign == b.halign
+        && a.wrap == b.wrap
+        && a.format == b.format
+        && a.border == b.border
+}
+
 /// 大文件打开时只保留公式文本的轻量工作簿：依赖图只需要它，省掉整份 clone
 fn formula_skeleton(wb: &Workbook) -> Workbook {
     let mut sk = Workbook::new_blank();
