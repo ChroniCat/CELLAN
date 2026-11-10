@@ -164,6 +164,10 @@ pub struct Sheet {
     pub tab_color_dirty: bool,
     /// 表格对象被改过（新建/删除/转换）：保存时要同步 table 部件
     pub tables_dirty: bool,
+    /// 工作表保护（None = 未保护）
+    pub protection: Option<crate::protection::SheetProtection>,
+    /// 保护状态被改过
+    pub protect_dirty: bool,
 }
 
 impl Sheet {
@@ -208,6 +212,8 @@ impl Sheet {
             tab_color: None,
             tab_color_dirty: false,
             tables_dirty: false,
+            protection: None,
+            protect_dirty: false,
         }
     }
 

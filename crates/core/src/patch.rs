@@ -2164,3 +2164,55 @@ where
     }
     Ok(())
 }
+
+/// 写/删工作表保护标签（schema 位置：紧跟 </sheetData> 之后）
+pub fn set_sheet_protection(
+    xml: &str,
+    prot: Option<&crate::protection::SheetProtection>,
+) -> String {
+    let mut x = xml.to_string();
+    while let Some(i) = x.find("<sheetProtection") {
+        if let Some(gt) = x[i..].find('>') {
+            x.replace_range(i..i + gt + 1, "");
+        } else {
+            break;
+        }
+    }
+    let Some(p) = prot else { return x };
+    let tag = p.to_xml();
+    if let Some(i) = x.find("</sheetData>") {
+        let at = i + "</sheetData>".len();
+        x.insert_str(at, &tag);
+    } else if let Some(i) = x.find("<sheetData/>") {
+        let at = i + "<sheetData/>".len();
+        x.insert_str(at, &tag);
+    }
+    x
+}
+
+/// 保存收尾：只给改过保护状态的表写 <sheetProtection>
+pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<
+        String,
+        Option<crate::protection::SheetProtection>,
+    > = std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if s.protect_dirty {
+            if let Some(part) = targets.get(&s.name) {
+                map.insert(part.clone(), s.protection.clone());
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(p) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return set_sheet_protection(&xml, p.as_ref()).into_bytes();
+            }
+        }
+        buf
+    })
+}

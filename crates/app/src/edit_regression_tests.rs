@@ -562,3 +562,28 @@ fn dragging_a_chart_moves_its_anchor_and_marks_dirty() {
     assert_ne!(after, (1, 2, 8, 6), "拖动后锚点应变化");
     assert!(app.wb.sheet(0).charts_dirty, "拖动后应标脏以便保存");
 }
+
+#[test]
+fn protected_sheet_blocks_clearing_and_formatting() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Number(1.0),
+            formula: None,
+        },
+    );
+    app.wb.sheet_mut(0).protection = Some(
+        sheetcore::protection::SheetProtection::new_with_password("pw"),
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clear_selection();
+    assert!(app.wb.sheet(0).get(0, 0).is_some(), "受保护时不能清空");
+    app.apply_style(|s| s.bold = true);
+    let sid = app.wb.sheet(0).style_of(0, 0);
+    assert!(!app.wb.styles.get(sid).bold, "受保护时不能改格式");
+    assert!(app.edit_blocked(), "保护状态应可查询");
+}

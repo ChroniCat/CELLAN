@@ -155,7 +155,48 @@ fn load_chunk(
     out
 }
 
+/// Office 加密文件是 CFB 容器，里面有一个叫 EncryptedPackage 的流。
+/// 这里只做识别：按 1MB 块扫 UTF-16LE 流名，命中就认为需要密码。
+fn is_password_encrypted(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8];
+    if f.read_exact(&mut head).is_err()
+        || head != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+    {
+        return false;
+    }
+    let needle: Vec<u8> = "EncryptedPackage"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut prev: Vec<u8> = Vec::new();
+    loop {
+        let Ok(n) = f.read(&mut buf) else { return false };
+        if n == 0 {
+            return false;
+        }
+        let mut window = Vec::with_capacity(prev.len() + n);
+        window.extend_from_slice(&prev);
+        window.extend_from_slice(&buf[..n]);
+        if window.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return true;
+        }
+        let keep = needle.len().saturating_sub(1).min(window.len());
+        prev = window[window.len() - keep..].to_vec();
+    }
+}
+
 pub fn load(path: &Path) -> Result<Workbook> {
+    if is_password_encrypted(path) {
+        anyhow::bail!(
+            "这个工作簿设置了打开密码（Office 加密），当前版本还不支持解密；\
+             请先在 Excel 里取消密码后另存一份"
+        );
+    }
     // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
     //（我们自己写出的容器就属于后一种）。
     let mut reader = match open_workbook_auto(path) {
@@ -388,6 +429,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     sheet.hidden_rows_user.insert(*r);
                 }
                 sheet.tab_color = lay.tab_color;
+                sheet.protection = lay.protection.clone();
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.dv = lay.dv.clone();
@@ -1097,6 +1139,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     if let Err(e) = crate::patch::apply_tab_colors(path, wb) {
         eprintln!("[save] 标签颜色写回失败: {e:#}");
     }
+    if let Err(e) = crate::patch::apply_protection(path, wb) {
+        eprintln!("[save] 工作表保护写回失败: {e:#}");
+    }
     // 表格对象：删除/转换/新建后同步 table 部件
     for sheet in &wb.sheets {
         if sheet.tables_dirty {
@@ -1254,6 +1299,34 @@ fn apply_cf_patch(
 mod tests {
     use super::*;
     use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn sheet_protection_survives_save_and_verifies() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("prot_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+        save(&path, &wb).expect("first save");
+
+        let mut wb = load(&path).expect("load");
+        wb.sheets[0].protection =
+            Some(crate::protection::SheetProtection::new_with_password("pw"));
+        wb.sheets[0].protect_dirty = true;
+        save(&path, &wb).expect("protect save");
+
+        let back = load(&path).expect("reload");
+        let p = back.sheets[0].protection.clone().expect("应带保护");
+        assert!(p.verify("pw"));
+        assert!(!p.verify("bad"));
+
+        let mut wb = back;
+        wb.sheets[0].protection = None;
+        wb.sheets[0].protect_dirty = true;
+        save(&path, &wb).expect("unprotect save");
+        assert!(load(&path).expect("reload2").sheets[0].protection.is_none());
+    }
 
     #[test]
     fn tab_color_survives_save() {

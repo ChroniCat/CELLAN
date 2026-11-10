@@ -57,6 +57,7 @@ pub enum Icon {
     FontGrow,
     FontShrink,
     Freeze,
+    Lock,
 }
 
 struct Pen<'a> {
@@ -473,6 +474,13 @@ fn draw_with_pen(pen: Pen<'_>, icon: Icon) {
                 pen.line((3.0, 3.0 + i as f32 * 6.0), (21.0, 3.0 + i as f32 * 6.0));
                 pen.line((3.0 + i as f32 * 6.0, 3.0), (3.0 + i as f32 * 6.0, 21.0));
             }
+        }
+        Lock => {
+            pen.rect(6.0, 11.0, 18.0, 20.0);
+            pen.line((8.0, 11.0), (8.0, 8.0));
+            pen.line((8.0, 8.0), (12.0, 5.0));
+            pen.line((12.0, 5.0), (16.0, 8.0));
+            pen.line((16.0, 8.0), (16.0, 11.0));
         }
         Freeze => {
             pen.rect(3.0, 3.0, 21.0, 21.0);

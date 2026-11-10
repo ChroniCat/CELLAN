@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sha2 = "0.11.1"
+base64 = "0.22"
 anyhow = "1.0.104"
 calamine = "0.38.0"
 quick-xml = "0.42"

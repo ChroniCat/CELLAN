@@ -156,6 +156,15 @@ fn chart_handle_at(r: egui::Rect, p: egui::Pos2) -> Option<u8> {
     None
 }
 
+/// 工作表保护对话框
+#[derive(Clone, Default)]
+struct ProtectDlg {
+    unprotect: bool,
+    pw: String,
+    confirm: String,
+    err: String,
+}
+
 /// 图表拖动/缩放的状态
 #[derive(Clone, Copy)]
 struct ChartDrag {
@@ -321,6 +330,8 @@ struct SheetApp {
     chart_sel: Option<usize>,
     /// 正在拖动/缩放的图表
     chart_drag: Option<ChartDrag>,
+    /// 工作表保护对话框
+    protect_dlg: Option<ProtectDlg>,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -557,6 +568,7 @@ impl SheetApp {
             head_menu: None,
             chart_sel: None,
             chart_drag: None,
+            protect_dlg: None,
             view_mode: std::env::var("SC_VIEW_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1414,7 +1426,20 @@ impl SheetApp {
     }
 
     /// 开始编辑：没联网直接开；联网先申请租约，批准后才开
+    /// 工作表受保护时阻止一切改内容的操作
+    fn edit_blocked(&mut self) -> bool {
+        if self.wb.sheet(self.sheet_idx).protection.is_some() {
+            self.status = "工作表受保护：请先“审阅 → 撤销保护”".into();
+            true
+        } else {
+            false
+        }
+    }
+
     fn begin_edit(&mut self, initial: Option<String>) {
+        if self.edit_blocked() {
+            return;
+        }
         let (r, c) = self.sel;
         if let Some(holder) = self.lock_holder(r, c) {
             self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
@@ -1618,6 +1643,9 @@ impl SheetApp {
 
     /// values_only=true 时只贴值（不贴公式和格式）
     fn clip_paste(&mut self, values_only: bool, text: Option<String>) {
+        if self.edit_blocked() {
+            return;
+        }
         let (r, c) = self.sel;
         let si = self.sheet_idx;
         let mut tsv_paste = false;
@@ -3870,6 +3898,9 @@ impl SheetApp {
 
     /// 清除内容（保留格式，和 Excel「清除内容」一致）
     fn clear_selection(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
         let (r1, c1, r2, c2) = self.sel_rect();
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         let txn = self.txn_begin(&keys);
@@ -3981,6 +4012,9 @@ impl SheetApp {
 
     /// 同上，但闭包能拿到格子坐标（画边框要用）
     fn apply_style_xy<F: Fn(&mut sheetcore::style::CellStyle, u32, u32)>(&mut self, f: F) {
+        if self.edit_blocked() {
+            return;
+        }
         let (r1, c1, r2, c2) = self.sel_rect();
         if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
             self.status = "选区太大（超过 20 万格），不给整块刷格式".into();
@@ -4030,6 +4064,9 @@ impl SheetApp {
     }
 
     fn toggle_merge(&mut self, on: bool) {
+        if self.edit_blocked() {
+            return;
+        }
         let (r1, c1, r2, c2) = self.sel_rect();
         {
             let sheet = self.wb.sheet_mut(self.sheet_idx);
@@ -4051,6 +4088,87 @@ impl SheetApp {
 
     /// Excel 的「文件」后台视图：左侧一列导航，右侧整块内容。
     /// 打开时盖住功能区和表格，标题栏保留。
+    /// 工作表保护：设置/撤销密码
+    fn protect_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.protect_dlg.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let title = if d.unprotect { "撤销工作表保护" } else { "保护工作表" };
+        ui_kit::window(ctx, title, 320.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.label(if d.unprotect {
+                "输入保护密码（没有密码直接确定）"
+            } else {
+                "设置密码后，锁定单元格将不能编辑；留空表示只防误改、不设密码"
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("密码");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.pw)
+                        .password(true)
+                        .desired_width(180.0),
+                );
+            });
+            if !d.unprotect {
+                ui.horizontal(|ui| {
+                    ui.label("确认");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.confirm)
+                            .password(true)
+                            .desired_width(180.0),
+                    );
+                });
+            }
+            if !d.err.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), &d.err);
+            }
+            ui_kit::footer(ui, |ui| {
+                if ui_kit::primary_button(ui, "确定").clicked() {
+                    apply = true;
+                }
+                if ui.button("取消").clicked() {
+                    open = false;
+                }
+            });
+        });
+        if apply {
+            if !d.unprotect && d.pw != d.confirm {
+                d.err = "两次输入的密码不一致".into();
+                self.protect_dlg = Some(d);
+                return;
+            }
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            if d.unprotect {
+                let ok = sh
+                    .protection
+                    .as_ref()
+                    .map(|p| p.verify(&d.pw))
+                    .unwrap_or(false);
+                if !ok {
+                    d.err = "密码不正确".into();
+                    self.protect_dlg = Some(d);
+                    return;
+                }
+                sh.protection = None;
+                sh.protect_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已撤销工作表保护".into();
+            } else {
+                sh.protection = Some(sheetcore::protection::SheetProtection::new_with_password(
+                    &d.pw,
+                ));
+                sh.protect_dirty = true;
+                self.wb.dirty = true;
+                self.status = "工作表已保护".into();
+            }
+            open = false;
+        }
+        if open {
+            self.protect_dlg = Some(d);
+        }
+    }
+
     /// 列宽/行高对话框（表头右键 → 列宽…/行高…）
     fn size_dialog(&mut self, ctx: &egui::Context) {
         let Some((is_col, mut value)) = self.size_dlg else { return };
@@ -4905,6 +5023,19 @@ impl SheetApp {
                     .map(|n| n.text.clone())
                     .unwrap_or_default();
                 self.note_edit = Some((r, c, cur));
+            }
+        });
+        ui_kit::group(ui, "保护", |ui| {
+            let protected = self.wb.sheet(self.sheet_idx).protection.is_some();
+            if protected {
+                if ui_kit::big(ui, Icon::Lock, "撤销保护").clicked() {
+                    self.protect_dlg = Some(ProtectDlg {
+                        unprotect: true,
+                        ..Default::default()
+                    });
+                }
+            } else if ui_kit::big(ui, Icon::Lock, "保护工作表").clicked() {
+                self.protect_dlg = Some(ProtectDlg::default());
             }
         });
         ui_kit::group(ui, "修订", |ui| {
@@ -6814,6 +6945,9 @@ impl SheetApp {
 
     /// 插入/删除行列：结构 + 撤销 + 协作广播
     fn structural(&mut self, op: sheetcore::structural::Structural) {
+        if self.edit_blocked() {
+            return;
+        }
         self.commit_edit(None);
         if self.editing.is_some() {
             return;
@@ -11274,6 +11408,7 @@ impl eframe::App for SheetApp {
         }
         self.rename_dialog(ctx);
         self.format_dialog(ctx);
+        self.protect_dialog(ctx);
         self.size_dialog(ctx);
         self.color_popup_window(ctx);
         // 缩放：Ctrl+滚轮

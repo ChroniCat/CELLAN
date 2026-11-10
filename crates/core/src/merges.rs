@@ -34,6 +34,8 @@ pub struct SheetLayout {
     pub filter: Option<crate::sort_filter::Filter>,
     /// 工作表标签颜色
     pub tab_color: Option<[u8; 3]>,
+    /// 工作表保护
+    pub protection: Option<crate::protection::SheetProtection>,
 }
 
 /// 返回 表名 → 版式
@@ -138,6 +140,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || lay.freeze.is_some()
             || lay.filter.is_some()
             || lay.tab_color.is_some()
+            || lay.protection.is_some()
         {
             out.insert(name.clone(), lay);
         }
@@ -169,6 +172,17 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             }
                         }
                     }
+                } else if name.ends_with("sheetProtection") {
+                    let mut tag = String::from("<sheetProtection");
+                    for a in e.attributes().flatten() {
+                        tag.push(' ');
+                        tag.push_str(a.key.as_ref());
+                        tag.push_str("=\"");
+                        tag.push_str(&crate::model::xml_unescape(&a.value.to_string()));
+                        tag.push('"');
+                    }
+                    tag.push_str("/>");
+                    out.protection = crate::protection::parse_tag(&tag);
                 } else if name.ends_with("tabColor") {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("rgb") {
