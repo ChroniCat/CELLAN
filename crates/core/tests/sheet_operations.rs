@@ -131,7 +131,7 @@ fn metadata_references_and_pending_pivots_follow_sheet_identity() {
     wb.sheets[1].charts.push(chart);
     wb.sources.push(Source { name: "Source".into(), kind: Kind::Internal { sheet: "Sheet1".into(), rect: (0, 0, 1, 1) }, at: (0, 0), rows: 2, cols: 2 });
     wb.pivot_shifts.push(("Sheet1".into(), 0, 0, 1, false));
-    let spec = PivotSpec { source: (0, 0, 1, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum };
+    let spec = PivotSpec { source: (0, 0, 1, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
     wb.pivots_pending.push((0, spec.clone(), PivotResult::default(), (2, 0, 3, 1), "First".into()));
     wb.pivots_pending.push((1, spec, PivotResult::default(), (2, 0, 3, 1), "Second".into()));
     assert!(rename_sheet(&mut wb, 0, "Renamed"));

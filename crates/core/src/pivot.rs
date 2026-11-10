@@ -29,6 +29,35 @@ impl Agg {
     }
 }
 
+/// 行字段的分组方式
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupBy {
+    None,
+    /// 日期按年
+    Year,
+    /// 日期按月（yyyy-mm）
+    Month,
+    /// 数值按区间（桶宽）
+    Bucket(f64),
+}
+
+impl Default for GroupBy {
+    fn default() -> Self {
+        GroupBy::None
+    }
+}
+
+impl GroupBy {
+    pub fn label(&self) -> String {
+        match self {
+            GroupBy::None => "不分组".into(),
+            GroupBy::Year => "按年".into(),
+            GroupBy::Month => "按月".into(),
+            GroupBy::Bucket(n) => format!("每 {n} 一档"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PivotSpec {
     /// 源区域（含表头行）
@@ -40,6 +69,10 @@ pub struct PivotSpec {
     /// 值字段（列号）
     pub value_field: u32,
     pub agg: Agg,
+    /// 行字段的分组
+    pub group: GroupBy,
+    /// 排除的行标签（分组后的字符串）
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +87,56 @@ pub struct PivotResult {
 }
 
 /// 计算透视结果
+/// 把行字段的原始值按分组方式变成标签
+pub fn group_key(v: &Value, g: &GroupBy) -> String {
+    match g {
+        GroupBy::None => v.display(),
+        GroupBy::Year | GroupBy::Month => {
+            let (y, m) = match v {
+                Value::Number(serial) => match crate::formula::serial_to_date_pub(*serial) {
+                    Some((y, m, _)) => (y, m),
+                    None => return v.display(),
+                },
+                Value::Text(t) => {
+                    let t = t.trim();
+                    let mut it = t.split(['-', '/', '年', '月']);
+                    let y = it.next().and_then(|s| s.parse::<i32>().ok());
+                    let m = it.next().and_then(|s| s.parse::<u32>().ok());
+                    match (y, m) {
+                        (Some(y), Some(m)) => (y, m),
+                        _ => return v.display(),
+                    }
+                }
+                _ => return v.display(),
+            };
+            if matches!(g, GroupBy::Year) {
+                format!("{y}")
+            } else {
+                format!("{y}-{m:02}")
+            }
+        }
+        GroupBy::Bucket(w) => {
+            let n = match v {
+                Value::Number(n) => *n,
+                Value::Text(t) => t.trim().parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            };
+            if *w <= 0.0 {
+                return v.display();
+            }
+            let b = (n / w).floor() * w;
+            let show = |v: f64| {
+                if v.fract().abs() < 1e-9 {
+                    format!("{}", v as i64)
+                } else {
+                    format!("{v}")
+                }
+            };
+            format!("{}~{}", show(b), show(b + w))
+        }
+    }
+}
+
 pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let (r1, c1, r2, c2) = spec.source;
     let header = |c: u32| {
@@ -68,11 +151,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     // 收集：行标签 → (列标签 → 值列表)
     let mut data: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
     for r in (r1 + 1)..=r2 {
-        let key = sheet
+        let raw = sheet
             .get(r, spec.row_field)
-            .map(|x| x.value.display())
-            .unwrap_or_default();
+            .map(|x| x.value.clone())
+            .unwrap_or(Value::Empty);
+        let key = group_key(&raw, &spec.group);
         if key.is_empty() {
+            continue;
+        }
+        if spec.exclude.iter().any(|e| e == &key) {
             continue;
         }
         let col_key = match spec.col_field {
@@ -202,6 +289,8 @@ mod tests {
             col_field: None,
             value_field: 2,
             agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: Vec::new(),
         };
         let res = compute(&s, &spec);
         assert_eq!(res.headers, vec!["部门", "金额"]);
@@ -223,6 +312,8 @@ mod tests {
             col_field: Some(1),
             value_field: 2,
             agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: Vec::new(),
         };
         let res = compute(&s, &spec);
         assert_eq!(res.headers, vec!["部门", "1月", "2月"]);
@@ -241,7 +332,9 @@ mod tests {
             col_field: None,
             value_field: 2,
             agg,
-        };
+            group: GroupBy::None,
+            exclude: Vec::new(),
+};
         assert_eq!(compute(&s, &mk(Agg::Count)).rows[0][1], Value::Number(3.0));
         assert_eq!(compute(&s, &mk(Agg::Max)).rows[0][1], Value::Number(150.0));
         assert_eq!(compute(&s, &mk(Agg::Min)).rows[0][1], Value::Number(20.0));
@@ -262,6 +355,8 @@ mod tests {
             col_field: None,
             value_field: 2,
             agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: Vec::new(),
         };
         let res = compute(&s, &spec);
         let rect = write_to(&mut s, (8, 0), &res);
@@ -269,5 +364,61 @@ mod tests {
         assert_eq!(s.get(8, 0).unwrap().value.display(), "部门");
         assert_eq!(s.get(9, 0).unwrap().value.display(), "研发");
         assert_eq!(s.get(9, 1).unwrap().value.display(), "270");
+    }
+}
+
+#[cfg(test)]
+mod protection_extra_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn groups_text_dates_by_month_and_excludes() {
+        let mut sh = Sheet::new("t");
+        sh.set(0, 0, Cell { value: Value::Text("date".into()), formula: None });
+        sh.set(0, 1, Cell { value: Value::Text("amount".into()), formula: None });
+        for (i, (d, a)) in [("2024-01-05", 100.0), ("2024-01-20", 50.0), ("2024-02-02", 30.0)]
+            .iter()
+            .enumerate()
+        {
+            sh.set(i as u32 + 1, 0, Cell { value: Value::Text((*d).into()), formula: None });
+            sh.set(i as u32 + 1, 1, Cell { value: Value::Number(*a), formula: None });
+        }
+        let spec = PivotSpec {
+            source: (0, 0, 3, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Sum,
+            group: GroupBy::Month,
+            exclude: vec!["2024-02".into()],
+        };
+        let r = compute(&sh, &spec);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].display(), "2024-01");
+        assert_eq!(r.rows[0][1].display(), "150");
+    }
+
+    #[test]
+    fn bucket_group_labels_ranges() {
+        let mut sh = Sheet::new("t");
+        sh.set(0, 0, Cell { value: Value::Text("v".into()), formula: None });
+        sh.set(0, 1, Cell { value: Value::Text("n".into()), formula: None });
+        for (i, n) in [5.0, 42.0, 120.0].iter().enumerate() {
+            sh.set(i as u32 + 1, 0, Cell { value: Value::Number(*n), formula: None });
+            sh.set(i as u32 + 1, 1, Cell { value: Value::Number(1.0), formula: None });
+        }
+        let spec = PivotSpec {
+            source: (0, 0, 3, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Count,
+            group: GroupBy::Bucket(50.0),
+            exclude: Vec::new(),
+        };
+        let r = compute(&sh, &spec);
+        let labels: Vec<String> = r.rows.iter().map(|row| row[0].display()).collect();
+        assert_eq!(&labels[..2], &["0~50", "100~150"]);
     }
 }

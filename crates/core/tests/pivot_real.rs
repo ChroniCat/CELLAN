@@ -16,7 +16,9 @@ fn writes_real_pivot_table() {
         col_field: None,
         value_field: 2,
         agg: Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     // 输出放在 H1
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 7), &res);
@@ -131,7 +133,9 @@ fn save_attaches_pending_pivot() {
         col_field: None,
         value_field: 2,
         agg: Agg::Count,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 8), &res);
     let name = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();

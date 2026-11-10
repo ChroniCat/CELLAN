@@ -814,7 +814,21 @@ pub fn sanitize_drawings(path: &Path) -> Result<Vec<String>> {
 
 /// 取出某个标签对应的完整片段（含自闭合）
 fn take_element(xml: &str, tag: &str) -> Option<String> {
-    let start = xml.find(&format!("<{tag}"))?;
+    // 按完整标签名找起点（避免 legacyDrawing 命中 legacyDrawingHF）
+    let pat = format!("<{tag}");
+    let mut start = None;
+    let mut from = 0usize;
+    while let Some(i) = xml[from..].find(&pat) {
+        let at = from + i + pat.len();
+        match xml[at..].chars().next() {
+            Some(' ') | Some('/') | Some('>') | Some('\r') | Some('\n') => {
+                start = Some(from + i);
+                break;
+            }
+            _ => from = at,
+        }
+    }
+    let start = start?;
     let rest = &xml[start..];
     let head_end = rest.find('>')?;
     if rest[..=head_end].ends_with("/>") {
@@ -827,6 +841,20 @@ fn take_element(xml: &str, tag: &str) -> Option<String> {
 
 /// umya 重写工作表时会丢掉 <drawing>/<tableParts>/<pivotTable> 这些「引用元素」，
 /// 部件和关系都在、表里却没指过去 —— Excel 直接判包损坏。这里按基准补回来。
+/// 标签名必须完整匹配：`<legacyDrawing` 不能命中 `<legacyDrawingHF`
+fn has_tag(xml: &str, tag: &str) -> bool {
+    let pat = format!("<{tag}");
+    let mut from = 0usize;
+    while let Some(i) = xml[from..].find(&pat) {
+        let at = from + i + pat.len();
+        match xml[at..].chars().next() {
+            Some(' ') | Some('/') | Some('>') | Some('\r') | Some('\n') => return true,
+            _ => from = at,
+        }
+    }
+    false
+}
+
 pub fn restore_sheet_refs(path: &Path, base: &Path) -> Result<Vec<String>> {
     if !base.exists() {
         return Ok(Vec::new());
@@ -858,7 +886,7 @@ pub fn restore_sheet_refs(path: &Path, base: &Path) -> Result<Vec<String>> {
         let mut add = String::new();
         let mut added = 0usize;
         for tag in order {
-            if new_xml.contains(&format!("<{tag}")) {
+            if has_tag(&new_xml, tag) {
                 continue;
             }
             if let Some(frag) = take_element(&base_xml, tag) {

@@ -1849,3 +1849,45 @@ XF 里四条边的颜色在 byte12..15，顺序是「左、下、上、右」，
 - 已知限制：内容不按 `scale/fit_to_page` 缩放（页纸宽度按 printable/scale 放大，保证列不溢出）；
   页面模式下方向键的“滚动跟随”仍按内容坐标，远距离跳转可能不自动对齐。
 - 测试：app 66 项、core lib 157 项；新增 `page_layout_modes_render_and_keep_the_selection`。
+
+## 第六轮：保护、透视表、导入链接、功能区收尾（2026-11-10）
+
+- **工作表保护**（审阅 → 保护工作表/撤销保护）
+  - Excel 365 的 `<sheetProtection algorithmName="SHA-512" .../>` 口令算法实测对齐：
+    `H0=SHA512(salt || UTF16LE(pw))`，随后 `Hi=SHA512(H(i-1) || LE32(i))` 迭代 spinCount 次，`hashValue=H`。
+    用真实 Excel 生成的样本做了固定向量测试；写出的文件在 Excel 里 `Unprotect("test")` 能解开。
+  - 旧格式只有 `password="XXXX"`（16 位哈希）时按旧算法校验。
+  - 受保护时统一走 `edit_blocked()`：键入/双击编辑、粘贴、清除、改格式、插删行列、合并、隐藏行列都被挡住，
+    状态栏提示“审阅 → 撤销保护”。
+  - 打开到 Office 加密（CFB + `EncryptedPackage` 流）的工作簿时，`xlsx::load` 直接给出明确提示，不再报压缩包损坏。
+- **透视表**：`GroupBy::{Year,Month,Bucket}` 行字段分组、`exclude` 排除标签；数据页签新增“刷新透视表”，
+  先清旧结果区域再按当前数据重算，并同步 `pivots_pending` 里的结果与区域，保存时透视缓存跟着更新。
+- **导入与链接**：数据页签“导入工作簿”把另一个 xlsx 的每张表复制进来（重名自动加 (2)）；
+  外部链接对话框每行加“更改源…”，选新文件后改 target/abs、清缓存并立即更新。
+- **功能区收尾**：开始页签的字体/对齐方式/数字三组右下角画了 Excel 的对话框启动器（斜箭头），点开“设置单元格格式”。
+- **顺带修的两个写盘问题**
+  - 图表引用写回日志在保存成功后没清空：同一次编辑连续保存两次会把 (旧→新) 反过来再应用一次，
+    撤销后保存也会被上一次的正向替换抵掉。`SaveReceipt` 现在记录 `committed_charts`，应用回执时清空 `ref_fixes`。
+  - umya 重写图表部件时会去掉工作表名引号，`replace_refs` 找不到带引号的旧串就静默跳过；
+    现在会按去引号形式再匹配一次（替换成带引号的新串，Excel 两种都接受）。
+
+### 第六轮补充：富文本、页面缩放与两个写盘修复（同日）
+
+- **单元格富文本**（审阅 → 文本 → 富文本…）
+  - 模型：`Sheet.rich: HashMap<(r,c), Vec<RichRun>>`，记录 bold/italic/color/size/font。
+  - 存储用 `inlineStr`：保存时把该格的 `<c …>` 整体替换成 `<c r="A1" s="…" t="inlineStr"><is><r>…</r></is></c>`，
+    Excel 打开后逐段格式可见（实测 A1 前 6 字符 Bold=True、Color=192，其余不加粗）。
+  - 加载只认 inlineStr；Excel 自己写在 sharedStrings 里的富文本仍按纯文本读入（后续可补 SST 解析）。
+  - 对话框里选中文字再点加粗/颜色/字号；文本框整体改写时格式会回到单段（避免错位），
+    单元格文本被普通编辑改写时自动丢弃旧 run，保存不会把旧分段盖回去。
+- **页面布局按打印比例缩放**
+  - 页面视图此前忽略 `pageSetup@scale`；现在 `PageGeo` 带 `scale`，列宽行高与字号都按比例画，
+    分页位置也先缩放再排版。
+  - **页面设置以前根本没写回**：`sheet.page_dirty` 有人设、保存时没人用。新增 `patch::apply_page_setup`
+    重写 `printOptions/pageMargins/pageSetup`，并按 `fitToPage` 维护 `sheetPr/pageSetUpPr`，
+    否则 Excel 会忽略 scale。实测 Excel 回读 `PageSetup.Zoom`：50% 文件=50、100% 文件=100。
+  - 页面布局页签加了“缩放：N%”（100/75/50/25 循环）和“调整为 1 页”。
+- **修 `restore_sheet_refs` 的前缀误匹配**：`take_element(xml,"legacyDrawing")` 会命中 `<legacyDrawingHF`，
+  表里已有 HF 时又被补一遍，写出两个 `<legacyDrawingHF>`，Excel 判包损坏。现在标签名按边界匹配。
+- **修图表引用保存日志**：`SaveReceipt` 记录 `committed_charts`，落盘后清 `ref_fixes`，
+  避免连续保存把 (旧→新) 反向再套一次；umya 去掉工作表名引号时按去引号形式再匹配一次。

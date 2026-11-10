@@ -23,7 +23,9 @@ fn pivot_by_department() {
         col_field: None,
         value_field: 2, // 金额
         agg: Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     assert_eq!(res.headers, vec!["部门", "金额"]);
     // 研发 300+200=500，销售 100+400=500，行政 50
@@ -70,7 +72,9 @@ fn pivot_count_and_average() {
         col_field: None,
         value_field: 2,
         agg,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let count = sheetcore::pivot::compute(wb.sheet(0), &mk(Agg::Count));
     let rd = count
         .rows

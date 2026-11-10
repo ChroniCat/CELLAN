@@ -520,7 +520,17 @@ pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -
     zip.by_name(chart_part)?.read_to_string(&mut xml)?;
     drop(zip);
     for (old, new) in pairs {
-        xml = xml.replace(old.as_str(), new.as_str());
+        if xml.contains(old.as_str()) {
+            xml = xml.replace(old.as_str(), new.as_str());
+            continue;
+        }
+        // umya 重写图表部件时会去掉工作表名的引号；按去引号形式再试一次，
+        // 否则插删行列后的引用改写会静默落空。
+        let bare = |s: &str| s.replace('\'', "");
+        let o = bare(old);
+        if o != *old && xml.contains(&o) {
+            xml = xml.replace(&o, new);
+        }
     }
     crate::patch::append_entry(path, chart_part, xml.as_bytes())?;
     Ok(())

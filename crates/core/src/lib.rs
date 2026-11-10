@@ -23,6 +23,7 @@ pub mod patch;
 pub mod pdf;
 pub mod print;
 pub mod protection;
+pub mod richtext;
 pub mod pivot;
 pub mod refs;
 pub mod sheet_ops;

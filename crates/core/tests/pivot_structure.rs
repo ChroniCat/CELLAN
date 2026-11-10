@@ -22,7 +22,9 @@ fn seed() -> Workbook {
     let spec = PivotSpec {
         source: (0, 1, 4, 4), row_field: 1, col_field: Some(2),
         value_field: 4, agg: Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     wb.pivots_pending.push((0, spec.clone(), Default::default(), (8, 1, 11, 3), "Value".into()));
     wb.sheets.push(Sheet::new("Unchanged"));
     wb.pivots_pending.push((1, spec, Default::default(), (8, 1, 11, 3), "Other".into()));
@@ -110,7 +112,9 @@ fn saved_pending_pivot_moves_source_fields_and_output_then_undo_restores_both() 
     let spec = PivotSpec {
         source: (0, 0, 3, 1), row_field: 0, col_field: None,
         value_field: 1, agg: Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     let rect = sheetcore::pivot::write_to(&mut wb.sheets[0], (6, 3), &result);
     wb.pivots_pending.push((0, spec, result, rect, "Value".into()));
@@ -162,7 +166,9 @@ fn deleting_a_value_field_saves_without_attachment_and_undo_restores_it_on_disk(
     let spec = PivotSpec {
         source: (0, 0, 3, 1), row_field: 0, col_field: None,
         value_field: 1, agg: Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     let rect = sheetcore::pivot::write_to(&mut wb.sheets[0], (6, 3), &result);
     wb.pivots_pending.push((0, spec, result, rect, "Value".into()));

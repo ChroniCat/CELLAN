@@ -2216,3 +2216,150 @@ pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> 
         buf
     })
 }
+
+/// 页面设置写回：printOptions / pageMargins / pageSetup 三个元素
+pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
+    let mut x = xml.to_string();
+    for tag in ["printOptions", "pageMargins", "pageSetup"] {
+        while let Some(i) = x.find(&format!("<{tag}")) {
+            if let Some(gt) = x[i..].find('>') {
+                x.replace_range(i..i + gt + 1, "");
+            } else {
+                break;
+            }
+        }
+    }
+    let landscape = if p.landscape { "landscape" } else { "portrait" };
+    let fit = if p.fit_to_page {
+        format!(
+            " fitToWidth=\"{}\" fitToHeight=\"{}\"",
+            p.fit_width, p.fit_height
+        )
+    } else {
+        String::new()
+    };
+    let scale = if p.fit_to_page {
+        String::new()
+    } else {
+        format!(" scale=\"{}\"", p.scale.clamp(10, 400))
+    };
+    let block = format!(
+        "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>\
+<pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>\
+<pageSetup paperSize=\"{}\" orientation=\"{landscape}\"{scale}{fit}/>",
+        if p.gridlines { 1 } else { 0 },
+        if p.headings { 1 } else { 0 },
+        if p.center_h { 1 } else { 0 },
+        if p.center_v { 1 } else { 0 },
+        p.margins[0], p.margins[1], p.margins[2], p.margins[3], p.margins[4], p.margins[5],
+        p.paper,
+    );
+    // fitToPage 由 sheetPr/pageSetUpPr 控制；不关掉的话 Excel 会忽略 scale
+    let fit_flag = if p.fit_to_page { "1" } else { "0" };
+    if let Some(sp) = x.find("<sheetPr") {
+        let end = x[sp..].find('>').map(|e| sp + e + 1).unwrap_or(sp);
+        if x[sp..end].ends_with("/>") {
+            // <sheetPr/> 自闭合：展开成带 pageSetUpPr 的形式
+            let inner = format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>");
+            let open = x[sp..end].replace("/>", ">");
+            x.replace_range(sp..end, &format!("{open}{inner}</sheetPr>"));
+        } else if let Some(psp) = x[sp..].find("<pageSetUpPr") {
+            let at = sp + psp;
+            let pe = x[at..].find('>').map(|e| at + e).unwrap_or(at);
+            let tag = &x[at..=pe];
+            let mut newtag = tag.to_string();
+            if tag.contains("fitToPage=") {
+                let re_start = tag.find("fitToPage=\"").unwrap();
+                let v0 = re_start + "fitToPage=\"".len();
+                let v1 = tag[v0..].find('"').map(|q| v0 + q).unwrap_or(v0);
+                newtag.replace_range(v0..v1, fit_flag);
+            } else {
+                newtag = newtag.replacen("<pageSetUpPr", &format!("<pageSetUpPr fitToPage=\"{fit_flag}\" "), 1);
+            }
+            x.replace_range(at..=pe, &newtag);
+        } else {
+            x.insert_str(end, &format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>"));
+        }
+    } else {
+        // 没有 sheetPr：作为 worksheet 的第一个子元素插入（不能插到 XML 声明后面）
+        if let Some(ws) = x.find("<worksheet") {
+            if let Some(gt) = x[ws..].find('>') {
+                let at = ws + gt + 1;
+                x.insert_str(
+                    at,
+                    &format!("<sheetPr><pageSetUpPr fitToPage=\"{fit_flag}\"/></sheetPr>"),
+                );
+            }
+        }
+    }
+    let markers = [
+        "<headerFooter",
+        "<rowBreaks",
+        "<colBreaks",
+        "<customProperties",
+        "<drawing",
+        "<legacyDrawing",
+        "<tableParts",
+        "<extLst",
+        "</worksheet>",
+    ];
+    let at = markers
+        .iter()
+        .filter_map(|m| x.find(m))
+        .min()
+        .unwrap_or(x.len());
+    x.insert_str(at, &block);
+    x
+}
+
+/// 保存收尾：只给改过页面设置的表写回
+pub fn apply_page_setup(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, crate::page::PageSetup> =
+        std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if s.page_dirty {
+            if let Some(part) = targets.get(&s.name) {
+                map.insert(part.clone(), s.page.clone());
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(p) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return set_page_setup(&xml, p).into_bytes();
+            }
+        }
+        buf
+    })
+}
+
+/// 保存收尾：把改过的富文本单元格写成 inlineStr
+pub fn apply_rich(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<
+        String,
+        std::collections::HashMap<(u32, u32), Vec<crate::richtext::RichRun>>,
+    > = std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if s.rich_dirty && !s.rich.is_empty() {
+            if let Some(part) = targets.get(&s.name) {
+                map.insert(part.clone(), s.rich.clone());
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(cells) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return crate::richtext::patch_sheet_rich(&xml, cells).into_bytes();
+            }
+        }
+        buf
+    })
+}

@@ -295,7 +295,9 @@ fn renamed_print_names_and_existing_pivot_source_follow_sheet_identity() {
     let spec = sheetcore::pivot::PivotSpec {
         source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1,
         agg: sheetcore::pivot::Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     sheetcore::pivot_xml::attach(&path, "Original", &spec, &result, (6, 0, 9, 1), "Sum").unwrap();
     let mut wb = xlsx::load(&path).unwrap();

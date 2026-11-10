@@ -86,7 +86,7 @@ fn pivot_book(path: &Path) -> Workbook {
     let mut wb = Workbook::new_blank();
     for r in 0..4 { wb.sheets[0].set(r, 0, number(r as f64)); wb.sheets[0].set(r, 1, number(10.)); }
     save(path, &mut wb);
-    let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum };
+    let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
     let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     sheetcore::pivot_xml::attach(path, "Sheet1", &spec, &result, (6, 0, 10, 1), "Sum").unwrap();
     xlsx::load(path).unwrap()
@@ -132,7 +132,7 @@ fn newly_created_pivot_sources_do_not_drift_across_repeated_saves() {
         let mut wb = Workbook::new_blank();
         for r in 0..4 { wb.sheets[0].set(r, 0, number(r as f64)); wb.sheets[0].set(r, 1, number(10.)); }
         if save_empty_first { save(&path, &mut wb); wb = xlsx::load(&path).unwrap(); }
-        let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum };
+        let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
         let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
         wb.pivots_pending.push((0, spec, result, (6, 0, 10, 1), "Sum".into()));
         save(&path, &mut wb);

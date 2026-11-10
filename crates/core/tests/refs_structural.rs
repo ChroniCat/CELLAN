@@ -71,7 +71,9 @@ fn pending_pivot_source_shifts() {
         col_field: None,
         value_field: 1,
         agg: sheetcore::pivot::Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     wb.pivots_pending.push((0, spec, res, (0, 4, 0, 5), "数值".into()));
     sheetcore::structural::apply_structural_wb(&mut wb, 0, &Structural::InsertRows { at: 0, n: 3 });

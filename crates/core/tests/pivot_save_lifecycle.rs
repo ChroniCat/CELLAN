@@ -112,7 +112,7 @@ fn seeded() -> Workbook {
     for r in 0..4 { wb.sheets[0].set(r, 0, number(r as f64)); wb.sheets[0].set(r, 1, number(10.)); }
     wb
 }
-fn spec() -> PivotSpec { PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum } }
+fn spec() -> PivotSpec { PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() } }
 fn add(wb: &mut Workbook, sheet: usize, out_row: u32) {
     let spec = spec();
     let result = sheetcore::pivot::compute(&wb.sheets[sheet], &spec);

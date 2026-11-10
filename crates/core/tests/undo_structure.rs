@@ -97,7 +97,7 @@ fn structure_undo_restores_foreign_reference_metadata_and_pending_pivot_specific
     wb.sheets[1].charts.push(chart);
     let original_cf = format!("{:?}", wb.sheets[1].cf);
     let original_chart = wb.sheets[1].charts[0].series[0].val_ref.clone();
-    let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 1, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum };
+    let spec = sheetcore::pivot::PivotSpec { source: (0, 0, 1, 1), row_field: 0, col_field: None, value_field: 1, agg: sheetcore::pivot::Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
     wb.pivots_pending.push((0, spec, Default::default(), (3, 0, 4, 1), "value".into()));
     let mut undo = UndoStack::new();
     apply(&mut wb, &mut undo, Structural::InsertRows { at: 0, n: 2 });
@@ -188,7 +188,9 @@ fn saved_pivot_delete_undo_and_redo_restore_exact_source_bounds() {
     let spec = sheetcore::pivot::PivotSpec {
         source: (0, 0, 3, 1), row_field: 0, col_field: None,
         value_field: 1, agg: sheetcore::pivot::Agg::Sum,
-    };
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+};
     let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     sheetcore::pivot_xml::attach(&path, "Sheet1", &spec, &result, (6, 0, 10, 1), "Sum").unwrap();
     let mut wb = xlsx::load(&path).unwrap();
@@ -232,9 +234,11 @@ fn saved_chart_references_follow_undo_and_redo_on_another_sheet() {
         xlsx::save_atomic_with_receipt(&path, wb).unwrap().apply_to(wb);
         sheetcore::charts::load_charts(&path, "Other").unwrap()[0].series[0].val_ref.clone()
     };
-    assert_eq!(save_and_ref(&mut wb), moved);
+    // 工作表名是否带引号不影响语义；第二次保存由 umya 重写图表部件时会去掉引号。
+    let norm = |s: &str| s.replace('\'', "");
+    assert_eq!(norm(&save_and_ref(&mut wb)), norm(&moved));
     undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
-    for _ in 0..2 { assert_eq!(save_and_ref(&mut wb), original); }
+    for _ in 0..2 { assert_eq!(norm(&save_and_ref(&mut wb)), norm(&original)); }
     undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
-    for _ in 0..2 { assert_eq!(save_and_ref(&mut wb), moved); }
+    for _ in 0..2 { assert_eq!(norm(&save_and_ref(&mut wb)), norm(&moved)); }
 }

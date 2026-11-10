@@ -28,6 +28,8 @@ fn creating_a_refreshable_pivot_prevents_older_structure_undo_from_erasing_it() 
     app.generate_pivot(&sheetcore::pivot::PivotSpec {
         source: (1, 0, 2, 1), row_field: 0, col_field: None,
         value_field: 1, agg: sheetcore::pivot::Agg::Sum,
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
     });
     assert_eq!(app.undo.depth(), (0, 0));
     assert_eq!(app.wb.pivots_pending.len(), 1);
@@ -586,4 +588,45 @@ fn protected_sheet_blocks_clearing_and_formatting() {
     let sid = app.wb.sheet(0).style_of(0, 0);
     assert!(!app.wb.styles.get(sid).bold, "受保护时不能改格式");
     assert!(app.edit_blocked(), "保护状态应可查询");
+}
+
+#[test]
+fn pivot_refresh_recomputes_in_place() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("k".into()), formula: None });
+        sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Text("v".into()), formula: None });
+        sh.set(1, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("a".into()), formula: None });
+        sh.set(1, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(10.0), formula: None });
+        sh.set(2, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("b".into()), formula: None });
+        sh.set(2, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(5.0), formula: None });
+    }
+    app.sel = (5, 0);
+    let spec = sheetcore::pivot::PivotSpec {
+        source: (0, 0, 2, 1),
+        row_field: 0,
+        col_field: None,
+        value_field: 1,
+        agg: sheetcore::pivot::Agg::Sum,
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+    };
+    app.generate_pivot(&spec);
+    let rect = app.pivot_last.as_ref().expect("应记录透视表位置").2;
+    let total = app.wb.sheet(0).value(rect.2, rect.1 + 1).display();
+    assert_eq!(total, "15", "生成后的总计");
+    app.wb.sheet_mut(0).set(
+        1,
+        1,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Number(110.0),
+            formula: None,
+        },
+    );
+    app.refresh_pivot();
+    let rect2 = app.pivot_last.as_ref().unwrap().2;
+    assert_eq!(rect2, rect, "刷新应写回同一块区域");
+    assert_eq!(app.wb.sheet(0).value(rect2.2, rect2.1 + 1).display(), "115");
 }

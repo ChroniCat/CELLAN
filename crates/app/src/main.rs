@@ -156,6 +156,17 @@ fn chart_handle_at(r: egui::Rect, p: egui::Pos2) -> Option<u8> {
     None
 }
 
+/// 富文本编辑对话框
+#[derive(Clone, Default)]
+struct RichDlg {
+    r: u32,
+    c: u32,
+    runs: Vec<sheetcore::richtext::RichRun>,
+    sel: (usize, usize),
+    color: [u8; 3],
+    size: f32,
+}
+
 /// 工作表保护对话框
 #[derive(Clone, Default)]
 struct ProtectDlg {
@@ -199,6 +210,8 @@ struct PageGeo {
     total_h: f32,
     header: String,
     footer: String,
+    /// 页面缩放（打印比例/调整为 1 页）
+    scale: f32,
 }
 
 struct SheetApp {
@@ -332,6 +345,13 @@ struct SheetApp {
     chart_drag: Option<ChartDrag>,
     /// 工作表保护对话框
     protect_dlg: Option<ProtectDlg>,
+    rich_dlg: Option<RichDlg>,
+    /// 最近生成的透视表：(表索引, 规格, 结果区域)
+    pivot_last: Option<(usize, sheetcore::pivot::PivotSpec, (u32, u32, u32, u32))>,
+    /// 点了功能区的“对话框启动器”
+    fmt_pending: bool,
+    /// 页面视图的绘制缩放（普通视图为 1）
+    paint_scale: f32,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -569,6 +589,10 @@ impl SheetApp {
             chart_sel: None,
             chart_drag: None,
             protect_dlg: None,
+            rich_dlg: None,
+            pivot_last: None,
+            fmt_pending: false,
+            paint_scale: 1.0,
             view_mode: std::env::var("SC_VIEW_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -2334,6 +2358,53 @@ impl SheetApp {
         self.import_csv_from(&path);
     }
 
+    /// 选一个工作簿，把它的每张表复制到当前工作簿末尾（值 + 公式）
+    fn import_workbook(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel 工作簿", &["xlsx", "xlsm", "xls"])
+            .pick_file()
+        else {
+            return;
+        };
+        let other = match sheetcore::xlsx::load(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                self.status = format!("打开失败：{e:#}");
+                return;
+            }
+        };
+        let txn = self.txn_begin(&[]);
+        let mut added: Vec<String> = Vec::new();
+        for src in other.sheets.iter() {
+            let mut name = src.name.clone();
+            let mut n = 2;
+            while self.wb.sheets.iter().any(|s| s.name == name) {
+                name = format!("{} ({n})", src.name);
+                n += 1;
+            }
+            let mut sheet = src.clone();
+            sheet.name = name.clone();
+            sheet.charts.clear();
+            sheet.tables.clear();
+            added.push(name);
+            self.wb.sheets.push(sheet);
+        }
+        let n = added.len();
+        if let Some(first) = self.wb.sheets.len().checked_sub(n) {
+            self.sheet_idx = first;
+        }
+        self.sel = (0, 0);
+        self.sel_end = self.sel;
+        self.txn_end("导入工作簿", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = if n == 0 {
+            "目标文件里没有工作表".into()
+        } else {
+            format!("已导入 {n} 张表：{}", added.join("、"))
+        };
+    }
+
     fn import_csv_from(&mut self, path: &std::path::Path) {
         let text = match std::fs::read(path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
@@ -3533,6 +3604,18 @@ impl SheetApp {
                 net.broadcast_op(op);
             }
         }
+        // 文本被改写后旧的富文本段就失效了（避免保存时把旧分段盖回去）
+        {
+            let (rr, cc) = self.sel;
+            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            if let Some(runs) = sheet.rich.get(&(rr, cc)).cloned() {
+                let t = sheetcore::richtext::runs_text(&runs);
+                if t != sheet.value(rr, cc).display() {
+                    sheet.rich.remove(&(rr, cc));
+                    sheet.rich_dirty = true;
+                }
+            }
+        }
         if let Some((dr, dc)) = advance {
             let nr = (self.sel.0 as i64 + dr as i64).max(0) as u32;
             let nc = (self.sel.1 as i64 + dc as i64).max(0) as u32;
@@ -4088,6 +4171,112 @@ impl SheetApp {
 
     /// Excel 的「文件」后台视图：左侧一列导航，右侧整块内容。
     /// 打开时盖住功能区和表格，标题栏保留。
+    /// 富文本：选中文字后加粗/改色/改字号
+    fn rich_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.rich_dlg.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        ui_kit::window(ctx, "富文本", 420.0).show(ctx, |ui| {
+            ui.label("先选中文字，再点下面的按钮；不选表示整格");
+            let text = sheetcore::richtext::runs_text(&d.runs);
+            let mut buf = text.clone();
+            let out = egui::TextEdit::multiline(&mut buf)
+                .desired_rows(4)
+                .desired_width(380.0)
+                .show(ui);
+            if let Some(range) = out.cursor_range {
+                let a = range.primary.ccursor.index;
+                let b = range.secondary.ccursor.index;
+                d.sel = if a <= b { (a, b) } else { (b, a) };
+            }
+            if out.response.changed() {
+                d.runs = vec![sheetcore::richtext::RichRun::plain(buf)];
+            }
+            let (start, end) = if d.sel.0 == d.sel.1 {
+                (0, d.runs.iter().map(|r| r.text.chars().count()).sum())
+            } else {
+                d.sel
+            };
+            ui.horizontal(|ui| {
+                if ui.button("加粗").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.bold = !r.bold
+                    });
+                }
+                if ui.button("斜体").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.italic = !r.italic
+                    });
+                }
+                for (name, c) in [("红", [192, 0, 0]), ("蓝", [0, 70, 180]), ("绿", [16, 124, 65])] {
+                    if ui.button(name).clicked() {
+                        sheetcore::richtext::apply_range(&mut d.runs, start, end, &move |r| {
+                            r.color = Some(c)
+                        });
+                    }
+                }
+                if ui.button("恢复默认").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.bold = false;
+                        r.italic = false;
+                        r.color = None;
+                        r.size = None;
+                        r.font = None;
+                    });
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("字号");
+                let mut sz = d.size.max(11.0);
+                if ui
+                    .add(egui::DragValue::new(&mut sz).range(6.0..=72.0).speed(1.0))
+                    .changed()
+                {
+                    d.size = sz;
+                }
+                if ui.button("应用到选中").clicked() {
+                    let sz = d.size.max(6.0);
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &move |r| {
+                        r.size = Some(sz)
+                    });
+                }
+            });
+            ui_kit::footer(ui, |ui| {
+                if ui_kit::primary_button(ui, "确定").clicked() {
+                    apply = true;
+                }
+                if ui.button("取消").clicked() {
+                    open = false;
+                }
+            });
+        });
+        if apply {
+            let runs = std::mem::take(&mut d.runs);
+            let text = sheetcore::richtext::runs_text(&runs);
+            let key = (d.r, d.c);
+            {
+                let sheet = self.wb.sheet_mut(self.sheet_idx);
+                sheet.rich.insert(key, runs);
+                sheet.rich_dirty = true;
+                sheet.set(
+                    d.r,
+                    d.c,
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Text(text.into()),
+                        formula: None,
+                    },
+                );
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = "富文本已应用（保存后 Excel 里能看到分段格式）".into();
+            open = false;
+        }
+        if open {
+            self.rich_dlg = Some(d);
+        }
+    }
+
     /// 工作表保护：设置/撤销密码
     fn protect_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.protect_dlg.take() else { return };
@@ -4639,7 +4828,7 @@ impl SheetApp {
             });
         });
 
-        ui_kit::group(ui, "字体", |ui| {
+        if ui_kit::group_l(ui, "字体", "font", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("font_pick")
@@ -4712,10 +4901,11 @@ impl SheetApp {
                         self.color_popup = Some(true);
                     }
                 });
-            });
-        });
 
-        ui_kit::group(ui, "对齐方式", |ui| {
+            });
+        }) { self.fmt_pending = true; }
+
+        if ui_kit::group_l(ui, "对齐方式", "align", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     for (ic, val, tip) in [
@@ -4756,9 +4946,9 @@ impl SheetApp {
                     }
                 });
             });
-        });
+        }) { self.fmt_pending = true; }
 
-        ui_kit::group(ui, "数字", |ui| {
+        if ui_kit::group_l(ui, "数字", "num", |ui| {
             ui.vertical(|ui| {
                 let fmt_label = match cur.format.as_str() {
                     "" => "常规",
@@ -4817,7 +5007,7 @@ impl SheetApp {
                     }
                 });
             });
-        });
+        }) { self.fmt_pending = true; }
 
         ui_kit::group(ui, "样式", |ui| {
             if ui_kit::big_sized(ui, Icon::Filter, "条件格式", Vec2::new(72.0, 76.0)).clicked() {
@@ -4875,6 +5065,10 @@ impl SheetApp {
                 }
             });
         });
+        if self.fmt_pending {
+            self.fmt_pending = false;
+            self.open_format_dialog();
+        }
     }
 
     fn ribbon_insert(&mut self, ui: &mut egui::Ui) {
@@ -4900,6 +5094,8 @@ impl SheetApp {
                             col_field: None,
                             value_field: c2,
                             agg: sheetcore::pivot::Agg::Sum,
+                            group: sheetcore::pivot::GroupBy::None,
+                            exclude: Vec::new(),
                         });
                     }
                 }
@@ -4955,6 +5151,20 @@ impl SheetApp {
                 self.note_edit = Some((r, c, cur));
             }
         });
+        ui_kit::group(ui, "透视表", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Pivot, "刷新透视表", 110.0, "用当前数据重算").clicked() {
+                    self.refresh_pivot();
+                }
+                if ui_kit::labeled_w(ui, Icon::Pivot, "透视表选项", 110.0, "分组 / 排除值").clicked() {
+                    if let Some((_, spec, _)) = self.pivot_last.clone() {
+                        self.pivot_edit = Some(spec);
+                    } else {
+                        self.status = "先选中数据区域再新建透视表".into();
+                    }
+                }
+            });
+        });
         ui_kit::group(ui, "链接", |ui| {
             let links = self.wb.links.len();
             let label = if links > 0 {
@@ -4987,6 +5197,26 @@ impl SheetApp {
                     self.set_page(move |p| {
                         let m = if narrow { [1.0, 1.0, 1.0, 1.0, 0.5, 0.5] } else if wide { [0.7, 0.7, 0.75, 0.75, 0.3, 0.3] } else { [0.25, 0.25, 0.75, 0.75, 0.3, 0.3] };
                         p.margins = m;
+                    });
+                }
+                let pct = page.scale;
+                if ui_kit::labeled_w(ui, Icon::Chart, &format!("缩放：{pct}%"), 110.0, "打印缩放：100/75/50/25 循环").clicked() {
+                    self.set_page(|p| {
+                        p.fit_to_page = false;
+                        p.scale = match p.scale {
+                            100 => 75,
+                            75 => 50,
+                            50 => 25,
+                            _ => 100,
+                        };
+                    });
+                }
+                if ui_kit::labeled_w_on(ui, Icon::Table, "调整为 1 页", 110.0, page.fit_to_page, "等比缩到一页").clicked() {
+                    let on = !page.fit_to_page;
+                    self.set_page(move |p| {
+                        p.fit_to_page = on;
+                        p.fit_width = 1;
+                        p.fit_height = 1;
                     });
                 }
             });
@@ -5023,6 +5253,29 @@ impl SheetApp {
                     .map(|n| n.text.clone())
                     .unwrap_or_default();
                 self.note_edit = Some((r, c, cur));
+            }
+        });
+        ui_kit::group(ui, "文本", |ui| {
+            if ui_kit::big(ui, Icon::FontColor, "富文本").clicked() {
+                let (r, c) = self.sel;
+                let runs = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .rich
+                    .get(&(r, c))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let t = self.wb.sheet(self.sheet_idx).value(r, c).display();
+                        vec![sheetcore::richtext::RichRun::plain(t)]
+                    });
+                self.rich_dlg = Some(RichDlg {
+                    r,
+                    c,
+                    runs,
+                    sel: (0, 0),
+                    color: [0, 0, 0],
+                    size: 0.0,
+                });
             }
         });
         ui_kit::group(ui, "保护", |ui| {
@@ -5093,6 +5346,9 @@ impl SheetApp {
             ui.vertical(|ui| {
                 if ui_kit::labeled_w(ui, Icon::Open, "导入 CSV/TSV", 120.0, "").clicked() {
                     self.import_csv();
+                }
+                if ui_kit::labeled_w(ui, Icon::Open, "导入工作簿", 120.0, "把另一个 xlsx 的表复制进来").clicked() {
+                    self.import_workbook();
                 }
                 if ui_kit::labeled_w(ui, Icon::Link, "从另一张表取数", 120.0, "").clicked() {
                     self.link_dlg = Some(String::new());
@@ -5238,6 +5494,8 @@ impl SheetApp {
                         source: (r1, c1, r2, c2),
                         row_field: c1,
                         col_field: None,
+                        group: sheetcore::pivot::GroupBy::None,
+                        exclude: Vec::new(),
                         value_field: c2,
                         agg: sheetcore::pivot::Agg::Sum,
                     });
@@ -6051,7 +6309,7 @@ impl SheetApp {
                 let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
                 let family = cell_family(font_name);
                 // 样式里的 size 是磅值（Excel 的 11 磅 ≈ 14.7px），画到屏幕上要换算
-                let fs = (st.size * 4.0 / 3.0).max(6.0);
+                let fs = (st.size * 4.0 / 3.0 * self.paint_scale).max(5.0);
                 let font = FontId::new(
                     if st.bold || cf_bold || table_header { fs + 0.8 } else { fs },
                     family.clone(),
@@ -6106,7 +6364,48 @@ impl SheetApp {
                 // 多行/自动换行要按单元格宽度排版并裁到格子里，
                 // 否则长地址会溢出到右边的发票号上（Excel 会裁掉）。
                 let multiline = st.wrap || txt.contains("\n");
-                if multiline {
+                let rich_runs = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .rich
+                    .get(&(r, c))
+                    .cloned();
+                if let Some(runs) = rich_runs.filter(|_| !multiline) {
+                    // 富文本：逐段排版、按段推进 x（Excel 的 run 顺序就是显示顺序）
+                    let fonts: Vec<(FontId, Color32)> = runs
+                        .iter()
+                        .map(|run| {
+                            let size = (run.size.unwrap_or(st.size) * 4.0 / 3.0
+                                * self.paint_scale)
+                                .max(5.0);
+                            let fam = cell_family(run.font.as_deref().unwrap_or(font_name));
+                            (
+                                FontId::new(if run.bold { size + 0.8 } else { size }, fam),
+                                run.color
+                                    .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                                    .unwrap_or(color),
+                            )
+                        })
+                        .collect();
+                    let galleys: Vec<_> = runs
+                        .iter()
+                        .zip(fonts.iter())
+                        .map(|(run, (f, c))| painter.layout_no_wrap(run.text.clone(), f.clone(), *c))
+                        .collect();
+                    let total: f32 = galleys.iter().map(|g| g.size().x).sum();
+                    let mut x = match align {
+                        Align2::CENTER_CENTER => rect.center().x - total / 2.0,
+                        Align2::RIGHT_CENTER => rect.max.x - 4.0 - total,
+                        _ => rect.min.x + 4.0 + icon_shift,
+                    };
+                    let y = ty - fs / 2.0;
+                    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+                    for (g, (_, c)) in galleys.into_iter().zip(fonts.iter()) {
+                        let w = g.size().x;
+                        clipped.galley(egui::pos2(x, y), g, *c);
+                        x += w;
+                    }
+                } else if multiline {
                     let max_w = (rect.width() - 8.0).max(8.0);
                     let galley = painter.layout(txt.clone(), font.clone(), color, max_w);
                     let h = galley.size().y;
@@ -7189,6 +7488,7 @@ impl SheetApp {
         let mut open = self.xlink_dlg;
         let mut do_refresh = false;
         let mut forget: Option<usize> = None;
+        let mut change: Option<usize> = None;
         ui_kit::window(ctx, "外部链接", 460.0)
             .open(&mut open)
             .resizable(true)
@@ -7200,11 +7500,12 @@ impl SheetApp {
                 } else {
                     egui::Grid::new("xlink_grid")
                         .striped(true)
-                        .num_columns(4)
+                        .num_columns(5)
                         .show(ui, |ui| {
                             ui.strong("文件");
                             ui.strong("表");
                             ui.strong("缓存");
+                            ui.strong("源文件");
                             ui.strong("");
                             ui.end_row();
                             for (i, l) in self.wb.links.iter().enumerate() {
@@ -7220,6 +7521,9 @@ impl SheetApp {
                                     l.sheets.join("、")
                                 });
                                 ui.label(format!("{} 格", l.cache.len()));
+                                if ui.small_button("更改源…").clicked() {
+                                    change = Some(i);
+                                }
                                 if ui.small_button("断开").clicked() {
                                     forget = Some(i);
                                 }
@@ -7242,6 +7546,36 @@ impl SheetApp {
                 });
                 ui.weak("更新后保存，缓存值会写回文件；别人打开时即使不更新链接也看到新数字。");
             });
+        if let Some(i) = change {
+            if i < self.wb.links.len() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Excel 工作簿", &["xlsx", "xlsm", "xls"])
+                    .pick_file()
+                {
+                    let newp = p.to_string_lossy().replace('\\', "/");
+                    {
+                        let l = &mut self.wb.links[i];
+                        l.target = newp.clone();
+                        l.abs = Some(newp);
+                        l.cache.clear();
+                        l.refreshed = false;
+                    }
+                    let rep = sheetcore::xlinks::refresh(&mut self.wb);
+                    sheetcore::formula::recalc_all(&mut self.wb);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.status = if rep.failed.is_empty() {
+                        format!("已更改源并更新 {} 个链接", rep.ok)
+                    } else {
+                        format!(
+                            "改源后仍有 {} 个失败：{}",
+                            rep.failed.len(),
+                            rep.failed.iter().map(|(n, e)| format!("{n}（{e}）")).collect::<Vec<_>>().join("，")
+                        )
+                    };
+                }
+            }
+        }
         if let Some(i) = forget {
             if i < self.wb.links.len() {
                 let name = sheetcore::xlinks::label(&self.wb.links[i]);
@@ -8035,6 +8369,7 @@ impl SheetApp {
                 .map(|(_, n)| n.clone())
                 .unwrap_or_default()
         };
+        let mut excl_text = spec.exclude.join(",");
         ui_kit::window(ctx, "数据透视表", 300.0)
             .collapsible(false)
             .resizable(false)
@@ -8111,6 +8446,40 @@ impl SheetApp {
                         });
                     ui.end_row();
 
+                    ui.label("分组");
+                    egui::ComboBox::from_id_salt("pivot_group")
+                        .selected_text(spec.group.label())
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(spec.group == sheetcore::pivot::GroupBy::None, "不分组").clicked() {
+                                spec.group = sheetcore::pivot::GroupBy::None;
+                            }
+                            if ui.selectable_label(spec.group == sheetcore::pivot::GroupBy::Year, "按年").clicked() {
+                                spec.group = sheetcore::pivot::GroupBy::Year;
+                            }
+                            if ui.selectable_label(spec.group == sheetcore::pivot::GroupBy::Month, "按月").clicked() {
+                                spec.group = sheetcore::pivot::GroupBy::Month;
+                            }
+                            let is_bucket = matches!(spec.group, sheetcore::pivot::GroupBy::Bucket(_));
+                            if ui.selectable_label(is_bucket, "按数值区间").clicked() && !is_bucket {
+                                spec.group = sheetcore::pivot::GroupBy::Bucket(100.0);
+                            }
+                        });
+                    ui.end_row();
+
+                    if let sheetcore::pivot::GroupBy::Bucket(w) = &mut spec.group {
+                        ui.label("区间宽度");
+                        ui.add(egui::DragValue::new(w).speed(1.0).range(0.1..=1e9));
+                        ui.end_row();
+                    }
+
+                    ui.label("排除值");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut excl_text)
+                            .hint_text("逗号分隔，如 华北,2024-01")
+                            .desired_width(180.0),
+                    );
+                    ui.end_row();
+
                     ui.checkbox(&mut self.pivot_real, "生成可刷新的透视表");
                     ui.end_row();
                     ui.label("");
@@ -8137,13 +8506,59 @@ impl SheetApp {
                 });
             });
         if apply {
+            spec.exclude = excl_text
+                .split([',', '，'])
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
             self.generate_pivot(&spec);
         } else if !cancel && open {
             self.pivot_edit = Some(spec);
         }
     }
 
-    fn generate_pivot(&mut self, spec: &sheetcore::pivot::PivotSpec) {
+    /// 刷新最近生成的透视表（清掉旧结果再按当前数据重算）
+    fn refresh_pivot(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let Some((si, spec, rect)) = self.pivot_last.clone() else {
+            self.status = "还没有生成过透视表".into();
+            return;
+        };
+        if rect.0 == 0 && rect.2 == 0 && rect.1 == 0 && rect.3 == 0 {
+            self.status = "透视表位置已失效，请重新生成".into();
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(si);
+            for r in rect.0..=rect.2 {
+                for c in rect.1..=rect.3 {
+                    sh.remove(r, c);
+                }
+            }
+        }
+        let res = sheetcore::pivot::compute(self.wb.sheet(si), &spec);
+        let nrect = sheetcore::pivot::write_to(self.wb.sheet_mut(si), (rect.0, rect.1), &res);
+        if let Some(p) = self
+            .wb
+            .pivots_pending
+            .iter_mut()
+            .find(|(s, _, _, r, _)| *s == si && *r == rect)
+        {
+            p.2 = res.clone();
+            p.3 = nrect;
+        }
+        self.pivot_last = Some((si, spec, nrect));
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "透视表已刷新：{} 行 × {} 列",
+            nrect.2 - nrect.0 + 1,
+            nrect.3 - nrect.1 + 1
+        );
+    }
+        fn generate_pivot(&mut self, spec: &sheetcore::pivot::PivotSpec) {
         let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), spec);
         let at = self.sel;
         let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
@@ -8156,6 +8571,7 @@ impl SheetApp {
             // leaving the newly-created attachment in a different coordinate space.
             self.undo.clear();
         }
+        self.pivot_last = Some((self.sheet_idx, spec.clone(), rect));
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!(
@@ -8351,6 +8767,7 @@ impl SheetApp {
         const PAGE_GAP: f32 = 26.0;
         const PAGE_PAD: f32 = 18.0;
         let mut pg: Option<PageGeo> = None;
+        self.paint_scale = 1.0;
         if page_mode {
             let sh = self.wb.sheet(self.sheet_idx);
             if let Some((pr1, pc1, _, _)) = sh.page.print_area.or_else(|| sh.used_bounds()) {
@@ -8369,9 +8786,13 @@ impl SheetApp {
                         ps.margins[3] * 96.0,
                     )
                 };
-                let paper_w = content_w + ml + mr;
-                let paper_h = content_h + mt + mb;
+                // 纸张尺寸按 100% 的可打印区 + 页边距；content_w/h 是能放进一页的内容量
+                let paper_w = pw_print + ml + mr;
+                let paper_h = ph_print + mt + mb;
                 let (bx, by) = sheetcore::page::page_breaks(sh);
+                // 分页位置是内容坐标；画到纸面上要乘缩放比例
+                let bx: Vec<f32> = bx.iter().map(|v| v * scale).collect();
+                let by: Vec<f32> = by.iter().map(|v| v * scale).collect();
                 let pages_x = bx.len() + 1;
                 let pages_y = by.len() + 1;
                 let total_w =
@@ -8399,7 +8820,9 @@ impl SheetApp {
                     total_h,
                     header: ps.header.clone(),
                     footer: ps.footer.clone(),
+                    scale,
                 });
+                self.paint_scale = scale;
             }
         }
         let max_x = match &pg {
@@ -8466,14 +8889,20 @@ impl SheetApp {
         }
         let gx = |c: u32| match &pg {
             Some(g) => {
-                body_x + PAGE_PAD + g.ml + pg_map(cols.pos(c) - g.origin_x, &g.bx, g.paper_w)
+                body_x
+                    + PAGE_PAD
+                    + g.ml
+                    + pg_map((cols.pos(c) - g.origin_x) * g.scale, &g.bx, g.paper_w)
                     - off_x
             }
             None => body_x + cols.pos(c) - off_x,
         };
         let gy = |r: u32| match &pg {
             Some(g) => {
-                body_y + PAGE_PAD + g.mt + pg_map(rows.pos(r) - g.origin_y, &g.by, g.paper_h)
+                body_y
+                    + PAGE_PAD
+                    + g.mt
+                    + pg_map((rows.pos(r) - g.origin_y) * g.scale, &g.by, g.paper_h)
                     - off_y
             }
             None => body_y + rows.pos(r) - off_y,
@@ -11408,6 +11837,7 @@ impl eframe::App for SheetApp {
         }
         self.rename_dialog(ctx);
         self.format_dialog(ctx);
+        self.rich_dialog(ctx);
         self.protect_dialog(ctx);
         self.size_dialog(ctx);
         self.color_popup_window(ctx);

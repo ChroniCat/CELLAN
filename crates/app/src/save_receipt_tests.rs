@@ -19,6 +19,8 @@ fn saving_during_pivot_replacement_preserves_only_the_live_pending_attachment() 
     let spec = sheetcore::pivot::PivotSpec {
         source: (0, 0, 1, 1), row_field: 0, col_field: None,
         value_field: 1, agg: sheetcore::pivot::Agg::Sum,
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
     };
     let queue = |wb: &mut Workbook| {
         let result = sheetcore::pivot::compute(&wb.sheets[0], &spec);

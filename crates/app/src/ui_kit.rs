@@ -147,7 +147,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 }
 
 /// 一个功能区小组：内容 + 底部组名；组间是一条竖细线（Excel 无外框）
-pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) -> Rect {
     let first = GROUP_FIRST.with(|c| c.replace(false));
     if !first {
         ui.add_space(5.0);
@@ -193,6 +193,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         })
         .response;
     // 布局自证：SC_UI_LOG=1 时打出每个分组框的几何
+    let group_rect = out.rect;
     if std::env::var("SC_UI_LOG").is_ok() {
         let r = out.rect;
         eprintln!(
@@ -205,8 +206,53 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         );
     }
     ui.add_space(2.0);
+    group_rect
 }
 
+/// 分组的“对话框启动器”：Excel 在分组右下角的斜箭头
+pub fn launcher_at(ui: &mut egui::Ui, group_rect: Rect, id: &str) -> bool {
+    let size = Vec2::new(12.0, 12.0);
+    let rect = Rect::from_min_size(
+        egui::pos2(group_rect.right() - size.x - 1.0, group_rect.bottom() - size.y - 1.0),
+        size,
+    );
+    let resp = ui.interact(rect, egui::Id::new(("grp_launch", id)), Sense::click());
+    let c = if resp.hovered() {
+        ACCENT
+    } else {
+        Color32::from_rgb(120, 120, 120)
+    };
+    let p = ui.painter();
+    let st = Stroke::new(1.0, c);
+    p.line_segment(
+        [
+            egui::pos2(rect.left() + 3.0, rect.bottom() - 3.0),
+            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+        ],
+        st,
+    );
+    p.line_segment(
+        [
+            egui::pos2(rect.right() - 6.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+        ],
+        st,
+    );
+    p.line_segment(
+        [
+            egui::pos2(rect.right() - 3.0, rect.top() + 6.0),
+            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+        ],
+        st,
+    );
+    resp.clicked()
+}
+
+/// 带对话框启动器的分组
+pub fn group_l(ui: &mut egui::Ui, title: &str, id: &str, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    let r = group(ui, title, add);
+    launcher_at(ui, r, id)
+}
 /// 图标在上、文字在下的大按钮（粘贴、图表这种）。Excel：42×76，图标 32
 pub fn big(ui: &mut egui::Ui, icon: Icon, label: &str) -> Response {
     big_sized(ui, icon, label, Vec2::new(42.0, 76.0))

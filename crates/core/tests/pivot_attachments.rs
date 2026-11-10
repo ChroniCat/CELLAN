@@ -52,7 +52,7 @@ fn book(path: &Path) -> Workbook {
     wb
 }
 fn attach(path: &Path, wb: &Workbook, sheet: usize, row: u32) -> u32 {
-    let spec = PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum };
+    let spec = PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
     pivot_xml::attach(path, &wb.sheets[sheet].name, &spec, &sheetcore::pivot::compute(&wb.sheets[sheet], &spec), (row, 0, row + 4, 1), "Sum").unwrap()
 }
 
@@ -229,7 +229,7 @@ fn imported_cache_ids_part_numbers_and_table_names_are_independent() {
 #[test]
 fn invalid_attachment_fails_before_mutating_the_package() {
     let f = Fixture::new(); let path = f.file(); let wb = book(&path);
-    let mut spec = PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum };
+    let mut spec = PivotSpec { source: (0, 0, 3, 1), row_field: 0, col_field: None, value_field: 1, agg: Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: Vec::new() };
     let res = sheetcore::pivot::compute(&wb.sheets[0], &spec);
     let before = std::fs::read(&path).unwrap();
     assert!(pivot_xml::attach(&path, "Missing", &spec, &res, (6, 0, 10, 1), "Sum").is_err());

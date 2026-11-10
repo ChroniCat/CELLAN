@@ -168,6 +168,10 @@ pub struct Sheet {
     pub protection: Option<crate::protection::SheetProtection>,
     /// 保护状态被改过
     pub protect_dirty: bool,
+    /// 单元格富文本（有记录时优先于纯文本绘制）
+    pub rich: std::collections::HashMap<(u32, u32), Vec<crate::richtext::RichRun>>,
+    /// 富文本被改过
+    pub rich_dirty: bool,
 }
 
 impl Sheet {
@@ -214,6 +218,8 @@ impl Sheet {
             tables_dirty: false,
             protection: None,
             protect_dirty: false,
+            rich: std::collections::HashMap::new(),
+            rich_dirty: false,
         }
     }
 

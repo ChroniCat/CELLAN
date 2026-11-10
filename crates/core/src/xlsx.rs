@@ -493,7 +493,22 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    // inlineStr 富文本（我们写出的文件；Excel 的 sharedStrings 富文本仍是纯文本）
     if is_ooxml {
+        if let Ok(targets) = crate::patch::sheet_targets(path) {
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(part) = targets.get(&sheet.name) {
+                    if let Some(bytes) = crate::fixups::read_part_file(path, part) {
+                        if let Ok(xml) = String::from_utf8(bytes) {
+                            let rich = crate::richtext::inline_cells(&xml);
+                            if !rich.is_empty() {
+                                sheet.rich = rich;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
             definitions: pivot_definitions(path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
@@ -514,6 +529,9 @@ fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
 #[derive(Debug, Default)]
 pub struct SaveReceipt {
     sheets: Vec<(u64, String)>,
+    /// 保存时已经把图表的引用改写落盘，回执应用后要清空写回日志，
+    /// 否则下一次保存会拿同一批 (旧→新) 再改一遍（撤销后再保存就会来回跳）。
+    committed_charts: bool,
 }
 
 struct RestoreFile(Option<std::path::PathBuf>);
@@ -528,6 +546,12 @@ impl SaveReceipt {
         for sheet in &mut wb.sheets {
             if let Some((_, part)) = self.sheets.iter().find(|(id, _)| *id == sheet.identity) {
                 sheet.source_part = Some(part.clone());
+            }
+            if self.committed_charts && sheet.charts_dirty {
+                for ch in sheet.charts.iter_mut() {
+                    ch.ref_fixes.clear();
+                }
+                sheet.charts_dirty = false;
             }
         }
     }
@@ -546,7 +570,10 @@ pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceip
             .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
         Ok((sheet.identity, part.clone()))
     }).collect::<Result<Vec<_>>>()?;
-    Ok(SaveReceipt { sheets })
+    Ok(SaveReceipt {
+        sheets,
+        committed_charts: wb.sheets.iter().any(|s| s.charts_dirty),
+    })
 }
 
 /// 写回 xlsx。文件已存在时先读入，以保留样式、列宽等未改动的部分。
@@ -1141,6 +1168,12 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     }
     if let Err(e) = crate::patch::apply_protection(path, wb) {
         eprintln!("[save] 工作表保护写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_rich(path, wb) {
+        eprintln!("[save] 富文本写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_page_setup(path, wb) {
+        eprintln!("[save] 页面设置写回失败: {e:#}");
     }
     // 表格对象：删除/转换/新建后同步 table 部件
     for sheet in &wb.sheets {
