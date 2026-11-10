@@ -29,10 +29,13 @@ use sheetcore::{cell_name, col_label, Cell, Value, Workbook};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const ROW_H: f32 = 22.0;
-const COL_W: f32 = 104.0;
-const HEAD_W: f32 = 52.0;
-const HEAD_H: f32 = 22.0;
+const ROW_H: f32 = 19.0;
+const COL_W: f32 = 72.0;
+/// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
+const HEAD_W: f32 = 29.0;
+const HEAD_H: f32 = 19.0;
+/// 滚动条厚度（Excel 17）
+const SB: f32 = 17.0;
 
 /// 不区分大小写地把 needle 换成 repl（保留原文其余部分）
 fn replace_ignore_case(hay: &str, needle: &str, repl: &str, case_sensitive: bool) -> String {
@@ -103,6 +106,58 @@ struct FmtState {
 #[derive(Default, Clone)]
 struct EditState {
     buf: String,
+}
+
+/// 去掉页眉页脚里的 OOXML 控制码（&L/&C/&R/&B 等），只留文字
+fn strip_hf(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.peek() {
+                Some('"') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if c2 == '"' {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => out.push('&'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 页面布局视图的几何：页纸尺寸、页间距、内容原点
+#[derive(Clone)]
+struct PageGeo {
+    bx: Vec<f32>,
+    by: Vec<f32>,
+    paper_w: f32,
+    paper_h: f32,
+    ml: f32,
+    mr: f32,
+    mt: f32,
+    mb: f32,
+    content_w: f32,
+    content_h: f32,
+    origin_x: f32,
+    origin_y: f32,
+    area_r1: u32,
+    area_c1: u32,
+    pages_x: usize,
+    pages_y: usize,
+    total_w: f32,
+    total_h: f32,
+    header: String,
+    footer: String,
 }
 
 struct SheetApp {
@@ -204,6 +259,43 @@ struct SheetApp {
     zoom: f32,
     /// 功能区当前页签：0 文件 1 开始 2 插入 3 公式 4 数据 5 视图
     ribbon_tab: usize,
+    /// 格式刷：点击目标格后套用这份样式
+    format_painter: Option<sheetcore::style::CellStyle>,
+    /// 颜色面板：Some(true)=字体颜色 Some(false)=填充颜色
+    color_popup: Option<bool>,
+    /// 编辑栏展开（Excel 右侧那个小箭头）
+    fx_expanded: bool,
+    /// Alt 键提示（KeyTips）：按 Alt 后页签上出现字母
+    keytips: bool,
+    /// Alt 上一次的按下状态（egui 没有单独的 Alt 键事件）
+    alt_down: bool,
+    /// 视图选项：网格线 / 标题 / 编辑栏
+    show_gridlines: bool,
+    show_headings: bool,
+    show_formula_bar: bool,
+    /// 工作表标签条的横向滚动量
+    tab_scroll: f32,
+    /// 拖表头边界改列宽：(列, 按下时的鼠标 x, 按下时的宽度)
+    col_drag: Option<(u32, f32, f32)>,
+    /// 拖行号下边界改行高：(行, 按下时的鼠标 y, 按下时的高度)
+    row_drag: Option<(u32, f32, f32)>,
+    /// 功能区收起（Ctrl+F1 / 双击页签）
+    ribbon_collapsed: bool,
+    /// 名称框下拉（定义名称列表）
+    name_dropdown: bool,
+    /// 表头右键菜单：(0=列 1=行, 索引, 屏幕位置)
+    head_menu: Option<(u8, u32, egui::Pos2)>,
+    /// 选中的图表（图表工具上下文页签）
+    chart_sel: Option<usize>,
+    /// 工作簿视图：0 普通 1 页面布局 2 分页预览
+    view_mode: u8,
+    /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
+    chart_auto: bool,
+    /// 列宽/行高对话框：(true=列, 当前值)
+    size_dlg: Option<(bool, f32)>,
+    /// 文件后台视图（Excel 的「文件」页）
+    backstage: bool,
+    backstage_page: u8,
     /// 单元格格式对话框
     fmt_dlg: bool,
     fmt_state: FmtState,
@@ -417,13 +509,36 @@ impl SheetApp {
             clip: None,
             find: FindState::default(),
             zoom: 1.0,
-            ribbon_tab: 1,
+            ribbon_tab: std::env::var("SC_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            format_painter: None,
+            color_popup: None,
+            fx_expanded: false,
+            keytips: std::env::var("SC_KEYTIPS").is_ok(),
+            alt_down: false,
+            show_gridlines: std::env::var("SC_VIEW_OFF").is_err(),
+            show_headings: std::env::var("SC_VIEW_OFF").is_err(),
+            show_formula_bar: true,
+            ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
+            name_dropdown: false,
+            head_menu: None,
+            chart_sel: None,
+            view_mode: std::env::var("SC_VIEW_MODE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            chart_auto: std::env::var("SC_CHART").is_ok(),
+            size_dlg: None,
+            tab_scroll: 0.0,
+            col_drag: None,
+            row_drag: None,
+            backstage: std::env::var("SC_BACKSTAGE").is_ok(),
+            backstage_page: 0,
             fmt_dlg: false,
             fmt_state: FmtState::default(),
             xlink_dlg: false,
             rev: Vec::new(),
             rev_open: false,
-            tree_open: true,
+            tree_open: false,
             shot_path: std::env::var("SC_SHOT").ok().map(PathBuf::from),
             shot_frames: 0,
             tab_drag: None,
@@ -1771,10 +1886,41 @@ impl SheetApp {
             width = width.max(w + 12.0);
         }
         let width = width.clamp(24.0, 400.0);
-        self.wb.sheet_mut(self.sheet_idx).cols.set(col, width);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.cols.set(col, width);
+            sh.layout_dirty = true;
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("{} 列宽已自适应：{:.0}px", cell_name(0, col).trim_end_matches('1'), width);
+    }
+
+    /// 按内容自适应行高（自动换行时按折行数算）
+    fn autofit_row(&mut self, row: u32) {
+        let sheet = self.wb.sheet(self.sheet_idx);
+        let (_, c1, _, c2) = sheet.used_bounds().unwrap_or((0, 0, 0, 0));
+        let mut lines = 1usize;
+        for c in c1..=c2 {
+            let Some(cell) = sheet.get(row, c) else { continue };
+            let txt = cell.value.display();
+            if txt.is_empty() {
+                continue;
+            }
+            let st = self.wb.styles.get(sheet.style_of(row, c));
+            let char_w = (st.size * 0.62).max(4.0);
+            let per_line = (((sheet.cols.size(c) - 8.0) / char_w).floor() as usize).max(1);
+            lines = lines.max((txt.chars().count() + per_line - 1) / per_line);
+        }
+        let h = (lines as f32 * 14.0 + 5.0).clamp(15.0, 409.0);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.rows.set(row, h);
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("第 {} 行行高已自适应：{:.0}px", row + 1, h);
     }
 
     // ===== 数据工具 =====
@@ -2463,7 +2609,11 @@ impl SheetApp {
             header_row: true,
             totals_row: false,
         };
-        self.wb.sheet_mut(self.sheet_idx).tables.push(t);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.tables.push(t);
+            sh.tables_dirty = true;
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已创建表格 {}（{}）", name, sheetcore::table::a1((r1, c1, r2, c2)));
@@ -3331,17 +3481,7 @@ impl SheetApp {
     /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
     fn ensure_visible(&mut self) {
         let (r, c) = self.sel;
-        let (cols, mut rows) = {
-            let s = self.wb.sheet(self.sheet_idx);
-            (s.cols.clone(), s.rows.clone())
-        };
-        // 被筛选隐藏的行 = 行高 0（和 Excel 一样，不是删数据）
-        {
-            let s = self.wb.sheet(self.sheet_idx);
-            for r in s.hidden_rows.iter() {
-                rows.set(*r, 0.0);
-            }
-        }
+        let (cols, mut rows) = self.view_axes();
         let view_w = (self.last_view.x - HEAD_W).max(64.0);
         let view_h = (self.last_view.y - HEAD_H).max(44.0);
         let top = rows.pos(r);
@@ -3362,6 +3502,11 @@ impl SheetApp {
 
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Ctrl+F1：和 Excel 一样收起/展开功能区
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
+            self.ribbon_collapsed = !self.ribbon_collapsed;
+        }
+
         if self.editing.is_some() {
             // 编辑框内的按键交给 TextEdit 自己处理
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -3369,6 +3514,48 @@ impl SheetApp {
                 self.release_lock();
             }
             return;
+        }
+
+        // Alt：显示页签字母提示（KeyTips），再按字母切换页签
+        let alt_now = ctx.input(|i| i.modifiers.alt);
+        if alt_now && !self.alt_down {
+            self.keytips = true;
+        }
+        self.alt_down = alt_now;
+        if self.keytips {
+            let chosen = ctx.input(|i| {
+                let m = i.modifiers;
+                if m.alt || m.command || m.shift {
+                    return None;
+                }
+                for (k, idx) in [
+                    (Key::F, 0usize),
+                    (Key::H, 1),
+                    (Key::N, 2),
+                    (Key::P, 3),
+                    (Key::M, 4),
+                    (Key::A, 5),
+                    (Key::R, 6),
+                    (Key::W, 7),
+                ] {
+                    if i.key_pressed(k) {
+                        return Some(idx);
+                    }
+                }
+                None
+            });
+            if let Some(idx) = chosen {
+                self.keytips = false;
+                if idx == 0 {
+                    self.backstage = true;
+                    self.backstage_page = 0;
+                } else {
+                    self.ribbon_tab = idx;
+                    self.ribbon_collapsed = false;
+                }
+            } else if ctx.input(|i| i.key_pressed(Key::Escape) || i.pointer.any_click()) {
+                self.keytips = false;
+            }
         }
         let (redo_key, undo_key) = ctx.input(|i| {
             (
@@ -3561,6 +3748,192 @@ impl SheetApp {
     }
 
     /// 选区左上角的样式（工具栏按钮显示当前状态）
+    /// 小数位 +1/−1：把当前区域的小数格式改成 n±1 位
+    fn decimals(&mut self, delta: i32) {
+        let cur = self.current_style();
+        let mut f = if cur.format.is_empty() {
+            "#,##0".to_string()
+        } else {
+            cur.format.clone()
+        };
+        let chars: Vec<char> = f.chars().collect();
+        if let Some(dot) = chars.iter().position(|c| *c == '.') {
+            let mut end = dot + 1;
+            while end < chars.len() && (chars[end] == '0' || chars[end] == '#') {
+                end += 1;
+            }
+            if delta > 0 {
+                f.insert(end, '0');
+            } else if end > dot + 1 {
+                f.remove(end - 1);
+            } else {
+                return;
+            }
+        } else if delta > 0 {
+            f.push_str(".0");
+        } else {
+            return;
+        }
+        self.apply_style(move |s| s.format = f.clone());
+    }
+
+    /// 自动求和：当前格上方连续数字 → =SUM(首:末)
+    fn auto_sum(&mut self) {
+        let (r, c) = self.sel;
+        let sheet = self.wb.sheet(self.sheet_idx);
+        let mut top = r;
+        while top > 0 {
+            let nonblank = sheet
+                .get(top - 1, c)
+                .map(|x| !x.is_blank())
+                .unwrap_or(false);
+            if nonblank {
+                top -= 1;
+            } else {
+                break;
+            }
+        }
+        let formula = if top < r {
+            format!("=SUM({}:{})", cell_name(top, c), cell_name(r - 1, c))
+        } else {
+            "=SUM(".to_string()
+        };
+        self.begin_edit(None);
+        if let Some(ed) = self.editing.as_mut() {
+            ed.buf = formula;
+        }
+        self.commit_edit(Some((1, 0)));
+    }
+
+    /// 填充：把选区第一行复制到其余行（值、公式、样式）
+    fn fill_down(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if r2 <= r1 {
+            self.status = "先选两行以上再填充".into();
+            return;
+        }
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
+        for cc in c1..=c2 {
+            let src = self.wb.sheet(self.sheet_idx).get(r1, cc).cloned();
+            let style_id = self.wb.sheet(self.sheet_idx).style_of(r1, cc);
+            for rr in r1 + 1..=r2 {
+                match &src {
+                    Some(cell) => {
+                        self.wb.sheet_mut(self.sheet_idx).set(rr, cc, cell.clone());
+                    }
+                    None => {
+                        self.wb.sheet_mut(self.sheet_idx).remove(rr, cc);
+                    }
+                }
+                self.wb.sheet_mut(self.sheet_idx).set_style(rr, cc, style_id);
+            }
+        }
+        self.txn_end("填充", txn);
+        self.status = "已向下填充".into();
+    }
+
+    /// 清除内容（保留格式，和 Excel「清除内容」一致）
+    fn clear_selection(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                self.wb.sheet_mut(self.sheet_idx).remove(r, c);
+            }
+        }
+        self.txn_end("清除内容", txn);
+        self.status = "已清除内容".into();
+    }
+
+    /// 字体/填充颜色面板（Excel 的主题色 + 标准色）
+    fn color_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(for_font) = self.color_popup else { return };
+        let title = if for_font { "字体颜色" } else { "填充颜色" };
+        let mut open = true;
+        let mut pick: Option<Color32> = None;
+        let mut clear_fill = false;
+        egui::Window::new(title)
+            .id(egui::Id::new("color_popup"))
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(ctx.screen_rect().center() - egui::vec2(90.0, 120.0))
+            .show(ctx, |ui| {
+                let colors: [u32; 20] = [
+                    0xFFFFFF, 0x000000, 0xE7E6E6, 0x44546A, 0x4472C4,
+                    0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47,
+                    0x255E91, 0x9E480E, 0x636363, 0x997300, 0x264478,
+                    0x43682B, 0xFF0000, 0xFFC0CB, 0xFFD700, 0x00B050,
+                ];
+                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                for row in 0..4 {
+                    ui.horizontal(|ui| {
+                        for col in 0..5 {
+                            let hex = colors[row * 5 + col];
+                            let c = Color32::from_rgb(
+                                ((hex >> 16) & 0xFF) as u8,
+                                ((hex >> 8) & 0xFF) as u8,
+                                (hex & 0xFF) as u8,
+                            );
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(24.0, 20.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 2.0, c);
+                            ui.painter().rect_stroke(
+                                rect,
+                                2.0,
+                                egui::Stroke::new(1.0, Color32::from_rgb(190, 190, 190)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if resp.clicked() {
+                                pick = Some(c);
+                            }
+                        }
+                    });
+                }
+                ui.add_space(2.0);
+                ui.separator();
+                if !for_font && ui.button("无填充颜色").clicked() {
+                    clear_fill = true;
+                }
+                if ui.button("更多颜色…").clicked() {
+                    // 简易取色：打开系统色板
+                    let mut c = if for_font {
+                        Color32::from_rgb(
+                            self.current_style().color[0],
+                            self.current_style().color[1],
+                            self.current_style().color[2],
+                        )
+                    } else {
+                        let f = self.current_style().fill.unwrap_or([255, 255, 255]);
+                        Color32::from_rgb(f[0], f[1], f[2])
+                    };
+                    if ui.color_edit_button_srgba(&mut c).changed() {
+                        pick = Some(c);
+                    }
+                }
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if let Some(c) = pick {
+            let rgb = [c.r(), c.g(), c.b()];
+            if for_font {
+                self.apply_style(move |s| s.color = rgb);
+            } else {
+                self.apply_style(move |s| s.fill = Some(rgb));
+            }
+            open = false;
+        }
+        if clear_fill {
+            self.apply_style(|s| s.fill = None);
+            open = false;
+        }
+        if !open {
+            self.color_popup = None;
+        }
+    }
+
     fn current_style(&self) -> sheetcore::style::CellStyle {
         let id = self.wb.sheet(self.sheet_idx).style_of(self.sel.0, self.sel.1);
         self.wb.styles.get(id).clone()
@@ -3641,6 +4014,337 @@ impl SheetApp {
     /// 格式工具栏（第二行）
     // ===== 功能区（Excel 式分组）=====
 
+    /// Excel 的「文件」后台视图：左侧一列导航，右侧整块内容。
+    /// 打开时盖住功能区和表格，标题栏保留。
+    /// 列宽/行高对话框（表头右键 → 列宽…/行高…）
+    fn size_dialog(&mut self, ctx: &egui::Context) {
+        let Some((is_col, mut value)) = self.size_dlg else { return };
+        let mut open = true;
+        let mut apply = false;
+        let title = if is_col { "列宽" } else { "行高" };
+        ui_kit::window(ctx, title, 260.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui_kit::field(ui, "像素", |ui| {
+                let range = if is_col { 8.0..=1500.0 } else { 4.0..=409.0 };
+                ui.add(
+                    egui::DragValue::new(&mut value)
+                        .speed(1.0)
+                        .range(range)
+                        .fixed_decimals(0),
+                );
+            });
+            ui_kit::footer(ui, |ui| {
+                if ui_kit::primary_button(ui, "确定").clicked() {
+                    apply = true;
+                }
+                if ui.button("取消").clicked() {
+                    open = false;
+                }
+            });
+        });
+        if apply {
+            let (r1, c1, r2, c2) = self.sel_rect();
+            if is_col {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for c in c1..=c2 {
+                    sh.cols.set(c, value);
+                }
+                sh.layout_dirty = true;
+                self.status = format!("列宽 {:.0} 像素", value);
+            } else {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for r in r1..=r2 {
+                    sh.rows.set(r, value);
+                }
+                sh.layout_dirty = true;
+                self.status = format!("行高 {:.0} 像素", value);
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            open = false;
+        }
+        if !open {
+            self.size_dlg = None;
+        }
+    }
+
+    fn backstage_ui(&mut self, ctx: &egui::Context) {
+        if !self.backstage {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let top = ui_kit::TITLE_H;
+        let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut action: Option<u8> = None;
+        egui::Area::new(egui::Id::new("backstage"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(screen.left(), top))
+            .show(ctx, |ui| {
+                let h = (screen.height() - top).max(100.0);
+                ui.set_min_size(Vec2::new(screen.width(), h));
+                let full = Rect::from_min_size(ui.min_rect().min, Vec2::new(screen.width(), h));
+                ui.painter().rect_filled(full, 0.0, Color32::WHITE);
+                let _block = ui.interact(full, egui::Id::new("bs_block"), Sense::click());
+                let nav = Rect::from_min_size(full.min, Vec2::new(240.0, h));
+                ui.painter()
+                    .rect_filled(nav, 0.0, Color32::from_rgb(243, 243, 243));
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(nav.right(), nav.top()),
+                        egui::pos2(nav.right() + 1.0, nav.bottom()),
+                    ),
+                    0.0,
+                    ui_kit::BORDER,
+                );
+                // 返回箭头
+                let back = Rect::from_min_size(nav.min + Vec2::new(10.0, 10.0), Vec2::splat(32.0));
+                let bresp = ui.interact(back, egui::Id::new("bs_back"), Sense::click());
+                if bresp.hovered() {
+                    ui.painter().rect_filled(back, 3.0, Color32::from_rgb(229, 229, 229));
+                }
+                let bc = back.center();
+                let st = egui::Stroke::new(1.4, ui_kit::TEXT);
+                ui.painter()
+                    .line_segment([egui::pos2(bc.x + 5.0, bc.y - 5.0), egui::pos2(bc.x - 4.0, bc.y)], st);
+                ui.painter()
+                    .line_segment([egui::pos2(bc.x - 4.0, bc.y), egui::pos2(bc.x + 5.0, bc.y + 5.0)], st);
+                if bresp.on_hover_text("返回（Esc）").clicked() {
+                    close = true;
+                }
+                let items: [(&str, u8); 7] = [
+                    ("信息", 0),
+                    ("新建", 1),
+                    ("打开", 2),
+                    ("打印", 3),
+                    ("导出", 4),
+                    ("共享", 5),
+                    ("关闭", 6),
+                ];
+                let mut y = nav.top() + 60.0;
+                for (label, page) in items {
+                    let r = Rect::from_min_size(
+                        egui::pos2(nav.left() + 8.0, y),
+                        Vec2::new(nav.width() - 16.0, 36.0),
+                    );
+                    let resp = ui.interact(r, egui::Id::new(("bs_nav", page)), Sense::click());
+                    if self.backstage_page == page {
+                        ui.painter().rect_filled(r, 3.0, Color32::from_rgb(225, 225, 225));
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r, 3.0, Color32::from_rgb(235, 235, 235));
+                    }
+                    ui.painter().text(
+                        egui::pos2(r.left() + 12.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::proportional(13.0),
+                        ui_kit::TEXT,
+                    );
+                    if resp.clicked() {
+                        self.backstage_page = page;
+                    }
+                    y += 38.0;
+                }
+                // 内容区
+                let content = Rect::from_min_max(
+                    egui::pos2(nav.right() + 44.0, nav.top() + 40.0),
+                    egui::pos2(full.right() - 44.0, full.bottom() - 24.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(content)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 8.0);
+                        let name = self
+                            .wb
+                            .path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "未命名.xlsx".into());
+                        match self.backstage_page {
+                            0 => {
+                                ui.label(egui::RichText::new("信息").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new(&name).size(16.0).color(ui_kit::TEXT));
+                                let path = self
+                                    .wb
+                                    .path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "尚未保存（打开或保存后才有路径）".into());
+                                ui.label(egui::RichText::new(path).size(12.0).color(ui_kit::TEXT_WEAK));
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "工作表：{} 张    单元格：{} 个    外部链接：{}",
+                                        self.wb.sheets.len(),
+                                        self.wb.sheet(self.sheet_idx).len(),
+                                        self.wb.links.len()
+                                    ))
+                                    .size(12.0),
+                                );
+                                if let Some(p) = self.wb.path.clone() {
+                                    if let Ok(md) = std::fs::metadata(&p) {
+                                        let size = md.len() as f64 / 1024.0;
+                                        ui.label(
+                                            egui::RichText::new(format!("文件大小：{size:.1} KB"))
+                                                .size(12.0),
+                                        );
+                                    }
+                                }
+
+                            }
+                            1 => {
+                                ui.label(egui::RichText::new("新建").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(10.0);
+                                let tile = egui::vec2(190.0, 120.0);
+                                let (r, resp) = ui.allocate_exact_size(tile, Sense::click());
+                                ui.painter().rect_filled(r, 2.0, Color32::WHITE);
+                                ui.painter().rect_stroke(
+                                    r,
+                                    2.0,
+                                    Stroke::new(1.0, ui_kit::BORDER),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let g = Rect::from_center_size(
+                                    egui::pos2(r.center().x, r.top() + 34.0),
+                                    Vec2::splat(34.0),
+                                );
+                                ui_icons::draw_excel(ui.painter(), g, Icon::Sheet, ui_kit::ACCENT, true);
+                                ui.painter().text(
+                                    egui::pos2(r.center().x, r.bottom() - 26.0),
+                                    Align2::CENTER_CENTER,
+                                    "空白工作簿",
+                                    FontId::proportional(12.5),
+                                    ui_kit::TEXT,
+                                );
+                                if resp.clicked() {
+                                    action = Some(1);
+                                }
+                            }
+                            2 => {
+                                ui.label(egui::RichText::new("打开").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(6.0);
+                                if ui_kit::primary_button(ui, "浏览…").clicked() {
+                                    action = Some(2);
+                                }
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("最近使用的工作簿")
+                                        .size(12.5)
+                                        .color(ui_kit::TEXT_WEAK),
+                                );
+                                for p in recent::load().into_iter().take(8) {
+                                    let label = p
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let r = ui.allocate_exact_size(
+                                        Vec2::new(content.width().min(520.0), 26.0),
+                                        Sense::click(),
+                                    );
+                                    if r.1.hovered() {
+                                        ui.painter().rect_filled(r.0, 2.0, ui_kit::HOVER);
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(r.0.left() + 8.0, r.0.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &label,
+                                        FontId::proportional(12.0),
+                                        ui_kit::TEXT,
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(r.0.left() + 260.0, r.0.center().y),
+                                        Align2::LEFT_CENTER,
+                                        p.parent().map(|x| x.display().to_string()).unwrap_or_default(),
+                                        FontId::proportional(11.0),
+                                        ui_kit::TEXT_WEAK,
+                                    );
+                                    if r.1.clicked() {
+                                        self.open_path(p);
+                                        close = true;
+                                    }
+                                }
+                            }
+                            3 => {
+                                ui.label(egui::RichText::new("打印").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(10.0);
+                                if ui_kit::primary_button(ui, "打印预览").clicked() {
+                                    self.preview_page = 0;
+                                    self.print_preview = true;
+                                    close = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("先在预览里确认分页和缩放，再交给打印机。").size(12.0).color(ui_kit::TEXT_WEAK));
+                            }
+                            4 => {
+                                ui.label(egui::RichText::new("导出").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(10.0);
+                                if ui_kit::primary_button(ui, "创建 PDF").clicked() {
+                                    self.export_pdf_dialog();
+                                    close = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("把当前工作表按打印版式导出成 PDF。").size(12.0).color(ui_kit::TEXT_WEAK));
+                            }
+                            5 => {
+                                ui.label(egui::RichText::new("共享").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(10.0);
+                                if self.net.is_none() {
+                                    if ui_kit::primary_button(ui, "共享到局域网").clicked() {
+                                        self.start_host();
+                                        close = true;
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new("不经过服务器：同事通过共享盘或局域网直接连到这台机器。").size(12.0).color(ui_kit::TEXT_WEAK));
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!("已共享 · 在线 {} 人", self.peers_list.len()))
+                                            .size(13.0),
+                                    );
+                                    if ui_kit::primary_button(ui, "查看成员").clicked() {
+                                        self.members_open = true;
+                                    }
+                                }
+                            }
+                            _ => {
+                                ui.label(egui::RichText::new("关闭").size(26.0).color(ui_kit::TEXT));
+                                ui.add_space(10.0);
+                                if ui_kit::primary_button(ui, "关闭当前工作簿").clicked() {
+                                    action = Some(6);
+                                }
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("有未保存的改动时会先提示保存。").size(12.0).color(ui_kit::TEXT_WEAK));
+                            }
+                        }
+                    },
+                );
+            });
+        match action {
+            Some(1) => {
+                self.open_in_new_tab(PathBuf::new());
+                close = true;
+            }
+            Some(2) => {
+                self.open();
+                close = true;
+            }
+            Some(6) => {
+                let idx = self.active_tab;
+                self.close_tab(idx);
+                close = true;
+            }
+            _ => {}
+        }
+        if close {
+            self.backstage = false;
+            self.ribbon_tab = 1;
+        }
+    }
+
     fn ribbon_file(&mut self, ui: &mut egui::Ui) {
         ui_kit::group(ui, "文件", |ui| {
             if ui_kit::big(ui, Icon::Open, "打开").clicked() {
@@ -3653,17 +4357,16 @@ impl SheetApp {
                 self.save(true);
             }
         });
-
         ui_kit::group(ui, "打印", |ui| {
             if ui_kit::big(ui, Icon::Print, "打印预览").clicked() {
                 self.preview_page = 0;
                 self.print_preview = true;
             }
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "导出 PDF…", "把当前表导出成 PDF").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Print, "导出 PDF", 90.0, "把当前表导出成 PDF").clicked() {
                     self.export_pdf_dialog();
                 }
-                if ui_kit::pill(ui, "历史版本…", "从自动备份恢复").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Revision, "历史版本", 90.0, "从自动备份恢复").clicked() {
                     if let Some(p) = self.wb.path.clone() {
                         self.history_view = Some((p.clone(), sheetcore::backup::list(&p)));
                     } else {
@@ -3672,29 +4375,27 @@ impl SheetApp {
                 }
             });
         });
-
         ui_kit::group(ui, "编辑", |ui| {
             let (cu, cr) = (self.undo.can_undo(), self.undo.can_redo());
             ui.vertical(|ui| {
                 ui.add_enabled_ui(cu, |ui| {
-                    if ui_kit::small(ui, Icon::Undo, "撤销（Ctrl+Z）").clicked() {
+                    if ui_kit::labeled_w(ui, Icon::Undo, "撤销", 90.0, "撤销（Ctrl+Z）").clicked() {
                         self.do_undo(false);
                     }
                 });
                 ui.add_enabled_ui(cr, |ui| {
-                    if ui_kit::small(ui, Icon::Redo, "重做（Ctrl+Y）").clicked() {
+                    if ui_kit::labeled_w(ui, Icon::Redo, "重做", 90.0, "重做（Ctrl+Y）").clicked() {
                         self.do_undo(true);
                     }
                 });
             });
         });
-
         ui_kit::group(ui, "标签", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "新建标签", "开一个空白工作簿").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Plus, "新建标签", 110.0, "开一个空白工作簿").clicked() {
                     self.open_in_new_tab(PathBuf::new());
                 }
-                if ui_kit::pill(ui, "打开到新标签…", "").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Open, "打开到新标签", 110.0, "").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
                         .pick_file()
@@ -3702,13 +4403,12 @@ impl SheetApp {
                         self.open_in_new_tab(p);
                     }
                 }
-                if ui_kit::pill(ui, "关闭当前标签", "").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Close, "关闭当前标签", 110.0, "").clicked() {
                     let idx = self.active_tab;
                     self.close_tab(idx);
                 }
             });
         });
-
         ui_kit::group(ui, "协作", |ui| {
             if self.net.is_none() {
                 if ui_kit::big(ui, Icon::Share, "共享").on_hover_text("把当前文件共享到局域网").clicked() {
@@ -3727,7 +4427,7 @@ impl SheetApp {
                                 .desired_width(64.0)
                                 .password(true),
                         );
-                        if ui_kit::pill(ui, "加入", "加入同事共享的房间").clicked() {
+                        if ui_kit::labeled_w(ui, Icon::Link, "加入", 56.0, "加入同事共享的房间").clicked() {
                             self.join_shared();
                         }
                     });
@@ -3737,28 +4437,27 @@ impl SheetApp {
                     ui,
                     Icon::Share,
                     &format!("在线 {}", self.peers_list.len()),
-                    Vec2::new(66.0, 50.0),
+                    Vec2::new(66.0, 76.0),
                 );
                 if online.clicked() {
                     self.members_open = true;
                 }
                 if self.room_lost {
-                    if ui_kit::pill(ui, "接任宿主", "宿主已离线：用我手里这份继续开房间").clicked() {
+                    if ui_kit::labeled_w(ui, Icon::Refresh, "接任宿主", 90.0, "宿主已离线：用我手里这份继续开房间").clicked() {
                         self.promote_to_host();
                     }
                 }
             }
         });
-
         ui_kit::group(ui, "更多", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "检查更新…", "").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Refresh, "检查更新", 110.0, "").clicked() {
                     self.check_update();
                 }
-                if ui_kit::pill(ui, "加入“打开方式”", "注册 .xlsx/.xlsm（当前用户）").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Open, "加入“打开方式”", 130.0, "注册 .xlsx/.xlsm（当前用户）").clicked() {
                     self.register_file_association(false);
                 }
-                if ui_kit::pill(ui, "设为默认打开方式", "").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Save, "设为默认打开方式", 130.0, "").clicked() {
                     self.register_file_association(true);
                 }
             });
@@ -3774,11 +4473,15 @@ impl SheetApp {
                 self.clip_paste(false, None);
             }
             ui.vertical(|ui| {
-                if ui_kit::small(ui, Icon::Cut, "剪切（Ctrl+X）").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Cut, "剪切", 81.0, "剪切（Ctrl+X）").clicked() {
                     self.clip_copy(true, &ctx);
                 }
-                if ui_kit::small(ui, Icon::Copy, "复制（Ctrl+C）").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Copy, "复制", 81.0, "复制（Ctrl+C）").clicked() {
                     self.clip_copy(false, &ctx);
+                }
+                if ui_kit::labeled_w(ui, Icon::Brush, "格式刷", 81.0, "把当前单元格的格式复制到别处").clicked() {
+                    self.format_painter = Some(cur.clone());
+                    self.status = "格式刷：点击目标单元格".into();
                 }
             });
         });
@@ -3792,7 +4495,8 @@ impl SheetApp {
                         } else {
                             cur.font.clone()
                         })
-                        .width(112.0)
+                        .width(170.0)
+                        .height(24.0)
                         .show_ui(ui, |ui| {
                             for name in sheetcore::style::FONT_CHOICES {
                                 let label = if name.is_empty() { "默认" } else { *name };
@@ -3811,16 +4515,24 @@ impl SheetApp {
                                 }
                             }
                         });
-                    let mut size = cur.size;
-                    let w = ui.add_sized(
-                        [40.0, 20.0],
-                        egui::DragValue::new(&mut size)
-                            .speed(0.5)
-                            .range(6.0..=72.0)
-                            .fixed_decimals(0),
-                    );
-                    if w.changed() {
-                        self.apply_style(move |s| s.size = size);
+                    egui::ComboBox::from_id_salt("size_pick")
+                        .selected_text(format!("{:.0}", cur.size))
+                        .width(48.0)
+                        .height(24.0)
+                        .show_ui(ui, |ui| {
+                            for size in [9.0f32, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
+                                if ui.selectable_label((cur.size - size).abs() < 0.01, format!("{size:.0}")).clicked() {
+                                    self.apply_style(move |s| s.size = size);
+                                }
+                            }
+                        });
+                    if ui_kit::small(ui, Icon::FontGrow, "增大字号").clicked() {
+                        let s2 = (cur.size + 1.0).min(72.0);
+                        self.apply_style(move |s| s.size = s2);
+                    }
+                    if ui_kit::small(ui, Icon::FontShrink, "减小字号").clicked() {
+                        let s2 = (cur.size - 1.0).max(6.0);
+                        self.apply_style(move |s| s.size = s2);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -3833,30 +4545,24 @@ impl SheetApp {
                         self.apply_style(move |s| s.italic = v);
                     }
                     ui.add_space(2.0);
-                    let mut fg = cur.color;
-                    if ui
-                        .color_edit_button_srgb(&mut fg)
-                        .on_hover_text("字体颜色")
-                        .changed()
-                    {
-                        self.apply_style(move |s| s.color = fg);
+                    if ui_kit::small(ui, Icon::Border, "所有框线").clicked() {
+                        self.apply_style(|s| s.set_all_borders(1, [128, 128, 128]));
                     }
-                    let mut bg = cur.fill.unwrap_or([255, 255, 255]);
-                    if ui
-                        .color_edit_button_srgb(&mut bg)
-                        .on_hover_text("填充颜色")
-                        .changed()
-                    {
-                        self.apply_style(move |s| s.fill = Some(bg));
+                });
+                ui.horizontal(|ui| {
+                    let fill = cur.fill.unwrap_or([255, 255, 255]);
+                    if ui_kit::color_button(ui, None, Some(Icon::Fill), Color32::from_rgb(fill[0], fill[1], fill[2]), "填充颜色").clicked() {
+                        self.color_popup = Some(false);
                     }
-                    if ui_kit::small(ui, Icon::Fill, "清除填充").clicked() {
-                        self.apply_style(|s| s.fill = None);
+                    let fg = cur.color;
+                    if ui_kit::color_button(ui, Some("A"), None, Color32::from_rgb(fg[0], fg[1], fg[2]), "字体颜色").clicked() {
+                        self.color_popup = Some(true);
                     }
                 });
             });
         });
 
-        ui_kit::group(ui, "对齐", |ui| {
+        ui_kit::group(ui, "对齐方式", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     for (ic, val, tip) in [
@@ -3867,10 +4573,6 @@ impl SheetApp {
                         if ui_kit::small_on(ui, ic, cur.halign == val, tip).clicked() {
                             self.apply_style(move |s| s.halign = val);
                         }
-                    }
-                    if ui_kit::small_on(ui, Icon::Wrap, cur.wrap, "自动换行").clicked() {
-                        let v = !cur.wrap;
-                        self.apply_style(move |s| s.wrap = v);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -3883,6 +4585,12 @@ impl SheetApp {
                             self.apply_style(move |s| s.valign = val);
                         }
                     }
+                });
+                ui.horizontal(|ui| {
+                    if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 81.0, cur.wrap, "自动换行").clicked() {
+                        let v = !cur.wrap;
+                        self.apply_style(move |s| s.wrap = v);
+                    }
                     let (r1, c1, r2, c2) = self.sel_rect();
                     let merged = self
                         .wb
@@ -3890,7 +4598,7 @@ impl SheetApp {
                         .merges
                         .iter()
                         .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2);
-                    if ui_kit::small_on(ui, Icon::Merge, merged, "合并/取消合并").clicked() {
+                    if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 96.0, merged, "合并后居中").clicked() {
                         self.toggle_merge(!merged);
                     }
                 });
@@ -3909,7 +4617,8 @@ impl SheetApp {
                 };
                 egui::ComboBox::from_id_salt("numfmt")
                     .selected_text(fmt_label.to_string())
-                    .width(86.0)
+                    .width(112.0)
+                    .height(24.0)
                     .show_ui(ui, |ui| {
                         for (label, code) in [
                             ("常规", ""),
@@ -3935,79 +4644,71 @@ impl SheetApp {
                         self.apply_style(|s| s.format = "#,##0.00".into());
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui_kit::small(ui, Icon::DecInc, "增加小数位数").clicked() {
+                        self.decimals(1);
+                    }
+                    if ui_kit::small(ui, Icon::DecDec, "减少小数位数").clicked() {
+                        self.decimals(-1);
+                    }
+                });
             });
         });
 
         ui_kit::group(ui, "样式", |ui| {
-            if ui_kit::big(ui, Icon::Border, "全部框线").clicked() {
-                self.apply_style(|s| s.set_all_borders(1, [128, 128, 128]));
+            if ui_kit::big_sized(ui, Icon::Filter, "条件格式", Vec2::new(72.0, 76.0)).clicked() {
+                self.cf_mgr = true;
             }
-            ui.vertical(|ui| {
-                ui.menu_button("外框", |ui| {
-                    if ui.button("细外框").clicked() {
-                        self.outer_border(1, [0, 0, 0]);
-                        ui.close_menu();
-                    }
-                    if ui.button("粗外框").clicked() {
-                        self.outer_border(3, [0, 0, 0]);
-                        ui.close_menu();
-                    }
-                });
-                if ui_kit::pill(ui, "无边框", "").clicked() {
-                    self.apply_style(|s| s.clear_borders());
-                }
-            });
+            if ui_kit::big_sized(ui, Icon::Table, "套用表格格式", Vec2::new(88.0, 76.0)).clicked() {
+                self.make_table();
+            }
+            if ui_kit::big_sized(ui, Icon::Grid, "单元格样式", Vec2::new(72.0, 76.0)).clicked() {
+                self.fmt_dlg = true;
+            }
         });
 
         ui_kit::group(ui, "单元格", |ui| {
             ui.vertical(|ui| {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 let cc = self.sel.1;
-                ui.horizontal(|ui| {
-                    if ui_kit::pill(ui, "插入行", "").clicked() {
-                        self.structural(sheetcore::structural::Structural::InsertRows {
-                            at: r1,
-                            n: r2 - r1 + 1,
-                        });
-                    }
-                    if ui_kit::pill(ui, "删除行", "").clicked() {
-                        self.structural(sheetcore::structural::Structural::DeleteRows {
-                            at: r1,
-                            n: r2 - r1 + 1,
-                        });
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui_kit::pill(ui, "插入列", "").clicked() {
-                        self.structural(sheetcore::structural::Structural::InsertCols { at: cc, n: 1 });
-                    }
-                    if ui_kit::pill(ui, "删除列", "").clicked() {
-                        self.structural(sheetcore::structural::Structural::DeleteCols { at: cc, n: 1 });
-                    }
-                });
+                if ui_kit::labeled_w(ui, Icon::Plus, "插入", 100.0, "插入行/列").clicked() {
+                    self.structural(sheetcore::structural::Structural::InsertRows {
+                        at: r1,
+                        n: r2 - r1 + 1,
+                    });
+                }
+                if ui_kit::labeled_w(ui, Icon::Close, "删除", 100.0, "删除行/列").clicked() {
+                    self.structural(sheetcore::structural::Structural::DeleteRows {
+                        at: r1,
+                        n: r2 - r1 + 1,
+                    });
+                }
+                if ui_kit::labeled_w(ui, Icon::Brush, "格式", 100.0, "设置单元格格式（Ctrl+1）").clicked() {
+                    self.fmt_dlg = true;
+                }
+                let _ = cc;
             });
         });
 
         ui_kit::group(ui, "编辑", |ui| {
             ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    if ui_kit::small(ui, Icon::Find, "查找与替换（Ctrl+F）").clicked() {
-                        self.find.open = true;
-                    }
-                    if ui_kit::small(ui, Icon::Filter, "筛选").clicked() {
-                        self.start_filter();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui_kit::pill(ui, "升序", "").clicked() {
-                        let c = self.sel.1;
-                        self.do_sort(c, true);
-                    }
-                    if ui_kit::pill(ui, "降序", "").clicked() {
-                        let c = self.sel.1;
-                        self.do_sort(c, false);
-                    }
-                });
+                if ui_kit::labeled_w(ui, Icon::Sum, "自动求和", 112.0, "对上方连续数字求和").clicked() {
+                    self.auto_sum();
+                }
+                if ui_kit::labeled_w(ui, Icon::Filter, "排序和筛选", 112.0, "排序 / 启用筛选").clicked() {
+                    self.start_filter();
+                }
+                if ui_kit::labeled_w(ui, Icon::Find, "查找和选择", 112.0, "查找与替换（Ctrl+F）").clicked() {
+                    self.find.open = true;
+                }
+            });
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Fill, "填充", 88.0, "把选区第一行填到下面").clicked() {
+                    self.fill_down();
+                }
+                if ui_kit::labeled_w(ui, Icon::Close, "清除", 88.0, "清除内容与格式").clicked() {
+                    self.clear_selection();
+                }
             });
         });
     }
@@ -4018,11 +4719,11 @@ impl SheetApp {
                 self.insert_chart_from_selection();
             }
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "图表管理…", "").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Chart, "图表管理", 92.0, "").clicked() {
                     self.chart_mgr = true;
                     self.reload_charts();
                 }
-                if ui_kit::pill(ui, "透视表…", "把选区做成数据透视表").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Pivot, "数据透视表", 92.0, "把选区做成数据透视表").clicked() {
                     let (r, c) = self.sel;
                     let (r1, c1, r2, c2) =
                         sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
@@ -4040,7 +4741,6 @@ impl SheetApp {
                 }
             });
         });
-
         ui_kit::group(ui, "插图", |ui| {
             if ui_kit::big(ui, Icon::Image, "图片").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
@@ -4075,7 +4775,6 @@ impl SheetApp {
                 }
             }
         });
-
         ui_kit::group(ui, "表格", |ui| {
             if ui_kit::big(ui, Icon::Table, "表格").on_hover_text("把选区转成表格对象").clicked() {
                 self.make_table();
@@ -4092,31 +4791,116 @@ impl SheetApp {
                 self.note_edit = Some((r, c, cur));
             }
         });
+        ui_kit::group(ui, "链接", |ui| {
+            let links = self.wb.links.len();
+            let label = if links > 0 {
+                format!("链接 {links}")
+            } else {
+                "链接".to_string()
+            };
+            if ui_kit::big(ui, Icon::Link, &label)
+                .on_hover_text("跨工作簿引用：查看、更新缓存")
+                .clicked()
+            {
+                self.xlink_dlg = true;
+            }
+        });
+    }
+
+    fn ribbon_page(&mut self, ui: &mut egui::Ui) {
+        let page = self.wb.sheet(self.sheet_idx).page.clone();
+        ui_kit::group(ui, "页面设置", |ui| {
+            if ui_kit::big(ui, Icon::Sheet, "纸张方向").on_hover_text(if page.landscape { "当前横向，点击改纵向" } else { "当前纵向，点击改横向" }).clicked() {
+                self.set_page(|p| p.landscape = !p.landscape);
+            }
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Table, if page.paper == 9 { "纸张：A4" } else { "纸张：Letter" }, 110.0, "切换纸张大小").clicked() {
+                    self.set_page(|p| p.paper = if p.paper == 9 { 1 } else { 9 });
+                }
+                if ui_kit::labeled_w(ui, Icon::Grid, "页边距：常规", 110.0, "在常规 / 窄 / 宽之间切换").clicked() {
+                    let narrow = page.margins[0] < 0.5;
+                    let wide = page.margins[0] > 0.9;
+                    self.set_page(move |p| {
+                        let m = if narrow { [1.0, 1.0, 1.0, 1.0, 0.5, 0.5] } else if wide { [0.7, 0.7, 0.75, 0.75, 0.3, 0.3] } else { [0.25, 0.25, 0.75, 0.75, 0.3, 0.3] };
+                        p.margins = m;
+                    });
+                }
+            });
+        });
+        ui_kit::group(ui, "工作表选项", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w_on(ui, Icon::Grid, "打印网格线", 120.0, page.gridlines, "").clicked() {
+                    let v = !page.gridlines;
+                    self.set_page(move |p| p.gridlines = v);
+                }
+                if ui_kit::labeled_w_on(ui, Icon::Table, "打印行号列标", 120.0, page.headings, "").clicked() {
+                    let v = !page.headings;
+                    self.set_page(move |p| p.headings = v);
+                }
+            });
+        });
+        ui_kit::group(ui, "打印", |ui| {
+            if ui_kit::big(ui, Icon::Print, "打印预览").clicked() {
+                self.preview_page = 0;
+                self.print_preview = true;
+            }
+        });
+    }
+
+    fn ribbon_review(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "批注", |ui| {
+            if ui_kit::big(ui, Icon::Comment, "新建批注").clicked() {
+                let (r, c) = self.sel;
+                let cur = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .notes
+                    .get(&sheetcore::model::CellRef::new(r, c))
+                    .map(|n| n.text.clone())
+                    .unwrap_or_default();
+                self.note_edit = Some((r, c, cur));
+            }
+        });
+        ui_kit::group(ui, "修订", |ui| {
+            if ui_kit::big(ui, Icon::Revision, "修订记录").clicked() {
+                self.rev_open = true;
+            }
+        });
+        ui_kit::group(ui, "共享", |ui| {
+            if self.net.is_none() {
+                if ui_kit::big(ui, Icon::Share, "共享").clicked() {
+                    self.start_host();
+                }
+            } else if ui_kit::big_sized(ui, Icon::Share, &format!("在线 {}", self.peers_list.len()), Vec2::new(66.0, 76.0)).clicked() {
+                self.members_open = true;
+            }
+        });
     }
 
     fn ribbon_formula(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "函数库", |ui| {
+            if ui_kit::big(ui, Icon::Fx, "插入函数").clicked() {
+                self.begin_edit(None);
+                if let Some(ed) = self.editing.as_mut() {
+                    if !ed.buf.starts_with('=') {
+                        ed.buf.insert(0, '=');
+                    }
+                }
+            }
+        });
         ui_kit::group(ui, "计算", |ui| {
             if ui_kit::big(ui, Icon::Calc, "重算全部").clicked() {
                 sheetcore::formula::recalc_all(&mut self.wb);
                 self.status = "已重算".to_string();
             }
         });
-        ui_kit::group(ui, "查找", |ui| {
-            if ui_kit::big(ui, Icon::Find, "查找与替换").clicked() {
-                self.find.open = true;
-            }
-        });
         ui_kit::group(ui, "区域", |ui| {
             ui.vertical(|ui| {
                 let (r1, c1, r2, c2) = self.sel_rect();
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{}:{}",
-                        cell_name(r1, c1),
-                        cell_name(r2, c2)
-                    ))
-                    .monospace()
-                    .size(11.5),
+                    egui::RichText::new(format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)))
+                        .size(12.0)
+                        .monospace(),
                 );
                 ui.label(
                     egui::RichText::new("fx 里显示公式，选中外部引用会标出文件名")
@@ -4128,10 +4912,49 @@ impl SheetApp {
     }
 
     fn ribbon_data(&mut self, ui: &mut egui::Ui) {
-        ui_kit::group(ui, "格式", |ui| {
-            if ui_kit::big(ui, Icon::Filter, "条件格式").clicked() {
-                self.cf_mgr = true;
-            }
+        ui_kit::group(ui, "获取数据", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Open, "导入 CSV/TSV", 120.0, "").clicked() {
+                    self.import_csv();
+                }
+                if ui_kit::labeled_w(ui, Icon::Link, "从另一张表取数", 120.0, "").clicked() {
+                    self.link_dlg = Some(String::new());
+                }
+                if ui_kit::labeled_w(ui, Icon::Table, "分列", 120.0, "").clicked() {
+                    self.open_data_dlg(1);
+                }
+                if ui_kit::labeled_w(ui, Icon::Refresh, "刷新导入", 120.0, "").clicked() {
+                    self.refresh_import();
+                }
+            });
+        });
+        ui_kit::group(ui, "排序和筛选", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::SortAsc, "升序", 100.0, "").clicked() {
+                    let c = self.sel.1;
+                    self.do_sort(c, true);
+                }
+                if ui_kit::labeled_w(ui, Icon::SortDesc, "降序", 100.0, "").clicked() {
+                    let c = self.sel.1;
+                    self.do_sort(c, false);
+                }
+                if ui_kit::labeled_w(ui, Icon::Filter, "筛选", 100.0, "").clicked() {
+                    self.start_filter();
+                }
+                if ui_kit::labeled_w(ui, Icon::Grid, "多级排序", 100.0, "").clicked() {
+                    self.open_data_dlg(0);
+                }
+            });
+        });
+        ui_kit::group(ui, "数据工具", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Table, "删除重复项", 110.0, "").clicked() {
+                    self.run_dedup();
+                }
+                if ui_kit::labeled_w(ui, Icon::Filter, "条件格式", 110.0, "").clicked() {
+                    self.cf_mgr = true;
+                }
+            });
         });
         ui_kit::group(ui, "链接", |ui| {
             let links = self.wb.links.len();
@@ -4147,52 +4970,181 @@ impl SheetApp {
                 self.xlink_dlg = true;
             }
         });
-        ui_kit::group(ui, "排序与筛选", |ui| {
+    }
+
+    /// 当前选区所在的表格（用于上下文“表设计”页签）
+    fn table_at_sel(&self) -> Option<sheetcore::table::Table> {
+        let (r, c) = self.sel;
+        self.wb
+            .sheet(self.sheet_idx)
+            .tables
+            .iter()
+            .find(|t| r >= t.range.0 && r <= t.range.2 && c >= t.range.1 && c <= t.range.3)
+            .cloned()
+    }
+
+    fn chart_at_sel(&self) -> Option<sheetcore::charts::Chart> {
+        let i = self.chart_sel?;
+        self.wb.sheet(self.sheet_idx).charts.get(i).cloned()
+    }
+
+    /// 上下文页签：图表工具（选中图表时出现）
+    fn ribbon_chart(&mut self, ui: &mut egui::Ui) {
+        let Some(ch) = self.chart_at_sel() else {
+            self.ribbon_tab = 1;
+            return;
+        };
+        ui_kit::group(ui, "图表", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "多级排序…", "").clicked() {
-                    self.open_data_dlg(0);
+                if ui_kit::labeled_w(ui, Icon::Chart, "编辑图表", 104.0, "改类型/标题/系列").clicked() {
+                    self.chart_edit = Some(ch.clone());
                 }
-                if ui_kit::pill(ui, "筛选", "").clicked() {
-                    self.start_filter();
-                }
-                if ui_kit::pill(ui, "删除重复…", "").clicked() {
-                    self.run_dedup();
+                if ui_kit::labeled_w(ui, Icon::Chart, "图表管理", 104.0, "查看本表所有图表").clicked()
+                {
+                    self.chart_mgr = true;
+                    self.reload_charts();
                 }
             });
         });
-        ui_kit::group(ui, "获取数据", |ui| {
+        ui_kit::group(ui, "当前图表", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "导入 CSV/TSV…", "").clicked() {
-                    self.import_csv();
+                ui.label(
+                    egui::RichText::new(&ch.title)
+                        .size(11.0)
+                        .color(ui_kit::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{:?} · {} 个系列", ch.kind, ch.series.len()))
+                        .size(10.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+            });
+        });
+    }
+
+    /// 上下文页签：表设计（选中表格里任意单元格时出现）
+    fn ribbon_table(&mut self, ui: &mut egui::Ui) {
+        let Some(t) = self.table_at_sel() else {
+            self.ribbon_tab = 1;
+            return;
+        };
+        ui_kit::group(ui, "属性", |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("表名：{}", t.display))
+                        .size(11.0)
+                        .color(ui_kit::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "区域 {}:{}",
+                        cell_name(t.range.0, t.range.1),
+                        cell_name(t.range.2, t.range.3)
+                    ))
+                    .size(10.5)
+                    .color(ui_kit::TEXT_WEAK),
+                );
+            });
+        });
+        ui_kit::group(ui, "工具", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Table, "选择表格", 100.0, "选中整个表格区域").clicked() {
+                    self.sel = (t.range.0, t.range.1);
+                    self.sel_end = (t.range.2, t.range.3);
+                    self.status = format!("已选中表格 {}", t.display);
                 }
-                if ui_kit::pill(ui, "从另一张表取数…", "").clicked() {
-                    self.link_dlg = Some(String::new());
+                if ui_kit::labeled_w(ui, Icon::Pivot, "数据透视表", 100.0, "按这个表格新建透视表")
+                    .clicked()
+                {
+                    let (r1, c1, r2, c2) = t.range;
+                    self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
+                        source: (r1, c1, r2, c2),
+                        row_field: c1,
+                        col_field: None,
+                        value_field: c2,
+                        agg: sheetcore::pivot::Agg::Sum,
+                    });
                 }
-                if ui_kit::pill(ui, "分列…", "").clicked() {
-                    self.open_data_dlg(1);
+                if ui_kit::labeled_w(
+                    ui,
+                    Icon::Table,
+                    "转换为区域",
+                    100.0,
+                    "保留单元格内容，去掉表格对象",
+                )
+                .clicked()
+                {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.tables.retain(|x| x.name != t.name);
+                    sh.tables_dirty = true;
+                    self.wb.dirty = true;
+                    self.ribbon_tab = 1;
+                    self.status = "已转换为普通区域".into();
                 }
-                if ui_kit::pill(ui, "刷新导入", "").clicked() {
-                    self.refresh_import();
+                if ui_kit::labeled_w(ui, Icon::Filter, "筛选", 100.0, "在表格标题行上加筛选").clicked() {
+                    self.sel = (t.range.0, t.range.1);
+                    self.sel_end = (t.range.2, t.range.3);
+                    self.start_filter();
                 }
+            });
+        });
+        ui_kit::group(ui, "表格样式", |ui| {
+            ui.vertical(|ui| {
+                let (r, p) = ui.allocate_exact_size(Vec2::new(120.0, 22.0), Sense::hover());
+                let painter = ui.painter();
+                let mut x = r.left();
+                for col in [
+                    Color32::from_rgb(21, 96, 58),
+                    Color32::from_rgb(33, 122, 76),
+                    Color32::from_rgb(59, 156, 104),
+                    Color32::from_rgb(160, 212, 183),
+                    Color32::from_rgb(226, 240, 231),
+                ] {
+                    painter.rect_filled(
+                        Rect::from_min_size(egui::pos2(x, r.top()), Vec2::new(24.0, 22.0)),
+                        0.0,
+                        col,
+                    );
+                    x += 24.0;
+                }
+                let _ = p;
+                ui.label(
+                    egui::RichText::new("TableStyleMedium2")
+                        .size(10.0)
+                        .color(ui_kit::TEXT_WEAK),
+                );
             });
         });
     }
 
     fn ribbon_view(&mut self, ui: &mut egui::Ui) {
         ui_kit::group(ui, "显示", |ui| {
+            ui.vertical(|ui| {
+                for (on, label, tip) in [
+                    (self.show_gridlines, "网格线", "显示单元格之间的浅灰网格线"),
+                    (self.show_headings, "标题", "显示列标和行号"),
+                    (self.show_formula_bar, "编辑栏", "显示名称框和 fx 输入行"),
+                ] {
+                    if ui_kit::labeled_w_on(ui, Icon::Grid, label, 96.0, on, tip).clicked() {
+                        match label {
+                            "网格线" => self.show_gridlines = !self.show_gridlines,
+                            "标题" => self.show_headings = !self.show_headings,
+                            _ => self.show_formula_bar = !self.show_formula_bar,
+                        }
+                    }
+                }
+            });
             if ui_kit::big(ui, Icon::Print, "打印预览").clicked() {
                 self.preview_page = 0;
                 self.print_preview = true;
             }
             ui.vertical(|ui| {
-                if ui_kit::pill(ui, "100%", "回到实际大小").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Zoom, "100%", 110.0, "回到实际大小").clicked() {
                     self.zoom = 1.0;
                     ui.ctx().set_zoom_factor(1.0);
                 }
                 let on = self.tree_open;
-                if ui_kit::pill(ui, if on { "隐藏文件列表" } else { "显示文件列表" }, "左侧文件树")
-                    .clicked()
-                {
+                if ui_kit::labeled_w(ui, Icon::Open, if on { "隐藏文件列表" } else { "显示文件列表" }, 110.0, "左侧文件树").clicked() {
                     self.tree_open = !on;
                 }
             });
@@ -4216,14 +5168,91 @@ impl SheetApp {
                 }
             });
         });
+        ui_kit::group(ui, "窗口", |ui| {
+            ui.vertical(|ui| {
+                let freeze = self.wb.sheet(self.sheet_idx).freeze;
+                if ui_kit::labeled_w_on(
+                    ui,
+                    Icon::Freeze,
+                    "冻结首行",
+                    96.0,
+                    freeze == Some((1, 0)),
+                    "滚动时第一行保持可见",
+                )
+                .clicked()
+                {
+                    let on = freeze == Some((1, 0));
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.freeze = if on { None } else { Some((1, 0)) };
+                    sh.freeze_dirty = true;
+                    self.wb.dirty = true;
+                }
+                if ui_kit::labeled_w_on(
+                    ui,
+                    Icon::Freeze,
+                    "冻结首列",
+                    96.0,
+                    freeze == Some((0, 1)),
+                    "滚动时第一列保持可见",
+                )
+                .clicked()
+                {
+                    let on = freeze == Some((0, 1));
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.freeze = if on { None } else { Some((0, 1)) };
+                    sh.freeze_dirty = true;
+                    self.wb.dirty = true;
+                }
+                if ui_kit::labeled_w(ui, Icon::Close, "取消冻结", 96.0, "").clicked() {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.freeze = None;
+                    sh.freeze_dirty = true;
+                    self.wb.dirty = true;
+                }
+            });
+        });
+        ui_kit::group(ui, "工作簿视图", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w_on(ui, Icon::Grid, "普通", 96.0, self.view_mode == 0, "普通视图")
+                    .clicked()
+                {
+                    self.view_mode = 0;
+                    self.scroll = Vec2::ZERO;
+                }
+                if ui_kit::labeled_w_on(
+                    ui,
+                    Icon::Sheet,
+                    "页面布局",
+                    96.0,
+                    self.view_mode == 1,
+                    "按打印页显示，含页边距和页眉页脚",
+                )
+                .clicked()
+                {
+                    self.view_mode = 1;
+                    self.scroll = Vec2::ZERO;
+                }
+                if ui_kit::labeled_w_on(
+                    ui,
+                    Icon::Print,
+                    "分页预览",
+                    96.0,
+                    self.view_mode == 2,
+                    "显示分页符和页码",
+                )
+                .clicked()
+                {
+                    self.view_mode = 2;
+                    self.scroll = Vec2::ZERO;
+                }
+            });
+        });
         ui_kit::group(ui, "修订", |ui| {
             if ui_kit::big(ui, Icon::Revision, "修订记录").clicked() {
                 self.rev_open = true;
             }
         });
     }
-
-
 
     /// 取（或新建）一个 dxf 索引；所有表保持同一份 dxfs，保证索引一致
     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
@@ -4763,7 +5792,30 @@ impl SheetApp {
     ) {
         let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
         let st = self.wb.styles.get(sid);
+        // 表格样式（TableStyleMedium2）：标题行深绿白字、数据行隔行浅绿
+        let table = self
+            .wb
+            .sheet(self.sheet_idx)
+            .tables
+            .iter()
+            .find(|t| r >= t.range.0 && r <= t.range.2 && c >= t.range.1 && c <= t.range.3)
+            .cloned();
+        let table_header = table
+            .as_ref()
+            .map(|t| t.header_row && r == t.range.0)
+            .unwrap_or(false);
+        let table_band = table
+            .as_ref()
+            .map(|t| {
+                !table_header && t.header_row && (r - t.range.0 - 1) % 2 == 1
+            })
+            .unwrap_or(false);
         // 选中不再用整格浅蓝填充（会和真实底色混淆），改成外描边，见选区绘制
+        if table_header && st.fill.is_none() {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(33, 122, 76));
+        } else if table_band && st.fill.is_none() {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(226, 240, 231));
+        }
         if let Some(fill) = st.fill {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(fill[0], fill[1], fill[2]));
             if dumping {
@@ -4813,16 +5865,17 @@ impl SheetApp {
             if !txt.is_empty() {
                 let is_num = matches!(cell.value, Value::Number(_));
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
-                let base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
+                let mut base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
+                if table_header && ov.is_none() {
+                    base_color = [255, 255, 255];
+                }
                 // 条件格式里指定的字体优先，其次单元格样式；未知字体回退默认
                 let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
                 let family = cell_family(font_name);
+                // 样式里的 size 是磅值（Excel 的 11 磅 ≈ 14.7px），画到屏幕上要换算
+                let fs = (st.size * 4.0 / 3.0).max(6.0);
                 let font = FontId::new(
-                    if st.bold || cf_bold {
-                        st.size + 0.6
-                    } else {
-                        st.size
-                    },
+                    if st.bold || cf_bold || table_header { fs + 0.8 } else { fs },
                     family.clone(),
                 );
                 let color = Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
@@ -4874,8 +5927,7 @@ impl SheetApp {
                 }
                 // 多行/自动换行要按单元格宽度排版并裁到格子里，
                 // 否则长地址会溢出到右边的发票号上（Excel 会裁掉）。
-                let multiline = st.wrap || txt.contains("
-");
+                let multiline = st.wrap || txt.contains("\n");
                 if multiline {
                     let max_w = (rect.width() - 8.0).max(8.0);
                     let galley = painter.layout(txt.clone(), font.clone(), color, max_w);
@@ -6928,6 +7980,7 @@ impl SheetApp {
     /// 主入口：没有比较对象时整块画；有就左右各一半
     fn draw_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.compare.is_none() || self.compare_window {
+            self.grid_scrollbars(ui);
             self.draw_grid_pane(ui, ctx, false);
             self.flush_dump();
             return;
@@ -6975,13 +8028,82 @@ impl SheetApp {
         }
     }
 
+    /// Excel 的滚动条：右侧 17px 竖条 + 底部 17px 横条，两端的箭头都在
+    fn grid_scrollbars(&mut self, ui: &mut egui::Ui) {
+        let (total_w, total_h) = {
+            let sh = self.wb.sheet(self.sheet_idx);
+            (sh.cols.pos(16_384), sh.rows.pos(1_048_576))
+        };
+        let view = self.last_view;
+        let view_w = (view.x - HEAD_W).max(1.0);
+        let view_h = (view.y - HEAD_H).max(1.0);
+        let mut sx = self.scroll.x;
+        let mut sy = self.scroll.y;
+        egui::TopBottomPanel::bottom("grid_hsb")
+            .exact_height(SB)
+            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .show_inside(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().rect_filled(
+                    Rect::from_min_size(r.min, Vec2::new(HEAD_W, r.height())),
+                    0.0,
+                    ui_kit::HEADER_BG,
+                );
+                let track = Rect::from_min_max(
+                    egui::pos2(r.left() + HEAD_W, r.top()),
+                    r.max,
+                );
+                scrollbar(ui, "hsb", track, true, &mut sx, total_w, view_w);
+            });
+        egui::SidePanel::right("grid_vsb")
+            .exact_width(SB)
+            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .show_inside(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().rect_filled(
+                    Rect::from_min_size(r.min, Vec2::new(r.width(), HEAD_H)),
+                    0.0,
+                    ui_kit::HEADER_BG,
+                );
+                let track = Rect::from_min_max(
+                    egui::pos2(r.left(), r.top() + HEAD_H),
+                    r.max,
+                );
+                scrollbar(ui, "vsb", track, false, &mut sy, total_h, view_h);
+            });
+        self.scroll.x = sx;
+        self.scroll.y = sy;
+    }
+
+    /// 当前表的显示版式：隐藏的行/列按 0 尺寸（和 Excel 一样，不是删数据）
+    fn view_axes(&self) -> (sheetcore::layout::Axis, sheetcore::layout::Axis) {
+        let s = self.wb.sheet(self.sheet_idx);
+        let mut cols = s.cols.clone();
+        let mut rows = s.rows.clone();
+        for r in s.hidden_rows.iter().chain(s.hidden_rows_user.iter()) {
+            rows.set(*r, 0.0);
+        }
+        for c in s.hidden_cols.iter() {
+            cols.set(*c, 0.0);
+        }
+        (cols, rows)
+    }
+
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
         self.last_view = avail;
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let origin = resp.rect.min;
+        // 视图 → 标题：关掉列标/行号后表头占 0 像素，网格从左上角开始
+        let hh = if self.show_headings { HEAD_H } else { 0.0 };
 
-        // 右键菜单（选区操作）
+        // 右键菜单（选区操作）；点在列标/行号上时留给表头自己的菜单
+        let secondary_in_head = resp.secondary_clicked()
+            && resp
+                .interact_pointer_pos()
+                .map(|p| p.x < origin.x + HEAD_W + 12.0 || p.y < origin.y + hh)
+                .unwrap_or(false);
+        if !secondary_in_head {
         resp.context_menu(|ui| {
             let (r1, c1, r2, c2) = self.sel_rect();
             let rows = r2 - r1 + 1;
@@ -7024,6 +8146,7 @@ impl SheetApp {
                 ui.close_menu();
             }
         });
+        }
         painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
 
         // 滚轮
@@ -7032,33 +8155,104 @@ impl SheetApp {
             self.scroll -= d;
         }
 
-        // 版式快照：列宽/行高随文件而变，位置不能再按「等宽 × 索引」算
-        let (cols, mut rows) = {
-            let s = self.wb.sheet(self.sheet_idx);
-            (s.cols.clone(), s.rows.clone())
-        };
-        // 被筛选隐藏的行 = 行高 0（和 Excel 一样，不是删数据）
-        {
-            let s = self.wb.sheet(self.sheet_idx);
-            for r in s.hidden_rows.iter() {
-                rows.set(*r, 0.0);
+        // 版式快照：列宽/行高随文件而变；被筛选/手动隐藏的行列按 0 尺寸处理
+        let (cols, rows) = self.view_axes();
+        // ---- 页面布局 / 分页预览几何 ----
+        let page_mode = self.view_mode != 0;
+        const PAGE_GAP: f32 = 26.0;
+        const PAGE_PAD: f32 = 18.0;
+        let mut pg: Option<PageGeo> = None;
+        if page_mode {
+            let sh = self.wb.sheet(self.sheet_idx);
+            if let Some((pr1, pc1, _, _)) = sh.page.print_area.or_else(|| sh.used_bounds()) {
+                let ps = sh.page.clone();
+                let scale = ps.scale_factor(sh).max(0.1);
+                let (pw_print, ph_print) = ps.printable_px();
+                let content_w = pw_print / scale;
+                let content_h = ph_print / scale;
+                let (ml, mr, mt, mb) = if self.view_mode == 2 {
+                    (0.0, 0.0, 0.0, 0.0)
+                } else {
+                    (
+                        ps.margins[0] * 96.0,
+                        ps.margins[1] * 96.0,
+                        ps.margins[2] * 96.0,
+                        ps.margins[3] * 96.0,
+                    )
+                };
+                let paper_w = content_w + ml + mr;
+                let paper_h = content_h + mt + mb;
+                let (bx, by) = sheetcore::page::page_breaks(sh);
+                let pages_x = bx.len() + 1;
+                let pages_y = by.len() + 1;
+                let total_w =
+                    pages_x as f32 * paper_w + pages_x.saturating_sub(1) as f32 * PAGE_GAP;
+                let total_h =
+                    pages_y as f32 * paper_h + pages_y.saturating_sub(1) as f32 * PAGE_GAP;
+                pg = Some(PageGeo {
+                    bx,
+                    by,
+                    paper_w,
+                    paper_h,
+                    ml,
+                    mr,
+                    mt,
+                    mb,
+                    content_w,
+                    content_h,
+                    origin_x: cols.pos(pc1),
+                    origin_y: rows.pos(pr1),
+                    area_r1: pr1,
+                    area_c1: pc1,
+                    pages_x,
+                    pages_y,
+                    total_w,
+                    total_h,
+                    header: ps.header.clone(),
+                    footer: ps.footer.clone(),
+                });
             }
         }
-        let max_x = (cols.pos(16_384) - avail.x).max(0.0);
-        let max_y = (rows.pos(1_048_576) - avail.y).max(0.0);
+        let max_x = match &pg {
+            Some(g) => (g.total_w + PAGE_PAD - (avail.x - HEAD_W)).max(0.0),
+            None => (cols.pos(16_384) - avail.x).max(0.0),
+        };
+        let max_y = match &pg {
+            Some(g) => (g.total_h + PAGE_PAD - (avail.y - hh)).max(0.0),
+            None => (rows.pos(1_048_576) - avail.y).max(0.0),
+        };
         self.scroll.x = self.scroll.x.clamp(0.0, max_x);
         self.scroll.y = self.scroll.y.clamp(0.0, max_y);
 
         let (off_x, off_y) = (self.scroll.x, self.scroll.y);
-        // 冻结窗格：滚动区域整体平移出冻结条
-        let (fy, fx) = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
-        let (fy, fx) = (fy.min(200), fx.min(50));
+        // 冻结窗格：页面视图下关闭（窗格和页间距叠在一起会错位）
+        let (fy, fx) = if page_mode {
+            (0, 0)
+        } else {
+            let f = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
+            (f.0.min(200), f.1.min(50))
+        };
+        // 行号列宽跟着最多位数的行号走（Excel 在滚到 5 位数行时会变宽）
+        let last_vis_row = rows.index_at(off_y + avail.y - hh) + 1;
+        let head_w = if self.show_headings {
+            ((last_vis_row.to_string().len() as f32) * 6.5 + 10.0).max(HEAD_W)
+        } else {
+            0.0
+        };
         let frozen_w = cols.pos(fx);
         let frozen_h = rows.pos(fy);
-        let body_x = origin.x + HEAD_W + frozen_w;
-        let body_y = origin.y + HEAD_H + frozen_h;
-        let first_col = cols.index_at(off_x).max(fx);
-        let first_row = rows.index_at(off_y).max(fy);
+        let body_x = origin.x + head_w + frozen_w;
+        let body_y = origin.y + hh + frozen_h;
+        let first_col = if page_mode {
+            pg.as_ref().map(|g| g.area_c1).unwrap_or(0)
+        } else {
+            cols.index_at(off_x).max(fx)
+        };
+        let first_row = if page_mode {
+            pg.as_ref().map(|g| g.area_r1).unwrap_or(0)
+        } else {
+            rows.index_at(off_y).max(fy)
+        };
         if std::env::var("SC_DBG_GRID").is_ok() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7067,23 +8261,153 @@ impl SheetApp {
                     avail, (off_x, off_y), cols.len(), rows.len(), first_col, first_row);
             }
         }
-        let gx = |c: u32| body_x + cols.pos(c) - off_x;
-        let gy = |r: u32| body_y + rows.pos(r) - off_y;
+        // 页内坐标 → 屏幕偏移：每跨过一个分页符多一个页间距
+        fn pg_map(rel: f32, breaks: &[f32], paper: f32) -> f32 {
+            let mut k = 0usize;
+            let mut start = 0.0f32;
+            for b in breaks {
+                if rel >= *b {
+                    k += 1;
+                    start = *b;
+                } else {
+                    break;
+                }
+            }
+            (rel - start) + k as f32 * (paper + PAGE_GAP)
+        }
+        let gx = |c: u32| match &pg {
+            Some(g) => {
+                body_x + PAGE_PAD + g.ml + pg_map(cols.pos(c) - g.origin_x, &g.bx, g.paper_w)
+                    - off_x
+            }
+            None => body_x + cols.pos(c) - off_x,
+        };
+        let gy = |r: u32| match &pg {
+            Some(g) => {
+                body_y + PAGE_PAD + g.mt + pg_map(rows.pos(r) - g.origin_y, &g.by, g.paper_h)
+                    - off_y
+            }
+            None => body_y + rows.pos(r) - off_y,
+        };
         // 冻结区里的格子用固定坐标
         let px_of = |c: u32| {
             if c < fx {
-                origin.x + HEAD_W + cols.pos(c)
+                origin.x + head_w + cols.pos(c)
             } else {
                 gx(c)
             }
         };
         let py_of = |r: u32| {
             if r < fy {
-                origin.y + HEAD_H + rows.pos(r)
+                origin.y + hh + rows.pos(r)
             } else {
                 gy(r)
             }
         };
+        // 点击命中的反向映射：页面视图里屏幕坐标要跨过页间距找回列/行
+        let col_at = |x: f32| -> u32 {
+            if pg.is_some() {
+                let mut lo = 0u32;
+                let mut hi = 16_383u32;
+                while lo < hi {
+                    let mid = (lo + hi + 1) / 2;
+                    if gx(mid) <= x {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                lo
+            } else if fx > 0 && x < body_x {
+                cols.index_at(x - (origin.x + head_w))
+            } else {
+                cols.index_at(off_x + x - (origin.x + head_w))
+            }
+        };
+        let row_at = |y: f32| -> u32 {
+            if pg.is_some() {
+                let mut lo = 0u32;
+                let mut hi = 1_048_575u32;
+                while lo < hi {
+                    let mid = (lo + hi + 1) / 2;
+                    if gy(mid) <= y {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                lo
+            } else if fy > 0 && y < body_y {
+                rows.index_at(y - (origin.y + hh))
+            } else {
+                rows.index_at(off_y + y - (origin.y + hh))
+            }
+        };
+        // 页面布局：灰底 + 白色页纸 + 页眉页脚
+        if let Some(g) = &pg {
+            let body_clip = Rect::from_min_max(
+                egui::pos2(origin.x + head_w, origin.y + hh),
+                resp.rect.max,
+            );
+            let pp = painter.with_clip_rect(body_clip);
+            pp.rect_filled(resp.rect, 0.0, Color32::from_rgb(191, 191, 191));
+            for k in 0..g.pages_x {
+                let left = body_x + PAGE_PAD + k as f32 * (g.paper_w + PAGE_GAP) - off_x;
+                if left >= body_clip.max.x || left + g.paper_w <= body_clip.min.x {
+                    continue;
+                }
+                for j in 0..g.pages_y {
+                    let top = body_y + PAGE_PAD + j as f32 * (g.paper_h + PAGE_GAP) - off_y;
+                    if top >= body_clip.max.y || top + g.paper_h <= body_clip.min.y {
+                        continue;
+                    }
+                    let r = Rect::from_min_size(
+                        egui::pos2(left, top),
+                        Vec2::new(g.paper_w, g.paper_h),
+                    );
+                    pp.rect_filled(
+                        r.translate(Vec2::new(2.0, 2.0)),
+                        0.0,
+                        Color32::from_rgb(150, 150, 150),
+                    );
+                    pp.rect_filled(r, 0.0, Color32::WHITE);
+                    pp.rect_stroke(
+                        r,
+                        0.0,
+                        Stroke::new(1.0, Color32::from_rgb(196, 196, 196)),
+                        egui::StrokeKind::Inside,
+                    );
+                    if self.view_mode == 2 {
+                        pp.rect_stroke(
+                            r,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_rgb(70, 110, 180)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let hf = strip_hf(&g.header);
+                    if !hf.is_empty() {
+                        pp.text(
+                            egui::pos2(left + g.ml, top + g.mt / 2.0),
+                            Align2::LEFT_CENTER,
+                            hf,
+                            FontId::proportional(9.5),
+                            Color32::from_rgb(120, 120, 120),
+                        );
+                    }
+                    let ft = strip_hf(&g.footer);
+                    if !ft.is_empty() {
+                        pp.text(
+                            egui::pos2(left + g.ml, top + g.paper_h - g.mb / 2.0),
+                            Align2::LEFT_CENTER,
+                            ft,
+                            FontId::proportional(9.5),
+                            Color32::from_rgb(120, 120, 120),
+                        );
+                    }
+                }
+            }
+        }
 
         let mut dump: Vec<String> = Vec::new();
         let dumping = std::env::var("SC_DUMP").is_ok()
@@ -7098,30 +8422,41 @@ impl SheetApp {
         let text_color = Color32::from_rgb(24, 24, 24);
         // 和 Excel 一致的浅灰网格线 / 表头底色
         let grid_line = Color32::from_rgb(217, 217, 217);
-        let head_bg = Color32::from_rgb(246, 246, 246);
-        let head_fg = Color32::from_rgb(60, 64, 70);
-        let head_sel = Color32::from_rgb(226, 233, 244);
+        let grid_stroke = if self.show_gridlines {
+            Stroke::new(1.0, grid_line)
+        } else {
+            Stroke::NONE
+        };
+        let head_bg = Color32::from_rgb(240, 240, 240);
+        let head_fg = Color32::from_rgb(68, 68, 68);
+        let head_sel = Color32::from_rgb(225, 225, 225);
 
         // 列标题
         painter.rect_filled(
-            Rect::from_min_size(origin, Vec2::new(avail.x, HEAD_H)),
+            Rect::from_min_size(origin, Vec2::new(avail.x, hh)),
             0.0,
             head_bg,
         );
         // 冻结列的标题（固定不动）
         for c in 0..fx {
-            let x = origin.x + HEAD_W + cols.pos(c);
+            let x = origin.x + head_w + cols.pos(c);
             let w = cols.size(c);
+            if self.show_headings {
             painter.text(
-                egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
-                Align2::CENTER_CENTER,
-                col_label(c),
-                FontId::new(12.0, family_named("latin")),
-                head_fg,
+                    egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
+                    Align2::CENTER_CENTER,
+                    col_label(c),
+                    FontId::new(11.0, family_named("latin")),
+                    head_fg,
+                );
+            }
+            painter.line_segment(
+                [egui::pos2(x, origin.y), egui::pos2(x, origin.y + hh)],
+                Stroke::new(1.0, ui_kit::BORDER),
             );
             painter.line_segment(
-                [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
-                Stroke::new(1.0, grid_line),
+                [egui::pos2(x, origin.y + hh), egui::pos2(x, origin.y + hh + avail.y)],
+                grid_stroke,
             );
         }
         let mut c = first_col;
@@ -7130,24 +8465,30 @@ impl SheetApp {
             guard += 1;
             let x = gx(c);
             let w = cols.size(c);
-            if x + w > origin.x + HEAD_W {
+            if x + w > origin.x + head_w {
                 if c == self.sel.1 {
                     painter.rect_filled(
-                        Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, HEAD_H)),
+                        Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, hh)),
                         0.0,
                         head_sel,
                     );
                 }
+                if self.show_headings {
                 painter.text(
-                    egui::pos2(x + w / 2.0, origin.y + HEAD_H / 2.0),
-                    Align2::CENTER_CENTER,
-                    col_label(c),
-                    FontId::new(12.0, family_named("latin")),
-                    head_fg,
+                                    egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
+                                    Align2::CENTER_CENTER,
+                                    col_label(c),
+                                    FontId::new(11.0, family_named("latin")),
+                                    head_fg,
+                                );
+                }
+                painter.line_segment(
+                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + hh)],
+                    Stroke::new(1.0, ui_kit::BORDER),
                 );
                 painter.line_segment(
-                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + HEAD_H + avail.y)],
-                    Stroke::new(1.0, grid_line),
+                    [egui::pos2(x, origin.y + hh), egui::pos2(x, origin.y + hh + avail.y)],
+                    grid_stroke,
                 );
             }
             c += 1;
@@ -7155,18 +8496,20 @@ impl SheetApp {
 
         // 行标题
         for r in 0..fy {
-            let y = origin.y + HEAD_H + rows.pos(r);
+            let y = origin.y + hh + rows.pos(r);
             let h = rows.size(r);
+            if self.show_headings {
             painter.text(
-                egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
-                Align2::CENTER_CENTER,
-                (r + 1).to_string(),
-                FontId::new(12.0, family_named("latin")),
-                head_fg,
-            );
+                    egui::pos2(origin.x + head_w / 2.0, y + h / 2.0),
+                    Align2::CENTER_CENTER,
+                    (r + 1).to_string(),
+                    FontId::new(11.0, family_named("latin")),
+                    head_fg,
+                );
+            }
             painter.line_segment(
                 [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
-                Stroke::new(1.0, grid_line),
+                grid_stroke,
             );
         }
         let mut r = first_row;
@@ -7179,28 +8522,50 @@ impl SheetApp {
                 r += 1;
                 continue;
             }
-            if y + h > origin.y + HEAD_H {
+            if y + h > origin.y + hh {
                 if r == self.sel.0 {
                     painter.rect_filled(
-                        Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(HEAD_W, h)),
+                        Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(head_w, h)),
                         0.0,
                         head_sel,
                     );
                 }
+                if self.show_headings {
                 painter.text(
-                    egui::pos2(origin.x + HEAD_W / 2.0, y + h / 2.0),
-                    Align2::CENTER_CENTER,
-                    (r + 1).to_string(),
-                    FontId::new(12.0, family_named("latin")),
-                    head_fg,
+                                    egui::pos2(origin.x + head_w / 2.0, y + h / 2.0),
+                                    Align2::CENTER_CENTER,
+                                    (r + 1).to_string(),
+                                    FontId::new(11.0, family_named("latin")),
+                                    head_fg,
+                                );
+                }
+                painter.line_segment(
+                    [egui::pos2(origin.x, y), egui::pos2(origin.x + head_w, y)],
+                    Stroke::new(1.0, ui_kit::BORDER),
                 );
                 painter.line_segment(
-                    [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
-                    Stroke::new(1.0, grid_line),
+                    [egui::pos2(origin.x + head_w, y), egui::pos2(origin.x + avail.x, y)],
+                    grid_stroke,
                 );
             }
             r += 1;
         }
+
+        // 行号列与表格之间的分界线（Excel 的 #D0D0D0）
+        painter.line_segment(
+            [
+                egui::pos2(origin.x + head_w, origin.y),
+                egui::pos2(origin.x + head_w, origin.y + avail.y),
+            ],
+            Stroke::new(1.0, ui_kit::BORDER),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(origin.x, origin.y + hh),
+                egui::pos2(origin.x + avail.x, origin.y + hh),
+            ],
+            Stroke::new(1.0, ui_kit::BORDER),
+        );
 
         // 条件格式叠加（只算可视范围）
         let si = self.sheet_idx;
@@ -7284,7 +8649,7 @@ impl SheetApp {
                 r += 1;
                 continue;
             }
-            if y + rh < origin.y + HEAD_H {
+            if y + rh < origin.y + hh {
                 r += 1;
                 continue;
             }
@@ -7294,7 +8659,7 @@ impl SheetApp {
                 cguard += 1;
                 let x = gx(c);
                 let cw = cols.size(c);
-                if x + cw < origin.x + HEAD_W {
+                if x + cw < origin.x + head_w {
                     c += 1;
                     continue;
                 }
@@ -7331,12 +8696,29 @@ impl SheetApp {
                             Vec2::new(14.0, 14.0),
                         );
                         painter.rect_filled(btn, 2.0, Color32::from_rgb(236, 239, 244));
-                        painter.text(
-                            btn.center(),
-                            Align2::CENTER_CENTER,
-                            "▾",
-                            FontId::proportional(10.0),
-                            Color32::from_rgb(70, 70, 70),
+                        // Excel 的筛选按钮是小漏斗，不是向下的三角
+                        let fc = btn.center();
+                        let ink = Color32::from_rgb(60, 60, 60);
+                        let fs = Stroke::new(1.0, ink);
+                        painter.line_segment(
+                            [egui::pos2(fc.x - 4.5, fc.y - 3.5), egui::pos2(fc.x + 4.5, fc.y - 3.5)],
+                            fs,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(fc.x - 4.0, fc.y - 3.0), egui::pos2(fc.x - 1.2, fc.y + 0.8)],
+                            fs,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(fc.x + 4.0, fc.y - 3.0), egui::pos2(fc.x + 1.2, fc.y + 0.8)],
+                            fs,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(fc.x - 1.2, fc.y + 0.8), egui::pos2(fc.x + 1.2, fc.y + 0.8)],
+                            fs,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(fc.x, fc.y + 0.8), egui::pos2(fc.x, fc.y + 3.8)],
+                            fs,
                         );
                         if dumping {
                             dump.push(format!("filter-arrow ({},{})", r, c));
@@ -7365,6 +8747,30 @@ impl SheetApp {
             r += 1;
         }
 
+        // 表格外框：Excel 的 TableStyleMedium2 有一圈深绿边框 + 标题行下的白线
+        for t in self.wb.sheet(self.sheet_idx).tables.clone() {
+            let (r1, c1, r2, c2) = t.range;
+            let tr = Rect::from_min_max(
+                egui::pos2(gx(c1), gy(r1)),
+                egui::pos2(gx(c2 + 1), gy(r2 + 1)),
+            );
+            if tr.intersects(resp.rect) && tr.width() > 0.0 && tr.height() > 0.0 {
+                painter.rect_stroke(
+                    tr,
+                    0.0,
+                    Stroke::new(1.0, Color32::from_rgb(33, 122, 76)),
+                    egui::StrokeKind::Inside,
+                );
+                if t.header_row {
+                    let y = gy(t.range.0 + 1);
+                    painter.line_segment(
+                        [egui::pos2(tr.left(), y), egui::pos2(tr.right(), y)],
+                        Stroke::new(1.0, Color32::WHITE),
+                    );
+                }
+            }
+        }
+
         if let Some(pf) = pending_filter.take() {
             self.filter_popup = Some(pf);
         }
@@ -7372,15 +8778,15 @@ impl SheetApp {
         // 冻结区单元格（覆盖在主体之上）
         if fx > 0 || fy > 0 {
             let clip_left = Rect::from_min_max(
-                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(body_x, origin.y + avail.y),
             );
             let clip_top = Rect::from_min_max(
-                egui::pos2(body_x, origin.y + HEAD_H),
+                egui::pos2(body_x, origin.y + hh),
                 egui::pos2(origin.x + avail.x, body_y),
             );
             let clip_corner = Rect::from_min_max(
-                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(body_x, body_y),
             );
             if fx > 0 {
@@ -7391,10 +8797,10 @@ impl SheetApp {
                     g += 1;
                     let y = gy(rr);
                     let h = rows.size(rr);
-                    if h >= 1.0 && y + h > origin.y + HEAD_H {
+                    if h >= 1.0 && y + h > origin.y + hh {
                         for cc in 0..fx {
                             let rect = Rect::from_min_size(
-                                egui::pos2(origin.x + HEAD_W + cols.pos(cc), y),
+                                egui::pos2(origin.x + head_w + cols.pos(cc), y),
                                 Vec2::new(cols.size(cc), h),
                             );
                             self.paint_cell(
@@ -7422,7 +8828,7 @@ impl SheetApp {
                     let w = cols.size(cc);
                     for rr in 0..fy {
                         let rect = Rect::from_min_size(
-                            egui::pos2(x, origin.y + HEAD_H + rows.pos(rr)),
+                            egui::pos2(x, origin.y + hh + rows.pos(rr)),
                             Vec2::new(w, rows.size(rr)),
                         );
                         self.paint_cell(
@@ -7444,8 +8850,8 @@ impl SheetApp {
                 for cc in 0..fx {
                     let rect = Rect::from_min_size(
                         egui::pos2(
-                            origin.x + HEAD_W + cols.pos(cc),
-                            origin.y + HEAD_H + rows.pos(rr),
+                            origin.x + head_w + cols.pos(cc),
+                            origin.y + hh + rows.pos(rr),
                         ),
                         Vec2::new(cols.size(cc), rows.size(rr)),
                     );
@@ -7466,7 +8872,7 @@ impl SheetApp {
             if fx > 0 {
                 painter.line_segment(
                     [
-                        egui::pos2(body_x - 0.5, origin.y + HEAD_H),
+                        egui::pos2(body_x - 0.5, origin.y + hh),
                         egui::pos2(body_x - 0.5, origin.y + avail.y),
                     ],
                     Stroke::new(1.6, edge),
@@ -7475,7 +8881,7 @@ impl SheetApp {
             if fy > 0 {
                 painter.line_segment(
                     [
-                        egui::pos2(origin.x + HEAD_W, body_y - 0.5),
+                        egui::pos2(origin.x + head_w, body_y - 0.5),
                         egui::pos2(origin.x + avail.x, body_y - 0.5),
                     ],
                     Stroke::new(1.6, edge),
@@ -7495,7 +8901,7 @@ impl SheetApp {
                 egui::pos2(px_of(c2), py_of(r2)),
             );
             let clip = egui::Rect::from_min_max(
-                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + avail.y),
             );
             if !rect.intersects(clip) {
@@ -7532,13 +8938,13 @@ impl SheetApp {
 
         // 图表（浮在单元格之上）
         let charts = self.wb.sheet(self.sheet_idx).charts.clone();
-        for ch in charts.iter() {
+        for (ci, ch) in charts.iter().enumerate() {
             let (r1, c1, r2, c2) = ch.anchor;
             let top_left = egui::pos2(px_of(c1), py_of(r1));
             let bottom_right = egui::pos2(px_of(c2), py_of(r2));
             let rect = egui::Rect::from_min_max(top_left, bottom_right);
             let clip = egui::Rect::from_min_max(
-                egui::pos2(origin.x + HEAD_W, origin.y + HEAD_H),
+                egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + avail.y),
             );
             if rect.intersects(clip) {
@@ -7550,11 +8956,41 @@ impl SheetApp {
                         ch.kind, ch.title, ch.series.len(), r1, c1, r2, c2
                     ));
                 }
+                if self.chart_sel == Some(ci) {
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        Stroke::new(1.5, ui_kit::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                    for p in [
+                        rect.left_top(),
+                        rect.right_top(),
+                        rect.left_bottom(),
+                        rect.right_bottom(),
+                        egui::pos2(rect.center().x, rect.top()),
+                        egui::pos2(rect.center().x, rect.bottom()),
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::pos2(rect.right(), rect.center().y),
+                    ] {
+                        painter.rect_filled(
+                            Rect::from_center_size(p, Vec2::splat(6.0)),
+                            0.0,
+                            Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            Rect::from_center_size(p, Vec2::splat(6.0)),
+                            0.0,
+                            Stroke::new(1.0, ui_kit::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
             }
         }
 
-        // 分页虚线（打印预览用）
-        if self.show_pages {
+        // 分页虚线（打印预览用）；页面布局/分页预览自己画页框
+        if self.show_pages && !page_mode {
             let (xs, ys) = sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx));
             let dash = Color32::from_rgb(120, 140, 180);
             let (r0, c0) = (first_row, first_col);
@@ -7569,7 +9005,7 @@ impl SheetApp {
             for x in xs.iter() {
                 let px = gx(pc1) + x;
                 if px >= body_x && px <= origin.x + avail.x {
-                    let mut y = py_of(pr1).max(origin.y + HEAD_H) + 0.0;
+                    let mut y = py_of(pr1).max(origin.y + hh) + 0.0;
                     while y < origin.y + avail.y {
                         let y2 = (y + 4.0).min(origin.y + avail.y);
                         painter.line_segment(
@@ -7583,7 +9019,7 @@ impl SheetApp {
             for y in ys.iter() {
                 let py = gy(pr1) + y;
                 if py >= body_y && py <= origin.y + avail.y {
-                    let mut x = px_of(pc1).max(origin.x + HEAD_W);
+                    let mut x = px_of(pc1).max(origin.x + head_w);
                     while x < origin.x + avail.x {
                         let x2 = (x + 4.0).min(origin.x + avail.x);
                         painter.line_segment(
@@ -7610,12 +9046,12 @@ impl SheetApp {
             painter.rect_filled(
                 Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
                 0.0,
-                Color32::from_rgba_unmultiplied(26, 115, 232, 28),
+                Color32::from_rgba_unmultiplied(16, 124, 65, 22),
             );
             painter.rect_stroke(
                 Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
                 0.0,
-                Stroke::new(1.5, Color32::from_rgb(26, 115, 232)),
+                Stroke::new(1.5, ui_kit::ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -7630,11 +9066,11 @@ impl SheetApp {
         let sy = py_of(sr1);
         let sw = cols.pos(sc2 + 1) - cols.pos(sc1);
         let sh = rows.pos(sr2 + 1) - rows.pos(sr1);
-        if sx + sw > origin.x + HEAD_W && sy + sh > origin.y + HEAD_H {
+        if sx + sw > origin.x + head_w && sy + sh > origin.y + hh {
             painter.rect_stroke(
                 Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(sw, sh)),
                 0.0,
-                Stroke::new(2.0, Color32::from_rgb(26, 115, 232)),
+                Stroke::new(2.0, ui_kit::ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -7648,8 +9084,8 @@ impl SheetApp {
                 .filter(|(r, c)| {
                     let x = gx(*c);
                     let y = gy(*r);
-                    x + cols.size(*c) > origin.x + HEAD_W
-                        && y + rows.size(*r) > origin.y + HEAD_H
+                    x + cols.size(*c) > origin.x + head_w
+                        && y + rows.size(*r) > origin.y + hh
                         && x < origin.x + avail.x
                         && y < origin.y + avail.y
                 })
@@ -7713,9 +9149,9 @@ impl SheetApp {
         {
             let hx = sx + sw;
             let hy = sy + sh;
-            if hx > origin.x + HEAD_W && hy > origin.y + HEAD_H {
+            if hx > origin.x + head_w && hy > origin.y + hh {
                 let handle = Rect::from_min_size(egui::pos2(hx - 4.0, hy - 4.0), Vec2::splat(7.0));
-                painter.rect_filled(handle, 1.0, Color32::from_rgb(26, 115, 232));
+                painter.rect_filled(handle, 0.0, ui_kit::ACCENT);
                 let grab = Rect::from_min_size(egui::pos2(hx - 7.0, hy - 7.0), Vec2::splat(14.0));
                 let resp = ui.interact(
                     grab,
@@ -7724,8 +9160,8 @@ impl SheetApp {
                 );
                 if !readonly && resp.dragged() {
                     if let Some(p) = resp.interact_pointer_pos() {
-                        let rr = rows.index_at(off_y + p.y - (origin.y + HEAD_H));
-                        let cc = cols.index_at(off_x + p.x - (origin.x + HEAD_W));
+                        let rr = rows.index_at(off_y + p.y - (origin.y + hh));
+                        let cc = cols.index_at(off_x + p.x - (origin.x + head_w));
                         let vertical = (p.y - hy).abs() > (p.x - hx).abs();
                         self.fill_drag = Some((if vertical { 0 } else { 1 }, rr, cc));
                         let preview = if vertical && rr > sr2 {
@@ -7770,7 +9206,7 @@ impl SheetApp {
         for (name, color, rr, cc) in self.remote.values() {
             let x = gx(*cc);
             let y = gy(*rr);
-            if x + cols.size(*cc) < origin.x + HEAD_W || y + rows.size(*rr) < origin.y + HEAD_H {
+            if x + cols.size(*cc) < origin.x + head_w || y + rows.size(*rr) < origin.y + hh {
                 continue;
             }
             if x > origin.x + avail.x || y > origin.y + avail.y {
@@ -7808,23 +9244,98 @@ impl SheetApp {
             }
         }
 
-        // 拖拽框选
-        if !readonly && resp.dragged() {
+        // 拖拽框选（正在拖列宽/行高时不要改选区）
+        if !readonly && resp.dragged() && self.col_drag.is_none() && self.row_drag.is_none() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let dx = pos.x - (origin.x + HEAD_W);
-                let dy = pos.y - (origin.y + HEAD_H);
+                let dx = pos.x - (origin.x + head_w);
+                let dy = pos.y - (origin.y + hh);
                 if dx >= 0.0 && dy >= 0.0 {
-                    let c = if fx > 0 && pos.x < body_x {
-                        cols.index_at(pos.x - (origin.x + HEAD_W))
-                    } else {
-                        cols.index_at(off_x + dx)
-                    };
-                    let r = if fy > 0 && pos.y < body_y {
-                        rows.index_at(pos.y - (origin.y + HEAD_H))
-                    } else {
-                        rows.index_at(off_y + dy)
-                    };
+                    let c = col_at(pos.x);
+                    let r = row_at(pos.y);
                     self.sel_end = (r, c);
+                }
+            }
+        }
+
+        // 表头边界拖拽：列宽 / 行高（Excel 的基础操作）
+        if !readonly {
+            let edge_zone = 3.5;
+            if resp.hovered() {
+                if let Some(p) = ui.ctx().pointer_interact_pos() {
+                    let in_col_head = p.y < origin.y + hh && p.x >= origin.x + head_w;
+                    let in_row_head = p.x < origin.x + head_w && p.y >= origin.y + hh;
+                    if in_col_head {
+                        // 边界属于「左边界所在的列」：指针正好在 x=边界 时要取左边那列
+                        let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
+                        if (p.x - (px_of(c) + cols.size(c))).abs() <= edge_zone {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                    } else if in_row_head {
+                        let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
+                        if (p.y - (py_of(r) + rows.size(r))).abs() <= edge_zone {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                        }
+                    }
+                }
+            }
+            if resp.drag_started() {
+                // drag_started 在指针已经移动后才触发，起点要用按下时的位置
+                let press = ui
+                    .ctx()
+                    .input(|i| i.pointer.press_origin())
+                    .or_else(|| resp.interact_pointer_pos());
+                if let Some(p) = press {
+                    let in_col_head = p.y < origin.y + hh && p.x >= origin.x + head_w;
+                    let in_row_head = p.x < origin.x + head_w && p.y >= origin.y + hh;
+                    if in_col_head {
+                        let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
+                        if (p.x - (px_of(c) + cols.size(c))).abs() <= edge_zone + 2.0 {
+                            self.col_drag = Some((c, p.x, cols.size(c)));
+                            self.sel = (0, c);
+                            self.sel_end = (1_048_575, c);
+                        }
+                    } else if in_row_head {
+                        let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
+                        if (p.y - (py_of(r) + rows.size(r))).abs() <= edge_zone + 2.0 {
+                            self.row_drag = Some((r, p.y, rows.size(r)));
+                            self.sel = (r, 0);
+                            self.sel_end = (r, 16_383);
+                        }
+                    }
+                }
+            }
+            if let Some((c, start_x, start_w)) = self.col_drag {
+                if let Some(p) = ui.ctx().pointer_interact_pos() {
+                    let w = (start_w + (p.x - start_x)).clamp(8.0, 1500.0);
+                    if (self.wb.sheet(self.sheet_idx).cols.size(c) - w).abs() > 0.3 {
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        sh.cols.set(c, w);
+                        sh.layout_dirty = true;
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
+                    self.status = format!(
+                        "{} 列宽 {:.0} 像素",
+                        cell_name(0, c).trim_end_matches('1'),
+                        w
+                    );
+                }
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.col_drag = None;
+                }
+            }
+            if let Some((r, start_y, start_h)) = self.row_drag {
+                if let Some(p) = ui.ctx().pointer_interact_pos() {
+                    let h = (start_h + (p.y - start_y)).clamp(4.0, 600.0);
+                    if (self.wb.sheet(self.sheet_idx).rows.size(r) - h).abs() > 0.3 {
+                        self.wb.sheet_mut(self.sheet_idx).rows.set(r, h);
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
+                    self.status = format!("第 {} 行行高 {:.0} 像素", r + 1, h);
+                }
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.row_drag = None;
                 }
             }
         }
@@ -7832,17 +9343,17 @@ impl SheetApp {
         // 点表头：整列 / 整行 / 全选
         if !readonly && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let in_head_x = pos.x < origin.x + HEAD_W;
-                let in_head_y = pos.y < origin.y + HEAD_H;
+                let in_head_x = pos.x < origin.x + head_w;
+                let in_head_y = pos.y < origin.y + hh;
                 if in_head_x && in_head_y {
                     let (_, _, r2, c2) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
                     self.sel = (0, 0);
                     self.sel_end = (r2, c2);
                     self.status = "已选中全表".into();
                 } else if in_head_y {
-                    let c = cols.index_at(off_x + pos.x - (origin.x + HEAD_W));
+                    let c = cols.index_at((off_x + pos.x - (origin.x + head_w) - 1.0).max(0.0));
                     // 双击列右边界 = 自适应列宽
-                    let edge = origin.x + HEAD_W + cols.pos(c + 1) - off_x;
+                    let edge = px_of(c) + cols.size(c);
                     if resp.double_clicked() && (pos.x - edge).abs() < 5.0 {
                         self.autofit_col(c);
                         return;
@@ -7852,7 +9363,12 @@ impl SheetApp {
                     self.sel_end = (r2, c);
                     self.status = format!("已选中 {} 列", cell_name(0, c).trim_end_matches('1'));
                 } else if in_head_x {
-                    let r = rows.index_at(off_y + pos.y - (origin.y + HEAD_H));
+                    let r = rows.index_at(off_y + pos.y - (origin.y + hh));
+                    let edge = py_of(r) + rows.size(r);
+                    if resp.double_clicked() && (pos.y - edge).abs() < 5.0 {
+                        self.autofit_row(r);
+                        return;
+                    }
                     let (_, _, _, c2) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
                     self.sel = (r, 0);
                     self.sel_end = (r, c2);
@@ -7861,13 +9377,37 @@ impl SheetApp {
             }
         }
 
-        // 点击选中
+        // 图表浮在单元格之上：先判断点是否落在图表里
+        let mut chart_hit = false;
         if !readonly && resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+                for (i, ch) in charts.iter().enumerate() {
+                    let (cr1, cc1, cr2, cc2) = ch.anchor;
+                    let rect = Rect::from_min_max(
+                        egui::pos2(px_of(cc1), py_of(cr1)),
+                        egui::pos2(px_of(cc2), py_of(cr2)),
+                    );
+                    if rect.contains(pos) {
+                        chart_hit = true;
+                        self.chart_sel = Some(i);
+                        self.status = format!("已选中图表：{}", ch.title);
+                        break;
+                    }
+                }
+                if !chart_hit {
+                    self.chart_sel = None;
+                }
+            }
+        }
+
+        // 点击选中
+        if !readonly && resp.clicked() && !chart_hit {
             // 点到别人正在编辑的格子，直接告诉他
             if let Some(pos) = resp.interact_pointer_pos() {
-                if pos.x > origin.x + HEAD_W && pos.y > origin.y + HEAD_H {
-                    let cc = cols.index_at(off_x + pos.x - (origin.x + HEAD_W));
-                    let rr = rows.index_at(off_y + pos.y - (origin.y + HEAD_H));
+                if pos.x > origin.x + head_w && pos.y > origin.y + hh {
+                    let cc = cols.index_at(off_x + pos.x - (origin.x + head_w));
+                    let rr = rows.index_at(off_y + pos.y - (origin.y + hh));
                     if let Some(holder) = self.lock_holder(rr, cc) {
                         self.status = format!(
                             "{} 正在编辑 {}，同一格只能一个人改",
@@ -7878,19 +9418,11 @@ impl SheetApp {
                 }
             }
             if let Some(pos) = resp.interact_pointer_pos() {
-                let dx = pos.x - (origin.x + HEAD_W);
-                let dy = pos.y - (origin.y + HEAD_H);
+                let dx = pos.x - (origin.x + head_w);
+                let dy = pos.y - (origin.y + hh);
                 if dx >= 0.0 && dy >= 0.0 {
-                    let c = if fx > 0 && pos.x < body_x {
-                        cols.index_at(pos.x - (origin.x + HEAD_W))
-                    } else {
-                        cols.index_at(off_x + dx)
-                    };
-                    let r = if fy > 0 && pos.y < body_y {
-                        rows.index_at(pos.y - (origin.y + HEAD_H))
-                    } else {
-                        rows.index_at(off_y + dy)
-                    };
+                    let c = col_at(pos.x);
+                    let r = row_at(pos.y);
                     if self.editing.is_some() {
                         self.commit_edit(None);
                     }
@@ -7902,6 +9434,17 @@ impl SheetApp {
                         None => (r, c),
                     };
                     self.sel_end = self.sel;
+                    if let Some(st) = self.format_painter.take() {
+                        self.apply_style(move |s| *s = st.clone());
+                        self.status = "已套用格式".into();
+                    }
+                    // 双击单元格进入编辑（Excel 的基础操作）
+                    let body_double = resp.double_clicked()
+                        && pos.x > origin.x + head_w
+                        && pos.y > origin.y + hh;
+                    if body_double {
+                        self.begin_edit(None);
+                    }
                 }
             }
         }
@@ -7999,7 +9542,8 @@ impl SheetApp {
         if let Some(mut ed) = if readonly { None } else { self.editing.take() } {
             let rect = Rect::from_min_size(
                 egui::pos2(sx, sy),
-                Vec2::new(sw.max(160.0), sh.max(rows.size(sr1))),
+                // 编辑框和 Excel 一样只盖住单元格本身，不再横向撑到 160px
+                Vec2::new(sw.max(72.0), sh.max(rows.size(sr1))),
             );
             let out = ui.put(rect, egui::TextEdit::singleline(&mut ed.buf));
             out.request_focus();
@@ -8016,9 +9560,9 @@ impl SheetApp {
 
         // 悬停显示批注
         if let Some(pos) = resp.hover_pos() {
-            if pos.x > origin.x + HEAD_W && pos.y > origin.y + HEAD_H {
-                let hc = cols.index_at(off_x + pos.x - (origin.x + HEAD_W));
-                let hr = rows.index_at(off_y + pos.y - (origin.y + HEAD_H));
+            if pos.x > origin.x + head_w && pos.y > origin.y + hh {
+                let hc = cols.index_at(off_x + pos.x - (origin.x + head_w));
+                let hr = rows.index_at(off_y + pos.y - (origin.y + hh));
                 if let Some(n) = notes.get(&sheetcore::model::CellRef::new(hr, hc)) {
                     egui::show_tooltip_at_pointer(
                         ctx,
@@ -8034,9 +9578,265 @@ impl SheetApp {
             }
         }
 
+        // 表头右键：插入/删除/自适应（Excel 的列标、行号菜单）
+        if !readonly && resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let in_col_head = p.y < origin.y + hh && p.x >= origin.x + head_w;
+                let in_row_head = p.x < origin.x + head_w && p.y >= origin.y + hh;
+                if in_col_head {
+                    let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
+                    self.sel = (0, c);
+                    self.sel_end = (1_048_575, c);
+                    self.head_menu = Some((0, c, p));
+                } else if in_row_head {
+                    let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
+                    self.sel = (r, 0);
+                    self.sel_end = (r, 16_383);
+                    self.head_menu = Some((1, r, p));
+                }
+            }
+        }
+        if let Some((kind, idx, menu_pos)) = self.head_menu {
+            let mut act: Option<u8> = None;
+            let out = egui::Area::new(egui::Id::new(("head_menu", kind, idx)))
+                .fixed_pos(menu_pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(150.0);
+                        if kind == 0 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} 列",
+                                    cell_name(0, idx).trim_end_matches('1')
+                                ))
+                                .size(11.0)
+                                .weak(),
+                            );
+                            ui.separator();
+                            if ui.button("插入列").clicked() {
+                                act = Some(0);
+                            }
+                            if ui.button("删除列").clicked() {
+                                act = Some(1);
+                            }
+                            if ui.button("列宽自适应").clicked() {
+                                act = Some(2);
+                            }
+                            if ui.button("列宽…").clicked() {
+                                act = Some(6);
+                            }
+                            ui.separator();
+                            if ui.button("隐藏列").clicked() {
+                                act = Some(8);
+                            }
+                            let (_, c1, _, c2) = self.sel_rect();
+                            let any_hidden = self
+                                .wb
+                                .sheet(self.sheet_idx)
+                                .hidden_cols
+                                .iter()
+                                .any(|c| *c >= c1 && *c <= c2);
+                            if any_hidden && ui.button("取消隐藏列").clicked() {
+                                act = Some(9);
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("第 {} 行", idx + 1))
+                                    .size(11.0)
+                                    .weak(),
+                            );
+                            ui.separator();
+                            if ui.button("插入行").clicked() {
+                                act = Some(3);
+                            }
+                            if ui.button("删除行").clicked() {
+                                act = Some(4);
+                            }
+                            if ui.button("行高自适应").clicked() {
+                                act = Some(5);
+                            }
+                            if ui.button("行高…").clicked() {
+                                act = Some(7);
+                            }
+                            ui.separator();
+                            if ui.button("隐藏行").clicked() {
+                                act = Some(10);
+                            }
+                            let (r1, _, r2, _) = self.sel_rect();
+                            let any_hidden = self
+                                .wb
+                                .sheet(self.sheet_idx)
+                                .hidden_rows_user
+                                .iter()
+                                .any(|r| *r >= r1 && *r <= r2);
+                            if any_hidden && ui.button("取消隐藏行").clicked() {
+                                act = Some(11);
+                            }
+                        }
+                    });
+                });
+            if ctx.input(|i| i.pointer.any_click()) {
+                let inside = ctx
+                    .pointer_interact_pos()
+                    .map(|p| out.response.rect.contains(p))
+                    .unwrap_or(false);
+                if !inside && act.is_none() {
+                    self.head_menu = None;
+                }
+            }
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.head_menu = None;
+            }
+            if let Some(a) = act {
+                match a {
+                    0 => self.structural(sheetcore::structural::Structural::InsertCols {
+                        at: idx,
+                        n: 1,
+                    }),
+                    1 => self.structural(sheetcore::structural::Structural::DeleteCols {
+                        at: idx,
+                        n: 1,
+                    }),
+                    2 => self.autofit_col(idx),
+                    3 => self.structural(sheetcore::structural::Structural::InsertRows {
+                        at: idx,
+                        n: 1,
+                    }),
+                    4 => self.structural(sheetcore::structural::Structural::DeleteRows {
+                        at: idx,
+                        n: 1,
+                    }),
+                    5 => self.autofit_row(idx),
+                    6 => {
+                        let w = self.wb.sheet(self.sheet_idx).cols.size(idx);
+                        self.size_dlg = Some((true, w));
+                    }
+                    7 => {
+                        let h = self.wb.sheet(self.sheet_idx).rows.size(idx);
+                        self.size_dlg = Some((false, h));
+                    }
+                    8 => {
+                        let (_, c1, _, c2) = self.sel_rect();
+                        let sheet = self.wb.sheet_mut(self.sheet_idx);
+                        for c in c1..=c2 {
+                            sheet.hidden_cols.insert(c);
+                        }
+                        sheet.layout_dirty = true;
+                        self.status = format!("已隐藏 {} 列", c2 - c1 + 1);
+                    }
+                    9 => {
+                        let (_, c1, _, c2) = self.sel_rect();
+                        let sheet = self.wb.sheet_mut(self.sheet_idx);
+                        let before = sheet.hidden_cols.len();
+                        sheet.hidden_cols.retain(|c| *c < c1 || *c > c2);
+                        let n = before - sheet.hidden_cols.len();
+                        sheet.layout_dirty = true;
+                        self.status = format!("已取消隐藏 {n} 列");
+                    }
+                    10 => {
+                        let (r1, _, r2, _) = self.sel_rect();
+                        let sheet = self.wb.sheet_mut(self.sheet_idx);
+                        for r in r1..=r2 {
+                            sheet.hidden_rows_user.insert(r);
+                        }
+                        sheet.layout_dirty = true;
+                        self.status = format!("已隐藏 {} 行", r2 - r1 + 1);
+                    }
+                    _ => {
+                        let (r1, _, r2, _) = self.sel_rect();
+                        let sheet = self.wb.sheet_mut(self.sheet_idx);
+                        let before = sheet.hidden_rows_user.len();
+                        sheet.hidden_rows_user.retain(|r| *r < r1 || *r > r2);
+                        let n = before - sheet.hidden_rows_user.len();
+                        sheet.layout_dirty = true;
+                        self.status = format!("已取消隐藏 {n} 行");
+                    }
+                }
+                self.head_menu = None;
+            }
+        }
+
+        // 页间距：把落在页缝里的网格线、冻结线盖掉（页缝本身没有单元格）
+        if let Some(g) = &pg {
+            let body_clip = Rect::from_min_max(
+                egui::pos2(origin.x + head_w, origin.y + hh),
+                resp.rect.max,
+            );
+            let pp = painter.with_clip_rect(body_clip);
+            let gray = Color32::from_rgb(191, 191, 191);
+            for k in 0..g.pages_x.saturating_sub(1) {
+                let x0 =
+                    body_x + PAGE_PAD + k as f32 * (g.paper_w + PAGE_GAP) + g.paper_w - off_x;
+                pp.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(x0, origin.y),
+                        egui::pos2(x0 + PAGE_GAP, resp.rect.max.y),
+                    ),
+                    0.0,
+                    gray,
+                );
+            }
+            for j in 0..g.pages_y.saturating_sub(1) {
+                let y0 =
+                    body_y + PAGE_PAD + j as f32 * (g.paper_h + PAGE_GAP) + g.paper_h - off_y;
+                pp.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(origin.x, y0),
+                        egui::pos2(resp.rect.max.x, y0 + PAGE_GAP),
+                    ),
+                    0.0,
+                    gray,
+                );
+            }
+            // 最后一页右侧/下方也是灰底（网格线画到了整块画布）
+            let right = body_x + PAGE_PAD + g.total_w - off_x;
+            if right < resp.rect.max.x {
+                pp.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(right.max(body_clip.min.x), origin.y),
+                        resp.rect.max,
+                    ),
+                    0.0,
+                    gray,
+                );
+            }
+            let bottom = body_y + PAGE_PAD + g.total_h - off_y;
+            if bottom < resp.rect.max.y {
+                pp.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(origin.x, bottom.max(body_clip.min.y)),
+                        egui::pos2(resp.rect.max.x, resp.rect.max.y),
+                    ),
+                    0.0,
+                    gray,
+                );
+            }
+            if self.view_mode == 2 {
+                for k in 0..g.pages_x {
+                    let left = body_x + PAGE_PAD + k as f32 * (g.paper_w + PAGE_GAP) - off_x;
+                    for j in 0..g.pages_y {
+                        let top = body_y + PAGE_PAD + j as f32 * (g.paper_h + PAGE_GAP) - off_y;
+                        let r = Rect::from_min_size(
+                            egui::pos2(left, top),
+                            Vec2::new(g.paper_w, g.paper_h),
+                        );
+                        if r.intersects(body_clip) {
+                            pp.text(
+                                egui::pos2(r.center().x, r.top() - 8.0),
+                                Align2::CENTER_CENTER,
+                                format!("第 {} 页", j * g.pages_x + k + 1),
+                                FontId::proportional(11.0),
+                                Color32::from_rgb(70, 110, 180),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if !dump.is_empty() {
-            self.dump_accum.push_str(&dump.join("
-"));
+            self.dump_accum.push_str(&dump.join("\n"));
             self.dump_accum.push_str("
 ");
         }
@@ -9016,8 +10816,213 @@ impl Drop for SheetApp {
     }
 }
 
+impl SheetApp {
+    /// 无边框窗口的边缘缩放：四周 5px 内按下就交给系统拖动改大小
+    fn window_resize_edges(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+        let r = ctx.screen_rect();
+        let m = 5.0;
+        let left = p.x <= r.left() + m;
+        let right = p.x >= r.right() - m;
+        let top = p.y <= r.top() + m;
+        let bottom = p.y >= r.bottom() - m;
+        let dir = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(egui::ResizeDirection::West),
+            (_, true, _, _) => Some(egui::ResizeDirection::East),
+            (_, _, true, _) => Some(egui::ResizeDirection::North),
+            (_, _, _, true) => Some(egui::ResizeDirection::South),
+            _ => None,
+        };
+        let Some(dir) = dir else { return };
+        let cursor = match dir {
+            egui::ResizeDirection::North | egui::ResizeDirection::South => {
+                egui::CursorIcon::ResizeVertical
+            }
+            egui::ResizeDirection::East | egui::ResizeDirection::West => {
+                egui::CursorIcon::ResizeHorizontal
+            }
+            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+                egui::CursorIcon::ResizeNwSe
+            }
+            _ => egui::CursorIcon::ResizeNeSw,
+        };
+        ctx.set_cursor_icon(cursor);
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+
+    /// Excel 式标题栏：应用图标 + 快速访问工具栏 + 居中文件名 + 窗口按钮。
+    /// 窗口已经关掉系统装饰，所以拖动/双击最大化/三键都由这里接管。
+    fn title_bar(&mut self, ctx: &egui::Context) {
+        let dark = ctx.style().visuals.dark_mode;
+        let bg = if dark {
+            Color32::from_rgb(38, 42, 49)
+        } else {
+            Color32::from_rgb(243, 243, 243)
+        };
+        let fg = if dark {
+            Color32::from_rgb(226, 229, 234)
+        } else {
+            Color32::from_rgb(29, 29, 29)
+        };
+        let hover = if dark {
+            Color32::from_rgb(55, 62, 72)
+        } else {
+            Color32::from_rgb(229, 229, 229)
+        };
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(ui_kit::TITLE_H)
+            .frame(egui::Frame::NONE.fill(bg))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter().clone();
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - 1.0),
+                        rect.right_bottom(),
+                    ),
+                    0.0,
+                    ui_kit::BORDER,
+                );
+                // 应用图标：绿色方块 + 白色网格（不抄 Excel 的 X 标志）
+                let ir = Rect::from_center_size(
+                    egui::pos2(rect.left() + 24.0, rect.center().y),
+                    Vec2::splat(20.0),
+                );
+                painter.rect_filled(ir, 3.0, ui_kit::ACCENT);
+                let g = ir.shrink(5.0);
+                let sw = egui::Stroke::new(1.0, Color32::WHITE);
+                painter.line_segment([egui::pos2(g.left(), g.top() + g.height() / 3.0), egui::pos2(g.right(), g.top() + g.height() / 3.0)], sw);
+                painter.line_segment([egui::pos2(g.left(), g.top() + g.height() * 2.0 / 3.0), egui::pos2(g.right(), g.top() + g.height() * 2.0 / 3.0)], sw);
+                painter.line_segment([egui::pos2(g.left() + g.width() / 3.0, g.top()), egui::pos2(g.left() + g.width() / 3.0, g.bottom())], sw);
+                painter.line_segment([egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.top()), egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.bottom())], sw);
+                // 快速访问工具栏：保存 / 撤销 / 重做
+                let (cu, cr) = (self.undo.can_undo(), self.undo.can_redo());
+                for (i, (icon, tip, on)) in [
+                    (Icon::Save, "保存（Ctrl+S）", true),
+                    (Icon::Undo, "撤销（Ctrl+Z）", cu),
+                    (Icon::Redo, "重做（Ctrl+Y）", cr),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let b = Rect::from_center_size(
+                        egui::pos2(rect.left() + 56.0 + i as f32 * 28.0, rect.center().y),
+                        Vec2::splat(26.0),
+                    );
+                    let resp = ui.interact(b, egui::Id::new(("qat", i)), Sense::click());
+                    if resp.hovered() {
+                        painter.rect_filled(b, 3.0, hover);
+                    }
+                    let col = if *on { fg } else { fg.gamma_multiply(0.35) };
+                    ui_icons::draw_excel(&painter, b.shrink(5.0), *icon, col, *on);
+                    let resp = resp.on_hover_text(*tip);
+                    if resp.clicked() && *on {
+                        match i {
+                            0 => self.save(false),
+                            1 => self.do_undo(false),
+                            _ => self.do_undo(true),
+                        }
+                    }
+                }
+                // 居中的文件名（和 Excel 一样不随窗口拉伸跑偏）
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &self.last_title,
+                    FontId::proportional(12.0),
+                    fg,
+                );
+                // 窗口按钮
+                let bw = 46.0;
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let buttons = [
+                    ("close", rect.right() - bw, bg),
+                    ("max", rect.right() - bw * 2.0, bg),
+                    ("min", rect.right() - bw * 3.0, bg),
+                ];
+                for (name, x, _) in buttons {
+                    let br = Rect::from_min_size(
+                        egui::pos2(x, rect.top()),
+                        Vec2::new(bw, ui_kit::TITLE_H),
+                    );
+                    let resp = ui.interact(br, egui::Id::new(("winbtn", name)), Sense::click());
+                    if resp.hovered() {
+                        let hb = if name == "close" {
+                            Color32::from_rgb(196, 43, 28)
+                        } else {
+                            hover
+                        };
+                        painter.rect_filled(br, 0.0, hb);
+                    }
+                    let col = if name == "close" && resp.hovered() {
+                        Color32::WHITE
+                    } else {
+                        fg
+                    };
+                    let c = br.center();
+                    match name {
+                        "close" => {
+                            let d = 5.0;
+                            let st = egui::Stroke::new(1.2, col);
+                            painter.line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], st);
+                            painter.line_segment([egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)], st);
+                        }
+                        "min" => {
+                            painter.line_segment([egui::pos2(c.x - 5.0, c.y + 4.0), egui::pos2(c.x + 5.0, c.y + 4.0)], egui::Stroke::new(1.2, col));
+                        }
+                        _ => {
+                            let st = egui::Stroke::new(1.2, col);
+                            if maximized {
+                                let a = Rect::from_min_size(egui::pos2(c.x - 4.0, c.y - 5.0), Vec2::new(8.0, 8.0));
+                                let b2 = Rect::from_min_size(egui::pos2(c.x - 6.0, c.y - 3.0), Vec2::new(8.0, 8.0));
+                                painter.rect_stroke(a, 0.0, st, egui::StrokeKind::Inside);
+                                painter.rect_stroke(b2, 0.0, st, egui::StrokeKind::Inside);
+                            } else {
+                                let a = Rect::from_center_size(c, Vec2::new(10.0, 10.0));
+                                painter.rect_stroke(a, 0.0, st, egui::StrokeKind::Inside);
+                            }
+                        }
+                    }
+                    if resp.clicked() {
+                        match name {
+                            "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            "max" => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+                            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        }
+                    }
+                }
+                // 空白处拖动 / 双击最大化（避开顶部 5px 缩放边）
+                let drag = Rect::from_min_max(
+                    egui::pos2(rect.left() + 130.0, rect.top() + 5.0),
+                    egui::pos2(rect.right() - bw * 3.0, rect.bottom() - 2.0),
+                );
+                let dr = ui.interact(drag, egui::Id::new("title_drag"), Sense::click_and_drag());
+                if dr.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if dr.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+            });
+    }
+}
+
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.chart_auto && !self.wb.sheet(self.sheet_idx).charts.is_empty() {
+            self.chart_sel = Some(0);
+            self.ribbon_tab = 101;
+            self.chart_auto = false;
+        }
         let was_saving = self.has_pending_save();
         self.poll_net();
         self.poll_open();
@@ -9106,6 +11111,8 @@ impl eframe::App for SheetApp {
         }
         self.rename_dialog(ctx);
         self.format_dialog(ctx);
+        self.size_dialog(ctx);
+        self.color_popup_window(ctx);
         // 缩放：Ctrl+滚轮
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if ctrl && wheel.abs() > 0.5 {
@@ -9116,91 +11123,374 @@ impl eframe::App for SheetApp {
             }
         }
 
+        // 无边框窗口：边缘缩放 + 自绘标题栏
+        self.window_resize_edges(ctx);
+        self.title_bar(ctx);
+
+        // ---- 功能区：30px 页签行 + 102px 命令区 ----
         egui::TopBottomPanel::top("ribbon")
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.panel_fill))
+            .exact_height(
+                ui_kit::TAB_H
+                    + if self.ribbon_collapsed {
+                        1.0
+                    } else {
+                        ui_kit::RIBBON_BODY_H + 1.0
+                    },
+            )
+            .frame(egui::Frame::NONE.fill(Color32::WHITE))
             .show(ctx, |ui| {
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    for (i, name) in
-                        ["文件", "开始", "插入", "公式", "数据", "视图"].iter().enumerate()
-                    {
-                        if ui_kit::tab(ui, name, self.ribbon_tab == i).clicked() {
-                            self.ribbon_tab = i;
+                let full = ui.max_rect();
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(full.width(), ui_kit::TAB_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(12.0);
+                        for (i, name) in
+                            ["文件", "开始", "插入", "页面布局", "公式", "数据", "审阅", "视图"]
+                                .iter()
+                                .enumerate()
+                        {
+                            let tab_resp =
+                                ui_kit::tab_ex(ui, name, self.ribbon_tab == i && i != 0, i == 0);
+                            if self.keytips {
+                                let letters = ["F", "H", "N", "P", "M", "A", "R", "W"];
+                                let r = tab_resp.rect;
+                                let b = Rect::from_center_size(
+                                    egui::pos2(r.center().x, r.top() + 6.0),
+                                    Vec2::new(13.0, 11.0),
+                                );
+                                ui.painter().rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
+                                ui.painter().text(
+                                    b.center(),
+                                    Align2::CENTER_CENTER,
+                                    letters[i],
+                                    FontId::proportional(8.5),
+                                    Color32::WHITE,
+                                );
+                            }
+                            // 双击页签 / Ctrl+F1：收起功能区（Excel 的老习惯）
+                            if tab_resp.double_clicked() {
+                                self.ribbon_collapsed = !self.ribbon_collapsed;
+                            }
+                            if tab_resp.clicked() {
+                                if i == 0 {
+                                    self.backstage = true;
+                                    self.backstage_page = 0;
+                                } else {
+                                    self.ribbon_tab = i;
+                                    self.ribbon_collapsed = false;
+                                }
+                            }
                         }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
-                        if self.wb.has_vba {
-                            ui.label(
-                                egui::RichText::new("含宏（保留不执行）")
-                                    .size(10.5)
-                                    .color(egui::Color32::from_rgb(180, 110, 0)),
-                            );
+                        if self.table_at_sel().is_some() {
+                            let tr = ui_kit::tab_ex(ui, "表设计", self.ribbon_tab == 100, false);
+                            if tr.clicked() {
+                                self.ribbon_tab = 100;
+                                self.ribbon_collapsed = false;
+                            }
                         }
-                        if self.net.is_some() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "协作 · {} 人",
-                                    self.peers_list.len()
-                                ))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(46, 125, 50)),
-                            );
+                        if self.chart_at_sel().is_some() {
+                            let cr = ui_kit::tab_ex(ui, "图表工具", self.ribbon_tab == 101, false);
+                            if cr.clicked() {
+                                self.ribbon_tab = 101;
+                                self.ribbon_collapsed = false;
+                            }
                         }
-                    });
-                });
-                ui.add_space(3.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            if self.wb.has_vba {
+                                ui.label(
+                                    egui::RichText::new("含宏（保留不执行）")
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(180, 110, 0)),
+                                );
+                            }
+                            if self.net.is_some() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "协作 · {} 人",
+                                        self.peers_list.len()
+                                    ))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(46, 125, 50)),
+                                );
+                            }
+                        });
+                    },
+                );
+                if !self.ribbon_collapsed {
                 egui::ScrollArea::horizontal()
                     .id_salt("ribbon_scroll")
-                    .auto_shrink([false, true])
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
+                        ui.set_height(ui_kit::RIBBON_BODY_H);
                         ui.horizontal_top(|ui| {
-                            ui.add_space(8.0);
+                            ui.add_space(12.0);
+                            ui_kit::reset_groups();
                             match self.ribbon_tab {
                                 0 => self.ribbon_file(ui),
                                 1 => self.ribbon_home(ui),
                                 2 => self.ribbon_insert(ui),
-                                3 => self.ribbon_formula(ui),
-                                4 => self.ribbon_data(ui),
+                                3 => self.ribbon_page(ui),
+                                4 => self.ribbon_formula(ui),
+                                5 => self.ribbon_data(ui),
+                                6 => self.ribbon_review(ui),
+                                100 => self.ribbon_table(ui),
+                                101 => self.ribbon_chart(ui),
                                 _ => self.ribbon_view(ui),
                             }
                         });
                     });
-                ui.add_space(4.0);
+                }
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(full.left(), full.bottom() - 1.0),
+                        full.right_bottom(),
+                    ),
+                    0.0,
+                    ui_kit::BORDER,
+                );
             });
-        egui::TopBottomPanel::top("formula").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+
+        // ---- 编辑栏：名称框 + ×/✓/fx + 输入行（44px） ----
+        if self.show_formula_bar {
+        egui::TopBottomPanel::top("formula")
+            .exact_height(if self.fx_expanded { 88.0 } else { ui_kit::FX_H })
+            .frame(egui::Frame::NONE.fill(Color32::WHITE))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter().clone();
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - 1.0),
+                        rect.right_bottom(),
+                    ),
+                    0.0,
+                    ui_kit::BORDER,
+                );
                 let (r, c) = self.sel;
                 if !self.name_edit {
                     self.name_buf = cell_name(r, c);
                 }
-                let nb = ui.add_sized(
-                    [84.0, 22.0],
-                    egui::TextEdit::singleline(&mut self.name_buf)
-                        .hint_text("A1")
-                        .font(egui::TextStyle::Monospace),
+                // 名称框
+                let nb = Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 10.0),
+                    Vec2::new(100.0, 24.0),
                 );
-                if nb.gained_focus() {
+                painter.rect_stroke(
+                    nb,
+                    2.0,
+                    Stroke::new(1.0, ui_kit::BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = Rect::from_min_max(
+                    nb.min + Vec2::new(6.0, 2.0),
+                    egui::pos2(nb.right() - 18.0, nb.bottom() - 2.0),
+                );
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let nb_resp = child.add_sized(
+                    Vec2::new(inner.width(), 20.0),
+                    egui::TextEdit::singleline(&mut self.name_buf).frame(false),
+                );
+                if nb_resp.gained_focus() {
                     self.name_edit = true;
                 }
-                if nb.lost_focus() {
+                if nb_resp.lost_focus() {
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     self.name_edit = false;
                     if enter {
                         self.goto_name();
                     }
                 }
-                ui.label(egui::RichText::new("fx").italics());
-                ui.separator();
+                let cx = nb.right() - 10.0;
+                let cy = nb.center().y;
+                let caret = Stroke::new(1.0, Color32::from_rgb(68, 68, 68));
+                painter.line_segment(
+                    [egui::pos2(cx - 3.5, cy - 1.5), egui::pos2(cx, cy + 2.0)],
+                    caret,
+                );
+                painter.line_segment(
+                    [egui::pos2(cx, cy + 2.0), egui::pos2(cx + 3.5, cy - 1.5)],
+                    caret,
+                );
+                let caret_btn = Rect::from_min_max(
+                    egui::pos2(nb.right() - 18.0, nb.top()),
+                    nb.right_bottom(),
+                );
+                let cresp = ui.interact(caret_btn, egui::Id::new("name_caret"), Sense::click());
+                if cresp.clicked() {
+                    self.name_dropdown = !self.name_dropdown;
+                }
+                if self.name_dropdown {
+                    let mut close = false;
+                    let mut pick: Option<String> = None;
+                    let pop_pos = egui::pos2(nb.left(), nb.bottom() + 2.0);
+                    egui::Area::new(egui::Id::new("name_list"))
+                        .fixed_pos(pop_pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(180.0);
+                                if self.wb.names.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("没有定义名称").size(11.5).weak(),
+                                    );
+                                }
+                                for (n, _, body) in &self.wb.names {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(format!("{n}   ={body}"))
+                                                    .size(11.5),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        pick = Some(n.clone());
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(n) = pick {
+                        self.name_buf = n;
+                        self.name_dropdown = false;
+                        self.goto_name();
+                        close = true;
+                    }
+                    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                        close = true;
+                    }
+                    if close {
+                        self.name_dropdown = false;
+                    }
+                }
+
+                // × ✓ fx
+                let fx_left = rect.left() + 112.0;
+                let mut commit = false;
+                let mut cancel = false;
+                let mut fx_click = false;
+                let editing = self.editing.is_some();
+                for (i, kind) in ["cancel", "ok", "fx"].iter().enumerate() {
+                    let b = Rect::from_min_size(
+                        egui::pos2(fx_left + i as f32 * 26.0, rect.top() + 10.0),
+                        Vec2::splat(24.0),
+                    );
+                    let resp = ui.interact(b, egui::Id::new(("fxbtn", i)), Sense::click());
+                    let active = editing || *kind == "fx";
+                    if resp.hovered() && active {
+                        painter.rect_filled(b, 2.0, ui_kit::HOVER);
+                    }
+                    let col = if active {
+                        Color32::from_rgb(68, 68, 68)
+                    } else {
+                        Color32::from_rgb(178, 178, 178)
+                    };
+                    let cc = b.center();
+                    match *kind {
+                        "cancel" => {
+                            let d = 4.5;
+                            let st = Stroke::new(1.3, col);
+                            painter.line_segment(
+                                [egui::pos2(cc.x - d, cc.y - d), egui::pos2(cc.x + d, cc.y + d)],
+                                st,
+                            );
+                            painter.line_segment(
+                                [egui::pos2(cc.x + d, cc.y - d), egui::pos2(cc.x - d, cc.y + d)],
+                                st,
+                            );
+                        }
+                        "ok" => {
+                            let st = Stroke::new(1.6, col);
+                            painter.line_segment(
+                                [egui::pos2(cc.x - 5.0, cc.y), egui::pos2(cc.x - 1.0, cc.y + 4.0)],
+                                st,
+                            );
+                            painter.line_segment(
+                                [egui::pos2(cc.x - 1.0, cc.y + 4.0), egui::pos2(cc.x + 5.5, cc.y - 4.0)],
+                                st,
+                            );
+                        }
+                        _ => {
+                            painter.text(
+                                cc,
+                                egui::Align2::CENTER_CENTER,
+                                "fx",
+                                FontId::proportional(12.0),
+                                col,
+                            );
+                        }
+                    }
+                    if resp.clicked() {
+                        match *kind {
+                            "cancel" => cancel = true,
+                            "ok" => commit = true,
+                            _ => fx_click = true,
+                        }
+                    }
+                }
+                painter.line_segment(
+                    [
+                        egui::pos2(fx_left + 84.0, rect.top() + 11.0),
+                        egui::pos2(fx_left + 84.0, rect.bottom() - 11.0),
+                    ],
+                    Stroke::new(1.0, egui::Color32::from_rgb(224, 224, 224)),
+                );
+
+                // 右侧展开箭头（Excel 的编辑栏折叠/展开）
+                let chev = Rect::from_min_size(
+                    egui::pos2(rect.right() - 22.0, rect.top() + 10.0),
+                    Vec2::new(18.0, 24.0),
+                );
+                let cresp = ui.interact(chev, egui::Id::new("fx_expand"), Sense::click());
+                if cresp.hovered() {
+                    painter.rect_filled(chev, 2.0, ui_kit::HOVER);
+                }
+                let cc = chev.center();
+                let cst = Stroke::new(1.1, Color32::from_rgb(90, 90, 90));
+                if self.fx_expanded {
+                    painter.line_segment([egui::pos2(cc.x - 4.0, cc.y + 2.0), egui::pos2(cc.x, cc.y - 2.0)], cst);
+                    painter.line_segment([egui::pos2(cc.x, cc.y - 2.0), egui::pos2(cc.x + 4.0, cc.y + 2.0)], cst);
+                } else {
+                    painter.line_segment([egui::pos2(cc.x - 4.0, cc.y - 2.0), egui::pos2(cc.x, cc.y + 2.0)], cst);
+                    painter.line_segment([egui::pos2(cc.x, cc.y + 2.0), egui::pos2(cc.x + 4.0, cc.y - 2.0)], cst);
+                }
+                if cresp.on_hover_text("展开编辑栏").clicked() {
+                    self.fx_expanded = !self.fx_expanded;
+                }
+
+                // 输入行
+                let ed_rect = Rect::from_min_max(
+                    egui::pos2(fx_left + 92.0, rect.top() + 10.0),
+                    egui::pos2(rect.right() - 8.0, rect.bottom() - 10.0),
+                );
                 if self.editing.is_some() {
-                    let mut commit = false;
-                    let mut cancel = false;
                     if let Some(ed) = self.editing.as_mut() {
-                        let te = ui.add_sized(
-                            [ui.available_width(), 20.0],
-                            egui::TextEdit::singleline(&mut ed.buf).font(egui::TextStyle::Monospace),
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(ed_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
+                        let te = if self.fx_expanded {
+                            child.add_sized(
+                                Vec2::new(ed_rect.width(), ed_rect.height()),
+                                egui::TextEdit::multiline(&mut ed.buf)
+                                    .frame(false)
+                                    .desired_rows(3),
+                            )
+                        } else {
+                            child.add_sized(
+                                Vec2::new(ed_rect.width(), 24.0),
+                                egui::TextEdit::singleline(&mut ed.buf).frame(false),
+                            )
+                        };
                         if te.lost_focus() {
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 commit = true;
@@ -9208,12 +11498,6 @@ impl eframe::App for SheetApp {
                                 cancel = true;
                             }
                         }
-                    }
-                    if commit {
-                        self.commit_edit(Some((1, 0)));
-                    } else if cancel {
-                        self.editing = None;
-                        self.release_lock();
                     }
                 } else {
                     let cur = match self.wb.sheet(self.sheet_idx).get(r, c) {
@@ -9224,39 +11508,58 @@ impl eframe::App for SheetApp {
                             .unwrap_or_else(|| cell.value.display()),
                         None => String::new(),
                     };
-                    let resp = ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), 22.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(cur)
-                                        .family(egui::FontFamily::Monospace)
-                                        .size(12.5),
-                                )
-                                .sense(egui::Sense::click()),
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(ed_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    let resp = child
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(cur)
+                                    .family(egui::FontFamily::Proportional)
+                                    .size(13.0),
                             )
-                            .interact(egui::Sense::click())
-                        },
-                    )
-                    .inner;
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        )
+                        .interact(egui::Sense::click());
                     if resp.clicked() {
                         self.begin_edit(None);
                     }
                 }
+                if commit {
+                    self.commit_edit(Some((1, 0)));
+                } else if cancel {
+                    self.editing = None;
+                    self.release_lock();
+                } else if fx_click {
+                    if self.editing.is_none() {
+                        self.begin_edit(None);
+                        if let Some(ed) = self.editing.as_mut() {
+                            if !ed.buf.starts_with('=') {
+                                ed.buf.insert(0, '=');
+                            }
+                        }
+                    }
+                }
             });
-        });
+        }
 
-        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+        // ---- 状态栏（22px，最底部） ----
+        egui::TopBottomPanel::bottom("statusbar")
+            .exact_height(22.0)
+            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(
+                    Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 1.0)),
+                    0.0,
+                    ui_kit::BORDER,
+                );
                 let (r1, c1, r2, c2) = self.sel_rect();
                 let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-                ui.label(format!("{cells} 格"));
-                if !self.wb.links.is_empty() {
-                    ui.separator();
-                    ui.label(format!("外部链接 {}", self.wb.links.len()))
-                        .on_hover_text("数据 → 编辑链接…");
-                }
+                let mut stat = String::new();
                 if cells > 1 && cells <= 200_000 {
                     let (mut count, mut sum, mut num) = (0u64, 0f64, 0u64);
                     let sheet = self.wb.sheet(self.sheet_idx);
@@ -9273,34 +11576,209 @@ impl eframe::App for SheetApp {
                             }
                         }
                     }
-                    ui.separator();
-                    ui.label(format!("计数 {count}"));
                     if num > 0 {
-                        ui.separator();
-                        ui.label(format!("求和 {sum:.2}"));
-                        ui.separator();
-                        ui.label(format!("平均 {:.2}", sum / num as f64));
+                        stat = format!("平均值: {:.4}    计数: {}    求和: {:.4}", sum / num as f64, count, sum);
+                    } else if count > 0 {
+                        stat = format!("计数: {count}");
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.net.is_some() {
-                        ui.label(egui::RichText::new("协作中").small().weak());
-                        ui.separator();
-                    }
-                    ui.label(egui::RichText::new(self.status.clone()).small().weak());
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(if self.editing.is_some() { "输入" } else { "就绪" })
+                            .size(11.0)
+                            .color(ui_kit::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        // 缩放百分比
+                        let ztext = format!("{:.0}%", self.zoom * 100.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(ztext).size(11.0).color(ui_kit::TEXT),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("点击回到 100%")
+                            .clicked()
+                        {
+                            self.zoom = 1.0;
+                            ctx.set_zoom_factor(1.0);
+                        }
+                        // 放大 / 滑杆 / 缩小（从右往左加，视觉上是 − 滑杆 +）
+                        if ui
+                            .add_sized(
+                                [18.0, 20.0],
+                                egui::Button::new(
+                                    egui::RichText::new("+").size(12.0).color(ui_kit::TEXT),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            let z = (self.zoom + 0.1).clamp(0.5, 2.5);
+                            self.zoom = z;
+                            ctx.set_zoom_factor(z);
+                        }
+                        let mut z = self.zoom;
+                        if zoom_bar(ui, &mut z) {
+                            self.zoom = z;
+                            ctx.set_zoom_factor(z);
+                        }
+                        if ui
+                            .add_sized(
+                                [18.0, 20.0],
+                                egui::Button::new(
+                                    egui::RichText::new("−").size(12.0).color(ui_kit::TEXT),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            let z = (self.zoom - 0.1).clamp(0.5, 2.5);
+                            self.zoom = z;
+                            ctx.set_zoom_factor(z);
+                        }
+                        ui.add_space(6.0);
+                        // 三个视图按钮
+                        let (vr, _) = ui.allocate_exact_size(Vec2::new(72.0, 21.0), Sense::hover());
+                        for (i, tip) in ["普通", "页面布局", "分页预览"].iter().enumerate() {
+                            let b = Rect::from_min_size(
+                                egui::pos2(vr.right() - (3 - i) as f32 * 24.0, vr.top()),
+                                Vec2::new(24.0, 20.0),
+                            );
+                            let resp = ui.interact(b, egui::Id::new(("viewbtn", i)), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(b, 2.0, ui_kit::HOVER);
+                            }
+                            let on = match i {
+                                0 => !self.print_preview && !self.show_pages,
+                                1 => self.print_preview,
+                                _ => self.show_pages,
+                            };
+                            let col = if on {
+                                ui_kit::ACCENT
+                            } else {
+                                Color32::from_rgb(96, 96, 96)
+                            };
+                            let st = Stroke::new(1.0, col);
+                            let inner = Rect::from_center_size(b.center(), Vec2::new(12.0, 10.0));
+                            ui.painter().rect_stroke(inner, 1.0, st, egui::StrokeKind::Inside);
+                            match i {
+                                0 => {}
+                                1 => {
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(
+                                            inner.min + Vec2::new(2.0, 2.0),
+                                            Vec2::new(8.0, 3.0),
+                                        ),
+                                        0.0,
+                                        col.gamma_multiply(0.35),
+                                    );
+                                }
+                                _ => {
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(inner.left() + 4.0, inner.top()),
+                                            egui::pos2(inner.left() + 4.0, inner.bottom()),
+                                        ],
+                                        st,
+                                    );
+                                }
+                            }
+                            let resp = resp.on_hover_text(*tip);
+                            if resp.clicked() {
+                                match i {
+                                    0 => {
+                                        self.show_pages = false;
+                                        self.print_preview = false;
+                                    }
+                                    1 => {
+                                        self.preview_page = 0;
+                                        self.print_preview = true;
+                                    }
+                                    _ => {
+                                        self.print_preview = false;
+                                        self.show_pages = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !stat.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(stat).size(11.0).color(ui_kit::TEXT),
+                            );
+                        }
+                        if !self.wb.links.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!("外部链接 {}", self.wb.links.len()))
+                                    .size(11.0)
+                                    .color(ui_kit::TEXT),
+                            )
+                            .on_hover_text("数据 → 编辑链接…");
+                        }
+                    });
                 });
             });
-        });
 
-        egui::TopBottomPanel::bottom("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+        // ---- 工作表标签条（32px，状态栏之上） ----
+        egui::TopBottomPanel::bottom("tabs")
+            .exact_height(32.0)
+            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().rect_filled(
+                    Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 1.0)),
+                    0.0,
+                    ui_kit::BORDER,
+                );
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let mut goto: Option<usize> = None;
                 let mut del: Option<usize> = None;
                 let mut ren: Option<(usize, String)> = None;
                 let mut mv: Option<(usize, i32)> = None;
+                // 左/右滚动按钮（Excel 在最左边两个 32×32）
+                for (i, dir) in ["left", "right"].iter().enumerate() {
+                    let b = Rect::from_min_size(
+                        egui::pos2(rect.left() + i as f32 * 32.0, rect.top() + 1.0),
+                        Vec2::new(32.0, 31.0),
+                    );
+                    let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(b, 0.0, ui_kit::HOVER);
+                    }
+                    if resp.clicked() {
+                        let delta = if *dir == "left" { -180.0 } else { 180.0 };
+                        self.tab_scroll = (self.tab_scroll + delta).max(0.0);
+                    }
+                    let c = b.center();
+                    let st = Stroke::new(1.0, Color32::from_rgb(120, 120, 120));
+                    let d = if *dir == "left" { -1.0 } else { 1.0 };
+                    ui.painter().line_segment(
+                        [egui::pos2(c.x - d * 2.0, c.y - 4.0), egui::pos2(c.x + d * 2.0, c.y)],
+                        st,
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(c.x + d * 2.0, c.y), egui::pos2(c.x - d * 2.0, c.y + 4.0)],
+                        st,
+                    );
+                }
+                ui.horizontal(|ui| {
+                ui.add_space(72.0);
+                let mut area = egui::ScrollArea::horizontal()
+                    .id_salt("sheet_tabs")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .auto_shrink([false, false])
+                    .horizontal_scroll_offset(self.tab_scroll);
+                let out = area.show(ui, |ui| {
+                ui.horizontal(|ui| {
                 for i in 0..self.wb.sheets.len() {
                     let name = self.wb.sheets[i].name.clone();
-                    let resp = ui_kit::sheet_tab(ui, &name, self.sheet_idx == i);
+                    let tab_color = self.wb.sheets[i].tab_color;
+                    let resp = ui_kit::sheet_tab(ui, &name, self.sheet_idx == i, tab_color);
                     if resp.drag_started() {
                         self.tab_drag = Some(i);
                     }
@@ -9316,9 +11794,11 @@ impl eframe::App for SheetApp {
                     }
                     if resp.clicked() {
                         self.commit_edit(None);
-                        if self.editing.is_none() {
-                            goto = Some(i);
-                        }
+                        goto = Some(i);
+                    }
+                    // 双击工作表标签 = 重命名（Excel 的基础操作）
+                    if resp.double_clicked() {
+                        ren = Some((i, name.clone()));
                     }
                     resp.context_menu(|ui| {
                         if ui.button("新建工作表").clicked() {
@@ -9330,6 +11810,73 @@ impl eframe::App for SheetApp {
                             ui.close_menu();
                         }
                         ui.separator();
+                        ui.menu_button("标签颜色", |ui| {
+                            ui.set_min_width(176.0);
+                            let colors: [(&str, Option<[u8; 3]>); 16] = [
+                                ("无颜色", None),
+                                ("红", Some([192, 0, 0])),
+                                ("橙", Some([237, 125, 49])),
+                                ("黄", Some([255, 192, 0])),
+                                ("浅绿", Some([112, 173, 71])),
+                                ("绿", Some([0, 153, 68])),
+                                ("青", Some([0, 176, 240])),
+                                ("蓝", Some([68, 114, 196])),
+                                ("深蓝", Some([31, 78, 121])),
+                                ("紫", Some([112, 48, 160])),
+                                ("粉", Some([255, 102, 204])),
+                                ("棕", Some([132, 60, 12])),
+                                ("灰", Some([128, 128, 128])),
+                                ("深灰", Some([64, 64, 64])),
+                                ("黑", Some([0, 0, 0])),
+                                ("金", Some([191, 144, 0])),
+                            ];
+                            for row in 0..4 {
+                                ui.horizontal(|ui| {
+                                    for k in 0..4 {
+                                        let (label, rgb) = colors[row * 4 + k];
+                                        let (r, p) = ui.allocate_exact_size(
+                                            Vec2::new(40.0, 22.0),
+                                            Sense::click(),
+                                        );
+                                        if let Some(c) = rgb {
+                                            ui.painter().rect_filled(
+                                                Rect::from_min_size(
+                                                    r.min + Vec2::new(2.0, 2.0),
+                                                    Vec2::new(36.0, 18.0),
+                                                ),
+                                                2.0,
+                                                Color32::from_rgb(c[0], c[1], c[2]),
+                                            );
+                                        } else {
+                                            ui.painter().rect_stroke(
+                                                Rect::from_min_size(
+                                                    r.min + Vec2::new(2.0, 2.0),
+                                                    Vec2::new(36.0, 18.0),
+                                                ),
+                                                2.0,
+                                                Stroke::new(1.0, ui_kit::BORDER),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                            ui.painter().text(
+                                                r.center(),
+                                                Align2::CENTER_CENTER,
+                                                "无",
+                                                FontId::proportional(10.0),
+                                                ui_kit::TEXT_WEAK,
+                                            );
+                                        }
+                                        let tip = if rgb.is_some() { label } else { "无颜色" };
+                                        if p.on_hover_text(tip).clicked() {
+                                            let sh = self.wb.sheet_mut(i);
+                                            sh.tab_color = rgb;
+                                            sh.tab_color_dirty = true;
+                                            self.wb.dirty = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                        });
                         if ui.button("重命名…").clicked() {
                             ren = Some((i, name.clone()));
                             ui.close_menu();
@@ -9349,39 +11896,27 @@ impl eframe::App for SheetApp {
                         }
                     });
                 }
-                ui.add_space(4.0);
-                if ui.button("＋").on_hover_text("新建工作表").clicked() {
+                // 新建工作表按钮（+）
+                let nb = Rect::from_min_size(
+                    egui::pos2(ui.cursor().left(), rect.top() + 1.0),
+                    Vec2::new(32.0, 31.0),
+                );
+                let nresp = ui.interact(nb, egui::Id::new("newsheet"), Sense::click());
+                if nresp.hovered() {
+                    ui.painter().rect_filled(nb, 0.0, ui_kit::HOVER);
+                }
+                let c = nb.center();
+                let st = Stroke::new(1.2, Color32::from_rgb(68, 68, 68));
+                ui.painter()
+                    .line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], st);
+                ui.painter()
+                    .line_segment([egui::pos2(c.x, c.y - 5.0), egui::pos2(c.x, c.y + 5.0)], st);
+                if nresp.on_hover_text("新建工作表").clicked() {
                     self.add_sheet();
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    if ui
-                        .add(egui::Button::new(format!("{:.0}%", self.zoom * 100.0)).frame(false))
-                        .on_hover_text("点击回到 100%")
-                        .clicked()
-                    {
-                        self.zoom = 1.0;
-                        ctx.set_zoom_factor(1.0);
-                    }
-                    let mut z = self.zoom;
-                    if ui
-                        .add_sized(
-                            [110.0, 18.0],
-                            egui::Slider::new(&mut z, 0.5..=2.5).show_value(false),
-                        )
-                        .changed()
-                    {
-                        self.zoom = z;
-                        ctx.set_zoom_factor(z);
-                    }
-                    if ui.small_button("−").on_hover_text("缩小").clicked() {
-                        self.zoom = (self.zoom - 0.1).max(0.5);
-                        ctx.set_zoom_factor(self.zoom);
-                    }
-                    if ui.small_button("+").on_hover_text("放大").clicked() {
-                        self.zoom = (self.zoom + 0.1).min(2.5);
-                        ctx.set_zoom_factor(self.zoom);
-                    }
+                });
+                });
+                self.tab_scroll = out.state.offset.x;
                 });
                 if let Some(i) = goto {
                     self.sheet_idx = i;
@@ -9397,7 +11932,6 @@ impl eframe::App for SheetApp {
                     self.delete_sheet(i);
                 }
             });
-        });
 
         self.tree.pump();
         // 选区变化时把光标位置广播出去
@@ -9431,9 +11965,13 @@ impl eframe::App for SheetApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                self.handle_keys(ctx);
+                if !self.backstage {
+                    self.handle_keys(ctx);
+                }
                 self.draw_grid(ui, ctx);
             });
+
+        self.backstage_ui(ctx);
 
         // 自截图：等界面稳定两帧再抓，避免抓到第一帧的半成品
         if let Some(path) = self.shot_path.clone() {
@@ -9466,6 +12004,151 @@ impl eframe::App for SheetApp {
         }
         self.defer_close_while_saving(ctx, was_saving);
     }
+}
+
+/// 一条 Excel 风格滚动条：17px 厚，两端有三角箭头，中间是灰色滑块
+fn scrollbar(
+    ui: &mut egui::Ui,
+    id: &str,
+    rect: Rect,
+    horizontal: bool,
+    scroll: &mut f32,
+    total: f32,
+    view: f32,
+) {
+    if rect.width() < 12.0 || rect.height() < 12.0 {
+        return;
+    }
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, ui_kit::STATUS_BG);
+    // 两端箭头按钮
+    let arrow = 17.0;
+    let (a1, a2) = if horizontal {
+        (
+            Rect::from_min_size(rect.min, Vec2::new(arrow, rect.height())),
+            Rect::from_min_size(
+                egui::pos2(rect.right() - arrow, rect.top()),
+                Vec2::new(arrow, rect.height()),
+            ),
+        )
+    } else {
+        (
+            Rect::from_min_size(rect.min, Vec2::new(rect.width(), arrow)),
+            Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - arrow),
+                Vec2::new(rect.width(), arrow),
+            ),
+        )
+    };
+    let gray = Color32::from_rgb(96, 96, 96);
+    for (i, ar) in [a1, a2].iter().enumerate() {
+        p.rect_filled(*ar, 0.0, ui_kit::STATUS_BG);
+        let c = ar.center();
+        let dir = if i == 0 { -1.0 } else { 1.0 };
+        let pts = if horizontal {
+            vec![
+                egui::pos2(c.x + dir * 3.0, c.y),
+                egui::pos2(c.x - dir * 2.0, c.y - 4.0),
+                egui::pos2(c.x - dir * 2.0, c.y + 4.0),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x, c.y + dir * 3.0),
+                egui::pos2(c.x - 4.0, c.y - dir * 2.0),
+                egui::pos2(c.x + 4.0, c.y - dir * 2.0),
+            ]
+        };
+        p.add(egui::Shape::convex_polygon(pts, gray, Stroke::NONE));
+    }
+    let inner = if horizontal {
+        Rect::from_min_max(
+            egui::pos2(a1.right() + 2.0, rect.top() + 2.0),
+            egui::pos2(a2.left() - 2.0, rect.bottom() - 2.0),
+        )
+    } else {
+        Rect::from_min_max(
+            egui::pos2(rect.left() + 2.0, a1.bottom() + 2.0),
+            egui::pos2(rect.right() - 2.0, a2.top() - 2.0),
+        )
+    };
+    let span = if horizontal { inner.width() } else { inner.height() };
+    if span <= 8.0 {
+        return;
+    }
+    let max_scroll = (total - view).max(0.0);
+    let frac = (view / total.max(1.0)).clamp(0.0, 1.0);
+    let thumb_len = (span * frac).clamp(24.0, span);
+    let t = if max_scroll > 0.0 {
+        (*scroll / max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pos = if horizontal { inner.left() } else { inner.top() } + t * (span - thumb_len);
+    let thumb = if horizontal {
+        Rect::from_min_size(egui::pos2(pos, inner.top()), Vec2::new(thumb_len, inner.height()))
+    } else {
+        Rect::from_min_size(egui::pos2(inner.left(), pos), Vec2::new(inner.width(), thumb_len))
+    };
+    p.rect_filled(thumb, 2.0, Color32::from_rgb(201, 201, 201));
+    p.rect_stroke(
+        thumb,
+        2.0,
+        Stroke::new(1.0, Color32::from_rgb(160, 160, 160)),
+        egui::StrokeKind::Inside,
+    );
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("scrollbar", id)),
+        Sense::click_and_drag(),
+    );
+    if resp.dragged() || resp.clicked() {
+        if let Some(pt) = resp.interact_pointer_pos() {
+            let along = if horizontal { pt.x } else { pt.y };
+            let base = if horizontal { inner.left() } else { inner.top() };
+            let t = ((along - base - thumb_len / 2.0) / (span - thumb_len)).clamp(0.0, 1.0);
+            *scroll = t * max_scroll;
+        }
+    }
+}
+
+/// 状态栏上的缩放滑杆：Excel 是一条细轨道 + 圆钮
+fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(100.0, 21.0), Sense::click_and_drag());
+    let p = ui.painter();
+    let cy = rect.center().y;
+    let track = Color32::from_rgb(208, 208, 208);
+    p.rect_filled(
+        Rect::from_min_max(
+            egui::pos2(rect.left() + 6.0, cy - 1.5),
+            egui::pos2(rect.right() - 6.0, cy + 1.5),
+        ),
+        1.5,
+        track,
+    );
+    let t = ((*zoom - 0.5) / 2.0).clamp(0.0, 1.0);
+    let x = rect.left() + 6.0 + t * (rect.width() - 12.0);
+    p.rect_filled(
+        Rect::from_min_max(
+            egui::pos2(rect.left() + 6.0, cy - 1.5),
+            egui::pos2(x, cy + 1.5),
+        ),
+        1.5,
+        ui_kit::ACCENT,
+    );
+    p.circle_filled(egui::pos2(x, cy), 5.0, Color32::WHITE);
+    p.circle_stroke(
+        egui::pos2(x, cy),
+        5.0,
+        Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+    );
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let t = ((pos.x - rect.left() - 6.0) / (rect.width() - 12.0)).clamp(0.0, 1.0);
+            *zoom = 0.5 + t * 2.0;
+            return true;
+        }
+    }
+    false
 }
 
 /// 绝对路径，并且去掉 Windows 的 `\?\` 前缀（`canonicalize` 会加，加了就和盘符根对不上）
@@ -9652,6 +12335,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([760.0, 420.0])
+            .with_decorations(false)
             .with_title("Sheets Native (v1.6)"),
         ..Default::default()
     };

@@ -52,6 +52,11 @@ pub enum Icon {
     Close,
     Plus,
     Refresh,
+    DecInc,
+    DecDec,
+    FontGrow,
+    FontShrink,
+    Freeze,
 }
 
 struct Pen<'a> {
@@ -143,6 +148,105 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         c: color,
         w: 1.8 * rect.width() / 24.0,
     };
+    draw_with_pen(pen, icon);
+}
+
+/// Excel 风格：先铺一层彩色底（和 Excel 自带的彩色图标同色系），再用单色线描边。
+/// 关掉的按钮只画灰线，不铺色。
+pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
+    let s = rect.width() / 24.0;
+    let at = |x: f32, y: f32| egui::pos2(rect.left() + x * s, rect.top() + y * s);
+    let fill = |x: f32, y: f32, w: f32, h: f32, c: Color32| {
+        p.rect_filled(
+            Rect::from_min_size(at(x, y), egui::vec2(w * s, h * s)),
+            0.8 * s,
+            c,
+        );
+    };
+    if enabled {
+        use Icon::*;
+        match icon {
+            Paste => {
+                fill(6.0, 7.0, 12.0, 13.0, Color32::from_rgb(242, 214, 160));
+                fill(9.5, 3.5, 5.0, 3.0, Color32::from_rgb(68, 114, 196));
+            }
+            Copy => {
+                fill(9.0, 4.0, 10.0, 12.0, Color32::from_rgb(222, 235, 247));
+            }
+            Brush => {
+                fill(4.6, 4.6, 7.8, 10.8, Color32::from_rgb(200, 162, 101));
+            }
+            Fill => {
+                fill(7.5, 6.5, 9.0, 8.0, Color32::from_rgb(242, 200, 17));
+                fill(18.6, 16.6, 3.0, 4.0, Color32::from_rgb(242, 200, 17));
+            }
+            FontColor => {
+                fill(5.0, 20.0, 14.0, 2.6, Color32::from_rgb(192, 0, 0));
+            }
+            Chart => {
+                fill(5.0, 12.0, 4.0, 8.0, Color32::from_rgb(68, 114, 196));
+                fill(10.0, 7.0, 4.0, 13.0, Color32::from_rgb(237, 125, 49));
+                fill(15.0, 10.0, 4.0, 10.0, Color32::from_rgb(165, 165, 165));
+            }
+            Image => {
+                fill(3.8, 5.8, 16.4, 12.4, Color32::from_rgb(222, 235, 247));
+                fill(3.8, 14.0, 6.0, 4.2, Color32::from_rgb(112, 173, 71));
+                fill(10.0, 12.0, 8.0, 6.2, Color32::from_rgb(84, 130, 53));
+                p.circle_filled(at(8.0, 9.0), 1.6 * s, Color32::from_rgb(255, 192, 0));
+            }
+            Table => {
+                fill(3.8, 5.0, 16.4, 4.4, Color32::from_rgb(68, 114, 196));
+                fill(3.8, 9.6, 16.4, 9.0, Color32::from_rgb(222, 235, 247));
+            }
+            Comment => {
+                fill(4.8, 4.8, 14.4, 9.6, Color32::from_rgb(255, 242, 204));
+            }
+            Link => {
+                p.circle_stroke(at(8.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, Color32::from_rgb(68, 114, 196)));
+                p.circle_stroke(at(16.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, Color32::from_rgb(68, 114, 196)));
+            }
+            Revision | Zoom | Find => {
+                p.circle_filled(at(11.0, 10.0), 5.4 * s, Color32::from_rgb(222, 235, 247));
+            }
+            Calc => {
+                fill(4.8, 3.8, 14.4, 16.4, Color32::from_rgb(231, 230, 230));
+            }
+            Sheet => {
+                fill(4.8, 3.8, 14.4, 16.4, Color32::from_rgb(226, 239, 218));
+            }
+            Filter => {
+                fill(6.0, 6.0, 12.0, 4.0, Color32::from_rgb(68, 114, 196));
+            }
+            SortAsc | SortDesc => {
+                fill(15.0, 5.0, 4.0, 12.0, Color32::from_rgb(68, 114, 196));
+            }
+            Share => {
+                p.circle_filled(at(17.0, 6.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
+                p.circle_filled(at(6.0, 12.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
+                p.circle_filled(at(17.0, 18.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
+            }
+            Save => {
+                fill(4.8, 4.8, 14.4, 14.4, Color32::from_rgb(222, 235, 247));
+            }
+            Open => {
+                fill(4.0, 8.0, 14.0, 9.0, Color32::from_rgb(255, 217, 102));
+            }
+            Print => {
+                fill(4.0, 10.0, 16.0, 6.0, Color32::from_rgb(222, 235, 247));
+            }
+            _ => {}
+        }
+    }
+    let pen = Pen {
+        p,
+        r: rect,
+        c: color,
+        w: 1.8 * rect.width() / 24.0,
+    };
+    draw_with_pen(pen, icon);
+}
+
+fn draw_with_pen(pen: Pen<'_>, icon: Icon) {
     use Icon::*;
     match icon {
         Open => {
@@ -370,6 +474,13 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 pen.line((3.0 + i as f32 * 6.0, 3.0), (3.0 + i as f32 * 6.0, 21.0));
             }
         }
+        Freeze => {
+            pen.rect(3.0, 3.0, 21.0, 21.0);
+            pen.line((3.0, 9.0), (21.0, 9.0));
+            pen.line((9.0, 3.0), (9.0, 21.0));
+            pen.rect(3.0, 3.0, 21.0, 9.0);
+            pen.rect(3.0, 3.0, 9.0, 21.0);
+        }
         Close => {
             pen.line((6.0, 6.0), (18.0, 18.0));
             pen.line((18.0, 6.0), (6.0, 18.0));
@@ -377,6 +488,27 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Plus => {
             pen.line((12.0, 5.0), (12.0, 19.0));
             pen.line((5.0, 12.0), (19.0, 12.0));
+        }
+        FontGrow => {
+            pen.text("A", 11.0);
+            pen.line((17.0, 18.0), (22.0, 18.0));
+            pen.line((19.5, 15.5), (19.5, 20.5));
+            pen.arrow_head((19.5, 14.0), (0.0, -1.0), 3.5);
+        }
+        FontShrink => {
+            pen.text("A", 11.0);
+            pen.line((17.0, 18.0), (22.0, 18.0));
+            pen.line((19.5, 15.5), (19.5, 20.5));
+            pen.arrow_head((19.5, 22.0), (0.0, 1.0), 3.5);
+        }
+        DecInc => {
+            pen.text("0.0", 9.0);
+            pen.line((18.5, 6.0), (22.5, 6.0));
+            pen.line((20.5, 4.0), (20.5, 8.0));
+        }
+        DecDec => {
+            pen.text("0.0", 9.0);
+            pen.line((18.5, 6.0), (22.5, 6.0));
         }
         Refresh => {
             pen.circle(12.0, 12.0, 7.5);

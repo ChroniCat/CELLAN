@@ -1,69 +1,129 @@
-//! 界面基座：一套配色、一套间距、分组框和图标按钮。
+//! 界面基座：照 Excel 365 的尺寸与配色重做。
 //!
-//! 目标是 Excel 的骨架（页签 + 分组框 + 图标文字）+ 现代的配色和留白。
+//! 参考值来自本机 Excel 16.0 的 UIA 实测（96 DPI，窗口客户区坐标）：
+//! 标题栏 48、页签行 30、功能区 102、编辑栏 44、列头 19、行头 29、
+//! 默认列宽 72、默认行高 19、工作表标签条 32、状态栏 22。
+//!
 //! 所有尺寸集中在这里，别再往各处写魔法数字。
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Response, RichText, Sense, Stroke, Vec2,
+    self, Align2, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Vec2,
 };
 use crate::ui_icons::{self, Icon};
+use std::cell::Cell;
 
-/// 功能区总高（页签行 + 分组行）
-pub const RIBBON_H: f32 = 96.0;
+/// Excel 绿色（选项卡下划线、工作表标签下划线、选中框）
+pub const ACCENT: Color32 = Color32::from_rgb(16, 124, 65);
+/// 分区分隔线 / 控件边框
+pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
+/// 功能区分组之间的竖线
+pub const SEP: Color32 = Color32::from_rgb(224, 224, 224);
+pub const TEXT: Color32 = Color32::from_rgb(29, 29, 29);
+pub const TEXT_WEAK: Color32 = Color32::from_rgb(96, 96, 96);
+pub const HEADER_BG: Color32 = Color32::from_rgb(240, 240, 240);
+pub const HEADER_SEL: Color32 = Color32::from_rgb(225, 225, 225);
+pub const GRID_LINE: Color32 = Color32::from_rgb(217, 217, 217);
+pub const HOVER: Color32 = Color32::from_rgb(233, 233, 233);
+pub const PRESSED: Color32 = Color32::from_rgb(217, 217, 217);
+pub const STATUS_BG: Color32 = Color32::from_rgb(245, 245, 245);
+
+/// 标题栏（自绘，含快速访问工具栏和窗口按钮）
+pub const TITLE_H: f32 = 48.0;
+/// 页签行
 pub const TAB_H: f32 = 30.0;
-/// 分组内容高度：图标大按钮按这个留
-pub const GROUP_BODY_H: f32 = 48.0;
+/// 功能区（不含页签行）
+pub const RIBBON_BODY_H: f32 = 102.0;
+/// 功能区总高
+pub const RIBBON_H: f32 = TAB_H + RIBBON_BODY_H;
+/// 编辑栏（名称框 + fx + 输入行）
+pub const FX_H: f32 = 44.0;
+/// 命令区高度：大按钮 76 + 上下留白
+pub const GROUP_BODY_H: f32 = 80.0;
+/// 分组名那一行
+pub const GROUP_LABEL_H: f32 = 18.0;
 
-pub fn accent(v: &egui::Visuals) -> Color32 {
-    if v.dark_mode {
-        Color32::from_rgb(96, 165, 250)
-    } else {
-        Color32::from_rgb(37, 99, 235)
-    }
+thread_local! {
+    static GROUP_FIRST: Cell<bool> = const { Cell::new(true) };
+}
+
+/// 每组 ribbon 内容开始前调用：第一组不画左侧分隔线
+pub fn reset_groups() {
+    GROUP_FIRST.with(|c| c.set(true));
+}
+
+pub fn accent(_v: &egui::Visuals) -> Color32 {
+    ACCENT
 }
 
 fn text_color(v: &egui::Visuals) -> Color32 {
-    v.override_text_color
-        .unwrap_or(v.widgets.noninteractive.fg_stroke.color)
+    v.override_text_color.unwrap_or(TEXT)
 }
 
-/// 浅色：白底、灰分隔、蓝选中；深色：深灰底、低对比描边
+/// Excel 浅色主题；深色沿用原来的深灰配色（Excel 也有深色模式）。
+/// 两套主题都要显式写入：egui 切主题时会用「该主题已保存的样式」，
+/// 只改当前主题会让系统深色模式下功能区变成默认灰。
 pub fn apply_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    let dark = style.visuals.dark_mode;
-    style.text_styles = [
+    let mut base = (*ctx.style()).clone();
+    base.text_styles = [
         (egui::TextStyle::Heading, FontId::proportional(15.0)),
-        (egui::TextStyle::Body, FontId::proportional(13.0)),
-        (egui::TextStyle::Button, FontId::proportional(12.5)),
-        (egui::TextStyle::Small, FontId::proportional(10.5)),
+        (egui::TextStyle::Body, FontId::proportional(12.0)),
+        (egui::TextStyle::Button, FontId::proportional(12.0)),
+        (egui::TextStyle::Small, FontId::proportional(10.0)),
         (egui::TextStyle::Monospace, FontId::monospace(12.0)),
     ]
     .into();
-    style.spacing.item_spacing = Vec2::new(6.0, 5.0);
-    style.spacing.button_padding = Vec2::new(8.0, 3.0);
-    style.spacing.interact_size.y = 22.0;
-    style.spacing.menu_margin = egui::Margin {
-        left: 6,
-        right: 6,
-        top: 5,
-        bottom: 5,
+    base.spacing.item_spacing = Vec2::new(4.0, 3.0);
+    base.spacing.button_padding = Vec2::new(7.0, 2.0);
+    base.spacing.interact_size.y = 24.0;
+    base.spacing.menu_margin = egui::Margin {
+        left: 4,
+        right: 4,
+        top: 4,
+        bottom: 4,
     };
 
-    let mut v = if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
+    let mut light = base.clone();
+    light.visuals = {
+        let mut v = egui::Visuals::light();
+        v.panel_fill = Color32::WHITE;
+        v.window_fill = Color32::WHITE;
+        v.extreme_bg_color = Color32::WHITE;
+        v.faint_bg_color = Color32::from_rgb(247, 247, 247);
+        v.widgets.noninteractive.bg_fill = Color32::WHITE;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.bg_fill = Color32::WHITE;
+        v.widgets.inactive.weak_bg_fill = Color32::WHITE;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.hovered.bg_fill = HOVER;
+        v.widgets.hovered.weak_bg_fill = HOVER;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.active.bg_fill = PRESSED;
+        v.widgets.active.weak_bg_fill = PRESSED;
+        v.widgets.active.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.open = v.widgets.active;
+        v.selection.bg_fill = Color32::from_rgb(204, 228, 215);
+        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.hyperlink_color = Color32::from_rgb(5, 99, 193);
+        v
     };
-    if dark {
+
+    let mut dark = base;
+    dark.visuals = {
+        let mut v = egui::Visuals::dark();
         v.panel_fill = Color32::from_rgb(30, 33, 38);
         v.window_fill = Color32::from_rgb(38, 42, 49);
         v.extreme_bg_color = Color32::from_rgb(24, 27, 31);
         v.faint_bg_color = Color32::from_rgb(36, 40, 46);
         v.widgets.noninteractive.bg_fill = Color32::from_rgb(38, 42, 49);
-        v.widgets.noninteractive.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(58, 64, 74));
-        v.widgets.noninteractive.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(228, 231, 236));
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 64, 74));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(228, 231, 236));
         v.widgets.inactive.bg_fill = Color32::from_rgb(44, 49, 57);
         v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 49, 57);
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 68, 79));
@@ -73,76 +133,68 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(86, 95, 110));
         v.widgets.active.bg_fill = Color32::from_rgb(62, 72, 86);
         v.widgets.active.weak_bg_fill = Color32::from_rgb(62, 72, 86);
+        v.widgets.open = v.widgets.active;
         v.selection.bg_fill = Color32::from_rgb(45, 74, 112);
         v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
         v.hyperlink_color = Color32::from_rgb(96, 165, 250);
-    } else {
-        v.panel_fill = Color32::from_rgb(252, 252, 253);
-        v.window_fill = Color32::from_rgb(255, 255, 255);
-        v.extreme_bg_color = Color32::from_rgb(255, 255, 255);
-        v.faint_bg_color = Color32::from_rgb(247, 248, 250);
-        v.widgets.noninteractive.bg_fill = Color32::from_rgb(255, 255, 255);
-        v.widgets.noninteractive.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(223, 226, 232));
-        v.widgets.noninteractive.fg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(32, 36, 42));
-        v.widgets.inactive.bg_fill = Color32::from_rgb(255, 255, 255);
-        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(255, 255, 255);
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(214, 218, 226));
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(32, 36, 42));
-        v.widgets.hovered.bg_fill = Color32::from_rgb(236, 242, 251);
-        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(236, 242, 251);
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(160, 178, 204));
-        v.widgets.active.bg_fill = Color32::from_rgb(219, 232, 251);
-        v.widgets.active.weak_bg_fill = Color32::from_rgb(219, 232, 251);
-        v.selection.bg_fill = Color32::from_rgb(206, 224, 251);
-        v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(37, 99, 235));
-        v.hyperlink_color = Color32::from_rgb(37, 99, 235);
-    }
-    style.visuals = v;
-    ctx.set_style(style);
+        v
+    };
+
+    ctx.set_style_of(egui::Theme::Dark, dark);
+    ctx.set_style_of(egui::Theme::Light, light);
+    // Excel 默认浅色；界面按浅色做像素对齐
+    ctx.set_theme(egui::ThemePreference::Light);
 }
 
-/// 一个功能区小组：内容 + 底部组名，浅底圆角框
+/// 一个功能区小组：内容 + 底部组名；组间是一条竖细线（Excel 无外框）
 pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let v = ui.visuals().clone();
-    let out = egui::Frame::NONE
-        .fill(v.faint_bg_color)
-        .stroke(Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin {
-            left: 6,
-            right: 6,
-            top: 4,
-            bottom: 2,
-        })
-        .show(ui, |ui| {
-            // Frame 会继承父级布局（功能区是横向的），这里必须显式竖排，
-            // 否则组名会跑到内容右边、分组框宽度翻倍。
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                let row = ui.horizontal_top(|ui| {
-                    ui.set_height(GROUP_BODY_H);
-                    add(ui);
-                });
-                let w = row.response.rect.width();
-                ui.add_space(3.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(w, 12.0),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            RichText::new(title)
-                                .size(9.5)
-                                .color(v.weak_text_color().gamma_multiply(0.85)),
-                        );
-                    },
-                );
+    let first = GROUP_FIRST.with(|c| c.replace(false));
+    if !first {
+        ui.add_space(5.0);
+        let v = ui.visuals().clone();
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, GROUP_BODY_H), Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            if v.dark_mode {
+                Color32::from_rgb(58, 64, 74)
+            } else {
+                SEP
+            },
+        );
+        ui.add_space(5.0);
+    }
+    let out = ui
+        .vertical(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+            // Excel 的命令区从分组顶往下 4px 才开始
+            ui.add_space(4.0);
+            let row = ui.horizontal_top(|ui| {
+                ui.add_space(6.0);
+                ui.set_height(GROUP_BODY_H);
+                add(ui);
+                ui.allocate_exact_size(Vec2::new(6.0, 0.0), Sense::hover());
             });
-        });
-    // 布局自证：SC_UI_LOG=1 时打出每个分组框的几何，比截图更适合做断言
+            let w = row.response.rect.width().max(24.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(w, GROUP_LABEL_H),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add_space(2.0);
+                    let c = if ui.visuals().dark_mode {
+                        ui.visuals().weak_text_color()
+                    } else {
+                        Color32::from_rgb(102, 102, 102)
+                    };
+                    ui.label(RichText::new(title).size(9.5).color(c));
+                },
+            );
+            ui.add_space(4.0);
+        })
+        .response;
+    // 布局自证：SC_UI_LOG=1 时打出每个分组框的几何
     if std::env::var("SC_UI_LOG").is_ok() {
-        let r = out.response.rect;
+        let r = out.rect;
         eprintln!(
             "[ui] 组 {:<8} x={:6.1} y={:6.1} w={:6.1} h={:5.1}",
             title,
@@ -152,11 +204,12 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
             r.height()
         );
     }
+    ui.add_space(2.0);
 }
 
-/// 图标在上、文字在下的大按钮（粘贴、图表这种）
+/// 图标在上、文字在下的大按钮（粘贴、图表这种）。Excel：42×76，图标 32
 pub fn big(ui: &mut egui::Ui, icon: Icon, label: &str) -> Response {
-    big_sized(ui, icon, label, Vec2::new(52.0, GROUP_BODY_H))
+    big_sized(ui, icon, label, Vec2::new(42.0, 76.0))
 }
 
 pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Response {
@@ -166,36 +219,37 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() {
-        v.selection.bg_fill
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
     } else if resp.hovered() {
-        v.widgets.hovered.weak_bg_fill
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 5.0, bg);
+        ui.painter().rect_filled(rect, 2.0, bg);
     }
     let col = if enabled {
         text_color(&v)
     } else {
-        v.weak_text_color().gamma_multiply(0.7)
+        v.weak_text_color().gamma_multiply(0.6)
     };
+    let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 19.0),
-        Vec2::splat(20.0),
+        egui::pos2(rect.center().x, rect.top() + 5.0 + icon_size / 2.0),
+        Vec2::splat(icon_size),
     );
-    ui_icons::draw(ui.painter(), icon_rect, icon, col);
+    ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
     ui.painter().text(
-        egui::pos2(rect.center().x, rect.bottom() - 10.0),
+        egui::pos2(rect.center().x, rect.bottom() - 9.0),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(10.5),
+        FontId::proportional(10.0),
         col,
     );
     resp
 }
 
-/// 只有图标的小按钮（撤销、对齐这类）
+/// 只有图标的小按钮（撤销、对齐这类）。Excel：24×24，图标 16
 pub fn small(ui: &mut egui::Ui, icon: Icon, tip: &str) -> Response {
     small_on(ui, icon, false, tip)
 }
@@ -203,92 +257,233 @@ pub fn small(ui: &mut egui::Ui, icon: Icon, tip: &str) -> Response {
 pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response {
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(26.0, 22.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if on {
-        v.selection.bg_fill
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
     } else if resp.hovered() {
-        v.widgets.hovered.weak_bg_fill
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 4.0, bg);
+        ui.painter().rect_filled(rect, 2.0, bg);
     }
     let col = if !enabled {
-        v.weak_text_color().gamma_multiply(0.7)
-    } else if on {
-        accent(&v)
+        v.weak_text_color().gamma_multiply(0.6)
     } else {
         text_color(&v)
     };
-    ui_icons::draw(ui.painter(), rect.shrink(3.0), icon, col);
+    ui_icons::draw_excel(ui.painter(), rect.shrink(4.0), icon, col, enabled);
+    resp.on_hover_text(tip)
+}
+
+/// 图标 + 文字的窄按钮（剪切、复制、格式刷）
+pub fn labeled(ui: &mut egui::Ui, icon: Icon, label: &str, tip: &str) -> Response {
+    let font = FontId::proportional(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
+    labeled_w(ui, icon, label, (16.0 + 4.0 + galley.size().x + 10.0).max(24.0), tip)
+}
+
+/// 固定宽度的图标文字按钮：Excel 的「剪切/复制」是 81×24，「插入」也是 81×24
+pub fn labeled_w(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    width: f32,
+    tip: &str,
+) -> Response {
+    labeled_w_on(ui, icon, label, width, false, tip)
+}
+
+/// 固定宽度的图标文字按钮，可显示按下状态
+pub fn labeled_w_on(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    width: f32,
+    on: bool,
+    tip: &str,
+) -> Response {
+    let v = ui.visuals().clone();
+    let enabled = ui.is_enabled();
+    let font = FontId::proportional(11.5);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
+    let bg = if !enabled {
+        Color32::TRANSPARENT
+    } else if on || resp.is_pointer_button_down_on() {
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
+    } else if resp.hovered() {
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 2.0, bg);
+    }
+    let col = if enabled {
+        text_color(&v)
+    } else {
+        v.weak_text_color().gamma_multiply(0.6)
+    };
+    let ir = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
+        Vec2::splat(16.0),
+    );
+    ui_icons::draw_excel(ui.painter(), ir, icon, col, enabled);
+    ui.painter().text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        col,
+    );
+    resp.on_hover_text(tip)
+}
+
+/// 选项右侧的小三角（下拉菜单按钮用）
+pub fn caret(ui: &mut egui::Ui, center: egui::Pos2, color: Color32) {
+    let st = Stroke::new(1.0, color);
+    ui.painter()
+        .line_segment([center + Vec2::new(-3.0, -1.5), center + Vec2::new(0.0, 1.5)], st);
+    ui.painter()
+        .line_segment([center + Vec2::new(0.0, 1.5), center + Vec2::new(3.0, -1.5)], st);
+}
+
+/// 字体颜色 / 填充颜色按钮：图标（或字母）+ 下方 3px 色条，Excel 的样子
+pub fn color_button(
+    ui: &mut egui::Ui,
+    letter: Option<&str>,
+    icon: Option<Icon>,
+    color: Color32,
+    tip: &str,
+) -> Response {
+    let v = ui.visuals().clone();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER },
+        );
+    }
+    let top = Rect::from_min_size(rect.min + Vec2::new(2.0, 1.0), Vec2::new(20.0, 18.0));
+    if let Some(t) = letter {
+        ui.painter().text(
+            egui::pos2(top.center().x, top.center().y - 1.0),
+            Align2::CENTER_CENTER,
+            t,
+            FontId::proportional(13.0),
+            text_color(&v),
+        );
+    }
+    if let Some(ic) = icon {
+        ui_icons::draw_excel(ui.painter(), top.shrink(2.0), ic, text_color(&v), true);
+    }
+    let bar = Rect::from_min_size(
+        egui::pos2(rect.left() + 5.0, rect.bottom() - 4.0),
+        Vec2::new(14.0, 3.0),
+    );
+    ui.painter().rect_filled(bar, 1.0, color);
     resp.on_hover_text(tip)
 }
 
 /// 字体类开关（B / I / U）：文字本身就是图标
-pub fn text_toggle(ui: &mut egui::Ui, label: &str, on: bool, tip: &str, strong: bool, italic: bool) -> Response {
+pub fn text_toggle(
+    ui: &mut egui::Ui,
+    label: &str,
+    on: bool,
+    tip: &str,
+    strong: bool,
+    italic: bool,
+) -> Response {
     let v = ui.visuals().clone();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
     let bg = if on {
-        v.selection.bg_fill
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
     } else if resp.hovered() {
-        v.widgets.hovered.weak_bg_fill
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 4.0, bg);
+        ui.painter().rect_filled(rect, 2.0, bg);
     }
-    let col = if on { accent(&v) } else { text_color(&v) };
-    let mut rt = RichText::new(label).size(14.0).color(col);
-    if strong {
-        rt = rt.strong();
-    }
-    if italic {
-        rt = rt.italics();
-    }
+    let col = text_color(&v);
+    let _ = italic;
+    let pos = rect.center() - Vec2::new(0.0, 0.5);
     ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(14.0), col);
-    let _ = rt;
+        .text(pos, Align2::CENTER_CENTER, label, FontId::proportional(13.5), col);
+    if strong {
+        // 小字号下用 0.55px 重描模拟加粗，比换字体更稳定
+        ui.painter().text(
+            pos + Vec2::new(0.55, 0.0),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(13.5),
+            col,
+        );
+    }
     resp.on_hover_text(tip)
 }
 
-/// 页签：悬停有底色，选中时下面一条蓝线
+/// 页签：Excel 365 —— 30 高，选中时底部 2px 绿线
 pub fn tab(ui: &mut egui::Ui, name: &str, active: bool) -> Response {
+    tab_ex(ui, name, active, false)
+}
+
+/// 文件页签常驻绿色文字
+pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(13.0);
+    let font = FontId::proportional(12.0);
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 26.0, TAB_H);
+    let size = Vec2::new(galley.size().x + 20.0, TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.hovered() && !active {
-        ui.painter()
-            .rect_filled(rect.shrink2(Vec2::new(3.0, 3.0)), 5.0, v.widgets.hovered.weak_bg_fill);
+        ui.painter().rect_filled(
+            rect.shrink2(Vec2::new(4.0, 3.0)),
+            2.0,
+            v.widgets.hovered.weak_bg_fill,
+        );
     }
-    let col = if active { text_color(&v) } else { v.weak_text_color() };
+    let col = if green {
+        ACCENT
+    } else if active {
+        TEXT
+    } else if v.dark_mode {
+        v.weak_text_color()
+    } else {
+        Color32::from_rgb(68, 68, 68)
+    };
     ui.painter()
         .text(rect.center(), Align2::CENTER_CENTER, name, font, col);
     if active {
         let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 8.0, rect.bottom() - 2.0),
-            Vec2::new(rect.width() - 16.0, 2.0),
+            egui::pos2(rect.left(), rect.bottom() - 2.0),
+            Vec2::new(rect.width(), 2.0),
         );
-        ui.painter().rect_filled(bar, 1.0, accent(&v));
+        ui.painter().rect_filled(bar, 0.0, ACCENT);
     }
     resp
 }
 
-/// 分组之间的竖细线
+/// 分组之间的竖细线（功能区内手动用）
 pub fn hairline(ui: &mut egui::Ui) {
     let v = ui.visuals().clone();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, GROUP_BODY_H), Sense::hover());
     ui.painter().rect_filled(
         rect,
         0.0,
-        v.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.9),
+        if v.dark_mode {
+            v.widgets.noninteractive.bg_stroke.color
+        } else {
+            SEP
+        },
     );
 }
 
@@ -307,12 +502,12 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-/// 主按钮（确定/应用）
+/// 主按钮（确定/应用）：Excel 绿
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> Response {
-    let v = ui.visuals().clone();
-    let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE))
-        .fill(accent(&v))
-        .corner_radius(4.0);
+    let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE).size(12.0))
+        .fill(ACCENT)
+        .corner_radius(2.0)
+        .min_size(Vec2::new(64.0, 24.0));
     ui.add(btn)
 }
 
@@ -323,16 +518,16 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 14.0, 22.0);
+    let size = Vec2::new(galley.size().x + 12.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = if resp.is_pointer_button_down_on() {
-        v.selection.bg_fill
+        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
     } else if resp.hovered() {
-        v.widgets.hovered.weak_bg_fill
+        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, 4.0, bg);
+    ui.painter().rect_filled(rect, 2.0, bg);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -346,50 +541,57 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     resp.on_hover_text(tip)
 }
 
-/// 工作表标签：活动页白底 + 顶部蓝条，未选中悬停变浅
-pub fn sheet_tab(ui: &mut egui::Ui, name: &str, active: bool) -> Response {
+/// 工作表标签：Excel 365 —— 32 高，活动页白底 + 底部 2px 绿线
+pub fn sheet_tab(
+    ui: &mut egui::Ui,
+    name: &str,
+    active: bool,
+    color: Option<[u8; 3]>,
+) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(if active { 13.0 } else { 12.5 });
+    let font = FontId::proportional(12.0);
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 24.0, 24.0);
+    let size = Vec2::new(galley.size().x + 26.0, 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let tab_rgb = color.map(|c| Color32::from_rgb(c[0], c[1], c[2]));
+    if let Some(fill) = tab_rgb {
+        // 有颜色的标签：整块铺色；深色配白字
+        ui.painter().rect_filled(rect, 0.0, fill);
+        let lum = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32;
+        let mut color = if lum > 165.0 {
+            Color32::from_rgb(30, 30, 30)
+        } else {
+            Color32::WHITE
+        };
+        if !active {
+            color = color.gamma_multiply(0.92);
+        }
+        ui.painter()
+            .text(rect.center(), Align2::CENTER_CENTER, name, font, color);
+        return resp;
+    }
     if active {
-        ui.painter().rect_filled(rect, 4.0, v.faint_bg_color);
-        ui.painter().rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, v.widgets.noninteractive.bg_stroke.color),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
         let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 3.0, rect.top()),
-            Vec2::new(rect.width() - 6.0, 2.5),
+            egui::pos2(rect.left(), rect.bottom() - 2.0),
+            Vec2::new(rect.width(), 2.0),
         );
-        ui.painter().rect_filled(bar, 1.0, accent(&v));
+        ui.painter().rect_filled(bar, 0.0, ACCENT);
     } else if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, 4.0, v.widgets.hovered.weak_bg_fill);
+            .rect_filled(rect, 0.0, v.widgets.hovered.weak_bg_fill);
     }
-    let color = if active { text_color(&v) } else { v.weak_text_color() };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        if active { name.to_string() } else { name.to_owned() },
-        font.clone(),
-        color,
-    );
-    if active {
-        // 再描一遍加粗：小字号下比改字体权重更明显
-        ui.painter().text(
-            rect.center() + Vec2::new(0.4, 0.0),
-            Align2::CENTER_CENTER,
-            name,
-            font,
-            color,
-        );
-    }
+    let color = if active {
+        TEXT
+    } else if v.dark_mode {
+        v.weak_text_color()
+    } else {
+        Color32::from_rgb(68, 68, 68)
+    };
+    ui.painter()
+        .text(rect.center(), Align2::CENTER_CENTER, name, font, color);
     resp
 }
 
@@ -409,12 +611,15 @@ pub fn window<'a>(
         .default_width(width)
         .default_pos(pos)
         .frame(
-            egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 8,
-                bottom: 12,
-            }),
+            egui::Frame::window(&ctx.style())
+                .fill(Color32::WHITE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 8,
+                    bottom: 12,
+                }),
         )
 }
 

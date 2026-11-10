@@ -333,3 +333,194 @@ fn structural_undo_restores_cross_sheet_formulas_names_and_layout() {
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(30.0));
 }
+
+fn run_grid_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    input.events = events;
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+    });
+}
+
+#[test]
+fn dragging_the_column_header_border_resizes_the_column() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let width = app.wb.sheets[0].cols.size(0);
+    let x = HEAD_W + width;
+    let y = HEAD_H / 2.0;
+    let pos = egui::pos2(x, y);
+    let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    // 先让 egui 认识指针位置，再按下（真实操作也是先悬停）
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    run_grid_frame(&mut app, &ctx, vec![button(pos, true)]);
+    let to = egui::pos2(x + 40.0, y);
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to), button(to, false)]);
+    let after = app.wb.sheets[0].cols.size(0);
+    assert!(
+        (after - (width + 40.0)).abs() < 3.0,
+        "列宽应变成 {:.0}，实际 {:.0}",
+        width + 40.0,
+        after
+    );
+    assert!(app.wb.dirty);
+}
+
+#[test]
+fn dragging_the_row_header_border_resizes_the_row() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let height = app.wb.sheets[0].rows.size(0);
+    let x = HEAD_W / 2.0;
+    let y = HEAD_H + height;
+    let pos = egui::pos2(x, y);
+    let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    run_grid_frame(&mut app, &ctx, vec![button(pos, true)]);
+    let to = egui::pos2(x, y + 12.0);
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to), button(to, false)]);
+    let after = app.wb.sheets[0].rows.size(0);
+    assert!(
+        (after - (height + 12.0)).abs() < 3.0,
+        "行高应变成 {:.0}，实际 {:.0}",
+        height + 12.0,
+        after
+    );
+}
+
+#[test]
+fn right_clicking_a_column_header_opens_the_header_menu() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let pos = egui::pos2(HEAD_W + 20.0, HEAD_H / 2.0);
+    let secondary = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+    run_grid_frame(&mut app, &ctx, vec![secondary(pos, true)]);
+    run_grid_frame(&mut app, &ctx, vec![secondary(pos, false)]);
+    match app.head_menu {
+        Some((kind, idx, _)) => {
+            assert_eq!(kind, 0, "应该是列菜单");
+            assert_eq!(idx, 0, "应该指向 A 列");
+        }
+        None => panic!("列标右键没有打开表头菜单"),
+    }
+    // 点表头菜单里的“列宽自适应”之前，先把菜单关掉，避免 Area 影响后续断言
+    app.head_menu = None;
+}
+
+#[test]
+fn hidden_rows_and_columns_collapse_to_zero_in_the_view() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.hidden_cols.insert(1);
+        sh.hidden_rows_user.insert(2);
+        sh.cols.set(0, 170.0);
+    }
+    let (cols, rows) = app.view_axes();
+    assert_eq!(cols.size(1), 0.0, "隐藏列应占 0 像素");
+    assert_eq!(rows.size(2), 0.0, "隐藏行应占 0 像素");
+    assert!((cols.size(0) - 170.0).abs() < 0.1, "其它列宽不变");
+    // 未隐藏的列还在原位
+    assert!(cols.pos(2) >= 170.0);
+}
+
+#[test]
+fn table_design_tab_is_offered_inside_a_table_range() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).tables.push(sheetcore::table::Table {
+        name: "表1".into(),
+        display: "表1".into(),
+        range: (0, 0, 3, 2),
+        columns: vec!["A".into(), "B".into(), "C".into()],
+        header_row: true,
+        totals_row: false,
+    });
+    app.sel = (2, 1);
+    app.sel_end = (2, 1);
+    assert!(app.table_at_sel().is_some(), "表格内应出现表设计页签");
+    app.sel = (9, 9);
+    app.sel_end = (9, 9);
+    assert!(app.table_at_sel().is_none(), "表格外不显示");
+}
+
+#[test]
+fn chart_selection_exposes_the_chart_tools_tab() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let ch = sheetcore::charts::Chart {
+        kind: sheetcore::charts::ChartKind::Column,
+        title: "测试图".into(),
+        series: Vec::new(),
+        legend: false,
+        anchor: (1, 4, 10, 9),
+        legend_pos: String::new(),
+        part: String::new(),
+        drawing: String::new(),
+        show_labels: false,
+        ref_fixes: Vec::new(),
+        axis_x: String::new(),
+        axis_y: String::new(),
+        y_min: None,
+        y_max: None,
+    };
+    app.wb.sheet_mut(0).charts.push(ch);
+    assert!(app.chart_at_sel().is_none(), "没选中时没有图表工具");
+    app.chart_sel = Some(0);
+    assert!(app.chart_at_sel().is_some(), "选中后应有图表工具");
+    app.chart_sel = Some(9);
+    assert!(app.chart_at_sel().is_none(), "越界索引不应崩");
+}
+
+#[test]
+fn page_layout_modes_render_and_keep_the_selection() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..30u32 {
+        app.wb.sheet_mut(0).set(
+            r,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text(format!("row {r}").into()),
+                formula: None,
+            },
+        );
+    }
+    app.sel = (3, 0);
+    app.sel_end = (3, 0);
+    app.view_mode = 1;
+    run_grid_frame(&mut app, &ctx, vec![]);
+    assert_eq!(app.sel, (3, 0), "页面布局不应改变选区");
+    app.view_mode = 2;
+    run_grid_frame(&mut app, &ctx, vec![]);
+    assert_eq!(app.view_mode, 2);
+    app.view_mode = 0;
+    run_grid_frame(&mut app, &ctx, vec![]);
+}

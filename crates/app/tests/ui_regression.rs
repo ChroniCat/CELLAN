@@ -469,7 +469,7 @@ fn ribbon_groups_aligned_and_fit() {
     let names: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
     assert_eq!(
         names,
-        ["剪贴板", "字体", "对齐", "数字", "样式", "单元格", "编辑"],
+        ["剪贴板", "字体", "对齐方式", "数字", "样式", "单元格", "编辑"],
         "开始页应显示 7 个分组"
     );
     let y0 = groups[0].2;
