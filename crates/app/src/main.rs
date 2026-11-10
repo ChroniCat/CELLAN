@@ -7736,10 +7736,17 @@ impl SheetApp {
                         Align2::RIGHT_CENTER => rect.max.x - 4.0 - total,
                         _ => rect.min.x + 4.0 + icon_shift,
                     };
-                    let y = ty - fs / 2.0;
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
                     for (g, (_, c)) in galleys.into_iter().zip(fonts.iter()) {
                         let w = g.size().x;
+                        let gh = g.size().y;
+                        let y = if st.valign == 1 {
+                            rect.min.y + 3.0
+                        } else if st.valign == 3 {
+                            rect.max.y - 3.0 - gh
+                        } else {
+                            rect.center().y - gh / 2.0
+                        };
                         clipped.galley(egui::pos2(x, y), g, *c);
                         x += w;
                     }
@@ -7770,7 +7777,14 @@ impl SheetApp {
                         Align2::RIGHT_CENTER => rect.max.x - 4.0 - w,
                         _ => tx,
                     };
-                    let y0 = ty - g.size().y / 2.0;
+                    let gh = g.size().y;
+                    let y0 = if st.valign == 1 {
+                        rect.min.y + 4.0
+                    } else if st.valign == 3 {
+                        rect.max.y - 4.0 - gh
+                    } else {
+                        rect.center().y - gh / 2.0
+                    };
                     let clip = if self.text_spill {
                         Rect::from_min_max(
                             egui::pos2(rect.min.x, rect.min.y),
@@ -7791,11 +7805,11 @@ impl SheetApp {
                             Align2::RIGHT_CENTER => tx - w,
                             _ => tx,
                         };
-                        let y0 = ty + fs * 0.55;
+                        let uy = y0 + gh - 2.0;
                         painter
                             .with_clip_rect(rect.intersect(painter.clip_rect()))
                             .line_segment(
-                                [egui::pos2(x0, y0), egui::pos2(x0 + w, y0)],
+                                [egui::pos2(x0, uy), egui::pos2(x0 + w, uy)],
                                 Stroke::new(1.0, color),
                             );
                     }
