@@ -23,6 +23,8 @@ pub mod patch;
 pub mod pdf;
 pub mod print;
 pub mod protection;
+pub mod cells;
+pub mod hyperlinks;
 pub mod richtext;
 pub mod pivot;
 pub mod refs;

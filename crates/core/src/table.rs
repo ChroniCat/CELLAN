@@ -191,17 +191,40 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Table>> {
 pub fn table_xml(t: &Table, id: u32) -> String {
     let mut cols = String::new();
     for (i, name) in t.columns.iter().enumerate() {
-        cols.push_str(&format!("<tableColumn id=\"{}\" name=\"{}\"/>", i + 1, esc(name)));
+        if t.totals_row {
+            if i == 0 {
+                cols.push_str(&format!(
+                    "<tableColumn id=\"{}\" name=\"{}\" totalsRowLabel=\"总计\"/>",
+                    i + 1,
+                    esc(name)
+                ));
+            } else {
+                cols.push_str(&format!(
+                    "<tableColumn id=\"{}\" name=\"{}\" totalsRowFunction=\"sum\"/>",
+                    i + 1,
+                    esc(name)
+                ));
+            }
+        } else {
+            cols.push_str(&format!("<tableColumn id=\"{}\" name=\"{}\"/>", i + 1, esc(name)));
+        }
     }
     let count = t.columns.len();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"{id}\" \
-name=\"{name}\" displayName=\"{display}\" ref=\"{range}\" totalsRowShown=\"0\">\
-<autoFilter ref=\"{range}\"/><tableColumns count=\"{count}\">{cols}</tableColumns>\
+name=\"{name}\" displayName=\"{display}\" ref=\"{range}\" totalsRowShown=\"{totals}\"{totals_count}>\
+<autoFilter ref=\"{filter_range}\"/><tableColumns count=\"{count}\">{cols}</tableColumns>\
 <tableStyleInfo name=\"TableStyleMedium2\" showFirstColumn=\"0\" showLastColumn=\"0\" \
 showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
         name = esc(&t.name),
+        totals = if t.totals_row { 1 } else { 0 },
+        totals_count = if t.totals_row { " totalsRowCount=\"1\"" } else { "" },
+        filter_range = if t.totals_row {
+            a1((t.range.0, t.range.1, t.range.2.saturating_sub(1), t.range.3))
+        } else {
+            a1(t.range)
+        },
         display = esc(if t.display.is_empty() { &t.name } else { &t.display }),
         range = a1(t.range),
         count = count,
@@ -423,7 +446,7 @@ mod tests {
 
     #[test]
     fn parses_definition() {
-        let xml = r#"<table id="1" name="Table1" displayName="Table1" ref="A1:C4" totalsRowShown="0"><tableColumns count="3"><tableColumn id="1" name="姓名"/><tableColumn id="2" name="部门"/><tableColumn id="3" name="金额"/></tableColumns></table>"#;
+        let xml = r#"<table id="1" name="Table1" displayName="Table1" ref="A1:C4" totalsRowShown="{}"><tableColumns count="3"><tableColumn id="1" name="姓名"/><tableColumn id="2" name="部门"/><tableColumn id="3" name="金额"/></tableColumns></table>"#;
         let t = parse_table_xml(xml).unwrap();
         assert_eq!(t.name, "Table1");
         assert_eq!(t.range, (0, 0, 3, 2));

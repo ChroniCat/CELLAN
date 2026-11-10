@@ -509,6 +509,49 @@ pub fn load(path: &Path) -> Result<Workbook> {
         }
     }
 
+    // 超链接：工作表 <hyperlinks> + rels
+    if is_ooxml {
+        if let Ok(targets) = crate::patch::sheet_targets(path) {
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(part) = targets.get(&sheet.name) {
+                    if let Some(bytes) = crate::fixups::read_part_file(path, part) {
+                        if let Ok(xml) = String::from_utf8(bytes) {
+                            let rels = crate::hyperlinks::read_rels(path, part);
+                            for raw in crate::hyperlinks::parse_sheet(&xml) {
+                                let (target, location, external) = match &raw.rid {
+                                    Some(id) => match rels.get(id) {
+                                        Some((t, ext)) => (t.clone(), String::new(), *ext),
+                                        None => (String::new(), String::new(), false),
+                                    },
+                                    None => (
+                                        String::new(),
+                                        raw.location.clone().unwrap_or_default(),
+                                        false,
+                                    ),
+                                };
+                                if target.is_empty() && location.is_empty() {
+                                    continue;
+                                }
+                                sheet.hyperlinks.insert(
+                                    (raw.r, raw.c),
+                                    crate::hyperlinks::Hyperlink {
+                                        target,
+                                        location,
+                                        tooltip: raw.tooltip.unwrap_or_default(),
+                                        external,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // 保存时 umya/修补链不保证原样保留 hyperlinks，载入即标记重写
+                    if !sheet.hyperlinks.is_empty() {
+                        sheet.hyperlinks_dirty = true;
+                    }
+                }
+            }
+        }
+    }
     // inlineStr 富文本（我们写出的文件；Excel 的 sharedStrings 富文本仍是纯文本）
     if is_ooxml {
         if let Ok(targets) = crate::patch::sheet_targets(path) {
@@ -1185,6 +1228,9 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     if let Err(e) = crate::patch::apply_protection(path, wb) {
         eprintln!("[save] 工作表保护写回失败: {e:#}");
     }
+    if let Err(e) = crate::hyperlinks::apply(path, wb) {
+        eprintln!("[save] 超链接写回失败: {e:#}");
+    }
     if let Err(e) = crate::patch::apply_rich(path, wb) {
         eprintln!("[save] 富文本写回失败: {e:#}");
     }
@@ -1259,7 +1305,13 @@ fn apply_cf_patch(
                         if !sheet
                             .tables
                             .iter()
-                            .any(|t| t.header_row && t.range == f.range) =>
+                            .any(|t| {
+                                t.header_row
+                                    && t.range.0 <= f.range.0
+                                    && t.range.1 <= f.range.1
+                                    && t.range.2 >= f.range.2
+                                    && t.range.3 >= f.range.3
+                            }) =>
                     {
                         crate::patch::auto_filter_xml(f)
                     }
@@ -1360,6 +1412,30 @@ fn apply_cf_patch(
 mod tests {
     use super::*;
     use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn manual_page_breaks_round_trip() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("breaks_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        for r in 0..30u32 {
+            wb.sheets[0].set(r, 0, Cell { value: Value::Number(r as f64), formula: None });
+        }
+        wb.sheets[0].page.row_breaks = vec![4, 12];
+        wb.sheets[0].page.col_breaks = vec![2];
+        wb.sheets[0].page_dirty = true;
+        save(&path, &wb).expect("save");
+        let xml = crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        assert!(xml.contains("<rowBreaks"), "应写出 rowBreaks");
+        assert!(xml.contains("<colBreaks"), "应写出 colBreaks");
+        let back = load(&path).expect("load");
+        assert_eq!(back.sheets[0].page.row_breaks, vec![4, 12]);
+        assert_eq!(back.sheets[0].page.col_breaks, vec![2]);
+    }
 
     #[test]
     fn table_filter_survives_save_without_duplicate_autofilter() {

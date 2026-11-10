@@ -729,6 +729,7 @@ pub fn insert_auto_filter(xml: &str, af: &str) -> String {
     }
     let mut at = xml.len();
     for a in [
+        "<phoneticPr",
         "<mergeCells",
         "<conditionalFormatting",
         "<dataValidations",
@@ -2254,6 +2255,29 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
         p.margins[0], p.margins[1], p.margins[2], p.margins[3], p.margins[4], p.margins[5],
         p.paper,
     );
+    let mut breaks = String::new();
+    if !p.row_breaks.is_empty() {
+        breaks.push_str(&format!(
+            "<rowBreaks count=\"{}\" manualBreakCount=\"{}\">",
+            p.row_breaks.len(),
+            p.row_breaks.len()
+        ));
+        for r in &p.row_breaks {
+            breaks.push_str(&format!("<brk id=\"{r}\" max=\"16383\" man=\"1\"/>"));
+        }
+        breaks.push_str("</rowBreaks>");
+    }
+    if !p.col_breaks.is_empty() {
+        breaks.push_str(&format!(
+            "<colBreaks count=\"{}\" manualBreakCount=\"{}\">",
+            p.col_breaks.len(),
+            p.col_breaks.len()
+        ));
+        for c in &p.col_breaks {
+            breaks.push_str(&format!("<brk id=\"{c}\" max=\"1048575\" man=\"1\"/>"));
+        }
+        breaks.push_str("</colBreaks>");
+    }
     // fitToPage 由 sheetPr/pageSetUpPr 控制；不关掉的话 Excel 会忽略 scale
     let fit_flag = if p.fit_to_page { "1" } else { "0" };
     if let Some(sp) = x.find("<sheetPr") {
@@ -2292,6 +2316,14 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
             }
         }
     }
+    // 旧的分页符先清掉，避免重复
+    for tag in ["rowBreaks", "colBreaks"] {
+        while let Some(i) = x.find(&format!("<{tag}")) {
+            let Some(rel) = x[i..].find(&format!("</{tag}>")) else { break };
+            let end = i + rel + format!("</{tag}>").len();
+            x.replace_range(i..end, "");
+        }
+    }
     let markers = [
         "<headerFooter",
         "<rowBreaks",
@@ -2309,6 +2341,14 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
         .min()
         .unwrap_or(x.len());
     x.insert_str(at, &block);
+    if !breaks.is_empty() {
+        // schema：rowBreaks/colBreaks 在 headerFooter 之后
+        let after = x
+            .find("</headerFooter>")
+            .map(|e| e + "</headerFooter>".len())
+            .unwrap_or_else(|| x.find("</worksheet>").unwrap_or(x.len()));
+        x.insert_str(after, &breaks);
+    }
     x
 }
 

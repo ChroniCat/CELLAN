@@ -172,6 +172,9 @@ pub struct Sheet {
     pub rich: std::collections::HashMap<(u32, u32), Vec<crate::richtext::RichRun>>,
     /// 富文本被改过
     pub rich_dirty: bool,
+    /// 单元格超链接
+    pub hyperlinks: std::collections::HashMap<(u32, u32), crate::hyperlinks::Hyperlink>,
+    pub hyperlinks_dirty: bool,
 }
 
 impl Sheet {
@@ -220,6 +223,8 @@ impl Sheet {
             protect_dirty: false,
             rich: std::collections::HashMap::new(),
             rich_dirty: false,
+            hyperlinks: std::collections::HashMap::new(),
+            hyperlinks_dirty: false,
         }
     }
 

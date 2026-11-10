@@ -30,6 +30,10 @@ pub struct PageSetup {
     pub title_rows: Option<(u32, u32)>,
     /// 左侧标题列
     pub title_cols: Option<(u32, u32)>,
+    /// 手动分页：在这些列之前分页（0 基）
+    pub col_breaks: Vec<u32>,
+    /// 手动分页：在这些行之前分页（0 基）
+    pub row_breaks: Vec<u32>,
 }
 
 impl Default for PageSetup {
@@ -51,6 +55,8 @@ impl Default for PageSetup {
             print_area: None,
             title_rows: None,
             title_cols: None,
+            col_breaks: Vec::new(),
+            row_breaks: Vec::new(),
         }
     }
 }
@@ -163,6 +169,12 @@ pub fn page_breaks(sheet: &Sheet) -> (Vec<f32>, Vec<f32>) {
         let _ = run;
     }
 
+    // 手动分页：用户拖过的地方优先
+    for c in ps.col_breaks.iter().copied() {
+        if c >= c1 && c <= c2 {
+            xs.push(sheet.cols.pos(c) - sheet.cols.pos(c1));
+        }
+    }
     let mut ys = Vec::new();
     let mut ay = 0.0;
     for r in r1..=r2 {
@@ -174,6 +186,15 @@ pub fn page_breaks(sheet: &Sheet) -> (Vec<f32>, Vec<f32>) {
             ay += h;
         }
     }
+    for r in ps.row_breaks.iter().copied() {
+        if r >= r1 && r <= r2 {
+            ys.push(sheet.rows.pos(r) - sheet.rows.pos(r1));
+        }
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
     (xs, ys)
 }
 
@@ -278,6 +299,38 @@ pub fn parse_page_setup(xml: &str) -> PageSetup {
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
+        }
+    }
+    // 手动分页
+    for (tag, is_row) in [("rowBreaks", true), ("colBreaks", false)] {
+        let Some(start) = xml.find(&format!("<{tag}")) else { continue };
+        let rest = &xml[start..];
+        let seg = rest
+            .find(&format!("</{tag}>"))
+            .map(|e| &rest[..e])
+            .unwrap_or(rest);
+        let mut v = Vec::new();
+        let mut from = 0usize;
+        while let Some(i) = seg[from..].find("<brk ") {
+            let i = from + i;
+            let Some(gt) = seg[i..].find('>').map(|e| i + e) else { break };
+            let tag = &seg[i..=gt];
+            if let Some(p) = tag.find("id=\"") {
+                let rest = &tag[p + 4..];
+                if let Some(q) = rest.find('"') {
+                    if let Ok(id) = rest[..q].parse::<u32>() {
+                        v.push(id);
+                    }
+                }
+            }
+            from = gt + 1;
+        }
+        v.sort_unstable();
+        v.dedup();
+        if is_row {
+            ps.row_breaks = v;
+        } else {
+            ps.col_breaks = v;
         }
     }
     ps
@@ -501,6 +554,18 @@ mod tests {
         assert!(!xs.is_empty(), "12 列 104px 在 A4 竖版应分成多页");
         // 第一条横线大约是整页高
         assert!(ys[0] > 800.0 && ys[0] < 1000.0, "{ys:?}");
+    }
+
+    #[test]
+    fn manual_row_break_is_included() {
+        let mut s = sheet();
+        s.page.row_breaks = vec![5];
+        let (_, ys) = page_breaks(&s);
+        let want = s.rows.pos(5) - s.rows.pos(0);
+        assert!(
+            ys.iter().any(|y| (y - want).abs() < 0.6),
+            "手动分页应出现在 {want} 附近：{ys:?}"
+        );
     }
 
     #[test]

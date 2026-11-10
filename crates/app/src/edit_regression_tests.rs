@@ -902,3 +902,144 @@ fn typing_below_a_table_extends_its_range() {
         "筛选区域应一起扩大"
     );
 }
+
+#[test]
+fn paste_special_values_transpose_and_operations() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let num = |v: f64| sheetcore::model::Cell {
+        value: sheetcore::model::Value::Number(v),
+        formula: None,
+    };
+    // 来源 2×2：1 2 / 3 4
+    let cells = vec![
+        vec![(num(1.0), 0), (num(2.0), 0)],
+        vec![(num(3.0), 0), (num(4.0), 0)],
+    ];
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 1, 1),
+        cells,
+        cut: false,
+    });
+    // 只粘数值
+    app.ps_kind = 1;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+    app.sel = (5, 0);
+    app.paste_special_apply(&ctx);
+    assert_eq!(app.wb.sheet(0).value(5, 0), sheetcore::model::Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(6, 1), sheetcore::model::Value::Number(4.0));
+    // 转置到 D1
+    app.ps_transpose = true;
+    app.sel = (0, 3);
+    app.paste_special_apply(&ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 3), sheetcore::model::Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(1, 3), sheetcore::model::Value::Number(2.0));
+    assert_eq!(app.wb.sheet(0).value(0, 4), sheetcore::model::Value::Number(3.0));
+    // 运算：10 + 来源
+    app.ps_transpose = false;
+    app.wb.sheet_mut(0).set(10, 0, num(10.0));
+    app.wb.sheet_mut(0).set(10, 1, num(10.0));
+    app.sel = (10, 0);
+    app.ps_op = 1;
+    app.paste_special_apply(&ctx);
+    assert_eq!(app.wb.sheet(0).value(10, 0), sheetcore::model::Value::Number(11.0));
+    assert_eq!(app.wb.sheet(0).value(10, 1), sheetcore::model::Value::Number(12.0));
+}
+
+#[test]
+fn totals_row_adds_subtotal_and_removes_cleanly() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        for c in 0..2u32 {
+            sh.set(0, c, sheetcore::model::Cell { value: sheetcore::model::Value::Text(format!("h{c}").into()), formula: None });
+            sh.set(1, c, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
+            sh.set(2, c, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
+        }
+    }
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.make_table();
+    let name = app.wb.sheet(0).tables[0].name.clone();
+    app.toggle_totals_row(&name);
+    {
+        let t = &app.wb.sheet(0).tables[0];
+        assert!(t.totals_row);
+        assert_eq!(t.range.2, 3, "汇总行并入表格范围");
+        assert_eq!(app.wb.sheet(0).value(3, 0).display(), "总计");
+        assert_eq!(app.wb.sheet(0).value(3, 1), sheetcore::model::Value::Number(3.0));
+    }
+    app.toggle_totals_row(&name);
+    assert!(!app.wb.sheet(0).tables[0].totals_row);
+    assert_eq!(app.wb.sheet(0).tables[0].range.2, 2);
+    assert_eq!(app.wb.sheet(0).value(3, 0), sheetcore::model::Value::Empty);
+}
+
+#[test]
+fn shift_cells_moves_values_down() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
+        sh.set(1, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 0), sheetcore::model::Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(2, 0), sheetcore::model::Value::Number(2.0));
+}
+
+#[test]
+fn ctrl_click_builds_multi_range_selection() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    run_grid_frame(&mut app, &ctx, vec![]);
+    // 先点 A1
+    let p1 = egui::pos2(HEAD_W + 36.0, HEAD_H + 9.5);
+    let click = |p: egui::Pos2, mods: egui::Modifiers| {
+        vec![
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: mods },
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: mods },
+        ]
+    };
+    run_grid_frame_mods(&mut app, &ctx, click(p1, Default::default()), Default::default());
+    assert_eq!(app.sel, (0, 0));
+    // Ctrl+点 C3
+    let p2 = egui::pos2(HEAD_W + 2.0 * 72.0 + 36.0, HEAD_H + 2.0 * 19.0 + 9.5);
+    let ctrl = egui::Modifiers { command: true, ..Default::default() };
+    run_grid_frame_mods(&mut app, &ctx, click(p2, ctrl), ctrl);
+    assert_eq!(app.sel, (2, 2));
+    assert_eq!(app.extra_sel.len(), 1, "A1 应固定在多选区里");
+    // 给两块区域加粗
+    app.apply_style(|st| st.bold = true);
+    let a1 = app.wb.sheet(0).style_of(0, 0);
+    let c3 = app.wb.sheet(0).style_of(2, 2);
+    assert!(app.wb.styles.get(a1).bold);
+    assert!(app.wb.styles.get(c3).bold);
+}
+
+#[test]
+fn move_selection_by_shifts_values_and_formulas() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(5.0), formula: None });
+        sh.set(1, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None });
+        sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Empty, formula: Some("A1+1".into()) });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.move_selection_by(1, 0);
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 0), sheetcore::model::Value::Number(5.0));
+    let f = app.wb.sheet(0).get(1, 1).and_then(|c| c.formula.clone());
+    assert_eq!(f.as_deref(), Some("A2+1"), "公式应跟着移动");
+    assert_eq!(app.wb.sheet(0).value(1, 1), sheetcore::model::Value::Number(6.0));
+}
