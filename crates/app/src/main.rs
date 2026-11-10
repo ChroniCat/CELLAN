@@ -343,6 +343,8 @@ struct SheetApp {
     keytips: bool,
     /// Alt 上一次的按下状态（egui 没有单独的 Alt 键事件）
     alt_down: bool,
+    /// 允许文字溢出到右侧空列（Excel 默认；关闭则裁剪在格子里）
+    text_spill: bool,
     /// 视图选项：网格线 / 标题 / 编辑栏
     show_gridlines: bool,
     show_headings: bool,
@@ -584,6 +586,7 @@ impl SheetApp {
             open_requests: None,
             shared_current_file: None,
             show_start: false,
+            text_spill: false,
             confirm_close_target: None,
             tabs_done: false,
             paste_done: false,
@@ -1042,6 +1045,8 @@ impl SheetApp {
                     // 调试：SC_SEL=r,c 时保留启动时的选区，便于无界面验证
                     if std::env::var("SC_SEL").is_err() {
                         self.sel = (0, 0);
+                    } else {
+                        self.ensure_visible();
                     }
                     self.scroll = Vec2::ZERO;
                     self.editing = None;
@@ -6882,11 +6887,13 @@ impl SheetApp {
                     (self.show_gridlines, "网格线", "显示单元格之间的浅灰网格线"),
                     (self.show_headings, "标题", "显示列标和行号"),
                     (self.show_formula_bar, "编辑栏", "显示名称框和 fx 输入行"),
+                    (self.text_spill, "文字溢出", "长文本允许越过右边界（Excel 默认）；关闭则裁剪在格子里"),
                 ] {
                     if ui_kit::labeled_w_on(ui, Icon::Grid, label, 96.0, on, tip).clicked() {
                         match label {
                             "网格线" => self.show_gridlines = !self.show_gridlines,
                             "标题" => self.show_headings = !self.show_headings,
+                            "文字溢出" => self.text_spill = !self.text_spill,
                             _ => self.show_formula_bar = !self.show_formula_bar,
                         }
                     }
@@ -7755,7 +7762,26 @@ impl SheetApp {
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
                     clipped.galley(egui::pos2(x, top), galley, color);
                 } else {
-                    painter.text(egui::pos2(tx, ty), align, txt.clone(), font.clone(), color);
+                    // 默认裁剪在格子里：长文本不再压住右侧列线（视图里可开回 Excel 的溢出行为）
+                    let g = painter.layout_no_wrap(txt.clone(), font.clone(), color);
+                    let w = g.size().x;
+                    let x0 = match align {
+                        Align2::CENTER_CENTER => rect.center().x - w / 2.0,
+                        Align2::RIGHT_CENTER => rect.max.x - 4.0 - w,
+                        _ => tx,
+                    };
+                    let y0 = ty - g.size().y / 2.0;
+                    let clip = if self.text_spill {
+                        Rect::from_min_max(
+                            egui::pos2(rect.min.x, rect.min.y),
+                            egui::pos2(painter.clip_rect().max.x, rect.max.y),
+                        )
+                    } else {
+                        rect
+                    };
+                    painter
+                        .with_clip_rect(clip.intersect(painter.clip_rect()))
+                        .galley(egui::pos2(x0, y0), g, color);
                     if is_link {
                         // Excel 的超链接是蓝色 + 下划线
                         let g = painter.layout_no_wrap(txt.clone(), font, color);
@@ -7766,10 +7792,12 @@ impl SheetApp {
                             _ => tx,
                         };
                         let y0 = ty + fs * 0.55;
-                        painter.line_segment(
-                            [egui::pos2(x0, y0), egui::pos2(x0 + w, y0)],
-                            Stroke::new(1.0, color),
-                        );
+                        painter
+                            .with_clip_rect(rect.intersect(painter.clip_rect()))
+                            .line_segment(
+                                [egui::pos2(x0, y0), egui::pos2(x0 + w, y0)],
+                                Stroke::new(1.0, color),
+                            );
                     }
                 }
             }
