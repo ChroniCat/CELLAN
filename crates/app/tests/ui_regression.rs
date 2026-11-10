@@ -283,6 +283,34 @@ fn merged_range_uses_anchor_font() {
 }
 
 #[test]
+fn header_highlight_follows_merged_selection() {
+    // Excel 选中合并格时，整块合并区覆盖的列头都高亮（不只是活动格那一列）
+    let dir = std::env::temp_dir().join("sheet_ui_headsel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("head_sel.xlsx");
+    let _ = std::fs::remove_file(&p);
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Text("标题".into()),
+            formula: None,
+        },
+    );
+    wb.sheets[0].merge_range(0, 0, 0, 4);
+    sheetcore::xlsx::save(&p, &wb).expect("造样本");
+
+    let dump = dump_for(p.to_str().unwrap(), &[], Duration::from_secs(30)).expect("dump headsel");
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with("head_sel "))
+        .unwrap_or_else(|| panic!("dump 里没有 head_sel：{dump}"));
+    assert!(line.contains("cols=0..4"), "合并区应该让 A..E 列头都高亮：{line}");
+    assert!(line.contains("rows=0..0"), "只选中第 1 行：{line}");
+}
+
+#[test]
 fn external_link_values_render_and_refresh() {
     let dir = std::env::temp_dir().join("sheet_ui_xlink");
     let _ = std::fs::remove_dir_all(&dir);

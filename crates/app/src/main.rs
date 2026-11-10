@@ -6045,10 +6045,12 @@ impl SheetApp {
         let cur = self.current_style();
 
         ui_kit::group(ui, "剪贴板", |ui| {
-            if ui_kit::big(ui, Icon::Paste, "粘贴").clicked() {
+            let paste = ui_kit::big(ui, Icon::Paste, "粘贴");
+            if paste.clicked() {
                 self.clip_paste(false, None);
             }
-            ui.menu_button("▾", |ui| {
+            // Excel 的粘贴是 split button：右键给出选择性粘贴，省掉按钮旁那个 ▾
+            paste.context_menu(|ui| {
                 if ui.button("选择性粘贴…").clicked() {
                     self.paste_special = true;
                     ui.close_menu();
@@ -6077,7 +6079,7 @@ impl SheetApp {
                         } else {
                             cur.font.clone()
                         })
-                        .width(170.0)
+                        .width(140.0)
                         .height(24.0)
                         .show_ui(ui, |ui| {
                             for name in sheetcore::style::FONT_CHOICES {
@@ -6099,7 +6101,7 @@ impl SheetApp {
                         });
                     egui::ComboBox::from_id_salt("size_pick")
                         .selected_text(format!("{:.0}", cur.size))
-                        .width(48.0)
+                        .width(36.0)
                         .height(24.0)
                         .show_ui(ui, |ui| {
                             for size in [9.0f32, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
@@ -6166,8 +6168,7 @@ impl SheetApp {
                             ui.close_menu();
                         }
                     });
-                });
-                ui.horizontal(|ui| {
+                    ui.add_space(2.0);
                     let fill = cur.fill.unwrap_or([255, 255, 255]);
                     if ui_kit::color_button(ui, None, Some(Icon::Fill), Color32::from_rgb(fill[0], fill[1], fill[2]), "填充颜色").clicked() {
                         self.color_popup = Some(false);
@@ -6177,23 +6178,12 @@ impl SheetApp {
                         self.color_popup = Some(true);
                     }
                 });
-
             });
         }) { self.fmt_pending = true; }
 
         if ui_kit::group_l(ui, "对齐方式", "align", |ui| {
             ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    for (ic, val, tip) in [
-                        (Icon::AlignL, 1u8, "左对齐"),
-                        (Icon::AlignC, 2, "居中"),
-                        (Icon::AlignR, 3, "右对齐"),
-                    ] {
-                        if ui_kit::small_on(ui, ic, cur.halign == val, tip).clicked() {
-                            self.apply_style(move |s| s.halign = val);
-                        }
-                    }
-                });
+                // Excel 的对齐组：上排垂直对齐（顶/中/底），中排水平对齐（左/中/右）
                 ui.horizontal(|ui| {
                     for (ic, val, tip) in [
                         (Icon::Top, 1u8, "顶端对齐"),
@@ -6206,7 +6196,18 @@ impl SheetApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 81.0, cur.wrap, "自动换行").clicked() {
+                    for (ic, val, tip) in [
+                        (Icon::AlignL, 1u8, "左对齐"),
+                        (Icon::AlignC, 2, "居中"),
+                        (Icon::AlignR, 3, "右对齐"),
+                    ] {
+                        if ui_kit::small_on(ui, ic, cur.halign == val, tip).clicked() {
+                            self.apply_style(move |s| s.halign = val);
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 78.0, cur.wrap, "自动换行").clicked() {
                         let v = !cur.wrap;
                         self.apply_style(move |s| s.wrap = v);
                     }
@@ -6217,7 +6218,7 @@ impl SheetApp {
                         .merges
                         .iter()
                         .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2);
-                    if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 96.0, merged, "合并后居中").clicked() {
+                    if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 92.0, merged, "合并后居中").clicked() {
                         self.toggle_merge(!merged);
                     }
                     ui.menu_button("▾", |ui| {
@@ -6307,13 +6308,13 @@ impl SheetApp {
         }) { self.fmt_pending = true; }
 
         ui_kit::group(ui, "样式", |ui| {
-            if ui_kit::big_sized(ui, Icon::Filter, "条件格式", Vec2::new(64.0, 76.0)).clicked() {
+            if ui_kit::big_sized(ui, Icon::Cf, "条件格式", Vec2::new(66.0, 76.0)).clicked() {
                 self.cf_mgr = true;
             }
-            if ui_kit::big_sized(ui, Icon::Table, "套用表格格式", Vec2::new(80.0, 76.0)).clicked() {
+            if ui_kit::big_sized(ui, Icon::Table, "套用表格格式", Vec2::new(66.0, 76.0)).clicked() {
                 self.make_table();
             }
-            if ui_kit::big_sized(ui, Icon::Grid, "单元格样式", Vec2::new(64.0, 76.0)).clicked() {
+            if ui_kit::big_sized(ui, Icon::Grid, "单元格样式", Vec2::new(66.0, 76.0)).clicked() {
                 self.fmt_dlg = true;
             }
         });
@@ -6323,7 +6324,7 @@ impl SheetApp {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 let cc = self.sel.1;
                 ui.horizontal(|ui| {
-                    if ui_kit::labeled_w(ui, Icon::Plus, "插入", 84.0, "插入行/列").clicked() {
+                    if ui_kit::labeled_w(ui, Icon::Plus, "插入", 81.0, "插入行/列").clicked() {
                         self.structural(sheetcore::structural::Structural::InsertRows {
                             at: r1,
                             n: r2 - r1 + 1,
@@ -6349,13 +6350,13 @@ impl SheetApp {
                         }
                     });
                 });
-                if ui_kit::labeled_w(ui, Icon::Close, "删除", 100.0, "删除行/列").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Close, "删除", 81.0, "删除行/列").clicked() {
                     self.structural(sheetcore::structural::Structural::DeleteRows {
                         at: r1,
                         n: r2 - r1 + 1,
                     });
                 }
-                if ui_kit::labeled_w(ui, Icon::Brush, "格式", 100.0, "设置单元格格式（Ctrl+1）").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Brush, "格式", 81.0, "设置单元格格式（Ctrl+1）").clicked() {
                     self.fmt_dlg = true;
                 }
                 let _ = cc;
@@ -6363,25 +6364,31 @@ impl SheetApp {
         });
 
         ui_kit::group(ui, "编辑", |ui| {
+            // Excel 的编辑组：自动求和是大按钮，填充/清除是小按钮，
+            // 排序和筛选、查找和选择也是 65×76 的大按钮
+            if ui_kit::big(ui, Icon::Sum, "自动求和").on_hover_text("对上方连续数字求和").clicked() {
+                self.auto_sum();
+            }
             ui.vertical(|ui| {
-                if ui_kit::labeled_w(ui, Icon::Sum, "自动求和", 96.0, "对上方连续数字求和").clicked() {
-                    self.auto_sum();
-                }
-                if ui_kit::labeled_w(ui, Icon::Filter, "排序和筛选", 96.0, "排序 / 启用筛选").clicked() {
-                    self.start_filter();
-                }
-                if ui_kit::labeled_w(ui, Icon::Find, "查找和选择", 96.0, "查找与替换（Ctrl+F）").clicked() {
-                    self.find.open = true;
-                }
-            });
-            ui.vertical(|ui| {
-                if ui_kit::labeled_w(ui, Icon::Fill, "填充", 80.0, "把选区第一行填到下面").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Fill, "填充", 81.0, "把选区第一行填到下面").clicked() {
                     self.fill_down();
                 }
-                if ui_kit::labeled_w(ui, Icon::Close, "清除", 80.0, "清除内容与格式").clicked() {
+                if ui_kit::labeled_w(ui, Icon::Close, "清除", 81.0, "清除内容与格式").clicked() {
                     self.clear_selection();
                 }
             });
+            if ui_kit::big_sized(ui, Icon::Filter, "排序和筛选", Vec2::new(68.0, 76.0))
+                .on_hover_text("排序 / 启用筛选")
+                .clicked()
+            {
+                self.start_filter();
+            }
+            if ui_kit::big_sized(ui, Icon::Find, "查找和选择", Vec2::new(68.0, 76.0))
+                .on_hover_text("查找与替换（Ctrl+F）")
+                .clicked()
+            {
+                self.find.open = true;
+            }
         });
         if self.fmt_pending {
             self.fmt_pending = false;
@@ -7758,7 +7765,7 @@ impl SheetApp {
                         _ => rect.min.x + 4.0 + icon_shift,
                     };
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-                    for (g, (_, c)) in galleys.into_iter().zip(fonts.iter()) {
+                    for (i_run, (g, (_, c))) in galleys.into_iter().zip(fonts.iter()).enumerate() {
                         let w = g.size().x;
                         let gh = g.size().y;
                         let y = if st.valign == 1 {
@@ -7768,7 +7775,11 @@ impl SheetApp {
                         } else {
                             rect.center().y - gh / 2.0
                         };
-                        clipped.galley(egui::pos2(x, y), g, *c);
+                        let is_run_bold = runs.get(i_run).map(|r| r.bold).unwrap_or(false);
+                        clipped.galley(egui::pos2(x, y), g.clone(), *c);
+                        if is_run_bold {
+                            clipped.galley(egui::pos2(x + 0.6, y), g, *c);
+                        }
                         x += w;
                     }
                 } else if multiline {
@@ -7814,9 +7825,13 @@ impl SheetApp {
                     } else {
                         rect
                     };
-                    painter
-                        .with_clip_rect(clip.intersect(painter.clip_rect()))
-                        .galley(egui::pos2(x0, y0), g, color);
+                    let clipped = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
+                    clipped.galley(egui::pos2(x0, y0), g.clone(), color);
+                    if st.bold {
+                        // egui 没有粗体字形：同一串再画一遍、右移 0.6px，
+                        // 笔画厚度才接近 Excel 的 Bold（只把字号 +0.8 显不出粗）
+                        clipped.galley(egui::pos2(x0 + 0.6, y0), g, color);
+                    }
                     if is_link {
                         // Excel 的超链接是蓝色 + 下划线
                         let g = painter.layout_no_wrap(txt.clone(), font, color);
@@ -10505,7 +10520,6 @@ impl SheetApp {
             dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{}) sel={:?} dv={} cf={}", avail, off_x, off_y, first_col, first_row, self.sel, self.wb.sheet(self.sheet_idx).dv.len(), self.wb.sheet(self.sheet_idx).cf.blocks.len()));
         }
 
-        let text_color = Color32::from_rgb(24, 24, 24);
         // 和 Excel 一致的浅灰网格线 / 表头底色
         let grid_line = Color32::from_rgb(217, 217, 217);
         let grid_stroke = if self.show_gridlines {
@@ -10518,6 +10532,25 @@ impl SheetApp {
         let head_sel = Color32::from_rgb(225, 225, 225);
 
         // 列标题
+        // Excel：选区覆盖到的列在列头上整块加深（不是只有活动格那一列）。
+        // 绿线统一放在表头分界线之后画，才不会被 1px 的边框盖住。
+        let (mut sr1, mut sc1, mut sr2, mut sc2) = self.sel_rect();
+        // 活动格落在合并区里时，Excel 会把整块合并区覆盖的行/列都高亮
+        if let Some((mr1, mc1, mr2, mc2)) = self
+            .wb
+            .sheet(self.sheet_idx)
+            .merges
+            .iter()
+            .find(|(r1, c1, r2, c2)| {
+                self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2
+            })
+            .copied()
+        {
+            sr1 = mr1;
+            sc1 = mc1;
+            sr2 = mr2;
+            sc2 = mc2;
+        }
         painter.rect_filled(
             Rect::from_min_size(origin, Vec2::new(avail.x, hh)),
             0.0,
@@ -10527,6 +10560,13 @@ impl SheetApp {
         for c in 0..fx {
             let x = origin.x + head_w + cols.pos(c);
             let w = cols.size(c);
+            if c >= sc1 && c <= sc2 {
+                painter.rect_filled(
+                    Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, hh)),
+                    0.0,
+                    head_sel,
+                );
+            }
             if self.show_headings {
             painter.text(
                     egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
@@ -10538,7 +10578,7 @@ impl SheetApp {
             }
             painter.line_segment(
                 [egui::pos2(x, origin.y), egui::pos2(x, origin.y + hh)],
-                Stroke::new(1.0, ui_kit::BORDER),
+                Stroke::new(1.0, ui_kit::HEAD_LINE),
             );
             painter.line_segment(
                 [egui::pos2(x, origin.y + hh), egui::pos2(x, origin.y + hh + avail.y)],
@@ -10552,7 +10592,7 @@ impl SheetApp {
             let x = gx(c);
             let w = cols.size(c);
             if x + w > origin.x + head_w {
-                if c == self.sel.1 {
+                if c >= sc1 && c <= sc2 {
                     painter.rect_filled(
                         Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, hh)),
                         0.0,
@@ -10570,7 +10610,7 @@ impl SheetApp {
                 }
                 painter.line_segment(
                     [egui::pos2(x, origin.y), egui::pos2(x, origin.y + hh)],
-                    Stroke::new(1.0, ui_kit::BORDER),
+                    Stroke::new(1.0, ui_kit::HEAD_LINE),
                 );
                 painter.line_segment(
                     [egui::pos2(x, origin.y + hh), egui::pos2(x, origin.y + hh + avail.y)],
@@ -10579,7 +10619,6 @@ impl SheetApp {
             }
             c += 1;
         }
-
         // 行标题
         for r in 0..fy {
             let y = origin.y + hh + rows.pos(r);
@@ -10609,7 +10648,7 @@ impl SheetApp {
                 continue;
             }
             if y + h > origin.y + hh {
-                if r == self.sel.0 {
+                if r >= sr1 && r <= sr2 {
                     painter.rect_filled(
                         Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(head_w, h)),
                         0.0,
@@ -10627,7 +10666,7 @@ impl SheetApp {
                 }
                 painter.line_segment(
                     [egui::pos2(origin.x, y), egui::pos2(origin.x + head_w, y)],
-                    Stroke::new(1.0, ui_kit::BORDER),
+                    Stroke::new(1.0, ui_kit::HEAD_LINE),
                 );
                 painter.line_segment(
                     [egui::pos2(origin.x + head_w, y), egui::pos2(origin.x + avail.x, y)],
@@ -10636,22 +10675,52 @@ impl SheetApp {
             }
             r += 1;
         }
-
-        // 行号列与表格之间的分界线（Excel 的 #D0D0D0）
+        // 行号列与表格之间的分界线（Excel 实测 #ABABAB，比控件边框深）
         painter.line_segment(
             [
                 egui::pos2(origin.x + head_w, origin.y),
                 egui::pos2(origin.x + head_w, origin.y + avail.y),
             ],
-            Stroke::new(1.0, ui_kit::BORDER),
+            Stroke::new(1.0, ui_kit::HEAD_LINE),
         );
         painter.line_segment(
             [
                 egui::pos2(origin.x, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + hh),
             ],
-            Stroke::new(1.0, ui_kit::BORDER),
+            Stroke::new(1.0, ui_kit::HEAD_LINE),
         );
+
+        if dumping {
+            dump.push(format!("head_sel cols={sc1}..{sc2} rows={sr1}..{sr2}"));
+        }
+        // 选中行列头的 2px 绿线：Excel 画在表头最外沿，盖住分界线
+        if self.show_headings {
+            let x0 = gx(sc1).max(origin.x + head_w);
+            let x1 = (gx(sc1) + cols.pos(sc2 + 1) - cols.pos(sc1)).min(origin.x + avail.x);
+            if x1 > x0 {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(x0, origin.y + hh - 2.0),
+                        egui::pos2(x1, origin.y + hh),
+                    ),
+                    0.0,
+                    ui_kit::ACCENT,
+                );
+            }
+            let y0 = gy(sr1).max(origin.y + hh);
+            let y1 = (gy(sr1) + rows.pos(sr2 + 1) - rows.pos(sr1)).min(origin.y + avail.y);
+            if y1 > y0 {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(origin.x + head_w - 2.0, y0),
+                        egui::pos2(origin.x + head_w, y1),
+                    ),
+                    0.0,
+                    ui_kit::ACCENT,
+                );
+            }
+        }
 
         // 条件格式叠加（只算可视范围）
         let si = self.sheet_idx;
@@ -13268,7 +13337,7 @@ impl SheetApp {
         let bg = if dark {
             Color32::from_rgb(38, 42, 49)
         } else {
-            Color32::from_rgb(243, 243, 243)
+            ui_kit::TITLE_BG
         };
         let fg = if dark {
             Color32::from_rgb(226, 229, 234)
@@ -13546,7 +13615,7 @@ impl eframe::App for SheetApp {
                         ui_kit::RIBBON_BODY_H + 1.0
                     },
             )
-            .frame(egui::Frame::NONE.fill(Color32::WHITE))
+            .frame(egui::Frame::NONE.fill(ui_kit::TABBAR_BG))
             .show(ctx, |ui| {
                 let full = ui.max_rect();
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -13592,6 +13661,34 @@ impl eframe::App for SheetApp {
                                 }
                             }
                         }
+                        // Excel 在页签行右端常驻“共享”（绿色）：我们对应的是协作入口
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            if self.net.is_some() {
+                                if ui_kit::labeled_w(
+                                    ui,
+                                    Icon::Share,
+                                    &format!("在线 {}", self.peers_list.len()),
+                                    90.0,
+                                    "查看在线协作者",
+                                )
+                                .clicked()
+                                {
+                                    self.members_open = true;
+                                }
+                            } else if ui_kit::labeled_tint(
+                                ui,
+                                Icon::Share,
+                                "共享",
+                                64.0,
+                                ui_kit::ACCENT,
+                                "把当前文件共享到局域网（不经过服务器）",
+                            )
+                            .clicked()
+                            {
+                                self.start_host();
+                            }
+                        });
                         if self.table_at_sel().is_some() {
                             let tr = ui_kit::tab_ex(ui, "表设计", self.ribbon_tab == 100, false);
                             if tr.clicked() {
@@ -13792,12 +13889,26 @@ impl eframe::App for SheetApp {
                 let mut cancel = false;
                 let mut fx_click = false;
                 let editing = self.editing.is_some();
-                for (i, kind) in ["cancel", "ok", "fx"].iter().enumerate() {
+                // Excel：×/✓ 只在单元格进入编辑态时出现，空闲时只留 fx
+                let btn_kinds: &[&str] = if editing {
+                    &["cancel", "ok", "fx"]
+                } else {
+                    &["fx"]
+                };
+                // fx 固定在右侧（Excel 的 fx 位置不动），×/✓ 出现在它左边
+                let slot = |kind: &str| -> f32 {
+                    match kind {
+                        "cancel" => fx_left,
+                        "ok" => fx_left + 26.0,
+                        _ => fx_left + 52.0,
+                    }
+                };
+                for kind in btn_kinds.iter() {
                     let b = Rect::from_min_size(
-                        egui::pos2(fx_left + i as f32 * 26.0, rect.top() + 10.0),
+                        egui::pos2(slot(kind), rect.top() + 10.0),
                         Vec2::splat(24.0),
                     );
-                    let resp = ui.interact(b, egui::Id::new(("fxbtn", i)), Sense::click());
+                    let resp = ui.interact(b, egui::Id::new(("fxbtn", *kind)), Sense::click());
                     let active = editing || *kind == "fx";
                     if resp.hovered() && active {
                         painter.rect_filled(b, 2.0, ui_kit::HOVER);
@@ -14055,12 +14166,12 @@ impl eframe::App for SheetApp {
                             ctx.set_zoom_factor(z);
                         }
                         ui.add_space(6.0);
-                        // 三个视图按钮
-                        let (vr, _) = ui.allocate_exact_size(Vec2::new(72.0, 21.0), Sense::hover());
+                        // 三个视图按钮：Excel 是 40×21（UIA 实测），不是图标小方块
+                        let (vr, _) = ui.allocate_exact_size(Vec2::new(120.0, 21.0), Sense::hover());
                         for (i, tip) in ["普通", "页面布局", "分页预览"].iter().enumerate() {
                             let b = Rect::from_min_size(
-                                egui::pos2(vr.right() - (3 - i) as f32 * 24.0, vr.top()),
-                                Vec2::new(24.0, 20.0),
+                                egui::pos2(vr.left() + i as f32 * 40.0, vr.top()),
+                                Vec2::new(40.0, 21.0),
                             );
                             let resp = ui.interact(b, egui::Id::new(("viewbtn", i)), Sense::click());
                             if resp.hovered() {
@@ -14156,8 +14267,9 @@ impl eframe::App for SheetApp {
                 let mut mv: Option<(usize, i32)> = None;
                 // 左/右滚动按钮（Excel 在最左边两个 32×32）
                 for (i, dir) in ["left", "right"].iter().enumerate() {
+                    // Excel 的标签滚动按钮从左边 16px 开始（UIA 实测）
                     let b = Rect::from_min_size(
-                        egui::pos2(rect.left() + i as f32 * 32.0, rect.top() + 1.0),
+                        egui::pos2(rect.left() + 16.0 + i as f32 * 32.0, rect.top() + 1.0),
                         Vec2::new(32.0, 31.0),
                     );
                     let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), Sense::click());
@@ -14181,7 +14293,7 @@ impl eframe::App for SheetApp {
                     );
                 }
                 ui.horizontal(|ui| {
-                ui.add_space(72.0);
+                ui.add_space(112.0);
                 let mut area = egui::ScrollArea::horizontal()
                     .id_salt("sheet_tabs")
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -14548,14 +14660,6 @@ fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
     );
     let t = ((*zoom - 0.5) / 2.0).clamp(0.0, 1.0);
     let x = rect.left() + 6.0 + t * (rect.width() - 12.0);
-    p.rect_filled(
-        Rect::from_min_max(
-            egui::pos2(rect.left() + 6.0, cy - 1.5),
-            egui::pos2(x, cy + 1.5),
-        ),
-        1.5,
-        ui_kit::ACCENT,
-    );
     p.circle_filled(egui::pos2(x, cy), 5.0, Color32::WHITE);
     p.circle_stroke(
         egui::pos2(x, cy),

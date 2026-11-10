@@ -58,6 +58,8 @@ pub enum Icon {
     FontShrink,
     Freeze,
     Lock,
+    /// 条件格式：三条彩色数据条（Excel 的那个图标）
+    Cf,
 }
 
 struct Pen<'a> {
@@ -152,9 +154,50 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     draw_with_pen(pen, icon);
 }
 
-/// Excel 风格：先铺一层彩色底（和 Excel 自带的彩色图标同色系），再用单色线描边。
+/// Office 色板：图标底色与描边都用这套，视觉上和 Excel 的彩色图标同一色系。
+const BLUE: Color32 = Color32::from_rgb(68, 114, 196);
+const BLUE_D: Color32 = Color32::from_rgb(31, 78, 121);
+const BLUE_L: Color32 = Color32::from_rgb(189, 215, 238);
+const BROWN: Color32 = Color32::from_rgb(166, 88, 42);
+const BROWN_D: Color32 = Color32::from_rgb(132, 60, 12);
+const CREAM: Color32 = Color32::from_rgb(255, 242, 204);
+const GOLD: Color32 = Color32::from_rgb(255, 192, 0);
+const GOLD_D: Color32 = Color32::from_rgb(127, 96, 0);
+const RED: Color32 = Color32::from_rgb(192, 0, 0);
+const GREEN: Color32 = Color32::from_rgb(112, 173, 71);
+const GREEN_D: Color32 = Color32::from_rgb(84, 130, 53);
+const ORANGE: Color32 = Color32::from_rgb(237, 125, 49);
+const ORANGE_D: Color32 = Color32::from_rgb(197, 90, 17);
+const GRAY_D: Color32 = Color32::from_rgb(89, 89, 89);
+
+/// 图标的线条色：Excel 的图标不是纯黑线条，而是各自主题色的深色版。
+fn stroke_of(icon: Icon) -> Option<Color32> {
+    use Icon::*;
+    Some(match icon {
+        Paste => BROWN_D,
+        Cut | Copy | Brush => BLUE_D,
+        Fill => GOLD_D,
+        FontColor => RED,
+        Border | Grid => GRAY_D,
+        AlignL | AlignC | AlignR | Top | Middle | Bottom | Wrap | Merge => BLUE_D,
+        Currency | Percent | Comma | DecInc | DecDec => GREEN_D,
+        SortAsc | SortDesc | Filter | Link | Table | Pivot | Share => BLUE_D,
+        Find | Zoom | Revision | Calc => GRAY_D,
+        Chart => ORANGE_D,
+        Image => GREEN_D,
+        Comment => GOLD_D,
+        Cf => GRAY_D,
+        Sheet => GREEN_D,
+        Sum | Fx => GRAY_D,
+        _ => return None,
+    })
+}
+
+/// Excel 风格：先铺一层彩色底（和 Excel 自带的彩色图标同色系），再按主题色描边。
 /// 关掉的按钮只画灰线，不铺色。
 pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
+    // Excel 的图形比 24 网格画得满：外扩 4%，32px 时约多 2.5px
+    let rect = rect.expand(rect.width() * 0.04);
     let s = rect.width() / 24.0;
     let at = |x: f32, y: f32| egui::pos2(rect.left() + x * s, rect.top() + y * s);
     let fill = |x: f32, y: f32, w: f32, h: f32, c: Color32| {
@@ -167,82 +210,137 @@ pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: 
     if enabled {
         use Icon::*;
         match icon {
+            // 粘贴：棕色剪贴板 + 米色纸 + 蓝夹子
             Paste => {
-                fill(6.0, 7.0, 12.0, 13.0, Color32::from_rgb(242, 214, 160));
-                fill(9.5, 3.5, 5.0, 3.0, Color32::from_rgb(68, 114, 196));
+                fill(5.0, 3.5, 14.0, 17.5, BROWN);
+                fill(7.0, 6.5, 10.0, 12.5, CREAM);
+                fill(9.5, 2.5, 5.0, 3.2, BLUE);
+            }
+            Cut => {
+                // 剪刀的两片刃用蓝色，环用深蓝
+                p.line_segment(
+                    [at(7.0, 4.0), at(16.0, 15.0)],
+                    Stroke::new(2.2 * s, BLUE),
+                );
+                p.line_segment(
+                    [at(17.0, 4.0), at(8.0, 15.0)],
+                    Stroke::new(2.2 * s, BLUE),
+                );
+                p.circle_stroke(at(6.0, 18.0), 2.4 * s, Stroke::new(1.8 * s, BLUE_D));
+                p.circle_stroke(at(18.0, 18.0), 2.4 * s, Stroke::new(1.8 * s, BLUE_D));
             }
             Copy => {
-                fill(9.0, 4.0, 10.0, 12.0, Color32::from_rgb(222, 235, 247));
+                fill(8.4, 3.4, 11.6, 13.6, BLUE_L);
+                fill(4.4, 7.4, 11.6, 13.6, CREAM);
             }
             Brush => {
-                fill(4.6, 4.6, 7.8, 10.8, Color32::from_rgb(200, 162, 101));
+                fill(4.2, 4.2, 8.6, 11.6, Color32::from_rgb(226, 196, 138));
+                fill(1.0, 17.6, 3.2, 3.2, BLUE_D);
             }
             Fill => {
-                fill(7.5, 6.5, 9.0, 8.0, Color32::from_rgb(242, 200, 17));
-                fill(18.6, 16.6, 3.0, 4.0, Color32::from_rgb(242, 200, 17));
+                // 油漆桶：桶身金黄、流出的那一滴也金黄
+                p.add(egui::Shape::convex_polygon(
+                    vec![at(6.0, 11.0), at(12.0, 4.0), at(18.0, 11.0), at(12.0, 18.0)],
+                    GOLD,
+                    Stroke::new(1.2 * s, GOLD_D),
+                ));
+                p.add(egui::Shape::convex_polygon(
+                    vec![at(19.0, 14.5), at(21.5, 20.5), at(16.5, 20.5)],
+                    GOLD,
+                    Stroke::new(1.0 * s, GOLD_D),
+                ));
             }
             FontColor => {
-                fill(5.0, 20.0, 14.0, 2.6, Color32::from_rgb(192, 0, 0));
+                fill(5.0, 19.6, 14.0, 3.2, RED);
+            }
+            Border => {
+                // 外框用蓝色，内部两条线浅蓝
+                p.rect_stroke(
+                    Rect::from_min_max(at(4.0, 4.0), at(20.0, 20.0)),
+                    0.0,
+                    Stroke::new(2.0 * s, BLUE),
+                    egui::StrokeKind::Inside,
+                );
+                fill(4.0, 11.2, 16.0, 1.6, BLUE_L);
+                fill(11.2, 4.0, 1.6, 16.0, BLUE_L);
             }
             Chart => {
-                fill(5.0, 12.0, 4.0, 8.0, Color32::from_rgb(68, 114, 196));
-                fill(10.0, 7.0, 4.0, 13.0, Color32::from_rgb(237, 125, 49));
-                fill(15.0, 10.0, 4.0, 10.0, Color32::from_rgb(165, 165, 165));
+                fill(4.6, 12.4, 4.2, 7.4, BLUE);
+                fill(9.8, 7.4, 4.2, 12.4, ORANGE);
+                fill(15.0, 10.4, 4.2, 9.4, Color32::from_rgb(165, 165, 165));
             }
             Image => {
-                fill(3.8, 5.8, 16.4, 12.4, Color32::from_rgb(222, 235, 247));
-                fill(3.8, 14.0, 6.0, 4.2, Color32::from_rgb(112, 173, 71));
-                fill(10.0, 12.0, 8.0, 6.2, Color32::from_rgb(84, 130, 53));
-                p.circle_filled(at(8.0, 9.0), 1.6 * s, Color32::from_rgb(255, 192, 0));
+                fill(3.6, 5.6, 16.8, 12.8, BLUE_L);
+                fill(3.6, 13.4, 7.4, 5.0, GREEN);
+                fill(9.6, 11.6, 10.8, 6.8, GREEN_D);
+                p.circle_filled(at(8.0, 9.0), 1.7 * s, GOLD);
             }
             Table => {
-                fill(3.8, 5.0, 16.4, 4.4, Color32::from_rgb(68, 114, 196));
-                fill(3.8, 9.6, 16.4, 9.0, Color32::from_rgb(222, 235, 247));
+                fill(3.6, 4.8, 16.8, 4.6, BLUE);
+                fill(3.6, 9.4, 16.8, 9.2, BLUE_L);
             }
             Comment => {
-                fill(4.8, 4.8, 14.4, 9.6, Color32::from_rgb(255, 242, 204));
+                fill(4.6, 4.6, 14.8, 10.0, CREAM);
             }
             Link => {
-                p.circle_stroke(at(8.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, Color32::from_rgb(68, 114, 196)));
-                p.circle_stroke(at(16.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, Color32::from_rgb(68, 114, 196)));
+                p.circle_stroke(at(8.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, BLUE));
+                p.circle_stroke(at(16.0, 12.0), 4.0 * s, Stroke::new(2.0 * s, BLUE));
             }
             Revision | Zoom | Find => {
-                p.circle_filled(at(11.0, 10.0), 5.4 * s, Color32::from_rgb(222, 235, 247));
+                p.circle_filled(at(11.0, 10.0), 5.6 * s, BLUE_L);
             }
             Calc => {
-                fill(4.8, 3.8, 14.4, 16.4, Color32::from_rgb(231, 230, 230));
+                fill(4.6, 3.6, 14.8, 16.8, Color32::from_rgb(231, 230, 230));
             }
             Sheet => {
-                fill(4.8, 3.8, 14.4, 16.4, Color32::from_rgb(226, 239, 218));
+                fill(4.6, 3.6, 14.8, 16.8, Color32::from_rgb(226, 239, 218));
             }
             Filter => {
-                fill(6.0, 6.0, 12.0, 4.0, Color32::from_rgb(68, 114, 196));
+                fill(5.4, 5.4, 13.2, 4.4, BLUE);
             }
             SortAsc | SortDesc => {
-                fill(15.0, 5.0, 4.0, 12.0, Color32::from_rgb(68, 114, 196));
+                fill(14.6, 4.6, 4.8, 12.8, BLUE);
             }
             Share => {
-                p.circle_filled(at(17.0, 6.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
-                p.circle_filled(at(6.0, 12.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
-                p.circle_filled(at(17.0, 18.0), 2.2 * s, Color32::from_rgb(68, 114, 196));
+                p.circle_filled(at(17.0, 6.0), 2.4 * s, BLUE);
+                p.circle_filled(at(6.0, 12.0), 2.4 * s, BLUE);
+                p.circle_filled(at(17.0, 18.0), 2.4 * s, BLUE);
             }
-            Save => {
-                fill(4.8, 4.8, 14.4, 14.4, Color32::from_rgb(222, 235, 247));
+            Save | SaveAs => {
+                fill(4.6, 4.6, 14.8, 14.8, BLUE_L);
             }
             Open => {
-                fill(4.0, 8.0, 14.0, 9.0, Color32::from_rgb(255, 217, 102));
+                fill(3.8, 8.0, 14.4, 9.2, GOLD);
             }
             Print => {
-                fill(4.0, 10.0, 16.0, 6.0, Color32::from_rgb(222, 235, 247));
+                fill(3.8, 9.8, 16.4, 6.2, BLUE_L);
+            }
+            Sum => {
+                // Σ 用绿色，Excel 的自动求和图标是绿色
+                fill(6.0, 16.4, 12.0, 2.4, GREEN);
+            }
+            Cf => {
+                // 条件格式：三条长度递减的彩色数据条
+                fill(4.4, 5.0, 14.0, 2.6, BLUE);
+                fill(4.4, 10.4, 9.6, 2.6, ORANGE);
+                fill(4.4, 15.8, 6.0, 2.6, GREEN);
             }
             _ => {}
         }
     }
+    // 线条色：彩色图标用主题深色，其余跟随文字色；关掉的按钮一律灰
+    let line_col = if enabled {
+        stroke_of(icon).unwrap_or(color)
+    } else {
+        color
+    };
+    // 32px 的大图标线宽 1.8 会显得又黑又粗，按尺寸收到 1.5；16px 时保底 1px
+    let w = (1.5 * s).max(1.0);
     let pen = Pen {
         p,
         r: rect,
-        c: color,
-        w: 1.8 * rect.width() / 24.0,
+        c: line_col,
+        w,
     };
     draw_with_pen(pen, icon);
 }
@@ -522,6 +620,11 @@ fn draw_with_pen(pen: Pen<'_>, icon: Icon) {
             pen.circle(12.0, 12.0, 7.5);
             pen.arrow_head((17.0, 5.0), (1.0, -0.4), 5.0);
             pen.frect(15.0, 3.0, 4.0, 4.0);
+        }
+        Cf => {
+            pen.rect(3.0, 4.0, 18.0, 16.0);
+            pen.line((3.0, 8.5), (21.0, 8.5));
+            pen.line((3.0, 14.0), (21.0, 14.0));
         }
     }
 }

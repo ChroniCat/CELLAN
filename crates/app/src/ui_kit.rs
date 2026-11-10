@@ -12,10 +12,13 @@ use eframe::egui::{
 use crate::ui_icons::{self, Icon};
 use std::cell::Cell;
 
-/// Excel 绿色（选项卡下划线、工作表标签下划线、选中框）
-pub const ACCENT: Color32 = Color32::from_rgb(16, 124, 65);
+/// Excel 绿色（选项卡下划线、工作表标签下划线、选中框）。
+/// 本机 Excel 16.0 实测取色：#217346，选中行列头底线、页签下的线、单元格选中框都是它。
+pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
+/// 列头/行头与网格的分界线：Excel 实测 #ABABAB，比普通控件边框深
+pub const HEAD_LINE: Color32 = Color32::from_rgb(171, 171, 171);
 /// 功能区分组之间的竖线
 pub const SEP: Color32 = Color32::from_rgb(224, 224, 224);
 pub const TEXT: Color32 = Color32::from_rgb(29, 29, 29);
@@ -23,6 +26,10 @@ pub const TEXT_WEAK: Color32 = Color32::from_rgb(96, 96, 96);
 pub const HEADER_BG: Color32 = Color32::from_rgb(240, 240, 240);
 pub const HEADER_SEL: Color32 = Color32::from_rgb(225, 225, 225);
 pub const GRID_LINE: Color32 = Color32::from_rgb(217, 217, 217);
+/// 页签行底色（Excel 是 #F3F2F1，活动页签白底盖在上面）
+pub const TABBAR_BG: Color32 = Color32::from_rgb(243, 242, 241);
+/// 标题栏底色：Excel 实测 240,240,240
+pub const TITLE_BG: Color32 = Color32::from_rgb(240, 240, 240);
 pub const HOVER: Color32 = Color32::from_rgb(233, 233, 233);
 pub const PRESSED: Color32 = Color32::from_rgb(217, 217, 217);
 pub const STATUS_BG: Color32 = Color32::from_rgb(245, 245, 245);
@@ -37,10 +44,10 @@ pub const RIBBON_BODY_H: f32 = 102.0;
 pub const RIBBON_H: f32 = TAB_H + RIBBON_BODY_H;
 /// 编辑栏（名称框 + fx + 输入行）
 pub const FX_H: f32 = 44.0;
-/// 命令区高度：大按钮 76 + 上下留白
-pub const GROUP_BODY_H: f32 = 80.0;
-/// 分组名那一行
-pub const GROUP_LABEL_H: f32 = 18.0;
+/// 命令区高度：Excel 的大按钮就是 76 高，命令区从分组顶 +4 开始
+pub const GROUP_BODY_H: f32 = 76.0;
+/// 分组名那一行（文字贴底，和 Excel 一样离功能区底边 0~2px）
+pub const GROUP_LABEL_H: f32 = 14.0;
 
 thread_local! {
     static GROUP_FIRST: Cell<bool> = const { Cell::new(true) };
@@ -66,9 +73,9 @@ pub fn apply_theme(ctx: &egui::Context) {
     let mut base = (*ctx.style()).clone();
     base.text_styles = [
         (egui::TextStyle::Heading, FontId::proportional(15.0)),
-        (egui::TextStyle::Body, FontId::proportional(12.0)),
+        (egui::TextStyle::Body, FontId::proportional(12.5)),
         (egui::TextStyle::Button, FontId::proportional(12.0)),
-        (egui::TextStyle::Small, FontId::proportional(10.0)),
+        (egui::TextStyle::Small, FontId::proportional(11.0)),
         (egui::TextStyle::Monospace, FontId::monospace(12.0)),
     ]
     .into();
@@ -176,20 +183,20 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
                 ui.allocate_exact_size(Vec2::new(6.0, 0.0), Sense::hover());
             });
             let w = row.response.rect.width().max(24.0);
+            // Excel 的组名紧贴功能区底边：4(顶) + 76(命令) + 8(间隙) + 14(字) = 102
+            ui.add_space(8.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(w, GROUP_LABEL_H),
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
-                    ui.add_space(2.0);
                     let c = if ui.visuals().dark_mode {
                         ui.visuals().weak_text_color()
                     } else {
                         Color32::from_rgb(102, 102, 102)
                     };
-                    ui.label(RichText::new(title).size(9.5).color(c));
+                    ui.label(RichText::new(title).size(11.5).color(c));
                 },
             );
-            ui.add_space(4.0);
         })
         .response;
     // 布局自证：SC_UI_LOG=1 时打出每个分组框的几何
@@ -281,15 +288,15 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
     };
     let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 5.0 + icon_size / 2.0),
+        egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
     ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
     ui.painter().text(
-        egui::pos2(rect.center().x, rect.bottom() - 9.0),
+        egui::pos2(rect.center().x, rect.bottom() - 7.0),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(10.0),
+        FontId::proportional(11.5),
         col,
     );
     resp
@@ -386,6 +393,39 @@ pub fn labeled_w_on(
         label,
         font,
         col,
+    );
+    resp.on_hover_text(tip)
+}
+
+/// 固定宽度的图标+文字按钮，指定文字/图标颜色（Excel 的“共享”是绿色）
+pub fn labeled_tint(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    width: f32,
+    tint: Color32,
+    tip: &str,
+) -> Response {
+    let v = ui.visuals().clone();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER },
+        );
+    }
+    let ir = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
+        Vec2::splat(16.0),
+    );
+    ui_icons::draw(ui.painter(), ir, icon, tint);
+    ui.painter().text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.5),
+        tint,
     );
     resp.on_hover_text(tip)
 }
@@ -490,6 +530,10 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
     let size = Vec2::new(galley.size().x + 20.0, TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // Excel 的活动页签是白底：和下面的功能区连成一片，只有底部 2px 绿线
+    if active && !green {
+        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+    }
     if resp.hovered() && !active {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(4.0, 3.0)),
