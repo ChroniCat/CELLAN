@@ -4615,6 +4615,11 @@ impl SheetApp {
                     "¥#,##0.00" => "货币",
                     "0.0%" => "百分比",
                     "yyyy-mm-dd" => "日期",
+                    "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计",
+                    "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计（无符号）",
+                    "0.00E+00" => "科学计数",
+                    "# ?/?" => "分数",
+                    "@" => "文本",
                     other => other,
                 };
                 egui::ComboBox::from_id_salt("numfmt")
@@ -4626,8 +4631,14 @@ impl SheetApp {
                             ("常规", ""),
                             ("数值", "#,##0.00"),
                             ("货币", "¥#,##0.00"),
+                            ("会计", "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-"),
+                            ("会计（无符号）", "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-"),
                             ("百分比", "0.0%"),
+                            ("科学计数", "0.00E+00"),
+                            ("分数", "# ?/?"),
                             ("日期", "yyyy-mm-dd"),
+                            ("日期时间", "yyyy-mm-dd hh:mm"),
+                            ("文本", "@"),
                         ] {
                             if ui.selectable_label(cur.format == code, label).clicked() {
                                 let c = code.to_string();
@@ -5867,7 +5878,8 @@ impl SheetApp {
             if !txt.is_empty() {
                 let is_num = matches!(cell.value, Value::Number(_));
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
-                let mut base_color = ov.and_then(|o| o.color).unwrap_or(st.color);
+                let fmt_color = sheetcore::style::format_color(&cell.value, &st.format);
+                let mut base_color = ov.and_then(|o| o.color).or(fmt_color).unwrap_or(st.color);
                 if table_header && ov.is_none() {
                     base_color = [255, 255, 255];
                 }
@@ -7253,10 +7265,16 @@ impl SheetApp {
                                         ("0.00", "0.00"),
                                         ("#,##0", "#,##0"),
                                         ("#,##0.00", "#,##0.00"),
+                                        ("会计", "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-"),
+                                        ("会计（无符号）", "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-"),
                                         ("0%", "0%"),
                                         ("0.00%", "0.00%"),
+                                        ("0.00E+00", "0.00E+00"),
+                                        ("# ?/?", "# ?/?"),
                                         ("yyyy-mm-dd", "yyyy-mm-dd"),
                                         ("yyyy/mm/dd", "yyyy/mm/dd"),
+                                        ("yyyy-mm-dd hh:mm", "yyyy-mm-dd hh:mm"),
+                                        ("文本 @", "@"),
                                     ] {
                                         if ui
                                             .selectable_label(
