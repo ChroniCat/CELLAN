@@ -76,6 +76,7 @@ pub fn paint_chart(painter: &egui::Painter, rect: Rect, chart: &Chart) {
 
     match chart.kind {
         ChartKind::Pie | ChartKind::Doughnut => paint_pie(painter, plot, chart),
+        ChartKind::Combo => paint_combo(painter, plot, chart),
         ChartKind::Line => paint_line(painter, plot, chart),
         ChartKind::Area => paint_area(painter, plot, chart),
         _ => paint_bars(painter, plot, chart),
@@ -156,6 +157,65 @@ fn bounds(chart: &Chart) -> (f64, f64) {
     let lo = min.min(0.0);
     let hi = max.max(lo + 1.0);
     (lo, hi)
+}
+
+/// 组合图：前 N-1 个系列柱状（主轴），最后一个系列折线（次轴）
+fn paint_combo(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+    if chart.series.len() < 2 {
+        paint_bars(painter, plot, chart);
+        return;
+    }
+    let split = chart.series.len() - 1;
+    let mut bars = chart.clone();
+    bars.kind = ChartKind::Column;
+    bars.series = chart.series[..split].to_vec();
+    paint_bars(painter, plot, &bars);
+
+    let line = &chart.series[split];
+    let max = line
+        .vals
+        .iter()
+        .cloned()
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    let n = line.vals.len().max(1);
+    let slot = plot.width() / n as f32;
+    let color = PALETTE[split % PALETTE.len()];
+    let mut pts = Vec::new();
+    for (i, v) in line.vals.iter().enumerate() {
+        let t = (v / max).clamp(0.0, 1.0) as f32;
+        pts.push(Pos2::new(
+            plot.min.x + slot * (i as f32 + 0.5),
+            plot.max.y - plot.height() * t,
+        ));
+    }
+    for w in pts.windows(2) {
+        painter.line_segment([w[0], w[1]], Stroke::new(2.0, color));
+    }
+    for p in pts.iter() {
+        painter.circle_filled(*p, 2.5, color);
+    }
+    // 次轴（右侧）
+    let line_col = Color32::from_rgb(180, 180, 180);
+    let text = Color32::from_rgb(110, 110, 110);
+    painter.line_segment(
+        [
+            Pos2::new(plot.max.x, plot.min.y),
+            Pos2::new(plot.max.x, plot.max.y),
+        ],
+        Stroke::new(1.0, line_col),
+    );
+    for i in 0..=4 {
+        let t = i as f64 / 4.0;
+        let y = plot.max.y - (plot.height() as f64 * t) as f32;
+        painter.text(
+            Pos2::new(plot.max.x + 5.0, y),
+            Align2::LEFT_CENTER,
+            format_num(max * t),
+            FontId::proportional(9.0),
+            text,
+        );
+    }
 }
 
 fn paint_bars(painter: &egui::Painter, plot: Rect, chart: &Chart) {

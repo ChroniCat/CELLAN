@@ -887,7 +887,19 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         if !sheet.charts_dirty {
             continue;
         }
-        for ch in sheet.charts.iter() {
+        for (idx, ch) in sheet.charts.iter().enumerate() {
+            // 拖动/缩放后的锚点写回 drawing
+            if !ch.drawing.is_empty() {
+                let ord = sheet.charts[..idx]
+                    .iter()
+                    .filter(|c| c.drawing == ch.drawing)
+                    .count();
+                if let Err(e) =
+                    crate::chart_write::write_anchor(path, &ch.drawing, ord, ch.anchor)
+                {
+                    eprintln!("[save] 图表锚点回写失败: {e:#}");
+                }
+            }
             if ch.part.is_empty() || ch.ref_fixes.is_empty() {
                 continue;
             }

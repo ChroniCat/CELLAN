@@ -20,6 +20,8 @@ pub enum ChartKind {
     Pie,
     Doughnut,
     Scatter,
+    /// 组合图：前面的系列柱状（主轴），最后一个系列折线（次轴）
+    Combo,
 }
 
 impl ChartKind {
@@ -33,6 +35,7 @@ impl ChartKind {
             ChartKind::Pie => "饼图",
             ChartKind::Doughnut => "圆环图",
             ChartKind::Scatter => "散点图",
+            ChartKind::Combo => "组合图",
         }
     }
 }
@@ -451,6 +454,8 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut in_val = false;
     let mut in_title = false;
     let mut in_f = false;
+    let mut saw_bar = false;
+    let mut saw_line = false;
 
     loop {
         match r.read_event() {
@@ -459,12 +464,14 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                 let name = local(nm.as_ref()).to_string();
                 match name.as_str() {
                     "barChart" => {
+                        saw_bar = true;
                         kind.get_or_insert(ChartKind::Column);
                     }
                     "bar3DChart" => {
                         kind.get_or_insert(ChartKind::Column);
                     }
                     "lineChart" => {
+                        saw_line = true;
                         kind.get_or_insert(ChartKind::Line);
                     }
                     "line3DChart" => {
@@ -607,6 +614,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
             k = ChartKind::BarStacked;
         }
     }
+    let k = if saw_bar && saw_line { ChartKind::Combo } else { k };
     let mut chart = Chart {
         kind: k,
         title,

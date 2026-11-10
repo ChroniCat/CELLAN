@@ -74,8 +74,13 @@ const PALETTE: [&str; 8] = [
 ];
 
 fn series_body(ch: &crate::charts::Chart) -> String {
+    series_body_at(ch, 0)
+}
+
+fn series_body_at(ch: &crate::charts::Chart, offset: usize) -> String {
     let mut out = String::new();
-    for (i, s) in ch.series.iter().enumerate() {
+    for (i0, s) in ch.series.iter().enumerate() {
+        let i = i0 + offset;
         let color: String = match s.color {
             Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
             None => PALETTE[i % PALETTE.len()].to_string(),
@@ -264,6 +269,27 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
                 out.push_str("<c:firstSliceAng val=\"0\"/><c:holeSize val=\"50\"/>");
             }
             out.push_str(&format!("</c:{tag}>"));
+        }
+        Combo => {
+            let split = ch.series.len().saturating_sub(1).max(1);
+            let mut bars = ch.clone();
+            bars.kind = Column;
+            bars.series = ch.series[..split.min(ch.series.len())].to_vec();
+            let mut line = ch.clone();
+            line.kind = Line;
+            line.series = ch.series[split.min(ch.series.len())..].to_vec();
+            out.push_str("<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>");
+            out.push_str(&series_body_at(&bars, 0));
+            out.push_str("<c:gapWidth val=\"150\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>");
+            out.push_str("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
+            out.push_str(&series_body_at(&line, split));
+            out.push_str("<c:marker val=\"1\"/><c:axId val=\"3\"/><c:axId val=\"4\"/></c:lineChart>");
+            // 主轴
+            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
+            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
+            // 次轴：右侧数值轴 + 隐藏的次分类轴
+            out.push_str("<c:valAx><c:axId val=\"4\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"r\"/><c:crossAx val=\"3\"/><c:crosses val=\"max\"/></c:valAx>");
+            out.push_str("<c:catAx><c:axId val=\"3\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"1\"/><c:axPos val=\"b\"/><c:crossAx val=\"4\"/></c:catAx>");
         }
         Scatter => {
             out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
@@ -622,4 +648,130 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
         buf
     })?;
     Ok(())
+}
+
+/// 把 drawing 里第 ordinal 个图表锚点改成单元格锚点（twoCellAnchor，单元格偏移 0）。
+/// 图表拖动/缩放后保存时调用；不依赖列宽行高，Excel 自己换算。
+pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32)) -> String {
+    let (r1, c1, r2, c2) = anchor;
+    let (r2, c2) = (r2.max(r1 + 1), c2.max(c1 + 1));
+    // 有些文件用 xdr: 前缀，umya 重写后是默认命名空间（无前缀），两种都要认
+    let pre = if xml.contains("xmlns:xdr=") { "xdr:" } else { "" };
+    let opens = [format!("<{pre}oneCellAnchor"), format!("<{pre}twoCellAnchor")];
+    let closes = [
+        format!("</{pre}oneCellAnchor>"),
+        format!("</{pre}twoCellAnchor>"),
+    ];
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while from < xml.len() {
+        let next = opens
+            .iter()
+            .filter_map(|t| xml[from..].find(t).map(|p| (from + p, t.clone())))
+            .min_by_key(|(p, _)| *p);
+        let Some((i, open)) = next else { break };
+        let close = if open.ends_with("oneCellAnchor") {
+            &closes[0]
+        } else {
+            &closes[1]
+        };
+        let Some(rel) = xml[i..].find(close.as_str()) else {
+            break;
+        };
+        let end = i + rel + close.len();
+        let span = &xml[i..end];
+        if span.contains("chart r:id") || span.contains(":chart") {
+            spans.push((i, end));
+        }
+        from = end;
+    }
+    let Some(&(s0, s1)) = spans.get(ordinal) else {
+        return xml.to_string();
+    };
+    let old = &xml[s0..s1];
+    let rid = old
+        .find("chart r:id=\"")
+        .and_then(|i| {
+            let rest = &old[i + "chart r:id=\"".len()..];
+            rest.find('"').map(|e| rest[..e].to_string())
+        })
+        .unwrap_or_else(|| "rId1".into());
+    let name = old
+        .find("name=\"")
+        .and_then(|i| {
+            let rest = &old[i + 6..];
+            rest.find('"').map(|e| rest[..e].to_string())
+        })
+        .unwrap_or_else(|| "图表 1".into());
+    let id = old
+        .find("cNvPr id=\"")
+        .and_then(|i| {
+            let rest = &old[i + "cNvPr id=\"".len()..];
+            rest.find('"').map(|e| rest[..e].to_string())
+        })
+        .unwrap_or_else(|| "2".into());
+    let p = pre;
+    let new = format!(
+        "<{p}twoCellAnchor editAs=\"oneCell\"><{p}from><{p}col>{c1}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r1}</{p}row><{p}rowOff>0</{p}rowOff></{p}from><{p}to><{p}col>{c2}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r2}</{p}row><{p}rowOff>0</{p}rowOff></{p}to><{p}graphicFrame macro=\"\"><{p}nvGraphicFramePr><{p}cNvPr id=\"{id}\" name=\"{name}\"/><{p}cNvGraphicFramePr/></{p}nvGraphicFramePr><{p}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{p}xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></{p}graphicFrame><{p}clientData/></{p}twoCellAnchor>"
+    );
+    let mut out = String::with_capacity(xml.len() + new.len());
+    out.push_str(&xml[..s0]);
+    out.push_str(&new);
+    out.push_str(&xml[s1..]);
+    out
+}
+
+/// 把某张表第 ordinal 个图表的锚点写回 drawing 部件
+pub fn write_anchor(
+    path: &Path,
+    drawing_part: &str,
+    ordinal: usize,
+    anchor: (u32, u32, u32, u32),
+) -> Result<()> {
+    let mut xml = String::new();
+    {
+        let file = std::fs::File::open(path)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        let mut f = zip.by_name(drawing_part)?;
+        f.read_to_string(&mut xml)?;
+    }
+    let edited = rewrite_anchor_xml(&xml, ordinal, anchor);
+    if edited != xml {
+        crate::patch::rewrite_zip(path, |name, buf| {
+            if name == drawing_part {
+                return edited.clone().into_bytes();
+            }
+            buf
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_chart_anchor_and_keeps_rid() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:oneCellAnchor><xdr:from><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="1" cy="1"/><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="图表 1"/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId7"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#;
+        let out = rewrite_anchor_xml(xml, 0, (2, 3, 10, 7));
+        assert!(out.contains("<xdr:twoCellAnchor"));
+        assert!(out.contains("<xdr:col>3</xdr:col>"), "{out}");
+        assert!(out.contains("<xdr:col>7</xdr:col>"));
+        assert!(out.contains("<xdr:row>2</xdr:row>"));
+        assert!(out.contains("<xdr:row>10</xdr:row>"));
+        assert!(out.contains("r:id=\"rId7\""));
+        assert!(out.contains("name=\"图表 1\""));
+        assert!(!out.contains("<xdr:oneCellAnchor"));
+    }
+
+    #[test]
+    fn leaves_other_anchors_alone() {
+        let one = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:oneCellAnchor><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame></xdr:oneCellAnchor><xdr:oneCellAnchor><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></xdr:graphicFrame></xdr:oneCellAnchor></xdr:wsDr>"#;
+        let out = rewrite_anchor_xml(one, 1, (0, 0, 5, 5));
+        assert_eq!(out.matches("<xdr:oneCellAnchor").count(), 1);
+        assert_eq!(out.matches("<xdr:twoCellAnchor").count(), 1);
+        assert!(out.contains("rId1"));
+        assert!(out.contains("rId2"));
+    }
 }

@@ -524,3 +524,41 @@ fn page_layout_modes_render_and_keep_the_selection() {
     app.view_mode = 0;
     run_grid_frame(&mut app, &ctx, vec![]);
 }
+
+#[test]
+fn dragging_a_chart_moves_its_anchor_and_marks_dirty() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let ch = sheetcore::charts::Chart {
+        kind: sheetcore::charts::ChartKind::Column,
+        title: "拖动测试".into(),
+        series: Vec::new(),
+        legend: false,
+        anchor: (1, 2, 8, 6),
+        legend_pos: String::new(),
+        part: String::new(),
+        drawing: String::new(),
+        show_labels: false,
+        ref_fixes: Vec::new(),
+        axis_x: String::new(),
+        axis_y: String::new(),
+        y_min: None,
+        y_max: None,
+    };
+    app.wb.sheet_mut(0).charts.push(ch);
+    let start = egui::pos2(HEAD_W + 2.0 * 72.0 + 40.0, HEAD_H + 19.0 + 30.0);
+    let end = egui::pos2(start.x + 120.0, start.y + 60.0);
+    let button = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+    run_grid_frame(&mut app, &ctx, vec![button(start, true)]);
+    run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+    run_grid_frame(&mut app, &ctx, vec![button(end, false)]);
+    let after = app.wb.sheet(0).charts[0].anchor;
+    assert_ne!(after, (1, 2, 8, 6), "拖动后锚点应变化");
+    assert!(app.wb.sheet(0).charts_dirty, "拖动后应标脏以便保存");
+}

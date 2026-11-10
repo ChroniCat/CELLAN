@@ -137,6 +137,36 @@ fn strip_hf(s: &str) -> String {
     out.trim().to_string()
 }
 
+fn chart_handle_at(r: egui::Rect, p: egui::Pos2) -> Option<u8> {
+    let pts = [
+        (r.left_top(), 1u8),
+        (egui::pos2(r.center().x, r.top()), 2),
+        (r.right_top(), 3),
+        (egui::pos2(r.right(), r.center().y), 4),
+        (r.right_bottom(), 5),
+        (egui::pos2(r.center().x, r.bottom()), 6),
+        (r.left_bottom(), 7),
+        (egui::pos2(r.left(), r.center().y), 8),
+    ];
+    for (pt, m) in pts {
+        if (p - pt).length() <= 7.0 {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// 图表拖动/缩放的状态
+#[derive(Clone, Copy)]
+struct ChartDrag {
+    idx: usize,
+    /// 0=移动，1..8=八个手柄（顺时针，从左上开始）
+    mode: u8,
+    start: egui::Pos2,
+    rect: (f32, f32, f32, f32),
+    anchor: (u32, u32, u32, u32),
+}
+
 /// 页面布局视图的几何：页纸尺寸、页间距、内容原点
 #[derive(Clone)]
 struct PageGeo {
@@ -289,6 +319,8 @@ struct SheetApp {
     head_menu: Option<(u8, u32, egui::Pos2)>,
     /// 选中的图表（图表工具上下文页签）
     chart_sel: Option<usize>,
+    /// 正在拖动/缩放的图表
+    chart_drag: Option<ChartDrag>,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -524,6 +556,7 @@ impl SheetApp {
             name_dropdown: false,
             head_menu: None,
             chart_sel: None,
+            chart_drag: None,
             view_mode: std::env::var("SC_VIEW_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -7619,6 +7652,7 @@ impl SheetApp {
                                 sheetcore::charts::ChartKind::Pie,
                                 sheetcore::charts::ChartKind::Doughnut,
                                 sheetcore::charts::ChartKind::Scatter,
+                                sheetcore::charts::ChartKind::Combo,
                             ] {
                                 if ui.selectable_label(ch.kind == k, k.label()).clicked() {
                                     ch.kind = k;
@@ -7794,6 +7828,7 @@ impl SheetApp {
                                     sheetcore::charts::ChartKind::Pie,
                                     sheetcore::charts::ChartKind::Doughnut,
                                     sheetcore::charts::ChartKind::Scatter,
+                                    sheetcore::charts::ChartKind::Combo,
                                 ] {
                                     if ui.selectable_label(ch.kind == k, k.label()).clicked() {
                                         retype = Some((i, k));
@@ -8958,6 +8993,13 @@ impl SheetApp {
 
         // 图表（浮在单元格之上）
         let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+        let chart_rect_of = |ch: &sheetcore::charts::Chart| {
+            let (r1, c1, r2, c2) = ch.anchor;
+            Rect::from_min_max(
+                egui::pos2(px_of(c1), py_of(r1)),
+                egui::pos2(px_of(c2), py_of(r2)),
+            )
+        };
         for (ci, ch) in charts.iter().enumerate() {
             let (r1, c1, r2, c2) = ch.anchor;
             let top_left = egui::pos2(px_of(c1), py_of(r1));
@@ -9006,6 +9048,102 @@ impl SheetApp {
                         );
                     }
                 }
+            }
+        }
+
+        // 图表拖动 / 缩放（手柄优先，其次拖图表本体）
+        if !readonly {
+            if resp.drag_started() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let mut started: Option<ChartDrag> = None;
+                    if let Some(i) = self.chart_sel {
+                        if let Some(ch) = charts.get(i) {
+                            let r = chart_rect_of(ch);
+                            if let Some(mode) = chart_handle_at(r, pos) {
+                                started = Some(ChartDrag {
+                                    idx: i,
+                                    mode,
+                                    start: pos,
+                                    rect: (r.left(), r.top(), r.right(), r.bottom()),
+                                    anchor: ch.anchor,
+                                });
+                            }
+                        }
+                    }
+                    if started.is_none() {
+                        for (i, ch) in charts.iter().enumerate() {
+                            let r = chart_rect_of(ch);
+                            if r.contains(pos) {
+                                self.chart_sel = Some(i);
+                                started = Some(ChartDrag {
+                                    idx: i,
+                                    mode: 0,
+                                    start: pos,
+                                    rect: (r.left(), r.top(), r.right(), r.bottom()),
+                                    anchor: ch.anchor,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    self.chart_drag = started;
+                }
+            }
+            if resp.dragged() {
+                if let (Some(d), Some(pos)) = (self.chart_drag, resp.interact_pointer_pos()) {
+                    let dx = pos.x - d.start.x;
+                    let dy = pos.y - d.start.y;
+                    let (mut x0, mut y0, mut x1, mut y1) = d.rect;
+                    match d.mode {
+                        0 => {
+                            x0 += dx;
+                            x1 += dx;
+                            y0 += dy;
+                            y1 += dy;
+                        }
+                        1 => {
+                            x0 += dx;
+                            y0 += dy;
+                        }
+                        2 => y0 += dy,
+                        3 => {
+                            x1 += dx;
+                            y0 += dy;
+                        }
+                        4 => x1 += dx,
+                        5 => {
+                            x1 += dx;
+                            y1 += dy;
+                        }
+                        6 => y1 += dy,
+                        7 => {
+                            x0 += dx;
+                            y1 += dy;
+                        }
+                        _ => x0 += dx,
+                    }
+                    if x1 - x0 >= 48.0 && y1 - y0 >= 36.0 {
+                        let c1 = col_at(x0 + 1.0);
+                        let r1 = row_at(y0 + 1.0);
+                        let c2 = col_at(x1 - 1.0).max(c1 + 1);
+                        let r2 = row_at(y1 - 1.0).max(r1 + 1);
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        if let Some(ch) = sh.charts.get_mut(d.idx) {
+                            ch.anchor = (r1, c1, r2, c2);
+                        }
+                        self.status = format!(
+                            "图表{} {}",
+                            if d.mode == 0 { "移动" } else { "调整大小" },
+                            cell_name(r1, c1)
+                        );
+                    }
+                }
+            }
+            if resp.drag_stopped() && self.chart_drag.take().is_some() {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.charts_dirty = true;
+                self.wb.dirty = true;
+                self.status = "图表位置已更新（保存后写回 Excel）".into();
             }
         }
 
@@ -9265,7 +9403,12 @@ impl SheetApp {
         }
 
         // 拖拽框选（正在拖列宽/行高时不要改选区）
-        if !readonly && resp.dragged() && self.col_drag.is_none() && self.row_drag.is_none() {
+        if !readonly
+            && resp.dragged()
+            && self.col_drag.is_none()
+            && self.row_drag.is_none()
+            && self.chart_drag.is_none()
+        {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let dx = pos.x - (origin.x + head_w);
                 let dy = pos.y - (origin.y + hh);
