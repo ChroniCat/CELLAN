@@ -241,7 +241,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
     // 稀疏表旁路：声明区域大到离谱的表（有人在 A1048576/XFD1048576 留了格子），
     // calamine 会按稠密网格分配内存，直接 OOM
     let targets = crate::patch::sheet_targets(path).unwrap_or_default();
+    let t_shared = std::time::Instant::now();
     let shared = crate::sparse::shared_strings(path);
+    if std::env::var("SC_LOAD_PROF").is_ok() {
+        eprintln!("[load] 共享字符串 {} 条 {:.2}s", shared.len(), t_shared.elapsed().as_secs_f64());
+    }
 
     let prof_load = std::env::var("SC_LOAD_PROF").is_ok();
     let t_all_load = std::time::Instant::now();
@@ -354,13 +358,16 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 if raw.sparse { "（稀疏）" } else { "" }
             );
         }
-        let _ = t_sheet;
+        if prof_load {
+            eprintln!("[load]   {} 物化 {:.2}s", sheet.name, t_sheet.elapsed().as_secs_f64());
+        }
         wb.sheets.push(sheet);
     }
     if prof_load {
         eprintln!("[load] 物化合计 {:.2}s（并行解析已完成）", t_all.elapsed().as_secs_f64());
     }
 
+    let t_side = std::time::Instant::now();
     let (found, layouts_raw, pics, tables) = side_rx.recv().unwrap_or_else(|_| {
         (
             Default::default(),
@@ -370,6 +377,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
         )
     });
     let layouts = layouts_raw.unwrap_or_default();
+    if prof_load {
+        eprintln!("[load] 旁路扫描等待 {:.2}s", t_side.elapsed().as_secs_f64());
+    }
 
     if wb.sheets.is_empty() {
         wb.sheets.push(Sheet::new("Sheet1"));
@@ -607,6 +617,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
             definitions: pivot_definitions(path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
         });
+        if std::env::var("SC_LOAD_PROF").is_ok() {
+            eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
+        }
     }
     Ok(wb)
 }

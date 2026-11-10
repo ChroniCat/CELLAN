@@ -414,6 +414,7 @@ struct SheetApp {
     /// 自截图：SC_SHOT=<png>，抓自己的 framebuffer（RDP 断着也能出图）
     shot_path: Option<PathBuf>,
     shot_frames: u32,
+    shot_sent: bool,
     /// 标签拖拽排序
     tab_drag: Option<usize>,
     /// 名称框
@@ -482,6 +483,8 @@ struct SheetApp {
     joined_doc: bool,
     /// 依赖图：编辑后只重算受影响的公式
     deps: sheetcore::formula::deps::Deps,
+    /// 大文件依赖图还在后台准备，先别让用户编辑
+    deps_pending: bool,
     /// Background channels move with their owning document when switching tabs.
     tasks: DocumentTasks,
     /// 文档代次：后台算完时如果有编辑，就丢弃结果
@@ -513,9 +516,13 @@ enum TabSlot {
 
 enum OpenMsg {
     /// 文件已读入（带的是上次保存的计算结果，先显示）
-    Loaded(Box<Workbook>),
+    Loaded(Box<Workbook>, bool),
     /// 全量重算完成
     Recalced(Box<Workbook>, Box<sheetcore::formula::deps::Deps>),
+    /// 大文件只把依赖图备好，不阻塞打开（缓存值先显示）
+    DepsReady(Box<sheetcore::formula::deps::Deps>),
+    /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch）
+    RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64),
     Failed(String),
 }
 
@@ -667,6 +674,7 @@ impl SheetApp {
             tree_open: false,
             shot_path: std::env::var("SC_SHOT").ok().map(PathBuf::from),
             shot_frames: 0,
+            shot_sent: false,
             tab_drag: None,
             name_buf: String::new(),
             name_edit: false,
@@ -720,6 +728,7 @@ impl SheetApp {
             last_cursor: None,
             joined_doc: false,
             deps: sheetcore::formula::deps::Deps::empty(),
+            deps_pending: false,
             tasks: DocumentTasks::default(),
             doc_gen: 0,
         };
@@ -763,13 +772,68 @@ impl SheetApp {
         self.tasks.busy = true;
         self.status = format!("正在打开 {}…", path.display());
         std::thread::spawn(move || {
+            let prof = std::env::var("SC_LOAD_PROF").is_ok();
+            let t0 = std::time::Instant::now();
             match sheetcore::xlsx::load(&path) {
                 Ok(wb) => {
-                    // 先把读到的内容发回去，界面立刻能画（值是文件里缓存的结果）
-                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone())));
+                    if prof {
+                        eprintln!("[open] load {:.2}s", t0.elapsed().as_secs_f64());
+                    }
+                    let cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
+                    let formulas: usize = wb
+                        .sheets
+                        .iter()
+                        .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count())
+                        .sum();
+                    let big_cells = std::env::var("SC_BIG_CELLS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(400_000usize);
+                    let big_formulas = std::env::var("SC_BIG_FORMULAS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30_000usize);
+                    let big = std::env::var("SC_FORCE_RECALC").is_err()
+                        && (cells > big_cells || formulas > big_formulas);
+                    if big {
+                        // 大文件：缓存值是 Excel 上次算好的，先不重算。
+                        // 依赖图只需要公式文本，用轻量骨架算，避免整份 clone 把内存翻倍。
+                        let t = std::time::Instant::now();
+                        let skeleton = formula_skeleton(&wb);
+                        if prof {
+                            eprintln!(
+                                "[open] 骨架 {:.2}s（{} 个公式）",
+                                t.elapsed().as_secs_f64(),
+                                skeleton.sheets.iter().map(|s| s.len()).sum::<usize>()
+                            );
+                        }
+                        let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true));
+                        let t = std::time::Instant::now();
+                        let deps = sheetcore::formula::deps::Deps::build(&skeleton);
+                        drop(skeleton);
+                        if prof {
+                            eprintln!("[open] deps {:.2}s（大文件，跳过重算）", t.elapsed().as_secs_f64());
+                        }
+                        let _ = tx.send(OpenMsg::DepsReady(Box::new(deps)));
+                        return;
+                    }
+                    // 小文件：克隆一份给界面先画，原份留在后台重算
+                    let t = std::time::Instant::now();
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false));
+                    if prof {
+                        eprintln!("[open] clone+send {:.2}s", t.elapsed().as_secs_f64());
+                    }
                     let mut wb2 = wb;
+                    let t = std::time::Instant::now();
                     sheetcore::formula::recalc_all(&mut wb2);
+                    if prof {
+                        eprintln!("[open] recalc {:.2}s", t.elapsed().as_secs_f64());
+                    }
+                    let t = std::time::Instant::now();
                     let deps = sheetcore::formula::deps::Deps::build(&wb2);
+                    if prof {
+                        eprintln!("[open] deps {:.2}s", t.elapsed().as_secs_f64());
+                    }
                     let _ = tx.send(OpenMsg::Recalced(Box::new(wb2), Box::new(deps)));
                 }
                 Err(e) => {
@@ -789,7 +853,7 @@ impl SheetApp {
         std::thread::spawn(move || {
             match sheetcore::xlsx::load_with_password(&path, &pw) {
                 Ok(wb) => {
-                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone())));
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false));
                     let mut wb2 = wb;
                     sheetcore::formula::recalc_all(&mut wb2);
                     let deps = sheetcore::formula::deps::Deps::build(&wb2);
@@ -799,6 +863,26 @@ impl SheetApp {
                     let _ = tx.send(OpenMsg::Failed(format!("打开失败: {e:#}")));
                 }
             }
+        });
+    }
+
+    /// 手动全量重算：复制一份到后台算，界面不冻结
+    fn recalc_all_async(&mut self) {
+        if self.tasks.open_rx.is_some() || self.tasks.busy {
+            self.status = "正在加载或重算，稍后再试".into();
+            return;
+        }
+        let wb = self.wb.clone();
+        let epoch = self.wb_epoch;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tasks.open_rx = Some(rx);
+        self.tasks.busy = true;
+        self.status = "正在后台重算全部公式…".into();
+        std::thread::spawn(move || {
+            let mut wb = wb;
+            sheetcore::formula::recalc_all(&mut wb);
+            let deps = sheetcore::formula::deps::Deps::build(&wb);
+            let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch));
         });
     }
 
@@ -949,7 +1033,8 @@ impl SheetApp {
         let mut finished = false;
         for msg in msgs {
             match msg {
-                OpenMsg::Loaded(wb) => {
+                OpenMsg::Loaded(wb, big) => {
+                    self.deps_pending = big;
                     self.wb = *wb;
                     self.wb_epoch += 1;
                     self.deps = sheetcore::formula::deps::Deps::empty();
@@ -1046,7 +1131,33 @@ impl SheetApp {
                         self.try_auto_join();
                     }
                 }
+                OpenMsg::RecalcedWb(wb, deps, epoch) => {
+                    self.tasks.busy = false;
+                    if epoch == self.wb_epoch {
+                        self.wb = *wb;
+                        self.wb_epoch += 1;
+                        self.deps = *deps;
+                        self.cf_stats_gen = u64::MAX;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.status = "重算全部完成".into();
+                        eprintln!("[open] 手动重算完成");
+                    } else {
+                        self.status = "重算结果已过期（期间有编辑），已丢弃".into();
+                    }
+                    finished = true;
+                    continue;
+                }
+                OpenMsg::DepsReady(deps) => {
+                    self.deps = *deps;
+                    self.deps_pending = false;
+                    self.tasks.busy = false;
+                    self.status = "已打开大文件（显示文件里的缓存值；公式→重算全部 可强制重算）".into();
+                    eprintln!("[open] 大文件：已准备依赖图，跳过全量重算");
+                    finished = true;
+                    continue;
+                }
                 OpenMsg::Recalced(wb, deps) => {
+                    self.deps_pending = false;
                     self.wb_epoch += 1;
                     // 整份替换后条件格式统计必须重算，否则色阶/图标/数据条全空
                     self.cf_stats_gen = u64::MAX;
@@ -1690,6 +1801,10 @@ impl SheetApp {
     /// 开始编辑：没联网直接开；联网先申请租约，批准后才开
     /// 工作表受保护时阻止一切改内容的操作
     fn edit_blocked(&mut self) -> bool {
+        if self.deps_pending {
+            self.status = "大文件还在后台准备依赖图，稍等一下再编辑".into();
+            return true;
+        }
         if self.wb.sheet(self.sheet_idx).protection.is_some() {
             self.status = "工作表受保护：请先“审阅 → 撤销保护”".into();
             true
@@ -4005,6 +4120,11 @@ impl SheetApp {
         // Ctrl+F1：和 Excel 一样收起/展开功能区
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
             self.ribbon_collapsed = !self.ribbon_collapsed;
+        }
+        // F9：Excel 同款“重算全部”，大文件走后台
+        if self.editing.is_none() && ctx.input(|i| i.key_pressed(Key::F9)) {
+            self.recalc_all_async();
+            return;
         }
 
         if self.editing.is_none()
@@ -6514,8 +6634,7 @@ impl SheetApp {
         });
         ui_kit::group(ui, "计算", |ui| {
             if ui_kit::big(ui, Icon::Calc, "重算全部").clicked() {
-                sheetcore::formula::recalc_all(&mut self.wb);
-                self.status = "已重算".to_string();
+                self.recalc_all_async();
             }
         });
         ui_kit::group(ui, "名称", |ui| {
@@ -14126,7 +14245,14 @@ impl eframe::App for SheetApp {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(8);
-            if self.shot_frames == at {
+            let delay_ms = std::env::var("SC_SHOT_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if self.shot_frames >= at
+                && !self.shot_sent
+                && self.t0.elapsed().as_millis() as u64 >= delay_ms
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             let shot = ctx.input(|i| {
@@ -14298,6 +14424,32 @@ fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
 }
 
 /// 绝对路径，并且去掉 Windows 的 `\?\` 前缀（`canonicalize` 会加，加了就和盘符根对不上）
+/// 大文件打开时只保留公式文本的轻量工作簿：依赖图只需要它，省掉整份 clone
+fn formula_skeleton(wb: &Workbook) -> Workbook {
+    let mut sk = Workbook::new_blank();
+    sk.sheets.clear();
+    for sh in &wb.sheets {
+        let mut s = sheetcore::model::Sheet::new(sh.name.clone());
+        for (cref, cell) in sh.iter() {
+            if let Some(f) = &cell.formula {
+                s.set(
+                    cref.row,
+                    cref.col,
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Empty,
+                        formula: Some(f.clone()),
+                    },
+                );
+            }
+        }
+        s.arrays = sh.arrays.clone();
+        sk.sheets.push(s);
+    }
+    sk.names = wb.names.clone();
+    sk.links = wb.links.clone();
+    sk
+}
+
 fn plain_path(p: &std::path::Path) -> std::path::PathBuf {
     let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let s = c.to_string_lossy();

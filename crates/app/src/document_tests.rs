@@ -97,7 +97,7 @@ fn loading_and_recalculation_follow_the_tab_that_started_them() {
     app.tasks.busy = true;
     app.open_in_new_tab(PathBuf::new());
     put(&mut app.wb, 99.0);
-    tx.send(OpenMsg::Loaded(Box::new(book(10.0)))).unwrap();
+    tx.send(OpenMsg::Loaded(Box::new(book(10.0)), false)).unwrap();
     tx.send(OpenMsg::Recalced(
         Box::new(book(20.0)), Box::new(sheetcore::formula::deps::Deps::empty()),
     )).unwrap();
