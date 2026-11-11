@@ -125,6 +125,9 @@ pub struct CellStyle {
     /// 0 常规 1 上 2 中 3 下
     pub valign: u8,
     pub wrap: bool,
+    /// 缩进级数（Excel 的 IndentLevel，1 级约 3 个字符宽）
+    #[serde(default)]
+    pub indent: u8,
     /// 数字格式代码，空串表示常规
     pub format: String,
     /// 左、右、上、下
@@ -169,6 +172,7 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.halign.hash(&mut h);
     s.valign.hash(&mut h);
     s.wrap.hash(&mut h);
+    s.indent.hash(&mut h);
     s.format.hash(&mut h);
     s.border.hash(&mut h);
     h.finish()

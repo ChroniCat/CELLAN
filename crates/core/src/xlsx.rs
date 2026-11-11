@@ -898,6 +898,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 3 => umya_spreadsheet::VerticalAlignmentValues::Bottom,
                 _ => umya_spreadsheet::VerticalAlignmentValues::Bottom,
             });
+            if st.indent > 0 {
+                a.set_indent(st.indent as u32);
+            }
             if !st.format.is_empty() {
                 let mut nf = umya_spreadsheet::NumberingFormat::default();
                 nf.set_format_code(st.format.clone());
@@ -1820,6 +1823,7 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
             _ => 0,
         };
         out.wrap = a.wrap_text;
+        out.indent = a.indent.unwrap_or(0).min(15);
     }
     if let Some(bs) = &st.borders {
         let map = |b: &calamine::Border| crate::style::Border {

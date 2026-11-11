@@ -102,6 +102,7 @@ struct FmtState {
     halign: u8,
     valign: u8,
     wrap: bool,
+    indent: u8,
     format: String,
     border: [bool; 4],
 }
@@ -3889,6 +3890,7 @@ impl SheetApp {
             halign: st.halign,
             valign: st.valign,
             wrap: st.wrap,
+            indent: st.indent,
             format: st.format,
             border: [
                 st.border[0].style != 0,
@@ -6086,6 +6088,8 @@ impl SheetApp {
         if ui_kit::group_l(ui, "字体", "font", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
+                    // Excel 的字体/字号框是 21px 高（UIA 实测），比 buttons 矮一档
+                    ui.spacing_mut().interact_size.y = 21.0;
                     egui::ComboBox::from_id_salt("font_pick")
                         .selected_text(if cur.font.is_empty() {
                             "默认".to_string()
@@ -6291,6 +6295,7 @@ impl SheetApp {
                     "@" => "文本",
                     other => other,
                 };
+                ui.spacing_mut().interact_size.y = 21.0;
                 egui::ComboBox::from_id_salt("numfmt")
                     .selected_text(fmt_label.to_string())
                     .width(96.0)
@@ -7732,7 +7737,8 @@ impl SheetApp {
                 let tx = match align {
                     Align2::CENTER_CENTER => rect.center().x + icon_shift / 2.0,
                     Align2::RIGHT_CENTER => rect.max.x - 4.0,
-                    _ => rect.min.x + 4.0 + icon_shift,
+                    // Excel 的缩进 1 级约 3 个字符宽，按字号折算成像素
+                    _ => rect.min.x + 4.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                 };
                 let ty = if st.valign == 1 {
                     rect.min.y + 4.0
@@ -7798,7 +7804,8 @@ impl SheetApp {
                     let mut x = match align {
                         Align2::CENTER_CENTER => rect.center().x - total / 2.0,
                         Align2::RIGHT_CENTER => rect.max.x - 4.0 - total,
-                        _ => rect.min.x + 4.0 + icon_shift,
+                        // Excel 的缩进 1 级约 3 个字符宽，按字号折算成像素
+                    _ => rect.min.x + 4.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                     };
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
                     for (i_run, (g, (_, c))) in galleys.into_iter().zip(fonts.iter()).enumerate() {
@@ -7832,7 +7839,7 @@ impl SheetApp {
                     let x = match align {
                         Align2::CENTER_CENTER => rect.center().x - galley.size().x / 2.0,
                         Align2::RIGHT_CENTER => rect.max.x - 4.0 - galley.size().x,
-                        _ => rect.min.x + 4.0,
+                        _ => rect.min.x + 4.0 + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                     };
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
                     let uw = galley.size().x;
@@ -9288,10 +9295,18 @@ impl SheetApp {
                         ui.end_row();
 
                         dlg_cell_label(ui, "文本");
-                        let mut wrap = self.fmt_state.wrap;
-                        if ui.checkbox(&mut wrap, "自动换行").changed() {
-                            self.fmt_state.wrap = wrap;
-                        }
+                        ui.horizontal(|ui| {
+                            let mut wrap = self.fmt_state.wrap;
+                            if ui.checkbox(&mut wrap, "自动换行").changed() {
+                                self.fmt_state.wrap = wrap;
+                            }
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("缩进").size(11.5).weak());
+                            let mut ind = self.fmt_state.indent as i32;
+                            if ui.add(egui::DragValue::new(&mut ind).range(0..=15)).changed() {
+                                self.fmt_state.indent = ind.clamp(0, 15) as u8;
+                            }
+                        });
                         ui.end_row();
                     });
 
@@ -9438,6 +9453,7 @@ impl SheetApp {
                 s.halign = st.halign;
                 s.valign = st.valign;
                 s.wrap = st.wrap;
+                s.indent = st.indent;
                 s.format = st.format.clone();
             });
             self.fmt_dlg = false;
@@ -14178,7 +14194,7 @@ impl eframe::App for SheetApp {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new(if self.editing.is_some() { "输入" } else { "就绪" })
+                        egui::RichText::new(if self.editing.is_some() { "单元格模式 输入" } else { "单元格模式 就绪" })
                             .size(11.0)
                             .color(ui_kit::TEXT),
                     );
