@@ -385,9 +385,10 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
                             if aw <= 18.0 {
                                 ui.spacing_mut().button_padding.x = 2.0;
                             }
-                            ui.add_sized(
+                            ui_kit::arrow_glyph_button(
+                                ui,
                                 Vec2::new(aw, 24.0),
-                                egui::Button::new(egui::RichText::new("▼").size(12.0)),
+                                Color32::from_rgb(68, 68, 68),
                             )
                         })
                         .inner;
@@ -725,9 +726,14 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                 MenuNode::Menu(sub) => {
                                     let label = sub.ctl.label.clone().unwrap_or_default();
                                     let r = ui.add(
-                                        egui::Button::new(egui::RichText::new(format!("{label} ▶")).size(12.0))
+                                        egui::Button::new(egui::RichText::new(label).size(12.0))
                                             .min_size(Vec2::new(160.0, 22.0))
                                             .frame(false),
+                                    );
+                                    ui_kit::caret_right(
+                                        ui,
+                                        egui::pos2(r.rect.right() - 9.0, r.rect.center().y),
+                                        Color32::from_rgb(68, 68, 68),
                                     );
                                     if r.clicked() {
                                         app.ribbon_popup = Some(Popup {
@@ -822,15 +828,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let ar = ui.interact(arrow_rect, egui::Id::new("font_arrow"), Sense::click());
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                egui::pos2(c.x - 4.0, c.y - 2.0),
-                egui::pos2(c.x + 4.0, c.y - 2.0),
-                egui::pos2(c.x, c.y + 3.0),
-            ],
-            Color32::from_rgb(68, 68, 68),
-            egui::Stroke::NONE,
-        ));
+        ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
         if ar.clicked() {
             arrow_clicked = true;
         }
@@ -928,15 +926,7 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let ar = ui.interact(arrow_rect, egui::Id::new("size_arrow"), Sense::click());
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                egui::pos2(c.x - 4.0, c.y - 2.0),
-                egui::pos2(c.x + 4.0, c.y - 2.0),
-                egui::pos2(c.x, c.y + 3.0),
-            ],
-            Color32::from_rgb(68, 68, 68),
-            egui::Stroke::NONE,
-        ));
+        ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
         if ar.clicked() {
             arrow_clicked = true;
         }
