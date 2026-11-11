@@ -75,6 +75,10 @@ pub enum Icon {
     IndentDec,
     /// 符号（Ω）
     Symbol,
+    /// 简体（「简」字图标）
+    ZhS,
+    /// 繁体（「繁」字图标）
+    ZhT,
     /// 追踪引用单元格：方块 + 指向它的箭头
     TraceIn,
     /// 追踪从属单元格：方块 + 离开它的箭头
@@ -717,6 +721,8 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
         Fx => pen.text("fx", 12.0, 12.0, 13.0, GRAY_D),
         Sum => pen.text("Σ", 15.0, 12.0, 12.2, GREEN_D),
         Symbol => pen.text("Ω", 15.0, 12.0, 12.2, BLUE_D),
+        ZhS => pen.text("简", 13.0, 12.0, 12.4, RED),
+        ZhT => pen.text("繁", 13.0, 12.0, 12.4, BLUE_D),
         TraceIn => {
             // 追踪引用：箭头从外面指向本格
             pen.rro(12.0, 7.0, 9.0, 10.0, 1.0, BLUE_D, 1.4);

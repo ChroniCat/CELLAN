@@ -1,6 +1,7 @@
 pub mod formula;
 pub mod errors;
 pub mod scenarios;
+pub mod zhconv;
 pub mod cf;
 pub mod chart_write;
 pub mod charts;

@@ -2020,7 +2020,13 @@ pub fn apply_outline(xml: &str, rows: &[(u32, u8)], cols: &[(u32, u8)]) -> Strin
             if let Some(gt) = x[i..].find('>') {
                 let end = i + gt;
                 if !x[i..end].contains("outlineLevel=") {
-                    x.insert_str(end, &format!(" outlineLevel=\"{lv}\""));
+                    // 自闭合标签要插在 "/>" 之前，否则会写出 `.../> outlineLevel="1">` 这种坏 XML
+                    let at = if x[i..end].trim_end().ends_with('/') {
+                        end - 1
+                    } else {
+                        end
+                    };
+                    x.insert_str(at, &format!(" outlineLevel=\"{lv}\""));
                 }
             }
         }
@@ -2034,7 +2040,13 @@ pub fn apply_outline(xml: &str, rows: &[(u32, u8)], cols: &[(u32, u8)]) -> Strin
             if let Some(gt) = x[i..].find('>') {
                 let end = i + gt;
                 if !x[i..end].contains("outlineLevel=") {
-                    x.insert_str(end, &format!(" outlineLevel=\"{lv}\""));
+                    // 自闭合标签要插在 "/>" 之前，否则会写出 `.../> outlineLevel="1">` 这种坏 XML
+                    let at = if x[i..end].trim_end().ends_with('/') {
+                        end - 1
+                    } else {
+                        end
+                    };
+                    x.insert_str(at, &format!(" outlineLevel=\"{lv}\""));
                 }
             }
         }

@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.56";
+const APP_VERSION: &str = "1.57";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -119,7 +119,71 @@ struct EditState {
 }
 
 /// 去掉页眉页脚里的 OOXML 控制码（&L/&C/&R/&B 等），只留文字
-/// 矩形中心到目标点的连线与矩形边的交点（公式审核箭头用）
+/// 列头上的分级 +/- 按钮：在本组最后一列的列头底部画一个 9px 小方块，
+/// 点一下收起/展开这一组列（明细列进 hidden_cols）。
+#[allow(clippy::too_many_arguments)]
+fn col_outline_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    groups: &[(u32, u32, u8)],
+    c: u32,
+    x: f32,
+    w: f32,
+    origin_y: f32,
+    hh: f32,
+    depth: f32,
+    wb: &sheetcore::model::Workbook,
+    si: usize,
+    pending: &mut Vec<(u32, u32)>,
+) {
+    for (gs, ge, glv) in groups.iter() {
+        if *ge + 1 != c {
+            continue;
+        }
+        let sheet = wb.sheet(si);
+        let hidden = (*gs..=*ge).all(|x| sheet.hidden_cols.contains(&x));
+        let bw = 9.0;
+        let bx = x + w / 2.0 - bw / 2.0;
+        let by = origin_y + hh - 10.0 - (*glv as f32 - 1.0) * 11.0;
+        let _ = depth;
+        let brect =
+            egui::Rect::from_min_size(egui::pos2(bx, by), Vec2::new(bw, bw));
+        let br = ui.interact(
+            brect,
+            egui::Id::new(("col_outline_btn", *gs, *ge)),
+            egui::Sense::click(),
+        );
+        painter.rect_filled(brect, 1.0, Color32::WHITE);
+        painter.rect_stroke(
+            brect,
+            1.0,
+            Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+            egui::StrokeKind::Inside,
+        );
+        let ctr = brect.center();
+        painter.line_segment(
+            [
+                egui::pos2(ctr.x - 2.5, ctr.y),
+                egui::pos2(ctr.x + 2.5, ctr.y),
+            ],
+            Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+        );
+        if hidden {
+            painter.line_segment(
+                [
+                    egui::pos2(ctr.x, ctr.y - 2.5),
+                    egui::pos2(ctr.x, ctr.y + 2.5),
+                ],
+                Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+            );
+        }
+        if br.clicked() {
+            pending.push((*gs, *ge));
+        }
+    }
+}
+
+/// 矩形中心到目标点的连线与矩形的交点（公式审核箭头用）
 fn edge_point(x0: f32, y0: f32, x1: f32, y1: f32, tx: f32, ty: f32) -> (f32, f32) {
     let cx = (x0 + x1) * 0.5;
     let cy = (y0 + y1) * 0.5;
@@ -397,6 +461,8 @@ struct SheetApp {
     scen_name: String,
     scen_comment: String,
     scen_range: String,
+    /// 摘要里的结果单元格（可选，例如 C1:C3）
+    scen_result: String,
     scen_msg: String,
     scen_sel: Option<usize>,
     /// 模拟运算表对话框
@@ -725,6 +791,7 @@ impl SheetApp {
             scen_name: String::new(),
             scen_comment: String::new(),
             scen_range: String::new(),
+            scen_result: String::new(),
             scen_msg: String::new(),
             scen_sel: None,
             dtable_dlg: false,
@@ -1302,6 +1369,46 @@ impl SheetApp {
                                 }
                             }
                         }
+                        Ok("zh") => {
+                            if let (Ok(sel), Ok(end)) = (
+                                std::env::var("SC_SEL"),
+                                std::env::var("SC_SEL2"),
+                            ) {
+                                let p = |v: &str| -> Option<(u32, u32)> {
+                                    let (x, y) = v.split_once(',')?;
+                                    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                                };
+                                if let (Some(s0), Some(s1)) = (p(&sel), p(&end)) {
+                                    self.sel = s0;
+                                    self.sel_end = s1;
+                                }
+                            }
+                            let dir = std::env::var("SC_ZH").unwrap_or_default();
+                            self.zh_convert(dir == "t");
+                            eprintln!("[zh] {}", self.status);
+                        }
+                        Ok("colgroup") => {
+                            if let Ok(spec) = std::env::var("SC_GROUP_COLS") {
+                                let mut it = spec.split(',');
+                                if let (Some(a0), Some(b0)) = (it.next(), it.next()) {
+                                    if let (Ok(c1), Ok(c2)) =
+                                        (a0.trim().parse::<u32>(), b0.trim().parse::<u32>())
+                                    {
+                                        self.sel = (0, c1);
+                                        self.sel_end = (1_048_575, c2);
+                                        self.group_selection();
+                                        if std::env::var("SC_COL_HIDE").is_ok() {
+                                            self.toggle_detail(true);
+                                        }
+                                        eprintln!(
+                                            "[colgroup] {} cols={:?}",
+                                            self.status,
+                                            self.wb.sheet(self.sheet_idx).col_levels.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         Ok("addsheet") => {
                             if let Ok(name) = std::env::var("SC_ADD_SHEET") {
                                 let mut sh = sheetcore::model::Sheet::new(&name);
@@ -1370,7 +1477,10 @@ impl SheetApp {
                                 }
                             }
                             if std::env::var("SC_SCEN_SUMMARY").is_ok() {
-                                match self.build_scenario_summary() {
+                                let res = std::env::var("SC_SCEN_RESULTS")
+                                    .ok()
+                                    .and_then(|v| SheetApp::parse_rect(&v));
+                                match self.build_scenario_summary(res) {
                                     Ok(n) => eprintln!("[scen] summary sheet {n}"),
                                     Err(e) => eprintln!("[scen] summary fail {e}"),
                                 }
@@ -5081,6 +5191,59 @@ impl SheetApp {
         });
     }
 
+    /// 中文简繁转换：把选区里的文本单元格整段转换（词组优先，见 core::zhconv）
+    fn zh_convert(&mut self, to_trad: bool) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if (r2 - r1) as u64 * (c2 - c1) as u64 > 200_000 {
+            self.status = "选区太大，先选一块再转换".into();
+            return;
+        }
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        let mut work: Vec<(u32, u32, String)> = Vec::new();
+        {
+            let sh = self.wb.sheet(self.sheet_idx);
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let Some(cell) = sh.get(r, c) else { continue };
+                    let sheetcore::model::Value::Text(t) = &cell.value else {
+                        continue;
+                    };
+                    let new = if to_trad {
+                        sheetcore::zhconv::to_traditional(t)
+                    } else {
+                        sheetcore::zhconv::to_simplified(t)
+                    };
+                    if new.as_str() != t.as_ref() {
+                        keys.push((r, c));
+                        work.push((r, c, new));
+                    }
+                }
+            }
+        }
+        if work.is_empty() {
+            self.status = "选区里没有需要转换的文本".into();
+            return;
+        }
+        let txn = self.txn_begin(&keys);
+        let n = work.len();
+        for (r, c, text) in work {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+            cell.value = sheetcore::model::Value::Text(text.into());
+            sh.set(r, c, cell);
+        }
+        self.txn_end(if to_trad { "简转繁" } else { "繁转简" }, txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "{}：已转换 {n} 个单元格",
+            if to_trad { "简转繁" } else { "繁转简" }
+        );
+    }
+
     /// 清除内容（保留格式，和 Excel「清除内容」一致）
     fn clear_selection(&mut self) {
         if self.edit_blocked() {
@@ -5891,6 +6054,15 @@ impl SheetApp {
                             .color(ui_kit::TEXT_WEAK),
                     );
                 });
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 20.0], egui::Label::new("结果单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.scen_result).desired_width(120.0));
+                    ui.label(
+                        egui::RichText::new("可选；摘要里额外列出这些格子在每个方案下的值")
+                            .size(11.0)
+                            .color(ui_kit::TEXT_WEAK),
+                    );
+                });
                 if !self.scen_msg.is_empty() {
                     ui.add_space(3.0);
                     ui.label(egui::RichText::new(&self.scen_msg).size(11.5));
@@ -5985,7 +6157,12 @@ impl SheetApp {
             }
         }
         if do_summary {
-            match self.build_scenario_summary() {
+            let res = if self.scen_result.trim().is_empty() {
+                None
+            } else {
+                Self::parse_rect(&self.scen_result)
+            };
+            match self.build_scenario_summary(res) {
                 Ok(name) => {
                     self.scen_msg = format!("已在「{name}」里生成摘要");
                     self.status = format!("方案摘要已生成：{name}");
@@ -6010,8 +6187,12 @@ impl SheetApp {
         parse_a1_ref(t).map(|(r, c)| (r, c, r, c))
     }
 
-    /// 生成「方案摘要」工作表（和 Excel 一样：新建一张表，每行一个方案）
-    fn build_scenario_summary(&mut self) -> Result<String, String> {
+    /// 生成「方案摘要」工作表（和 Excel 一样：每行一个方案）。
+    /// 带 `results` 时，还会把每个方案下这些格子的计算结果一起写进去。
+    fn build_scenario_summary(
+        &mut self,
+        results: Option<(u32, u32, u32, u32)>,
+    ) -> Result<String, String> {
         let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
         if list.is_empty() {
             return Err("还没有方案，先保存一个".into());
@@ -6025,6 +6206,71 @@ impl SheetApp {
             }
         }
         keys.sort();
+        let result_cells: Vec<(u32, u32)> = match results {
+            Some((r1, c1, r2, c2)) => {
+                let mut v = Vec::new();
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        v.push((r, c));
+                    }
+                }
+                v
+            }
+            None => Vec::new(),
+        };
+        // 先把「所有方案会动的格子」的当前值记下来，算完恢复
+        let snapshot: Vec<((u32, u32), sheetcore::model::Value)> = keys
+            .iter()
+            .map(|(r, c)| {
+                (
+                    (*r, *c),
+                    self.wb
+                        .sheet(self.sheet_idx)
+                        .get(*r, *c)
+                        .map(|x| x.value.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        // 逐个方案代值、重算、抓结果
+        let mut rows: Vec<Vec<Vec<sheetcore::model::Value>>> = Vec::new();
+        let deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        for sc in &list {
+            for ((r, c), v) in &sc.cells {
+                let val = sheetcore::scenarios::apply_value(v);
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+                cell.value = val;
+                cell.formula = None;
+                sh.set(*r, *c, cell);
+            }
+            let seeds: Vec<_> = sc
+                .cells
+                .iter()
+                .map(|((r, c), _)| (self.sheet_idx, *r, *c))
+                .collect();
+            sheetcore::formula::recalc_dirty(&mut self.wb, &deps, &seeds);
+            let vals: Vec<sheetcore::model::Value> = result_cells
+                .iter()
+                .map(|(r, c)| {
+                    self.wb
+                        .sheet(self.sheet_idx)
+                        .get(*r, *c)
+                        .map(|x| x.value.clone())
+                        .unwrap_or_default()
+                })
+                .collect();
+            rows.push(vec![vals]);
+        }
+        // 恢复原状
+        for ((r, c), v) in snapshot {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+            cell.value = v;
+            sh.set(r, c, cell);
+        }
+        sheetcore::formula::recalc_all(&mut self.wb);
+
         let mut base = "方案摘要".to_string();
         let mut n = 1;
         while self.wb.sheets.iter().any(|s| s.name == base) {
@@ -6054,6 +6300,14 @@ impl SheetApp {
                 sheetcore::model::Value::Text(cell_name(*r, *c).into()),
             );
         }
+        for (j, (r, c)) in result_cells.iter().enumerate() {
+            put(
+                &mut sh,
+                1,
+                keys.len() as u32 + j as u32 + 1,
+                sheetcore::model::Value::Text(cell_name(*r, *c).into()),
+            );
+        }
         for (i, sc) in list.iter().enumerate() {
             let row = i as u32 + 2;
             put(&mut sh, row, 0, sheetcore::model::Value::Text(sc.name.clone().into()));
@@ -6066,6 +6320,14 @@ impl SheetApp {
                     .unwrap_or_default();
                 put(&mut sh, row, j as u32 + 1, v);
             }
+            for (j, v) in rows[i][0].iter().enumerate() {
+                put(
+                    &mut sh,
+                    row,
+                    keys.len() as u32 + j as u32 + 1,
+                    v.clone(),
+                );
+            }
         }
         let idx = self.wb.sheets.len();
         if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, idx, sh) {
@@ -6075,6 +6337,8 @@ impl SheetApp {
         self.sel = (0, 0);
         self.sel_end = (0, 0);
         self.finish_sheet_change();
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
         Ok(base)
     }
 
@@ -8280,6 +8544,20 @@ impl SheetApp {
     }
 
     fn ribbon_review(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "中文简繁转换", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::ZhS, "简转繁", 92.0, "把选区里的简体转成繁体")
+                    .clicked()
+                {
+                    self.zh_convert(true);
+                }
+                if ui_kit::labeled_w(ui, Icon::ZhT, "繁转简", 92.0, "把选区里的繁体转成简体")
+                    .clicked()
+                {
+                    self.zh_convert(false);
+                }
+            });
+        });
         ui_kit::group(ui, "批注", |ui| {
             if ui_kit::big(ui, Icon::Comment, "新建批注").clicked() {
                 let (r, c) = self.sel;
@@ -8568,6 +8846,7 @@ impl SheetApp {
                     };
                     self.scen_name.clear();
                     self.scen_comment.clear();
+                    self.scen_result.clear();
                     self.scen_msg.clear();
                     self.scen_sel = None;
                     self.scen_dlg = true;
@@ -8576,15 +8855,21 @@ impl SheetApp {
         });
         ui_kit::group(ui, "分级显示", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::labeled_w(ui, Icon::Plus, "组合", 104.0, "把选中的行组成一级")
-                    .clicked()
+                if ui_kit::labeled_w(
+                    ui,
+                    Icon::Plus,
+                    "组合",
+                    104.0,
+                    "整列选区组合列，其余组合行",
+                )
+                .clicked()
                 {
-                    self.group_rows();
+                    self.group_selection();
                 }
-                if ui_kit::labeled_w(ui, Icon::Close, "取消组合", 104.0, "选中的行降一级")
+                if ui_kit::labeled_w(ui, Icon::Close, "取消组合", 104.0, "整列选区拆列，其余拆行")
                     .clicked()
                 {
-                    self.ungroup_rows();
+                    self.ungroup_selection();
                 }
             });
             ui.vertical(|ui| {
@@ -12248,6 +12533,100 @@ impl SheetApp {
         out
     }
 
+    /// 列分级区域：连续的同一级别算一组
+    fn col_groups(&self) -> Vec<(u32, u32, u8)> {
+        let m = &self.wb.sheet(self.sheet_idx).col_levels;
+        if m.is_empty() {
+            return Vec::new();
+        }
+        let mut keys: Vec<(u32, u8)> = m.iter().map(|(c, l)| (*c, *l)).collect();
+        keys.sort();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < keys.len() {
+            let (start, lv) = keys[i];
+            let mut end = start;
+            let mut j = i + 1;
+            while j < keys.len() && keys[j].1 == lv && keys[j].0 == end + 1 {
+                end = keys[j].0;
+                j += 1;
+            }
+            out.push((start, end, lv));
+            i = j;
+        }
+        out
+    }
+
+    /// 选区是不是「整列」（点列标选出来的）：行跨度很大就当整列
+    fn selection_is_columns(&self) -> bool {
+        let (r1, _, r2, _) = self.sel_rect();
+        r2 - r1 > 1000
+    }
+
+    /// 组合：整列选区组合列，其余组合行
+    fn group_selection(&mut self) {
+        if self.selection_is_columns() {
+            self.group_cols();
+        } else {
+            self.group_rows();
+        }
+    }
+
+    fn ungroup_selection(&mut self) {
+        if self.selection_is_columns() {
+            self.ungroup_cols();
+        } else {
+            self.ungroup_rows();
+        }
+    }
+
+    fn group_cols(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (_r1, c1, _r2, c2) = self.sel_rect();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut base = 0u8;
+            for probe in [c1.saturating_sub(1), c2 + 1, c1, c2] {
+                if let Some(l) = sh.col_levels.get(&probe) {
+                    base = base.max(*l);
+                }
+            }
+            let lv = (base + 1).min(7);
+            for c in c1..=c2 {
+                sh.col_levels.insert(c, lv);
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已组合 {}~{} 列", col_label(c1), col_label(c2));
+    }
+
+    fn ungroup_cols(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (_r1, c1, _r2, c2) = self.sel_rect();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for c in c1..=c2 {
+                if let Some(l) = sh.col_levels.get(&c).copied() {
+                    if l <= 1 {
+                        sh.col_levels.remove(&c);
+                    } else {
+                        sh.col_levels.insert(c, l - 1);
+                    }
+                }
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已取消组合 {}~{} 列", col_label(c1), col_label(c2));
+    }
+
     /// 组合：把选区整体升一级（Excel 的「组合」）
     fn group_rows(&mut self) {
         if self.edit_blocked() {
@@ -12300,6 +12679,40 @@ impl SheetApp {
 
     /// 隐藏/显示明细：选区落在哪个分级区域里，就收起/展开那个区域的明细行
     fn toggle_detail(&mut self, hide: bool) {
+        // 整列选区走列的分级
+        if self.selection_is_columns() {
+            let (_r1, c1, _r2, c2) = self.sel_rect();
+            let groups: Vec<(u32, u32, u8)> = self
+                .col_groups()
+                .into_iter()
+                .filter(|(a, b, _)| !(*b < c1 || *a > c2))
+                .collect();
+            if groups.is_empty() {
+                self.status = "选区不在任何列分级区域里".into();
+                return;
+            }
+            {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for (a, b, _lv) in groups {
+                    for c in a..=b {
+                        if hide {
+                            sh.hidden_cols.insert(c);
+                        } else {
+                            sh.hidden_cols.remove(&c);
+                        }
+                    }
+                }
+                sh.layout_dirty = true;
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = if hide {
+                "已隐藏列的明细".to_string()
+            } else {
+                "已显示列的明细".to_string()
+            };
+            return;
+        }
         let (r1, _c1, r2, _c2) = self.sel_rect();
         let groups: Vec<(u32, u32, u8)> = self
             .row_groups()
@@ -12352,7 +12765,20 @@ impl SheetApp {
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let origin = resp.rect.min;
         // 视图 → 标题：关掉列标/行号后表头占 0 像素，网格从左上角开始
-        let hh = if self.show_headings { HEAD_H } else { 0.0 };
+        // 列头高度：有列分级时每级留 11px 放 +/- 按钮
+        let col_depth = self
+            .wb
+            .sheet(self.sheet_idx)
+            .col_levels
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0) as f32;
+        let hh = if self.show_headings {
+            HEAD_H + col_depth * 11.0
+        } else {
+            0.0
+        };
 
         // 右键菜单（选区操作）；点在列标/行号上时留给表头自己的菜单
         let secondary_in_head = resp.secondary_clicked()
@@ -12712,6 +13138,8 @@ impl SheetApp {
         // 列标题
         // Excel：选区覆盖到的列在列头上整块加深（不是只有活动格那一列）。
         // 绿线统一放在表头分界线之后画，才不会被 1px 的边框盖住。
+        let col_groups = self.col_groups();
+        let mut pending_col_toggle: Vec<(u32, u32)> = Vec::new();
         let (mut sr1, mut sc1, mut sr2, mut sc2) = self.sel_rect();
         // 活动格落在合并区里时，Excel 会把整块合并区覆盖的行/列都高亮
         if let Some((mr1, mc1, mr2, mc2)) = self
@@ -12747,11 +13175,25 @@ impl SheetApp {
             }
             if self.show_headings {
             painter.text(
-                    egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
+                    egui::pos2(x + w / 2.0, origin.y + (hh - col_depth * 11.0) / 2.0),
                     Align2::CENTER_CENTER,
                     col_label(c),
                     FontId::new(12.0, family_named("latin")),
                     head_fg,
+                );
+                col_outline_button(
+                    ui,
+                    &painter,
+                    col_groups.as_slice(),
+                    c,
+                    x,
+                    w,
+                    origin.y,
+                    hh,
+                    col_depth,
+                    &self.wb,
+                    self.sheet_idx,
+                    &mut pending_col_toggle,
                 );
             }
             painter.line_segment(
@@ -12779,12 +13221,26 @@ impl SheetApp {
                 }
                 if self.show_headings {
                 painter.text(
-                                    egui::pos2(x + w / 2.0, origin.y + hh / 2.0),
+                                    egui::pos2(x + w / 2.0, origin.y + (hh - col_depth * 11.0) / 2.0),
                                     Align2::CENTER_CENTER,
                                     col_label(c),
                                     FontId::new(12.0, family_named("latin")),
                                     head_fg,
                                 );
+                    col_outline_button(
+                        ui,
+                        &painter,
+                        col_groups.as_slice(),
+                        c,
+                        x,
+                        w,
+                        origin.y,
+                        hh,
+                        col_depth,
+                        &self.wb,
+                        self.sheet_idx,
+                        &mut pending_col_toggle,
+                    );
                 }
                 painter.line_segment(
                     [egui::pos2(x, origin.y), egui::pos2(x, origin.y + hh)],
@@ -12921,6 +13377,22 @@ impl SheetApp {
             Stroke::new(1.0, ui_kit::HEAD_LINE),
         );
 
+        if !pending_col_toggle.is_empty() {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for (gs, ge) in pending_col_toggle {
+                let hiding = !(gs..=ge).all(|x| sh.hidden_cols.contains(&x));
+                for x in gs..=ge {
+                    if hiding {
+                        sh.hidden_cols.insert(x);
+                    } else {
+                        sh.hidden_cols.remove(&x);
+                    }
+                }
+            }
+            sh.layout_dirty = true;
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+        }
         if !pending_toggle.is_empty() {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             for (gs, ge) in pending_toggle {

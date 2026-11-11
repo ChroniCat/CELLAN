@@ -108,7 +108,19 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 
 
-二、Rust / 系统依赖
+二、内置中文简繁词典（Apache License 2.0）
+----------------------------------------
+简繁转换使用 OpenCC 的字典数据（字表 STCharacters/TSCharacters、词表 STPhrases/TSPhrases），
+经 scripts/gen_zhconv.py 转成二进制块 assets/zhconv.bin 内嵌进程序。
+
+OpenCC-Python
+Copyright 2016
+This product includes dictionary data and configurations developed by
+OpenCC (https://github.com/BYVoid/OpenCC).
+
+OpenCC 以 Apache License 2.0 发布，许可证全文见本文件末尾「Apache License 2.0 全文」。
+
+三、Rust / 系统依赖
 ------------------
 共 387 个（含仅在其他平台使用的条件依赖）。逐项许可证如下：
 
@@ -500,7 +512,7 @@ zopfli 0.8.4 — Apache-2.0
 zune-core 0.5.3 — MIT OR Apache-2.0 OR Zlib
 zune-jpeg 0.5.15 — MIT OR Apache-2.0 OR Zlib
 
-三、MIT 许可证全文
+四、MIT 许可证全文
 ------------------
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -527,7 +539,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 
-四、Apache License 2.0 全文
+五、Apache License 2.0 全文
 ---------------------------
                               Apache License
                         Version 2.0, January 2004
