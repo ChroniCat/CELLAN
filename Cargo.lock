@@ -105,6 +105,7 @@ dependencies = [
  "eframe",
  "hex",
  "image",
+ "quick-xml 0.42.0",
  "rfd",
  "serde_json",
  "sha2",

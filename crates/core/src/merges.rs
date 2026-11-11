@@ -170,6 +170,8 @@ fn parse_layout(xml: &str) -> SheetLayout {
     let mut out = SheetLayout::default();
     let mut af_range: Option<(u32, u32, u32, u32)> = None;
     let mut cur_col: Option<u32> = None;
+    let mut af_criteria: std::collections::HashMap<u32, crate::sort_filter::Criterion> =
+        std::collections::HashMap::new();
     let mut af_allows: std::collections::HashMap<u32, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     let mut freeze_y = 0u32;
@@ -343,6 +345,42 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             cur_col = crate::model::xml_unescape(&a.value.to_string()).parse().ok();
                         }
                     }
+                } else if name.ends_with("customFilter") {
+                    // <customFilter operator="contains" val="张"/>；Between 在 Excel 里是两条 and="1"
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        let mut op_s = String::new();
+                        let mut val = String::new();
+                        for a in e.attributes().flatten() {
+                            let k = a.key.as_ref();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if k.ends_with("operator") {
+                                op_s = v;
+                            } else if k.ends_with("val") {
+                                val = v;
+                            }
+                        }
+                        let key = range.1 + col;
+                        if let Some(op) = crate::sort_filter::CmpOp::from_xml(&op_s) {
+                            match af_criteria.get_mut(&key) {
+                                // 第二条 between 的上界
+                                Some(c)
+                                    if c.op == crate::sort_filter::CmpOp::Between
+                                        && c.val2.is_none() =>
+                                {
+                                    c.val2 = Some(val);
+                                }
+                                Some(_) => {}
+                                None => {
+                                    let c = crate::sort_filter::Criterion {
+                                        op,
+                                        val,
+                                        val2: None,
+                                    };
+                                    af_criteria.insert(key, c);
+                                }
+                            }
+                        }
+                    }
                 } else if name == "filter" || name.ends_with(":filter") {
                     if let (Some(col), Some(range)) = (cur_col, af_range) {
                         for a in e.attributes().flatten() {
@@ -387,6 +425,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
     if let Some(range) = af_range {
         let mut f = crate::sort_filter::Filter::new(range.0, range.1, range.2, range.3);
         f.allows = af_allows;
+        f.criteria = af_criteria;
         out.filter = Some(f);
     }
     out

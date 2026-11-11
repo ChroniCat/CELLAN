@@ -170,24 +170,184 @@ pub fn current_region(sheet: &Sheet, r: u32, c: u32) -> (u32, u32, u32, u32) {
     (r1, c1, r2, c2)
 }
 
-/// 一个筛选器：区域 + 每列允许的值
+/// 比价方式：
+/// - 文本类：Contains/NotContains/Begins/Ends
+/// - 数值类：Eq/Ne/Gt/Ge/Lt/Le/Between（两边都能转成数字就按数字比，否则按文本比）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Between,
+    Contains,
+    NotContains,
+    Begins,
+    Ends,
+}
+
+impl CmpOp {
+    /// 菜单里的中文名
+    pub fn label(&self) -> &'static str {
+        match self {
+            CmpOp::Eq => "等于",
+            CmpOp::Ne => "不等于",
+            CmpOp::Gt => "大于",
+            CmpOp::Ge => "大于或等于",
+            CmpOp::Lt => "小于",
+            CmpOp::Le => "小于或等于",
+            CmpOp::Between => "介于",
+            CmpOp::Contains => "包含",
+            CmpOp::NotContains => "不包含",
+            CmpOp::Begins => "开头是",
+            CmpOp::Ends => "结尾是",
+        }
+    }
+
+    /// xlsx customFilter 的 operator 属性
+    pub fn xml_operator(&self) -> &'static str {
+        match self {
+            CmpOp::Eq => "equal",
+            CmpOp::Ne => "notEqual",
+            CmpOp::Gt => "greaterThan",
+            CmpOp::Ge => "greaterThanOrEqual",
+            CmpOp::Lt => "lessThan",
+            CmpOp::Le => "lessThanOrEqual",
+            CmpOp::Between => "between",
+            CmpOp::Contains => "contains",
+            CmpOp::NotContains => "notContains",
+            CmpOp::Begins => "beginsWith",
+            CmpOp::Ends => "endsWith",
+        }
+    }
+
+    pub fn from_xml(op: &str) -> Option<Self> {
+        Some(match op {
+            "equal" => CmpOp::Eq,
+            "notEqual" => CmpOp::Ne,
+            "greaterThan" => CmpOp::Gt,
+            "greaterThanOrEqual" => CmpOp::Ge,
+            "lessThan" => CmpOp::Lt,
+            "lessThanOrEqual" => CmpOp::Le,
+            "between" => CmpOp::Between,
+            "contains" => CmpOp::Contains,
+            "notContains" => CmpOp::NotContains,
+            "beginsWith" => CmpOp::Begins,
+            "endsWith" => CmpOp::Ends,
+            _ => return None,
+        })
+    }
+
+    /// 文本类还是数值类（决定菜单里显示「文本筛选」还是「数字筛选」）
+    pub fn is_text(&self) -> bool {
+        matches!(
+            self,
+            CmpOp::Contains | CmpOp::NotContains | CmpOp::Begins | CmpOp::Ends
+        )
+    }
+}
+
+/// 一条筛选条件
+#[derive(Clone, Debug, PartialEq)]
+pub struct Criterion {
+    pub op: CmpOp,
+    pub val: String,
+    /// 只有 Between 用
+    pub val2: Option<String>,
+}
+
+impl Criterion {
+    pub fn new(op: CmpOp, val: impl Into<String>) -> Self {
+        Self {
+            op,
+            val: val.into(),
+            val2: None,
+        }
+    }
+
+    pub fn between(a: impl Into<String>, b: impl Into<String>) -> Self {
+        Self {
+            op: CmpOp::Between,
+            val: a.into(),
+            val2: Some(b.into()),
+        }
+    }
+
+    /// 这条条件是否放行某个显示文本
+    pub fn matches(&self, text: &str) -> bool {
+        match self.op {
+            CmpOp::Contains => text.to_lowercase().contains(&self.val.to_lowercase()),
+            CmpOp::NotContains => !text.to_lowercase().contains(&self.val.to_lowercase()),
+            CmpOp::Begins => text.to_lowercase().starts_with(&self.val.to_lowercase()),
+            CmpOp::Ends => text.to_lowercase().ends_with(&self.val.to_lowercase()),
+            _ => {
+                // 数值优先，转不动就按文本比
+                if let (Ok(a), Ok(b)) = (text.trim().parse::<f64>(), self.val.trim().parse::<f64>()) {
+                    return match self.op {
+                        CmpOp::Eq => a == b,
+                        CmpOp::Ne => a != b,
+                        CmpOp::Gt => a > b,
+                        CmpOp::Ge => a >= b,
+                        CmpOp::Lt => a < b,
+                        CmpOp::Le => a <= b,
+                        CmpOp::Between => {
+                            let hi = self
+                                .val2
+                                .as_deref()
+                                .and_then(|v| v.trim().parse::<f64>().ok())
+                                .unwrap_or(b);
+                            a >= b.min(hi) && a <= b.max(hi)
+                        }
+                        _ => true,
+                    };
+                }
+                let t = text.to_lowercase();
+                let v = self.val.to_lowercase();
+                match self.op {
+                    CmpOp::Eq => t == v,
+                    CmpOp::Ne => t != v,
+                    CmpOp::Gt => t > v,
+                    CmpOp::Ge => t >= v,
+                    CmpOp::Lt => t < v,
+                    CmpOp::Le => t <= v,
+                    CmpOp::Between => {
+                        let hi = self.val2.as_deref().unwrap_or("").to_lowercase();
+                        let (lo, hi) = if v <= hi { (v, hi) } else { (hi, v) };
+                        t >= lo && t <= hi
+                    }
+                    _ => true,
+                }
+            }
+        }
+    }
+}
+
+/// 一个筛选器：区域 + 每列允许的值 / 每列的条件
 #[derive(Clone, Debug, Default)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
     /// 列号 → 允许出现文本值；没有条目的列不过滤
     pub allows: HashMap<u32, HashSet<String>>,
+    /// 列号 → 条件（文本筛选/数字筛选）；和 allows 是「与」关系
+    pub criteria: HashMap<u32, Criterion>,
 }
 
 impl Filter {
     pub fn new(r1: u32, c1: u32, r2: u32, c2: u32) -> Self {
-        Self { range: (r1, c1, r2, c2), allows: HashMap::new() }
+        Self {
+            range: (r1, c1, r2, c2),
+            allows: HashMap::new(),
+            criteria: HashMap::new(),
+        }
     }
 
     /// 按当前规则算出要隐藏的行（不含表头行）
     pub fn hidden_rows(&self, sheet: &Sheet) -> HashSet<u32> {
         let (r1, c1, r2, c2) = self.range;
         let mut out = HashSet::new();
-        if self.allows.is_empty() {
+        if self.allows.is_empty() && self.criteria.is_empty() {
             return out;
         }
         for r in (r1 + 1)..=r2 {
@@ -201,8 +361,27 @@ impl Filter {
                     break;
                 }
             }
+            if out.contains(&r) {
+                continue;
+            }
+            for (col, crit) in self.criteria.iter() {
+                if *col < c1 || *col > c2 {
+                    continue;
+                }
+                let v = sheet.get(r, *col).map(|c| c.value.display()).unwrap_or_default();
+                if !crit.matches(&v) {
+                    out.insert(r);
+                    break;
+                }
+            }
         }
         out
+    }
+
+    /// 这列有没有任何筛选（值列表或条件）
+    pub fn is_filtered(&self, col: u32) -> bool {
+        self.allows.get(&col).map(|a| !a.is_empty()).unwrap_or(false)
+            || self.criteria.contains_key(&col)
     }
 }
 
@@ -242,6 +421,48 @@ mod tests {
         s.set(0, 0, Cell { value: Value::Text("姓名".into()), formula: None });
         s.set(0, 1, Cell { value: Value::Text("分数".into()), formula: None });
         s
+    }
+
+    #[test]
+    fn criteria_filter_by_text_and_number() {
+        let s = sheet();
+        let mut f = Filter::new(0, 0, 4, 1);
+        f.criteria.insert(0, Criterion::new(CmpOp::Contains, "张"));
+        let hid = f.hidden_rows(&s);
+        assert_eq!(hid.len(), 3, "只有张三含「张」");
+
+        let mut f2 = Filter::new(0, 0, 4, 1);
+        f2.criteria.insert(1, Criterion::new(CmpOp::Gt, "15"));
+        let hid2 = f2.hidden_rows(&s);
+        // 分数 30/10/20/0 → 大于 15 只有 30、20
+        assert_eq!(hid2.len(), 2);
+
+        let mut f3 = Filter::new(0, 0, 4, 1);
+        f3.criteria.insert(1, Criterion::between("5", "25"));
+        assert_eq!(f3.hidden_rows(&s).len(), 2, "10、20 落在 5..25");
+
+        let mut f4 = Filter::new(0, 0, 4, 1);
+        f4.criteria.insert(0, Criterion::new(CmpOp::Begins, "李"));
+        assert_eq!(f4.hidden_rows(&s).len(), 3);
+    }
+
+    #[test]
+    fn criterion_xml_operator_roundtrip() {
+        for op in [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Gt,
+            CmpOp::Ge,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Between,
+            CmpOp::Contains,
+            CmpOp::NotContains,
+            CmpOp::Begins,
+            CmpOp::Ends,
+        ] {
+            assert_eq!(CmpOp::from_xml(op.xml_operator()), Some(op), "{op:?}");
+        }
     }
 
     #[test]

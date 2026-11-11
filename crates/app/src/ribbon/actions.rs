@@ -1,0 +1,850 @@
+//! 功能区回调：状态（getEnabled/getPressed/getLabel/getText/getImage）与命令。
+//!
+//! 命令体全部落在既有方法上；这里只保留 MS-CUSTOMUI 回调那一层的转发，
+//! 不复制业务逻辑。
+
+use eframe::egui;
+
+use super::{CtlState, Size};
+use crate::{cell_name, SheetApp};
+
+fn fmt_label(code: &str) -> &str {
+    match code {
+        "" => "常规",
+        "#,##0.00" => "数值",
+        "¥#,##0.00" => "货币",
+        "0.0%" => "百分比",
+        "yyyy-mm-dd" => "日期",
+        "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计",
+        "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计（无符号）",
+        "0.00E+00" => "科学计数",
+        "# ?/?" => "分数",
+        "@" => "文本",
+        other => other,
+    }
+}
+
+fn size_text(v: f32) -> String {
+    if (v - v.round()).abs() < 0.01 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+impl SheetApp {
+    /// 控件状态：等价于 MS-CUSTOMUI 的 get* 回调。
+    pub fn ctl_state(&self, id: &str) -> CtlState {
+        let mut st = CtlState::default();
+        let cur = self.current_style();
+        match id {
+            "Undo" => st.enabled = self.undo.can_undo(),
+            "Redo" => st.enabled = self.undo.can_redo(),
+            "Font" => {
+                st.text = Some(if cur.font.is_empty() {
+                    "默认".to_string()
+                } else {
+                    cur.font.clone()
+                })
+            }
+            "FontSize" => st.text = Some(size_text(cur.size)),
+            "Bold" => st.checked = cur.bold,
+            "Italic" => st.checked = cur.italic,
+            "Underline" => st.checked = cur.underline,
+            "AlignTop" => st.checked = cur.valign == 1,
+            "AlignMiddle" => st.checked = cur.valign == 2,
+            "AlignBottom" => st.checked = cur.valign == 3,
+            "AlignLeft" => st.checked = cur.halign == 1,
+            "AlignCenter" => st.checked = cur.halign == 2,
+            "AlignRight" => st.checked = cur.halign == 3,
+            "WrapText" => st.checked = cur.wrap,
+            "MergeCenter" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                st.checked = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .merges
+                    .iter()
+                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2);
+            }
+            "FillColor" => {
+                let f = cur.fill.unwrap_or([255, 255, 255]);
+                st.swatch = Some(egui::Color32::from_rgb(f[0], f[1], f[2]));
+            }
+            "FontColor" => {
+                let c = cur.color;
+                st.swatch = Some(egui::Color32::from_rgb(c[0], c[1], c[2]));
+            }
+            "NumberFormat" => st.text = Some(fmt_label(&cur.format).to_string()),
+            "PrintGridlines" => st.checked = self.wb.sheet(self.sheet_idx).page.gridlines,
+            "PrintHeadings" => st.checked = self.wb.sheet(self.sheet_idx).page.headings,
+            "ShowGridlines" => st.checked = self.show_gridlines,
+            "ShowHeadings" => st.checked = self.show_headings,
+            "ShowFormulaBar" => st.checked = self.show_formula_bar,
+            "TextSpill" => st.checked = self.text_spill,
+            "ShowFormulas" => st.checked = self.show_formulas,
+            "DataFilter" => {
+                st.checked = self.wb.sheet(self.sheet_idx).filter.is_some();
+                if st.checked {
+                    st.tip = Some("筛选已启用：再点一次取消".into());
+                }
+            }
+            "FreezeTopRow" => st.checked = self.wb.sheet(self.sheet_idx).freeze == Some((1, 0)),
+            "FreezeFirstColumn" => {
+                st.checked = self.wb.sheet(self.sheet_idx).freeze == Some((0, 1))
+            }
+            "NormalView" => st.checked = self.view_mode == 0,
+            "PageLayoutView" => st.checked = self.view_mode == 1,
+            "PageBreakPreview" => st.checked = self.view_mode == 2,
+            "TableTotals" => {
+                if let Some(t) = self.table_at_sel() {
+                    st.checked = t.totals_row;
+                }
+            }
+            "ProtectSheet" => {
+                let on = self.wb.sheet(self.sheet_idx).protection.is_some();
+                st.label = Some(if on { "撤销保护" } else { "保护工作表" }.into());
+            }
+            "FileShare" | "ReviewShare" | "JoinAddress" | "RoomPassword" | "JoinRoom"
+            | "AutoShare" => {
+                st.visible = self.net.is_none();
+                if id == "AutoShare" {
+                    st.checked = self.auto_share;
+                }
+            }
+            "FileOnlinePeers" | "ReviewOnlinePeers" => {
+                st.visible = self.net.is_some();
+                st.label = Some(format!("在线 {}", self.peers_list.len()));
+            }
+            "PromoteHost" => st.visible = self.net.is_some() && self.room_lost,
+            "PaperSize" => {
+                let page = &self.wb.sheet(self.sheet_idx).page;
+                st.label = Some(if page.paper == 9 {
+                    "纸张：A4".into()
+                } else {
+                    "纸张：Letter".into()
+                });
+            }
+            "PageOrientation" => {
+                let page = &self.wb.sheet(self.sheet_idx).page;
+                st.tip = Some(if page.landscape {
+                    "当前横向，点击改纵向".into()
+                } else {
+                    "当前纵向，点击改横向".into()
+                });
+            }
+            "FitToWidth" => {
+                let p = &self.wb.sheet(self.sheet_idx).page;
+                st.text = Some(if p.fit_width == 0 {
+                    "自动".into()
+                } else {
+                    format!("{} 页", p.fit_width)
+                });
+            }
+            "FitToHeight" => {
+                let p = &self.wb.sheet(self.sheet_idx).page;
+                st.text = Some(if p.fit_height == 0 {
+                    "自动".into()
+                } else {
+                    format!("{} 页", p.fit_height)
+                });
+            }
+            "PageScale" => {
+                let p = self.wb.sheet(self.sheet_idx).page.clone();
+                let pct = if p.fit_to_page {
+                    (p.scale_factor(self.wb.sheet(self.sheet_idx)) * 100.0).round() as i32
+                } else {
+                    p.scale as i32
+                };
+                st.text = Some(format!("{pct}%"));
+                st.enabled = !p.fit_to_page;
+            }
+            "ZoomLevel" => st.text = Some(format!("{:.0}%", self.zoom * 100.0)),
+            "ToggleFileTree" => {
+                st.label = Some(if self.tree_open {
+                    "隐藏文件列表".into()
+                } else {
+                    "显示文件列表".into()
+                })
+            }
+            "InsertWorkbookLinks" | "DataWorkbookLinks" => {
+                let n = self.wb.links.len();
+                if n > 0 {
+                    st.label = Some(format!("链接 {n}"));
+                }
+            }
+            "AreaLabel" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                st.text = Some(format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)));
+            }
+            "ChartTitle" => {
+                if let Some(ch) = self.chart_at_sel() {
+                    st.text = Some(ch.title.clone());
+                } else {
+                    st.visible = false;
+                }
+            }
+            "ChartMeta" => {
+                if let Some(ch) = self.chart_at_sel() {
+                    st.text = Some(format!("{:?} · {} 个系列", ch.kind, ch.series.len()));
+                } else {
+                    st.visible = false;
+                }
+            }
+            "TableName" => {
+                if let Some(t) = self.table_at_sel() {
+                    st.text = Some(format!("表名：{}", t.display));
+                } else {
+                    st.visible = false;
+                }
+            }
+            "TableRange" => {
+                if let Some(t) = self.table_at_sel() {
+                    st.text = Some(format!(
+                        "区域 {}:{}",
+                        cell_name(t.range.0, t.range.1),
+                        cell_name(t.range.2, t.range.3)
+                    ));
+                } else {
+                    st.visible = false;
+                }
+            }
+            _ => {}
+        }
+        if std::env::var("SC_RIBBON_STATE").map(|v| v == id).unwrap_or(false) {
+            let ranges: Vec<_> = self
+                .wb
+                .sheet(self.sheet_idx)
+                .tables
+                .iter()
+                .map(|t| (t.name.clone(), t.range))
+                .collect();
+            eprintln!(
+                "[ribbon] 状态 {id} → {st:?} sel={:?} 图={} 表={ranges:?}",
+                self.sel, self.sheet_idx
+            );
+        }
+        st
+    }
+
+    /// 命令分发：XML 的 onAction → 既有实现。
+    pub fn ribbon_action(&mut self, action: &str, ctx: &egui::Context) {
+        // 下拉项按前缀带值
+        if let Some(code) = action.strip_prefix("fmt:") {
+            let code = code.to_string();
+            self.apply_style(move |s| s.format = code.clone());
+            return;
+        }
+        if let Some(v) = action.strip_prefix("zoom:") {
+            if let Ok(z) = v.parse::<f32>() {
+                self.zoom = z.clamp(0.5, 2.5);
+                ctx.set_zoom_factor(self.zoom);
+            }
+            return;
+        }
+        if let Some(v) = action.strip_prefix("fitw:") {
+            let n: u16 = v.parse().unwrap_or(0);
+            self.set_page(move |p| {
+                p.fit_width = n;
+                p.fit_to_page = p.fit_width > 0 || p.fit_height > 0;
+                if !p.fit_to_page {
+                    p.scale = 100;
+                }
+            });
+            return;
+        }
+        if let Some(v) = action.strip_prefix("fith:") {
+            let n: u16 = v.parse().unwrap_or(0);
+            self.set_page(move |p| {
+                p.fit_height = n;
+                p.fit_to_page = p.fit_width > 0 || p.fit_height > 0;
+                if !p.fit_to_page {
+                    p.scale = 100;
+                }
+            });
+            return;
+        }
+        if let Some(v) = action.strip_prefix("scale:") {
+            let n: u16 = v.parse().unwrap_or(100);
+            self.set_page(move |p| {
+                p.scale = n;
+                p.fit_to_page = false;
+                p.fit_width = 0;
+                p.fit_height = 0;
+            });
+            return;
+        }
+
+        match action {
+            // ---------------------------------------------------- 文件
+            "FileOpen" => self.open(),
+            "FileSave" => self.save(false),
+            "FileSaveAs" => self.save(true),
+            "PrintPreview" => {
+                self.preview_page = 0;
+                self.print_preview = true;
+            }
+            "ExportPdf" => self.export_pdf_dialog(),
+            "VersionHistory" => {
+                if let Some(p) = self.wb.path.clone() {
+                    self.history_view = Some((p.clone(), sheetcore::backup::list(&p)));
+                } else {
+                    self.status = "先保存文件，才有历史版本".into();
+                }
+            }
+            "Undo" => self.do_undo(false),
+            "Redo" => self.do_undo(true),
+            "NewTab" => self.open_in_new_tab(std::path::PathBuf::new()),
+            "OpenInNewTab" => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
+                    .pick_file()
+                {
+                    self.open_in_new_tab(p);
+                }
+            }
+            "CloseTab" => {
+                let idx = self.active_tab;
+                self.close_tab(idx);
+            }
+            "Share" => {
+                if self.net.is_none() {
+                    self.start_host();
+                } else {
+                    self.members_open = true;
+                }
+            }
+            "ShowMembers" => self.members_open = true,
+            "PromoteHost" => self.promote_to_host(),
+            "JoinRoom" => self.join_shared(),
+            "CheckUpdate" => self.check_update(),
+            "RegisterAssociation" => self.register_file_association(false),
+            "SetDefaultApp" => self.register_file_association(true),
+
+            // ---------------------------------------------------- 开始
+            "Paste" => self.clip_paste(false, None),
+            "PasteSpecial" => self.paste_special = true,
+            "Cut" => self.clip_copy(true, ctx),
+            "Copy" => self.clip_copy(false, ctx),
+            "FormatPainter" => {
+                let cur = self.current_style();
+                self.format_painter = Some(cur);
+                self.status = "格式刷：点击目标单元格".into();
+            }
+            "GrowFont" => {
+                let cur = self.current_style();
+                let s2 = (cur.size + 1.0).min(72.0);
+                self.apply_style(move |s| s.size = s2);
+            }
+            "ShrinkFont" => {
+                let cur = self.current_style();
+                let s2 = (cur.size - 1.0).max(6.0);
+                self.apply_style(move |s| s.size = s2);
+            }
+            "Bold" => {
+                let v = !self.current_style().bold;
+                self.apply_style(move |s| s.bold = v);
+            }
+            "Italic" => {
+                let v = !self.current_style().italic;
+                self.apply_style(move |s| s.italic = v);
+            }
+            "Underline" => {
+                let v = !self.current_style().underline;
+                self.apply_style(move |s| s.underline = v);
+            }
+            "BordersAll" => self.apply_style(|s| s.set_all_borders(1, [128, 128, 128])),
+            "BorderBottom" => self.apply_style(|s| {
+                s.border[2] = sheetcore::style::Border {
+                    style: 1,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderTop" => self.apply_style(|s| {
+                s.border[0] = sheetcore::style::Border {
+                    style: 1,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderLeft" => self.apply_style(|s| {
+                s.border[3] = sheetcore::style::Border {
+                    style: 1,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderRight" => self.apply_style(|s| {
+                s.border[1] = sheetcore::style::Border {
+                    style: 1,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderOuter" => self.border_outer(1),
+            "BorderThickOuter" => self.border_outer(2),
+            "BorderThickBottom" => self.apply_style(|s| {
+                s.border[2] = sheetcore::style::Border {
+                    style: 2,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderDoubleBottom" => self.apply_style(|s| {
+                s.border[2] = sheetcore::style::Border {
+                    style: 4,
+                    color: [128, 128, 128],
+                }
+            }),
+            "BorderInsideH" => {
+                let (r1, _c1, r2, _c2) = self.sel_rect();
+                self.apply_style_xy(|s, r, _c| {
+                    if r > r1 && r <= r2 {
+                        s.border[0] = sheetcore::style::Border {
+                            style: 1,
+                            color: [128, 128, 128],
+                        };
+                    }
+                    if r >= r1 && r < r2 {
+                        s.border[2] = sheetcore::style::Border {
+                            style: 1,
+                            color: [128, 128, 128],
+                        };
+                    }
+                });
+            }
+            "BorderInsideV" => {
+                let (_r1, c1, _r2, c2) = self.sel_rect();
+                self.apply_style_xy(|s, _r, c| {
+                    if c > c1 && c <= c2 {
+                        s.border[3] = sheetcore::style::Border {
+                            style: 1,
+                            color: [128, 128, 128],
+                        };
+                    }
+                    if c >= c1 && c < c2 {
+                        s.border[1] = sheetcore::style::Border {
+                            style: 1,
+                            color: [128, 128, 128],
+                        };
+                    }
+                });
+            }
+            "BorderNone" => {
+                self.apply_style(|s| s.border = [sheetcore::style::Border::default(); 4])
+            }
+            "FillColor" => self.color_popup = Some(false),
+            "FontColor" => self.color_popup = Some(true),
+            "ClearFormat" => self.apply_style(|s| {
+                // 保留字体名（中文环境大多是宋体/黑体），其余恢复默认
+                let f = s.font.clone();
+                *s = sheetcore::style::CellStyle {
+                    font: f,
+                    size: 11.0,
+                    color: [0, 0, 0],
+                    ..Default::default()
+                };
+            }),
+            "AlignTop" => self.apply_style(|s| s.valign = 1),
+            "AlignMiddle" => self.apply_style(|s| s.valign = 2),
+            "AlignBottom" => self.apply_style(|s| s.valign = 3),
+            "AlignLeft" => self.apply_style(|s| s.halign = 1),
+            "AlignCenter" => self.apply_style(|s| s.halign = 2),
+            "AlignRight" => self.apply_style(|s| s.halign = 3),
+            "DecreaseIndent" => self.apply_style(|s| s.indent = s.indent.saturating_sub(1)),
+            "IncreaseIndent" => self.apply_style(|s| s.indent = (s.indent + 1).min(15)),
+            "WrapText" => {
+                let v = !self.current_style().wrap;
+                self.apply_style(move |s| s.wrap = v);
+            }
+            "MergeCenter" => {
+                let on = !self.ctl_state("MergeCenter").checked;
+                self.toggle_merge(on);
+                if on {
+                    self.apply_style(|s| s.halign = 2);
+                }
+            }
+            "MergeCells" => self.toggle_merge(true),
+            "UnmergeCells" => self.toggle_merge(false),
+            "CenterAcross" => self.apply_style(|s| s.halign = 2),
+            "NumberFormatApply" => {}
+            "CurrencyStyle" => self.apply_style(|s| s.format = "¥#,##0.00".into()),
+            "PercentStyle" => self.apply_style(|s| s.format = "0.0%".into()),
+            "CommaStyle" => self.apply_style(|s| s.format = "#,##0.00".into()),
+            "IncreaseDecimal" => self.decimals(1),
+            "DecreaseDecimal" => self.decimals(-1),
+            "ConditionalFormatting" => self.cf_mgr = true,
+            "FormatAsTable" => self.make_table(),
+            "CellStyles" => self.fmt_dlg = true,
+            "FormatDialogLauncher" => self.fmt_pending = true,
+            "FormatCellsDialog" => self.fmt_dlg = true,
+            "InsertRow" => {
+                let (r1, _c1, r2, _c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::InsertRows {
+                    at: r1,
+                    n: r2 - r1 + 1,
+                });
+            }
+            "InsertColumn" => {
+                let (_r1, c1, _r2, _c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: 1 });
+            }
+            "InsertCellsDown" => self.shift_cells(true, false),
+            "InsertCellsRight" => self.shift_cells(true, true),
+            "DeleteRow" => {
+                let (r1, _c1, r2, _c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::DeleteRows {
+                    at: r1,
+                    n: r2 - r1 + 1,
+                });
+            }
+            "DeleteColumn" => {
+                let (_r1, c1, _r2, _c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: 1 });
+            }
+            "DeleteCellsUp" => self.shift_cells(false, false),
+            "DeleteCellsLeft" => self.shift_cells(false, true),
+            "RowHeight" => {
+                self.size_dlg = Some((
+                    false,
+                    self.wb.sheet(self.sheet_idx).rows.size(self.sel.0),
+                ))
+            }
+            "ColumnWidth" => {
+                self.size_dlg = Some((
+                    true,
+                    self.wb.sheet(self.sheet_idx).cols.size(self.sel.1),
+                ))
+            }
+            "AutoSum" => self.auto_sum(),
+            "FillDown" => self.fill_down(),
+            "ClearContent" => self.clear_selection(),
+            "SortFilter" => self.start_filter(),
+            "FindReplace" => self.find.open = true,
+
+            // ---------------------------------------------------- 插入
+            "Hyperlink" => {
+                let (r, c) = self.sel;
+                let text = self.wb.sheet(self.sheet_idx).value(r, c).display();
+                self.hyper_dlg = Some((String::new(), text));
+            }
+            "ColumnChart" => self.insert_chart_from_selection(),
+            "ChartManager" => {
+                self.chart_mgr = true;
+                self.reload_charts();
+            }
+            "InsertPivot" => {
+                let (r, c) = self.sel;
+                let (r1, c1, r2, c2) =
+                    sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+                if c2 <= c1 || r2 <= r1 {
+                    self.status = "当前区域太小，选一个带表头的表格".into();
+                } else {
+                    self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
+                        source: (r1, c1, r2, c2),
+                        row_field: c1,
+                        col_field: None,
+                        value_field: c2,
+                        agg: sheetcore::pivot::Agg::Sum,
+                        group: sheetcore::pivot::GroupBy::None,
+                        exclude: Vec::new(),
+                    });
+                }
+            }
+            "InsertPicture" => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("图片", &["png", "jpg", "jpeg", "gif", "bmp"])
+                    .pick_file()
+                {
+                    match (self.wb.path.clone(), std::fs::read(&p)) {
+                        (Some(out), Ok(bytes)) => {
+                            let ext = p
+                                .extension()
+                                .map(|e| e.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "png".into());
+                            let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+                            let (r, c) = self.sel;
+                            match sheetcore::pic_write::insert_picture(
+                                &out, &sheet_name, &bytes, &ext, c, r,
+                            ) {
+                                Ok(_) => {
+                                    if let Some(list) =
+                                        sheetcore::pic::load(&out).remove(&sheet_name)
+                                    {
+                                        self.wb.sheet_mut(self.sheet_idx).pictures = list;
+                                    }
+                                    self.status = "已插入图片".into();
+                                }
+                                Err(e) => self.status = format!("插入图片失败：{e:#}"),
+                            }
+                        }
+                        (None, _) => self.status = "请先保存文件，再插入图片".into(),
+                        (_, Err(e)) => self.status = format!("读图片失败：{e}"),
+                    }
+                }
+            }
+            "InsertTable" => self.make_table(),
+            "InsertComment" | "NewComment" => {
+                let (r, c) = self.sel;
+                let cur = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .notes
+                    .get(&sheetcore::model::CellRef::new(r, c))
+                    .map(|n| n.text.clone())
+                    .unwrap_or_default();
+                self.note_edit = Some((r, c, cur));
+            }
+            "InsertSymbol" => self.symbol_dlg = true,
+            "RefreshPivot" => self.refresh_pivot(),
+            "PivotOptions" => {
+                if let Some((_, spec, _)) = self.pivot_last.clone() {
+                    self.pivot_edit = Some(spec);
+                } else {
+                    self.status = "先选中数据区域再新建透视表".into();
+                }
+            }
+            "WorkbookLinks" => self.xlink_dlg = true,
+
+            // ---------------------------------------------------- 页面布局
+            "PageOrientation" => self.set_page(|p| p.landscape = !p.landscape),
+            "PaperSize" => self.set_page(|p| p.paper = if p.paper == 9 { 1 } else { 9 }),
+            "PageMargins" => {
+                let page = self.wb.sheet(self.sheet_idx).page.clone();
+                let narrow = page.margins[0] < 0.5;
+                let wide = page.margins[0] > 0.9;
+                self.set_page(move |p| {
+                    let m = if narrow {
+                        [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]
+                    } else if wide {
+                        [0.7, 0.7, 0.75, 0.75, 0.3, 0.3]
+                    } else {
+                        [0.25, 0.25, 0.75, 0.75, 0.3, 0.3]
+                    };
+                    p.margins = m;
+                });
+            }
+            "TogglePrintGridlines" => {
+                let v = !self.wb.sheet(self.sheet_idx).page.gridlines;
+                self.set_page(move |p| p.gridlines = v);
+            }
+            "TogglePrintHeadings" => {
+                let v = !self.wb.sheet(self.sheet_idx).page.headings;
+                self.set_page(move |p| p.headings = v);
+            }
+
+            // ---------------------------------------------------- 公式
+            "InsertFunction" => {
+                self.begin_edit(None);
+                if let Some(ed) = self.editing.as_mut() {
+                    if !ed.buf.starts_with('=') {
+                        ed.buf.insert(0, '=');
+                    }
+                }
+            }
+            "TracePrecedents" => self.trace_precedents(),
+            "TraceDependents" => self.trace_dependents(),
+            "RemoveArrows" => {
+                self.trace_arrows.clear();
+                self.status = "已移去追踪箭头".into();
+            }
+            "ShowFormulas" => self.show_formulas = !self.show_formulas,
+            "ErrorChecking" => self.open_error_check(),
+            "CalculateNow" => self.recalc_all_async(),
+            "NameManager" => self.name_mgr = true,
+
+            // ---------------------------------------------------- 数据
+            "GoalSeek" => {
+                let (r, c) = self.sel;
+                self.goal_target = cell_name(r, c);
+                self.goal_goal = self
+                    .cell_num(r, c)
+                    .map(|v| format!("{v}"))
+                    .unwrap_or_default();
+                self.goal_input.clear();
+                self.goal_msg.clear();
+                self.goal_dlg = true;
+            }
+            "DataTable" => {
+                self.dtable_row.clear();
+                self.dtable_col.clear();
+                self.dtable_msg.clear();
+                self.dtable_dlg = true;
+            }
+            "ScenarioManager" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                self.scen_range = if r1 == r2 && c1 == c2 {
+                    cell_name(r1, c1)
+                } else {
+                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                };
+                self.scen_name.clear();
+                self.scen_comment.clear();
+                self.scen_result.clear();
+                self.scen_msg.clear();
+                self.scen_sel = None;
+                self.scen_dlg = true;
+            }
+            "GroupSelection" => self.group_selection(),
+            "UngroupSelection" => self.ungroup_selection(),
+            "OutlineSettings" => self.outline_set_dlg = true,
+            "HideDetail" => self.toggle_detail(true),
+            "ShowDetail" => self.toggle_detail(false),
+            "ImportCsv" => self.import_csv(),
+            "ImportWorkbook" => self.import_workbook(),
+            "LinkSheet" => self.link_dlg = Some(String::new()),
+            "TextToColumns" => self.open_data_dlg(1),
+            "RefreshImport" => self.refresh_import(),
+            "SortAscending" => {
+                let c = self.sel.1;
+                self.do_sort(c, true);
+            }
+            "SortDescending" => {
+                let c = self.sel.1;
+                self.do_sort(c, false);
+            }
+            "Filter" => self.start_filter(),
+            "MultiSort" => self.open_data_dlg(0),
+            "RemoveDuplicates" => self.run_dedup(),
+            "CFManager" => self.cf_mgr = true,
+
+            // ---------------------------------------------------- 审阅
+            "Spelling" => self.open_proof(),
+            "ConvertTraditional" | "ToGeneric" => {
+                self.zh_convert(true, sheetcore::zhconv::Variant::Generic)
+            }
+            "ToTaiwan" => self.zh_convert(true, sheetcore::zhconv::Variant::Taiwan),
+            "ToHongKong" => self.zh_convert(true, sheetcore::zhconv::Variant::HongKong),
+            "ZhPreview" => {
+                self.zh_preview_variant = sheetcore::zhconv::Variant::Generic;
+                self.zh_preview_scan();
+                self.zh_preview_dlg = true;
+            }
+            "ConvertSimplified" => {
+                self.zh_convert(false, sheetcore::zhconv::Variant::Generic)
+            }
+            "RichText" => {
+                let (r, c) = self.sel;
+                let runs = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .rich
+                    .get(&(r, c))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let t = self.wb.sheet(self.sheet_idx).value(r, c).display();
+                        vec![sheetcore::richtext::RichRun::plain(t)]
+                    });
+                self.rich_dlg = Some(crate::RichDlg {
+                    r,
+                    c,
+                    runs,
+                    sel: (0, 0),
+                    color: [0, 0, 0],
+                    size: 0.0,
+                });
+            }
+            "ProtectSheet" => {
+                if self.wb.sheet(self.sheet_idx).protection.is_some() {
+                    self.protect_dlg = Some(crate::ProtectDlg {
+                        unprotect: true,
+                        ..Default::default()
+                    });
+                } else {
+                    self.protect_dlg = Some(crate::ProtectDlg::default());
+                }
+            }
+            "TrackChanges" => self.rev_open = true,
+            "AutoShare" => self.auto_share = !self.auto_share,
+
+            // ---------------------------------------------------- 视图
+            "ShowGridlines" => self.show_gridlines = !self.show_gridlines,
+            "ShowHeadings" => self.show_headings = !self.show_headings,
+            "ShowFormulaBar" => self.show_formula_bar = !self.show_formula_bar,
+            "TextSpill" => self.text_spill = !self.text_spill,
+            "Zoom100" => {
+                self.zoom = 1.0;
+                ctx.set_zoom_factor(1.0);
+            }
+            "ToggleFileTree" => self.tree_open = !self.tree_open,
+            "ZoomIn" => {
+                self.zoom = (self.zoom + 0.1).min(2.5);
+                ctx.set_zoom_factor(self.zoom);
+            }
+            "ZoomOut" => {
+                self.zoom = (self.zoom - 0.1).max(0.5);
+                ctx.set_zoom_factor(self.zoom);
+            }
+            "FreezeTopRow" => {
+                let on = self.wb.sheet(self.sheet_idx).freeze == Some((1, 0));
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.freeze = if on { None } else { Some((1, 0)) };
+                sh.freeze_dirty = true;
+                self.wb.dirty = true;
+            }
+            "FreezeFirstColumn" => {
+                let on = self.wb.sheet(self.sheet_idx).freeze == Some((0, 1));
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.freeze = if on { None } else { Some((0, 1)) };
+                sh.freeze_dirty = true;
+                self.wb.dirty = true;
+            }
+            "Unfreeze" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.freeze = None;
+                sh.freeze_dirty = true;
+                self.wb.dirty = true;
+            }
+            "NormalView" => {
+                self.view_mode = 0;
+                self.scroll = egui::Vec2::ZERO;
+            }
+            "PageLayoutView" => {
+                self.view_mode = 1;
+                self.scroll = egui::Vec2::ZERO;
+            }
+            "PageBreakPreview" => {
+                self.view_mode = 2;
+                self.scroll = egui::Vec2::ZERO;
+            }
+
+            // ---------------------------------------------------- 帮助
+            "Help" | "About" => self.about_open = true,
+
+            // ---------------------------------------------------- 表设计
+            "TableSelect" => {
+                if let Some(t) = self.table_at_sel() {
+                    self.sel = (t.range.0, t.range.1);
+                    self.sel_end = (t.range.2, t.range.3);
+                    self.status = format!("已选中表格 {}", t.display);
+                }
+            }
+            "TableToRange" => {
+                if let Some(t) = self.table_at_sel() {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.tables.retain(|x| x.name != t.name);
+                    sh.tables_dirty = true;
+                    self.wb.dirty = true;
+                    self.ribbon_tab = 1;
+                    self.status = "已转换为普通区域".into();
+                }
+            }
+            "ToggleTotals" => {
+                if let Some(t) = self.table_at_sel() {
+                    self.toggle_totals_row(&t.name);
+                }
+            }
+
+            // ---------------------------------------------------- 图表工具
+            "ChartEdit" => {
+                if let Some(ch) = self.chart_at_sel() {
+                    self.chart_edit = Some(ch);
+                }
+            }
+
+            // 其余（字体/字号/下拉里带值的项）已在上面处理
+            _ => {
+                if std::env::var("SC_RIBBON_LOG").is_ok() {
+                    eprintln!("[ribbon] 未实现的命令：{action}");
+                }
+            }
+        }
+        let _ = Size::Normal;
+    }
+}

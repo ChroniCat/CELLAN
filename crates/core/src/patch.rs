@@ -685,15 +685,49 @@ pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
         crate::model::col_label(c2),
         r2 + 1
     );
-    let mut cols: Vec<&u32> = f.allows.keys().collect();
+    let mut cols: Vec<u32> = f.allows.keys().copied().collect();
+    for c in f.criteria.keys() {
+        if !cols.contains(c) {
+            cols.push(*c);
+        }
+    }
     cols.sort();
     for col in cols {
-        if *col < c1 || *col > c2 {
+        if col < c1 || col > c2 {
             continue;
         }
         let col_id = col - c1;
+        if let Some(crit) = f.criteria.get(&col) {
+            // 条件筛选：介于写成两条 and="1"
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><customFilters and=\"1\">"
+            ));
+            match crit.op {
+                crate::sort_filter::CmpOp::Between => {
+                    let hi = crit.val2.clone().unwrap_or_default();
+                    out.push_str(&format!(
+                        "<customFilter operator=\"greaterThanOrEqual\" val=\"{}\"/>",
+                        esc(&crit.val)
+                    ));
+                    out.push_str(&format!(
+                        "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
+                        esc(&hi)
+                    ));
+                }
+                op => out.push_str(&format!(
+                    "<customFilter operator=\"{}\" val=\"{}\"/>",
+                    op.xml_operator(),
+                    esc(&crit.val)
+                )),
+            }
+            out.push_str("</customFilters></filterColumn>");
+            continue;
+        }
+        let Some(set) = f.allows.get(&col) else {
+            continue;
+        };
         out.push_str(&format!("<filterColumn colId=\"{col_id}\"><filters>"));
-        let mut vals: Vec<&String> = f.allows[col].iter().collect();
+        let mut vals: Vec<&String> = set.iter().collect();
         vals.sort();
         for v in vals {
             out.push_str(&format!("<filter val=\"{}\"/>", esc(v)));
