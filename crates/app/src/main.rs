@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.59";
+const APP_VERSION: &str = "1.60";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -486,7 +486,10 @@ struct SheetApp {
     ec_options: bool,
     /// 简繁转换预览
     zh_preview_dlg: bool,
-    zh_preview: Vec<(u32, u32, String, String)>,
+    /// (表序号, 行, 列, 原值, 新值)
+    zh_preview: Vec<(usize, u32, u32, String, String)>,
+    /// 预览范围：整簿 or 当前选区
+    zh_preview_all_sheets: bool,
     zh_preview_variant: sheetcore::zhconv::Variant,
     /// 分级显示设置对话框
     outline_set_dlg: bool,
@@ -494,6 +497,8 @@ struct SheetApp {
     proof_dlg: bool,
     proof_list: Vec<sheetcore::proof::ProofIssue>,
     proof_rules: sheetcore::proof::ProofRules,
+    /// 校对范围：false=整表，true=只查选区
+    proof_only_sel: bool,
     /// 绿三角缓存（按 doc_gen 失效）
     error_marks: std::collections::HashSet<(u32, u32)>,
     /// 循环引用的格子（当前表），状态栏提示用
@@ -820,11 +825,13 @@ impl SheetApp {
             ec_options: false,
             zh_preview_dlg: false,
             zh_preview: Vec::new(),
+            zh_preview_all_sheets: false,
             zh_preview_variant: sheetcore::zhconv::Variant::Generic,
             outline_set_dlg: false,
             proof_dlg: false,
             proof_list: Vec::new(),
             proof_rules: sheetcore::proof::ProofRules::default(),
+            proof_only_sel: false,
             error_marks: std::collections::HashSet::new(),
             cycles: Vec::new(),
             cycles_key: (u64::MAX, u64::MAX),
@@ -1442,6 +1449,8 @@ impl SheetApp {
                                     self.sel_end = s1;
                                 }
                             }
+                            self.zh_preview_all_sheets =
+                                std::env::var("SC_ZH_ALL").map(|v| v == "1").unwrap_or(false);
                             self.zh_preview_variant = match std::env::var("SC_ZH_VARIANT")
                                 .unwrap_or_default()
                                 .as_str()
@@ -1453,6 +1462,22 @@ impl SheetApp {
                             self.zh_preview_scan();
                             self.zh_preview_dlg = true;
                             eprintln!("[zhpreview] diffs={}", self.zh_preview.len());
+                        }
+                        Ok("level") => {
+                            if let Ok(spec) = std::env::var("SC_LEVEL") {
+                                let axis = spec.chars().next().unwrap_or('r');
+                                let k: u8 = spec[1..].trim().parse().unwrap_or(1);
+                                self.set_outline_level(axis != 'c', k);
+                                eprintln!("[level] {} -> {}", spec, self.status);
+                                let sh = self.wb.sheet(self.sheet_idx);
+                                let mut v: Vec<u32> =
+                                    sh.hidden_rows_user.iter().copied().collect();
+                                v.sort();
+                                let mut w: Vec<u32> =
+                                    sh.hidden_cols.iter().copied().collect();
+                                w.sort();
+                                eprintln!("[level] hidden_rows={v:?} hidden_cols={w:?}");
+                            }
                         }
                         Ok("outline_set") => {
                             self.outline_set_dlg = true;
@@ -5322,11 +5347,15 @@ impl SheetApp {
 
     /// 算一遍简转繁的差异（不动数据），供预览对话框显示
     fn zh_preview_scan(&mut self) {
-        let (r1, c1, r2, c2) = self.sel_rect();
+        let v = self.zh_preview_variant;
         let mut rows = Vec::new();
-        if (r2 - r1) as u64 * (c2 - c1) as u64 <= 200_000 {
-            let v = self.zh_preview_variant;
-            let sh = self.wb.sheet(self.sheet_idx);
+        let scan_sheet = |si: usize,
+                          r1: u32,
+                          c1: u32,
+                          r2: u32,
+                          c2: u32,
+                          out: &mut Vec<(usize, u32, u32, String, String)>| {
+            let sh = self.wb.sheet(si);
             for r in r1..=r2 {
                 for c in c1..=c2 {
                     let Some(cell) = sh.get(r, c) else { continue };
@@ -5335,12 +5364,69 @@ impl SheetApp {
                     };
                     let new = sheetcore::zhconv::to_traditional_with(t, v);
                     if new.as_str() != t.as_ref() {
-                        rows.push((r, c, t.to_string(), new));
+                        out.push((si, r, c, t.to_string(), new));
                     }
                 }
             }
+        };
+        if self.zh_preview_all_sheets {
+            for si in 0..self.wb.sheets.len() {
+                let bounds = self.wb.sheet(si).used_bounds();
+                if let Some((r1, c1, r2, c2)) = bounds {
+                    if (r2 - r1) as u64 * (c2 - c1) as u64 <= 400_000 {
+                        scan_sheet(si, r1, c1, r2, c2, &mut rows);
+                    }
+                }
+                if rows.len() > 5000 {
+                    break;
+                }
+            }
+        } else {
+            let (r1, c1, r2, c2) = self.sel_rect();
+            if (r2 - r1) as u64 * (c2 - c1) as u64 <= 200_000 {
+                scan_sheet(self.sheet_idx, r1, c1, r2, c2, &mut rows);
+            }
         }
         self.zh_preview = rows;
+    }
+
+    /// 按预览列表逐条写入（跨表也用这个，一个撤销事务）
+    fn zh_apply_preview(&mut self) {
+        if self.edit_blocked() || self.zh_preview.is_empty() {
+            return;
+        }
+        let v = self.zh_preview_variant;
+        let items = self.zh_preview.clone();
+        let cur = self.sheet_idx;
+        let txn = self.txn_begin(&[(0, 0)]);
+        let mut n = 0usize;
+        let mut touched: Vec<usize> = Vec::new();
+        for (si, r, c, old, _new) in items {
+            let sh = self.wb.sheet_mut(si);
+            let Some(cell) = sh.get(r, c).cloned() else {
+                continue;
+            };
+            let sheetcore::model::Value::Text(t) = &cell.value else {
+                continue;
+            };
+            if t.as_ref() != old.as_str() {
+                continue;
+            }
+            let new = sheetcore::zhconv::to_traditional_with(t, v);
+            let mut cell = cell;
+            cell.value = sheetcore::model::Value::Text(new.into());
+            sh.set(r, c, cell);
+            n += 1;
+            if !touched.contains(&si) {
+                touched.push(si);
+            }
+        }
+        self.sheet_idx = cur;
+        self.txn_end("简转繁", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("简转繁：{n} 个单元格（{} 张表）", touched.len());
+        self.zh_preview_dlg = false;
     }
 
     fn zh_preview_window(&mut self, ctx: &egui::Context) {
@@ -5354,6 +5440,13 @@ impl SheetApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.zh_preview_all_sheets, "所有工作表")
+                        .changed()
+                    {
+                        variant_changed = true;
+                    }
+                    ui.separator();
                     ui.label("目标:");
                     variant_changed |= ui
                         .radio_value(
@@ -5380,7 +5473,12 @@ impl SheetApp {
                 ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "选区内 {} 个单元格会被改动（只列有差异的）",
+                        "{} {} 个单元格会被改动（只列有差异的）",
+                        if self.zh_preview_all_sheets {
+                            "整簿内"
+                        } else {
+                            "选区内"
+                        },
                         self.zh_preview.len()
                     ))
                     .size(11.5)
@@ -5391,13 +5489,20 @@ impl SheetApp {
                     if self.zh_preview.is_empty() {
                         ui.label(egui::RichText::new("选区里没有需要转换的内容。").size(12.0));
                     }
-                    for (r, c, old, new) in self.zh_preview.clone() {
+                    for (si, r, c, old, new) in self.zh_preview.clone() {
                         ui.horizontal(|ui| {
+                            let addr = if self.zh_preview_all_sheets {
+                                let name = self.wb.sheet(si).name.clone();
+                                format!("{name}!{}", cell_name(r, c))
+                            } else {
+                                cell_name(r, c)
+                            };
                             ui.add_sized(
-                                [60.0, 20.0],
+                                [110.0, 20.0],
                                 egui::Label::new(
-                                    egui::RichText::new(cell_name(r, c)).size(11.5).monospace(),
-                                ),
+                                    egui::RichText::new(addr).size(11.5).monospace(),
+                                )
+                                .truncate(),
                             );
                             ui.add_sized(
                                 [220.0, 20.0],
@@ -5433,9 +5538,7 @@ impl SheetApp {
             self.zh_preview_scan();
         }
         if apply {
-            let v = self.zh_preview_variant;
-            self.zh_convert(true, v);
-            self.zh_preview_dlg = false;
+            self.zh_apply_preview();
         }
         if !open {
             self.zh_preview_dlg = false;
@@ -5484,8 +5587,62 @@ impl SheetApp {
         self.txn_end("校对修正", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.proof_list = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        self.proof_rescan();
         self.status = format!("校对修正：{n} 个单元格");
+    }
+
+    /// 收/展到第 k 级（Excel 左上角 1/2/3 按钮的语义）：级别 > k 的藏起来，≤ k 的露出来
+    fn set_outline_level(&mut self, is_rows: bool, k: u8) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (levels, n_hidden) = {
+            let sh = self.wb.sheet(self.sheet_idx);
+            let map = if is_rows {
+                sh.row_levels.clone()
+            } else {
+                sh.col_levels.clone()
+            };
+            let mut hidden: Vec<u32> = Vec::new();
+            for (idx, lv) in map.iter() {
+                if *lv > k {
+                    hidden.push(*idx);
+                }
+            }
+            (map, hidden)
+        };
+        if levels.is_empty() {
+            return;
+        }
+        let mut txn = Vec::new();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let hid = if is_rows {
+                &mut sh.hidden_rows_user
+            } else {
+                &mut sh.hidden_cols
+            };
+            for idx in levels.keys() {
+                hid.remove(idx);
+            }
+            for idx in &n_hidden {
+                hid.insert(*idx);
+                txn.push(if is_rows {
+                    (*idx, None)
+                } else {
+                    (0, Some(*idx))
+                });
+            }
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        for _ in txn {}
+        self.status = format!(
+            "{}分级显示：显示到第 {k} 级（隐藏 {} {}）",
+            if is_rows { "行" } else { "列" },
+            n_hidden.len(),
+            if is_rows { "行" } else { "列" }
+        );
     }
 
     /// 分级显示设置：明细位置（上/下、左/右）+ 是否显示分级符号
@@ -5542,8 +5699,22 @@ impl SheetApp {
         }
     }
 
+    /// 按当前范围重扫：整表或选区
+    fn proof_rescan(&mut self) {
+        let all = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        if self.proof_only_sel {
+            let (r1, c1, r2, c2) = self.sel_rect();
+            self.proof_list = all
+                .into_iter()
+                .filter(|i| i.row >= r1 && i.row <= r2 && i.col >= c1 && i.col <= c2)
+                .collect();
+        } else {
+            self.proof_list = all;
+        }
+    }
+
     fn open_proof(&mut self) {
-        self.proof_list = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        self.proof_rescan();
         self.proof_dlg = true;
         self.status = if self.proof_list.is_empty() {
             "没有发现排版问题".into()
@@ -5565,6 +5736,11 @@ impl SheetApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    changed |= ui
+                        .checkbox(&mut self.proof_only_sel, "只查选区")
+                        .on_hover_text("不勾就查整张表")
+                        .changed();
+                    ui.separator();
                     changed |= ui
                         .checkbox(&mut self.proof_rules.double_space, "多个空格")
                         .changed();
@@ -5646,8 +5822,7 @@ impl SheetApp {
                         fix_one = true;
                     }
                     if ui.button("重新检查").clicked() {
-                        self.proof_list =
-                            sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+                        self.proof_rescan();
                     }
                     if ui_kit::primary_button(ui, "关闭").clicked() {
                         self.proof_dlg = false;
@@ -13802,6 +13977,64 @@ impl SheetApp {
                 [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
                 grid_stroke,
             );
+        }
+        // 左上角：分级显示的级别按钮（Excel 那里是 1/2/3），横向排行级别、竖向排列级别
+        if self.show_headings && (row_depth > 0.0 || col_depth > 0.0) {
+            let corner = Rect::from_min_size(origin, Vec2::new(head_w, hh));
+            painter.rect_filled(corner, 0.0, ui_kit::HEADER_BG);
+            let bs = 12.0;
+            let mut hit: Option<(bool, u8)> = None;
+            let mut draw_btn = |rect: Rect, n: u8, key: (&'static str, bool, u8)| {
+                let id = egui::Id::new(("ol_lvl", key.1, key.2));
+                let resp = ui.interact(rect, id, Sense::click());
+                let bg = if resp.hovered() {
+                    ui_kit::HOVER
+                } else {
+                    egui::Color32::WHITE
+                };
+                painter.rect_filled(rect, 1.0, bg);
+                painter.rect_stroke(
+                    rect,
+                    1.0,
+                    Stroke::new(1.0, ui_kit::HEAD_LINE),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    n.to_string(),
+                    egui::FontId::proportional(9.5),
+                    ui_kit::TEXT,
+                );
+                if resp.clicked() {
+                    hit = Some((key.1, key.2));
+                }
+            };
+            for i in 0..row_depth as u8 {
+                let x = origin.x + 2.0 + i as f32 * (bs + 1.0);
+                let y = origin.y + hh - bs - 2.0;
+                if x + bs <= origin.x + head_w {
+                    draw_btn(
+                        Rect::from_min_size(egui::pos2(x, y), Vec2::splat(bs)),
+                        i + 1,
+                        ("r", true, i + 1),
+                    );
+                }
+            }
+            for i in 0..col_depth as u8 {
+                let x = origin.x + head_w - bs - 2.0;
+                let y = origin.y + 2.0 + i as f32 * (bs + 1.0);
+                if y + bs <= origin.y + hh {
+                    draw_btn(
+                        Rect::from_min_size(egui::pos2(x, y), Vec2::splat(bs)),
+                        i + 1,
+                        ("c", false, i + 1),
+                    );
+                }
+            }
+            if let Some((is_rows, k)) = hit {
+                self.set_outline_level(is_rows, k);
+            }
         }
         let mut r = first_row;
         let groups = self.row_groups();
