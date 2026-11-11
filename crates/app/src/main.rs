@@ -18189,6 +18189,19 @@ impl eframe::App for SheetApp {
             }
         }
         self.defer_close_while_saving(ctx, was_saving);
+        // 无系统装饰，自绘 1 物理像素外边框
+        let ppp = ctx.pixels_per_point();
+        let screen = ctx.screen_rect();
+        let p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("app_outer_border"),
+        ));
+        p.rect_stroke(
+            screen.shrink(0.5 / ppp),
+            0.0,
+            egui::Stroke::new(1.0 / ppp, egui::Color32::from_rgb(160, 158, 156)),
+            egui::StrokeKind::Inside,
+        );
     }
 }
 
