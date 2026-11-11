@@ -7030,12 +7030,11 @@ impl SheetApp {
         let mut apply = false;
         let mut close = false;
         ui_kit::window(ctx, "插入超链接", 380.0).open(&mut open).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("地址");
+            dlg_section(ui, "链接");
+            ui_kit::field(ui, "地址", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut url).desired_width(260.0));
             });
-            ui.horizontal(|ui| {
-                ui.label("显示");
+            ui_kit::field(ui, "显示文字", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).desired_width(260.0));
             });
             if !self.link_err.is_empty() {
