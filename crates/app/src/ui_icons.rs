@@ -73,6 +73,8 @@ pub enum Icon {
     IndentInc,
     /// 减少缩进
     IndentDec,
+    /// 符号（Ω）
+    Symbol,
 }
 
 // ---------------------------------------------------------------- 色板
@@ -710,6 +712,7 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
         }
         Fx => pen.text("fx", 12.0, 12.0, 13.0, GRAY_D),
         Sum => pen.text("Σ", 15.0, 12.0, 12.2, GREEN_D),
+        Symbol => pen.text("Ω", 15.0, 12.0, 12.2, BLUE_D),
         Calc => {
             pen.rrs(
                 4.0,

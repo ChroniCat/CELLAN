@@ -36,7 +36,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.50";
+const APP_VERSION: &str = "1.51";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -357,6 +357,8 @@ struct SheetApp {
     show_formula_bar: bool,
     /// 关于窗口
     about_open: bool,
+    /// 符号对话框
+    symbol_dlg: bool,
     /// 工作表标签条的横向滚动量
     tab_scroll: f32,
     /// 拖表头边界改列宽：(列, 按下时的鼠标 x, 按下时的宽度)
@@ -429,6 +431,11 @@ struct SheetApp {
     shot_sent: bool,
     /// 标签拖拽排序
     tab_drag: Option<usize>,
+    /// 字体/字号框的编辑缓冲（Excel 的这两个框可以直接打字）
+    font_buf: String,
+    size_buf: String,
+    font_menu: bool,
+    size_menu: bool,
     /// 名称框
     name_buf: String,
     name_edit: bool,
@@ -646,6 +653,7 @@ impl SheetApp {
             show_headings: std::env::var("SC_VIEW_OFF").is_err(),
             show_formula_bar: true,
             about_open: false,
+            symbol_dlg: false,
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
             head_menu: None,
@@ -694,6 +702,10 @@ impl SheetApp {
             shot_sent: false,
             tab_drag: None,
             name_buf: String::new(),
+            font_buf: String::new(),
+            size_buf: String::new(),
+            font_menu: false,
+            size_menu: false,
             name_edit: false,
             rename_sheet: None,
             fill_drag: None,
@@ -1117,6 +1129,7 @@ impl SheetApp {
                             self.reload_charts();
                         }
                         Ok("about") => self.about_open = true,
+                        Ok("symbol") => self.symbol_dlg = true,
                         _ => {}
                     }
                     // 无界面验收：SC_REV_REVERT=N 撤回倒数第 N 条修订
@@ -2264,7 +2277,8 @@ impl SheetApp {
                 };
                 for r in (r1 + 1)..=r2 {
                     let mut cell = src.clone();
-                    if let Some(f) = &src.formula {
+                    if let Some(f) = &src.formula {
+
                         cell.formula = Some(sheetcore::cf::shift_formula(f, r - r1, 0).into());
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
@@ -2277,7 +2291,8 @@ impl SheetApp {
                 };
                 for c in (c1 + 1)..=c2 {
                     let mut cell = src.clone();
-                    if let Some(f) = &src.formula {
+                    if let Some(f) = &src.formula {
+
                         cell.formula = Some(sheetcore::cf::shift_formula(f, 0, c - c1).into());
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
@@ -5196,74 +5211,177 @@ impl SheetApp {
     }
 
     /// 关于窗口：版本、协作方式、常用快捷键、许可
-    fn about_window(&mut self, ctx: &egui::Context) {
-        if !self.about_open {
-            return;
-        }
-        let mut open = true;
-        ui_kit::window(ctx, "关于 Sheets Native", 520.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Sheets Native").size(20.0).color(ui_kit::TEXT));
-                ui.label(
-                    egui::RichText::new(format!("版本 {}（内部测试版）", APP_VERSION))
-                        .size(11.5)
-                        .color(ui_kit::TEXT_WEAK),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "单个原生应用：打开、编辑、保存 .xlsx/.xlsm/.xls/.csv；协作走共享盘或局域网，不需要服务器；同一单元格同一时间只允许一人编辑。",
-                        )
-                        .size(12.0),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("常用快捷键").size(12.5).strong());
-                for (k, v) in [
-                    ("Ctrl+S / Ctrl+Shift+S", "保存 / 另存为"),
-                    ("Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴"),
-                    ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
-                    ("Ctrl+B / Ctrl+I / Ctrl+U", "加粗 / 斜体 / 下划线"),
-                    ("Ctrl+1", "设置单元格格式"),
-                    ("Ctrl+F", "查找与替换"),
-                    ("Alt", "显示页签快捷键提示"),
-                    ("Ctrl+滚轮", "缩放"),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(170.0, 18.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(egui::RichText::new(k).size(11.5).monospace());
-                            },
-                        );
-                        ui.label(egui::RichText::new(v).size(11.5));
-                    });
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "内嵌字体为 SIL OFL 1.1；第三方依赖许可见随包的 THIRD_PARTY_NOTICES.txt。",
-                        )
-                        .size(11.0)
-                        .color(ui_kit::TEXT_WEAK),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(6.0);
-            });
-        if !open {
-            self.about_open = false;
-        }
-    }
-
+    /// 把一个符号插进当前编辑框；没在编辑就先进入编辑、接在原内容后面
+    fn insert_symbol(&mut self, ch: char) {
+        if let Some(e) = self.editing.as_mut() {
+            e.buf.push(ch);
+            return;
+        }
+        let (r, c) = self.sel;
+        let mut buf = self.wb.sheet(self.sheet_idx).value(r, c).display();
+        buf.push(ch);
+        self.editing = Some(EditState { buf });
+    }
+
+    fn symbol_window(&mut self, ctx: &egui::Context) {
+        if !self.symbol_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut insert: Option<char> = None;
+        ui_kit::window(ctx, "符号", 430.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("点一个符号就插到当前单元格")
+                        .size(11.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(4.0);
+                let cats: [(&str, &[&str]); 6] = [
+                    (
+                        "常用",
+                        &[
+                            "×", "÷", "±", "≈", "≠", "≤", "≥", "∞", "√", "∑",
+                            "∏", "∫", "°", "′", "″", "℃", "¥", "$", "€", "£",
+                            "‰", "§", "¶", "※",
+                        ],
+                    ),
+                    (
+                        "箭头",
+                        &[
+                            "←", "↑", "→", "↓", "↔", "↕", "⇐", "⇒",
+                            "⇔", "▲", "▼", "◀", "▶", "△", "▽",
+                        ],
+                    ),
+                    (
+                        "数学",
+                        &[
+                            "∀", "∂", "∃", "∅", "∇", "∈", "∉", "∋", "∝", "∠",
+                            "⊥", "∥", "∩", "∪", "⊂", "⊃", "⊆", "⊇", "⊕", "⊗",
+                        ],
+                    ),
+                    (
+                        "希腊",
+                        &[
+                            "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ",
+                            "λ", "μ", "ν", "ξ", "π", "ρ", "σ", "τ", "υ", "φ",
+                            "χ", "ψ", "ω", "Δ", "Ω", "Σ", "Π", "Λ", "Θ", "Φ",
+                        ],
+                    ),
+                    (
+                        "图形",
+                        &[
+                            "●", "○", "◆", "◇", "■", "□", "★", "☆", "♀", "♂",
+                            "♪", "♫", "♠", "♣", "♥", "♦", "✓", "✗",
+                        ],
+                    ),
+                    (
+                        "编号",
+                        &[
+                            "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+                            "Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "½", "¼", "¾",
+                        ],
+                    ),
+                ];
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (name, list) in cats {
+                        ui.label(egui::RichText::new(name).size(12.0).strong());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                            for sy in list {
+                                if ui
+                                    .add_sized(
+                                        [26.0, 26.0],
+                                        egui::Button::new(egui::RichText::new(*sy).size(14.0)),
+                                    )
+                                    .on_hover_text(*sy)
+                                    .clicked()
+                                {
+                                    insert = sy.chars().next();
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+                });
+            });
+        if let Some(ch) = insert {
+            self.insert_symbol(ch);
+            self.status = format!("已插入 {ch}");
+        }
+        if !open {
+            self.symbol_dlg = false;
+        }
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        ui_kit::window(ctx, "关于 Sheets Native", 520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Sheets Native").size(20.0).color(ui_kit::TEXT));
+                ui.label(
+                    egui::RichText::new(format!("版本 {}（内部测试版）", APP_VERSION))
+                        .size(11.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "单个原生应用：打开、编辑、保存 .xlsx/.xlsm/.xls/.csv；协作走共享盘或局域网，不需要服务器；同一单元格同一时间只允许一人编辑。",
+                        )
+                        .size(12.0),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("常用快捷键").size(12.5).strong());
+                for (k, v) in [
+                    ("Ctrl+S / Ctrl+Shift+S", "保存 / 另存为"),
+                    ("Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴"),
+                    ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
+                    ("Ctrl+B / Ctrl+I / Ctrl+U", "加粗 / 斜体 / 下划线"),
+                    ("Ctrl+1", "设置单元格格式"),
+                    ("Ctrl+F", "查找与替换"),
+                    ("Alt", "显示页签快捷键提示"),
+                    ("Ctrl+滚轮", "缩放"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(170.0, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(k).size(11.5).monospace());
+                            },
+                        );
+                        ui.label(egui::RichText::new(v).size(11.5));
+                    });
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "内嵌字体为 SIL OFL 1.1；第三方依赖许可见随包的 THIRD_PARTY_NOTICES.txt。",
+                        )
+                        .size(11.0)
+                        .color(ui_kit::TEXT_WEAK),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+            });
+        if !open {
+            self.about_open = false;
+        }
+    }
     /// 选择性粘贴对话框
     fn paste_special_dialog(&mut self, ctx: &egui::Context) {
         if !self.paste_special {
@@ -6167,45 +6285,226 @@ impl SheetApp {
         if ui_kit::group_l(ui, "字体", "font", |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    // Excel 的字体/字号框是 21px 高（UIA 实测），比 buttons 矮一档
+                    // Excel 的字体/字号框是 21px 高（UIA 实测），而且能直接打字：
+                    // 输入框 + 右侧窄箭头（下拉列表），不是只能选的 ComboBox
                     ui.spacing_mut().interact_size.y = 21.0;
-                    egui::ComboBox::from_id_salt("font_pick")
-                        .selected_text(if cur.font.is_empty() {
-                            "默认".to_string()
-                        } else {
-                            cur.font.clone()
-                        })
-                        .width(155.0)
-                        .height(24.0)
-                        .show_ui(ui, |ui| {
-                            for name in sheetcore::style::FONT_CHOICES {
-                                let label = if name.is_empty() { "默认" } else { *name };
-                                let preview = egui::RichText::new(label);
-                                let preview = match sheetcore::style::font_class(name) {
-                                    sheetcore::style::FontClass::Serif => preview.family(
-                                        egui::FontFamily::Name("cjk-serif".into()),
-                                    ),
-                                    sheetcore::style::FontClass::Mono => preview
-                                        .family(egui::FontFamily::Name("mono".into())),
-                                    _ => preview,
-                                };
-                                if ui.selectable_label(cur.font == *name, preview).clicked() {
-                                    let pick = name.to_string();
-                                    self.apply_style(move |s| s.font = pick.clone());
-                                }
-                            }
-                        });
-                    egui::ComboBox::from_id_salt("size_pick")
-                        .selected_text(format!("{:.0}", cur.size))
-                        .width(36.0)
-                        .height(24.0)
-                        .show_ui(ui, |ui| {
-                            for size in [9.0f32, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
-                                if ui.selectable_label((cur.size - size).abs() < 0.01, format!("{size:.0}")).clicked() {
-                                    self.apply_style(move |s| s.size = size);
-                                }
-                            }
-                        });
+                    let fid = egui::Id::new("font_edit");
+                    if !ui.memory(|m| m.has_focus(fid)) {
+                        self.font_buf = cur.font.clone();
+                    }
+                    // 组合框：自己画一个外框，文字区和右侧箭头都在框内（Excel 的样子）
+                    let mut fr_lost = false;
+                    let mut arrow_pos = egui::pos2(0.0, 0.0);
+                    let mut arrow_clicked = false;
+                    {
+                        let (crect, _) = ui.allocate_exact_size(
+                            egui::vec2(160.0, 21.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect(
+                            crect,
+                            2.0,
+                            Color32::WHITE,
+                            egui::Stroke::new(1.0, ui_kit::BORDER),
+                            egui::StrokeKind::Inside,
+                        );
+                        let arrow_rect = egui::Rect::from_min_max(
+                            egui::pos2(crect.right() - 16.0, crect.top() + 1.0),
+                            egui::pos2(crect.right() - 1.0, crect.bottom() - 1.0),
+                        );
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(crect.left() + 5.0, crect.top() + 1.0),
+                            egui::pos2(crect.right() - 18.0, crect.bottom() - 1.0),
+                        );
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(text_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        let fr = child
+                            .add_sized(
+                                egui::vec2(text_rect.width(), 18.0),
+                                egui::TextEdit::singleline(&mut self.font_buf)
+                                    .id(fid)
+                                    .frame(false)
+                                    .hint_text("默认"),
+                            )
+                            .on_hover_text("字体名，回车应用");
+                        fr_lost = fr.lost_focus();
+                        let ar = ui.interact(
+                            arrow_rect,
+                            egui::Id::new("font_arrow"),
+                            egui::Sense::click(),
+                        );
+                        arrow_pos = egui::pos2(crect.left(), crect.bottom());
+                        let c = arrow_rect.center();
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(c.x - 4.0, c.y - 2.0),
+                                egui::pos2(c.x + 4.0, c.y - 2.0),
+                                egui::pos2(c.x, c.y + 3.0),
+                            ],
+                            Color32::from_rgb(68, 68, 68),
+                            egui::Stroke::NONE,
+                        ));
+                        if ar.clicked() {
+                            arrow_clicked = true;
+                        }
+                    }
+                    if arrow_clicked {
+                        self.font_menu = !self.font_menu;
+                        self.size_menu = false;
+                    }
+                    if fr_lost && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let pick = self.font_buf.trim().to_string();
+                        self.apply_style(move |s| s.font = pick.clone());
+                    }
+                    if self.font_menu {
+                        let ctx = ui.ctx().clone();
+                        let mut pick: Option<String> = None;
+                        let mut close = false;
+                        egui::Area::new(egui::Id::new("font_list"))
+                            .fixed_pos(arrow_pos)
+                            .order(egui::Order::Foreground)
+                            .show(&ctx, |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(170.0);
+                                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                        for name in sheetcore::style::FONT_CHOICES {
+                                            let label =
+                                                if name.is_empty() { "默认" } else { *name };
+                                            let preview = egui::RichText::new(label);
+                                            let preview = match sheetcore::style::font_class(name) {
+                                                sheetcore::style::FontClass::Serif => preview
+                                                    .family(egui::FontFamily::Name(
+                                                        "cjk-serif".into(),
+                                                    )),
+                                                sheetcore::style::FontClass::Mono => preview
+                                                    .family(egui::FontFamily::Name("mono".into())),
+                                                _ => preview,
+                                            };
+                                            if ui
+                                                .selectable_label(cur.font == *name, preview)
+                                                .clicked()
+                                            {
+                                                pick = Some(name.to_string());
+                                                close = true;
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        if let Some(p) = pick {
+                            self.apply_style(move |s| s.font = p.clone());
+                        }
+                        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.font_menu = false;
+                        }
+                    }
+                    let sid = egui::Id::new("size_edit");
+                    if !ui.memory(|m| m.has_focus(sid)) {
+                        self.size_buf = format!("{:.0}", cur.size);
+                    }
+                    let mut sr_lost = false;
+                    let mut arrow_pos2 = egui::pos2(0.0, 0.0);
+                    let mut arrow2_clicked = false;
+                    {
+                        let (crect, _) = ui.allocate_exact_size(
+                            egui::vec2(52.0, 21.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect(
+                            crect,
+                            2.0,
+                            Color32::WHITE,
+                            egui::Stroke::new(1.0, ui_kit::BORDER),
+                            egui::StrokeKind::Inside,
+                        );
+                        let arrow_rect = egui::Rect::from_min_max(
+                            egui::pos2(crect.right() - 16.0, crect.top() + 1.0),
+                            egui::pos2(crect.right() - 1.0, crect.bottom() - 1.0),
+                        );
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(crect.left() + 5.0, crect.top() + 1.0),
+                            egui::pos2(crect.right() - 18.0, crect.bottom() - 1.0),
+                        );
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(text_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        let sr = child
+                            .add_sized(
+                                egui::vec2(text_rect.width(), 18.0),
+                                egui::TextEdit::singleline(&mut self.size_buf)
+                                    .id(sid)
+                                    .frame(false),
+                            )
+                            .on_hover_text("字号（磅），回车应用");
+                        sr_lost = sr.lost_focus();
+                        let ar = ui.interact(
+                            arrow_rect,
+                            egui::Id::new("size_arrow"),
+                            egui::Sense::click(),
+                        );
+                        arrow_pos2 = egui::pos2(crect.left(), crect.bottom());
+                        let c = arrow_rect.center();
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(c.x - 4.0, c.y - 2.0),
+                                egui::pos2(c.x + 4.0, c.y - 2.0),
+                                egui::pos2(c.x, c.y + 3.0),
+                            ],
+                            Color32::from_rgb(68, 68, 68),
+                            egui::Stroke::NONE,
+                        ));
+                        if ar.clicked() {
+                            arrow2_clicked = true;
+                        }
+                    }
+                    if arrow2_clicked {
+                        self.size_menu = !self.size_menu;
+                        self.font_menu = false;
+                    }
+                    if sr_lost && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(v) = self.size_buf.trim().parse::<f32>() {
+                            let v = v.clamp(6.0, 72.0);
+                            self.apply_style(move |s| s.size = v);
+                        }
+                    }
+                    if self.size_menu {
+                        let ctx = ui.ctx().clone();
+                        let mut pick: Option<f32> = None;
+                        let mut close = false;
+                        egui::Area::new(egui::Id::new("size_list"))
+                            .fixed_pos(arrow_pos2)
+                            .order(egui::Order::Foreground)
+                            .show(&ctx, |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(90.0);
+                                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                        for size in [9.0f32, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0, 48.0, 72.0] {
+                                            if ui
+                                                .selectable_label(
+                                                    (cur.size - size).abs() < 0.01,
+                                                    format!("{size:.0}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                pick = Some(size);
+                                                close = true;
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        if let Some(p) = pick {
+                            self.apply_style(move |s| s.size = p);
+                        }
+                        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.size_menu = false;
+                        }
+                    }
                     if ui_kit::small(ui, Icon::FontGrow, "增大字号").clicked() {
                         let s2 = (cur.size + 1.0).min(72.0);
                         self.apply_style(move |s| s.size = s2);
@@ -6232,7 +6531,7 @@ impl SheetApp {
                     if ui_kit::small(ui, Icon::Border, "所有框线").clicked() {
                         self.apply_style(|s| s.set_all_borders(1, [128, 128, 128]));
                     }
-                    ui.menu_button("▾", |ui| {
+                    ui.menu_button("▼", |ui| {
                         ui.set_min_width(120.0);
                         if ui.button("下框线").clicked() {
                             self.apply_style(|s| s.border[2] = sheetcore::style::Border { style: 1, color: [128, 128, 128] });
@@ -6373,7 +6672,7 @@ impl SheetApp {
                     if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 86.0, merged, "合并后居中").clicked() {
                         self.toggle_merge(!merged);
                     }
-                    ui.menu_button("▾", |ui| {
+                    ui.menu_button("▼", |ui| {
                         ui.set_min_width(130.0);
                         if ui.button("合并后居中").clicked() {
                             self.toggle_merge(true);
@@ -6486,7 +6785,7 @@ impl SheetApp {
                 let split_arrow = |ui: &mut egui::Ui, id: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
                     ui.scope(|ui| {
                         ui.spacing_mut().button_padding.x = 2.0;
-                        ui.menu_button("▾", |ui| add(ui));
+                        ui.menu_button("▼", |ui| add(ui));
                     });
                     let _ = id;
                 };
@@ -6700,6 +6999,14 @@ impl SheetApp {
                     .map(|n| n.text.clone())
                     .unwrap_or_default();
                 self.note_edit = Some((r, c, cur));
+            }
+        });
+        ui_kit::group(ui, "符号", |ui| {
+            if ui_kit::big(ui, Icon::Symbol, "符号")
+                .on_hover_text("插入特殊符号")
+                .clicked()
+            {
+                self.symbol_dlg = true;
             }
         });
         ui_kit::group(ui, "透视表", |ui| {
@@ -12211,7 +12518,7 @@ impl SheetApp {
                 painter.text(
                     btn.center(),
                     Align2::CENTER_CENTER,
-                    "▾",
+                    "▼",
                     FontId::proportional(11.0),
                     Color32::from_rgb(70, 70, 70),
                 );
@@ -13932,6 +14239,7 @@ impl eframe::App for SheetApp {
         self.hyperlink_dialog(ctx);
         self.paste_special_dialog(ctx);
         self.about_window(ctx);
+        self.symbol_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
         self.password_prompt_ui(ctx);

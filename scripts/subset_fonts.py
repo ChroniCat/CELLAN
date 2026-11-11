@@ -3,7 +3,10 @@
 
 用法：uv run --with fonttools python scripts/subset_fonts.py
 """
+import glob
+import io
 import os
+import re
 import subprocess
 import sys
 
@@ -33,6 +36,22 @@ def charset() -> str:
     # 不换行空格：Excel 常用   做对齐，字体缺了会显示成问号
     chars.update("     ")
     chars.update("①②③④⑤⑥⑦⑧⑨⑩ⅠⅡⅢⅣⅤ")
+    # 三角形（功能区下拉箭头用 ▾，缺字形会显示成方框）
+    chars.update("▾▼▸◀▶◁▷●○◆◇■□▲△")
+    # 源码里真正用到的字符全部纳入：GB2312 之外还有 ¥（半角人民币）、−（U+2212 真减号）这类，
+    # 漏掉就会在界面上渲染成方框。直接扫 *.rs 的字符串字面量，比手工维护清单可靠。
+    lit = re.compile(r'"((?:[^"\\]|\\.)*)"')
+    for path in glob.glob(
+        os.path.join(HERE, "crates", "**", "src", "**", "*.rs"), recursive=True
+    ):
+        try:
+            src = io.open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        for m in lit.finditer(src):
+            for ch in m.group(1):
+                if ord(ch) >= 0x20 and ch != "\\":
+                    chars.add(ch)
     return "".join(sorted(chars))
 
 
