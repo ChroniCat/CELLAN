@@ -22,6 +22,9 @@ pub struct SheetLayout {
     pub hidden_cols: Vec<u32>,
     /// 手动隐藏的行（0-based）
     pub hidden_rows: Vec<u32>,
+    /// 分级显示级别（0-based 行列 → 1..=7）
+    pub row_levels: Vec<(u32, u8)>,
+    pub col_levels: Vec<(u32, u8)>,
     /// 条件格式
     pub cf: Vec<crate::cf::CfBlock>,
     /// 差异格式表
@@ -135,6 +138,10 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
             || !lay.row_heights.is_empty()
+            || !lay.row_levels.is_empty()
+            || !lay.col_levels.is_empty()
+            || !lay.hidden_rows.is_empty()
+            || !lay.hidden_cols.is_empty()
             || !lay.cf.is_empty()
             || !lay.dv.is_empty()
             || lay.freeze.is_some()
@@ -215,6 +222,14 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             k if k.ends_with("width") => width = val.parse().unwrap_or(0.0),
                             k if k.ends_with("customWidth") => custom = val == "1" || val == "true",
                             "hidden" => hidden = val == "1" || val == "true",
+                            "outlineLevel" => {
+                                let lv = val.parse::<u8>().unwrap_or(0);
+                                if lv > 0 && min >= 1 && max >= min && (max - min) < 1024 {
+                                    for c in (min - 1)..max {
+                                        out.col_levels.push((c, lv));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -249,6 +264,12 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             "ht" => ht = val.parse().unwrap_or(0.0),
                             "customHeight" => custom = val == "1" || val == "true",
                             "hidden" => hidden = val == "1" || val == "true",
+                            "outlineLevel" => {
+                                let lv = val.parse::<u8>().unwrap_or(0);
+                                if lv > 0 && idx >= 1 {
+                                    out.row_levels.push((idx - 1, lv));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -405,6 +426,13 @@ mod tests {
         assert!((lay.col_widths[0].1 - 128.0).abs() < 1.0);
         assert_eq!(lay.row_heights, vec![(1, 40.0)]);
         assert!(lay.merges.is_empty());
+    }
+
+    #[test]
+    fn parses_outline_levels() {
+        let xml = r#"<worksheet><sheetData><row r="2" outlineLevel="1"><c r="A2"/></row><row r="3" outlineLevel="2"><c r="A3"/></row></sheetData></worksheet>"#;
+        let lay = parse_layout(xml);
+        assert_eq!(lay.row_levels, vec![(1, 1), (2, 2)], "行分级应被读出");
     }
 
     #[test]

@@ -452,6 +452,12 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 for r in lay.hidden_rows.iter() {
                     sheet.hidden_rows_user.insert(*r);
                 }
+                for (r, lv) in lay.row_levels.iter() {
+                    sheet.row_levels.insert(*r, *lv);
+                }
+                for (c, lv) in lay.col_levels.iter() {
+                    sheet.col_levels.insert(*c, *lv);
+                }
                 sheet.tab_color = lay.tab_color;
                 sheet.protection = lay.protection.clone();
                 sheet.cf.blocks = lay.cf.clone();

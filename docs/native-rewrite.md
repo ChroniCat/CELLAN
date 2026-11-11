@@ -2256,3 +2256,37 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 **符号字形**：符号表第一次只显示了一半、箭头和数学类全是方框——原因是内嵌字体子集没跟着更新。
 顺序必须是：改代码 → 跑 `scripts/subset_fonts.py`（它会扫 `*.rs` 的字符串字面量并入字符集）→
 跑 `work/check_glyphs.py` 确认「缺失字形 0」→ 再编译。`⇑`/`⇓` 源字体确实没有，已从列表里去掉。
+### 第二十一轮：调整为合适大小、公式审核、分级显示
+
+**调整为合适大小（页面布局页签）**
+
+- 新增独立分组「调整为合适大小」：宽度 / 高度 / 缩放三个下拉，和 Excel 的布局一致。
+- 模型语义修正：`fitToWidth`/`fitToHeight` 里的 **0 是「自动」**，不能一出现就把 `fit_to_page` 置真。
+  现在解析完整个 `<pageSetup>` 再判定 `fit_to_page = fit_width > 0 || fit_height > 0`。
+- `scale_factor` 重写：宽、高两个方向分别算 `页宽×页数 / 内容宽`，取更小的那个；页数为 0 的方向不参与；
+  只缩不放（上限 100%，下限 10%）。内容尺寸用打印区域或已用区域，列宽 + 行高都算。
+- 缩放下拉在「按页数缩」时变灰并显示算出来的百分比（Excel 行为）。
+- 测试：`fit_parsing_keeps_auto_direction`、`two_pages_wide_is_looser_than_one`、`fit_height_limits_scale`。
+
+**公式审核（公式页签）**
+
+- 四个命令：追踪引用单元格、追踪从属单元格、移去箭头、显示公式。
+- 引用来自己有的 `formula::deps::refs_of`（含表格结构化引用与整列规范化），从属是逐条公式反查矩形是否覆盖选区。
+- 箭头画法：源区域边缘 → 14px「桥」→ 目标格边缘，源端小圆点、目标端实心三角；相邻格也不会缩成一个点。
+  整列引用会先裁到已用范围，避免箭头算到几千列外。
+- 显示公式：单元格里画 `=公式文本`（`Ctrl+`` 切换），公式格不再画结果。
+- 图标：新增 `TraceIn` / `TraceOut`（蓝框 + 红箭头，箭头方向按语义区分）。
+- 验收钩子：`SC_TRACE=prec|dep|outline`、`SC_SHOW_FORMULAS=1`。实测 A3=`=SUM(A1:A2)` 时引用 1 条、
+  选 A1 时从属 2 条（A3、B2），箭头与公式文本截图核对。
+
+**分级显示（数据页签）**
+
+- `Sheet.row_levels` / `col_levels`：行列 → 1..=7 级；xlsx 读写 `<row outlineLevel>` / `<col outlineLevel>`。
+- 数据页签新增「分级显示」组：组合 / 取消组合 / 隐藏明细 / 显示明细。
+- 行头按最大级别加宽（每级 11px），在每组下面那一行的行头上画 `+` / `-` 小方块，点一下收起/展开该组明细
+  （明细行进 `hidden_rows_user`，和 Excel 的 summaryBelow 约定一致）。
+- 踩坑：`merges::load_layout` 是**按需入表**——只有合并/列宽/行高/筛选等字段非空才把这张表放进 map，
+  新增 `row_levels` 后忘了同步这个条件，结果「只有分级、没有其它版式」的表整份被丢掉，界面看不到任何按钮。
+  现在条件里补上 levels 和 hidden_rows/hidden_cols。
+- 往返验收：Excel 造三组嵌套分组 → 我们读出 7 行级别、行头出 4 个按钮 → `SC_SAVE` 另存 →
+  Excel COM 回读 `OutlineLevel`（COM 值 = 文件值 + 1）与 `Outline.SummaryRow` 全部一致。

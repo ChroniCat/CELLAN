@@ -36,7 +36,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.51";
+const APP_VERSION: &str = "1.52";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -117,6 +117,23 @@ struct EditState {
 }
 
 /// 去掉页眉页脚里的 OOXML 控制码（&L/&C/&R/&B 等），只留文字
+/// 矩形中心到目标点的连线与矩形边的交点（公式审核箭头用）
+fn edge_point(x0: f32, y0: f32, x1: f32, y1: f32, tx: f32, ty: f32) -> (f32, f32) {
+    let cx = (x0 + x1) * 0.5;
+    let cy = (y0 + y1) * 0.5;
+    let dx = tx - cx;
+    let dy = ty - cy;
+    if dx.abs() < 1e-6 && dy.abs() < 1e-6 {
+        return (cx, cy);
+    }
+    let hw = (x1 - x0).abs() * 0.5;
+    let hh = (y1 - y0).abs() * 0.5;
+    let sx = if dx.abs() > 1e-6 { hw / dx.abs() } else { f32::INFINITY };
+    let sy = if dy.abs() > 1e-6 { hh / dy.abs() } else { f32::INFINITY };
+    let k = sx.min(sy).min(1.0);
+    (cx + dx * k, cy + dy * k)
+}
+
 fn strip_hf(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -359,6 +376,10 @@ struct SheetApp {
     about_open: bool,
     /// 符号对话框
     symbol_dlg: bool,
+    /// 显示公式（Ctrl+`）：单元格里画公式文本而不是结果
+    show_formulas: bool,
+    /// 公式审核箭头：（来源区域行1,列1,行2,列2）→（目标行,目标列）
+    trace_arrows: Vec<((u32, u32, u32, u32), (u32, u32))>,
     /// 工作表标签条的横向滚动量
     tab_scroll: f32,
     /// 拖表头边界改列宽：(列, 按下时的鼠标 x, 按下时的宽度)
@@ -654,6 +675,8 @@ impl SheetApp {
             show_formula_bar: true,
             about_open: false,
             symbol_dlg: false,
+            show_formulas: false,
+            trace_arrows: Vec::new(),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
             head_menu: None,
@@ -1109,6 +1132,40 @@ impl SheetApp {
                             rep.failed,
                             self.wb.sheets[0].get(0, 0).map(|c| c.value.display())
                         );
+                    }
+                    // 无界面验收：SC_TRACE=prec|dep 打开后直接画追踪箭头；SC_SHOW_FORMULAS=1 显示公式
+                    match std::env::var("SC_TRACE").as_deref() {
+                        Ok("prec") => {
+                            if let Ok(v) = std::env::var("SC_SEL") {
+                                if let Some((a, b)) = v.split_once(',') {
+                                    if let (Ok(r), Ok(c)) =
+                                        (a.trim().parse::<u32>(), b.trim().parse::<u32>())
+                                    {
+                                        self.sel = (r, c);
+                                        self.sel_end = (r, c);
+                                    }
+                                }
+                            }
+                            self.trace_precedents();
+                            eprintln!("[trace] arrows={}", self.trace_arrows.len());
+                        }
+                        Ok("outline") => {
+                            let sh = self.wb.sheet(self.sheet_idx);
+                            eprintln!(
+                                "[outline] rows={} cols={} max={:?}",
+                                sh.row_levels.len(),
+                                sh.col_levels.len(),
+                                sh.row_levels.values().copied().max()
+                            );
+                        }
+                        Ok("dep") => {
+                            self.trace_dependents();
+                            eprintln!("[trace] arrows={}", self.trace_arrows.len());
+                        }
+                        _ => {}
+                    }
+                    if std::env::var("SC_SHOW_FORMULAS").is_ok() {
+                        self.show_formulas = true;
                     }
                     // 无界面验收：SC_FILTER=1 打开后按当前区域启用筛选
                     if std::env::var("SC_FILTER").is_ok()
@@ -4240,6 +4297,15 @@ impl SheetApp {
                 i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
             )
         });
+        let show_f_k = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Backtick));
+        if show_f_k {
+            self.show_formulas = !self.show_formulas;
+            self.status = if self.show_formulas {
+                "显示公式（再按 Ctrl+` 切回结果）".into()
+            } else {
+                "显示结果".into()
+            };
+        }
         let (copy_k, cut_k, paste_k, paste_v_k, find_k, repl_k) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::C),
@@ -7057,26 +7123,106 @@ impl SheetApp {
                         p.margins = m;
                     });
                 }
-                let pct = page.scale;
-                if ui_kit::labeled_w(ui, Icon::Chart, &format!("缩放：{pct}%"), 110.0, "打印缩放：100/75/50/25 循环").clicked() {
-                    self.set_page(|p| {
-                        p.fit_to_page = false;
-                        p.scale = match p.scale {
-                            100 => 75,
-                            75 => 50,
-                            50 => 25,
-                            _ => 100,
-                        };
+            });
+        });
+        // Excel 的「调整为合适大小」组：宽度 / 高度两个方向各自一个下拉，调整为按页数缩时缩放框变灰
+        ui_kit::group(ui, "调整为合适大小", |ui| {
+            ui.vertical(|ui| {
+                let fit = page.fit_to_page;
+                let cur_pct = if fit {
+                    (page.scale_factor(self.wb.sheet(self.sheet_idx)) * 100.0).round() as i32
+                } else {
+                    page.scale as i32
+                };
+                ui.horizontal(|ui| {
+                    ui.add_sized([34.0, 21.0], egui::Label::new("宽度:"));
+                    let text = if page.fit_width == 0 {
+                        "自动".to_string()
+                    } else {
+                        format!("{} 页", page.fit_width)
+                    };
+                    egui::ComboBox::from_id_salt("fit_w")
+                        .selected_text(text)
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(page.fit_width == 0, "自动").clicked() {
+                                self.set_page(|p| {
+                                    p.fit_width = 0;
+                                    p.fit_to_page = p.fit_width > 0 || p.fit_height > 0;
+                                    if !p.fit_to_page {
+                                        p.scale = 100;
+                                    }
+                                });
+                            }
+                            for n in 1..=4u16 {
+                                if ui
+                                    .selectable_label(page.fit_width == n, format!("{n} 页"))
+                                    .clicked()
+                                {
+                                    self.set_page(move |p| {
+                                        p.fit_width = n;
+                                        p.fit_to_page = true;
+                                    });
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([34.0, 21.0], egui::Label::new("高度:"));
+                    let text = if page.fit_height == 0 {
+                        "自动".to_string()
+                    } else {
+                        format!("{} 页", page.fit_height)
+                    };
+                    egui::ComboBox::from_id_salt("fit_h")
+                        .selected_text(text)
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(page.fit_height == 0, "自动").clicked() {
+                                self.set_page(|p| {
+                                    p.fit_height = 0;
+                                    p.fit_to_page = p.fit_width > 0 || p.fit_height > 0;
+                                    if !p.fit_to_page {
+                                        p.scale = 100;
+                                    }
+                                });
+                            }
+                            for n in 1..=4u16 {
+                                if ui
+                                    .selectable_label(page.fit_height == n, format!("{n} 页"))
+                                    .clicked()
+                                {
+                                    self.set_page(move |p| {
+                                        p.fit_height = n;
+                                        p.fit_to_page = true;
+                                    });
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([34.0, 21.0], egui::Label::new("缩放:"));
+                    ui.add_enabled_ui(!fit, |ui| {
+                        egui::ComboBox::from_id_salt("fit_scale")
+                            .selected_text(format!("{cur_pct}%"))
+                            .width(84.0)
+                            .show_ui(ui, |ui| {
+                                for v in [400u16, 200, 150, 100, 75, 50, 25, 10] {
+                                    if ui
+                                        .selectable_label(!fit && page.scale == v, format!("{v}%"))
+                                        .clicked()
+                                    {
+                                        self.set_page(move |p| {
+                                            p.scale = v;
+                                            p.fit_to_page = false;
+                                            p.fit_width = 0;
+                                            p.fit_height = 0;
+                                        });
+                                    }
+                                }
+                            });
                     });
-                }
-                if ui_kit::labeled_w_on(ui, Icon::Table, "调整为 1 页", 110.0, page.fit_to_page, "等比缩到一页").clicked() {
-                    let on = !page.fit_to_page;
-                    self.set_page(move |p| {
-                        p.fit_to_page = on;
-                        p.fit_width = 1;
-                        p.fit_height = 1;
-                    });
-                }
+                });
             });
         });
         ui_kit::group(ui, "工作表选项", |ui| {
@@ -7179,6 +7325,96 @@ impl SheetApp {
         });
     }
 
+    /// 追踪引用单元格：给选区里的公式格画「来源 → 本格」的箭头
+    fn trace_precedents(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let used = self.wb.sheet(self.sheet_idx).used_bounds();
+        let mut arrows: Vec<((u32, u32, u32, u32), (u32, u32))> = Vec::new();
+        for r in r1..=r2.min(r1 + 20) {
+            for c in c1..=c2.min(c1 + 20) {
+                let Some(f) = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .get(r, c)
+                    .and_then(|x| x.formula.clone())
+                else {
+                    continue;
+                };
+                for rect in sheetcore::formula::deps::refs_of(&self.wb, self.sheet_idx, &f) {
+                    if rect.sheet != self.sheet_idx || rect.r1 < 0 || rect.c1 < 0 {
+                        continue;
+                    }
+                    let (mut fr1, mut fc1) = (rect.r1 as u32, rect.c1 as u32);
+                    let (mut fr2, mut fc2) = (rect.r2.max(0) as u32, rect.c2.max(0) as u32);
+                    // 整列/整行引用会是巨大区域：裁到已用范围，否则箭头算到几千列外去
+                    if let Some((_ur1, _uc1, ur2, uc2)) = used {
+                        fr2 = fr2.min(ur2);
+                        fc2 = fc2.min(uc2);
+                        if fr1 > fr2 {
+                            fr1 = fr2;
+                        }
+                        if fc1 > fc2 {
+                            fc1 = fc2;
+                        }
+                    }
+                    arrows.push(((fr1, fc1, fr2, fc2), (r, c)));
+                    if arrows.len() >= 64 {
+                        break;
+                    }
+                }
+                if arrows.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        if arrows.is_empty() {
+            self.status = "选中的单元格没有公式引用".into();
+        } else {
+            let n = arrows.len();
+            self.trace_arrows = arrows;
+            self.status = format!("已标出 {n} 条引用（移去箭头可清除）");
+        }
+    }
+
+    /// 追踪从属单元格：找出哪些公式引用了选区，画「本格 → 它们」的箭头
+    fn trace_dependents(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let keys: Vec<(u32, u32, String)> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .iter()
+            .filter_map(|(k, cell)| {
+                cell.formula
+                    .as_ref()
+                    .map(|f| (k.row, k.col, f.to_string()))
+            })
+            .collect();
+        let mut arrows: Vec<((u32, u32, u32, u32), (u32, u32))> = Vec::new();
+        for (r, c, f) in keys {
+            let refs = sheetcore::formula::deps::refs_of(&self.wb, self.sheet_idx, &f);
+            let hit = refs.iter().any(|x| {
+                x.sheet == self.sheet_idx
+                    && x.r1 <= r2 as i64
+                    && x.r2 >= r1 as i64
+                    && x.c1 <= c2 as i64
+                    && x.c2 >= c1 as i64
+            });
+            if hit {
+                arrows.push(((r1, c1, r2, c2), (r, c)));
+                if arrows.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        if arrows.is_empty() {
+            self.status = "没有公式引用选中的单元格".into();
+        } else {
+            let n = arrows.len();
+            self.trace_arrows = arrows;
+            self.status = format!("已标出 {n} 个从属单元格");
+        }
+    }
+
     fn ribbon_formula(&mut self, ui: &mut egui::Ui) {
         ui_kit::group(ui, "函数库", |ui| {
             if ui_kit::big(ui, Icon::Fx, "插入函数").clicked() {
@@ -7188,6 +7424,32 @@ impl SheetApp {
                         ed.buf.insert(0, '=');
                     }
                 }
+            }
+        });
+        ui_kit::group(ui, "公式审核", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::TraceIn, "追踪引用单元格", 132.0, "")
+                    .clicked()
+                {
+                    self.trace_precedents();
+                }
+                if ui_kit::labeled_w(ui, Icon::TraceOut, "追踪从属单元格", 132.0, "")
+                    .clicked()
+                {
+                    self.trace_dependents();
+                }
+                if ui_kit::labeled_w(ui, Icon::Eraser, "移去箭头", 132.0, "清除追踪线")
+                    .clicked()
+                {
+                    self.trace_arrows.clear();
+                    self.status = "已移去追踪箭头".into();
+                }
+            });
+            let on = self.show_formulas;
+            if ui_kit::labeled_w_on(ui, Icon::Fx, "显示公式", 86.0, on, "Ctrl+` 切换公式/结果")
+                .clicked()
+            {
+                self.show_formulas = !self.show_formulas;
             }
         });
         ui_kit::group(ui, "计算", |ui| {
@@ -7218,6 +7480,32 @@ impl SheetApp {
     }
 
     fn ribbon_data(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "分级显示", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Plus, "组合", 104.0, "把选中的行组成一级")
+                    .clicked()
+                {
+                    self.group_rows();
+                }
+                if ui_kit::labeled_w(ui, Icon::Close, "取消组合", 104.0, "选中的行降一级")
+                    .clicked()
+                {
+                    self.ungroup_rows();
+                }
+            });
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w_on(ui, Icon::Close, "隐藏明细", 96.0, false, "")
+                    .clicked()
+                {
+                    self.toggle_detail(true);
+                }
+                if ui_kit::labeled_w(ui, Icon::Plus, "显示明细", 96.0, "")
+                    .clicked()
+                {
+                    self.toggle_detail(false);
+                }
+            });
+        });
         ui_kit::group(ui, "获取数据", |ui| {
             ui.vertical(|ui| {
                 if ui_kit::labeled_w(ui, Icon::Open, "导入 CSV/TSV", 120.0, "").clicked() {
@@ -8194,7 +8482,20 @@ impl SheetApp {
             }
         }
         if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
-            let txt = sheetcore::style::format_value(&cell.value, &st.format);
+            let txt = if self.show_formulas {
+                match &cell.formula {
+                    Some(f) => {
+                        if f.starts_with('=') {
+                            f.to_string()
+                        } else {
+                            format!("={f}")
+                        }
+                    }
+                    None => sheetcore::style::format_value(&cell.value, &st.format),
+                }
+            } else {
+                sheetcore::style::format_value(&cell.value, &st.format)
+            };
             if !txt.is_empty() {
                 let is_num = matches!(cell.value, Value::Number(_));
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
@@ -10816,6 +11117,114 @@ impl SheetApp {
         self.scroll.y = sy;
     }
 
+    /// 行分级区域：连续的同一级别算一组（start, end, level）
+    fn row_groups(&self) -> Vec<(u32, u32, u8)> {
+        let m = &self.wb.sheet(self.sheet_idx).row_levels;
+        if m.is_empty() {
+            return Vec::new();
+        }
+        let mut keys: Vec<(u32, u8)> = m.iter().map(|(r, l)| (*r, *l)).collect();
+        keys.sort();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < keys.len() {
+            let (start, lv) = keys[i];
+            let mut end = start;
+            let mut j = i + 1;
+            while j < keys.len() && keys[j].1 == lv && keys[j].0 == end + 1 {
+                end = keys[j].0;
+                j += 1;
+            }
+            out.push((start, end, lv));
+            i = j;
+        }
+        out
+    }
+
+    /// 组合：把选区整体升一级（Excel 的「组合」）
+    fn group_rows(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, _c1, r2, _c2) = self.sel_rect();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            // 选区边界已有的级别决定新级别
+            let mut base = 0u8;
+            for probe in [r1.saturating_sub(1), r2 + 1, r1, r2] {
+                if let Some(l) = sh.row_levels.get(&probe) {
+                    base = base.max(*l);
+                }
+            }
+            let lv = (base + 1).min(7);
+            for r in r1..=r2 {
+                sh.row_levels.insert(r, lv);
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已组合第 {}~{} 行", r1 + 1, r2 + 1);
+    }
+
+    /// 取消组合：选区降一级，级别归零就从表里删掉
+    fn ungroup_rows(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, _c1, r2, _c2) = self.sel_rect();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for r in r1..=r2 {
+                if let Some(l) = sh.row_levels.get(&r).copied() {
+                    if l <= 1 {
+                        sh.row_levels.remove(&r);
+                    } else {
+                        sh.row_levels.insert(r, l - 1);
+                    }
+                }
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已取消组合第 {}~{} 行", r1 + 1, r2 + 1);
+    }
+
+    /// 隐藏/显示明细：选区落在哪个分级区域里，就收起/展开那个区域的明细行
+    fn toggle_detail(&mut self, hide: bool) {
+        let (r1, _c1, r2, _c2) = self.sel_rect();
+        let groups: Vec<(u32, u32, u8)> = self
+            .row_groups()
+            .into_iter()
+            .filter(|(a, b, _)| !(*b < r1 || *a > r2))
+            .collect();
+        if groups.is_empty() {
+            self.status = "选区不在任何分级区域里".into();
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for (a, b, _lv) in groups {
+                for r in a..=b {
+                    if hide {
+                        sh.hidden_rows_user.insert(r);
+                    } else {
+                        sh.hidden_rows_user.remove(&r);
+                    }
+                }
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = if hide {
+            "已隐藏明细".to_string()
+        } else {
+            "已显示明细".to_string()
+        };
+    }
+
     /// 当前表的显示版式：隐藏的行/列按 0 尺寸（和 Excel 一样，不是删数据）
     fn view_axes(&self) -> (sheetcore::layout::Axis, sheetcore::layout::Axis) {
         let s = self.wb.sheet(self.sheet_idx);
@@ -10982,8 +11391,17 @@ impl SheetApp {
         };
         // 行号列宽跟着最多位数的行号走（Excel 在滚到 5 位数行时会变宽）
         let last_vis_row = rows.index_at(off_y + avail.y - hh) + 1;
+        // 行头宽度按分级深度加宽：每级 11px，最里层放 +/- 按钮（Excel 也是这样加宽的）
+        let row_depth = self
+            .wb
+            .sheet(self.sheet_idx)
+            .row_levels
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0) as f32;
         let head_w = if self.show_headings {
-            ((last_vis_row.to_string().len() as f32) * 6.5 + 10.0).max(HEAD_W)
+            ((last_vis_row.to_string().len() as f32) * 6.5 + 10.0).max(HEAD_W) + row_depth * 11.0
         } else {
             0.0
         };
@@ -11291,6 +11709,8 @@ impl SheetApp {
             );
         }
         let mut r = first_row;
+        let groups = self.row_groups();
+        let mut pending_toggle: Vec<(u32, u32)> = Vec::new();
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
             guard += 1;
@@ -11310,12 +11730,62 @@ impl SheetApp {
                 }
                 if self.show_headings {
                 painter.text(
-                                    egui::pos2(origin.x + head_w / 2.0, y + h / 2.0),
+                                    egui::pos2(
+                                        origin.x + (head_w - row_depth * 11.0) / 2.0,
+                                        y + h / 2.0,
+                                    ),
                                     Align2::CENTER_CENTER,
                                     (r + 1).to_string(),
                                     FontId::new(12.0, family_named("latin")),
                                     head_fg,
                                 );
+                    // 分级显示：在本组最后一行下面那一行的行头上画 +/-（Excel 的 summaryBelow 约定）
+                    for (gs, ge, glv) in groups.iter() {
+                        if *ge + 1 != r {
+                            continue;
+                        }
+                        let hidden = (*gs..=*ge).all(|x| {
+                            self.wb.sheet(self.sheet_idx).hidden_rows_user.contains(&x)
+                        });
+                        let bw = 9.0;
+                        let bx = origin.x + head_w - bw - 2.0 - (*glv as f32 - 1.0) * 11.0;
+                        let brect = egui::Rect::from_min_size(
+                            egui::pos2(bx, y + h / 2.0 - bw / 2.0),
+                            Vec2::new(bw, bw),
+                        );
+                        let br = ui.interact(
+                            brect,
+                            egui::Id::new(("outline_btn", *gs, *ge)),
+                            Sense::click(),
+                        );
+                        painter.rect_filled(brect, 1.0, Color32::WHITE);
+                        painter.rect_stroke(
+                            brect,
+                            1.0,
+                            Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+                            egui::StrokeKind::Inside,
+                        );
+                        let c = brect.center();
+                        painter.line_segment(
+                            [
+                                egui::pos2(c.x - 2.5, c.y),
+                                egui::pos2(c.x + 2.5, c.y),
+                            ],
+                            Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+                        );
+                        if hidden {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(c.x, c.y - 2.5),
+                                    egui::pos2(c.x, c.y + 2.5),
+                                ],
+                                Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+                            );
+                        }
+                        if br.clicked() {
+                            pending_toggle.push((*gs, *ge));
+                        }
+                    }
                 }
                 painter.line_segment(
                     [egui::pos2(origin.x, y), egui::pos2(origin.x + head_w, y)],
@@ -11344,6 +11814,22 @@ impl SheetApp {
             Stroke::new(1.0, ui_kit::HEAD_LINE),
         );
 
+        if !pending_toggle.is_empty() {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for (gs, ge) in pending_toggle {
+                let hiding = !(gs..=ge).all(|x| sh.hidden_rows_user.contains(&x));
+                for x in gs..=ge {
+                    if hiding {
+                        sh.hidden_rows_user.insert(x);
+                    } else {
+                        sh.hidden_rows_user.remove(&x);
+                    }
+                }
+            }
+            sh.layout_dirty = true;
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+        }
         if dumping {
             dump.push(format!("head_sel cols={sc1}..{sc2} rows={sr1}..{sr2}"));
         }
@@ -12024,6 +12510,51 @@ impl SheetApp {
                 Stroke::new(1.5, ui_kit::ACCENT),
                 egui::StrokeKind::Inside,
             );
+        }
+
+        // 公式审核箭头：从引用区域边缘画到公式格（Excel 的蓝色追踪线）
+        if !self.trace_arrows.is_empty() {
+            let clip = painter.clip_rect();
+            let col = Color32::from_rgb(0, 102, 204);
+            for (from, to) in self.trace_arrows.clone() {
+                let (sx0, sy0) = (gx(from.1), gy(from.0));
+                let (sx1, sy1) = (gx(from.3 + 1), gy(from.2 + 1));
+                let (tx0, ty0) = (gx(to.1), gy(to.0));
+                let (tx1, ty1) = (gx(to.1 + 1), gy(to.0 + 1));
+                let sc = ((sx0 + sx1) * 0.5, (sy0 + sy1) * 0.5);
+                let tc = ((tx0 + tx1) * 0.5, (ty0 + ty1) * 0.5);
+                let (ax, ay) = edge_point(sx0, sy0, sx1, sy1, tc.0, tc.1);
+                let (bx, by) = edge_point(tx0, ty0, tx1, ty1, sc.0, sc.1);
+                let a = egui::pos2(ax, ay);
+                let b = egui::pos2(bx, by);
+                if !clip.intersects(Rect::from_two_pos(a, b).expand(18.0)) {
+                    continue;
+                }
+                // 相邻格时 a/b 会贴在一起，直线等于看不见：绕一个 14px 的「桥」再折回目标，
+                // 和 Excel 追踪线的观感一致，也保证任何距离都看得清
+                let d = b - a;
+                let nrm = if d.length() > 0.5 {
+                    egui::vec2(-d.y, d.x).normalized()
+                } else {
+                    egui::vec2(1.0, 0.0)
+                };
+                let off = 14.0;
+                let m1 = a + nrm * off;
+                let m2 = b + nrm * off;
+                painter.add(egui::Shape::line(
+                    vec![a, m1, m2, b],
+                    Stroke::new(1.5, col),
+                ));
+                painter.circle_filled(a, 2.2, col);
+                let dir = (b - m2).normalized();
+                let dir = if dir.length() > 0.0 { dir } else { -nrm };
+                let nn = egui::vec2(-dir.y, dir.x);
+                painter.add(egui::Shape::convex_polygon(
+                    vec![b, b - dir * 10.0 + nn * 4.5, b - dir * 10.0 - nn * 4.5],
+                    col,
+                    Stroke::NONE,
+                ));
+            }
         }
 
         // 选区边框（合并区域按整块画）

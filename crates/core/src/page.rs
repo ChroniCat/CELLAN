@@ -111,25 +111,51 @@ impl PageSetup {
         (w_mm * k, h_mm * k)
     }
 
-    /// 缩放系数（fit_to_page 时按页宽反推）
+    /// 打印内容区的像素尺寸（有打印区域按打印区域，否则按已用区域）
+    pub fn content_px(&self, sheet: &Sheet) -> (f32, f32) {
+        let rect = match self.print_area {
+            Some(r) => Some(r),
+            None => sheet.used_bounds(),
+        };
+        match rect {
+            Some((r1, c1, r2, c2)) => (
+                cols_width(sheet, c1, c2).max(1.0),
+                rows_height(sheet, r1, r2).max(1.0),
+            ),
+            None => (1.0, 1.0),
+        }
+    }
+
+    /// 缩放系数。fit_to_page 时按「宽 N 页 / 高 M 页」两个方向分别算，取更小的那个；
+    /// 页数为 0 表示该方向不限（Excel 的「自动」）。只缩不放，上限 100%。
     pub fn scale_factor(&self, sheet: &Sheet) -> f32 {
         if self.fit_to_page {
-            let used_w: f32 = match self.print_area {
-                Some((_, c1, _, c2)) => cols_width(sheet, c1, c2),
-                None => match sheet.used_bounds() {
-                    Some((_, c1, _, c2)) => cols_width(sheet, c1, c2),
-                    None => 1.0,
-                },
-            };
-            let (pw, _) = self.printable_px();
-            if used_w > 1.0 {
-                return (pw / used_w).clamp(0.1, 1.0);
+            let (pw, ph) = self.printable_px();
+            let (aw, ah) = self.content_px(sheet);
+            let mut best = f32::INFINITY;
+            if self.fit_width > 0 && aw > 0.0 {
+                best = best.min(pw * self.fit_width as f32 / aw);
             }
-            1.0
+            if self.fit_height > 0 && ah > 0.0 {
+                best = best.min(ph * self.fit_height as f32 / ah);
+            }
+            if best.is_finite() {
+                best.clamp(0.1, 1.0)
+            } else {
+                1.0
+            }
         } else {
             (self.scale as f32 / 100.0).clamp(0.1, 4.0)
         }
     }
+}
+
+fn rows_height(sheet: &Sheet, r1: u32, r2: u32) -> f32 {
+    let mut h = 0.0;
+    for r in r1..=r2.min(r1 + 20000) {
+        h += sheet.rows.size(r);
+    }
+    h
 }
 
 fn cols_width(sheet: &Sheet, c1: u32, c2: u32) -> f32 {
@@ -227,16 +253,17 @@ pub fn parse_page_setup(xml: &str) -> PageSetup {
                             "paperSize" => ps.paper = v.parse().unwrap_or(9),
                             "scale" => ps.scale = v.parse().unwrap_or(100),
                             "fitToWidth" => {
-                                ps.fit_width = v.parse().unwrap_or(1);
-                                ps.fit_to_page = true;
+                                ps.fit_width = v.parse().unwrap_or(0);
                             }
                             "fitToHeight" => {
                                 ps.fit_height = v.parse().unwrap_or(0);
-                                ps.fit_to_page = true;
                             }
                             _ => {}
                         }
                     }
+                    // 只有某一方向的页数 >0 才是「调整为合适大小」；
+                    // fitToWidth="1" fitToHeight="0" = 1 页宽、高度自动
+                    ps.fit_to_page = ps.fit_width > 0 || ps.fit_height > 0;
                 } else if name.ends_with("pageMargins") {
                     for a in e.attributes().flatten() {
                         let k = a.key.as_ref();
@@ -578,5 +605,44 @@ mod tests {
         let b = ps.scale_factor(&s);
         assert!(b < 1.0, "调整为 1 页宽应缩小: {b}");
         assert!(b > 0.1);
+    }
+
+    #[test]
+    fn fit_parsing_keeps_auto_direction() {
+        let ps = parse_page_setup(
+            "<worksheet><pageSetup fitToWidth=\"1\" fitToHeight=\"0\"/></worksheet>",
+        );
+        assert!(ps.fit_to_page);
+        assert_eq!(ps.fit_width, 1);
+        assert_eq!(ps.fit_height, 0, "0 是高度自动，不能当成 0 页");
+        let ps2 = parse_page_setup(
+            "<worksheet><pageSetup fitToWidth=\"0\" fitToHeight=\"0\" scale=\"80\"/></worksheet>",
+        );
+        assert!(!ps2.fit_to_page, "两个方向都自动时不是 fit-to-page");
+        assert_eq!(ps2.scale, 80);
+    }
+
+    #[test]
+    fn two_pages_wide_is_looser_than_one() {
+        let s = sheet();
+        let mut ps = PageSetup::default();
+        ps.fit_to_page = true;
+        ps.fit_width = 1;
+        let one = ps.scale_factor(&s);
+        ps.fit_width = 2;
+        let two = ps.scale_factor(&s);
+        assert!(two > one + 0.1, "2 页宽应更宽松: {one} -> {two}");
+        assert!(two <= 1.0);
+    }
+
+    #[test]
+    fn fit_height_limits_scale() {
+        let s = sheet();
+        let mut ps = PageSetup::default();
+        ps.fit_to_page = true;
+        ps.fit_width = 0;
+        ps.fit_height = 1;
+        let by_h = ps.scale_factor(&s);
+        assert!(by_h < 1.0, "100 行必须缩到一页: {by_h}");
     }
 }

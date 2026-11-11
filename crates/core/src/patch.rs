@@ -2008,10 +2008,46 @@ pub fn set_row_sizes(xml: &str, wanted: &[(u32, Option<f32>, bool)]) -> String {
     out
 }
 
+/// 给 <row>/<col> 补 outlineLevel（分级显示）。只加属性，不改已有内容。
+pub fn apply_outline(xml: &str, rows: &[(u32, u8)], cols: &[(u32, u8)]) -> String {
+    let mut x = xml.to_string();
+    for (r, lv) in rows {
+        if *lv == 0 {
+            continue;
+        }
+        let needle = format!("<row r=\"{}\"", r + 1);
+        if let Some(i) = x.find(&needle) {
+            if let Some(gt) = x[i..].find('>') {
+                let end = i + gt;
+                if !x[i..end].contains("outlineLevel=") {
+                    x.insert_str(end, &format!(" outlineLevel=\"{lv}\""));
+                }
+            }
+        }
+    }
+    for (c, lv) in cols {
+        if *lv == 0 {
+            continue;
+        }
+        let needle = format!("<col min=\"{}\"", c + 1);
+        if let Some(i) = x.find(&needle) {
+            if let Some(gt) = x[i..].find('>') {
+                let end = i + gt;
+                if !x[i..end].contains("outlineLevel=") {
+                    x.insert_str(end, &format!(" outlineLevel=\"{lv}\""));
+                }
+            }
+        }
+    }
+    x
+}
+
 /// 保存收尾：把列宽/行高/隐藏状态补进 sheet XML
 pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, (Vec<(u32, f32, bool)>, Vec<(u32, Option<f32>, bool)>)> =
+        std::collections::HashMap::new();
+    let mut outline: std::collections::HashMap<String, (Vec<(u32, u8)>, Vec<(u32, u8)>)> =
         std::collections::HashMap::new();
     for s in &wb.sheets {
         if !s.layout_dirty {
@@ -2039,6 +2075,19 @@ pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyh
                 rows.push((*r, None, true));
             }
         }
+        // 只有分级、没有尺寸/隐藏的行也要有 <row> 元素，否则 outlineLevel 无处可挂
+        for r in s.row_levels.keys() {
+            if !rows.iter().any(|(x, _, _)| x == r) {
+                rows.push((*r, None, false));
+            }
+        }
+        let mut rl: Vec<(u32, u8)> = s.row_levels.iter().map(|(r, l)| (*r, *l)).collect();
+        rl.sort();
+        let mut cl: Vec<(u32, u8)> = s.col_levels.iter().map(|(c, l)| (*c, *l)).collect();
+        cl.sort();
+        if !rl.is_empty() || !cl.is_empty() {
+            outline.insert(part.clone(), (cl, rl));
+        }
         map.insert(part.clone(), (cols, rows));
     }
     if map.is_empty() {
@@ -2049,6 +2098,9 @@ pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyh
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = set_cols_xml(&xml, cols);
                 x = set_row_sizes(&x, rows);
+                if let Some((cl, rl)) = outline.get(name) {
+                    x = apply_outline(&x, rl, cl);
+                }
                 return x.into_bytes();
             }
         }
