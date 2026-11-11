@@ -82,6 +82,11 @@ pub fn apply_theme(ctx: &egui::Context) {
     base.spacing.item_spacing = Vec2::new(4.0, 3.0);
     base.spacing.button_padding = Vec2::new(7.0, 2.0);
     base.spacing.interact_size.y = 24.0;
+    base.spacing.scroll.floating = false;
+    base.spacing.scroll.bar_width = 12.0;
+    base.spacing.scroll.bar_inner_margin = 2.0;
+    base.spacing.scroll.bar_outer_margin = 0.0;
+    base.spacing.scroll.handle_min_length = 24.0;
     base.spacing.menu_margin = egui::Margin {
         left: 4,
         right: 4,
@@ -99,17 +104,17 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.widgets.noninteractive.bg_fill = Color32::WHITE;
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
         v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.inactive.bg_fill = Color32::WHITE;
+        v.widgets.inactive.bg_fill = Color32::from_rgb(243, 242, 241);
         v.widgets.inactive.weak_bg_fill = Color32::WHITE;
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(171, 169, 167));
         v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
         v.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
-        v.widgets.hovered.bg_fill = HOVER;
+        v.widgets.hovered.bg_fill = Color32::from_rgb(237, 235, 233);
         v.widgets.hovered.weak_bg_fill = HOVER;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(140, 138, 136));
         v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
         v.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
-        v.widgets.active.bg_fill = PRESSED;
+        v.widgets.active.bg_fill = Color32::from_rgb(225, 223, 221);
         v.widgets.active.weak_bg_fill = PRESSED;
         v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
         v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
@@ -673,13 +678,36 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// 主按钮（确定/应用）：Excel 绿
-pub fn primary_button(ui: &mut egui::Ui, label: &str) -> Response {
+pub struct BtnResp {
+    pub clicked: bool,
+}
+impl BtnResp {
+    pub fn clicked(&self) -> bool {
+        self.clicked
+    }
+}
+
+pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
     let btn = egui::Button::new(RichText::new(label).color(ACCENT).size(12.0))
         .fill(Color32::WHITE)
         .stroke(Stroke::new(1.0, ACCENT))
         .corner_radius(2.0)
         .min_size(Vec2::new(75.0, 24.0));
-    ui.add(btn)
+    let resp = ui.add(btn);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            resp.rect.shrink(1.5),
+            1.5,
+            Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter))
+        && ui.ctx().memory(|m| m.focused().is_none())
+        && !ui.ctx().memory(|m| m.any_popup_open());
+    BtnResp {
+        clicked: resp.clicked() || enter,
+    }
 }
 
 /// 次要按钮（取消/关闭）：白底灰边，和 Excel 对话框一致
@@ -856,6 +884,21 @@ impl Dlg {
             .data(|d| d.get_temp::<f32>(id.with("h")))
             .unwrap_or(self.height);
         let mut closed = false;
+        let now = ctx.input(|i| i.time);
+        let last = ctx
+            .data(|d| d.get_temp::<f64>(id.with("shown")))
+            .unwrap_or(-10.0);
+        let born = if now - last > 0.5 {
+            now
+        } else {
+            ctx.data(|d| d.get_temp::<f64>(id.with("born")))
+                .unwrap_or(now)
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(id.with("born"), born);
+            d.insert_temp(id.with("shown"), now);
+            d.insert_temp(egui::Id::new("dlg_born"), born);
+        });
         // 模态遮挡：对话框打开时吞掉背景点击
         egui::Area::new(id.with("block"))
             .order(egui::Order::Middle)
@@ -901,7 +944,7 @@ impl Dlg {
                                 egui::pos2(trect.left(), trect.bottom() - 0.5),
                                 egui::pos2(trect.right(), trect.bottom() - 0.5),
                             ],
-                            Stroke::new(1.0, Color32::from_rgb(225, 223, 221)),
+                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(225, 223, 221)),
                         );
                         ui.painter().text(
                             egui::pos2(trect.left() + 12.0, trect.center().y),
@@ -935,6 +978,7 @@ impl Dlg {
                             [crect.center() + egui::vec2(k, -k), crect.center() + egui::vec2(-k, k)],
                             st,
                         );
+                        let cresp = cresp.on_hover_text("关闭");
                         if cresp.clicked() {
                             closed = true;
                         }
@@ -952,6 +996,7 @@ impl Dlg {
                             .show(ui, |ui| {
                                 ui.set_width(w - 32.0);
                                 ui.set_max_width(w - 32.0);
+                                ui.spacing_mut().interact_size.y = 20.0;
                                 if h > 0.0 {
                                     egui::ScrollArea::vertical()
                                         .max_height(h)
@@ -992,7 +1037,7 @@ impl Dlg {
                 ui.painter().rect_stroke(
                     fr.response.rect.shrink(0.5),
                     4.0,
-                    Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
+                    Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(179, 177, 175)),
                     egui::StrokeKind::Inside,
                 );
                 fr.inner
@@ -1012,13 +1057,85 @@ impl Dlg {
     }
 }
 
+/// 对话框刚打开时把焦点给第一个输入框
+pub fn autofocus(ui: &mut egui::Ui, resp: &Response) {
+    let now = ui.input(|i| i.time);
+    let born = ui
+        .ctx()
+        .data(|d| d.get_temp::<f64>(egui::Id::new("dlg_born")))
+        .unwrap_or(-10.0);
+    if now - born < 0.6 && ui.ctx().memory(|m| m.focused().is_none()) {
+        resp.request_focus();
+    }
+}
+
+/// 带常驻上下微调箭头的数字框（20px 高）
+pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::click());
+    let v0 = *v;
+    let a = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 12.0, rect.top()),
+        Vec2::new(12.0, 10.0),
+    );
+    let b = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 12.0, rect.top() + 10.0),
+        Vec2::new(12.0, 10.0),
+    );
+    let ar = ui.interact(a, ui.id().with(("spinup", rect.left() as i32)), Sense::click());
+    let br = ui.interact(b, ui.id().with(("spindn", rect.left() as i32)), Sense::click());
+    if ar.clicked() {
+        *v = (*v + step).min(max);
+    }
+    if br.clicked() {
+        *v = (*v - step).max(min);
+    }
+    ui.painter().rect(
+        rect,
+        2.0,
+        Color32::WHITE,
+        Stroke::new(1.0, Color32::from_rgb(171, 169, 167)),
+        egui::StrokeKind::Inside,
+    );
+    let txt = if (step.fract()).abs() < 1e-9 {
+        format!("{:.0}", *v)
+    } else {
+        format!("{:.1}", *v)
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        txt,
+        FontId::proportional(12.0),
+        TEXT,
+    );
+    let cc = Color32::from_rgb(68, 68, 68);
+    let st = Stroke::new(1.0, cc);
+    for (r, up) in [(a, true), (b, false)] {
+        if (up && ar.hovered()) || (!up && br.hovered()) {
+            ui.painter().rect_filled(r, 0.0, HOVER);
+        }
+        let c = r.center();
+        let dy = if up { 1.5 } else { -1.5 };
+        ui.painter().line_segment(
+            [egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 3.0, c.y - dy)],
+            st,
+        );
+    }
+    ui.painter().line_segment(
+        [egui::pos2(a.left(), a.bottom()), egui::pos2(a.right(), a.bottom())],
+        Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+    );
+    let _ = resp;
+    (*v - v0).abs() > 1e-9
+}
+
 /// 对话框标签页（Excel 的文件夹式页签）
 pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
     let top = ui.cursor().top();
     let left = ui.cursor().left();
     let right = left + ui.available_width();
     ui.painter().line_segment(
-        [egui::pos2(left, top + 26.0), egui::pos2(right, top + 26.0)],
+        [egui::pos2(left, top + 25.5), egui::pos2(right, top + 25.5)],
         Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
     );
     ui.horizontal(|ui| {
@@ -1042,7 +1159,7 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 );
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+                        egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0),
                         egui::pos2(rect.right() - 1.0, rect.bottom()),
                     ),
                     0.0,

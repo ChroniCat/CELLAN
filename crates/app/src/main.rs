@@ -6951,12 +6951,9 @@ impl SheetApp {
             });
             ui.horizontal(|ui| {
                 ui.label("字号");
-                let mut sz = d.size.max(11.0);
-                if ui
-                    .add(egui::DragValue::new(&mut sz).range(6.0..=72.0).speed(1.0))
-                    .changed()
-                {
-                    d.size = sz;
+                let mut sz = d.size.max(11.0) as f64;
+                if ui_kit::spin(ui, &mut sz, 6.0, 72.0, 1.0, 54.0) {
+                    d.size = sz as f32;
                 }
                 if ui.button("应用到选中").clicked() {
                     let sz = d.size.max(6.0);
@@ -7036,7 +7033,8 @@ impl SheetApp {
         ui_kit::window(ctx, "插入超链接", 380.0).open(&mut open).show(ctx, |ui| {
             dlg_section(ui, "链接");
             ui_kit::field(ui, "地址", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut url).desired_width(260.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut url).desired_width(260.0));
+                ui_kit::autofocus(ui, &r);
             });
             ui_kit::field(ui, "显示文字", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).desired_width(260.0));
@@ -8598,13 +8596,11 @@ impl SheetApp {
         ui_kit::window(ctx, title, 260.0).open(&mut open).show(ctx, |ui| {
             ui.add_space(4.0);
             ui_kit::field(ui, "像素", |ui| {
-                let range = if is_col { 8.0..=1500.0 } else { 4.0..=409.0 };
-                ui.add(
-                    egui::DragValue::new(&mut value)
-                        .speed(1.0)
-                        .range(range)
-                        .fixed_decimals(0),
-                );
+                let (lo, hi) = if is_col { (8.0, 1500.0) } else { (4.0, 409.0) };
+                let mut vv = value as f64;
+                if ui_kit::spin(ui, &mut vv, lo, hi, 1.0, 72.0) {
+                    value = vv as f32;
+                }
             });
             ui_kit::footer(ui, |ui| {
                 if ui_kit::primary_button(ui, "确定").clicked() {
@@ -10061,11 +10057,12 @@ impl SheetApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label("格式：表名!A1:C10");
-                ui.add(
+                let r = ui.add(
                     egui::TextEdit::singleline(&mut text)
                         .desired_width(f32::INFINITY)
                         .hint_text("销售!A1:C100"),
                 );
+                ui_kit::autofocus(ui, &r);
                 ui.add_space(4.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -11855,12 +11852,10 @@ impl SheetApp {
                                 });
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new("字号").size(11.5).weak());
-                            ui.add_sized(
-                                [46.0, 22.0],
-                                egui::DragValue::new(&mut self.fmt_state.size)
-                                    .range(6.0..=72.0)
-                                    .fixed_decimals(0),
-                            );
+                            let mut szv = self.fmt_state.size as f64;
+                            if ui_kit::spin(ui, &mut szv, 6.0, 72.0, 1.0, 50.0) {
+                                self.fmt_state.size = szv as f32;
+                            }
                         });
                         ui.end_row();
 
@@ -11992,9 +11987,9 @@ impl SheetApp {
                             }
                             ui.add_space(12.0);
                             ui.label(egui::RichText::new("缩进").size(11.5).weak());
-                            let mut ind = self.fmt_state.indent as i32;
-                            if ui.add(egui::DragValue::new(&mut ind).range(0..=15)).changed() {
-                                self.fmt_state.indent = ind.clamp(0, 15) as u8;
+                            let mut ind = self.fmt_state.indent as f64;
+                            if ui_kit::spin(ui, &mut ind, 0.0, 15.0, 1.0, 50.0) {
+                                self.fmt_state.indent = ind as u8;
                             }
                         });
                         ui.end_row();
@@ -12173,6 +12168,7 @@ impl SheetApp {
                 ui.horizontal(|ui| {
                     ui.label("名称");
                     let r = ui.text_edit_singleline(&mut name);
+                    ui_kit::autofocus(ui, &r);
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         ok = true;
                     }
@@ -12210,6 +12206,7 @@ impl SheetApp {
                         [ui.available_width(), 22.0],
                         egui::TextEdit::singleline(&mut self.find.find),
                     );
+                    ui_kit::autofocus(ui, &r);
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         do_find = true;
                     }
@@ -12446,9 +12443,9 @@ impl SheetApp {
                         if !auto {
                             let mut lo = ch.y_min.unwrap_or(0.0);
                             let mut hi = ch.y_max.unwrap_or(0.0);
-                            ui.add(egui::DragValue::new(&mut lo).speed(1.0));
+                            ui_kit::spin(ui, &mut lo, -1e9, 1e9, 1.0, 64.0);
                             ui.label("到");
-                            ui.add(egui::DragValue::new(&mut hi).speed(1.0));
+                            ui_kit::spin(ui, &mut hi, -1e9, 1e9, 1.0, 64.0);
                             ch.y_min = Some(lo);
                             ch.y_max = Some(hi);
                         }
@@ -12742,7 +12739,10 @@ impl SheetApp {
 
                     if let sheetcore::pivot::GroupBy::Bucket(w) = &mut spec.group {
                         ui.label("区间宽度");
-                        ui.add(egui::DragValue::new(w).speed(1.0).range(0.1..=1e9));
+                        let mut wv = *w;
+                        if ui_kit::spin(ui, &mut wv, 0.1, 1e9, 1.0, 72.0) {
+                            *w = wv;
+                        }
                         ui.end_row();
                     }
 
