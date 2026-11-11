@@ -481,52 +481,25 @@ pub fn labeled_tint(
 
 /// 选项右侧的小三角（下拉菜单按钮用）
 pub fn caret(ui: &mut egui::Ui, center: egui::Pos2, color: Color32) {
-    // 5×3 的 V，用 1:1 纹理画，像素级锐利、无抗锯齿灰边
-    let tex = chevron_tex(ui.ctx(), false, color);
-    let ppp = ui.ctx().pixels_per_point();
-    let x = (center.x * ppp - 2.5).round() / ppp;
-    let y = (center.y * ppp - 1.5).round() / ppp;
-    ui.painter().image(
-        tex.id(),
-        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(5.0 / ppp, 3.0 / ppp)),
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
-}
-
-fn chevron_tex(ctx: &egui::Context, right: bool, color: Color32) -> egui::TextureHandle {
-    let id = egui::Id::new(("chevron-tex", right));
-    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return t;
-    }
-    let (w, h) = if right { (3usize, 5usize) } else { (5usize, 3usize) };
-    let mut img = egui::ColorImage::new([w, h], Color32::TRANSPARENT);
-    let pts: &[(usize, usize)] = if right {
-        &[(0, 0), (1, 1), (2, 2), (1, 3), (0, 4)]
-    } else {
-        &[(0, 0), (1, 1), (2, 2), (3, 1), (4, 0)]
-    };
-    for &(x, y) in pts {
-        img[(x, y)] = color;
-    }
-    let t = ctx.load_texture("chevron", img, egui::TextureOptions::NEAREST);
-    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
-    t
+    // 细 V 形折线（Excel 下拉箭头），1px 描边
+    let st = Stroke::new(1.0, color);
+    let (w, h) = (2.5, 1.5);
+    ui.painter()
+        .line_segment([center + Vec2::new(-w, -h), center + Vec2::new(0.0, h)], st);
+    ui.painter()
+        .line_segment([center + Vec2::new(0.0, h), center + Vec2::new(w, -h)], st);
 }
 
 /// 右向细折线箭头（子菜单）
 pub fn caret_right(ui: &mut egui::Ui, center: egui::Pos2, color: Color32) {
-    let tex = chevron_tex(ui.ctx(), true, color);
-    let ppp = ui.ctx().pixels_per_point();
-    let x = (center.x * ppp - 1.5).round() / ppp;
-    let y = (center.y * ppp - 2.5).round() / ppp;
-    ui.painter().image(
-        tex.id(),
-        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(3.0 / ppp, 5.0 / ppp)),
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
+    let st = Stroke::new(1.0, color);
+    ui.painter()
+        .line_segment([center + Vec2::new(-1.5, -2.5), center + Vec2::new(1.5, 0.0)], st);
+    ui.painter()
+        .line_segment([center + Vec2::new(1.5, 0.0), center + Vec2::new(-1.5, 2.5)], st);
 }
+
+
 
 /// 拆分按钮右侧的小箭头按钮：悬停底色 + 细折线箭头
 pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Response {
