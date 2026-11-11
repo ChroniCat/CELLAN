@@ -586,6 +586,8 @@ struct SheetApp {
     cell_move: Option<((u32, u32), egui::Pos2, bool)>,
     /// 拖动行号/列标移动整行整列：(是否行, 起始索引, 行/列数)
     header_move: Option<(bool, u32, u32)>,
+    /// 待执行的自适应（无界面验收用）：(是否列, 索引)
+    pending_autofit: Option<(bool, u32)>,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -902,6 +904,7 @@ impl SheetApp {
             extra_sel: Vec::new(),
             cell_move: None,
             header_move: None,
+            pending_autofit: None,
             view_mode: std::env::var("SC_VIEW_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1899,19 +1902,13 @@ impl SheetApp {
                         let parts: Vec<&str> = spec.split(':').collect();
                         if parts.len() == 2 {
                             if let Ok(idx) = parts[1].trim().parse::<u32>() {
-                                if parts[0].trim() == "c" {
-                                    let before = self.wb.sheet(self.sheet_idx).cols.size(idx);
-                                    let ctx2 = ctx.clone();
-                                    self.autofit_col(&ctx2, idx);
-                                    let after = self.wb.sheet(self.sheet_idx).cols.size(idx);
-                                    eprintln!("[autofit] 列{idx} {before:.0} -> {after:.0}");
+                                let before = if parts[0].trim() == "c" {
+                                    self.wb.sheet(self.sheet_idx).cols.size(idx)
                                 } else {
-                                    let before = self.wb.sheet(self.sheet_idx).rows.size(idx);
-                                    let ctx2 = ctx.clone();
-                                    self.autofit_row(&ctx2, idx);
-                                    let after = self.wb.sheet(self.sheet_idx).rows.size(idx);
-                                    eprintln!("[autofit] 行{idx} {before:.0} -> {after:.0}");
-                                }
+                                    self.wb.sheet(self.sheet_idx).rows.size(idx)
+                                };
+                                self.pending_autofit = Some((parts[0].trim() == "c", idx));
+                                eprintln!("[autofit] 登记 {spec} 原尺寸 {before:.0}");
                             }
                         }
                     }
@@ -16909,6 +16906,19 @@ impl SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some((is_col, idx)) = self.pending_autofit.take() {
+            if is_col {
+                let before = self.wb.sheet(self.sheet_idx).cols.size(idx);
+                self.autofit_col(ctx, idx);
+                let after = self.wb.sheet(self.sheet_idx).cols.size(idx);
+                eprintln!("[autofit] 列{idx} {before:.0} -> {after:.0}");
+            } else {
+                let before = self.wb.sheet(self.sheet_idx).rows.size(idx);
+                self.autofit_row(ctx, idx);
+                let after = self.wb.sheet(self.sheet_idx).rows.size(idx);
+                eprintln!("[autofit] 行{idx} {before:.0} -> {after:.0}");
+            }
+        }
         if self.chart_auto && !self.wb.sheet(self.sheet_idx).charts.is_empty() {
             self.chart_sel = Some(0);
             self.ribbon_tab = 101;
