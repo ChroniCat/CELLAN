@@ -583,7 +583,7 @@ struct SheetApp {
     /// Ctrl+点击追加的多块选区
     extra_sel: Vec<(u32, u32, u32, u32)>,
     /// 拖动选区移动：起点格 + 指针起点
-    cell_move: Option<((u32, u32), egui::Pos2)>,
+    cell_move: Option<((u32, u32), egui::Pos2, bool)>,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -1861,6 +1861,35 @@ impl SheetApp {
                     if std::env::var("SC_UNDERLINE").is_ok() {
                         self.apply_style(|s| s.underline = true);
                         eprintln!("[ul] 选区下划线={}", self.current_style().underline);
+                    }
+                    // 无界面验收：SC_DRAG=r1,c1,r2,c2,dr,dc[,copy] 直接走「拖动边框移动/复制」
+                    if let Ok(spec) = std::env::var("SC_DRAG") {
+                        let v: Vec<i64> = spec
+                            .split(',')
+                            .filter_map(|x| x.trim().parse::<i64>().ok())
+                            .collect();
+                        if v.len() >= 6 {
+                            self.sel = (v[0].max(0) as u32, v[1].max(0) as u32);
+                            self.sel_end = (v[2].max(0) as u32, v[3].max(0) as u32);
+                            let (dr, dc) = (v[4], v[5]);
+                            let copy = spec.split(',').nth(6).map(|s| s.trim() == "1").unwrap_or(false);
+                            if copy {
+                                self.copy_selection_by(dr, dc);
+                            } else {
+                                self.move_selection_by(dr, dc);
+                            }
+                            eprintln!("[drag] {} -> {}", spec, self.status);
+                            let sh = self.wb.sheet(self.sheet_idx);
+                            eprintln!(
+                                "[drag] 源A1={:?} 目标={:?}",
+                                sh.get(0, 0).map(|c| c.value.display()),
+                                sh.get(
+                                    (v[2].max(0) as i64 + dr).max(0) as u32,
+                                    (v[3].max(0) as i64 + dc).max(0) as u32
+                                )
+                                .map(|c| c.value.display())
+                            );
+                        }
                     }
                     if let Ok(out) = std::env::var("SC_SAVE") {
                         let target = PathBuf::from(&out);
@@ -5526,6 +5555,110 @@ impl SheetApp {
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
         self.status = format!("已移动到 {}", sheetcore::model::cell_name(nr1, nc1));
+    }
+
+    /// Ctrl+拖动选区边框：复制到新位置（源保留）
+    fn copy_selection_by(&mut self, dr: i64, dc: i64) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let nr1 = (r1 as i64 + dr).max(0) as u32;
+        let nc1 = (c1 as i64 + dc).max(0) as u32;
+        let nr2 = nr1 + (r2 - r1);
+        let nc2 = nc1 + (c2 - c1);
+        if (nr1, nc1) == (r1, c1) {
+            return;
+        }
+        let mut keys = sheetcore::undo::rect_keys(nr1, nc1, nr2, nc2);
+        keys.extend(sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let txn = self.txn_begin(&keys);
+        // 先把源区域的快照取出来（不改源）
+        let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).cloned() {
+                    let st = self
+                        .wb
+                        .sheet(self.sheet_idx)
+                        .styles
+                        .get(&sheetcore::model::CellRef::new(r, c))
+                        .copied();
+                    cells.push((r - r1, c - c1, cell, st));
+                }
+            }
+        }
+        let notes: Vec<_> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .notes
+            .iter()
+            .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+            .map(|(k, v)| ((k.row - r1, k.col - c1), v.clone()))
+            .collect();
+        let rich: Vec<_> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .rich
+            .iter()
+            .filter(|((r, c), _)| *r >= r1 && *r <= r2 && *c >= c1 && *c <= c2)
+            .map(|((r, c), v)| ((r - r1, c - c1), v.clone()))
+            .collect();
+        let links: Vec<_> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .hyperlinks
+            .iter()
+            .filter(|((r, c), _)| *r >= r1 && *r <= r2 && *c >= c1 && *c <= c2)
+            .map(|((r, c), v)| ((r - r1, c - c1), v.clone()))
+            .collect();
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            // 目标区域先清空（Excel 复制粘贴也是覆盖）
+            for r in nr1..=nr2 {
+                for c in nc1..=nc2 {
+                    sh.remove(r, c);
+                    sh.styles.remove(&sheetcore::model::CellRef::new(r, c));
+                    sh.notes.remove(&sheetcore::model::CellRef::new(r, c));
+                    sh.rich.remove(&(r, c));
+                    sh.hyperlinks.remove(&(r, c));
+                }
+            }
+            for ((r, c), n) in notes {
+                sh.notes.insert(sheetcore::model::CellRef::new(nr1 + r, nc1 + c), n);
+            }
+            for ((r, c), v) in rich {
+                sh.rich.insert((nr1 + r, nc1 + c), v);
+                sh.rich_dirty = true;
+            }
+            for ((r, c), v) in links {
+                sh.hyperlinks.insert((nr1 + r, nc1 + c), v);
+                sh.hyperlinks_dirty = true;
+            }
+            for (dr0, dc0, cell, st) in cells {
+                let (r, c) = (nr1 + dr0, nc1 + dc0);
+                let mut cell = cell;
+                if let Some(f) = cell.formula.clone() {
+                    // 相对引用按实际位移平移；往左上时 shift_formula 只接受无符号，保持原样更安全
+                    if dr >= 0 && dc >= 0 {
+                        cell.formula =
+                            Some(sheetcore::cf::shift_formula(&f, dr as u32, dc as u32).into());
+                    }
+                }
+                sh.set(r, c, cell);
+                if let Some(id) = st {
+                    sh.set_style(r, c, id);
+                }
+            }
+        }
+        self.txn_end("复制单元格", txn);
+        self.sel = (nr1, nc1);
+        self.sel_end = (nr2, nc2);
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.wb.dirty = true;
+        self.status = format!("已复制到 {}", sheetcore::model::cell_name(nr1, nc1));
     }
 
     /// 插入/删除单元格（down_or_up: true=插入；horizontal: true=右移/左移）
@@ -14534,25 +14667,52 @@ impl SheetApp {
             && self.row_drag.is_none()
             && self.chart_drag.is_none()
         {
-            if let Some(p) = resp.interact_pointer_pos() {
+            // drag_started 在指针已经移动后才触发：必须用「按下时」的位置判边框，
+            // 否则永远点不中那 3~4px 的边（以前就是这么点不动的）
+            let press = ui
+                .ctx()
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| resp.interact_pointer_pos());
+            if let Some(p) = press {
                 if p.x > origin.x + head_w && p.y > origin.y + hh {
                     let (r1, c1, r2, c2) = self.sel_rect();
                     let boxr = Rect::from_min_max(
                         egui::pos2(px_of(c1), py_of(r1)),
                         egui::pos2(px_of(c2 + 1), py_of(r2 + 1)),
                     );
-                    let near_border = boxr.contains(p)
-                        && (p.x - boxr.left()).abs() <= 3.5
-                            || (p.x - boxr.right()).abs() <= 3.5
-                            || (p.y - boxr.top()).abs() <= 3.5
-                            || (p.y - boxr.bottom()).abs() <= 3.5;
+                    // 边框环：离边框 4px 以内、且不在选区内部
+                    let near_border =
+                        boxr.expand(4.0).contains(p) && !boxr.shrink(4.0).contains(p);
                     if near_border {
-                        self.cell_move = Some(((row_at(p.y), col_at(p.x)), p));
+                        let copy = ui.input(|i| i.modifiers.command);
+                        self.cell_move = Some(((row_at(p.y), col_at(p.x)), p, copy));
                     }
                 }
             }
         }
-        if let Some((start, _sp)) = self.cell_move {
+        if let Some((start, _sp, copy)) = self.cell_move {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(p) = resp.interact_pointer_pos() {
+                let (tr, tc) = (row_at(p.y), col_at(p.x));
+                let dr = tr as i64 - start.0 as i64;
+                let dc = tc as i64 - start.1 as i64;
+                // 目标位置画个虚框，拖的时候能看见要放到哪
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let nr1 = (r1 as i64 + dr).max(0) as u32;
+                let nc1 = (c1 as i64 + dc).max(0) as u32;
+                let nr2 = nr1 + (r2 - r1);
+                let nc2 = nc1 + (c2 - c1);
+                let g = Rect::from_min_max(
+                    egui::pos2(px_of(nc1), py_of(nr1)),
+                    egui::pos2(px_of(nc2 + 1), py_of(nr2 + 1)),
+                );
+                painter.rect_stroke(
+                    g,
+                    0.0,
+                    Stroke::new(1.5, Color32::from_rgb(120, 120, 120)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if resp.drag_stopped() {
                 self.cell_move = None;
                 if let Some(p) = resp.interact_pointer_pos() {
@@ -14560,7 +14720,13 @@ impl SheetApp {
                     let dr = tr as i64 - start.0 as i64;
                     let dc = tc as i64 - start.1 as i64;
                     if dr != 0 || dc != 0 {
-                        self.move_selection_by(dr, dc);
+                        // 松开这一刻的 Ctrl 状态说了算（按下时的可能晚一帧才到）
+                        let ctrl_now = ui.input(|i| i.modifiers.command);
+                        if copy || ctrl_now {
+                            self.copy_selection_by(dr, dc);
+                        } else {
+                            self.move_selection_by(dr, dc);
+                        }
                     }
                 }
             }
@@ -14581,6 +14747,22 @@ impl SheetApp {
                     let c = col_at(pos.x);
                     let r = row_at(pos.y);
                     self.sel_end = (r, c);
+                }
+            }
+        }
+
+        // 悬停在选区边框：给四向移动光标（不然用户根本不知道能拖）
+        if !readonly && self.cell_move.is_none() && resp.hovered() {
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                if p.x > origin.x + head_w && p.y > origin.y + hh {
+                    let (r1, c1, r2, c2) = self.sel_rect();
+                    let boxr = Rect::from_min_max(
+                        egui::pos2(px_of(c1), py_of(r1)),
+                        egui::pos2(px_of(c2 + 1), py_of(r2 + 1)),
+                    );
+                    if boxr.expand(3.5).contains(p) && !boxr.shrink(3.5).contains(p) {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
                 }
             }
         }
