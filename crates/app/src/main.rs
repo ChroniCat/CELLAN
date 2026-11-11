@@ -1303,6 +1303,7 @@ impl SheetApp {
                             }
                         }
                         Ok("scen") => {
+                            self.scen_dlg = true;
                             // SC_SCEN_ADD="名称:A1:B1" 保存方案；SC_SCEN_SHOW=名称 应用；SC_SCEN_SUMMARY=1 生成摘要
                             if let Ok(spec) = std::env::var("SC_SCEN_ADD") {
                                 if let Some((name, range)) = spec.split_once(':') {
