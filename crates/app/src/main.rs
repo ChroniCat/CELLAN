@@ -9529,19 +9529,24 @@ impl SheetApp {
             .default_width(280.0)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("批注内容").size(11.5).weak());
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
-                        .desired_rows(4)
+                        .desired_rows(5)
                         .desired_width(f32::INFINITY)
                         .hint_text("写点什么…"),
                 );
+                ui.add_space(4.0);
+                ui.separator();
                 ui.horizontal(|ui| {
-                    if ui_kit::primary_button(ui, "确定").clicked() {
-                        apply = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        cancel = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                        if ui_kit::primary_button(ui, "确定").clicked() {
+                            apply = true;
+                        }
+                    });
                 });
             });
         if apply {
@@ -10058,13 +10063,17 @@ impl SheetApp {
                         .desired_width(f32::INFINITY)
                         .hint_text("销售!A1:C100"),
                 );
+                ui.add_space(4.0);
+                ui.separator();
                 ui.horizontal(|ui| {
-                    if ui_kit::primary_button(ui, "确定").clicked() {
-                        apply = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        ui.close_menu();
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            ui.close_menu();
+                        }
+                        if ui_kit::primary_button(ui, "确定").clicked() {
+                            apply = true;
+                        }
+                    });
                 });
             });
         if apply {
