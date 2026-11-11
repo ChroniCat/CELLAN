@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.55";
+const APP_VERSION: &str = "1.56";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -1299,6 +1299,27 @@ impl SheetApp {
                                             Err(e) => eprintln!("[goal] fail {e}"),
                                         }
                                     }
+                                }
+                            }
+                        }
+                        Ok("addsheet") => {
+                            if let Ok(name) = std::env::var("SC_ADD_SHEET") {
+                                let mut sh = sheetcore::model::Sheet::new(&name);
+                                sh.set(
+                                    0,
+                                    0,
+                                    sheetcore::model::Cell {
+                                        value: sheetcore::model::Value::Text("新表".into()),
+                                        formula: None,
+                                    },
+                                );
+                                let idx = self.wb.sheets.len();
+                                if sheetcore::sheet_ops::insert_sheet(&mut self.wb, idx, sh) {
+                                    self.sheet_idx = idx;
+                                    self.finish_sheet_change();
+                                    eprintln!("[addsheet] ok {name} sheets={}", self.wb.sheets.len());
+                                } else {
+                                    eprintln!("[addsheet] fail {name}");
                                 }
                             }
                         }
@@ -5989,8 +6010,7 @@ impl SheetApp {
         parse_a1_ref(t).map(|(r, c)| (r, c, r, c))
     }
 
-    /// 生成「方案摘要」：直接写在本表已用区域下方（Excel 会新建一个工作表，
-    /// 但我们的保存链对「临时新增工作表」还不够稳，先落在本表，功能不打折）。
+    /// 生成「方案摘要」工作表（和 Excel 一样：新建一张表，每行一个方案）
     fn build_scenario_summary(&mut self) -> Result<String, String> {
         let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
         if list.is_empty() {
@@ -6005,55 +6025,57 @@ impl SheetApp {
             }
         }
         keys.sort();
-        let top = self
-            .wb
-            .sheet(self.sheet_idx)
-            .used_bounds()
-            .map(|(_, _, r2, _)| r2 + 2)
-            .unwrap_or(0);
-        {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut put = |r: u32, c: u32, v: sheetcore::model::Value| {
-                sh.set(
-                    r,
-                    c,
-                    sheetcore::model::Cell {
-                        value: v,
-                        formula: None,
-                    },
-                );
-            };
-            put(
-                top,
-                0,
-                sheetcore::model::Value::Text("方案摘要".into()),
-            );
-            for (i, (r, c)) in keys.iter().enumerate() {
-                put(
-                    top + 1,
-                    i as u32 + 1,
-                    sheetcore::model::Value::Text(cell_name(*r, *c).into()),
-                );
-            }
-            for (i, sc) in list.iter().enumerate() {
-                let row = top + 2 + i as u32;
-                put(row, 0, sheetcore::model::Value::Text(sc.name.clone().into()));
-                for (j, k) in keys.iter().enumerate() {
-                    let v = sc
-                        .cells
-                        .iter()
-                        .find(|(kk, _)| kk == k)
-                        .map(|(_, v)| sheetcore::scenarios::apply_value(v))
-                        .unwrap_or_default();
-                    put(row, j as u32 + 1, v);
-                }
-            }
-            sh.layout_dirty = true;
+        let mut base = "方案摘要".to_string();
+        let mut n = 1;
+        while self.wb.sheets.iter().any(|s| s.name == base) {
+            n += 1;
+            base = format!("方案摘要{n}");
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        let last = top + 1 + list.len() as u32;
-        Ok(format!("{}:{}", cell_name(top, 0), cell_name(last, keys.len() as u32)))
+        let mut sh = sheetcore::model::Sheet::new(&base);
+        let mut put = |sh: &mut sheetcore::model::Sheet,
+                       r: u32,
+                       c: u32,
+                       v: sheetcore::model::Value| {
+            sh.set(
+                r,
+                c,
+                sheetcore::model::Cell {
+                    value: v,
+                    formula: None,
+                },
+            );
+        };
+        put(&mut sh, 0, 0, sheetcore::model::Value::Text("方案摘要".into()));
+        for (i, (r, c)) in keys.iter().enumerate() {
+            put(
+                &mut sh,
+                1,
+                i as u32 + 1,
+                sheetcore::model::Value::Text(cell_name(*r, *c).into()),
+            );
+        }
+        for (i, sc) in list.iter().enumerate() {
+            let row = i as u32 + 2;
+            put(&mut sh, row, 0, sheetcore::model::Value::Text(sc.name.clone().into()));
+            for (j, k) in keys.iter().enumerate() {
+                let v = sc
+                    .cells
+                    .iter()
+                    .find(|(kk, _)| kk == k)
+                    .map(|(_, v)| sheetcore::scenarios::apply_value(v))
+                    .unwrap_or_default();
+                put(&mut sh, row, j as u32 + 1, v);
+            }
+        }
+        let idx = self.wb.sheets.len();
+        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, idx, sh) {
+            return Err("新建摘要表失败".into());
+        }
+        self.sheet_idx = idx;
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        self.finish_sheet_change();
+        Ok(base)
     }
 
     fn goal_window(&mut self, ctx: &egui::Context) {
