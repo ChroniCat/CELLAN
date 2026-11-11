@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.57";
+const APP_VERSION: &str = "1.58";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -476,6 +476,10 @@ struct SheetApp {
     ec: ErrorCheckOptions,
     /// 错误检查选项对话框
     ec_options: bool,
+    /// 校对（拼写检查）对话框
+    proof_dlg: bool,
+    proof_list: Vec<sheetcore::proof::ProofIssue>,
+    proof_rules: sheetcore::proof::ProofRules,
     /// 绿三角缓存（按 doc_gen 失效）
     error_marks: std::collections::HashSet<(u32, u32)>,
     /// 循环引用的格子（当前表），状态栏提示用
@@ -800,6 +804,9 @@ impl SheetApp {
             dtable_msg: String::new(),
             ec: ErrorCheckOptions::load(),
             ec_options: false,
+            proof_dlg: false,
+            proof_list: Vec::new(),
+            proof_rules: sheetcore::proof::ProofRules::default(),
             error_marks: std::collections::HashSet::new(),
             cycles: Vec::new(),
             cycles_key: (u64::MAX, u64::MAX),
@@ -1369,6 +1376,43 @@ impl SheetApp {
                                 }
                             }
                         }
+                        Ok("detail") => {
+                            // SC_DETAIL="r1,r2" 收/展这一段的明细；SC_DETAIL_HIDE=0 表示展开
+                            if let Ok(spec) = std::env::var("SC_DETAIL") {
+                                let mut it = spec.split(',');
+                                if let (Some(a0), Some(b0)) = (it.next(), it.next()) {
+                                    if let (Ok(r1), Ok(r2)) =
+                                        (a0.trim().parse::<u32>(), b0.trim().parse::<u32>())
+                                    {
+                                        self.sel = (r1, 0);
+                                        self.sel_end = (r2, 0);
+                                        let hide = std::env::var("SC_DETAIL_HIDE")
+                                            .map(|v| v != "0")
+                                            .unwrap_or(true);
+                                        self.toggle_detail(hide);
+                                        eprintln!(
+                                            "[detail] {} hidden={:?}",
+                                            self.status,
+                                            {
+                                                let mut v: Vec<u32> = self
+                                                    .wb
+                                                    .sheet(self.sheet_idx)
+                                                    .hidden_rows_user
+                                                    .iter()
+                                                    .copied()
+                                                    .collect();
+                                                v.sort();
+                                                v
+                                            }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok("proof") => {
+                            self.open_proof();
+                            eprintln!("[proof] issues={} first={:?}", self.proof_list.len(), self.proof_list.first().map(|i| (i.row, i.col, i.kind)));
+                        }
                         Ok("zh") => {
                             if let (Ok(sel), Ok(end)) = (
                                 std::env::var("SC_SEL"),
@@ -1384,7 +1428,12 @@ impl SheetApp {
                                 }
                             }
                             let dir = std::env::var("SC_ZH").unwrap_or_default();
-                            self.zh_convert(dir == "t");
+                            match dir.as_str() {
+                                "tw" => self.zh_convert(true, sheetcore::zhconv::Variant::Taiwan),
+                                "hk" => self.zh_convert(true, sheetcore::zhconv::Variant::HongKong),
+                                "t" => self.zh_convert(true, sheetcore::zhconv::Variant::Generic),
+                                _ => self.zh_convert(false, sheetcore::zhconv::Variant::Generic),
+                            }
                             eprintln!("[zh] {}", self.status);
                         }
                         Ok("colgroup") => {
@@ -5191,8 +5240,113 @@ impl SheetApp {
         });
     }
 
+    fn open_proof(&mut self) {
+        self.proof_list = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        self.proof_dlg = true;
+        self.status = if self.proof_list.is_empty() {
+            "没有发现排版问题".into()
+        } else {
+            format!("发现 {} 处排版问题", self.proof_list.len())
+        };
+    }
+
+    fn proof_window(&mut self, ctx: &egui::Context) {
+        if !self.proof_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut jump: Option<(u32, u32)> = None;
+        let mut changed = false;
+        ui_kit::window(ctx, "拼写检查", 600.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .checkbox(&mut self.proof_rules.double_space, "多个空格")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut self.proof_rules.edge_space, "首尾空格")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut self.proof_rules.full_width, "全角字母数字")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut self.proof_rules.repeat_punct, "重复标点")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut self.proof_rules.half_punct, "中文里的半角标点")
+                        .changed();
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "当前表共 {} 处（点一行跳到那个单元格）",
+                        self.proof_list.len()
+                    ))
+                    .size(11.5)
+                    .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if self.proof_list.is_empty() {
+                        ui.label(egui::RichText::new("没有发现排版问题。").size(12.0));
+                    }
+                    for it in self.proof_list.clone() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(
+                                    [64.0, 20.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(cell_name(it.row, it.col))
+                                            .size(11.5)
+                                            .monospace(),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                jump = Some((it.row, it.col));
+                            }
+                            ui.add_sized(
+                                [150.0, 20.0],
+                                egui::Label::new(egui::RichText::new(&it.text).size(11.5))
+                                    .truncate(),
+                            );
+                            ui.label(
+                                egui::RichText::new(it.kind.detail())
+                                    .size(11.0)
+                                    .color(ui_kit::TEXT_WEAK),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+                ui_kit::footer(ui, |ui| {
+                    if ui.button("重新检查").clicked() {
+                        self.proof_list =
+                            sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+                    }
+                    if ui_kit::primary_button(ui, "关闭").clicked() {
+                        self.proof_dlg = false;
+                    }
+                });
+            });
+        if changed {
+            self.proof_list =
+                sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        }
+        if let Some((r, c)) = jump {
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+        }
+        if !open {
+            self.proof_dlg = false;
+        }
+    }
+
     /// 中文简繁转换：把选区里的文本单元格整段转换（词组优先，见 core::zhconv）
-    fn zh_convert(&mut self, to_trad: bool) {
+    fn zh_convert(&mut self, to_trad: bool, variant: sheetcore::zhconv::Variant) {
         if self.edit_blocked() {
             return;
         }
@@ -5212,7 +5366,7 @@ impl SheetApp {
                         continue;
                     };
                     let new = if to_trad {
-                        sheetcore::zhconv::to_traditional(t)
+                        sheetcore::zhconv::to_traditional_with(t, variant)
                     } else {
                         sheetcore::zhconv::to_simplified(t)
                     };
@@ -5238,10 +5392,16 @@ impl SheetApp {
         self.txn_end(if to_trad { "简转繁" } else { "繁转简" }, txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!(
-            "{}：已转换 {n} 个单元格",
-            if to_trad { "简转繁" } else { "繁转简" }
-        );
+        let label = if to_trad {
+            match variant {
+                sheetcore::zhconv::Variant::Generic => "简转繁（通用）",
+                sheetcore::zhconv::Variant::Taiwan => "简转繁（台湾正体）",
+                sheetcore::zhconv::Variant::HongKong => "简转繁（香港繁体）",
+            }
+        } else {
+            "繁转简"
+        };
+        self.status = format!("{label}：已转换 {n} 个单元格");
     }
 
     /// 清除内容（保留格式，和 Excel「清除内容」一致）
@@ -8544,17 +8704,44 @@ impl SheetApp {
     }
 
     fn ribbon_review(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "校对", |ui| {
+            if ui_kit::big(ui, Icon::Find, "拼写检查")
+                .on_hover_text("查重复空格、全角字母数字、重复标点等排版问题")
+                .clicked()
+            {
+                self.open_proof();
+            }
+        });
         ui_kit::group(ui, "中文简繁转换", |ui| {
             ui.vertical(|ui| {
-                if ui_kit::labeled_w(ui, Icon::ZhS, "简转繁", 92.0, "把选区里的简体转成繁体")
-                    .clicked()
-                {
-                    self.zh_convert(true);
-                }
+                ui.horizontal(|ui| {
+                    if ui_kit::labeled_w(ui, Icon::ZhS, "简转繁", 74.0, "通用繁体；右侧箭头选地区")
+                        .clicked()
+                    {
+                        self.zh_convert(true, sheetcore::zhconv::Variant::Generic);
+                    }
+                    // 地区变体：主按钮走通用，箭头里选台湾/香港
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.spacing_mut().button_padding.x = 2.0;
+                        ui.menu_button("▼", |ui| {
+                            for (label, v) in [
+                                ("通用繁体", sheetcore::zhconv::Variant::Generic),
+                                ("台湾正体", sheetcore::zhconv::Variant::Taiwan),
+                                ("香港繁体", sheetcore::zhconv::Variant::HongKong),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    self.zh_convert(true, v);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                });
                 if ui_kit::labeled_w(ui, Icon::ZhT, "繁转简", 92.0, "把选区里的繁体转成简体")
                     .clicked()
                 {
-                    self.zh_convert(false);
+                    self.zh_convert(false, sheetcore::zhconv::Variant::Generic);
                 }
             });
         });
@@ -12515,44 +12702,50 @@ impl SheetApp {
         if m.is_empty() {
             return Vec::new();
         }
-        let mut keys: Vec<(u32, u8)> = m.iter().map(|(r, l)| (*r, *l)).collect();
-        keys.sort();
+        let max_lv = m.values().copied().max().unwrap_or(0);
+        let last = m.keys().copied().max().unwrap_or(0);
         let mut out = Vec::new();
-        let mut i = 0;
-        while i < keys.len() {
-            let (start, lv) = keys[i];
-            let mut end = start;
-            let mut j = i + 1;
-            while j < keys.len() && keys[j].1 == lv && keys[j].0 == end + 1 {
-                end = keys[j].0;
-                j += 1;
+        // Excel 的分级是嵌套的：第 k 级的一组 = 「级别 ≥ k」的连续行段。
+        // 这样外层（级别 1）自然会盖住内层（级别 2）：收起外层会把内层一起藏掉。
+        for k in 1..=max_lv {
+            let mut r = 0u32;
+            while r <= last {
+                if m.get(&r).copied().unwrap_or(0) >= k {
+                    let start = r;
+                    while r <= last && m.get(&r).copied().unwrap_or(0) >= k {
+                        r += 1;
+                    }
+                    out.push((start, r - 1, k));
+                } else {
+                    r += 1;
+                }
             }
-            out.push((start, end, lv));
-            i = j;
         }
         out
     }
 
-    /// 列分级区域：连续的同一级别算一组
+    /// 列分级区域：和行一样按「级别 ≥ k 的连续段」算，支持嵌套
     fn col_groups(&self) -> Vec<(u32, u32, u8)> {
         let m = &self.wb.sheet(self.sheet_idx).col_levels;
         if m.is_empty() {
             return Vec::new();
         }
-        let mut keys: Vec<(u32, u8)> = m.iter().map(|(c, l)| (*c, *l)).collect();
-        keys.sort();
+        let max_lv = m.values().copied().max().unwrap_or(0);
+        let last = m.keys().copied().max().unwrap_or(0);
         let mut out = Vec::new();
-        let mut i = 0;
-        while i < keys.len() {
-            let (start, lv) = keys[i];
-            let mut end = start;
-            let mut j = i + 1;
-            while j < keys.len() && keys[j].1 == lv && keys[j].0 == end + 1 {
-                end = keys[j].0;
-                j += 1;
+        for k in 1..=max_lv {
+            let mut c = 0u32;
+            while c <= last {
+                if m.get(&c).copied().unwrap_or(0) >= k {
+                    let start = c;
+                    while c <= last && m.get(&c).copied().unwrap_or(0) >= k {
+                        c += 1;
+                    }
+                    out.push((start, c - 1, k));
+                } else {
+                    c += 1;
+                }
             }
-            out.push((start, end, lv));
-            i = j;
         }
         out
     }
@@ -16363,6 +16556,7 @@ impl eframe::App for SheetApp {
         self.about_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
+        self.proof_window(ctx);
         self.ec_options_window(ctx);
         self.goal_window(ctx);
         self.dtable_window(ctx);

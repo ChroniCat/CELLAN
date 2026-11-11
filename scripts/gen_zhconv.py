@@ -54,6 +54,10 @@ def main():
         ("S", "STPhrases.txt"),
         ("T", "TSCharacters.txt"),
         ("T", "TSPhrases.txt"),
+        # 繁体变体：W = 台湾用词（软件→軟體），V = 台湾字形，K = 香港字形
+        ("W", "TWPhrases.txt"),
+        ("V", "TWVariants.txt"),
+        ("K", "HKVariants.txt"),
     ]:
         p = os.path.join(dic, fname)
         if not os.path.exists(p):

@@ -92,6 +92,27 @@ pub fn to_simplified(text: &str) -> String {
     convert(text, 'T')
 }
 
+/// 繁体的目标地区
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// 通用繁体
+    Generic,
+    /// 台湾正体：先通用繁体，再换台湾用词（软件→軟體），最后台湾字形
+    Taiwan,
+    /// 香港繁体：通用繁体 + 香港字形
+    HongKong,
+}
+
+/// 简体 → 指定变体的繁体
+pub fn to_traditional_with(text: &str, v: Variant) -> String {
+    let base = to_traditional(text);
+    match v {
+        Variant::Generic => base,
+        Variant::Taiwan => convert(&convert(&base, 'W'), 'V'),
+        Variant::HongKong => convert(&base, 'K'),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +130,20 @@ mod tests {
     fn mixed_text_keeps_ascii() {
         assert_eq!(to_traditional("A1: 中国 2024"), "A1: 中國 2024");
         assert_eq!(to_simplified("A1: 中國 2024"), "A1: 中国 2024");
+    }
+
+    #[test]
+    fn variants_taiwan_and_hongkong() {
+        // 台湾用词：U盘 → 隨身碟（词表），字形走 TWVariants
+        assert_eq!(
+            to_traditional_with("U盘", Variant::Taiwan),
+            "隨身碟",
+            "台湾正体应换成当地用词"
+        );
+        assert_eq!(to_traditional_with("U盘", Variant::Generic), "U盤");
+        // 香港字形：HKVariants 把「兌」归到「兑」
+        assert_eq!(to_traditional_with("兑换", Variant::Generic), "兌換");
+        assert_eq!(to_traditional_with("兑换", Variant::HongKong), "兑換");
     }
 
     #[test]
