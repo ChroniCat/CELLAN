@@ -977,20 +977,21 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 let text = f.strip_prefix('=').unwrap_or(f);
                 let target = ws.get_cell_mut(coord);
                 target.set_formula(text.to_string());
-                // 外部引用刷新过之后，把新的缓存值一起写进去：否则别人打开看到的还是旧数字
-                if crate::xlinks::is_external_formula(f) {
-                    match &cell.value {
-                        Value::Number(n) => {
-                            target.set_formula_result_number(*n);
-                        }
-                        Value::Text(t) if !t.starts_with('#') => {
-                            target.set_formula_result_string(t.to_string());
-                        }
-                        Value::Bool(v) => {
-                            target.set_formula_result_bool(*v);
-                        }
-                        _ => {}
+                // 缓存值一律按模型里的当前值写。只给外部引用写的话，改了输入格、
+                // 公式格重算过之后，文件里留的还是旧的 <v>（Excel 要重算才看得对）。
+                match &cell.value {
+                    Value::Number(n) => {
+                        target.set_formula_result_number(*n);
                     }
+                    // 错误值（内部是 #Div0/#NA 这类简写）不写缓存，交给 Excel 重算
+                    Value::Text(t) if t.starts_with('#') => {}
+                    Value::Text(t) => {
+                        target.set_formula_result_string(t.to_string());
+                    }
+                    Value::Bool(v) => {
+                        target.set_formula_result_bool(*v);
+                    }
+                    _ => {}
                 }
                 continue;
             }

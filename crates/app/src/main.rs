@@ -36,7 +36,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.52";
+const APP_VERSION: &str = "1.53";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -380,6 +380,26 @@ struct SheetApp {
     show_formulas: bool,
     /// 公式审核箭头：（来源区域行1,列1,行2,列2）→（目标行,目标列）
     trace_arrows: Vec<((u32, u32, u32, u32), (u32, u32))>,
+    /// 错误检查对话框
+    error_dlg: bool,
+    /// 错误检查列表（打开对话框时重算）
+    error_list: Vec<sheetcore::errors::Issue>,
+    /// 单变量求解对话框
+    goal_dlg: bool,
+    goal_target: String,
+    goal_goal: String,
+    goal_input: String,
+    goal_msg: String,
+    /// 模拟运算表对话框
+    dtable_dlg: bool,
+    dtable_input: String,
+    dtable_msg: String,
+    /// 背景错误检查：错误格左上角的绿三角
+    show_error_marks: bool,
+    /// 绿三角缓存（按 doc_gen 失效）
+    error_marks: std::collections::HashSet<(u32, u32)>,
+    /// 缓存键：(doc_gen, wb_epoch)——装载和编辑都要让它失效
+    error_marks_key: (u64, u64),
     /// 工作表标签条的横向滚动量
     tab_scroll: f32,
     /// 拖表头边界改列宽：(列, 按下时的鼠标 x, 按下时的宽度)
@@ -677,6 +697,19 @@ impl SheetApp {
             symbol_dlg: false,
             show_formulas: false,
             trace_arrows: Vec::new(),
+            error_dlg: false,
+            error_list: Vec::new(),
+            goal_dlg: false,
+            goal_target: String::new(),
+            goal_goal: String::new(),
+            goal_input: String::new(),
+            goal_msg: String::new(),
+            dtable_dlg: false,
+            dtable_input: String::new(),
+            dtable_msg: String::new(),
+            show_error_marks: true,
+            error_marks: std::collections::HashSet::new(),
+            error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
             head_menu: None,
@@ -1187,6 +1220,48 @@ impl SheetApp {
                         }
                         Ok("about") => self.about_open = true,
                         Ok("symbol") => self.symbol_dlg = true,
+                        Ok("errors") => self.open_error_check(),
+                        Ok("goal") => {
+                            // SC_GOAL="目标格,可变格,目标值"，例如 SC_GOAL=A2,A1,150
+                            if let Ok(spec) = std::env::var("SC_GOAL") {
+                                let parts: Vec<&str> = spec.split(',').collect();
+                                if parts.len() == 3 {
+                                    let t = SheetApp::parse_addr(parts[0]);
+                                    let v = SheetApp::parse_addr(parts[1]);
+                                    let g = parts[2].trim().parse::<f64>();
+                                    if let (Some((tr, tc)), Some((vr, vc)), Ok(g)) = (t, v, g) {
+                                        match self.goal_seek_run(tr, tc, g, vr, vc) {
+                                            Ok(x) => eprintln!("[goal] ok x={x}"),
+                                            Err(e) => eprintln!("[goal] fail {e}"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok("dtable") => {
+                            // SC_SEL=r,c 起点、SC_SEL2=r2,c2 终点
+                            if let (Ok(a1), Ok(a2)) = (
+                                std::env::var("SC_SEL"),
+                                std::env::var("SC_SEL2"),
+                            ) {
+                                let pa = |v: &str| -> Option<(u32, u32)> {
+                                    let (x, y) = v.split_once(',')?;
+                                    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                                };
+                                if let (Some(s0), Some(s1)) = (pa(&a1), pa(&a2)) {
+                                    self.sel = s0;
+                                    self.sel_end = s1;
+                                }
+                            }
+                            if let Ok(spec) = std::env::var("SC_DTABLE") {
+                                if let Some(i) = SheetApp::parse_addr(&spec) {
+                                    match self.data_table_run(i) {
+                                        Ok(n) => eprintln!("[dtable] filled {n}"),
+                                        Err(e) => eprintln!("[dtable] fail {e}"),
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     // 无界面验收：SC_REV_REVERT=N 撤回倒数第 N 条修订
@@ -5289,6 +5364,353 @@ impl SheetApp {
         self.editing = Some(EditState { buf });
     }
 
+    /// 单元格当前数值（数字才算，其它返回 None）
+    fn cell_num(&self, r: u32, c: u32) -> Option<f64> {
+        match self.wb.sheet(self.sheet_idx).get(r, c).map(|x| x.value.clone()) {
+            Some(sheetcore::model::Value::Number(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// 把一个数字写进格子并按依赖图重算受影响的公式（不记撤销，求解器内部用）
+    fn poke_cell(&mut self, deps: &sheetcore::formula::deps::Deps, r: u32, c: u32, v: f64) {
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+        cell.value = sheetcore::model::Value::Number(v);
+        cell.formula = None;
+        sh.set(r, c, cell);
+        let keys = [(self.sheet_idx, r, c)];
+        sheetcore::formula::recalc_dirty(&mut self.wb, deps, &keys);
+    }
+
+    /// 单变量求解：找可变格的值，让目标格的公式等于目标值。
+    /// 用割线法（两点割线 + 必要时二分兜底），最多 60 次，每次只重算受影响的公式。
+    fn goal_seek_run(&mut self, tr: u32, tc: u32, goal: f64, vr: u32, vc: u32) -> Result<f64, String> {
+        let Some(orig) = self.cell_num(vr, vc) else {
+            return Err("可变单元格里必须是一个数字".into());
+        };
+        // 依赖图必须现建：大文件加载后 app 里可能是空 deps，靠它重算等于什么都不算
+        let deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        let f = |app: &mut Self, x: f64| -> Option<f64> {
+            app.poke_cell(&deps, vr, vc, x);
+            app.cell_num(tr, tc).map(|v| v - goal)
+        };
+        let mut x0 = orig;
+        let mut f0 = f(self, x0).ok_or("目标单元格不是数字（公式可能出错）")?;
+        if f0.abs() < 1e-9 {
+            return Ok(x0);
+        }
+        let step = if x0.abs() > 1e-9 { x0.abs() * 0.1 } else { 1.0 };
+        let mut x1 = x0 + step;
+        let mut f1 = f(self, x1).ok_or("目标单元格不是数字")?;
+        let mut lo = f32::NAN;
+        let mut hi = f32::NAN;
+        for _ in 0..60 {
+            if f1.abs() < 1e-9 {
+                return Ok(x1);
+            }
+            if f0.abs() < 1e-9 {
+                return Ok(x0);
+            }
+            // 记下括住根的区间，割线法跳飞时用二分
+            if f0 * f1 < 0.0 {
+                lo = x0 as f32;
+                hi = x1 as f32;
+            }
+            let denom = f1 - f0;
+            let mut next = if denom.abs() > 1e-15 {
+                x1 - f1 * (x1 - x0) / denom
+            } else {
+                f32::NAN as f64
+            };
+            if !next.is_finite() || (lo.is_finite() && hi.is_finite() && (next < lo.min(hi) as f64 || next > lo.max(hi) as f64)) {
+                next = if lo.is_finite() && hi.is_finite() {
+                    ((lo as f64) + (hi as f64)) * 0.5
+                } else {
+                    x1 + step
+                };
+            }
+            x0 = x1;
+            f0 = f1;
+            x1 = next;
+            f1 = f(self, x1).ok_or("目标单元格不是数字")?;
+            if (x1 - x0).abs() < 1e-12 * (1.0 + x1.abs()) {
+                break;
+            }
+        }
+        if f1.abs() < 1e-6 {
+            // 重算只改了模型里的值，保存时公式格的缓存值要按「已编辑」重写
+            self.poke_cell(&deps, vr, vc, x1);
+            if let Some(cell) = self.wb.sheet(self.sheet_idx).get(tr, tc).cloned() {
+                self.wb.sheet_mut(self.sheet_idx).set(tr, tc, cell);
+            }
+            Ok(x1)
+        } else {
+            self.poke_cell(&deps, vr, vc, orig);
+            Err(format!("没有找到解（最后一次偏差 {:.6}）", f1))
+        }
+    }
+
+    /// 解析 "A1" / "$B$2" 形式的地址
+    fn parse_addr(s: &str) -> Option<(u32, u32)> {
+        parse_a1_ref(s.trim().trim_start_matches('$').replace('$', "").as_str())
+    }
+
+    /// 打开错误检查：重扫一遍当前表
+    fn open_error_check(&mut self) {
+        self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+        self.error_dlg = true;
+        self.status = if self.error_list.is_empty() {
+            "这张表没发现错误".into()
+        } else {
+            format!("找到 {} 处问题", self.error_list.len())
+        };
+    }
+
+    fn error_window(&mut self, ctx: &egui::Context) {
+        if !self.error_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut jump: Option<(u32, u32)> = None;
+        ui_kit::window(ctx, "错误检查", 600.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "当前表共 {} 处（点一行跳到那个单元格）",
+                        self.error_list.len()
+                    ))
+                    .size(11.5)
+                    .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(4.0);
+                if self.error_list.is_empty() {
+                    ui.label(egui::RichText::new("没有发现错误。").size(12.0));
+                }
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for it in self.error_list.clone() {
+                        ui.horizontal(|ui| {
+                            let addr = cell_name(it.row, it.col);
+                            if ui
+                                .add_sized(
+                                    [64.0, 20.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(addr).size(11.5).monospace(),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                jump = Some((it.row, it.col));
+                            }
+                            ui.add_sized(
+                                [120.0, 20.0],
+                                egui::Label::new(
+                                    egui::RichText::new(if it.text.is_empty() {
+                                        "-"
+                                    } else {
+                                        it.text.as_str()
+                                    })
+                                    .size(11.5),
+                                )
+                                .truncate(),
+                            );
+                            ui.label(
+                                egui::RichText::new(it.kind.detail())
+                                    .size(11.0)
+                                    .color(ui_kit::TEXT_WEAK),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+                ui_kit::footer(ui, |ui| {
+                    if ui.button("重新检查").clicked() {
+                        self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+                    }
+                    if ui_kit::primary_button(ui, "关闭").clicked() {
+                        self.error_dlg = false;
+                    }
+                });
+            });
+        if let Some((r, c)) = jump {
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+        }
+        if !open {
+            self.error_dlg = false;
+        }
+    }
+
+    fn goal_window(&mut self, ctx: &egui::Context) {
+        if !self.goal_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut solve = false;
+        ui_kit::window(ctx, "单变量求解", 420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([84.0, 20.0], egui::Label::new("目标单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.goal_target).desired_width(150.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([84.0, 20.0], egui::Label::new("目标值:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.goal_goal).desired_width(150.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([84.0, 20.0], egui::Label::new("可变单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.goal_input).desired_width(150.0));
+                });
+                if !self.goal_msg.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&self.goal_msg).size(11.5));
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "求解").clicked() {
+                        solve = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.goal_dlg = false;
+                    }
+                });
+            });
+        if solve {
+            let t = Self::parse_addr(&self.goal_target);
+            let v = Self::parse_addr(&self.goal_input);
+            let goal = self.goal_goal.trim().parse::<f64>();
+            match (t, v, goal) {
+                (Some((tr, tc)), Some((vr, vc)), Ok(g)) => {
+                    let txn_keys = [(vr, vc)];
+                    let txn = self.txn_begin(&txn_keys.into_iter().map(|(r, c)| (r, c)).collect::<Vec<_>>());
+                    match self.goal_seek_run(tr, tc, g, vr, vc) {
+                        Ok(x) => {
+                            self.goal_msg = format!(
+                                "求解成功：{}{} = {:.6}",
+                                sheetcore::model::cell_name(vr, vc),
+                                "，",
+                                x
+                            );
+                            self.txn_end("单变量求解", txn);
+                            self.wb.dirty = true;
+                            self.doc_gen = self.doc_gen.wrapping_add(1);
+                            self.status = format!("单变量求解：{}{} = {:.6}", sheetcore::model::cell_name(vr, vc), "", x);
+                        }
+                        Err(e) => self.goal_msg = e,
+                    }
+                }
+                _ => self.goal_msg = "单元格地址或目标值写错了".into(),
+            }
+        }
+        if !open {
+            self.goal_dlg = false;
+        }
+    }
+
+    /// 模拟运算表（列式单变量）：选区第一列是输入值，第二列顶行是公式，
+    /// 按每个输入值代入后把结果填到第二列。
+    fn data_table_run(&mut self, input: (u32, u32)) -> Result<usize, String> {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        if c2 < c1 + 1 {
+            return Err("选区要至少两列：第一列放输入值，第二列放结果".into());
+        }
+        if r1 == 0 {
+            return Err("公式要写在结果列的上一行，选区不能从第 1 行开始".into());
+        }
+        // Excel 的列式单变量表：公式在结果列的上方一格，选区内是「输入值 + 空结果格」
+        let fr = r1 - 1;
+        let Some(formula) = self
+            .wb
+            .sheet(self.sheet_idx)
+            .get(fr, c2)
+            .and_then(|x| x.formula.clone())
+        else {
+            return Err(format!(
+                "{} 必须是公式（结果列上方那一格）",
+                sheetcore::model::cell_name(fr, c2)
+            ));
+        };
+        let _ = &formula;
+        let Some(orig) = self.cell_num(input.0, input.1) else {
+            return Err("输入引用单元格里必须是数字".into());
+        };
+        let deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        let mut done = 0usize;
+        for r in r1..=r2 {
+            let Some(v) = self.cell_num(r, c1) else {
+                continue;
+            };
+            self.poke_cell(&deps, input.0, input.1, v);
+            let out = self
+                .wb
+                .sheet(self.sheet_idx)
+                .get(fr, c2)
+                .map(|x| x.value.clone())
+                .unwrap_or_default();
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut cell = sh.get(r, c2).cloned().unwrap_or_default();
+            cell.value = out;
+            cell.formula = None;
+            sh.set(r, c2, cell);
+            done += 1;
+        }
+        self.poke_cell(&deps, input.0, input.1, orig);
+        Ok(done)
+    }
+
+    fn dtable_window(&mut self, ctx: &egui::Context) {
+        if !self.dtable_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut run = false;
+        ui_kit::window(ctx, "模拟运算表", 460.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("选区：第一列是要代入的值，第二列顶行是公式")
+                        .size(11.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("输入引用单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.dtable_input).desired_width(140.0));
+                });
+                if !self.dtable_msg.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&self.dtable_msg).size(11.5));
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        run = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.dtable_dlg = false;
+                    }
+                });
+            });
+        if run {
+            match Self::parse_addr(&self.dtable_input) {
+                Some(i) => match self.data_table_run(i) {
+                    Ok(n) => {
+                        self.dtable_msg = format!("已填 {n} 行");
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.status = format!("模拟运算表：已填 {n} 行");
+                    }
+                    Err(e) => self.dtable_msg = e,
+                },
+                None => self.dtable_msg = "输入引用单元格地址写错了".into(),
+            }
+        }
+        if !open {
+            self.dtable_dlg = false;
+        }
+    }
+
     fn symbol_window(&mut self, ctx: &egui::Context) {
         if !self.symbol_dlg {
             return;
@@ -7445,12 +7867,32 @@ impl SheetApp {
                     self.status = "已移去追踪箭头".into();
                 }
             });
-            let on = self.show_formulas;
-            if ui_kit::labeled_w_on(ui, Icon::Fx, "显示公式", 86.0, on, "Ctrl+` 切换公式/结果")
+            ui.vertical(|ui| {
+                let on = self.show_formulas;
+                if ui_kit::labeled_w_on(
+                    ui,
+                    Icon::Fx,
+                    "显示公式",
+                    96.0,
+                    on,
+                    "Ctrl+` 切换公式/结果",
+                )
                 .clicked()
-            {
-                self.show_formulas = !self.show_formulas;
-            }
+                {
+                    self.show_formulas = !self.show_formulas;
+                }
+                if ui_kit::labeled_w(
+                    ui,
+                    Icon::Eraser,
+                    "错误检查",
+                    96.0,
+                    "扫 #DIV/0! 之类的错误",
+                )
+                .clicked()
+                {
+                    self.open_error_check();
+                }
+            });
         });
         ui_kit::group(ui, "计算", |ui| {
             if ui_kit::big(ui, Icon::Calc, "重算全部").clicked() {
@@ -7480,6 +7922,30 @@ impl SheetApp {
     }
 
     fn ribbon_data(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "模拟分析", |ui| {
+            ui.vertical(|ui| {
+                if ui_kit::labeled_w(ui, Icon::Calc, "单变量求解", 110.0, "反推可变单元格的值")
+                    .clicked()
+                {
+                    let (r, c) = self.sel;
+                    self.goal_target = cell_name(r, c);
+                    self.goal_goal = self
+                        .cell_num(r, c)
+                        .map(|v| format!("{v}"))
+                        .unwrap_or_default();
+                    self.goal_input.clear();
+                    self.goal_msg.clear();
+                    self.goal_dlg = true;
+                }
+                if ui_kit::labeled_w(ui, Icon::Grid, "模拟运算表", 110.0, "列式单变量敏感性表")
+                    .clicked()
+                {
+                    self.dtable_input.clear();
+                    self.dtable_msg.clear();
+                    self.dtable_dlg = true;
+                }
+            });
+        });
         ui_kit::group(ui, "分级显示", |ui| {
             ui.vertical(|ui| {
                 if ui_kit::labeled_w(ui, Icon::Plus, "组合", 104.0, "把选中的行组成一级")
@@ -8799,6 +9265,19 @@ impl SheetApp {
             draw_edge(painter, egui::pos2(rr, t), egui::pos2(rr, bb), &bd[1]);
             draw_edge(painter, egui::pos2(l, t), egui::pos2(rr, t), &bd[2]);
             draw_edge(painter, egui::pos2(l, bb), egui::pos2(rr, bb), &bd[3]);
+        }
+        if self.show_error_marks && self.error_marks.contains(&(r, c)) {
+            // Excel 的背景错误标记：单元格左上角一个 5px 的绿三角
+            let s = 5.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    rect.left_top(),
+                    rect.left_top() + egui::vec2(s, 0.0),
+                    rect.left_top() + egui::vec2(0.0, s),
+                ],
+                Color32::from_rgb(40, 160, 40),
+                Stroke::NONE,
+            ));
         }
     }
 
@@ -14678,6 +15157,14 @@ impl eframe::App for SheetApp {
             self.ribbon_tab = 101;
             self.chart_auto = false;
         }
+        // 背景错误检查：按文档代次刷新绿三角缓存（关掉开关就不算）
+        if self.show_error_marks && self.error_marks_key != (self.doc_gen, self.wb_epoch) {
+            self.error_marks = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx)
+                .into_iter()
+                .map(|i| (i.row, i.col))
+                .collect();
+            self.error_marks_key = (self.doc_gen, self.wb_epoch);
+        }
         let was_saving = self.has_pending_save();
         self.poll_net();
         self.poll_open();
@@ -14771,6 +15258,9 @@ impl eframe::App for SheetApp {
         self.paste_special_dialog(ctx);
         self.about_window(ctx);
         self.symbol_window(ctx);
+        self.error_window(ctx);
+        self.goal_window(ctx);
+        self.dtable_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
         self.password_prompt_ui(ctx);
