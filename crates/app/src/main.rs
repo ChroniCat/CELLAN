@@ -94,6 +94,7 @@ struct DataDlg {
 #[derive(Clone, Default)]
 struct FindState {
     open: bool,
+    tab: u8,
     find: String,
     replace: String,
     match_case: bool,
@@ -12186,6 +12187,8 @@ impl SheetApp {
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
+                ui_kit::dialog_tabs(ui, &mut self.find.tab, &["查找", "替换"]);
+                ui.add_space(6.0);
                 ui_kit::field(ui, "查找", |ui| {
                     let r = ui.add_sized(
                         [ui.available_width(), 22.0],
@@ -12195,12 +12198,14 @@ impl SheetApp {
                         do_find = true;
                     }
                 });
-                ui_kit::field(ui, "替换为", |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), 22.0],
-                        egui::TextEdit::singleline(&mut self.find.replace),
-                    );
-                });
+                if self.find.tab == 1 {
+                    ui_kit::field(ui, "替换为", |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 22.0],
+                            egui::TextEdit::singleline(&mut self.find.replace),
+                        );
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(68.0);
                     ui.checkbox(&mut self.find.match_case, "区分大小写");
@@ -12217,11 +12222,13 @@ impl SheetApp {
                 ui.separator();
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    if ui.button("全部替换").clicked() {
-                        do_all = true;
-                    }
-                    if ui.button("替换").clicked() {
-                        do_repl = true;
+                    if self.find.tab == 1 {
+                        if ui_kit::secondary_button(ui, "全部替换").clicked() {
+                            do_all = true;
+                        }
+                        if ui_kit::secondary_button(ui, "替换").clicked() {
+                            do_repl = true;
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui_kit::secondary_button(ui, "关闭").clicked() {
