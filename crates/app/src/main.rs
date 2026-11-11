@@ -3276,7 +3276,18 @@ impl SheetApp {
                     .size()
                     .x
             });
-            width = width.max(w + 10.0 + st.indent as f32 * size * 2.0);
+            if std::env::var("SC_AUTOFIT").is_ok() {
+                eprintln!(
+                    "[autofit]   r{r} txt={:?} len={} galley={:.1} size={:.1} bold={}",
+                    txt.chars().take(12).collect::<String>(),
+                    txt.chars().count(),
+                    w,
+                    size,
+                    st.bold
+                );
+            }
+            // 左边 4px 起始 + 右边留 6px，再加一点余量避免最后一个字被切
+            width = width.max(w + 16.0 + st.indent as f32 * size * 2.0);
         }
         let width = width.clamp(24.0, 1500.0);
         {
