@@ -159,7 +159,9 @@ impl SheetApp {
                 st.text = Some(format!("{pct}%"));
                 st.enabled = !p.fit_to_page;
             }
-            "ZoomLevel" => st.text = Some(format!("{:.0}%", self.zoom * 100.0)),
+            "ZoomLevel" | "ZoomPercent" => {
+                st.text = Some(format!("{:.0}%", self.zoom * 100.0))
+            }
             "ToggleFileTree" => {
                 st.label = Some(if self.tree_open {
                     "隐藏文件列表".into()
@@ -841,6 +843,24 @@ impl SheetApp {
                     self.chart_edit = Some(ch);
                 }
             }
+
+            "Noop" | "PhoneticGuide" | "AddIns" => {}
+            "DoubleUnderline" => self.apply_style(|s| s.underline = true),
+            "TextVertical" => self.apply_style(|s| s.rotation = 90),
+            "TextRotateUp" => self.apply_style(|s| s.rotation = 45),
+            "TextRotateDown" => self.apply_style(|s| s.rotation = -45),
+            "AccountingStyle" => self.apply_style(|s| {
+                s.format = "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-".into()
+            }),
+            "AutoAverage" => self.auto_func("AVERAGE"),
+            "AutoCount" => self.auto_func("COUNT"),
+            "FillRight" => self.fill_cmd(false),
+            "ClearValues" => self.clear_values(),
+            "StyleNormal" => self.apply_style_preset("normal"),
+            "StyleTitle" => self.apply_style_preset("title"),
+            "StyleHeading" => self.apply_style_preset("heading"),
+            "StyleGood" => self.apply_style_preset("good"),
+            "StyleBad" => self.apply_style_preset("bad"),
 
             // 其余（字体/字号/下拉里带值的项）已在上面处理
             _ => {

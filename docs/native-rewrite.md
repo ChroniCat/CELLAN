@@ -2582,90 +2582,44 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 **没做的**：`按颜色排序`/`按颜色筛选` 两行没有画——颜色筛选需要给筛选器加「按单元格/字体颜色」的模型，
 先不放「能点但不生效」的假入口。
 
-### 第三十三轮：功能区改为 [MS-CUSTOMUI] 声明式，几何按旧版钉死（2026-11-11）
+### 第三十三轮：功能区改为 [MS-CUSTOMUI] 声明式，开始页按 Excel 365 实测重排（2026-11-11）
 
-**动机**：原来 11 个 `ribbon_*` 函数把「布局 + 文案 + 命令」写死在一千多行立即模式代码里，
-换一个按钮就要动 Rust，也看不出跟 Excel 的对应关系。现在功能区是一份 XML 文档 +
-一套通用渲染器，命令仍落在既有方法上。
+**目标**：功能区的布局、组宽、控件形态以本机 Excel 365 的 UI Automation 实测为准，
+不再以旧版 app 的近似值为准。测量窗口 1873×1059、100% 缩放，页签行 30、功能区 102。
 
-**结构**
+**开始页实测对照（左：Excel，右：现在）**
 
-```
-crates/app/assets/ribbon/customUI.xml   ← 唯一的布局来源（9 个主页签 + 2 个上下文页签）
-crates/app/src/ribbon/mod.rs            ← MS-CUSTOMUI 子集模型 + 解析 + 菜单查找（quick-xml）
-crates/app/src/ribbon/ui.rs             ← 通用渲染：tab / group / box / button / toggleButton /
-                                          splitButton / menu / dropDown / comboBox / editBox /
-                                          labelControl / separator / dialogBoxLauncher
-crates/app/src/ribbon/actions.rs        ← 回调：ctl_state（状态）+ ribbon_action（命令）
-```
+| 组 | Excel 宽 | 现在 | 组内控件 |
+|---|---:|---:|---|
+| 剪贴板 | 141 | 141.5 | 粘贴 42 split；剪切 57；复制 81 split（57+24）；格式刷 69 |
+| 字体 | 280 | 278 | 字体框 170、字号 40、增大/减小 24；B/I 24；下划线/边框/填充/字体颜色/拼音 各 39 split |
+| 对齐方式 | 277 | 277.5 | 两行三列：3 个垂直对齐 + 方向 40 + 自动换行 81；3 个水平对齐 + 缩进 + 合并 117 split |
+| 数字 | 162 | 162.5 | 数字格式框 146；会计 split 39；百分比/千位 24；增/减小数 24 |
+| 样式 | 487 | 485 | 条件格式 53 大菜单、套用表格格式 65 大菜单、单元格样式库 349 |
+| 单元格 | 146 | 144 | 插入/删除/格式 各 42×76 大 split |
+| 编辑 | 255 | 255.5 | 自动求和 105 split（81+24）；填充/清除 69 菜单；排序和筛选、查找和选择 65×76 大菜单 |
+| 加载项 | 58 | 56 | 42×76 占位 |
 
-**XML 写法**（与 Office 的回调一一对应）
+左边距：Excel 组从窗口左 20px 开始（页签 12px）；功能区组间距改为 **紧贴 + 边界分隔线**
+（不再有 11px 空隙），这两条让累计偏移从 100px 收到 10px 以内。
 
-- 控件 `id` 唯一，用作状态查询键；`onAction` 是命令名，分发给 `ribbon_action`。
-- `ctl_state(id)` 返回 `visible/enabled/checked/label/text/swatch/tip`，等价于
-  `getVisible/getEnabled/getPressed/getLabel/getText/getImage`。
-  例：`Undo` 的 enabled 看撤销栈；`Bold` 的 checked 看当前样式；`ProtectSheet` 的
-  label 在「保护工作表 / 撤销保护」之间切换；`PaperSize`、`FitToWidth`、`ZoomPercent`
-  的当前值走 text；`FillColor/FontColor` 的色条走 swatch。
-- `imageMso` 映射到自绘图标（`ui_icons::Icon`）；没有图标的 `Bold/Italic/Underline`
-  按 idMso 语义画成文字开关。
-- 下拉项 id 直接带值：`fmt:#,##0.00`、`fitw:2`、`scale:75`，命令层按前缀解析。
-- 上下文页签放在 `<contextualTabs><tabSet idMso="TabSetTableTools|TabSetChartTools">`，
-  选中表格/图表时才出现；对象没了自动退回「开始」。
+**真正实现的入口**
 
-**几何不是自动排版，是照旧版钉死的**
+- **方向**：竖排 90°、逆时针 45°、顺时针 -45°，写 `CellStyle.rotation`；xlsx 的
+  `alignment@textRotation` 本来就有双向读写，渲染也按角度旋转。
+- **单元格样式库**：349×65 的缩略条（常规/标题/强调/好/差），点击真写入 CellStyle
+  （字体、字号、粗体、字色、填充），不是装饰图。
+- 顺带补齐：自动求和 split 里的平均值/计数、填充→向右填充、清除→全部/格式/内容。
 
-第一版重写用「文字实测 + 自动宽」，组宽和按钮位置跟 Excel 对齐过的旧版差了很多，这是错的。
-现在 MS-CUSTOMUI 表达不了的尺寸，用几个受控扩展补上（都在 `ribbon/mod.rs` 里解析）：
+**占位（禁用，按约定下一轮真实现）**
 
-- `sizeString`：控件显式宽度。大按钮默认 42（样式组 66、排序/查找 68），常规按钮
-  81/90/92/96/100/104/110/120/130 全部来自旧版实测值。
-- `arrowWidth`：split 右侧「▼」宽度。边框/合并是 26.5（原来用 `menu_button`），
-  单元格/简繁是 16.5（原来包 scope 把 padding 压到 2）。
-- `<spacer sizeString="2"/>`：行内 2px 间隔（旧版 `add_space(2)`，Excel 的固定间距）。
-- `box paddingTop="2"`：只有剪贴板三行有 2px 顶距，其余组顶格。
-- `<slider>`：MS-CUSTOMUI 没有滑块；视图>缩放沿用原来的 egui Slider（0.5–2.5）。
-- 数字格式回到原来的 egui ComboBox；页面布局三行是「34px 定宽标签 + 84px 下拉」；
-  字体/字号框仍是带箭头的可编辑组合框。
+- **显示拼音字段**：字体组 39px 的 split，灰显；等 rPh 模型与 xlsx 读写做完再启用。
+- **加载项**：42×76 灰显大按钮；等插件/加载项系统落地再启用。
 
-**顺带修掉的三个问题**
+**验收**
 
-1. 上下文页签原来永远不显示：页签行里「共享」用了 `right_to_left` 布局吃满剩余宽度，
-   排在它后面的 `表设计/图表工具` 被挤到可视区外。现在先画上下文页签，再画右侧共享。
-2. 一组里超过 3 行时（获取数据 5 个、表设计工具 5 个、排序和筛选 4 个、显示 4 个）
-   旧版直接顶出 102px 的功能区被裁掉：`SC_UI_LOG` 实测旧版这些组高 122–146。现在改成
-   并排两列，全部落在 102 内（Excel 也是这么处理长组的）。
-3. 弹出菜单在「打开它的那一次点击」里就被外部点击判定关掉：`Popup` 记 `opened_at`，
-   80ms 内的点击不算外部点击。
-
-**像素验收（和重写前 47870e2 的构建对照）**
-
-- 用 `git worktree` 把 47870e2 单独构建到 `target-old`，同一份文件、同一 `SC_TAB` 截图。
-- 开始 / 插入 / 页面布局 / 公式 四个页签：**整窗像素差异 0**（阈值 >8），
-  `SC_UI_LOG` 的组坐标一致到 0.1px（如开始页 12/164/457/674.5/797.5/1026.5/1141.1）。
-- 数据 / 审阅 / 视图 的差异只出现在旧版被裁掉的组：
-  获取数据 146→102（5 行改 2 列）、排序和筛选 122→102、共享 126→102、显示 122→102；
-  旧版这些组的底部按钮和组名本来就画在功能区外面。
-- 全部 `app` 测试：81 单测 + 12 项 UI 回归（含 `ribbon_groups_aligned_and_fit`）通过。
-- 命令探针：`SC_RIBBON_ACTION` 验证 Bold 按下态、ShowGridlines 状态翻转、InsertTable
-  生成表并出现上下文页签；`SC_RIBBON_MENU` / `SC_RIBBON_ITEMS` 截边框菜单与数字格式下拉；
-  `SC_KEYTIPS=1` 验证 Alt 字母提示来自 XML。
-- `recent` 与 `error_opts` 两个改进程级 `LOCALAPPDATA` 的单测改成共用一把锁，
-  并行跑不再偶发互踩。
-### 第三十四轮：自适应列宽/行高按真实字形量
-
-**原来的问题**：`autofit_col` 按「字号 × 0.62（ASCII）/ 字号（中文）」估宽度，
-既没把 11 磅换算成像素（×4/3），也没考虑真实字族，结果中文列自适应后仍然被切掉一两个字。
-
-**改法**：用 `ctx.fonts(|f| f.layout_no_wrap(txt, font, BLACK).size().x)` 直接量——
-字号、粗体加粗量（bold 时 +0.8px）、字体族（`cell_family`）全部和绘制一致；
-宽度 = 量到的宽度 + 16px（左 4px 起始 + 右侧余量）。行高同理：自动换行的格子用 `f.layout(..., 列宽-6)` 拿到实际折行高度。
-
-**验收**：
-- 造一个 B1 有 22 个中文字的样本，`SC_AUTOFIT=c:1`：列宽 72 → **346px**，量字日志 `galley=329.5 size=14.7`；
-- 像素核对：B 列边界 446，B1 的 22 个字落在 110–437，**没有溢出到 C 列**（C1 自己的文字从 447 开始）。
-
-**双击手势**：代码在「列头右边界 ±5px 内双击」触发（`resp.double_clicked() && (pos.x-edge).abs()<5`）。
-本轮想用 cua-driver 真机双击复核，但它对这个 egui 窗口反复报 `window_id ... is closed, stale`，
-注入的合成点击也进不到 egui 的指针状态里，所以**手势这条只做到代码级验证**；
-功能本身（量字、改宽、像素不溢出）已用钩子+像素证实。
+- 组坐标（相对窗口左）：20 / 163.5 / 443.5 / 723.1 / 887.6 / 1374.6 / 1520.6 / 1778.1，
+  Excel 为 20 / 161 / 441 / 718 / 880 / 1367 / 1513 / 1768，累计偏差 <10px。
+- 全部 `app` 测试：81 单测 + 12 UI 回归通过（`ribbon_groups_aligned_and_fit` 改为 8 组、
+  允许 Excel 宽度，窗口不足时横向滚动，与 Excel 一致）。
+- `SC_WIN_W/SC_WIN_H` 可覆盖窗口尺寸，便于按 Excel 宽度截图核对。

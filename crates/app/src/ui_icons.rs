@@ -325,6 +325,10 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 
 /// Excel 风格：彩色块面 + 深色描边。关掉的按钮只画灰线，不铺色。
 pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
+    // 优先用从 Office imageMso 导出的原始位图
+    if crate::ui_png::draw(p, rect, icon, enabled) {
+        return;
+    }
     // Excel 的图形比 24 网格画得满：外扩 4%，32px 时约多 2.5px
     let r = rect.expand(rect.width() * 0.04);
     paint(p, r, icon, if enabled { None } else { Some(color) });

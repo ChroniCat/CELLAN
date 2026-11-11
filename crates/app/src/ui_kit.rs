@@ -157,12 +157,15 @@ pub fn apply_theme(ctx: &egui::Context) {
 pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) -> Rect {
     let first = GROUP_FIRST.with(|c| c.replace(false));
     if !first {
-        ui.add_space(5.0);
+        // Excel 的组是紧挨着的：分隔线画在两组交界处，不额外占宽
+        let x = ui.cursor().left();
+        let y = ui.cursor().top();
         let v = ui.visuals().clone();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, GROUP_BODY_H), Sense::hover());
-        // 分隔线从命令区顶（+4）画到命令区底，和 Excel 一样不顶到功能区边
         ui.painter().rect_filled(
-            rect.translate(Vec2::new(0.0, 4.0)),
+            egui::Rect::from_min_size(
+                egui::pos2(x, y + 4.0),
+                Vec2::new(1.0, GROUP_BODY_H),
+            ),
             0.0,
             if v.dark_mode {
                 Color32::from_rgb(58, 64, 74)
@@ -170,7 +173,6 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
                 SEP
             },
         );
-        ui.add_space(5.0);
     }
     let out = ui
         .vertical(|ui| {
@@ -308,21 +310,22 @@ pub fn big_sized_split(
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // Excel 的大 split 是底部一条 12px 的箭头带，不是右侧竖条
     let arrow_rect = Rect::from_min_size(
-        egui::pos2(rect.right() - 9.0, rect.top()),
-        Vec2::new(9.0, rect.height()),
+        egui::pos2(rect.left(), rect.bottom() - 12.0),
+        Vec2::new(rect.width(), 12.0),
     );
     let aresp = ui.interact(
         arrow_rect,
         egui::Id::new(("bigsplit", rect.left().to_bits(), rect.top().to_bits())),
         Sense::click(),
     );
-    let hover = resp.hovered() && !arrow_rect.contains(resp.hover_pos().unwrap_or(rect.center()));
+    let over_arrow = arrow_rect.contains(resp.hover_pos().unwrap_or(rect.center()));
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() || aresp.is_pointer_button_down_on() {
         if v.dark_mode { v.selection.bg_fill } else { PRESSED }
-    } else if hover || aresp.hovered() {
+    } else if (resp.hovered() && !over_arrow) || aresp.hovered() {
         if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
     } else {
         Color32::TRANSPARENT
@@ -335,33 +338,33 @@ pub fn big_sized_split(
     } else {
         v.weak_text_color().gamma_multiply(0.6)
     };
-    // 图标和文字居中于「主区」（去掉右侧箭头条），否则整体重心向右偏
-    let main_cx = rect.left() + (rect.width() - 9.0) / 2.0;
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(main_cx, rect.top() + 6.0 + 16.0),
-        Vec2::splat(32.0),
+    let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
+    let icon_rect = Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
+        Vec2::splat(icon_size),
     );
     ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
     ui.painter().text(
-        egui::pos2(main_cx, rect.bottom() - 7.0),
+        egui::pos2(rect.center().x, rect.bottom() - 22.0),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
         col,
     );
-    // 右侧分隔条 + 下拉箭头：箭头在按钮垂直中线，像 Excel 的 split
     ui.painter().line_segment(
         [
-            egui::pos2(arrow_rect.left(), rect.top() + 6.0),
-            egui::pos2(arrow_rect.left(), rect.bottom() - 6.0),
+            egui::pos2(rect.left() + 2.0, rect.bottom() - 12.0),
+            egui::pos2(rect.right() - 2.0, rect.bottom() - 12.0),
         ],
         Stroke::new(1.0, BORDER),
     );
-    let ac = egui::pos2(arrow_rect.center().x, rect.center().y);
-    caret(ui, ac, col);
+    caret(
+        ui,
+        egui::pos2(rect.center().x, rect.bottom() - 6.0),
+        col,
+    );
     (resp, aresp)
 }
-
 pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response {
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();

@@ -61,6 +61,11 @@ pub struct Ctl {
     pub label: Option<String>,
     pub image: Option<String>,
     pub size: Size,
+    /// 显式宽度（像素）。Excel 的组宽是实测调出来的，自动排版会跑偏；
+    /// MS-CUSTOMUI 只有 editBox/comboBox 有 sizeString，这里对所有控件都认。
+    pub width: Option<f32>,
+    /// split 右侧箭头区的宽度（旧版「▼」按 menu_button 走是 28，「tight」是 16）
+    pub arrow: Option<f32>,
     pub screentip: Option<String>,
     pub supertip: Option<String>,
     pub keytip: Option<String>,
@@ -113,6 +118,11 @@ pub enum Node {
     Split { ctl: Ctl, menu: Menu },
     Menu(Menu),
     DropDown { ctl: Ctl, items: Vec<Item> },
+    Gallery {
+        ctl: Ctl,
+        items: Vec<Item>,
+        columns: u32,
+    },
     ComboBox {
         ctl: Ctl,
         items: Vec<Item>,
@@ -125,7 +135,16 @@ pub enum Node {
         width: f32,
     },
     Label(LabelCtl),
-    Box { vertical: bool, children: Vec<Node> },
+    /// MS-CUSTOMUI 没有滑块；视图>缩放这一格沿用原来的 egui Slider。
+    Slider { ctl: Ctl, min: f32, max: f32 },
+    Box {
+        vertical: bool,
+        top: f32,
+        gap: f32,
+        children: Vec<Node>,
+    },
+    /// 横向 2px 分隔（旧版行内的 add_space，Excel 用固定间距，MS-CUSTOMUI 没有对应元素）
+    Spacer(f32),
     Separator,
 }
 
@@ -158,6 +177,7 @@ pub struct LabelCtl {
     /// mono / weak / chip
     pub style: Option<String>,
     pub size: f32,
+    pub width: Option<f32>,
 }
 
 /// 编译进包的文档。解析失败是编译产物的问题，直接炸出来，别静默降级。
@@ -363,6 +383,12 @@ fn read_node(e: &El) -> Result<Option<Node>, String> {
                 ctl.screentip = outer.screentip.clone();
             }
             ctl.size = outer.size;
+            if ctl.width.is_none() {
+                ctl.width = outer.width;
+            }
+            if ctl.arrow.is_none() {
+                ctl.arrow = outer.arrow;
+            }
             let menu = child(e, "menu")
                 .map(read_menu)
                 .transpose()?
@@ -376,6 +402,13 @@ fn read_node(e: &El) -> Result<Option<Node>, String> {
             Node::Split { ctl, menu }
         }
         "menu" => Node::Menu(read_menu(e)?),
+        "gallery" => Node::Gallery {
+            ctl: read_ctl(e),
+            items: read_items(e),
+            columns: attr(e, "columns")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5),
+        },
         "dropDown" => Node::DropDown {
             ctl: read_ctl(e),
             items: read_items(e),
@@ -402,17 +435,37 @@ fn read_node(e: &El) -> Result<Option<Node>, String> {
             size: attr(e, "fontSize")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(11.0),
+            width: attr(e, "sizeString").and_then(|s| s.parse().ok()),
         }),
         "box" => {
             let vertical = attr(e, "boxStyle").as_deref() == Some("vertical");
+            let top = attr(e, "paddingTop")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let gap = attr(e, "gap").and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut children = Vec::new();
             for c in &e.children {
                 if let Some(n) = read_node(c)? {
                     children.push(n);
                 }
             }
-            Node::Box { vertical, children }
+            Node::Box {
+                vertical,
+                top,
+                gap,
+                children,
+            }
         }
+        "spacer" => Node::Spacer(
+            attr(e, "sizeString")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2.0),
+        ),
+        "slider" => Node::Slider {
+            ctl: read_ctl(e),
+            min: attr(e, "min").and_then(|v| v.parse().ok()).unwrap_or(0.5),
+            max: attr(e, "max").and_then(|v| v.parse().ok()).unwrap_or(2.5),
+        },
         "separator" => Node::Separator,
         // 未知元素不致命：跳过，方便以后按需扩。
         _ => return Ok(None),
@@ -458,6 +511,10 @@ fn read_ctl(e: &El) -> Ctl {
             Some("large") => Size::Large,
             _ => Size::Normal,
         },
+        width: attr(e, "sizeString")
+            .or_else(|| attr(e, "width"))
+            .and_then(|s| s.parse().ok()),
+        arrow: attr(e, "arrowWidth").and_then(|s| s.parse().ok()),
         screentip: attr(e, "screentip").filter(|s| !s.is_empty()),
         supertip: attr(e, "supertip").filter(|s| !s.is_empty()),
         keytip: attr(e, "keytip").filter(|s| !s.is_empty()),
@@ -555,7 +612,7 @@ mod tests {
                         menu_ids(menu, out);
                     }
                     Node::Menu(m) => menu_ids(m, out),
-                    Node::DropDown { ctl, items } => {
+                    Node::DropDown { ctl, items } | Node::Gallery { ctl, items, .. } => {
                         out.push(ctl.id.clone());
                         out.extend(items.iter().map(|i| i.id.clone()));
                     }
@@ -565,8 +622,9 @@ mod tests {
                     }
                     Node::EditBox { ctl, .. } => out.push(ctl.id.clone()),
                     Node::Label(l) => out.push(l.id.clone()),
+                    Node::Slider { ctl, .. } => out.push(ctl.id.clone()),
                     Node::Box { children, .. } => walk(children, out),
-                    Node::Separator => {}
+                    Node::Spacer(_) | Node::Separator => {}
                 }
             }
         }
@@ -636,7 +694,7 @@ mod tests {
                         walk_menu(menu, out);
                     }
                     Node::Menu(m) => walk_menu(m, out),
-                    Node::DropDown { items, .. } => {
+                    Node::DropDown { items, .. } | Node::Gallery { items, .. } => {
                         out.extend(items.iter().map(|i| i.id.clone()))
                     }
                     Node::Box { children, .. } => walk(children, out),

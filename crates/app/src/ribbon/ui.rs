@@ -111,11 +111,21 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
 /// 当前页签的功能区主体。
 pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
     // 上下文页签的宿主对象没了就退回「开始」（和 Excel 一样）
-    if app.ribbon_tab == 100 && app.table_at_sel().is_none() {
-        app.ribbon_tab = 1;
-    }
-    if app.ribbon_tab == 101 && app.chart_at_sel().is_none() {
-        app.ribbon_tab = 1;
+    // 文件还在后台打开时，选区/表格都还没就位，先别把上下文页签踢掉
+    if app.tasks.open_rx.is_none() {
+        if app.ribbon_tab == 100 && app.table_at_sel().is_none() {
+            if std::env::var("SC_RIBBON_LOG").is_ok() {
+                eprintln!(
+                    "[ribbon] 上下文页签退回开始 sel={:?} 表={}",
+                    app.sel,
+                    app.wb.sheet(app.sheet_idx).tables.len()
+                );
+            }
+            app.ribbon_tab = 1;
+        }
+        if app.ribbon_tab == 101 && app.chart_at_sel().is_none() {
+            app.ribbon_tab = 1;
+        }
     }
     let tab = match app.ribbon_tab {
         100 => app
@@ -183,6 +193,7 @@ fn node(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
         Node::Split { ctl, menu } => split(app, ui, ctl, menu),
         Node::Menu(m) => menu(app, ui, m),
         Node::DropDown { ctl, items } => dropdown(app, ui, ctl, items),
+        Node::Gallery { ctl, items, .. } => gallery(app, ui, ctl, items),
         Node::ComboBox { ctl, items, width } => combo(app, ui, ctl, items, *width),
         Node::EditBox {
             ctl,
@@ -191,11 +202,19 @@ fn node(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
             width,
         } => edit(app, ui, ctl, hint, *password, *width),
         Node::Label(l) => label(app, ui, l),
-        Node::Box { vertical, children } => {
+        Node::Slider { ctl, min, max } => slider(app, ui, ctl, *min, *max),
+        Node::Box {
+            vertical,
+            top,
+            gap,
+            children,
+        } => {
             if *vertical {
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.add_space(2.0);
+                    ui.spacing_mut().item_spacing.y = *gap;
+                    if *top > 0.0 {
+                        ui.add_space(*top);
+                    }
                     nodes(app, ui, children);
                 });
             } else {
@@ -205,11 +224,18 @@ fn node(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
                 });
             }
         }
+        Node::Spacer(w) => {
+            ui.add_space(*w);
+        }
         Node::Separator => ui_kit::hairline(ui),
     }
 }
 
 // ---------------------------------------------------------------- 控件
+
+fn on_enabled(c: &Ctl, st: &super::CtlState) -> bool {
+    c.enabled && st.enabled
+}
 
 fn tip_of(c: &Ctl) -> String {
     match (&c.screentip, &c.supertip) {
@@ -240,9 +266,9 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
     let tip = st.tip.clone().unwrap_or_else(|| tip_of(c));
     let icon = c.image.as_deref().and_then(icon_of);
     let on = toggle && st.checked;
+    let enabled = on_enabled(c, &st);
 
-    let resp = ui.add_enabled_ui(st.enabled, |ui| {
-        // Excel 内置的字体类开关：字本身就是图标
+    let resp = ui.add_enabled_ui(enabled, |ui| {
         if matches!(c.id.as_str(), "Bold" | "Italic" | "Underline") {
             return ui_kit::text_toggle(
                 ui,
@@ -260,7 +286,6 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
                 c.id == "Underline",
             );
         }
-        // 颜色按钮：图标/字母 + 底部色条
         if matches!(c.id.as_str(), "FillColor" | "FontColor") {
             let col = st.swatch.unwrap_or(Color32::from_rgb(128, 128, 128));
             return ui_kit::color_button(
@@ -273,8 +298,7 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
         }
         match c.size {
             Size::Large => {
-                let w = measure(ui, &label, 12.0).max(28.0) + 14.0;
-                let w = w.max(42.0);
+                let w = c.width.unwrap_or(42.0);
                 let ic = icon.unwrap_or(Icon::Grid);
                 let r = ui_kit::big_sized(ui, ic, &label, Vec2::new(w, 76.0));
                 if !tip.is_empty() {
@@ -285,12 +309,12 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
             }
             Size::Normal => {
                 if label.is_empty() {
-                    let ic = icon.unwrap_or(Icon::Grid);
-                    ui_kit::small_on(ui, ic, on, &tip)
+                    ui_kit::small_on(ui, icon.unwrap_or(Icon::Grid), on, &tip)
                 } else {
-                    let w = 16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0;
-                    let ic = icon.unwrap_or(Icon::Grid);
-                    ui_kit::labeled_w_on(ui, ic, &label, w.max(24.0), on, &tip)
+                    let w = c.width.unwrap_or_else(|| {
+                        (16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0).max(24.0)
+                    });
+                    ui_kit::labeled_w_on(ui, icon.unwrap_or(Icon::Grid), &label, w, on, &tip)
                 }
             }
         }
@@ -310,40 +334,70 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
     let tip = st.tip.clone().unwrap_or_else(|| tip_of(ctl));
     let icon = ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
     let on = st.checked;
+    let enabled = on_enabled(ctl, &st);
     let mut open = false;
     let mut pos = egui::pos2(0.0, 0.0);
     let main_clicked;
 
     match ctl.size {
         Size::Large => {
-            let w = (measure(ui, &label, 12.0).max(28.0) + 14.0).max(42.0);
+            let w = ctl.width.unwrap_or(42.0);
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
-            main_clicked = r.clicked();
-            if ar.clicked() {
+            main_clicked = enabled && r.clicked();
+            if ar.clicked() && enabled {
                 open = true;
                 pos = egui::pos2(ar.rect.left(), ar.rect.bottom());
             }
         }
         Size::Normal => {
-            let r = ui.add_enabled_ui(st.enabled, |ui| {
-                if label.is_empty() {
-                    ui_kit::small_on(ui, icon, on, &tip)
-                } else {
-                    let w = 16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0;
-                    ui_kit::labeled_w_on(ui, icon, &label, w.max(24.0), on, &tip)
-                }
-            });
-            main_clicked = r.inner.clicked();
-            // Excel 的 split 右侧那条窄箭头
-            let (rect, ar) = ui.allocate_exact_size(Vec2::new(12.0, 24.0), Sense::click());
-            if ar.hovered() {
-                ui.painter()
-                    .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
-            }
-            ui_kit::caret(ui, rect.center(), ui.visuals().text_color());
-            if ar.clicked() {
+            let aw = ctl.arrow.unwrap_or(15.0);
+            let (mr, ar) = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let main = ui.add_enabled_ui(enabled, |ui| {
+                        match ctl.id.as_str() {
+                            "Bold" => ui_kit::text_toggle(ui, "B", on, &tip, true, false, false),
+                            "Italic" => ui_kit::text_toggle(ui, "I", on, &tip, false, true, false),
+                            "Underline" => {
+                                ui_kit::text_toggle(ui, "U", on, &tip, false, false, true)
+                            }
+                            "FillColor" | "FontColor" => {
+                                let col = st.swatch.unwrap_or(Color32::from_rgb(128, 128, 128));
+                                ui_kit::color_button(
+                                    ui,
+                                    if ctl.id == "FontColor" { Some("A") } else { None },
+                                    icon_of(if ctl.id == "FontColor" { "FontColor" } else { "Fill" }),
+                                    col,
+                                    &tip,
+                                )
+                            }
+                            _ if label.is_empty() => ui_kit::small_on(ui, icon, on, &tip),
+                            _ => {
+                                let w = ctl.width.unwrap_or_else(|| {
+                                    (16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0).max(24.0)
+                                });
+                                ui_kit::labeled_w_on(ui, icon, &label, w, on, &tip)
+                            }
+                        }
+                    });
+                    let ar = ui
+                        .scope(|ui| {
+                            if aw <= 18.0 {
+                                ui.spacing_mut().button_padding.x = 2.0;
+                            }
+                            ui.add_sized(
+                                Vec2::new(aw, 24.0),
+                                egui::Button::new(egui::RichText::new("▼").size(12.0)),
+                            )
+                        })
+                        .inner;
+                    (main.inner, ar)
+                })
+                .inner;
+            main_clicked = mr.clicked();
+            if ar.clicked() && enabled {
                 open = true;
-                pos = rect.left_bottom();
+                pos = ar.rect.left_bottom();
             }
         }
     }
@@ -369,15 +423,35 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
     let label = st.label.clone().or_else(|| m.ctl.label.clone()).unwrap_or_default();
     let tip = tip_of(&m.ctl);
     let icon = m.ctl.image.as_deref().and_then(icon_of);
-    let clicked = ui.add_enabled_ui(st.enabled, |ui| {
-        let w = if let Some(ic) = icon {
-            let w = 16.0 + 4.0 + measure(ui, &label, 12.0) + 16.0;
-            ui_kit::labeled_w(ui, ic, &label, w.max(24.0), &tip)
+    if m.ctl.size == Size::Large {
+        let w = m.ctl.width.unwrap_or(65.0);
+        let ic = m.ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
+        let (r, ar) = ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0));
+        if (r.clicked() || ar.clicked()) && on_enabled(&m.ctl, &st) {
+            app.ribbon_popup = Some(Popup {
+                kind: PopupKind::Menu(m.clone()),
+                pos: egui::pos2(ar.rect.left(), ar.rect.bottom()),
+                opened_at: ui.input(|i| i.time),
+            });
+        }
+        return;
+    }
+    let clicked = ui.add_enabled_ui(on_enabled(&m.ctl, &st), |ui| {
+        let w = m.ctl.width.unwrap_or_else(|| {
+            if icon.is_some() {
+                (16.0 + 4.0 + measure(ui, &label, 12.0) + 16.0).max(24.0)
+            } else {
+                (measure(ui, &label, 12.0) + 26.0).max(24.0)
+            }
+        });
+        if let Some(ic) = icon {
+            ui_kit::labeled_w(ui, ic, &label, w, &tip)
         } else {
-            let w = measure(ui, &label, 12.0) + 26.0;
-            ui_kit::labeled_w(ui, Icon::Grid, &label, w.max(24.0), &tip)
-        };
-        w
+            ui.add(
+                egui::Button::new(egui::RichText::new(&label).size(12.0))
+                    .min_size(Vec2::new(w, 24.0)),
+            )
+        }
     });
     if clicked.inner.clicked() {
         app.ribbon_popup = Some(Popup {
@@ -393,6 +467,33 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     if !st.visible {
         return;
     }
+    // Excel 的数字格式是「可输入的下拉」，原来用 egui ComboBox 调过对齐，别再自绘
+    if c.id == "NumberFormat" {
+        let cur = st
+            .text
+            .clone()
+            .or_else(|| items.first().map(|i| i.label.clone()))
+            .unwrap_or_default();
+        let mut picked: Option<String> = None;
+        ui.add_enabled_ui(st.enabled, |ui| {
+            ui.spacing_mut().interact_size.y = 21.0;
+            egui::ComboBox::from_id_salt("numfmt")
+                .selected_text(cur)
+                .width(c.width.unwrap_or(96.0))
+                .height(24.0)
+                .show_ui(ui, |ui| {
+                    for it in items {
+                        if ui.selectable_label(false, &it.label).clicked() {
+                            picked = Some(it.id.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(p) = picked {
+            app.ribbon_action(&p, ui.ctx());
+        }
+        return;
+    }
     let text = st
         .text
         .clone()
@@ -406,8 +507,10 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         .map(|_| 0.0)
         .unwrap_or(0.0);
     let _ = w;
-    let clicked = ui.add_enabled_ui(st.enabled, |ui| {
-        let width = 96.0_f32.max(measure(ui, &text, 12.0) + 30.0);
+    let clicked = ui.add_enabled_ui(on_enabled(c, &st), |ui| {
+        let width = c
+            .width
+            .unwrap_or_else(|| 96.0_f32.max(measure(ui, &text, 12.0) + 30.0));
         let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 21.0), Sense::click());
         let hover = r.hovered();
         ui.painter().rect(
@@ -447,8 +550,8 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
 fn combo(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item], width: f32) {
     // 字体、字号是 Excel 的「可编辑组合框」，外观单独做
     match c.id.as_str() {
-        "Font" => return font_combo(app, ui),
-        "FontSize" => return size_combo(app, ui),
+        "Font" => return font_combo(app, ui, width),
+        "FontSize" => return size_combo(app, ui, width),
         _ => {}
     }
     let st = app.ctl_state(&c.id);
@@ -461,8 +564,7 @@ fn combo(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item], width: 
         .or_else(|| items.first().map(|i| i.label.clone()))
         .unwrap_or_default();
     let mut picked: Option<String> = None;
-    ui.add_enabled_ui(st.enabled, |ui| {
-        ui.spacing_mut().interact_size.y = 21.0;
+    ui.add_enabled_ui(on_enabled(c, &st), |ui| {
         egui::ComboBox::from_id_salt(&c.id)
             .selected_text(cur)
             .width(width)
@@ -491,7 +593,7 @@ fn edit(
     if !st.visible {
         return;
     }
-    ui.add_enabled_ui(st.enabled, |ui| {
+    ui.add_enabled_ui(on_enabled(c, &st), |ui| {
         ui.spacing_mut().interact_size.y = 21.0;
         let buf: &mut String = match c.id.as_str() {
             "JoinAddress" => &mut app.join_addr,
@@ -516,11 +618,10 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, l: &LabelCtl) {
     let text = st.text.clone().or_else(|| l.label.clone()).unwrap_or_default();
     let weak = l.style.as_deref() == Some("weak");
     let mono = l.style.as_deref() == Some("mono");
-    let chip = l.style.as_deref() == Some("chip");
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 1.0;
-        if chip {
-            // 表格样式缩略：五段主题绿，和 Excel 的表样式预览同一路数
+
+    if l.style.as_deref() == Some("chip") {
+        // 表格样式缩略：五段主题绿，和 Excel 的表样式预览同一路数
+        ui.vertical(|ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::new(120.0, 22.0), Sense::hover());
             let painter = ui.painter();
             let mut x = r.left();
@@ -538,22 +639,28 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, l: &LabelCtl) {
                 );
                 x += 24.0;
             }
-            let mut t = egui::RichText::new(&text).size(l.size);
-            t = t.color(ui_kit::TEXT_WEAK);
-            ui.label(t);
-            return;
-        }
-        let mut t = egui::RichText::new(&text).size(l.size);
-        if mono {
-            t = t.monospace();
-        }
-        if weak {
-            t = t.color(ui_kit::TEXT_WEAK);
-        } else if mono {
-            t = t.color(ui_kit::TEXT);
-        }
-        ui.label(t);
-    });
+            ui.label(egui::RichText::new(&text).size(l.size).color(ui_kit::TEXT_WEAK));
+        });
+        return;
+    }
+
+    if let Some(w) = l.width {
+        // 页面布局那三行「宽度:/高度:/缩放:」是定宽标签 + 定宽下拉
+        ui.add_sized(
+            [w, 21.0],
+            egui::Label::new(egui::RichText::new(&text).size(l.size)),
+        );
+        return;
+    }
+
+    let mut t = egui::RichText::new(&text).size(l.size);
+    if mono {
+        t = t.monospace().color(ui_kit::TEXT);
+    }
+    if weak {
+        t = t.weak();
+    }
+    ui.label(t);
 }
 
 // ---------------------------------------------------------------- 弹出层
@@ -670,7 +777,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- 字体/字号框
 
-fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
+fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
     let cur = app.current_style();
     ui.spacing_mut().interact_size.y = 21.0;
     let fid = egui::Id::new("font_edit");
@@ -681,7 +788,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
     let mut arrow_pos = egui::pos2(0.0, 0.0);
     let mut arrow_clicked = false;
     {
-        let (crect, _) = ui.allocate_exact_size(Vec2::new(160.0, 21.0), Sense::hover());
+        let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
             2.0,
@@ -704,7 +811,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
         );
         let fr = child
             .add_sized(
-                Vec2::new(text_rect.width(), 18.0),
+                Vec2::new(text_rect.width(), 20.0),
                 egui::TextEdit::singleline(&mut app.font_buf)
                     .id(fid)
                     .frame(false)
@@ -777,7 +884,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
 }
 
-fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
+fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
     let cur = app.current_style();
     ui.spacing_mut().interact_size.y = 21.0;
     let sid = egui::Id::new("size_edit");
@@ -788,7 +895,7 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
     let mut arrow_pos = egui::pos2(0.0, 0.0);
     let mut arrow_clicked = false;
     {
-        let (crect, _) = ui.allocate_exact_size(Vec2::new(52.0, 21.0), Sense::hover());
+        let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
             2.0,
@@ -811,7 +918,7 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
         );
         let sr = child
             .add_sized(
-                Vec2::new(text_rect.width(), 18.0),
+                Vec2::new(text_rect.width(), 20.0),
                 egui::TextEdit::singleline(&mut app.size_buf)
                     .id(sid)
                     .frame(false),
@@ -881,6 +988,129 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui) {
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.size_menu = false;
         }
+    }
+}
+
+fn slider(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, min: f32, max: f32) {
+    let st = app.ctl_state(&c.id);
+    if !st.visible {
+        return;
+    }
+    let mut z = app.zoom;
+    ui.spacing_mut().slider_width = c.width.unwrap_or(120.0);
+    let r = ui.add_enabled(
+        on_enabled(c, &st),
+        egui::Slider::new(&mut z, min..=max).show_value(false),
+    );
+    if r.changed() {
+        app.zoom = z.clamp(min, max);
+        ui.ctx().set_zoom_factor(app.zoom);
+    }
+}
+
+fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
+    let st = app.ctl_state(&c.id);
+    if !st.visible {
+        return;
+    }
+    let w = c.width.unwrap_or(349.0);
+    let enabled = on_enabled(c, &st);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 65.0), Sense::hover());
+    let arrow_w = 24.0;
+    let area = Rect::from_min_max(rect.min, egui::pos2(rect.right() - arrow_w, rect.bottom()));
+    let n = items.len().max(1) as f32;
+    let tw = area.width() / n;
+    let mut fire: Option<String> = None;
+    for (i, it) in items.iter().enumerate() {
+        let r = Rect::from_min_size(
+            egui::pos2(area.left() + i as f32 * tw + 1.0, area.top() + 1.0),
+            Vec2::new(tw - 2.0, 63.0),
+        );
+        let resp = ui.interact(r, ui.id().with(("gal", &c.id, i)), Sense::click());
+        let (bg, fg, bold) = style_preview(&it.id);
+        let bg = if resp.hovered() { bg.gamma_multiply(0.94) } else { bg };
+        ui.painter().rect(
+            r,
+            2.0,
+            bg,
+            egui::Stroke::new(1.0, ui_kit::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        // 像 Excel 的样式缩略图：一块样例底纹 + Aa + 两条模拟网格线
+        if bg != Color32::WHITE {
+            let band = Rect::from_min_max(r.min, egui::pos2(r.right(), r.top() + 6.0));
+            ui.painter().rect_filled(band, 0.0, bg.gamma_multiply(0.85));
+        }
+        let fs = if bold { 13.0 } else { 12.0 };
+        let pos = egui::pos2(r.center().x, r.top() + 22.0);
+        ui.painter().text(
+            pos,
+            Align2::CENTER_CENTER,
+            "Aa",
+            FontId::proportional(fs),
+            fg,
+        );
+        if bold {
+            ui.painter().text(
+                pos + Vec2::new(0.5, 0.0),
+                Align2::CENTER_CENTER,
+                "Aa",
+                FontId::proportional(fs),
+                fg,
+            );
+        }
+        let line = egui::Stroke::new(1.0, ui_kit::BORDER);
+        for k in 0..2 {
+            let y = r.top() + 40.0 + k as f32 * 9.0;
+            ui.painter().line_segment(
+                [egui::pos2(r.left() + 6.0, y), egui::pos2(r.right() - 6.0, y)],
+                line,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(r.center().x, r.bottom() - 8.0),
+            Align2::CENTER_CENTER,
+            it.label.clone(),
+            FontId::proportional(9.0),
+            ui_kit::TEXT_WEAK,
+        );
+        if resp.clicked() && enabled {
+            fire = Some(it.id.clone());
+        }
+    }
+    let arrow_rect = Rect::from_min_max(egui::pos2(rect.right() - arrow_w, rect.top()), rect.max);
+    let ar = ui.interact(arrow_rect, ui.id().with(("galarrow", &c.id)), Sense::click());
+    if ar.hovered() {
+        ui.painter().rect_filled(arrow_rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    ui_kit::caret(
+        ui,
+        egui::pos2(rect.right() - arrow_w / 2.0, rect.center().y),
+        ui.visuals().text_color(),
+    );
+    if ar.clicked() && enabled {
+        app.ribbon_popup = Some(Popup {
+            kind: PopupKind::Items(items.to_vec()),
+            pos: egui::pos2(rect.right() - arrow_w, rect.top()),
+            opened_at: ui.input(|i| i.time),
+        });
+    }
+    if let Some(a) = fire {
+        app.ribbon_action(&a, ui.ctx());
+    }
+}
+
+fn style_preview(id: &str) -> (Color32, Color32, bool) {
+    match id {
+        "StyleTitle" => (Color32::WHITE, Color32::from_rgb(31, 78, 121), true),
+        "StyleHeading" => (
+            Color32::from_rgb(217, 226, 243),
+            Color32::from_rgb(31, 56, 100),
+            true,
+        ),
+        "StyleGood" => (Color32::from_rgb(198, 239, 206), Color32::from_rgb(0, 97, 0), false),
+        "StyleBad" => (Color32::from_rgb(255, 199, 206), Color32::from_rgb(156, 0, 6), false),
+        _ => (Color32::WHITE, ui_kit::TEXT, false),
     }
 }
 

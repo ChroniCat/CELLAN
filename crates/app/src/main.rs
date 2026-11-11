@@ -31,6 +31,7 @@ mod chart_view;
 mod icons;
 mod ui_icons;
 mod ui_kit;
+mod ui_png;
 
 use ui_icons::Icon;
 use files::FileTree;
@@ -18467,7 +18468,16 @@ fn main() -> eframe::Result<()> {
     }
     let mut opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
+            .with_inner_size([
+                std::env::var("SC_WIN_W")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1440.0),
+                std::env::var("SC_WIN_H")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(900.0),
+            ])
             .with_min_inner_size([760.0, 420.0])
             .with_decorations(false)
             .with_title("Sheets Native (v1.6)"),
