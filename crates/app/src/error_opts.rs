@@ -85,6 +85,7 @@ mod tests {
 
     #[test]
     fn roundtrip_through_file() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("sn_ec_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let old = std::env::var("LOCALAPPDATA").ok();

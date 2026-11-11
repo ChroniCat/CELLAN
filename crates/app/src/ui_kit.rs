@@ -261,11 +261,6 @@ pub fn group_l(ui: &mut egui::Ui, title: &str, id: &str, add: impl FnOnce(&mut e
     let r = group(ui, title, add);
     launcher_at(ui, r, id)
 }
-/// 图标在上、文字在下的大按钮（粘贴、图表这种）。Excel：42×76，图标 32
-pub fn big(ui: &mut egui::Ui, icon: Icon, label: &str) -> Response {
-    big_sized(ui, icon, label, Vec2::new(42.0, 76.0))
-}
-
 pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Response {
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
@@ -301,12 +296,6 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
         col,
     );
     resp
-}
-
-/// 大按钮的 split 形态：主区执行命令，右侧 9px 条是下拉箭头（Excel 的粘贴/合并/边框）。
-/// 宽度仍是 42，箭头画在按钮内部，不额外占位。
-pub fn big_split(ui: &mut egui::Ui, icon: Icon, label: &str) -> (Response, Response) {
-    big_sized_split(ui, icon, label, Vec2::new(42.0, 76.0))
 }
 
 /// 同上，可指定按钮尺寸（样式组的 66×76 也用 split）
@@ -373,11 +362,6 @@ pub fn big_sized_split(
     (resp, aresp)
 }
 
-/// 只有图标的小按钮（撤销、对齐这类）。Excel：24×24，图标 16
-pub fn small(ui: &mut egui::Ui, icon: Icon, tip: &str) -> Response {
-    small_on(ui, icon, false, tip)
-}
-
 pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response {
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
@@ -401,15 +385,6 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
     };
     ui_icons::draw_excel(ui.painter(), rect.shrink(4.0), icon, col, enabled);
     resp.on_hover_text(tip)
-}
-
-/// 图标 + 文字的窄按钮（剪切、复制、格式刷）
-pub fn labeled(ui: &mut egui::Ui, icon: Icon, label: &str, tip: &str) -> Response {
-    let font = FontId::proportional(12.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
-    labeled_w(ui, icon, label, (16.0 + 4.0 + galley.size().x + 10.0).max(24.0), tip)
 }
 
 /// 固定宽度的图标文字按钮：Excel 的「剪切/复制」是 81×24，「插入」也是 81×24
@@ -606,11 +581,6 @@ pub fn text_toggle(
     resp.on_hover_text(tip)
 }
 
-/// 页签：Excel 365 —— 30 高，选中时底部 2px 绿线
-pub fn tab(ui: &mut egui::Ui, name: &str, active: bool) -> Response {
-    tab_ex(ui, name, active, false)
-}
-
 /// 文件页签常驻绿色文字
 pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
     let v = ui.visuals().clone();
@@ -665,12 +635,6 @@ pub fn hairline(ui: &mut egui::Ui) {
             SEP
         },
     );
-}
-
-/// 对话框统一外框：标题栏 + 内容 + 底部按钮区
-pub fn dialog(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
-    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-    body(ui);
 }
 
 /// 对话框底部的按钮行（右对齐）

@@ -22,6 +22,8 @@ pub enum PopupKind {
 pub struct Popup {
     pub kind: PopupKind,
     pub pos: egui::Pos2,
+    /// 打开时刻：同一帧的这次点击不能立刻把弹层关掉
+    pub opened_at: f64,
 }
 
 /// 页签行（文件…帮助）。上下文页签由调用方按需追加。
@@ -55,6 +57,7 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
         if resp.double_clicked() {
             app.ribbon_collapsed = !app.ribbon_collapsed;
+            app.ribbon_popup = None;
         }
         if resp.clicked() {
             if i == 0 {
@@ -63,6 +66,7 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             } else {
                 app.ribbon_tab = i;
                 app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
             }
         }
     }
@@ -82,6 +86,7 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             if r.clicked() {
                 app.ribbon_tab = 100;
                 app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
             }
         }
     }
@@ -97,6 +102,7 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             if r.clicked() {
                 app.ribbon_tab = 101;
                 app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
             }
         }
     }
@@ -104,6 +110,13 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
 
 /// 当前页签的功能区主体。
 pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
+    // 上下文页签的宿主对象没了就退回「开始」（和 Excel 一样）
+    if app.ribbon_tab == 100 && app.table_at_sel().is_none() {
+        app.ribbon_tab = 1;
+    }
+    if app.ribbon_tab == 101 && app.chart_at_sel().is_none() {
+        app.ribbon_tab = 1;
+    }
     let tab = match app.ribbon_tab {
         100 => app
             .ribbon
@@ -120,8 +133,15 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         n if n < app.ribbon.tabs.len() => Some(app.ribbon.tabs[n].clone()),
         _ => None,
     };
-    let Some(tab) = tab else {
-        return;
+    let tab = match tab {
+        Some(t) => t,
+        None => {
+            app.ribbon_tab = 1;
+            match app.ribbon.tabs.get(1) {
+                Some(t) => t.clone(),
+                None => return,
+            }
+        }
     };
     ui_kit::reset_groups();
     for g in &tab.groups {
@@ -336,6 +356,7 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Menu(menu_def.clone()),
             pos,
+            opened_at: ui.input(|i| i.time),
         });
     }
 }
@@ -362,6 +383,7 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Menu(m.clone()),
             pos: clicked.inner.rect.left_bottom(),
+            opened_at: ui.input(|i| i.time),
         });
     }
 }
@@ -391,7 +413,7 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         ui.painter().rect(
             rect,
             2.0,
-            Color32::WHITE,
+            ui.visuals().extreme_bg_color,
             egui::Stroke::new(1.0, ui_kit::BORDER),
             egui::StrokeKind::Inside,
         );
@@ -417,6 +439,7 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
             pos: clicked.inner.rect.left_bottom(),
+            opened_at: ui.input(|i| i.time),
         });
     }
 }
@@ -603,6 +626,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                         app.ribbon_popup = Some(Popup {
                                             kind: PopupKind::Menu(sub.clone()),
                                             pos: egui::pos2(r.rect.right(), r.rect.top()),
+                                            opened_at: ui.input(|i| i.time),
                                         });
                                     }
                                 }
@@ -629,9 +653,12 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     if let Some(a) = fire {
         app.ribbon_action(&a, &ctx);
     }
+    let now = ctx.input(|i| i.time);
+    let fresh = now - p.opened_at < 0.08;
     if close
         || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        || (ctx.input(|i| i.pointer.any_click())
+        || (!fresh
+            && ctx.input(|i| i.pointer.any_click())
             && !ctx
                 .input(|i| i.pointer.interact_pos())
                 .map(|p| rect.contains(p))

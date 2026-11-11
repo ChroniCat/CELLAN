@@ -20,6 +20,11 @@ mod ribbon;
 mod session_lock;
 mod single_instance;
 
+#[cfg(test)]
+/// 改进程级环境变量（LOCALAPPDATA）的测试必须串行，否则并行跑时互相把
+/// 存储目录指到别人的临时目录里，断言时灵时不灵。
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use eframe::egui;
 
 mod chart_view;
@@ -40,7 +45,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.63";
+const APP_VERSION: &str = "1.64";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -2490,6 +2495,7 @@ impl SheetApp {
                 self.ribbon_popup = Some(ribbon::ui::Popup {
                     kind: ribbon::ui::PopupKind::Items(items),
                     pos: egui::pos2(200.0, 200.0),
+                    opened_at: 0.0,
                 });
             } else {
                 eprintln!("[ribbon] 找不到下拉 {id}");
@@ -2501,6 +2507,7 @@ impl SheetApp {
                 self.ribbon_popup = Some(ribbon::ui::Popup {
                     kind: ribbon::ui::PopupKind::Menu(menu),
                     pos: egui::pos2(200.0, 200.0),
+                    opened_at: 0.0,
                 });
             } else {
                 eprintln!("[ribbon] 找不到菜单 {m}");
@@ -12993,7 +13000,7 @@ impl SheetApp {
                     + pg_map((cols.pos(c) - g.origin_x) * g.scale, &g.bx, g.paper_w)
                     - off_x
             }
-            None => body_x + cols.pos(c) - off_x,
+            None => body_x + cols.pos(c) - frozen_w - off_x,
         };
         let gy = |r: u32| match &pg {
             Some(g) => {
@@ -13003,7 +13010,7 @@ impl SheetApp {
                     + pg_map((rows.pos(r) - g.origin_y) * g.scale, &g.by, g.paper_h)
                     - off_y
             }
-            None => body_y + rows.pos(r) - off_y,
+            None => body_y + rows.pos(r) - frozen_h - off_y,
         };
         // 冻结区里的格子用固定坐标
         let px_of = |c: u32| {
@@ -13035,9 +13042,11 @@ impl SheetApp {
                 }
                 lo
             } else if fx > 0 && x < body_x {
+                // 冻结列：从第 0 列量的
                 cols.index_at(x - (origin.x + head_w))
             } else {
-                cols.index_at(off_x + x - (origin.x + head_w))
+                // 正文区：body_x 已经把冻结列让出去了，要把冻结宽度补回来
+                cols.index_at(frozen_w + off_x + (x - body_x))
             }
         };
         let row_at = |y: f32| -> u32 {
@@ -13056,9 +13065,44 @@ impl SheetApp {
             } else if fy > 0 && y < body_y {
                 rows.index_at(y - (origin.y + hh))
             } else {
-                rows.index_at(off_y + y - (origin.y + hh))
+                rows.index_at(frozen_h + off_y + (y - body_y))
             }
         };
+        // 无界面验收：SC_HIT="x,y" 走一遍和鼠标点击一样的命中测试，打印命中的格子
+        if let Ok(spec) = std::env::var("SC_HIT") {
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let ready = self.tasks.open_rx.is_none()
+                && self.wb.sheets.iter().any(|s| s.len() > 0);
+            if ready && !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                for one in spec.split(';') {
+                    if let Some((xs, ys)) = one.split_once(',') {
+                        if let (Ok(x), Ok(y)) = (xs.trim().parse::<f32>(), ys.trim().parse::<f32>()) {
+                            let c = col_at(x);
+                            let r = row_at(y);
+                            let cx = origin.x + head_w + cols.pos(c) - if fx > 0 && x < body_x { 0.0 } else { off_x };
+                            let cy = origin.y + hh + rows.pos(r) - if fy > 0 && y < body_y { 0.0 } else { off_y };
+                            eprintln!(
+                                "[hit] ({x:.0},{y:.0}) -> {} cell_rect=({cx:.0},{cy:.0},{:.0},{:.0}) origin=({:.0},{:.0}) head=({:.0},{:.0}) off=({:.0},{:.0}) freeze=({fx},{fy}) sheet={:?} custom=({},{}) sheet_freeze={:?}",
+                                cell_name(r, c),
+                                cols.size(c),
+                                rows.size(r),
+                                origin.x,
+                                origin.y,
+                                head_w,
+                                hh,
+                                off_x,
+                                off_y,
+                                self.wb.sheet(self.sheet_idx).name,
+                                cols.len(),
+                                rows.len(),
+                                self.wb.sheet(self.sheet_idx).freeze
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // 页面布局：灰底 + 白色页纸 + 页眉页脚
         if let Some(g) = &pg {
             let body_clip = Rect::from_min_max(
@@ -13777,10 +13821,28 @@ impl SheetApp {
                     let h = rows.size(rr);
                     if h >= 1.0 && y + h > origin.y + hh {
                         for cc in 0..fx {
-                            let rect = Rect::from_min_size(
+                            let mut rect = Rect::from_min_size(
                                 egui::pos2(origin.x + head_w + cols.pos(cc), y),
                                 Vec2::new(cols.size(cc), h),
                             );
+                            // 冻结区的合并格也要按整块画，否则文字被裁在一格里
+                            if let Some((mr1, mc1, mr2, mc2)) = merges
+                                .iter()
+                                .find(|(r1, c1, r2, c2)| {
+                                    rr >= *r1 && rr <= *r2 && cc >= *c1 && cc <= *c2
+                                })
+                                .copied()
+                            {
+                                if (rr, cc) != (mr1, mc1) {
+                                    continue;
+                                }
+                                rect.set_width(
+                                    (cols.pos(mc2 + 1) - cols.pos(mc1)).max(rect.width()),
+                                );
+                                rect.set_height(
+                                    (rows.pos(mr2 + 1) - rows.pos(mr1)).max(rect.height()),
+                                );
+                            }
                             self.paint_cell(
                                 &p2,
                                 rect,
@@ -13805,10 +13867,21 @@ impl SheetApp {
                     let x = gx(cc);
                     let w = cols.size(cc);
                     for rr in 0..fy {
-                        let rect = Rect::from_min_size(
+                        let mut rect = Rect::from_min_size(
                             egui::pos2(x, origin.y + hh + rows.pos(rr)),
                             Vec2::new(w, rows.size(rr)),
                         );
+                        if let Some((mr1, mc1, mr2, mc2)) = merges
+                            .iter()
+                            .find(|(r1, c1, r2, c2)| rr >= *r1 && rr <= *r2 && cc >= *c1 && cc <= *c2)
+                            .copied()
+                        {
+                            if (rr, cc) != (mr1, mc1) {
+                                continue;
+                            }
+                            rect.set_width((cols.pos(mc2 + 1) - cols.pos(mc1)).max(w));
+                            rect.set_height((rows.pos(mr2 + 1) - rows.pos(mr1)).max(rect.height()));
+                        }
                         self.paint_cell(
                             &p2,
                             rect,
@@ -13826,13 +13899,28 @@ impl SheetApp {
             let p3 = painter.with_clip_rect(clip_corner);
             for rr in 0..fy {
                 for cc in 0..fx {
-                    let rect = Rect::from_min_size(
+                    let mut rect = Rect::from_min_size(
                         egui::pos2(
                             origin.x + head_w + cols.pos(cc),
                             origin.y + hh + rows.pos(rr),
                         ),
                         Vec2::new(cols.size(cc), rows.size(rr)),
                     );
+                    if let Some((mr1, mc1, mr2, mc2)) = merges
+                        .iter()
+                        .find(|(r1, c1, r2, c2)| rr >= *r1 && rr <= *r2 && cc >= *c1 && cc <= *c2)
+                        .copied()
+                    {
+                        if (rr, cc) != (mr1, mc1) {
+                            continue;
+                        }
+                        rect.set_width(
+                            (cols.pos(mc2 + 1) - cols.pos(mc1)).max(rect.width()),
+                        );
+                        rect.set_height(
+                            (rows.pos(mr2 + 1) - rows.pos(mr1)).max(rect.height()),
+                        );
+                    }
                     self.paint_cell(
                         &p3,
                         rect,
@@ -14355,8 +14443,8 @@ impl SheetApp {
                 }
                 if !readonly && resp.dragged() {
                     if let Some(p) = resp.interact_pointer_pos() {
-                        let rr = rows.index_at(off_y + p.y - (origin.y + hh));
-                        let cc = cols.index_at(off_x + p.x - (origin.x + head_w));
+                        let rr = row_at(p.y);
+                        let cc = col_at(p.x);
                         let vertical = (p.y - hy).abs() > (p.x - hx).abs();
                         self.fill_drag = Some((if vertical { 0 } else { 1 }, rr, cc));
                         let preview = if vertical && rr > sr2 {
@@ -14603,7 +14691,7 @@ impl SheetApp {
                     self.sel_end = (r2, c);
                     self.status = format!("已选中 {} 列", cell_name(0, c).trim_end_matches('1'));
                 } else if in_head_x {
-                    let r = rows.index_at(off_y + pos.y - (origin.y + hh));
+                    let r = row_at(pos.y);
                     let edge = py_of(r) + rows.size(r);
                     if resp.double_clicked() && (pos.y - edge).abs() < 5.0 {
                         self.autofit_row(r);
@@ -14646,8 +14734,8 @@ impl SheetApp {
             // 点到别人正在编辑的格子，直接告诉他
             if let Some(pos) = resp.interact_pointer_pos() {
                 if pos.x > origin.x + head_w && pos.y > origin.y + hh {
-                    let cc = cols.index_at(off_x + pos.x - (origin.x + head_w));
-                    let rr = rows.index_at(off_y + pos.y - (origin.y + hh));
+                    let cc = col_at(pos.x);
+                    let rr = row_at(pos.y);
                     if let Some(holder) = self.lock_holder(rr, cc) {
                         self.status = format!(
                             "{} 正在编辑 {}，同一格只能一个人改",
@@ -14852,8 +14940,8 @@ impl SheetApp {
         // 悬停显示批注
         if let Some(pos) = resp.hover_pos() {
             if pos.x > origin.x + head_w && pos.y > origin.y + hh {
-                let hc = cols.index_at(off_x + pos.x - (origin.x + head_w));
-                let hr = rows.index_at(off_y + pos.y - (origin.y + hh));
+                let hc = col_at(pos.x);
+                let hr = row_at(pos.y);
                 if let Some(n) = notes.get(&sheetcore::model::CellRef::new(hr, hc)) {
                     egui::show_tooltip_at_pointer(
                         ctx,

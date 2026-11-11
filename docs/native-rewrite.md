@@ -2581,3 +2581,86 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 
 **没做的**：`按颜色排序`/`按颜色筛选` 两行没有画——颜色筛选需要给筛选器加「按单元格/字体颜色」的模型，
 先不放「能点但不生效」的假入口。
+
+### 第三十三轮：功能区改为 [MS-CUSTOMUI] 声明式（2026-11-11）
+
+**动机**：原来 11 个 `ribbon_*` 函数把「布局 + 文案 + 命令」写死在一千多行立即模式代码里，
+换一个按钮就要动 Rust，也看不出跟 Excel 的对应关系。现在功能区是一份 XML 文档 +
+一套通用渲染器，命令仍落在既有方法上。
+
+**结构**
+
+```
+crates/app/assets/ribbon/customUI.xml   ← 唯一的布局来源（9 个主页签 + 2 个上下文页签）
+crates/app/src/ribbon/mod.rs            ← MS-CUSTOMUI 子集模型 + 解析 + 菜单查找（quick-xml）
+crates/app/src/ribbon/ui.rs             ← 通用渲染：tab / group / box / button / toggleButton /
+                                          splitButton / menu / dropDown / comboBox / editBox /
+                                          labelControl / separator / dialogBoxLauncher
+crates/app/src/ribbon/actions.rs        ← 回调：ctl_state（状态）+ ribbon_action（命令）
+```
+
+**XML 写法**（与 Office 的回调一一对应）
+
+- 控件 `id` 唯一，用作状态查询键；`onAction` 是命令名，分发给 `ribbon_action`。
+- `ctl_state(id)` 返回 `visible/enabled/checked/label/text/swatch/tip`，等价于
+  `getVisible/getEnabled/getPressed/getLabel/getText/getImage`。
+  例：`Undo` 的 enabled 看撤销栈；`Bold` 的 checked 看当前样式；`ProtectSheet` 的
+  label 在「保护工作表 / 撤销保护」之间切换；`PaperSize`、`FitToWidth`、`ZoomLevel`
+  的当前值走 text；`FillColor/FontColor` 的色条走 swatch。
+- `imageMso` 映射到自绘图标（`ui_icons::Icon`）；没有图标的 `Bold/Italic/Underline`
+  按 idMso 语义画成文字开关。
+- 下拉项 id 直接带值：`fmt:#,##0.00`、`fitw:2`、`scale:75`、`zoom:1.5`，命令层按前缀解析。
+- 上下文页签放在 `<contextualTabs><tabSet idMso="TabSetTableTools|TabSetChartTools">`，
+  选中表格/图表时才出现；对象没了自动退回「开始」。
+
+**顺带修掉的三个问题**
+
+1. 上下文页签原来永远不显示：页签行里「共享」用了 `right_to_left` 布局吃满剩余宽度，
+   排在它后面的 `表设计/图表工具` 被挤到可视区外。现在先画上下文页签，再画右侧共享。
+2. 一组里超过 3 行（表设计工具 5 个、获取数据 5 个、显示 4 个）会顶到组名上：
+   拆成并排的两个 `<box boxStyle="vertical">`，每组最多 3 行 = 72px。
+3. 弹出菜单在「打开它的那一次点击」里就被外部点击判定关掉：`Popup` 记 `opened_at`，
+   80ms 内的点击不算外部点击。
+
+**与原来的差异（有意为之）**
+
+- 大/常规按钮宽度改为按文字实测（Excel 也是自动宽），不再写死 66/81/92/104 这些数，
+  组宽会有几像素变化。
+- 视图页签原来的缩放滑块换成 MS-CUSTOMUI 能表达的 `dropDown` + 放大/缩小按钮
+  （Excel 的缩放本来也不在 ribbon 上放滑块）。
+- 颜色按钮仍是「图标 + 色条」，点开原来的调色板窗口。
+
+**验收**
+
+- `ribbon::tests`：解析成功、9+2 个页签顺序与 Excel 一致、所有控件 id 非空且唯一、
+  无空组、XML 里的每条命令都能在 `ribbon_action` 找到实现。
+- 全部 `app` 测试：81 单测 + 12 项 UI 回归（含 `ribbon_groups_aligned_and_fit`）通过。
+- 无界面取证：`SC_SHOT` 逐页签截图（文件/开始/插入/页面布局/公式/数据/审阅/视图/帮助、
+  表设计、图表工具），`SC_RIBBON_MENU` / `SC_RIBBON_ITEMS` 截边框菜单与数字格式下拉，
+  `SC_RIBBON_ACTION` 验证命令（Bold 按下态、ShowGridlines 状态翻转、InsertTable 生成表
+  并出现上下文页签），`SC_KEYTIPS=1` 验证 Alt 字母提示来自 XML。截图逐张核对无重叠、
+  无压组名、无缺字。
+- `recent` 与 `error_opts` 两个改进程级 `LOCALAPPDATA` 的单测改成共用一把锁，
+  并行跑不再偶发互踩（之前 3 次里会挂 1 次）。
+### 第三十三轮：冻结窗格的点击错位、冻结区合并格被裁
+
+**症状**：打开带冻结窗格的文件，点 B3 会选中 B7（差 4 行）。
+
+**根因 1（点击）**：正文区的屏幕坐标映射漏掉了冻结带的高度。
+`gy()` 画格子时用 `body_y + pos(r)`（body_y 已经把冻结行让出来了），
+而点击反算却用 `index_at(y - (origin.y + hh))`——少减了 `frozen_h`，
+于是每点一格都往下多算 `frozen_h/行高` 行。这个文件冻结行 43+35=78px，正好约 4 行。
+列方向同理（漏了 `frozen_w`）。
+
+**修复**：`gy/gx` 减掉冻结带；`col_at/row_at` 改成 `index_at(frozen_w + off_x + (x - body_x))`，
+并把另外 4 处手写的「屏幕点→格子」统一改成调用 `col_at/row_at`。
+
+**根因 2（画面）**：冻结区的行/列/角块三个绘制分支没有处理合并单元格，
+合并标题被拆成一格一格画并裁在自己的格宽里（只看得见「年 1 月 销售」）。
+修复：三个分支都加上和主区一样的合并展开逻辑（只有左上角画、矩形按整块尺寸、文字居中）。
+
+**验收**：
+- 冻结 A3 的文件：`SC_HIT` 打点 (200,330)→B3 且矩形 322–341 包含该点；(200,410)→B6；(150,250)→B1（冻结区）。
+- 冻结 C1 的文件（行列都冻结、合并 A1:D1）：(40,320)→A3、(150,320)→B3、(250,320)→C3、(420,320)→D3 全部正确。
+- 标题文字像素范围 238–450，中心 344 = 合并区中心 ✓（修好前 32–128，被裁在第一列）。
+- 网格线坐标恢复连续：287/341/360/379/419/438/457，冻结带与正文之间不再有 78px 空白。

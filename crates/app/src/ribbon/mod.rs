@@ -623,6 +623,66 @@ mod tests {
         assert_eq!(r.context[1].tab.label, "图表工具");
     }
 
+    /// XML 里声明的命令必须都能在 ribbon_action 里找到对应的臂。
+    /// （comboBox/editBox 的 onChange 不走命令分发，跳过。）
+    #[test]
+    fn every_action_is_dispatched() {
+        fn walk(nodes: &[Node], out: &mut Vec<String>) {
+            for n in nodes {
+                match n {
+                    Node::Button(c) | Node::Toggle(c) => out.push(c.action().to_string()),
+                    Node::Split { ctl, menu } => {
+                        out.push(ctl.action().to_string());
+                        walk_menu(menu, out);
+                    }
+                    Node::Menu(m) => walk_menu(m, out),
+                    Node::DropDown { items, .. } => {
+                        out.extend(items.iter().map(|i| i.id.clone()))
+                    }
+                    Node::Box { children, .. } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        fn walk_menu(m: &Menu, out: &mut Vec<String>) {
+            for i in &m.items {
+                match i {
+                    MenuNode::Button(c) | MenuNode::Toggle(c) => out.push(c.action().to_string()),
+                    MenuNode::Menu(sub) => walk_menu(sub, out),
+                    MenuNode::Separator => {}
+                }
+            }
+        }
+        let r = load();
+        let mut acts = Vec::new();
+        for t in &r.tabs {
+            for g in &t.groups {
+                walk(&g.children, &mut acts);
+            }
+        }
+        for c in &r.context {
+            for g in &c.tab.groups {
+                walk(&g.children, &mut acts);
+            }
+        }
+        let src = include_str!("actions.rs");
+        let region = &src[src.find("pub fn ribbon_action").expect("没有 ribbon_action")..];
+        for a in acts {
+            let known = if let Some(tail) = a.strip_prefix("fmt:") {
+                region.contains("strip_prefix(\"fmt:\")") || tail.is_empty()
+            } else if a.starts_with("zoom:")
+                || a.starts_with("fitw:")
+                || a.starts_with("fith:")
+                || a.starts_with("scale:")
+            {
+                true
+            } else {
+                region.contains(&format!("\"{a}\""))
+            };
+            assert!(known, "XML 动作「{a}」在 ribbon_action 里没有实现");
+        }
+    }
+
     #[test]
     fn every_group_has_children_or_launcher() {
         let r = load();

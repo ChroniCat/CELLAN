@@ -5,7 +5,7 @@
 
 use eframe::egui;
 
-use super::{CtlState, Size};
+use super::CtlState;
 use crate::{cell_name, SheetApp};
 
 fn fmt_label(code: &str) -> &str {
@@ -212,17 +212,7 @@ impl SheetApp {
             _ => {}
         }
         if std::env::var("SC_RIBBON_STATE").map(|v| v == id).unwrap_or(false) {
-            let ranges: Vec<_> = self
-                .wb
-                .sheet(self.sheet_idx)
-                .tables
-                .iter()
-                .map(|t| (t.name.clone(), t.range))
-                .collect();
-            eprintln!(
-                "[ribbon] 状态 {id} → {st:?} sel={:?} 图={} 表={ranges:?}",
-                self.sel, self.sheet_idx
-            );
+            eprintln!("[ribbon] 状态 {id} → {st:?}");
         }
         st
     }
@@ -808,6 +798,20 @@ impl SheetApp {
             "Help" | "About" => self.about_open = true,
 
             // ---------------------------------------------------- 表设计
+            "TablePivot" => {
+                if let Some(t) = self.table_at_sel() {
+                    let (r1, c1, r2, c2) = t.range;
+                    self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
+                        source: (r1, c1, r2, c2),
+                        row_field: c1,
+                        col_field: None,
+                        group: sheetcore::pivot::GroupBy::None,
+                        exclude: Vec::new(),
+                        value_field: c2,
+                        agg: sheetcore::pivot::Agg::Sum,
+                    });
+                }
+            }
             "TableSelect" => {
                 if let Some(t) = self.table_at_sel() {
                     self.sel = (t.range.0, t.range.1);
@@ -845,6 +849,5 @@ impl SheetApp {
                 }
             }
         }
-        let _ = Size::Normal;
     }
 }

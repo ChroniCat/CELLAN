@@ -541,7 +541,7 @@
           <group id="GroupTableTools" label="工具">
             <box boxStyle="vertical">
               <button id="TableSelect" label="选择表格" imageMso="Table" screentip="选中整个表格区域" onAction="TableSelect"/>
-              <button id="TablePivot" label="数据透视表" imageMso="Pivot" screentip="按这个表格新建透视表" onAction="InsertPivot"/>
+              <button id="TablePivot" label="数据透视表" imageMso="Pivot" screentip="按这个表格新建透视表" onAction="TablePivot"/>
               <button id="TableToRange" label="转换为区域" imageMso="Table" screentip="保留单元格内容，去掉表格对象" onAction="TableToRange"/>
             </box>
             <box boxStyle="vertical">

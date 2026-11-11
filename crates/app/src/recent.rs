@@ -66,6 +66,7 @@ mod tests {
 
     #[test]
     fn touch_moves_to_front_and_dedupes() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::env::temp_dir().join(format!("sheetflow_recent_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
