@@ -22,6 +22,8 @@ pub struct SheetLayout {
     pub hidden_cols: Vec<u32>,
     /// 手动隐藏的行（0-based）
     pub hidden_rows: Vec<u32>,
+    /// 被忽略错误的单元格（0-based）
+    pub ignored_errors: Vec<(u32, u32)>,
     /// 分级显示级别（0-based 行列 → 1..=7）
     pub row_levels: Vec<(u32, u8)>,
     pub col_levels: Vec<(u32, u8)>,
@@ -138,6 +140,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
             || !lay.row_heights.is_empty()
+            || !lay.ignored_errors.is_empty()
             || !lay.row_levels.is_empty()
             || !lay.col_levels.is_empty()
             || !lay.hidden_rows.is_empty()
@@ -280,6 +283,27 @@ fn parse_layout(xml: &str) -> SheetLayout {
                         let px = crate::layout::pt_to_px(ht);
                         if (px - crate::layout::DEFAULT_ROW_H).abs() > 0.5 {
                             out.row_heights.push((idx - 1, px));
+                        }
+                    }
+                } else if name.ends_with("ignoredError") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("sqref") {
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            for tok in v.split_whitespace() {
+                                if let Some((r1, c1, r2, c2)) = parse_range(tok) {
+                                    // 大区域只取左上角，避免整列忽略把内存撑爆
+                                    out.ignored_errors.push((r1, c1));
+                                    if (r2 - r1) * (c2 - c1) < 4096 {
+                                        for r in r1..=r2 {
+                                            for c in c1..=c2 {
+                                                out.ignored_errors.push((r, c));
+                                            }
+                                        }
+                                    }
+                                } else if let Some((r, c)) = parse_cell(tok) {
+                                    out.ignored_errors.push((r, c));
+                                }
+                            }
                         }
                     }
                 } else if name.ends_with("autoFilter") {

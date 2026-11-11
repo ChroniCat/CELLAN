@@ -2042,6 +2042,87 @@ pub fn apply_outline(xml: &str, rows: &[(u32, u8)], cols: &[(u32, u8)]) -> Strin
     x
 }
 
+/// 写 <ignoredErrors>：被用户忽略错误的单元格（Excel 的「忽略错误」）。
+/// 空列表表示清空。元素必须排在 drawing / tableParts / extLst 之前。
+pub fn set_ignored_errors(xml: &str, cells: &[(u32, u32)]) -> String {
+    let mut x = String::with_capacity(xml.len() + 64);
+    // 先删旧的
+    let mut rest = xml;
+    while let Some(i) = rest.find("<ignoredErrors") {
+        x.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(gt) = tail.find('>') {
+            if tail[..gt].ends_with('/') {
+                rest = &tail[gt + 1..];
+            } else if let Some(end) = tail.find("</ignoredErrors>") {
+                rest = &tail[end + "</ignoredErrors>".len()..];
+            } else {
+                rest = &tail[gt + 1..];
+            }
+        } else {
+            rest = tail;
+            break;
+        }
+    }
+    x.push_str(rest);
+    if cells.is_empty() {
+        return x;
+    }
+    let mut list = cells.to_vec();
+    list.sort();
+    list.dedup();
+    let sqref = list
+        .iter()
+        .map(|(r, c)| crate::model::cell_name(*r, *c))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let block = format!(
+        "<ignoredErrors><ignoredError sqref=\"{sqref}\" evalError=\"1\" numberStoredAsText=\"1\"/></ignoredErrors>"
+    );
+    let mut at = x.len();
+    for tag in ["<smartTags", "<drawing", "<legacyDrawing", "<tableParts", "<extLst"] {
+        if let Some(i) = x.find(tag) {
+            if i < at {
+                at = i;
+            }
+        }
+    }
+    if at == x.len() {
+        if let Some(i) = x.rfind("</worksheet>") {
+            at = i;
+        }
+    }
+    x.insert_str(at, &block);
+    x
+}
+
+/// 保存收尾：把忽略错误列表写回各表
+pub fn apply_ignored_errors(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, Vec<(u32, u32)>> = std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if !s.ignored_errors_dirty {
+            continue;
+        }
+        if let Some(part) = targets.get(&s.name) {
+            let mut v: Vec<(u32, u32)> = s.ignored_errors.iter().copied().collect();
+            v.sort();
+            map.insert(part.clone(), v);
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(cells) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return set_ignored_errors(&xml, cells).into_bytes();
+            }
+        }
+        buf
+    })
+}
+
 /// 保存收尾：把列宽/行高/隐藏状态补进 sheet XML
 pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let targets = sheet_targets(path)?;

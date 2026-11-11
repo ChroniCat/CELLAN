@@ -148,6 +148,10 @@ pub struct Sheet {
     pub hidden_cols: std::collections::HashSet<u32>,
     /// 列宽/行高/隐藏状态被改过：保存时要重写 <cols> 和行属性
     pub layout_dirty: bool,
+    /// 被用户「忽略错误」的单元格（写进 <ignoredErrors>）
+    pub ignored_errors: std::collections::HashSet<(u32, u32)>,
+    /// 忽略列表被改过
+    pub ignored_errors_dirty: bool,
     /// 分级显示（组合）级别：行/列 → 1..=7；不在表里表示不在任何分级里
     pub row_levels: std::collections::HashMap<u32, u8>,
     pub col_levels: std::collections::HashMap<u32, u8>,
@@ -214,6 +218,8 @@ impl Sheet {
             hidden_rows_user: std::collections::HashSet::new(),
             hidden_cols: std::collections::HashSet::new(),
             layout_dirty: false,
+            ignored_errors: std::collections::HashSet::new(),
+            ignored_errors_dirty: false,
             row_levels: std::collections::HashMap::new(),
             col_levels: std::collections::HashMap::new(),
             filter_dirty: false,

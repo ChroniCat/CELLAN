@@ -36,7 +36,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.53";
+const APP_VERSION: &str = "1.54";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -392,7 +392,10 @@ struct SheetApp {
     goal_msg: String,
     /// 模拟运算表对话框
     dtable_dlg: bool,
-    dtable_input: String,
+    /// 行输入引用单元格（横向表的输入格，双变量时和列输入一起用）
+    dtable_row: String,
+    /// 列输入引用单元格（纵向表的输入格）
+    dtable_col: String,
     dtable_msg: String,
     /// 背景错误检查：错误格左上角的绿三角
     show_error_marks: bool,
@@ -705,7 +708,8 @@ impl SheetApp {
             goal_input: String::new(),
             goal_msg: String::new(),
             dtable_dlg: false,
-            dtable_input: String::new(),
+            dtable_row: String::new(),
+            dtable_col: String::new(),
             dtable_msg: String::new(),
             show_error_marks: true,
             error_marks: std::collections::HashSet::new(),
@@ -1220,7 +1224,41 @@ impl SheetApp {
                         }
                         Ok("about") => self.about_open = true,
                         Ok("symbol") => self.symbol_dlg = true,
-                        Ok("errors") => self.open_error_check(),
+                        Ok("errors") => {
+                            self.open_error_check();
+                            match std::env::var("SC_IGNORE").as_deref() {
+                                Ok("all") => {
+                                    let all: Vec<(u32, u32)> =
+                                        self.error_list.iter().map(|i| (i.row, i.col)).collect();
+                                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                                    for k in &all {
+                                        sh.ignored_errors.insert(*k);
+                                    }
+                                    sh.ignored_errors_dirty = true;
+                                    let n = all.len();
+                                    self.error_list.clear();
+                                    eprintln!("[ignore] all n={n}");
+                                }
+                                Ok("sel") => {
+                                    let (r, c) = self.sel;
+                                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                                    sh.ignored_errors.insert((r, c));
+                                    sh.ignored_errors_dirty = true;
+                                    self.error_list =
+                                        sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+                                    eprintln!("[ignore] sel={r},{c}");
+                                }
+                                Ok("reset") => {
+                                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                                    sh.ignored_errors.clear();
+                                    sh.ignored_errors_dirty = true;
+                                    self.error_list =
+                                        sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+                                    eprintln!("[ignore] reset left={}", self.error_list.len());
+                                }
+                                _ => {}
+                            }
+                        }
                         Ok("goal") => {
                             // SC_GOAL="目标格,可变格,目标值"，例如 SC_GOAL=A2,A1,150
                             if let Ok(spec) = std::env::var("SC_GOAL") {
@@ -1254,11 +1292,12 @@ impl SheetApp {
                                 }
                             }
                             if let Ok(spec) = std::env::var("SC_DTABLE") {
-                                if let Some(i) = SheetApp::parse_addr(&spec) {
-                                    match self.data_table_run(i) {
-                                        Ok(n) => eprintln!("[dtable] filled {n}"),
-                                        Err(e) => eprintln!("[dtable] fail {e}"),
-                                    }
+                                let mut it = spec.split(',');
+                                let col_in = it.next().and_then(|v| SheetApp::parse_addr(v));
+                                let row_in = it.next().and_then(|v| SheetApp::parse_addr(v));
+                                match self.data_table_run(row_in, col_in) {
+                                    Ok((label, n)) => eprintln!("[dtable] {label} filled {n}"),
+                                    Err(e) => eprintln!("[dtable] fail {e}"),
                                 }
                             }
                         }
@@ -5473,6 +5512,9 @@ impl SheetApp {
         }
         let mut open = true;
         let mut jump: Option<(u32, u32)> = None;
+        let mut ignore_sel = false;
+        let mut ignore_all = false;
+        let mut reset_ignored = false;
         ui_kit::window(ctx, "错误检查", 600.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -5526,6 +5568,15 @@ impl SheetApp {
                 });
                 ui.add_space(6.0);
                 ui_kit::footer(ui, |ui| {
+                    if ui.button("忽略此单元格").clicked() {
+                        ignore_sel = true;
+                    }
+                    if ui.button("忽略全部").clicked() {
+                        ignore_all = true;
+                    }
+                    if ui.button("重置忽略").clicked() {
+                        reset_ignored = true;
+                    }
                     if ui.button("重新检查").clicked() {
                         self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
                     }
@@ -5538,6 +5589,42 @@ impl SheetApp {
             self.sel = (r, c);
             self.sel_end = (r, c);
             self.ensure_visible();
+        }
+        if ignore_sel {
+            let (r, c) = self.sel;
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.ignored_errors.insert((r, c));
+            sh.ignored_errors_dirty = true;
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+            self.status = format!("已忽略 {} 的错误", sheetcore::model::cell_name(r, c));
+        }
+        if ignore_all {
+            let all: Vec<(u32, u32)> = self.error_list.iter().map(|i| (i.row, i.col)).collect();
+            {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for k in &all {
+                    sh.ignored_errors.insert(*k);
+                }
+                sh.ignored_errors_dirty = true;
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            let n = all.len();
+            self.error_list.clear();
+            self.status = format!("已忽略 {n} 处错误");
+        }
+        if reset_ignored {
+            {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.ignored_errors.clear();
+                sh.ignored_errors_dirty = true;
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+            self.status = "已重置忽略的错误".into();
         }
         if !open {
             self.error_dlg = false;
@@ -5612,53 +5699,115 @@ impl SheetApp {
 
     /// 模拟运算表（列式单变量）：选区第一列是输入值，第二列顶行是公式，
     /// 按每个输入值代入后把结果填到第二列。
-    fn data_table_run(&mut self, input: (u32, u32)) -> Result<usize, String> {
+    /// 模拟运算表：列式单变量 / 行式单变量 / 双变量三种版式，按选区形状自动判断。
+    /// - 双变量：公式在选区左上角，第一行是行输入值，第一列是列输入值
+    /// - 列式单变量：公式在选区右上格的上方，第一列是输入值、第二列出结果
+    /// - 行式单变量：公式在选区左下格的左边，第一行是输入值、第二行出结果
+    fn data_table_run(
+        &mut self,
+        row_in: Option<(u32, u32)>,
+        col_in: Option<(u32, u32)>,
+    ) -> Result<(String, usize), String> {
         let (r1, c1, r2, c2) = self.sel_rect();
-        if c2 < c1 + 1 {
-            return Err("选区要至少两列：第一列放输入值，第二列放结果".into());
-        }
-        if r1 == 0 {
-            return Err("公式要写在结果列的上一行，选区不能从第 1 行开始".into());
-        }
-        // Excel 的列式单变量表：公式在结果列的上方一格，选区内是「输入值 + 空结果格」
-        let fr = r1 - 1;
-        let Some(formula) = self
-            .wb
-            .sheet(self.sheet_idx)
-            .get(fr, c2)
-            .and_then(|x| x.formula.clone())
-        else {
-            return Err(format!(
-                "{} 必须是公式（结果列上方那一格）",
-                sheetcore::model::cell_name(fr, c2)
-            ));
+        let has_formula = |app: &Self, r: i64, c: i64| -> bool {
+            if r < 0 || c < 0 {
+                return false;
+            }
+            app.wb
+                .sheet(app.sheet_idx)
+                .get(r as u32, c as u32)
+                .and_then(|x| x.formula.clone())
+                .is_some()
         };
-        let _ = &formula;
-        let Some(orig) = self.cell_num(input.0, input.1) else {
-            return Err("输入引用单元格里必须是数字".into());
+        // 判定版式
+        let mode = if has_formula(self, r1 as i64, c1 as i64) && c2 > c1 && r2 > r1 {
+            "two"
+        } else if has_formula(self, r1 as i64 - 1, c2 as i64) {
+            "col"
+        } else if has_formula(self, r1 as i64 + 1, c1 as i64) {
+            "row"
+        } else {
+            return Err(
+                "认不出版式：双变量要求公式在选区左上角；                  单变量（列）要求公式在结果列上方；                 单变量（行）要求公式在结果行左侧"
+                    .into(),
+            );
         };
+        let need_row = mode == "row" || mode == "two";
+        let need_col = mode == "col" || mode == "two";
+        if need_row && row_in.is_none() {
+            return Err("这个版式需要「行输入引用单元格」".into());
+        }
+        if need_col && col_in.is_none() {
+            return Err("这个版式需要「列输入引用单元格」".into());
+        }
+        let (fcell, results_src): ((u32, u32), Vec<(u32, u32, Option<f64>, Option<f64>)>) = match mode {
+            "two" => {
+                let mut cells = Vec::new();
+                for r in (r1 + 1)..=r2 {
+                    for c in (c1 + 1)..=c2 {
+                        let rv = self.cell_num(r, c1);
+                        let cv = self.cell_num(r1, c);
+                        cells.push((r, c, rv, cv));
+                    }
+                }
+                ((r1, c1), cells)
+            }
+            "col" => {
+                let mut cells = Vec::new();
+                for r in r1..=r2 {
+                    let cv = self.cell_num(r, c1);
+                    cells.push((r, c2, None, cv));
+                }
+                ((r1 - 1, c2), cells)
+            }
+            _ => {
+                let mut cells = Vec::new();
+                for c in (c1 + 1)..=c2 {
+                    let rv = self.cell_num(r1, c);
+                    cells.push((r1 + 1, c, rv, None));
+                }
+                ((r1 + 1, c1), cells)
+            }
+        };
+        if results_src.iter().all(|(_, _, rv, cv)| rv.is_none() && cv.is_none()) {
+            return Err("选区里没有可用的输入值".into());
+        }
         let deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        let orig_row = row_in.and_then(|(r, c)| self.cell_num(r, c));
+        let orig_col = col_in.and_then(|(r, c)| self.cell_num(r, c));
         let mut done = 0usize;
-        for r in r1..=r2 {
-            let Some(v) = self.cell_num(r, c1) else {
-                continue;
-            };
-            self.poke_cell(&deps, input.0, input.1, v);
+        for (r, c, rv, cv) in results_src {
+            if let (Some((ri, ci)), Some(v)) = (row_in, rv) {
+                self.poke_cell(&deps, ri, ci, v);
+            }
+            if let (Some((ci2, cj2)), Some(v)) = (col_in, cv) {
+                self.poke_cell(&deps, ci2, cj2, v);
+            }
             let out = self
                 .wb
                 .sheet(self.sheet_idx)
-                .get(fr, c2)
+                .get(fcell.0, fcell.1)
                 .map(|x| x.value.clone())
                 .unwrap_or_default();
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(r, c2).cloned().unwrap_or_default();
+            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
             cell.value = out;
             cell.formula = None;
-            sh.set(r, c2, cell);
+            sh.set(r, c, cell);
             done += 1;
         }
-        self.poke_cell(&deps, input.0, input.1, orig);
-        Ok(done)
+        if let (Some((ri, ci)), Some(v)) = (row_in, orig_row) {
+            self.poke_cell(&deps, ri, ci, v);
+        }
+        if let (Some((ci2, cj2)), Some(v)) = (col_in, orig_col) {
+            self.poke_cell(&deps, ci2, cj2, v);
+        }
+        let label = match mode {
+            "two" => "双变量",
+            "col" => "单变量（列）",
+            _ => "单变量（行）",
+        };
+        Ok((label.to_string(), done))
     }
 
     fn dtable_window(&mut self, ctx: &egui::Context) {
@@ -5667,17 +5816,26 @@ impl SheetApp {
         }
         let mut open = true;
         let mut run = false;
-        ui_kit::window(ctx, "模拟运算表", 460.0)
+        ui_kit::window(ctx, "模拟运算表", 480.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("选区：第一列是要代入的值，第二列顶行是公式")
-                        .size(11.5)
-                        .color(ui_kit::TEXT_WEAK),
+                    egui::RichText::new(
+                        "双变量：公式在选区左上角，首行是行输入值、首列是列输入值。
+                         单变量（列）：公式在结果列上方，第一列是输入值。
+                         单变量（行）：公式在结果行左侧，第一行是输入值。",
+                    )
+                    .size(11.5)
+                    .color(ui_kit::TEXT_WEAK),
                 );
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized([110.0, 20.0], egui::Label::new("输入引用单元格:"));
-                    ui.add(egui::TextEdit::singleline(&mut self.dtable_input).desired_width(140.0));
+                    ui.add_sized([110.0, 20.0], egui::Label::new("行输入单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.dtable_row).desired_width(120.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("列输入单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.dtable_col).desired_width(120.0));
                 });
                 if !self.dtable_msg.is_empty() {
                     ui.add_space(4.0);
@@ -5693,17 +5851,24 @@ impl SheetApp {
                 });
             });
         if run {
-            match Self::parse_addr(&self.dtable_input) {
-                Some(i) => match self.data_table_run(i) {
-                    Ok(n) => {
-                        self.dtable_msg = format!("已填 {n} 行");
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.status = format!("模拟运算表：已填 {n} 行");
-                    }
-                    Err(e) => self.dtable_msg = e,
-                },
-                None => self.dtable_msg = "输入引用单元格地址写错了".into(),
+            let rin = if self.dtable_row.trim().is_empty() {
+                None
+            } else {
+                Self::parse_addr(&self.dtable_row)
+            };
+            let cin = if self.dtable_col.trim().is_empty() {
+                None
+            } else {
+                Self::parse_addr(&self.dtable_col)
+            };
+            match self.data_table_run(rin, cin) {
+                Ok((label, n)) => {
+                    self.dtable_msg = format!("{label}：已填 {n} 个结果");
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.status = format!("模拟运算表（{label}）：已填 {n} 个结果");
+                }
+                Err(e) => self.dtable_msg = e,
             }
         }
         if !open {
@@ -7940,7 +8105,8 @@ impl SheetApp {
                 if ui_kit::labeled_w(ui, Icon::Grid, "模拟运算表", 110.0, "列式单变量敏感性表")
                     .clicked()
                 {
-                    self.dtable_input.clear();
+                    self.dtable_row.clear();
+                    self.dtable_col.clear();
                     self.dtable_msg.clear();
                     self.dtable_dlg = true;
                 }

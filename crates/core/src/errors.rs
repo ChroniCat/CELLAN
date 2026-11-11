@@ -103,6 +103,9 @@ pub fn looks_numeric(s: &str) -> bool {
 pub fn scan(sheet: &Sheet) -> Vec<Issue> {
     let mut out = Vec::new();
     for (cref, cell) in sheet.iter() {
+        if sheet.ignored_errors.contains(&(cref.row, cref.col)) {
+            continue;
+        }
         let Value::Text(t) = &cell.value else {
             continue;
         };
@@ -132,6 +135,10 @@ pub fn scan_wb(wb: &crate::model::Workbook, si: usize) -> Vec<Issue> {
     let sheet = wb.sheet(si);
     let mut out = Vec::new();
     for (cref, cell) in sheet.iter() {
+        // 用户点过「忽略错误」的格子不再报
+        if sheet.ignored_errors.contains(&(cref.row, cref.col)) {
+            continue;
+        }
         match &cell.value {
             Value::Text(t) => {
                 if let Some(kind) = error_kind(t) {
@@ -206,6 +213,15 @@ mod tests {
             .filter(|i| i.kind == IssueKind::NumberAsText)
             .count();
         assert_eq!(got, 3);
+    }
+
+    #[test]
+    fn ignored_cells_are_skipped() {
+        let mut s = sheet_with(&[(0, 0, "#DIV/0!"), (1, 0, "#N/A")]);
+        s.ignored_errors.insert((0, 0));
+        let got = scan(&s);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].row, 1);
     }
 
     #[test]
