@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.60";
+const APP_VERSION: &str = "1.61";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -490,6 +490,8 @@ struct SheetApp {
     zh_preview: Vec<(usize, u32, u32, String, String)>,
     /// 预览范围：整簿 or 当前选区
     zh_preview_all_sheets: bool,
+    /// 整簿预览时只看某一张表（None=全部）
+    zh_preview_sheet: Option<usize>,
     zh_preview_variant: sheetcore::zhconv::Variant,
     /// 分级显示设置对话框
     outline_set_dlg: bool,
@@ -826,6 +828,7 @@ impl SheetApp {
             zh_preview_dlg: false,
             zh_preview: Vec::new(),
             zh_preview_all_sheets: false,
+            zh_preview_sheet: None,
             zh_preview_variant: sheetcore::zhconv::Variant::Generic,
             outline_set_dlg: false,
             proof_dlg: false,
@@ -1451,6 +1454,8 @@ impl SheetApp {
                             }
                             self.zh_preview_all_sheets =
                                 std::env::var("SC_ZH_ALL").map(|v| v == "1").unwrap_or(false);
+                            self.zh_preview_sheet =
+                                std::env::var("SC_ZH_SHEET").ok().and_then(|v| v.parse().ok());
                             self.zh_preview_variant = match std::env::var("SC_ZH_VARIANT")
                                 .unwrap_or_default()
                                 .as_str()
@@ -1504,7 +1509,38 @@ impl SheetApp {
                             }
                         }
                         Ok("proof") => {
+                            if std::env::var("SC_PROOF_SEL").map(|v| v == "1").unwrap_or(false) {
+                                let p = |v: &str| -> Option<(u32, u32)> {
+                                    let (x, y) = v.split_once(',')?;
+                                    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                                };
+                                if let (Ok(a), Ok(b)) = (
+                                    std::env::var("SC_SEL"),
+                                    std::env::var("SC_SEL2"),
+                                ) {
+                                    if let (Some(s0), Some(s1)) = (p(&a), p(&b)) {
+                                        self.sel = s0;
+                                        self.sel_end = s1;
+                                    }
+                                }
+                                self.proof_only_sel = true;
+                            }
                             self.open_proof();
+                            if let Ok(spec) = std::env::var("SC_PROOF_DBL") {
+                                if let Some((a0, b0)) = spec.split_once(',') {
+                                    if let (Ok(r), Ok(c)) =
+                                        (a0.trim().parse::<u32>(), b0.trim().parse::<u32>())
+                                    {
+                                        self.proof_fix_cells(vec![(r, c)]);
+                                        eprintln!(
+                                            "[proof] 双击修 {} -> issues={} status={}",
+                                            cell_name(r, c),
+                                            self.proof_list.len(),
+                                            self.status
+                                        );
+                                    }
+                                }
+                            }
                             match std::env::var("SC_PROOF_FIX").as_deref() {
                                 Ok("all") => {
                                     self.proof_apply_fix(false);
@@ -5370,7 +5406,13 @@ impl SheetApp {
             }
         };
         if self.zh_preview_all_sheets {
+            let only = self.zh_preview_sheet;
             for si in 0..self.wb.sheets.len() {
+                if let Some(only) = only {
+                    if si != only {
+                        continue;
+                    }
+                }
                 let bounds = self.wb.sheet(si).used_bounds();
                 if let Some((r1, c1, r2, c2)) = bounds {
                     if (r2 - r1) as u64 * (c2 - c1) as u64 <= 400_000 {
@@ -5444,7 +5486,40 @@ impl SheetApp {
                         .checkbox(&mut self.zh_preview_all_sheets, "所有工作表")
                         .changed()
                     {
+                        self.zh_preview_sheet = None;
                         variant_changed = true;
+                    }
+                    if self.zh_preview_all_sheets {
+                        let mut label = match self.zh_preview_sheet {
+                            Some(i) => self.wb.sheet(i).name.clone(),
+                            None => "全部表".to_string(),
+                        };
+                        egui::ComboBox::from_id_salt("zh_prev_sheet")
+                            .selected_text(label.clone())
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_value(&mut self.zh_preview_sheet, None, "全部表")
+                                    .clicked()
+                                {
+                                    variant_changed = true;
+                                    label = "全部表".into();
+                                }
+                                for i in 0..self.wb.sheets.len() {
+                                    let name = self.wb.sheet(i).name.clone();
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.zh_preview_sheet,
+                                            Some(i),
+                                            &name,
+                                        )
+                                        .clicked()
+                                    {
+                                        variant_changed = true;
+                                        label = name.clone();
+                                    }
+                                }
+                            });
                     }
                     ui.separator();
                     ui.label("目标:");
@@ -5543,6 +5618,36 @@ impl SheetApp {
         if !open {
             self.zh_preview_dlg = false;
         }
+    }
+
+    /// 只修指定的几格（双击列表行时用）
+    fn proof_fix_cells(&mut self, cells: Vec<(u32, u32)>) {
+        if self.edit_blocked() || cells.is_empty() {
+            return;
+        }
+        let txn = self.txn_begin(&cells);
+        let mut n = 0usize;
+        for (r, c) in &cells {
+            let sh = self.wb.sheet(self.sheet_idx);
+            let Some(cell) = sh.get(*r, *c) else { continue };
+            let sheetcore::model::Value::Text(t) = &cell.value else {
+                continue;
+            };
+            let fixed = sheetcore::proof::fix_text(t, &self.proof_rules);
+            if fixed.as_str() == t.as_ref() {
+                continue;
+            }
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            cell.value = sheetcore::model::Value::Text(fixed.into());
+            sh.set(*r, *c, cell);
+            n += 1;
+        }
+        self.txn_end("校对修正", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.proof_rescan();
+        self.status = format!("校对修正：{n} 个单元格");
     }
 
     /// 按当前规则修正：only_sel=true 只修当前选中的那一格
@@ -5732,6 +5837,7 @@ impl SheetApp {
         let mut changed = false;
         let mut fix_all = false;
         let mut fix_one = false;
+        let mut fix_cells: Vec<(u32, u32)> = Vec::new();
         ui_kit::window(ctx, "拼写检查", 600.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -5772,7 +5878,7 @@ impl SheetApp {
                         ui.label(egui::RichText::new("没有发现排版问题。").size(12.0));
                     }
                     for it in self.proof_list.clone() {
-                        ui.horizontal(|ui| {
+                        let row_resp = ui.horizontal(|ui| {
                             if ui
                                 .add_sized(
                                     [64.0, 20.0],
@@ -5783,6 +5889,7 @@ impl SheetApp {
                                     )
                                     .frame(false),
                                 )
+                                .on_hover_text("双击就地修好这一格")
                                 .clicked()
                             {
                                 jump = Some((it.row, it.col));
@@ -5798,6 +5905,35 @@ impl SheetApp {
                                     .color(ui_kit::TEXT_WEAK),
                             );
                         });
+                        let resp = row_resp
+                            .response
+                            .interact(egui::Sense::click())
+                            .on_hover_text("双击：跳过去并修好这一格");
+                        if std::env::var("SC_PROOF_RECT").is_ok() {
+                            let r = resp.rect;
+                            eprintln!(
+                                "[rect] {} center=({:.0},{:.0}) ppp={:.2} screen={:?}",
+                                cell_name(it.row, it.col),
+                                r.center().x,
+                                r.center().y,
+                                ui.ctx().pixels_per_point(),
+                                ui.ctx().input(|i| i.pointer.latest_pos())
+                            );
+                        }
+                        if std::env::var("SC_PROOF_RECT").is_ok()
+                            && (resp.clicked() || resp.double_clicked())
+                        {
+                            eprintln!(
+                                "[row] {} click={} dbl={}",
+                                cell_name(it.row, it.col),
+                                resp.clicked(),
+                                resp.double_clicked()
+                            );
+                        }
+                        if resp.double_clicked() {
+                            jump = Some((it.row, it.col));
+                            fix_cells.push((it.row, it.col));
+                        }
                     }
                 });
                 ui.add_space(4.0);
@@ -5829,7 +5965,10 @@ impl SheetApp {
                     }
                 });
             });
-        if fix_all {
+        if !fix_cells.is_empty() {
+            let cells = std::mem::take(&mut fix_cells);
+            self.proof_fix_cells(cells);
+        } else if fix_all {
             self.proof_apply_fix(false);
         } else if fix_one {
             self.proof_apply_fix(true);
