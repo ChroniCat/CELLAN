@@ -296,7 +296,14 @@ impl Sheet {
         if !self.loading {
             self.edited = true;
         }
-        self.cells.remove(r, c)
+        let key = CellRef::new(r, c);
+        let out = self.cells.remove(r, c);
+        // 删掉的格子要登记，否则保存时会把基准文件里的旧值又写回去
+        // （拖动移动、剪切这类「先删后写」的操作全靠这个）
+        if out.is_some() {
+            self.cleared.insert(key);
+        }
+        out
     }
 
     pub fn len(&self) -> usize {

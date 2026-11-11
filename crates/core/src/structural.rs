@@ -247,6 +247,177 @@ impl Sheet {
         self.styles_dirty |= !self.style_edits.is_empty();
     }
 
+    /// 把 [from, from+n) 这段整行移动到 `to`（`to` 是「删掉源行之后」的插入位置，
+    /// 也就是拖放时画出的那条插入线的位置）。
+    pub fn move_rows(&mut self, from: u32, n: u32, to: u32) {
+        if n == 0 || to == from {
+            return;
+        }
+        let (_, _, _, c2) = self.used_bounds().unwrap_or((0, 0, 0, 0));
+        let r2 = from + n - 1;
+        let mut cells: Vec<(u32, u32, Cell)> = Vec::new();
+        let mut styles: Vec<(u32, u32, u16)> = Vec::new();
+        for r in from..=r2 {
+            for c in 0..=c2 {
+                if let Some(cell) = self.get(r, c) {
+                    cells.push((r - from, c, cell.clone()));
+                }
+                if let Some(st) = self.styles.get(&CellRef::new(r, c)).copied() {
+                    styles.push((r - from, c, st));
+                }
+            }
+        }
+        let notes: Vec<_> = self
+            .notes
+            .iter()
+            .filter(|(k, _)| k.row >= from && k.row <= r2)
+            .map(|(k, v)| (k.row - from, k.col, v.clone()))
+            .collect();
+        let rich: Vec<_> = self
+            .rich
+            .iter()
+            .filter(|((r, _), _)| *r >= from && *r <= r2)
+            .map(|((r, c), v)| (r - from, *c, v.clone()))
+            .collect();
+        let links: Vec<_> = self
+            .hyperlinks
+            .iter()
+            .filter(|((r, _), _)| *r >= from && *r <= r2)
+            .map(|((r, c), v)| (r - from, *c, v.clone()))
+            .collect();
+        let heights: Vec<f32> = (from..=r2).map(|r| self.rows.size(r)).collect();
+        let hidden: Vec<bool> = (from..=r2)
+            .map(|r| self.hidden_rows_user.contains(&r) || self.hidden_rows.contains(&r))
+            .collect();
+        let levels: Vec<u8> = (from..=r2)
+            .map(|r| self.row_levels.get(&r).copied().unwrap_or(0))
+            .collect();
+
+        self.delete_rows(from, n);
+        let at = if to > from { to - n } else { to };
+        self.insert_rows(at, n);
+
+        for (dr, c, cell) in cells {
+            self.set(at + dr, c, cell);
+        }
+        for (dr, c, st) in styles {
+            self.set_style(at + dr, c, st);
+        }
+        for (dr, c, v) in notes {
+            self.notes.insert(CellRef::new(at + dr, c), v);
+        }
+        for (dr, c, v) in rich {
+            self.rich.insert((at + dr, c), v);
+            self.rich_dirty = true;
+        }
+        for (dr, c, v) in links {
+            self.hyperlinks.insert((at + dr, c), v);
+            self.hyperlinks_dirty = true;
+        }
+        for (i, h) in heights.into_iter().enumerate() {
+            let i = i as u32;
+            self.rows.set(at + i, h);
+        }
+        for (i, hid) in hidden.into_iter().enumerate() {
+            let i = i as u32;
+            if hid {
+                self.hidden_rows_user.insert(at + i);
+            }
+        }
+        for (i, lv) in levels.into_iter().enumerate() {
+            let i = i as u32;
+            if lv > 0 {
+                self.row_levels.insert(at + i, lv);
+            }
+        }
+        self.layout_dirty = true;
+        self.edited = true;
+    }
+
+    /// 列版本的移动，语义同 `move_rows`
+    pub fn move_cols(&mut self, from: u32, n: u32, to: u32) {
+        if n == 0 || to == from {
+            return;
+        }
+        let (_, _, r2, _) = self.used_bounds().unwrap_or((0, 0, 0, 0));
+        let c2 = from + n - 1;
+        let mut cells: Vec<(u32, u32, Cell)> = Vec::new();
+        let mut styles: Vec<(u32, u32, u16)> = Vec::new();
+        for c in from..=c2 {
+            for r in 0..=r2 {
+                if let Some(cell) = self.get(r, c) {
+                    cells.push((r, c - from, cell.clone()));
+                }
+                if let Some(st) = self.styles.get(&CellRef::new(r, c)).copied() {
+                    styles.push((r, c - from, st));
+                }
+            }
+        }
+        let notes: Vec<_> = self
+            .notes
+            .iter()
+            .filter(|(k, _)| k.col >= from && k.col <= c2)
+            .map(|(k, v)| (k.row, k.col - from, v.clone()))
+            .collect();
+        let rich: Vec<_> = self
+            .rich
+            .iter()
+            .filter(|((_, c), _)| *c >= from && *c <= c2)
+            .map(|((r, c), v)| (*r, c - from, v.clone()))
+            .collect();
+        let links: Vec<_> = self
+            .hyperlinks
+            .iter()
+            .filter(|((_, c), _)| *c >= from && *c <= c2)
+            .map(|((r, c), v)| (*r, c - from, v.clone()))
+            .collect();
+        let widths: Vec<f32> = (from..=c2).map(|c| self.cols.size(c)).collect();
+        let hidden: Vec<bool> = (from..=c2).map(|c| self.hidden_cols.contains(&c)).collect();
+        let levels: Vec<u8> = (from..=c2)
+            .map(|c| self.col_levels.get(&c).copied().unwrap_or(0))
+            .collect();
+
+        self.delete_cols(from, n);
+        let at = if to > from { to - n } else { to };
+        self.insert_cols(at, n);
+
+        for (r, dc, cell) in cells {
+            self.set(r, at + dc, cell);
+        }
+        for (r, dc, st) in styles {
+            self.set_style(r, at + dc, st);
+        }
+        for (r, dc, v) in notes {
+            self.notes.insert(CellRef::new(r, at + dc), v);
+        }
+        for (r, dc, v) in rich {
+            self.rich.insert((r, at + dc), v);
+            self.rich_dirty = true;
+        }
+        for (r, dc, v) in links {
+            self.hyperlinks.insert((r, at + dc), v);
+            self.hyperlinks_dirty = true;
+        }
+        for (i, w) in widths.into_iter().enumerate() {
+            let i = i as u32;
+            self.cols.set(at + i, w);
+        }
+        for (i, hid) in hidden.into_iter().enumerate() {
+            let i = i as u32;
+            if hid {
+                self.hidden_cols.insert(at + i);
+            }
+        }
+        for (i, lv) in levels.into_iter().enumerate() {
+            let i = i as u32;
+            if lv > 0 {
+                self.col_levels.insert(at + i, lv);
+            }
+        }
+        self.layout_dirty = true;
+        self.edited = true;
+    }
+
     pub fn insert_rows(&mut self, at: u32, n: u32) {
         if n == 0 {
             return;

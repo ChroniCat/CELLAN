@@ -45,7 +45,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.65";
+const APP_VERSION: &str = "1.66";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -584,6 +584,8 @@ struct SheetApp {
     extra_sel: Vec<(u32, u32, u32, u32)>,
     /// 拖动选区移动：起点格 + 指针起点
     cell_move: Option<((u32, u32), egui::Pos2, bool)>,
+    /// 拖动行号/列标移动整行整列：(是否行, 起始索引, 行/列数)
+    header_move: Option<(bool, u32, u32)>,
     /// 工作簿视图：0 普通 1 页面布局 2 分页预览
     view_mode: u8,
     /// 启动时自动选中第一个图表（SC_CHART，用于截图/自检）
@@ -899,6 +901,7 @@ impl SheetApp {
             paint_scale: 1.0,
             extra_sel: Vec::new(),
             cell_move: None,
+            header_move: None,
             view_mode: std::env::var("SC_VIEW_MODE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1872,11 +1875,11 @@ impl SheetApp {
                             self.sel = (v[0].max(0) as u32, v[1].max(0) as u32);
                             self.sel_end = (v[2].max(0) as u32, v[3].max(0) as u32);
                             let (dr, dc) = (v[4], v[5]);
-                            let copy = spec.split(',').nth(6).map(|s| s.trim() == "1").unwrap_or(false);
-                            if copy {
-                                self.copy_selection_by(dr, dc);
-                            } else {
-                                self.move_selection_by(dr, dc);
+                            let mode = spec.split(',').nth(6).map(|s| s.trim().to_string()).unwrap_or_default();
+                            match mode.as_str() {
+                                "1" => self.copy_selection_by(dr, dc),
+                                "2" => self.shift_insert_by(dr, dc),
+                                _ => self.move_selection_by(dr, dc),
                             }
                             eprintln!("[drag] {} -> {}", spec, self.status);
                             let sh = self.wb.sheet(self.sheet_idx);
@@ -5555,6 +5558,106 @@ impl SheetApp {
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
         self.status = format!("已移动到 {}", sheetcore::model::cell_name(nr1, nc1));
+    }
+
+    /// Shift+拖动：把选区「插」到目标位置（整行下移 / 整列右移），Excel 的 shift 拖放
+    fn shift_insert_by(&mut self, dr: i64, dc: i64) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let nr1 = (r1 as i64 + dr).max(0) as u32;
+        let nc1 = (c1 as i64 + dc).max(0) as u32;
+        if (nr1, nc1) == (r1, c1) {
+            return;
+        }
+        // 目标落在源块里就没意义
+        if nr1 >= r1 && nr1 <= r2 && nc1 >= c1 && nc1 <= c2 {
+            return;
+        }
+        let vertical = dr.abs() >= dc.abs();
+        // 1) 快照
+        let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).cloned() {
+                    let st = self
+                        .wb
+                        .sheet(self.sheet_idx)
+                        .styles
+                        .get(&sheetcore::model::CellRef::new(r, c))
+                        .copied();
+                    cells.push((r - r1, c - c1, cell, st));
+                }
+            }
+        }
+        // 2) 清源
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    sh.remove(r, c);
+                    sh.styles.remove(&sheetcore::model::CellRef::new(r, c));
+                }
+            }
+        }
+        // 3) 在目标处插入空行/空列（走结构操作，合并/格式/验证会跟着挪）
+        let idx = self.sheet_idx;
+        let op = if vertical {
+            sheetcore::structural::Structural::InsertRows {
+                at: nr1,
+                n: r2 - r1 + 1,
+            }
+        } else {
+            sheetcore::structural::Structural::InsertCols {
+                at: nc1,
+                n: c2 - c1 + 1,
+            }
+        };
+        let snap = if self.wb.sheet(idx).len() <= 200_000 {
+            Some(sheetcore::undo::snapshot_structure(&self.wb, idx, &op))
+        } else {
+            None
+        };
+        sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
+        // 4) 写回目标
+        {
+            let sh = self.wb.sheet_mut(idx);
+            for (dr0, dc0, mut cell, st) in cells {
+                if let Some(f) = cell.formula.clone() {
+                    if dr >= 0 && dc >= 0 {
+                        cell.formula =
+                            Some(sheetcore::cf::shift_formula(&f, dr as u32, dc as u32).into());
+                    }
+                }
+                let (r, c) = if vertical {
+                    (nr1 + dr0, c1 + dc0)
+                } else {
+                    (r1 + dr0, nc1 + dc0)
+                };
+                sh.set(r, c, cell);
+                if let Some(id) = st {
+                    sh.set_style(r, c, id);
+                }
+            }
+        }
+        if let Some(before) = snap {
+            let after = before.capture_after(&self.wb);
+            let label = if vertical { "插入行并移动" } else { "插入列并移动" };
+            self.undo
+                .push_structure(label.to_string(), before, after, (idx, self.sel.0, self.sel.1));
+        }
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.wb.dirty = true;
+        self.sel = (nr1, nc1);
+        self.sel_end = (nr1 + (r2 - r1), nc1 + (c2 - c1));
+        self.status = format!(
+            "已插入到 {}（{}）",
+            sheetcore::model::cell_name(nr1, nc1),
+            if vertical { "整行下移" } else { "整列右移" }
+        );
     }
 
     /// Ctrl+拖动选区边框：复制到新位置（源保留）
@@ -14660,6 +14763,98 @@ impl SheetApp {
             }
         }
 
+        // 拖动行号/列标：画插入线，松开就移动整行整列
+        if let Some((is_rows, from, n)) = self.header_move {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                let mut drop = if is_rows { row_at(p.y) } else { col_at(p.x) };
+                // 落在格子的后半段就插到它后面
+                let frac = if is_rows {
+                    (p.y - py_of(drop)).max(0.0) / rows.size(drop).max(1.0)
+                } else {
+                    (p.x - px_of(drop)).max(0.0) / cols.size(drop).max(1.0)
+                };
+                if frac > 0.5 {
+                    drop += 1;
+                }
+                let (head_lo, head_hi, total) = if is_rows {
+                    (origin.x, origin.x + head_w, 1_048_576u32)
+                } else {
+                    (origin.y, origin.y + hh, 16_384u32)
+                };
+                let _ = (head_lo, head_hi);
+                let drop = drop.min(total);
+                // 插入线
+                let line = if is_rows {
+                    let y = py_of(drop);
+                    egui::Rect::from_min_max(
+                        egui::pos2(origin.x, y - 1.0),
+                        egui::pos2(origin.x + avail.x, y + 1.0),
+                    )
+                } else {
+                    let x = px_of(drop);
+                    egui::Rect::from_min_max(
+                        egui::pos2(x - 1.0, origin.y),
+                        egui::pos2(x + 1.0, origin.y + avail.y),
+                    )
+                };
+                painter.rect_filled(line, 0.0, Color32::from_rgb(26, 115, 232));
+                if resp.drag_stopped() {
+                    self.header_move = None;
+                    // 落在被拖动块内部 = 不动
+                    let inside = drop >= from && drop <= from + n;
+                    if !inside {
+                        // 和插入/删除一样走结构快照，撤销才有东西可回
+                        let idx = self.sheet_idx;
+                        let op = if is_rows {
+                            sheetcore::structural::Structural::DeleteRows { at: from, n }
+                        } else {
+                            sheetcore::structural::Structural::DeleteCols { at: from, n }
+                        };
+                        let snap = if self.wb.sheet(idx).len() <= 200_000 {
+                            Some(sheetcore::undo::snapshot_structure(&self.wb, idx, &op))
+                        } else {
+                            None
+                        };
+                        {
+                            let sh = self.wb.sheet_mut(idx);
+                            if is_rows {
+                                sh.move_rows(from, n, drop);
+                            } else {
+                                sh.move_cols(from, n, drop);
+                            }
+                        }
+                        if let Some(before) = snap {
+                            let after = before.capture_after(&self.wb);
+                            let label = if is_rows { "移动行" } else { "移动列" };
+                            self.undo.push_structure(
+                                label.to_string(),
+                                before,
+                                after,
+                                (idx, self.sel.0, self.sel.1),
+                            );
+                        }
+                        sheetcore::formula::recalc_all(&mut self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.wb.dirty = true;
+                        self.status = if is_rows {
+                            format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
+                        } else {
+                            format!(
+                                "已把 {}–{} 列移动到 {} 列前",
+                                sheetcore::model::col_label(from),
+                                sheetcore::model::col_label(from + n - 1),
+                                sheetcore::model::col_label(drop)
+                            )
+                        };
+                    }
+                }
+            }
+        } else if resp.drag_stopped() {
+            // 没有移动状态时不做处理（留给其它分支）
+        }
+
         // 拖动选区边框 = 移动单元格（Excel 的基础操作）
         if !readonly
             && resp.drag_started()
@@ -14722,7 +14917,10 @@ impl SheetApp {
                     if dr != 0 || dc != 0 {
                         // 松开这一刻的 Ctrl 状态说了算（按下时的可能晚一帧才到）
                         let ctrl_now = ui.input(|i| i.modifiers.command);
-                        if copy || ctrl_now {
+                        let shift_now = ui.input(|i| i.modifiers.shift);
+                        if shift_now {
+                            self.shift_insert_by(dr, dc);
+                        } else if copy || ctrl_now {
                             self.copy_selection_by(dr, dc);
                         } else {
                             self.move_selection_by(dr, dc);
@@ -14779,11 +14977,16 @@ impl SheetApp {
                         let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
                         if (p.x - (px_of(c) + cols.size(c))).abs() <= edge_zone {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        } else {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                         }
                     } else if in_row_head {
                         let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
                         if (p.y - (py_of(r) + rows.size(r))).abs() <= edge_zone {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                        } else {
+                            // 表头本体：可以拖着走（Excel 拖动行号/列标就是移动整行整列）
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                         }
                     }
                 }
@@ -14803,6 +15006,14 @@ impl SheetApp {
                             self.col_drag = Some((c, p.x, cols.size(c)));
                             self.sel = (0, c);
                             self.sel_end = (1_048_575, c);
+                        } else {
+                            let (_, sc1, _, sc2) = self.sel_rect();
+                            let (from, n) = if c >= sc1 && c <= sc2 && sc2 > sc1 {
+                                (sc1, sc2 - sc1 + 1)
+                            } else {
+                                (c, 1)
+                            };
+                            self.header_move = Some((false, from, n));
                         }
                     } else if in_row_head {
                         let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
@@ -14810,6 +15021,15 @@ impl SheetApp {
                             self.row_drag = Some((r, p.y, rows.size(r)));
                             self.sel = (r, 0);
                             self.sel_end = (r, 16_383);
+                        } else {
+                            // 从行号本体拖：整行（选区跨多行就整块）移动
+                            let (sr1, _, sr2, _) = self.sel_rect();
+                            let (from, n) = if r >= sr1 && r <= sr2 && sr2 > sr1 {
+                                (sr1, sr2 - sr1 + 1)
+                            } else {
+                                (r, 1)
+                            };
+                            self.header_move = Some((true, from, n));
                         }
                     }
                 }
