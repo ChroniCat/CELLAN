@@ -409,6 +409,11 @@ struct SheetApp {
     filter_popup: Option<FilterPopup>,
     /// 显示分页虚线
     show_pages: bool,
+    /// 自动保存开关与上次保存时间
+    autosave: bool,
+    last_autosave: f64,
+    /// 标题栏搜索框
+    search: String,
     /// 撤销/重做
     undo: sheetcore::undo::UndoStack,
     /// 标签页：与 active_tab 一一对应，Active 那个的数据在 self 上
@@ -802,6 +807,9 @@ impl SheetApp {
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
+            autosave: false,
+            last_autosave: 0.0,
+            search: String::new(),
             tabs: vec![TabSlot::Active],
             active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
@@ -16979,6 +16987,30 @@ impl SheetApp {
                 painter.line_segment([egui::pos2(g.left(), g.top() + g.height() * 2.0 / 3.0), egui::pos2(g.right(), g.top() + g.height() * 2.0 / 3.0)], sw);
                 painter.line_segment([egui::pos2(g.left() + g.width() / 3.0, g.top()), egui::pos2(g.left() + g.width() / 3.0, g.bottom())], sw);
                 painter.line_segment([egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.top()), egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.bottom())], sw);
+                // 自动保存开关（Excel 标题栏左侧）
+                let as_r = Rect::from_min_size(
+                    egui::pos2(rect.left() + 50.0, rect.center().y - 9.0),
+                    Vec2::new(104.0, 18.0),
+                );
+                let as_resp = ui.interact(as_r, egui::Id::new("autosave"), Sense::click());
+                let pill = Rect::from_min_size(as_r.min, Vec2::new(34.0, 18.0));
+                painter.rect_filled(
+                    pill,
+                    9.0,
+                    if self.autosave { ui_kit::ACCENT } else { Color32::from_rgb(200, 198, 196) },
+                );
+                let kx = if self.autosave { pill.right() - 9.0 } else { pill.left() + 9.0 };
+                painter.circle_filled(egui::pos2(kx, pill.center().y), 7.0, Color32::WHITE);
+                painter.text(
+                    egui::pos2(pill.right() + 8.0, as_r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "自动保存",
+                    FontId::proportional(11.0),
+                    fg,
+                );
+                if as_resp.on_hover_text("每 30 秒自动保存一次").clicked() {
+                    self.autosave = !self.autosave;
+                }
                 // 快速访问工具栏：保存 / 撤销 / 重做
                 let (cu, cr) = (self.undo.can_undo(), self.undo.can_redo());
                 for (i, (icon, tip, on)) in [
@@ -16990,7 +17022,7 @@ impl SheetApp {
                 .enumerate()
                 {
                     let b = Rect::from_center_size(
-                        egui::pos2(rect.left() + 56.0 + i as f32 * 28.0, rect.center().y),
+                        egui::pos2(rect.left() + 158.0 + i as f32 * 32.0, rect.center().y),
                         Vec2::splat(26.0),
                     );
                     let resp = ui.interact(b, egui::Id::new(("qat", i)), Sense::click());
@@ -17008,16 +17040,86 @@ impl SheetApp {
                         }
                     }
                 }
-                // 居中的文件名（和 Excel 一样不随窗口拉伸跑偏）
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
+                // 文件名左对齐（Excel 在 QAT 之后），超出部分裁剪
+                let search_w = 368.0;
+                let sx = rect.center().x - search_w / 2.0;
+                let name_rect = Rect::from_min_max(
+                    egui::pos2(rect.left() + 294.0, rect.top() + 4.0),
+                    egui::pos2(sx - 16.0, rect.bottom() - 4.0),
+                );
+                let clipped = painter.with_clip_rect(name_rect);
+                clipped.text(
+                    egui::pos2(name_rect.left(), name_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
                     &self.last_title,
                     FontId::proportional(12.0),
                     fg,
                 );
+                // 搜索框（Excel 标题栏中部）
+                let sr = Rect::from_min_size(
+                    egui::pos2(sx, rect.top() + 8.0),
+                    Vec2::new(search_w, 32.0),
+                );
+                painter.rect(
+                    sr,
+                    4.0,
+                    Color32::WHITE,
+                    egui::Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+                    egui::StrokeKind::Inside,
+                );
+                let mc = egui::pos2(sr.left() + 18.0, sr.center().y);
+                let mst = egui::Stroke::new(1.2, Color32::from_rgb(96, 94, 92));
+                painter.circle_stroke(mc, 5.5, mst);
+                painter.line_segment(
+                    [egui::pos2(mc.x + 4.0, mc.y + 4.0), egui::pos2(mc.x + 8.0, mc.y + 8.0)],
+                    mst,
+                );
+                let te_rect = Rect::from_min_max(
+                    egui::pos2(sr.left() + 32.0, sr.top() + 5.0),
+                    egui::pos2(sr.right() - 8.0, sr.bottom() - 5.0),
+                );
+                let te = ui.put(
+                    te_rect,
+                    egui::TextEdit::singleline(&mut self.search)
+                        .frame(false)
+                        .hint_text("搜索"),
+                );
+                if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    self.find.find = self.search.clone();
+                    self.find.tab = 0;
+                    self.find.open = true;
+                }
+                // 账户按钮（Excel 标题栏右侧头像）
+                let acc = Rect::from_min_size(
+                    egui::pos2(rect.right() - 48.0 * 3.0 - 92.0, rect.center().y - 14.0),
+                    Vec2::new(88.0, 28.0),
+                );
+                let aresp = ui.interact(acc, egui::Id::new("account"), Sense::click());
+                if aresp.hovered() {
+                    painter.rect_filled(acc, 3.0, hover);
+                }
+                let ac = egui::pos2(acc.left() + 14.0, acc.center().y);
+                painter.circle_filled(ac, 11.0, Color32::from_rgb(0, 120, 212));
+                let user = std::env::var("USERNAME").unwrap_or_else(|_| "U".into());
+                painter.text(
+                    ac,
+                    egui::Align2::CENTER_CENTER,
+                    user.chars().next().unwrap_or('U').to_uppercase().to_string(),
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+                painter.text(
+                    egui::pos2(ac.x + 16.0, acc.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    if user.len() > 8 { &user[..8] } else { &user },
+                    FontId::proportional(11.0),
+                    fg,
+                );
+                if aresp.on_hover_text("账户").clicked() {
+                    self.about_open = true;
+                }
                 // 窗口按钮
-                let bw = 46.0;
+                let bw = 48.0;
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 let buttons = [
                     ("close", rect.right() - bw, bg),
@@ -17093,6 +17195,14 @@ impl SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 自动保存：脏数据且已有路径时，每 30 秒落盘一次
+        if self.autosave && self.wb.dirty && self.wb.path.is_some() {
+            let now = ctx.input(|i| i.time);
+            if now - self.last_autosave > 30.0 {
+                self.last_autosave = now;
+                self.save(false);
+            }
+        }
         // 无界面验收：SC_DBLCLICK="x,y" 在应用内注入两次点击，走真实的双击判定
         if let Ok(spec) = std::env::var("SC_DBLCLICK") {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -17321,6 +17431,26 @@ impl eframe::App for SheetApp {
                             .clicked()
                             {
                                 self.start_host();
+                            }
+                            if ui_kit::labeled_w(
+                                ui,
+                                Icon::Comment,
+                                "批注",
+                                54.0,
+                                "新建或编辑批注",
+                            )
+                            .clicked()
+                            {
+                                let (r, c) = self.sel;
+                                let key = sheetcore::model::CellRef::new(r, c);
+                                let cur = self
+                                    .wb
+                                    .sheet(self.sheet_idx)
+                                    .notes
+                                    .get(&key)
+                                    .map(|n| n.text.clone())
+                                    .unwrap_or_default();
+                                self.note_edit = Some((r, c, cur));
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
