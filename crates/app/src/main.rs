@@ -8445,7 +8445,7 @@ impl SheetApp {
                 }
                 ui.weak("引用写法：Sheet1!$A$1:$B$3，或常量 ={\"甲\";\"乙\"}");
                 ui_kit::footer(ui, |ui| {
-                    if ui.button("关闭").clicked() {
+                    if ui_kit::secondary_button(ui, "关闭").clicked() {
                         self.name_mgr = false;
                     }
                 });
@@ -9324,6 +9324,7 @@ impl SheetApp {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
+                dlg_section(ui, "验证条件");
                 egui::Grid::new("dv_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("允许");
                     egui::ComboBox::from_id_salt("dv_kind")
@@ -9406,21 +9407,26 @@ impl SheetApp {
                     ui.label("忽略空值");
                     ui.checkbox(&mut draft.allow_blank, "");
                     ui.end_row();
+                });
+                dlg_section(ui, "出错警告");
+                egui::Grid::new("dv_err").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("出错标题");
-                    ui.add(egui::TextEdit::singleline(&mut draft.error_title).desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut draft.error_title).desired_width(220.0));
                     ui.end_row();
                     ui.label("出错说明");
-                    ui.add(egui::TextEdit::singleline(&mut draft.error_msg).desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut draft.error_msg).desired_width(220.0));
                     ui.end_row();
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
-                        apply = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        cancel = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                        if ui_kit::primary_button(ui, "确定").clicked() {
+                            apply = true;
+                        }
+                    });
                 });
             });
         if apply {
@@ -9529,7 +9535,7 @@ impl SheetApp {
                         .hint_text("写点什么…"),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
                         apply = true;
                     }
                     if ui_kit::secondary_button(ui, "取消").clicked() {
@@ -10052,7 +10058,7 @@ impl SheetApp {
                         .hint_text("销售!A1:C100"),
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
                         apply = true;
                     }
                     if ui_kit::secondary_button(ui, "取消").clicked() {
@@ -11696,7 +11702,7 @@ impl SheetApp {
                     {
                         do_refresh = true;
                     }
-                    if ui.button("关闭").clicked() {
+                    if ui_kit::secondary_button(ui, "关闭").clicked() {
                         self.xlink_dlg = false;
                     }
                 });
@@ -12154,7 +12160,7 @@ impl SheetApp {
                         ok = true;
                     }
                 });
-                if ui.button("确定").clicked() {
+                if ui_kit::primary_button(ui, "确定").clicked() {
                     ok = true;
                 }
             });
@@ -12218,7 +12224,7 @@ impl SheetApp {
                         do_repl = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("关闭").clicked() {
+                        if ui_kit::secondary_button(ui, "关闭").clicked() {
                             self.find.open = false;
                         }
                         if ui_kit::primary_button(ui, "查找下一个").clicked() {
@@ -16299,7 +16305,7 @@ impl SheetApp {
                     }
                 });
                 ui.separator();
-                if ui.button("关闭").clicked() {
+                if ui_kit::secondary_button(ui, "关闭").clicked() {
                     close = true;
                 }
             });
