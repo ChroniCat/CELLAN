@@ -95,6 +95,7 @@ struct FmtState {
     font: String,
     bold: bool,
     italic: bool,
+    underline: bool,
     size: f32,
     color: [u8; 3],
     fill: Option<[u8; 3]>,
@@ -1121,6 +1122,11 @@ impl SheetApp {
                         let font = font.trim().to_string();
                         self.apply_style(move |s| s.font = font.clone());
                         eprintln!("[font] 选区已套用字体 {:?}", self.current_style().font);
+                    }
+                    // 无界面验收：SC_UNDERLINE=1 给选区加下划线（同样的 apply_style 通路）
+                    if std::env::var("SC_UNDERLINE").is_ok() {
+                        self.apply_style(|s| s.underline = true);
+                        eprintln!("[ul] 选区下划线={}", self.current_style().underline);
                     }
                     if let Ok(out) = std::env::var("SC_SAVE") {
                         let target = PathBuf::from(&out);
@@ -3876,6 +3882,7 @@ impl SheetApp {
             font: st.font.clone(),
             bold: st.bold,
             italic: st.italic,
+            underline: st.underline,
             size: st.size,
             color: st.color,
             fill: st.fill,
@@ -6085,7 +6092,7 @@ impl SheetApp {
                         } else {
                             cur.font.clone()
                         })
-                        .width(140.0)
+                        .width(155.0)
                         .height(24.0)
                         .show_ui(ui, |ui| {
                             for name in sheetcore::style::FONT_CHOICES {
@@ -6126,13 +6133,17 @@ impl SheetApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui_kit::text_toggle(ui, "B", cur.bold, "加粗（Ctrl+B）", true, false).clicked() {
+                    if ui_kit::text_toggle(ui, "B", cur.bold, "加粗（Ctrl+B）", true, false, false).clicked() {
                         let v = !cur.bold;
                         self.apply_style(move |s| s.bold = v);
                     }
-                    if ui_kit::text_toggle(ui, "I", cur.italic, "斜体（Ctrl+I）", false, true).clicked() {
+                    if ui_kit::text_toggle(ui, "I", cur.italic, "斜体（Ctrl+I）", false, true, false).clicked() {
                         let v = !cur.italic;
                         self.apply_style(move |s| s.italic = v);
+                    }
+                    if ui_kit::text_toggle(ui, "U", cur.underline, "下划线（Ctrl+U）", false, false, true).clicked() {
+                        let v = !cur.underline;
+                        self.apply_style(move |s| s.underline = v);
                     }
                     ui.add_space(2.0);
                     if ui_kit::small(ui, Icon::Border, "所有框线").clicked() {
@@ -6183,6 +6194,19 @@ impl SheetApp {
                     if ui_kit::color_button(ui, Some("A"), None, Color32::from_rgb(fg[0], fg[1], fg[2]), "字体颜色").clicked() {
                         self.color_popup = Some(true);
                     }
+                    ui.add_space(2.0);
+                    if ui_kit::small(ui, Icon::ClearFmt, "清除格式").clicked() {
+                        // 保留字体名（中文环境大多是宋体/黑体），其余恢复默认
+                        self.apply_style(|s| {
+                            let f = s.font.clone();
+                            *s = sheetcore::style::CellStyle {
+                                font: f,
+                                size: 11.0,
+                                color: [0, 0, 0],
+                                ..Default::default()
+                            };
+                        });
+                    }
                 });
             });
         }) { self.fmt_pending = true; }
@@ -6213,7 +6237,7 @@ impl SheetApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 78.0, cur.wrap, "自动换行").clicked() {
+                    if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 74.0, cur.wrap, "自动换行").clicked() {
                         let v = !cur.wrap;
                         self.apply_style(move |s| s.wrap = v);
                     }
@@ -6224,7 +6248,7 @@ impl SheetApp {
                         .merges
                         .iter()
                         .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2);
-                    if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 92.0, merged, "合并后居中").clicked() {
+                    if ui_kit::labeled_w_on(ui, Icon::Merge, "合并后居中", 86.0, merged, "合并后居中").clicked() {
                         self.toggle_merge(!merged);
                     }
                     ui.menu_button("▾", |ui| {
@@ -6269,7 +6293,7 @@ impl SheetApp {
                 };
                 egui::ComboBox::from_id_salt("numfmt")
                     .selected_text(fmt_label.to_string())
-                    .width(112.0)
+                    .width(96.0)
                     .height(24.0)
                     .show_ui(ui, |ui| {
                         for (label, code) in [
@@ -7811,7 +7835,16 @@ impl SheetApp {
                         _ => rect.min.x + 4.0,
                     };
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+                    let uw = galley.size().x;
+                    let uh = galley.size().y;
                     clipped.galley(egui::pos2(x, top), galley, color);
+                    if st.underline {
+                        let uy = top + uh - 1.0;
+                        clipped.line_segment(
+                            [egui::pos2(x, uy), egui::pos2(x + uw, uy)],
+                            Stroke::new(1.0, color),
+                        );
+                    }
                 } else {
                     // 默认裁剪在格子里：长文本不再压住右侧列线（视图里可开回 Excel 的溢出行为）
                     let g = painter.layout_no_wrap(txt.clone(), font.clone(), color);
@@ -7843,6 +7876,13 @@ impl SheetApp {
                         // egui 没有粗体字形：同一串再画一遍、右移 0.6px，
                         // 笔画厚度才接近 Excel 的 Bold（只把字号 +0.8 显不出粗）
                         clipped.galley(egui::pos2(x0 + 0.6, y0), g, color);
+                    }
+                    if st.underline {
+                        let uy = y0 + gh - 1.0;
+                        clipped.line_segment(
+                            [egui::pos2(x0, uy), egui::pos2(x0 + w, uy)],
+                            Stroke::new(1.0, color),
+                        );
                     }
                     if is_link {
                         // Excel 的超链接是蓝色 + 下划线
@@ -9176,6 +9216,7 @@ impl SheetApp {
                                 "粗体",
                                 true,
                                 false,
+                                false,
                             )
                             .clicked()
                             {
@@ -9188,10 +9229,24 @@ impl SheetApp {
                                 "斜体",
                                 false,
                                 true,
+                                false,
                             )
                             .clicked()
                             {
                                 self.fmt_state.italic = !self.fmt_state.italic;
+                            }
+                            if ui_kit::text_toggle(
+                                ui,
+                                "U",
+                                self.fmt_state.underline,
+                                "下划线",
+                                false,
+                                false,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.fmt_state.underline = !self.fmt_state.underline;
                             }
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("颜色").size(11.5).weak());
@@ -9376,6 +9431,7 @@ impl SheetApp {
                 s.font = st.font.clone();
                 s.bold = st.bold;
                 s.italic = st.italic;
+                s.underline = st.underline;
                 s.size = st.size;
                 s.color = st.color;
                 s.fill = st.fill;
@@ -14200,26 +14256,41 @@ impl eframe::App for SheetApp {
                                 Color32::from_rgb(96, 96, 96)
                             };
                             let st = Stroke::new(1.0, col);
-                            let inner = Rect::from_center_size(b.center(), Vec2::new(12.0, 10.0));
-                            ui.painter().rect_stroke(inner, 1.0, st, egui::StrokeKind::Inside);
+                            // Excel 的三个视图图标：普通（行头竖条）、页面布局（页边距）、
+                            // 分页预览（右三分之一填色）
+                            let inner = Rect::from_center_size(b.center(), Vec2::new(13.0, 11.0));
+                            ui.painter().rect_stroke(inner, 0.5, st, egui::StrokeKind::Inside);
                             match i {
-                                0 => {}
-                                1 => {
+                                0 => {
                                     ui.painter().rect_filled(
                                         Rect::from_min_size(
-                                            inner.min + Vec2::new(2.0, 2.0),
-                                            Vec2::new(8.0, 3.0),
+                                            inner.min + Vec2::new(0.6, 0.6),
+                                            Vec2::new(2.6, inner.height() - 1.2),
                                         ),
                                         0.0,
-                                        col.gamma_multiply(0.35),
+                                        col.gamma_multiply(0.45),
+                                    );
+                                }
+                                1 => {
+                                    ui.painter().rect_stroke(
+                                        inner.shrink(2.2),
+                                        0.0,
+                                        Stroke::new(1.0, col.gamma_multiply(0.55)),
+                                        egui::StrokeKind::Inside,
                                     );
                                 }
                                 _ => {
+                                    let x = inner.left() + inner.width() * 0.62;
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_max(
+                                            egui::pos2(x, inner.top() + 0.6),
+                                            egui::pos2(inner.right() - 0.6, inner.bottom() - 0.6),
+                                        ),
+                                        0.0,
+                                        col.gamma_multiply(0.3),
+                                    );
                                     ui.painter().line_segment(
-                                        [
-                                            egui::pos2(inner.left() + 4.0, inner.top()),
-                                            egui::pos2(inner.left() + 4.0, inner.bottom()),
-                                        ],
+                                        [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
                                         st,
                                     );
                                 }

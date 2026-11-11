@@ -540,11 +540,22 @@ pub fn color_button(
     if let Some(ic) = icon {
         ui_icons::draw_excel(ui.painter(), top.shrink(2.0), ic, text_color(&v), true);
     }
+    // 色条左收 + 右下角小三角：Excel 的颜色按钮是「图标 + 色条 + 下拉箭头」
     let bar = Rect::from_min_size(
-        egui::pos2(rect.left() + 5.0, rect.bottom() - 4.0),
-        Vec2::new(14.0, 3.0),
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 4.0),
+        Vec2::new(12.0, 3.0),
     );
     ui.painter().rect_filled(bar, 1.0, color);
+    let ac = Color32::from_rgb(68, 68, 68);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(rect.right() - 7.0, rect.bottom() - 6.0),
+            egui::pos2(rect.right() - 2.0, rect.bottom() - 6.0),
+            egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
+        ],
+        ac,
+        Stroke::NONE,
+    ));
     resp.on_hover_text(tip)
 }
 
@@ -556,6 +567,7 @@ pub fn text_toggle(
     tip: &str,
     strong: bool,
     italic: bool,
+    underline: bool,
 ) -> Response {
     let v = ui.visuals().clone();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
@@ -582,6 +594,13 @@ pub fn text_toggle(
             label,
             FontId::proportional(13.5),
             col,
+        );
+    }
+    if underline {
+        let uy = pos.y + 7.5;
+        ui.painter().line_segment(
+            [egui::pos2(pos.x - 5.0, uy), egui::pos2(pos.x + 5.0, uy)],
+            Stroke::new(1.4, col),
         );
     }
     resp.on_hover_text(tip)

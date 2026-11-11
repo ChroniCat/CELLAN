@@ -872,6 +872,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 let f = s.get_font_mut();
                 f.set_bold(st.bold);
                 f.set_italic(st.italic);
+                f.set_underline(if st.underline { "single" } else { "none" });
                 f.set_size(st.size as f64);
                 // 字体名：空串表示默认字体，不碰原文件的字体（避免把 Calibri 写成别的）
                 if !st.font.is_empty() {
@@ -1785,6 +1786,7 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
     if let Some(f) = &st.font {
         out.bold = matches!(f.weight, calamine::FontWeight::Bold);
         out.italic = matches!(f.style, calamine::FontStyle::Italic);
+        out.underline = !matches!(f.underline, calamine::UnderlineStyle::None);
         if let Some(n) = &f.name {
             out.font = crate::style::normalize_font(n);
         }

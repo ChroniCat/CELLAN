@@ -109,6 +109,9 @@ pub fn font_class(name: &str) -> FontClass {
 pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
+    /// 单下划线（Excel 的 U）
+    #[serde(default)]
+    pub underline: bool,
     /// 字体名（见 `normalize_font`；空串 = 默认字体）
     #[serde(default)]
     pub font: String,
@@ -158,6 +161,7 @@ fn hash_of(s: &CellStyle) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.bold.hash(&mut h);
     s.italic.hash(&mut h);
+    s.underline.hash(&mut h);
     s.font.hash(&mut h);
     s.size.to_bits().hash(&mut h);
     s.color.hash(&mut h);
