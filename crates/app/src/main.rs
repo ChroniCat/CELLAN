@@ -38,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.58";
+const APP_VERSION: &str = "1.59";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -136,8 +136,16 @@ fn col_outline_button(
     si: usize,
     pending: &mut Vec<(u32, u32)>,
 ) {
+    let (sum_right, symbols_on) = {
+        let sh = wb.sheet(si);
+        (sh.outline_summary_right, sh.outline_symbols)
+    };
+    if !symbols_on {
+        return;
+    }
     for (gs, ge, glv) in groups.iter() {
-        if *ge + 1 != c {
+        let target_col = if sum_right { *ge + 1 } else { gs.saturating_sub(1) };
+        if target_col != c {
             continue;
         }
         let sheet = wb.sheet(si);
@@ -476,6 +484,12 @@ struct SheetApp {
     ec: ErrorCheckOptions,
     /// 错误检查选项对话框
     ec_options: bool,
+    /// 简繁转换预览
+    zh_preview_dlg: bool,
+    zh_preview: Vec<(u32, u32, String, String)>,
+    zh_preview_variant: sheetcore::zhconv::Variant,
+    /// 分级显示设置对话框
+    outline_set_dlg: bool,
     /// 校对（拼写检查）对话框
     proof_dlg: bool,
     proof_list: Vec<sheetcore::proof::ProofIssue>,
@@ -804,6 +818,10 @@ impl SheetApp {
             dtable_msg: String::new(),
             ec: ErrorCheckOptions::load(),
             ec_options: false,
+            zh_preview_dlg: false,
+            zh_preview: Vec::new(),
+            zh_preview_variant: sheetcore::zhconv::Variant::Generic,
+            outline_set_dlg: false,
             proof_dlg: false,
             proof_list: Vec::new(),
             proof_rules: sheetcore::proof::ProofRules::default(),
@@ -1409,8 +1427,70 @@ impl SheetApp {
                                 }
                             }
                         }
+                        Ok("zhpreview") => {
+                            // SC_SEL/SC_SEL2 定选区，SC_ZH_VARIANT=tw|hk 选变体
+                            if let (Ok(a), Ok(b)) = (
+                                std::env::var("SC_SEL"),
+                                std::env::var("SC_SEL2"),
+                            ) {
+                                let p = |v: &str| -> Option<(u32, u32)> {
+                                    let (x, y) = v.split_once(',')?;
+                                    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                                };
+                                if let (Some(s0), Some(s1)) = (p(&a), p(&b)) {
+                                    self.sel = s0;
+                                    self.sel_end = s1;
+                                }
+                            }
+                            self.zh_preview_variant = match std::env::var("SC_ZH_VARIANT")
+                                .unwrap_or_default()
+                                .as_str()
+                            {
+                                "tw" => sheetcore::zhconv::Variant::Taiwan,
+                                "hk" => sheetcore::zhconv::Variant::HongKong,
+                                _ => sheetcore::zhconv::Variant::Generic,
+                            };
+                            self.zh_preview_scan();
+                            self.zh_preview_dlg = true;
+                            eprintln!("[zhpreview] diffs={}", self.zh_preview.len());
+                        }
+                        Ok("outline_set") => {
+                            self.outline_set_dlg = true;
+                            if let Ok(spec) = std::env::var("SC_OUTLINE_PR") {
+                                let parts: Vec<&str> = spec.split(',').collect();
+                                if parts.len() >= 3 {
+                                    let (b, r, sym) = (
+                                        parts[0].trim() != "0",
+                                        parts[1].trim() != "0",
+                                        parts[2].trim() != "0",
+                                    );
+                                    {
+                                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                                        sh.outline_summary_below = b;
+                                        sh.outline_summary_right = r;
+                                        sh.outline_symbols = sym;
+                                        sh.outline_pr_dirty = true;
+                                    }
+                                    // 当成一次编辑：否则后台重算的结果会把整份 wb 换回去
+                                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                                    self.wb.dirty = true;
+                                    eprintln!("[outline] below={b} right={r} symbols={sym}");
+                                }
+                            }
+                        }
                         Ok("proof") => {
                             self.open_proof();
+                            match std::env::var("SC_PROOF_FIX").as_deref() {
+                                Ok("all") => {
+                                    self.proof_apply_fix(false);
+                                    eprintln!("[proof] fixed all -> {}", self.status);
+                                }
+                                Ok("sel") => {
+                                    self.proof_apply_fix(true);
+                                    eprintln!("[proof] fixed sel -> {}", self.status);
+                                }
+                                _ => {}
+                            }
                             eprintln!("[proof] issues={} first={:?}", self.proof_list.len(), self.proof_list.first().map(|i| (i.row, i.col, i.kind)));
                         }
                         Ok("zh") => {
@@ -5240,6 +5320,228 @@ impl SheetApp {
         });
     }
 
+    /// 算一遍简转繁的差异（不动数据），供预览对话框显示
+    fn zh_preview_scan(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let mut rows = Vec::new();
+        if (r2 - r1) as u64 * (c2 - c1) as u64 <= 200_000 {
+            let v = self.zh_preview_variant;
+            let sh = self.wb.sheet(self.sheet_idx);
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let Some(cell) = sh.get(r, c) else { continue };
+                    let sheetcore::model::Value::Text(t) = &cell.value else {
+                        continue;
+                    };
+                    let new = sheetcore::zhconv::to_traditional_with(t, v);
+                    if new.as_str() != t.as_ref() {
+                        rows.push((r, c, t.to_string(), new));
+                    }
+                }
+            }
+        }
+        self.zh_preview = rows;
+    }
+
+    fn zh_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.zh_preview_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut variant_changed = false;
+        ui_kit::window(ctx, "简转繁预览", 660.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("目标:");
+                    variant_changed |= ui
+                        .radio_value(
+                            &mut self.zh_preview_variant,
+                            sheetcore::zhconv::Variant::Generic,
+                            "通用繁体",
+                        )
+                        .changed();
+                    variant_changed |= ui
+                        .radio_value(
+                            &mut self.zh_preview_variant,
+                            sheetcore::zhconv::Variant::Taiwan,
+                            "台湾正体",
+                        )
+                        .changed();
+                    variant_changed |= ui
+                        .radio_value(
+                            &mut self.zh_preview_variant,
+                            sheetcore::zhconv::Variant::HongKong,
+                            "香港繁体",
+                        )
+                        .changed();
+                });
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "选区内 {} 个单元格会被改动（只列有差异的）",
+                        self.zh_preview.len()
+                    ))
+                    .size(11.5)
+                    .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
+                    if self.zh_preview.is_empty() {
+                        ui.label(egui::RichText::new("选区里没有需要转换的内容。").size(12.0));
+                    }
+                    for (r, c, old, new) in self.zh_preview.clone() {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [60.0, 20.0],
+                                egui::Label::new(
+                                    egui::RichText::new(cell_name(r, c)).size(11.5).monospace(),
+                                ),
+                            );
+                            ui.add_sized(
+                                [220.0, 20.0],
+                                egui::Label::new(
+                                    egui::RichText::new(old).size(11.5).color(ui_kit::TEXT_WEAK),
+                                )
+                                .truncate(),
+                            );
+                            ui.label(egui::RichText::new("→").size(11.5));
+                            ui.add_sized(
+                                [220.0, 20.0],
+                                egui::Label::new(egui::RichText::new(new).size(11.5)).truncate(),
+                            );
+                        });
+                    }
+                });
+                ui_kit::footer(ui, |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.zh_preview.is_empty(),
+                            egui::Button::new("应用转换"),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui_kit::primary_button(ui, "取消").clicked() {
+                        self.zh_preview_dlg = false;
+                    }
+                });
+            });
+        if variant_changed {
+            self.zh_preview_scan();
+        }
+        if apply {
+            let v = self.zh_preview_variant;
+            self.zh_convert(true, v);
+            self.zh_preview_dlg = false;
+        }
+        if !open {
+            self.zh_preview_dlg = false;
+        }
+    }
+
+    /// 按当前规则修正：only_sel=true 只修当前选中的那一格
+    fn proof_apply_fix(&mut self, only_sel: bool) {
+        if self.edit_blocked() {
+            return;
+        }
+        let mut targets: Vec<(u32, u32)> = if only_sel {
+            let (r, c) = self.sel;
+            self.proof_list
+                .iter()
+                .filter(|i| i.row == r && i.col == c)
+                .map(|i| (i.row, i.col))
+                .collect()
+        } else {
+            self.proof_list.iter().map(|i| (i.row, i.col)).collect()
+        };
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            self.status = "没有可修正的单元格".into();
+            return;
+        }
+        let txn = self.txn_begin(&targets);
+        let mut n = 0usize;
+        for (r, c) in &targets {
+            let sh = self.wb.sheet(self.sheet_idx);
+            let Some(cell) = sh.get(*r, *c) else { continue };
+            let sheetcore::model::Value::Text(t) = &cell.value else {
+                continue;
+            };
+            let fixed = sheetcore::proof::fix_text(t, &self.proof_rules);
+            if fixed.as_str() == t.as_ref() {
+                continue;
+            }
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            cell.value = sheetcore::model::Value::Text(fixed.into());
+            sh.set(*r, *c, cell);
+            n += 1;
+        }
+        self.txn_end("校对修正", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.proof_list = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
+        self.status = format!("校对修正：{n} 个单元格");
+    }
+
+    /// 分级显示设置：明细位置（上/下、左/右）+ 是否显示分级符号
+    fn outline_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.outline_set_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let (mut below, mut right, mut symbols) = {
+            let sh = self.wb.sheet(self.sheet_idx);
+            (
+                sh.outline_summary_below,
+                sh.outline_summary_right,
+                sh.outline_symbols,
+            )
+        };
+        ui_kit::window(ctx, "设置分级显示", 420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("明细数据的表示方式").size(12.0).strong());
+                changed |= ui.radio_value(&mut below, true, "明细数据在下方").changed();
+                changed |= ui.radio_value(&mut below, false, "明细数据在上方").changed();
+                ui.add_space(4.0);
+                changed |= ui.radio_value(&mut right, true, "明细数据在右侧").changed();
+                changed |= ui.radio_value(&mut right, false, "明细数据在左侧").changed();
+                ui.add_space(6.0);
+                changed |= ui.checkbox(&mut symbols, "显示分级符号（+ / -）").changed();
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        self.outline_set_dlg = false;
+                    }
+                });
+            });
+        if changed {
+            {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.outline_summary_below = below;
+                sh.outline_summary_right = right;
+                sh.outline_symbols = symbols;
+                sh.outline_pr_dirty = true;
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = format!(
+                "分级显示：明细{}方 / 明细{}侧 / 符号{}",
+                if below { "下" } else { "上" },
+                if right { "右" } else { "左" },
+                if symbols { "显示" } else { "隐藏" }
+            );
+        }
+        if !open {
+            self.outline_set_dlg = false;
+        }
+    }
+
     fn open_proof(&mut self) {
         self.proof_list = sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
         self.proof_dlg = true;
@@ -5257,6 +5559,8 @@ impl SheetApp {
         let mut open = true;
         let mut jump: Option<(u32, u32)> = None;
         let mut changed = false;
+        let mut fix_all = false;
+        let mut fix_one = false;
         ui_kit::window(ctx, "拼写检查", 600.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -5322,6 +5626,25 @@ impl SheetApp {
                 });
                 ui.add_space(4.0);
                 ui_kit::footer(ui, |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.proof_list.is_empty(),
+                            egui::Button::new("修正全部"),
+                        )
+                        .on_hover_text("按当前规则修掉列表里的所有问题（可撤销）")
+                        .clicked()
+                    {
+                        fix_all = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.proof_list.is_empty(),
+                            egui::Button::new("修正此单元格"),
+                        )
+                        .clicked()
+                    {
+                        fix_one = true;
+                    }
                     if ui.button("重新检查").clicked() {
                         self.proof_list =
                             sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
@@ -5331,7 +5654,11 @@ impl SheetApp {
                     }
                 });
             });
-        if changed {
+        if fix_all {
+            self.proof_apply_fix(false);
+        } else if fix_one {
+            self.proof_apply_fix(true);
+        } else if changed {
             self.proof_list =
                 sheetcore::proof::scan(self.wb.sheet(self.sheet_idx), &self.proof_rules);
         }
@@ -8735,6 +9062,13 @@ impl SheetApp {
                                     ui.close_menu();
                                 }
                             }
+                            ui.separator();
+                            if ui.button("预览…").clicked() {
+                                self.zh_preview_variant = sheetcore::zhconv::Variant::Generic;
+                                self.zh_preview_scan();
+                                self.zh_preview_dlg = true;
+                                ui.close_menu();
+                            }
                         });
                     });
                 });
@@ -9057,6 +9391,11 @@ impl SheetApp {
                     .clicked()
                 {
                     self.ungroup_selection();
+                }
+                if ui_kit::labeled_w(ui, Icon::Grid, "分级设置", 104.0, "明细在下方/右侧、显示分级符号")
+                    .clicked()
+                {
+                    self.outline_set_dlg = true;
                 }
             });
             ui.vertical(|ui| {
@@ -13495,9 +13834,21 @@ impl SheetApp {
                                     FontId::new(12.0, family_named("latin")),
                                     head_fg,
                                 );
-                    // 分级显示：在本组最后一行下面那一行的行头上画 +/-（Excel 的 summaryBelow 约定）
+                    // 分级显示：明细在下方时按钮画在组最后一行下面那行，在上方时画在上面那行
+                    let (sum_below, symbols_on) = {
+                        let sh = self.wb.sheet(self.sheet_idx);
+                        (sh.outline_summary_below, sh.outline_symbols)
+                    };
                     for (gs, ge, glv) in groups.iter() {
-                        if *ge + 1 != r {
+                        if !symbols_on {
+                            break;
+                        }
+                        let target_row = if sum_below {
+                            *ge + 1
+                        } else {
+                            gs.saturating_sub(1)
+                        };
+                        if target_row != r {
                             continue;
                         }
                         let hidden = (*gs..=*ge).all(|x| {
@@ -16557,6 +16908,8 @@ impl eframe::App for SheetApp {
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
+        self.outline_settings_window(ctx);
+        self.zh_preview_window(ctx);
         self.ec_options_window(ctx);
         self.goal_window(ctx);
         self.dtable_window(ctx);

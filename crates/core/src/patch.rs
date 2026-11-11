@@ -2108,6 +2108,90 @@ pub fn set_ignored_errors(xml: &str, cells: &[(u32, u32)]) -> String {
     x
 }
 
+/// 写 `<sheetPr><outlinePr …/></sheetPr>`：分级显示的明细位置与符号开关。
+/// schema 顺序是 tabColor → outlinePr → pageSetUpPr，插错位置 Excel 会判损坏。
+pub fn set_outline_pr(xml: &str, below: bool, right: bool, symbols: bool) -> String {
+    let tag = format!(
+        "<outlinePr summaryBelow=\"{}\" summaryRight=\"{}\" showOutlineSymbols=\"{}\"/>",
+        if below { 1 } else { 0 },
+        if right { 1 } else { 0 },
+        if symbols { 1 } else { 0 }
+    );
+    let mut x = xml.to_string();
+    // 先删旧的 outlinePr
+    while let Some(i) = x.find("<outlinePr") {
+        let tail = &x[i..];
+        if let Some(gt) = tail.find('>') {
+            if tail[..gt].ends_with('/') {
+                x.replace_range(i..i + gt + 1, "");
+            } else if let Some(end) = tail.find("</outlinePr>") {
+                x.replace_range(i..i + end + "</outlinePr>".len(), "");
+            } else {
+                x.replace_range(i..i + gt + 1, "");
+            }
+        } else {
+            break;
+        }
+    }
+    if let Some(sp) = x.find("<sheetPr") {
+        let Some(gt) = x[sp..].find('>') else {
+            return x;
+        };
+        let end = sp + gt + 1;
+        if x[sp..end].ends_with("/>") {
+            // <sheetPr/> 自闭合：展开
+            let open = x[sp..end].replace("/>", ">");
+            x.replace_range(sp..end, &format!("{open}{tag}</sheetPr>"));
+        } else {
+            // 放在 pageSetUpPr 之前，没有就放 </sheetPr> 前
+            let at = x[end..]
+                .find("<pageSetUpPr")
+                .map(|i| end + i)
+                .or_else(|| x[end..].find("</sheetPr>").map(|i| end + i))
+                .unwrap_or(end);
+            x.insert_str(at, &tag);
+        }
+    } else if let Some(i) = x.find("<dimension") {
+        // 没有 sheetPr：紧跟在 <worksheet …> 之后建一个
+        let at = x[..i].rfind('>').map(|p| p + 1).unwrap_or(i);
+        x.insert_str(at, &format!("<sheetPr>{tag}</sheetPr>"));
+    }
+    x
+}
+
+/// 保存收尾：把分级设置写回各表
+pub fn apply_outline_pr(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, (bool, bool, bool)> =
+        std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if !s.outline_pr_dirty {
+            continue;
+        }
+        if let Some(part) = targets.get(&s.name) {
+            map.insert(
+                part.clone(),
+                (
+                    s.outline_summary_below,
+                    s.outline_summary_right,
+                    s.outline_symbols,
+                ),
+            );
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some((b, r, sym)) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return set_outline_pr(&xml, *b, *r, *sym).into_bytes();
+            }
+        }
+        buf
+    })
+}
+
 /// 保存收尾：把方案列表写回各表（`<scenarios>`）
 pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let targets = sheet_targets(path)?;

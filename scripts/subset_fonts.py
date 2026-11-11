@@ -52,6 +52,28 @@ def charset() -> str:
             for ch in m.group(1):
                 if ord(ch) >= 0x20 and ch != "\\":
                     chars.add(ch)
+    # 简繁词典里的字：转换结果（軟/隨/兌…）不在 GB2312 里，缺字形就会渲染成方框。
+    blob_path = os.path.join(HERE, "crates", "core", "assets", "zhconv.bin")
+    if os.path.exists(blob_path):
+        b = open(blob_path, "rb").read()
+        if len(b) > 8 and b[:4] == b"ZHC1":
+            n = int.from_bytes(b[4:8], "little")
+            at = 8
+            for _ in range(n):
+                if at + 2 > len(b):
+                    break
+                kl = int.from_bytes(b[at:at + 2], "little")
+                at += 2
+                k = b[at:at + kl].decode("utf-8", "ignore")
+                at += kl
+                if at + 2 > len(b):
+                    break
+                vl = int.from_bytes(b[at:at + 2], "little")
+                at += 2
+                v = b[at:at + vl].decode("utf-8", "ignore")
+                at += vl
+                chars.update(k)
+                chars.update(v)
     return "".join(sorted(chars))
 
 

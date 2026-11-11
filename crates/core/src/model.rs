@@ -156,6 +156,12 @@ pub struct Sheet {
     pub ignored_errors: std::collections::HashSet<(u32, u32)>,
     /// 忽略列表被改过
     pub ignored_errors_dirty: bool,
+    /// 分级显示设置：明细在下方 / 在右侧 / 显示分级符号
+    pub outline_summary_below: bool,
+    pub outline_summary_right: bool,
+    pub outline_symbols: bool,
+    /// 分级设置被改过
+    pub outline_pr_dirty: bool,
     /// 分级显示（组合）级别：行/列 → 1..=7；不在表里表示不在任何分级里
     pub row_levels: std::collections::HashMap<u32, u8>,
     pub col_levels: std::collections::HashMap<u32, u8>,
@@ -226,6 +232,10 @@ impl Sheet {
             scenarios_dirty: false,
             ignored_errors: std::collections::HashSet::new(),
             ignored_errors_dirty: false,
+            outline_summary_below: true,
+            outline_summary_right: true,
+            outline_symbols: true,
+            outline_pr_dirty: false,
             row_levels: std::collections::HashMap::new(),
             col_levels: std::collections::HashMap::new(),
             filter_dirty: false,

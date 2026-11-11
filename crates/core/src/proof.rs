@@ -135,6 +135,93 @@ pub fn scan(sheet: &Sheet, rules: &ProofRules) -> Vec<ProofIssue> {
     out
 }
 
+/// 把一条文本按启用的规则修好（幂等：再跑一次不会再变）
+pub fn fix_text(text: &str, rules: &ProofRules) -> String {
+    let mut t = text.to_string();
+    if rules.full_width {
+        let mut out = String::with_capacity(t.len());
+        for c in t.chars() {
+            let m = match c {
+                '\u{3000}' => ' ',
+                '０'..='９' => char::from_u32(c as u32 - 0xFF10 + '0' as u32).unwrap_or(c),
+                'Ａ'..='Ｚ' => char::from_u32(c as u32 - 0xFF21 + 'A' as u32).unwrap_or(c),
+                'ａ'..='ｚ' => char::from_u32(c as u32 - 0xFF41 + 'a' as u32).unwrap_or(c),
+                _ => c,
+            };
+            out.push(m);
+        }
+        t = out;
+    }
+    if rules.double_space {
+        // 连续的半角空格压成一个
+        let mut out = String::with_capacity(t.len());
+        let mut prev_space = false;
+        for c in t.chars() {
+            if c == ' ' {
+                if prev_space {
+                    continue;
+                }
+                prev_space = true;
+            } else {
+                prev_space = false;
+            }
+            out.push(c);
+        }
+        t = out;
+    }
+    if rules.half_punct {
+        // 中文里的半角标点换成全角
+        let chars: Vec<char> = t.chars().collect();
+        let mut out = String::with_capacity(t.len());
+        for i in 0..chars.len() {
+            let c = chars[i];
+            let between_cjk = i > 0
+                && i + 1 < chars.len()
+                && is_cjk(chars[i - 1])
+                && is_cjk(chars[i + 1]);
+            if between_cjk {
+                let m = match c {
+                    ',' => '，',
+                    '.' => '。',
+                    ';' => '；',
+                    ':' => '：',
+                    '!' => '！',
+                    '?' => '？',
+                    _ => c,
+                };
+                out.push(m);
+            } else {
+                out.push(c);
+            }
+        }
+        t = out;
+    }
+    if rules.repeat_punct {
+        // 相同的中文标点连写压成一个（「……」保留）
+        let chars: Vec<char> = t.chars().collect();
+        let mut out = String::with_capacity(t.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if is_cjk_punct(c) && c != '…' {
+                out.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] == c {
+                    i += 1;
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        t = out;
+    }
+    if rules.edge_space {
+        t = t.trim().to_string();
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +265,21 @@ mod tests {
         let got = scan(&s, &ProofRules::default());
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].kind, ProofKind::HalfPunct);
+    }
+
+    #[test]
+    fn fixes_are_idempotent_and_correct() {
+        let r = ProofRules::default();
+        assert_eq!(fix_text("  前导  ", &r), "前导");
+        assert_eq!(fix_text("中间  两个空格", &r), "中间 两个空格");
+        assert_eq!(fix_text("１２３ＡＢＣ", &r), "123ABC");
+        assert_eq!(fix_text("好的。。", &r), "好的。");
+        assert_eq!(fix_text("甲,乙", &r), "甲，乙");
+        assert_eq!(fix_text("A, B", &r), "A, B", "中文之外的半角标点不动");
+        assert_eq!(fix_text("……", &r), "……", "省略号不被当成重复标点");
+        // 幂等
+        let once = fix_text("  好的。。１２３  ", &r);
+        assert_eq!(fix_text(&once, &r), once);
     }
 
     #[test]

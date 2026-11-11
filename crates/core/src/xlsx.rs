@@ -461,6 +461,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 if !lay.scenarios.is_empty() {
                     sheet.scenarios = lay.scenarios.clone();
                 }
+                if let Some((below, right, symbols)) = lay.outline_pr {
+                    sheet.outline_summary_below = below;
+                    sheet.outline_summary_right = right;
+                    sheet.outline_symbols = symbols;
+                }
                 for (c, lv) in lay.col_levels.iter() {
                     sheet.col_levels.insert(*c, *lv);
                 }
@@ -1362,6 +1367,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     if let Err(e) = crate::patch::apply_layout(path, wb) {
         eprintln!("[save] 列宽/行高写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_outline_pr(path, wb) {
+        eprintln!("[save] 分级设置写回失败: {e:#}");
     }
     if let Err(e) = crate::patch::apply_scenarios(path, wb) {
         eprintln!("[save] 方案写回失败: {e:#}");
