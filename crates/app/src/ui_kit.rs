@@ -686,7 +686,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> Response {
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
     let btn = egui::Button::new(RichText::new(label).color(TEXT).size(12.0))
         .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(179, 177, 175)))
         .corner_radius(2.0)
         .min_size(Vec2::new(75.0, 24.0));
     ui.add(btn)
@@ -856,13 +856,22 @@ impl Dlg {
             .data(|d| d.get_temp::<f32>(id.with("h")))
             .unwrap_or(self.height);
         let mut closed = false;
+        // 模态遮挡：对话框打开时吞掉背景点击
+        egui::Area::new(id.with("block"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let r = egui::Rect::from_min_size(screen.min, screen.size());
+                let resp = ui.interact(r, id.with("blocki"), egui::Sense::click_and_drag());
+                let _ = resp;
+            });
         let out = egui::Area::new(id.with("area"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
+                    .stroke(Stroke::NONE)
                     .corner_radius(4.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 4],
@@ -871,7 +880,7 @@ impl Dlg {
                         color: Color32::from_black_alpha(32),
                     })
                     .inner_margin(egui::Margin::same(0));
-                frame
+                let fr = frame
                     .show(ui, |ui| {
                         ui.set_width(w);
                         // 标题栏
@@ -942,6 +951,7 @@ impl Dlg {
                         let inner = body
                             .show(ui, |ui| {
                                 ui.set_width(w - 32.0);
+                                ui.set_max_width(w - 32.0);
                                 if h > 0.0 {
                                     egui::ScrollArea::vertical()
                                         .max_height(h)
@@ -978,8 +988,14 @@ impl Dlg {
                             }
                         }
                         (inner, tresp)
-                    })
-                    .inner
+                    });
+                ui.painter().rect_stroke(
+                    fr.response.rect.shrink(0.5),
+                    4.0,
+                    Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
+                    egui::StrokeKind::Inside,
+                );
+                fr.inner
             });
         if closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if let Some(p) = self.open {
@@ -1003,7 +1019,7 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
     let right = left + ui.available_width();
     ui.painter().line_segment(
         [egui::pos2(left, top + 26.0), egui::pos2(right, top + 26.0)],
-        Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+        Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
     );
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1021,7 +1037,7 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                     rect,
                     0.0,
                     Color32::WHITE,
-                    Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+                    Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().rect_filled(
