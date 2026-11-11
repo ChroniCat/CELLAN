@@ -1894,6 +1894,27 @@ impl SheetApp {
                             );
                         }
                     }
+                    // 无界面验收：SC_AUTOFIT="c:1" 或 "r:2"（0 基），跑自适应并打印前后尺寸
+                    if let Ok(spec) = std::env::var("SC_AUTOFIT") {
+                        let parts: Vec<&str> = spec.split(':').collect();
+                        if parts.len() == 2 {
+                            if let Ok(idx) = parts[1].trim().parse::<u32>() {
+                                if parts[0].trim() == "c" {
+                                    let before = self.wb.sheet(self.sheet_idx).cols.size(idx);
+                                    let ctx2 = ctx.clone();
+                                    self.autofit_col(&ctx2, idx);
+                                    let after = self.wb.sheet(self.sheet_idx).cols.size(idx);
+                                    eprintln!("[autofit] 列{idx} {before:.0} -> {after:.0}");
+                                } else {
+                                    let before = self.wb.sheet(self.sheet_idx).rows.size(idx);
+                                    let ctx2 = ctx.clone();
+                                    self.autofit_row(&ctx2, idx);
+                                    let after = self.wb.sheet(self.sheet_idx).rows.size(idx);
+                                    eprintln!("[autofit] 行{idx} {before:.0} -> {after:.0}");
+                                }
+                            }
+                        }
+                    }
                     if let Ok(out) = std::env::var("SC_SAVE") {
                         let target = PathBuf::from(&out);
                         // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
@@ -2426,7 +2447,7 @@ impl SheetApp {
         let filled: Vec<String> = (8..=13)
             .map(|r| self.wb.sheet(self.sheet_idx).get(r, 0).map(|c| c.value.display()).unwrap_or_default())
             .collect();
-        self.autofit_col(0);
+        self.autofit_col(ctx, 0);
         let w = self.wb.sheet(self.sheet_idx).cols.size(0);
         eprintln!("[A] 填充={filled:?} 列宽={w:.0} 粘贴={pasted} 替换后B2={replaced} ({status_find}) 表数 {before}->{} 新表={new_name} 移动后位置={moved_to}",
             self.wb.sheets.len()
@@ -3233,26 +3254,34 @@ impl SheetApp {
     }
 
     /// 按内容自适应列宽
-    fn autofit_col(&mut self, col: u32) {
-        let mut width: f32 = 40.0;
+    fn autofit_col(&mut self, ctx: &egui::Context, col: u32) {
+        let mut width: f32 = 24.0;
         let (_, _, r2, _) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
-        for r in 0..=r2.min(2000) {
-            let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, col) else { continue };
-            let text = cell.value.display();
-            if text.is_empty() {
+        for r in 0..=r2.min(5000) {
+            let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, col) else {
+                continue;
+            };
+            let st = {
+                let sh = self.wb.sheet(self.sheet_idx);
+                self.wb.styles.get(sh.style_of(r, col)).clone()
+            };
+            let txt = sheetcore::style::format_value(&cell.value, &st.format);
+            if txt.is_empty() {
                 continue;
             }
-            let size = {
-                let st = self.wb.styles.get(self.wb.sheet(self.sheet_idx).style_of(r, col));
-                if st.size > 0.0 { st.size } else { 11.0 }
-            };
-            let w: f32 = text
-                .chars()
-                .map(|ch| if (ch as u32) > 0x2e80 { size } else { size * 0.62 })
-                .sum();
-            width = width.max(w + 12.0);
+            // 和绘制用同一套字号/字族，量出来的才是真宽度
+            let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0
+                * self.paint_scale;
+            let fam = cell_family(if st.font.is_empty() { "默认" } else { &st.font });
+            let font = egui::FontId::new(if st.bold { size + 0.8 } else { size }, fam);
+            let w = ctx.fonts(|f| {
+                f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
+                    .size()
+                    .x
+            });
+            width = width.max(w + 10.0 + st.indent as f32 * size * 2.0);
         }
-        let width = width.clamp(24.0, 400.0);
+        let width = width.clamp(24.0, 1500.0);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             sh.cols.set(col, width);
@@ -3260,26 +3289,59 @@ impl SheetApp {
         }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!("{} 列宽已自适应：{:.0}px", cell_name(0, col).trim_end_matches('1'), width);
+        self.status = format!(
+            "{} 列宽已自适应：{:.0}px",
+            cell_name(0, col).trim_end_matches('1'),
+            width
+        );
     }
 
-    /// 按内容自适应行高（自动换行时按折行数算）
-    fn autofit_row(&mut self, row: u32) {
-        let sheet = self.wb.sheet(self.sheet_idx);
-        let (_, c1, _, c2) = sheet.used_bounds().unwrap_or((0, 0, 0, 0));
-        let mut lines = 1usize;
+    /// 按内容自适应行高（自动换行时按折行数算，用真实字形量）
+    fn autofit_row(&mut self, ctx: &egui::Context, row: u32) {
+        let (_, c1, _, c2) = self
+            .wb
+            .sheet(self.sheet_idx)
+            .used_bounds()
+            .unwrap_or((0, 0, 0, 0));
+        let mut best: f32 = 15.0;
         for c in c1..=c2 {
-            let Some(cell) = sheet.get(row, c) else { continue };
-            let txt = cell.value.display();
+            let Some(cell) = self.wb.sheet(self.sheet_idx).get(row, c) else {
+                continue;
+            };
+            let st = {
+                let sh = self.wb.sheet(self.sheet_idx);
+                self.wb.styles.get(sh.style_of(row, c)).clone()
+            };
+            let txt = sheetcore::style::format_value(&cell.value, &st.format);
             if txt.is_empty() {
                 continue;
             }
-            let st = self.wb.styles.get(sheet.style_of(row, c));
-            let char_w = (st.size * 0.62).max(4.0);
-            let per_line = (((sheet.cols.size(c) - 8.0) / char_w).floor() as usize).max(1);
-            lines = lines.max((txt.chars().count() + per_line - 1) / per_line);
+            let size =
+                (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0 * self.paint_scale;
+            let fam = cell_family(if st.font.is_empty() { "默认" } else { &st.font });
+            let font = egui::FontId::new(if st.bold { size + 0.8 } else { size }, fam);
+            let col_w = self.wb.sheet(self.sheet_idx).cols.size(c);
+            let h = if st.wrap {
+                ctx.fonts(|f| {
+                    f.layout(
+                        txt.clone(),
+                        font.clone(),
+                        egui::Color32::BLACK,
+                        (col_w - 6.0).max(8.0),
+                    )
+                    .size()
+                    .y
+                })
+            } else {
+                ctx.fonts(|f| {
+                    f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
+                        .size()
+                        .y
+                })
+            };
+            best = best.max(h + 5.0);
         }
-        let h = (lines as f32 * 14.0 + 5.0).clamp(15.0, 409.0);
+        let h = best.clamp(15.0, 409.0);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             sh.rows.set(row, h);
@@ -15085,7 +15147,7 @@ impl SheetApp {
                     // 双击列右边界 = 自适应列宽
                     let edge = px_of(c) + cols.size(c);
                     if resp.double_clicked() && (pos.x - edge).abs() < 5.0 {
-                        self.autofit_col(c);
+                        self.autofit_col(ui.ctx(), c);
                         return;
                     }
                     let (_, _, r2, _) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
@@ -15096,7 +15158,7 @@ impl SheetApp {
                     let r = row_at(pos.y);
                     let edge = py_of(r) + rows.size(r);
                     if resp.double_clicked() && (pos.y - edge).abs() < 5.0 {
-                        self.autofit_row(r);
+                        self.autofit_row(ui.ctx(), r);
                         return;
                     }
                     let (_, _, _, c2) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
@@ -15479,7 +15541,7 @@ impl SheetApp {
                         at: idx,
                         n: 1,
                     }),
-                    2 => self.autofit_col(idx),
+                    2 => self.autofit_col(ui.ctx(), idx),
                     3 => self.structural(sheetcore::structural::Structural::InsertRows {
                         at: idx,
                         n: 1,
@@ -15488,7 +15550,7 @@ impl SheetApp {
                         at: idx,
                         n: 1,
                     }),
-                    5 => self.autofit_row(idx),
+                    5 => self.autofit_row(ui.ctx(), idx),
                     6 => {
                         let w = self.wb.sheet(self.sheet_idx).cols.size(idx);
                         self.size_dlg = Some((true, w));
