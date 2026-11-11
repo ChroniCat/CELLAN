@@ -22,6 +22,8 @@ pub struct SheetLayout {
     pub hidden_cols: Vec<u32>,
     /// 手动隐藏的行（0-based）
     pub hidden_rows: Vec<u32>,
+    /// 方案管理器里的方案
+    pub scenarios: Vec<crate::scenarios::Scenario>,
     /// 被忽略错误的单元格（0-based）
     pub ignored_errors: Vec<(u32, u32)>,
     /// 分级显示级别（0-based 行列 → 1..=7）
@@ -133,6 +135,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         let mut xml = String::new();
         let _ = f.read_to_string(&mut xml);
         let mut lay = parse_layout(&xml);
+        lay.scenarios = crate::scenarios::parse(&xml);
         lay.cf = crate::cf::parse_cf_blocks(&xml);
         lay.dxfs = dxfs.clone();
         lay.dv = crate::dv::parse_validations(&xml);
@@ -140,6 +143,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
             || !lay.row_heights.is_empty()
+            || !lay.scenarios.is_empty()
             || !lay.ignored_errors.is_empty()
             || !lay.row_levels.is_empty()
             || !lay.col_levels.is_empty()

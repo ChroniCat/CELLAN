@@ -148,6 +148,10 @@ pub struct Sheet {
     pub hidden_cols: std::collections::HashSet<u32>,
     /// 列宽/行高/隐藏状态被改过：保存时要重写 <cols> 和行属性
     pub layout_dirty: bool,
+    /// 方案管理器里的方案（写进 <scenarios>）
+    pub scenarios: Vec<crate::scenarios::Scenario>,
+    /// 方案列表被改过
+    pub scenarios_dirty: bool,
     /// 被用户「忽略错误」的单元格（写进 <ignoredErrors>）
     pub ignored_errors: std::collections::HashSet<(u32, u32)>,
     /// 忽略列表被改过
@@ -218,6 +222,8 @@ impl Sheet {
             hidden_rows_user: std::collections::HashSet::new(),
             hidden_cols: std::collections::HashSet::new(),
             layout_dirty: false,
+            scenarios: Vec::new(),
+            scenarios_dirty: false,
             ignored_errors: std::collections::HashSet::new(),
             ignored_errors_dirty: false,
             row_levels: std::collections::HashMap::new(),

@@ -4,6 +4,7 @@ mod files;
 mod document_tasks;
 
 use document_tasks::DocumentTasks;
+use error_opts::ErrorCheckOptions;
 
 #[cfg(test)]
 mod document_tests;
@@ -13,6 +14,7 @@ mod net;
 mod office_clipboard;
 mod recent;
 mod update;
+mod error_opts;
 mod session_lock;
 mod single_instance;
 
@@ -36,7 +38,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.54";
+const APP_VERSION: &str = "1.55";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -390,6 +392,13 @@ struct SheetApp {
     goal_goal: String,
     goal_input: String,
     goal_msg: String,
+    /// 方案管理器
+    scen_dlg: bool,
+    scen_name: String,
+    scen_comment: String,
+    scen_range: String,
+    scen_msg: String,
+    scen_sel: Option<usize>,
     /// 模拟运算表对话框
     dtable_dlg: bool,
     /// 行输入引用单元格（横向表的输入格，双变量时和列输入一起用）
@@ -397,10 +406,15 @@ struct SheetApp {
     /// 列输入引用单元格（纵向表的输入格）
     dtable_col: String,
     dtable_msg: String,
-    /// 背景错误检查：错误格左上角的绿三角
-    show_error_marks: bool,
+    /// 错误检查选项（应用级，持久化到 %LOCALAPPDATA%\SheetsNative\errorcheck.ini）
+    ec: ErrorCheckOptions,
+    /// 错误检查选项对话框
+    ec_options: bool,
     /// 绿三角缓存（按 doc_gen 失效）
     error_marks: std::collections::HashSet<(u32, u32)>,
+    /// 循环引用的格子（当前表），状态栏提示用
+    cycles: Vec<(u32, u32)>,
+    cycles_key: (u64, u64),
     /// 缓存键：(doc_gen, wb_epoch)——装载和编辑都要让它失效
     error_marks_key: (u64, u64),
     /// 工作表标签条的横向滚动量
@@ -707,12 +721,21 @@ impl SheetApp {
             goal_goal: String::new(),
             goal_input: String::new(),
             goal_msg: String::new(),
+            scen_dlg: false,
+            scen_name: String::new(),
+            scen_comment: String::new(),
+            scen_range: String::new(),
+            scen_msg: String::new(),
+            scen_sel: None,
             dtable_dlg: false,
             dtable_row: String::new(),
             dtable_col: String::new(),
             dtable_msg: String::new(),
-            show_error_marks: true,
+            ec: ErrorCheckOptions::load(),
+            ec_options: false,
             error_marks: std::collections::HashSet::new(),
+            cycles: Vec::new(),
+            cycles_key: (u64::MAX, u64::MAX),
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
@@ -1225,6 +1248,9 @@ impl SheetApp {
                         Ok("about") => self.about_open = true,
                         Ok("symbol") => self.symbol_dlg = true,
                         Ok("errors") => {
+                            if std::env::var("SC_ECOPTS").is_ok() {
+                                self.ec_options = true;
+                            }
                             self.open_error_check();
                             match std::env::var("SC_IGNORE").as_deref() {
                                 Ok("all") => {
@@ -1273,6 +1299,58 @@ impl SheetApp {
                                             Err(e) => eprintln!("[goal] fail {e}"),
                                         }
                                     }
+                                }
+                            }
+                        }
+                        Ok("scen") => {
+                            // SC_SCEN_ADD="名称:A1:B1" 保存方案；SC_SCEN_SHOW=名称 应用；SC_SCEN_SUMMARY=1 生成摘要
+                            if let Ok(spec) = std::env::var("SC_SCEN_ADD") {
+                                if let Some((name, range)) = spec.split_once(':') {
+                                    if let Some(r) = SheetApp::parse_rect(range) {
+                                        let sc = sheetcore::scenarios::capture(
+                                            self.wb.sheet(self.sheet_idx),
+                                            name,
+                                            "",
+                                            r,
+                                        );
+                                        let n = sc.cells.len();
+                                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                                        sh.scenarios.push(sc);
+                                        sh.scenarios_dirty = true;
+                                        eprintln!("[scen] added {name} cells={n}");
+                                    } else {
+                                        eprintln!("[scen] bad range {range}");
+                                    }
+                                }
+                            }
+                            if let Ok(name) = std::env::var("SC_SCEN_SHOW") {
+                                let sc = self
+                                    .wb
+                                    .sheet(self.sheet_idx)
+                                    .scenarios
+                                    .iter()
+                                    .find(|x| x.name == name)
+                                    .cloned();
+                                match sc {
+                                    Some(sc) => {
+                                        for ((r, c), v) in &sc.cells {
+                                            let val = sheetcore::scenarios::apply_value(v);
+                                            let sh = self.wb.sheet_mut(self.sheet_idx);
+                                            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+                                            cell.value = val;
+                                            cell.formula = None;
+                                            sh.set(*r, *c, cell);
+                                        }
+                                        sheetcore::formula::recalc_all(&mut self.wb);
+                                        eprintln!("[scen] shown {name}");
+                                    }
+                                    None => eprintln!("[scen] not found {name}"),
+                                }
+                            }
+                            if std::env::var("SC_SCEN_SUMMARY").is_ok() {
+                                match self.build_scenario_summary() {
+                                    Ok(n) => eprintln!("[scen] summary sheet {n}"),
+                                    Err(e) => eprintln!("[scen] summary fail {e}"),
                                 }
                             }
                         }
@@ -5495,9 +5573,20 @@ impl SheetApp {
         parse_a1_ref(s.trim().trim_start_matches('$').replace('$', "").as_str())
     }
 
+    /// 按当前规则扫一遍：公式错误 / 数字存为文本 各自可以关掉
+    fn scan_issues(&self) -> Vec<sheetcore::errors::Issue> {
+        sheetcore::errors::scan_wb(&self.wb, self.sheet_idx)
+            .into_iter()
+            .filter(|i| match i.kind {
+                sheetcore::errors::IssueKind::NumberAsText => self.ec.check_text,
+                _ => self.ec.check_errors,
+            })
+            .collect()
+    }
+
     /// 打开错误检查：重扫一遍当前表
     fn open_error_check(&mut self) {
-        self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+        self.error_list = self.scan_issues();
         self.error_dlg = true;
         self.status = if self.error_list.is_empty() {
             "这张表没发现错误".into()
@@ -5515,6 +5604,7 @@ impl SheetApp {
         let mut ignore_sel = false;
         let mut ignore_all = false;
         let mut reset_ignored = false;
+        let mut options_clicked = false;
         ui_kit::window(ctx, "错误检查", 600.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -5577,8 +5667,11 @@ impl SheetApp {
                     if ui.button("重置忽略").clicked() {
                         reset_ignored = true;
                     }
+                    if ui.button("选项…").clicked() {
+                        options_clicked = true;
+                    }
                     if ui.button("重新检查").clicked() {
-                        self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+                        self.error_list = self.scan_issues();
                     }
                     if ui_kit::primary_button(ui, "关闭").clicked() {
                         self.error_dlg = false;
@@ -5597,7 +5690,7 @@ impl SheetApp {
             sh.ignored_errors_dirty = true;
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+            self.error_list = self.scan_issues();
             self.status = format!("已忽略 {} 的错误", sheetcore::model::cell_name(r, c));
         }
         if ignore_all {
@@ -5615,6 +5708,9 @@ impl SheetApp {
             self.error_list.clear();
             self.status = format!("已忽略 {n} 处错误");
         }
+        if options_clicked {
+            self.ec_options = true;
+        }
         if reset_ignored {
             {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -5623,12 +5719,340 @@ impl SheetApp {
             }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.error_list = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx);
+            self.error_list = self.scan_issues();
             self.status = "已重置忽略的错误".into();
         }
         if !open {
             self.error_dlg = false;
         }
+    }
+
+    /// 错误检查选项：背景检查开关、标记颜色、两条规则的开关（Excel「错误检查选项」那一页）
+    fn ec_options_window(&mut self, ctx: &egui::Context) {
+        if !self.ec_options {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut reset_all = false;
+        ui_kit::window(ctx, "错误检查选项", 470.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if ui
+                    .checkbox(&mut self.ec.background, "启用背景错误检查（在单元格左上角标出来）")
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.add_sized([80.0, 20.0], egui::Label::new("标记颜色:"));
+                    for (name, rgb) in [
+                        ("绿", [40u8, 160, 40]),
+                        ("红", [200, 40, 40]),
+                        ("蓝", [40, 80, 200]),
+                        ("橙", [210, 120, 20]),
+                    ] {
+                        let on = self.ec.color == rgb;
+                        if ui.selectable_label(on, name).clicked() {
+                            self.ec.color = rgb;
+                            changed = true;
+                        }
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            r,
+                            2.0,
+                            Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("检查规则").size(12.0).strong());
+                if ui
+                    .checkbox(&mut self.ec.check_errors, "公式错误（#DIV/0!、#N/A、#NAME? 等）")
+                    .changed()
+                {
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut self.ec.check_text, "数字以文本形式存储")
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.add_space(6.0);
+                if ui.button("重置所有忽略的错误").clicked() {
+                    reset_all = true;
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        self.ec_options = false;
+                    }
+                });
+            });
+        if reset_all {
+            {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.ignored_errors.clear();
+                sh.ignored_errors_dirty = true;
+            }
+            self.wb.dirty = true;
+            changed = true;
+            self.status = "已重置本表忽略的错误".into();
+        }
+        if changed {
+            self.ec.save();
+            self.error_marks_key = (u64::MAX, u64::MAX);
+            if self.error_dlg {
+                self.error_list = self.scan_issues();
+            }
+        }
+        if !open {
+            self.ec_options = false;
+        }
+    }
+
+    /// 方案管理器：保存/显示/删除/摘要
+    fn scenario_window(&mut self, ctx: &egui::Context) {
+        if !self.scen_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut do_add = false;
+        let mut do_show = false;
+        let mut do_del = false;
+        let mut do_summary = false;
+        let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
+        let mut sel = self.scen_sel;
+        ui_kit::window(ctx, "方案管理器", 580.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("这张表里保存的方案（点一条可以装载到下面的名称/备注）")
+                        .size(11.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(3.0);
+                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                    if list.is_empty() {
+                        ui.label(egui::RichText::new("还没有方案").size(11.5));
+                    }
+                    for (i, sc) in list.iter().enumerate() {
+                        let mut label = format!("{}（{} 个单元格）", sc.name, sc.cells.len());
+                        if !sc.comment.is_empty() {
+                            label.push_str(&format!(" — {}", sc.comment));
+                        }
+                        if ui.selectable_label(sel == Some(i), label).clicked() {
+                            sel = Some(i);
+                            self.scen_name = sc.name.clone();
+                            self.scen_comment = sc.comment.clone();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 20.0], egui::Label::new("名称:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.scen_name).desired_width(240.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 20.0], egui::Label::new("备注:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.scen_comment).desired_width(240.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 20.0], egui::Label::new("可变单元格:"));
+                    ui.add(egui::TextEdit::singleline(&mut self.scen_range).desired_width(120.0));
+                    ui.label(
+                        egui::RichText::new("例如 A1:C3")
+                            .size(11.0)
+                            .color(ui_kit::TEXT_WEAK),
+                    );
+                });
+                if !self.scen_msg.is_empty() {
+                    ui.add_space(3.0);
+                    ui.label(egui::RichText::new(&self.scen_msg).size(11.5));
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui.button("添加/修改").clicked() {
+                        do_add = true;
+                    }
+                    if ui.add_enabled(sel.is_some(), egui::Button::new("显示")).clicked() {
+                        do_show = true;
+                    }
+                    if ui.add_enabled(sel.is_some(), egui::Button::new("删除")).clicked() {
+                        do_del = true;
+                    }
+                    if ui.button("摘要").clicked() {
+                        do_summary = true;
+                    }
+                    if ui_kit::primary_button(ui, "关闭").clicked() {
+                        self.scen_dlg = false;
+                    }
+                });
+            });
+        self.scen_sel = sel;
+        let rect = Self::parse_rect(&self.scen_range);
+        if do_add {
+            match (rect, self.scen_name.trim().is_empty()) {
+                (Some(r), false) => {
+                    let name = self.scen_name.trim().to_string();
+                    let comment = self.scen_comment.trim().to_string();
+                    let sc = sheetcore::scenarios::capture(
+                        self.wb.sheet(self.sheet_idx),
+                        &name,
+                        &comment,
+                        r,
+                    );
+                    let n = sc.cells.len();
+                    {
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        if let Some(pos) = sh.scenarios.iter().position(|x| x.name == name) {
+                            sh.scenarios[pos] = sc;
+                        } else {
+                            sh.scenarios.push(sc);
+                        }
+                        sh.scenarios_dirty = true;
+                    }
+                    self.wb.dirty = true;
+                    self.scen_msg = format!("已保存方案「{name}」（{n} 个单元格）");
+                    self.status = format!("方案「{name}」已保存");
+                }
+                (None, _) => self.scen_msg = "可变单元格地址写错了（例如 A1:C3）".into(),
+                (_, true) => self.scen_msg = "名称不能为空".into(),
+            }
+        }
+        if do_show {
+            if let Some(i) = self.scen_sel {
+                if let Some(sc) = self.wb.sheet(self.sheet_idx).scenarios.get(i).cloned() {
+                    for ((r, c), v) in &sc.cells {
+                        let val = sheetcore::scenarios::apply_value(v);
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+                        cell.value = val;
+                        cell.formula = None;
+                        sh.set(*r, *c, cell);
+                    }
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                    sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[]);
+                    sheetcore::formula::recalc_all(&mut self.wb);
+                    self.scen_msg = format!("已显示方案「{}」", sc.name);
+                    self.status = format!("已切换到方案「{}」", sc.name);
+                }
+            }
+        }
+        if do_del {
+            if let Some(i) = self.scen_sel {
+                let removed = {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    if i < sh.scenarios.len() {
+                        let n = sh.scenarios.remove(i).name;
+                        sh.scenarios_dirty = true;
+                        Some(n)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(n) = removed {
+                    self.wb.dirty = true;
+                    self.scen_sel = None;
+                    self.scen_msg = format!("已删除方案「{n}」");
+                }
+            }
+        }
+        if do_summary {
+            match self.build_scenario_summary() {
+                Ok(name) => {
+                    self.scen_msg = format!("已在「{name}」里生成摘要");
+                    self.status = format!("方案摘要已生成：{name}");
+                }
+                Err(e) => self.scen_msg = e,
+            }
+        }
+        if !open {
+            self.scen_dlg = false;
+        }
+    }
+
+    /// "A1:C3" / "A1" → (r1, c1, r2, c2)
+    fn parse_rect(s: &str) -> Option<(u32, u32, u32, u32)> {
+        let t = s.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if let Some(r) = sheetcore::table::parse_a1(t) {
+            return Some(r);
+        }
+        parse_a1_ref(t).map(|(r, c)| (r, c, r, c))
+    }
+
+    /// 生成「方案摘要」：直接写在本表已用区域下方（Excel 会新建一个工作表，
+    /// 但我们的保存链对「临时新增工作表」还不够稳，先落在本表，功能不打折）。
+    fn build_scenario_summary(&mut self) -> Result<String, String> {
+        let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
+        if list.is_empty() {
+            return Err("还没有方案，先保存一个".into());
+        }
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        for sc in &list {
+            for (k, _) in &sc.cells {
+                if !keys.contains(k) {
+                    keys.push(*k);
+                }
+            }
+        }
+        keys.sort();
+        let top = self
+            .wb
+            .sheet(self.sheet_idx)
+            .used_bounds()
+            .map(|(_, _, r2, _)| r2 + 2)
+            .unwrap_or(0);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let mut put = |r: u32, c: u32, v: sheetcore::model::Value| {
+                sh.set(
+                    r,
+                    c,
+                    sheetcore::model::Cell {
+                        value: v,
+                        formula: None,
+                    },
+                );
+            };
+            put(
+                top,
+                0,
+                sheetcore::model::Value::Text("方案摘要".into()),
+            );
+            for (i, (r, c)) in keys.iter().enumerate() {
+                put(
+                    top + 1,
+                    i as u32 + 1,
+                    sheetcore::model::Value::Text(cell_name(*r, *c).into()),
+                );
+            }
+            for (i, sc) in list.iter().enumerate() {
+                let row = top + 2 + i as u32;
+                put(row, 0, sheetcore::model::Value::Text(sc.name.clone().into()));
+                for (j, k) in keys.iter().enumerate() {
+                    let v = sc
+                        .cells
+                        .iter()
+                        .find(|(kk, _)| kk == k)
+                        .map(|(_, v)| sheetcore::scenarios::apply_value(v))
+                        .unwrap_or_default();
+                    put(row, j as u32 + 1, v);
+                }
+            }
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let last = top + 1 + list.len() as u32;
+        Ok(format!("{}:{}", cell_name(top, 0), cell_name(last, keys.len() as u32)))
     }
 
     fn goal_window(&mut self, ctx: &egui::Context) {
@@ -8102,13 +8526,28 @@ impl SheetApp {
                     self.goal_msg.clear();
                     self.goal_dlg = true;
                 }
-                if ui_kit::labeled_w(ui, Icon::Grid, "模拟运算表", 110.0, "列式单变量敏感性表")
+                if ui_kit::labeled_w(ui, Icon::Grid, "模拟运算表", 110.0, "单变量 / 双变量敏感性表")
                     .clicked()
                 {
                     self.dtable_row.clear();
                     self.dtable_col.clear();
                     self.dtable_msg.clear();
                     self.dtable_dlg = true;
+                }
+                if ui_kit::labeled_w(ui, Icon::Table, "方案管理器", 110.0, "保存/切换多套输入值")
+                    .clicked()
+                {
+                    let (r1, c1, r2, c2) = self.sel_rect();
+                    self.scen_range = if r1 == r2 && c1 == c2 {
+                        cell_name(r1, c1)
+                    } else {
+                        format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                    };
+                    self.scen_name.clear();
+                    self.scen_comment.clear();
+                    self.scen_msg.clear();
+                    self.scen_sel = None;
+                    self.scen_dlg = true;
                 }
             });
         });
@@ -9432,7 +9871,7 @@ impl SheetApp {
             draw_edge(painter, egui::pos2(l, t), egui::pos2(rr, t), &bd[2]);
             draw_edge(painter, egui::pos2(l, bb), egui::pos2(rr, bb), &bd[3]);
         }
-        if self.show_error_marks && self.error_marks.contains(&(r, c)) {
+        if self.ec.background && self.error_marks.contains(&(r, c)) {
             // Excel 的背景错误标记：单元格左上角一个 5px 的绿三角
             let s = 5.0;
             painter.add(egui::Shape::convex_polygon(
@@ -9441,7 +9880,7 @@ impl SheetApp {
                     rect.left_top() + egui::vec2(s, 0.0),
                     rect.left_top() + egui::vec2(0.0, s),
                 ],
-                Color32::from_rgb(40, 160, 40),
+                Color32::from_rgb(self.ec.color[0], self.ec.color[1], self.ec.color[2]),
                 Stroke::NONE,
             ));
         }
@@ -15324,12 +15763,16 @@ impl eframe::App for SheetApp {
             self.chart_auto = false;
         }
         // 背景错误检查：按文档代次刷新绿三角缓存（关掉开关就不算）
-        if self.show_error_marks && self.error_marks_key != (self.doc_gen, self.wb_epoch) {
-            self.error_marks = sheetcore::errors::scan_wb(&self.wb, self.sheet_idx)
+        if self.ec.background && self.error_marks_key != (self.doc_gen, self.wb_epoch) {
+            self.error_marks = self.scan_issues()
                 .into_iter()
                 .map(|i| (i.row, i.col))
                 .collect();
             self.error_marks_key = (self.doc_gen, self.wb_epoch);
+        }
+        if self.cycles_key != (self.doc_gen, self.wb_epoch) {
+            self.cycles = sheetcore::errors::find_cycles(&self.wb, self.sheet_idx);
+            self.cycles_key = (self.doc_gen, self.wb_epoch);
         }
         let was_saving = self.has_pending_save();
         self.poll_net();
@@ -15425,8 +15868,10 @@ impl eframe::App for SheetApp {
         self.about_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
+        self.ec_options_window(ctx);
         self.goal_window(ctx);
         self.dtable_window(ctx);
+        self.scenario_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
         self.password_prompt_ui(ctx);
@@ -15957,6 +16402,36 @@ impl eframe::App for SheetApp {
                             .size(11.0)
                             .color(ui_kit::TEXT),
                     );
+                    // 循环引用：Excel 在状态栏用红字提示「循环引用: C3」，点一下可以跳过去
+                    if !self.cycles.is_empty() {
+                        let c0 = self.cycles[0];
+                        let txt = if self.cycles.len() > 1 {
+                            format!(
+                                "循环引用: {} 等 {} 格",
+                                cell_name(c0.0, c0.1),
+                                self.cycles.len()
+                            )
+                        } else {
+                            format!("循环引用: {}", cell_name(c0.0, c0.1))
+                        };
+                        ui.add_space(10.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(txt)
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(200, 30, 30)),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("点击跳到参与循环的单元格")
+                            .clicked()
+                        {
+                            self.sel = c0;
+                            self.sel_end = c0;
+                            self.ensure_visible();
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         // 缩放百分比

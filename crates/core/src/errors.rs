@@ -168,6 +168,91 @@ pub fn scan_wb(wb: &crate::model::Workbook, si: usize) -> Vec<Issue> {
     out
 }
 
+/// 找循环引用：在「公式格 → 它引用的公式格」这张图上做 DFS，遇到回边就把环上的格子标出来。
+/// 公式太多（> 20000）时直接返回空，避免每次编辑都全量解析。
+pub fn find_cycles(wb: &crate::model::Workbook, si: usize) -> Vec<(u32, u32)> {
+    use std::collections::HashMap;
+    let sheet = wb.sheet(si);
+    let formulas: Vec<(u32, u32)> = sheet
+        .iter()
+        .filter(|(_, c)| c.formula.is_some())
+        .map(|(k, _)| (k.row, k.col))
+        .collect();
+    if formulas.is_empty() || formulas.len() > 20_000 {
+        return Vec::new();
+    }
+    let idx: HashMap<(u32, u32), usize> = formulas
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (*k, i))
+        .collect();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); formulas.len()];
+    for (i, (r, c)) in formulas.iter().enumerate() {
+        let Some(f) = sheet.get(*r, *c).and_then(|x| x.formula.clone()) else {
+            continue;
+        };
+        for rect in crate::formula::deps::refs_of(wb, si, &f) {
+            if rect.sheet != si {
+                continue;
+            }
+            let (r1, c1) = (rect.r1.max(0) as u32, rect.c1.max(0) as u32);
+            let (r2, c2) = (rect.r2.max(0) as u32, rect.c2.max(0) as u32);
+            // 整列/整行引用会扫到几十万格，只在合理范围内枚举
+            if (r2 - r1) as u64 * (c2 - c1) as u64 > 100_000 {
+                continue;
+            }
+            for rr in r1..=r2 {
+                for cc in c1..=c2 {
+                    if let Some(j) = idx.get(&(rr, cc)) {
+                        adj[i].push(*j);
+                    }
+                }
+            }
+        }
+    }
+    let n = formulas.len();
+    let mut color = vec![0u8; n]; // 0 未访问 / 1 在栈上 / 2 已完成
+    let mut cyc = vec![false; n];
+    for s0 in 0..n {
+        if color[s0] != 0 {
+            continue;
+        }
+        color[s0] = 1;
+        let mut stack: Vec<usize> = vec![s0];
+        let mut next: Vec<usize> = vec![0];
+        while let Some(&u) = stack.last() {
+            let k = *next.last().unwrap();
+            if k < adj[u].len() {
+                *next.last_mut().unwrap() += 1;
+                let v = adj[u][k];
+                if color[v] == 1 {
+                    if let Some(pos) = stack.iter().position(|x| *x == v) {
+                        for &w in &stack[pos..] {
+                            cyc[w] = true;
+                        }
+                    }
+                } else if color[v] == 0 {
+                    color[v] = 1;
+                    stack.push(v);
+                    next.push(0);
+                }
+            } else {
+                color[u] = 2;
+                stack.pop();
+                next.pop();
+            }
+        }
+    }
+    let mut out: Vec<(u32, u32)> = formulas
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| cyc[*i])
+        .map(|(_, k)| *k)
+        .collect();
+    out.sort();
+    out
+}
+
 /// 只扫错误值（不含「数字存为文本」）——画绿色小三角时用
 pub fn scan_errors(sheet: &Sheet) -> Vec<Issue> {
     scan(sheet)
@@ -213,6 +298,40 @@ mod tests {
             .filter(|i| i.kind == IssueKind::NumberAsText)
             .count();
         assert_eq!(got, 3);
+    }
+
+    #[test]
+    fn finds_circular_references() {
+        let mut s = Sheet::new("S");
+        let mut wb = crate::model::Workbook::default();
+        wb.sheets.push(s.clone());
+        s.set(
+            0,
+            0,
+            Cell {
+                value: Value::Empty,
+                formula: Some("A1+1".into()),
+            },
+        );
+        s.set(
+            0,
+            1,
+            Cell {
+                value: Value::Empty,
+                formula: Some("C1".into()),
+            },
+        );
+        s.set(
+            0,
+            2,
+            Cell {
+                value: Value::Empty,
+                formula: Some("B1".into()),
+            },
+        );
+        wb.sheets[0] = s;
+        let got = find_cycles(&wb, 0);
+        assert_eq!(got, vec![(0, 0), (0, 1), (0, 2)], "{got:?}");
     }
 
     #[test]

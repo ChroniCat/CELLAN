@@ -458,6 +458,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 for (r, c) in lay.ignored_errors.iter() {
                     sheet.ignored_errors.insert((*r, *c));
                 }
+                if !lay.scenarios.is_empty() {
+                    sheet.scenarios = lay.scenarios.clone();
+                }
                 for (c, lv) in lay.col_levels.iter() {
                     sheet.col_levels.insert(*c, *lv);
                 }
@@ -1359,6 +1362,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     if let Err(e) = crate::patch::apply_layout(path, wb) {
         eprintln!("[save] 列宽/行高写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_scenarios(path, wb) {
+        eprintln!("[save] 方案写回失败: {e:#}");
     }
     if let Err(e) = crate::patch::apply_ignored_errors(path, wb) {
         eprintln!("[save] 忽略错误列表写回失败: {e:#}");

@@ -2096,6 +2096,32 @@ pub fn set_ignored_errors(xml: &str, cells: &[(u32, u32)]) -> String {
     x
 }
 
+/// 保存收尾：把方案列表写回各表（`<scenarios>`）
+pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, Vec<crate::scenarios::Scenario>> =
+        std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if !s.scenarios_dirty {
+            continue;
+        }
+        if let Some(part) = targets.get(&s.name) {
+            map.insert(part.clone(), s.scenarios.clone());
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_zip(path, |name, buf| {
+        if let Some(list) = map.get(name) {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                return crate::scenarios::set_scenarios(&xml, list).into_bytes();
+            }
+        }
+        buf
+    })
+}
+
 /// 保存收尾：把忽略错误列表写回各表
 pub fn apply_ignored_errors(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let targets = sheet_targets(path)?;
