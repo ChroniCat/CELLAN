@@ -5393,6 +5393,11 @@ impl SheetApp {
 
     /// 自动求和：当前格上方连续数字 → =SUM(首:末)
     fn auto_sum(&mut self) {
+        self.auto_func("SUM");
+    }
+
+    /// 自动求和 / 平均值 / 计数：都按「上方连续非空区域」生成公式
+    fn auto_func(&mut self, func: &str) {
         let (r, c) = self.sel;
         let sheet = self.wb.sheet(self.sheet_idx);
         let mut top = r;
@@ -5408,15 +5413,80 @@ impl SheetApp {
             }
         }
         let formula = if top < r {
-            format!("=SUM({}:{})", cell_name(top, c), cell_name(r - 1, c))
+            format!("={func}({}:{})", cell_name(top, c), cell_name(r - 1, c))
         } else {
-            "=SUM(".to_string()
+            format!("={func}(")
         };
         self.begin_edit(None);
         if let Some(ed) = self.editing.as_mut() {
             ed.buf = formula;
         }
         self.commit_edit(Some((1, 0)));
+    }
+
+    /// 只清内容，保留格式/批注（Excel「清除内容」）
+    fn clear_values(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let txn = self.txn_begin(&keys);
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                self.wb.sheet_mut(self.sheet_idx).set(
+                    r,
+                    c,
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Empty,
+                        formula: None,
+                    },
+                );
+            }
+        }
+        self.txn_end("清除内容", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = "已清除内容".into();
+    }
+
+    /// 单元格样式库的 5 个预设（真写入 CellStyle）
+    fn apply_style_preset(&mut self, kind: &str) {
+        match kind {
+            "normal" => self.apply_style(|s| {
+                let f = s.font.clone();
+                *s = sheetcore::style::CellStyle {
+                    font: f,
+                    size: 11.0,
+                    color: [0, 0, 0],
+                    ..Default::default()
+                };
+            }),
+            "title" => self.apply_style(|s| {
+                s.bold = true;
+                s.italic = false;
+                s.size = 14.0;
+                s.color = [31, 78, 121];
+                s.fill = None;
+            }),
+            "heading" => self.apply_style(|s| {
+                s.bold = true;
+                s.size = 11.0;
+                s.color = [31, 56, 100];
+                s.fill = Some([217, 226, 243]);
+            }),
+            "good" => self.apply_style(|s| {
+                s.bold = false;
+                s.color = [0, 97, 0];
+                s.fill = Some([198, 239, 206]);
+            }),
+            "bad" => self.apply_style(|s| {
+                s.bold = false;
+                s.color = [156, 0, 6];
+                s.fill = Some([255, 199, 206]);
+            }),
+            _ => {}
+        }
     }
 
     /// 填充：把选区第一行复制到其余行（值、公式、样式）
@@ -15154,6 +15224,17 @@ impl SheetApp {
                     let c = cols.index_at((off_x + pos.x - (origin.x + head_w) - 1.0).max(0.0));
                     // 双击列右边界 = 自适应列宽
                     let edge = px_of(c) + cols.size(c);
+                    if std::env::var("SC_HIT_LOG").is_ok() {
+                        eprintln!(
+                            "[head] 双击? dbl={} pos=({:.0},{:.0}) c={} edge={:.0} dist={:.1}",
+                            resp.double_clicked(),
+                            pos.x,
+                            pos.y,
+                            c,
+                            edge,
+                            (pos.x - edge).abs()
+                        );
+                    }
                     if resp.double_clicked() && (pos.x - edge).abs() < 5.0 {
                         self.autofit_col(ui.ctx(), c);
                         return;
@@ -15165,6 +15246,17 @@ impl SheetApp {
                 } else if in_head_x {
                     let r = row_at(pos.y);
                     let edge = py_of(r) + rows.size(r);
+                    if std::env::var("SC_HIT_LOG").is_ok() {
+                        eprintln!(
+                            "[head] 双击? dbl={} pos=({:.0},{:.0}) r={} edge={:.0} dist={:.1}",
+                            resp.double_clicked(),
+                            pos.x,
+                            pos.y,
+                            r,
+                            edge,
+                            (pos.y - edge).abs()
+                        );
+                    }
                     if resp.double_clicked() && (pos.y - edge).abs() < 5.0 {
                         self.autofit_row(ui.ctx(), r);
                         return;
