@@ -69,6 +69,10 @@ pub enum Icon {
     Eraser,
     /// 清除格式：A + 橡皮
     ClearFmt,
+    /// 增加缩进
+    IndentInc,
+    /// 减少缩进
+    IndentDec,
 }
 
 // ---------------------------------------------------------------- 色板
@@ -596,6 +600,20 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(4.4, 5.6, 15.2, 2.8, BLUE);
             pen.bar(4.4, 9.8, 10.6, 2.8, ORANGE);
             pen.bar(4.4, 14.0, 6.4, 2.8, GREEN);
+        }
+        IndentInc => {
+            for i in 0..4 {
+                pen.bar(8.2, 5.6 + i as f32 * 4.0, 12.0, 1.6, if i < 2 { GRAY_D } else { INK });
+            }
+            pen.bar(3.4, 11.2, 5.4, 1.7, BLUE);
+            pen.arrow((9.4, 12.0), (1.0, 0.0), 3.0, BLUE);
+        }
+        IndentDec => {
+            for i in 0..4 {
+                pen.bar(3.4, 5.6 + i as f32 * 4.0, 12.0, 1.6, if i < 2 { GRAY_D } else { INK });
+            }
+            pen.bar(15.2, 11.2, 5.4, 1.7, BLUE);
+            pen.arrow((14.6, 12.0), (-1.0, 0.0), 3.0, BLUE);
         }
         ClearFmt => {
             pen.text("A", 11.0, 8.6, 10.4, INK);

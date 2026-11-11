@@ -35,6 +35,8 @@ const ROW_H: f32 = 19.0;
 const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
+/// 发行版本号（与 packaging/使用说明.txt 同步改）
+const APP_VERSION: &str = "1.49";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -351,6 +353,8 @@ struct SheetApp {
     show_gridlines: bool,
     show_headings: bool,
     show_formula_bar: bool,
+    /// 关于窗口
+    about_open: bool,
     /// 工作表标签条的横向滚动量
     tab_scroll: f32,
     /// 拖表头边界改列宽：(列, 按下时的鼠标 x, 按下时的宽度)
@@ -639,6 +643,7 @@ impl SheetApp {
             show_gridlines: std::env::var("SC_VIEW_OFF").is_err(),
             show_headings: std::env::var("SC_VIEW_OFF").is_err(),
             show_formula_bar: true,
+            about_open: false,
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
             head_menu: None,
@@ -1109,6 +1114,7 @@ impl SheetApp {
                             self.chart_mgr = true;
                             self.reload_charts();
                         }
+                        Ok("about") => self.about_open = true,
                         _ => {}
                     }
                     // 无界面验收：SC_REV_REVERT=N 撤回倒数第 N 条修订
@@ -5185,6 +5191,75 @@ impl SheetApp {
         }
     }
 
+    /// 关于窗口：版本、协作方式、常用快捷键、许可
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        ui_kit::window(ctx, "关于 Sheets Native", 520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Sheets Native").size(20.0).color(ui_kit::TEXT));
+                ui.label(
+                    egui::RichText::new(format!("版本 {}（内部测试版）", APP_VERSION))
+                        .size(11.5)
+                        .color(ui_kit::TEXT_WEAK),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "单个原生应用：打开、编辑、保存 .xlsx/.xlsm/.xls/.csv；协作走共享盘或局域网，不需要服务器；同一单元格同一时间只允许一人编辑。",
+                        )
+                        .size(12.0),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("常用快捷键").size(12.5).strong());
+                for (k, v) in [
+                    ("Ctrl+S / Ctrl+Shift+S", "保存 / 另存为"),
+                    ("Ctrl+C / Ctrl+X / Ctrl+V", "复制 / 剪切 / 粘贴"),
+                    ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
+                    ("Ctrl+B / Ctrl+I / Ctrl+U", "加粗 / 斜体 / 下划线"),
+                    ("Ctrl+1", "设置单元格格式"),
+                    ("Ctrl+F", "查找与替换"),
+                    ("Alt", "显示页签快捷键提示"),
+                    ("Ctrl+滚轮", "缩放"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(170.0, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(k).size(11.5).monospace());
+                            },
+                        );
+                        ui.label(egui::RichText::new(v).size(11.5));
+                    });
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "内嵌字体为 SIL OFL 1.1；第三方依赖许可见随包的 THIRD_PARTY_NOTICES.txt。",
+                        )
+                        .size(11.0)
+                        .color(ui_kit::TEXT_WEAK),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+            });
+        if !open {
+            self.about_open = false;
+        }
+    }
+
     /// 选择性粘贴对话框
     fn paste_special_dialog(&mut self, ctx: &egui::Context) {
         if !self.paste_special {
@@ -6239,6 +6314,13 @@ impl SheetApp {
                             self.apply_style(move |s| s.halign = val);
                         }
                     }
+                    // Excel 的减少/增加缩进（1 级 = 2 个字宽，写进 xlsx 的 IndentLevel）
+                    if ui_kit::small(ui, Icon::IndentDec, "减少缩进").clicked() {
+                        self.apply_style(|s| s.indent = s.indent.saturating_sub(1));
+                    }
+                    if ui_kit::small(ui, Icon::IndentInc, "增加缩进").clicked() {
+                        self.apply_style(|s| s.indent = (s.indent + 1).min(15));
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui_kit::labeled_w_on(ui, Icon::Wrap, "自动换行", 74.0, cur.wrap, "自动换行").clicked() {
@@ -6945,6 +7027,20 @@ impl SheetApp {
                         .color(ui_kit::TEXT_WEAK),
                 );
             });
+        });
+    }
+
+    /// 帮助页签：使用说明 / 关于（Excel 的「帮助」页签就这两个入口）
+    fn ribbon_help(&mut self, ui: &mut egui::Ui) {
+        ui_kit::group(ui, "帮助", |ui| {
+            if ui_kit::big(ui, Icon::Comment, "使用说明").clicked() {
+                self.about_open = true;
+            }
+        });
+        ui_kit::group(ui, "关于", |ui| {
+            if ui_kit::big(ui, Icon::Sheet, "关于").clicked() {
+                self.about_open = true;
+            }
         });
     }
 
@@ -13669,6 +13765,7 @@ impl eframe::App for SheetApp {
         self.rich_dialog(ctx);
         self.hyperlink_dialog(ctx);
         self.paste_special_dialog(ctx);
+        self.about_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
         self.password_prompt_ui(ctx);
@@ -13709,14 +13806,14 @@ impl eframe::App for SheetApp {
                     |ui| {
                         ui.add_space(12.0);
                         for (i, name) in
-                            ["文件", "开始", "插入", "页面布局", "公式", "数据", "审阅", "视图"]
+                            ["文件", "开始", "插入", "页面布局", "公式", "数据", "审阅", "视图", "帮助"]
                                 .iter()
                                 .enumerate()
                         {
                             let tab_resp =
                                 ui_kit::tab_ex(ui, name, self.ribbon_tab == i && i != 0, i == 0);
                             if self.keytips {
-                                let letters = ["F", "H", "N", "P", "M", "A", "R", "W"];
+                                let letters = ["F", "H", "N", "P", "M", "A", "R", "W", "H"];
                                 let r = tab_resp.rect;
                                 let b = Rect::from_center_size(
                                     egui::pos2(r.center().x, r.top() + 6.0),
@@ -13829,6 +13926,7 @@ impl eframe::App for SheetApp {
                                 6 => self.ribbon_review(ui),
                                 100 => self.ribbon_table(ui),
                                 101 => self.ribbon_chart(ui),
+                                8 => self.ribbon_help(ui),
                                 _ => self.ribbon_view(ui),
                             }
                         });
