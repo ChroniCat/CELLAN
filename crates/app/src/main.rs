@@ -6900,7 +6900,7 @@ impl SheetApp {
         let Some(mut d) = self.rich_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        ui_kit::window(ctx, "富文本", 420.0).show(ctx, |ui| {
+        ui_kit::window(ctx, "富文本", 420.0).open(&mut open).show(ctx, |ui| {
             ui.label("先选中文字，再点下面的按钮；不选表示整格");
             let text = sheetcore::richtext::runs_text(&d.runs);
             let mut buf = text.clone();
@@ -8514,7 +8514,7 @@ impl SheetApp {
         let mut open = true;
         let mut apply = false;
         let title = if d.unprotect { "撤销工作表保护" } else { "保护工作表" };
-        ui_kit::window(ctx, title, 320.0).show(ctx, |ui| {
+        ui_kit::window(ctx, title, 320.0).open(&mut open).show(ctx, |ui| {
             ui.add_space(4.0);
             ui.label(if d.unprotect {
                 "输入保护密码（没有密码直接确定）"
@@ -8595,7 +8595,7 @@ impl SheetApp {
         let mut open = true;
         let mut apply = false;
         let title = if is_col { "列宽" } else { "行高" };
-        ui_kit::window(ctx, title, 260.0).show(ctx, |ui| {
+        ui_kit::window(ctx, title, 260.0).open(&mut open).show(ctx, |ui| {
             ui.add_space(4.0);
             ui_kit::field(ui, "像素", |ui| {
                 let range = if is_col { 8.0..=1500.0 } else { 4.0..=409.0 };
@@ -10905,11 +10905,12 @@ impl SheetApp {
             });
         }
         let mut crit_close = false;
+        let mut crit_open = true;
         if let Some((op, v1, v2)) = st.crit_dlg.clone() {
             let mut a = v1.clone();
             let mut b = v2.clone();
             let mut ok = false;
-            ui_kit::window(ctx, "自定义自动筛选方式", 360.0).show(ctx, |ui| {
+            ui_kit::window(ctx, "自定义自动筛选方式", 360.0).open(&mut crit_open).show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(format!("显示行：{}", op.label()))
                         .size(12.0),
@@ -11032,6 +11033,9 @@ impl SheetApp {
         if cancel {
             self.filter_popup = None;
             return;
+        }
+        if !crit_open {
+            crit_close = true;
         }
         if crit_close {
             self.filter_popup = None;
@@ -16236,7 +16240,9 @@ impl SheetApp {
         }
         let mut open_wanted: Option<PathBuf> = None;
         let mut close = false;
+        let mut open = true;
         ui_kit::window(ctx, "开始", 460.0)
+            .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
@@ -16286,6 +16292,9 @@ impl SheetApp {
                     }
                 });
             });
+        if !open {
+            close = true;
+        }
         if let Some(p) = open_wanted {
             self.show_start = false;
             self.open_path(p);

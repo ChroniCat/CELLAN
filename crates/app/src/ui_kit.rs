@@ -776,39 +776,224 @@ pub fn sheet_tab(
     resp
 }
 
-/// 统一样式的对话框窗口：固定内边距、首次出现在屏幕中间、可拖动、
-/// 不折叠。宽度由调用方给（同一类对话框用同一个宽度）。
-pub fn window<'a>(
-    ctx: &egui::Context,
-    title: impl Into<String>,
+/// 统一样式的对话框窗口：自绘标题栏（左对齐标题 + 关闭按钮 + 可拖动），
+/// 白底、1px 边框、圆角、投影；不再使用 egui 自带标题栏。
+pub struct Dlg {
+    title: String,
     width: f32,
-) -> egui::Window<'a> {
-    let title = title.into();
-    let screen = ctx.screen_rect();
-    let pos = screen.center() - egui::vec2(width / 2.0, 200.0);
-    egui::Window::new(title.clone())
-        .id(egui::Id::new(("dlg", title)))
-        .collapsible(false)
-        .default_width(width)
-        .default_pos(pos)
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(Color32::WHITE)
-                .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
-                .corner_radius(4.0)
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 4],
-                    blur: 18,
-                    spread: 0,
-                    color: Color32::from_black_alpha(32),
-                })
-                .inner_margin(egui::Margin {
-                    left: 14,
-                    right: 14,
-                    top: 8,
-                    bottom: 12,
-                }),
-        )
+    height: f32,
+    open: Option<*mut bool>,
+    resizable: bool,
+    anchor: Option<(egui::Align2, [f32; 2])>,
+}
+
+pub fn window(_ctx: &egui::Context, title: impl Into<String>, width: f32) -> Dlg {
+    Dlg {
+        title: title.into(),
+        width,
+        height: 0.0,
+        open: None,
+        resizable: false,
+        anchor: None,
+    }
+}
+
+impl Dlg {
+    pub fn open(mut self, open: &mut bool) -> Self {
+        self.open = Some(open as *mut bool);
+        self
+    }
+    pub fn default_width(mut self, w: f32) -> Self {
+        self.width = w;
+        self
+    }
+    pub fn min_width(self, _w: f32) -> Self {
+        self
+    }
+    pub fn default_size(mut self, s: [f32; 2]) -> Self {
+        self.width = s[0];
+        self.height = s[1];
+        self
+    }
+    pub fn collapsible(self, _v: bool) -> Self {
+        self
+    }
+    pub fn resizable(mut self, v: bool) -> Self {
+        self.resizable = v;
+        self
+    }
+    pub fn anchor(mut self, a: egui::Align2, offset: [f32; 2]) -> Self {
+        self.anchor = Some((a, offset));
+        self
+    }
+    pub fn frame(self, _f: egui::Frame) -> Self {
+        self
+    }
+
+    pub fn show<R>(
+        mut self,
+        ctx: &egui::Context,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> Option<egui::InnerResponse<R>> {
+        let id = egui::Id::new(("dlgwin", &self.title));
+        let screen = ctx.screen_rect();
+        let mut pos = ctx
+            .data(|d| d.get_temp::<egui::Pos2>(id.with("pos")))
+            .unwrap_or_else(|| {
+                let (a, off) = self
+                    .anchor
+                    .unwrap_or((egui::Align2::CENTER_CENTER, [0.0, 0.0]));
+                let p = a.align_size_within_rect(
+                    egui::vec2(self.width, 240.0),
+                    screen,
+                );
+                p.min + egui::vec2(off[0], off[1])
+            });
+        let mut w = ctx
+            .data(|d| d.get_temp::<f32>(id.with("w")))
+            .unwrap_or(self.width);
+        let mut h = ctx
+            .data(|d| d.get_temp::<f32>(id.with("h")))
+            .unwrap_or(self.height);
+        let mut closed = false;
+        let out = egui::Area::new(id.with("area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let frame = egui::Frame::window(&ctx.style())
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
+                    .corner_radius(4.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(32),
+                    })
+                    .inner_margin(egui::Margin::same(0));
+                frame
+                    .show(ui, |ui| {
+                        ui.set_width(w);
+                        // 标题栏
+                        let (trect, tresp) = ui.allocate_exact_size(
+                            egui::vec2(w, 30.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                trect.min,
+                                egui::vec2(w, 30.0),
+                            ),
+                            0.0,
+                            Color32::WHITE,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(trect.left(), trect.bottom() - 0.5),
+                                egui::pos2(trect.right(), trect.bottom() - 0.5),
+                            ],
+                            Stroke::new(1.0, Color32::from_rgb(225, 223, 221)),
+                        );
+                        ui.painter().text(
+                            egui::pos2(trect.left() + 12.0, trect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &self.title,
+                            FontId::proportional(12.5),
+                            TEXT,
+                        );
+                        // 关闭按钮
+                        let crect = egui::Rect::from_min_size(
+                            egui::pos2(trect.right() - 46.0, trect.top()),
+                            egui::vec2(46.0, 30.0),
+                        );
+                        let cresp = ui.interact(
+                            crect,
+                            id.with("close"),
+                            egui::Sense::click(),
+                        );
+                        if cresp.hovered() {
+                            ui.painter()
+                                .rect_filled(crect, 0.0, Color32::from_rgb(232, 17, 35));
+                        }
+                        let cc = cresp.hovered().then_some(Color32::WHITE).unwrap_or(TEXT);
+                        let k = 4.5;
+                        let st = Stroke::new(1.1, cc);
+                        ui.painter().line_segment(
+                            [crect.center() + egui::vec2(-k, -k), crect.center() + egui::vec2(k, k)],
+                            st,
+                        );
+                        ui.painter().line_segment(
+                            [crect.center() + egui::vec2(k, -k), crect.center() + egui::vec2(-k, k)],
+                            st,
+                        );
+                        if cresp.clicked() {
+                            closed = true;
+                        }
+                        if tresp.dragged() {
+                            pos += tresp.drag_delta();
+                        }
+                        // 内容
+                        let body = egui::Frame::none().inner_margin(egui::Margin {
+                            left: 16,
+                            right: 16,
+                            top: 10,
+                            bottom: 12,
+                        });
+                        let inner = body
+                            .show(ui, |ui| {
+                                ui.set_width(w - 32.0);
+                                if h > 0.0 {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(h)
+                                        .show(ui, add)
+                                        .inner
+                                } else {
+                                    add(ui)
+                                }
+                            })
+                            .inner;
+                        if self.resizable {
+                            let bottom = ui.min_rect().bottom();
+                            let gr = egui::Rect::from_min_size(
+                                egui::pos2(trect.right() - 14.0, bottom - 14.0),
+                                egui::vec2(14.0, 14.0),
+                            );
+                            let g = ui.interact(gr, id.with("grip"), egui::Sense::drag());
+                            let gc = Color32::from_rgb(160, 158, 156);
+                            for k in 0..3 {
+                                let o = 3.0 + k as f32 * 3.0;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(gr.right() - o, gr.bottom() - 1.0),
+                                        egui::pos2(gr.right() - 1.0, gr.bottom() - o),
+                                    ],
+                                    Stroke::new(1.0, gc),
+                                );
+                            }
+                            if g.dragged() {
+                                let d = g.drag_delta();
+                                w = (w + d.x).max(220.0);
+                                let cur_h = if h > 0.0 { h } else { bottom - trect.bottom() };
+                                h = (cur_h + d.y).max(120.0);
+                            }
+                        }
+                        (inner, tresp)
+                    })
+                    .inner
+            });
+        if closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(p) = self.open {
+                unsafe { *p = false; }
+            }
+        }
+        ctx.data_mut(|d| {
+            d.insert_temp(id.with("pos"), pos);
+            d.insert_temp(id.with("w"), w);
+            d.insert_temp(id.with("h"), h);
+        });
+        let _ = self.resizable;
+        Some(egui::InnerResponse::new(out.inner.0, out.response))
+    }
 }
 
 /// 对话框标签页（Excel 的文件夹式页签）
