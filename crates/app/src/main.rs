@@ -36,7 +36,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.49";
+const APP_VERSION: &str = "1.50";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -98,6 +98,8 @@ struct FmtState {
     bold: bool,
     italic: bool,
     underline: bool,
+    strikethrough: bool,
+    rotation: i16,
     size: f32,
     color: [u8; 3],
     fill: Option<[u8; 3]>,
@@ -3890,6 +3892,8 @@ impl SheetApp {
             bold: st.bold,
             italic: st.italic,
             underline: st.underline,
+            strikethrough: st.strikethrough,
+            rotation: st.rotation,
             size: st.size,
             color: st.color,
             fill: st.fill,
@@ -6251,12 +6255,44 @@ impl SheetApp {
                             self.apply_style(|s| s.set_all_borders(1, [128, 128, 128]));
                             ui.close_menu();
                         }
-                        if ui.button("外边框").clicked() {
+                        if ui.button("外侧框线").clicked() {
                             self.border_outer(1);
                             ui.close_menu();
                         }
-                        if ui.button("粗外框").clicked() {
+                        if ui.button("粗外侧框线").clicked() {
                             self.border_outer(2);
+                            ui.close_menu();
+                        }
+                        if ui.button("粗底框线").clicked() {
+                            self.apply_style(|s| s.border[2] = sheetcore::style::Border { style: 2, color: [128, 128, 128] });
+                            ui.close_menu();
+                        }
+                        if ui.button("双底框线").clicked() {
+                            self.apply_style(|s| s.border[2] = sheetcore::style::Border { style: 4, color: [128, 128, 128] });
+                            ui.close_menu();
+                        }
+                        if ui.button("内侧横线").clicked() {
+                            let (r1, _c1, r2, _c2) = self.sel_rect();
+                            self.apply_style_xy(|s, r, _c| {
+                                if r > r1 && r <= r2 {
+                                    s.border[0] = sheetcore::style::Border { style: 1, color: [128, 128, 128] };
+                                }
+                                if r >= r1 && r < r2 {
+                                    s.border[2] = sheetcore::style::Border { style: 1, color: [128, 128, 128] };
+                                }
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("内侧竖线").clicked() {
+                            let (_r1, c1, _r2, c2) = self.sel_rect();
+                            self.apply_style_xy(|s, _r, c| {
+                                if c > c1 && c <= c2 {
+                                    s.border[3] = sheetcore::style::Border { style: 1, color: [128, 128, 128] };
+                                }
+                                if c >= c1 && c < c2 {
+                                    s.border[1] = sheetcore::style::Border { style: 1, color: [128, 128, 128] };
+                                }
+                            });
                             ui.close_menu();
                         }
                         if ui.button("无框线").clicked() {
@@ -6444,22 +6480,70 @@ impl SheetApp {
 
         ui_kit::group(ui, "单元格", |ui| {
             ui.vertical(|ui| {
-                let (r1, _c1, r2, _c2) = self.sel_rect();
-                let cc = self.sel.1;
+                let (r1, c1, r2, _c2) = self.sel_rect();
+                // Excel 的插入/删除/格式都是 split：主区执行默认命令，右侧窄箭头给其它选项；
+                // 箭头用 menu_button 但把内边距压到 2px，视觉上贴着按钮，总宽仍 81+12。
+                let split_arrow = |ui: &mut egui::Ui, id: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().button_padding.x = 2.0;
+                        ui.menu_button("▾", |ui| add(ui));
+                    });
+                    let _ = id;
+                };
                 ui.horizontal(|ui| {
-                    if ui_kit::labeled_w(ui, Icon::Plus, "插入", 81.0, "插入行/列").clicked() {
+                    if ui_kit::labeled_w(ui, Icon::Plus, "插入", 69.0, "插入行（下方下移）").clicked() {
                         self.structural(sheetcore::structural::Structural::InsertRows {
                             at: r1,
                             n: r2 - r1 + 1,
                         });
                     }
-                    ui.menu_button("▾", |ui| {
+                    let mut items = |ui: &mut egui::Ui| {
+                        if ui.button("插入行").clicked() {
+                            self.structural(sheetcore::structural::Structural::InsertRows {
+                                at: r1,
+                                n: r2 - r1 + 1,
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("插入列").clicked() {
+                            self.structural(sheetcore::structural::Structural::InsertCols {
+                                at: c1,
+                                n: 1,
+                            });
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("插入单元格（下移）").clicked() {
                             self.shift_cells(true, false);
                             ui.close_menu();
                         }
                         if ui.button("插入单元格（右移）").clicked() {
                             self.shift_cells(true, true);
+                            ui.close_menu();
+                        }
+                    };
+                    split_arrow(ui, "ins", &mut items);
+                });
+                ui.horizontal(|ui| {
+                    if ui_kit::labeled_w(ui, Icon::Close, "删除", 69.0, "删除行").clicked() {
+                        self.structural(sheetcore::structural::Structural::DeleteRows {
+                            at: r1,
+                            n: r2 - r1 + 1,
+                        });
+                    }
+                    let mut items = |ui: &mut egui::Ui| {
+                        if ui.button("删除行").clicked() {
+                            self.structural(sheetcore::structural::Structural::DeleteRows {
+                                at: r1,
+                                n: r2 - r1 + 1,
+                            });
+                            ui.close_menu();
+                        }
+                        if ui.button("删除列").clicked() {
+                            self.structural(sheetcore::structural::Structural::DeleteCols {
+                                at: c1,
+                                n: 1,
+                            });
                             ui.close_menu();
                         }
                         ui.separator();
@@ -6471,18 +6555,30 @@ impl SheetApp {
                             self.shift_cells(false, true);
                             ui.close_menu();
                         }
-                    });
+                    };
+                    split_arrow(ui, "del", &mut items);
                 });
-                if ui_kit::labeled_w(ui, Icon::Close, "删除", 81.0, "删除行/列").clicked() {
-                    self.structural(sheetcore::structural::Structural::DeleteRows {
-                        at: r1,
-                        n: r2 - r1 + 1,
-                    });
-                }
-                if ui_kit::labeled_w(ui, Icon::Brush, "格式", 81.0, "设置单元格格式（Ctrl+1）").clicked() {
-                    self.fmt_dlg = true;
-                }
-                let _ = cc;
+                ui.horizontal(|ui| {
+                    if ui_kit::labeled_w(ui, Icon::Brush, "格式", 69.0, "设置单元格格式（Ctrl+1）").clicked() {
+                        self.fmt_dlg = true;
+                    }
+                    let mut items = |ui: &mut egui::Ui| {
+                        if ui.button("设置单元格格式…").clicked() {
+                            self.fmt_dlg = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("行高…").clicked() {
+                            self.size_dlg = Some((false, self.wb.sheet(self.sheet_idx).rows.size(self.sel.0)));
+                            ui.close_menu();
+                        }
+                        if ui.button("列宽…").clicked() {
+                            self.size_dlg = Some((true, self.wb.sheet(self.sheet_idx).cols.size(self.sel.1)));
+                            ui.close_menu();
+                        }
+                    };
+                    split_arrow(ui, "fmt", &mut items);
+                });
             });
         });
 
@@ -7948,6 +8044,13 @@ impl SheetApp {
                             Stroke::new(1.0, color),
                         );
                     }
+                    if st.strikethrough {
+                        let sy = top + uh * 0.52;
+                        clipped.line_segment(
+                            [egui::pos2(x, sy), egui::pos2(x + uw, sy)],
+                            Stroke::new(1.0, color),
+                        );
+                    }
                 } else {
                     // 默认裁剪在格子里：长文本不再压住右侧列线（视图里可开回 Excel 的溢出行为）
                     let g = painter.layout_no_wrap(txt.clone(), font.clone(), color);
@@ -7974,16 +8077,39 @@ impl SheetApp {
                         rect
                     };
                     let clipped = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
-                    clipped.galley(egui::pos2(x0, y0), g.clone(), color);
-                    if st.bold {
-                        // egui 没有粗体字形：同一串再画一遍、右移 0.6px，
-                        // 笔画厚度才接近 Excel 的 Bold（只把字号 +0.8 显不出粗）
-                        clipped.galley(egui::pos2(x0 + 0.6, y0), g, color);
+                    if st.rotation != 0 {
+                        // 文字旋转：TextShape 的 angle 绕原点转，所以把原点放在
+                        // 「单元格中心减去旋转后的半尺寸」处，文字中心才落在格心
+                        let angle = -(st.rotation as f32).to_radians();
+                        let (sa, ca) = angle.sin_cos();
+                        let hx = w * 0.5;
+                        let hy = gh * 0.5;
+                        let ctr = rect.center();
+                        let px = ctr.x - (hx * ca - hy * sa);
+                        let py = ctr.y - (hx * sa + hy * ca);
+                        clipped.add(egui::Shape::Text(
+                            egui::epaint::TextShape::new(egui::pos2(px, py), g.clone(), color)
+                                .with_angle(angle),
+                        ));
+                    } else {
+                        clipped.galley(egui::pos2(x0, y0), g.clone(), color);
+                        if st.bold {
+                            // egui 没有粗体字形：同一串再画一遍、右移 0.6px，
+                            // 笔画厚度才接近 Excel 的 Bold（只把字号 +0.8 显不出粗）
+                            clipped.galley(egui::pos2(x0 + 0.6, y0), g, color);
+                        }
                     }
-                    if st.underline {
+                    if st.underline && st.rotation == 0 {
                         let uy = y0 + gh - 1.0;
                         clipped.line_segment(
                             [egui::pos2(x0, uy), egui::pos2(x0 + w, uy)],
+                            Stroke::new(1.0, color),
+                        );
+                    }
+                    if st.strikethrough && st.rotation == 0 {
+                        let sy = y0 + gh * 0.52;
+                        clipped.line_segment(
+                            [egui::pos2(x0, sy), egui::pos2(x0 + w, sy)],
                             Stroke::new(1.0, color),
                         );
                     }
@@ -9351,6 +9477,19 @@ impl SheetApp {
                             {
                                 self.fmt_state.underline = !self.fmt_state.underline;
                             }
+                            if ui_kit::text_toggle(
+                                ui,
+                                "S",
+                                self.fmt_state.strikethrough,
+                                "删除线",
+                                false,
+                                false,
+                                false,
+                            )
+                            .clicked()
+                            {
+                                self.fmt_state.strikethrough = !self.fmt_state.strikethrough;
+                            }
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("颜色").size(11.5).weak());
                             ui.color_edit_button_srgb(&mut self.fmt_state.color)
@@ -9387,6 +9526,31 @@ impl SheetApp {
                             {
                                 ui.selectable_value(&mut self.fmt_state.valign, v, label);
                             }
+                        });
+                        ui.end_row();
+
+                        dlg_cell_label(ui, "方向");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("fmt_dlg_rot")
+                                .selected_text(match self.fmt_state.rotation {
+                                    90 => "竖排（90°）",
+                                    -90 => "竖排（-90°）",
+                                    45 => "斜排（45°）",
+                                    -45 => "斜排（-45°）",
+                                    _ => "横排（0°）",
+                                })
+                                .width(120.0)
+                                .show_ui(ui, |ui| {
+                                    for (label, v) in [
+                                        ("横排（0°）", 0i16),
+                                        ("斜排（45°）", 45),
+                                        ("竖排（90°）", 90),
+                                        ("竖排（-90°）", -90),
+                                        ("斜排（-45°）", -45),
+                                    ] {
+                                        ui.selectable_value(&mut self.fmt_state.rotation, v, label);
+                                    }
+                                });
                         });
                         ui.end_row();
 
@@ -9543,6 +9707,8 @@ impl SheetApp {
                 s.bold = st.bold;
                 s.italic = st.italic;
                 s.underline = st.underline;
+                s.strikethrough = st.strikethrough;
+                s.rotation = st.rotation;
                 s.size = st.size;
                 s.color = st.color;
                 s.fill = st.fill;

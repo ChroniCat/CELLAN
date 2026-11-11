@@ -873,6 +873,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 f.set_bold(st.bold);
                 f.set_italic(st.italic);
                 f.set_underline(if st.underline { "single" } else { "none" });
+                f.set_strikethrough(st.strikethrough);
                 f.set_size(st.size as f64);
                 // 字体名：空串表示默认字体，不碰原文件的字体（避免把 Calibri 写成别的）
                 if !st.font.is_empty() {
@@ -900,6 +901,15 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             });
             if st.indent > 0 {
                 a.set_indent(st.indent as u32);
+            }
+            if st.rotation != 0 {
+                // OOXML：0..90 逆时针，91..180 表示 -1..-90
+                let v = if st.rotation >= 0 {
+                    st.rotation as u32
+                } else {
+                    (90 - st.rotation) as u32
+                };
+                a.set_text_rotation(v);
             }
             if !st.format.is_empty() {
                 let mut nf = umya_spreadsheet::NumberingFormat::default();
@@ -1790,6 +1800,7 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         out.bold = matches!(f.weight, calamine::FontWeight::Bold);
         out.italic = matches!(f.style, calamine::FontStyle::Italic);
         out.underline = !matches!(f.underline, calamine::UnderlineStyle::None);
+        out.strikethrough = f.strikethrough;
         if let Some(n) = &f.name {
             out.font = crate::style::normalize_font(n);
         }
@@ -1824,6 +1835,16 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         };
         out.wrap = a.wrap_text;
         out.indent = a.indent.unwrap_or(0).min(15);
+        out.rotation = match a.text_rotation {
+            calamine::TextRotation::Degrees(d) => {
+                if d <= 90 {
+                    d as i16
+                } else {
+                    90 - d as i16
+                }
+            }
+            _ => 0,
+        };
     }
     if let Some(bs) = &st.borders {
         let map = |b: &calamine::Border| crate::style::Border {
