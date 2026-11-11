@@ -15,6 +15,7 @@ mod office_clipboard;
 mod recent;
 mod update;
 mod error_opts;
+mod ui_prefs;
 mod session_lock;
 mod single_instance;
 
@@ -38,7 +39,7 @@ const COL_W: f32 = 72.0;
 /// 行号列宽（Excel 在 96 DPI 下随行号位数变化，29 起步）
 const HEAD_W: f32 = 29.0;
 /// 发行版本号（与 packaging/使用说明.txt 同步改）
-const APP_VERSION: &str = "1.61";
+const APP_VERSION: &str = "1.62";
 const HEAD_H: f32 = 19.0;
 /// 滚动条厚度（Excel 17）
 const SB: f32 = 17.0;
@@ -493,6 +494,8 @@ struct SheetApp {
     /// 整簿预览时只看某一张表（None=全部）
     zh_preview_sheet: Option<usize>,
     zh_preview_variant: sheetcore::zhconv::Variant,
+    /// 界面偏好（简繁变体、校对分组等，持久化）
+    prefs: ui_prefs::UiPrefs,
     /// 分级显示设置对话框
     outline_set_dlg: bool,
     /// 校对（拼写检查）对话框
@@ -829,7 +832,8 @@ impl SheetApp {
             zh_preview: Vec::new(),
             zh_preview_all_sheets: false,
             zh_preview_sheet: None,
-            zh_preview_variant: sheetcore::zhconv::Variant::Generic,
+            zh_preview_variant: ui_prefs::variant_from_u8(ui_prefs::UiPrefs::load().zh_variant),
+            prefs: ui_prefs::UiPrefs::load(),
             outline_set_dlg: false,
             proof_dlg: false,
             proof_list: Vec::new(),
@@ -1456,17 +1460,21 @@ impl SheetApp {
                                 std::env::var("SC_ZH_ALL").map(|v| v == "1").unwrap_or(false);
                             self.zh_preview_sheet =
                                 std::env::var("SC_ZH_SHEET").ok().and_then(|v| v.parse().ok());
-                            self.zh_preview_variant = match std::env::var("SC_ZH_VARIANT")
-                                .unwrap_or_default()
-                                .as_str()
-                            {
-                                "tw" => sheetcore::zhconv::Variant::Taiwan,
-                                "hk" => sheetcore::zhconv::Variant::HongKong,
-                                _ => sheetcore::zhconv::Variant::Generic,
-                            };
+                            // 没显式指定就沿用记住的变体（不覆盖）
+                            if let Ok(v) = std::env::var("SC_ZH_VARIANT") {
+                                self.zh_preview_variant = match v.as_str() {
+                                    "tw" => sheetcore::zhconv::Variant::Taiwan,
+                                    "hk" => sheetcore::zhconv::Variant::HongKong,
+                                    _ => sheetcore::zhconv::Variant::Generic,
+                                };
+                            }
                             self.zh_preview_scan();
                             self.zh_preview_dlg = true;
-                            eprintln!("[zhpreview] diffs={}", self.zh_preview.len());
+                            eprintln!(
+                                "[zhpreview] diffs={} variant={:?}",
+                                self.zh_preview.len(),
+                                self.zh_preview_variant
+                            );
                         }
                         Ok("level") => {
                             if let Ok(spec) = std::env::var("SC_LEVEL") {
@@ -5610,6 +5618,11 @@ impl SheetApp {
                 });
             });
         if variant_changed {
+            let v = ui_prefs::variant_to_u8(self.zh_preview_variant);
+            if self.prefs.zh_variant != v {
+                self.prefs.zh_variant = v;
+                self.prefs.save();
+            }
             self.zh_preview_scan();
         }
         if apply {
@@ -5846,6 +5859,13 @@ impl SheetApp {
                         .checkbox(&mut self.proof_only_sel, "只查选区")
                         .on_hover_text("不勾就查整张表")
                         .changed();
+                    if ui
+                        .checkbox(&mut self.prefs.proof_group, "按类型分组")
+                        .changed()
+                    {
+                        self.prefs.save();
+                        changed = true;
+                    }
                     ui.separator();
                     changed |= ui
                         .checkbox(&mut self.proof_rules.double_space, "多个空格")
@@ -5877,7 +5897,39 @@ impl SheetApp {
                     if self.proof_list.is_empty() {
                         ui.label(egui::RichText::new("没有发现排版问题。").size(12.0));
                     }
-                    for it in self.proof_list.clone() {
+                    // 按类型分组时先出一行小标题；顺序固定，方便对照
+                    let group_mode = self.prefs.proof_group;
+                    let mut items: Vec<sheetcore::proof::ProofIssue> = self.proof_list.clone();
+                    if group_mode {
+                        let order = |k: sheetcore::proof::ProofKind| -> u8 {
+                            use sheetcore::proof::ProofKind::*;
+                            match k {
+                                EdgeSpace => 0,
+                                DoubleSpace => 1,
+                                FullWidth => 2,
+                                RepeatPunct => 3,
+                                HalfPunct => 4,
+                            }
+                        };
+                        items.sort_by_key(|i| (order(i.kind), i.row, i.col));
+                    }
+                    let mut last_kind: Option<sheetcore::proof::ProofKind> = None;
+                    for it in items {
+                        if group_mode && last_kind != Some(it.kind) {
+                            let n = self
+                                .proof_list
+                                .iter()
+                                .filter(|x| x.kind == it.kind)
+                                .count();
+                            last_kind = Some(it.kind);
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("{}（{n}）", it.kind.detail()))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(ui_kit::ACCENT),
+                            );
+                        }
                         let row_resp = ui.horizontal(|ui| {
                             if ui
                                 .add_sized(
@@ -5988,6 +6040,10 @@ impl SheetApp {
 
     /// 中文简繁转换：把选区里的文本单元格整段转换（词组优先，见 core::zhconv）
     fn zh_convert(&mut self, to_trad: bool, variant: sheetcore::zhconv::Variant) {
+        if to_trad && self.prefs.zh_variant != ui_prefs::variant_to_u8(variant) {
+            self.prefs.zh_variant = ui_prefs::variant_to_u8(variant);
+            self.prefs.save();
+        }
         if self.edit_blocked() {
             return;
         }
@@ -13980,6 +14036,21 @@ impl SheetApp {
         let head_bg = Color32::from_rgb(240, 240, 240);
         let head_fg = Color32::from_rgb(68, 68, 68);
         let head_sel = Color32::from_rgb(225, 225, 225);
+        // 筛选启用后，区域内的行号是蓝色（Excel 实测 #0066B6 一类的蓝）
+        let filter_rows = self
+            .wb
+            .sheet(self.sheet_idx)
+            .filter
+            .as_ref()
+            .map(|f| (f.range.0, f.range.2));
+        let row_num_fg = |r: u32| -> Color32 {
+            if let Some((r1, r2)) = filter_rows {
+                if r >= r1 && r <= r2 {
+                    return Color32::from_rgb(0, 102, 182);
+                }
+            }
+            head_fg
+        };
 
         // 列标题
         // Excel：选区覆盖到的列在列头上整块加深（不是只有活动格那一列）。
@@ -14109,7 +14180,7 @@ impl SheetApp {
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
                     FontId::new(12.0, family_named("latin")),
-                    head_fg,
+                    row_num_fg(r),
                 );
             }
             painter.line_segment(
@@ -14204,7 +14275,7 @@ impl SheetApp {
                                     Align2::CENTER_CENTER,
                                     (r + 1).to_string(),
                                     FontId::new(12.0, family_named("latin")),
-                                    head_fg,
+                                    row_num_fg(r),
                                 );
                     // 分级显示：明细在下方时按钮画在组最后一行下面那行，在上方时画在上面那行
                     let (sum_below, symbols_on) = {
