@@ -4121,6 +4121,7 @@ impl SheetApp {
             .open(&mut open)
             .default_width(260.0)
             .show(ctx, |ui| {
+                dlg_section(ui, "当前共享成员");
                 let me = self.net.as_ref().map(|n| n.site);
                 if self.peers_list.is_empty() && self.net.is_none() {
                     ui.label("当前没有共享");
@@ -4145,7 +4146,10 @@ impl SheetApp {
                         } else {
                             name.clone()
                         };
-                        ui.label(label);
+                        ui.add_sized(
+                            [120.0, 18.0],
+                            egui::Label::new(label).truncate(),
+                        );
                         // 远端光标位置
                         let pos = self
                             .remote
@@ -12362,13 +12366,14 @@ impl SheetApp {
         let mut open = true;
         let mut ok = false;
         let mut cancel = false;
-        ui_kit::window(ctx, "插入图表", 280.0)
+        ui_kit::window(ctx, "插入图表", 360.0)
             .collapsible(false)
             .resizable(false)
-            .default_width(280.0)
+            .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::Grid::new("chart_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                dlg_section(ui, "图表");
+                egui::Grid::new("chart_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label("图表类型");
                     egui::ComboBox::from_id_salt("chart_kind")
                         .selected_text(ch.kind.label())
@@ -12473,12 +12478,14 @@ impl SheetApp {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("插入").clicked() {
-                        ok = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        cancel = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                        if ui_kit::primary_button(ui, "插入").clicked() {
+                            ok = true;
+                        }
+                    });
                 });
             });
         if self.chart_reload_src {
@@ -12632,13 +12639,14 @@ impl SheetApp {
                 .unwrap_or_default()
         };
         let mut excl_text = spec.exclude.join(",");
-        ui_kit::window(ctx, "数据透视表", 300.0)
+        ui_kit::window(ctx, "数据透视表", 360.0)
             .collapsible(false)
             .resizable(false)
-            .default_width(300.0)
+            .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::Grid::new("pivot_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                dlg_section(ui, "布局");
+                egui::Grid::new("pivot_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label("源区域");
                     ui.label(format!(
                         "{}-{}（{} 行）",
@@ -12759,12 +12767,14 @@ impl SheetApp {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("生成").clicked() {
-                        apply = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        cancel = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                        if ui_kit::primary_button(ui, "生成").clicked() {
+                            apply = true;
+                        }
+                    });
                 });
             });
         if apply {
@@ -16305,24 +16315,44 @@ impl SheetApp {
                 ui.separator();
                 if versions.is_empty() {
                     ui.label("还没有历史版本——先保存一次试试。");
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [300.0, 18.0],
+                            egui::Label::new(egui::RichText::new("时间 · 大小").size(11.0).weak()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("操作").size(11.0).weak());
+                        });
+                    });
                 }
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for v in &versions {
                         ui.horizontal(|ui| {
                             let kb = v.bytes as f64 / 1024.0;
-                            ui.label(
-                                egui::RichText::new(format!("{}  ·  {kb:.0} KB", v.stamp)).monospace(),
+                            ui.add_sized(
+                                [300.0, 20.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}  ·  {kb:.0} KB", v.stamp))
+                                        .monospace(),
+                                ),
                             );
-                            if ui.button("打开这一版").clicked() {
-                                restore = Some(v.path.clone());
-                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui_kit::secondary_button(ui, "打开这一版").clicked() {
+                                    restore = Some(v.path.clone());
+                                }
+                            });
                         });
                     }
                 });
                 ui.separator();
-                if ui_kit::secondary_button(ui, "关闭").clicked() {
-                    close = true;
-                }
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "关闭").clicked() {
+                            close = true;
+                        }
+                    });
+                });
             });
         if let Some(p) = restore {
             self.status = "已打开历史版本（另存为新文件即可保留）".into();

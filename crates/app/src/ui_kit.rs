@@ -72,7 +72,7 @@ fn text_color(v: &egui::Visuals) -> Color32 {
 pub fn apply_theme(ctx: &egui::Context) {
     let mut base = (*ctx.style()).clone();
     base.text_styles = [
-        (egui::TextStyle::Heading, FontId::proportional(15.0)),
+        (egui::TextStyle::Heading, FontId::proportional(13.0)),
         (egui::TextStyle::Body, FontId::proportional(12.5)),
         (egui::TextStyle::Button, FontId::proportional(12.0)),
         (egui::TextStyle::Small, FontId::proportional(11.0)),
