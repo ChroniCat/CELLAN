@@ -674,10 +674,21 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 
 /// 主按钮（确定/应用）：Excel 绿
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> Response {
-    let btn = egui::Button::new(RichText::new(label).color(Color32::WHITE).size(12.0))
-        .fill(ACCENT)
+    let btn = egui::Button::new(RichText::new(label).color(ACCENT).size(12.0))
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, ACCENT))
         .corner_radius(2.0)
-        .min_size(Vec2::new(64.0, 24.0));
+        .min_size(Vec2::new(75.0, 24.0));
+    ui.add(btn)
+}
+
+/// 次要按钮（取消/关闭）：白底灰边，和 Excel 对话框一致
+pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
+    let btn = egui::Button::new(RichText::new(label).color(TEXT).size(12.0))
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
+        .corner_radius(2.0)
+        .min_size(Vec2::new(75.0, 24.0));
     ui.add(btn)
 }
 
@@ -783,7 +794,14 @@ pub fn window<'a>(
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(Color32::WHITE)
-                .stroke(Stroke::new(1.0, BORDER))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(200, 198, 196)))
+                .corner_radius(4.0)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 18,
+                    spread: 0,
+                    color: Color32::from_black_alpha(32),
+                })
                 .inner_margin(egui::Margin {
                     left: 14,
                     right: 14,
@@ -791,6 +809,61 @@ pub fn window<'a>(
                     bottom: 12,
                 }),
         )
+}
+
+/// 对话框标签页（Excel 的文件夹式页签）
+pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
+    let top = ui.cursor().top();
+    let left = ui.cursor().left();
+    let right = left + ui.available_width();
+    ui.painter().line_segment(
+        [egui::pos2(left, top + 26.0), egui::pos2(right, top + 26.0)],
+        Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+    );
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (i, t) in tabs.iter().enumerate() {
+            let galley = ui.painter().layout_no_wrap(
+                (*t).to_owned(),
+                FontId::proportional(12.0),
+                Color32::PLACEHOLDER,
+            );
+            let w = galley.size().x + 26.0;
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
+            let on = *sel as usize == i;
+            if on {
+                ui.painter().rect(
+                    rect,
+                    0.0,
+                    Color32::WHITE,
+                    Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+                        egui::pos2(rect.right() - 1.0, rect.bottom()),
+                    ),
+                    0.0,
+                    Color32::WHITE,
+                );
+            } else if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            }
+            let col = if on {
+                TEXT
+            } else {
+                ui.visuals().weak_text_color()
+            };
+            ui.painter()
+                .text(rect.center(), Align2::CENTER_CENTER, *t, FontId::proportional(12.0), col);
+            if resp.clicked() {
+                *sel = i as u8;
+            }
+        }
+    });
+    ui.add_space(2.0);
 }
 
 /// 表单的一行：定宽字段名 + 内容

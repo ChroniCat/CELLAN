@@ -601,6 +601,7 @@ struct SheetApp {
     /// 单元格格式对话框
     fmt_dlg: bool,
     fmt_state: FmtState,
+    fmt_tab: u8,
     /// 外部链接对话框
     xlink_dlg: bool,
     /// 修订记录（新的在后）
@@ -919,6 +920,7 @@ impl SheetApp {
             backstage_page: 0,
             fmt_dlg: false,
             fmt_state: FmtState::default(),
+            fmt_tab: 0,
             xlink_dlg: false,
             rev: Vec::new(),
             rev_open: false,
@@ -1181,7 +1183,7 @@ impl SheetApp {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         go = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         close = true;
                     }
                 });
@@ -1247,7 +1249,7 @@ impl SheetApp {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         close = true;
                     }
                 });
@@ -4787,6 +4789,7 @@ impl SheetApp {
         let (r, c) = self.sel;
         let id = self.wb.sheet(self.sheet_idx).style_of(r, c);
         let st = self.wb.styles.get(id).clone();
+        self.fmt_tab = 0;
         self.fmt_state = FmtState {
             font: st.font.clone(),
             bold: st.bold,
@@ -6961,7 +6964,7 @@ impl SheetApp {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
                 }
-                if ui.button("取消").clicked() {
+                if ui_kit::secondary_button(ui, "取消").clicked() {
                     open = false;
                 }
             });
@@ -7041,7 +7044,7 @@ impl SheetApp {
                 if ui_kit::primary_button(ui, "插入").clicked() {
                     apply = true;
                 }
-                if ui.button("取消").clicked() {
+                if ui_kit::secondary_button(ui, "取消").clicked() {
                     close = true;
                 }
             });
@@ -7808,7 +7811,7 @@ impl SheetApp {
                     if ui_kit::primary_button(ui, "求解").clicked() {
                         solve = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         self.goal_dlg = false;
                     }
                 });
@@ -7993,7 +7996,7 @@ impl SheetApp {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         run = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         self.dtable_dlg = false;
                     }
                 });
@@ -8217,7 +8220,7 @@ impl SheetApp {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
                 }
-                if ui.button("取消").clicked() {
+                if ui_kit::secondary_button(ui, "取消").clicked() {
                     close = true;
                 }
             });
@@ -8540,7 +8543,7 @@ impl SheetApp {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
                 }
-                if ui.button("取消").clicked() {
+                if ui_kit::secondary_button(ui, "取消").clicked() {
                     open = false;
                 }
             });
@@ -8603,7 +8606,7 @@ impl SheetApp {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
                 }
-                if ui.button("取消").clicked() {
+                if ui_kit::secondary_button(ui, "取消").clicked() {
                     open = false;
                 }
             });
@@ -9415,7 +9418,7 @@ impl SheetApp {
                     if ui.button("确定").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         cancel = true;
                     }
                 });
@@ -9529,7 +9532,7 @@ impl SheetApp {
                     if ui.button("确定").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         cancel = true;
                     }
                 });
@@ -10052,7 +10055,7 @@ impl SheetApp {
                     if ui.button("确定").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         ui.close_menu();
                     }
                 });
@@ -10181,7 +10184,7 @@ impl SheetApp {
                     if ui.button("运行").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         ui.close_menu();
                     }
                 });
@@ -10911,7 +10914,7 @@ impl SheetApp {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         ok = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         crit_close = true;
                     }
                 });
@@ -11768,24 +11771,37 @@ impl SheetApp {
         let mut apply = false;
         let mut cancel = false;
         let st = self.fmt_state.clone();
-        ui_kit::window(ctx, "设置单元格格式", 420.0)
+        ui_kit::window(ctx, "设置单元格格式", 452.0)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
             .frame(
-                egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
-                    left: 16,
-                    right: 16,
-                    top: 10,
-                    bottom: 12,
-                }),
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 198, 196)))
+                    .corner_radius(4.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 18,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(32),
+                    })
+                    .inner_margin(egui::Margin {
+                        left: 16,
+                        right: 16,
+                        top: 10,
+                        bottom: 12,
+                    }),
             )
             .show(ctx, |ui| {
                 ui.set_width(452.0);
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 7.0);
                 ui.spacing_mut().button_padding = egui::Vec2::new(10.0, 4.0);
 
+                ui_kit::dialog_tabs(ui, &mut self.fmt_tab, &["数字", "对齐", "字体", "边框"]);
+                ui.add_space(6.0);
+                if self.fmt_tab == 2 {
                 dlg_section(ui, "字体");
                 egui::Grid::new("fmt_g_font")
                     .num_columns(2)
@@ -11896,6 +11912,8 @@ impl SheetApp {
                         ui.end_row();
                     });
 
+                }
+                if self.fmt_tab == 1 {
                 dlg_section(ui, "对齐");
                 egui::Grid::new("fmt_g_align")
                     .num_columns(2)
@@ -11959,6 +11977,8 @@ impl SheetApp {
                         ui.end_row();
                     });
 
+                }
+                if self.fmt_tab == 0 {
                 dlg_section(ui, "数字");
                 egui::Grid::new("fmt_g_num")
                     .num_columns(2)
@@ -12016,6 +12036,8 @@ impl SheetApp {
                         ui.end_row();
                     });
 
+                }
+                if self.fmt_tab == 3 {
                 dlg_section(ui, "边框");
                 egui::Grid::new("fmt_g_border")
                     .num_columns(2)
@@ -12053,6 +12075,7 @@ impl SheetApp {
                         ui.end_row();
                     });
 
+                }
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(2.0);
@@ -12060,7 +12083,7 @@ impl SheetApp {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui.button("取消").clicked() {
+                            if ui_kit::secondary_button(ui, "取消").clicked() {
                                 cancel = true;
                             }
                             if ui_kit::primary_button(ui, "确定").clicked() {
@@ -12432,7 +12455,7 @@ impl SheetApp {
                     if ui.button("插入").clicked() {
                         ok = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         cancel = true;
                     }
                 });
@@ -12718,7 +12741,7 @@ impl SheetApp {
                     if ui.button("生成").clicked() {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         cancel = true;
                     }
                 });
@@ -18307,14 +18330,14 @@ fn dlg_col(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)) {
 
 /// 对话框的小节标题（细线 + 强调色小字）
 fn dlg_section(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(text)
-            .size(10.5)
+            .size(11.5)
             .strong()
-            .color(ui_kit::accent(ui.visuals())),
+            .color(ui_kit::TEXT),
     );
-    ui.separator();
+    ui.add_space(2.0);
 }
 
 /// 对话框里的字段名：固定宽度，保证多行控件对成一列
