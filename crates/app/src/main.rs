@@ -17009,6 +17009,35 @@ impl SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 无界面验收：SC_DBLCLICK="x,y" 在应用内注入两次点击，走真实的双击判定
+        if let Ok(spec) = std::env::var("SC_DBLCLICK") {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let at = spec.split_once(',').and_then(|(a, b)| {
+                Some(egui::pos2(a.trim().parse().ok()?, b.trim().parse().ok()?))
+            });
+            if let Some(pos) = at {
+                if n == 6 || n == 8 {
+                    let m = egui::Modifiers::default();
+                    ctx.input_mut(|i| {
+                        i.events.push(egui::Event::PointerMoved(pos));
+                        i.events.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: m,
+                        });
+                        i.events.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: m,
+                        });
+                    });
+                    eprintln!("[dbl] 注入第 {} 次点击 ({:.0},{:.0})", if n == 6 { 1 } else { 2 }, pos.x, pos.y);
+                }
+            }
+        }
         if let Some((is_col, idx)) = self.pending_autofit.take() {
             if is_col {
                 let before = self.wb.sheet(self.sheet_idx).cols.size(idx);
@@ -17240,7 +17269,7 @@ impl eframe::App for SheetApp {
                     .show(ui, |ui| {
                         ui.set_height(ui_kit::RIBBON_BODY_H);
                         ui.horizontal_top(|ui| {
-                            ui.add_space(12.0);
+                            ui.add_space(20.0);
                             ribbon::ui::body(self, ui);
                         });
                     });
