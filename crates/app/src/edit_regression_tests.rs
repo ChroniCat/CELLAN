@@ -2209,3 +2209,52 @@ fn xmlss_datetime_pastes_into_each_date_system_with_time_and_plain_numbers() {
         "1904-01-02 12:00"
     );
 }
+
+#[test]
+fn incomplete_load_blocks_overwrite_but_allows_rescue_save_as() {
+    // C14：打开时工作表 XML 坏了（公式/单元格读不出来），就地保存必须被拒绝，
+    // 否则会把"没读到的东西"永久写没；「另存为」抢救副本仍然允许。
+    let env = crate::test_env::TestEnv::new("c14_guard");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    let path = env.path("broken.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "数据".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(5.0), formula: None });
+    wb.sheets[0].set(1, 0, Cell { value: Value::Number(100.0), formula: Some("=A1*20".into()) });
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+
+    // 破坏工作表 XML（模拟下载损坏/磁盘坏块）
+    let part = sheetcore::patch::sheet_targets(&path).unwrap().get("数据").cloned().unwrap();
+    sheetcore::fixups::write_parts(
+        &path,
+        &[(part.clone(), b"<worksheet><sheetData><row>".to_vec())],
+    )
+    .unwrap();
+
+    let (loaded, diag) = sheetcore::xlsx::load_diag(&path).unwrap();
+    assert!(diag.has_fatal(), "坏表必须被标成致命：{:?}", diag.problems);
+    app.wb = loaded;
+    app.wb.path = Some(path.clone());
+    app.load_diag = Some(diag);
+    app.wb.dirty = true;
+    let before = file_sha256(&path);
+
+    // 就地保存：拒绝，且不产生保存任务、原文件不动
+    app.save(false);
+    assert!(app.status.contains("禁止覆盖保存"), "状态栏应说明原因：{}", app.status);
+    assert!(app.tasks.saving.is_none(), "被拒绝的保存不能启动后台写盘");
+    assert_eq!(file_sha256(&path), before, "原文件不得被改写");
+
+    // 另存抢救副本：允许，并且写出的新文件读得回来
+    let rescue = env.path("rescue.xlsx");
+    env.sc("SC_SAVE_AS", rescue.to_str().unwrap());
+    app.save(true);
+    assert!(app.tasks.saving.is_some(), "另存为应启动保存任务");
+    wait_save(&mut app);
+    assert!(rescue.is_file(), "抢救副本必须写出来");
+    assert!(sheetcore::xlsx::load(&rescue).is_ok());
+    assert!(app.load_diag.is_none(), "另存成功后不应继续挡住新文件的保存");
+    drop(env);
+}

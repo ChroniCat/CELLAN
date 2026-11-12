@@ -783,17 +783,31 @@
    "scope": "core/xlsx.rs + app打开流程",
    "source": "core-requirements.md",
    "heading": "C14 P0 部分加载失败不得伪装完整工作簿",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "待验收",
+   "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
+   "files": [
+    "crates/core/src/xlsx.rs",
+    "crates/core/src/model.rs",
+    "crates/app/src/main.rs",
+    "crates/app/src/document_tests.rs",
+    "crates/core/tests/load_diag.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
+    "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+   ],
+   "not_done": [
+    "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
+    "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "用户复核；round19 回归数字补入证据",
+   "updated_utc": "2026-11-12T19:45:00Z",
    "slices": [
     {
      "id": "C14.1",
@@ -801,17 +815,31 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
+     "files": [
+      "crates/core/src/xlsx.rs",
+      "crates/core/src/model.rs",
+      "crates/app/src/main.rs",
+      "crates/app/src/document_tests.rs",
+      "crates/core/tests/load_diag.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+     ],
+     "not_done": [
+      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
+      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "用户复核",
+     "updated_utc": "2026-11-12T19:45:00Z"
     },
     {
      "id": "C14.2",
@@ -819,17 +847,31 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
+     "files": [
+      "crates/core/src/xlsx.rs",
+      "crates/core/src/model.rs",
+      "crates/app/src/main.rs",
+      "crates/app/src/document_tests.rs",
+      "crates/core/tests/load_diag.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+     ],
+     "not_done": [
+      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
+      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "用户复核",
+     "updated_utc": "2026-11-12T19:45:00Z"
     },
     {
      "id": "C14.3",
@@ -837,17 +879,31 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
+     "files": [
+      "crates/core/src/xlsx.rs",
+      "crates/core/src/model.rs",
+      "crates/app/src/main.rs",
+      "crates/app/src/document_tests.rs",
+      "crates/core/tests/load_diag.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+     ],
+     "not_done": [
+      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
+      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "用户复核",
+     "updated_utc": "2026-11-12T19:45:00Z"
     }
    ]
   },

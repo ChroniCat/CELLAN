@@ -489,6 +489,8 @@ struct FilterPopup {
 
 struct SheetApp {
     wb: Workbook,
+    /// C14：本次打开的结构化诊断。带致命问题时禁止覆盖保存，只允许另存抢救副本。
+    load_diag: Option<sheetcore::xlsx::LoadDiag>,
     sheet_idx: usize,
     sel: (u32, u32), // row, col
     scroll: Vec2,
@@ -908,7 +910,7 @@ enum TabSlot {
 
 enum OpenMsg {
     /// 文件已读入（带的是上次保存的计算结果，先显示）
-    Loaded(Box<Workbook>, bool),
+    Loaded(Box<Workbook>, bool, Box<sheetcore::xlsx::LoadDiag>),
     /// 全量重算完成
     Recalced(Box<Workbook>, Box<sheetcore::formula::deps::Deps>),
     /// 大文件只把依赖图备好，不阻塞打开（缓存值先显示）
@@ -1165,6 +1167,7 @@ impl SheetApp {
         }
         let mut app = Self {
             wb: Workbook::new_blank(),
+            load_diag: None,
             sheet_idx: 0,
             sel: {
                 let mut se = (0u32, 0u32);
@@ -1529,8 +1532,8 @@ impl SheetApp {
         std::thread::spawn(move || {
             let prof = std::env::var("SC_LOAD_PROF").is_ok();
             let t0 = std::time::Instant::now();
-            match sheetcore::xlsx::load(&path) {
-                Ok(wb) => {
+            match sheetcore::xlsx::load_diag(&path) {
+                Ok((wb, diag)) => {
                     if prof {
                         eprintln!("[open] load {:.2}s", t0.elapsed().as_secs_f64());
                     }
@@ -1562,7 +1565,7 @@ impl SheetApp {
                                 skeleton.sheets.iter().map(|s| s.len()).sum::<usize>()
                             );
                         }
-                        let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true));
+                        let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true, Box::new(diag.clone())));
                         let t = std::time::Instant::now();
                         let deps = sheetcore::formula::deps::Deps::build(&skeleton);
                         drop(skeleton);
@@ -1574,7 +1577,7 @@ impl SheetApp {
                     }
                     // 小文件：克隆一份给界面先画，原份留在后台重算
                     let t = std::time::Instant::now();
-                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false));
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(diag.clone())));
                     if prof {
                         eprintln!("[open] clone+send {:.2}s", t.elapsed().as_secs_f64());
                     }
@@ -1608,7 +1611,7 @@ impl SheetApp {
         std::thread::spawn(move || {
             match sheetcore::xlsx::load_with_password(&path, &pw) {
                 Ok(wb) => {
-                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false));
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(sheetcore::xlsx::LoadDiag::default())));
                     let mut wb2 = wb;
                     sheetcore::formula::recalc_all(&mut wb2);
                     let deps = sheetcore::formula::deps::Deps::build(&wb2);
@@ -1788,8 +1791,9 @@ impl SheetApp {
         let mut finished = false;
         for msg in msgs {
             match msg {
-                OpenMsg::Loaded(wb, big) => {
+                OpenMsg::Loaded(wb, big, diag) => {
                     self.deps_pending = big;
+                    self.load_diag = if diag.is_complete() { None } else { Some(*diag) };
                     self.wb = *wb;
                     self.wb_epoch += 1;
                     self.deps = sheetcore::formula::deps::Deps::empty();
@@ -2813,6 +2817,17 @@ impl SheetApp {
     }
 
     fn save(&mut self, force_dialog: bool) {
+        // C14：打开时有关键部件没读出来（公式/样式/整张表），就地覆盖会把"没读到的东西"
+        // 永久写没。只读查看和「另存为抢救副本」仍然允许。
+        if !force_dialog && self.wb.path.is_some() {
+            if let Some(d) = self.load_diag.as_ref().filter(|d| d.has_fatal()) {
+                self.status = format!(
+                    "打开不完整，已禁止覆盖保存：{}。请用「另存为」保存抢救副本",
+                    d.summary()
+                );
+                return;
+            }
+        }
         if self.tasks.saving.is_some() {
             self.status = "上一次保存还没完成…".into();
             return;
@@ -2865,7 +2880,15 @@ impl SheetApp {
     fn poll_save(&mut self) {
         if let Some(result) = self.tasks.poll_save(&mut self.wb) {
             self.status = match result {
-                Ok(path) => format!("已保存 {}", path.display()),
+                Ok(path) => {
+                    // 另存成功后新文件是按当前已知内容完整写出的；诊断清掉，
+                    // 后续对这份新文件的覆盖保存不再被旧文件的缺口挡住。
+                    if self.wb.path.as_deref() == Some(path.as_path()) {
+                        self.load_diag = None;
+                        self.wb.load_incomplete = false;
+                    }
+                    format!("已保存 {}", path.display())
+                }
                 Err(error) => error,
             };
             eprintln!("[save] {}", self.status);

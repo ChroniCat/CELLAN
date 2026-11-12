@@ -497,6 +497,9 @@ impl DateSystem {
 
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
+    /// 打开时有关键部件没读全（C14）。这类簿子不能用原文件当保存基准，
+    /// 也不能就地覆盖——原文件里的东西我们根本没读到。
+    pub load_incomplete: bool,
     /// 文件里是否带 VBA 宏（只保留，不执行）
     pub has_vba: bool,
     /// 自定义名称（名称管理器里的东西）：(名字, 作用表, 公式文本)
@@ -536,6 +539,7 @@ pub struct Workbook {
 impl Workbook {
     pub fn new_blank() -> Self {
         Self {
+            load_incomplete: false,
             has_vba: false,
             names: Vec::new(),
             sources: Vec::new(),

@@ -104,6 +104,59 @@ fn data_to_value(d: &Data) -> Value {
 
 /// 读取 xlsx/xls/ods（按扩展名自动识别）
 
+/// 一次加载中发现的问题。`fatal` 表示"覆盖保存会丢掉用户的真实数据"，
+/// 调用方（应用层）必须据此禁止普通覆盖保存，只能只读查看或另存抢救副本。
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadProblem {
+    /// 工作表名（部件级问题为 None）
+    pub sheet: Option<String>,
+    /// 出问题的部件或环节，例如 `xl/worksheets/sheet1.xml`、`styles`、`sharedStrings`
+    pub part: String,
+    /// 丢了什么：单元格数据 / 公式 / 样式 / 关系 …
+    pub what: String,
+    pub detail: String,
+    pub fatal: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadDiag {
+    pub problems: Vec<LoadProblem>,
+}
+
+impl LoadDiag {
+    pub fn push(&mut self, sheet: Option<&str>, part: &str, what: &str, detail: String, fatal: bool) {
+        self.problems.push(LoadProblem {
+            sheet: sheet.map(|s| s.to_string()),
+            part: part.into(),
+            what: what.into(),
+            detail,
+            fatal,
+        });
+    }
+    pub fn is_complete(&self) -> bool {
+        self.problems.is_empty()
+    }
+    pub fn has_fatal(&self) -> bool {
+        self.problems.iter().any(|p| p.fatal)
+    }
+    /// 给状态栏/对话框用的一句话摘要
+    pub fn summary(&self) -> String {
+        if self.problems.is_empty() {
+            return String::new();
+        }
+        let fatal = self.problems.iter().filter(|p| p.fatal).count();
+        let first = &self.problems[0];
+        format!(
+            "{} 处读取问题（{} 处会丢数据）：{}{} {}",
+            self.problems.len(),
+            fatal,
+            first.sheet.as_deref().map(|s| format!("{s} ")).unwrap_or_default(),
+            first.what,
+            first.detail
+        )
+    }
+}
+
 /// 并行解析的中间结果：只存原始数据，样式留给主线程 intern
 struct RawSheet {
     name: String,
@@ -120,10 +173,23 @@ fn load_chunk(
     targets: &std::collections::HashMap<String, String>,
     shared: &[String],
     limit: u64,
-) -> Vec<RawSheet> {
+) -> (Vec<RawSheet>, Vec<LoadProblem>) {
     let mut out = Vec::new();
-    let Ok(mut reader) = crate::xlsx::open_workbook_auto(path) else {
-        return out;
+    let mut problems = Vec::new();
+    let mut reader = match crate::xlsx::open_workbook_auto(path) {
+        Ok(r) => r,
+        Err(e) => {
+            for n in names {
+                problems.push(LoadProblem {
+                    sheet: Some(n.clone()),
+                    part: "workbook".into(),
+                    what: "整张工作表".into(),
+                    detail: format!("无法打开工作簿：{e:#}"),
+                    fatal: true,
+                });
+            }
+            return (out, problems);
+        }
     };
     for name in names {
         let mut raw = RawSheet {
@@ -144,10 +210,27 @@ fn load_chunk(
                     out.push(raw);
                     continue;
                 }
-                Err(e) => eprintln!("[load] {name} 稀疏读取失败，退回 calamine: {e:#}"),
+                Err(e) => {
+                    eprintln!("[load] {name} 稀疏读取失败，退回 calamine: {e:#}");
+                    problems.push(LoadProblem {
+                        sheet: Some(name.clone()),
+                        part: part.clone(),
+                        what: "大表稀疏读取".into(),
+                        detail: format!("退回通用解析器：{e:#}"),
+                        fatal: false,
+                    });
+                }
             }
         }
-        if let Ok(range) = reader.worksheet_range(name) {
+        match reader.worksheet_range(name) {
+            Err(e) => problems.push(LoadProblem {
+                sheet: Some(name.clone()),
+                part: targets.get(name).cloned().unwrap_or_else(|| format!("{name} 的工作表部件")),
+                what: "全部单元格数据".into(),
+                detail: format!("{e:#}"),
+                fatal: true,
+            }),
+            Ok(range) => {
             let (r0, c0) = range.start().unwrap_or((0, 0));
             for (row, col, data) in range.cells() {
                 let v = data_to_value(data);
@@ -158,28 +241,47 @@ fn load_chunk(
                     ));
                 }
             }
-        }
-        if let Ok(st) = reader.worksheet_style(name) {
-            for (row, col, style) in st.cells() {
-                raw.styles.push(((row, col), convert_style(style)));
             }
         }
-        if let Ok(forms) = reader.worksheet_formula(name) {
-            let (fr0, fc0) = forms.start().unwrap_or((0, 0));
-            for (row, col, f) in forms.cells() {
-                if f.is_empty() {
-                    continue;
+        match reader.worksheet_style(name) {
+            Err(e) => problems.push(LoadProblem {
+                sheet: Some(name.clone()),
+                part: targets.get(name).cloned().unwrap_or_default(),
+                what: "单元格样式".into(),
+                detail: format!("{e:#}"),
+                fatal: true,
+            }),
+            Ok(st) => {
+                for (row, col, style) in st.cells() {
+                    raw.styles.push(((row, col), convert_style(style)));
                 }
-                let text = {
-                    let raw = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
-                    crate::normalize_formula(&raw)
-                };
-                raw.formulas.push(((fr0 + row as u32, fc0 + col as u32), text));
+            }
+        }
+        match reader.worksheet_formula(name) {
+            Err(e) => problems.push(LoadProblem {
+                sheet: Some(name.clone()),
+                part: targets.get(name).cloned().unwrap_or_default(),
+                what: "全部公式".into(),
+                detail: format!("{e:#}"),
+                fatal: true,
+            }),
+            Ok(forms) => {
+                let (fr0, fc0) = forms.start().unwrap_or((0, 0));
+                for (row, col, f) in forms.cells() {
+                    if f.is_empty() {
+                        continue;
+                    }
+                    let text = {
+                        let raw = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
+                        crate::normalize_formula(&raw)
+                    };
+                    raw.formulas.push(((fr0 + row as u32, fc0 + col as u32), text));
+                }
             }
         }
         out.push(raw);
     }
-    out
+    (out, problems)
 }
 
 /// Office 加密文件是 CFB 容器，里面有一个叫 EncryptedPackage 的流。
@@ -218,6 +320,13 @@ fn is_password_encrypted(path: &Path) -> bool {
 }
 
 pub fn load(path: &Path) -> Result<Workbook> {
+    load_diag(path).map(|(wb, _)| wb)
+}
+
+/// 读取工作簿并带回**结构化诊断**（C14）：哪些部件没读全、丢了什么、是否致命。
+/// `load()` 是它的忽略诊断包装，老调用点行为不变。
+pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
+    let mut diag = LoadDiag::default();
     if is_password_encrypted(path) {
         anyhow::bail!(
             "这个工作簿设置了打开密码（Office 加密），当前版本还不支持解密；\
@@ -238,7 +347,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
             eprintln!("[load] calamine 打不开，改用内置 BIFF 读取器：{e}");
             let mut wb = crate::xls_read::load(path)?;
             apply_xls_meta(path, &mut wb);
-            return Ok(wb);
+            return Ok((wb, diag));
         }
     };
     let names = reader.sheet_names().to_owned();
@@ -247,6 +356,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         .map(|b| b.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]))
         .unwrap_or(false);
     let mut wb = Workbook {
+        load_incomplete: false,
         names: crate::patch::read_defined_names(path),
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
         sources: crate::external::read_sources(path),
@@ -308,7 +418,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         .clamp(1, 6)
         .min(names.len().max(1));
     let chunk = names.len().div_ceil(nthreads).max(1);
-    let raws: Vec<RawSheet> = std::thread::scope(|sc| {
+    let (raws, chunked): (Vec<RawSheet>, Vec<LoadProblem>) = std::thread::scope(|sc| {
         let mut handles = Vec::new();
         for t in 0..nthreads {
             let lo = t * chunk;
@@ -323,14 +433,40 @@ pub fn load(path: &Path) -> Result<Workbook> {
             handles.push(sc.spawn(move || load_chunk(&p, slice, targets_ref, shared_ref, limit)));
         }
         let mut all = Vec::new();
+        let mut probs = Vec::new();
         for h in handles {
             match h.join() {
-                Ok(v) => all.extend(v),
-                Err(_) => eprintln!("[load] 并行解析线程异常退出"),
+                Ok((v, p)) => {
+                    all.extend(v);
+                    probs.extend(p);
+                }
+                Err(_) => {
+                    eprintln!("[load] 并行解析线程异常退出");
+                    probs.push(LoadProblem {
+                        sheet: None,
+                        part: "xl/worksheets".into(),
+                        what: "一组工作表的全部内容".into(),
+                        detail: "解析线程异常退出（panic）".into(),
+                        fatal: true,
+                    });
+                }
             }
         }
-        all
+        (all, probs)
     });
+    diag.problems.extend(chunked);
+    // 声明了但没解析出来的表：宁可报错，也不能当空表打开
+    for name in &names {
+        if !raws.iter().any(|r| &r.name == name) {
+            diag.problems.push(LoadProblem {
+                sheet: Some(name.clone()),
+                part: targets.get(name).cloned().unwrap_or_default(),
+                what: "整张工作表".into(),
+                detail: "workbook.xml 里声明了，但没有解析结果".into(),
+                fatal: true,
+            });
+        }
+    }
 
     // .xls 不是 zip：这条只给 ooXML 用
     let is_ooxml = std::fs::read(path)
@@ -551,12 +687,15 @@ pub fn load(path: &Path) -> Result<Workbook> {
     }
 
     // 图表
-    if let Ok(all) = crate::charts::load_charts_all(path, &wb.sheets) {
-        for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
-            if let Some(list) = all.get(&(idx as u32)) {
-                sheet.charts = list.clone();
+    match crate::charts::load_charts_all(path, &wb.sheets) {
+        Ok(all) => {
+            for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+                if let Some(list) = all.get(&(idx as u32)) {
+                    sheet.charts = list.clone();
+                }
             }
         }
+        Err(e) => diag.push(None, "xl/charts", "全部图表", format!("{e:#}"), true),
     }
 
     // 批注
@@ -702,7 +841,8 @@ pub fn load(path: &Path) -> Result<Workbook> {
             eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
         }
     }
-    Ok(wb)
+    wb.load_incomplete = diag.has_fatal();
+    Ok((wb, diag))
 }
 
 fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
@@ -1308,7 +1448,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         .filter(|p| p.exists())
         .map(|p| p.to_path_buf())
         .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists()).cloned())
-        .or_else(|| wb.path.as_ref().filter(|p| p.exists()).cloned())
+        // 打开不完整的文件不能当保存基准：里面的坏 XML 会让解析器直接崩，
+        // 而且我们没读到的东西写回去就是丢数据。
+        .or_else(|| wb.path.as_ref().filter(|p| p.exists() && !wb.load_incomplete).cloned())
     {
         Some(p) => p,
         None => path.to_path_buf(),

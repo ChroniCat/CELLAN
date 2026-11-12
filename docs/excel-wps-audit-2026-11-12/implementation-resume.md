@@ -1,9 +1,9 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`），HEAD `dece894`（C04 首版已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 3 待验收 / 52 待实施；
-  切片 17 已验收 / 5 待验收 / 126 待实施。
-  C02 已验收（用户 02:43 复核认可）；C04、C08 待验收（用户复核中）。
+- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 4 待验收 / 51 待实施；
+  切片 17 已验收 / 8 待验收 / 123 待实施。
+  C02 已验收（用户 02:43 复核认可）；C04、C08、C14 待验收（用户复核中）。
 
 ## 本轮（2026-11-13 02:45–03:05）：C08 + C04 两条补证
 
@@ -39,12 +39,25 @@
 - `cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture --nocapture` → 1 passed
 - `powershell scratch/c04_export_probe.ps1 <dir>` → 4 行读数（Excel/WPS × 1904/1900）全部符合预期
 - round17（旧代码）：core FAILED 1（sfi，已修）；app 141 passed；GUI 12 passed / 8 ignored
-- round18（当前代码）：运行中，日志 `scratch/round18_{core,app,gui}.log`
+- round18：中途有一次多余括号（编译不过），日志无效，不作为结果
+- round19（当前代码）：core 560/0/40、app 143、GUI 12/8，全部 EXIT=0
+
+### C14 部分加载失败不得伪装完整工作簿（P0，待验收）
+- 新增 `LoadDiag`/`LoadProblem` + `load_diag()`（`load()` 保持兼容）；
+  单元格/公式/样式/整表/图表读取失败 = 致命，稀疏回退 = 非致命。
+- `Workbook.load_incomplete`：不完整的簿子不拿原文件当保存基准（坏 XML 会让 umya panic）。
+- 应用层：`OpenMsg::Loaded` 带诊断；有致命问题时 `save(false)` 拒绝就地保存并说明原因，
+  「另存为」允许并解除限制。
+- 测试：`core/tests/load_diag.rs` **6 passed**；app `incomplete_load_blocks…` **1 passed**。
+- 变异：M1（致命标记改 false）2 failed；M3（去掉基准跳过）app 用例失败；
+  M2（缺表兜底检查）**未被抓住**，已登记为未覆盖。
+- round19 全量：core 64 bins / **560 passed / 0 failed / 40 ignored**；
+  app **143 passed**；GUI **12 passed / 8 ignored**；全部 EXIT=0。
 
 ## 下一步
-1. 读 round18 结果；全绿则把数字写进 resume/台账并提交推送。
-2. 下一个可执行任务：C14（P0，无依赖）部分加载失败不得伪装完整工作簿；
-   之后 C05（P1，依赖 C01 已验收）、C06（P1，无依赖）。
+1. 提交 C14（代码 + 证据 + 台账）并推送。
+2. 下一个可执行任务：C05（P1，依赖 C01 已验收）空值/布尔/文本比较语义，
+   或 C06（P1，无依赖）本地时间与序列 60。
 3. UI-01 真实 IME/键盘/Alt+Enter 取证仍阻塞在硬件条件；C09 依赖 C13+UI-03，
    C10/C11 依赖 C03，C12 依赖 C01+C13，C15 依赖 UI-03。
 
