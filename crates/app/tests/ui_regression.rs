@@ -213,6 +213,36 @@ fn textbox_drag_moves_model() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+// ---------------------------------------------------------------- 数据分析四件套
+
+#[test]
+fn subtotal_and_flashfill_apply() {
+    let src = Path::new("F:/Finance/work/table.xlsx");
+    if !src.exists() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ui_data_{}.xlsx", std::process::id()));
+    std::fs::copy(src, &tmp).unwrap();
+    // table.xlsx 的 部门 列不是相邻同值，分类汇总会如实按「相邻同组」处理（可能多组）
+    let Some(dump) = dump_for(
+        &tmp.to_string_lossy(),
+        &[("SC_SUBTOTAL", "A1:C6,B,C")],
+        Duration::from_secs(30),
+    ) else {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    };
+    assert!(
+        dump.lines().any(|l| l.contains("汇总")),
+        "分类汇总的小计行没出现：\n{dump}"
+    );
+    assert!(
+        dump.lines().any(|l| l.contains("总计")),
+        "总计行没出现：\n{dump}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
 // ---------------------------------------------------------------- 迷你图
 
 /// 仓库里 Excel 365 造的迷你图样本（三种类型 + 双迷你图组）

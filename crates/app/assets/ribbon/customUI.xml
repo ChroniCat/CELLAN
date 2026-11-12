@@ -556,6 +556,12 @@
             <button id="ScenarioManager" label="方案管理器" imageMso="Table" screentip="保存/切换多套输入值" onAction="ScenarioManager" sizeString="110"/>
           </box>
         </group>
+        <group id="GroupForecast" label="预测">
+          <box boxStyle="vertical">
+            <button id="ForecastSheet" label="预测工作表" imageMso="Chart" screentip="线性回归外推到新工作表" onAction="ForecastSheet" sizeString="118"/>
+            <button id="SubtotalBtn" label="分类汇总" imageMso="Sum" screentip="按列分组插入 SUBTOTAL 小计" onAction="Subtotal" sizeString="118"/>
+          </box>
+        </group>
         <group id="GroupOutline" label="分级显示">
           <box boxStyle="vertical">
             <button id="GroupSelection" label="组合" imageMso="Plus" screentip="整列选区组合列，其余组合行" onAction="GroupSelection" sizeString="104"/>
@@ -597,6 +603,10 @@
             <button id="RemoveDuplicates" label="删除重复项" imageMso="Table" onAction="RemoveDuplicates" sizeString="110"/>
             <button id="CFManager" label="条件格式" imageMso="Filter" onAction="CFManager" sizeString="110"/>
             <button id="DataValidationBtn" label="数据验证" imageMso="Grid" onAction="DataValidation" sizeString="110"/>
+          </box>
+          <box boxStyle="vertical">
+            <button id="FlashFill" label="快速填充" imageMso="Fx" screentip="从示例反推规则并填充" onAction="FlashFill" sizeString="104"/>
+            <button id="Consolidate" label="合并计算" imageMso="Table" screentip="按行/列标签把多张表汇总" onAction="Consolidate" sizeString="104"/>
           </box>
         </group>
         <group id="GroupDataLinks" label="链接">

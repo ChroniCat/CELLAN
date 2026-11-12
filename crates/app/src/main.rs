@@ -347,6 +347,44 @@ struct ProtectDlg {
 }
 
 /// 图表拖动/缩放的状态
+/// 预测工作表对话框
+#[derive(Clone)]
+struct ForecastDlg {
+    range: String,
+    periods: u32,
+    msg: String,
+}
+
+/// 分类汇总对话框
+#[derive(Clone)]
+struct SubtotalDlg {
+    range: String,
+    key_col: String,
+    funcs: sheetcore::subtotal::SubFn,
+    value_cols: String,
+    msg: String,
+}
+
+/// 快速填充对话框
+#[derive(Clone)]
+struct FlashDlg {
+    range: String,
+    src_col: String,
+    dst_col: String,
+    aux_col: String,
+    msg: String,
+}
+
+/// 合并计算对话框
+#[derive(Clone)]
+struct ConsDlg {
+    funcs: sheetcore::consolidate::ConsFn,
+    sources: String,
+    row_labels: bool,
+    col_labels: bool,
+    msg: String,
+}
+
 /// 切片器面板：绑在当前透视表上，勾选状态直接映射到 PivotSpec.exclude
 #[derive(Clone)]
 struct SlicerUI {
@@ -455,6 +493,10 @@ struct SheetApp {
     tb_dlg: Option<(usize, sheetcore::textbox::TextBox)>,
     /// 切片器面板
     slicer: Option<SlicerUI>,
+    fc_dlg: Option<ForecastDlg>,
+    st_dlg: Option<SubtotalDlg>,
+    ff_dlg: Option<FlashDlg>,
+    cs_dlg: Option<ConsDlg>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
     /// 批注编辑：(行, 列, 文本)
@@ -878,6 +920,10 @@ impl SheetApp {
             tb_insert: false,
             tb_dlg: None,
             slicer: None,
+            fc_dlg: None,
+            st_dlg: None,
+            ff_dlg: None,
+            cs_dlg: None,
             dv_open: None,
             note_edit: None,
             link_dlg: None,
@@ -1570,6 +1616,78 @@ impl SheetApp {
                                     }),
                                 });
                                 eprintln!("[tb] 改位置 {spec}");
+                            }
+                        }
+                    }
+                    // 无界面验收：SC_ACTIVE_SHEET=n 切到第 n 张表（0 起）
+                    if let Ok(v) = std::env::var("SC_ACTIVE_SHEET") {
+                        if let Ok(i) = v.parse::<usize>() {
+                            if i < self.wb.sheets.len() {
+                                self.sheet_idx = i;
+                                eprintln!("[sheet] 切到 {i}（{}）", self.wb.sheets[i].name);
+                            }
+                        }
+                    }
+                    // 无界面验收：数据分析四件套
+                    if let Ok(spec) = std::env::var("SC_FORECAST") {
+                        let mut it = spec.split(',');
+                        let range = it.next().unwrap_or("").trim().to_string();
+                        let periods = it
+                            .next()
+                            .and_then(|v| v.trim().parse::<u32>().ok())
+                            .unwrap_or(6);
+                        match self.forecast_run(&range, periods) {
+                            Ok(s) => eprintln!("[forecast] {s}"),
+                            Err(e) => eprintln!("[forecast] 失败：{e}"),
+                        }
+                    }
+                    if let Ok(spec) = std::env::var("SC_SUBTOTAL") {
+                        let v: Vec<&str> = spec.split(',').collect();
+                        if v.len() >= 3 {
+                            let f = match v.get(3).map(|s| s.trim()) {
+                                Some("avg") => sheetcore::subtotal::SubFn::Average,
+                                Some("count") => sheetcore::subtotal::SubFn::Count,
+                                Some("max") => sheetcore::subtotal::SubFn::Max,
+                                Some("min") => sheetcore::subtotal::SubFn::Min,
+                                _ => sheetcore::subtotal::SubFn::Sum,
+                            };
+                            match self.subtotal_run(v[0].trim(), v[1].trim(), v[2].trim(), f) {
+                                Ok(s) => eprintln!("[subtotal] {s}"),
+                                Err(e) => eprintln!("[subtotal] 失败：{e}"),
+                            }
+                        }
+                    }
+                    if let Ok(spec) = std::env::var("SC_FLASHFILL") {
+                        let v: Vec<&str> = spec.split(',').collect();
+                        if v.len() >= 3 {
+                            match self.flashfill_run(
+                                v[0].trim(),
+                                v[1].trim(),
+                                v[2].trim(),
+                                v.get(3).map(|s| s.trim()).unwrap_or(""),
+                            ) {
+                                Ok(s) => eprintln!("[flashfill] {s}"),
+                                Err(e) => eprintln!("[flashfill] 失败：{e}"),
+                            }
+                        }
+                    }
+                    if let Ok(spec) = std::env::var("SC_CONSOLIDATE") {
+                        // 函数;引用(用 | 分隔多行);行标签;列标签
+                        let v: Vec<&str> = spec.split(';').collect();
+                        if v.len() >= 2 {
+                            let f = match v[0].trim() {
+                                "avg" => sheetcore::consolidate::ConsFn::Average,
+                                "count" => sheetcore::consolidate::ConsFn::Count,
+                                "max" => sheetcore::consolidate::ConsFn::Max,
+                                "min" => sheetcore::consolidate::ConsFn::Min,
+                                _ => sheetcore::consolidate::ConsFn::Sum,
+                            };
+                            let src = v[1].replace('|', "\n");
+                            let row = v.get(2).map(|s| s.trim() != "0").unwrap_or(true);
+                            let col = v.get(3).map(|s| s.trim() != "0").unwrap_or(true);
+                            match self.consolidate_run(&src, f, row, col) {
+                                Ok(s) => eprintln!("[consolidate] {s}"),
+                                Err(e) => eprintln!("[consolidate] 失败：{e}"),
                             }
                         }
                     }
@@ -9134,6 +9252,524 @@ impl SheetApp {
         }
         self.status = format!("已创建 {made} 条迷你图");
         Ok(made)
+    }
+
+    // ---------------------------------------------------------------- 数据工具
+
+    /// 预测工作表：线性回归 + 新建「预测」工作表
+    fn forecast_run(&mut self, range: &str, periods: u32) -> Result<String, String> {
+        let Some(rect) = Self::parse_rect(range) else {
+            return Err(format!("区域「{range}」看不懂，写成 A1:B13 或 A1:A13"));
+        };
+        let (r1, c1, r2, c2) = rect;
+        // 数据列：取第一个至少有两个数字的列
+        let mut col = None;
+        for c in c1..=c2 {
+            let n = (r1..=r2)
+                .filter(|r| matches!(self.wb.sheet(self.sheet_idx).value(*r, c), Value::Number(_)))
+                .count();
+            if n >= 2 {
+                col = Some(c);
+                break;
+            }
+        }
+        let Some(c) = col else {
+            return Err("选区内没有至少两个数字的列".into());
+        };
+        let mut xs: Vec<f64> = Vec::new();
+        let mut ys: Vec<f64> = Vec::new();
+        for (i, r) in (r1..=r2).enumerate() {
+            if let Value::Number(n) = self.wb.sheet(self.sheet_idx).value(r, c) {
+                xs.push(i as f64 + 1.0);
+                ys.push(n);
+            }
+        }
+        let Some(f) = sheetcore::forecast::linear(&xs, &ys, periods as usize) else {
+            return Err("数据太少或横轴没有变化，算不出回归".into());
+        };
+        // 新建工作表
+        let mut name = "预测".to_string();
+        let mut k = 2;
+        while self.wb.sheets.iter().any(|s| s.name == name) {
+            name = format!("预测{k}");
+            k += 1;
+        }
+        let mut sh = sheetcore::Sheet::new(name.clone());
+        sh.set(0, 0, Cell { value: Value::Text("期".into()), formula: None });
+        sh.set(0, 1, Cell { value: Value::Text("原值".into()), formula: None });
+        sh.set(0, 2, Cell { value: Value::Text("拟合值".into()), formula: None });
+        sh.set(0, 3, Cell { value: Value::Text("预测值".into()), formula: None });
+        for i in 0..ys.len() {
+            let r = i as u32 + 1;
+            sh.set(r, 0, Cell { value: Value::Number(i as f64 + 1.0), formula: None });
+            sh.set(r, 1, Cell { value: Value::Number(ys[i]), formula: None });
+            sh.set(r, 2, Cell { value: Value::Number(f.fitted[i]), formula: None });
+        }
+        let n = ys.len() as u32;
+        for (k, v) in f.future.iter().enumerate() {
+            let r = n + 1 + k as u32;
+            sh.set(r, 0, Cell { value: Value::Number((n + 1 + k as u32) as f64), formula: None });
+            sh.set(r, 3, Cell { value: Value::Number(*v), formula: None });
+        }
+        // 参数与拟合质量写在右侧，方便核对
+        let info = [
+            ("斜率 b", f.b),
+            ("截距 a", f.a),
+            ("R²", f.r2),
+            ("残差标准差 σ", f.sigma),
+            ("95% 区间半宽", 1.96 * f.sigma),
+        ];
+        sh.set(0, 5, Cell { value: Value::Text("回归参数".into()), formula: None });
+        for (i, (k2, v)) in info.iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set(r, 5, Cell { value: Value::Text((*k2).into()), formula: None });
+            sh.set(r, 6, Cell { value: Value::Number(*v), formula: None });
+        }
+        self.wb.sheets.push(sh);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let idx = self.wb.sheets.len() - 1;
+        self.sheet_idx = idx;
+        self.sel = (0, 0);
+        self.sel_end = (0, 0);
+        self.status = format!(
+            "已生成「{name}」：y = {:.4} + {:.4}·x，R²={:.3}，外推 {} 期",
+            f.a,
+            f.b,
+            f.r2,
+            periods
+        );
+        Ok(self.status.clone())
+    }
+
+    /// 分类汇总
+    fn subtotal_run(
+        &mut self,
+        range: &str,
+        key: &str,
+        value_cols: &str,
+        f: sheetcore::subtotal::SubFn,
+    ) -> Result<String, String> {
+        let Some(rect) = Self::parse_rect(range) else {
+            return Err(format!("区域「{range}」看不懂"));
+        };
+        let key_col = Self::parse_col(key)
+            .ok_or_else(|| format!("分组列「{key}」看不懂，写成 A 或 1"))?;
+        let mut cols: Vec<u32> = Vec::new();
+        for part in value_cols.split([',', '，']) {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            let c = Self::parse_col(p).ok_or_else(|| format!("汇总列「{p}」看不懂"))?;
+            cols.push(c);
+        }
+        if cols.is_empty() {
+            return Err("至少填一个汇总列".into());
+        }
+        let before = sheetcore::undo::snapshot_sheet(self.wb.sheet(self.sheet_idx), self.sheet_idx);
+        let rep = sheetcore::subtotal::subtotal(
+            self.wb.sheet_mut(self.sheet_idx),
+            rect,
+            key_col,
+            &cols,
+            f,
+        );
+        if rep.groups == 0 {
+            return Err("选区内没有可分组的行".into());
+        }
+        let after = sheetcore::undo::snapshot_sheet(self.wb.sheet(self.sheet_idx), self.sheet_idx);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.undo.push(sheetcore::undo::Action {
+            label: "分类汇总".into(),
+            deltas: Vec::new(),
+            focus: (self.sheet_idx, self.sel.0, self.sel.1),
+            snap_before: Some(before),
+            snap_after: Some(after),
+            by_site: 0,
+            shapes: None,
+        });
+        self.status = format!("分类汇总：{} 组，插了 {} 行（{}）", rep.groups, rep.rows, f.label());
+        Ok(self.status.clone())
+    }
+
+    /// 快速填充
+    fn flashfill_run(
+        &mut self,
+        range: &str,
+        src: &str,
+        dst: &str,
+        aux: &str,
+    ) -> Result<String, String> {
+        let Some(rect) = Self::parse_rect(range) else {
+            return Err(format!("区域「{range}」看不懂"));
+        };
+        let src_col = Self::parse_col(src).ok_or_else(|| format!("源列「{src}」看不懂"))?;
+        let dst_col = Self::parse_col(dst).ok_or_else(|| format!("目标列「{dst}」看不懂"))?;
+        let aux_col = if aux.trim().is_empty() {
+            None
+        } else {
+            Some(Self::parse_col(aux).ok_or_else(|| format!("辅助列「{aux}」看不懂"))?)
+        };
+        let out = sheetcore::flashfill::flash_fill(
+            self.wb.sheet_mut(self.sheet_idx),
+            src_col,
+            dst_col,
+            rect.0,
+            rect.2,
+            aux_col,
+        )?;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("快速填充：{}（填了 {} 格）", out.rule.label(), out.filled);
+        Ok(self.status.clone())
+    }
+
+    /// 合并计算
+    fn consolidate_run(
+        &mut self,
+        sources: &str,
+        f: sheetcore::consolidate::ConsFn,
+        row_labels: bool,
+        col_labels: bool,
+    ) -> Result<String, String> {
+        let mut list: Vec<sheetcore::consolidate::Source> = Vec::new();
+        for line in sources.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (sheet, rng) = match line.rsplit_once('!') {
+                Some((s, r)) => {
+                    let s = s.trim().trim_matches('\'').replace("''", "'");
+                    (s, r.to_string())
+                }
+                None => (self.wb.sheet(self.sheet_idx).name.clone(), line.to_string()),
+            };
+            let Some(rect) = Self::parse_rect(&rng) else {
+                return Err(format!("引用「{line}」的区域看不懂"));
+            };
+            list.push(sheetcore::consolidate::Source { sheet, rect });
+        }
+        if list.is_empty() {
+            return Err("至少填一行引用位置，例如 一月!A1:B10".into());
+        }
+        let at = self.sel;
+        let rep = sheetcore::consolidate::consolidate(
+            &mut self.wb,
+            self.sheet_idx,
+            at,
+            &list,
+            f,
+            row_labels,
+            col_labels,
+        )?;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "合并计算（{}）：{} 行 × {} 列，写在 {}",
+            f.label(),
+            rep.rows,
+            rep.cols,
+            cell_name(at.0, at.1)
+        );
+        Ok(self.status.clone())
+    }
+
+    /// 列字母或 1 起的列号
+    fn parse_col(s: &str) -> Option<u32> {
+        let t = s.trim().trim_end_matches("列");
+        if t.is_empty() {
+            return None;
+        }
+        if let Ok(n) = t.parse::<u32>() {
+            return Some(n.saturating_sub(1));
+        }
+        let mut v = 0u32;
+        for ch in t.chars() {
+            if !ch.is_ascii_alphabetic() {
+                return None;
+            }
+            v = v * 26 + (ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+        }
+        Some(v.saturating_sub(1))
+    }
+
+    /// 预测工作表对话框
+    fn forecast_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.fc_dlg.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "预测工作表", 430.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "数据区域", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.range)
+                            .desired_width(280.0)
+                            .hint_text("A1:A13（含数值列）"),
+                    );
+                });
+                ui_kit::field(ui, "预测期数", |ui| {
+                    let mut v = d.periods as f64;
+                    if ui_kit::spin(ui, &mut v, 1.0, 120.0, 1.0, 70.0) {
+                        d.periods = v as u32;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("用最小二乘线性回归外推；结果写到新工作表（期/原值/拟合值/预测值 + 回归参数）")
+                        .size(10.5)
+                        .weak(),
+                );
+                if !d.msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&d.msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(192, 0, 0)),
+                    );
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "创建").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            match self.forecast_run(&d.range, d.periods.max(1)) {
+                Ok(_) => self.fc_dlg = None,
+                Err(e) => {
+                    d.msg = e;
+                    self.fc_dlg = Some(d);
+                }
+            }
+        } else {
+            self.fc_dlg = if open { Some(d) } else { None };
+        }
+    }
+
+    /// 分类汇总对话框
+    fn subtotal_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.st_dlg.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "分类汇总", 440.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "区域", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.range)
+                            .desired_width(300.0)
+                            .hint_text("A1:C20（含表头）"),
+                    );
+                });
+                ui_kit::field(ui, "分组列", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.key_col)
+                            .desired_width(80.0)
+                            .hint_text("A"),
+                    );
+                });
+                ui_kit::field(ui, "汇总方式", |ui| {
+                    egui::ComboBox::from_id_salt("sub_fn")
+                        .selected_text(d.funcs.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for f in [
+                                sheetcore::subtotal::SubFn::Sum,
+                                sheetcore::subtotal::SubFn::Average,
+                                sheetcore::subtotal::SubFn::Count,
+                                sheetcore::subtotal::SubFn::Max,
+                                sheetcore::subtotal::SubFn::Min,
+                            ] {
+                                if ui.selectable_label(d.funcs == f, f.label()).clicked() {
+                                    d.funcs = f;
+                                }
+                            }
+                        });
+                });
+                ui_kit::field(ui, "汇总列", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.value_cols)
+                            .desired_width(160.0)
+                            .hint_text("B,C"),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("同值必须相邻（先按分组列排序）；小计用 SUBTOTAL，明细自动打 1 级")
+                        .size(10.5)
+                        .weak(),
+                );
+                if !d.msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&d.msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(192, 0, 0)),
+                    );
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            match self.subtotal_run(&d.range, &d.key_col, &d.value_cols, d.funcs) {
+                Ok(_) => self.st_dlg = None,
+                Err(e) => {
+                    d.msg = e;
+                    self.st_dlg = Some(d);
+                }
+            }
+        } else {
+            self.st_dlg = if open { Some(d) } else { None };
+        }
+    }
+
+    /// 快速填充对话框
+    fn flashfill_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.ff_dlg.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "快速填充", 430.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "区域", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.range)
+                            .desired_width(240.0)
+                            .hint_text("A1:C20"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui_kit::field(ui, "源列", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut d.src_col).desired_width(50.0));
+                    });
+                    ui_kit::field(ui, "目标列", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut d.dst_col).desired_width(50.0));
+                    });
+                    ui_kit::field(ui, "辅助列", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.aux_col)
+                                .desired_width(50.0)
+                                .hint_text("可空"),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new("先在目标列写一个示例；推不出规则会直接报错，不猜")
+                        .size(10.5)
+                        .weak(),
+                );
+                if !d.msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&d.msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(192, 0, 0)),
+                    );
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "填充").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            match self.flashfill_run(&d.range, &d.src_col, &d.dst_col, &d.aux_col) {
+                Ok(_) => self.ff_dlg = None,
+                Err(e) => {
+                    d.msg = e;
+                    self.ff_dlg = Some(d);
+                }
+            }
+        } else {
+            self.ff_dlg = if open { Some(d) } else { None };
+        }
+    }
+
+    /// 合并计算对话框
+    fn consolidate_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.cs_dlg.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "合并计算", 460.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "函数", |ui| {
+                    egui::ComboBox::from_id_salt("cons_fn")
+                        .selected_text(d.funcs.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for f in [
+                                sheetcore::consolidate::ConsFn::Sum,
+                                sheetcore::consolidate::ConsFn::Count,
+                                sheetcore::consolidate::ConsFn::Average,
+                                sheetcore::consolidate::ConsFn::Max,
+                                sheetcore::consolidate::ConsFn::Min,
+                            ] {
+                                if ui.selectable_label(d.funcs == f, f.label()).clicked() {
+                                    d.funcs = f;
+                                }
+                            }
+                        });
+                });
+                ui.label(egui::RichText::new("引用位置（每行一个）").size(12.0).weak());
+                ui.add(
+                    egui::TextEdit::multiline(&mut d.sources)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("一月!A1:B10\n二月!A1:B10"),
+                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut d.row_labels, "首行（列标签）");
+                    ui.checkbox(&mut d.col_labels, "最左列（行标签）");
+                });
+                ui.label(
+                    egui::RichText::new(format!("结果写在当前选中格 {}", cell_name(self.sel.0, self.sel.1)))
+                        .size(10.5)
+                        .weak(),
+                );
+                if !d.msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&d.msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(192, 0, 0)),
+                    );
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            let src = d.sources.clone();
+            match self.consolidate_run(&src, d.funcs, d.row_labels, d.col_labels) {
+                Ok(_) => self.cs_dlg = None,
+                Err(e) => {
+                    d.msg = e;
+                    self.cs_dlg = Some(d);
+                }
+            }
+        } else {
+            self.cs_dlg = if open { Some(d) } else { None };
+        }
     }
 
     // ---------------------------------------------------------------- 切片器
@@ -18918,6 +19554,10 @@ impl eframe::App for SheetApp {
         self.spark_dialog(ctx);
         self.tb_dialog(ctx);
         self.slicer_window(ctx);
+        self.forecast_dialog(ctx);
+        self.subtotal_dialog(ctx);
+        self.flashfill_dialog(ctx);
+        self.consolidate_dialog(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);

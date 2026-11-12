@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use super::CtlState;
-use crate::{cell_name, SheetApp};
+use crate::{cell_name, col_label, SheetApp};
 
 fn fmt_label(code: &str) -> &str {
     match code {
@@ -812,6 +812,61 @@ impl SheetApp {
             "Filter" => self.start_filter(),
             "MultiSort" => self.open_data_dlg(0),
             "RemoveDuplicates" => self.run_dedup(),
+            // ---------------------------------------------------- 数据分析四件套
+            "ForecastSheet" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let range = if r1 == r2 && c1 == c2 {
+                    // 单格：取当前区域
+                    let (a, b) = (self.sel.0, self.sel.1);
+                    let reg = sheetcore::sort_filter::current_region(
+                        self.wb.sheet(self.sheet_idx),
+                        a,
+                        b,
+                    );
+                    format!("{}:{}", cell_name(reg.0, reg.1), cell_name(reg.2, reg.3))
+                } else {
+                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                };
+                self.fc_dlg = Some(crate::ForecastDlg {
+                    range,
+                    periods: 6,
+                    msg: String::new(),
+                });
+            }
+            "Subtotal" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let range = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+                self.st_dlg = Some(crate::SubtotalDlg {
+                    range,
+                    key_col: col_label(c1),
+                    funcs: sheetcore::subtotal::SubFn::Sum,
+                    value_cols: if c2 > c1 {
+                        col_label(c1 + 1)
+                    } else {
+                        String::new()
+                    },
+                    msg: String::new(),
+                });
+            }
+            "FlashFill" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                self.ff_dlg = Some(crate::FlashDlg {
+                    range: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
+                    src_col: col_label(c1),
+                    dst_col: col_label(c1 + 1),
+                    aux_col: if c2 > c1 + 1 { col_label(c2) } else { String::new() },
+                    msg: String::new(),
+                });
+            }
+            "Consolidate" => {
+                self.cs_dlg = Some(crate::ConsDlg {
+                    funcs: sheetcore::consolidate::ConsFn::Sum,
+                    sources: String::new(),
+                    row_labels: true,
+                    col_labels: true,
+                    msg: String::new(),
+                });
+            }
             "CFManager" => self.cf_mgr = true,
 
             // ---------------------------------------------------- 审阅
