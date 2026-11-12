@@ -557,17 +557,34 @@
    "scope": "core/csv.rs, external.rs + app导入",
    "source": "core-requirements.md",
    "heading": "C09 P0 CSV首次导入与刷新使用同一解析和列类型模型",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "待验收",
+   "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
+   "files": [
+    "crates/core/src/csv.rs",
+    "crates/core/src/external.rs",
+    "crates/app/src/main.rs",
+    "crates/core/tests/csv_import.rs",
+    "crates/app/src/edit_regression_tests.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --offline --test csv_import -> 6 passed",
+    "cargo test -p sheetcore --offline --test external_data -> 7 passed",
+    "cargo test -p app ... --bin app -- csv_import_from_the_app -> 1 passed",
+    "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c09-csv-source.txt"
+   ],
+   "not_done": [
+    "编码/列类型预览对话框未实现（仅自动探测 + 代码指定文本列）",
+    "Excel/WPS 编码向导三方对拍未做",
+    "刷新命令入口的 undo 单步取证未做"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "用户复核；后续补预览对话框与三方对拍",
+   "updated_utc": "2026-11-13T03:15:00Z",
    "slices": [
     {
      "id": "C09.1",
@@ -575,17 +592,34 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
+     "files": [
+      "crates/core/src/csv.rs",
+      "crates/core/src/external.rs",
+      "crates/app/src/main.rs",
+      "crates/core/tests/csv_import.rs",
+      "crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test csv_import -> 6 passed",
+      "cargo test -p sheetcore --offline --test external_data -> 7 passed",
+      "cargo test -p app ... --bin app -- csv_import_from_the_app -> 1 passed",
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c09-csv-source.txt"
+     ],
+     "not_done": [
+      "编码/列类型预览对话框未实现（仅自动探测 + 代码指定文本列）",
+      "Excel/WPS 编码向导三方对拍未做",
+      "刷新命令入口的 undo 单步取证未做"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     },
     {
      "id": "C09.2",
@@ -593,17 +627,34 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
+     "files": [
+      "crates/core/src/csv.rs",
+      "crates/core/src/external.rs",
+      "crates/app/src/main.rs",
+      "crates/core/tests/csv_import.rs",
+      "crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test csv_import -> 6 passed",
+      "cargo test -p sheetcore --offline --test external_data -> 7 passed",
+      "cargo test -p app ... --bin app -- csv_import_from_the_app -> 1 passed",
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c09-csv-source.txt"
+     ],
+     "not_done": [
+      "编码/列类型预览对话框未实现（仅自动探测 + 代码指定文本列）",
+      "Excel/WPS 编码向导三方对拍未做",
+      "刷新命令入口的 undo 单步取证未做"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     },
     {
      "id": "C09.3",
@@ -611,17 +662,34 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
+     "files": [
+      "crates/core/src/csv.rs",
+      "crates/core/src/external.rs",
+      "crates/app/src/main.rs",
+      "crates/core/tests/csv_import.rs",
+      "crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test csv_import -> 6 passed",
+      "cargo test -p sheetcore --offline --test external_data -> 7 passed",
+      "cargo test -p app ... --bin app -- csv_import_from_the_app -> 1 passed",
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c09-csv-source.txt"
+     ],
+     "not_done": [
+      "编码/列类型预览对话框未实现（仅自动探测 + 代码指定文本列）",
+      "Excel/WPS 编码向导三方对拍未做",
+      "刷新命令入口的 undo 单步取证未做"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     }
    ]
   },
@@ -793,24 +861,26 @@
    ],
    "commits": [],
    "commands": [
-    "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+    "cargo test -p sheetcore --offline --test c14_guard -> 13 passed",
     "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
     "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
-    "round21: core 574 failed 0 / app 146 / gui 12"
+    "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round3.txt"
    ],
    "not_done": [
-    "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
-    "解析线程 panic / 旁路线程失败注入夹具未建立",
-    "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
+    "工作线程 panic / 旁路线程失败注入夹具未建立",
+    "正常 .xls 的 calamine 成功路径无夹具",
+    "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包",
+    "未与真实 Office 修复对话框目视对比"
    ],
    "failures": [],
    "blocker": "",
    "next": "用户复核 round2（A–F 与测试真实性）",
-   "updated_utc": "2026-11-12T21:10:00Z",
+   "updated_utc": "2026-11-13T03:15:00Z",
    "slices": [
     {
      "id": "C14.1",
@@ -833,24 +903,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test c14_guard -> 13 passed",
       "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
       "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
-      "round21: core 574 failed 0 / app 146 / gui 12"
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
      ],
      "evidence": [
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round3.txt"
      ],
      "not_done": [
-      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
-      "解析线程 panic / 旁路线程失败注入夹具未建立",
-      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
+      "工作线程 panic / 旁路线程失败注入夹具未建立",
+      "正常 .xls 的 calamine 成功路径无夹具",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包",
+      "未与真实 Office 修复对话框目视对比"
      ],
      "failures": [],
      "blocker": "",
      "next": "用户复核 round2（A–F 与测试真实性）",
-     "updated_utc": "2026-11-12T21:10:00Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     },
     {
      "id": "C14.2",
@@ -873,24 +945,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test c14_guard -> 13 passed",
       "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
       "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
-      "round21: core 574 failed 0 / app 146 / gui 12"
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
      ],
      "evidence": [
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round3.txt"
      ],
      "not_done": [
-      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
-      "解析线程 panic / 旁路线程失败注入夹具未建立",
-      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
+      "工作线程 panic / 旁路线程失败注入夹具未建立",
+      "正常 .xls 的 calamine 成功路径无夹具",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包",
+      "未与真实 Office 修复对话框目视对比"
      ],
      "failures": [],
      "blocker": "",
      "next": "用户复核 round2（A–F 与测试真实性）",
-     "updated_utc": "2026-11-12T21:10:00Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     },
     {
      "id": "C14.3",
@@ -913,24 +987,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test c14_guard -> 13 passed",
       "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
       "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
-      "round21: core 574 failed 0 / app 146 / gui 12"
+      "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
      ],
      "evidence": [
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round3.txt"
      ],
      "not_done": [
-      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
-      "解析线程 panic / 旁路线程失败注入夹具未建立",
-      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
+      "工作线程 panic / 旁路线程失败注入夹具未建立",
+      "正常 .xls 的 calamine 成功路径无夹具",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包",
+      "未与真实 Office 修复对话框目视对比"
      ],
      "failures": [],
      "blocker": "",
      "next": "用户复核 round2（A–F 与测试真实性）",
-     "updated_utc": "2026-11-12T21:10:00Z"
+     "updated_utc": "2026-11-13T03:15:00Z"
     }
    ]
   },

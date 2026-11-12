@@ -78,3 +78,16 @@
   （drawing→缺失 chart 报致命）。`c14_guard` 8 passed、app 4 passed。
 - round21 全量：core 66 bins 574/0/41、app 146/0、gui 12/0/8（首轮 ribbon 分组抖动，单跑与复跑均过）。
 - 未执行：真实 Excel 另存 .xls 的 calamine 成功分支、工作线程/旁路失败注入、Excel 属性对话框目视。
+
+## 03:49 复核轮（C14 round3 + C09）
+
+- C14：`clear_sheet_notes` 改用 roxmltree 按节点删关系，重建后严格解析再写盘；
+  实测坏件 `work/hermes-round21-.../notes.xlsx` 根标签被删已复现。新增 2 项关系 XML 用例
+  （首个关系是批注 / 批注与其他关系共存），断言根、剩余关系、Id 列表。
+- C14：图表三处吞错改为报错（缺 drawing rels / 缺 rId / chart XML 截断），加 3 个窄夹具。
+  `c14_guard` 13 passed；变异 M7/M8/M9 全部被抓。
+- C09：CSV 统一解码（BOM/UTF-16/GB18030）+ 记录解析 + 列类型（文本列保留 00123/18 位）
+  + 配置持久化 + 原子写入；`csv_import` 6 passed、app 入口 1 passed；
+  变异退回 `lines()+split_line` 得到 (3,2) 症状被抓。
+- round24 全量：core 585/0/41、app 147/0、gui 12/0/8。
+- 待补：编码/列类型预览对话框、Excel/WPS 三方对拍；C14 的工作线程注入、calamine 成功路径、Excel 加密包。
