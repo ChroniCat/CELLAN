@@ -1,0 +1,74 @@
+{
+  "excel": {
+    "version": "16.0",
+    "formulas": {
+      "=DAY(60)": 29.0,
+      "=TEXT(60,\"yyyy-mm-dd\")": "1900-02-29",
+      "=SEQUENCE(2,2)+1": [
+        [
+          2.0,
+          3.0
+        ],
+        [
+          4.0,
+          5.0
+        ]
+      ],
+      "=SEQUENCE(3,1)*2": [
+        [
+          2.0
+        ],
+        [
+          4.0
+        ],
+        [
+          6.0
+        ]
+      ],
+      "=SUM({1;2}+{10,20})": 66.0,
+      "=\"_xlfn.TEXT\"": "_xlfn.TEXT",
+      "=A1=0": true,
+      "=A1=\"\"": true,
+      "=A1<0": false
+    },
+    "incremental_before": "#DIV/0!",
+    "incremental_after": "#DIV/0!",
+    "date1904_A1_iso": "1904-01-02"
+  },
+  "wps": {
+    "version": "12.0",
+    "formulas": {
+      "=DAY(60)": 29.0,
+      "=TEXT(60,\"yyyy-mm-dd\")": "1900-02-29",
+      "=SEQUENCE(2,2)+1": [
+        [
+          2.0,
+          3.0
+        ],
+        [
+          4.0,
+          5.0
+        ]
+      ],
+      "=SEQUENCE(3,1)*2": [
+        [
+          2.0
+        ],
+        [
+          4.0
+        ],
+        [
+          6.0
+        ]
+      ],
+      "=SUM({1;2}+{10,20})": 66.0,
+      "=\"_xlfn.TEXT\"": "_xlfn.TEXT",
+      "=A1=0": true,
+      "=A1=\"\"": true,
+      "=A1<0": false
+    },
+    "incremental_before": "#DIV/0!",
+    "incremental_after": "#DIV/0!",
+    "date1904_A1_iso": "1904-01-02"
+  }
+}

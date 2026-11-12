@@ -21,6 +21,8 @@ cargo test -p app --no-default-features --features glow
 
 部分集成测试依赖未随仓库提供的工作簿，默认标记为 ignored；准备相应样本后需显式运行。测试使用独立的空 TEMP/TMP 目录；GUI 与协作测试可能启动程序或监听本地网络。具体步骤见 [测试说明](crates/core/tests/README.md)。开发记录见 [原生重写记录](docs/native-rewrite.md) 与 [界面差异清单](docs/ui-parity-audit.md)。
 
+当前功能补齐与界面优化需求见 [2026-11-12 Excel 与 WPS 对标审查](docs/excel-wps-audit-2026-11-12/README.md)：包含三方实测、61项优先级任务、验收标准及 Hermes/DeepSeek 实施说明。旧界面清单属于历史快照，不代表当前功能完成率。
+
 ## 第三方资源
 
 字体和依赖许可见 [第三方声明](packaging/THIRD_PARTY_NOTICES.txt)。部分界面图标来自 Office `GetImageMso`，分发前应核实适用授权。

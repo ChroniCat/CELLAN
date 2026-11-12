@@ -1,0 +1,117 @@
+{
+  "baseline": "df48672",
+  "date": "2026-11-12",
+  "timezone": "Asia/Shanghai",
+  "scope": "documentation and diagnostic probes; no product code changes",
+  "versions": {
+    "excel_file": "16.0.20326.20318",
+    "wps_file": "12.1.0.29690",
+    "app": "df48672 debug glow",
+    "dpi": 96,
+    "screen": [
+      2560,
+      1440
+    ]
+  },
+  "tests": {
+    "core": {
+      "command": "cargo test -p sheetcore --offline --no-fail-fast -- --test-threads=1",
+      "result": "passed",
+      "passed": 457,
+      "failed": 0,
+      "ignored": 34,
+      "measured": 0,
+      "filtered": 0
+    },
+    "app_unit": {
+      "command": "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests::",
+      "result": "passed",
+      "passed": 100,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 4
+    },
+    "app_ui": {
+      "command": "cargo test -p app --no-default-features --features glow --offline --test ui_regression -- --test-threads=1",
+      "result": "passed",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 9,
+      "measured": 0,
+      "filtered": 0
+    }
+  },
+  "diagnostic": {
+    "UI-01": {
+      "result": "expected_failure",
+      "passed": 0,
+      "failed": 1,
+      "filtered": 104,
+      "layer": "egui events through handle_keys -> draw_grid_pane",
+      "temporary_test_removed": true,
+      "evidence": "ui-edit-probe.txt"
+    }
+  },
+  "not_executed": [
+    "4 network unit tests",
+    "43 ignored fixture-dependent tests",
+    "complete native keyboard/mouse suite",
+    "Chinese IME candidate interaction",
+    "125/150/200 percent system DPI",
+    "all Office menu paths",
+    "physical printing",
+    "three-product PDF rendering",
+    "release performance benchmark"
+  ],
+  "limitations": [
+    "Initial core test fixture path failure disappeared after current-directory rebuild; stale relocated target cache suspected, not conclusively proven.",
+    "UI screenshots establish visible state, not end-to-end input behavior.",
+    "Existing tests passing does not override the failing new input regression."
+  ],
+  "build": {
+    "command": "cargo build -p app --no-default-features --features glow --offline",
+    "result": "passed",
+    "app_warning_count": 193
+  },
+  "synthetic_baseline_sha256": "bd59dc7dd082c7f55fe786a38c4a890c01d2f3ed8823adabb71c25e2c11878d8",
+  "app_exe_sha256": "1a97de6b426ad8eadd9358e5435be266e2d720c59a6cdb8fe89a3b0bad84beed",
+  "screenshots": [
+    {
+      "file": "app-data.png",
+      "sha256": "0d147bb5bf372adb056ad8397cd537a47e76fa61378294942538932f2ba77a6d"
+    },
+    {
+      "file": "app-find.png",
+      "sha256": "1937216e508b30e8d3bb758697002bd0f02cc940ed366d9e08e94d38645d4b68"
+    },
+    {
+      "file": "app-format.png",
+      "sha256": "f455867a7b1ff74ccd483aa0ce843ae04b131a6b3d5790569e6bbe3f92b74678"
+    },
+    {
+      "file": "app-home-1024.png",
+      "sha256": "ccef1daf31030ddf6774d0967e76ae618ae0915bbe4bfffd93baf9f03ec0a293"
+    },
+    {
+      "file": "app-home-1440.png",
+      "sha256": "11c5eee79108bc7a081f949c527ab8848f6fcf4ecf22ceb3c83445860ab256b7"
+    },
+    {
+      "file": "app-home-760.png",
+      "sha256": "1670c74c528154231f0bf34ab154afdfdf5bdfdbb36f28c51bee11b063578286"
+    },
+    {
+      "file": "app-insert.png",
+      "sha256": "51360107f06de7f08856a80f5bb82545925244286945ccbf0e832a7d436a4e6f"
+    },
+    {
+      "file": "excel-home-1440.png",
+      "sha256": "23dce6c19691bef2126536cb32448f4944c21d9ca185ab58c64489560fe08c2e"
+    },
+    {
+      "file": "wps-home-1440.png",
+      "sha256": "72806a8f1e37572134fddc1fbbad6aa9c5e8b8ca53331f41b38d331bca68251e"
+    }
+  ]
+}

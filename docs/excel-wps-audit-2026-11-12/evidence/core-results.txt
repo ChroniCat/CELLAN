@@ -1,0 +1,30 @@
+Current source rebuilt 2026-11-12; synthetic inputs only.
+=SEQUENCE(2,2)+1 => Array(Array { rows: 1, cols: 4, data: [Number(2.0), Number(3.0), Number(4.0), Number(5.0)] })
+=SEQUENCE(3,1)*2 => Array(Array { rows: 1, cols: 3, data: [Number(2.0), Number(4.0), Number(6.0)] })
+=SUM(Sheet1:Sheet3!A1) => Error(Value)
+=SUM(A1#) => Error(Name)
+=@A1 => Error(Value)
+=SUM(1:1) => Error(Value)
+=DAY(60) => Number(1.0)
+=TEXT(60,"yyyy-mm-dd") => Text("1900-03-01")
+=NOW() => Number(46338.40734336844)
+=TODAY() => Number(46338.0)
+DV NamedList accepts arbitrary: true
+DV >= A1(1) accepts 0: true
+normalize string: ="TEXT"
+load: Ok([("Sheet1", Number(1.0), Text("synthetic"))])
+format A1 date: 1900-01-01
+full C1 Text("#DIV/0!")
+dirty C1 Number(2.0)
+full_again C1 Text("#DIV/0!")
+pivot count missing cell PivotResult { headers: ["Group", "Value"], rows: [[Text("A"), Number(2.0)]], row_name: "Group", value_name: "Value" }
+=A1=0 => Bool(false)
+=A1="" => Bool(false)
+=A1<0 => Bool(true)
+=SUM({1;2}+{10,20}) => Number(33.0)
+=SUM(Sales[Amount]) => Number(30.0)
+=Sales[Amount] => Error(Value)
+=SUM(Sales[[#Data],[Amount]]) => Error(Value)
+="Sales[Amount]" => Text("A2:A3")
+custom original kept: false
+csv refreshed (3, 2),B2=Text("line1"),A3=Text("line2")
