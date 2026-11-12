@@ -34,9 +34,19 @@ C13 结论文档：保存 34 处吞错已清零；注入 5 类（保护/图表/�
 
 **UI-02.3 命令 enabled/tooltip 统一注册**（父任务 UI-02 的最后切片）
 
-第一条动作：读 `crates/app/src/ribbon/ui.rs` 与 `ribbon/actions.rs`，列出当前按钮
-enabled/tooltip 的来源（是否有集中表），先写出「同一命令在不同入口 enabled/提示不一致」
-的最小复现，再建命令表并接线；快捷键（已完成的 Ctrl+S/O/N/P）改为按命令 id 分发。
+已完成的源码盘点（本轮）：
+
+- tooltip：`ribbon/ui.rs` 只有 5 处，主入口是 `tip_of(c)`（ui.rs:648），其余为字体/字号等
+  控件内联文案；`ribbon/actions.rs` 里没有 tooltip。
+- enabled：没有集中表；按钮用 `ui.is_enabled()`（ui.rs:550）绘制态，启用判断散落在各 action
+  实现与 `main.rs` 的命令前置检查里。
+- 结论：UI-02.3 需要建 `Command` 表（id、label、tooltip、enabled 谓词、快捷键），
+  ribbon 绘制与快捷键都从表取状态；这是跨 ui.rs/main.rs 的改动，先做「同一命令
+  在按钮禁用时快捷键仍可执行」的最小复现，再接线。
+
+第一条动作：在 `handle_keys` 的 Ctrl+S/O/N/P 分支旁检查对应 ribbon 按钮的 enabled 条件
+（如保存中/加载中），写一个「按钮 disabled 但快捷键仍触发」的整窗事件测试，
+再引入命令表让两处共用同一谓词。
 
 ## 尚未解决的风险 / 未执行
 
