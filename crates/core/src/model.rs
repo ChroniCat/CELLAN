@@ -200,6 +200,9 @@ pub struct Sheet {
     pub textboxes: Vec<crate::textbox::TextBox>,
     /// 文本框被改过：保存时重写 drawing 部件
     pub textboxes_dirty: bool,
+    /// 工作表被隐藏（workbook.xml 的 `state="hidden"`）
+    pub hidden: bool,
+    pub hidden_dirty: bool,
 }
 
 impl Sheet {
@@ -264,6 +267,8 @@ impl Sheet {
             sparklines_dirty: false,
             textboxes: Vec::new(),
             textboxes_dirty: false,
+            hidden: false,
+            hidden_dirty: false,
         }
     }
 

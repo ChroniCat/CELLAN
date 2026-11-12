@@ -2694,3 +2694,106 @@ pub fn apply_rich(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow
         buf
     })
 }
+
+/// 读 workbook.xml 里每张表的可见性：true = hidden
+pub fn read_sheet_states(path: &std::path::Path) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    let Some(xml) = crate::fixups::read_part_file(path, "xl/workbook.xml")
+        .and_then(|b| String::from_utf8(b).ok())
+    else {
+        return out;
+    };
+    let mut from = 0usize;
+    while let Some(i) = xml[from..].find("<sheet ") {
+        let i = from + i;
+        let Some(gt) = xml[i..].find('>').map(|e| i + e) else { break };
+        let tag = &xml[i..=gt];
+        from = gt + 1;
+        let attr = |name: &str| -> Option<String> {
+            let pat = format!("{name}=\"");
+            let p = tag.find(&pat)? + pat.len();
+            let rest = &tag[p..];
+            let q = rest.find('"')?;
+            Some(crate::model::xml_unescape(&rest[..q]))
+        };
+        if let Some(name) = attr("name") {
+            out.insert(name, attr("state").as_deref() == Some("hidden"));
+        }
+    }
+    out
+}
+
+/// 保存收尾：把工作表可见性写回 workbook.xml（只处理 dirty 的表）
+pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let want: std::collections::HashMap<String, bool> = wb
+        .sheets
+        .iter()
+        .filter(|s| s.hidden_dirty)
+        .map(|s| (s.name.clone(), s.hidden))
+        .collect();
+    if want.is_empty() {
+        return Ok(());
+    }
+    let Some(xml) = crate::fixups::read_part_file(path, "xl/workbook.xml")
+        .and_then(|b| String::from_utf8(b).ok())
+    else {
+        return Ok(());
+    };
+    // 至少要留一张可见表
+    if !wb.sheets.iter().any(|s| !s.hidden) {
+        return Err(anyhow::anyhow!("不能把全部工作表都隐藏"));
+    }
+    let mut out = String::with_capacity(xml.len() + 32);
+    let mut rest = xml.as_str();
+    while let Some(i) = rest.find("<sheet ") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let Some(gt) = tail.find('>') else {
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let tag = &tail[..=gt];
+        let attr = |name: &str| -> Option<String> {
+            let pat = format!("{name}=\"");
+            let p = tag.find(&pat)? + pat.len();
+            let r2 = &tag[p..];
+            let q = r2.find('"')?;
+            Some(r2[..q].to_string())
+        };
+        let name = attr("name").map(|n| crate::model::xml_unescape(&n));
+        match name.as_deref().and_then(|n| want.get(n).map(|h| (n, *h))) {
+            Some((_, hide)) => {
+                // 去掉旧的 state 属性再按需补
+                let mut clean = String::new();
+                let mut seg = tag;
+                loop {
+                    let Some(si) = seg.find(" state=\"") else {
+                        clean.push_str(seg);
+                        break;
+                    };
+                    clean.push_str(&seg[..si]);
+                    let after = &seg[si + " state=\"".len()..];
+                    let Some(q) = after.find('"') else {
+                        clean.push_str(&seg[si..]);
+                        break;
+                    };
+                    seg = &after[q + 1..];
+                }
+                if hide {
+                    if let Some(slash) = clean.rfind("/>") {
+                        clean.insert_str(slash, " state=\"hidden\"");
+                    } else if let Some(gt2) = clean.rfind('>') {
+                        clean.insert_str(gt2, " state=\"hidden\"");
+                    }
+                }
+                out.push_str(&clean);
+            }
+            None => out.push_str(tag),
+        }
+        rest = &tail[gt + 1..];
+    }
+    out.push_str(rest);
+    crate::patch::append_entry(path, "xl/workbook.xml", out.as_bytes())?;
+    Ok(())
+}

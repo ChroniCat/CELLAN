@@ -2779,3 +2779,16 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 - 验收：`SC_OPEN_DIALOG=a11y` 对 spark_gt.xlsx 报 3 项（F2/F3/G2 迷你图缺表头），
   对 data_probe（表名都是中文）报 0 项「一切就绪」；截图核对四列表头与建议文案。
 
+### 第三十九轮：工作表视图、隐藏/取消隐藏、冻结窗格（2026-11-12）
+
+- **工作表隐藏**：`Sheet.hidden/hidden_dirty` + `patch::read_sheet_states()` / `apply_sheet_states()`，
+  读写 `xl/workbook.xml` 的 `<sheet state="hidden">`；隐藏的表不出现在标签栏，全部隐藏会被拒绝。
+  验收：隐藏「一月」→ workbook.xml 里 `<sheet name="一月" … state="hidden"/>` → Excel 打开 4 张表、只 3 张可见。
+- **工作表视图**：`ui_prefs::SavedView { 名称, 表, 缩放, 冻结, 选区 }`，按文件路径散列存到
+  `%LOCALAPPDATA%\SheetsNative\views\<hash>.ini`。视图页签新增「工作表视图」组：
+  切换（列出）/ 保留（更新当前）/ 退出 / 新建。**不进 xlsx**——Excel 的 customSheetViews 只存视图设置、
+  不存命名视图列表，我们没去猜它的部件结构，这一点写在这里和界面提示里。
+  验收：在「销量」表存「看销量」→ 新进程打开同一文件 → 切换视图后 sheet=3、选区=(10,2) 原样恢复。
+- **冻结窗格**：按当前单元格冻结上方行/左侧列（与「冻结首行/首列」并存），写 `freeze` + `freeze_dirty`。
+- 视图页签「窗口」组补齐：冻结窗格 / 隐藏 / 取消隐藏；多窗口那 6 项按 B 口径 ⛔（产品是单窗口形态）。
+

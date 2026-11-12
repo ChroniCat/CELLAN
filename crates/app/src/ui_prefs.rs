@@ -121,3 +121,147 @@ mod tests {
         assert!(!got.proof_group);
     }
 }
+
+// ---------------------------------------------------------------- 工作表视图
+
+/// 一个保存下来的工作表视图（缩放 + 冻结 + 选区）
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedView {
+    pub name: String,
+    pub sheet: usize,
+    pub zoom: f32,
+    pub freeze: Option<(u32, u32)>,
+    pub sel: (u32, u32),
+}
+
+fn views_path(key: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    // 文件名用「路径的十六进制摘要」，避免中文/空格/超长路径出问题
+    let mut h: u64 = 1469598103934665603;
+    for b in key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    Some(
+        std::path::Path::new(&base)
+            .join("SheetsNative")
+            .join("views")
+            .join(format!("{h:016x}.ini")),
+    )
+}
+
+impl SavedView {
+    fn to_line(&self) -> String {
+        let fz = match self.freeze {
+            Some((r, c)) => format!("{r},{c}"),
+            None => "-".into(),
+        };
+        format!(
+            "{}|{}|{:.3}|{}|{},{}",
+            self.name, self.sheet, self.zoom, fz, self.sel.0, self.sel.1
+        )
+    }
+    fn from_line(line: &str) -> Option<Self> {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() != 5 {
+            return None;
+        }
+        let freeze = if parts[3] == "-" {
+            None
+        } else {
+            let (a, b) = parts[3].split_once(',')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        };
+        let (sr, sc) = parts[4].split_once(',')?;
+        Some(Self {
+            name: parts[0].to_string(),
+            sheet: parts[1].parse().ok()?,
+            zoom: parts[2].parse().ok()?,
+            freeze,
+            sel: (sr.parse().ok()?, sc.parse().ok()?),
+        })
+    }
+}
+
+/// 读某个工作簿保存的视图
+pub fn load_views(key: &str) -> Vec<SavedView> {
+    let Some(p) = views_path(key) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    text.lines().filter_map(SavedView::from_line).collect()
+}
+
+/// 写某个工作簿的视图（空列表 = 删文件）
+pub fn save_views(key: &str, views: &[SavedView]) {
+    let Some(p) = views_path(key) else {
+        return;
+    };
+    if views.is_empty() {
+        let _ = std::fs::remove_file(p);
+        return;
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text: String = views.iter().map(|v| format!("{}\n", v.to_line())).collect();
+    let _ = std::fs::write(p, text);
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn saved_view_line_roundtrip() {
+        let v = SavedView {
+            name: "看一季度".into(),
+            sheet: 2,
+            zoom: 1.25,
+            freeze: Some((1, 2)),
+            sel: (10, 3),
+        };
+        let line = v.to_line();
+        assert_eq!(SavedView::from_line(&line).as_ref(), Some(&v));
+        let none = SavedView {
+            freeze: None,
+            ..v.clone()
+        };
+        assert_eq!(SavedView::from_line(&none.to_line()), Some(none));
+    }
+
+    #[test]
+    fn views_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sn_views_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 直接测文件格式（不经过 LOCALAPPDATA）
+        let file = dir.join("v.ini");
+        let views = vec![
+            SavedView {
+                name: "A".into(),
+                sheet: 0,
+                zoom: 1.0,
+                freeze: None,
+                sel: (0, 0),
+            },
+            SavedView {
+                name: "B".into(),
+                sheet: 1,
+                zoom: 1.5,
+                freeze: Some((0, 1)),
+                sel: (3, 4),
+            },
+        ];
+        let text: String = views.iter().map(|v| format!("{}\n", v.to_line())).collect();
+        std::fs::write(&file, &text).unwrap();
+        let back: Vec<SavedView> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .filter_map(SavedView::from_line)
+            .collect();
+        assert_eq!(back, views);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

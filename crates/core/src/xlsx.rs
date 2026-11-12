@@ -653,6 +653,13 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 }
             }
         }
+        // 工作表可见性（workbook.xml 的 state="hidden"）
+        let states = crate::patch::read_sheet_states(path);
+        for sheet in wb.sheets.iter_mut() {
+            if let Some(&hide) = states.get(&sheet.name) {
+                sheet.hidden = hide;
+            }
+        }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
             definitions: pivot_definitions(path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
@@ -1414,6 +1421,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     if let Err(e) = crate::textbox::apply(path, wb) {
         eprintln!("[save] 文本框写回失败: {e:#}");
+    }
+    if let Err(e) = crate::patch::apply_sheet_states(path, wb) {
+        eprintln!("[save] 工作表可见性写回失败: {e:#}");
     }
     if let Err(e) = crate::patch::apply_rich(path, wb) {
         eprintln!("[save] 富文本写回失败: {e:#}");

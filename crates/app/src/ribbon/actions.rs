@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use super::CtlState;
-use crate::{cell_name, col_label, SheetApp};
+use crate::{cell_name, col_label, ui_prefs, SheetApp};
 
 fn fmt_label(code: &str) -> &str {
     match code {
@@ -961,6 +961,39 @@ impl SheetApp {
                 sh.freeze = if on { None } else { Some((0, 1)) };
                 sh.freeze_dirty = true;
                 self.wb.dirty = true;
+            }
+            "ViewNew" => {
+                self.view_new = Some(format!("视图 {}", self.views.len() + 1));
+            }
+            "ViewKeep" => match self.view_active {
+                Some(i) => {
+                    let name = self.views[i].name.clone();
+                    let v = self.view_capture(&name);
+                    self.views[i] = v;
+                    ui_prefs::save_views(&self.views_key(), &self.views);
+                    self.status = format!("已保留「{name}」的当前状态");
+                }
+                None => self.status = "先切换到一个视图，再点「保留」".into(),
+            },
+            "ViewExit" => {
+                self.view_active = None;
+                self.status = "已退出工作表视图（不改变当前缩放/冻结）".into();
+            }
+            "ViewSwitch" => self.views_open = true,
+            "HideSheet" => self.hide_current_sheet(),
+            "UnhideSheet" => self.unhide_open = true,
+            "FreezePanes" => {
+                // 冻结当前单元格上方的行与左侧的列（和 Excel 的「冻结窗格」一致）
+                let (r, c) = self.sel;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.freeze = if r == 0 && c == 0 { None } else { Some((r, c)) };
+                sh.freeze_dirty = true;
+                self.wb.dirty = true;
+                self.status = if r == 0 && c == 0 {
+                    "已取消冻结".into()
+                } else {
+                    format!("冻结在 {}：上方 {} 行、左侧 {} 列", cell_name(r, c), r, c)
+                };
             }
             "Unfreeze" => {
                 let sh = self.wb.sheet_mut(self.sheet_idx);

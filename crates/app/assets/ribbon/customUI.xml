@@ -692,11 +692,24 @@
             <slider id="ZoomSlider" sizeString="102" min="0.5" max="2.5"/>
           </box>
         </group>
+        <group id="GroupSheetView" label="工作表视图">
+          <box boxStyle="vertical">
+            <button id="ViewSwitch" label="切换工作表视图" imageMso="Grid" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
+            <button id="ViewKeep" label="保留" imageMso="Save" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118"/>
+            <button id="ViewExit" label="退出" imageMso="Close" screentip="退出视图模式（不改变当前状态）" onAction="ViewExit" sizeString="118"/>
+          </box>
+          <button id="ViewNew" label="新建" size="large" imageMso="Plus" screentip="新建一个工作表视图" onAction="ViewNew"/>
+        </group>
         <group id="GroupWindow" label="窗口">
           <box boxStyle="vertical">
             <toggleButton id="FreezeTopRow" label="冻结首行" imageMso="Freeze" screentip="滚动时第一行保持可见" onAction="FreezeTopRow" sizeString="96"/>
             <toggleButton id="FreezeFirstColumn" label="冻结首列" imageMso="Freeze" screentip="滚动时第一列保持可见" onAction="FreezeFirstColumn" sizeString="96"/>
+            <button id="FreezePanes" label="冻结窗格" imageMso="Freeze" screentip="冻结当前单元格上方的行与左侧的列" onAction="FreezePanes" sizeString="96"/>
+          </box>
+          <box boxStyle="vertical">
             <button id="Unfreeze" label="取消冻结" imageMso="Close" onAction="Unfreeze" sizeString="96"/>
+            <button id="HideSheet" label="隐藏" imageMso="Eraser" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
+            <button id="UnhideSheet" label="取消隐藏" imageMso="Refresh" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
           </box>
         </group>
         <group id="GroupViews" label="工作簿视图">

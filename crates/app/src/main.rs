@@ -497,6 +497,12 @@ struct SheetApp {
     /// 辅助功能检查器：问题列表 + 打开状态
     a11y_open: bool,
     a11y_list: Vec<sheetcore::a11y::Issue>,
+    /// 工作表视图
+    views: Vec<ui_prefs::SavedView>,
+    view_active: Option<usize>,
+    view_new: Option<String>,
+    views_open: bool,
+    unhide_open: bool,
     st_dlg: Option<SubtotalDlg>,
     ff_dlg: Option<FlashDlg>,
     cs_dlg: Option<ConsDlg>,
@@ -926,6 +932,11 @@ impl SheetApp {
             fc_dlg: None,
             a11y_open: false,
             a11y_list: Vec::new(),
+            views: Vec::new(),
+            view_active: None,
+            view_new: None,
+            views_open: false,
+            unhide_open: false,
             st_dlg: None,
             ff_dlg: None,
             cs_dlg: None,
@@ -1478,6 +1489,9 @@ impl SheetApp {
                         .as_ref()
                         .map(|p| sheetcore::revision::load(p, 300))
                         .unwrap_or_default();
+                    // 工作表视图（存在本机，按文件路径分）
+                    self.views = ui_prefs::load_views(&self.views_key());
+                    self.view_active = None;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
                     eprintln!("[open] 已显示缓存值 {n} 格");
@@ -1624,6 +1638,33 @@ impl SheetApp {
                             }
                         }
                     }
+                    // 无界面验收：SC_HIDE_SHEET=n 隐藏第 n 张表；SC_UNHIDE=1 打开取消隐藏窗口
+                    if let Ok(v) = std::env::var("SC_HIDE_SHEET") {
+                        if let Ok(i) = v.parse::<usize>() {
+                            if i < self.wb.sheets.len() {
+                                self.sheet_idx = i;
+                                self.hide_current_sheet();
+                                eprintln!(
+                                    "[hide] {} 隐藏={:?} 当前={}",
+                                    i,
+                                    self.wb.sheets.iter().map(|s| s.hidden).collect::<Vec<_>>(),
+                                    self.sheet_idx
+                                );
+                            }
+                        }
+                    }
+                    if std::env::var("SC_UNHIDE").is_ok() {
+                        self.unhide_open = true;
+                        eprintln!(
+                            "[unhide] 隐藏表={:?}",
+                            self.wb
+                                .sheets
+                                .iter()
+                                .filter(|s| s.hidden)
+                                .map(|s| s.name.clone())
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     // 无界面验收：SC_ACTIVE_SHEET=n 切到第 n 张表（0 起）
                     if let Ok(v) = std::env::var("SC_ACTIVE_SHEET") {
                         if let Ok(i) = v.parse::<usize>() {
@@ -1631,6 +1672,37 @@ impl SheetApp {
                                 self.sheet_idx = i;
                                 eprintln!("[sheet] 切到 {i}（{}）", self.wb.sheets[i].name);
                             }
+                        }
+                    }
+                    // 无界面验收：SC_VIEW_NEW=名字 存一个视图；SC_VIEW_SWITCH=n 切到第 n 个视图
+                    if let Ok(name) = std::env::var("SC_VIEW_NEW") {
+                        let v = self.view_capture(&name);
+                        self.views.retain(|x| x.name != v.name);
+                        self.views.push(v);
+                        ui_prefs::save_views(&self.views_key(), &self.views);
+                        self.status = format!("已保存视图「{name}」");
+                        eprintln!(
+                            "[view] 新建「{name}」 共 {} 个（文件 {}）",
+                            self.views.len(),
+                            self.views_key()
+                        );
+                    }
+                    // 无界面验收：SC_VIEW_SWITCH=n 应用第 n 个视图（视图从本机按文件恢复）
+                    if let Ok(v) = std::env::var("SC_VIEW_SWITCH") {
+                        if let Ok(i) = v.parse::<usize>() {
+                            eprintln!(
+                                "[view] 载入 {} 个视图：{:?}",
+                                self.views.len(),
+                                self.views.iter().map(|x| x.name.clone()).collect::<Vec<_>>()
+                            );
+                            self.view_apply(i);
+                            eprintln!(
+                                "[view] 应用后 zoom={:.2} freeze={:?} sheet={} sel={:?}",
+                                self.zoom,
+                                self.wb.sheet(self.sheet_idx).freeze,
+                                self.sheet_idx,
+                                self.sel
+                            );
                         }
                     }
                     // 无界面验收：数据分析四件套
@@ -9270,6 +9342,214 @@ impl SheetApp {
         }
         self.status = format!("已创建 {made} 条迷你图");
         Ok(made)
+    }
+
+    // ---------------------------------------------------------------- 工作表视图 / 窗口
+
+    fn views_key(&self) -> String {
+        self.wb
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// 把当前缩放/冻结/选区存成一个命名视图
+    fn view_capture(&self, name: &str) -> ui_prefs::SavedView {
+        ui_prefs::SavedView {
+            name: name.to_string(),
+            sheet: self.sheet_idx,
+            zoom: self.zoom,
+            freeze: self.wb.sheet(self.sheet_idx).freeze,
+            sel: self.sel,
+        }
+    }
+
+    /// 应用一个视图
+    fn view_apply(&mut self, idx: usize) {
+        let Some(v) = self.views.get(idx).cloned() else { return };
+        self.sheet_idx = v.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        self.zoom = v.zoom.clamp(0.5, 2.5);
+        self.wb.sheet_mut(self.sheet_idx).freeze = v.freeze;
+        self.wb.sheet_mut(self.sheet_idx).freeze_dirty = true;
+        self.sel = v.sel;
+        self.sel_end = v.sel;
+        self.view_active = Some(idx);
+        self.ensure_visible();
+        self.status = format!("已切换到工作表视图「{}」", v.name);
+    }
+
+    fn view_new_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.view_new.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "新建工作表视图", 360.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "名称", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .desired_width(220.0)
+                            .hint_text("例如：看一季度"),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("保存当前缩放、冻结窗格和选区；视图存在本机（不进 xlsx）")
+                        .size(10.5)
+                        .weak(),
+                );
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok && !name.trim().is_empty() {
+            let v = self.view_capture(name.trim());
+            // 同名覆盖
+            if let Some(i) = self.views.iter().position(|x| x.name == v.name) {
+                self.views[i] = v;
+                self.view_active = Some(i);
+            } else {
+                self.views.push(v);
+                self.view_active = Some(self.views.len() - 1);
+            }
+            ui_prefs::save_views(&self.views_key(), &self.views);
+            self.status = format!("已保存工作表视图「{}」", name.trim());
+            self.view_new = None;
+            return;
+        }
+        self.view_new = if open { Some(name) } else { None };
+    }
+
+    fn views_window(&mut self, ctx: &egui::Context) {
+        if !self.views_open {
+            return;
+        }
+        let mut open = true;
+        let mut pick: Option<usize> = None;
+        let mut del: Option<usize> = None;
+        let views = self.views.clone();
+        let active = self.view_active;
+        ui_kit::window(ctx, "工作表视图", 420.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if views.is_empty() {
+                    ui.label("还没有保存的视图：用「视图 → 新建」把当前缩放/冻结/选区存下来。");
+                }
+                for (i, v) in views.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mark = if active == Some(i) { "● " } else { "　" };
+                        if ui
+                            .selectable_label(active == Some(i), format!("{mark}{}", v.name))
+                            .clicked()
+                        {
+                            pick = Some(i);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} 表 · {:.0}% · {}",
+                                v.sheet + 1,
+                                v.zoom * 100.0,
+                                v.freeze
+                                    .map(|(r, c)| format!("冻结 {r} 行 {c} 列"))
+                                    .unwrap_or_else(|| "无冻结".into())
+                            ))
+                            .size(10.5)
+                            .weak(),
+                        );
+                        if ui.small_button("删除").clicked() {
+                            del = Some(i);
+                        }
+                    });
+                }
+            });
+        if let Some(i) = pick {
+            self.view_apply(i);
+        }
+        if let Some(i) = del {
+            self.views.remove(i);
+            self.view_active = None;
+            ui_prefs::save_views(&self.views_key(), &self.views);
+            self.status = "已删除视图".into();
+        }
+        self.views_open = open;
+    }
+
+    /// 取消隐藏：列出所有隐藏的表
+    fn unhide_window(&mut self, ctx: &egui::Context) {
+        if !self.unhide_open {
+            return;
+        }
+        let mut open = true;
+        let mut show_idx: Option<usize> = None;
+        let hidden: Vec<(usize, String)> = self
+            .wb
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.hidden)
+            .map(|(i, s)| (i, s.name.clone()))
+            .collect();
+        ui_kit::window(ctx, "取消隐藏", 340.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if hidden.is_empty() {
+                    ui.label("当前工作簿没有被隐藏的工作表。");
+                }
+                for (i, name) in &hidden {
+                    if ui.selectable_label(false, name).clicked() {
+                        show_idx = Some(*i);
+                    }
+                }
+                ui.label(
+                    egui::RichText::new("选中一张表即可恢复显示").size(10.5).weak(),
+                );
+            });
+        if let Some(i) = show_idx {
+            let sh = self.wb.sheet_mut(i);
+            sh.hidden = false;
+            sh.hidden_dirty = true;
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = format!("已取消隐藏「{}」", self.wb.sheet(i).name);
+            self.unhide_open = false;
+            return;
+        }
+        self.unhide_open = open;
+    }
+
+    /// 隐藏当前工作表（至少留一张可见）
+    fn hide_current_sheet(&mut self) {
+        let visible = self.wb.sheets.iter().filter(|s| !s.hidden).count();
+        if visible <= 1 {
+            self.status = "至少要留一张可见的工作表".into();
+            return;
+        }
+        let i = self.sheet_idx;
+        let name = self.wb.sheet(i).name.clone();
+        let sh = self.wb.sheet_mut(i);
+        sh.hidden = true;
+        sh.hidden_dirty = true;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        // 切到下一张可见表
+        if let Some(next) = self
+            .wb
+            .sheets
+            .iter()
+            .enumerate()
+            .position(|(k, s)| k != i && !s.hidden)
+        {
+            self.sheet_idx = next;
+        }
+        self.status = format!("已隐藏「{name}」；视图 → 取消隐藏 可以恢复");
     }
 
     // ---------------------------------------------------------------- 辅助功能 / 批注导航
@@ -19735,6 +20015,9 @@ impl eframe::App for SheetApp {
         self.flashfill_dialog(ctx);
         self.consolidate_dialog(ctx);
         self.a11y_window(ctx);
+        self.view_new_dialog(ctx);
+        self.views_window(ctx);
+        self.unhide_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
@@ -20465,6 +20748,10 @@ impl eframe::App for SheetApp {
                 let out = area.show(ui, |ui| {
                 ui.horizontal(|ui| {
                 for i in 0..self.wb.sheets.len() {
+                    // 隐藏的工作表不在标签栏里出现（和 Excel 一致）
+                    if self.wb.sheets[i].hidden {
+                        continue;
+                    }
                     let name = self.wb.sheets[i].name.clone();
                     let tab_color = self.wb.sheets[i].tab_color;
                     let resp = ui_kit::sheet_tab(ui, &name, self.sheet_idx == i, tab_color);
