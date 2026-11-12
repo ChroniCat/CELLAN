@@ -42,8 +42,8 @@ C01.1 错误类型与文本错误区分
 | `all_traditional_errors_keep_their_kind` | 七种传统错误逐个核对类型与显示文本 |
 | `iferror_catches_a_real_error` | `IFERROR(A1,"兜底")` = 兜底 |
 | `sum_propagates_a_real_error_instead_of_skipping_it` | `SUM(A1:A3)` = `#DIV/0!` |
-| `cross_sheet_reference_keeps_the_error_type` | `=数据!A1&""` 仍是错误 |
-| `incremental_recalc_keeps_the_error_type` | 全量重算后仍是 `Error(Div0)`，不降级为文本 |
+| `a_reference_to_the_same_sheet_keeps_the_error_type` | `=数据!A1&""` 仍是错误（**同一张表**，不是跨表；跨表待 C01.3） |
+| `full_recalc_keeps_the_error_type` | 调 `recalc_all` 全量重算后仍是 `Error(Div0)`；**没有**验证 `recalc_dirty` 增量路径（C01.3） |
 | `save_and_reload_keep_the_error_type` | 公式错误与静态错误存盘后仍是 `Error(..)`，文本 `#DIV/0!` 仍是 Text |
 
 RED（模型还没有 `Value::Error` 时）编译失败，逐条 `no variant named Error`；
@@ -66,6 +66,12 @@ RED（模型还没有 `Value::Error` 时）编译失败，逐条 `no variant nam
 
 前两条是把断言改到**新模型**（要求原文就写明错误要成为类型），不是为了让失败消失而放松断言；
 第三条是本次改动引入的真实回归，已修在实现里而不是测试里。
+
+四之二、命名更正（00:19 复核）
+------------------------------
+原先两条用例名分别叫 `cross_sheet_reference_keeps_the_error_type` 与
+`incremental_recalc_keeps_the_error_type`，但实际覆盖是「同一张表的引用」与
+「recalc_all 全量重算」，名字暗示了没验证的东西。已按实际覆盖改名，并在上表写清。
 
 五、还没做（C01 仍未验收）
 --------------------------
