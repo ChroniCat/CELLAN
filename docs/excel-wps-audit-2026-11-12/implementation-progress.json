@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T11:16:41Z",
+ "updated_utc": "2026-11-12T11:17:40Z",
  "tasks": [
   {
    "id": "C01",
@@ -440,12 +440,13 @@
    "commands": [],
    "evidence": [],
    "not_done": [
-    "图表锚点/引用与 raw-copies 注入未执行（需图表夹具）"
+    "图表锚点/引用与 raw-copies 注入未执行（需图表夹具）",
+    "图表子步骤注入未执行（需图表夹具）；文件占用/权限不足的 rename 失败注入未执行"
    ],
    "failures": [],
    "blocker": "",
-   "next": "C13.3 dirty/回执/重试集成；图表注入待夹具",
-   "updated_utc": "2026-11-12T11:16:41Z",
+   "next": "补图表锚点/引用注入夹具 + 文件占用场景后整体验收 C13",
+   "updated_utc": "2026-11-12T11:17:40Z",
    "slices": [
     {
      "id": "C13.1",
@@ -514,17 +515,27 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C13 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "保存失败时：状态栏给出可定位错误（含失败子步骤）、wb.dirty 保持 true、不写 wb.path、不应用 SaveReceipt、磁盘内容不变；故障解除后再按 Ctrl+S 能重试成功并清 dirty。",
+     "files": [
+      "crates/app/src/document_tasks.rs",
+      "crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p app ... --bin app -- edit_regression_tests::failed_save --nocapture --test-threads=1 => 1 passed（输出含「保存失败: 保存子步骤 layout 失败」）",
+      "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 128 passed, 0 failed, 0 ignored, 4 filtered"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt"
+     ],
+     "not_done": [
+      "文件占用/权限不足/断电的 rename 失败注入未执行；图表子步骤注入待图表夹具"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "C13 父任务：补图表注入夹具后整体验收",
+     "updated_utc": "2026-11-12T11:17:35Z"
     }
    ]
   },

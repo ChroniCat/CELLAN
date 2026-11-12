@@ -1812,3 +1812,46 @@ fn ctrl_p_opens_print_preview() {
     assert!(app.print_preview, "Ctrl+P 应打开打印预览");
     assert_eq!(app.preview_page, 0, "预览从第一页开始");
 }
+
+// ---------------------------------------------------------------- C13.3 保存失败回执
+
+#[test]
+fn failed_save_keeps_dirty_reports_the_step_and_allows_retry() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("c133-retry", 1.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    uiframe_type_commit(&mut app, &ctx, "5");
+    assert!(app.wb.dirty);
+
+    // 注入保存子步骤失败：界面必须保留 dirty、给出可定位错误、不写盘
+    env.sc("SC_FAIL_SAVE_STEP", "layout");
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    wait_save(&mut app);
+    assert!(
+        app.status.contains("保存失败") && app.status.contains("layout"),
+        "状态栏要说明失败原因与步骤，实际：{}",
+        app.status
+    );
+    assert!(app.wb.dirty, "保存失败后必须仍是未保存状态");
+    assert_eq!(
+        sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0),
+        Value::Number(1.0),
+        "失败时磁盘内容不得变化"
+    );
+
+    // 故障解除后再按一次 Ctrl+S 必须能重试成功
+    env.sc("SC_FAIL_SAVE_STEP", "none");
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    wait_save(&mut app);
+    assert!(!app.wb.dirty, "重试成功后 dirty 才能清掉");
+    assert_eq!(
+        sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0),
+        Value::Number(5.0),
+        "重试必须把新值写进文件"
+    );
+    drop(env);
+}

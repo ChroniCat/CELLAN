@@ -1,0 +1,32 @@
+# C13.3 保存失败时的 dirty / 回执 / 重试集成：验收证据
+
+## 结论
+
+当前实现的失败语义已经正确，本次用真实失败路径（注入子步骤失败）补齐验收，
+未为产生 diff 重写已正确代码。
+
+- `start_save` 乐观清 dirty；`poll_save` 在 Err 分支把 `wb.dirty = true` 放回，
+  且不写 `wb.path`、不应用 SaveReceipt。
+- 保存线程把错误整理成 `保存失败: <anyhow 链>`，链里带具体子步骤名（如 `layout`）。
+
+## 回归（整窗事件）
+
+`edit_regression_tests::failed_save_keeps_dirty_reports_the_step_and_allows_retry`
+
+1. 打开已保存副本 → 键入 5 → Ctrl+S，注入 `SC_FAIL_SAVE_STEP=layout`
+2. 断言：状态栏含「保存失败」与「layout」；`wb.dirty == true`；磁盘仍是旧值 1
+3. 解除注入后再按 Ctrl+S：`dirty == false`；磁盘为新值 5
+
+实际输出：
+
+    [save] 保存失败: 保存子步骤 layout 失败: 注入的保存子步骤失败: layout
+    test result: ok. 1 passed
+
+全量：`cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests::`
+→ 128 passed, 0 failed, 0 ignored, 4 filtered。
+
+## 未执行
+
+- 文件被 Office 独占 / 权限不足 / 断电导致 rename 失败的注入：未执行
+  （现有 `save_atomic` 的 rename 失败分支会保留临时文件并如实报错，但本轮没有构造真实占用场景）。
+- 图表锚点/引用子步骤的注入：需带图表的合成基准（见 C13.2 记录）。
