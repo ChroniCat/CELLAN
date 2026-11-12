@@ -1,0 +1,43 @@
+== UI-02 父任务验收：Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N / Ctrl+P（真实 update() 注入按键）==
+test edit_regression_tests::ctrl_n_creates_a_blank_document_without_losing_the_current_one ... ok
+test edit_regression_tests::ctrl_n_while_editing_commits_the_draft_before_adding_a_document ... ok
+test edit_regression_tests::ctrl_o_opens_the_picked_file ... ok
+test edit_regression_tests::ctrl_p_commits_the_draft_before_opening_print_preview ... ok
+test edit_regression_tests::ctrl_p_opens_print_preview ... ok
+test edit_regression_tests::ctrl_s_commits_the_active_edit_before_saving ... ok
+test edit_regression_tests::ctrl_s_does_not_save_when_validation_rejects_the_draft ... ok
+test edit_regression_tests::ctrl_s_saves_the_open_file_after_a_typed_edit ... ok
+test edit_regression_tests::ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 129 filtered out; finished in 0.49s
+
+
+UI-02 父任务验收对照（ui-requirements.md「验收」逐条）
+------------------------------------------------------
+1) 打开隔离副本，修改 A1 后按 Ctrl+S，文件重新加载结果正确
+   -> ctrl_s_saves_the_open_file_after_a_typed_edit：A1 输入 123 -> Ctrl+S ->
+      save_atomic 落盘 -> xlsx::load 读回 A1=123，dirty 清零。ok
+   （说明：以「重新加载读回」核对内容，未单独计算文件 SHA256；内容等价判断依据是
+     sheetcore::xlsx::load 解析后的单元格值，而不是内存状态。）
+2) Ctrl+Shift+S 另存为且不更改原文件
+   -> ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original：目标文件写出 42，
+      原文件仍是 5。ok
+3) Ctrl+O/N/P 均对应正确入口
+   -> ctrl_o_opens_the_picked_file（SC_OPEN_PATH 只替换系统对话框，仍走 open_in_new_tab）。ok
+   -> ctrl_n_creates_a_blank_document_without_losing_the_current_one。ok
+   -> ctrl_p_opens_print_preview。ok
+4) 测试必须注入按键事件或驱动真实窗口
+   -> 全部用例经 egui::RawInput 注入 Key 事件并跑真实 eframe::App::update()，
+      不是直接调用 save()/new_document()。GUI 回归另用真实窗口子进程。
+
+切分落实情况
+------------
+UI-02.1 Ctrl+S / Ctrl+Shift+S 与编辑态          已验收（6dc206a）
+UI-02.2 Ctrl+O / Ctrl+N / Ctrl+P 与开始页入口   已验收（5535d40）
+UI-02.3 命令表 enabled/tooltip/执行与优先级     已验收（8eb35d5）
+
+保留差异（记录，不冒充 Excel 一致）
+----------------------------------
+- 单元格编辑中触发 Ctrl+N/Ctrl+O/Ctrl+P：本项目先提交草稿再执行；Excel 也先落编辑，
+  但它在编辑控件失焦时才提交，时序不同，结果一致。
+- 模态对话框打开时 Ctrl+S 被忽略（与 Excel 一致），但本项目对话框不是系统级模态
+  （非对话框区域仍可点击滚动条），仅键盘与应用级命令被拦。

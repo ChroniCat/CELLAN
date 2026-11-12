@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T11:19:49Z",
+ "updated_utc": "2026-11-12T14:03:28Z",
  "tasks": [
   {
    "id": "C01",
@@ -962,17 +962,27 @@
    "scope": "app/main.rs handle_keys + 命令注册",
    "source": "ui-requirements.md",
    "heading": "UI-02 补齐保存等已宣称存在的快捷键",
-   "status": "实施中",
-   "acceptance": "见 ui-requirements.md UI-02：快捷键与点击同一结果；编辑期间保存先提交；统一命令注册表",
-   "files": [],
-   "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "status": "已验收",
+   "acceptance": "Ctrl+S 落盘后重新加载值正确；Ctrl+Shift+S 另存为不改原文件；Ctrl+O/N/P 对应正确入口；全部按键经真实 update() 注入",
+   "files": [
+    "crates/app/src/command.rs,crates/app/src/main.rs,crates/app/src/ribbon/actions.rs,crates/app/src/ribbon/ui.rs,crates/app/src/ui_kit.rs,crates/app/src/edit_regression_tests.rs"
+   ],
+   "commits": [
+    "6dc206a,5535d40,8eb35d5"
+   ],
+   "commands": [
+    "cargo test -p app --bin app -- --test-threads=1 (138 passed); GUI ui_regression (8 passed/9 ignored)"
+   ],
+   "evidence": [
+    "implementation-evidence/ui02-parent-acceptance.txt,implementation-evidence/ui023-command-registry.txt"
+   ],
+   "not_done": [
+    "真实系统文件对话框、硬件键盘、中文 IME 未人工验收"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "UI-02.3 命令 enabled/tooltip 统一注册",
-   "updated_utc": "2026-11-12T10:52:38Z",
+   "next": "",
+   "updated_utc": "2026-11-12T14:03:28Z",
    "slices": [
     {
      "id": "UI-02.1",
@@ -1038,17 +1048,27 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
-     "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "status": "已验收",
+     "acceptance": "命令表唯一登记快捷键/enabled/tooltip/执行；功能区、QAT、标签条、开始页与快捷键同源；模态对话框/编辑态/开始页优先级明确并被测试锁定",
+     "files": [
+      "crates/app/src/command.rs,crates/app/src/main.rs,crates/app/src/ribbon/actions.rs,crates/app/src/ribbon/ui.rs,crates/app/src/ui_kit.rs,crates/app/src/edit_regression_tests.rs"
+     ],
+     "commits": [
+      "8eb35d5"
+     ],
+     "commands": [
+      "cargo test -p app --bin app -- --test-threads=1 => 138 passed / 0 failed / 0 ignored / 0 filtered; cargo test -p app --test ui_regression => 8 passed / 9 ignored"
+     ],
+     "evidence": [
+      "implementation-evidence/ui023-command-registry.txt,implementation-evidence/ui023-suites.txt,implementation-evidence/ui023/doc.png,implementation-evidence/ui023/start.png"
+     ],
+     "not_done": [
+      "真实鼠标悬停 tooltip 与硬件键盘未人工核对；网格级 Ctrl+C/X/V/F/H 未纳入命令表（当前无 enabled 谓词，留 UI-06/07）"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T14:03:12Z"
     }
    ]
   },

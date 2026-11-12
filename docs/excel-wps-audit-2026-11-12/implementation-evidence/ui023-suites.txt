@@ -1,0 +1,14 @@
+== app 单测（串行）==
+test update::tests::version_compare ... ok
+
+test result: ok. 138 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+
+== GUI 回归 ==
+
+test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 26.82s
+
+
+== build ==
+warning: `app` (bin "app") generated 193 warnings (run `cargo fix --bin "app" -p app` to apply 156 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
