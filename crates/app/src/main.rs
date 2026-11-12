@@ -728,6 +728,8 @@ struct SheetApp {
     paint_scale: f32,
     /// Ctrl+点击追加的多块选区
     extra_sel: Vec<(u32, u32, u32, u32)>,
+    /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
+    grid_press: Option<(u32, u32)>,
     /// 拖动选区移动：起点格 + 指针起点
     cell_move: Option<((u32, u32), egui::Pos2, bool)>,
     /// 拖动行号/列标移动整行整列：(是否行, 起始索引, 行/列数)
@@ -1075,6 +1077,7 @@ impl SheetApp {
             fmt_pending: false,
             paint_scale: 1.0,
             extra_sel: Vec::new(),
+            grid_press: None,
             cell_move: None,
             header_move: None,
             pending_autofit: None,
@@ -15840,6 +15843,18 @@ impl SheetApp {
             let f = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
             (f.0.min(200), f.1.min(50))
         };
+        if std::env::var("SC_SCROLL_DBG").is_ok() {
+            static ONCE3: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if ONCE3.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10 == 0 {
+                eprintln!(
+                    "[draw] sheet={} freeze={:?} -> fy={fy} fx={fx} scroll=({:.0},{:.0})",
+                    self.sheet_idx,
+                    self.wb.sheet(self.sheet_idx).freeze,
+                    off_x,
+                    off_y
+                );
+            }
+        }
         // 行号列宽跟着最多位数的行号走（Excel 在滚到 5 位数行时会变宽）
         let last_vis_row = rows.index_at(off_y + avail.y - hh) + 1;
         // 行头宽度按分级深度加宽：每级 11px，最里层放 +/- 按钮（Excel 也是这样加宽的）
@@ -15874,8 +15889,8 @@ impl SheetApp {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 || n % 120 == 0 {
-                eprintln!("[grid] f={n} avail={:?} scroll={:?} cols.custom={} rows.custom={} first=({},{})",
-                    avail, (off_x, off_y), cols.len(), rows.len(), first_col, first_row);
+                eprintln!("[grid] f={n} avail={:?} scroll={:?} fy={fy} fx={fx} hh={hh:.0} body=({:.0},{:.0}) first=({},{}) colw0={:.0} rowh0={:.0}",
+                    avail, (off_x, off_y), body_x, body_y, first_col, first_row, cols.size(0), rows.size(0));
             }
         }
         // 页内坐标 → 屏幕偏移：每跨过一个分页符多一个页间距
@@ -16177,11 +16192,17 @@ impl SheetApp {
         }
         let mut c = first_col;
         let mut guard = 0;
+        // 列标带：冻结列右边的部分才画（半列滚出去时它的列标会被裁掉，和 Excel 一致）
+        let colhead_clip = Rect::from_min_max(
+            egui::pos2(origin.x + head_w + frozen_w, origin.y),
+            egui::pos2(resp.rect.max.x, origin.y + hh),
+        );
+        let colhead = painter.with_clip_rect(colhead_clip.intersect(painter.clip_rect()));
         while gx(c) < origin.x + avail.x && guard < 4096 {
             guard += 1;
             let x = gx(c);
             let w = cols.size(c);
-            if x + w > origin.x + head_w {
+            if x + w > origin.x + head_w + frozen_w {
                 if c >= sc1 && c <= sc2 {
                     painter.rect_filled(
                         Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, hh)),
@@ -16190,7 +16211,7 @@ impl SheetApp {
                     );
                 }
                 if self.show_headings {
-                painter.text(
+                colhead.text(
                                     egui::pos2(x + w / 2.0, origin.y + (hh - col_depth * 11.0) / 2.0),
                                     Align2::CENTER_CENTER,
                                     col_label(c),
@@ -16236,8 +16257,9 @@ impl SheetApp {
                     row_num_fg(r),
                 );
             }
+            let ly = y.max(origin.y + hh + frozen_h);
             painter.line_segment(
-                [egui::pos2(origin.x, y), egui::pos2(origin.x + avail.x, y)],
+                [egui::pos2(origin.x, ly), egui::pos2(origin.x + avail.x, ly)],
                 grid_stroke,
             );
         }
@@ -16302,6 +16324,12 @@ impl SheetApp {
         let mut r = first_row;
         let groups = self.row_groups();
         let mut pending_toggle: Vec<(u32, u32)> = Vec::new();
+        // 行号栏的裁剪：冻结带以下的才画（不然半个滚出去的行号会压在冻结行上）
+        let gutter_clip = Rect::from_min_max(
+            egui::pos2(origin.x, origin.y + hh + frozen_h),
+            egui::pos2(origin.x + head_w, resp.rect.max.y),
+        );
+        let gutter = painter.with_clip_rect(gutter_clip.intersect(painter.clip_rect()));
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
             guard += 1;
@@ -16311,7 +16339,7 @@ impl SheetApp {
                 r += 1;
                 continue;
             }
-            if y + h > origin.y + hh {
+            if y + h > origin.y + hh + frozen_h {
                 if r >= sr1 && r <= sr2 {
                     painter.rect_filled(
                         Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(head_w, h)),
@@ -16320,7 +16348,7 @@ impl SheetApp {
                     );
                 }
                 if self.show_headings {
-                painter.text(
+                gutter.text(
                                     egui::pos2(
                                         origin.x + (head_w - row_depth * 11.0) / 2.0,
                                         y + h / 2.0,
@@ -16390,12 +16418,14 @@ impl SheetApp {
                         }
                     }
                 }
+                // 这一行被滚到冻结带里时，线要压在冻结带下沿，不能画进冻结行
+                let ly = y.max(origin.y + hh + frozen_h);
                 painter.line_segment(
-                    [egui::pos2(origin.x, y), egui::pos2(origin.x + head_w, y)],
+                    [egui::pos2(origin.x, ly), egui::pos2(origin.x + head_w, ly)],
                     Stroke::new(1.0, ui_kit::HEAD_LINE),
                 );
                 painter.line_segment(
-                    [egui::pos2(origin.x + head_w, y), egui::pos2(origin.x + avail.x, y)],
+                    [egui::pos2(origin.x + head_w, ly), egui::pos2(origin.x + avail.x, ly)],
                     grid_stroke,
                 );
             }
@@ -16551,7 +16581,67 @@ impl SheetApp {
             );
         }
         let notes = self.wb.sheet(self.sheet_idx).notes.clone();
+        // 选区底色：Excel 365 是「范围铺一层 22% 黑（白底上约 #C7C7C7），活动格所在合并块留白」。
+        // 画在格子之前，文字才不会被压暗；冻结带用固定坐标，正文用滚动坐标。
+        {
+            let (qr1, qc1, qr2, qc2) = self.sel_rect();
+            let (ar1, ac1, ar2, ac2) = merges
+                .iter()
+                .find(|(r1, c1, r2, c2)| {
+                    self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2
+                })
+                .copied()
+                .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
+            if (qr1, qc1) != (qr2, qc2) || (ar1, ac1, ar2, ac2) != (qr1, qc1, qr2, qc2) {
+                let tint = Color32::from_rgba_unmultiplied(0, 0, 0, 55);
+                let grid_area = Rect::from_min_max(
+                    egui::pos2(origin.x + head_w, origin.y + hh),
+                    resp.rect.max,
+                );
+                let pt = painter.with_clip_rect(grid_area.intersect(painter.clip_rect()));
+                let mut parts: Vec<(u32, u32, u32, u32)> = Vec::new();
+                // 抠掉活动块：上 / 下 / 左 / 右四块
+                if qr1 < ar1 {
+                    parts.push((qr1, ar1 - 1, qc1, qc2));
+                }
+                if qr2 > ar2 {
+                    parts.push((ar2 + 1, qr2, qc1, qc2));
+                }
+                let mr1 = qr1.max(ar1);
+                let mr2 = qr2.min(ar2);
+                if mr1 <= mr2 {
+                    if qc1 < ac1 {
+                        parts.push((mr1, mr2, qc1, ac1 - 1));
+                    }
+                    if qc2 > ac2 {
+                        parts.push((mr1, mr2, ac2 + 1, qc2));
+                    }
+                }
+                for (r1, r2, c1, c2) in parts {
+                    if r1 > r2 || c1 > c2 {
+                        continue;
+                    }
+                    let x0 = px_of(c1);
+                    let y0 = py_of(r1);
+                    let w = px_of(c2 + 1) - x0;
+                    let h = py_of(r2 + 1) - y0;
+                    if w > 0.0 && h > 0.0 {
+                        pt.rect_filled(
+                            Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
+                            0.0,
+                            tint,
+                        );
+                    }
+                }
+            }
+        }
         let mut pending_filter: Option<(u32, Vec<(String, bool)>, egui::Pos2)> = None;
+        // 正文区 painter：滚到冻结带下面的半行必须裁掉，否则它的文字会压到冻结行上
+        let body_area = Rect::from_min_max(
+            egui::pos2(origin.x + head_w + frozen_w, origin.y + hh + frozen_h),
+            resp.rect.max,
+        );
+        let body_painter = painter.with_clip_rect(body_area.intersect(painter.clip_rect()));
         let mut r = first_row;
         guard = 0;
         while gy(r) < origin.y + avail.y && guard < 8192 {
@@ -16591,7 +16681,7 @@ impl SheetApp {
                     rect.set_height((rows.pos(mr2 + 1) - rows.pos(mr1)).max(rh));
                 }
                 self.paint_cell(
-                    &painter,
+                    &body_painter,
                     rect,
                     r,
                     c,
@@ -17302,25 +17392,6 @@ impl SheetApp {
             }
         }
 
-        // 框选范围底色
-        let (qr1, qc1, qr2, qc2) = self.sel_rect();
-        if (qr1, qc1) != (qr2, qc2) {
-            let x0 = gx(qc1);
-            let y0 = gy(qr1);
-            let w = cols.pos(qc2 + 1) - cols.pos(qc1);
-            let h = rows.pos(qr2 + 1) - rows.pos(qr1);
-            painter.rect_filled(
-                Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
-                0.0,
-                Color32::from_rgba_unmultiplied(16, 124, 65, 22),
-            );
-            painter.rect_stroke(
-                Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h)),
-                0.0,
-                Stroke::new(1.5, ui_kit::ACCENT),
-                egui::StrokeKind::Inside,
-            );
-        }
 
         // Ctrl+点击追加的选区：同样的浅绿底 + 边框
         for (er1, ec1, er2, ec2) in self.extra_sel.clone() {
@@ -17383,21 +17454,17 @@ impl SheetApp {
             }
         }
 
-        // 选区边框（合并区域按整块画）
-        let (sr1, sc1, sr2, sc2) = merges
-            .iter()
-            .find(|(r1, c1, r2, c2)| self.sel.0 >= *r1 && self.sel.0 <= *r2 && self.sel.1 >= *c1 && self.sel.1 <= *c2)
-            .copied()
-            .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
-        let sx = px_of(sc1);
-        let sy = py_of(sr1);
-        let sw = cols.pos(sc2 + 1) - cols.pos(sc1);
-        let sh = rows.pos(sr2 + 1) - rows.pos(sr1);
+        // 选区边框：Excel 365 是整块外框 #217346 2px（合并区按整块算），填充柄在右下角
+        let (er1, ec1, er2, ec2) = self.sel_rect();
+        let sx = px_of(ec1);
+        let sy = py_of(er1);
+        let sw = px_of(ec2 + 1) - sx;
+        let sh = py_of(er2 + 1) - sy;
         if sx + sw > origin.x + head_w && sy + sh > origin.y + hh {
             painter.rect_stroke(
                 Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(sw, sh)),
                 0.0,
-                Stroke::new(2.0, ui_kit::ACCENT),
+                Stroke::new(2.0, Color32::from_rgb(33, 115, 70)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -17749,8 +17816,13 @@ impl SheetApp {
         }
 
         // 拖拽框选（正在拖列宽/行高时不要改选区）
+        // 焦点：按下后就跟着指针扩，不用等 egui 的拖动阈值——否则快速点按拖动会有明显延迟
+        let dragging_sel = resp.dragged()
+            || (self.grid_press.is_some() && ui.input(|i| i.pointer.primary_down()));
         if !readonly
-            && resp.dragged()
+            && dragging_sel
+            && self.tb_drag.is_none()
+            && self.fill_drag.is_none()
             && self.col_drag.is_none()
             && self.row_drag.is_none()
             && self.chart_drag.is_none()
@@ -17945,6 +18017,80 @@ impl SheetApp {
                     self.status = format!("已选中第 {} 行", r + 1);
                 }
             }
+        }
+
+        // 按下即落锚点（Excel 的行为）。egui 的 clicked() 要等松开、drag_started() 要等超过阈值，
+        // 只靠它们的话「快速点按后马上拖」会从上一个选区开始长，手感上也像延迟了一拍。
+        if !readonly {
+            let pressed = ui.input(|i| i.pointer.primary_pressed());
+            if pressed {
+                if let Some(p) = ui.ctx().input(|i| i.pointer.press_origin()) {
+                    let inside = p.x > origin.x + head_w && p.y > origin.y + hh && resp.rect.contains(p);
+                    // 选区边框（移动单元格）、填充柄、文本框、图表：都不抢按下事件
+                    let (cur_r1, cur_c1, cur_r2, cur_c2) = self.sel_rect();
+                    let cur_box = Rect::from_min_max(
+                        egui::pos2(px_of(cur_c1), py_of(cur_r1)),
+                        egui::pos2(px_of(cur_c2 + 1), py_of(cur_r2 + 1)),
+                    );
+                    let on_border =
+                        cur_box.expand(4.0).contains(p) && !cur_box.shrink(4.0).contains(p);
+                    let on_handle = Rect::from_min_size(
+                        egui::pos2(cur_box.right() - 7.0, cur_box.bottom() - 7.0),
+                        Vec2::splat(14.0),
+                    )
+                    .contains(p);
+                    let on_tb = tb_rects.iter().any(|(_, r)| r.contains(p));
+                    // 正在编辑的格子（内联编辑器浮在格子上）：点进去是放光标，不能改选区
+                    let on_editor = self.editing.is_some()
+                        && Rect::from_min_max(
+                            egui::pos2(px_of(self.sel.1), py_of(self.sel.0)),
+                            egui::pos2(px_of(self.sel.1 + 1), py_of(self.sel.0 + 1)),
+                        )
+                        .contains(p);
+                    let charts = self.wb.sheet(self.sheet_idx).charts.clone();
+                    let on_chart = charts.iter().any(|ch| {
+                        let (cr1, cc1, cr2, cc2) = ch.anchor;
+                        Rect::from_min_max(
+                            egui::pos2(px_of(cc1), py_of(cr1)),
+                            egui::pos2(px_of(cc2), py_of(cr2)),
+                        )
+                        .contains(p)
+                    });
+                    // 正在编辑时不在按下这一拍改选区：草稿被数据验证拒绝时要留在原格
+                    // （edit_regression_tests 里的两条用例守着这个不变量）
+                    if inside
+                        && !on_border
+                        && !on_handle
+                        && !on_tb
+                        && !on_chart
+                        && !on_editor
+                        && self.editing.is_none()
+                    {
+                        let c = col_at(p.x);
+                        let r = row_at(p.y);
+                        let hit = match merges
+                            .iter()
+                            .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+                        {
+                            Some((mr1, mc1, _, _)) => (*mr1, *mc1),
+                            None => (r, c),
+                        };
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        let ctrl = ui.input(|i| i.modifiers.command);
+                        if !shift && !ctrl {
+                            self.extra_sel.clear();
+                        }
+                        self.sel = hit;
+                        if !shift {
+                            self.sel_end = hit;
+                        }
+                        self.grid_press = Some(hit);
+                    }
+                }
+            }
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            self.grid_press = None;
         }
 
         // 图表浮在单元格之上：先判断点是否落在图表里
@@ -19815,6 +19961,85 @@ impl SheetApp {
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let __cpu_t0 = std::time::Instant::now();
+        // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
+        if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
+            static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let v: Vec<f32> = spec
+                .split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect();
+            let ready = self.tasks.open_rx.is_none() && v.len() == 4;
+            if ready {
+                // 只有文件装好之后才开始计数，否则步数在装载期间就耗光了
+                let n = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let p1 = egui::pos2(v[0], v[1]);
+                let p2 = egui::pos2(v[2], v[3]);
+                match n {
+                    2 => ctx.input_mut(|i| {
+                        i.events.push(egui::Event::PointerMoved(p1));
+                        i.events.push(egui::Event::PointerButton {
+                            pos: p1,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        });
+                    }),
+                    3 => ctx.input_mut(|i| i.events.push(egui::Event::PointerMoved(p2))),
+                    4 => eprintln!(
+                        "[drag] 第 4 帧 sel={:?} sel_end={:?}（按下 ({:.0},{:.0}) → 拖到 ({:.0},{:.0})）",
+                        self.sel, self.sel_end, p1.x, p1.y, p2.x, p2.y
+                    ),
+                    6 => ctx.input_mut(|i| {
+                        i.events.push(egui::Event::PointerButton {
+                            pos: p2,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        })
+                    }),
+                    8 => eprintln!(
+                        "[drag] 松开后 sel={:?} sel_end={:?}",
+                        self.sel, self.sel_end
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        // 无界面验收：SC_FREEZE="行,列" 设冻结（不写盘，只看渲染）
+        if let Ok(spec) = std::env::var("SC_FREEZE") {
+            // 每帧重设：装载完成后的整份替换会把冻结冲掉
+            if self.tasks.open_rx.is_none() {
+                let v: Vec<u32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if v.len() == 2 {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    let before = sh.freeze;
+                    sh.freeze = if v[0] == 0 && v[1] == 0 { None } else { Some((v[0], v[1])) };
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    if std::env::var("SC_SCROLL_DBG").is_ok() {
+                        static ONCE2: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ONCE2.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[freeze] 设 {before:?} -> {:?}", self.wb.sheet(self.sheet_idx).freeze);
+                        }
+                    }
+                }
+            }
+        }
+        // 无界面验收：SC_SCROLL_Y=n 直接把竖向滚动量设到 n 像素（冻结区验收用）
+        if let Ok(v) = std::env::var("SC_SCROLL_Y") {
+            if let Ok(y) = v.parse::<f32>() {
+                if self.tasks.open_rx.is_none() {
+                    self.scroll.y = y;
+                    if std::env::var("SC_SCROLL_DBG").is_ok() {
+                        static ONCE: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("[scroll] 设定 scroll.y={y} (avail 已算)");
+                        }
+                    }
+                }
+            }
+        }
         // 性能验收：SC_SAVE_ASYNC=path 走真实的异步保存（和 Ctrl+S 同一条路径）
         if let Ok(out) = std::env::var("SC_SAVE_ASYNC") {
             if !self.async_save_fired && self.tasks.open_rx.is_none() && !self.wb.sheets.is_empty() {

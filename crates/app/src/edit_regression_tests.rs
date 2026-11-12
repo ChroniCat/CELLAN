@@ -133,6 +133,70 @@ fn restrict_a1(app: &mut SheetApp) {
     app.editing = Some(EditState { buf: "99".into() });
 }
 
+
+/// 按下这一拍就落锚点：只发 press（不发 release），选区必须已经移到按下的格子。
+/// 旧实现只在 resp.clicked()（松开）里改选区，快速点按后立即拖动会从上一个选区开始长。
+#[test]
+fn press_anchors_selection_before_release() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let pos = egui::pos2(
+        HEAD_W + app.wb.sheets[0].cols.pos(2) + 15.0,
+        HEAD_H + app.wb.sheets[0].rows.pos(2) + 10.0,
+    );
+    let mut step = |pressed: Option<bool>| {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::default(),
+            });
+        }
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    };
+    step(None);
+    step(Some(true)); // 只按下，不松开
+    assert_eq!(app.sel, (2, 2), "按下就应定位到 C3");
+    assert_eq!(app.sel_end, (2, 2));
+}
+
+/// 按住拖动：还没松开、也不依赖 egui 的拖动阈值，选区终点就要跟着指针走
+#[test]
+fn drag_extends_selection_while_button_is_down() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let x = HEAD_W + app.wb.sheets[0].cols.pos(1) + 15.0;
+    let y0 = HEAD_H + app.wb.sheets[0].rows.pos(0) + 10.0;
+    let y1 = HEAD_H + app.wb.sheets[0].rows.pos(4) + 10.0;
+    let run = |app: &mut SheetApp, ctx: &egui::Context, pos: egui::Pos2, pressed: Option<bool>| {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::default(),
+            });
+        }
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    };
+    run(&mut app, &ctx, egui::pos2(x, y0), None);
+    run(&mut app, &ctx, egui::pos2(x, y0), Some(true));
+    run(&mut app, &ctx, egui::pos2(x, y1), None); // 按住、只移动
+    assert_eq!(app.sel, (0, 1), "锚点应停在按下的格");
+    assert_eq!(app.sel_end, (4, 1), "没松开也要扩到第 5 行");
+}
+
 fn click_grid(app: &mut SheetApp, ctx: &egui::Context, pos: egui::Pos2) {
     for pressed in [None, Some(true), Some(false)] {
         let mut input = egui::RawInput {
