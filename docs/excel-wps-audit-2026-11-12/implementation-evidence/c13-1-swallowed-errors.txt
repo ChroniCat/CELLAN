@@ -1,0 +1,88 @@
+# C13.1 保存吞错分支盘点（save_plain_base）
+
+源码：crates/core/src/xlsx.rs `save_plain_base`（行号为本次盘点时）。
+分类原则：**任何会丢用户修改/文件部件的失败都不可降级**；可降级项必须先给出具体影响并另存，
+不能显示普通成功回执。本次盘点未发现可安全降级的子步骤，故全部归为「必须传播」。
+
+| 行 | 子步骤日志 | 失败即丢什么 | 当前状态 |
+|---|---|---|---|
+| 1151 | [save] 宏恢复失败: {e:#} | VBA 工程丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1180 | [save] 透视表源区域回写失败: {e:#} | 透视缓存指向旧区域 | 仍只 eprintln（C13.2 待处理） |
+| 1192 | [save] 数据源写入失败: {e:#} | 外部数据源定义丢失，刷新失效 | 仍只 eprintln（C13.2 待处理） |
+| 1223 | [save] 图表锚点回写失败: {e:#} | 图表位置/大小回退 | 仍只 eprintln（C13.2 待处理） |
+| 1230 | [save] 图表引用回写失败: {e:#} | 插删行列后图表引用错位 | 仍只 eprintln（C13.2 待处理） |
+| 1239 | [save] 表格对象写入失败: {e:#} | 表格对象（tableParts）丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1254 | [save] 条件格式/数据验证补丁失败: {e} | CF/DV/冻结/筛选/页面设置补丁整批丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1269 | [save] 修复 drawing 关系失败: {e:#} | 图表关系断裂，Excel 报修复 | 仍只 eprintln（C13.2 待处理） |
+| 1272 | [save] 去重关系失败: {e:#} | 重复关系，Excel 报修复 | 仍只 eprintln（C13.2 待处理） |
+| 1275 | [save] 清理孤儿部件失败: {e:#} | 旧部件残留（体积/关系错） | 仍只 eprintln（C13.2 待处理） |
+| 1278 | [save] 补回工作表引用元素失败: {e:#} | 工作表引用元素丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1281 | [save] 迁移 workbook 关系失败: {e:#} | 外部链接/宏关系断裂 | 仍只 eprintln（C13.2 待处理） |
+| 1284 | [save] 清理绘图属性失败: {e:#} | drawing 属性不合法 | 仍只 eprintln（C13.2 待处理） |
+| 1287 | [save] 补齐内容类型失败: {e:#} | 部件未注册，Excel 报修复 | 仍只 eprintln（C13.2 待处理） |
+| 1301 | [save] 恢复未编辑工作表失败: {e:#} | 未编辑表被 umya 重写（未知结构丢失） | 仍只 eprintln（C13.2 待处理） |
+| 1311 | [save] 工作表归位失败: {e:#} | 工作表路径变化，图表/图片相对路径断裂 | 仍只 eprintln（C13.2 待处理） |
+| 1320 | [save] 恢复工作簿骨架失败: {e:#} | definedNames/pivotCaches 丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1329 | [save] 恢复工作表 rels 失败: {e:#} | 批注/图片/表格关系丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1342 | [save] 重算 styles count 失败: {e:#} | styles.xml count 与条目不符，Excel 报修复 | 仍只 eprintln（C13.2 待处理） |
+| 1353 | [save] 补 sharedStrings 关系失败: {e:#} | 共享字符串关系缺失 | 仍只 eprintln（C13.2 待处理） |
+| 1356 | [save] 重建内容类型失败: {e:#} | 内容类型缺失 | 仍只 eprintln（C13.2 待处理） |
+| 1375 | [save] 原样搬运失败: {e:#} | 未知部件丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1381 | [save] 补外部链接部件失败: {e:#} | 外链部件缺失 | 仍只 eprintln（C13.2 待处理） |
+| 1392 | [save] 外部链接缓存写回失败: {e:#} | 外链缓存值过期 | 仍只 eprintln（C13.2 待处理） |
+| 1420 | [save] 分级设置写回失败: {e:#} | 分级显示设置丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1423 | [save] 方案写回失败: {e:#} | 方案管理器内容丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1426 | [save] 忽略错误列表写回失败: {e:#} | 忽略错误标记丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1429 | [save] 标签颜色写回失败: {e:#} | 工作表标签颜色丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1433 | [save] 超链接写回失败: {e:#} | 超链接丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1436 | [save] 迷你图写回失败: {e:#} | 迷你图丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1439 | [save] 文本框写回失败: {e:#} | 文本框丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1442 | [save] 工作表可见性写回失败: {e:#} | 隐藏/显示状态丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1445 | [save] 富文本写回失败: {e:#} | 单元格内富文本分段丢失 | 仍只 eprintln（C13.2 待处理） |
+| 1452 | [save] 表格部件同步失败: {e:#} | 表格列/汇总行与模型不一致 | 仍只 eprintln（C13.2 待处理） |
+
+## 故障注入与失败证据
+
+- 注入开关：`SC_FAIL_SAVE_STEP=名称[,名称]`（`xlsx.rs::save_step`），未设置时行为不变。
+- 回归：`crates/core/tests/save_failure_injection.rs`
+- 已传播的 5 个子步骤：merge-sheet-data / layout / protection / page-setup / fixups-migrate-sheet-rels
+- RED 证据（传播前）：注入 merge-sheet-data 后 save_atomic 仍返回 Ok，且目标文件 SHA256 被替换
+- GREEN：5 个子步骤注入后保存返回 Err、错误点名步骤、原文件 SHA256 不变；清掉注入后重试成功
+
+## 待办（C13.2）
+
+1. 把上表其余「仍只 eprintln」的子步骤逐个改为 `must_save!`（失败即中止，临时文件不替换目标）。
+2. 为有条件触发的步骤（宏/图表/表格/CF/外链/未编辑表恢复等）补合成夹具后再注入，
+   不能只测未触发的空转路径。
+3. 失败回执：保存失败时 dirty 必须保留、给出可定位错误、允许重试（C13.3）。
+
+## 实施记录（C13.1 收尾）
+
+### RED（传播前，真实输出）
+
+    注入 merge-sheet-data 失败时原文件不得被改写
+      left:  "9288328923801e22c9303fb6d94c7ac94c5031dd1ce8839c01aa62024c26d3ce"
+     right:  "a899fbb013cc8da6f68f60f27a5acfc8477699cc0ffe1d8c81f99d53d9326fd5"
+    test result: FAILED
+
+即：子步骤已报错（`[save] 合并工作表骨架失败: 注入的保存子步骤失败: merge-sheet-data`），
+但 `save_atomic` 仍返回成功，目标文件已被替换成带缺口的临时文件——正是本节要防的丢数据路径。
+
+### GREEN（传播后）
+
+    cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1
+    test result: ok. 1 passed; 0 failed
+
+- 5 个子步骤注入后：`save_atomic` 返回 Err、错误里点名步骤、原文件 SHA256 不变；
+  清掉注入后重试成功，重开内容正确。
+
+### 全量回归
+
+    cargo test -p sheetcore --offline -- --test-threads=1
+      54 个测试二进制：458 passed, 0 failed, 34 ignored
+
+    cargo test -p app --no-default-features --features glow --offline --bin app -- \
+        --test-threads=1 --skip net::tests:: --skip net::presence_tests::
+      127 passed, 0 failed, 0 ignored, 4 filtered
+
+（原始输出：`c13-1-core-suite.txt`、`c13-1-app-suite.txt`。）

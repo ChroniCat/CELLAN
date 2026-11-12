@@ -37,6 +37,17 @@
    - 证据：`implementation-evidence/ui01-edit-commit.txt`、`ui01-full-window-probe.rs`
    - 未执行：真实硬件键盘、中文 IME 候选（归 QA-04）；窗口关闭未保存提示（后续项）
 
+## 进行中：C13.1 保存吞错盘点与故障注入
+
+- 已加 `xlsx.rs::save_step` + `must_save!`：`SC_FAIL_SAVE_STEP=名称` 注入失败；未设置不改变行为
+- 已把 5 个无条件子步骤改为失败即中止：merge-sheet-data / layout / protection / page-setup /
+  fixups-migrate-sheet-rels（临时文件不再被 rename 成目标文件）
+- 新回归 `crates/core/tests/save_failure_injection.rs`：注入→Err、错误点名步骤、原文件 SHA256 不变、
+  清注入后重试成功（已通过）
+- 盘点表（34 处吞错）：`implementation-evidence/c13-1-swallowed-errors.txt`
+- 正在跑 `cargo test -p sheetcore --offline -- --test-threads=1` 全量回归；结果决定是否 13.1 收尾
+- 剩余 29 处（宏/图表/表格/CF/外链/未编辑表恢复等）属 C13.2，需补对应合成夹具后逐个传播
+
 ## 下一步（按 task-index 建议顺序）
 
 **UI-02.1 Ctrl+S / 另存为与编辑态**（父任务 UI-02 P0；依赖 UI-01 已满足）。

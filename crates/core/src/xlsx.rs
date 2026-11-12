@@ -835,6 +835,28 @@ fn save_plain(path: &Path, wb: &Workbook) -> Result<()> {
     save_plain_base(path, wb, None)
 }
 
+/// 保存子步骤的故障注入（验收专用）：`SC_FAIL_SAVE_STEP=名称[,名称]` 让指定子步骤返回错误。
+/// 未设置时完全不改变行为；用于验证「子步骤失败不得回报成功」。
+fn save_step<T>(step: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Ok(spec) = std::env::var("SC_FAIL_SAVE_STEP") {
+        if spec.split(',').any(|s| s.trim() == step) {
+            return Err(anyhow::anyhow!("注入的保存子步骤失败: {step}"));
+        }
+    }
+    f()
+}
+
+/// 保存子步骤失败必须中止整次保存（临时文件不得被替换成目标文件）。
+macro_rules! must_save {
+    ($step:expr, $body:expr) => {{ 
+        let step: &str = $step;
+        match save_step(step, || $body) {
+            Ok(v) => v,
+            Err(e) => return Err(e.context(format!("保存子步骤 {step} 失败"))),
+        }
+    }};
+}
+
 fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<()> {
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
@@ -1094,27 +1116,22 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
 
     // 只把 sheetData 换进去，工作表骨架沿用基准
     if restore_base.exists() {
-        match crate::fixups::merge_sheet_data(path, &restore_base, wb) {
-            Ok(v) if !v.is_empty() => {
-                if prof {
-                    eprintln!("  [save] 合并单元格数据到基准骨架: {:?}", v);
-                }
-            }
-            Err(e) => eprintln!("[save] 合并工作表骨架失败: {e:#}"),
-            _ => {}
+        let merged = must_save!("merge-sheet-data", crate::fixups::merge_sheet_data(
+            path,
+            &restore_base,
+            wb
+        ));
+        if !merged.is_empty() && prof {
+            eprintln!("  [save] 合并单元格数据到基准骨架: {:?}", merged);
         }
     }
 
     // 样式表原样沿用基准：umya 重建的样式表和原文件对不上（字体/填充被裁、dxfs 被压）
     let untouched = wb.sheets.iter().all(|s| !s.styles_dirty);
     if let Some(xml) = base_styles.as_ref().filter(|_| untouched) {
-        match crate::patch::append_entry(path, "xl/styles.xml", xml) {
-            Ok(()) => {
-                if prof {
-                    eprintln!("  [save] 样式表沿用基准");
-                }
-            }
-            Err(e) => eprintln!("[save] 恢复样式表失败: {e:#}"),
+        must_save!("styles", crate::patch::append_entry(path, "xl/styles.xml", xml));
+        if prof {
+            eprintln!("  [save] 样式表沿用基准");
         }
     }
 
@@ -1122,9 +1139,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // Excel 会判「内容有问题」并要求修复。没有数据源改动时原样搬回基准的 custom.xml。
     if wb.sources.is_empty() {
         if let Some(xml) = crate::fixups::read_part(&restore_base, "docProps/custom.xml") {
-            if let Err(e) = crate::patch::append_entry(path, "docProps/custom.xml", &xml) {
-                eprintln!("[save] 自定义属性沿用基准失败: {e:#}");
-            }
+            must_save!("custom-xml", {
+                crate::patch::append_entry(path, "docProps/custom.xml", &xml)
+            });
         }
     }
 
@@ -1244,9 +1261,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 收尾：umya 会改坏 drawing rels 的图表关系，并留下旧的表格/批注部件
     if restore_base.exists() && std::env::var("SC_NO_FIXUPS").is_err() {
         // 工作表被挪目录时，关系要跟着搬过去
-        if let Err(e) = crate::fixups::migrate_sheet_rels(path, &restore_base) {
-            eprintln!("[save] 迁移工作表关系失败: {e:#}");
-        }
+        must_save!("fixups-migrate-sheet-rels", crate::fixups::migrate_sheet_rels(
+            path,
+            &restore_base
+        ));
         if let Err(e) = crate::fixups::fix_drawing_rels(path, &restore_base) {
             eprintln!("[save] 修复 drawing 关系失败: {e:#}");
         }
@@ -1397,9 +1415,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             .context("透视表部件写入失败")?;
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
-    if let Err(e) = crate::patch::apply_layout(path, wb) {
-        eprintln!("[save] 列宽/行高写回失败: {e:#}");
-    }
+    must_save!("layout", crate::patch::apply_layout(path, wb));
     if let Err(e) = crate::patch::apply_outline_pr(path, wb) {
         eprintln!("[save] 分级设置写回失败: {e:#}");
     }
@@ -1412,9 +1428,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     if let Err(e) = crate::patch::apply_tab_colors(path, wb) {
         eprintln!("[save] 标签颜色写回失败: {e:#}");
     }
-    if let Err(e) = crate::patch::apply_protection(path, wb) {
-        eprintln!("[save] 工作表保护写回失败: {e:#}");
-    }
+    must_save!("protection", crate::patch::apply_protection(path, wb));
     if let Err(e) = crate::hyperlinks::apply(path, wb) {
         eprintln!("[save] 超链接写回失败: {e:#}");
     }
@@ -1430,9 +1444,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     if let Err(e) = crate::patch::apply_rich(path, wb) {
         eprintln!("[save] 富文本写回失败: {e:#}");
     }
-    if let Err(e) = crate::patch::apply_page_setup(path, wb) {
-        eprintln!("[save] 页面设置写回失败: {e:#}");
-    }
+    must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     // 表格对象：删除/转换/新建后同步 table 部件
     for sheet in &wb.sheets {
         if sheet.tables_dirty {

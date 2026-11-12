@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T10:52:38Z",
+ "updated_utc": "2026-11-12T11:05:34Z",
  "tasks": [
   {
    "id": "C01",
@@ -433,8 +433,8 @@
    "scope": "core/xlsx.rs, patch.rs + app/document_tasks.rs",
    "source": "core-requirements.md",
    "heading": "C13 P0 保存子步骤失败必须阻止成功回执",
-   "status": "待实施",
-   "acceptance": "",
+   "status": "实施中",
+   "acceptance": "见 core-requirements.md C13：只有完整保存才清 dirty；失败保留原文件与可重试状态；注入保护/图表/布局/CF/外链/宏补丁失败时原文件 SHA256 不变、dirty 仍在、有可定位错误、无成功提示",
    "files": [],
    "commits": [],
    "commands": [],
@@ -442,8 +442,8 @@
    "not_done": [],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "C13.2 错误传播和临时文件完整性",
+   "updated_utc": "2026-11-12T11:05:34Z",
    "slices": [
     {
      "id": "C13.1",
@@ -451,17 +451,30 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C13 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "盘点 save_plain_base 全部 34 处吞错分支并分类；提供 SC_FAIL_SAVE_STEP 故障注入；注入子步骤失败后 save_atomic 必须返回 Err、错误点名步骤、目标文件 SHA256 不变；清注入重试成功。已完成 5 个无条件子步骤的传播（merge-sheet-data/layout/protection/page-setup/fixups-migrate-sheet-rels），其余 29 处登记在盘点表待 C13.2。",
+     "files": [
+      "crates/core/src/xlsx.rs",
+      "crates/core/tests/save_failure_injection.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1 => 1 passed",
+      "cargo test -p sheetcore --offline -- --test-threads=1 => 458 passed, 0 failed, 34 ignored（54 个二进制）",
+      "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 127 passed, 0 failed, 0 ignored, 4 filtered"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-1-swallowed-errors.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-1-core-suite.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-1-app-suite.txt"
+     ],
+     "not_done": [
+      "其余 29 处吞错（宏/图表/表格/CF/外链/未编辑表恢复/包结构收尾等）仍需传播并补各自夹具（C13.2）；保存失败时的 dirty/回执/重试集成（C13.3）"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "C13.2 逐个传播剩余子步骤并补宏/图表/表格/CF/外链夹具",
+     "updated_utc": "2026-11-12T11:05:34Z"
     },
     {
      "id": "C13.2",
