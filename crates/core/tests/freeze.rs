@@ -2,19 +2,17 @@
 use std::path::Path;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn freeze_roundtrip() {
-    let src = Path::new("F:/Finance/work/freeze.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = Path::new("tests/test-work/freeze.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).expect("读入");
     assert_eq!(wb.sheets[0].freeze, Some((1, 2)), "应读出冻结首行 + 前两列");
 
     // 改成冻结 3 行 1 列
     wb.sheets[0].freeze = Some((3, 1));
     wb.sheets[0].freeze_dirty = true;
-    let out = Path::new("F:/Finance/work/freeze_edit.xlsx");
+    let out = Path::new("tests/test-work/freeze_edit.xlsx");
     let _ = std::fs::remove_file(out);
     sheetcore::xlsx::save(out, &wb).expect("保存");
 
@@ -25,7 +23,7 @@ fn freeze_roundtrip() {
     let mut wb2 = back;
     wb2.sheets[0].freeze = None;
     wb2.sheets[0].freeze_dirty = true;
-    let out2 = Path::new("F:/Finance/work/freeze_none.xlsx");
+    let out2 = Path::new("tests/test-work/freeze_none.xlsx");
     let _ = std::fs::remove_file(out2);
     sheetcore::xlsx::save(out2, &wb2).expect("保存取消");
     let back2 = sheetcore::xlsx::load(out2).expect("再读");

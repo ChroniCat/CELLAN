@@ -3,15 +3,13 @@ use sheetcore::cf::{compute_stats, overlay_at, CfKind, CfSheet, CfStats};
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/cf.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/cf.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn parses_rules_from_file() {
     let Some(wb) = load() else { return };
     let cf = &wb.sheets[0].cf;
@@ -40,6 +38,7 @@ fn parses_rules_from_file() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn overlay_matches_values() {
     let Some(wb) = load() else { return };
     let sheet = wb.sheet(0);
@@ -60,6 +59,7 @@ fn overlay_matches_values() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn expression_rule_uses_block_anchor() {
     let Some(wb) = load() else { return };
     let sheet = wb.sheet(0);
@@ -88,9 +88,10 @@ fn expression_rule_uses_block_anchor() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn write_new_rules_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("F:/Finance/work/cf_edit.xlsx");
+    let out = Path::new("tests/test-work/cf_edit.xlsx");
     let _ = std::fs::remove_file(out);
 
     // 追加一条：A 列包含"乙" → 加粗
@@ -130,12 +131,10 @@ fn write_new_rules_and_save() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn icon_sets_resolve_levels() {
-    let p = std::path::Path::new("F:/Finance/work/icons.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return;
-    }
+    let p = std::path::Path::new("tests/test-work/icons.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     let wb = sheetcore::xlsx::load(p).expect("读入");
     let sheet = wb.sheet(0);
     let cf = &sheet.cf;

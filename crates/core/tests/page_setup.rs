@@ -2,15 +2,13 @@
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/page.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/page.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_page_settings() {
     let Some(wb) = load() else { return };
     let ps = &wb.sheet(0).page;
@@ -24,9 +22,10 @@ fn reads_page_settings() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn changes_survive_save() {
     let Some(mut wb) = load() else { return };
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/page_out_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/page_out_{}.xlsx", std::process::id()));
     let out = out.as_path();
     let _ = std::fs::remove_file(out);
     {
@@ -43,7 +42,7 @@ fn changes_survive_save() {
         sh.page_dirty = true;
     }
     sheetcore::xlsx::save(out, &wb).expect("保存");
-    let _ = std::fs::remove_file("F:/Finance/work/page_edit2.xlsx");
+    let _ = std::fs::remove_file("tests/test-work/page_edit2.xlsx");
     let back = sheetcore::xlsx::load(out).expect("重新读入");
     let ps = &back.sheet(0).page;
     assert!(!ps.landscape);

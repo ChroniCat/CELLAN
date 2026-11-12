@@ -2,15 +2,13 @@
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/notes.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/notes.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_comments() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -30,9 +28,10 @@ fn reads_comments() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn add_edit_delete_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("F:/Finance/work/notes_edit.xlsx");
+    let out = Path::new("tests/test-work/notes_edit.xlsx");
     let _ = std::fs::remove_file(out);
 
     // 新增 C5、修改 B2、删除 A3

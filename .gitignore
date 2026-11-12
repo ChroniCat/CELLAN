@@ -1,0 +1,29 @@
+# Rust build and packaging output
+/target/
+/dist/
+
+# Local workbooks, generated test data, logs, and backups
+/work/
+**/tests/test-work/
+*.xlsx
+*.xlsm
+*.xls
+*.xlsb
+*.xlsx.tmp
+*.log
+*.tmp
+*.bak
+*.bak-*
+*.orig
+.~*
+
+# Checked-in synthetic test fixtures
+!crates/core/tests/data/compat_in.xlsx
+!crates/core/tests/data/two_sheets.xlsx
+!crates/core/tests/data/sparklines.xlsx
+!crates/core/tests/data/real_macro.xlsm
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini

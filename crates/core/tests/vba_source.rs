@@ -1,12 +1,10 @@
 //! VBA 源码提取：OLE 复合文档（含 mini stream）+ MS-OVBA 解压 → 模块与代码
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_modules_from_fixture() {
-    let p = std::path::Path::new("F:/Finance/work/vba_fixture2.bin");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return;
-    }
+    let p = std::path::Path::new("tests/test-work/vba_fixture2.bin");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     let data = std::fs::read(p).unwrap();
     let mods = sheetcore::vba_src::read_modules(&data).expect("解析宏工程");
     assert_eq!(mods.len(), 2, "应有两个模块");

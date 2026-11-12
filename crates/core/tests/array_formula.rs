@@ -3,12 +3,10 @@
 use sheetcore::arr;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_array_formula_from_file() {
-    let path = std::path::Path::new("F:/Finance/work/array.xlsx");
-    if !path.exists() {
-        eprintln!("跳过：缺少 array.xlsx");
-        return;
-    }
+    let path = std::path::Path::new("tests/test-work/array.xlsx");
+    assert!(path.exists(), "required test fixture is missing: {}", path.display());
     let found = arr::scan(path);
     let list = found.get("数组").expect("没找到「数组」表里的数组公式");
     assert_eq!(list.len(), 1, "{list:?}");
@@ -17,11 +15,10 @@ fn reads_array_formula_from_file() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn load_keeps_array_and_save_writes_it_back() {
-    let src = std::path::Path::new("F:/Finance/work/array.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/array.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let wb = sheetcore::xlsx::load(src).expect("加载失败");
     let sheet = &wb.sheets[0];
     assert_eq!(sheet.arrays.len(), 1, "加载后应记住 1 条数组公式");

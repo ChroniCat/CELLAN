@@ -4,11 +4,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/table.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/table.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
@@ -19,6 +16,7 @@ fn names(wb: &sheetcore::model::Workbook) -> Vec<String> {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn sort_by_amount() {
     let Some(mut wb) = load() else { return };
     let region = current_region(wb.sheet(0), 2, 2);
@@ -31,9 +29,10 @@ fn sort_by_amount() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn filter_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("F:/Finance/work/table_filtered.xlsx");
+    let out = Path::new("tests/test-work/table_filtered.xlsx");
     let _ = std::fs::remove_file(out);
 
     let mut f = Filter::new(0, 0, 5, 2);

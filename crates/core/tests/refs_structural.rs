@@ -14,11 +14,10 @@ fn defined_names_shift() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn chart_series_refs_shift_and_are_written_back() {
-    let src = std::path::Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).unwrap();
     let name = wb.sheet(0).name.clone();
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
@@ -30,7 +29,7 @@ fn chart_series_refs_shift_and_are_written_back() {
         sheetcore::charts::ChartKind::Column,
     );
     wb.sheet_mut(0).charts.push(ch.clone());
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/refshift_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/refshift_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).unwrap();
     sheetcore::chart_write::insert_chart(&out, &name, &ch).unwrap();
@@ -82,14 +81,13 @@ fn pending_pivot_source_shifts() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn saving_keeps_chart_parts() {
     // 回归：umya 只写它懂的部件，图表曾在「读入→保存」后整份消失
-    let src = std::path::Path::new("F:/Finance/work/chart.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/chart.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let wb = sheetcore::xlsx::load(src).unwrap();
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/keepparts_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/keepparts_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).unwrap();
     let z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
@@ -112,16 +110,15 @@ fn saving_keeps_chart_parts() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn foreign_charts_survive_round_trip() {
     // 别人做的图表（openpyxl 两个图）保存后必须还在，且能读回来
-    let src = std::path::Path::new("F:/Finance/work/chart.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/chart.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let wb = sheetcore::xlsx::load(src).unwrap();
     let n_before = wb.sheet(0).charts.len();
     assert!(n_before > 0);
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/foreign_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/foreign_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).unwrap();
     let back = sheetcore::xlsx::load(&out).unwrap();

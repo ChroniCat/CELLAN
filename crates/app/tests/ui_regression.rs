@@ -23,10 +23,7 @@ fn dump_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String
 
 fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
     let source = Path::new(file);
-    if !source.exists() {
-        eprintln!("跳过：缺少 {}", source.display());
-        return None;
-    }
+    assert!(source.exists(), "required test fixture is missing: {}", source.display());
     let out = std::env::temp_dir().join(format!(
         "ui_dump_{}_{}.txt",
         std::process::id(),
@@ -39,6 +36,9 @@ fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option
     cmd.arg(file)
         .env("SC_DUMP", &out)
         .env("SC_DUMP_AT", "2")
+        .env_remove("SC_B1")
+        .env_remove("SC_B3")
+        .env_remove("SC_B4")
         // 独立单实例端口：用户开着 app 时也要能起测试实例（否则会转发给用户那个进程）
         .env("SC_INSTANCE_PORT", "49731")
         .stdout(Stdio::null())
@@ -65,7 +65,7 @@ fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&out);
-    None
+    panic!("UI dump was not produced for {} within {:?}", source.display(), wait)
 }
 
 fn has_cell(dump: &str, r: u32, c: u32, text: &str) -> bool {
@@ -75,8 +75,9 @@ fn has_cell(dump: &str, r: u32, c: u32, text: &str) -> bool {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn grid_renders_cells_and_panes() {
-    let Some(dump) = dump_for("F:/Finance/work/table.xlsx", &[], Duration::from_secs(30)) else {
+    let Some(dump) = dump_for("tests/test-work/table.xlsx", &[], Duration::from_secs(30)) else {
         return;
     };
     assert!(
@@ -92,9 +93,10 @@ fn grid_renders_cells_and_panes() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn conditional_format_icons_render() {
     let Some(dump) = dump_for(
-        "F:/Finance/work/icons.xlsx",
+        "tests/test-work/icons.xlsx",
         &[],
         Duration::from_secs(30),
     ) else {
@@ -109,10 +111,11 @@ fn conditional_format_icons_render() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn compare_mode_splits_into_two_panes() {
     let Some(dump) = dump_for(
-        "F:/Finance/work/chart.xlsx",
-        &[("SC_COMPARE", "F:/Finance/work/table.xlsx")],
+        "tests/test-work/chart.xlsx",
+        &[("SC_COMPARE", "tests/test-work/table.xlsx")],
         Duration::from_secs(30),
     ) else {
         return;
@@ -125,8 +128,9 @@ fn compare_mode_splits_into_two_panes() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn pictures_are_drawn_at_anchor() {
-    let Some(dump) = dump_for("F:/Finance/work/pic.xlsx", &[], Duration::from_secs(30)) else {
+    let Some(dump) = dump_for("tests/test-work/pic.xlsx", &[], Duration::from_secs(30)) else {
         return;
     };
     let pics: Vec<&str> = dump.lines().filter(|l| l.starts_with("pic ")).collect();
@@ -137,10 +141,11 @@ fn pictures_are_drawn_at_anchor() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn locked_cell_is_marked() {
     // 单机时锁不会出现；用 SC_LOCK 让宿主自己占一格，应能看到标记
     let Some(dump) = dump_for(
-        "F:/Finance/work/table.xlsx",
+        "tests/test-work/table.xlsx",
         &[("SC_LOCK", "1"), ("SC_LOCK_CELL", "1,1"), ("SC_LOCK_RELEASE_SECS", "60")],
         Duration::from_secs(30),
     ) else {
@@ -151,12 +156,10 @@ fn locked_cell_is_marked() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn textbox_renders_and_moves() {
-    let src = Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = std::env::temp_dir().join(format!("ui_tb_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
@@ -190,11 +193,10 @@ fn textbox_renders_and_moves() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn textbox_drag_moves_model() {
-    let src = Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = std::env::temp_dir().join(format!("ui_tbdrag_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
@@ -242,11 +244,10 @@ fn textbox_drag_moves_model() {
 // ---------------------------------------------------------------- 数据分析四件套
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn subtotal_and_flashfill_apply() {
-    let src = Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = std::env::temp_dir().join(format!("ui_data_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     // table.xlsx 的 部门 列不是相邻同值，分类汇总会如实按「相邻同组」处理（可能多组）
@@ -282,13 +283,14 @@ fn spark_fixture() -> PathBuf {
 #[test]
 fn sparklines_render_in_cells() {
     let f = spark_fixture();
-    if !f.exists() {
-        eprintln!("跳过：缺少 {}", f.display());
-        return;
-    }
-    let Some(dump) = dump_for(&f.to_string_lossy(), &[], Duration::from_secs(30)) else {
+    assert!(f.exists(), "required test fixture is missing: {}", f.display());
+    // The app creates coordination files next to an opened workbook; use a temporary copy.
+    let copy = std::env::temp_dir().join(format!("ui_spark_fixture_{}.xlsx", std::process::id()));
+    std::fs::copy(&f, &copy).expect("copy sparkline fixture");
+    let Some(dump) = dump_for(&copy.to_string_lossy(), &[], Duration::from_secs(30)) else {
         return;
     };
+    let _ = std::fs::remove_file(&copy);
     let lines: Vec<&str> = dump
         .lines()
         .filter(|l| l.starts_with("sparkline "))
@@ -312,13 +314,11 @@ fn sparklines_render_in_cells() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn sparkline_create_from_selection() {
     // 用两张表的普通文件，按 A1:E1 选区建柱形迷你图，落在 F1
-    let src = Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = std::env::temp_dir().join(format!("ui_spark_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
@@ -629,6 +629,7 @@ fn revision_revert_restores_font() {
 
 /// 跑一次 app，把 stderr 收回来（功能区几何日志走 stderr）
 fn ui_log_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> String {
+    let _guard = serial();
     let out = std::env::temp_dir().join(format!("ui_log_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let f = std::fs::File::create(&out).unwrap();
@@ -636,6 +637,10 @@ fn ui_log_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> String {
     let mut cmd = Command::new(exe);
     cmd.arg(file)
         .env("SC_NO_OPEN_DIALOG", "1")
+        .env("SC_INSTANCE_PORT", "49731")
+        .env_remove("SC_B1")
+        .env_remove("SC_B3")
+        .env_remove("SC_B4")
         .stdout(Stdio::null())
         .stderr(Stdio::from(f));
     for (k, v) in extra {

@@ -2,12 +2,10 @@
 use sheetcore::pivot::{Agg, PivotSpec};
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn writes_real_pivot_table() {
-    let src = std::path::Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).expect("读入");
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
     let spec = PivotSpec {
@@ -23,7 +21,7 @@ fn writes_real_pivot_table() {
     // 输出放在 H1
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 7), &res);
     let out = std::path::PathBuf::from(format!(
-        "F:/Finance/work/pivot_real_{}.xlsx",
+        "tests/test-work/pivot_real_{}.xlsx",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&out);
@@ -106,25 +104,22 @@ fn writes_real_pivot_table() {
 }
 
 #[test]
+#[ignore = "depends on another test output; run only as part of a controlled fixture workflow"]
 fn pivot_parts_are_well_formed() {
     // 直接检查 XML 是否能被解析（用 zip + 简单配对检查，避免引入依赖）
     let p = std::path::PathBuf::from(format!(
-        "F:/Finance/work/pivot_real_{}.xlsx",
+        "tests/test-work/pivot_real_{}.xlsx",
         std::process::id()
     ));
-    if !p.exists() {
-        eprintln!("跳过");
-        return;
-    }
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     let _ = std::fs::remove_file(&p);
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn save_attaches_pending_pivot() {
-    let src = std::path::Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).expect("读入");
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
     let spec = PivotSpec {
@@ -140,7 +135,7 @@ fn save_attaches_pending_pivot() {
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 8), &res);
     let name = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
     wb.pivots_pending.push((0, spec, res, rect, name));
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/pivot_pending_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/pivot_pending_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存");
 

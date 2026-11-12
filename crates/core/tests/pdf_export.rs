@@ -32,16 +32,14 @@ fn xref_ok(data: &[u8]) -> (bool, usize) {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn exports_valid_pdf() {
-    let src = std::path::Path::new("F:/Finance/work/table.xlsx");
+    let src = std::path::Path::new("tests/test-work/table.xlsx");
     let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-    if !src.exists() || !font.exists() {
-        eprintln!("跳过：缺测试文件或字体");
-        return;
-    }
+    assert!(!(!src.exists() || !font.exists() ), "required test fixture or dependency is missing; see tests/README.md");
     let wb = sheetcore::xlsx::load(src).expect("读入");
     let layout = sheetcore::print::paginate(wb.sheet(0), &wb.sheet(0).page);
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/t_pdf_{}.pdf", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/t_pdf_{}.pdf", std::process::id()));
     let n = sheetcore::print::export_pdf(&wb, 0, &out, font).expect("导出");
     assert_eq!(n, layout.pages.len(), "页数与分页结果不一致");
     let data = std::fs::read(&out).expect("读回");

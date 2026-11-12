@@ -4,14 +4,12 @@ use sheetcore::style::{Border, CellStyle};
 use std::path::Path;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn edit_style_merge_border_then_save() {
-    let src = Path::new("F:/Finance/work/styled.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = Path::new("tests/test-work/styled.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).expect("读入");
-    let out = Path::new("F:/Finance/work/styled_edit.xlsx");
+    let out = Path::new("tests/test-work/styled_edit.xlsx");
     let _ = std::fs::remove_file(out);
 
     // 1) 给 B10:C11 刷成：加粗 + 黄底 + 全部细边框 + 数值格式

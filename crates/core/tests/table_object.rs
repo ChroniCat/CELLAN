@@ -3,11 +3,10 @@
 use sheetcore::table;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_table_object() {
-    let path = std::path::Path::new("F:/Finance/work/table_obj.xlsx");
-    if !path.exists() {
-        return;
-    }
+    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    assert!(path.exists(), "required test fixture is missing: {}", path.display());
     let wb = sheetcore::xlsx::load(path).expect("加载失败");
     let sheet = wb.sheets.iter().find(|s| s.name == "报价").expect("没有「报价」表");
     assert_eq!(sheet.tables.len(), 1, "{:?}", sheet.tables);
@@ -18,11 +17,10 @@ fn reads_table_object() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn structured_reference_resolves() {
-    let path = std::path::Path::new("F:/Finance/work/table_obj.xlsx");
-    if !path.exists() {
-        return;
-    }
+    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    assert!(path.exists(), "required test fixture is missing: {}", path.display());
     let wb = sheetcore::xlsx::load(path).expect("加载失败");
     let si = wb.sheets.iter().position(|s| s.name == "报价").unwrap();
     // 展开结果应该是数值列（C 列）且跳过标题行
@@ -36,11 +34,10 @@ fn structured_reference_resolves() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn save_keeps_table_parts() {
-    let path = std::path::Path::new("F:/Finance/work/table_obj.xlsx");
-    if !path.exists() {
-        return;
-    }
+    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    assert!(path.exists(), "required test fixture is missing: {}", path.display());
     let wb = sheetcore::xlsx::load(path).expect("加载失败");
     let out = std::env::temp_dir().join("table_obj_out.xlsx");
     let _ = std::fs::remove_file(&out);

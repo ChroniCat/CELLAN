@@ -4,15 +4,13 @@ use sheetcore::model::Value;
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/dv.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/dv.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn parses_from_file() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -27,6 +25,7 @@ fn parses_from_file() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn validates_values() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -44,9 +43,10 @@ fn validates_values() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn add_and_save_roundtrip() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("F:/Finance/work/dv_edit.xlsx");
+    let out = Path::new("tests/test-work/dv_edit.xlsx");
     let _ = std::fs::remove_file(out);
 
     // 给 A2:A20 加一条文本长度验证

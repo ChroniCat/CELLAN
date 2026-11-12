@@ -3,15 +3,13 @@ use sheetcore::pivot::{Agg, PivotSpec};
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("F:/Finance/work/table.xlsx");
-    if !p.exists() {
-        eprintln!("跳过：缺少 {}", p.display());
-        return None;
-    }
+    let p = Path::new("tests/test-work/table.xlsx");
+    assert!(p.exists(), "required test fixture is missing: {}", p.display());
     Some(sheetcore::xlsx::load(p).expect("读入"))
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn pivot_by_department() {
     let Some(mut wb) = load() else { return };
     // 表格：A 姓名 / B 部门 / C 金额，5 行数据
@@ -50,7 +48,7 @@ fn pivot_by_department() {
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 6), &res);
     assert_eq!(rect.1, 6);
     wb.dirty = true;
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/pivot_out_{}.xlsx", std::process::id()));
+    let out = std::path::PathBuf::from(format!("tests/test-work/pivot_out_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存");
 
@@ -63,6 +61,7 @@ fn pivot_by_department() {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn pivot_count_and_average() {
     let Some(wb) = load() else { return };
     let region = (0u32, 0u32, 5u32, 2u32);

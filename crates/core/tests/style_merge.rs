@@ -3,12 +3,10 @@ use sheetcore::model::Value;
 use std::path::Path;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn style_and_merge_survive_save() {
-    let src = Path::new("F:/Finance/work/styled.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
+    let src = Path::new("tests/test-work/styled.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let mut wb = sheetcore::xlsx::load(src).expect("读入");
 
     // 原始状态
@@ -27,7 +25,7 @@ fn style_and_merge_survive_save() {
         value: Value::Text("改过的产品A".into()),
         formula: None,
     });
-    let out = Path::new("F:/Finance/work/styled_out.xlsx");
+    let out = Path::new("tests/test-work/styled_out.xlsx");
     let _ = std::fs::remove_file(out);
     sheetcore::xlsx::save(out, &wb).expect("保存");
 

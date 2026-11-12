@@ -2,13 +2,11 @@
 use std::path::Path;
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn insert_column_chart() {
-    let src = Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        eprintln!("跳过：缺少 {}", src.display());
-        return;
-    }
-    let out = std::path::PathBuf::from(format!("F:/Finance/work/chart_out_{}.xlsx", std::process::id()));
+    let src = Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
+    let out = std::path::PathBuf::from(format!("tests/test-work/chart_out_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
     let wb = sheetcore::xlsx::load(src).expect("读入");

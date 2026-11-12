@@ -15,18 +15,16 @@ fn kinds() -> Vec<ChartKind> {
 }
 
 #[test]
+#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn every_kind_inserts_and_deletes() {
-    let src = std::path::Path::new("F:/Finance/work/table.xlsx");
-    if !src.exists() {
-        eprintln!("跳过");
-        return;
-    }
+    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
     for k in kinds() {
         let mut wb = sheetcore::xlsx::load(src).expect("读入");
         let name = wb.sheet(0).name.clone();
         let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
         let out = std::path::PathBuf::from(format!(
-            "F:/Finance/work/ck_{:?}_{}.xlsx",
+            "tests/test-work/ck_{:?}_{}.xlsx",
             k,
             std::process::id()
         ));
