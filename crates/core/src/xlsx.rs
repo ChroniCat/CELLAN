@@ -61,6 +61,22 @@ mod structure;
 #[path = "xlsx_pivots.rs"]
 mod pivots;
 
+/// ErrKind → umya 的错误类型。umya 没有 #SPILL!，用 #VALUE! 代；循环引用在 Excel 里也报 #REF!。
+fn to_umya_error(e: crate::formula::ErrKind) -> umya_spreadsheet::CellErrorType {
+    use crate::formula::ErrKind as K;
+    use umya_spreadsheet::CellErrorType as U;
+    match e {
+        K::Null => U::Null,
+        K::Div0 => U::Div0,
+        K::Value => U::Value,
+        K::Ref | K::Circular => U::Ref,
+        K::Name => U::Name,
+        K::Num => U::Num,
+        K::Na => U::NA,
+        K::Spill => U::Value,
+    }
+}
+
 fn data_to_value(d: &Data) -> Value {
     match d {
         Data::Empty => Value::Empty,
@@ -71,7 +87,18 @@ fn data_to_value(d: &Data) -> Value {
         Data::DateTime(dt) => Value::Number(dt.as_f64()),
         Data::DateTimeIso(s) => Value::Text(s.as_str().into()),
         Data::DurationIso(s) => Value::Text(s.as_str().into()),
-        Data::Error(e) => Value::Text(format!("#{:?}", e).into()),
+        // 低层错误类型要映射回我们自己的 ErrKind，不能 Debug 拼字符串：
+        // `Data::Error` 的 Debug 输出和我们显示/存盘用的文本并不是一回事。
+        Data::Error(e) => match e {
+            calamine::CellErrorType::Div0 => Value::Error(crate::formula::ErrKind::Div0),
+            calamine::CellErrorType::Name => Value::Error(crate::formula::ErrKind::Name),
+            calamine::CellErrorType::NA => Value::Error(crate::formula::ErrKind::Na),
+            calamine::CellErrorType::Num => Value::Error(crate::formula::ErrKind::Num),
+            calamine::CellErrorType::Value => Value::Error(crate::formula::ErrKind::Value),
+            calamine::CellErrorType::Ref => Value::Error(crate::formula::ErrKind::Ref),
+            calamine::CellErrorType::Null => Value::Error(crate::formula::ErrKind::Null),
+            _ => Value::Error(crate::formula::ErrKind::Value),
+        },
     }
 }
 
@@ -1454,8 +1481,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     Value::Number(n) => {
                         target.set_formula_result_number(*n);
                     }
-                    // 错误值（内部是 #Div0/#NA 这类简写）不写缓存，交给 Excel 重算
-                    Value::Text(t) if t.starts_with('#') => {}
+                    Value::Error(e) => {
+                        // 真正的错误值写成 t="e"，Excel 打开就是 #DIV/0! 这类错误，
+                        // 而不是一段看起来像错误的文本
+                        target.set_formula_result_error(to_umya_error(*e));
+                    }
                     Value::Text(t) => {
                         target.set_formula_result_string(t.to_string());
                     }
@@ -1476,6 +1506,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 }
                 Value::Bool(b) => {
                     ws.get_cell_mut(coord).set_value_bool(*b);
+                }
+                Value::Error(e) => {
+                    ws.get_cell_mut(coord).set_formula_result_error(to_umya_error(*e));
                 }
             }
         }

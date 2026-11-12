@@ -177,7 +177,12 @@ fn circular_reference_is_caught() {
     wb.sheets[0].set(0, 0, Cell { value: Value::Empty, formula: Some("=A2".into()) });
     wb.sheets[0].set(1, 0, Cell { value: Value::Empty, formula: Some("=A1".into()) });
     formula::recalc_all(&mut wb);
-    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("#REF!".into()));
+    // C01：循环引用是错误**类型**（显示为 #REF!），不是一段文本
+    assert_eq!(
+        wb.sheets[0].value(0, 0),
+        Value::Error(sheetcore::formula::ErrKind::Circular)
+    );
+    assert_eq!(wb.sheets[0].value(0, 0).display(), "#REF!");
 }
 
 #[test]

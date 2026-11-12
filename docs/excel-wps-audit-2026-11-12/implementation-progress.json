@@ -192,7 +192,7 @@
    "scope": "core/lib.rs, table.rs, formula parser",
    "source": "core-requirements.md",
    "heading": "C03 P0 公式预处理不得改写字符串和标识符",
-   "status": "已验收",
+   "status": "待验收",
    "acceptance": "[core-requirements.md C03] 改写只看引号外：`=\"_xlfn.TEXT\"`/`=\"Sales[Amount]\"`/`=\"A:A\"`/含 \"\" 转义的文本结果与原文逐字一致；真 `_xlfn.XLOOKUP` 与 `SUM(Sales[Amount])` 仍计算；含单引号工作表名按 '' 转义解析；输入/载入/复制/重算/保存五条路径公式文本不变（11 项测试）。",
    "files": [
     "crates/core/src/lib.rs,crates/core/src/table.rs,crates/core/tests/formula_strings.rs"
@@ -210,13 +210,17 @@
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c03-formula-strings.txt"
    ],
    "not_done": [
-    "未与 Excel/WPS 实机对拍（期望值来自需求表与 Excel 语义）",
-    "`Sales[[#Data],[Amount]]` 多段说明符仍不支持（C10 范围）"
+    "复核 23:58 指出：normalize_formula 对引号外片段仍是全局 replace，会改坏 Tax_xlfn.Rate / Sales_xlfn.Backup[Amount]（已改为 token/上下文判定，待整套回归确认）",
+    "复制路径原先用 shift_refs(f,0,0)，零偏移直接返回，等于没验证（已改为非零偏移混合引用+字符串）",
+    "_xlfn.XLOOKUP 原先只断言归一化文本，未验证计算（已补真实数据求值 20/30/#N/A）",
+    "含单引号表名原先只测同表 si=0（已补真实第二张表跨表引用）",
+    "未与 Excel/WPS 实机对拍",
+    "Sales[[#Data],[Amount]] 多段说明符仍不支持（C10 范围）"
    ],
    "failures": [],
    "blocker": "",
    "next": "按 task-index 第一批顺序进入 C01.1 错误类型回归",
-   "updated_utc": "2026-11-12T15:50:31Z",
+   "updated_utc": "2026-11-12T15:59:35Z",
    "slices": [
     {
      "id": "C03.1",
@@ -224,7 +228,7 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C03 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
+     "status": "待验收",
      "acceptance": "[core-requirements.md C03] 改写只看引号外：`=\"_xlfn.TEXT\"`/`=\"Sales[Amount]\"`/`=\"A:A\"`/含 \"\" 转义的文本结果与原文逐字一致；真 `_xlfn.XLOOKUP` 与 `SUM(Sales[Amount])` 仍计算；含单引号工作表名按 '' 转义解析；输入/载入/复制/重算/保存五条路径公式文本不变（11 项测试）。",
      "files": [
       "crates/core/src/lib.rs,crates/core/src/table.rs,crates/core/tests/formula_strings.rs"
@@ -242,13 +246,17 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c03-formula-strings.txt"
      ],
      "not_done": [
-      "未与 Excel/WPS 实机对拍（期望值来自需求表与 Excel 语义）",
-      "`Sales[[#Data],[Amount]]` 多段说明符仍不支持（C10 范围）"
+      "复核 23:58 指出：normalize_formula 对引号外片段仍是全局 replace，会改坏 Tax_xlfn.Rate / Sales_xlfn.Backup[Amount]（已改为 token/上下文判定，待整套回归确认）",
+      "复制路径原先用 shift_refs(f,0,0)，零偏移直接返回，等于没验证（已改为非零偏移混合引用+字符串）",
+      "_xlfn.XLOOKUP 原先只断言归一化文本，未验证计算（已补真实数据求值 20/30/#N/A）",
+      "含单引号表名原先只测同表 si=0（已补真实第二张表跨表引用）",
+      "未与 Excel/WPS 实机对拍",
+      "Sales[[#Data],[Amount]] 多段说明符仍不支持（C10 范围）"
      ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T15:50:31Z"
+     "updated_utc": "2026-11-12T15:59:35Z"
     }
    ]
   },

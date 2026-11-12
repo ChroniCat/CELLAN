@@ -49,7 +49,13 @@ fn spill_blocked_by_existing_data() {
     wb.sheets[0].set(1, 0, text("占用"));
     wb.sheets[0].set(0, 0, f("=SEQUENCE(3,1)"));
     formula::recalc_all(&mut wb);
-    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("#SPILL!".into()));
+    // C01 之后错误是**类型**而不是文本：溢出被占必须是 Error(Spill)，
+    // 否则 IFERROR 抓不到、SUM 也拦不住（旧断言 Text("#SPILL!") 是旧错误模型的产物）
+    assert_eq!(
+        wb.sheets[0].value(0, 0),
+        Value::Error(formula::ErrKind::Spill)
+    );
+    assert_eq!(wb.sheets[0].value(0, 0).display(), "#SPILL!");
     assert_eq!(wb.sheets[0].value(1, 0), Value::Text("占用".into()));
 }
 

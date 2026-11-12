@@ -16,6 +16,8 @@ pub enum ValueWire {
     Number(f64),
     Text(String),
     Bool(bool),
+    /// 错误值单独一类：不能被当成文本同步过去
+    Error(String),
 }
 
 impl From<&Value> for ValueWire {
@@ -25,6 +27,7 @@ impl From<&Value> for ValueWire {
             Value::Number(n) => ValueWire::Number(*n),
             Value::Text(s) => ValueWire::Text(s.to_string()),
             Value::Bool(b) => ValueWire::Bool(*b),
+            Value::Error(e) => ValueWire::Error(e.text().to_string()),
         }
     }
 }
@@ -36,6 +39,9 @@ impl From<&ValueWire> for Value {
             ValueWire::Number(n) => Value::Number(*n),
             ValueWire::Text(s) => Value::Text(s.as_str().into()),
             ValueWire::Bool(b) => Value::Bool(*b),
+            ValueWire::Error(t) => crate::formula::ErrKind::from_text(t)
+                .map(Value::Error)
+                .unwrap_or_else(|| Value::Text(t.as_str().into())),
         }
     }
 }

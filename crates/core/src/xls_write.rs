@@ -156,6 +156,13 @@ fn cached_value(v: &Value) -> ([u8; 8], Option<Vec<u8>>) {
             b[2] = 1;
             b[3] = if *x { 1 } else { 0 };
         }
+        Value::Error(e) => {
+            // FORMULA 缓存值的错误标号：2 = 错误，第 4 字节是 BIFF 错误码
+            b[0] = 0xFF;
+            b[1] = 0xFF;
+            b[2] = 2;
+            b[3] = biff_error_code(*e);
+        }
         Value::Empty => {
             b[0] = 0xFF;
             b[1] = 0xFF;
@@ -163,6 +170,21 @@ fn cached_value(v: &Value) -> ([u8; 8], Option<Vec<u8>>) {
         }
     }
     (b, None)
+}
+
+/// BIFF8 的单元格错误码（与 OOXML 的 `t="e"` 文本一一对应）
+fn biff_error_code(e: crate::formula::ErrKind) -> u8 {
+    use crate::formula::ErrKind as K;
+    match e {
+        K::Null => 0x00,
+        K::Div0 => 0x07,
+        K::Value => 0x0F,
+        K::Ref | K::Circular => 0x17,
+        K::Name => 0x1D,
+        K::Num => 0x24,
+        K::Na => 0x2A,
+        K::Spill => 0x0F, // BIFF8 没有 #SPILL!，用 #VALUE! 兜底
+    }
 }
 
 fn builtin_id(code: &str) -> Option<u16> {
@@ -476,6 +498,12 @@ fn sheet_stream(
             Value::Bool(v) => {
                 b.push(if *v { 1 } else { 0 });
                 b.push(0);
+                rec(&mut out, BOOLERR, &b);
+            }
+            Value::Error(e) => {
+                // BOOLERR：第 1 字节 1 = 错误，第 2 字节是错误码
+                b.push(1);
+                b.push(biff_error_code(*e));
                 rec(&mut out, BOOLERR, &b);
             }
             Value::Empty => {}

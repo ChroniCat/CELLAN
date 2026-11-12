@@ -39,6 +39,8 @@ impl Snap {
             Value::Bool(_) => "b",
             Value::Empty => "e",
             Value::Text(_) => "s",
+            // "x" 是错误值：旧版本没有这个分支，读到时按文本兜底
+            Value::Error(_) => "x",
         };
         Self {
             v: c.value.display(),
@@ -52,6 +54,9 @@ impl Snap {
             "n" => self.v.parse::<f64>().map(Value::Number).unwrap_or(Value::Empty),
             "b" => Value::Bool(self.v.eq_ignore_ascii_case("true") || self.v == "1"),
             "e" => Value::Empty,
+            "x" => crate::formula::ErrKind::from_text(&self.v)
+                .map(Value::Error)
+                .unwrap_or_else(|| Value::Text(self.v.as_str().into())),
             _ => {
                 if self.v.is_empty() {
                     Value::Empty

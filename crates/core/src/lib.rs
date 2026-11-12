@@ -196,15 +196,78 @@ pub fn normalize_formula(text: &str) -> String {
     for (in_quote, seg) in split_quoted(&text) {
         if in_quote {
             out.push_str(seg);
-            continue;
+        } else {
+            out.push_str(&strip_fn_prefixes(seg));
         }
-        out.push_str(
-            &seg.replace("_xlfn._xlws.", "")
-                .replace("_xlfn.", "")
-                .replace("_xlws.", "")
-                .replace("_xlpm.", "")
-                .replace("_xludf.", ""),
-        );
+    }
+    out
+}
+
+/// 剥掉 `_xlfn.` / `_xlfn._xlws.` / `_xludf.` 这类**函数调用前缀**。
+///
+/// 不能对整段做 `replace`：`Tax_xlfn.Rate` 是合法名称、`Sales_xlfn.Backup` 是合法表名，
+/// 只要前缀前面还粘着别的字符，就不是前缀。判据三条：
+/// 1. 必须从标识符起点开始（前一个字符不是字母/数字/`_`/`.`）；
+/// 2. 前缀后面必须是合法标识符；
+/// 3. 函数前缀（`_xlfn.`/`_xlws.`/`_xludf.`）后面的标识符必须紧跟 `(` ——
+///    这才说明它是一个被调用的函数，而不是同名名称。
+/// `_xlpm.` 是 LET/LAMBDA 的参数名，它不跟括号，单独处理。
+fn strip_fn_prefixes(seg: &str) -> String {
+    const FN_PREFIXES: [&str; 3] = ["_xlfn.", "_xlws.", "_xludf."];
+    let chars: Vec<char> = seg.chars().collect();
+    let mut out = String::with_capacity(seg.len());
+    let mut i = 0usize;
+    let id_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c > '\u{7f}';
+    let id_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c > '\u{7f}';
+    while i < chars.len() {
+        let boundary = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '_' | '.' | '$'));
+        if boundary {
+            let rest: String = chars[i..].iter().take(16).collect();
+            // LET/LAMBDA 的参数：_xlpm.name → name
+            if rest.starts_with("_xlpm.") {
+                let mut j = i + "_xlpm.".len();
+                let name_start = j;
+                while j < chars.len() && id_char(chars[j]) {
+                    j += 1;
+                }
+                if j > name_start && id_start(chars[name_start]) {
+                    out.extend(chars[name_start..j].iter());
+                    i = j;
+                    continue;
+                }
+            }
+            // 函数前缀：可以连续出现（_xlfn._xlws.FILTER）
+            let mut j = i;
+            let mut matched = false;
+            loop {
+                let ahead: String = chars[j..].iter().take(8).collect();
+                match FN_PREFIXES.iter().find(|p| ahead.starts_with(**p)) {
+                    Some(p) => {
+                        j += p.len();
+                        matched = true;
+                    }
+                    None => break,
+                }
+            }
+            if matched {
+                let name_start = j;
+                while j < chars.len() && id_char(chars[j]) {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < chars.len() && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                let is_call = k < chars.len() && chars[k] == '(';
+                if j > name_start && id_start(chars[name_start]) && is_call {
+                    out.extend(chars[name_start..j].iter());
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }

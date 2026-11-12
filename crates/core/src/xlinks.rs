@@ -390,6 +390,7 @@ fn cell_xml(r: u32, c: u32, v: &Value) -> String {
             xml_escape(t)
         ),
         Value::Bool(b) => format!("<cell r=\"{name}\" t=\"b\"><v>{}</v></cell>", if *b { 1 } else { 0 }),
+        Value::Error(e) => format!("<cell r=\"{name}\" t=\"e\"><v>{}</v></cell>", e.text()),
         Value::Empty => String::new(),
     }
 }

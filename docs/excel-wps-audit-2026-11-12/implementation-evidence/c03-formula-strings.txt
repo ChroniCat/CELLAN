@@ -106,3 +106,56 @@ C03 公式预处理不得改写字符串和标识符
 - `_xlfn.` 前缀在引号外仍然全量剥掉，包括自定义函数名 `_xludf.foo` —— 前缀剥除的语义
   没有变，只是不再跨引号生效。
 - 没有 Excel 对拍截图；期望值来自需求表与 Excel 语义，不是本机实测（本机 Excel 未启动）。
+
+六、复核补正（23:58）：前缀只在「函数调用」位置剥
+------------------------------------------------
+复核指出：`normalize_formula` 对每个引号外片段仍在做 `str::replace`，
+于是合法名称 `Tax_xlfn.Rate` 会变成 `TaxRate`、`Sales_xlfn.Backup[Amount]` 的表名会被改坏。
+「引号外」只是必要条件，不是充分条件——还得看**这个词法位置是不是函数调用**。
+
+改法 `strip_fn_prefixes(seg)`，三条判据：
+
+1. 前缀必须从标识符起点开始（前一个字符不是字母/数字/`_`/`.`/`$`）；
+2. 前缀后面必须是合法标识符（首字符是字母/`_`/非 ASCII，其余可含数字与 `.`）；
+3. 函数前缀 `_xlfn.` / `_xlws.` / `_xludf.` 后面的标识符必须紧跟 `(`
+   —— 只有被调用的函数才剥；`_xlpm.` 是 LET/LAMBDA 的参数名，不跟括号，单独处理。
+
+`_xlfn._xlws.FILTER(` 这种连续前缀按链式剥掉，最后输出 `FILTER(`。
+
+新增用例：
+
+| 输入 | 期望 |
+|---|---|
+| `=Tax_xlfn.Rate` | 原样 |
+| `=Tax_xlfn.Rate*2` | 原样 |
+| `=Sales_xlfn.Backup[Amount]` | 原样（表不存在时不展开） |
+| `=SUM(Sales_xlfn.Backup[Amount])`（表真的叫这名字） | `=SUM(A2:A4)`，表名本身不改写 |
+| `=_xlfn.Rate`（没有括号 → 不是函数调用） | 原样 |
+| `=LET(_xlpm.x,1,_xlpm.x+1)` | `=LET(x,1,x+1)` |
+| `=_xludf.MYFUNC(1)` | `=MYFUNC(1)` |
+
+**mutation 验证强度**：把 `strip_fn_prefixes(seg)` 换回旧的全局 replace 链：
+
+    test prefix_inside_a_legal_name_is_not_stripped ... FAILED
+    panicked at crates\core\tests\formula_strings.rs:143
+    test result: FAILED. 12 passed; 1 failed
+
+恢复后 13 项全通过。
+
+七、复核补正：三条「证明力不足」的用例
+--------------------------------------
+1. **复制路径**：原来 `shift_refs(&f, 0, 0)` —— `sparse.rs:156` 对零偏移直接
+   `return formula.to_string()`，等于什么都没验证。改成
+   `shift_refs("=A1&\"A1\"&$B$2&\"Sales[Amount]\"", 1, 1)`，
+   期望 `=B2&\"A1\"&$B$2&\"Sales[Amount]\"`：相对引用 A1 跟着移动，绝对引用与两段字符串一字不动。
+2. **XLOOKUP**：原来只断言 `normalize_formula` 的文本。现在铺 A1:A3=1/2/3、B1:B3=10/20/30，
+   直接算 `=_xlfn.XLOOKUP(2,A1:A3,B1:B3)` = 20、`3` = 30、`9` = `#N/A`。
+3. **含单引号工作表名**：原来只在 si=0 的同表上测。现在真的建第二张表 `Bob's Data`
+   （A1=7、B1="A1"），从「汇总」表引用 `='Bob''s Data'!A1` = 7、
+   `='Bob''s Data'!B1` = `A1`（引号里的是数据不是引用），并断言 `normalize_formula` 不动它。
+
+八、当前状态
+------------
+- `formula_strings`：**13 passed / 0 failed**
+- 完整 core / app / GUI 回归在补正后重跑，数字见提交说明与 `implementation-progress.json`
+- C03 在复核后先回退「待验收」，等这套补正与全量回归一起过再恢复

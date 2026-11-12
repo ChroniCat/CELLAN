@@ -2182,6 +2182,7 @@ pub fn to_fvalue(v: &crate::model::Value) -> FValue {
         V::Number(n) => FValue::Number(*n),
         V::Text(s) => FValue::Text(s.to_string()),
         V::Bool(b) => FValue::Bool(*b),
+        V::Error(e) => FValue::Error(*e),
     }
 }
 
@@ -2192,7 +2193,7 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
         FValue::Number(n) => V::Number(*n),
         FValue::Text(s) => V::Text(s.as_str().into()),
         FValue::Bool(b) => V::Bool(*b),
-        FValue::Error(e) => V::Text(e.text().into()),
+        FValue::Error(e) => V::Error(*e),
         FValue::Array(a) => from_fvalue(&a.get(0, 0)),
         // 函数值落盘没有对应类型，Excel 里显示 #CALC!
         FValue::Lambda(_) => V::Text("#CALC!".into()),
@@ -2326,8 +2327,15 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
         return 0;
     }
     let has_spills = wb.sheets.iter().any(|s| !s.spilled.is_empty() || !s.arrays.is_empty()
-        || s.iter().any(|(_, c)| c.formula.is_some() && matches!(&c.value,
-            crate::Value::Text(t) if t.as_ref() == "#SPILL!")));
+        || s.iter().any(|(_, c)| {
+            // 错误值现在是类型；老的 Text("#SPILL!") 仍然认，兼容旧文件与旧缓存
+            c.formula.is_some()
+                && match &c.value {
+                    crate::Value::Error(ErrKind::Spill) => true,
+                    crate::Value::Text(t) => t.as_ref() == "#SPILL!",
+                    _ => false,
+                }
+        }));
     if deps.requires_full_recalc() || has_spills {
         // 用户覆盖溢出格时保留输入，让数组按正常冲突规则处理。
         for &(si, r, c) in seeds {

@@ -37,6 +37,7 @@ pub fn value_text(v: &Value) -> String {
             }
         }
         Value::Text(t) => t.to_string(),
+        Value::Error(e) => e.text().to_string(),
         Value::Bool(b) => {
             if *b {
                 "TRUE".into()

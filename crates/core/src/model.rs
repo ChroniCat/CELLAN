@@ -21,6 +21,8 @@ pub enum Value {
     Number(f64),
     Text(Box<str>),
     Bool(bool),
+    /// 真正的错误值（`=1/0` 算出来的），与「用户输入的文本 `#DIV/0!`」是两回事。
+    Error(crate::formula::ErrKind),
 }
 
 /// 数字显示：整数不带小数点，小数最多 10 位并去掉尾零
@@ -44,6 +46,7 @@ impl Value {
             Value::Number(n) => format_number(*n),
             Value::Text(s) => s.to_string(),
             Value::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+            Value::Error(e) => e.text().to_string(),
         }
     }
 

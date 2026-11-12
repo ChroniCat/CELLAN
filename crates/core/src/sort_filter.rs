@@ -13,6 +13,8 @@ fn key_of(v: &Value) -> Option<(u8, f64, String)> {
         Value::Number(n) => Some((0, *n, String::new())),
         Value::Text(t) => Some((1, 0.0, t.to_lowercase())),
         Value::Bool(b) => Some((2, if *b { 1.0 } else { 0.0 }, String::new())),
+        // 错误值排在最后（Excel 同序），同类之间按错误文本稳定排序
+        Value::Error(e) => Some((3, 0.0, e.text().to_string())),
         Value::Empty => None,
     }
 }

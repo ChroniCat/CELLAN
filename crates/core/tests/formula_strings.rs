@@ -15,6 +15,10 @@ fn ev(wb: &Workbook, f: &str) -> String {
 
 /// A1:B4 的表，表名 `Sales`，列 `Amount`；表列值 10/20/30。
 fn book_with_table() -> Workbook {
+    book_with_table_named("Sales")
+}
+
+fn book_with_table_named(name: &str) -> Workbook {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "数据".to_string();
     for (r, c, v) in [
@@ -26,8 +30,8 @@ fn book_with_table() -> Workbook {
         wb.sheets[0].set(r, c, Cell { value: v, formula: None });
     }
     wb.sheets[0].tables.push(sheetcore::table::Table {
-        name: "Sales".into(),
-        display: "Sales".into(),
+        name: name.into(),
+        display: name.into(),
         range: (0, 0, 3, 0),
         columns: vec!["Amount".into()],
         header_row: true,
@@ -107,11 +111,53 @@ fn real_function_prefixes_are_still_normalized() {
         "=FILTER(A1:A3,B1:B3>0)"
     );
     assert_eq!(sheetcore::normalize_formula("=_xlfn._xlws.SORT(A1:A3)"), "=SORT(A1:A3)");
+    assert_eq!(sheetcore::normalize_formula("=_xludf.MYFUNC(1)"), "=MYFUNC(1)");
+    // LET 的参数名（_xlpm.）也归一到裸名字
+    assert_eq!(
+        sheetcore::normalize_formula("=LET(_xlpm.x,1,_xlpm.x+1)"),
+        "=LET(x,1,x+1)"
+    );
     // 字符串里的不能被顺手带走：真前缀在引号外被去掉，引号内的原样
     assert_eq!(
         sheetcore::normalize_formula(r#"="_xlfn.TEXT"&_xlfn.TEXT(1,"0")"#),
         r#"="_xlfn.TEXT"&TEXT(1,"0")"#
     );
+}
+
+#[test]
+fn prefix_inside_a_legal_name_is_not_stripped() {
+    // 名称/表名里带 `_xlfn.` 子串是合法的：只有「标识符起点 + 后面紧跟括号」才算前缀
+    for src in [
+        "=Tax_xlfn.Rate",
+        "=Tax_xlfn.Rate*2",
+        "=SUM(Sales_xlfn.Backup[Amount])",
+        "=Sales_xlfn.Backup[Amount]",
+        "=_xlfn.Rate",
+        "=A1&\"_xlfn.XLOOKUP\"",
+    ] {
+        let want = if src.contains("SUM(Sales_xlfn.Backup[Amount])") {
+            src.to_string() // 表不存在时不展开，文本必须原样
+        } else {
+            src.to_string()
+        };
+        assert_eq!(sheetcore::normalize_formula(src), want, "{src} 里的合法名称被改写了");
+    }
+    // 表名真的存在时，结构化引用照常展开，但表名本身不能被当成前缀处理
+    let wb = book_with_table_named("Sales_xlfn.Backup");
+    let out = expand_structured(&wb, 0, "=SUM(Sales_xlfn.Backup[Amount])").expect("应展开");
+    assert_eq!(out, "=SUM(A2:A4)");
+}
+
+#[test]
+fn xlookup_with_prefix_really_calculates() {
+    let mut wb = Workbook::new_blank();
+    for (r, (k, v)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+        wb.sheets[0].set(r as u32, 0, Cell { value: Value::Number(*k), formula: None });
+        wb.sheets[0].set(r as u32, 1, Cell { value: Value::Number(*v), formula: None });
+    }
+    assert_eq!(ev(&wb, "=_xlfn.XLOOKUP(2,A1:A3,B1:B3)"), "20");
+    assert_eq!(ev(&wb, "=_xlfn.XLOOKUP(3,A1:A3,B1:B3)"), "30");
+    assert_eq!(ev(&wb, "=_xlfn.XLOOKUP(9,A1:A3,B1:B3)"), "#N/A");
 }
 
 // ---------------------------------------------------------------- 计算路径
@@ -167,11 +213,22 @@ fn input_save_load_copy_keep_the_formula_text() {
 
 #[test]
 fn quoted_sheet_name_reference_escapes_and_resolves() {
+    // 真的两张表：从「汇总」引用「Bob's Data」
     let mut wb = Workbook::new_blank();
-    wb.sheets[0].name = "Bob's".to_string();
-    wb.sheets[0].set(0, 0, Cell { value: Value::Number(7.0), formula: None });
-    let v = formula::eval_formula(&wb, 0, "='Bob''s'!A1");
+    wb.sheets[0].name = "汇总".to_string();
+    let mut other = sheetcore::model::Sheet::new("Bob's Data");
+    other.set(0, 0, Cell { value: Value::Number(7.0), formula: None });
+    other.set(0, 1, Cell { value: Value::Text("A1".into()), formula: None });
+    wb.sheets.push(other);
+
+    let v = formula::eval_formula(&wb, 0, "='Bob''s Data'!A1");
     assert_eq!(v.display(), "7", "含单引号的工作表名必须按 '' 转义解析");
+    // 引号里的 A1 是数据，不是引用
+    let v = formula::eval_formula(&wb, 0, "='Bob''s Data'!B1");
+    assert_eq!(v.display(), "A1");
+    // 归一化不能动工作表名里的单引号
+    let src = "='Bob''s Data'!A1";
+    assert_eq!(sheetcore::normalize_formula(src), src);
 }
 
 #[test]

@@ -31,6 +31,23 @@ impl ErrKind {
     }
 }
 
+impl ErrKind {
+    /// 从 `#DIV/0!` 之类的文本还原错误种类（读文件、读修订日志都要用）。
+    pub fn from_text(s: &str) -> Option<ErrKind> {
+        Some(match s.trim().to_ascii_uppercase().as_str() {
+            "#NULL!" => ErrKind::Null,
+            "#DIV/0!" => ErrKind::Div0,
+            "#VALUE!" => ErrKind::Value,
+            "#REF!" => ErrKind::Ref,
+            "#NAME?" => ErrKind::Name,
+            "#NUM!" => ErrKind::Num,
+            "#N/A" => ErrKind::Na,
+            "#SPILL!" => ErrKind::Spill,
+            _ => return None,
+        })
+    }
+}
+
 impl fmt::Display for ErrKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.text())
