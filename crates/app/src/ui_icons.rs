@@ -94,6 +94,23 @@ pub enum Icon {
     ErrorCheck,
     NameTag,
     WatchPane,
+    Spelling,
+    CommentPrev,
+    CommentNext,
+    ShowComment,
+    A11y,
+    Online,
+    AutoShare,
+    Help,
+    About,
+    Orientation,
+    PaperSize,
+    PrintGrid,
+    PrintHeadings,
+    PrintArea,
+    PivotRefresh,
+    PivotOptions,
+    ChartList,
     Freeze,
     FreezeRow,
     FreezeCol,
@@ -950,6 +967,139 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
             pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
             pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+        }
+        PivotRefresh => {
+            // 刷新透视表：小网格 + 循环箭头
+            pen.rrs(3.0, 4.4, 11.0, 9.2, 0.6, Color32::from_rgb(243, 242, 241), INK, 1.1);
+            pen.bar(3.4, 7.4, 10.2, 0.9, INK);
+            pen.bar(7.4, 4.8, 0.9, 8.4, INK);
+            pen.polyline(&[(17.0, 15.4), (20.4, 13.2), (20.4, 17.6), (16.6, 17.6)], 1.6, Color32::from_rgb(33, 115, 70));
+            pen.arrow((18.6, 19.0), (-0.8, -0.6), 2.6, Color32::from_rgb(33, 115, 70));
+        }
+        PivotOptions => {
+            // 透视表选项：小网格 + 齿轮
+            pen.rrs(3.0, 4.4, 10.4, 9.2, 0.6, Color32::from_rgb(243, 242, 241), INK, 1.1);
+            pen.bar(3.4, 7.4, 9.6, 0.9, INK);
+            pen.bar(7.0, 4.8, 0.9, 8.4, INK);
+            pen.ring(17.4, 12.0, 3.4, 1.4, INK);
+            pen.dot(17.4, 12.0, 1.0, INK);
+            for k in 0..4 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_2;
+                let (s, c) = (a.sin(), a.cos());
+                pen.ln(17.4 + c * 3.6, 12.0 + s * 3.6, 17.4 + c * 5.2, 12.0 + s * 5.2, 1.6, INK);
+            }
+        }
+        ChartList => {
+            // 图表管理：一张小柱图 + 右侧列表线
+            pen.bar(3.0, 12.4, 2.6, 6.0, Color32::from_rgb(33, 115, 70));
+            pen.bar(6.4, 8.8, 2.6, 9.6, Color32::from_rgb(91, 127, 166));
+            pen.bar(9.8, 10.8, 2.6, 7.6, Color32::from_rgb(165, 165, 165));
+            pen.ln(2.6, 19.2, 12.8, 19.2, 1.2, GRAY_D);
+            pen.bar(15.0, 8.6, 6.6, 1.4, INK);
+            pen.bar(15.0, 12.4, 6.6, 1.4, GRAY_D);
+            pen.bar(15.0, 16.2, 6.6, 1.4, GRAY_D);
+        }
+        Spelling => {
+            pen.text("A", 8.6, 10.4, 12.6, INK);
+            pen.polyline(&[(12.2, 17.6), (15.2, 20.6), (21.4, 12.6)], 2.0, Color32::from_rgb(33, 115, 70));
+        }
+        CommentPrev => {
+            pen.rrs(9.0, 6.0, 11.6, 8.6, 0.8, Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 1.0);
+            pen.poly(&[(10.4, 14.4), (10.4, 18.4), (14.2, 14.4)], Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 0.9);
+            pen.bar(12.6, 8.8, 6.2, 1.0, Color32::from_rgb(191, 144, 0));
+            pen.bar(12.6, 11.4, 4.6, 1.0, Color32::from_rgb(191, 144, 0));
+            pen.poly(&[(7.6, 7.6), (7.6, 14.4), (2.6, 11.0)], INK, INK, 0.0);
+        }
+        CommentNext => {
+            pen.rrs(3.4, 6.0, 11.6, 8.6, 0.8, Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 1.0);
+            pen.poly(&[(11.4, 14.4), (11.4, 18.4), (7.6, 14.4)], Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 0.9);
+            pen.bar(5.2, 8.8, 6.2, 1.0, Color32::from_rgb(191, 144, 0));
+            pen.bar(5.2, 11.4, 4.6, 1.0, Color32::from_rgb(191, 144, 0));
+            pen.poly(&[(16.4, 7.6), (16.4, 14.4), (21.4, 11.0)], INK, INK, 0.0);
+        }
+        ShowComment => {
+            pen.rrs(3.0, 4.2, 13.2, 9.4, 0.8, Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 1.0);
+            pen.poly(&[(4.4, 13.4), (4.4, 17.4), (8.2, 13.4)], Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 0.9);
+            pen.bar(5.4, 7.0, 8.2, 1.0, Color32::from_rgb(191, 144, 0));
+            pen.ring(17.4, 17.0, 3.2, 1.3, INK);
+            pen.dot(17.4, 17.0, 1.1, INK);
+        }
+        A11y => {
+            // 辅助功能：人 + 对勾
+            pen.ring(9.0, 5.4, 2.2, 1.4, INK);
+            pen.polyline(&[(4.6, 18.6), (4.6, 13.4), (9.0, 11.4), (13.4, 13.4), (13.4, 18.6)], 1.5, INK);
+            pen.polyline(&[(13.4, 15.4), (15.6, 17.8), (20.8, 11.4)], 1.9, Color32::from_rgb(33, 115, 70));
+        }
+        Online => {
+            // 在线：人 + 信号弧
+            pen.ring(8.4, 8.0, 2.4, 1.4, INK);
+            pen.polyline(&[(3.8, 19.2), (3.8, 15.0), (8.4, 12.8), (13.0, 15.0), (13.0, 19.2)], 1.5, INK);
+            pen.polyline(&[(15.4, 13.6), (17.4, 11.6)], 1.4, Color32::from_rgb(33, 115, 70));
+            pen.polyline(&[(15.4, 9.4), (18.6, 6.2)], 1.4, Color32::from_rgb(33, 115, 70));
+            pen.dot(16.6, 16.4, 1.0, Color32::from_rgb(33, 115, 70));
+        }
+        AutoShare => {
+            // 自动共享：三点连线 + 循环箭头
+            pen.bar(8.0, 10.6, 6.0, 1.6, Color32::from_rgb(68, 114, 196));
+            pen.bar(8.0, 13.0, 6.0, 1.6, Color32::from_rgb(68, 114, 196));
+            pen.dot(16.4, 6.2, 2.2, Color32::from_rgb(68, 114, 196));
+            pen.dot(6.2, 12.0, 2.2, Color32::from_rgb(68, 114, 196));
+            pen.dot(16.4, 17.8, 2.2, Color32::from_rgb(68, 114, 196));
+            pen.polyline(&[(13.6, 20.6), (10.4, 17.8), (13.6, 15.0)], 1.5, Color32::from_rgb(33, 115, 70));
+        }
+        Help => {
+            pen.ring(12.0, 12.0, 8.4, 1.5, INK);
+            pen.text("?", 12.0, 12.4, 11.0, INK);
+        }
+        About => {
+            pen.ring(12.0, 12.0, 8.4, 1.5, INK);
+            pen.text("i", 12.0, 12.2, 11.0, INK);
+        }
+        Orientation => {
+            // 纸张方向：竖纸 + 旋转箭头
+            pen.rrs(5.0, 3.6, 9.6, 13.6, 0.5, WHITE, INK, 1.15);
+            pen.bar(6.6, 7.0, 6.4, 0.9, GRAY_D);
+            pen.bar(6.6, 9.8, 6.4, 0.9, GRAY_D);
+            pen.polyline(&[(16.0, 15.6), (19.6, 13.4), (21.0, 9.4), (19.2, 5.6)], 1.5, Color32::from_rgb(33, 115, 70));
+            pen.arrow((17.4, 4.4), (-0.6, -0.8), 2.8, Color32::from_rgb(33, 115, 70));
+        }
+        PaperSize => {
+            // 纸张大小：纸 + 尺寸标注
+            pen.rrs(4.0, 4.6, 12.0, 15.0, 0.5, WHITE, INK, 1.15);
+            pen.bar(4.0, 1.8, 12.0, 1.0, GRAY_D);
+            pen.bar(4.0, 1.8, 1.0, 2.2, GRAY_D);
+            pen.bar(15.0, 1.8, 1.0, 2.2, GRAY_D);
+            pen.bar(20.0, 4.6, 1.0, 15.0, GRAY_D);
+            pen.bar(18.4, 4.6, 2.2, 1.0, GRAY_D);
+            pen.bar(18.4, 18.6, 2.2, 1.0, GRAY_D);
+        }
+        PrintGrid => {
+            // 打印网格线：打印机 + 纸上的网格
+            pen.rrs(3.0, 11.0, 15.0, 7.0, 0.8, Color32::from_rgb(237, 237, 237), INK, 1.15);
+            pen.rrs(4.6, 5.2, 11.8, 7.4, 0.4, WHITE, INK, 1.0);
+            pen.bar(6.2, 8.6, 8.6, 0.8, GRAY_D);
+            pen.bar(10.0, 5.4, 0.8, 7.0, GRAY_D);
+            pen.bar(6.2, 10.8, 8.6, 0.8, GRAY_D);
+        }
+        PrintHeadings => {
+            // 打印行号列标：打印机 + 纸上的表头带
+            pen.rrs(3.0, 11.0, 15.0, 7.0, 0.8, Color32::from_rgb(237, 237, 237), INK, 1.15);
+            pen.rrs(4.6, 5.2, 11.8, 7.4, 0.4, WHITE, INK, 1.0);
+            pen.rr(4.8, 5.4, 11.4, 1.8, 0.0, Color32::from_rgb(191, 191, 191));
+            pen.rr(4.8, 5.4, 1.8, 7.0, 0.0, Color32::from_rgb(191, 191, 191));
+            pen.bar(6.8, 8.2, 9.2, 0.8, GRAY_D);
+        }
+        PrintArea => {
+            // 打印区域：纸 + 虚线框
+            pen.rrs(4.4, 2.8, 15.0, 18.0, 0.5, WHITE, INK, 1.15);
+            for k in 0..4 {
+                pen.bar(6.6 + k as f32 * 2.6, 6.4, 1.5, 0.9, Color32::from_rgb(33, 115, 70));
+                pen.bar(6.6 + k as f32 * 2.6, 16.6, 1.5, 0.9, Color32::from_rgb(33, 115, 70));
+            }
+            for k in 0..4 {
+                pen.bar(6.6, 8.6 + k as f32 * 2.2, 0.9, 1.4, Color32::from_rgb(33, 115, 70));
+                pen.bar(17.6, 8.6 + k as f32 * 2.2, 0.9, 1.4, Color32::from_rgb(33, 115, 70));
+            }
         }
         FormulaView => {
             // 显示公式：小网格 + fx

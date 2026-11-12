@@ -334,7 +334,7 @@
         <group id="GroupCharts" label="图表">
           <button id="ColumnChart" label="柱状图" size="large" imageMso="Chart" screentip="按选区插一张柱状图" onAction="ColumnChart"/>
           <box boxStyle="vertical">
-            <button id="ChartManagerBtn" label="图表管理" imageMso="Chart" onAction="ChartManager" sizeString="92"/>
+            <button id="ChartManagerBtn" label="图表管理" imageMso="ChartList" onAction="ChartManager" sizeString="92"/>
             <button id="InsertPivotTable" label="数据透视表" imageMso="Pivot" screentip="把选区做成数据透视表" onAction="InsertPivot" sizeString="92"/>
           </box>
         </group>
@@ -350,8 +350,8 @@
         </group>
         <group id="GroupPivot" label="透视表">
           <box boxStyle="vertical">
-            <button id="RefreshPivot" label="刷新透视表" imageMso="Pivot" screentip="用当前数据重算" onAction="RefreshPivot" sizeString="110"/>
-            <button id="PivotOptions" label="透视表选项" imageMso="Pivot" screentip="分组 / 排除值" onAction="PivotOptions" sizeString="110"/>
+            <button id="RefreshPivot" label="刷新透视表" imageMso="PivotRefresh" screentip="用当前数据重算" onAction="RefreshPivot" sizeString="110"/>
+            <button id="PivotOptions" label="透视表选项" imageMso="PivotOptions" screentip="分组 / 排除值" onAction="PivotOptions" sizeString="110"/>
           </box>
         </group>
         <group id="GroupLinks" label="链接">
@@ -370,10 +370,10 @@
       <!-- ======================================================== 页面布局 -->
       <tab id="TabPageLayout" label="页面布局" keytip="P">
         <group id="GroupPageSetup" label="页面设置">
-          <button id="PageOrientation" label="纸张方向" size="large" imageMso="Sheet" onAction="PageOrientation"/>
+          <button id="PageOrientation" label="纸张方向" size="large" imageMso="Orientation" onAction="PageOrientation"/>
           <box boxStyle="vertical">
-            <button id="PaperSize" label="纸张：A4" imageMso="Table" screentip="切换纸张大小" onAction="PaperSize" sizeString="110"/>
-            <button id="PageMargins" label="页边距：常规" imageMso="Grid" screentip="在常规 / 窄 / 宽之间切换" onAction="PageMargins" sizeString="110"/>
+            <button id="PaperSize" label="纸张：A4" imageMso="PaperSize" screentip="切换纸张大小" onAction="PaperSize" sizeString="110"/>
+            <button id="PageMargins" label="页边距：常规" imageMso="PageLayout" screentip="在常规 / 窄 / 宽之间切换" onAction="PageMargins" sizeString="110"/>
           </box>
           <menu id="PrintAreaMenu" label="打印区域" sizeString="72" screentip="设置或取消打印区域">
             <button id="SetPrintArea" label="设置打印区域" onAction="PrintAreaSet"/>
@@ -435,8 +435,8 @@
         </group>
         <group id="GroupSheetOptions" label="工作表选项">
           <box boxStyle="vertical">
-            <toggleButton id="PrintGridlines" label="打印网格线" imageMso="Grid" onAction="TogglePrintGridlines" sizeString="120"/>
-            <toggleButton id="PrintHeadings" label="打印行号列标" imageMso="Table" onAction="TogglePrintHeadings" sizeString="120"/>
+            <toggleButton id="PrintPrintGridlines" label="打印网格线" imageMso="Grid" onAction="TogglePrintGridlines" sizeString="120"/>
+            <toggleButton id="PrintHeadings" label="打印行号列标" imageMso="PrintHeadings" onAction="TogglePrintHeadings" sizeString="120"/>
           </box>
         </group>
         <group id="GroupPrintPage" label="打印">
@@ -617,7 +617,7 @@
       <!-- ======================================================== 审阅 -->
       <tab id="TabReview" label="审阅" keytip="R">
         <group id="GroupProofing" label="校对">
-          <button id="Spelling" label="拼写检查" size="large" imageMso="Find" screentip="查重复空格、全角字母数字、重复标点等排版问题" onAction="Spelling"/>
+          <button id="Spelling" label="拼写检查" size="large" imageMso="Spelling" screentip="查重复空格、全角字母数字、重复标点等排版问题" onAction="Spelling"/>
         </group>
         <group id="GroupZh" label="中文简繁转换">
           <box boxStyle="vertical">
@@ -637,13 +637,13 @@
         <group id="GroupComments" label="批注">
           <button id="NewComment" label="新建批注" size="large" imageMso="Comment" onAction="NewComment"/>
           <box boxStyle="vertical">
-            <button id="PrevComment" label="上一条批注" imageMso="TraceIn" onAction="PrevComment" sizeString="104"/>
-            <button id="NextComment" label="下一条批注" imageMso="TraceOut" onAction="NextComment" sizeString="104"/>
-            <button id="ShowCommentBtn" label="显示批注" imageMso="Comment" onAction="ShowComment" sizeString="104"/>
+            <button id="PrevComment" label="上一条批注" imageMso="CommentPrev" onAction="PrevComment" sizeString="104"/>
+            <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104"/>
+            <button id="ShowShowCommentBtn" label="显示批注" imageMso="Comment" onAction="ShowComment" sizeString="104"/>
           </box>
         </group>
         <group id="GroupA11y" label="辅助功能">
-          <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="Grid" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker"/>
+          <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker"/>
         </group>
         <group id="GroupInsertText" label="文本">
           <button id="RichText" label="富文本" size="large" imageMso="FontColor" onAction="RichText"/>
@@ -657,10 +657,10 @@
         </group>
         <group id="GroupReviewShare" label="共享">
           <box boxStyle="vertical">
-            <toggleButton id="AutoShare" label="自动共享" imageMso="Share" screentip="网盘上的文件打开后自动开房；别人打开同一文件自动加入" onAction="AutoShare" sizeString="100"/>
+            <toggleButton id="AutoAutoShare" label="自动共享" imageMso="Share" screentip="网盘上的文件打开后自动开房；别人打开同一文件自动加入" onAction="AutoShare" sizeString="100"/>
           </box>
           <button id="ReviewShare" label="共享" size="large" imageMso="Share" onAction="Share"/>
-          <button id="ReviewOnlinePeers" label="在线" size="large" imageMso="Share" screentip="查看在线协作者" onAction="ShowMembers" sizeString="66"/>
+          <button id="ReviewOnlinePeers" label="在线" size="large" imageMso="Online" screentip="查看在线协作者" onAction="ShowMembers" sizeString="66"/>
         </group>
       </tab>
 
@@ -727,10 +727,10 @@
       <!-- ======================================================== 帮助 -->
       <tab id="TabHelp" label="帮助" keytip="H">
         <group id="GroupHelp" label="帮助">
-          <button id="Help" label="使用说明" size="large" imageMso="Comment" onAction="Help"/>
+          <button id="Help" label="使用说明" size="large" imageMso="Help" onAction="Help"/>
         </group>
         <group id="GroupAbout" label="关于">
-          <button id="About" label="关于" size="large" imageMso="Sheet" onAction="About"/>
+          <button id="About" label="关于" size="large" imageMso="About" onAction="About"/>
         </group>
       </tab>
 
