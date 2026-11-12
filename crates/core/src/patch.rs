@@ -105,11 +105,19 @@ where
                 e.read_to_end(&mut buf)?;
                 (name, buf)
             };
+            let orig = buf.clone();
             buf = f(&name, buf);
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-            zw.start_file(name, opts)?;
-            zw.write_all(&buf)?;
+            if buf == orig {
+                // 没改动的部件原样拷过去：不重新压缩（省掉整包重编码，也保住原压缩率）
+                let e = zip.by_index_raw(i)?;
+                zw.raw_copy_file(e)?;
+            } else {
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(Some(4));
+                zw.start_file(name, opts)?;
+                zw.write_all(&buf)?;
+            }
         }
         zw.finish()?;
     }
@@ -1137,6 +1145,7 @@ pub fn commit_stage(path: &Path) -> Result<usize> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         for i in 0..zip.len() {
             let name = zip.by_index_raw(i)?.name().to_string();
@@ -1210,6 +1219,7 @@ pub fn apply_raw_copies(dst: &Path, src: &Path) -> Result<usize> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         for i in 0..dst_zip.len() {
             let name = dst_zip.by_index_raw(i)?.name().to_string();
@@ -1259,6 +1269,7 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         let mut replaced = false;
         for i in 0..zip.len() {
@@ -1308,6 +1319,7 @@ pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         for i in 0..zip.len() {
             let name = zip.by_index_raw(i)?.name().to_string();
@@ -1348,6 +1360,7 @@ pub fn remove_entries(path: &Path, names: &[String]) -> Result<()> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         for i in 0..zip.len() {
             let (n, buf) = {
@@ -1400,6 +1413,7 @@ pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
         let mut zw = zip::ZipWriter::new(out);
         let opts = || {
             zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4))
         };
         for i in 0..zip.len() {
             let (n, buf) = {
@@ -2443,7 +2457,8 @@ where
             }
             buf = f(&name, buf);
             let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+                .compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(4));
             zw.start_file(name, opts)?;
             zw.write_all(&buf)?;
         }

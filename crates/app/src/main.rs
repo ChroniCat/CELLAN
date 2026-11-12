@@ -497,6 +497,8 @@ struct SheetApp {
     /// 辅助功能检查器：问题列表 + 打开状态
     a11y_open: bool,
     a11y_list: Vec<sheetcore::a11y::Issue>,
+    /// 性能验收：SC_SAVE_ASYNC 只触发一次
+    async_save_fired: bool,
     /// 工作表视图
     views: Vec<ui_prefs::SavedView>,
     view_active: Option<usize>,
@@ -932,6 +934,7 @@ impl SheetApp {
             fc_dlg: None,
             a11y_open: false,
             a11y_list: Vec::new(),
+            async_save_fired: false,
             views: Vec::new(),
             view_active: None,
             view_new: None,
@@ -1494,7 +1497,10 @@ impl SheetApp {
                     self.view_active = None;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
-                    eprintln!("[open] 已显示缓存值 {n} 格");
+                    eprintln!(
+                        "[open] 已显示缓存值 {n} 格，距启动 {}ms",
+                        self.t0.elapsed().as_millis()
+                    );
                     // 无界面验收钩子：SC_FONT=字体名 把字体套到当前选区（走真实的 apply_style，
                     // 含样式去重、撤销事务、协作广播），SC_SAVE=路径 立刻另存一份
                     // 无界面验收：SC_XLINK_REFRESH=1 打开后立刻更新外部链接并重算
@@ -2386,8 +2392,13 @@ impl SheetApp {
                         let target = PathBuf::from(&out);
                         // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
                         let wb = self.wb.clone();
+                        let ts = std::time::Instant::now();
                         match sheetcore::xlsx::save_atomic(&target, &wb) {
-                            Ok(()) => eprintln!("[save] 测试钩子已存 {}", target.display()),
+                            Ok(()) => eprintln!(
+                                "[save] 测试钩子已存 {}（{}ms）",
+                                target.display(),
+                                ts.elapsed().as_millis()
+                            ),
                             Err(e) => eprintln!("[save] 测试钩子失败 {e:#}"),
                         }
                     }
@@ -12350,14 +12361,11 @@ impl SheetApp {
             }
         }
         // 迷你图：画在文字之上、边框与锁标记之下
-        if !self.wb.sheet(self.sheet_idx).sparklines.is_empty() {
-            if let Some(sp) = self
-                .wb
-                .sheet(self.sheet_idx)
-                .sparklines
-                .iter()
-                .find(|s| s.r == r && s.c == c)
-            {
+        // 迷你图按 (列, 行) 有序，二分查找：每格 O(log n) 而不是 O(n)
+        let sparks = &self.wb.sheet(self.sheet_idx).sparklines;
+        if !sparks.is_empty() {
+            if let Ok(si) = sparks.binary_search_by_key(&(c, r), |s| (s.c, s.r)) {
+                let sp = &sparks[si];
                 let vals = spark_view::values(&self.wb, self.sheet_idx, sp);
                 spark_view::draw(painter, rect, sp, &vals);
                 if dumping {
@@ -16677,12 +16685,12 @@ impl SheetApp {
             }
         }
 
-        // 文本框：画在格子与表格框之上、图表之下
-        let tbs = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        // 文本框：画在格子与表格框之上、图表之下（只借用，不克隆整份 Vec）
         let base_x = gx(0);
         let base_y = gy(0);
-        let mut tb_rects: Vec<(usize, Rect)> = Vec::with_capacity(tbs.len());
-        for (i, tb) in tbs.iter().enumerate() {
+        let mut tb_rects: Vec<(usize, Rect)> =
+            Vec::with_capacity(self.wb.sheet(self.sheet_idx).textboxes.len());
+        for (i, tb) in self.wb.sheet(self.sheet_idx).textboxes.iter().enumerate() {
             let (x, y, w, h) = tb.rect_px(&cols, &rows);
             let r = Rect::from_min_size(
                 egui::pos2(base_x + x, base_y + y),
@@ -17063,6 +17071,7 @@ impl SheetApp {
             if resp.drag_started() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let sp = egui::pos2(pos.x - base_x, pos.y - base_y);
+                    let tbs = self.wb.sheet(self.sheet_idx).textboxes.clone();
                     self.tb_drag = self.tb_drag_begin(sp, &tb_sheet_rects, &tbs);
                 }
             }
@@ -19805,6 +19814,19 @@ impl SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let __cpu_t0 = std::time::Instant::now();
+        // 性能验收：SC_SAVE_ASYNC=path 走真实的异步保存（和 Ctrl+S 同一条路径）
+        if let Ok(out) = std::env::var("SC_SAVE_ASYNC") {
+            if !self.async_save_fired && self.tasks.open_rx.is_none() && !self.wb.sheets.is_empty() {
+                self.async_save_fired = true;
+                let ts = std::time::Instant::now();
+                self.tasks.start_save(&mut self.wb, PathBuf::from(&out));
+                eprintln!(
+                    "[save-async] 快照克隆完成，进入后台线程（{}ms）",
+                    ts.elapsed().as_millis()
+                );
+            }
+        }
         // 自动保存：脏数据且已有路径时，每 30 秒落盘一次
         if self.autosave && self.wb.dirty && self.wb.path.is_some() {
             let now = ctx.input(|i| i.time);
@@ -20999,6 +21021,50 @@ impl eframe::App for SheetApp {
             egui::Stroke::new(1.0 / ppp, egui::Color32::from_rgb(160, 158, 156)),
             egui::StrokeKind::Inside,
         );
+        // 性能探针：SC_FRAME_LOG=N 强制连续重绘，收 N 帧真实帧间隔，打印 avg/p50/p95/max
+        if let Ok(v) = std::env::var("SC_FRAME_LOG") {
+            if let Ok(limit) = v.parse::<usize>() {
+                static TIMES: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                // 默认跳过装载期间的帧；SC_FRAME_ALL=1 连装载期一起量（看打开时会不会卡）
+                if self.tasks.open_rx.is_none() || std::env::var("SC_FRAME_ALL").is_ok() {
+                    let now = std::time::Instant::now();
+                    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut report = None;
+                    if let Some(_prev) = *last {
+                        // 用 update() 自身的 CPU 耗时（墙钟被 vsync 钉在 16.7ms，量不出余量）
+                        let dt = __cpu_t0.elapsed().as_secs_f64() * 1000.0;
+                        // 丢掉异常长的帧（窗口创建、字体首次加载）
+                        if dt < 500.0 {
+                            times.push(dt);
+                        }
+                        if times.len() >= limit {
+                            let mut sorted = times.clone();
+                            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                            let n = sorted.len();
+                            let avg = sorted.iter().sum::<f64>() / n as f64;
+                            let p50 = sorted[n / 2];
+                            let p95 = sorted[((n as f64 * 0.95) as usize).min(n - 1)];
+                            report = Some((n, avg, p50, p95, *sorted.last().unwrap()));
+                        }
+                    }
+                    *last = Some(now);
+                    drop(times);
+                    drop(last);
+                    if let Some((n, avg, p50, p95, mx)) = report {
+                        eprintln!(
+                            "[cpu] {n} 帧 update() 耗时：avg={avg:.2}ms p50={p50:.2}ms p95={p95:.2}ms max={mx:.2}ms"
+                        );
+                        if std::env::var("SC_FRAME_EXIT").is_ok() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
     }
 }
 

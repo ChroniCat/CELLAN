@@ -595,8 +595,10 @@ pub fn load(path: &Path) -> Result<Workbook> {
                 if let Some(part) = targets.get(&sheet.name) {
                     if let Some(bytes) = crate::fixups::read_part_file(path, part) {
                         if let Ok(xml) = String::from_utf8(bytes) {
-                            let list = crate::sparkline::parse_sheet(&xml);
+                            let mut list = crate::sparkline::parse_sheet(&xml);
                             if !list.is_empty() {
+                                // 渲染层按 (列, 行) 二分查找，这里保证有序
+                                list.sort_by_key(|s| (s.c, s.r));
                                 sheet.sparklines = list;
                                 // 模型外的属性不保证原样保留，载入即标记重写
                                 sheet.sparklines_dirty = true;
