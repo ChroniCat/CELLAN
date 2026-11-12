@@ -431,6 +431,73 @@
       <tab id="TabFormulas" label="公式" keytip="M">
         <group id="GroupFunctionLibrary" label="函数库">
           <button id="InsertFunction" label="插入函数" size="large" imageMso="Fx" onAction="InsertFunction"/>
+          <menu id="AutoSumMenu2" label="自动求和" sizeString="72" imageMso="Sum">
+            <button id="SumFn" label="求和 (SUM)" onAction="InsertFn:SUM"/>
+            <button id="AvgFn" label="平均值 (AVERAGE)" onAction="InsertFn:AVERAGE"/>
+            <button id="CountFn" label="计数 (COUNT)" onAction="InsertFn:COUNT"/>
+            <button id="MaxFn" label="最大值 (MAX)" onAction="InsertFn:MAX"/>
+            <button id="MinFn" label="最小值 (MIN)" onAction="InsertFn:MIN"/>
+          </menu>
+          <menu id="RecentFnMenu" label="最近使用的函数" sizeString="96">
+            <button id="FnSum" label="SUM" onAction="InsertFn:SUM"/>
+            <button id="FnIf" label="IF" onAction="InsertFn:IF"/>
+            <button id="FnVlookup" label="VLOOKUP" onAction="InsertFn:VLOOKUP"/>
+            <button id="FnCountif" label="COUNTIF" onAction="InsertFn:COUNTIF"/>
+            <button id="FnSumif" label="SUMIF" onAction="InsertFn:SUMIF"/>
+          </menu>
+          <menu id="FnFinancialMenu" label="财务" sizeString="56">
+            <button id="FnPmt" label="PMT" onAction="InsertFn:PMT"/>
+            <button id="FnFv" label="FV" onAction="InsertFn:FV"/>
+            <button id="FnPv" label="PV" onAction="InsertFn:PV"/>
+            <button id="FnRate" label="RATE" onAction="InsertFn:RATE"/>
+            <button id="FnNpv" label="NPV" onAction="InsertFn:NPV"/>
+            <button id="FnIrr" label="IRR" onAction="InsertFn:IRR"/>
+          </menu>
+          <menu id="FnLogicalMenu" label="逻辑" sizeString="56">
+            <button id="FnIf2" label="IF" onAction="InsertFn:IF"/>
+            <button id="FnAnd" label="AND" onAction="InsertFn:AND"/>
+            <button id="FnOr" label="OR" onAction="InsertFn:OR"/>
+            <button id="FnNot" label="NOT" onAction="InsertFn:NOT"/>
+            <button id="FnIfError" label="IFERROR" onAction="InsertFn:IFERROR"/>
+          </menu>
+          <menu id="FnTextMenu" label="文本" sizeString="56">
+            <button id="FnLeft" label="LEFT" onAction="InsertFn:LEFT"/>
+            <button id="FnRight" label="RIGHT" onAction="InsertFn:RIGHT"/>
+            <button id="FnMid" label="MID" onAction="InsertFn:MID"/>
+            <button id="FnLen" label="LEN" onAction="InsertFn:LEN"/>
+            <button id="FnText" label="TEXT" onAction="InsertFn:TEXT"/>
+            <button id="FnConcat" label="CONCAT" onAction="InsertFn:CONCAT"/>
+          </menu>
+          <menu id="FnDateMenu" label="日期和时间" sizeString="88">
+            <button id="FnToday" label="TODAY" onAction="InsertFn:TODAY"/>
+            <button id="FnNow" label="NOW" onAction="InsertFn:NOW"/>
+            <button id="FnDate" label="DATE" onAction="InsertFn:DATE"/>
+            <button id="FnYear" label="YEAR" onAction="InsertFn:YEAR"/>
+            <button id="FnMonth" label="MONTH" onAction="InsertFn:MONTH"/>
+            <button id="FnDay" label="DAY" onAction="InsertFn:DAY"/>
+          </menu>
+          <menu id="FnLookupMenu" label="查找与引用" sizeString="88">
+            <button id="FnVlookup2" label="VLOOKUP" onAction="InsertFn:VLOOKUP"/>
+            <button id="FnHlookup" label="HLOOKUP" onAction="InsertFn:HLOOKUP"/>
+            <button id="FnIndex" label="INDEX" onAction="InsertFn:INDEX"/>
+            <button id="FnMatch" label="MATCH" onAction="InsertFn:MATCH"/>
+            <button id="FnOffset" label="OFFSET" onAction="InsertFn:OFFSET"/>
+            <button id="FnIndirect" label="INDIRECT" onAction="InsertFn:INDIRECT"/>
+          </menu>
+          <menu id="FnMathMenu" label="数学和三角函数" sizeString="112">
+            <button id="FnSum2" label="SUM" onAction="InsertFn:SUM"/>
+            <button id="FnRound" label="ROUND" onAction="InsertFn:ROUND"/>
+            <button id="FnAbs" label="ABS" onAction="InsertFn:ABS"/>
+            <button id="FnInt" label="INT" onAction="InsertFn:INT"/>
+            <button id="FnMod" label="MOD" onAction="InsertFn:MOD"/>
+            <button id="FnSqrt" label="SQRT" onAction="InsertFn:SQRT"/>
+          </menu>
+          <menu id="FnOtherMenu" label="其他函数" sizeString="72">
+            <button id="FnRand" label="RAND" onAction="InsertFn:RAND"/>
+            <button id="FnRow" label="ROW" onAction="InsertFn:ROW"/>
+            <button id="FnColumn" label="COLUMN" onAction="InsertFn:COLUMN"/>
+            <button id="FnIsBlank" label="ISBLANK" onAction="InsertFn:ISBLANK"/>
+          </menu>
         </group>
         <group id="GroupFormulaAuditing" label="公式审核">
           <box boxStyle="vertical">
@@ -441,10 +508,16 @@
           <box boxStyle="vertical">
             <toggleButton id="ShowFormulas" label="显示公式" imageMso="Fx" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96"/>
             <button id="ErrorChecking" label="错误检查" imageMso="Eraser" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
+            <button id="WatchWindow" label="监视窗口" imageMso="Grid" onAction="WatchWindow" sizeString="96"/>
           </box>
         </group>
         <group id="GroupCalculation" label="计算">
-          <button id="CalculateNow" label="重算全部" size="large" imageMso="Calc" onAction="CalculateNow"/>
+          <button id="CalculateNow" label="开始计算" size="large" imageMso="Calc" onAction="CalculateNow"/>
+          <menu id="CalcOptionsMenu" label="计算选项" sizeString="88">
+            <button id="CalcAuto" label="自动" onAction="CalcAuto"/>
+            <button id="CalcManual" label="手动" onAction="CalcManual"/>
+          </menu>
+          <button id="CalculateSheet" label="计算工作表" imageMso="Calc" onAction="CalculateSheet" sizeString="96"/>
         </group>
         <group id="GroupNames" label="名称">
           <button id="NameManager" label="名称管理器" size="large" imageMso="Table" onAction="NameManager"/>

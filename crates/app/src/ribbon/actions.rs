@@ -227,6 +227,20 @@ impl SheetApp {
             self.apply_style(move |s| s.format = code.clone());
             return;
         }
+        if let Some(name) = action.strip_prefix("InsertFn:") {
+            let name = name.to_string();
+            if self.editing.is_none() {
+                self.begin_edit(None);
+            }
+            if let Some(ed) = self.editing.as_mut() {
+                if !ed.buf.starts_with('=') {
+                    ed.buf.insert(0, '=');
+                }
+                ed.buf.push_str(&name);
+                ed.buf.push('(');
+            }
+            return;
+        }
         if let Some(v) = action.strip_prefix("zoom:") {
             if let Ok(z) = v.parse::<f32>() {
                 self.zoom = z.clamp(0.5, 2.5);
@@ -638,7 +652,17 @@ impl SheetApp {
             }
             "ShowFormulas" => self.show_formulas = !self.show_formulas,
             "ErrorChecking" => self.open_error_check(),
-            "CalculateNow" => self.recalc_all_async(),
+            "CalculateNow" | "CalculateSheet" => self.recalc_all_async(),
+            "CalcAuto" => {
+                self.manual_calc = false;
+                self.recalc_all_async();
+                self.status = "计算选项：自动".into();
+            }
+            "CalcManual" => {
+                self.manual_calc = true;
+                self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
+            }
+            "WatchWindow" => self.watch_open = true,
             "NameManager" => self.name_mgr = true,
 
             // ---------------------------------------------------- 数据

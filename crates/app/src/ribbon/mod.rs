@@ -728,7 +728,7 @@ mod tests {
         for a in acts {
             let known = if let Some(tail) = a.strip_prefix("fmt:") {
                 region.contains("strip_prefix(\"fmt:\")") || tail.is_empty()
-            } else if a.starts_with("zoom:")
+            } else if a.starts_with("InsertFn:") || a.starts_with("zoom:")
                 || a.starts_with("fitw:")
                 || a.starts_with("fith:")
                 || a.starts_with("scale:")

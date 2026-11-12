@@ -416,6 +416,10 @@ struct SheetApp {
     search: String,
     /// 缩放对话框（百分比）
     zoom_dlg: Option<f32>,
+    /// 手动计算模式
+    manual_calc: bool,
+    /// 监视窗口
+    watch_open: bool,
     /// 撤销/重做
     undo: sheetcore::undo::UndoStack,
     /// 标签页：与 active_tab 一一对应，Active 那个的数据在 self 上
@@ -813,6 +817,8 @@ impl SheetApp {
             last_autosave: 0.0,
             search: String::new(),
             zoom_dlg: None,
+            manual_calc: false,
+            watch_open: false,
             tabs: vec![TabSlot::Active],
             active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
@@ -3073,7 +3079,9 @@ impl SheetApp {
             self.deps.update_cell(&self.wb, *k);
         }
         let deps = std::mem::replace(&mut self.deps, sheetcore::formula::deps::Deps::empty());
-        sheetcore::formula::recalc_dirty(&mut self.wb, &deps, keys);
+        if !self.manual_calc {
+            sheetcore::formula::recalc_dirty(&mut self.wb, &deps, keys);
+        }
         self.deps = deps;
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
             for (si, r, c) in keys.iter() {
@@ -8599,6 +8607,63 @@ impl SheetApp {
     }
 
     /// 列宽/行高对话框（表头右键 → 列宽…/行高…）
+    /// 监视窗口：列出当前表的公式单元格
+    fn watch_window(&mut self, ctx: &egui::Context) {
+        if !self.watch_open {
+            return;
+        }
+        let mut open = true;
+        let mut jump: Option<(u32, u32)> = None;
+        let rows: Vec<(u32, u32, String, String)> = {
+            let sh = self.wb.sheet(self.sheet_idx);
+            let mut out = Vec::new();
+            if let Some((r1, c1, r2, c2)) = sh.used_bounds() {
+                'scan: for r in r1..=r2.min(r1 + 2000) {
+                    for c in c1..=c2.min(c1 + 200) {
+                        if let Some(cell) = sh.get(r, c) {
+                            if let Some(f) = &cell.formula {
+                                out.push((r, c, f.to_string(), cell.value.display()));
+                                if out.len() >= 200 { break 'scan; }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        ui_kit::window(ctx, "监视窗口", 560.0)
+            .open(&mut open)
+            .resizable(true)
+            .default_size([560.0, 320.0])
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.label("当前表没有公式单元格。");
+                }
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    egui::Grid::new("watch_grid").num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                        ui.label(egui::RichText::new("单元格").size(11.0).weak());
+                        ui.label(egui::RichText::new("公式").size(11.0).weak());
+                        ui.label(egui::RichText::new("值").size(11.0).weak());
+                        ui.end_row();
+                        for (r, c, f, v) in &rows {
+                            if ui.link(cell_name(*r, *c)).clicked() {
+                                jump = Some((*r, *c));
+                            }
+                            ui.label(egui::RichText::new(f).monospace().size(11.0));
+                            ui.label(egui::RichText::new(v).size(11.0));
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        if let Some((r, c)) = jump {
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+        }
+        self.watch_open = open;
+    }
+
     /// 缩放对话框
     fn zoom_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut z) = self.zoom_dlg else { return };
@@ -17394,6 +17459,7 @@ impl eframe::App for SheetApp {
         self.paste_special_dialog(ctx);
         self.about_window(ctx);
         self.zoom_dialog(ctx);
+        self.watch_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
