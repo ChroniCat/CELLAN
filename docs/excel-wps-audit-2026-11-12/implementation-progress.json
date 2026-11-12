@@ -192,17 +192,31 @@
    "scope": "core/lib.rs, table.rs, formula parser",
    "source": "core-requirements.md",
    "heading": "C03 P0 公式预处理不得改写字符串和标识符",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
-   "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "status": "已验收",
+   "acceptance": "[core-requirements.md C03] 改写只看引号外：`=\"_xlfn.TEXT\"`/`=\"Sales[Amount]\"`/`=\"A:A\"`/含 \"\" 转义的文本结果与原文逐字一致；真 `_xlfn.XLOOKUP` 与 `SUM(Sales[Amount])` 仍计算；含单引号工作表名按 '' 转义解析；输入/载入/复制/重算/保存五条路径公式文本不变（11 项测试）。",
+   "files": [
+    "crates/core/src/lib.rs,crates/core/src/table.rs,crates/core/tests/formula_strings.rs"
+   ],
+   "commits": [
+    "f348f02"
+   ],
+   "commands": [
+    "cargo test -p sheetcore --test formula_strings (11 passed)",
+    "cargo test -p sheetcore -- --test-threads=1 (55 bins, 484 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (139 passed)",
+    "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored)"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c03-formula-strings.txt"
+   ],
+   "not_done": [
+    "未与 Excel/WPS 实机对拍（期望值来自需求表与 Excel 语义）",
+    "`Sales[[#Data],[Amount]]` 多段说明符仍不支持（C10 范围）"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "按 task-index 第一批顺序进入 C01.1 错误类型回归",
+   "updated_utc": "2026-11-12T15:50:31Z",
    "slices": [
     {
      "id": "C03.1",
@@ -210,17 +224,31 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C03 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
-     "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "status": "已验收",
+     "acceptance": "[core-requirements.md C03] 改写只看引号外：`=\"_xlfn.TEXT\"`/`=\"Sales[Amount]\"`/`=\"A:A\"`/含 \"\" 转义的文本结果与原文逐字一致；真 `_xlfn.XLOOKUP` 与 `SUM(Sales[Amount])` 仍计算；含单引号工作表名按 '' 转义解析；输入/载入/复制/重算/保存五条路径公式文本不变（11 项测试）。",
+     "files": [
+      "crates/core/src/lib.rs,crates/core/src/table.rs,crates/core/tests/formula_strings.rs"
+     ],
+     "commits": [
+      "f348f02"
+     ],
+     "commands": [
+      "cargo test -p sheetcore --test formula_strings (11 passed)",
+      "cargo test -p sheetcore -- --test-threads=1 (55 bins, 484 passed / 34 ignored, EXIT=0)",
+      "cargo test -p app --bin app (139 passed)",
+      "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored)"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c03-formula-strings.txt"
+     ],
+     "not_done": [
+      "未与 Excel/WPS 实机对拍（期望值来自需求表与 Excel 语义）",
+      "`Sales[[#Data],[Amount]]` 多段说明符仍不支持（C10 范围）"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T15:50:31Z"
     }
    ]
   },
@@ -445,18 +473,20 @@
     "d3a141a",
     "e14ff88",
     "4a24506",
-    "1eea577"
+    "1eea577",
+    "f348f02"
    ],
    "commands": [
-    "cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1 => 5 passed（33 无条件 + 7 有条件 + vba + 图表 + 只读目标）",
-    "cargo test -p sheetcore --offline -- --test-threads=1 => 462 passed, 0 failed, 34 ignored（54 个二进制）",
-    "cargo test -p app ... --bin app -- --test-threads=1 ... => 128 passed, 0 failed, 0 ignored, 4 filtered"
+    "cargo test -p sheetcore -- --test-threads=1 (55 bins, 484 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (139 passed, EXIT=0)",
+    "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored, EXIT=0)"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-parent-acceptance.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-final-suite.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-integrity-gate.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-integrity-gate.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/review-2337-boundaries.txt"
    ],
    "not_done": [
     "物理断电无法模拟：用「保存阶段强杀子进程」覆盖进程终止路径，页缓存/掉电顺序未覆盖",
@@ -466,7 +496,7 @@
    "failures": [],
    "blocker": "",
    "next": "补验：保存中途强杀子进程（不真断电）+ 第二进程以 FileShare.None 独占目标构造真实占用",
-   "updated_utc": "2026-11-12T11:19:49Z",
+   "updated_utc": "2026-11-12T15:50:31Z",
    "slices": [
     {
      "id": "C13.1",
@@ -1045,25 +1075,29 @@
     "6dc206a",
     "5535d40",
     "8eb35d5",
-    "1eea577"
+    "1eea577",
+    "f348f02"
    ],
    "commands": [
-    "cargo test -p app --bin app -- --test-threads=1 (138 passed); GUI ui_regression (8 passed/9 ignored)"
+    "cargo test -p sheetcore -- --test-threads=1 (55 bins, 484 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (139 passed, EXIT=0)",
+    "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored, EXIT=0)"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-parent-acceptance.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui023-command-registry.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui023-suites.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-real-dialogs.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-real-dialogs.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/review-2337-boundaries.txt"
    ],
    "not_done": [
-    "另存为/打开对话框内部的「确认」动作未自动化（已证明对话框真实弹出、取消后原文件不变）",
+    "另存为/打开对话框内部的「确认」动作未自动化（弹出、取消、窗口关闭与主窗应答已实测）",
     "系统对话框为阻塞式，与 Excel 的窗口内模态有时序差异（已登记）"
    ],
    "failures": [],
    "blocker": "",
    "next": "如需覆盖对话框内确认动作，用 UI 自动化选中文件；当前以「对话框真实弹出 + 取消不改文件」为验收边界并如实登记",
-   "updated_utc": "2026-11-12T14:03:28Z",
+   "updated_utc": "2026-11-12T15:50:31Z",
    "slices": [
     {
      "id": "UI-02.1",

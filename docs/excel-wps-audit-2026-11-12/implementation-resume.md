@@ -5,13 +5,13 @@
 
 ## 当前状态（最后更新：2026-11-12 UTC+08，C13 门禁 + QA-03 复核补正后）
 
-- 分支 `main`，跟踪 `origin/main`；最新提交 `1eea577`（本轮代码）与紧随其后的台账提交
-- 已验收：任务 **3/61**（UI-02、C13、QA-03）；切片 **9/148**
+- 分支 `main`，跟踪 `origin/main`；最新提交 `f348f02`（C03 + 复核边界修补）
+- 已验收：任务 **4/61**（UI-02、C13、QA-03、C03）；切片 **10/148**
 - 待验收：UI-01（真实中文输入法与硬件键盘未执行，父任务与 UI-01.1 都保持待验收）
 - 基线（本轮实测）：
   - app 单测 **139 passed / 0 failed / 0 ignored**，**默认并行连跑两轮 EXIT=0**
   - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**（含 2 个真实系统对话框用例、1 个双进程持锁用例）
-  - sheetcore **525 passed / 0 failed / 34 ignored**（54 个测试二进制，EXIT=0）
+  - sheetcore **484 passed / 0 failed / 34 ignored**（55 个测试二进制，EXIT=0）
 - 工具链：`C:/Users/Administrator/.cargo/bin/cargo.exe`；`source scripts/audit_env.sh <标签>`
 
 ## 本轮完成（提交 → 证据）
@@ -23,6 +23,8 @@
 | QA-03.1 环境竞态修复 + 并行 GREEN | `1eea577` | `qa03-1-env-race-fix.txt` |
 | QA-03.3 free_port TOCTOU + 他人持锁绘制 | `1eea577` | `qa03-3-other-participant-lock.txt` |
 | UI-02 真实系统另存为/打开对话框 + 原文件哈希 | `1eea577` | `ui02-real-dialogs.txt` |
+| C03 字符串/标识符不被改写（split_quoted） | `f348f02` | `c03-formula-strings.txt` |
+| 复核两处边界：根前根外内容、成功另存为整份 SHA、取消等真关闭 | `f348f02` | `review-2337-boundaries.txt` |
 
 ## 台账口径（不要凭记忆）
 
