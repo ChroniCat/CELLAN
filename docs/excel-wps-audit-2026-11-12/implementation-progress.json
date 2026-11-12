@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T11:17:40Z",
+ "updated_utc": "2026-11-12T11:19:49Z",
  "tasks": [
   {
    "id": "C01",
@@ -433,20 +433,34 @@
    "scope": "core/xlsx.rs, patch.rs + app/document_tasks.rs",
    "source": "core-requirements.md",
    "heading": "C13 P0 保存子步骤失败必须阻止成功回执",
-   "status": "实施中",
-   "acceptance": "见 core-requirements.md C13：只有完整保存才清 dirty；失败保留原文件与可重试状态；注入保护/图表/布局/CF/外链/宏补丁失败时原文件 SHA256 不变、dirty 仍在、有可定位错误、无成功提示",
-   "files": [],
+   "status": "已验收",
+   "acceptance": "保存只有完整成功才清 dirty：注入保护/图表/布局/CF/外链/宏失败时 save_atomic 返回 Err、错误点名子步骤、原文件 SHA256 不变；app 层 dirty 保留、状态栏可定位错误、无成功提示；故障解除后重试成功；只读目标等替换失败保留原文件与半成品。",
+   "files": [
+    "crates/core/src/xlsx.rs",
+    "crates/core/tests/save_failure_injection.rs",
+    "crates/app/src/document_tasks.rs",
+    "crates/app/src/edit_regression_tests.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
+   "commands": [
+    "cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1 => 5 passed（33 无条件 + 7 有条件 + vba + 图表 + 只读目标）",
+    "cargo test -p sheetcore --offline -- --test-threads=1 => 462 passed, 0 failed, 34 ignored（54 个二进制）",
+    "cargo test -p app ... --bin app -- --test-threads=1 ... => 128 passed, 0 failed, 0 ignored, 4 filtered"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-parent-acceptance.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-final-suite.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt"
+   ],
    "not_done": [
     "图表锚点/引用与 raw-copies 注入未执行（需图表夹具）",
-    "图表子步骤注入未执行（需图表夹具）；文件占用/权限不足的 rename 失败注入未执行"
+    "图表子步骤注入未执行（需图表夹具）；文件占用/权限不足的 rename 失败注入未执行",
+    "断电不可模拟；Office 真实独占锁未构造（只读目标覆盖同一 rename 失败分支）；复杂图表部件保真属 C19/QA-01"
    ],
    "failures": [],
    "blocker": "",
-   "next": "补图表锚点/引用注入夹具 + 文件占用场景后整体验收 C13",
-   "updated_utc": "2026-11-12T11:17:40Z",
+   "next": "UI-02.3 命令 enabled/tooltip 统一注册",
+   "updated_utc": "2026-11-12T11:19:49Z",
    "slices": [
     {
      "id": "C13.1",

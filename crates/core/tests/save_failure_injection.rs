@@ -245,3 +245,108 @@ fn injected_vba_restore_failure_aborts_saving_a_macro_workbook() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+
+/// 图表：锚点/引用回写失败时必须中止保存（不能“成功”地把图弄丢或弄错位）。
+#[test]
+fn injected_chart_failures_abort_the_save() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("chart");
+    let path = dir.join("chart.xlsx");
+
+    let mut wb = book();
+    wb.sheets[0].set(0, 1, Cell { value: Value::Text("数量".into()), formula: None });
+    wb.sheets[0].set(1, 1, Cell { value: Value::Number(2.0), formula: None });
+    wb.sheets[0].set(2, 0, Cell { value: Value::Number(3.0), formula: None });
+    wb.sheets[0].set(2, 1, Cell { value: Value::Number(4.0), formula: None });
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("基线保存");
+
+    let chart = sheetcore::chart_write::chart_from_selection(
+        &wb.sheets[0],
+        "数据",
+        (0, 0, 2, 1),
+        "数量图",
+        sheetcore::charts::ChartKind::Column,
+    );
+    sheetcore::chart_write::insert_chart(&path, "数据", &chart).expect("插入图表");
+
+    let mut wb2 = sheetcore::xlsx::load(&path).expect("读回带图表的文件");
+    wb2.path = Some(path.clone());
+    assert_eq!(wb2.sheets[0].charts.len(), 1, "读回应有一张图");
+    // 让锚点与引用两个回写步骤都真的执行
+    wb2.sheets[0].charts_dirty = true;
+    {
+        let ch = &mut wb2.sheets[0].charts[0];
+        assert!(!ch.drawing.is_empty(), "图表应有 drawing 部件");
+        ch.ref_fixes.push(("A1".into(), "A1".into()));
+    }
+    wb2.sheets[0].set(2, 1, Cell { value: Value::Number(9.0), formula: None });
+
+    let before = hash(&path);
+    let mut swallowed = Vec::new();
+    for step in ["chart-anchor", "chart-refs"] {
+        // SAFETY: 整个测试持有 ENV_LOCK
+        unsafe { std::env::set_var("SC_FAIL_SAVE_STEP", step) };
+        let result = sheetcore::xlsx::save_atomic(&path, &wb2);
+        unsafe { std::env::remove_var("SC_FAIL_SAVE_STEP") };
+        match result {
+            Err(e) => assert!(
+                format!("{e:#}").contains(step),
+                "错误里必须点名失败的子步骤 {step}"
+            ),
+            Ok(()) => swallowed.push(step),
+        }
+        assert_eq!(hash(&path), before, "注入 {step} 失败时原文件不得被改写");
+    }
+    assert!(swallowed.is_empty(), "图表子步骤失败后仍回报成功：{swallowed:?}");
+
+    sheetcore::xlsx::save_atomic(&path, &wb2).expect("故障解除后应保存成功");
+    assert_eq!(sheetcore::charts::load_charts(&path, "数据").unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+
+/// 目标文件不可替换（只读属性）：必须报错、保留原文件与半成品临时文件，清掉后能重试。
+#[test]
+fn readonly_target_is_not_silently_replaced() {
+    let dir = scratch("readonly");
+    let path = dir.join("ro.xlsx");
+    let mut wb = book();
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("基线保存");
+    wb.sheets[0].set(1, 0, Cell { value: Value::Number(8.0), formula: None });
+    let before = hash(&path);
+
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms.clone()).unwrap();
+
+    let err = format!(
+        "{:#}",
+        sheetcore::xlsx::save_atomic(&path, &wb).expect_err("只读目标必须报错")
+    );
+    assert!(err.contains("替换"), "错误要说明替换失败并给出临时文件位置：{err}");
+    assert_eq!(hash(&path), before, "原文件不得被改写");
+    let leftover = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().contains(".saving-"));
+    assert!(
+        leftover.is_some(),
+        "替换失败时半成品必须留在临时文件里，不能删掉后假装没发生"
+    );
+
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let n = entry.file_name().to_string_lossy().to_string();
+        if n.contains(".saving-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("清掉只读后应能重试成功");
+    assert_eq!(
+        sheetcore::xlsx::load(&path).unwrap().sheets[0].value(1, 0),
+        Value::Number(8.0)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
