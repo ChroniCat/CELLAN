@@ -491,6 +491,8 @@ struct SheetApp {
     wb: Workbook,
     /// C14：本次打开的结构化诊断。带致命问题时禁止覆盖保存，只允许另存抢救副本。
     load_diag: Option<sheetcore::xlsx::LoadDiag>,
+    /// 打开不完整时自动弹出的「加载问题」窗口是否显示
+    show_load_diag: bool,
     sheet_idx: usize,
     sel: (u32, u32), // row, col
     scroll: Vec2,
@@ -888,6 +890,8 @@ struct SheetApp {
 /// 一个被挂起（非活动）的文档：切走时把它整份存这里，切回来再装回去
 struct ParkedDoc {
     title: String,
+    /// 这份文档自己的加载诊断：切回来不能拿别的文档的诊断顶替
+    load_diag: Option<sheetcore::xlsx::LoadDiag>,
     wb: Workbook,
     undo: sheetcore::undo::UndoStack,
     deps: sheetcore::formula::deps::Deps,
@@ -1168,6 +1172,7 @@ impl SheetApp {
         let mut app = Self {
             wb: Workbook::new_blank(),
             load_diag: None,
+            show_load_diag: false,
             sheet_idx: 0,
             sel: {
                 let mut se = (0u32, 0u32);
@@ -1609,9 +1614,9 @@ impl SheetApp {
         self.tasks.busy = true;
         self.status = format!("正在解密 {}…", path.display());
         std::thread::spawn(move || {
-            match sheetcore::xlsx::load_with_password(&path, &pw) {
-                Ok(wb) => {
-                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(sheetcore::xlsx::LoadDiag::default())));
+            match sheetcore::xlsx::load_with_password_diag(&path, &pw) {
+                Ok((wb, diag)) => {
+                    let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(diag)));
                     let mut wb2 = wb;
                     sheetcore::formula::recalc_all(&mut wb2);
                     let deps = sheetcore::formula::deps::Deps::build(&wb2);
@@ -1642,6 +1647,61 @@ impl SheetApp {
             let deps = sheetcore::formula::deps::Deps::build(&wb);
             let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch));
         });
+    }
+
+    /// 打开不完整时的「加载问题」窗口：把每处问题、丢了什么、在哪个部件都列出来。
+    fn load_diag_ui(&mut self, ctx: &egui::Context) {
+        let Some(diag) = self.load_diag.clone() else {
+            self.show_load_diag = false;
+            return;
+        };
+        if diag.is_complete() {
+            self.show_load_diag = false;
+            return;
+        }
+        let mut open = self.show_load_diag;
+        let fatal = diag.problems.iter().filter(|p| p.fatal).count();
+        egui::Window::new("加载问题")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if fatal > 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 60, 40),
+                        format!("这个工作簿没有完整读入：{} 处问题，其中 {fatal} 处会丢数据。", diag.problems.len()),
+                    );
+                    ui.label("已禁止覆盖保存；需要保留当前内容请用「另存抢救副本」。");
+                } else {
+                    ui.label(format!("打开时有 {} 处读取问题（不影响保存）。", diag.problems.len()));
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for p in &diag.problems {
+                        let head = format!(
+                            "{}{} · {}",
+                            p.sheet.as_deref().map(|s| format!("[{s}] ")).unwrap_or_default(),
+                            p.what,
+                            if p.fatal { "（致命）" } else { "" }
+                        );
+                        ui.label(egui::RichText::new(head).strong());
+                        ui.label(format!("部件：{}", p.part));
+                        ui.label(format!("详情：{}", p.detail));
+                        ui.add_space(6.0);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("另存抢救副本…").clicked() {
+                        self.save(true);
+                        self.show_load_diag = false;
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.show_load_diag = false;
+                    }
+                });
+            });
+        self.show_load_diag = open;
     }
 
     /// 打开密码框：验证后走解密加载
@@ -1794,6 +1854,10 @@ impl SheetApp {
                 OpenMsg::Loaded(wb, big, diag) => {
                     self.deps_pending = big;
                     self.load_diag = if diag.is_complete() { None } else { Some(*diag) };
+                    if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
+                        self.status = self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default();
+                        self.show_load_diag = true;
+                    }
                     self.wb = *wb;
                     self.wb_epoch += 1;
                     self.deps = sheetcore::formula::deps::Deps::empty();
@@ -1826,6 +1890,11 @@ impl SheetApp {
                     self.view_active = None;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = format!("已打开（{n} 个非空格），正在后台重算…");
+                    // 不完整时必须压过普通提示：用户第一眼就要知道这份文件没读全
+                    if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
+                        self.status = self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default();
+                        self.show_load_diag = true;
+                    }
                     eprintln!(
                         "[open] 已显示缓存值 {n} 格，距启动 {}ms",
                         self.t0.elapsed().as_millis()
@@ -2794,7 +2863,11 @@ impl SheetApp {
                     self.tasks.needs_full = false;
                     finished = true;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
-                    self.status = format!("已打开并重算完成（{n} 个非空格）");
+                    self.status = if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
+                        self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default()
+                    } else {
+                        format!("已打开并重算完成（{n} 个非空格）")
+                    };
                     eprintln!("[open] 后台重算完成 {n} 格");
                     if std::env::var("SC_FILTER").is_ok()
                         && self.wb.sheet(self.sheet_idx).filter.is_none()
@@ -2899,6 +2972,12 @@ impl SheetApp {
                 match result {
                     Ok(path) => {
                         doc.title = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        // 挂起的文档保存成功同样要解除旧诊断：否则切回来还会拿
+                        // 已经修好的旧缺口挡住保存。
+                        if doc.wb.path.as_deref() == Some(path.as_path()) {
+                            doc.load_diag = None;
+                            doc.wb.load_incomplete = false;
+                        }
                         self.status = format!("已保存 {}", path.display());
                     }
                     Err(error) => self.status = format!("{}：{error}", doc.title),
@@ -20365,6 +20444,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             .unwrap_or_else(|| "未命名".into());
         Box::new(ParkedDoc {
             title,
+            load_diag: self.load_diag.take(),
             wb: std::mem::replace(&mut self.wb, Workbook::new_blank()),
             undo: std::mem::replace(&mut self.undo, sheetcore::undo::UndoStack::new()),
             deps: std::mem::replace(&mut self.deps, sheetcore::formula::deps::Deps::empty()),
@@ -20383,6 +20463,7 @@ fn elide(s: &str, max_chars: usize) -> String {
     /// 把一份挂起的文档装到 self 上
     fn activate_parked(&mut self, doc: Box<ParkedDoc>) {
         self.wb = doc.wb;
+        self.load_diag = doc.load_diag;
         self.undo = doc.undo;
         self.deps = doc.deps;
         self.sel = doc.sel;
@@ -21575,6 +21656,7 @@ impl eframe::App for SheetApp {
         self.scenario_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
+        self.load_diag_ui(ctx);
         self.password_prompt_ui(ctx);
         self.encrypt_dialog_ui(ctx);
         self.size_dialog(ctx);

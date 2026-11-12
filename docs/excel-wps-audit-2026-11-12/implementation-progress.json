@@ -493,25 +493,20 @@
    ],
    "commits": [],
    "commands": [
-    "cargo test -p sheetcore --offline --test custom_props  -> 8 passed / 0 failed / 2 ignored",
-    "excel probe: powershell scratch/c08_excel_roundtrip.ps1 -> Excel 16.0 打开/另存, 部件+关系在",
-    "wps probe: powershell scratch/c08_wps_roundtrip.ps1 -> WPS 12.0 同上",
-    "SC_C08_RT_FILE=<另存文件> cargo test --test custom_props -- --ignored excel_roundtrip -> 1 passed (Excel 与 WPS 各一次)",
-    "openpyxl 3.1.5 读取 c08.xlsx -> custom_doc_props 5 项 (4 第三方 + _sc_src_1)",
-    "cargo test -p sheetcore --offline --test save_failure_injection -> 11 passed / 0 failed / 1 ignored"
+    "cargo test -p sheetcore --offline --test custom_props -> 10 passed / 0 failed / 2 ignored"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
    ],
    "not_done": [
-    "Excel/WPS 属性对话框目视检查未执行（本机 COM CustomDocumentProperties 恒为 0，含 openpyxl 生成的合法文件）",
-    "刷新经模型层 import_csv 覆盖，未点击 UI 刷新按钮取证"
+    "Excel「属性」对话框目视核对未执行（COM CustomDocumentProperties 恒 0）",
+    "Office 打开无修复提示的直接证据未取得"
    ],
    "failures": [],
    "blocker": "",
    "next": "用户复核；补属性对话框的 UIA 取证（如可行）",
-   "updated_utc": "2026-11-12T19:05:00Z",
+   "updated_utc": "2026-11-12T21:10:00Z",
    "slices": [
     {
      "id": "C08.1",
@@ -546,7 +541,7 @@
      "failures": [],
      "blocker": "",
      "next": "用户复核",
-     "updated_utc": "2026-11-12T19:05:00Z"
+     "updated_utc": "2026-11-12T21:10:00Z"
     }
    ]
   },
@@ -788,26 +783,34 @@
    "files": [
     "crates/core/src/xlsx.rs",
     "crates/core/src/model.rs",
+    "crates/core/src/sparse.rs",
+    "crates/core/src/external.rs",
     "crates/app/src/main.rs",
     "crates/app/src/document_tests.rs",
-    "crates/core/tests/load_diag.rs"
+    "crates/app/src/edit_regression_tests.rs",
+    "crates/core/tests/load_diag.rs",
+    "crates/core/tests/c14_guard.rs"
    ],
    "commits": [],
    "commands": [
-    "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
-    "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+    "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+    "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
+    "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
+    "round21: core 574 failed 0 / app 146 / gui 12"
    ],
    "evidence": [
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
    ],
    "not_done": [
-    "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
-    "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+    "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
+    "解析线程 panic / 旁路线程失败注入夹具未建立",
+    "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
    ],
    "failures": [],
    "blocker": "",
-   "next": "用户复核；round19 回归数字补入证据",
-   "updated_utc": "2026-11-12T19:45:00Z",
+   "next": "用户复核 round2（A–F 与测试真实性）",
+   "updated_utc": "2026-11-12T21:10:00Z",
    "slices": [
     {
      "id": "C14.1",
@@ -820,26 +823,34 @@
      "files": [
       "crates/core/src/xlsx.rs",
       "crates/core/src/model.rs",
+      "crates/core/src/sparse.rs",
+      "crates/core/src/external.rs",
       "crates/app/src/main.rs",
       "crates/app/src/document_tests.rs",
-      "crates/core/tests/load_diag.rs"
+      "crates/app/src/edit_regression_tests.rs",
+      "crates/core/tests/load_diag.rs",
+      "crates/core/tests/c14_guard.rs"
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
-      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
+      "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
+      "round21: core 574 failed 0 / app 146 / gui 12"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
      ],
      "not_done": [
-      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
-      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
+      "解析线程 panic / 旁路线程失败注入夹具未建立",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
      ],
      "failures": [],
      "blocker": "",
-     "next": "用户复核",
-     "updated_utc": "2026-11-12T19:45:00Z"
+     "next": "用户复核 round2（A–F 与测试真实性）",
+     "updated_utc": "2026-11-12T21:10:00Z"
     },
     {
      "id": "C14.2",
@@ -852,26 +863,34 @@
      "files": [
       "crates/core/src/xlsx.rs",
       "crates/core/src/model.rs",
+      "crates/core/src/sparse.rs",
+      "crates/core/src/external.rs",
       "crates/app/src/main.rs",
       "crates/app/src/document_tests.rs",
-      "crates/core/tests/load_diag.rs"
+      "crates/app/src/edit_regression_tests.rs",
+      "crates/core/tests/load_diag.rs",
+      "crates/core/tests/c14_guard.rs"
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
-      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
+      "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
+      "round21: core 574 failed 0 / app 146 / gui 12"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
      ],
      "not_done": [
-      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
-      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
+      "解析线程 panic / 旁路线程失败注入夹具未建立",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
      ],
      "failures": [],
      "blocker": "",
-     "next": "用户复核",
-     "updated_utc": "2026-11-12T19:45:00Z"
+     "next": "用户复核 round2（A–F 与测试真实性）",
+     "updated_utc": "2026-11-12T21:10:00Z"
     },
     {
      "id": "C14.3",
@@ -884,26 +903,34 @@
      "files": [
       "crates/core/src/xlsx.rs",
       "crates/core/src/model.rs",
+      "crates/core/src/sparse.rs",
+      "crates/core/src/external.rs",
       "crates/app/src/main.rs",
       "crates/app/src/document_tests.rs",
-      "crates/core/tests/load_diag.rs"
+      "crates/app/src/edit_regression_tests.rs",
+      "crates/core/tests/load_diag.rs",
+      "crates/core/tests/c14_guard.rs"
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --offline --test load_diag -> 6 passed / 0 failed",
-      "cargo test -p app --no-default-features --features glow --offline --bin app incomplete_load_blocks -> 1 passed"
+      "cargo test -p sheetcore --offline --test c14_guard -> 8 passed",
+      "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
+      "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
+      "round21: core 574 failed 0 / app 146 / gui 12"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt"
      ],
      "not_done": [
-      "解析线程 panic 分支无合成夹具（源码兜底，M2 变异未被抓住，已登记）",
-      "未与真实 Office 的损坏修复对话框做对比；只用合成损坏包"
+      "正常 .xls 的 calamine 成功路径无夹具（现有 BIFF 由本仓库写出，走内置读取器错误分支）",
+      "解析线程 panic / 旁路线程失败注入夹具未建立",
+      "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包"
      ],
      "failures": [],
      "blocker": "",
-     "next": "用户复核",
-     "updated_utc": "2026-11-12T19:45:00Z"
+     "next": "用户复核 round2（A–F 与测试真实性）",
+     "updated_utc": "2026-11-12T21:10:00Z"
     }
    ]
   },
@@ -1903,17 +1930,26 @@
    "scope": "core/formula/value.rs, criteria paths",
    "source": "core-requirements.md",
    "heading": "C05 P1 空值、布尔、文本比较的 Excel 语义",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "待验收",
+   "acceptance": "空引用比较时按对方类型强制（0/\"\"/FALSE），跨类型排序 数字<文本<布尔，错误值任一侧传播；COUNTBLANK/IF/COUNTIF 等条件函数语义不回退。",
+   "files": [
+    "crates/core/src/formula/value.rs",
+    "crates/core/tests/comparison_semantics.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --offline --test comparison_semantics -> 4 passed / 0 failed / 1 ignored"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05-comparison.txt"
+   ],
+   "not_done": [
+    "Excel 16.0 / WPS 12.0 实机对拍矩阵未跑（夹具 %TEMP%\\sc_c05\\c05.xlsx 已生成）"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "用户复核；实机对拍待跑",
+   "updated_utc": "2026-11-12T20:40:00Z",
    "slices": [
     {
      "id": "C05.1",
@@ -1921,17 +1957,26 @@
      "priority": "P1",
      "acceptance_source": "core-requirements.md / C05 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "空引用比较时按对方类型强制（0/\"\"/FALSE），跨类型排序 数字<文本<布尔，错误值任一侧传播；COUNTBLANK/IF/COUNTIF 等条件函数语义不回退。",
+     "files": [
+      "crates/core/src/formula/value.rs",
+      "crates/core/tests/comparison_semantics.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test comparison_semantics -> 4 passed / 0 failed / 1 ignored"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05-comparison.txt"
+     ],
+     "not_done": [
+      "Excel 16.0 / WPS 12.0 实机对拍矩阵未跑（夹具 %TEMP%\\sc_c05\\c05.xlsx 已生成）"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "用户复核；实机对拍待跑",
+     "updated_utc": "2026-11-12T20:40:00Z"
     }
    ]
   },

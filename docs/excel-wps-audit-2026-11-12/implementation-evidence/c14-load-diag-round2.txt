@@ -1,0 +1,151 @@
+C14 第二轮：门禁覆盖所有入口 / 抢救副本保结构 / 只跑适用扫描器 / 加密与稀疏诊断
+================================================================================
+
+对应 03:08 复核 A–F 与“测试真实性”四条。全部用例核对 **SHA-256**（`sha2`），不是长度。
+
+A 核心保存入口统一门禁
+---------------------
+- 新增 `xlsx::refuse_overwrite_of_source(wb, target)`，在 `save`、`save_atomic`、
+  `save_atomic_with_receipt` **三个公开入口**最前面调用。
+- 原因：另存/原子保存都是“写临时文件再 rename”，只在底层 `save_plain_base` 比路径会被
+  临时路径绕过（复核指出的 `commit_chart → save_atomic_with_receipt` 即此路径）。
+- `save_plain_base` 里保留第二道检查，并让 `base_override` / `wb.decrypted`
+  在 `load_incomplete` 时都不再充当保存基准（F）。
+- 用例 `core_save_refuses_to_overwrite_a_fatally_damaged_source`：
+  损坏源 → `save_atomic_with_receipt` 与 `save` 均返回“拒绝覆盖”，原文件 SHA-256 不变。
+
+B 稀疏大表 / 缺 SST / 旁路失败都不许吞
+------------------------------------
+- `sparse::parse_sheet_xml` 改为 `Result`：
+  - XML 解析错误 → `Err`；
+  - 必须以 `</worksheet>` 收尾，否则 `Err("工作表 XML 未正常结束（文件可能被截断）")`
+    （calamine/quick-xml 对“截断在标签边界”的文件会安静地返回半张表）；
+  - 引用不存在的共享字符串 → 统计 `bad_shared`，>0 时 `Err`，不再变空值。
+- `sparse::shared_strings_checked` 区分“部件缺失/读失败”和“空表”；
+  只有工作簿里真的存在 `t="s"` 引用时才记为问题（`any_sheet_uses_shared_strings`），
+  且标致命。
+- `load_chunk` 里稀疏读取失败原先 `fatal: false` → 改 **致命**（退回 calamine 只补数据，
+  不代表读全了）。
+- 旁路扫描：`side_rx.recv()` 失败、`layouts_raw` 为 `Err` 都转成致命 `LoadProblem`，
+  不再 `unwrap_or_default()` 静默吞掉。
+- 用例：`truncated_sparse_sheet_is_fatal_not_partial`（声明整表区域 + 截断 sheetData）、
+  `sparse_sheet_with_missing_shared_strings_is_fatal`（`t="s"` 指向不存在项）。
+
+C 打开即报不完整，诊断跟随文档，正常消息不得覆盖
+----------------------------------------------
+- `OpenMsg::Loaded` 处理完后立刻用 `LoadDiag::summary()` 覆盖状态栏，
+  并把 `show_load_diag` 置真自动弹出「加载问题」窗口；后台“已打开并重算完成”分支
+  在 `has_fatal()` 时同样让位给诊断摘要。
+- 新增 `load_diag_ui`：逐条列出 [工作表] 丢了什么 / 部件 / 详情，带「另存抢救副本」按钮。
+- `ParkedDoc` 增加 `load_diag` 字段：`park_current` 取走、`activate_parked` 装回，
+  诊断跟具体文档走，不会出现“A 坏了却拦 B”或“切回 A 可以覆盖”。
+- 用例（app）：
+  - `opening_a_damaged_document_reports_it_immediately_and_diag_follows_the_tab`：
+    走真实 `OpenMsg` 通道，打开时状态栏即含“读取问题”、弹窗标志为真；
+    切到完好文档 B 无致命诊断、切回 A 恢复、再切回 B 仍干净；
+  - `save_as_back_to_the_original_path_is_refused_for_damaged_documents`：
+    `SC_SAVE_AS` 指向原路径时保存被拒，原 SHA-256 不变；核心 `save` 同样拒绝。
+
+D 抢救副本（无基准）必须重建整表结构
+---------------------------------
+- `save_plain_base` 记录 `fresh_base = !base.exists()`；为真时：
+  - 样式不再只看 `style_edits`，而是遍历整表所有 `style_of != 0` 的格；
+  - 合并区域 `fresh_base || merges_dirty`；
+  - 批注 `fresh_base || notes_dirty`（批注为空则跳过）。
+- 用例 `rescue_copy_keeps_formats_merges_and_notes_of_the_healthy_sheet`：
+  坏表 A + 完好表 B（金额 `#,##0.00` 加粗、日期 `yyyy-mm-dd`、合并 A2:C2、C4 批注），
+  另存抢救副本后逐项断言保住，原文件 SHA-256 不变。
+
+E 只对适用格式跑扫描器
+--------------------
+- 判定 `is_ooxml = 文件头 PK`：
+  - 共享字符串、旁路线程（arr/merges/pic/table）、图表、超链接、迷你图、富文本
+    等 OOXML 扫描器只在 `is_ooxml` 时运行；
+  - 图表以前无条件调用 `load_charts_all → patch::sheet_targets → ZipArchive`，
+    正常 `.xls` 会被判成“损坏”并禁保存，现在不会。
+- 用例 `healthy_biff_xls_has_no_fatal_diag_and_can_be_saved`：
+  自写 BIFF `.xls` → `load_diag` 无致命问题 → `save_atomic` 另存成功 → 读回值一致。
+
+F 加密包同样保留诊断与门禁
+------------------------
+- 新增 `xlsx::load_with_password_diag`（`load_with_password` 变成它的忽略诊断包装）；
+  应用密码路径改用它，`Loaded` 携带真实诊断。
+- `base_override` 与 `decrypted` 在 `load_incomplete` 时都不再作为保存基准。
+- 用例 `rescue_copy_of_an_encrypted_damaged_source_does_not_reuse_the_bad_package`：
+  坏包加密 → 带密码打开得到致命诊断 → 覆盖加密原件被拒（SHA-256 不变）→
+  另存抢救副本（沿用密码）读回无致命问题。
+
+测试真实性整改
+-------------
+- 所有“原文件没变”的断言改为 `sha2::Sha256` 十六进制比较；`load_diag.rs` 里的
+  `hash_before`（其实是长度）不再作为证据，已被 `c14_guard.rs` 的 SHA-256 取代。
+- 缺共享字符串改用确定夹具：手写 `<c r="A1" t="s"><v>5</v></c>` 并删除
+  `xl/sharedStrings.xml` 与内容类型声明，不依赖“没部件就 return”。
+
+运行结果（当前源码）
+------------------
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p sheetcore --test c14_guard` | **6 passed / 0 failed** |
+| `cargo test -p sheetcore --test load_diag` | **6 passed / 0 failed** |
+| `cargo test -p sheetcore --test custom_props` | **9 passed / 0 failed / 2 ignored** |
+| app：`incomplete_load_blocks opening_a_damaged save_as_back_to` | **3 passed / 0 failed** |
+
+变异验证
+--------
+| 变异 | 结果 |
+|---|---|
+| M4 删除 `</worksheet>` 收尾检查 | 稀疏截断用例失败（2 failed） |
+| M2 抢救时样式只写 `style_edits` | 抢救结构用例失败（2 failed） |
+
+未执行 / 边界
+-------------
+- 加密夹具是本项目 `crypto::encrypt` 写出的 CFB 加密包，不是 Excel 生成的加密文件。
+- “属性对话框/Office 修复提示”类目视验收仍未执行（本机 COM `CustomDocumentProperties`
+  恒为 0 的环境限制，见 C08 证据）。
+
+七、03:26 复核补充整改
+--------------------
+1. 挂起标签的保存完成：`poll_save` 对 `ParkedDoc` 也只更新标题，未清 `doc.load_diag`
+   / `doc.wb.load_incomplete`，保存完成后切回仍会被旧诊断拦住。
+   已修：保存成功且目标就是该文档路径时清空。用例
+   `rescue_save_started_before_switching_tabs_clears_diag_when_it_finishes`：
+   坏文档另存抢救副本 → 保存未完成就切到 B（A 连同任务挂起）→ 轮询到完成 →
+   切回 A 断言 `load_diag` 为空、保存不再被拦。变异（删掉清除分支）→ 用例失败。
+2. 抢救副本的“空白格式格”：`fresh_base` 的样式枚举从 `sheet.iter()` 改为
+   `sheet.styles` 全表枚举，空白但有填充/边框的格也能写出。
+3. 布局/保护/页面设置：这些字段载入后 `dirty=false`，抢救副本不写就全丢。
+   新增 `Sheet::mark_all_dirty()`；`save_plain_base` 在 `fresh_base` 时克隆一份簿子
+   并全部标脏，列宽/行高/隐藏行列/分级/保护/页面设置/标签色/合并/批注/条件格式/
+   数据验证/图表/表格都重新序列化。
+   用例扩展为：空白填充格、D 列宽 30、第 6 行高 40、隐藏列/行、工作表保护、
+   横向 A4 全部逐项保留。
+4. 批注删空的回归：`notes.is_empty()` 跳过导致“删掉最后一条批注”不写盘，旧
+   comments 部件复活。已改为空也写，并新增 `notes::clear_sheet_notes()`：
+   保存后删除该表的 comments/VML 部件与关系、清理 Content_Types。
+   用例 `deleting_the_last_note_removes_it_from_the_saved_file`：存回重开批注为 0。
+   变异（删掉 clear 调用）→ 用例失败。
+5. 图表内部错误传播：`load_charts_all_in` 的 `if let Ok` 以及 `load_charts` 里
+   drawing→chart 部件缺失的 `continue` 都会把“图表丢了”变成空列表；
+   现在逐表 `?` 上抛、缺部件/解析失败都报错，`load_diag` 记为致命。
+   用例 `drawing_pointing_at_a_missing_chart_is_reported`（手写 drawing + rels
+   指向不存在的 chart1.xml）断言出现致命“图表”问题。
+
+当前结果（本轮）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p sheetcore --test c14_guard` | **8 passed / 0 failed** |
+| `cargo test -p sheetcore --test custom_props` | **10 passed / 0 failed / 2 ignored** |
+| app：`incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started` | **4 passed / 0 failed** |
+| 全量 core（round21） | 66 bins，**574 passed / 0 failed / 41 ignored**，EXIT=0 |
+| 全量 app（round21） | **146 passed / 0 failed**，EXIT=0 |
+| GUI（ui_regression） | 12 passed / 0 failed / 8 ignored（首轮 1 项 ribbon 分组数失败，单跑与全量复跑均通过，属顺序相关的已知抖动） |
+
+仍未执行 / 待补
+--------------
+- 正常 `.xls` 走 **calamine 成功路径** 的夹具：现有用例的 BIFF 由本仓库写出，
+  calamine 打不开时会落到内置 BIFF 读取器（错误分支）。需要一份 Excel/WPS 另存的
+  真实 `.xls` 才能覆盖 calamine 成功分支。
+- 工作线程 panic / 旁路线程失败的注入夹具仍未建立（源码已传播，但无合成手段）。
+- 加密夹具仍是本项目 `crypto::encrypt` 生成的，不是 Excel 生成的加密包。

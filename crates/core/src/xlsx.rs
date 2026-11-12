@@ -211,13 +211,15 @@ fn load_chunk(
                     continue;
                 }
                 Err(e) => {
+                    // 稀疏解析失败说明这份表 XML 读不完整：退回 calamine 只补数据，
+                    // 不能当成"完整打开"，必须标致命（覆盖保存会丢没读到的格）。
                     eprintln!("[load] {name} 稀疏读取失败，退回 calamine: {e:#}");
                     problems.push(LoadProblem {
                         sheet: Some(name.clone()),
                         part: part.clone(),
                         what: "大表稀疏读取".into(),
-                        detail: format!("退回通用解析器：{e:#}"),
-                        fatal: false,
+                        detail: format!("{e:#}"),
+                        fatal: true,
                     });
                 }
             }
@@ -384,7 +386,30 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // calamine 会按稠密网格分配内存，直接 OOM
     let targets = crate::patch::sheet_targets(path).unwrap_or_default();
     let t_shared = std::time::Instant::now();
-    let shared = crate::sparse::shared_strings(path);
+    // 先判断容器格式：BIFF(.xls) 不是 zip，下面所有 OOXML 扫描器都不能跑
+    let is_ooxml = std::fs::read(path)
+        .map(|b| b.starts_with(b"PK"))
+        .unwrap_or(false);
+    let shared = match if is_ooxml {
+        crate::sparse::shared_strings_checked(path)
+    } else {
+        Ok(Vec::new())
+    } {
+        Ok(v) => v,
+        Err(e) => {
+            // 缺 SST 只在真的有人引用 `t="s"` 时才算问题；没人引用时是正常的。
+            if crate::sparse::any_sheet_uses_shared_strings(path) {
+                diag.push(
+                    None,
+                    "xl/sharedStrings.xml",
+                    "共享字符串表",
+                    format!("{e:#}（有单元格按共享字符串引用）"),
+                    true,
+                );
+            }
+            Vec::new()
+        }
+    };
     if std::env::var("SC_LOAD_PROF").is_ok() {
         eprintln!("[load] 共享字符串 {} 条 {:.2}s", shared.len(), t_shared.elapsed().as_secs_f64());
     }
@@ -394,7 +419,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // 版面/合并/数组公式/图片/表格这几趟扫描跟单元格数据无关，
     // 和下面的逐表解析并行跑，省掉串行等待
     let (side_tx, side_rx) = std::sync::mpsc::channel();
-    {
+    if is_ooxml {
         let p = path.to_path_buf();
         std::thread::spawn(move || {
             let out = (
@@ -536,15 +561,34 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     }
 
     let t_side = std::time::Instant::now();
-    let (found, layouts_raw, pics, tables) = side_rx.recv().unwrap_or_else(|_| {
-        (
-            Default::default(),
-            Ok(Default::default()),
-            Default::default(),
-            Default::default(),
-        )
-    });
-    let layouts = layouts_raw.unwrap_or_default();
+    let (found, layouts_raw, pics, tables) = if !is_ooxml {
+        (Default::default(), Ok(Default::default()), Default::default(), Default::default())
+    } else { match side_rx.recv() {
+        Ok(v) => v,
+        Err(_) => {
+            diag.push(
+                None,
+                "xl/worksheets（版面扫描）",
+                "合并单元格/数组公式/图片/表格",
+                "旁路扫描线程异常退出，这些结构没有加载".to_string(),
+                true,
+            );
+            (Default::default(), Ok(Default::default()), Default::default(), Default::default())
+        }
+    } };
+    let layouts = match layouts_raw {
+        Ok(v) => v,
+        Err(e) => {
+            diag.push(
+                None,
+                "xl/worksheets（版面扫描）",
+                "合并单元格/版面/数组公式",
+                format!("{e:#}"),
+                true,
+            );
+            Default::default()
+        }
+    };
     if prof_load {
         eprintln!("[load] 旁路扫描等待 {:.2}s", t_side.elapsed().as_secs_f64());
     }
@@ -686,8 +730,13 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         }
     }
 
-    // 图表
-    match crate::charts::load_charts_all(path, &wb.sheets) {
+    // 图表：drawing 是 OOXML 结构，BIFF(.xls) 没有，别拿 zip 扫描器去读
+    let charts_res = if is_ooxml {
+        crate::charts::load_charts_all(path, &wb.sheets)
+    } else {
+        Ok(Default::default())
+    };
+    match charts_res {
         Ok(all) => {
             for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
                 if let Some(list) = all.get(&(idx as u32)) {
@@ -888,6 +937,7 @@ impl SaveReceipt {
 /// Save a snapshot, then acknowledge only its sheet identities in the live
 /// workbook. Callers retaining the workbook should apply the returned receipt.
 pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
+    refuse_overwrite_of_source(wb, path)?;
     save_atomic(path, wb)?;
     if path.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("xls")) {
         return Ok(SaveReceipt::default());
@@ -1302,6 +1352,7 @@ fn replace_zip_part(path: &Path, part: &str, replacement: Option<&str>) {
 }
 
 pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
+    refuse_overwrite_of_source(wb, path)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -1352,6 +1403,7 @@ pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
 
 /// 保存：原文件带打开密码时，先写明文到临时文件，再加密回目标路径。
 pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
+    refuse_overwrite_of_source(wb, path)?;
     let Some(enc) = wb.encryption.as_ref() else {
         return save_plain(path, wb);
     };
@@ -1385,6 +1437,12 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
 /// 带打开密码的文件：解密到临时文件后按普通 xlsx 加载。
 /// 工作簿记住原路径与密码，另存时继续加密。
 pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
+    load_with_password_diag(path, password).map(|(wb, _)| wb)
+}
+
+/// 带密码打开并返回诊断：加密文件里的工作表坏了同样要报"不完整"，
+/// 不能因为是加密包就把诊断丢掉。
+pub fn load_with_password_diag(path: &Path, password: &str) -> Result<(Workbook, LoadDiag)> {
     let plain = crate::crypto::decrypt(path, password)?;
     let tmp = std::env::temp_dir().join(format!(
         "sheets-native-dec-{}-{}.xlsx",
@@ -1395,8 +1453,8 @@ pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
             .unwrap_or(0)
     ));
     std::fs::write(&tmp, &plain).with_context(|| "写入解密临时文件失败")?;
-    let mut wb = match load(&tmp) {
-        Ok(wb) => wb,
+    let (mut wb, diag) = match load_diag(&tmp) {
+        Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -1406,7 +1464,8 @@ pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
     wb.path = Some(path.to_path_buf());
     wb.decrypted = None;
     wb.encryption = Some(crate::crypto::EncryptionSettings::new(password));
-    Ok(wb)
+    wb.load_incomplete = diag.has_fatal();
+    Ok((wb, diag))
 }
 
 fn save_plain(path: &Path, wb: &Workbook) -> Result<()> {
@@ -1435,9 +1494,51 @@ macro_rules! must_save {
     }};
 }
 
+/// 打开不完整的簿子不许把结果写回它的来源文件。
+/// 放在每个公开保存入口的最前面：另存/原子保存都会先写临时文件，
+/// 只在底层比较临时路径会被整条绕过。
+fn refuse_overwrite_of_source(wb: &Workbook, target: &Path) -> Result<()> {
+    if wb.load_incomplete {
+        if let Some(orig) = wb.path.as_ref().filter(|p| same_file(p, target)) {
+            anyhow::bail!(
+                "打开不完整，拒绝覆盖原文件 {}（请另存为新文件）",
+                orig.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 两个路径是否指向同一个文件（另存为时用户可能把目标选回原路径）
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => {
+            let norm = |p: &Path| {
+                let s = p.to_string_lossy().replace('\\', "/");
+                if cfg!(windows) { s.to_lowercase() } else { s }
+            };
+            norm(a) == norm(b)
+        }
+    }
+}
+
 fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<()> {
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
+
+    // 打开不完整的簿子：所有保存入口（界面、另存为选回原路径、图表提交、脚本）
+    // 都不许覆盖原文件——没读到的内容写回去就是永久丢失。
+    if wb.load_incomplete {
+        if let Some(orig) = wb.path.as_ref().filter(|p| same_file(p, path)) {
+            anyhow::bail!(
+                "打开不完整，拒绝覆盖原文件 {}（请另存为新文件）",
+                orig.display()
+            );
+        }
+    }
+    // 不完整时也不能拿任何「原文件派生」的包当基准（decrypted / base_override 都是）
+    let usable_base = !wb.load_incomplete;
 
     let prof = std::env::var("SC_SAVE_PROF").is_ok();
     let t_read = std::time::Instant::now();
@@ -1445,9 +1546,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等
     // 我们不解析也不重建的结构（umya 从零建表只会写单元格）。
     let original_base = match base_override
-        .filter(|p| p.exists())
+        .filter(|p| p.exists() && usable_base)
         .map(|p| p.to_path_buf())
-        .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists()).cloned())
+        .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists() && usable_base).cloned())
         // 打开不完整的文件不能当保存基准：里面的坏 XML 会让解析器直接崩，
         // 而且我们没读到的东西写回去就是丢数据。
         .or_else(|| wb.path.as_ref().filter(|p| p.exists() && !wb.load_incomplete).cloned())
@@ -1476,6 +1577,22 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         crate::fixups::read_part(&restore_base, "xl/styles.xml")
     } else {
         None
+    };
+    // 没有可用的基准（抢救副本 / 全新文件）：整份内容只能从模型重建，
+    // 做过载入的表也要把样式、合并、批注等写出来，不能等 dirty 标记。
+    let fresh_base = !base.exists();
+    // 抢救副本从零建包：以后所有补丁都要按"全部脏"跑一遍，
+    // 否则已加载但没编辑过的列宽/行高/保护/页面设置/批注会静默丢掉。
+    let forced_snapshot;
+    let wb: &Workbook = if fresh_base {
+        let mut copy = wb.clone();
+        for sh in copy.sheets.iter_mut() {
+            sh.mark_all_dirty();
+        }
+        forced_snapshot = copy;
+        &forced_snapshot
+    } else {
+        wb
     };
     let mut book = if base.exists() {
         read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
@@ -1518,11 +1635,23 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             ws.remove_cell((cref.col + 1, cref.row + 1));
         }
 
-        // 样式：只回写用户改过的格子（整表重写样式在 10 万格级别会拖慢保存）
-        for cref in sheet.style_edits.iter() {
-            let sid = sheet.style_of(cref.row, cref.col);
+        // 样式：正常保存只回写用户改过的格子（整表重写样式在 10 万格级别会拖慢保存）；
+        // 抢救副本没有基准，整表有样式的格都要写，否则完好表的格式会丢。
+        let style_targets: Vec<(u32, u32)> = if fresh_base {
+            // 从样式表枚举：空白但有填充/边框的格不在 sheet.iter() 里，漏了就丢格式
+            sheet
+                .styles
+                .iter()
+                .filter(|(_, id)| **id != 0)
+                .map(|(c, _)| (c.row, c.col))
+                .collect()
+        } else {
+            sheet.style_edits.iter().map(|c| (c.row, c.col)).collect()
+        };
+        for (row, col) in style_targets {
+            let sid = sheet.style_of(row, col);
             let st = wb.styles.get(sid);
-            let cell = ws.get_cell_mut((cref.col + 1, cref.row + 1));
+            let cell = ws.get_cell_mut((col + 1, row + 1));
             let s = cell.get_style_mut();
             {
                 let f = s.get_font_mut();
@@ -1602,8 +1731,8 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             bs.set_bottom(make(&st.border[3]));
         }
 
-        // 合并区域：只有被改过才同步，没动过就沿用文件里原有的
-        if sheet.merges_dirty {
+        // 合并区域：没有基准时整份重建；有基准时只在改过才同步
+        if fresh_base || sheet.merges_dirty {
             let refs: Vec<umya_spreadsheet::Range> = sheet
                 .merges
                 .iter()
@@ -1685,7 +1814,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
 
     // 批注：直接走 umya（它会生成 comments 部件和 vml 绘图）
     for (idx, sheet) in wb.sheets.iter().enumerate() {
-        if !sheet.notes_dirty {
+        // 删掉最后一条批注也要写：不能因为 notes 为空就跳过，
+        // 否则旧批注还留在盘上的 comments 部件里。
+        if !(fresh_base || sheet.notes_dirty) {
             continue;
         }
         if let Ok(ws) = book.get_sheet_by_name_mut(&sheet.name) {
@@ -1980,6 +2111,12 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     must_save!("sheet-states", crate::patch::apply_sheet_states(path, wb));
     must_save!("rich", crate::patch::apply_rich(path, wb));
     must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
+    // 批注被删空时必须把旧部件也删掉，否则重开会从 comments 部件里复活
+    for sheet in &wb.sheets {
+        if sheet.notes_dirty && sheet.notes.is_empty() {
+            must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
+        }
+    }
     // 表格对象：删除/转换/新建后同步 table 部件
     for sheet in &wb.sheets {
         if sheet.tables_dirty {

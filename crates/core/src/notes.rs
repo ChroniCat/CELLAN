@@ -226,3 +226,76 @@ mod tests {
         assert_eq!(find_comments_target(rels), Some("comments/comment1.xml".into()));
     }
 }
+
+/// 删掉某张表的批注部件（comments + VML）及其工作表关系。
+/// umya 只会清空它模型里的 comments，旧部件仍留在包里，重开就会"复活"。
+pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Result<()> {
+    let targets = crate::patch::sheet_targets(path)?;
+    let Some(part) = targets.get(sheet_name) else { return Ok(()) };
+    let (dir, file) = match part.rsplit_once('/') {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let Some(rels) = crate::fixups::read_part(path, &rels_part).and_then(|b| String::from_utf8(b).ok())
+    else {
+        return Ok(());
+    };
+    let mut kept = String::with_capacity(rels.len());
+    let mut removed: Vec<String> = Vec::new();
+    let mut rest = rels.as_str();
+    while let Some(i) = rest.find("<Relationship") {
+        kept.push_str(&rest[..i]);
+        let Some(end) = rest[i..].find("/>") else { break };
+        let seg = &rest[i..i + end + 2];
+        let ty = attr(seg, "Type").unwrap_or_default();
+        if ty.contains("/comments") || ty.contains("/vmlDrawing") {
+            if let Some(t) = attr(seg, "Target") {
+                removed.push(resolve(dir, &t));
+            }
+        } else {
+            kept.push_str(seg);
+        }
+        rest = &rest[i + end + 2..];
+    }
+    kept.push_str(rest);
+    if removed.is_empty() {
+        return Ok(());
+    }
+    for p in &removed {
+        let _ = crate::patch::remove_entry(path, p);
+    }
+    crate::fixups::write_parts(path, &[(rels_part, kept.into_bytes())])?;
+    // 清掉悬空的 Content_Types Override
+    let _ = crate::fixups::prune_content_types(path);
+    Ok(())
+}
+
+fn attr(seg: &str, name: &str) -> Option<String> {
+    let key = format!("{name}=");
+    let i = seg.find(&key)? + key.len();
+    let quote = seg.as_bytes().get(i).copied()? as char;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &seg[i + 1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn resolve(base: &str, target: &str) -> String {
+    if let Some(t) = target.strip_prefix('/') {
+        return t.to_string();
+    }
+    let mut parts: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}

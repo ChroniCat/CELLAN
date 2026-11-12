@@ -355,6 +355,28 @@ impl Sheet {
         self.cells.iter_values()
     }
 
+    /// 抢救副本没有基准：把「已加载但没改过」的内容全部标脏，
+    /// 让布局/保护/页面设置/批注/图表等补丁把它们重新写出来。
+    pub fn mark_all_dirty(&mut self) {
+        self.styles_dirty = true;
+        self.merges_dirty = true;
+        self.cf_dirty = true;
+        self.dv_dirty = true;
+        self.notes_dirty = true;
+        self.freeze_dirty = true;
+        self.layout_dirty = true;
+        self.scenarios_dirty = true;
+        self.ignored_errors_dirty = true;
+        self.outline_pr_dirty = true;
+        self.filter_dirty = true;
+        self.page_dirty = true;
+        self.charts_dirty = true;
+        self.tab_color_dirty = true;
+        self.tables_dirty = true;
+        self.protect_dirty = true;
+        self.hidden_dirty = true;
+    }
+
     pub fn style_of(&self, r: u32, c: u32) -> u16 {
         self.styles.get(&CellRef::new(r, c)).copied().unwrap_or(0)
     }

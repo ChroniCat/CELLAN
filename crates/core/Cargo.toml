@@ -24,4 +24,5 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 zip = { version = "8", default-features = false, features = ["deflate"] }
+sha2 = "0.11.1"
 windows-sys = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation", "Win32_System_Threading"] }

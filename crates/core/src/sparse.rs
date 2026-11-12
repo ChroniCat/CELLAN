@@ -94,20 +94,18 @@ pub fn declared_area(xml_head: &str) -> u64 {
 
 /// 读共享字符串表
 pub fn shared_strings(path: &Path) -> Vec<String> {
+    shared_strings_checked(path).unwrap_or_default()
+}
+
+/// 读共享字符串表；部件缺失/读失败要能区分出来（上层据此判定打开不完整），
+/// 不能像 `shared_strings` 那样一律返回空表。
+pub fn shared_strings_checked(path: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    let Ok(file) = std::fs::File::open(path) else {
-        return out;
-    };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else {
-        return out;
-    };
-    let Ok(mut f) = zip.by_name("xl/sharedStrings.xml") else {
-        return out;
-    };
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut f = zip.by_name("xl/sharedStrings.xml")?;
     let mut xml = String::new();
-    if f.read_to_string(&mut xml).is_err() {
-        return out;
-    }
+    f.read_to_string(&mut xml)?;
     let mut reader = Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
     let mut in_si = false;
@@ -132,11 +130,11 @@ pub fn shared_strings(path: &Path) -> Vec<String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => anyhow::bail!("sharedStrings.xml 解析失败：{e}"),
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// 流式读一张表：返回 (行, 列, 单元格)
@@ -146,7 +144,8 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
     let mut f = zip.by_name(part)?;
     let mut xml = String::new();
     f.read_to_string(&mut xml)?;
-    Ok(parse_sheet_xml(&xml, ss))
+    let cells = parse_sheet_xml(&xml, ss)?;
+    Ok(cells)
 }
 
 
@@ -343,8 +342,11 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
 }
 
 /// 工作表 XML → 单元格表。单拎出来是为了能直接用字符串写测试。
-pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
+pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), Cell>> {
     let mut out: HashMap<(u32, u32), Cell> = HashMap::new();
+    // 共享字符串索引取不到时不能静默变空值：要么整份 SST 没读出来，要么文件本身坏了
+    let mut bad_shared = 0usize;
+    let mut xml_err: Option<String> = None;
     let mut reader = Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
 
@@ -369,7 +371,11 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                         let idx: usize = text.trim().parse().unwrap_or(usize::MAX);
                         match ss.get(idx) {
                             Some(s) if !s.is_empty() => Value::Text(s.clone().into()),
-                            _ => Value::Empty,
+                            Some(_) => Value::Empty,
+                            None => {
+                                bad_shared += 1;
+                                Value::Empty
+                            }
                         }
                     }
                     "b" => Value::Bool(text.trim() == "1" || text.trim().eq_ignore_ascii_case("true")),
@@ -544,11 +550,33 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> HashMap<(u32, u32), Cell> {
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => { eprintln!("[sparse] 解析出错: {e}"); break; }
+            Err(e) => { xml_err = Some(format!("{e}")); break; }
             _ => {}
         }
     }
-    out
+    if let Some(e) = xml_err {
+        anyhow::bail!("工作表 XML 解析失败：{e}");
+    }
+    // 文档必须以 </worksheet> 收尾：calamine/quick-xml 对"截断但在标签边界"的文件
+    // 都可能安静地返回半张表，这里补一道结构检查。
+    let closed = {
+        let t = xml.trim_end();
+        match t.rfind("</") {
+            Some(i) => {
+                let tail = &t[i + 2..];
+                let name = tail.trim_end_matches('>').trim();
+                name.rsplit(':').next().unwrap_or(name) == "worksheet"
+            }
+            None => false,
+        }
+    };
+    if !closed {
+        anyhow::bail!("工作表 XML 未正常结束（文件可能被截断）");
+    }
+    if bad_shared > 0 {
+        anyhow::bail!("{bad_shared} 个单元格引用了不存在的共享字符串（sharedStrings 缺失或损坏）");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -584,7 +612,7 @@ mod tests {
             <row r="2"><c r="B2"><f>IF(A2&lt;=3,"小","大")</f><v>2</v></c></row>
             <row r="3"><c r="B3"><f>IF(AND(A3&gt;=1,A3&lt;9),"中","外")</f><v>3</v></c></row>
         </sheetData></worksheet>"#;
-        let cells = parse_sheet_xml(xml, &[]);
+        let cells = parse_sheet_xml(xml, &[]).expect("应能解析");
         let f = |r: u32| {
             cells
                 .get(&(r, 1))
@@ -604,7 +632,7 @@ mod tests {
             <row r="7"><c r="G7"><f t="shared" si="0"></f><v>2</v></c></row>
             <row r="8"><c r="G8"><f t="shared" si="0"/><v>3</v></c></row>
         </sheetData></worksheet>"#;
-        let cells = parse_sheet_xml(xml, &[]);
+        let cells = parse_sheet_xml(xml, &[]).expect("应能解析");
         let f = |r: u32| {
             cells
                 .get(&(r, 6))
@@ -624,4 +652,27 @@ mod tests {
         assert_eq!(declared_area(small), 20001 * 8);
         assert_eq!(declared_area("<worksheet>"), 0);
     }
+}
+
+/// 工作簿里是否有单元格真的引用了共享字符串（`t="s"`）。
+/// 没有 SST 部件且没人引用时不算问题；有人引用才是数据丢失。
+pub fn any_sheet_uses_shared_strings(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else { return false };
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.name_for_index(i).map(|s| s.to_string()))
+        .filter(|n| n.starts_with("xl/worksheets/") && n.ends_with(".xml"))
+        .collect();
+    for n in names {
+        let Ok(mut f) = zip.by_name(&n) else { continue };
+        let mut xml = String::new();
+        if f.read_to_string(&mut xml).is_err() {
+            continue;
+        }
+        if xml.contains("t=\"s\"") || xml.contains("t='s'") {
+            return true;
+        }
+    }
+    false
 }

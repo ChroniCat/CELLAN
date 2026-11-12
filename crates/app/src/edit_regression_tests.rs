@@ -2258,3 +2258,165 @@ fn incomplete_load_blocks_overwrite_but_allows_rescue_save_as() {
     assert!(app.load_diag.is_none(), "另存成功后不应继续挡住新文件的保存");
     drop(env);
 }
+
+#[test]
+fn opening_a_damaged_document_reports_it_immediately_and_diag_follows_the_tab() {
+    // C14：打开就不完整要当场说清楚（不是等保存才提示），
+    // 而且诊断属于具体文档：切到别的标签不能被串用。
+    let env = crate::test_env::TestEnv::new("c14_status");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    // 坏文档 A
+    let bad = env.path("bad.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "数据".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(5.0), formula: None });
+    sheetcore::xlsx::save(&bad, &wb).unwrap();
+    let part = sheetcore::patch::sheet_targets(&bad).unwrap().get("数据").cloned().unwrap();
+    sheetcore::fixups::write_parts(&bad, &[(part, b"<worksheet><sheetData><row>".to_vec())]).unwrap();
+    let (wb_bad, diag) = sheetcore::xlsx::load_diag(&bad).unwrap();
+    assert!(diag.has_fatal());
+
+    // 好文档 B
+    let good = env.path("good.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "汇总".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(9.0), formula: None });
+    sheetcore::xlsx::save(&good, &wb).unwrap();
+    let (wb_good, diag_good) = sheetcore::xlsx::load_diag(&good).unwrap();
+    assert!(!diag_good.has_fatal());
+
+    // 走真实的打开消息路径：打开 A 后状态栏必须立刻是"读取问题"
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tasks.open_rx = Some(rx);
+    tx.send(crate::OpenMsg::Loaded(Box::new(wb_bad), false, Box::new(diag.clone()))).unwrap();
+    drop(tx);
+    app.poll_open();
+    assert!(app.status.contains("读取问题"), "打开当时就要报：{}", app.status);
+    assert!(app.show_load_diag, "加载问题窗口应自动弹出");
+    assert!(app.load_diag.as_ref().is_some_and(|d| d.has_fatal()));
+
+    // 切到 B：诊断必须换成 B 的（干净），保存不再被挡
+    let parked_a = app.park_current();
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    app.tasks.open_rx = Some(rx2);
+    tx2.send(crate::OpenMsg::Loaded(Box::new(wb_good), false, Box::new(diag_good.clone()))).unwrap();
+    drop(tx2);
+    app.poll_open();
+    assert!(
+        !app.load_diag.as_ref().is_some_and(|d| d.has_fatal()),
+        "B 是完好的，不应继承 A 的致命诊断：{:?}",
+        app.load_diag
+    );
+    assert!(!app.status.contains("读取问题"), "B 不该显示 A 的问题：{}", app.status);
+
+    // 切回 A：致命诊断跟着文档回来
+    let parked_b = app.park_current();
+    app.activate_parked(parked_a);
+    assert!(app.load_diag.as_ref().is_some_and(|d| d.has_fatal()), "切回 A 必须恢复 A 的诊断");
+    app.activate_parked(parked_b);
+    assert!(app.load_diag.is_none(), "再切回 B 仍然干净");
+    drop(env);
+}
+
+#[test]
+fn save_as_back_to_the_original_path_is_refused_for_damaged_documents() {
+    let env = crate::test_env::TestEnv::new("c14_same_path");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    let path = env.path("same.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "数据".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(3.0), formula: None });
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+    let part = sheetcore::patch::sheet_targets(&path).unwrap().get("数据").cloned().unwrap();
+    sheetcore::fixups::write_parts(&path, &[(part, b"<worksheet><sheetData><row>".to_vec())]).unwrap();
+    let (loaded, diag) = sheetcore::xlsx::load_diag(&path).unwrap();
+    app.wb = loaded;
+    app.wb.path = Some(path.clone());
+    app.load_diag = Some(diag);
+    let before = file_sha256(&path);
+
+    // 另存为把目标选回原路径：同样要拒绝
+    env.sc("SC_SAVE_AS", path.to_str().unwrap());
+    app.save(true);
+    wait_save(&mut app);
+    assert_eq!(file_sha256(&path), before, "另存回原路径也不能改写损坏的原文件");
+
+    // 核心层直接写同类目标也不许过（防界面之外的入口）
+    let err = sheetcore::xlsx::save(&path, &app.wb).expect_err("核心保存必须拒绝");
+    assert!(format!("{err:#}").contains("拒绝覆盖"));
+    assert_eq!(file_sha256(&path), before);
+    drop(env);
+}
+
+#[test]
+fn rescue_save_started_before_switching_tabs_clears_diag_when_it_finishes() {
+    // 复核场景：A 坏了 → 另存抢救副本（后台写盘中）→ 立刻切到 B →
+    // 保存完成时 A 已经挂起；切回 A 不能还拿旧诊断拦保存。
+    let env = crate::test_env::TestEnv::new("c14_parked_save");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    let path = env.path("parked_bad.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "数据".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+    let part = sheetcore::patch::sheet_targets(&path).unwrap().get("数据").cloned().unwrap();
+    sheetcore::fixups::write_parts(&path, &[(part, b"<worksheet><sheetData><row>".to_vec())]).unwrap();
+    let (loaded, diag) = sheetcore::xlsx::load_diag(&path).unwrap();
+    assert!(diag.has_fatal());
+    app.wb = loaded;
+    app.wb.path = Some(path.clone());
+    app.load_diag = Some(diag);
+    app.wb.dirty = true;
+
+    let rescue = env.path("parked_rescue.xlsx");
+    env.sc("SC_SAVE_AS", rescue.to_str().unwrap());
+    app.save(true);
+    assert!(app.tasks.saving.is_some(), "另存应启动后台写盘");
+
+    // 保存还没完成就切标签：A 连同 diag/pending save 一起挂起
+    let parked = app.park_current();
+    app.tabs[0] = crate::TabSlot::Parked(parked);
+    app.tabs.push(crate::TabSlot::Active);
+    app.active_tab = 1;
+    let mut good = Workbook::new_blank();
+    good.sheets[0].name = "汇总".into();
+    good.sheets[0].set(0, 0, Cell { value: Value::Number(2.0), formula: None });
+    app.wb = good;
+
+    // 等挂起的保存完成（poll_save 会轮询所有 Parked 文档）
+    for _ in 0..200 {
+        app.poll_save();
+        let still = matches!(&app.tabs[0], crate::TabSlot::Parked(d) if d.tasks.saving.is_some());
+        if !still {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(rescue.is_file(), "抢救副本必须写出来：{}", rescue.display());
+
+    // 切回 A：诊断应已清掉，保存不再被拦
+    let slot = std::mem::replace(&mut app.tabs[0], crate::TabSlot::Active);
+    if let crate::TabSlot::Parked(doc) = slot {
+        app.activate_parked(doc);
+    } else {
+        panic!("A 应当是挂起状态");
+    }
+    assert!(app.load_diag.is_none(), "保存成功后旧诊断必须清掉：{:?}", app.load_diag);
+    assert!(app.wb.path.is_some());
+    app.wb.dirty = true;
+    app.save(false);
+    // 没有致命诊断时，保存应正常进入写盘（不是被"打开不完整"挡住）
+    assert!(
+        app.tasks.saving.is_some() || !app.status.contains("禁止覆盖保存"),
+        "保存不应再被旧诊断拦截：{}",
+        app.status
+    );
+    wait_save(&mut app);
+    drop(env);
+}

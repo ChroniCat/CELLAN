@@ -110,7 +110,9 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
     let mut drawing_xml = String::new();
     {
         use std::io::Read;
-        let Ok(mut f) = zip.by_name(&drawing_path) else { if dbg { eprintln!("[chart] 打不开 drawing {drawing_path}") } return Ok(Vec::new()) };
+        let Ok(mut f) = zip.by_name(&drawing_path) else {
+            anyhow::bail!("工作表引用了 drawing 部件 {drawing_path}，但包里没有它");
+        };
         let _ = f.read_to_string(&mut drawing_xml);
     }
 
@@ -171,17 +173,20 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
         if let Some(cp) = chart_targets.get(&rid) {
             use std::io::Read;
             let mut cx = String::new();
-            if let Ok(mut f) = zip.by_name(cp) {
-                let _ = f.read_to_string(&mut cx);
-            } else {
-                continue;
+            {
+                use std::io::Read;
+                let mut f = zip
+                    .by_name(cp)
+                    .map_err(|e| anyhow::anyhow!("drawing 关系指向的图表部件 {cp} 不存在：{e}"))?;
+                f.read_to_string(&mut cx)
+                    .map_err(|e| anyhow::anyhow!("图表部件 {cp} 读取失败：{e}"))?;
             }
-            if let Some(mut ch) = parse_chart(&cx) {
-                ch.anchor = anchor;
-                ch.part = cp.clone();
-                ch.drawing = drawing_path.clone();
-                out.push(ch);
-            }
+            let mut ch = parse_chart(&cx)
+                .ok_or_else(|| anyhow::anyhow!("图表部件 {cp} 解析失败（不是可识别的 chart XML）"))?;
+            ch.anchor = anchor;
+            ch.part = cp.clone();
+            ch.drawing = drawing_path.clone();
+            out.push(ch);
         }
     }
     Ok(out)
@@ -205,15 +210,17 @@ pub fn load_charts_all_in(
     let targets = crate::patch::sheet_targets(path)?;
     let mut out = std::collections::HashMap::new();
     for (idx, (name, _)) in sorted_targets(&targets).into_iter().enumerate() {
-        if let Ok(mut list) = load_charts(path, &name) {
-            if let Some(sh) = sheets.get(idx) {
-                for ch in list.iter_mut() {
-                    resolve_series_in(ch, sh, styles, sys);
-                }
+        // 每张表都要读；读失败要带表名往上抛，不能 `if let Ok` 悄悄跳过
+        // （drawing 指向缺失的 chart XML 时，图表就是真丢了）
+        let mut list = load_charts(path, &name)
+            .map_err(|e| anyhow::anyhow!("读取工作表 {name} 的图表失败：{e:#}"))?;
+        if let Some(sh) = sheets.get(idx) {
+            for ch in list.iter_mut() {
+                resolve_series_in(ch, sh, styles, sys);
             }
-            if !list.is_empty() {
-                out.insert(idx as u32, list);
-            }
+        }
+        if !list.is_empty() {
+            out.insert(idx as u32, list);
         }
     }
     Ok(out)
