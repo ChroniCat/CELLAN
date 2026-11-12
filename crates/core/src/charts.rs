@@ -122,10 +122,11 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
         None => return Ok(Vec::new()),
     };
     let mut d_rels_xml = String::new();
+    let mut d_rels_ok = false;
     {
         use std::io::Read;
         if let Ok(mut f) = zip.by_name(&d_rels) {
-            let _ = f.read_to_string(&mut d_rels_xml);
+            d_rels_ok = f.read_to_string(&mut d_rels_xml).is_ok();
         }
     }
     let mut chart_targets: HashMap<String, String> = HashMap::new();
@@ -168,9 +169,16 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
         eprintln!("[chart] 锚点={:?}", parse_drawing_anchors(&drawing_xml));
     }
     // 每个 anchor 里的 chart r:id
+    let anchors = parse_drawing_anchors(&drawing_xml);
+    if !anchors.is_empty() && !d_rels_ok {
+        anyhow::bail!("drawing 部件 {drawing_path} 有图表引用，但缺少关系部件 {d_rels}");
+    }
     let mut out = Vec::new();
-    for (anchor, rid) in parse_drawing_anchors(&drawing_xml) {
-        if let Some(cp) = chart_targets.get(&rid) {
+    for (anchor, rid) in anchors {
+        let cp = chart_targets
+            .get(&rid)
+            .ok_or_else(|| anyhow::anyhow!("drawing 里的图表引用 {rid} 在关系部件中不存在"))?;
+        {
             use std::io::Read;
             let mut cx = String::new();
             {
@@ -180,6 +188,25 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
                     .map_err(|e| anyhow::anyhow!("drawing 关系指向的图表部件 {cp} 不存在：{e}"))?;
                 f.read_to_string(&mut cx)
                     .map_err(|e| anyhow::anyhow!("图表部件 {cp} 读取失败：{e}"))?;
+            }
+            // 截断/半截 XML 里可能已经出现 <c:barChart>，parse_chart 会返回部分结果；
+            // 先做严格良构校验，坏 XML 一律报错而不是"读到一半当成功"。
+            let mut r = Reader::from_str(&cx);
+            r.config_mut().check_end_names = true;
+            let mut depth: i32 = 0;
+            loop {
+                match r.read_event() {
+                    Ok(Event::Start(_)) => depth += 1,
+                    Ok(Event::End(_)) => depth -= 1,
+                    Ok(Event::Eof) => {
+                        if depth != 0 {
+                            anyhow::bail!("图表部件 {cp} 的 XML 在元素内被截断");
+                        }
+                        break;
+                    }
+                    Err(e) => anyhow::bail!("图表部件 {cp} 的 XML 不完整：{e}"),
+                    _ => {}
+                }
             }
             let mut ch = parse_chart(&cx)
                 .ok_or_else(|| anyhow::anyhow!("图表部件 {cp} 解析失败（不是可识别的 chart XML）"))?;

@@ -1,0 +1,75 @@
+C14 第三轮：关系 XML 良构性 + 图表内部三类吞错
+==============================================
+
+对应 03:49 复核的两条。
+
+一、clear_sheet_notes 生成非法关系 XML（实证）
+--------------------------------------------
+**实证落盘**：`work/hermes-round21-20261113-033013-1728/sc_c14g_notes_50312/notes.xlsx`
+的 `xl/worksheets/_rels/sheet1.xml.rels` 实际内容为
+
+```
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+</Relationships>
+```
+
+根开始标签 `<Relationships ...>` 被删掉，标准 XML 解析必失败。
+
+**根因**：`clear_sheet_notes` 用 `rels.find("<Relationship")` 找关系段，
+这个前缀同样匹配根标签 `<Relationships`；当批注关系排在第一个时，
+"删除该关系" 实际删掉了根开始标签及后面的批注关系。
+
+**修法**：改用 `roxmltree` 解析关系部件，按 `<Relationship>` **节点**判断
+`Type` 是否 `/comments` 或 `/vmlDrawing`；保留其余关系的全部属性，
+重建时保留根标签及其 `xmlns` 声明；写盘前再严格解析一次，非法直接拒绝写出。
+`resolve()` 仍按工作表目录解析相对 Target。
+
+**用例**（`crates/core/tests/c14_guard.rs`，2 项）
+- `clearing_notes_keeps_rel_xml_well_formed_when_comments_rels_is_first`
+- `clearing_notes_keeps_other_relationships_when_comments_rels_is_not_first`
+
+断言：`roxmltree::Document::parse` 成功、根是 `Relationships`、
+批注/VML 关系不存在、其余 hyperlink 关系仍在、Id 列表只剩 `rIdKeep`、
+重开后批注为空。
+
+**变异**：把重建时的根标签写成空串（等价旧 bug 丢失根）
+→ 两项用例均失败并报关系部件非法；已还原。
+
+二、图表内部仍吞错
+----------------
+复核指出三处：
+
+1. drawing 的 `.rels` 缺失 → `if let Ok` 变成空 map，最后 `Ok(vec![])`；
+2. drawing 里 `r:id` 在关系 map 里找不到 → 直接跳过；
+3. chart XML 截断但已出现 `<c:barChart>` → `parse_chart` 返回部分结果。
+
+**修法**（`crates/core/src/charts.rs::load_charts`）：
+- 记录关系部件是否成功读到；有锚点但关系部件缺失 → 直接 bail；
+- `r:id` 查不到 → bail（带 rId 文本）；
+- 读 chart XML 后做严格良构检查：`check_end_names = true` 且统计元素深度，
+  EOF 时深度不为 0 即“元素内被截断”，bail；随后才交给 `parse_chart`。
+
+**窄夹具**（3 项，均断言 `load_diag` 出现致命“图表”问题）
+- `drawing_without_rels_is_reported`（无 drawing rels）
+- `drawing_rid_missing_from_rels_is_reported`（rels 里只有 rIdOther）
+- `truncated_chart_xml_after_recognized_type_is_reported`
+  （`<c:barChart>` 后截断）
+
+**变异**
+| 变异 | 结果 |
+|---|---|
+| M8 rid 缺失改回 `continue` | `drawing_rid_missing...` 失败 |
+| M9 去掉深度检查 | `truncated_chart...` 失败 |
+
+保留：`drawing_pointing_at_a_missing_chart_is_reported`（上一轮已加）。
+
+三、当前结果
+-----------
+`cargo test -p sheetcore --offline --test c14_guard` → **13 passed / 0 failed**（3.2s）。
+
+四、仍未执行（不称通过）
+----------------------
+- 工作线程 panic / 旁路线程失败注入夹具。
+- 正常 `.xls` 走 calamine 成功路径的夹具（现有 BIFF 由本仓库写出，走内置读取器）。
+- Excel 生成的加密包（现为本项目 `crypto::encrypt`）。
+- 与真实 Office「修复」对话框的目视对比。

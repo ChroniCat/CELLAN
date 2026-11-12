@@ -241,34 +241,59 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
     else {
         return Ok(());
     };
-    let mut kept = String::with_capacity(rels.len());
+    // 按 XML 节点删，不做字符串切分：根标签是 <Relationships>，
+    // 前缀匹配 <Relationship 会把根开始标签一起吃掉，生成非法 XML。
+    let doc = match roxmltree::Document::parse(&rels) {
+        Ok(d) => d,
+        Err(e) => anyhow::bail!("关系部件 {rels_part} 不是合法 XML：{e}"),
+    };
     let mut removed: Vec<String> = Vec::new();
-    let mut rest = rels.as_str();
-    while let Some(i) = rest.find("<Relationship") {
-        kept.push_str(&rest[..i]);
-        let Some(end) = rest[i..].find("/>") else { break };
-        let seg = &rest[i..i + end + 2];
-        let ty = attr(seg, "Type").unwrap_or_default();
-        if ty.contains("/comments") || ty.contains("/vmlDrawing") {
-            if let Some(t) = attr(seg, "Target") {
-                removed.push(resolve(dir, &t));
+    let mut keep_ids: Vec<String> = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
+        let ty = node.attribute("Type").unwrap_or("");
+        if ty.ends_with("/comments") || ty.ends_with("/vmlDrawing") {
+            if let Some(t) = node.attribute("Target") {
+                removed.push(resolve(dir, t));
             }
-        } else {
-            kept.push_str(seg);
+        } else if let Some(id) = node.attribute("Id") {
+            keep_ids.push(id.to_string());
         }
-        rest = &rest[i + end + 2..];
     }
-    kept.push_str(rest);
     if removed.is_empty() {
         return Ok(());
     }
     for p in &removed {
         let _ = crate::patch::remove_entry(path, p);
     }
-    crate::fixups::write_parts(path, &[(rels_part, kept.into_bytes())])?;
-    // 清掉悬空的 Content_Types Override
+    // 重建关系部件：保留原有根属性（命名空间），只写没删的关系
+    let root = doc.root_element();
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+    out.push_str("<Relationships");
+    for a in root.attributes() {
+        out.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+    }
+    out.push('>');
+    for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
+        let Some(id) = node.attribute("Id") else { continue };
+        if !keep_ids.iter().any(|k| k == id) {
+            continue;
+        }
+        out.push_str("<Relationship");
+        for a in node.attributes() {
+            out.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+        }
+        out.push_str("/>");
+    }
+    out.push_str("</Relationships>");
+    // 写盘前先严格解析一遍，任何不合法都拒绝写出
+    roxmltree::Document::parse(&out).map_err(|e| anyhow::anyhow!("重建的关系 XML 非法：{e}"))?;
+    crate::fixups::write_parts(path, &[(rels_part, out.into_bytes())])?;
     let _ = crate::fixups::prune_content_types(path);
     Ok(())
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 fn attr(seg: &str, name: &str) -> Option<String> {

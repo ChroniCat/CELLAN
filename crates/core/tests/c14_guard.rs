@@ -314,3 +314,130 @@ fn drawing_pointing_at_a_missing_chart_is_reported() {
         diag.problems
     );
 }
+
+/// 删除批注部件时重建的关系 XML 必须良构：根 <Relationships> 不能被当关系删掉。
+fn rels_after_clear(first_is_comments: bool) {
+    let d = dir(if first_is_comments { "notes_first" } else { "notes_mixed" });
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    wb.sheets[0].notes.insert(
+        CellRef::new(0, 0),
+        sheetcore::notes::Note { r: 0, c: 0, text: "批注".into(), author: "t".into() },
+    );
+    wb.sheets[0].notes_dirty = true;
+    let p = d.join("n.xlsx");
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+
+    let part = part_of(&p, "S");
+    let rels_part = {
+        let (dirp, file) = part.rsplit_once('/').unwrap();
+        format!("{dirp}/_rels/{file}.rels")
+    };
+    let orig = String::from_utf8(sheetcore::fixups::read_part(&p, &rels_part).unwrap()).unwrap();
+    // 造出「首个关系就是批注」/「批注和其他关系共存」两种排布
+    let comments_rel = orig
+        .split("<Relationship ")
+        .find(|x| x.contains("/comments"))
+        .map(|x| format!("<Relationship {}/>", x.split("/>").next().unwrap()))
+        .expect("应有 comments 关系");
+    let other = "<Relationship Id=\"rIdKeep\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.com/\" TargetMode=\"External\"/>";
+    let head = orig.split("<Relationship ").next().unwrap();
+    let rebuilt = if first_is_comments {
+        format!("{head}{comments_rel}{other}</Relationships>")
+    } else {
+        format!("{head}{other}{comments_rel}</Relationships>")
+    };
+    sheetcore::fixups::write_parts(&p, &[(rels_part.clone(), rebuilt.clone().into_bytes())]).unwrap();
+
+    // 删空批注再保存
+    let mut wb = sheetcore::xlsx::load(&p).unwrap();
+    wb.sheets[0].notes.clear();
+    wb.sheets[0].notes_dirty = true;
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+    assert!(sheetcore::xlsx::load(&p).unwrap().sheets[0].notes.is_empty());
+
+    let out = String::from_utf8(sheetcore::fixups::read_part(&p, &rels_part).unwrap()).unwrap();
+    let doc = roxmltree::Document::parse(&out).expect("关系部件必须仍是合法 XML");
+    assert!(doc.root_element().has_tag_name("Relationships"), "根必须是 Relationships");
+    let types: Vec<String> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("Relationship"))
+        .filter_map(|n| n.attribute("Type").map(|t| t.to_string()))
+        .collect();
+    assert!(!types.iter().any(|t| t.ends_with("/comments") || t.ends_with("/vmlDrawing")), "批注关系应删掉：{types:?}");
+    assert!(types.iter().any(|t| t.ends_with("/hyperlink")), "其他关系必须保留：{types:?}");
+    let ids: Vec<&str> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("Relationship"))
+        .filter_map(|n| n.attribute("Id"))
+        .collect();
+    assert_eq!(ids, vec!["rIdKeep"], "删除后只剩保留的关系：{ids:?}");
+}
+
+#[test]
+fn clearing_notes_keeps_rel_xml_well_formed_when_comments_rels_is_first() {
+    rels_after_clear(true);
+}
+
+#[test]
+fn clearing_notes_keeps_other_relationships_when_comments_rels_is_not_first() {
+    rels_after_clear(false);
+}
+
+/// 三种窄夹具：drawing 缺关系部件 / 缺 rId / chart XML 截断。
+fn chart_fixture(tag: &str, d_rels: Option<&str>, chart: Option<&str>) {
+    let d = dir(tag);
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    let p = d.join("c.xlsx");
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+    let part = part_of(&p, "S");
+    let xml = String::from_utf8(sheetcore::fixups::read_part(&p, &part).unwrap()).unwrap();
+    let xml = xml.replacen("</worksheet>", "<drawing r:id=\"rIdDraw\"/></worksheet>", 1);
+    let sheet_rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdDraw\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing1.xml\"/></Relationships>";
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:row>8</xdr:row></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>";
+    let rels_part = {
+        let (dirp, file) = part.rsplit_once('/').unwrap();
+        format!("{dirp}/_rels/{file}.rels")
+    };
+    let mut parts: Vec<(String, Vec<u8>)> = vec![
+        (part.clone(), xml.into_bytes()),
+        (rels_part, sheet_rels.as_bytes().to_vec()),
+        ("xl/drawings/drawing1.xml".into(), drawing.as_bytes().to_vec()),
+    ];
+    if let Some(r) = d_rels {
+        parts.push(("xl/drawings/_rels/drawing1.xml.rels".into(), r.as_bytes().to_vec()));
+    }
+    if let Some(c) = chart {
+        parts.push(("xl/charts/chart1.xml".into(), c.as_bytes().to_vec()));
+    }
+    sheetcore::fixups::write_parts(&p, &parts).unwrap();
+    let (_wb, diag) = sheetcore::xlsx::load_diag(&p).expect("应能打开");
+    assert!(
+        diag.problems.iter().any(|x| x.fatal && x.what.contains("图表")),
+        "{tag}: 必须报致命图表问题：{:?}",
+        diag.problems
+    );
+}
+
+#[test]
+fn drawing_without_rels_is_reported() {
+    chart_fixture("chart_no_rels", None, None);
+}
+
+#[test]
+fn drawing_rid_missing_from_rels_is_reported() {
+    let rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdOther\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart1.xml\"/></Relationships>";
+    let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart/></c:plotArea></c:chart></c:chartSpace>";
+    chart_fixture("chart_missing_rid", Some(rels), Some(chart));
+}
+
+#[test]
+fn truncated_chart_xml_after_recognized_type_is_reported() {
+    let rels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart1.xml\"/></Relationships>";
+    // 已经出现 barChart（parse_chart 会认出来），但后面被截断
+    let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart>";
+    chart_fixture("chart_truncated", Some(rels), Some(chart));
+}
