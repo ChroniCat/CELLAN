@@ -64,6 +64,20 @@ pub enum Icon {
     TextDir,
     HeaderFooter,
     DocLink,
+    GroupRows,
+    UngroupRows,
+    ShowDetail,
+    HideDetail,
+    Validation,
+    SplitColumns,
+    RemoveDup,
+    Consolidate,
+    ImportCsv,
+    ImportBook,
+    WhatIf,
+    OutlineLevels,
+    GoalSeek,
+    Scenario,
     Freeze,
     Lock,
     /// 条件格式：三条彩色数据条
@@ -566,18 +580,19 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.arrow((17.9, 19.6), (0.0, 1.0), 3.6, INK);
         }
         Filter => {
+            // Excel 365：深灰漏斗线稿，浅灰内面，不加蓝
             pen.poly(
                 &[
-                    (3.8, 4.8),
-                    (20.2, 4.8),
-                    (13.8, 12.2),
-                    (13.8, 19.2),
-                    (10.2, 16.8),
-                    (10.2, 12.2),
+                    (3.8, 4.6),
+                    (20.2, 4.6),
+                    (13.8, 12.0),
+                    (13.8, 19.4),
+                    (10.2, 16.9),
+                    (10.2, 12.0),
                 ],
-                BLUE,
-                BLUE_D,
-                1.0,
+                Color32::from_rgb(243, 242, 241),
+                INK,
+                1.15,
             );
         }
         Find => {
@@ -587,103 +602,107 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
 
         // ---- 插入 ----
         Chart => {
-            pen.bar(4.8, 12.6, 3.8, 7.4, BLUE);
-            pen.bar(10.1, 7.4, 3.8, 12.6, ORANGE);
-            pen.bar(15.4, 10.2, 3.8, 9.8, GRAY);
-            pen.ln(3.0, 20.9, 21.0, 20.9, 1.2, GRAY_D);
+            // 扁平柱状图：绿 / 蓝灰 / 灰三根，同一基线，无高光
+            pen.bar(4.6, 12.4, 4.0, 7.6, Color32::from_rgb(33, 115, 70));
+            pen.bar(10.0, 7.2, 4.0, 12.8, Color32::from_rgb(91, 127, 166));
+            pen.bar(15.4, 10.0, 4.0, 10.0, Color32::from_rgb(165, 165, 165));
+            pen.ln(3.0, 20.8, 21.0, 20.8, 1.2, GRAY_D);
         }
         Image => {
-            pen.rrs(3.0, 5.0, 18.0, 14.0, 1.2, BLUE_L, BLUE_D, 1.1);
+            // 相片：深灰相框 + 白底 + 浅蓝山 + 金色太阳（降低饱和度）
+            pen.rrs(3.0, 5.0, 18.0, 14.0, 1.0, WHITE, INK, 1.2);
             pen.poly(
-                &[(3.8, 18.4), (9.6, 11.4), (14.6, 18.4)],
-                GREEN,
-                GREEN_D,
-                0.9,
+                &[(3.9, 18.2), (9.6, 11.6), (14.4, 18.2)],
+                Color32::from_rgb(197, 217, 241),
+                Color32::from_rgb(91, 127, 166),
+                0.85,
             );
             pen.poly(
-                &[(12.4, 18.4), (16.6, 12.4), (20.4, 18.4)],
-                GREEN_D,
-                GREEN_D,
-                0.9,
+                &[(12.4, 18.2), (16.6, 12.6), (20.2, 18.2)],
+                Color32::from_rgb(162, 190, 226),
+                Color32::from_rgb(91, 127, 166),
+                0.85,
             );
-            pen.dot(8.2, 9.2, 1.7, GOLD);
+            pen.dot(8.0, 9.0, 1.7, Color32::from_rgb(255, 192, 0));
         }
         Table => {
-            pen.rrs(3.0, 4.4, 18.0, 15.2, 1.0, WHITE, BLUE_D, 1.1);
-            pen.bar(3.4, 4.8, 17.2, 4.0, BLUE);
-            pen.bar(3.4, 9.2, 17.2, 1.0, BLUE_XL);
-            pen.bar(3.4, 14.4, 17.2, 1.0, BLUE_XL);
-            pen.bar(8.9, 9.2, 1.0, 10.2, BLUE_XL);
-            pen.bar(15.0, 9.2, 1.0, 10.2, BLUE_XL);
+            // 表格：中性网格 + 浅灰表头条，网格线用 191 灰
+            pen.rrs(3.0, 4.4, 18.0, 15.2, 0.8, WHITE, INK, 1.2);
+            pen.rr(3.4, 4.8, 17.2, 4.0, 0.0, Color32::from_rgb(217, 217, 217));
+            pen.bar(3.4, 9.2, 17.2, 1.0, Color32::from_rgb(191, 191, 191));
+            pen.bar(3.4, 14.4, 17.2, 1.0, Color32::from_rgb(191, 191, 191));
+            pen.bar(8.9, 9.2, 1.0, 10.2, Color32::from_rgb(191, 191, 191));
+            pen.bar(15.0, 9.2, 1.0, 10.2, Color32::from_rgb(191, 191, 191));
         }
         Comment => {
-            pen.rrs(4.0, 4.0, 16.0, 11.0, 2.2, CREAM, GOLD_D, 1.1);
-            pen.poly(&[(7.2, 14.6), (7.2, 19.4), (11.8, 14.6)], CREAM, GOLD_D, 1.0);
-            pen.bar(7.0, 8.0, 10.0, 1.2, GOLD_D);
-            pen.bar(7.0, 11.0, 7.4, 1.2, GOLD_D);
+            pen.rrs(4.2, 4.2, 15.6, 10.6, 2.0, Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 1.0);
+            pen.poly(&[(7.4, 14.6), (7.4, 19.0), (11.6, 14.6)], Color32::from_rgb(255, 246, 214), Color32::from_rgb(191, 144, 0), 0.95);
+            pen.bar(7.2, 8.2, 9.6, 1.1, Color32::from_rgb(191, 144, 0));
+            pen.bar(7.2, 11.0, 7.0, 1.1, Color32::from_rgb(191, 144, 0));
         }
         Pivot => {
-            pen.rrs(3.0, 4.0, 11.0, 9.0, 0.8, BLUE_L, BLUE_D, 1.0);
-            pen.bar(3.2, 7.2, 10.6, 1.0, BLUE_D);
-            pen.bar(7.6, 4.2, 1.0, 8.6, BLUE_D);
-            pen.bar(13.6, 18.6, 7.2, 1.6, BLUE_D);
-            pen.bar(17.2, 14.4, 1.6, 4.2, BLUE_D);
-            pen.arrow((21.4, 19.4), (1.0, 0.0), 3.0, BLUE_D);
+            // 透视表：左边一张小网格，右下角一支汇总箭头（绿色强调）
+            pen.rrs(3.0, 4.0, 10.6, 9.0, 0.8, Color32::from_rgb(243, 242, 241), INK, 1.1);
+            pen.bar(3.4, 7.0, 9.8, 0.9, INK);
+            pen.bar(7.2, 4.4, 0.9, 8.2, INK);
+            pen.bar(13.4, 18.8, 7.4, 1.6, GRAY_D);
+            pen.bar(17.0, 14.6, 1.6, 4.2, GRAY_D);
+            pen.arrow((21.2, 19.6), (1.0, 0.0), 3.0, Color32::from_rgb(33, 115, 70));
         }
         Link => {
-            pen.ring(8.0, 12.0, 4.0, 2.0, BLUE);
-            pen.ring(16.0, 12.0, 4.0, 2.0, BLUE);
-            pen.bar(11.2, 11.2, 1.6, 1.6, BLUE_D);
+            pen.ring(8.2, 12.0, 4.0, 1.9, Color32::from_rgb(68, 114, 196));
+            pen.ring(15.8, 12.0, 4.0, 1.9, Color32::from_rgb(68, 114, 196));
+            pen.bar(11.2, 11.3, 1.6, 1.4, Color32::from_rgb(47, 85, 151));
         }
-
-        // ---- 审阅 / 视图 ----
         Revision => {
             pen.ring(12.0, 12.0, 8.0, 1.8, GRAY_D);
             pen.ln(12.0, 12.0, 12.0, 6.8, 1.8, GRAY_D);
             pen.ln(12.0, 12.0, 15.8, 14.0, 1.8, GRAY_D);
         }
         Zoom => {
-            pen.ring(10.2, 10.2, 5.4, 1.9, GRAY_D);
-            pen.ln(14.2, 14.4, 19.8, 19.8, 2.4, GRAY_D);
-            pen.bar(7.6, 9.4, 5.2, 1.5, BLUE);
-            pen.bar(9.45, 7.55, 1.5, 5.2, BLUE);
+            pen.ring(10.2, 10.2, 5.4, 1.9, INK);
+            pen.ln(14.2, 14.4, 19.8, 19.8, 2.4, INK);
+            pen.bar(7.6, 9.4, 5.2, 1.4, GRAY_D);
+            pen.bar(9.5, 7.5, 1.4, 5.2, GRAY_D);
         }
         Freeze => {
-            pen.rrs(3.2, 3.2, 17.6, 17.6, 0.8, WHITE, GRAY_D, 1.3);
-            pen.bar(3.6, 3.6, 16.8, 5.0, BLUE_XL);
-            pen.bar(3.6, 3.6, 5.0, 16.8, BLUE_XL);
-            pen.bar(3.6, 8.4, 16.8, 1.2, BLUE_D);
-            pen.bar(8.4, 3.6, 1.2, 16.8, BLUE_D);
+            // 冻结窗格：白底 + 浅灰冻结带 + 两条深灰分隔线
+            pen.rrs(3.2, 3.2, 17.6, 17.6, 0.8, WHITE, INK, 1.2);
+            pen.rr(3.6, 5.6, 16.8, 4.2, 0.0, Color32::from_rgb(237, 237, 237));
+            pen.rr(5.6, 9.8, 4.2, 10.6, 0.0, Color32::from_rgb(237, 237, 237));
+            pen.bar(3.6, 9.6, 16.8, 1.2, GRAY_D);
+            pen.bar(9.6, 3.6, 1.2, 16.8, GRAY_D);
         }
         Lock => {
             pen.polyline(
                 &[(7.8, 10.4), (7.8, 7.2), (12.0, 4.4), (16.2, 7.2), (16.2, 10.4)],
                 1.9,
-                GRAY_D,
+                INK,
             );
-            pen.rrs(5.8, 10.0, 12.4, 9.6, 1.2, GOLD, GOLD_D, 1.1);
-            pen.dot(12.0, 13.6, 1.5, GOLD_D);
-            pen.bar(11.4, 14.2, 1.2, 2.4, GOLD_D);
+            pen.rrs(5.8, 10.0, 12.4, 9.6, 1.0, Color32::from_rgb(255, 217, 102), INK, 1.15);
+            pen.dot(12.0, 13.6, 1.5, INK);
+            pen.bar(11.4, 14.2, 1.2, 2.4, INK);
         }
         Cf => {
-            pen.rrs(3.0, 4.0, 18.0, 16.0, 1.0, WHITE, GRAY_D, 1.1);
-            pen.bar(4.4, 5.6, 15.2, 2.8, BLUE);
-            pen.bar(4.4, 9.8, 10.6, 2.8, ORANGE);
-            pen.bar(4.4, 14.0, 6.4, 2.8, GREEN);
+            // 条件格式：白底网格 + 蓝/橙/绿三条数据条（语义色保留，压暗一档）
+            pen.rrs(3.0, 4.0, 18.0, 16.0, 0.8, WHITE, INK, 1.15);
+            pen.bar(4.6, 5.8, 14.8, 2.6, Color32::from_rgb(68, 114, 196));
+            pen.bar(4.6, 10.0, 10.4, 2.6, Color32::from_rgb(237, 125, 49));
+            pen.bar(4.6, 14.2, 6.2, 2.6, Color32::from_rgb(112, 173, 71));
         }
         IndentInc => {
             for i in 0..4 {
                 pen.bar(8.2, 5.6 + i as f32 * 4.0, 12.0, 1.6, if i < 2 { GRAY_D } else { INK });
             }
-            pen.bar(3.4, 11.2, 5.4, 1.7, BLUE);
-            pen.arrow((9.4, 12.0), (1.0, 0.0), 3.0, BLUE);
+            pen.bar(3.4, 11.2, 5.4, 1.7, INK);
+            pen.arrow((9.4, 12.0), (1.0, 0.0), 3.0, INK);
         }
         IndentDec => {
             for i in 0..4 {
                 pen.bar(3.4, 5.6 + i as f32 * 4.0, 12.0, 1.6, if i < 2 { GRAY_D } else { INK });
             }
-            pen.bar(15.2, 11.2, 5.4, 1.7, BLUE);
-            pen.arrow((14.6, 12.0), (-1.0, 0.0), 3.0, BLUE);
+            pen.bar(15.2, 11.2, 5.4, 1.7, INK);
+            pen.arrow((14.6, 12.0), (-1.0, 0.0), 3.0, INK);
         }
         ClearFmt => {
             pen.text("A", 11.0, 8.6, 10.4, INK);
@@ -779,7 +798,7 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.dot(17.0, 18.0, 2.5, BLUE);
         }
         Fx => pen.text("fx", 12.0, 12.0, 13.0, GRAY_D),
-        Sum => pen.text("Σ", 15.0, 12.0, 12.2, GREEN_D),
+        Sum => pen.text("Σ", 15.0, 12.0, 12.6, INK),
         Symbol => pen.text("Ω", 15.0, 12.0, 12.2, BLUE_D),
         ZhS => pen.text("简", 13.0, 12.0, 12.4, RED),
         ZhT => pen.text("繁", 13.0, 12.0, 12.4, BLUE_D),
@@ -887,8 +906,127 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.rrs(6.4, 6.6, 10.6, 13.6, 0.6, WHITE, INK, 1.1);
             pen.ln(8.4, 10.0, 15.2, 10.0, 0.9, GRAY_D);
             pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
-            pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(222, 235, 247), BLUE_D, 0.9);
-            pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(222, 235, 247), BLUE_D, 0.9);
+            pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+            pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+        }
+        GoalSeek => {
+            // 单变量求解：靶心 + 射中的箭头
+            pen.ring(11.0, 11.4, 6.4, 1.3, INK);
+            pen.ring(11.0, 11.4, 3.2, 1.3, INK);
+            pen.dot(11.0, 11.4, 1.2, INK);
+            pen.ln(3.0, 3.4, 9.4, 9.2, 1.4, GRAY_D);
+            pen.arrow((11.0, 11.4), (0.62, 0.62), 3.2, GRAY_D);
+        }
+        Scenario => {
+            // 方案管理器：表格 + 右上角书签
+            pen.rro(3.0, 6.0, 13.0, 12.0, 0.5, INK, 1.15);
+            pen.bar(3.2, 9.4, 12.6, 0.9, GRAY_D);
+            pen.bar(8.2, 6.2, 0.9, 11.6, GRAY_D);
+            pen.poly(&[(17.0, 3.4), (21.4, 3.4), (21.4, 12.2), (19.2, 9.8), (17.0, 12.2)], Color32::from_rgb(255, 217, 102), INK, 1.1);
+        }
+        GroupRows => {
+            // 组合：方括号 + 加号（不带行线，和「显示明细」区分开）
+            pen.ln(5.2, 4.2, 5.2, 19.8, 1.8, INK);
+            pen.ln(5.2, 4.2, 8.4, 4.2, 1.8, INK);
+            pen.ln(5.2, 19.8, 8.4, 19.8, 1.8, INK);
+            pen.bar(11.0, 11.1, 8.0, 1.9, Color32::from_rgb(33, 115, 70));
+            pen.bar(14.05, 8.05, 1.9, 8.0, Color32::from_rgb(33, 115, 70));
+        }
+        UngroupRows => {
+            pen.ln(5.2, 4.2, 5.2, 19.8, 1.8, INK);
+            pen.ln(5.2, 4.2, 8.4, 4.2, 1.8, INK);
+            pen.ln(5.2, 19.8, 8.4, 19.8, 1.8, INK);
+            pen.bar(11.0, 11.1, 8.0, 1.9, Color32::from_rgb(33, 115, 70));
+        }
+        ShowDetail => {
+            // 展开明细：行 + 向下的三角（展开），比「+」不容易和插入行混淆
+            for i in 0..3 {
+                pen.bar(10.4, 7.0 + i as f32 * 4.0, 9.8, 1.6, GRAY_D);
+            }
+            pen.poly(&[(2.4, 9.2), (7.6, 9.2), (5.0, 14.0)], INK, INK, 0.0);
+        }
+        HideDetail => {
+            // 折叠明细：行 + 向右的三角
+            for i in 0..3 {
+                pen.bar(10.4, 7.0 + i as f32 * 4.0, 9.8, 1.6, GRAY_D);
+            }
+            pen.poly(&[(3.0, 8.6), (3.0, 15.0), (7.8, 11.8)], INK, INK, 0.0);
+        }
+        Validation => {
+            // 单元格 + 右侧下拉三角 + 右下角对勾
+            pen.rrs(3.2, 4.2, 17.6, 10.4, 0.6, WHITE, INK, 1.15);
+            pen.bar(15.6, 8.2, 1.0, 6.4, Color32::from_rgb(191, 191, 191));
+            pen.poly(
+                &[(16.6, 9.6), (19.4, 9.6), (18.0, 11.6)],
+                GRAY_D,
+                GRAY_D,
+                0.0,
+            );
+            pen.polyline(&[(13.2, 17.0), (15.4, 19.4), (20.4, 14.0)], 2.0, Color32::from_rgb(33, 115, 70));
+        }
+        SplitColumns => {
+            // 分列：两个色块 + 中间一条加粗分界线，16px 下最清楚
+            pen.rr(3.0, 4.4, 7.2, 15.2, 0.3, Color32::from_rgb(217, 217, 217));
+            pen.rro(3.0, 4.4, 7.2, 15.2, 0.3, INK, 1.15);
+            pen.rro(13.8, 4.4, 7.2, 15.2, 0.3, INK, 1.15);
+            pen.bar(11.5, 3.4, 1.0, 17.2, INK);
+            pen.arrow((12.0, 2.0), (0.0, -1.0), 2.4, INK);
+            pen.arrow((12.0, 22.0), (0.0, 1.0), 2.4, INK);
+        }
+        RemoveDup => {
+            // 三行，最后一行划掉（去重）
+            for i in 0..3 {
+                pen.bar(4.0, 6.0 + i as f32 * 4.6, 15.0, 1.6, if i == 2 { GRAY_D } else { INK });
+            }
+            pen.ln(3.4, 16.4, 11.4, 9.4, 1.5, Color32::from_rgb(192, 0, 0));
+        }
+        Consolidate => {
+            // 三张来源表 → 合到一张（右）
+            for (k, y) in [3.6_f32, 9.4, 15.2].iter().enumerate() {
+                let _ = k;
+                pen.rro(2.8, *y, 6.4, 5.2, 0.4, GRAY_D, 1.0);
+            }
+            pen.rro(14.6, 6.4, 7.0, 11.2, 0.5, INK, 1.15);
+            pen.bar(16.2, 9.0, 3.8, 0.9, GRAY_D);
+            pen.bar(16.2, 12.2, 3.8, 0.9, GRAY_D);
+            pen.bar(16.2, 15.4, 2.6, 0.9, GRAY_D);
+            pen.ln(9.8, 8.6, 13.4, 11.0, 1.1, INK);
+            pen.ln(9.8, 12.0, 13.4, 12.0, 1.1, INK);
+            pen.ln(9.8, 15.4, 13.4, 13.0, 1.1, INK);
+        }
+        ImportCsv => {
+            // 文件 + 向下的绿色导入箭头
+            pen.rrs(4.0, 3.4, 12.2, 17.2, 0.5, WHITE, INK, 1.15);
+            pen.bar(6.2, 7.4, 7.8, 1.1, GRAY_D);
+            pen.bar(6.2, 10.2, 7.8, 1.1, GRAY_D);
+            pen.bar(6.2, 13.0, 5.4, 1.1, GRAY_D);
+            pen.ln(17.6, 9.0, 17.6, 17.4, 2.0, Color32::from_rgb(33, 115, 70));
+            pen.arrow((17.6, 19.6), (0.0, 1.0), 3.0, Color32::from_rgb(33, 115, 70));
+        }
+        ImportBook => {
+            // 小网格文件 + 导入箭头
+            pen.rrs(3.6, 3.6, 12.6, 14.0, 0.5, WHITE, INK, 1.15);
+            pen.bar(3.8, 7.0, 12.2, 0.9, GRAY_D);
+            pen.bar(3.8, 10.4, 12.2, 0.9, GRAY_D);
+            pen.bar(9.2, 3.8, 0.9, 13.6, GRAY_D);
+            pen.ln(18.4, 9.0, 18.4, 17.4, 2.0, Color32::from_rgb(33, 115, 70));
+            pen.arrow((18.4, 19.6), (0.0, 1.0), 3.0, Color32::from_rgb(33, 115, 70));
+        }
+        WhatIf => {
+            // 模拟分析：一张小表 + 上下箭头
+            pen.rro(3.4, 8.4, 12.4, 9.6, 0.4, INK, 1.1);
+            pen.bar(3.6, 11.4, 12.0, 0.9, GRAY_D);
+            pen.bar(7.8, 8.6, 0.9, 9.2, GRAY_D);
+            pen.ln(18.6, 6.4, 18.6, 16.4, 1.6, GRAY_D);
+            pen.arrow((18.6, 4.8), (0.0, -1.0), 2.6, GRAY_D);
+            pen.arrow((18.6, 18.0), (0.0, 1.0), 2.6, GRAY_D);
+        }
+        OutlineLevels => {
+            // 分级显示：三行不同缩进 + 左侧级别点
+            for i in 0..3 {
+                pen.bar(6.0 + i as f32 * 2.4, 6.4 + i as f32 * 4.4, 14.0 - i as f32 * 2.4, 1.5, INK);
+                pen.dot(4.2 + i as f32 * 0.0, 7.1 + i as f32 * 4.4, 1.0, GRAY_D);
+            }
         }
         TextDir => {
             // 竖排文字：一个 A + 向下的折线箭头（Excel 的「方向」图标）

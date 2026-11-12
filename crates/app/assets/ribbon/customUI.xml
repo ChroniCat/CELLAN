@@ -551,9 +551,9 @@
       <tab id="TabData" label="数据" keytip="A">
         <group id="GroupWhatIf" label="模拟分析">
           <box boxStyle="vertical">
-            <button id="GoalSeek" label="单变量求解" imageMso="Calc" screentip="反推可变单元格的值" onAction="GoalSeek" sizeString="110"/>
-            <button id="DataTable" label="模拟运算表" imageMso="Grid" screentip="单变量 / 双变量敏感性表" onAction="DataTable" sizeString="110"/>
-            <button id="ScenarioManager" label="方案管理器" imageMso="Table" screentip="保存/切换多套输入值" onAction="ScenarioManager" sizeString="110"/>
+            <button id="GoalSeek" label="单变量求解" imageMso="GoalSeek" screentip="反推可变单元格的值" onAction="GoalSeek" sizeString="110"/>
+            <button id="DataTable" label="模拟运算表" imageMso="WhatIf" screentip="单变量 / 双变量敏感性表" onAction="DataTable" sizeString="110"/>
+            <button id="ScenarioManager" label="方案管理器" imageMso="Scenario" screentip="保存/切换多套输入值" onAction="ScenarioManager" sizeString="110"/>
           </box>
         </group>
         <group id="GroupForecast" label="预测">
@@ -564,23 +564,23 @@
         </group>
         <group id="GroupOutline" label="分级显示">
           <box boxStyle="vertical">
-            <button id="GroupSelection" label="组合" imageMso="Plus" screentip="整列选区组合列，其余组合行" onAction="GroupSelection" sizeString="104"/>
-            <button id="UngroupSelection" label="取消组合" imageMso="Close" screentip="整列选区拆列，其余拆行" onAction="UngroupSelection" sizeString="104"/>
-            <button id="OutlineSettings" label="分级设置" imageMso="Grid" screentip="明细在下方/右侧、显示分级符号" onAction="OutlineSettings" sizeString="104"/>
+            <button id="GroupSelection" label="组合" imageMso="GroupRows" screentip="整列选区组合列，其余组合行" onAction="GroupSelection" sizeString="104"/>
+            <button id="UngroupSelection" label="取消组合" imageMso="UngroupRows" screentip="整列选区拆列，其余拆行" onAction="UngroupSelection" sizeString="104"/>
+            <button id="OutlineSettings" label="分级设置" imageMso="OutlineLevels" screentip="明细在下方/右侧、显示分级符号" onAction="OutlineSettings" sizeString="104"/>
           </box>
           <box boxStyle="vertical">
-            <button id="HideDetail" label="隐藏明细" imageMso="Close" onAction="HideDetail" sizeString="96"/>
-            <button id="ShowDetail" label="显示明细" imageMso="Plus" onAction="ShowDetail" sizeString="96"/>
+            <button id="HideDetail" label="隐藏明细" imageMso="HideDetail" onAction="HideDetail" sizeString="96"/>
+            <button id="ShowDetail" label="显示明细" imageMso="ShowDetail" onAction="ShowDetail" sizeString="96"/>
           </box>
         </group>
         <group id="GroupGetData" label="获取数据">
           <box boxStyle="vertical">
-            <button id="ImportCsv" label="导入 CSV/TSV" imageMso="Open" onAction="ImportCsv" sizeString="120"/>
-            <button id="ImportWorkbook" label="导入工作簿" imageMso="Open" screentip="把另一个 xlsx 的表复制进来" onAction="ImportWorkbook" sizeString="120"/>
+            <button id="ImportCsv" label="导入 CSV/TSV" imageMso="ImportCsv" onAction="ImportCsv" sizeString="120"/>
+            <button id="ImportWorkbook" label="导入工作簿" imageMso="ImportBook" screentip="把另一个 xlsx 的表复制进来" onAction="ImportWorkbook" sizeString="120"/>
             <button id="LinkSheet" label="从另一张表取数" imageMso="Link" onAction="LinkSheet" sizeString="120"/>
           </box>
           <box boxStyle="vertical">
-            <button id="TextToColumns" label="分列" imageMso="Table" onAction="TextToColumns" sizeString="120"/>
+            <button id="TextToColumns" label="分列" imageMso="SplitColumns" onAction="TextToColumns" sizeString="120"/>
             <button id="RefreshImport" label="刷新导入" imageMso="Refresh" onAction="RefreshImport" sizeString="120"/>
           </box>
         </group>
@@ -591,7 +591,7 @@
           </box>
           <box boxStyle="vertical">
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
-            <button id="MultiSort" label="排序..." imageMso="Grid" onAction="MultiSort" sizeString="100"/>
+            <button id="MultiSort" label="排序..." imageMso="SortAsc" onAction="MultiSort" sizeString="100"/>
           </box>
           <box boxStyle="vertical">
             <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="88"/>
@@ -600,13 +600,13 @@
         </group>
         <group id="GroupDataTools" label="数据工具">
           <box boxStyle="vertical">
-            <button id="RemoveDuplicates" label="删除重复项" imageMso="Table" onAction="RemoveDuplicates" sizeString="110"/>
-            <button id="CFManager" label="条件格式" imageMso="Filter" onAction="CFManager" sizeString="110"/>
-            <button id="DataValidationBtn" label="数据验证" imageMso="Grid" onAction="DataValidation" sizeString="110"/>
+            <button id="RemoveDuplicates" label="删除重复项" imageMso="RemoveDup" onAction="RemoveDuplicates" sizeString="110"/>
+            <button id="CFManager" label="条件格式" imageMso="Cf" onAction="CFManager" sizeString="110"/>
+            <button id="DataValidationBtn" label="数据验证" imageMso="Validation" onAction="DataValidation" sizeString="110"/>
           </box>
           <box boxStyle="vertical">
             <button id="FlashFill" label="快速填充" imageMso="Fx" screentip="从示例反推规则并填充" onAction="FlashFill" sizeString="104"/>
-            <button id="Consolidate" label="合并计算" imageMso="Table" screentip="按行/列标签把多张表汇总" onAction="Consolidate" sizeString="104"/>
+            <button id="Consolidate" label="合并计算" imageMso="Consolidate" screentip="按行/列标签把多张表汇总" onAction="Consolidate" sizeString="104"/>
           </box>
         </group>
         <group id="GroupDataLinks" label="链接">
