@@ -137,6 +137,28 @@ pub fn group_key(v: &Value, g: &GroupBy) -> String {
     }
 }
 
+/// 行字段的去重取值（按 spec.group 归一后的标签，与 compute 里的 key 一致）。
+/// 切片器用它列出可勾选项；exclude 里的项也照样返回（勾选状态由调用方决定）。
+pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
+    let (r1, c1, r2, _c2) = spec.source;
+    let mut out: Vec<String> = Vec::new();
+    for r in (r1 + 1)..=r2 {
+        let raw = sheet
+            .get(r, spec.row_field)
+            .map(|x| x.value.clone())
+            .unwrap_or(Value::Empty);
+        let key = group_key(&raw, &spec.group);
+        if key.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|k| *k == key) {
+            out.push(key);
+        }
+    }
+    out.sort();
+    out
+}
+
 pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let (r1, c1, r2, c2) = spec.source;
     let header = |c: u32| {
@@ -421,4 +443,40 @@ mod protection_extra_tests {
         let labels: Vec<String> = r.rows.iter().map(|row| row[0].display()).collect();
         assert_eq!(&labels[..2], &["0~50", "100~150"]);
     }
+    #[test]
+    fn row_values_lists_distinct_labels() {
+        let mut sh = Sheet::new("S");
+        for (i, (name, v)) in [("甲", 1.0), ("乙", 2.0), ("甲", 3.0), ("", 4.0)].iter().enumerate() {
+            sh.set(
+                i as u32 + 1,
+                0,
+                crate::model::Cell {
+                    value: Value::Text((*name).into()),
+                    formula: None,
+                },
+            );
+            sh.set(
+                i as u32 + 1,
+                1,
+                crate::model::Cell {
+                    value: Value::Number(*v),
+                    formula: None,
+                },
+            );
+        }
+        sh.set(0, 0, crate::model::Cell { value: Value::Text("名".into()), formula: None });
+        sh.set(0, 1, crate::model::Cell { value: Value::Text("值".into()), formula: None });
+        let spec = PivotSpec {
+            source: (0, 0, 4, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: vec!["乙".into()],
+        };
+        // 去重、排序、不含空标签；exclude 里的项也返回（切片器要显示它的勾选状态）
+        assert_eq!(row_values(&sh, &spec), vec!["乙".to_string(), "甲".to_string()]);
+    }
+
 }

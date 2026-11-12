@@ -357,6 +357,9 @@
         <group id="GroupLinks" label="链接">
           <button id="InsertWorkbookLinks" label="链接" size="large" imageMso="Link" screentip="跨工作簿引用：查看、更新缓存" onAction="WorkbookLinks"/>
         </group>
+        <group id="GroupFilters" label="筛选器">
+          <button id="InsertSlicer" label="切片器" size="large" imageMso="Filter" screentip="给当前透视表加一个可勾选的切片器" onAction="InsertSlicer"/>
+        </group>
         <group id="GroupSparklines" label="迷你图">
           <button id="SparkLine" label="折线" size="large" imageMso="SparkLine" screentip="在单元格里放一张一排数据的折线（迷你图）" onAction="SparkLine"/>
           <button id="SparkColumn" label="柱形" size="large" imageMso="SparkColumn" screentip="在单元格里放一张一排数据的柱形（迷你图）" onAction="SparkColumn"/>

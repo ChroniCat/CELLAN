@@ -219,6 +219,7 @@ impl SheetApp {
             "SparkAxis" => st.checked = self.spark_at_sel().map(|s| s.axis).unwrap_or(false),
             // 没有选中文本框时，编辑/删除不可用（和 Excel 一样）
             "EditTextBox" | "DeleteTextBox" => st.enabled = self.tb_sel.is_some(),
+            "InsertSlicer" => st.enabled = self.pivot_last.is_some(),
             "TableName" => {
                 if let Some(t) = self.table_at_sel() {
                     st.text = Some(format!("表名：{}", t.display));
@@ -633,6 +634,7 @@ impl SheetApp {
                 }
             }
             "WorkbookLinks" => self.xlink_dlg = true,
+            "InsertSlicer" => self.slicer_open(),
 
             // ---------------------------------------------------- 页面布局
             "PageOrientation" => self.set_page(|p| p.landscape = !p.landscape),

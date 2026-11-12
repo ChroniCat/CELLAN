@@ -347,6 +347,17 @@ struct ProtectDlg {
 }
 
 /// 图表拖动/缩放的状态
+/// 切片器面板：绑在当前透视表上，勾选状态直接映射到 PivotSpec.exclude
+#[derive(Clone)]
+struct SlicerUI {
+    pos: egui::Pos2,
+    sheet: usize,
+    /// 行字段名（面板标题）
+    field: String,
+    /// 取值 + 是否显示
+    items: Vec<(String, bool)>,
+}
+
 /// 文本框拖动/缩放：记下按下时的矩形与动作前的模型（松手时进撤销栈）
 #[derive(Clone)]
 struct TbDrag {
@@ -442,6 +453,8 @@ struct SheetApp {
     tb_insert: bool,
     /// 文本框编辑对话框：(下标, 草稿)
     tb_dlg: Option<(usize, sheetcore::textbox::TextBox)>,
+    /// 切片器面板
+    slicer: Option<SlicerUI>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
     /// 批注编辑：(行, 列, 文本)
@@ -864,6 +877,7 @@ impl SheetApp {
             tb_drag: None,
             tb_insert: false,
             tb_dlg: None,
+            slicer: None,
             dv_open: None,
             note_edit: None,
             link_dlg: None,
@@ -1557,6 +1571,61 @@ impl SheetApp {
                                 });
                                 eprintln!("[tb] 改位置 {spec}");
                             }
+                        }
+                    }
+                    // 无界面验收：SC_PIVOT="源区域" 直接生成透视表；SC_SLICER=1 再开切片器
+                    if let Ok(spec) = std::env::var("SC_PIVOT") {
+                        let rect = SheetApp::parse_rect(&spec).or_else(|| {
+                            let (r, c) = self.sel;
+                            Some((r, c, r + 20, c + 12))
+                        });
+                        if let Some(src) = rect {
+                            let p = sheetcore::pivot::PivotSpec {
+                                source: src,
+                                row_field: src.1,
+                                col_field: None,
+                                value_field: src.3,
+                                agg: sheetcore::pivot::Agg::Sum,
+                                group: sheetcore::pivot::GroupBy::None,
+                                exclude: Vec::new(),
+                            };
+                            let at = (src.2 + 2, src.1);
+                            self.sel = at;
+                            self.generate_pivot(&p);
+                            eprintln!(
+                                "[pivot] 生成 rect={:?} 规格={:?}",
+                                self.pivot_last.as_ref().map(|x| x.2),
+                                self.pivot_last.is_some()
+                            );
+                        }
+                    }
+                    if std::env::var("SC_SLICER").is_ok() {
+                        self.slicer_open();
+                        eprintln!(
+                            "[slicer] 面板={} 项={:?}",
+                            self.slicer.is_some(),
+                            self.slicer
+                                .as_ref()
+                                .map(|s| (s.field.clone(), s.items.len()))
+                        );
+                        // SC_SLICER_OFF=\"甲,乙\" 模拟取消勾选后应用
+                        if let Ok(off) = std::env::var("SC_SLICER_OFF") {
+                            if let Some(s) = self.slicer.as_mut() {
+                                for name in off.split(',') {
+                                    let name = name.trim();
+                                    for (v, on) in s.items.iter_mut() {
+                                        if v == name {
+                                            *on = false;
+                                        }
+                                    }
+                                }
+                            }
+                            self.slicer_apply();
+                            eprintln!(
+                                "[slicer] 筛掉 {:?}，透视表规格 exclude={:?}",
+                                off,
+                                self.pivot_last.as_ref().map(|x| x.1.exclude.clone())
+                            );
                         }
                     }
                     // 无界面验收：SC_OPEN_DIALOG=format/revision/xlink 直接开对话框截图
@@ -9065,6 +9134,169 @@ impl SheetApp {
         }
         self.status = format!("已创建 {made} 条迷你图");
         Ok(made)
+    }
+
+    // ---------------------------------------------------------------- 切片器
+
+    /// 插入切片器：绑到当前透视表的行字段，列出可勾选的取值
+    fn slicer_open(&mut self) {
+        let Some((si, spec, _)) = self.pivot_last.clone() else {
+            self.status = "先插入一个数据透视表，切片器才有可筛选的字段".into();
+            return;
+        };
+        let field = self
+            .wb
+            .sheet(si)
+            .get(spec.source.0, spec.row_field)
+            .map(|c| c.value.display())
+            .unwrap_or_else(|| "行字段".into());
+        let vals = sheetcore::pivot::row_values(self.wb.sheet(si), &spec);
+        if vals.is_empty() {
+            self.status = "这个透视表的行字段没有可筛选的取值".into();
+            return;
+        }
+        let items = vals
+            .into_iter()
+            .map(|v| {
+                let on = !spec.exclude.iter().any(|e| e == &v);
+                (v, on)
+            })
+            .collect();
+        self.slicer = Some(SlicerUI {
+            pos: egui::pos2(340.0, 320.0),
+            sheet: si,
+            field,
+            items,
+        });
+        self.status = "切片器：取消勾选即可筛掉该值".into();
+    }
+
+    /// 把切片器勾选状态写回透视表规格并重算
+    fn slicer_apply(&mut self) {
+        let Some(s) = self.slicer.clone() else { return };
+        let Some((si, mut spec, _)) = self.pivot_last.clone() else {
+            return;
+        };
+        if si != s.sheet {
+            return;
+        }
+        spec.exclude = s
+            .items
+            .iter()
+            .filter(|(_, on)| !*on)
+            .map(|(v, _)| v.clone())
+            .collect();
+        self.pivot_last = Some((si, spec, self.pivot_last.as_ref().unwrap().2));
+        self.refresh_pivot();
+        let hidden = self
+            .slicer
+            .as_ref()
+            .map(|s| s.items.iter().filter(|(_, on)| !*on).count())
+            .unwrap_or(0);
+        self.status = format!("切片器：筛掉 {hidden} 个取值");
+    }
+
+    /// 切片器面板（浮在表上，可拖动标题栏）
+    fn slicer_window(&mut self, ctx: &egui::Context) {
+        let Some(mut s) = self.slicer.clone() else {
+            return;
+        };
+        let mut close = false;
+        let mut changed = false;
+        let mut cleared = false;
+        let id = egui::Id::new("slicer_panel");
+        let mut pos = ctx
+            .data(|d| d.get_temp::<egui::Pos2>(id.with("pos")))
+            .unwrap_or(s.pos);
+        let area = egui::Area::new(id.with("area"))
+            .order(egui::Order::Middle)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::window(&ctx.style())
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, ui_kit::BORDER))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(0))
+                    .show(ui, |ui| {
+                        ui.set_width(210.0);
+                        let (trect, tresp) = ui.allocate_exact_size(
+                            egui::vec2(210.0, 26.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        ui.painter()
+                            .rect_filled(trect, 0.0, Color32::from_rgb(243, 242, 241));
+                        ui.painter().text(
+                            egui::pos2(trect.left() + 8.0, trect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("切片器：{}", s.field),
+                            FontId::proportional(12.0),
+                            ui_kit::TEXT,
+                        );
+                        let crect = Rect::from_min_size(
+                            egui::pos2(trect.right() - 22.0, trect.top() + 4.0),
+                            egui::vec2(18.0, 18.0),
+                        );
+                        let cresp = ui.interact(crect, id.with("close"), egui::Sense::click());
+                        let k = 4.0;
+                        let st = Stroke::new(1.1, ui_kit::TEXT);
+                        ui.painter().line_segment(
+                            [crect.center() + egui::vec2(-k, -k), crect.center() + egui::vec2(k, k)],
+                            st,
+                        );
+                        ui.painter().line_segment(
+                            [crect.center() + egui::vec2(k, -k), crect.center() + egui::vec2(-k, k)],
+                            st,
+                        );
+                        if cresp.clicked() {
+                            close = true;
+                        }
+                        if tresp.dragged() {
+                            pos += tresp.drag_delta();
+                        }
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        for (v, on) in s.items.iter_mut() {
+                                            if ui.checkbox(on, v.as_str()).changed() {
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui_kit::secondary_button(ui, "清除筛选").clicked() {
+                                        cleared = true;
+                                    }
+                                    if ui_kit::primary_button(ui, "应用").clicked() {
+                                        changed = true;
+                                    }
+                                });
+                            });
+                    });
+            });
+        let _ = area;
+        ctx.data_mut(|d| d.insert_temp(id.with("pos"), pos));
+        s.pos = pos;
+        self.slicer = Some(s);
+        if cleared {
+            if let Some(sl) = self.slicer.as_mut() {
+                for (_, on) in sl.items.iter_mut() {
+                    *on = true;
+                }
+            }
+            self.slicer_apply();
+            return;
+        }
+        if changed {
+            self.slicer_apply();
+        }
+        if close {
+            self.slicer = None;
+            self.status = "已关闭切片器（透视表保留当前筛选）".into();
+        }
     }
 
     // ---------------------------------------------------------------- 文本框
@@ -18685,6 +18917,7 @@ impl eframe::App for SheetApp {
         self.header_footer_dialog(ctx);
         self.spark_dialog(ctx);
         self.tb_dialog(ctx);
+        self.slicer_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
