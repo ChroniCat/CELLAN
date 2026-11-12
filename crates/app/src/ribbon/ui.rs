@@ -1196,6 +1196,7 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "SparkLine" => Icon::SparkLine,
         "SparkColumn" => Icon::SparkColumn,
         "SparkLoss" => Icon::SparkLoss,
+        "TextBox" => Icon::TextBox,
         _ => return None,
     })
 }

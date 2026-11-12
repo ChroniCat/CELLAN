@@ -136,6 +136,83 @@ fn locked_cell_is_marked() {
     assert!(has_cell(&dump, 1, 1, "研发"), "内容没画出来");
 }
 
+#[test]
+fn textbox_renders_and_moves() {
+    let src = Path::new("F:/Finance/work/table.xlsx");
+    if !src.exists() {
+        eprintln!("跳过：缺少 {}", src.display());
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ui_tb_{}.xlsx", std::process::id()));
+    std::fs::copy(src, &tmp).unwrap();
+    let Some(dump) = dump_for(
+        &tmp.to_string_lossy(),
+        &[
+            ("SC_TEXTBOX", "120,80,220,70"),
+            ("SC_TB_TEXT", "文本框内容"),
+            ("SC_TB_SEL", "0"),
+            ("SC_TB_RECT", "160,40,180,50"),
+        ],
+        Duration::from_secs(30),
+    ) else {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    };
+    let lines: Vec<&str> = dump.lines().filter(|l| l.starts_with("textbox ")).collect();
+    assert_eq!(lines.len(), 1, "文本框没画出来：\n{dump}");
+    assert!(lines[0].contains("文字=\"文本框内容\""), "文字：{}", lines[0]);
+    // SC_TB_RECT 之后尺寸要变成 180×50（dump 里是屏幕坐标，含表格原点偏移）
+    let nums: Vec<f32> = lines[0]
+        .split("rect=(")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    assert_eq!(nums.len(), 4, "rect 解析失败：{}", lines[0]);
+    assert!((nums[2] - 180.0).abs() < 1.5, "宽没跟模型走：{}", lines[0]);
+    assert!((nums[3] - 50.0).abs() < 1.5, "高没跟模型走：{}", lines[0]);
+    assert!(nums[0] > 160.0, "x 应该右移：{}", lines[0]);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn textbox_drag_moves_model() {
+    let src = Path::new("F:/Finance/work/table.xlsx");
+    if !src.exists() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ui_tbdrag_{}.xlsx", std::process::id()));
+    std::fs::copy(src, &tmp).unwrap();
+    let Some(dump) = dump_for(
+        &tmp.to_string_lossy(),
+        &[
+            ("SC_TEXTBOX", "120,80,220,70"),
+            ("SC_TB_TEXT", "拖我"),
+            ("SC_TB_SEL", "0"),
+            ("SC_TB_DRAG", "60,40"),
+        ],
+        Duration::from_secs(30),
+    ) else {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    };
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with("textbox (0)"))
+        .unwrap_or_else(|| panic!("文本框没画出来：\n{dump}"));
+    let nums: Vec<f32> = line
+        .split("rect=(")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    // 拖动 (60,40)：模型从 (120,80) 到 (180,120)，屏幕坐标再加表格原点
+    assert!(nums[0] >= 205.0 && nums[0] <= 215.0, "x 没动到位：{line}");
+    assert!(nums[1] >= 360.0 && nums[1] <= 370.0, "y 没动到位：{line}");
+    assert!((nums[2] - 220.0).abs() < 1.5 && (nums[3] - 70.0).abs() < 1.5, "尺寸不该变：{line}");
+    let _ = std::fs::remove_file(&tmp);
+}
+
 // ---------------------------------------------------------------- 迷你图
 
 /// 仓库里 Excel 365 造的迷你图样本（三种类型 + 双迷你图组）

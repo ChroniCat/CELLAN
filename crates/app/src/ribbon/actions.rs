@@ -217,6 +217,8 @@ impl SheetApp {
                 st.checked = self.spark_at_sel().map(|s| s.negative).unwrap_or(false)
             }
             "SparkAxis" => st.checked = self.spark_at_sel().map(|s| s.axis).unwrap_or(false),
+            // 没有选中文本框时，编辑/删除不可用（和 Excel 一样）
+            "EditTextBox" | "DeleteTextBox" => st.enabled = self.tb_sel.is_some(),
             "TableName" => {
                 if let Some(t) = self.table_at_sel() {
                     st.text = Some(format!("表名：{}", t.display));
@@ -707,6 +709,30 @@ impl SheetApp {
                 self.status = "已重新应用筛选".into();
             }
             "HeaderFooter" => self.hf_dlg = true,
+            // ---------------------------------------------------- 文本框
+            "InsertTextBox" => {
+                // 放在当前选区左上角，默认 200×60，插完直接打开编辑框
+                let (r, c) = self.sel;
+                let (cols, rows) = self.view_axes();
+                let x = cols.pos(c) + 4.0;
+                let y = rows.pos(r) + 2.0;
+                self.tb_create(x, y, 200.0, 60.0);
+                if let Some(i) = self.tb_sel {
+                    self.tb_open_edit(i);
+                }
+            }
+            "DrawTextBox" => {
+                self.tb_insert = true;
+                self.status = "绘制文本框：在表格上拖出一个框（单击则用默认大小）".into();
+            }
+            "EditTextBox" => match self.tb_sel {
+                Some(i) => self.tb_open_edit(i),
+                None => self.status = "先选中一个文本框".into(),
+            },
+            "DeleteTextBox" => match self.tb_sel {
+                Some(i) => self.tb_delete(i),
+                None => self.status = "先选中一个文本框".into(),
+            },
             // ---------------------------------------------------- 迷你图
             "SparkLine" => self.spark_open_create(sheetcore::sparkline::SparkKind::Line),
             "SparkColumn" => self.spark_open_create(sheetcore::sparkline::SparkKind::Column),

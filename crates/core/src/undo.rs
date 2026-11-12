@@ -51,6 +51,14 @@ pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
     sheet.merges_dirty = true;
 }
 
+/// 形状（文本框）改动的前后快照：文本框不在格子模型里，靠整组前后状态回退
+#[derive(Clone, Debug)]
+pub struct ShapeEdit {
+    pub sheet: usize,
+    pub before: Vec<crate::textbox::TextBox>,
+    pub after: Vec<crate::textbox::TextBox>,
+}
+
 /// 一个可撤销的动作
 #[derive(Clone, Debug)]
 pub struct Action {
@@ -63,20 +71,25 @@ pub struct Action {
     pub snap_after: Option<SheetSnapshot>,
     /// 这个动作是谁做的（协作站点号）；0 表示单人/未知
     pub by_site: u32,
+    /// 形状（文本框）改动；None = 普通格子动作
+    pub shapes: Option<ShapeEdit>,
 }
 
 impl Action {
     pub fn len(&self) -> usize {
-        self.deltas.len().max(
-            self.snap_before
-                .as_ref()
-                .map(|s| s.cells.len())
-                .unwrap_or(0),
-        )
+        self.deltas
+            .len()
+            .max(
+                self.snap_before
+                    .as_ref()
+                    .map(|s| s.cells.len())
+                    .unwrap_or(0),
+            )
+            .max(if self.shapes.is_some() { 1 } else { 0 })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.deltas.is_empty() && self.snap_before.is_none()
+        self.deltas.is_empty() && self.snap_before.is_none() && self.shapes.is_none()
     }
 }
 
@@ -394,6 +407,21 @@ impl UndoStack {
         let Entry::Cells(action) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
+        if let Some(sh) = action.shapes.clone() {
+            if let Some(sheet) = sheets.get_mut(sh.sheet) {
+                sheet.textboxes = sh.before;
+                sheet.textboxes_dirty = true;
+            }
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+            };
+            self.undone.push(Entry::Cells(action));
+            return Some(applied);
+        }
         if let Some(snap) = action.snap_before.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
                 restore_sheet(sheet, &snap);
@@ -452,6 +480,21 @@ impl UndoStack {
         let Entry::Cells(action) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
+        if let Some(sh) = action.shapes.clone() {
+            if let Some(sheet) = sheets.get_mut(sh.sheet) {
+                sheet.textboxes = sh.after;
+                sheet.textboxes_dirty = true;
+            }
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+            };
+            self.done.push(Entry::Cells(action));
+            return Some(applied);
+        }
         if let Some(snap) = action.snap_after.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
                 restore_sheet(sheet, &snap);
@@ -540,6 +583,7 @@ mod tests {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            shapes: None,
             deltas: vec![CellDelta {
                 sheet: 0,
                 row: r,

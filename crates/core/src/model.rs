@@ -196,6 +196,10 @@ pub struct Sheet {
     pub sparklines: Vec<crate::sparkline::Sparkline>,
     /// 迷你图被改过：保存时要重写工作表 extLst
     pub sparklines_dirty: bool,
+    /// 文本框（drawing 里的 xdr:sp）
+    pub textboxes: Vec<crate::textbox::TextBox>,
+    /// 文本框被改过：保存时重写 drawing 部件
+    pub textboxes_dirty: bool,
 }
 
 impl Sheet {
@@ -258,6 +262,8 @@ impl Sheet {
             hyperlinks_dirty: false,
             sparklines: Vec::new(),
             sparklines_dirty: false,
+            textboxes: Vec::new(),
+            textboxes_dirty: false,
         }
     }
 

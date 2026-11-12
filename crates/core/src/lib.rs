@@ -31,6 +31,7 @@ pub mod cells;
 pub mod crypto;
 pub mod hyperlinks;
 pub mod sparkline;
+pub mod textbox;
 pub mod richtext;
 pub mod pivot;
 pub mod refs;

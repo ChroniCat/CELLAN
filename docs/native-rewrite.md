@@ -2665,3 +2665,48 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
   视觉复核 F1 红折线、F2 蓝柱形（有正负）、F3 上半蓝下半红的盈亏。
 - 插入页签「迷你图」组三个按钮与图标、选中 F1 后出现的「迷你图」上下文页签，均截图确认。
 - 测试数：sheetcore 单测 +6（迷你图），`app` 单测 86、UI 回归 14（新增 `sparklines_render_in_cells`、`sparkline_create_from_selection`）。
+
+### 第三十五轮：文本框（浮动对象 / 拖动缩放 / drawing 往返）（2026-11-12）
+
+**模型与文件**
+
+- `crates/core/src/textbox.rs`：`TextBox { id, name, from/to 锚点(列+EMU偏移), 文字, 字号, 粗斜体, 字色, 填充, 边框, 对齐, 换行 }`。
+  位置照 Excel 的 `xdr:twoCellAnchor` 原样存（col/colOff/row/rowOff），渲染时用 `Axis` 换算成像素，
+  拖动后 `set_rect_px()` 再反推锚点——所以「我们存 → Excel 打开 → 再改」不会因为只记整格而漂移。
+- 读：`<drawing r:id>` → 工作表 rels → drawing 部件 → 逐 anchor 取 `<xdr:sp>`（排除 `xdr:pic`/`graphicFrame`），
+  文字拼 `<a:t>`、字号取 `rPr@sz`、颜色/填充/边框取 `solidFill`、对齐取 `pPr@algn`。
+- 写：`rewrite_drawing()` 只替换形状锚点，图片与图表锚点原样保留；没有 drawing 部件时新建
+  `xl/drawings/drawingN.xml` + rels + `[Content_Types]` Override + 工作表 `<drawing r:id>`（schema 顺序在
+  legacyDrawing/tableParts/extLst 之前）。同一个表第二次保存复用原部件，不会越存越多。
+
+**界面**
+
+- 插入页「文本」组：大按钮「文本框」、小按钮「绘制横排文本框 / 编辑文本框 / 删除文本框」+ 页眉和页脚。
+  没有选中文本框时编辑/删除置灰（`ctl_state` 给 enabled）。
+- 「文本框」：在当前单元格左上角放一个 200×60 的框并直接打开设置对话框。
+- 「绘制横排文本框」：进入十字光标模式，在表上拖出大小；单击则用默认 180×60。
+- 框体：拖动移动、八个手柄缩放（沿用图表那套 `chart_handle_at`）、双击进编辑、选中后 Delete 删除。
+- 设置对话框：多行文字、字号、粗体/斜体/自动换行、左中右对齐、填充与边框各 6 色 + 「无」、删除按钮。
+- 撤销：`undo::Action` 增加 `shapes: Option<ShapeEdit>`（整组前后快照）。移动/缩放/改属性/新建/删除
+  全部进撤销栈，`undo/redo` 遇到形状动作直接换回整组。
+
+**踩到的坑**
+
+- `additions` 只用于**新增**部件：已有部件必须走改写闭包。第一版把「工作表 rels 里加 drawing 关系」也塞进 additions，
+  结果 rels 没被写出来、工作表挂着一个悬空 `r:id`，第二次保存还会新建 `drawing2.xml`。
+  现在已有部件走闭包、新部件走 additions，两条路分开。
+- 工作簿默认列宽和 Excel 不完全一致（我们 72px、Excel 默认 64px），同一锚点在两边的**绝对**位置会差几个像素；
+  锚点语义（第几列 + 偏移）是对的。等做「表格区逐项对照」统一默认列宽后再核绝对坐标。
+
+**验收（实测）**
+
+- core 测试：`textbox.rs` 单测 4 条（图片锚点保留、读写往返、schema 顺序、像素↔锚点往返）+
+  `tests/textbox.rs` 5 条（新建/改写复用/删空/列宽/撤销）。
+- Excel COM：我们写出的文件 `Shapes.Count=2`，`Type=17`（文本框），文字「第一个文本框\n第二行」逐字一致；
+  应用里 SC_TEXTBOX 建的框另存后 Excel 也读得到（`TextBox 1`、文字一致）。
+- 应用内：`SC_DUMP` 打出 `textbox (0) rect=(...) 文字="..."`；像素扫描确认 (127,127,127) 边框 380 像素；
+  截图确认对话框字段、以及「文本」组按钮与置灰状态。
+- 真实拖动路径：`SC_TB_DRAG="60,40"` 调的是 UI 同一套 `tb_drag_begin/update/end`，
+  模型从 (120,80) 移到 (180,120)，dump 屏幕坐标 (209,364) = 表格原点 (29,244) + 模型坐标。
+- 测试数：sheetcore 单测 219、集成新增 5；app 单测 86、UI 回归 16（新增 2 条文本框用例）。
+

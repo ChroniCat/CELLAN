@@ -347,6 +347,17 @@ struct ProtectDlg {
 }
 
 /// 图表拖动/缩放的状态
+/// 文本框拖动/缩放：记下按下时的矩形与动作前的模型（松手时进撤销栈）
+#[derive(Clone)]
+struct TbDrag {
+    idx: usize,
+    /// 0 = 移动，1..8 = 八个手柄（顺序同 chart_handle_at）
+    mode: u8,
+    start: egui::Pos2,
+    rect: (f32, f32, f32, f32),
+    before: Vec<sheetcore::textbox::TextBox>,
+}
+
 #[derive(Clone, Copy)]
 struct ChartDrag {
     idx: usize,
@@ -423,6 +434,14 @@ struct SheetApp {
     dv_edit: Option<sheetcore::dv::DataValidation>,
     /// 迷你图对话框
     spark_dlg: Option<SparkDlg>,
+    /// 选中的文本框（下标）
+    tb_sel: Option<usize>,
+    /// 文本框拖动状态
+    tb_drag: Option<TbDrag>,
+    /// 「绘制文本框」模式：下一次在表格上拖动就画一个
+    tb_insert: bool,
+    /// 文本框编辑对话框：(下标, 草稿)
+    tb_dlg: Option<(usize, sheetcore::textbox::TextBox)>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
     /// 批注编辑：(行, 列, 文本)
@@ -841,6 +860,10 @@ impl SheetApp {
             cf_v2: "0".into(),
             dv_edit: None,
             spark_dlg: None,
+            tb_sel: None,
+            tb_drag: None,
+            tb_insert: false,
+            tb_dlg: None,
             dv_open: None,
             note_edit: None,
             link_dlg: None,
@@ -1469,6 +1492,73 @@ impl SheetApp {
                         }
                         self.spark_dlg = None;
                     }
+                    // 无界面验收：SC_TEXTBOX="x,y,w,h" 在表格原点放一个文本框（文字取 SC_TB_TEXT）
+                    if let Ok(spec) = std::env::var("SC_TEXTBOX") {
+                        let v: Vec<f32> = spec
+                            .split(',')
+                            .filter_map(|x| x.trim().parse::<f32>().ok())
+                            .collect();
+                        if v.len() == 4 {
+                            self.tb_create(v[0], v[1], v[2], v[3]);
+                            let idx = self.tb_sel.unwrap_or(0);
+                            if let Ok(t) = std::env::var("SC_TB_TEXT") {
+                                let mut tb = self.wb.sheet(self.sheet_idx).textboxes[idx].clone();
+                                tb.text = t;
+                                self.tb_commit(idx, tb);
+                            }
+                            eprintln!(
+                                "[tb] 新建 idx={idx} 共 {} 个，rect={:?}",
+                                self.wb.sheet(self.sheet_idx).textboxes.len(),
+                                self.wb.sheet(self.sheet_idx).textboxes[idx].rect_px(
+                                    &sheetcore::layout::Axis::new(sheetcore::layout::DEFAULT_COL_W),
+                                    &sheetcore::layout::Axis::new(sheetcore::layout::DEFAULT_ROW_H)
+                                )
+                            );
+                        }
+                    }
+                    if let Ok(v) = std::env::var("SC_TB_SEL") {
+                        if let Ok(i) = v.parse::<usize>() {
+                            self.tb_sel = Some(i);
+                            eprintln!("[tb] 选中 {i}");
+                        }
+                    }
+                    // 无界面验收：SC_TB_RECT="x,y,w,h" 改选中文本框的位置（走 set_rect_px）
+                    if let Ok(spec) = std::env::var("SC_TB_RECT") {
+                        let v: Vec<f32> = spec
+                            .split(',')
+                            .filter_map(|x| x.trim().parse::<f32>().ok())
+                            .collect();
+                        if v.len() == 4 {
+                            if let Some(i) = self.tb_sel {
+                                let before = self.wb.sheet(self.sheet_idx).textboxes.clone();
+                                let (cols, rows) = self.view_axes();
+                                {
+                                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                                    if let Some(tb) = sh.textboxes.get_mut(i) {
+                                        tb.set_rect_px(&cols, &rows, v[0], v[1], v[2], v[3]);
+                                        sh.textboxes_dirty = true;
+                                    }
+                                }
+                                let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
+                                self.wb.dirty = true;
+                                self.doc_gen = self.doc_gen.wrapping_add(1);
+                                self.undo.push(sheetcore::undo::Action {
+                                    label: "移动文本框".into(),
+                                    deltas: Vec::new(),
+                                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                                    snap_before: None,
+                                    snap_after: None,
+                                    by_site: 0,
+                                    shapes: Some(sheetcore::undo::ShapeEdit {
+                                        sheet: self.sheet_idx,
+                                        before,
+                                        after,
+                                    }),
+                                });
+                                eprintln!("[tb] 改位置 {spec}");
+                            }
+                        }
+                    }
                     // 无界面验收：SC_OPEN_DIALOG=format/revision/xlink 直接开对话框截图
                     match std::env::var("SC_OPEN_DIALOG").as_deref() {
                         Ok("format") => self.open_format_dialog(),
@@ -1485,6 +1575,13 @@ impl SheetApp {
                             sheetcore::sparkline::SparkKind::Line,
                         ),
                         Ok("sparkedit") => self.spark_open_edit(),
+                        Ok("textbox") => {
+                            if self.tb_sel.is_none() {
+                                self.tb_sel = Some(0);
+                            }
+                            let i = self.tb_sel.unwrap_or(0);
+                            self.tb_open_edit(i);
+                        }
                         Ok("symbol") => self.symbol_dlg = true,
                         Ok("errors") => {
                             if std::env::var("SC_ECOPTS").is_ok() {
@@ -2701,6 +2798,7 @@ impl SheetApp {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            shapes: None,
             deltas: vec![sheetcore::undo::CellDelta {
                 sheet: self.sheet_idx,
                 row: r,
@@ -2856,6 +2954,7 @@ impl SheetApp {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            shapes: None,
         });
     }
 
@@ -3097,6 +3196,7 @@ impl SheetApp {
         self.undo.push(sheetcore::undo::Action {
             label: label.into(), deltas, focus: (si, r, c),
             snap_before: None, snap_after: None, by_site: 0,
+            shapes: None,
         });
         if cut_src.is_some() {
             self.clip = None;
@@ -5178,6 +5278,16 @@ impl SheetApp {
                 self.release_lock();
             }
             return;
+        }
+
+        // 选中文本框时 Delete/Backspace 删掉它（Excel 同款）
+        if self.editing.is_none() && !ctx.wants_keyboard_input() {
+            if let Some(i) = self.tb_sel {
+                if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                    self.tb_delete(i);
+                    return;
+                }
+            }
         }
 
         // Alt：显示页签字母提示（KeyTips），再按字母切换页签
@@ -8955,6 +9065,381 @@ impl SheetApp {
         }
         self.status = format!("已创建 {made} 条迷你图");
         Ok(made)
+    }
+
+    // ---------------------------------------------------------------- 文本框
+
+    /// 本表文本框的屏幕矩形（相对表格原点；调用方自己加 gx(0)/gy(0)）
+    fn tb_rect_px(&self, tb: &sheetcore::textbox::TextBox) -> (f32, f32, f32, f32) {
+        let (cols, rows) = self.view_axes();
+        tb.rect_px(&cols, &rows)
+    }
+
+    /// 新建文本框（像素矩形，相对表格原点）：写模型 + 记撤销 + 打开编辑框
+    fn tb_create(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let (cols, rows) = self.view_axes();
+        let before = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        let mut tb = sheetcore::textbox::TextBox {
+            text: String::new(),
+            ..Default::default()
+        };
+        let max_id = before.iter().map(|t| t.id).max().unwrap_or(1);
+        tb.id = max_id + 1;
+        tb.name = format!("文本框 {}", before.len() + 1);
+        tb.set_rect_px(&cols, &rows, x.max(0.0), y.max(0.0), w.max(60.0), h.max(24.0));
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        sh.textboxes.push(tb);
+        sh.textboxes_dirty = true;
+        let idx = sh.textboxes.len() - 1;
+        let after = sh.textboxes.clone();
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.undo.push(sheetcore::undo::Action {
+            label: "插入文本框".into(),
+            deltas: Vec::new(),
+            focus: (self.sheet_idx, self.sel.0, self.sel.1),
+            snap_before: None,
+            snap_after: None,
+            by_site: 0,
+            shapes: Some(sheetcore::undo::ShapeEdit {
+                sheet: self.sheet_idx,
+                before,
+                after,
+            }),
+        });
+        self.tb_sel = Some(idx);
+        self.status = "已插入文本框：在对话框里填文字".into();
+    }
+
+    /// 选中的文本框进编辑对话框
+    fn tb_open_edit(&mut self, idx: usize) {
+        if let Some(tb) = self.wb.sheet(self.sheet_idx).textboxes.get(idx).cloned() {
+            self.tb_dlg = Some((idx, tb));
+        }
+    }
+
+    /// 对话框「确定」：整组前后进撤销栈
+    fn tb_commit(&mut self, idx: usize, draft: sheetcore::textbox::TextBox) {
+        let before = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        let mut changed = false;
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            if let Some(tb) = sh.textboxes.get_mut(idx) {
+                if *tb != draft {
+                    *tb = draft;
+                    changed = true;
+                }
+                sh.textboxes_dirty |= changed;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.undo.push(sheetcore::undo::Action {
+            label: "修改文本框".into(),
+            deltas: Vec::new(),
+            focus: (self.sheet_idx, self.sel.0, self.sel.1),
+            snap_before: None,
+            snap_after: None,
+            by_site: 0,
+            shapes: Some(sheetcore::undo::ShapeEdit {
+                sheet: self.sheet_idx,
+                before,
+                after,
+            }),
+        });
+        self.status = "文本框已更新".into();
+    }
+
+    /// 文本框拖动开始：手柄优先（缩放），其次点在框里（移动），绘制模式从起点画新框。
+    /// 坐标是表格坐标（像素，相对表格原点）。
+    fn tb_drag_begin(
+        &mut self,
+        pos: egui::Pos2,
+        rects: &[(usize, (f32, f32, f32, f32))],
+        tbs: &[sheetcore::textbox::TextBox],
+    ) -> Option<TbDrag> {
+        // 1) 已选中文本框的手柄
+        if let Some(i) = self.tb_sel {
+            if let Some((_, (x, y, w, h))) = rects.iter().find(|(k, _)| *k == i) {
+                let r = Rect::from_min_size(egui::pos2(*x, *y), Vec2::new(*w, *h));
+                if let Some(mode) = chart_handle_at(r, pos) {
+                    return Some(TbDrag {
+                        idx: i,
+                        mode,
+                        start: pos,
+                        rect: (*x, *y, x + w, y + h),
+                        before: tbs.to_vec(),
+                    });
+                }
+            }
+        }
+        // 2) 绘制模式
+        if self.tb_insert {
+            return Some(TbDrag {
+                idx: usize::MAX,
+                mode: 1,
+                start: pos,
+                rect: (pos.x, pos.y, pos.x + 40.0, pos.y + 20.0),
+                before: tbs.to_vec(),
+            });
+        }
+        // 3) 点在框里：选中并整体移动
+        for (i, (x, y, w, h)) in rects.iter().rev() {
+            let r = Rect::from_min_size(egui::pos2(*x, *y), Vec2::new(*w, *h));
+            if r.contains(pos) {
+                self.tb_sel = Some(*i);
+                return Some(TbDrag {
+                    idx: *i,
+                    mode: 0,
+                    start: pos,
+                    rect: (*x, *y, x + w, y + h),
+                    before: tbs.to_vec(),
+                });
+            }
+        }
+        None
+    }
+
+    /// 拖动中：按手柄方向改矩形，写回模型（松手才进撤销栈）
+    fn tb_drag_update(&mut self, d: &TbDrag, pos: egui::Pos2) {
+        let dx = pos.x - d.start.x;
+        let dy = pos.y - d.start.y;
+        let (mut x0, mut y0, mut x1, mut y1) = d.rect;
+        match d.mode {
+            0 => {
+                x0 += dx;
+                x1 += dx;
+                y0 += dy;
+                y1 += dy;
+            }
+            1 => {
+                x0 += dx;
+                y0 += dy;
+            }
+            2 => y0 += dy,
+            3 => {
+                x1 += dx;
+                y0 += dy;
+            }
+            4 => x1 += dx,
+            5 => {
+                x1 += dx;
+                y1 += dy;
+            }
+            6 => y1 += dy,
+            7 => {
+                x0 += dx;
+                y1 += dy;
+            }
+            _ => x0 += dx,
+        }
+        if x1 - x0 < 24.0 || y1 - y0 < 16.0 {
+            return;
+        }
+        let (cols, rows) = self.view_axes();
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        if d.idx == usize::MAX {
+            let mut tb = sheetcore::textbox::TextBox {
+                name: format!("文本框 {}", sh.textboxes.len() + 1),
+                id: sh.textboxes.iter().map(|t| t.id).max().unwrap_or(1) + 1,
+                ..Default::default()
+            };
+            tb.set_rect_px(&cols, &rows, x0, y0, x1 - x0, y1 - y0);
+            sh.textboxes.push(tb);
+            sh.textboxes_dirty = true;
+            self.tb_sel = Some(sh.textboxes.len() - 1);
+        } else if let Some(tb) = sh.textboxes.get_mut(d.idx) {
+            tb.set_rect_px(&cols, &rows, x0, y0, x1 - x0, y1 - y0);
+            sh.textboxes_dirty = true;
+        }
+    }
+
+    /// 松手：变化进撤销栈；绘制模式结束后直接打开编辑框
+    fn tb_drag_end(&mut self, mut d: TbDrag) {
+        if d.idx == usize::MAX {
+            // 绘制模式：拖出来的就是最后一个
+            if let Some(last) = self.wb.sheet(self.sheet_idx).textboxes.len().checked_sub(1) {
+                d.idx = last;
+                self.tb_sel = Some(last);
+            }
+        }
+        let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        if after != d.before {
+            let label = if d.mode == 0 { "移动文本框" } else { "调整文本框大小" };
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.undo.push(sheetcore::undo::Action {
+                label: label.into(),
+                deltas: Vec::new(),
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                shapes: Some(sheetcore::undo::ShapeEdit {
+                    sheet: self.sheet_idx,
+                    before: d.before,
+                    after,
+                }),
+            });
+            self.status = format!("{label}（保存后写回 Excel）");
+        }
+        if self.tb_insert {
+            self.tb_insert = false;
+            self.tb_open_edit(d.idx);
+        }
+    }
+
+    /// 删除选中的文本框
+    fn tb_delete(&mut self, idx: usize) {
+        let before = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        if idx >= before.len() {
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.textboxes.remove(idx);
+            sh.textboxes_dirty = true;
+        }
+        let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.undo.push(sheetcore::undo::Action {
+            label: "删除文本框".into(),
+            deltas: Vec::new(),
+            focus: (self.sheet_idx, self.sel.0, self.sel.1),
+            snap_before: None,
+            snap_after: None,
+            by_site: 0,
+            shapes: Some(sheetcore::undo::ShapeEdit {
+                sheet: self.sheet_idx,
+                before,
+                after,
+            }),
+        });
+        self.tb_sel = None;
+        self.status = "已删除文本框".into();
+    }
+
+    /// 文本框对话框：文字 / 字号 / 粗斜体 / 颜色 / 填充 / 边框 / 对齐 / 换行
+    fn tb_dialog(&mut self, ctx: &egui::Context) {
+        let Some((idx, mut d)) = self.tb_dlg.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut ok = false;
+        let mut del = false;
+        ui_kit::window(ctx, "设置文本框", 420.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "文字", |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut d.text)
+                            .desired_rows(3)
+                            .desired_width(300.0)
+                            .hint_text("可以分多行"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui_kit::field(ui, "字号", |ui| {
+                        let mut v = d.size as f64;
+                        if ui_kit::spin(ui, &mut v, 6.0, 72.0, 1.0, 64.0) {
+                            d.size = v as f32;
+                        }
+                    });
+                    ui.checkbox(&mut d.bold, "粗体");
+                    ui.checkbox(&mut d.italic, "斜体");
+                    ui.checkbox(&mut d.wrap, "自动换行");
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("对齐").size(12.0).weak());
+                    for (v, name) in [(0u8, "左"), (1, "中"), (2, "右")] {
+                        if ui.radio(d.align == v, name).clicked() {
+                            d.align = v;
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+                let mut swatch_row = |ui: &mut egui::Ui, title: &str, cur: &mut Option<[u8; 3]>| {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(64.0, 20.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(title).size(12.0).weak());
+                            },
+                        );
+                        if ui.radio(cur.is_none(), "无").clicked() {
+                            *cur = None;
+                        }
+                        for c in [
+                            [0x00, 0x00, 0x00],
+                            [0xFF, 0xFF, 0xFF],
+                            [0xFF, 0xF2, 0xCC],
+                            [0xDE, 0xEB, 0xF7],
+                            [0x00, 0xB0, 0x50],
+                            [0xFF, 0x00, 0x00],
+                        ] {
+                            let (r, resp) = ui
+                                .allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::click());
+                            ui.painter().rect_filled(
+                                r.shrink(1.0),
+                                2.0,
+                                egui::Color32::from_rgb(c[0], c[1], c[2]),
+                            );
+                            ui.painter().rect_stroke(
+                                r,
+                                2.0,
+                                egui::Stroke::new(1.0, ui_kit::BORDER),
+                                egui::StrokeKind::Inside,
+                            );
+                            if *cur == Some(c) {
+                                ui.painter().rect_stroke(
+                                    r.expand(1.0),
+                                    2.0,
+                                    egui::Stroke::new(2.0, ui_kit::ACCENT),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if resp.clicked() {
+                                *cur = Some(c);
+                            }
+                        }
+                    });
+                };
+                let mut fill = d.fill;
+                swatch_row(ui, "填充", &mut fill);
+                d.fill = fill;
+                let mut line = d.line;
+                swatch_row(ui, "边框", &mut line);
+                d.line = line;
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "删除").clicked() {
+                        del = true;
+                    }
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if del {
+            self.tb_delete(idx);
+            self.tb_dlg = None;
+            return;
+        }
+        if ok {
+            self.tb_commit(idx, d);
+            self.tb_dlg = None;
+            return;
+        }
+        self.tb_dlg = if open { Some((idx, d)) } else { None };
     }
 
     /// 「创建/编辑迷你图」对话框
@@ -14868,6 +15353,103 @@ impl SheetApp {
             }
         }
 
+        // 文本框：画在格子与表格框之上、图表之下
+        let tbs = self.wb.sheet(self.sheet_idx).textboxes.clone();
+        let base_x = gx(0);
+        let base_y = gy(0);
+        let mut tb_rects: Vec<(usize, Rect)> = Vec::with_capacity(tbs.len());
+        for (i, tb) in tbs.iter().enumerate() {
+            let (x, y, w, h) = tb.rect_px(&cols, &rows);
+            let r = Rect::from_min_size(
+                egui::pos2(base_x + x, base_y + y),
+                Vec2::new(w, h),
+            );
+            tb_rects.push((i, r));
+            if !r.intersects(resp.rect) {
+                continue;
+            }
+            let clip = r.intersect(painter.clip_rect());
+            let pt = painter.with_clip_rect(clip);
+            if let Some(f) = tb.fill {
+                pt.rect_filled(r, 1.0, Color32::from_rgb(f[0], f[1], f[2]));
+            }
+            if let Some(l) = tb.line {
+                pt.rect_stroke(
+                    r,
+                    1.0,
+                    Stroke::new(1.0, Color32::from_rgb(l[0], l[1], l[2])),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if !tb.text.is_empty() {
+                let fs = (tb.size * 4.0 / 3.0 * self.paint_scale).max(6.0);
+                let fam = cell_family("");
+                let font = FontId::new(if tb.bold { fs + 0.8 } else { fs }, fam);
+                let col = Color32::from_rgb(tb.color[0], tb.color[1], tb.color[2]);
+                let max_w = (w - 8.0).max(8.0);
+                let galley = pt.layout(tb.text.clone(), font, col, max_w);
+                let gx0 = match tb.align {
+                    1 => r.center().x - galley.size().x / 2.0,
+                    2 => r.right() - 4.0 - galley.size().x,
+                    _ => r.left() + 4.0,
+                };
+                pt.galley(egui::pos2(gx0, r.top() + 3.0), galley, col);
+            }
+            if dumping {
+                dump.push(format!(
+                    "textbox ({i}) rect=({:.0},{:.0},{:.0},{:.0}) 文字={:?} 字号={:.1} 填充={:?} 边框={:?}",
+                    r.left(),
+                    r.top(),
+                    r.width(),
+                    r.height(),
+                    tb.text,
+                    tb.size,
+                    tb.fill,
+                    tb.line
+                ));
+            }
+        }
+        // 选中的文本框：虚线框 + 八个手柄（和图表同一套画法）
+        if let Some(i) = self.tb_sel {
+            if let Some((_, r)) = tb_rects.iter().find(|(k, _)| *k == i) {
+                let r = *r;
+                painter.add(egui::Shape::dashed_line(
+                    &[
+                        r.left_top(),
+                        r.right_top(),
+                        r.right_bottom(),
+                        r.left_bottom(),
+                        r.left_top(),
+                    ],
+                    Stroke::new(1.0, ui_kit::ACCENT),
+                    4.0,
+                    3.0,
+                ));
+                for p in [
+                    r.left_top(),
+                    egui::pos2(r.center().x, r.top()),
+                    r.right_top(),
+                    egui::pos2(r.right(), r.center().y),
+                    r.right_bottom(),
+                    egui::pos2(r.center().x, r.bottom()),
+                    r.left_bottom(),
+                    egui::pos2(r.left(), r.center().y),
+                ] {
+                    painter.rect_filled(
+                        Rect::from_center_size(p, Vec2::splat(6.0)),
+                        0.0,
+                        Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        Rect::from_center_size(p, Vec2::splat(6.0)),
+                        0.0,
+                        Stroke::new(1.0, ui_kit::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+        }
+
         if let Some((col, items, anchor)) = pending_filter.take() {
             self.filter_popup = Some(FilterPopup {
                 col,
@@ -15140,6 +15722,62 @@ impl SheetApp {
                             Stroke::new(1.0, ui_kit::ACCENT),
                             egui::StrokeKind::Inside,
                         );
+                    }
+                }
+            }
+        }
+
+        // 文本框：手柄缩放、本体拖动、双击编辑、绘制模式（屏幕坐标先换算到表格坐标）
+        if !readonly {
+            if self.tb_insert {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            let tb_sheet_rects: Vec<(usize, (f32, f32, f32, f32))> = tb_rects
+                .iter()
+                .map(|(i, r)| (*i, (r.left() - base_x, r.top() - base_y, r.width(), r.height())))
+                .collect();
+            if resp.drag_started() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let sp = egui::pos2(pos.x - base_x, pos.y - base_y);
+                    self.tb_drag = self.tb_drag_begin(sp, &tb_sheet_rects, &tbs);
+                }
+            }
+            if resp.dragged() {
+                if let (Some(d), Some(pos)) = (self.tb_drag.clone(), resp.interact_pointer_pos()) {
+                    let sp = egui::pos2(pos.x - base_x, pos.y - base_y);
+                    self.tb_drag_update(&d, sp);
+                }
+            }
+            if resp.drag_stopped() {
+                if let Some(d) = self.tb_drag.take() {
+                    self.tb_drag_end(d);
+                }
+            }
+            // 绘制模式下单击：按默认尺寸放一个
+            if self.tb_insert && resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let (lx, ly) = (pos.x - base_x, pos.y - base_y);
+                    self.tb_insert = false;
+                    self.tb_create(lx, ly, 180.0, 60.0);
+                    let idx = self.tb_sel.unwrap_or(0);
+                    self.tb_open_edit(idx);
+                }
+            }
+            // 双击文本框 → 编辑内容
+            if resp.double_clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let (lx, ly) = (pos.x - base_x, pos.y - base_y);
+                    if let Some((i, _)) = tb_sheet_rects
+                        .iter()
+                        .rev()
+                        .find(|(_, (x, y, w, h))| {
+                            egui::Rect::from_min_size(egui::pos2(*x, *y), Vec2::new(*w, *h))
+                                .contains(egui::pos2(lx, ly))
+                        })
+                        .map(|(i, r)| (*i, *r))
+                    {
+                        self.tb_sel = Some(i);
+                        self.tb_open_edit(i);
                     }
                 }
             }
@@ -17880,6 +18518,45 @@ impl eframe::App for SheetApp {
                 }
             }
         }
+        // 无界面验收：SC_TB_DRAG="dx,dy" 对选中文本框走一遍真实的拖动三件套（只跑一次）
+        if let Ok(spec) = std::env::var("SC_TB_DRAG") {
+            static DRAGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DRAGGED.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(i) = self.tb_sel {
+                    let v: Vec<f32> = spec
+                        .split(',')
+                        .filter_map(|x| x.trim().parse().ok())
+                        .collect();
+                    let (cols, rows) = self.view_axes();
+                    let tbs = self.wb.sheet(self.sheet_idx).textboxes.clone();
+                    if v.len() == 2 {
+                        if let Some(tb) = tbs.get(i) {
+                            let (x, y, w, h) = tb.rect_px(&cols, &rows);
+                            let rects: Vec<(usize, (f32, f32, f32, f32))> = tbs
+                                .iter()
+                                .enumerate()
+                                .map(|(k, t)| (k, t.rect_px(&cols, &rows)))
+                                .collect();
+                            let start = egui::pos2(x + w / 2.0, y + h / 2.0);
+                            let end = egui::pos2(start.x + v[0], start.y + v[1]);
+                            if let Some(d) = self.tb_drag_begin(start, &rects, &tbs) {
+                                self.tb_drag_update(&d, end);
+                                self.tb_drag_end(d);
+                                DRAGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let after = self
+                                    .wb
+                                    .sheet(self.sheet_idx)
+                                    .textboxes
+                                    .get(i)
+                                    .map(|t| t.rect_px(&cols, &rows));
+                                eprintln!("[tb] 拖动 {spec} → {:?}", after);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some((is_col, idx)) = self.pending_autofit.take() {
             if is_col {
                 let before = self.wb.sheet(self.sheet_idx).cols.size(idx);
@@ -18007,6 +18684,7 @@ impl eframe::App for SheetApp {
         self.watch_window(ctx);
         self.header_footer_dialog(ctx);
         self.spark_dialog(ctx);
+        self.tb_dialog(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);

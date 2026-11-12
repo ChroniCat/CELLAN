@@ -577,6 +577,12 @@ pub fn load(path: &Path) -> Result<Workbook> {
                     if !sheet.hyperlinks.is_empty() {
                         sheet.hyperlinks_dirty = true;
                     }
+                    // 文本框：drawing 部件里的 xdr:sp
+                    let tbs = crate::textbox::load(path, part);
+                    if !tbs.is_empty() {
+                        sheet.textboxes = tbs;
+                        sheet.textboxes_dirty = true;
+                    }
                 }
             }
         }
@@ -1405,6 +1411,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     if let Err(e) = crate::sparkline::apply(path, wb) {
         eprintln!("[save] 迷你图写回失败: {e:#}");
+    }
+    if let Err(e) = crate::textbox::apply(path, wb) {
+        eprintln!("[save] 文本框写回失败: {e:#}");
     }
     if let Err(e) = crate::patch::apply_rich(path, wb) {
         eprintln!("[save] 富文本写回失败: {e:#}");
