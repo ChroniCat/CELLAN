@@ -2010,3 +2010,39 @@ fn command_tooltips_carry_their_registered_shortcut() {
         "Ctrl+Shift+S"
     );
 }
+
+
+// ---------------------------------------------------------------- QA-03.2 自检输出路径
+
+/// 无界面自检（SC_B1/B3/B4）原来把输出写死到 `F:/Finance/work`：
+/// 在别的机器上父目录不存在，自检悄悄什么都不产出，还会往开发目录乱写。
+/// 现在输出目录由 SC_PROBE_DIR 指定，否则落在系统临时目录下。
+#[test]
+fn probe_outputs_go_to_the_declared_directory_not_a_fixed_dev_path() {
+    let env = crate::test_env::TestEnv::new("qa032-probe-dir");
+    let dir = env.path("probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("import.csv"), "姓名,部门,金额\n张三,研发,100\n李四,财务,200\n").unwrap();
+    env.sc("SC_B4", "1");
+    env.sc("SC_PROBE_DIR", dir.to_str().unwrap());
+
+    let dev = std::path::Path::new("F:/Finance/work");
+    let dev_existed = dev.exists();
+
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.b4_probe();
+
+    assert!(
+        dir.join("b4_out.xlsx").is_file(),
+        "自检产物必须写在 SC_PROBE_DIR 里，实际状态：{}",
+        app.status
+    );
+    assert!(
+        dir.join("import.csv").is_file(),
+        "自检用到的 CSV 也必须在该目录内"
+    );
+    let back = sheetcore::xlsx::load(&dir.join("b4_out.xlsx")).unwrap();
+    assert_eq!(back.sources.len(), 1, "重开后数据源必须还在");
+    assert_eq!(!dev.exists(), !dev_existed, "不得在固定开发目录下新建任何东西");
+}

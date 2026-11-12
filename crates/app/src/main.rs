@@ -2979,10 +2979,12 @@ impl SheetApp {
         if std::env::var("SC_B4").is_err() || self.tasks.open_rx.is_some() || self.b4_done {
             return;
         }
+        let Some(dir) = Self::probe_dir() else { return };
         self.b4_done = true;
         self.sel = (0, 0);
         self.sel_end = (0, 0);
-        self.import_csv_from(std::path::Path::new("F:/Finance/work/import.csv"));
+        let csv = dir.join("import.csv");
+        self.import_csv_from(&csv);
         eprintln!("[B4] {}", self.status);
         for r in 0..4 {
             let row: Vec<String> = (0..3)
@@ -2991,7 +2993,7 @@ impl SheetApp {
             eprintln!("[B4] 第{}行 {:?}", r + 1, row);
         }
         // 改文件再刷新
-        let _ = std::fs::write("F:/Finance/work/import.csv", "姓名,部门,金额
+        let _ = std::fs::write(&csv, "姓名,部门,金额
 赵六,财务,900
 ");
         self.refresh_import();
@@ -3000,7 +3002,7 @@ impl SheetApp {
         eprintln!("[B4] 数据源 {} 个", self.wb.sources.len());
 
         // 存盘再重开：数据源应当还在，刷新能力才谈得上"持久"
-        let out = std::path::PathBuf::from("F:/Finance/work/b4_out.xlsx");
+        let out = dir.join("b4_out.xlsx");
         let _ = std::fs::remove_file(&out);
         if let Err(e) = sheetcore::xlsx::save_atomic(&out, &self.wb) {
             eprintln!("[B4] 存盘失败: {e:#}");
@@ -3062,6 +3064,7 @@ impl SheetApp {
         if std::env::var("SC_B1").is_err() || self.tasks.open_rx.is_some() || self.b1_done {
             return;
         }
+        let Some(dir) = Self::probe_dir() else { return };
         self.b1_done = true;
         self.sel = (0, 0);
         self.sel_end = (5, 2);
@@ -3073,7 +3076,7 @@ impl SheetApp {
         let si = self.sheet_idx;
         let v = sheetcore::formula::eval_formula(&self.wb, si, &format!("=SUM({name}[金额])"));
         eprintln!("[B1] SUM({name}[金额]) = {v:?}");
-        let out = std::path::PathBuf::from("F:/Finance/work/b1_out.xlsx");
+        let out = dir.join("b1_out.xlsx");
         let _ = std::fs::remove_file(&out);
         match sheetcore::xlsx::save_atomic(&out, &self.wb) {
             Ok(_) => eprintln!("[B1] 存盘后表格={:?}", sheetcore::table::load(&out)),
@@ -3087,6 +3090,7 @@ impl SheetApp {
         if std::env::var("SC_B3").is_err() || self.tasks.open_rx.is_some() || self.b3_done {
             return;
         }
+        let Some(dir) = Self::probe_dir() else { return };
         self.b3_done = true;
         self.sel = (1, 1);
         self.sel_end = (1, 3);
@@ -3094,7 +3098,7 @@ impl SheetApp {
         self.cse_pending = true;
         self.commit_edit(None);
         eprintln!("[B3] 状态={} 数组={:?}", self.status, self.wb.sheet(self.sheet_idx).arrays);
-        let out = std::path::PathBuf::from("F:/Finance/work/b3_out.xlsx");
+        let out = dir.join("b3_out.xlsx");
         let _ = std::fs::remove_file(&out);
         match sheetcore::xlsx::save_atomic(&out, &self.wb) {
             Ok(_) => {
@@ -19950,6 +19954,21 @@ impl SheetApp {
             self.command_exec("FileOpen", ctx);
         }
     }
+
+/// 无界面自检的输出目录：`SC_PROBE_DIR` 显式指定，否则用系统临时目录下的
+/// `sheets-native-probe-<pid>`。绝不写固定开发路径——以前的 `F:/Finance/work`
+/// 在别的机器上不存在，自检就悄悄什么都不产出。
+fn probe_dir() -> Option<std::path::PathBuf> {
+    let dir = match std::env::var("SC_PROBE_DIR") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir().join(format!("sheets-native-probe-{}", std::process::id())),
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[probe] 无法创建输出目录 {}：{e}", dir.display());
+        return None;
+    }
+    Some(dir)
+}
 
 /// 路径太长时中间省略，卡片上不至于溢出
 fn elide(s: &str, max_chars: usize) -> String {
