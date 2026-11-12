@@ -62,6 +62,8 @@ pub enum Icon {
     FontGrow,
     FontShrink,
     TextDir,
+    HeaderFooter,
+    DocLink,
     Freeze,
     Lock,
     /// 条件格式：三条彩色数据条
@@ -869,6 +871,24 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(4.4, 8.0, 15.2, 1.0, GREEN_D);
             pen.bar(11.0, 8.0, 1.0, 12.6, GREEN_D);
             pen.bar(4.4, 14.5, 15.2, 1.0, GREEN_D);
+        }
+        HeaderFooter => {
+            // 一页纸：上下各一条深色带（页眉/页脚）+ 中间三条浅线
+            pen.rro(4.6, 3.2, 14.8, 17.6, 0.8, INK, 1.2);
+            pen.bar(4.6, 3.2, 14.8, 3.0, Color32::from_rgb(33, 115, 70));
+            pen.bar(4.6, 17.8, 14.8, 3.0, Color32::from_rgb(33, 115, 70));
+            pen.ln(7.0, 8.8, 17.0, 8.8, 0.9, GRAY_D);
+            pen.ln(7.0, 11.8, 17.0, 11.8, 0.9, GRAY_D);
+            pen.ln(7.0, 14.8, 13.4, 14.8, 0.9, GRAY_D);
+        }
+        DocLink => {
+            // 两份文档 + 右下角一小段链条：跨工作簿引用
+            pen.rrs(3.4, 4.2, 10.6, 13.6, 0.6, WHITE, GRAY_D, 1.0);
+            pen.rrs(6.4, 6.6, 10.6, 13.6, 0.6, WHITE, INK, 1.1);
+            pen.ln(8.4, 10.0, 15.2, 10.0, 0.9, GRAY_D);
+            pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
+            pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(222, 235, 247), BLUE_D, 0.9);
+            pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(222, 235, 247), BLUE_D, 0.9);
         }
         TextDir => {
             // 竖排文字：一个 A + 向下的折线箭头（Excel 的「方向」图标）

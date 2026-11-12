@@ -326,7 +326,7 @@
             <button id="EditTextBox" label="编辑文本框" imageMso="FontColor" screentip="改文字/字号/颜色/填充" onAction="EditTextBox" sizeString="124"/>
             <button id="DeleteTextBox" label="删除文本框" imageMso="Close" onAction="DeleteTextBox" sizeString="124"/>
           </box>
-          <button id="HeaderFooter" label="页眉和页脚" size="large" imageMso="Sheet" onAction="HeaderFooter"/>
+          <button id="HeaderFooter" label="页眉和页脚" size="large" imageMso="HeaderFooter" onAction="HeaderFooter"/>
         </group>
         <group id="GroupHyperlink" label="链接">
           <button id="Hyperlink" label="超链接" size="large" imageMso="Link" onAction="Hyperlink"/>
@@ -355,7 +355,7 @@
           </box>
         </group>
         <group id="GroupLinks" label="链接">
-          <button id="InsertWorkbookLinks" label="链接" size="large" imageMso="Link" screentip="跨工作簿引用：查看、更新缓存" onAction="WorkbookLinks"/>
+          <button id="InsertWorkbookLinks" label="链接" size="large" imageMso="WorkbookLinks" screentip="跨工作簿引用：查看、更新缓存" onAction="WorkbookLinks"/>
         </group>
         <group id="GroupFilters" label="筛选器">
           <button id="InsertSlicer" label="切片器" size="large" imageMso="Filter" screentip="给当前透视表加一个可勾选的切片器" onAction="InsertSlicer"/>
