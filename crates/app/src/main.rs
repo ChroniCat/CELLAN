@@ -1455,6 +1455,38 @@ impl SheetApp {
         }
     }
 
+    /// Ctrl+N / 开始页“新建”：开始页直接进空白文档，否则在新标签里开一份空白。
+    fn new_document(&mut self) {
+        if self.show_start {
+            self.show_start = false;
+            self.tabs = vec![TabSlot::Active];
+            self.active_tab = 0;
+            self.wb = Workbook::new_blank();
+            self.reset_editor_state();
+        } else {
+            self.open_in_new_tab(PathBuf::new());
+        }
+    }
+
+    /// Ctrl+O / 开始页“打开”：选择文件并在新标签里打开。
+    /// 无界面验收可用 SC_OPEN_PATH=路径 只替换系统对话框。
+    fn open_dialog(&mut self) {
+        let picked = match std::env::var("SC_OPEN_PATH") {
+            Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
+            _ => rfd::FileDialog::new()
+                .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
+                .pick_file(),
+        };
+        if let Some(p) = picked {
+            self.show_start = false;
+            if self.tabs.is_empty() {
+                self.tabs = vec![TabSlot::Active];
+                self.active_tab = 0;
+            }
+            self.open_in_new_tab(p);
+        }
+    }
+
     /// 打开文件：当前是「没动过的空白标签」就复用，否则开新标签（WPS 的行为）
     fn open_any(&mut self, path: PathBuf) {
         let untouched_blank = self.tabs.len() == 1
@@ -5887,6 +5919,27 @@ impl SheetApp {
         }
         if save_k {
             self.save(false);
+            return;
+        }
+        // Ctrl+O / Ctrl+N / Ctrl+P：与开始页、功能区走同一实现
+        let (open_k, new_k, print_k) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::O),
+                i.modifiers.command && i.key_pressed(Key::N),
+                i.modifiers.command && i.key_pressed(Key::P),
+            )
+        });
+        if open_k {
+            self.open_dialog();
+            return;
+        }
+        if new_k {
+            self.new_document();
+            return;
+        }
+        if print_k {
+            self.preview_page = 0;
+            self.print_preview = true;
             return;
         }
         // Ctrl+F1：和 Excel 一样收起/展开功能区
@@ -19932,28 +19985,10 @@ impl SheetApp {
             self.switch_tab(i);
         }
         if new_tab {
-            if self.show_start {
-                self.show_start = false;
-                self.tabs = vec![TabSlot::Active];
-                self.active_tab = 0;
-                self.wb = Workbook::new_blank();
-                self.reset_editor_state();
-            } else {
-                self.open_in_new_tab(PathBuf::new());
-            }
+            self.new_document();
         }
         if open_dlg {
-            if let Some(p) = rfd::FileDialog::new()
-                .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
-                .pick_file()
-            {
-                self.show_start = false;
-                if self.tabs.is_empty() {
-                    self.tabs = vec![TabSlot::Active];
-                    self.active_tab = 0;
-                }
-                self.open_in_new_tab(p);
-            }
+            self.open_dialog();
         }
     }
 

@@ -1748,3 +1748,67 @@ fn uiframe_type_commit(app: &mut SheetApp, ctx: &egui::Context, text: &str) {
     ui_frame(app, ctx, vec![egui::Event::Text(text.into())]);
     ui_frame(app, ctx, vec![key_event(egui::Key::Enter, false)]);
 }
+
+// ---------------------------------------------------------------- UI-02.2 Ctrl+O/N/P
+
+fn wait_open(app: &mut SheetApp) {
+    let started = std::time::Instant::now();
+    while app.tasks.open_rx.is_some() || app.tasks.busy {
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "打开超时");
+        app.poll_open();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn ctrl_n_creates_a_blank_document_without_losing_the_current_one() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-ctrl-n", 9.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::N, false)]);
+    assert_eq!(app.tabs.len(), 2, "新文档应在新标签里开");
+    assert_eq!(app.active_tab, 1);
+    assert!(app.wb.path.is_none(), "新文档没有路径");
+    assert!(!app.wb.dirty, "新文档不该是脏的");
+    assert_eq!(app.wb.sheet(0).len(), 0, "新文档应为空白");
+    // 原文档仍停在旧标签里
+    match &app.tabs[0] {
+        TabSlot::Parked(doc) => assert_eq!(doc.wb.path.as_ref(), Some(&path)),
+        TabSlot::Active => panic!("旧文档应被 park"),
+    }
+    drop(env);
+}
+
+#[test]
+fn ctrl_o_opens_the_picked_file() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-ctrl-o", 12.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    env.sc("SC_OPEN_PATH", path.to_str().unwrap());
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::O, false)]);
+    wait_open(&mut app);
+    assert_eq!(
+        app.wb.sheet(0).value(0, 0),
+        Value::Number(12.0),
+        "Ctrl+O 应打开选定文件"
+    );
+    assert_eq!(app.wb.path.as_ref(), Some(&path));
+    drop(env);
+}
+
+#[test]
+fn ctrl_p_opens_print_preview() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    assert!(!app.print_preview);
+    app.preview_page = 3;
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::P, false)]);
+    assert!(app.print_preview, "Ctrl+P 应打开打印预览");
+    assert_eq!(app.preview_page, 0, "预览从第一页开始");
+}

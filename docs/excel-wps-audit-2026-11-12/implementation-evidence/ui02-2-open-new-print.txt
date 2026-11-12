@@ -1,0 +1,40 @@
+# UI-02.2 Ctrl+O / Ctrl+N / Ctrl+P：失败→通过证据
+
+## 1 修复前
+
+`handle_keys` 没有这三个快捷键；开始页“新建/打开”各写一份内联代码，功能区只有
+`FileOpen`/`PrintPreview` 动作。
+
+## 2 失败复现（RED）
+
+临时把三个分支改成不可达后：
+
+    ctrl_n_creates_a_blank_document_without_losing_the_current_one ... FAILED（标签 1 != 2）
+    ctrl_o_opens_the_picked_file ... FAILED（A1 Empty）
+    ctrl_p_opens_print_preview ... FAILED
+    test result: FAILED. 6 passed; 3 failed
+
+原始输出：`ui02-2-red.txt`。
+
+## 3 修改
+
+- 抽出 `new_document()`（开始页新建 + 非开始页新标签空白）与 `open_dialog()`（选择文件后
+  在新标签打开）；开始页改为调用它们，Ctrl+N/Ctrl+O 也调用它们——同一实现，不是两套。
+- `open_dialog()` 支持 `SC_OPEN_PATH=路径` 只替换系统对话框（打开链路不变）。
+- Ctrl+P 走与功能区 `PrintPreview` 相同的状态（`print_preview=true`、从第 1 页开始）。
+
+## 4 通过证据（GREEN）
+
+    cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests::
+    test result: ok. 127 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out
+
+| 测试 | 覆盖 |
+|---|---|
+| ctrl_n_creates_a_blank_document_without_losing_the_current_one | 新标签空白文档；原文档被 park 且保留路径 |
+| ctrl_o_opens_the_picked_file | Ctrl+O 打开选定文件（异步打开完成后 A1=12，路径正确） |
+| ctrl_p_opens_print_preview | Ctrl+P 打开打印预览并从第一页开始 |
+
+## 5 未执行
+
+- 真实系统“打开”对话框交互（选目录/取消）未执行；本切片用 SC_OPEN_PATH 只替换对话框。
+- 快捷键与对话框/文本编辑的优先级细化、命令 enabled/tooltip 注册：UI-02.3。
