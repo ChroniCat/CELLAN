@@ -194,6 +194,17 @@ const GRAY_D: Color32 = Color32::from_rgb(89, 89, 89);
 /// 文字级深灰（对齐类图标的横线）
 const INK: Color32 = Color32::from_rgb(58, 58, 58);
 
+/// 线宽量化：逻辑宽 * 设备像素比 → 最近的整数设备像素（至少 1）
+fn dev_stroke(w_logical: f32, ppp: f32) -> f32 {
+    (w_logical * ppp * 0.82).max(1.0).round()
+}
+
+/// 线条中心对齐：奇数设备宽 → 半像素中心；偶数设备宽 → 整像素中心
+fn snap_center(v: f32, ppp: f32, wdev: f32) -> f32 {
+    let off = if (wdev.round() as i32) & 1 == 1 { 0.5 } else { 0.0 };
+    ((v * ppp - off).round() + off) / ppp
+}
+
 fn lighten(c: Color32, f: f32) -> Color32 {
     let l = |v: u8| (v as f32 + (255.0 - v as f32) * f).min(255.0) as u8;
     Color32::from_rgb(l(c.r()), l(c.g()), l(c.b()))
@@ -217,9 +228,17 @@ impl Pen<'_> {
     fn snap(&self, v: f32) -> f32 {
         (v * self.ppp).round() / self.ppp
     }
-    /// 线条：中心对齐到半像素（1px 线才落在单个像素上）
-    fn snapl(&self, v: f32) -> f32 {
-        ((v * self.ppp - 0.5).round() + 0.5) / self.ppp
+    /// 线宽量化到整数设备像素（1 / 2 / 3 …）：分数像素宽的线在任何 DPI 下都会糊
+    fn wdev(&self, w: f32) -> f32 {
+        dev_stroke(w * self.s, self.ppp)
+    }
+    /// 线宽换回逻辑像素
+    fn wl(&self, w: f32) -> f32 {
+        self.wdev(w) / self.ppp
+    }
+    /// 线条中心对齐：奇数设备宽落在半像素，偶数落在整像素
+    fn snapl(&self, v: f32, wdev: f32) -> f32 {
+        snap_center(v, self.ppp, wdev)
     }
     fn xy(&self, x: f32, y: f32) -> Pos2 {
         Pos2::new(
@@ -227,11 +246,11 @@ impl Pen<'_> {
             self.snap(self.r.top() + y * self.s),
         )
     }
-    /// 线条端点用半像素对齐
-    fn xyl(&self, x: f32, y: f32) -> Pos2 {
+    /// 线条端点：按线宽奇偶做对齐
+    fn xyl(&self, x: f32, y: f32, wdev: f32) -> Pos2 {
         Pos2::new(
-            self.snapl(self.r.left() + x * self.s),
-            self.snapl(self.r.top() + y * self.s),
+            self.snapl(self.r.left() + x * self.s, wdev),
+            self.snapl(self.r.top() + y * self.s, wdev),
         )
     }
     fn px(&self, v: f32) -> f32 {
@@ -284,7 +303,7 @@ impl Pen<'_> {
         self.p.rect_stroke(
             rect,
             cr,
-            Stroke::new((sw * self.s * 0.82).max(0.9), self.col(stroke)),
+            Stroke::new(self.wl(sw), self.col(stroke)),
             egui::StrokeKind::Inside,
         );
     }
@@ -294,15 +313,16 @@ impl Pen<'_> {
         self.p.rect_stroke(
             self.rect_of(x, y, w, h),
             self.px(rad),
-            Stroke::new((sw * self.s * 0.82).max(0.9), self.col(stroke)),
+            Stroke::new(self.wl(sw), self.col(stroke)),
             egui::StrokeKind::Inside,
         );
     }
 
     fn ln(&self, x1: f32, y1: f32, x2: f32, y2: f32, w: f32, c: Color32) {
+        let wd = self.wdev(w);
         self.p.line_segment(
-            [self.xyl(x1, y1), self.xyl(x2, y2)],
-            Stroke::new((w * self.s * 0.82).max(0.9), self.col(c)),
+            [self.xyl(x1, y1, wd), self.xyl(x2, y2, wd)],
+            Stroke::new(wd / self.ppp, self.col(c)),
         );
     }
 
@@ -329,10 +349,11 @@ impl Pen<'_> {
     }
 
     fn ring(&self, x: f32, y: f32, rad: f32, w: f32, c: Color32) {
+        let wd = self.wdev(w);
         self.p.circle_stroke(
-            self.xyl(x, y),
+            self.xyl(x, y, wd),
             self.px(rad),
-            Stroke::new((w * self.s * 0.82).max(0.9), self.col(c)),
+            Stroke::new(wd / self.ppp, self.col(c)),
         );
     }
 
@@ -346,16 +367,14 @@ impl Pen<'_> {
         closed.push(closed[0]);
         self.p.add(egui::Shape::line(
             closed,
-            Stroke::new((sw * self.s * 0.82).max(0.9), self.col(stroke)),
+            Stroke::new(self.wl(sw), self.col(stroke)),
         ));
     }
 
     fn polyline(&self, pts: &[(f32, f32)], w: f32, c: Color32) {
-        let v: Vec<Pos2> = pts.iter().map(|q| self.xyl(q.0, q.1)).collect();
-        self.p.add(egui::Shape::line(
-            v,
-            Stroke::new((w * self.s * 0.82).max(0.9), self.col(c)),
-        ));
+        let wd = self.wdev(w);
+        let v: Vec<Pos2> = pts.iter().map(|q| self.xyl(q.0, q.1, wd)).collect();
+        self.p.add(egui::Shape::line(v, Stroke::new(wd / self.ppp, self.col(c))));
     }
 
     fn text(&self, s: &str, size: f32, x: f32, y: f32, c: Color32) {
@@ -1563,5 +1582,45 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(17.2, 7.2, 1.7, 9.4, GREEN_D);
             pen.arrow((18.05, 18.4), (0.0, 1.0), 3.4, GREEN_D);
         }
+    }
+}
+
+#[cfg(test)]
+mod stroke_tests {
+    use super::*;
+
+    /// 任何 DPI 下，线条的设备宽度都必须是整数（否则抗锯齿把线糊成两像素）
+    #[test]
+    fn stroke_width_is_integral_device_pixels() {
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0, 2.5] {
+            for w in [0.5_f32, 0.6, 0.85, 1.0, 1.15, 1.5, 1.8, 2.2, 3.0] {
+                let d = dev_stroke(w, ppp);
+                assert!(d >= 1.0, "w={w} ppp={ppp} → {d}");
+                assert!((d - d.round()).abs() < 1e-6, "线宽不是整数设备像素: w={w} ppp={ppp} → {d}");
+            }
+        }
+    }
+
+    /// 对齐后：奇数宽落半像素、偶数宽落整像素
+    #[test]
+    fn line_centers_land_on_pixel_centers() {
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            for wdev in [1.0_f32, 2.0, 3.0] {
+                for v in [10.0_f32, 10.3, 10.5, 10.77, 12.2] {
+                    let dev = snap_center(v, ppp, wdev) * ppp;
+                    let err = if wdev as i32 & 1 == 1 { (dev - dev.floor() - 0.5).abs() } else { dev - dev.round() };
+                    assert!(err < 1e-4, "v={v} ppp={ppp} wdev={wdev} → 设备坐标 {dev} 没落在像素中心");
+                }
+            }
+        }
+    }
+
+    /// 32px 图标：100% 下 1.15 单位的线落到 1 设备像素，150% 下落到 2
+    #[test]
+    fn thirty_two_px_icon_scales_to_integer_device_pixels() {
+        let s = 32.0 / 24.0;
+        assert_eq!(dev_stroke(1.15 * s, 1.0), 1.0);
+        assert_eq!(dev_stroke(1.15 * s, 1.5), 2.0);
+        assert_eq!(dev_stroke(1.15 * s, 2.0), 3.0);
     }
 }

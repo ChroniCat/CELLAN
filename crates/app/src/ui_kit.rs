@@ -17,6 +17,8 @@ use std::cell::Cell;
 pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
+/// 禁用态：Excel 的禁用图标是中性灰 #A6A6A6，比正文浅、比分隔线深
+pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 /// 列头/行头与网格的分界线：Excel 实测 #ABABAB，比普通控件边框深
 pub const HEAD_LINE: Color32 = Color32::from_rgb(171, 171, 171);
 /// 功能区分组之间的竖线
@@ -30,8 +32,8 @@ pub const GRID_LINE: Color32 = Color32::from_rgb(217, 217, 217);
 pub const TABBAR_BG: Color32 = Color32::from_rgb(243, 242, 241);
 /// 标题栏底色：Excel 实测 240,240,240
 pub const TITLE_BG: Color32 = Color32::from_rgb(240, 240, 240);
-pub const HOVER: Color32 = Color32::from_rgb(233, 233, 233);
-pub const PRESSED: Color32 = Color32::from_rgb(217, 217, 217);
+pub const HOVER: Color32 = Color32::from_rgb(243, 242, 241);
+pub const PRESSED: Color32 = Color32::from_rgb(237, 235, 233);
 pub const STATUS_BG: Color32 = Color32::from_rgb(245, 245, 245);
 
 /// 标题栏（自绘，含快速访问工具栏和窗口按钮）
@@ -287,7 +289,7 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
     let col = if enabled {
         text_color(&v)
     } else {
-        v.weak_text_color().gamma_multiply(0.6)
+        DISABLED
     };
     let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
@@ -341,7 +343,7 @@ pub fn big_sized_split(
     let col = if enabled {
         text_color(&v)
     } else {
-        v.weak_text_color().gamma_multiply(0.6)
+        DISABLED
     };
     let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
     let icon_rect = Rect::from_center_size(
@@ -387,7 +389,7 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
         ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = if !enabled {
-        v.weak_text_color().gamma_multiply(0.6)
+        DISABLED
     } else {
         text_color(&v)
     };
@@ -434,7 +436,7 @@ pub fn labeled_w_on(
     let col = if enabled {
         text_color(&v)
     } else {
-        v.weak_text_color().gamma_multiply(0.6)
+        DISABLED
     };
     let ir = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),

@@ -20593,6 +20593,12 @@ impl SheetApp {
 
 impl eframe::App for SheetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 高 DPI 验收：SC_PPP=1.5 强制设备像素比（默认跟随系统）
+        if let Ok(v) = std::env::var("SC_PPP") {
+            if let Ok(f) = v.parse::<f32>() {
+                ctx.set_pixels_per_point(f.clamp(0.75, 3.0));
+            }
+        }
         let __cpu_t0 = std::time::Instant::now();
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
@@ -21878,6 +21884,75 @@ impl eframe::App for SheetApp {
         let wake = if self.net.is_some() { 120 } else { 500 };
         ctx.request_repaint_after(std::time::Duration::from_millis(wake));
 
+        // 图标状态条：SC_STATE_STRIP=1 画「常态 / 悬停 / 按下 / 选中 / 禁用」五列，核对背景与灰阶
+        if std::env::var("SC_STATE_STRIP").is_ok() {
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("state_strip"),
+            ));
+            p.rect_filled(ctx.screen_rect(), 0.0, Color32::WHITE);
+            let icons = [
+                crate::ui_icons::Icon::Paste,
+                crate::ui_icons::Icon::Cut,
+                crate::ui_icons::Icon::Filter,
+                crate::ui_icons::Icon::Chart,
+                crate::ui_icons::Icon::Fill,
+                crate::ui_icons::Icon::Sum,
+            ];
+            let states = ["常态", "悬停", "按下", "选中", "禁用"];
+            for (si, name) in states.iter().enumerate() {
+                let x = 120.0 + si as f32 * 90.0;
+                p.text(
+                    egui::pos2(x, 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    *name,
+                    egui::FontId::proportional(12.0),
+                    Color32::from_gray(90),
+                );
+            }
+            for (ii, icon) in icons.iter().enumerate() {
+                let y = 48.0 + ii as f32 * 72.0;
+                p.text(
+                    egui::pos2(10.0, y + 22.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{icon:?}"),
+                    egui::FontId::proportional(11.0),
+                    Color32::from_gray(110),
+                );
+                for si in 0..5 {
+                    let x = 80.0 + si as f32 * 90.0;
+                    let bg = match si {
+                        1 => crate::ui_kit::HOVER,
+                        2 => crate::ui_kit::PRESSED,
+                        3 => crate::ui_kit::PRESSED,
+                        _ => Color32::TRANSPARENT,
+                    };
+                    if bg != Color32::TRANSPARENT {
+                        p.rect_filled(
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(72.0, 44.0)),
+                            3.0,
+                            bg,
+                        );
+                    }
+                    let enabled = si != 4;
+                    let col = if enabled {
+                        crate::ui_kit::TEXT
+                    } else {
+                        crate::ui_kit::DISABLED
+                    };
+                    crate::ui_icons::draw_excel(
+                        &p,
+                        egui::Rect::from_center_size(
+                            egui::pos2(x + 36.0, y + 22.0),
+                            egui::Vec2::splat(32.0),
+                        ),
+                        *icon,
+                        col,
+                        enabled,
+                    );
+                }
+            }
+        }
         // 图标对照表：SC_ICON_SHEET=1 时在最上层画「位图 / 矢量」并排，配合 SC_SHOT 截图
         if std::env::var("SC_ICON_SHEET").is_ok() {
             let screen = ctx.screen_rect();
