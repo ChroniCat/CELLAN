@@ -71,7 +71,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cell {
     pub value: Value,
     /// 公式原文（以 = 开头）。用 Box<str> 而不是 String：省 8 字节/格，

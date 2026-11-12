@@ -1,23 +1,29 @@
-UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:30）
+UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:55）
 
 一、已实现
 1) 合并（main.rs::toggle_merge）
 - 先 write_preflight（他人锁定/保护整批拒绝）。
 - 选区除锚点外有非空内容时，第一次只提示“只保留左上角「…」，其余 N 格内容会被删除；再点一次合并确认”，
-  模型不变；同一区域第二次点击才执行。
+  模型不变；第二次点击必须同时满足：同一 wb_epoch、同一 doc_gen、同一工作表、同一矩形、
+  锚点内容与待删格内容快照完全一致才执行；换表/换文档/改内容都会重新提示。
+  Esc、切换标签页、切换工作表标签、打开/新建文档都会清掉待确认与格式对话框挂起。
 - 执行时删除非锚点内容（锚点值与格式保留），merge_range 拆相交旧合并；
-  一个 undo Action 同时记录 MergeEdit(before/after merges) + 被删格 delta。
-- 撤销恢复合并列表和被删的每格内容/样式；重做再次删除；保存重开保留 merges 与锚点。
-- 协作：被删格 broadcast_op(Empty)，合并状态 broadcast_merge。
+  一个 undo Action 同时记录 MergeEdit(added/removed 差异) + 被删格 delta。
+- 撤销/重做只按差异增删合并，不整表覆盖 merges；动作之后新增的无关合并保留。
+  若恢复矩形与现有合并相交，跳过该项，避免结构撤销盖掉协作方后加的结构。
+- 撤销恢复被删的每格内容/样式；重做再次删除；保存重开保留 merges 与锚点。
+- 协作：被删格 broadcast_op(Empty)，合并状态 broadcast_merge；do_undo/do_redo 按
+  Applied.merge_changes 广播实际增删的合并矩形。
 2) 格式对话框（FmtState / fmt_merge_pending）
 - “合并单元格/取消合并”只写挂起标记，点“确定”才调用 commit_fmt_merge → toggle_merge；
   取消/关闭清挂起，模型完全不变。
 3) 格式刷（FormatPainter）
-- 记录源区域 rect + 样式号矩阵，按行/列取模平铺到目标选区；
+- 记录源区域 rect + 样式号矩阵 + 取样式时的 wb_epoch/sheet；按行/列取模平铺到目标选区。
+  换文档/换表后样式号不可跨簿解释，套用前校验失败即取消，不套错样式、不新增撤销。
   支持拖选范围、单击一次自动退出、双击 ribbon 进入连续模式、Esc 结束。
 - 目标一次事务、一次撤销；样式经 broadcast_style 同步；目标上限 20 万格。
 
-二、用例（crates/app/src/edit_regression_tests.rs，3 passed）
+二、用例（crates/app/src/edit_regression_tests.rs，7 passed）
 - merge_warns_cancel_keeps_data_and_confirm_is_undoable
   首次提示不动数据；二次确认只留锚点；undo 恢复乙/9 与 merges；redo 再删；
   save_atomic → load_diag 重开 merges/锚点一致。
@@ -26,7 +32,15 @@ UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:30）
 - format_painter_maps_range_continuous_and_escape
   1×2 源样式平铺到 3×2 目标；连续模式刷两次仍在；Esc 清 painter；
   单击模式刷一次自动退出。
-- 全量 app 188 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+- merge_confirmation_is_scoped_to_document_sheet_rect_and_content
+  同表改内容、换到另一表同矩形都重新提示且不删内容；真实 Esc 键事件清待确认后再点仍提示。
+- format_painter_is_rejected_after_document_switch_even_with_same_style_id
+  两簿同 sid 不同样式，换簿后目标格不变、B 簿同号样式不被改写、undo 深度不变。
+- merge_undo_keeps_unrelated_merges_and_redo_restores_only_diff
+  A1:B1 合并后新增 C3:D4，undo 只拆前者，redo 恢复两者。
+- merge_undo_and_redo_broadcast_to_second_client_preserving_its_new_merge
+  双端 poll_net：合并到达；B 新增无关合并；A undo/redo 后 B 结构一致且无关合并保留。
+- 全量 app 192 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 
 三、变异（全红后还原）
 M22 跳过合并二次确认 → FAILED
@@ -35,9 +49,14 @@ M24 undo 不恢复 merges → FAILED
 M25 连续格式刷被强制退出 → FAILED
 M26 格式刷固定取源 [0][0] → FAILED
 M27 Esc 不结束格式刷 → FAILED
+M32 合并确认只比矩形 → merge_confirmation... FAILED
+M33 去掉格式刷文档校验 → format_painter... FAILED
+M34 undo 整表覆盖 merges → merge_undo_keeps... FAILED
+M35 撤销/重做不广播 merge → merge_undo_and_redo... FAILED
 
 四、未执行（父项保持待验收）
 - 真实 GUI 双击 ribbon 格式刷、拖选两个目标范围、Esc 的真实鼠标键盘流程未自动化（当前命令级）。
 - 合并提示是状态栏二次点击，不是 Excel 的模态 MessageBox；未与 Excel/WPS 实机并排对比。
-- 格式刷跨工作表/跨工作簿未覆盖；源区域超过 20 万格未限制（目标已限制）。
-- 合并撤销的协作端未做双端 poll_net 断言（值/样式会广播，merge 状态撤销广播未做）。
+- 真实 GUI 的换表/换簿后点击格式刷流程未自动化；当前为直接调用 apply_format_painter 的命令级 + 文档身份负例。
+- 源区域超过 20 万格未限制（目标已限制）；真实 Excel/WPS 合并冲突（与后加合并相交）行为未对拍。
+- 合并撤销的协作同步已做双端 poll_net 断言；真实网络丢包/重连下的结构冲突未覆盖。

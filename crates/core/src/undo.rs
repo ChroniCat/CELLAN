@@ -59,12 +59,62 @@ pub struct ShapeEdit {
     pub after: Vec<crate::textbox::TextBox>,
 }
 
-/// 合并/取消合并：只记合并矩形列表的前后状态，不整表快照。
+/// 合并/取消合并：只记差异，不整表快照。撤销/重做按差异增删，
+/// 因此动作之后别人新增的无关合并不会被旧的整表列表覆盖。
 #[derive(Clone, Debug)]
 pub struct MergeEdit {
     pub sheet: usize,
-    pub before: Vec<(u32, u32, u32, u32)>,
-    pub after: Vec<(u32, u32, u32, u32)>,
+    /// 这个动作新增的合并矩形
+    pub added: Vec<(u32, u32, u32, u32)>,
+    /// 这个动作拆掉的既有合并矩形（撤销时恢复）
+    pub removed: Vec<(u32, u32, u32, u32)>,
+}
+
+impl MergeEdit {
+    pub fn between(
+        sheet: usize,
+        before: &[(u32, u32, u32, u32)],
+        after: &[(u32, u32, u32, u32)],
+    ) -> Option<Self> {
+        let added: Vec<_> = after.iter().copied().filter(|r| !before.contains(r)).collect();
+        let removed: Vec<_> = before.iter().copied().filter(|r| !after.contains(r)).collect();
+        (!added.is_empty() || !removed.is_empty()).then_some(Self { sheet, added, removed })
+    }
+}
+
+fn rects_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+/// 把一组合并差异应用到表上，返回实际发生的 (矩形, 是否新增)。
+/// 如果恢复/新增的矩形与当前表里另一个合并相交，保留当前（通常是别人后加的），
+/// 跳过这一项，避免结构撤销把协作方的改动盖掉。
+fn apply_merge_diff(
+    sheet: &mut Sheet,
+    add: &[(u32, u32, u32, u32)],
+    remove: &[(u32, u32, u32, u32)],
+) -> Vec<((u32, u32, u32, u32), bool)> {
+    let mut changed = Vec::new();
+    for r in remove {
+        if let Some(pos) = sheet.merges.iter().position(|m| m == r) {
+            sheet.merges.remove(pos);
+            changed.push((*r, false));
+        }
+    }
+    for r in add {
+        if sheet.merges.iter().any(|m| m == r) {
+            continue;
+        }
+        if sheet.merges.iter().any(|m| rects_overlap(*m, *r)) {
+            continue;
+        }
+        sheet.merges.push(*r);
+        changed.push((*r, true));
+    }
+    if !changed.is_empty() {
+        sheet.merges_dirty = true;
+    }
+    changed
 }
 
 /// 一个可撤销的动作
@@ -131,6 +181,8 @@ pub struct Applied {
     pub structural: bool,
     /// 撤销/重做后要写回的外源源尺寸（名字, 行, 列）
     pub refresh_sizes: Option<Vec<(String, u32, u32)>>,
+    /// 撤销/重做实际发生的合并结构变化：(表, 矩形, 是否新增)
+    pub merge_changes: Vec<(usize, (u32, u32, u32, u32), bool)>,
 }
 
 enum Entry {
@@ -391,7 +443,7 @@ impl UndoStack {
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         let Entry::Structure(action) = self.done.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.before);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new() };
         self.undone.push(Entry::Structure(action));
         Some(applied)
     }
@@ -401,7 +453,7 @@ impl UndoStack {
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         let Entry::Structure(action) = self.undone.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.after);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new() };
         self.done.push(Entry::Structure(action));
         Some(applied)
     }
@@ -425,6 +477,7 @@ impl UndoStack {
         let Entry::Cells(action) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
+        let mut merge_changes = Vec::new();
         if let Some(sh) = action.shapes.clone() {
             if let Some(sheet) = sheets.get_mut(sh.sheet) {
                 sheet.textboxes = sh.before;
@@ -437,14 +490,16 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: None,
+                merge_changes,
             };
             self.undone.push(Entry::Cells(action));
             return Some(applied);
         }
         if let Some(m) = action.merges.as_ref() {
             if let Some(sheet) = sheets.get_mut(m.sheet) {
-                sheet.merges = m.before.clone();
-                sheet.merges_dirty = true;
+                for (rect, added) in apply_merge_diff(sheet, &m.removed, &m.added) {
+                    merge_changes.push((m.sheet, rect, added));
+                }
             }
         }
         if let Some(snap) = action.snap_before.clone() {
@@ -459,6 +514,7 @@ impl UndoStack {
                 skipped,
                 structural: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
+                merge_changes,
             };
             self.undone.push(Entry::Cells(action));
             return Some(applied);
@@ -484,6 +540,7 @@ impl UndoStack {
             skipped,
             structural: false,
             refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
+            merge_changes,
         };
         self.undone.push(Entry::Cells(action));
         Some(applied)
@@ -507,6 +564,7 @@ impl UndoStack {
         let Entry::Cells(action) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
+        let mut merge_changes = Vec::new();
         if let Some(sh) = action.shapes.clone() {
             if let Some(sheet) = sheets.get_mut(sh.sheet) {
                 sheet.textboxes = sh.after;
@@ -519,14 +577,16 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
+                merge_changes,
             };
             self.done.push(Entry::Cells(action));
             return Some(applied);
         }
         if let Some(m) = action.merges.as_ref() {
             if let Some(sheet) = sheets.get_mut(m.sheet) {
-                sheet.merges = m.after.clone();
-                sheet.merges_dirty = true;
+                for (rect, added) in apply_merge_diff(sheet, &m.added, &m.removed) {
+                    merge_changes.push((m.sheet, rect, added));
+                }
             }
         }
         if let Some(snap) = action.snap_after.clone() {
@@ -541,6 +601,7 @@ impl UndoStack {
                 skipped,
                 structural: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
+                merge_changes,
             };
             self.done.push(Entry::Cells(action));
             return Some(applied);
@@ -566,6 +627,7 @@ impl UndoStack {
             skipped,
             structural: false,
             refresh_sizes: None,
+            merge_changes,
         };
         self.done.push(Entry::Cells(action));
         Some(applied)

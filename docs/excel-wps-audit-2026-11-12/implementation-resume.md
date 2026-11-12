@@ -9,11 +9,15 @@
 
 ## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
 
-- 合并有内容损失时先提示，二次确认才执行；MergeEdit+delta 一步撤销/重做，保存重开一致。
+- 合并有内容损失时先提示，二次确认才执行；确认绑定 wb_epoch/doc_gen/表/矩形/锚点/待删内容快照，
+  换表、换文档、改内容都重新提示；Esc 与切换标签/工作表会清挂起。
+- MergeEdit 改记 added/removed 差异；undo/redo 只增删差异，保留动作后新增的无关合并；
+  相交冲突跳过恢复，避免覆盖协作方后加结构。
 - 格式对话框的合并改为挂起，确定才执行；取消/关闭完全不改。
-- 格式刷保存源区域样式矩阵、范围平铺、拖选、单击一次、双击连续、Esc 结束、一次撤销。
-- app 188 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored；core 599/41（68 bins）。
-- 变异 M22–M27 全红。未执行：真实 GUI 双击/拖选/Esc、Excel 模态提示对比。
+- 格式刷保存源区域样式矩阵 + wb_epoch/sheet；跨文档/跨表校验失败即取消，避免同 sid 套错。
+- 合并撤销/重做按 Applied.merge_changes 广播；双端 poll_net 断言 undo/redo 一致且保留 B 后加合并。
+- app 192 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored；core 599/41（68 bins）。
+- 变异 M22–M27、M32–M35 全红。未执行：真实 GUI 双击/拖选/Esc、Excel 模态提示对比。
 
 ## 本轮：UI-06 选择性粘贴（待验收）
 

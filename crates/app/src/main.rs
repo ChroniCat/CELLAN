@@ -141,6 +141,21 @@ struct FormatPainter {
     styles: Vec<Vec<u16>>,
     /// 双击进入连续模式，Esc 结束
     continuous: bool,
+    /// 取样式时所在文档身份；换文档后样式号不可跨簿解释，必须取消
+    wb_epoch: u64,
+    sheet: usize,
+}
+
+/// 合并丢内容的待确认状态。绑定文档、表、矩形与待删内容快照；
+/// 任何一项变化都要求重新提示，不能靠一次旧确认删掉别处的内容。
+#[derive(Clone)]
+struct MergePending {
+    wb_epoch: u64,
+    doc_gen: u64,
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    anchor: sheetcore::model::Cell,
+    removed: Vec<(u32, u32, sheetcore::model::Cell)>,
 }
 
 #[derive(Default, Clone)]
@@ -698,8 +713,8 @@ struct SheetApp {
     painter_double: bool,
     /// 最近一次 app 复制时写入系统剪贴板的文本；用于识别之后的外部复制
     clip_stamp: Option<String>,
-    /// 合并会丢内容时的二次确认；再次点合并同一区域才执行
-    merge_pending: Option<(u32, u32, u32, u32)>,
+    /// 合并会丢内容时的二次确认；再次点同一文档/表/矩形且内容未变才执行
+    merge_pending: Option<MergePending>,
     /// 格式对话框里的“合并/取消合并”：确定后才执行，取消不改
     fmt_merge_pending: Option<bool>,
     /// 颜色面板：Some(true)=字体颜色 Some(false)=填充颜色
@@ -6358,6 +6373,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             for (sheet, items) in by_sheet {
                 net.broadcast_style(sheet, items);
             }
+            // 合并结构也要同步；只发内容/样式会让对端留下旧的合并轮廓。
+            for (sheet, rect, on) in applied.merge_changes.iter() {
+                net.broadcast_merge(*sheet, *rect, *on);
+            }
         }
         // 回到出事的格
         let (sheet, row, col) = applied.focus;
@@ -6757,6 +6776,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
 
+        if self.editing.is_none()
+            && (self.merge_pending.is_some() || self.fmt_merge_pending.is_some())
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
+            self.drop_merge_confirmation();
+            self.status = "已取消未确认的合并".into();
+            return;
+        }
         if self.editing.is_none()
             && !self.extra_sel.is_empty()
             && ctx.input(|i| i.key_pressed(Key::Escape))
@@ -8616,14 +8643,11 @@ let txn = self.txn_begin(&keys);
         }
         // 合并只保留左上角内容；其余非空格会被删掉，先让用户确认。
         let mut loss = 0u64;
-        let mut anchor_text = String::new();
+        let mut anchor = sheetcore::model::Cell::default();
         let mut removed_cells: Vec<(u32, u32, sheetcore::model::Cell)> = Vec::new();
         {
             let sheet = self.wb.sheet(self.sheet_idx);
-            anchor_text = sheet
-                .get(r1, c1)
-                .map(|c| c.value.display())
-                .unwrap_or_default();
+            anchor = sheet.get(r1, c1).cloned().unwrap_or_default();
             if on {
                 for r in r1..=r2 {
                     for c in c1..=c2 {
@@ -8640,9 +8664,30 @@ let txn = self.txn_begin(&keys);
                 }
             }
         }
-        if on && loss > 0 && self.merge_pending != Some((r1, c1, r2, c2)) {
-            self.merge_pending = Some((r1, c1, r2, c2));
-            let shown = if anchor_text.is_empty() { "（空）" } else { anchor_text.as_str() };
+        let confirmed = on
+            && loss > 0
+            && self.merge_pending.as_ref().is_some_and(|p| {
+                p.wb_epoch == self.wb_epoch
+                    && p.doc_gen == self.doc_gen
+                    && p.sheet == self.sheet_idx
+                    && p.rect == (r1, c1, r2, c2)
+                    && p.anchor == anchor
+                    && p.removed == removed_cells
+            });
+        if on && loss > 0 && !confirmed {
+            let shown = if anchor.value.display().is_empty() {
+                "（空）".to_string()
+            } else {
+                anchor.value.display()
+            };
+            self.merge_pending = Some(MergePending {
+                wb_epoch: self.wb_epoch,
+                doc_gen: self.doc_gen,
+                sheet: self.sheet_idx,
+                rect: (r1, c1, r2, c2),
+                anchor,
+                removed: removed_cells.clone(),
+            });
             self.status = format!(
                 "合并只保留左上角「{shown}」的内容，其余 {loss} 格内容会被删除；再点一次合并确认"
             );
@@ -8671,11 +8716,11 @@ let txn = self.txn_begin(&keys);
         if changed {
             self.undo.push(sheetcore::undo::Action {
                 label: if on { "合并单元格".into() } else { "取消合并".into() },
-                merges: Some(sheetcore::undo::MergeEdit {
-                    sheet: self.sheet_idx,
-                    before: before_merges,
-                    after: after_merges,
-                }),
+                merges: sheetcore::undo::MergeEdit::between(
+                    self.sheet_idx,
+                    &before_merges,
+                    &after_merges,
+                ),
                 deltas,
                 focus: (self.sheet_idx, self.sel.0, self.sel.1),
                 snap_before: None,
@@ -8710,6 +8755,12 @@ let txn = self.txn_begin(&keys);
     /// 格式刷：把源区域样式按行列重复铺到当前选区，一次撤销。
     fn apply_format_painter(&mut self) {
         let Some(p) = self.format_painter.clone() else { return };
+        if p.wb_epoch != self.wb_epoch || p.sheet != self.sheet_idx {
+            self.format_painter = None;
+            self.painter_double = false;
+            self.status = "文档或工作表已切换，格式刷已取消".into();
+            return;
+        }
         if self.edit_blocked() {
             return;
         }
@@ -21524,6 +21575,9 @@ fn elide(s: &str, max_chars: usize) -> String {
 
     /// 把当前文档从 self 上"取下来"
     fn park_current(&mut self) -> Box<ParkedDoc> {
+        self.drop_merge_confirmation();
+        self.format_painter = None;
+        self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
         self.find.find_all_open = false;
@@ -21554,6 +21608,9 @@ fn elide(s: &str, max_chars: usize) -> String {
 
     /// 把一份挂起的文档装到 self 上
     fn activate_parked(&mut self, doc: Box<ParkedDoc>) {
+        self.drop_merge_confirmation();
+        self.format_painter = None;
+        self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
         self.find.find_all.clear();
@@ -21590,6 +21647,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         if self.editing.is_some() {
             return;
         }
+        self.drop_merge_confirmation();
         let parked = self.park_current();
         self.tabs[self.active_tab] = TabSlot::Parked(parked);
         let target = std::mem::replace(&mut self.tabs[idx], TabSlot::Active);
@@ -21625,6 +21683,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         if self.editing.is_some() {
             return;
         }
+        self.drop_merge_confirmation();
         let parked = self.park_current();
         self.tabs[self.active_tab] = TabSlot::Parked(parked);
         self.tabs.push(TabSlot::Active);
@@ -21699,8 +21758,17 @@ fn elide(s: &str, max_chars: usize) -> String {
         false
     }
 
+    /// 合并确认与格式对话框里的待执行合并都不能跨文档/表/操作残留。
+    fn drop_merge_confirmation(&mut self) {
+        self.merge_pending = None;
+        self.fmt_merge_pending = None;
+    }
+
     /// 打开一个新文档时把编辑态清干净
     fn reset_editor_state(&mut self) {
+        self.drop_merge_confirmation();
+        self.format_painter = None;
+        self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
         self.find.find_all.clear();
@@ -23571,6 +23639,11 @@ impl eframe::App for SheetApp {
                 self.tab_scroll = out.state.offset.x;
                 });
                 if let Some(i) = goto {
+                    if i != self.sheet_idx {
+                        self.drop_merge_confirmation();
+                        self.format_painter = None;
+                        self.painter_double = false;
+                    }
                     self.sheet_idx = i;
                     self.sel = (0, 0);
                 }

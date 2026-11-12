@@ -399,6 +399,8 @@ impl SheetApp {
                     rect: (r1, c1, r2, c2),
                     styles,
                     continuous,
+                    wb_epoch: self.wb_epoch,
+                    sheet: self.sheet_idx,
                 });
                 self.status = if continuous {
                     "格式刷（连续）：选择目标区域，Esc 结束".into()

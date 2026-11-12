@@ -3910,3 +3910,173 @@ fn paste_special_prefers_newer_system_clipboard_over_stale_internal_clip() {
     assert_eq!(app.wb.sheet(0).get(8, 0).unwrap().value, Value::Text("内部甲".into()));
     assert_eq!(app.wb.sheet(0).get(8, 1).unwrap().value, Value::Text("内部乙".into()));
 }
+
+/// UI-27 复核：合并确认绑定文档/表/矩形/待删内容；换表、换内容、Esc 取消都重新提示。
+#[test]
+fn merge_confirmation_is_scoped_to_document_sheet_rect_and_content() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.toggle_merge(true);
+    assert!(app.merge_pending.is_some(), "首次丢内容应进入待确认");
+
+    // 同表同矩形但待删内容变了：旧确认必须失效，且这一下不能删
+    app.wb.sheet_mut(0).set(0, 1, text("乙改"));
+    app.toggle_merge(true);
+    assert!(app.wb.sheet(0).merges.is_empty());
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value, Value::Text("乙改".into()));
+    assert!(app.status.contains("再点一次"), "内容变化后必须重新确认: {}", app.status);
+
+    // 换到另一张表，同矩形一次点击也不能复用 A 表的确认
+    app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    app.toggle_merge(true);
+    assert!(app.merge_pending.is_some());
+    let mut sh = sheetcore::model::Sheet::new("另一表");
+    sh.set(0, 0, text("丙"));
+    sh.set(0, 1, text("丁"));
+    app.wb.sheets.push(sh);
+    app.sheet_idx = 1;
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.toggle_merge(true);
+    assert!(app.wb.sheet(1).merges.is_empty(), "B 表不能被 A 表确认删内容");
+    assert_eq!(app.wb.sheet(1).get(0, 1).unwrap().value, Value::Text("丁".into()));
+    assert!(app.status.contains("再点一次"));
+
+    // Esc 是真实按键事件：清掉待确认，再点必须重新提示
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.merge_pending.is_none(), "Esc 必须失效待确认");
+    assert!(app.status.contains("已取消未确认的合并"));
+    app.toggle_merge(true);
+    assert!(app.wb.sheet(1).merges.is_empty());
+    assert!(app.status.contains("再点一次"));
+}
+
+/// UI-27 复核：格式刷样式号不能跨文档解释；换簿后不套错样式、不新增撤销。
+#[test]
+fn format_painter_is_rejected_after_document_switch_even_with_same_style_id() {
+    let mut app = app();
+    let mut bold = app.wb.styles.get(0).clone();
+    bold.bold = true;
+    let a_sid = app.wb.styles.intern(bold);
+    app.wb.sheet_mut(0).set_style(0, 0, a_sid);
+    app.format_painter = Some(FormatPainter {
+        rect: (0, 0, 0, 0),
+        styles: vec![vec![a_sid]],
+        continuous: false,
+        wb_epoch: app.wb_epoch,
+        sheet: 0,
+    });
+
+    let mut wb2 = sheetcore::model::Workbook::new_blank();
+    wb2.sheet_mut(0).set(0, 0, text("乙簿"));
+    let mut italic = wb2.styles.get(0).clone();
+    italic.italic = true;
+    let b_sid = wb2.styles.intern(italic);
+    assert_eq!(a_sid, b_sid, "两簿同一样式号但语义不同，正是风险场景");
+    wb2.sheet_mut(0).set_style(0, 1, b_sid);
+    app.wb = wb2;
+    app.wb_epoch = app.wb_epoch.wrapping_add(1);
+    app.doc_gen = 0;
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    let before = app.undo.depth();
+    app.apply_format_painter();
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), 0, "目标格不能套上 A 簿样式号");
+    assert!(!app.wb.styles.get(app.wb.sheet(0).style_of(0, 1)).bold, "B 簿自己的同号样式不能被改写");
+    assert_eq!(app.undo.depth(), before, "取消的格式刷不能新增撤销");
+    assert!(app.format_painter.is_none());
+    assert!(app.status.contains("格式刷已取消"));
+}
+
+/// UI-27 复核：撤销合并只按差异回滚，保留动作之后新增的无关合并。
+#[test]
+fn merge_undo_keeps_unrelated_merges_and_redo_restores_only_diff() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.toggle_merge(true);
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+    app.wb.sheet_mut(0).merge_range(3, 3, 4, 4);
+    assert_eq!(app.wb.sheet(0).merges.len(), 2);
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).merges, vec![(3, 3, 4, 4)], "撤销不能整表覆盖后加的合并");
+    app.do_undo(true);
+    assert!(app.wb.sheet(0).merges.contains(&(0, 0, 0, 1)));
+    assert!(app.wb.sheet(0).merges.contains(&(3, 3, 4, 4)));
+}
+
+/// UI-27 复核：合并撤销/重做要广播结构；第二客户端后加的无关合并保留。
+#[test]
+fn merge_undo_and_redo_broadcast_to_second_client_preserving_its_new_merge() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = crate::net::host_on(listener, 1, "甲".into(), "doc".into(), "pw".into()).unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let peer = crate::net::join(2, "乙".into(), "doc".into(), &addr, "pw".into()).unwrap();
+    let mut a = app();
+    let mut b = app();
+    a.peer = Some(sheetcore::sync::Peer::new(1));
+    b.peer = Some(sheetcore::sync::Peer::new(2));
+    a.net = Some(host);
+    b.net = Some(peer);
+    for _ in 0..40 {
+        a.poll_net();
+        b.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    a.wb.sheet_mut(0).set(0, 0, text("甲"));
+    a.sel = (0, 0);
+    a.sel_end = (0, 1);
+    a.toggle_merge(true);
+    assert_eq!(a.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+    let mut got_merge = false;
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).merges == vec![(0, 0, 0, 1)] {
+            got_merge = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_merge, "第二客户端要收到合并结构");
+
+    // B 在期间新增一个无关合并；A 的撤销不能把它抹掉
+    b.wb.sheet_mut(0).merge_range(5, 5, 6, 6);
+    a.do_undo(false);
+    assert!(a.wb.sheet(0).merges.is_empty());
+    let mut got_undo = false;
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).merges == vec![(5, 5, 6, 6)] {
+            got_undo = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_undo, "撤销合并要广播，且保留对端后加的合并: {:?}", b.wb.sheet(0).merges);
+
+    a.do_undo(true);
+    assert!(a.wb.sheet(0).merges.contains(&(0, 0, 0, 1)));
+    let mut got_redo = false;
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).merges.contains(&(0, 0, 0, 1))
+            && b.wb.sheet(0).merges.contains(&(5, 5, 6, 6))
+        {
+            got_redo = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(got_redo, "重做合并要广播，且不覆盖对端无关合并: {:?}", b.wb.sheet(0).merges);
+    a.net.as_mut().unwrap().shutdown();
+    b.net.as_mut().unwrap().shutdown();
+}
