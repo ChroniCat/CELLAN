@@ -2623,3 +2623,45 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 - 全部 `app` 测试：81 单测 + 12 UI 回归通过（`ribbon_groups_aligned_and_fit` 改为 8 组、
   允许 Excel 宽度，窗口不足时横向滚动，与 Excel 一致）。
 - `SC_WIN_W/SC_WIN_H` 可覆盖窗口尺寸，便于按 Excel 宽度截图核对。
+
+### 第三十四轮：迷你图（折线 / 柱形 / 盈亏）全链路（2026-11-12）
+
+**存储与模型**
+
+- 新增 `crates/core/src/sparkline.rs`：`Sparkline { 锚点格, 数据表+区域, 类型, 颜色, 标记/高点/低点/首点/末点/负点/坐标轴, 空单元格处理 }`。
+- 文件格式照本机 Excel 365 造的样本实测（`crates/core/tests/data/sparklines.xlsx`，由 Excel COM 生成）：
+  工作表 `<extLst><ext uri="{05C60535-1F16-4fd2-B633-F4F36F0B64E0}" xmlns:x14=…>` 里的
+  `<x14:sparklineGroups>`；折线不写 `type`、柱形 `type="column"`、**盈亏是 `type="stacked" negative="1"`**（这点容易猜错）；
+  颜色 8 项固定顺序 `colorSeries/colorNegative/colorAxis/colorMarkers/colorFirst/colorLast/colorHigh/colorLow`，ARGB。
+- 读取拍平成「一个锚点一条」，写回时把连续且格式相同的重新合成一组——Excel 的分组只是共享格式，语义等价，
+  改一条不会连带改同组的另一条（模型里就是独立条目）。
+- `set_sparklines()` 只摘自己那条 `<ext>`，extLst 里别的扩展（x14 数据验证等）原样保留；清空迷你图时 extLst 一起删掉。
+
+**界面**
+
+- 插入页签新增「迷你图」组（折线 / 柱形 / 盈亏，42×76 大按钮，图标走 `ui_icons` 矢量：格子 + 小折线/柱/上下块）。
+- 「创建迷你图」对话框：数据范围、位置范围、类型（带实时缩略预览）、8 色调色板、7 个显示开关、空单元格三选一。
+  位置多格时按 Excel 的规则与数据一一对应（单格取整段；多行单列逐行；单行多列逐列；对不上直接报错，不硬塞）。
+- 选中带迷你图的单元格时出现「迷你图工具 > 迷你图」上下文页签（数据 / 类型 / 显示 / 组），
+  类型与显示开关都是真写模型、真重画、可撤销路径（走 `spark_apply_sel`）。
+- 单元格内绘制：`crates/app/src/spark_view.rs`，四边留 2px；折线 1px、柱形含 0 缩放、盈亏按中线上下分色（负值用 `colorNegative`）。
+- 行列结构改动时锚点和同表数据区一起位移；锚点被删掉的那条丢弃；跨表数据引用在源表结构变化时同步位移。
+
+**踩到的坑**
+
+- 装载后的后台重算会**整份替换 `wb`**（`OpenMsg::Recalced` 只在 `doc_gen != 0` 时丢弃结果）。
+  迷你图是在装载回调里建的，一开始没推进 `doc_gen`，结果「新建成功、画面上没有」；三个写入口现在都补了 `doc_gen += 1`。
+- `SC_SEL2` 以前只在个别钩子里生效，`reset_editor_state()` 会把选区清回 A1，导致多格选区钩子全部拿到单格；
+  现在 `reset_editor_state` 会按 `SC_SEL/SC_SEL2` 恢复。
+- 第一次截图看不到迷你图，是因为样本 `table.xlsx` 的 A1:E1 全是文本（姓名/部门/金额），
+  迷你图取不到数值本来就不画；换成 Excel 造的数值样本（1,-2,3,4,-5）后像素与视觉都确认。
+
+**验收（实测）**
+
+- `cargo test -p sheetcore --test sparklines`：读 Excel 样本 5 条（F1 折线 / F2 柱形 / F3 盈亏 / G1:G2 双迷你图组）→ 改色改类型 + 新增 H1 → 另存 → 自家加载器回读 6 条，格式与锚点全对。
+- Excel COM 回读我们写出的文件：`Range("F1").SparklineGroups.Item(1).Type` = column、颜色 `#00B050`、源数据 `$A$1:$E$1`；
+  `sparklineGroups` 只出现一次、extLst 仍是 worksheet 最后一个子元素。
+- `SC_DUMP` 抓到 `sparkline (0,5) Column 点=5 颜色=[55, 96, 146]`；截图按像素找到蓝 (55,96,146) 与红 (255,0,0) 两类笔画，
+  视觉复核 F1 红折线、F2 蓝柱形（有正负）、F3 上半蓝下半红的盈亏。
+- 插入页签「迷你图」组三个按钮与图标、选中 F1 后出现的「迷你图」上下文页签，均截图确认。
+- 测试数：sheetcore 单测 +6（迷你图），`app` 单测 86、UI 回归 14（新增 `sparklines_render_in_cells`、`sparkline_create_from_selection`）。

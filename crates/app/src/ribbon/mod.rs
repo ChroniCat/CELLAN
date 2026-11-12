@@ -659,7 +659,7 @@ mod tests {
     fn parses_and_ids_are_unique() {
         let r = load();
         assert_eq!(r.tabs.len(), 9, "页签数");
-        assert_eq!(r.context.len(), 2, "上下文页签数");
+        assert_eq!(r.context.len(), 3, "上下文页签数（表设计 / 迷你图 / 图表工具）");
         let ids = all_ids(&r);
         let mut seen = BTreeSet::new();
         for id in &ids {
@@ -678,7 +678,8 @@ mod tests {
             ["文件", "开始", "插入", "页面布局", "公式", "数据", "审阅", "视图", "帮助"]
         );
         assert_eq!(r.context[0].tab.label, "表设计");
-        assert_eq!(r.context[1].tab.label, "图表工具");
+        assert_eq!(r.context[1].tab.label, "迷你图");
+        assert_eq!(r.context[2].tab.label, "图表工具");
     }
 
     /// XML 里声明的命令必须都能在 ribbon_action 里找到对应的臂。

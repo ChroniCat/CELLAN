@@ -193,6 +193,30 @@ impl SheetApp {
                     st.visible = false;
                 }
             }
+            "SparkTypeLine" => {
+                if let Some(sp) = self.spark_at_sel() {
+                    st.checked = sp.kind == sheetcore::sparkline::SparkKind::Line;
+                }
+            }
+            "SparkTypeColumn" => {
+                if let Some(sp) = self.spark_at_sel() {
+                    st.checked = sp.kind == sheetcore::sparkline::SparkKind::Column;
+                }
+            }
+            "SparkTypeWinLoss" => {
+                if let Some(sp) = self.spark_at_sel() {
+                    st.checked = sp.kind == sheetcore::sparkline::SparkKind::WinLoss;
+                }
+            }
+            "SparkMarkers" => st.checked = self.spark_at_sel().map(|s| s.markers).unwrap_or(false),
+            "SparkHigh" => st.checked = self.spark_at_sel().map(|s| s.high).unwrap_or(false),
+            "SparkLow" => st.checked = self.spark_at_sel().map(|s| s.low).unwrap_or(false),
+            "SparkFirst" => st.checked = self.spark_at_sel().map(|s| s.first).unwrap_or(false),
+            "SparkLast" => st.checked = self.spark_at_sel().map(|s| s.last).unwrap_or(false),
+            "SparkNegative" => {
+                st.checked = self.spark_at_sel().map(|s| s.negative).unwrap_or(false)
+            }
+            "SparkAxis" => st.checked = self.spark_at_sel().map(|s| s.axis).unwrap_or(false),
             "TableName" => {
                 if let Some(t) = self.table_at_sel() {
                     st.text = Some(format!("表名：{}", t.display));
@@ -683,6 +707,28 @@ impl SheetApp {
                 self.status = "已重新应用筛选".into();
             }
             "HeaderFooter" => self.hf_dlg = true,
+            // ---------------------------------------------------- 迷你图
+            "SparkLine" => self.spark_open_create(sheetcore::sparkline::SparkKind::Line),
+            "SparkColumn" => self.spark_open_create(sheetcore::sparkline::SparkKind::Column),
+            "SparkWinLoss" => self.spark_open_create(sheetcore::sparkline::SparkKind::WinLoss),
+            "SparkEdit" => self.spark_open_edit(),
+            "SparkClear" => self.spark_delete_in_sel(),
+            "SparkTypeLine" => {
+                self.spark_apply_sel(|s| s.kind = sheetcore::sparkline::SparkKind::Line)
+            }
+            "SparkTypeColumn" => {
+                self.spark_apply_sel(|s| s.kind = sheetcore::sparkline::SparkKind::Column)
+            }
+            "SparkTypeWinLoss" => {
+                self.spark_apply_sel(|s| s.kind = sheetcore::sparkline::SparkKind::WinLoss)
+            }
+            "SparkMarkers" => self.spark_apply_sel(|s| s.markers = !s.markers),
+            "SparkHigh" => self.spark_apply_sel(|s| s.high = !s.high),
+            "SparkLow" => self.spark_apply_sel(|s| s.low = !s.low),
+            "SparkFirst" => self.spark_apply_sel(|s| s.first = !s.first),
+            "SparkLast" => self.spark_apply_sel(|s| s.last = !s.last),
+            "SparkNegative" => self.spark_apply_sel(|s| s.negative = !s.negative),
+            "SparkAxis" => self.spark_apply_sel(|s| s.axis = !s.axis),
             "NameManager" => self.name_mgr = true,
 
             // ---------------------------------------------------- 数据

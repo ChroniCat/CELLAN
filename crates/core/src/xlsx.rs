@@ -583,6 +583,23 @@ pub fn load(path: &Path) -> Result<Workbook> {
     }
     // inlineStr 富文本（我们写出的文件；Excel 的 sharedStrings 富文本仍是纯文本）
     if is_ooxml {
+        // 迷你图：工作表 extLst 里的 x14:sparklineGroups
+        if let Ok(targets) = crate::patch::sheet_targets(path) {
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(part) = targets.get(&sheet.name) {
+                    if let Some(bytes) = crate::fixups::read_part_file(path, part) {
+                        if let Ok(xml) = String::from_utf8(bytes) {
+                            let list = crate::sparkline::parse_sheet(&xml);
+                            if !list.is_empty() {
+                                sheet.sparklines = list;
+                                // 模型外的属性不保证原样保留，载入即标记重写
+                                sheet.sparklines_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Ok(targets) = crate::patch::sheet_targets(path) {
             for sheet in wb.sheets.iter_mut() {
                 if let Some(part) = targets.get(&sheet.name) {
@@ -1385,6 +1402,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     if let Err(e) = crate::hyperlinks::apply(path, wb) {
         eprintln!("[save] 超链接写回失败: {e:#}");
+    }
+    if let Err(e) = crate::sparkline::apply(path, wb) {
+        eprintln!("[save] 迷你图写回失败: {e:#}");
     }
     if let Err(e) = crate::patch::apply_rich(path, wb) {
         eprintln!("[save] 富文本写回失败: {e:#}");

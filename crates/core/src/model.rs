@@ -192,6 +192,10 @@ pub struct Sheet {
     /// 单元格超链接
     pub hyperlinks: std::collections::HashMap<(u32, u32), crate::hyperlinks::Hyperlink>,
     pub hyperlinks_dirty: bool,
+    /// 单元格迷你图（Excel 的 x14 sparklineGroups）
+    pub sparklines: Vec<crate::sparkline::Sparkline>,
+    /// 迷你图被改过：保存时要重写工作表 extLst
+    pub sparklines_dirty: bool,
 }
 
 impl Sheet {
@@ -252,6 +256,8 @@ impl Sheet {
             rich_dirty: false,
             hyperlinks: std::collections::HashMap::new(),
             hyperlinks_dirty: false,
+            sparklines: Vec::new(),
+            sparklines_dirty: false,
         }
     }
 

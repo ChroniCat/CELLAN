@@ -83,6 +83,12 @@ pub enum Icon {
     TraceIn,
     /// 追踪从属单元格：方块 + 离开它的箭头
     TraceOut,
+    /// 迷你图-折线
+    SparkLine,
+    /// 迷你图-柱形
+    SparkColumn,
+    /// 迷你图-盈亏
+    SparkLoss,
 }
 
 // ---------------------------------------------------------------- 色板
@@ -316,6 +322,13 @@ impl Pen<'_> {
     fn rule(&self, x: f32, y: f32, len: f32, c: Color32) {
         self.bar(x, y, len, 1.7, c);
     }
+}
+
+/// 图标里那一格浅色网格（迷你图按钮上都有）
+fn grid(pen: &Pen<'_>, x: f32, y: f32, w: f32, h: f32) {
+    pen.ln(x + w / 3.0, y, x + w / 3.0, y + h, 0.6, BLUE_XL);
+    pen.ln(x + w * 2.0 / 3.0, y, x + w * 2.0 / 3.0, y + h, 0.6, BLUE_XL);
+    pen.ln(x, y + h / 2.0, x + w, y + h / 2.0, 0.6, BLUE_XL);
 }
 
 // ---------------------------------------------------------------- 入口
@@ -732,6 +745,48 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.rro(12.0, 7.0, 9.0, 10.0, 1.0, BLUE_D, 1.4);
             pen.ln(3.0, 12.0, 9.0, 12.0, 1.5, RED);
             pen.poly(&[(11.0, 12.0), (7.5, 9.6), (7.5, 14.4)], RED, RED, 0.0);
+        }
+        // ---- 迷你图 ----
+        SparkLine => {
+            // 浅色格子 + 蓝折线（和 Excel 的“折线迷你图”按钮同构）
+            pen.rr(3.0, 5.0, 18.0, 14.0, 0.8, BLUE_L);
+            pen.rro(3.0, 5.0, 18.0, 14.0, 0.8, BLUE_S, 1.0);
+            grid(&pen, 3.0, 5.0, 18.0, 14.0);
+            let pts = [
+                (5.0, 15.0),
+                (8.0, 10.5),
+                (11.0, 13.0),
+                (14.0, 8.0),
+                (19.0, 11.5),
+            ];
+            for w in pts.windows(2) {
+                pen.ln(w[0].0, w[0].1, w[1].0, w[1].1, 1.5, BLUE_D);
+            }
+            pen.bar(18.0, 7.0, 2.0, 2.0, RED);
+        }
+        SparkColumn => {
+            pen.rr(3.0, 5.0, 18.0, 14.0, 0.8, WHITE);
+            pen.rro(3.0, 5.0, 18.0, 14.0, 0.8, BLUE_S, 1.0);
+            grid(&pen, 3.0, 5.0, 18.0, 14.0);
+            // 五根柱，高低错开
+            let bars = [(5.0, 6.0), (8.0, 9.5), (11.0, 4.0), (14.0, 8.0), (17.0, 5.0)];
+            for (x, h) in bars {
+                pen.bar(x, 18.0 - h, 2.2, h, BLUE_M_D);
+            }
+        }
+        SparkLoss => {
+            pen.rr(3.0, 5.0, 18.0, 14.0, 0.8, WHITE);
+            pen.rro(3.0, 5.0, 18.0, 14.0, 0.8, BLUE_S, 1.0);
+            // 中线 + 上下分别的红绿块（Excel 的盈亏图标就是这个意思）
+            pen.ln(4.0, 12.0, 20.0, 12.0, 0.9, INK);
+            for (i, up) in [true, false, true, false, true].iter().enumerate() {
+                let x = 5.0 + i as f32 * 3.0;
+                if *up {
+                    pen.bar(x, 9.2, 2.2, 2.8, GREEN);
+                } else {
+                    pen.bar(x, 12.0, 2.2, 2.8, RED);
+                }
+            }
         }
         TraceOut => {
             // 追踪从属：箭头从本格指向外面

@@ -136,6 +136,78 @@ fn locked_cell_is_marked() {
     assert!(has_cell(&dump, 1, 1, "研发"), "内容没画出来");
 }
 
+// ---------------------------------------------------------------- 迷你图
+
+/// 仓库里 Excel 365 造的迷你图样本（三种类型 + 双迷你图组）
+fn spark_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../core/tests/data/sparklines.xlsx")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("../core/tests/data/sparklines.xlsx"))
+}
+
+#[test]
+fn sparklines_render_in_cells() {
+    let f = spark_fixture();
+    if !f.exists() {
+        eprintln!("跳过：缺少 {}", f.display());
+        return;
+    }
+    let Some(dump) = dump_for(&f.to_string_lossy(), &[], Duration::from_secs(30)) else {
+        return;
+    };
+    let lines: Vec<&str> = dump
+        .lines()
+        .filter(|l| l.starts_with("sparkline "))
+        .collect();
+    assert_eq!(lines.len(), 5, "五条迷你图都要画：\n{dump}");
+    // F1 折线、F2 柱形、F3 盈亏，各 5 个点
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("sparkline (0,5) Line") && l.contains("点=5")),
+        "F1 折线没画：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("sparkline (1,5) Column")),
+        "F2 柱形没画：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("sparkline (2,5) WinLoss")),
+        "F3 盈亏没画：{lines:?}"
+    );
+}
+
+#[test]
+fn sparkline_create_from_selection() {
+    // 用两张表的普通文件，按 A1:E1 选区建柱形迷你图，落在 F1
+    let src = Path::new("F:/Finance/work/table.xlsx");
+    if !src.exists() {
+        eprintln!("跳过：缺少 {}", src.display());
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ui_spark_{}.xlsx", std::process::id()));
+    std::fs::copy(src, &tmp).unwrap();
+    let Some(dump) = dump_for(
+        &tmp.to_string_lossy(),
+        &[
+            ("SC_SEL", "0,0"),
+            ("SC_SEL2", "0,4"),
+            ("SC_SPARK", "column"),
+        ],
+        Duration::from_secs(30),
+    ) else {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    };
+    assert!(
+        dump.lines()
+            .any(|l| l.starts_with("sparkline (0,5) Column") && l.contains("点=5")),
+        "选区建的迷你图没画出来：\n{dump}"
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
+
 /// 造一个只有 A1 的小文件，可选地带上字体（走真实的 xlsx 写盘）
 fn make_font_fixture(name: &str, font: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("sheet_ui_font");

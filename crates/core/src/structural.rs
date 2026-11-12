@@ -436,6 +436,7 @@ impl Sheet {
         self.shift_notes(at, n, true, false);
         self.shift_cf(at, n, true, false);
         self.shift_dv(at, n, true, false);
+        self.shift_sparklines(at, n, true, false);
         if let Some((fr, fc)) = self.freeze {
             if fr >= at {
                 self.freeze = Some((fr + n, fc));
@@ -466,6 +467,7 @@ impl Sheet {
         self.shift_notes(at, n, true, true);
         self.shift_cf(at, n, true, true);
         self.shift_dv(at, n, true, true);
+        self.shift_sparklines(at, n, true, true);
         if let Some((fr, fc)) = self.freeze {
             let nf = if fr >= at + n { fr - n } else { at.min(fr) };
             self.freeze = Some((nf, fc));
@@ -493,6 +495,7 @@ impl Sheet {
         self.shift_notes(at, n, false, false);
         self.shift_cf(at, n, false, false);
         self.shift_dv(at, n, false, false);
+        self.shift_sparklines(at, n, false, false);
         if let Some((fr, fc)) = self.freeze {
             if fc >= at {
                 self.freeze = Some((fr, fc + n));
@@ -521,6 +524,7 @@ impl Sheet {
         self.shift_notes(at, n, false, true);
         self.shift_cf(at, n, false, true);
         self.shift_dv(at, n, false, true);
+        self.shift_sparklines(at, n, false, true);
         if let Some((fr, fc)) = self.freeze {
             let nf = if fc >= at + n { fc - n } else { at.min(fc) };
             self.freeze = Some((fr, nf));
@@ -548,6 +552,56 @@ impl Sheet {
             }
         }
         self.notes = out;
+    }
+
+    /// 迷你图跟着行列结构走：锚点格位移，同表的数据区一起位移；
+    /// 锚点被删掉的那条直接丢弃（和 Excel 一致）。
+    fn shift_sparklines(&mut self, at: u32, n: u32, rows: bool, del: bool) {
+        if n == 0 || self.sparklines.is_empty() {
+            return;
+        }
+        let old = std::mem::take(&mut self.sparklines);
+        let mut out = Vec::with_capacity(old.len());
+        for mut sp in old {
+            let anchor = if rows { sp.r } else { sp.c };
+            let Some(na) = shift_axis(anchor, at, n, del) else {
+                continue;
+            };
+            if rows {
+                sp.r = na;
+            } else {
+                sp.c = na;
+            }
+            if sp.source_sheet.is_none() {
+                let (r1, c1, r2, c2) = sp.rect;
+                let (a, b) = if rows {
+                    let a = shift_axis(r1, at, n, del);
+                    let b = shift_axis(r2, at, n, del);
+                    (a, b)
+                } else {
+                    let a = shift_axis(c1, at, n, del);
+                    let b = shift_axis(c2, at, n, del);
+                    (a, b)
+                };
+                match (rows, a, b) {
+                    // 整段都被删掉：这条迷你图没有数据了
+                    (true, None, None) | (false, None, None) => continue,
+                    (true, a, b) => {
+                        let nr1 = a.unwrap_or(at);
+                        let nr2 = b.unwrap_or(nr1);
+                        sp.rect = (nr1, c1, nr2.max(nr1), c2);
+                    }
+                    (false, a, b) => {
+                        let nc1 = a.unwrap_or(at);
+                        let nc2 = b.unwrap_or(nc1);
+                        sp.rect = (r1, nc1, r2, nc2.max(nc1));
+                    }
+                }
+            }
+            out.push(sp);
+        }
+        self.sparklines = out;
+        self.sparklines_dirty = true;
     }
 
     fn shift_cf(&mut self, at: u32, n: u32, rows: bool, del: bool) {
@@ -705,6 +759,27 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
             if ch.rewrite_refs(&shift) {
                 sheet.charts_dirty = true;
             }
+        }
+        // 迷你图：数据在别的表上的，引用跟着那张表一起位移
+        for sp in sheet.sparklines.iter_mut() {
+            if sp.source_sheet.as_deref() != Some(name.as_str()) {
+                continue;
+            }
+            let (r1, c1, r2, c2) = sp.rect;
+            if axis == crate::refs::Axis::Row {
+                let a = shift_axis(r1, at, n, delete);
+                let b = shift_axis(r2, at, n, delete);
+                let nr1 = a.unwrap_or(at);
+                let nr2 = b.unwrap_or(nr1);
+                sp.rect = (nr1, c1, nr2.max(nr1), c2);
+            } else {
+                let a = shift_axis(c1, at, n, delete);
+                let b = shift_axis(c2, at, n, delete);
+                let nc1 = a.unwrap_or(at);
+                let nc2 = b.unwrap_or(nc1);
+                sp.rect = (r1, nc1, r2, nc2.max(nc1));
+            }
+            sheet.sparklines_dirty = true;
         }
     }
     // 记一笔，保存时搬透视表缓存

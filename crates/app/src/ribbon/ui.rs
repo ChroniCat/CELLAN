@@ -106,6 +106,23 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
         }
     }
+    // 选中带迷你图的单元格才出现「迷你图工具」
+    if app.spark_at_sel().is_some() {
+        if let Some(c) = app
+            .ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetSparklineTools")
+        {
+            let label = c.tab.label.clone();
+            let r = ui_kit::tab_ex(ui, &label, app.ribbon_tab == 102, false);
+            if r.clicked() {
+                app.ribbon_tab = 102;
+                app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
+            }
+        }
+    }
 }
 
 /// 当前页签的功能区主体。
@@ -126,6 +143,9 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         if app.ribbon_tab == 101 && app.chart_at_sel().is_none() {
             app.ribbon_tab = 1;
         }
+        if app.ribbon_tab == 102 && app.spark_at_sel().is_none() {
+            app.ribbon_tab = 1;
+        }
     }
     let tab = match app.ribbon_tab {
         100 => app
@@ -139,6 +159,12 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
             .context
             .iter()
             .find(|c| c.set_id == "TabSetChartTools")
+            .map(|c| c.tab.clone()),
+        102 => app
+            .ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetSparklineTools")
             .map(|c| c.tab.clone()),
         n if n < app.ribbon.tabs.len() => Some(app.ribbon.tabs[n].clone()),
         _ => None,
@@ -1167,6 +1193,9 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "ZhT" => Icon::ZhT,
         "TraceIn" => Icon::TraceIn,
         "TraceOut" => Icon::TraceOut,
+        "SparkLine" => Icon::SparkLine,
+        "SparkColumn" => Icon::SparkColumn,
+        "SparkLoss" => Icon::SparkLoss,
         _ => return None,
     })
 }
