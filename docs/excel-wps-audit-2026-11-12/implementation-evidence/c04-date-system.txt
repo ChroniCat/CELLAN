@@ -126,3 +126,53 @@ C04 1900 与 1904 日期体系（全路径共用基准）
 - 1904 工作簿里 CF/DV 规则的**真实 xlsx 文件**（由 Excel 创建）未单独跑：目前断言的是
   规则求值路径；`parse_cf_blocks`/`parse_validations` 解析层面另有既有用例。
 - 1904 的 `.xls` 与两款软件互通未实机验证（只验证了自家 DATEMODE 往返）。
+
+
+九、原要求路径补证（2026-11-13 02:48，本轮新增）
+------------------------------------------------
+要求路径：本项目导入 1904 夹具 → 本项目改**非日期格** → 本项目另存到**新路径** →
+Excel 与 WPS 各自打开这个新文件。
+
+执行链（Rust，`date_system::make_c04_export_fixture`，`#[ignore]`）：
+1. 本项目写出夹具 `seed_1904.xlsx` / `seed_1900.xlsx`（A1=1，格式 `yyyy-mm-dd`，DateSystem 1904/1900）；
+2. `xlsx::load` 导入（断言体系与 A1 不漂）；
+3. 改 B2=7（非日期格）；
+4. `xlsx::save` 另存为**新路径** `export_1904.xlsx` / `export_1900.xlsx`；
+5. 自检读回：体系、A1=1、B2=7、显示 `1904-01-02` / `1900-01-01`。
+命令：`cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture --nocapture`
+结果：1 passed；输出两行 EXPORT（system/file/A1/display/B2/fmt）。
+
+实机（`scratch/c04_export_probe.ps1` 打开导出文件，只读，不改动）：
+
+| 软件 | 文件 | date1904 | A1 值 | A1 显示 | B2 值 | B2 显示 |
+|---|---|---|---|---|---|---|
+| Excel 16.0 | export_1904.xlsx | True | 1 | 1904-01-02 | 7 | 7 |
+| WPS 12.0 | export_1904.xlsx | True | 1 | 1904-01-02 | 7 | 7 |
+| Excel 16.0 | export_1900.xlsx | False | 1 | 1900-01-01 | 7 | 7 |
+| WPS 12.0 | export_1900.xlsx | False | 1 | 1900-01-01 | 7 | 7 |
+
+产物：`implementation-evidence/c04-probe/export/{seed_1904.xlsx,seed_1900.xlsx,export_1904.xlsx,export_1900.xlsx,probe-c04-export.json}`
+（JSON 含时间、机器名、版本、四个软件的逐项读数）。
+
+这一路径与第六节旧探针的区别：旧探针是「本项目造文件 → Excel 打开并另存」，
+新探针是「本项目导入 → 本项目改非日期格 → 本项目另存新路径 → 两个软件打开**本项目另存的文件**」，
+后者才是原要求的验收方向。
+
+十、应用层粘贴链路（本轮新增行为测试）
+------------------------------------
+`crates/app/src/edit_regression_tests.rs::xmlss_datetime_pastes_into_each_date_system_with_time_and_plain_numbers`
+（`cargo test -p app --bin app xmlss_datetime_pastes`，1 passed）
+
+同一份 XMLSS 文本（`DateTime 1904-01-02T12:00:00` + `Number 1234.5` + `String 文本`，带
+`NumberFormat yyyy-mm-dd hh:mm`）走完整应用路径：
+`clipboard_xmlss::parse` → `office_clipboard::convert_block` → `SheetApp::paste_office_block`
+（真实粘贴处理，不是只测 helper），分别粘进 1904 与 1900 目标簿：
+
+- 1904 簿：A1 = 1.5；1900 簿：A1 = 1463.5；两者差 **1462.0**；
+- 小数部分都是 0.5（时间 12:00 保留，没被截成整数天）；
+- 普通数字 1234.5 在两个簿完全一致，文本「文本」一致；
+- 两个簿落格后都带 `yyyy…hh` 日期时间格式；
+- 显示：两个体系对同一时刻都显示 `1904-01-02 12:00`（序列号差 1462，基准也差 1462）。
+
+变异：把 `iso_to_serial(self.wb.date_system, …)` 改成固定 `D1900` → 该测试失败
+（`left: 1463.5, right: 1.5`），源码已还原。

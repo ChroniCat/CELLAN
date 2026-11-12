@@ -183,22 +183,62 @@ pub fn read_sources(path: &std::path::Path) -> Vec<Source> {
 
 
 /// 把数据源写进 `docProps/custom.xml`（Excel 的自定义文档属性）。
+///
+/// 这是**合并**而不是重写：第三方属性（Customer 之类）的类型、fmtid、pid、值都要原样保留，
+/// 只替换本应用自己拥有的 `_sc_src_*`。旧实现每次新造整份 XML，用户原有属性全被删掉。
 pub fn write_sources(path: &std::path::Path, sources: &[Source]) -> anyhow::Result<()> {
+    write_sources_from(path, sources, None)
+}
+
+/// `base` 是保存前的原文件：umya 重写包之后 `docProps/custom.xml` 可能已经不在新包里，
+/// 第三方属性只能从基准文件读。
+pub fn write_sources_from(
+    path: &std::path::Path,
+    sources: &[Source],
+    base: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let existing = base
+        .and_then(|b| crate::fixups::read_part(b, "docProps/custom.xml"))
+        .or_else(|| crate::fixups::read_part(path, "docProps/custom.xml"))
+        .and_then(|b| String::from_utf8(b).ok());
+
+    let kept = existing.as_deref().map(parse_third_party_props).unwrap_or_default();
+    if kept.is_empty() && sources.is_empty() {
+        // 没有第三方属性、也没有数据源：把本应用写过的东西清干净（含关系与内容类型）
+        remove_custom_part(path)?;
+        return Ok(());
+    }
+
+    let next_pid = kept.iter().map(|p| p.pid).max().unwrap_or(1) + 1;
     let mut body = String::new();
+    for p in &kept {
+        body.push_str(&p.raw);
+    }
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, src) in sources.iter().enumerate() {
-        let name = if src.name.is_empty() { format!("_sc_src_{}", i + 1) } else { src.name.clone() };
-        let text = src.to_name_text().trim_matches('"').replace('&', "&amp;").replace('<', "&lt;");
+        // 归属只认 `_sc_src_` 前缀：名字必须落在这个命名空间里，否则下次保存会被当成第三方属性。
+        // 老代码允许任意 name（如「导入1」），那样的源保存后根本读不回来。
+        let mut name = if src.name.starts_with("_sc_src_") {
+            src.name.clone()
+        } else {
+            format!("_sc_src_{}", i + 1)
+        };
+        while !used.insert(name.clone()) {
+            name = format!("_sc_src_{}_{}", i + 1, used.len() + 1);
+        }
+        let text = src.to_name_text().trim_matches('"').to_string();
         body.push_str(&format!(
             "<property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"{}\" name=\"{}\"><vt:lpwstr>{}</vt:lpwstr></property>",
-            i + 2,
-            name,
-            text
+            next_pid + i as u32,
+            xml_escape_attr(&name),
+            xml_escape_text(&text)
         ));
     }
     let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>{nl}\
 <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" \
-xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">{body}</Properties>"
+xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">{body}</Properties>",
+        nl = "\r\n"
     );
 
     let mut parts: Vec<(String, Vec<u8>)> = vec![("docProps/custom.xml".into(), xml.into_bytes())];
@@ -239,6 +279,97 @@ xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\
         }
     }
     crate::fixups::write_parts(path, &parts)?;
+    Ok(())
+}
+
+struct RawProp {
+    name: String,
+    pid: u32,
+    raw: String,
+}
+
+/// 读出**第三方**属性（保留原始 XML 片段，类型/命名空间/fmtid/pid 一律不动）
+fn parse_third_party_props(xml: &str) -> Vec<RawProp> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<property") {
+        let seg = &rest[i..];
+        let Some(gt) = seg.find('>') else { break };
+        let self_closing = seg[..gt].ends_with('/');
+        let (raw, consumed) = if self_closing {
+            (seg[..gt + 1].to_string(), gt + 1)
+        } else {
+            let Some(c) = seg.find("</property>") else { break };
+            (seg[..c + "</property>".len()].to_string(), c + "</property>".len())
+        };
+        let head = &raw[..raw.find('>').unwrap_or(raw.len())];
+        let name = attr_value(head, "name").map(|v| xml_unescape(&v)).unwrap_or_default();
+        let pid = attr_value(head, "pid").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        if !name.starts_with("_sc_src_") {
+            out.push(RawProp { name, pid, raw });
+        }
+        rest = &seg[consumed..];
+    }
+    out
+}
+
+fn attr_value(head: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let i = head.find(&pat)?;
+    let after = &head[i + pat.len()..];
+    after.split('"').next().map(|s| s.to_string())
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    xml_escape_text(s).replace('"', "&quot;")
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+/// 清掉本应用写的自定义属性部件，以及只为它存在的关系/内容类型
+fn remove_custom_part(path: &std::path::Path) -> anyhow::Result<()> {
+    const PART: &str = "docProps/custom.xml";
+    if crate::fixups::read_part(path, PART).is_none() {
+        return Ok(());
+    }
+    crate::patch::remove_entry(path, PART)?;
+    if let Some(rels) = crate::fixups::read_part(path, "_rels/.rels").and_then(|b| String::from_utf8(b).ok()) {
+        let mut out = String::with_capacity(rels.len());
+        let mut rest = rels.as_str();
+        while let Some(i) = rest.find("<Relationship ") {
+            out.push_str(&rest[..i]);
+            let Some(gt) = rest[i..].find("/>") else { break };
+            let rel = &rest[i..i + gt + 2];
+            if !(rel.contains("custom-properties") && rel.contains(PART)) {
+                out.push_str(rel);
+            }
+            rest = &rest[i + gt + 2..];
+        }
+        out.push_str(rest);
+        if out != rels {
+            crate::fixups::write_parts(path, &[("_rels/.rels".into(), out.into_bytes())])?;
+        }
+    }
+    if let Some(ct) = crate::fixups::read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
+        let needle = "<Override PartName=\"/docProps/custom.xml\"";
+        if let Some(i) = ct.find(needle) {
+            if let Some(end) = ct[i..].find("/>") {
+                let mut out = ct[..i].to_string();
+                out.push_str(&ct[i + end + 2..]);
+                crate::fixups::write_parts(path, &[("[Content_Types].xml".into(), out.into_bytes())])?;
+            }
+        }
+    }
     Ok(())
 }
 

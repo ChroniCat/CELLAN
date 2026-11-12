@@ -428,3 +428,52 @@ fn excel_saved_1900_file_stays_1900() {
         "1900-01-01"
     );
 }
+
+/// 原要求路径：本项目导入 1904 夹具 → 本项目改非日期格 → 本项目另存**新路径** →
+/// Excel 与 WPS 各自打开这个新文件。
+/// 生成两对文件（1904/1900）供 `scratch/c04_export_probe.ps1` 实机打开。
+#[test]
+#[ignore = "生成 C04 另存新路径的夹具（Excel/WPS 实机打开用）"]
+fn make_c04_export_fixture() {
+    let dir = std::env::temp_dir().join("sc_c04_export");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, sys) in [("1904", DateSystem::D1904), ("1900", DateSystem::D1900)] {
+        // 1) 先造夹具（本项目写出）
+        let mut seed_wb = Workbook::new_blank();
+        seed_wb.sheets[0].name = "S".into();
+        seed_wb.date_system = sys;
+        let id = seed_wb
+            .styles
+            .intern(sheetcore::style::CellStyle { format: "yyyy-mm-dd".into(), ..Default::default() });
+        seed_wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        seed_wb.sheets[0].set_style(0, 0, id);
+        seed_wb.sheets[0].cols.set(0, 96.0);
+        seed_wb.sheets[0].cols.set(1, 64.0);
+        seed_wb.sheets[0].layout_dirty = true;
+        let seed = dir.join(format!("seed_{name}.xlsx"));
+        sheetcore::xlsx::save(&seed, &seed_wb).expect("写夹具");
+
+        // 2) 本项目导入（读端）：体系必须是夹具声明的那个
+        let mut wb = sheetcore::xlsx::load(&seed).expect("导入夹具");
+        assert_eq!(wb.date_system, sys, "{name} 夹具导入后体系漂了");
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(1.0));
+
+        // 3) 改一个**非日期**格
+        wb.sheets[0].set(1, 1, Cell { value: Value::Number(7.0), formula: None });
+
+        // 4) 另存到新路径（不是原地）
+        let out = dir.join(format!("export_{name}.xlsx"));
+        sheetcore::xlsx::save(&out, &wb).expect("另存新路径");
+
+        // 5) 自检：新文件读回来体系、序列、非日期格都对
+        let back = sheetcore::xlsx::load(&out).expect("读另存文件");
+        assert_eq!(back.date_system, sys);
+        assert_eq!(back.sheets[0].value(0, 0), Value::Number(1.0));
+        assert_eq!(back.sheets[0].value(1, 1), Value::Number(7.0));
+        let fmt = back.styles.get(back.sheet(0).style_of(0, 0)).format.clone();
+        let disp = format_value_in(sys, &Value::Number(1.0), &fmt);
+        println!("EXPORT system={} file={} A1=1 display={} B2=7 fmt={}",
+                 sys.name(), out.display(), disp, fmt);
+    }
+}

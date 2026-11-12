@@ -1,38 +1,56 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `cf42c1d` + 本轮未提交改动（C04 全量）。
-- 台账：5 已验收 / 3 待验收 / 53 待实施；切片 14 已验收 / 7 待验收 / 127 待实施。
-  C02 待复核（14 pass、6 处变异已抓）；C04 待复核（本轮）。
+- 分支 `main`（`origin/main`），HEAD `dece894`（C04 首版已推送）+ 本轮未提交改动。
+- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 3 待验收 / 52 待实施；
+  切片 17 已验收 / 5 待验收 / 126 待实施。
+  C02 已验收（用户 02:43 复核认可）；C04、C08 待验收（用户复核中）。
 
-## 本轮（C04 1900/1904，复核 02:02 + 02:22 后）
+## 本轮（2026-11-13 02:45–03:05）：C08 + C04 两条补证
 
-已核实真值：
-- `array_shape` 14 passed / 0 failed，EXIT=0（在**恢复后的源码**上跑，diff 无 mutation 残留）。
-- `save_failure_injection` 11 passed / 0 failed / 1 ignored，EXIT=0（round16_sfi）。
-- `date_system` 10 passed / 2 ignored；`date_system_shared` 8 passed。
-- round16：core 62 bins / 546 passed / 0 failed / 37 ignored；app 141；GUI 12 passed / 8 ignored。
+### C08 无损更新自定义文档属性（P0，待验收）
+- 根因：`external::write_sources` 每次新造整份 `docProps/custom.xml`，第三方属性全丢；
+  调用点还有 `!wb.sources.is_empty()` 前置条件，删最后一个源时不清残留。
+- 修法：合并式写入（第三方属性原片段+pid 保留，只替换 `_sc_src_*`；pid 接着最大值分配；
+  名称/值转义；无第三方且无源时删部件+关系+Content_Types；从 base 文件读回 umya 已丢弃的部件）。
+- 附带修复：`Source.name` 为任意文字（如「导入1」）时归一成 `_sc_src_N` 并保证唯一，
+  否则保存后读端认不出、源直接消失（round17 的 sfi 失败由这条触发）。
+- 测试：`crates/core/tests/custom_props.rs` **8 passed / 0 failed / 2 ignored**；
+  `save_failure_injection` **11 passed / 0 failed / 1 ignored**。
+- 变异：整份重写 → 6 failed；不清理 → 3 failed；不转义 → 1 failed（首版 0 failed，已补断言）。
+- 实机：Excel 16.0 / WPS 12.0 打开夹具→改格→另存，部件与四类属性原样保留，
+  `excel_roundtrip_keeps_custom_props` 两边各 1 passed；openpyxl 读出 5 项属性。
+- 未执行：属性对话框目视（本机 COM `CustomDocumentProperties` 对 openpyxl 合法文件也返回 0）。
 
-本轮修的两个复核问题：
-1. `clipboard_xmlss::iso_to_serial` 原来丢掉 `T` 后的时间 → 中午变午夜。现按 `hh:mm[:ss[.ms]]`
-   折成一天的小数，1904/1900 两侧都有"带时间"断言，普通数字仍不当日期。
-2. `charts::resolve_series_in` 的值轴原来走格式化文本再 `parse::<f64>()`，
-   `1,234.50` / `12.50%` / `$5.00` / 日期格式全部 parse 失败 → 系列点整段丢失。
-   新增 `read_ref_numbers` 取原始数值；分类/名称仍用显示文本。回归断言 4 格带
-   千分位/百分比/货币/日期格式时 vals 原值不变、点数 4。
+### C04 两条原要求补证
+1. **导出新路径双软件打开**（`date_system::make_c04_export_fixture`，ignored）：
+   本项目写夹具 → 本项目导入 → 改 B2=7（非日期）→ 另存 `export_1904/1900.xlsx` →
+   Excel 16.0 与 WPS 12.0 各自打开：Date1904 True/False、A1=1 显示 1904-01-02 / 1900-01-01、B2=7。
+   产物 `implementation-evidence/c04-probe/export/`（含 probe JSON）。
+2. **应用层粘贴链路**（`edit_regression_tests::xmlss_datetime_pastes_…`，1 passed）：
+   同一 XMLSS 块 → `convert_block` → `SheetApp::paste_office_block` →
+   1904 簿 1.5、1900 簿 1463.5（差 1462），时间小数 0.5 保留，普通数字 1234.5 不变，
+   两边格式含 `yyyy…hh`，显示同为 `1904-01-02 12:00`。
+   变异：固定 D1900 → 失败（left 1463.5 / right 1.5），已还原。
 
-另：实机验收发现写包缺陷——字体无条件 `set_size(0)`/`set_underline("none")`/
-`set_strikethrough(false)` 产生 `<sz val="0"/>` 等非法值，**Excel 16.0 拒绝打开**。
-已改为只写设置过的属性，并加 styles.xml 断言。
-
-实机结果文件（可核对）：`implementation-evidence/c04-probe/probe-result.json` +
-两份夹具 + 两份 Excel 另存件；Excel 16.0 / WPS 12.0 的 Date1904、A1 显示、另存不漂移全部记录。
+## 已执行命令与结果
+- `cargo test -p sheetcore --test custom_props` → 8 passed / 0 failed / 2 ignored（EXIT 0）
+- `cargo test -p sheetcore --test save_failure_injection` → 11 passed / 0 failed / 1 ignored（EXIT 0）
+- `cargo test -p app --bin app xmlss_datetime_pastes` → 1 passed（EXIT 0）
+- `cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture --nocapture` → 1 passed
+- `powershell scratch/c04_export_probe.ps1 <dir>` → 4 行读数（Excel/WPS × 1904/1900）全部符合预期
+- round17（旧代码）：core FAILED 1（sfi，已修）；app 141 passed；GUI 12 passed / 8 ignored
+- round18（当前代码）：运行中，日志 `scratch/round18_{core,app,gui}.log`
 
 ## 下一步
-- 提交本轮（C04 修复 + 证据 + 台账）。
-- 继续任务队列：按 task-index 选下一个可执行切片（UI-01 真实 IME/键盘仍阻塞在硬件取证）。
-- C04 未执行项：真实剪贴板 E2E（Excel 复制 → 应用粘贴）、1904 的 .xls 与两款软件互通。
+1. 读 round18 结果；全绿则把数字写进 resume/台账并提交推送。
+2. 下一个可执行任务：C14（P0，无依赖）部分加载失败不得伪装完整工作簿；
+   之后 C05（P1，依赖 C01 已验收）、C06（P1，无依赖）。
+3. UI-01 真实 IME/键盘/Alt+Enter 取证仍阻塞在硬件条件；C09 依赖 C13+UI-03，
+   C10/C11 依赖 C03，C12 依赖 C01+C13，C15 依赖 UI-03。
 
-## 风险
-- Excel COM 打开文件必须用**反斜杠**原生路径；用 `F:/...` 会报 0x800A03EC，
-  容易误判成文件损坏。
-- 刚写出的文件立刻被 Excel 打开偶尔失败，probe 脚本已带 4 次重试。
+## 风险 / 注意
+- Excel COM 必须用反斜杠原生路径；`F:/...` 会 0x800A03EC。
+- `Workbook.CustomDocumentProperties` 在本机不可用（对任何文件都返回 0），
+  不能用它判定自定义属性可见性。
+- 后续建议（不在本轮范围）：我们写出的 `xl/styles.xml` 没有 `<cellStyles>` 默认样式，
+  openpyxl 会告警；Excel 能开但值得补。

@@ -171,7 +171,7 @@
    "scope": "core/formula/mod.rs, formula/value.rs, formula/array.rs",
    "source": "core-requirements.md",
    "heading": "C02 P0 保持数组形状与正确广播",
-   "status": "待验收",
+   "status": "已验收",
    "acceptance": "需求三条（SEQUENCE(2,2)+1 为 2×2、SEQUENCE(3,1)*2 为 3×1、SUM({1;2}+{10,20})=66）与 2×2+2×2、3×1+1×4、标量+3×1、不兼容形状 #VALUE!、比较/拼接/一元/百分号/SUMPRODUCT/FILTER 全部按形状断言；溢出锚点、阻挡（用户输入保留）、移开阻挡、下游引用、保存重开形状一致。11 项用例 + 3 处变异。",
    "files": [
     "crates/core/src/formula/mod.rs,crates/core/src/formula/functions.rs,crates/core/src/model.rs,crates/core/tests/array_shape.rs"
@@ -191,8 +191,8 @@
    ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T17:48:49Z",
+   "next": "无（用户 02:43 复核认可，最终 GREEN 已在恢复源码上复跑）",
+   "updated_utc": "2026-11-12T19:05:00Z",
    "slices": [
     {
      "id": "C02.1",
@@ -200,7 +200,7 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待验收",
+     "status": "已验收",
      "acceptance": "标量与 1×n / n×1 / 2×2 数组运算保留原形状；一元负号、百分号逐元素；变异（结果摊平）被抓。",
      "files": [],
      "commits": [],
@@ -214,7 +214,7 @@
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T17:48:49Z"
+     "updated_utc": "2026-11-12T19:05:00Z"
     },
     {
      "id": "C02.2",
@@ -222,7 +222,7 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待验收",
+     "status": "已验收",
      "acceptance": "2×2+2×2 逐格、3×1+1×4 广播成 3×4、标量+3×1、2×2+2×3 与 2×2+1×4 为 #VALUE!；SUMPRODUCT 按形状校验。",
      "files": [],
      "commits": [],
@@ -236,7 +236,7 @@
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T17:48:49Z"
+     "updated_utc": "2026-11-12T19:05:00Z"
     },
     {
      "id": "C02.3",
@@ -244,7 +244,7 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待验收",
+     "status": "已验收",
      "acceptance": "锚点 2/3/4/5、下游 SUM=14、占住 B2 → #SPILL! 且用户输入「挡」保留、移开恢复、存盘只落锚点重开重算恢复形状。",
      "files": [
       "crates/core/src/model.rs,crates/core/src/formula/mod.rs"
@@ -260,7 +260,7 @@
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T17:48:49Z"
+     "updated_utc": "2026-11-12T19:05:00Z"
     }
    ],
    "note": "01:41 复核指出两处原范围缺口（FILTER 条件摊平按长度猜方向、Unary/Percent 遇错整块坍成单错误），修复与用例已落地，等复核。"
@@ -348,25 +348,26 @@
    ],
    "commits": [],
    "commands": [
-    "cargo test -p sheetcore --test date_system (10 passed / 2 ignored, EXIT=0)",
-    "cargo test -p sheetcore --test date_system_shared (8 passed, EXIT=0)",
-    "cargo test -p sheetcore --test date_system -- --ignored make_excel_fixtures (1 passed)",
-    "powershell -File scratch/c04_excel_probe2.ps1 <dir> -> Excel 16.0 / WPS 12.0 结果，落盘 probe-result.json",
-    "SC_C04_EXCEL_OUT=... cargo test --test date_system -- --ignored excel_saved (2 passed, EXIT=0)",
-    "round16: sfi 11/0/1 EXIT=0; core 62 bins 546 passed/0 failed/37 ignored EXIT=0; app 141 EXIT=0; gui 12/8 EXIT=0"
+    "cargo test -p sheetcore --offline --test date_system -> 10 passed / 2 ignored",
+    "cargo test -p sheetcore --offline --test date_system_shared -> 8 passed",
+    "cargo test -p app --no-default-features --features glow --offline --bin app xmlss_datetime_pastes -> 1 passed（应用层 convert_block + paste_office_block，1904=1.5 / 1900=1463.5，差 1462，时间小数 0.5 保留）",
+    "cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture -> 1 passed（导入夹具→改 B2→另存新路径→自检）",
+    "powershell scratch/c04_export_probe.ps1 <dir> -> Excel 16.0 / WPS 12.0 各自打开 export_1904/1900.xlsx：Date1904 正确、A1=1 显示 1904-01-02 / 1900-01-01、B2=7",
+    "powershell scratch/c04_excel_probe2.ps1 -> Excel 16.0 打开+另存，体系不漂"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/probe-result.json"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/export/"
    ],
    "not_done": [
-    "真实剪贴板端到端（Excel Ctrl+C → 本应用 Ctrl+V）未执行，只有 XMLSS→落格转换层断言",
-    "1904 的 .xls 与 Excel/WPS 互通未实机验证（仅自家 DATEMODE 往返）"
+    "真实系统剪贴板 E2E（Excel Ctrl+C → 应用 Ctrl+V）未执行；已用同一 XMLSS 块经 convert_block + paste_office_block 覆盖应用层链路（用户 02:43 明确不要求 OS 键鼠自动化）",
+    "1904 的 .xls（BIFF）与 Excel/WPS 互通未实机验证"
    ],
    "failures": [],
    "blocker": "",
-   "next": "等复核；如需，补真实剪贴板 E2E 与 Excel 生成的 CF/DV 1904 文件",
-   "updated_utc": "2026-11-12T18:26:24Z",
+   "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
+   "updated_utc": "2026-11-12T19:05:00Z",
    "slices": [
     {
      "id": "C04.1",
@@ -381,16 +382,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --test date_system saving_a_1904 / a_1900_workbook / xls_datetime_mode"
+      "cargo test -p sheetcore --offline --test date_system -> 10 passed / 2 ignored",
+      "cargo test -p sheetcore --offline --test date_system_shared -> 8 passed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app xmlss_datetime_pastes -> 1 passed（应用层 convert_block + paste_office_block，1904=1.5 / 1900=1463.5，差 1462，时间小数 0.5 保留）",
+      "cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture -> 1 passed（导入夹具→改 B2→另存新路径→自检）",
+      "powershell scratch/c04_export_probe.ps1 <dir> -> Excel 16.0 / WPS 12.0 各自打开 export_1904/1900.xlsx：Date1904 正确、A1=1 显示 1904-01-02 / 1900-01-01、B2=7",
+      "powershell scratch/c04_excel_probe2.ps1 -> Excel 16.0 打开+另存，体系不漂"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/export/"
      ],
-     "not_done": [],
+     "not_done": [
+      "真实系统剪贴板 E2E（Excel Ctrl+C → 应用 Ctrl+V）未执行；已用同一 XMLSS 块经 convert_block + paste_office_block 覆盖应用层链路（用户 02:43 明确不要求 OS 键鼠自动化）",
+      "1904 的 .xls（BIFF）与 Excel/WPS 互通未实机验证"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T18:26:24Z"
+     "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
+     "updated_utc": "2026-11-12T19:05:00Z"
     },
     {
      "id": "C04.2",
@@ -405,16 +416,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --test date_system_shared"
+      "cargo test -p sheetcore --offline --test date_system -> 10 passed / 2 ignored",
+      "cargo test -p sheetcore --offline --test date_system_shared -> 8 passed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app xmlss_datetime_pastes -> 1 passed（应用层 convert_block + paste_office_block，1904=1.5 / 1900=1463.5，差 1462，时间小数 0.5 保留）",
+      "cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture -> 1 passed（导入夹具→改 B2→另存新路径→自检）",
+      "powershell scratch/c04_export_probe.ps1 <dir> -> Excel 16.0 / WPS 12.0 各自打开 export_1904/1900.xlsx：Date1904 正确、A1=1 显示 1904-01-02 / 1900-01-01、B2=7",
+      "powershell scratch/c04_excel_probe2.ps1 -> Excel 16.0 打开+另存，体系不漂"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/export/"
      ],
-     "not_done": [],
+     "not_done": [
+      "真实系统剪贴板 E2E（Excel Ctrl+C → 应用 Ctrl+V）未执行；已用同一 XMLSS 块经 convert_block + paste_office_block 覆盖应用层链路（用户 02:43 明确不要求 OS 键鼠自动化）",
+      "1904 的 .xls（BIFF）与 Excel/WPS 互通未实机验证"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T18:26:24Z"
+     "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
+     "updated_utc": "2026-11-12T19:05:00Z"
     },
     {
      "id": "C04.3",
@@ -429,20 +450,26 @@
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --test date_system chart_category_axis",
-      "cargo test -p sheetcore --test date_system_shared chart_values / xmlss_datetime"
+      "cargo test -p sheetcore --offline --test date_system -> 10 passed / 2 ignored",
+      "cargo test -p sheetcore --offline --test date_system_shared -> 8 passed",
+      "cargo test -p app --no-default-features --features glow --offline --bin app xmlss_datetime_pastes -> 1 passed（应用层 convert_block + paste_office_block，1904=1.5 / 1900=1463.5，差 1462，时间小数 0.5 保留）",
+      "cargo test -p sheetcore --test date_system -- --ignored make_c04_export_fixture -> 1 passed（导入夹具→改 B2→另存新路径→自检）",
+      "powershell scratch/c04_export_probe.ps1 <dir> -> Excel 16.0 / WPS 12.0 各自打开 export_1904/1900.xlsx：Date1904 正确、A1=1 显示 1904-01-02 / 1900-01-01、B2=7",
+      "powershell scratch/c04_excel_probe2.ps1 -> Excel 16.0 打开+另存，体系不漂"
      ],
      "evidence": [
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/probe-result.json"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/export/"
      ],
      "not_done": [
-      "真实剪贴板 E2E 未执行"
+      "真实系统剪贴板 E2E（Excel Ctrl+C → 应用 Ctrl+V）未执行；已用同一 XMLSS 块经 convert_block + paste_office_block 覆盖应用层链路（用户 02:43 明确不要求 OS 键鼠自动化）",
+      "1904 的 .xls（BIFF）与 Excel/WPS 互通未实机验证"
      ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T18:26:24Z"
+     "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
+     "updated_utc": "2026-11-12T19:05:00Z"
     }
    ]
   },
@@ -457,17 +484,34 @@
    "scope": "core/external.rs, xlsx.rs",
    "source": "core-requirements.md",
    "heading": "C08 P0 无损更新自定义文档属性",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "待验收",
+   "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>\" 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。未执行：属性对话框目视（COM CustomDocumentProperties 在本机不可用，openpyxl 文件也返回 0）。",
+   "files": [
+    "crates/core/src/external.rs",
+    "crates/core/src/xlsx.rs",
+    "crates/core/tests/custom_props.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --offline --test custom_props  -> 8 passed / 0 failed / 2 ignored",
+    "excel probe: powershell scratch/c08_excel_roundtrip.ps1 -> Excel 16.0 打开/另存, 部件+关系在",
+    "wps probe: powershell scratch/c08_wps_roundtrip.ps1 -> WPS 12.0 同上",
+    "SC_C08_RT_FILE=<另存文件> cargo test --test custom_props -- --ignored excel_roundtrip -> 1 passed (Excel 与 WPS 各一次)",
+    "openpyxl 3.1.5 读取 c08.xlsx -> custom_doc_props 5 项 (4 第三方 + _sc_src_1)",
+    "cargo test -p sheetcore --offline --test save_failure_injection -> 11 passed / 0 failed / 1 ignored"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
+   ],
+   "not_done": [
+    "Excel/WPS 属性对话框目视检查未执行（本机 COM CustomDocumentProperties 恒为 0，含 openpyxl 生成的合法文件）",
+    "刷新经模型层 import_csv 覆盖，未点击 UI 刷新按钮取证"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "用户复核；补属性对话框的 UIA 取证（如可行）",
+   "updated_utc": "2026-11-12T19:05:00Z",
    "slices": [
     {
      "id": "C08.1",
@@ -475,17 +519,34 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C08 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>\" 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。未执行：属性对话框目视（COM CustomDocumentProperties 在本机不可用，openpyxl 文件也返回 0）。",
+     "files": [
+      "crates/core/src/external.rs",
+      "crates/core/src/xlsx.rs",
+      "crates/core/tests/custom_props.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test custom_props  -> 8 passed / 0 failed / 2 ignored",
+      "excel probe: powershell scratch/c08_excel_roundtrip.ps1 -> Excel 16.0 打开/另存, 部件+关系在",
+      "wps probe: powershell scratch/c08_wps_roundtrip.ps1 -> WPS 12.0 同上",
+      "SC_C08_RT_FILE=<另存文件> cargo test --test custom_props -- --ignored excel_roundtrip -> 1 passed (Excel 与 WPS 各一次)",
+      "openpyxl 3.1.5 读取 c08.xlsx -> custom_doc_props 5 项 (4 第三方 + _sc_src_1)",
+      "cargo test -p sheetcore --offline --test save_failure_injection -> 11 passed / 0 failed / 1 ignored"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
+     ],
+     "not_done": [
+      "Excel/WPS 属性对话框目视检查未执行（本机 COM CustomDocumentProperties 恒为 0，含 openpyxl 生成的合法文件）",
+      "刷新经模型层 import_csv 覆盖，未点击 UI 刷新按钮取证"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "用户复核",
+     "updated_utc": "2026-11-12T19:05:00Z"
     }
    ]
   },

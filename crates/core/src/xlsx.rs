@@ -1641,8 +1641,13 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     // 数据源存成"自定义文档属性"：这是 Excel 自己的规范位置，
     // 塞进 definedNames 会和查询表打架，单独加未知部件又会被拒收
-    if !wb.sources.is_empty() && std::env::var("SC_NO_SRC_PROP").is_err() {
-        must_save!("sources", crate::external::write_sources(path, &wb.sources));
+    // 即使 sources 为空也要走一次：删掉最后一个数据源时，必须把本应用的属性清掉，
+    // 第三方属性保持原样。基准文件用于读回 umya 重写包时已经丢掉的自定义属性。
+    if std::env::var("SC_NO_SRC_PROP").is_err() {
+        must_save!(
+            "sources",
+            crate::external::write_sources_from(path, &wb.sources, Some(&restore_base))
+        );
     }
 
     // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来

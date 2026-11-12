@@ -2146,3 +2146,66 @@ fn app_undo_restores_an_error_cell_after_a_real_edit() {
     app.do_undo(true);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(1.0), "重做没生效");
 }
+
+#[test]
+fn xmlss_datetime_pastes_into_each_date_system_with_time_and_plain_numbers() {
+    // C04：Excel 复制出来的 DateTime 是 ISO 文本。真实粘贴路径必须按**目标簿**的日期体系
+    // 重算序列号（1900/1904 相差 1462 天），保留时间小数，普通数字原样不动，并带上日期格式。
+    let xml = r#"<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Styles><Style ss:ID="dt"><NumberFormat ss:Format="yyyy-mm-dd hh:mm"/></Style></Styles>
+ <Worksheet ss:Name="Sheet1"><Table>
+  <Row><Cell ss:StyleID="dt"><Data ss:Type="DateTime">1904-01-02T12:00:00</Data></Cell>
+       <Cell><Data ss:Type="Number">1234.5</Data></Cell>
+       <Cell><Data ss:Type="String">文本</Data></Cell></Row>
+ </Table></Worksheet></Workbook>"#;
+    let block = office_clipboard::convert_block(sheetcore::clipboard_xmlss::parse(xml));
+    assert_eq!(block.rows[0][0].kind, 3, "DateTime 必须映射成日期类型");
+
+    let mut a04 = app();
+    a04.wb.date_system = sheetcore::model::DateSystem::D1904;
+    a04.sel = (0, 0);
+    assert!(a04.paste_office_block(&block), "1904 簿粘贴被拒绝");
+
+    let mut a00 = app();
+    a00.wb.date_system = sheetcore::model::DateSystem::D1900;
+    a00.sel = (0, 0);
+    assert!(a00.paste_office_block(&block), "1900 簿粘贴被拒绝");
+
+    // 同一份 XMLSS，两个体系落成不同序列号，差正好 1462 天
+    let s04 = match a04.wb.sheets[0].value(0, 0) {
+        Value::Number(n) => n,
+        other => panic!("1904 簿得到的不是数字：{other:?}"),
+    };
+    let s00 = match a00.wb.sheets[0].value(0, 0) {
+        Value::Number(n) => n,
+        other => panic!("1900 簿得到的不是数字：{other:?}"),
+    };
+    assert_eq!(s04, 1.5, "1904-01-02 12:00 在 1904 体系里是 1.5");
+    assert_eq!(s00, 1463.5, "同一时刻在 1900 体系里是 1463.5");
+    assert_eq!(s00 - s04, 1462.0, "两个体系必须正好相差 1462 天");
+    assert_eq!(s04.fract(), 0.5, "时间小数不能丢");
+    assert_eq!(s00.fract(), 0.5, "时间小数不能丢");
+
+    // 普通数字与文本不受日期体系影响
+    for app in [&a04, &a00] {
+        assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(1234.5));
+        assert_eq!(app.wb.sheets[0].value(0, 2), Value::Text("文本".into()));
+        let sid = app.wb.sheet(0).style_of(0, 0);
+        let fmt = app.wb.styles.get(sid).format.clone();
+        assert!(fmt.contains("yyyy") && fmt.contains("hh"), "粘贴后应带日期时间格式，实际 {fmt:?}");
+    }
+
+    // 显示：同一时刻在两个体系里显示成同一个日期时间（序列号差 1462，基准也差 1462）
+    let f04 = a04.wb.styles.get(a04.wb.sheet(0).style_of(0, 0)).format.clone();
+    let f00 = a00.wb.styles.get(a00.wb.sheet(0).style_of(0, 0)).format.clone();
+    assert_eq!(
+        sheetcore::style::format_value_in(sheetcore::model::DateSystem::D1904, &Value::Number(s04), &f04),
+        "1904-01-02 12:00"
+    );
+    assert_eq!(
+        sheetcore::style::format_value_in(sheetcore::model::DateSystem::D1900, &Value::Number(s00), &f00),
+        "1904-01-02 12:00"
+    );
+}
