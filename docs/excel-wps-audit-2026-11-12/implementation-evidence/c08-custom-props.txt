@@ -116,3 +116,55 @@ M3 暴露了首版测试只覆盖值转义、没覆盖名称属性转义；已�
   新增 `crates/core/tests/custom_props.rs`。
 - 所有保存路径（普通保存、另存为、自动保存）都经过 `xlsx::save`，因此行为一致。
 - 回归：round17（core 全量 / app / ui_regression）结果见 implementation-resume.md。
+
+十一、03:05 复核整改：真正的 XML 命名空间解析
+--------------------------------------------
+复核指出的三个风险（前缀 `<cp:property>` 漏读、前缀未绑定、单引号属性误判）均已修：
+
+1. 写端 `parse_custom_props` 改用 `quick-xml::NsReader::read_resolved_event_into`，
+   按 **命名空间 + local name** 判定属性元素，不再字符串找 `<property`；
+   - 属性值统一走 `quick_xml::escape::unescape`，单引号 `pid='2'`、`name='客户'` 都能正确取值；
+   - 保留项以原始 XML 片段搬运，根标签原文（含全部 `xmlns:*` 声明）原样保留；
+   - 新属性沿用文件里的前缀（`cp:` 或空），不会写出未绑定前缀；
+   - VT 前缀从根上的声明里取（`v:`、`vt:` 都行），缺声明时才补 `xmlns:vt`。
+2. pid：保留项按最大值继续；本应用已有的 `_sc_src_N` **按名字复用原 pid**，连续保存不漂移。
+3. 读端 `read_all_props` 同样按命名空间解析，`<cp:property>` 也能读回数据源。
+
+新增夹具 `prefixed_properties_single_quotes_and_alt_type_prefix_survive`：
+第三方属性写成 `<cp:property ... pid='2' name='客户'><v:lpwstr>甲公司</v:lpwstr>`，断言
+
+- `pid='2' name='客户'` 原文保留、`<v:lpwstr>甲公司</v:lpwstr>` 与 `<v:i4>42</v:i4>` 保留、fmtid 保留；
+- 根上 `xmlns:cp` 与 `xmlns:v` 都还在（没有未绑定前缀）；
+- 新属性写成 `<cp:property`（不混用默认命名空间）；
+- 全部 pid 唯一（含新分配的）；
+- `read_sources` 能读回 1 条源。
+
+测试结果（当前源码）：
+
+- `cargo test -p sheetcore --test custom_props` → **9 passed / 0 failed / 2 ignored**
+  （原 8 项 + 前缀/单引号/替代前缀 1 项）。
+- 早前 `repeated_saves_do_not_duplicate_or_drift` 因 pid 漂移曾失败（8/9 vs 6/7），
+  改为按名字复用后恢复通过——这条就是"连续保存不重复、不漂移"的直接证据。
+
+十二、03:26 复核整改：单引号命名空间声明
+--------------------------------------
+风险：判断“根上有没有 `xmlns:vt`”用的是 `root_raw.contains("xmlns:vt=\"URI\"")`，
+合法文件写成 `xmlns:v='URI'`（单引号）会被误判成“没声明”，再追加一条同名声明，
+同一元素上出现两个 `xmlns:v` → XML 非法。
+
+修法：改用**解析出的声明集合**判断（`parse_custom_props` 已记录 VT 前缀，
+`vt_prefix.is_some()` 即已声明），不再做字符串匹配。
+
+新增夹具 `single_quoted_namespace_declarations_are_not_duplicated`：
+根写成 `xmlns=...` / `xmlns:v='...'`（单引号），属性 `<v:lpwstr>`；断言
+
+- `docPropsVTypes` 在整份 XML 里只出现 **1 次**（无重复声明）；
+- 单引号声明原文保留；
+- 新属性沿用 `v:` 前缀，不写 `<vt:lpwstr>`；
+- `read_sources` 仍能读回 1 条源。
+
+结果：`cargo test -p sheetcore --test custom_props` → **10 passed / 0 failed / 2 ignored**。
+变异 M4（把判断改回 `root_raw.contains(...)`）→ 该用例失败，已还原。
+
+仍未执行：Excel「属性」对话框目视核对、以及 Office 打开时“无修复提示”的直接证据
+（本机 COM `CustomDocumentProperties` 恒为 0 属环境限制），保留待验收。

@@ -190,8 +190,175 @@ pub fn write_sources(path: &std::path::Path, sources: &[Source]) -> anyhow::Resu
     write_sources_from(path, sources, None)
 }
 
-/// `base` 是保存前的原文件：umya 重写包之后 `docProps/custom.xml` 可能已经不在新包里，
-/// 第三方属性只能从基准文件读。
+const CP_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
+const VT_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes";
+
+/// 解析后的 `docProps/custom.xml` 结构：保留原有根标签与第三方属性的原始片段，
+/// 只标记出应用自己的属性范围。
+struct CustomPropsDoc {
+    /// 根标签原文（`<Properties ...>` 或 `<cp:Properties ...>`）
+    root_raw: String,
+    /// 根结束标签原文（`</Properties>` / `</cp:Properties>`）
+    root_close: String,
+    /// 文档声明（含 `<?xml ...?>` 与其后空白）
+    decl: String,
+    /// 第三方属性原始片段
+    kept: Vec<String>,
+    /// 保留属性的最大 pid
+    max_pid: u32,
+    /// 本应用属性现有的 (name, pid)，替换时按名字复用 pid，连续保存不漂移
+    owned: Vec<(String, u32)>,
+    /// 属性元素用的前缀（"" 或 "cp:"）；同命名空间的元素前缀应当一致
+    prop_prefix: String,
+    /// VT 命名空间已绑定的前缀（"vt:" 或别的）；None 表示根上没声明
+    vt_prefix: Option<String>,
+}
+
+/// 用 quick-xml 按**命名空间 + local name** 解析，而不是字符串找 `<property`：
+/// 合法文件里可能是 `<cp:property>`、`<property pid='2'>`（单引号）、
+/// 类型元素也可能写成 `<v:lpwstr>`。
+fn parse_custom_props(xml: &str) -> Option<CustomPropsDoc> {
+    use quick_xml::events::Event;
+    use quick_xml::name::{Namespace, ResolveResult};
+
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+
+    let mut decl_end = 0usize;
+    let mut root_raw: Option<String> = None;
+    let mut root_close: Option<String> = None;
+    let mut kept: Vec<String> = Vec::new();
+    let mut max_pid = 1u32;
+    let mut owned: Vec<(String, u32)> = Vec::new();
+    let mut prop_prefix = String::new();
+    let mut vt_prefix: Option<String> = None;
+    let mut depth = 0usize;
+    let mut prop_start: Option<(usize, String, bool)> = None; // (pos, raw head, owned)
+
+    loop {
+        let pos = reader.buffer_position() as usize;
+        let (ns, ev) = reader.read_resolved_event_into(&mut buf).ok()?;
+        match ev {
+            Event::Decl(_) => decl_end = reader.buffer_position() as usize,
+            Event::Start(ref e) => {
+                let local = e.local_name();
+                let name = local.as_ref();
+                if depth == 0 {
+                    if name != "Properties" || ns != ResolveResult::Bound(Namespace(CP_NS)) {
+                        return None; // 根不是自定义属性文档
+                    }
+                    let end = reader.buffer_position() as usize;
+                    let raw = &xml[pos..end];
+                    // 记录命名空间声明
+                    for a in e.attributes().with_checks(false).flatten() {
+                        let key = a.key.as_ref();
+                        if key.starts_with("xmlns:") {
+                            let prefix = &key[6..];
+                            if a.value.as_ref() == VT_NS {
+                                vt_prefix = Some(format!("{prefix}:"));
+                            }
+                        }
+                    }
+                    root_raw = Some(raw.to_string());
+                } else if depth == 1 && name == "property" && ns == ResolveResult::Bound(Namespace(CP_NS)) {
+                    let mut pname = String::new();
+                    let mut pid = 0u32;
+                    for a in e.attributes().with_checks(false).flatten() {
+                        let key = a.key.local_name();
+                        let val = quick_xml::escape::unescape(a.value.as_ref()).map(|v| v.into_owned()).unwrap_or_default();
+                        match key.as_ref() {
+                            "name" => pname = val,
+                            "pid" => pid = val.trim().parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                    // 前缀沿用文件里的写法（`cp:` 或空），新建属性时保持一致
+                    let qname = e.name().as_ref().to_string();
+                    if let Some((pre, _)) = qname.split_once(':') {
+                        if prop_prefix.is_empty() {
+                            prop_prefix = format!("{pre}:");
+                        }
+                    }
+                    max_pid = max_pid.max(pid);
+                    let is_owned = pname.starts_with("_sc_src_");
+                    if is_owned {
+                        owned.push((pname.clone(), pid));
+                    }
+                    prop_start = Some((pos, qname, is_owned));
+                }
+                depth += 1;
+            }
+            Event::End(ref e) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let close_start = pos;
+                    root_close = Some(xml[close_start..reader.buffer_position() as usize].to_string());
+                    break;
+                }
+                if depth == 1 {
+                    if let Some((start_pos, qname, owned)) = prop_start.take() {
+                        let expect = format!("</{qname}>");
+                        let end_pos = reader.buffer_position() as usize;
+                        let raw = xml[start_pos..end_pos].to_string();
+                        if !own_starts_with_close(&raw, &expect) {
+                            return None;
+                        }
+                        if !owned {
+                            kept.push(raw);
+                        }
+                    }
+                }
+                let _ = e;
+            }
+            Event::Empty(ref e) => {
+                if depth == 1 && e.local_name().as_ref() == "property"
+                    && ns == ResolveResult::Bound(Namespace(CP_NS))
+                {
+                    let mut pname = String::new();
+                    let mut pid = 0u32;
+                    for a in e.attributes().with_checks(false).flatten() {
+                        let val = quick_xml::escape::unescape(a.value.as_ref()).map(|v| v.into_owned()).unwrap_or_default();
+                        match a.key.local_name().as_ref() {
+                            "name" => pname = val,
+                            "pid" => pid = val.trim().parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                    max_pid = max_pid.max(pid);
+                    if pname.starts_with("_sc_src_") {
+                        owned.push((pname, pid));
+                    } else {
+                        kept.push(xml[pos..reader.buffer_position() as usize].to_string());
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    let decl = xml[..decl_end].to_string();
+    Some(CustomPropsDoc {
+        root_raw: root_raw?,
+        root_close: root_close.unwrap_or_else(|| "</Properties>".into()),
+        decl,
+        kept,
+        max_pid,
+        owned,
+        prop_prefix,
+        vt_prefix,
+    })
+}
+
+fn own_starts_with_close(raw: &str, expect: &str) -> bool {
+    raw.trim_end().ends_with(expect)
+}
+
+/// 把数据源写进 `docProps/custom.xml`（Excel 的自定义文档属性）。
+///
+/// 合并而不是重写：第三方属性连同它们用的前缀、类型元素、fmtid、pid 原样保留；
+/// 只替换本应用拥有的 `_sc_src_*`。
 pub fn write_sources_from(
     path: &std::path::Path,
     sources: &[Source],
@@ -202,22 +369,60 @@ pub fn write_sources_from(
         .or_else(|| crate::fixups::read_part(path, "docProps/custom.xml"))
         .and_then(|b| String::from_utf8(b).ok());
 
-    let kept = existing.as_deref().map(parse_third_party_props).unwrap_or_default();
-    if kept.is_empty() && sources.is_empty() {
-        // 没有第三方属性、也没有数据源：把本应用写过的东西清干净（含关系与内容类型）
+    let parsed = existing.as_deref().and_then(parse_custom_props);
+    let kept = parsed.as_ref().map(|d| d.kept.len()).unwrap_or(0);
+    if kept == 0 && sources.is_empty() {
         remove_custom_part(path)?;
         return Ok(());
     }
 
-    let next_pid = kept.iter().map(|p| p.pid).max().unwrap_or(1) + 1;
+    // 属性名前缀与 VT 前缀
+    let prop_prefix = parsed.as_ref().map(|d| d.prop_prefix.clone()).unwrap_or_default();
+    let vt_prefix = parsed
+        .as_ref()
+        .and_then(|d| d.vt_prefix.clone())
+        .unwrap_or_else(|| "vt:".into());
+    let mut root_raw = parsed
+        .as_ref()
+        .map(|d| d.root_raw.clone())
+        .unwrap_or_else(|| format!("<Properties xmlns=\"{CP_NS}\" xmlns:vt=\"{VT_NS}\">"));
+    let root_close = parsed
+        .as_ref()
+        .map(|d| d.root_close.clone())
+        .unwrap_or_else(|| "</Properties>".into());
+    let decl = parsed
+        .as_ref()
+        .map(|d| d.decl.clone())
+        .filter(|d| d.contains("<?xml"))
+        .unwrap_or_else(|| "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n".into());
+
+    // 根上没声明 VT 命名空间时补一条。判断必须用**解析出来的声明集合**：
+    // 合法文件可能写成 xmlns:v='URI'（单引号），按字符串找双引号会误判成"没声明"，
+    // 再补一条同名的 xmlns:v 就是重复属性，XML 直接非法。
+    let vt_declared = match parsed.as_ref() {
+        Some(d) => d.vt_prefix.is_some(),
+        None => true, // 新建的根已经带 xmlns:vt
+    };
+    if !vt_declared
+    {
+        if let Some(i) = root_raw.rfind('>') {
+            let ins = format!(" xmlns:{}=\"{}\"", vt_prefix.trim_end_matches(':'), VT_NS);
+            root_raw.insert_str(i, &ins);
+        }
+    }
+
+    let mut next_pid = parsed.as_ref().map(|d| d.max_pid).unwrap_or(1) + 1;
+    let mut existing: Vec<(String, u32)> = parsed.as_ref().map(|d| d.owned.clone()).unwrap_or_default();
     let mut body = String::new();
-    for p in &kept {
-        body.push_str(&p.raw);
+    // 第三方属性原样搬过来（含它们自己的前缀）
+    if let Some(d) = parsed.as_ref() {
+        for raw in &d.kept {
+            body.push_str(raw);
+        }
     }
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, src) in sources.iter().enumerate() {
         // 归属只认 `_sc_src_` 前缀：名字必须落在这个命名空间里，否则下次保存会被当成第三方属性。
-        // 老代码允许任意 name（如「导入1」），那样的源保存后根本读不回来。
         let mut name = if src.name.starts_with("_sc_src_") {
             src.name.clone()
         } else {
@@ -226,24 +431,28 @@ pub fn write_sources_from(
         while !used.insert(name.clone()) {
             name = format!("_sc_src_{}_{}", i + 1, used.len() + 1);
         }
+        let pid = match existing.iter().position(|(n, _)| *n == name) {
+            Some(i) => existing.remove(i).1,
+            None => {
+                let p = next_pid;
+                next_pid += 1;
+                p
+            }
+        };
         let text = src.to_name_text().trim_matches('"').to_string();
         body.push_str(&format!(
-            "<property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"{}\" name=\"{}\"><vt:lpwstr>{}</vt:lpwstr></property>",
-            next_pid + i as u32,
-            xml_escape_attr(&name),
-            xml_escape_text(&text)
+            "<{p}property fmtid=\"{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}\" pid=\"{pid}\" name=\"{name}\"><{v}lpwstr>{text}</{v}lpwstr></{p}property>",
+            p = prop_prefix,
+            v = vt_prefix,
+            pid = pid,
+            name = xml_escape_attr(&name),
+            text = xml_escape_text(&text)
         ));
     }
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>{nl}\
-<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" \
-xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">{body}</Properties>",
-        nl = "\r\n"
-    );
+    let xml = format!("{decl}{root_raw}{body}{root_close}");
 
     let mut parts: Vec<(String, Vec<u8>)> = vec![("docProps/custom.xml".into(), xml.into_bytes())];
-
-    // 关系：包级 _rels/.rels 要指向它
+    // 关系与内容类型（已有就不重复加）
     let rels = crate::fixups::read_part(path, "_rels/.rels")
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
@@ -264,8 +473,6 @@ xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\
             parts.push(("_rels/.rels".into(), format!("{}{}{}", &rels[..i], rel, &rels[i..]).into_bytes()));
         }
     }
-
-    // 内容类型
     if let Some(ct) = crate::fixups::read_part(path, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()) {
         if !ct.contains("/docProps/custom.xml") {
             if let Some(i) = ct.rfind("</Types>") {
@@ -282,58 +489,12 @@ xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\
     Ok(())
 }
 
-struct RawProp {
-    name: String,
-    pid: u32,
-    raw: String,
-}
-
-/// 读出**第三方**属性（保留原始 XML 片段，类型/命名空间/fmtid/pid 一律不动）
-fn parse_third_party_props(xml: &str) -> Vec<RawProp> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find("<property") {
-        let seg = &rest[i..];
-        let Some(gt) = seg.find('>') else { break };
-        let self_closing = seg[..gt].ends_with('/');
-        let (raw, consumed) = if self_closing {
-            (seg[..gt + 1].to_string(), gt + 1)
-        } else {
-            let Some(c) = seg.find("</property>") else { break };
-            (seg[..c + "</property>".len()].to_string(), c + "</property>".len())
-        };
-        let head = &raw[..raw.find('>').unwrap_or(raw.len())];
-        let name = attr_value(head, "name").map(|v| xml_unescape(&v)).unwrap_or_default();
-        let pid = attr_value(head, "pid").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-        if !name.starts_with("_sc_src_") {
-            out.push(RawProp { name, pid, raw });
-        }
-        rest = &seg[consumed..];
-    }
-    out
-}
-
-fn attr_value(head: &str, key: &str) -> Option<String> {
-    let pat = format!("{key}=\"");
-    let i = head.find(&pat)?;
-    let after = &head[i + pat.len()..];
-    after.split('"').next().map(|s| s.to_string())
-}
-
 fn xml_escape_text(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn xml_escape_attr(s: &str) -> String {
     xml_escape_text(s).replace('"', "&quot;")
-}
-
-fn xml_unescape(s: &str) -> String {
-    s.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&gt;", ">")
-        .replace("&lt;", "<")
-        .replace("&amp;", "&")
 }
 
 /// 清掉本应用写的自定义属性部件，以及只为它存在的关系/内容类型
@@ -380,31 +541,65 @@ fn read_sources_from_props(path: &std::path::Path) -> Vec<Source> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut rest = xml.as_str();
-    while let Some(i) = rest.find("<property ") {
-        rest = &rest[i..];
-        let Some(gt) = rest.find('>') else { break };
-        let head = &rest[..gt];
-        let name = head
-            .find("name=\"")
-            .map(|p| {
-                let after = &head[p + 6..];
-                after.split('"').next().unwrap_or("").to_string()
-            })
-            .unwrap_or_default();
-        let Some(close) = rest.find("</property>") else { break };
-        let body = &rest[gt + 1..close];
+    for (name, text) in read_all_props(&xml) {
         if name.starts_with("_sc_src_") {
-            let text = body
-                .trim_start_matches("<vt:lpwstr>")
-                .trim_end_matches("</vt:lpwstr>")
-                .replace("&amp;", "&")
-                .replace("&lt;", "<");
             if let Some(src) = Source::from_name_text(&name, &text) {
                 out.push(src);
             }
         }
-        rest = &rest[close + 11..];
+    }
+    out
+}
+
+/// 按命名空间解析所有自定义属性 → (name, 文本值)。
+/// 只认 CP 命名空间里的 `property`：前缀可以是 `cp:`，属性引号可以是单引号。
+fn read_all_props(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    use quick_xml::name::{Namespace, ResolveResult};
+
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    let mut in_value = false;
+    loop {
+        let (ns, ev) = match reader.read_resolved_event_into(&mut buf) {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        match ev {
+            Event::Start(e) => {
+                let local = e.local_name();
+                if local.as_ref() == "property" && ns == ResolveResult::Bound(Namespace(CP_NS)) {
+                    let mut name = String::new();
+                    for a in e.attributes().with_checks(false).flatten() {
+                        if a.key.local_name().as_ref() == "name" {
+                            name = quick_xml::escape::unescape(a.value.as_ref()).map(|v| v.into_owned()).unwrap_or_default();
+                        }
+                    }
+                    cur = Some((name, String::new()));
+                } else if cur.is_some() {
+                    in_value = true;
+                }
+            }
+            Event::Text(t) if in_value => {
+                if let Some((_, v)) = cur.as_mut() {
+                    v.push_str(&t.xml10_content());
+                }
+            }
+            Event::End(e) => {
+                let local = e.local_name();
+                if local.as_ref() == "property" && ns == ResolveResult::Bound(Namespace(CP_NS)) {
+                    if let Some(p) = cur.take() {
+                        out.push(p);
+                    }
+                }
+                in_value = false;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
     }
     out
 }

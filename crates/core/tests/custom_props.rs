@@ -52,6 +52,48 @@ fn book_with_props(dir: &std::path::Path) -> std::path::PathBuf {
     p
 }
 
+/// 合法但写法刁钻的第三方文件：`<cp:property>` 前缀、单引号 pid/name、
+/// 类型元素用 `v:` 而不是 `vt:`。旧实现字符串找 `<property` 会漏掉它。
+fn book_with_prefixed_props(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+    let p = dir.join("prefixed.xlsx");
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+
+    let custom = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:Properties xmlns:cp="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:v="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><cp:property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid='2' name='客户'><v:lpwstr>甲公司</v:lpwstr></cp:property><cp:property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Revision"><v:i4>42</v:i4></cp:property></cp:Properties>"#;
+    let rels = sheetcore::fixups::read_part(&p, "_rels/.rels").and_then(|b| String::from_utf8(b).ok()).unwrap();
+    let rel = "<Relationship Id=\"rId900\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties\" Target=\"docProps/custom.xml\"/>";
+    let i = rels.rfind("</Relationships>").unwrap();
+    let rels = format!("{}{}{}", &rels[..i], rel, &rels[i..]);
+    let ct = sheetcore::fixups::read_part(&p, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()).unwrap();
+    let i = ct.rfind("</Types>").unwrap();
+    let ct = format!("{}<Override PartName=\"/docProps/custom.xml\" ContentType=\"{CT}\"/>{}</Types>", &ct[..i], "");
+    let ct = ct.replace("</Types></Types>", "</Types>");
+    sheetcore::fixups::write_parts(&p, &[
+        ("docProps/custom.xml".into(), custom.as_bytes().to_vec()),
+        ("_rels/.rels".into(), rels.into_bytes()),
+        ("[Content_Types].xml".into(), ct.into_bytes()),
+    ]).unwrap();
+    p
+}
+
+fn pids(xml: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let b = xml.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = xml[i..].find("pid=") {
+        let at = i + pos + 4;
+        let (q, start) = match b.get(at) { Some(b'\'') => (b'\'', at + 1), Some(b'"') => (b'"', at + 1), _ => { i = at; continue; } };
+        let mut end = start;
+        while end < b.len() && b[end] != q && b[end].is_ascii_digit() { end += 1; }
+        if let Ok(n) = xml[start..end].parse() { out.push(n); }
+        i = end;
+    }
+    out
+}
+
 fn custom_xml(p: &std::path::Path) -> String {
     String::from_utf8(sheetcore::fixups::read_part(p, "docProps/custom.xml").expect("custom.xml 应存在"))
         .unwrap()
@@ -307,4 +349,74 @@ fn sources_with_arbitrary_labels_land_in_the_app_namespace() {
 
     let back = sheetcore::xlsx::load(&p).unwrap();
     assert_eq!(back.sources.len(), 2, "两个数据源都要读回来：{:?}", back.sources);
+}
+
+#[test]
+fn prefixed_properties_single_quotes_and_alt_type_prefix_survive() {
+    let dir = std::env::temp_dir().join(format!("sc_c08_pref_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let p = book_with_prefixed_props(&dir);
+    write_sources(&p, &[src(1, "C:/data/a.csv")]).unwrap();
+    let xml = custom_xml(&p);
+
+    // 第三方属性原样保留（含单引号原文、v: 前缀、类型值）
+    assert!(xml.contains("pid='2' name='客户'"), "单引号 pid/name 必须原样保留：{xml}");
+    assert!(xml.contains("<v:lpwstr>甲公司</v:lpwstr>"), "替代前缀类型元素必须保留：{xml}");
+    assert!(xml.contains("<v:i4>42</v:i4>"));
+    assert!(xml.contains("fmtid=\"{D5CDD505-2E9C-101B-9397-08002B2CF9AE}\""));
+    // 前缀仍然绑定（没有 unbound prefix）
+    assert!(xml.contains("xmlns:cp=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\""));
+    assert!(xml.contains("xmlns:v=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\""));
+    // 本应用属性沿用文件里的前缀，不混用默认命名空间
+    assert!(xml.contains("<cp:property"), "新属性应沿用 cp: 前缀：{xml}");
+    assert!(!xml.contains("<property "), "不应写出无前缀属性：{xml}");
+    // pid 唯一
+    let mut ids = pids(&xml);
+    ids.sort_unstable();
+    let before = ids.len();
+    ids.dedup();
+    assert_eq!(before, ids.len(), "pid 必须唯一：{xml}");
+    // 读端能读回数据源
+    let back = sheetcore::external::read_sources(&p);
+    assert_eq!(back.len(), 1, "读完应看到 1 条源：{back:?}");
+}
+
+/// 根上的命名空间用单引号声明也是合法 XML：不能再补一条同名声明（重复属性 → 非法）。
+#[test]
+fn single_quoted_namespace_declarations_are_not_duplicated() {
+    let d = std::env::temp_dir().join(format!("sc_c08_sq_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+    let p = d.join("sq.xlsx");
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+
+    let custom = "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\
+<Properties xmlns='http://schemas.openxmlformats.org/officeDocument/2006/custom-properties' xmlns:v='http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'>\
+<property fmtid='{D5CDD505-2E9C-101B-9397-08002B2CF9AE}' pid='2' name='Owner'><v:lpwstr>甲</v:lpwstr></property></Properties>";
+    let rels = sheetcore::fixups::read_part(&p, "_rels/.rels").and_then(|b| String::from_utf8(b).ok()).unwrap();
+    let rel = "<Relationship Id=\"rId901\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties\" Target=\"docProps/custom.xml\"/>";
+    let i = rels.rfind("</Relationships>").unwrap();
+    let rels = format!("{}{}{}", &rels[..i], rel, &rels[i..]);
+    let ct = sheetcore::fixups::read_part(&p, "[Content_Types].xml").and_then(|b| String::from_utf8(b).ok()).unwrap();
+    let i = ct.rfind("</Types>").unwrap();
+    let ct = format!("{}<Override PartName=\"/docProps/custom.xml\" ContentType=\"{CT}\"/>{}</Types>", &ct[..i], "").replace("</Types></Types>", "</Types>");
+    sheetcore::fixups::write_parts(&p, &[
+        ("docProps/custom.xml".into(), custom.as_bytes().to_vec()),
+        ("_rels/.rels".into(), rels.into_bytes()),
+        ("[Content_Types].xml".into(), ct.into_bytes()),
+    ]).unwrap();
+
+    write_sources(&p, &[src(1, "C:/data/a.csv")]).unwrap();
+    let xml = custom_xml(&p);
+    // VT 命名空间只能声明一次（单引号/双引号都算）
+    let n = xml.matches("docPropsVTypes").count();
+    assert_eq!(n, 1, "VT 命名空间不能重复声明：{xml}");
+    assert!(xml.contains("xmlns:v='http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'"), "原声明应原样保留：{xml}");
+    assert!(xml.contains("<v:lpwstr>甲</v:lpwstr>"));
+    assert!(!xml.contains("<vt:lpwstr>"), "新属性要沿用文件里的前缀");
+    // 属性名/值仍能读回
+    assert_eq!(sheetcore::external::read_sources(&p).len(), 1);
 }
