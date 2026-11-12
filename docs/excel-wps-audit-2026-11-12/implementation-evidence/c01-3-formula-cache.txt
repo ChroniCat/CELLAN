@@ -1,0 +1,96 @@
+C01.2 修正 + C01.3 FORMULA 缓存布局与增量/全量一致性
+======================================================
+日期：2026-11-13 UTC+08   对标：core-requirements.md C01（C01.2 补正、C01.3）
+
+一、复核指出的读取回归（已证实）
+------------------------------
+上一版 `xls_read` 用「两种布局都接受」的启发式：
+
+    if body[6] == 0xFF && body[7] == 0xFF { (body[8], body[9]) }
+    else if body[12] == 0xFF && body[13] == 0xFF { (body[6], body[8]) }
+
+`body[6..8]` 是 num 字段的**低 16 位**，普通 finite double 完全可能是 0xFFFF：
+
+    f64::from_bits(0x3ff000000000ffff) = 1.0000000000145517
+    小端字节 = ff ff 00 00 00 00 f0 3f      ← body[6..8] 命中
+
+于是这个合法数值被判成特殊值，`ty = body[8] = 0x00`（字符串）→ 不 push → **整格丢失**。
+
+二、规范依据（不是猜的）
+------------------------
+calamine 0.38 `xls.rs::parse_formula_value`（`r` = `body[6..14]`）：
+
+    [0x00, .., 0xFF, 0xFF] => 字符串（值在下一条 STRING 记录）
+    [0x01, _, b, .., 0xFF, 0xFF] => Bool(b)
+    [0x02, _, e, .., 0xFF, 0xFF] => 错误 e
+    [0x03, .., 0xFF, 0xFF] => 空
+    _ => 普通 f64
+
+即：**高两字节 num[6..8] == 0xFFFF 才是特殊值**，num[0] = 类型，num[2] = 取值。
+高两字节 0xFFFF 对应符号位 1 + 指数全 1，只能是 NaN，不可能是真数值 —— 这才是可判的边界。
+
+三、改动
+--------
+1. `xls_read`：只按高两字节判特殊值（删掉低两字节分支），type=body[6]、val=body[8]。
+2. `xls_read`：补 **STRING 记录**（0x0207）——之前完全没有这个分支，
+   我们自己写出去的文本公式缓存读回来是空的。
+3. `xls_write::cached_value`：标号从 `num[0..2]` 挪到 `num[6..8]`（type=num[0]、value=num[2]）。
+   旧写法只有我们自己的旧读端能认，Excel 会把缓存读成 NaN。
+
+四、用例（`crates/core/tests/xls_formula_cache.rs`，7 项）
+--------------------------------------------------------
+直接按规范字节造记录喂 `read_stream`，不经过自己的写端（避免读写两端一起错、互相自洽）：
+
+| 用例 | 断言 |
+|---|---|
+| `a_plain_number_whose_low_word_is_ffff_survives` | num = `ff ff 00 00 00 00 f0 3f` → `Number(1.0000000000145517)`，不得丢格 |
+| `special_results_use_the_high_word_marker` | 错误/布尔/空/普通数值/0.0 六种缓存按高字节标号解析正确，空结果不落格 |
+| `a_string_result_is_read_from_the_following_string_record` | FORMULA(type 0) + STRING("文本") → `Text("文本")` |
+| `our_own_xls_roundtrip_covers_every_cached_type` | 我们的写端 → 读端：tricky 数值、Div0、TRUE、文本全部保持 |
+| `full_recalc_gives_the_expected_three_stage_behavior` | 跨表错误 → 改无关输入增量 → 再全算，三阶段一致 |
+| `every_incremental_step_matches_a_clone_full_recalc` | 5 步改动（含清 SPILL 障碍、公式列被数值覆盖），每步增量 vs 克隆全算**逐格比类型与数值** |
+| `fixing_the_error_source_clears_dependents_incrementally` | 错误源修好后，依赖格 `A1&"x"`、`SUM(A1,2)` 增量就恢复成 0.25 / "0.25x" / 2.25 |
+| `requirement_three_stage_case_stays_div0` | 需求表格原样场景：A1=`=1/0`、B1=1、C1=`=SUM(A1,B1)`；全算 → 改 B1=2 增量 → 再全算，C1 始终 `#DIV/0!` |
+
+五、变异验证（真实输出）
+------------------------
+    [1] 读端退回「低两字节优先」
+        test a_plain_number_whose_low_word_is_ffff_survives ... FAILED
+          left: []   right: [(0, 0, Number(1.0000000000145517))]
+
+    [2] 写端标号挪回 num[0..2]
+        test our_own_xls_roundtrip_covers_every_cached_type ... FAILED
+          left: Number(5.8120459e-316)   right: Error(Div0)
+        —— 旧布局写出的错误缓存被按 NaN 双精度读回，正是 Excel 会看到的错值
+
+    [3] 删掉 STRING 分支
+        test a_string_result_is_read_from_the_following_string_record ... FAILED
+          left: []   right: [(0, 0, Text("文本"))]
+
+六、C01.3 覆盖说明（哪些已证、哪些没证）
+----------------------------------------
+- 七种传统错误中的 Div0/Na/Num/Name/Value/Ref 在 `book()` 里参与增量与全量比较；
+  `#NULL!` 用 `=SUM(A1 A2)`（无交集）构造，若引擎不产生 #NULL! 则该分支等价于 Value 错误，
+  记录在此，不冒充逐种一一定位。
+- SPILL 用 `=SEQUENCE(2,1)` + 占用格构造，并在第 4 步清障碍后比较增量结果。
+- 跨表：`汇总!A1 = 数据!A1`，依赖链 `A1&"x"`、`IFERROR(A1,7)`、`SUM(A1,2)`。
+- 外链缓存不参与 recalc（只是缓存），其类型保持由 C01.2 的 `external_link_cache_keeps_error_type` 覆盖。
+- 未做：撤销/协作同步端到端（C01.4）；与 Excel/WPS 实机对拍。
+
+七、最终实测（本文件与代码同一提交）
+------------------------------------
+    cargo test -p sheetcore --test xls_formula_cache
+    → 8 passed / 0 failed，EXIT=0（c013e.log）
+
+    cargo test -p sheetcore -- --test-threads=1
+    → 58 个测试二进制，506 passed / 0 failed / 34 ignored，CORE_EXIT=0（round8_core.log）
+    cargo test -p app --bin app                      → 140 passed，APP_EXIT=0
+    cargo test -p app --test ui_regression -- --test-threads=1
+    → 12 passed / 8 ignored，GUI_EXIT=0
+
+八、对 C01.2 证据的更正
+-----------------------
+`c01-2-error-persistence.txt` 里的 `book()` 全部是 `formula: None`，
+只证明了 BOOLERR（静态错误/布尔）往返，**没有**覆盖 FORMULA 缓存；
+该文写法容易让人以为公式缓存也验过。公式缓存的部分以本文件为准，
+C01.2 的验收范围相应改为「静态 BOOLERR + 剪贴板映射 + 外链缓存」。

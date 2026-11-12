@@ -137,36 +137,39 @@ struct XfKey {
     fill: Option<u8>,
 }
 
-/// FORMULA 记录里的 8 字节缓存值；文本还要跟一条 STRING 记录
+/// FORMULA 记录里的 8 字节缓存值（MS-XLS Xnum）；文本还要跟一条 STRING 记录。
+///
+/// 布局：非数值结果把 **num[6..8] 写成 0xFFFF**，num[0] = 类型（0 串/1 布尔/2 错误/3 空），
+/// num[2] = 取值。不能把标号放在 num[0..2]：那样普通数值只要低 16 位是 0xFFFF
+/// （1.0000000000145517 就是）就会被当成特殊值读坏。
 fn cached_value(v: &Value) -> ([u8; 8], Option<Vec<u8>>) {
     let mut b = [0u8; 8];
     match v {
         Value::Number(n) => b.copy_from_slice(&n.to_le_bytes()),
         Value::Text(t) => {
-            b[0] = 0xFF;
-            b[1] = 0xFF; // 类型标号：0=字符串
-            b[2] = 0;
+            b[0] = 0; // 字符串：值在随后的 STRING 记录里
+            b[6] = 0xFF;
+            b[7] = 0xFF;
             let mut sb = Vec::new();
             sb.extend_from_slice(&unicode_str(t));
             return (b, Some(sb));
         }
         Value::Bool(x) => {
-            b[0] = 0xFF;
-            b[1] = 0xFF;
-            b[2] = 1;
-            b[3] = if *x { 1 } else { 0 };
+            b[0] = 1;
+            b[2] = if *x { 1 } else { 0 };
+            b[6] = 0xFF;
+            b[7] = 0xFF;
         }
         Value::Error(e) => {
-            // FORMULA 缓存值的错误标号：2 = 错误，第 4 字节是 BIFF 错误码
-            b[0] = 0xFF;
-            b[1] = 0xFF;
-            b[2] = 2;
-            b[3] = biff_error_code(*e);
+            b[0] = 2;
+            b[2] = biff_error_code(*e);
+            b[6] = 0xFF;
+            b[7] = 0xFF;
         }
         Value::Empty => {
-            b[0] = 0xFF;
-            b[1] = 0xFF;
-            b[2] = 3;
+            b[0] = 3;
+            b[6] = 0xFF;
+            b[7] = 0xFF;
         }
     }
     (b, None)

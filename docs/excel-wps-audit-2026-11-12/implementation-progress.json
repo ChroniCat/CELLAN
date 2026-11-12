@@ -29,23 +29,24 @@
    "commands": [
     "cargo test -p sheetcore --test error_values (8 passed)",
     "cargo test -p sheetcore --test error_persistence (4 passed)",
-    "cargo test -p sheetcore -- --test-threads=1 (57 bins, 498 passed / 34 ignored, EXIT=0)",
-    "cargo test -p app --bin app (140 passed, EXIT=0)"
+    "cargo test -p sheetcore --test xls_formula_cache (8 passed)",
+    "cargo test -p sheetcore -- --test-threads=1 (58 bins, 506 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (140 passed, EXIT=0)",
+    "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored, EXIT=0)"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-1-error-type.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-2-error-persistence.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-2-error-persistence.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt"
    ],
    "not_done": [
-    "C01.3：七种错误 × 跨表 × 外链的 recalc_dirty 与 clone-recalc_all 逐格比较夹具未建（`full_recalc_keeps_the_error_type` 只调 recalc_all，`a_reference_to_the_same_sheet_keeps_the_error_type` 只测同表，名称已按实际覆盖改正）",
     "C01.4：撤销恢复错误值、协作同步错误值的端到端用例未做",
-    "XLS FORMULA 缓存为字符串（type=0 + STRING 记录）的读回无用例",
     "未与 Excel/WPS 实机对拍"
    ],
    "failures": [],
    "blocker": "",
    "next": "",
-   "updated_utc": "2026-11-12T16:35:34Z",
+   "updated_utc": "2026-11-12T16:52:09Z",
    "slices": [
     {
      "id": "C01.1",
@@ -82,7 +83,7 @@
      "acceptance_source": "core-requirements.md / C01 验收中与本切片有关的条目",
      "depends_on": [],
      "status": "已验收",
-     "acceptance": "XLSX/XLS 缓存类型与保存重开：错误写成 t=\"e\"/BOOLERR 错误码，读回是 Value::Error；布尔/数字/文本不受影响；外链缓存 t=\"e\" 与刷新 Data::Error 都保类型；粘贴 ss:Type=\"Error\"→kind=4→Value::Error；4+1 项用例，三处变异验证（含一次最初没抓住的假通过）",
+     "acceptance": "静态/缓存类型往返：BOOLERR（错误/布尔）与 FORMULA 缓存（数值含低16位0xFFFF、传统错误、布尔、字符串、空）读写一致；xlsx t=\"e\"、外链缓存 t=\"e\"、粘贴 ss:Type=\"Error\"→Value::Error。公式缓存布局按 MS-XLS 高两字节标号，变异证明低两字节启发式会丢 1.0000000000145517。",
      "files": [
       "crates/core/src/xls_write.rs,crates/core/src/xls_read.rs,crates/core/src/xlinks.rs,crates/core/tests/error_persistence.rs,crates/app/src/office_clipboard.rs,crates/app/src/main.rs,crates/app/src/edit_regression_tests.rs"
      ],
@@ -91,18 +92,18 @@
      ],
      "commands": [
       "cargo test -p sheetcore --test error_persistence (4 passed)",
+      "cargo test -p sheetcore --test xls_formula_cache (8 passed)",
       "cargo test -p app --bin app pasting_an_excel_error (1 passed)"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-2-error-persistence.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-2-error-persistence.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt"
      ],
-     "not_done": [
-      "XLS FORMULA 缓存字符串（type=0 + STRING）读回无用例"
-     ],
+     "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T16:35:34Z"
+     "updated_utc": "2026-11-12T16:52:09Z"
     },
     {
      "id": "C01.3",
@@ -110,17 +111,23 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C01 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "需求三阶段场景（A1=1/0、B1=1、C1=SUM(A1,B1)；全算→改B1增量→再全算）C1 始终 #DIV/0!；七种错误 + SPILL + 跨表依赖链；每步增量与克隆全量逐格比较类型与数值（5 步改动）；错误源修复后依赖增量恢复。8 项用例 + 3 处变异。",
+     "files": [
+      "crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/tests/xls_formula_cache.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test xls_formula_cache (8 passed)"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T16:52:09Z"
     },
     {
      "id": "C01.4",

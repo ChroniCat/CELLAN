@@ -15,6 +15,7 @@ const RK: u16 = 0x027E;
 const MULRK: u16 = 0x00BD;
 const BOOLERR: u16 = 0x0205;
 const FORMULA: u16 = 0x0006;
+const STRING: u16 = 0x0207;
 const SST: u16 = 0x00FC;
 const CONTINUE: u16 = 0x003C;
 const BOF: u16 = 0x0809;
@@ -135,6 +136,8 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
         .collect();
 
     let mut cur: Option<usize> = None;
+    // FORMULA 的字符串结果放在紧随其后的 STRING 记录里
+    let mut pending_string: Option<(u32, u32)> = None;
     let mut next_bound = 0usize;
     let mut i = 0usize;
     while i + 4 <= stream.len() {
@@ -197,6 +200,13 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
                         push(r, c, Value::Text(s.clone().into()));
                     }
                 }
+                STRING if body.len() >= 2 => {
+                    if let Some((r, c)) = pending_string.take() {
+                        if let Some((t, _)) = read_str(body, 0) {
+                            push(r, c, Value::Text(t.into()));
+                        }
+                    }
+                }
                 BOOLERR if body.len() >= 8 => {
                     let r = u16le(body, 0).unwrap() as u32;
                     let c = u16le(body, 2).unwrap() as u32;
@@ -212,23 +222,19 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
                 FORMULA if body.len() >= 14 => {
                     let r = u16le(body, 0).unwrap() as u32;
                     let c = u16le(body, 2).unwrap() as u32;
-                    // 缓存结果：前两字节 0xFFFF 表示特殊值。两种布局都要认——
-                    // MS-XLS 写在 num 的开头（body[6..8]），Excel 实际文件里也见过
-                    // 写在 num 末尾（body[12..14]）的，旧实现只认后者还读错了类型字节。
-                    let special = if body[6] == 0xFF && body[7] == 0xFF {
-                        Some((body[8], body[9]))
-                    } else if body[12] == 0xFF && body[13] == 0xFF {
-                        Some((body[6], body[8]))
-                    } else {
-                        None
-                    };
-                    if let Some((ty, val)) = special {
-                        match ty {
-                            // 0 = 字符串结果（值在随后的 STRING 记录里，这里不抢着写）
-                            0 => {}
-                            1 => push(r, c, Value::Bool(val != 0)),
+                    // 缓存结果（MS-XLS 2.4.127 Xnum）：**高两字节** num[6..8] == 0xFFFF
+                    // 才是特殊值，此时 num[0] 是类型、num[2] 是取值。
+                    // 不能用低两字节判：普通 finite 双精度数的低 16 位可以正好是 0xFFFF
+                    // （f64::from_bits(0x3ff000000000ffff) = 1.0000000000145517，
+                    // 小端 ff ff 00 00 00 00 f0 3f），那样会把合法数值整格丢掉。
+                    // 高两字节 0xFFFF 对应符号位 1 + 指数全 1，只能是 NaN，不是真数值。
+                    if body[12] == 0xFF && body[13] == 0xFF {
+                        match body[6] {
+                            // 0 = 字符串结果，值在紧随其后的 STRING 记录里
+                            0 => pending_string = Some((r, c)),
+                            1 => push(r, c, Value::Bool(body[8] != 0)),
                             2 => {
-                                if let Some(k) = err_kind_from_biff(val) {
+                                if let Some(k) = err_kind_from_biff(body[8]) {
                                     push(r, c, Value::Error(k));
                                 }
                             }

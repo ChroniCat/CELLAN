@@ -1,17 +1,12 @@
-# 实施恢复记录
+## 当前状态（最后更新：2026-11-13 UTC+08，C01.2/C01.3 之后）
 
-> 每轮开始、上下文压缩后或恢复会话时先读这份文件，再核对 `git status` 与实际源码。
-> 计数以 `implementation-progress.json` 为准：`python scripts/audit_progress.py counts`。
-
-## 当前状态（最后更新：2026-11-12 UTC+08，C13 门禁 + QA-03 复核补正后）
-
-- 分支 `main`，跟踪 `origin/main`；最新提交 `f348f02`（C03 + 复核边界修补）
-- 已验收：任务 **4/61**（UI-02、C13、QA-03、C03）；切片 **10/148**
-- 待验收：UI-01（真实中文输入法与硬件键盘未执行，父任务与 UI-01.1 都保持待验收）
-- 基线（本轮实测）：
-  - app 单测 **139 passed / 0 failed / 0 ignored**，**默认并行连跑两轮 EXIT=0**
-  - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**（含 2 个真实系统对话框用例、1 个双进程持锁用例）
-  - sheetcore **484 passed / 0 failed / 34 ignored**（55 个测试二进制，EXIT=0）
+- 分支 `main`，跟踪 `origin/main`；最新提交见 `git log -1`（C01.2/C01.3 提交在 `b978fd0` 之后）
+- 已验收：任务 **4/61**（UI-02、C13、QA-03、C03）；切片 **13/148**（C01.1/C01.2/C01.3 已验收）
+- 待验收：UI-01（真实中文输入法与硬件键盘未执行）、C01（只差 C01.4：撤销/协作同步端到端）
+- 基线（本轮实测，round8）：
+  - sheetcore **58 个测试二进制 / 506 passed / 0 failed / 34 ignored**，EXIT=0
+  - app 单测 **140 passed / 0 failed**，EXIT=0
+  - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**，EXIT=0
 - 工具链：`C:/Users/Administrator/.cargo/bin/cargo.exe`；`source scripts/audit_env.sh <标签>`
 
 ## 本轮完成（提交 → 证据）
@@ -30,6 +25,14 @@
 
 - `counts`：`tasks.已验收=3`、`slices.已验收=9`、`待验收=1`（UI-01 及其切片）
 - `check` 输出「清单一致」，说明 tasks.json 的 61/148 与台账结构未走样
+
+## C01.2 / C01.3 关键结论（不要重复踩）
+
+- XLS FORMULA 缓存布局：**高两字节 num[6..8] == 0xFFFF** 才是特殊值（num[0]=类型、num[2]=取值）；
+  低两字节可以正好是 0xFFFF（1.0000000000145517），按低字判断会整格丢数。
+- 写端也必须用高字节标号；旧写法 Excel 会读成 NaN。
+- FORMULA 的字符串结果在随后的 **STRING 记录**（0x0207）里，之前完全没解析。
+- 增量 vs 全量：`recalc_dirty(wb, &deps, &[(sheet,row,col)])`，`Deps::build(&wb)`，CellKey 是元组。
 
 ## 下一步（按依赖优先级）
 
