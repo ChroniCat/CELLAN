@@ -73,7 +73,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     let mut base = (*ctx.style()).clone();
     base.text_styles = [
         (egui::TextStyle::Heading, FontId::proportional(13.0)),
-        (egui::TextStyle::Body, FontId::proportional(12.5)),
+        (egui::TextStyle::Body, FontId::proportional(12.0)),
         (egui::TextStyle::Button, FontId::proportional(12.0)),
         (egui::TextStyle::Small, FontId::proportional(11.0)),
         (egui::TextStyle::Monospace, FontId::monospace(12.0)),
@@ -200,7 +200,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
                     let c = if ui.visuals().dark_mode {
                         ui.visuals().weak_text_color()
                     } else {
-                        Color32::from_rgb(102, 102, 102)
+                        Color32::from_rgb(89, 89, 89)
                     };
                     ui.label(RichText::new(title).size(12.0).color(c));
                 },

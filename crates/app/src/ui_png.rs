@@ -75,13 +75,23 @@ fn texture(ctx: &Context, name: &'static str, small: bool, bytes: &'static [u8])
 /// 画一张位图图标；小尺寸用原生 16px 版本，避免 32px 缩小的发虚。
 pub fn draw(p: &egui::Painter, rect: egui::Rect, icon: Icon, enabled: bool) -> bool {
     if let Some((name, big, small)) = png(icon) {
-        let small_mode = rect.width() <= 20.0;
+        // 小于 28 的图标框一律用 16px 素材（32px 素材塞进 24px 框会溢出）
+        let small_mode = rect.width() < 28.0;
         let bytes = if small_mode { small } else { big };
         let t = texture(p.ctx(), name, small_mode, bytes);
         let tint = if enabled { Color32::WHITE } else { Color32::from_gray(170) };
+        // 位图按设备像素对齐：位置和尺寸都落到整数像素，纹素才和屏幕像素 1:1。
+        // 否则 egui 的双线性采样会把 16px 图标糊掉——这是「图标发虚」的主因。
+        // 关键：按位图原始像素尺寸画（16px 素材画 16 逻辑像素、32px 画 32），
+        // 再居中并落到整数设备像素。以前把 16px 素材拉伸到按钮给的 18~20px，
+        // 双线性放大就发虚——这是「图标糊」的根因。
+        let ppp = p.pixels_per_point().max(0.1);
+        let natural = if small_mode { 16.0 } else { 32.0 };
+        let x0 = ((rect.center().x - natural / 2.0) * ppp).round() / ppp;
+        let y0 = ((rect.center().y - natural / 2.0) * ppp).round() / ppp;
         p.image(
             t.id(),
-            rect,
+            egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(natural, natural)),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             tint,
         );

@@ -21101,6 +21101,13 @@ impl eframe::App for SheetApp {
                         });
                     },
                 );
+                // Excel：页签条是浅灰，命令区是纯白。整块铺 TABBAR_BG 会让功能区发灰、显脏。
+                let body_top = ui.cursor().top();
+                ui.painter().rect_filled(
+                    Rect::from_min_max(egui::pos2(full.left(), body_top), full.max),
+                    0.0,
+                    Color32::WHITE,
+                );
                 if !self.ribbon_collapsed {
                 egui::ScrollArea::horizontal()
                     .id_salt("ribbon_scroll")

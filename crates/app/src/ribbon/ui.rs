@@ -841,15 +841,26 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
                 .max_rect(text_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        let focused = ui.memory(|m| m.has_focus(fid));
         let fr = child
             .add_sized(
                 Vec2::new(text_rect.width(), 20.0),
                 egui::TextEdit::singleline(&mut app.font_buf)
                     .id(fid)
                     .frame(false)
-                    .hint_text("默认"),
+                    // 空字体时不再用灰色 hint（Excel 框里永远是具体的字体名）
+                    .hint_text(""),
             )
             .on_hover_text("字体名，回车应用");
+        if !focused && app.font_buf.is_empty() {
+            ui.painter().text(
+                egui::pos2(text_rect.left(), text_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "思源黑体",
+                egui::FontId::proportional(12.0),
+                ui_kit::TEXT,
+            );
+        }
         lost = fr.lost_focus();
         let ar = ui.interact(arrow_rect, egui::Id::new("font_arrow"), Sense::click());
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
