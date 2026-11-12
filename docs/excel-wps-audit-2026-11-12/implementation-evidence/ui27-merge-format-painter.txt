@@ -1,0 +1,43 @@
+UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:30）
+
+一、已实现
+1) 合并（main.rs::toggle_merge）
+- 先 write_preflight（他人锁定/保护整批拒绝）。
+- 选区除锚点外有非空内容时，第一次只提示“只保留左上角「…」，其余 N 格内容会被删除；再点一次合并确认”，
+  模型不变；同一区域第二次点击才执行。
+- 执行时删除非锚点内容（锚点值与格式保留），merge_range 拆相交旧合并；
+  一个 undo Action 同时记录 MergeEdit(before/after merges) + 被删格 delta。
+- 撤销恢复合并列表和被删的每格内容/样式；重做再次删除；保存重开保留 merges 与锚点。
+- 协作：被删格 broadcast_op(Empty)，合并状态 broadcast_merge。
+2) 格式对话框（FmtState / fmt_merge_pending）
+- “合并单元格/取消合并”只写挂起标记，点“确定”才调用 commit_fmt_merge → toggle_merge；
+  取消/关闭清挂起，模型完全不变。
+3) 格式刷（FormatPainter）
+- 记录源区域 rect + 样式号矩阵，按行/列取模平铺到目标选区；
+  支持拖选范围、单击一次自动退出、双击 ribbon 进入连续模式、Esc 结束。
+- 目标一次事务、一次撤销；样式经 broadcast_style 同步；目标上限 20 万格。
+
+二、用例（crates/app/src/edit_regression_tests.rs，3 passed）
+- merge_warns_cancel_keeps_data_and_confirm_is_undoable
+  首次提示不动数据；二次确认只留锚点；undo 恢复乙/9 与 merges；redo 再删；
+  save_atomic → load_diag 重开 merges/锚点一致。
+- format_dialog_merge_is_deferred_until_ok
+  仅设置挂起 + 清掉（取消）模型不变；commit_fmt_merge 才合并。
+- format_painter_maps_range_continuous_and_escape
+  1×2 源样式平铺到 3×2 目标；连续模式刷两次仍在；Esc 清 painter；
+  单击模式刷一次自动退出。
+- 全量 app 188 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+
+三、变异（全红后还原）
+M22 跳过合并二次确认 → FAILED
+M23 合并不删除非锚点 → FAILED
+M24 undo 不恢复 merges → FAILED
+M25 连续格式刷被强制退出 → FAILED
+M26 格式刷固定取源 [0][0] → FAILED
+M27 Esc 不结束格式刷 → FAILED
+
+四、未执行（父项保持待验收）
+- 真实 GUI 双击 ribbon 格式刷、拖选两个目标范围、Esc 的真实鼠标键盘流程未自动化（当前命令级）。
+- 合并提示是状态栏二次点击，不是 Excel 的模态 MessageBox；未与 Excel/WPS 实机并排对比。
+- 格式刷跨工作表/跨工作簿未覆盖；源区域超过 20 万格未限制（目标已限制）。
+- 合并撤销的协作端未做双端 poll_net 断言（值/样式会广播，merge 状态撤销广播未做）。

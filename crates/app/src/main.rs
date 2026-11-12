@@ -133,8 +133,17 @@ struct FindScan {
     purpose: u8,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
+struct FormatPainter {
+    /// 源区域（同簿内样式号可直接复用）
+    rect: (u32, u32, u32, u32),
+    /// 按源区域行列保存的样式号
+    styles: Vec<Vec<u16>>,
+    /// 双击进入连续模式，Esc 结束
+    continuous: bool,
+}
 
+#[derive(Default, Clone)]
 struct FmtState {
     font: String,
     bold: bool,
@@ -683,8 +692,16 @@ struct SheetApp {
     ribbon_popup: Option<ribbon::ui::Popup>,
     /// 无界面探针只触发一次
     ribbon_probe_done: bool,
-    /// 格式刷：点击目标格后套用这份样式
-    format_painter: Option<sheetcore::style::CellStyle>,
+    /// 格式刷：源区域样式矩阵；连续模式刷完不退出
+    format_painter: Option<FormatPainter>,
+    /// 双击格式刷：ribbon 点击时置位，动作里转成连续模式
+    painter_double: bool,
+    /// 最近一次 app 复制时写入系统剪贴板的文本；用于识别之后的外部复制
+    clip_stamp: Option<String>,
+    /// 合并会丢内容时的二次确认；再次点合并同一区域才执行
+    merge_pending: Option<(u32, u32, u32, u32)>,
+    /// 格式对话框里的“合并/取消合并”：确定后才执行，取消不改
+    fmt_merge_pending: Option<bool>,
     /// 颜色面板：Some(true)=字体颜色 Some(false)=填充颜色
     color_popup: Option<bool>,
     /// 编辑栏展开（Excel 右侧那个小箭头）
@@ -1341,6 +1358,10 @@ impl SheetApp {
             ribbon_popup: None,
             ribbon_probe_done: false,
             format_painter: None,
+            painter_double: false,
+            clip_stamp: None,
+            merge_pending: None,
+            fmt_merge_pending: None,
             color_popup: None,
             fx_expanded: false,
             keytips: std::env::var("SC_KEYTIPS").is_ok(),
@@ -2093,6 +2114,7 @@ impl SheetApp {
                                 self.doc_gen = self.doc_gen.wrapping_add(1);
                                 self.undo.push(sheetcore::undo::Action {
                                     label: "移动文本框".into(),
+                                    merges: None,
                                     deltas: Vec::new(),
                                     focus: (self.sheet_idx, self.sel.0, self.sel.1),
                                     snap_before: None,
@@ -3602,6 +3624,7 @@ impl SheetApp {
             .set(r, c, Cell { value: Value::Empty, formula: None });
         self.undo.push(sheetcore::undo::Action {
             label: "清除".into(),
+            merges: None,
             snap_before: None,
             snap_after: None,
             by_site: 0,
@@ -3803,6 +3826,7 @@ impl SheetApp {
         let focus = (self.sheet_idx, self.sel.0, self.sel.1);
         self.undo.push(sheetcore::undo::Action {
             label: label.to_string(),
+            merges: None,
             deltas,
             focus,
             snap_before: None,
@@ -3928,7 +3952,8 @@ impl SheetApp {
             tsv.push('\n');
             cells.push(row);
         }
-        ctx.copy_text(tsv);
+        ctx.copy_text(tsv.clone());
+        self.clip_stamp = Some(tsv);
         self.clip = Some(Clip { sheet: si, rect: (r1, c1, r2, c2), cells, cut });
         self.status = format!(
             "已{} {:?}（{} 行 × {} 列）",
@@ -4065,6 +4090,7 @@ impl SheetApp {
         }
         self.undo.push(sheetcore::undo::Action {
             label: label.into(), deltas, focus: (si, r, c),
+            merges: None,
             snap_before: None, snap_after: None, by_site: 0,
             shapes: None,
             refresh_sizes: None,
@@ -5191,6 +5217,7 @@ impl SheetApp {
                 self.wb.sources.iter().map(|s| (s.name.clone(), s.rows, s.cols)).collect();
             self.undo.push(sheetcore::undo::Action {
                 label: "刷新外部数据".into(),
+                merges: None,
                 deltas: Vec::new(),
                 focus: (idx, self.sel.0, self.sel.1),
                 snap_before: Some(snap_before),
@@ -6104,6 +6131,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.record_revision("全部替换", &deltas);
             self.undo.push(sheetcore::undo::Action {
                 label: "全部替换".into(),
+                merges: None,
                 deltas,
                 focus: (diffs[0].0, diffs[0].1, diffs[0].2),
                 snap_before: None,
@@ -6455,6 +6483,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 st.border[3].style != 0,
             ],
         };
+        self.fmt_merge_pending = None;
         self.fmt_dlg = true;
     }
 
@@ -6715,6 +6744,16 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         // F9：Excel 同款“重算全部”，大文件走后台
         if self.editing.is_none() && ctx.input(|i| i.key_pressed(Key::F9)) {
             self.recalc_all_async();
+            return;
+        }
+        // 格式刷：Esc 结束（连续模式也结束）
+        if self.editing.is_none()
+            && self.format_painter.is_some()
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
+            self.format_painter = None;
+            self.painter_double = false;
+            self.status = "格式刷已取消".into();
             return;
         }
 
@@ -8567,19 +8606,153 @@ let txn = self.txn_begin(&keys);
             return;
         }
         let (r1, c1, r2, c2) = self.sel_rect();
+        if on && r1 == r2 && c1 == c2 {
+            self.status = "请选择两个以上单元格再合并".into();
+            return;
+        }
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        if !self.write_preflight(&keys, if on { "合并单元格" } else { "取消合并" }) {
+            return;
+        }
+        // 合并只保留左上角内容；其余非空格会被删掉，先让用户确认。
+        let mut loss = 0u64;
+        let mut anchor_text = String::new();
+        let mut removed_cells: Vec<(u32, u32, sheetcore::model::Cell)> = Vec::new();
+        {
+            let sheet = self.wb.sheet(self.sheet_idx);
+            anchor_text = sheet
+                .get(r1, c1)
+                .map(|c| c.value.display())
+                .unwrap_or_default();
+            if on {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        if r == r1 && c == c1 {
+                            continue;
+                        }
+                        if let Some(cell) = sheet.get(r, c) {
+                            if !cell.is_blank() {
+                                loss += 1;
+                                removed_cells.push((r, c, cell.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if on && loss > 0 && self.merge_pending != Some((r1, c1, r2, c2)) {
+            self.merge_pending = Some((r1, c1, r2, c2));
+            let shown = if anchor_text.is_empty() { "（空）" } else { anchor_text.as_str() };
+            self.status = format!(
+                "合并只保留左上角「{shown}」的内容，其余 {loss} 格内容会被删除；再点一次合并确认"
+            );
+            return;
+        }
+        self.merge_pending = None;
+        let before_merges = self.wb.sheet(self.sheet_idx).merges.clone();
+        let deltas = self.txn_begin(&keys);
         {
             let sheet = self.wb.sheet_mut(self.sheet_idx);
             if on {
+                for (r, c, _) in removed_cells.iter() {
+                    sheet.set(*r, *c, sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Empty,
+                        formula: None,
+                    });
+                }
                 sheet.merge_range(r1, c1, r2, c2);
             } else {
                 sheet.unmerge_range(r1, c1, r2, c2);
             }
         }
-        if let Some(net) = self.net.as_ref() {
+        let after_merges = self.wb.sheet(self.sheet_idx).merges.clone();
+        let deltas = sheetcore::undo::finish(deltas, self.wb.sheet(self.sheet_idx));
+        let changed = before_merges != after_merges || !deltas.is_empty();
+        if changed {
+            self.undo.push(sheetcore::undo::Action {
+                label: if on { "合并单元格".into() } else { "取消合并".into() },
+                merges: Some(sheetcore::undo::MergeEdit {
+                    sheet: self.sheet_idx,
+                    before: before_merges,
+                    after: after_merges,
+                }),
+                deltas,
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                shapes: None,
+                refresh_sizes: None,
+            });
+        }
+        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+            for (r, c, _) in removed_cells.iter() {
+                let cell = self.wb.sheet(self.sheet_idx).get(*r, *c).cloned().unwrap_or_default();
+                let op = peer.local_set(self.sheet_idx, *r, *c, &cell);
+                net.broadcast_op(op);
+            }
             net.broadcast_merge(self.sheet_idx, (r1, c1, r2, c2), on);
         }
         self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        sheetcore::formula::recalc_all(&mut self.wb);
         self.status = if on { "已合并选区".into() } else { "已取消合并".into() };
+    }
+
+    /// 格式对话框点「确定」：先落格式，再执行挂起的合并动作。
+    fn commit_fmt_merge(&mut self) {
+        if let Some(on) = self.fmt_merge_pending.take() {
+            self.toggle_merge(on);
+        }
+    }
+
+    /// 格式刷：把源区域样式按行列重复铺到当前选区，一次撤销。
+    fn apply_format_painter(&mut self) {
+        let Some(p) = self.format_painter.clone() else { return };
+        if self.edit_blocked() {
+            return;
+        }
+        let (tr1, tc1, tr2, tc2) = self.sel_rect();
+        let area = (tr2 - tr1 + 1) as u64 * (tc2 - tc1 + 1) as u64;
+        if area > 200_000 {
+            self.status = "目标区域太大（超过 20 万格），格式刷不执行".into();
+            return;
+        }
+        let (sr1, sc1, sr2, sc2) = p.rect;
+        let sh = (sr2 - sr1 + 1) as u32;
+        let sw = (sc2 - sc1 + 1) as u32;
+        if sh == 0 || sw == 0 {
+            self.format_painter = None;
+            return;
+        }
+        let keys = sheetcore::undo::rect_keys(tr1, tc1, tr2, tc2);
+        if !self.write_preflight(&keys, "格式刷") {
+            return;
+        }
+        let txn = self.txn_begin(&keys);
+        let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
+        for r in tr1..=tr2 {
+            for c in tc1..=tc2 {
+                let i = ((r - tr1) % sh) as usize;
+                let j = ((c - tc1) % sw) as usize;
+                let sid = p.styles[i][j];
+                self.wb.sheet_mut(self.sheet_idx).set_style(r, c, sid);
+                wire.push((r, c, self.wb.styles.get(sid).clone()));
+            }
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.broadcast_style(self.sheet_idx, wire);
+        }
+        self.txn_end("格式刷", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        if p.continuous {
+            self.status = "格式刷（连续）：继续选择目标区域，Esc 结束".into();
+        } else {
+            self.format_painter = None;
+            self.status = "已套用格式".into();
+        }
     }
 
     /// 格式工具栏（第二行）
@@ -9930,7 +10103,20 @@ let txn = self.txn_begin(&keys);
     }
 
     /// 执行选择性粘贴：内部剪贴板优先，其次系统剪贴板文本
-    fn paste_special_apply(&mut self, _ctx: &egui::Context) {
+    fn paste_special_apply(&mut self, ctx: &egui::Context) {
+        let text = Self::read_clipboard_text();
+        self.paste_special_apply_text(ctx, text);
+    }
+
+    /// 系统剪贴板读取集中加锁：并行测试/多个 arboard 实例在 Windows 上会互相踩。
+    fn read_clipboard_text() -> Option<String> {
+        static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = IO.lock().ok()?;
+        arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+    }
+
+    /// text 是系统剪贴板文本；None/空 表示没有可粘贴的外部文本。
+    fn paste_special_apply_text(&mut self, _ctx: &egui::Context, ext_text: Option<String>) {
         if self.edit_blocked() {
             return;
         }
@@ -9939,33 +10125,40 @@ let txn = self.txn_begin(&keys);
 
         // 内部剪贴板：matrix 是要粘贴的格子，coords 记录每格在源表里的绝对坐标。
         // 外部文本没有源坐标，公式只能按原文粘贴（不偏移）。
+        // 关键：内部 Clip 不能遮盖后复制到系统剪贴板的新内容——与普通粘贴同一判定。
+        let internal: Option<&Clip> = match (&self.clip, &ext_text) {
+            (Some(clip), Some(t)) if !t.trim_end().is_empty() => {
+                let same = match &self.clip_stamp {
+                    Some(stamp) => t.replace("\r\n", "\n").trim_end() == stamp.replace("\r\n", "\n").trim_end(),
+                    // 程序内构造的 Clip（测试/导入）没有 stamp，按内部剪贴板处理
+                    None => true,
+                };
+                if same { Some(clip) } else { None }
+            }
+            (Some(clip), _) => Some(clip),
+            (None, _) => None,
+        };
         let mut src_sheet_name: Option<String> = None;
-        let (mut matrix, mut coords) = match &self.clip {
-            Some(clip) => {
-                let (sr1, sc1, _, _) = clip.rect;
-                src_sheet_name = Some(self.wb.sheet(clip.sheet).name.clone());
-                let mut coords: Vec<Vec<(u32, u32)>> = Vec::new();
-                for (i, row) in clip.cells.iter().enumerate() {
-                    coords.push(
-                        (0..row.len())
-                            .map(|j| (sr1 + i as u32, sc1 + j as u32))
-                            .collect(),
-                    );
-                }
-                (clip.cells.clone(), Some(coords))
+        let (mut matrix, mut coords) = if let Some(clip) = internal {
+            let (sr1, sc1, _, _) = clip.rect;
+            src_sheet_name = Some(self.wb.sheet(clip.sheet).name.clone());
+            let mut coords: Vec<Vec<(u32, u32)>> = Vec::new();
+            for (i, row) in clip.cells.iter().enumerate() {
+                coords.push(
+                    (0..row.len())
+                        .map(|j| (sr1 + i as u32, sc1 + j as u32))
+                        .collect(),
+                );
             }
-            None => {
-                let text = arboard::Clipboard::new()
-                    .ok()
-                    .and_then(|mut c| c.get_text().ok())
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    self.status = "剪贴板是空的".into();
-                    return;
-                }
-                // 与普通粘贴共用同一解析器：保留中间空行，= 开头按公式解析
-                (Self::parse_clip_text(&text), None)
+            (clip.cells.clone(), Some(coords))
+        } else {
+            let text = ext_text.unwrap_or_default();
+            if text.is_empty() {
+                self.status = "剪贴板是空的".into();
+                return;
             }
+            // 与普通粘贴共用同一解析器：保留中间空行，= 开头按公式解析
+            (Self::parse_clip_text(&text), None)
         };
         if matrix.is_empty() {
             self.status = "剪贴板是空的".into();
@@ -10013,6 +10206,7 @@ let txn = self.txn_begin(&keys);
             return;
         }
         let txn = self.txn_begin(&keys);
+        let mut wire_styles: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
         for (i, row) in matrix.iter().enumerate() {
             for (j, (src, sid)) in row.iter().enumerate() {
                 let (r, c) = (r0 + i as u32, c0 + j as u32);
@@ -10107,10 +10301,25 @@ let txn = self.txn_begin(&keys);
                 sheet.set(r, c, cell);
                 if self.ps_kind == 3 || self.ps_kind == 0 {
                     sheet.set_style(r, c, style);
+                    wire_styles.push((r, c, self.wb.styles.get(style).clone()));
                 }
             }
         }
         self.txn_end("选择性粘贴", txn);
+        // 与普通粘贴一致：值/公式和样式都同步给协作者
+        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+            for (i, row) in matrix.iter().enumerate() {
+                for j in 0..row.len() {
+                    let (r, c) = (r0 + i as u32, c0 + j as u32);
+                    let cell = self.wb.sheet(self.sheet_idx).get(r, c).cloned().unwrap_or_default();
+                    let op = peer.local_set(self.sheet_idx, r, c, &cell);
+                    net.broadcast_op(op);
+                }
+            }
+            if !wire_styles.is_empty() {
+                net.broadcast_style(self.sheet_idx, wire_styles);
+            }
+        }
         self.sel_end = (r0 + rows - 1, c0 + cols - 1);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -11091,6 +11300,7 @@ let txn = self.txn_begin(&keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.undo.push(sheetcore::undo::Action {
             label: "分类汇总".into(),
+            merges: None,
             deltas: Vec::new(),
             focus: (self.sheet_idx, self.sel.0, self.sel.1),
             snap_before: Some(before),
@@ -11675,6 +11885,7 @@ let txn = self.txn_begin(&keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.undo.push(sheetcore::undo::Action {
             label: "插入文本框".into(),
+            merges: None,
             deltas: Vec::new(),
             focus: (self.sheet_idx, self.sel.0, self.sel.1),
             snap_before: None,
@@ -11720,6 +11931,7 @@ let txn = self.txn_begin(&keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.undo.push(sheetcore::undo::Action {
             label: "修改文本框".into(),
+            merges: None,
             deltas: Vec::new(),
             focus: (self.sheet_idx, self.sel.0, self.sel.1),
             snap_before: None,
@@ -11855,6 +12067,7 @@ let txn = self.txn_begin(&keys);
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.undo.push(sheetcore::undo::Action {
                 label: label.into(),
+                merges: None,
                 deltas: Vec::new(),
                 focus: (self.sheet_idx, self.sel.0, self.sel.1),
                 snap_before: None,
@@ -11891,6 +12104,7 @@ let txn = self.txn_begin(&keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.undo.push(sheetcore::undo::Action {
             label: "删除文本框".into(),
+            merges: None,
             deltas: Vec::new(),
             focus: (self.sheet_idx, self.sel.0, self.sel.1),
             snap_before: None,
@@ -15838,11 +16052,13 @@ let txn = self.txn_begin(&keys);
 
                         dlg_cell_label(ui, "合并");
                         ui.horizontal(|ui| {
-                            if ui_kit::pill(ui, "合并单元格", "").clicked() {
-                                self.toggle_merge(true);
+                            if ui_kit::pill(ui, "合并单元格", "确定后执行；取消不改").clicked() {
+                                self.fmt_merge_pending = Some(true);
+                                self.status = "将在点「确定」后合并单元格".into();
                             }
-                            if ui_kit::pill(ui, "取消合并", "").clicked() {
-                                self.toggle_merge(false);
+                            if ui_kit::pill(ui, "取消合并", "确定后执行；取消不改").clicked() {
+                                self.fmt_merge_pending = Some(false);
+                                self.status = "将在点「确定」后取消合并".into();
                             }
                         });
                         ui.end_row();
@@ -15905,8 +16121,10 @@ let txn = self.txn_begin(&keys);
             });
             self.fmt_dlg = false;
             self.status = "已应用格式".into();
+            self.commit_fmt_merge();
         }
         if cancel || !open {
+            self.fmt_merge_pending = None;
             self.fmt_dlg = false;
         }
     }
@@ -19976,9 +20194,8 @@ let txn = self.txn_begin(&keys);
                             self.sel_end = hit;
                         }
                     }
-                    if let Some(st) = self.format_painter.take() {
-                        self.apply_style(move |s| *s = st.clone());
-                        self.status = "已套用格式".into();
+                    if self.format_painter.is_some() {
+                        self.apply_format_painter();
                     }
                     // 双击单元格进入编辑（Excel 的基础操作）
                     let body_double = resp.double_clicked()
@@ -19987,6 +20204,14 @@ let txn = self.txn_begin(&keys);
                     if body_double {
                         self.begin_edit(None);
                     }
+                }
+            }
+        }
+        // 拖选目标区域后松手再套格式（按下时选区还没长完）
+        if !readonly && self.format_painter.is_some() && resp.drag_stopped() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if pos.x > origin.x + head_w && pos.y > origin.y + hh {
+                    self.apply_format_painter();
                 }
             }
         }

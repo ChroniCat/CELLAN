@@ -4,8 +4,16 @@
 - 台账（`scripts/audit_progress.py counts`）：9 已验收 / 6 待验收 / 46 待实施（本轮后待重算）；
   切片 26 已验收 / 10 待验收 / 112 待实施（UI-05.4 待验收）。
 - 当前测试真值（本轮源码，round47/48）：core 68 bins / 599 passed / 0 failed / 41 ignored，
-  CORE_EXIT=0；app 182 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  CORE_EXIT=0；app 188 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 16 passed；`search_matches` 7 passed。
+
+## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
+
+- 合并有内容损失时先提示，二次确认才执行；MergeEdit+delta 一步撤销/重做，保存重开一致。
+- 格式对话框的合并改为挂起，确定才执行；取消/关闭完全不改。
+- 格式刷保存源区域样式矩阵、范围平铺、拖选、单击一次、双击连续、Esc 结束、一次撤销。
+- app 188 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored；core 599/41（68 bins）。
+- 变异 M22–M27 全红。未执行：真实 GUI 双击/拖选/Esc、Excel 模态提示对比。
 
 ## 本轮：UI-06 选择性粘贴（待验收）
 

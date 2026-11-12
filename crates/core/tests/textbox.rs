@@ -194,6 +194,7 @@ fn shape_undo_restores_textboxes() {
     let mut stack = sheetcore::undo::UndoStack::new();
     stack.push(Action {
         label: "修改文本框".into(),
+        merges: None,
         deltas: Vec::new(),
         focus: (0, 0, 0),
         snap_before: None,

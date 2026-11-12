@@ -11,7 +11,8 @@ UI-06 选择性粘贴 —— 状态：待验收（2026-11-13 06:10）
   不再静默保留原值；格式模式（只格式）不执行运算。
 - 外部文本：与普通粘贴共用 parse_clip_text → parse_tsv，保留中间空行、= 开头按公式解析；
   不再 filter(!is_empty)。
-- 写入门禁仍在最前（write_preflight），整次粘贴一个事务；结束置 dirty/重算/广播，一步撤销。
+- 写入门禁仍在最前（write_preflight），整次粘贴一个事务；结束置 dirty/重算；
+  值/公式逐格 broadcast_op，全部/格式模式的样式 wire 走 broadcast_style（不是拿 dirty/重算冒充广播）。
 
 二、用例（crates/app/src/edit_regression_tests.rs，4 passed）
 1) paste_special_formula_translates_negative_and_positive_offsets
@@ -38,3 +39,21 @@ M21 parse_clip_text 过滤空行 → 空行用例 FAILED
 - 未用真实系统剪贴板做跨应用选择性粘贴（内部 Clip + 文本解析已测）。
 - 跨工作簿样式 id 映射（UI-07 范围）未做；当前样式号按同簿解释。
 - 合并单元格、错误值、日期在“运算”下的行为未覆盖。
+
+五、06:12 复核后补强（2026-11-13）
+1) 系统剪贴板优先级：paste_special_apply 先读系统文本，内部 Clip 只在系统文本仍等于
+   clip_copy 时写入的 clip_stamp 时优先；外部后复制 B 会走 parse_clip_text(B)。
+   验证 paste_special_prefers_newer_system_clipboard_over_stale_internal_clip：
+   app 复制 A → 注入外部 B → 选择性粘贴得 B；再 app 复制 A 后恢复内部坐标/格式。
+   （自动测试通过 paste_special_apply_text 注入系统文本，避免并行测试踩真实剪贴板；
+    真实跨应用路径仍需 GUI 手验。）
+2) “全部”补公式正负引用：paste_special_all_translates_formula_offsets
+   C3 =A1+$B$1 → B2 得 =#REF!+$B$1，→ D4 得 =B2+$B$1，并带加粗。
+3) 转置负位移：paste_special_transpose_negative_offset_is_ref_error
+   C3 =A1 转置到 B2 得 =#REF!。
+4) 全部粘贴的广播已实现（值/公式 broadcast_op + 样式 broadcast_style）；
+   现有自动测试未做双端 poll_net 断言，协作同步仍待验收。
+5) 06.3 运算对文本/错误值/日期、合并单元格的行为仍未覆盖；“只格式”不做运算已固定。
+
+当前用例：paste_special 过滤 7 passed；全量 app 188 passed / 0 failed。
+未执行：Excel/WPS 实机对拍（含全部公式偏移与转置负位移）。

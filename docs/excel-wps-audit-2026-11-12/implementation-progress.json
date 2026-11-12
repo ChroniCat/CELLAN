@@ -1761,7 +1761,6 @@
         "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
         "查找范围只取主选区，extra_sel 多选区未并入",
         "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
-        "反向查找无 UI 按钮（核心 API 支持）",
         "结果列表最多显示 500 项，未做虚拟滚动"
       ],
       "failures": [],
@@ -1797,9 +1796,7 @@
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
           ],
-          "not_done": [
-            "真实键鼠对话框未做；跨表全部替换撤销未测"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
@@ -1833,9 +1830,7 @@
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
           ],
-          "not_done": [
-            "真实键鼠对话框未做；跨表全部替换撤销未测"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
@@ -1869,9 +1864,7 @@
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
           ],
-          "not_done": [
-            "真实键鼠对话框未做；跨表全部替换撤销未测"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
@@ -1909,7 +1902,6 @@
             "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
             "查找范围只取主选区，extra_sel 多选区未并入",
             "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
-            "反向查找无 UI 按钮（核心 API 支持）",
             "结果列表最多显示 500 项，未做虚拟滚动"
           ],
           "failures": [],
@@ -1946,15 +1938,14 @@
         "implementation-evidence/ui06-paste-special.txt"
       ],
       "not_done": [
-        "未与 Excel/WPS 实机对拍选择性粘贴样本",
-        "未用真实系统剪贴板跨应用粘贴",
-        "跨工作簿样式映射（UI-07）未做",
-        "合并/错误值/日期的运算语义未覆盖"
+        "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
+        "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
+        "跨工作簿样式映射（UI-07）未做"
       ],
       "failures": [],
       "blocker": "",
       "next": "与 Excel/WPS 对拍公式平移与除零，并补真实系统剪贴板路径。",
-      "updated_utc": "2026-11-13T06:10:00Z",
+      "updated_utc": "2026-11-13T06:30:00Z",
       "slices": [
         {
           "id": "UI-06.1",
@@ -1977,15 +1968,14 @@
             "implementation-evidence/ui06-paste-special.txt"
           ],
           "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴样本",
-            "未用真实系统剪贴板跨应用粘贴",
-            "跨工作簿样式映射（UI-07）未做",
-            "合并/错误值/日期的运算语义未覆盖"
+            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
+            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
+            "跨工作簿样式映射（UI-07）未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:10:00Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         },
         {
           "id": "UI-06.2",
@@ -2008,15 +1998,14 @@
             "implementation-evidence/ui06-paste-special.txt"
           ],
           "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴样本",
-            "未用真实系统剪贴板跨应用粘贴",
-            "跨工作簿样式映射（UI-07）未做",
-            "合并/错误值/日期的运算语义未覆盖"
+            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
+            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
+            "跨工作簿样式映射（UI-07）未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:10:00Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         },
         {
           "id": "UI-06.3",
@@ -2039,15 +2028,14 @@
             "implementation-evidence/ui06-paste-special.txt"
           ],
           "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴样本",
-            "未用真实系统剪贴板跨应用粘贴",
-            "跨工作簿样式映射（UI-07）未做",
-            "合并/错误值/日期的运算语义未覆盖"
+            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
+            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
+            "跨工作簿样式映射（UI-07）未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:10:00Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         }
       ]
     },
@@ -2142,17 +2130,34 @@
       "scope": "app/main.rs合并/格式刷 + core/model.rs",
       "source": "ui-requirements.md",
       "heading": "UI-27 合并与格式刷的细节",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
-      "files": [],
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/core/src/undo.rs",
+        "crates/app/src/ribbon/actions.rs",
+        "crates/app/src/ribbon/ui.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
       "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": [
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
+        "cargo test -p app --no-default-features --features glow --offline --bin app",
+        "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+      ],
+      "evidence": [
+        "implementation-evidence/ui27-merge-format-painter.txt"
+      ],
+      "not_done": [
+        "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
+        "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
+        "格式刷跨工作表/跨工作簿未覆盖",
+        "合并撤销的协作端 merge 状态未做双端 poll_net"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "真实 GUI 双击/拖选/Esc 验收；与 Excel 合并提示对比。",
+      "updated_utc": "2026-11-13T06:30:00Z",
       "slices": [
         {
           "id": "UI-27.1",
@@ -2160,17 +2165,34 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "A1=甲 B1=乙 合并前提示；不确认完全保留；确认后只留锚点、可撤销/重做并保存重开一致。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/ribbon/ui.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
+            "cargo test -p app --no-default-features --features glow --offline --bin app",
+            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+          ],
+          "evidence": [
+            "implementation-evidence/ui27-merge-format-painter.txt"
+          ],
+          "not_done": [
+            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
+            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
+            "格式刷跨工作表/跨工作簿未覆盖",
+            "合并撤销的协作端 merge 状态未做双端 poll_net"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         },
         {
           "id": "UI-27.2",
@@ -2178,17 +2200,34 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "格式对话框点合并后取消模型不变；点确定才执行。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/ribbon/ui.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
+            "cargo test -p app --no-default-features --features glow --offline --bin app",
+            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+          ],
+          "evidence": [
+            "implementation-evidence/ui27-merge-format-painter.txt"
+          ],
+          "not_done": [
+            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
+            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
+            "格式刷跨工作表/跨工作簿未覆盖",
+            "合并撤销的协作端 merge 状态未做双端 poll_net"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         },
         {
           "id": "UI-27.3",
@@ -2196,17 +2235,34 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "双击格式刷连续刷两个范围，Esc 结束；单击只刷一次；源区域样式按行列映射。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/ribbon/ui.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
+            "cargo test -p app --no-default-features --features glow --offline --bin app",
+            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+          ],
+          "evidence": [
+            "implementation-evidence/ui27-merge-format-painter.txt"
+          ],
+          "not_done": [
+            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
+            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
+            "格式刷跨工作表/跨工作簿未覆盖",
+            "合并撤销的协作端 merge 状态未做双端 poll_net"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T06:30:00Z"
         }
       ]
     },

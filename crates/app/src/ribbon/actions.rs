@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use super::CtlState;
-use crate::{cell_name, col_label, ui_prefs, SheetApp};
+use crate::{cell_name, col_label, ui_prefs, FormatPainter, SheetApp};
 
 fn fmt_label(code: &str) -> &str {
     match code {
@@ -381,9 +381,30 @@ impl SheetApp {
             "Cut" => self.clip_copy(true, ctx),
             "Copy" => self.clip_copy(false, ctx),
             "FormatPainter" => {
-                let cur = self.current_style();
-                self.format_painter = Some(cur);
-                self.status = "格式刷：点击目标单元格".into();
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let mut styles = Vec::new();
+                {
+                    let sheet = self.wb.sheet(self.sheet_idx);
+                    for r in r1..=r2 {
+                        let mut row = Vec::new();
+                        for c in c1..=c2 {
+                            row.push(sheet.style_of(r, c));
+                        }
+                        styles.push(row);
+                    }
+                }
+                let continuous = self.painter_double;
+                self.painter_double = false;
+                self.format_painter = Some(FormatPainter {
+                    rect: (r1, c1, r2, c2),
+                    styles,
+                    continuous,
+                });
+                self.status = if continuous {
+                    "格式刷（连续）：选择目标区域，Esc 结束".into()
+                } else {
+                    "格式刷：选择目标区域".into()
+                };
             }
             "GrowFont" => {
                 let cur = self.current_style();

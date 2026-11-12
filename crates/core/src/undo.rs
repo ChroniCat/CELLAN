@@ -59,6 +59,14 @@ pub struct ShapeEdit {
     pub after: Vec<crate::textbox::TextBox>,
 }
 
+/// 合并/取消合并：只记合并矩形列表的前后状态，不整表快照。
+#[derive(Clone, Debug)]
+pub struct MergeEdit {
+    pub sheet: usize,
+    pub before: Vec<(u32, u32, u32, u32)>,
+    pub after: Vec<(u32, u32, u32, u32)>,
+}
+
 /// 一个可撤销的动作
 #[derive(Clone, Debug)]
 pub struct Action {
@@ -73,6 +81,8 @@ pub struct Action {
     pub by_site: u32,
     /// 形状（文本框）改动；None = 普通格子动作
     pub shapes: Option<ShapeEdit>,
+    /// 合并状态改动；None = 不涉及合并
+    pub merges: Option<MergeEdit>,
     /// 刷新外部数据时的源尺寸（前, 后）：撤销/重做要一并还原，否则范围记录漂移
     pub refresh_sizes: Option<(Vec<(String, u32, u32)>, Vec<(String, u32, u32)>)>,
 }
@@ -88,10 +98,14 @@ impl Action {
                     .unwrap_or(0),
             )
             .max(if self.shapes.is_some() { 1 } else { 0 })
+            .max(if self.merges.is_some() { 1 } else { 0 })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.deltas.is_empty() && self.snap_before.is_none() && self.shapes.is_none()
+        self.deltas.is_empty()
+            && self.snap_before.is_none()
+            && self.shapes.is_none()
+            && self.merges.is_none()
     }
 }
 
@@ -427,6 +441,12 @@ impl UndoStack {
             self.undone.push(Entry::Cells(action));
             return Some(applied);
         }
+        if let Some(m) = action.merges.as_ref() {
+            if let Some(sheet) = sheets.get_mut(m.sheet) {
+                sheet.merges = m.before.clone();
+                sheet.merges_dirty = true;
+            }
+        }
         if let Some(snap) = action.snap_before.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
                 restore_sheet(sheet, &snap);
@@ -502,6 +522,12 @@ impl UndoStack {
             };
             self.done.push(Entry::Cells(action));
             return Some(applied);
+        }
+        if let Some(m) = action.merges.as_ref() {
+            if let Some(sheet) = sheets.get_mut(m.sheet) {
+                sheet.merges = m.after.clone();
+                sheet.merges_dirty = true;
+            }
         }
         if let Some(snap) = action.snap_after.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
@@ -590,6 +616,7 @@ mod tests {
         let after = wb.sheets[0].get(r, c).cloned().unwrap();
         Action {
             label: "编辑".into(),
+            merges: None,
             snap_before: None,
             snap_after: None,
             by_site: 0,

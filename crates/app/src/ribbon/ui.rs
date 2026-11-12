@@ -362,6 +362,9 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
             }
         }
     });
+    if resp.inner.double_clicked() && c.action() == "FormatPainter" {
+        app.painter_double = true;
+    }
     if resp.inner.clicked() {
         let action = c.action().to_string();
         app.ribbon_action(&action, ui.ctx());

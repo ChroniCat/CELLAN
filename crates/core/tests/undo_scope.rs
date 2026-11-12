@@ -18,6 +18,7 @@ fn change_to(wb: &mut Workbook, label: &str, text: &str) -> Action {
     let deltas = undo::finish(before, &wb.sheets[0]);
     Action {
         label: label.into(),
+        merges: None,
         deltas,
         focus: (0, 0, 0),
         snap_before: None,

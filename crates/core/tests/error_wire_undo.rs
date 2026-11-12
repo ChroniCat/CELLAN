@@ -81,6 +81,7 @@ fn undo_and_redo_restore_the_error_cell_verbatim() {
     let mut stack = UndoStack::new();
     stack.push(Action {
         label: "输入".into(),
+        merges: None,
         deltas,
         focus: (0, 0, 0),
         snap_before: None,

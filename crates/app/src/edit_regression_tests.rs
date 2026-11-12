@@ -1253,6 +1253,8 @@ fn ctx_menu_paste_values_keeps_number_but_drops_formula() {
     app.sel = (0, 0);
     app.sel_end = (0, 0);
     app.clip_copy(false, &ctx);
+    // 该用例只验证“只贴值”；并行测试会改系统剪贴板，这里固定走内部 Clip
+    app.clip_stamp = None;
     app.sel = (2, 2);
     app.sel_end = (2, 2);
     app.ctx_menu_run(CtxAct::PasteValues, 0, &ctx);
@@ -3685,4 +3687,226 @@ fn tsv_parsing_keeps_blank_rows_between_values() {
     assert_eq!(rows.len(), 3, "中间空行必须保留");
     assert_eq!(rows[1][0].0.value, sheetcore::model::Value::Empty);
     assert_eq!(rows[2][0].0.value, sheetcore::model::Value::Text("乙".into()));
+}
+
+/// UI-27.1：合并先提示丢内容；取消不动；确认后只保留锚点、可撤销/重做并保存。
+#[test]
+fn merge_warns_cancel_keeps_data_and_confirm_is_undoable() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    app.wb.sheet_mut(0).set(0, 2, Cell { value: Value::Number(9.0), formula: None });
+    app.sel = (0, 0);
+    app.sel_end = (0, 2);
+    // 第一次点击只警告，不合并、不改任何数据
+    app.toggle_merge(true);
+    assert!(app.wb.sheet(0).merges.is_empty(), "提示阶段不能合并");
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value, Value::Text("乙".into()));
+    assert_eq!(app.wb.sheet(0).get(0, 2).unwrap().value, Value::Number(9.0));
+    assert!(app.status.contains("再点一次"), "status 应说明要二次确认: {}", app.status);
+    // 取消 = 不再点；数据完整
+    assert!(app.merge_pending.is_some());
+    // 再次点击同一区域才执行
+    app.toggle_merge(true);
+    assert!(app.merge_pending.is_none());
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 0, 0, 2)]);
+    assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value, Value::Text("甲".into()));
+    assert!(app.wb.sheet(0).get(0, 1).is_none(), "非锚点内容应删除");
+    assert!(app.wb.sheet(0).get(0, 2).is_none());
+    assert!(app.wb.dirty);
+    // 撤销完整恢复合并状态和两格内容
+    app.do_undo(false);
+    assert!(app.wb.sheet(0).merges.is_empty(), "撤销应拆掉合并");
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value, Value::Text("乙".into()));
+    assert_eq!(app.wb.sheet(0).get(0, 2).unwrap().value, Value::Number(9.0));
+    // 重做再删一次
+    app.do_undo(true);
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 0, 0, 2)]);
+    assert!(app.wb.sheet(0).get(0, 1).is_none());
+    // 保存/重开保留合并与锚点内容
+    // 不用 std::env::temp_dir()：并行 test_env 用例会改写 TEMP 并在 Drop 时删根目录
+    let dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("sc_ui27_merge_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("merge.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &app.wb).unwrap();
+    let (wb2, diag) = sheetcore::xlsx::load_diag(&path).expect("重新打开");
+    assert!(diag.is_complete(), "合并保存后不应有加载问题: {:?}", diag);
+    assert_eq!(wb2.sheet(0).merges, vec![(0, 0, 0, 2)]);
+    assert_eq!(wb2.sheet(0).get(0, 0).unwrap().value, Value::Text("甲".into()));
+    assert!(wb2.sheet(0).get(0, 1).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UI-27.2：格式对话框里的合并只是草稿；取消不执行，确定才执行。
+#[test]
+fn format_dialog_merge_is_deferred_until_ok() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.fmt_merge_pending = Some(true);
+    // 模拟“取消”：挂起被清掉，模型完全没动
+    app.fmt_merge_pending = None;
+    assert!(app.wb.sheet(0).merges.is_empty());
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value, Value::Text("乙".into()));
+    // 模拟“确定”：执行挂起动作（无内容损失才会直接合并；这里先清掉乙避免确认分支）
+    app.wb.sheet_mut(0).set(0, 1, Cell { value: Value::Empty, formula: None });
+    app.fmt_merge_pending = Some(true);
+    app.commit_fmt_merge();
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+    assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value, Value::Text("甲".into()));
+}
+
+/// UI-27.3：格式刷按源范围平铺样式；连续模式刷完不退出，Esc 结束；单击只刷一次。
+#[test]
+fn format_painter_maps_range_continuous_and_escape() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut st_bold = app.wb.styles.get(0).clone();
+    st_bold.bold = true;
+    let s_bold = app.wb.styles.intern(st_bold);
+    let mut st_fill = app.wb.styles.get(0).clone();
+    st_fill.fill = Some([255, 222, 0]);
+    let s_fill = app.wb.styles.intern(st_fill);
+    app.wb.sheet_mut(0).set_style(0, 0, s_bold);
+    app.wb.sheet_mut(0).set_style(0, 1, s_fill);
+    // 源区域 A1:B1 已是 bold / fill，arm 连续模式
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.painter_double = true;
+    app.ribbon_action("FormatPainter", &ctx);
+    let p = app.format_painter.clone().expect("应进入格式刷");
+    assert!(p.continuous, "双击格式刷应连续");
+    assert_eq!(p.styles, vec![vec![s_bold, s_fill]]);
+    // 目标 A3:B5，样式按 1 行 2 列循环平铺
+    app.sel = (2, 0);
+    app.sel_end = (4, 1);
+    app.apply_format_painter();
+    for r in 2..=4 {
+        assert!(app.wb.styles.get(app.wb.sheet(0).style_of(r, 0)).bold, "第 {r} 行左列应加粗");
+        assert_eq!(
+            app.wb.styles.get(app.wb.sheet(0).style_of(r, 1)).fill,
+            Some([255, 222, 0]),
+            "第 {r} 行右列应填充"
+        );
+    }
+    assert!(app.format_painter.is_some(), "连续模式刷完不退出");
+    // 再刷第二个范围仍然生效
+    app.sel = (7, 0);
+    app.sel_end = (7, 1);
+    app.apply_format_painter();
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(7, 0)).bold);
+    // Esc 结束
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.format_painter.is_none(), "Esc 必须结束格式刷");
+    // 单击模式：刷一次自动退出
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.painter_double = false;
+    app.ribbon_action("FormatPainter", &ctx);
+    app.sel = (10, 3);
+    app.sel_end = (10, 4);
+    app.apply_format_painter();
+    assert!(app.format_painter.is_none(), "单击格式刷只生效一次");
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(10, 3)).bold);
+}
+
+/// UI-06.1：全部模式同样平移公式（正/负偏移），并保留源样式。
+#[test]
+fn paste_special_all_translates_formula_offsets() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut st = app.wb.styles.get(0).clone();
+    st.bold = true;
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$1".into()) });
+    app.wb.sheet_mut(0).set_style(2, 2, sid);
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (2, 2, 2, 2),
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), sid)]],
+        cut: false,
+    });
+    app.ps_kind = 0;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+    app.sel = (1, 1); // B2：负偏移
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(1, 1).unwrap().formula.as_deref(),
+        Some("=#REF!+$B$1"),
+        "全部模式负偏移必须 #REF!"
+    );
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(1, 1)).bold);
+    app.sel = (3, 3); // D4：正偏移
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(3, 3).unwrap().formula.as_deref(),
+        Some("=B2+$B$1")
+    );
+}
+
+/// UI-06.2：转置到负位移位置时，公式仍按原源坐标算偏移并产生 #REF!。
+#[test]
+fn paste_special_transpose_negative_offset_is_ref_error() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(1.0), formula: Some("=A1".into()) }); // C3
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (2, 2, 2, 2),
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
+        cut: false,
+    });
+    app.ps_kind = 2;
+    app.ps_transpose = true;
+    app.ps_op = 0;
+    app.sel = (1, 1); // B2：相对 A1 负位移
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(1, 1).unwrap().formula.as_deref(),
+        Some("=#REF!"),
+        "转置到 B2 后 A1 已越界，必须 #REF!"
+    );
+}
+
+/// UI-06：内部 Clip 不得遮盖之后复制到系统剪贴板的新内容；再次复制后才恢复内部坐标/格式。
+#[test]
+fn paste_special_prefers_newer_system_clipboard_over_stale_internal_clip() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // 1) app 内复制 A1（内部 Clip + 系统文本）
+    app.wb.sheet_mut(0).set(0, 0, text("内部甲"));
+    app.wb.sheet_mut(0).set(0, 1, text("内部乙"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.clip_copy(false, &ctx);
+    // 2) 外部应用复制 B（系统剪贴板换成外部文本）
+    app.sel = (5, 0);
+    app.ps_kind = 1;
+    app.ps_op = 0;
+    app.ps_transpose = false;
+    app.paste_special_apply_text(&ctx, Some("外部乙\t2\n".into()));
+    assert_eq!(app.wb.sheet(0).get(5, 0).unwrap().value, Value::Text("外部乙".into()));
+    assert_eq!(app.wb.sheet(0).get(5, 1).unwrap().value, Value::Number(2.0));
+    // 3) 回到 app 再复制，内部坐标/格式才应优先
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.clip_copy(false, &ctx);
+    app.ps_kind = 0;
+    app.sel = (8, 0);
+    app.paste_special_apply_text(&ctx, Some("内部甲\t内部乙\n".into()));
+    assert_eq!(app.wb.sheet(0).get(8, 0).unwrap().value, Value::Text("内部甲".into()));
+    assert_eq!(app.wb.sheet(0).get(8, 1).unwrap().value, Value::Text("内部乙".into()));
 }
