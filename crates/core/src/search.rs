@@ -15,6 +15,21 @@ pub struct SearchOpts {
     pub in_formula: bool,
 }
 
+/// 搜索推进顺序：行优先（默认）或列优先。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchOrder {
+    #[default]
+    RowMajor,
+    ColumnMajor,
+}
+
+fn ordered_key(h: &Hit, order: SearchOrder) -> (usize, u32, u32) {
+    match order {
+        SearchOrder::RowMajor => (h.sheet, h.row, h.col),
+        SearchOrder::ColumnMajor => (h.sheet, h.col, h.row),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hit {
     pub sheet: usize,
@@ -87,48 +102,95 @@ pub fn cell_matches(
     }
 }
 
-/// 一张表内全部命中，按 (行, 列) 升序。
-pub fn hits_in_sheet(wb: &Workbook, sheet: usize, needle: &str, opts: &SearchOpts) -> Vec<Hit> {
+/// 一张表内全部命中，按指定顺序排序。
+pub fn hits_in_sheet(
+    wb: &Workbook,
+    sheet: usize,
+    needle: &str,
+    opts: &SearchOpts,
+    order: SearchOrder,
+) -> Vec<Hit> {
+    hits_in_rect(
+        wb,
+        sheet,
+        (0, 0, u32::MAX - 1, u32::MAX - 1),
+        needle,
+        opts,
+        order,
+    )
+}
+
+/// 一张表某个矩形内的命中（稀疏过滤），按指定顺序排序。
+pub fn hits_in_rect(
+    wb: &Workbook,
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    needle: &str,
+    opts: &SearchOpts,
+    order: SearchOrder,
+) -> Vec<Hit> {
     let Some(sh) = wb.sheets.get(sheet) else {
         return Vec::new();
     };
+    let (r1, c1, r2, c2) = rect;
     let mut out: Vec<Hit> = sh
         .iter()
-        .filter(|(k, _)| cell_matches(wb, sheet, k.row, k.col, needle, opts))
+        .filter(|(k, _)| {
+            k.row >= r1.min(r2)
+                && k.row <= r1.max(r2)
+                && k.col >= c1.min(c2)
+                && k.col <= c1.max(c2)
+                && cell_matches(wb, sheet, k.row, k.col, needle, opts)
+        })
         .map(|(k, _)| Hit {
             sheet,
             row: k.row,
             col: k.col,
         })
         .collect();
-    out.sort_unstable();
+    match order {
+        SearchOrder::RowMajor => out.sort_unstable(),
+        SearchOrder::ColumnMajor => out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row)),
+    }
     out
 }
 
 /// 工作表（Some）或整个工作簿（None）的命中，按 (表, 行, 列) 升序。
-pub fn hits(wb: &Workbook, sheet: Option<usize>, needle: &str, opts: &SearchOpts) -> Vec<Hit> {
+pub fn hits(
+    wb: &Workbook,
+    sheet: Option<usize>,
+    needle: &str,
+    opts: &SearchOpts,
+    order: SearchOrder,
+) -> Vec<Hit> {
     let mut out = Vec::new();
     for si in 0..wb.sheets.len() {
         if sheet.is_some_and(|only| only != si) {
             continue;
         }
-        out.extend(hits_in_sheet(wb, si, needle, opts));
+        out.extend(hits_in_sheet(wb, si, needle, opts, order));
     }
     out
 }
 
 /// 循环取下一处；`cur` 为当前活动格。forward=false 时反向。
-pub fn next_hit(hits: &[Hit], cur: Hit, forward: bool) -> Option<(Hit, bool)> {
+pub fn next_hit(
+    hits: &[Hit],
+    cur: Hit,
+    forward: bool,
+    order: SearchOrder,
+) -> Option<(Hit, bool)> {
     if hits.is_empty() {
         return None;
     }
+    let cur_key = ordered_key(&cur, order);
     if forward {
-        if let Some(h) = hits.iter().find(|h| **h > cur) {
+        if let Some(h) = hits.iter().find(|h| ordered_key(h, order) > cur_key) {
             return Some((*h, false));
         }
         Some((hits[0], true))
     } else {
-        if let Some(h) = hits.iter().rev().find(|h| **h < cur) {
+        if let Some(h) = hits.iter().rev().find(|h| ordered_key(h, order) < cur_key) {
             return Some((*h, false));
         }
         Some((hits[hits.len() - 1], true))

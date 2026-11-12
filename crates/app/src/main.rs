@@ -103,13 +103,34 @@ struct FindState {
     replace: String,
     match_case: bool,
     whole_cell: bool,
-    /// 0 = 当前工作表，1 = 整个工作簿
+    /// 0 = 当前工作表，1 = 整个工作簿，2 = 当前选区
     scope: u8,
+    /// false = 行优先，true = 列优先
+    order_column: bool,
+    /// scope==2 时锁定的搜索选区：与命中光标分离，连续“下一个”不会退化成单格
+    session_rect: Option<(u32, u32, u32, u32)>,
     /// true = 在公式文本里查找/替换
     in_formula: bool,
     /// 值模式命中公式结果时，是否允许把公式替换成常量（默认否，避免静默破坏公式）
     replace_formula_results: bool,
     hits: usize,
+    /// 查找全部结果窗口
+    find_all_open: bool,
+    find_all: Vec<sheetcore::search::Hit>,
+}
+
+/// 分帧扫描：大工作簿上“查找全部/全部替换”每帧只处理一段，可随时取消。
+#[derive(Clone)]
+struct FindScan {
+    /// 发起扫描时的文档世代；切换文档后旧扫描必须作废
+    wb_epoch: u64,
+    keys: Vec<sheetcore::search::Hit>,
+    at: usize,
+    needle: String,
+    opts: sheetcore::search::SearchOpts,
+    out: Vec<sheetcore::search::Hit>,
+    /// 0 = 查找全部，1 = 全部替换
+    purpose: u8,
 }
 
 #[derive(Default, Clone)]
@@ -651,6 +672,7 @@ struct SheetApp {
     clip: Option<Clip>,
     /// 查找替换
     find: FindState,
+    find_scan: Option<FindScan>,
     /// 缩放
     zoom: f32,
     /// 功能区当前页签：XML 里的页签序号；100 表设计 / 101 图表工具
@@ -1312,6 +1334,7 @@ impl SheetApp {
             lock_first_at: None,
             clip: None,
             find: FindState::default(),
+            find_scan: None,
             zoom: 1.0,
             ribbon_tab: std::env::var("SC_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             ribbon: ribbon::load(),
@@ -2276,7 +2299,10 @@ impl SheetApp {
                         Ok("format") => self.open_format_dialog(),
                         Ok("revision") => self.rev_open = true,
                         Ok("xlink") => self.xlink_dlg = true,
-                        Ok("find") => self.find.open = true,
+                        Ok("find") => {
+                            self.find.open = true;
+                            self.find.session_rect = None;
+                        }
                         Ok("cf") => self.cf_mgr = true,
                         Ok("chart") => {
                             self.chart_mgr = true;
@@ -5707,28 +5733,168 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
-    /// 当前范围（工作表/工作簿）的全部命中，按位置排序
+    fn search_order(&self) -> sheetcore::search::SearchOrder {
+        if self.find.order_column {
+            sheetcore::search::SearchOrder::ColumnMajor
+        } else {
+            sheetcore::search::SearchOrder::RowMajor
+        }
+    }
+
+    /// 当前范围（选区/工作表/工作簿）的全部命中，按选定顺序排序
     fn find_hits(&self) -> Vec<sheetcore::search::Hit> {
         let opts = self.search_opts();
         let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
         if needle.is_empty() {
             return Vec::new();
         }
-        let scope = if self.find.scope == 1 { None } else { Some(self.sheet_idx) };
-        sheetcore::search::hits(&self.wb, scope, &needle, &opts)
+        let order = self.search_order();
+        match self.find.scope {
+            1 => sheetcore::search::hits(&self.wb, None, &needle, &opts, order),
+            2 => {
+                let (r1, c1, r2, c2) =
+                    self.find.session_rect.unwrap_or_else(|| self.sel_rect());
+                sheetcore::search::hits_in_rect(
+                    &self.wb,
+                    self.sheet_idx,
+                    (r1, c1, r2, c2),
+                    &needle,
+                    &opts,
+                    order,
+                )
+            }
+            _ => sheetcore::search::hits(&self.wb, Some(self.sheet_idx), &needle, &opts, order),
+        }
+    }
+
+    /// 把范围内所有“存在的格”作为候选，按顺序排好，供分帧扫描。
+    fn scan_candidates(&self) -> Vec<sheetcore::search::Hit> {
+        let mut keys = Vec::new();
+        let order = self.search_order();
+        let (only, rect) = match self.find.scope {
+            1 => (None, None),
+            2 => (
+                Some(self.sheet_idx),
+                Some(self.find.session_rect.unwrap_or_else(|| self.sel_rect())),
+            ),
+            _ => (Some(self.sheet_idx), None),
+        };
+        for (si, sh) in self.wb.sheets.iter().enumerate() {
+            if only.is_some_and(|x| x != si) {
+                continue;
+            }
+            for (k, _) in sh.iter() {
+                if let Some((r1, c1, r2, c2)) = rect {
+                    if k.row < r1 || k.row > r2 || k.col < c1 || k.col > c2 {
+                        continue;
+                    }
+                }
+                keys.push(sheetcore::search::Hit { sheet: si, row: k.row, col: k.col });
+            }
+        }
+        match order {
+            sheetcore::search::SearchOrder::RowMajor => keys.sort_unstable(),
+            sheetcore::search::SearchOrder::ColumnMajor => {
+                keys.sort_unstable_by_key(|h| (h.sheet, h.col, h.row))
+            }
+        }
+        keys
+    }
+
+    fn start_scan(&mut self, purpose: u8) {
+        if self.find.find.is_empty() {
+            return;
+        }
+        let opts = self.search_opts();
+        let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
+        if needle.is_empty() {
+            return;
+        }
+        if self.find.scope == 2 && self.find.session_rect.is_none() {
+            self.find.session_rect = Some(self.sel_rect());
+        }
+        let keys = self.scan_candidates();
+        if keys.is_empty() {
+            self.status = "没找到".into();
+            return;
+        }
+        let mut scan = FindScan {
+            wb_epoch: self.wb_epoch,
+            keys,
+            at: 0,
+            needle,
+            opts,
+            out: Vec::new(),
+            purpose,
+        };
+        // 小范围直接同步跑完（测试与日常小表不需要跨帧）；大表分帧，可取消
+        if scan.keys.len() <= 8000 {
+            let total = scan.keys.len();
+            self.run_scan_chunk(&mut scan, total);
+            self.finish_scan(scan);
+        } else {
+            self.status = format!("正在扫描 {} 格，可点“取消”…", scan.keys.len());
+            self.find_scan = Some(scan);
+        }
+    }
+
+    fn run_scan_chunk(&self, scan: &mut FindScan, count: usize) {
+        let end = (scan.at + count).min(scan.keys.len());
+        for h in scan.keys[scan.at..end].iter() {
+            if sheetcore::search::cell_matches(
+                &self.wb, h.sheet, h.row, h.col, &scan.needle, &scan.opts,
+            ) {
+                scan.out.push(*h);
+            }
+        }
+        scan.at = end;
+    }
+
+    fn poll_find_scan(&mut self) {
+        let Some(mut scan) = self.find_scan.take() else { return };
+        if scan.wb_epoch != self.wb_epoch {
+            self.status = "文档已切换，已取消扫描".into();
+            return;
+        }
+        self.run_scan_chunk(&mut scan, 4000);
+        if scan.at >= scan.keys.len() {
+            self.finish_scan(scan);
+        } else {
+            self.status = format!("正在扫描 {}/{} 格，可点“取消”…", scan.at, scan.keys.len());
+            self.find_scan = Some(scan);
+        }
+    }
+
+    fn cancel_find_scan(&mut self) {
+        if self.find_scan.take().is_some() {
+            self.status = "已取消扫描".into();
+        }
+    }
+
+    fn finish_scan(&mut self, scan: FindScan) {
+        // 候选键本身已按选定顺序排好，out 天然有序，无需再排
+        if scan.purpose == 0 {
+            self.find.hits = scan.out.len();
+            self.find.find_all = scan.out;
+            self.find.find_all_open = true;
+            self.status = format!("查找全部：{} 处", self.find.hits);
+        } else {
+            self.apply_replace_hits(scan.out);
+        }
     }
 
     /// 按匹配规则算出替换后的格子；没有实际变化时返回 None。
     /// 值模式默认不碰公式格：命中公式结果时必须由用户显式勾选“替换公式结果”。
     fn replacement_at(
         &self,
+        sheet: usize,
         r: u32,
         c: u32,
         cell: &sheetcore::model::Cell,
     ) -> Option<sheetcore::model::Cell> {
         let opts = self.search_opts();
         let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
-        if !sheetcore::search::cell_matches(&self.wb, self.sheet_idx, r, c, &needle, &opts) {
+        if !sheetcore::search::cell_matches(&self.wb, sheet, r, c, &needle, &opts) {
             return None;
         }
         if !opts.in_formula && cell.formula.is_some() && !self.find.replace_formula_results {
@@ -5736,7 +5902,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         let text = sheetcore::search::cell_text_at(
             &self.wb,
-            self.sheet_idx,
+            sheet,
             r,
             c,
             cell,
@@ -5784,6 +5950,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if self.find.find.is_empty() {
             return;
         }
+        if self.find.scope == 2 && self.find.session_rect.is_none() {
+            self.find.session_rect = Some(self.sel_rect());
+        }
         let hits = self.find_hits();
         if hits.is_empty() {
             self.status = "没找到".into();
@@ -5794,7 +5963,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             row: self.sel.0,
             col: self.sel.1,
         };
-        let Some((hit, wrapped)) = sheetcore::search::next_hit(&hits, cur, !backwards) else {
+        let Some((hit, wrapped)) =
+            sheetcore::search::next_hit(&hits, cur, !backwards, self.search_order())
+        else {
             self.status = "没找到".into();
             return;
         };
@@ -5835,7 +6006,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.status = msg;
             return;
         }
-        let Some(new_cell) = self.replacement_at(r, c, &cell) else {
+        let Some(new_cell) = self.replacement_at(self.sheet_idx, r, c, &cell) else {
             self.find_next(false);
             return;
         };
@@ -5853,10 +6024,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     fn replace_all(&mut self) {
-        if self.find.find.is_empty() {
-            return;
-        }
-        let hits = self.find_hits();
+        // 大表分帧扫描（可取消），扫描完成后再统一算差异并提交
+        self.start_scan(1);
+    }
+
+    fn apply_replace_hits(&mut self, hits: Vec<sheetcore::search::Hit>) {
         if hits.is_empty() {
             self.status = "没找到可替换的内容".into();
             return;
@@ -5865,7 +6037,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let mut diffs: Vec<(usize, u32, u32, sheetcore::model::Cell)> = Vec::new();
         for h in hits.iter() {
             let Some(cell) = self.wb.sheet(h.sheet).get(h.row, h.col) else { continue };
-            if let Some(new_cell) = self.replacement_at(h.row, h.col, cell) {
+            if let Some(new_cell) = self.replacement_at(h.sheet, h.row, h.col, cell) {
                 diffs.push((h.sheet, h.row, h.col, new_cell));
             }
         }
@@ -6660,6 +6832,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         if find_k || repl_k {
             self.find.open = true;
+            self.find.session_rect = None;
             if repl_k {
                 self.find.replace.clear();
             }
@@ -15735,6 +15908,8 @@ let txn = self.txn_begin(&keys);
         let mut do_repl = false;
         let mut do_all = false;
         let mut do_count = false;
+        let mut do_list = false;
+        let mut cancel_scan = false;
         ui_kit::window(ctx, "查找与替换", 380.0)
             .open(&mut open)
             .resizable(false)
@@ -15771,10 +15946,15 @@ let txn = self.txn_begin(&keys);
                     ui.label("范围");
                     egui::ComboBox::from_id_salt("find_scope")
                         .width(112.0)
-                        .selected_text(if self.find.scope == 1 { "整个工作簿" } else { "当前工作表" })
+                        .selected_text(match self.find.scope {
+                            1 => "整个工作簿",
+                            2 => "当前选区",
+                            _ => "当前工作表",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.find.scope, 0, "当前工作表");
                             ui.selectable_value(&mut self.find.scope, 1, "整个工作簿");
+                            ui.selectable_value(&mut self.find.scope, 2, "当前选区");
                         });
                     ui.label("查找");
                     egui::ComboBox::from_id_salt("find_mode")
@@ -15784,10 +15964,30 @@ let txn = self.txn_begin(&keys);
                             ui.selectable_value(&mut self.find.in_formula, false, "值");
                             ui.selectable_value(&mut self.find.in_formula, true, "公式");
                         });
+                    ui.label("顺序");
+                    egui::ComboBox::from_id_salt("find_order")
+                        .width(78.0)
+                        .selected_text(if self.find.order_column { "按列" } else { "按行" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.find.order_column, false, "按行");
+                            ui.selectable_value(&mut self.find.order_column, true, "按列");
+                        });
+                    if ui_kit::pill(ui, "查找全部", "列出范围内全部命中，可点击跳转").clicked() {
+                        do_list = true;
+                    }
                     if ui_kit::pill(ui, "统计", "统计当前范围命中数").clicked() {
                         do_count = true;
                     }
                 });
+                if let Some(scan) = self.find_scan.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(68.0);
+                        ui.label(format!("正在扫描 {}/{} 格", scan.at, scan.keys.len()));
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel_scan = true;
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(68.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -15838,11 +16038,64 @@ let txn = self.txn_begin(&keys);
         if do_count {
             let hits = self.find_hits();
             self.find.hits = hits.len();
-            let scope = if self.find.scope == 1 { "整个工作簿" } else { "当前工作表" };
+            let scope = match self.find.scope {
+                1 => "整个工作簿",
+                2 => "当前选区",
+                _ => "当前工作表",
+            };
             let mode = if self.find.in_formula { "公式" } else { "值" };
-            self.status = format!("{scope}（{mode}）命中 {} 处", hits.len());
+            let order = if self.find.order_column { "按列" } else { "按行" };
+            self.status = format!("{scope}（{mode}/{order}）命中 {} 处", hits.len());
+        }
+        if do_list {
+            self.start_scan(0);
+        }
+        if cancel_scan {
+            self.cancel_find_scan();
         }
         self.find.open = open;
+    }
+
+    /// “查找全部”结果列表：点击任意一项跳到该格。
+    fn find_all_window(&mut self, ctx: &egui::Context) {
+        if !self.find.find_all_open {
+            return;
+        }
+        let mut open = true;
+        let mut pick: Option<sheetcore::search::Hit> = None;
+        let all = &self.find.find_all;
+        egui::Window::new("查找全部")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.label(format!("共 {} 处（点击定位）", all.len()));
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (i, h) in all.iter().take(500).enumerate() {
+                        let sheet = self
+                            .wb
+                            .sheets
+                            .get(h.sheet)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("?");
+                        let label = format!("{}. {}!{}", i + 1, sheet, cell_name(h.row, h.col));
+                        if ui.selectable_label(false, label).clicked() {
+                            pick = Some(*h);
+                        }
+                    }
+                    if all.len() > 500 {
+                        ui.weak(format!("仅列出前 500 处，共 {} 处", all.len()));
+                    }
+                });
+            });
+        if let Some(h) = pick {
+            self.sheet_idx = h.sheet.min(self.wb.sheets.len().saturating_sub(1));
+            self.sel = (h.row, h.col);
+            self.sel_end = (h.row, h.col);
+            self.extra_sel.clear();
+            self.ensure_visible();
+        }
+        self.find.find_all_open = open;
     }
 
     fn macro_window(&mut self, ctx: &egui::Context) {
@@ -21003,6 +21256,9 @@ fn elide(s: &str, max_chars: usize) -> String {
 
     /// 把当前文档从 self 上"取下来"
     fn park_current(&mut self) -> Box<ParkedDoc> {
+        self.find_scan = None;
+        self.find.session_rect = None;
+        self.find.find_all_open = false;
         let title = self
             .wb
             .path
@@ -21030,6 +21286,10 @@ fn elide(s: &str, max_chars: usize) -> String {
 
     /// 把一份挂起的文档装到 self 上
     fn activate_parked(&mut self, doc: Box<ParkedDoc>) {
+        self.find_scan = None;
+        self.find.session_rect = None;
+        self.find.find_all.clear();
+        self.find.find_all_open = false;
         self.wb = doc.wb;
         self.load_diag = doc.load_diag;
         self.undo = doc.undo;
@@ -21173,6 +21433,10 @@ fn elide(s: &str, max_chars: usize) -> String {
 
     /// 打开一个新文档时把编辑态清干净
     fn reset_editor_state(&mut self) {
+        self.find_scan = None;
+        self.find.session_rect = None;
+        self.find.find_all.clear();
+        self.find.find_all_open = false;
         // 无界面验收：SC_SEL/SC_SEL2 给定了选区就保留（否则打开文件后会被清掉）。
         // 格式是「行,列」（0 起），和别处的钩子一致。
         let rc = |name: &str| -> Option<(u32, u32)> {
@@ -21691,6 +21955,7 @@ impl SheetApp {
                     self.find.find = self.search.clone();
                     self.find.tab = 0;
                     self.find.open = true;
+                    self.find.session_rect = None;
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
                 let acc = Rect::from_min_size(
@@ -22180,7 +22445,9 @@ impl eframe::App for SheetApp {
         self.show_compare_window(ctx);
         self.chart_manager(ctx);
         self.macro_window(ctx);
+        self.poll_find_scan();
         self.find_dialog(ctx);
+        self.find_all_window(ctx);
         self.data_dialog(ctx);
         self.cf_manager(ctx);
         if std::env::var("SC_PREVIEW").is_ok() && self.tasks.open_rx.is_none() {

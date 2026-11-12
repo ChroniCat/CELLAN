@@ -1688,8 +1688,8 @@
       ],
       "failures": [],
       "blocker": "",
-      "next": "补 UI-04 真实 GUI 抽查与第二客户端广播观察；然后转 UI-05 查找替换。",
-      "updated_utc": "2026-11-12T21:40:39Z",
+      "next": "补 Ribbon/右键清除与 dirty 关闭提示的真实键鼠验收；然后转 UI-05 真实交互。",
+      "updated_utc": "2026-11-12T22:00:00Z",
       "slices": [
         {
           "id": "UI-04.1",
@@ -1706,20 +1706,20 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_"
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_all_broadcasts"
           ],
           "evidence": [
             "implementation-evidence/ui04-clear-contents.txt"
           ],
           "not_done": [
             "Ribbon/右键的真实键鼠点击未做（命令级 + 全量 GUI 回归已过）",
-            "第二客户端真实网络广播未观察",
             "保存关闭提示 dirty 的真实窗口流程未执行（仅断言 wb.dirty）"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T21:03:46Z"
+          "next": "补 Ribbon/右键清除与 dirty 关闭提示的真实键鼠验收。",
+          "updated_utc": "2026-11-13T05:55:00Z"
         }
       ]
     },
@@ -1746,25 +1746,28 @@
       "commits": [],
       "commands": [
         "cargo test -p sheetcore --offline --test search_matches",
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
       ],
       "evidence": [
         "implementation-evidence/ui05-find-replace.txt"
       ],
       "not_done": [
-        "选区范围与行/列序搜索未做（当前只有当前工作表/整个工作簿，固定行优先）",
-        "查找全部结果列表与长操作取消未做",
+        "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
+        "查找范围只取主选区，extra_sel 多选区未并入",
+        "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
         "反向查找无 UI 按钮（核心 API 支持）",
-        "真实键鼠点击查找/替换对话框按钮未做",
-        "跨工作表 replace_all 的单一撤销未测"
+        "结果列表最多显示 500 项，未做虚拟滚动"
       ],
       "failures": [],
       "blocker": "",
-      "next": "补 UI-05.4：选区范围、行/列序、查找全部列表与取消，再补跨表 replace_all 撤销。",
-      "updated_utc": "2026-11-12T21:40:39Z",
+      "next": "补真实键鼠点击查找对话框/取消/结果跳转，以及多选区与单次查找可取消。",
+      "updated_utc": "2026-11-12T22:00:00Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -1783,10 +1786,13 @@
           "commits": [],
           "commands": [
             "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
           ],
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
@@ -1797,7 +1803,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T21:40:39Z"
+          "updated_utc": "2026-11-12T22:00:00Z"
         },
         {
           "id": "UI-05.2",
@@ -1816,10 +1822,13 @@
           "commits": [],
           "commands": [
             "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
           ],
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
@@ -1830,7 +1839,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T21:40:39Z"
+          "updated_utc": "2026-11-12T22:00:00Z"
         },
         {
           "id": "UI-05.3",
@@ -1849,10 +1858,13 @@
           "commits": [],
           "commands": [
             "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
           ],
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
@@ -1863,7 +1875,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T21:40:39Z"
+          "updated_utc": "2026-11-12T22:00:00Z"
         },
         {
           "id": "UI-05.4",
@@ -1871,8 +1883,8 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "status": "待验收",
+          "acceptance": "选区/工作表/工作簿范围可选；按行/按列顺序生效；查找全部给出可跳转列表；大范围扫描分帧并可取消，取消不写任何格；跨表替换按命中表取文本/格式；扫描跨文档作废。",
           "files": [
             "crates/core/src/search.rs",
             "crates/core/tests/search_matches.rs",
@@ -1882,21 +1894,28 @@
           "commits": [],
           "commands": [
             "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
           ],
           "evidence": [
             "implementation-evidence/ui05-find-replace.txt"
           ],
           "not_done": [
-            "选区范围、行/列序、查找全部列表、取消均未做"
+            "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
+            "查找范围只取主选区，extra_sel 多选区未并入",
+            "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
+            "反向查找无 UI 按钮（核心 API 支持）",
+            "结果列表最多显示 500 项，未做虚拟滚动"
           ],
           "failures": [],
           "blocker": "",
           "next": "实现选区范围与行/列序搜索，再加查找全部列表和取消。",
-          "updated_utc": "2026-11-12T21:40:39Z"
+          "updated_utc": "2026-11-12T22:00:00Z"
         }
       ]
     },

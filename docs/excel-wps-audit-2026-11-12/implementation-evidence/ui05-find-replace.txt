@@ -59,3 +59,65 @@ M9 单次替换不置 dirty → 保存/脏标记用例 FAILED
   但查找对话框仍未提供行/列方向与选区范围）。
 - 真实键鼠点击查找对话框按钮/取消/关闭未执行。
 - 跨工作表 replace_all 的单一撤销未测（代码按表捕获后合并，只有单表 1000 格证据）。
+
+
+============================================================
+五、05:48 复核后的三项安全语义修复（UI-05.4，2026-11-13）
+============================================================
+1) 替换按命中表取文本/格式
+   旧 replacement_at 只有 (r,c,cell)，内部固定 self.sheet_idx；apply_replace_hits 传的是
+   h.sheet 的 cell，跨表时用活动表的显示串/公式判断，会漏改或取错格式。
+   现改为 replacement_at(sheet,r,c,cell)，匹配/显示串/公式都用命中表；
+   replace_current 传 self.sheet_idx，全部替换传 h.sheet。
+   用例 replace_all_uses_the_hit_sheet_not_the_active_sheet：
+   A!A1=keep、B!A1=old；B!D4=old（不同坐标，加粗+百分比格式）；
+   A!C3=0.5 无格式、B!C3=0.5 百分比。old→new 只改 B!A1/D4，A!A1 与 A!C3 不动，D4 格式保留；
+   再查“50.00%”→只改 B!C3（旧实现会去 A!C3 找显示串而漏掉）。
+
+2) 搜索选区与命中光标分离
+   旧 find_hits 每次取 sel_rect；find_next 把 sel/sel_end 折叠到命中格，第二次就变成单格回绕。
+   新增 FindState.session_rect：首次在选区范围查找时锁定，连续 Next/Prev 都用它；
+   打开查找窗口（三处入口）重置，park/activate/reset 清空。
+   用例 selection_scope_survives_repeated_next_and_previous：
+   A1:B2 四个命中，连续 Next 依次 B1→A2→B2→回绕 A1，命中数始终 4；
+   Prev 从 A1 回绕到 B2，状态分别含“回到开头/从末尾继续”。
+
+3) 扫描绑定文档世代
+   FindScan 新增 wb_epoch；poll 时世代不一致立即丢弃并提示“文档已切换，已取消扫描”。
+   park_current/activate_parked/reset_editor_state 主动取消扫描并清空结果列表。
+   用例：
+   - stale_scan_is_dropped_after_document_switch：A 上 9000 格扫描未完成时换成 B 文档，
+     保留旧扫描继续 poll → 扫描丢弃，B 的值/dirty/undo 都不变；同文档重扫可正常完成。
+   - parking_a_document_cancels_its_find_scan：park 立即取消扫描并清空结果。
+
+4) 附带修复：c14 的 LAST_LOAD_KIND 从进程级 Atomic 改为线程局部 Cell
+   （last_load_kind()/set_load_kind）。并行跑 c14_guard 时其他用例的加载不再覆盖断言值；
+   c14_guard 16 passed，全量 core 68 bins / 599 passed / 41 ignored，CORE_EXIT=0。
+
+命令与结果：
+  cargo test -p app ... -- replace_all_uses_the_hit_sheet   1 passed
+  cargo test -p app ... -- selection_scope_survives         1 passed
+  cargo test -p app ... -- stale_scan_is_dropped            1 passed
+  cargo test -p app ... -- parking_a_document               1 passed
+  cargo test -p app ... -- find_selection_scope             1 passed
+  cargo test -p app ... -- long_find_scan                   1 passed
+  cargo test -p app ... -- find_all_collects                1 passed
+  cargo test -p app ... -- replace_all_across_sheets        1 passed
+  cargo test -p app ... -- find_dialog_and_results          1 passed
+全量见 round48：app 178 passed / 0 failed；GUI 12 passed / 8 ignored。
+
+变异（均转红后还原）：
+  M10 scope==2 退化成当前表 → find_selection_scope FAILED
+  M11 忽略按列顺序 → find_selection_scope FAILED
+  M12 取消失效 → long_find_scan FAILED
+  M13 replacement_at 忽略传入 sheet → replace_all_uses_the_hit_sheet FAILED
+  M14 不保存搜索选区 → selection_scope_survives FAILED
+  M15 不校验 wb_epoch → stale_scan_is_dropped FAILED
+  M16 park 不取消扫描 → parking_a_document FAILED
+
+仍未执行（如实保留）：
+- 真实鼠标点击查找对话框按钮、结果列表项、取消按钮（render + 命令级已测）。
+- 选区范围只取主选区（extra_sel 多选区未并入查找范围）。
+- 单次“查找下一个”仍是同步稀疏扫描，超大簿上不可取消；可取消覆盖的是查找全部/全部替换的扫描阶段。
+- 反向查找仍无 UI 按钮（API 支持 backwards）。
+- 结果列表窗口最多显示 500 项（更长的会提示总数，但未做虚拟滚动）。

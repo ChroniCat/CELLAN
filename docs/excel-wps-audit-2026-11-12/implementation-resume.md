@@ -1,29 +1,28 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `1089783`（C14/UI-04 已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 5 待验收 / 47 待实施；
-  切片 26 已验收 / 7 待验收 / 115 待实施。
-- 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
-  app 168 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
-- 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
-  app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
-  `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。
+- 分支 `main`（`origin/main`），HEAD `c6d56c9`（UI-03/04/05 首轮已推送）+ 本轮未提交改动。
+- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 6 待验收 / 46 待实施（本轮后待重算）；
+  切片 26 已验收 / 10 待验收 / 112 待实施（UI-05.4 待验收）。
+- 当前测试真值（本轮源码，round47/48）：core 68 bins / 599 passed / 0 failed / 41 ignored，
+  CORE_EXIT=0；app 178 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+- 专项：`c14_guard` 16 passed；`search_matches` 7 passed。
 
-## 本轮：UI-03 门禁补口 + UI-04 双端样式同步 + UI-05 查找替换（待验收）
+## 本轮：UI-05.4 选区/列序/查找全部/分帧取消 + 三项安全语义（待验收）
 
-- UI-03（仍待验收）：fill_cmd 按真实写入范围预检（Ctrl+D 向下 / Ctrl+R 向右）；
-  fill_to 横向门禁扩到目标列；move/copy/shift 三个拖拽入口分别预检源/目标/移位范围；
-  lock_holder_on 离线也认租约表；dv 选择抽成 dv_pick_apply 并纳入保护测试。
-  真实 Ctrl+D / Ctrl+R 键事件用例 3 项；变异 M1/M2/M3 全红。
-- UI-04（仍待验收）：ClearAll 同时广播内容与默认样式；do_undo/do_redo 对 touched
-  每格补发撤销后的真实样式。真实回环双客户端用例：清除→双端值与格式都清；
-  撤销→双端值与格式都恢复；重做→双端再次清空。变异 M4/M5 全红。
-- UI-05（待验收）：新增 core/search.rs 稀疏匹配器（A300/XFD1048576、循环、整格、
-  值/公式、格式化显示串、Unicode 安全替换）；app 单次替换置 dirty、全部替换单 Action；
-  值模式默认跳过公式结果并提示，勾选后才允许常量化。core 6 项 + app 5 项用例；
-  变异 M1–M9 九项均被抓。
-- 未执行：选区范围/行列序/查找全部列表/取消、真实键鼠点击对话框、跨表 replace_all 撤销；
-  UI-03/UI-04 的真实 GUI 点验与 dirty 关闭提示。
+- 范围可选 当前工作表 / 整个工作簿 / 当前选区；顺序可选按行/按列；对话框新增“查找全部”
+  结果窗口（点击跳转，最多显示 500 项）。
+- 查找全部/全部替换改为候选键预排 + 每帧 4000 格扫描，可取消；小范围（≤8000 格）同步完成。
+- 05:48 复核三项修复：
+  1) replacement_at 增加 sheet 参数，匹配/显示串/公式都用命中表，不再固定活动表；
+     跨表夹具 A!A1=keep、B!A1=old、B!D4=old、B!C3 百分比；
+  2) FindState.session_rect 锁定搜索选区，连续 Next/Prev 不再退化成单格回绕；
+  3) FindScan.wb_epoch + park/activate/reset 主动取消，跨文档旧扫描不得写新文档；
+  4) 附带把 c14 的 LAST_LOAD_KIND 改为线程局部，消除并行测试串台。
+- 用例：core 7 passed；app 新增 find_selection_scope / selection_scope_survives /
+  long_find_scan / find_all_collects / replace_all_across_sheets /
+  find_dialog_and_results / replace_all_uses_the_hit_sheet / stale_scan_is_dropped /
+  parking_a_document 共 9 项；变异 M10–M16 全红。
+- 未执行：真实键鼠点击对话框/取消/结果项、多选区、单次查找可取消、反向 UI。
 
 ## 本轮：C09/C14 收尾 + UI-04 清除命令（C09/C14/C04 已验收；UI-04 待验收）
 

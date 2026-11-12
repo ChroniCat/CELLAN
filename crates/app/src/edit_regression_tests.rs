@@ -10,6 +10,10 @@ fn number(value: f64) -> Cell {
     Cell { value: Value::Number(value), formula: None }
 }
 
+fn text(s: &str) -> Cell {
+    Cell { value: Value::Text(s.into()), formula: None }
+}
+
 fn formula(text: &str) -> Cell {
     Cell { value: Value::Empty, formula: Some(text.into()) }
 }
@@ -3249,4 +3253,304 @@ fn single_replace_marks_dirty_survives_save_and_undoes_in_one_step() {
     app.do_undo(false);
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("old".into()), "一步撤销恢复");
     drop(env);
+}
+
+/// UI-05.4：选区范围与按列顺序真正参与查找；选区外不命中。
+#[test]
+fn find_selection_scope_and_column_order_are_honored() {
+    let mut app = app();
+    for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (5, 2)] {
+        app.wb.sheet_mut(0).set(r, c, text("x"));
+    }
+    app.find.find = "x".into();
+    app.find.scope = 2;
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    let hits = app.find_hits();
+    assert_eq!(hits.len(), 3, "选区 (A1:B2) 内 3 处，C6 不算");
+    assert!(!hits.iter().any(|h| (h.row, h.col) == (5, 2)));
+
+    app.find.order_column = true;
+    let hits = app.find_hits();
+    assert_eq!(
+        hits.iter().map(|h| (h.row, h.col)).collect::<Vec<_>>(),
+        vec![(0, 0), (1, 0), (0, 1)],
+        "按列顺序：A1, A2, B1"
+    );
+    app.find.scope = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.find_next(false);
+    assert_eq!(app.sel, (1, 0), "按列查找的下一处应向下而不是向右");
+}
+
+/// UI-05.4：全部替换只看选区，且仍是一个撤销步。
+#[test]
+fn replace_all_in_selection_spares_cells_outside_and_is_one_undo() {
+    let mut app = app();
+    for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (5, 2)] {
+        app.wb.sheet_mut(0).set(r, c, text("old"));
+    }
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        scope: 2,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.replace_all();
+    for (r, c) in [(0u32, 0u32), (0, 1), (1, 0)] {
+        assert_eq!(app.wb.sheet(0).value(r, c), Value::Text("new".into()));
+    }
+    assert_eq!(
+        app.wb.sheet(0).value(5, 2),
+        Value::Text("old".into()),
+        "选区外不能动"
+    );
+    assert_eq!(app.undo.depth(), (1, 0), "选区全部替换只压一步撤销");
+    assert!(app.status.contains("3"), "{}", app.status);
+}
+
+/// UI-05.4：大范围扫描分帧进行，可取消且取消后不写任何格；继续扫描则最终一次提交。
+#[test]
+fn long_find_scan_is_chunked_cancellable_and_commits_once() {
+    let mut app = app();
+    for r in 0..9000u32 {
+        app.wb.sheet_mut(0).set(r, 0, text("old"));
+    }
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.start_scan(1);
+    assert!(app.find_scan.is_some(), "9000 格应进入分帧扫描");
+    app.poll_find_scan();
+    assert!(app.find_scan.is_some(), "一帧还没扫完");
+    app.cancel_find_scan();
+    assert!(app.find_scan.is_none());
+    assert_eq!(app.status, "已取消扫描");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("old".into()));
+    assert_eq!(app.undo.depth(), (0, 0), "取消不能产生撤销步");
+
+    app.start_scan(1);
+    let mut guard = 0;
+    while app.find_scan.is_some() && guard < 10 {
+        app.poll_find_scan();
+        guard += 1;
+    }
+    assert!(app.find_scan.is_none(), "分帧应在有限帧内完成");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
+    assert_eq!(app.wb.sheet(0).value(8999, 0), Value::Text("new".into()));
+    assert_eq!(app.undo.depth(), (1, 0), "扫描完成后一次提交、一步撤销");
+    assert!(app.status.contains("9000"), "{}", app.status);
+}
+
+/// UI-05.4：查找全部把整个工作簿的命中列成结果表（可跳转的数据源）。
+#[test]
+fn find_all_collects_workbook_hits_with_sheet_and_position() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::model::Sheet::new("第二表"));
+    app.wb.sheet_mut(0).set(0, 0, text("q"));
+    app.wb.sheet_mut(1).set(1, 1, text("q"));
+    app.find.find = "q".into();
+    app.find.scope = 1;
+    app.start_scan(0);
+    assert!(app.find.find_all_open);
+    assert_eq!(app.find.find_all.len(), 2);
+    assert_eq!((app.find.find_all[0].sheet, app.find.find_all[0].row, app.find.find_all[0].col), (0, 0, 0));
+    assert_eq!((app.find.find_all[1].sheet, app.find.find_all[1].row, app.find.find_all[1].col), (1, 1, 1));
+    assert!(app.status.contains("2"), "{}", app.status);
+}
+
+/// UI-05.4：跨工作簿全部替换按表捕获后合并成一个撤销步。
+#[test]
+fn replace_all_across_sheets_is_one_undo_step() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::model::Sheet::new("第二表"));
+    app.wb.sheet_mut(0).set(0, 0, text("old"));
+    app.wb.sheet_mut(1).set(0, 0, text("old"));
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        scope: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.replace_all();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Text("new".into()));
+    assert_eq!(app.undo.depth(), (1, 0), "两个表也只压一步");
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("old".into()));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Text("old".into()));
+}
+
+/// 查找对话框与查找全部窗口能真实构建（选区/按列/结果列表控件都在）。
+#[test]
+fn find_dialog_and_results_window_render() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("q"));
+    app.find = FindState {
+        open: true,
+        find: "q".into(),
+        scope: 2,
+        order_column: true,
+        ..Default::default()
+    };
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.start_scan(0);
+    assert!(app.find.find_all_open);
+    let _out = ctx.run(Default::default(), |ctx| {
+        app.find_dialog(ctx);
+        app.find_all_window(ctx);
+    });
+}
+
+/// UI-05 安全语义：全部替换必须按命中所在表取文本/格式，不能拿活动表判断。
+/// A!A1=keep 与 B!A1=old 同坐标，B!C3 依赖 B 自己的百分比格式才能命中。
+#[test]
+fn replace_all_uses_the_hit_sheet_not_the_active_sheet() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::model::Sheet::new("B"));
+    app.wb.sheet_mut(0).set(0, 0, text("keep"));
+    app.wb.sheet_mut(0).set(2, 2, number(0.5)); // 活动表同坐标是普通数字
+    app.wb.sheet_mut(1).set(0, 0, text("old"));
+    app.wb.sheet_mut(1).set(2, 2, number(0.5)); // B!C3
+    app.wb.sheet_mut(1).set(3, 3, text("old")); // B!D4，不同坐标
+    let mut st = app.wb.styles.get(0).clone();
+    st.bold = true;
+    st.format = "0.00%".into();
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(1).set_style(2, 2, sid);
+    app.wb.sheet_mut(1).set_style(3, 3, sid);
+
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        scope: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.replace_all();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("keep".into()), "活动表不能被动");
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Text("new".into()), "B!A1 要替换");
+    assert_eq!(app.wb.sheet(1).value(3, 3), Value::Text("new".into()), "B!D4 也要替换");
+    assert_eq!(app.wb.sheet(1).style_of(3, 3), sid, "替换保留原格式");
+    assert_eq!(app.wb.sheet(0).value(2, 2), Value::Number(0.5), "活动表 C3 不动");
+
+    // 只有 B!C3 的百分比格式能把 0.5 显示成 50.00%：查显示串必须命中 B，而不是 A
+    app.find.find = "50.00%".into();
+    app.find.replace = "X".into();
+    app.replace_all();
+    assert_eq!(
+        app.wb.sheet(1).value(2, 2),
+        Value::Text("X".into()),
+        "要按命中表的格式取显示串"
+    );
+    assert_eq!(app.wb.sheet(0).value(2, 2), Value::Number(0.5));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(1).value(2, 2), Value::Number(0.5));
+}
+
+/// UI-05 安全语义：搜索选区一旦开始就与命中光标分离，连续 Next/Prev 不退化。
+#[test]
+fn selection_scope_survives_repeated_next_and_previous() {
+    let mut app = app();
+    for (r, c) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+        app.wb.sheet_mut(0).set(r, c, text("x"));
+    }
+    app.find = FindState {
+        open: true,
+        scope: 2,
+        find: "x".into(),
+        ..Default::default()
+    };
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    // 从 A1 开始，下一次依次 B1、A2、B2，再下一次回绕到 A1
+    for (i, rc) in [(0u32, 1u32), (1, 0), (1, 1)].iter().enumerate() {
+        app.find_next(false);
+        assert_eq!(app.sel, *rc, "第 {} 次下一次", i + 1);
+        assert_eq!(app.find.hits, 4, "选区 4 处不能缩成 1 处");
+    }
+    app.find_next(false);
+    assert_eq!(app.sel, (0, 0), "第 4 次回绕到选区第一处");
+    assert!(app.status.contains("回到开头"), "{}", app.status);
+    // 反向从第一处回绕到最后一处
+    app.find_next(true);
+    assert_eq!(app.sel, (1, 1));
+    assert!(app.status.contains("从末尾继续"), "{}", app.status);
+}
+
+/// UI-05 安全语义：扫描绑定文档世代；切文档后旧扫描作废，不得写新文档。
+#[test]
+fn stale_scan_is_dropped_after_document_switch() {
+    let mut app = app();
+    for r in 0..9000u32 {
+        app.wb.sheet_mut(0).set(r, 0, text("old"));
+    }
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.start_scan(1);
+    let stale = app.find_scan.take().expect("应进入分帧扫描");
+    // 模拟切到另一份文档：内容与世代都换了，但扫描被错误地保留
+    let mut b = sheetcore::model::Workbook::new_blank();
+    b.sheets[0].set(0, 0, text("old"));
+    b.sheets[0].set(1, 1, text("old"));
+    app.wb = b;
+    app.wb_epoch += 1;
+    app.wb.dirty = false;
+    app.find_scan = Some(stale);
+    app.poll_find_scan();
+    assert!(app.find_scan.is_none(), "跨文档的扫描必须立即丢弃");
+    assert_eq!(app.status, "文档已切换，已取消扫描");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("old".into()));
+    assert!(!app.wb.dirty, "取消的扫描不能把新文档标脏");
+    assert_eq!(app.undo.depth(), (0, 0));
+
+    // 正常的分帧扫描仍在同一文档内完成
+    app.undo = sheetcore::undo::UndoStack::new();
+    app.start_scan(1);
+    let mut guard = 0;
+    while app.find_scan.is_some() && guard < 10 {
+        app.poll_find_scan();
+        guard += 1;
+    }
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
+}
+
+/// 切文档/挂起文档必须主动取消扫描（不依赖世代检查兜底）。
+#[test]
+fn parking_a_document_cancels_its_find_scan() {
+    let mut app = app();
+    for r in 0..9000u32 {
+        app.wb.sheet_mut(0).set(r, 0, text("old"));
+    }
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.start_scan(1);
+    assert!(app.find_scan.is_some());
+    let _doc = app.park_current();
+    assert!(app.find_scan.is_none(), "park 要取消扫描");
+    assert!(app.find.find_all.is_empty());
 }

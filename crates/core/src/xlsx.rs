@@ -327,8 +327,20 @@ pub fn load(path: &Path) -> Result<Workbook> {
 
 /// 读取工作簿并带回**结构化诊断**（C14）：哪些部件没读全、丢了什么、是否致命。
 /// `load()` 是它的忽略诊断包装，老调用点行为不变。
-/// 上一次 load_diag 实际走的读取分支（集成测试用来证明没有误走 OOXML）
-pub static LAST_LOAD_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 上一次 load_diag 实际走的读取分支（集成测试用来证明没有误走 OOXML）。
+/// 用线程局部存储：并行测试各自加载不同文件时不会互相覆盖。
+std::thread_local! {
+    static LAST_LOAD_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程上一次加载实际走的分支。
+pub fn last_load_kind() -> u8 {
+    LAST_LOAD_KIND.with(|c| c.get())
+}
+
+fn set_load_kind(kind: u8) {
+    LAST_LOAD_KIND.with(|c| c.set(kind));
+}
 
 /// 故障注入按“文件路径”登记，而不是进程级环境变量：
 /// 同一测试进程里并行跑的其他加载不会被误伤（环境变量是全局的，会串台）。
@@ -370,7 +382,7 @@ pub const LOAD_KIND_BIFF_BUILTIN: u8 = 2;
 pub const LOAD_KIND_OOXML: u8 = 3;
 
 pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
-    LAST_LOAD_KIND.store(LOAD_KIND_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
+    set_load_kind(LOAD_KIND_UNKNOWN);
     if injected(&INJECT_WORKER_PANIC, path) {
         panic!("注入：主加载线程 panic");
     }
@@ -393,7 +405,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 return Err(e).with_context(|| format!("无法打开 {}", path.display()));
             }
             eprintln!("[load] calamine 打不开，改用内置 BIFF 读取器：{e}");
-            LAST_LOAD_KIND.store(LOAD_KIND_BIFF_BUILTIN, std::sync::atomic::Ordering::SeqCst);
+            set_load_kind(LOAD_KIND_BIFF_BUILTIN);
             let mut wb = crate::xls_read::load(path)?;
             apply_xls_meta(path, &mut wb);
             return Ok((wb, diag));
@@ -437,10 +449,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     let is_ooxml = std::fs::read(path)
         .map(|b| b.starts_with(b"PK"))
         .unwrap_or(false);
-    LAST_LOAD_KIND.store(
-        if is_ooxml { LOAD_KIND_OOXML } else { LOAD_KIND_BIFF_CALAMINE },
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    set_load_kind(if is_ooxml { LOAD_KIND_OOXML } else { LOAD_KIND_BIFF_CALAMINE });
     let shared = match if is_ooxml {
         crate::sparse::shared_strings_checked(path)
     } else {

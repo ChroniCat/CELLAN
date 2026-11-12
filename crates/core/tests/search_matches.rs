@@ -1,7 +1,7 @@
 //! UI-05 统一匹配器：稀疏遍历、远端格子、循环下一项、整格/公式模式。
 
 use sheetcore::model::{Cell, Value, Workbook};
-use sheetcore::search::{self, Hit, SearchOpts};
+use sheetcore::search::{self, Hit, SearchOpts, SearchOrder};
 
 fn text(s: &str) -> Cell {
     Cell {
@@ -24,7 +24,7 @@ fn sparse_search_reaches_a300_and_the_last_cell_then_wraps() {
     wb.sheets[0].set(299, 0, text("abc")); // A300
     wb.sheets[0].set(1_048_575, 16_383, text("ABC")); // XFD1048576
     let n = search::normalize_needle("abc", &opts(false, false));
-    let hits = search::hits(&wb, Some(0), &n, &opts(false, false));
+    let hits = search::hits(&wb, Some(0), &n, &opts(false, false), SearchOrder::RowMajor);
     assert_eq!(
         hits,
         vec![
@@ -33,11 +33,11 @@ fn sparse_search_reaches_a300_and_the_last_cell_then_wraps() {
         ],
         "两张远端格都要命中且按位置排序"
     );
-    let (h1, wrapped) = search::next_hit(&hits, Hit { sheet: 0, row: 0, col: 0 }, true).unwrap();
+    let (h1, wrapped) = search::next_hit(&hits, Hit { sheet: 0, row: 0, col: 0 }, true, SearchOrder::RowMajor).unwrap();
     assert_eq!((h1.row, h1.col, wrapped), (299, 0, false));
-    let (h2, wrapped) = search::next_hit(&hits, h1, true).unwrap();
+    let (h2, wrapped) = search::next_hit(&hits, h1, true, SearchOrder::RowMajor).unwrap();
     assert_eq!((h2.row, h2.col, wrapped), (1_048_575, 16_383, false));
-    let (h3, wrapped) = search::next_hit(&hits, h2, true).unwrap();
+    let (h3, wrapped) = search::next_hit(&hits, h2, true, SearchOrder::RowMajor).unwrap();
     assert_eq!((h3.row, h3.col, wrapped), (299, 0, true), "一轮后回到第一处并标记回绕");
 }
 
@@ -47,7 +47,7 @@ fn whole_cell_does_not_match_a_longer_text() {
     wb.sheets[0].set(0, 0, text("abc"));
     wb.sheets[0].set(0, 1, text("xabc"));
     let n = search::normalize_needle("abc", &opts(true, false));
-    let hits = search::hits(&wb, Some(0), &n, &opts(true, false));
+    let hits = search::hits(&wb, Some(0), &n, &opts(true, false), SearchOrder::RowMajor);
     assert_eq!(hits.len(), 1);
     assert_eq!((hits[0].row, hits[0].col), (0, 0));
 }
@@ -65,12 +65,12 @@ fn formula_mode_matches_formula_text_value_mode_matches_display() {
     );
     let f = opts(false, true);
     let n = search::normalize_needle("A1", &f);
-    assert_eq!(search::hits(&wb, Some(0), &n, &f).len(), 1, "公式模式查公式文本");
+    assert_eq!(search::hits(&wb, Some(0), &n, &f, SearchOrder::RowMajor).len(), 1, "公式模式查公式文本");
     let v = opts(false, false);
     let nv = search::normalize_needle("3", &v);
-    assert_eq!(search::hits(&wb, Some(0), &nv, &v).len(), 1, "值模式查公式结果");
+    assert_eq!(search::hits(&wb, Some(0), &nv, &v, SearchOrder::RowMajor).len(), 1, "值模式查公式结果");
     let nf = search::normalize_needle("SUM", &v);
-    assert!(search::hits(&wb, Some(0), &nf, &v).is_empty(), "值模式不看公式文本");
+    assert!(search::hits(&wb, Some(0), &nf, &v, SearchOrder::RowMajor).is_empty(), "值模式不看公式文本");
 }
 
 #[test]
@@ -96,9 +96,9 @@ fn value_mode_matches_formatted_display_text() {
     wb.sheets[0].set_style(0, 0, id);
     let o = opts(false, false);
     let n = search::normalize_needle("50.00%", &o);
-    assert_eq!(search::hits(&wb, Some(0), &n, &o).len(), 1, "显示串 50.00% 应能查到");
+    assert_eq!(search::hits(&wb, Some(0), &n, &o, SearchOrder::RowMajor).len(), 1, "显示串 50.00% 应能查到");
     let raw = search::normalize_needle("0.5", &o);
-    assert!(search::hits(&wb, Some(0), &raw, &o).is_empty(), "屏幕上看不到 0.5 就不该命中");
+    assert!(search::hits(&wb, Some(0), &raw, &o, SearchOrder::RowMajor).is_empty(), "屏幕上看不到 0.5 就不该命中");
 }
 
 /// Unicode 小写化改变字节长度时，替换不能按小写索引切原串（İabc 查 abc）。
@@ -108,4 +108,19 @@ fn case_insensitive_replace_handles_unicode_length_change() {
     assert_eq!(search::replace_in_text("abcabc", "abc", "X", false), "XX");
     // 中文/多字节文本里做不区分大小写替换也不能切坏 UTF-8
     assert_eq!(search::replace_in_text("表abc格", "abc", "值", false), "表值格");
+}
+
+/// 列优先顺序：B1 先于 A2；选区矩形只查框内。
+#[test]
+fn column_order_and_selection_rect_filter() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 1, text("x")); // B1
+    wb.sheets[0].set(1, 0, text("x")); // A2
+    wb.sheets[0].set(5, 2, text("x")); // C6，框外
+    let o = opts(false, false);
+    let n = search::normalize_needle("x", &o);
+    let rows = search::hits(&wb, Some(0), &n, &o, SearchOrder::RowMajor);
+    assert_eq!(rows.iter().map(|h| (h.row, h.col)).collect::<Vec<_>>(), vec![(0, 1), (1, 0), (5, 2)]);
+    let cols = search::hits_in_rect(&wb, 0, (0, 0, 3, 1), &n, &o, SearchOrder::ColumnMajor);
+    assert_eq!(cols.iter().map(|h| (h.row, h.col)).collect::<Vec<_>>(), vec![(1, 0), (0, 1)], "列优先且框外 C6 不算");
 }

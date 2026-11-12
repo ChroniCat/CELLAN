@@ -525,9 +525,8 @@ fn fixture(name: &str) -> std::path::PathBuf {
 fn real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml() {
     let path = fixture("real_excel.xls");
     let (wb, diag) = sheetcore::xlsx::load_diag(&path).expect("真实 .xls 应能打开");
-    use std::sync::atomic::Ordering::SeqCst;
     assert_eq!(
-        sheetcore::xlsx::LAST_LOAD_KIND.load(SeqCst),
+        sheetcore::xlsx::last_load_kind(),
         sheetcore::xlsx::LOAD_KIND_BIFF_CALAMINE,
         "应走 calamine，而不是内置 BIFF/OOXML 分支"
     );

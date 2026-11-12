@@ -36,7 +36,7 @@ M3 清格式分支也清内容 → clear_formats_and_clear_all… 失败。
 
 五、未执行 / 边界
 - 真实 GUI 键鼠点击 Ribbon 清除菜单三项、右键清除内容未做；当前为命令函数级 + 全量 GUI 回归。
-- 第二客户端真实网络广播未观察；本轮验证的是同一 recalc_and_broadcast/broadcast_style 代码路径。
+- （已关闭）第二客户端真实网络广播：05:30 后由回环双实例用例覆盖，见第七节。
 - “保存关闭必须提示 dirty”：断言了 wb.dirty=true，未走真实关闭窗口的提示框流程。
 
 

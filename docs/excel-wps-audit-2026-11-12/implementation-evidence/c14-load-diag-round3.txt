@@ -123,3 +123,12 @@ c14_guard 与 app 的 worker-panic 用例改用新接口，并在结束时清空
 
 复跑：core 68 bins / 598 passed / 0 failed / 41 ignored，CORE_EXIT=0
       （两条 c14 边界用例仍包含在 16 项 c14_guard 内，断言未改）。
+
+
+============================================================
+八、LAST_LOAD_KIND 改为线程局部（并行测试稳定性）
+============================================================
+round46 全量 core 时 real_excel_biff_uses_the_calamine_branch 偶发读到 0：同进程并行跑的
+其他 c14 用例也在 load_diag，进程级 Atomic 被后一次加载覆盖。改为 thread_local Cell，
+新增 pub fn last_load_kind()，测试只读本线程的结果；产品行为不变（app 不读该值）。
+复跑：c14_guard 16 passed；全量 core 68 bins / 599 passed / 41 ignored，CORE_EXIT=0。
