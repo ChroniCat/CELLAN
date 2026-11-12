@@ -1,30 +1,13 @@
-## 当前状态（最后更新：2026-11-13 UTC+08，C01.2/C01.3 之后）
+## 当前状态（最后更新：2026-11-13 UTC+08，C01 全部切片之后）
 
-- 分支 `main`，跟踪 `origin/main`；最新提交见 `git log -1`（C01.2/C01.3 提交在 `b978fd0` 之后）
-- 已验收：任务 **4/61**（UI-02、C13、QA-03、C03）；切片 **13/148**（C01.1/C01.2/C01.3 已验收）
-- 待验收：UI-01（真实中文输入法与硬件键盘未执行）、C01（只差 C01.4：撤销/协作同步端到端）
-- 基线（本轮实测，round8）：
-  - sheetcore **58 个测试二进制 / 506 passed / 0 failed / 34 ignored**，EXIT=0
-  - app 单测 **140 passed / 0 failed**，EXIT=0
+- 分支 `main`，跟踪 `origin/main`
+- 已验收：任务 **5/61**（UI-02、C13、QA-03、C03、C01）；切片 **14/148**
+- 待验收：UI-01（真实中文输入法与硬件键盘未执行）
+- 基线（round10 实测，与本状态同一代码）：
+  - sheetcore **59 个测试二进制 / 514 passed / 0 failed / 34 ignored**，EXIT=0
+  - app 单测 **141 passed / 0 failed**，EXIT=0
   - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**，EXIT=0
 - 工具链：`C:/Users/Administrator/.cargo/bin/cargo.exe`；`source scripts/audit_env.sh <标签>`
-
-## 本轮完成（提交 → 证据）
-
-| 内容 | 提交 | 证据 |
-|---|---|---|
-| C13 最终产物门禁（ZIP/CFB 识别、关系归一、XML 单根、prune 修复） | `1eea577` | `c13-integrity-gate.txt` |
-| C13 真实占用（Windows 独占句柄）+ 保存阶段强杀子进程 | `1eea577` | `c13-integrity-gate.txt` |
-| QA-03.1 环境竞态修复 + 并行 GREEN | `1eea577` | `qa03-1-env-race-fix.txt` |
-| QA-03.3 free_port TOCTOU + 他人持锁绘制 | `1eea577` | `qa03-3-other-participant-lock.txt` |
-| UI-02 真实系统另存为/打开对话框 + 原文件哈希 | `1eea577` | `ui02-real-dialogs.txt` |
-| C03 字符串/标识符不被改写（split_quoted） | `f348f02` | `c03-formula-strings.txt` |
-| 复核两处边界：根前根外内容、成功另存为整份 SHA、取消等真关闭 | `f348f02` | `review-2337-boundaries.txt` |
-
-## 台账口径（不要凭记忆）
-
-- `counts`：`tasks.已验收=3`、`slices.已验收=9`、`待验收=1`（UI-01 及其切片）
-- `check` 输出「清单一致」，说明 tasks.json 的 61/148 与台账结构未走样
 
 ## C01.2 / C01.3 关键结论（不要重复踩）
 

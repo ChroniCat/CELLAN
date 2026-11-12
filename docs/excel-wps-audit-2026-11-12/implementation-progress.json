@@ -18,8 +18,8 @@
    "scope": "core/model.rs, formula/mod.rs, sync.rs, wire.rs, xlsx.rs, xls_*",
    "source": "core-requirements.md",
    "heading": "C01 P0 错误值模型与增量重算一致性",
-   "status": "待验收",
-   "acceptance": "[core-requirements.md C01] 显式错误值类型贯穿 xlsx/xls 读写、剪贴板、网络、撤销、持久化；区分用户输入文本与真错误；七种错误 + SPILL 跨表/外链/保存重开/只改另一依赖项；增量与全量逐格比较类型与数值。当前完成 C01.1（类型与文本区分 + 8 项测试），C01.2/C01.3/C01.4 未完成，故父任务待验收。",
+   "status": "已验收",
+   "acceptance": "七种传统错误为 Value::Error（手打同形文本仍是 Text）；XLSX/XLS/外链/剪贴板往返保类型；需求三阶段场景始终 #DIV/0!；无数组簿子里 recalc_dirty 真实局部（脏集 5 格）与克隆全算整本逐格一致，且不碰无关缓存；SPILL 真实占用→#SPILL!→删障碍后锚点与子格恢复（该路径如实注明全量回退）；错误值经 Msg 信封同步与撤销/重做原样还原。",
    "files": [
     "crates/core/src/model.rs,crates/core/src/formula/mod.rs,crates/core/src/formula/value.rs,crates/core/src/xlsx.rs,crates/core/src/xls_write.rs,crates/core/src/sync.rs,crates/core/src/revision.rs,crates/core/src/sort_filter.rs,crates/core/src/scenarios.rs,crates/core/src/xlinks.rs,crates/core/tests/error_values.rs"
    ],
@@ -29,24 +29,26 @@
    "commands": [
     "cargo test -p sheetcore --test error_values (8 passed)",
     "cargo test -p sheetcore --test error_persistence (4 passed)",
-    "cargo test -p sheetcore --test xls_formula_cache (8 passed)",
-    "cargo test -p sheetcore -- --test-threads=1 (58 bins, 506 passed / 34 ignored, EXIT=0)",
-    "cargo test -p app --bin app (140 passed, EXIT=0)",
+    "cargo test -p sheetcore --test xls_formula_cache (10 passed)",
+    "cargo test -p sheetcore --test error_wire_undo (6 passed)",
+    "cargo test -p sheetcore -- --test-threads=1 (59 bins, 514 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (141 passed, EXIT=0)",
     "cargo test -p app --test ui_regression -- --test-threads=1 (12 passed / 8 ignored, EXIT=0)"
    ],
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-1-error-type.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-2-error-persistence.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-4-wire-undo.txt"
    ],
    "not_done": [
-    "C01.4：撤销恢复错误值、协作同步错误值的端到端用例未做",
+    "真实双进程 socket 传错误值未做 GUI 级取证（已证 Msg 信封+Peer 状态机+模型应用）",
     "未与 Excel/WPS 实机对拍"
    ],
    "failures": [],
    "blocker": "",
    "next": "",
-   "updated_utc": "2026-11-12T16:52:09Z",
+   "updated_utc": "2026-11-12T17:13:08Z",
    "slices": [
     {
      "id": "C01.1",
@@ -112,13 +114,13 @@
      "acceptance_source": "core-requirements.md / C01 验收中与本切片有关的条目",
      "depends_on": [],
      "status": "已验收",
-     "acceptance": "需求三阶段场景（A1=1/0、B1=1、C1=SUM(A1,B1)；全算→改B1增量→再全算）C1 始终 #DIV/0!；七种错误 + SPILL + 跨表依赖链；每步增量与克隆全量逐格比较类型与数值（5 步改动）；错误源修复后依赖增量恢复。8 项用例 + 3 处变异。",
+     "acceptance": "第一版返工：簿子里的成功溢出导致 recalc_dirty 每次全量回退、障碍占错列、snapshot 漏子格、#NULL! 未断言。返工后：无数组簿子七种错误逐个断言（含 Error(Null)）；recalc_dirty 脏集精确 5 格，与克隆全算整本非空格逐格一致；无关格旧缓存 999 不被触碰；SPILL 用 A10 真占用→Error(Spill)→删障碍恢复锚点 1/子格 2 并注明全量回退；需求原样三阶段 C1 始终 #DIV/0!。变异 if true 使 4 项失败。",
      "files": [
       "crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/tests/xls_formula_cache.rs"
      ],
      "commits": [],
      "commands": [
-      "cargo test -p sheetcore --test xls_formula_cache (8 passed)"
+      "cargo test -p sheetcore --test xls_formula_cache (10 passed)"
      ],
      "evidence": [
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-3-formula-cache.txt"
@@ -127,7 +129,7 @@
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T16:52:09Z"
+     "updated_utc": "2026-11-12T17:13:08Z"
     },
     {
      "id": "C01.4",
@@ -135,17 +137,26 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C01 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "错误值经 Msg::Op 信封 JSON 往返、Peer::apply、模型回写；像错误的文本过线仍是文本；last-writer-wins 两个方向；UndoStack 撤销回 Error(Div0)+公式、重做回数值；App 的 txn_begin/txn_end/do_undo 端到端；整表快照回填保类型。变异（错误当文本传）使 2 项失败。",
+     "files": [
+      "crates/core/tests/error_wire_undo.rs,crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --test error_wire_undo (6 passed)",
+      "cargo test -p app --bin app app_undo_restores (1 passed)"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c01-4-wire-undo.txt"
+     ],
+     "not_done": [
+      "真实双进程 socket 传错误值未做 GUI 级取证"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T17:13:08Z"
     }
    ]
   },

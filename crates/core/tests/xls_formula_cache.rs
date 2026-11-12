@@ -141,37 +141,53 @@ fn our_own_xls_roundtrip_covers_every_cached_type() {
     assert_eq!(s.value(3, 0), Value::Text("结果".into()));
 }
 
-// ---------------------------------------------------------------- 增量 vs 全量
+// ------------------------------------------------------- 七种错误：真实局部 dirty 路径
+//
+// 这里刻意**不含任何数组/溢出**：`recalc_dirty` 一旦发现 spilled/arrays 就会整本回退全算，
+// 那样测到的只是「全量 vs 全量」。局部路径必须用没有溢出源的簿子来验。
 
-fn book() -> Workbook {
-    let mut wb = Workbook::new_blank();
+fn error_book() -> Workbook {
+    let mut wb = Workbook::new_blank(); // 0 = 汇总
     wb.sheets[0].name = "汇总".into();
-    let mut other = sheetcore::model::Sheet::new("数据");
-    // 七种传统错误 + SPILL
+    let mut data = sheetcore::model::Sheet::new("数据"); // 1 = 数据
+
+    // A1..A7：七种传统错误，互不依赖
     let defs = [
-        "=1/0", "=NA()", "=SQRT(-1)", "=NOPE()", "=\"a\"+1", "=#REF!", "=SUM(A1 A2)",
+        "=1/0",          // #DIV/0!
+        "=NA()",         // #N/A
+        "=SQRT(-1)",     // #NUM!
+        "=NOPE()",       // #NAME?
+        "=\"a\"+1",      // #VALUE!
+        "=#REF!",        // #REF!
+        "=SUM(A1 A9)",   // #NULL!（空格是交集，A1 与 A9 不相交）
     ];
     for (i, f) in defs.iter().enumerate() {
-        other.set(i as u32, 0, Cell { value: Value::Empty, formula: Some((*f).into()) });
+        data.set(i as u32, 0, Cell { value: Value::Empty, formula: Some((*f).into()) });
     }
-    // SPILL：A9 溢出，B9 被占
-    other.set(8, 0, Cell { value: Value::Empty, formula: Some("=SEQUENCE(2,1)".into()) });
-    other.set(8, 1, Cell { value: Value::Number(1.0), formula: None });
-    // 依赖链：跨表引用错误值
-    wb.sheets[0].set(0, 0, Cell { value: Value::Empty, formula: Some("=数据!A1".into()) });
+    // A9 是一条真实的错误链：B1=0 → 1/B1 = #DIV/0!
+    data.set(0, 1, Cell { value: Value::Number(0.0), formula: None });
+    data.set(8, 0, Cell { value: Value::Empty, formula: Some("=1/B1".into()) });
+
+    // 跨表依赖链
+    wb.sheets[0].set(0, 0, Cell { value: Value::Empty, formula: Some("=数据!A9".into()) });
     wb.sheets[0].set(1, 0, Cell { value: Value::Empty, formula: Some("=A1&\"x\"".into()) });
     wb.sheets[0].set(2, 0, Cell { value: Value::Empty, formula: Some("=IFERROR(A1,7)".into()) });
     wb.sheets[0].set(3, 0, Cell { value: Value::Empty, formula: Some("=SUM(A1,2)".into()) });
-    wb.sheets.push(other);
+    wb.sheets.push(data);
     formula::recalc_all(&mut wb);
     wb
 }
 
+fn total_formulas(wb: &Workbook) -> usize {
+    wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum()
+}
+
+/// 所有非空格（含溢出子格），逐格记类型与值
 fn snapshot(wb: &Workbook) -> Vec<(usize, u32, u32, Value)> {
     let mut out = Vec::new();
     for (si, s) in wb.sheets.iter().enumerate() {
         for (cref, cell) in s.iter() {
-            if cell.formula.is_some() {
+            if cell.formula.is_some() || cell.value != Value::Empty {
                 out.push((si, cref.row, cref.col, cell.value.clone()));
             }
         }
@@ -181,67 +197,30 @@ fn snapshot(wb: &Workbook) -> Vec<(usize, u32, u32, Value)> {
 }
 
 #[test]
-fn full_recalc_gives_the_expected_three_stage_behavior() {
-    let mut wb = book();
-    // 阶段 1：全算
+fn seven_errors_are_typed_after_a_full_recalc() {
+    let wb = error_book();
+    let d = &wb.sheets[1];
+    let want = [
+        Value::Error(ErrKind::Div0),
+        Value::Error(ErrKind::Na),
+        Value::Error(ErrKind::Num),
+        Value::Error(ErrKind::Name),
+        Value::Error(ErrKind::Value),
+        Value::Error(ErrKind::Ref),
+        Value::Error(ErrKind::Null), // 断言类型，不靠「可能等价于 Value」的推测
+    ];
+    for (i, w) in want.iter().enumerate() {
+        assert_eq!(&d.value(i as u32, 0), w, "第 {i} 种错误类型不对");
+    }
     assert_eq!(wb.sheets[0].value(0, 0), Value::Error(ErrKind::Div0));
     assert_eq!(wb.sheets[0].value(1, 0), Value::Error(ErrKind::Div0));
     assert_eq!(wb.sheets[0].value(2, 0), Value::Number(7.0), "IFERROR 应抓住跨表错误");
     assert_eq!(wb.sheets[0].value(3, 0), Value::Error(ErrKind::Div0), "SUM 不能吞错误");
-    // 阶段 2：只改一个无关输入（B1 在 数据!B1 之外的地方）
-    wb.sheets[1].set(20, 5, Cell { value: Value::Number(2.0), formula: None });
-    let deps = formula::deps::Deps::build(&wb);
-    formula::recalc_dirty(&mut wb, &deps, &[(1, 20, 5)]);
-    assert_eq!(wb.sheets[0].value(0, 0), Value::Error(ErrKind::Div0), "增量后跨表错误退化了");
-    assert_eq!(wb.sheets[0].value(3, 0), Value::Error(ErrKind::Div0));
-    // 阶段 3：再全算，仍应一致
-    let before = snapshot(&wb);
-    formula::recalc_all(&mut wb);
-    assert_eq!(snapshot(&wb), before, "再次全算改变了结果");
-}
-
-#[test]
-fn every_incremental_step_matches_a_clone_full_recalc() {
-    let mut wb = book();
-    // 逐格改一批输入，每改一次：增量算 vs 克隆后全算，逐格比类型与数值
-    let edits: &[(usize, u32, u32, f64)] = &[
-        (1, 20, 0, 2.0),
-        (1, 21, 0, -1.0),
-        (0, 30, 30, 5.0),
-        (1, 8, 1, 9.0),  // 清掉 SPILL 障碍
-        (1, 8, 0, 0.0),  // 公式列被数值覆盖
-    ];
-    for (step, (si, r, c, v)) in edits.iter().enumerate() {
-        wb.sheets[*si].set(*r, *c, Cell { value: Value::Number(*v), formula: None });
-        let deps = formula::deps::Deps::build(&wb);
-        formula::recalc_dirty(&mut wb, &deps, &[(*si, *r, *c)]);
-        let mut clone = wb.clone();
-        formula::recalc_all(&mut clone);
-        assert_eq!(
-            snapshot(&clone),
-            snapshot(&wb),
-            "第 {step} 步（{si}!{}）增量与全量不一致",
-            sheetcore::model::cell_name(*r, *c)
-        );
-    }
-}
-
-#[test]
-fn fixing_the_error_source_clears_dependents_incrementally() {
-    let mut wb = book();
-    wb.sheets[1].set(0, 1, Cell { value: Value::Number(4.0), formula: None });
-    wb.sheets[1].set(0, 0, Cell { value: Value::Empty, formula: Some("=1/B1".into()) });
-    let deps = formula::deps::Deps::build(&wb);
-    formula::recalc_dirty(&mut wb, &deps, &[(1, 0, 0)]);
-    assert_eq!(wb.sheets[0].value(0, 0), Value::Number(0.25));
-    assert_eq!(wb.sheets[0].value(1, 0), Value::Text("0.25x".into()));
-    assert_eq!(wb.sheets[0].value(3, 0), Value::Number(2.25));
 }
 
 #[test]
 fn requirement_three_stage_case_stays_div0() {
     // core-requirements.md C01 表格第一行：A1=1/0，B1=1，C1=SUM(A1,B1)
-    // 全算 → 改 B1=2 增量 → 再全算，C1 必须始终是 #DIV/0!（旧行为会变成 2）
     let mut wb = Workbook::new_blank();
     wb.sheets[0].set(0, 0, Cell { value: Value::Empty, formula: Some("=1/0".into()) });
     wb.sheets[0].set(0, 1, Cell { value: Value::Number(1.0), formula: None });
@@ -252,7 +231,8 @@ fn requirement_three_stage_case_stays_div0() {
 
     wb.sheets[0].set(0, 1, Cell { value: Value::Number(2.0), formula: None });
     let deps = formula::deps::Deps::build(&wb);
-    formula::recalc_dirty(&mut wb, &deps, &[(0, 0, 1)]);
+    let n = formula::recalc_dirty(&mut wb, &deps, &[(0, 0, 1)]);
+    assert_eq!(n, 1, "这里应是只算 C1 的局部路径，实际算了 {n} 格");
     assert_eq!(
         wb.sheets[0].value(0, 2),
         Value::Error(ErrKind::Div0),
@@ -263,4 +243,84 @@ fn requirement_three_stage_case_stays_div0() {
 
     formula::recalc_all(&mut wb);
     assert_eq!(wb.sheets[0].value(0, 2), Value::Error(ErrKind::Div0), "再全算又变了");
+}
+
+#[test]
+fn a_local_recalc_matches_a_full_recalc_over_the_whole_book() {
+    let mut wb = error_book();
+    let total = total_formulas(&wb);
+    // 改真实依赖：数据!B1 = 4 → A9 从 #DIV/0! 变 0.25，跨表链跟着变
+    for (step, v) in [4.0f64, 8.0, 0.0].into_iter().enumerate() {
+        wb.sheets[1].set(0, 1, Cell { value: Value::Number(v), formula: None });
+        let deps = formula::deps::Deps::build(&wb);
+        let n = formula::recalc_dirty(&mut wb, &deps, &[(1, 0, 1)]);
+        // 依赖锥就是 数据!A9 + 汇总!A1..D1 这 5 格；精确值比「小于总数」更能说明范围
+        assert_eq!(n, 5, "第 {step} 步的脏集合不对（总公式 {total} 格），说明不是局部路径");
+        let mut clone = wb.clone();
+        formula::recalc_all(&mut clone);
+        assert_eq!(snapshot(&clone), snapshot(&wb), "第 {step} 步局部与全量不一致");
+    }
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Error(ErrKind::Div0), "B1=0 时应回到 #DIV/0!");
+}
+
+#[test]
+fn a_local_recalc_does_not_touch_an_unrelated_cached_cell() {
+    let mut wb = error_book();
+    // Z31 = 1+1，但缓存被故意写成 999：局部路径不该碰它，全量回退会把它改回 2
+    wb.sheets[0].set(30, 25, Cell { value: Value::Number(999.0), formula: Some("=1+1".into()) });
+    wb.sheets[1].set(0, 1, Cell { value: Value::Number(4.0), formula: None });
+    let deps = formula::deps::Deps::build(&wb);
+    let n = formula::recalc_dirty(&mut wb, &deps, &[(1, 0, 1)]);
+    assert_eq!(n, 5, "脏集合应为 5 格");
+    assert_eq!(
+        wb.sheets[0].value(30, 25),
+        Value::Number(999.0),
+        "无关格的缓存被重算成 2 = 实际走了全量"
+    );
+    assert_eq!(wb.sheets[1].value(8, 0), Value::Number(0.25), "范围内的依赖没更新");
+}
+
+#[test]
+fn fixing_the_error_source_clears_dependents_incrementally() {
+    let mut wb = error_book();
+    assert_eq!(wb.sheets[1].value(8, 0), Value::Error(ErrKind::Div0));
+    wb.sheets[1].set(0, 1, Cell { value: Value::Number(4.0), formula: None });
+    let deps = formula::deps::Deps::build(&wb);
+    let n = formula::recalc_dirty(&mut wb, &deps, &[(1, 0, 1)]);
+    assert!(n < total_formulas(&wb), "走了全量回退");
+    assert_eq!(wb.sheets[1].value(8, 0), Value::Number(0.25));
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Number(0.25));
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Text("0.25x".into()));
+    assert_eq!(wb.sheets[0].value(3, 0), Value::Number(2.25));
+}
+
+// -------------------------------------------------------------------- SPILL 单独验
+//
+// 有溢出时 `recalc_dirty` 会整本回退全算（返回总公式数）。这条路径单独测，
+// 不混进上面的局部矩阵，也不假装它是增量。
+
+#[test]
+fn a_blocked_spill_reports_spill_and_recovers_after_the_blocker_is_removed() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(8, 0, Cell { value: Value::Empty, formula: Some("=SEQUENCE(2,1)".into()) });
+    wb.sheets[0].set(9, 0, Cell { value: Value::Number(7.0), formula: None }); // A10 真占用
+    formula::recalc_all(&mut wb);
+    assert_eq!(
+        wb.sheets[0].value(8, 0),
+        Value::Error(ErrKind::Spill),
+        "A10 被占时 A9 应是 #SPILL!，实际 {:?}",
+        wb.sheets[0].value(8, 0)
+    );
+    assert_eq!(wb.sheets[0].value(9, 0), Value::Number(7.0), "占用格不能被溢出覆盖");
+
+    // 删掉障碍，再算：锚点与子格都要回来
+    wb.sheets[0].set(9, 0, Cell::default());
+    let deps = formula::deps::Deps::build(&wb);
+    let n = formula::recalc_dirty(&mut wb, &deps, &[(0, 9, 0)]);
+    assert_eq!(n, total_formulas(&wb), "有溢出时按预期走全量回退，返回的是总公式数");
+    assert_eq!(wb.sheets[0].value(8, 0), Value::Number(1.0), "锚点没恢复");
+    assert_eq!(wb.sheets[0].value(9, 0), Value::Number(2.0), "溢出子格没恢复");
+    let mut clone = wb.clone();
+    formula::recalc_all(&mut clone);
+    assert_eq!(snapshot(&clone), snapshot(&wb), "溢出恢复后与全量重算逐格不一致");
 }

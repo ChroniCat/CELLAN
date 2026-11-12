@@ -2120,3 +2120,29 @@ fn pasting_an_excel_error_cell_keeps_it_an_error_value() {
     // kind=1（文本）的 "#DIV/0!" 仍然是文本
     assert_eq!(app.wb.sheets[0].value(3, 2), Value::Text("#DIV/0!".into()));
 }
+
+#[test]
+fn app_undo_restores_an_error_cell_after_a_real_edit() {
+    // 走 App 自己的事务与撤销栈（不是直接操作 core 的 UndoStack）
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, Cell {
+        value: Value::Error(sheetcore::formula::ErrKind::Div0),
+        formula: Some("=1/0".into()),
+    });
+    app.sel = (0, 0);
+    let before = app.txn_begin(&[(0, 0)]);
+    app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    app.txn_end("输入", before);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(1.0));
+
+    app.do_undo(false);
+    assert_eq!(
+        app.wb.sheets[0].value(0, 0),
+        Value::Error(sheetcore::formula::ErrKind::Div0),
+        "撤销后错误值没回来"
+    );
+    assert_eq!(app.wb.sheets[0].get(0, 0).unwrap().formula.as_deref(), Some("=1/0"));
+
+    app.do_undo(true);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(1.0), "重做没生效");
+}
