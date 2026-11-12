@@ -523,9 +523,9 @@
             <button id="RemoveArrows" label="移去箭头" imageMso="Eraser" screentip="清除追踪线" onAction="RemoveArrows" sizeString="132"/>
           </box>
           <box boxStyle="vertical">
-            <toggleButton id="ShowFormulas" label="显示公式" imageMso="Fx" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96"/>
-            <button id="ErrorChecking" label="错误检查" imageMso="Eraser" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
-            <button id="WatchWindow" label="监视窗口" imageMso="Grid" onAction="WatchWindow" sizeString="96"/>
+            <toggleButton id="ShowFormulas" label="显示公式" imageMso="FormulaView" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96"/>
+            <button id="ErrorChecking" label="错误检查" imageMso="ErrorCheck" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
+            <button id="WatchWindow" label="监视窗口" imageMso="WatchPane" onAction="WatchWindow" sizeString="96"/>
           </box>
         </group>
         <group id="GroupCalculation" label="计算">
@@ -537,7 +537,7 @@
           <button id="CalculateSheet" label="计算工作表" imageMso="Calc" onAction="CalculateSheet" sizeString="96"/>
         </group>
         <group id="GroupNames" label="名称">
-          <button id="NameManager" label="名称管理器" size="large" imageMso="Table" onAction="NameManager"/>
+          <button id="NameManager" label="名称管理器" size="large" imageMso="NameTag" onAction="NameManager"/>
         </group>
         <group id="GroupArea" label="区域">
           <box boxStyle="vertical">

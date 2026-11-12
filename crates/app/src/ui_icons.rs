@@ -90,6 +90,10 @@ pub enum Icon {
     Pin,
     NewView,
     ZoomSelection,
+    FormulaView,
+    ErrorCheck,
+    NameTag,
+    WatchPane,
     Freeze,
     FreezeRow,
     FreezeCol,
@@ -946,6 +950,35 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
             pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
             pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+        }
+        FormulaView => {
+            // 显示公式：小网格 + fx
+            pen.rrs(2.8, 4.0, 18.4, 14.0, 0.6, WHITE, INK, 1.15);
+            pen.bar(3.0, 8.4, 18.0, 0.9, Color32::from_rgb(191, 191, 191));
+            pen.bar(9.4, 4.2, 0.9, 13.6, Color32::from_rgb(191, 191, 191));
+            pen.text("fx", 15.4, 14.6, 8.0, Color32::from_rgb(33, 115, 70));
+        }
+        ErrorCheck => {
+            // 错误检查：格子右上角红三角 + 一个对勾
+            pen.rrs(3.0, 4.0, 12.6, 11.0, 0.5, WHITE, INK, 1.15);
+            pen.poly(&[(15.6, 4.0), (15.6, 9.4), (10.4, 4.0)], Color32::from_rgb(192, 0, 0), Color32::from_rgb(192, 0, 0), 0.0);
+            pen.polyline(&[(10.6, 17.0), (13.4, 20.2), (20.4, 12.0)], 2.0, Color32::from_rgb(33, 115, 70));
+        }
+        NameTag => {
+            // 名称管理器：吊牌 + 三条线
+            pen.poly(&[(3.4, 8.0), (12.0, 4.4), (20.6, 8.0), (20.6, 16.6), (12.0, 20.2), (3.4, 16.6)], WHITE, INK, 1.15);
+            pen.dot(7.4, 9.2, 1.2, INK);
+            pen.bar(10.4, 8.6, 7.0, 1.0, GRAY_D);
+            pen.bar(10.4, 11.4, 7.0, 1.0, GRAY_D);
+            pen.bar(10.4, 14.2, 4.6, 1.0, GRAY_D);
+        }
+        WatchPane => {
+            // 监视窗口：小表 + 眼睛
+            pen.rrs(2.6, 3.4, 12.6, 10.0, 0.5, WHITE, INK, 1.1);
+            pen.bar(2.8, 6.4, 12.2, 0.9, GRAY_D);
+            pen.bar(7.6, 3.6, 0.9, 9.6, GRAY_D);
+            pen.ring(16.6, 16.2, 3.4, 1.3, INK);
+            pen.dot(16.6, 16.2, 1.2, INK);
         }
         Eye => {
             // 眼睛：上下两条弧 + 瞳孔
