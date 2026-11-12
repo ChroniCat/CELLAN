@@ -2420,3 +2420,25 @@ fn rescue_save_started_before_switching_tabs_clears_diag_when_it_finishes() {
     wait_save(&mut app);
     drop(env);
 }
+
+#[test]
+fn csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_source() {
+    let env = crate::test_env::TestEnv::new("c09_app_import");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let csv = env.path("a.csv");
+    std::fs::write(&csv, "\"line1\nline2\",B\nC,D\n").unwrap();
+    app.import_csv_from(&csv);
+
+    let sh = app.wb.sheet(app.sheet_idx);
+    let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
+        Some(sheetcore::model::Value::Text(t)) => t.to_string(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(val(0, 0), "line1\nline2", "应用导入路径也必须保留字段内换行");
+    assert_eq!(val(1, 1), "D");
+    let src = app.wb.sources.iter().find(|s| s.name.starts_with("_sc_src_")).expect("应登记数据源");
+    assert_eq!((src.rows, src.cols), (2, 2));
+    assert!(app.undo.undo_label().map(|l| l.contains("导入 CSV")).unwrap_or(false), "导入应可一步撤销");
+    drop(env);
+}

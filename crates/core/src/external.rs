@@ -17,6 +17,15 @@ pub enum Kind {
     Internal { sheet: String, rect: (u32, u32, u32, u32) },
 }
 
+/// CSV 的持久化配置：编码与“按文本保留”的列（00123、18 位账号）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CsvOpts {
+    /// None = 自动（BOM → UTF-8 → GB18030）
+    pub encoding: Option<crate::csv::Encoding>,
+    /// 这些列一律按文本写入，不自动转数字
+    pub text_cols: Vec<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Source {
     pub name: String,
@@ -26,6 +35,8 @@ pub struct Source {
     /// 上次刷新写出的行列数
     pub rows: u32,
     pub cols: u32,
+    /// 仅 CSV 有效；老工作簿里没有这一段时按自动处理
+    pub csv_opts: Option<CsvOpts>,
 }
 
 impl Source {
@@ -35,16 +46,27 @@ impl Source {
     /// SHEET|表名|r1,c1,r2,c2|行|列|上次行数|上次列数
     pub fn to_name_text(&self) -> String {
         match &self.kind {
-            Kind::Csv { path, delim, header } => format!(
-                "\"CSV|{}|{}|{}|{}|{}|{}|{}\"",
-                path.replace('"', "\"\""),
-                delim,
-                if *header { 1 } else { 0 },
-                self.at.0,
-                self.at.1,
-                self.rows,
-                self.cols
-            ),
+            Kind::Csv { path, delim, header } => {
+                let (enc, cols) = match &self.csv_opts {
+                    Some(o) => (
+                        o.encoding.map(|e| e.id()).unwrap_or("auto").to_string(),
+                        o.text_cols.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
+                    ),
+                    None => ("auto".to_string(), String::new()),
+                };
+                format!(
+                    "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
+                    path.replace('"', "\"\""),
+                    delim,
+                    if *header { 1 } else { 0 },
+                    self.at.0,
+                    self.at.1,
+                    self.rows,
+                    self.cols,
+                    enc,
+                    cols
+                )
+            }
             Kind::Internal { sheet, rect } => format!(
                 "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}\"",
                 sheet.replace('"', "\"\""),
@@ -84,12 +106,27 @@ impl Source {
             }
             _ => return None,
         };
+        let csv_opts = if matches!(kind, Kind::Csv { .. }) {
+            let enc = f.get(8).and_then(|x| crate::csv::Encoding::from_id(x));
+            let cols: Vec<u32> = f
+                .get(9)
+                .map(|x| x.split(',').filter_map(|c| c.trim().parse().ok()).collect())
+                .unwrap_or_default();
+            if enc.is_some() || !cols.is_empty() {
+                Some(CsvOpts { encoding: enc, text_cols: cols })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Some(Source {
             name: name.to_string(),
             kind,
             at: (num(4), num(5)),
             rows: num(6),
             cols: num(7),
+            csv_opts,
         })
     }
 }
@@ -642,24 +679,70 @@ pub fn import_csv(
     header: bool,
     at: (u32, u32),
 ) -> std::io::Result<(u32, u32)> {
-    let text = std::fs::read_to_string(path)?;
-    let mut rows = 0u32;
-    let mut cols = 0u32;
-    for (ri, line) in text.lines().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = split_line(line, delim);
-        cols = cols.max(fields.len() as u32);
-        for (ci, f) in fields.iter().enumerate() {
+    import_csv_with(sheet, path, delim, header, None, &[], (0, 0), at)
+}
+
+/// 与首次导入共用的实现：解码（BOM/UTF-16/GB18030）→ 记录解析（引号内换行不拆行）
+/// → 按列类型转值 → 一次性写目标区域。
+///
+/// `old` 是上次刷新的行列数：新数据更小时要把多出来的旧格清掉，
+/// 但只清"上一次自己写的区域"，不碰旁边的用户数据。
+pub fn import_csv_with(
+    sheet: &mut Sheet,
+    path: &str,
+    delim: char,
+    header: bool,
+    encoding: Option<crate::csv::Encoding>,
+    text_cols: &[u32],
+    old: (u32, u32),
+    at: (u32, u32),
+) -> std::io::Result<(u32, u32)> {
+    let bytes = std::fs::read(path)?;
+    let (text, _enc, had_errors) = crate::csv::decode(&bytes, encoding);
+    if had_errors {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CSV 编码无法完整解码（文件可能不是声明的编码）",
+        ));
+    }
+    let records = crate::csv::records(&text, delim);
+    let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(records.len());
+    for (ri, rec) in records.iter().enumerate() {
+        let mut row = Vec::with_capacity(rec.len());
+        for (ci, f) in rec.iter().enumerate() {
             let cell = if header && ri == 0 {
                 Cell { value: Value::Text(f.as_str().into()), formula: None }
+            } else if text_cols.contains(&(ci as u32)) {
+                if f.is_empty() {
+                    Cell::default()
+                } else {
+                    Cell { value: Value::Text(f.as_str().into()), formula: None }
+                }
             } else {
                 parse_field(f)
             };
-            sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
+            row.push(cell);
         }
-        rows = ri as u32 + 1;
+        grid.push(row);
+    }
+    let rows = grid.len() as u32;
+    let cols = grid.iter().map(|r| r.len() as u32).max().unwrap_or(0);
+    // 旧区域里超出新数据的部分要清掉（只清自己上次写的那块）
+    for r in 0..old.0 {
+        for c in 0..old.1 {
+            if r >= rows || c >= cols {
+                sheet.set(at.0 + r, at.1 + c, Cell::default());
+            }
+        }
+    }
+    for (ri, row) in grid.into_iter().enumerate() {
+        for (ci, cell) in row.into_iter().enumerate() {
+            if !matches!(cell.value, Value::Empty) {
+                sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
+            } else if (ri as u32) < old.0 && (ci as u32) < old.1 {
+                sheet.set(at.0 + ri as u32, at.1 + ci as u32, Cell::default());
+            }
+        }
     }
     Ok((rows, cols))
 }
@@ -715,7 +798,20 @@ pub fn refresh(wb: &mut crate::model::Workbook, sheet_idx: usize, src: &Source) 
     match &src.kind {
         Kind::Csv { path, delim, header } => {
             let real = resolve_path(wb, path);
-            import_csv(&mut wb.sheets[sheet_idx], &real.to_string_lossy(), *delim, *header, src.at)
+            let (enc, cols) = match &src.csv_opts {
+                Some(o) => (o.encoding, o.text_cols.as_slice()),
+                None => (None, &[][..]),
+            };
+            import_csv_with(
+                &mut wb.sheets[sheet_idx],
+                &real.to_string_lossy(),
+                *delim,
+                *header,
+                enc,
+                cols,
+                (src.rows, src.cols),
+                src.at,
+            )
         }
         Kind::Internal { sheet, rect } => {
             let Some(si) = wb.sheets.iter().position(|s| &s.name == sheet) else {

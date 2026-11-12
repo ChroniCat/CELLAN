@@ -107,3 +107,78 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 }
+
+/// CSV 文本编码。BOM 优先，其次按 UTF-8 严格解码，失败再按 GB18030。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Encoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Gb18030,
+}
+
+impl Encoding {
+    pub fn id(self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "utf-8",
+            Encoding::Utf16Le => "utf-16le",
+            Encoding::Utf16Be => "utf-16be",
+            Encoding::Gb18030 => "gb18030",
+        }
+    }
+    pub fn from_id(s: &str) -> Option<Encoding> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" | "utf-8" | "utf8" => Some(Encoding::Utf8),
+            "utf-16le" | "utf-16" => Some(Encoding::Utf16Le),
+            "utf-16be" => Some(Encoding::Utf16Be),
+            "gb18030" | "gbk" | "gb2312" => Some(Encoding::Gb18030),
+            _ => None,
+        }
+    }
+}
+
+/// 解码 CSV 字节流，返回文本与最终采用的编码。
+/// 显式传入的 `wanted` 优先；`None`/`auto` 时按 BOM → UTF-8 → GB18030 探测。
+/// 有损解码会返回 `had_errors`，调用方可以据此提示（但不静默丢内容）。
+pub fn decode(bytes: &[u8], wanted: Option<Encoding>) -> (String, Encoding, bool) {
+    let bom_enc = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Some(Encoding::Utf8)
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Some(Encoding::Utf16Le)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Some(Encoding::Utf16Be)
+    } else {
+        None
+    };
+    let enc = wanted.filter(|e| *e != Encoding::Utf8).or(bom_enc).unwrap_or(Encoding::Utf8);
+    match enc {
+        Encoding::Utf16Le => {
+            let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
+            (cow.into_owned(), Encoding::Utf16Le, bad)
+        }
+        Encoding::Utf16Be => {
+            let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
+            (cow.into_owned(), Encoding::Utf16Be, bad)
+        }
+        Encoding::Gb18030 => {
+            let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+            (cow.into_owned(), Encoding::Gb18030, bad)
+        }
+        Encoding::Utf8 => match std::str::from_utf8(bytes) {
+            Ok(t) => (t.trim_start_matches('\u{feff}').to_string(), Encoding::Utf8, false),
+            Err(_) => {
+                // 不是合法 UTF-8 又没有 BOM：按中文环境最常见的 GB18030 解
+                let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+                (cow.into_owned(), Encoding::Gb18030, bad)
+            }
+        },
+    }
+}
+
+/// 记录模式：跳过完全空行，但**保留**字段内的换行与引号。
+pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
+    parse(text, delim)
+        .into_iter()
+        .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
+        .collect()
+}

@@ -46,6 +46,7 @@ fn refresh_picks_up_file_changes() {
         at: (0, 0),
         rows: 0,
         cols: 0,
+    csv_opts: None,
     };
     external::refresh(&mut wb, 0, &src).unwrap();
     assert_eq!(wb.sheets[0].get(1, 0).unwrap().value.display(), "1");
@@ -72,6 +73,7 @@ fn cross_sheet_copy() {
         at: (2, 2),
         rows: 0,
         cols: 0,
+    csv_opts: None,
     };
     external::refresh(&mut wb, 1, &src).unwrap();
     assert_eq!(wb.sheets[1].get(2, 2).unwrap().value.display(), "甲");
@@ -92,6 +94,7 @@ fn cross_sheet_writes_linked_formula() {
         at: (0, 0),
         rows: 0,
         cols: 0,
+    csv_opts: None,
     };
     external::refresh(&mut wb, 1, &src).unwrap();
     let cell = wb.sheets[1].get(0, 0).unwrap();
@@ -121,6 +124,7 @@ fn relative_csv_path_resolves_next_to_workbook() {
         at: (0, 0),
         rows: 0,
         cols: 0,
+    csv_opts: None,
     });
     let src0 = wb.sources[0].clone();
     external::refresh(&mut wb, 0, &src0).unwrap();
@@ -143,6 +147,7 @@ fn source_survives_save_and_load() {
         at: (0, 0),
         rows: 2,
         cols: 2,
+    csv_opts: None,
     });
     wb.dirty = true;
     sheetcore::xlsx::save(&out, &wb).expect("保存");

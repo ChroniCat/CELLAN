@@ -1,0 +1,72 @@
+C09：首次导入与刷新共用同一解析 / 编码 / 列类型模型
+====================================================
+
+原始缺陷（core-requirements.md C09）
+-----------------------------------
+- 首次导入走 `csv::parse_auto`，刷新走 `external::import_csv` 的
+  `text.lines()` + `split_line`：字段里带换行的 CSV（`"line1\nline2"`）被拆成多条记录，
+  应 2 行的文件变 3 行。已实测计数 `(3,2)` vs 期望 `(2,2)`。
+- 刷新只 `read_to_string`（UTF-8），UTF-16/GB18030 直接失败或乱码。
+- 刷新对所有列自动转数字，`00123` 变 123、18 位账号变浮点。
+- 刷新先写后判错：源损坏时可能已清掉旧值。
+
+修改
+----
+1. `crates/core/src/csv.rs`
+   - 新增 `Encoding`（Utf8 / Utf16Le / Utf16Be / Gb18030）与 `id()/from_id()`。
+   - `decode(bytes, wanted)`：BOM → 显式编码 → 严格 UTF-8 → GB18030 探测；
+     有损解码返回 `had_errors`，调用方报错而不是吞。
+   - `records(text, delim)`：复用原有引号/逗号状态机，只跳过真正的空行。
+2. `crates/core/src/external.rs`
+   - `Source` 增加 `csv_opts: Option<CsvOpts>`（编码 + 文本列），
+     在自定义名称文本尾部追加 `|enc|cols`，旧文件（无尾段）按自动处理。
+   - 新增 `import_csv_with(sheet, path, delim, header, encoding, text_cols, old, at)`：
+     读字节 → 解码 → 记录解析 → 按列类型生成 `Cell`（文本列逐字保留）→
+     先构建完整网格，再一次性写入。
+   - 旧区域超出新数据的部分按 `old=(rows,cols)` 清理，只清自己上次写过的块。
+   - `refresh` 的 CSV 分支改用 `import_csv_with`，传入持久化配置与旧尺寸；
+     `import_csv` 保留为 `import_csv_with(..., None, &[], (0,0), at)` 的包装。
+3. `crates/app/src/main.rs::import_csv_from`
+   - 不再 `String::from_utf8_lossy` + `parse_auto`，改为与刷新同一个
+     `decode` + `import_csv_with`；失败时按快照还原并提示，不写入脏数据。
+   - 数据源登记带上 `CsvOpts::default()`，刷新与首次导入配置同源。
+
+测试（`crates/core/tests/csv_import.rs`，**6 passed / 0 failed**）
+----------------------------------------------------------------
+| 用例 | 断言 |
+|---|---|
+| `newline_inside_quotes_is_one_field_for_import_and_refresh` | 2 行 2 列；`line1\nline2` 是一个字段；刷新结果逐格一致 |
+| `decodes_bom_utf16_and_gb18030` | UTF-8 BOM / UTF-16LE BOM / GB18030 中文都能读 |
+| `text_columns_keep_leading_zeros_and_long_accounts` | 文本列的 `00123`、18 位账号逐字保留；未标记列仍按数字（兼容 v1） |
+| `decode_failure_keeps_previous_data` | 坏 UTF-16 报错且旧值仍在 |
+| `shrinking_refresh_clears_only_its_own_old_region` | 新数据变小时清掉旧块，旁边的用户格不动 |
+| `csv_options_survive_save_and_reload` | 编码/文本列随 xlsx 保存重开仍在 |
+
+应用层用例（`crates/app/src/edit_regression_tests.rs`，**1 passed**）
+-------------------------------------------------------------------
+`csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_source`：
+走真实 `import_csv_from` 入口，断言字段内换行保留、登记 `_sc_src_*` 且尺寸 2×2、
+撤销栈有「导入 CSV」一步。
+
+RED / 变异证据
+-------------
+- 变异 M1：把 `records(&text, delim)` 换回 `text.lines().map(split_line)`
+  → `newline_inside_quotes...` 失败，`left: (3, 2) right: (2, 2)`，正是审计描述的症状；已还原。
+
+未执行 / 待补（不写成通过）
+--------------------------
+- 编码与列类型的**预览对话框**未实现：当前用自动探测 + 代码可指定文本列，
+  界面上还不能在导入前选编码/列类型。
+- 首次导入的列宽/日期/布尔推断与 Excel 编码向导的三方对拍未做。
+- 刷新「成功一步撤销」在应用层由现有 `txn_end("导入 CSV")` 覆盖；
+  刷新入口（`refresh` 命令）是否复用同一 undo 步骤尚未单独取证。
+- WPS/Excel 打开刷新后的数据一致性未对拍。
+
+运行命令
+-------
+```
+cargo test -p sheetcore --offline --test csv_import           # 6 passed
+cargo test -p sheetcore --offline --test external_data        # 7 passed
+cargo test -p sheetcore --offline --test custom_props         # 10 passed / 2 ignored
+cargo test -p app --no-default-features --features glow --offline --bin app -- csv_import_from_the_app
+```

@@ -15,6 +15,7 @@ fn src(i: u32, path: &str) -> Source {
         at: (0, 0),
         rows: 2,
         cols: 2,
+        csv_opts: None,
     }
 }
 

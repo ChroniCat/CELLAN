@@ -4706,26 +4706,28 @@ impl SheetApp {
     }
 
     fn import_csv_from(&mut self, path: &std::path::Path) {
-        let text = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        // 先用和刷新完全相同的解码器读一遍：只为探测分隔符与行列数
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
             Err(e) => {
                 self.status = format!("读不了 {}：{e}", path.display());
                 return;
             }
         };
-        // 分隔符要记下来：查询表连接里写错分隔符，Excel 刷新会读成一整列
+        let (text, _enc, _bad) = sheetcore::csv::decode(&bytes, None);
         let first = text.lines().next().unwrap_or("");
         let tabs = first.matches('\t').count();
         let commas = first.matches(',').count();
         let delim = if tabs > commas { '\t' } else { ',' };
-        let rows = sheetcore::csv::parse_auto(&text);
-        if rows.is_empty() {
+        let (r0, c0) = self.sel;
+        // 解析到临时网格并一次性写入；失败时旧值不动
+        let probe = sheetcore::csv::records(&text, delim);
+        if probe.is_empty() {
             self.status = "这个文件里没有可导入的内容".into();
             return;
         }
-        let (r0, c0) = self.sel;
-        let max_r = rows.len() as u32;
-        let max_c = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
+        let max_r = probe.len() as u32;
+        let max_c = probe.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
         let mut keys: Vec<(u32, u32)> = Vec::new();
         for r in 0..max_r {
             for c in 0..max_c {
@@ -4733,27 +4735,30 @@ impl SheetApp {
             }
         }
         let txn = self.txn_begin(&keys);
-        for (i, row) in rows.iter().enumerate() {
-            for (j, val) in row.iter().enumerate() {
-                let cell = if val.is_empty() {
-                    sheetcore::model::Cell {
-                        value: sheetcore::model::Value::Empty,
-                        formula: None,
-                    }
-                } else {
-                    sheetcore::model::Cell {
-                        value: sheetcore::model::Value::parse_input(val),
-                        formula: None,
-                    }
-                };
-                self.wb.sheet_mut(self.sheet_idx).set(r0 + i as u32, c0 + j as u32, cell);
+        let size = match sheetcore::external::import_csv_with(
+            self.wb.sheet_mut(self.sheet_idx),
+            &path.to_string_lossy(),
+            delim,
+            false,
+            None,
+            &[],
+            (0, 0),
+            (r0, c0),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // 解码/读取失败发生在任何写入之前，这里只是把已捕获的快照还原干净
+                for d in &txn {
+                    self.wb.sheet_mut(self.sheet_idx).set(d.row, d.col, d.before.clone());
+                }
+                self.status = format!("导入 CSV 失败：{e}");
+                return;
             }
-        }
+        };
         self.txn_end("导入 CSV", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         // 登记成数据源：换台机器/重开文件还能刷新
-        let size = (rows.len() as u32, max_c);
         let stored_path = sheetcore::external::store_path(&self.wb, path);
         let key = (stored_path.clone(), r0, c0);
         let existing = self.wb.sources.iter_mut().find(|src| match &src.kind {
@@ -4773,11 +4778,13 @@ impl SheetApp {
             at: (r0, c0),
             rows: size.0,
             cols: size.1,
+            csv_opts: Some(sheetcore::external::CsvOpts::default()),
         };
         match existing {
             Some(slot) => {
                 slot.rows = size.0;
                 slot.cols = size.1;
+                slot.csv_opts = src.csv_opts.clone();
             }
             None => {
                 let n = self.wb.sources.len() + 1;
@@ -4786,13 +4793,7 @@ impl SheetApp {
                 self.wb.sources.push(src);
             }
         }
-        self.last_import = Some((path.to_path_buf(), r0, c0));
-        self.status = format!(
-            "已导入 {} 行 × {} 列（{}）",
-            rows.len(),
-            max_c,
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        self.status = format!("已导入 {}（{} 行 × {} 列）", path.display(), size.0, size.1);
     }
 
     /// 刷新数据：优先按登记过的数据源重读，没有就退回"上次导入"
@@ -13088,6 +13089,7 @@ impl SheetApp {
                         at,
                         rows: 0,
                         cols: 0,
+                        csv_opts: None,
                     };
                     let idx = self.sheet_idx;
                     match sheetcore::external::refresh(&mut self.wb, idx, &src) {

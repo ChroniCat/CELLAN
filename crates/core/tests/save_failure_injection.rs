@@ -174,6 +174,7 @@ fn injected_failures_in_conditional_steps_abort_the_save() {
         at: (4, 0),
         rows: 2,
         cols: 2,
+    csv_opts: None,
     });
     wb.links.push(sheetcore::xlinks::ExternalBook {
         index: 1,
