@@ -1,13 +1,30 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `9534cb7`（C09/C14 round3/UI-03 已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 7 待验收 / 48 待实施；
-  切片 17 已验收 / 15 待验收 / 116 待实施。
+- 分支 `main`（`origin/main`），HEAD `eccadf6`（UI-03 已推送）+ 本轮未提交改动。
+- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 5 待验收 / 47 待实施；
+  切片 26 已验收 / 7 待验收 / 115 待实施。
 - 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
-  app 155 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  app 159 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
   app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
   `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。
+
+## 本轮：C09/C14 收尾 + UI-04 清除命令（C09/C14/C04 已验收；UI-04 待验收）
+
+- C09：证据文档重写（当前结论在前，首版 RED 标注历史），台账改已验收；
+  明确未做系统键鼠点选，round33 日志汇总与进程退出码分开记录。
+- C14：补齐三项原登记边界：
+  1) 真实 Excel 16.0 保存的 BIFF 夹具（tests/fixtures/real_excel.xls，SHA 7d5213…），
+     LAST_LOAD_KIND 断言走 calamine、不跑 OOXML；
+  2) SC_SIDE_PANIC 旁路线程 panic → fatal 诊断 + incomplete + 拒绝覆盖 + SHA 不变；
+  3) SC_LOAD_WORKER_PANIC 主线程 panic → app catch_unwind → Failed 状态 + 原文件不动。
+  c14_guard 16 passed；M1/M2 变异均被抓。台账改已验收。
+- C04：按 04:49 复核意见整理台账为已验收，不再挂过期待办。
+- UI-04：ClearPart::{Contents,Formats,All} + clear_rects 统一事务/重算/广播/撤销；
+  Ribbon 清除菜单三项分别接 clear_all / clear_formats / clear_values；
+  Delete 与右键走同一命令；deps 空时先构建再重算。
+  3 个新用例 + 3 个变异全过；app 159 passed；GUI 12/8。
+- 未执行：Ribbon/右键真实键鼠点击、第二客户端广播观察、关闭窗口 dirty 提示流程。
 
 ## 本轮：UI-03 统一写入门禁（待验收）
 

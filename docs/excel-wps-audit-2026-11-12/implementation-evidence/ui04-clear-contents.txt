@@ -1,0 +1,40 @@
+UI-04 统一清除操作的重算、撤销与广播 —— 验收证据
+日期：2026-11-13（Rust/eframe 原生 app；app bin 集成测试）
+
+一、统一命令
+ClearPart::{Contents, Formats, All} → clear_rects(part)：
+  1) sel_rects() 收集主选区 + 所有 extra_sel 非连续矩形；
+  2) keys 排序去重；write_preflight 一次判断保护/锁/后台依赖，失败整批不执行；
+  3) 单个 txn 覆盖全部 keys：Contents 只清值，Formats 只 set_style(0)，All 两者都做；
+  4) txn_end 记录一次撤销 + 修订；dirty/doc_gen 各加一次；
+  5) Contents/All 调 recalc_and_broadcast（deps 空时先 Deps::build），
+     依赖更新 + recalc_dirty + 逐格广播；Formats 走 net.broadcast_style。
+入口：Ribbon 清除菜单三项（全部清除→clear_all、清除格式→clear_formats、
+清除内容→ClearValues→clear_values）；右键“清除内容”；Delete/Backspace；多选清除。
+
+二、按验收场景的用例
+1) clear_contents_recalcs_dependents_and_one_undo_restores_all
+   A1=1、A2=2、B1=A1*10、B2=A2*10；选 A1:A2 清除后 B1/B2 立即为 0；
+   wb.dirty=true；undo 深度正好 1；Ctrl+Z 后 A1/A2/B1/B2 全部恢复（10/20）。
+2) clear_multi_select_does_not_touch_the_gap
+   主选 A1 + extra_sel A3 → A1、A3 清空，A2 仍为 2（不漏、不误清）。
+3) clear_formats_and_clear_all_are_distinct_and_undoable
+   清格式保留 A1=5 且样式号回 0，撤销恢复样式；
+   清全部同时清值与样式，单次撤销把两者一起带回。
+
+三、命令与结果
+cargo test -p app --no-default-features --features glow --offline --bin app -- clear_
+  → 6 passed / 0 failed（3 项 UI-04 + 3 项历史 clear 用例）
+app 全量：APP_EXIT=0，159 passed / 0 failed / 0 ignored（1.85s）
+GUI：GUI_EXIT=0，12 passed / 0 failed / 8 ignored
+
+四、变异验证
+M1 去掉 recalc_and_broadcast 调用 → clear_contents_recalcs… 失败（B 仍为旧值）。
+M2 rects 只用 sel_rect()、忽略 extra_sel → clear_multi_select… 失败（A1 未清）。
+M3 清格式分支也清内容 → clear_formats_and_clear_all… 失败。
+三次均先备份 main.rs，跑完还原；还原后 6 passed。
+
+五、未执行 / 边界
+- 真实 GUI 键鼠点击 Ribbon 清除菜单三项、右键清除内容未做；当前为命令函数级 + 全量 GUI 回归。
+- 第二客户端真实网络广播未观察；本轮验证的是同一 recalc_and_broadcast/broadcast_style 代码路径。
+- “保存关闭必须提示 dirty”：断言了 wb.dirty=true，未走真实关闭窗口的提示框流程。

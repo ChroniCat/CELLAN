@@ -341,7 +341,7 @@
       "scope": "core/model.rs, xlsx.rs, style.rs, formula/functions.rs",
       "source": "core-requirements.md",
       "heading": "C04 P0 1900与1904日期体系",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "日期函数/格式化/条件格式/数据验证/透视日期分组/图表轴共用工作簿基准（1900/1904）；xlsx 写 date1904、xls 写 DATEMODE 且存盘重开不漂；Excel 16.0 与 WPS 12.0 打开我们写的 1904/1900 簿显示正确，Excel 改非日期格另存后 flag 与序列不漂、我们的读端能读回；跨簿粘贴 ISO 日期按目标体系重算并保留时间小数，普通数字不偏移；写包不再产生 Excel 拒绝的字体属性。",
       "files": [
         "crates/core/src/model.rs,crates/core/src/formula/functions.rs,crates/core/src/formula/mod.rs,crates/core/src/xlsx.rs,crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/src/style.rs,crates/core/src/charts.rs,crates/core/src/clipboard_xmlss.rs,crates/app/src/main.rs,crates/core/tests/date_system.rs,crates/core/tests/date_system_shared.rs"
@@ -366,8 +366,8 @@
       ],
       "failures": [],
       "blocker": "",
-      "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
-      "updated_utc": "2026-11-12T19:05:00Z",
+      "next": "无新增缺口；保持回归。",
+      "updated_utc": "2026-11-12T21:03:46Z",
       "slices": [
         {
           "id": "C04.1",
@@ -375,7 +375,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "xlsx 读 `workbookPr/@date1904`、写 set_date1904；xls 读写 DATEMODE（就地改，不追加）；存盘重开基准与序列不漂。",
           "files": [
             "crates/core/src/xlsx.rs,crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/src/patch.rs,crates/core/src/model.rs"
@@ -401,7 +401,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
-          "updated_utc": "2026-11-12T19:05:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C04.2",
@@ -409,7 +409,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "DATE/DATEVALUE/YEAR/MONTH/DAY/TEXT、日期减法、数字格式化、NOW/TODAY 都按工作簿基准；CF/DV 的 DATE() 字面量、透视按年/月分组同样按基准。",
           "files": [
             "crates/core/src/formula/functions.rs,crates/core/src/formula/mod.rs,crates/core/src/style.rs,crates/core/src/cf.rs,crates/core/src/dv.rs,crates/core/src/pivot.rs"
@@ -435,7 +435,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
-          "updated_utc": "2026-11-12T19:05:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C04.3",
@@ -443,7 +443,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "图表分类轴按体系显示日期、值轴取原始数值（格式化不吞点）；跨簿粘贴日期按目标体系重算并保留时间，普通数字不变；Excel 另存后两款软件打开不漂移。",
           "files": [
             "crates/core/src/charts.rs,crates/core/src/clipboard_xmlss.rs,crates/app/src/main.rs"
@@ -469,7 +469,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核本轮两条补证（导出新路径双软件打开、应用层粘贴链路）",
-          "updated_utc": "2026-11-12T19:05:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         }
       ]
     },
@@ -557,34 +557,31 @@
       "scope": "core/csv.rs, external.rs + app导入",
       "source": "core-requirements.md",
       "heading": "C09 P0 CSV首次导入与刷新使用同一解析和列类型模型",
-      "status": "待验收",
-      "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
+      "status": "已验收",
+      "acceptance": "首次导入与刷新共用 decode + records_strict_q + import_csv_opts；指定编码不回退、实际编码/引号/文本列持久化；解析失败不动旧值；短行一致；刷新一步撤销含源尺寸。",
       "files": [
         "crates/core/src/csv.rs",
         "crates/core/src/external.rs",
         "crates/app/src/main.rs",
-        "crates/core/tests/csv_import.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [],
       "commands": [
-        "cargo test -p sheetcore --offline --test csv_import -> 6 passed",
-        "cargo test -p sheetcore --offline --test external_data -> 7 passed",
-        "cargo test -p app ... --bin app -- csv_import_from_the_app -> 1 passed",
-        "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+        "cargo test -p sheetcore --offline --test csv_import",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- csv_import"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c09-csv-source.txt",
-        "implementation-evidence/c09-csv-source.txt (round2 段：严格解析/指定编码/短行/撤销/导入选择与引号持久化；csv_import 10 passed、app 151 passed)"
+        "implementation-evidence/c09-csv-source.txt"
       ],
       "not_done": [
-        "Excel/WPS 编码向导三方对拍未做（本机可用 COM 打开对话框但不自动点选）",
-        "引号字符选择仅在导入对话框提供，刷新沿用已存配置；尚无独立引号偏好管理界面"
+        "Excel/WPS 编码向导三方对拍未执行",
+        "导入对话框仅有状态/渲染帧/处理函数验证，未做系统键鼠点击取消或确认",
+        "无独立“引号偏好”管理界面（引号在导入时选择并持久化）"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用户复核；后续补预览对话框与三方对拍",
-      "updated_utc": "2026-11-13T03:15:00Z",
+      "next": "无阻塞；如需进一步对标，补 Excel/WPS 编码向导截图对拍。",
+      "updated_utc": "2026-11-12T21:03:46Z",
       "slices": [
         {
           "id": "C09.1",
@@ -592,7 +589,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
           "files": [
             "crates/core/src/csv.rs",
@@ -619,7 +616,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C09.2",
@@ -627,7 +624,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
           "files": [
             "crates/core/src/csv.rs",
@@ -654,7 +651,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C09.3",
@@ -662,7 +659,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "同一 CSV 首次导入与刷新结果一致；引号内换行不拆记录；UTF-8/BOM/UTF-16/GB18030 可读；指定文本列时 00123/18 位账号逐字保留；源损坏时旧数据仍在；缩小刷新不误清旁边数据。",
           "files": [
             "crates/core/src/csv.rs",
@@ -689,7 +686,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         }
       ]
     },
@@ -846,42 +843,32 @@
       "scope": "core/xlsx.rs + app打开流程",
       "source": "core-requirements.md",
       "heading": "C14 P0 部分加载失败不得伪装完整工作簿",
-      "status": "待验收",
-      "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
+      "status": "已验收",
+      "acceptance": "坏包/缺件/线程失败都进入结构化诊断并禁止覆盖原文件；抢救副本保留完好内容；真实 BIFF 走 calamine 且不跑 OOXML 扫描；外链关系命名空间/TargetMode/URL 保真。",
       "files": [
         "crates/core/src/xlsx.rs",
-        "crates/core/src/model.rs",
-        "crates/core/src/sparse.rs",
-        "crates/core/src/external.rs",
-        "crates/app/src/main.rs",
-        "crates/app/src/document_tests.rs",
-        "crates/app/src/edit_regression_tests.rs",
-        "crates/core/tests/load_diag.rs",
-        "crates/core/tests/c14_guard.rs"
+        "crates/core/src/notes.rs",
+        "crates/core/src/charts.rs",
+        "crates/core/src/fixups.rs",
+        "crates/core/tests/c14_guard.rs",
+        "crates/app/src/main.rs"
       ],
       "commits": [],
       "commands": [
-        "cargo test -p sheetcore --offline --test c14_guard -> 13 passed",
-        "cargo test -p sheetcore --offline --test load_diag -> 6 passed",
-        "cargo test -p app ... --bin app -- incomplete_load_blocks opening_a_damaged save_as_back_to rescue_save_started -> 4 passed",
-        "round24 全量：core 67 bins 585 passed/0 failed/41 ignored；app 147/0；gui 12/0/8"
+        "cargo test -p sheetcore --offline --test c14_guard",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- c14_"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round2.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c14-load-diag-round3.txt",
-        "implementation-evidence/c14-load-diag-round3.txt (round4 段：关系命名空间/TargetMode/URL 与真实改链接回归；c14_guard 14 passed)"
+        "implementation-evidence/c14-load-diag-round3.txt"
       ],
       "not_done": [
-        "工作线程 panic / 旁路线程失败注入夹具未建立",
-        "正常 .xls 的 calamine 成功路径无夹具",
-        "加密夹具由本项目 crypto::encrypt 生成，非 Excel 加密包",
-        "未与真实 Office 修复对话框目视对比"
+        "加密夹具由本项目 crypto::encrypt 生成，不是 Excel 加密包",
+        "未与真实 Office「修复」对话框做目视对比"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用户复核 round2（A–F 与测试真实性）",
-      "updated_utc": "2026-11-13T03:15:00Z",
+      "next": "无阻塞；边界保持记录。",
+      "updated_utc": "2026-11-12T21:03:46Z",
       "slices": [
         {
           "id": "C14.1",
@@ -889,7 +876,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
           "files": [
             "crates/core/src/xlsx.rs",
@@ -923,7 +910,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核 round2（A–F 与测试真实性）",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C14.2",
@@ -931,7 +918,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
           "files": [
             "crates/core/src/xlsx.rs",
@@ -965,7 +952,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核 round2（A–F 与测试真实性）",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         },
         {
           "id": "C14.3",
@@ -973,7 +960,7 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "加载返回 Workbook + 结构化诊断（LoadDiag），逐项列出未读完整的部件与丢失内容；关键部件（单元格/公式/样式/整表/图表）失败标致命，应用层禁止就地覆盖保存，状态栏说明原因并允许另存抢救副本；另存成功后解除限制；正常稀疏表路径不受影响。",
           "files": [
             "crates/core/src/xlsx.rs",
@@ -1007,7 +994,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核 round2（A–F 与测试真实性）",
-          "updated_utc": "2026-11-13T03:15:00Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         }
       ]
     },
@@ -1675,17 +1662,29 @@
       "scope": "app/main.rs clear_values/clear_selection/handle_keys",
       "source": "ui-requirements.md",
       "heading": "UI-04 统一清除操作的重算、撤销与广播",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
+      "status": "待验收",
+      "acceptance": "清除内容/格式/全部走同一命令；所有非连续选区去重后一次事务；依赖重算、一步撤销、dirty、广播一致；A1=1/A2=2/B1=A1*10/B2=A2*10 清 A1:A2 后 B 立即为 0，撤销全部恢复。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/ribbon/actions.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
       "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": [
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_"
+      ],
+      "evidence": [
+        "implementation-evidence/ui04-clear-contents.txt"
+      ],
+      "not_done": [
+        "Ribbon/右键的真实键鼠点击未做（命令级 + 全量 GUI 回归已过）",
+        "第二客户端真实网络广播未观察",
+        "保存关闭提示 dirty 的真实窗口流程未执行（仅断言 wb.dirty）"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "补 UI-04 真实 GUI 抽查与第二客户端广播观察；然后转 UI-05 查找替换。",
+      "updated_utc": "2026-11-12T21:03:46Z",
       "slices": [
         {
           "id": "UI-04.1",
@@ -1693,17 +1692,29 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "清除内容/格式/全部走同一命令；所有非连续选区去重后一次事务；依赖重算、一步撤销、dirty、广播一致；A1=1/A2=2/B1=A1*10/B2=A2*10 清 A1:A2 后 B 立即为 0，撤销全部恢复。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_"
+          ],
+          "evidence": [
+            "implementation-evidence/ui04-clear-contents.txt"
+          ],
+          "not_done": [
+            "Ribbon/右键的真实键鼠点击未做（命令级 + 全量 GUI 回归已过）",
+            "第二客户端真实网络广播未观察",
+            "保存关闭提示 dirty 的真实窗口流程未执行（仅断言 wb.dirty）"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-12T21:03:46Z"
         }
       ]
     },

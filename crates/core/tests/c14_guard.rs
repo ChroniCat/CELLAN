@@ -509,3 +509,79 @@ fn editing_an_existing_external_link_persists_the_new_target() {
     let wb3 = sheetcore::xlsx::load(&p).unwrap();
     assert_eq!(wb3.sheets[0].hyperlinks[&(0, 0)].target, "https://new.example/b");
 }
+
+// ---------------------------------------------------------------- 04:49 补充三项边界
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+/// 真实 Excel 保存的 .xls（BIFF8，OLE 复合文档）：必须走 calamine 成功分支，
+/// 不能落到内置 BIFF 读取器，也不能对非 zip 容器跑 OOXML 扫描。
+#[test]
+fn real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml() {
+    let _g = env_guard();
+    unsafe {
+        std::env::remove_var("SC_SIDE_PANIC");
+        std::env::remove_var("SC_LOAD_WORKER_PANIC");
+    }
+    let path = fixture("real_excel.xls");
+    let (wb, diag) = sheetcore::xlsx::load_diag(&path).expect("真实 .xls 应能打开");
+    use std::sync::atomic::Ordering::SeqCst;
+    assert_eq!(
+        sheetcore::xlsx::LAST_LOAD_KIND.load(SeqCst),
+        sheetcore::xlsx::LOAD_KIND_BIFF_CALAMINE,
+        "应走 calamine，而不是内置 BIFF/OOXML 分支"
+    );
+    assert!(diag.is_complete(), "不应有读取问题: {:?}", diag.problems);
+    assert_eq!(wb.sheets.len(), 2, "两张表都要读出来");
+    assert_eq!(wb.sheets[0].name, "数据");
+    assert_eq!(
+        wb.sheets[0].value(0, 0),
+        Value::Text("你好".into()),
+        "文本不能被 OOXML 扫描器弄丢"
+    );
+    assert_eq!(wb.sheets[0].value(0, 1), Value::Number(1234.5));
+    assert_eq!(wb.sheets[0].value(1, 1), Value::Number(2469.0), "公式缓存值");
+    assert_eq!(wb.sheets[1].name, "第二");
+}
+
+/// 侧通道（合并/数组/图片/表格扫描）线程 panic：必须变成 fatal 诊断，
+/// 工作簿标 incomplete，禁止覆盖原文件，原文件 SHA 不变。
+#[test]
+fn side_scan_panic_is_fatal_and_source_bytes_are_untouched() {
+    let _g = env_guard();
+    let d = dir("sidepanic");
+    let p = d.join("side.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+    let before = sha256(&p);
+
+    unsafe { std::env::set_var("SC_SIDE_PANIC", "1") };
+    let loaded = sheetcore::xlsx::load_diag(&p);
+    unsafe { std::env::remove_var("SC_SIDE_PANIC") };
+    let (wb2, diag) = loaded.expect("线程 panic 不应把整个加载变成 Err");
+    assert!(diag.has_fatal(), "必须记为 fatal: {:?}", diag.problems);
+    assert!(
+        diag.problems
+            .iter()
+            .any(|x| x.detail.contains("旁路扫描线程异常退出")),
+        "诊断要说明是旁路扫描线程退出: {:?}",
+        diag.problems
+    );
+    assert!(wb2.load_incomplete, "线程死掉后不能当作完整工作簿");
+    let err = sheetcore::xlsx::save(&p, &wb2).expect_err("incomplete 时禁止就地保存");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("拒绝覆盖"), "错误要说明拒绝覆盖: {msg}");
+    assert_eq!(sha256(&p), before, "原文件必须一字节不变");
+}

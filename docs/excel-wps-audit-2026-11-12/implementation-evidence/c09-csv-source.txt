@@ -1,75 +1,74 @@
 C09：首次导入与刷新共用同一解析 / 编码 / 列类型模型
 ====================================================
+状态：已验收（2026-11-13 04:49 复核，按最终代码与测试证据）。
+阅读顺序：先看「当前结论」「最终实现」「最终验证」；第 1–5 节是首版历史记录，
+其中「未执行 / 待补」里的预览对话框、刷新撤销、默认 encoding 登记等已在第 6 节关闭，
+原文保留仅作审计轨迹（标注【历史 RED】）。
 
-原始缺陷（core-requirements.md C09）
------------------------------------
-- 首次导入走 `csv::parse_auto`，刷新走 `external::import_csv` 的
-  `text.lines()` + `split_line`：字段里带换行的 CSV（`"line1\nline2"`）被拆成多条记录，
-  应 2 行的文件变 3 行。已实测计数 `(3,2)` vs 期望 `(2,2)`。
-- 刷新只 `read_to_string`（UTF-8），UTF-16/GB18030 直接失败或乱码。
-- 刷新对所有列自动转数字，`00123` 变 123、18 位账号变浮点。
-- 刷新先写后判错：源损坏时可能已清掉旧值。
+当前结论
+--------
+- 首次导入与刷新共用 decode + records_strict_q + import_csv_opts 单一管线。
+- 显式指定编码失败不回退；自动探测才 BOM→UTF-8→GB18030。
+- 文本列、引号、分隔符、表头、实际编码随源持久化；保存重开后刷新复用。
+- 解析失败不写旧区域；短行刷新与首次导入逐格一致。
+- 刷新是一步可撤销操作，撤销同时恢复源 rows/cols。
 
-修改
-----
-1. `crates/core/src/csv.rs`
-   - 新增 `Encoding`（Utf8 / Utf16Le / Utf16Be / Gb18030）与 `id()/from_id()`。
-   - `decode(bytes, wanted)`：BOM → 显式编码 → 严格 UTF-8 → GB18030 探测；
-     有损解码返回 `had_errors`，调用方报错而不是吞。
-   - `records(text, delim)`：复用原有引号/逗号状态机，只跳过真正的空行。
-2. `crates/core/src/external.rs`
-   - `Source` 增加 `csv_opts: Option<CsvOpts>`（编码 + 文本列），
-     在自定义名称文本尾部追加 `|enc|cols`，旧文件（无尾段）按自动处理。
-   - 新增 `import_csv_with(sheet, path, delim, header, encoding, text_cols, old, at)`：
-     读字节 → 解码 → 记录解析 → 按列类型生成 `Cell`（文本列逐字保留）→
-     先构建完整网格，再一次性写入。
-   - 旧区域超出新数据的部分按 `old=(rows,cols)` 清理，只清自己上次写过的块。
-   - `refresh` 的 CSV 分支改用 `import_csv_with`，传入持久化配置与旧尺寸；
-     `import_csv` 保留为 `import_csv_with(..., None, &[], (0,0), at)` 的包装。
-3. `crates/app/src/main.rs::import_csv_from`
-   - 不再 `String::from_utf8_lossy` + `parse_auto`，改为与刷新同一个
-     `decode` + `import_csv_with`；失败时按快照还原并提示，不写入脏数据。
-   - 数据源登记带上 `CsvOpts::default()`，刷新与首次导入配置同源。
+最终实现
+--------
+1. crates/core/src/csv.rs
+   - Encoding {Utf8,Utf16Le,Utf16Be,Gb18030} + id/from_id。
+   - decode(bytes, Some(enc))：解码失败返回 ("", enc, true)，绝不回退 GB18030；
+     decode(bytes, None)：BOM → 严格 UTF-8 → GB18030。
+   - records_strict_q / parse_strict_q：未闭合引号、闭引号后多余字符返回 Err；
+     保留引号内换行、CRLF、转义引号、尾空列、空行语义。
+2. crates/core/src/external.rs
+   - CsvOpts { encoding: Option<Encoding>, text_cols: Vec<u32>, quote: char }（手写 Default，quote='"'）。
+   - import_csv_opts 返回 (rows, cols, used_enc)；先完整解析再一次性写入。
+   - Source.csv_opts 持久化名尾部追加 |enc|cols|q<码点>，旧文件按自动处理。
+   - mutate/refresh 传入同一配置与旧尺寸；缩小时只清自己上次写过的块；短行缺失列清空。
+3. crates/app/src/main.rs
+   - 选文件后进 CsvDlg（编码/引号/表头/按列文本 + 真实 records_strict_q 预览），
+     确认走 import_csv_choice → import_csv_opts；首次导入把 used_enc 写回 CsvOpts。
+   - refresh_import：刷新前整表快照 + 源尺寸前后值入一步 undo；失败快照还原。
+   - undo/redo 的 refresh_sizes 分支恢复 wb.sources 的 rows/cols。
 
-测试（`crates/core/tests/csv_import.rs`，**6 passed / 0 failed**）
-----------------------------------------------------------------
-| 用例 | 断言 |
-|---|---|
-| `newline_inside_quotes_is_one_field_for_import_and_refresh` | 2 行 2 列；`line1\nline2` 是一个字段；刷新结果逐格一致 |
-| `decodes_bom_utf16_and_gb18030` | UTF-8 BOM / UTF-16LE BOM / GB18030 中文都能读 |
-| `text_columns_keep_leading_zeros_and_long_accounts` | 文本列的 `00123`、18 位账号逐字保留；未标记列仍按数字（兼容 v1） |
-| `decode_failure_keeps_previous_data` | 坏 UTF-16 报错且旧值仍在 |
-| `shrinking_refresh_clears_only_its_own_old_region` | 新数据变小时清掉旧块，旁边的用户格不动 |
-| `csv_options_survive_save_and_reload` | 编码/文本列随 xlsx 保存重开仍在 |
+最终验证（当前代码）
+--------------------
+- crates/core/tests/csv_import.rs：10 passed / 0 failed / 0 ignored
+  （引号内换行、BOM/UTF-16/GB18030、文本列、损坏源保旧值、缩小刷新、
+    CRLF/尾空列/空行、严格解析、显式编码不回退、配置持久化）。
+- crates/app/src/edit_regression_tests.rs：
+  - csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_source
+  - refresh_is_one_undo_step_that_restores_values_rect_and_source_size
+  - csv_import_choices_persist_and_refresh_reuses_them
+  - csv_import_dialog_renders_with_real_preview_before_any_write
+  以上均为状态/处理函数级验证；未做系统键鼠点击“取消/确认”。
+- 进程结果与汇总分开记录：
+  - round33 `cargo test -p sheetcore --offline`：同一命令终端回显 CORE=0；
+    日志解析汇总 67 bins / 590 passed / 0 failed / 41 ignored（该日志文件本身不含退出码）。
+  - round36/round38 `cargo test -p app ... --bin app`：APP_EXIT=0，159 passed / 0 failed。
+  - GUI `--test ui_regression`：GUI_EXIT=0，12 passed / 0 failed / 8 ignored。
 
-应用层用例（`crates/app/src/edit_regression_tests.rs`，**1 passed**）
--------------------------------------------------------------------
-`csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_source`：
-走真实 `import_csv_from` 入口，断言字段内换行保留、登记 `_sc_src_*` 且尺寸 2×2、
-撤销栈有「导入 CSV」一步。
+【历史 RED】第 1–5 节（首版，2026-11-12）
+-----------------------------------------
+原始缺陷：首次导入走 csv::parse_auto，刷新走 text.lines()+split_line；
+引号内换行被拆行（实测 (3,2) vs 期望 (2,2)）；刷新只 read_to_string（UTF-8）；
+所有列自动转数字（00123→123、18 位账号变浮点）；先写后判错。
 
-RED / 变异证据
--------------
-- 变异 M1：把 `records(&text, delim)` 换回 `text.lines().map(split_line)`
-  → `newline_inside_quotes...` 失败，`left: (3, 2) right: (2, 2)`，正是审计描述的症状；已还原。
+首版修改：
+1. csv.rs 增加 Encoding / decode / records（BOM → 显式编码 → 严格 UTF-8 → GB18030）。
+2. external.rs 增加 CsvOpts（编码 + 文本列），Source 文本尾部 |enc|cols；
+   import_csv_with 先构建完整网格再一次写入；刷新复用同一路径。
+3. app import_csv_from 不再 from_utf8_lossy + parse_auto，失败快照还原。
 
-未执行 / 待补（不写成通过）
---------------------------
-- 编码与列类型的**预览对话框**未实现：当前用自动探测 + 代码可指定文本列，
-  界面上还不能在导入前选编码/列类型。
-- 首次导入的列宽/日期/布尔推断与 Excel 编码向导的三方对拍未做。
-- 刷新「成功一步撤销」在应用层由现有 `txn_end("导入 CSV")` 覆盖；
-  刷新入口（`refresh` 命令）是否复用同一 undo 步骤尚未单独取证。
-- WPS/Excel 打开刷新后的数据一致性未对拍。
+首版测试：csv_import 6 passed；应用层 1 passed。
+RED/变异 M1：records 换回 text.lines() → 用例失败 left (3,2) right (2,2)，已还原。
 
-运行命令
--------
-```
-cargo test -p sheetcore --offline --test csv_import           # 6 passed
-cargo test -p sheetcore --offline --test external_data        # 7 passed
-cargo test -p sheetcore --offline --test custom_props         # 10 passed / 2 ignored
-cargo test -p app --no-default-features --features glow --offline --bin app -- csv_import_from_the_app
-```
+【历史 RED】首版「未执行 / 待补」（均已在第 6 节关闭或转为已记录边界）
+- 预览对话框未实现 → 已实现（CsvDlg + records_strict_q 预览 + 渲染帧用例）。
+- 刷新成功一步撤销未单独取证 → 已实现并有用例（refresh_sizes + 快照）。
+- 首次导入默认 encoding 未登记实际值 → 已回写 used_enc。
+- 编码/列类型与 Excel 编码向导三方对拍未做 → 仍未做，见下方边界。
 
 六、round2（04:08/04:29 复核后）
 1) 严格解析：csv::parse_strict_q / records_strict_q 对未闭合引号、闭引号后多余字符返回 Err；import_csv_opts 在写入前解析，失败时旧区域一个格都不动（bad_quote_on_refresh_keeps_previous_cells_untouched）。
@@ -78,4 +77,10 @@ cargo test -p app --no-default-features --features glow --offline --bin app -- c
 4) 短行一致：刷新时新矩形内缺失列在旧区域内清空，A,B\nC,D → A\nB,C 后 B1 为空，与首次导入逐格一致（short_row_refresh_matches_first_import_for_the_same_rectangle）。
 5) 刷新 undo：refresh_import 以整表快照 + 源尺寸前后值入栈一步；do_undo 恢复值、范围与 wb.sources 的 rows/cols（app 用例 refresh_is_one_undo_step...）。
 6) 导入前选择：open_csv_dialog + csv_dlg_ui 提供编码/引号/表头/按列文本勾选与真实预览；确认走 import_csv_choice，CsvOpts 持久化 encoding/text_cols/quote（名称文本第 10 段 q<码点>）；保存重开后 refresh 复用（app 用例 csv_import_choices_persist_and_refresh_reuses_them）；csv_import_dialog_renders_with_real_preview_before_any_write 渲染一帧并断言取消前不写任何格。
-7) 结果：csv_import 10 passed / 0 failed；app 152 passed / 0 failed；core 全量 590 passed / 41 ignored；GUI 12 passed / 8 ignored。
+7) 结果：csv_import 10 passed / 0 failed；app 159 passed / 0 failed；core 全量 592 passed / 41 ignored（round37，CORE_EXIT=0）；GUI 12 passed / 8 ignored。
+
+边界（未写成通过）
+------------------
+- Excel/WPS 编码向导三方对拍未执行。
+- 导入对话框的确认/取消是状态级 + 渲染帧 + 处理函数验证，没有系统键鼠点击。
+- 刷新与导入共用配置，但没有独立的“引号偏好”管理界面（引号在导入时选择并持久化）。

@@ -941,6 +941,14 @@ enum OpenMsg {
 
 // ---------------------------------------------------------------- 右键菜单（Excel 365 样式）
 
+/// 清除的三种粒度（对应 Excel 清除内容 / 清除格式 / 清除全部）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClearPart {
+    Contents,
+    Formats,
+    All,
+}
+
 /// 右键菜单能执行的动作
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CtxAct {
@@ -1551,6 +1559,8 @@ impl SheetApp {
         self.tasks.busy = true;
         self.status = format!("正在打开 {}…", path.display());
         std::thread::spawn(move || {
+            let tx2 = tx.clone();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let prof = std::env::var("SC_LOAD_PROF").is_ok();
             let t0 = std::time::Instant::now();
             match sheetcore::xlsx::load_diag(&path) {
@@ -1619,7 +1629,18 @@ impl SheetApp {
                     let _ = tx.send(OpenMsg::Failed(format!("打开失败: {e:#}")));
                 }
             }
-        });
+                    }));
+            if let Err(p) = r {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|x| x.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic".to_string());
+                let _ = tx2.send(OpenMsg::Failed(format!(
+                    "打开失败：加载线程异常退出（panic）：{msg}"
+                )));
+            }
+});
     }
 
     fn open_path_with_password(&mut self, path: PathBuf, pw: String) {
@@ -4068,6 +4089,11 @@ impl SheetApp {
     }
 
     fn recalc_and_broadcast(&mut self, keys: &[(usize, u32, u32)]) {
+        // 依赖图还没建好（刚打开、后台构建中）时先补一份，否则清除/粘贴的
+        // 下游公式不会重算。空图 + 无公式时这次构建只是一次扫描。
+        if self.deps.is_empty() {
+            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        }
         for k in keys {
             self.deps.update_cell(&self.wb, *k);
         }
@@ -6588,30 +6614,7 @@ impl SheetApp {
             self.cse_pending = true;
         }
         if clear {
-            let (r1, c1, r2, c2) = self.sel_rect();
-            let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-            if !self.write_preflight(&keys, "清除内容") {
-                return;
-            }
-            let txn = self.txn_begin(&keys);
-            for rr in r1..=r2 {
-                for cc in c1..=c2 {
-                    self.wb.sheet_mut(self.sheet_idx)
-                        .set(rr, cc, Cell { value: Value::Empty, formula: None });
-                }
-            }
-            self.txn_end("清除内容", txn);
-            let (r, c) = self.sel;
-            let _ = (r, c);
-            self.wb.dirty = true;
-            let key = (self.sheet_idx, r, c);
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.deps.update_cell(&self.wb, key);
-            sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
-            if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
-                let op = peer.local_set(self.sheet_idx, r, c, &Cell { value: Value::Empty, formula: None });
-                net.broadcast_op(op);
-            }
+            self.clear_values();
         }
         if commit || dr != 0 || dc != 0 {
             let nr = (self.sel.0 as i64 + dr).max(0) as u32;
@@ -6728,18 +6731,40 @@ impl SheetApp {
     }
 
     /// 只清内容，保留格式/批注（Excel「清除内容」）
-    fn clear_values(&mut self) {
-        if self.edit_blocked() {
+fn clear_values(&mut self) {
+        self.clear_rects(ClearPart::Contents);
+    }
+
+    /// 清除格式（保留内容）
+    fn clear_formats(&mut self) {
+        self.clear_rects(ClearPart::Formats);
+    }
+
+    /// 清除全部（内容 + 格式），一次事务、一步撤销
+    fn clear_all(&mut self) {
+        self.clear_rects(ClearPart::All);
+    }
+
+    /// 统一的 ClearContents 命令：所有非连续选区去重后一次事务完成
+    fn clear_rects(&mut self, part: ClearPart) {
+        let rects = self.sel_rects();
+        let mut keys: Vec<(u32, u32)> = Vec::new();
+        for (r1, c1, r2, c2) in rects.iter().copied() {
+            keys.extend(sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let what = match part {
+            ClearPart::Contents => "清除内容",
+            ClearPart::Formats => "清除格式",
+            ClearPart::All => "清除全部",
+        };
+        if !self.write_preflight(&keys, what) {
             return;
         }
-        let (r1, c1, r2, c2) = self.sel_rect();
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-                if !self.write_preflight(&keys, "清除内容") {
-            return;
-        }
-let txn = self.txn_begin(&keys);
-        for r in r1..=r2 {
-            for c in c1..=c2 {
+        let txn = self.txn_begin(&keys);
+        for &(r, c) in keys.iter() {
+            if part != ClearPart::Formats {
                 self.wb.sheet_mut(self.sheet_idx).set(
                     r,
                     c,
@@ -6749,11 +6774,23 @@ let txn = self.txn_begin(&keys);
                     },
                 );
             }
+            if part != ClearPart::Contents {
+                self.wb.sheet_mut(self.sheet_idx).set_style(r, c, 0);
+            }
         }
-        self.txn_end("清除内容", txn);
+        self.txn_end(what, txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = "已清除内容".into();
+        if part != ClearPart::Formats {
+            let keys3: Vec<(usize, u32, u32)> =
+                keys.iter().map(|(r, c)| (self.sheet_idx, *r, *c)).collect();
+            self.recalc_and_broadcast(&keys3);
+        } else if let Some(net) = self.net.as_ref() {
+            let items: Vec<(u32, u32, sheetcore::style::CellStyle)> =
+                keys.iter().map(|(r, c)| (*r, *c, sheetcore::style::CellStyle::default())).collect();
+            net.broadcast_style(self.sheet_idx, items);
+        }
+        self.status = format!("已{what}");
     }
 
     /// 单元格样式库的 5 个预设（真写入 CellStyle）
@@ -7987,30 +8024,8 @@ let txn = self.txn_begin(&keys);
     }
 
     /// 清除内容（保留格式，和 Excel「清除内容」一致）
-    fn clear_selection(&mut self) {
-        if self.edit_blocked() {
-            return;
-        }
-        let rects = self.sel_rects();
-        let mut keys: Vec<(u32, u32)> = Vec::new();
-        for (r1, c1, r2, c2) in rects.iter() {
-            keys.extend(sheetcore::undo::rect_keys(*r1, *c1, *r2, *c2));
-        }
-                keys.sort_unstable();
-        keys.dedup();
-        if !self.write_preflight(&keys, "清除内容") {
-            return;
-        }
-let txn = self.txn_begin(&keys);
-        for (r1, c1, r2, c2) in rects.iter().copied() {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    self.wb.sheet_mut(self.sheet_idx).remove(r, c);
-                }
-            }
-        }
-        self.txn_end("清除内容", txn);
-        self.status = "已清除内容".into();
+fn clear_selection(&mut self) {
+        self.clear_rects(ClearPart::Contents);
     }
 
     /// 字体/填充颜色面板（Excel 的主题色 + 标准色）

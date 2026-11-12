@@ -2712,3 +2712,131 @@ fn one_locked_cell_blocks_the_whole_clear() {
     assert!(!app.wb.dirty);
     drop(env);
 }
+
+/// C14：主加载工作线程 panic 必须变成可诊断的失败，原文件不被写、不绑定到当前文档。
+#[test]
+fn open_worker_panic_reports_failure_and_keeps_the_file_untouched() {
+    use sha2::{Digest, Sha256};
+    let env = crate::test_env::TestEnv::new("c14_worker_panic");
+    let src = env.path("seed.xls");
+    std::fs::copy(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../core/tests/fixtures/real_excel.xls"),
+        &src,
+    )
+    .unwrap();
+    let before: Vec<u8> = std::fs::read(&src).unwrap();
+    let sha_before: String = Sha256::digest(&before).iter().map(|b| format!("{b:02x}")).collect();
+
+    // SAFETY: TestEnv 持有 ENV_LOCK，其它测试不会并发读写进程环境。
+    unsafe { std::env::set_var("SC_LOAD_WORKER_PANIC", "1") };
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.open_path(src.clone());
+    for _ in 0..200 {
+        app.poll_open();
+        if !app.tasks.busy {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    unsafe { std::env::remove_var("SC_LOAD_WORKER_PANIC") };
+
+    assert!(!app.tasks.busy, "线程死后不能一直占用 busy");
+    assert!(
+        app.status.contains("加载线程异常退出"),
+        "status 要说明 worker panic：{}",
+        app.status
+    );
+    assert!(app.wb.path.is_none(), "失败后不能把原路径挂到当前文档");
+    assert_eq!(app.wb.path.as_deref(), None);
+    let after = std::fs::read(&src).unwrap();
+    assert_eq!(after, before, "失败路径不能改原文件");
+    let sha_after: String = Sha256::digest(&after).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(sha_after, sha_before);
+    drop(env);
+}
+
+/// UI-04 验收：A1=1、A2=2、B1=A1*10、B2=A2*10，选 A1:A2 清除内容后
+/// B1/B2 立即为 0；Ctrl+Z 一次恢复四格；保存会提示 dirty。
+#[test]
+fn clear_contents_recalcs_dependents_and_one_undo_restores_all() {
+    let env = crate::test_env::TestEnv::new("ui04_recalc");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let num = |v: f64| Cell { value: sheetcore::model::Value::Number(v), formula: None };
+    let f = |t: &str| Cell { value: sheetcore::model::Value::Empty, formula: Some(t.into()) };
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, num(1.0));
+        sh.set(1, 0, num(2.0));
+        sh.set(0, 1, f("=A1*10"));
+        sh.set(1, 1, f("=A2*10"));
+    }
+    sheetcore::formula::recalc_all(&mut app.wb);
+    assert_eq!(app.wb.sheet(0).value(0, 1), sheetcore::model::Value::Number(10.0));
+
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.clear_values();
+
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 1), sheetcore::model::Value::Number(0.0), "B2 要立即变 0");
+    assert_eq!(app.wb.sheet(0).value(0, 1), sheetcore::model::Value::Number(0.0), "B1 要立即变 0");
+    assert!(app.wb.dirty, "清除后必须标脏");
+    assert_eq!(app.undo.depth().0, 1, "一次清除只压一步撤销");
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(1, 0), sheetcore::model::Value::Number(2.0));
+    assert_eq!(app.wb.sheet(0).value(0, 1), sheetcore::model::Value::Number(10.0), "撤销后 B1 恢复");
+    assert_eq!(app.wb.sheet(0).value(1, 1), sheetcore::model::Value::Number(20.0), "撤销后 B2 恢复");
+    drop(env);
+}
+
+/// UI-04：多选 A1 与 A3（非连续）只清这两块，A2 不能被误清。
+#[test]
+fn clear_multi_select_does_not_touch_the_gap() {
+    let env = crate::test_env::TestEnv::new("ui04_multi");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let num = |v: f64| Cell { value: sheetcore::model::Value::Number(v), formula: None };
+    app.wb.sheet_mut(0).set(0, 0, num(1.0));
+    app.wb.sheet_mut(0).set(1, 0, num(2.0));
+    app.wb.sheet_mut(0).set(2, 0, num(3.0));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.extra_sel = vec![(2, 0, 2, 0)];
+    app.clear_values();
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 0), sheetcore::model::Value::Number(2.0), "A2 不能被误清");
+    assert_eq!(app.wb.sheet(0).value(2, 0), sheetcore::model::Value::Empty);
+    drop(env);
+}
+
+/// UI-04：清除格式保留内容；清除全部一次撤销同时恢复内容和格式。
+#[test]
+fn clear_formats_and_clear_all_are_distinct_and_undoable() {
+    let env = crate::test_env::TestEnv::new("ui04_parts");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: sheetcore::model::Value::Number(5.0), formula: None });
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.apply_style(|st| st.bold = true);
+    assert_ne!(app.wb.sheet(0).style_of(0, 0), 0);
+
+    app.clear_formats();
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(5.0), "清格式不能丢内容");
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), 0, "样式要回到默认");
+    app.do_undo(false);
+    assert_ne!(app.wb.sheet(0).style_of(0, 0), 0, "撤销要恢复样式");
+
+    app.clear_all();
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Empty);
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), 0);
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(5.0), "清全部的撤销要带回内容");
+    assert_ne!(app.wb.sheet(0).style_of(0, 0), 0, "清全部的撤销要带回格式");
+    drop(env);
+}

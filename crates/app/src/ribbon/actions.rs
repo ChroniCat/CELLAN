@@ -485,16 +485,7 @@ impl SheetApp {
             }
             "FillColor" => self.color_popup = Some(false),
             "FontColor" => self.color_popup = Some(true),
-            "ClearFormat" => self.apply_style(|s| {
-                // 保留字体名（中文环境大多是宋体/黑体），其余恢复默认
-                let f = s.font.clone();
-                *s = sheetcore::style::CellStyle {
-                    font: f,
-                    size: 11.0,
-                    color: [0, 0, 0],
-                    ..Default::default()
-                };
-            }),
+            "ClearFormat" => self.clear_formats(),
             "AlignTop" => self.apply_style(|s| s.valign = 1),
             "AlignMiddle" => self.apply_style(|s| s.valign = 2),
             "AlignBottom" => self.apply_style(|s| s.valign = 3),
@@ -568,7 +559,7 @@ impl SheetApp {
             }
             "AutoSum" => self.auto_sum(),
             "FillDown" => self.fill_down(),
-            "ClearContent" => self.clear_selection(),
+            "ClearContent" => self.clear_all(),
             "SortFilter" => self.start_filter(),
             "FindReplace" => self.find.open = true,
 

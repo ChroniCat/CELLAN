@@ -79,3 +79,31 @@ C14 第三轮：关系 XML 良构性 + 图表内部三类吞错
 2) 外链属性：clear_sheet_notes 只对包内关系解析 Target，TargetMode=External 的 URL 不再当路径；restore_external_rels 只在"目标被引擎归一"时恢复原文（https://host/ → https:/host），并对缺失的 TargetMode 补回。
 3) 真实改链接回归：editing_an_existing_external_link_persists_the_new_target —— 首次保存 old.example → 重新打开改成 new.example → 保存，rels 中必须是 new.example、无 old.example、TargetMode=External 且根命名空间存在；再打开模型读回 new.example。修复前该用例会因末尾恢复策略把 rIdHk1 换回旧 URL 而失败。
 4) 结果：c14_guard 14 passed / 0 failed（3.16s）；两个"删批注保关系"用例与四类图表窄夹具不退化。
+
+六、round5（04:49 复核后补齐原登记的三项测试边界）
+1) 真实 BIFF 成功分支
+   - 夹具：crates/core/tests/fixtures/real_excel.xls，由本机 Excel 16.0（Build 20326）
+     以 FileFormat=56（xlExcel8）保存的合成工作簿：25600 字节，SHA-256
+     7d5213539cd4b857d6780409f987352820991a4abe867daad9383a6d55d193ef。
+     两张表：数据（A1 你好、B1 1234.5、B2 =B1*2、A3 "保留,逗号"）、第二（A1 2024-03-05）。
+   - xlsx::load_diag 新增 LAST_LOAD_KIND 标记（BIFF_CALAMINE / BIFF_BUILTIN / OOXML）。
+   - 用例 real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml：
+     断言 LAST_LOAD_KIND == BIFF_CALAMINE、diag 为空、两张表名与值（含公式缓存 2469）正确。
+     变异：把非 zip 的标记改成 BIFF_BUILTIN → 用例失败，证明断言确实在检查分支。
+2) 侧通道线程失败
+   - 注入点：xlsx.rs 旁路扫描线程读取 SC_SIDE_PANIC 后 panic（可控、只在该线程）。
+   - 用例 side_scan_panic_is_fatal_and_source_bytes_are_untouched：
+     recv() 收到 Err → fatal 诊断「旁路扫描线程异常退出，这些结构没有加载」；
+     wb.load_incomplete == true；save 同一路径返回错误且含「拒绝覆盖」；SHA-256 不变。
+     变异：去掉注入 panic → 诊断为空，用例失败。
+3) 主加载工作线程 panic
+   - 注入点：xlsx::load_diag 读取 SC_LOAD_WORKER_PANIC 后 panic。
+   - app open_path 的加载线程用 catch_unwind 包住整个 load+recalc 流程，
+     捕获后发送 OpenMsg::Failed("打开失败：加载线程异常退出（panic）：…")。
+   - app 用例 open_worker_panic_reports_failure_and_keeps_the_file_untouched：
+     busy 归位、status 含「加载线程异常退出」、wb.path 不绑定该文件、原文件 SHA 不变。
+4) 结果：c14_guard 16 passed / 0 failed（原 14 + 2）；app 全量 159 passed / 0 failed；
+   core 全量（round37）CORE_EXIT=0，67 bins / 592 passed / 0 failed / 41 ignored；
+   GUI（round38）GUI_EXIT=0，12 passed / 0 failed / 8 ignored。
+5) 保留边界（不写成通过）：加密夹具仍由本项目 crypto::encrypt 生成，不是 Excel 加密包；
+   未与真实 Office「修复」对话框做目视对比。

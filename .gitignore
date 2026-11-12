@@ -22,6 +22,7 @@
 !crates/core/tests/data/two_sheets.xlsx
 !crates/core/tests/data/sparklines.xlsx
 !crates/core/tests/data/real_macro.xlsm
+!crates/core/tests/fixtures/real_excel.xls
 
 # Operating-system files
 .DS_Store
