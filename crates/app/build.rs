@@ -1,0 +1,81 @@
+//! 把 assets/app.ico 编译进 exe（资源管理器/任务栏看到的图标）。
+//!
+//! 不引入 winres 之类的额外依赖：直接调用 Windows SDK 里的 rc.exe 生成 .res，
+//! 再通过 cargo:rustc-link-arg 交给 MSVC 链接器。找不到 rc.exe 时只警告，
+//! 不影响编译（图标缺失，但程序照常构建）。
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn main() {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let ico = manifest.join("../../assets/app.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if !ico.exists() {
+        println!("cargo:warning=缺少 {}，exe 图标不打包", ico.display());
+        return;
+    }
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    let Some(rc) = find_rc() else {
+        println!("cargo:warning=没找到 rc.exe（Windows SDK），exe 图标不打包");
+        return;
+    };
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let rc_file = out.join("app.rc");
+    let res_file = out.join("app.res");
+    // rc 的路径里反斜杠要转义，用正斜杠最稳
+    let ico_arg = ico.display().to_string().replace('\\', "/");
+    if std::fs::write(&rc_file, format!("1 ICON \"{ico_arg}\"\n")).is_err() {
+        return;
+    }
+    let status = Command::new(&rc)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&res_file)
+        .arg(&rc_file)
+        .status();
+    match status {
+        Ok(s) if s.success() && res_file.exists() => {
+            println!("cargo:rustc-link-arg={}", res_file.display());
+            println!("cargo:warning=已把 app.ico 打进 exe（{}）", rc.display());
+        }
+        Ok(s) => println!("cargo:warning=rc.exe 退出码 {s}，exe 图标不打包"),
+        Err(e) => println!("cargo:warning=调用 rc.exe 失败：{e}"),
+    }
+}
+
+/// 找 rc.exe：PATH 里没有就去 Windows Kits 目录挑最高版本（x64）
+fn find_rc() -> Option<PathBuf> {
+    if let Ok(out) = Command::new("rc.exe").arg("/?").output() {
+        if out.status.success() || !out.stderr.is_empty() {
+            return Some(PathBuf::from("rc.exe"));
+        }
+    }
+    let roots = [
+        std::env::var("ProgramFiles(x86)").ok(),
+        std::env::var("ProgramFiles").ok(),
+    ];
+    let mut best: Option<(Vec<u32>, PathBuf)> = None;
+    for root in roots.into_iter().flatten() {
+        let kits = Path::new(&root).join("Windows Kits").join("10").join("bin");
+        let Ok(rd) = std::fs::read_dir(&kits) else { continue };
+        for e in rd.flatten() {
+            let p = e.path().join("x64").join("rc.exe");
+            if !p.exists() {
+                continue;
+            }
+            let ver: Vec<u32> = e
+                .file_name()
+                .to_string_lossy()
+                .split('.')
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if best.as_ref().map(|(v, _)| ver > *v).unwrap_or(true) {
+                best = Some((ver, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}

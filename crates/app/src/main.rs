@@ -22303,6 +22303,11 @@ fn main() -> eframe::Result<()> {
             ])
             .with_min_inner_size([760.0, 420.0])
             .with_decorations(false)
+            // 任务栏/Alt-Tab 图标：和 exe 里的 app.ico 同一张图
+            .with_icon(std::sync::Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/app64.png"))
+                    .unwrap_or_default(),
+            ))
             .with_title("Sheets Native (v1.6)"),
         ..Default::default()
     };

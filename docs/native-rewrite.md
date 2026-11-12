@@ -2924,3 +2924,15 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 - A 在第 9 秒改 A1 → B 立刻收到 `ops: 1`，A1 变成同一内容。
 - 99 单测 + 17 UI 回归全过。
 
+### 第四十五轮：图标与 exe 资源（2026-11-12）
+
+- **橙色圆点**：`Share` 的 imageMso 导出只有一层橙色圆（内部图形没导出来，32px 和 16px 都一样），
+  缩到 16px 就是个色块。把它从 `ui_png` 的位图表里移除，回落到矢量画法（三个点 + 连线），
+  任何 DPI 下都清晰。其余 54 个 imageMso 图标保持不变。
+- **exe 图标**：新增 `crates/app/build.rs`，用 Windows SDK 的 `rc.exe` 把 `assets/app.ico`
+  编成 `.res` 再通过 `cargo:rustc-link-arg` 交给链接器；找不到 rc.exe 只警告、不影响构建。
+  `assets/app.ico`（7 档 16–256）与 `app32/app64.png` 一起入库。
+- **窗口图标**：`ViewportBuilder::with_icon` 用 `app64.png`，任务栏/Alt-Tab 和 exe 图标同一张图。
+- 验证：`[System.Drawing.Icon]::ExtractAssociatedIcon(app.exe)` 取出的 32×32 是绿底白网格图标；
+  页签行共享按钮变成蓝色分享图标，橙色像素数为 0；99 单测 + 17 UI 回归通过。
+

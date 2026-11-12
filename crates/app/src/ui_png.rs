@@ -44,7 +44,8 @@ pub fn png(icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
         Icon::Print => ("Print", include_bytes!("../../../assets/icons/excel/Print.png"), include_bytes!("../../../assets/icons/excel/Print_16.png")),
         Icon::Refresh => ("Refresh", include_bytes!("../../../assets/icons/excel/Refresh.png"), include_bytes!("../../../assets/icons/excel/Refresh_16.png")),
         Icon::SaveAs => ("SaveAs", include_bytes!("../../../assets/icons/excel/SaveAs.png"), include_bytes!("../../../assets/icons/excel/SaveAs_16.png")),
-        Icon::Share => ("Share", include_bytes!("../../../assets/icons/excel/Share.png"), include_bytes!("../../../assets/icons/excel/Share_16.png")),
+        // Share 的 imageMso 导出只剩一个橙色圆点（内部图形没导出来），
+        // 改用矢量画法（三个点 + 连线），任何 DPI 下都清晰。
         Icon::SortAsc => ("SortAsc", include_bytes!("../../../assets/icons/excel/SortAsc.png"), include_bytes!("../../../assets/icons/excel/SortAsc_16.png")),
         Icon::SortDesc => ("SortDesc", include_bytes!("../../../assets/icons/excel/SortDesc.png"), include_bytes!("../../../assets/icons/excel/SortDesc_16.png")),
         Icon::Sum => ("Sum", include_bytes!("../../../assets/icons/excel/Sum.png"), include_bytes!("../../../assets/icons/excel/Sum_16.png")),
