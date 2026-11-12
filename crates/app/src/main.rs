@@ -20592,6 +20592,17 @@ impl SheetApp {
 }
 
 impl eframe::App for SheetApp {
+    /// 背景清屏色：默认 eframe 用透明，任何没被面板覆盖的缝都会变成黑块。
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let c = visuals.panel_fill;
+        [
+            c.r() as f32 / 255.0,
+            c.g() as f32 / 255.0,
+            c.b() as f32 / 255.0,
+            1.0,
+        ]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 高 DPI 验收：SC_PPP=1.5 强制设备像素比（默认跟随系统）
         if let Ok(v) = std::env::var("SC_PPP") {
@@ -21109,24 +21120,35 @@ impl eframe::App for SheetApp {
                 );
                 // Excel：页签条是浅灰，命令区是纯白。整块铺 TABBAR_BG 会让功能区发灰、显脏。
                 let body_top = ui.cursor().top();
-                ui.painter().rect_filled(
-                    Rect::from_min_max(egui::pos2(full.left(), body_top), full.max),
-                    0.0,
-                    Color32::WHITE,
+                let body_rect = Rect::from_min_max(
+                    egui::pos2(full.left(), body_top),
+                    egui::pos2(full.right(), body_top + ui_kit::RIBBON_BODY_H),
                 );
+                ui.painter().rect_filled(body_rect, 0.0, Color32::WHITE);
                 if !self.ribbon_collapsed {
-                egui::ScrollArea::horizontal()
-                    .id_salt("ribbon_scroll")
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .show(ui, |ui| {
-                        ui.set_height(ui_kit::RIBBON_BODY_H);
-                        ui.horizontal_top(|ui| {
-                            ui.add_space(20.0);
-                            ribbon::ui::body(self, ui);
+                    // 命令区画在一个**尺寸固定**的子 ui 里：内容再高也撑不到父面板，
+                    // 否则某个组多堆几行就会把编辑栏往下顶、中间留出一条空白带。
+                    let mut body_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    body_ui.set_clip_rect(body_rect);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("ribbon_scroll")
+                        .auto_shrink([false, false])
+                        .max_height(ui_kit::RIBBON_BODY_H)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(&mut body_ui, |ui| {
+                            ui.set_height(ui_kit::RIBBON_BODY_H);
+                            ui.horizontal_top(|ui| {
+                                ui.add_space(20.0);
+                                ribbon::ui::body(self, ui);
+                            });
                         });
-                    });
                 }
+                // 父 ui 只承认这一块，命令区内部溢出不影响后续面板
+                ui.allocate_rect(body_rect, egui::Sense::hover());
                 ui.painter().rect_filled(
                     Rect::from_min_max(
                         egui::pos2(full.left(), full.bottom() - 1.0),

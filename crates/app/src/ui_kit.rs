@@ -397,6 +397,56 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
     resp.on_hover_text(tip)
 }
 
+/// 勾选行：自绘复选框（白底/勾选填主题绿+白勾），不再用「✓」字符
+pub fn check_row(ui: &mut egui::Ui, label: &str, checked: bool, enabled: bool, width: f32) -> Response {
+    let v = ui.visuals().clone();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click());
+    let bg = state_bg(enabled, false, resp.hovered(), resp.is_pointer_button_down_on(), v.dark_mode);
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 2.0, bg);
+    }
+    let box_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        Vec2::splat(13.0),
+    );
+    if checked && enabled {
+        ui.painter().rect_filled(box_rect, 2.0, ACCENT);
+        let p = ui.painter();
+        let st = Stroke::new(1.8, Color32::WHITE);
+        p.line_segment(
+            [
+                egui::pos2(box_rect.left() + 3.0, box_rect.center().y),
+                egui::pos2(box_rect.left() + 5.6, box_rect.bottom() - 3.4),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                egui::pos2(box_rect.left() + 5.6, box_rect.bottom() - 3.4),
+                egui::pos2(box_rect.right() - 2.6, box_rect.top() + 3.6),
+            ],
+            st,
+        );
+    } else {
+        ui.painter().rect(
+            box_rect,
+            2.0,
+            Color32::WHITE,
+            Stroke::new(1.0, if enabled { Color32::from_rgb(171, 169, 167) } else { Color32::from_rgb(210, 210, 210) }),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let fg = if enabled { text_color(&v) } else { DISABLED };
+    ui.painter().text(
+        egui::pos2(rect.left() + 26.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        fg,
+    );
+    resp
+}
+
 /// 固定宽度的图标文字按钮：Excel 的「剪切/复制」是 81×24，「插入」也是 81×24
 pub fn labeled_w(
     ui: &mut egui::Ui,
@@ -508,13 +558,37 @@ pub fn caret_right(ui: &mut egui::Ui, center: egui::Pos2, color: Color32) {
 
 
 
+/// 控件状态底色：禁用不给底、按下/选中用 PRESSED、悬停用 HOVER
+pub fn state_bg(enabled: bool, on: bool, hovered: bool, down: bool, dark: bool) -> Color32 {
+    if !enabled {
+        return Color32::TRANSPARENT;
+    }
+    if down || on {
+        if dark { Color32::from_rgb(62, 72, 86) } else { PRESSED }
+    } else if hovered {
+        if dark { Color32::from_rgb(55, 62, 72) } else { HOVER }
+    } else {
+        Color32::TRANSPARENT
+    }
+}
+
 /// 拆分按钮右侧的小箭头按钮：悬停底色 + 细折线箭头
 pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Response {
+    let v = ui.visuals().clone();
+    let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect.shrink(1.0), 2.0, HOVER);
+    let bg = state_bg(
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        v.dark_mode,
+    );
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(1.0), 2.0, bg);
     }
-    caret(ui, rect.center(), color);
+    let c = if enabled { color } else { DISABLED };
+    caret(ui, rect.center(), c);
     resp
 }
 
@@ -527,14 +601,19 @@ pub fn color_button(
     tip: &str,
 ) -> Response {
     let v = ui.visuals().clone();
+    let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            2.0,
-            if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER },
-        );
+    let bg = state_bg(
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        v.dark_mode,
+    );
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 2.0, bg);
     }
+    let fg = if enabled { text_color(&v) } else { DISABLED };
     let top = Rect::from_min_size(rect.min + Vec2::new(2.0, 1.0), Vec2::new(20.0, 18.0));
     if let Some(t) = letter {
         ui.painter().text(
@@ -542,11 +621,11 @@ pub fn color_button(
             Align2::CENTER_CENTER,
             t,
             FontId::proportional(13.0),
-            text_color(&v),
+            fg,
         );
     }
     if let Some(ic) = icon {
-        ui_icons::draw_excel(ui.painter(), top.shrink(2.0), ic, text_color(&v), true);
+        ui_icons::draw_excel(ui.painter(), top.shrink(2.0), ic, fg, enabled);
     }
     // 色条左收 + 右下角小三角：Excel 的颜色按钮是「图标 + 色条 + 下拉箭头」
     let bar = Rect::from_min_size(
@@ -578,18 +657,19 @@ pub fn text_toggle(
     underline: bool,
 ) -> Response {
     let v = ui.visuals().clone();
+    let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
-    let bg = if on {
-        if v.dark_mode { v.selection.bg_fill } else { PRESSED }
-    } else if resp.hovered() {
-        if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = state_bg(
+        enabled,
+        on,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        v.dark_mode,
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
-    let col = text_color(&v);
+    let col = if enabled { text_color(&v) } else { DISABLED };
     let _ = italic;
     let pos = rect.center() - Vec2::new(0.0, 0.5);
     ui.painter()
@@ -1198,4 +1278,23 @@ pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
         );
         add(ui);
     });
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_has_no_background() {
+        assert_eq!(state_bg(false, false, true, true, false), Color32::TRANSPARENT);
+        assert_eq!(state_bg(false, true, true, true, true), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn pressed_beats_hover_and_checked_beats_hover() {
+        assert_eq!(state_bg(true, false, true, true, false), PRESSED);
+        assert_eq!(state_bg(true, true, true, false, false), PRESSED);
+        assert_eq!(state_bg(true, false, true, false, false), HOVER);
+        assert_eq!(state_bg(true, false, false, false, false), Color32::TRANSPARENT);
+    }
 }

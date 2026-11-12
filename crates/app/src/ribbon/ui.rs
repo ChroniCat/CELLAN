@@ -191,7 +191,11 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
     popup(app, ui);
 }
 
+static DBG_GROUPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn group(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
+    let dbg = *DBG_GROUPS.get_or_init(|| std::env::var("SC_PANEL_LOG").is_ok());
+    let before = if dbg { ui.min_rect() } else { Rect::NOTHING };
     match &g.launcher {
         Some(l) => {
             let hit = ui_kit::group_l(ui, &g.label, &g.id, |ui| nodes(app, ui, &g.children));
@@ -203,6 +207,10 @@ fn group(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
         None => {
             ui_kit::group(ui, &g.label, |ui| nodes(app, ui, &g.children));
         }
+    }
+    if dbg {
+        let after = ui.min_rect();
+        eprintln!("[group] {:22} h={:.0}", g.label, after.height() - before.height());
     }
 }
 
@@ -539,12 +547,16 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
             .width
             .unwrap_or_else(|| 96.0_f32.max(measure(ui, &text, 12.0) + 30.0));
         let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 21.0), Sense::click());
-        let hover = r.hovered();
+        let enabled = ui.is_enabled();
+        let hover = r.hovered() && enabled;
         ui.painter().rect(
             rect,
             2.0,
-            ui.visuals().extreme_bg_color,
-            egui::Stroke::new(1.0, ui_kit::BORDER),
+            if enabled { ui.visuals().extreme_bg_color } else { ui_kit::HOVER },
+            egui::Stroke::new(
+                1.0,
+                if enabled { ui_kit::BORDER } else { Color32::from_rgb(224, 224, 224) },
+            ),
             egui::StrokeKind::Inside,
         );
         if hover {
@@ -556,12 +568,12 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
             Align2::LEFT_CENTER,
             &text,
             FontId::proportional(12.0),
-            ui.visuals().text_color(),
+            if enabled { ui.visuals().text_color() } else { ui_kit::DISABLED },
         );
         ui_kit::caret(
             ui,
             egui::pos2(rect.right() - 8.0, rect.center().y),
-            Color32::from_rgb(68, 68, 68),
+            if enabled { Color32::from_rgb(68, 68, 68) } else { ui_kit::DISABLED },
         );
         r.on_hover_text(tip)
     });
@@ -737,13 +749,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                     }
                                     let label =
                                         st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
-                                    let text =
-                                        format!("{} {}", if st.checked { "✓" } else { "　" }, label);
-                                    let btn =
-                                        egui::Button::new(egui::RichText::new(text).size(12.0))
-                                            .min_size(Vec2::new(160.0, 22.0))
-                                            .frame(false);
-                                    let r = ui.add_enabled(st.enabled, btn);
+                                    let r = ui_kit::check_row(ui, &label, st.checked, st.enabled, 200.0);
                                     if r.clicked() {
                                         fire = Some(c.action().to_string());
                                         close = true;
@@ -1278,6 +1284,7 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "Symbol" => Icon::Symbol,
         "ZhS" => Icon::ZhS,
         "ZhT" => Icon::ZhT,
+        "RichText" => Icon::RichText,
         "TraceIn" => Icon::TraceIn,
         "TraceOut" => Icon::TraceOut,
         "SparkLine" => Icon::SparkLine,

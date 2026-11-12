@@ -133,6 +133,7 @@ pub enum Icon {
     TableToRange,
     SparkEdit,
     ChartEdit,
+    RichText,
     Freeze,
     FreezeRow,
     FreezeCol,
@@ -731,9 +732,13 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(11.2, 11.3, 1.6, 1.4, Color32::from_rgb(47, 85, 151));
         }
         Revision => {
-            pen.ring(12.0, 12.0, 8.0, 1.8, GRAY_D);
-            pen.ln(12.0, 12.0, 12.0, 6.8, 1.8, GRAY_D);
-            pen.ln(12.0, 12.0, 15.8, 14.0, 1.8, GRAY_D);
+            // 修订记录：纸 + 右上角一支笔（表示改动）
+            pen.rrs(3.4, 3.2, 13.6, 17.6, 0.6, WHITE, INK, 1.15);
+            pen.bar(6.0, 7.4, 8.4, 1.0, GRAY_D);
+            pen.bar(6.0, 10.4, 8.4, 1.0, GRAY_D);
+            pen.bar(6.0, 13.4, 5.4, 1.0, GRAY_D);
+            pen.poly(&[(13.2, 17.6), (17.2, 13.6), (19.6, 16.0), (15.6, 20.0)], Color32::from_rgb(255, 217, 102), INK, 1.0);
+            pen.poly(&[(13.2, 17.6), (12.6, 20.6), (15.6, 20.0)], INK, INK, 0.0);
         }
         Zoom => {
             pen.ring(10.2, 10.2, 5.4, 1.9, INK);
@@ -900,8 +905,24 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
         Fx => pen.text("fx", 12.0, 12.0, 13.0, GRAY_D),
         Sum => pen.text("Σ", 15.0, 12.0, 12.6, INK),
         Symbol => pen.text("Ω", 15.0, 12.0, 12.2, BLUE_D),
-        ZhS => pen.text("简", 13.0, 12.0, 12.4, RED),
-        ZhT => pen.text("繁", 13.0, 12.0, 12.4, BLUE_D),
+        RichText => {
+            // 富文本：一个 A + 三条不同颜色的短线（选区里混排样式）
+            pen.text("A", 12.0, 9.6, 12.4, INK);
+            pen.bar(5.0, 16.6, 14.0, 1.8, Color32::from_rgb(68, 114, 196));
+            pen.bar(5.0, 19.2, 9.4, 1.8, Color32::from_rgb(237, 125, 49));
+        }
+        ZhS => {
+            // 简转繁：中性「简」+ 绿色向右箭头
+            pen.text("简", 8.4, 12.0, 12.4, INK);
+            pen.ln(15.4, 12.0, 21.2, 12.0, 1.8, Color32::from_rgb(33, 115, 70));
+            pen.poly(&[(21.8, 12.0), (18.2, 9.6), (18.2, 14.4)], Color32::from_rgb(33, 115, 70), Color32::from_rgb(33, 115, 70), 0.0);
+        }
+        ZhT => {
+            // 繁转简：中性「繁」+ 绿色向左箭头
+            pen.text("繁", 14.6, 12.0, 12.4, INK);
+            pen.ln(8.6, 12.0, 2.8, 12.0, 1.8, Color32::from_rgb(33, 115, 70));
+            pen.poly(&[(2.2, 12.0), (5.8, 9.6), (5.8, 14.4)], Color32::from_rgb(33, 115, 70), Color32::from_rgb(33, 115, 70), 0.0);
+        }
         TraceIn => {
             // 追踪引用：箭头从外面指向本格
             pen.rro(12.0, 7.0, 9.0, 10.0, 1.0, BLUE_D, 1.4);
