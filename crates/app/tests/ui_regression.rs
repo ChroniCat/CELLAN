@@ -39,6 +39,8 @@ fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option
     cmd.arg(file)
         .env("SC_DUMP", &out)
         .env("SC_DUMP_AT", "2")
+        // 独立单实例端口：用户开着 app 时也要能起测试实例（否则会转发给用户那个进程）
+        .env("SC_INSTANCE_PORT", "49731")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (k, v) in extra {

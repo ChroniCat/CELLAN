@@ -2866,3 +2866,31 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
    真实鼠标拖拽无法在本机无头环境验证（RDP 的 SendInput/驱动拖拽会被 egui 压成一帧的 press+release），
    这一点如实记在这里。
 
+### 第四十三轮：单元格右键菜单按 Excel 365 重做（2026-11-12）
+
+用户拿 Excel 的右键（p1）和我们的（p2）对照，条目和样子都差太多。改成自绘菜单：
+
+- **条目与顺序照 Excel 365**：剪切 / 复制 / 粘贴 / 粘贴选项图标条 / 选择性粘贴… /
+  插入▸ / 删除▸ / 清除内容 / 筛选▸ / 排序▸ / 设置单元格格式… / 超链接…
+- **几何**：宽 246、行高 26、图标 16px（左内边距 12、文字起点 36）、快捷键右对齐 11px 灰、
+  子菜单箭头 `›`、1px `#C6C6C6` 边框 + 2px 阴影、选中行 4px 内缩的 `#F2F2F2` 高亮、分隔线 8px 间距。
+- **粘贴选项图标条**：粘贴 / 公式 / 数值 / 格式 / 转置，五个图标一格，点哪个就按哪种方式粘
+  （走 `paste_special_apply` 的 ps_kind 通路，不是假按钮）。
+- **子菜单**：插入（单元格… / 工作表行 / 工作表列）、删除（同）、筛选（有筛选时给清除/重新应用）、
+  排序（升序 / 降序 / 自定义排序…）。
+- **右击不在选区里的格子会先把选区挪过去**（Excel 行为），再弹菜单。
+- 全部动作走既有真实实现：clip_copy/clip_paste、shift_cells、structural、clear_values、
+  start_filter、do_sort、open_format_dialog、超链接对话框——都可撤销。
+
+验收：
+- `ctx_menu_rows_match_excel_cell_menu`（条目/顺序/子菜单归属/宽高）
+- `ctx_menu_clear_contents_only_clears_values`（清内容保留格式 + 可撤销）
+- `ctx_menu_sort_asc_and_desc_are_real`（整区域升降序 + 状态栏）
+- `ctx_menu_insert_and_delete_rows_are_real`（插入推移、删除还原）
+- `ctx_menu_paste_values_keeps_number_but_drops_formula`（只粘数值不带公式）
+- 截图：主菜单 15 行全部渲染（图标/快捷键/分隔线/箭头齐全），插入子菜单与「插入」行顶部对齐、不重叠。
+
+顺带修掉一个测试环境坑：UI 回归启动的 app 实例会和用户正在跑的预览抢单实例端口 48765，
+抢不到就转发过去随即退出、dump 永远不落盘（表现为随机假失败）。`single_instance::port()` 支持
+`SC_INSTANCE_PORT` 覆盖，回归测试改用 49731，用户开着 app 也能跑测试。
+

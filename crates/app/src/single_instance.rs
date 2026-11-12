@@ -16,6 +16,14 @@ use std::time::Duration;
 /// 只监听 127.0.0.1，外部连不进来
 pub const PORT: u16 = 48_765;
 
+/// 实际使用的端口：`SC_INSTANCE_PORT` 可覆盖（UI 回归测试用它避开用户正在跑的实例）
+pub fn port() -> u16 {
+    std::env::var("SC_INSTANCE_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(PORT)
+}
+
 pub enum Role {
     /// 我是第一个实例；别人的"你打开的是不是这个文件"询问从这里进来
     Primary(Receiver<PathBuf>),
@@ -30,7 +38,7 @@ pub fn claim(
     forward: Option<PathBuf>,
     current: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
 ) -> Role {
-    match TcpListener::bind(("127.0.0.1", PORT)) {
+    match TcpListener::bind(("127.0.0.1", port())) {
         Ok(listener) => {
             let (tx, rx) = channel();
             std::thread::spawn(move || {
@@ -70,7 +78,7 @@ pub fn claim(
         Err(_) => {
             let Some(path) = forward else { return Role::Standalone };
             let Ok(mut s) = TcpStream::connect_timeout(
-                &format!("127.0.0.1:{PORT}").parse().unwrap(),
+                &format!("127.0.0.1:{}", port()).parse().unwrap(),
                 Duration::from_millis(600),
             ) else {
                 return Role::Standalone;

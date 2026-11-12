@@ -1129,3 +1129,98 @@ fn insert_cells_rewrites_formula_refs() {
     let f = app.wb.sheet(0).get(0, 1).and_then(|c| c.formula.clone());
     assert_eq!(f.as_deref(), Some("A3+1"));
 }
+
+// ---------------------------------------------------------------- 右键菜单
+
+#[test]
+fn ctx_menu_rows_match_excel_cell_menu() {
+    let rows = ctx_menu_rows(false);
+    let labels: Vec<&str> = rows.iter().filter(|r| !r.is_sep() && !r.strip).map(|r| r.label).collect();
+    assert_eq!(
+        labels,
+        [
+            "剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容",
+            "筛选", "排序", "设置单元格格式…", "超链接…"
+        ],
+        "条目与顺序照 Excel 365 的单元格右键菜单"
+    );
+    // 四个子菜单
+    let parents: Vec<&str> = rows.iter().filter(|r| !r.children.is_empty()).map(|r| r.label).collect();
+    assert_eq!(parents, ["插入", "删除", "筛选", "排序"]);
+    // 粘贴选项图标条在「复制」和「选择性粘贴」之间
+    let strip_at = rows.iter().position(|r| r.strip).unwrap();
+    assert_eq!(rows[strip_at - 1].label, "粘贴");
+    assert_eq!(rows[strip_at + 2].label, "选择性粘贴…");
+    // 高度：246 宽、行高 26
+    assert_eq!(CTX_W, 246.0);
+    assert_eq!(CTX_ROW_H, 26.0);
+    assert!(ctx_menu_height(&rows) > 300.0 && ctx_menu_height(&rows) < 480.0);
+}
+
+#[test]
+fn ctx_menu_clear_contents_only_clears_values() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(7.0));
+    app.wb.sheets[0].set_style(0, 0, 0);
+    app.wb.sheets[0].set(0, 1, number(9.0));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.ctx_menu_run(CtxAct::ClearContents, &ctx);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Empty);
+    // 撤销要能回来
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(7.0));
+}
+
+#[test]
+fn ctx_menu_sort_asc_and_desc_are_real() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    for (i, v) in [("b", 3.0), ("a", 1.0), ("c", 2.0)].iter().enumerate() {
+        app.wb.sheets[0].set(i as u32, 0, Cell { value: Value::Text((*v).0.into()), formula: None });
+        app.wb.sheets[0].set(i as u32, 1, number(v.1));
+    }
+    app.sel = (1, 1);
+    app.ctx_menu_run(CtxAct::SortAsc, &ctx);
+    let col: Vec<String> = (0..3).map(|r| app.wb.sheets[0].value(r, 1).display()).collect();
+    assert_eq!(col, ["1", "2", "3"], "升序按当前列排整个区域");
+    assert!(app.status.contains("升序"));
+    app.ctx_menu_run(CtxAct::SortDesc, &ctx);
+    let col: Vec<String> = (0..3).map(|r| app.wb.sheets[0].value(r, 1).display()).collect();
+    assert_eq!(col, ["3", "2", "1"]);
+}
+
+#[test]
+fn ctx_menu_insert_and_delete_rows_are_real() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(1.0));
+    app.wb.sheets[0].set(1, 0, number(2.0));
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.ctx_menu_run(CtxAct::InsertRows, &ctx);
+    assert_eq!(app.wb.sheets[0].value(2, 0), Value::Number(2.0), "原第 2 行被推到第 3 行");
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.ctx_menu_run(CtxAct::DeleteRows, &ctx);
+    assert_eq!(app.wb.sheets[0].value(1, 0), Value::Number(2.0), "删掉刚插入的空行");
+}
+
+#[test]
+fn ctx_menu_paste_values_keeps_number_but_drops_formula() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    // 剪贴板里放一个带公式的格子
+    app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(5.0), formula: Some("2+3".into()) });
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clip_copy(false, &ctx);
+    app.sel = (2, 2);
+    app.sel_end = (2, 2);
+    app.ctx_menu_run(CtxAct::PasteValues, &ctx);
+    let cell = app.wb.sheets[0].get(2, 2).cloned().unwrap();
+    assert!(cell.formula.is_none(), "只粘数值，不带公式");
+    assert_eq!(cell.value, Value::Number(5.0));
+}

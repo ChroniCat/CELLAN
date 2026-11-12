@@ -730,6 +730,10 @@ struct SheetApp {
     extra_sel: Vec<(u32, u32, u32, u32)>,
     /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
     grid_press: Option<(u32, u32)>,
+    /// 单元格右键菜单
+    ctx_menu: Option<CtxMenuState>,
+    /// 本帧菜单占用的矩形（判断点击是否落在外面）
+    ctx_rects: Vec<egui::Rect>,
     /// 拖动选区移动：起点格 + 指针起点
     cell_move: Option<((u32, u32), egui::Pos2, bool)>,
     /// 拖动行号/列标移动整行整列：(是否行, 起始索引, 行/列数)
@@ -878,6 +882,148 @@ enum OpenMsg {
     /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch）
     RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64),
     Failed(String),
+}
+
+// ---------------------------------------------------------------- 右键菜单（Excel 365 样式）
+
+/// 右键菜单能执行的动作
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CtxAct {
+    Cut,
+    Copy,
+    Paste,
+    PasteSpecial,
+    PasteValues,
+    PasteFormulas,
+    PasteFormats,
+    PasteTranspose,
+    InsertCells,
+    InsertRows,
+    InsertCols,
+    DeleteCells,
+    DeleteRows,
+    DeleteCols,
+    ClearContents,
+    ToggleFilter,
+    ClearFilter,
+    SortAsc,
+    SortDesc,
+    SortCustom,
+    FormatCells,
+    Hyperlink,
+}
+
+/// 一行菜单项；`strip` 为真的行画粘贴选项图标条
+struct CtxRow {
+    label: &'static str,
+    icon: Option<crate::ui_icons::Icon>,
+    shortcut: &'static str,
+    act: Option<CtxAct>,
+    children: Vec<CtxRow>,
+    strip: bool,
+}
+
+impl CtxRow {
+    fn item(label: &'static str, icon: Option<crate::ui_icons::Icon>, shortcut: &'static str, act: CtxAct) -> Self {
+        Self { label, icon, shortcut, act: Some(act), children: Vec::new(), strip: false }
+    }
+    fn parent(label: &'static str, icon: Option<crate::ui_icons::Icon>, children: Vec<CtxRow>) -> Self {
+        Self { label, icon, shortcut: "", act: None, children, strip: false }
+    }
+    fn sep() -> Self {
+        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: false }
+    }
+    fn paste_strip() -> Self {
+        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: true }
+    }
+    fn is_sep(&self) -> bool {
+        self.label.is_empty() && !self.strip
+    }
+}
+
+/// 右键菜单状态
+struct CtxMenuState {
+    pos: egui::Pos2,
+    /// 打开这一帧的帧号：同一帧的点击不算「点到外面」
+    frame: u64,
+    /// 展开的子菜单 (行号)
+    sub: Option<usize>,
+}
+
+/// 单元格右键菜单的条目（照本机 Excel 365 的单元格菜单排）
+fn ctx_menu_rows(has_filter: bool) -> Vec<CtxRow> {
+    vec![
+        CtxRow::item("剪切", Some(crate::ui_icons::Icon::Cut), "Ctrl+X", CtxAct::Cut),
+        CtxRow::item("复制", Some(crate::ui_icons::Icon::Copy), "Ctrl+C", CtxAct::Copy),
+        CtxRow::item("粘贴", Some(crate::ui_icons::Icon::Paste), "Ctrl+V", CtxAct::Paste),
+        CtxRow::paste_strip(),
+        CtxRow::sep(),
+        CtxRow::item("选择性粘贴…", None, "Ctrl+Alt+V", CtxAct::PasteSpecial),
+        CtxRow::sep(),
+        CtxRow::parent(
+            "插入",
+            Some(crate::ui_icons::Icon::Plus),
+            vec![
+                CtxRow::item("单元格…", None, "", CtxAct::InsertCells),
+                CtxRow::item("工作表行", None, "", CtxAct::InsertRows),
+                CtxRow::item("工作表列", None, "", CtxAct::InsertCols),
+            ],
+        ),
+        CtxRow::parent(
+            "删除",
+            Some(crate::ui_icons::Icon::Eraser),
+            vec![
+                CtxRow::item("单元格…", None, "", CtxAct::DeleteCells),
+                CtxRow::item("工作表行", None, "", CtxAct::DeleteRows),
+                CtxRow::item("工作表列", None, "", CtxAct::DeleteCols),
+            ],
+        ),
+        CtxRow::item("清除内容", Some(crate::ui_icons::Icon::Eraser), "Delete", CtxAct::ClearContents),
+        CtxRow::sep(),
+        CtxRow::parent(
+            "筛选",
+            Some(crate::ui_icons::Icon::Filter),
+            if has_filter {
+                vec![
+                    CtxRow::item("清除筛选", None, "", CtxAct::ClearFilter),
+                    CtxRow::item("重新应用", None, "", CtxAct::ToggleFilter),
+                ]
+            } else {
+                vec![CtxRow::item("筛选", None, "", CtxAct::ToggleFilter)]
+            },
+        ),
+        CtxRow::parent(
+            "排序",
+            Some(crate::ui_icons::Icon::SortAsc),
+            vec![
+                CtxRow::item("升序", None, "", CtxAct::SortAsc),
+                CtxRow::item("降序", None, "", CtxAct::SortDesc),
+                CtxRow::item("自定义排序…", None, "", CtxAct::SortCustom),
+            ],
+        ),
+        CtxRow::sep(),
+        CtxRow::item("设置单元格格式…", Some(crate::ui_icons::Icon::FontColor), "Ctrl+1", CtxAct::FormatCells),
+        CtxRow::item("超链接…", Some(crate::ui_icons::Icon::Link), "Ctrl+K", CtxAct::Hyperlink),
+    ]
+}
+
+/// 菜单的像素尺寸（本机 Excel 365 实测：宽 246、行高 26、图标 16）
+const CTX_W: f32 = 246.0;
+const CTX_ROW_H: f32 = 26.0;
+const CTX_STRIP_H: f32 = 34.0;
+
+fn ctx_menu_height(rows: &[CtxRow]) -> f32 {
+    let mut h = 4.0;
+    for r in rows {
+        h += if r.strip {
+            CTX_STRIP_H
+        } else if r.is_sep() {
+            8.0
+        } else {
+            CTX_ROW_H
+        };
+    }
+    h + 4.0
 }
 
 impl SheetApp {
@@ -1078,6 +1224,8 @@ impl SheetApp {
             paint_scale: 1.0,
             extra_sel: Vec::new(),
             grid_press: None,
+            ctx_menu: None,
+            ctx_rects: Vec::new(),
             cell_move: None,
             header_move: None,
             pending_autofit: None,
@@ -15680,6 +15828,317 @@ impl SheetApp {
         (cols, rows)
     }
 
+    /// 自绘单元格右键菜单（照本机 Excel 365 的条目、分组、行高与图标位）
+    fn ctx_menu_window(&mut self, ctx: &egui::Context) {
+        self.ctx_rects.clear();
+        let Some(m) = self.ctx_menu.as_ref() else { return };
+        let (pos, opened_frame, sub) = (m.pos, m.frame, m.sub);
+        let has_filter = self.wb.sheet(self.sheet_idx).filter.is_some();
+        let rows = ctx_menu_rows(has_filter);
+        let total_h = ctx_menu_height(&rows);
+        let mut action: Option<CtxAct> = None;
+        let mut sub_req: Option<(usize, f32)> = None;
+        let mut rects: Vec<egui::Rect> = Vec::new();
+        let fg = egui::Color32::from_rgb(32, 32, 32);
+        let grey = egui::Color32::from_rgb(120, 120, 120);
+        let ink = egui::Color32::from_rgb(56, 56, 56);
+        let hover_bg = egui::Color32::from_rgb(242, 242, 242);
+
+        egui::Area::new(egui::Id::new("ctx_menu_area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(pos, egui::vec2(CTX_W, total_h));
+                rects.push(rect);
+                ui.allocate_rect(rect, egui::Sense::hover());
+                let p = ui.painter().clone();
+                // 阴影 + 白底 + 1px 边框（Excel 的菜单没有圆角）
+                p.rect_filled(
+                    rect.translate(egui::vec2(2.0, 2.0)),
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                );
+                p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                p.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+                    egui::StrokeKind::Inside,
+                );
+                let mut y = pos.y + 4.0;
+                for (i, row) in rows.iter().enumerate() {
+                    if row.is_sep() {
+                        p.line_segment(
+                            [
+                                egui::pos2(pos.x + 8.0, y + 3.5),
+                                egui::pos2(pos.x + CTX_W - 8.0, y + 3.5),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 226, 226)),
+                        );
+                        y += 8.0;
+                        continue;
+                    }
+                    if row.strip {
+                        // 粘贴选项：Excel 在菜单里放一排图标按钮
+                        let strip = egui::Rect::from_min_size(
+                            egui::pos2(pos.x, y),
+                            egui::vec2(CTX_W, CTX_STRIP_H),
+                        );
+                        p.rect_filled(
+                            strip.shrink2(egui::vec2(6.0, 2.0)),
+                            2.0,
+                            egui::Color32::from_rgb(247, 247, 247),
+                        );
+                        let icons = [
+                            (CtxAct::Paste, crate::ui_icons::Icon::Paste),
+                            (CtxAct::PasteFormulas, crate::ui_icons::Icon::Fx),
+                            (CtxAct::PasteValues, crate::ui_icons::Icon::Sum),
+                            (CtxAct::PasteFormats, crate::ui_icons::Icon::Brush),
+                            (CtxAct::PasteTranspose, crate::ui_icons::Icon::Table),
+                        ];
+                        for (k, (a, ic)) in icons.iter().enumerate() {
+                            let br = egui::Rect::from_min_size(
+                                egui::pos2(strip.left() + 10.0 + k as f32 * 45.0, strip.top() + 5.0),
+                                egui::vec2(36.0, 24.0),
+                            );
+                            let r = ui.interact(
+                                br,
+                                egui::Id::new(("ctx_paste", k)),
+                                egui::Sense::click(),
+                            );
+                            if r.hovered() {
+                                p.rect_filled(br, 2.0, egui::Color32::from_rgb(232, 232, 232));
+                            }
+                            ui_icons::draw(&p, br.shrink(6.0), *ic, ink);
+                            if r.clicked() {
+                                action = Some(*a);
+                            }
+                        }
+                        y += CTX_STRIP_H;
+                        continue;
+                    }
+                    let rr = egui::Rect::from_min_size(
+                        egui::pos2(pos.x, y),
+                        egui::vec2(CTX_W, CTX_ROW_H),
+                    );
+                    let r = ui.interact(rr, egui::Id::new(("ctx_row", i)), egui::Sense::click());
+                    let active = matches!(sub, Some(s) if s == i);
+                    if r.hovered() || active {
+                        p.rect_filled(
+                            rr.shrink2(egui::vec2(4.0, 0.0)),
+                            2.0,
+                            hover_bg,
+                        );
+                    }
+                    if let Some(ic) = row.icon {
+                        ui_icons::draw(
+                            &p,
+                            egui::Rect::from_min_size(
+                                egui::pos2(pos.x + 12.0, y + 5.0),
+                                egui::vec2(16.0, 16.0),
+                            ),
+                            ic,
+                            ink,
+                        );
+                    }
+                    p.text(
+                        egui::pos2(pos.x + 36.0, y + CTX_ROW_H / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        row.label,
+                        egui::FontId::proportional(12.5),
+                        fg,
+                    );
+                    let has_children = !row.children.is_empty();
+                    if !row.shortcut.is_empty() {
+                        p.text(
+                            egui::pos2(
+                                pos.x + CTX_W - 12.0 - if has_children { 14.0 } else { 0.0 },
+                                y + CTX_ROW_H / 2.0,
+                            ),
+                            egui::Align2::RIGHT_CENTER,
+                            row.shortcut,
+                            egui::FontId::proportional(11.0),
+                            grey,
+                        );
+                    }
+                    if has_children {
+                        p.text(
+                            egui::pos2(pos.x + CTX_W - 9.0, y + CTX_ROW_H / 2.0),
+                            egui::Align2::RIGHT_CENTER,
+                            "›",
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::from_rgb(90, 90, 90),
+                        );
+                        if r.hovered() || matches!(sub, Some(s) if s == i) {
+                            sub_req = Some((i, rr.top()));
+                        }
+                    }
+                    if r.clicked() {
+                        if let Some(a) = row.act {
+                            action = Some(a);
+                        }
+                    }
+                    y += CTX_ROW_H;
+                }
+            });
+
+        // 子菜单
+        if let Some((idx, top)) = sub_req {
+            let kids = &rows[idx].children;
+            let w = 172.0;
+            let hh = kids.len() as f32 * CTX_ROW_H + 8.0;
+            let sp = egui::pos2(pos.x + CTX_W - 2.0, top - 3.0);
+            egui::Area::new(egui::Id::new("ctx_sub_area"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(sp)
+                .show(ctx, |ui| {
+                    let rect = egui::Rect::from_min_size(sp, egui::vec2(w, hh));
+                    rects.push(rect);
+                    ui.allocate_rect(rect, egui::Sense::hover());
+                    let p = ui.painter().clone();
+                    p.rect_filled(
+                        rect.translate(egui::vec2(2.0, 2.0)),
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                    );
+                    p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                    p.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let mut y = sp.y + 4.0;
+                    for (k, kid) in kids.iter().enumerate() {
+                        let rr = egui::Rect::from_min_size(
+                            egui::pos2(sp.x, y),
+                            egui::vec2(w, CTX_ROW_H),
+                        );
+                        let r = ui.interact(
+                            rr,
+                            egui::Id::new(("ctx_sub_row", k)),
+                            egui::Sense::click(),
+                        );
+                        if r.hovered() {
+                            p.rect_filled(rr.shrink2(egui::vec2(4.0, 0.0)), 2.0, hover_bg);
+                        }
+                        p.text(
+                            egui::pos2(sp.x + 14.0, y + CTX_ROW_H / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            kid.label,
+                            egui::FontId::proportional(12.5),
+                            fg,
+                        );
+                        if r.clicked() {
+                            if let Some(a) = kid.act {
+                                action = Some(a);
+                            }
+                        }
+                        y += CTX_ROW_H;
+                    }
+                });
+        }
+
+        self.ctx_rects = rects;
+        if let Some(a) = action {
+            self.ctx_menu = None;
+            self.ctx_menu_run(a, ctx);
+            return;
+        }
+        // Esc / 点到菜单外面（打开那一帧的点击不算）
+        let now_frame = ctx.cumulative_pass_nr();
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let click_out = ctx.input(|i| {
+            i.pointer.any_click()
+                && i.pointer
+                    .interact_pos()
+                    .map(|p| !self.ctx_rects.iter().any(|r| r.contains(p)))
+                    .unwrap_or(false)
+        });
+        if esc || (click_out && now_frame != opened_frame) || now_frame > opened_frame + 1 && click_out {
+            self.ctx_menu = None;
+        }
+        // 子菜单：指针离开父菜单就收起
+        if let Some(m) = self.ctx_menu.as_mut() {
+            m.sub = sub_req.map(|(i, _)| i);
+        }
+    }
+
+    /// 执行右键菜单动作
+    fn ctx_menu_run(&mut self, act: CtxAct, ctx: &egui::Context) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let n_rows = r2 - r1 + 1;
+        let n_cols = c2 - c1 + 1;
+        match act {
+            CtxAct::Cut => self.clip_copy(true, ctx),
+            CtxAct::Copy => self.clip_copy(false, ctx),
+            CtxAct::Paste => self.clip_paste(false, None),
+            CtxAct::PasteValues => {
+                self.ps_kind = 1;
+                self.ps_transpose = false;
+                self.paste_special_apply(ctx);
+            }
+            CtxAct::PasteFormulas => {
+                self.ps_kind = 2;
+                self.ps_transpose = false;
+                self.paste_special_apply(ctx);
+            }
+            CtxAct::PasteFormats => {
+                self.ps_kind = 3;
+                self.ps_transpose = false;
+                self.paste_special_apply(ctx);
+            }
+            CtxAct::PasteTranspose => {
+                self.ps_kind = 0;
+                self.ps_transpose = true;
+                self.paste_special_apply(ctx);
+            }
+            CtxAct::PasteSpecial => self.paste_special = true,
+            CtxAct::InsertCells => self.shift_cells(true, true),
+            CtxAct::InsertRows => self.structural(sheetcore::structural::Structural::InsertRows {
+                at: r1,
+                n: n_rows,
+            }),
+            CtxAct::InsertCols => self.structural(sheetcore::structural::Structural::InsertCols {
+                at: c1,
+                n: n_cols,
+            }),
+            CtxAct::DeleteCells => self.shift_cells(false, true),
+            CtxAct::DeleteRows => self.structural(sheetcore::structural::Structural::DeleteRows {
+                at: r1,
+                n: n_rows,
+            }),
+            CtxAct::DeleteCols => self.structural(sheetcore::structural::Structural::DeleteCols {
+                at: c1,
+                n: n_cols,
+            }),
+            CtxAct::ClearContents => self.clear_values(),
+            CtxAct::ToggleFilter => self.start_filter(),
+            CtxAct::ClearFilter => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.filter = None;
+                sh.hidden_rows.clear();
+                sh.filter_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = "已取消筛选".into();
+            }
+            CtxAct::SortAsc => self.do_sort(self.sel.1, true),
+            CtxAct::SortDesc => self.do_sort(self.sel.1, false),
+            CtxAct::SortCustom => {
+                self.data_dlg = Some(DataDlg {
+                    tab: 0,
+                    keys: vec![(self.sel.1, true, true)],
+                    header: true,
+                    delim: ",".into(),
+                });
+            }
+            CtxAct::FormatCells => self.open_format_dialog(),
+            CtxAct::Hyperlink => {
+                self.hyper_dlg = Some((String::new(), String::new()));
+            }
+        }
+    }
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -15707,50 +16166,6 @@ impl SheetApp {
                 .interact_pointer_pos()
                 .map(|p| p.x < origin.x + HEAD_W + 12.0 || p.y < origin.y + hh)
                 .unwrap_or(false);
-        if !secondary_in_head {
-        resp.context_menu(|ui| {
-            let (r1, c1, r2, c2) = self.sel_rect();
-            let rows = r2 - r1 + 1;
-            if ui.button("剪切").clicked() {
-                self.clip_copy(true, ui.ctx());
-                ui.close_menu();
-            }
-            if ui.button("复制").clicked() {
-                self.clip_copy(false, ui.ctx());
-                ui.close_menu();
-            }
-            if ui.button("粘贴").clicked() {
-                self.clip_paste(false, None);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button(format!("插入 {rows} 行")).clicked() {
-                self.structural(sheetcore::structural::Structural::InsertRows { at: r1, n: rows });
-                ui.close_menu();
-            }
-            if ui.button(format!("删除 {rows} 行")).clicked() {
-                self.structural(sheetcore::structural::Structural::DeleteRows { at: r1, n: rows });
-                ui.close_menu();
-            }
-            if ui.button("插入列").clicked() {
-                self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: 1 });
-                ui.close_menu();
-            }
-            if ui.button("删除列").clicked() {
-                self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: 1 });
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("冻结到当前单元格").clicked() {
-                self.set_freeze(Some((r1, c1)));
-                ui.close_menu();
-            }
-            if ui.button("取消冻结").clicked() {
-                self.set_freeze(None);
-                ui.close_menu();
-            }
-        });
-        }
         painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
 
         // 滚轮
@@ -18019,6 +18434,33 @@ impl SheetApp {
             }
         }
 
+        // 单元格右键菜单：Excel 365 的条目与几何（自绘，见 ctx_menu_window）
+        if !secondary_in_head && resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                // Excel：右击不在选区里的格子会先把选区挪过去，再弹菜单
+                if p.x > origin.x + head_w && p.y > origin.y + hh {
+                    let (cr, cc) = (row_at(p.y), col_at(p.x));
+                    let (r1, c1, r2, c2) = self.sel_rect();
+                    if cr < r1 || cr > r2 || cc < c1 || cc > c2 {
+                        let hit = match merges
+                            .iter()
+                            .find(|(mr1, mc1, mr2, mc2)| cr >= *mr1 && cr <= *mr2 && cc >= *mc1 && cc <= *mc2)
+                        {
+                            Some((mr1, mc1, _, _)) => (*mr1, *mc1),
+                            None => (cr, cc),
+                        };
+                        self.sel = hit;
+                        self.sel_end = hit;
+                        self.extra_sel.clear();
+                    }
+                }
+                self.ctx_menu = Some(CtxMenuState {
+                    pos: p,
+                    frame: ui.ctx().cumulative_pass_nr(),
+                    sub: None,
+                });
+            }
+        }
         // 按下即落锚点（Excel 的行为）。egui 的 clicked() 要等松开、drag_started() 要等超过阈值，
         // 只靠它们的话「快速点按后马上拖」会从上一个选区开始长，手感上也像延迟了一拍。
         if !readonly {
@@ -20005,6 +20447,22 @@ impl eframe::App for SheetApp {
                 }
             }
         }
+        // 无界面验收：SC_CTX_MENU="x,y" 在该屏幕位置弹出单元格右键菜单；SC_CTX_SUB=n 展开第 n 行的子菜单
+        if let Ok(spec) = std::env::var("SC_CTX_MENU") {
+            if self.tasks.open_rx.is_none() {
+                let v: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if v.len() == 2 {
+                    let sub = std::env::var("SC_CTX_SUB")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok());
+                    self.ctx_menu = Some(CtxMenuState {
+                        pos: egui::pos2(v[0], v[1]),
+                        frame: 0,
+                        sub,
+                    });
+                }
+            }
+        }
         // 无界面验收：SC_FREEZE="行,列" 设冻结（不写盘，只看渲染）
         if let Ok(spec) = std::env::var("SC_FREEZE") {
             // 每帧重设：装载完成后的整份替换会把冻结冲掉
@@ -20262,6 +20720,7 @@ impl eframe::App for SheetApp {
         self.flashfill_dialog(ctx);
         self.consolidate_dialog(ctx);
         self.a11y_window(ctx);
+        self.ctx_menu_window(ctx);
         self.view_new_dialog(ctx);
         self.views_window(ctx);
         self.unhide_window(ctx);
