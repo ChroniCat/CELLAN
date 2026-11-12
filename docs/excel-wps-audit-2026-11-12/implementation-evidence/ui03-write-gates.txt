@@ -52,3 +52,40 @@ M3 去掉 clear_selection 的 "清除内容" 门禁 → 同上 FAILED
 五、已知边界（未标通过）
 - 保护粒度：当前模型只有整表 protection；"允许编辑区域/细粒度 locked/hidden" 在需求中明确另交核心保护任务，本任务只统一入口语义。
 - 真实 GUI 键鼠逐入口点验（含右键菜单、拖拽手柄、协作对端实际收到/未收到广播）未执行；本轮为状态级集成测试 + 全量 GUI 回归，登记为待验收项。
+
+
+============================================================
+七、05:12/05:30 复核后的四处入口补齐（2026-11-13）
+============================================================
+实现：
+- fill_cmd（Ctrl+D/Ctrl+R）在 commit_edit 后、写模型前，按“真实被写范围”预检：
+  向下 = 首行之外的行；向右 = 首列之外的列。受保护/尾端目标锁/deps_pending 全部
+  在 txn 之前拒绝，值、样式、undo、dirty、广播都不动。
+- fill_to 横向门禁从“只查源区”扩到 target_col，锁在 C1 时 A1→F1 整批拒绝，B1 不会半写。
+- move_selection_by 预检源+目标；copy_selection_by 预检真实目标；shift_insert_by 预检
+  源区 + 结构插入会挪动的已有格/样式 + 租约表里的空目标锁。
+- lock_holder_on 离线也认本地租约表（以前 net=None 直接放行，测试锁不住）。
+- dv 选择逻辑抽成 dv_pick_apply（网格弹层与测试同一入口），受保护表调用被拒绝。
+
+用例（crates/app/src/edit_regression_tests.rs）：
+- fill_shortcuts_are_blocked_by_protection_tail_locks_and_pending_deps：
+  真实 Ctrl+D 事件（egui RawInput）跑受保护/尾端锁/pending 三分支；新增真实 Ctrl+R 分支，
+  锁在 C1，B1 保持 Empty。
+- horizontal_fill_gate_covers_the_real_target_column
+- drag_moves_copy_and_shift_check_source_target_and_moved_ranges
+- protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick 现在真的调用 dv_pick_apply
+
+命令与结果：
+  cargo test -p app ... -- fill_shortcuts                   1 passed
+  cargo test -p app ... -- horizontal_fill_gate             1 passed
+  cargo test -p app ... -- drag_moves_copy                  1 passed
+  全量 app 168 passed / 0 failed；GUI 12 passed / 8 ignored
+变异（均转红后还原）：
+  M1 去掉 fill_cmd 预检 → fill_shortcuts FAILED
+  M2 横向门禁退回源区 → horizontal_fill_gate FAILED
+  M3 去掉移动预检 → drag_moves_copy FAILED
+
+仍未执行（保留待验收）：
+- 右键菜单/拖拽手柄/协作对端的真实键鼠点验；dv 弹层里的真实鼠标选择未做
+  （只覆盖了与弹层共用的 dv_pick_apply 入口）。
+- 细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）。

@@ -512,12 +512,6 @@ fn editing_an_existing_external_link_persists_the_new_target() {
 
 // ---------------------------------------------------------------- 04:49 补充三项边界
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -529,11 +523,6 @@ fn fixture(name: &str) -> std::path::PathBuf {
 /// 不能落到内置 BIFF 读取器，也不能对非 zip 容器跑 OOXML 扫描。
 #[test]
 fn real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml() {
-    let _g = env_guard();
-    unsafe {
-        std::env::remove_var("SC_SIDE_PANIC");
-        std::env::remove_var("SC_LOAD_WORKER_PANIC");
-    }
     let path = fixture("real_excel.xls");
     let (wb, diag) = sheetcore::xlsx::load_diag(&path).expect("真实 .xls 应能打开");
     use std::sync::atomic::Ordering::SeqCst;
@@ -559,7 +548,6 @@ fn real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml() {
 /// 工作簿标 incomplete，禁止覆盖原文件，原文件 SHA 不变。
 #[test]
 fn side_scan_panic_is_fatal_and_source_bytes_are_untouched() {
-    let _g = env_guard();
     let d = dir("sidepanic");
     let p = d.join("side.xlsx");
     let mut wb = Workbook::new_blank();
@@ -567,9 +555,9 @@ fn side_scan_panic_is_fatal_and_source_bytes_are_untouched() {
     sheetcore::xlsx::save(&p, &wb).unwrap();
     let before = sha256(&p);
 
-    unsafe { std::env::set_var("SC_SIDE_PANIC", "1") };
+    sheetcore::xlsx::inject_side_panic(&p);
     let loaded = sheetcore::xlsx::load_diag(&p);
-    unsafe { std::env::remove_var("SC_SIDE_PANIC") };
+    sheetcore::xlsx::clear_fault_injections();
     let (wb2, diag) = loaded.expect("线程 panic 不应把整个加载变成 Err");
     assert!(diag.has_fatal(), "必须记为 fatal: {:?}", diag.problems);
     assert!(

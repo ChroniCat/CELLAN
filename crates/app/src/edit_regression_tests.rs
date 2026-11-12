@@ -775,6 +775,20 @@ fn run_keys(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
     let _ = ctx.run(input, |ctx| app.handle_keys(ctx));
 }
 
+fn ctrl_key_event(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        },
+    }
+}
+
 fn key_event(key: egui::Key, shift: bool) -> egui::Event {
     egui::Event::Key {
         key,
@@ -2636,6 +2650,11 @@ fn protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick() {
     app.sel_end = (1, 1);
     app.fill_to(2, true);
     assert_eq!(snapshot(&app), before, "受保护时填充不能改数据");
+    assert!(
+        !app.dv_pick_apply(0, 0, "v2"),
+        "受保护时验证下拉选中也必须被门禁拒绝"
+    );
+    assert_eq!(snapshot(&app), before, "受保护时验证下拉不能改数据");
     assert!(!app.wb.dirty, "被拒绝的操作不能把文档标脏");
     assert!(app.status.contains("受保护"), "应提示受保护：{}", app.status);
     drop(env);
@@ -2728,8 +2747,8 @@ fn open_worker_panic_reports_failure_and_keeps_the_file_untouched() {
     let before: Vec<u8> = std::fs::read(&src).unwrap();
     let sha_before: String = Sha256::digest(&before).iter().map(|b| format!("{b:02x}")).collect();
 
-    // SAFETY: TestEnv 持有 ENV_LOCK，其它测试不会并发读写进程环境。
-    unsafe { std::env::set_var("SC_LOAD_WORKER_PANIC", "1") };
+    // 故障注入按路径登记：只影响这一份文件，不会串到并行用例。
+    sheetcore::xlsx::inject_worker_panic(&src);
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.open_path(src.clone());
@@ -2740,7 +2759,7 @@ fn open_worker_panic_reports_failure_and_keeps_the_file_untouched() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    unsafe { std::env::remove_var("SC_LOAD_WORKER_PANIC") };
+    sheetcore::xlsx::clear_fault_injections();
 
     assert!(!app.tasks.busy, "线程死后不能一直占用 busy");
     assert!(
@@ -2838,5 +2857,396 @@ fn clear_formats_and_clear_all_are_distinct_and_undoable() {
     app.do_undo(false);
     assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(5.0), "清全部的撤销要带回内容");
     assert_ne!(app.wb.sheet(0).style_of(0, 0), 0, "清全部的撤销要带回格式");
+    drop(env);
+}
+
+/// UI-05 验收：A300、XFD1048576 都能从 A1 找到；一轮后回到第一处。
+#[test]
+fn find_reaches_far_cells_and_wraps_to_the_first_hit() {
+    let env = crate::test_env::TestEnv::new("ui05_far");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let t = |v: &str| Cell { value: sheetcore::model::Value::Text(v.into()), formula: None };
+    app.wb.sheet_mut(0).set(299, 0, t("needle"));
+    app.wb.sheet_mut(0).set(1_048_575, 16_383, t("needle"));
+    app.sel = (0, 0);
+    app.find.find = "needle".into();
+    app.find_next(false);
+    assert_eq!(app.sel, (299, 0), "A1→A300");
+    app.find_next(false);
+    assert_eq!(app.sel, (1_048_575, 16_383), "A300→XFD1048576");
+    app.find_next(false);
+    assert_eq!(app.sel, (299, 0), "一轮后回到第一处");
+    assert!(app.status.contains("回到开头"), "status={}", app.status);
+    drop(env);
+}
+
+/// UI-05 验收：整格匹配不改 xabc；公式模式把 A1 换成 B1 并保持公式。
+#[test]
+fn whole_cell_replace_spares_longer_text_and_formula_replace_keeps_formula() {
+    let env = crate::test_env::TestEnv::new("ui05_whole");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let t = |v: &str| Cell { value: sheetcore::model::Value::Text(v.into()), formula: None };
+    app.wb.sheet_mut(0).set(0, 0, t("abc"));
+    app.wb.sheet_mut(0).set(0, 1, t("xabc"));
+    app.find.find = "abc".into();
+    app.find.replace = "Z".into();
+    app.find.whole_cell = true;
+    app.replace_all();
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Text("Z".into()));
+    assert_eq!(app.wb.sheet(0).value(0, 1), sheetcore::model::Value::Text("xabc".into()), "xabc 不能被改");
+    assert!(app.status.contains("找到 1 处，替换 1 处"), "{}", app.status);
+
+    let mut cell = Cell { value: sheetcore::model::Value::Number(3.0), formula: Some("=SUM(A1:A2)".into()) };
+    app.wb.sheet_mut(0).set(0, 2, cell.clone());
+    app.find = FindState { open: true, tab: 1, find: "A1".into(), replace: "B1".into(), whole_cell: false, in_formula: true, ..Default::default() };
+    app.sel = (0, 2);
+    app.replace_current();
+    let got = app.wb.sheet(0).get(0, 2).unwrap();
+    assert_eq!(got.formula.as_deref(), Some("=SUM(B1:A2)"), "公式文本被替换");
+    assert!(!matches!(got.value, sheetcore::model::Value::Text(_)), "不能写成常量文本");
+    drop(env);
+}
+
+/// UI-05 验收：1000 格全部替换只压一步撤销；数值也能被值模式命中。
+#[test]
+fn replace_all_is_one_undo_step_and_covers_numbers() {
+    let env = crate::test_env::TestEnv::new("ui05_all");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..1000u32 {
+        app.wb.sheet_mut(0).set(r, 0, Cell { value: sheetcore::model::Value::Text("old".into()), formula: None });
+    }
+    app.wb.sheet_mut(0).set(1000, 0, Cell { value: sheetcore::model::Value::Number(1234.0), formula: None });
+    app.find.find = "old".into();
+    app.find.replace = "new".into();
+    let depth = app.undo.depth().0;
+    app.replace_all();
+    assert_eq!(app.undo.depth().0, depth + 1, "全部替换只产生一步撤销");
+    assert_eq!(app.wb.sheet(0).value(999, 0), sheetcore::model::Value::Text("new".into()));
+    assert!(app.status.contains("找到 1000 处，替换 1000 处"), "{}", app.status);
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), sheetcore::model::Value::Text("old".into()));
+    assert_eq!(app.wb.sheet(0).value(999, 0), sheetcore::model::Value::Text("old".into()), "一次撤销恢复全部");
+
+    app.find.find = "1234".into();
+    app.find.replace = "5678".into();
+    app.sel = (1000, 0);
+    app.replace_all();
+    assert_eq!(app.wb.sheet(0).value(1000, 0), sheetcore::model::Value::Number(5678.0), "数值命中并替换");
+    drop(env);
+}
+
+/// UI-03 复核：Ctrl+D / Ctrl+R 快捷键入口也走统一门禁，失败不留值/样式/undo/dirty。
+#[test]
+fn fill_shortcuts_are_blocked_by_protection_tail_locks_and_pending_deps() {
+    // 受保护表
+    let mut protected = app();
+    protected.wb.sheet_mut(0).set(0, 0, number(1.0));
+    protected.wb.sheet_mut(0).set(1, 0, number(2.0));
+    protected.wb.sheet_mut(0).protection = Some(sheetcore::protection::SheetProtection::default());
+    protected.sel = (0, 0);
+    protected.sel_end = (1, 0);
+    protected.wb.dirty = false;
+    run_keys(&mut protected, &egui::Context::default(), vec![ctrl_key_event(egui::Key::D)]);
+    assert_eq!(protected.wb.sheet(0).value(1, 0), number(2.0).value, "受保护时不能填充");
+    assert_eq!(protected.undo.depth(), (0, 0));
+    assert!(!protected.wb.dirty);
+    assert!(protected.status.contains("受保护"), "{}", protected.status);
+
+    // Ctrl+R 横向分支：真实按键，只有末端目标列 C1 被锁
+    let mut right = app();
+    right.wb.sheet_mut(0).set(0, 0, number(3.0));
+    let now_r = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    right.locks.request(0, 0, 2, 93, "庚", now_r);
+    right.sel = (0, 0);
+    right.sel_end = (0, 2);
+    right.wb.dirty = false;
+    run_keys(&mut right, &egui::Context::default(), vec![ctrl_key_event(egui::Key::R)]);
+    assert_eq!(right.wb.sheet(0).value(0, 1), Value::Empty, "锁前不能部分写入");
+    assert_eq!(right.wb.sheet(0).value(0, 2), Value::Empty);
+    assert_eq!(right.undo.depth(), (0, 0));
+    assert!(!right.wb.dirty);
+
+    // 只有尾端目标格被锁：首行是源，也必须整批拒绝
+    let mut locked = app();
+    locked.wb.sheet_mut(0).set(0, 0, number(1.0));
+    locked.wb.sheet_mut(0).set(1, 0, number(2.0));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    locked.locks.request(0, 1, 0, 98, "乙", now);
+    locked.sel = (0, 0);
+    locked.sel_end = (1, 0);
+    locked.wb.dirty = false;
+    run_keys(&mut locked, &egui::Context::default(), vec![ctrl_key_event(egui::Key::D)]);
+    assert_eq!(locked.wb.sheet(0).value(1, 0), number(2.0).value, "尾端目标被锁不能写");
+    assert_eq!(locked.undo.depth(), (0, 0));
+    assert!(!locked.wb.dirty);
+
+    // 后台依赖未就绪
+    let mut pending = app();
+    pending.wb.sheet_mut(0).set(0, 0, number(1.0));
+    pending.wb.sheet_mut(0).set(1, 0, number(2.0));
+    pending.deps_pending = true;
+    pending.sel = (0, 0);
+    pending.sel_end = (1, 0);
+    pending.wb.dirty = false;
+    run_keys(&mut pending, &egui::Context::default(), vec![ctrl_key_event(egui::Key::D)]);
+    assert_eq!(pending.wb.sheet(0).value(1, 0), number(2.0).value);
+    assert_eq!(pending.undo.depth(), (0, 0));
+    assert!(!pending.wb.dirty);
+}
+
+/// UI-03 复核：横向填充柄的门禁要覆盖真实目标列，而不是只查源区。
+#[test]
+fn horizontal_fill_gate_covers_the_real_target_column() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(7.0));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    app.locks.request(0, 0, 2, 97, "丙", now); // C1 末端目标被他人锁
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.wb.dirty = false;
+    app.fill_to(5, false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), number(7.0).value);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty, "不能在锁前部分写入");
+    assert_eq!(app.wb.sheet(0).value(0, 5), Value::Empty);
+    assert_eq!(app.undo.depth(), (0, 0));
+    assert!(!app.wb.dirty);
+}
+
+/// UI-03 复核：边框拖拽（移动/复制/Shift 插入）分别对源、目标、移位范围预检。
+#[test]
+fn drag_moves_copy_and_shift_check_source_target_and_moved_ranges() {
+    // 移动：源被锁 → 不先清源
+    let mut moved = app();
+    moved.wb.sheet_mut(0).set(0, 0, number(7.0));
+    moved.wb.sheet_mut(0).set(1, 0, number(8.0));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    moved.locks.request(0, 0, 0, 96, "乙", now);
+    moved.sel = (0, 0);
+    moved.sel_end = (1, 0);
+    moved.wb.dirty = false;
+    moved.move_selection_by(0, 2);
+    assert_eq!(moved.wb.sheet(0).value(0, 0), number(7.0).value, "源不能被清");
+    assert_eq!(moved.wb.sheet(0).value(0, 2), Value::Empty, "目标不能半写");
+    assert_eq!(moved.undo.depth(), (0, 0));
+    assert!(!moved.wb.dirty);
+
+    // 复制：目标被锁 → 不写目标
+    let mut copy = app();
+    copy.wb.sheet_mut(0).set(0, 0, number(7.0));
+    let now2 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    copy.locks.request(0, 0, 2, 95, "丙", now2);
+    copy.sel = (0, 0);
+    copy.sel_end = (0, 0);
+    copy.wb.dirty = false;
+    copy.copy_selection_by(0, 2);
+    assert_eq!(copy.wb.sheet(0).value(0, 2), Value::Empty);
+    assert_eq!(copy.wb.sheet(0).value(0, 0), number(7.0).value);
+    assert_eq!(copy.undo.depth(), (0, 0));
+
+    // Shift 插入：插入点右侧已有格被锁（结构移位会挪到它）→ 整批拒绝
+    let mut shift = app();
+    shift.wb.sheet_mut(0).set(0, 0, number(7.0));
+    shift.wb.sheet_mut(0).set(0, 1, number(8.0));
+    let now3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    shift.locks.request(0, 0, 2, 94, "丁", now3); // C1：插列后会被右移的格
+    shift.sel = (0, 0);
+    shift.sel_end = (0, 0);
+    shift.wb.dirty = false;
+    shift.shift_insert_by(0, 2);
+    assert_eq!(shift.wb.sheet(0).value(0, 0), number(7.0).value, "源不能先被清");
+    assert_eq!(shift.wb.sheet(0).value(0, 1), number(8.0).value);
+    assert_eq!(shift.undo.depth(), (0, 0));
+    assert!(!shift.wb.dirty);
+}
+
+/// UI-04 复核：清除全部要同时同步内容和样式；第二客户端与撤销一致。
+#[test]
+fn clear_all_broadcasts_style_and_content_to_a_second_client_and_undo_restores_both() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = crate::net::host_on(listener, 1, "甲".into(), "doc".into(), "pw".into()).unwrap();
+    // host.addr 是 0.0.0.0:port（监听通配地址），客户端要连回环地址
+    let addr = format!("127.0.0.1:{port}");
+    let peer = crate::net::join(2, "乙".into(), "doc".into(), &addr, "pw".into()).unwrap();
+
+    let mut a = app();
+    let mut b = app();
+    a.peer = Some(sheetcore::sync::Peer::new(1));
+    b.peer = Some(sheetcore::sync::Peer::new(2));
+    a.net = Some(host);
+    b.net = Some(peer);
+    for _ in 0..40 {
+        a.poll_net();
+        b.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let mut style = a.wb.styles.get(0).clone();
+    style.bold = true;
+    style.fill = Some([255, 200, 0]);
+    let sid = a.wb.styles.intern(style);
+    a.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+    a.wb.sheet_mut(0).set_style(0, 0, sid);
+    a.wb.dirty = false;
+    b.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Text("x".into()), formula: None });
+    // 第二客户端自己也要有非默认格式，否则无法证明样式清除被同步
+    let mut st2 = b.wb.styles.get(0).clone();
+    st2.bold = true;
+    let sid2 = b.wb.styles.intern(st2);
+    b.wb.sheet_mut(0).set_style(0, 0, sid2);
+    assert!(b.wb.styles.get(b.wb.sheet(0).style_of(0, 0)).bold, "前置：对端确有加粗");
+
+    a.sel = (0, 0);
+    a.sel_end = (0, 0);
+    a.clear_rects(ClearPart::All);
+    assert_eq!(a.wb.sheet(0).value(0, 0), Value::Empty);
+    assert_eq!(a.wb.sheet(0).style_of(0, 0), 0, "本地样式也要清");
+
+    let mut synced = false;
+    let peer_style_cleared = |b: &SheetApp| {
+        let st = b.wb.styles.get(b.wb.sheet(0).style_of(0, 0));
+        !st.bold && st.fill.is_none()
+    };
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).value(0, 0) == Value::Empty && peer_style_cleared(&b) {
+            synced = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(synced, "第二客户端必须同时收到内容清除和样式清除");
+
+    a.do_undo(false);
+    assert_eq!(a.wb.sheet(0).value(0, 0), Value::Text("x".into()), "撤销恢复内容");
+    assert_eq!(a.wb.sheet(0).style_of(0, 0), sid, "撤销恢复原样式");
+
+    // 对端必须也在 poll 后同时恢复旧内容和旧样式（只恢复值不够）
+    let peer_style_restored = |b: &SheetApp| {
+        let st = b.wb.styles.get(b.wb.sheet(0).style_of(0, 0));
+        st.bold && st.fill == Some([255, 200, 0])
+    };
+    let mut remote_undo = false;
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).value(0, 0) == Value::Text("x".into()) && peer_style_restored(&b) {
+            remote_undo = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(remote_undo, "撤销后第二客户端要同时恢复内容和样式");
+
+    // 重做同样要同步：内容清空 + 格式回默认
+    a.do_undo(true);
+    assert_eq!(a.wb.sheet(0).value(0, 0), Value::Empty);
+    let mut remote_redo = false;
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).value(0, 0) == Value::Empty && peer_style_cleared(&b) {
+            remote_redo = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(remote_redo, "重做后第二客户端也要同步清内容和格式");
+    a.net.as_mut().unwrap().shutdown();
+    b.net.as_mut().unwrap().shutdown();
+}
+
+/// UI-05 复核：值模式按网格显示串查；公式结果默认跳过并提示，勾选后才可替换。
+#[test]
+fn find_uses_formatted_values_and_formula_results_need_explicit_opt_in() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(0.5));
+    let mut st = app.wb.styles.get(0).clone();
+    st.format = "0.00%".into();
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(0, 0, sid);
+    app.find.find = "50.00%".into();
+    app.sel = (0, 0);
+    app.find_next(false);
+    assert_eq!(app.sel, (0, 0), "日期/百分比这类显示串要能查到");
+    assert!(app.status.contains("找到"), "{}", app.status);
+
+    // C1 是公式结果 1：值模式默认不能静默改成常量
+    app.wb.sheet_mut(0).set(0, 2, Cell {
+        value: Value::Number(1.0),
+        formula: Some("=A1*2".into()),
+    });
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "1".into(),
+        replace: "9".into(),
+        ..Default::default()
+    };
+    app.sel = (0, 2);
+    app.replace_current();
+    let c1 = app.wb.sheet(0).get(0, 2).unwrap();
+    assert_eq!(c1.formula.as_deref(), Some("=A1*2"), "默认不能破坏公式");
+    assert_eq!(app.undo.depth(), (0, 0), "跳过不产生撤销步");
+    assert!(app.status.contains("公式结果"), "{}", app.status);
+
+    // 全部替换同样不能绕过公式保护
+    app.replace_all();
+    assert!(
+        app.wb.sheet(0).get(0, 2).unwrap().formula.is_some(),
+        "全部替换默认也要跳过公式结果"
+    );
+    assert!(app.status.contains("公式结果"), "{}", app.status);
+
+    app.find.replace_formula_results = true;
+    app.sel = (0, 2);
+    app.replace_current();
+    let c1 = app.wb.sheet(0).get(0, 2).unwrap();
+    assert!(c1.formula.is_none(), "显式勾选后才允许换成常量");
+    assert_eq!(c1.value, Value::Number(9.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+}
+
+/// UI-05 复核：干净簿上单次替换必须标脏、可撤销，并且保存后重开能读回。
+#[test]
+fn single_replace_marks_dirty_survives_save_and_undoes_in_one_step() {
+    let env = crate::test_env::TestEnv::new("ui05_single");
+    let path = env.path("single.xlsx");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Text("old".into()), formula: None });
+    sheetcore::xlsx::save(&path, &app.wb).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "old".into(),
+        replace: "new".into(),
+        ..Default::default()
+    };
+    app.sel = (0, 0);
+    app.replace_current();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
+    assert!(app.wb.dirty, "单次替换必须把干净文档标脏");
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    app.save(false);
+    for _ in 0..300 {
+        app.poll_save();
+        if app.tasks.saving.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.tasks.saving.is_none(), "保存要在超时内完成");
+    let (wb, diag) = sheetcore::xlsx::load_diag(&path).unwrap();
+    assert!(diag.is_complete(), "{:?}", diag.problems);
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("new".into()), "保存后重开读到新值");
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("old".into()), "一步撤销恢复");
     drop(env);
 }

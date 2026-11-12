@@ -1,13 +1,29 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `eccadf6`（UI-03 已推送）+ 本轮未提交改动。
+- 分支 `main`（`origin/main`），HEAD `1089783`（C14/UI-04 已推送）+ 本轮未提交改动。
 - 台账（`scripts/audit_progress.py counts`）：9 已验收 / 5 待验收 / 47 待实施；
   切片 26 已验收 / 7 待验收 / 115 待实施。
 - 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
-  app 159 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  app 168 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
   app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
   `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。
+
+## 本轮：UI-03 门禁补口 + UI-04 双端样式同步 + UI-05 查找替换（待验收）
+
+- UI-03（仍待验收）：fill_cmd 按真实写入范围预检（Ctrl+D 向下 / Ctrl+R 向右）；
+  fill_to 横向门禁扩到目标列；move/copy/shift 三个拖拽入口分别预检源/目标/移位范围；
+  lock_holder_on 离线也认租约表；dv 选择抽成 dv_pick_apply 并纳入保护测试。
+  真实 Ctrl+D / Ctrl+R 键事件用例 3 项；变异 M1/M2/M3 全红。
+- UI-04（仍待验收）：ClearAll 同时广播内容与默认样式；do_undo/do_redo 对 touched
+  每格补发撤销后的真实样式。真实回环双客户端用例：清除→双端值与格式都清；
+  撤销→双端值与格式都恢复；重做→双端再次清空。变异 M4/M5 全红。
+- UI-05（待验收）：新增 core/search.rs 稀疏匹配器（A300/XFD1048576、循环、整格、
+  值/公式、格式化显示串、Unicode 安全替换）；app 单次替换置 dirty、全部替换单 Action；
+  值模式默认跳过公式结果并提示，勾选后才允许常量化。core 6 项 + app 5 项用例；
+  变异 M1–M9 九项均被抓。
+- 未执行：选区范围/行列序/查找全部列表/取消、真实键鼠点击对话框、跨表 replace_all 撤销；
+  UI-03/UI-04 的真实 GUI 点验与 dirty 关闭提示。
 
 ## 本轮：C09/C14 收尾 + UI-04 清除命令（C09/C14/C04 已验收；UI-04 待验收）
 

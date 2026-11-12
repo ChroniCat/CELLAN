@@ -38,3 +38,34 @@ M3 清格式分支也清内容 → clear_formats_and_clear_all… 失败。
 - 真实 GUI 键鼠点击 Ribbon 清除菜单三项、右键清除内容未做；当前为命令函数级 + 全量 GUI 回归。
 - 第二客户端真实网络广播未观察；本轮验证的是同一 recalc_and_broadcast/broadcast_style 代码路径。
 - “保存关闭必须提示 dirty”：断言了 wb.dirty=true，未走真实关闭窗口的提示框流程。
+
+
+============================================================
+七、05:12/05:33 复核：ClearAll 样式双端 + undo/redo 样式广播
+============================================================
+实现修正：
+- clear_rects：内容与样式是两条独立通道。All 现在同时 recalc_and_broadcast(内容)
+  和 net.broadcast_style(默认样式)；Formats 仍只发样式；Contents 只发内容。
+- do_undo/do_redo：以前只 broadcast_op 内容，远端撤销会恢复值却留下默认格式。
+  现在对 applied.touched 的每格读取撤销后的真实样式，按表分组 broadcast_style，
+  撤销和重做都把内容和格式一起同步。
+
+用例：
+- clear_all_broadcasts_style_and_content_to_a_second_client_and_undo_restores_both
+  真实 host_on+join 两个 SheetApp（回环 TCP，非 mock）：
+  1) 宿主 A1=文本 x + 加粗/黄色填充；对端自己也有加粗格式；
+  2) ClearAll → 宿主值与格式清空；对端 poll_net 后值与格式都清空；
+  3) 宿主 undo → 本地值与样式恢复；对端继续 poll，断言文本 x 与加粗/黄色填充都恢复；
+  4) 宿主 redo → 本地清空；对端 poll 后值与格式再次清空。
+- 全量 app 168 passed / 0 failed。
+
+命令：
+  cargo test -p app ... -- clear_all_broadcasts   1 passed
+变异（转红后还原）：
+  M4 不发样式清除 → 对端格式仍加粗，用例 FAILED
+  M5 撤销不广播样式 → 对端只恢复值不恢复格式，用例 FAILED
+
+仍未执行（保留待验收）：
+- Ribbon/右键“清除”菜单的真实键鼠点击（命令级 + GUI 全量回归已过）。
+- 关闭窗口 dirty 提示的真实窗口流程。
+- 真实鼠标拖拽手势（当前测的是与手势共用的命令入口）。

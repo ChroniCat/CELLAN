@@ -1543,19 +1543,23 @@
       "commands": [
         "cargo test -p app --no-default-features --features glow --offline --bin app -- protected_sheet_blocks",
         "cargo test -p app --no-default-features --features glow --offline --bin app -- one_locked_cell",
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- cut_from_a_protected"
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- cut_from_a_protected",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- fill_shortcuts",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- horizontal_fill_gate",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- drag_moves_copy"
       ],
       "evidence": [
         "implementation-evidence/ui03-write-gates.txt"
       ],
       "not_done": [
-        "真实 GUI 键鼠逐入口点验（右键菜单/拖拽手柄/协作对端广播）",
+        "右键菜单/拖拽手柄/协作对端的真实键鼠点验",
+        "dv 弹层里的真实鼠标选择未做（共用入口 dv_pick_apply 已测）",
         "细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）"
       ],
       "failures": [],
       "blocker": "",
       "next": "对 UI-03 做真实 GUI 操作抽查（保护态下 Delete/格式/排序/粘贴）并补截图；然后转 UI-04 清除操作重算/撤销/广播。",
-      "updated_utc": "2026-11-12T20:46:52Z",
+      "updated_utc": "2026-11-12T21:40:39Z",
       "slices": [
         {
           "id": "UI-03.1",
@@ -1671,20 +1675,21 @@
       ],
       "commits": [],
       "commands": [
-        "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_"
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_all_broadcasts"
       ],
       "evidence": [
         "implementation-evidence/ui04-clear-contents.txt"
       ],
       "not_done": [
-        "Ribbon/右键的真实键鼠点击未做（命令级 + 全量 GUI 回归已过）",
-        "第二客户端真实网络广播未观察",
-        "保存关闭提示 dirty 的真实窗口流程未执行（仅断言 wb.dirty）"
+        "Ribbon/右键“清除”菜单的真实键鼠点击",
+        "关闭窗口 dirty 提示的真实窗口流程",
+        "真实鼠标拖拽手势（当前测共用命令入口）"
       ],
       "failures": [],
       "blocker": "",
       "next": "补 UI-04 真实 GUI 抽查与第二客户端广播观察；然后转 UI-05 查找替换。",
-      "updated_utc": "2026-11-12T21:03:46Z",
+      "updated_utc": "2026-11-12T21:40:39Z",
       "slices": [
         {
           "id": "UI-04.1",
@@ -1730,17 +1735,36 @@
       "scope": "app/main.rs find_next/replace_current/replace_all",
       "source": "ui-requirements.md",
       "heading": "UI-05 查找替换避免漏查和不可撤销改写",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
+      "status": "待验收",
+      "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+      "files": [
+        "crates/core/src/search.rs",
+        "crates/core/tests/search_matches.rs",
+        "crates/app/src/main.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
       "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": [
+        "cargo test -p sheetcore --offline --test search_matches",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
+        "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+      ],
+      "evidence": [
+        "implementation-evidence/ui05-find-replace.txt"
+      ],
+      "not_done": [
+        "选区范围与行/列序搜索未做（当前只有当前工作表/整个工作簿，固定行优先）",
+        "查找全部结果列表与长操作取消未做",
+        "反向查找无 UI 按钮（核心 API 支持）",
+        "真实键鼠点击查找/替换对话框按钮未做",
+        "跨工作表 replace_all 的单一撤销未测"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "补 UI-05.4：选区范围、行/列序、查找全部列表与取消，再补跨表 replace_all 撤销。",
+      "updated_utc": "2026-11-12T21:40:39Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -1748,17 +1772,32 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "files": [
+            "crates/core/src/search.rs",
+            "crates/core/tests/search_matches.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test search_matches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+          ],
+          "evidence": [
+            "implementation-evidence/ui05-find-replace.txt"
+          ],
+          "not_done": [
+            "真实键鼠对话框未做；跨表全部替换撤销未测"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-12T21:40:39Z"
         },
         {
           "id": "UI-05.2",
@@ -1766,17 +1805,32 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "files": [
+            "crates/core/src/search.rs",
+            "crates/core/tests/search_matches.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test search_matches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+          ],
+          "evidence": [
+            "implementation-evidence/ui05-find-replace.txt"
+          ],
+          "not_done": [
+            "真实键鼠对话框未做；跨表全部替换撤销未测"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-12T21:40:39Z"
         },
         {
           "id": "UI-05.3",
@@ -1784,17 +1838,32 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "files": [
+            "crates/core/src/search.rs",
+            "crates/core/tests/search_matches.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test search_matches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+          ],
+          "evidence": [
+            "implementation-evidence/ui05-find-replace.txt"
+          ],
+          "not_done": [
+            "真实键鼠对话框未做；跨表全部替换撤销未测"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-12T21:40:39Z"
         },
         {
           "id": "UI-05.4",
@@ -1803,16 +1872,31 @@
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "files": [
+            "crates/core/src/search.rs",
+            "crates/core/tests/search_matches.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test search_matches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_reaches",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_is_one",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_uses_formatted",
+            "cargo test -p app --no-default-features --features glow --offline --bin app -- single_replace_marks"
+          ],
+          "evidence": [
+            "implementation-evidence/ui05-find-replace.txt"
+          ],
+          "not_done": [
+            "选区范围、行/列序、查找全部列表、取消均未做"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "实现选区范围与行/列序搜索，再加查找全部列表和取消。",
+          "updated_utc": "2026-11-12T21:40:39Z"
         }
       ]
     },

@@ -103,6 +103,12 @@ struct FindState {
     replace: String,
     match_case: bool,
     whole_cell: bool,
+    /// 0 = 当前工作表，1 = 整个工作簿
+    scope: u8,
+    /// true = 在公式文本里查找/替换
+    in_formula: bool,
+    /// 值模式命中公式结果时，是否允许把公式替换成常量（默认否，避免静默破坏公式）
+    replace_formula_results: bool,
     hits: usize,
 }
 
@@ -3632,8 +3638,8 @@ impl SheetApp {
     }
 
     fn lock_holder_on(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
-        let site = self.net.as_ref().map(|n| n.site);
-        let Some(site) = site else { return None };
+        // 离线时也认本地租约表：表里已有他人持有时，不能因为暂时没连网就放行
+        let site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
         if self.locks.is_locked_by_other(sheet, row, col, site) {
             self.locks
                 .holder(sheet, row, col)
@@ -4142,6 +4148,18 @@ impl SheetApp {
         if !down && c2 == c1 {
             return;
         }
+        // 实际被写的是尾端目标区（首行/首列只是源），门禁按真实写入范围收集
+        let gate = if down {
+            sheetcore::undo::rect_keys(r1 + 1, c1, r2, c2)
+        } else {
+            sheetcore::undo::rect_keys(r1, c1 + 1, r2, c2)
+        };
+        if !self.write_preflight(
+            &gate,
+            if down { "向下填充" } else { "向右填充" },
+        ) {
+            return;
+        }
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         let txn = self.txn_begin(&keys);
         if down {
@@ -4185,13 +4203,33 @@ impl SheetApp {
         };
     }
 
+    /// 验证下拉选中一项后真正写入（与网格内联逻辑同一个入口，便于门禁回归）。
+    fn dv_pick_apply(&mut self, dr: u32, dc: u32, v: &str) -> bool {
+        if !self.write_preflight(&[(dr, dc)], "选择验证下拉值") {
+            self.dv_open = None;
+            return false;
+        }
+        let cell = Cell {
+            value: Value::parse_input(v),
+            formula: None,
+        };
+        let key = (self.sheet_idx, dr, dc);
+        self.wb.sheet_mut(self.sheet_idx).set(dr, dc, cell);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.deps.update_cell(&self.wb, key);
+        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
+        true
+    }
+
     /// 填充柄：把源区域按线性序列/复制的方式填到目标区域
     fn fill_to(&mut self, target_row: u32, vertical: bool) {
         let (r1, c1, r2, c2) = self.sel_rect();
         let gate = if vertical {
             sheetcore::undo::rect_keys(r1, c1, target_row.max(r2), c2)
         } else {
-            sheetcore::undo::rect_keys(r1, c1, r2, c2)
+            // 横向填充写的是 target_row（此处是目标列）之前的整段，不能只查源区
+            sheetcore::undo::rect_keys(r1, c1, r2, target_row.max(c2))
         };
         if !self.write_preflight(&gate, "填充") {
             return;
@@ -5661,164 +5699,263 @@ impl SheetApp {
     }
 
     // ===== 查找替换 =====
+fn search_opts(&self) -> sheetcore::search::SearchOpts {
+        sheetcore::search::SearchOpts {
+            match_case: self.find.match_case,
+            whole_cell: self.find.whole_cell,
+            in_formula: self.find.in_formula,
+        }
+    }
+
+    /// 当前范围（工作表/工作簿）的全部命中，按位置排序
+    fn find_hits(&self) -> Vec<sheetcore::search::Hit> {
+        let opts = self.search_opts();
+        let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let scope = if self.find.scope == 1 { None } else { Some(self.sheet_idx) };
+        sheetcore::search::hits(&self.wb, scope, &needle, &opts)
+    }
+
+    /// 按匹配规则算出替换后的格子；没有实际变化时返回 None。
+    /// 值模式默认不碰公式格：命中公式结果时必须由用户显式勾选“替换公式结果”。
+    fn replacement_at(
+        &self,
+        r: u32,
+        c: u32,
+        cell: &sheetcore::model::Cell,
+    ) -> Option<sheetcore::model::Cell> {
+        let opts = self.search_opts();
+        let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
+        if !sheetcore::search::cell_matches(&self.wb, self.sheet_idx, r, c, &needle, &opts) {
+            return None;
+        }
+        if !opts.in_formula && cell.formula.is_some() && !self.find.replace_formula_results {
+            return None;
+        }
+        let text = sheetcore::search::cell_text_at(
+            &self.wb,
+            self.sheet_idx,
+            r,
+            c,
+            cell,
+            opts.in_formula,
+        )?;
+        if opts.in_formula {
+            let formula = cell.formula.as_deref()?;
+            let next = if opts.whole_cell {
+                self.find.replace.clone()
+            } else {
+                sheetcore::search::replace_in_text(
+                    formula,
+                    &self.find.find,
+                    &self.find.replace,
+                    self.find.match_case,
+                )
+            };
+            if next == formula {
+                return None;
+            }
+            let mut out = cell.clone();
+            out.formula = Some(next.into_boxed_str());
+            return Some(out);
+        }
+        let next = if opts.whole_cell {
+            self.find.replace.clone()
+        } else {
+            sheetcore::search::replace_in_text(
+                &text,
+                &self.find.find,
+                &self.find.replace,
+                self.find.match_case,
+            )
+        };
+        if next == text {
+            return None;
+        }
+        Some(sheetcore::model::Cell {
+            value: sheetcore::model::Value::parse_input(&next),
+            formula: None,
+        })
+    }
+
     fn find_next(&mut self, backwards: bool) {
         if self.find.find.is_empty() {
             return;
         }
-        let si = self.sheet_idx;
-        let needle = if self.find.match_case {
-            self.find.find.clone()
-        } else {
-            self.find.find.to_lowercase()
-        };
-        let (mut r, mut c) = self.sel;
-        let max_r = 1_048_575u32;
-        let max_c = 16_383u32;
-        let total = (max_r as u64 + 1) * (max_c as u64 + 1);
-        let mut steps = 0u64;
-        loop {
-            steps += 1;
-            if steps > total.min(4_000_000) {
-                self.status = "没找到".into();
-                return;
-            }
-            if backwards {
-                if c == 0 {
-                    if r == 0 {
-                        r = max_r;
-                        c = max_c;
-                    } else {
-                        r -= 1;
-                        c = max_c;
-                    }
-                } else {
-                    c -= 1;
-                }
-            } else {
-                if c >= max_c {
-                    c = 0;
-                    r = if r >= max_r { 0 } else { r + 1 };
-                } else {
-                    c += 1;
-                }
-            }
-            let Some(cell) = self.wb.sheet(si).get(r, c) else { continue };
-            let text = cell.value.display();
-            let hay = if self.find.match_case { text.clone() } else { text.to_lowercase() };
-            let hit = if self.find.whole_cell { hay == needle } else { hay.contains(&needle) };
-            if hit {
-                self.sel = (r, c);
-                self.sel_end = (r, c);
-                self.ensure_visible();
-                self.find.hits += 1;
-                self.status = format!("找到 {}（第 {} 处）", cell_name(r, c), self.find.hits);
-                return;
-            }
-            if r == self.sel.0 && c == self.sel.1 && steps > 2 {
-                self.status = "没找到".into();
-                return;
-            }
+        let hits = self.find_hits();
+        if hits.is_empty() {
+            self.status = "没找到".into();
+            return;
         }
+        let cur = sheetcore::search::Hit {
+            sheet: self.sheet_idx,
+            row: self.sel.0,
+            col: self.sel.1,
+        };
+        let Some((hit, wrapped)) = sheetcore::search::next_hit(&hits, cur, !backwards) else {
+            self.status = "没找到".into();
+            return;
+        };
+        let idx = hits.iter().position(|h| *h == hit).unwrap_or(0) + 1;
+        self.find.hits = hits.len();
+        self.sheet_idx = hit.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        self.sel = (hit.row, hit.col);
+        self.sel_end = (hit.row, hit.col);
+        self.extra_sel.clear();
+        self.ensure_visible();
+        let name = cell_name(hit.row, hit.col);
+        let where_ = self.wb.sheet(self.sheet_idx).name.clone();
+        let edge = if wrapped {
+            if backwards { "，已到最前，从末尾继续" } else { "，已回到开头" }
+        } else {
+            ""
+        };
+        self.status = format!("找到 {where_}!{name}（第 {idx}/{} 处{edge}）", hits.len());
     }
 
     fn replace_current(&mut self) {
-        let (r, c) = self.sel;
         let si = self.sheet_idx;
-        let Some(cell) = self.wb.sheet(si).get(r, c).cloned() else { return };
-        let text = cell.value.display();
-        let (hay, needle) = if self.find.match_case {
-            (text.clone(), self.find.find.clone())
-        } else {
-            (text.to_lowercase(), self.find.find.to_lowercase())
-        };
-        if !hay.contains(&needle) {
+        let (r, c) = self.sel;
+        let Some(cell) = self.wb.sheet(si).get(r, c).cloned() else {
             self.find_next(false);
             return;
+        };
+        if !self.find.in_formula
+            && cell.formula.is_some()
+            && !self.find.replace_formula_results
+        {
+            let msg = format!(
+                "{} 是公式结果：值模式不替换公式，请勾选“替换公式结果”或切到公式模式",
+                cell_name(r, c)
+            );
+            self.find_next(false);
+            // find_next 会写“找到…”，这里要保留真正的拒绝原因
+            self.status = msg;
+            return;
         }
-        let new_text = if self.find.whole_cell {
-            self.find.replace.clone()
-        } else {
-            replace_ignore_case(&text, &self.find.find, &self.find.replace, self.find.match_case)
+        let Some(new_cell) = self.replacement_at(r, c, &cell) else {
+            self.find_next(false);
+            return;
         };
         if !self.write_preflight(&[(r, c)], "替换") {
             return;
         }
-        let keys = vec![(si, r, c)];
         let txn = self.txn_begin(&[(r, c)]);
-        self.wb
-            .sheet_mut(si)
-            .set(r, c, sheetcore::model::Cell { value: sheetcore::model::Value::parse_input(&new_text), formula: None });
+        self.wb.sheet_mut(si).set(r, c, new_cell);
         self.txn_end("替换", txn);
-        self.recalc_and_broadcast(&keys);
+        self.recalc_and_broadcast(&[(si, r, c)]);
+        self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已替换 {}", cell_name(r, c));
         self.find_next(false);
     }
 
     fn replace_all(&mut self) {
-        let si = self.sheet_idx;
-        let keys: Vec<(u32, u32)> = self
-            .wb
-            .sheet(si)
-            .iter()
-            .filter(|(_, cell)| matches!(cell.value, sheetcore::model::Value::Text(_)))
-            .map(|(k, _)| (k.row, k.col))
-            .collect();
-        let needle = if self.find.match_case {
-            self.find.find.clone()
-        } else {
-            self.find.find.to_lowercase()
-        };
-        // 命中的目标格里有任何一格不可写，整批都不执行
-        let hits: Vec<(u32, u32)> = keys
-            .iter()
-            .copied()
-            .filter(|(r, c)| {
-                self.wb
-                    .sheet(si)
-                    .get(*r, *c)
-                    .map(|cell| {
-                        let t = cell.value.display();
-                        let hay = if self.find.match_case { t.clone() } else { t.to_lowercase() };
-                        let needle = if self.find.match_case { self.find.find.clone() } else { needle.clone() };
-                        if self.find.whole_cell { hay == needle } else { hay.contains(&needle) }
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
-        if !self.write_preflight(&hits, "全部替换") {
+        if self.find.find.is_empty() {
             return;
         }
-        let mut changed = 0usize;
-        let mut touched = Vec::new();
-        for (r, c) in keys {
-            let Some(cell) = self.wb.sheet(si).get(r, c).cloned() else { continue };
-            let text = cell.value.display();
-            let hay = if self.find.match_case { text.clone() } else { text.to_lowercase() };
-            let hit = if self.find.whole_cell { hay == needle } else { hay.contains(&needle) };
-            if !hit {
-                continue;
+        let hits = self.find_hits();
+        if hits.is_empty() {
+            self.status = "没找到可替换的内容".into();
+            return;
+        }
+        // 先算差异，再统一提交：命中数与实改数可对账
+        let mut diffs: Vec<(usize, u32, u32, sheetcore::model::Cell)> = Vec::new();
+        for h in hits.iter() {
+            let Some(cell) = self.wb.sheet(h.sheet).get(h.row, h.col) else { continue };
+            if let Some(new_cell) = self.replacement_at(h.row, h.col, cell) {
+                diffs.push((h.sheet, h.row, h.col, new_cell));
             }
-            let new_text = if self.find.whole_cell {
-                self.find.replace.clone()
+        }
+        let formula_skips = if self.find.in_formula || self.find.replace_formula_results {
+            0
+        } else {
+            hits.iter()
+                .filter(|h| {
+                    self.wb
+                        .sheet(h.sheet)
+                        .get(h.row, h.col)
+                        .is_some_and(|c| c.formula.is_some())
+                })
+                .count()
+        };
+        if diffs.is_empty() {
+            self.status = if formula_skips > 0 {
+                format!(
+                    "找到 {} 处，其中 {} 处是公式结果（未替换；勾选“替换公式结果”或切到公式模式）",
+                    hits.len(),
+                    formula_skips
+                )
             } else {
-                replace_ignore_case(&text, &self.find.find, &self.find.replace, self.find.match_case)
+                format!("找到 {} 处，替换后没有变化", hits.len())
             };
-            self.wb.sheet_mut(si).set(
-                r,
-                c,
-                sheetcore::model::Cell {
-                    value: sheetcore::model::Value::parse_input(&new_text),
-                    formula: None,
-                },
-            );
-            touched.push((si, r, c));
-            changed += 1;
+            return;
         }
-        if changed > 0 {
-            self.recalc_and_broadcast(&touched);
-            self.doc_gen = self.doc_gen.wrapping_add(1);
+        // 按表分组做保护/锁检查；任何一格不可写就整批拒绝
+        let mut groups: std::collections::BTreeMap<usize, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
+        for (si, r, c, _) in diffs.iter() {
+            groups.entry(*si).or_default().push((*r, *c));
         }
-        self.status = format!("替换了 {changed} 处");
+        for (si, keys) in groups.iter() {
+            let mut keys = keys.clone();
+            keys.sort_unstable();
+            keys.dedup();
+            if !self.write_preflight_on(*si, &keys, "全部替换") {
+                return;
+            }
+        }
+        // 多表单事务：逐表捕获，合并成一次撤销
+        let mut before: std::collections::BTreeMap<usize, Vec<sheetcore::undo::CellDelta>> =
+            std::collections::BTreeMap::new();
+        for (si, keys) in groups.iter() {
+            let mut keys = keys.clone();
+            keys.sort_unstable();
+            keys.dedup();
+            before.insert(*si, sheetcore::undo::capture(self.wb.sheet(*si), *si, &keys));
+        }
+        for (si, r, c, cell) in diffs.iter() {
+            self.wb.sheet_mut(*si).set(*r, *c, cell.clone());
+        }
+        let mut deltas: Vec<sheetcore::undo::CellDelta> = Vec::new();
+        for (si, caps) in before.into_iter() {
+            deltas.extend(sheetcore::undo::finish(caps, self.wb.sheet(si)));
+        }
+        if !deltas.is_empty() {
+            self.record_revision("全部替换", &deltas);
+            self.undo.push(sheetcore::undo::Action {
+                label: "全部替换".into(),
+                deltas,
+                focus: (diffs[0].0, diffs[0].1, diffs[0].2),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                shapes: None,
+                refresh_sizes: None,
+            });
+        }
+        let keys: Vec<(usize, u32, u32)> =
+            diffs.iter().map(|(si, r, c, _)| (*si, *r, *c)).collect();
+        self.recalc_and_broadcast(&keys);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = if formula_skips > 0 {
+            format!(
+                "找到 {} 处，替换 {} 处，跳过 {} 处公式结果（可勾选“替换公式结果”）",
+                hits.len(),
+                diffs.len(),
+                formula_skips
+            )
+        } else {
+            format!(
+                "找到 {} 处，替换 {} 处（{}）",
+                hits.len(),
+                diffs.len(),
+                if diffs.len() < hits.len() { "其余替换后无变化" } else { "全部成功" }
+            )
+        };
     }
 
     // ===== 工作表 =====
@@ -5999,6 +6136,22 @@ impl SheetApp {
                 let cell = self.wb.sheet(*sheet).get(*row, *col).cloned().unwrap_or_default();
                 let op = peer.local_set(*sheet, *row, *col, &cell);
                 net.broadcast_op(op);
+            }
+            // 撤销/重做也会改样式（清除全部、格式操作）；只发内容会让对端留下默认格式，
+            // 必须把每格撤销后的真实样式再同步一遍。
+            let mut by_sheet: std::collections::BTreeMap<
+                usize,
+                Vec<(u32, u32, sheetcore::style::CellStyle)>,
+            > = std::collections::BTreeMap::new();
+            for (sheet, row, col) in applied.touched.iter() {
+                if *sheet < self.wb.sheets.len() {
+                    let id = self.wb.sheet(*sheet).style_of(*row, *col);
+                    let st = self.wb.styles.get(id).clone();
+                    by_sheet.entry(*sheet).or_default().push((*row, *col, st));
+                }
+            }
+            for (sheet, items) in by_sheet {
+                net.broadcast_style(sheet, items);
             }
         }
         // 回到出事的格
@@ -6781,14 +6934,20 @@ fn clear_values(&mut self) {
         self.txn_end(what, txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        // 内容与格式是两条独立通道：清除全部必须同时发，不能只发内容
+        if part != ClearPart::Contents {
+            if let Some(net) = self.net.as_ref() {
+                let items: Vec<(u32, u32, sheetcore::style::CellStyle)> = keys
+                    .iter()
+                    .map(|(r, c)| (*r, *c, sheetcore::style::CellStyle::default()))
+                    .collect();
+                net.broadcast_style(self.sheet_idx, items);
+            }
+        }
         if part != ClearPart::Formats {
             let keys3: Vec<(usize, u32, u32)> =
                 keys.iter().map(|(r, c)| (self.sheet_idx, *r, *c)).collect();
             self.recalc_and_broadcast(&keys3);
-        } else if let Some(net) = self.net.as_ref() {
-            let items: Vec<(u32, u32, sheetcore::style::CellStyle)> =
-                keys.iter().map(|(r, c)| (*r, *c, sheetcore::style::CellStyle::default())).collect();
-            net.broadcast_style(self.sheet_idx, items);
         }
         self.status = format!("已{what}");
     }
@@ -6956,6 +7115,11 @@ fn clear_values(&mut self) {
         }
         let mut keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         keys.extend(sheetcore::undo::rect_keys(nr1, nc1, nr2, nc2));
+        keys.sort_unstable();
+        keys.dedup();
+        if !self.write_preflight(&keys, "移动单元格") {
+            return;
+        }
         let txn = self.txn_begin(&keys);
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
         for r in r1..=r2 {
@@ -7059,6 +7223,28 @@ fn clear_values(&mut self) {
             return;
         }
         let vertical = dr.abs() >= dc.abs();
+        let mut gate = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        for (k, _) in self.wb.sheet(self.sheet_idx).iter() {
+            if (vertical && k.row >= nr1) || (!vertical && k.col >= nc1) {
+                gate.push((k.row, k.col));
+            }
+        }
+        for k in self.wb.sheet(self.sheet_idx).styles.keys() {
+            if (vertical && k.row >= nr1) || (!vertical && k.col >= nc1) {
+                gate.push((k.row, k.col));
+            }
+        }
+        // 空目标格没有 Cell/Style 可枚举，但别人可能正锁着它；租约表本身是稀疏的
+        for ((si, r, c), _) in self.locks.iter() {
+            if si == self.sheet_idx && ((vertical && r >= nr1) || (!vertical && c >= nc1)) {
+                gate.push((r, c));
+            }
+        }
+        gate.sort_unstable();
+        gate.dedup();
+        if !self.write_preflight(&gate, "插入并移动") {
+            return;
+        }
         // 1) 快照
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
         for r in r1..=r2 {
@@ -7158,6 +7344,12 @@ fn clear_values(&mut self) {
         }
         let mut keys = sheetcore::undo::rect_keys(nr1, nc1, nr2, nc2);
         keys.extend(sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        if !self.write_preflight(
+            &sheetcore::undo::rect_keys(nr1, nc1, nr2, nc2),
+            "复制单元格",
+        ) {
+            return;
+        }
         let txn = self.txn_begin(&keys);
         // 先把源区域的快照取出来（不改源）
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
@@ -15542,6 +15734,7 @@ let txn = self.txn_begin(&keys);
         let mut do_prev = false;
         let mut do_repl = false;
         let mut do_all = false;
+        let mut do_count = false;
         ui_kit::window(ctx, "查找与替换", 380.0)
             .open(&mut open)
             .resizable(false)
@@ -15570,6 +15763,33 @@ let txn = self.txn_begin(&keys);
                     ui.add_space(68.0);
                     ui.checkbox(&mut self.find.match_case, "区分大小写");
                     ui.checkbox(&mut self.find.whole_cell, "整格匹配");
+                    ui.checkbox(&mut self.find.replace_formula_results, "替换公式结果")
+                        .on_hover_text("值模式命中公式结果时，允许把公式替换成常量");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(68.0);
+                    ui.label("范围");
+                    egui::ComboBox::from_id_salt("find_scope")
+                        .width(112.0)
+                        .selected_text(if self.find.scope == 1 { "整个工作簿" } else { "当前工作表" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.find.scope, 0, "当前工作表");
+                            ui.selectable_value(&mut self.find.scope, 1, "整个工作簿");
+                        });
+                    ui.label("查找");
+                    egui::ComboBox::from_id_salt("find_mode")
+                        .width(78.0)
+                        .selected_text(if self.find.in_formula { "公式" } else { "值" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.find.in_formula, false, "值");
+                            ui.selectable_value(&mut self.find.in_formula, true, "公式");
+                        });
+                    if ui_kit::pill(ui, "统计", "统计当前范围命中数").clicked() {
+                        do_count = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(68.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("命中 {} 处", self.find.hits))
@@ -15614,6 +15834,13 @@ let txn = self.txn_begin(&keys);
         }
         if do_all {
             self.replace_all();
+        }
+        if do_count {
+            let hits = self.find_hits();
+            self.find.hits = hits.len();
+            let scope = if self.find.scope == 1 { "整个工作簿" } else { "当前工作表" };
+            let mode = if self.find.in_formula { "公式" } else { "值" };
+            self.status = format!("{scope}（{mode}）命中 {} 处", hits.len());
         }
         self.find.open = open;
     }
@@ -19531,21 +19758,9 @@ let txn = self.txn_begin(&keys);
                             });
                         });
                     if let Some(v) = picked {
-                        if !self.write_preflight(&[(dr, dc)], "选择验证下拉值") {
-                            self.dv_open = None;
-                            return;
+                        if self.dv_pick_apply(dr, dc, &v) {
+                            close = true;
                         }
-                        let cell = Cell {
-                            value: Value::parse_input(&v),
-                            formula: None,
-                        };
-                        let key = (self.sheet_idx, dr, dc);
-                        self.wb.sheet_mut(self.sheet_idx).set(dr, dc, cell.clone());
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.deps.update_cell(&self.wb, key);
-                        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
-                        close = true;
                     }
                     if ctx.input(|i| i.pointer.any_click()) && !ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < pos.y + 200.0).unwrap_or(false)) {
                         close = true;

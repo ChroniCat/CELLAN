@@ -107,3 +107,19 @@ C14 第三轮：关系 XML 良构性 + 图表内部三类吞错
    GUI（round38）GUI_EXIT=0，12 passed / 0 failed / 8 ignored。
 5) 保留边界（不写成通过）：加密夹具仍由本项目 crypto::encrypt 生成，不是 Excel 加密包；
    未与真实 Office「修复」对话框做目视对比。
+
+
+============================================================
+七、05:50 故障注入改为按路径登记（测试基础设施修正）
+============================================================
+问题：SC_SIDE_PANIC / SC_LOAD_WORKER_PANIC 是进程级环境变量。round40 全量 core 并行跑时，
+side_scan 用例设置的环境变量被同进程其他 c14 用例读到，editing_an_existing_external_link
+与 rescue_copy 两项被误 panic（CORE_EXIT=101）。这不是产品缺陷，但会让全量结果不可信。
+
+修正：xlsx.rs 改为按文件路径登记注入：
+  inject_worker_panic(&path) / inject_side_panic(&path) / clear_fault_injections()
+load_diag 与旁路线程只对登记过的规范化路径 panic；不再读 SC_SIDE_PANIC / SC_LOAD_WORKER_PANIC。
+c14_guard 与 app 的 worker-panic 用例改用新接口，并在结束时清空。
+
+复跑：core 68 bins / 598 passed / 0 failed / 41 ignored，CORE_EXIT=0
+      （两条 c14 边界用例仍包含在 16 项 c14_guard 内，断言未改）。

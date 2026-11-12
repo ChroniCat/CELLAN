@@ -329,6 +329,41 @@ pub fn load(path: &Path) -> Result<Workbook> {
 /// `load()` 是它的忽略诊断包装，老调用点行为不变。
 /// 上一次 load_diag 实际走的读取分支（集成测试用来证明没有误走 OOXML）
 pub static LAST_LOAD_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 故障注入按“文件路径”登记，而不是进程级环境变量：
+/// 同一测试进程里并行跑的其他加载不会被误伤（环境变量是全局的，会串台）。
+static INJECT_WORKER_PANIC: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+static INJECT_SIDE_PANIC: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn canonical_or_self(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// 测试用：让指定路径的主加载线程 panic。
+pub fn inject_worker_panic(path: &std::path::Path) {
+    INJECT_WORKER_PANIC
+        .lock()
+        .unwrap()
+        .push(canonical_or_self(path));
+}
+
+/// 测试用：让指定路径的旁路扫描线程 panic。
+pub fn inject_side_panic(path: &std::path::Path) {
+    INJECT_SIDE_PANIC.lock().unwrap().push(canonical_or_self(path));
+}
+
+/// 测试用：清空全部注入（用例结束必须调用）。
+pub fn clear_fault_injections() {
+    INJECT_WORKER_PANIC.lock().unwrap().clear();
+    INJECT_SIDE_PANIC.lock().unwrap().clear();
+}
+
+fn injected(list: &std::sync::Mutex<Vec<std::path::PathBuf>>, path: &std::path::Path) -> bool {
+    let p = canonical_or_self(path);
+    list.lock().unwrap().iter().any(|x| *x == p)
+}
 pub const LOAD_KIND_UNKNOWN: u8 = 0;
 pub const LOAD_KIND_BIFF_CALAMINE: u8 = 1;
 pub const LOAD_KIND_BIFF_BUILTIN: u8 = 2;
@@ -336,8 +371,8 @@ pub const LOAD_KIND_OOXML: u8 = 3;
 
 pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     LAST_LOAD_KIND.store(LOAD_KIND_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
-    if std::env::var("SC_LOAD_WORKER_PANIC").is_ok() {
-        panic!("注入：主加载线程 panic（SC_LOAD_WORKER_PANIC）");
+    if injected(&INJECT_WORKER_PANIC, path) {
+        panic!("注入：主加载线程 panic");
     }
     let mut diag = LoadDiag::default();
     if is_password_encrypted(path) {
@@ -438,8 +473,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     if is_ooxml {
         let p = path.to_path_buf();
         std::thread::spawn(move || {
-            if std::env::var("SC_SIDE_PANIC").is_ok() {
-                panic!("注入：旁路扫描线程 panic（SC_SIDE_PANIC）");
+            if injected(&INJECT_SIDE_PANIC, &p) {
+                panic!("注入：旁路扫描线程 panic");
             }
             let out = (
                 crate::arr::scan(&p),
