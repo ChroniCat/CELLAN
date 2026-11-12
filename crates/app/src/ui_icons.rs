@@ -78,7 +78,21 @@ pub enum Icon {
     OutlineLevels,
     GoalSeek,
     Scenario,
+    Eye,
+    EyeOff,
+    PageLayout,
+    PageBreak,
+    NormalView,
+    ShowHeadings,
+    FormulaBar,
+    TextSpill,
+    ViewPane,
+    Pin,
+    NewView,
+    ZoomSelection,
     Freeze,
+    FreezeRow,
+    FreezeCol,
     Lock,
     /// 条件格式：三条彩色数据条
     Cf,
@@ -665,15 +679,39 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(7.6, 9.4, 5.2, 1.4, GRAY_D);
             pen.bar(9.5, 7.5, 1.4, 5.2, GRAY_D);
         }
-        Freeze => {
-            // 冻结窗格：白底 + 浅灰冻结带 + 两条深灰分隔线
-            pen.rrs(3.2, 3.2, 17.6, 17.6, 0.8, WHITE, INK, 1.2);
-            pen.rr(3.6, 5.6, 16.8, 4.2, 0.0, Color32::from_rgb(237, 237, 237));
-            pen.rr(5.6, 9.8, 4.2, 10.6, 0.0, Color32::from_rgb(237, 237, 237));
-            pen.bar(3.6, 9.6, 16.8, 1.2, GRAY_D);
-            pen.bar(9.6, 3.6, 1.2, 16.8, GRAY_D);
+        FreezeRow => {
+            // 冻结首行：顶带淡蓝 + 雪花
+            pen.rrs(3.0, 3.0, 17.4, 17.4, 0.7, WHITE, INK, 1.2);
+            pen.rr(3.4, 3.4, 16.6, 4.6, 0.0, Color32::from_rgb(222, 235, 247));
+            pen.bar(3.4, 8.4, 16.6, 1.2, Color32::from_rgb(91, 127, 166));
+            // 右下角小雪花：三个方向各一条，冻结的通用符号
+            pen.ln(17.6, 15.4, 17.6, 21.0, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(15.2, 16.8, 20.0, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(20.0, 16.8, 15.2, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
         }
-        Lock => {
+        FreezeCol => {
+            // 冻结首列：左带淡蓝 + 雪花
+            pen.rrs(3.0, 3.0, 17.4, 17.4, 0.7, WHITE, INK, 1.2);
+            pen.rr(3.4, 3.4, 4.6, 16.6, 0.0, Color32::from_rgb(222, 235, 247));
+            pen.bar(8.4, 3.4, 1.2, 16.6, Color32::from_rgb(91, 127, 166));
+            // 右下角小雪花：三个方向各一条，冻结的通用符号
+            pen.ln(17.6, 15.4, 17.6, 21.0, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(15.2, 16.8, 20.0, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(20.0, 16.8, 15.2, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
+        }
+        Freeze => {
+            // 冻结窗格：顶带 + 左带 + 雪花
+            pen.rrs(3.0, 3.0, 17.4, 17.4, 0.7, WHITE, INK, 1.2);
+            pen.rr(3.4, 3.4, 16.6, 4.6, 0.0, Color32::from_rgb(222, 235, 247));
+            pen.rr(3.4, 8.4, 4.6, 11.6, 0.0, Color32::from_rgb(222, 235, 247));
+            pen.bar(3.4, 8.4, 16.6, 1.2, Color32::from_rgb(91, 127, 166));
+            pen.bar(8.4, 3.4, 1.2, 16.6, Color32::from_rgb(91, 127, 166));
+            // 右下角小雪花：三个方向各一条，冻结的通用符号
+            pen.ln(17.6, 15.4, 17.6, 21.0, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(15.2, 16.8, 20.0, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
+            pen.ln(20.0, 16.8, 15.2, 19.6, 0.9, Color32::from_rgb(91, 127, 166));
+        }
+       Lock => {
             pen.polyline(
                 &[(7.8, 10.4), (7.8, 7.2), (12.0, 4.4), (16.2, 7.2), (16.2, 10.4)],
                 1.9,
@@ -778,11 +816,11 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(4.0, 4.4, 15.6, 3.4, BLUE_XL);
         }
         Close => {
-            pen.ln(6.6, 6.6, 17.4, 17.4, 2.1, RED);
-            pen.ln(17.4, 6.6, 6.6, 17.4, 2.1, RED);
+            pen.ln(6.8, 6.8, 17.2, 17.2, 1.8, INK);
+            pen.ln(17.2, 6.8, 6.8, 17.2, 1.8, INK);
         }
         Plus => {
-            pen.bar(11.1, 5.2, 1.8, 13.6, GREEN_D);
+            pen.bar(11.1, 5.2, 1.8, 13.6, INK);
             pen.bar(5.2, 11.1, 13.6, 1.8, GREEN_D);
         }
         Refresh => {
@@ -908,6 +946,100 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
             pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
             pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+        }
+        Eye => {
+            // 眼睛：上下两条弧 + 瞳孔
+            pen.polyline(&[(2.6, 12.0), (6.0, 7.6), (12.0, 6.0), (18.0, 7.6), (21.4, 12.0)], 1.4, INK);
+            pen.polyline(&[(2.6, 12.0), (6.0, 16.4), (12.0, 18.0), (18.0, 16.4), (21.4, 12.0)], 1.4, INK);
+            pen.ring(12.0, 12.0, 3.0, 1.5, INK);
+        }
+        EyeOff => {
+            pen.polyline(&[(2.6, 12.0), (6.0, 7.6), (12.0, 6.0), (18.0, 7.6), (21.4, 12.0)], 1.4, GRAY_D);
+            pen.polyline(&[(2.6, 12.0), (6.0, 16.4), (12.0, 18.0), (18.0, 16.4), (21.4, 12.0)], 1.4, GRAY_D);
+            pen.ring(12.0, 12.0, 3.0, 1.5, GRAY_D);
+            pen.ln(3.4, 20.2, 20.6, 3.8, 1.8, Color32::from_rgb(192, 0, 0));
+        }
+        PageLayout => {
+            // 页面布局：纸上画页边距虚线 + 页眉带
+            pen.rrs(4.6, 2.8, 14.8, 18.4, 0.6, WHITE, INK, 1.15);
+            pen.bar(4.6, 2.8, 14.8, 2.6, Color32::from_rgb(217, 217, 217));
+            for k in 0..4 {
+                let y = 8.0 + k as f32 * 3.4;
+                pen.ln(7.0, y, 10.0, y, 0.9, GRAY_D);
+                pen.ln(13.0, y, 17.0, y, 0.9, GRAY_D);
+            }
+            pen.ln(6.4, 6.6, 6.4, 19.6, 0.9, GRAY_D);
+            pen.ln(17.6, 6.6, 17.6, 19.6, 0.9, GRAY_D);
+        }
+        PageBreak => {
+            // 分页预览：纸 + 一条粗分页虚线
+            pen.rrs(4.6, 2.8, 14.8, 18.4, 0.6, WHITE, INK, 1.15);
+            for k in 0..5 {
+                pen.ln(6.4 + k as f32 * 2.6, 12.0, 7.4 + k as f32 * 2.6, 12.0, 1.4, Color32::from_rgb(33, 115, 70));
+            }
+            pen.bar(6.4, 8.6, 11.2, 0.9, Color32::from_rgb(191, 191, 191));
+            pen.bar(6.4, 15.4, 11.2, 0.9, Color32::from_rgb(191, 191, 191));
+        }
+        NormalView => {
+            // 普通视图：一张小网格
+            pen.rrs(3.4, 4.4, 17.2, 15.2, 0.6, WHITE, INK, 1.15);
+            pen.bar(3.6, 9.4, 16.8, 0.9, GRAY_D);
+            pen.bar(3.6, 14.4, 16.8, 0.9, GRAY_D);
+            pen.bar(9.2, 4.6, 0.9, 14.8, GRAY_D);
+            pen.bar(15.0, 4.6, 0.9, 14.8, GRAY_D);
+            pen.rr(3.6, 4.6, 5.4, 4.6, 0.0, Color32::from_rgb(226, 239, 218));
+        }
+        ShowHeadings => {
+            // 行/列标题：左上角深色条 + 网格
+            pen.rrs(3.4, 4.4, 17.2, 15.2, 0.6, WHITE, INK, 1.15);
+            pen.rr(3.6, 4.6, 16.8, 3.4, 0.0, Color32::from_rgb(191, 191, 191));
+            pen.rr(3.6, 4.6, 3.4, 14.8, 0.0, Color32::from_rgb(191, 191, 191));
+            pen.bar(7.4, 8.4, 0.9, 11.0, GRAY_D);
+            pen.bar(3.6, 8.4, 16.8, 0.9, GRAY_D);
+        }
+        FormulaBar => {
+            // 编辑栏：一条长条 + 左边 fx
+            pen.rrs(2.8, 8.0, 18.4, 8.0, 0.8, WHITE, INK, 1.15);
+            pen.text("fx", 5.4, 12.0, 7.4, GRAY_D);
+            pen.bar(9.4, 8.2, 0.9, 7.6, Color32::from_rgb(191, 191, 191));
+            pen.bar(11.4, 10.6, 8.0, 0.9, GRAY_D);
+            pen.bar(11.4, 13.2, 5.6, 0.9, GRAY_D);
+        }
+        TextSpill => {
+            // 文字溢出：左格有字，向右溢出成三条线
+            pen.rro(2.8, 8.4, 7.2, 7.2, 0.4, INK, 1.15);
+            pen.bar(11.6, 9.6, 9.6, 1.3, GRAY_D);
+            pen.bar(11.6, 12.6, 7.4, 1.3, GRAY_D);
+            pen.arrow((21.4, 10.2), (1.0, 0.0), 2.6, Color32::from_rgb(33, 115, 70));
+        }
+        ViewPane => {
+            // 侧栏/视图：一个框 + 左侧分栏
+            pen.rrs(2.8, 4.4, 18.4, 15.2, 0.8, WHITE, INK, 1.15);
+            pen.bar(8.6, 4.6, 0.9, 14.8, INK);
+            pen.bar(4.2, 7.2, 3.0, 0.9, GRAY_D);
+            pen.bar(4.2, 10.0, 3.0, 0.9, GRAY_D);
+            pen.bar(4.2, 12.8, 3.0, 0.9, GRAY_D);
+            pen.bar(10.4, 7.2, 8.4, 0.9, Color32::from_rgb(191, 191, 191));
+            pen.bar(10.4, 10.0, 8.4, 0.9, Color32::from_rgb(191, 191, 191));
+        }
+        Pin => {
+            // 图钉：钉帽 + 针
+            pen.rrs(9.0, 3.0, 6.0, 3.4, 0.6, Color32::from_rgb(197, 217, 241), INK, 1.0);
+            pen.poly(&[(7.4, 6.4), (16.6, 6.4), (14.6, 12.4), (9.4, 12.4)], Color32::from_rgb(197, 217, 241), INK, 1.05);
+            pen.ln(12.0, 12.4, 12.0, 21.0, 1.6, INK);
+        }
+        NewView => {
+            // 新建视图：两个重叠窗口 + 加号
+            pen.rrs(3.0, 4.6, 12.4, 12.4, 0.6, WHITE, GRAY_D, 1.0);
+            pen.rrs(8.0, 8.0, 12.4, 12.4, 0.6, WHITE, INK, 1.15);
+            pen.bar(13.6, 18.4, 5.6, 1.6, Color32::from_rgb(33, 115, 70));
+            pen.bar(15.6, 16.4, 1.6, 5.6, Color32::from_rgb(33, 115, 70));
+        }
+        ZoomSelection => {
+            // 缩放到选区：放大镜里有虚线选框
+            pen.ring(10.4, 10.4, 5.6, 1.8, INK);
+            pen.ln(14.6, 14.6, 20.0, 20.0, 2.2, INK);
+            pen.rro(7.6, 8.0, 5.6, 4.8, 0.3, GRAY_D, 0.9);
         }
         GoalSeek => {
             // 单变量求解：靶心 + 射中的箭头

@@ -669,22 +669,22 @@
         <group id="GroupShow" label="显示">
           <box boxStyle="vertical">
             <toggleButton id="ShowGridlines" label="网格线" imageMso="Grid" screentip="显示单元格之间的浅灰网格线" onAction="ShowGridlines" sizeString="96"/>
-            <toggleButton id="ShowHeadings" label="标题" imageMso="Grid" screentip="显示列标和行号" onAction="ShowHeadings" sizeString="96"/>
+            <toggleButton id="ShowHeadings" label="标题" imageMso="ShowHeadings" screentip="显示列标和行号" onAction="ShowHeadings" sizeString="96"/>
           </box>
           <box boxStyle="vertical">
-            <toggleButton id="ShowFormulaBar" label="编辑栏" imageMso="Grid" screentip="显示名称框和 fx 输入行" onAction="ShowFormulaBar" sizeString="96"/>
-            <toggleButton id="TextSpill" label="文字溢出" imageMso="Grid" screentip="长文本允许越过右边界（Excel 默认）；关闭则裁剪在格子里" onAction="TextSpill" sizeString="96"/>
+            <toggleButton id="ShowFormulaBar" label="编辑栏" imageMso="FormulaBar" screentip="显示名称框和 fx 输入行" onAction="ShowFormulaBar" sizeString="96"/>
+            <toggleButton id="TextSpill" label="文字溢出" imageMso="TextSpill" screentip="长文本允许越过右边界（Excel 默认）；关闭则裁剪在格子里" onAction="TextSpill" sizeString="96"/>
           </box>
           <button id="ViewPrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
             <button id="Zoom100" label="100%" imageMso="Zoom" screentip="回到实际大小" onAction="Zoom100" sizeString="110"/>
-            <button id="ToggleFileTree" label="显示文件列表" imageMso="Open" screentip="左侧文件树" onAction="ToggleFileTree" sizeString="110"/>
+            <button id="ToggleFileTree" label="显示文件列表" imageMso="ViewPane" screentip="左侧文件树" onAction="ToggleFileTree" sizeString="110"/>
           </box>
         </group>
         <group id="GroupZoom" label="缩放">
           <box boxStyle="vertical">
             <button id="ZoomDialog" label="缩放..." imageMso="Zoom" onAction="ZoomDialog" sizeString="96"/>
-            <button id="ZoomToSelection" label="缩放到选定区域" imageMso="Zoom" onAction="ZoomToSelection" sizeString="120"/>
+            <button id="ZoomToSelection" label="缩放到选定区域" imageMso="ZoomSelection" onAction="ZoomToSelection" sizeString="120"/>
             <box boxStyle="horizontal">
               <button id="ZoomIn" imageMso="Zoom" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>
@@ -694,29 +694,29 @@
         </group>
         <group id="GroupSheetView" label="工作表视图">
           <box boxStyle="vertical">
-            <button id="ViewSwitch" label="切换工作表视图" imageMso="Grid" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
-            <button id="ViewKeep" label="保留" imageMso="Save" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118"/>
+            <button id="ViewSwitch" label="切换工作表视图" imageMso="ViewPane" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
+            <button id="ViewKeep" label="保留" imageMso="Pin" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118"/>
             <button id="ViewExit" label="退出" imageMso="Close" screentip="退出视图模式（不改变当前状态）" onAction="ViewExit" sizeString="118"/>
           </box>
-          <button id="ViewNew" label="新建" size="large" imageMso="Plus" screentip="新建一个工作表视图" onAction="ViewNew"/>
+          <button id="ViewNew" label="新建" size="large" imageMso="NewView" screentip="新建一个工作表视图" onAction="ViewNew"/>
         </group>
         <group id="GroupWindow" label="窗口">
           <box boxStyle="vertical">
-            <toggleButton id="FreezeTopRow" label="冻结首行" imageMso="Freeze" screentip="滚动时第一行保持可见" onAction="FreezeTopRow" sizeString="96"/>
-            <toggleButton id="FreezeFirstColumn" label="冻结首列" imageMso="Freeze" screentip="滚动时第一列保持可见" onAction="FreezeFirstColumn" sizeString="96"/>
+            <toggleButton id="FreezeTopRow" label="冻结首行" imageMso="FreezeRow" screentip="滚动时第一行保持可见" onAction="FreezeTopRow" sizeString="96"/>
+            <toggleButton id="FreezeFirstColumn" label="冻结首列" imageMso="FreezeCol" screentip="滚动时第一列保持可见" onAction="FreezeFirstColumn" sizeString="96"/>
             <button id="FreezePanes" label="冻结窗格" imageMso="Freeze" screentip="冻结当前单元格上方的行与左侧的列" onAction="FreezePanes" sizeString="96"/>
           </box>
           <box boxStyle="vertical">
             <button id="Unfreeze" label="取消冻结" imageMso="Close" onAction="Unfreeze" sizeString="96"/>
-            <button id="HideSheet" label="隐藏" imageMso="Eraser" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
-            <button id="UnhideSheet" label="取消隐藏" imageMso="Refresh" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
+            <button id="HideSheet" label="隐藏" imageMso="EyeOff" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
+            <button id="UnhideSheet" label="取消隐藏" imageMso="Eye" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
           </box>
         </group>
         <group id="GroupViews" label="工作簿视图">
           <box boxStyle="vertical">
-            <toggleButton id="NormalView" label="普通" imageMso="Grid" screentip="普通视图" onAction="NormalView" sizeString="96"/>
-            <toggleButton id="PageLayoutView" label="页面布局" imageMso="Sheet" screentip="按打印页显示，含页边距和页眉页脚" onAction="PageLayoutView" sizeString="96"/>
-            <toggleButton id="PageBreakPreview" label="分页预览" imageMso="Print" screentip="显示分页符和页码" onAction="PageBreakPreview" sizeString="96"/>
+            <toggleButton id="NormalView" label="普通" imageMso="NormalView" screentip="普通视图" onAction="NormalView" sizeString="96"/>
+            <toggleButton id="PageLayoutView" label="页面布局" imageMso="PageLayout" screentip="按打印页显示，含页边距和页眉页脚" onAction="PageLayoutView" sizeString="96"/>
+            <toggleButton id="PageBreakPreview" label="分页预览" imageMso="PageBreak" screentip="显示分页符和页码" onAction="PageBreakPreview" sizeString="96"/>
           </box>
         </group>
         <group id="GroupViewChanges" label="修订">
