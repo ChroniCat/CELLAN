@@ -86,3 +86,34 @@
       127 passed, 0 failed, 0 ignored, 4 filtered
 
 （原始输出：`c13-1-core-suite.txt`、`c13-1-app-suite.txt`。）
+
+## C13.2 收尾：34 处全部传播
+
+`save_plain_base` 里已无 `eprintln!("[save] … 失败")` 形式的吞错（本次检索为 0 处）。
+
+| 批次 | 子步骤 | 注入证据 |
+|---|---|---|
+| C13.1 | merge-sheet-data, layout, protection, page-setup, fixups-migrate-sheet-rels | 注入测试 #1 |
+| C13.2 无条件 | styles-count, shared-strings-rel, content-types, prune-content-types, outline, scenarios, ignored-errors, tab-colors, hyperlinks, sparkline, textbox, sheet-states, rich | 注入测试 #1（共 18 步） |
+| C13.2 收尾链 | fixups-drawing-rels, fixups-dedupe-rels, fixups-prune-orphans, fixups-sheet-refs, fixups-workbook-rels, fixups-drawing-props, fixups-content-types, restore-unedited-sheets, rehome-sheets, workbook-skeleton, base-sheet-rels, fixups-content-types-2, fixups-prune-orphans-2 | 注入测试 #1（共 33 步） |
+| C13.2 有条件 | table-attach, cf-patch, sources, xlink-parts, xlink-cache, table-sync, pivot-shifts | 注入测试 #2（带表格/DV/数据源/外链/透视位移的合成工作簿） |
+| C13.2 宏 | vba | 注入测试 #3（tests/data/real_macro.xlsm 副本） |
+| 已传播但未做注入 | chart-anchor, chart-refs, raw-copies | 需带真实图表的合成基准（图表锚点/引用改写只在 charts_dirty 且有 ref_fixes 时执行） |
+
+回归：
+
+    cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1
+    test result: ok. 3 passed; 0 failed
+
+    cargo test -p sheetcore --offline -- --test-threads=1
+    54 个二进制：460 passed, 0 failed, 34 ignored
+
+    cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests::
+    127 passed, 0 failed, 0 ignored, 4 filtered
+
+原始输出：`c13-2-suite.txt`。
+
+### 仍未覆盖
+
+- 图表锚点/引用（chart-anchor / chart-refs）与 raw-copies 的注入：需要带图表的基准文件与
+  `ref_fixes` 的真实内容，登记到图表任务（C19/QA-02 夹具）一起做；代码路径已传播，真实错误会中止保存。

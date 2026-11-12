@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T11:05:34Z",
+ "updated_utc": "2026-11-12T11:16:41Z",
  "tasks": [
   {
    "id": "C01",
@@ -439,11 +439,13 @@
    "commits": [],
    "commands": [],
    "evidence": [],
-   "not_done": [],
+   "not_done": [
+    "图表锚点/引用与 raw-copies 注入未执行（需图表夹具）"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "C13.2 错误传播和临时文件完整性",
-   "updated_utc": "2026-11-12T11:05:34Z",
+   "next": "C13.3 dirty/回执/重试集成；图表注入待夹具",
+   "updated_utc": "2026-11-12T11:16:41Z",
    "slices": [
     {
      "id": "C13.1",
@@ -482,17 +484,29 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C13 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "save_plain_base 全部 34 处吞错改为失败即中止（must_save!），临时文件不替换目标；注入覆盖 33 个无条件/尾链子步骤 + 7 个有条件子步骤（表格/DV/数据源/外链/表同步/透视位移）+ 宏工作簿；每次注入断言 Err 点名步骤、原文件 SHA256 不变、清注入重试成功。",
+     "files": [
+      "crates/core/src/xlsx.rs",
+      "crates/core/tests/save_failure_injection.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --offline --test save_failure_injection -- --test-threads=1 => 3 passed (33 无条件 + 7 有条件 + vba)",
+      "cargo test -p sheetcore --offline -- --test-threads=1 => 460 passed, 0 failed, 34 ignored（54 个二进制）",
+      "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 127 passed, 0 failed, 0 ignored, 4 filtered"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-1-swallowed-errors.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-2-suite.txt"
+     ],
+     "not_done": [
+      "chart-anchor / chart-refs / raw-copies 的注入缺带真实图表的基准（代码已传播，测试待图表夹具）；保存失败时的 dirty/回执/重试集成属 C13.3"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "C13.3 dirty/回执/重试集成",
+     "updated_utc": "2026-11-12T11:16:40Z"
     },
     {
      "id": "C13.3",

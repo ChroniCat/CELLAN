@@ -70,6 +70,32 @@ fn injected_step_failures_do_not_report_success() {
         "protection",
         "page-setup",
         "fixups-migrate-sheet-rels",
+        "styles-count",
+        "shared-strings-rel",
+        "content-types",
+        "prune-content-types",
+        "outline",
+        "scenarios",
+        "ignored-errors",
+        "tab-colors",
+        "hyperlinks",
+        "sparkline",
+        "textbox",
+        "sheet-states",
+        "rich",
+        "fixups-drawing-rels",
+        "fixups-dedupe-rels",
+        "fixups-prune-orphans",
+        "fixups-sheet-refs",
+        "fixups-workbook-rels",
+        "fixups-drawing-props",
+        "fixups-content-types",
+        "restore-unedited-sheets",
+        "rehome-sheets",
+        "workbook-skeleton",
+        "base-sheet-rels",
+        "fixups-content-types-2",
+        "fixups-prune-orphans-2",
     ];
     let mut swallowed = Vec::new();
     for step in steps {
@@ -100,5 +126,122 @@ fn injected_step_failures_do_not_report_success() {
     sheetcore::xlsx::save_atomic(&path, &wb).expect("故障解除后应保存成功");
     let back = sheetcore::xlsx::load(&path).unwrap();
     assert_eq!(back.sheets[0].value(1, 0), Value::Number(2.0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+
+/// 有条件触发的子步骤：只有工作簿里真的有对应部件时才会执行。
+/// 这里用一份“什么东西都带一点”的合成工作簿把它们真正跑起来。
+#[test]
+fn injected_failures_in_conditional_steps_abort_the_save() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("conditional");
+    let path = dir.join("rich.xlsx");
+
+    let mut wb = book();
+    wb.sheets[0].set(
+        0,
+        1,
+        Cell { value: Value::Text("数量".into()), formula: None },
+    );
+    wb.sheets[0].set(1, 1, Cell { value: Value::Number(5.0), formula: None });
+    wb.sheets[0].tables.push(sheetcore::table::Table {
+        name: "Sales".into(),
+        display: "Sales".into(),
+        range: (0, 0, 1, 1),
+        columns: vec!["金额".into(), "数量".into()],
+        header_row: true,
+        totals_row: false,
+    });
+    wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+        ranges: vec![(1, 0, 1, 0)],
+        kind: sheetcore::dv::DvKind::Whole,
+        f1: "1".into(),
+        f2: "9".into(),
+        ..Default::default()
+    });
+    wb.sources.push(sheetcore::external::Source {
+        name: "导入1".into(),
+        kind: sheetcore::external::Kind::Internal {
+            sheet: "数据".into(),
+            rect: (0, 0, 1, 1),
+        },
+        at: (4, 0),
+        rows: 2,
+        cols: 2,
+    });
+    wb.links.push(sheetcore::xlinks::ExternalBook {
+        index: 1,
+        target: "外部.xlsx".into(),
+        sheets: vec!["Sheet1".into()],
+        ..Default::default()
+    });
+
+    wb.sheets[0].tables_dirty = true;
+    wb.pivot_shifts.push(("数据".into(), 0, 1, 0, true));
+
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("基线保存");
+    let before = hash(&path);
+    wb.sheets[0].set(1, 1, Cell { value: Value::Number(6.0), formula: None });
+
+    let steps = [
+        "table-attach",
+        "cf-patch",
+        "sources",
+        "xlink-parts",
+        "xlink-cache",
+        "table-sync",
+        "pivot-shifts",
+    ];
+    let mut swallowed = Vec::new();
+    for step in steps {
+        // SAFETY: 整个测试持有 ENV_LOCK
+        unsafe { std::env::set_var("SC_FAIL_SAVE_STEP", step) };
+        let result = sheetcore::xlsx::save_atomic(&path, &wb);
+        unsafe { std::env::remove_var("SC_FAIL_SAVE_STEP") };
+        match result {
+            Err(e) => assert!(
+                format!("{e:#}").contains(step),
+                "错误里必须点名失败的子步骤 {step}"
+            ),
+            Ok(()) => swallowed.push(step),
+        }
+        assert_eq!(hash(&path), before, "注入 {step} 失败时原文件不得被改写");
+    }
+    assert!(swallowed.is_empty(), "这些子步骤失败后仍回报成功：{swallowed:?}");
+
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("故障解除后应保存成功");
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheets[0].value(1, 1), Value::Number(6.0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+
+/// 宏工作簿：VBA 部件写不回去时必须让保存失败，不能“成功”地丢掉宏。
+#[test]
+fn injected_vba_restore_failure_aborts_saving_a_macro_workbook() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("vba");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/real_macro.xlsm");
+    let path = dir.join("macro.xlsm");
+    std::fs::copy(&src, &path).expect("复制宏工作簿样本");
+    let mut wb = sheetcore::xlsx::load(&path).expect("读取宏工作簿");
+    wb.path = Some(path.clone());
+    wb.sheets[0].set(1, 0, Cell { value: Value::Number(7.0), formula: None });
+    let before = hash(&path);
+
+    // SAFETY: 整个测试持有 ENV_LOCK
+    unsafe { std::env::set_var("SC_FAIL_SAVE_STEP", "vba") };
+    let result = sheetcore::xlsx::save_atomic(&path, &wb);
+    unsafe { std::env::remove_var("SC_FAIL_SAVE_STEP") };
+    let err = format!("{:#}", result.expect_err("宏恢复失败时保存必须报错"));
+    assert!(err.contains("vba"), "错误里必须点名 vba 步骤：{err}");
+    assert_eq!(hash(&path), before, "失败时原宏工作簿不得被改写");
+
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("故障解除后应保存成功");
+    assert!(
+        sheetcore::vba::read_vba(&path).is_some(),
+        "正常保存后宏部件必须还在"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

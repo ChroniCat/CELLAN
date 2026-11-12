@@ -1147,9 +1147,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
 
     // 宏部件：umya 写不出来，塞回去
     if let Some(v) = vba {
-        if let Err(e) = crate::vba::restore_vba(path, &v) {
-            eprintln!("[save] 宏恢复失败: {e:#}");
-        }
+        must_save!("vba", crate::vba::restore_vba(path, &v));
     }
 
     // umya may emit an empty cacheSource/cacheFields for an imported pivot.
@@ -1176,9 +1174,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
 
     // 透视表缓存里的源区域
     if !wb.pivot_shifts.is_empty() {
-        if let Err(e) = crate::patch::shift_pivot_caches(path, &wb.pivot_shifts) {
-            eprintln!("[save] 透视表源区域回写失败: {e:#}");
-        }
+        must_save!("pivot-shifts", crate::patch::shift_pivot_caches(path, &wb.pivot_shifts));
     }
 
     // 自定义名称
@@ -1188,9 +1184,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 数据源存成"自定义文档属性"：这是 Excel 自己的规范位置，
     // 塞进 definedNames 会和查询表打架，单独加未知部件又会被拒收
     if !wb.sources.is_empty() && std::env::var("SC_NO_SRC_PROP").is_err() {
-        if let Err(e) = crate::external::write_sources(path, &wb.sources) {
-            eprintln!("[save] 数据源写入失败: {e:#}");
-        }
+        must_save!("sources", crate::external::write_sources(path, &wb.sources));
     }
 
     // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来
@@ -1217,27 +1211,25 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     .iter()
                     .filter(|c| c.drawing == ch.drawing)
                     .count();
-                if let Err(e) =
+                must_save!(
+                    "chart-anchor",
                     crate::chart_write::write_anchor(path, &ch.drawing, ord, ch.anchor)
-                {
-                    eprintln!("[save] 图表锚点回写失败: {e:#}");
-                }
+                );
             }
             if ch.part.is_empty() || ch.ref_fixes.is_empty() {
                 continue;
             }
-            if let Err(e) = crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes) {
-                eprintln!("[save] 图表引用回写失败: {e:#}");
-            }
+            must_save!(
+                "chart-refs",
+                crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes)
+            );
         }
     }
 
     // 表格对象：umya 会丢掉 tableParts，保存后自己挂回去
     for sheet in wb.sheets.iter() {
         if !sheet.tables.is_empty() && std::env::var("SC_NO_TABLE_ATTACH").is_err() {
-            if let Err(e) = crate::table::attach(path, &sheet.name, &sheet.tables) {
-                eprintln!("[save] 表格对象写入失败: {e:#}");
-            }
+            must_save!("table-attach", crate::table::attach(path, &sheet.name, &sheet.tables));
         }
     }
     // umya 不管条件格式的 dxf 细节，保存完直接补 XML
@@ -1250,9 +1242,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     let any_page = wb.sheets.iter().any(|s| s.page_dirty);
     let any_arr = wb.sheets.iter().any(|s| !s.arrays.is_empty());
     if any_cf || any_dv || any_freeze || any_filter || any_page || any_arr {
-        if let Err(e) = apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter, any_page) {
-            eprintln!("[save] 条件格式/数据验证补丁失败: {e}");
-        }
+        must_save!(
+            "cf-patch",
+            apply_cf_patch(path, wb, any_cf, any_dv, any_freeze, any_filter, any_page)
+        );
     }
     if prof {
         eprintln!("  [save] 其余补丁 {:.2}s", t_write.elapsed().as_secs_f64());
@@ -1265,103 +1258,65 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             path,
             &restore_base
         ));
-        if let Err(e) = crate::fixups::fix_drawing_rels(path, &restore_base) {
-            eprintln!("[save] 修复 drawing 关系失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::dedupe_singleton_rels(path) {
-            eprintln!("[save] 去重关系失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::prune_orphans(path) {
-            eprintln!("[save] 清理孤儿部件失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::restore_sheet_refs(path, &restore_base) {
-            eprintln!("[save] 补回工作表引用元素失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::migrate_workbook_rels(path, &restore_base) {
-            eprintln!("[save] 迁移 workbook 关系失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::sanitize_drawings(path) {
-            eprintln!("[save] 清理绘图属性失败: {e:#}");
-        }
-        if let Err(e) = crate::fixups::ensure_content_types(path, &restore_base) {
-            eprintln!("[save] 补齐内容类型失败: {e:#}");
-        }
+        must_save!("fixups-drawing-rels", crate::fixups::fix_drawing_rels(path, &restore_base));
+        must_save!("fixups-dedupe-rels", crate::fixups::dedupe_singleton_rels(path));
+        must_save!("fixups-prune-orphans", crate::fixups::prune_orphans(path));
+        must_save!("fixups-sheet-refs", crate::fixups::restore_sheet_refs(path, &restore_base));
+        must_save!("fixups-workbook-rels", crate::fixups::migrate_workbook_rels(path, &restore_base));
+        must_save!("fixups-drawing-props", crate::fixups::sanitize_drawings(path));
+        must_save!("fixups-content-types", crate::fixups::ensure_content_types(path, &restore_base));
     }
 
     // 最后一步：没编辑过的表整段按基准恢复（放在所有补丁之后，覆盖 umya 的改写）
     if restore_base.exists() {
         // 这一步要复制二十几张表的 XML（几百 MB），攒成一次落盘
         crate::patch::begin_stage();
-        match crate::fixups::restore_unedited_sheets(path, &restore_base, wb) {
-            Ok(v) if !v.is_empty() => {
-                if prof {
-                    eprintln!("  [save] 原样沿用 {} 张表: {:?}", v.len(), v);
-                }
-            }
-            Err(e) => eprintln!("[save] 恢复未编辑工作表失败: {e:#}"),
-            _ => {}
+        let kept = must_save!("restore-unedited-sheets", crate::fixups::restore_unedited_sheets(
+            path,
+            &restore_base,
+            wb
+        ));
+        if !kept.is_empty() && prof {
+            eprintln!("  [save] 原样沿用 {} 张表: {:?}", kept.len(), kept);
         }
         // umya 会把工作表搬到 xl/worksheets/，搬回去（绘图/图表/透视表的相对路径才成立）
-        match crate::fixups::rehome_sheets(path, &restore_base) {
-            Ok(v) if !v.is_empty() => {
-                if prof {
-                    eprintln!("  [save] 工作表放回原位 {} 张", v.len());
-                }
-            }
-            Err(e) => eprintln!("[save] 工作表归位失败: {e:#}"),
-            _ => {}
+        let rehomed = must_save!("rehome-sheets", crate::fixups::rehome_sheets(path, &restore_base));
+        if !rehomed.is_empty() && prof {
+            eprintln!("  [save] 工作表放回原位 {} 张", rehomed.len());
         }
-        match crate::fixups::restore_workbook_skeleton(path, &restore_base, wb) {
-            Ok(true) => {
-                if prof {
-                    eprintln!("  [save] 工作簿骨架沿用基准（definedNames/pivotCaches 保住）");
-                }
-            }
-            Err(e) => eprintln!("[save] 恢复工作簿骨架失败: {e:#}"),
-            _ => {}
+        let skeleton = must_save!("workbook-skeleton", crate::fixups::restore_workbook_skeleton(
+            path,
+            &restore_base,
+            wb
+        ));
+        if skeleton && prof {
+            eprintln!("  [save] 工作簿骨架沿用基准（definedNames/pivotCaches 保住）");
         }
-        match crate::fixups::restore_base_sheet_rels(path, &restore_base, wb) {
-            Ok(n) if n > 0 => {
-                if prof {
-                    eprintln!("  [save] 工作表 rels 沿用基准 {n} 份");
-                }
-            }
-            Err(e) => eprintln!("[save] 恢复工作表 rels 失败: {e:#}"),
-            _ => {}
+        let rels = must_save!("base-sheet-rels", crate::fixups::restore_base_sheet_rels(
+            path,
+            &restore_base,
+            wb
+        ));
+        if rels > 0 && prof {
+            eprintln!("  [save] 工作表 rels 沿用基准 {rels} 份");
         }
-        let _ = crate::fixups::ensure_content_types(path, &restore_base);
+        must_save!("fixups-content-types-2", crate::fixups::ensure_content_types(path, &restore_base));
         // 恢复后清一遍孤儿部件（基准部件另有一份同类型副本时会重复）
-        let _ = crate::fixups::prune_orphans(path);
+        must_save!("fixups-prune-orphans-2", crate::fixups::prune_orphans(path));
         if std::env::var("SC_NO_NORM_STYLES").is_err() {
-        match crate::fixups::normalize_styles_counts(path) {
-            Ok(true) => {
-                if prof {
-                    eprintln!("  [save] 重算 styles.xml 的 count");
-                }
-            }
-            Err(e) => eprintln!("[save] 重算 styles count 失败: {e:#}"),
-            _ => {}
+        let restyled = must_save!("styles-count", crate::fixups::normalize_styles_counts(path));
+        if restyled && prof {
+            eprintln!("  [save] 重算 styles.xml 的 count");
         }
         }
-        match crate::fixups::ensure_shared_strings_rel(path) {
-            Ok(true) => {
-                if prof {
-                    eprintln!("  [save] 补上 sharedStrings 关系");
-                }
-            }
-            Ok(false) => {}
-            Err(e) => eprintln!("[save] 补 sharedStrings 关系失败: {e:#}"),
+        let added_ss = must_save!("shared-strings-rel", crate::fixups::ensure_shared_strings_rel(path));
+        if added_ss && prof {
+            eprintln!("  [save] 补上 sharedStrings 关系");
         }
-        if let Err(e) = crate::fixups::rebuild_content_types(path, &restore_base) {
-            eprintln!("[save] 重建内容类型失败: {e:#}");
-        }
-        match crate::fixups::prune_content_types(path) {
-            Ok(n) if n > 0 => {
-                if prof {
-                    eprintln!("  [save] 清掉 {n} 条悬空内容类型");
-                }
-            }
-            _ => {}
+        must_save!("content-types", crate::fixups::rebuild_content_types(path, &restore_base));
+        let pruned = must_save!("prune-content-types", crate::fixups::prune_content_types(path));
+        if pruned > 0 && prof {
+            eprintln!("  [save] 清掉 {pruned} 条悬空内容类型");
         }
     }
     // 原样搬过来的部件（从基准包里 direct copy，不解压）
@@ -1372,24 +1327,17 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     eprintln!("  [save] 原样搬运 {n} 个部件");
                 }
             }
-            Err(e) => eprintln!("[save] 原样搬运失败: {e:#}"),
+            Err(e) => return Err(e.context("保存子步骤 raw-copies 失败")),
         }
     }
     // 跨工作簿引用：先把缺的部件补齐（用户新加的工作簿），再写缓存
     if !wb.links.is_empty() && std::env::var("SC_NO_XLINKS").is_err() {
-        if let Err(e) = crate::xlinks::ensure_parts(path, &wb.links) {
-            eprintln!("[save] 补外部链接部件失败: {e:#}");
-        }
+        must_save!("xlink-parts", crate::xlinks::ensure_parts(path, &wb.links));
     }
     if !wb.links.is_empty() && std::env::var("SC_NO_XLINKS").is_err() {
-        match crate::xlinks::write_cache(path, &wb.links) {
-            Ok(n) if n > 0 => {
-                if prof {
-                    eprintln!("  [save] 刷新 {n} 个外部链接缓存");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("[save] 外部链接缓存写回失败: {e:#}"),
+        let refreshed = must_save!("xlink-cache", crate::xlinks::write_cache(path, &wb.links));
+        if refreshed > 0 && prof {
+            eprintln!("  [save] 刷新 {refreshed} 个外部链接缓存");
         }
     }
     match crate::patch::commit_stage(path) {
@@ -1416,41 +1364,21 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     must_save!("layout", crate::patch::apply_layout(path, wb));
-    if let Err(e) = crate::patch::apply_outline_pr(path, wb) {
-        eprintln!("[save] 分级设置写回失败: {e:#}");
-    }
-    if let Err(e) = crate::patch::apply_scenarios(path, wb) {
-        eprintln!("[save] 方案写回失败: {e:#}");
-    }
-    if let Err(e) = crate::patch::apply_ignored_errors(path, wb) {
-        eprintln!("[save] 忽略错误列表写回失败: {e:#}");
-    }
-    if let Err(e) = crate::patch::apply_tab_colors(path, wb) {
-        eprintln!("[save] 标签颜色写回失败: {e:#}");
-    }
+    must_save!("outline", crate::patch::apply_outline_pr(path, wb));
+    must_save!("scenarios", crate::patch::apply_scenarios(path, wb));
+    must_save!("ignored-errors", crate::patch::apply_ignored_errors(path, wb));
+    must_save!("tab-colors", crate::patch::apply_tab_colors(path, wb));
     must_save!("protection", crate::patch::apply_protection(path, wb));
-    if let Err(e) = crate::hyperlinks::apply(path, wb) {
-        eprintln!("[save] 超链接写回失败: {e:#}");
-    }
-    if let Err(e) = crate::sparkline::apply(path, wb) {
-        eprintln!("[save] 迷你图写回失败: {e:#}");
-    }
-    if let Err(e) = crate::textbox::apply(path, wb) {
-        eprintln!("[save] 文本框写回失败: {e:#}");
-    }
-    if let Err(e) = crate::patch::apply_sheet_states(path, wb) {
-        eprintln!("[save] 工作表可见性写回失败: {e:#}");
-    }
-    if let Err(e) = crate::patch::apply_rich(path, wb) {
-        eprintln!("[save] 富文本写回失败: {e:#}");
-    }
+    must_save!("hyperlinks", crate::hyperlinks::apply(path, wb));
+    must_save!("sparkline", crate::sparkline::apply(path, wb));
+    must_save!("textbox", crate::textbox::apply(path, wb));
+    must_save!("sheet-states", crate::patch::apply_sheet_states(path, wb));
+    must_save!("rich", crate::patch::apply_rich(path, wb));
     must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     // 表格对象：删除/转换/新建后同步 table 部件
     for sheet in &wb.sheets {
         if sheet.tables_dirty {
-            if let Err(e) = crate::table::sync(path, &sheet.name, &sheet.tables) {
-                eprintln!("[save] 表格部件同步失败: {e:#}");
-            }
+            must_save!("table-sync", crate::table::sync(path, &sheet.name, &sheet.tables));
         }
     }
     Ok(())
