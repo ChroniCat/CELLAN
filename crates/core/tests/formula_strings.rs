@@ -142,6 +142,14 @@ fn prefix_inside_a_legal_name_is_not_stripped() {
         };
         assert_eq!(sheetcore::normalize_formula(src), want, "{src} 里的合法名称被改写了");
     }
+    // 结构化引用方括号里的是**列名**，哪怕长得像参数前缀也不能改
+    for src in [
+        "=SUM(Sales[_xlpm.Amount])",
+        "=SUM(Sales[_xlfn.Qty])",
+        "=Sales[[#All],[_xlpm.Col]]",
+    ] {
+        assert_eq!(sheetcore::normalize_formula(src), src, "{src} 的列名被改写了");
+    }
     // 表名真的存在时，结构化引用照常展开，但表名本身不能被当成前缀处理
     let wb = book_with_table_named("Sales_xlfn.Backup");
     let out = expand_structured(&wb, 0, "=SUM(Sales_xlfn.Backup[Amount])").expect("应展开");
@@ -201,10 +209,31 @@ fn input_save_load_copy_keep_the_formula_text() {
     assert_eq!(back.sheets[0].get(1, 2).unwrap().formula.as_deref(), Some(r#"="A:A""#));
     // 载入后重算仍一致
     assert_eq!(ev(&back, back.sheets[0].get(0, 2).unwrap().formula.as_deref().unwrap()), "Sales[Amount]");
-    // 复制路径：公式文本原样搬走
-    let src_formula = back.sheets[0].get(0, 2).unwrap().formula.clone().unwrap();
-    let copied = sheetcore::sparse::shift_refs(&src_formula, 0, 0);
-    assert_eq!(copied, src_formula.as_ref(), "复制路径改写了公式文本");
+    // 复制路径：拖拽一格（+1 行 +1 列）时引用跟着动，字符串与表名一字不动。
+    // 用 (0,0) 偏移是假的：`sparse.rs::shift_refs` 对零偏移直接 return，什么也没验证。
+    let moved = sheetcore::sparse::shift_refs(
+        r#"=A1&"A1"&$B$2&"Sales[Amount]"&TAX_xlfn.Rate"#,
+        1,
+        1,
+    );
+    assert_eq!(
+        moved.as_str(),
+        r#"=B2&"A1"&$B$2&"Sales[Amount]"&TAX_xlfn.Rate"#,
+        "复制（+1 行 +1 列）：相对引用要移动，字符串/绝对引用/名称不能动"
+    );
+    // 再把这条带真实引用的公式存盘重开，文本必须还是移动后的样子
+    let mut with_refs = back.clone();
+    with_refs.sheets[0].set(4, 2, Cell {
+        value: Value::Text("=B2&\"A1\"&$B$2".into()),
+        formula: Some(moved.clone().into_boxed_str()),
+    });
+    sheetcore::xlsx::save_atomic(&path, &with_refs).expect("保存移动后的公式失败");
+    let reopened = sheetcore::xlsx::load(&path).expect("重开失败");
+    assert_eq!(
+        reopened.sheets[0].get(4, 2).unwrap().formula.as_deref(),
+        Some(moved.as_str()),
+        "复制后的公式存盘重开被改写"
+    );
     // 再存一次，文本不变
     sheetcore::xlsx::save_atomic(&path, &back).expect("二次保存失败");
     let again = sheetcore::xlsx::load(&path).expect("二次载入失败");

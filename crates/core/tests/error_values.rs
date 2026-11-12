@@ -84,7 +84,7 @@ fn sum_propagates_a_real_error_instead_of_skipping_it() {
 }
 
 #[test]
-fn cross_sheet_reference_keeps_the_error_type() {
+fn a_reference_to_the_same_sheet_keeps_the_error_type() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "数据".into();
     wb.sheets[0].set(0, 0, Cell { value: Value::Error(ErrKind::Div0), formula: None });
@@ -95,7 +95,7 @@ fn cross_sheet_reference_keeps_the_error_type() {
 // ---------------------------------------------------------------- 增量重算
 
 #[test]
-fn incremental_recalc_keeps_the_error_type() {
+fn full_recalc_keeps_the_error_type() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
     wb.sheets[0].set(0, 1, Cell { value: Value::Number(0.0), formula: None });

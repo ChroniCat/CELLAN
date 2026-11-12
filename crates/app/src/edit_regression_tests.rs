@@ -2063,3 +2063,60 @@ fn probe_outputs_go_to_the_declared_directory_not_a_fixed_dev_path() {
     assert_eq!(back.sources.len(), 1, "重开后数据源必须还在");
     assert_eq!(!dev.exists(), !dev_existed, "不得在固定开发目录下新建任何东西");
 }
+
+#[test]
+fn pasting_an_excel_error_cell_keeps_it_an_error_value() {
+    // Excel 复制出来的错误格在 XML Spreadsheet 里是 `ss:Type="Error"`，
+    // 解析后 kind=4；粘贴必须还原成 Value::Error，不能变成文本或 0。
+    let mut app = app();
+    app.sel = (2, 1);
+    let cell = |text: &str, kind: u8, formula: Option<&str>| office_clipboard::OfficeCell {
+        text: text.into(),
+        bold: false,
+        italic: false,
+        fill: None,
+        color: None,
+        halign: 0,
+        colspan: 1,
+        rowspan: 1,
+        border: None,
+        formula: formula.map(|f| f.into()),
+        kind,
+        font: String::new(),
+        size: 0.0,
+        num_format: String::new(),
+    };
+    // 真正走一遍 XMLSS 解析：Excel 的 ss:Type="Error" 必须映射成 kind=4
+    let xml = r#"<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Worksheet ss:Name="Sheet1"><Table>
+  <Row><Cell><Data ss:Type="Error">#DIV/0!</Data></Cell>
+       <Cell><Data ss:Type="String">#N/A</Data></Cell></Row>
+ </Table></Worksheet></Workbook>"#;
+    let parsed = sheetcore::clipboard_xmlss::parse(xml);
+    let mapped = office_clipboard::convert_block(parsed);
+    assert_eq!(
+        mapped.rows[0][0].kind, 4,
+        "ss:Type=\"Error\" 应该映射成 kind=4（错误值），实际 {}",
+        mapped.rows[0][0].kind
+    );
+    assert_eq!(mapped.rows[0][1].kind, 1, "ss:Type=\"String\" 应仍是文本");
+    let block = office_clipboard::OfficeBlock {
+        rows: vec![
+            vec![cell("#DIV/0!", 4, None), cell("#N/A", 4, None)],
+            vec![cell("5", 0, None), cell("#DIV/0!", 1, None)],
+        ],
+    };
+    assert!(app.paste_office_block(&block), "粘贴被拒绝");
+    assert_eq!(
+        app.wb.sheets[0].value(2, 1),
+        Value::Error(sheetcore::formula::ErrKind::Div0),
+        "粘贴的错误格变成了 {:?}",
+        app.wb.sheets[0].value(2, 1)
+    );
+    assert_eq!(app.wb.sheets[0].value(2, 2), Value::Error(sheetcore::formula::ErrKind::Na));
+    assert_eq!(app.wb.sheets[0].value(3, 1), Value::Number(5.0));
+    // kind=1（文本）的 "#DIV/0!" 仍然是文本
+    assert_eq!(app.wb.sheets[0].value(3, 2), Value::Text("#DIV/0!".into()));
+}

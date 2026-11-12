@@ -501,9 +501,10 @@ fn sheet_stream(
                 rec(&mut out, BOOLERR, &b);
             }
             Value::Error(e) => {
-                // BOOLERR：第 1 字节 1 = 错误，第 2 字节是错误码
-                b.push(1);
+                // BOOLERR 的字节序是 (bBoolErr, fError)：错误时第 1 字节放错误码、
+                // 第 2 字节置 1。写反了读端就会把 1 当错误码，整格丢掉。
                 b.push(biff_error_code(*e));
+                b.push(1);
                 rec(&mut out, BOOLERR, &b);
             }
             Value::Empty => {}

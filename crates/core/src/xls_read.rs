@@ -71,6 +71,21 @@ pub struct SheetData {
     pub merges: Vec<(u32, u32, u32, u32)>,
 }
 
+/// BIFF8 错误码 → ErrKind（与 xls_write::biff_error_code 互为反函数）
+fn err_kind_from_biff(code: u8) -> Option<crate::formula::ErrKind> {
+    use crate::formula::ErrKind as K;
+    Some(match code {
+        0x00 => K::Null,
+        0x07 => K::Div0,
+        0x0F => K::Value,
+        0x17 => K::Ref,
+        0x1D => K::Name,
+        0x24 => K::Num,
+        0x2A => K::Na,
+        _ => return None,
+    })
+}
+
 pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
     // 表名 + BOF 偏移
     let mut bounds: Vec<(u32, String)> = Vec::new();
@@ -187,16 +202,37 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
                     let c = u16le(body, 2).unwrap() as u32;
                     if body[7] == 0 {
                         push(r, c, Value::Bool(body[6] != 0));
+                    } else {
+                        // fError=1：#NULL!/#DIV/0!/... 第 2 字节是 BIFF 错误码
+                        if let Some(k) = err_kind_from_biff(body[6]) {
+                            push(r, c, Value::Error(k));
+                        }
                     }
                 }
                 FORMULA if body.len() >= 14 => {
                     let r = u16le(body, 0).unwrap() as u32;
                     let c = u16le(body, 2).unwrap() as u32;
-                    // 缓存结果：前两字节 0xFFFF 表示字符串/布尔等特殊值
-                    if body[12] == 0xFF && body[13] == 0xFF {
-                        match body[6] {
-                            0 => push(r, c, Value::Bool(body[8] != 0)),
-                            1 => {}
+                    // 缓存结果：前两字节 0xFFFF 表示特殊值。两种布局都要认——
+                    // MS-XLS 写在 num 的开头（body[6..8]），Excel 实际文件里也见过
+                    // 写在 num 末尾（body[12..14]）的，旧实现只认后者还读错了类型字节。
+                    let special = if body[6] == 0xFF && body[7] == 0xFF {
+                        Some((body[8], body[9]))
+                    } else if body[12] == 0xFF && body[13] == 0xFF {
+                        Some((body[6], body[8]))
+                    } else {
+                        None
+                    };
+                    if let Some((ty, val)) = special {
+                        match ty {
+                            // 0 = 字符串结果（值在随后的 STRING 记录里，这里不抢着写）
+                            0 => {}
+                            1 => push(r, c, Value::Bool(val != 0)),
+                            2 => {
+                                if let Some(k) = err_kind_from_biff(val) {
+                                    push(r, c, Value::Error(k));
+                                }
+                            }
+                            3 => push(r, c, Value::Empty),
                             _ => {}
                         }
                     } else {

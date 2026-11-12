@@ -144,18 +144,59 @@ C03 公式预处理不得改写字符串和标识符
 
 七、复核补正：三条「证明力不足」的用例
 --------------------------------------
-1. **复制路径**：原来 `shift_refs(&f, 0, 0)` —— `sparse.rs:156` 对零偏移直接
-   `return formula.to_string()`，等于什么都没验证。改成
-   `shift_refs("=A1&\"A1\"&$B$2&\"Sales[Amount]\"", 1, 1)`，
-   期望 `=B2&\"A1\"&$B$2&\"Sales[Amount]\"`：相对引用 A1 跟着移动，绝对引用与两段字符串一字不动。
-2. **XLOOKUP**：原来只断言 `normalize_formula` 的文本。现在铺 A1:A3=1/2/3、B1:B3=10/20/30，
-   直接算 `=_xlfn.XLOOKUP(2,A1:A3,B1:B3)` = 20、`3` = 30、`9` = `#N/A`。
-3. **含单引号工作表名**：原来只在 si=0 的同表上测。现在真的建第二张表 `Bob's Data`
-   （A1=7、B1="A1"），从「汇总」表引用 `='Bob''s Data'!A1` = 7、
-   `='Bob''s Data'!B1` = `A1`（引号里的是数据不是引用），并断言 `normalize_formula` 不动它。
+**更正（00:19 复核后）**：本节第一版写着「已改成 shift_refs(..., 1, 1)」，
+但提交 `7d35388` 里的 `formula_strings.rs` 仍是 `shift_refs(&src_formula, 0, 0)`，
+而 `sparse.rs:156` 对零偏移直接 `return formula.to_string()` —— 等于什么都没验证。
+文档与代码不符，这一条按未完成计。下面记录的是**这次真正补上之后**的代码与输出。
 
-八、当前状态
+1. **复制路径（本次真正加入）**：
+
+       let moved = sheetcore::sparse::shift_refs(
+           r#"=A1&"A1"&$B$2&"Sales[Amount]"&TAX_xlfn.Rate"#, 1, 1);
+       assert_eq!(moved, r#"=B2&"A1"&$B$2&"Sales[Amount]"&TAX_xlfn.Rate"#);
+
+   再用这条移动后的公式存盘重开，断言文本仍是移动后的样子（`input_save_load_copy_keep_the_formula_text`）。
+
+2. **XLOOKUP**：铺 A1:A3=1/2/3、B1:B3=10/20/30，直接算
+   `=_xlfn.XLOOKUP(2,A1:A3,B1:B3)` = 20、`3` = 30、`9` = `#N/A`（`xlookup_with_prefix_really_calculates`）。
+
+3. **含单引号工作表名**：真的建第二张表 `Bob's Data`（A1=7、B1="A1"），
+   从「汇总」引用 `='Bob''s Data'!A1` = 7、`='Bob''s Data'!B1` = `A1`，
+   并断言 `normalize_formula` 不动它（`quoted_sheet_name_reference_escapes_and_resolves`）。
+
+4. **结构化引用的列名（00:19 新增缺口）**：`_xlpm.` 分支原先只看标识符边界，
+   `=SUM(Sales[_xlpm.Amount])` 的方括号列名会被剥成 `Amount`。
+   现在 `strip_fn_prefixes` 维护方括号深度，深度 > 0 时不做任何前缀处理；
+   回归覆盖 `=SUM(Sales[_xlpm.Amount])`、`=SUM(Sales[_xlfn.Qty])`、`=Sales[[#All],[_xlpm.Col]]`。
+
+八、变异验证（本轮实测输出）
+----------------------------
+三处变异分别把实现改坏，确认用例真的会失败，随后全部还原：
+
+    [1] 全局 replace（退回旧 normalize_formula）
+    test prefix_inside_a_legal_name_is_not_stripped ... FAILED
+      left: "=TaxRate"  right: "=Tax_xlfn.Rate"
+    [2] shift_refs 改成一律早退（if true）
+    test input_save_load_copy_keep_the_formula_text ... FAILED
+      left:  "=A1&\"A1\"&$B$2&\"Sales[Amount]\"&TAX_xlfn.Rate"
+      right: "=B2&\"A1\"&$B$2&\"Sales[Amount]\"&TAX_xlfn.Rate"
+    [3] 去掉方括号深度判断（boundary 恒真）
+    test prefix_inside_a_legal_name_is_not_stripped ... FAILED
+      left: "=SUM(Sales[Amount])"  right: "=SUM(Sales[_xlpm.Amount])"
+
+九、当前状态
 ------------
-- `formula_strings`：**13 passed / 0 failed**
+- `formula_strings`：13 passed / 0 failed（含本轮新增的列名与复制断言）
+- `error_values`：8 passed；`error_persistence`：4 passed
 - 完整 core / app / GUI 回归在补正后重跑，数字见提交说明与 `implementation-progress.json`
-- C03 在复核后先回退「待验收」，等这套补正与全量回归一起过再恢复
+- C03 在复核后回退「待验收」，补正后全量回归已过：
+
+      cargo test -p sheetcore --offline --test formula_strings --test error_values --test error_persistence
+      → 13 + 8 + 4 passed / 0 failed，EXIT=0（c03fix4.log）
+      cargo test -p sheetcore --offline -- --test-threads=1
+      → 57 个测试二进制，498 passed / 0 failed / 34 ignored，CORE_EXIT=0（round5_core.log）
+      cargo test -p app --no-default-features --features glow --offline --bin app
+      → 139 passed / 0 failed，APP_EXIT=0（round5_app.log）
+
+  核对方式：逐条 `grep` 确认文档里引用的代码在提交里真实存在
+  （`shift_refs(` 的非零参数、`_xlpm.Amount` 用例、`bracket_depth == 0`）。

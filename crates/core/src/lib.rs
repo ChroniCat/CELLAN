@@ -217,10 +217,20 @@ fn strip_fn_prefixes(seg: &str) -> String {
     let chars: Vec<char> = seg.chars().collect();
     let mut out = String::with_capacity(seg.len());
     let mut i = 0usize;
+    // 结构化引用（`Sales[_xlpm.Amount]`）里的方括号内容是**列名**，不是公式 token
+    let mut bracket_depth = 0usize;
     let id_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c > '\u{7f}';
     let id_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c > '\u{7f}';
     while i < chars.len() {
-        let boundary = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '_' | '.' | '$'));
+        if chars[i] == '[' {
+            bracket_depth += 1;
+        } else if chars[i] == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        }
+        let boundary = bracket_depth == 0
+            && (i == 0
+                || !(chars[i - 1].is_ascii_alphanumeric()
+                    || matches!(chars[i - 1], '_' | '.' | '$')));
         if boundary {
             let rest: String = chars[i..].iter().take(16).collect();
             // LET/LAMBDA 的参数：_xlpm.name → name

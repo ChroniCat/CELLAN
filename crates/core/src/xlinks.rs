@@ -194,7 +194,10 @@ fn parse_link_part(xml: &str) -> ParsedPart {
                         let v = match cur_t.as_str() {
                             "str" => Value::Text(text.clone().into_boxed_str()),
                             "b" => Value::Bool(text.trim() == "1"),
-                            "e" => Value::Empty,
+                            "e" => match crate::formula::ErrKind::from_text(&text) {
+                                Some(k) => Value::Error(k),
+                                None => Value::Text(text.clone().into_boxed_str()),
+                            },
                             _ => text
                                 .trim()
                                 .parse::<f64>()
@@ -686,7 +689,17 @@ fn data_to_value(d: &calamine::Data) -> Value {
         Data::Bool(b) => Value::Bool(*b),
         Data::DateTime(x) => Value::Number(x.as_f64()),
         Data::DateTimeIso(s) | Data::DurationIso(s) => Value::Text(s.clone().into_boxed_str()),
-        Data::Error(_) | Data::Empty => Value::Empty,
+        Data::Error(e) => match e {
+            calamine::CellErrorType::Div0 => Value::Error(crate::formula::ErrKind::Div0),
+            calamine::CellErrorType::Name => Value::Error(crate::formula::ErrKind::Name),
+            calamine::CellErrorType::NA => Value::Error(crate::formula::ErrKind::Na),
+            calamine::CellErrorType::Num => Value::Error(crate::formula::ErrKind::Num),
+            calamine::CellErrorType::Value => Value::Error(crate::formula::ErrKind::Value),
+            calamine::CellErrorType::Ref => Value::Error(crate::formula::ErrKind::Ref),
+            calamine::CellErrorType::Null => Value::Error(crate::formula::ErrKind::Null),
+            _ => Value::Error(crate::formula::ErrKind::Value),
+        },
+        Data::Empty => Value::Empty,
     }
 }
 

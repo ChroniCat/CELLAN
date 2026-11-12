@@ -4767,6 +4767,9 @@ impl SheetApp {
                             .map(Value::Number)
                             .unwrap_or(Value::Empty),
                         2 => Value::Bool(text == "1" || text.eq_ignore_ascii_case("true")),
+                        4 => sheetcore::formula::ErrKind::from_text(text)
+                            .map(Value::Error)
+                            .unwrap_or(Value::Text(text.into())),
                         _ => {
                             if text.is_empty() {
                                 Value::Empty
@@ -4777,6 +4780,11 @@ impl SheetApp {
                     }
                 } else if text.is_empty() {
                     Value::Empty
+                } else if cell.kind == 4 {
+                    // 从 Excel 复制的错误格：还原成错误值，别当文本也别当 0
+                    sheetcore::formula::ErrKind::from_text(text)
+                        .map(Value::Error)
+                        .unwrap_or_else(|| Value::Text(text.into()))
                 } else if let Ok(n) = text.replace(',', "").parse::<f64>() {
                     Value::Number(n)
                 } else {

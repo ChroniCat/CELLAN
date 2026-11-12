@@ -354,7 +354,7 @@ fn read_xmlss() -> Option<OfficeBlock> {
     }
 }
 
-fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock {
+pub(crate) fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock {
     use sheetcore::clipboard_xmlss::Kind;
     let mut rows = Vec::with_capacity(b.rows.len());
     for row in b.rows {
@@ -365,7 +365,8 @@ fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock {
                 Kind::Text => 1,
                 Kind::Bool => 2,
                 Kind::DateTime => 3,
-                Kind::Error => 0,
+                // 4 = 错误值（不能被当成数字 0，否则粘进来变成 0）
+                Kind::Error => 4,
             };
             out.push(OfficeCell {
                 text: c.text,
