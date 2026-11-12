@@ -1,0 +1,62 @@
+# QA-03.1 修复前：源码证据（HEAD 1f4683b）
+
+## recent.rs 测试改进程 LOCALAPPDATA 且不恢复
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_moves_to_front_and_dedupes() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("sheetflow_recent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let a = d.join("a.xlsx");
+        let b = d.join("b.xlsx");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+
+        // SAFETY: 测试内单线程设置，仅用于把存储目录指到临时目录
+        unsafe { std::env::set_var("LOCALAPPDATA", &d) };
+        touch(&a);
+        touch(&b);
+        touch(&a);
+        let list = load();
+        assert_eq!(list.len(), 2, "同一文件不该重复出现");
+        assert!(list[0].ends_with("a.xlsx"), "最近打开的排最前");
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+## 全仓库没有统一测试环境构造器（修复前检索）
+HEAD:crates/app/src/error_opts.rs:88:        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+HEAD:crates/app/src/main.rs:26:pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+HEAD:crates/app/src/recent.rs:69:        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+## ui_regression 子进程只移除三个 SC_*，LOCALAPPDATA 仍是真实用户目录
+fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
+    let source = Path::new(file);
+    assert!(source.exists(), "required test fixture is missing: {}", source.display());
+    let out = std::env::temp_dir().join(format!(
+        "ui_dump_{}_{}.txt",
+        std::process::id(),
+        source.file_stem().unwrap_or_default().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&out);
+
+    let exe = env!("CARGO_BIN_EXE_app");
+    let mut cmd = Command::new(exe);
+    cmd.arg(file)
+        .env("SC_DUMP", &out)
+        .env("SC_DUMP_AT", "2")
+        .env_remove("SC_B1")
+        .env_remove("SC_B3")
+        .env_remove("SC_B4")
+        // 独立单实例端口：用户开着 app 时也要能起测试实例（否则会转发给用户那个进程）
+        .env("SC_INSTANCE_PORT", "49731")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("启动 app 失败");

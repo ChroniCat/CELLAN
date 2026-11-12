@@ -10,6 +10,8 @@ use error_opts::ErrorCheckOptions;
 mod document_tests;
 #[cfg(test)]
 mod edit_regression_tests;
+#[cfg(test)]
+mod test_env;
 mod net;
 mod office_clipboard;
 mod recent;

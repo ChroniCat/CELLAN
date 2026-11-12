@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join("sheetflow_lock_test");
+        let d = crate::test_env::scratch("lock-test");
         std::fs::create_dir_all(&d).unwrap();
         d.join(name)
     }

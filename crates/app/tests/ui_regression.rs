@@ -16,6 +16,31 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 本次测试进程专用的运行目录（QA-03.1）：dump、日志、合成工作簿都放这里，
+/// 不在系统临时目录里撒固定文件名，也不会与另一次运行互相覆盖。
+fn run_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("sheets-native-ui-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("profile")).expect("建 UI 测试运行目录");
+        d
+    })
+}
+
+/// 子进程环境隔离：TEMP/TMP/LOCALAPPDATA 指向本次运行目录，清除继承的 SC_*。
+/// 被测 app 打开工作簿会写 recent.txt/协作文件——不能写到真实用户目录里。
+fn isolate_child(cmd: &mut Command) {
+    let dir = run_dir();
+    cmd.env("TEMP", dir)
+        .env("TMP", dir)
+        .env("LOCALAPPDATA", dir.join("profile"));
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("SC_") {
+            cmd.env_remove(&k);
+        }
+    }
+}
+
 fn dump_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
     let _guard = serial();
     dump_for_locked(file, extra, wait)
@@ -24,7 +49,7 @@ fn dump_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String
 fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
     let source = Path::new(file);
     assert!(source.exists(), "required test fixture is missing: {}", source.display());
-    let out = std::env::temp_dir().join(format!(
+    let out = run_dir().join(format!(
         "ui_dump_{}_{}.txt",
         std::process::id(),
         source.file_stem().unwrap_or_default().to_string_lossy()
@@ -33,12 +58,10 @@ fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option
 
     let exe = env!("CARGO_BIN_EXE_app");
     let mut cmd = Command::new(exe);
+    isolate_child(&mut cmd);
     cmd.arg(file)
         .env("SC_DUMP", &out)
         .env("SC_DUMP_AT", "2")
-        .env_remove("SC_B1")
-        .env_remove("SC_B3")
-        .env_remove("SC_B4")
         // 独立单实例端口：用户开着 app 时也要能起测试实例（否则会转发给用户那个进程）
         .env("SC_INSTANCE_PORT", "49731")
         .stdout(Stdio::null())
@@ -160,7 +183,7 @@ fn locked_cell_is_marked() {
 fn textbox_renders_and_moves() {
     let src = Path::new("tests/test-work/table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let tmp = std::env::temp_dir().join(format!("ui_tb_{}.xlsx", std::process::id()));
+    let tmp = run_dir().join(format!("ui_tb_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
         &tmp.to_string_lossy(),
@@ -197,7 +220,7 @@ fn textbox_renders_and_moves() {
 fn textbox_drag_moves_model() {
     let src = Path::new("tests/test-work/table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let tmp = std::env::temp_dir().join(format!("ui_tbdrag_{}.xlsx", std::process::id()));
+    let tmp = run_dir().join(format!("ui_tbdrag_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
         &tmp.to_string_lossy(),
@@ -248,7 +271,7 @@ fn textbox_drag_moves_model() {
 fn subtotal_and_flashfill_apply() {
     let src = Path::new("tests/test-work/table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let tmp = std::env::temp_dir().join(format!("ui_data_{}.xlsx", std::process::id()));
+    let tmp = run_dir().join(format!("ui_data_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     // table.xlsx 的 部门 列不是相邻同值，分类汇总会如实按「相邻同组」处理（可能多组）
     let Some(dump) = dump_for(
@@ -285,7 +308,7 @@ fn sparklines_render_in_cells() {
     let f = spark_fixture();
     assert!(f.exists(), "required test fixture is missing: {}", f.display());
     // The app creates coordination files next to an opened workbook; use a temporary copy.
-    let copy = std::env::temp_dir().join(format!("ui_spark_fixture_{}.xlsx", std::process::id()));
+    let copy = run_dir().join(format!("ui_spark_fixture_{}.xlsx", std::process::id()));
     std::fs::copy(&f, &copy).expect("copy sparkline fixture");
     let Some(dump) = dump_for(&copy.to_string_lossy(), &[], Duration::from_secs(30)) else {
         return;
@@ -319,7 +342,7 @@ fn sparkline_create_from_selection() {
     // 用两张表的普通文件，按 A1:E1 选区建柱形迷你图，落在 F1
     let src = Path::new("tests/test-work/table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let tmp = std::env::temp_dir().join(format!("ui_spark_{}.xlsx", std::process::id()));
+    let tmp = run_dir().join(format!("ui_spark_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
     let Some(dump) = dump_for(
         &tmp.to_string_lossy(),
@@ -343,7 +366,7 @@ fn sparkline_create_from_selection() {
 
 /// 造一个只有 A1 的小文件，可选地带上字体（走真实的 xlsx 写盘）
 fn make_font_fixture(name: &str, font: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("sheet_ui_font");
+    let dir = run_dir().join("sheet_ui_font");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(name);
     let _ = std::fs::remove_file(&p);
@@ -455,7 +478,7 @@ fn font_change_applies_and_saves() {
 #[test]
 fn merged_range_uses_anchor_font() {
     // 合并区域只画左上角，整块应该按锚点那格的样式（含字体）来画
-    let dir = std::env::temp_dir().join("sheet_ui_font");
+    let dir = run_dir().join("sheet_ui_font");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("merged_font.xlsx");
     let _ = std::fs::remove_file(&p);
@@ -490,7 +513,7 @@ fn merged_range_uses_anchor_font() {
 #[test]
 fn header_highlight_follows_merged_selection() {
     // Excel 选中合并格时，整块合并区覆盖的列头都高亮（不只是活动格那一列）
-    let dir = std::env::temp_dir().join("sheet_ui_headsel");
+    let dir = run_dir().join("sheet_ui_headsel");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("head_sel.xlsx");
     let _ = std::fs::remove_file(&p);
@@ -517,7 +540,7 @@ fn header_highlight_follows_merged_selection() {
 
 #[test]
 fn external_link_values_render_and_refresh() {
-    let dir = std::env::temp_dir().join("sheet_ui_xlink");
+    let dir = run_dir().join("sheet_ui_xlink");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -576,7 +599,7 @@ fn external_link_values_render_and_refresh() {
 }
 #[test]
 fn revision_revert_restores_font() {
-    let dir = std::env::temp_dir().join("sheet_ui_rev");
+    let dir = run_dir().join("sheet_ui_rev");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("修订.xlsx");
@@ -630,17 +653,15 @@ fn revision_revert_restores_font() {
 /// 跑一次 app，把 stderr 收回来（功能区几何日志走 stderr）
 fn ui_log_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> String {
     let _guard = serial();
-    let out = std::env::temp_dir().join(format!("ui_log_{}.txt", std::process::id()));
+    let out = run_dir().join(format!("ui_log_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let f = std::fs::File::create(&out).unwrap();
     let exe = env!("CARGO_BIN_EXE_app");
     let mut cmd = Command::new(exe);
+    isolate_child(&mut cmd);
     cmd.arg(file)
         .env("SC_NO_OPEN_DIALOG", "1")
         .env("SC_INSTANCE_PORT", "49731")
-        .env_remove("SC_B1")
-        .env_remove("SC_B3")
-        .env_remove("SC_B4")
         .stdout(Stdio::null())
         .stderr(Stdio::from(f));
     for (k, v) in extra {
@@ -665,7 +686,7 @@ fn ui_log_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> String {
 
 #[test]
 fn ribbon_groups_aligned_and_fit() {
-    let dir = std::env::temp_dir().join("sheet_ui_ribbon");
+    let dir = run_dir().join("sheet_ui_ribbon");
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join("空白.xlsx");
     let wb = sheetcore::model::Workbook::new_blank();

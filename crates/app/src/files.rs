@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn lists_dirs_first_and_hides_system_entries() {
-        let dir = std::env::temp_dir().join("sheets_tree_test");
+        let dir = crate::test_env::scratch("tree-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("b.xlsx"), b"x").unwrap();
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn filter_matches_loaded_subtree() {
-        let dir = std::env::temp_dir().join("sheets_tree_filter");
+        let dir = crate::test_env::scratch("tree-filter");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("深/层")).unwrap();
         std::fs::write(dir.join("深/层/报表.xlsx"), b"x").unwrap();

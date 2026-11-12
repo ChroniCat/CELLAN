@@ -1,0 +1,52 @@
+# QA-03.1 验收：隔离环境 + 污染环境套件
+
+运行目录：work/hermes-qa031-accept-183339
+
+## 预置污染（进程环境）
+export TEMP=work/hermes-qa031-accept-183339
+export TMP=work/hermes-qa031-accept-183339
+export LOCALAPPDATA=work/hermes-qa031-accept-183339/profile
+export SC_B1="work/hermes-qa031-accept-183339/leak-b1.xlsx"
+export SC_B3="work/hermes-qa031-accept-183339/leak-b3.xlsx"
+export SC_B4="work/hermes-qa031-accept-183339/leak-b4.txt"
+export SC_DUMP="work/hermes-qa031-accept-183339/leak-dump.txt"
+export SC_SHOT="work/hermes-qa031-accept-183339/leak-shot.png"
+
+## 预置 canary profile 内容
+d64923629f8c682fcd7460f30409844d77287ba5d3f6ba6a4d247eed7f6a031d *./SheetsNative/recent.txt
+abead111fd899ff8dec95a1e169eb14bebdc735c108a3698cd900d05697ddca5 *./SheetsNative/ui.ini
+
+## 串行结果
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 2.39s
+
+
+## 并行结果
+
+error: test failed, to rerun pass `-p app --bin app`
+
+## canary profile 运行后
+d64923629f8c682fcd7460f30409844d77287ba5d3f6ba6a4d247eed7f6a031d *./SheetsNative/recent.txt
+abead111fd899ff8dec95a1e169eb14bebdc735c108a3698cd900d05697ddca5 *./SheetsNative/ui.ini
+
+## canary 差异（无输出=未变）
+IDENTICAL
+
+## 污染探针是否被消费（应全部不存在）
+none
+
+## 本次运行产生的目录（全部位于运行目录内）
+canary-after.sha
+canary-before.sha
+env.sh
+profile
+sheetflow_lock_test
+sheetflow-app-save-22876-1794479626462323000
+sheetflow-app-save-23168-1794479622585952000
+sheetflow-app-xls-formula-22876-1794479626462148200
+sheetflow-app-xls-formula-23168-1794479623383054900
+sheetflow-app-xls-save-22876-1794479626462734500
+sheetflow-app-xls-save-23168-1794479623039173000
+sheets_tree_filter
+sheets_tree_test
+sheets-native-tests
+sn-sentinel-restore

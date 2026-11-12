@@ -1,0 +1,18 @@
+# QA-03.1：GUI 回归子进程隔离
+
+测试：cargo test -p app --test ui_regression sparklines_render_in_cells -- --test-threads=1
+结果：1 passed
+
+## 子进程运行目录（app 的 LOCALAPPDATA）
+F:/finance-native-sheets-ready/work/hermes-qa031-ui-183318
+F:/finance-native-sheets-ready/work/hermes-qa031-ui-183318/profile
+F:/finance-native-sheets-ready/work/hermes-qa031-ui-183318/sheets-native-ui-63396
+F:/finance-native-sheets-ready/work/hermes-qa031-ui-183318/sheets-native-ui-63396/profile
+F:/finance-native-sheets-ready/work/hermes-qa031-ui-183318/sheets-native-ui-63396/profile/SheetsNative
+
+## 真实用户 %LOCALAPPDATA%\SheetsNative 价值（运行前后）
+before/after 相同：
+dbaf9e40284b16d7 1794196133 apply-update.cmd
+7c1a5e193c8ac51e 1794474245 recent.txt
+8e2facb2edfb2463 1794196130 updates\pending-99.0.exe
+c0f6b35c5266327d 1794454556 views\fc304d4188ead41b.ini

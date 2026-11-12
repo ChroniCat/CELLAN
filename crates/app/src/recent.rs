@@ -63,26 +63,43 @@ fn save(list: &[PathBuf]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
 
+    /// QA-03.1：LOCALAPPDATA 由守卫指向本次运行专用目录，测试结束自动恢复原值。
+    /// 旧实现直接 `set_var("LOCALAPPDATA")` 且不还原，后续测试会读到别人的临时目录。
     #[test]
     fn touch_moves_to_front_and_dedupes() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = std::env::temp_dir().join(format!("sheetflow_recent_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let env = TestEnv::new("recent");
+        let d = env.path("files");
         std::fs::create_dir_all(&d).unwrap();
         let a = d.join("a.xlsx");
         let b = d.join("b.xlsx");
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&b, b"x").unwrap();
 
-        // SAFETY: 测试内单线程设置，仅用于把存储目录指到临时目录
-        unsafe { std::env::set_var("LOCALAPPDATA", &d) };
         touch(&a);
         touch(&b);
         touch(&a);
         let list = load();
         assert_eq!(list.len(), 2, "同一文件不该重复出现");
         assert!(list[0].ends_with("a.xlsx"), "最近打开的排最前");
-        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn recent_store_lives_under_isolated_profile() {
+        let env = TestEnv::new("recent-store");
+        let d = env.path("files");
+        std::fs::create_dir_all(&d).unwrap();
+        let a = d.join("a.xlsx");
+        std::fs::write(&a, b"x").unwrap();
+        touch(&a);
+        let store = env.profile().join("SheetsNative").join("recent.txt");
+        assert!(
+            store.is_file(),
+            "recent.txt 必须落在本次运行目录：{}",
+            store.display()
+        );
+        let text = std::fs::read_to_string(&store).unwrap();
+        assert!(text.contains("a.xlsx"));
     }
 }

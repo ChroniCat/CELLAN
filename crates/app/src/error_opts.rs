@@ -82,14 +82,12 @@ impl ErrorCheckOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::TestEnv;
 
     #[test]
     fn roundtrip_through_file() {
-        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("sn_ec_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let old = std::env::var("LOCALAPPDATA").ok();
-        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        // QA-03.1：环境目录和恢复交给 TestEnv，不再手写 set_var + 手工还原。
+        let env = TestEnv::new("error-opts");
         let mut opts = ErrorCheckOptions::default();
         opts.background = false;
         opts.check_text = false;
@@ -100,10 +98,7 @@ mod tests {
         assert!(back.check_errors);
         assert!(!back.check_text);
         assert_eq!(back.color, [200, 0, 0]);
-        match old {
-            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
-            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        let file = env.profile().join("SheetsNative").join("errorcheck.ini");
+        assert!(file.is_file(), "选项必须写在隔离 profile 下：{}", file.display());
     }
 }

@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn prefs_roundtrip_via_file() {
         // 走纯路径接口：不动 LOCALAPPDATA，避免和其它用到它的测试并行时打架
-        let dir = std::env::temp_dir().join(format!("sn_ui_prefs_{}", std::process::id()));
+        let dir = crate::test_env::scratch("ui-prefs");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("ui.ini");
         let p = UiPrefs {
@@ -234,7 +234,7 @@ mod view_tests {
 
     #[test]
     fn views_file_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("sn_views_{}", std::process::id()));
+        let dir = crate::test_env::scratch("views");
         std::fs::create_dir_all(&dir).unwrap();
         // 直接测文件格式（不经过 LOCALAPPDATA）
         let file = dir.join("v.ini");
