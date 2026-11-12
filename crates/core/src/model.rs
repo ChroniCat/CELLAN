@@ -302,6 +302,10 @@ impl Sheet {
             self.edited = true;
         }
         let key = CellRef::new(r, c);
+        // 往溢出区里写东西 = 用户覆盖：从这个集合里摘掉，重算时才会判成 #SPILL!，
+        // 而不是被 clear_spills 当成旧溢出值删掉（那会静默吞掉用户输入）。
+        // 溢出写回自己是先 set 再 insert，顺序不受影响。
+        self.spilled.remove(&key);
         if cell.is_blank() {
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);

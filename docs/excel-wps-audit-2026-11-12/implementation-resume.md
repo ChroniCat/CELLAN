@@ -1,12 +1,12 @@
-## 当前状态（最后更新：2026-11-13 UTC+08，C01 全部切片之后）
+## 当前状态（最后更新：2026-11-13 UTC+08，C02 之后）
 
 - 分支 `main`，跟踪 `origin/main`
-- 已验收：任务 **5/61**（UI-02、C13、QA-03、C03、C01）；切片 **14/148**
+- 已验收：任务 **6/61**（UI-02、C13、QA-03、C03、C01、C02）；切片 **17/148**
 - 待验收：UI-01（真实中文输入法与硬件键盘未执行）
-- 基线（round10 实测，与本状态同一代码）：
-  - sheetcore **59 个测试二进制 / 514 passed / 0 failed / 34 ignored**，EXIT=0
+- 基线（round11 实测，与本状态同一代码）：
+  - sheetcore **60 个测试二进制 / 525 passed / 0 failed / 34 ignored**，EXIT=0
   - app 单测 **141 passed / 0 failed**，EXIT=0
-  - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**，EXIT=0
+  - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**（round10 值，C02 只动 core）
 - 工具链：`C:/Users/Administrator/.cargo/bin/cargo.exe`；`source scripts/audit_env.sh <标签>`
 
 ## C01.2 / C01.3 关键结论（不要重复踩）
@@ -16,6 +16,14 @@
 - 写端也必须用高字节标号；旧写法 Excel 会读成 NaN。
 - FORMULA 的字符串结果在随后的 **STRING 记录**（0x0207）里，之前完全没解析。
 - 增量 vs 全量：`recalc_dirty(wb, &deps, &[(sheet,row,col)])`，`Deps::build(&wb)`，CellKey 是元组。
+
+## C02 关键结论（不要重复踩）
+
+- 二元运算操作数必须保留 (rows, cols)：`operand_block`；广播按两个维度判，不能只比元素个数
+  （2×2 与 1×4 元素数相同但 Excel 报 #VALUE!）。
+- `Sheet::set` 会把被写的格从 `spilled` 摘掉 —— 溢出区里的用户输入靠这个存活，
+  否则 `clear_spills` 会把它当旧溢出值删掉再被数组覆盖（已加变异回归）。
+- 溢出值不落盘，只存锚点公式；重开后要 `recalc_all` 才看得到子格。
 
 ## 下一步（按依赖优先级）
 

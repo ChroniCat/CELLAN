@@ -593,22 +593,31 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "SUMSQ" => r(|| Ok(FValue::number(numbers(args, 0)?.iter().map(|x| x * x).sum()))),
         "SUMPRODUCT" => r(|| {
-            // 支持 2 个及以上的等长区域逐项相乘
-            let ranges: Vec<Vec<f64>> = args
+            // 各参数必须同形（标量 1×1 可参与），只比元素个数会把 2×2 与 1×4 当成一样
+            let grids: Vec<(usize, usize, Vec<f64>)> = args
                 .iter()
                 .map(|a| {
-                    a.values()
-                        .iter()
-                        .map(|v| v.to_number().unwrap_or(0.0))
-                        .collect()
+                    let (rows, cols, data) = a.grid();
+                    (rows, cols, data.iter().map(|v| v.to_number().unwrap_or(0.0)).collect())
                 })
                 .collect();
-            let len = ranges.iter().map(|v| v.len()).min().unwrap_or(0);
+            let shape = grids
+                .iter()
+                .map(|(r, c, _)| (*r, *c))
+                .find(|(r, c)| *r != 1 || *c != 1);
+            let (rows, cols) = shape.unwrap_or((1, 1));
+            for (r, c, _) in &grids {
+                let ok = (*r == 1 && *c == 1) || (*r == rows && *c == cols);
+                if !ok {
+                    return Err(ErrKind::Value);
+                }
+            }
             let mut sum = 0.0;
-            for i in 0..len {
+            for i in 0..rows * cols {
                 let mut p = 1.0;
-                for rg in &ranges {
-                    p *= rg[i];
+                for (r, c, data) in &grids {
+                    let idx = if *r == 1 && *c == 1 { 0 } else { i };
+                    p *= data[idx];
                 }
                 sum += p;
             }

@@ -171,17 +171,28 @@
    "scope": "core/formula/mod.rs, formula/value.rs, formula/array.rs",
    "source": "core-requirements.md",
    "heading": "C02 P0 保持数组形状与正确广播",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "已验收",
+   "acceptance": "需求三条（SEQUENCE(2,2)+1 为 2×2、SEQUENCE(3,1)*2 为 3×1、SUM({1;2}+{10,20})=66）与 2×2+2×2、3×1+1×4、标量+3×1、不兼容形状 #VALUE!、比较/拼接/一元/百分号/SUMPRODUCT/FILTER 全部按形状断言；溢出锚点、阻挡（用户输入保留）、移开阻挡、下游引用、保存重开形状一致。11 项用例 + 3 处变异。",
+   "files": [
+    "crates/core/src/formula/mod.rs,crates/core/src/formula/functions.rs,crates/core/src/model.rs,crates/core/tests/array_shape.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --test array_shape (11 passed)",
+    "cargo test -p sheetcore -- --test-threads=1 (60 bins, 525 passed / 34 ignored, EXIT=0)",
+    "cargo test -p app --bin app (141 passed, EXIT=0)"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c02-array-shape.txt"
+   ],
+   "not_done": [
+    "未与 Excel/WPS 实机对拍这三条",
+    "FILTER 条件与数据形状不一致的组合未穷举"
+   ],
    "failures": [],
    "blocker": "",
    "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "updated_utc": "2026-11-12T17:22:47Z",
    "slices": [
     {
      "id": "C02.1",
@@ -189,17 +200,21 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
+     "status": "已验收",
+     "acceptance": "标量与 1×n / n×1 / 2×2 数组运算保留原形状；一元负号、百分号逐元素；变异（结果摊平）被抓。",
      "files": [],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test array_shape a_2x2/a_column/unary"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c02-array-shape.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T17:22:47Z"
     },
     {
      "id": "C02.2",
@@ -207,17 +222,21 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
+     "status": "已验收",
+     "acceptance": "2×2+2×2 逐格、3×1+1×4 广播成 3×4、标量+3×1、2×2+2×3 与 2×2+1×4 为 #VALUE!；SUMPRODUCT 按形状校验。",
      "files": [],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test array_shape matching/incompatible/sumproduct"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c02-array-shape.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T17:22:47Z"
     },
     {
      "id": "C02.3",
@@ -225,17 +244,23 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "锚点 2/3/4/5、下游 SUM=14、占住 B2 → #SPILL! 且用户输入「挡」保留、移开恢复、存盘只落锚点重开重算恢复形状。",
+     "files": [
+      "crates/core/src/model.rs,crates/core/src/formula/mod.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test array_shape spill_anchor/the_spilled_shape"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c02-array-shape.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T17:22:47Z"
     }
    ]
   },

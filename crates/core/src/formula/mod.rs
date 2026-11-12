@@ -1057,18 +1057,33 @@ impl<'a> Calc<'a> {
                 Err(e) => FValue::Error(e),
             },
             Node::Unary(neg, e) => {
-                let v = self.eval_node(e, si);
-                match v.to_number() {
-                    Ok(n) => FValue::number(if *neg { -n } else { n }),
-                    Err(err) => FValue::Error(err),
+                // 一元也走二维块：`=-SEQUENCE(2,2)` 必须得到 2×2 而不是 #VALUE!
+                let (rows, cols, vals) = self.operand_block(e, si);
+                let mut out = Vec::with_capacity(vals.len());
+                for v in &vals {
+                    match v.to_number() {
+                        Ok(n) => out.push(FValue::number(if *neg { -n } else { n })),
+                        Err(err) => return FValue::Error(err),
+                    }
                 }
+                if rows == 1 && cols == 1 {
+                    return out.pop().unwrap_or(FValue::Error(ErrKind::Value));
+                }
+                FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
             }
             Node::Percent(e) => {
-                let v = self.eval_node(e, si);
-                match v.to_number() {
-                    Ok(n) => FValue::number(n / 100.0),
-                    Err(err) => FValue::Error(err),
+                let (rows, cols, vals) = self.operand_block(e, si);
+                let mut out = Vec::with_capacity(vals.len());
+                for v in &vals {
+                    match v.to_number() {
+                        Ok(n) => out.push(FValue::number(n / 100.0)),
+                        Err(err) => return FValue::Error(err),
+                    }
                 }
+                if rows == 1 && cols == 1 {
+                    return out.pop().unwrap_or(FValue::Error(ErrKind::Value));
+                }
+                FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
             }
             Node::Binary(op, l, r) => self.eval_binary(*op, l, r, si),
             Node::Array(rows, cols, data) => {
@@ -2091,24 +2106,55 @@ impl<'a> Calc<'a> {
         vec![v]
     }
 
+    /// 二元运算的操作数一律当成二维块：区域/数组保留 rows×cols，标量是 1×1。
+    /// 旧实现直接摊平成 Vec，长度相等就按 1×n 输出，纵向数组会被写成横的。
+    fn operand_block(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
+        if let Node::Range(a, b) = n {
+            if let Ok(Arg::Range { values, rows, cols }) = self.range_values(a, b, si) {
+                return (rows.max(1), cols.max(1), (*values).clone());
+            }
+        }
+        match self.eval_node(n, si) {
+            FValue::Array(a) => (a.rows.max(1), a.cols.max(1), a.data.clone()),
+            v => (1, 1, vec![v]),
+        }
+    }
+
     fn eval_binary(&mut self, op: BinOp, l: &Node, r: &Node, si: usize) -> FValue {
-        let lv = self.operand_values(l, si);
-        let rv = self.operand_values(r, si);
-        if lv.len() == 1 && rv.len() == 1 {
+        let (lr, lc, lv) = self.operand_block(l, si);
+        let (rr, rc, rv) = self.operand_block(r, si);
+        if lr == 1 && lc == 1 && rr == 1 && rc == 1 {
             return bin_scalar(op, &lv[0], &rv[0]);
         }
-        // 广播：一方是单值就复制，否则要求等长
-        let n = lv.len().max(rv.len());
-        if lv.len() != 1 && rv.len() != 1 && lv.len() != rv.len() {
+        // Excel 的广播按两个维度分别判：相等就逐格算，一边是 1 就复制，其余为 #VALUE!。
+        // 不能只比元素总数——2×2 与 1×4 元素个数一样，但 Excel 报 #VALUE!。
+        let rows = if lr == rr {
+            lr
+        } else if lr == 1 {
+            rr
+        } else if rr == 1 {
+            lr
+        } else {
             return FValue::Error(ErrKind::Value);
+        };
+        let cols = if lc == rc {
+            lc
+        } else if lc == 1 {
+            rc
+        } else if rc == 1 {
+            lc
+        } else {
+            return FValue::Error(ErrKind::Value);
+        };
+        let mut out = Vec::with_capacity(rows * cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                let li = (if lr == 1 { 0 } else { i }) * lc + (if lc == 1 { 0 } else { j });
+                let ri = (if rr == 1 { 0 } else { i }) * rc + (if rc == 1 { 0 } else { j });
+                out.push(bin_scalar(op, &lv[li], &rv[ri]));
+            }
         }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = if lv.len() == 1 { lv[0].clone() } else { lv[i].clone() };
-            let b = if rv.len() == 1 { rv[0].clone() } else { rv[i].clone() };
-            out.push(bin_scalar(op, &a, &b));
-        }
-        FValue::Array(std::rc::Rc::new(value::Array::new(1, n, out)))
+        FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
     }
 }
 
@@ -2387,6 +2433,8 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
 
 fn clear_spills(wb: &mut Workbook) {
     for sheet in &mut wb.sheets {
+        // `Sheet::set` 会把被用户覆盖的格子从 spilled 里摘掉，
+        // 所以这里剩下的键一定还是上次溢出写的值，可以安全清掉。
         let old: Vec<CellRef> = sheet.spilled.drain().collect();
         for key in old {
             // set(empty) 同时记录 cleared，保存时才能删除缩小后的旧尾部。
