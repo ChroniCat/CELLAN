@@ -1647,6 +1647,15 @@ fn saved_copy(tag: &str, value: f64) -> (crate::test_env::TestEnv, std::path::Pa
     (env, path)
 }
 
+
+/// 文件完整 SHA256（UI-02 验收要求核对「原文件哈希」，不能只看内存 dirty）
+fn file_sha256(path: &std::path::Path) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(std::fs::read(path).unwrap());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[test]
 fn ctrl_s_saves_the_open_file_after_a_typed_edit() {
     let ctx = egui::Context::default();
@@ -1661,10 +1670,14 @@ fn ctrl_s_saves_the_open_file_after_a_typed_edit() {
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0));
     assert!(app.wb.dirty);
 
+    let before = file_sha256(&path);
     ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
     assert!(app.tasks.saving.is_some(), "Ctrl+S 必须触发保存");
     wait_save(&mut app);
     assert!(!app.wb.dirty, "保存成功后 dirty 必须清掉");
+    // 原文件必须真的被换掉（不是只清了内存里的 dirty 标记）
+    let after = file_sha256(&path);
+    assert_ne!(before, after, "Ctrl+S 之后磁盘上文件的 SHA256 没变 = 没真保存");
     let back = sheetcore::xlsx::load(&path).unwrap();
     assert_eq!(back.sheets[0].value(0, 0), Value::Number(123.0), "文件里必须是新值");
     drop(env);

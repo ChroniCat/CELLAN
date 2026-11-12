@@ -738,6 +738,370 @@ pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceip
 ///
 /// 网盘（SMB）上直接写目标路径，断网或对方锁定会留下半截文件；
 /// 同一卷内 rename 是原子的，别人要么看到旧文件、要么看到完整的新文件。
+/// 最终产物完整性门禁（C13）：临时文件必须先通过校验，才允许 rename 覆盖原文件。
+///
+/// 覆盖：ZIP 能打开、每个条目 CRC 读通、必需部件齐全、[Content_Types].xml 声明的部件全在、
+/// workbook.xml.rels 里的工作表目标全在、这几个关键 XML 良构。XLS 走对应的 CFB 读取路径。
+pub fn verify_saved_package(path: &Path) -> Result<()> {
+    // 不能靠扩展名判断类型：调用方传进来的常常是临时文件（.~a.xls.saving-1234），
+    // 它的扩展名是 saving-1234。按文件头判断才可靠。
+    let mut head = [0u8; 8];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+        let n = f.read(&mut head).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
+        if n < 8 {
+            anyhow::bail!("保存产物只有 {n} 字节，明显被截断");
+        }
+    }
+    let is_zip = head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08");
+    let is_cfb = head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    if is_cfb {
+        // 两种合法情况：老的 .xls（BIFF），或加了打开密码的 OOXML（CFB 里装 EncryptedPackage）。
+        if crate::xls_read::load(path).is_ok() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(path).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
+        let compound = crate::cfb::Compound::open(bytes).context("保存产物是 CFB 容器但打不开")?;
+        let names: Vec<String> = compound
+            .names()
+            .into_iter()
+            .map(|n| n.split('[').next().unwrap_or(&n).to_string())
+            .collect();
+        if names.iter().any(|n| n.eq_ignore_ascii_case("EncryptedPackage"))
+            && names.iter().any(|n| n.eq_ignore_ascii_case("EncryptionInfo"))
+        {
+            return Ok(()); // 加密容器：内容无法在不解密的前提下深查，结构与流都在即视为完整
+        }
+        anyhow::bail!("保存产物是 CFB 容器，但既不是可读的 XLS，也不含 EncryptedPackage（流：{names:?}）");
+    }
+    if !is_zip {
+        anyhow::bail!("保存产物开头不是 ZIP/CFB 签名，格式无法识别");
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("保存产物不是有效的 ZIP（中央目录缺失或文件被截断）")?;
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.name_for_index(i).map(|s| s.to_string()).unwrap_or_default())
+        .collect();
+    for must in ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"] {
+        if !names.iter().any(|n| n == must) {
+            anyhow::bail!("保存产物缺少必需部件 {must}");
+        }
+    }
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i).with_context(|| format!("读取保存产物第 {i} 个条目失败"))?;
+        let name = e.name().to_string();
+        let mut sink = std::io::sink();
+        std::io::copy(&mut e, &mut sink).with_context(|| format!("保存产物条目损坏：{name}"))?;
+    }
+    for part in ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"] {
+        let body = read_zip_text(&mut zip, part)?;
+        check_single_root(part, &body)?;
+    }
+    // 必需结构：Content-Types 至少要有 workbook 与 worksheet 的类型；
+    // workbook.xml 至少要有一个 <sheet> 且带 name/r:id —— 空 XML、多根、只有壳子都要拦。
+    let types = read_zip_text(&mut zip, "[Content_Types].xml")?;
+    // 工作簿主部件的类型随格式不同：xlsx 是 sheet.main+xml，xlsm 是 macroEnabled.main+xml，
+    // xltx/xltm 又是 template.main+xml。统一按「/xl/workbook.xml 的 Override 以 main+xml 结尾」判断。
+    if !override_is_workbook_main(&types) {
+        anyhow::bail!("[Content_Types].xml 里没有工作簿主部件（/xl/workbook.xml）的类型声明");
+    }
+    let wb_xml = read_zip_text(&mut zip, "xl/workbook.xml")?;
+    let sheets = count_elements(&wb_xml, "sheet");
+    if sheets == 0 {
+        anyhow::bail!("workbook.xml 里没有任何 <sheet>");
+    }
+    for part in override_part_names(&types) {
+        let want = part.trim_start_matches('/').to_string();
+        if !names.iter().any(|n| *n == want) {
+            anyhow::bail!("[Content_Types].xml 声明了不存在的部件 {part}");
+        }
+    }
+    let rels = read_zip_text(&mut zip, "xl/_rels/workbook.xml.rels")?;
+    for target in relationship_targets(&rels) {
+        if target.starts_with("http://") || target.starts_with("https://") || target.starts_with("mailto:") {
+            continue;
+        }
+        // 关系目标相对 xl/workbook.xml 解析：'/xl/...' 是包内绝对路径，'../' 要真的向上走，
+        // 不能像以前那样遇到 '../' 直接跳过（等于漏检）。
+        let Some(resolved) = resolve_part("xl", &target) else {
+            anyhow::bail!("workbook.xml.rels 的目标越出包根：{target}");
+        };
+        if !names.iter().any(|n| *n == resolved) {
+            anyhow::bail!("workbook.xml.rels 指向不存在的部件 {target}（解析为 {resolved}）");
+        }
+    }
+    Ok(())
+}
+
+/// 把一个关系目标解析成包内路径。`base` 是引用方所在目录（如 "xl"）。
+fn resolve_part(base: &str, target: &str) -> Option<String> {
+    let target = target.split('#').next().unwrap_or(target);
+    let mut segs: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        base.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for seg in target.trim_start_matches('/').split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop()?;
+            }
+            other => segs.push(other),
+        }
+    }
+    Some(segs.join("/"))
+}
+
+/// XML 必须「有且只有一个根元素」，根之后不允许再出现元素或非空白文本。
+/// 自闭合根（`<a/>`）也算根；根后再来一个 `<extra/>` 或第二段文本都要拒。
+fn check_single_root(part: &str, body: &str) -> Result<()> {
+    let mut reader = quick_xml::Reader::from_str(body);
+    reader.config_mut().check_end_names = true;
+    let mut depth: i32 = 0;
+    let mut roots = 0;
+    let mut closed = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(_)) => {
+                if closed {
+                    anyhow::bail!("{part} 在根元素之后又出现了元素（多个根）");
+                }
+                if depth == 0 {
+                    roots += 1;
+                }
+                depth += 1;
+            }
+            Ok(quick_xml::events::Event::Empty(_)) => {
+                if closed {
+                    anyhow::bail!("{part} 在根元素之后又出现了元素（多个根）");
+                }
+                // 自闭合元素既不进也不出栈；在顶层时它自己就是一个根。
+                if depth == 0 {
+                    roots += 1;
+                    closed = true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                depth -= 1;
+                if depth == 0 {
+                    closed = true;
+                }
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                if closed && !t.as_ref().chars().all(|c| c.is_whitespace()) {
+                    anyhow::bail!("{part} 在根元素之后还有文本内容");
+                }
+            }
+            Ok(quick_xml::events::Event::CData(c)) => {
+                if closed && !c.as_ref().chars().all(|ch| ch.is_whitespace()) {
+                    anyhow::bail!("{part} 在根元素之后还有 CDATA 内容");
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("保存产物里的 {part} 不是良构 XML：{e}"),
+        }
+        if depth < 0 {
+            anyhow::bail!("保存产物里的 {part} 结束标签多于开始标签");
+        }
+    }
+    if roots == 0 {
+        anyhow::bail!("保存产物里的 {part} 没有任何根元素（空文件？）");
+    }
+    if roots > 1 {
+        anyhow::bail!("保存产物里的 {part} 有 {roots} 个根元素");
+    }
+    if depth != 0 {
+        anyhow::bail!("保存产物里的 {part} 有 {depth} 个标签没闭合（产物被截断）");
+    }
+    if !closed {
+        anyhow::bail!("保存产物里的 {part} 根元素没有闭合");
+    }
+    Ok(())
+}
+
+/// 数某个本地名元素出现的次数（Start 或自闭合）
+fn count_elements(xml: &str, local: &str) -> usize {
+    let mut n = 0;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if e.local_name().as_ref() == local {
+                    n += 1;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::check_single_root;
+
+    #[test]
+    fn accepts_a_single_root_of_every_shape() {
+        for body in ["<a></a>", "<a/>", "<a><b/></a>", "  <a>t</a>  ", "<a></a><!--c-->", "<?xml version=\"1.0\"?><a/>"] {
+            check_single_root("p", body).unwrap_or_else(|e| panic!("应通过 {body}: {e}"));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_multi_root_and_trailing_content() {
+        for body in ["", "   ", "<a>", "<a></a><b></b>", "<a/><b/>", "<a></a>text", "<a></a><extra/>", "<a></a><![CDATA[x]]>", "</a>"] {
+            assert!(check_single_root("p", body).is_err(), "必须拒绝 {body:?}");
+        }
+    }
+}
+
+fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
+    let mut body = String::new();
+    let mut e = zip.by_name(name).with_context(|| format!("缺少部件 {name}"))?;
+    std::io::Read::read_to_string(&mut e, &mut body).with_context(|| format!("读取 {name} 失败"))?;
+    Ok(body)
+}
+
+fn override_is_workbook_main(xml: &str) -> bool {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if e.local_name().as_ref() == "Override" {
+                    let mut part = None;
+                    let mut ctype = None;
+                    for a in e.attributes().flatten() {
+                        match a.key.as_ref() {
+                            "PartName" => part = Some(a.value.to_string()),
+                            "ContentType" => ctype = Some(a.value.to_string()),
+                            _ => {}
+                        }
+                    }
+                    if part.as_deref() == Some("/xl/workbook.xml")
+                        && ctype.is_some_and(|c| c.ends_with("main+xml"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    false
+}
+
+fn override_part_names(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if e.local_name().as_ref() == "Override" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "PartName" {
+                            out.push(a.value.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn relationship_targets(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if e.local_name().as_ref() == "Relationship" {
+                    let mut target = None;
+                    let mut external = false;
+                    for a in e.attributes().flatten() {
+                        match a.key.as_ref() {
+                            "Target" => target = Some(a.value.to_string()),
+                            "TargetMode" => external = a.value.eq_ignore_ascii_case("External"),
+                            _ => {}
+                        }
+                    }
+                    // 外部链接指向包外，不能在包里找
+                    if let Some(t) = target {
+                        if !external {
+                            out.push(t);
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// 验收专用故障注入：`SC_CORRUPT_TMP=truncate|drop-part|drop-sheet|corrupt-xml`
+/// 让「写步骤成功但产物已损坏」可复现；未设置时完全不改变行为。
+fn corrupt_tmp_for_test(path: &Path) {
+    let Ok(mode) = std::env::var("SC_CORRUPT_TMP") else { return };
+    match mode.as_str() {
+        "truncate" => {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let _ = f.set_len(len / 2);
+            }
+        }
+        "drop-part" => replace_zip_part(path, "[Content_Types].xml", None),
+        "drop-sheet" => replace_zip_part(path, "xl/worksheets/sheet1.xml", None),
+        "corrupt-xml" => replace_zip_part(path, "xl/workbook.xml", Some("<workbook><sheets>")),
+        _ => {}
+    }
+}
+
+/// 重写 zip：删除指定部件（replacement=None）或替换其内容
+fn replace_zip_part(path: &Path, part: &str, replacement: Option<&str>) {
+    let Ok(file) = std::fs::File::open(path) else { return };
+    let Ok(mut src) = zip::ZipArchive::new(file) else { return };
+    let tmp = path.with_extension("rezipped");
+    let Ok(out) = std::fs::File::create(&tmp) else { return };
+    let mut w = zip::ZipWriter::new(out);
+    let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+    for i in 0..src.len() {
+        let Ok(mut e) = src.by_index(i) else { continue };
+        let name = e.name().to_string();
+        if name == part {
+            if let Some(text) = replacement {
+                use std::io::Write;
+                if w.start_file(name, opts).is_ok() {
+                    let _ = w.write_all(text.as_bytes());
+                }
+            }
+            continue;
+        }
+        if w.start_file(name, opts).is_ok() {
+            use std::io::Write;
+            let mut buf = Vec::new();
+            if std::io::Read::read_to_end(&mut e, &mut buf).is_ok() {
+                let _ = w.write_all(&buf);
+            }
+        }
+    }
+    if w.finish().is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -758,6 +1122,19 @@ pub fn save_atomic(path: &Path, wb: &Workbook) -> Result<()> {
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+    // 验收专用：SC_SAVE_PAUSE_MS 让「临时文件已写好、还没替换」的窗口可控制，
+    // 用于模拟保存过程中进程被强杀（不是物理断电）。未设置时零影响。
+    if let Ok(ms) = std::env::var("SC_SAVE_PAUSE_MS") {
+        if let Ok(ms) = ms.trim().parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+    // 写成功 ≠ 产物完整：临时文件先过完整性门禁，不通过不许覆盖原文件
+    corrupt_tmp_for_test(&tmp);
+    if let Err(e) = verify_saved_package(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.context(format!("保存产物完整性校验失败，未覆盖 {}", path.display())));
     }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -797,6 +1174,8 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
         let _ = std::fs::remove_file(b);
     }
     let out = res.and_then(|()| {
+        corrupt_tmp_for_test(&tmp);
+        verify_saved_package(&tmp).context("加密前的临时明文未通过完整性校验")?;
         let bytes = std::fs::read(&tmp).with_context(|| "读取临时明文失败")?;
         crate::crypto::encrypt(path, &bytes, enc)
     });
@@ -1381,6 +1760,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             must_save!("table-sync", crate::table::sync(path, &sheet.name, &sheet.tables));
         }
     }
+    // 所有部件落盘之后再清一次悬空的 [Content_Types] Override：前面的 prune 跑在
+    // staged 补丁之前，加表/改名时会出现「Content-Types 声明 /xl/worksheets/sheet2.xml，
+    // 包里只有 native-sheet-…」——verify_saved_package 抓到的正是这个（Excel 会判包损坏）。
+    must_save!("prune-content-types-final", crate::fixups::prune_content_types(path));
     Ok(())
 }
 

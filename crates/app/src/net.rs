@@ -337,7 +337,21 @@ pub fn host(
     port: u16,
     password: String,
 ) -> std::io::Result<Net> {
+    // 生产路径：真的绑 0.0.0.0（局域网可连），端口来自配置。
     let listener = TcpListener::bind(("0.0.0.0", port))?;
+    host_on(listener, site, name, doc, password)
+}
+
+/// 用调用方已经绑定好的 listener 起宿主。测试用它绑 `0.0.0.0:0`——
+/// 既走真实的通配地址，又消灭「先探测端口、放开、再绑」的 TOCTOU 窗口。
+pub fn host_on(
+    listener: TcpListener,
+    site: u32,
+    name: String,
+    doc: String,
+    password: String,
+) -> std::io::Result<Net> {
+    let port = listener.local_addr()?.port();
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (evt_tx, evt_rx) = channel::<NetEvent>();
     let alive = Arc::new(AtomicBool::new(true));
@@ -1079,22 +1093,15 @@ mod tests {
 
     /// 让系统分配一个空闲端口（本机回环），不再写死 17881/7987 这类固定端口：
     /// 端口被占时旧写法会把「起不来」当「跳过」而记成通过。
-    pub(super) fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("取空闲端口");
-        l.local_addr().unwrap().port()
-    }
-
-    /// 起宿主：端口被抢就换一个再试，重试用尽必须 panic（真实失败不能当通过）。
+    /// 起宿主：测试自己绑 `127.0.0.1:0`（只回环，不对外开端口），端口由系统分配，
+    /// 再把已绑定的 listener 交给 host_on——既没有「探测端口→放开→再绑」的 TOCTOU，
+    /// 也不会在跑测试的机器上暴露一个对外监听。生产 `host()` 仍绑 `0.0.0.0`。
     pub(super) fn host_for_test(site: u32, name: &str, doc: &str, password: &str) -> (Net, u16) {
-        let mut last = String::new();
-        for _ in 0..8 {
-            let port = free_port();
-            match host(site, name.into(), doc.into(), port, password.into()) {
-                Ok(n) => return (n, port),
-                Err(e) => last = e.to_string(),
-            }
-        }
-        panic!("连续 8 次都没能绑定端口：{last}");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("绑 127.0.0.1:0");
+        let port = listener.local_addr().expect("取本地端口").port();
+        let net = super::host_on(listener, site, name.into(), doc.into(), password.into())
+            .expect("在已绑定 listener 上起宿主");
+        (net, port)
     }
 
     fn wait_for<F: Fn(&NetEvent) -> bool>(net: &Net, secs: u64, f: F) -> bool {

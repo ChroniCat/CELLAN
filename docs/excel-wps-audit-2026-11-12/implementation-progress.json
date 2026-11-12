@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T14:03:28Z",
+ "updated_utc": "2026-11-12T14:06:27Z",
  "tasks": [
   {
    "id": "C01",
@@ -433,8 +433,8 @@
    "scope": "core/xlsx.rs, patch.rs + app/document_tasks.rs",
    "source": "core-requirements.md",
    "heading": "C13 P0 保存子步骤失败必须阻止成功回执",
-   "status": "已验收",
-   "acceptance": "保存只有完整成功才清 dirty：注入保护/图表/布局/CF/外链/宏失败时 save_atomic 返回 Err、错误点名子步骤、原文件 SHA256 不变；app 层 dirty 保留、状态栏可定位错误、无成功提示；故障解除后重试成功；只读目标等替换失败保留原文件与半成品。",
+   "status": "待验收",
+   "acceptance": "[原始 core-requirements.md C13 验收] 注入保护、图表、布局、CF、外链、宏补丁失败时，原文件 SHA256 不变、dirty 仍在、有可定位错误、无成功提示；修复故障重试成功。**断电/文件占用/权限不足测试与现有原子保存测试一起通过。**前一句已全部通过；断电未执行、Office 真实独占未构造（只读目标只覆盖同一 rename 失败分支）。",
    "files": [
     "crates/core/src/xlsx.rs",
     "crates/core/tests/save_failure_injection.rs",
@@ -450,16 +450,17 @@
    "evidence": [
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-parent-acceptance.txt",
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-final-suite.txt",
-    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-integrity-gate.txt"
    ],
    "not_done": [
-    "图表锚点/引用与 raw-copies 注入未执行（需图表夹具）",
-    "图表子步骤注入未执行（需图表夹具）；文件占用/权限不足的 rename 失败注入未执行",
-    "断电不可模拟；Office 真实独占锁未构造（只读目标覆盖同一 rename 失败分支）；复杂图表部件保真属 C19/QA-01"
+    "物理断电无法模拟：用「保存阶段强杀子进程」覆盖进程终止路径，页缓存/掉电顺序未覆盖",
+    "真实占用用同进程独占句柄构造（Windows 共享语义等价），未启动真实 Excel/Office",
+    "门禁对 100MB 级工作簿的保存耗时未做基准（属 QA-06）"
    ],
    "failures": [],
    "blocker": "",
-   "next": "UI-02.3 命令 enabled/tooltip 统一注册",
+   "next": "补验：保存中途强杀子进程（不真断电）+ 第二进程以 FileShare.None 独占目标构造真实占用",
    "updated_utc": "2026-11-12T11:19:49Z",
    "slices": [
     {
@@ -516,12 +517,14 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-2-suite.txt"
      ],
      "not_done": [
-      "chart-anchor / chart-refs / raw-copies 的注入缺带真实图表的基准（代码已传播，测试待图表夹具）；保存失败时的 dirty/回执/重试集成属 C13.3"
+      "raw-copies 子步骤的注入未单列（该步骤只在不编辑的原始部件上触发，已由 restore-unedited-sheets 覆盖同一路径）",
+      "保存失败时的 dirty/回执/重试集成属 C13.3"
      ],
      "failures": [],
      "blocker": "",
      "next": "C13.3 dirty/回执/重试集成",
-     "updated_utc": "2026-11-12T11:16:40Z"
+     "updated_utc": "2026-11-12T11:16:40Z",
+     "status_note": "更正：injected_chart_failures_abort_the_save 已用程序化插入的真实图表部件覆盖 chart-anchor/chart-refs（5 passed 实测），原「缺带真实图表的基准」记录有误"
     },
     {
      "id": "C13.3",
@@ -529,7 +532,7 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C13 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
+     "status": "待验收",
      "acceptance": "保存失败时：状态栏给出可定位错误（含失败子步骤）、wb.dirty 保持 true、不写 wb.path、不应用 SaveReceipt、磁盘内容不变；故障解除后再按 Ctrl+S 能重试成功并清 dirty。",
      "files": [
       "crates/app/src/document_tasks.rs",
@@ -541,17 +544,20 @@
       "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 128 passed, 0 failed, 0 ignored, 4 filtered"
      ],
      "evidence": [
-      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-3-save-failure-receipt.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c13-integrity-gate.txt"
      ],
      "not_done": [
-      "文件占用/权限不足/断电的 rename 失败注入未执行；图表子步骤注入待图表夹具"
+      "物理断电未模拟（用保存阶段强杀进程代替，边界见 c13-integrity-gate.txt）"
      ],
      "failures": [],
      "blocker": "",
-     "next": "C13 父任务：补图表注入夹具后整体验收",
-     "updated_utc": "2026-11-12T11:17:35Z"
+     "next": "补验真实独占锁与保存中途强杀",
+     "updated_utc": "2026-11-12T11:17:35Z",
+     "status_note": "独立审查更正：本切片承担 rename 失败类场景（占用/权限/断电），后两项未执行"
     }
-   ]
+   ],
+   "status_note": "独立审查更正：证据 c13-parent-acceptance.txt 自述「断电：未执行」「Office 独占：真实独占未执行」，原验收含该两项，故回到待验收"
   },
   {
    "id": "C14",
@@ -795,16 +801,39 @@
    "scope": "app/recent.rs, net.rs, SC_*钩子",
    "source": "qa-requirements.md",
    "heading": "QA-03 P0 修复名义通过与测试环境污染",
-   "status": "实施中",
-   "acceptance": "见 qa-requirements.md QA-03：独立夹具、正确断言、端口分配、统一测试环境、去掉生产程序固定开发路径写入",
-   "files": [],
-   "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "status": "待验收",
+   "acceptance": "[qa-requirements.md QA-03] 3.1 隔离 TEMP/TMP/LOCALAPPDATA 与 SC_*；3.2 无界面自检不得写固定开发路径；3.3 端口冲突/名义断言必须真跑。独立复核指出：QA-03.1 的隔离单测自身有「设哨兵→放锁→再取锁」竞态且不恢复入口原值，旧并行结果仍是 error: test failed；QA-03.3 的 free_port 只在 127.0.0.1 探测而生产 host 绑 0.0.0.0，锁用例只验了自己的租约。三条已修，需重新跑完整并行套件并补第二参与者持锁的绘制验证后才恢复已验收。",
+   "files": [
+    "scripts/audit_env.sh",
+    "crates/app/src/test_env.rs",
+    "crates/app/src/net.rs",
+    "crates/app/src/main.rs",
+    "crates/app/tests/ui_regression.rs",
+    "crates/core/tests/pivot_real.rs"
+   ],
+   "commits": [
+    "d1ebffd",
+    "a53e27a"
+   ],
+   "commands": [
+    "app bin 串行 139 passed / 并行 139 passed（一致）",
+    "GUI ui_regression 9 passed / 8 ignored（串行）",
+    "port 7987 被占时旧用例 0.00s 假通过 → 修复后 0.31s 真实通过"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-1-before-source.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-1-env-isolation.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-1-ui-child.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-2-probe-paths.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-3-nominal-tests.txt"
+   ],
+   "not_done": [
+    "8 个 GUI 用例仍依赖 tests/test-work 外部夹具（ignored），未逐个改自建夹具",
+    "真实多机跨 LAN 协作未验证（仅同机双实例 + 回环）"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "QA-03.2 硬编码 SC 输出路径（SC_B1/B3/B4 固定 F:/Finance/work）",
+   "next": "",
    "updated_utc": "2026-11-12T10:35:01Z",
    "slices": [
     {
@@ -813,7 +842,7 @@
      "priority": "P0",
      "acceptance_source": "qa-requirements.md / QA-03 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
+     "status": "待验收",
      "acceptance": "统一测试环境守卫：每次测试唯一目录，TEMP/TMP/LOCALAPPDATA 指向该目录并在 Drop 恢复原值；清空继承 SC_*（显式 allowlist 才生效）；GUI 回归子进程同样隔离；串行与并行结果一致；真实用户 recent.txt/ui.ini 哈希不变；所有输出位于本次运行目录；只删本次运行目录（校验在 base 之下）。",
      "files": [
       "crates/app/src/test_env.rs",
@@ -826,7 +855,9 @@
       "crates/app/src/main.rs",
       "scripts/audit_env.sh"
      ],
-     "commits": [],
+     "commits": [
+      "d1ebffd"
+     ],
      "commands": [
       "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 105 passed, 0 failed, 0 ignored, 4 filtered",
       "同上并行（去掉 --test-threads=1）=> 105 passed, 0 failed",
@@ -838,7 +869,7 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-1-ui-child.txt"
      ],
      "not_done": [
-      "QA-03.2 硬编码 SC_B1/SC_B3/SC_B4 输出路径、QA-03.3 端口冲突与名义断言不在本切片"
+      "隔离单测的哨兵写入/读回仍在锁外（竞态），且不回滚测试入口原值——已改 TestEnv::building + EnvTxn，待并行复跑确认"
      ],
      "failures": [],
      "blocker": "",
@@ -851,17 +882,27 @@
      "priority": "P0",
      "acceptance_source": "qa-requirements.md / QA-03 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
-     "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "status": "已验收",
+     "acceptance": "SC_B1/B3/B4 自检输出目录由 SC_PROBE_DIR 决定，缺省为系统临时目录；生产代码无固定开发路径写入；产物可重开校验",
+     "files": [
+      "crates/app/src/main.rs,crates/app/src/edit_regression_tests.rs"
+     ],
+     "commits": [
+      "12efb7d"
+     ],
+     "commands": [
+      "cargo test -p app --bin app -- --test-threads=1 => 139 passed / 0 failed; cargo test -p app --test ui_regression => 8 passed / 9 ignored"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-2-probe-paths.txt"
+     ],
+     "not_done": [
+      "SC_B5/B6 等其他自检钩子只读/写显式路径，未逐一改造；本轮未验证 Windows 之外平台"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T14:06:27Z"
     },
     {
      "id": "QA-03.3",
@@ -869,13 +910,30 @@
      "priority": "P0",
      "acceptance_source": "qa-requirements.md / QA-03 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
-     "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "status": "待验收",
+     "acceptance": "端口用 127.0.0.1:0 系统分配 + 抢不到换端口重试（用尽 panic，不再「跳过」记通过）；pivot 部件测试自建夹具、解析 XML/ContentType/关系引用并做过 mutation 验证；locked_cell_is_marked 走真实宿主+租约协议，断言 dump 里的 `lock (1,1) mine=true`",
+     "files": [
+      "crates/app/src/net.rs",
+      "crates/app/src/main.rs",
+      "crates/app/tests/ui_regression.rs",
+      "crates/core/tests/pivot_real.rs"
+     ],
+     "commits": [
+      "a53e27a"
+     ],
+     "commands": [
+      "cargo test -p app --bin app -- --test-threads=1 => 139 passed / 0 failed / 0 ignored",
+      "cargo test -p app --bin app（并行默认）=> 139 passed / 0 failed / 0 ignored（串并行一致）",
+      "cargo test -p app --test ui_regression -- --test-threads=1 => 9 passed / 0 failed / 8 ignored",
+      "cargo test -p sheetcore --test pivot_real pivot_parts_are_well_formed => 1 passed（mutation 时 FAILED）"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa03-3-nominal-tests.txt"
+     ],
+     "not_done": [
+      "他人持锁的绘制标记未验证（原用例只验自己的租约 mine=true）——已加双进程用例，待跑通",
+      "free_port 探测回环而生产绑 0.0.0.0——已改为测试自绑 0.0.0.0:0 + host_on"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
@@ -892,8 +950,8 @@
    "scope": "app/main.rs editing/commit_edit/draw_grid_pane",
    "source": "ui-requirements.md",
    "heading": "UI-01 修复真实键盘编辑提交链路",
-   "status": "已验收",
-   "acceptance": "见切片 UI-01.1：真实 update() 全窗事件路径覆盖 Enter/Tab/Shift/Esc/F2/编辑栏/点格/跳转/关窗/验证失败/撤销/保存重开",
+   "status": "待验收",
+   "acceptance": "[原始 ui-requirements.md UI-01 验收] 从真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值；**公式和中文输入法确认同测**；撤销一次恢复旧值；保存重开保持结果；非法验证输入不移动、不丢编辑内容。本机已用真实 update() 全窗事件路径覆盖除输入法外的全部条目，输入法候选交互未执行。",
    "files": [
     "crates/app/src/main.rs",
     "crates/app/src/edit_regression_tests.rs",
@@ -910,11 +968,13 @@
     "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
    ],
    "not_done": [
-    "真实硬件键盘与中文 IME 候选交互未执行（QA-04）；窗口关闭未保存提示另立后续项"
+    "中文输入法（IME 候选窗上屏、组合中取消）未执行——原始验收要求「公式和中文输入法确认同测」",
+    "真实硬件键盘与 Alt+Enter 光标位置未人工核对（事件注入已覆盖按键语义，但不能冒充硬件/IME 链路）",
+    "窗口关闭未保存提示属既有缺口，另立后续项"
    ],
    "failures": [],
    "blocker": "",
-   "next": "UI-02.1 Ctrl+S/另存为快捷键",
+   "next": "补验真实中文 IME（Win32 SendInput + 微软拼音候选）与硬件键盘；实现与回归已就绪，未改验收标准",
    "updated_utc": "2026-11-12T10:47:18Z",
    "slices": [
     {
@@ -923,8 +983,8 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-01 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
-     "acceptance": "真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值且不脏不记撤销；公式栏与格内共用唯一缓冲、点编辑栏进入编辑、Enter 提交；非法验证输入不移动不丢草稿；一次撤销恢复旧值、重做恢复新值；保存重开保持结果；点其他格/名称框跳转/关窗口先提交草稿。",
+     "status": "待验收",
+     "acceptance": "真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值且不脏不记撤销；公式栏与格内共用唯一缓冲、点编辑栏进入编辑、Enter 提交；非法验证输入不移动不丢草稿；一次撤销恢复旧值、重做恢复新值；保存重开保持结果；点其他格/名称框跳转/关窗口先提交草稿。另加原始验收要求的「公式和中文输入法确认同测」——输入法候选交互尚未执行。",
      "files": [
       "crates/app/src/main.rs",
       "crates/app/src/edit_regression_tests.rs",
@@ -942,14 +1002,17 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
      ],
      "not_done": [
-      "真实硬件键盘与中文 IME 候选交互（归 QA-04，本机 RDP 不可自动化）；窗口关闭的未保存保存提示属既有缺口，另立后续项"
+      "真实硬件键盘与中文 IME 候选交互（归 QA-04，本机 RDP 不可自动化）；窗口关闭的未保存保存提示属既有缺口，另立后续项",
+      "中文 IME 候选窗与组合输入未执行（原始验收明文要求同测）",
+      "真实硬件键盘未人工核对"
      ],
      "failures": [],
      "blocker": "",
-     "next": "UI-02.1 Ctrl+S/另存为快捷键与编辑态",
+     "next": "补验中文 IME 与硬件键盘后回到已验收",
      "updated_utc": "2026-11-12T10:47:17Z"
     }
-   ]
+   ],
+   "status_note": "独立审查更正：证据 ui01-edit-commit.txt 第 6 节明确「真实硬件键盘、中文 IME 候选窗…未执行」，原验收含输入法同测，故父任务与切片回到待验收（实现与已通过回归保留）"
   },
   {
    "id": "UI-02",
@@ -962,26 +1025,31 @@
    "scope": "app/main.rs handle_keys + 命令注册",
    "source": "ui-requirements.md",
    "heading": "UI-02 补齐保存等已宣称存在的快捷键",
-   "status": "已验收",
-   "acceptance": "Ctrl+S 落盘后重新加载值正确；Ctrl+Shift+S 另存为不改原文件；Ctrl+O/N/P 对应正确入口；全部按键经真实 update() 注入",
+   "status": "待验收",
+   "acceptance": "[原始 ui-requirements.md UI-02 验收] 打开隔离副本，修改 A1 后按 Ctrl+S，文件哈希/重新加载结果正确；Ctrl+Shift+S **实际弹出另存为**且不更改原文件；Ctrl+O/N/P 均对应正确入口；测试必须注入按键事件或驱动真实窗口。当前 Ctrl+S 已用重新加载核对（未计算完整文件哈希），Ctrl+Shift+S/Ctrl+O 走 SC_SAVE_AS/SC_OPEN_PATH 绕过了系统对话框，不能作为「弹窗」证据，故父任务为待验收。",
    "files": [
     "crates/app/src/command.rs,crates/app/src/main.rs,crates/app/src/ribbon/actions.rs,crates/app/src/ribbon/ui.rs,crates/app/src/ui_kit.rs,crates/app/src/edit_regression_tests.rs"
    ],
    "commits": [
-    "6dc206a,5535d40,8eb35d5"
+    "6dc206a",
+    "5535d40",
+    "8eb35d5"
    ],
    "commands": [
     "cargo test -p app --bin app -- --test-threads=1 (138 passed); GUI ui_regression (8 passed/9 ignored)"
    ],
    "evidence": [
-    "implementation-evidence/ui02-parent-acceptance.txt,implementation-evidence/ui023-command-registry.txt"
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-parent-acceptance.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui023-command-registry.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui023-suites.txt"
    ],
    "not_done": [
-    "真实系统文件对话框、硬件键盘、中文 IME 未人工验收"
+    "Ctrl+Shift+S 的系统另存为对话框：已用真实 Win32 对话框（#32770 Save As）验证弹出与取消，未验证「确认后写到新路径」",
+    "Ctrl+O 的系统打开对话框：已验证弹出与取消，未在对话框内实际选中文件（选择后的加载路径由 SC_OPEN_PATH 事件测试覆盖）"
    ],
    "failures": [],
    "blocker": "",
-   "next": "",
+   "next": "如需覆盖对话框内确认动作，用 UI 自动化选中文件；当前以「对话框真实弹出 + 取消不改文件」为验收边界并如实登记",
    "updated_utc": "2026-11-12T14:03:28Z",
    "slices": [
     {
@@ -990,7 +1058,7 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
+     "status": "待验收",
      "acceptance": "已保存副本改 A1 后按 Ctrl+S：真正开始保存、完成后 dirty=false、重开文件为新值；编辑态按 Ctrl+S 先提交有效编辑再保存；Ctrl+Shift+S 写到新路径且原文件不变；数据验证拒绝时 Ctrl+S 不开始保存且保留草稿。快捷键与标题栏/功能区共用 save()/save(true)。",
      "files": [
       "crates/app/src/main.rs",
@@ -1006,11 +1074,12 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-1-red.txt"
      ],
      "not_done": [
-      "Ctrl+O/N/P（UI-02.2）；真实系统另存为对话框交互；命令 enabled/tooltip 注册（UI-02.3）"
+      "另存为对话框未真实弹出（SC_SAVE_AS 直接落盘），「弹出并取消后原文件不变」未验证",
+      "Ctrl+S 后只核对重新加载的值，未记录文件完整 SHA256"
      ],
      "failures": [],
      "blocker": "",
-     "next": "UI-02.2 Ctrl+O/N/P",
+     "next": "补验真实另存为对话框（确认/取消）",
      "updated_utc": "2026-11-12T10:50:31Z"
     },
     {
@@ -1019,7 +1088,7 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "已验收",
+     "status": "待验收",
      "acceptance": "Ctrl+N 在开始页直接进空白、在文档中新标签开空白且不丢当前文档；Ctrl+O 打开选定文件并在新标签装载（路径/内容正确）；Ctrl+P 打开打印预览且从第一页开始。三者与开始页/功能区同一实现。",
      "files": [
       "crates/app/src/main.rs",
@@ -1035,11 +1104,12 @@
       "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-2-red.txt"
      ],
      "not_done": [
-      "真实系统打开对话框交互；命令注册表/enabled（UI-02.3）"
+      "Ctrl+O 的系统打开对话框未真实弹出（SC_OPEN_PATH 直接给路径）",
+      "开始页「打开」入口只验证了状态转移，未走真实对话框"
      ],
      "failures": [],
      "blocker": "",
-     "next": "UI-02.3 命令 enabled/tooltip 统一注册",
+     "next": "补验真实打开对话框（选择/取消）",
      "updated_utc": "2026-11-12T10:52:34Z"
     },
     {
@@ -1060,7 +1130,7 @@
       "cargo test -p app --bin app -- --test-threads=1 => 138 passed / 0 failed / 0 ignored / 0 filtered; cargo test -p app --test ui_regression => 8 passed / 9 ignored"
      ],
      "evidence": [
-      "implementation-evidence/ui023-command-registry.txt,implementation-evidence/ui023-suites.txt,implementation-evidence/ui023/doc.png,implementation-evidence/ui023/start.png"
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui023-command-registry.txt,implementation-evidence/ui023-suites.txt,implementation-evidence/ui023/doc.png,implementation-evidence/ui023/start.png"
      ],
      "not_done": [
       "真实鼠标悬停 tooltip 与硬件键盘未人工核对；网格级 Ctrl+C/X/V/F/H 未纳入命令表（当前无 enabled 谓词，留 UI-06/07）"
@@ -1070,7 +1140,8 @@
      "next": "",
      "updated_utc": "2026-11-12T14:03:12Z"
     }
-   ]
+   ],
+   "status_note": "独立审查更正：SC_SAVE_AS/SC_OPEN_PATH 绕过系统对话框，不能作为弹窗证据；父任务回到待验收，事件回归保留"
   },
   {
    "id": "UI-03",

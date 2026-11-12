@@ -350,3 +350,255 @@ fn readonly_target_is_not_silently_replaced() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// C13 最终产物完整性门禁：写步骤全部成功、但临时文件已经损坏时，绝不能覆盖原文件。
+// 注入的是「写完之后把产物弄坏」，与 SC_FAIL_SAVE_STEP（中途返回错误）互补。
+
+#[test]
+fn corrupted_temp_package_is_never_committed() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for mode in ["truncate", "drop-part", "drop-sheet", "corrupt-xml"] {
+        let dir = scratch(mode);
+        let path = dir.join("gate.xlsx");
+        let mut wb = book();
+        sheetcore::xlsx::save_atomic(&path, &wb).expect("先写一份正常文件");
+        let before = hash(&path);
+
+        // 改内容 + 让临时文件在写完后损坏
+        wb.sheets[0].set(5, 0, Cell { value: Value::Number(999.0), formula: None });
+        unsafe { std::env::set_var("SC_CORRUPT_TMP", mode) };
+        let err = sheetcore::xlsx::save_atomic(&path, &wb).expect_err("产物损坏必须报错");
+        unsafe { std::env::remove_var("SC_CORRUPT_TMP") };
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("完整性校验失败") || msg.contains("未通过完整性校验"), "{mode} 的错误没点明门禁：{msg}");
+        assert_eq!(hash(&path), before, "{mode}：原文件被覆盖了");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.contains(".saving-") || n.ends_with(".rezipped"))
+            .collect();
+        assert!(leftovers.is_empty(), "{mode}：失败后留下临时文件 {leftovers:?}");
+
+        // 解除注入后重试必须成功，且新内容真的写进去
+        sheetcore::xlsx::save_atomic(&path, &wb).expect("解除注入后应能保存");
+        let back = sheetcore::xlsx::load(&path).expect("重新读回");
+        assert_eq!(back.sheet(0).get(5, 0).unwrap().value.display(), "999", "{mode}：重试后内容不对");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 门禁不能误伤正常文件：新建、覆盖、另存为都要能通过
+#[test]
+fn integrity_gate_accepts_every_normal_save() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("gate-ok");
+    let path = dir.join("ok.xlsx");
+    let mut wb = book();
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("首次保存");
+    sheetcore::xlsx::verify_saved_package(&path).expect("首次产物应通过门禁");
+    wb.sheets[0].set(2, 0, Cell { value: Value::Number(7.0), formula: None });
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("覆盖保存");
+    sheetcore::xlsx::verify_saved_package(&path).expect("覆盖后的产物应通过门禁");
+    let other = dir.join("copy.xlsx");
+    sheetcore::xlsx::save_atomic(&other, &wb).expect("另存为");
+    sheetcore::xlsx::verify_saved_package(&other).expect("另存产物应通过门禁");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+// ---------------------------------------------------------------------------
+// C13 真实文件占用 & 保存阶段进程中断（不真断电）
+
+#[cfg(windows)]
+mod occupancy {
+    use super::*;
+
+    // 直接声明 FFI：windows-sys 0.52 的这些符号分散在别的 feature 里，为一条测试开
+    // 一整套 feature 不值得。共享模式取「只读」，正是 Office 打开工作簿时的行为。
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *mut core::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const OPEN_EXISTING: u32 = 3;
+
+    struct Exclusive(*mut core::ffi::c_void);
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn open_exclusive(path: &Path) -> Exclusive {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let h = unsafe {
+            CreateFileW(wide.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut())
+        };
+        assert!(!h.is_null() && h as isize != -1, "独占打开失败");
+        Exclusive(h)
+    }
+
+    #[test]
+    fn exclusive_handle_blocks_replacement_and_retry_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("occupied");
+        let path = dir.join("occupied.xlsx");
+        let mut wb = book();
+        sheetcore::xlsx::save_atomic(&path, &wb).expect("先写一份");
+        let before = hash(&path);
+
+        let hold = open_exclusive(&path);
+        wb.sheets[0].set(3, 0, Cell { value: Value::Number(5.0), formula: None });
+        let err = sheetcore::xlsx::save_atomic(&path, &wb).expect_err("被独占时必须报错");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("替换") && msg.contains("失败"), "错误没说明替换失败：{msg}");
+        assert_eq!(hash(&path), before, "被独占时原文件不能变");
+        let stray: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.contains(".saving-"))
+            .collect();
+        assert_eq!(stray.len(), 1, "失败后应保留一份新内容供人工抢救：{stray:?}");
+
+        drop(hold);
+        for n in &stray {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+        sheetcore::xlsx::save_atomic(&path, &wb).expect("解除占用后应能保存");
+        let back = sheetcore::xlsx::load(&path).expect("读回");
+        assert_eq!(back.sheet(0).get(3, 0).unwrap().value.display(), "5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn killed_during_save_leaves_the_original_intact() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("killed");
+    let path = dir.join("killed.xlsx");
+    let mut wb = book();
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("先写一份");
+    let before = hash(&path);
+
+    // 子进程：同一个测试二进制，跑 child_save_worker，卡在“临时文件已写好”的窗口里
+    let exe = std::env::current_exe().expect("测试可执行文件");
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", "child_save_worker", "--ignored", "--nocapture"])
+        .env("SC_WORKER_PATH", &path)
+        .env("SC_SAVE_PAUSE_MS", "15000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("启动保存子进程");
+    // 等到临时文件出现（说明已经写完、正卡在替换前），再强杀
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut saw_tmp = false;
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            e.file_name().to_string_lossy().contains(".saving-")
+        }) {
+            saw_tmp = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(saw_tmp, "子进程没进入「已写临时文件」阶段");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(hash(&path), before, "强杀后原文件必须完好");
+    let back = sheetcore::xlsx::load(&path).expect("原文件仍可读");
+    assert_eq!(back.sheet(0).get(0, 0).unwrap().value.display(), "金额");
+
+    // 清掉残留临时文件后，再次保存必须成功（不是永久卡死）
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        if e.file_name().to_string_lossy().contains(".saving-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    wb.sheets[0].set(4, 0, Cell { value: Value::Number(6.0), formula: None });
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("强杀后重试应成功");
+    let back = sheetcore::xlsx::load(&path).expect("重试后读回");
+    assert_eq!(back.sheet(0).get(4, 0).unwrap().value.display(), "6");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只被子进程用：加载 → 改一格 → 保存（父进程会在 SC_SAVE_PAUSE_MS 的窗口里杀掉它）
+#[test]
+#[ignore = "helper process for killed_during_save_leaves_the_original_intact"]
+fn child_save_worker() {
+    let Ok(path) = std::env::var("SC_WORKER_PATH") else { return };
+    let path = PathBuf::from(path);
+    let mut wb = sheetcore::xlsx::load(&path).expect("子进程读入");
+    wb.sheets[0].set(9, 0, Cell { value: Value::Number(12345.0), formula: None });
+    let _ = sheetcore::xlsx::save_atomic(&path, &wb);
+}
+
+/// 加密工作簿最终落盘是 CFB 容器（不是 ZIP）：门禁必须认，不能当坏包拒绝
+#[test]
+fn encrypted_workbook_passes_the_gate_even_though_it_is_cfb() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("encrypted");
+    let path = dir.join("secret.xlsx");
+    let mut wb = book();
+    wb.encryption = Some(sheetcore::crypto::EncryptionSettings::new("pw-123"));
+    sheetcore::xlsx::save(&path, &wb).expect("加密保存");
+    let head = std::fs::read(&path).unwrap();
+    assert_eq!(&head[..8], &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1], "加密后应是 CFB");
+    sheetcore::xlsx::verify_saved_package(&path).expect("加密产物必须通过门禁");
+    // 且能真的解回来
+    let back = sheetcore::xlsx::load_with_password(&path, "pw-123").expect("解密读回");
+    assert_eq!(back.sheet(0).get(0, 0).unwrap().value.display(), "金额");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 关系目标解析：'/xl/...' 绝对路径、'../' 向上、外部链接不查
+#[test]
+fn relationship_targets_are_resolved_the_xml_way() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("rels");
+    let path = dir.join("rels.xlsx");
+    let wb = book();
+    sheetcore::xlsx::save_atomic(&path, &wb).expect("保存");
+    sheetcore::xlsx::verify_saved_package(&path).expect("正常文件的相对关系应解析正确");
+
+    // 把工作簿关系改成一个 '../xl/worksheets/sheet1.xml'（等价路径）：必须仍能解析到
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut rels = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("xl/_rels/workbook.xml.rels").unwrap(), &mut rels).unwrap();
+    drop(zip);
+    let patched = rels.replace("worksheets/sheet1.xml", "../xl/worksheets/sheet1.xml");
+    assert_ne!(patched, rels, "夹具里应有 worksheets/sheet1.xml");
+    let tmp = dir.join("rels2.xlsx");
+    {
+        let mut src = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let out = std::fs::File::create(&tmp).unwrap();
+        let mut zw = zip::ZipWriter::new(out);
+        for i in 0..src.len() {
+            let mut e = src.by_index(i).unwrap();
+            let name = e.name().to_string();
+            zw.start_file(name.clone(), zip::write::SimpleFileOptions::default()).unwrap();
+            if name == "xl/_rels/workbook.xml.rels" {
+                std::io::Write::write_all(&mut zw, patched.as_bytes()).unwrap();
+            } else {
+                std::io::copy(&mut e, &mut zw).unwrap();
+            }
+        }
+        zw.finish().unwrap();
+    }
+    sheetcore::xlsx::verify_saved_package(&tmp).expect("../ 关系必须解析到真实部件，而不是被跳过");
+    let _ = std::fs::remove_dir_all(&dir);
+}

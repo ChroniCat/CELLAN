@@ -5,7 +5,7 @@
 //! 屏幕关着/RDP 断开也能跑，因为不依赖截图。
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// 跑一次 app，等 dump 落盘，返回内容
@@ -784,5 +784,284 @@ fn ribbon_groups_aligned_and_fit() {
     // Excel 的「开始」页本身就是 ~1750px 宽；窗口不足时功能区横向滚动（Excel 也会）。
     let end = groups.last().unwrap().1 + groups.last().unwrap().3;
     assert!(end < 2100.0, "分组总宽 {end} 与 Excel 实测差距过大");
+}
+
+
+// ---------------------------------------------------------------- UI-02 真实系统对话框
+#[cfg(windows)]
+mod real_dialogs {
+    use super::*;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: extern "system" fn(isize, isize) -> i32, lparam: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetClassNameW(hwnd: isize, buf: *mut u16, len: i32) -> i32;
+        fn GetWindowTextW(hwnd: isize, buf: *mut u16, len: i32) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn PostMessageW(hwnd: isize, msg: u32, w: usize, l: isize) -> i32;
+    }
+    const WM_CLOSE: u32 = 0x0010;
+
+    fn wide_text(f: unsafe extern "system" fn(isize, *mut u16, i32) -> i32, hwnd: isize) -> String {
+        let mut buf = [0u16; 512];
+        let n = unsafe { f(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    fn dialog_windows(pid: u32) -> Vec<(isize, String, String)> {
+        static WANT: std::sync::Mutex<Option<(u32, Vec<(isize, String, String)>)>> =
+            std::sync::Mutex::new(None);
+        extern "system" fn cb(hwnd: isize, _l: isize) -> i32 {
+            let mut wpid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut wpid) };
+            let mut guard = WANT.lock().unwrap();
+            let Some((want, out)) = guard.as_mut() else { return 1 };
+            if wpid == *want && unsafe { IsWindowVisible(hwnd) } != 0 {
+                let class = wide_text(GetClassNameW, hwnd);
+                let title = wide_text(GetWindowTextW, hwnd);
+                if class == "#32770" || class.starts_with("AlternateModal") || title.contains("另存为")
+                    || title.contains("打开") || title.to_lowercase().contains("save as")
+                {
+                    out.push((hwnd, class, title));
+                }
+            }
+            1
+        }
+        *WANT.lock().unwrap() = Some((pid, Vec::new()));
+        unsafe { EnumWindows(cb, 0) };
+        WANT.lock().unwrap().take().map(|(_, v)| v).unwrap_or_default()
+    }
+
+    fn sha256(path: &Path) -> String {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(std::fs::read(path).unwrap());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn run_and_expect_dialog(action: &str, doc: &str) -> (Option<String>, String) {
+        let exe = env!("CARGO_BIN_EXE_app");
+        let mut cmd = Command::new(exe);
+        isolate_child(&mut cmd);
+        static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cmd.arg(doc)
+            .env("SC_RIBBON_ACTION", action)
+            // 每人一个单实例端口：默认 48765 共用时后来者会被转交给已有窗口然后退出
+            .env("SC_INSTANCE_PORT", (49500 + (std::process::id() % 300) as u16 + n).to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("启动 app");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut found: Option<(isize, String, String)> = None;
+        while Instant::now() < deadline {
+            if let Some(w) = dialog_windows(pid).into_iter().next() {
+                found = Some(w);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let desc = match &found {
+            Some((hwnd, class, title)) => {
+                // 取消：给对话框发 WM_CLOSE，让它走「取消」分支
+                unsafe { PostMessageW(*hwnd, WM_CLOSE, 0, 0) };
+                std::thread::sleep(Duration::from_millis(600));
+                format!("class={class} title={title}")
+            }
+            None => String::new(),
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = child.kill();
+        let _ = child.wait();
+        let shown = found.is_some();
+        (if shown { Some(desc.clone()) } else { None }, desc)
+    }
+
+    /// Ctrl+Shift+S（另存为）必须真的弹出系统对话框；取消后原文件一个字节都不能变
+    #[test]
+    fn save_as_command_shows_a_real_system_dialog_and_cancel_keeps_the_file() {
+        let src = run_dir().join("ui_saveas.xlsx");
+        {
+            let mut wb = sheetcore::model::Workbook::new_blank();
+            wb.sheet_mut(0).set(0, 0, sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text("另存为测试".into()),
+                formula: None,
+            });
+            sheetcore::xlsx::save(&src, &wb).expect("造样本");
+        }
+        let before = sha256(&src);
+        let before_files = xlsx_count();
+        let (found, desc) = run_and_expect_dialog("FileSaveAs", &src.to_string_lossy());
+        assert!(
+            found.is_some(),
+            "执行另存为没有出现系统对话框（说明走的是 SC_SAVE_AS 之类的旁路）"
+        );
+        println!("另存为对话框：{desc}");
+        assert_eq!(sha256(&src), before, "取消另存为后原文件被改动");
+        assert_eq!(xlsx_count(), before_files, "取消另存为却在运行目录里多出了文件");
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// Ctrl+O（打开）必须真的弹出系统文件对话框
+    #[test]
+    fn open_command_shows_a_real_system_dialog() {
+        let src = run_dir().join("ui_open.xlsx");
+        {
+            let mut wb = sheetcore::model::Workbook::new_blank();
+            wb.sheet_mut(0).set(0, 0, sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text("打开测试".into()),
+                formula: None,
+            });
+            sheetcore::xlsx::save(&src, &wb).expect("造样本");
+        }
+        let before = sha256(&src);
+        let (found, desc) = run_and_expect_dialog("FileOpen", &src.to_string_lossy());
+        assert!(found.is_some(), "执行打开没有出现系统文件对话框");
+        println!("打开对话框：{desc}");
+        assert_eq!(sha256(&src), before, "取消打开后文件被改动");
+        let _ = std::fs::remove_file(&src);
+    }
+
+    fn xlsx_count() -> usize {
+        std::fs::read_dir(run_dir())
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
+// --------------------------------------------------- QA-03.3 别人持锁的绘制标记
+mod other_participant_lock {
+    use super::*;
+
+    /// 进程守卫：断言失败/早退时也要把子进程收掉，否则残留的 app 会一直占着
+    /// 0.0.0.0:端口，后面所有实例都起不了宿主（表现为「莫名不共享」）。
+    struct Kid(Child);
+    impl Drop for Kid {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    impl Kid {
+        fn kill_now(mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn(tag: &str, doc: &Path, envs: &[(&str, &str)]) -> Kid {
+        let exe = env!("CARGO_BIN_EXE_app");
+        let mut cmd = Command::new(exe);
+        isolate_child(&mut cmd);
+        // 每个参与者必须有**自己的** LOCALAPPDATA：单实例转发按 profile 判定，
+        // 共用一份会把后来者当成「重复打开」直接转给前一个实例然后退出（dump 永远不落盘）。
+        let profile = run_dir().join(format!("profile-{tag}"));
+        let _ = std::fs::create_dir_all(&profile);
+        cmd.env("LOCALAPPDATA", &profile);
+        // 协作端口与「单实���转发」端口都必须一人一个：
+        // - 7878 默认端口容易被上一轮残留的实例占住，绑不上就静默不共享；
+        // - 48765 单实例端口共用会把后来者当成「重复打开」，转给前一个实例后自己退出
+        //   （表现就是 dump 永远不落盘）。SC_INSTANCE_PORT 就是为这个场景留的。
+        static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cmd.env("SC_NET_PORT", (20000 + std::process::id() % 20000).to_string());
+        cmd.env("SC_INSTANCE_PORT", (49000 + (std::process::id() % 500) as u16 + n).to_string());
+        let log = run_dir().join(format!("{tag}.log"));
+        let errf = std::fs::File::create(&log).expect("建子进程日志");
+        cmd.arg(doc).stdout(Stdio::null()).stderr(Stdio::from(errf));
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        Kid(cmd.spawn().expect("启动 app"))
+    }
+
+    fn read_dump(path: &Path, secs: u64) -> String {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("{} 秒内没等到 dump：{}", secs, path.display());
+    }
+
+    /// 甲持锁 → 乙的绘制里必须出现 locked；甲放锁 → 乙再画就没有该标记。
+    /// 不能用「自己 my_lock 的 dump」冒充：这里跨两个进程、走真实租约协议。
+    #[test]
+    fn another_participants_lock_is_drawn_then_disappears_after_release() {
+        let doc = run_dir().join("ui_lock_other.xlsx");
+        {
+            let mut wb = sheetcore::model::Workbook::new_blank();
+            for r in 0..4u32 {
+                wb.sheet_mut(0).set(r, 0, sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text(format!("项目{}", r + 1).into()),
+                    formula: None,
+                });
+                wb.sheet_mut(0).set(r, 1, sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Number(r as f64 * 10.0),
+                    formula: None,
+                });
+            }
+            sheetcore::xlsx::save(&doc, &wb).expect("造样本");
+        }
+        let a_dump = run_dir().join("A.dump");
+        let b1_dump = run_dir().join("B1.dump");
+        let b2_dump = run_dir().join("B2.dump");
+        for f in [&a_dump, &b1_dump, &b2_dump] {
+            let _ = std::fs::remove_file(f);
+        }
+
+        // 甲：宿主 + 占住 (1,1)，20 秒后自己放锁
+        let mut a = spawn("A", &doc, &[
+            ("SC_AUTO_SHARE", "1"),
+            ("SC_LOCK", "1"),
+            ("SC_LOCK_CELL", "1,1"),
+            ("SC_LOCK_RELEASE_SECS", "30"),
+            ("SC_DUMP", &a_dump.to_string_lossy()),
+            ("SC_DUMP_AT", "10"),
+        ]);
+        let a_txt = read_dump(&a_dump, 40);
+        assert!(a_txt.contains("lock (1,1) mine=true"), "甲没能占住 (1,1)：\n{a_txt}");
+
+        // 乙：同一份文档，自动发现甲并加入，15 秒时落一帧
+        let mut b1 = spawn("B1", &doc, &[
+            ("SC_AUTO_SHARE", "1"),
+            ("SC_DUMP", &b1_dump.to_string_lossy()),
+            ("SC_DUMP_AT", "12"),
+        ]);
+        let b1_txt = read_dump(&b1_dump, 70);
+        assert!(
+            b1_txt.contains("locked (1,1) by="),
+            "乙的绘制里没有别人持锁的标记：\n{b1_txt}"
+        );
+        assert!(!b1_txt.contains("lock (1,1) mine=true"), "乙不该认为锁是自己的");
+        b1.kill_now();
+
+        // 甲已在 20 秒放锁；乙再来一帧，必须没有标记（同一连接、同一绘制路径的阴性对照）
+        let mut b2 = spawn("B2", &doc, &[
+            ("SC_AUTO_SHARE", "1"),
+            ("SC_DUMP", &b2_dump.to_string_lossy()),
+            ("SC_DUMP_AT", "25"),
+        ]);
+        let b2_txt = read_dump(&b2_dump, 60);
+        assert!(b2_txt.contains("pane readonly="), "乙2 根本没画表格：\n{b2_txt}");
+        assert!(
+            !b2_txt.contains("locked (1,1)"),
+            "甲已放锁，乙2 仍在画锁定标记：\n{b2_txt}"
+        );
+
+        b2.kill_now();
+        a.kill_now();
+        let _ = std::fs::remove_file(&doc);
+    }
 }
 

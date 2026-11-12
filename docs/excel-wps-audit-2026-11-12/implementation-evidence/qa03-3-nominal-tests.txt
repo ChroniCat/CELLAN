@@ -1,0 +1,90 @@
+QA-03.3 端口冲突与名义测试
+===========================
+日期：2026-11-12 UTC+08   运行环境：source scripts/audit_env.sh（隔离 TEMP/TMP/LOCALAPPDATA，清空 SC_*）
+
+一、三个缺陷与证据
+------------------
+
+### 1) net::presence_tests::welcome_lists_the_host_as_a_peer 端口被占时静默通过
+
+原代码写死 `let port: u16 = 7987;`，bind 失败就 `eprintln!("跳过…"); return;` ——
+harness 记成 pass。RED（先用 python 占住 7987 再跑）：
+
+    test net::presence_tests::welcome_lists_the_host_as_a_peer ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 0.00s
+
+`finished in 0.00s` 就是证据：一个 300ms 睡眠 + 连服务器 + 等 Welcome 的用例不可能 0.00s 结束，
+它压根没跑。修复后（7987 仍被占）：
+
+    pub(super) fn free_port() -> u16          // 127.0.0.1:0 让系统分配
+    pub(super) fn host_for_test(...)          // 抢不到就换端口重试 8 次，用尽 panic
+    test net::presence_tests::welcome_lists_the_host_as_a_peer ... ok
+    test net::tests::host_and_client_exchange_ops ... ok
+    test net::tests::right_password_connects ... ok
+    test net::tests::wrong_password_is_denied ... ok
+    test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 135 filtered out; finished in 0.31s
+
+同一批用例从 0.00s 变成 0.31s，说明真的建了连接；三个写死端口 17881/17882/17883 一并改掉。
+
+### 2) core/tests/pivot_real.rs::pivot_parts_are_well_formed 是空壳
+
+原实现只有三行：断言「另一个用例的产物文件存在」→ 删掉它；并且 `#[ignore]`，从来不跑。
+重写为自建夹具（内存里造 部门/金额 四行 → save → 计算透视 → write_to → attach），
+断言六件事：
+
+1. zip 里存在 pivotCacheDefinitionN.xml / pivotTables/pivotTable1.xml
+2. [Content_Types].xml 用 **正确的 ContentType** 声明这两个部件（解析 Override，不做字符串猜测）
+3. xl/pivotTables/_rels/pivotTable1.xml.rels 指向 pivotCacheDefinition
+4. 两个部件都能被 quick_xml 逐事件读到 EOF，根元素分别为 pivotCacheDefinition / pivotTableDefinition
+5. cacheDefinition 的 worksheetSource 表名/字段名与工作簿一致
+6. workbook.xml 登记了 cacheId，且文件能被 xlsx::load 读回
+
+mutation 检查（证明它抓得住）：把 pivot_xml.rs 的 ContentType 后缀改成 `pivotTable_MUTANT`：
+
+    test pivot_parts_are_well_formed ... FAILED
+    assertion `left == right` failed: 透视表的 ContentType 不对：
+    {"/xl/pivotTables/pivotTable1.xml": "...spreadsheetml.pivotTable_MUTANT+xml", ...}
+
+恢复后 `test result: ok. 1 passed`。第一次 mutation 只改 PartName 时用例仍通过——
+说明当时的断言只查了「部件被声明」，查不出类型写错，已补强。
+
+### 3) ui_regression::locked_cell_is_marked 只断言单元格文字
+
+原注释写着「单机无网络时不产生锁，dump 里没有 locked 行是正常的」，实际只断言 `研发` 两个字，
+且 `#[ignore]`（依赖 tests/test-work/table.xlsx）。
+现在：自建夹具 + `SC_AUTO_SHARE=1` 起真实宿主（回环 socket，日志 `[net] 已共享…`）+
+`SC_LOCK=1 SC_LOCK_CELL=1,1` 走一遍 LockReq/LockOk 租约协议，dump 新增一行来自
+`my_lock` 的租约记录（只在 SC_DUMP 模式写，不改渲染）。
+
+    test locked_cell_is_marked ... ok        （20.30s，真实起窗 + 连回环 + 拿租约）
+    test result: ok. 9 passed; 0 failed; 8 ignored
+
+断言：dump 含 `lock (1,1) mine=true ttl_ms=…`；且**没有** `locked (1,1)`
+（自己的租约不能被画成「别人正在编辑」）。手工运行同一组 env 的 stderr：
+
+    [net] 已共享，同事可加入：192.168.3.232:7878
+    [lock] granted site=15701 cell=(1,1)
+    [dbg] t=20s 写 dump: ...
+
+过程中踩到的坑记录在此：测试里不能再自己调 `serial()`，`dump_for` 内部已经取同一把
+非重入 Mutex —— 自锁会挂到超时（表现为 "test ... " 后无输出）。
+
+二、当前结果
+------------
+
+    cargo test -p app --test ui_regression -- --test-threads=1
+    test result: ok. 9 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 47.59s
+
+    cargo test -p app --bin app -- --test-threads=1
+    test result: ok. 139 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+
+    cargo test -p sheetcore --test pivot_real pivot_parts_are_well_formed
+    test result: ok. 1 passed; 0 failed; 0 ignored
+
+剩下 8 个 ignored 仍是「缺 tests/test-work 外部夹具」的老用例（grid/图标/图片/文本框等），
+不在本切片范围；逐个改成自建夹具属 QA-03 后续补项，不在此冒充通过。
+
+三、未执行
+----------
+- 真实多机协作（两台物理机不同 LAN）未做：本切片只用回环 + 单进程宿主。
+- 端口被真正占用（非重试换端口）时的用户可见提示：属 UI-14 网络面板，不在本切片。
