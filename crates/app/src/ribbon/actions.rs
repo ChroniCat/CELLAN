@@ -663,6 +663,7 @@ impl SheetApp {
                 self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
             }
             "WatchWindow" => self.watch_open = true,
+            "HeaderFooter" => self.hf_dlg = true,
             "NameManager" => self.name_mgr = true,
 
             // ---------------------------------------------------- 数据

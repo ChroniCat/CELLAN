@@ -319,6 +319,9 @@
 
       <!-- ======================================================== 插入 -->
       <tab id="TabInsert" label="插入" keytip="N">
+        <group id="GroupText" label="文本">
+          <button id="HeaderFooter" label="页眉和页脚" size="large" imageMso="Sheet" onAction="HeaderFooter"/>
+        </group>
         <group id="GroupHyperlink" label="链接">
           <button id="Hyperlink" label="超链接" size="large" imageMso="Link" onAction="Hyperlink"/>
         </group>

@@ -420,6 +420,8 @@ struct SheetApp {
     manual_calc: bool,
     /// 监视窗口
     watch_open: bool,
+    /// 页眉页脚对话框
+    hf_dlg: bool,
     /// 撤销/重做
     undo: sheetcore::undo::UndoStack,
     /// 标签页：与 active_tab 一一对应，Active 那个的数据在 self 上
@@ -819,6 +821,7 @@ impl SheetApp {
             zoom_dlg: None,
             manual_calc: false,
             watch_open: false,
+            hf_dlg: false,
             tabs: vec![TabSlot::Active],
             active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
@@ -8607,6 +8610,57 @@ impl SheetApp {
     }
 
     /// 列宽/行高对话框（表头右键 → 列宽…/行高…）
+    /// 页眉和页脚
+    fn header_footer_dialog(&mut self, ctx: &egui::Context) {
+        if !self.hf_dlg {
+            return;
+        }
+        let mut open = true;
+        let mut ok = false;
+        let mut header = self.wb.sheet(self.sheet_idx).page.header.clone();
+        let mut footer = self.wb.sheet(self.sheet_idx).page.footer.clone();
+        ui_kit::window(ctx, "页眉和页脚", 420.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                dlg_section(ui, "页眉");
+                ui.add(
+                    egui::TextEdit::singleline(&mut header)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如：&L左&中&R右"),
+                );
+                dlg_section(ui, "页脚");
+                ui.add(
+                    egui::TextEdit::singleline(&mut footer)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如：第 &P 页，共 &N 页"),
+                );
+                ui.label(
+                    egui::RichText::new("可用代码：&L 左、&C 中、&R 右、&P 页码、&N 总页数、&D 日期")
+                        .size(10.5)
+                        .weak(),
+                );
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.page.header = header;
+            sh.page.footer = footer;
+            self.wb.dirty = true;
+            self.hf_dlg = false;
+            self.status = "已更新页眉页脚".into();
+        } else if !open {
+            self.hf_dlg = false;
+        }
+    }
+
     /// 监视窗口：列出当前表的公式单元格
     fn watch_window(&mut self, ctx: &egui::Context) {
         if !self.watch_open {
@@ -17460,6 +17514,7 @@ impl eframe::App for SheetApp {
         self.about_window(ctx);
         self.zoom_dialog(ctx);
         self.watch_window(ctx);
+        self.header_footer_dialog(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
