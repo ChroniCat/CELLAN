@@ -12795,6 +12795,15 @@ impl SheetApp {
                 }
             }
         }
+        // 自己持有的编辑租约也要能在 dump 里看到：单机自检无法制造「别人锁住」，但
+        // 「这一格被租约占着」是可核查状态，别拿单元格文字冒充锁标记。
+        if dumping {
+            if let Some((ls, lr, lc)) = self.my_lock {
+                if ls == self.sheet_idx && lr == r && lc == c {
+                    dump.push(format!("lock ({r},{c}) mine=true ttl_ms={}", self.locks.ttl_ms));
+                }
+            }
+        }
         if let Some(ov) = ov {
             if let Some(mark) = &ov.icon {
                 icons::draw_icon(painter, rect, mark);

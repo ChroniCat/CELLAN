@@ -1077,6 +1077,26 @@ mod tests {
         Op { sheet: 0, row, col: 0, value: ValueWire::Number(n), formula: None, ts, site }
     }
 
+    /// 让系统分配一个空闲端口（本机回环），不再写死 17881/7987 这类固定端口：
+    /// 端口被占时旧写法会把「起不来」当「跳过」而记成通过。
+    pub(super) fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("取空闲端口");
+        l.local_addr().unwrap().port()
+    }
+
+    /// 起宿主：端口被抢就换一个再试，重试用尽必须 panic（真实失败不能当通过）。
+    pub(super) fn host_for_test(site: u32, name: &str, doc: &str, password: &str) -> (Net, u16) {
+        let mut last = String::new();
+        for _ in 0..8 {
+            let port = free_port();
+            match host(site, name.into(), doc.into(), port, password.into()) {
+                Ok(n) => return (n, port),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        panic!("连续 8 次都没能绑定端口：{last}");
+    }
+
     fn wait_for<F: Fn(&NetEvent) -> bool>(net: &Net, secs: u64, f: F) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(secs);
         while std::time::Instant::now() < deadline {
@@ -1091,8 +1111,7 @@ mod tests {
 
     #[test]
     fn host_and_client_exchange_ops() {
-        let port = 17881;
-        let host_net = host(1, "A".into(), "doc".into(), port, String::new()).expect("host");
+        let (host_net, port) = host_for_test(1, "A", "doc", "");
         host_net.broadcast_op(op(0, 1.0, 1, 1));
 
         let client = join(
@@ -1116,8 +1135,7 @@ mod tests {
 
     #[test]
     fn wrong_password_is_denied() {
-        let port = 17882;
-        let _host = host(1, "A".into(), "doc".into(), port, "secret".into()).expect("host");
+        let (_host, port) = host_for_test(1, "A", "doc", "secret");
         let client = join(
             2,
             "B".into(),
@@ -1134,8 +1152,7 @@ mod tests {
 
     #[test]
     fn right_password_connects() {
-        let port = 17883;
-        let _host = host(1, "A".into(), "doc".into(), port, "secret".into()).expect("host");
+        let (_host, port) = host_for_test(1, "A", "doc", "secret");
         let client = join(
             2,
             "B".into(),
@@ -1154,19 +1171,15 @@ mod tests {
 #[cfg(test)]
 mod presence_tests {
     use super::*;
+    use super::tests::host_for_test;
 
     /// 新加入的人必须能在 Welcome 里看到宿主（以前宿主不登记自己，
     /// 刚加入的人只看到自己一个人 = 用户说的「显示不出另一台在线」）。
     #[test]
     fn welcome_lists_the_host_as_a_peer() {
-        let port: u16 = 7987;
-        let host_net = match host(11, "宿主".into(), "doc".into(), port, String::new()) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("跳过：端口 {port} 起不来（{e}）");
-                return;
-            }
-        };
+        // 端口由系统分配；绑定失败就换端口重试，重试用尽 panic
+        // ——不再「端口被占就跳过」把没跑当通过。
+        let (host_net, port) = host_for_test(11, "宿主", "doc", "");
         std::thread::sleep(Duration::from_millis(300));
         let client = join(
             22,

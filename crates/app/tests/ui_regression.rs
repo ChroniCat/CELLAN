@@ -164,18 +164,52 @@ fn pictures_are_drawn_at_anchor() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn locked_cell_is_marked() {
-    // 单机时锁不会出现；用 SC_LOCK 让宿主自己占一格，应能看到标记
-    let Some(dump) = dump_for(
-        "tests/test-work/table.xlsx",
-        &[("SC_LOCK", "1"), ("SC_LOCK_CELL", "1,1"), ("SC_LOCK_RELEASE_SECS", "60")],
-        Duration::from_secs(30),
-    ) else {
-        return;
-    };
-    // 单机无网络时不产生锁，dump 里没有 locked 行是正常的；这里只要求能正常渲染
+    // 原来这个用例只断言「单元格文字画出来了」，锁标记根本没检查（且依赖外部夹具从不运行）。
+    // 现在：自建夹具 + SC_AUTO_SHARE 起真实宿主（回环 socket）+ SC_LOCK 走一遍
+    // LockReq/LockOk 租约协议，断言 dump 里出现这一格的租约记录。
+    let src = run_dir().join("ui_lock.xlsx");
+    {
+        let mut wb = sheetcore::model::Workbook::new_blank();
+        {
+            let sh = wb.sheet_mut(0);
+            let rows = [("姓名", "部门"), ("张三", "研发"), ("李四", "财务")];
+            for (r, (a, b)) in rows.iter().enumerate() {
+                sh.set(r as u32, 0, sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text((*a).into()),
+                    formula: None,
+                });
+                sh.set(r as u32, 1, sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text((*b).into()),
+                    formula: None,
+                });
+            }
+        }
+        sheetcore::xlsx::save(&src, &wb).expect("造样本");
+    }
+    let dump = dump_for(
+        &src.to_string_lossy(),
+        &[
+            ("SC_AUTO_SHARE", "1"),
+            ("SC_LOCK", "1"),
+            ("SC_LOCK_CELL", "1,1"),
+            ("SC_LOCK_RELEASE_SECS", "60"),
+            ("SC_DUMP_AT", "20"),
+        ],
+        Duration::from_secs(40),
+    )
+    .expect("应产出 dump");
     assert!(has_cell(&dump, 1, 1, "研发"), "内容没画出来");
+    let lock_line = dump
+        .lines()
+        .find(|l| l.starts_with("lock (1,1) mine=true"))
+        .unwrap_or_else(|| panic!("dump 里没有这一格的编辑租约记录：\n{dump}"));
+    assert!(lock_line.contains("ttl_ms="), "租约记录缺 TTL：{lock_line}");
+    assert!(
+        !dump.lines().any(|l| l.starts_with("locked (1,1)")),
+        "自己持有的租约不应被画成「别人正在编辑」：\n{dump}"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]
