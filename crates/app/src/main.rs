@@ -4785,6 +4785,23 @@ impl SheetApp {
                     sheetcore::formula::ErrKind::from_text(text)
                         .map(Value::Error)
                         .unwrap_or_else(|| Value::Text(text.into()))
+                } else if cell.kind == 3 {
+                    // 从 Excel/WPS 复制的日期：XMLSS 给的是 ISO 文本，不是序列号。
+                    // 按**目标簿的日期体系**重算序列号（1900/1904 差 1462 天），
+                    // 顺手补一个日期格式，否则粘进来是 45293 这样的裸数字。
+                    match sheetcore::clipboard_xmlss::iso_to_serial(self.wb.date_system, text) {
+                        Some((serial, _)) => {
+                            if cell.num_format.trim().is_empty() {
+                                let sid = self.wb.styles.intern(sheetcore::style::CellStyle {
+                                    format: "yyyy-mm-dd".into(),
+                                    ..Default::default()
+                                });
+                                self.wb.sheet_mut(si).set_style(r, c, sid);
+                            }
+                            Value::Number(serial)
+                        }
+                        None => Value::Text(text.into()),
+                    }
                 } else if let Ok(n) = text.replace(',', "").parse::<f64>() {
                     Value::Number(n)
                 } else {
@@ -14127,7 +14144,12 @@ impl SheetApp {
 
     fn reload_charts(&mut self) {
         if let Some(path) = self.wb.path.clone() {
-            if let Ok(all) = sheetcore::charts::load_charts_all(&path, &self.wb.sheets) {
+            if let Ok(all) = sheetcore::charts::load_charts_all_in(
+                &path,
+                &self.wb.sheets,
+                Some(&self.wb.styles),
+                self.wb.date_system,
+            ) {
                 for (idx, sh) in self.wb.sheets.iter_mut().enumerate() {
                     sh.charts = all.get(&(idx as u32)).cloned().unwrap_or_default();
                 }

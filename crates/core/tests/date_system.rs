@@ -296,3 +296,135 @@ fn xls_datetime_mode_survives_a_roundtrip() {
     assert_eq!(back2.date_system, DateSystem::D1900);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn chart_category_axis_uses_the_workbook_date_system() {
+    use sheetcore::charts::{Chart, ChartKind, Series};
+
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.date_system = DateSystem::D1904;
+    let id = wb.styles.intern(sheetcore::style::CellStyle { format: "yyyy-mm-dd".into(), ..Default::default() });
+    // 1904 体系：1 = 1904-01-02，2 = 1904-01-03
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    wb.sheets[0].set(1, 0, Cell { value: Value::Number(2.0), formula: None });
+    wb.sheets[0].set_style(0, 0, id);
+    wb.sheets[0].set_style(1, 0, id);
+
+    let mut ch = Chart {
+        kind: ChartKind::Column,
+        title: String::new(),
+        series: vec![Series {
+            cat_ref: "S!$A$1:$A$2".into(),
+            ..Default::default()
+        }],
+        legend: false,
+        anchor: (0, 0, 10, 10),
+        legend_pos: String::new(),
+        part: String::new(),
+        drawing: String::new(),
+        show_labels: false,
+        ref_fixes: Vec::new(),
+        axis_x: String::new(),
+        axis_y: String::new(),
+        y_min: None,
+        y_max: None,
+    };
+    sheetcore::charts::resolve_series_in(
+        &mut ch,
+        &wb.sheets[0],
+        Some(&wb.styles),
+        wb.date_system,
+    );
+    assert_eq!(ch.series[0].cats, vec!["1904-01-02", "1904-01-03"], "图表分类轴要按日期格式+体系渲染");
+
+    // 同一份数据换成 1900 体系（序列 1 = 1900-01-01）
+    let mut wb2 = wb.clone();
+    wb2.date_system = DateSystem::D1900;
+    let mut ch2 = ch.clone();
+    ch2.series[0].cats.clear();
+    sheetcore::charts::resolve_series_in(&mut ch2, &wb2.sheets[0], Some(&wb2.styles), wb2.date_system);
+    assert_eq!(ch2.series[0].cats, vec!["1900-01-01", "1900-01-02"]);
+}
+
+/// 生成给真实 Excel/WPS 对拍用的夹具（不进常规回归）。路径固定，方便 COM 脚本引用：
+///   %TEMP%\sc_c04_excel\a1904.xlsx / a1900.xlsx
+#[test]
+#[ignore = "生成 Excel/WPS 对拍夹具（人工驱动的实机验收用）"]
+fn make_excel_fixtures() {
+    let dir = std::env::temp_dir().join("sc_c04_excel");
+    let _ = std::fs::create_dir_all(&dir);
+    for (name, sys) in [("a1904.xlsx", DateSystem::D1904), ("a1900.xlsx", DateSystem::D1900)] {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S".into();
+        wb.date_system = sys;
+        let id = wb
+            .styles
+            .intern(sheetcore::style::CellStyle { format: "yyyy-mm-dd".into(), ..Default::default() });
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        wb.sheets[0].set_style(0, 0, id);
+        wb.sheets[0].cols.set(0, 96.0); // 否则 Excel/WPS 里 A 列太窄，日期显示成 #######
+        wb.sheets[0].cols.set(1, 64.0);
+        wb.sheets[0].layout_dirty = true;
+        wb.sheets[0].set(0, 1, Cell { value: Value::Text("保留".into()), formula: None });
+        let p = dir.join(name);
+        sheetcore::xlsx::save(&p, &wb).expect("写夹具");
+        println!("FIXTURE {} {}", p.display(), sys.name());
+    }
+}
+
+/// Excel 另存出来的文件用我们的读端打开：日期体系与序列都不能漂。
+/// 由 COM 脚本先跑，再 `SC_C04_EXCEL_OUT=... cargo test --test date_system excel_saved -- --ignored`
+#[test]
+#[ignore = "需要先由 Excel/WPS 另存出文件（COM 驱动）"]
+fn excel_saved_file_keeps_the_date_system() {
+    let path = std::env::var("SC_C04_EXCEL_OUT").expect("需要 SC_C04_EXCEL_OUT=<Excel 另存的文件>");
+    let wb = sheetcore::xlsx::load(std::path::Path::new(&path)).expect("读 Excel 另存的文件");
+    assert_eq!(wb.date_system, DateSystem::D1904, "Excel 另存后 date1904 丢了");
+    assert_eq!(wb.sheets[0].get(0, 0).unwrap().value.clone(), Value::Number(1.0), "A1 序列漂了");
+    assert_eq!(
+        format_value_in(wb.date_system, &Value::Number(1.0), "yyyy-mm-dd"),
+        "1904-01-02"
+    );
+    // Excel 改了非日期格 B2=7 再另存：证明读的确实是 Excel 写出来的文件
+    assert_eq!(wb.sheets[0].get(1, 1).unwrap().value.clone(), Value::Number(7.0));
+}
+
+/// 新簿 + 自定义数字格式：styles.xml 不能写出非法字体属性。
+/// 实测 `sz val="0"` / `u val="none"` / `strike val="0"` 会让 Excel 16.0 直接拒绝打开整个文件
+/// （COM 报 0x800A03EC），我们自己的读端却读得回来——所以必须断言包内容。
+#[test]
+fn saved_styles_never_emit_zero_font_size_or_val_none() {
+    let dir = std::env::temp_dir().join(format!("sc_c04_font_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    let id = wb
+        .styles
+        .intern(sheetcore::style::CellStyle { format: "yyyy-mm-dd".into(), ..Default::default() });
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    wb.sheets[0].set_style(0, 0, id);
+    let p = dir.join("font.xlsx");
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+    let xml = String::from_utf8(sheetcore::fixups::read_part(&p, "xl/styles.xml").expect("styles.xml"))
+        .expect("utf8");
+    for bad in ["sz val=\"0\"", "u val=\"none\"", "strike val=\"0\""] {
+        assert!(!xml.contains(bad), "styles.xml 里不该出现 {bad}：\n{xml}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 同一套检查用在 Excel 另存出来的 **1900** 文件上：不许被顺手写成 1904。
+#[test]
+#[ignore = "需要先由 Excel/WPS 另存出文件（COM 驱动）"]
+fn excel_saved_1900_file_stays_1900() {
+    let path = std::env::var("SC_C04_EXCEL_OUT_1900").expect("需要 SC_C04_EXCEL_OUT_1900");
+    let wb = sheetcore::xlsx::load(std::path::Path::new(&path)).expect("读 Excel 另存的文件");
+    assert_eq!(wb.date_system, DateSystem::D1900);
+    assert_eq!(wb.sheets[0].get(0, 0).unwrap().value.clone(), Value::Number(1.0));
+    assert_eq!(wb.sheets[0].get(1, 1).unwrap().value.clone(), Value::Number(7.0));
+    assert_eq!(
+        format_value_in(wb.date_system, &Value::Number(1.0), "yyyy-mm-dd"),
+        "1900-01-01"
+    );
+}

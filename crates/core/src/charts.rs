@@ -192,13 +192,23 @@ pub fn load_charts_all(
     path: &Path,
     sheets: &[Sheet],
 ) -> Result<std::collections::HashMap<u32, Vec<Chart>>> {
+    load_charts_all_in(path, sheets, None, crate::model::DateSystem::D1900)
+}
+
+/// 图表分类轴要按本簿的样式与日期体系解析引用区域
+pub fn load_charts_all_in(
+    path: &Path,
+    sheets: &[Sheet],
+    styles: Option<&crate::style::StyleTable>,
+    sys: crate::model::DateSystem,
+) -> Result<std::collections::HashMap<u32, Vec<Chart>>> {
     let targets = crate::patch::sheet_targets(path)?;
     let mut out = std::collections::HashMap::new();
     for (idx, (name, _)) in sorted_targets(&targets).into_iter().enumerate() {
         if let Ok(mut list) = load_charts(path, &name) {
             if let Some(sh) = sheets.get(idx) {
                 for ch in list.iter_mut() {
-                    resolve_series(ch, sh);
+                    resolve_series_in(ch, sh, styles, sys);
                 }
             }
             if !list.is_empty() {
@@ -655,25 +665,32 @@ impl Chart {
 
 /// 用表里的实际值回填（图表只写了区间引用、没有缓存值的时候）
 pub fn resolve_series(chart: &mut Chart, sheet: &Sheet) {
+    resolve_series_in(chart, sheet, None, crate::model::DateSystem::D1900)
+}
+
+pub fn resolve_series_in(
+    chart: &mut Chart,
+    sheet: &Sheet,
+    styles: Option<&crate::style::StyleTable>,
+    sys: crate::model::DateSystem,
+) {
     for s in chart.series.iter_mut() {
         if !s.name_ref.is_empty() && s.name.is_empty() {
-            if let Some(cells) = read_ref(sheet, &s.name_ref) {
+            if let Some(cells) = read_ref_in(sheet, &s.name_ref, styles, sys) {
                 if let Some((_, v)) = cells.first() {
                     s.name = v.clone();
                 }
             }
         }
         if !s.cat_ref.is_empty() && s.cats.is_empty() {
-            if let Some(cells) = read_ref(sheet, &s.cat_ref) {
+            if let Some(cells) = read_ref_in(sheet, &s.cat_ref, styles, sys) {
                 s.cats = cells.iter().map(|(_, v)| v.clone()).collect();
             }
         }
         if !s.val_ref.is_empty() && s.vals.is_empty() {
-            if let Some(cells) = read_ref(sheet, &s.val_ref) {
-                s.vals = cells
-                    .iter()
-                    .filter_map(|(_, v)| v.trim().parse::<f64>().ok())
-                    .collect();
+            // 值轴拿原始数值；分类/名称才用显示文本
+            if let Some(cells) = read_ref_numbers(sheet, &s.val_ref) {
+                s.vals = cells.into_iter().map(|(_, v)| v).collect();
             }
         }
     }
@@ -681,6 +698,11 @@ pub fn resolve_series(chart: &mut Chart, sheet: &Sheet) {
 
 /// "'表名'!$A$2:$A$5" → [(行列, 显示值)]
 fn read_ref(sheet: &Sheet, r: &str) -> Option<Vec<((u32, u32), String)>> {
+    read_ref_in(sheet, r, None, crate::model::DateSystem::D1900)
+}
+
+/// "Sheet1!$B$2:$B$5" → 逐格坐标（按行优先）
+fn ref_cells(r: &str) -> Option<Vec<(u32, u32)>> {
     let tail = match r.rsplit_once('!') {
         Some((_, t)) => t,
         None => r,
@@ -695,12 +717,54 @@ fn read_ref(sheet: &Sheet, r: &str) -> Option<Vec<((u32, u32), String)>> {
     let mut out = Vec::new();
     for rr in r1.min(r2)..=r1.max(r2) {
         for cc in c1.min(c2)..=c1.max(c2) {
-            let v = sheet
-                .get(rr, cc)
-                .map(|c| c.value.display())
-                .unwrap_or_default();
+            out.push((rr, cc));
+        }
+    }
+    Some(out)
+}
+
+/// 值轴专用：取**原始数值**，不做数字格式化。
+///
+/// 显示文本会把 `1234.5` 变成 "1,234.50"、`0.125` 变成 "12.50%"、日期变成 "1904-01-02"，
+/// 这些再 `parse::<f64>()` 全都失败——旧实现就是这样把整段系列点丢掉的。
+fn read_ref_numbers(sheet: &Sheet, r: &str) -> Option<Vec<((u32, u32), f64)>> {
+    let mut out = Vec::new();
+    for (rr, cc) in ref_cells(r)? {
+        let Some(cell) = sheet.get(rr, cc) else { continue };
+        let v = match &cell.value {
+            crate::model::Value::Number(n) => Some(*n),
+            // 文本里存的数字仍然可画，按字面解析；带 % 或货币符号的文本不算数
+            crate::model::Value::Text(t) => t.trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        if let Some(v) = v {
             out.push(((rr, cc), v));
         }
+    }
+    Some(out)
+}
+
+/// 从工作表读引用区域的**显示文本**。日期轴/分类轴必须按单元格自己的数字格式
+/// 和本簿的日期体系渲染，否则 1904 簿的日期分类会显示成裸序列（或差 1462 天）。
+fn read_ref_in(
+    sheet: &Sheet,
+    r: &str,
+    styles: Option<&crate::style::StyleTable>,
+    sys: crate::model::DateSystem,
+) -> Option<Vec<((u32, u32), String)>> {
+    let mut out = Vec::new();
+    for (rr, cc) in ref_cells(r)? {
+        let v = sheet
+            .get(rr, cc)
+            .map(|c| match styles {
+                Some(t) if !matches!(c.value, crate::model::Value::Empty) => {
+                    let fmt = &t.get(sheet.style_of(rr, cc)).format;
+                    crate::style::format_value_in(sys, &c.value, fmt)
+                }
+                _ => c.value.display(),
+            })
+            .unwrap_or_default();
+        out.push(((rr, cc), v));
     }
     Some(out)
 }

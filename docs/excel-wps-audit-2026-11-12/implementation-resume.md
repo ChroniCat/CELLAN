@@ -1,42 +1,38 @@
-## 当前状态（最后更新：2026-11-13 UTC+08，C02 之后）
+# 恢复记录
 
-- 分支 `main`，跟踪 `origin/main`
-- 已验收：任务 **6/61**（UI-02、C13、QA-03、C03、C01、C02）；切片 **17/148**
-- 待验收：UI-01（真实中文输入法与硬件键盘未执行）
-- 基线（round11 实测，与本状态同一代码）：
-  - sheetcore **60 个测试二进制 / 525 passed / 0 failed / 34 ignored**，EXIT=0
-  - app 单测 **141 passed / 0 failed**，EXIT=0
-  - GUI `ui_regression` **12 passed / 0 failed / 8 ignored**（round10 值，C02 只动 core）
-- 工具链：`C:/Users/Administrator/.cargo/bin/cargo.exe`；`source scripts/audit_env.sh <标签>`
+- 分支 `main`（`origin/main`），HEAD `cf42c1d` + 本轮未提交改动（C04 全量）。
+- 台账：5 已验收 / 3 待验收 / 53 待实施；切片 14 已验收 / 7 待验收 / 127 待实施。
+  C02 待复核（14 pass、6 处变异已抓）；C04 待复核（本轮）。
 
-## C01.2 / C01.3 关键结论（不要重复踩）
+## 本轮（C04 1900/1904，复核 02:02 + 02:22 后）
 
-- XLS FORMULA 缓存布局：**高两字节 num[6..8] == 0xFFFF** 才是特殊值（num[0]=类型、num[2]=取值）；
-  低两字节可以正好是 0xFFFF（1.0000000000145517），按低字判断会整格丢数。
-- 写端也必须用高字节标号；旧写法 Excel 会读成 NaN。
-- FORMULA 的字符串结果在随后的 **STRING 记录**（0x0207）里，之前完全没解析。
-- 增量 vs 全量：`recalc_dirty(wb, &deps, &[(sheet,row,col)])`，`Deps::build(&wb)`，CellKey 是元组。
+已核实真值：
+- `array_shape` 14 passed / 0 failed，EXIT=0（在**恢复后的源码**上跑，diff 无 mutation 残留）。
+- `save_failure_injection` 11 passed / 0 failed / 1 ignored，EXIT=0（round16_sfi）。
+- `date_system` 10 passed / 2 ignored；`date_system_shared` 8 passed。
+- round16：core 62 bins / 546 passed / 0 failed / 37 ignored；app 141；GUI 12 passed / 8 ignored。
 
-## C02 关键结论（不要重复踩）
+本轮修的两个复核问题：
+1. `clipboard_xmlss::iso_to_serial` 原来丢掉 `T` 后的时间 → 中午变午夜。现按 `hh:mm[:ss[.ms]]`
+   折成一天的小数，1904/1900 两侧都有"带时间"断言，普通数字仍不当日期。
+2. `charts::resolve_series_in` 的值轴原来走格式化文本再 `parse::<f64>()`，
+   `1,234.50` / `12.50%` / `$5.00` / 日期格式全部 parse 失败 → 系列点整段丢失。
+   新增 `read_ref_numbers` 取原始数值；分类/名称仍用显示文本。回归断言 4 格带
+   千分位/百分比/货币/日期格式时 vals 原值不变、点数 4。
 
-- 二元运算操作数必须保留 (rows, cols)：`operand_block`；广播按两个维度判，不能只比元素个数
-  （2×2 与 1×4 元素数相同但 Excel 报 #VALUE!）。
-- `Sheet::set` 会把被写的格从 `spilled` 摘掉 —— 溢出区里的用户输入靠这个存活，
-  否则 `clear_spills` 会把它当旧溢出值删掉再被数组覆盖（已加变异回归）。
-- 溢出值不落盘，只存锚点公式；重开后要 `recalc_all` 才看得到子格。
+另：实机验收发现写包缺陷——字体无条件 `set_size(0)`/`set_underline("none")`/
+`set_strikethrough(false)` 产生 `<sz val="0"/>` 等非法值，**Excel 16.0 拒绝打开**。
+已改为只写设置过的属性，并加 styles.xml 断言。
 
-## 下一步（按依赖优先级）
+实机结果文件（可核对）：`implementation-evidence/c04-probe/probe-result.json` +
+两份夹具 + 两份 Excel 另存件；Excel 16.0 / WPS 12.0 的 Date1904、A1 显示、另存不漂移全部记录。
 
-1. **UI-01 收尾**：真实中文输入法（组合中取消、候选窗上屏）与真实硬件键盘的 Alt+Enter 光标位置。
-   必须真机人工执行，事件注入不算；做完前 UI-01 保持待验收。
-2. 之后按 `task-index.md` 的 P0 顺序推进未开工任务（C 系列 → UI 系列 → QA 系列），
-   每完成一个切片就写证据 + 更新台账 + 提交；父任务只在全部切片与整体验收通过后才标已验收。
+## 下一步
+- 提交本轮（C04 修复 + 证据 + 台账）。
+- 继续任务队列：按 task-index 选下一个可执行切片（UI-01 真实 IME/键盘仍阻塞在硬件取证）。
+- C04 未执行项：真实剪贴板 E2E（Excel 复制 → 应用粘贴）、1904 的 .xls 与两款软件互通。
 
-## 尚未解决的风险 / 未执行
-
-- 物理断电不可模拟（用保存阶段强杀进程代替，边界已在证据里写明）
-- 真实 IME、硬件键盘、DPI、打印、Excel/WPS 对拍、跨机 LAN 协作：未执行
-- 8 个 GUI 用例仍依赖 `tests/test-work` 外部夹具（ignored）
-- 窗口关闭时 dirty 文档无保存提示：既有缺口，登记后续
-- 网格级 Ctrl+C/X/V/F/H 未进命令表（留 UI-06/07）
-- Supabase 生产数据只读、未接触
+## 风险
+- Excel COM 打开文件必须用**反斜杠**原生路径；用 `F:/...` 会报 0x800A03EC，
+  容易误判成文件损坏。
+- 刚写出的文件立刻被 Excel 打开偶尔失败，probe 脚本已带 4 次重试。

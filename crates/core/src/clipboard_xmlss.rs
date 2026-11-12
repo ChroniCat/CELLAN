@@ -38,6 +38,42 @@ pub struct Style {
     pub halign: u8,
 }
 
+/// XMLSS 的 `<Data ss:Type="DateTime">1904-01-02T00:00:00</Data>` → 目标簿的序列号。
+///
+/// 跨工作簿复制日期**不能**照搬数字：1900 簿的 1 是 1900-01-01，1904 簿的 1 是 1904-01-02，
+/// 差 1462 天。所以按 ISO 日期 + **目标簿的日期体系**重新算序列号；普通数字原样保留。
+pub fn iso_to_serial(sys: crate::model::DateSystem, iso: &str) -> Option<(f64, (i32, u32, u32))> {
+    let s = iso.trim();
+    let (date_part, time_part) = match s.find(['T', ' ']) {
+        Some(i) => (&s[..i], s[i + 1..].trim()),
+        None => (s, ""),
+    };
+    let mut it = date_part.split('-');
+    let y: i32 = it.next()?.parse().ok()?;
+    let m: u32 = it.next()?.parse().ok()?;
+    let d: u32 = it.next()?.parse().ok()?;
+    let serial = crate::formula::date_to_serial_in(sys, y, m, d)?;
+    // 时间部分必须保留：XMLSS 的 DateTime 是完整时间戳，
+    // "2024-03-01T12:00:00" 是中午，丢掉就成了午夜（差 0.5 天）。
+    Some((serial + time_fraction(time_part)?, (y, m, d)))
+}
+
+/// "12:34:56.789" → 0.5242683…（一天的分数）；空串 → 0；格式不对 → None
+fn time_fraction(t: &str) -> Option<f64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return Some(0.0);
+    }
+    let mut parts = t.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let mi: f64 = parts.next()?.parse().ok()?;
+    let sec: f64 = parts.next().unwrap_or("0").parse().ok()?;
+    if !(0.0..24.0).contains(&h) || !(0.0..60.0).contains(&mi) || !(0.0..61.0).contains(&sec) {
+        return None;
+    }
+    Some((h * 3600.0 + mi * 60.0 + sec) / 86_400.0)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Cell {
     /// 显示值（数值会保留原始文本，便于回退）

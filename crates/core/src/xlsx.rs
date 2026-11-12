@@ -1386,9 +1386,18 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 let f = s.get_font_mut();
                 f.set_bold(st.bold);
                 f.set_italic(st.italic);
-                f.set_underline(if st.underline { "single" } else { "none" });
-                f.set_strikethrough(st.strikethrough);
-                f.set_size(st.size as f64);
+                // 只写真正设置过的字体属性：umya 对 set_underline("none") / set_strikethrough(false)
+                // 会写成 <u val="none"/> / <strike val="0"/>，set_size(0) 写 <sz val="0"/>，
+                // 这三样都不合 OOXML 约束，Excel 直接拒绝打开整个文件（0x800A03EC）。
+                if st.underline {
+                    f.set_underline("single");
+                }
+                if st.strikethrough {
+                    f.set_strikethrough(true);
+                }
+                if st.size >= 1.0 {
+                    f.set_size(st.size as f64);
+                }
                 // 字体名：空串表示默认字体，不碰原文件的字体（避免把 Calibri 写成别的）
                 if !st.font.is_empty() {
                     f.set_name(st.font.clone());

@@ -341,17 +341,32 @@
    "scope": "core/model.rs, xlsx.rs, style.rs, formula/functions.rs",
    "source": "core-requirements.md",
    "heading": "C04 P0 1900与1904日期体系",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "待验收",
+   "acceptance": "日期函数/格式化/条件格式/数据验证/透视日期分组/图表轴共用工作簿基准（1900/1904）；xlsx 写 date1904、xls 写 DATEMODE 且存盘重开不漂；Excel 16.0 与 WPS 12.0 打开我们写的 1904/1900 簿显示正确，Excel 改非日期格另存后 flag 与序列不漂、我们的读端能读回；跨簿粘贴 ISO 日期按目标体系重算并保留时间小数，普通数字不偏移；写包不再产生 Excel 拒绝的字体属性。",
+   "files": [
+    "crates/core/src/model.rs,crates/core/src/formula/functions.rs,crates/core/src/formula/mod.rs,crates/core/src/xlsx.rs,crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/src/style.rs,crates/core/src/charts.rs,crates/core/src/clipboard_xmlss.rs,crates/app/src/main.rs,crates/core/tests/date_system.rs,crates/core/tests/date_system_shared.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p sheetcore --test date_system (10 passed / 2 ignored, EXIT=0)",
+    "cargo test -p sheetcore --test date_system_shared (8 passed, EXIT=0)",
+    "cargo test -p sheetcore --test date_system -- --ignored make_excel_fixtures (1 passed)",
+    "powershell -File scratch/c04_excel_probe2.ps1 <dir> -> Excel 16.0 / WPS 12.0 结果，落盘 probe-result.json",
+    "SC_C04_EXCEL_OUT=... cargo test --test date_system -- --ignored excel_saved (2 passed, EXIT=0)",
+    "round16: sfi 11/0/1 EXIT=0; core 62 bins 546 passed/0 failed/37 ignored EXIT=0; app 141 EXIT=0; gui 12/8 EXIT=0"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/probe-result.json"
+   ],
+   "not_done": [
+    "真实剪贴板端到端（Excel Ctrl+C → 本应用 Ctrl+V）未执行，只有 XMLSS→落格转换层断言",
+    "1904 的 .xls 与 Excel/WPS 互通未实机验证（仅自家 DATEMODE 往返）"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "等复核；如需，补真实剪贴板 E2E 与 Excel 生成的 CF/DV 1904 文件",
+   "updated_utc": "2026-11-12T18:26:24Z",
    "slices": [
     {
      "id": "C04.1",
@@ -359,17 +374,23 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "xlsx 读 `workbookPr/@date1904`、写 set_date1904；xls 读写 DATEMODE（就地改，不追加）；存盘重开基准与序列不漂。",
+     "files": [
+      "crates/core/src/xlsx.rs,crates/core/src/xls_read.rs,crates/core/src/xls_write.rs,crates/core/src/patch.rs,crates/core/src/model.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test date_system saving_a_1904 / a_1900_workbook / xls_datetime_mode"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T18:26:24Z"
     },
     {
      "id": "C04.2",
@@ -377,17 +398,23 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "DATE/DATEVALUE/YEAR/MONTH/DAY/TEXT、日期减法、数字格式化、NOW/TODAY 都按工作簿基准；CF/DV 的 DATE() 字面量、透视按年/月分组同样按基准。",
+     "files": [
+      "crates/core/src/formula/functions.rs,crates/core/src/formula/mod.rs,crates/core/src/style.rs,crates/core/src/cf.rs,crates/core/src/dv.rs,crates/core/src/pivot.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
+     "commands": [
+      "cargo test -p sheetcore --test date_system_shared"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt"
+     ],
      "not_done": [],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T18:26:24Z"
     },
     {
      "id": "C04.3",
@@ -395,17 +422,27 @@
      "priority": "P0",
      "acceptance_source": "core-requirements.md / C04 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "待验收",
+     "acceptance": "图表分类轴按体系显示日期、值轴取原始数值（格式化不吞点）；跨簿粘贴日期按目标体系重算并保留时间，普通数字不变；Excel 另存后两款软件打开不漂移。",
+     "files": [
+      "crates/core/src/charts.rs,crates/core/src/clipboard_xmlss.rs,crates/app/src/main.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p sheetcore --test date_system chart_category_axis",
+      "cargo test -p sheetcore --test date_system_shared chart_values / xmlss_datetime"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-date-system.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/c04-probe/probe-result.json"
+     ],
+     "not_done": [
+      "真实剪贴板 E2E 未执行"
+     ],
      "failures": [],
      "blocker": "",
      "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "updated_utc": "2026-11-12T18:26:24Z"
     }
    ]
   },

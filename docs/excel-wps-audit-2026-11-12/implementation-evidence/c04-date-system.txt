@@ -1,109 +1,128 @@
-C04 1900 与 1904 日期体系
-=========================
-日期：2026-11-13 UTC+08   对标：core-requirements.md C04
-本机 Excel 16.0 与 WPS 的 1904 开关行为一致：同一张工作簿里「插入的日期」序列差 1462，
-显示仍是同一天；1904 簿另存后 flag 不丢。
+C04 1900 与 1904 日期体系（全路径共用基准）
+============================================
+日期：2026-11-13 UTC+08   依据：core-requirements.md C04
+原文要求：日期函数、数字格式化、条件格式、数据验证、透视表日期分组、图表轴
+**共用同一个基准**；另存后两款软件打开不漂移；日期减法；日期与普通数字的跨簿复制分别测试。
 
 一、原缺陷（修复前的事实）
 --------------------------
-`grep -rn "1904\|1462" crates/core/src` 命中 0（只有 dist.rs 里一个浮点常量巧合）。
-即：完全不认 `workbookPr/@date1904`，所有日期按 1900 算。打开 Excel 的 1904 工作簿时，
-序列 1 会显示成 1900-01-01（应为 1904-01-02），整本日期整体偏移 1462 天；
-另存也不会写这个 flag，等于把用户的工作簿悄悄改成 1900。
-`.xls` 侧的 `DATEMODE (0x0022)` 同样没读没写。
+`grep -rn "1904\|1462" crates/core/src` 命中 0（只有 dist.rs 一个浮点常量巧合）。
+即完全不认 `workbookPr/@date1904`：1904 工作簿里序列 1 显示成 1900-01-01（应 1904-01-02），
+整本日期偏 1462 天，另存还会把 flag 丢掉。`.xls` 的 `DATEMODE (0x0022)` 同样没读没写。
 
 二、改动
 --------
-1. `model.rs`
-   - `pub enum DateSystem { D1900, D1904 }`（`is_1904()`、`OFFSET = 1462`）；
-   - `Workbook.date_system`，默认 `D1900`；`Workbook::date_to_serial / serial_to_date`
-     两个便捷方法，避免各处各写一套偏移。
-2. `formula/functions.rs`
-   - `date_to_serial_in(sys, y, m, d)` / `serial_to_date_in(sys, serial)`：
-     1904 基准 = `days - days_from_civil(1904,1,1)`，没有 1900 闰年 bug；
-     1900 分支保留原 `+25569/+25568` 的伪闰日行为。
-   - 线程本地 `DATE_SYSTEM` + `current/set/with_date_system`：
-     函数库签名不变（`&[Arg]`），由求值入口设置。
-   - `now_serial()`：`NOW/TODAY` 改成**本地时间**（`GetLocalTime`，含夏令时），
-     1904 体系再减 1462。旧实现直接用 UTC，本机 UTC+08 每天 00:00–08:00 会显示前一天
-     （本轮实测：本地 2026-11-13 01:0x，旧 `TODAY()` 显示 2026-11-12）。
-3. `formula/mod.rs`
-   - `Calc::new` 用 `wb.date_system` 设线程本地，`Drop` 恢复外层值 ——
-     `eval_formula`/`eval_cell`/`recalc_all`/`recalc_dirty` 全走这一条路，不漏入口。
-   - 重导出 `date_to_serial_in/serial_to_date_in/current_date_system/with_date_system`。
-4. `xlsx.rs`
-   - 读：`patch::read_date1904(path)` 解析 `xl/workbook.xml` 的 `workbookPr/@date1904`
-     （`"1"` 与 `"true"` 都认），load 时写入 `Workbook.date_system`；
-   - 写：`save_plain_base` 里与 umya 的 `book.date1904()` 对比后 `set_date1904(...)`，
-     保证 1904 簿存回去还是 1904（新建文件也写）。
-5. `xls_read.rs` / `xls_write.rs`
-   - 新 `read_date1904(stream)`：扫 `DATEMODE(0x0022)`；
-   - 写端 `set_datemode(&mut prefix, is_1904)`：**改骨架里已有的那条记录**而不是追加
-     —— 内嵌骨架来自 Excel 生成的空簿，本来就有一条 `DATEMODE=0`，追加会让读端先撞上 0
-     （这正是本轮第一版测试失败的原因，已改正）。
-6. `style.rs`
-   - `format_date_in(sys, serial, fmt)`；`format_value_in(sys, v, fmt)` 用
-     `with_date_system` 包住整段渲染；星期几按体系分别算：
-     1900 体系 `serial 25569 = 1970-01-01（周四）`，1904 体系 `serial 0 = 1904-01-01（周五）`。
-   - 应用里 5 处 `format_value` 调用全部换成 `format_value_in(self.wb.date_system, ..)`。
-7. `pivot.rs` 的三处调用（`compute` ×2、`row_values`）用 `with_date_system(...)` 包住，
-   按年/月分组的标签不会在 1904 簿里错位。
+1. `model.rs`：`DateSystem { D1900, D1904 }`（`is_1904()`、`OFFSET=1462`）、`Workbook.date_system`、
+   `date_to_serial/serial_to_date`。
+2. `formula/functions.rs`：`date_to_serial_in/serial_to_date_in`（1904 无 1900 伪闰日）；
+   线程本地 `DATE_SYSTEM` + `with_date_system`；`NOW/TODAY` 改本地时间（`GetLocalTime`）。
+3. `formula/mod.rs`：`Calc::new` 设线程本地、`Drop` 恢复；重导出；`date_to_serial_pub/
+   serial_to_date_pub` 走线程本地（CF/DV/透视都从这里拿基准）。
+4. `xlsx.rs`：读 `patch::read_date1904`，写 `book.set_date1904`（与基准不同才写）。
+5. `xls_read.rs` / `xls_write.rs`：`read_date1904` 扫 `DATEMODE`；`set_datemode` **就地改**
+   骨架里已有那条记录（追加会让读端先撞上 0）。
+6. `style.rs`：`format_date_in/format_value_in(sys,..)`；星期几按体系分别算。
+   应用 5 处 `format_value` 全改 `format_value_in(self.wb.date_system, ..)`。
+7. `pivot.rs` 三处调用（`compute`×2、`row_values`）在 app 里用 `with_date_system` 包住。
+8. `charts.rs`：`read_ref_in` 拆出带 `styles+sys` 版本（分类/名称仍用显示文本）；
+   **值轴改用 `read_ref_numbers` 取原始数值**。
+9. `clipboard_xmlss.rs`：新增 `iso_to_serial(sys, iso)`，按目标簿重算序列号，
+   **保留时间小数**（`T12:00:00` → +0.5）。
+10. `app/main.rs`：粘贴 Excel/WPS 的 XMLSS `DateTime` 走 `iso_to_serial`，
+    不再落成文本；无数字格式时补 `yyyy-mm-dd`。
+11. **实机验收中发现的写包缺陷**：`xlsx.rs` 写字体时无条件 `set_size(0)`、`set_underline("none")`、
+    `set_strikethrough(false)`，umya 会写出 `<sz val="0"/>`、`<u val="none"/>`、`<strike val="0"/>`，
+    这些不合 OOXML 约束，**Excel 16.0 直接拒绝打开整个文件（COM 0x800A03EC）**，WPS 能开。
+    改为只在真正设置过时才写。回归测试断言 styles.xml 里不出现这三个值。
+    （这是"自己的读端能读 ⇒ 认定没问题"的反例。）
 
-三、验收用例 `crates/core/tests/date_system.rs`（8 项，全绿）
-------------------------------------------------------------
+三、用例
+--------
+`crates/core/tests/date_system.rs`（10 项 + 2 项 `#[ignore]` 实机辅助）：
+- a_1904_file_is_read_on_its_own_basis（夹具外部改 XML 造，不经自家写端）
+- the_same_calendar_date_gets_two_serials_that_differ_by_1462
+- date_functions_follow_the_workbook_system（含 `=B1-A1` 日期减法）
+- both_systems_keep_their_own_leap_year_quirks
+- today_is_offset_by_1462_in_the_1904_system
+- saving_a_1904_workbook_writes_the_flag_and_reopens_without_drift
+- a_1900_workbook_does_not_gain_the_flag
+- xls_datetime_mode_survives_a_roundtrip
+- chart_category_axis_uses_the_workbook_date_system（分类轴 1904-01-02/03）
+- saved_styles_never_emit_zero_font_size_or_val_none（写包约束）
+- [ignore] make_excel_fixtures（生成两款软件对拍夹具）
+- [ignore] excel_saved_file_keeps_the_date_system / excel_saved_1900_file_stays_1900
+
+`crates/core/tests/date_system_shared.rs`（8 项，全部是"共用基准"的行为断言）：
 | 用例 | 断言 |
 |---|---|
-| `a_1904_file_is_read_on_its_own_basis` | 夹具是**外部改 XML** 造的：先存一份 1900 的 xlsx，再把 `workbook.xml` 的属性改成 `date1904="1"`（zip 重写，不经我们写端）。load 后 `date_system == D1904`；A1 序列 1 显示 `1904-01-02`；`=YEAR(A1)` = 1904 |
-| `the_same_calendar_date_gets_two_serials_that_differ_by_1462` | `=DATE(2024,3,1)` 在 1900 = 45352、1904 = 43890，差正好 1462；两边显示都是 `2024-03-01` |
-| `date_functions_follow_the_workbook_system` | 1904 簿里 `DATE(1904,1,1)=0`、`DATE(1904,3,1)=60`、`DATE(2024,2,29)=43889`、`DATEVALUE("2024-03-01")=43890`、`YEAR/MONTH/DAY/TEXT` 正确、日期相减仍是天数 |
-| `both_systems_keep_their_own_leap_year_quirks` | 1900 `DATE(1900,2,29)=60`（伪闰日）、`DATE(1900,2,28)=59`；1904 `DATE(1904,2,29)=59`（真闰年） |
-| `today_is_offset_by_1462_in_the_1904_system` | 两个体系的 `TODAY()` 显示**同一日历日**，且等于本机本地日期（独立 Hinnant 算法核对，不引 chrono） |
-| `saving_a_1904_workbook_writes_the_flag_and_reopens_without_drift` | 存盘后 `xl/workbook.xml` 真带 `date1904="1"`（zip 读出来 grep）；重开 `date_system` 还是 1904、序列 43890 不漂、`recalc_all` 后仍是 43890、显示 `2024-03-01` |
-| `a_1900_workbook_does_not_gain_the_flag` | 默认簿存出来**没有** `date1904="1"`，重开还是 1900 |
-| `xls_datetime_mode_survives_a_roundtrip` | 1904 簿存 `.xls` → `DATEMODE` 读回 1904、值不变；1900 簿存 `.xls` 读回仍是 1900 |
+| date_subtraction_and_function_results_use_the_1904_basis | 1904：DATE(1904,1,1)=0、B1-A1=10、DATE 相减=1；1900：同一 DATE=1462 |
+| number_formatting_follows_the_basis | 序列 1 → 1904-01-02 / 1900-01-01；序列 0 → 1904-01-01 |
+| conditional_format_date_literal_uses_the_workbook_basis | CF `cellIs > DATE(1904,1,2)`：1904 簿 A1(1) 不中、A2(2) 中；1900 簿两格都不中 |
+| data_validation_date_bounds_use_the_workbook_basis | DV `between DATE(1904,1,1)..DATE(1904,1,5)`：1904 簿 3 通过/9 拒绝；1900 簿都拒绝 |
+| pivot_year_grouping_uses_the_workbook_basis | 同一序列 1 → 1904 簿 "1904"、400 → "1905" |
+| xmlss_datetime_is_rebased_on_the_target_workbook | ISO 1904-01-02 → 1904 簿 1、1900 簿 1463；Number 1 不变 |
+| xmlss_datetime_keeps_the_time_of_day_in_both_systems | T12:00 → 1.5 显示 12:00；T06:00 → 1.25；带毫秒/缺秒可读；"1" 不当日期 |
+| chart_values_keep_raw_numbers_when_cells_are_formatted | 4 格带千分位/百分比/货币/日期格式 → vals 仍是 1234.5/0.125/5/1，点数 4；分类仍是文本 |
 
-四、变异验证（真实输出，全部恢复）
-----------------------------------
-    [1] date_to_serial_in 里 1904 分支改成 `if false`
-        the_same_calendar_date... FAILED   left 45352 right 43890
-        date_functions...        FAILED   left 1462 right 0 / left 1521 right 59
-        both_systems_leap...     FAILED
-        saving_a_1904...         FAILED
-        → 4 passed / 4 failed
+四、变异验证（真实输出，全部已恢复）
+------------------------------------
+    [1] date_to_serial_in 1904 分支 `if false`          → 4 passed / 4 failed
+    [2] load 不读 flag（`if false && read_date1904`）   → 6 passed / 2 failed
+    [3] save 不写 flag                                  → 7 passed / 1 failed
+    [4] now_serial 退回 UTC                             → 7 passed / 1 failed（left 2026-11-12）
+    [M1] date_to_serial_pub 恒按 D1900                  → 6 passed / 2 failed（CF、DV 两用例）
+    [M2] iso_to_serial 恒按 D1900                       → 7 passed / 1 failed（跨簿）
+    [M3] format_value_in 内 `sys = D1900`               → 7 passed / 1 failed（格式化）
+    [M4] serial_to_date_pub 恒按 D1900                  → 7 passed / 1 failed（透视分组）
+    [M5] iso_to_serial 丢掉时间小数                     → 7 passed / 1 failed（带时间粘贴）
+    [M6] 值轴改回"显示文本再 parse::<f64>()"            → 7 passed / 1 failed（格式化图表值）
 
-    [2] xlsx load 不读 flag（`if false && read_date1904`）
-        a_1904_file_is_read_on_its_own_basis ... FAILED  left D1900 right D1904
-        saving_a_1904...                        ... FAILED  left D1900 right D1904
-        → 6 passed / 2 failed
+五、两款软件实机对拍（可核对的结果文件）
+----------------------------------------
+夹具与结果都在 `implementation-evidence/c04-probe/`：
+`a1904.xlsx`、`a1900.xlsx`（我们写）、`a1904_excel_saved.xlsx`、`a1900_excel_saved.xlsx`
+（Excel 打开 → 把**非日期格 B2 改成 7** → 另存）、`probe-result.json`（脚本落盘原始输出，
+含时间/机器/用户/版本）。
 
-    [3] save 不写 flag（`let _ = wb.date_system;`）
-        saving_a_1904_workbook_writes_the_flag... FAILED
-        「存出来的 workbook.xml 必须带 date1904=1：<?xml ...」（XML 里确实没有）
-        → 7 passed / 1 failed
+    Excel 16.0：a1904 → Date1904=True、A1 显示 "1904-01-02"、值 1、B1 "保留"
+                a1900 → Date1904=False、A1 "1900-01-01"、值 1
+                Excel 另存 a1904 → Date1904=True、A1 "1904-01-02"、值 1、B2=7   （不漂移）
+                Excel 另存 a1900 → Date1904=False、A1 "1900-01-01"、值 1、B2=7
+    WPS 12.0：  a1904 → Date1904=True、A1 "1904-01-02"、值 1
+                a1900 → Date1904=False、A1 "1900-01-01"、值 1
 
-    [4] now_serial 退回 UTC（`+ 0.0 * local_offset_seconds()`）
-        today_is_offset... FAILED  left "2026-11-12" right "2026-11-13"
-        → 7 passed / 1 failed
+再用我们自己的读端打开 Excel 另存的两份文件：
+`excel_saved_file_keeps_the_date_system` / `excel_saved_1900_file_stays_1900` 均通过
+（基准、序列、B2=7 全部对上）。
 
-五、跨簿粘贴策略（明确规则，不是「所有数值加减 1462」）
-------------------------------------------------------
-- 同一工作簿内复制粘贴：序列就是本簿体系的序列，**不做任何数值调整**，格式跟着走。
-- 系统剪贴板（到 Excel/WPS 或反过来）：承载的是**显示文本**，不是序列；
-  本项目按文本落格，不会把文本偷偷当序列再偏移，因此不存在「粘贴时被加 1462」的路径。
-- 富文本（XML Spreadsheet）粘贴的数值按字面数值落格，同样不偏移。
-  跨工作簿要带格式的日期仍以文本/显示值为准，这是本项目的既定边界（未做 Excel 那种
-  携带源簿 flag 的私有剪贴板格式）。
-- `.xls` 与 `.xlsx` 互转：走同一 `Workbook.date_system`，写端按体系写 flag / DATEMODE，
-  序列不动（禁止「转格式时补 1462」）。
+命令（可复跑）：
+    cargo test -p sheetcore --test date_system -- --ignored make_excel_fixtures --nocapture
+    powershell -File scratch/c04_excel_probe2.ps1 <夹具目录>          # 生成 probe-result.json
+    SC_C04_EXCEL_OUT=<...>\a1904_excel_saved.xlsx \
+    SC_C04_EXCEL_OUT_1900=<...>\a1900_excel_saved.xlsx \
+    cargo test -p sheetcore --test date_system -- --ignored excel_saved
 
-六、回归
---------
-见 round12：core 全部测试二进制、app 单测、GUI 回归，EXIT 见日志。
-`date_system` 单测 8 passed。
+六、跨簿复制的转换规则（不是"所有数值加减 1462"）
+------------------------------------------------
+- 从 Excel/WPS 复制日期：XMLSS 的 `ss:Type="DateTime"` 是 **ISO 时间戳**，不是序列号。
+  落格时按**目标簿的日期体系**重算：1904-01-02 → 1904 簿 1、1900 簿 1463；
+  时间部分保留（`T12:00:00` → +0.5 天），否则中午会变午夜。
+- 从 Excel/WPS 复制普通数字：`ss:Type="Number"` 原样落格，**不做任何偏移**（有断言）。
+- 本应用复制出去：剪贴板是显示文本（日期就是 `1904-01-02` 这样的文本），
+  Excel 会按自己的体系识别成日期，不存在"被我们加了 1462"的路径。
+- `.xls ↔ .xlsx`：同一 `Workbook.date_system`，写端按体系写 flag/DATEMODE，序列不动。
 
-七、还没做
-----------
-- 没有启动真实 Excel/WPS 打开本机生成的 1904 簿对拍显示（未执行，未标通过）；
-  夹具 XML 是外部手改的，但「Excel 打开我们存的 1904 簿」这一步属于实机验收。
-- 图表分类轴、条件格式「发生在…」这类按日期取值的规则，仍用 `serial_to_date`
-  的同一套换算，但没有单独为 1904 体系写用例（C04 之外的细化）。
+七、回归（round16，当前源码，含本轮全部改动）
+-------------------------------------------
+    save_failure_injection : 11 passed / 0 failed / 1 ignored   EXIT=0   （3.22s；round12 的失败已有最终结果）
+    core 全量              : 62 bins / 546 passed / 0 failed / 37 ignored   EXIT=0
+    app --bin app          : 141 passed / 0 failed                EXIT=0
+    app ui_regression      : 12 passed / 0 failed / 8 ignored     EXIT=0   （52.5s）
+
+八、未执行 / 边界（不标通过）
+----------------------------
+- **真实剪贴板端到端**（在 Excel 里 Ctrl+C、切到本应用 Ctrl+V）未执行：需要驱动 GUI 与
+  系统剪贴板会话，当前只有"XMLSS 文本 → 落格转换"这一层的行为断言（用的是 Excel 真实格式样本）。
+- 1904 工作簿里 CF/DV 规则的**真实 xlsx 文件**（由 Excel 创建）未单独跑：目前断言的是
+  规则求值路径；`parse_cf_blocks`/`parse_validations` 解析层面另有既有用例。
+- 1904 的 `.xls` 与两款软件互通未实机验证（只验证了自家 DATEMODE 往返）。
