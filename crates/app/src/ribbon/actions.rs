@@ -916,6 +916,18 @@ impl SheetApp {
                 }
             }
             "TrackChanges" => self.rev_open = true,
+            // 审阅：显示更改（复用修订日志）、批注导航、辅助功能检查器
+            "ShowChanges" => {
+                self.rev_open = true;
+                self.status = "显示更改：列表里点「撤回」可还原".into();
+            }
+            "PrevComment" => self.note_step(false),
+            "NextComment" => self.note_step(true),
+            "ShowComment" => self.note_show(),
+            "A11yChecker" => {
+                self.a11y_scan();
+                self.a11y_open = true;
+            }
             "AutoShare" => self.auto_share = !self.auto_share,
 
             // ---------------------------------------------------- 视图

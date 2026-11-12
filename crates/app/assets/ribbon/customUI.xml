@@ -636,6 +636,14 @@
         </group>
         <group id="GroupComments" label="批注">
           <button id="NewComment" label="新建批注" size="large" imageMso="Comment" onAction="NewComment"/>
+          <box boxStyle="vertical">
+            <button id="PrevComment" label="上一条批注" imageMso="TraceIn" onAction="PrevComment" sizeString="104"/>
+            <button id="NextComment" label="下一条批注" imageMso="TraceOut" onAction="NextComment" sizeString="104"/>
+            <button id="ShowCommentBtn" label="显示批注" imageMso="Comment" onAction="ShowComment" sizeString="104"/>
+          </box>
+        </group>
+        <group id="GroupA11y" label="辅助功能">
+          <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="Grid" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker"/>
         </group>
         <group id="GroupInsertText" label="文本">
           <button id="RichText" label="富文本" size="large" imageMso="FontColor" onAction="RichText"/>
@@ -645,6 +653,7 @@
         </group>
         <group id="GroupChanges" label="修订">
           <button id="ReviewTrackChanges" label="修订记录" size="large" imageMso="Revision" onAction="TrackChanges"/>
+          <button id="ShowChangesBtn" label="显示更改" imageMso="Revision" screentip="逐条查看改动并可撤回" onAction="ShowChanges" sizeString="96"/>
         </group>
         <group id="GroupReviewShare" label="共享">
           <box boxStyle="vertical">

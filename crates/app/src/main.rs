@@ -494,6 +494,9 @@ struct SheetApp {
     /// 切片器面板
     slicer: Option<SlicerUI>,
     fc_dlg: Option<ForecastDlg>,
+    /// 辅助功能检查器：问题列表 + 打开状态
+    a11y_open: bool,
+    a11y_list: Vec<sheetcore::a11y::Issue>,
     st_dlg: Option<SubtotalDlg>,
     ff_dlg: Option<FlashDlg>,
     cs_dlg: Option<ConsDlg>,
@@ -921,6 +924,8 @@ impl SheetApp {
             tb_dlg: None,
             slicer: None,
             fc_dlg: None,
+            a11y_open: false,
+            a11y_list: Vec::new(),
             st_dlg: None,
             ff_dlg: None,
             cs_dlg: None,
@@ -1762,6 +1767,19 @@ impl SheetApp {
                             sheetcore::sparkline::SparkKind::Line,
                         ),
                         Ok("sparkedit") => self.spark_open_edit(),
+                        Ok("a11y") => {
+                            self.a11y_scan();
+                            self.a11y_open = true;
+                            eprintln!(
+                                "[a11y] {} 项：{:?}",
+                                self.a11y_list.len(),
+                                self.a11y_list
+                                    .iter()
+                                    .take(4)
+                                    .map(|i| (i.sheet_name.clone(), i.kind.label(), i.detail.clone()))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
                         Ok("textbox") => {
                             if self.tb_sel.is_none() {
                                 self.tb_sel = Some(0);
@@ -9252,6 +9270,164 @@ impl SheetApp {
         }
         self.status = format!("已创建 {made} 条迷你图");
         Ok(made)
+    }
+
+    // ---------------------------------------------------------------- 辅助功能 / 批注导航
+
+    fn a11y_scan(&mut self) {
+        self.a11y_list = sheetcore::a11y::scan(&self.wb);
+        self.status = format!("辅助功能检查器：{} 项", self.a11y_list.len());
+    }
+
+    fn a11y_window(&mut self, ctx: &egui::Context) {
+        if !self.a11y_open {
+            return;
+        }
+        let mut open = true;
+        let mut jump: Option<(usize, (u32, u32))> = None;
+        let mut rescan = false;
+        let list = self.a11y_list.clone();
+        ui_kit::window(ctx, "辅助功能检查器", 560.0)
+            .open(&mut open)
+            .resizable(true)
+            .default_size([560.0, 380.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let n = list.len();
+                    let (text, color) = if n == 0 {
+                        ("一切就绪：没有发现辅助功能问题".to_string(), ui_kit::ACCENT)
+                    } else {
+                        (format!("发现 {n} 项需要处理"), Color32::from_rgb(192, 0, 0))
+                    };
+                    ui.label(egui::RichText::new(text).size(12.5).color(color));
+                    if ui_kit::secondary_button(ui, "重新检查").clicked() {
+                        rescan = true;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    egui::Grid::new("a11y_grid")
+                        .num_columns(4)
+                        .spacing([10.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("工作表").size(11.0).weak());
+                            ui.label(egui::RichText::new("位置").size(11.0).weak());
+                            ui.label(egui::RichText::new("问题").size(11.0).weak());
+                            ui.label(egui::RichText::new("建议").size(11.0).weak());
+                            ui.end_row();
+                            for it in &list {
+                                ui.label(egui::RichText::new(&it.sheet_name).size(11.0));
+                                match it.at {
+                                    Some((r, c)) => {
+                                        if ui.link(cell_name(r, c)).clicked() {
+                                            jump = Some((it.sheet, (r, c)));
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("—");
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}：{}",
+                                        it.kind.label(),
+                                        it.detail
+                                    ))
+                                    .size(11.0),
+                                );
+                                ui.label(egui::RichText::new(it.kind.advice()).size(10.5).weak());
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        if rescan {
+            self.a11y_scan();
+        }
+        if let Some((si, (r, c))) = jump {
+            self.sheet_idx = si.min(self.wb.sheets.len() - 1);
+            self.sel = (r, c);
+            self.sel_end = (r, c);
+            self.ensure_visible();
+        }
+        self.a11y_open = open;
+    }
+
+    /// 上一条/下一条批注：按行列排序在当前表里找
+    fn note_step(&mut self, forward: bool) {
+        let mut keys: Vec<(u32, u32)> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .notes
+            .keys()
+            .map(|k| (k.row, k.col))
+            .collect();
+        if keys.is_empty() {
+            self.status = "当前表没有批注".into();
+            return;
+        }
+        keys.sort_unstable();
+        let cur = (self.sel.0, self.sel.1);
+        let target = if forward {
+            keys.iter()
+                .find(|k| **k > cur)
+                .copied()
+                .unwrap_or(keys[0])
+        } else {
+            keys.iter()
+                .rev()
+                .find(|k| **k < cur)
+                .copied()
+                .unwrap_or(*keys.last().unwrap())
+        };
+        self.sel = target;
+        self.sel_end = target;
+        self.ensure_visible();
+        self.status = format!("批注 {}", cell_name(target.0, target.1));
+    }
+
+    /// 显示批注：有就打开编辑框，没有就提示
+    fn note_show(&mut self) {
+        let (r, c) = self.sel;
+        let cur = self
+            .wb
+            .sheet(self.sheet_idx)
+            .notes
+            .get(&sheetcore::model::CellRef::new(r, c))
+            .map(|n| n.text.clone());
+        match cur {
+            Some(t) => self.note_edit = Some((r, c, t)),
+            None => {
+                // 找最近的一条批注并跳过去
+                let mut keys: Vec<(u32, u32)> = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .notes
+                    .keys()
+                    .map(|k| (k.row, k.col))
+                    .collect();
+                if keys.is_empty() {
+                    self.status = "当前表没有批注".into();
+                    return;
+                }
+                keys.sort_unstable();
+                let t = keys[0];
+                self.sel = t;
+                self.sel_end = t;
+                self.ensure_visible();
+                self.note_edit = Some((
+                    t.0,
+                    t.1,
+                    self.wb
+                        .sheet(self.sheet_idx)
+                        .notes
+                        .get(&sheetcore::model::CellRef::new(t.0, t.1))
+                        .map(|n| n.text.clone())
+                        .unwrap_or_default(),
+                ));
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 数据工具
@@ -19558,6 +19734,7 @@ impl eframe::App for SheetApp {
         self.subtotal_dialog(ctx);
         self.flashfill_dialog(ctx);
         self.consolidate_dialog(ctx);
+        self.a11y_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);

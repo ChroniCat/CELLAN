@@ -36,6 +36,7 @@ pub mod forecast;
 pub mod subtotal;
 pub mod flashfill;
 pub mod consolidate;
+pub mod a11y;
 pub mod richtext;
 pub mod pivot;
 pub mod refs;
