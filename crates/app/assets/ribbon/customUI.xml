@@ -21,7 +21,7 @@
         <group id="GroupPrint" label="打印">
           <button id="FilePrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
-            <button id="ExportPdf" label="导出 PDF" imageMso="Print" screentip="把当前表导出成 PDF" onAction="ExportPdf" sizeString="90"/>
+            <button id="ExportPdf" label="导出 PDF" imageMso="PdfExport" screentip="把当前表导出成 PDF" onAction="ExportPdf" sizeString="90"/>
             <button id="VersionHistory" label="历史版本" imageMso="Revision" screentip="从自动备份恢复" onAction="VersionHistory" sizeString="90"/>
           </box>
         </group>
@@ -34,7 +34,7 @@
         <group id="GroupTabs" label="标签">
           <box boxStyle="vertical">
             <button id="NewTab" label="新建标签" imageMso="Plus" screentip="开一个空白工作簿" onAction="NewTab" sizeString="110"/>
-            <button id="OpenInNewTab" label="打开到新标签" imageMso="Open" onAction="OpenInNewTab" sizeString="110"/>
+            <button id="OpenInNewTab" label="打开到新标签" imageMso="FolderPlus" onAction="OpenInNewTab" sizeString="110"/>
             <button id="CloseTab" label="关闭当前标签" imageMso="Close" onAction="CloseTab" sizeString="110"/>
           </box>
         </group>
@@ -47,14 +47,14 @@
               <button id="JoinRoom" label="加入" imageMso="Link" screentip="加入同事共享的房间" onAction="JoinRoom" sizeString="56"/>
             </box>
           </box>
-          <button id="FileOnlinePeers" label="在线" size="large" imageMso="Share" screentip="查看在线协作者" onAction="ShowMembers"/>
-          <button id="PromoteHost" label="接任宿主" imageMso="Refresh" screentip="宿主已离线：用我手里这份继续开房间" onAction="PromoteHost" sizeString="90"/>
+          <button id="FileOnlinePeers" label="在线" size="large" imageMso="Online" screentip="查看在线协作者" onAction="ShowMembers"/>
+          <button id="PromoteHost" label="接任宿主" imageMso="HostTakeover" screentip="宿主已离线：用我手里这份继续开房间" onAction="PromoteHost" sizeString="90"/>
         </group>
         <group id="GroupMore" label="更多">
           <box boxStyle="vertical">
-            <button id="CheckUpdate" label="检查更新" imageMso="Refresh" onAction="CheckUpdate" sizeString="110"/>
-            <button id="RegisterAssociation" label="加入“打开方式”" imageMso="Open" screentip="注册 .xlsx/.xlsm（当前用户）" onAction="RegisterAssociation" sizeString="130"/>
-            <button id="SetDefaultApp" label="设为默认打开方式" imageMso="Save" onAction="SetDefaultApp" sizeString="130"/>
+            <button id="CheckUpdate" label="检查更新" imageMso="UpdateCheck" onAction="CheckUpdate" sizeString="110"/>
+            <button id="RegisterAssociation" label="加入“打开方式”" imageMso="AppAdd" screentip="注册 .xlsx/.xlsm（当前用户）" onAction="RegisterAssociation" sizeString="130"/>
+            <button id="SetDefaultApp" label="设为默认打开方式" imageMso="AppDefault" onAction="SetDefaultApp" sizeString="130"/>
           </box>
         </group>
       </tab>
@@ -154,7 +154,7 @@
               </box>
               <spacer sizeString="2"/>
               <menu id="TextDirection" label="方向" imageMso="TextDirection" sizeString="62" screentip="文字方向">
-                <button id="TextVertical" label="竖排文字" imageMso="TextDirection" onAction="TextVertical"/>
+                <button id="TextVertical" label="竖排文字" imageMso="TextVerticalDraw" onAction="TextVertical"/>
                 <button id="TextRotateUp" label="逆时针旋转文字" onAction="TextRotateUp"/>
                 <button id="TextRotateDown" label="顺时针旋转文字" onAction="TextRotateDown"/>
                 <menuSeparator id="TextDirSep"/>
@@ -267,7 +267,7 @@
               </menu>
             </splitButton>
             <splitButton id="FormatSplit" size="large" sizeString="42" imageMso="Brush" label="格式">
-              <button id="FormatCells" label="格式" imageMso="Brush" onAction="FormatCellsDialog"/>
+              <button id="FormatCells" label="格式" imageMso="FormatCells" onAction="FormatCellsDialog"/>
               <menu id="FormatMenu">
                 <button id="FormatCellsItem" label="设置单元格格式…" onAction="FormatCellsDialog"/>
                 <menuSeparator id="FormatSep1"/>
@@ -322,7 +322,7 @@
         <group id="GroupHeaderFooter" label="文本">
           <button id="InsertTextBox" label="文本框" size="large" imageMso="TextBox" screentip="在当前单元格上放一个文本框" onAction="InsertTextBox"/>
           <box boxStyle="vertical">
-            <button id="DrawTextBox" label="绘制横排文本框" imageMso="TextBox" screentip="在表格上拖出一个横排文本框" onAction="DrawTextBox" sizeString="124"/>
+            <button id="DrawTextBox" label="绘制横排文本框" imageMso="TextBoxDraw" screentip="在表格上拖出一个横排文本框" onAction="DrawTextBox" sizeString="124"/>
             <button id="EditTextBox" label="编辑文本框" imageMso="FontColor" screentip="改文字/字号/颜色/填充" onAction="EditTextBox" sizeString="124"/>
             <button id="DeleteTextBox" label="删除文本框" imageMso="Close" onAction="DeleteTextBox" sizeString="124"/>
           </box>
@@ -534,7 +534,7 @@
             <button id="CalcAuto" label="自动" onAction="CalcAuto"/>
             <button id="CalcManual" label="手动" onAction="CalcManual"/>
           </menu>
-          <button id="CalculateSheet" label="计算工作表" imageMso="Calc" onAction="CalculateSheet" sizeString="96"/>
+          <button id="CalculateSheet" label="计算工作表" imageMso="CalcSheet" onAction="CalculateSheet" sizeString="96"/>
         </group>
         <group id="GroupNames" label="名称">
           <button id="NameManager" label="名称管理器" size="large" imageMso="NameTag" onAction="NameManager"/>
@@ -577,7 +577,7 @@
           <box boxStyle="vertical">
             <button id="ImportCsv" label="导入 CSV/TSV" imageMso="ImportCsv" onAction="ImportCsv" sizeString="120"/>
             <button id="ImportWorkbook" label="导入工作簿" imageMso="ImportBook" screentip="把另一个 xlsx 的表复制进来" onAction="ImportWorkbook" sizeString="120"/>
-            <button id="LinkSheet" label="从另一张表取数" imageMso="Link" onAction="LinkSheet" sizeString="120"/>
+            <button id="LinkSheet" label="从另一张表取数" imageMso="SheetRef" onAction="LinkSheet" sizeString="120"/>
           </box>
           <box boxStyle="vertical">
             <button id="TextToColumns" label="分列" imageMso="SplitColumns" onAction="TextToColumns" sizeString="120"/>
@@ -591,11 +591,11 @@
           </box>
           <box boxStyle="vertical">
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
-            <button id="MultiSort" label="排序..." imageMso="SortAsc" onAction="MultiSort" sizeString="100"/>
+            <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="100"/>
           </box>
           <box boxStyle="vertical">
             <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="88"/>
-            <button id="FilterReapply" label="重新应用" imageMso="Refresh" onAction="FilterReapply" sizeString="88"/>
+            <button id="FilterReapply" label="重新应用" imageMso="FilterReapply" onAction="FilterReapply" sizeString="88"/>
           </box>
         </group>
         <group id="GroupDataTools" label="数据工具">
@@ -639,7 +639,7 @@
           <box boxStyle="vertical">
             <button id="PrevComment" label="上一条批注" imageMso="CommentPrev" onAction="PrevComment" sizeString="104"/>
             <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104"/>
-            <button id="ShowShowCommentBtn" label="显示批注" imageMso="Comment" onAction="ShowComment" sizeString="104"/>
+            <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104"/>
           </box>
         </group>
         <group id="GroupA11y" label="辅助功能">
@@ -653,11 +653,11 @@
         </group>
         <group id="GroupChanges" label="修订">
           <button id="ReviewTrackChanges" label="修订记录" size="large" imageMso="Revision" onAction="TrackChanges"/>
-          <button id="ShowChangesBtn" label="显示更改" imageMso="Revision" screentip="逐条查看改动并可撤回" onAction="ShowChanges" sizeString="96"/>
+          <button id="ShowChangesBtn" label="显示更改" imageMso="ShowChanges" screentip="逐条查看改动并可撤回" onAction="ShowChanges" sizeString="96"/>
         </group>
         <group id="GroupReviewShare" label="共享">
           <box boxStyle="vertical">
-            <toggleButton id="AutoAutoShare" label="自动共享" imageMso="Share" screentip="网盘上的文件打开后自动开房；别人打开同一文件自动加入" onAction="AutoShare" sizeString="100"/>
+            <toggleButton id="AutoAutoShare" label="自动共享" imageMso="AutoShare" screentip="网盘上的文件打开后自动开房；别人打开同一文件自动加入" onAction="AutoShare" sizeString="100"/>
           </box>
           <button id="ReviewShare" label="共享" size="large" imageMso="Share" onAction="Share"/>
           <button id="ReviewOnlinePeers" label="在线" size="large" imageMso="Online" screentip="查看在线协作者" onAction="ShowMembers" sizeString="66"/>
@@ -677,16 +677,16 @@
           </box>
           <button id="ViewPrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
-            <button id="Zoom100" label="100%" imageMso="Zoom" screentip="回到实际大小" onAction="Zoom100" sizeString="110"/>
+            <button id="Zoom100" label="100%" imageMso="Zoom100" screentip="回到实际大小" onAction="Zoom100" sizeString="110"/>
             <button id="ToggleFileTree" label="显示文件列表" imageMso="ViewPane" screentip="左侧文件树" onAction="ToggleFileTree" sizeString="110"/>
           </box>
         </group>
         <group id="GroupZoom" label="缩放">
           <box boxStyle="vertical">
-            <button id="ZoomDialog" label="缩放..." imageMso="Zoom" onAction="ZoomDialog" sizeString="96"/>
+            <button id="ZoomDialog" label="缩放..." imageMso="ZoomDialog" onAction="ZoomDialog" sizeString="96"/>
             <button id="ZoomToSelection" label="缩放到选定区域" imageMso="ZoomSelection" onAction="ZoomToSelection" sizeString="120"/>
             <box boxStyle="horizontal">
-              <button id="ZoomIn" imageMso="Zoom" screentip="放大" onAction="ZoomIn"/>
+              <button id="ZoomIn" imageMso="ZoomIn" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>
             </box>
             <slider id="ZoomSlider" sizeString="102" min="0.5" max="2.5"/>
@@ -694,7 +694,7 @@
         </group>
         <group id="GroupSheetView" label="工作表视图">
           <box boxStyle="vertical">
-            <button id="ViewSwitch" label="切换工作表视图" imageMso="ViewPane" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
+            <button id="ViewSwitch" label="切换工作表视图" imageMso="SheetViewSwitch" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
             <button id="ViewKeep" label="保留" imageMso="Pin" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118"/>
             <button id="ViewExit" label="退出" imageMso="Close" screentip="退出视图模式（不改变当前状态）" onAction="ViewExit" sizeString="118"/>
           </box>
@@ -707,7 +707,7 @@
             <button id="FreezePanes" label="冻结窗格" imageMso="Freeze" screentip="冻结当前单元格上方的行与左侧的列" onAction="FreezePanes" sizeString="96"/>
           </box>
           <box boxStyle="vertical">
-            <button id="Unfreeze" label="取消冻结" imageMso="Close" onAction="Unfreeze" sizeString="96"/>
+            <button id="Unfreeze" label="取消冻结" imageMso="Unfreeze" onAction="Unfreeze" sizeString="96"/>
             <button id="HideSheet" label="隐藏" imageMso="EyeOff" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
             <button id="UnhideSheet" label="取消隐藏" imageMso="Eye" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
           </box>
@@ -750,7 +750,7 @@
             <box boxStyle="vertical">
               <button id="TableSelect" label="选择表格" imageMso="Table" screentip="选中整个表格区域" onAction="TableSelect" sizeString="100"/>
               <button id="TablePivot" label="数据透视表" imageMso="Pivot" screentip="按这个表格新建透视表" onAction="TablePivot" sizeString="100"/>
-              <button id="TableToRange" label="转换为区域" imageMso="Table" screentip="保留单元格内容，去掉表格对象" onAction="TableToRange" sizeString="100"/>
+              <button id="TableToRange" label="转换为区域" imageMso="TableToRange" screentip="保留单元格内容，去掉表格对象" onAction="TableToRange" sizeString="100"/>
             </box>
             <box boxStyle="vertical">
               <button id="TableFilter" label="筛选" imageMso="Filter" screentip="在表格标题行上加筛选" onAction="Filter" sizeString="100"/>
@@ -767,7 +767,7 @@
       <tabSet idMso="TabSetSparklineTools" label="迷你图工具">
         <tab id="TabSparklineDesign" label="迷你图">
           <group id="GroupSparkData" label="数据">
-            <button id="SparkEdit" label="编辑数据" size="large" imageMso="SparkLine" screentip="改数据范围 / 位置 / 颜色" onAction="SparkEdit"/>
+            <button id="SparkEdit" label="编辑数据" size="large" imageMso="SparkEdit" screentip="改数据范围 / 位置 / 颜色" onAction="SparkEdit"/>
           </group>
           <group id="GroupSparkType" label="类型">
             <box boxStyle="vertical">
@@ -800,7 +800,7 @@
         <tab id="TabChartTools" label="图表工具">
           <group id="GroupChartTools" label="图表">
             <box boxStyle="vertical">
-              <button id="ChartEdit" label="编辑图表" imageMso="Chart" screentip="改类型/标题/系列" onAction="ChartEdit" sizeString="104"/>
+              <button id="ChartEdit" label="编辑图表" imageMso="ChartEdit" screentip="改类型/标题/系列" onAction="ChartEdit" sizeString="104"/>
               <button id="ChartToolsManager" label="图表管理" imageMso="Chart" screentip="查看本表所有图表" onAction="ChartManager" sizeString="104"/>
             </box>
           </group>

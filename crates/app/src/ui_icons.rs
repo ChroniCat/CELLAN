@@ -111,6 +111,28 @@ pub enum Icon {
     PivotRefresh,
     PivotOptions,
     ChartList,
+    FolderPlus,
+    AppDefault,
+    AppAdd,
+    PdfExport,
+    HostTakeover,
+    UpdateCheck,
+    FormatCells,
+    TextVerticalDraw,
+    TextBoxDraw,
+    CalcSheet,
+    SheetRef,
+    FilterReapply,
+    SortDialog,
+    ShowChanges,
+    SheetViewSwitch,
+    Zoom100,
+    ZoomDialog,
+    ZoomIn,
+    Unfreeze,
+    TableToRange,
+    SparkEdit,
+    ChartEdit,
     Freeze,
     FreezeRow,
     FreezeCol,
@@ -967,6 +989,187 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.ln(8.4, 12.4, 15.2, 12.4, 0.9, GRAY_D);
             pen.rrs(13.6, 15.2, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
             pen.rrs(17.0, 17.0, 4.2, 3.0, 1.5, Color32::from_rgb(237, 243, 252), BLUE_D, 0.8);
+        }
+        FolderPlus => {
+            // 打开到新标签：文件夹 + 加号
+            pen.poly(&[(2.8, 7.4), (9.0, 7.4), (10.6, 9.2), (21.0, 9.2), (21.0, 19.2), (2.8, 19.2)], Color32::from_rgb(255, 217, 102), INK, 1.15);
+            pen.bar(10.4, 13.2, 6.0, 1.8, INK);
+            pen.bar(12.5, 11.1, 1.8, 6.0, INK);
+        }
+        AppAdd => {
+            // 加入「打开方式」：文件 + 加号
+            pen.rrs(3.6, 3.6, 9.6, 12.4, 0.5, WHITE, INK, 1.1);
+            pen.bar(5.4, 6.6, 6.0, 1.0, GRAY_D);
+            pen.bar(5.4, 9.4, 6.0, 1.0, GRAY_D);
+            pen.bar(14.2, 13.6, 7.0, 1.9, Color32::from_rgb(33, 115, 70));
+            pen.bar(16.75, 11.05, 1.9, 7.0, Color32::from_rgb(33, 115, 70));
+        }
+        AppDefault => {
+            // 设为默认打开方式：文件 + 齿轮
+            pen.rrs(3.0, 3.6, 9.6, 12.4, 0.5, WHITE, INK, 1.1);
+            pen.ring(16.6, 16.4, 3.2, 1.4, INK);
+            pen.dot(16.6, 16.4, 0.9, INK);
+            for k in 0..4 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_2;
+                let (s, c) = (a.sin(), a.cos());
+                pen.ln(16.6 + c * 3.4, 16.4 + s * 3.4, 16.6 + c * 5.0, 16.4 + s * 5.0, 1.5, INK);
+            }
+        }
+        PdfExport => {
+            // 导出 PDF：纸 + 向下箭头 + 红色页脚条
+            pen.rrs(4.2, 2.8, 13.2, 15.0, 0.5, WHITE, INK, 1.15);
+            pen.rr(4.6, 15.4, 12.4, 1.8, 0.0, Color32::from_rgb(192, 0, 0));
+            pen.bar(6.4, 6.0, 8.8, 1.0, GRAY_D);
+            pen.bar(6.4, 8.8, 8.8, 1.0, GRAY_D);
+            pen.bar(6.4, 11.6, 5.6, 1.0, GRAY_D);
+            pen.ln(19.0, 8.0, 19.0, 15.6, 1.8, Color32::from_rgb(33, 115, 70));
+            pen.arrow((19.0, 17.8), (0.0, 1.0), 2.8, Color32::from_rgb(33, 115, 70));
+        }
+        HostTakeover => {
+            // 接任宿主：显示器 + 向上箭头
+            pen.rrs(3.0, 4.4, 13.2, 9.4, 0.6, WHITE, INK, 1.15);
+            pen.bar(7.4, 14.2, 4.2, 1.2, INK);
+            pen.bar(6.2, 15.6, 6.6, 1.0, INK);
+            pen.ln(18.4, 12.0, 18.4, 5.0, 1.7, Color32::from_rgb(33, 115, 70));
+            pen.arrow((18.4, 3.2), (0.0, -1.0), 3.0, Color32::from_rgb(33, 115, 70));
+        }
+        UpdateCheck => {
+            // 检查更新：循环箭头 + 星
+            pen.polyline(&[(7.0, 15.0), (4.0, 11.0), (9.6, 10.4)], 1.6, Color32::from_rgb(33, 115, 70));
+            pen.polyline(&[(17.0, 9.0), (20.0, 13.0), (14.4, 13.6)], 1.6, Color32::from_rgb(33, 115, 70));
+            pen.polyline(&[(6.4, 8.4), (9.2, 3.6), (14.8, 3.6), (17.6, 8.4)], 1.5, GRAY_D);
+            pen.polyline(&[(6.4, 15.6), (9.2, 20.4), (14.8, 20.4), (17.6, 15.6)], 1.5, GRAY_D);
+        }
+        FormatCells => {
+            // 设置单元格格式：格子 + 小滚筒
+            pen.rrs(3.0, 5.0, 9.6, 8.4, 0.4, WHITE, INK, 1.1);
+            pen.bar(3.2, 8.4, 9.2, 0.8, GRAY_D);
+            pen.rr(12.2, 4.0, 6.4, 3.6, 0.6, Color32::from_rgb(255, 217, 102));
+            pen.rro(12.2, 4.0, 6.4, 3.6, 0.6, INK, 1.05);
+            pen.ln(15.4, 7.6, 15.4, 11.4, 1.4, INK);
+            pen.rr(14.4, 11.4, 2.0, 4.6, 0.8, Color32::from_rgb(255, 217, 102));
+            pen.rro(14.4, 11.4, 2.0, 4.6, 0.8, INK, 1.0);
+        }
+        TextVerticalDraw => {
+            // 竖排文字：竖着的 A 和 b
+            pen.text("A", 8.6, 12.0, 10.0, INK);
+            pen.ln(16.0, 6.0, 16.0, 19.0, 1.6, GRAY_D);
+            pen.ln(16.0, 6.0, 19.0, 6.0, 1.6, GRAY_D);
+            pen.ln(16.0, 12.4, 19.0, 12.4, 1.6, GRAY_D);
+            pen.ln(16.0, 19.0, 19.0, 19.0, 1.6, GRAY_D);
+            pen.ln(19.0, 6.0, 19.0, 19.0, 1.6, GRAY_D);
+        }
+        TextBoxDraw => {
+            // 绘制文本框：框 + 铅笔
+            pen.rro(2.8, 5.0, 13.6, 10.4, 0.6, INK, 1.15);
+            pen.bar(5.0, 8.4, 9.2, 1.0, GRAY_D);
+            pen.bar(5.0, 11.2, 6.4, 1.0, GRAY_D);
+            pen.poly(&[(15.4, 16.4), (19.6, 12.2), (21.8, 14.4), (17.6, 18.6)], Color32::from_rgb(255, 217, 102), INK, 1.0);
+            pen.poly(&[(15.4, 16.4), (14.8, 19.4), (17.6, 18.6)], INK, INK, 0.0);
+        }
+        CalcSheet => {
+            // 计算工作表：格子 + 计算器
+            pen.rrs(2.6, 4.2, 9.6, 8.6, 0.4, WHITE, INK, 1.1);
+            pen.bar(2.8, 7.4, 9.2, 0.8, GRAY_D);
+            pen.bar(7.0, 4.4, 0.8, 8.2, GRAY_D);
+            pen.rrs(13.2, 9.6, 8.0, 10.4, 0.8, Color32::from_rgb(243, 242, 241), INK, 1.1);
+            pen.rr(14.4, 11.0, 5.6, 2.2, 0.3, Color32::from_rgb(255, 255, 255));
+            pen.rro(14.4, 11.0, 5.6, 2.2, 0.3, GRAY_D, 0.8);
+            pen.dot(15.4, 16.0, 0.7, INK);
+            pen.dot(17.4, 16.0, 0.7, INK);
+            pen.dot(19.4, 16.0, 0.7, INK);
+        }
+        SheetRef => {
+            // 从另一张表取数：两张小表 + 箭头
+            pen.rro(2.6, 4.0, 7.6, 7.0, 0.4, INK, 1.0);
+            pen.rro(9.0, 12.0, 7.6, 7.0, 0.4, INK, 1.0);
+            pen.ln(11.6, 9.2, 11.6, 12.6, 1.4, Color32::from_rgb(33, 115, 70));
+            pen.arrow((11.6, 14.2), (0.0, 1.0), 2.6, Color32::from_rgb(33, 115, 70));
+        }
+        FilterReapply => {
+            // 重新应用筛选：漏斗 + 循环箭头
+            pen.poly(&[(2.6, 4.2), (14.0, 4.2), (9.6, 9.6), (9.6, 15.4), (6.8, 13.4), (6.8, 9.6)], Color32::from_rgb(243, 242, 241), INK, 1.05);
+            pen.polyline(&[(15.2, 16.4), (19.4, 14.2), (19.4, 18.2), (15.6, 18.2)], 1.5, Color32::from_rgb(33, 115, 70));
+            pen.arrow((17.0, 19.8), (-0.8, -0.6), 2.4, Color32::from_rgb(33, 115, 70));
+        }
+        SortDialog => {
+            // 排序对话框：AZ 两条 + 滑块
+            pen.text("A", 5.6, 8.6, 8.4, INK);
+            pen.text("Z", 12.4, 8.6, 8.4, INK);
+            pen.bar(4.6, 14.6, 12.0, 1.2, GRAY_D);
+            pen.bar(4.6, 17.4, 8.0, 1.2, GRAY_D);
+            pen.rr(17.2, 12.6, 2.4, 6.4, 0.6, Color32::from_rgb(217, 217, 217));
+            pen.rr(17.6, 13.4, 1.6, 2.2, 0.4, INK);
+        }
+        ShowChanges => {
+            // 显示更改：列表 + 眼睛
+            pen.rrs(3.0, 3.6, 11.0, 13.6, 0.5, WHITE, INK, 1.1);
+            pen.bar(5.0, 6.4, 7.0, 1.0, GRAY_D);
+            pen.bar(5.0, 9.2, 7.0, 1.0, GRAY_D);
+            pen.bar(5.0, 12.0, 4.6, 1.0, GRAY_D);
+            pen.ring(16.6, 16.8, 3.0, 1.3, INK);
+            pen.dot(16.6, 16.8, 1.0, INK);
+        }
+        SheetViewSwitch => {
+            // 切换工作表视图：页签 + 眼睛
+            pen.rro(2.8, 4.0, 17.2, 11.2, 0.5, INK, 1.1);
+            pen.bar(2.8, 15.2, 17.2, 1.4, INK);
+            pen.bar(4.6, 17.4, 4.6, 2.0, INK);
+            pen.bar(10.4, 17.4, 4.6, 2.0, INK);
+            pen.ring(18.6, 9.4, 3.0, 1.3, Color32::from_rgb(33, 115, 70));
+            pen.dot(18.6, 9.4, 1.0, Color32::from_rgb(33, 115, 70));
+        }
+        Zoom100 => {
+            // 100%：放大镜 + 里面一个方框（原始尺寸）
+            pen.ring(10.4, 10.4, 5.6, 1.8, INK);
+            pen.ln(14.6, 14.6, 20.0, 20.0, 2.2, INK);
+            pen.rro(7.8, 7.8, 5.2, 5.2, 0.3, GRAY_D, 0.9);
+        }
+        ZoomDialog => {
+            // 缩放对话框：放大镜 + 加减
+            pen.ring(10.4, 10.4, 5.2, 1.8, INK);
+            pen.ln(14.2, 14.2, 19.4, 19.4, 2.1, INK);
+            pen.bar(7.4, 9.9, 4.0, 1.0, GRAY_D);
+            pen.bar(8.9, 8.4, 1.0, 1.0, GRAY_D);
+            pen.dot(16.4, 6.0, 1.2, Color32::from_rgb(33, 115, 70));
+            pen.dot(19.6, 9.2, 1.2, Color32::from_rgb(33, 115, 70));
+        }
+        ZoomIn => {
+            pen.ring(10.4, 10.4, 5.4, 1.8, INK);
+            pen.ln(14.4, 14.4, 19.8, 19.8, 2.2, INK);
+            pen.bar(7.4, 9.9, 4.4, 1.0, GRAY_D);
+            pen.bar(9.1, 8.2, 1.0, 4.4, GRAY_D);
+        }
+        Unfreeze => {
+            // 取消冻结：冻结格 + 斜杠
+            pen.rrs(3.0, 3.0, 17.4, 17.4, 0.7, WHITE, GRAY_D, 1.2);
+            pen.rr(3.4, 3.4, 16.6, 4.6, 0.0, Color32::from_rgb(237, 237, 237));
+            pen.bar(3.4, 8.4, 16.6, 1.1, GRAY_D);
+            pen.ln(3.4, 20.2, 20.4, 3.4, 2.0, Color32::from_rgb(192, 0, 0));
+        }
+        TableToRange => {
+            // 转换为区域：网格 + 向外箭头
+            pen.rrs(4.0, 6.0, 12.0, 12.0, 0.5, WHITE, INK, 1.15);
+            pen.bar(4.2, 10.0, 11.6, 0.9, GRAY_D);
+            pen.bar(10.0, 6.2, 0.9, 11.6, GRAY_D);
+            pen.arrow((19.4, 2.6), (0.7, -0.7), 3.0, Color32::from_rgb(33, 115, 70));
+            pen.arrow((19.4, 21.4), (0.7, 0.7), 3.0, Color32::from_rgb(33, 115, 70));
+        }
+        SparkEdit => {
+            // 编辑迷你图数据：迷你折线 + 铅笔
+            pen.polyline(&[(2.8, 12.4), (6.2, 8.4), (9.0, 12.0), (12.2, 6.8)], 1.6, Color32::from_rgb(33, 115, 70));
+            pen.ln(2.6, 15.4, 12.6, 15.4, 1.0, GRAY_D);
+            pen.poly(&[(14.4, 18.4), (18.6, 14.2), (20.8, 16.4), (16.6, 20.6)], Color32::from_rgb(255, 217, 102), INK, 1.0);
+            pen.poly(&[(14.4, 18.4), (13.8, 21.4), (16.6, 20.6)], INK, INK, 0.0);
+        }
+        ChartEdit => {
+            // 编辑图表：小柱图 + 铅笔
+            pen.bar(2.8, 12.0, 2.4, 6.0, Color32::from_rgb(33, 115, 70));
+            pen.bar(6.0, 8.8, 2.4, 9.2, Color32::from_rgb(91, 127, 166));
+            pen.bar(9.2, 10.6, 2.4, 7.4, Color32::from_rgb(165, 165, 165));
+            pen.ln(2.6, 18.8, 12.2, 18.8, 1.1, GRAY_D);
+            pen.poly(&[(14.6, 18.2), (18.8, 14.0), (21.0, 16.2), (16.8, 20.4)], Color32::from_rgb(255, 217, 102), INK, 1.0);
+            pen.poly(&[(14.6, 18.2), (14.0, 21.2), (16.8, 20.4)], INK, INK, 0.0);
         }
         PivotRefresh => {
             // 刷新透视表：小网格 + 循环箭头
