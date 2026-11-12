@@ -2445,6 +2445,28 @@ fn csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_sou
 
 
 
+
+#[test]
+fn csv_import_dialog_renders_with_real_preview_before_any_write() {
+    let env = crate::test_env::TestEnv::new("c09_app_dialog");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let csv = env.path("dlg.csv");
+    std::fs::write(&csv, "编号,名称\n00123,甲\n".as_bytes()).unwrap();
+    app.open_csv_dialog(&csv);
+    let dlg = app.csv_dlg.as_ref().unwrap();
+    assert_eq!(dlg.preview.len(), 2, "对话框打开即解析出预览");
+    assert_eq!(dlg.preview[1][0], "00123");
+    // 渲染一帧：窗口能画出来，且不因预览/勾选框 panic
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        app.csv_dlg_ui(ctx);
+    });
+    assert!(app.csv_dlg.is_some(), "未确认前对话框保持打开");
+    // 取消不写任何格
+    app.csv_dlg = None;
+    assert!(app.wb.sheet(app.sheet_idx).get(0, 0).is_none());
+    drop(env);
+}
 #[test]
 fn csv_import_choices_persist_and_refresh_reuses_them() {
     let env = crate::test_env::TestEnv::new("c09_app_choice");

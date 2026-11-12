@@ -4,7 +4,7 @@
 - 台账（`scripts/audit_progress.py counts`）：6 已验收 / 6 待验收 / 49 待实施；
   切片 17 已验收 / 12 待验收 / 119 待实施。
 - 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
-  app 151 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  app 152 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
   app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
   `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。

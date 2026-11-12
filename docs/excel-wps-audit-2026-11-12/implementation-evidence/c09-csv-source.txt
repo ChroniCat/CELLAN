@@ -77,5 +77,5 @@ cargo test -p app --no-default-features --features glow --offline --bin app -- c
 3) 首次导入记录实际编码：import_csv_opts 返回 (rows, cols, used_enc)，应用写入 CsvOpts.encoding=Some(used_enc)。
 4) 短行一致：刷新时新矩形内缺失列在旧区域内清空，A,B\nC,D → A\nB,C 后 B1 为空，与首次导入逐格一致（short_row_refresh_matches_first_import_for_the_same_rectangle）。
 5) 刷新 undo：refresh_import 以整表快照 + 源尺寸前后值入栈一步；do_undo 恢复值、范围与 wb.sources 的 rows/cols（app 用例 refresh_is_one_undo_step...）。
-6) 导入前选择：open_csv_dialog + csv_dlg_ui 提供编码/引号/表头/按列文本勾选与真实预览；确认走 import_csv_choice，CsvOpts 持久化 encoding/text_cols/quote（名称文本第 10 段 q<码点>）；保存重开后 refresh 复用（app 用例 csv_import_choices_persist_and_refresh_reuses_them）。
-7) 结果：csv_import 10 passed / 0 failed；app 151 passed / 0 failed；core 全量 590 passed / 41 ignored；GUI 12 passed / 8 ignored。
+6) 导入前选择：open_csv_dialog + csv_dlg_ui 提供编码/引号/表头/按列文本勾选与真实预览；确认走 import_csv_choice，CsvOpts 持久化 encoding/text_cols/quote（名称文本第 10 段 q<码点>）；保存重开后 refresh 复用（app 用例 csv_import_choices_persist_and_refresh_reuses_them）；csv_import_dialog_renders_with_real_preview_before_any_write 渲染一帧并断言取消前不写任何格。
+7) 结果：csv_import 10 passed / 0 failed；app 152 passed / 0 failed；core 全量 590 passed / 41 ignored；GUI 12 passed / 8 ignored。
