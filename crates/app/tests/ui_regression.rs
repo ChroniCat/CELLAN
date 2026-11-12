@@ -9,7 +9,19 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// 跑一次 app，等 dump 落盘，返回内容
+/// 这些测试各自会启动同一个 app.exe：单实例端口只有一个，必须串行跑，
+/// 否则后启动的进程会把路径转给前一个实例然后自己退出，dump 永远不落盘（假失败）。
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn dump_for(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
+    let _guard = serial();
+    dump_for_locked(file, extra, wait)
+}
+
+fn dump_for_locked(file: &str, extra: &[(&str, &str)], wait: Duration) -> Option<String> {
     let source = Path::new(file);
     if !source.exists() {
         eprintln!("跳过：缺少 {}", source.display());
