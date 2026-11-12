@@ -571,13 +571,18 @@
           </box>
           <box boxStyle="vertical">
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
-            <button id="MultiSort" label="多级排序" imageMso="Grid" onAction="MultiSort" sizeString="100"/>
+            <button id="MultiSort" label="排序..." imageMso="Grid" onAction="MultiSort" sizeString="100"/>
+          </box>
+          <box boxStyle="vertical">
+            <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="88"/>
+            <button id="FilterReapply" label="重新应用" imageMso="Refresh" onAction="FilterReapply" sizeString="88"/>
           </box>
         </group>
         <group id="GroupDataTools" label="数据工具">
           <box boxStyle="vertical">
             <button id="RemoveDuplicates" label="删除重复项" imageMso="Table" onAction="RemoveDuplicates" sizeString="110"/>
             <button id="CFManager" label="条件格式" imageMso="Filter" onAction="CFManager" sizeString="110"/>
+            <button id="DataValidationBtn" label="数据验证" imageMso="Grid" onAction="DataValidation" sizeString="110"/>
           </box>
         </group>
         <group id="GroupDataLinks" label="链接">

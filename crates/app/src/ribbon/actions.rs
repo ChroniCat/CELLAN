@@ -663,6 +663,25 @@ impl SheetApp {
                 self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
             }
             "WatchWindow" => self.watch_open = true,
+            "DataValidation" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let cur = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, r1, c1).cloned();
+                let mut draft = cur.unwrap_or_default();
+                draft.ranges = vec![(r1, c1, r2, c2)];
+                self.dv_edit = Some(draft);
+            }
+            "FilterClear" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.filter = None;
+                sh.filter_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已清除筛选".into();
+            }
+            "FilterReapply" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.filter_dirty = true;
+                self.status = "已重新应用筛选".into();
+            }
             "HeaderFooter" => self.hf_dlg = true,
             "NameManager" => self.name_mgr = true,
 
