@@ -3615,7 +3615,7 @@ impl SheetApp {
         let Some(site) = site else { return None };
         if self.locks.is_locked_by_other(sheet, row, col, site) {
             self.locks
-                .holder(self.sheet_idx, row, col)
+                .holder(sheet, row, col)
                 .map(|h| h.name.clone())
         } else {
             None
@@ -3641,16 +3641,22 @@ impl SheetApp {
     /// - 后台依赖未就绪、工作表受保护 → 拒绝；
     /// - 目标区域里**任何一格**被别人锁定 → 整批拒绝，不做部分写入。
     fn write_preflight(&mut self, keys: &[(u32, u32)], what: &str) -> bool {
+        self.write_preflight_on(self.sheet_idx, keys, what)
+    }
+
+    /// 指定工作表的统一门禁（跨表剪切等场景不能只看当前表）
+    fn write_preflight_on(&mut self, sheet: usize, keys: &[(u32, u32)], what: &str) -> bool {
         if self.deps_pending {
             self.status = "大文件还在后台准备依赖图，稍等一下再操作".into();
             return false;
         }
-        if self.wb.sheet(self.sheet_idx).protection.is_some() {
-            self.status = format!("工作表受保护：不能{what}（先“审阅 → 撤销保护”）");
+        if self.wb.sheet(sheet).protection.is_some() {
+            let name = self.wb.sheet(sheet).name.clone();
+            self.status = format!("工作表「{name}」受保护：不能{what}（先“审阅 → 撤销保护”）");
             return false;
         }
         for (r, c) in keys {
-            if let Some(holder) = self.lock_holder(*r, *c) {
+            if let Some(holder) = self.lock_holder_on(sheet, *r, *c) {
                 self.status = format!("{holder} 正在编辑 {}，不能{what}", cell_name(*r, *c));
                 return false;
             }
@@ -3964,13 +3970,9 @@ impl SheetApp {
             return;
         }
         if let Some((source, (sr1, sc1, sr2, sc2))) = cut_src {
-            for rr in sr1..=sr2 {
-                for cc in sc1..=sc2 {
-                    if let Some(holder) = self.lock_holder_on(source, rr, cc) {
-                        self.status = format!("{holder} 正在编辑 {}，不能剪切", cell_name(rr, cc));
-                        return;
-                    }
-                }
+            let src_keys = sheetcore::undo::rect_keys(sr1, sc1, sr2, sc2);
+            if !self.write_preflight_on(source, &src_keys, "剪切") {
+                return;
             }
         }
         let mut transactions = std::collections::BTreeMap::new();
@@ -6732,7 +6734,10 @@ impl SheetApp {
         }
         let (r1, c1, r2, c2) = self.sel_rect();
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        let txn = self.txn_begin(&keys);
+                if !self.write_preflight(&keys, "清除内容") {
+            return;
+        }
+let txn = self.txn_begin(&keys);
         for r in r1..=r2 {
             for c in c1..=c2 {
                 self.wb.sheet_mut(self.sheet_idx).set(
@@ -7991,7 +7996,12 @@ impl SheetApp {
         for (r1, c1, r2, c2) in rects.iter() {
             keys.extend(sheetcore::undo::rect_keys(*r1, *c1, *r2, *c2));
         }
-        let txn = self.txn_begin(&keys);
+                keys.sort_unstable();
+        keys.dedup();
+        if !self.write_preflight(&keys, "清除内容") {
+            return;
+        }
+let txn = self.txn_begin(&keys);
         for (r1, c1, r2, c2) in rects.iter().copied() {
             for r in r1..=r2 {
                 for c in c1..=c2 {
@@ -8118,7 +8128,12 @@ impl SheetApp {
         for (r1, c1, r2, c2) in rects.iter() {
             keys.extend(sheetcore::undo::rect_keys(*r1, *c1, *r2, *c2));
         }
-        let txn = self.txn_begin(&keys);
+                keys.sort_unstable();
+        keys.dedup();
+        if !self.write_preflight(&keys, "设置格式") {
+            return;
+        }
+let txn = self.txn_begin(&keys);
         let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
         for (r1, c1, r2, c2) in rects.iter().copied() {
             for r in r1..=r2 {
@@ -9588,7 +9603,10 @@ impl SheetApp {
             return;
         }
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
-        let txn = self.txn_begin(&keys);
+                if !self.write_preflight(&keys, "选择性粘贴") {
+            return;
+        }
+let txn = self.txn_begin(&keys);
         for (i, row) in matrix.iter().enumerate() {
             for (j, (src, sid)) in row.iter().enumerate() {
                 let (r, c) = (r0 + i as u32, c0 + j as u32);
@@ -13631,7 +13649,10 @@ impl SheetApp {
         let (r, c) = self.sel;
         let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        let txn = self.txn_begin(&keys);
+                if !self.write_preflight(&keys, "排序") {
+            return;
+        }
+let txn = self.txn_begin(&keys);
         let res = sheetcore::sort_filter::sort_region(
             self.wb.sheet_mut(self.sheet_idx),
             (r1, c1, r2, c2),

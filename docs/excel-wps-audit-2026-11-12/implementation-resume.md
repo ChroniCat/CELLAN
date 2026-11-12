@@ -1,13 +1,23 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`），HEAD `9534cb7`（C09/C14 round3/UI-03 已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 6 待验收 / 49 待实施；
-  切片 17 已验收 / 12 待验收 / 119 待实施。
+- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 7 待验收 / 48 待实施；
+  切片 17 已验收 / 15 待验收 / 116 待实施。
 - 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
-  app 152 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  app 155 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
   app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
   `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。
+
+## 本轮：UI-03 统一写入门禁（待验收）
+
+- `write_preflight` 增加 `write_preflight_on(sheet, keys, what)`；修 `lock_holder_on` 用错 `self.sheet_idx`（跨表取锁持有人）。
+- 新增门禁：`clear_values`、`clear_selection`（keys 去重）、`apply_style_xy`（覆盖格式/颜色/填充/对话框）、`do_sort`、`paste_special_apply`。
+- `clip_paste` 剪切源改为 `write_preflight_on(source, src_keys)`，受保护源表不再被清空。
+- 新增 3 个回归：受保护下清除按钮/多选/格式/快速排序；单格被锁多选整批拒绝；受保护表剪切粘贴整批拒绝。
+- 变异：分别去掉格式/排序/clear_selection 门禁，用例均转红；还原后全绿。
+- app 全量 155 passed / 0 failed；GUI 12 / 0 / 8。
+- 未执行：真实 GUI 逐入口键鼠点验与协作对端广播观察（登记待验收）。
 
 ## 本轮：C09 与 C14 复核整改（04:08/04:29）
 

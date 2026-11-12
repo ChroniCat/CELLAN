@@ -963,6 +963,28 @@ fn typing_below_a_table_extends_its_range() {
     );
 }
 
+
+/// UI-03：从受保护的另一张表剪切，粘贴必须整批拒绝，源表数据不能消失。
+#[test]
+fn cut_from_a_protected_sheet_cannot_be_pasted() {
+    let env = crate::test_env::TestEnv::new("ui03_cut_prot");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "cutprot");
+    let mut second = sheetcore::model::Sheet::new("源表");
+    second.set(0, 0, Cell { value: sheetcore::model::Value::Number(7.0), formula: None });
+    second.protection = Some(sheetcore::protection::SheetProtection::default());
+    app.wb.sheets.push(second);
+    let cells = vec![vec![(Cell { value: sheetcore::model::Value::Number(7.0), formula: None }, 0)]];
+    app.clip = Some(Clip { sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
+    app.sheet_idx = 0;
+    app.sel = (2, 2);
+    let before = snapshot(&app);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheet(1).value(0, 0), sheetcore::model::Value::Number(7.0), "源表不能被清空");
+    assert_eq!(snapshot(&app), before, "目标不能写入");
+    assert!(app.status.contains("受保护"), "应说明原因：{}", app.status);
+    drop(env);
+}
 #[test]
 fn paste_special_values_transpose_and_operations() {
     let ctx = egui::Context::default();
@@ -2619,6 +2641,60 @@ fn protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick() {
     drop(env);
 }
 
+
+/// UI-03：受保护时清除按钮/多选清除/格式/快速排序都不能改数据、样式、undo 或 dirty。
+#[test]
+fn protected_sheet_blocks_clear_buttons_multi_select_format_and_quick_sort() {
+    let env = crate::test_env::TestEnv::new("ui03_protected_more");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "prot2");
+    app.wb.sheet_mut(0).protection = Some(sheetcore::protection::SheetProtection::default());
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    let before = snapshot(&app);
+    let styles: Vec<u16> = (0..3).flat_map(|r| (0..3).map(move |c| (r, c))).map(|(r, c)| app.wb.sheet(0).style_of(r, c)).collect();
+
+    app.clear_values();
+    assert_eq!(snapshot(&app), before, "清除按钮不能绕过保护");
+    app.clear_selection();
+    assert_eq!(snapshot(&app), before, "多选清除不能绕过保护");
+
+    app.apply_style(|st| st.bold = !st.bold);
+    assert_eq!(snapshot(&app), before, "格式不能绕过保护");
+    app.do_sort(0, true);
+    assert_eq!(snapshot(&app), before, "快速排序不能绕过保护");
+
+    let styles2: Vec<u16> = (0..3).flat_map(|r| (0..3).map(move |c| (r, c))).map(|(r, c)| app.wb.sheet(0).style_of(r, c)).collect();
+    assert_eq!(styles, styles2, "被拒绝的操作不能改样式");
+    assert!(app.undo.undo_label().is_none(), "被拒绝的操作不能进撤销栈");
+    assert!(!app.wb.dirty, "被拒绝的操作不能标脏");
+    assert!(app.status.contains("受保护"), "应提示受保护：{}", app.status);
+    drop(env);
+}
+
+/// UI-03：区域里只有一格被锁，多选清除/格式/排序一律整批拒绝。
+#[test]
+fn one_locked_cell_blocks_multi_select_clear_format_and_sort() {
+    let env = crate::test_env::TestEnv::new("ui03_lock_more");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "lock2");
+    app.net = Some(crate::net::host(92, "我".into(), "ui03b".into(), 0, "t".into()).unwrap());
+    app.locks.request(0, 1, 1, 93, "丙", 0);
+    app.sel = (0, 0);
+    app.sel_end = (2, 2);
+    let before = snapshot(&app);
+    let depth = app.undo.depth().0;
+
+    app.clear_selection();
+    app.apply_style(|st| st.italic = true);
+    app.do_sort(0, true);
+
+    assert_eq!(snapshot(&app), before, "有锁时多选清除/格式/排序都不能写");
+    assert_eq!(app.undo.depth().0, depth, "不能产生撤销步");
+    assert!(!app.wb.dirty);
+    assert!(app.status.contains("丙"), "应指出锁持有人：{}", app.status);
+    drop(env);
+}
 /// UI-03：区域里只有一格被别人锁定，也整批不写（不做部分写入）。
 #[test]
 fn one_locked_cell_blocks_the_whole_clear() {
