@@ -220,6 +220,15 @@ impl StyleTable {
 }
 
 /// 把值按 Excel 格式代码显示（支持最多四段：正;负;零;文本）
+/// 按指定工作簿的日期体系格式化（1904 的序列跟 1900 差 1462 天）
+pub fn format_value_in(
+    sys: crate::model::DateSystem,
+    v: &crate::model::Value,
+    fmt: &str,
+) -> String {
+    crate::formula::with_date_system(sys, || format_value(v, fmt))
+}
+
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     use crate::model::Value;
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
@@ -787,7 +796,11 @@ fn strip_literals(fmt: &str) -> String {
 }
 
 fn format_date(serial: f64, fmt: &str) -> Option<String> {
-    let (y, mo, d) = crate::formula::serial_to_date_pub(serial)?;
+    format_date_in(crate::formula::current_date_system(), serial, fmt)
+}
+
+fn format_date_in(sys: crate::model::DateSystem, serial: f64, fmt: &str) -> Option<String> {
+    let (y, mo, d) = crate::formula::serial_to_date_in(sys, serial)?;
     let total = (serial.fract().abs() * 86400.0).round() as u32;
     let (hh, mi, ss) = (total / 3600, (total % 3600) / 60, total % 60);
     let elapsed = serial.abs() * 86400.0;
@@ -798,7 +811,12 @@ fn format_date(serial: f64, fmt: &str) -> Option<String> {
     let day_names = [
         "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
     ];
-    let wd = (((serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize;
+    // 1900 体系：serial 25569 = 1970-01-01（周四）；1904 体系：serial 0 = 1904-01-01（周五）
+    let wd = if sys.is_1904() {
+        (((serial.abs().floor() as i64) % 7 + 7 + 5) % 7) as usize
+    } else {
+        (((serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize
+    };
     let lower_fmt = fmt.to_lowercase();
     let cn_ampm = fmt.contains("上午/下午");
     let has_ampm = lower_fmt.contains("am/pm") || lower_fmt.contains("a/p") || cn_ampm;

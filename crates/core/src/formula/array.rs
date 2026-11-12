@@ -191,9 +191,25 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "FILTER" => r(|| {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
-            let include = args.get(1).ok_or(ErrKind::Value)?.values();
-            // 一维条件：按行过滤（长度=行数）或按列过滤（长度=列数）
-            let by_col = include.len() == cols && cols != rows;
+            // 条件按**形状**判方向，不能按元素个数：2×2 数据配 1×2 条件，
+            // 个数也等于 2，若按长度猜就会错当成「按行」。
+            let (ir, ic, include) = args.get(1).ok_or(ErrKind::Value)?.grid();
+            if ir == 1 && ic == 1 {
+                // 标量条件：TRUE 返回整块，FALSE 走 if_empty
+                if include.first().map(truthy).unwrap_or(false) {
+                    return Ok(arr(Array::new(rows, cols, data)));
+                }
+                if let Some(f) = args.get(2) {
+                    return Ok(f.first());
+                }
+                return Err(ErrKind::Value);
+            }
+            // 列向量（n×1）= 按行筛；行向量（1×n）= 按列筛；其余（含 2×2 条件）= #VALUE!
+            let by_row = ic == 1 && ir == rows;
+            let by_col = ir == 1 && ic == cols && !by_row;
+            if !by_row && !by_col {
+                return Err(ErrKind::Value);
+            }
             let mut out = Vec::new();
             let mut n = 0usize;
             if by_col {

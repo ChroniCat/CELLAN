@@ -153,6 +153,11 @@ fn spill_anchor_shape_downstream_and_blocking() {
     wb.sheets[0].set(1, 1, Cell { value: Value::Text("挡".into()), formula: None });
     formula::recalc_all(&mut wb);
     assert_eq!(wb.sheets[0].value(0, 0), Value::Error(ErrKind::Spill));
+    assert_eq!(
+        wb.sheets[0].value(1, 1),
+        Value::Text("挡".into()),
+        "阻挡格里的用户内容必须保留（不能被溢出值或清空逻辑吞掉）"
+    );
 
     // 移开阻挡 → 形状回来
     wb.sheets[0].set(1, 1, Cell::default());
@@ -184,4 +189,82 @@ fn the_spilled_shape_survives_a_save_and_reopen() {
     assert_eq!(s.value(1, 0), Value::Number(4.0), "重开后 A2");
     assert_eq!(s.value(1, 1), Value::Number(5.0), "重开后 B2");
     assert_eq!(s.get(0, 0).unwrap().formula.as_deref(), Some("=SEQUENCE(2,2)+1"));
+}
+
+// ---------------------------------------- FILTER 的条件形状（2×2 数据两种方向）
+
+#[test]
+fn filter_picks_the_direction_from_the_condition_grid() {
+    let wb = Workbook::new_blank();
+    // {1,2;3,4}：第 0 行 = 1,2；第 1 行 = 3,4
+    // 横向 1×2 条件 → 按列筛：留第 0 列 → 2×1 [1;3]
+    assert_eq!(
+        grid(&eval(&wb, "=FILTER({1,2;3,4},{TRUE,FALSE})")),
+        (2, 1, "1/3".to_string()),
+        "1×2 条件对 2×2 数据是按列筛，旧实现按长度猜成按行，得到 1×2 [1,2]"
+    );
+    // 纵向 2×1 条件 → 按行筛：留第 0 行 → 1×2 [1,2]
+    assert_eq!(
+        grid(&eval(&wb, "=FILTER({1,2;3,4},{TRUE;FALSE})")),
+        (1, 2, "1,2".to_string()),
+        "2×1 条件对 2×2 数据是按行筛"
+    );
+    // 方形数据（2×2）本身就撞上「行数=列数」，方向只能由条件形状决定
+    assert_eq!(
+        grid(&eval(&wb, "=FILTER({1,2;3,4},{FALSE;TRUE})")),
+        (1, 2, "3,4".to_string())
+    );
+    assert_eq!(
+        grid(&eval(&wb, "=FILTER({1,2;3,4},{FALSE,TRUE})")),
+        (2, 1, "2/4".to_string())
+    );
+}
+
+#[test]
+fn filter_rejects_conditions_that_match_neither_axis() {
+    let wb = Workbook::new_blank();
+    // 2×2 条件：既不是列向量也不是行向量 —— Excel 返回 #VALUE!
+    assert_eq!(
+        eval(&wb, "=FILTER({1,2;3,4},{TRUE,FALSE;TRUE,FALSE})"),
+        FValue::Error(ErrKind::Value),
+        "二维条件不能拿来当 include"
+    );
+    // 3 个元素配 2×2 数据：两边都对不上
+    assert_eq!(
+        eval(&wb, "=FILTER({1,2;3,4},{TRUE,FALSE,TRUE})"),
+        FValue::Error(ErrKind::Value),
+        "长度 3 的条件既不是 2×1 也不是 1×2"
+    );
+    // 全 FALSE 且没有 if_empty → #VALUE!
+    assert_eq!(eval(&wb, "=FILTER({1,2;3,4},{FALSE,FALSE})"), FValue::Error(ErrKind::Value));
+    // 全 FALSE 有 if_empty → 返回 if_empty
+    assert_eq!(
+        eval(&wb, "=FILTER({1,2;3,4},{FALSE,FALSE},\"空\")"),
+        FValue::Text("空".into())
+    );
+    // 标量 TRUE → 整块原样返回
+    assert_eq!(grid(&eval(&wb, "=FILTER({1,2;3,4},TRUE)")), (2, 2, "1,2/3,4".to_string()));
+}
+
+// ------------------------------- 一元负号 / 百分号：错误逐元素保留，不坍成单错误
+
+#[test]
+fn unary_and_percent_keep_shape_and_carry_errors_elementwise() {
+    let wb = Workbook::new_blank();
+    let v = eval(&wb, "=-{1;#N/A}");
+    let (r, c, txt) = grid(&v);
+    assert_eq!((r, c), (2, 1), "2×1 的输入不能坍成单个错误：{txt}");
+    let FValue::Array(a) = &v else { panic!() };
+    assert_eq!(a.get(0, 0), FValue::Number(-1.0), "正常元素照算");
+    assert!(matches!(a.get(1, 0), FValue::Error(ErrKind::Na)), "错误元素保留原错误类型");
+
+    let v = eval(&wb, "={1;#N/A}%");
+    let (r, c, txt) = grid(&v);
+    assert_eq!((r, c), (2, 1), "百分号同样逐元素：{txt}");
+    let FValue::Array(a) = &v else { panic!() };
+    assert_eq!(a.get(0, 0), FValue::Number(0.01));
+    assert!(matches!(a.get(1, 0), FValue::Error(ErrKind::Na)));
+
+    // 二维也要保持形状
+    assert_eq!(grid(&eval(&wb, "=-{1,2;3,4}")), (2, 2, "-1,-2/-3,-4".to_string()));
 }

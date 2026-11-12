@@ -4110,7 +4110,7 @@ impl SheetApp {
                 let sh = self.wb.sheet(self.sheet_idx);
                 self.wb.styles.get(sh.style_of(r, col)).clone()
             };
-            let txt = sheetcore::style::format_value(&cell.value, &st.format);
+            let txt = sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format);
             if txt.is_empty() {
                 continue;
             }
@@ -4168,7 +4168,7 @@ impl SheetApp {
                 let sh = self.wb.sheet(self.sheet_idx);
                 self.wb.styles.get(sh.style_of(row, c)).clone()
             };
-            let txt = sheetcore::style::format_value(&cell.value, &st.format);
+            let txt = sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format);
             if txt.is_empty() {
                 continue;
             }
@@ -10627,7 +10627,9 @@ impl SheetApp {
             .get(spec.source.0, spec.row_field)
             .map(|c| c.value.display())
             .unwrap_or_else(|| "行字段".into());
-        let vals = sheetcore::pivot::row_values(self.wb.sheet(si), &spec);
+        let vals = sheetcore::formula::with_date_system(self.wb.date_system, || {
+            sheetcore::pivot::row_values(self.wb.sheet(si), &spec)
+        });
         if vals.is_empty() {
             self.status = "这个透视表的行字段没有可筛选的取值".into();
             return;
@@ -12508,10 +12510,10 @@ impl SheetApp {
                             format!("={f}")
                         }
                     }
-                    None => sheetcore::style::format_value(&cell.value, &st.format),
+                    None => sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format),
                 }
             } else {
-                sheetcore::style::format_value(&cell.value, &st.format)
+                sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
             };
             if !txt.is_empty() {
                 let is_num = matches!(cell.value, Value::Number(_));
@@ -14912,7 +14914,7 @@ impl SheetApp {
                                         }
                                     }
                                 });
-                            let sample = sheetcore::style::format_value(
+                            let sample = sheetcore::style::format_value_in(self.wb.date_system, 
                                 &sheetcore::model::Value::Number(1234.5678),
                                 &self.fmt_state.format,
                             );
@@ -15686,7 +15688,9 @@ impl SheetApp {
                 }
             }
         }
-        let res = sheetcore::pivot::compute(self.wb.sheet(si), &spec);
+        let res = sheetcore::formula::with_date_system(self.wb.date_system, || {
+            sheetcore::pivot::compute(self.wb.sheet(si), &spec)
+        });
         let nrect = sheetcore::pivot::write_to(self.wb.sheet_mut(si), (rect.0, rect.1), &res);
         if let Some(p) = self
             .wb
@@ -15707,7 +15711,9 @@ impl SheetApp {
         );
     }
         fn generate_pivot(&mut self, spec: &sheetcore::pivot::PivotSpec) {
-        let res = sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), spec);
+        let res = sheetcore::formula::with_date_system(self.wb.date_system, || {
+            sheetcore::pivot::compute(self.wb.sheet(self.sheet_idx), spec)
+        });
         let at = self.sel;
         let rect = sheetcore::pivot::write_to(self.wb.sheet_mut(self.sheet_idx), at, &res);
         if self.pivot_real {

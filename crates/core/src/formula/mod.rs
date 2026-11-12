@@ -443,6 +443,24 @@ impl Parser {
                         },
                         Some(Tok::Ident(id)) if id.eq_ignore_ascii_case("TRUE") => FValue::Bool(true),
                         Some(Tok::Ident(id)) if id.eq_ignore_ascii_case("FALSE") => FValue::Bool(false),
+                        // 数组常量里的错误字面量：`{1;#N/A}`。字面量在词法阶段被编成
+                        // "\0ERRn="，这里必须认，否则整个常量直接 #VALUE!。
+                        Some(Tok::Ident(id)) if id.starts_with('\u{0}') => {
+                            let code = id
+                                .trim_start_matches('\u{0}')
+                                .strip_prefix("ERR")
+                                .and_then(|c| c.trim_end_matches('=').parse::<u8>().ok())
+                                .ok_or(ErrKind::Name)?;
+                            FValue::Error(match code {
+                                0 => ErrKind::Null,
+                                1 => ErrKind::Div0,
+                                2 => ErrKind::Value,
+                                3 => ErrKind::Ref,
+                                4 => ErrKind::Name,
+                                5 => ErrKind::Num,
+                                _ => ErrKind::Na,
+                            })
+                        }
                         _ => return Err(ErrKind::Value),
                     };
                     rows.last_mut().unwrap().push(v);
@@ -701,7 +719,8 @@ pub struct Calc<'a> {
     cur_sheet: usize,
     /// 同一次重算的溢出稳定化阶段重放随机/时间采样，不反复生成新值。
     volatile_values: HashMap<(deps::CellKey, usize, String), FValue>,
-    volatile_counts: HashMap<deps::CellKey, usize>,
+    volatile_counts: HashMap<deps::CellKey, usize>,    /// 进入时外层的日期体系，Drop 时恢复
+    prev_system: crate::model::DateSystem,
     /// 区域内容缓存：同一轮重算里同一块区域只物化一次
     range_cache: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<Vec<FValue>>>,
     /// 每张表的实际使用范围（最大行、最大列）
@@ -799,12 +818,21 @@ impl Arg {
     }
 }
 
+impl Drop for Calc<'_> {
+    fn drop(&mut self) {
+        functions::set_current_date_system(self.prev_system);
+    }
+}
+
 impl<'a> Calc<'a> {
     pub fn new(wb: &'a Workbook) -> Self {
+        let prev_system = functions::current_date_system();
+        functions::set_current_date_system(wb.date_system);
         Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), scope: None,
             agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
             cache_order: std::collections::VecDeque::new(), agg_hits: 0, agg_miss: 0,
-            cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new() }
+            cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
+            prev_system: functions::current_date_system() }
     }
 
     fn sheet_index(&self, name: Option<&str>, cur: usize) -> Result<usize, ErrKind> {
@@ -1061,9 +1089,11 @@ impl<'a> Calc<'a> {
                 let (rows, cols, vals) = self.operand_block(e, si);
                 let mut out = Vec::with_capacity(vals.len());
                 for v in &vals {
+                    // 逐元素：遇到错误值保留该格的错误，不能把整块坍成一个错误
+                    // （`=-{1;#N/A}` 在 Excel 里是 2×1 的 [-1; #N/A]）
                     match v.to_number() {
                         Ok(n) => out.push(FValue::number(if *neg { -n } else { n })),
-                        Err(err) => return FValue::Error(err),
+                        Err(err) => out.push(FValue::Error(err)),
                     }
                 }
                 if rows == 1 && cols == 1 {
@@ -1077,7 +1107,7 @@ impl<'a> Calc<'a> {
                 for v in &vals {
                     match v.to_number() {
                         Ok(n) => out.push(FValue::number(n / 100.0)),
-                        Err(err) => return FValue::Error(err),
+                        Err(err) => out.push(FValue::Error(err)),
                     }
                 }
                 if rows == 1 && cols == 1 {
@@ -2295,6 +2325,12 @@ pub fn date_to_serial_pub(y: i32, m: u32, d: u32) -> Option<f64> {
 }
 
 /// 供样式模块格式化日期
+// 日期体系相关的公开入口（model/style/pivot 用）
+pub use functions::{
+    current_date_system, date_to_serial_in, serial_to_date_in, set_current_date_system,
+    with_date_system,
+};
+
 pub fn serial_to_date_pub(serial: f64) -> Option<(i32, u32, u32)> {
     functions::serial_to_date(serial)
 }

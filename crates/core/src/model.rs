@@ -471,6 +471,30 @@ impl Default for PivotSession {
     }
 }
 
+/// 日期体系：workbookPr/@date1904。1904 体系里序列 0 = 1904-01-01，
+/// 同一日历日期比 1900 体系小 1462（且没有 1900 闰年 bug）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DateSystem {
+    #[default]
+    D1900,
+    D1904,
+}
+
+impl DateSystem {
+    pub fn is_1904(self) -> bool {
+        matches!(self, DateSystem::D1904)
+    }
+    /// 1904 体系相对 1900 的偏移（天）
+    pub const OFFSET: f64 = 1462.0;
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DateSystem::D1900 => "1900",
+            DateSystem::D1904 => "1904",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     /// 文件里是否带 VBA 宏（只保留，不执行）
@@ -502,6 +526,8 @@ pub struct Workbook {
     pub path: Option<PathBuf>,
     /// 原文件有打开密码时：解密到临时文件的路径（保存时当基准）
     pub decrypted: Option<PathBuf>,
+    /// 日期体系（workbookPr/@date1904）
+    pub date_system: DateSystem,
     /// 打开密码设置；另存时继续加密
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     pub dirty: bool,
@@ -523,9 +549,18 @@ impl Workbook {
             path: None,
             decrypted: None,
             encryption: None,
+            date_system: DateSystem::D1900,
             dirty: false,
             styles: crate::style::StyleTable::new(),
         }
+    }
+
+    /// 日期序列 ↔ 日历日期都走这里，避免各处各写一套 1462
+    pub fn date_to_serial(&self, y: i32, m: u32, d: u32) -> Option<f64> {
+        crate::formula::date_to_serial_in(self.date_system, y, m, d)
+    }
+    pub fn serial_to_date(&self, serial: f64) -> Option<(i32, u32, u32)> {
+        crate::formula::serial_to_date_in(self.date_system, serial)
     }
 
     pub fn sheet(&self, idx: usize) -> &Sheet {

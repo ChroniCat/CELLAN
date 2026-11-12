@@ -256,6 +256,11 @@ pub fn load(path: &Path) -> Result<Workbook> {
         pivot_cache_base: Default::default(),
         pivot_session: Default::default(),
         has_vba: crate::vba::has_macros(path),
+        date_system: if crate::patch::read_date1904(path) {
+            crate::model::DateSystem::D1904
+        } else {
+            crate::model::DateSystem::D1900
+        },
         pivots_pending: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
@@ -1335,6 +1340,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     } else {
         new_file()
     };
+
+    // 日期体系：base 是原文件（多带同一个 flag），新建文件要显式写
+    if book.date1904() != wb.date_system.is_1904() {
+        book.set_date1904(wb.date_system.is_1904());
+    }
 
     if prof {
         eprintln!("  [save] 读入原文件 {:.2}s", t_read.elapsed().as_secs_f64());

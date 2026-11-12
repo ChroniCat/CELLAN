@@ -43,6 +43,33 @@ const TPL_FONTS_XFS: &[u8] = include_bytes!("xls_tpl/fonts_xfs.bin");
 const TPL_STYLE: &[u8] = include_bytes!("xls_tpl/style.bin");
 
 /// 骨架里已有的字体数 / XF 数：我们的表和单元格引用都从这之后开始编号
+/// 把全局流里的 DATEMODE(0x0022) 改成指定值；没有就在 BOF 之后插一条。
+fn set_datemode(buf: &mut Vec<u8>, is_1904: bool) {
+    let want = if is_1904 { 1u16 } else { 0u16 };
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let t = u16::from_le_bytes([buf[i], buf[i + 1]]);
+        let l = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        if t == 0x0022 && i + 6 <= buf.len() {
+            buf[i + 4] = (want & 0xFF) as u8;
+            buf[i + 5] = (want >> 8) as u8;
+            return;
+        }
+        let n = (i + 4 + l).min(buf.len());
+        if n <= i {
+            break;
+        }
+        i = n;
+    }
+    // 没找到：插在第一条记录（BOF）之后
+    if buf.len() >= 4 {
+        let l0 = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        let at = (4 + l0).min(buf.len());
+        let rec_bytes = [0x22u8, 0x00, 0x02, 0x00, (want & 0xFF) as u8, (want >> 8) as u8];
+        buf.splice(at..at, rec_bytes);
+    }
+}
+
 fn tpl_counts() -> (u16, u16) {
     let mut fonts = 0u16;
     let mut xfs = 0u16;
@@ -601,7 +628,11 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     // 全局流：前缀、标准字体/XF 块都来自内嵌的合法骨架（Excel 生成），
     // 我们只在后面追加自己的格式/字体/XF 和 BOUNDSHEET。
     let mut g: Vec<u8> = Vec::new();
-    g.extend_from_slice(TPL_PREFIX);
+    // DATEMODE：骨架前缀里本来就有（Excel 生成的空簿写的是 0），改值而不是追加，
+    // 否则读端先撞上骨架里的 0。
+    let mut prefix = TPL_PREFIX.to_vec();
+    set_datemode(&mut prefix, wb.date_system.is_1904());
+    g.extend_from_slice(&prefix);
     g.extend_from_slice(TPL_FONTS_XFS);
 
     let (base_fonts, base_xfs) = tpl_counts();

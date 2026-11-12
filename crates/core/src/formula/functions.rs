@@ -88,7 +88,36 @@ pub(crate) fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
-pub(crate) fn date_to_serial(y: i32, m: u32, d: u32) -> Option<f64> {
+// ---------------------------------------------------------------- 日期体系
+//
+// 函数库拿不到 Workbook，所以当前日期体系放在线程本地：`Calc` / `eval_formula`
+// 在求值前用 `with_date_system` 设好，退出时恢复。默认 1900。
+
+use crate::model::DateSystem;
+use std::cell::Cell;
+
+thread_local! {
+    static DATE_SYSTEM: Cell<DateSystem> = const { Cell::new(DateSystem::D1900) };
+}
+
+/// 由 `Calc::new` 设置、`Calc::drop` 恢复
+pub fn set_current_date_system(sys: DateSystem) {
+    DATE_SYSTEM.with(|c| c.set(sys));
+}
+
+pub fn current_date_system() -> DateSystem {
+    DATE_SYSTEM.with(|c| c.get())
+}
+
+/// 在这段求值里用指定日期体系；嵌套调用会正确恢复外层
+pub fn with_date_system<T>(sys: DateSystem, f: impl FnOnce() -> T) -> T {
+    let prev = DATE_SYSTEM.with(|c| c.replace(sys));
+    let out = f();
+    DATE_SYSTEM.with(|c| c.set(prev));
+    out
+}
+
+pub fn date_to_serial_in(sys: DateSystem, y: i32, m: u32, d: u32) -> Option<f64> {
     if !(1..=12).contains(&m) || d == 0 || d > 31 {
         return None;
     }
@@ -96,18 +125,33 @@ pub(crate) fn date_to_serial(y: i32, m: u32, d: u32) -> Option<f64> {
         return None;
     }
     let days = days_from_civil(y, m, d);
+    if sys.is_1904() {
+        // 1904 体系：1904-01-01 = 0，没有 1900 闰年 bug
+        return Some((days - days_from_civil(1904, 1, 1)) as f64);
+    }
     // Excel 的 1900 闰年 bug：1900-03-01 之前的序列号要 +1
     let pivot = days_from_civil(1900, 3, 1);
     Some((days + if days >= pivot { 25_569 } else { 25_568 }) as f64)
 }
 
-pub(crate) fn serial_to_date(serial: f64) -> Option<(i32, u32, u32)> {
+pub fn serial_to_date_in(sys: DateSystem, serial: f64) -> Option<(i32, u32, u32)> {
     if !serial.is_finite() || serial < 0.0 {
         return None;
     }
     let d = serial.floor();
+    if sys.is_1904() {
+        return Some(civil_from_days(days_from_civil(1904, 1, 1) + d as i64));
+    }
     let days = if d < 61.0 { d - 25_568.0 } else { d - 25_569.0 };
     Some(civil_from_days(days as i64))
+}
+
+pub(crate) fn date_to_serial(y: i32, m: u32, d: u32) -> Option<f64> {
+    date_to_serial_in(current_date_system(), y, m, d)
+}
+
+pub(crate) fn serial_to_date(serial: f64) -> Option<(i32, u32, u32)> {
+    serial_to_date_in(current_date_system(), serial)
 }
 
 fn days_in_month(y: i32, m: u32) -> u32 {
@@ -125,13 +169,52 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
+/// 本机 UTC 偏移（秒）。Excel 的 NOW/TODAY 用本地时间，不用 UTC。
+/// 用 GetLocalTime 直接拿本地钟面（夏令时由系统处理），只声明一个 SYSTEMTIME，
+/// 不碰 TIME_ZONE_INFORMATION 那种容易写错布局的大结构。
+#[cfg(windows)]
+fn local_offset_seconds() -> i64 {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16, month: u16, dow: u16, day: u16,
+        hour: u16, minute: u16, second: u16, ms: u16,
+    }
+    unsafe extern "system" {
+        fn GetLocalTime(st: *mut SystemTime);
+    }
+    let mut st = SystemTime { year: 0, month: 0, dow: 0, day: 0, hour: 0, minute: 0, second: 0, ms: 0 };
+    unsafe { GetLocalTime(&mut st) };
+    if st.year < 1970 {
+        return 0;
+    }
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let local = days_from_civil(st.year as i32, st.month as u32, st.day as u32) * 86_400
+        + st.hour as i64 * 3600 + st.minute as i64 * 60 + st.second as i64;
+    // 取整到 15 分钟，去掉两次读钟之间的秒级抖动
+    ((local - utc) as f64 / 900.0).round() as i64 * 900
+}
+
+#[cfg(not(windows))]
+fn local_offset_seconds() -> i64 {
+    0
+}
+
 fn now_serial() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    secs / 86_400.0 + 25_569.0
+        .unwrap_or(0.0)
+        + local_offset_seconds() as f64;
+    let serial_1900 = secs / 86_400.0 + 25_569.0;
+    if current_date_system().is_1904() {
+        serial_1900 - DateSystem::OFFSET
+    } else {
+        serial_1900
+    }
 }
 
 // ---------------------------------------------------------------- 条件匹配

@@ -16,6 +16,11 @@ use std::sync::Mutex;
 /// 进程级环境变量，串行跑（cargo test -- --test-threads=1 或本锁）
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
         "sheetcore-c13-{}-{}-{tag}",
@@ -54,6 +59,7 @@ fn book() -> Workbook {
 /// 注入后保存必须失败；失败时目标文件一个字节都不能变。
 #[test]
 fn injected_step_failures_do_not_report_success() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("inject");
     let path = dir.join("book.xlsx");
@@ -134,6 +140,7 @@ fn injected_step_failures_do_not_report_success() {
 /// 这里用一份“什么东西都带一点”的合成工作簿把它们真正跑起来。
 #[test]
 fn injected_failures_in_conditional_steps_abort_the_save() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("conditional");
     let path = dir.join("rich.xlsx");
@@ -220,6 +227,7 @@ fn injected_failures_in_conditional_steps_abort_the_save() {
 /// 宏工作簿：VBA 部件写不回去时必须让保存失败，不能“成功”地丢掉宏。
 #[test]
 fn injected_vba_restore_failure_aborts_saving_a_macro_workbook() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("vba");
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/real_macro.xlsm");
@@ -250,6 +258,7 @@ fn injected_vba_restore_failure_aborts_saving_a_macro_workbook() {
 /// 图表：锚点/引用回写失败时必须中止保存（不能“成功”地把图弄丢或弄错位）。
 #[test]
 fn injected_chart_failures_abort_the_save() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("chart");
     let path = dir.join("chart.xlsx");
@@ -309,6 +318,7 @@ fn injected_chart_failures_abort_the_save() {
 /// 目标文件不可替换（只读属性）：必须报错、保留原文件与半成品临时文件，清掉后能重试。
 #[test]
 fn readonly_target_is_not_silently_replaced() {
+    let _env = env_guard();
     let dir = scratch("readonly");
     let path = dir.join("ro.xlsx");
     let mut wb = book();
@@ -357,6 +367,7 @@ fn readonly_target_is_not_silently_replaced() {
 
 #[test]
 fn corrupted_temp_package_is_never_committed() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for mode in ["truncate", "drop-part", "drop-sheet", "corrupt-xml"] {
         let dir = scratch(mode);
@@ -392,6 +403,7 @@ fn corrupted_temp_package_is_never_committed() {
 /// 门禁不能误伤正常文件：新建、覆盖、另存为都要能通过
 #[test]
 fn integrity_gate_accepts_every_normal_save() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("gate-ok");
     let path = dir.join("ok.xlsx");
@@ -486,6 +498,7 @@ mod occupancy {
 
 #[test]
 fn killed_during_save_leaves_the_original_intact() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("killed");
     let path = dir.join("killed.xlsx");
@@ -550,6 +563,7 @@ fn child_save_worker() {
 /// 加密工作簿最终落盘是 CFB 容器（不是 ZIP）：门禁必须认，不能当坏包拒绝
 #[test]
 fn encrypted_workbook_passes_the_gate_even_though_it_is_cfb() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("encrypted");
     let path = dir.join("secret.xlsx");
@@ -568,6 +582,7 @@ fn encrypted_workbook_passes_the_gate_even_though_it_is_cfb() {
 /// 关系目标解析：'/xl/...' 绝对路径、'../' 向上、外部链接不查
 #[test]
 fn relationship_targets_are_resolved_the_xml_way() {
+    let _env = env_guard();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("rels");
     let path = dir.join("rels.xlsx");

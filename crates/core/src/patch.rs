@@ -11,6 +11,33 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+/// workbookPr/@date1904：true/1 都算（Excel 写 "1"，有些工具写 "true"）
+pub fn read_date1904(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else { return false };
+    let Ok(mut f) = zip.by_name("xl/workbook.xml") else { return false };
+    let mut xml = String::new();
+    if f.read_to_string(&mut xml).is_err() {
+        return false;
+    }
+    let mut r = Reader::from_str(&xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == "workbookPr" => {
+                for a in e.attributes().flatten() {
+                    if a.key.local_name().as_ref() == "date1904" {
+                        let v = a.value.to_ascii_lowercase();
+                        return v == "1" || v == "true";
+                    }
+                }
+                return false;
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
 /// 表名 → zip 内的 worksheet 路径
 pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
     let file = std::fs::File::open(path)?;

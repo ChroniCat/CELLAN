@@ -962,7 +962,9 @@ mod real_dialogs {
             sheetcore::xlsx::save(&src, &wb).expect("造样本");
         }
         let before = sha256(&src);
-        let before_files = xlsx_count();
+        // 同一二进制的其它用例也在 run_dir 里造文件，直接比「xlsx 个数」会打架。
+        // 这里只关心「跟本用例同名/同源的新文件」（如 Excel 风格的 ui_saveas (2).xlsx）。
+        let before_files = xlsx_names();
         let run = run_and_expect_dialog("FileSaveAs", &src.to_string_lossy());
         assert!(
             !run.desc.is_empty(),
@@ -972,7 +974,12 @@ mod real_dialogs {
         assert!(run.dialog_closed, "发 WM_CLOSE 之后另存为对话框没有关闭（取消没生效）");
         assert!(run.main_responsive, "取消另存为之后主窗口不再应答（进程可能崩了）");
         assert_eq!(sha256(&src), before, "取消另存为后原文件被改动");
-        assert_eq!(xlsx_count(), before_files, "取消另存为却在运行目录里多出了文件");
+        let extra: Vec<String> = xlsx_names()
+            .into_iter()
+            .filter(|n| !before_files.contains(n))
+            .filter(|n| n.starts_with("ui_saveas"))
+            .collect();
+        assert!(extra.is_empty(), "取消另存为却多出了文件：{extra:?}");
         let _ = std::fs::remove_file(&src);
     }
 
@@ -998,15 +1005,17 @@ mod real_dialogs {
         let _ = std::fs::remove_file(&src);
     }
 
-    fn xlsx_count() -> usize {
+    fn xlsx_names() -> Vec<String> {
         std::fs::read_dir(run_dir())
             .map(|it| {
                 it.flatten()
                     .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("xlsx")))
-                    .count()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
+
 }
 
 // --------------------------------------------------- QA-03.3 别人持锁的绘制标记

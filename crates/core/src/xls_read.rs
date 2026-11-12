@@ -87,6 +87,24 @@ fn err_kind_from_biff(code: u8) -> Option<crate::formula::ErrKind> {
     })
 }
 
+/// DATEMODE (0x0022)：1 = 1904 体系。只在全局流里出现一次。
+pub fn read_date1904(stream: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 4 <= stream.len() {
+        let t = u16le(stream, i).unwrap_or(0);
+        let l = u16le(stream, i + 2).unwrap_or(0) as usize;
+        if t == 0x0022 && i + 6 <= stream.len() {
+            return u16le(stream, i + 4).unwrap_or(0) == 1;
+        }
+        let n = (i + 4 + l).min(stream.len());
+        if n <= i {
+            break;
+        }
+        i = n;
+    }
+    false
+}
+
 pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
     // 表名 + BOF 偏移
     let mut bounds: Vec<(u32, String)> = Vec::new();
@@ -312,8 +330,12 @@ pub fn load(path: &Path) -> Result<Workbook> {
         .or_else(|| cf.stream_by_path("Book"))
         .ok_or_else(|| anyhow::anyhow!("没有 Workbook 流"))?;
     let parsed = read_stream(&stream)?;
+    let date1904 = read_date1904(&stream);
 
     let mut wb = Workbook::new_blank();
+    if date1904 {
+        wb.date_system = crate::model::DateSystem::D1904;
+    }
     wb.path = Some(path.to_path_buf());
     wb.sheets.clear();
     for sd in parsed {
