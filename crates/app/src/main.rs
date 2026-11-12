@@ -18,6 +18,7 @@ mod recent;
 mod update;
 mod error_opts;
 mod ui_prefs;
+mod command;
 mod ribbon;
 mod session_lock;
 mod single_instance;
@@ -5907,41 +5908,8 @@ impl SheetApp {
 
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        // Ctrl+S / Ctrl+Shift+S：保存 / 另存为。编辑期间也生效——save() 会先提交有效编辑，
-        // 验证不通过时保留草稿且不落盘。
-        let (save_k, save_as_k) = ctx.input(|i| {
-            let s = i.modifiers.command && i.key_pressed(Key::S);
-            (s && !i.modifiers.shift, s && i.modifiers.shift)
-        });
-        if save_as_k {
-            self.save(true);
-            return;
-        }
-        if save_k {
-            self.save(false);
-            return;
-        }
-        // Ctrl+O / Ctrl+N / Ctrl+P：与开始页、功能区走同一实现
-        let (open_k, new_k, print_k) = ctx.input(|i| {
-            (
-                i.modifiers.command && i.key_pressed(Key::O),
-                i.modifiers.command && i.key_pressed(Key::N),
-                i.modifiers.command && i.key_pressed(Key::P),
-            )
-        });
-        if open_k {
-            self.open_dialog();
-            return;
-        }
-        if new_k {
-            self.new_document();
-            return;
-        }
-        if print_k {
-            self.preview_page = 0;
-            self.print_preview = true;
-            return;
-        }
+        // 保存/打开/新建/打印/撤销/重做由 crate::command 的命令表统一处理
+        // （见 `handle_command_keys`），这里只剩网格自身的按键。
         // Ctrl+F1：和 Excel 一样收起/展开功能区
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
             self.ribbon_collapsed = !self.ribbon_collapsed;
@@ -6023,12 +5991,6 @@ impl SheetApp {
                 self.keytips = false;
             }
         }
-        let (redo_key, undo_key) = ctx.input(|i| {
-            (
-                i.modifiers.command && i.key_pressed(Key::Y),
-                i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
-            )
-        });
         let show_f_k = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Backtick));
         if show_f_k {
             self.show_formulas = !self.show_formulas;
@@ -6084,10 +6046,6 @@ impl SheetApp {
         }
         if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(Key::V)) {
             self.paste_special = true;
-            return;
-        }
-        if undo_key || redo_key {
-            self.do_undo(redo_key);
             return;
         }
         // Ctrl+方向：跳到数据边缘；Ctrl+Home/End：回到 A1 / 已用区域末尾
@@ -19984,11 +19942,12 @@ impl SheetApp {
         if let Some(i) = do_switch {
             self.switch_tab(i);
         }
+        // 标签条上的 + 和开始页的入口与 Ctrl+N / Ctrl+O 共用命令表
         if new_tab {
-            self.new_document();
+            self.command_exec("NewTab", ctx);
         }
         if open_dlg {
-            self.open_dialog();
+            self.command_exec("FileOpen", ctx);
         }
     }
 
@@ -20919,16 +20878,17 @@ impl SheetApp {
                 if as_resp.on_hover_text("每 30 秒自动保存一次").clicked() {
                     self.autosave = !self.autosave;
                 }
-                // 快速访问工具栏：保存 / 撤销 / 重做
-                let (cu, cr) = (self.undo.can_undo(), self.undo.can_redo());
-                for (i, (icon, tip, on)) in [
-                    (Icon::Save, "保存（Ctrl+S）", true),
-                    (Icon::Undo, "撤销（Ctrl+Z）", cu),
-                    (Icon::Redo, "重做（Ctrl+Y）", cr),
+                // 快速访问工具栏：保存 / 撤销 / 重做。可用性、tooltip 文本和执行都取
+                // 自命令表，与快捷键、功能区共用同一份定义（UI-02.3）。
+                for (i, (icon, action)) in [
+                    (Icon::Save, "FileSave"),
+                    (Icon::Undo, "Undo"),
+                    (Icon::Redo, "Redo"),
                 ]
                 .iter()
                 .enumerate()
                 {
+                    let on = self.command_enabled(action);
                     let b = Rect::from_center_size(
                         egui::pos2(rect.left() + 158.0 + i as f32 * 32.0, rect.center().y),
                         Vec2::splat(26.0),
@@ -20937,15 +20897,14 @@ impl SheetApp {
                     if resp.hovered() {
                         painter.rect_filled(b, 3.0, hover);
                     }
-                    let col = if *on { fg } else { fg.gamma_multiply(0.35) };
-                    ui_icons::draw_excel(&painter, b.shrink(5.0), *icon, col, *on);
-                    let resp = resp.on_hover_text(*tip);
-                    if resp.clicked() && *on {
-                        match i {
-                            0 => self.save(false),
-                            1 => self.do_undo(false),
-                            _ => self.do_undo(true),
-                        }
+                    let col = if on { fg } else { fg.gamma_multiply(0.35) };
+                    ui_icons::draw_excel(&painter, b.shrink(5.0), *icon, col, on);
+                    let tip = crate::command::by_action(action)
+                        .map(|c| c.tip())
+                        .unwrap_or_default();
+                    let resp = resp.on_hover_text(tip);
+                    if resp.clicked() && on {
+                        self.command_exec(action, ui.ctx());
                     }
                 }
                 // 文件名左对齐（Excel 在 QAT 之后），超出部分裁剪
@@ -22385,6 +22344,11 @@ impl eframe::App for SheetApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
+                if !self.backstage {
+                    // 应用级命令（保存/打开/新建/打印/撤销）先过命令表：
+                    // 开始页也要能用 Ctrl+N / Ctrl+O，模态对话框与编辑态则让路。
+                    self.handle_command_keys(ctx);
+                }
                 if self.show_start {
                     self.home_page(ui);
                 } else {

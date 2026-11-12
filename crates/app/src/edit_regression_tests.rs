@@ -1855,3 +1855,158 @@ fn failed_save_keeps_dirty_reports_the_step_and_allows_retry() {
     );
     drop(env);
 }
+// ---------------------------------------------------------------- UI-02.3 命令表与快捷键优先级
+
+/// 编辑中按 Ctrl+N 原来会直接新建标签，把没提交的输入悄悄扔掉。
+/// 对标行为：先提交编辑，再执行命令——草稿必须落到原文档里。
+#[test]
+fn ctrl_n_while_editing_commits_the_draft_before_adding_a_document() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    assert_eq!(app.editing.as_ref().map(|e| e.buf.as_str()), Some("123"));
+    let tabs = app.tabs.len();
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::N, false)]);
+    assert!(app.editing.is_none(), "命令执行前必须先结束编辑");
+    let parked = app
+        .tabs
+        .iter()
+        .find_map(|t| match t {
+            TabSlot::Parked(d) => Some(d),
+            _ => None,
+        })
+        .expect("原来的文档应保留在标签里");
+    assert_eq!(
+        parked.wb.sheet(0).value(0, 0),
+        Value::Number(123.0),
+        "没提交的 123 必须写回原文档，不能随快捷键丢掉"
+    );
+    assert_eq!(app.tabs.len(), tabs + 1, "Ctrl+N 仍然要新开一个文档");
+}
+
+/// Ctrl+P 同理：先提交再进打印预览，预览里的内容必须是刚输入的值。
+#[test]
+fn ctrl_p_commits_the_draft_before_opening_print_preview() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("42".into())]);
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::P, false)]);
+    assert!(app.print_preview, "Ctrl+P 必须进打印预览");
+    assert!(app.editing.is_none());
+    assert_eq!(
+        app.wb.sheet(0).value(0, 0),
+        Value::Number(42.0),
+        "进预览前必须提交编辑"
+    );
+}
+
+/// 模态对话框打开时，应用级快捷键必须让路，否则会在对话框背后换掉文档。
+#[test]
+fn app_shortcuts_are_ignored_while_a_modal_dialog_is_open() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.hf_dlg = true; // 页眉和页脚
+    ui_frame(&mut app, &ctx, vec![]); // 让对话框真正画出来
+    let tabs = app.tabs.len();
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::N, false)]);
+    assert_eq!(
+        app.tabs.len(),
+        tabs,
+        "模态对话框打开时 Ctrl+N 不得在背后新建文档"
+    );
+    assert!(!app.print_preview, "也不得在背后打开打印预览");
+    // 对话框关掉后快捷键恢复
+    app.hf_dlg = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::N, false)]);
+    assert_eq!(app.tabs.len(), tabs + 1, "对话框关掉后 Ctrl+N 必须恢复");
+}
+
+/// 开始页没有文档：Ctrl+S/Ctrl+P 不得给不存在的文档弹另存为或写文件，
+/// Ctrl+N/Ctrl+O 仍然要能新建/打开。
+#[test]
+fn start_page_only_allows_new_and_open_shortcuts() {
+    let ctx = egui::Context::default();
+    let env = crate::test_env::TestEnv::new("ui023-start-page");
+    let target = env.path("should-not-exist.xlsx");
+    env.sc("SC_SAVE_AS", target.to_str().unwrap());
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.show_start = true;
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    assert!(
+        app.tasks.saving.is_none(),
+        "开始页没有文档，Ctrl+S 不得触发保存"
+    );
+    assert!(!target.exists(), "开始页 Ctrl+S 不得写出文件");
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::P, false)]);
+    assert!(!app.print_preview, "开始页没有文档，Ctrl+P 不得进预览");
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::N, false)]);
+    assert!(!app.show_start, "开始页 Ctrl+N 必须新建文档");
+    drop(env);
+}
+
+/// 功能区的灰态与快捷键必须来自同一个谓词：撤销栈空时两处都不可用，
+/// 有一步编辑后两处同时可用。
+#[test]
+fn ribbon_buttons_and_command_table_share_one_enabled_predicate() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let ids = [
+        "FileSave",
+        "FileSaveAs",
+        "FileOpen",
+        "NewTab",
+        "FilePrintPreview",
+        "PagePrintPreview",
+        "ViewPrintPreview",
+        "Undo",
+        "Redo",
+    ];
+    for id in ids {
+        let action = crate::command::action_for_ctl(id);
+        let cmd = crate::command::by_action(action)
+            .unwrap_or_else(|| panic!("{id}（action {action}）必须登记在命令表里"));
+        assert_eq!(
+            app.ctl_state(id).enabled,
+            (cmd.enabled)(&app),
+            "{id} 的按钮灰态与命令表谓词不一致"
+        );
+    }
+    assert!(!app.command_enabled("Undo"), "空撤销栈");
+    assert!(!app.ctl_state("Undo").enabled);
+
+    ui_frame(&mut app, &ctx, vec![]);
+    uiframe_type_commit(&mut app, &ctx, "7");
+    assert!(app.command_enabled("Undo"), "有一步编辑后撤销必须可用");
+    assert!(app.ctl_state("Undo").enabled, "功能区撤销按钮也必须同时变亮");
+    // 灰掉的按钮点不动：不可用时执行函数直接返回，且不改模型
+    app.undo.clear();
+    let before = app.wb.sheet(0).value(0, 0).clone();
+    assert!(!app.command_enabled("Undo"));
+    let _ = app.command_exec("Undo", &ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 0), before, "不可用的命令不得执行");
+}
+
+/// tooltip 里的快捷键来自命令表，不改帮助文字就会对不上。
+#[test]
+fn command_tooltips_carry_their_registered_shortcut() {
+    for cmd in crate::command::COMMANDS {
+        let tip = cmd.tip();
+        assert!(
+            tip.contains(&cmd.shortcut()),
+            "{} 的 tooltip 缺少快捷键：{tip}",
+            cmd.action
+        );
+    }
+    assert_eq!(
+        crate::command::by_action("FileSave").unwrap().shortcut(),
+        "Ctrl+S"
+    );
+    assert_eq!(
+        crate::command::by_action("FileSaveAs").unwrap().shortcut(),
+        "Ctrl+Shift+S"
+    );
+}

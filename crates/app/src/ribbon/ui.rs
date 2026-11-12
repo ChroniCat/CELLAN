@@ -272,12 +272,21 @@ fn on_enabled(c: &Ctl, st: &super::CtlState) -> bool {
 }
 
 fn tip_of(c: &Ctl) -> String {
-    match (&c.screentip, &c.supertip) {
+    let mut s = match (&c.screentip, &c.supertip) {
         (Some(a), Some(b)) => format!("{a}\n{b}"),
         (Some(a), None) => a.clone(),
         (None, Some(b)) => b.clone(),
         (None, None) => String::new(),
+    };
+    // 命令表里登记的快捷键直接写进 tooltip，避免帮助文字与实际按键不符
+    if let Some(cmd) = crate::command::by_action(c.action()) {
+        s = if s.is_empty() {
+            cmd.tip()
+        } else {
+            format!("{s} ({})", cmd.shortcut())
+        };
     }
+    s
 }
 
 fn measure(ui: &egui::Ui, text: &str, size: f32) -> f32 {

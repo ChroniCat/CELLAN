@@ -38,8 +38,24 @@ impl SheetApp {
         let mut st = CtlState::default();
         let cur = self.current_style();
         match id {
-            "Undo" => st.enabled = self.undo.can_undo(),
-            "Redo" => st.enabled = self.undo.can_redo(),
+            // 按钮的可用性与快捷键共用命令表里的同一个谓词
+            "Undo" => st.enabled = self.command_enabled("Undo"),
+            "Redo" => st.enabled = self.command_enabled("Redo"),
+            "FileSave" | "FileSaveAs" | "FileOpen" | "NewTab" | "FilePrintPreview"
+            | "PagePrintPreview" | "ViewPrintPreview" => {
+                let action = crate::command::action_for_ctl(id);
+                st.enabled = self.command_enabled(action);
+                if let Some(hint) = self.disabled_hint(action) {
+                    let base = crate::command::by_action(action)
+                        .map(|c| c.tip())
+                        .unwrap_or_default();
+                    st.tip = Some(if base.is_empty() {
+                        format!("{hint}。")
+                    } else {
+                        format!("{base}\n{hint}。")
+                    });
+                }
+            }
             "Font" => {
                 st.text = Some(if cur.font.is_empty() {
                     "默认".to_string()
@@ -248,6 +264,11 @@ impl SheetApp {
 
     /// 命令分发：XML 的 onAction → 既有实现。
     pub fn ribbon_action(&mut self, action: &str, ctx: &egui::Context) {
+        // 登记过的应用级命令（保存/另存为/打开/新建/打印/撤销/重做）只有一份实现，
+        // 快捷键与菜单点击都落到这里。
+        if self.command_exec(action, ctx) {
+            return;
+        }
         // 下拉项按前缀带值
         if let Some(code) = action.strip_prefix("fmt:") {
             let code = code.to_string();

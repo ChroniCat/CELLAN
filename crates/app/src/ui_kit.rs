@@ -888,6 +888,19 @@ pub fn sheet_tab(
 
 /// 统一样式的对话框窗口：自绘标题栏（左对齐标题 + 关闭按钮 + 可拖动），
 /// 白底、1px 边框、圆角、投影；不再使用 egui 自带标题栏。
+/// 本帧是否画过 ui_kit 模态对话框。命令层用它判断「模态对话框是否占着键盘」，
+/// 不用逐个枚举 50 个对话框字段——只要对话框还开着，`Dlg::show` 每帧都会打标。
+const DIALOG_SHOWN: &str = "ui_kit_dialog_shown";
+
+fn dialog_mark() -> egui::Id {
+    egui::Id::new(DIALOG_SHOWN)
+}
+
+/// 读一次即清：对话框关掉后标记不会残留到下一帧。
+pub fn take_dialog_shown(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(dialog_mark()).unwrap_or(false))
+}
+
 pub struct Dlg {
     title: String,
     width: f32,
@@ -946,6 +959,7 @@ impl Dlg {
         add: impl FnOnce(&mut egui::Ui) -> R,
     ) -> Option<egui::InnerResponse<R>> {
         let id = egui::Id::new(("dlgwin", &self.title));
+        ctx.data_mut(|d| d.insert_temp(dialog_mark(), true));
         let screen = ctx.screen_rect();
         let mut pos = ctx
             .data(|d| d.get_temp::<egui::Pos2>(id.with("pos")))
