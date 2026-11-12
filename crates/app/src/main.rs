@@ -21089,24 +21089,13 @@ impl eframe::App for SheetApp {
                                     .unwrap_or_default();
                                 self.note_edit = Some((r, c, cur));
                             }
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
+                            // 含宏提示和上面的按钮放进同一组：以前这里是第二个
+                            // right_to_left 布局，右侧已被前一占满，结果「在线」和「协作 · N 人」叠字。
                             if self.wb.has_vba {
                                 ui.label(
                                     egui::RichText::new("含宏（保留不执行）")
                                         .size(10.5)
                                         .color(egui::Color32::from_rgb(180, 110, 0)),
-                                );
-                            }
-                            if self.net.is_some() {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "协作 · {} 人",
-                                        self.peers_list.len()
-                                    ))
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(46, 125, 50)),
                                 );
                             }
                         });
