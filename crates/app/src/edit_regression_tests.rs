@@ -488,15 +488,11 @@ fn right_clicking_a_column_header_opens_the_header_menu() {
     run_grid_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
     run_grid_frame(&mut app, &ctx, vec![secondary(pos, true)]);
     run_grid_frame(&mut app, &ctx, vec![secondary(pos, false)]);
-    match app.head_menu {
-        Some((kind, idx, _)) => {
-            assert_eq!(kind, 0, "应该是列菜单");
-            assert_eq!(idx, 0, "应该指向 A 列");
-        }
-        None => panic!("列标右键没有打开表头菜单"),
+    match app.ctx_menu.as_ref().map(|m| (m.kind, m.idx)) {
+        Some((CtxKind::Cols, idx)) => assert_eq!(idx, 0, "应该指向 A 列"),
+        other => panic!("列标右键没有打开表头菜单：{other:?}"),
     }
-    // 点表头菜单里的“列宽自适应”之前，先把菜单关掉，避免 Area 影响后续断言
-    app.head_menu = None;
+    app.ctx_menu = None;
 }
 
 #[test]
@@ -1166,7 +1162,7 @@ fn ctx_menu_clear_contents_only_clears_values() {
     app.wb.sheets[0].set(0, 1, number(9.0));
     app.sel = (0, 0);
     app.sel_end = (0, 1);
-    app.ctx_menu_run(CtxAct::ClearContents, &ctx);
+    app.ctx_menu_run(CtxAct::ClearContents, 0, &ctx);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
     assert_eq!(app.wb.sheets[0].value(0, 1), Value::Empty);
     // 撤销要能回来
@@ -1183,11 +1179,11 @@ fn ctx_menu_sort_asc_and_desc_are_real() {
         app.wb.sheets[0].set(i as u32, 1, number(v.1));
     }
     app.sel = (1, 1);
-    app.ctx_menu_run(CtxAct::SortAsc, &ctx);
+    app.ctx_menu_run(CtxAct::SortAsc, 0, &ctx);
     let col: Vec<String> = (0..3).map(|r| app.wb.sheets[0].value(r, 1).display()).collect();
     assert_eq!(col, ["1", "2", "3"], "升序按当前列排整个区域");
     assert!(app.status.contains("升序"));
-    app.ctx_menu_run(CtxAct::SortDesc, &ctx);
+    app.ctx_menu_run(CtxAct::SortDesc, 0, &ctx);
     let col: Vec<String> = (0..3).map(|r| app.wb.sheets[0].value(r, 1).display()).collect();
     assert_eq!(col, ["3", "2", "1"]);
 }
@@ -1200,11 +1196,11 @@ fn ctx_menu_insert_and_delete_rows_are_real() {
     app.wb.sheets[0].set(1, 0, number(2.0));
     app.sel = (1, 0);
     app.sel_end = (1, 0);
-    app.ctx_menu_run(CtxAct::InsertRows, &ctx);
+    app.ctx_menu_run(CtxAct::InsertRows, 0, &ctx);
     assert_eq!(app.wb.sheets[0].value(2, 0), Value::Number(2.0), "原第 2 行被推到第 3 行");
     app.sel = (1, 0);
     app.sel_end = (1, 0);
-    app.ctx_menu_run(CtxAct::DeleteRows, &ctx);
+    app.ctx_menu_run(CtxAct::DeleteRows, 0, &ctx);
     assert_eq!(app.wb.sheets[0].value(1, 0), Value::Number(2.0), "删掉刚插入的空行");
 }
 
@@ -1219,8 +1215,57 @@ fn ctx_menu_paste_values_keeps_number_but_drops_formula() {
     app.clip_copy(false, &ctx);
     app.sel = (2, 2);
     app.sel_end = (2, 2);
-    app.ctx_menu_run(CtxAct::PasteValues, &ctx);
+    app.ctx_menu_run(CtxAct::PasteValues, 0, &ctx);
     let cell = app.wb.sheets[0].get(2, 2).cloned().unwrap();
     assert!(cell.formula.is_none(), "只粘数值，不带公式");
     assert_eq!(cell.value, Value::Number(5.0));
+}
+
+#[test]
+fn ctx_head_menu_hides_and_unhides_rows_and_cols() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(1.0));
+    app.sel = (1, 0);
+    app.sel_end = (3, 0);
+    app.ctx_menu_run(CtxAct::HideRows, 1, &ctx);
+    assert_eq!(app.wb.sheets[0].hidden_rows_user.len(), 3, "选区 3 行都隐藏");
+    app.ctx_menu_run(CtxAct::UnhideRows, 1, &ctx);
+    assert!(app.wb.sheets[0].hidden_rows_user.is_empty(), "取消隐藏把选区内的放出来");
+
+    app.sel = (0, 1);
+    app.sel_end = (0, 2);
+    app.ctx_menu_run(CtxAct::HideCols, 1, &ctx);
+    assert_eq!(app.wb.sheets[0].hidden_cols.len(), 2);
+    app.ctx_menu_run(CtxAct::UnhideCols, 1, &ctx);
+    assert!(app.wb.sheets[0].hidden_cols.is_empty());
+}
+
+#[test]
+fn ctx_head_menu_rows_are_excel_like() {
+    let rows = ctx_head_rows(true);
+    let labels: Vec<&str> = rows.iter().filter(|r| !r.is_sep() && !r.strip).map(|r| r.label).collect();
+    assert_eq!(
+        labels,
+        ["剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容", "列宽…", "隐藏", "取消隐藏", "设置单元格格式…"]
+    );
+    // 列标用「列宽…」，行号用「行高…」
+    let row_labels: Vec<&str> = ctx_head_rows(false).iter().map(|r| r.label).collect();
+    assert!(row_labels.contains(&"行高…") && !row_labels.contains(&"列宽…"));
+}
+
+#[test]
+fn ctx_tab_menu_sets_and_clears_tab_color() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.add_sheet();
+    let idx = app.wb.sheets.len() - 1;
+    app.ctx_menu_run(CtxAct::TabColor(Some([68, 114, 196])), idx, &ctx);
+    assert_eq!(app.wb.sheets[idx].tab_color, Some([68, 114, 196]));
+    assert!(app.wb.sheets[idx].tab_color_dirty);
+    app.ctx_menu_run(CtxAct::TabColor(None), idx, &ctx);
+    assert_eq!(app.wb.sheets[idx].tab_color, None);
+    // 标签菜单的条目
+    let labels: Vec<&str> = ctx_tab_rows().iter().filter(|r| !r.is_sep()).map(|r| r.label).collect();
+    assert_eq!(labels, ["插入…", "删除", "重命名", "复制", "工作表标签颜色", "设置单元格格式…"]);
 }

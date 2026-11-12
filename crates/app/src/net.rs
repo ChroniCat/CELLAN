@@ -16,6 +16,14 @@ use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 7878;
 
+/// 实际监听的端口：`SC_NET_PORT` 可覆盖（同机多实例、端口被占时用）
+pub fn port() -> u16 {
+    std::env::var("SC_NET_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     Connected,
@@ -336,6 +344,11 @@ pub fn host(
 
     let peers: Arc<Mutex<HashMap<u32, Sender<String>>>> = Arc::new(Mutex::new(HashMap::new()));
     let peer_names: Arc<Mutex<HashMap<u32, (String, u8)>>> = Arc::new(Mutex::new(HashMap::new()));
+    // 宿主自己也是参与者：名单里没有它，新加入的同事就只看到自己一个人（"显示不出另一台在线"）
+    peer_names
+        .lock()
+        .unwrap()
+        .insert(site, (name.clone(), (site % 7) as u8));
     let state: Arc<Mutex<Vec<Op>>> = Arc::new(Mutex::new(Vec::new()));
 
     // 广播分发
@@ -811,8 +824,12 @@ pub fn join(
     addr: &str,
     password: String,
 ) -> std::io::Result<Net> {
-    // 先同步试连一次，连不上立刻报错（避免用户以为成功了）
-    let first = TcpStream::connect(addr)?;
+    // 先同步试连一次，连不上立刻报错（避免用户以为成功了）。
+    // 必须带超时：对端防火墙丢包时默认 connect 会卡 20 秒，界面像死了。
+    let sock: std::net::SocketAddr = addr.parse().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("地址格式不对：{addr}"))
+    })?;
+    let first = TcpStream::connect_timeout(&sock, Duration::from_secs(3))?;
     drop(first);
 
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
@@ -1131,5 +1148,52 @@ mod tests {
             wait_for(&client, 3, |e| matches!(e, NetEvent::Connected)),
             "正确口令应连上"
         );
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    /// 新加入的人必须能在 Welcome 里看到宿主（以前宿主不登记自己，
+    /// 刚加入的人只看到自己一个人 = 用户说的「显示不出另一台在线」）。
+    #[test]
+    fn welcome_lists_the_host_as_a_peer() {
+        let port: u16 = 7987;
+        let host_net = match host(11, "宿主".into(), "doc".into(), port, String::new()) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("跳过：端口 {port} 起不来（{e}）");
+                return;
+            }
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let client = join(
+            22,
+            "同事".into(),
+            "doc".into(),
+            &format!("127.0.0.1:{port}"),
+            String::new(),
+        )
+        .expect("应能连上宿主");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got: Option<Vec<(u32, String, u8)>> = None;
+        while std::time::Instant::now() < deadline {
+            match client.events.recv_timeout(Duration::from_millis(200)) {
+                Ok(NetEvent::Welcome { peers }) => {
+                    got = Some(peers);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        let peers = got.expect("5 秒内应收到 Welcome");
+        assert!(
+            peers.iter().any(|(s, _, _)| *s == 11),
+            "Welcome 里必须包含宿主站点 11，实际 {peers:?}"
+        );
+        drop(client);
+        drop(host_net);
     }
 }

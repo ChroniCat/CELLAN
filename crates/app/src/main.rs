@@ -696,7 +696,6 @@ struct SheetApp {
     /// 名称框下拉（定义名称列表）
     name_dropdown: bool,
     /// 表头右键菜单：(0=列 1=行, 索引, 屏幕位置)
-    head_menu: Option<(u8, u32, egui::Pos2)>,
     /// 选中的图表（图表工具上下文页签）
     chart_sel: Option<usize>,
     /// 正在拖动/缩放的图表
@@ -834,6 +833,10 @@ struct SheetApp {
     peers_list: Vec<(u32, String, u8)>,
     join_addr: String,
     room_password: String,
+    /// 周期发现的节流
+    auto_tick: Option<std::time::Instant>,
+    /// 后台探测对端是否可达：地址 + 结果通道
+    auto_probe: Option<(String, std::sync::mpsc::Receiver<bool>)>,
     /// 网盘文件打开后自动开房/加入（静默，不必点共享）
     auto_share: bool,
     my_name: String,
@@ -911,6 +914,19 @@ enum CtxAct {
     SortCustom,
     FormatCells,
     Hyperlink,
+    // 行号 / 列标
+    SetRowHeight,
+    SetColWidth,
+    HideRows,
+    UnhideRows,
+    HideCols,
+    UnhideCols,
+    // 工作表标签
+    InsertSheet,
+    DeleteSheet,
+    RenameSheet,
+    CopySheet,
+    TabColor(Option<[u8; 3]>),
 }
 
 /// 一行菜单项；`strip` 为真的行画粘贴选项图标条
@@ -921,24 +937,35 @@ struct CtxRow {
     act: Option<CtxAct>,
     children: Vec<CtxRow>,
     strip: bool,
+    /// 颜色块（标签颜色子菜单用）
+    swatch: Option<[u8; 3]>,
 }
 
 impl CtxRow {
     fn item(label: &'static str, icon: Option<crate::ui_icons::Icon>, shortcut: &'static str, act: CtxAct) -> Self {
-        Self { label, icon, shortcut, act: Some(act), children: Vec::new(), strip: false }
+        Self { label, icon, shortcut, act: Some(act), children: Vec::new(), strip: false, swatch: None }
     }
     fn parent(label: &'static str, icon: Option<crate::ui_icons::Icon>, children: Vec<CtxRow>) -> Self {
-        Self { label, icon, shortcut: "", act: None, children, strip: false }
+        Self { label, icon, shortcut: "", act: None, children, strip: false, swatch: None }
     }
     fn sep() -> Self {
-        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: false }
+        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: false, swatch: None }
     }
     fn paste_strip() -> Self {
-        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: true }
+        Self { label: "", icon: None, shortcut: "", act: None, children: Vec::new(), strip: true, swatch: None }
     }
     fn is_sep(&self) -> bool {
         self.label.is_empty() && !self.strip
     }
+}
+
+/// 右键菜单的种类：单元格 / 行号 / 列标 / 工作表标签
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CtxKind {
+    Cell,
+    Rows,
+    Cols,
+    Tab,
 }
 
 /// 右键菜单状态
@@ -948,6 +975,73 @@ struct CtxMenuState {
     frame: u64,
     /// 展开的子菜单 (行号)
     sub: Option<usize>,
+    kind: CtxKind,
+    /// 行号/列号，或工作表下标
+    idx: usize,
+}
+
+/// 工作表标签的 8 个颜色 + 无颜色（Excel 的「工作表标签颜色」）
+const TAB_COLORS: [(&str, [u8; 3]); 8] = [
+    ("红色", [192, 0, 0]),
+    ("橙色", [237, 125, 49]),
+    ("黄色", [255, 192, 0]),
+    ("绿色", [112, 173, 71]),
+    ("青色", [0, 176, 176]),
+    ("蓝色", [68, 114, 196]),
+    ("紫色", [112, 48, 160]),
+    ("灰色", [128, 128, 128]),
+];
+
+/// 行号 / 列标菜单（Excel 365 的行头与列头菜单，条目一致，只是「行高/列宽」互换）
+fn ctx_head_rows(is_col: bool) -> Vec<CtxRow> {
+    let size_label = if is_col { "列宽…" } else { "行高…" };
+    let size_act = if is_col { CtxAct::SetColWidth } else { CtxAct::SetRowHeight };
+    let hide_act = if is_col { CtxAct::HideCols } else { CtxAct::HideRows };
+    let unhide_act = if is_col { CtxAct::UnhideCols } else { CtxAct::UnhideRows };
+    let ins = if is_col { CtxAct::InsertCols } else { CtxAct::InsertRows };
+    let del = if is_col { CtxAct::DeleteCols } else { CtxAct::DeleteRows };
+    vec![
+        CtxRow::item("剪切", Some(crate::ui_icons::Icon::Cut), "Ctrl+X", CtxAct::Cut),
+        CtxRow::item("复制", Some(crate::ui_icons::Icon::Copy), "Ctrl+C", CtxAct::Copy),
+        CtxRow::item("粘贴", Some(crate::ui_icons::Icon::Paste), "Ctrl+V", CtxAct::Paste),
+        CtxRow::paste_strip(),
+        CtxRow::sep(),
+        CtxRow::item("选择性粘贴…", None, "Ctrl+Alt+V", CtxAct::PasteSpecial),
+        CtxRow::sep(),
+        CtxRow::item("插入", Some(crate::ui_icons::Icon::Plus), "", ins),
+        CtxRow::item("删除", Some(crate::ui_icons::Icon::Eraser), "", del),
+        CtxRow::item("清除内容", Some(crate::ui_icons::Icon::Eraser), "Delete", CtxAct::ClearContents),
+        CtxRow::sep(),
+        CtxRow::item(size_label, None, "", size_act),
+        CtxRow::item("隐藏", None, "", hide_act),
+        CtxRow::item("取消隐藏", None, "", unhide_act),
+        CtxRow::sep(),
+        CtxRow::item("设置单元格格式…", Some(crate::ui_icons::Icon::FontColor), "Ctrl+1", CtxAct::FormatCells),
+    ]
+}
+
+/// 工作表标签菜单
+fn ctx_tab_rows() -> Vec<CtxRow> {
+    let mut colors: Vec<CtxRow> = vec![{
+        let mut r = CtxRow::item("无颜色", None, "", CtxAct::TabColor(None));
+        r.swatch = Some([255, 255, 255]);
+        r
+    }];
+    for (name, rgb) in TAB_COLORS.iter() {
+        let mut r = CtxRow::item(name, None, "", CtxAct::TabColor(Some(*rgb)));
+        r.swatch = Some(*rgb);
+        colors.push(r);
+    }
+    vec![
+        CtxRow::item("插入…", Some(crate::ui_icons::Icon::Plus), "", CtxAct::InsertSheet),
+        CtxRow::item("删除", Some(crate::ui_icons::Icon::Eraser), "", CtxAct::DeleteSheet),
+        CtxRow::item("重命名", None, "", CtxAct::RenameSheet),
+        CtxRow::item("复制", None, "", CtxAct::CopySheet),
+        CtxRow::sep(),
+        CtxRow::parent("工作表标签颜色", None, colors),
+        CtxRow::sep(),
+        CtxRow::item("设置单元格格式…", Some(crate::ui_icons::Icon::FontColor), "Ctrl+1", CtxAct::FormatCells),
+    ]
 }
 
 /// 单元格右键菜单的条目（照本机 Excel 365 的单元格菜单排）
@@ -1200,8 +1294,7 @@ impl SheetApp {
             cycles_key: (u64::MAX, u64::MAX),
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
-            name_dropdown: false,
-            head_menu: None,
+            name_dropdown: false,
             chart_sel: None,
             chart_drag: None,
             protect_dlg: None,
@@ -1304,6 +1397,8 @@ impl SheetApp {
             peers_list: Vec::new(),
             join_addr: String::new(),
             room_password: String::new(),
+            auto_tick: None,
+            auto_probe: None,
             auto_share: true,
             my_name: default_name(),
             last_cursor: None,
@@ -11487,9 +11582,33 @@ impl SheetApp {
                                         egui::RichText::new(format!("已共享 · 在线 {} 人", self.peers_list.len()))
                                             .size(13.0),
                                     );
+                                    if let Some(addr) = self
+                                        .wb
+                                        .path
+                                        .as_ref()
+                                        .and_then(|p| session_lock::read(p))
+                                        .map(|i| i.host)
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!("本机地址：{addr}"))
+                                                .size(12.0)
+                                                .color(ui_kit::TEXT_WEAK),
+                                        );
+                                    }
                                     if ui_kit::primary_button(ui, "查看成员").clicked() {
                                         self.members_open = true;
                                     }
+                                }
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "同事连不上时，通常是本机防火墙没放行协作端口。",
+                                    )
+                                    .size(12.0)
+                                    .color(ui_kit::TEXT_WEAK),
+                                );
+                                if ui_kit::secondary_button(ui, "放行防火墙").clicked() {
+                                    self.open_firewall_port();
                                 }
                             }
                             _ => {
@@ -15831,10 +15950,15 @@ impl SheetApp {
     /// 自绘单元格右键菜单（照本机 Excel 365 的条目、分组、行高与图标位）
     fn ctx_menu_window(&mut self, ctx: &egui::Context) {
         self.ctx_rects.clear();
-        let Some(m) = self.ctx_menu.as_ref() else { return };
-        let (pos, opened_frame, sub) = (m.pos, m.frame, m.sub);
+        let Some(m0) = self.ctx_menu.as_ref() else { return };
+        let (pos, opened_frame, sub, kind0, idx0) = (m0.pos, m0.frame, m0.sub, m0.kind, m0.idx);
         let has_filter = self.wb.sheet(self.sheet_idx).filter.is_some();
-        let rows = ctx_menu_rows(has_filter);
+        let rows = match kind0 {
+            CtxKind::Cell => ctx_menu_rows(has_filter),
+            CtxKind::Rows => ctx_head_rows(false),
+            CtxKind::Cols => ctx_head_rows(true),
+            CtxKind::Tab => ctx_tab_rows(),
+        };
         let total_h = ctx_menu_height(&rows);
         let mut action: Option<CtxAct> = None;
         let mut sub_req: Option<(usize, f32)> = None;
@@ -16022,8 +16146,23 @@ impl SheetApp {
                         if r.hovered() {
                             p.rect_filled(rr.shrink2(egui::vec2(4.0, 0.0)), 2.0, hover_bg);
                         }
+                        let mut text_x = sp.x + 14.0;
+                        if let Some(rgb) = kid.swatch {
+                            let sw = egui::Rect::from_min_size(
+                                egui::pos2(sp.x + 12.0, y + 6.0),
+                                egui::vec2(14.0, 14.0),
+                            );
+                            p.rect_filled(sw, 1.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                            p.rect_stroke(
+                                sw,
+                                1.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 150)),
+                                egui::StrokeKind::Inside,
+                            );
+                            text_x = sp.x + 34.0;
+                        }
                         p.text(
-                            egui::pos2(sp.x + 14.0, y + CTX_ROW_H / 2.0),
+                            egui::pos2(text_x, y + CTX_ROW_H / 2.0),
                             egui::Align2::LEFT_CENTER,
                             kid.label,
                             egui::FontId::proportional(12.5),
@@ -16042,7 +16181,7 @@ impl SheetApp {
         self.ctx_rects = rects;
         if let Some(a) = action {
             self.ctx_menu = None;
-            self.ctx_menu_run(a, ctx);
+            self.ctx_menu_run(a, idx0, ctx);
             return;
         }
         // Esc / 点到菜单外面（打开那一帧的点击不算）
@@ -16065,7 +16204,7 @@ impl SheetApp {
     }
 
     /// 执行右键菜单动作
-    fn ctx_menu_run(&mut self, act: CtxAct, ctx: &egui::Context) {
+    fn ctx_menu_run(&mut self, act: CtxAct, idx: usize, ctx: &egui::Context) {
         let (r1, c1, r2, c2) = self.sel_rect();
         let n_rows = r2 - r1 + 1;
         let n_cols = c2 - c1 + 1;
@@ -16135,7 +16274,81 @@ impl SheetApp {
             }
             CtxAct::FormatCells => self.open_format_dialog(),
             CtxAct::Hyperlink => {
-                self.hyper_dlg = Some((String::new(), String::new()));
+                let (r, c) = self.sel;
+                let text = self.wb.sheet(self.sheet_idx).value(r, c).display();
+                self.hyper_dlg = Some((String::new(), text));
+            }
+            CtxAct::SetRowHeight => {
+                let h = self.wb.sheet(self.sheet_idx).rows.size(self.sel.0);
+                self.size_dlg = Some((false, h));
+            }
+            CtxAct::SetColWidth => {
+                let w = self.wb.sheet(self.sheet_idx).cols.size(self.sel.1);
+                self.size_dlg = Some((true, w));
+            }
+            CtxAct::HideRows => {
+                let (r1, _, r2, _) = self.sel_rect();
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for r in r1..=r2 {
+                    sh.hidden_rows_user.insert(r);
+                }
+                sh.layout_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已隐藏 {} 行", r2 - r1 + 1);
+            }
+            CtxAct::UnhideRows => {
+                let (r1, _, r2, _) = self.sel_rect();
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let before = sh.hidden_rows_user.len();
+                sh.hidden_rows_user.retain(|r| *r < r1 || *r > r2);
+                let n = before - sh.hidden_rows_user.len();
+                sh.layout_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已取消隐藏 {n} 行");
+            }
+            CtxAct::HideCols => {
+                let (_, c1, _, c2) = self.sel_rect();
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                for c in c1..=c2 {
+                    sh.hidden_cols.insert(c);
+                }
+                sh.layout_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已隐藏 {} 列", c2 - c1 + 1);
+            }
+            CtxAct::UnhideCols => {
+                let (_, c1, _, c2) = self.sel_rect();
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let before = sh.hidden_cols.len();
+                sh.hidden_cols.retain(|c| *c < c1 || *c > c2);
+                let n = before - sh.hidden_cols.len();
+                sh.layout_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已取消隐藏 {n} 列");
+            }
+            CtxAct::InsertSheet => self.add_sheet(),
+            CtxAct::DeleteSheet => self.delete_sheet(idx),
+            CtxAct::RenameSheet => {
+                if let Some(name) = self.wb.sheets.get(idx).map(|s| s.name.clone()) {
+                    self.rename_sheet = Some((idx, name));
+                }
+            }
+            CtxAct::CopySheet => self.duplicate_sheet(idx),
+            CtxAct::TabColor(rgb) => {
+                if let Some(sh) = self.wb.sheets.get_mut(idx) {
+                    sh.tab_color = rgb;
+                    sh.tab_color_dirty = true;
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.status = match rgb {
+                        Some(_) => "已设置工作表标签颜色".into(),
+                        None => "已清除工作表标签颜色".into(),
+                    };
+                }
             }
         }
     }
@@ -18458,6 +18671,8 @@ impl SheetApp {
                     pos: p,
                     frame: ui.ctx().cumulative_pass_nr(),
                     sub: None,
+                    kind: CtxKind::Cell,
+                    idx: 0,
                 });
             }
         }
@@ -18796,173 +19011,25 @@ impl SheetApp {
                     let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
                     self.sel = (0, c);
                     self.sel_end = (1_048_575, c);
-                    self.head_menu = Some((0, c, p));
+                    self.ctx_menu = Some(CtxMenuState {
+                        pos: p,
+                        frame: ui.ctx().cumulative_pass_nr(),
+                        sub: None,
+                        kind: CtxKind::Cols,
+                        idx: c as usize,
+                    });
                 } else if in_row_head {
                     let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
                     self.sel = (r, 0);
                     self.sel_end = (r, 16_383);
-                    self.head_menu = Some((1, r, p));
-                }
-            }
-        }
-        if let Some((kind, idx, menu_pos)) = self.head_menu {
-            let mut act: Option<u8> = None;
-            let out = egui::Area::new(egui::Id::new(("head_menu", kind, idx)))
-                .fixed_pos(menu_pos)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::menu(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(150.0);
-                        if kind == 0 {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} 列",
-                                    cell_name(0, idx).trim_end_matches('1')
-                                ))
-                                .size(11.0)
-                                .weak(),
-                            );
-                            ui.separator();
-                            if ui.button("插入列").clicked() {
-                                act = Some(0);
-                            }
-                            if ui.button("删除列").clicked() {
-                                act = Some(1);
-                            }
-                            if ui.button("列宽自适应").clicked() {
-                                act = Some(2);
-                            }
-                            if ui.button("列宽…").clicked() {
-                                act = Some(6);
-                            }
-                            ui.separator();
-                            if ui.button("隐藏列").clicked() {
-                                act = Some(8);
-                            }
-                            let (_, c1, _, c2) = self.sel_rect();
-                            let any_hidden = self
-                                .wb
-                                .sheet(self.sheet_idx)
-                                .hidden_cols
-                                .iter()
-                                .any(|c| *c >= c1 && *c <= c2);
-                            if any_hidden && ui.button("取消隐藏列").clicked() {
-                                act = Some(9);
-                            }
-                        } else {
-                            ui.label(
-                                egui::RichText::new(format!("第 {} 行", idx + 1))
-                                    .size(11.0)
-                                    .weak(),
-                            );
-                            ui.separator();
-                            if ui.button("插入行").clicked() {
-                                act = Some(3);
-                            }
-                            if ui.button("删除行").clicked() {
-                                act = Some(4);
-                            }
-                            if ui.button("行高自适应").clicked() {
-                                act = Some(5);
-                            }
-                            if ui.button("行高…").clicked() {
-                                act = Some(7);
-                            }
-                            ui.separator();
-                            if ui.button("隐藏行").clicked() {
-                                act = Some(10);
-                            }
-                            let (r1, _, r2, _) = self.sel_rect();
-                            let any_hidden = self
-                                .wb
-                                .sheet(self.sheet_idx)
-                                .hidden_rows_user
-                                .iter()
-                                .any(|r| *r >= r1 && *r <= r2);
-                            if any_hidden && ui.button("取消隐藏行").clicked() {
-                                act = Some(11);
-                            }
-                        }
+                    self.ctx_menu = Some(CtxMenuState {
+                        pos: p,
+                        frame: ui.ctx().cumulative_pass_nr(),
+                        sub: None,
+                        kind: CtxKind::Rows,
+                        idx: r as usize,
                     });
-                });
-            if ctx.input(|i| i.pointer.any_click()) {
-                let inside = ctx
-                    .pointer_interact_pos()
-                    .map(|p| out.response.rect.contains(p))
-                    .unwrap_or(false);
-                if !inside && act.is_none() {
-                    self.head_menu = None;
                 }
-            }
-            if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                self.head_menu = None;
-            }
-            if let Some(a) = act {
-                match a {
-                    0 => self.structural(sheetcore::structural::Structural::InsertCols {
-                        at: idx,
-                        n: 1,
-                    }),
-                    1 => self.structural(sheetcore::structural::Structural::DeleteCols {
-                        at: idx,
-                        n: 1,
-                    }),
-                    2 => self.autofit_col(ui.ctx(), idx),
-                    3 => self.structural(sheetcore::structural::Structural::InsertRows {
-                        at: idx,
-                        n: 1,
-                    }),
-                    4 => self.structural(sheetcore::structural::Structural::DeleteRows {
-                        at: idx,
-                        n: 1,
-                    }),
-                    5 => self.autofit_row(ui.ctx(), idx),
-                    6 => {
-                        let w = self.wb.sheet(self.sheet_idx).cols.size(idx);
-                        self.size_dlg = Some((true, w));
-                    }
-                    7 => {
-                        let h = self.wb.sheet(self.sheet_idx).rows.size(idx);
-                        self.size_dlg = Some((false, h));
-                    }
-                    8 => {
-                        let (_, c1, _, c2) = self.sel_rect();
-                        let sheet = self.wb.sheet_mut(self.sheet_idx);
-                        for c in c1..=c2 {
-                            sheet.hidden_cols.insert(c);
-                        }
-                        sheet.layout_dirty = true;
-                        self.status = format!("已隐藏 {} 列", c2 - c1 + 1);
-                    }
-                    9 => {
-                        let (_, c1, _, c2) = self.sel_rect();
-                        let sheet = self.wb.sheet_mut(self.sheet_idx);
-                        let before = sheet.hidden_cols.len();
-                        sheet.hidden_cols.retain(|c| *c < c1 || *c > c2);
-                        let n = before - sheet.hidden_cols.len();
-                        sheet.layout_dirty = true;
-                        self.status = format!("已取消隐藏 {n} 列");
-                    }
-                    10 => {
-                        let (r1, _, r2, _) = self.sel_rect();
-                        let sheet = self.wb.sheet_mut(self.sheet_idx);
-                        for r in r1..=r2 {
-                            sheet.hidden_rows_user.insert(r);
-                        }
-                        sheet.layout_dirty = true;
-                        self.status = format!("已隐藏 {} 行", r2 - r1 + 1);
-                    }
-                    _ => {
-                        let (r1, _, r2, _) = self.sel_rect();
-                        let sheet = self.wb.sheet_mut(self.sheet_idx);
-                        let before = sheet.hidden_rows_user.len();
-                        sheet.hidden_rows_user.retain(|r| *r < r1 || *r > r2);
-                        let n = before - sheet.hidden_rows_user.len();
-                        sheet.layout_dirty = true;
-                        self.status = format!("已取消隐藏 {n} 行");
-                    }
-                }
-                self.head_menu = None;
             }
         }
 
@@ -19069,15 +19136,40 @@ impl SheetApp {
             self.status = format!(
                 "已接任宿主，同事请用这个地址重新加入：{}:{}",
                 local_ip_hint(),
-                net::DEFAULT_PORT
+                net::port()
             );
             eprintln!("[net] {}{}", "接任宿主 ", self.status);
         }
     }
 
+    /// 放行协作端口：弹 UAC 让用户确认，成功后同事才连得进来。
+    /// 只在用户点按钮时执行，不改任何安全设置里的其它项。
+    fn open_firewall_port(&mut self) {
+        let port = net::port();
+        let rule = format!(
+            "advfirewall firewall add rule name=\"Sheets Native 协作\" dir=in action=allow protocol=TCP localport={port}"
+        );
+        #[cfg(windows)]
+        let res = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Start-Process netsh -ArgumentList '{rule}' -Verb RunAs -Wait"),
+            ])
+            .status();
+        #[cfg(not(windows))]
+        let res: std::io::Result<std::process::ExitStatus> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "仅 Windows"));
+        self.status = match res {
+            Ok(s) if s.success() => format!("已为协作端口 {port} 添加防火墙入站规则"),
+            Ok(_) => "防火墙规则没有加上（可能取消了 UAC 授权）".into(),
+            Err(e) => format!("打开防火墙设置失败：{e}"),
+        };
+        eprintln!("[net] {}", self.status);
+    }
     fn start_host(&mut self) {
         let site = rand_site();
-        let port = net::DEFAULT_PORT;
+        let port = net::port();
         match net::host(site, self.my_name.clone(), self.wb.title(), port, self.room_password.clone()) {
             Ok(n) => {
                 let mut peer = Peer::new(site);
@@ -19112,6 +19204,82 @@ impl SheetApp {
         }
     }
 
+
+    /// 周期发现（每 3 秒）：同事后来才打开/开房，也能在这里接上。
+    /// 只做非阻塞的事：读小文件、抢选主（create_new）、连一次（3s 超时）。
+    fn auto_discovery_tick(&mut self) {
+        if self.net.is_some() || !self.auto_share || !self.room_password.is_empty() {
+            return;
+        }
+        let Some(path) = self.wb.path.clone() else { return };
+        let due = self
+            .auto_tick
+            .map(|t| t.elapsed().as_secs() >= 3)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        let force = std::env::var("SC_AUTO_SHARE").map(|v| v != "0").unwrap_or(false);
+        let net_path = session_lock::is_network_path(&path);
+        self.auto_tick = Some(std::time::Instant::now());
+        // 上一次后台探测的结果先处理（connect 不能放 UI 线程，防火墙丢包会卡几秒）
+        if let Some((addr, rx)) = self.auto_probe.take() {
+            match rx.try_recv() {
+                Ok(true) => {
+                    if let Some(info) = session_lock::read(&path) {
+                        let fresh = session_lock::is_fresh(&info) && !session_lock::is_mine(&info);
+                        if fresh && info.host == addr {
+                            eprintln!("[net] 探测通过，加入 {addr}");
+                            self.join_lock(&info);
+                            return;
+                        }
+                    }
+                }
+                Ok(false) => {
+                    self.status = format!(
+                        "发现同事在编辑，但连不上 {addr}（检查对方防火墙是否放行 {} 端口）",
+                        net::port()
+                    );
+                    eprintln!("[net] 探测失败 {addr}");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.auto_probe = Some((addr, rx));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        // 有别人的新鲜占用卡 → 先在后台试连一下
+        if let Some(info) = session_lock::read(&path) {
+            if session_lock::is_fresh(&info) && !session_lock::is_mine(&info) {
+                let addr = info.host.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let probe = addr.clone();
+                std::thread::spawn(move || {
+                    let ok = match probe.parse::<std::net::SocketAddr>() {
+                        Ok(s) => std::net::TcpStream::connect_timeout(
+                            &s,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .is_ok(),
+                        Err(_) => false,
+                    };
+                    let _ = tx.send(ok);
+                });
+                self.auto_probe = Some((addr, rx));
+                return;
+            }
+        }
+        // 没有卡（或卡已过期）时才考虑自己开房；而且只对共享盘这么做，
+        // 免得在本机随便打开一个文件就悄悄监听端口。
+        if !(force || net_path) {
+            return;
+        }
+        if session_lock::claim_election(&path) {
+            eprintln!("[net] 周期发现：没有占用卡，自己开房");
+            self.start_host();
+        }
+    }
 
     /// 打开文件后自动发现同编人：读文件旁边的占用卡，新鲜就加入
     /// 加入占用卡指向的房间（自动/手动共用）
@@ -19157,7 +19325,7 @@ impl SheetApp {
         }
         self.start_host();
         if let Some(info) = session_lock::read(path) {
-            let mine = format!("{}:{}", local_ip_hint(), net::DEFAULT_PORT);
+            let mine = format!("{}:{}", local_ip_hint(), net::port());
             if info.host != mine && session_lock::is_fresh(&info) && !session_lock::is_mine(&info) {
                 eprintln!("[net] 检测到另一个宿主，改加入 {}", info.host);
                 self.net = None;
@@ -19213,7 +19381,7 @@ impl SheetApp {
         if !due {
             return;
         }
-        let addr = format!("{}:{}", local_ip_hint(), net::DEFAULT_PORT);
+        let addr = format!("{}:{}", local_ip_hint(), net::port());
         let _ = session_lock::write(&path, &addr, &self.my_name);
         self.lock_beat = Some(std::time::Instant::now());
     }
@@ -20080,16 +20248,39 @@ fn default_name() -> String {
 }
 
 fn local_ip_hint() -> String {
-    // 取本机在局域网里的地址（UDP connect 技巧，不会真的发包）
-    use std::net::UdpSocket;
-    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
-        if s.connect("8.8.8.8:80").is_ok() {
-            if let Ok(a) = s.local_addr() {
-                return a.ip().to_string();
+    // 共享地址：SC_HOST_ADDR 可强制指定（多网卡/VMware 虚拟网卡选错时用）
+    if let Ok(v) = std::env::var("SC_HOST_ADDR") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            // 允许写成 192.168.1.5 或 192.168.1.5:7878
+            return v.split(':').next().unwrap_or(&v).to_string();
+        }
+    }
+    // 取本机在局域网里的地址（UDP connect 技巧，不会真的发包）。
+    // 依次试几个目标：默认路由、常见网关、公网 DNS，挑第一个「私有网段」的地址，
+    // 避免多网卡机器把 VMware/Hyper-V 的地址写进占用卡，别人连不上。
+    use std::net::{IpAddr, UdpSocket};
+    let is_private = |ip: &IpAddr| match ip {
+        IpAddr::V4(v4) => v4.is_private() && !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(_) => false,
+    };
+    let mut first_any: Option<IpAddr> = None;
+    for target in ["8.8.8.8:80", "192.168.1.1:80", "10.0.0.1:80", "172.16.0.1:80"] {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            if s.connect(target).is_ok() {
+                if let Ok(a) = s.local_addr() {
+                    let ip = a.ip();
+                    if is_private(&ip) {
+                        return ip.to_string();
+                    }
+                    if first_any.is_none() && !ip.is_loopback() {
+                        first_any = Some(ip);
+                    }
+                }
             }
         }
     }
-    "本机IP".into()
+    first_any.map(|ip| ip.to_string()).unwrap_or_else(|| "127.0.0.1".into())
 }
 
 impl Drop for SheetApp {
@@ -20455,12 +20646,88 @@ impl eframe::App for SheetApp {
                     let sub = std::env::var("SC_CTX_SUB")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok());
+                    let kind = match std::env::var("SC_CTX_KIND").as_deref() {
+                        Ok("rows") => CtxKind::Rows,
+                        Ok("cols") => CtxKind::Cols,
+                        Ok("tab") => CtxKind::Tab,
+                        _ => CtxKind::Cell,
+                    };
+                    let idx = std::env::var("SC_CTX_IDX")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
                     self.ctx_menu = Some(CtxMenuState {
                         pos: egui::pos2(v[0], v[1]),
                         frame: 0,
                         sub,
+                        kind,
+                        idx,
                     });
                 }
+            }
+        }
+        // 无界面验收：SC_PUT="r,c,文本" 改一格并广播（走和编辑提交同一套 Op 通路）
+        if let Ok(spec) = std::env::var("SC_PUT") {
+            static DONE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let at = std::env::var("SC_PUT_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let ready = self.tasks.open_rx.is_none() && self.t0.elapsed().as_secs() >= at;
+            if ready && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let parts: Vec<&str> = spec.splitn(3, ',').collect();
+                if parts.len() == 3 {
+                    if let (Ok(r), Ok(c)) =
+                        (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>())
+                    {
+                        let cell = sheetcore::model::Cell {
+                            value: sheetcore::model::Value::parse_input(parts[2]),
+                            formula: None,
+                        };
+                        self.wb.sheet_mut(self.sheet_idx).set(r, c, cell.clone());
+                        let mut sent = false;
+                        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+                            let op = peer.local_set(self.sheet_idx, r, c, &cell);
+                            net.broadcast_op(op);
+                            sent = true;
+                        }
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.wb.dirty = true;
+                        eprintln!(
+                            "[put] ({r},{c})={:?} 广播={} 在线={}",
+                            parts[2],
+                            sent,
+                            self.peers_list.len()
+                        );
+                    }
+                }
+            }
+        }
+        // 无界面验收：SC_NET_DUMP=1 周期打印在线人数
+        if std::env::var("SC_NET_DUMP").is_ok() {
+            static LAST: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
+                std::sync::Mutex::new(None);
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last
+                .as_ref()
+                .map(|(_, t): &(usize, std::time::Instant)| t.elapsed().as_secs() >= 2)
+                .unwrap_or(true);
+            if due {
+                *last = Some((self.peers_list.len(), std::time::Instant::now()));
+                let a1 = self
+                    .wb
+                    .sheet(0)
+                    .get(0, 0)
+                    .map(|c| c.value.display())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[netdump] online={} hosting={} peers={:?} A1={:?}",
+                    self.peers_list.len(),
+                    self.net.as_ref().map(|n| n.hosting).unwrap_or(false),
+                    self.peers_list.iter().map(|(_, n, _)| n.clone()).collect::<Vec<_>>(),
+                    a1
+                );
             }
         }
         // 无界面验收：SC_FREEZE="行,列" 设冻结（不写盘，只看渲染）
@@ -20721,6 +20988,7 @@ impl eframe::App for SheetApp {
         self.consolidate_dialog(ctx);
         self.a11y_window(ctx);
         self.ctx_menu_window(ctx);
+        self.auto_discovery_tick();
         self.view_new_dialog(ctx);
         self.views_window(ctx);
         self.unhide_window(ctx);
@@ -21482,101 +21750,19 @@ impl eframe::App for SheetApp {
                     if resp.double_clicked() {
                         ren = Some((i, name.clone()));
                     }
-                    resp.context_menu(|ui| {
-                        if ui.button("新建工作表").clicked() {
-                            self.add_sheet();
-                            ui.close_menu();
+                    // 工作表标签右键：和单元格菜单同一套自绘样式
+                    if resp.secondary_clicked() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            goto = Some(i);
+                            self.ctx_menu = Some(CtxMenuState {
+                                pos: p,
+                                frame: ui.ctx().cumulative_pass_nr(),
+                                sub: None,
+                                kind: CtxKind::Tab,
+                                idx: i,
+                            });
                         }
-                        if ui.button("复制本表").clicked() {
-                            self.duplicate_sheet(i);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        ui.menu_button("标签颜色", |ui| {
-                            ui.set_min_width(176.0);
-                            let colors: [(&str, Option<[u8; 3]>); 16] = [
-                                ("无颜色", None),
-                                ("红", Some([192, 0, 0])),
-                                ("橙", Some([237, 125, 49])),
-                                ("黄", Some([255, 192, 0])),
-                                ("浅绿", Some([112, 173, 71])),
-                                ("绿", Some([0, 153, 68])),
-                                ("青", Some([0, 176, 240])),
-                                ("蓝", Some([68, 114, 196])),
-                                ("深蓝", Some([31, 78, 121])),
-                                ("紫", Some([112, 48, 160])),
-                                ("粉", Some([255, 102, 204])),
-                                ("棕", Some([132, 60, 12])),
-                                ("灰", Some([128, 128, 128])),
-                                ("深灰", Some([64, 64, 64])),
-                                ("黑", Some([0, 0, 0])),
-                                ("金", Some([191, 144, 0])),
-                            ];
-                            for row in 0..4 {
-                                ui.horizontal(|ui| {
-                                    for k in 0..4 {
-                                        let (label, rgb) = colors[row * 4 + k];
-                                        let (r, p) = ui.allocate_exact_size(
-                                            Vec2::new(40.0, 22.0),
-                                            Sense::click(),
-                                        );
-                                        if let Some(c) = rgb {
-                                            ui.painter().rect_filled(
-                                                Rect::from_min_size(
-                                                    r.min + Vec2::new(2.0, 2.0),
-                                                    Vec2::new(36.0, 18.0),
-                                                ),
-                                                2.0,
-                                                Color32::from_rgb(c[0], c[1], c[2]),
-                                            );
-                                        } else {
-                                            ui.painter().rect_stroke(
-                                                Rect::from_min_size(
-                                                    r.min + Vec2::new(2.0, 2.0),
-                                                    Vec2::new(36.0, 18.0),
-                                                ),
-                                                2.0,
-                                                Stroke::new(1.0, ui_kit::BORDER),
-                                                egui::StrokeKind::Inside,
-                                            );
-                                            ui.painter().text(
-                                                r.center(),
-                                                Align2::CENTER_CENTER,
-                                                "无",
-                                                FontId::proportional(10.0),
-                                                ui_kit::TEXT_WEAK,
-                                            );
-                                        }
-                                        let tip = if rgb.is_some() { label } else { "无颜色" };
-                                        if p.on_hover_text(tip).clicked() {
-                                            let sh = self.wb.sheet_mut(i);
-                                            sh.tab_color = rgb;
-                                            sh.tab_color_dirty = true;
-                                            self.wb.dirty = true;
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        if ui.button("重命名…").clicked() {
-                            ren = Some((i, name.clone()));
-                            ui.close_menu();
-                        }
-                        if ui.button("左移").clicked() {
-                            mv = Some((i, -1));
-                            ui.close_menu();
-                        }
-                        if ui.button("右移").clicked() {
-                            mv = Some((i, 1));
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("删除").clicked() {
-                            del = Some(i);
-                            ui.close_menu();
-                        }
-                    });
+                    }
                 }
                 // 新建工作表按钮（+）
                 let nb = Rect::from_min_size(
@@ -21691,6 +21877,11 @@ impl eframe::App for SheetApp {
                 ctx.request_repaint();
             }
         }
+        // 空闲时 egui 不重绘：协作收包、占用卡轮询、心跳都会停摆
+        // （窗口被别的程序挡住时，对方改了东西也看不到）。这里主动按节奏唤醒。
+        let wake = if self.net.is_some() { 120 } else { 500 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(wake));
+
         self.defer_close_while_saving(ctx, was_saving);
         // 无系统装饰，自绘 1 物理像素外边框
         let ppp = ctx.pixels_per_point();
