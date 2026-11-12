@@ -130,7 +130,7 @@ fn restrict_a1(app: &mut SheetApp) {
         ranges: vec![(0, 0, 0, 0)], kind: sheetcore::dv::DvKind::Whole,
         f1: "1".into(), f2: "10".into(), ..Default::default()
     });
-    app.editing = Some(EditState { buf: "99".into() });
+    app.editing = Some(EditState::new("99".into()));
 }
 
 
@@ -305,9 +305,9 @@ fn cut_and_undo_publish_source_clears_across_sheets() {
 #[test]
 fn closing_parked_dirty_tabs_requires_confirmation_for_that_tab() {
     let mut app = app();
-    app.editing = Some(EditState { buf: "123".into() });
+    app.editing = Some(EditState::new("123".into()));
     app.open_in_new_tab(PathBuf::new());
-    app.editing = Some(EditState { buf: "456".into() });
+    app.editing = Some(EditState::new("456".into()));
     app.open_in_new_tab(PathBuf::new());
     app.close_tab(0);
     assert_eq!(app.tabs.len(), 3);
@@ -327,10 +327,10 @@ fn closing_parked_dirty_tabs_requires_confirmation_for_that_tab() {
 fn edits_after_close_prompt_require_a_new_confirmation() {
     let mut app = app();
     app.open_in_new_tab(PathBuf::new());
-    app.editing = Some(EditState { buf: "1".into() });
+    app.editing = Some(EditState::new("1".into()));
     app.close_tab(1);
     assert_eq!(app.tabs.len(), 2);
-    app.editing = Some(EditState { buf: "2".into() });
+    app.editing = Some(EditState::new("2".into()));
     app.close_tab(1);
     assert_eq!(app.tabs.len(), 2);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(2.0));
@@ -356,7 +356,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         }
         assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(10.0));
         app.sel_end = app.sel;
-        app.editing = Some(EditState { buf: "3".into() });
+        app.editing = Some(EditState::new("3".into()));
         app.commit_edit(None);
         assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(30.0));
         assert_eq!(app.wb.sheets[0].value(1, 1), Value::Number(20.0));
@@ -395,7 +395,7 @@ fn structural_undo_restores_cross_sheet_formulas_names_and_layout() {
     assert_eq!(app.wb.sheets[1].get(0, 0).unwrap().formula.as_deref(), Some("=Sheet1!A2"));
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(10.0));
     app.do_undo(false);
-    app.editing = Some(EditState { buf: "30".into() });
+    app.editing = Some(EditState::new("30".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(30.0));
 }
@@ -920,7 +920,7 @@ fn alt_enter_inserts_a_newline_in_the_cell_editor() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.sel = (0, 0);
     app.sel_end = (0, 0);
-    app.editing = Some(EditState { buf: "第一行".into() });
+    app.editing = Some(EditState::new("第一行".into()));
     run_grid_frame(&mut app, &ctx, vec![]);
     let ev = egui::Event::Key {
         key: egui::Key::Enter,
@@ -953,7 +953,7 @@ fn typing_below_a_table_extends_its_range() {
     // 在表格正下方输入
     app.sel = (3, 0);
     app.sel_end = (3, 0);
-    app.editing = Some(EditState { buf: "c".into() });
+    app.editing = Some(EditState::new("c".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheet(0).tables[0].range.2, 3, "表格应自动向下扩一行");
     assert_eq!(
@@ -1268,4 +1268,341 @@ fn ctx_tab_menu_sets_and_clears_tab_color() {
     // 标签菜单的条目
     let labels: Vec<&str> = ctx_tab_rows().iter().filter(|r| !r.is_sep()).map(|r| r.label).collect();
     assert_eq!(labels, ["插入…", "删除", "重命名", "复制", "工作表标签颜色", "设置单元格格式…"]);
+}
+
+// ---------------------------------------------------------------- UI-01 编辑提交链路
+
+/// 整窗事件帧：走真实 `update()`（标题栏、功能区、编辑栏、网格全部在内），
+/// 而不是只调用某个处理函数。输入 123→Enter 丢缓冲的缺陷就是在这条链路上。
+fn ui_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1024.0, 768.0),
+        )),
+        ..Default::default()
+    };
+    input.modifiers = events
+        .iter()
+        .find_map(|e| match e {
+            egui::Event::Key { modifiers, .. } => Some(*modifiers),
+            _ => None,
+        })
+        .unwrap_or_default();
+    input.events = events;
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame));
+}
+
+fn type_and_key(keys: &[(egui::Key, bool)], text: &str) -> Vec<egui::Event> {
+    let mut v = vec![egui::Event::Text(text.into())];
+    for (k, shift) in keys {
+        v.push(key_event(*k, *shift));
+    }
+    v
+}
+
+#[test]
+fn typed_text_commits_on_enter_through_full_window() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("123"),
+        "输入必须进入唯一编辑缓冲"
+    );
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0), "Enter 必须提交 A1");
+    assert!(app.editing.is_none(), "提交后编辑态应结束");
+    assert_eq!(app.sel, (1, 0), "Enter 后选区向下");
+    assert!(app.wb.dirty, "提交后必须标脏");
+    assert_eq!(app.undo.depth(), (1, 0), "提交必须记一步撤销");
+}
+
+/// 编辑栏输入行的点击位置：网格面板上沿往上就是编辑栏（窗口分栏变了也不用改）
+fn formula_bar_point(app: &SheetApp) -> egui::Pos2 {
+    egui::pos2(600.0, app.last_pane.y - ui_kit::FX_H * 0.5)
+}
+
+fn click(app: &mut SheetApp, ctx: &egui::Context, pos: egui::Pos2) {
+    for pressed in [Some(true), Some(false)] {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0))),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: pressed.unwrap(),
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame));
+    }
+}
+
+#[test]
+fn tab_commits_and_moves_right() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("42".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(42.0), "Tab 必须提交 A1");
+    assert_eq!(app.sel, (0, 1), "Tab 后选区向右");
+    assert!(app.editing.is_none());
+}
+
+#[test]
+fn shift_enter_and_shift_tab_commit_backwards() {
+    for (key, want) in [(egui::Key::Enter, (1u32, 2u32)), (egui::Key::Tab, (2u32, 1u32))] {
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.sel = (2, 2);
+        app.sel_end = (2, 2);
+        ui_frame(&mut app, &ctx, vec![]);
+        ui_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())]);
+        ui_frame(&mut app, &ctx, vec![key_event(key, true)]);
+        assert_eq!(
+            app.wb.sheet(0).value(2, 2),
+            Value::Number(7.0),
+            "Shift+{key:?} 也要提交"
+        );
+        assert_eq!(app.sel, want, "Shift+{key:?} 应反向移动");
+    }
+}
+
+#[test]
+fn escape_discards_draft_without_touching_model() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("999".into())]);
+    assert!(app.editing.is_some());
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.editing.is_none(), "Esc 应结束编辑");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0), "Esc 不得改值");
+    assert_eq!(app.sel, (0, 0), "Esc 不移动选区");
+    assert!(!app.wb.dirty, "Esc 不标脏");
+    assert_eq!(app.undo.depth(), (0, 0), "Esc 不记撤销");
+    // 取消后残留按键不能把草稿补交上去
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+}
+
+#[test]
+fn f2_keeps_existing_formula_and_escape_restores_nothing() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        Cell { value: Value::Number(3.0), formula: Some("=1+2".into()) },
+    );
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::F2, false)]);
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("=1+2"),
+        "F2 必须带原公式进入编辑"
+    );
+    assert_eq!(app.editing.as_ref().unwrap().spot, EditSpot::Grid);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("+4".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    let cell = app.wb.sheet(0).get(0, 0).unwrap();
+    assert_eq!(cell.formula.as_deref(), Some("=1+2"), "Esc 后公式不变");
+    assert!(!app.wb.dirty);
+}
+
+#[test]
+fn formula_bar_edit_uses_same_buffer_and_commits() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(11.0));
+    ui_frame(&mut app, &ctx, vec![]);
+    let bar = formula_bar_point(&app);
+    click(&mut app, &ctx, bar);
+    assert!(
+        app.editing.as_ref().is_some_and(|e| e.spot == EditSpot::FormulaBar),
+        "点编辑栏应把焦点搬到编辑栏，实际 {:?}",
+        app.editing.as_ref().map(|e| e.spot)
+    );
+    assert_eq!(app.editing.as_ref().unwrap().buf, "11", "编辑栏缓冲取当前格内容");
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("22".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(
+        app.wb.sheet(0).value(0, 0),
+        Value::Number(1122.0),
+        "编辑栏里追加的内容必须一起提交"
+    );
+    assert!(app.editing.is_none(), "编辑栏 Enter 提交后结束编辑");
+}
+
+#[test]
+fn clicking_another_cell_commits_the_draft() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    let p = app.last_pane
+        + egui::vec2(
+            HEAD_W + app.wb.sheets[0].cols.pos(2) + 15.0,
+            HEAD_H + app.wb.sheets[0].rows.pos(2) + 10.0,
+        );
+    click(&mut app, &ctx, p);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0), "点别的格要先提交草稿");
+    assert_eq!(app.sel, (2, 2), "然后选区落到被点的格");
+    assert!(app.editing.is_none());
+}
+
+#[test]
+fn rejected_validation_keeps_draft_and_position() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    restrict_a1(&mut app);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Empty, "非法值不得写入");
+    assert_eq!(app.sel, (0, 0), "验证失败不得跳格");
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("99"),
+        "验证失败必须保留编辑内容"
+    );
+    assert!(!app.wb.dirty);
+    // 改成合法值再提交
+    app.editing.as_mut().unwrap().buf = "9".into();
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(9.0));
+    assert_eq!(app.sel, (1, 0), "合法提交后正常下移");
+}
+
+#[test]
+fn one_undo_restores_previous_value_and_redo_reapplies() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0));
+    assert_eq!(app.undo.depth(), (1, 0), "一次键入只需一步撤销");
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0), "一次撤销回到旧值");
+    app.do_undo(true);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0), "重做恢复新值");
+}
+
+#[test]
+fn committed_value_survives_save_and_reload() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("456".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    let dir = crate::test_env::scratch("ui01-save");
+    let path = dir.join("typed.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &app.wb).unwrap();
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheets[0].value(0, 0), Value::Number(456.0), "保存重开必须保留键入值");
+}
+
+#[test]
+fn chinese_text_commits_once_without_duplication() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    // 中文输入法上屏在 egui 层是一个 Text 事件（真实 IME 候选交互见 QA-04）
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("财务报表".into())]);
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("财务报表"),
+        "上屏文本只能进缓冲一次"
+    );
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(
+        app.wb.sheet(0).value(0, 0),
+        Value::Text("财务报表".into()),
+        "提交后不能重复上屏"
+    );
+}
+
+#[test]
+fn goto_name_commits_pending_edit_before_navigating() {
+    // 名称框跳转、切工作表/标签、保存、关闭窗口的处理函数都是先 commit_edit(None)
+    // 再判断 editing；修复前那一步必然丢输入。
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    app.name_buf = "C3".into();
+    app.goto_name();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0), "跳转前必须先提交");
+    assert_eq!(app.sel, (2, 2), "然后才跳到 C3");
+}
+
+#[test]
+fn closing_the_window_commits_pending_edit() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("123".into())]);
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0))),
+        ..Default::default()
+    };
+    input.viewports.insert(
+        egui::ViewportId::ROOT,
+        egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() },
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0), "关窗口不能把草稿丢了");
+    assert!(app.editing.is_none());
+}
+
+#[test]
+fn closing_the_window_keeps_a_rejected_draft() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    restrict_a1(&mut app);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![]);
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0))),
+        ..Default::default()
+    };
+    input.viewports.insert(
+        egui::ViewportId::ROOT,
+        egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() },
+    );
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Empty, "非法值不能写");
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("99"),
+        "验证失败时必须取消关闭并保留草稿"
+    );
+}
+
+#[test]
+fn escape_in_formula_bar_discards_draft() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(11.0));
+    ui_frame(&mut app, &ctx, vec![]);
+    let bar = formula_bar_point(&app);
+    click(&mut app, &ctx, bar);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("99".into())]);
+    assert_eq!(app.editing.as_ref().map(|e| e.buf.clone()).as_deref(), Some("1199"));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.editing.is_none(), "编辑栏 Esc 也要结束编辑");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(11.0), "Esc 不写回");
+    assert!(!app.wb.dirty);
 }

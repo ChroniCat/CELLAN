@@ -193,7 +193,7 @@ fn rejected_edit_survives_tab_switch_new_tab_and_save() {
         f2: "10".into(),
         ..Default::default()
     });
-    app.editing = Some(EditState { buf: "99".into() });
+    app.editing = Some(EditState::new("99".into()));
     app.switch_tab(1);
     assert_eq!(app.active_tab, 0);
     assert_eq!(app.editing.as_ref().unwrap().buf, "99");
@@ -229,7 +229,7 @@ fn failed_save_in_the_close_frame_keeps_the_window_open() {
 #[test]
 fn sheet_handlers_update_references_dependencies_and_indexed_state() {
     let mut app = app();
-    app.editing = Some(EditState { buf: "1".into() });
+    app.editing = Some(EditState::new("1".into()));
     app.commit_edit(None);
     assert_eq!(app.undo.depth().0, 1);
     let mut other = sheetcore::Sheet::new("Other");
@@ -277,7 +277,7 @@ fn failed_open_restores_dependencies_of_the_retained_document() {
     app.tasks.open_rx = Some(rx);
     tx.send(OpenMsg::Failed("cannot read workbook".into())).unwrap();
     app.poll_open();
-    app.editing = Some(EditState { buf: "10".into() });
+    app.editing = Some(EditState::new("10".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(11.0));
 }

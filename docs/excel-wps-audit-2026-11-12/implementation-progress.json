@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T10:35:01Z",
+ "updated_utc": "2026-11-12T10:47:18Z",
  "tasks": [
   {
    "id": "C01",
@@ -840,17 +840,30 @@
    "scope": "app/main.rs editing/commit_edit/draw_grid_pane",
    "source": "ui-requirements.md",
    "heading": "UI-01 修复真实键盘编辑提交链路",
-   "status": "待实施",
-   "acceptance": "",
-   "files": [],
+   "status": "已验收",
+   "acceptance": "见切片 UI-01.1：真实 update() 全窗事件路径覆盖 Enter/Tab/Shift/Esc/F2/编辑栏/点格/跳转/关窗/验证失败/撤销/保存重开",
+   "files": [
+    "crates/app/src/main.rs",
+    "crates/app/src/edit_regression_tests.rs",
+    "crates/app/src/document_tests.rs"
+   ],
    "commits": [],
-   "commands": [],
-   "evidence": [],
-   "not_done": [],
+   "commands": [
+    "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 119 passed, 0 failed, 0 ignored, 4 filtered",
+    "cargo test -p app --test ui_regression -- --test-threads=1 => 8 passed, 0 failed, 9 ignored",
+    "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 120 passed, 0 failed, 0 ignored, 4 filtered"
+   ],
+   "evidence": [
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
+    "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
+   ],
+   "not_done": [
+    "真实硬件键盘与中文 IME 候选交互未执行（QA-04）；窗口关闭未保存提示另立后续项"
+   ],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "UI-02.1 Ctrl+S/另存为快捷键",
+   "updated_utc": "2026-11-12T10:47:18Z",
    "slices": [
     {
      "id": "UI-01.1",
@@ -858,17 +871,31 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-01 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值且不脏不记撤销；公式栏与格内共用唯一缓冲、点编辑栏进入编辑、Enter 提交；非法验证输入不移动不丢草稿；一次撤销恢复旧值、重做恢复新值；保存重开保持结果；点其他格/名称框跳转/关窗口先提交草稿。",
+     "files": [
+      "crates/app/src/main.rs",
+      "crates/app/src/edit_regression_tests.rs",
+      "crates/app/src/document_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 119 passed, 0 failed, 0 ignored, 4 filtered",
+      "cargo test -p app --test ui_regression -- --test-threads=1 => 8 passed, 0 failed, 9 ignored",
+      "修复前同一测试：typed_text_commits_on_enter_through_full_window => FAILED（A1=Empty）",
+      "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 120 passed, 0 failed, 0 ignored, 4 filtered（含 15 项 UI-01 回归）"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
+     ],
+     "not_done": [
+      "真实硬件键盘与中文 IME 候选交互（归 QA-04，本机 RDP 不可自动化）；窗口关闭的未保存保存提示属既有缺口，另立后续项"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "UI-02.1 Ctrl+S/另存为快捷键与编辑态",
+     "updated_utc": "2026-11-12T10:47:17Z"
     }
    ]
   },

@@ -125,9 +125,33 @@ struct FmtState {
     border: [bool; 4],
 }
 
+/// 编辑焦点在格内还是编辑栏。缓冲只有一个（`self.editing`），位置只决定谁拿焦点。
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum EditSpot {
+    /// 格内编辑框（键入 / F2 / 双击进入）
+    #[default]
+    Grid,
+    /// 编辑栏输入行（点编辑栏或 fx 进入）
+    FormulaBar,
+}
+
 #[derive(Default, Clone)]
 struct EditState {
     buf: String,
+    spot: EditSpot,
+}
+
+impl EditState {
+    fn new(buf: String) -> Self {
+        Self { buf, spot: EditSpot::Grid }
+    }
+}
+
+/// 一帧编辑框的处置：保持编辑 / 提交（附带选区移动）/ 取消
+enum EditAct {
+    Keep,
+    Commit(Option<(i32, i32)>),
+    Cancel,
 }
 
 /// 去掉页眉页脚里的 OOXML 控制码（&L/&C/&R/&B 等），只留文字
@@ -471,6 +495,8 @@ struct SheetApp {
     sel_end: (u32, u32),
     /// 上一帧表格可视尺寸，供 ensure_visible 用
     last_view: Vec2,
+    /// 网格面板在窗口里的左上角（命中测试/回归用，随每帧绘制刷新）
+    last_pane: egui::Pos2,
     /// 只 dump 一帧
     dump_once: bool,
     /// 一帧里多个面板的绘制记录
@@ -564,6 +590,8 @@ struct SheetApp {
     locks: sheetcore::sync::LockTable,
     /// 等待授权中的编辑（初始输入）
     pending_edit: Option<String>,
+    /// 等协作锁批准后，编辑框开在哪（格内 / 编辑栏）
+    pending_spot: EditSpot,
     /// 我当前持有的格
     my_lock: Option<(usize, u32, u32)>,
     /// 上次续期
@@ -1162,6 +1190,7 @@ impl SheetApp {
                 se
             },
             last_view: Vec2::new(800.0, 600.0),
+            last_pane: egui::Pos2::ZERO,
             dump_once: true,
             dump_accum: String::new(),
             cf_stats: sheetcore::cf::CfStats::default(),
@@ -1220,6 +1249,7 @@ impl SheetApp {
             active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
             pending_edit: None,
+            pending_spot: EditSpot::Grid,
             my_lock: None,
             lock_renew: std::time::Instant::now(),
             t0: std::time::Instant::now(),
@@ -1738,7 +1768,7 @@ impl SheetApp {
                         self.ensure_visible();
                     }
                     self.scroll = Vec2::ZERO;
-                    self.editing = None;
+                    self.cancel_edit();
                     self.doc_gen = 0;
                     if let Some(p) = self.wb.path.clone() {
                         recent::touch(&p);
@@ -2823,6 +2853,19 @@ impl SheetApp {
         })
     }
 
+    /// 窗口关闭前把编辑缓冲落进模型；数据验证不通过时取消关闭（草稿不能顺手丢）。
+    fn commit_edit_before_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.editing.is_some() {
+            self.commit_edit(None);
+            if self.editing.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+    }
+
     fn defer_close_while_saving(&mut self, ctx: &egui::Context, was_saving: bool) {
         if (was_saving || self.has_pending_save())
             && ctx.input(|input| input.viewport().close_requested())
@@ -3323,7 +3366,7 @@ impl SheetApp {
             .unwrap_or_default();
         // 1) 编辑
         self.sel = (r, c);
-        self.editing = Some(EditState { buf: "999".into() });
+        self.editing = Some(EditState::new("999".into()));
         self.commit_edit(None);
         let after_edit = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
         // 2) 撤销
@@ -3429,6 +3472,20 @@ impl SheetApp {
     }
 
     fn begin_edit(&mut self, initial: Option<String>) {
+        self.begin_edit_at(initial, EditSpot::Grid);
+    }
+
+    /// 进入编辑并指定焦点位置。没在编辑时按当前格进；已在编辑时只搬焦点、不重置缓冲
+    /// （在编辑栏点一下不能把刚打的字清掉）。
+    fn focus_edit(&mut self, spot: EditSpot) {
+        if let Some(ed) = self.editing.as_mut() {
+            ed.spot = spot;
+            return;
+        }
+        self.begin_edit_at(None, spot);
+    }
+
+    fn begin_edit_at(&mut self, initial: Option<String>, spot: EditSpot) {
         if self.edit_blocked() {
             return;
         }
@@ -3448,11 +3505,12 @@ impl SheetApp {
                     None => String::new(),
                 }
             });
-            self.editing = Some(EditState { buf });
+            self.editing = Some(EditState { buf, spot });
             return;
         };
         let name = self.my_name.clone();
         net.request_lock(self.sheet_idx, r, c, &name);
+        self.pending_spot = spot;
         self.pending_edit = Some(initial.unwrap_or_default());
         self.status = format!("正在申请编辑 {}…", cell_name(r, c));
     }
@@ -5625,9 +5683,11 @@ impl SheetApp {
         self.status = format!("找不到名称：{text}");
     }
 
-    fn commit_edit(&mut self, advance: Option<(i32, i32)>) {
+    /// 提交当前编辑。缓冲的唯一所有者是 `self.editing`；数据验证不通过时不写、
+    /// 不移动选区、保留编辑内容和协作租约（Excel 的「重试」）。返回是否真的写入。
+    fn commit_edit(&mut self, advance: Option<(i32, i32)>) -> bool {
+        let mut wrote = false;
         if let Some(ed) = self.editing.take() {
-            self.release_lock();
             let (r, c) = self.sel;
             // 数据验证：不合规就不写入，编辑框留着让用户改（Excel 的「重试」）
             let mut rejected: Option<String> = None;
@@ -5660,8 +5720,9 @@ impl SheetApp {
                 let mut again = ed.clone();
                 again.buf = ed.buf.clone();
                 self.editing = Some(again);
-                return;
+                return false;
             }
+            self.release_lock();
             let cell = if ed.buf.starts_with('=') {
                 // 手输的 [预算.xlsx]Sheet!A1：先把工作簿登记成链接（能读到就带缓存），
                 // 再折回 Excel 认的 [N] 形式
@@ -5680,6 +5741,7 @@ impl SheetApp {
             let cell_clone = cell.clone();
             let txn = self.txn_begin(&[(r, c)]);
             self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
+            wrote = true;
             self.txn_end("编辑单元格", txn);
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
@@ -5767,12 +5829,21 @@ impl SheetApp {
                 }
             }
         }
-        if let Some((dr, dc)) = advance {
-            let nr = (self.sel.0 as i64 + dr as i64).max(0) as u32;
-            let nc = (self.sel.1 as i64 + dc as i64).max(0) as u32;
-            self.sel = (nr, nc);
-            self.ensure_visible();
+        if wrote {
+            if let Some((dr, dc)) = advance {
+                let nr = (self.sel.0 as i64 + dr as i64).max(0) as u32;
+                let nc = (self.sel.1 as i64 + dc as i64).max(0) as u32;
+                self.sel = (nr, nc);
+                self.ensure_visible();
+            }
         }
+        wrote
+    }
+
+    /// 取消编辑：丢弃缓冲、交还租约，不碰模型、不记撤销、不改 dirty。
+    fn cancel_edit(&mut self) {
+        self.editing = None;
+        self.release_lock();
     }
 
     /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
@@ -5824,8 +5895,7 @@ impl SheetApp {
         if self.editing.is_some() {
             // 编辑框内的按键交给 TextEdit 自己处理
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                self.editing = None;
-                self.release_lock();
+                self.cancel_edit();
             }
             return;
         }
@@ -7859,7 +7929,7 @@ impl SheetApp {
         let (r, c) = self.sel;
         let mut buf = self.wb.sheet(self.sheet_idx).value(r, c).display();
         buf.push(ch);
-        self.editing = Some(EditState { buf });
+        self.editing = Some(EditState::new(buf));
     }
 
     /// 单元格当前数值（数字才算，其它返回 None）
@@ -16373,6 +16443,7 @@ impl SheetApp {
         self.last_view = avail;
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let origin = resp.rect.min;
+        self.last_pane = origin;
         // 视图 → 标题：关掉列标/行号后表头占 0 像素，网格从左上角开始
         // 列头高度：有列分级时每级留 11px 放 +/- 按钮
         let col_depth = self
@@ -18956,11 +19027,21 @@ impl SheetApp {
             }
         }
 
-        // 编辑框（只读面板不画）
-        if let Some(mut ed) = if readonly { None } else { self.editing.take() } {
-            // 单元格里有换行（Alt+Enter 输入）时按多行编辑框画
-            let lines = ed.buf.lines().count().max(1) as f32;
-            let h = if ed.buf.contains('\n') {
+        // 编辑框（只读面板不画）。缓冲的唯一所有者是 self.editing：这里借用它画
+        // TextEdit，不再 take 出去；提交/取消统一走 commit_edit / cancel_edit。
+        // 在编辑栏里编辑时不画格内编辑框（Excel 同款，也避免两个 TextEdit 抢焦点）。
+        if !readonly && self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::Grid) {
+            let multiline = self
+                .editing
+                .as_ref()
+                .map(|ed| ed.buf.contains('\n'))
+                .unwrap_or(false);
+            let lines = self
+                .editing
+                .as_ref()
+                .map(|ed| ed.buf.lines().count().max(1))
+                .unwrap_or(1) as f32;
+            let h = if multiline {
                 (sh.max(rows.size(sr1)) * lines).max(38.0)
             } else {
                 sh.max(rows.size(sr1))
@@ -18970,31 +19051,37 @@ impl SheetApp {
                 // 编辑框和 Excel 一样只盖住单元格本身，不再横向撑到 160px
                 Vec2::new(sw.max(72.0), h),
             );
-            let multiline = ed.buf.contains('\n');
-            let out = if multiline {
-                ui.put(rect, egui::TextEdit::multiline(&mut ed.buf))
-            } else {
-                ui.put(rect, egui::TextEdit::singleline(&mut ed.buf))
-            };
-            out.request_focus();
             let (alt_enter, shift) = ctx.input(|i| {
                 (
                     i.modifiers.alt && i.key_pressed(Key::Enter),
                     i.modifiers.shift,
                 )
             });
-            if alt_enter {
-                // Excel 的 Alt+Enter：单元格内换行
-                ed.buf.push('\n');
-                self.editing = Some(ed);
-            } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
-                self.commit_edit(Some((if shift { -1 } else { 1 }, 0)));
-            } else if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                // 放弃编辑
-            } else if ctx.input(|i| i.key_pressed(Key::Tab)) {
-                self.commit_edit(Some((0, if shift { -1 } else { 1 })));
-            } else {
-                self.editing = Some(ed);
+            let mut act = EditAct::Keep;
+            if let Some(ed) = self.editing.as_mut() {
+                let out = if multiline {
+                    ui.put(rect, egui::TextEdit::multiline(&mut ed.buf))
+                } else {
+                    ui.put(rect, egui::TextEdit::singleline(&mut ed.buf))
+                };
+                out.request_focus();
+                if alt_enter {
+                    // Excel 的 Alt+Enter：单元格内换行
+                    ed.buf.push('\n');
+                } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    act = EditAct::Commit(Some((if shift { -1 } else { 1 }, 0)));
+                } else if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    act = EditAct::Cancel;
+                } else if ctx.input(|i| i.key_pressed(Key::Tab)) {
+                    act = EditAct::Commit(Some((0, if shift { -1 } else { 1 })));
+                }
+            }
+            match act {
+                EditAct::Keep => {}
+                EditAct::Commit(adv) => {
+                    self.commit_edit(adv);
+                }
+                EditAct::Cancel => self.cancel_edit(),
             }
         }
 
@@ -20208,7 +20295,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.rev = doc.revisions;
         self.cf_stats_gen = doc.cf_stats_gen;
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
-        self.editing = None;
+        self.cancel_edit();
         self.cf_stats_gen = u64::MAX;
         self.confirm_close_target = None;
     }
@@ -20349,7 +20436,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.sel_end = rc("SC_SEL2").unwrap_or(sel);
         self.sheet_idx = 0;
         self.scroll = Vec2::ZERO;
-        self.editing = None;
+        self.cancel_edit();
         self.confirm_close_target = None;
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
@@ -20414,7 +20501,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                             } else {
                                 initial
                             };
-                            self.editing = Some(EditState { buf });
+                            self.editing = Some(EditState { buf, spot: self.pending_spot });
                             self.status = format!("正在编辑 {}", cell_name(r, c));
                         }
                     } else {
@@ -21768,6 +21855,15 @@ impl eframe::App for SheetApp {
                     egui::pos2(fx_left + 92.0, rect.top() + 10.0),
                     egui::pos2(rect.right() - 8.0, rect.bottom() - 10.0),
                 );
+                // 整条输入行都可点：Excel 里点编辑栏空白处就进入编辑，
+                // 点到的不是文字也要算（标签本身的命中区只有文字那么宽）。
+                let row_resp = ui.interact(ed_rect, egui::Id::new("fx_row"), Sense::click());
+                if row_resp.clicked() && self.editing.is_none() {
+                    self.focus_edit(EditSpot::FormulaBar);
+                    // 当帧就把焦点给编辑栏，下一帧的按键/上屏不会丢第一个字符
+                    ui.ctx()
+                        .memory_mut(|m| m.request_focus(egui::Id::new("fx_edit")));
+                }
                 if self.editing.is_some() {
                     if let Some(ed) = self.editing.as_mut() {
                         let mut child = ui.new_child(
@@ -21779,20 +21875,24 @@ impl eframe::App for SheetApp {
                             child.add_sized(
                                 Vec2::new(ed_rect.width(), ed_rect.height()),
                                 egui::TextEdit::multiline(&mut ed.buf)
+                                    .id(egui::Id::new("fx_edit"))
                                     .frame(false)
                                     .desired_rows(3),
                             )
                         } else {
                             child.add_sized(
                                 Vec2::new(ed_rect.width(), 24.0),
-                                egui::TextEdit::singleline(&mut ed.buf).frame(false),
+                                egui::TextEdit::singleline(&mut ed.buf)
+                                    .id(egui::Id::new("fx_edit"))
+                                    .frame(false),
                             )
                         };
-                        if te.lost_focus() {
+                        if ed.spot == EditSpot::FormulaBar {
+                            te.request_focus();
+                            // 编辑栏自己判 Enter：单行 TextEdit 在 Enter 时先失去焦点，
+                            // 用 lost_focus 判断会和每帧 request_focus 互相打架（永远不提交）。
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 commit = true;
-                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                cancel = true;
                             }
                         }
                     }
@@ -21822,17 +21922,18 @@ impl eframe::App for SheetApp {
                         )
                         .interact(egui::Sense::click());
                     if resp.clicked() {
-                        self.begin_edit(None);
+                        self.focus_edit(EditSpot::FormulaBar);
                     }
                 }
                 if commit {
                     self.commit_edit(Some((1, 0)));
                 } else if cancel {
-                    self.editing = None;
-                    self.release_lock();
+                    self.cancel_edit();
                 } else if fx_click {
                     if self.editing.is_none() {
-                        self.begin_edit(None);
+                        self.begin_edit_at(None, EditSpot::FormulaBar);
+                        ui.ctx()
+                            .memory_mut(|m| m.request_focus(egui::Id::new("fx_edit")));
                         if let Some(ed) = self.editing.as_mut() {
                             if !ed.buf.starts_with('=') {
                                 ed.buf.insert(0, '=');
@@ -22388,6 +22489,7 @@ impl eframe::App for SheetApp {
                 );
             }
         }
+        self.commit_edit_before_close(ctx);
         self.defer_close_while_saving(ctx, was_saving);
         // 无系统装饰，自绘 1 物理像素外边框
         let ppp = ctx.pixels_per_point();

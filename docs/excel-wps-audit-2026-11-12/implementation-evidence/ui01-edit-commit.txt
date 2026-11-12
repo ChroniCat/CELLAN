@@ -1,0 +1,98 @@
+# UI-01 修复真实键盘编辑提交链路：失败→通过证据
+
+## 1 缺陷（修复前）
+
+源码路径（基线 df48672 的 18957 行起，当前代码同构）：
+
+    // draw_grid_pane
+    if let Some(mut ed) = if readonly { None } else { self.editing.take() } {
+        ...
+        } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
+            self.commit_edit(Some((if shift { -1 } else { 1 }, 0)));
+        }
+
+`commit_edit` 内部是 `if let Some(ed) = self.editing.take() { ... }`。绘制时已经把
+`self.editing` 取空，于是 Enter/Tab/Shift 方向提交时 `commit_edit` 拿到 None：不写值、
+不记撤销、不标 dirty，只有末尾的“移动选区”生效——表现为输入后缓冲消失、A1 仍为空、
+选区却动了。
+
+## 2 失败复现（修复前运行）
+
+测试（与仓库内 `edit_regression_tests::typed_text_commits_on_enter_through_full_window`
+相同，探针源码另存 `ui01-full-window-probe.rs`）驱动真实 `eframe::App::update`：
+空白 A1 → Text("123") → Enter。
+
+    cargo test -p app --no-default-features --features glow --offline --bin app -- \
+        typed_text_commits_on_enter_through_full_window --nocapture --test-threads=1
+
+实际输出（修复前）：
+
+    test edit_regression_tests::typed_text_commits_on_enter_through_full_window ...
+    [title] 未命名.xlsx - Sheets Native
+    thread '...' panicked at crates\app\src\edit_regression_tests.rs:1317:5:
+    assertion `left == right` failed: Enter 必须提交 A1
+      left: Empty
+     right: Number(123.0)
+    test result: FAILED. 0 passed; 1 failed
+
+## 3 根因
+
+1. 编辑缓冲有两个所有者：`self.editing` 与 draw_grid_pane 局部的 `ed`（take 出来的）。
+2. 提交/取消没有唯一入口：格内 Enter/Tab、编辑栏 ×/✓、Escape、切表、保存、关闭窗口
+   各写一套，take/放回顺序不一致就会丢。
+3. `commit_edit` 的“移动选区”在 `if let Some(ed)` 之外，即使没写入也会移动，
+   把丢输入伪装成“提交成功”。
+4. 编辑栏与格内编辑共用一个缓冲，但两处 TextEdit 每帧都 `request_focus`，互相抢焦点；
+   编辑栏点空白处也进不了编辑（命中区只有文字那么宽），Enter 提交又被每帧 request_focus
+   压掉（lost_focus 永远为 false）。
+
+## 4 修改（有界）
+
+`crates/app/src/main.rs`：
+
+- `EditState` 增加 `spot: EditSpot{Grid, FormulaBar}`，缓冲唯一所有者仍是 `self.editing`；
+  删除 draw_grid_pane 里的 `self.editing.take()`，改为借用绘制。
+- 新增 `cancel_edit()`；`commit_edit(advance) -> bool` 只在真正写入后移动选区，
+  数据验证失败时不写、不移动、保留缓冲与协作租约（租约从“进入提交”改到“确认写入”后交还）。
+- 格内编辑、编辑栏、Escape、切表/换文档、关闭窗口统一走这两个函数。
+- 编辑栏：整条输入行可点进入编辑；TextEdit 固定 id `fx_edit` 并在进入编辑当帧
+  `request_focus`（首字符不丢）；Enter 在编辑栏内显式判定，不再依赖 lost_focus。
+- 关闭窗口：`commit_edit_before_close` 先提交有效编辑，验证不通过则 CancelClose。
+- 新增 `last_pane`（网格面板屏幕原点），供命中测试与回归使用。
+
+## 5 通过证据（修复后）
+
+    cargo test -p app --no-default-features --features glow --offline --bin app -- \
+        --test-threads=1 --skip net::tests:: --skip net::presence_tests::
+    test result: ok. 119 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out
+
+UI-01 新增回归（全部走 `eframe::App::update` 整窗事件路径，不用 SC_* 注入状态）：
+
+| 测试 | 覆盖 |
+|---|---|
+| typed_text_commits_on_enter_through_full_window | 键入 123 + Enter：A1=123、选区 A2、editing=None、dirty、undo=1 |
+| tab_commits_and_moves_right | Tab 提交并右移 |
+| shift_enter_and_shift_tab_commit_backwards | Shift+Enter/Shift+Tab 反向提交 |
+| escape_discards_draft_without_touching_model | Esc 丢弃草稿：不写、不脏、不记撤销、不移动、残余 Enter 不补交 |
+| f2_keeps_existing_formula_and_escape_restores_nothing | F2 带原公式进入编辑，Esc 后公式不变 |
+| formula_bar_edit_uses_same_buffer_and_commits | 点编辑栏进入编辑、同一缓冲追加、Enter 提交 1122 |
+| clicking_another_cell_commits_the_draft | 点别的格先提交再移动 |
+| rejected_validation_keeps_draft_and_position | 非法验证值不写入/不跳格/保留草稿，改合法后正常提交 |
+| one_undo_restores_previous_value_and_redo_reapplies | 一次撤销/重做 |
+| committed_value_survives_save_and_reload | 保存重开仍是键入值 |
+| chinese_text_commits_once_without_duplication | 中文上屏只进缓冲一次、提交不重复 |
+| goto_name_commits_pending_edit_before_navigating | 切表/跳转类命令先提交 |
+| closing_the_window_commits_pending_edit | 关窗口先落缓冲 |
+| closing_the_window_keeps_a_rejected_draft | 验证失败时取消关闭、保留草稿 |
+
+GUI 回归（真实 app.exe）：
+
+    cargo test -p app --no-default-features --features glow --offline --test ui_regression -- --test-threads=1
+    test result: ok. 8 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out
+
+## 6 未执行 / 剩余风险
+
+- 真实硬件键盘、中文 IME 候选窗、Alt+Enter 光标位置：未执行，归 QA-04（本机 RDP 截图/输入
+  自动化不可用，不能拿事件测试冒充）。
+- 关闭窗口的“未保存是否提示保存”：当前应用对任何 dirty 文档都没有保存提示，属既有缺口，
+  已登记为后续项；本切片只保证关闭请求先提交有效编辑且验证失败时取消关闭。
