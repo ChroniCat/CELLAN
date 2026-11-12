@@ -1,0 +1,93 @@
+23:37 复核的两个精确边界：修补与证据
+====================================
+日期：2026-11-12 UTC+08
+
+一、`check_single_root`：根**之前**的根外内容
+--------------------------------------------
+复核原文：Text/CData 只在 `closed == true` 时拒绝，根前非空白内容 `text<a/>` 仍放过。
+
+确认：旧条件是 `if closed && !text.is_whitespace()`。`text<a/>` 里根还没闭合，
+`closed == false`，于是整段被忽略，函数返回 Ok —— 一个前面挂着裸文本的「XML」被当成良构。
+
+改为 `if depth == 0 && !…is_whitespace()`：根外（根前、根后、根之间）任何非空白文本都拒绝。
+注释写清为什么不能用 `closed` 作判据。`<a/><b>` 这种「第二个根没闭合」仍由结尾的 `depth != 0` 兜住。
+
+新增/扩充的三组用例（`xlsx::gate_tests`）：
+
+| 用例 | 覆盖 |
+|---|---|
+| `rejects_content_before_the_root_too` | `text<a/>`、`text<a></a>`、`<![CDATA[x]]><a/>`、`  x  <a/>`、`<a/><b>` 必须拒绝；`\n <a/>\n`、`<!--c--><a/>`、`<?xml…?>\n<a></a>\n` 必须通过 |
+| `rejects_empty_multi_root_and_trailing_content` | 原有 9 种（空串、纯空白、未闭合、双根、自闭合双根、根后文本/元素/CDATA、多余结束标签） |
+| `text_inside_the_root_is_fine` | `<a>text</a>`、`<a><![CDATA[x]]></a>`、`<a> <b>t</b> </a>` 不能被误拒 |
+
+RED（把条件改回 `closed &&` 后跑）：
+
+    test xlsx::gate_tests::rejects_content_before_the_root_too ... FAILED
+    panicked at crates\core\src\xlsx.rs:973:13:
+    根外内容必须拒绝 "text<a/>"
+    test result: FAILED. 3 passed; 1 failed; 0 ignored; 243 filtered out
+
+GREEN（恢复 `depth == 0` 后）：
+
+    test xlsx::gate_tests::rejects_content_before_the_root_too ... ok
+    test xlsx::gate_tests::accepts_a_single_root_of_every_shape ... ok
+    test xlsx::gate_tests::text_inside_the_root_is_fine ... ok
+    test xlsx::gate_tests::rejects_empty_multi_root_and_trailing_content ... ok
+    test result: ok. 4 passed; 0 failed; 0 ignored; 243 filtered out
+
+二、UI-02 成功另存为：源文件整份 SHA
+------------------------------------
+复核原文：成功 SaveAs 只比较源 A1=5；完整源 SHA 只用在取消路径。
+
+改 `edit_regression_tests::ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original`：
+保存前记 `file_sha256(&path)`，另存为完成后再算一次，断言相等。
+只比 A1 不够——另存为若走错路径/顺手重写共享字符串或样式，A1 仍会是 5。
+
+**断言强度验证**（mutation）：把测试里的目标路径改成源文件本身
+（`let target = path.clone();`），模拟「另存为写回了原文件」：
+
+    test ... FAILED
+    panicked at crates\app\src\edit_regression_tests.rs:1731:5
+    （即 `另存为之后原文件的完整 SHA256 变了`）
+
+恢复后：
+
+    test edit_regression_tests::ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original ... ok
+    test result: ok. 1 passed; 0 failed; 0 ignored; 138 filtered out
+
+三、UI-02 取消路径：等对话框真的关掉，再检查文件
+------------------------------------------------
+复核原文：PostMessage 后固定等 1 秒就 kill，没确认对话框关闭/主窗恢复，可能掩盖「取消没生效」。
+
+改动都在 `ui_regression.rs` 的 `mod real_dialogs`：
+
+1. 新增 FFI：`IsWindow`、`SendMessageTimeoutW`（`WM_NULL` + `SMTO_ABORTIFHUNG`，1 秒超时）。
+2. `main_window(pid)`：枚举该进程可见顶层窗口，排除 `#32770`/`AlternateModal*`，找主窗。
+3. `alive_and_responsive(hwnd)`：`IsWindow` 为真 **且** 主窗能应答 `WM_NULL`
+   —— 能区分「对话框关了」与「整个进程假死」。
+4. `wait_until(f, secs)`：100ms 轮询，最多 10 秒。
+5. 取消流程改为：`PostMessage(WM_CLOSE)` → `wait_until(对话框 IsWindow == 0)` →
+   `wait_until(主窗存在且响应)` → 再断言 SHA 不变、运行目录没多出 xlsx → 最后才 kill。
+   断言消息：「发 WM_CLOSE 之后另存为对话框没有关闭（取消没生效）」
+   「取消另存为之后主窗口不再应答（进程可能崩了）」。
+
+**断言强度验证**（mutation）：注释掉 `PostMessageW(hwnd, WM_CLOSE, …)`：
+
+    test real_dialogs::save_as_command_shows_a_real_system_dialog_and_cancel_keeps_the_file ... FAILED
+    panicked at crates\app\tests\ui_regression.rs:973:9:
+    发 WM_CLOSE 之后另存为对话框没有关闭（取消没生效）
+    test result: FAILED. 0 passed; 1 failed; 19 filtered out; finished in 10.75s
+
+10.75s 正好是 10 秒轮询超时 + 启动时间，说明等待逻辑真的在等窗口消失，而不是睡固定时长。
+恢复后两个用例都通过：
+
+    test real_dialogs::open_command_shows_a_real_system_dialog ... 打开对话框：class=#32770 title=Open
+    test real_dialogs::save_as_command_shows_a_real_system_dialog_and_cancel_keeps_the_file ... 另存为对话框：class=#32770 title=Save As
+    test result: ok. 2 passed; 0 failed; 18 filtered out; finished in 3.25s
+
+四、提交前的计数订正（自查）
+----------------------------
+上一轮我在 `qa03-1-env-race-fix.txt` 与 `c13-integrity-gate.txt` 里写了
+「core 525 passed」，那是统计脚本把每个二进制的 `passed` 重复累加了一次。
+逐二进制复算的真实值：core4 = **469**、core5 = **471**、加 `formula_strings` 后 = **482**。
+两份证据已就地订正，并且以后一律用逐二进制解析脚本取数，不再用单行累加。

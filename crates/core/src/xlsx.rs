@@ -890,13 +890,15 @@ fn check_single_root(part: &str, body: &str) -> Result<()> {
                 }
             }
             Ok(quick_xml::events::Event::Text(t)) => {
-                if closed && !t.as_ref().chars().all(|c| c.is_whitespace()) {
-                    anyhow::bail!("{part} 在根元素之后还有文本内容");
+                // 根外（根之前 depth==0 且还没闭合，或根之后）只要是非空白文本就非法：
+                // `text<a/>` 这种「根前面挂了内容」不能因为 closed 还是 false 就放过。
+                if depth == 0 && !t.as_ref().chars().all(|c| c.is_whitespace()) {
+                    anyhow::bail!("{part} 在根元素之外还有文本内容");
                 }
             }
             Ok(quick_xml::events::Event::CData(c)) => {
-                if closed && !c.as_ref().chars().all(|ch| ch.is_whitespace()) {
-                    anyhow::bail!("{part} 在根元素之后还有 CDATA 内容");
+                if depth == 0 && !c.as_ref().chars().all(|ch| ch.is_whitespace()) {
+                    anyhow::bail!("{part} 在根元素之外还有 CDATA 内容");
                 }
             }
             Ok(quick_xml::events::Event::Eof) => break,
@@ -955,6 +957,31 @@ mod gate_tests {
     fn rejects_empty_multi_root_and_trailing_content() {
         for body in ["", "   ", "<a>", "<a></a><b></b>", "<a/><b/>", "<a></a>text", "<a></a><extra/>", "<a></a><![CDATA[x]]>", "</a>"] {
             assert!(check_single_root("p", body).is_err(), "必须拒绝 {body:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_content_before_the_root_too() {
+        // 根**之前**挂内容同样不是良构文档；旧实现只在 closed 之后检查，这四种会漏过。
+        for body in [
+            "text<a/>",
+            "text<a></a>",
+            "<![CDATA[x]]><a/>",
+            "  x  <a/>",
+            "<a/><b>",
+        ] {
+            assert!(check_single_root("p", body).is_err(), "根外内容必须拒绝 {body:?}");
+        }
+        // 空白与注释在根外是合法的
+        for body in ["\n  <a/>\n", "<!--c--><a/>", "<?xml version=\"1.0\"?>\n<a></a>\n"] {
+            check_single_root("p", body).unwrap_or_else(|e| panic!("应通过 {body:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn text_inside_the_root_is_fine() {
+        for body in ["<a>text</a>", "<a><![CDATA[x]]></a>", "<a> <b>t</b> </a>"] {
+            check_single_root("p", body).unwrap_or_else(|e| panic!("根内文本应通过 {body:?}: {e}"));
         }
     }
 }

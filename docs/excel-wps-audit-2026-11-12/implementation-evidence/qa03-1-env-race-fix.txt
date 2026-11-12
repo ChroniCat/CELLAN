@@ -65,7 +65,7 @@ GUI 套件（设计上串行，因为每个用例都要独占启动 app.exe）�
 
 core 套件：
 
-    54 个测试二进制，525 passed / 0 failed / 34 ignored，EXIT=0
+    54 个测试二进制，471 passed / 0 failed / 34 ignored，EXIT=0（旧稿写 525 是统计脚本重复累加算错，以 471 为准）
 
 五、仍然存在的边界
 ------------------

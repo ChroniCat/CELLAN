@@ -358,6 +358,31 @@ pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> 
     if !body.contains('[') {
         return None;
     }
+    // 引号里是数据：`="Sales[Amount]"` 不能变成 `="A2:A4"`；
+    // `'Sales'!A1` 里的 `Sales` 是工作表名，也不能当表格展开。
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut changed = false;
+    for (in_quote, seg) in crate::split_quoted(body) {
+        if in_quote {
+            out.push_str(seg);
+            continue;
+        }
+        match expand_segment(wb, si, seg) {
+            Some(s) => {
+                out.push_str(&s);
+                changed = true;
+            }
+            None => out.push_str(seg),
+        }
+    }
+    if changed { Some(out) } else { None }
+}
+
+/// 只展开一段**引号外**文本里的结构化引用。
+fn expand_segment(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
+    if !body.contains('[') {
+        return None;
+    }
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::with_capacity(body.len() + 16);
     let mut changed = false;

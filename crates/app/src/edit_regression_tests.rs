@@ -1709,6 +1709,9 @@ fn ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original() {
     let ctx = egui::Context::default();
     let (env, path) = saved_copy("ui02-save-as", 5.0);
     let target = env.path("saved-as.xlsx");
+    // 原文件的**整份**哈希：另存为是「写新文件」，原文件必须一个字节都不变。
+    // 只比 A1 的值不够——样式、共享字符串、包结构都可能被顺手改写。
+    let before_sha = file_sha256(&path);
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb = sheetcore::xlsx::load(&path).unwrap();
     app.wb.path = Some(path.clone());
@@ -1730,6 +1733,7 @@ fn ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original() {
         Value::Number(5.0),
         "另存为不得改动原文件"
     );
+    assert_eq!(file_sha256(&path), before_sha, "另存为之后原文件的完整 SHA256 变了");
     drop(env);
 }
 

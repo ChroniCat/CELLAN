@@ -800,8 +800,20 @@ mod real_dialogs {
         fn GetWindowTextW(hwnd: isize, buf: *mut u16, len: i32) -> i32;
         fn IsWindowVisible(hwnd: isize) -> i32;
         fn PostMessageW(hwnd: isize, msg: u32, w: usize, l: isize) -> i32;
+        fn IsWindow(hwnd: isize) -> i32;
+        fn SendMessageTimeoutW(
+            hwnd: isize,
+            msg: u32,
+            w: usize,
+            l: isize,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
     }
     const WM_CLOSE: u32 = 0x0010;
+    const WM_NULL: u32 = 0x0000;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
 
     fn wide_text(f: unsafe extern "system" fn(isize, *mut u16, i32) -> i32, hwnd: isize) -> String {
         let mut buf = [0u16; 512];
@@ -833,6 +845,49 @@ mod real_dialogs {
         WANT.lock().unwrap().take().map(|(_, v)| v).unwrap_or_default()
     }
 
+    /// 该进程的可见主窗口（排除系统对话框 #32770 与 egui 的临时弹层）。
+    fn main_window(pid: u32) -> Option<isize> {
+        static WANT2: std::sync::Mutex<Option<(u32, Option<isize>)>> = std::sync::Mutex::new(None);
+        extern "system" fn cb2(hwnd: isize, _l: isize) -> i32 {
+            let mut wpid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut wpid) };
+            let mut guard = WANT2.lock().unwrap();
+            let Some((want, out)) = guard.as_mut() else { return 1 };
+            if wpid == *want && out.is_none() && unsafe { IsWindowVisible(hwnd) } != 0 {
+                let class = wide_text(GetClassNameW, hwnd);
+                if class != "#32770" && !class.starts_with("AlternateModal") {
+                    *out = Some(hwnd);
+                }
+            }
+            1
+        }
+        *WANT2.lock().unwrap() = Some((pid, None));
+        unsafe { EnumWindows(cb2, 0) };
+        WANT2.lock().unwrap().take().and_then(|(_, v)| v)
+    }
+
+    /// 窗口还在不在、消息循环还答不答。`WM_NULL` 走 `SendMessageTimeout`：
+    /// 卡死的窗口会超时返回 0，能区分「对话框关了」和「整个进程假死」。
+    fn alive_and_responsive(hwnd: isize) -> bool {
+        if unsafe { IsWindow(hwnd) } == 0 {
+            return false;
+        }
+        let mut out: usize = 0;
+        let ok = unsafe { SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 1000, &mut out) };
+        ok != 0
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool, secs: u64) -> bool {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        f()
+    }
+
     fn sha256(path: &Path) -> String {
         use sha2::Digest;
         let mut h = sha2::Sha256::new();
@@ -840,7 +895,15 @@ mod real_dialogs {
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn run_and_expect_dialog(action: &str, doc: &str) -> (Option<String>, String) {
+    struct DialogRun {
+        desc: String,
+        /// 取消后对话框真的没了
+        dialog_closed: bool,
+        /// 取消后主窗口还在、消息循环还答
+        main_responsive: bool,
+    }
+
+    fn run_and_expect_dialog(action: &str, doc: &str) -> DialogRun {
         let exe = env!("CARGO_BIN_EXE_app");
         let mut cmd = Command::new(exe);
         isolate_child(&mut cmd);
@@ -863,20 +926,27 @@ mod real_dialogs {
             }
             std::thread::sleep(Duration::from_millis(150));
         }
+        let mut dialog_closed = false;
+        let mut main_responsive = false;
         let desc = match &found {
             Some((hwnd, class, title)) => {
-                // 取消：给对话框发 WM_CLOSE，让它走「取消」分支
-                unsafe { PostMessageW(*hwnd, WM_CLOSE, 0, 0) };
-                std::thread::sleep(Duration::from_millis(600));
+                let hwnd = *hwnd;
+                // 取消：给对话框发 WM_CLOSE，然后**等它真的关掉**，
+                // 不能发完就睡固定时长——那样「取消没生效」也会被当成关掉了。
+                unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                dialog_closed = wait_until(|| unsafe { IsWindow(hwnd) } == 0, 10);
+                // 主窗口必须还活着并且能应答消息，说明只是对话框关了、应用没崩
+                main_responsive = wait_until(
+                    || main_window(pid).is_some_and(alive_and_responsive),
+                    10,
+                );
                 format!("class={class} title={title}")
             }
             None => String::new(),
         };
-        std::thread::sleep(Duration::from_millis(400));
         let _ = child.kill();
         let _ = child.wait();
-        let shown = found.is_some();
-        (if shown { Some(desc.clone()) } else { None }, desc)
+        DialogRun { desc, dialog_closed, main_responsive }
     }
 
     /// Ctrl+Shift+S（另存为）必须真的弹出系统对话框；取消后原文件一个字节都不能变
@@ -893,12 +963,14 @@ mod real_dialogs {
         }
         let before = sha256(&src);
         let before_files = xlsx_count();
-        let (found, desc) = run_and_expect_dialog("FileSaveAs", &src.to_string_lossy());
+        let run = run_and_expect_dialog("FileSaveAs", &src.to_string_lossy());
         assert!(
-            found.is_some(),
+            !run.desc.is_empty(),
             "执行另存为没有出现系统对话框（说明走的是 SC_SAVE_AS 之类的旁路）"
         );
-        println!("另存为对话框：{desc}");
+        println!("另存为对话框：{}", run.desc);
+        assert!(run.dialog_closed, "发 WM_CLOSE 之后另存为对话框没有关闭（取消没生效）");
+        assert!(run.main_responsive, "取消另存为之后主窗口不再应答（进程可能崩了）");
         assert_eq!(sha256(&src), before, "取消另存为后原文件被改动");
         assert_eq!(xlsx_count(), before_files, "取消另存为却在运行目录里多出了文件");
         let _ = std::fs::remove_file(&src);
@@ -917,9 +989,11 @@ mod real_dialogs {
             sheetcore::xlsx::save(&src, &wb).expect("造样本");
         }
         let before = sha256(&src);
-        let (found, desc) = run_and_expect_dialog("FileOpen", &src.to_string_lossy());
-        assert!(found.is_some(), "执行打开没有出现系统文件对话框");
-        println!("打开对话框：{desc}");
+        let run = run_and_expect_dialog("FileOpen", &src.to_string_lossy());
+        assert!(!run.desc.is_empty(), "执行打开没有出现系统文件对话框");
+        println!("打开对话框：{}", run.desc);
+        assert!(run.dialog_closed, "发 WM_CLOSE 之后打开对话框没有关闭（取消没生效）");
+        assert!(run.main_responsive, "取消打开之后主窗口不再应答（进程可能崩了）");
         assert_eq!(sha256(&src), before, "取消打开后文件被改动");
         let _ = std::fs::remove_file(&src);
     }

@@ -1,0 +1,108 @@
+C03 公式预处理不得改写字符串和标识符
+=====================================
+日期：2026-11-12 UTC+08   对标：core-requirements.md C03（P0）
+
+一、原始缺陷（复核表第 22/23 行）
+--------------------------------
+| 输入 | 旧结果 | 应为 |
+|---|---|---|
+| `="_xlfn.TEXT"` | `"TEXT"` | `"_xlfn.TEXT"` |
+| `="Sales[Amount]"` | `"A2:A3"` | `"Sales[Amount]"` |
+| `="A:A"` | `"$A$1:$A$1048576"` | `"A:A"` |
+
+三处都是同一个根因：改写公式的步骤不看引号状态。
+
+- `lib.rs:139 normalize_formula` —— 对整串做五次 `str::replace`，把 `_xlfn.` `_xlws.`
+  `_xlpm.` `_xludf.` 从字符串里一起去掉。
+- `lib.rs:106 expand_whole_cols` —— 只认 `"`，且是「见到就翻转」的浅状态机，
+  单引号工作表名（`'Q1:Q2'!A1`）里的冒号会被当整列引用展开。
+- `table.rs:357 expand_structured` —— 完全没有引号追踪，`Sales[Amount]` 出现在哪都展开。
+
+二、改法：先切引号，再改写
+--------------------------
+新增 `sheetcore::split_quoted(text) -> Vec<(bool, &str)>`：按 Excel 的引号规则切段。
+
+- `"` 包住字符串，串内 `""` 是一个引号；
+- `'` 包住工作表名/外部簿名，串内 `''` 是一个引号；
+- 返回的每段带「是否在引号内」标记，**所有改写只动引号外的段**。
+
+三个改写点全部改成「遍历 `split_quoted` 的段」：
+
+- `normalize_formula`：只在引号外去前缀；
+- `expand_whole_cols`：拆成 wrapper + `expand_whole_cols_seg`（后者只处理无引号文本，
+  状态机里那段 `in_str` 翻转因此删掉）；
+- `expand_structured`：拆成 wrapper + `expand_segment`，引号内的段原样拼回。
+
+这样做的原因：`split_quoted` 是**无损**的（拼回去等于原文），
+而用词法器 `lex` 改写会丢掉大小写、空格与原始写法——C03 要求「保留原公式以支持无损显示与存盘」，
+所以这里需要的是「按词法边界切段」而不是「解析成 AST 再打印」。
+
+三、RED（先失败）
+-----------------
+`cargo test -p sheetcore --test formula_strings`，修复前：
+
+    test result: FAILED. 4 passed; 7 failed
+
+    xlfn_prefix_inside_a_string_is_not_stripped
+      left: "=\" TEXT\""                       right: "=\" _xlfn.TEXT\""
+    escaped_quotes_keep_the_string_intact
+      left: "=\"他说\"\"X\"\"了\""             right: "=\"他说\"\"_xlfn.X\"\"了\""
+    structured_reference_inside_a_string_is_not_expanded
+      left: Some("=\"A2:A4\"")                 right: None
+    real_structured_reference_still_expands_and_calculates
+      left: "=SUM(A2:A4)"                      right: "=SUM($A$2:$A$4)"   ← 期望值写错，见下
+    real_function_prefixes_are_still_normalized
+      left: "=XLOOKUP(A1,$A$1:$A$1048576,…)"   （整列展开是既有设计，见下）
+    evaluated_strings_are_returned_verbatim
+      left: "A2:A4"                            right: "Sales[Amount]"
+    input_save_load_copy_keep_the_formula_text
+      left: "A2:A4"                            right: "Sales[Amount]"
+
+其中两条是**我自己的期望值写错**，不是实现错，已在提交前订正：
+
+1. `=SUM(Sales[Amount])` 展开成 `=SUM(A2:A4)`（不带 `$`），旧实现就如此，正确；
+   我一开始写成 `$A$2:$A$4`。
+2. `=XLOOKUP(A1,A:A,B:B)` 里的 `A:A` 是**真引用**，按既有设计会展开成 `$A$1:$A$1048576`，
+   这是 `expand_whole_cols` 的既有行为（解析器要求整列带行号），不属于 C03；
+   断言改成与展开后一致，同时保留「`_xlfn.` 被剥掉」这一核心检查。
+
+还有一次假 RED 值得记：`r#"="""_xlfn.TEXT"""#` 在 Rust 原始字符串里以 `"#` 结尾，
+最后那个引号被当成终止符吃掉了，实际传入的是**引号不配对**的公式，
+求值返回 `#VALUE!` 是正确行为。改用 `r##"…"##` 后通过。
+
+四、GREEN
+---------
+    $ cargo test -p sheetcore --offline --test formula_strings
+    test result: ok. 11 passed; 0 failed; 0 ignored
+
+覆盖的断言：
+
+| 检查 | 用例 |
+|---|---|
+| 字符串里的 `_xlfn.` 不被剥 | `xlfn_prefix_inside_a_string_is_not_stripped` |
+| `""` 转义整段仍是字符串 | `escaped_quotes_keep_the_string_intact` |
+| 字符串里的 `A:A` / `A:C` 不展开 | `whole_column_reference_inside_a_string_is_not_expanded` |
+| 字符串里的 `Sales[Amount]` 不展开 | `structured_reference_inside_a_string_is_not_expanded` |
+| 真结构化引用仍展开并算出 60 | `real_structured_reference_still_expands_and_calculates` |
+| `'Sales'!A1` 不误当表格 | `single_quoted_sheet_name_is_not_mistaken_for_a_table` |
+| 真 `_xlfn.XLOOKUP` / `_xlfn._xlws.FILTER` 仍归一 | `real_function_prefixes_are_still_normalized` |
+| 计算结果是原文 | `evaluated_strings_are_returned_verbatim` |
+| 输入→保存→载入→重算→复制→再保存 | `input_save_load_copy_keep_the_formula_text` |
+| 含单引号工作表名按 `''` 转义解析 | `quoted_sheet_name_reference_escapes_and_resolves` |
+| `"1:1"` `"A1:B2"` 文本不被当引用 | `numbers_in_strings_are_not_mistaken_for_references` |
+
+「五条路径」的落点：
+- **输入**：`normalize_formula` 是 cell 输入、粘贴、载入的唯一入口（`xlsx.rs:148/343`、
+  `sparse.rs:502-539`、`formula/mod.rs:938/2559`），用例直接断言它的输出；
+- **载入**：`input_save_load_copy_keep_the_formula_text` 里 `load` 后读 `cell.formula`；
+- **复制**：`sparse::shift_refs(&f, 0, 0)`（拖拽/复制走的就是它），文本必须不变；
+- **重算**：`eval_formula` 直接求值；
+- **保存**：`save_atomic` 后再 `load` 比对公式文本，二次保存再比一次。
+
+五、边界（没做的事）
+--------------------
+- 结构化引用只在**引号外**展开，但 `Sales[[#Data],[Amount]]` 这类多段说明符仍未支持
+  （C10 的范围），本任务只保证含 `[` 的字符串不被改。
+- `_xlfn.` 前缀在引号外仍然全量剥掉，包括自定义函数名 `_xludf.foo` —— 前缀剥除的语义
+  没有变，只是不再跨引号生效。
+- 没有 Excel 对拍截图；期望值来自需求表与 Excel 语义，不是本机实测（本机 Excel 未启动）。

@@ -101,22 +101,73 @@ fn match_cols(chars: &[char], i: usize) -> Option<(usize, String, String)> {
     Some((j, first, second))
 }
 
+/// 把公式按引号切成 `(是否在引号内, 片段)`。
+///
+/// Excel 的引号规则：`"` 包住字符串，串内用 `""` 表示一个引号；
+/// `'` 包住工作表名/外部工作簿名，串内用 `''` 表示一个引号。
+/// 所有「改写公式」的步骤都必须只动引号外的片段——引号里是数据，不是公式。
+pub fn split_quoted(text: &str) -> Vec<(bool, &str)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out: Vec<(bool, &str)> = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    let mut k = 0usize;
+    while k < chars.len() {
+        let (i, c) = chars[k];
+        match quote {
+            None if c == '"' || c == '\'' => {
+                if i > start {
+                    out.push((false, &text[start..i]));
+                }
+                quote = Some(c);
+                start = i;
+            }
+            Some(q) if c == q => {
+                let escaped = chars.get(k + 1).map(|(_, n)| *n == q).unwrap_or(false);
+                if escaped {
+                    k += 1; // `""` / `''`：成对跳过，仍在串内
+                } else {
+                    let end = i + c.len_utf8();
+                    out.push((true, &text[start..end]));
+                    quote = None;
+                    start = end;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    if start < text.len() {
+        out.push((quote.is_some(), &text[start..]));
+    }
+    out
+}
+
 /// 整列引用 `A:C`（可带表名前缀）在 OOXML 里不带行号，
 /// 加载时改写成 `$A$1:$C$1048576`，求值时再按实际使用范围裁剪。
 fn expand_whole_cols(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 24);
+    for (in_quote, seg) in split_quoted(text) {
+        if in_quote {
+            out.push_str(seg);
+        } else {
+            out.push_str(&expand_whole_cols_seg(seg));
+        }
+    }
+    out
+}
+
+/// 只处理一段**引号外**的文本。
+fn expand_whole_cols_seg(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len() + 24);
     let mut i = 0usize;
-    let mut in_str = false;
     while i < chars.len() {
         let c = chars[i];
-        if c == '"' {
-            in_str = !in_str;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if !in_str {
+        {
             let boundary = i == 0
                 || !(chars[i - 1].is_ascii_alphanumeric()
                     || chars[i - 1] == '$'
@@ -141,9 +192,19 @@ pub fn normalize_formula(text: &str) -> String {
         return text.to_string();
     }
     let text = expand_whole_cols(text);
-    text.replace("_xlfn._xlws.", "")
-        .replace("_xlfn.", "")
-        .replace("_xlws.", "")
-        .replace("_xlpm.", "")
-        .replace("_xludf.", "")
+    let mut out = String::with_capacity(text.len());
+    for (in_quote, seg) in split_quoted(&text) {
+        if in_quote {
+            out.push_str(seg);
+            continue;
+        }
+        out.push_str(
+            &seg.replace("_xlfn._xlws.", "")
+                .replace("_xlfn.", "")
+                .replace("_xlws.", "")
+                .replace("_xlpm.", "")
+                .replace("_xludf.", ""),
+        );
+    }
+    out
 }
