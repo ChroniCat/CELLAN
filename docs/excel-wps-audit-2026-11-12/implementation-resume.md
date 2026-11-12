@@ -1,8 +1,8 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`），HEAD `dece894`（C04 首版已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 4 待验收 / 51 待实施；
-  切片 17 已验收 / 8 待验收 / 123 待实施。
+- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 5 待验收 / 50 待实施；
+  切片 17 已验收 / 9 待验收 / 122 待实施。
   C02 已验收（用户 02:43 复核认可）；C04、C08、C14 待验收（用户复核中）。
 
 ## 本轮（2026-11-13 02:45–03:05）：C08 + C04 两条补证
@@ -67,3 +67,14 @@
   不能用它判定自定义属性可见性。
 - 后续建议（不在本轮范围）：我们写出的 `xl/styles.xml` 没有 `<cellStyles>` 默认样式，
   openpyxl 会告警；Excel 能开但值得补。
+
+## 03:26 复核轮（HEAD 176c088）
+
+- C08：VT 命名空间改按解析出的声明集合判断；新增单引号声明夹具（断言 VT URI 只出现一次）；
+  `custom_props` 10 passed / 2 ignored；变异回退会被抓。
+- C05：`FValue::compare` 空引用按对方类型强制、类别序 数字<文本<布尔；`comparison_semantics` 4 passed / 1 ignored。
+- C14：挂起标签保存完成清 `load_diag`/`load_incomplete`；抢救副本 `fresh_base` 全量标脏
+  （布局/隐藏/保护/页设置/空白填充格）；批注删空清 comments/VML 部件；图表内部错误传播
+  （drawing→缺失 chart 报致命）。`c14_guard` 8 passed、app 4 passed。
+- round21 全量：core 66 bins 574/0/41、app 146/0、gui 12/0/8（首轮 ribbon 分组抖动，单跑与复跑均过）。
+- 未执行：真实 Excel 另存 .xls 的 calamine 成功分支、工作线程/旁路失败注入、Excel 属性对话框目视。
