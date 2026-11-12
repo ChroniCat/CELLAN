@@ -195,6 +195,8 @@ impl FValue {
     /// 比较：返回 -1/0/1；类型不同按 Excel 规则（数字 < 文本 < 布尔）
     pub fn compare(&self, other: &FValue) -> Result<std::cmp::Ordering, ErrKind> {
         use std::cmp::Ordering;
+        // Excel 的跨类型排序：数字 < 文本 < 布尔。空引用不参与排序，
+        // 先按对方的类型强制成 0 / "" / FALSE（=A1=0、=A1=""、=A1=FALSE 都为 TRUE）。
         fn rank(v: &FValue) -> u8 {
             match v {
                 FValue::Empty => 0,
@@ -206,21 +208,36 @@ impl FValue {
                 FValue::Lambda(_) => 6,
             }
         }
+        fn blank_like(v: &FValue) -> FValue {
+            match v {
+                FValue::Number(_) => FValue::Number(0.0),
+                FValue::Text(_) => FValue::Text("".into()),
+                FValue::Bool(_) => FValue::Bool(false),
+                other => other.clone(),
+            }
+        }
         if let (FValue::Error(e), _) = (self, other) {
             return Err(*e);
         }
         if let (_, FValue::Error(e)) = (self, other) {
             return Err(*e);
         }
-        let (ra, rb) = (rank(self), rank(other));
+        if matches!(self, FValue::Empty) && matches!(other, FValue::Empty) {
+            return Ok(Ordering::Equal);
+        }
+        let (a, b): (FValue, FValue) = match (self, other) {
+            (FValue::Empty, o) => (blank_like(o), o.clone()),
+            (o, FValue::Empty) => (o.clone(), blank_like(o)),
+            _ => (self.clone(), other.clone()),
+        };
+        let (ra, rb) = (rank(&a), rank(&b));
         if ra != rb {
             return Ok(ra.cmp(&rb));
         }
-        Ok(match (self, other) {
-            (FValue::Empty, FValue::Empty) => Ordering::Equal,
-            (FValue::Number(a), FValue::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (FValue::Text(a), FValue::Text(b)) => a.to_lowercase().cmp(&b.to_lowercase()),
-            (FValue::Bool(a), FValue::Bool(b)) => a.cmp(b),
+        Ok(match (&a, &b) {
+            (FValue::Number(x), FValue::Number(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (FValue::Text(x), FValue::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+            (FValue::Bool(x), FValue::Bool(y)) => x.cmp(y),
             _ => Ordering::Equal,
         })
     }

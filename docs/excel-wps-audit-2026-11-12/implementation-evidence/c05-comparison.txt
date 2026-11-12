@@ -1,0 +1,44 @@
+C05 空值 / 布尔 / 文本比较的 Excel 语义
+=======================================
+
+缺陷
+----
+`FValue::compare` 把 `Empty` 当作独立的最低等级：`=A1=0`、`=A1=""`、`=A1=FALSE`
+在 A1 为空时全部返回 FALSE，`=IF(A1=0,…)` 也走错分支。
+
+Excel 语义（Office 文档 + 本机实测口径）
+---------------------------------------
+1. 空引用参与比较时先按**对方的类型**强制：和数字比当 0，和文本比当 `""`，和布尔比当 FALSE。
+2. 跨类型排序固定为 数字 < 文本 < 布尔。
+3. 任一侧是错误值，结果是该错误。
+
+修改
+----
+`crates/core/src/formula/value.rs::compare`：
+
+- 两侧都是 `Empty` → `Equal`；
+- 一侧 `Empty` → 用 `blank_like()` 强制成对方类型再比；
+- `rank`: Number=1 < Text=2 < Bool=3（错误先传播，数组/Lambda 保持原等级）；
+- 文本仍按大小写不敏感比较。
+
+测试（`crates/core/tests/comparison_semantics.rs`，**4 passed / 1 ignored**）
+----------------------------------------------------------------------------
+| 用例 | 断言 |
+|---|---|
+| `blank_compares_as_zero_empty_string_and_false` | `A1=0`/`A1=""`/`A1=FALSE` 为 TRUE；`<>` 为 FALSE；`<`/`>` 全 FALSE，`<=`/`>=` 全 TRUE；`A1<"文本"`、`A1<TRUE` 为 TRUE |
+| `type_order_is_number_then_text_then_boolean` | `5<"文本"<TRUE`；`"文本">0`、`TRUE>9`；`"文本"=5`、`5="5"` 为 FALSE；文本比较不区分大小写 |
+| `errors_propagate_from_either_side` | `A1=#N/A`、`#N/A=0`、`#N/A>#N/A` 均为 `#N/A` |
+| `conditional_aggregates_keep_their_blank_semantics` | `COUNTBLANK(A1:A5)=1`、`IF(A1=0,…)="空"`、`IF(A1="",…)="空"`、`IF(A1,…)="假"`、`COUNTIF(A1:A5,0)=1` |
+
+`make_c05_fixture` 为 ignored：生成 `%TEMP%\sc_c05\c05.xlsx`（38 条公式），
+用于后续与 Excel/WPS 实机对拍。
+
+RED → GREEN
+-----------
+- 修改前：`=A1=0 应为 TRUE` 与 `IF(A1=0,…)` 两处失败（2 passed / 2 failed）。
+- 修改后：**4 passed / 0 failed / 1 ignored**。
+
+未执行
+------
+- Excel 16.0 / WPS 12.0 实机对拍矩阵尚未跑（夹具已生成，脚本在 `scratch/c05_probe.ps1`）；
+  本文件只登记代码语义与单元测试结论，不把实机对拍写成已完成。
