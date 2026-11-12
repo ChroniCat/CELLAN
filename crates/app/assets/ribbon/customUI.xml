@@ -153,8 +153,8 @@
                 <toggleButton id="AlignBottom" imageMso="Bottom" screentip="底端对齐" onAction="AlignBottom"/>
               </box>
               <spacer sizeString="2"/>
-              <menu id="TextDirection" label="方向" sizeString="40" screentip="文字方向">
-                <button id="TextVertical" label="竖排文字" onAction="TextVertical"/>
+              <menu id="TextDirection" label="方向" imageMso="TextDirection" sizeString="62" screentip="文字方向">
+                <button id="TextVertical" label="竖排文字" imageMso="TextDirection" onAction="TextVertical"/>
                 <button id="TextRotateUp" label="逆时针旋转文字" onAction="TextRotateUp"/>
                 <button id="TextRotateDown" label="顺时针旋转文字" onAction="TextRotateDown"/>
                 <menuSeparator id="TextDirSep"/>

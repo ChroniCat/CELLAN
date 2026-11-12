@@ -10,7 +10,7 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icon {
     Open,
     Save,
@@ -61,6 +61,7 @@ pub enum Icon {
     DecDec,
     FontGrow,
     FontShrink,
+    TextDir,
     Freeze,
     Lock,
     /// 条件格式：三条彩色数据条
@@ -338,10 +339,44 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     paint(p, rect, icon, Some(color));
 }
 
+/// 图标总表：给「对照表」和自检用（位图 vs 矢量并排看）
+pub const SHEET_ICONS: [Icon; 46] = [
+    Icon::AlignC, Icon::AlignL, Icon::AlignR, Icon::Border, Icon::Bottom, Icon::Brush,
+    Icon::Cf, Icon::Chart, Icon::ClearFmt, Icon::Close, Icon::Comma, Icon::Comment,
+    Icon::Copy, Icon::Currency, Icon::Cut, Icon::Eraser, Icon::Fill, Icon::Filter,
+    Icon::Find, Icon::FontColor, Icon::FontGrow, Icon::FontShrink, Icon::Freeze, Icon::Grid,
+    Icon::Image, Icon::IndentDec, Icon::IndentInc, Icon::Link, Icon::Lock, Icon::Merge,
+    Icon::Middle, Icon::Open, Icon::Paste, Icon::Percent, Icon::Pivot, Icon::Print,
+    Icon::Refresh, Icon::SaveAs, Icon::SortAsc, Icon::SortDesc, Icon::Sum, Icon::Symbol,
+    Icon::Table, Icon::Top, Icon::Wrap, Icon::Zoom,
+];
+
+/// 对照表用：只画矢量（不回落位图）
+pub fn draw_vec(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let r = rect.expand(rect.width() * 0.04);
+    paint(p, r, icon, Some(color));
+}
+
+/// 对照表用：矢量彩色版（和正式界面一致）
+pub fn draw_vec_color(p: &Painter, rect: Rect, icon: Icon) {
+    let r = rect.expand(rect.width() * 0.04);
+    paint(p, r, icon, None);
+}
+
+/// 图标来源：默认矢量。imageMso 导出的是 Office 2010 时代的彩色渐变图，
+/// 和 Excel 365 的扁平线面风格差得远；SC_ICONS=bitmap 可切回位图做对照。
+fn use_bitmap() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("SC_ICONS")
+            .map(|v| v.eq_ignore_ascii_case("bitmap"))
+            .unwrap_or(false)
+    })
+}
+
 /// Excel 风格：彩色块面 + 深色描边。关掉的按钮只画灰线，不铺色。
 pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
-    // 优先用从 Office imageMso 导出的原始位图
-    if crate::ui_png::draw(p, rect, icon, enabled) {
+    if use_bitmap() && crate::ui_png::draw(p, rect, icon, enabled) {
         return;
     }
     // Excel 的图形比 24 网格画得满：外扩 4%，32px 时约多 2.5px
@@ -368,52 +403,50 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
     match icon {
         // ---- 剪贴板 ----
         Paste => {
-            // Excel 2016 的画法：棕色剪贴板轮廓 + 白纸 + 同色夹子，
-            // 全程低饱和、细线，靠留白和层次而不是大面积填色。
-            pen.rr(5.0, 3.6, 14.0, 17.4, 1.4, Color32::from_rgb(250, 240, 228));
-            pen.rro(5.0, 3.6, 14.0, 17.4, 1.4, BROWN_D, 1.3);
-            pen.rr(7.4, 6.6, 9.2, 12.2, 0.6, WHITE);
-            pen.rro(7.4, 6.6, 9.2, 12.2, 0.6, BROWN_M, 0.85);
-            pen.ln(9.6, 10.8, 14.4, 10.8, 0.85, BROWN_M);
-            pen.ln(9.6, 13.6, 14.4, 13.6, 0.85, BROWN_M);
-            pen.rr(9.4, 1.6, 5.2, 4.0, 1.0, Color32::from_rgb(250, 240, 228));
-            pen.rro(9.4, 1.6, 5.2, 4.0, 1.0, BROWN_D, 1.0);
-            pen.ln(11.0, 1.6, 11.0, 5.6, 0.8, BROWN_M);
+            // Excel 365：米色小板 + 白纸，线条细、体量克制（不要压过旁边的剪切/复制）
+            pen.rr(5.4, 4.6, 13.2, 16.0, 1.2, Color32::from_rgb(250, 244, 233));
+            pen.rro(5.4, 4.6, 13.2, 16.0, 1.2, INK, 1.1);
+            pen.rr(7.8, 7.4, 8.4, 10.6, 0.5, WHITE);
+            pen.rro(7.8, 7.4, 8.4, 10.6, 0.5, GRAY_D, 0.8);
+            pen.ln(9.6, 10.4, 14.2, 10.4, 0.8, GRAY_D);
+            pen.ln(9.6, 12.6, 14.2, 12.6, 0.8, GRAY_D);
+            pen.rr(9.6, 2.8, 4.8, 3.6, 0.9, Color32::from_rgb(250, 244, 233));
+            pen.rro(9.6, 2.8, 4.8, 3.6, 0.9, INK, 0.95);
+            pen.ln(10.9, 2.8, 10.9, 6.4, 0.75, GRAY_D);
         }
         Cut => {
             // 细刀刃 + 两个空心环，低饱和蓝；开合角度按 Excel 的 40° 左右
-            pen.ln(7.6, 4.4, 15.2, 14.8, 1.4, BLUE_S);
-            pen.ln(16.4, 4.4, 8.8, 14.8, 1.4, BLUE_S);
-            pen.ring(6.2, 18.0, 2.35, 1.35, BLUE_S);
-            pen.ring(17.8, 18.0, 2.35, 1.35, BLUE_S);
+            pen.ln(7.6, 4.4, 15.2, 14.8, 1.4, INK);
+            pen.ln(16.4, 4.4, 8.8, 14.8, 1.4, INK);
+            pen.ring(6.2, 18.0, 2.35, 1.35, INK);
+            pen.ring(17.8, 18.0, 2.35, 1.35, INK);
         }
         Copy => {
             // 两张错位纸张：后页浅灰蓝、前页白，前面那页带折角
             pen.rr(8.6, 3.8, 10.6, 12.4, 0.5, Color32::from_rgb(234, 241, 250));
-            pen.rro(8.6, 3.8, 10.6, 12.4, 0.5, BLUE_M_D, 0.95);
+            pen.rro(8.6, 3.8, 10.6, 12.4, 0.5, GRAY_D, 0.95);
             pen.rr(4.0, 7.4, 10.6, 12.4, 0.5, WHITE);
-            pen.rro(4.0, 7.4, 10.6, 12.4, 0.5, BLUE_S, 1.05);
+            pen.rro(4.0, 7.4, 10.6, 12.4, 0.5, INK, 1.05);
             pen.poly(
                 &[(11.4, 7.4), (14.6, 7.4), (14.6, 10.6)],
                 Color32::from_rgb(234, 241, 250),
-                BLUE_S,
+                INK,
                 0.9,
             );
-            pen.ln(11.4, 7.4, 14.6, 10.6, 0.8, BLUE_S);
+            pen.ln(11.4, 7.4, 14.6, 10.6, 0.8, INK);
         }
         Brush => {
-            // 斜握的刷子：刷头是平行四边形，手柄细长，颜色全走暖棕
+            // Excel 365 的格式刷：斜握，刷头浅色、杆深灰，只用一点暖色区分刷毛
             pen.poly(
-                &[(4.4, 5.4), (10.2, 3.0), (12.4, 9.2), (6.6, 11.6)],
-                Color32::from_rgb(242, 219, 178),
-                BROWN_D,
-                1.25,
+                &[(4.6, 5.6), (10.2, 3.4), (12.2, 8.8), (6.6, 11.0)],
+                Color32::from_rgb(255, 242, 204),
+                INK,
+                1.1,
             );
-            pen.ln(6.2, 8.6, 8.6, 7.7, 0.9, BROWN_M);
-            pen.ln(7.2, 11.2, 9.6, 10.2, 0.9, BROWN_M);
-            pen.ln(12.0, 9.8, 16.4, 17.8, 2.1, Color32::from_rgb(200, 162, 106));
-            pen.rr(14.8, 17.2, 4.4, 2.2, 1.0, Color32::from_rgb(200, 162, 106));
-            pen.rro(14.8, 17.2, 4.4, 2.2, 1.0, BROWN_D, 0.9);
+            pen.ln(6.4, 8.4, 8.6, 7.6, 0.8, GRAY_D);
+            pen.ln(7.4, 10.6, 9.6, 9.8, 0.8, GRAY_D);
+            pen.ln(11.8, 9.4, 15.8, 17.0, 1.9, INK);
+            pen.rr(14.2, 16.4, 4.2, 2.0, 0.9, INK);
         }
         Fill => {
             // 正面油漆桶：桶身 + 上沿 + 提手 + 一滴漆（斜放的四边形会被看成菱形）
@@ -455,58 +488,64 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             for i in 0..4 {
                 pen.rule(4.0, 6.6 + i as f32 * 3.5, 8.6, GRAY_D);
             }
-            pen.bar(4.0, 3.4, 16.0, 2.0, BLUE);
-            pen.bar(17.2, 7.0, 1.7, 6.4, BLUE);
-            pen.arrow((17.9, 5.4), (0.0, -1.0), 3.6, BLUE);
+            pen.bar(4.0, 3.4, 16.0, 2.0, INK);
+            pen.bar(17.2, 7.0, 1.7, 6.4, INK);
+            pen.arrow((17.9, 5.4), (0.0, -1.0), 3.6, INK);
         }
         Middle => {
             for i in 0..4 {
                 pen.rule(4.0, 6.6 + i as f32 * 3.5, 8.6, GRAY_D);
             }
-            pen.bar(4.0, 11.0, 16.0, 2.0, BLUE);
-            pen.arrow((19.6, 9.6), (0.0, -1.0), 3.2, BLUE);
-            pen.arrow((19.6, 14.4), (0.0, 1.0), 3.2, BLUE);
-            pen.bar(18.6, 10.2, 1.6, 3.6, BLUE);
+            pen.bar(4.0, 11.0, 16.0, 2.0, INK);
+            pen.arrow((19.6, 9.6), (0.0, -1.0), 3.2, INK);
+            pen.arrow((19.6, 14.4), (0.0, 1.0), 3.2, INK);
+            pen.bar(18.6, 10.2, 1.6, 3.6, INK);
         }
         Bottom => {
             for i in 0..4 {
                 pen.rule(4.0, 6.6 + i as f32 * 3.5, 8.6, GRAY_D);
             }
-            pen.bar(4.0, 18.6, 16.0, 2.0, BLUE);
-            pen.bar(17.2, 10.6, 1.7, 6.4, BLUE);
-            pen.arrow((17.9, 18.2), (0.0, 1.0), 3.6, BLUE);
+            pen.bar(4.0, 18.6, 16.0, 2.0, INK);
+            pen.bar(17.2, 10.6, 1.7, 6.4, INK);
+            pen.arrow((17.9, 18.2), (0.0, 1.0), 3.6, INK);
         }
         Wrap => {
             pen.bar(4.0, 5.0, 16.0, 1.8, INK);
             pen.bar(4.0, 10.4, 9.6, 1.8, INK);
             pen.bar(4.0, 15.8, 16.0, 1.8, INK);
-            pen.polyline(&[(13.6, 9.2), (18.0, 12.4), (13.6, 15.6)], 1.8, BLUE);
+            pen.polyline(&[(13.6, 9.2), (18.0, 12.4), (13.6, 15.6)], 1.8, INK);
         }
         Merge => {
-            pen.rrs(3.2, 6.0, 7.0, 12.0, 0.9, BLUE_L, BLUE_D, 1.0);
-            pen.rrs(13.8, 6.0, 7.0, 12.0, 0.9, BLUE_L, BLUE_D, 1.0);
-            pen.ln(10.4, 12.0, 13.6, 12.0, 1.4, BLUE_D);
-            pen.arrow((9.6, 12.0), (-1.0, 0.0), 2.6, BLUE_D);
-            pen.arrow((14.4, 12.0), (1.0, 0.0), 2.6, BLUE_D);
+            // 一个大格 + 中间虚线 + 两侧向内箭头 + 底部居中短横（表示「合并后居中」）
+            pen.rro(3.4, 4.2, 17.2, 11.6, 0.8, INK, 1.2);
+            for (k, y) in [0.0_f32, 2.9, 5.8, 8.7].iter().enumerate() {
+                let yy = 4.9 + y;
+                if k % 2 == 0 {
+                    pen.ln(11.2, yy, 12.8, yy, 0.9, GRAY_D);
+                }
+            }
+            pen.arrow((9.4, 10.0), (-1.0, 0.0), 2.6, INK);
+            pen.arrow((14.6, 10.0), (1.0, 0.0), 2.6, INK);
+            pen.bar(8.6, 18.2, 6.8, 1.6, INK);
         }
         Border => {
-            pen.rrs(3.6, 3.6, 16.8, 16.8, 0.8, WHITE, BLUE_D, 1.8);
-            pen.bar(4.2, 11.3, 15.6, 1.4, BLUE_XL);
-            pen.bar(11.3, 4.2, 1.4, 15.6, BLUE_XL);
+            pen.rrs(3.6, 3.6, 16.8, 16.8, 0.8, WHITE, INK, 1.8);
+            pen.bar(4.2, 11.3, 15.6, 1.4, Color32::from_rgb(196,196,196));
+            pen.bar(11.3, 4.2, 1.4, 15.6, Color32::from_rgb(196,196,196));
         }
 
         // ---- 数字 ----
         Currency => pen.text("¥", 14.5, 12.0, 12.2, GREEN_D),
         Percent => pen.text("%", 13.5, 12.0, 12.2, GREEN_D),
-        Comma => pen.text(",", 17.0, 12.0, 11.0, GREEN_D),
+        Comma => pen.text(",", 16.4, 12.6, 21.0, GREEN_D),
         DecInc => {
             pen.text("0.0", 8.6, 9.2, 12.6, INK);
-            pen.bar(16.4, 6.4, 4.6, 1.3, BLUE_D);
-            pen.bar(18.05, 4.75, 1.3, 4.6, BLUE_D);
+            pen.bar(16.4, 6.4, 4.6, 1.3, INK);
+            pen.bar(18.05, 4.75, 1.3, 4.6, INK);
         }
         DecDec => {
             pen.text("0.0", 8.6, 9.2, 12.6, INK);
-            pen.bar(16.4, 6.4, 4.6, 1.3, BLUE_D);
+            pen.bar(16.4, 6.4, 4.6, 1.3, INK);
         }
 
         // ---- 排序 / 筛选 / 查找 ----
@@ -514,15 +553,15 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.rule(4.0, 6.2, 8.0, GRAY_D);
             pen.rule(4.0, 10.8, 6.0, GRAY_D);
             pen.rule(4.0, 15.4, 4.0, GRAY_D);
-            pen.bar(17.0, 6.0, 1.8, 12.0, BLUE);
-            pen.arrow((17.9, 4.2), (0.0, -1.0), 3.6, BLUE);
+            pen.bar(17.0, 6.0, 1.8, 12.0, INK);
+            pen.arrow((17.9, 4.2), (0.0, -1.0), 3.6, INK);
         }
         SortDesc => {
             pen.rule(4.0, 6.2, 4.0, GRAY_D);
             pen.rule(4.0, 10.8, 6.0, GRAY_D);
             pen.rule(4.0, 15.4, 8.0, GRAY_D);
-            pen.bar(17.0, 5.8, 1.8, 12.0, BLUE);
-            pen.arrow((17.9, 19.6), (0.0, 1.0), 3.6, BLUE);
+            pen.bar(17.0, 5.8, 1.8, 12.0, INK);
+            pen.arrow((17.9, 19.6), (0.0, 1.0), 3.6, INK);
         }
         Filter => {
             pen.poly(
@@ -831,17 +870,22 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(11.0, 8.0, 1.0, 12.6, GREEN_D);
             pen.bar(4.4, 14.5, 15.2, 1.0, GREEN_D);
         }
+        TextDir => {
+            // 竖排文字：一个 A + 向下的折线箭头（Excel 的「方向」图标）
+            pen.text("A", 8.2, 9.0, 12.0, INK);
+            pen.ln(17.6, 4.0, 17.6, 18.0, 1.5, GRAY_D);
+            pen.arrow((17.6, 19.6), (0.0, 1.0), 3.2, GRAY_D);
+        }
         FontGrow => {
-            pen.text("A", 10.0, 8.6, 12.6, INK);
-            pen.bar(16.4, 12.4, 4.6, 1.3, GREEN_D);
-            pen.bar(18.05, 10.75, 1.3, 4.6, GREEN_D);
-            pen.arrow((18.7, 9.0), (0.0, -1.0), 2.8, GREEN_D);
+            // Excel：一个 A + 右侧向上的小箭头（不要加号，16px 下三个元素会糊成一团）
+            pen.text("A", 9.4, 9.0, 13.0, INK);
+            pen.bar(17.2, 7.2, 1.7, 9.4, GREEN_D);
+            pen.arrow((18.05, 5.6), (0.0, -1.0), 3.4, GREEN_D);
         }
         FontShrink => {
-            pen.text("A", 10.0, 8.6, 12.6, INK);
-            pen.bar(16.4, 12.4, 4.6, 1.3, GREEN_D);
-            pen.bar(18.05, 10.75, 1.3, 4.6, GREEN_D);
-            pen.arrow((18.7, 17.4), (0.0, 1.0), 2.8, GREEN_D);
+            pen.text("A", 9.4, 9.0, 13.0, INK);
+            pen.bar(17.2, 7.2, 1.7, 9.4, GREEN_D);
+            pen.arrow((18.05, 18.4), (0.0, 1.0), 3.4, GREEN_D);
         }
     }
 }

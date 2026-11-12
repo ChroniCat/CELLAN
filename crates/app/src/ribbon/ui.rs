@@ -1153,6 +1153,8 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "Cut" => Icon::Cut,
         "Copy" => Icon::Copy,
         "Brush" => Icon::Brush,
+        "TextDirection" => Icon::TextDir,
+        "TextVertical" => Icon::TextDir,
         "Fill" => Icon::Fill,
         "FontColor" => Icon::FontColor,
         "AlignL" => Icon::AlignL,

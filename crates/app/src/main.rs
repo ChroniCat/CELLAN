@@ -21878,6 +21878,42 @@ impl eframe::App for SheetApp {
         let wake = if self.net.is_some() { 120 } else { 500 };
         ctx.request_repaint_after(std::time::Duration::from_millis(wake));
 
+        // 图标对照表：SC_ICON_SHEET=1 时在最上层画「位图 / 矢量」并排，配合 SC_SHOT 截图
+        if std::env::var("SC_ICON_SHEET").is_ok() {
+            let screen = ctx.screen_rect();
+            let p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("icon_sheet"),
+            ));
+            p.rect_filled(screen, 0.0, Color32::WHITE);
+            let col_w = 74.0;
+            let row_h = 84.0;
+            for (i, icon) in crate::ui_icons::SHEET_ICONS.iter().enumerate() {
+                let cx = 18.0 + (i % 15) as f32 * col_w;
+                let cy = 24.0 + (i / 15) as f32 * row_h;
+                crate::ui_png::draw(
+                    &p,
+                    egui::Rect::from_min_size(egui::pos2(cx, cy), egui::Vec2::splat(32.0)),
+                    *icon,
+                    true,
+                );
+                crate::ui_icons::draw_vec_color(
+                    &p,
+                    egui::Rect::from_min_size(
+                        egui::pos2(cx, cy + 34.0),
+                        egui::Vec2::splat(32.0),
+                    ),
+                    *icon,
+                );
+                p.text(
+                    egui::pos2(cx, cy + 70.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{icon:?}"),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_gray(110),
+                );
+            }
+        }
         self.defer_close_while_saving(ctx, was_saving);
         // 无系统装饰，自绘 1 物理像素外边框
         let ppp = ctx.pixels_per_point();

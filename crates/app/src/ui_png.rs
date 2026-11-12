@@ -23,7 +23,6 @@ pub fn png(icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
         Icon::Cut => ("Cut", include_bytes!("../../../assets/icons/excel/Cut.png"), include_bytes!("../../../assets/icons/excel/Cut_16.png")),
         Icon::Eraser => ("Eraser", include_bytes!("../../../assets/icons/excel/Eraser.png"), include_bytes!("../../../assets/icons/excel/Eraser_16.png")),
         Icon::Fill => ("Fill", include_bytes!("../../../assets/icons/excel/Fill.png"), include_bytes!("../../../assets/icons/excel/Fill_16.png")),
-        Icon::Filter => ("Filter", include_bytes!("../../../assets/icons/excel/Filter.png"), include_bytes!("../../../assets/icons/excel/Filter_16.png")),
         Icon::Find => ("Find", include_bytes!("../../../assets/icons/excel/Find.png"), include_bytes!("../../../assets/icons/excel/Find_16.png")),
         Icon::FontColor => ("FontColor", include_bytes!("../../../assets/icons/excel/FontColor.png"), include_bytes!("../../../assets/icons/excel/FontColor_16.png")),
         Icon::FontGrow => ("FontGrow", include_bytes!("../../../assets/icons/excel/FontGrow.png"), include_bytes!("../../../assets/icons/excel/FontGrow_16.png")),
@@ -49,11 +48,9 @@ pub fn png(icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
         Icon::SortAsc => ("SortAsc", include_bytes!("../../../assets/icons/excel/SortAsc.png"), include_bytes!("../../../assets/icons/excel/SortAsc_16.png")),
         Icon::SortDesc => ("SortDesc", include_bytes!("../../../assets/icons/excel/SortDesc.png"), include_bytes!("../../../assets/icons/excel/SortDesc_16.png")),
         Icon::Sum => ("Sum", include_bytes!("../../../assets/icons/excel/Sum.png"), include_bytes!("../../../assets/icons/excel/Sum_16.png")),
-        Icon::Symbol => ("Symbol", include_bytes!("../../../assets/icons/excel/Symbol.png"), include_bytes!("../../../assets/icons/excel/Symbol_16.png")),
         Icon::Table => ("Table", include_bytes!("../../../assets/icons/excel/Table.png"), include_bytes!("../../../assets/icons/excel/Table_16.png")),
         Icon::Top => ("Top", include_bytes!("../../../assets/icons/excel/Top.png"), include_bytes!("../../../assets/icons/excel/Top_16.png")),
         Icon::Wrap => ("Wrap", include_bytes!("../../../assets/icons/excel/Wrap.png"), include_bytes!("../../../assets/icons/excel/Wrap_16.png")),
-        Icon::Zoom => ("Zoom", include_bytes!("../../../assets/icons/excel/Zoom.png"), include_bytes!("../../../assets/icons/excel/Zoom_16.png")),
         _ => return None,
     })
 }
@@ -75,23 +72,22 @@ fn texture(ctx: &Context, name: &'static str, small: bool, bytes: &'static [u8])
 /// 画一张位图图标；小尺寸用原生 16px 版本，避免 32px 缩小的发虚。
 pub fn draw(p: &egui::Painter, rect: egui::Rect, icon: Icon, enabled: bool) -> bool {
     if let Some((name, big, small)) = png(icon) {
-        // 小于 28 的图标框一律用 16px 素材（32px 素材塞进 24px 框会溢出）
-        let small_mode = rect.width() < 28.0;
+        let ppp = p.pixels_per_point().max(0.1);
+        // 按**设备像素**选素材：目标 24 设备像素时用 32 素材缩到 24，比拿 16 素材放大 1.5 倍清楚。
+        let dev = rect.width() * ppp;
+        let small_mode = dev <= 20.0;
+        let native = if small_mode { 16.0 } else { 32.0 };
         let bytes = if small_mode { small } else { big };
         let t = texture(p.ctx(), name, small_mode, bytes);
         let tint = if enabled { Color32::WHITE } else { Color32::from_gray(170) };
-        // 位图按设备像素对齐：位置和尺寸都落到整数像素，纹素才和屏幕像素 1:1。
-        // 否则 egui 的双线性采样会把 16px 图标糊掉——这是「图标发虚」的主因。
-        // 关键：按位图原始像素尺寸画（16px 素材画 16 逻辑像素、32px 画 32），
-        // 再居中并落到整数设备像素。以前把 16px 素材拉伸到按钮给的 18~20px，
-        // 双线性放大就发虚——这是「图标糊」的根因。
-        let ppp = p.pixels_per_point().max(0.1);
-        let natural = if small_mode { 16.0 } else { 32.0 };
-        let x0 = ((rect.center().x - natural / 2.0) * ppp).round() / ppp;
-        let y0 = ((rect.center().y - natural / 2.0) * ppp).round() / ppp;
+        // 画成「纹素 = 设备像素」：逻辑尺寸 = 素材像素 / ppp，再居中并对齐整数设备像素。
+        // 以前是把 16px 素材拉伸到按钮给的 18~20px，双线性一放大就糊——「图标发虚」的根因。
+        let side = native / ppp;
+        let x0 = ((rect.center().x - side / 2.0) * ppp).round() / ppp;
+        let y0 = ((rect.center().y - side / 2.0) * ppp).round() / ppp;
         p.image(
             t.id(),
-            egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(natural, natural)),
+            egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(side, side)),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             tint,
         );
@@ -100,3 +96,4 @@ pub fn draw(p: &egui::Painter, rect: egui::Rect, icon: Icon, enabled: bool) -> b
         false
     }
 }
+
