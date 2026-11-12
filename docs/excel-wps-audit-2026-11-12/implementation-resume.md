@@ -1,11 +1,21 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `c6d56c9`（UI-03/04/05 首轮已推送）+ 本轮未提交改动。
+- 分支 `main`（`origin/main`），HEAD `eac47ac`（UI-05.4 已推送）+ 本轮未提交改动。
 - 台账（`scripts/audit_progress.py counts`）：9 已验收 / 6 待验收 / 46 待实施（本轮后待重算）；
   切片 26 已验收 / 10 待验收 / 112 待实施（UI-05.4 待验收）。
 - 当前测试真值（本轮源码，round47/48）：core 68 bins / 599 passed / 0 failed / 41 ignored，
-  CORE_EXIT=0；app 178 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+  CORE_EXIT=0；app 182 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
 - 专项：`c14_guard` 16 passed；`search_matches` 7 passed。
+
+## 本轮：UI-06 选择性粘贴（待验收）
+
+- formula/全部都走 refs::translate（相对平移、$ 锁定、负偏移 #REF!）；
+  转置时矩阵与源坐标一起转置，偏移始终用原始源坐标。
+- 全部同时写源样式；格式模式只写样式；运算除零写 #DIV/0!，不再静默保留；
+  外部文本与普通粘贴共用 parse_clip_text，保留中间空行。
+- 4 个新用例：正负偏移、转置源坐标、全部含格式+除零、TSV 空行；变异 M17–M21 全红。
+- app 182 passed / 0 failed。
+- 未执行：Excel/WPS 实机对拍、真实系统剪贴板跨应用、跨簿样式映射（UI-07）。
 
 ## 本轮：UI-05.4 选区/列序/查找全部/分帧取消 + 三项安全语义（待验收）
 

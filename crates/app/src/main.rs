@@ -4120,6 +4120,11 @@ impl SheetApp {
         rows
     }
 
+    /// 系统剪贴板文本 → 粘贴矩阵。与普通粘贴共用 parse_tsv，保留中间空行。
+    fn parse_clip_text(text: &str) -> Vec<Vec<(sheetcore::model::Cell, u16)>> {
+        Self::parse_tsv(text)
+    }
+
     fn recalc_and_broadcast(&mut self, keys: &[(usize, u32, u32)]) {
         // 依赖图还没建好（刚打开、后台构建中）时先补一份，否则清除/粘贴的
         // 下游公式不会重算。空图 + 无公式时这次构建只是一次扫描。
@@ -9929,8 +9934,26 @@ let txn = self.txn_begin(&keys);
         if self.edit_blocked() {
             return;
         }
-        let (mut matrix, origin) = match &self.clip {
-            Some(clip) => (clip.cells.clone(), Some((clip.rect.0, clip.rect.1))),
+        let (r0, c0) = self.sel;
+        let target_sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+
+        // 内部剪贴板：matrix 是要粘贴的格子，coords 记录每格在源表里的绝对坐标。
+        // 外部文本没有源坐标，公式只能按原文粘贴（不偏移）。
+        let mut src_sheet_name: Option<String> = None;
+        let (mut matrix, mut coords) = match &self.clip {
+            Some(clip) => {
+                let (sr1, sc1, _, _) = clip.rect;
+                src_sheet_name = Some(self.wb.sheet(clip.sheet).name.clone());
+                let mut coords: Vec<Vec<(u32, u32)>> = Vec::new();
+                for (i, row) in clip.cells.iter().enumerate() {
+                    coords.push(
+                        (0..row.len())
+                            .map(|j| (sr1 + i as u32, sc1 + j as u32))
+                            .collect(),
+                    );
+                }
+                (clip.cells.clone(), Some(coords))
+            }
             None => {
                 let text = arboard::Clipboard::new()
                     .ok()
@@ -9940,25 +9963,8 @@ let txn = self.txn_begin(&keys);
                     self.status = "剪贴板是空的".into();
                     return;
                 }
-                let rows: Vec<Vec<(sheetcore::model::Cell, u16)>> = text
-                    .replace("\r\n", "\n")
-                    .split('\n')
-                    .filter(|l| !l.is_empty())
-                    .map(|line| {
-                        line.split('\t')
-                            .map(|v| {
-                                (
-                                    sheetcore::model::Cell {
-                                        value: sheetcore::model::Value::parse_input(v),
-                                        formula: None,
-                                    },
-                                    0u16,
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect();
-                (rows, None)
+                // 与普通粘贴共用同一解析器：保留中间空行，= 开头按公式解析
+                (Self::parse_clip_text(&text), None)
             }
         };
         if matrix.is_empty() {
@@ -9968,25 +9974,45 @@ let txn = self.txn_begin(&keys);
         if self.ps_transpose {
             let h = matrix.len();
             let w = matrix.iter().map(|r| r.len()).max().unwrap_or(0);
-            let mut t = vec![vec![(sheetcore::model::Cell { value: sheetcore::model::Value::Empty, formula: None }, 0u16); h]; w];
+            let mut t = vec![
+                vec![
+                    (
+                        sheetcore::model::Cell {
+                            value: sheetcore::model::Value::Empty,
+                            formula: None,
+                        },
+                        0u16,
+                    );
+                    h
+                ];
+                w
+            ];
             for (r, row) in matrix.iter().enumerate() {
                 for (c, cell) in row.iter().enumerate() {
                     t[c][r] = cell.clone();
                 }
             }
             matrix = t;
+            if let Some(co) = coords.take() {
+                let mut tc = vec![vec![(0u32, 0u32); h]; w];
+                for (r, row) in co.iter().enumerate() {
+                    for (c, rc) in row.iter().enumerate() {
+                        tc[c][r] = *rc;
+                    }
+                }
+                coords = Some(tc);
+            }
         }
-        let (r0, c0) = self.sel;
         let rows = matrix.len() as u32;
         let cols = matrix.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
         if rows == 0 || cols == 0 {
             return;
         }
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
-                if !self.write_preflight(&keys, "选择性粘贴") {
+        if !self.write_preflight(&keys, "选择性粘贴") {
             return;
         }
-let txn = self.txn_begin(&keys);
+        let txn = self.txn_begin(&keys);
         for (i, row) in matrix.iter().enumerate() {
             for (j, (src, sid)) in row.iter().enumerate() {
                 let (r, c) = (r0 + i as u32, c0 + j as u32);
@@ -9999,15 +10025,32 @@ let txn = self.txn_begin(&keys);
                         value: sheetcore::model::Value::Empty,
                         formula: None,
                     });
-                let mut style = sid.to_owned();
+                let mut style = *sid;
+                // 公式按“目标位置 - 源绝对坐标”平移；负偏移由 refs::translate 产出 #REF!
+                let shifted_formula = |f: &str| -> String {
+                    match (&coords, &src_sheet_name) {
+                        (Some(co), Some(_)) => {
+                            let (sr, sc) = co[i][j];
+                            sheetcore::refs::translate(
+                                f,
+                                r as i64 - sr as i64,
+                                c as i64 - sc as i64,
+                                &target_sheet_name,
+                            )
+                        }
+                        _ => f.to_string(),
+                    }
+                };
                 match self.ps_kind {
                     1 => {
                         cell.value = src.value.clone();
                         cell.formula = None;
                     }
                     2 => {
-                        cell.formula = src.formula.clone();
-                        if cell.formula.is_none() {
+                        if let Some(f) = &src.formula {
+                            cell.formula = Some(shifted_formula(f).into());
+                        } else {
+                            cell.formula = None;
                             cell.value = src.value.clone();
                         }
                     }
@@ -10016,24 +10059,15 @@ let txn = self.txn_begin(&keys);
                     }
                     _ => {
                         cell = src.clone();
-                        cell.formula = match (&src.formula, origin) {
-                            (Some(f), Some((sr, sc))) => {
-                                let dr = r as i64 - (sr as i64 + i as i64);
-                                let dc = c as i64 - (sc as i64 + j as i64);
-                                if dr >= 0 && dc >= 0 {
-                                    Some(
-                                        sheetcore::cf::shift_formula(f, dr as u32, dc as u32)
-                                            .into(),
-                                    )
-                                } else {
-                                    Some(f.clone())
-                                }
-                            }
-                            _ => None,
-                        };
+                        if let Some(f) = &src.formula {
+                            cell.formula = Some(shifted_formula(f).into());
+                        } else {
+                            cell.formula = None;
+                        }
+                        style = *sid;
                     }
                 }
-                if self.ps_op != 0 {
+                if self.ps_op != 0 && self.ps_kind != 3 {
                     // Excel 的“运算”是：目标原值 op 剪贴板值
                     let target_before = self
                         .wb
@@ -10045,24 +10079,33 @@ let txn = self.txn_begin(&keys);
                         (target_before, src.value.clone())
                     {
                         let v = match self.ps_op {
-                            1 => a + b,
-                            2 => a - b,
-                            3 => a * b,
+                            1 => Some(a + b),
+                            2 => Some(a - b),
+                            3 => Some(a * b),
                             _ => {
                                 if b == 0.0 {
-                                    a
+                                    None
                                 } else {
-                                    a / b
+                                    Some(a / b)
                                 }
                             }
                         };
-                        cell.value = sheetcore::model::Value::Number(v);
+                        match v {
+                            Some(v) => {
+                                cell.value = sheetcore::model::Value::Number(v);
+                            }
+                            None => {
+                                cell.value = sheetcore::model::Value::Error(
+                                    sheetcore::formula::ErrKind::Div0,
+                                );
+                            }
+                        }
                         cell.formula = None;
                     }
                 }
                 let sheet = self.wb.sheet_mut(self.sheet_idx);
                 sheet.set(r, c, cell);
-                if self.ps_kind == 3 {
+                if self.ps_kind == 3 || self.ps_kind == 0 {
                     sheet.set_style(r, c, style);
                 }
             }

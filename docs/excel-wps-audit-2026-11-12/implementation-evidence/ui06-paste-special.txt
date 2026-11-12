@@ -1,0 +1,40 @@
+UI-06 选择性粘贴 —— 状态：待验收（2026-11-13 06:10）
+
+一、已实现（crates/app/src/main.rs::paste_special_apply）
+- 源坐标：内部剪贴板按 clip.rect 为每格记录源表绝对坐标 (sr,sc)，转置时矩阵和坐标一起转置，
+  公式偏移始终用“目标绝对坐标 - 原始源坐标”，不再用转置后的下标猜源位置。
+- 公式：ps_kind=2 和“全部”都调用 sheetcore::refs::translate(f, dr, dc, 目标表名)：
+  相对引用平移、$ 锁定不变、负偏移变 #REF!；外部文本没有源坐标，按原文粘贴不偏移。
+- 全部：cell=src.clone() 后 **同时 set_style(src样式)**；公式/值/格式三样都过去。
+- 格式：ps_kind=3 只写样式，不改内容和公式。
+- 运算：目标原值 op 剪贴板值（+ - * /）；除数为 0 时写入 Value::Error(Div0) 显示 #DIV/0!，
+  不再静默保留原值；格式模式（只格式）不执行运算。
+- 外部文本：与普通粘贴共用 parse_clip_text → parse_tsv，保留中间空行、= 开头按公式解析；
+  不再 filter(!is_empty)。
+- 写入门禁仍在最前（write_preflight），整次粘贴一个事务；结束置 dirty/重算/广播，一步撤销。
+
+二、用例（crates/app/src/edit_regression_tests.rs，4 passed）
+1) paste_special_formula_translates_negative_and_positive_offsets
+   C3 =A1+$B$1 → B2 得 =#REF!+$B$1；→ D4 得 =B2+$B$1；一次撤销只回退第二次。
+2) paste_special_transpose_keeps_original_source_coordinates
+   A1:A2（=A2 / =A3）转置到 C5:D5，得 C5=C6、D5=D6（按原始源坐标算偏移）。
+3) paste_special_all_keeps_format_and_divide_by_zero_is_an_error
+   全部：公式 + 加粗 + 黄色填充都到目标；5 ÷ 0 → #DIV/0!，撤销恢复 5。
+4) tsv_parsing_keeps_blank_rows_between_values
+   "甲\t1\n\n乙\t2\n" → 3 行，中间行是空值，末行“乙”。
+- 既有 paste_special_values_transpose_and_operations 仍通过（值/转置/加法）。
+- 全量 app：182 passed / 0 failed，APP_EXIT=0。
+
+三、变异（转红后还原）
+M17 公式分支直接 clone 原文不 translate → 偏移用例 FAILED
+M18 转置用转置后下标算源坐标 → 转置用例 FAILED
+M19 “全部”不写样式 → 全部格式断言 FAILED
+M20 除零保留 a → #DIV/0! 断言 FAILED
+M21 parse_clip_text 过滤空行 → 空行用例 FAILED
+
+四、未执行 / 仍需外部验收
+- 未与 Excel/WPS 实机对拍同一份选择性粘贴样本（需求要求“按实际 Excel 基准校验”，
+  当前期望值来自需求文字与 refs::translate 语义，尚未跑 Excel COM 真值）。
+- 未用真实系统剪贴板做跨应用选择性粘贴（内部 Clip + 文本解析已测）。
+- 跨工作簿样式 id 映射（UI-07 范围）未做；当前样式号按同簿解释。
+- 合并单元格、错误值、日期在“运算”下的行为未覆盖。

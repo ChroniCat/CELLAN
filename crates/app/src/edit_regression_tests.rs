@@ -3554,3 +3554,135 @@ fn parking_a_document_cancels_its_find_scan() {
     assert!(app.find_scan.is_none(), "park 要取消扫描");
     assert!(app.find.find_all.is_empty());
 }
+
+/// UI-06.1：公式选择性粘贴按目标位置平移，负偏移产生 #REF!，绝对引用不变。
+#[test]
+fn paste_special_formula_translates_negative_and_positive_offsets() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let f = |s: &str| Cell { value: Value::Number(3.0), formula: Some(s.into()) };
+    app.wb.sheet_mut(0).set(2, 2, f("=A1+$B$1")); // C3
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (2, 2, 2, 2),
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
+        cut: false,
+    });
+    // C3 → B2：相对 A1 平移 (-1,-1) → #REF!；$B$1 不变
+    app.ps_kind = 2;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+    app.sel = (1, 1);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(1, 1).unwrap().formula.as_deref(),
+        Some("=#REF!+$B$1"),
+        "负偏移必须变成 #REF!，绝对引用保持"
+    );
+    // C3 → D4：A1→B2
+    app.sel = (3, 3);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(3, 3).unwrap().formula.as_deref(),
+        Some("=B2+$B$1"),
+        "正偏移按行列平移"
+    );
+    // 一次撤销只回退第二次
+    app.do_undo(false);
+    assert!(app.wb.sheet(0).get(3, 3).is_none());
+    assert!(app.wb.sheet(0).get(1, 1).unwrap().formula.is_some());
+}
+
+/// UI-06.1：转置后仍用原始 source 坐标计算偏移，不是用转置后的下标。
+#[test]
+fn paste_special_transpose_keeps_original_source_coordinates() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let f = |s: &str| Cell { value: Value::Number(1.0), formula: Some(s.into()) };
+    app.wb.sheet_mut(0).set(0, 0, f("=A2")); // A1
+    app.wb.sheet_mut(0).set(1, 0, f("=A3")); // A2
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 1, 0),
+        cells: vec![
+            vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)],
+            vec![(app.wb.sheet(0).get(1, 0).unwrap().clone(), 0)],
+        ],
+        cut: false,
+    });
+    app.ps_kind = 2;
+    app.ps_transpose = true;
+    app.ps_op = 0;
+    app.sel = (4, 2); // C5
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(4, 2).unwrap().formula.as_deref(),
+        Some("=C6"),
+        "A1 的 =A2 转置到 C5 应为 =C6"
+    );
+    assert_eq!(
+        app.wb.sheet(0).get(4, 3).unwrap().formula.as_deref(),
+        Some("=D6"),
+        "A2 的 =A3 转置到 D5 应为 =D6"
+    );
+}
+
+/// UI-06.2：全部必须带样式；数值/运算/除零各自有明确语义。
+#[test]
+fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
+    use sheetcore::model::Value;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut st = app.wb.styles.get(0).clone();
+    st.bold = true;
+    st.fill = Some([255u8, 200, 0]);
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: Some("=3+4".into()) });
+    app.wb.sheet_mut(0).set_style(0, 0, sid);
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 0, 0),
+        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), sid)]],
+        cut: false,
+    });
+    // 全部：公式 + 样式都过去
+    app.ps_kind = 0;
+    app.ps_op = 0;
+    app.sel = (5, 5);
+    app.paste_special_apply(&ctx);
+    let got = app.wb.sheet(0).get(5, 5).unwrap();
+    assert!(got.formula.is_some());
+    let st2 = app.wb.styles.get(app.wb.sheet(0).style_of(5, 5));
+    assert!(st2.bold && st2.fill == Some([255u8, 200, 0]), "全部要带源格式");
+    // 除以 0：显示 #DIV/0!，不能静默保留原值
+    app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Number(5.0), formula: None });
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(0.0), formula: None });
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 0, 0),
+        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)]],
+        cut: false,
+    });
+    app.ps_kind = 1;
+    app.ps_op = 4;
+    app.sel = (10, 0);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).value(10, 0),
+        Value::Error(sheetcore::formula::ErrKind::Div0),
+        "0 除数必须得到 #DIV/0!"
+    );
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(10, 0), Value::Number(5.0), "一次撤销完整还原");
+}
+
+/// UI-06.3：外部 TSV 保留中间空行（不能 filter 掉）。
+#[test]
+fn tsv_parsing_keeps_blank_rows_between_values() {
+    let rows = SheetApp::parse_clip_text("甲\t1\n\n乙\t2\n");
+    assert_eq!(rows.len(), 3, "中间空行必须保留");
+    assert_eq!(rows[1][0].0.value, sheetcore::model::Value::Empty);
+    assert_eq!(rows[2][0].0.value, sheetcore::model::Value::Text("乙".into()));
+}
