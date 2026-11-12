@@ -5,7 +5,7 @@
  "source_date": "2026-11-12",
  "branch": "main",
  "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
- "updated_utc": "2026-11-12T10:47:18Z",
+ "updated_utc": "2026-11-12T10:50:32Z",
  "tasks": [
   {
    "id": "C01",
@@ -910,8 +910,8 @@
    "scope": "app/main.rs handle_keys + 命令注册",
    "source": "ui-requirements.md",
    "heading": "UI-02 补齐保存等已宣称存在的快捷键",
-   "status": "待实施",
-   "acceptance": "",
+   "status": "实施中",
+   "acceptance": "见 ui-requirements.md UI-02：快捷键与点击同一结果；编辑期间保存先提交；统一命令注册表",
    "files": [],
    "commits": [],
    "commands": [],
@@ -919,8 +919,8 @@
    "not_done": [],
    "failures": [],
    "blocker": "",
-   "next": "",
-   "updated_utc": "2026-11-12T10:28:37Z",
+   "next": "UI-02.2 Ctrl+O/N/P",
+   "updated_utc": "2026-11-12T10:50:32Z",
    "slices": [
     {
      "id": "UI-02.1",
@@ -928,17 +928,28 @@
      "priority": "P0",
      "acceptance_source": "ui-requirements.md / UI-02 验收中与本切片有关的条目",
      "depends_on": [],
-     "status": "待实施",
-     "acceptance": "",
-     "files": [],
+     "status": "已验收",
+     "acceptance": "已保存副本改 A1 后按 Ctrl+S：真正开始保存、完成后 dirty=false、重开文件为新值；编辑态按 Ctrl+S 先提交有效编辑再保存；Ctrl+Shift+S 写到新路径且原文件不变；数据验证拒绝时 Ctrl+S 不开始保存且保留草稿。快捷键与标题栏/功能区共用 save()/save(true)。",
+     "files": [
+      "crates/app/src/main.rs",
+      "crates/app/src/edit_regression_tests.rs"
+     ],
      "commits": [],
-     "commands": [],
-     "evidence": [],
-     "not_done": [],
+     "commands": [
+      "cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 124 passed, 0 failed, 0 ignored, 4 filtered",
+      "RED（临时禁用快捷键分支）: ctrl_s_* => 2 failed（Ctrl+S 必须触发保存）"
+     ],
+     "evidence": [
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-1-save-shortcuts.txt",
+      "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui02-1-red.txt"
+     ],
+     "not_done": [
+      "Ctrl+O/N/P（UI-02.2）；真实系统另存为对话框交互；命令 enabled/tooltip 注册（UI-02.3）"
+     ],
      "failures": [],
      "blocker": "",
-     "next": "",
-     "updated_utc": "2026-11-12T10:28:37Z"
+     "next": "UI-02.2 Ctrl+O/N/P",
+     "updated_utc": "2026-11-12T10:50:31Z"
     },
     {
      "id": "UI-02.2",

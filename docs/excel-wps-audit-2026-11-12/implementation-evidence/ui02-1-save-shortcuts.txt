@@ -1,0 +1,50 @@
+# UI-02.1 Ctrl+S / 另存为与编辑态：失败→通过证据
+
+## 1 修复前现状（源码）
+
+`handle_keys` 的主分发（当时 5799 行起）只处理 F9、Escape、方向键、Ctrl+方向、复制/粘贴、
+查找、撤销等，**没有 Ctrl+S / Ctrl+Shift+S / Ctrl+O / Ctrl+N / Ctrl+P**；而帮助面板与标题
+保存提示都写“Ctrl+S 保存”。`save(force_dialog)` 已经存在并被标题栏与功能区调用，缺的只是
+键盘入口。
+
+## 2 失败复现（RED）
+
+把快捷键分支临时改成不可达（`if false && save_k`，与修改前等价）后运行：
+
+    cargo test -p app ... --bin app -- edit_regression_tests::ctrl_s_ --test-threads=1
+
+    ctrl_s_commits_the_active_edit_before_saving ... FAILED
+    ctrl_s_saves_the_open_file_after_a_typed_edit ... FAILED  "Ctrl+S 必须触发保存"
+    test result: FAILED. 1 passed; 2 failed
+
+原始输出：`ui02-1-red.txt`。恢复分支后同一组测试全部通过。
+
+## 3 修改（有界）
+
+`crates/app/src/main.rs`：
+
+- `handle_keys` 顶部处理 Ctrl+S / Ctrl+Shift+S，直接调用已有的 `save(false)` / `save(true)`，
+  与标题栏、功能区 FileSave/FileSaveAs 同一实现（不是另写一套保存）。
+- 快捷键在“编辑中”分支之前处理：`save()` 内部会 `commit_edit(None)`，验证不通过时
+  `editing` 仍在 → 直接返回，不落盘、不丢草稿（Excel 的“重试”语义）。
+- 另存为的系统对话框支持无界面验收钩子 `SC_SAVE_AS=路径`：只替换对话框，保存仍走
+  `DocumentTasks::start_save` 的同一条异步链路。
+
+## 4 通过证据（GREEN）
+
+    cargo test -p app ... --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests::
+    test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out
+
+| 测试（整窗 `eframe::App::update` 事件路径） | 覆盖 |
+|---|---|
+| ctrl_s_saves_the_open_file_after_a_typed_edit | 打开已保存副本→键入123→Ctrl+S：真的开始保存，完成后 dirty=false，重开文件为 123 |
+| ctrl_s_commits_the_active_edit_before_saving | 编辑态未提交时按 Ctrl+S：先提交再保存，文件里是 777 |
+| ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original | Ctrl+Shift+S 写到新路径，原文件仍是旧值 5 |
+| ctrl_s_does_not_save_when_validation_rejects_the_draft | 非法草稿 + Ctrl+S：不开始保存、草稿保留、磁盘不变 |
+
+## 5 未执行 / 剩余风险
+
+- Ctrl+O / Ctrl+N / Ctrl+P：属 UI-02.2，本切片未做。
+- 真实系统“另存为”对话框的交互（选择目录/改扩展名/取消）：未执行；本切片用 SC_SAVE_AS
+  只替换对话框，原生对话框仍需 QA-04 级别的真实操作验收。
+- 命令 enabled/tooltip 统一注册：UI-02.3。

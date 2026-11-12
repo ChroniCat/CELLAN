@@ -1606,3 +1606,145 @@ fn escape_in_formula_bar_discards_draft() {
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(11.0), "Esc 不写回");
     assert!(!app.wb.dirty);
 }
+
+// ---------------------------------------------------------------- UI-02.1 保存快捷键
+
+fn ctrl_key(key: egui::Key, shift: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        },
+    }
+}
+
+fn wait_save(app: &mut SheetApp) {
+    let started = std::time::Instant::now();
+    while app.tasks.saving.is_some() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "保存超时");
+        app.poll_save();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// 造一个已保存的副本，返回 (测试环境, 路径)。环境要活着，否则 LOCALAPPDATA 会指回去。
+fn saved_copy(tag: &str, value: f64) -> (crate::test_env::TestEnv, std::path::PathBuf) {
+    let env = crate::test_env::TestEnv::new(tag);
+    let path = env.path("book.xlsx");
+    let mut wb = sheetcore::model::Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        0,
+        Cell { value: Value::Number(value), formula: None },
+    );
+    sheetcore::xlsx::save_atomic(&path, &wb).unwrap();
+    (env, path)
+}
+
+#[test]
+fn ctrl_s_saves_the_open_file_after_a_typed_edit() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-ctrl-s", 1.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // 打开是异步的；直接同步装载同一份文件作为“已打开”状态
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    uiframe_type_commit(&mut app, &ctx, "123");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(123.0));
+    assert!(app.wb.dirty);
+
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    assert!(app.tasks.saving.is_some(), "Ctrl+S 必须触发保存");
+    wait_save(&mut app);
+    assert!(!app.wb.dirty, "保存成功后 dirty 必须清掉");
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheets[0].value(0, 0), Value::Number(123.0), "文件里必须是新值");
+    drop(env);
+}
+
+#[test]
+fn ctrl_s_commits_the_active_edit_before_saving() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-ctrl-s-editing", 1.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    // 编辑态还没提交就按 Ctrl+S
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("777".into())]);
+    assert!(app.editing.is_some());
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    assert!(app.editing.is_none(), "保存前必须先提交有效编辑");
+    assert!(app.tasks.saving.is_some());
+    wait_save(&mut app);
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheets[0].value(0, 0), Value::Number(777.0), "编辑中的值必须落盘");
+    drop(env);
+}
+
+#[test]
+fn ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-save-as", 5.0);
+    let target = env.path("saved-as.xlsx");
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    ui_frame(&mut app, &ctx, vec![]);
+    uiframe_type_commit(&mut app, &ctx, "42");
+
+    // 无界面验收钩子只替换系统对话框，按键仍走真实 Ctrl+Shift+S
+    env.sc("SC_SAVE_AS", target.to_str().unwrap());
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, true)]);
+    assert!(app.tasks.saving.is_some(), "Ctrl+Shift+S 必须触发另存为");
+    wait_save(&mut app);
+    assert!(target.is_file(), "另存为目标必须写出来");
+    let saved = sheetcore::xlsx::load(&target).unwrap();
+    assert_eq!(saved.sheets[0].value(0, 0), Value::Number(42.0));
+    let original = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(
+        original.sheets[0].value(0, 0),
+        Value::Number(5.0),
+        "另存为不得改动原文件"
+    );
+    drop(env);
+}
+
+#[test]
+fn ctrl_s_does_not_save_when_validation_rejects_the_draft() {
+    let ctx = egui::Context::default();
+    let (env, path) = saved_copy("ui02-ctrl-s-invalid", 3.0);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = false;
+    restrict_a1(&mut app);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
+    assert!(!app.tasks.saving.is_some(), "验证失败时不能开始保存");
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).as_deref(),
+        Some("99"),
+        "草稿必须留着"
+    );
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheets[0].value(0, 0), Value::Number(3.0), "磁盘内容不变");
+    drop(env);
+}
+
+/// 键入并 Enter 提交（走整窗事件）
+fn uiframe_type_commit(app: &mut SheetApp, ctx: &egui::Context, text: &str) {
+    ui_frame(app, ctx, vec![egui::Event::Text(text.into())]);
+    ui_frame(app, ctx, vec![key_event(egui::Key::Enter, false)]);
+}

@@ -2794,16 +2794,21 @@ impl SheetApp {
         }
         let path = match (&self.wb.path, force_dialog) {
             (Some(p), false) => Some(p.clone()),
-            _ => rfd::FileDialog::new()
+            // 无界面验收：SC_SAVE_AS=路径 时把「另存为」直接落在该路径（不弹系统对话框）。
+            // 只换对话框，保存本身仍走同一条 start_save 链路。
+            _ => match std::env::var("SC_SAVE_AS") {
+                Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
+                _ => rfd::FileDialog::new()
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .add_filter("Excel 启用宏的工作簿", &["xlsm"])
                 .add_filter("Excel 97-2003 工作簿", &["xls"])
-                .set_file_name(if self.wb.has_vba {
-                    format!("{}.xlsm", self.wb.title())
-                } else {
-                    format!("{}.xlsx", self.wb.title())
-                })
-                .save_file(),
+                    .set_file_name(if self.wb.has_vba {
+                        format!("{}.xlsm", self.wb.title())
+                    } else {
+                        format!("{}.xlsx", self.wb.title())
+                    })
+                    .save_file(),
+            },
         };
         let Some(path) = path else { return };
 
@@ -5870,6 +5875,20 @@ impl SheetApp {
 
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Ctrl+S / Ctrl+Shift+S：保存 / 另存为。编辑期间也生效——save() 会先提交有效编辑，
+        // 验证不通过时保留草稿且不落盘。
+        let (save_k, save_as_k) = ctx.input(|i| {
+            let s = i.modifiers.command && i.key_pressed(Key::S);
+            (s && !i.modifiers.shift, s && i.modifiers.shift)
+        });
+        if save_as_k {
+            self.save(true);
+            return;
+        }
+        if save_k {
+            self.save(false);
+            return;
+        }
         // Ctrl+F1：和 Excel 一样收起/展开功能区
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
             self.ribbon_collapsed = !self.ribbon_collapsed;
