@@ -141,38 +141,152 @@ impl Encoding {
 /// 显式传入的 `wanted` 优先；`None`/`auto` 时按 BOM → UTF-8 → GB18030 探测。
 /// 有损解码会返回 `had_errors`，调用方可以据此提示（但不静默丢内容）。
 pub fn decode(bytes: &[u8], wanted: Option<Encoding>) -> (String, Encoding, bool) {
-    let bom_enc = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        Some(Encoding::Utf8)
-    } else if bytes.starts_with(&[0xFF, 0xFE]) {
-        Some(Encoding::Utf16Le)
-    } else if bytes.starts_with(&[0xFE, 0xFF]) {
-        Some(Encoding::Utf16Be)
-    } else {
-        None
-    };
-    let enc = wanted.filter(|e| *e != Encoding::Utf8).or(bom_enc).unwrap_or(Encoding::Utf8);
-    match enc {
-        Encoding::Utf16Le => {
-            let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
-            (cow.into_owned(), Encoding::Utf16Le, bad)
-        }
-        Encoding::Utf16Be => {
-            let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
-            (cow.into_owned(), Encoding::Utf16Be, bad)
-        }
-        Encoding::Gb18030 => {
-            let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
-            (cow.into_owned(), Encoding::Gb18030, bad)
-        }
-        Encoding::Utf8 => match std::str::from_utf8(bytes) {
-            Ok(t) => (t.trim_start_matches('\u{feff}').to_string(), Encoding::Utf8, false),
-            Err(_) => {
-                // 不是合法 UTF-8 又没有 BOM：按中文环境最常见的 GB18030 解
+    // 指定编码就按指定的解，失败也不回退：由调用方报错并保留旧数据。
+    // 只有 `None`（自动）才做 BOM → UTF-8 → GB18030 探测。
+    if let Some(w) = wanted {
+        return match w {
+            Encoding::Utf8 => match std::str::from_utf8(bytes) {
+                Ok(t) => (
+                    t.trim_start_matches('\u{feff}').to_string(),
+                    Encoding::Utf8,
+                    false,
+                ),
+                Err(_) => (String::new(), Encoding::Utf8, true),
+            },
+            Encoding::Utf16Le => {
+                let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
+                (cow.into_owned(), Encoding::Utf16Le, bad)
+            }
+            Encoding::Utf16Be => {
+                let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
+                (cow.into_owned(), Encoding::Utf16Be, bad)
+            }
+            Encoding::Gb18030 => {
                 let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
                 (cow.into_owned(), Encoding::Gb18030, bad)
             }
-        },
+        };
     }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return match std::str::from_utf8(bytes) {
+            Ok(t) => (
+                t.trim_start_matches('\u{feff}').to_string(),
+                Encoding::Utf8,
+                false,
+            ),
+            Err(_) => {
+                let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+                (cow.into_owned(), Encoding::Gb18030, bad)
+            }
+        };
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
+        return (cow.into_owned(), Encoding::Utf16Le, bad);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
+        return (cow.into_owned(), Encoding::Utf16Be, bad);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(t) => (t.to_string(), Encoding::Utf8, false),
+        Err(_) => {
+            let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+            (cow.into_owned(), Encoding::Gb18030, bad)
+        }
+    }
+}
+
+/// 严格解析：引号未闭合、闭引号后还有多余字符都报错。
+///
+/// 刷新外部数据时用它：解析失败必须整体放弃，旧区域一个格都不能动。
+pub fn parse_strict(text: &str, delim: char) -> Result<Vec<Vec<String>>, String> {
+    parse_strict_q(text, delim, '"')
+}
+
+/// 同 `parse_strict`，但可指定引号字符（部分德语/法语 CSV 用 `'`）。
+pub fn parse_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<String>>, String> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut quoted_field = false;
+    let mut closed = false;
+    let mut line = 1usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == quote {
+                if chars.peek() == Some(&quote) {
+                    field.push(quote);
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                    closed = true;
+                }
+            } else {
+                if ch == '\n' {
+                    line += 1;
+                }
+                field.push(ch);
+            }
+            continue;
+        }
+        if closed && ch != delim && ch != '\r' && ch != '\n' {
+            return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+        }
+        match ch {
+            c if c == quote && field.is_empty() => {
+                in_quotes = true;
+                quoted_field = true;
+            }
+            c if c == quote && quoted_field => {
+                return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+            }
+            c if c == delim => {
+                row.push(std::mem::take(&mut field));
+                quoted_field = false;
+                closed = false;
+            }
+            '\r' => {}
+            '\n' => {
+                row.push(std::mem::take(&mut field));
+                quoted_field = false;
+                closed = false;
+                if !(row.len() == 1 && row[0].is_empty()) {
+                    rows.push(std::mem::take(&mut row));
+                } else {
+                    row.clear();
+                }
+                line += 1;
+            }
+            c => field.push(c),
+        }
+    }
+    if in_quotes {
+        return Err(format!("第 {line} 行：引号没有闭合"));
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        if !(row.len() == 1 && row[0].is_empty()) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// 严格模式的记录视图（跳过空行）
+pub fn records_strict(text: &str, delim: char) -> Result<Vec<Vec<String>>, String> {
+    records_strict_q(text, delim, '"')
+}
+
+/// 可指定引号字符的严格记录视图
+pub fn records_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<String>>, String> {
+    let rows = parse_strict_q(text, delim, quote)?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
+        .collect())
 }
 
 /// 记录模式：跳过完全空行，但**保留**字段内的换行与引号。

@@ -252,8 +252,11 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
     for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
         let ty = node.attribute("Type").unwrap_or("");
         if ty.ends_with("/comments") || ty.ends_with("/vmlDrawing") {
-            if let Some(t) = node.attribute("Target") {
-                removed.push(resolve(dir, t));
+            // 只有包内关系才解析成路径；External 的 Target 是 URL
+            if node.attribute("TargetMode") != Some("External") {
+                if let Some(t) = node.attribute("Target") {
+                    removed.push(resolve(dir, t));
+                }
             }
         } else if let Some(id) = node.attribute("Id") {
             keep_ids.push(id.to_string());
@@ -269,6 +272,14 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
     let root = doc.root_element();
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
     out.push_str("<Relationships");
+    // roxmltree 的 attributes() 不含命名空间声明，必须单独补回，
+    // 否则重建出来的关系部件没有 xmlns，Excel 视为非法包。
+    for ns in root.namespaces() {
+        match ns.name() {
+            Some(prefix) => out.push_str(&format!(" xmlns:{}=\"{}\"", prefix, xml_escape(ns.uri()))),
+            None => out.push_str(&format!(" xmlns=\"{}\"", xml_escape(ns.uri()))),
+        }
+    }
     for a in root.attributes() {
         out.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
     }
@@ -323,4 +334,159 @@ fn resolve(base: &str, target: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// 保存前后保住"外链关系"的原文：某些引擎会把 Target="https://…" 当包内路径
+/// 归一（变成 https:/…）并丢掉 TargetMode。这里按关系 Id 捕获原文，保存结束后
+/// 原样恢复。
+pub fn capture_external_rels(path: &std::path::Path) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for name in crate::fixups::entries_of(path) {
+        if !name.ends_with(".rels") {
+            continue;
+        }
+        let Some(raw) = crate::fixups::read_part_file(path, &name).and_then(|b| String::from_utf8(b).ok())
+        else {
+            continue;
+        };
+        let mut kept = Vec::new();
+        let mut rest = raw.as_str();
+        while let Some(i) = rest.find("<Relationship ") {
+            let Some(gt) = rest[i..].find('>').map(|e| i + e + 1) else { break };
+            let tag = &rest[i..gt];
+            if tag.contains("TargetMode=\"External\"") || tag.contains("TargetMode='External'") {
+                kept.push(tag.to_string());
+            }
+            rest = &rest[gt..];
+        }
+        if !kept.is_empty() {
+            out.push((name, kept));
+        }
+    }
+    out
+}
+
+/// 把捕获的外链关系按原文恢复——只恢复"被引擎改写过的"关系：
+/// - 目标完全相同：只补回丢失的 TargetMode；
+/// - 目标只是被当成包内路径归一（https:// → https:/）：恢复原文；
+/// - 目标已经不同（用户在本应用里改了链接）：保留新值，只补 TargetMode。
+pub fn restore_external_rels(path: &std::path::Path, captured: &[(String, Vec<String>)]) -> anyhow::Result<()> {
+    if captured.is_empty() {
+        return Ok(());
+    }
+    for (rels_part, tags) in captured {
+        let Some(raw) = crate::fixups::read_part_file(path, rels_part).and_then(|b| String::from_utf8(b).ok())
+        else {
+            continue;
+        };
+        let doc = match roxmltree::Document::parse(&raw) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let root = doc.root_element();
+        let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        out.push_str("<Relationships");
+        for ns in root.namespaces() {
+            match ns.name() {
+                Some(p) => out.push_str(&format!(" xmlns:{}=\"{}\"", p, xml_escape(ns.uri()))),
+                None => out.push_str(&format!(" xmlns=\"{}\"", xml_escape(ns.uri()))),
+            }
+        }
+        for a in root.attributes() {
+            out.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+        }
+        out.push('>');
+        for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
+            let id = node.attribute("Id").unwrap_or("");
+            let cur_target = node.attribute("Target").unwrap_or("");
+            let cur_external = node.attribute("TargetMode") == Some("External");
+            let cap = tags.iter().find(|t| id_of(t) == id);
+            let rebuilt = match cap {
+                Some(tag) if !cur_external && cur_target.is_empty() => Some(tag.to_string()),
+                Some(tag) => {
+                    let cap_target = attr_of(tag, "Target").unwrap_or_default();
+                    let cap_mode = attr_of(tag, "TargetMode");
+                    if cur_target == cap_target {
+                        // 只补 TargetMode
+                        let mut s = String::from("<Relationship");
+                        for a in node.attributes() {
+                            s.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+                        }
+                        if cap_mode.is_some() && !cur_external {
+                            s.push_str(" TargetMode=\"External\"");
+                        }
+                        s.push_str("/>");
+                        Some(s)
+                    } else if engine_mangled(&cap_target).trim_end_matches('/')
+                        == cur_target.trim_end_matches('/')
+                    {
+                        // 只是被当成包内路径改写了，恢复原文
+                        Some(tag.clone())
+                    } else {
+                        // 用户改了目标：保留新 URL，TargetMode 按原关系补
+                        let mut s = String::from("<Relationship");
+                        for a in node.attributes() {
+                            s.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+                        }
+                        if cap_mode.is_some() && !cur_external {
+                            s.push_str(" TargetMode=\"External\"");
+                        }
+                        s.push_str("/>");
+                        Some(s)
+                    }
+                }
+                None => None,
+            };
+            match rebuilt {
+                Some(tag) => out.push_str(&tag),
+                None => {
+                    out.push_str("<Relationship");
+                    for a in node.attributes() {
+                        out.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+                    }
+                    out.push_str("/>");
+                }
+            }
+        }
+        out.push_str("</Relationships>");
+        if roxmltree::Document::parse(&out).is_ok() {
+            crate::fixups::write_parts(path, &[(rels_part.clone(), out.into_bytes())])?;
+        }
+    }
+    Ok(())
+}
+
+/// 引擎把 `https://host/` 当包内路径拼过后会变成 `https:/host/`。
+fn engine_mangled(target: &str) -> String {
+    let mut out = String::new();
+    let mut prev_slash = false;
+    for ch in target.chars() {
+        if ch == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn attr_of(tag: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=");
+    let i = tag.find(&pat)?;
+    let rest = &tag[i + pat.len()..];
+    let quote = rest.chars().next()?;
+    let body = rest.trim_start_matches(quote);
+    Some(body.split(quote).next()?.to_string())
+}
+
+fn id_of(tag: &str) -> String {
+    let Some(i) = tag.find("Id=") else { return String::new() };
+    let rest = &tag[i + 3..];
+    let quote = rest.chars().next().unwrap_or('"');
+    let body = rest.trim_start_matches(quote);
+    body.split(quote).next().unwrap_or("").to_string()
 }

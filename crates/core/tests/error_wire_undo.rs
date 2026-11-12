@@ -87,6 +87,7 @@ fn undo_and_redo_restore_the_error_cell_verbatim() {
         snap_after: None,
         by_site: 0,
         shapes: None,
+        refresh_sizes: None,
     });
 
     assert!(stack.undo(&mut sheets, |_, _, _, _| true).is_some());

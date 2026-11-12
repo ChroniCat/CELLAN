@@ -73,6 +73,8 @@ pub struct Action {
     pub by_site: u32,
     /// 形状（文本框）改动；None = 普通格子动作
     pub shapes: Option<ShapeEdit>,
+    /// 刷新外部数据时的源尺寸（前, 后）：撤销/重做要一并还原，否则范围记录漂移
+    pub refresh_sizes: Option<(Vec<(String, u32, u32)>, Vec<(String, u32, u32)>)>,
 }
 
 impl Action {
@@ -113,6 +115,8 @@ pub struct Applied {
     /// Structural restoration changes coordinates and references across sheets.
     /// Rebuild dependencies and recalculate the workbook after applying it.
     pub structural: bool,
+    /// 撤销/重做后要写回的外源源尺寸（名字, 行, 列）
+    pub refresh_sizes: Option<Vec<(String, u32, u32)>>,
 }
 
 enum Entry {
@@ -373,7 +377,7 @@ impl UndoStack {
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         let Entry::Structure(action) = self.done.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.before);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None };
         self.undone.push(Entry::Structure(action));
         Some(applied)
     }
@@ -383,7 +387,7 @@ impl UndoStack {
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         let Entry::Structure(action) = self.undone.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.after);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None };
         self.done.push(Entry::Structure(action));
         Some(applied)
     }
@@ -418,6 +422,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                refresh_sizes: None,
             };
             self.undone.push(Entry::Cells(action));
             return Some(applied);
@@ -433,6 +438,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: true,
+                refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
             };
             self.undone.push(Entry::Cells(action));
             return Some(applied);
@@ -457,6 +463,7 @@ impl UndoStack {
             focus: action.focus,
             skipped,
             structural: false,
+            refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
         };
         self.undone.push(Entry::Cells(action));
         Some(applied)
@@ -491,6 +498,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
             };
             self.done.push(Entry::Cells(action));
             return Some(applied);
@@ -506,6 +514,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: true,
+                refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
             };
             self.done.push(Entry::Cells(action));
             return Some(applied);
@@ -530,6 +539,7 @@ impl UndoStack {
             focus: action.focus,
             skipped,
             structural: false,
+            refresh_sizes: None,
         };
         self.done.push(Entry::Cells(action));
         Some(applied)
@@ -594,6 +604,7 @@ mod tests {
                 after_style: bs,
             }],
             focus: (0, r, c),
+            refresh_sizes: None,
         }
     }
 

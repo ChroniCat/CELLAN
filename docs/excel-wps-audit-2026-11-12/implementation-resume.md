@@ -1,9 +1,29 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `dece894`（C04 首版已推送）+ 本轮未提交改动。
-- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 5 待验收 / 50 待实施；
-  切片 17 已验收 / 9 待验收 / 122 待实施。
-  C02 已验收（用户 02:43 复核认可）；C04、C08、C14 待验收（用户复核中）。
+- 分支 `main`（`origin/main`），HEAD `9534cb7`（C09/C14 round3/UI-03 已推送）+ 本轮未提交改动。
+- 台账（`scripts/audit_progress.py counts`）：6 已验收 / 6 待验收 / 49 待实施；
+  切片 17 已验收 / 12 待验收 / 119 待实施。
+- 当前测试真值（本轮源码，round33/34）：core 67 bins / 590 passed / 0 failed / 41 ignored；
+  app 151 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+- 专项：`c14_guard` 14 passed（含真实改外链目标回归）；`csv_import` 10 passed；
+  app 的 `csv_import_choices_persist_and_refresh_reuses_them`、
+  `refresh_is_one_undo_step_that_restores_values_rect_and_source_size` 各 1 passed。
+
+## 本轮：C09 与 C14 复核整改（04:08/04:29）
+
+### C09（待验收）
+- `csv::parse_strict_q`/`records_strict_q`：未闭合引号、闭引号后多余字符报错；导入/刷新在写入前解析，失败旧区域不动。
+- `decode(Some(enc))` 指定编码失败不再回退 GB18030（返回 had_errors）；自动探测仍 BOM→UTF-8→GB18030。
+- 首次导入回写实际编码；`CsvOpts` 增加 `quote` 并持久化（名称文本第 10 段 `q<码点>`）。
+- 短行刷新清空新矩形内缺失列；刷新以整表快照+源尺寸入一步 undo，undo/redo 一并回滚 rows/cols。
+- 导入对话框（`open_csv_dialog`/`csv_dlg_ui`/`import_csv_choice`）：编码、引号、表头、按列文本 + 真实预览；保存重开后 refresh 复用配置。
+- 未执行：Excel/WPS 编码向导三方对拍。
+
+### C14（待验收）
+- `notes::clear_sheet_notes` 重建关系时按 `root.namespaces()` 补回 xmlns；External 的 Target 不做包内路径解析。
+- `capture_external_rels`/`restore_external_rels` 收窄：仅在目标被引擎归一（https://→https:/）时恢复原文；用户改了目标就保留新 URL，仅补 TargetMode。
+- 新增 `editing_an_existing_external_link_persists_the_new_target`：old→new 保存回读 new，断言无 old、TargetMode/命名空间在。
+- 未执行：worker panic / sidefail / 正常 .xls calamine 成功路径夹具。
 
 ## 本轮（2026-11-13 02:45–03:05）：C08 + C04 两条补证
 

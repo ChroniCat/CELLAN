@@ -41,6 +41,11 @@ pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// 包内全部条目名（含暂存），供需要按后缀扫描的调用方使用
+pub fn entries_of(path: &Path) -> Vec<String> {
+    entries(path)
+}
+
 fn entries(path: &Path) -> Vec<String> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();

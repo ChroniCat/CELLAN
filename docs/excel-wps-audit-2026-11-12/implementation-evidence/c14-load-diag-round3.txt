@@ -73,3 +73,9 @@ C14 第三轮：关系 XML 良构性 + 图表内部三类吞错
 - 正常 `.xls` 走 calamine 成功路径的夹具（现有 BIFF 由本仓库写出，走内置读取器）。
 - Excel 生成的加密包（现为本项目 `crypto::encrypt`）。
 - 与真实 Office「修复」对话框的目视对比。
+
+五、round4（04:29 复核后）
+1) 关系部件命名空间：roxmltree 的 attributes() 不含 xmlns 声明，重建 <Relationships> 时按 root.namespaces() 逐条补回默认/前缀声明；两份 r13 产物与 c14_g18 均已带规则命名空间。
+2) 外链属性：clear_sheet_notes 只对包内关系解析 Target，TargetMode=External 的 URL 不再当路径；restore_external_rels 只在"目标被引擎归一"时恢复原文（https://host/ → https:/host），并对缺失的 TargetMode 补回。
+3) 真实改链接回归：editing_an_existing_external_link_persists_the_new_target —— 首次保存 old.example → 重新打开改成 new.example → 保存，rels 中必须是 new.example、无 old.example、TargetMode=External 且根命名空间存在；再打开模型读回 new.example。修复前该用例会因末尾恢复策略把 rIdHk1 换回旧 URL 而失败。
+4) 结果：c14_guard 14 passed / 0 failed（3.16s）；两个"删批注保关系"用例与四类图表窄夹具不退化。

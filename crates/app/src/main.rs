@@ -487,12 +487,27 @@ struct FilterPopup {
     ops_anchor: egui::Pos2,
 }
 
+/// C09：导入前的编码 / 引号 / 文本列选择（预览用真实解析结果）
+struct CsvDlg {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    delim: char,
+    header: bool,
+    enc: Option<sheetcore::csv::Encoding>,
+    quote: char,
+    text_cols: std::collections::BTreeSet<u32>,
+    preview: Vec<Vec<String>>,
+    err: Option<String>,
+}
+
 struct SheetApp {
     wb: Workbook,
     /// C14：本次打开的结构化诊断。带致命问题时禁止覆盖保存，只允许另存抢救副本。
     load_diag: Option<sheetcore::xlsx::LoadDiag>,
     /// 打开不完整时自动弹出的「加载问题」窗口是否显示
     show_load_diag: bool,
+    /// C09 导入 CSV 的选择对话框
+    csv_dlg: Option<CsvDlg>,
     sheet_idx: usize,
     sel: (u32, u32), // row, col
     scroll: Vec2,
@@ -1173,6 +1188,7 @@ impl SheetApp {
             wb: Workbook::new_blank(),
             load_diag: None,
             show_load_diag: false,
+            csv_dlg: None,
             sheet_idx: 0,
             sel: {
                 let mut se = (0u32, 0u32);
@@ -2037,6 +2053,7 @@ impl SheetApp {
                                         before,
                                         after,
                                     }),
+                                    refresh_sizes: None,
                                 });
                                 eprintln!("[tb] 改位置 {spec}");
                             }
@@ -3546,6 +3563,7 @@ impl SheetApp {
                 after_style: 0,
             }],
             focus: (self.sheet_idx, r, c),
+            refresh_sizes: None,
         });
         self.do_undo(false);
         let clear_undo = self.wb.sheet(self.sheet_idx).get(r, c).unwrap().value.display();
@@ -3589,9 +3607,13 @@ impl SheetApp {
 
     /// 这个格子现在能不能由我编辑
     fn lock_holder(&self, row: u32, col: u32) -> Option<String> {
+        self.lock_holder_on(self.sheet_idx, row, col)
+    }
+
+    fn lock_holder_on(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
         let site = self.net.as_ref().map(|n| n.site);
         let Some(site) = site else { return None };
-        if self.locks.is_locked_by_other(self.sheet_idx, row, col, site) {
+        if self.locks.is_locked_by_other(sheet, row, col, site) {
             self.locks
                 .holder(self.sheet_idx, row, col)
                 .map(|h| h.name.clone())
@@ -3613,6 +3635,27 @@ impl SheetApp {
         } else {
             false
         }
+    }
+
+    /// 统一写入门禁：所有直接改模型的入口先过这里。
+    /// - 后台依赖未就绪、工作表受保护 → 拒绝；
+    /// - 目标区域里**任何一格**被别人锁定 → 整批拒绝，不做部分写入。
+    fn write_preflight(&mut self, keys: &[(u32, u32)], what: &str) -> bool {
+        if self.deps_pending {
+            self.status = "大文件还在后台准备依赖图，稍等一下再操作".into();
+            return false;
+        }
+        if self.wb.sheet(self.sheet_idx).protection.is_some() {
+            self.status = format!("工作表受保护：不能{what}（先“审阅 → 撤销保护”）");
+            return false;
+        }
+        for (r, c) in keys {
+            if let Some(holder) = self.lock_holder(*r, *c) {
+                self.status = format!("{holder} 正在编辑 {}，不能{what}", cell_name(*r, *c));
+                return false;
+            }
+        }
+        true
     }
 
     fn begin_edit(&mut self, initial: Option<String>) {
@@ -3707,6 +3750,7 @@ impl SheetApp {
             snap_after: None,
             by_site: 0,
             shapes: None,
+            refresh_sizes: None,
         });
     }
 
@@ -3910,6 +3954,25 @@ impl SheetApp {
                 }
             }
         }
+        // 目标区或剪切源里任何一格被别人锁着 → 整批都不写
+        let target_keys: Vec<(u32, u32)> = touched
+            .iter()
+            .filter(|(sheet, _, _)| *sheet == si)
+            .map(|(_, rr, cc)| (*rr, *cc))
+            .collect();
+        if !self.write_preflight(&target_keys, "粘贴") {
+            return;
+        }
+        if let Some((source, (sr1, sc1, sr2, sc2))) = cut_src {
+            for rr in sr1..=sr2 {
+                for cc in sc1..=sc2 {
+                    if let Some(holder) = self.lock_holder_on(source, rr, cc) {
+                        self.status = format!("{holder} 正在编辑 {}，不能剪切", cell_name(rr, cc));
+                        return;
+                    }
+                }
+            }
+        }
         let mut transactions = std::collections::BTreeMap::new();
         for &(sheet, rr, cc) in &touched {
             transactions.entry(sheet).or_insert_with(Vec::new).push((rr, cc));
@@ -3949,6 +4012,7 @@ impl SheetApp {
             label: label.into(), deltas, focus: (si, r, c),
             snap_before: None, snap_after: None, by_site: 0,
             shapes: None,
+            refresh_sizes: None,
         });
         if cut_src.is_some() {
             self.clip = None;
@@ -4096,6 +4160,14 @@ impl SheetApp {
     /// 填充柄：把源区域按线性序列/复制的方式填到目标区域
     fn fill_to(&mut self, target_row: u32, vertical: bool) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        let gate = if vertical {
+            sheetcore::undo::rect_keys(r1, c1, target_row.max(r2), c2)
+        } else {
+            sheetcore::undo::rect_keys(r1, c1, r2, c2)
+        };
+        if !self.write_preflight(&gate, "填充") {
+            return;
+        }
         if vertical {
             if target_row <= r2 {
                 return;
@@ -4320,6 +4392,9 @@ impl SheetApp {
 
     fn run_sort(&mut self, dlg: &DataDlg) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "排序") {
+            return;
+        }
         if let Err(error) = sheetcore::sort_filter::validate_sort_region(
             self.wb.sheet(self.sheet_idx), (r1, c1, r2, c2),
         ) {
@@ -4357,6 +4432,9 @@ impl SheetApp {
 
     fn run_dedup(&mut self) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "删除重复") {
+            return;
+        }
         let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
         let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
         let removed = sheetcore::data_tools::remove_duplicates(
@@ -4377,6 +4455,9 @@ impl SheetApp {
 
     fn run_split(&mut self, delim: char) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "分列") {
+            return;
+        }
         let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
         let n = sheetcore::data_tools::text_to_columns(
             self.wb.sheet_mut(self.sheet_idx),
@@ -4655,7 +4736,7 @@ impl SheetApp {
         else {
             return;
         };
-        self.import_csv_from(&path);
+        self.open_csv_dialog(&path);
     }
 
     /// 选一个工作簿，把它的每张表复制到当前工作簿末尾（值 + 公式）
@@ -4705,8 +4786,165 @@ impl SheetApp {
         };
     }
 
+    /// C09：选文件后先打开选项对话框（编码/引号/表头/文本列 + 真实预览）
+    fn open_csv_dialog(&mut self, path: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            self.status = format!("读不了 {}", path.display());
+            return;
+        };
+        let (text, enc, _bad) = sheetcore::csv::decode(&bytes, None);
+        let delim = sheetcore::csv::sniff(&text);
+        let preview = sheetcore::csv::records_strict_q(&text, delim, '"').unwrap_or_default();
+        self.csv_dlg = Some(CsvDlg {
+            path: path.to_path_buf(),
+            bytes,
+            delim,
+            header: false,
+            enc: Some(enc),
+            quote: '"',
+            text_cols: std::collections::BTreeSet::new(),
+            preview,
+            err: None,
+        });
+    }
+
+    /// 对话框里的选项变了：按当前编码/引号重新解析预览
+    fn csv_dlg_reload(&mut self) {
+        let Some(dlg) = self.csv_dlg.as_mut() else { return };
+        let (text, _enc, bad) = sheetcore::csv::decode(&dlg.bytes, dlg.enc);
+        if bad {
+            dlg.preview.clear();
+            dlg.err = Some("所选编码无法完整解码这个文件".into());
+            return;
+        }
+        match sheetcore::csv::records_strict_q(&text, dlg.delim, dlg.quote) {
+            Ok(rows) => {
+                dlg.err = None;
+                dlg.preview = rows;
+            }
+            Err(e) => {
+                dlg.preview.clear();
+                dlg.err = Some(e);
+            }
+        }
+    }
+
+    fn csv_dlg_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.csv_dlg.take() else { return };
+        let mut close = false;
+        let mut import = false;
+        let mut changed = false;
+        egui::Window::new("导入 CSV")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(format!("文件：{}", dlg.path.display()));
+                ui.horizontal(|ui| {
+                    ui.label("编码");
+                    let label = match dlg.enc {
+                        None => "自动".to_string(),
+                        Some(e) => e.id().to_string(),
+                    };
+                    egui::ComboBox::from_id_salt("csv_enc")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(dlg.enc.is_none(), "自动（BOM/UTF-8/GB18030）").clicked() {
+                                dlg.enc = None;
+                                changed = true;
+                            }
+                            for e in [
+                                sheetcore::csv::Encoding::Utf8,
+                                sheetcore::csv::Encoding::Utf16Le,
+                                sheetcore::csv::Encoding::Gb18030,
+                            ] {
+                                if ui.selectable_label(dlg.enc == Some(e), e.id()).clicked() {
+                                    dlg.enc = Some(e);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.separator();
+                    ui.label("引号");
+                    let mut q = dlg.quote.to_string();
+                    if ui.add(egui::TextEdit::singleline(&mut q).desired_width(28.0)).changed() {
+                        if let Some(c) = q.chars().next() {
+                            dlg.quote = c;
+                            changed = true;
+                        }
+                    }
+                    ui.separator();
+                    if ui.checkbox(&mut dlg.header, "首行是表头").changed() {
+                        changed = true;
+                    }
+                });
+                ui.label("勾选下面的列按文本导入（保留 00123、18 位账号这类前导零）：");
+                egui::ScrollArea::both().max_height(260.0).show(ui, |ui| {
+                    egui::Grid::new("csv_preview").striped(true).show(ui, |ui| {
+                        let cols = dlg.preview.iter().map(|r| r.len()).max().unwrap_or(0);
+                        for c in 0..cols {
+                            let mut on = dlg.text_cols.contains(&(c as u32));
+                            if ui.checkbox(&mut on, format!("第 {} 列", c + 1)).changed() {
+                                if on {
+                                    dlg.text_cols.insert(c as u32);
+                                } else {
+                                    dlg.text_cols.remove(&(c as u32));
+                                }
+                            }
+                        }
+                        ui.end_row();
+                        for row in dlg.preview.iter().take(8) {
+                            for c in 0..cols {
+                                ui.label(row.get(c).cloned().unwrap_or_default());
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                if let Some(e) = &dlg.err {
+                    ui.colored_label(egui::Color32::RED, e);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        close = true;
+                    }
+                    if ui.add_enabled(dlg.err.is_none(), egui::Button::new("导入")).clicked() {
+                        import = true;
+                    }
+                });
+            });
+        if changed {
+            self.csv_dlg = Some(dlg);
+            self.csv_dlg_reload();
+        } else {
+            self.csv_dlg = Some(dlg);
+        }
+        if import {
+            let d = self.csv_dlg.as_ref().unwrap();
+            let (path, delim, header, enc, quote) =
+                (d.path.clone(), d.delim, d.header, d.enc, d.quote);
+            let cols: Vec<u32> = d.text_cols.iter().copied().collect();
+            self.csv_dlg = None;
+            self.import_csv_choice(&path, delim, header, enc, quote, &cols);
+        } else if close {
+            self.csv_dlg = None;
+        }
+    }
+
     fn import_csv_from(&mut self, path: &std::path::Path) {
-        // 先用和刷新完全相同的解码器读一遍：只为探测分隔符与行列数
+        self.import_csv_choice(path, ',', false, None, '"', &[]);
+    }
+
+    /// C09：按用户在导入对话框里选的编码/引号/文本列导入，并把选择持久化到数据源。
+    fn import_csv_choice(
+        &mut self,
+        path: &std::path::Path,
+        delim: char,
+        header: bool,
+        enc: Option<sheetcore::csv::Encoding>,
+        quote: char,
+        text_cols: &[u32],
+    ) {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -4714,18 +4952,28 @@ impl SheetApp {
                 return;
             }
         };
-        let (text, _enc, _bad) = sheetcore::csv::decode(&bytes, None);
-        let first = text.lines().next().unwrap_or("");
-        let tabs = first.matches('\t').count();
-        let commas = first.matches(',').count();
-        let delim = if tabs > commas { '\t' } else { ',' };
-        let (r0, c0) = self.sel;
-        // 解析到临时网格并一次性写入；失败时旧值不动
-        let probe = sheetcore::csv::records(&text, delim);
+        let (text, _used, bad) = sheetcore::csv::decode(&bytes, enc);
+        if bad {
+            self.status = "这个文件用所选编码解不出来（没有写入任何格）".into();
+            return;
+        }
+        let delim = if delim == ',' && !text.lines().next().unwrap_or("").contains(',') {
+            sheetcore::csv::sniff(&text)
+        } else {
+            delim
+        };
+        let probe = match sheetcore::csv::records_strict_q(&text, delim, quote) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("CSV 解析失败（没有写入任何格）：{e}");
+                return;
+            }
+        };
         if probe.is_empty() {
             self.status = "这个文件里没有可导入的内容".into();
             return;
         }
+        let (r0, c0) = self.sel;
         let max_r = probe.len() as u32;
         let max_c = probe.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
         let mut keys: Vec<(u32, u32)> = Vec::new();
@@ -4735,19 +4983,19 @@ impl SheetApp {
             }
         }
         let txn = self.txn_begin(&keys);
-        let size = match sheetcore::external::import_csv_with(
+        let (size, used_enc) = match sheetcore::external::import_csv_opts(
             self.wb.sheet_mut(self.sheet_idx),
             &path.to_string_lossy(),
             delim,
-            false,
-            None,
-            &[],
+            header,
+            enc,
+            text_cols,
+            quote,
             (0, 0),
             (r0, c0),
         ) {
-            Ok(v) => v,
+            Ok((rows, cols, enc)) => ((rows, cols), enc),
             Err(e) => {
-                // 解码/读取失败发生在任何写入之前，这里只是把已捕获的快照还原干净
                 for d in &txn {
                     self.wb.sheet_mut(self.sheet_idx).set(d.row, d.col, d.before.clone());
                 }
@@ -4758,7 +5006,6 @@ impl SheetApp {
         self.txn_end("导入 CSV", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        // 登记成数据源：换台机器/重开文件还能刷新
         let stored_path = sheetcore::external::store_path(&self.wb, path);
         let key = (stored_path.clone(), r0, c0);
         let existing = self.wb.sources.iter_mut().find(|src| match &src.kind {
@@ -4767,33 +5014,43 @@ impl SheetApp {
             }
             _ => false,
         });
-        let src = sheetcore::external::Source {
-            name: String::new(),
-            kind: sheetcore::external::Kind::Csv {
-                // 和文件放一起就存相对路径，换机器也能刷新
-                path: stored_path.clone(),
-                delim,
-                header: false,
-            },
-            at: (r0, c0),
-            rows: size.0,
-            cols: size.1,
-            csv_opts: Some(sheetcore::external::CsvOpts::default()),
+        let opts = sheetcore::external::CsvOpts {
+            encoding: Some(used_enc),
+            text_cols: text_cols.to_vec(),
+            quote,
         };
         match existing {
-            Some(slot) => {
-                slot.rows = size.0;
-                slot.cols = size.1;
-                slot.csv_opts = src.csv_opts.clone();
+            Some(src) => {
+                src.rows = size.0;
+                src.cols = size.1;
+                src.csv_opts = Some(opts);
             }
             None => {
-                let n = self.wb.sources.len() + 1;
-                let mut src = src;
-                src.name = format!("_sc_src_{n}");
+                let src = sheetcore::external::Source {
+                    name: String::new(),
+                    kind: sheetcore::external::Kind::Csv {
+                        path: stored_path,
+                        delim,
+                        header,
+                    },
+                    at: (r0, c0),
+                    rows: size.0,
+                    cols: size.1,
+                    csv_opts: Some(opts),
+                };
                 self.wb.sources.push(src);
+                let mut n = self.wb.sources.len();
+                loop {
+                    let name = format!("_sc_src_{n}");
+                    if !self.wb.sources.iter().any(|s| s.name == name) {
+                        self.wb.sources.last_mut().unwrap().name = name;
+                        break;
+                    }
+                    n += 1;
+                }
             }
         }
-        self.status = format!("已导入 {}（{} 行 × {} 列）", path.display(), size.0, size.1);
+        self.status = format!("已导入 {} 行 × {} 列", size.0, size.1);
     }
 
     /// 刷新数据：优先按登记过的数据源重读，没有就退回"上次导入"
@@ -4811,6 +5068,10 @@ impl SheetApp {
         }
         let idx = self.sheet_idx;
         let sources = self.wb.sources.clone();
+        let before_sizes: Vec<(String, u32, u32)> =
+            sources.iter().map(|s| (s.name.clone(), s.rows, s.cols)).collect();
+        // 刷新是一步可撤销操作：整表快照 + 源尺寸前后值
+        let snap_before = sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx);
         let mut ok = 0;
         let mut fail = 0;
         for mut src in sources {
@@ -4826,6 +5087,21 @@ impl SheetApp {
                 }
                 Err(_) => fail += 1,
             }
+        }
+        if ok > 0 {
+            let snap_after = sheetcore::undo::snapshot_sheet(self.wb.sheet(idx), idx);
+            let after_sizes: Vec<(String, u32, u32)> =
+                self.wb.sources.iter().map(|s| (s.name.clone(), s.rows, s.cols)).collect();
+            self.undo.push(sheetcore::undo::Action {
+                label: "刷新外部数据".into(),
+                deltas: Vec::new(),
+                focus: (idx, self.sel.0, self.sel.1),
+                snap_before: Some(snap_before),
+                snap_after: Some(snap_after),
+                by_site: 0,
+                shapes: None,
+                refresh_sizes: Some((before_sizes, after_sizes)),
+            });
         }
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
@@ -5436,6 +5712,9 @@ impl SheetApp {
         } else {
             replace_ignore_case(&text, &self.find.find, &self.find.replace, self.find.match_case)
         };
+        if !self.write_preflight(&[(r, c)], "替换") {
+            return;
+        }
         let keys = vec![(si, r, c)];
         let txn = self.txn_begin(&[(r, c)]);
         self.wb
@@ -5461,6 +5740,26 @@ impl SheetApp {
         } else {
             self.find.find.to_lowercase()
         };
+        // 命中的目标格里有任何一格不可写，整批都不执行
+        let hits: Vec<(u32, u32)> = keys
+            .iter()
+            .copied()
+            .filter(|(r, c)| {
+                self.wb
+                    .sheet(si)
+                    .get(*r, *c)
+                    .map(|cell| {
+                        let t = cell.value.display();
+                        let hay = if self.find.match_case { t.clone() } else { t.to_lowercase() };
+                        let needle = if self.find.match_case { self.find.find.clone() } else { needle.clone() };
+                        if self.find.whole_cell { hay == needle } else { hay.contains(&needle) }
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !self.write_preflight(&hits, "全部替换") {
+            return;
+        }
         let mut changed = 0usize;
         let mut touched = Vec::new();
         for (r, c) in keys {
@@ -5638,6 +5937,15 @@ impl SheetApp {
         let Some(applied) = applied else {
             self.status = if redo { "没有可重做的操作".into() } else { "没有可撤销的操作".into() };
             return;
+        };
+        // 刷新类动作撤销/重做时把外源源尺寸一起还原
+        if let Some(sizes) = &applied.refresh_sizes {
+            for (name, rows, cols) in sizes {
+                if let Some(src) = self.wb.sources.iter_mut().find(|s| &s.name == name) {
+                    src.rows = *rows;
+                    src.cols = *cols;
+                }
+            }
         };
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -6278,13 +6586,11 @@ impl SheetApp {
             self.cse_pending = true;
         }
         if clear {
-            let (r, c) = self.sel;
-            if let Some(holder) = self.lock_holder(r, c) {
-                self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
-                return;
-            }
             let (r1, c1, r2, c2) = self.sel_rect();
             let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+            if !self.write_preflight(&keys, "清除内容") {
+                return;
+            }
             let txn = self.txn_begin(&keys);
             for rr in r1..=r2 {
                 for cc in c1..=c2 {
@@ -10350,6 +10656,7 @@ impl SheetApp {
             snap_after: Some(after),
             by_site: 0,
             shapes: None,
+            refresh_sizes: None,
         });
         self.status = format!("分类汇总：{} 组，插了 {} 行（{}）", rep.groups, rep.rows, f.label());
         Ok(self.status.clone())
@@ -10937,6 +11244,7 @@ impl SheetApp {
                 before,
                 after,
             }),
+            refresh_sizes: None,
         });
         self.tb_sel = Some(idx);
         self.status = "已插入文本框：在对话框里填文字".into();
@@ -10981,6 +11289,7 @@ impl SheetApp {
                 before,
                 after,
             }),
+            refresh_sizes: None,
         });
         self.status = "文本框已更新".into();
     }
@@ -11111,10 +11420,11 @@ impl SheetApp {
                 snap_after: None,
                 by_site: 0,
                 shapes: Some(sheetcore::undo::ShapeEdit {
-                    sheet: self.sheet_idx,
+                sheet: self.sheet_idx,
                     before: d.before,
                     after,
                 }),
+                refresh_sizes: None,
             });
             self.status = format!("{label}（保存后写回 Excel）");
         }
@@ -11150,6 +11460,7 @@ impl SheetApp {
                 before,
                 after,
             }),
+            refresh_sizes: None,
         });
         self.tb_sel = None;
         self.status = "已删除文本框".into();
@@ -19184,6 +19495,10 @@ impl SheetApp {
                             });
                         });
                     if let Some(v) = picked {
+                        if !self.write_preflight(&[(dr, dc)], "选择验证下拉值") {
+                            self.dv_open = None;
+                            return;
+                        }
                         let cell = Cell {
                             value: Value::parse_input(&v),
                             formula: None,
@@ -21659,6 +21974,7 @@ impl eframe::App for SheetApp {
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);
         self.load_diag_ui(ctx);
+        self.csv_dlg_ui(ctx);
         self.password_prompt_ui(ctx);
         self.encrypt_dialog_ui(ctx);
         self.size_dialog(ctx);

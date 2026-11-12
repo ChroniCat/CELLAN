@@ -18,12 +18,20 @@ pub enum Kind {
 }
 
 /// CSV 的持久化配置：编码与“按文本保留”的列（00123、18 位账号）。
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CsvOpts {
     /// None = 自动（BOM → UTF-8 → GB18030）
     pub encoding: Option<crate::csv::Encoding>,
     /// 这些列一律按文本写入，不自动转数字
     pub text_cols: Vec<u32>,
+    /// 引号字符；默认 `"`
+    pub quote: char,
+}
+
+impl Default for CsvOpts {
+    fn default() -> Self {
+        CsvOpts { encoding: None, text_cols: Vec::new(), quote: '"' }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,15 +55,16 @@ impl Source {
     pub fn to_name_text(&self) -> String {
         match &self.kind {
             Kind::Csv { path, delim, header } => {
-                let (enc, cols) = match &self.csv_opts {
+                let (enc, cols, quote) = match &self.csv_opts {
                     Some(o) => (
                         o.encoding.map(|e| e.id()).unwrap_or("auto").to_string(),
                         o.text_cols.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
+                        format!("q{}", o.quote as u32),
                     ),
-                    None => ("auto".to_string(), String::new()),
+                    None => ("auto".to_string(), String::new(), format!("q{}", '"' as u32)),
                 };
                 format!(
-                    "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
+                    "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
                     path.replace('"', "\"\""),
                     delim,
                     if *header { 1 } else { 0 },
@@ -64,7 +73,8 @@ impl Source {
                     self.rows,
                     self.cols,
                     enc,
-                    cols
+                    cols,
+                    quote
                 )
             }
             Kind::Internal { sheet, rect } => format!(
@@ -112,8 +122,14 @@ impl Source {
                 .get(9)
                 .map(|x| x.split(',').filter_map(|c| c.trim().parse().ok()).collect())
                 .unwrap_or_default();
-            if enc.is_some() || !cols.is_empty() {
-                Some(CsvOpts { encoding: enc, text_cols: cols })
+            let quote = f
+                .get(10)
+                .and_then(|x| x.strip_prefix('q'))
+                .and_then(|n| n.parse::<u32>().ok())
+                .and_then(char::from_u32)
+                .unwrap_or('"');
+            if enc.is_some() || !cols.is_empty() || quote != '"' {
+                Some(CsvOpts { encoding: enc, text_cols: cols, quote })
             } else {
                 None
             }
@@ -697,15 +713,44 @@ pub fn import_csv_with(
     old: (u32, u32),
     at: (u32, u32),
 ) -> std::io::Result<(u32, u32)> {
+    let (rows, cols, _enc) = import_csv_opts(
+        sheet,
+        path,
+        delim,
+        header,
+        encoding,
+        text_cols,
+        '"',
+        old,
+        at,
+    )?;
+    Ok((rows, cols))
+}
+
+/// 同 `import_csv_with`，另外返回实际使用的编码（首次导入要把它存进配置）。
+pub fn import_csv_opts(
+    sheet: &mut Sheet,
+    path: &str,
+    delim: char,
+    header: bool,
+    encoding: Option<crate::csv::Encoding>,
+    text_cols: &[u32],
+    quote: char,
+    old: (u32, u32),
+    at: (u32, u32),
+) -> std::io::Result<(u32, u32, crate::csv::Encoding)> {
     let bytes = std::fs::read(path)?;
-    let (text, _enc, had_errors) = crate::csv::decode(&bytes, encoding);
+    let (text, used, had_errors) = crate::csv::decode(&bytes, encoding);
     if had_errors {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "CSV 编码无法完整解码（文件可能不是声明的编码）",
         ));
     }
-    let records = crate::csv::records(&text, delim);
+    // 严格解析：引号不闭合/闭引号后有多余字符都算失败，失败时一个格都不写
+    let records = crate::csv::records_strict_q(&text, delim, quote).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
     let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(records.len());
     for (ri, rec) in records.iter().enumerate() {
         let mut row = Vec::with_capacity(rec.len());
@@ -736,15 +781,19 @@ pub fn import_csv_with(
         }
     }
     for (ri, row) in grid.into_iter().enumerate() {
-        for (ci, cell) in row.into_iter().enumerate() {
-            if !matches!(cell.value, Value::Empty) {
-                sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
-            } else if (ri as u32) < old.0 && (ci as u32) < old.1 {
-                sheet.set(at.0 + ri as u32, at.1 + ci as u32, Cell::default());
+        if (ri as u32) < old.0 {
+            // 短行补齐：新矩形里这一行没有的列要清空，才能和首次导入一致
+            for ci in row.len()..cols as usize {
+                if (ci as u32) < old.1 {
+                    sheet.set(at.0 + ri as u32, at.1 + ci as u32, Cell::default());
+                }
             }
         }
+        for (ci, cell) in row.into_iter().enumerate() {
+            sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
+        }
     }
-    Ok((rows, cols))
+    Ok((rows, cols, used))
 }
 
 /// 数字就当数字，空就是空，别的原样当文本
@@ -798,20 +847,22 @@ pub fn refresh(wb: &mut crate::model::Workbook, sheet_idx: usize, src: &Source) 
     match &src.kind {
         Kind::Csv { path, delim, header } => {
             let real = resolve_path(wb, path);
-            let (enc, cols) = match &src.csv_opts {
-                Some(o) => (o.encoding, o.text_cols.as_slice()),
-                None => (None, &[][..]),
+            let (enc, cols, quote) = match &src.csv_opts {
+                Some(o) => (o.encoding, o.text_cols.as_slice(), o.quote),
+                None => (None, &[][..], '"'),
             };
-            import_csv_with(
+            let (rows, cols, _enc) = import_csv_opts(
                 &mut wb.sheets[sheet_idx],
                 &real.to_string_lossy(),
                 *delim,
                 *header,
                 enc,
                 cols,
+                quote,
                 (src.rows, src.cols),
                 src.at,
-            )
+            )?;
+            Ok((rows, cols))
         }
         Kind::Internal { sheet, rect } => {
             let Some(si) = wb.sheets.iter().position(|s| &s.name == sheet) else {

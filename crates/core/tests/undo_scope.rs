@@ -24,6 +24,7 @@ fn change_to(wb: &mut Workbook, label: &str, text: &str) -> Action {
         snap_after: None,
         by_site: 0,
             shapes: None,
+            refresh_sizes: None,
     }
 }
 

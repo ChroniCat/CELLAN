@@ -204,6 +204,7 @@ fn shape_undo_restores_textboxes() {
             before,
             after,
         }),
+        refresh_sizes: None,
     });
     assert!(stack.can_undo(), "形状动作要能撤销");
     let applied = stack

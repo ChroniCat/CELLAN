@@ -2442,3 +2442,175 @@ fn csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_sou
     assert!(app.undo.undo_label().map(|l| l.contains("导入 CSV")).unwrap_or(false), "导入应可一步撤销");
     drop(env);
 }
+
+
+
+#[test]
+fn csv_import_choices_persist_and_refresh_reuses_them() {
+    let env = crate::test_env::TestEnv::new("c09_app_choice");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let csv = env.path("acct.csv");
+    std::fs::write(&csv, "账号,金额\n001234567890123456,5\n").unwrap();
+    // 模拟对话框选择：UTF-8 + 首行表头 + 第 1 列按文本
+    app.open_csv_dialog(&csv);
+    let dlg = app.csv_dlg.as_ref().expect("应打开导入对话框");
+    assert!(!dlg.preview.is_empty(), "对话框要有真实预览");
+    let delim = dlg.delim;
+    app.csv_dlg = None;
+    app.import_csv_choice(&csv, delim, true, Some(sheetcore::csv::Encoding::Utf8), '"', &[0]);
+
+    let sh = app.wb.sheet(app.sheet_idx);
+    let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
+        Some(sheetcore::model::Value::Text(t)) => t.to_string(),
+        Some(sheetcore::model::Value::Number(n)) => format!("{n}"),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(val(1, 0), "001234567890123456", "文本列要保留前导零和 18 位账号");
+    let src = app.wb.sources.iter().find(|s| s.name.starts_with("_sc_src_")).unwrap();
+    let opts = src.csv_opts.as_ref().expect("导入必须记录实际编码/列型/引号");
+    assert_eq!(opts.encoding, Some(sheetcore::csv::Encoding::Utf8));
+    assert_eq!(opts.text_cols, vec![0]);
+    assert_eq!(opts.quote, '"');
+
+    // 保存重开：配置仍在
+    let x = env.path("acct.xlsx");
+    sheetcore::xlsx::save(&x, &app.wb).unwrap();
+    let mut back = sheetcore::xlsx::load(&x).unwrap();
+    let src = back.sources.iter().find(|s| s.name.starts_with("_sc_src_")).expect("源应随包保存");
+    let opts = src.csv_opts.as_ref().expect("重开后配置应在");
+    assert_eq!(opts.text_cols, vec![0]);
+    assert_eq!(opts.encoding, Some(sheetcore::csv::Encoding::Utf8));
+    // 刷新复用同一配置
+    std::fs::write(&csv, "账号,金额\n009999999999999999,9\n").unwrap();
+    let src = src.clone();
+    let (r, c) = sheetcore::external::refresh(&mut back, 0, &src).unwrap();
+    assert_eq!((r, c), (2, 2));
+    match &back.sheets[0].get(1, 0).map(|x| x.value.clone()) {
+        Some(sheetcore::model::Value::Text(t)) => assert_eq!(t.to_string(), "009999999999999999"),
+        other => panic!("刷新后账号应仍为文本：{other:?}"),
+    }
+    drop(env);
+}
+#[test]
+fn refresh_is_one_undo_step_that_restores_values_rect_and_source_size() {
+    let env = crate::test_env::TestEnv::new("c09_app_refresh_undo");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let csv = env.path("r.csv");
+    std::fs::write(&csv, "A,B\nC,D\n").unwrap();
+    app.import_csv_from(&csv);
+    assert_eq!(app.wb.sources.len(), 1);
+    assert_eq!((app.wb.sources[0].rows, app.wb.sources[0].cols), (2, 2));
+    let labels_before = app.undo.depth().0;
+    // 文件变长且首行变短：刷新后 B1 必须清空、矩形变 3x2
+    std::fs::write(&csv, "A\nE,F\nG,H\n").unwrap();
+    app.refresh_import();
+    let sh = app.wb.sheet(app.sheet_idx);
+    let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
+        Some(sheetcore::model::Value::Text(t)) => t.to_string(),
+        Some(sheetcore::model::Value::Empty) | None => String::new(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!((app.wb.sources[0].rows, app.wb.sources[0].cols), (3, 2));
+    assert_eq!(val(0, 1), "", "短行刷新必须清掉旧 B1");
+    assert_eq!(val(2, 1), "H");
+    assert_eq!(app.undo.depth().0, labels_before + 1, "刷新只能占一步撤销");
+    assert!(app.undo.undo_label().map(|l| l.contains("刷新")).unwrap_or(false));
+    // 一步撤销：值、范围、源尺寸全部回到刷新前
+    app.do_undo(false);
+    let sh = app.wb.sheet(app.sheet_idx);
+    let val2 = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
+        Some(sheetcore::model::Value::Text(t)) => t.to_string(),
+        Some(sheetcore::model::Value::Empty) | None => String::new(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(val2(0, 0), "A");
+    assert_eq!(val2(0, 1), "B", "撤销要恢复被清掉的 B1");
+    assert_eq!(val2(1, 1), "D");
+    assert_eq!(val2(2, 0), "", "刷新多出来的行要撤掉");
+    assert_eq!((app.wb.sources[0].rows, app.wb.sources[0].cols), (2, 2), "源尺寸要回滚");
+    drop(env);
+}
+fn seeded_app(env: &crate::test_env::TestEnv, tag: &str) -> SheetApp {
+    let _ = tag;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..3u32 {
+        for c in 0..3u32 {
+            app.wb.sheet_mut(0).set(
+                r,
+                c,
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text(format!("v{r}{c}").into()),
+                    formula: None,
+                },
+            );
+        }
+    }
+    app.undo = sheetcore::undo::UndoStack::new();
+    app.wb.dirty = false;
+    app
+}
+
+fn snapshot(app: &SheetApp) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in 0..3u32 {
+        for c in 0..3u32 {
+            out.push(app.wb.sheet(0).get(r, c).map(|x| x.value.display()).unwrap_or_default());
+        }
+    }
+    out
+}
+
+/// UI-03：受保护的表，Delete / 替换 / 去重 / 填充 / 验证下拉都不能改模型。
+#[test]
+fn protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick() {
+    let env = crate::test_env::TestEnv::new("ui03_protected");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "prot");
+    app.wb.sheet_mut(0).protection = Some(sheetcore::protection::SheetProtection::default());
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    let before = snapshot(&app);
+
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Delete, false)]);
+    assert_eq!(snapshot(&app), before, "受保护时 Delete 不能改数据");
+    assert!(app.undo.undo_label().is_none(), "不能产生撤销步");
+
+    app.find.find = "v1".into();
+    app.find.replace = "X".into();
+    app.sel = (1, 0);
+    app.replace_current();
+    assert_eq!(snapshot(&app), before, "受保护时替换不能改数据");
+    app.replace_all();
+    assert_eq!(snapshot(&app), before, "受保护时全部替换不能改数据");
+
+    app.run_dedup();
+    assert_eq!(snapshot(&app), before, "受保护时去重不能改数据");
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.fill_to(2, true);
+    assert_eq!(snapshot(&app), before, "受保护时填充不能改数据");
+    assert!(!app.wb.dirty, "被拒绝的操作不能把文档标脏");
+    assert!(app.status.contains("受保护"), "应提示受保护：{}", app.status);
+    drop(env);
+}
+
+/// UI-03：区域里只有一格被别人锁定，也整批不写（不做部分写入）。
+#[test]
+fn one_locked_cell_blocks_the_whole_clear() {
+    let env = crate::test_env::TestEnv::new("ui03_lock");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "lock");
+    app.net = Some(crate::net::host(91, "我".into(), "ui03".into(), 0, "t".into()).unwrap());
+    app.locks.request(0, 1, 1, 92, "乙", 0);
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    let before = snapshot(&app);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Delete, false)]);
+    assert_eq!(snapshot(&app), before, "有一格被锁时整块都不能清");
+    assert!(app.status.contains("乙"), "应指出是谁锁着：{}", app.status);
+    assert!(!app.wb.dirty);
+    drop(env);
+}

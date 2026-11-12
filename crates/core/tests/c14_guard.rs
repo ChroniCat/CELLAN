@@ -360,6 +360,24 @@ fn rels_after_clear(first_is_comments: bool) {
     let out = String::from_utf8(sheetcore::fixups::read_part(&p, &rels_part).unwrap()).unwrap();
     let doc = roxmltree::Document::parse(&out).expect("关系部件必须仍是合法 XML");
     assert!(doc.root_element().has_tag_name("Relationships"), "根必须是 Relationships");
+    assert!(
+        doc.root_element().tag_name().namespace() == Some("http://schemas.openxmlformats.org/package/2006/relationships"),
+        "根必须保留关系命名空间：{out}"
+    );
+    let keep = doc
+        .descendants()
+        .find(|n| n.has_tag_name("Relationship") && n.attribute("Id") == Some("rIdKeep"))
+        .expect("保留的关系要在：{out}");
+    assert_eq!(
+        keep.attribute("TargetMode"),
+        Some("External"),
+        "外链关系的 TargetMode 必须保留：{out}"
+    );
+    assert_eq!(
+        keep.attribute("Target"),
+        Some("https://example.com/"),
+        "外链 URL 不能被当作包内路径归一：{out}"
+    );
     let types: Vec<String> = doc
         .descendants()
         .filter(|n| n.has_tag_name("Relationship"))
@@ -440,4 +458,54 @@ fn truncated_chart_xml_after_recognized_type_is_reported() {
     // 已经出现 barChart（parse_chart 会认出来），但后面被截断
     let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart>";
     chart_fixture("chart_truncated", Some(rels), Some(chart));
+}
+
+/// 真实链路：首次保存带外链 → 重新打开改目标 → 再保存，必须写新 URL。
+/// 保存末尾的"恢复原文"只允许修引擎归一化，不能把用户的新链接换回旧的。
+#[test]
+fn editing_an_existing_external_link_persists_the_new_target() {
+    let d = std::env::temp_dir().join(format!("sc_c14_link_edit_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&d);
+    let p = d.join("link.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "链接".into();
+    wb.sheets[0].set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("old".into()), formula: None });
+    wb.sheets[0].hyperlinks.insert(
+        (0, 0),
+        sheetcore::hyperlinks::Hyperlink {
+            target: "https://old.example/a".into(),
+            location: String::new(),
+            tooltip: "旧".into(),
+            external: true,
+        },
+    );
+    wb.sheets[0].hyperlinks_dirty = true;
+    sheetcore::xlsx::save(&p, &wb).unwrap();
+    let rels = {
+        let part = sheetcore::patch::sheet_targets(&p).unwrap()["链接"].clone();
+        let (dd, ff) = part.rsplit_once('/').unwrap();
+        format!("{dd}/_rels/{ff}.rels")
+    };
+    let first = String::from_utf8(sheetcore::fixups::read_part(&p, &rels).unwrap()).unwrap();
+    assert!(first.contains("https://old.example/a"), "首次保存应写旧链接：{first}");
+
+    let mut wb2 = sheetcore::xlsx::load(&p).unwrap();
+    let link = wb2.sheets[0].hyperlinks.get_mut(&(0, 0)).expect("链接应读回");
+    assert_eq!(link.target, "https://old.example/a");
+    link.target = "https://new.example/b".into();
+    wb2.sheets[0].hyperlinks_dirty = true;
+    sheetcore::xlsx::save(&p, &wb2).unwrap();
+
+    let second = String::from_utf8(sheetcore::fixups::read_part(&p, &rels).unwrap()).unwrap();
+    assert!(second.contains("https://new.example/b"), "用户改的新链接必须落盘：{second}");
+    assert!(!second.contains("old.example"), "不能把新链接恢复成旧值：{second}");
+    assert!(second.contains("TargetMode=\"External\""), "外链 TargetMode 要保留：{second}");
+    let doc = roxmltree::Document::parse(&second).expect("rels 必须良构");
+    assert_eq!(
+        doc.root_element().tag_name().namespace(),
+        Some("http://schemas.openxmlformats.org/package/2006/relationships")
+    );
+    // 再打开读回模型
+    let wb3 = sheetcore::xlsx::load(&p).unwrap();
+    assert_eq!(wb3.sheets[0].hyperlinks[&(0, 0)].target, "https://new.example/b");
 }

@@ -67,7 +67,7 @@ fn newline_inside_quotes_is_one_field_for_import_and_refresh() {
 /// UTF-8 BOM / UTF-16LE / GB18030 都能读，且中文不丢。
 #[test]
 fn decodes_bom_utf16_and_gb18030() {
-    let d = std::env::temp_dir().join(format!("sc_c09_enc_{}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("sc_c09_explicit_enc_{}", std::process::id()));
 
     let mut bom = vec![0xEF, 0xBB, 0xBF];
     bom.extend_from_slice("城市,数量\n北京,1\n".as_bytes());
@@ -207,7 +207,7 @@ fn csv_options_survive_save_and_reload() {
         at: (0, 0),
         rows: 1,
         cols: 1,
-        csv_opts: Some(CsvOpts { encoding: Some(sheetcore::csv::Encoding::Gb18030), text_cols: vec![0] }),
+        csv_opts: Some(CsvOpts { encoding: Some(sheetcore::csv::Encoding::Gb18030), text_cols: vec![0], quote: '\'' }),
     });
     let x = d.join("p.xlsx");
     sheetcore::xlsx::save(&x, &wb).unwrap();
@@ -216,6 +216,7 @@ fn csv_options_survive_save_and_reload() {
     let opts = src.csv_opts.as_ref().expect("CSV 配置应持久化");
     assert_eq!(opts.encoding, Some(sheetcore::csv::Encoding::Gb18030));
     assert_eq!(opts.text_cols, vec![0]);
+    assert_eq!(opts.quote, '\'', "引号字符也要持久化");
     assert_eq!(
         match &back.sheets[0].get(0, 0).map(|c| c.value.clone()) {
             Some(Value::Text(t)) => t.to_string(),
@@ -223,4 +224,97 @@ fn csv_options_survive_save_and_reload() {
         },
         "00123"
     );
+}
+
+#[test]
+fn strict_parser_rejects_unclosed_and_trailing_junk_quotes() {
+    assert!(sheetcore::csv::records_strict("\"abc,1\n", ',').is_err(), "未闭合引号必须报错");
+    assert!(
+        sheetcore::csv::records_strict("\"abc\"x,1\n", ',').is_err(),
+        "闭引号后多余字符必须报错"
+    );
+    let ok = sheetcore::csv::records_strict("\"a\"\"b\",2\n", ',').unwrap();
+    assert_eq!(ok, vec![vec!["a\"b".to_string(), "2".to_string()]]);
+    // CRLF、尾空列、空行
+    let rows = sheetcore::csv::records_strict("a,b,\r\n\r\nc,d,e\r\n", ',').unwrap();
+    assert_eq!(rows, vec![
+        vec![String::from("a"), String::from("b"), String::new()],
+        vec![String::from("c"), String::from("d"), String::from("e")],
+    ]);
+}
+
+#[test]
+fn explicit_encoding_is_never_silently_replaced_by_gb18030() {
+    let d = std::env::temp_dir().join(format!("sc_c09_enc_{}", std::process::id()));
+    let gb = write(&d, "gb.csv", &[0xC4, 0xE3, 0xBA, 0xC3, b',', b'1', b'\n']); // 你好,1 的 GB18030
+    let bytes = std::fs::read(&gb).unwrap();
+    let (txt, enc, bad) = sheetcore::csv::decode(&bytes, Some(sheetcore::csv::Encoding::Utf8));
+    assert!(bad, "指定 UTF-8 解码失败必须报告，而不是回退 GB18030");
+    assert!(txt.is_empty());
+    assert_eq!(enc, sheetcore::csv::Encoding::Utf8);
+    // 自动探测才允许回退
+    let (txt2, enc2, bad2) = sheetcore::csv::decode(&bytes, None);
+    assert!(!bad2);
+    assert_eq!(enc2, sheetcore::csv::Encoding::Gb18030);
+    assert_eq!(txt2, "你好,1\n");
+}
+
+#[test]
+fn bad_quote_on_refresh_keeps_previous_cells_untouched() {
+    let d = std::env::temp_dir().join(format!("sc_c09_badq_{}", std::process::id()));
+    let csv = write(&d, "q.csv", b"A,B\nC,D\n");
+    let mut sh = sheet();
+    let (r, c) = import_csv_with(&mut sh, csv.to_str().unwrap(), ',', false, None, &[], (0, 0), (0, 0)).unwrap();
+    assert_eq!((r, c), (2, 2));
+    // 破坏引号：未闭合
+    std::fs::write(&csv, b"A,B\n\"C\n").unwrap();
+    let src = Source {
+        name: "_sc_src_1".into(),
+        kind: Kind::Csv { path: csv.to_str().unwrap().into(), delim: ',', header: false },
+        at: (0, 0),
+        rows: r,
+        cols: c,
+        csv_opts: Some(CsvOpts::default()),
+    };
+    let mut wb = Workbook::new_blank();
+    wb.sheets = vec![sh];
+    let err = refresh(&mut wb, 0, &src).unwrap_err();
+    assert!(format!("{err}").contains("引号"), "错误要指出引号问题：{err}");
+    assert_eq!(text(&wb.sheets[0], 0, 0), "A");
+    assert_eq!(text(&wb.sheets[0], 0, 1), "B");
+    assert_eq!(text(&wb.sheets[0], 1, 0), "C");
+    assert_eq!(text(&wb.sheets[0], 1, 1), "D");
+}
+
+#[test]
+fn short_row_refresh_matches_first_import_for_the_same_rectangle() {
+    let d = std::env::temp_dir().join(format!("sc_c09_short_{}", std::process::id()));
+    let csv = write(&d, "s.csv", b"A,B\nC,D\n");
+    let mut fresh = sheet();
+    let mut old = sheet();
+    let (r0, c0) = import_csv_with(&mut old, csv.to_str().unwrap(), ',', false, None, &[], (0, 0), (0, 0)).unwrap();
+    assert_eq!((r0, c0), (2, 2));
+    std::fs::write(&csv, b"A\nB,C\n").unwrap();
+    let src = Source {
+        name: "_sc_src_1".into(),
+        kind: Kind::Csv { path: csv.to_str().unwrap().into(), delim: ',', header: false },
+        at: (0, 0),
+        rows: r0,
+        cols: c0,
+        csv_opts: Some(CsvOpts::default()),
+    };
+    let mut wb = Workbook::new_blank();
+    wb.sheets = vec![old];
+    refresh(&mut wb, 0, &src).unwrap();
+    let (r1, c1) = import_csv_with(&mut fresh, csv.to_str().unwrap(), ',', false, None, &[], (0, 0), (0, 0)).unwrap();
+    for r in 0..r1.max(2) {
+        for c in 0..c1.max(2) {
+            assert_eq!(
+                text(&wb.sheets[0], r, c),
+                text(&fresh, r, c),
+                "短行刷新后 ({r},{c}) 应与首次导入一致"
+            );
+        }
+    }
+    assert_eq!(text(&wb.sheets[0], 0, 1), "", "旧 B1 必须被清空");
 }

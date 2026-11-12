@@ -1594,6 +1594,8 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     } else {
         wb
     };
+    // 外链关系的原文（URL/TargetMode）：有的引擎会把 URL 当包内路径改写
+    let external_rels = crate::notes::capture_external_rels(if base.exists() { &base } else { path });
     let mut book = if base.exists() {
         read(&base).with_context(|| format!("读取现有文件失败 {}", base.display()))?
     } else {
@@ -2127,6 +2129,8 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // staged 补丁之前，加表/改名时会出现「Content-Types 声明 /xl/worksheets/sheet2.xml，
     // 包里只有 native-sheet-…」——verify_saved_package 抓到的正是这个（Excel 会判包损坏）。
     must_save!("prune-content-types-final", crate::fixups::prune_content_types(path));
+    // 最后一步：外链关系按原文恢复，避免 URL 被归一、TargetMode 被丢
+    must_save!("restore-external-rels", crate::notes::restore_external_rels(path, &external_rels));
     Ok(())
 }
 
