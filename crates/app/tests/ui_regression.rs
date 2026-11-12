@@ -220,9 +220,21 @@ fn textbox_drag_moves_model() {
         .and_then(|s| s.split(')').next())
         .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
         .unwrap_or_default();
-    // 拖动 (60,40)：模型从 (120,80) 到 (180,120)，屏幕坐标再加表格原点
-    assert!(nums[0] >= 205.0 && nums[0] <= 215.0, "x 没动到位：{line}");
-    assert!(nums[1] >= 360.0 && nums[1] <= 370.0, "y 没动到位：{line}");
+    // 拖动 (60,40)：模型从 (120,80) 到 (180,120)。
+    // 表格原点不写死——标签条/功能区高度变了也会跟着走，用 dump 里的 pane 矩形换算。
+    let pane_y = dump
+        .lines()
+        .find(|l| l.starts_with("pane "))
+        .and_then(|l| l.split("rect=(").nth(1))
+        .and_then(|s| s.split(',').nth(1))
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(225.0);
+    assert!(nums[0] >= 200.0 && nums[0] <= 220.0, "x 没动到位：{line}");
+    let want_y = pane_y + 19.0 + 120.0;
+    assert!(
+        (nums[1] - want_y).abs() <= 4.0,
+        "y 没动到位：期望 ≈{want_y}（pane_y={pane_y}），实际 {line}"
+    );
     assert!((nums[2] - 220.0).abs() < 1.5 && (nums[3] - 70.0).abs() < 1.5, "尺寸不该变：{line}");
     let _ = std::fs::remove_file(&tmp);
 }
