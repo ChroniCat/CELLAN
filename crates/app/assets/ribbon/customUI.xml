@@ -358,6 +358,14 @@
             <button id="PaperSize" label="纸张：A4" imageMso="Table" screentip="切换纸张大小" onAction="PaperSize" sizeString="110"/>
             <button id="PageMargins" label="页边距：常规" imageMso="Grid" screentip="在常规 / 窄 / 宽之间切换" onAction="PageMargins" sizeString="110"/>
           </box>
+          <menu id="PrintAreaMenu" label="打印区域" sizeString="72" screentip="设置或取消打印区域">
+            <button id="SetPrintArea" label="设置打印区域" onAction="PrintAreaSet"/>
+            <button id="ClearPrintArea" label="取消打印区域" onAction="PrintAreaClear"/>
+          </menu>
+          <menu id="PageBreaksMenu" label="分隔符" sizeString="60" screentip="插入或删除分页符">
+            <button id="InsertPageBreak" label="插入分页符" onAction="PageBreakInsert"/>
+            <button id="RemovePageBreak" label="删除分页符" onAction="PageBreakRemove"/>
+          </menu>
         </group>
         <group id="GroupScale" label="调整为合适大小">
           <box boxStyle="vertical">
@@ -394,6 +402,18 @@
                 <item id="scale:10" label="10%"/>
               </comboBox>
             </box>
+          </box>
+        </group>
+        <group id="GroupGridlines" label="网格线">
+          <box boxStyle="vertical">
+            <toggleButton id="ViewGridlines" label="查看" onAction="ShowGridlines" sizeString="60"/>
+            <toggleButton id="PrintGridlinesToggle" label="打印" onAction="TogglePrintGridlines" sizeString="60"/>
+          </box>
+        </group>
+        <group id="GroupHeadings" label="标题">
+          <box boxStyle="vertical">
+            <toggleButton id="ViewHeadings" label="查看" onAction="ShowHeadings" sizeString="60"/>
+            <toggleButton id="PrintHeadingsToggle" label="打印" onAction="TogglePrintHeadings" sizeString="60"/>
           </box>
         </group>
         <group id="GroupSheetOptions" label="工作表选项">
@@ -549,6 +569,8 @@
         </group>
         <group id="GroupZoom" label="缩放">
           <box boxStyle="vertical">
+            <button id="ZoomDialog" label="缩放..." imageMso="Zoom" onAction="ZoomDialog" sizeString="96"/>
+            <button id="ZoomToSelection" label="缩放到选定区域" imageMso="Zoom" onAction="ZoomToSelection" sizeString="120"/>
             <box boxStyle="horizontal">
               <button id="ZoomIn" imageMso="Zoom" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>

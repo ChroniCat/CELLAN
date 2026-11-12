@@ -414,6 +414,8 @@ struct SheetApp {
     last_autosave: f64,
     /// 标题栏搜索框
     search: String,
+    /// 缩放对话框（百分比）
+    zoom_dlg: Option<f32>,
     /// 撤销/重做
     undo: sheetcore::undo::UndoStack,
     /// 标签页：与 active_tab 一一对应，Active 那个的数据在 self 上
@@ -810,6 +812,7 @@ impl SheetApp {
             autosave: false,
             last_autosave: 0.0,
             search: String::new(),
+            zoom_dlg: None,
             tabs: vec![TabSlot::Active],
             active_tab: 0,
             locks: sheetcore::sync::LockTable::new(20_000),
@@ -8596,6 +8599,41 @@ impl SheetApp {
     }
 
     /// 列宽/行高对话框（表头右键 → 列宽…/行高…）
+    /// 缩放对话框
+    fn zoom_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut z) = self.zoom_dlg else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "缩放", 240.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::field(ui, "百分比", |ui| {
+                    let mut v = (z * 100.0).round() as f64;
+                    if ui_kit::spin(ui, &mut v, 10.0, 400.0, 5.0, 80.0) {
+                        z = v as f32 / 100.0;
+                    }
+                });
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            self.zoom = z;
+            ctx.set_zoom_factor(z);
+            self.zoom_dlg = None;
+        } else if open {
+            self.zoom_dlg = Some(z);
+        } else {
+            self.zoom_dlg = None;
+        }
+    }
+
     fn size_dialog(&mut self, ctx: &egui::Context) {
         let Some((is_col, mut value)) = self.size_dlg else { return };
         let mut open = true;
@@ -17355,6 +17393,7 @@ impl eframe::App for SheetApp {
         self.hyperlink_dialog(ctx);
         self.paste_special_dialog(ctx);
         self.about_window(ctx);
+        self.zoom_dialog(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);

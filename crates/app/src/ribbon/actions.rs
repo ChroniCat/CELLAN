@@ -783,6 +783,56 @@ impl SheetApp {
                 sh.freeze_dirty = true;
                 self.wb.dirty = true;
             }
+            "PrintAreaSet" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.page.print_area = Some((r1, c1, r2, c2));
+                self.wb.dirty = true;
+                self.status = format!(
+                    "打印区域设为 {}-{}",
+                    cell_name(r1, c1),
+                    cell_name(r2, c2)
+                );
+            }
+            "PrintAreaClear" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.page.print_area = None;
+                self.wb.dirty = true;
+                self.status = "已取消打印区域".into();
+            }
+            "PageBreakInsert" => {
+                let r = self.sel.0;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                if !sh.page.row_breaks.contains(&r) {
+                    sh.page.row_breaks.push(r);
+                    sh.page.row_breaks.sort_unstable();
+                    sh.page.row_breaks.dedup();
+                }
+                self.wb.dirty = true;
+                self.status = format!("已在第 {} 行插入分页符", r + 1);
+            }
+            "PageBreakRemove" => {
+                let r = self.sel.0;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.page.row_breaks.retain(|x| *x != r);
+                self.wb.dirty = true;
+                self.status = format!("已删除第 {} 行的分页符", r + 1);
+            }
+            "ZoomToSelection" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let sh = self.wb.sheet(self.sheet_idx);
+                let w: f32 = (c1..=c2).map(|c| sh.cols.size(c)).sum();
+                let h: f32 = (r1..=r2).map(|r| sh.rows.size(r)).sum();
+                let view = self.last_view;
+                if w > 1.0 && h > 1.0 && view.x > 10.0 && view.y > 10.0 {
+                    let z = ((view.x - 40.0) / w).min((view.y - 40.0) / h).clamp(0.5, 2.5);
+                    self.zoom = z;
+                    self.scroll = egui::Vec2::new(c1 as f32 * 8.0, r1 as f32 * 4.0);
+                    ctx.set_zoom_factor(z);
+                    self.status = format!("缩放到选定区域：{:.0}%", z * 100.0);
+                }
+            }
+            "ZoomDialog" => self.zoom_dlg = Some(self.zoom),
             "NormalView" => {
                 self.view_mode = 0;
                 self.scroll = egui::Vec2::ZERO;
