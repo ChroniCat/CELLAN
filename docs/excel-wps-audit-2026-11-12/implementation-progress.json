@@ -4282,7 +4282,7 @@
       "scope": "docs历史状态索引",
       "source": "qa-requirements.md",
       "heading": "QA-08 P1 修订历史文档为可追踪状态",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -4292,7 +4292,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T21:14:08Z",
       "slices": [
         {
           "id": "QA-08.1",
@@ -4300,17 +4300,26 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "docs/ui-parity-audit.md",
+            "docs/native-v147-plan.md",
+            "docs/native-rewrite.md",
+            "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
+          ],
+          "not_done": [
+            "旧日志逐轮条目未逐条加日期外的时间戳；当前以台账与证据为准"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:14:08Z"
         }
       ]
     },

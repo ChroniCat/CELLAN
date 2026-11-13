@@ -1,5 +1,17 @@
 # 三项待办：实现方案（v1.47，已全部实现）
 
+> **历史方案，非当前需求单。** 本文所有“还没做/现在算不了”都是 v1.47 提案当时的状态；
+> 三项后来均已实现。当前状态如下，代码与验收以表中链接为准：
+>
+> | 项 | 当前状态 | 实现/证据 |
+> |---|---|---|
+> | 跨工作簿引用 | 已实现 | `crates/core/src/xlinks.rs`；C11 切片与 Excel COM 回读 |
+> | 单元格级修订跟踪 | 已实现 | 修订日志与 `txn_end` 撤回；C23 切片 |
+> | 命名视图 | 已实现 | `ui_prefs` 视图保存/恢复；验收见对应切片 |
+>
+> 当前总清单与每项状态：[implementation-progress.json](excel-wps-audit-2026-11-12/implementation-progress.json)；
+> 旧审计快照说明：[revision-traceability.md](excel-wps-audit-2026-11-12/revision-traceability.md)。
+
 > 实现见 `docs/native-rewrite.md` 的 v1.47 一节；本文保留当时的实测与设计。
 
 > 正文的“还没做”指当时提案状态。当前任务请以 [2026-11-12 Excel 与 WPS 对标审查](excel-wps-audit-2026-11-12/README.md) 为准，避免重复实现已有能力。

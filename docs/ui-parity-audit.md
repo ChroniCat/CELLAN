@@ -2,7 +2,10 @@
 
 > 历史快照：本文控件计数及部分“缺失/不做”结论已被后续实现改变，不能作为当前需求或兼容完成率。当前基线 `df48672` 的实测差距、任务优先级与验收见 [2026-11-12 三方对标审查](excel-wps-audit-2026-11-12/README.md)。下文保留原记录。
 
-> Excel UI Automation 实测：9 个页签共 257 个控件；当前同名/同 screentip 90 个，缺 167 个。
+> Excel UI Automation 实测：9 个页签共 257 个控件。**90/257 是本文初次快照**；
+> 同一轮收尾实测为 123/257（见 `docs/native-rewrite.md` 第四十轮，2026-11-12），
+> 两者都不是当前完成率。当前状态只认
+> [implementation-progress.json](excel-wps-audit-2026-11-12/implementation-progress.json) 与源码实测。
 
 > ✅ = 有对应控件（行为仍需核对）；❌ = 缺；⛔ 见文末。
 
