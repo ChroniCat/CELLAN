@@ -199,7 +199,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
             Some(other) => (other.display().parse::<f64>().ok(), true),
         };
         // 先建立分组标签，再决定是否纳值。否则某个标签下的值全为空时，
-        // 整行/整列会从结果里消失（Excel 仍保留标签并显示 Count=0）。
+        // 整行/整列会从结果里消失（Excel 仍保留标签，全空组的 Count 显示空白）。
         let entry = data.entry(key).or_default().entry(col_key).or_default();
         if spec.agg == Agg::Count {
             if nonempty {
@@ -348,7 +348,7 @@ mod tests {
         s.set(3, 0, Cell { value: Value::Text("A".into()), formula: None });
         // B4 故意留空：Count 不应把空格算成 0
         s.set(4, 0, Cell { value: Value::Text("B".into()), formula: None });
-        // B5 也留空：B 组整组无值，但标签必须保留，Count=0
+        // B5 也留空：B 组整组无值，但标签必须保留，Count 显示空白
         let spec = PivotSpec {
             source: (0, 0, 4, 1),
             row_field: 0,
