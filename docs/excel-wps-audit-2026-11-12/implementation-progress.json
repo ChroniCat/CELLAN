@@ -1265,12 +1265,13 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
       ],
       "not_done": [
-        "QA-02.1 尚未完全收口；QA-02.2/QA-02.3 未开始。"
+        "QA-02.1 待监督复核；vba_source 仍缺真实样本。",
+        "QA-02.2/02.3 证据已写入，未获监督验收。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "继续 QA-02.1 剩余 vba/app 夹具，再进入 QA-02.2/QA-02.3。",
-      "updated_utc": "2026-11-13T20:16:00Z",
+      "next": "等待/接受 QA-02 复核；同时继续下一可执行任务（QA-03.2/03.3）。",
+      "updated_utc": "2026-11-13T20:22:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1377,17 +1378,37 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/tests/conditional_format.rs",
+            "crates/core/tests/data_validation.rs",
+            "crates/core/tests/pdf_export.rs",
+            "crates/core/tests/pivot_file.rs",
+            "crates/core/tests/pivot_real.rs",
+            "crates/core/tests/refs_structural.rs",
+            "crates/core/tests/sort_filter.rs",
+            "crates/core/tests/format_edit.rs",
+            "crates/core/tests/style_merge.rs",
+            "crates/core/tests/table_object.rs",
+            "crates/app/tests/ui_regression.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0",
+            "cargo test -p app --offline --test ui_regression -> 20 passed, 0 failed, 0 ignored",
+            "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
+          ],
+          "not_done": [
+            "vba_source 仍缺真实 OLE VBA 样本；8 个 core ignored 是生成器/COM/辅助进程，不是日常夹具。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "监督复核 QA-02.2 的对象/输出夹具证据；无新增测试改写。",
+          "updated_utc": "2026-11-13T20:22:00Z"
         },
         {
           "id": "QA-02.3",
@@ -1395,17 +1416,26 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-ledger.md"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -> 9 ignored listed with reason/owner/unlock",
+            "cargo test -p app --offline --test ui_regression -> 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-ledger.md"
+          ],
+          "not_done": [
+            "9 个 ignored 中 1 个 vba 真实样本仍未解锁；其余 8 个按 optional/COM/helper 分类。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "监督复核 ledger；提供 VBA 样本后才去 ignore。",
+          "updated_utc": "2026-11-13T20:22:00Z"
         }
       ]
     },
