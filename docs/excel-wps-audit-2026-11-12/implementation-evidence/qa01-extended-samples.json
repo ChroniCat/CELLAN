@@ -1,0 +1,60 @@
+{
+  "schema": "qa01-extended-samples-v1",
+  "generated_by": "scripts/qa01_extended_samples.py (openpyxl)",
+  "date_system": "1900",
+  "fixtures": [
+    {
+      "id": "table",
+      "file": "table.xlsx",
+      "sha256": "8760f619e631ecd9355e8f179873de0104a2d5ab5b22646b6947993c2f617769",
+      "sheet": "表格",
+      "expected": {
+        "A1": "姓名",
+        "B1": "部门",
+        "C1": "金额",
+        "A2": "张三",
+        "B2": "研发",
+        "C2": 300,
+        "A6": "钱七",
+        "B6": "销售",
+        "C6": 400
+      },
+      "purpose": "pivot source and chart data"
+    },
+    {
+      "id": "chart",
+      "file": "chart.xlsx",
+      "sha256": "543cc30fd053ee33ab2a364caca55074fb2c82ca81c298ce35c6c8f8e4b42b6c",
+      "sheet": "表格",
+      "expected": {
+        "charts": 1,
+        "chart_title": "按部门金额"
+      },
+      "purpose": "drawing/chart preservation"
+    },
+    {
+      "id": "page",
+      "file": "page.xlsx",
+      "sha256": "a32d8dfe0649dccb98a51615f26f6560e3e5afafa47af47ce36746af70a146e8",
+      "sheet": "页面",
+      "expected": {
+        "landscape": true,
+        "paper": 8,
+        "scale": 85,
+        "gridlines": true,
+        "print_area": [
+          0,
+          0,
+          39,
+          7
+        ],
+        "title_rows": [
+          0,
+          1
+        ]
+      },
+      "purpose": "print/page settings"
+    }
+  ],
+  "notes": "Synthetic files only. Chart fixture contains one bar chart; pivot result is computed from table, not a third-party pivotTable part."
+}

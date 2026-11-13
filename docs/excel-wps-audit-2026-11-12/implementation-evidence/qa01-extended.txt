@@ -1,0 +1,44 @@
+# QA-01.3 图表/透视/打印扩展夹具
+
+日期：2026-11-13（CST）
+状态：实施中。此片只建立并跑通本项目内的对象/打印最小往返；**不代表**
+QA-01 父项的三方 Office 矩阵已完成，也不把透视结果表当成真实 pivotTable 部件。
+
+## 夹具与生成
+
+- 生成器：`scripts/qa01_extended_samples.py`（openpyxl，只写新文件）。
+- 目录：`crates/core/tests/fixtures/qa01_extended/`。
+- `table.xlsx`：`表格`，姓名/部门/金额 5 行；研发 300+200、销售 100+400、行政 50。
+  SHA-256 `8760f619e631ecd9355e8f179873de0104a2d5ab5b22646b6947993c2f617769`。
+- `chart.xlsx`：同一表格 + 一个柱形图，标题「按部门金额」。
+  SHA-256 `543cc30fd053ee33ab2a364caca55074fb2c82ca81c298ce35c6c8f8e4b42b6c`。
+- `page.xlsx`：A1:H40，横向、paperSize=8、85%、网格线、打印区域 A1:H40、
+  顶端标题行 1:2。SHA-256 `a32d8dfe0649dccb98a51615f26f6560e3e5afafa47af47ce36746af70a146e8`。
+- manifest：`implementation-evidence/qa01-extended-samples.json`。
+
+## 实际执行
+
+```text
+cargo test -p sheetcore --offline --test qa01_extended -- --nocapture
+running 3 tests
+chart_object_survives_load_save_reload ... ok
+pivot_computes_and_writes_from_extended_table ... ok
+page_settings_survive_load_and_save ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored
+```
+
+- 图表：load 后 `charts.len()==1`，save 再 load 仍为 1 且标题一致。
+- 透视：由 `table.xlsx` 计算 Sum，断言研发 500、销售 500、行政 50，以及总计行；
+  写 H1 后 save/load 断言表头/首行/金额 500。
+- 打印：load 断言横向、paper=8、scale=85、左边距 0.5、网格线、打印区域
+  `(0,0,39,7)`、标题行 `(0,1)`；save/load 后再核对。
+
+## 未完成
+
+- 尚未用 Excel 16.0 / WPS 12.0 对 chart.xlsx/page.xlsx 做打开、修复提示、
+  二次保存和目视检查；尚未做 Excel/WPS 三方路径。
+- 透视目前是 `pivot::compute`/`write_to` 的结果表，不是带 pivotCache/
+  pivotTable 部件的真实透视对象；该类别不能据此记通过。
+- `.xls/.xlsm`、图片、命名区域、外链、表格对象、CF/DV 的扩展夹具不在本片。
+
+本片保持实施中，等待父项后续补三方矩阵和真实 pivot 部件后再验收。

@@ -1014,7 +1014,12 @@
         "crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx",
         "crates/core/tests/fixtures/qa01/qa01_edit_min.xlsx",
         "crates/core/examples/qa01_roundtrip.rs",
-        "scripts/qa01_roundtrip.py"
+        "scripts/qa01_roundtrip.py",
+        "scripts/qa01_extended_samples.py",
+        "crates/core/tests/qa01_extended.rs",
+        "crates/core/tests/fixtures/qa01_extended/table.xlsx",
+        "crates/core/tests/fixtures/qa01_extended/chart.xlsx",
+        "crates/core/tests/fixtures/qa01_extended/page.xlsx"
       ],
       "commits": [
         "fd91c28",
@@ -1025,14 +1030,17 @@
         "python scripts/qa01_min_oracle.py --fixture crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx --out docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json -> Excel 16.0 / WPS 12.0 values match",
         "cargo test -p sheetcore --offline --test qa01_min_formula -> 2 passed / 0 failed / 0 ignored",
         "cargo run -p sheetcore --offline --example qa01_roundtrip -- <fixture> <output> -> exit 0",
-        "python scripts/qa01_roundtrip.py --fixture ... --manifest ... --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 3 paths, 0 differences"
+        "python scripts/qa01_roundtrip.py --fixture ... --manifest ... --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 3 paths, 0 differences",
+        "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.json"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.json",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-samples.json"
       ],
       "not_done": [
         "仅覆盖最小 .xlsx 公式样本；.xls/.xlsm、图表/图片/透视/打印/命名区域/隐藏冻结/外链等类别的 runner 尚未建立。",
@@ -1040,8 +1048,8 @@
       ],
       "failures": [],
       "blocker": "",
-      "next": "QA-01.1/01.2 已落盘待验收；继续 QA-01.3 扩展类别，父项保持实施中。",
-      "updated_utc": "2026-11-13T19:32:00Z",
+      "next": "QA-01.3 继续补三方 Office 矩阵/真实 pivot；父项未完成。",
+      "updated_utc": "2026-11-13T19:42:00Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1121,17 +1129,32 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "scripts/qa01_extended_samples.py",
+            "crates/core/tests/qa01_extended.rs",
+            "crates/core/tests/fixtures/qa01_extended/table.xlsx",
+            "crates/core/tests/fixtures/qa01_extended/chart.xlsx",
+            "crates/core/tests/fixtures/qa01_extended/page.xlsx"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-samples.json"
+          ],
+          "not_done": [
+            "尚未做 Excel/WPS 打开、修复提示、二次保存、目视检查。",
+            "透视仅为 compute/write_to 结果表，不是真实 pivotCache/pivotTable 部件。",
+            "未覆盖 .xls/.xlsm、图片、命名区域、外链、表格对象、CF/DV。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补 Excel/WPS 三方打开与真实 pivotTable 夹具；再判断本片可否转待验收。",
+          "updated_utc": "2026-11-13T19:42:00Z"
         }
       ]
     },
