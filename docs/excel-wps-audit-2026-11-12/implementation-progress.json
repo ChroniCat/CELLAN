@@ -3873,7 +3873,9 @@
       "status": "实施中",
       "acceptance": "边框方向已修并专项通过；格式对话框混合样式/未改属性保留仍未实施，父项不提前验收。",
       "files": [],
-      "commits": [],
+      "commits": [
+        "2745438"
+      ],
       "commands": [],
       "evidence": [],
       "not_done": [],
@@ -3896,7 +3898,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "2745438"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app ribbon_border_commands_follow_left_right_top_bottom_order -> 1 passed",
             "cargo test -p app --offline --bin app -> 214 passed / 0 failed / 0 ignored"
