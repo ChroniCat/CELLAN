@@ -1,13 +1,18 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；代码修复 `5fd9ea3`（UI-09/08 四项）、`5e3c4e8`（UI-15.1 自定义格式），文档记录提交 `f17bde8`；C11 父项已验收；UI-09 父项仍待真机复核。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 4 实施中 / 34 待实施；
-  切片 35 已验收 / 28 待验收 / 85 待实施。C11 父项已按用户 14:00 认可翻绿。
-- 当前测试真值（15:14 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
-  app **218 passed / 0 failed / 0 ignored**，APP_EXIT=0。UI-08 混合值、UI-15.1 自定义格式已用
-  SC_SHOT 抓真实 framebuffer；真实鼠标/Office 目视仍待。
-- 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
-  C10.2 live 按用户要求保留。
+- 分支 `main`（`origin/main`）；最近代码修复 `745e1ab`（混合字段明确选择、UI-15 三段格式、
+  UI-16 每表视图/标签菜单），上一轮四项修复 `5fd9ea3` 已由用户认可关闭。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 5 实施中 / 33 待实施；
+  切片 35 已验收 / 29 待验收 / 84 待实施。父项计数仍为 13/61，未提前翻绿。
+- 当前测试真值（15:28 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
+  app **223 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+- 15:21 用户要求补的两项已实现：混合字段明确选择等于活动值也提交（FmtTouched）；
+  UI-15 正/负/零三段预览、保存 reload 后逐格预览一致，数值 framebuffer
+  `implementation-evidence/ui15-three-sections.png`。
+- UI-16 新增每表 identity 视图状态、Ctrl+Page/标签统一入口、移动/复制目标、隐藏/取消隐藏、
+  30 表搜索；三项专项通过，真实 GUI/Office 目视未做，保持待验收。
+- 当前未完成：真实鼠标/Office 目视（UI-08.2/15.1/16.1 等）；UI-16.1 已待验收；
+  UI-15.2/15.3、C22/UI-05/UI-06 及原队列继续。C10.2 live 按用户要求保留。
 
 ## 12:35 当前：11:38 UTF-8 回归修复
 

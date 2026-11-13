@@ -18,3 +18,17 @@ UI-15.1 自定义数字格式与当前值预览（2026-11-13 15:12 CST）
 未完成
 - 真实鼠标在输入框键入、取消/Esc、Excel/WPS 保存重开目视未做。
 - UI-15.1 标待验收；UI-15 父项实施中，不因专项通过提前验收。
+
+## 15:28 正/负/零三段与重开渲染
+- 新增 custom_format_three_sections_preview_and_reload：
+  A1=1234.5、A2=-1234.5、A3=0，格式
+  #,##0.00;[Red](#,##0.00);"-"；逐格断言当前值预览为
+  1,234.50 / (1,234.50) / -。
+- 保存 xlsx 后重新 load，再逐格打开格式对话框；格式串仍为三段式，
+  预览与重开后渲染一致（A1 1,234.50、A2 (1,234.50)、A3 -）。
+- 真实 framebuffer 用合成工作簿 ui15_three_gui.xlsx 打开：
+  A1 显示 1,234.50、A2 红色 (1,234.50)、A3 显示 -；打开 A2 格式对话框，
+  “示例”和“当前值”均为 (1,234.50)。证据
+  implementation-evidence/ui15-three-sections.png。
+- 专项 1 passed；全量 app 223 passed / 0 failed / 0 ignored，APP_EXIT=0。
+- 真实鼠标键入、取消/Esc、Excel/WPS 保存重开目视仍未做；UI-15.1 保持待验收。

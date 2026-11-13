@@ -41,3 +41,15 @@ UI-08.2 格式对话框只提交改动字段与混合值（2026-11-13 14:54 CST�
   数字格式功能区显示活动格 0.00；这证明混合值进入真实 UI，不只是单元测试。
 - 证据：implementation-evidence/ui08-format-mixed.png。
 - 仍未做真实鼠标切字体/边框页、确定/取消/Esc，以及 Excel/WPS 目视；UI-08 父项不翻绿。
+
+## 15:28 混合字段明确选择
+- FmtTouched 记录用户实际动过的字段；字体下拉、字号、粗斜体、颜色、填充、
+  水平/垂直对齐、方向、换行、缩进、数字格式和边框分别记录。
+- apply_format_dialog 的 want_* 改为“值变化 OR 用户动过该字段”；未动字段
+  继续沿用原值，显式选择等于活动格原值时也写入整个选区。混合标签在该字段被
+  用户动过后不再显示“混合”，直接显示用户选择。
+- 回归 mixed_field_explicit_choice_equal_to_active_value_is_applied：
+  A1 宋体/0、A2 黑体/0.00；打开显示两项混合；明确选回“宋体”和“0”后确定，
+  A2 也变为宋体/0，A1 保持宋体/0。
+- full app 223 passed / 0 failed / 0 ignored，APP_EXIT=0。
+- 真实鼠标在字体/数字下拉选择等 Office 目视仍未做；UI-08.2 保持待验收。

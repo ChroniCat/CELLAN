@@ -3877,7 +3877,8 @@
         "2745438",
         "fb2b55d",
         "f97377a",
-        "5fd9ea3"
+        "5fd9ea3",
+        "745e1ab"
       ],
       "commands": [],
       "evidence": [],
@@ -3885,7 +3886,7 @@
       "failures": [],
       "blocker": "",
       "next": "实现 UI-08.2 格式草稿 dirty/mixed 与 UI-08.3 一次事务，再实测 Excel/WPS。",
-      "updated_utc": "2026-11-13T07:01:45Z",
+      "updated_utc": "2026-11-13T07:30:19Z",
       "slices": [
         {
           "id": "UI-08.1",
@@ -3927,30 +3928,33 @@
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "fmt_orig 逐字段 diff，只提交变化属性；未改直接确定不重写；边框仅在开关变化时整组提交；混合选区各字段显示混合，两格只改数字格式后各自字体颜色保留。专项 1 passed，全量 app 215。 15:04 实机 framebuffer 选中 A1:A2 打开格式对话框，数字页格式/示例显示“混合”。",
+          "acceptance": "fmt_orig 逐字段 diff，只提交变化属性；未改直接确定不重写；边框仅在开关变化时整组提交；混合选区各字段显示混合，两格只改数字格式后各自字体颜色保留。专项 1 passed，全量 app 215。 15:04 实机 framebuffer 选中 A1:A2 打开格式对话框，数字页格式/示例显示“混合”。 15:28 FmtTouched 明确选择等于活动值也应用（宋体/数字格式回归），full app 223。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
             "fb2b55d",
-            "f97377a"
+            "f97377a",
+            "745e1ab"
           ],
           "commands": [
             "cargo test -p app --offline --bin app format_dialog_preserves_unchanged_fields_and_mixed_cell_styles -> 1 passed",
-            "cargo test -p app --offline --bin app -> 215 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app mixed_field_explicit_choice_equal_to_active_value_is_applied -> 1 passed",
+            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-mixed.png"
           ],
           "not_done": [
-            "真实鼠标确定/取消/Esc、混合项显示截图与 Excel/WPS 目视未做"
+            "真实鼠标确定/取消/Esc 与 Office 目视未做",
+            "混合字段显式选择只做了状态层回归；真实下拉点击取证未做"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补混合值显示和真实鼠标/Office 目视，再做 UI-08.3 一次事务与撤销。",
-          "updated_utc": "2026-11-13T07:06:30Z"
+          "next": "补真实鼠标下拉选择、确定/取消/Esc 与 Excel/WPS 目视。",
+          "updated_utc": "2026-11-13T07:30:19Z"
         },
         {
           "id": "UI-08.3",
@@ -4531,7 +4535,8 @@
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "5e3c4e8"
+        "5e3c4e8",
+        "745e1ab"
       ],
       "commands": [],
       "evidence": [
@@ -4545,7 +4550,7 @@
       "failures": [],
       "blocker": "",
       "next": "继续 UI-15.2 填充/保护页与 UI-15.3 双下划线/竖排。",
-      "updated_utc": "2026-11-13T07:13:30Z",
+      "updated_utc": "2026-11-13T07:30:19Z",
       "slices": [
         {
           "id": "UI-15.1",
@@ -4554,29 +4559,33 @@
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "数字页提供自定义格式输入与当前值/示例预览；活动值 -1234.5 在 #,##0.00;[Red](#,##0.00);- 下预览 (1,234.50)；确定后样式写回，保存 xlsx 重开保留；专项 1 passed，全量 app 218。",
+          "acceptance": "数字页提供自定义格式输入与当前值/示例预览；活动值 -1234.5 在 #,##0.00;[Red](#,##0.00);- 下预览 (1,234.50)；确定后样式写回，保存 xlsx 重开保留；专项 1 passed，全量 app 218。 15:28 新增正/负/零三段预览与 save/reload 后逐格预览一致，数值 framebuffer 已取证，full app 223。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "5e3c4e8"
+            "5e3c4e8",
+            "745e1ab"
           ],
           "commands": [
             "cargo test -p app --offline --bin app custom_format_previews_active_cell_value -> 1 passed",
-            "cargo test -p app --offline --bin app -> 218 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app custom_format_three_sections_preview_and_reload -> 1 passed",
+            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-three-sections.png"
           ],
           "not_done": [
-            "真实鼠标在格式输入框键入、取消/Esc、Excel/WPS 保存重开目视未做"
+            "真实鼠标在格式输入框键入、取消/Esc、Excel/WPS 保存重开目视未做",
+            "三段值已由测试与数值 framebuffer 覆盖；不等于 Office 实机验收"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补真实鼠标与 Office 目视，再评估 UI-15 父项。",
-          "updated_utc": "2026-11-13T07:13:30Z"
+          "next": "补真实鼠标输入/Esc 与 Excel/WPS 目视，再评估 UI-15.1。",
+          "updated_utc": "2026-11-13T07:30:19Z"
         },
         {
           "id": "UI-15.2",
@@ -4627,17 +4636,32 @@
       "scope": "app/main.rs SheetViewState/切表",
       "source": "ui-requirements.md",
       "heading": "UI-16 工作表切换状态与标签管理",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
-      "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "status": "实施中",
+      "acceptance": "每表按 identity 保存/恢复 sel、sel_end、extra_sel、scroll、zoom；标签点击、Ctrl+Page 及查找/超链接/撤销等跳转统一走切换入口；标签右键菜单含移动/复制目标、隐藏/取消隐藏、工作表列表搜索；专项已通过，真实 GUI/Office 目视未做。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
+      "commits": [
+        "745e1ab"
+      ],
+      "commands": [
+        "cargo test -p app --offline --bin app sheet_view_state_is_restored_by_stable_identity -> 1 passed",
+        "cargo test -p app --offline --bin app sheet_list_search_finds_one_of_thirty_sheets -> 1 passed",
+        "cargo test -p app --offline --bin app sheet_move_and_copy_targets_preserve_active_identity -> 1 passed",
+        "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
+      ],
+      "not_done": [
+        "真实鼠标点击标签、右键菜单各入口、移动/复制对话框、30 表列表滚动未取证",
+        "Excel/WPS 实际切表后视图保持对比未做"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
+      "updated_utc": "2026-11-13T07:30:19Z",
       "slices": [
         {
           "id": "UI-16.1",
@@ -4645,17 +4669,32 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "待验收",
+          "acceptance": "SheetViewState 按 identity 保存/恢复选区、extra_sel、滚动、缩放；Ctrl+Page 与标签入口统一；30 表搜索、移动/复制目标、隐藏/取消隐藏菜单已实现；三项专项通过，full app 223。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "745e1ab"
+          ],
+          "commands": [
+            "cargo test -p app --offline --bin app sheet_view_state_is_restored_by_stable_identity -> 1 passed",
+            "cargo test -p app --offline --bin app sheet_list_search_finds_one_of_thirty_sheets -> 1 passed",
+            "cargo test -p app --offline --bin app sheet_move_and_copy_targets_preserve_active_identity -> 1 passed",
+            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
+          ],
+          "not_done": [
+            "真实鼠标点击标签、右键菜单各入口、移动/复制对话框、30 表列表滚动未取证",
+            "Excel/WPS 实际切表后视图保持对比未做"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
+          "updated_utc": "2026-11-13T07:30:19Z"
         }
       ]
     },
