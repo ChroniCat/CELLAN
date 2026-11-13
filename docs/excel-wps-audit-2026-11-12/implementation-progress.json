@@ -3959,7 +3959,7 @@
       "failures": [],
       "blocker": "",
       "next": "UI-09.1/09.2 待真机复核；继续 UI-09.3 区域内 Tab/Enter 与隐藏行列边界。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "updated_utc": "2026-11-13T06:37:15Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -3968,7 +3968,7 @@
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "Ctrl+B/I/U 通过既有 Ribbon 样式命令作用到当前选区；Ctrl+A 第一次当前区域、第二次全表；Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 请求名称框焦点。专项 1 passed，全量 app 212 passed。",
+          "acceptance": "Ctrl+B/I/U 通过既有 Ribbon 样式命令作用到当前选区；Ctrl+A 第一次当前区域、第二次全表且替换旧多选区；Ctrl+Space/Shift+Space 按当前选择跨度选整列/整行并清 extra_sel；F5/Ctrl+G 请求名称框焦点。专项覆盖多行/多列/远端旧块；全量 app 212 passed。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -3990,7 +3990,7 @@
           "failures": [],
           "blocker": "",
           "next": "补 F4/Shift+F10/F6 或按依赖转 UI-09.3；先做真实键鼠名称框焦点。",
-          "updated_utc": "2026-11-13T07:28:00Z"
+          "updated_utc": "2026-11-13T06:37:15Z"
         },
         {
           "id": "UI-09.2",
@@ -3999,7 +3999,7 @@
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "PageUp/Down 按视口可见行数（含一行重叠）翻页并跳过隐藏行；1080p 步长大于 720p；最大行不越界；Ctrl+PageUp/Down 切可见表且不改单元格。专项 1 passed，全量 app 211 passed。",
+          "acceptance": "PageUp/PageDown 按真实视口可见行数翻页，活动格到新视口首/末行且 scroll 同步，不落隐藏行；首末连续隐藏时停最近可见行；Ctrl+PageUp/PageDown 切可见表、跳过隐藏表、不改单元格。专项独立断言首/末可见行与 scroll；全量 app 212 passed。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -4009,19 +4009,19 @@
           ],
           "commands": [
             "cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet -> 1 passed",
-            "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt"
           ],
           "not_done": [
-            "720/1080 真机键盘与滚动重叠视觉未复验",
-            "Ctrl+Page 与每表选区状态（UI-16）未合并"
+            "720/1080 真机窗口真实键盘与滚轮视觉重叠未做",
+            "Ctrl+PageUp 与 UI-16 每表选区合并未做"
           ],
           "failures": [],
           "blocker": "",
-          "next": "真机窗口用 PageUp/Down 和 Ctrl+Page 复核，随后做 UI-09.1 基本选择/格式快捷键。",
-          "updated_utc": "2026-11-13T07:08:00Z"
+          "next": "真机 720/1080 键盘复核；与 UI-16 每表选区合并后再评估父项。",
+          "updated_utc": "2026-11-13T06:37:15Z"
         },
         {
           "id": "UI-09.3",

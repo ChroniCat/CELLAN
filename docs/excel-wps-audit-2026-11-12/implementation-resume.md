@@ -447,3 +447,14 @@
   回落仍未做，UI-10 保持待验收。
 - 已按实际系统时间修正 ui09-page-viewport (14:25)、ui09-shortcuts (14:28)、
   ui18-filter-clear (14:21)、ui10 (14:13/14:30) 的时间标注。
+
+## 14:37 当前：UI-09 三处缺口修复
+
+- page_move 同步 scroll：PageDown 把新首行放到视口顶部，PageUp 放到视口底部；
+  测试用独立可见行窗口断言首/末行与 scroll，旧实现 scroll=2 的缺陷已被检出。
+- next_visible_row 边界隐藏时停最近可见行；首端 0/1、末端 1048574/1048575
+  连续隐藏回归通过。
+- Ctrl+A / Ctrl+Space / Shift+Space 按选择跨度选取并清 extra_sel：A1:B2 -> 1:2 行，
+  C3:D5 -> C:D 列，远端旧多选块不再残留。
+- 专项两 test 各 1 passed；全量 app **212 passed / 0 failed / 0 ignored**。
+  UI-09.1/09.2 仍待验收，等真机键盘/名称框焦点与滚轮视觉。

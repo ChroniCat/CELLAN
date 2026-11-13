@@ -6878,36 +6878,68 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         n.max(1)
     }
 
-    /// 下一个可见行/列，跳过隐藏（尺寸为 0）的行/列；到边界则停住。
+    /// 下一个可见行/列，跳过隐藏（尺寸为 0）的行/列。
+    /// 到首/末边界且边界本身隐藏时，停在该方向最近的可见行；只有全表都隐藏才返回原值。
     fn next_visible_row(&self, from: u32, down: bool) -> u32 {
+        const MAX_ROW: u32 = 1_048_575;
         let (_, rows) = self.view_axes();
+        let visible = |r: u32| rows.size(r) > 0.0;
         let mut r = from;
-        let mut guard = 0u32;
-        loop {
-            if down {
-                if r >= 1_048_575 { return r; }
+        if down {
+            while r < MAX_ROW {
                 r += 1;
-            } else {
-                if r == 0 { return r; }
-                r -= 1;
+                if visible(r) {
+                    return r;
+                }
             }
-            guard += 1;
-            if rows.size(r) > 0.0 || guard >= 1_048_576 {
-                return r;
+            if visible(from) {
+                return from;
+            }
+            // 下方没有可见行：回退到最近的可见行，绝不停在隐藏的末行。
+            for r in (0..from).rev() {
+                if visible(r) {
+                    return r;
+                }
+            }
+        } else {
+            while r > 0 {
+                r -= 1;
+                if visible(r) {
+                    return r;
+                }
+            }
+            if visible(from) {
+                return from;
+            }
+            // 上方没有可见行：前进到最近的可见行，绝不停在隐藏的首行。
+            for r in (from + 1)..=MAX_ROW {
+                if visible(r) {
+                    return r;
+                }
             }
         }
+        from
     }
 
     /// PageUp/PageDown：按当前视口可见行数翻页，保留一行重叠；不落到隐藏行。
+    /// 视口本身也翻一页：向下时把新活动格放到视口顶部，向上时放到视口底部。
     fn page_move(&mut self, down: bool) {
         let step = self.visible_page_rows().saturating_sub(1).max(1);
         let (mut r, c) = self.sel;
         for _ in 0..step {
             r = self.next_visible_row(r, down);
         }
+        let (_, rows) = self.view_axes();
+        let view_h = (self.last_view.y - HEAD_H).max(44.0);
+        let top = rows.pos(r);
+        self.scroll.y = if down {
+            top
+        } else {
+            (top + rows.size(r) - view_h).max(0.0)
+        };
         self.sel = (r, c);
         self.sel_end = (r, c);
-        self.ensure_visible();
+        self.extra_sel.clear();
     }
 
     /// Ctrl+PageUp/PageDown：在当前文档内切换可见工作表，跳过隐藏表。
@@ -6938,6 +6970,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let (r1, c1, r2, c2) =
             sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), self.sel.0, self.sel.1);
         let already = self.sel == (r1, c1) && self.sel_end == (r2, c2);
+        self.extra_sel.clear();
         if already {
             self.sel = (0, 0);
             self.sel_end = (1_048_575, 16_383);
@@ -6952,19 +6985,29 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     fn select_whole_row(&mut self) {
-        let r = self.sel.0;
-        self.sel = (r, 0);
-        self.sel_end = (r, 16_383);
+        let (r1, _, r2, _) = self.sel_rect();
+        self.extra_sel.clear();
+        self.sel = (r1, 0);
+        self.sel_end = (r2, 16_383);
         self.ensure_visible();
-        self.status = format!("已选择第 {} 行", r + 1);
+        self.status = if r1 == r2 {
+            format!("已选择第 {} 行", r1 + 1)
+        } else {
+            format!("已选择第 {}–{} 行", r1 + 1, r2 + 1)
+        };
     }
 
     fn select_whole_col(&mut self) {
-        let c = self.sel.1;
-        self.sel = (0, c);
-        self.sel_end = (1_048_575, c);
+        let (_, c1, _, c2) = self.sel_rect();
+        self.extra_sel.clear();
+        self.sel = (0, c1);
+        self.sel_end = (1_048_575, c2);
         self.ensure_visible();
-        self.status = format!("已选择 {} 列", col_label(c));
+        self.status = if c1 == c2 {
+            format!("已选择 {} 列", col_label(c1))
+        } else {
+            format!("已选择 {}–{} 列", col_label(c1), col_label(c2))
+        };
     }
 
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑

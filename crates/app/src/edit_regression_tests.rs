@@ -14,6 +14,29 @@ fn text(s: &str) -> Cell {
     Cell { value: Value::Text(s.into()), formula: None }
 }
 
+/// 测试侧独立读取视口内的首/末可见行；不复用 page_move/visible_page_rows 的落点计算。
+fn visible_row_window(app: &SheetApp) -> (u32, u32) {
+    let (_, rows) = app.view_axes();
+    let view_h = (app.last_view.y - HEAD_H).max(44.0);
+    let top = app.scroll.y;
+    let mut first = rows.index_at(top);
+    while first < 1_048_575 && rows.size(first) <= 0.0 {
+        first += 1;
+    }
+    let mut last = first;
+    let mut r = first;
+    while r <= 1_048_575 {
+        if rows.pos(r) >= top + view_h {
+            break;
+        }
+        if rows.size(r) > 0.0 {
+            last = r;
+        }
+        r += 1;
+    }
+    (first, last)
+}
+
 fn formula(text: &str) -> Cell {
     Cell { value: Value::Empty, formula: Some(text.into()) }
 }
@@ -866,17 +889,42 @@ fn common_selection_and_format_shortcuts_work() {
 
     app.sel = (0, 0);
     app.sel_end = (0, 0);
+    app.extra_sel = vec![(10, 10, 11, 11)];
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::A)]);
     assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 1)), "第一次 Ctrl+A 选当前区域");
+    assert!(app.extra_sel.is_empty(), "Ctrl+A 必须替换旧多选区");
+    app.extra_sel = vec![(10, 10, 11, 11)];
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::A)]);
     assert_eq!((app.sel, app.sel_end), ((0, 0), (1_048_575, 16_383)), "第二次 Ctrl+A 选全表");
+    assert!(app.extra_sel.is_empty(), "第二次 Ctrl+A 也必须清旧多选区");
 
+    // A1:B2 的整行选择必须覆盖两行，而不是只取活动格所在的第 1 行。
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.extra_sel = vec![(20, 20, 21, 21)];
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Space, true)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 16_383)), "Shift+Space 应按选区跨两行");
+    assert!(app.extra_sel.is_empty(), "整行选择必须替换旧多选区");
+
+    // C3:D5 的整列选择必须覆盖 C:D 两列。
+    app.sel = (2, 2);
+    app.sel_end = (4, 3);
+    app.extra_sel = vec![(30, 30, 31, 31)];
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::Space)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 2), (1_048_575, 3)), "Ctrl+Space 应按选区跨两列");
+    assert!(app.extra_sel.is_empty(), "整列选择必须替换旧多选区");
+
+    // 单格仍保持原来的整行/整列语义。
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
     app.sel = (1, 1);
     app.sel_end = (1, 1);
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::Space)]);
-    assert_eq!((app.sel, app.sel_end), ((0, 1), (1_048_575, 1)), "Ctrl+Space 选整列");
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (1_048_575, 1)), "Ctrl+Space 单格选整列");
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Space, true)]);
-    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 16_383)), "Shift+Space 选整行");
+    assert_eq!((app.sel, app.sel_end), ((1, 0), (1, 16_383)), "Shift+Space 单格选整行");
 
     app.name_focus_request = false;
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::F5, false)]);
@@ -893,38 +941,56 @@ fn page_keys_follow_viewport_and_ctrl_page_switches_sheet() {
     app.wb.sheet_mut(0).set(0, 0, text("keep"));
     app.wb.sheets.push(sheetcore::Sheet::new("Second"));
     app.wb.sheet_mut(1).set(0, 0, number(99.0));
+    app.wb.sheet_mut(0).rows.set_default(19.0);
     app.last_view = egui::vec2(1000.0, 720.0);
     app.scroll = egui::Vec2::ZERO;
     app.sel = (0, 0);
     app.sel_end = (0, 0);
 
-    // 720p：隐藏第 2/3 行，翻页必须跳过，而不是落到不可见格。
+    // 720p：隐藏第 2/3 行；PageDown 后活动格应到新视口首行，
+    // 视口本身翻一页并保留一行重叠，而不是只把 scroll.y 挪 2px。
     app.wb.sheet_mut(0).rows.set(1, 0.0);
     app.wb.sheet_mut(0).rows.set(2, 0.0);
-    let n720 = app.visible_page_rows();
-    let mut expected720 = 0u32;
-    for _ in 0..n720.saturating_sub(1) {
-        expected720 = app.next_visible_row(expected720, true);
-    }
+    let (first0, last0) = visible_row_window(&app);
+    assert_eq!(first0, 0);
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
-    assert_eq!(app.sel.0, expected720, "PageDown 应按视口行数而不是固定 20 行");
+    let (first1, last1) = visible_row_window(&app);
+    assert_eq!(first1, last0, "新视口首行必须是旧视口末行（一行重叠）");
+    assert_eq!(app.sel.0, first1, "活动格应落在新视口首行");
+    assert!(last1 > last0, "视口必须真的向下翻页");
     assert!(app.sel.0 >= 3, "隐藏行 1/2 不能成为落点");
+    let row_top = app.view_axes().1.pos(app.sel.0);
+    assert!((app.scroll.y - row_top).abs() < 0.5, "scroll.y={} 应到新首行位置 {}", app.scroll.y, row_top);
+    assert!(app.scroll.y > 100.0, "从第 0 行翻页不能只滚动 2px");
 
-    // 1080p：可见行更多，翻页步长应随之增大。
+    // 1080p：可见行更多，翻页目标仍是旧视口末行，scroll 同步到新首行。
     app.sel = (0, 0);
     app.sel_end = (0, 0);
     app.scroll = egui::Vec2::ZERO;
     app.last_view = egui::vec2(1000.0, 1080.0);
-    let n1080 = app.visible_page_rows();
-    assert!(n1080 >= n720, "1080p 可见行数不应少于 720p");
-    let mut expected1080 = 0u32;
-    for _ in 0..n1080.saturating_sub(1) {
-        expected1080 = app.next_visible_row(expected1080, true);
-    }
+    let last720 = last0;
+    let (first1080, last1080) = visible_row_window(&app);
+    assert_eq!(first1080, 0);
+    assert!(last1080 > last720, "1080p 可见行数应多于 720p");
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
-    assert_eq!(app.sel.0, expected1080);
+    let (after_first, after_last) = visible_row_window(&app);
+    assert_eq!(after_first, last1080, "1080p 也保留一行重叠");
+    assert!(after_last > last1080);
+    let row_top1080 = app.view_axes().1.pos(app.sel.0);
+    assert!((app.scroll.y - row_top1080).abs() < 0.5, "1080p scroll 未同步");
 
-    // 到最大行不越界。
+    // 边界连续隐藏：首端停在最近可见行，末端也不落到隐藏的 1048574/1048575。
+    app.wb.sheet_mut(0).rows.set(0, 0.0);
+    app.wb.sheet_mut(0).rows.set(1, 0.0);
+    app.wb.sheet_mut(0).rows.set(2, 19.0);
+    assert_eq!(app.next_visible_row(0, false), 2, "首端隐藏应停最近可见行 2");
+    app.wb.sheet_mut(0).rows.set(1_048_574, 0.0);
+    app.wb.sheet_mut(0).rows.set(1_048_575, 0.0);
+    assert_eq!(app.next_visible_row(1_048_573, true), 1_048_573, "末端隐藏应停最近可见行");
+    assert_eq!(app.next_visible_row(1_048_575, true), 1_048_573, "从隐藏末行向下也要回退到最近可见行");
+
+    // 到最大行不越界（末行可见时仍停在末行）。
+    app.wb.sheet_mut(0).rows.set(1_048_575, 19.0);
     app.sel = (1_048_575, 0);
     app.sel_end = (1_048_575, 0);
     app.scroll = egui::Vec2::ZERO;

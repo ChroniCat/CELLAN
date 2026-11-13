@@ -4,8 +4,10 @@ UI-09.1 常用选择/格式快捷键（2026-11-13 14:28 CST）
 - Ctrl+B/I/U：调用既有 Ribbon Bold/Italic/Underline 命令，走 apply_style 的
   write_preflight→事务→undo，不用测试钩子直接改样式。
 - Ctrl+A：第一次取 current_region 作为选区；在已恰好选中该区域时再按一次选整表
-  （0,0..1048575,16383），状态栏明确提示；避免一次就选全表。
-- Ctrl+Space：整列；Shift+Space：整行；均保留当前行/列。
+  （0,0..1048575,16383），状态栏明确提示；避免一次就选全表。三个选择入口都清
+  extra_sel，旧远端多选块不再参与后续编辑。
+- Ctrl+Space：按当前选择跨度选整列（C3:D5 -> C:D）；Shift+Space：按当前选择跨度
+  选整行（A1:B2 -> 第 1:2 行）；单格时退化为整列/整行。
 - F5 或 Ctrl+G：置 name_focus_request，下一帧把焦点给名称框；名称框现有回车
   goto_name 支持 A1、A1:B2 和定义名称。
 - 新增 name_focus_request 字段与名称框 request_focus 消费点。
@@ -13,7 +15,8 @@ UI-09.1 常用选择/格式快捷键（2026-11-13 14:28 CST）
 验证
 - edit_regression_tests::common_selection_and_format_shortcuts_work：
   Ctrl+B 对 A1:B2 全选加粗、再按取消；Ctrl+I/U 生效；Ctrl+A 第一/第二次分别
-  为当前区域/全表；Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 都置名称框请求。
+  为当前区域/全表且清旧多选块；A1:B2 Shift+Space 得第 1:2 行、C3:D5 Ctrl+Space
+  得 C:D 两列，两者都清远端旧块；单格仍整列/整行；F5/Ctrl+G 都置名称框请求。
 - 命令：cargo test -p app --offline --bin app common_selection_and_format_shortcuts_work
   -> 1 passed。
 - 全量：cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored，
@@ -21,5 +24,6 @@ UI-09.1 常用选择/格式快捷键（2026-11-13 14:28 CST）
 
 未完成
 - 真实窗口按 F5/Ctrl+G 后名称框获得焦点、光标与 Esc 返回网格未做 GUI 取证。
+- 全表格式 200000 的安全拒绝是既有保护，本轮未改为批量格式化；不把它当作卡死。
 - F4（编辑中引用绝对/相对切换）、Shift+F10 右键菜单、F6 窗格循环仍属 UI-09.1
   剩余项，不能因本轮四条快捷键通过就标父项验收。
