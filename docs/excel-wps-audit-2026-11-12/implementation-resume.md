@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `cc3cec5`（C06 D1904 快照修复；C10.1 在前）。
+- 分支 `main`（`origin/main`），HEAD `d6f8c32`（C06 D1904 快照修复与台账；C10.1 在前）。
 - 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 1 实施中 / 41 待实施；
   切片 28 已验收 / 19 待验收 / 101 待实施。
 - 当前测试真值（C06 修改后，09:39 重跑）：core 69 bins / 626 passed / 0 failed / 41 ignored，
