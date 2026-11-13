@@ -25099,7 +25099,9 @@ impl eframe::App for SheetApp {
                 if self.show_start {
                     self.home_page(ui);
                 } else {
-                    if !self.backstage {
+                    if !self.backstage && !self.dialog_modal {
+                        // 对话框打开/本帧刚由 Enter 关闭时，键盘不能落到网格；
+                        // 否则焦点在关闭按钮上按 Enter 会同时激活按钮并推进选区。
                         self.handle_keys(ctx);
                     }
                     self.draw_grid(ui, ctx);

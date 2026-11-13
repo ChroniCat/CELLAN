@@ -5631,6 +5631,41 @@ fn cross_sheet_undo_clears_restored_extra_selection() {
     );
 }
 
+/// 真实 egui 焦点链：Tab 到关闭按钮后单个 Enter 关闭，同一 Enter 不能推进选区；
+/// 下一帧键盘输入应回到网格。
+#[test]
+fn enter_on_focused_dialog_close_does_not_advance_selection() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(1, 1, text("old"));
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    app.find = FindState {
+        open: true,
+        tab: 1,
+        find: "alpha".into(),
+        replace: "beta".into(),
+        ..Default::default()
+    };
+
+    // 先让真实 update() 画出对话框；对话框标题决定关闭按钮的 Id。
+    ui_frame(&mut app, &ctx, vec![]);
+    let close_id = egui::Id::new(("dlgwin", "查找与替换")).with("close");
+    ctx.memory_mut(|m| m.request_focus(close_id));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert!(!app.find.open, "焦点在关闭按钮时 Enter 必须关闭对话框");
+    assert_eq!(app.sel, (1, 1), "关闭对话框的同一个 Enter 不能推进选区");
+
+    // 下一帧：输入 9 并按 Enter 应正常进入 B2 并提交，而不是被隐藏焦点吞掉。
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("9".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(
+        app.wb.sheet(0).value(1, 1),
+        Value::Number(9.0),
+        "关闭后的下一帧键盘输入必须回到网格"
+    );
+}
+
 /// 模态对话框存在时，关闭按钮同帧的点击不能穿透到网格选中背后的单元格。
 #[test]
 fn modal_dialog_click_does_not_select_grid_behind() {
