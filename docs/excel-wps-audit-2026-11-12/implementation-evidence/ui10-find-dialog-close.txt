@@ -150,3 +150,13 @@ if !self.backstage && !self.dialog_modal {
 - core 仍为 679 passed / 0 failed / 41 ignored；build glow EXIT=0。
 - 代码提交：`14b36af fix: consume dialog-closing Enter before grid navigation`；
   `af71be7 test: assert focused dialog close button holds keyboard focus`（测试内断言焦点确实在关闭按钮 Id 上）。
+
+## 17:xx 用户最终确认（UI-10 父项已验收）
+
+- 用户确认原 UI-10 父项验收通过，独立通过增至 **14/61**。
+- 依据：`14b36af` 关闭帧隔离 `handle_keys`；`af71be7` 真实关闭控件 focus 断言；
+  完整 update 单 Enter 保持 B2、次帧 `9` 正常；负向移除门禁 NEG 101（B3 vs B2）；
+  recheck/final/app 232/build 全通过；结合 `649828c`/`65e1932` 的实际 Ctrl+H、
+  关闭、×、Esc、历史回归、`8`+Enter、B3/B4、保存 SHA 完整链。
+- 用户明确不再追加物理 Tab 遍历或 Office 对话框矩阵；本文件中的旧“待验收”措辞
+  均为历史记录，当前状态为已验收。

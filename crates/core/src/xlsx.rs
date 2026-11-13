@@ -416,9 +416,14 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     let is_cfb = std::fs::read(path)
         .map(|b| b.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]))
         .unwrap_or(false);
+    let manual_hidden = crate::patch::read_manual_hidden(path);
     let mut wb = Workbook {
         load_incomplete: false,
-        names: crate::patch::read_defined_names(path),
+        names: {
+            let mut names = crate::patch::read_defined_names(path);
+            names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
+            names
+        },
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
         sources: crate::external::read_sources(path),
         links: crate::xlinks::read(path),
@@ -762,7 +767,20 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     sheet.filter = lay.filter.clone();
                 }
                 if let Some(f) = &sheet.filter {
-                    sheet.hidden_rows = f.hidden_rows(sheet);
+                    let fh = f.hidden_rows(sheet);
+                    // 文件里 row hidden 既可能来自手动隐藏，也可能来自筛选。
+                    // 先把筛选能解释的行从手动集合移出，否则关闭筛选时
+                    // union 会把它们永久当成手动隐藏。同时存在手动和筛选重叠的行
+                    // 无法从 OOXML 区分，这里按筛选隐藏处理；清除/关闭筛选时该行恢复。
+                    for r in &fh {
+                        sheet.hidden_rows_user.remove(r);
+                    }
+                    sheet.hidden_rows = fh;
+                }
+                if let Some(map) = &manual_hidden {
+                    // 本应用保存的手动隐藏行来源：它明确区分了
+                    // 筛选隐藏与手动隐藏，包括两者重叠的行，不再靠猜 hidden 。
+                    sheet.hidden_rows_user = map.get(&sheet.name).cloned().unwrap_or_default();
                 }
             }
         }
@@ -2207,6 +2225,29 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     must_save!("layout", crate::patch::apply_layout(path, wb));
+    // 手动隐藏行来源写成隐藏 definedName，同时被筛选
+    // 遮蔽的 overlap 行也能在重开后继续保留手动身份。
+    let manual_hidden: std::collections::BTreeMap<String, Vec<u32>> = wb
+        .sheets
+        .iter()
+        .filter(|s| !s.hidden_rows_user.is_empty())
+        .map(|s| {
+            let mut rows: Vec<u32> = s.hidden_rows_user.iter().copied().collect();
+            rows.sort_unstable();
+            (s.name.clone(), rows)
+        })
+        .collect();
+    must_save!(
+        "manual-hidden",
+        crate::patch::write_manual_hidden(path, &manual_hidden)
+    );
+    // 关闭筛选后清掉 workbook.xml 的 _FilterDatabase：这一步必须在
+    // restore_workbook_skeleton 之后，否则会被基准工作簿骨架再度带回。
+    for sheet in &wb.sheets {
+        if sheet.filter_dirty && sheet.filter.is_none() && sheet.tables.is_empty() {
+            must_save!("filter-database", crate::patch::remove_filter_database(path, &sheet.name));
+        }
+    }
     must_save!("outline", crate::patch::apply_outline_pr(path, wb));
     must_save!("scenarios", crate::patch::apply_scenarios(path, wb));
     must_save!("ignored-errors", crate::patch::apply_ignored_errors(path, wb));
@@ -2328,7 +2369,14 @@ fn apply_cf_patch(
                         sheet.freeze,
                         sheet.freeze_dirty,
                         af,
-                        sheet.hidden_rows.clone(),
+                        {
+                            // 屏蔽行两种来源必须合并：筛选条件命中的 hidden_rows
+                            // 和用户手动隐藏的 hidden_rows_user。关闭筛选时只清 hidden_rows，
+                            // 不能把手动隐藏的行一起抹掉。
+                            let mut hidden = sheet.hidden_rows.clone();
+                            hidden.extend(sheet.hidden_rows_user.iter().copied());
+                            hidden
+                        },
                         sheet.filter_dirty,
                         sheet.page.clone(),
                         sheet.page_dirty,
@@ -2472,6 +2520,285 @@ mod tests {
             Some((0, 0, 2, 1)),
             "表格自带筛选，载入后应有漏斗"
         );
+    }
+
+    /// UI-18：关闭筛选后保留手动隐藏行，并清掉 _FilterDatabase。
+    #[test]
+    fn disable_filter_keeps_manual_hidden_rows_and_removes_filter_name() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("disable_filter_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        let sheet_name = wb.sheets[0].name.clone();
+        {
+            let sh = &mut wb.sheets[0];
+            sh.set(0, 0, Cell { value: Value::Text("Name".into()), formula: None });
+            sh.set(0, 1, Cell { value: Value::Text("Amount".into()), formula: None });
+            sh.set(1, 0, Cell { value: Value::Text("A".into()), formula: None });
+            sh.set(1, 1, Cell { value: Value::Number(10.0), formula: None });
+            sh.set(2, 0, Cell { value: Value::Text("B".into()), formula: None });
+            sh.set(2, 1, Cell { value: Value::Number(20.0), formula: None });
+            sh.set(3, 0, Cell { value: Value::Text("C".into()), formula: None });
+            sh.set(3, 1, Cell { value: Value::Number(30.0), formula: None });
+            let mut f = crate::sort_filter::Filter::new(0, 0, 3, 1);
+            f.criteria.insert(
+                1,
+                crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "15"),
+            );
+            sh.hidden_rows = f.hidden_rows(sh);
+            sh.hidden_rows_user.insert(2);
+            sh.filter = Some(f);
+            sh.filter_dirty = true;
+        }
+        save(&path, &wb).expect("base save");
+        // 模拟 Excel 留下的内部名称；umya 不会自己创造它。
+        crate::patch::rewrite_zip(&path, |n, buf| {
+            if n != "xl/workbook.xml" {
+                return buf;
+            }
+            let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+            let name = format!(
+                "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">'{sheet_name}'!$A$1:$B$4</definedName>"
+            );
+            if let Some(i) = xml.find("</definedNames>") {
+                let mut out = xml;
+                out.insert_str(i, &name);
+                out.into_bytes()
+            } else if let Some(i) = xml.find("</sheets>") {
+                let mut out = xml;
+                out.insert_str(i + "</sheets>".len(), &format!("<definedNames>{name}</definedNames>"));
+                out.into_bytes()
+            } else {
+                xml.into_bytes()
+            }
+        })
+        .expect("inject filter database");
+        let mut back = load(&path).expect("load base");
+        assert!(back.sheets[0].filter.is_some());
+        assert!(back.sheets[0].hidden_rows_user.contains(&2));
+        {
+            let sh = &mut back.sheets[0];
+            sh.filter = None;
+            sh.hidden_rows.clear();
+            sh.filter_dirty = true;
+        }
+        save(&path, &back).expect("disable save");
+        let reloaded = load(&path).expect("reload");
+        assert!(reloaded.sheets[0].filter.is_none(), "filter must be removed");
+        assert!(reloaded.sheets[0].hidden_rows_user.contains(&2), "manual hidden row must survive");
+        assert!(!reloaded.sheets[0].hidden_rows_user.contains(&1), "filter-hidden row2 must not become manual");
+        assert!(!reloaded.sheets[0].hidden_rows.contains(&1));
+        assert!(!reloaded.sheets[0].hidden_rows.contains(&2));
+        let sheet_xml = crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        let row_tag = |n: u32| {
+            sheet_xml
+                .split(&format!("<row r=\"{n}\""))
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .unwrap_or("")
+        };
+        assert!(!row_tag(2).contains("hidden=\"1\""), "row2 must be visible after disabling filter");
+        assert!(row_tag(3).contains("hidden=\"1\""), "row3 manual hidden must remain");
+        let wb_xml = crate::fixups::read_part_file(&path, "xl/workbook.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        assert!(!wb_xml.contains("_xlnm._FilterDatabase"), "filter database name must be removed");
+    }
+
+    #[test]
+    fn clear_filter_restores_filter_hidden_and_keeps_manual_hidden() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("clear_filter_source_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        {
+            let sh = &mut wb.sheets[0];
+            sh.set(0, 0, Cell { value: Value::Text("Name".into()), formula: None });
+            sh.set(0, 1, Cell { value: Value::Text("Amount".into()), formula: None });
+            sh.set(1, 0, Cell { value: Value::Text("A".into()), formula: None });
+            sh.set(1, 1, Cell { value: Value::Number(10.0), formula: None });
+            sh.set(2, 0, Cell { value: Value::Text("B".into()), formula: None });
+            sh.set(2, 1, Cell { value: Value::Number(20.0), formula: None });
+            sh.set(3, 0, Cell { value: Value::Text("C".into()), formula: None });
+            sh.set(3, 1, Cell { value: Value::Number(30.0), formula: None });
+            let mut f = crate::sort_filter::Filter::new(0, 0, 3, 1);
+            f.criteria.insert(
+                1,
+                crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "15"),
+            );
+            sh.hidden_rows = f.hidden_rows(sh);
+            sh.hidden_rows_user.insert(2);
+            sh.filter = Some(f);
+            sh.filter_dirty = true;
+        }
+        save(&path, &wb).expect("base save");
+        let mut back = load(&path).expect("load base");
+        assert!(!back.sheets[0].hidden_rows_user.contains(&1));
+        assert!(back.sheets[0].hidden_rows.contains(&1));
+        {
+            let sh = &mut back.sheets[0];
+            let f = sh.filter.as_mut().expect("filter");
+            f.allows.clear();
+            f.criteria.clear();
+            sh.hidden_rows.clear();
+            sh.filter_dirty = true;
+        }
+        save(&path, &back).expect("clear save");
+        let reloaded = load(&path).expect("reload");
+        let sh = &reloaded.sheets[0];
+        assert!(sh.filter.is_some(), "clear keeps filter arrows");
+        assert!(!sh.hidden_rows_user.contains(&1));
+        assert!(sh.hidden_rows_user.contains(&2), "manual row survives clear");
+        assert!(sh.hidden_rows.is_empty());
+        let xml = crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        assert!(xml.contains("<autoFilter"), "autoFilter must stay after clear");
+        let row_tag = |n: u32| {
+            xml.split(&format!("<row r=\"{n}\""))
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .unwrap_or("")
+        };
+        assert!(!row_tag(2).contains("hidden=\"1\""), "filter-hidden row restores");
+        assert!(row_tag(3).contains("hidden=\"1\""), "manual hidden row stays");
+    }
+
+    #[test]
+    fn remove_filter_database_matches_escaped_sheet_name_and_keeps_other() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("filter_db_escape_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "A&B".into();
+        wb.sheets.push(Sheet::new("Other"));
+        save(&path, &wb).expect("base save");
+        crate::patch::rewrite_zip(&path, |n, buf| {
+            if n != "xl/workbook.xml" {
+                return buf;
+            }
+            let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+            let names = concat!(
+                "<definedNames>",
+                "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">'A&amp;B'!$A$1:$B$4</definedName>",
+                "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"1\" hidden=\"1\">'Other'!$A$1:$B$4</definedName>",
+                "</definedNames>"
+            );
+            if let Some(i) = xml.find("</sheets>") {
+                let mut out = xml;
+                out.insert_str(i + "</sheets>".len(), names);
+                out.into_bytes()
+            } else {
+                xml.into_bytes()
+            }
+        })
+        .expect("inject names");
+        crate::patch::remove_filter_database(&path, "A&B").expect("remove filter database");
+        let xml = crate::fixups::read_part_file(&path, "xl/workbook.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        assert_eq!(xml.matches("_xlnm._FilterDatabase").count(), 1, "only other sheet keeps its filter name");
+        assert!(xml.contains("'Other'!$A$1:$B$4"), "other sheet must remain");
+        assert!(!xml.contains("'A&amp;B'!$A$1:$B$4"), "escaped target reference must be removed");
+    }
+
+    #[test]
+    fn manual_filter_overlap_survives_save_load_clear_and_disable() {
+        let dir = std::env::temp_dir().join("sheets_native_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("manual_filter_overlap_{}.xlsx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut wb = Workbook::new_blank();
+        {
+            let sh = &mut wb.sheets[0];
+            sh.set(0, 0, Cell { value: Value::Text("Name".into()), formula: None });
+            sh.set(0, 1, Cell { value: Value::Text("Amount".into()), formula: None });
+            sh.set(1, 0, Cell { value: Value::Text("A".into()), formula: None });
+            sh.set(1, 1, Cell { value: Value::Number(100.0), formula: None });
+            sh.set(2, 0, Cell { value: Value::Text("B".into()), formula: None });
+            sh.set(2, 1, Cell { value: Value::Number(200.0), formula: None });
+            sh.set(3, 0, Cell { value: Value::Text("C".into()), formula: None });
+            sh.set(3, 1, Cell { value: Value::Number(300.0), formula: None });
+            sh.set(4, 0, Cell { value: Value::Text("D".into()), formula: None });
+            sh.set(4, 1, Cell { value: Value::Number(50.0), formula: None });
+            let mut f = crate::sort_filter::Filter::new(0, 0, 4, 1);
+            f.criteria.insert(
+                1,
+                crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "150"),
+            );
+            sh.hidden_rows = f.hidden_rows(sh);
+            // row1 既手动隐藏又被筛选隐藏（overlap），row2 只手动隐藏，row4 只筛选隐藏。
+            sh.hidden_rows_user.insert(1);
+            sh.hidden_rows_user.insert(2);
+            sh.filter = Some(f);
+            sh.filter_dirty = true;
+        }
+        save(&path, &wb).expect("base save");
+        assert!(
+            crate::patch::read_manual_hidden(&path).is_some(),
+            "app save must persist manual hidden source"
+        );
+        // 反向：把本应用的来源去掉，只剩 OOXML row hidden 时，overlap
+        // 不能再被识别为 manual，证明上面测试依赖来源元数据而非偶然。
+        let legacy = dir.join(format!("manual_filter_overlap_legacy_{}.xlsx", std::process::id()));
+        std::fs::copy(&path, &legacy).expect("copy legacy");
+        crate::patch::write_manual_hidden(&legacy, &std::collections::BTreeMap::new())
+            .expect("strip metadata");
+        let legacy_wb = load(&legacy).expect("load legacy");
+        assert!(!legacy_wb.sheets[0].hidden_rows_user.contains(&1));
+        assert!(legacy_wb.sheets[0].hidden_rows.contains(&1));
+        let mut back = load(&path).expect("load base");
+        assert!(back.sheets[0].hidden_rows_user.contains(&1), "overlap manual source survives load");
+        assert!(back.sheets[0].hidden_rows_user.contains(&2), "manual-only source survives load");
+        assert!(back.sheets[0].hidden_rows.contains(&1));
+        assert!(back.sheets[0].hidden_rows.contains(&4));
+        assert!(!back.sheets[0].hidden_rows_user.contains(&4), "filter-only row is not manual");
+        {
+            let sh = &mut back.sheets[0];
+            let f = sh.filter.as_mut().expect("filter");
+            f.allows.clear();
+            f.criteria.clear();
+            sh.hidden_rows.clear();
+            sh.filter_dirty = true;
+        }
+        save(&path, &back).expect("clear save");
+        let cleared = load(&path).expect("reload cleared");
+        let sh = &cleared.sheets[0];
+        assert!(sh.filter.is_some(), "clear keeps filter");
+        assert!(sh.hidden_rows_user.contains(&1), "overlap manual row stays after clear");
+        assert!(sh.hidden_rows_user.contains(&2), "manual row stays after clear");
+        assert!(!sh.hidden_rows_user.contains(&4), "filter-only row stays non-manual");
+        assert!(sh.hidden_rows.is_empty());
+        let xml = crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap();
+        let row_tag = |n: u32| {
+            xml.split(&format!("<row r=\"{n}\""))
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .unwrap_or("")
+        };
+        assert!(row_tag(2).contains("hidden=\"1\""), "overlap row stays hidden");
+        assert!(row_tag(3).contains("hidden=\"1\""), "manual row stays hidden");
+        assert!(!row_tag(5).contains("hidden=\"1\""), "filter-only row restores after clear");
+        {
+            let mut disabled = cleared.clone();
+            let sh = &mut disabled.sheets[0];
+            sh.filter = None;
+            sh.hidden_rows.clear();
+            sh.filter_dirty = true;
+            save(&path, &disabled).expect("disable save");
+            let reloaded = load(&path).expect("reload disabled");
+            assert!(reloaded.sheets[0].filter.is_none());
+            assert!(reloaded.sheets[0].hidden_rows_user.contains(&1));
+            assert!(reloaded.sheets[0].hidden_rows_user.contains(&2));
+            assert!(!reloaded.sheets[0].hidden_rows_user.contains(&4));
+        }
     }
 
     #[test]

@@ -3,15 +3,14 @@
 - 分支 `main`（`origin/main`）；当前代码检查点 `af71be7`（查找对话框关闭穿透/焦点/残余 Enter 修复与焦点断言）。
   之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
   UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
-- 台账（`python scripts/audit_progress.py counts`）：任务 13 已验收 / 10 待验收 /
-  5 实施中 / 33 待实施；切片 35 已验收 / 30 待验收 / 83 待实施。父项 13/61 未变。
+- 台账（`python scripts/audit_progress.py counts`）：任务 **14 已验收** / 9 待验收 /
+  5 实施中 / 33 待实施；切片 **36 已验收** / 29 待验收 / 83 待实施。父项 **14/61**。
 - 当前测试真值（17:30 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **232 passed / 0 failed / 0 ignored**，APP_EXIT=0；
   `cargo build -p app --offline --no-default-features --features glow` 成功。
-- UI-10 真实键鼠完整链通过：B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载
-  B2/A3/B4/C3 不变；同时修掉关闭按钮点击穿透（modal 网格门禁）、关闭后隐藏查找框
-  吞键盘焦点（`stop_text_input`）与焦点在关闭按钮时单 Enter 同帧推进选区（`handle_keys` 门禁）。截图/xlsx 见 `ui10-find-dialog-close.txt` 17:05 节；
-  用户复核后可申请父项验收，不扩大到其他父项。
+- UI-10 已验收（第 14 项）：用户确认 `14b36af`/`af71be7` 关闭帧隔离与 focus 回归，
+  加上 `649828c`/`65e1932` 真实键鼠链；不再追加物理 Tab/Office 矩阵。截图/xlsx 见
+  `ui10-find-dialog-close.txt`。
 - 15:47 监督三处 UI-16 入口已修：
   1. `copy_sheet_to` 插入前按 identity 保存视图，插入后按 identity 恢复原索引再切副本；
      复制到前方/同位均保留原 B/C 的 sel/extra_sel/scroll/zoom。
@@ -24,9 +23,11 @@
   的回归在修复前失败、修复后 1 passed（930ff80）；全量 app 230；截图
   `ui15-fill-protection-fill.png` / `ui15-fill-protection-lock.png`；真实鼠标/Office、
   逐格保护执行语义仍待验收。
-- 当前未完成：UI-16.1 真实 GUI/Office；UI-15.1/15.2 真实鼠标与 Office；UI-15.3
-  双下划线/竖排；其余原队列。下一步先安排一组已登记 GUI/Office 收敛（UI-10/UI-18），
-  再继续 UI-15.3。
+- UI-18 真实条件/清除/关闭 GUI 已获 18:10 局部认可；18:34–18:57 进一步确认
+  实际持久化 bug（旧件 row2 filter-only 被写回 hidden、FilterDatabase 残留）并补齐
+  手动来源持久化（`_sc_manual_hidden`）/overlap 回归，待监督复核。
+- 当前未完成：UI-16.1 真实 GUI/Office；UI-15.1/15.2 真实鼠标与 Office；
+  UI-15.3 双下划线/竖排仍为待实施（早期尝试未保留）。
 
 ## 12:35 当前：11:38 UTF-8 回归修复
 
@@ -517,3 +518,27 @@
 - 15:12 UI-15.1：格式对话框增加自定义格式输入与“当前值”预览，活动值真实渲染；
   自定义格式保存 xlsx 重开保留；专项 1 passed，全量 218；实机 framebuffer 已截。
   UI-15.1 待验收，UI-15 父项实施中。
+
+## 19:06 当前：UI-18 持久化来源闭环（待复核）
+
+- 真实保存触发已确认：`[save] 已保存 .../ui18_gui_fixed.xlsx`，mtime
+  `2026-11-13 18:33:54.832679700 +0800`，size 5753，SHA-256
+  `b29147710880c950cefc6be57cb4a43e51fcad4d94f4cf0f4f518e82f1e039c2`；
+  不是 unverifiable/仅星号变化。
+- 问题根因：load 把所有 `<row hidden>` 放进 `hidden_rows_user`，同时算
+  `filter.hidden_rows`，保存 union 后 filter-only 行被永久当 manual；关闭筛选
+  还残留 `_xlnm._FilterDatabase`。旧件 `disable_filter_30268.xlsx` 的 row2/row3
+  XML 都 hidden=1（row2 仅 filter），已作为 bug 留证。
+- 修复：本应用保存时把手动行写入 `workbook.xml` 的隐藏 definedName
+  `_sc_manual_hidden`（hidden=1，hex JSON）；load 读取存在来源时用它恢复
+  `hidden_rows_user`，overlap 行保留 manual，filter-only 行只进 `hidden_rows`；
+  第三方无来源文件仍按 row hidden 推断，不能保证未知 overlap 历史。
+  关闭筛选改为在 `restore_workbook_skeleton` 后清 `_xlnm._FilterDatabase`，
+  并用 `xml_unescape` 匹配 A&B 等转义表名。
+- 回归：`manual_filter_overlap_survives_save_load_clear_and_disable` 1 passed
+  （overlap/manual/filter-only 同测，clear+disable 两段）；旧 `disable`/`clear`
+  非重叠回归各 1 passed；`A&B` + Other 名称保留 1 passed。
+- 真实保存件仍筛选启用（A/B，C 行筛选隐藏）；关闭筛选完整 GUI 序列化证据以
+  18:10 三图 + 旧/新 XML 对照为准，不重做已认可三图。
+- 当前 core lib 271 passed；core 全量 75 bins / 683 passed / 0 failed / 41 ignored；
+  app 232 passed / 0 failed / 0 ignored。UI-18 仍待监督复核，台账 14/61 不变。

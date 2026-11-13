@@ -819,6 +819,162 @@ pub fn insert_auto_filter(xml: &str, af: &str) -> String {
     out
 }
 
+/// 本应用用来保存“手动隐藏行”来源的隐藏定义名。
+/// 第三方 OOXML 只有 row hidden，无法区分手动与筛选；本应用保存的文件
+/// 可以恢复手动行，包括同时被筛选遮住的 overlap 行。
+pub const MANUAL_HIDDEN_NAME: &str = "_sc_manual_hidden";
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)? as u8;
+        let lo = (bytes[i + 1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// 读本应用写入的手动隐藏行来源；无定义名时返回 None。
+pub fn read_manual_hidden(
+    path: &Path,
+) -> Option<std::collections::HashMap<String, std::collections::HashSet<u32>>> {
+    let (_, _, text) = read_defined_names(path)
+        .into_iter()
+        .find(|(name, _, _)| name == MANUAL_HIDDEN_NAME)?;
+    let text = text.trim().trim_start_matches('=').trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(text);
+    let hex = text.strip_prefix("SCMH1:")?;
+    let bytes = hex_decode(hex)?;
+    let map: std::collections::BTreeMap<String, Vec<u32>> = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        map.into_iter()
+            .map(|(sheet, rows)| (sheet, rows.into_iter().collect()))
+            .collect(),
+    )
+}
+
+/// 写入手动隐藏行来源；空表则删除来源定义名。
+/// 使用隐藏的工作簿级 definedName；内容用 hex 包装，避免表名和 JSON 字符串影响 definedName 语法。
+pub fn write_manual_hidden(
+    path: &Path,
+    map: &std::collections::BTreeMap<String, Vec<u32>>,
+) -> Result<()> {
+    let text = if map.is_empty() {
+        String::new()
+    } else {
+        let bytes = serde_json::to_vec(map)?;
+        format!("\"SCMH1:{}\"", hex_encode(&bytes))
+    };
+    rewrite_zip(path, |n, buf| {
+        if n != "xl/workbook.xml" {
+            return buf;
+        }
+        let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+        let mut out = String::with_capacity(xml.len() + text.len() + 80);
+        let mut rest = xml.as_str();
+        while let Some(i) = rest.find("<definedName ") {
+            out.push_str(&rest[..i]);
+            let Some(head_end) = rest[i..].find('>').map(|e| i + e) else {
+                out.push_str(&rest[i..]);
+                return out.into_bytes();
+            };
+            let Some(tail) = rest[head_end..]
+                .find("</definedName>")
+                .map(|e| head_end + e)
+            else {
+                out.push_str(&rest[i..]);
+                return out.into_bytes();
+            };
+            let end = tail + "</definedName>".len();
+            if !rest[i..head_end].contains(&format!("name=\"{MANUAL_HIDDEN_NAME}\"")) {
+                out.push_str(&rest[i..end]);
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        if !text.is_empty() {
+            let def = format!(
+                "<definedName name=\"{MANUAL_HIDDEN_NAME}\" hidden=\"1\">{text}</definedName>"
+            );
+            if let Some(i) = out.find("</definedNames>") {
+                out.insert_str(i, &def);
+            } else if let Some((i, tag)) = ["<definedNames/>", "<definedNames />"]
+                .iter()
+                .find_map(|tag| out.find(tag).map(|i| (i, *tag)))
+            {
+                out.replace_range(i..i + tag.len(), &format!("<definedNames>{def}</definedNames>"));
+            } else if let Some(i) = out.find("</sheets>") {
+                out.insert_str(i + "</sheets>".len(), &format!("<definedNames>{def}</definedNames>"));
+            }
+        }
+        out.into_bytes()
+    })
+}
+
+/// 关闭筛选后删除 workbook.xml 中指向该表的 _xlnm._FilterDatabase。
+/// 只删指定工作表，保留其他表的筛选名称和所有其他内置名称。
+pub fn remove_filter_database(path: &Path, sheet_name: &str) -> Result<()> {
+    let quoted = format!("'{}'!", sheet_name.replace('\'', "''"));
+    let plain = format!("{}!", sheet_name);
+    rewrite_zip(path, |n, buf| {
+        if n != "xl/workbook.xml" {
+            return buf;
+        }
+        let Ok(xml) = String::from_utf8(buf.clone()) else {
+            return buf;
+        };
+        let mut out = String::with_capacity(xml.len());
+        let mut rest = xml.as_str();
+        while let Some(i) = rest.find("<definedName ") {
+            out.push_str(&rest[..i]);
+            let Some(head_end) = rest[i..].find('>').map(|e| i + e) else {
+                out.push_str(&rest[i..]);
+                return out.into_bytes();
+            };
+            let Some(tail) = rest[head_end..]
+                .find("</definedName>")
+                .map(|e| head_end + e)
+            else {
+                out.push_str(&rest[i..]);
+                return out.into_bytes();
+            };
+            let end = tail + "</definedName>".len();
+            let head = &rest[i..head_end];
+            let text = &rest[head_end + 1..tail];
+            let is_filter = head.contains("name=\"_xlnm._FilterDatabase\"");
+            // workbook.xml 里的工作表引用是 XML 转义后的（如 A&amp;B），
+            // 不能拿原始 sheet_name 直接 starts_with，否则含 & / < / > 的表名删不掉。
+            let decoded = crate::model::xml_unescape(text);
+            let is_sheet = decoded.starts_with(&quoted) || decoded.starts_with(&plain);
+            if !(is_filter && is_sheet) {
+                out.push_str(&rest[i..end]);
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out.into_bytes()
+    })
+}
+
 /// 给 <row r="N"> 加/去 hidden 属性
 pub fn set_hidden_rows(xml: &str, hidden: &std::collections::HashSet<u32>) -> String {
     let mut out = String::with_capacity(xml.len() + hidden.len() * 12);
@@ -2346,9 +2502,9 @@ pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyh
         let mut rows: Vec<(u32, Option<f32>, bool)> = s
             .rows
             .entries()
-            .map(|(r, h)| (*r, Some(*h), s.hidden_rows_user.contains(r)))
+            .map(|(r, h)| (*r, Some(*h), s.hidden_rows_user.contains(r) || s.hidden_rows.contains(r)))
             .collect();
-        for r in s.hidden_rows_user.iter() {
+        for r in s.hidden_rows_user.iter().chain(s.hidden_rows.iter()) {
             if !rows.iter().any(|(x, _, _)| x == r) {
                 rows.push((*r, None, true));
             }

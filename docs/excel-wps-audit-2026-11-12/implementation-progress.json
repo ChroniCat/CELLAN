@@ -4122,8 +4122,8 @@
       "scope": "app/main.rs find_dialog/name_manager",
       "source": "ui-requirements.md",
       "heading": "UI-10 查找对话框按钮和默认页签",
-      "status": "待验收",
-      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。",
+      "status": "已验收",
+      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。 2026-11-13 17:xx 用户最终确认：原 UI-10 父项验收通过，独立通过 14/61；14b36af 关闭帧隔离 handle_keys、af71be7 真实关闭控件 focus 断言、完整 update 单 Enter 保持 B2/次帧 9 正常，NEG 101 复现 B3 vs B2，recheck/final/app/build 均通过；结合 649828c/65e1932 历史链，不再追加物理 Tab 或 Office 对话框矩阵。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
@@ -4167,12 +4167,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-chain-after.xlsx"
       ],
       "not_done": [
-        "Excel/WPS 同位置视觉对比尚未做；当前 GUI 证据为本机 app framebuffer/窗口 capture。"
+        "历史记录（用户 2026-11-13 明确不追加）：物理 Tab 遍历与 Office 对话框矩阵未单独取证；已由真实 egui 关闭按钮 focus + 单 Enter 回归覆盖。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-      "updated_utc": "2026-11-13T09:35:00Z",
+      "next": "已验收（第 14 项）；不重开。",
+      "updated_utc": "2026-11-13T09:50:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4180,8 +4180,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-10 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。",
+          "status": "已验收",
+          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。 2026-11-13 17:xx 用户最终确认：原 UI-10 父项验收通过，独立通过 14/61；14b36af 关闭帧隔离 handle_keys、af71be7 真实关闭控件 focus 断言、完整 update 单 Enter 保持 B2/次帧 9 正常，NEG 101 复现 B3 vs B2，recheck/final/app/build 均通过；结合 649828c/65e1932 历史链，不再追加物理 Tab 或 Office 对话框矩阵。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -4220,12 +4220,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-chain-after.xlsx"
           ],
           "not_done": [
-            "Excel/WPS 同位置视觉对比尚未做；当前 GUI 证据为本机 app framebuffer/窗口 capture。"
+            "历史记录（用户 2026-11-13 明确不追加）：物理 Tab 遍历与 Office 对话框矩阵未单独取证；已由真实 egui 关闭按钮 focus + 单 Enter 回归覆盖。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-          "updated_utc": "2026-11-13T09:35:00Z"
+          "next": "已验收（第 14 项）；不重开。",
+          "updated_utc": "2026-11-13T09:50:00Z"
         }
       ]
     },
@@ -4869,11 +4869,13 @@
       "source": "ui-requirements.md",
       "heading": "UI-18 筛选清除入口语义一致",
       "status": "待验收",
-      "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”，hidden_rows_user 手动隐藏行始终保留。两条专项断言覆盖入口与 xlsx save/load；全量 app 210 passed。 filter_clear_survives_save_reload 的临时路径改用 current_exe().parent()，并行全量通过。",
+      "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。",
       "files": [
+        "crates/app/src/edit_regression_tests.rs",
         "crates/app/src/main.rs",
         "crates/app/src/ribbon/actions.rs",
-        "crates/app/src/edit_regression_tests.rs"
+        "crates/core/src/patch.rs",
+        "crates/core/src/xlsx.rs"
       ],
       "commits": [
         "56f5a80",
@@ -4883,20 +4885,31 @@
         "cargo test -p app --offline --bin app filter_clear -> 2 passed",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --lib manual_filter_overlap_survives_save_load_clear_and_disable -> 1 passed",
+        "cargo test -p sheetcore --offline --lib disable_filter_keeps_manual_hidden_rows_and_removes_filter_name -> 1 passed",
+        "cargo test -p sheetcore --offline --lib clear_filter_restores_filter_hidden_and_keeps_manual_hidden -> 1 passed",
+        "cargo test -p sheetcore --offline --lib remove_filter_database_matches_escaped_sheet_name_and_keeps_other -> 1 passed",
+        "cargo test -p sheetcore --offline --lib -> 271 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-bug-row2-row3.xlsx",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-fixed-row2-visible.xlsx",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-overlap-source.xlsx",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-db-escape.xlsx"
       ],
       "not_done": [
-        "真实鼠标点击三个菜单入口未取得可验证效果（本轮 capture 成功但点击返回 screen unchanged）",
-        "真实 Excel/WPS 打开保存后的 xlsx 目视箭头未做"
+        "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。",
+        "等待监督复核 UI-18 父项；不自行记为已验收。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-      "updated_utc": "2026-11-13T08:25:00Z",
+      "next": "等待监督复核；全量 core 结果补入。",
+      "updated_utc": "2026-11-13T19:13:05Z",
       "slices": [
         {
           "id": "UI-18.1",
@@ -4905,11 +4918,13 @@
           "acceptance_source": "ui-requirements.md / UI-18 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”，hidden_rows_user 手动隐藏行始终保留。两条专项断言覆盖入口与 xlsx save/load；全量 app 210 passed。",
+          "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。",
           "files": [
+            "crates/app/src/edit_regression_tests.rs",
             "crates/app/src/main.rs",
             "crates/app/src/ribbon/actions.rs",
-            "crates/app/src/edit_regression_tests.rs"
+            "crates/core/src/patch.rs",
+            "crates/core/src/xlsx.rs"
           ],
           "commits": [
             "56f5a80",
@@ -4917,20 +4932,33 @@
           ],
           "commands": [
             "cargo test -p app --offline --bin app filter_clear -> 2 passed",
-            "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
+            "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+            "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --lib manual_filter_overlap_survives_save_load_clear_and_disable -> 1 passed",
+            "cargo test -p sheetcore --offline --lib disable_filter_keeps_manual_hidden_rows_and_removes_filter_name -> 1 passed",
+            "cargo test -p sheetcore --offline --lib clear_filter_restores_filter_hidden_and_keeps_manual_hidden -> 1 passed",
+            "cargo test -p sheetcore --offline --lib remove_filter_database_matches_escaped_sheet_name_and_keeps_other -> 1 passed",
+            "cargo test -p sheetcore --offline --lib -> 271 passed / 0 failed / 0 ignored",
+            "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-bug-row2-row3.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-fixed-row2-visible.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-overlap-source.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-db-escape.xlsx"
           ],
           "not_done": [
-            "真实鼠标点击三个菜单入口未取得可验证效果（本轮 capture 成功但点击返回 screen unchanged）",
-            "真实 Excel/WPS 打开保存后的 xlsx 目视箭头未做"
+            "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。",
+            "等待监督复核 UI-18 父项；不自行记为已验收。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-          "updated_utc": "2026-11-13T08:25:00Z"
+          "next": "等待监督复核；全量 core 结果补入。",
+          "updated_utc": "2026-11-13T19:13:05Z"
         }
       ]
     },
