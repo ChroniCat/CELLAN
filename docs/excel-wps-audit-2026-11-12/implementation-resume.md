@@ -1,5 +1,28 @@
 # 恢复记录
 
+## 2026-11-14 检查点：UI-25 四项缺口、UI-14.3、C15 整块门禁
+
+- 代码 HEAD `8e58657` 已 push；单 cargo `-j 2`，测试 `--test-threads=2`。
+- 台账计数 **24 已验收 / 61**。这是台账计数，不是“监督已认可 24 项”；监督仍在逐项复核。
+- 测试：sheetcore lib **292 passed**；app `--bin app` **287 passed**（本轮曾出现
+  `merges::parses_cols_and_rows`、`xls_write::round_trips_...` 2 个失败，根因是把
+  `col_width_to_px` 全局改成 +5 破坏了既有列宽序列化契约；已回退该全局改动，
+  未通过改断言掩盖，两个测试恢复真实通过）。
+- **UI-25（仍待验收）**：统计覆盖主选区+Ctrl 追加选区；去掉 200k 格硬门槛，大选区
+  按 Store 稀疏格分帧、显示「计算中」；跳过筛选/隐藏行列；mask=0 时「统计 ▾」入口
+  常驻并可复制结果。证据 `implementation-evidence/ui25-stats.txt`。
+  not_done：真实鼠标 Ctrl 多选/右键点选未做；百万行密集选区分帧未压测；
+  手动隐藏+筛选隐藏组合未与 Excel 逐项对拍。
+- **UI-14.3（待验收）**：行高校准到 Excel（R1 42.75pt、R2 14.25pt）；列宽 43.28 vs
+  Excel 41.5（默认字体度量差异，末字符完整，未改换算系数）。
+  证据 `implementation-evidence/ui14-autofit.txt`。
+- **C15（待验收，等复核）**：拖选/Shift+点击/Shift+方向键/Ctrl+点击全部走
+  `rect_sel_blocked` 整块门禁；新增真实指针事件回归。
+  证据 `implementation-evidence/c15-selection-gate.txt`。
+- **C17**：diagonal 污染 fill 的修复与 load/save/reopen 回归已获独立复核认可，本轮未重做。
+- **QA-02**：既有独立 clone 验收已成立，本轮不扩其范围。
+- 仍未关闭：C12.4、QA-01 父项矩阵、UI-19 键盘下拉实证、C15/C17 复核结论。
+
 ## 2026-11-14 检查点：C12、QA-01.3/08、UI-17/25/28 进待验收
 
 - 代码 HEAD `3c7d102` 已 push；台账 **24 已验收 / 61** 不变，新增只进待验收。
