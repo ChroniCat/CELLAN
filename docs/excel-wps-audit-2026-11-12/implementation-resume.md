@@ -1,8 +1,8 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`），HEAD `e81c221`（Ribbon 新会话清快照 + C22 General 对齐已提交）；C11 父项已验收。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；
-  切片 35 已验收 / 19 待验收 / 94 待实施。C11 父项已按用户 14:00 认可翻绿。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 9 待验收 / 1 实施中 / 38 待实施；
+  切片 35 已验收 / 20 待验收 / 93 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
@@ -395,10 +395,18 @@
 - C22：绘制改为 `cell_text_align`，General 文本左、数字右、布尔/错误居中，显式对齐覆盖；
   专项 1 passed。合成工作簿 SC_SHOT 实测 A1 左、B1 右、C1 中、D1 中、E1/F1/G1 显式
   左/中/右；长文本仍按用户偏好默认裁剪，长文本多情况与 Excel 同位置像素对拍未做，C22 待验收。
-- 当前全量：app **207 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
+- 当前全量：app **208 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
   **75 bins / 678 passed / 0 failed / 41 ignored**。
 - 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
 - 已提交：`e81c221`（`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
   resume、c11-final-acceptance、ui05-ribbon-session、c22-general-alignment）。
 - 下一步：提交/推送本批，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
   其余 P0/P1 任务）。
+
+## 14:22 当前：UI-10 查找页签与关闭覆盖
+
+- Ctrl+H 设置 find.tab=1，Ctrl+F 设置 0；仍走 find_open_new_session 清新快照。
+- 查找对话框“关闭”改为局部 close 意图，末尾 open && !close；名称管理器与加载问题窗口
+  的同类末尾覆盖一并修复。
+- 新测试 ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab 通过；全量 app
+  **208 passed / 0 failed / 0 ignored**。真实鼠标关闭/×/Esc 与焦点回落未做，UI-10 待验收。

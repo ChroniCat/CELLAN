@@ -1790,6 +1790,7 @@ impl SheetApp {
             return;
         }
         let mut open = self.show_load_diag;
+        let mut close = false;
         let fatal = diag.problems.iter().filter(|p| p.fatal).count();
         egui::Window::new("加载问题")
             .open(&mut open)
@@ -1825,13 +1826,14 @@ impl SheetApp {
                     if ui.button("另存抢救副本…").clicked() {
                         self.save(true);
                         self.show_load_diag = false;
+                        close = true;
                     }
                     if ui.button("关闭").clicked() {
-                        self.show_load_diag = false;
+                        close = true;
                     }
                 });
             });
-        self.show_load_diag = open;
+        self.show_load_diag = open && !close;
     }
 
     /// 打开密码框：验证后走解密加载
@@ -7004,6 +7006,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if find_k || repl_k {
+            self.find.tab = if repl_k { 1 } else { 0 };
             self.find_open_new_session();
             if repl_k {
                 self.find.replace.clear();
@@ -10486,6 +10489,7 @@ let txn = self.txn_begin(&keys);
             return;
         }
         let mut open = self.name_mgr;
+        let mut close = false;
         let mut del: Option<usize> = None;
         let mut start_edit: Option<usize> = None;
         let mut submit = false;
@@ -10542,11 +10546,11 @@ let txn = self.txn_begin(&keys);
                 ui.weak("引用写法：Sheet1!$A$1:$B$3，或常量 ={\"甲\";\"乙\"}");
                 ui_kit::footer(ui, |ui| {
                     if ui_kit::secondary_button(ui, "关闭").clicked() {
-                        self.name_mgr = false;
+                        close = true;
                     }
                 });
             });
-        self.name_mgr = open;
+        self.name_mgr = open && !close;
         if let Some(i) = start_edit {
             let item = self.wb.names.get(i).cloned();
             if let Some((name, _sheet, refers)) = item {
@@ -16362,6 +16366,7 @@ let txn = self.txn_begin(&keys);
             return;
         }
         let mut open = true;
+        let mut close = false;
         let mut do_find = false;
         let mut do_prev = false;
         let mut do_repl = false;
@@ -16471,7 +16476,7 @@ let txn = self.txn_begin(&keys);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui_kit::secondary_button(ui, "关闭").clicked() {
-                            self.find.open = false;
+                            close = true;
                         }
                         if ui_kit::primary_button(ui, "查找下一个").clicked() {
                             do_find = true;
@@ -16512,7 +16517,7 @@ let txn = self.txn_begin(&keys);
         if cancel_scan {
             self.cancel_find_scan();
         }
-        self.find.open = open;
+        self.find.open = open && !close;
     }
 
     /// “查找全部”结果列表：点击任意一项跳到该格。

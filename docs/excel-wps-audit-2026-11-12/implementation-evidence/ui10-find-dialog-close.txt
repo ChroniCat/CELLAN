@@ -1,0 +1,26 @@
+UI-10 查找对话框按钮与页签（2026-11-13 14:20 CST）
+
+问题
+- Ctrl+H 只走 find_open_new_session，没有设置 find.tab=1，打开后仍停在“查找”页。
+- 查找对话框底部“关闭”按钮在闭包里直接写 self.find.open=false，函数末尾又执行
+  self.find.open = open，把关闭结果覆盖回 true；X/Esc 不会触发这个覆盖，所以只有按钮失效。
+- 名称管理器底部“关闭”同样在闭包里写 self.name_mgr=false，函数末尾 self.name_mgr=open 覆盖。
+- 加载问题窗口“关闭/另存抢救副本”也有同类覆盖。
+
+修改
+- Ctrl+F/Ctrl+H 统一设置 find.tab=0/1，再调用 find_open_new_session。
+- 查找对话框新增局部 close 意图；底部关闭只置 close=true，末尾 self.find.open=open && !close。
+  右上角 X/Esc 由 .open(&mut open) 置 open=false，同样关闭。
+- 名称管理器新增局部 close；末尾 self.name_mgr=open && !close。
+- 加载问题窗口新增局部 close；关闭/另存抢救副本不再被末尾赋值覆盖。
+
+验证
+- 新增 edit_regression_tests::ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab：
+  Ctrl+H 后 open=true、tab=1；Ctrl+F 后 tab=0。
+- 命令：cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab
+  -> 1 passed。
+- 全量：cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored，APP_EXIT=0。
+
+未完成
+- 真实鼠标点“关闭/×”、Esc、重新打开后焦点回网格与残余 Enter 的 GUI 操作未执行；
+  代码路径已修，但 UI-10 保持待验收，不以按钮出现或单测替代真实点击。

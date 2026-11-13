@@ -3451,6 +3451,20 @@ fn find_dialog_and_results_window_render() {
     });
 }
 
+/// UI-10：Ctrl+F/Ctrl+H 必须分别落到“查找/替换”页签，不能总是查找页。
+#[test]
+fn ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.find.open = false;
+    app.find.tab = 0;
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::H)]);
+    assert!(app.find.open, "Ctrl+H 必须打开查找对话框");
+    assert_eq!(app.find.tab, 1, "Ctrl+H 必须直接显示替换页");
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::F)]);
+    assert_eq!(app.find.tab, 0, "Ctrl+F 必须回到查找页");
+}
+
 /// UI-05 安全语义：全部替换必须按命中所在表取文本/格式，不能拿活动表判断。
 /// A!A1=keep 与 B!A1=old 同坐标，B!C3 依赖 B 自己的百分比格式才能命中。
 #[test]
