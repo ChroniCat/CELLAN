@@ -103,9 +103,9 @@ UI-21 真正的手动计算与工作表计算 —— 状态：已验收（2026-1
 
 四、实际 GUI 结果（不是模型注入）
 
-- 用 work/ui21_gui/ui21_mode_fixture.xlsx（A1=5、B1=A1*2 缓存 10、
-  A2=观察、B2=A1+1 缓存 6、calcMode=manual）启动 app，真实窗口见
-  implementation-evidence/ui21-gui/gui-initial-cached-10.png：
+- 用 work/ui21_gui/ui21_gui.xlsx（A1=5、B1=A1*2 缓存 10、
+  A2=观察、B2=A1+1 缓存 6、calcMode=manual；窗口标题即 ui21_gui.xlsx）启动 app，
+  真实窗口见 implementation-evidence/ui21-gui/gui-initial-cached-10.png：
   A1=5、B1=10、B2=6，状态“手动计算”，B1 没有变成 14。
 - 向真实 app 窗口发送 Win32 WM_SETFOCUS + WM_KEYDOWN/WM_CHAR/WM_KEYUP
   （A1 键入 7、Enter），截图
@@ -127,34 +127,37 @@ UI-21 真正的手动计算与工作表计算 —— 状态：已验收（2026-1
 夹具与保存路径：
 - work/ui21_gui/ui21_stale_manual.xlsx：A1=7、B1=A1*2 缓存 10、
   B2=A1+1 缓存 6、calcMode=manual。缓存故意是旧的（B1 应为 14），
-  因此能区分“手动保持旧缓存”和“打开即自动重算”。
+  因此能区分“手动保持旧缓存”和“打开即自动重算”。它与 app_saved_manual*
+  不是同一个文件：后者 A1=5，只用于核对保存后的模式识别。
 - 实时保存代码生成的 app_saved_manual.xlsx、app_saved_manual2.xls
   （SC_SAVE_ASYNC）也用于 Office 打开核对；这是保存代码，不是 SaveAs
-  对话框流程。
+  对话框流程，不能拿它证明旧缓存不重算。
 - 所有模式判断以 Application.Calculation 为准；
   CalculationVersion 不是模式字段，已从检查脚本移除。
 
 Excel 16.0（详见 implementation-evidence/ui21-gui/excel-cycle.txt）：
-- 新实例直接打开 ui21_stale_manual.xlsx：
+- 在同一 Excel Application 实例中打开 ui21_stale_manual.xlsx：
   Calculation=xlCalculationManual，A1=7、B1=10、B2=6；
 - Application.CalculateFull() 后：
   Calculation 仍为 xlCalculationManual，B1=14、B2=8；
-- 另存为 .xls 与 .xlsx，两个文件重新打开：
+- 在同一 Application 实例内另存为 .xls 与 .xlsx，随后重新打开这两个文件：
   Calculation 均为 xlCalculationManual，A1=7、B1=14、B2=8。
 - 另用 app_saved_manual.xlsx / app_saved_manual2.xls 直接打开：
-  Calculation 均为 xlCalculationManual，B1=10、B2=6。
+  Calculation 均为 xlCalculationManual，B1=10、B2=6（这两个文件 A1=5，
+  只核对模式识别，不是上面的陈旧缓存夹具）。
 
 WPS 12.0（详见 implementation-evidence/ui21-gui/wps-cycle.txt）：
-- 新实例直接打开 ui21_stale_manual.xlsx：
+- 在同一 WPS Application 实例中打开 ui21_stale_manual.xlsx：
   Calculation=-4135（xlCalculationManual），A1=7、B1=10、B2=6；
 - CalculateFull() 后：Calculation 仍为 -4135，B1=14、B2=8；
-- 另存为 .xls 与 .xlsx，重新打开：
-  Calculation 均为 -4135，A1=7、B1=14、B2=8；
+- 在同一 Application 实例内另存为 .xls 与 .xlsx，随后重新打开这两个文件：
+  Calculation 均为 -4135，A1=7、B1=14、B2=8。
 - app_saved_manual.xlsx / app_saved_manual2.xls 直接打开：
-  Calculation 均为 -4135，B1=10、B2=6。
+  Calculation 均为 -4135，B1=10、B2=6（同样只核对模式识别）。
 
 结论：Excel/WPS 的“旧缓存保持 → 手动 Calculate 更新 → 另存再打开”
-值/模式闭环已完成，且两套 Office 对 .xlsx 与 .xls 都识别手动模式；
+值/模式闭环已完成（两次 reopen 都在各自同一个 Application 实例内），
+且两套 Office 对 .xlsx 与 .xls 都识别手动模式；
 原 BIFF 全局流写法被实机否证，已修正为工作表流写入。
 
 六、未执行边界

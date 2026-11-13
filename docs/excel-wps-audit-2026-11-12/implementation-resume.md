@@ -15,14 +15,16 @@
   都按自动模式打开；现由每个 sheet_stream 写在工作表 BOF 之后。xls_read 扫描记录流，
   测试增加“CALCMODE 位于第一张工作表 BOF 之后”断言；该断言不声称逐表紧邻。
 - 自动测试（当前源码）：core 612/0/41 CORE_EXIT0；app 200/0 APP_EXIT0；GUI 12/0/8 GUI_EXIT0。
-- 实际 GUI：真实 app 窗口打开 manual 夹具，A1 5→7 后 B1 保持 10 且待计算；
+- 实际 GUI：真实 app 窗口打开 work/ui21_gui/ui21_gui.xlsx（窗口标题 ui21_gui.xlsx；
+  与 fullCalcOnLoad 不同的 ui21_mode_fixture.xlsx 不是本轮 GUI 启动文件），A1 5→7 后 B1 保持 10 且待计算；
   VK_F9 后 B1=14、B2=8，状态仍手动且无待计算。截图与说明在
   implementation-evidence/ui21-gui/ 与 ui21-manual-calc.txt；键盘为 Win32 消息投递，
   因本会话无前台桌面，不是物理键盘。
 - Excel/WPS 值/模式闭环（模式识别已实测）：ui21_stale_manual.xlsx（A1=7、B1 故意旧缓存 10）
-  在 Excel 16.0 / WPS 12.0 新实例打开均为手动且 B1=10；CalculateFull 后 B1=14；
-  另存 .xls/.xlsx 再打开仍手动且 B1=14。app_saved_manual.xlsx / app_saved_manual2.xls
-  （真实保存代码，非 SaveAs 对话框）也均为手动、B1=10。
+  在 Excel 16.0 / WPS 12.0 各自同一个 Application 实例中打开均为手动且 B1=10；
+  CalculateFull 后 B1=14；同一实例内另存 .xls/.xlsx 再打开仍手动且 B1=14。
+  app_saved_manual.xlsx / app_saved_manual2.xls（A1=5，真实保存代码，非 SaveAs 对话框）
+  也均为手动、B1=10；它们只核对模式识别，与 A1=7 的陈旧缓存夹具不是同一文件。
 - 证据：implementation-evidence/ui21-manual-calc.txt、ui21-gui/{excel-cycle.txt,wps-cycle.txt,
   gui-initial-cached-10.png,gui-after-edit-pending.png,gui-after-f9.png}。
 - 未执行边界：“计算工作表”GUI 点选未单独取证（命令级 app 测试覆盖）；大表数组/循环引用
