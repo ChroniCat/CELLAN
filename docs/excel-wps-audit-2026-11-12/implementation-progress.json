@@ -3973,7 +3973,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "5bd5d8c"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app common_selection_and_format_shortcuts_work -> 1 passed",
             "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
@@ -3988,7 +3990,7 @@
           "failures": [],
           "blocker": "",
           "next": "补 F4/Shift+F10/F6 或按依赖转 UI-09.3；先做真实键鼠名称框焦点。",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T07:28:00Z"
         },
         {
           "id": "UI-09.2",
