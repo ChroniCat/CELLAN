@@ -281,71 +281,480 @@ pub fn list_items(dv: &DataValidation, sheet: &Sheet) -> Vec<String> {
     Vec::new()
 }
 
-/// 从工作簿上下文解析列表来源：内联、命名区域、跨表区域、单值区域。
+/// 内联序列 `"甲,乙"`（Excel 只认英文双引号）。
+fn inline_items(src: &str) -> Option<Vec<String>> {
+    let rest = src.trim().strip_prefix('"')?.strip_suffix('"')?;
+    Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// 按 `!` 拆工作表前缀：跳过单引号表名（`''` 是转义的单引号）和双引号字符串。
+/// 这样 `'预算(2026)'!$A$1:$A$2` 的括号不会被当成函数调用。
+fn split_sheet_prefix(text: &str) -> (Option<String>, String) {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut in_quote = false;
+    let mut last: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                if in_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    i += 2;
+                    continue;
+                }
+                in_quote = !in_quote;
+            }
+            '!' if !in_quote => {
+                if last.is_none() {
+                    last = Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match last {
+        Some(idx) => {
+            let head: String = chars[..idx].iter().collect();
+            let tail: String = chars[idx + 1..].iter().collect();
+            (Some(unquote_sheet_name(head.trim())), tail.trim().to_string())
+        }
+        None => (None, text.trim().to_string()),
+    }
+}
+
+/// 把一个端点拆成（列字母，行数字）。
+fn split_endpoint(s: &str) -> Option<(String, String)> {
+    let mut letters = String::new();
+    let mut digits = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphabetic() && digits.is_empty() {
+            letters.push(ch);
+        } else if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            return None;
+        }
+    }
+    if letters.is_empty() && digits.is_empty() {
+        return None;
+    }
+    Some((letters, digits))
+}
+
+/// 解析 A1 / A1:B2 / A:A / 1:1 / $A$1:$B$2 → 0 基矩形。
+fn parse_rect(text: &str) -> Option<(u32, u32, u32, u32)> {
+    const MAXR: u32 = 1_048_575;
+    const MAXC: u32 = 16_383;
+    let clean: String = text
+        .chars()
+        .filter(|c| *c != '$' && !c.is_whitespace())
+        .collect();
+    if clean.is_empty() {
+        return None;
+    }
+    let (a, b) = match clean.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (clean.as_str(), clean.as_str()),
+    };
+    let (al, ad) = split_endpoint(a)?;
+    let (bl, bd) = split_endpoint(b)?;
+    let col_of = |letters: &str| -> Option<u32> {
+        if letters.is_empty() {
+            None
+        } else {
+            Some(parse_a1(&format!("{letters}1"))?.1)
+        }
+    };
+    // 行号写坏了就是非法引用：不能因为溢出退化成"整列"
+    let row_of = |digits: &str| -> Result<Option<u32>, ()> {
+        if digits.is_empty() {
+            Ok(None)
+        } else {
+            let n: u32 = digits.parse().map_err(|_| ())?;
+            let zero = n.checked_sub(1).ok_or(())?;
+            if zero > MAXR {
+                return Err(());
+            }
+            Ok(Some(zero))
+        }
+    };
+    let ac = col_of(&al);
+    let ar = row_of(&ad).ok()?;
+    let bc = col_of(&bl);
+    let br = row_of(&bd).ok()?;
+    // 行/列必须成对出现：A:5 这种混合端点不合法
+    if ar.is_some() != br.is_some() || ac.is_some() != bc.is_some() {
+        return None;
+    }
+    let (r1, r2) = match (ar, br) {
+        (Some(x), Some(y)) => (x.min(y), x.max(y)),
+        _ => (0, MAXR),
+    };
+    let (c1, c2) = match (ac, bc) {
+        (Some(x), Some(y)) => (x.min(y), x.max(y)),
+        _ => (0, MAXC),
+    };
+    if ar.is_none() && ac.is_none() {
+        return None;
+    }
+    Some((r1, c1, r2, c2))
+}
+
+/// 取矩形里的非空显示文本；大区域（整列）走稀疏迭代，不逐格扫一百万行。
+fn collect_rect(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> Vec<String> {
+    let (r1, c1, r2, c2) = rect;
+    let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+    if area <= 65_536 {
+        let mut out = Vec::new();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if let Some(v) = sheet.get(r, c) {
+                    let t = v.value.display();
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        let mut hits: Vec<(u32, u32, String)> = sheet
+            .iter()
+            .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+            .map(|(k, v)| (k.row, k.col, v.value.display()))
+            .filter(|(_, _, t)| !t.is_empty())
+            .collect();
+        hits.sort_by_key(|(r, c, _)| (*r, *c));
+        hits.into_iter().map(|(_, _, t)| t).collect()
+    }
+}
+
+fn count_rect(sheet: &Sheet, rect: (u32, u32, u32, u32), numeric_only: bool) -> f64 {
+    let (r1, c1, r2, c2) = rect;
+    sheet
+        .iter()
+        .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+        .filter(|(_, v)| {
+            if numeric_only {
+                matches!(v.value, Value::Number(_))
+            } else {
+                !matches!(v.value, Value::Empty)
+            }
+        })
+        .count() as f64
+}
+
+/// 列表来源的解析结果：是引用就取项，像引用但坏了就报配置错误，否则交给动态公式。
+enum ListSrc {
+    Items(Vec<String>),
+    Invalid,
+    NotRef,
+}
+
+fn static_source(wb: &crate::model::Workbook, si: usize, text: &str) -> ListSrc {
+    let (sheet_name, range) = split_sheet_prefix(text);
+    // 区域部分必须整段就是一个引用（A1、A1:B2、A:A）；否则这是公式，不是引用。
+    let Some(rect) = parse_rect(&range) else {
+        return ListSrc::NotRef;
+    };
+    let sheet = match sheet_name.as_deref() {
+        Some(n) if !n.is_empty() => match wb.sheets.iter().find(|s| s.name == n) {
+            Some(s) => s,
+            None => return ListSrc::Invalid,
+        },
+        _ => wb.sheet(si),
+    };
+    ListSrc::Items(collect_rect(sheet, rect))
+}
+
+/// 整个表达式就是一个函数调用时取参数文本：`OFFSET(a,b)` → `a,b`。
+fn func_args<'a>(expr: &'a str, name: &str) -> Option<&'a str> {
+    let t = expr.trim();
+    let head = t.get(..name.len())?;
+    if !head.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let rest = t.get(name.len()..)?.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let rest = rest.strip_suffix(')')?;
+    Some(rest)
+}
+
+/// 按顶层逗号切参数（跳过字符串和嵌套括号）。
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for ch in args.chars() {
+        match ch {
+            '"' => {
+                in_str = !in_str;
+                cur.push(ch);
+            }
+            '(' | '{' if !in_str => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' | '}' if !in_str => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if !in_str && depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() || !out.is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// 求一个整数参数：字面量、COUNTA/COUNT/ROWS/COLUMNS(区域)，以及它们的 + - * / 组合。
+fn eval_int(wb: &crate::model::Workbook, default_sheet: &Sheet, expr: &str) -> Option<i64> {
+    let t = expr.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(v) = t.parse::<i64>() {
+        return Some(v);
+    }
+    if let Some(rest) = t.strip_prefix('-') {
+        return eval_int(wb, default_sheet, rest.trim()).map(|v| -v);
+    }
+    for op in ['+', '-', '*', '/'] {
+        if let Some(idx) = top_level_op(t, op) {
+            let a = eval_int(wb, default_sheet, &t[..idx])?;
+            let b = eval_int(wb, default_sheet, &t[idx + 1..])?;
+            return match op {
+                '+' => Some(a + b),
+                '-' => Some(a - b),
+                '*' => Some(a * b),
+                '/' if b != 0 => Some(a / b),
+                _ => None,
+            };
+        }
+    }
+    for (fname, mode) in [("COUNTA", 0), ("COUNT", 1), ("ROWS", 2), ("COLUMNS", 3)] {
+        if let Some(args) = func_args(t, fname) {
+            let (sheet_name, range) = split_sheet_prefix(args.trim());
+            let sheet = match sheet_name.as_deref() {
+                Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
+                _ => default_sheet,
+            };
+            let rect = parse_rect(&range)?;
+            return Some(match mode {
+                0 => count_rect(sheet, rect, false) as i64,
+                1 => count_rect(sheet, rect, true) as i64,
+                2 => (rect.2 as i64 - rect.0 as i64 + 1) as i64,
+                _ => (rect.3 as i64 - rect.1 as i64 + 1) as i64,
+            });
+        }
+    }
+    None
+}
+
+/// 顶层（不在括号/字符串里）的运算符位置；取最右边，保证左结合。
+fn top_level_op(expr: &str, want: char) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut hit: Option<usize> = None;
+    let mut prev: Option<char> = None;
+    for (i, ch) in expr.char_indices() {
+        match ch {
+            '"' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => depth -= 1,
+            c if !in_str && depth == 0 && c == want => {
+                // 一元正负号不是运算符
+                if (want == '+' || want == '-')
+                    && matches!(prev, None | Some('+') | Some('-') | Some('*') | Some('/') | Some('('))
+                {
+                    prev = Some(c);
+                    continue;
+                }
+                hit = Some(i);
+            }
+            _ => {}
+        }
+        prev = Some(ch);
+    }
+    hit
+}
+
+/// 动态来源：INDIRECT("区域") 与 OFFSET(锚点,行,列[,高[,宽]])。
+/// 本机求值器没有整块数组求值，这里按区域语义解析，不用数组字面量冒充公式。
+/// 去掉空格和 $ 后的规范形，用来判断 FILTER 的条件是不是"同一区域非空"。
+fn norm_ref(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '$' && !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// `FILTER(区域, 区域<>"")` —— Excel 里最常见的动态列表写法（去掉空白）。
+fn is_nonblank_filter(range: &str, cond: &str) -> bool {
+    let want = format!("{}<>\"\"", norm_ref(range));
+    norm_ref(cond) == want
+}
+
+/// 数字优先、其余按文本排序，和 Excel 的 SORT 默认升序一致。
+fn sort_items(items: &mut [String]) {
+    items.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    });
+}
+
+/// 把来源文本解析成候选（静态引用或动态公式），供 UNIQUE/SORT 之类包装函数复用。
+fn resolve_any(wb: &crate::model::Workbook, si: usize, text: &str) -> Option<Vec<String>> {
+    match static_source(wb, si, text) {
+        ListSrc::Items(v) => Some(v),
+        ListSrc::Invalid => None,
+        ListSrc::NotRef => dynamic_source(wb, si, text),
+    }
+}
+
+fn dynamic_source(wb: &crate::model::Workbook, si: usize, expr: &str) -> Option<Vec<String>> {
+    // FILTER(区域, 区域<>"")：现代 Excel 的动态列表写法
+    if let Some(args) = func_args(expr, "FILTER") {
+        let parts = split_args(args);
+        if parts.len() != 2 {
+            return None;
+        }
+        if is_nonblank_filter(&parts[0], &parts[1]) {
+            return resolve_any(wb, si, &parts[0]);
+        }
+        return None;
+    }
+    // UNIQUE(来源)：去重，保留首次出现的顺序
+    if let Some(args) = func_args(expr, "UNIQUE") {
+        let parts = split_args(args);
+        let mut items = resolve_any(wb, si, parts.first()?)?;
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|it| seen.insert(it.clone()));
+        return Some(items);
+    }
+    // SORT(来源[, 排序索引, 方向])：默认按第一列升序
+    if let Some(args) = func_args(expr, "SORT") {
+        let parts = split_args(args);
+        let mut items = resolve_any(wb, si, parts.first()?)?;
+        let desc = parts
+            .get(2)
+            .map(|d| d.trim() == "-1")
+            .unwrap_or(false);
+        sort_items(&mut items);
+        if desc {
+            items.reverse();
+        }
+        return Some(items);
+    }
+    if let Some(args) = func_args(expr, "INDIRECT") {
+        let parts = split_args(args);
+        let text = parts.first()?.trim().trim_matches('"');
+        return match static_source(wb, si, text) {
+            ListSrc::Items(v) => Some(v),
+            _ => None,
+        };
+    }
+    if let Some(args) = func_args(expr, "OFFSET") {
+        let parts = split_args(args);
+        if parts.len() < 3 {
+            return None;
+        }
+        let (sheet_name, anchor) = split_sheet_prefix(&parts[0]);
+        let sheet = match sheet_name.as_deref() {
+            Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
+            _ => wb.sheet(si),
+        };
+        let (ar, ac, _, _) = parse_rect(&anchor)?;
+        let rows = eval_int(wb, sheet, &parts[1])?;
+        let cols = eval_int(wb, sheet, &parts[2])?;
+        let h = if parts.len() > 3 && !parts[3].is_empty() {
+            eval_int(wb, sheet, &parts[3])?
+        } else {
+            1
+        };
+        let w = if parts.len() > 4 && !parts[4].is_empty() {
+            eval_int(wb, sheet, &parts[4])?
+        } else {
+            1
+        };
+        let r1 = ar as i64 + rows;
+        let c1 = ac as i64 + cols;
+        if r1 < 0 || c1 < 0 || h <= 0 || w <= 0 {
+            return Some(Vec::new());
+        }
+        let r1 = r1 as u32;
+        let c1 = c1 as u32;
+        let r2 = (r1 as i64 + h - 1).min(1_048_575) as u32;
+        let c2 = (c1 as i64 + w - 1).min(16_383) as u32;
+        return Some(collect_rect(sheet, (r1, c1, r2, c2)));
+    }
+    None
+}
+
+fn lookup_name(wb: &crate::model::Workbook, si: usize, name: &str) -> Option<String> {
+    let mut global: Option<&str> = None;
+    for (n, scope, target) in wb.names.iter().rev() {
+        if !n.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if *scope == Some(si) {
+            return Some(target.clone());
+        }
+        if scope.is_none() && global.is_none() {
+            global = Some(target);
+        }
+    }
+    global.map(|s| s.to_string())
+}
+
+/// 从工作簿上下文解析列表来源：内联、区域引用、名称、INDIRECT/OFFSET 动态来源。
+/// `r/c` 是正在校验的目标单元格：Excel 的数据验证公式以规则范围左上角为基准，
+/// 每个单元格看到的是平移后的 Formula1（本机 Excel COM 实测：C2:C3 用 =$A1:$A2，
+/// C3 的 Formula1 为 =$A2:$A3，C3 接受 A3 的值、拒绝 A2 的值）。
 /// 返回 `None` 表示配置无法解析；调用方必须拒绝并给出诊断，不能当成“无限制”。
-pub fn list_items_wb(wb: &crate::model::Workbook, si: usize, dv: &DataValidation) -> Option<Vec<String>> {
+pub fn list_items_wb(
+    wb: &crate::model::Workbook,
+    si: usize,
+    dv: &DataValidation,
+    r: u32,
+    c: u32,
+) -> Option<Vec<String>> {
     let src = dv.f1.trim();
     if src.is_empty() {
         return Some(Vec::new());
     }
-    if let Some(rest) = src.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        return Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    if let Some(items) = inline_items(src) {
+        return Some(items);
     }
-    let mut expr = src.trim().trim_start_matches('=').trim();
-    // 命名区域（工作簿级或本表级）；名称不区分大小写。
-    // 本表级优先于工作簿级，不能按定义顺序碰巧选到全局同名项。
-    let has_sheet = expr.contains('!');
-    if !has_sheet && !expr.contains(':') {
-        let mut global: Option<&str> = None;
-        for (n, scope, target) in wb.names.iter().rev() {
-            if !n.eq_ignore_ascii_case(expr) {
-                continue;
-            }
-            if *scope == Some(si) {
-                expr = target.trim();
-                global = None;
-                break;
-            }
-            if scope.is_none() && global.is_none() {
-                global = Some(target.trim());
-            }
+    let mut expr = src.strip_prefix('=').unwrap_or(src).trim().to_string();
+    for _ in 0..8 {
+        // 裸名称才查名称表；带 ! 或 : 的是引用，带括号的是公式
+        if expr.contains('!') || expr.contains(':') || expr.contains('(') {
+            break;
         }
-        if let Some(target) = global {
-            expr = target;
+        let Some(target) = lookup_name(wb, si, &expr) else {
+            break;
+        };
+        expr = target.trim().trim_start_matches('=').trim().to_string();
+        if let Some(items) = inline_items(&expr) {
+            return Some(items);
         }
     }
-    if let Some(rest) = expr.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        return Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    let (ar, ac) = range_anchor(dv, r, c);
+    let shifted = crate::cf::shift_formula(&expr, r - ar, c - ac);
+    match static_source(wb, si, &shifted) {
+        ListSrc::Items(v) => Some(v),
+        ListSrc::Invalid => None,
+        ListSrc::NotRef => dynamic_source(wb, si, &shifted),
     }
-    // 动态/普通公式源（如 FILTER(...)、SUMPRODUCT(...)）不是静态区域；
-    // 当前求值器不把数组字面量当成列表来源，宁可报配置失败。
-    if expr.contains('(') || expr.contains(')') || expr.contains('{') || expr.contains('}') {
-        return None;
-    }
-    let (sheet_name, range) = match expr.rsplit_once('!') {
-        Some((s, r)) => (Some(unquote_sheet_name(s)), r.trim()),
-        None => (None, expr),
-    };
-    let target_sheet = match sheet_name.as_deref() {
-        Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
-        _ => wb.sheet(si),
-    };
-    let clean: String = range.chars().filter(|c| *c != '$').collect();
-    let (a, b) = clean.split_once(':').unwrap_or((clean.as_str(), clean.as_str()));
-    let (r1, c1) = parse_a1(a)?;
-    let (r2, c2) = parse_a1(b)?;
-    let mut out = Vec::new();
-    for r in r1.min(r2)..=r1.max(r2) {
-        for c in c1.min(c2)..=c1.max(c2) {
-            if let Some(v) = target_sheet.get(r, c) {
-                let t = v.value.display();
-                if !t.is_empty() {
-                    out.push(t);
-                }
-            }
-        }
-    }
-    Some(out)
 }
 
 fn unquote_sheet_name(s: &str) -> String {
@@ -468,7 +877,7 @@ where
     F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
     if dv.kind == DvKind::List {
-        let items = list_items_wb(wb, si, dv).unwrap_or_default();
+        let items = list_items_wb(wb, si, dv, r, c).unwrap_or_default();
         validate_impl(dv, value, wb.sheet(si), r, c, Some(&items), formula_eval)
     } else {
         validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
@@ -647,6 +1056,12 @@ pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
                 let raw: &str = &t;
                 buf.push_str(&crate::model::xml_unescape(raw));
             }
+            // quick_xml 把 &quot; 这类实体单独发成 GeneralRef；不接住的话
+            // 内联序列 "甲,乙" 的引号会整个丢掉，重开后来源就解析不出来了。
+            Ok(Event::GeneralRef(e)) if field.is_some() => {
+                let name: String = e.into_inner().to_string();
+                buf.push_str(&crate::model::resolve_entity(&name));
+            }
             Ok(Event::End(e)) if e.name().as_ref().ends_with("dataValidation") => {
                 if let Some(dv) = cur.take() {
                     if has_range {
@@ -801,11 +1216,14 @@ mod tests {
 
         // 单值区域
         let single = DataValidation { kind: DvKind::List, f1: "=列表!$A$1".into(), ..Default::default() };
-        assert_eq!(list_items_wb(&wb, 0, &single).as_deref(), Some(&["甲".to_string()][..]));
+        assert_eq!(
+            list_items_wb(&wb, 0, &single, 0, 0).as_deref(),
+            Some(&["甲".to_string()][..])
+        );
         // 含空白的多格区域
         let gap = DataValidation { kind: DvKind::List, f1: "=列表!$A$1:$A$4".into(), ..Default::default() };
         assert_eq!(
-            list_items_wb(&wb, 0, &gap).as_deref(),
+            list_items_wb(&wb, 0, &gap, 0, 0).as_deref(),
             Some(&["甲".to_string(), "乙".to_string()][..]),
             "空白跳过，不能变成空候选"
         );
@@ -844,14 +1262,106 @@ mod tests {
         let wb = crate::model::Workbook::new_blank();
         for f1 in [
             "=SUMPRODUCT(1,2)",
-            "=FILTER(A1:A2,A1:A2<>\"\")",
             "=ABCDEFGHIJKLMNOPQRSTUVWXYZ",
             "=A1:A2:A3",
             "=A999999999999999999999",
         ] {
             let dv = DataValidation { kind: DvKind::List, f1: f1.into(), ..Default::default() };
-            assert!(list_items_wb(&wb, 0, &dv).is_none(), "不应把 {f1} 当静态列表");
+            assert!(list_items_wb(&wb, 0, &dv, 0, 0).is_none(), "不应把 {f1} 当列表来源");
         }
+    }
+
+    /// 动态列表来源按 Excel 语义解析：OFFSET/INDIRECT/FILTER(非空)/名称，以及相对来源按
+    /// 规则范围左上角平移。基准值来自本机 Excel COM 实测（见 docs 证据）。
+    #[test]
+    fn dynamic_list_sources_follow_excel_semantics() {
+        use crate::model::{Cell, Sheet, Value, Workbook};
+        let mut wb = Workbook::new_blank();
+        for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
+            wb.sheets[0].set(i as u32, 0, Cell { value: Value::Number(*v), formula: None });
+        }
+        let mut list = Sheet::default();
+        list.name = "列表".into();
+        for (i, t) in ["甲", "乙", "丙"].iter().enumerate() {
+            list.set(i as u32, 0, Cell { value: Value::Text((*t).into()), formula: None });
+        }
+        wb.sheets.push(list);
+        let mut paren = Sheet::default();
+        paren.name = "预算(2026)".into();
+        paren.set(0, 0, Cell { value: Value::Text("甲".into()), formula: None });
+        paren.set(1, 0, Cell { value: Value::Text("乙".into()), formula: None });
+        wb.sheets.push(paren);
+        wb.names.push(("动态".into(), None, "=OFFSET(列表!$A$1,0,0,COUNTA(列表!$A$1:$A$3),1)".into()));
+
+        let off = DataValidation {
+            kind: DvKind::List,
+            f1: "=OFFSET(列表!$A$1,0,0,COUNTA(列表!$A$1:$A$4),1)".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_items_wb(&wb, 0, &off, 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string(), "丙".to_string()][..])
+        );
+
+        let ind = DataValidation {
+            kind: DvKind::List,
+            f1: "=INDIRECT(\"列表!A1:A2\")".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_items_wb(&wb, 0, &ind, 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string()][..])
+        );
+
+        let filt = DataValidation {
+            kind: DvKind::List,
+            f1: "=FILTER(列表!$A$1:$A$4,列表!$A$1:$A$4<>\"\")".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_items_wb(&wb, 0, &filt, 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string(), "丙".to_string()][..])
+        );
+
+        let named = DataValidation { kind: DvKind::List, f1: "=动态".into(), ..Default::default() };
+        assert_eq!(
+            list_items_wb(&wb, 0, &named, 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string(), "丙".to_string()][..])
+        );
+
+        let par = DataValidation {
+            kind: DvKind::List,
+            f1: "='预算(2026)'!$A$1:$A$2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_items_wb(&wb, 0, &par, 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string()][..]),
+            "带括号的表名不能被当成动态公式拒绝"
+        );
+        let mut ev = |_: &str, _: u32, _: u32| crate::formula::FValue::Bool(true);
+        assert!(validate_wb(&wb, 0, &par, &Value::Text("乙".into()), 0, 0, &mut ev));
+        assert!(!validate_wb(&wb, 0, &par, &Value::Text("丙".into()), 0, 0, &mut ev));
+
+        let rel = DataValidation {
+            kind: DvKind::List,
+            f1: "=$A1:$A2".into(),
+            ranges: vec![(1, 2, 2, 2)],
+            ..Default::default()
+        };
+        assert_eq!(
+            list_items_wb(&wb, 0, &rel, 1, 2).as_deref(),
+            Some(&["10".to_string(), "20".to_string()][..]),
+            "C2 看 A1:A2"
+        );
+        assert_eq!(
+            list_items_wb(&wb, 0, &rel, 2, 2).as_deref(),
+            Some(&["20".to_string(), "30".to_string()][..]),
+            "C3 看 A2:A3（和 Excel 的 Formula1 平移一致）"
+        );
+        let mut ev2 = |_: &str, _: u32, _: u32| crate::formula::FValue::Bool(true);
+        assert!(validate_wb(&wb, 0, &rel, &Value::Number(30.0), 2, 2, &mut ev2));
+        assert!(!validate_wb(&wb, 0, &rel, &Value::Number(10.0), 2, 2, &mut ev2));
     }
 
     #[test]

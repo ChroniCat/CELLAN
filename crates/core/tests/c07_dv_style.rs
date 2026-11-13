@@ -131,3 +131,41 @@ fn prompt_text_needs_switch_and_content() {
     d.show_prompt = false;
     assert_eq!(d.prompt_text(), None);
 }
+
+#[test]
+fn inline_list_keeps_its_quotes_after_save() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].dv.push(DataValidation {
+        ranges: vec![(1, 1, 1, 1)],
+        kind: DvKind::List,
+        f1: "\"甲,乙\"".into(),
+        ..Default::default()
+    });
+    wb.sheets[0].dv_dirty = true;
+    let out = out_path("c07_dv_inline");
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
+    let xml = sheetcore::patch::dv_xml(&wb.sheets[0].dv);
+    println!("XML={xml}");
+    let back = sheetcore::xlsx::load(&out).expect("重开");
+    let rule = dv::find(&back.sheet(0).dv, 1, 1).expect("规则仍在");
+    println!("f1={:?}", rule.f1);
+    println!("items={:?}", dv::list_items_wb(&back, 0, rule, 1, 1));
+    println!("chars={:?}", rule.f1.chars().map(|c| c as u32).collect::<Vec<_>>());
+    assert_eq!(
+        dv::list_items_wb(&back, 0, rule, 1, 1),
+        Some(vec!["甲".to_string(), "乙".to_string()]),
+        "f1={:?}",
+        rule.f1
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn parse_keeps_inline_quotes() {
+    let xml = r#"<dataValidations count="1"><dataValidation type="list" sqref="B2"><formula1>&quot;甲,乙&quot;</formula1></dataValidation></dataValidations>"#;
+    let v = dv::parse_validations(xml);
+    println!("parsed f1={:?}", v[0].f1);
+    println!("parsed chars={:?}", v[0].f1.chars().map(|c| c as u32).collect::<Vec<_>>());
+    assert_eq!(v[0].f1, "\"甲,乙\"");
+}

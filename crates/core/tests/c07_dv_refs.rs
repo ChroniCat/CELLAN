@@ -67,13 +67,18 @@ fn workbook_sources_and_relative_anchor_are_limited_to_real_file() {
 
     // 不存在的名称：配置失败，不能退化成“全部允许”
     let bad_name = find(1, 4);
-    assert!(sheetcore::dv::list_items_wb(&wb, 0, &bad_name).is_none());
+    assert!(sheetcore::dv::list_items_wb(&wb, 0, &bad_name, 1, 4).is_none());
     assert!(!sheetcore::dv::validate_wb(&wb, 0, &bad_name, &Value::Text("甲".into()), 1, 4, &mut ev));
 
-    // 动态公式来源：当前求值器不把它当数组字面量，必须报配置失败
+    // 动态来源 FILTER(区域, 区域<>"")：真解析成候选，不能当成"全部允许"或一律失败
     let dynamic = find(1, 6);
-    assert!(sheetcore::dv::list_items_wb(&wb, 0, &dynamic).is_none());
-    assert!(!sheetcore::dv::validate_wb(&wb, 0, &dynamic, &Value::Text("甲".into()), 1, 6, &mut ev));
+    assert_eq!(
+        sheetcore::dv::list_items_wb(&wb, 0, &dynamic, 1, 6).as_deref(),
+        Some(&["甲".to_string(), "乙".to_string()][..]),
+        "FILTER 非空筛选应解析出列表候选"
+    );
+    assert!(sheetcore::dv::validate_wb(&wb, 0, &dynamic, &Value::Text("甲".into()), 1, 6, &mut ev));
+    assert!(!sheetcore::dv::validate_wb(&wb, 0, &dynamic, &Value::Text("丙".into()), 1, 6, &mut ev));
 
     // O'Brien 表名的双引号转义
     let ob = find(1, 7);
