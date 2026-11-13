@@ -6039,3 +6039,31 @@ fn dv_information_ok_button_writes_once() {
     assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(7.0), "确定后写入");
     assert_eq!(app.undo.depth(), (1, 0), "只留一条撤销");
 }
+
+#[test]
+fn f2_replace_then_tab_commits_and_moves_right() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(123.0));
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::F2, false)]);
+    assert_eq!(app.editing.as_ref().map(|e| e.buf.clone()).as_deref(), Some("123"));
+    // F2 把光标放在末尾；Ctrl+A 全选后键入 456 才是“改 456”
+    ui_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, command: true, ..Default::default() },
+        }],
+    );
+    ui_frame(&mut app, &ctx, vec![egui::Event::Text("456".into())]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(456.0), "F2 改值后 Tab 提交");
+    assert_eq!(app.sel, (0, 1), "Tab 后选区向右");
+    assert!(app.editing.is_none());
+    assert_eq!(app.undo.depth(), (1, 0), "一次提交只记一步撤销");
+}

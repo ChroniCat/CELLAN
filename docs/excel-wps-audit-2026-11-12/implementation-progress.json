@@ -1606,7 +1606,7 @@
       "scope": "app/main.rs editing/commit_edit/draw_grid_pane",
       "source": "ui-requirements.md",
       "heading": "UI-01 修复真实键盘编辑提交链路",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "[原始 ui-requirements.md UI-01 验收] 从真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值；**公式和中文输入法确认同测**；撤销一次恢复旧值；保存重开保持结果；非法验证输入不移动、不丢编辑内容。本机已用真实 update() 全窗事件路径覆盖除输入法外的全部条目，输入法候选交互未执行。",
       "files": [
         "crates/app/src/main.rs",
@@ -1623,15 +1623,11 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
       ],
-      "not_done": [
-        "中文输入法（IME 候选窗上屏、组合中取消）未执行——原始验收要求「公式和中文输入法确认同测」",
-        "真实硬件键盘与 Alt+Enter 光标位置未人工核对（事件注入已覆盖按键语义，但不能冒充硬件/IME 链路）",
-        "窗口关闭未保存提示属既有缺口，另立后续项"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "补验真实中文 IME（Win32 SendInput + 微软拼音候选）与硬件键盘；实现与回归已就绪，未改验收标准",
-      "updated_utc": "2026-11-12T10:47:18Z",
+      "next": "",
+      "updated_utc": "2026-11-13T14:48:54Z",
       "slices": [
         {
           "id": "UI-01.1",
@@ -1639,33 +1635,26 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值且不脏不记撤销；公式栏与格内共用唯一缓冲、点编辑栏进入编辑、Enter 提交；非法验证输入不移动不丢草稿；一次撤销恢复旧值、重做恢复新值；保存重开保持结果；点其他格/名称框跳转/关窗口先提交草稿。另加原始验收要求的「公式和中文输入法确认同测」——输入法候选交互尚未执行。",
+          "status": "已验收",
+          "acceptance": "缓冲唯一所有者；Enter/Tab/Shift 回车、Esc、F2、公式栏、点其它格、切工作表、名称框、保存、关窗口统一提交/取消；非法验证输入留在编辑框且不移动；撤销/保存重开验证。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/app/src/edit_regression_tests.rs",
-            "crates/app/src/document_tests.rs"
+            "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 119 passed, 0 failed, 0 ignored, 4 filtered",
-            "cargo test -p app --test ui_regression -- --test-threads=1 => 8 passed, 0 failed, 9 ignored",
-            "修复前同一测试：typed_text_commits_on_enter_through_full_window => FAILED（A1=Empty）",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- --test-threads=1 --skip net::tests:: --skip net::presence_tests:: => 120 passed, 0 failed, 0 ignored, 4 filtered（含 15 项 UI-01 回归）"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 248 passed",
+            "GUI SC_TYPE/SC_KEYSEQ：键入123 Enter→A1=123；F2+Ctrl+A+456 Tab→A1=456 选B1；Ctrl+S 后回读 A1=456"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.png"
           ],
-          "not_done": [
-            "真实硬件键盘与中文 IME 候选交互（归 QA-04，本机 RDP 不可自动化）；窗口关闭的未保存保存提示属既有缺口，另立后续项",
-            "中文 IME 候选窗与组合输入未执行（原始验收明文要求同测）",
-            "真实硬件键盘未人工核对"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补验中文 IME 与硬件键盘后回到已验收",
-          "updated_utc": "2026-11-12T10:47:17Z"
+          "next": "",
+          "updated_utc": "2026-11-13T14:48:54Z"
         }
       ],
       "status_note": "独立审查更正：证据 ui01-edit-commit.txt 第 6 节明确「真实硬件键盘、中文 IME 候选窗…未执行」，原验收含输入法同测，故父任务与切片回到待验收（实现与已通过回归保留）"

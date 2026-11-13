@@ -686,6 +686,9 @@ struct SheetApp {
     /// 验收探针：SC_KEYSEQ 逐帧注入的按键序列（无界面会话用）
     key_seq: Vec<String>,
     key_frames: u32,
+    /// SC_TYPE：逐帧注入文本（"60:123;120:456"），验收时走真实输入路径
+    type_seq: Vec<(u32, String)>,
+    type_frames: u32,
 
     /// 批注编辑：(行, 列, 文本)
     note_edit: Option<(u32, u32, String)>,
@@ -1463,6 +1466,18 @@ impl SheetApp {
                 })
                 .unwrap_or_default(),
             key_frames: 0,
+            type_seq: std::env::var("SC_TYPE")
+                .ok()
+                .map(|v| {
+                    v.split(';')
+                        .filter_map(|part| {
+                            let (n, t) = part.split_once(':')?;
+                            Some((n.trim().parse::<u32>().ok()?, t.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            type_frames: 0,
             note_edit: None,
             link_dlg: None,
             macro_run_dlg: None,
@@ -24189,6 +24204,25 @@ impl eframe::App for SheetApp {
                 eprintln!("[keyseq] 结束");
             }
         }
+
+        if !self.type_seq.is_empty() {
+            self.type_frames += 1;
+            let mut hits = Vec::new();
+            for (at, text) in &self.type_seq {
+                if *at == self.type_frames {
+                    hits.push(text.clone());
+                }
+            }
+            for text in hits {
+                eprintln!("[types] frame {} -> {text:?}", self.type_frames);
+                ctx.input_mut(|inp| inp.events.push(egui::Event::Text(text)));
+            }
+            let last = self.type_seq.iter().map(|(f, _)| *f).max().unwrap_or(0);
+            if self.type_frames > last {
+                self.type_seq.clear();
+                eprintln!("[types] 结束");
+            }
+        }
         let __cpu_t0 = std::time::Instant::now();
         // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
         self.dialog_modal = self.find.open || self.dv_alert.is_some();
@@ -26317,6 +26351,11 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "enter" | "return" => key = Some(egui::Key::Enter),
             "escape" | "esc" => key = Some(egui::Key::Escape),
             "s" => key = Some(egui::Key::S),
+            "a" => key = Some(egui::Key::A),
+            "tab" => key = Some(egui::Key::Tab),
+            "f2" => key = Some(egui::Key::F2),
+            "left" => key = Some(egui::Key::ArrowLeft),
+            "right" => key = Some(egui::Key::ArrowRight),
             other => eprintln!("[keyseq] 未知按键 {other}"),
         }
     }
