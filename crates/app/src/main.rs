@@ -6947,7 +6947,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.sel = (r1, c1);
             self.sel_end = (r2, c2);
             self.ensure_visible();
-            self.status = format!("已选择当前区域 {}{}:{}{}", cell_name(r1, c1), "", cell_name(r2, c2), "");
+            self.status = format!("已选择当前区域 {}:{}", cell_name(r1, c1), cell_name(r2, c2));
         }
     }
 
