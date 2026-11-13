@@ -66,7 +66,9 @@ fn rk_value(rk: u32) -> f64 {
     v
 }
 
-/// 读全局流 CALCMODE：0=手动，1=自动，2=自动（表除外）。
+/// 读 Workbook 流中的 CALCMODE：0=手动，1=自动，2=自动（表除外）。
+/// Excel/WPS 会把该记录写在工作表 BOF 之后；本函数按记录流顺序扫描，不要求
+/// 它出现在全局流里。
 pub fn read_calc_manual(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else { return false };
     let Ok(cf) = crate::cfb::Compound::open(bytes) else { return false };

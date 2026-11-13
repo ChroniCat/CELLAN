@@ -71,31 +71,8 @@ fn set_datemode(buf: &mut Vec<u8>, is_1904: bool) {
     }
 }
 
-/// 把全局流里的 CALCMODE(0x000D) 改成自动/手动；没有就在 BOF 之后插一条。
-fn set_calcmode(buf: &mut Vec<u8>, manual: bool) {
-    let want: u16 = if manual { 0 } else { 1 };
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        let t = u16::from_le_bytes([buf[i], buf[i + 1]]);
-        let l = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
-        if t == CALCMODE && i + 6 <= buf.len() {
-            buf[i + 4] = (want & 0xFF) as u8;
-            buf[i + 5] = (want >> 8) as u8;
-            return;
-        }
-        let n = (i + 4 + l).min(buf.len());
-        if n <= i {
-            break;
-        }
-        i = n;
-    }
-    if buf.len() >= 4 {
-        let l0 = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-        let at = (4 + l0).min(buf.len());
-        let rec_bytes = [0x0Du8, 0x00, 0x02, 0x00, (want & 0xFF) as u8, (want >> 8) as u8];
-        buf.splice(at..at, rec_bytes);
-    }
-}
+/// CALCMODE(0x000D) 的兼容写入位置：Excel/WPS 只认工作表流 BOF 之后的记录；
+/// 具体写入由 sheet_stream 负责，本文件不再修改全局流里的记录。
 
 fn tpl_counts() -> (u16, u16) {
     let mut fonts = 0u16;
@@ -430,6 +407,7 @@ fn sheet_stream(
     style_table: &crate::style::StyleTable,
     tables: &mut Tables,
     styles_cache: &mut HashMap<u16, u16>,
+    calc_manual: bool,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut bof = Vec::new();
@@ -440,6 +418,9 @@ fn sheet_stream(
     bof.extend_from_slice(&w32(0));
     bof.extend_from_slice(&w32(0));
     rec(&mut out, BOF, &bof);
+    // Excel 16 的实际行为：CALCMODE 放在工作表 BOF 之后才生效；放在全局流里
+    // Excel/WPS 都按自动计算打开（缓存值虽在，模式提示错误）。0=手动，1=自动。
+    rec(&mut out, CALCMODE, &w16(if calc_manual { 0 } else { 1 }));
 
     // 范围
     let (mut rmax, mut cmax) = (0u32, 0u32);
@@ -649,6 +630,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
             &wb.styles,
             &mut tables,
             &mut cache,
+            wb.calc_manual,
         )?);
     }
 
@@ -659,7 +641,6 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     // 否则读端先撞上骨架里的 0。
     let mut prefix = TPL_PREFIX.to_vec();
     set_datemode(&mut prefix, wb.date_system.is_1904());
-    set_calcmode(&mut prefix, wb.calc_manual);
     g.extend_from_slice(&prefix);
     g.extend_from_slice(TPL_FONTS_XFS);
 
@@ -864,6 +845,37 @@ mod tests {
         write(&p, &wb).unwrap();
         let back = crate::xlsx::load(&p).unwrap();
         assert!(back.calc_manual, "BIFF CALCMODE 手动模式应读回");
+        // 旧实现把 CALCMODE 插在全局流 BOF 之后；Excel/WPS 都忽略，按自动模式打开。
+        // 这里额外锁定记录位置：必须位于第一张工作表 BOF 之后；这是 Excel/WPS
+        // 识别逐表 CALCMODE 的必要条件（本断言不声称已验证每条记录都紧邻）。
+        let bytes = std::fs::read(&p).unwrap();
+        let cf = crate::cfb::Compound::open(bytes).unwrap();
+        let stream = cf.stream_by_path("Workbook").unwrap();
+        let mut i = 0usize;
+        let mut sheet_bof = None;
+        let mut calc_at = None;
+        while i + 4 <= stream.len() {
+            let t = u16::from_le_bytes([stream[i], stream[i + 1]]);
+            let l = u16::from_le_bytes([stream[i + 2], stream[i + 3]]) as usize;
+            if t == BOF && i + 8 <= stream.len() {
+                let dt = u16::from_le_bytes([stream[i + 6], stream[i + 7]]);
+                if dt == 0x0010 && sheet_bof.is_none() {
+                    sheet_bof = Some(i);
+                }
+            }
+            if t == CALCMODE && calc_at.is_none() {
+                calc_at = Some(i);
+            }
+            let n = (i + 4 + l).min(stream.len());
+            if n <= i {
+                break;
+            }
+            i = n;
+        }
+        assert!(
+            sheet_bof.is_some() && calc_at.is_some() && calc_at > sheet_bof,
+            "CALCMODE 必须在工作表 BOF 之后（Excel/WPS 才认）：bof={sheet_bof:?} calc={calc_at:?}"
+        );
         wb.calc_manual = false;
         write(&p, &wb).unwrap();
         let back = crate::xlsx::load(&p).unwrap();
