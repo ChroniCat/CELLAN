@@ -23,6 +23,7 @@
 !crates/core/tests/data/sparklines.xlsx
 !crates/core/tests/data/real_macro.xlsm
 !crates/core/tests/fixtures/real_excel.xls
+!docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/*.xlsx
 
 # Operating-system files
 .DS_Store
