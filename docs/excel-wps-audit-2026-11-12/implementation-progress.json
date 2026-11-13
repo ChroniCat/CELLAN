@@ -1025,7 +1025,8 @@
       ],
       "commits": [
         "fd91c28",
-        "3d8804f"
+        "3d8804f",
+        "6760803"
       ],
       "commands": [
         "python scripts/qa01_min_samples.py --out-dir crates/core/tests/fixtures/qa01 --manifest docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json -> generated",
@@ -1055,7 +1056,7 @@
       "failures": [],
       "blocker": "",
       "next": "QA-01.3 继续补三方 Office 矩阵/真实 pivot；父项未完成。",
-      "updated_utc": "2026-11-13T19:54:00Z",
+      "updated_utc": "2026-11-13T19:55:00Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1111,7 +1112,8 @@
             "scripts/qa01_roundtrip_test.py"
           ],
           "commits": [
-            "3d8804f"
+            "3d8804f",
+            "6760803"
           ],
           "commands": [
             "cargo run -p sheetcore --offline --example qa01_roundtrip -- <fixture> <output> -> exit 0",
@@ -1130,7 +1132,7 @@
           "failures": [],
           "blocker": "",
           "next": "继续 QA-01.3 图表/透视/打印扩展夹具；或按监督复核意见调整本 runner。",
-          "updated_utc": "2026-11-13T19:54:00Z"
+          "updated_utc": "2026-11-13T19:55:00Z"
         },
         {
           "id": "QA-01.3",
@@ -1200,7 +1202,8 @@
         "scripts/qa02_extended_fixtures.py"
       ],
       "commits": [
-        "45f3f0c"
+        "45f3f0c",
+        "6760803"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
@@ -1222,7 +1225,7 @@
       "failures": [],
       "blocker": "",
       "next": "完成 QA-02.1 剩余 P0/P1 夹具后进入 QA-02.2/QA-02.3。",
-      "updated_utc": "2026-11-13T19:54:00Z",
+      "updated_utc": "2026-11-13T19:55:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1249,7 +1252,8 @@
             "scripts/qa02_extended_fixtures.py"
           ],
           "commits": [
-            "45f3f0c"
+            "45f3f0c",
+            "6760803"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
@@ -1272,7 +1276,7 @@
           "failures": [],
           "blocker": "",
           "next": "继续恢复 P1 对象/输出夹具，并逐项建立剩余 ignored 的原因、解锁步骤台账。",
-          "updated_utc": "2026-11-13T19:54:00Z"
+          "updated_utc": "2026-11-13T19:55:00Z"
         },
         {
           "id": "QA-02.2",
