@@ -1,11 +1,11 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；当前代码检查点 `af71be7`（查找对话框关闭穿透/焦点/残余 Enter 修复与焦点断言）。
+- 分支 `main`（`origin/main`）；当前代码检查点 `639ee42`（UI-18 手动隐藏来源持久化 + `_FilterDatabase`/A&B 清理，`838035d` 代码提交）。
   之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
   UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
 - 台账（`python scripts/audit_progress.py counts`）：任务 **14 已验收** / 9 待验收 /
   5 实施中 / 33 待实施；切片 **36 已验收** / 29 待验收 / 83 待实施。父项 **14/61**。
-- 当前测试真值（17:30 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
+- 当前测试真值（19:13 重跑）：core **75 bins / 683 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **232 passed / 0 failed / 0 ignored**，APP_EXIT=0；
   `cargo build -p app --offline --no-default-features --features glow` 成功。
 - UI-10 已验收（第 14 项）：用户确认 `14b36af`/`af71be7` 关闭帧隔离与 focus 回归，
