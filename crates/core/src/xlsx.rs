@@ -1826,7 +1826,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 // 会写成 <u val="none"/> / <strike val="0"/>，set_size(0) 写 <sz val="0"/>，
                 // 这三样都不合 OOXML 约束，Excel 直接拒绝打开整个文件（0x800A03EC）。
                 if st.underline {
-                    f.set_underline("single");
+                    f.set_underline(if st.double_underline { "double" } else { "single" });
                 }
                 if st.strikethrough {
                     f.set_strikethrough(true);
@@ -1907,7 +1907,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             if st.indent > 0 {
                 a.set_indent(st.indent as u32);
             }
-            if st.rotation != 0 {
+            if st.vertical_text {
+                // OOXML：textRotation=255 表示竖排（字符正立，从上到下）
+                a.set_text_rotation(255);
+            } else if st.rotation != 0 {
                 // OOXML：0..90 逆时针，91..180 表示 -1..-90
                 let v = if st.rotation >= 0 {
                     st.rotation as u32
@@ -3128,6 +3131,7 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         out.bold = matches!(f.weight, calamine::FontWeight::Bold);
         out.italic = matches!(f.style, calamine::FontStyle::Italic);
         out.underline = !matches!(f.underline, calamine::UnderlineStyle::None);
+        out.double_underline = matches!(f.underline, calamine::UnderlineStyle::Double);
         out.strikethrough = f.strikethrough;
         if let Some(n) = &f.name {
             out.font = crate::style::normalize_font(n);
@@ -3167,6 +3171,7 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         };
         out.wrap = a.wrap_text;
         out.indent = a.indent.unwrap_or(0).min(15);
+        out.vertical_text = matches!(a.text_rotation, calamine::TextRotation::Stacked);
         out.rotation = match a.text_rotation {
             calamine::TextRotation::Degrees(d) => {
                 if d <= 90 {

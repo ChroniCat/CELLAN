@@ -1279,6 +1279,10 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
     let mut in_dxfs = false;
     let mut cur: Option<Dxf> = None;
     let mut in_font = false;
+    let mut in_fill = false;
+    let mut in_border = false;
+    /// 正在读对角/内部这类未建模边框：其中的 color 不能落进填充
+    let mut skip_color = false;
     let mut side: Option<usize> = None;
 
     fn side_index(name: &str) -> Option<usize> {
@@ -1298,6 +1302,9 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
         in_dxfs: &mut bool,
         cur: &mut Option<Dxf>,
         in_font: &mut bool,
+        in_fill: &mut bool,
+        in_border: &mut bool,
+        skip_color: &mut bool,
         side: &mut Option<usize>,
     ) {
         let name = e.name();
@@ -1314,6 +1321,21 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
         let Some(d) = cur.as_mut() else { return };
         if name.ends_with("font") {
             *in_font = true;
+        }
+        if name == "fill" || name.ends_with(":fill") {
+            *in_fill = true;
+        }
+        if name == "border" || name.ends_with(":border") {
+            *in_border = true;
+        }
+        if *in_border
+            && matches!(
+                name.to_ascii_lowercase().rsplit(':').next().unwrap_or(""),
+                "diagonal" | "vertical" | "horizontal" | "start" | "end"
+            )
+        {
+            // 未建模方向：读样式存在性即可，颜色不参与填充/四边
+            *skip_color = true;
         }
         if name.ends_with("numFmt") {
             if let Some(fc) = attr_val(e, "formatCode") {
@@ -1337,6 +1359,14 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
             return;
         }
         let lname = name.to_ascii_lowercase();
+        let local = lname.rsplit(':').next().unwrap_or("");
+        if *in_border
+            && matches!(local, "diagonal" | "vertical" | "horizontal" | "start" | "end")
+        {
+            // 未建模方向：样式存在性由 dxfs_unsupported 告警，这里不改四边、不碰填充
+            *skip_color = true;
+            return;
+        }
         if let Some(idx) = side_index(&lname) {
             if let Some(style) = attr_val(e, "style") {
                 if !style.is_empty() && style != "none" {
@@ -1360,13 +1390,17 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                     if let Some(c) = hex_rgb(&a.value.to_string()) {
                         if *in_font {
                             d.color = Some(c);
-                        } else if let Some(idx) = *side {
-                            if let Some(b) = d.border.as_mut() {
-                                if let Some(slot) = b.sides[idx].as_mut() {
-                                    slot.1 = c;
+                        } else if *skip_color {
+                            // 对角/内部边框的颜色：不写进填充
+                        } else if *in_border {
+                            if let Some(idx) = *side {
+                                if let Some(b) = d.border.as_mut() {
+                                    if let Some(slot) = b.sides[idx].as_mut() {
+                                        slot.1 = c;
+                                    }
                                 }
                             }
-                        } else {
+                        } else if *in_fill {
                             d.fill = Some(c);
                         }
                     }
@@ -1377,13 +1411,27 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
 
     loop {
         match r.read_event() {
-            Ok(Event::Start(e)) => on_open(&e, false, &mut in_dxfs, &mut cur, &mut in_font, &mut side),
-            Ok(Event::Empty(e)) => on_open(&e, true, &mut in_dxfs, &mut cur, &mut in_font, &mut side),
+            Ok(Event::Start(e)) => on_open(
+                &e, false, &mut in_dxfs, &mut cur, &mut in_font, &mut in_fill, &mut in_border,
+                &mut skip_color, &mut side,
+            ),
+            Ok(Event::Empty(e)) => on_open(
+                &e, true, &mut in_dxfs, &mut cur, &mut in_font, &mut in_fill, &mut in_border,
+                &mut skip_color, &mut side,
+            ),
             Ok(Event::End(e)) => {
                 let name = e.name().as_ref().to_string();
                 let name = name.as_str();
+                let local = name.rsplit(':').next().unwrap_or("");
                 if name.ends_with("font") {
                     in_font = false;
+                } else if name == "fill" || name.ends_with(":fill") {
+                    in_fill = false;
+                } else if name == "border" || name.ends_with(":border") {
+                    in_border = false;
+                    skip_color = false;
+                } else if matches!(local, "diagonal" | "vertical" | "horizontal" | "start" | "end") {
+                    skip_color = false;
                 } else if side_index(name).is_some() {
                     side = None;
                 } else if name.ends_with("dxf") {

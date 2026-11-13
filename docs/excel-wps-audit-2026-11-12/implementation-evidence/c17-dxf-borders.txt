@@ -71,3 +71,26 @@ test result: ok. 3 passed
 ## 状态
 
 C17 按监督意见回退「待验收」：逐边保真与提示已补齐，等待复核。
+
+## 2026-11-14 监督补漏：对角颜色污染填充
+
+监督指出 `parse_dxfs` 对不支持方向（diagonal/vertical/horizontal/start/end）里的
+`<color>` 会落进 `d.fill`，`borders.xlsx` 第二条黑色对角可能变成黑填充。已修：
+
+- 解析时跟踪元素上下文：`in_font` / `in_border` / `in_fill` / `skip_color`；
+- `<fill>` 内的 color 才写 `d.fill`；四边内的 color 只写对应边；
+- 对角/内部/起止方向只记录“存在未建模样式”供 `dxfs_unsupported` 告警，
+  其 color 一律忽略，既不进填充也不塞进四边；
+- `<b/>`、`<i/>`、字体 color、numFmt 行为不变。
+
+回归 `c17_dxf_fill`：
+
+```text
+diagonal_color_does_not_become_fill      ... ok   dxfs[1].fill=None，四边不吞对角
+real_fill_still_parses                   ... ok   真正的 <fill> 仍解析为 #EAEAEA
+saving_does_not_turn_diagonal_into_fill  ... ok   保存重开后所有 dxf fill 仍为 None
+```
+
+`borders.xlsx` 两条 dxf：第一条四边 thick/thin/medium/double 各自颜色；第二条
+`diagonalUp=1` 的对角 thin 黑，`fill=None`。对角本身保存仍会丢（`dxf_unsupported`
+提示不可无损编辑），本次只保证不再污染填充。

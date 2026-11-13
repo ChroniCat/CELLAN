@@ -1,0 +1,65 @@
+# UI-15.3 双下划线与竖排文字（真实模型）
+
+日期：2026-11-14
+
+## 模型
+
+`CellStyle` 新增两个独立字段，均参与样式去重（xf 哈希）：
+
+```rust
+pub underline: bool,
+pub double_underline: bool,   // underline 打开时生效
+pub vertical_text: bool,      // OOXML textRotation=255，字符正立纵向排列
+```
+
+- 双下划线写 `<u val="double"/>`，单线仍写 `<u/>`；两者是不同的 xf，不能互相顶替。
+- 竖排写 `<alignment textRotation="255"/>`，与 90° 旋转（`textRotation="90"`）是两个值。
+- 读取用 calamine：`UnderlineStyle::Double` → `double_underline`，
+  `TextRotation::Stacked` → `vertical_text`，`Degrees(90)` 仍是 rotation=90。
+
+## 绘制
+
+- 单线/双线：在文字下沿画一条/两条 1px 线（折行与不折行两个分支都补了双线）。
+- 竖排：每个字符正立、逐字从上到下排列，整列在格内水平居中；竖排时不再走
+  水平折行分支，也不套 90° 旋转矩阵。
+
+## 格式对话框
+
+字体页在原「U 下划线」旁新增「═ 双下划线」「竖 竖排文字」两个开关；
+勾双下划线会自动把 underline 一起打开并标记为已改动。取消不写、未改动不重写其他样式
+仍由既有的 `fmt_touched` 机制保证。
+
+## Excel / WPS 对拍
+
+Excel 造夹具（`crates/core/tests/fixtures/ui15/style.xlsx`，`scripts/ui15_style_fixture.ps1`）：
+
+```text
+FIXTURE A1_UL=-4119 A1_ORI=-4166 B2_UL=2      # 双线 / 竖排 / 单线
+styles.xml: <u val="double"/>, <u/>, textRotation="255", textRotation="90"
+```
+
+`ui15_fixture` 读取：A1 双线+竖排、B2 单线非双线、C3 旋转 90 非竖排 —— 1 passed。
+
+本实现保存的文件用 Excel 与 WPS 打开：
+
+```text
+EXCEL UL=-4119 ORI=-4166 TEXT=财务报表
+WPS   ORI=-4166 TEXT=财务报表
+```
+
+即两款 Office 都读出「双下划线 + 竖排」，文字未变。
+
+## 单测
+
+```text
+double_underline_is_a_separate_style_not_single        ... ok
+vertical_text_is_not_rotation_90                       ... ok
+double_underline_and_vertical_text_survive_xlsx_roundtrip ... ok  (styles.xml 断言 val="double"、textRotation="255")
+excel_double_underline_and_vertical_are_read_distinctly ... ok
+```
+
+## 未做
+
+- 真实键鼠在对话框中勾选/取消并目视两条线、竖排字符（RDP 不可用），入口与保存由单测覆盖。
+- 会计用单/双下划线（singleAccounting/doubleAccounting）未建模；只做普通单/双线。
+- 竖排只用于单行文本；与自动换行同时打开时按竖排优先，不再水平折行。

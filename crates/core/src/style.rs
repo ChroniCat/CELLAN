@@ -128,6 +128,12 @@ pub struct CellStyle {
     /// 单下划线（Excel 的 U）
     #[serde(default)]
     pub underline: bool,
+    /// 双下划线（underline 打开时生效）
+    #[serde(default)]
+    pub double_underline: bool,
+    /// 竖排文字（OOXML textRotation=255，字符正立纵向排列）
+    #[serde(default)]
+    pub vertical_text: bool,
     /// 删除线
     #[serde(default)]
     pub strikethrough: bool,
@@ -172,6 +178,8 @@ impl Default for CellStyle {
             bold: false,
             italic: false,
             underline: false,
+            double_underline: false,
+            vertical_text: false,
             strikethrough: false,
             rotation: 0,
             font: String::new(),
@@ -229,6 +237,8 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.bold.hash(&mut h);
     s.italic.hash(&mut h);
     s.underline.hash(&mut h);
+        s.double_underline.hash(&mut h);
+        s.vertical_text.hash(&mut h);
     s.strikethrough.hash(&mut h);
     s.rotation.hash(&mut h);
     s.font.hash(&mut h);

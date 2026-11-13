@@ -6667,6 +6667,75 @@ fn selection_permissions_block_jumping_into_forbidden_cells() {
     assert!(!app.sel_blocked_at(5, 5));
 }
 
+/// C15：Tab/Enter 的 advance_active 也必须过选择权限，不能从名称框拦住、键盘却走得进去。
+#[test]
+fn keyboard_advance_skips_cells_without_selection_permission() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // A1 锁定（默认），B1/C1 解锁，D1 锁定；保护表只允许选未锁格
+    for c in [1u32, 2] {
+        let sid = app.wb.sheet(0).style_of(0, c);
+        let mut st = app.wb.styles.get(sid).clone();
+        st.locked = false;
+        let sid = app.wb.styles.intern(st);
+        app.wb.sheet_mut(0).set_style(0, c, sid);
+    }
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.advance_active(0, 1); // Tab：C1 未锁，可以进
+    assert_eq!(app.sel, (0, 2), "Tab 应停在 C1");
+    app.advance_active(0, 1); // D1 锁定：必须跳过
+    assert_ne!(app.sel, (0, 3), "Tab 不能进入禁止选择的锁定格 D1");
+    assert!(app.sel_blocked_at(0, 3));
+
+    // 全锁：来回都走不动，状态栏说明原因
+    let mut app2 = SheetApp::new_with_context(&ctx, None);
+    let mut p2 = sheetcore::protection::SheetProtection::new_with_password("pw");
+    p2.perms.select_locked = false;
+    p2.perms.select_unlocked = true;
+    app2.wb.sheet_mut(0).protection = Some(p2);
+    app2.sel = (0, 0);
+    app2.sel_end = (0, 0);
+    app2.advance_active(0, 1);
+    assert_eq!(app2.sel, (0, 0), "全部禁选时不能移动");
+    assert!(app2.status.contains("不允许选择"), "状态栏：{}", app2.status);
+}
+
+/// C15：名称框 A1:B2 这类整块选区必须逐格检查，不能只看左上角。
+#[test]
+fn name_box_range_rejects_when_any_cell_is_forbidden() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // B1 解锁，A1/B2 保持锁定
+    let sid = app.wb.sheet(0).style_of(0, 1);
+    let mut st = app.wb.styles.get(sid).clone();
+    st.locked = false;
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(0, 1, sid);
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.name_buf = "A1:B2".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 1), "含锁定格的整块选区不能被接受");
+    assert_eq!(app.sel_end, (0, 1));
+    assert!(app.rect_sel_blocked((0, 0), (1, 1)));
+    assert!(!app.rect_sel_blocked((0, 1), (0, 1)));
+
+    app.name_buf = "B1".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 1), "仅未锁格可以定位");
+    assert_eq!(app.sel_end, (0, 1));
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();

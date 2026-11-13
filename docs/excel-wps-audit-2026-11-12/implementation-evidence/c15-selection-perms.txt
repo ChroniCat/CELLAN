@@ -59,3 +59,30 @@ test result: ok. 1 passed; 0 failed
 
 C15 已按监督意见回退「待验收」：入口与回归已补齐，等待复核；
 真实 GUI 键鼠操作在本机 RDP 会话不可用时未执行，不以 SC_* 探针或截图冒充。
+
+## 2026-11-14 监督补漏：Enter/Tab 与整块名称框
+
+监督指出两处原范围绕过，已修并加回归：
+
+1. `advance_active`（Enter / Shift+Enter / Tab / Shift+Tab）原来只按可见行列推进，
+   不查选择权限。现在：
+   - 有导航矩形时，逐个候选格查 `sel_blocked_at`，被禁选的格跳过继续找；
+   - 无导航矩形时，沿方向反复 `next_visible_row/col` 跳过被禁选格，回到起点或
+     2 万次上限则停在原地并在状态栏说明；
+   - 锁定格与未锁格分别按 `select_locked` / `select_unlocked` 判定。
+
+2. 名称框 `A1:B2` 原来只查左上角 A1。现在 `rect_sel_blocked(a,b)` 逐格检查
+   整个矩形（超过 20 万格时保守地按权限位判断），任何一格禁选就整块拒绝，
+   与鼠标拖选的门禁一致。
+
+回归（app `--bin app`）：
+
+```text
+edit_regression_tests::keyboard_advance_skips_cells_without_selection_permission ... ok
+edit_regression_tests::name_box_range_rejects_when_any_cell_is_forbidden ... ok
+```
+
+第一条覆盖：B1/C1 未锁时 Tab 停在 C1；再 Tab 不进入锁定的 D1；全锁时原地不动并提示。
+第二条覆盖：`A1:B2` 含锁定格被拒、只选 `B1` 可以定位。
+
+未做：真实键鼠按 Tab 的 GUI 目视（RDP 不可用），入口由单元回归覆盖。

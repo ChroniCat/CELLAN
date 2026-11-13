@@ -3309,12 +3309,13 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "选择锁定/未锁定单元格权限已在鼠标按下、拖拽扩选、方向键、名称框定位四个入口执行；等待监督复核"
+        "选择锁定/未锁定单元格权限已在鼠标按下、拖拽扩选、方向键、名称框定位四个入口执行；等待监督复核",
+        "Enter/Tab advance_active 与名称框整块选区门禁已补；真实键鼠未目视"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核选择权限入口",
-      "updated_utc": "2026-11-13T17:41:44Z",
+      "updated_utc": "2026-11-13T20:26:43Z",
       "slices": [
         {
           "id": "C15.1",
@@ -3615,12 +3616,13 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "Dxf 四边已逐边保真（style+color），对角/内部/起止边框不建模但标 unsupported 并在管理窗口提示；等待监督复核"
+        "Dxf 四边已逐边保真（style+color），对角/内部/起止边框不建模但标 unsupported 并在管理窗口提示；等待监督复核",
+        "parse_dxfs 按元素上下文取 color；对角颜色不再进填充，保存重开断言"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核逐边边框与扩展提示",
-      "updated_utc": "2026-11-13T17:41:44Z",
+      "updated_utc": "2026-11-13T20:26:43Z",
       "slices": [
         {
           "id": "C17.1",
@@ -5165,7 +5167,7 @@
       "scope": "app/main.rs format_dialog + core/style.rs",
       "source": "ui-requirements.md",
       "heading": "UI-15 格式对话框补全高频能力",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "UI-15.1 自定义格式/正负零三段已实现并专项、全量通过；UI-15.2 填充/保护页已实现（模板字段/protection OOXML 往返、混合页签、截图），真实鼠标与 Office 目视待验收；UI-15.3 双下划线/竖排仍未实现，父项实施中。",
       "files": [
         "crates/app/src/main.rs",
@@ -5185,14 +5187,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt"
       ],
       "not_done": [
-        "真实鼠标输入/取消/Esc、Excel/WPS 保存重开目视未做",
-        "双下划线/竖排真实模型未实现",
-        "逐格 locked/hidden 的执行语义仍需在保护流程中专项验收"
+        "双下划线/竖排已建模并经 Excel/WPS 回读；自定义数字格式已验；真实键鼠对话框未执行"
       ],
       "failures": [],
       "blocker": "",
       "next": "继续 UI-15.3 双下划线/竖排；随后补填充/保护页真实鼠标和 Office 目视。",
-      "updated_utc": "2026-11-13T07:58:00Z",
+      "updated_utc": "2026-11-13T20:26:43Z",
       "slices": [
         {
           "id": "UI-15.1",
@@ -5275,17 +5275,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/style.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/ui15_style.rs",
+            "crates/core/tests/ui15_fixture.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.txt"
+          ],
+          "not_done": [
+            "双下划线独立 xf；竖排 textRotation=255 非 rotation=90；Excel/WPS 回读 -4119/-4166；真实键鼠未执行"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T20:26:43Z"
         }
       ]
     },

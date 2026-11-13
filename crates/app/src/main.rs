@@ -177,6 +177,8 @@ struct FmtState {
     bold: bool,
     italic: bool,
     underline: bool,
+    double_underline: bool,
+    vertical_text: bool,
     strikethrough: bool,
     rotation: i16,
     size: f32,
@@ -200,6 +202,8 @@ struct FmtMixed {
     bold: bool,
     italic: bool,
     underline: bool,
+    double_underline: bool,
+    vertical_text: bool,
     strikethrough: bool,
     rotation: bool,
     color: bool,
@@ -222,6 +226,8 @@ struct FmtTouched {
     bold: bool,
     italic: bool,
     underline: bool,
+    double_underline: bool,
+    vertical_text: bool,
     strikethrough: bool,
     rotation: bool,
     color: bool,
@@ -4095,6 +4101,30 @@ impl SheetApp {
         }
     }
 
+    /// 名称框整块选区：任何一格被禁选就整批拒绝（和鼠标拖选一致）
+    fn rect_sel_blocked(&self, a: (u32, u32), b: (u32, u32)) -> bool {
+        let (r1, c1) = (a.0.min(b.0), a.1.min(b.1));
+        let (r2, c2) = (a.0.max(b.0), a.1.max(b.1));
+        let total = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+        if total > 200_000 {
+            let Some(p) = self.wb.sheet(self.sheet_idx).protection.as_ref() else {
+                return false;
+            };
+            if !p.sheet {
+                return false;
+            }
+            return !(p.perms.select_locked && p.perms.select_unlocked);
+        }
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if self.sel_blocked_at(r, c) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn block_selection(&mut self) {
         self.status = "工作表受保护：不允许选择该区域的单元格（审阅 → 撤销保护后可改）".into();
     }
@@ -7245,6 +7275,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             bold: st.bold,
             italic: st.italic,
             underline: st.underline,
+            double_underline: st.double_underline,
+            vertical_text: st.vertical_text,
             strikethrough: st.strikethrough,
             rotation: st.rotation,
             size: st.size,
@@ -7296,6 +7328,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 m.bold |= s.bold != first.bold;
                 m.italic |= s.italic != first.italic;
                 m.underline |= s.underline != first.underline;
+                m.double_underline |= s.double_underline != first.double_underline;
+                m.vertical_text |= s.vertical_text != first.vertical_text;
                 m.strikethrough |= s.strikethrough != first.strikethrough;
                 m.rotation |= s.rotation != first.rotation;
                 m.color |= s.color != first.color;
@@ -7335,6 +7369,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let want_bold = st.bold != orig.bold || touched.bold;
         let want_italic = st.italic != orig.italic || touched.italic;
         let want_underline = st.underline != orig.underline || touched.underline;
+        let want_double_u = st.double_underline != orig.double_underline || touched.double_underline;
+        let want_vertical = st.vertical_text != orig.vertical_text || touched.vertical_text;
         let want_strike = st.strikethrough != orig.strikethrough || touched.strikethrough;
         let want_rotation = st.rotation != orig.rotation || touched.rotation;
         let want_size = (st.size - orig.size).abs() > f32::EPSILON || touched.size;
@@ -7352,6 +7388,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             || want_bold
             || want_italic
             || want_underline
+            || want_double_u
+            || want_vertical
             || want_strike
             || want_rotation
             || want_size
@@ -7398,6 +7436,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 if want_bold { s.bold = st.bold; }
                 if want_italic { s.italic = st.italic; }
                 if want_underline { s.underline = st.underline; }
+                if want_double_u { s.double_underline = st.double_underline; }
+                if want_vertical { s.vertical_text = st.vertical_text; }
                 if want_strike { s.strikethrough = st.strikethrough; }
                 if want_rotation { s.rotation = st.rotation; }
                 if want_size { s.size = st.size; }
@@ -7438,7 +7478,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 sheetcore::sparse::parse_ref(parts[1]),
             ) {
                 self.commit_edit(None);
-                if self.sel_blocked_at(a.0, a.1) {
+                if self.rect_sel_blocked(a, b) {
                     self.block_selection();
                     return;
                 }
@@ -8143,6 +8183,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     }
                 }
                 if rows.size(r) > 0.0 && cols.size(c) > 0.0 {
+                    if self.sel_blocked_at(r, c) {
+                        continue;
+                    }
                     self.sel = (r, c);
                     self.ensure_visible();
                     return;
@@ -8150,13 +8193,29 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
             return;
         }
-        let (nr, nc) = if dr != 0 {
+        let (mut nr, mut nc) = if dr != 0 {
             (self.next_visible_row(self.sel.0, dr > 0), self.sel.1)
         } else if dc != 0 {
             (self.sel.0, self.next_visible_col(self.sel.1, dc > 0))
         } else {
             return;
         };
+        let start = self.sel;
+        let mut guard = 0;
+        while self.sel_blocked_at(nr, nc) {
+            let next = if dr != 0 {
+                (self.next_visible_row(nr, dr > 0), nc)
+            } else {
+                (nr, self.next_visible_col(nc, dc > 0))
+            };
+            if next == (nr, nc) || next == start || guard > 20_000 {
+                self.block_selection();
+                return;
+            }
+            nr = next.0;
+            nc = next.1;
+            guard += 1;
+        }
         self.sel = (nr, nc);
         self.sel_end = (nr, nc);
         self.extra_sel.clear();
@@ -15853,7 +15912,7 @@ let txn = self.txn_begin(&keys);
                         }
                         x += w;
                     }
-                } else if multiline {
+                } else if multiline && !st.vertical_text {
                     let max_w = (rect.width() - 8.0).max(8.0);
                     let galley = painter.layout(txt.clone(), font.clone(), color, max_w);
                     let h = galley.size().y;
@@ -15879,6 +15938,13 @@ let txn = self.txn_begin(&keys);
                             [egui::pos2(x, uy), egui::pos2(x + uw, uy)],
                             Stroke::new(1.0, color),
                         );
+                        if st.double_underline {
+                            let uy2 = uy + 2.0;
+                            clipped.line_segment(
+                                [egui::pos2(x, uy2), egui::pos2(x + uw, uy2)],
+                                Stroke::new(1.0, color),
+                            );
+                        }
                     }
                     if st.strikethrough {
                         let sy = top + uh * 0.52;
@@ -15917,7 +15983,19 @@ let txn = self.txn_begin(&keys);
                         ));
                     }
                     let clipped = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
-                    if st.rotation != 0 {
+                    if st.vertical_text {
+                        // 竖排：每个字符正立，从上往下排，整体在格内水平居中
+                        let chs: Vec<char> = txt.chars().collect();
+                        let line_h = font.size * 1.35;
+                        let total = line_h * chs.len() as f32;
+                        let mut yy = (rect.center().y - total / 2.0).max(rect.min.y + 1.0);
+                        for ch in chs {
+                            let cg = painter.layout_no_wrap(ch.to_string(), font.clone(), color);
+                            let xx = rect.center().x - cg.size().x / 2.0;
+                            clipped.galley(egui::pos2(xx, yy), cg, color);
+                            yy += line_h;
+                        }
+                    } else if st.rotation != 0 {
                         // 文字旋转：TextShape 的 angle 绕原点转，所以把原点放在
                         // 「单元格中心减去旋转后的半尺寸」处，文字中心才落在格心
                         let angle = -(st.rotation as f32).to_radians();
@@ -15945,6 +16023,13 @@ let txn = self.txn_begin(&keys);
                             [egui::pos2(x0, uy), egui::pos2(x0 + w, uy)],
                             Stroke::new(1.0, color),
                         );
+                        if st.double_underline {
+                            let uy2 = uy + 2.0;
+                            clipped.line_segment(
+                                [egui::pos2(x0, uy2), egui::pos2(x0 + w, uy2)],
+                                Stroke::new(1.0, color),
+                            );
+                        }
                     }
                     if st.strikethrough && st.rotation == 0 {
                         let sy = y0 + gh * 0.52;
@@ -18143,6 +18228,38 @@ let txn = self.txn_begin(&keys);
                             {
                                 self.fmt_state.underline = !self.fmt_state.underline;
                                 self.fmt_touched.underline = true;
+                            }
+                            if ui_kit::text_toggle(
+                                ui,
+                                "═",
+                                self.fmt_state.double_underline,
+                                "双下划线",
+                                false,
+                                false,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.fmt_state.double_underline = !self.fmt_state.double_underline;
+                                self.fmt_touched.double_underline = true;
+                                if self.fmt_state.double_underline {
+                                    self.fmt_state.underline = true;
+                                    self.fmt_touched.underline = true;
+                                }
+                            }
+                            if ui_kit::text_toggle(
+                                ui,
+                                "竖",
+                                self.fmt_state.vertical_text,
+                                "竖排文字（字符正立，从上到下）",
+                                false,
+                                false,
+                                false,
+                            )
+                            .clicked()
+                            {
+                                self.fmt_state.vertical_text = !self.fmt_state.vertical_text;
+                                self.fmt_touched.vertical_text = true;
                             }
                             if ui_kit::text_toggle(
                                 ui,
