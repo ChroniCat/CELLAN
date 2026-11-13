@@ -1,29 +1,31 @@
 # 恢复记录
 
-## 2026-11-14 04:0x 监督复核后的检查点
+## 2026-11-14 检查点：C16 打印四切片已实现
 
-- 分支 `main`，HEAD `723c6cd` 已 push。
-- 台账：**已验收 24 / 61**，待验收 4（C07、UI-01、C15、C17），实施中 8，待实施 25。
-  监督明确指出：28/61 是上一轮自报，尚未全认可；本次按复核意见把四项回退待验收，
-  不以改测试期望或删需求消缺口。
-- 本轮修复（都有实测/回归，见 `implementation-evidence/`）：
-  - **C07 OFFSET**（`c07-dv-offset.txt`）：省略 height/width 继承 reference 尺寸；
-    跨表 reference 不改变 COUNTA($A:$A) 的表上下文；负数 height 反向展开；reference 可名称。
-    Excel 16.0 COM 实测 ROWS=3 / 跨表 ROWS=2 / OFFSET($A$3,0,0,-2,1)=$A$2:$A$3；
-    夹具 `fixtures/c07/offset.xlsx` 往返 + 两条单测 + 两条集成测试。
-  - **C15 选择权限**（`c15-selection-perms.txt`）：selectLockedCells/selectUnlockedCells
-    在鼠标按下、拖拽扩选、方向键、名称框四个入口执行；回归
-    `selection_permissions_block_jumping_into_forbidden_cells`。
-  - **C17 Dxf 四边**（`c17-dxf-borders.txt`）：`DxfBorder.sides[4]` 逐边 style/color，
-    解析/保存/绘制都按边；对角/内部/起止边标 `dxf_unsupported` 并在管理窗口提示；
-    夹具 `fixtures/c17/borders.xlsx`，Excel 重开我们保存的文件四边颜色各自保留。
-  - **UI-01**：按监督意见回退，not_done 明确「中文 IME 实机确认未执行，转 QA-04」。
-- 测试基线（同一 cargo 串行，`--offline -j 2`，测试 `--test-threads=2`）：
-  - sheetcore 全量 → 757 passed / 0 failed
-  - app `--bin app` → 263 passed / 0 failed
-  - `--test ui_regression` → 20 passed
-- 真实 GUI 约束（监督新要求，长期有效）：不得用 `SC_*` 注入或截图替代实际键鼠/IME；
-  本机 RDP 会话不可用，需要真实输入的验收（UI-01 IME、C15/C17 交互）一律留待验收，
-  改用可在无界面验证的部分推进其它任务。
-- 下一步：C16 打印/PDF（数字格式已共享，缺合并/换行/对齐/分页重复标题/图片/图表/
-  预览与 PDF 一致），先做 `print` 共享显示模型 + 逐页 PDF 对拍；不触碰已验收项。
+- 分支 `main`，HEAD `f31ce19` 已 push。
+- 台账：已验收 24 / 61；待验收 5（UI-01、C07、C15、C17、C16）；实施中 7；待实施 25。
+- C16（打印/PDF）四个切片全部实现，证据 `implementation-evidence/c16-print-layout.txt`、
+  `c16-objects.txt`：
+  - 新增 `crates/core/src/display.rs`：General 对齐、数字格式、[Red]、合并、折行、
+    垂直对齐、缩进、条件格式叠加，屏幕/预览/PDF 共用；
+  - `print::page_ops` 产 rects/lines/texts/polys/images，PDF 只多字形编码，
+    预览直接画同一份 ops；分页正文从标题之后开始，标题每页重复且不与正文/标题列重叠；
+  - 页眉页脚 `&L/&C/&R`、`&P`、`&N`；单段数字格式负号按 Excel 实测修正（`--987.65`）；
+  - 图片（JPEG DCTDecode / PNG 解 IDAT+过滤器后 FlateDecode）、图表（柱/条/折线/饼 +
+    标题/轴/图例）、文本框（EMU 换算 + 自动换行）；
+  - 修复真实 bug：图表锚点 `<xdr:from><xdr:col>` 解析失败导致锚点全变 (0,0,4,3)、
+    图表压住数据；修复后夹具解析 C1:I15。
+- 测试：sheetcore **766 passed**、app `--bin app` **263 passed**；c16_print 6 条、
+  c16_objects 3 条。PDF 用 pypdfium2 逐页取文本 + 渲染 PNG 核对（表格/图表/图片/文本框无重叠）。
+- Excel 对拍差异如实记录：Excel 在 `print_title_rows=1:2` 与合并标题重叠时，把合并标题
+  挪到第 2 页、并跳过合并换行块；我们按"标题每页重复、正文不重不漏"输出，不复刻该缺陷。
+- GUI 约束继续有效：真实键鼠/IME 未执行（RDP 不可用），C16 及此前四项均留待验收，
+  不用 `SC_*` 注入或截图冒充。
+
+## 下一步
+
+1. **C18 样式模型与未知样式保留**（待实施）：先做 C18.1 主题色/tint 解析——读
+   `xl/theme/theme1.xml` 的 `clrScheme`，`<color theme="n" tint="t"/>` 按 tint 公式解析成
+   RGB；保存时保留原始 theme/tint 属性，不能降级成 rgb。再评估图案填充与复杂边框。
+2. QA-06 公式语义矩阵（纯核心，可与 C18 并行排期）。
+3. 需要真实输入/IME 的项（UI-01、QA-04、UI-11、UI-24…）等可用桌面会话，不伪造。
