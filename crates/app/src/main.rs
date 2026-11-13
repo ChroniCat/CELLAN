@@ -109,6 +109,9 @@ struct FindState {
     order_column: bool,
     /// scope==2 时锁定的搜索选区：与命中光标分离，连续“下一个”不会退化成单格
     session_rect: Option<(u32, u32, u32, u32)>,
+    /// scope==2 时锁定的全部选区（主选区 + Ctrl 多选块），按选区快照顺序去重。
+    /// `find_next` 会清空当前 extra_sel，不能靠它保存搜索范围。
+    session_rects: Vec<(u32, u32, u32, u32)>,
     /// true = 在公式文本里查找/替换
     in_formula: bool,
     /// 值模式命中公式结果时，是否允许把公式替换成常量（默认否，避免静默破坏公式）
@@ -2371,6 +2374,7 @@ impl SheetApp {
                         Ok("find") => {
                             self.find.open = true;
                             self.find.session_rect = None;
+                            self.find.session_rects.clear();
                         }
                         Ok("cf") => self.cf_mgr = true,
                         Ok("chart") => {
@@ -5833,6 +5837,33 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
+    /// scope==2 的选区快照：主矩形 + Ctrl 多选矩形；没有快照时退回当前选择。
+    fn find_rects(&self) -> Vec<(u32, u32, u32, u32)> {
+        if self.find.scope != 2 {
+            return Vec::new();
+        }
+        if !self.find.session_rects.is_empty() {
+            return self.find.session_rects.clone();
+        }
+        let mut rects = self.extra_sel.clone();
+        rects.push(self.find.session_rect.unwrap_or_else(|| self.sel_rect()));
+        rects.sort_unstable();
+        rects.dedup();
+        rects
+    }
+
+    fn lock_find_rects(&mut self) {
+        if self.find.scope != 2 || !self.find.session_rects.is_empty() {
+            return;
+        }
+        self.find.session_rect = Some(self.sel_rect());
+        let mut rects = self.extra_sel.clone();
+        rects.push(self.sel_rect());
+        rects.sort_unstable();
+        rects.dedup();
+        self.find.session_rects = rects;
+    }
+
     /// 当前范围（选区/工作表/工作簿）的全部命中，按选定顺序排序
     fn find_hits(&self) -> Vec<sheetcore::search::Hit> {
         let opts = self.search_opts();
@@ -5844,16 +5875,25 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         match self.find.scope {
             1 => sheetcore::search::hits(&self.wb, None, &needle, &opts, order),
             2 => {
-                let (r1, c1, r2, c2) =
-                    self.find.session_rect.unwrap_or_else(|| self.sel_rect());
-                sheetcore::search::hits_in_rect(
-                    &self.wb,
-                    self.sheet_idx,
-                    (r1, c1, r2, c2),
-                    &needle,
-                    &opts,
-                    order,
-                )
+                let mut out = Vec::new();
+                for (r1, c1, r2, c2) in self.find_rects() {
+                    out.extend(sheetcore::search::hits_in_rect(
+                        &self.wb,
+                        self.sheet_idx,
+                        (r1, c1, r2, c2),
+                        &needle,
+                        &opts,
+                        order,
+                    ));
+                }
+                match order {
+                    sheetcore::search::SearchOrder::RowMajor => out.sort_unstable(),
+                    sheetcore::search::SearchOrder::ColumnMajor => {
+                        out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row))
+                    }
+                }
+                out.dedup();
+                out
             }
             _ => sheetcore::search::hits(&self.wb, Some(self.sheet_idx), &needle, &opts, order),
         }
@@ -5863,23 +5903,25 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn scan_candidates(&self) -> Vec<sheetcore::search::Hit> {
         let mut keys = Vec::new();
         let order = self.search_order();
-        let (only, rect) = match self.find.scope {
-            1 => (None, None),
-            2 => (
-                Some(self.sheet_idx),
-                Some(self.find.session_rect.unwrap_or_else(|| self.sel_rect())),
-            ),
-            _ => (Some(self.sheet_idx), None),
+        let (only, rects) = match self.find.scope {
+            1 => (None, Vec::new()),
+            2 => (Some(self.sheet_idx), self.find_rects()),
+            _ => (Some(self.sheet_idx), Vec::new()),
         };
         for (si, sh) in self.wb.sheets.iter().enumerate() {
             if only.is_some_and(|x| x != si) {
                 continue;
             }
             for (k, _) in sh.iter() {
-                if let Some((r1, c1, r2, c2)) = rect {
-                    if k.row < r1 || k.row > r2 || k.col < c1 || k.col > c2 {
-                        continue;
-                    }
+                if !rects.is_empty()
+                    && !rects.iter().any(|(r1, c1, r2, c2)| {
+                        k.row >= (*r1).min(*r2)
+                            && k.row <= (*r1).max(*r2)
+                            && k.col >= (*c1).min(*c2)
+                            && k.col <= (*c1).max(*c2)
+                    })
+                {
+                    continue;
                 }
                 keys.push(sheetcore::search::Hit { sheet: si, row: k.row, col: k.col });
             }
@@ -5903,7 +5945,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if self.find.scope == 2 && self.find.session_rect.is_none() {
-            self.find.session_rect = Some(self.sel_rect());
+            self.lock_find_rects();
         }
         let keys = self.scan_candidates();
         if keys.is_empty() {
@@ -6043,7 +6085,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if self.find.scope == 2 && self.find.session_rect.is_none() {
-            self.find.session_rect = Some(self.sel_rect());
+            self.lock_find_rects();
         }
         let hits = self.find_hits();
         if hits.is_empty() {
@@ -6957,6 +6999,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if find_k || repl_k {
             self.find.open = true;
             self.find.session_rect = None;
+            self.find.session_rects.clear();
             if repl_k {
                 self.find.replace.clear();
             }
@@ -21687,6 +21730,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
+        self.find.session_rects.clear();
         self.find.find_all_open = false;
         let title = self
             .wb
@@ -21720,6 +21764,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
+        self.find.session_rects.clear();
         self.find.find_all.clear();
         self.find.find_all_open = false;
         self.wb = doc.wb;
@@ -21880,6 +21925,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.painter_double = false;
         self.find_scan = None;
         self.find.session_rect = None;
+        self.find.session_rects.clear();
         self.find.find_all.clear();
         self.find.find_all_open = false;
         // 无界面验收：SC_SEL/SC_SEL2 给定了选区就保留（否则打开文件后会被清掉）。
@@ -22401,6 +22447,7 @@ impl SheetApp {
                     self.find.tab = 0;
                     self.find.open = true;
                     self.find.session_rect = None;
+                    self.find.session_rects.clear();
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
                 let acc = Rect::from_min_size(

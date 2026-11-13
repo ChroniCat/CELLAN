@@ -4,7 +4,7 @@
 - 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
   切片 33 已验收 / 20 待验收 / 95 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
-  CORE_EXIT=0；app **204 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
+  CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
 - 当前未完成：C11.3/C11.4 待独立复核、C11 父项仍实施中；C10.2 live 按用户要求保留，
   C11.1/C11.2 已认可项不重复修。
@@ -366,5 +366,17 @@
 - `c11_compat` 新增真实 recalc 负例：前者缓存 7 -> `Text("[1]First:Third!A1")`，
   后者缓存 7 -> `Error(Div0)`；检测器三条字符串/转义断言均为 `None`。
 - 专项 **4 passed**；全量 core **75 bins / 678 passed / 0 failed / 41 ignored**，
-  CORE_EXIT=0；app **204 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+  CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。
 - 未重做 Office 外部三维夹具，原 60 缓存链仍有效；父项 C11 保持待验收。
+- 已提交并推送 `4d1f925`（字符串边界修复）；远端 `origin/main` 与本地一致。
+
+
+## 13:55 当前：UI-05 多选区查找范围
+
+- 补齐 `extra_sel` 多选区并入查找/全部替换；`session_rects` 锁定主选区与
+  Ctrl 多选块，`find_next` 清空当前 `extra_sel` 后仍保留搜索快照。
+- 新测试 `find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot`
+  通过；`find_` **8 passed**；App 全量 **205 passed / 0 failed / 0 ignored**，
+  APP_EXIT=0。core 未改，沿用 **75 bins / 678 / 0 / 41**。
+- UI-05 的剩余真实鼠标对话框、单次查找可取消、结果虚拟滚动仍未做，
+  UI-05.4/UI-05 保持待验收。

@@ -4435,3 +4435,33 @@ fn manual_mode_dv_and_paste_keep_cached_values() {
     assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0), "粘贴不能自动重算");
     assert!(app.wb.calc_pending);
 }
+
+/// UI-05.4：Ctrl 多选区必须整体成为查找范围；查找跳转后当前 extra_sel
+/// 会被清空，但锁定快照仍要保留其余块，不能从第二处起退回主选区。
+#[test]
+fn find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot() {
+    let mut app = app();
+    for (r, c) in [(0u32, 0u32), (4, 1), (9, 3)] {
+        app.wb.sheet_mut(0).set(r, c, text("needle"));
+    }
+    app.find.find = "needle".into();
+    app.find.scope = 2;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.extra_sel = vec![(4, 1, 4, 1), (9, 3, 9, 3)];
+
+    let hits = app.find_hits();
+    assert_eq!(
+        hits.iter().map(|h| (h.row, h.col)).collect::<Vec<_>>(),
+        vec![(0, 0), (4, 1), (9, 3)],
+        "主选区 + 两个 Ctrl 块都应命中"
+    );
+
+    app.find.session_rect = None;
+    app.find.session_rects.clear();
+    app.find_next(false);
+    assert_eq!(app.sel, (4, 1), "第一处应从主选区跳到第二块");
+    assert!(app.extra_sel.is_empty(), "跳转本身仍清当前多选");
+    app.find_next(false);
+    assert_eq!(app.sel, (9, 3), "锁定快照必须保留第三块");
+}

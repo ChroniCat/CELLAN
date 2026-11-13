@@ -121,3 +121,14 @@ M9 单次替换不置 dirty → 保存/脏标记用例 FAILED
 - 单次“查找下一个”仍是同步稀疏扫描，超大簿上不可取消；可取消覆盖的是查找全部/全部替换的扫描阶段。
 - 反向查找已有「上一个」按钮；真实鼠标点击仍待验收。
 - 结果列表窗口最多显示 500 项（更长的会提示总数，但未做虚拟滚动）。
+
+
+## 2026-11-13 13:55 追加：Ctrl 多选区查找范围
+
+- 已补齐 `extra_sel` 多选区并入查找与全部替换；`find_next` 跳转后仍保留
+  搜索选区快照，第二处不会退回主选区。
+- 新测试 `find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot`
+  通过；`find_` 8 passed；App 全量 205 passed / 0 failed。
+- 证据：`ui05-multiselect-scope.txt`。
+- 真实鼠标按钮/取消/结果列表项、单次查找可取消、结果虚拟滚动仍未做，
+  UI-05.4/UI-05 保持待验收。
