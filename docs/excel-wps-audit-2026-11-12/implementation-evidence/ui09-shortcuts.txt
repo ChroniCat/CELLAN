@@ -1,4 +1,4 @@
-UI-09.1 常用选择/格式快捷键（2026-11-13 15:25 CST）
+UI-09.1 常用选择/格式快捷键（2026-11-13 14:28 CST）
 
 实现
 - Ctrl+B/I/U：调用既有 Ribbon Bold/Italic/Underline 命令，走 apply_style 的

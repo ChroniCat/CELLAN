@@ -7160,9 +7160,6 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if find_k || repl_k {
             self.find.tab = if repl_k { 1 } else { 0 };
             self.find_open_new_session();
-            if repl_k {
-                self.find.replace.clear();
-            }
             return;
         }
         if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(Key::V)) {

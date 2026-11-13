@@ -403,7 +403,7 @@
 - 下一步：提交/推送 UI-10，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
   其余 P0/P1 任务）。
 
-## 14:22 当前：UI-10 查找页签与关闭覆盖
+## 14:13 当前：UI-10 查找页签与关闭覆盖
 
 - Ctrl+H 设置 find.tab=1，Ctrl+F 设置 0；仍走 find_open_new_session 清新快照。
 - 查找对话框“关闭”改为局部 close 意图，末尾 open && !close；名称管理器与加载问题窗口
@@ -411,7 +411,7 @@
 - 新测试 ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab 通过；全量 app
   **210 passed / 0 failed / 0 ignored**。真实鼠标关闭/×/Esc 与焦点回落未做，UI-10 待验收。
 
-## 14:40 当前：UI-18 筛选入口语义
+## 14:21 当前：UI-18 筛选入口语义
 
 - clear_filter_criteria 保留 filter/箭头，只清条件并恢复条件隐藏行；disable_filter 才移除
   筛选器；reapply_filter 单独重算；hidden_rows_user 手动隐藏行不被清。
@@ -420,7 +420,7 @@
 - 专项 2 passed（含 xlsx save/load 后箭头在、条件空、手动隐藏行保留）；全量 app
   **210 passed / 0 failed / 0 ignored**。真实 Excel/WPS 目视与鼠标入口未做，UI-18 待验收。
 
-## 15:05 当前：UI-09.2 视口翻页与切表
+## 14:25 当前：UI-09.2 视口翻页与切表
 
 - PageUp/Down 改为按 visible_page_rows（真实行高、当前滚动、跳过隐藏行）翻页，
   步长=可见行数-1，保留一行重叠；到 1048575 不越界。
@@ -430,10 +430,20 @@
   test_env 冲突而失败一次，已改 current_exe().parent() 后全绿。
 - UI-09.2 待真实 720/1080 键盘与滚动重叠目视；UI-09 父项未验收。
 
-## 15:25 当前：UI-09.1 常用选择/格式快捷键
+## 14:28 当前：UI-09.1 常用选择/格式快捷键
 
 - Ctrl+B/I/U 接既有 Ribbon 样式命令；Ctrl+A 第一次当前区域、第二次全表；
   Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 名称框焦点请求。
 - 专项 common_selection_and_format_shortcuts_work 1 passed；全量 app
   **212 passed / 0 failed / 0 ignored**。F4、Shift+F10、F6 与名称框真实焦点
   仍未做，UI-09.1/09.2 均为待验收。
+
+## 14:30 当前：UI-10 重开保留输入
+
+- 移除 Ctrl+H 分支中 `self.find.replace.clear()`；find_open_new_session 只清明细快照。
+- 回归先存 alpha/beta，关闭后 Ctrl+H：open=true、tab=1、两输入保留；关闭 Ctrl+F：
+  tab=0、输入保留；再关闭 Ctrl+H 仍保留。
+- 专项 1 passed；全量 app **212 passed / 0 failed / 0 ignored**。真实关闭/×/Esc 与焦点
+  回落仍未做，UI-10 保持待验收。
+- 已按实际系统时间修正 ui09-page-viewport (14:25)、ui09-shortcuts (14:28)、
+  ui18-filter-clear (14:21)、ui10 (14:13/14:30) 的时间标注。

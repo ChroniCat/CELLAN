@@ -1,4 +1,4 @@
-UI-10 查找对话框按钮与页签（2026-11-13 14:20 CST）
+UI-10 查找对话框按钮与页签（2026-11-13 14:13 CST）
 
 问题
 - Ctrl+H 只走 find_open_new_session，没有设置 find.tab=1，打开后仍停在“查找”页。
@@ -20,6 +20,14 @@ UI-10 查找对话框按钮与页签（2026-11-13 14:20 CST）
 - 命令：cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab
   -> 1 passed。
 - 全量：cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored，APP_EXIT=0。
+
+## 14:30 追加：重开保留输入
+- 用户指出 Ctrl+H 仍调用 find.replace.clear()，重复打开会丢替换文本。
+- 已移除该清空；find_open_new_session 只清明细快照，保留 find/replace。
+- 回归改为先存 alpha/beta，关闭后 Ctrl+H 重开：open=true、tab=1、alpha/beta 均在；
+  再关闭 Ctrl+F：tab=0、输入仍在；再次关闭 Ctrl+H 仍保留。
+- 命令：cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab
+  -> 1 passed；全量 212 passed / 0 failed / 0 ignored，APP_EXIT=0。
 
 未完成
 - 真实鼠标点“关闭/×”、Esc、重新打开后焦点回网格与残余 Enter 的 GUI 操作未执行；

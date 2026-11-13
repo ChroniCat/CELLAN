@@ -1,4 +1,4 @@
-UI-18 筛选清除入口语义（2026-11-13 14:40 CST）
+UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 
 问题
 - Ribbon FilterClear 只把 filter 置 None，不清 hidden_rows：条件隐藏行仍隐藏，且筛选箭头消失。

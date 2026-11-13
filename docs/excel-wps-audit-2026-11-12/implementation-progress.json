@@ -4053,7 +4053,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-10 查找对话框按钮和默认页签",
       "status": "待验收",
-      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）。查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项断言 Ctrl+H/Ctrl+F 页签；全量 app 208 passed。",
+      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
@@ -4066,6 +4066,8 @@
         "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
         "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
@@ -4077,7 +4079,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "updated_utc": "2026-11-13T06:30:31Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4107,7 +4109,7 @@
           "failures": [],
           "blocker": "",
           "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-          "updated_utc": "2026-11-13T06:24:00Z"
+          "updated_utc": "2026-11-13T06:30:31Z"
         }
       ]
     },

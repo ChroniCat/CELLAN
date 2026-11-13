@@ -3644,13 +3644,30 @@ fn filter_clear_survives_save_reload() {
 fn ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
+    app.find.find = "alpha".into();
+    app.find.replace = "beta".into();
     app.find.open = false;
     app.find.tab = 0;
+
+    // 首次关闭后从 Ribbon/快捷键重开：输入必须保留，页签按快捷键切换。
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::H)]);
     assert!(app.find.open, "Ctrl+H 必须打开查找对话框");
     assert_eq!(app.find.tab, 1, "Ctrl+H 必须直接显示替换页");
+    assert_eq!(app.find.find, "alpha", "重开不得清空查找内容");
+    assert_eq!(app.find.replace, "beta", "重开不得清空替换内容");
+
+    app.find.open = false;
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::F)]);
     assert_eq!(app.find.tab, 0, "Ctrl+F 必须回到查找页");
+    assert_eq!(app.find.find, "alpha");
+    assert_eq!(app.find.replace, "beta");
+
+    // 再次 Ctrl+H 仍保留，而不是每次重开丢替换文本。
+    app.find.open = false;
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::H)]);
+    assert_eq!(app.find.tab, 1);
+    assert_eq!(app.find.find, "alpha");
+    assert_eq!(app.find.replace, "beta");
 }
 
 /// UI-05 安全语义：全部替换必须按命中所在表取文本/格式，不能拿活动表判断。
