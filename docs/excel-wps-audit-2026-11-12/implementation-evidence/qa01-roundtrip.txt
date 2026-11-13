@@ -53,3 +53,22 @@ exit、源/目标版本、全部逐格值和 SHA-256）。
   这不等于 Excel/WPS 的人工目视矩阵。
 
 本片状态：待验收。QA-01.1 与 QA-01.2 均仅为父项的切片证据，父项仍为实施中。
+
+## 19:52 CST 类型/错误语义加固（监督指出后）
+
+原版 runner 的 `compare` 存在三类假绿：Python `True == 1`、文本比较先
+`str(value)` 把数字当同字面、错误只比较 `Text` 让普通文本 `#DIV/0!` 冒充真实错误。
+现已修正：
+
+- `read_values` 逐格记录 `value_type`、`is_error`（真实调用
+  `Application.WorksheetFunction.IsError`）和 `error_code`；
+- `compare` 按 `error`/`text`/`boolean`/`number` 显式检查 COM 类型；错误必须先
+  `is_error is True`，再比错误文本/可选错误码；公式仍执行精确比较；
+- 负例单测 `scripts/qa01_roundtrip_test.py` 六项全部通过：布尔 True 不能当数字 1、
+  数字 1 不能当文本 "1"、普通文本 "#DIV/0!" 不能当真实错误、真实错误通过、
+  错误公式被发现、数字不能当布尔。命令：
+  `cd scripts && python -m unittest -v qa01_roundtrip_test.py` -> 6 passed。
+- 用加固后的 runner 重跑三条路径：`status=pass`，0 differences；
+  目标 B1 均记录 `is_error=true`、`error_code=-2146826281`、`text="#DIV/0!"`，
+  不是仅靠显示文本通过。新 JSON 已覆盖本目录 `qa01-roundtrip.json`；
+  先前 19:32 的结果应视为被本次类型加固取代。

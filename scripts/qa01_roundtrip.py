@@ -38,13 +38,18 @@ def app_name(product: str) -> str:
     return "Excel.Application" if product == "excel" else "ket.Application"
 
 
-def read_values(book) -> dict:
+def read_values(app, book) -> dict:
     result = {}
     sheet = book.Worksheets(1)
     for address in CELLS:
         cell = sheet.Range(address)
+        value = cell.Value2
+        is_error = bool(app.WorksheetFunction.IsError(cell))
         result[address] = {
-            "value": cell.Value2,
+            "value": value,
+            "value_type": type(value).__name__,
+            "is_error": is_error,
+            "error_code": int(value) if is_error and isinstance(value, int) else None,
             "text": cell.Text,
             "formula": cell.Formula,
         }
@@ -69,7 +74,7 @@ def save_as(product: str, src: Path, dst: Path, out_dir: Path) -> tuple[dict, st
         book = None
         book = app.Workbooks.Open(str(dst), ReadOnly=True, UpdateLinks=0)
         app.Calculate()
-        values = read_values(book)
+        values = read_values(app, book)
         info = {
             "product": product,
             "version": str(app.Version),
@@ -106,7 +111,7 @@ def read_with(product: str, path: Path) -> tuple[dict, str | None]:
             pass
         book = app.Workbooks.Open(str(path), ReadOnly=True, UpdateLinks=0)
         app.Calculate()
-        values = read_values(book)
+        values = read_values(app, book)
         return {
             "product": product,
             "version": str(app.Version),
@@ -142,21 +147,58 @@ def normalize(value):
 
 
 def compare(actual: dict, expected: dict) -> list[str]:
+    """Compare COM results without numeric/string/boolean coercion.
+
+    In particular Python's ``True == 1`` and ``str(1) == "1"`` are not allowed:
+    the COM cell type is part of the contract.  An error must be a real error
+    according to WorksheetFunction.IsError, not merely text that looks like
+    ``#DIV/0!``.
+    """
     differences = []
     for address, want in expected.items():
         got = actual.get(address, {})
-        if want["type"] == "error":
-            text = str(got.get("text", ""))
-            if text != want["value"]:
-                differences.append(f"{address}: expected {want['value']} error text, got {text!r}")
-        elif want["type"] == "text":
-            text = str(got.get("value", ""))
-            if text != want["value"]:
-                differences.append(f"{address}: expected text {want['value']!r}, got {text!r}")
+        kind = want["type"]
+        value = got.get("value")
+        if kind == "error":
+            if got.get("is_error") is not True:
+                differences.append(
+                    f"{address}: expected real {want['value']} error, got non-error value "
+                    f"{value!r} (type {type(value).__name__}, IsError={got.get('is_error')!r})"
+                )
+            elif str(got.get("text", "")) != want["value"]:
+                differences.append(
+                    f"{address}: expected error text {want['value']!r}, got {got.get('text')!r}"
+                )
+            elif "error_code" in want and got.get("error_code") != want["error_code"]:
+                differences.append(
+                    f"{address}: expected error code {want['error_code']}, got {got.get('error_code')!r}"
+                )
+        elif kind == "text":
+            if not isinstance(value, str):
+                differences.append(
+                    f"{address}: expected text {want['value']!r}, got {value!r} "
+                    f"(type {type(value).__name__})"
+                )
+            elif value != want["value"]:
+                differences.append(f"{address}: expected text {want['value']!r}, got {value!r}")
+        elif kind == "boolean":
+            if not isinstance(value, bool):
+                differences.append(
+                    f"{address}: expected boolean {want['value']!r}, got {value!r} "
+                    f"(type {type(value).__name__})"
+                )
+            elif value != want["value"]:
+                differences.append(f"{address}: expected boolean {want['value']!r}, got {value!r}")
+        elif kind == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                differences.append(
+                    f"{address}: expected number {want['value']!r}, got {value!r} "
+                    f"(type {type(value).__name__})"
+                )
+            elif normalize(value) != want["value"]:
+                differences.append(f"{address}: expected {want['value']!r}, got {normalize(value)!r}")
         else:
-            value = normalize(got.get("value"))
-            if value != want["value"]:
-                differences.append(f"{address}: expected {want['value']!r}, got {value!r}")
+            differences.append(f"{address}: unsupported expected type {kind!r}")
         if "formula" in want:
             formula = str(got.get("formula", ""))
             if formula != "=" + want["formula"]:

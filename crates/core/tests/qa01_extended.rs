@@ -110,3 +110,27 @@ fn page_settings_survive_load_and_save() {
     assert_eq!(back_page.title_rows, Some((0, 1)));
     let _ = std::fs::remove_file(&dst);
 }
+
+#[test]
+fn structure_metadata_survives_roundtrip() {
+    let src = fixture("metadata.xlsx");
+    assert!(src.exists(), "required fixture missing: {}", src.display());
+    let wb = sheetcore::xlsx::load(&src).expect("load metadata fixture");
+    let sh = wb.sheet(0);
+    assert_eq!(sh.name, "结构");
+    assert_eq!(sh.freeze, Some((1, 2)));
+    assert!(sh.hidden_rows_user.contains(&2) || sh.hidden_rows.contains(&2), "row 3 should be hidden: user={:?} filter={:?}", sh.hidden_rows_user, sh.hidden_rows);
+    assert!(sh.hidden_cols.contains(&2), "column C should be hidden: {:?}", sh.hidden_cols);
+    assert!(wb.names.iter().any(|(name, _, _)| name == "QA_RANGE"), "named range missing: {:?}", wb.names);
+
+    let dst = out("qa01_metadata");
+    let _ = std::fs::remove_file(&dst);
+    sheetcore::xlsx::save(&dst, &wb).expect("save metadata fixture");
+    let back = sheetcore::xlsx::load(&dst).expect("reload metadata output");
+    let bsh = back.sheet(0);
+    assert_eq!(bsh.freeze, Some((1, 2)));
+    assert!(bsh.hidden_rows_user.contains(&2) || bsh.hidden_rows.contains(&2));
+    assert!(bsh.hidden_cols.contains(&2));
+    assert!(back.names.iter().any(|(name, _, _)| name == "QA_RANGE"), "named range lost: {:?}", back.names);
+    let _ = std::fs::remove_file(&dst);
+}

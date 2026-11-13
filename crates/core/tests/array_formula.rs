@@ -14,8 +14,8 @@ fn reads_array_formula_from_file() {
     let found = arr::scan(&path);
     let list = found.get("数组").expect("没找到「数组」表里的数组公式");
     assert_eq!(list.len(), 1, "{list:?}");
-    assert_eq!(list[0].anchor, (1, 1), "锚点应该是 B2");
-    assert_eq!(list[0].range, (1, 1, 1, 3), "区域应该是 B2:D2");
+    assert_eq!(list[0].anchor, (3, 1), "锚点应该是 B4");
+    assert_eq!(list[0].range, (3, 1, 3, 3), "区域应该是 B4:D4");
 }
 
 #[test]
@@ -25,10 +25,10 @@ fn load_keeps_array_and_save_writes_it_back() {
     let wb = sheetcore::xlsx::load(&src).expect("加载失败");
     let sheet = &wb.sheets[0];
     assert_eq!(sheet.arrays.len(), 1, "加载后应记住 1 条数组公式");
-    assert_eq!(sheet.arrays[0].1, (1, 1, 1, 3));
+    assert_eq!(sheet.arrays[0].1, (3, 1, 3, 3));
     // 公式本身也要在
-    let cell = sheet.get(1, 1).expect("B2 应该有内容");
-    let f = cell.formula.as_ref().expect("B2 应该有公式");
+    let cell = sheet.get(3, 1).expect("B4 应该有内容");
+    let f = cell.formula.as_ref().expect("B4 应该有公式");
     assert!(f.contains("SUM"), "公式文本丢了: {f}");
 
     let out = std::env::current_exe()
@@ -42,7 +42,7 @@ fn load_keeps_array_and_save_writes_it_back() {
     let again = arr::scan(&out);
     let list = again.get("数组").expect("保存后数组标记丢了");
     assert_eq!(list.len(), 1);
-    assert_eq!(list[0].range, (1, 1, 1, 3), "区域写回不一致");
+    assert_eq!(list[0].range, (3, 1, 3, 3), "区域写回不一致");
 
     // 原始 XML 里必须真有 t="array"
     let targets = sheetcore::patch::sheet_targets(&out).unwrap();
@@ -53,6 +53,6 @@ fn load_keeps_array_and_save_writes_it_back() {
     let mut xml = String::new();
     zip.by_name(part).unwrap().read_to_string(&mut xml).unwrap();
     assert!(xml.contains("t=\"array\""), "XML 里没有 array 标记:\n{xml}");
-    assert!(xml.contains("ref=\"B2:D2\""), "XML 里没有 ref:\n{xml}");
+    assert!(xml.contains("ref=\"B4:D4\""), "XML 里没有 ref:\n{xml}");
     let _ = std::fs::remove_file(&out);
 }

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
+from openpyxl.workbook.defined_name import DefinedName
 
 
 def make_table() -> Workbook:
@@ -68,6 +69,20 @@ def main() -> None:
     ps.print_area = "A1:H40"
     ps.print_title_rows = "1:2"
     page.save(out_dir / "page.xlsx")
+
+    # Named range + hidden row/column + frozen pane metadata.
+    meta = Workbook()
+    ms = meta.active
+    assert ms is not None
+    ms.title = "结构"
+    for r in range(1, 11):
+        for c in range(1, 6):
+            ms.cell(row=r, column=c, value=r * c)
+    ms.row_dimensions[3].hidden = True
+    ms.column_dimensions["C"].hidden = True
+    ms.freeze_panes = "C2"
+    meta.defined_names["QA_RANGE"] = DefinedName("QA_RANGE", attr_text="'结构'!$A$1:$C$6")
+    meta.save(out_dir / "metadata.xlsx")
     print(out_dir)
 
 

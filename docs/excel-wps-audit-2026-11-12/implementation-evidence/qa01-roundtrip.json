@@ -1,6 +1,6 @@
 {
   "schema": "qa01-three-party-roundtrip-v1",
-  "generated_utc": "2026-11-13T11:30:24Z",
+  "generated_utc": "2026-11-13T11:47:49Z",
   "fixture": "F:\\finance-native-sheets-ready\\crates\\core\\tests\\fixtures\\qa01\\qa01_formula_min.xlsx",
   "fixture_sha256": "d21a9c5c7147f0b9c9419759f3490826ee7abb87fbeb5da034fb7841384b7b3a",
   "manifest": "F:\\finance-native-sheets-ready\\docs\\excel-wps-audit-2026-11-12\\implementation-evidence\\qa01-min-samples.json",
@@ -12,56 +12,86 @@
         "product": "excel",
         "version": "16.0",
         "build": "20326.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\excel-input.xlsx",
-        "sha256": "c7890d653d4357270d25519fd7cfe619193e11b96e75063a0d4a768b88d02912",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\01-excel-project-excel\\excel-input.xlsx",
+        "sha256": "3c509cbf3be197a8b125950524ab11914e9858ced832e9cc86a619d752f302ac",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -71,56 +101,86 @@
         "product": "excel",
         "version": "16.0",
         "build": "20326.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\project-output.xlsx",
-        "sha256": "55ace0730134f10f547f273c67588c8a292e3081465c3ccf2ad58eaeb0186ec1",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\01-excel-project-excel\\project-output.xlsx",
+        "sha256": "b42c20e3390865f1b436e34e5f6f3d85c496858bd2efb40262da5e1f87e6e35a",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -129,14 +189,14 @@
       "core": {
         "command": [
           "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\excel-input.xlsx",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\project-output.xlsx"
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\01-excel-project-excel\\excel-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\01-excel-project-excel\\project-output.xlsx"
         ],
         "exit": 0,
-        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\01-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\01-excel-project-excel\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\01-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\01-excel-project-excel\\\\project-output.xlsx\",\"sheets\":1}\n",
         "stderr": "",
         "output_exists": true,
-        "output_sha256": "55ace0730134f10f547f273c67588c8a292e3081465c3ccf2ad58eaeb0186ec1"
+        "output_sha256": "b42c20e3390865f1b436e34e5f6f3d85c496858bd2efb40262da5e1f87e6e35a"
       },
       "expected": {
         "A1": {
@@ -196,56 +256,86 @@
         "product": "wps",
         "version": "12.0",
         "build": "29690.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\wps-input.xlsx",
-        "sha256": "98df94476c72fdb23ada5251631aa58674cd771479cb4ae5ba5d69cf537c2864",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\02-wps-project-wps\\wps-input.xlsx",
+        "sha256": "0e0010c42305517f1f34fad509de87a124ab71f43e7397f9502342b6facb0efc",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -255,56 +345,86 @@
         "product": "wps",
         "version": "12.0",
         "build": "29690.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\project-output.xlsx",
-        "sha256": "a4edc689fa70f6e29ba43d14cf212e392e1756b17c569bfdddc84f25345eb2e5",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\02-wps-project-wps\\project-output.xlsx",
+        "sha256": "b9f48bc9b02f6228fe369c29db21b14ba0d918dad02b99c8fa8d548449aab21f",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -313,14 +433,14 @@
       "core": {
         "command": [
           "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\wps-input.xlsx",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\project-output.xlsx"
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\02-wps-project-wps\\wps-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\02-wps-project-wps\\project-output.xlsx"
         ],
         "exit": 0,
-        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\02-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\02-wps-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\02-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\02-wps-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
         "stderr": "",
         "output_exists": true,
-        "output_sha256": "a4edc689fa70f6e29ba43d14cf212e392e1756b17c569bfdddc84f25345eb2e5"
+        "output_sha256": "b9f48bc9b02f6228fe369c29db21b14ba0d918dad02b99c8fa8d548449aab21f"
       },
       "expected": {
         "A1": {
@@ -380,56 +500,86 @@
         "product": "excel",
         "version": "16.0",
         "build": "20326.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\excel-input.xlsx",
-        "sha256": "0bbc1bda46e1d8931204d2d22c0702cbd89e1aede2d7efd6d6f76a6e56058cdf",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\03-excel-project-wps\\excel-input.xlsx",
+        "sha256": "a659b9da17377ac51abcd0a08aaa8143440c320a2d07e58e1cafa34b9180e16b",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -439,56 +589,86 @@
         "product": "wps",
         "version": "12.0",
         "build": "29690.0",
-        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\project-output.xlsx",
-        "sha256": "8ad189a5288d9d70a2625fe6a71bc683eea93a3c3a30534b4c57ddc82b4f5a5c",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\03-excel-project-wps\\project-output.xlsx",
+        "sha256": "93116cf2874c690cae6b4e94d1dfe690fcb599da4cd2a6ad948bc7193363977a",
         "values": {
           "A1": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "1"
           },
           "A2": {
             "value": 2.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "2",
             "formula": "2"
           },
           "A3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=SUM(A1:A2)"
           },
           "B1": {
             "value": -2146826281,
+            "value_type": "int",
+            "is_error": true,
+            "error_code": -2146826281,
             "text": "#DIV/0!",
             "formula": "=1/0"
           },
           "B2": {
             "value": "ok",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "ok",
             "formula": "=IFERROR(B1,\"ok\")"
           },
           "B3": {
             "value": 3.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "3",
             "formula": "=A1+2"
           },
           "C1": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "财务"
           },
           "C2": {
             "value": "财务",
+            "value_type": "str",
+            "is_error": false,
+            "error_code": null,
             "text": "财务",
             "formula": "=CONCATENATE(\"财\",\"务\")"
           },
           "D1": {
             "value": true,
+            "value_type": "bool",
+            "is_error": false,
+            "error_code": null,
             "text": "TRUE",
             "formula": "=A1=1"
           },
           "A4": {
             "value": 1.0,
+            "value_type": "float",
+            "is_error": false,
+            "error_code": null,
             "text": "1",
             "formula": "=DATE(1900,1,1)"
           }
@@ -497,14 +677,14 @@
       "core": {
         "command": [
           "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\excel-input.xlsx",
-          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\project-output.xlsx"
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\03-excel-project-wps\\excel-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip3\\03-excel-project-wps\\project-output.xlsx"
         ],
         "exit": 0,
-        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\03-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\03-excel-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\03-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip3\\\\03-excel-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
         "stderr": "",
         "output_exists": true,
-        "output_sha256": "8ad189a5288d9d70a2625fe6a71bc683eea93a3c3a30534b4c57ddc82b4f5a5c"
+        "output_sha256": "93116cf2874c690cae6b4e94d1dfe690fcb599da4cd2a6ad948bc7193363977a"
       },
       "expected": {
         "A1": {

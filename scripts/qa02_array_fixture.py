@@ -25,10 +25,12 @@ def main() -> None:
     ws = wb.active
     assert ws is not None
     ws.title = "数组"
-    for row, values in enumerate([(1, 2, 3), (4, 5, 6), (7, 8, 9)], start=2):
-        for col, value in enumerate(values, start=1):
-            ws.cell(row=row, column=col, value=value)
-    ws["B2"] = ArrayFormula("B2:D2", "=SUM(A2:C2)")
+    # Input is deliberately outside the array output range: B4:D4.
+    # The old fixture put the array at B2:D2 and summed A2:C2, which included
+    # its own top-left B2 and made the sample circular.
+    for col, value in enumerate((1, 2, 3), start=1):
+        ws.cell(row=2, column=col, value=value)
+    ws["B4"] = ArrayFormula("B4:D4", "=SUM(A2:C2)")
     wb.save(out)
     print(out)
 

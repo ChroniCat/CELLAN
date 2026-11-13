@@ -44,7 +44,6 @@ fn changes_survive_save() {
         sh.page_dirty = true;
     }
     sheetcore::xlsx::save(out, &wb).expect("保存");
-    let _ = std::fs::remove_file("tests/test-work/page_edit2.xlsx");
     let back = sheetcore::xlsx::load(out).expect("重新读入");
     let ps = &back.sheet(0).page;
     assert!(!ps.landscape);
