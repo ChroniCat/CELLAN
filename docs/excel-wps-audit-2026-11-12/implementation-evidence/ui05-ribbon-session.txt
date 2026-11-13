@@ -1,0 +1,19 @@
+UI-05 Ribbon 新查找会话入口（2026-11-13 14:07 CST）
+
+用户 14:00 监督指出的缺口
+- Ribbon actions 的 FindReplace 只执行 find.open = true，没有清 session_rect / session_rects。
+- 上一次在 A1/A3 查找并关闭，改选 B1/B3 后从 Ribbon 重新打开，全部替换仍可能作用到旧 A 区。
+
+实现
+- 新增 SheetApp::find_open_new_session()：统一清 session_rect、session_rects 并打开查找。
+- 接入所有新会话入口：Ribbon FindReplace、Ctrl+F/Ctrl+H、标题栏搜索框、SC_OPEN_DIALOG=find。
+- 连续 find_next 不走该入口，仍使用已锁定的快照，因此不破坏上一轮认可的多块连续定位。
+
+回归
+- 新增 edit_regression_tests::ribbon_find_replace_clears_stale_scope_before_replace_all。
+- 步骤：A1/A3 与 B1/B3 都为 needle；先留下 A1/A3 的旧 session_rect/session_rects；
+  关闭后改选 B1 + extra_sel B3；调用真实 ribbon_action("FindReplace", ctx)；范围选择=选区。
+- 断言：新会话快照为空；find_hits 只返回 B1/B3；replace_all 后 A1/A3 仍为 needle，
+  B1/B3 变 done；一次 do_undo(false) 同时恢复 B1/B3，A1 始终未动。
+- 命令：cargo test -p app --offline --bin app ribbon_find_replace_clears_stale_scope_before_replace_all
+  -> 1 passed / 0 failed。

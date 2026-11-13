@@ -1,13 +1,13 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `304ea01`（C11 外部三维缓存保护已提交）；本轮反向真实顺序与 C11 输入/重算保护见文末。
-- 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
-  切片 33 已验收 / 20 待验收 / 95 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
+- 分支 `main`（`origin/main`），HEAD `c0af4a3`（UI-05 多选区查找已提交）；14:07 的 Ribbon 新会话修复与 C22 对齐尚未提交，见文末。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；
+  切片 35 已验收 / 19 待验收 / 94 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
-- 当前未完成：C11.3/C11.4 待独立复核、C11 父项仍实施中；C10.2 live 按用户要求保留，
-  C11.1/C11.2 已认可项不重复修。
+- 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
+  C10.2 live 按用户要求保留。
 
 ## 12:35 当前：11:38 UTF-8 回归修复
 
@@ -380,3 +380,25 @@
   APP_EXIT=0。core 未改，沿用 **75 bins / 678 / 0 / 41**。
 - UI-05 的剩余真实鼠标对话框、单次查找可取消、结果虚拟滚动仍未做，
   UI-05.4/UI-05 保持待验收。
+
+## 14:07 当前：C11 父项验收 + Ribbon 新查找会话 + C22 对齐
+
+- 用户 14:00 监督：结合 C11.1/C11.2、C11.3/C11.4 四切片及真实 Office 夹具/缓存提示链，
+  C11 父项转「已验收」，独立接受第 13 项；不再要求 WPS 全函数或每格式 Office 另存矩阵。
+  C11.3/C11.4 一并转已验收；旧的“.3/.4 待矩阵”记录清理，保留 xls 仅导出后可重算、
+  .xls 拒绝是导出安全网、外部三维组合范围有限三条边界。
+- UI-05：新增 `find_open_new_session()`，Ribbon FindReplace、Ctrl+F/H、标题栏搜索框、
+  SC_OPEN_DIALOG=find 统一清 `session_rect`/`session_rects`；连续 `find_next` 不走这里。
+  新测试 `ribbon_find_replace_clears_stale_scope_before_replace_all`：旧 A1/A3 快照 +
+  新 B1/B3 多选 → 真实 `ribbon_action("FindReplace")` → 全部替换只改 B1/B3，
+  旧 A 不变，一次 `do_undo(false)` 恢复 B1/B3；专项 1 passed。
+- C22：绘制改为 `cell_text_align`，General 文本左、数字右、布尔/错误居中，显式对齐覆盖；
+  专项 1 passed。合成工作簿 SC_SHOT 实测 A1 左、B1 右、C1 中、D1 中、E1/F1/G1 显式
+  左/中/右；长文本仍按用户偏好默认裁剪，长文本多情况与 Excel 同位置像素对拍未做，C22 待验收。
+- 当前全量：app **207 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
+  **75 bins / 678 passed / 0 failed / 41 ignored**。
+- 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
+- 尚未提交：`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
+  resume、c11-final-acceptance、ui05-ribbon-session、c22-general-alignment 与截图。
+- 下一步：提交/推送本批，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
+  其余 P0/P1 任务）。

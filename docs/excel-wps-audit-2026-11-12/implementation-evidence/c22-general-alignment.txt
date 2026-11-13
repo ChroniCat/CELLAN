@@ -1,0 +1,28 @@
+C22 General 文本对齐与长文本裁剪（2026-11-13 14:07 CST）
+
+问题
+- 绘制代码原先把 General 下的所有非数字都居中：st.halign == 0 && !is_num -> CENTER_CENTER。
+- 因此普通文本和长文本都从中间开始，长文本被裁掉时看不到起始端；布尔/错误也没有按 Excel 约定单独处理。
+
+实现
+- crates/app/src/main.rs 新增 cell_text_align(halign, value)：
+  General（halign=0）文本左、数字（含日期序列号）右、布尔/错误居中；
+  显式 halign 1/2/3 分别覆盖为左/中/右。
+- 单元格文字绘制改用该函数，不再把文本默认居中。
+- 长文本默认仍裁剪在单元格矩形内（用户既定偏好）；视图→显示→“文字溢出”保留 Excel 溢出行为。
+
+验证
+- 专项单测：cargo test -p app --offline --bin app general_text_alignment_matches_excel_and_explicit_alignment_wins
+  -> 1 passed；断言文本/数字/布尔/错误及显式左中右。
+- 合成工作簿：C:\Users\Administrator\AppData\Local\hermes\cache\scratch\c22_align.xlsx
+  A1 左侧文本、B1 123.45、C1 TRUE、D1 =1/0、E1 显式左、F1 显式中、G1 显式右。
+- SC_SHOT 截图（1440×900）：
+  F:\finance-native-sheets-ready\work\hermes-c22_align2-20261113-140127-1123\c22_align.png
+  网格区域放大裁图：
+  F:\finance-native-sheets-ready\work\hermes-c22_align2-20261113-140127-1123\c22_grid_crop.png
+- 截图判读：A1 左、B1 右、C1 中、D1 中、E1 左、F1 中、G1 右，符合上述规则。
+
+未完成/边界
+- 本机已有其他 Excel 实例，未强行复用；真实 Excel 365 同位置像素对拍未做。
+- 长文本“相邻空格溢出 / 被占用裁剪”两种情况的真实鼠标操作与截图待补。
+- 因此 C22 仍为待验收，登记为已实现并有代码级/截图级证据。

@@ -4465,3 +4465,64 @@ fn find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot() {
     app.find_next(false);
     assert_eq!(app.sel, (9, 3), "锁定快照必须保留第三块");
 }
+
+/// 14:00 监督：Ribbon 的“查找和替换”也是新会话入口，必须清掉上一次
+/// 锁定的选区快照；否则新选 B1/B3 后“全部替换”仍会作用到旧 A1/A3。
+#[test]
+fn ribbon_find_replace_clears_stale_scope_before_replace_all() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for (r, c) in [(0u32, 0u32), (2, 0), (0, 1), (2, 1)] {
+        app.wb.sheet_mut(0).set(r, c, text("needle"));
+    }
+    app.find.find = "needle".into();
+    app.find.replace = "done".into();
+    app.find.scope = 2;
+    // 模拟上一次查找留下的 A1/A3 会话快照
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.extra_sel = vec![(2, 0, 2, 0)];
+    app.find.session_rect = Some((0, 0, 2, 0));
+    app.find.session_rects = vec![(0, 0, 2, 0)];
+    app.find.open = false;
+
+    // 关闭旧会话后，改选不相邻的 B1/B3，再从 Ribbon 打开查找
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.extra_sel = vec![(2, 1, 2, 1)];
+    app.ribbon_action("FindReplace", &ctx);
+    assert!(app.find.open, "Ribbon FindReplace 必须打开查找会话");
+    assert!(app.find.session_rect.is_none(), "新会话不能沿用旧主选区");
+    assert!(app.find.session_rects.is_empty(), "新会话不能沿用旧多选区快照");
+
+    let hits = app.find_hits();
+    assert_eq!(
+        hits.iter().map(|h| (h.row, h.col)).collect::<Vec<_>>(),
+        vec![(0, 1), (2, 1)],
+        "新会话应只命中当前 B1/B3"
+    );
+    app.replace_all();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("needle".into()), "旧 A1 不能变");
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Text("needle".into()), "旧 A3 不能变");
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("done".into()));
+    assert_eq!(app.wb.sheet(0).value(2, 1), Value::Text("done".into()));
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("needle".into()), "一次撤销恢复 B1");
+    assert_eq!(app.wb.sheet(0).value(2, 1), Value::Text("needle".into()), "一次撤销恢复 B3");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("needle".into()), "A1 始终未动");
+}
+
+/// C22：General 对齐按 Excel 约定——文本左、数字（含日期序列号）右、
+/// 布尔/错误居中；显式对齐必须覆盖 General。
+#[test]
+fn general_text_alignment_matches_excel_and_explicit_alignment_wins() {
+    use sheetcore::formula::ErrKind;
+    assert_eq!(cell_text_align(0, &Value::Text("left".into())), egui::Align2::LEFT_CENTER);
+    assert_eq!(cell_text_align(0, &Value::Number(1.5)), egui::Align2::RIGHT_CENTER);
+    assert_eq!(cell_text_align(0, &Value::Bool(true)), egui::Align2::CENTER_CENTER);
+    assert_eq!(cell_text_align(0, &Value::Error(ErrKind::Div0)), egui::Align2::CENTER_CENTER);
+    assert_eq!(cell_text_align(1, &Value::Number(1.5)), egui::Align2::LEFT_CENTER);
+    assert_eq!(cell_text_align(2, &Value::Text("explicit".into())), egui::Align2::CENTER_CENTER);
+    assert_eq!(cell_text_align(3, &Value::Text("right".into())), egui::Align2::RIGHT_CENTER);
+}

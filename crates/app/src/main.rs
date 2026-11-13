@@ -2372,9 +2372,7 @@ impl SheetApp {
                         Ok("revision") => self.rev_open = true,
                         Ok("xlink") => self.xlink_dlg = true,
                         Ok("find") => {
-                            self.find.open = true;
-                            self.find.session_rect = None;
-                            self.find.session_rects.clear();
+                            self.find_open_new_session();
                         }
                         Ok("cf") => self.cf_mgr = true,
                         Ok("chart") => {
@@ -5837,6 +5835,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
+    /// 从 Ribbon/快捷键/搜索框开始一次新的查找会话：
+    /// 旧会话锁定的选区快照必须清掉，否则下一次“全部替换”仍会作用到旧区域。
+    /// 连续 Next 不走这里，会话内定位继续使用已锁定快照。
+    fn find_open_new_session(&mut self) {
+        self.find.session_rect = None;
+        self.find.session_rects.clear();
+        self.find.open = true;
+    }
+
     /// scope==2 的选区快照：主矩形 + Ctrl 多选矩形；没有快照时退回当前选择。
     fn find_rects(&self) -> Vec<(u32, u32, u32, u32)> {
         if self.find.scope != 2 {
@@ -6997,9 +7004,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if find_k || repl_k {
-            self.find.open = true;
-            self.find.session_rect = None;
-            self.find.session_rects.clear();
+            self.find_open_new_session();
             if repl_k {
                 self.find.replace.clear();
             }
@@ -13802,7 +13807,6 @@ let txn = self.txn_begin(&keys);
                 sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
             };
             if !txt.is_empty() {
-                let is_num = matches!(cell.value, Value::Number(_));
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
                 let fmt_color = sheetcore::style::format_color(&cell.value, &st.format);
                 let mut base_color = ov.and_then(|o| o.color).or(fmt_color).unwrap_or(st.color);
@@ -13827,13 +13831,7 @@ let txn = self.txn_begin(&keys);
                     base_color = [5, 99, 193];
                 }
                 let color = Color32::from_rgb(base_color[0], base_color[1], base_color[2]);
-                let align = if st.halign == 2 || (st.halign == 0 && !is_num) {
-                    Align2::CENTER_CENTER
-                } else if st.halign == 3 || (st.halign == 0 && is_num) {
-                    Align2::RIGHT_CENTER
-                } else {
-                    Align2::LEFT_CENTER
-                };
+                let align = cell_text_align(st.halign, &cell.value);
                 let icon_shift = if ov.and_then(|o| o.icon.as_ref()).is_some() {
                     18.0
                 } else {
@@ -22445,9 +22443,7 @@ impl SheetApp {
                 if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     self.find.find = self.search.clone();
                     self.find.tab = 0;
-                    self.find.open = true;
-                    self.find.session_rect = None;
-                    self.find.session_rects.clear();
+                    self.find_open_new_session();
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
                 let acc = Rect::from_min_size(
@@ -24338,6 +24334,19 @@ fn family_named(key: &str) -> egui::FontFamily {
 /// 单元格字体族：按 style.font 选内嵌 family，未知字体回退默认
 fn cell_family(name: &str) -> egui::FontFamily {
     family_named(sheetcore::style::font_class(name).key())
+}
+
+/// Excel 的 General 对齐：文本靠左，数字（含日期）靠右，布尔和错误居中。
+/// 显式 halign 覆盖 General；1/2/3 分别对应左/中/右。
+fn cell_text_align(halign: u8, value: &Value) -> egui::Align2 {
+    let general_center = matches!(value, Value::Bool(_) | Value::Error(_));
+    if halign == 2 || (halign == 0 && general_center) {
+        egui::Align2::CENTER_CENTER
+    } else if halign == 3 || (halign == 0 && matches!(value, Value::Number(_))) {
+        egui::Align2::RIGHT_CENTER
+    } else {
+        egui::Align2::LEFT_CENTER
+    }
 }
 
 /// 注册四套内嵌字体，并把自定义 family 都绑上——

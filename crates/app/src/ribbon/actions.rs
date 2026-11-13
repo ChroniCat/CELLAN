@@ -584,7 +584,7 @@ impl SheetApp {
             "FillDown" => self.fill_down(),
             "ClearContent" => self.clear_all(),
             "SortFilter" => self.start_filter(),
-            "FindReplace" => self.find.open = true,
+            "FindReplace" => self.find_open_new_session(),
 
             // ---------------------------------------------------- 插入
             "Hyperlink" => {
