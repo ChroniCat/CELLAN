@@ -113,3 +113,5 @@ UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 - `ui18-filter-fixed-row2-visible.xlsx`（修复：row2 visible，row3 hidden，无 autoFilter/FilterDatabase）
 - `ui18-filter-overlap-source.xlsx`（overlap 测试 artifact：disable 后 row2/row3 hidden，row5 visible）
 - `ui18-filter-db-escape.xlsx`（A&B 目标删除，Other 名称保留）
+
+- 提交 `838035d`（core/xlsx 手动来源、FilterDatabase 清理与 A&B 转义、证据/台账）。

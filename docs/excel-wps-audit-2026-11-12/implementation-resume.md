@@ -542,3 +542,5 @@
   18:10 三图 + 旧/新 XML 对照为准，不重做已认可三图。
 - 当前 core lib 271 passed；core 全量 75 bins / 683 passed / 0 failed / 41 ignored；
   app 232 passed / 0 failed / 0 ignored。UI-18 仍待监督复核，台账 14/61 不变。
+
+- 19:13 UI-18 修复提交 `838035d`；台账仍为 14/61，等待监督复核。
