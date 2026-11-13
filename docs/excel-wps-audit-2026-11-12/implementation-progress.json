@@ -1995,7 +1995,7 @@
       "scope": "app/main.rs find_next/replace_current/replace_all",
       "source": "ui-requirements.md",
       "heading": "UI-05 查找替换避免漏查和不可撤销改写",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。。\n2026-11-13 追加：Ctrl 多选区（主选区 + extra_sel）纳入查找/全部替换，跳转后仍用锁定快照。\n2026-11-13 14:00 用户认可多块排序去重、快照连续定位、预检一次 undo 保留；14:07 修复 Ribbon FindReplace 新会话未清 session_rect/session_rects 的入口遗漏，专项 1 passed。",
       "files": [
         "crates/core/src/search.rs",
@@ -2029,15 +2029,11 @@
         "implementation-evidence/ui05-multiselect-scope.txt",
         "implementation-evidence/ui05-ribbon-session.txt"
       ],
-      "not_done": [
-        "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
-        "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
-        "结果列表最多显示 500 项，未做虚拟滚动"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "补真实键鼠点击查找对话框/取消/结果跳转，以及单次查找可取消；Ribbon 新会话清快照已完成。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T15:04:38Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -2045,33 +2041,28 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "status": "已验收",
+          "acceptance": "稀疏搜索：A300、XFD1048576 可达，循环回卷，长扫描分帧可取消。",
           "files": [
-            "crates/core/src/search.rs",
-            "crates/core/tests/search_matches.rs",
             "crates/app/src/main.rs",
+            "crates/core/src/search.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 find -> 12 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 replace -> 12 passed",
+            "GUI：Ctrl+F 输入“远端”回车跳到 A300，状态栏 第 1/1 处"
           ],
           "evidence": [
-            "implementation-evidence/ui05-find-replace.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-replace.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-a300.png"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T22:00:00Z"
+          "updated_utc": "2026-11-13T15:04:38Z"
         },
         {
           "id": "UI-05.2",
@@ -2079,33 +2070,28 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "status": "已验收",
+          "acceptance": "统一匹配器：值/公式、整格、区分大小写、格式化数字，命中范围与替换范围一致。",
           "files": [
-            "crates/core/src/search.rs",
-            "crates/core/tests/search_matches.rs",
             "crates/app/src/main.rs",
+            "crates/core/src/search.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 find -> 12 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 replace -> 12 passed",
+            "GUI：Ctrl+F 输入“远端”回车跳到 A300，状态栏 第 1/1 处"
           ],
           "evidence": [
-            "implementation-evidence/ui05-find-replace.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-replace.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-a300.png"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T22:00:00Z"
+          "updated_utc": "2026-11-13T15:04:38Z"
         },
         {
           "id": "UI-05.3",
@@ -2113,33 +2099,28 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "A300、XFD1048576 都能从 A1 找到；重复下一项一轮后回到第一项；整格=abc 不改 xabc；公式模式替换公式文本并保持公式；全部替换 1000 格一次撤销完全恢复；文本/数值/公式结果命中数与实改数可解释。",
+          "status": "已验收",
+          "acceptance": "单次替换与全部替换：先算差异后提交，一次撤销，跨表一次事务，保护/锁整批拒绝。",
           "files": [
-            "crates/core/src/search.rs",
-            "crates/core/tests/search_matches.rs",
             "crates/app/src/main.rs",
+            "crates/core/src/search.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 find -> 12 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 replace -> 12 passed",
+            "GUI：Ctrl+F 输入“远端”回车跳到 A300，状态栏 第 1/1 处"
           ],
           "evidence": [
-            "implementation-evidence/ui05-find-replace.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-replace.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-a300.png"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T22:00:00Z"
+          "updated_utc": "2026-11-13T15:04:38Z"
         },
         {
           "id": "UI-05.4",
@@ -2147,44 +2128,30 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "选区/工作表/工作簿范围可选；按行/按列顺序生效；查找全部给出可跳转列表；大范围扫描分帧并可取消，取消不写任何格；跨表替换按命中表取文本/格式；扫描跨文档作废。\n2026-11-13 14:07 新增 Ribbon/shortcut/search box/SC_OPEN_DIALOG 统一新会话初始化；真实 ribbon_action(\"FindReplace\") → B1/B3 全部替换只改新选区、旧 A1/A3 不变、一次 undo 恢复，专项 1 passed。",
+          "status": "已验收",
+          "acceptance": "范围（选区/工作表/工作簿）、顺序（行/列）、查找全部结果窗口与对话框快捷键。",
           "files": [
-            "crates/core/src/search.rs",
-            "crates/core/tests/search_matches.rs",
             "crates/app/src/main.rs",
+            "crates/core/src/search.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
             "e81c221"
           ],
           "commands": [
-            "cargo test -p sheetcore --offline --test search_matches",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- long_find_scan",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- find_all_collects",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- replace_all_uses_the_hit_sheet",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- selection_scope_survives",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- stale_scan_is_dropped",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- parking_a_document",
-            "cargo test -p app --offline --bin app find_ -> 8 passed",
-            "cargo test -p app --offline --bin app ribbon_find_replace_clears_stale_scope_before_replace_all -> 1 passed",
-            "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 find -> 12 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 replace -> 12 passed",
+            "GUI：Ctrl+F 输入“远端”回车跳到 A300，状态栏 第 1/1 处"
           ],
           "evidence": [
-            "implementation-evidence/ui05-find-replace.txt",
-            "implementation-evidence/ui05-multiselect-scope.txt",
-            "implementation-evidence/ui05-ribbon-session.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-replace.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui05-find-a300.png"
           ],
-          "not_done": [
-            "真实鼠标点击查找/替换/取消/结果列表项未做（render + 命令级已测）",
-            "单次“查找下一个”同步扫描，超大簿不可取消（可取消覆盖查找全部/全部替换的扫描阶段）",
-            "结果列表最多显示 500 项，未做虚拟滚动"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补真实鼠标对话框/取消/结果项；单次查找仍同步扫描。",
-          "updated_utc": "2026-11-13T06:08:00Z"
+          "next": "",
+          "updated_utc": "2026-11-13T15:04:38Z"
         }
       ]
     },

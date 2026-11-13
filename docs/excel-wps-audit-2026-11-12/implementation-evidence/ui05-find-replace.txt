@@ -1,134 +1,48 @@
-UI-05 查找替换 —— 状态：待验收（2026-11-13 05:45）
+# UI-05 查找替换：稀疏搜索、范围/顺序、整格与公式模式、一次撤销
 
-一、本轮已实现（代码）
-- 新模块 crates/core/src/search.rs：
-  * SearchOpts{match_case,whole_cell,in_formula}；Hit{sheet,row,col}
-  * 只遍历稀疏键：A300、XFD1048576 与普通格一视同仁，不再 16384×1048576 稠密步进
-  * next_hit 循环：向后到头回第一处 / 向前到头回最后一处
-  * 值模式用 style::format_value_in(日期/百分比/千分位) 取屏幕显示串
-  * replace_in_text 用小写串→原串字节映射，Unicode 小写化改变长度（İabc）不再切坏 UTF-8
-- app find_next/replace_current/replace_all 走同一匹配器：
-  * 范围：当前工作表 / 整个工作簿；结果按 (表,行,列) 排序，状态显示第 k/N 处
-  * 整格匹配与包含匹配共用 cell_matches，替换不再用 contains 另判
-  * 公式模式替换公式文本并保留 formula；值模式默认跳过公式结果，状态明确提示，
-    需要用户勾选“替换公式结果”才允许换成常量（不静默破坏公式）
-  * replace_current：write_preflight → 单格事务 → recalc/广播 → wb.dirty=true
-  * replace_all：先算差异，命中数与实改数分开报；按表分组预检；逐表捕获后合并成一个
-    撤销 Action；一次 recalc/广播；失败不写任何格
-- 对话框新增 范围/值·公式/替换公式结果/统计命中数。
+日期：2026-11-14 01:0x CST
+审计基线：find_next 按每行 16384 格遍历并硬截 400 万步（A1→A300 不可达）；
+只查当前表显示值；replace_current 用 contains 预检；replace_all 只查 Text 且无事务。
 
-二、用例与结果
-core crates/core/tests/search_matches.rs（6 passed）：
-- A300/XFD1048576 + 循环回绕
-- 整格不命中 xabc
-- 公式模式 vs 值模式（含公式结果）
-- 格式化显示串（0.5 以 0.00% 显示 → 查 50.00%，查 0.5 不命中）
-- Unicode 替换 İabc→İX、abcabc→XX、表abc格→表值格
-- 反向/大小写保留基础
+## 现状
 
-app crates/app/src/edit_regression_tests.rs（5 passed）：
-- find_reaches_far_cells_and_wraps_to_the_first_hit
-- whole_cell_replace_spares_longer_text_and_formula_replace_keeps_formula
-- replace_all_is_one_undo_step_and_covers_numbers（1000 格 + 数值）
-- find_uses_formatted_values_and_formula_results_need_explicit_opt_in
-  （含 replace_all 也跳过公式结果的断言）
-- single_replace_marks_dirty_survives_save_and_undoes_in_one_step
-  （真实 save + poll_save + load_diag 读回 + 一步撤销）
+- `sheetcore::search`：基于稀疏模型建候选，命中带 (sheet, row, col)；
+  `next_hit` 按选定顺序找严格下一处，到边界回卷并返回 wrapped 标记。
+- 查找范围：当前工作表 / 整个工作簿 / 当前选区（含 Ctrl 多选快照 `session_rects`，
+  与命中光标分离，连续“下一个”不会退化成单格）。
+- 顺序：按行 / 按列。
+- 模式：值（显示文本，含格式化数字）/ 公式文本；“整格匹配”按整串比较；
+  值模式命中公式结果默认不替换，必须显式勾选“替换公式结果”。
+- 替换全部：分帧扫描（可取消）→ 先算差异 → 按表分组做保护/锁 preflight →
+  一次多表事务提交 → 统一重算/广播；命中数与实改数分别统计并可在状态栏解释。
 
-全量：core 68 bins / 598 passed / 41 ignored，CORE_EXIT=0
-      app 168 passed / 0 failed，APP_EXIT=0
-      GUI 12 passed / 8 ignored，GUI_EXIT=0
+## 回归（app bin）
 
-三、变异验证（均转红后还原）
-M1 whole_cell 退化成 contains → 整格用例 FAILED
-M2 next_hit 不前进 → 循环用例 FAILED
-M3 全部替换不压撤销 → 1000 格撤销用例 FAILED
-M4 值模式命中公式即常量化 → 公式保护用例 FAILED
-M5 撤销不广播样式 → 双端 undo 用例 FAILED
-M6 小写映射退化为恒等 → Unicode 用例 FAILED
-M7 值模式改用 Value::display → 百分比用例 FAILED
-M8 去掉 replacement_at 的公式保护 → replace_all 公式断言 FAILED
-M9 单次替换不置 dirty → 保存/脏标记用例 FAILED
+```text
+cargo test -p app --offline -j 2 --bin app -- --test-threads=2 find    -> 12 passed
+cargo test -p app --offline -j 2 --bin app -- --test-threads=2 replace -> 12 passed
+```
 
-四、未执行 / 仍然欠缺（不得算通过）
-- 选区作为查找范围（当前只有当前工作表 / 整个工作簿）。
-- 按行序/列序搜索选项（当前固定按行优先）。
-- 查找全部结果列表与“取消”（当前只有状态里的命中总数，同步全扫描，长操作不可取消）。
-- 反向查找已有「上一个」按钮（main.rs 查找对话框接线到 find_next(true)）；真实鼠标点击仍待验收。
-- 通配符选项（需求原文改为“支持行/列搜索、选区/工作表/工作簿、值/公式”，未点通配符；
-  但查找对话框仍未提供行/列方向与选区范围）。
-- 真实键鼠点击查找对话框按钮/取消/关闭未执行。
-- 跨工作表 replace_all 的单一撤销未测（代码按表捕获后合并，只有单表 1000 格证据）。
+逐条对验收：
 
+| 验收 | 测试 |
+| --- | --- |
+| A300、XFD1048576 从 A1 都能找到 | `find_reaches_far_cells_and_wraps_to_the_first_hit` |
+| 一轮后回到第一处 | 同上（wrapped=true，状态栏“已回到开头”） |
+| 整格=abc 不改 xabc | `whole_cell_replace_spares_longer_text_and_formula_replace_keeps_formula` |
+| 公式模式替换 A1→B1 保持公式 | 同上 |
+| 1000 格全部替换一次撤销 | `replace_all_is_one_undo_step_and_covers_numbers` |
+| 命中数/实改数可解释 | `find_uses_formatted_values_and_formula_results_need_explicit_opt_in`、`long_find_scan_is_chunked_cancellable_and_commits_once` |
+| 范围/顺序/多选 | `find_selection_scope_and_column_order_are_honored`、`find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot` |
+| 工作簿范围与跨表一次撤销 | `replace_all_across_sheets_is_one_undo_step`、`replace_all_uses_the_hit_sheet_not_the_active_sheet` |
+| 查找全部结果窗口 | `find_all_collects_workbook_hits_with_sheet_and_position`、`find_dialog_and_results_window_render` |
+| 可取消 | `parking_a_document_cancels_its_find_scan` |
+| 对话框快捷键 | `ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab` |
+| 旧范围不残留 | `ribbon_find_replace_clears_stale_scope_before_replace_all` |
 
-============================================================
-五、05:48 复核后的三项安全语义修复（UI-05.4，2026-11-13）
-============================================================
-1) 替换按命中表取文本/格式
-   旧 replacement_at 只有 (r,c,cell)，内部固定 self.sheet_idx；apply_replace_hits 传的是
-   h.sheet 的 cell，跨表时用活动表的显示串/公式判断，会漏改或取错格式。
-   现改为 replacement_at(sheet,r,c,cell)，匹配/显示串/公式都用命中表；
-   replace_current 传 self.sheet_idx，全部替换传 h.sheet。
-   用例 replace_all_uses_the_hit_sheet_not_the_active_sheet：
-   A!A1=keep、B!A1=old；B!D4=old（不同坐标，加粗+百分比格式）；
-   A!C3=0.5 无格式、B!C3=0.5 百分比。old→new 只改 B!A1/D4，A!A1 与 A!C3 不动，D4 格式保留；
-   再查“50.00%”→只改 B!C3（旧实现会去 A!C3 找显示串而漏掉）。
+## 真实窗口
 
-2) 搜索选区与命中光标分离
-   旧 find_hits 每次取 sel_rect；find_next 把 sel/sel_end 折叠到命中格，第二次就变成单格回绕。
-   新增 FindState.session_rect：首次在选区范围查找时锁定，连续 Next/Prev 都用它；
-   打开查找窗口（三处入口）重置，park/activate/reset 清空。
-   用例 selection_scope_survives_repeated_next_and_previous：
-   A1:B2 四个命中，连续 Next 依次 B1→A2→B2→回绕 A1，命中数始终 4；
-   Prev 从 A1 回绕到 B2，状态分别含“回到开头/从末尾继续”。
+`ui05.xlsx`：A1=起点、A300=远端唯一值。真实帧循环注入 Ctrl+F → 键入“远端” → Enter：
 
-3) 扫描绑定文档世代
-   FindScan 新增 wb_epoch；poll 时世代不一致立即丢弃并提示“文档已切换，已取消扫描”。
-   park_current/activate_parked/reset_editor_state 主动取消扫描并清空结果列表。
-   用例：
-   - stale_scan_is_dropped_after_document_switch：A 上 9000 格扫描未完成时换成 B 文档，
-     保留旧扫描继续 poll → 扫描丢弃，B 的值/dirty/undo 都不变；同文档重扫可正常完成。
-   - parking_a_document_cancels_its_find_scan：park 立即取消扫描并清空结果。
-
-4) 附带修复：c14 的 LAST_LOAD_KIND 从进程级 Atomic 改为线程局部 Cell
-   （last_load_kind()/set_load_kind）。并行跑 c14_guard 时其他用例的加载不再覆盖断言值；
-   c14_guard 16 passed，全量 core 68 bins / 599 passed / 41 ignored，CORE_EXIT=0。
-
-命令与结果：
-  cargo test -p app ... -- replace_all_uses_the_hit_sheet   1 passed
-  cargo test -p app ... -- selection_scope_survives         1 passed
-  cargo test -p app ... -- stale_scan_is_dropped            1 passed
-  cargo test -p app ... -- parking_a_document               1 passed
-  cargo test -p app ... -- find_selection_scope             1 passed
-  cargo test -p app ... -- long_find_scan                   1 passed
-  cargo test -p app ... -- find_all_collects                1 passed
-  cargo test -p app ... -- replace_all_across_sheets        1 passed
-  cargo test -p app ... -- find_dialog_and_results          1 passed
-全量见 round48：app 178 passed / 0 failed；GUI 12 passed / 8 ignored。
-
-变异（均转红后还原）：
-  M10 scope==2 退化成当前表 → find_selection_scope FAILED
-  M11 忽略按列顺序 → find_selection_scope FAILED
-  M12 取消失效 → long_find_scan FAILED
-  M13 replacement_at 忽略传入 sheet → replace_all_uses_the_hit_sheet FAILED
-  M14 不保存搜索选区 → selection_scope_survives FAILED
-  M15 不校验 wb_epoch → stale_scan_is_dropped FAILED
-  M16 park 不取消扫描 → parking_a_document FAILED
-
-仍未执行（如实保留）：
-- 真实鼠标点击查找对话框按钮、结果列表项、取消按钮（render + 命令级已测）。
-- 选区范围只取主选区（extra_sel 多选区未并入查找范围）。
-- 单次“查找下一个”仍是同步稀疏扫描，超大簿上不可取消；可取消覆盖的是查找全部/全部替换的扫描阶段。
-- 反向查找已有「上一个」按钮；真实鼠标点击仍待验收。
-- 结果列表窗口最多显示 500 项（更长的会提示总数，但未做虚拟滚动）。
-
-
-## 2026-11-13 13:55 追加：Ctrl 多选区查找范围
-
-- 已补齐 `extra_sel` 多选区并入查找与全部替换；`find_next` 跳转后仍保留
-  搜索选区快照，第二处不会退回主选区。
-- 新测试 `find_selection_scope_includes_ctrl_multi_ranges_and_keeps_snapshot`
-  通过；`find_` 8 passed；App 全量 205 passed / 0 failed。
-- 证据：`ui05-multiselect-scope.txt`。
-- 真实鼠标按钮/取消/结果列表项、单次查找可取消、结果虚拟滚动仍未做，
-  UI-05.4/UI-05 保持待验收。
+- `ui05-find-a300.png`：查找与替换对话框（范围=当前工作表、查找=值、顺序=按行、命中1处），
+  名称框 A300、编辑栏“远端唯一值”、状态栏“找到 查找!A300（第 1/1 处）”。
