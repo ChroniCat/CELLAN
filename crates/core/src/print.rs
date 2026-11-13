@@ -75,7 +75,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
         let target_w = printable.0 * setup.fit_width.max(1) as f32;
         let total_w: f32 = (c1..=c2).map(|c| sheet.cols.size(c)).sum();
         if total_w > 0.0 {
-            (target_w / total_w).min(1.0)
+            (target_w / (total_w * 0.75)).min(1.0)
         } else {
             1.0
         }
@@ -86,7 +86,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
         let target_h = printable.1 * setup.fit_height as f32;
         let total_h: f32 = (r1..=r2).map(|r| sheet.rows.size(r)).sum();
         if total_h > 0.0 {
-            scale = scale.min((target_h / total_h).min(1.0));
+            scale = scale.min((target_h / (total_h * 0.75)).min(1.0));
         }
     }
     let px = scale * 0.75;
@@ -113,6 +113,10 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
         let mut used = 0.0f32;
         let mut last_row = row;
         while last_row <= r2 {
+            // 手动分页：用户在该行之前插入了分页符
+            if last_row > row && setup.row_breaks.contains(&last_row) {
+                break;
+            }
             let h = sheet.rows.size(last_row) * px;
             if used + h > body_top && last_row > row {
                 break;
@@ -126,6 +130,9 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
             let mut wused = 0.0f32;
             let mut last_col = col;
             while last_col <= c2 {
+                if last_col > col && setup.col_breaks.contains(&last_col) {
+                    break;
+                }
                 let w = sheet.cols.size(last_col) * px;
                 if wused + w > body_left && last_col > col {
                     break;
