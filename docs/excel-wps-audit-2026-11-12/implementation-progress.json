@@ -3874,7 +3874,8 @@
       "acceptance": "边框方向、格式对话框逐字段提交已实现并专项通过；混合值显示、UI-08.3 事务及真实 Office 目视未完成。",
       "files": [],
       "commits": [
-        "2745438"
+        "2745438",
+        "fb2b55d"
       ],
       "commands": [],
       "evidence": [],
@@ -3929,7 +3930,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "fb2b55d"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app format_dialog_preserves_unchanged_fields_and_mixed_cell_styles -> 1 passed",
             "cargo test -p app --offline --bin app -> 215 passed / 0 failed / 0 ignored"
