@@ -5880,7 +5880,7 @@
       "scope": "app页面设置/打印入口",
       "source": "ui-requirements.md",
       "heading": "UI-26 页面布局和打印设置的完整入口",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5890,7 +5890,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T23:49:43Z",
       "slices": [
         {
           "id": "UI-26.1",
@@ -5898,17 +5898,32 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-26 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/core/src/print.rs",
+            "crates/core/tests/page_setup.rs",
+            "crates/core/tests/pdf_export.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26-page-setup.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26/page-setup.png"
+          ],
+          "not_done": [
+            "真打印机出纸未验证（本机无可用打印机）",
+            "份数按 N 个打印任务提交，未向驱动传 Copies",
+            "真实鼠标拖动/滑块未做（RDP 注入不可用）",
+            "WPS 仅对页面数，未重新做 PDF 像素对拍"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:49:43Z"
         }
       ]
     },

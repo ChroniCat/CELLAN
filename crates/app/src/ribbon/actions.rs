@@ -648,23 +648,8 @@ impl SheetApp {
             "InsertSlicer" => self.slicer_open(),
 
             // ---------------------------------------------------- 页面布局
-            "PageOrientation" => self.set_page(|p| p.landscape = !p.landscape),
-            "PaperSize" => self.set_page(|p| p.paper = if p.paper == 9 { 1 } else { 9 }),
-            "PageMargins" => {
-                let page = self.wb.sheet(self.sheet_idx).page.clone();
-                let narrow = page.margins[0] < 0.5;
-                let wide = page.margins[0] > 0.9;
-                self.set_page(move |p| {
-                    let m = if narrow {
-                        [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]
-                    } else if wide {
-                        [0.7, 0.7, 0.75, 0.75, 0.3, 0.3]
-                    } else {
-                        [0.25, 0.25, 0.75, 0.75, 0.3, 0.3]
-                    };
-                    p.margins = m;
-                });
-            }
+            // UI-26：方向/纸型/边距不再循环切换，统一进页面设置做明确选择。
+            "PageOrientation" | "PaperSize" | "PageMargins" => self.open_page_setup(),
             "TogglePrintGridlines" => {
                 let v = !self.wb.sheet(self.sheet_idx).page.gridlines;
                 self.set_page(move |p| p.gridlines = v);
@@ -1031,22 +1016,29 @@ impl SheetApp {
                 self.status = "已取消打印区域".into();
             }
             "PageBreakInsert" => {
-                let r = self.sel.0;
+                // Excel：在活动格左上方同时插入水平+垂直分页符
+                let (r, c) = self.sel;
                 let sh = self.wb.sheet_mut(self.sheet_idx);
-                if !sh.page.row_breaks.contains(&r) {
+                if r > 0 && !sh.page.row_breaks.contains(&r) {
                     sh.page.row_breaks.push(r);
                     sh.page.row_breaks.sort_unstable();
                     sh.page.row_breaks.dedup();
                 }
+                if c > 0 && !sh.page.col_breaks.contains(&c) {
+                    sh.page.col_breaks.push(c);
+                    sh.page.col_breaks.sort_unstable();
+                    sh.page.col_breaks.dedup();
+                }
                 self.wb.dirty = true;
-                self.status = format!("已在第 {} 行插入分页符", r + 1);
+                self.status = format!("已在第 {} 行、第 {} 列前插入分页符", r + 1, c + 1);
             }
             "PageBreakRemove" => {
-                let r = self.sel.0;
+                let (r, c) = self.sel;
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.page.row_breaks.retain(|x| *x != r);
+                sh.page.col_breaks.retain(|x| *x != c);
                 self.wb.dirty = true;
-                self.status = format!("已删除第 {} 行的分页符", r + 1);
+                self.status = format!("已删除第 {} 行、第 {} 列的分页符", r + 1, c + 1);
             }
             "ZoomToSelection" => {
                 let (r1, c1, r2, c2) = self.sel_rect();

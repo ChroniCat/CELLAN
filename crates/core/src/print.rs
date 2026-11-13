@@ -897,13 +897,36 @@ pub fn export_pdf_from(
     font_path: &Path,
     source: Option<&Path>,
 ) -> Result<usize> {
+    export_pdf_pages_from(wb, sheet_idx, path, font_path, source, None)
+}
+
+/// 导出指定页范围的 PDF。`pages` 为 0 基闭区间；None 表示全部。
+/// 页码/页眉页脚仍按原分页编号，便于打印“第 3-5 页”时与预览一致。
+pub fn export_pdf_pages_from(
+    wb: &Workbook,
+    sheet_idx: usize,
+    path: &Path,
+    font_path: &Path,
+    source: Option<&Path>,
+    pages: Option<(usize, usize)>,
+) -> Result<usize> {
     let Some(sheet) = wb.sheets.get(sheet_idx) else {
         anyhow::bail!("没有第 {sheet_idx} 张表");
     };
     let layout = paginate(sheet, &sheet.page);
+    let total = layout.pages.len();
+    let (first, last) = match pages {
+        Some((a, b)) => (a.min(total.saturating_sub(1)), b.min(total.saturating_sub(1))),
+        None => (0, total.saturating_sub(1)),
+    };
     let font = Font::load(font_path)?;
     let mut doc = Doc::new(font);
-    for (pi, _) in layout.pages.iter().enumerate() {
+    let mut exported = 0usize;
+    for pi in first..=last {
+        if pi >= total {
+            break;
+        }
+        exported += 1;
         let (pw, ph) = layout.page_size;
         doc.add_page(pw, ph);
         let out = page_ops_with(wb, sheet_idx, &layout, pi, source);
@@ -937,7 +960,7 @@ pub fn export_pdf_from(
             doc.page_mut().text_styled(t.x, t.baseline, t.size, &hex, t.color, t.bold, t.italic, t.rotation);
         }
     }
-    let n = layout.pages.len();
+    let n = exported;
     doc.write(path)?;
     Ok(n)
 }

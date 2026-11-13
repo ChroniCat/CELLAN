@@ -7324,3 +7324,107 @@ fn sheet_list_search_finds_one_of_many_sheets() {
     app.wb.sheets[25].hidden = true;
     assert!(app.sheet_list_matches("s25").is_empty(), "隐藏表不参与搜索");
 }
+
+/// UI-26：页面设置先作用于预览，取消必须恢复 page/page_dirty/wb.dirty。
+#[test]
+fn page_setup_cancel_restores_everything() {
+    let mut app = app();
+    app.wb.dirty = false;
+    app.wb.sheet_mut(0).page_dirty = false;
+    let before = app.wb.sheet(0).page.clone();
+    app.open_page_setup();
+    app.page_setup_draft.paper = 8;
+    app.page_setup_draft.landscape = true;
+    app.page_setup_draft.margins = [10.0 / 25.4, 10.0 / 25.4, 0.5, 0.5, 0.3, 0.3];
+    app.page_setup_draft.title_rows = Some((0, 0));
+    app.page_setup_draft.title_cols = Some((0, 1));
+    app.page_setup_draft.fit_to_page = true;
+    app.page_setup_draft.fit_width = 1;
+    app.page_setup_draft.fit_height = 0;
+    app.page_setup_draft.row_breaks = vec![8];
+    app.page_setup_draft.col_breaks = vec![2];
+    app.apply_page_setup_draft();
+    assert_eq!(app.wb.sheet(0).page.paper, 8, "draft 已进入预览");
+    assert!(app.wb.dirty);
+    app.cancel_page_setup();
+    assert_eq!(app.wb.sheet(0).page, before, "取消后页面设置完全恢复");
+    assert!(!app.wb.dirty, "取消不能把文档标脏");
+    assert!(!app.wb.sheet(0).page_dirty);
+    assert!(!app.page_setup_open);
+    assert!(app.page_setup_orig.is_none());
+}
+
+/// UI-26：A4 横向、左右 10mm、首行重复、宽 1 页高自动 + 横纵分页符能一起生效。
+#[test]
+fn page_setup_accepts_excel_style_fields() {
+    let mut app = app();
+    app.open_page_setup();
+    app.page_setup_draft.landscape = true;
+    app.page_setup_draft.margins[0] = 10.0 / 25.4;
+    app.page_setup_draft.margins[1] = 10.0 / 25.4;
+    app.page_setup_draft.title_rows = Some((0, 0));
+    app.page_setup_draft.fit_to_page = true;
+    app.page_setup_draft.fit_width = 1;
+    app.page_setup_draft.fit_height = 0;
+    app.page_setup_draft.row_breaks = vec![49];
+    app.page_setup_draft.col_breaks = vec![6];
+    app.apply_page_setup_draft();
+    app.page_setup_open = false;
+    app.page_setup_orig = None;
+    let ps = &app.wb.sheet(0).page;
+    assert!(ps.landscape);
+    assert_eq!(ps.paper, 9);
+    assert!((ps.margins[0] - 0.3937).abs() < 0.001);
+    assert_eq!(ps.title_rows, Some((0, 0)));
+    assert_eq!((ps.fit_width, ps.fit_height), (1, 0), "宽 1 页、高自动");
+    assert_eq!(ps.row_breaks, vec![49]);
+    assert_eq!(ps.col_breaks, vec![6], "垂直分页也要有");
+}
+
+/// UI-26：打印页码范围 全部 / 当前页 / 自定义（含夹取和反序）。
+#[test]
+fn print_page_span_modes_are_clamped() {
+    let mut app = app();
+    app.print_range = 0;
+    assert_eq!(app.print_page_span(5), None, "全部");
+    app.print_range = 1;
+    app.preview_page = 3;
+    assert_eq!(app.print_page_span(5), Some((3, 3)));
+    app.preview_page = 99;
+    assert_eq!(app.print_page_span(5), Some((4, 4)), "当前页越界夹到末页");
+    app.print_range = 2;
+    app.print_from = 3;
+    app.print_to = 5;
+    assert_eq!(app.print_page_span(5), Some((2, 4)), "1 基转 0 基");
+    app.print_from = 9;
+    app.print_to = 7;
+    assert_eq!(app.print_page_span(5), Some((4, 4)), "反序+越界");
+}
+
+/// UI-26：Ribbon 的纸型/边距入口改为打开页面设置，不再循环切换。
+#[test]
+fn ribbon_page_buttons_open_explicit_dialog() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    for action in ["PaperSize", "PageMargins", "PageOrientation"] {
+        app.page_setup_open = false;
+        app.ribbon_action(action, &ctx);
+        assert!(app.page_setup_open, "{action} 应打开页面设置");
+        app.cancel_page_setup();
+    }
+}
+
+/// UI-26：Ribbon 的“插入分页符”在活动格同时插入水平和垂直分页。
+#[test]
+fn ribbon_page_break_inserts_both_directions() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.sel = (5, 3);
+    app.sel_end = (5, 3);
+    app.ribbon_action("PageBreakInsert", &ctx);
+    assert_eq!(app.wb.sheet(0).page.row_breaks, vec![5]);
+    assert_eq!(app.wb.sheet(0).page.col_breaks, vec![3]);
+    app.ribbon_action("PageBreakRemove", &ctx);
+    assert!(app.wb.sheet(0).page.row_breaks.is_empty());
+    assert!(app.wb.sheet(0).page.col_breaks.is_empty());
+}

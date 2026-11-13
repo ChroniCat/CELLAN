@@ -132,3 +132,33 @@ fn number_formats_are_used_during_pdf_export() {
     // 本测试只锁住 “格式渲染后的文字仍能导出合法 PDF，且带有 Unicode 映射”。
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn exports_only_requested_page_range() {
+    use sheetcore::model::{Cell, Value};
+    fn num(v: f64) -> Cell {
+        Cell { value: Value::Number(v), formula: None }
+    }
+    let src = fixture("table.xlsx");
+    let font = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/fonts/subset/NotoSansSC-Regular.subset.ttf");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
+    for r in 10..90u32 {
+        wb.sheet_mut(0).set(r, 0, num(r as f64 + 1.0));
+    }
+    let layout = sheetcore::print::paginate(wb.sheet(0), &wb.sheet(0).page);
+    assert!(layout.pages.len() >= 2, "补到 90 行应至少分两页");
+    let all = out_path("pdf_range_all");
+    let one = out_path("pdf_range_one");
+    let _ = std::fs::remove_file(&all);
+    let _ = std::fs::remove_file(&one);
+    let n_all = sheetcore::print::export_pdf(&wb, 0, &all, &font).expect("全量导出");
+    let n_one = sheetcore::print::export_pdf_pages_from(&wb, 0, &one, &font, None, Some((1, 1)))
+        .expect("单页导出");
+    assert_eq!(n_all, layout.pages.len());
+    assert_eq!(n_one, 1, "只导出请求的那一页");
+    let data = std::fs::read(&one).expect("读回");
+    let (ok, _, _) = xref_ok(&data);
+    assert!(ok, "单页 PDF xref 仍要合法");
+    assert!(data.starts_with(b"%PDF-1."));
+}
