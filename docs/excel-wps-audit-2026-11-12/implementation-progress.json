@@ -5419,7 +5419,7 @@
       "scope": "app/main.rs run_sort/run_dedup/分列",
       "source": "ui-requirements.md",
       "heading": "UI-17 排序去重与分列的范围和预览",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5429,7 +5429,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T21:16:38Z",
       "slices": [
         {
           "id": "UI-17.1",
@@ -5473,17 +5473,26 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/core/src/data_tools.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
+          ],
+          "not_done": [
+            "真实鼠标点选与两次确认未执行",
+            "固定宽度分列未实现"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:16:38Z"
         }
       ]
     },

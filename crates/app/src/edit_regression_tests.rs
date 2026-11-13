@@ -6824,6 +6824,38 @@ fn status_bar_stats_follow_excel_definitions() {
     assert_eq!(txt, "计数: 1");
 }
 
+/// UI-17.3：分列覆盖右侧格子时要二次确认，撤销必须把扩展区域一起还原。
+#[test]
+fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Text("甲,00123,2026-03-05".into()), formula: None });
+    app.wb.sheet_mut(0).set(0, 1, Cell { value: Value::Text("旧".into()), formula: None });
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    let dlg = DataDlg {
+        tab: 1,
+        keys: Vec::new(),
+        header: false,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: true,
+        detect_types: true,
+    };
+    app.run_split(&dlg);
+    assert!(app.status.contains("覆盖"), "第一次应只预览：{}", app.status);
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value.display(), "旧", "确认前不能写");
+    app.run_split(&dlg);
+    assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "甲");
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value.display(), "00123", "前导零保留文本");
+    assert!(!app.wb.sheet(0).get(0, 2).map(|c| c.is_blank()).unwrap_or(true), "日期列写出");
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "甲,00123,2026-03-05", "撤销恢复原文本");
+    assert_eq!(app.wb.sheet(0).get(0, 1).unwrap().value.display(), "旧", "被覆盖格也恢复");
+    assert!(app.wb.sheet(0).get(0, 2).map(|c| c.is_blank()).unwrap_or(true), "新写日期列被撤销");
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();

@@ -5184,9 +5184,6 @@ impl SheetApp {
 
     fn run_split(&mut self, dlg: &DataDlg) {
         let (r1, c1, r2, c2) = self.sel_rect();
-        if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "分列") {
-            return;
-        }
         let opts = sheetcore::data_tools::SplitOpts {
             delim: dlg.delim.chars().next().unwrap_or(','),
             merge_consecutive: dlg.merge_consecutive,
@@ -5200,6 +5197,12 @@ impl SheetApp {
             &opts,
             true,
         );
+        // 分列会向右写出 width 列：权限门禁和撤销都必须覆盖扩展后的区域
+        let c2w = (c2 + dry.width.max(1) as u32 - 1).min(16_383);
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2w);
+        if !self.write_preflight(&keys, "分列") {
+            return;
+        }
         if dry.overwritten > 0 && self.split_confirm != Some((self.doc_gen, dry.overwritten)) {
             self.split_confirm = Some((self.doc_gen, dry.overwritten));
             self.status = format!(
@@ -5209,7 +5212,7 @@ impl SheetApp {
             return;
         }
         self.split_confirm = None;
-        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let txn = self.txn_begin(&keys);
         let report = sheetcore::data_tools::text_to_columns_ex(
             self.wb.sheet_mut(self.sheet_idx),
             (r1, c1, r2, c2),
