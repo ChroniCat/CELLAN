@@ -5698,7 +5698,7 @@
       "scope": "app/main.rs验证下拉",
       "source": "ui-requirements.md",
       "heading": "UI-19 数据验证下拉的可用性与事务",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5708,7 +5708,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T23:01:48Z",
       "slices": [
         {
           "id": "UI-19.1",
@@ -5716,17 +5716,26 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-19 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-dv.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19/dropdown.png"
+          ],
+          "not_done": [
+            "真实鼠标点选/中文IME搜索未做",
+            "10万项GUI滚动计时未做"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:01:48Z"
         }
       ]
     },

@@ -731,6 +731,8 @@ struct SheetApp {
     cs_dlg: Option<ConsDlg>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
+    /// UI-19：下拉里的搜索词；打开时清空
+    dv_query: String,
     /// 序列下拉里键盘高亮的下标（Alt+↓ 打开后方向键移动）
     dv_hilite: usize,
     /// 验收探针：SC_KEYSEQ 逐帧注入的按键序列（无界面会话用）
@@ -1582,6 +1584,7 @@ impl SheetApp {
             ff_dlg: None,
             cs_dlg: None,
             dv_open: None,
+            dv_query: String::new(),
             dv_hilite: 0,
             key_seq: std::env::var("SC_KEYSEQ")
                 .map(|v| {
@@ -4832,6 +4835,10 @@ impl SheetApp {
     }
 
     /// 选中格可用的列表候选；没有列表验证或来源解析失败时为空。
+    fn dv_visible_items(&self, r: u32, c: u32) -> Vec<String> {
+        filter_dv_items(&self.dv_items(r, c), &self.dv_query)
+    }
+
     fn dv_items(&self, r: u32, c: u32) -> Vec<String> {
         let sheet = self.wb.sheet(self.sheet_idx);
         match sheetcore::dv::find(&sheet.dv, r, c) {
@@ -4854,6 +4861,7 @@ impl SheetApp {
             return;
         }
         let cur = self.wb.sheet(self.sheet_idx).value(r, c).display();
+        self.dv_query.clear();
         self.dv_hilite = items.iter().position(|it| *it == cur).unwrap_or(0);
         self.dv_open = Some((r, c));
     }
@@ -8606,10 +8614,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
         // 序列下拉打开时键盘接管：↑↓ 移动、Enter 选、Esc 关（Excel 的下拉键盘行为）
         if let Some((dr, dc)) = self.dv_open {
-            let items = self.dv_items(dr, dc);
-            if items.is_empty() {
+            let items = self.dv_visible_items(dr, dc);
+            if self.dv_items(dr, dc).is_empty() {
                 self.dv_open = None;
-            } else {
+            } else if !items.is_empty() {
                 if ctx.input(|i| i.key_pressed(Key::Escape)) {
                     self.dv_open = None;
                     self.status = "已关闭序列下拉（未写入）".into();
@@ -23548,9 +23556,9 @@ let txn = self.txn_begin(&keys);
                 let sheet = self.wb.sheet(self.sheet_idx);
                 sheetcore::dv::find(&sheet.dv, dr, dc).cloned()
             } {
-                let items = sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, &dv, dr, dc)
-                    .unwrap_or_default();
-                if !items.is_empty() {
+                let all_items = self.dv_items(dr, dc);
+                let items = self.dv_visible_items(dr, dc);
+                if !all_items.is_empty() {
                     let pos = egui::pos2(gx(dc), gy(dr) + rows.size(dr));
                     let mut picked: Option<(usize, String)> = None;
                     let mut close = false;
@@ -23559,13 +23567,27 @@ let txn = self.txn_begin(&keys);
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(120.0);
-                                // 限高 + 键盘高亮；UI-19 的虚拟化/搜索另算，这里只保证
-                                // 方向键选中的项一定在可视区内（否则键盘会选到看不见的项）
+                                ui.set_min_width(180.0);
+                                let te = ui.add(
+                                    egui::TextEdit::singleline(&mut self.dv_query)
+                                        .hint_text("搜索序列项")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if te.changed() {
+                                    self.dv_hilite = 0;
+                                }
+                                ui.label(format!("{}/{} 项", items.len(), all_items.len()));
+                                if items.is_empty() {
+                                    ui.weak("无匹配项（退格清除搜索）");
+                                    return;
+                                }
+                                // 长序列只画可视行，10 万项也不会卡住。
+                                let row_h = ui.text_style_height(&egui::TextStyle::Body);
                                 egui::ScrollArea::vertical()
                                     .max_height(260.0)
-                                    .show(ui, |ui| {
-                                        for (i, it) in items.iter().enumerate() {
+                                    .show_rows(ui, row_h, items.len(), |ui, range| {
+                                        for i in range {
+                                            let it = &items[i];
                                             let resp = ui.selectable_label(
                                                 i == self.dv_hilite,
                                                 it.as_str(),
@@ -26120,6 +26142,13 @@ impl eframe::App for SheetApp {
                 let after = self.wb.sheet(self.sheet_idx).rows.size(idx);
                 eprintln!("[autofit] 行{idx} {before:.0} -> {after:.0}");
             }
+            if let Ok(out) = std::env::var("SC_AUTOFIT_SAVE") {
+                let wb = self.wb.clone();
+                match sheetcore::xlsx::save_atomic(std::path::Path::new(&out), &wb) {
+                    Ok(()) => eprintln!("[autofit] 已存 {out}"),
+                    Err(e) => eprintln!("[autofit] 保存失败 {e:#}"),
+                }
+            }
         }
         if self.chart_auto && !self.wb.sheet(self.sheet_idx).charts.is_empty() {
             self.chart_sel = Some(0);
@@ -27652,6 +27681,19 @@ const FONT_SANS: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSansSC
 const FONT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Regular.subset.ttf");
 const FONT_LATIN: &[u8] = include_bytes!("../../../assets/fonts/subset/Inter-Regular.subset.ttf");
 const FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/subset/JetBrainsMono-Regular.subset.ttf");
+
+/// UI-19：序列下拉的大小写不敏感子串过滤（空白查询返回全部）。
+fn filter_dv_items(items: &[String], query: &str) -> Vec<String> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return items.to_vec();
+    }
+    items
+        .iter()
+        .filter(|it| it.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
 
 /// 自定义 family 名（和 `sheetcore::style::FontClass::key()` 一一对应）
 fn family_named(key: &str) -> egui::FontFamily {

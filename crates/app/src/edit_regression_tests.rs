@@ -6972,3 +6972,49 @@ fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
         "结构化引用里的列名要一起改"
     );
 }
+#[test]
+fn dv_dropdown_filters_and_selection_is_one_undo_step() {
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+        ranges: vec![(1, 1, 1, 1)],
+        kind: sheetcore::dv::DvKind::List,
+        f1: "\"苹果,香蕉,Apple,apricot\"".into(),
+        ..Default::default()
+    });
+    app.sel = (1, 1);
+    app.dv_open_for_selection();
+    assert_eq!(app.dv_query, "", "打开下拉应先清空搜索词");
+    assert_eq!(app.dv_visible_items(1, 1).len(), 4);
+
+    // 无匹配时下拉不能自己关掉，否则用户没法退格改搜索词
+    app.dv_query = "不存在".into();
+    ui_frame(&mut app, &ctx, Vec::new());
+    assert!(app.dv_open.is_some(), "无匹配项时下拉应保持打开");
+    assert!(app.dv_visible_items(1, 1).is_empty());
+
+    app.dv_query = "AP".into();
+    let vis = app.dv_visible_items(1, 1);
+    assert_eq!(vis, vec!["Apple".to_string(), "apricot".to_string()], "大小写不敏感");
+    app.dv_hilite = 1;
+    // 走真实键盘路径：下拉打开时 Enter 应选中过滤后的第 2 项
+    app.dv_open = Some((1, 1));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Text("apricot".into()));
+    assert!(app.dv_open.is_none(), "选择后应关闭下拉");
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "一次撤销应整体回退");
+}
+
+#[test]
+fn dv_filter_handles_large_lists() {
+    let items: Vec<String> = (0..5000).map(|i| format!("客户{i:04}")).collect();
+    let hit = filter_dv_items(&items, "客户49");
+    assert_eq!(hit.len(), 100, "5000 项里只留 4900..4999");
+    assert_eq!(hit.first().map(String::as_str), Some("客户4900"));
+    assert_eq!(hit.last().map(String::as_str), Some("客户4999"));
+    assert_eq!(filter_dv_items(&items, "   ").len(), 5000);
+    assert!(filter_dv_items(&items, "不存在").is_empty());
+}

@@ -1,0 +1,21 @@
+# UI-19 数据验证下拉的可用性与事务
+
+日期：2026-11-14
+
+- 搜索：下拉顶部新增「搜索序列项」输入框，大小写不敏感子串过滤；
+  计数显示「匹配/总数 项」；无匹配时保留下拉并提示「无匹配项（退格清除搜索）」，
+  不会像以前一样直接关闭让用户丢搜索词。
+- 虚拟化：列表改用 `ScrollArea::show_rows`，只绘制可视行；10 万项不一次性建控件。
+- 键盘：↑/↓ 在**过滤后**列表内移动并滚动到可视区，Enter 选中，Esc 关闭不写入；
+  Alt+↓ 打开时清空旧搜索词并把高亮放在当前值。
+- 事务：选中项写入与手输同一套 `write_preflight` + `txn_begin/txn_end`，
+  一次选择 = 一步撤销；只读/保护/远端锁仍拒绝。
+- GUI 实测（`c07/keyboard.xlsx`，B2 Alt+↓）：浮层显示「搜索序列项」「4/4 项」
+  和苹果/香蕉选项，苹果高亮；截图 `implementation-evidence/ui19/dropdown.png`。
+- 回归：
+  - `dv_dropdown_filters_and_selection_is_one_undo_step`：过滤 AP→Apple/apricot，
+    键盘 Enter 选 apricot，一次撤销回空；无匹配时下拉保持打开。
+  - `dv_filter_handles_large_lists`：5000 项过滤出 100 项、空查询全量、无匹配为空。
+- app `--bin app` **279 passed**。
+- 未做：真实鼠标点选/中文 IME 输入搜索（RDP 注入不可用）；
+  10 万项 GUI 长列表未做实际滚动计时；下拉不支持多列显示（Excel 也不支持）。
