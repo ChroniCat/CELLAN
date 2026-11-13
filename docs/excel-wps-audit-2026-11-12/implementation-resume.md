@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `e37888b`；本轮 UI-21 改动尚未提交。
+- 分支 `main`（`origin/main`），HEAD `1e15885`（UI-21 实现 `11ee281` + 台账 `1e15885` 已推送）。
 - 台账（`scripts/audit_progress.py counts`）：9 已验收 / 9 待验收 / 43 待实施；
   切片 26 已验收 / 18 待验收 / 104 待实施。
 - 当前候选测试真值（08:00–08:06）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
