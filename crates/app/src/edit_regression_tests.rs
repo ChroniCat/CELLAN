@@ -1147,6 +1147,49 @@ fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
     assert_eq!(app.wb.styles.get(before.1).format, "#,##0.00");
 }
 
+/// UI-08 混合值：明确选中活动格原值时也必须应用到整个选区。
+#[test]
+fn mixed_field_explicit_choice_equal_to_active_value_is_applied() {
+    use sheetcore::style::CellStyle;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let base = CellStyle::default_dark();
+    let song = CellStyle {
+        font: "宋体".into(),
+        format: "0".into(),
+        size: 13.0,
+        ..base.clone()
+    };
+    let hei = CellStyle {
+        font: "黑体".into(),
+        format: "0.00".into(),
+        size: 10.0,
+        ..base
+    };
+    let song_id = app.wb.styles.intern(song);
+    let hei_id = app.wb.styles.intern(hei);
+    app.wb.sheet_mut(0).set_style(0, 0, song_id);
+    app.wb.sheet_mut(0).set_style(1, 0, hei_id);
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.open_format_dialog();
+    assert!(app.fmt_mixed.font);
+    assert!(app.fmt_mixed.format);
+    // 下拉里明确点“宋体”：值与活动格原值相同，但仍是明确的用户选择。
+    app.fmt_state.font = "宋体".into();
+    app.fmt_touched.font = true;
+    // 数字格式同样明确选回活动格原值 "0"。
+    app.fmt_state.format = "0".into();
+    app.fmt_touched.format = true;
+    app.apply_format_dialog();
+    for r in 0..2u32 {
+        let st = app.wb.styles.get(app.wb.sheet(0).style_of(r, 0));
+        assert_eq!(st.font, "宋体", "A{} 字体应被明确选择覆盖", r + 1);
+        assert_eq!(st.format, "0", "A{} 格式应被明确选择覆盖", r + 1);
+    }
+    assert_eq!(app.fmt_state.font, "宋体");
+}
+
 /// UI-15.1：自定义数字格式用活动格当前值预览，并写回样式。
 #[test]
 fn custom_format_previews_active_cell_value() {
@@ -1168,6 +1211,168 @@ fn custom_format_previews_active_cell_value() {
         back.styles.get(back.sheet(0).style_of(0, 0)).format,
         "#,##0.00;[Red](#,##0.00);-"
     );
+}
+
+/// UI-15.1：自定义格式的正/负/零三段预览，并在保存重开后保持一致。
+#[test]
+fn custom_format_three_sections_preview_and_reload() {
+    use sheetcore::style::CellStyle;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let fmt = "#,##0.00;[Red](#,##0.00);\"-\"";
+    let style = CellStyle {
+        format: fmt.into(),
+        ..CellStyle::default_dark()
+    };
+    let sid = app.wb.styles.intern(style);
+    for (r, v) in [(0u32, 1234.5), (1, -1234.5), (2, 0.0)] {
+        app.wb.sheet_mut(0).set(r, 0, number(v));
+        app.wb.sheet_mut(0).set_style(r, 0, sid);
+    }
+    for (r, want) in [(0u32, "1,234.50"), (1, "(1,234.50)"), (2, "-")] {
+        app.sel = (r, 0);
+        app.sel_end = (r, 0);
+        app.open_format_dialog();
+        assert_eq!(app.format_dialog_preview(), want, "第 {} 行三段预览", r + 1);
+    }
+    let path = crate::test_env::scratch("ui15-three-sections").join("three.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &app.wb).unwrap();
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    let mut app2 = SheetApp::new_with_context(&ctx, None);
+    app2.wb = back;
+    for (r, want) in [(0u32, "1,234.50"), (1, "(1,234.50)"), (2, "-")] {
+        app2.sel = (r, 0);
+        app2.sel_end = (r, 0);
+        app2.open_format_dialog();
+        assert_eq!(app2.fmt_state.format, fmt, "重开后格式串必须保留");
+        assert_eq!(app2.format_dialog_preview(), want, "重开后第 {} 行显示", r + 1);
+    }
+}
+
+/// UI-16：每张表按 identity 恢复自己的选区/滚动/缩放，改名和重排不能串表。
+#[test]
+fn sheet_view_state_is_restored_by_stable_identity() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    assert!(sheetcore::sheet_ops::insert_sheet(
+        &mut app.wb,
+        1,
+        sheetcore::model::Sheet::new("Second")
+    ));
+    let first_id = app.wb.sheets[0].identity;
+    let second_id = app.wb.sheets[1].identity;
+    app.sel = (99, 25);
+    app.sel_end = (100, 26);
+    app.extra_sel = vec![(3, 3, 4, 4)];
+    app.scroll = egui::vec2(123.0, 456.0);
+    app.zoom = 1.5;
+    assert!(app.switch_sheet_view(1));
+    assert_eq!(app.sel, (0, 0), "新表不能继承上一表的选区");
+    assert_eq!(app.scroll, Vec2::ZERO);
+    assert_eq!(app.zoom, 1.0);
+    assert!(app.switch_sheet_view(0));
+    assert_eq!((app.sel, app.sel_end), ((99, 25), (100, 26)));
+    assert_eq!(app.extra_sel, vec![(3, 3, 4, 4)]);
+    assert_eq!(app.scroll, egui::vec2(123.0, 456.0));
+    assert!((app.zoom - 1.5).abs() < f32::EPSILON);
+
+    // 改名后 identity 不变，仍恢复原状态；重排后也不串到别的表。
+    app.wb.sheets[0].name = "Renamed".into();
+    assert!(app.switch_sheet_view(1));
+    assert!(app.switch_sheet_view(0));
+    assert_eq!(app.sel, (99, 25));
+    assert_eq!(app.wb.sheets[0].identity, first_id);
+    assert!(app.swap_sheet_positions(0, 1));
+    // 当前活动表仍是原 first，索引已变为 1；切到第二张再恢复。
+    assert!(app.switch_sheet_view(0));
+    assert_eq!(app.sel, (0, 0));
+    assert!(app.switch_sheet_view(1));
+    assert_eq!(app.sel, (99, 25));
+    assert_eq!(app.wb.sheets[1].identity, first_id);
+    assert_eq!(app.wb.sheets[0].identity, second_id);
+
+    // Ctrl+PageDown/PageUp 也必须走同一恢复路径，而不是重置到 A1。
+    assert!(app.switch_sheet_view(0));
+    app.sel = (1, 2);
+    app.sel_end = (1, 2);
+    app.scroll = egui::vec2(7.0, 8.0);
+    app.zoom = 1.2;
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::PageDown)]);
+    assert_eq!(app.sheet_idx, 1);
+    app.sel = (5, 6);
+    app.sel_end = (5, 7);
+    app.scroll = egui::vec2(9.0, 10.0);
+    app.zoom = 0.8;
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::PageUp)]);
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!((app.sel, app.sel_end), ((1, 2), (1, 2)));
+    assert_eq!(app.scroll, egui::vec2(7.0, 8.0));
+    assert!((app.zoom - 1.2).abs() < f32::EPSILON);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::PageDown)]);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!((app.sel, app.sel_end), ((5, 6), (5, 7)));
+    assert_eq!(app.scroll, egui::vec2(9.0, 10.0));
+    assert!((app.zoom - 0.8).abs() < f32::EPSILON);
+}
+
+/// UI-16：30 张表时工作表列表可按名称搜索并定位到目标。
+#[test]
+fn sheet_list_search_finds_one_of_thirty_sheets() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for i in 1..30 {
+        assert!(sheetcore::sheet_ops::insert_sheet(
+            &mut app.wb,
+            i,
+            sheetcore::model::Sheet::new(format!("表{i}"))
+        ));
+    }
+    assert_eq!(app.wb.sheets.len(), 30);
+    assert_eq!(app.sheet_list_matches("表17"), vec![17]);
+    assert_eq!(app.sheet_list_matches("表29"), vec![29]);
+    assert!(!app.sheet_list_matches("表17").contains(&16));
+    assert!(app.sheet_list_matches("不存在").is_empty());
+    assert!(app.switch_sheet_view(17));
+    assert_eq!(app.wb.sheet(app.sheet_idx).name, "表17");
+}
+
+/// UI-16：移动/复制到任意目标位置，活动表按 identity 跟随而不是串索引。
+#[test]
+fn sheet_move_and_copy_targets_preserve_active_identity() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for (i, name) in ["B", "C"].iter().enumerate() {
+        assert!(sheetcore::sheet_ops::insert_sheet(
+            &mut app.wb,
+            i + 1,
+            sheetcore::model::Sheet::new(*name)
+        ));
+    }
+    let a_id = app.wb.sheets[0].identity;
+    app.sel = (4, 5);
+    app.scroll = egui::vec2(12.0, 34.0);
+    app.zoom = 1.3;
+    assert!(app.move_sheet_to(0, 3));
+    assert_eq!(
+        app.wb.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["B", "C", "Sheet1"]
+    );
+    assert_eq!(app.wb.sheet(app.sheet_idx).identity, a_id);
+    assert_eq!(app.sheet_idx, 2);
+    // 视图按 identity 仍在原 Sheet1 上。
+    assert!(app.switch_sheet_view(0));
+    assert_eq!(app.sel, (0, 0));
+    assert!(app.switch_sheet_view(2));
+    assert_eq!(app.sel, (4, 5));
+    assert_eq!(app.scroll, egui::vec2(12.0, 34.0));
+    assert!((app.zoom - 1.3).abs() < f32::EPSILON);
+
+    // 复制到指定位置；新表成为活动表，源表仍保留。
+    assert!(app.copy_sheet_to(0, 0));
+    assert_eq!(app.wb.sheets.len(), 4);
+    assert_eq!(app.wb.sheets[0].name, "B (2)");
+    assert_eq!(app.wb.sheet(app.sheet_idx).name, "B (2)");
+    assert_eq!(app.wb.sheets[0].identity != app.wb.sheets[1].identity, true);
 }
 
 /// UI-08.3：对话框只切换一条边时，其他边的粗细和颜色不能被改成细灰线。
@@ -1864,7 +2069,21 @@ fn ctx_tab_menu_sets_and_clears_tab_color() {
     assert_eq!(app.wb.sheets[idx].tab_color, None);
     // 标签菜单的条目
     let labels: Vec<&str> = ctx_tab_rows().iter().filter(|r| !r.is_sep()).map(|r| r.label).collect();
-    assert_eq!(labels, ["插入…", "删除", "重命名", "复制", "工作表标签颜色", "设置单元格格式…"]);
+    assert_eq!(
+        labels,
+        [
+            "插入…",
+            "删除",
+            "重命名",
+            "复制",
+            "移动或复制…",
+            "隐藏工作表",
+            "取消隐藏…",
+            "工作表列表…",
+            "工作表标签颜色",
+            "设置单元格格式…",
+        ]
+    );
 }
 
 // ---------------------------------------------------------------- UI-01 编辑提交链路

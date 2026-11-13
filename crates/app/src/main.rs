@@ -200,6 +200,26 @@ struct FmtMixed {
     border: [bool; 4],
 }
 
+/// 用户在格式对话框里明确动过的字段；即使值等于活动格原值也必须应用。
+#[derive(Default, Clone)]
+struct FmtTouched {
+    font: bool,
+    size: bool,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    rotation: bool,
+    color: bool,
+    fill: bool,
+    halign: bool,
+    valign: bool,
+    wrap: bool,
+    indent: bool,
+    format: bool,
+    border: [bool; 4],
+}
+
 /// 编辑焦点在格内还是编辑栏。缓冲只有一个（`self.editing`），位置只决定谁拿焦点。
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum EditSpot {
@@ -627,6 +647,10 @@ struct SheetApp {
     view_new: Option<String>,
     views_open: bool,
     unhide_open: bool,
+    /// UI-16：工作表列表（可搜索跳转）
+    sheet_list_open: bool,
+    sheet_list_query: String,
+    sheet_move_dlg: Option<SheetMoveDlg>,
     st_dlg: Option<SubtotalDlg>,
     ff_dlg: Option<FlashDlg>,
     cs_dlg: Option<ConsDlg>,
@@ -862,6 +886,8 @@ struct SheetApp {
     paint_scale: f32,
     /// Ctrl+点击追加的多块选区
     extra_sel: Vec<(u32, u32, u32, u32)>,
+    /// UI-16：按工作表 identity 保存的每表视图（切表时保存/恢复）
+    sheet_views: std::collections::HashMap<u64, SheetViewState>,
     /// Tab/Enter 在矩形选区内循环时保留的原始区域；None 表示普通单格导航
     nav_rect: Option<(u32, u32, u32, u32)>,
     /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
@@ -892,6 +918,8 @@ struct SheetApp {
     fmt_orig: FmtState,
     /// 选中区域相对活动格哪些字段是混合值。
     fmt_mixed: FmtMixed,
+    /// 用户明确选择/编辑过的字段；混合值选回活动值也必须提交。
+    fmt_touched: FmtTouched,
     fmt_tab: u8,
     /// 外部链接对话框
     xlink_dlg: bool,
@@ -1012,6 +1040,38 @@ struct ParkedDoc {
     revisions: Vec<sheetcore::revision::Entry>,
 }
 
+/// UI-16：每张工作表自己的视图状态，按 Sheet.identity 绑定。
+/// 不能按索引存：重排、改名、删除后索引会变；identity 在运行期稳定。
+#[derive(Clone)]
+struct SheetViewState {
+    sel: (u32, u32),
+    sel_end: (u32, u32),
+    extra_sel: Vec<(u32, u32, u32, u32)>,
+    scroll: Vec2,
+    zoom: f32,
+}
+
+impl Default for SheetViewState {
+    fn default() -> Self {
+        Self {
+            sel: (0, 0),
+            sel_end: (0, 0),
+            extra_sel: Vec::new(),
+            scroll: Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+/// UI-16：移动或复制工作表对话框的草稿。
+#[derive(Clone, Copy)]
+struct SheetMoveDlg {
+    src: usize,
+    copy: bool,
+    /// 插入位置：0..=len，len 表示末尾
+    target: usize,
+}
+
 /// 标签页槽位：一个是当前活动的，其余挂起
 enum TabSlot {
     Active,
@@ -1079,6 +1139,10 @@ enum CtxAct {
     DeleteSheet,
     RenameSheet,
     CopySheet,
+    MoveSheet,
+    HideSheet,
+    UnhideSheet,
+    SheetList,
     TabColor(Option<[u8; 3]>),
 }
 
@@ -1190,6 +1254,11 @@ fn ctx_tab_rows() -> Vec<CtxRow> {
         CtxRow::item("删除", Some(crate::ui_icons::Icon::Eraser), "", CtxAct::DeleteSheet),
         CtxRow::item("重命名", None, "", CtxAct::RenameSheet),
         CtxRow::item("复制", None, "", CtxAct::CopySheet),
+        CtxRow::item("移动或复制…", None, "", CtxAct::MoveSheet),
+        CtxRow::item("隐藏工作表", None, "", CtxAct::HideSheet),
+        CtxRow::item("取消隐藏…", None, "", CtxAct::UnhideSheet),
+        CtxRow::sep(),
+        CtxRow::item("工作表列表…", None, "", CtxAct::SheetList),
         CtxRow::sep(),
         CtxRow::parent("工作表标签颜色", None, colors),
         CtxRow::sep(),
@@ -1340,6 +1409,9 @@ impl SheetApp {
             view_new: None,
             views_open: false,
             unhide_open: false,
+            sheet_list_open: false,
+            sheet_list_query: String::new(),
+            sheet_move_dlg: None,
             st_dlg: None,
             ff_dlg: None,
             cs_dlg: None,
@@ -1480,6 +1552,7 @@ impl SheetApp {
             fmt_pending: false,
             paint_scale: 1.0,
             extra_sel: Vec::new(),
+            sheet_views: std::collections::HashMap::new(),
             nav_rect: None,
             grid_press: None,
             ctx_menu: None,
@@ -1502,6 +1575,7 @@ impl SheetApp {
             fmt_state: FmtState::default(),
             fmt_orig: FmtState::default(),
             fmt_mixed: FmtMixed::default(),
+            fmt_touched: FmtTouched::default(),
             fmt_tab: 0,
             xlink_dlg: false,
             rev: Vec::new(),
@@ -2026,6 +2100,7 @@ impl SheetApp {
                         self.show_load_diag = true;
                     }
                     self.wb = *wb;
+                    self.sheet_views.clear();
                     self.manual_calc = self.wb.calc_manual;
                     self.wb.calc_pending = false;
                     self.wb_epoch += 1;
@@ -6149,7 +6224,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         };
         let idx = hits.iter().position(|h| *h == hit).unwrap_or(0) + 1;
         self.find.hits = hits.len();
-        self.sheet_idx = hit.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        let target = hit.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        if target != self.sheet_idx && !self.switch_sheet_view(target) {
+            return;
+        }
         self.sel = (hit.row, hit.col);
         self.sel_end = (hit.row, hit.col);
         self.extra_sel.clear();
@@ -6369,7 +6447,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.status = "无法创建工作表：名称无效或已存在".into();
             return;
         }
-        self.sheet_idx = index;
+        self.switch_sheet_view(index);
         self.finish_sheet_change();
         self.status = format!("已新建 {name}");
     }
@@ -6383,13 +6461,22 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         let name = self.wb.sheets[idx].name.clone();
+        let deleted_id = self.wb.sheet(idx).identity;
+        let was_current = self.sheet_idx == idx;
+        if was_current {
+            self.remember_sheet_view();
+        }
         if !sheetcore::sheet_ops::delete_sheet(&mut self.wb, idx) {
             return;
         }
+        self.sheet_views.remove(&deleted_id);
         if self.sheet_idx > idx {
             self.sheet_idx -= 1;
         }
         self.sheet_idx = self.sheet_idx.min(self.wb.sheets.len() - 1);
+        if was_current {
+            self.load_sheet_view(self.sheet_idx);
+        }
         self.finish_sheet_change();
         self.status = format!("已删除 {name}");
     }
@@ -6519,7 +6606,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         // 回到出事的格
         let (sheet, row, col) = applied.focus;
-        self.sheet_idx = sheet.min(self.wb.sheets.len().saturating_sub(1));
+        let target = sheet.min(self.wb.sheets.len().saturating_sub(1));
+        if target != self.sheet_idx {
+            self.switch_sheet_view(target);
+        }
         self.sel = (row, col);
         self.sel_end = (row, col);
         self.nav_rect = None;
@@ -6557,7 +6647,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         copy.edited = true;
         // Keep spill ownership so the next recalc clears and rebuilds its tail.
         if sheetcore::sheet_ops::insert_sheet(&mut self.wb, i + 1, copy) {
-            self.sheet_idx = i + 1;
+            self.switch_sheet_view(i + 1);
             self.finish_sheet_change();
         }
     }
@@ -6643,6 +6733,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             ],
         };
         self.fmt_orig = self.fmt_state.clone();
+        self.fmt_touched = FmtTouched::default();
         let (r1, c1, r2, c2) = self.sel_rect();
         self.fmt_mixed = self.fmt_mixed_for_rect(r1, c1, r2, c2);
         self.fmt_merge_pending = None;
@@ -6704,21 +6795,22 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn apply_format_dialog(&mut self) {
         let st = self.fmt_state.clone();
         let orig = self.fmt_orig.clone();
-        let border_changed = st.border != orig.border;
-        let want_font = st.font != orig.font;
-        let want_bold = st.bold != orig.bold;
-        let want_italic = st.italic != orig.italic;
-        let want_underline = st.underline != orig.underline;
-        let want_strike = st.strikethrough != orig.strikethrough;
-        let want_rotation = st.rotation != orig.rotation;
-        let want_size = (st.size - orig.size).abs() > f32::EPSILON;
-        let want_color = st.color != orig.color;
-        let want_fill = st.fill != orig.fill;
-        let want_halign = st.halign != orig.halign;
-        let want_valign = st.valign != orig.valign;
-        let want_wrap = st.wrap != orig.wrap;
-        let want_indent = st.indent != orig.indent;
-        let want_format = st.format != orig.format;
+        let touched = self.fmt_touched.clone();
+        let border_changed = st.border != orig.border || touched.border.iter().any(|x| *x);
+        let want_font = st.font != orig.font || touched.font;
+        let want_bold = st.bold != orig.bold || touched.bold;
+        let want_italic = st.italic != orig.italic || touched.italic;
+        let want_underline = st.underline != orig.underline || touched.underline;
+        let want_strike = st.strikethrough != orig.strikethrough || touched.strikethrough;
+        let want_rotation = st.rotation != orig.rotation || touched.rotation;
+        let want_size = (st.size - orig.size).abs() > f32::EPSILON || touched.size;
+        let want_color = st.color != orig.color || touched.color;
+        let want_fill = st.fill != orig.fill || touched.fill;
+        let want_halign = st.halign != orig.halign || touched.halign;
+        let want_valign = st.valign != orig.valign || touched.valign;
+        let want_wrap = st.wrap != orig.wrap || touched.wrap;
+        let want_indent = st.indent != orig.indent || touched.indent;
+        let want_format = st.format != orig.format || touched.format;
         let style_changed = border_changed
             || want_font
             || want_bold
@@ -6738,10 +6830,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if style_changed {
             let borders = st.border;
             let side_changed = [
-                st.border[0] != orig.border[0],
-                st.border[1] != orig.border[1],
-                st.border[2] != orig.border[2],
-                st.border[3] != orig.border[3],
+                st.border[0] != orig.border[0] || touched.border[0],
+                st.border[1] != orig.border[1] || touched.border[1],
+                st.border[2] != orig.border[2] || touched.border[2],
+                st.border[3] != orig.border[3] || touched.border[3],
             ];
             let all_sides_changed = side_changed.iter().all(|x| *x);
             let font = st.font.clone();
@@ -6836,7 +6928,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         .iter()
                         .position(|s| s.name.eq_ignore_ascii_case(nm))
                     {
-                        self.sheet_idx = idx;
+                        if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
+                            return;
+                        }
                     }
                 }
                 self.commit_edit(None);
@@ -7147,6 +7241,61 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.ensure_visible();
     }
 
+    /// UI-16：把当前表的选区/滚动/缩放存到该表的 identity 下。
+    fn remember_sheet_view(&mut self) {
+        let Some(sh) = self.wb.sheets.get(self.sheet_idx) else {
+            return;
+        };
+        let id = sh.identity;
+        self.sheet_views.insert(
+            id,
+            SheetViewState {
+                sel: self.sel,
+                sel_end: self.sel_end,
+                extra_sel: self.extra_sel.clone(),
+                scroll: self.scroll,
+                zoom: self.zoom,
+            },
+        );
+    }
+
+    /// UI-16：切到 idx 前先保存当前表视图；目标表没有记录时用新表默认视图。
+    fn switch_sheet_view(&mut self, idx: usize) -> bool {
+        if idx >= self.wb.sheets.len() {
+            return false;
+        }
+        if idx == self.sheet_idx {
+            return true;
+        }
+        self.commit_edit(None);
+        if self.editing.is_some() {
+            return false;
+        }
+        self.remember_sheet_view();
+        self.drop_merge_confirmation();
+        self.format_painter = None;
+        self.painter_double = false;
+        self.load_sheet_view(idx);
+        true
+    }
+
+    /// 把目标表自己的视图装回活动字段；调用方负责 sheet_idx 边界。
+    fn load_sheet_view(&mut self, idx: usize) {
+        self.sheet_idx = idx;
+        let id = self.wb.sheet(idx).identity;
+        let view = self
+            .sheet_views
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        self.sel = view.sel;
+        self.sel_end = view.sel_end;
+        self.extra_sel = view.extra_sel;
+        self.scroll = view.scroll;
+        self.zoom = view.zoom;
+        self.nav_rect = None;
+    }
+
     /// Ctrl+PageUp/PageDown：在当前文档内切换可见工作表，跳过隐藏表。
     fn switch_sheet_relative(&mut self, delta: i32) {
         let n = self.wb.sheets.len();
@@ -7158,13 +7307,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         for _ in 0..n {
             i = (i + delta).rem_euclid(n as i32);
             if !self.wb.sheets[i as usize].hidden {
-                self.sheet_idx = i as usize;
-                self.sel = (0, 0);
-                self.sel_end = (0, 0);
-                self.extra_sel.clear();
-                self.nav_rect = None;
-                self.scroll = Vec2::ZERO;
-                self.status = format!("当前工作表：{}", self.wb.sheet(self.sheet_idx).name);
+                if self.switch_sheet_view(i as usize) {
+                    self.status = format!("当前工作表：{}", self.wb.sheet(self.sheet_idx).name);
+                }
                 return;
             }
         }
@@ -9580,7 +9725,9 @@ let txn = self.txn_begin(&keys);
             if let Some((sheet, a1)) = loc.rsplit_once('!') {
                 let sheet = sheet.trim_matches('\'');
                 if let Some(i) = self.wb.sheets.iter().position(|s| s.name == sheet) {
-                    self.sheet_idx = i;
+                    if i != self.sheet_idx && !self.switch_sheet_view(i) {
+                        return;
+                    }
                 }
                 if let Some((r, c)) = parse_a1_ref(a1) {
                     self.sel = (r, c);
@@ -10350,7 +10497,7 @@ let txn = self.txn_begin(&keys);
         if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, idx, sh) {
             return Err("新建摘要表失败".into());
         }
-        self.sheet_idx = idx;
+        self.switch_sheet_view(idx);
         self.sel = (0, 0);
         self.sel_end = (0, 0);
         self.finish_sheet_change();
@@ -11540,7 +11687,10 @@ let txn = self.txn_begin(&keys);
     /// 应用一个视图
     fn view_apply(&mut self, idx: usize) {
         let Some(v) = self.views.get(idx).cloned() else { return };
-        self.sheet_idx = v.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        let target = v.sheet.min(self.wb.sheets.len().saturating_sub(1));
+        if target != self.sheet_idx && !self.switch_sheet_view(target) {
+            return;
+        }
         self.zoom = v.zoom.clamp(0.5, 2.5);
         self.wb.sheet_mut(self.sheet_idx).freeze = v.freeze;
         self.wb.sheet_mut(self.sheet_idx).freeze_dirty = true;
@@ -11697,6 +11847,220 @@ let txn = self.txn_begin(&keys);
         self.unhide_open = open;
     }
 
+    /// UI-16：把工作表移到指定插入位置（0..=len，len 为末尾）。
+    fn move_sheet_to(&mut self, from: usize, target: usize) -> bool {
+        let len = self.wb.sheets.len();
+        if from >= len || target > len || from == target || from + 1 == target {
+            return false;
+        }
+        if !self.can_change_sheets() {
+            return false;
+        }
+        let active_id = self.wb.sheet(self.sheet_idx).identity;
+        let mut dest = if target > from { target - 1 } else { target };
+        dest = dest.min(len - 1);
+        if dest == from {
+            return false;
+        }
+        let mut cur = from;
+        while cur < dest {
+            if !sheetcore::sheet_ops::move_sheet(&mut self.wb, cur, cur + 1) {
+                break;
+            }
+            cur += 1;
+        }
+        while cur > dest {
+            if !sheetcore::sheet_ops::move_sheet(&mut self.wb, cur, cur - 1) {
+                break;
+            }
+            cur -= 1;
+        }
+        if let Some(new_idx) = self.wb.sheets.iter().position(|s| s.identity == active_id) {
+            self.sheet_idx = new_idx;
+        }
+        self.finish_sheet_change();
+        self.status = format!(
+            "已移动「{}」到第 {} 位",
+            self.wb.sheet(cur).name,
+            cur + 1
+        );
+        true
+    }
+
+    /// UI-16：复制工作表到指定插入位置（0..=len，len 为末尾）。
+    fn copy_sheet_to(&mut self, from: usize, target: usize) -> bool {
+        let len = self.wb.sheets.len();
+        if from >= len {
+            return false;
+        }
+        if !self.can_change_sheets() {
+            return false;
+        }
+        let mut copy = self.wb.sheets[from].clone();
+        let base = copy.name.clone();
+        let mut n = 2;
+        let suffix = format!(" ({n})");
+        let mut name = format!(
+            "{}{suffix}",
+            base.chars().take(31usize.saturating_sub(suffix.chars().count())).collect::<String>()
+        );
+        while self.wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+            n += 1;
+            let suffix = format!(" ({n})");
+            name = format!(
+                "{}{suffix}",
+                base.chars().take(31usize.saturating_sub(suffix.chars().count())).collect::<String>()
+            );
+        }
+        copy.name = name.clone();
+        copy.source_part = None;
+        copy.charts.clear();
+        copy.tables.clear();
+        copy.hidden = false;
+        copy.edited = true;
+        let at = target.min(self.wb.sheets.len());
+        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, at, copy) {
+            self.status = "复制工作表失败：名称无效或已存在".into();
+            return false;
+        }
+        self.switch_sheet_view(at);
+        self.finish_sheet_change();
+        self.status = format!("已复制为「{name}」");
+        true
+    }
+
+    /// UI-16：移动或复制工作表的对话框。
+    fn sheet_move_window(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.sheet_move_dlg else {
+            return;
+        };
+        let len = self.wb.sheets.len();
+        let src_name = self.wb.sheets.get(d.src).map(|s| s.name.clone()).unwrap_or_default();
+        let names: Vec<String> = self.wb.sheets.iter().map(|s| s.name.clone()).collect();
+        let mut open = true;
+        let mut apply = false;
+        ui_kit::window(ctx, "移动或复制工作表", 400.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("源工作表：{}", src_name));
+                ui.checkbox(&mut d.copy, "建立副本");
+                ui.horizontal(|ui| {
+                    ui.label("位置");
+                    let selected = if d.target >= len {
+                        "移到末尾".to_string()
+                    } else {
+                        format!("移到「{}」之前", names.get(d.target).cloned().unwrap_or_default())
+                    };
+                    egui::ComboBox::from_id_salt("sheet_move_target")
+                        .selected_text(selected)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for i in 0..=len {
+                                let label = if i == len {
+                                    "移到末尾".to_string()
+                                } else {
+                                    format!("移到「{}」之前", names.get(i).cloned().unwrap_or_default())
+                                };
+                                ui.selectable_value(&mut d.target, i, label);
+                            }
+                        });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        open = false;
+                    }
+                });
+            });
+        if apply {
+            let ok = if d.copy {
+                self.copy_sheet_to(d.src, d.target)
+            } else {
+                self.move_sheet_to(d.src, d.target)
+            };
+            self.sheet_move_dlg = if open && !ok { Some(d) } else { None };
+            return;
+        }
+        self.sheet_move_dlg = if open { Some(d) } else { None };
+    }
+
+    /// UI-16：工作表列表的搜索过滤（隐藏表不参与）。
+    fn sheet_list_matches(&self, query: &str) -> Vec<usize> {
+        let q = query.trim().to_lowercase();
+        self.wb
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.hidden)
+            .filter(|(_, s)| q.is_empty() || s.name.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// UI-16：工作表列表，带搜索定位；大量工作表时不用横向找标签。
+    fn sheet_list_window(&mut self, ctx: &egui::Context) {
+        if !self.sheet_list_open {
+            return;
+        }
+        let mut open = true;
+        let mut query = self.sheet_list_query.clone();
+        let mut pick: Option<usize> = None;
+        let sheets: Vec<(usize, String, bool)> = self
+            .wb
+            .sheets
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.name.clone(), s.hidden))
+            .collect();
+        ui_kit::window(ctx, "工作表列表", 360.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("搜索");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .desired_width(240.0)
+                            .hint_text("输入表名"),
+                    );
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    let matches = self.sheet_list_matches(&query);
+                    let mut shown = 0usize;
+                    for (i, name, hidden) in &sheets {
+                        if *hidden || !matches.contains(i) {
+                            continue;
+                        }
+                        shown += 1;
+                        let label = if *i == self.sheet_idx {
+                            format!("● {name}")
+                        } else {
+                            format!("　{name}")
+                        };
+                        if ui.selectable_label(*i == self.sheet_idx, label).clicked() {
+                            pick = Some(*i);
+                        }
+                    }
+                    if shown == 0 {
+                        ui.weak("没有匹配的工作表");
+                    }
+                });
+            });
+        self.sheet_list_query = query;
+        if let Some(i) = pick {
+            if self.switch_sheet_view(i) {
+                self.status = format!("当前工作表：{}", self.wb.sheet(self.sheet_idx).name);
+                open = false;
+            }
+        }
+        self.sheet_list_open = open;
+    }
+
     /// 隐藏当前工作表（至少留一张可见）
     fn hide_current_sheet(&mut self) {
         let visible = self.wb.sheets.iter().filter(|s| !s.hidden).count();
@@ -11706,6 +12070,7 @@ let txn = self.txn_begin(&keys);
         }
         let i = self.sheet_idx;
         let name = self.wb.sheet(i).name.clone();
+        self.remember_sheet_view();
         let sh = self.wb.sheet_mut(i);
         sh.hidden = true;
         sh.hidden_dirty = true;
@@ -11719,7 +12084,7 @@ let txn = self.txn_begin(&keys);
             .enumerate()
             .position(|(k, s)| k != i && !s.hidden)
         {
-            self.sheet_idx = next;
+            self.load_sheet_view(next);
         }
         self.status = format!("已隐藏「{name}」；视图 → 取消隐藏 可以恢复");
     }
@@ -11798,7 +12163,11 @@ let txn = self.txn_begin(&keys);
             self.a11y_scan();
         }
         if let Some((si, (r, c))) = jump {
-            self.sheet_idx = si.min(self.wb.sheets.len() - 1);
+            let target = si.min(self.wb.sheets.len() - 1);
+            if target != self.sheet_idx && !self.switch_sheet_view(target) {
+                self.a11y_open = open;
+                return;
+            }
             self.sel = (r, c);
             self.sel_end = (r, c);
             self.ensure_visible();
@@ -11957,7 +12326,7 @@ let txn = self.txn_begin(&keys);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         let idx = self.wb.sheets.len() - 1;
-        self.sheet_idx = idx;
+        self.switch_sheet_view(idx);
         self.sel = (0, 0);
         self.sel_end = (0, 0);
         self.status = format!(
@@ -16351,7 +16720,9 @@ let txn = self.txn_begin(&keys);
         }
         if let Some((sheet, r, c)) = jump {
             if let Some(si) = self.wb.sheets.iter().position(|s| s.name == sheet) {
-                self.sheet_idx = si;
+                if si != self.sheet_idx && !self.switch_sheet_view(si) {
+                    return;
+                }
                 self.sel = (r, c);
                 self.sel_end = (r, c);
                 self.ensure_visible();
@@ -16410,7 +16781,9 @@ let txn = self.txn_begin(&keys);
             );
             return;
         }
-        self.sheet_idx = si;
+        if si != self.sheet_idx && !self.switch_sheet_view(si) {
+            return;
+        }
         let keys: Vec<(u32, u32)> = e.cells.iter().map(|c| (c.r, c.c)).collect();
         let txn = self.txn_begin(&keys);
         for ch in &e.cells {
@@ -16572,20 +16945,48 @@ let txn = self.txn_begin(&keys);
         let st = self.fmt_state.clone();
         let mixed = self.fmt_mixed.clone();
         let orig = self.fmt_orig.clone();
-        let font_mixed = mixed.font && self.fmt_state.font == orig.font;
-        let size_mixed = mixed.size && (self.fmt_state.size - orig.size).abs() <= f32::EPSILON;
-        let style_mixed = (mixed.bold && self.fmt_state.bold == orig.bold)
-            || (mixed.italic && self.fmt_state.italic == orig.italic)
-            || (mixed.underline && self.fmt_state.underline == orig.underline)
-            || (mixed.strikethrough && self.fmt_state.strikethrough == orig.strikethrough);
-        let color_mixed = mixed.color && self.fmt_state.color == orig.color;
-        let fill_mixed = mixed.fill && self.fmt_state.fill == orig.fill;
-        let halign_mixed = mixed.halign && self.fmt_state.halign == orig.halign;
-        let valign_mixed = mixed.valign && self.fmt_state.valign == orig.valign;
-        let rotation_mixed = mixed.rotation && self.fmt_state.rotation == orig.rotation;
-        let wrap_mixed = mixed.wrap && self.fmt_state.wrap == orig.wrap;
-        let indent_mixed = mixed.indent && self.fmt_state.indent == orig.indent;
-        let format_mixed = mixed.format && self.fmt_state.format == orig.format;
+        let font_mixed = mixed.font
+            && !self.fmt_touched.font
+            && self.fmt_state.font == orig.font;
+        let size_mixed = mixed.size
+            && !self.fmt_touched.size
+            && (self.fmt_state.size - orig.size).abs() <= f32::EPSILON;
+        let style_mixed = (mixed.bold
+            && !self.fmt_touched.bold
+            && self.fmt_state.bold == orig.bold)
+            || (mixed.italic
+                && !self.fmt_touched.italic
+                && self.fmt_state.italic == orig.italic)
+            || (mixed.underline
+                && !self.fmt_touched.underline
+                && self.fmt_state.underline == orig.underline)
+            || (mixed.strikethrough
+                && !self.fmt_touched.strikethrough
+                && self.fmt_state.strikethrough == orig.strikethrough);
+        let color_mixed = mixed.color
+            && !self.fmt_touched.color
+            && self.fmt_state.color == orig.color;
+        let fill_mixed = mixed.fill
+            && !self.fmt_touched.fill
+            && self.fmt_state.fill == orig.fill;
+        let halign_mixed = mixed.halign
+            && !self.fmt_touched.halign
+            && self.fmt_state.halign == orig.halign;
+        let valign_mixed = mixed.valign
+            && !self.fmt_touched.valign
+            && self.fmt_state.valign == orig.valign;
+        let rotation_mixed = mixed.rotation
+            && !self.fmt_touched.rotation
+            && self.fmt_state.rotation == orig.rotation;
+        let wrap_mixed = mixed.wrap
+            && !self.fmt_touched.wrap
+            && self.fmt_state.wrap == orig.wrap;
+        let indent_mixed = mixed.indent
+            && !self.fmt_touched.indent
+            && self.fmt_state.indent == orig.indent;
+        let format_mixed = mixed.format
+            && !self.fmt_touched.format
+            && self.fmt_state.format == orig.format;
         ui_kit::window(ctx, "设置单元格格式", 452.0)
             .open(&mut open)
             .resizable(false)
@@ -16644,6 +17045,7 @@ let txn = self.txn_begin(&keys);
                                             .clicked()
                                         {
                                             self.fmt_state.font = name.to_string();
+                                            self.fmt_touched.font = true;
                                         }
                                     }
                                 });
@@ -16652,6 +17054,7 @@ let txn = self.txn_begin(&keys);
                             let mut szv = self.fmt_state.size as f64;
                             if ui_kit::spin(ui, &mut szv, 6.0, 72.0, 1.0, 50.0) {
                                 self.fmt_state.size = szv as f32;
+                                self.fmt_touched.size = true;
                             }
                             if size_mixed {
                                 ui.label(egui::RichText::new("混合").size(11.0).weak());
@@ -16673,6 +17076,7 @@ let txn = self.txn_begin(&keys);
                             .clicked()
                             {
                                 self.fmt_state.bold = !self.fmt_state.bold;
+                                self.fmt_touched.bold = true;
                             }
                             if ui_kit::text_toggle(
                                 ui,
@@ -16686,6 +17090,7 @@ let txn = self.txn_begin(&keys);
                             .clicked()
                             {
                                 self.fmt_state.italic = !self.fmt_state.italic;
+                                self.fmt_touched.italic = true;
                             }
                             if ui_kit::text_toggle(
                                 ui,
@@ -16699,6 +17104,7 @@ let txn = self.txn_begin(&keys);
                             .clicked()
                             {
                                 self.fmt_state.underline = !self.fmt_state.underline;
+                                self.fmt_touched.underline = true;
                             }
                             if ui_kit::text_toggle(
                                 ui,
@@ -16712,14 +17118,18 @@ let txn = self.txn_begin(&keys);
                             .clicked()
                             {
                                 self.fmt_state.strikethrough = !self.fmt_state.strikethrough;
+                                self.fmt_touched.strikethrough = true;
                             }
                             if style_mixed {
                                 ui.label(egui::RichText::new("混合").size(11.0).weak());
                             }
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("颜色").size(11.5).weak());
-                            ui.color_edit_button_srgb(&mut self.fmt_state.color)
-                                .on_hover_text("字体颜色");
+                            let color_res = ui.color_edit_button_srgb(&mut self.fmt_state.color);
+                            if color_res.changed() {
+                                self.fmt_touched.color = true;
+                            }
+                            color_res.on_hover_text("字体颜色");
                             if color_mixed {
                                 ui.label(egui::RichText::new("混合").size(11.0).weak());
                             }
@@ -16729,9 +17139,14 @@ let txn = self.txn_begin(&keys);
                             if ui.checkbox(&mut has_fill, fill_label).changed() {
                                 self.fmt_state.fill =
                                     if has_fill { Some([255, 255, 0]) } else { None };
+                                self.fmt_touched.fill = true;
                             }
                             if let Some(f) = self.fmt_state.fill.as_mut() {
-                                ui.color_edit_button_srgb(f).on_hover_text("底色");
+                                let fill_res = ui.color_edit_button_srgb(f);
+                                if fill_res.changed() {
+                                    self.fmt_touched.fill = true;
+                                }
+                                fill_res.on_hover_text("底色");
                             }
                         });
                         ui.end_row();
@@ -16749,7 +17164,9 @@ let txn = self.txn_begin(&keys);
                             for (label, v) in
                                 [("常规", 0u8), ("左", 1), ("中", 2), ("右", 3)]
                             {
-                                ui.selectable_value(&mut self.fmt_state.halign, v, label);
+                                if ui.selectable_value(&mut self.fmt_state.halign, v, label).clicked() {
+                                    self.fmt_touched.halign = true;
+                                }
                             }
                             ui.add_space(12.0);
                             let vlabel = if valign_mixed { "垂直（混合）" } else { "垂直" };
@@ -16757,7 +17174,9 @@ let txn = self.txn_begin(&keys);
                             for (label, v) in
                                 [("常规", 0u8), ("上", 1), ("中", 2), ("下", 3)]
                             {
-                                ui.selectable_value(&mut self.fmt_state.valign, v, label);
+                                if ui.selectable_value(&mut self.fmt_state.valign, v, label).clicked() {
+                                    self.fmt_touched.valign = true;
+                                }
                             }
                         });
                         ui.end_row();
@@ -16785,7 +17204,12 @@ let txn = self.txn_begin(&keys);
                                         ("竖排（-90°）", -90),
                                         ("斜排（-45°）", -45),
                                     ] {
-                                        ui.selectable_value(&mut self.fmt_state.rotation, v, label);
+                                        if ui
+                                            .selectable_value(&mut self.fmt_state.rotation, v, label)
+                                            .clicked()
+                                        {
+                                            self.fmt_touched.rotation = true;
+                                        }
                                     }
                                 });
                         });
@@ -16797,6 +17221,7 @@ let txn = self.txn_begin(&keys);
                             let wrap_label = if wrap_mixed { "自动换行（混合）" } else { "自动换行" };
                             if ui.checkbox(&mut wrap, wrap_label).changed() {
                                 self.fmt_state.wrap = wrap;
+                                self.fmt_touched.wrap = true;
                             }
                             ui.add_space(12.0);
                             let ilabel = if indent_mixed { "缩进（混合）" } else { "缩进" };
@@ -16804,6 +17229,7 @@ let txn = self.txn_begin(&keys);
                             let mut ind = self.fmt_state.indent as f64;
                             if ui_kit::spin(ui, &mut ind, 0.0, 15.0, 1.0, 50.0) {
                                 self.fmt_state.indent = ind as u8;
+                                self.fmt_touched.indent = true;
                             }
                         });
                         ui.end_row();
@@ -16853,6 +17279,7 @@ let txn = self.txn_begin(&keys);
                                             .clicked()
                                         {
                                             self.fmt_state.format = code.to_string();
+                                            self.fmt_touched.format = true;
                                         }
                                     }
                                 });
@@ -16864,6 +17291,7 @@ let txn = self.txn_begin(&keys);
                             );
                             if r.changed() {
                                 self.fmt_state.format = custom;
+                                self.fmt_touched.format = true;
                             }
                             let sample = if format_mixed {
                                 "混合".to_string()
@@ -16900,6 +17328,7 @@ let txn = self.txn_begin(&keys);
                             {
                                 let on = self.fmt_state.border[idx];
                                 let border_mixed = mixed.border[idx]
+                                    && !self.fmt_touched.border[idx]
                                     && self.fmt_state.border[idx] == orig.border[idx];
                                 let label = if border_mixed {
                                     format!("{label}?")
@@ -16908,14 +17337,17 @@ let txn = self.txn_begin(&keys);
                                 };
                                 if ui.selectable_label(on, label).clicked() {
                                     self.fmt_state.border[idx] = !on;
+                                    self.fmt_touched.border[idx] = true;
                                 }
                             }
                             ui.add_space(8.0);
                             if ui_kit::pill(ui, "外框", "四周都画").clicked() {
                                 self.fmt_state.border = [true; 4];
+                                self.fmt_touched.border = [true; 4];
                             }
                             if ui_kit::pill(ui, "无", "去掉所有边框").clicked() {
                                 self.fmt_state.border = [false; 4];
+                                self.fmt_touched.border = [true; 4];
                             }
                         });
                         ui.end_row();
@@ -17183,7 +17615,11 @@ let txn = self.txn_begin(&keys);
                 });
             });
         if let Some(h) = pick {
-            self.sheet_idx = h.sheet.min(self.wb.sheets.len().saturating_sub(1));
+            let target = h.sheet.min(self.wb.sheets.len().saturating_sub(1));
+            if target != self.sheet_idx && !self.switch_sheet_view(target) {
+                self.find.find_all_open = open;
+                return;
+            }
             self.sel = (h.row, h.col);
             self.sel_end = (h.row, h.col);
             self.extra_sel.clear();
@@ -18529,6 +18965,27 @@ let txn = self.txn_begin(&keys);
                 }
             }
             CtxAct::CopySheet => self.duplicate_sheet(idx),
+            CtxAct::MoveSheet => {
+                self.sheet_move_dlg = Some(SheetMoveDlg {
+                    src: idx.min(self.wb.sheets.len().saturating_sub(1)),
+                    copy: false,
+                    target: idx.min(self.wb.sheets.len()),
+                });
+            }
+            CtxAct::HideSheet => {
+                if self.sheet_idx != idx
+                    && idx < self.wb.sheets.len()
+                    && !self.switch_sheet_view(idx)
+                {
+                    return;
+                }
+                self.hide_current_sheet();
+            }
+            CtxAct::UnhideSheet => self.unhide_open = true,
+            CtxAct::SheetList => {
+                self.sheet_list_open = true;
+                self.sheet_list_query.clear();
+            }
             CtxAct::TabColor(rgb) => {
                 if let Some(sh) = self.wb.sheets.get_mut(idx) {
                     sh.tab_color = rgb;
@@ -23610,6 +24067,8 @@ impl eframe::App for SheetApp {
         self.view_new_dialog(ctx);
         self.views_window(ctx);
         self.unhide_window(ctx);
+        self.sheet_list_window(ctx);
+        self.sheet_move_window(ctx);
         self.symbol_window(ctx);
         self.error_window(ctx);
         self.proof_window(ctx);
@@ -24458,12 +24917,8 @@ impl eframe::App for SheetApp {
                 });
                 if let Some(i) = goto {
                     if i != self.sheet_idx {
-                        self.drop_merge_confirmation();
-                        self.format_painter = None;
-                        self.painter_double = false;
+                        self.switch_sheet_view(i);
                     }
-                    self.sheet_idx = i;
-                    self.sel = (0, 0);
                 }
                 if let Some((i, n)) = ren {
                     self.rename_sheet = Some((i, n));
