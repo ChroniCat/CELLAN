@@ -188,11 +188,99 @@ fn expand_whole_cols_seg(text: &str) -> String {
     out
 }
 
+/// 整行引用 `1:3` / `$1:$3` 的匹配。返回 (结束位置, 起始行, 结束行, 是否绝对行)。
+fn match_rows(chars: &[char], i: usize) -> Option<(usize, u32, u32, bool, bool)> {
+    let mut j = i;
+    let a_abs = j < chars.len() && chars[j] == '$';
+    if a_abs {
+        j += 1;
+    }
+    let start = j;
+    while j < chars.len() && chars[j].is_ascii_digit() && j - start < 7 {
+        j += 1;
+    }
+    if j == start || j >= chars.len() || chars[j] != ':' {
+        return None;
+    }
+    let first: u32 = chars[start..j].iter().collect::<String>().parse().ok()?;
+    j += 1;
+    let b_abs = j < chars.len() && chars[j] == '$';
+    if b_abs {
+        j += 1;
+    }
+    let start2 = j;
+    while j < chars.len() && chars[j].is_ascii_digit() && j - start2 < 7 {
+        j += 1;
+    }
+    if j == start2 {
+        return None;
+    }
+    let second: u32 = chars[start2..j].iter().collect::<String>().parse().ok()?;
+    // `1:3` 后面不能紧跟字母/数字/`$`/`(`，否则不是完整的整行引用。
+    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(') {
+        return None;
+    }
+    if first == 0 || second == 0 {
+        return None;
+    }
+    Some((j, first, second, a_abs, b_abs))
+}
+
+/// 整行引用在 OOXML/公式里是 `1:3`；解析器只认 A1 区域，因此先展开成
+/// `A1:XFD3`（或绝对行 `A$1:XFD$3`），求值时再按实际使用范围裁剪。
+fn expand_whole_rows(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 24);
+    for (in_quote, seg) in split_quoted(text) {
+        if in_quote {
+            out.push_str(seg);
+        } else {
+            out.push_str(&expand_whole_rows_seg(seg));
+        }
+    }
+    out
+}
+
+fn expand_whole_rows_seg(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 24);
+    let mut i = 0usize;
+    let mut bracket_depth = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '[' {
+            bracket_depth += 1;
+        } else if c == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        }
+        let boundary = bracket_depth == 0
+            && (i == 0
+                || !(chars[i - 1].is_ascii_alphanumeric()
+                    || chars[i - 1] == '$'
+                    || chars[i - 1] == '.'
+                    || chars[i - 1] == '_'));
+        if boundary {
+            if let Some((end, a, b, a_abs, b_abs)) = match_rows(&chars, i) {
+                let da = if a_abs { "$" } else { "" };
+                let db = if b_abs { "$" } else { "" };
+                out.push_str(&format!("A{da}{a}:XFD{db}{b}"));
+                i = end;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 pub fn normalize_formula(text: &str) -> String {
     if !text.contains("_xl") && !text.contains('!') && !text.contains(':') {
         return text.to_string();
     }
-    let text = expand_whole_cols(text);
+    let text = expand_whole_rows(&expand_whole_cols(text));
     let mut out = String::with_capacity(text.len());
     for (in_quote, seg) in split_quoted(&text) {
         if in_quote {

@@ -1,0 +1,64 @@
+# C11.1 整行引用：实现与验证
+
+状态：实现完成，待独立复核（2026-11-13 10:45）
+父项：C11 未完成；C11.2/C11.3/C11.4 未实施。
+
+## 审计基线
+
+`core-requirements.md` C11 现状与定位（第 142 行）：`lib.rs` 只扩展整列，
+整行、三维、`#`、`@` 动态确认失败。C11.1 只处理 `=SUM(1:1)` 这类整行引用，
+不把另外三个切片算入本项。
+
+## 根因
+
+公式解析器只认 A1 单元格/区域；`1:3` 的词法首字符是数字，未规范化时无法形成
+合法 Range。现有 `normalize_formula` 只调用 `expand_whole_cols`，没有整行版本。
+
+## 实现
+
+文件：`crates/core/src/lib.rs`
+
+- 新增 `match_rows`：识别可选 `$` 的行号、冒号、第二个可选 `$` 行号；
+  要求边界完整（后面不能紧跟字母/数字/`$`/`(`），行号 1..1048576。
+- 新增 `expand_whole_rows` / `expand_whole_rows_seg`：
+  - `1:3` -> `A1:XFD3`；
+  - `$1:$3` -> `A$1:XFD$3`，保留两端的行绝对标志；
+  - `Sheet!2:2` -> `Sheet!A2:XFD2`，工作表前缀原样保留；
+  - 跳过引号内文本；方括号结构化引用内不展开（`Sales[1:3]` 保持原样）。
+- `normalize_formula` 现在依次执行 `expand_whole_cols`、`expand_whole_rows`，
+  再交给现有解析器和 `refs::rewrite`。求值时巨大的 XFD 区域由现有
+  `range_values` 按工作表实际使用边界裁剪，不展开 16384 列。
+
+依赖和结构编辑走同一条规范化路径：`deps::dependencies` 调用
+`normalize_formula`；现有的 `refs::rewrite` 已能识别整行 `1:3`。
+
+## 自动化验证
+
+命令：`cargo test -p sheetcore --offline --test whole_row_refs`
+结果：4 passed / 0 failed。
+
+- `whole_row_reference_normalizes_to_a1_but_not_strings`：
+  `=SUM(1:3)` -> `=SUM(A1:XFD3)`；`$1:$3` -> `A$1:XFD$3`；
+  引号内 `"1:3"` 与普通 `A1:B2` 不变。
+- `whole_row_sum_uses_used_range_and_is_sheet_scoped`：
+  合成 Data 表 A1=1、B2=2、C3=3、D4=4；
+  `=SUM(1:3)=6`、`=SUM(1:1)=1`、`=SUM(2:2)=2`、`=SUM($2:$2)=2`；
+  `Other!1:2=30`、`Other!$2:$2=20`。
+- `whole_row_inside_structured_reference_is_not_rewritten`：
+  `=SUM(Sales[1:3])` 不被误改为 A1:XFD。
+- `whole_row_is_a_dependency_and_moves_on_row_insert`：
+  A4 的 `=SUM(1:3)` 在 A2 改变时经 `Deps::closure` 命中；
+  `refs::rewrite("=SUM(1:3)", 行首插 1 行)` -> `=SUM(2:4)`。
+
+全量回归（当前源码）：
+- `cargo test -p sheetcore --offline` -> 70 bins / 630 passed / 0 failed / 41 ignored / CORE_EXIT=0。
+- `cargo test -p app --offline --bin app` -> 200 passed / 0 failed / APP_EXIT=0。
+日志：`implementation-evidence/c11-whole-row/core.txt`、`app.txt`。
+
+## 未执行/边界
+
+- 未做 Excel/WPS 实机整行公式对拍；本切片验收文本未要求 Office 操作，
+  父项 C11 的实机兼容仍待 C11.4 收口。
+- 未实现 C11.2 溢出引用、C11.3 隐式交集、C11.4 三维引用；不得把 C11 标为已验收。
+- 公式保存后可能以展开后的 `A1:XFD3` 形式写出，这是沿用现有整列规范化策略；
+  原公式保真问题留待 C11.4/后续兼容检查，不在本切片宣称已解决。

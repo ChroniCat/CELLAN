@@ -1,13 +1,23 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `d6f8c32`（C06 D1904 快照修复与台账；C10.1 在前）。
-- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 1 实施中 / 41 待实施；
-  切片 28 已验收 / 19 待验收 / 101 待实施。
-- 当前测试真值（C06 修改后，09:39 重跑）：core 69 bins / 626 passed / 0 failed / 41 ignored，
+- 分支 `main`（`origin/main`），HEAD `2d0b265`（C06 D1904 快照修复；C10.1 在前；C11.1 工作区未提交）。
+- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 2 实施中 / 40 待实施；
+  切片 28 已验收 / 20 待验收 / 100 待实施。
+- 当前测试真值（C11.1 修改后重跑）：core 70 bins / 630 passed / 0 failed / 41 ignored，
   CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
-  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10 未重跑 GUI。
+  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10/C11.1 未重跑 GUI。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
+
+## 本轮：C11.1 整行引用（实现完成，待独立复核）
+
+- `normalize_formula` 新增整行展开：`1:3` → `A1:XFD3`、
+  `$1:$3` → `A$1:XFD$3`、`Sheet!2:2` → `Sheet!A2:XFD2`；
+  跳过引号和结构化引用方括号，依赖与 `refs::rewrite` 共用规范化路径。
+- `crates/core/tests/whole_row_refs.rs` 4 项：规范化/字符串、按已用区求值、
+  Sheet 作用域、结构化引用不误改、Deps 和插行改写。
+- 专项 4/0；全量 core 70 bins / 630 / 0 / 41；app 200/0。
+- C11.2 溢出引用、C11.3 隐式交集、C11.4 三维引用尚未实施，C11 父项未验收。
 
 ## 本轮：UI-21 手动计算与工作表计算（已验收）
 
