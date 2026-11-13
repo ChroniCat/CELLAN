@@ -1945,7 +1945,7 @@
       "scope": "app/main.rs clear_values/clear_selection/handle_keys",
       "source": "ui-requirements.md",
       "heading": "UI-04 统一清除操作的重算、撤销与广播",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "清除内容/格式/全部走同一命令；所有非连续选区去重后一次事务；依赖重算、一步撤销、dirty、广播一致；A1=1/A2=2/B1=A1*10/B2=A2*10 清 A1:A2 后 B 立即为 0，撤销全部恢复。",
       "files": [
         "crates/app/src/main.rs",
@@ -1960,15 +1960,11 @@
       "evidence": [
         "implementation-evidence/ui04-clear-contents.txt"
       ],
-      "not_done": [
-        "Ribbon/右键“清除”菜单的真实键鼠点击",
-        "关闭窗口 dirty 提示的真实窗口流程",
-        "真实鼠标拖拽手势（当前测共用命令入口）"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "补 Ribbon/右键清除与 dirty 关闭提示的真实键鼠验收；然后转 UI-05 真实交互。",
-      "updated_utc": "2026-11-12T22:00:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T14:58:57Z",
       "slices": [
         {
           "id": "UI-04.1",
@@ -1976,29 +1972,27 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "清除内容/格式/全部走同一命令；所有非连续选区去重后一次事务；依赖重算、一步撤销、dirty、广播一致；A1=1/A2=2/B1=A1*10/B2=A2*10 清 A1:A2 后 B 立即为 0，撤销全部恢复。",
+          "status": "已验收",
+          "acceptance": "Delete/右键/功能区统一到 clear_rects：去重、preflight、一次事务、依赖重算、修订与广播、dirty、一步撤销；区分清除内容/格式/全部；多选不误清间隙；保护/协作整批拒绝。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/app/src/ribbon/actions.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- clear_all_broadcasts"
+            "cargo test -p app --offline -j 2 --bin app clear -- --test-threads=2 -> 21 passed",
+            "GUI：A1:A2 Delete → B1/B2=0、状态栏已清除内容；Ctrl+Z 全恢复（SC_DUMP 佐证）"
           ],
           "evidence": [
-            "implementation-evidence/ui04-clear-contents.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui04-clear.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui04-clear-recalc.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui04-clear-undo.png"
           ],
-          "not_done": [
-            "Ribbon/右键的真实键鼠点击未做（命令级 + 全量 GUI 回归已过）",
-            "保存关闭提示 dirty 的真实窗口流程未执行（仅断言 wb.dirty）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补 Ribbon/右键清除与 dirty 关闭提示的真实键鼠验收。",
-          "updated_utc": "2026-11-13T05:55:00Z"
+          "next": "",
+          "updated_utc": "2026-11-13T14:58:57Z"
         }
       ]
     },

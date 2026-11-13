@@ -6067,3 +6067,73 @@ fn f2_replace_then_tab_commits_and_moves_right() {
     assert!(app.editing.is_none());
     assert_eq!(app.undo.depth(), (1, 0), "一次提交只记一步撤销");
 }
+
+/// UI-04：Delete 键走的是 handle_keys → clear_values → clear_rects，
+/// 不能只有按钮路径统一。这里按真实按键事件提交，断言依赖重算、撤销和选区。
+#[test]
+fn delete_key_clears_rect_and_recalcs_dependents() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let num = |v: f64| Cell { value: Value::Number(v), formula: None };
+    let f = |t: &str| Cell { value: Value::Empty, formula: Some(t.into()) };
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, num(1.0));
+        sh.set(1, 0, num(2.0));
+        sh.set(0, 1, f("=A1*10"));
+        sh.set(1, 1, f("=A2*10"));
+    }
+    sheetcore::formula::recalc_all(&mut app.wb);
+    ui_frame(&mut app, &ctx, vec![]);
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Delete, false)]);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(0.0), "B1 立即为 0");
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(0.0), "B2 立即为 0");
+    assert_eq!(app.sel, (0, 0), "Delete 不移动选区");
+    assert!(app.wb.dirty, "清除必须标脏");
+    assert_eq!(app.undo.depth().0, 1, "一次清除只压一步撤销");
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(20.0), "撤销恢复依赖结果");
+}
+
+/// UI-04：右键“清除内容”、功能区“清除内容”和 Delete 键必须是同一条命令。
+#[test]
+fn clear_entries_leave_identical_state() {
+    let build = |ctx: &egui::Context| {
+        let mut app = SheetApp::new_with_context(ctx, None);
+        let num = |v: f64| Cell { value: Value::Number(v), formula: None };
+        let f = |t: &str| Cell { value: Value::Empty, formula: Some(t.into()) };
+        {
+            let sh = app.wb.sheet_mut(0);
+            sh.set(0, 0, num(3.0));
+            sh.set(0, 1, f("=A1*10"));
+            sh.set_style(0, 0, 0);
+        }
+        sheetcore::formula::recalc_all(&mut app.wb);
+        app.sel = (0, 0);
+        app.sel_end = (0, 0);
+        app
+    };
+    let ctx = egui::Context::default();
+    let mut a = build(&ctx);
+    ui_frame(&mut a, &ctx, vec![key_event(egui::Key::Delete, false)]);
+    let mut b = build(&ctx);
+    b.ctx_menu_run(CtxAct::ClearContents, 0, &ctx);
+    let mut c = build(&ctx);
+    c.ribbon_action("ClearValues", &ctx);
+    let snap = |app: &SheetApp| {
+        (
+            app.wb.sheet(0).value(0, 0),
+            app.wb.sheet(0).value(0, 1),
+            app.wb.sheet(0).style_of(0, 0),
+            app.undo.depth(),
+            app.wb.dirty,
+        )
+    };
+    assert_eq!(snap(&a), snap(&b), "Delete 与右键清除内容结果一致");
+    assert_eq!(snap(&a), snap(&c), "Delete 与功能区清除内容结果一致");
+}

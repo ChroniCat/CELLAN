@@ -1,0 +1,63 @@
+# UI-04 清除操作：重算、撤销、广播与入口一致性
+
+日期：2026-11-13 00:2x CST（会话跨零点）
+审计基线 df48672 指出的问题：Delete 循环只对活动格更新依赖；`clear_values` 不重算/不广播；
+`clear_selection` 不统一 dirty/doc_gen；txn_end 不提供隐式行为。
+
+## 现状（当前 HEAD）
+
+所有入口已收敛到一个命令 `clear_rects(ClearPart)`（main.rs:8267）：
+
+```text
+sel_rects() 收集所有非连续矩形 → rect_keys 展开 → sort+dedup 去重
+→ write_preflight(&keys, 动作名)        // 保护 / 只读 / 协作租约一次判完，失败整批不执行
+→ txn_begin(&keys) … 改值/清格式 … txn_end(动作名, txn)
+→ dirty + doc_gen
+→ 清除格式/全部：broadcast_style(默认样式)
+→ 清除内容/全部：recalc_and_broadcast(sheet, r, c 列表)
+```
+
+入口映射：
+- Delete / Backspace（handle_keys）→ `clear_values()` → `clear_rects(Contents)`
+- 右键“清除内容”（CtxAct::ClearContents）→ 同上
+- 功能区“清除内容” ClearValues / “全部清除” ClearContent → `clear_values()` / `clear_all()`
+- `clear_selection` 保留为薄封装，行为与上面同一个函数
+
+## 回归
+
+```text
+cargo test -p app --offline -j 2 --bin app clear -- --test-threads=2
+-> 21 passed / 0 failed
+```
+
+覆盖：
+- `delete_key_clears_rect_and_recalcs_dependents`（新增）：真实按键事件走 handle_keys，
+  A1=1/A2=2/B1=A1*10/B2=A2*10 → Delete 后 B1/B2 立即 0、选区不动、dirty、一步撤销、
+  Ctrl+Z 恢复依赖结果 20。
+- `clear_entries_leave_identical_state`（新增）：Delete / 右键 / 功能区三条入口后
+  (值, 依赖值, 样式, undo 深度, dirty) 完全一致。
+- `clear_contents_recalcs_dependents_and_one_undo_restores_all`
+- `clear_multi_select_does_not_touch_the_gap`：多选 A1 与 A3 不清 A2
+- `clear_formats_and_clear_all_are_distinct_and_undoable`
+- `clear_all_broadcasts_style_and_content_to_a_second_client_and_undo_restores_both`
+- `protected_sheet_blocks_clear_buttons_multi_select_format_and_quick_sort`
+- `one_locked_cell_blocks_the_whole_clear`、`one_locked_cell_blocks_multi_select_clear_format_and_sort`
+- `manual_mode_delete_keeps_cached_dependents_until_f9`（手动计算模式一致）
+
+## 真实窗口
+
+夹具 `ui04.xlsx`：A1=1、A2=2、B1=`=A1*10`、B2=`=A2*10`、D1 有加粗红字格式。
+
+```text
+SC_SEL=0,0 SC_SEL2=1,0 SC_KEYSEQ="60:delete"        SC_SHOT_FRAMES=100
+SC_SEL=0,0 SC_SEL2=1,0 SC_KEYSEQ="60:delete,150:ctrl+z" SC_SHOT_FRAMES=190
+```
+
+- `ui04-clear-recalc.png`：选区 A1:A2，A1/A2 空，B1/B2 显示 0，状态栏“已清除内容”，标题带未保存星号。
+- `ui04-clear-undo.png` + `SC_DUMP`：Ctrl+Z 后 A1=1、A2=2、B1=10、B2=20，
+  D1 仍是红色加粗（清除内容不动格式）。
+
+## 边界
+
+Delete 按键同样是 `SC_KEYSEQ` 注入真实应用帧循环，不是人工键盘（本机 RDP 断开会话
+无法投递系统级按键）。协作第二客户端由上面那条单元测试覆盖（真实 net 通道）。

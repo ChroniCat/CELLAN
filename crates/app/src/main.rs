@@ -26356,6 +26356,9 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "f2" => key = Some(egui::Key::F2),
             "left" => key = Some(egui::Key::ArrowLeft),
             "right" => key = Some(egui::Key::ArrowRight),
+            "delete" => key = Some(egui::Key::Delete),
+            "backspace" => key = Some(egui::Key::Backspace),
+            "z" => key = Some(egui::Key::Z),
             other => eprintln!("[keyseq] 未知按键 {other}"),
         }
     }
