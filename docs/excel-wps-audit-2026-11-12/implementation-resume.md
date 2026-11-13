@@ -1,28 +1,32 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `1e15885`（UI-21 实现 `11ee281` + 台账 `1e15885` 已推送）。
-- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 9 待验收 / 43 待实施；
-  切片 26 已验收 / 18 待验收 / 104 待实施。
-- 当前候选测试真值（08:00–08:06）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
-  app 200 passed / 0 failed / APP_ALL_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / APP_ALL_EXIT=0（08:03/08:04/08:06 三轮；修复对话框测试扫描竞态）。
-- 专项：`c14_guard` 16 passed；`search_matches` 7 passed；UI-21 新增 spill/pending/prefix/xls 用例。
-- 旧 core 605/app 196 快照（07:24-25）早于 formula/patch/xls 修改，不再作为当前证据。
+- 分支 `main`（`origin/main`），HEAD `564b979`（BIFF CALCMODE 工作表流修正）；UI-21 验收证据待随下一提交入库。
+- 台账（`scripts/audit_progress.py counts`）：10 已验收 / 8 待验收 / 43 待实施；
+  切片 27 已验收 / 17 待验收 / 104 待实施。
+- 当前测试真值（08:41–08:45，work/hermes-ui21-final-20261113-084145）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
+  app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / GUI_EXIT=0。
+- Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
+- 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
 
-## 本轮：UI-21 手动计算与工作表计算（待验收）
+## 本轮：UI-21 手动计算与工作表计算（已验收）
 
-- 三个 07:24 复核风险已补代码/用例：
-  1) recalc_sheet 先清目标表旧 spill/静态数组覆盖区，再多遍计算目标表依赖；缩小的旧尾格清空，
-     扩回不被旧尾格挡；另一表 RAND 缓存保持 999；
-  2) calc_pending_sheets 逐表记录，recalc_async(Some)/recalc_sheet 不再无条件清全簿；
-     两表都有未算编辑时计算第一表，第二表旧缓存和 pending 保留，F9 后才清；
-  3) set_calc_mode 按 local_name 找 x:workbook/x:calcPr，前缀 XML 往返；新增 zip 级读取。
-- BIFF .xls 不再是“另立切片”豁免：xls_write/xls_read 增加 CALCMODE(0x000D)，
-  手动/自动读回用例通过；xls 动态数组/溢出边界仍明确未验收。
-- 入口一致：Delete、排序、DV 下拉、选择性粘贴均补 app 测试，手动模式下保持缓存并置 pending。
-- 当前候选证据：core 612/0/41 CORE_EXIT0；app 200/0 APP_EXIT0；GUI 12/0/8 GUI_EXIT0；
-  SaveAs 单独复跑 1 passed（真实 #32770 Save As）；GUI 对话框测试扫描已串行化，避免并发覆盖 WANT。
-- 未执行：Excel/WPS 实机 calcPr/CALCMODE 对拍、真实 GUI 点击 F9/计算工作表/徽标、
-  大表循环引用/溢出与 Excel 对拍。UI-21 保持待验收。
+- 三个 07:24 复核风险已补代码/用例：spill、逐表 pending、calcPr 前缀；本轮未回退。
+- BIFF CALCMODE 修正（564b979）：旧实现写 Workbook 全局流，内部往返能读但 Excel 16.0/WPS 12.0
+  都按自动模式打开；现由每个 sheet_stream 写在工作表 BOF 之后。xls_read 扫描记录流，
+  测试增加“CALCMODE 位于第一张工作表 BOF 之后”断言；该断言不声称逐表紧邻。
+- 自动测试（当前源码）：core 612/0/41 CORE_EXIT0；app 200/0 APP_EXIT0；GUI 12/0/8 GUI_EXIT0。
+- 实际 GUI：真实 app 窗口打开 manual 夹具，A1 5→7 后 B1 保持 10 且待计算；
+  VK_F9 后 B1=14、B2=8，状态仍手动且无待计算。截图与说明在
+  implementation-evidence/ui21-gui/ 与 ui21-manual-calc.txt；键盘为 Win32 消息投递，
+  因本会话无前台桌面，不是物理键盘。
+- Excel/WPS 值/模式闭环（模式识别已实测）：ui21_stale_manual.xlsx（A1=7、B1 故意旧缓存 10）
+  在 Excel 16.0 / WPS 12.0 新实例打开均为手动且 B1=10；CalculateFull 后 B1=14；
+  另存 .xls/.xlsx 再打开仍手动且 B1=14。app_saved_manual.xlsx / app_saved_manual2.xls
+  （真实保存代码，非 SaveAs 对话框）也均为手动、B1=10。
+- 证据：implementation-evidence/ui21-manual-calc.txt、ui21-gui/{excel-cycle.txt,wps-cycle.txt,
+  gui-initial-cached-10.png,gui-after-edit-pending.png,gui-after-f9.png}。
+- 未执行边界：“计算工作表”GUI 点选未单独取证（命令级 app 测试覆盖）；大表数组/循环引用
+  对拍未执行；.xls 动态数组不在当前 BIFF 模型。UI-21 父项与 UI-21.1 均已验收。
 
 ## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
 

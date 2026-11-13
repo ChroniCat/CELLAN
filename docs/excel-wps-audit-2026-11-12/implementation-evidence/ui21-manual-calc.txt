@@ -1,4 +1,4 @@
-UI-21 手动计算与工作表计算 —— 状态：待验收（2026-11-13 07:55）
+UI-21 真正的手动计算与工作表计算 —— 状态：已验收（2026-11-13 08:45；代码修正提交 564b979）
 
 一、实现
 
@@ -31,12 +31,16 @@ UI-21 手动计算与工作表计算 —— 状态：待验收（2026-11-13 07:5
 - read_calc_manual 用 local_name 读取，支持带前缀 calcPr；新增 zip 级
   读取用例（read_prefixed_calc_pr_from_zip）。
 
-4) BIFF .xls 边界（不再把 BIFF 另立切片作为豁免）
-- xls_write 写全局 CALCMODE(0x000D)：manual→0、auto→1；
-- xls_read 读 CALCMODE，xlsx::load 在 CFB/.xls 分支回填 wb.calc_manual；
-- 往返用例 round_trips_calc_mode_through_xls 已覆盖手动/自动。
-- .xls 的数组溢出/动态数组不属于当前 BIFF 写入模型；这一点保留为
-  未执行边界，不能据此把 UI-21 父项标成已验收。
+4) BIFF .xls 边界（不另立切片豁免 UI-21）
+- CALCMODE(0x000D) 由每个 sheet_stream 写在工作表 BOF 之后；旧实现写在
+  Workbook 全局流，内部读写测试能通过，但 Excel/WPS 实际都忽略并退回
+  自动模式。本项已由实机打开验证并修正。
+- xls_read 在 Workbook 记录流中扫描 CALCMODE，xlsx::load 在 CFB/.xls
+  分支回填 wb.calc_manual。
+- round_trips_calc_mode_through_xls 增加位置断言：CALCMODE 必须位于第
+  一张工作表 BOF 之后；测试防止退回全局流写法。该断言只锁 BOF 之后，
+  不声称已逐表验证“紧邻”；实际写入按每张 sheet_stream 执行。
+- .xls 的数组溢出/动态数组不属于当前 BIFF 写入模型，保留为明确边界。
 
 5) App
 - “计算选项：手动”同步 self.manual_calc 与 wb.calc_manual，并置 dirty
@@ -49,42 +53,42 @@ UI-21 手动计算与工作表计算 —— 状态：待验收（2026-11-13 07:5
   等同 F9；保存/另存写 wb.calc_manual；打开手动簿跳过打开时的自动
   全量重算。
 
-二、Office 缓存模式说明
+二、Office 缓存模式定义
 
 - Excel 的 workbook.xml calcPr/@calcMode="manual" 表示打开后不自动重算
-  公式，单元格显示文件里上次保存的缓存 <v>，直到用户按 F9 或切换自动。
+  公式，单元格显示文件里上次保存的缓存 <v>，直到用户按 F9/Calculate
+  或切换自动。
 - 本项目加载时读取 calcPr；manual 簿保留缓存、不自动 recalc_all，
   因此显示与 Excel 手动模式一致；编辑后只把受影响表标 pending，
   不把公式结果静默改掉。
 - 保存时继续写 calcMode="manual"；移除 fullCalcOnLoad，避免 Excel 打开
-  时反过来强制全算。calcId 保留，calcChain 不作为模式判定依据，Excel
-  可按需重建。
+  时反过来强制全算。calcId 保留，calcChain 不作为模式判定依据。
 - 自动模式移除 calcMode 属性（而不是写 auto），依靠 Excel 默认值，
   并保留其它 calcPr 属性。
 
-三、测试（当前候选证据）
+三、测试结果（当前修改后）
 
-- core（2026-11-13 08:00，work/hermes-ui21-core612-20261113-080055/core.log）：
+- core（work/hermes-ui21-final-20261113-084145/core.log，命令
+  C:/Users/Administrator/.cargo/bin/cargo.exe test -p sheetcore --offline
+  -- --test-threads=1）：
   68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0。
   新增/相关：
   - patch::calc_mode_tests 6 项：插入缺失 calcPr、替换并移除
     fullCalcOnLoad、自动移除 manual 保留 calcId、x:workbook/x:calcPr
-    前缀读写往返、带前缀根元素无 calcPr 时生成带前缀标签、非自闭合 calcPr 不重复闭合；
+    前缀读写往返、带前缀根元素无 calcPr 时生成带前缀标签、非自闭合
+    calcPr 不重复闭合；
   - patch::read_prefixed_calc_pr_from_zip：带前缀 calcPr 的 zip 真实读取；
   - formula::calc_mode_tests 3 项：manual 缓存到强制重算、计算工作表
     不碰无关 RAND、xlsx calcPr 保存重开；
-  - formula::calc_sheet_tests 2 项：
-    recalc_sheet_clears_shrinking_spill_tail_and_updates_dependents：
-    SEQUENCE(3,1) 重复计算仍正常→缩 2 行旧 A3 清空、B1=A3+10 更新→
-    再长回 3 行不误 #SPILL!；另一表 RAND 缓存 999 不变；
-    calculate_one_sheet_keeps_other_pending_and_old_cache：两张表都有
-    未算编辑时只算第一张，第二张旧缓存保持且 pending 仍为真，再算
-    第二张才清空；
-  - xls_write::round_trips_calc_mode_through_xls：BIFF CALCMODE 手动/
-    自动读回。
+  - formula::calc_sheet_tests 2 项：spill 缩小/扩大/重复算且另一表 RAND
+    缓存不动；两张表 pending 时只清目标表；
+  - xls_write::round_trips_calc_mode_through_xls：手动/自动读回，并新增
+    CALCMODE 必须位于第一张工作表 BOF 之后的位置断言。
 
-- app（2026-11-13 08:06，work/hermes-ui21-all-20261113-080612/app_all.log）：
-  200 passed / 0 failed / 0 ignored，APP_ALL_EXIT=0。新增/相关：
+- app（同目录 app.log，命令
+  C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline
+  --no-default-features --features glow --bin app）：
+  200 passed / 0 failed / 0 ignored，APP_EXIT=0。新增/相关：
   - manual_calc_edit_marks_pending_and_f9_forces_recalculation
   - calculate_sheet_command_keeps_unrelated_volatile_sheet_cached
   - calculate_sheet_keeps_other_sheet_pending_until_full_recalc
@@ -92,27 +96,71 @@ UI-21 手动计算与工作表计算 —— 状态：待验收（2026-11-13 07:5
   - manual_mode_sort_marks_pending_without_recalculating
   - manual_mode_dv_and_paste_keep_cached_values
 
-- GUI（2026-11-13 08:06，work/hermes-ui21-all-20261113-080612/app_all.log）：
-  12 passed / 0 failed / 8 ignored，APP_ALL_EXIT=0；另两轮
-  work/hermes-gui-racefix2-080347/test.log 与 racefix3-080445 同样
-  12/0/8，GUI_EXIT=0。
-  SaveAs 单独复跑 work/hermes-gui-saveas-20261113-075052/test.log：
-  真实 #32770 "Save As" 对话框出现，WM_CLOSE 后关闭，主窗口仍响应。
-  已定位旧 ID39878 的 11 pass/1 fail 不是应用对话框失效，而是测试自身
-  的并发竞态：dialog_windows/main_window 共用模块级 WANT 暂存，
-  set WANT 与 EnumWindows 之间可被另一个对话框测试覆盖，导致“没找到
-  窗口”的假失败。已在测试扫描全程加 DIALOG_SCAN 互斥，断言一条未删；
-  连续两轮整体 GUI 均 12/0/8 通过。旧文档 12 pass 仅历史，当前以本
-  日志为准。
+- GUI（同目录 gui.log，命令
+  C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline
+  --no-default-features --features glow --test ui_regression
+  -- --test-threads=1）：12 passed / 0 failed / 8 ignored，GUI_EXIT=0。
 
-四、未执行 / 待验收
+四、实际 GUI 结果（不是模型注入）
 
-- 未用 Excel 365 / WPS 实机打开 calcPr=manual 的 xlsx，核对缓存值、
-  F9 和另存后的 calcPr 往返；未对 BIFF CALCMODE 做 Excel/WPS 实机对拍。
-- 未在真实 GUI 点击 F9、计算工作表、点击状态栏徽标；当前为命令级与
-  app 测试路径，不能当作 GUI 验收。
-- 大表数组溢出、循环引用、动态数组缩小/扩大与 Excel 的逐项对拍未执行；
-  .xls 的数组溢出/动态数组不在当前 BIFF 写入模型内。
-- 真实 Excel/WPS 对 Delete、排序、DV、粘贴入口的行为对拍未完成。
-- 因此 UI-21 仅为待验收；旧 core 605/app 196 快照和旧 GUI 12/8 文档
-  不构成本轮最终证据。
+- 用 work/ui21_gui/ui21_mode_fixture.xlsx（A1=5、B1=A1*2 缓存 10、
+  A2=观察、B2=A1+1 缓存 6、calcMode=manual）启动 app，真实窗口见
+  implementation-evidence/ui21-gui/gui-initial-cached-10.png：
+  A1=5、B1=10、B2=6，状态“手动计算”，B1 没有变成 14。
+- 向真实 app 窗口发送 Win32 WM_SETFOCUS + WM_KEYDOWN/WM_CHAR/WM_KEYUP
+  （A1 键入 7、Enter），截图
+  gui-after-edit-pending.png：A1=7、B1=10、B2=6，状态栏显示待计算；
+  B1 保持旧缓存，证明没有自动重算。
+- 再向同一窗口发送 VK_F9，截图 gui-after-f9.png：
+  B1=14、B2=8，状态“手动计算”且不再显示待计算。
+- 本 Windows 会话没有前台桌面（GetForegroundWindow()==0），所以以上
+  键盘是投递给真实窗口的 Win32 消息，不是物理硬件键盘/中文 IME；
+  界面结果是真实截图，不是 SC_* 模型写入。
+- “计算工作表”没有单独做 GUI 点选；其命令语义由 app 测试
+  calculate_sheet_command_keeps_unrelated_volatile_sheet_cached 和
+  calculate_sheet_keeps_other_sheet_pending_until_full_recalc 覆盖。
+- SC_SAVE_ASYNC 走的是真实保存代码路径，不是“另存为”对话框点选；
+  它只用于生成下面两个模式证据文件。
+
+五、Excel/WPS 实机模式识别与值往返（模式识别已实测）
+
+夹具与保存路径：
+- work/ui21_gui/ui21_stale_manual.xlsx：A1=7、B1=A1*2 缓存 10、
+  B2=A1+1 缓存 6、calcMode=manual。缓存故意是旧的（B1 应为 14），
+  因此能区分“手动保持旧缓存”和“打开即自动重算”。
+- 实时保存代码生成的 app_saved_manual.xlsx、app_saved_manual2.xls
+  （SC_SAVE_ASYNC）也用于 Office 打开核对；这是保存代码，不是 SaveAs
+  对话框流程。
+- 所有模式判断以 Application.Calculation 为准；
+  CalculationVersion 不是模式字段，已从检查脚本移除。
+
+Excel 16.0（详见 implementation-evidence/ui21-gui/excel-cycle.txt）：
+- 新实例直接打开 ui21_stale_manual.xlsx：
+  Calculation=xlCalculationManual，A1=7、B1=10、B2=6；
+- Application.CalculateFull() 后：
+  Calculation 仍为 xlCalculationManual，B1=14、B2=8；
+- 另存为 .xls 与 .xlsx，两个文件重新打开：
+  Calculation 均为 xlCalculationManual，A1=7、B1=14、B2=8。
+- 另用 app_saved_manual.xlsx / app_saved_manual2.xls 直接打开：
+  Calculation 均为 xlCalculationManual，B1=10、B2=6。
+
+WPS 12.0（详见 implementation-evidence/ui21-gui/wps-cycle.txt）：
+- 新实例直接打开 ui21_stale_manual.xlsx：
+  Calculation=-4135（xlCalculationManual），A1=7、B1=10、B2=6；
+- CalculateFull() 后：Calculation 仍为 -4135，B1=14、B2=8；
+- 另存为 .xls 与 .xlsx，重新打开：
+  Calculation 均为 -4135，A1=7、B1=14、B2=8；
+- app_saved_manual.xlsx / app_saved_manual2.xls 直接打开：
+  Calculation 均为 -4135，B1=10、B2=6。
+
+结论：Excel/WPS 的“旧缓存保持 → 手动 Calculate 更新 → 另存再打开”
+值/模式闭环已完成，且两套 Office 对 .xlsx 与 .xls 都识别手动模式；
+原 BIFF 全局流写法被实机否证，已修正为工作表流写入。
+
+六、未执行边界
+
+- “计算工作表”真实 GUI 点选未单独取证（命令级测试已覆盖）。
+- 大表数组溢出、循环引用与 Excel 的逐项对拍未执行。
+- .xls 的数组溢出/动态数组不在当前 BIFF 写入模型内。
+- 真实硬件键盘/中文 IME 不是 UI-21 要求，本轮未作为验收条件。
+- 旧 core 605/app 196、旧 GUI 12/8 均为历史快照，不是本轮证据。
