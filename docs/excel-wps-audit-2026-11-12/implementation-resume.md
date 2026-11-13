@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `a0f8284`（C10.1 裸当前行；C11.2/C11.1 在前）。
+- 分支 `main`（`origin/main`），HEAD `4f49dda`（C10.1 裸当前行记录；C11.2/C11.1 在前）。
 - 台账（`scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
   切片 30 已验收 / 19 待验收 / 99 待实施。
 - 当前测试真值（C11.1 修改后重跑）：core 71 bins / 636 passed / 0 failed / 41 ignored，
