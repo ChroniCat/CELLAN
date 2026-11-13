@@ -18902,6 +18902,9 @@ let txn = self.txn_begin(&keys);
                             cell_name(ch.anchor.0, ch.anchor.1),
                             cell_name(ch.anchor.2, ch.anchor.3)
                         ));
+                        if matches!(ch.kind, sheetcore::charts::ChartKind::Unknown) {
+                            ui.label("只保留原图，不能改类型");
+                        } else {
                         egui::ComboBox::from_id_salt(format!("ret{i}"))
                             .selected_text(ch.kind.label())
                             .width(96.0)
@@ -18922,6 +18925,7 @@ let txn = self.txn_begin(&keys);
                                     }
                                 }
                             });
+                        }
                         if ui.button("删除").clicked() {
                             del = Some(i);
                         }

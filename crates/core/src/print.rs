@@ -434,6 +434,16 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
     out.lines.push((x, y, x, y + h, 0.6, [180, 180, 180]));
     out.lines.push((x + w, y, x + w, y + h, 0.6, [180, 180, 180]));
 
+    if matches!(ch.kind, ChartKind::Unknown) {
+        let label = if ch.title.is_empty() {
+            "高级图表（保留原图，不能在此编辑）".to_string()
+        } else {
+            format!("{}（保留原图，不能在此编辑）", ch.title)
+        };
+        let tw = display::text_width(&label, 9.0);
+        chart_text(out, x + (w - tw) / 2.0, y + h / 2.0, 9.0, &label, [120, 90, 40]);
+        return;
+    }
     let mut top = y + h - 6.0;
     if !ch.title.is_empty() {
         let tw = display::text_width(&ch.title, 10.0);
@@ -506,6 +516,30 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
             }
             out.polys.push((pts, CHART_COLORS[i % CHART_COLORS.len()]));
             start_a -= sweep;
+        }
+    } else if matches!(ch.kind, ChartKind::Radar) {
+        let groups = n.max(2);
+        let cx = px0 + pw / 2.0;
+        let cy = py0 + ph / 2.0;
+        let rad = (pw.min(ph) / 2.0 - 6.0).max(6.0);
+        for (si, se) in ch.series.iter().enumerate() {
+            let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
+            let pts: Vec<(f32, f32)> = se
+                .vals
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let ang = std::f32::consts::FRAC_PI_2 - i as f32 * std::f32::consts::TAU / groups as f32;
+                    let r = rad * (*v / max_main) as f32;
+                    (cx + r * ang.cos(), cy + r * ang.sin())
+                })
+                .collect();
+            for k in 0..pts.len() {
+                let a = pts[k];
+                let b = pts[(k + 1) % pts.len()];
+                out.lines.push((a.0, a.1, b.0, b.1, 1.2, color));
+                out.rects.push((a.0 - 1.5, a.1 - 1.5, 3.0, 3.0, color));
+            }
         }
     } else {
         // 每个系列按自己的图型画；柱/条系列按柱系列序号并排

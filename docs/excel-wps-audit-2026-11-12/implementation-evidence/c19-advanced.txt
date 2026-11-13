@@ -1,0 +1,66 @@
+# C19.3 按场景补高级图种（雷达；chartex 原图保留与占位）
+
+日期：2026-11-14
+夹具：`crates/core/tests/fixtures/c19/advanced.xlsx`（Excel 16.0，`scripts/c19_advanced_fixture.ps1`）
+
+```text
+雷达!A1:B6  能力/得分 8/6/9/7/5         → xl/charts/chart1.xml（radarChart）
+瀑布!A1:B5  收入/成本/税费/净利 100/-40/-10/50 → xl/charts/chartEx1.xml（waterfall）
+直方!A1:A13 12 个分数                    → xl/charts/chartEx2.xml（histogram）
+```
+
+## 1. 雷达图（经典 c: 命名空间）
+
+- `ChartKind::Radar`；`radarChart` 容器解析系列；
+- 绘制为闭合折线 + 顶点标记（屏幕/预览/PDF 共用 `draw_chart`）；
+- `chart_write` 写 `<c:radarChart>`，可改类型后保存。
+
+```text
+radar_chart_is_parsed_and_drawn ... ok
+kind=Radar cats=速度/力量/技巧/耐力/意识 vals=8/6/9/7/5，折线段 ≥5
+```
+
+## 2. chartex（Excel 2016+ 高级图种）保留与占位
+
+之前 loader 只认 rel 类型 `.../chart`，chartex 的 `.../chartEx`（大写 E）被当成缺失关系，
+整簿图表加载直接报错；随后保存走“重建”路径，**把 xl/drawings 与 xl/charts 全丢了**。
+
+修复：
+- 关系类型大小写不敏感识别 `/chart` 与 `/chartex`；
+- chartex 部件不尝试 2D 解析，生成 `ChartKind::Unknown`，带 part/drawing/锚点与标题；
+- 绘制时画白底+边框+「高级图表（保留原图，不能在此编辑）」占位；
+- `replace_chart` 对 Unknown 直接报错，不允许用 2D XML 覆盖；
+- 管理器里 Unknown 只显示“只保留原图，不能改类型”（仍可删除）。
+
+```text
+chartex_types_become_visible_placeholders ... ok   part=chartEx1.xml，占位文字可见
+unsupported_chart_cannot_be_overwritten_by_2d ... ok
+```
+
+## 3. 保存保真
+
+改普通格（A1 加粗）后另存，chartEx 两部件逐字节一致：
+
+```text
+chartex_parts_survive_a_normal_save ... ok
+```
+
+Excel 16.0 / WPS 打开我方保存的文件：
+
+```text
+EXCEL 雷达 charts=1 type=81    瀑布 charts=1 type=119    直方 charts=1 type=118
+WPS   雷达 charts=1            瀑布 charts=1            直方 charts=1
+```
+
+即三张图都在、类型未降级（81 雷达 / 119 瀑布 / 118 直方），也没有“修复”提示。
+
+## 4. 未做（不写成已验收）
+
+- chartex 图种（瀑布/直方/树图/旭日/箱线/漏斗/帕累托）只保留原图 + 占位，
+  不能编辑数据、系列或格式；这是按合同“未知类型保留、不得 2D 覆盖”的边界处理。
+- 雷达图不支持填充区域、雷达轴刻度标签与多轴样式，仅折线+标记。
+- 真实键鼠在界面里点开图表管理器核对占位/改雷达类型未执行（RDP 不可用）。
+
+## 5. 回归
+
+sheetcore **796 passed**、app `--bin app` **264 passed**。

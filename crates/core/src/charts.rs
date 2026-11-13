@@ -22,6 +22,10 @@ pub enum ChartKind {
     Scatter,
     /// 组合图：前面的系列柱状（主轴），最后一个系列折线（次轴）
     Combo,
+    /// 雷达图
+    Radar,
+    /// 本应用不建模的图种（瀑布/直方/树图/箱线等）：只保留原部件并显示占位
+    Unknown,
 }
 
 impl ChartKind {
@@ -36,6 +40,8 @@ impl ChartKind {
             ChartKind::Doughnut => "圆环图",
             ChartKind::Scatter => "散点图",
             ChartKind::Combo => "组合图",
+            ChartKind::Radar => "雷达图",
+            ChartKind::Unknown => "高级/未知图表",
         }
     }
 }
@@ -137,7 +143,7 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
             d_rels_ok = f.read_to_string(&mut d_rels_xml).is_ok();
         }
     }
-    let mut chart_targets: HashMap<String, String> = HashMap::new();
+    let mut chart_targets: HashMap<String, (String, bool)> = HashMap::new();
     {
         let mut r = Reader::from_str(&d_rels_xml);
         loop {
@@ -157,12 +163,14 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
                             ty = v;
                         }
                     }
-                    if ty.ends_with("/chart") && !id.is_empty() {
+                    let tl = ty.to_ascii_lowercase();
+                    if (tl.ends_with("/chart") || tl.ends_with("/chartex")) && !id.is_empty() {
                         let ddir = match drawing_path.rsplit_once('/') {
                             Some((d, _)) => format!("{d}/"),
                             None => "xl/drawings/".into(),
                         };
-                        chart_targets.insert(id, normalize(&ddir, &target));
+                        let is_ex = tl.ends_with("/chartex");
+                        chart_targets.insert(id, (normalize(&ddir, &target), is_ex));
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -183,8 +191,9 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
     }
     let mut out = Vec::new();
     for (anchor, rid) in anchors {
-        let cp = chart_targets
+        let (cp, is_ex) = chart_targets
             .get(&rid)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("drawing 里的图表引用 {rid} 在关系部件中不存在"))?;
         {
             use std::io::Read;
@@ -192,7 +201,7 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
             {
                 use std::io::Read;
                 let mut f = zip
-                    .by_name(cp)
+                    .by_name(&cp)
                     .map_err(|e| anyhow::anyhow!("drawing 关系指向的图表部件 {cp} 不存在：{e}"))?;
                 f.read_to_string(&mut cx)
                     .map_err(|e| anyhow::anyhow!("图表部件 {cp} 读取失败：{e}"))?;
@@ -216,8 +225,28 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
                     _ => {}
                 }
             }
-            let mut ch = parse_chart(&cx)
-                .ok_or_else(|| anyhow::anyhow!("图表部件 {cp} 解析失败（不是可识别的 chart XML）"))?;
+            let mut ch = if is_ex {
+                None
+            } else {
+                parse_chart(&cx)
+            }
+            .unwrap_or_else(|| Chart {
+                kind: ChartKind::Unknown,
+                title: if is_ex { chartex_title(&cx) } else { String::new() },
+                series: Vec::new(),
+                legend: false,
+                anchor,
+                legend_pos: String::new(),
+                part: String::new(),
+                drawing: String::new(),
+                show_labels: false,
+                ref_fixes: Vec::new(),
+                axis_x: String::new(),
+                axis_y: String::new(),
+                y_fmt: String::new(),
+                y_min: None,
+                y_max: None,
+            });
             ch.anchor = anchor;
             ch.part = cp.clone();
             ch.drawing = drawing_path.clone();
@@ -554,6 +583,11 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                         plot = Some((ChartKind::Doughnut, Vec::new(), series.len()));
                         plot_dir.clear();
                     }
+                    "radarChart" => {
+                        kind.get_or_insert(ChartKind::Radar);
+                        plot = Some((ChartKind::Radar, Vec::new(), series.len()));
+                        plot_dir.clear();
+                    }
                     "scatterChart" => {
                         kind.get_or_insert(ChartKind::Scatter);
                         plot = Some((ChartKind::Scatter, Vec::new(), series.len()));
@@ -676,7 +710,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                         }
                     }
                     "barChart" | "bar3DChart" | "lineChart" | "line3DChart" | "areaChart"
-                    | "pieChart" | "pie3DChart" | "doughnutChart" | "scatterChart" => {
+                    | "pieChart" | "pie3DChart" | "doughnutChart" | "scatterChart" | "radarChart" => {
                         if let Some((mut k, ids, start)) = plot.take() {
                             if matches!(k, ChartKind::Column) && plot_dir == "bar" {
                                 k = ChartKind::Bar;
@@ -985,4 +1019,38 @@ mod anchor_tests {
         assert_eq!(a[0].0 .0, 1, "起始行");
         assert_eq!(a[0].0 .1, 4, "起始列");
     }
+}
+
+/// chartex（Excel 2016+ 高级图表）里取标题文本，只为占位显示
+fn chartex_title(xml: &str) -> String {
+    let mut r = Reader::from_str(xml);
+    let mut in_title = false;
+    let mut buf = String::new();
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => {
+                if local(e.name().as_ref()) == "title" {
+                    in_title = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local(e.name().as_ref()) == "title" {
+                    let t = buf.trim();
+                    if !t.is_empty() {
+                        return t.to_string();
+                    }
+                    in_title = false;
+                    buf.clear();
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_title {
+                    buf.push_str(&crate::model::xml_unescape(t.as_ref()));
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    String::new()
 }

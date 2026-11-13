@@ -5917,17 +5917,19 @@
       "scope": "core/charts.rs + app/chart_view.rs",
       "source": "core-requirements.md",
       "heading": "C19 P2 图表种类与编辑模型",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "三个切片均待复核；chartex 高级图种只保留原图+占位，雷达无填充/轴刻度，真实键鼠未执行"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T19:44:26Z",
+      "updated_utc": "2026-11-13T19:53:35Z",
       "slices": [
         {
           "id": "C19.1",
@@ -5993,17 +5995,28 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C19 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/charts.rs",
+            "crates/core/src/print.rs",
+            "crates/core/src/chart_write.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c19_advanced.rs",
+            "fixtures/c19/advanced.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-advanced.txt"
+          ],
+          "not_done": [
+            "雷达解析/绘制/写出；chartex 关系识别、Unknown 占位、禁止 2D 覆盖、保存逐字节保真；Excel/WPS 类型 81/119/118 未降级；chartex 不可编辑、雷达无填充"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T19:53:35Z"
         }
       ]
     },

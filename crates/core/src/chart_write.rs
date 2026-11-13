@@ -368,6 +368,14 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
             }
         }
         Combo => {}
+        Radar => {
+            out.push_str("<c:radarChart><c:radarStyle val=\"marker\"/><c:varyColors val=\"0\"/>");
+            out.push_str(&series_body(ch));
+            out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:radarChart>");
+            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
+            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
+        }
+        Unknown => {}
         Scatter => {
             out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
             out.push_str(&scatter_body(ch));
@@ -615,6 +623,10 @@ pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -
 
 /// 换掉已有图表的内容（改类型/改标题），保留锚点与部件路径
 pub fn replace_chart(path: &Path, chart_part: &str, ch: &crate::charts::Chart) -> Result<()> {
+    // 不建模的图种只能原样保留：用 2D 结果覆盖会把原图降级
+    if matches!(ch.kind, crate::charts::ChartKind::Unknown) {
+        anyhow::bail!("该图表类型不受支持，只能保留原图");
+    }
     let body = chart_xml(ch);
     crate::patch::append_entry(path, chart_part, body.as_bytes())?;
     Ok(())
