@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `46c32ac`（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收。
+- 分支 `main`（`origin/main`），HEAD `56f5a80`（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
   切片 35 已验收 / 21 待验收 / 92 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
