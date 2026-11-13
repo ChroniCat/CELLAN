@@ -5179,17 +5179,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/system_fonts.rs",
+            "crates/app/src/main.rs",
+            "crates/core/src/style_theme.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-system-fonts.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/system-fonts.png"
+          ],
+          "not_done": [
+            "真实字重未加载",
+            "真实字体度量未用于换行/列宽"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T22:47:24Z"
         },
         {
           "id": "UI-14.2",

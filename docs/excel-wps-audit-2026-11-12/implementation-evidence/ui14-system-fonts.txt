@@ -1,0 +1,27 @@
+# UI-14.1 系统字体加载与回退
+
+日期：2026-11-14
+
+- 新增 `crates/app/src/system_fonts.rs`：
+  - 只加载工作簿实际引用的字体名；常见中文字体用确定映射
+    （宋体/新宋体→simsun.ttc、微软雅黑→msyh.ttc、黑体→simhei.ttf、
+    楷体→simkai.ttf、仿宋→simfang.ttf、等线→Deng.ttf），
+    西文常见字体同理（Arial/Calibri/Times/Cambria/Consolas/Segoe UI…）。
+  - TTC 用 `ttf-parser` 按 family 名选 face（宋体 face0、微软雅黑 face0），
+    不靠注册表代码页猜名字。
+  - 工作簿每 30 帧检查一次字体；新增字体才 `set_fonts`，且延后一帧生效，
+    避免同帧字体族尚未绑定导致 epaint panic。
+  - 找不到的字体回落四族（cjk-sans/cjk-serif/latin/mono），不 panic。
+- 夹具 `crates/core/tests/fixtures/ui14/fonts.xlsx`：A1 宋体、A2 微软雅黑、
+  A3 Arial、A4「绝对不存在的字体 XYZ」。
+- GUI 实测：日志 `[fonts] cell "宋体" sys=true`、`"微软雅黑" sys=true`、
+  `"Arial" sys=true`；未知字体始终 `sys=false`（回退）；
+  `[fonts] loaded` 4 个名字、`bound=7`，进程正常退出（RUN=0）。
+  截图 `implementation-evidence/ui14/system-fonts.png`。
+- 顺带修复主题槽位：`<color theme="1"/>` 是 tx1/dk1（黑），之前按 clrScheme
+  原始顺序解析成 lt1（白），Excel 默认字体在本应用里会变白不可见。
+  `scheme_index` 按 clrMap 映射 0↔lt1、1↔dk1、2↔lt2、3↔dk2，4 起不变；
+  新增单测 `theme_slots_follow_clrmap`。
+- 测试：sheetcore 100 个 target 全 ok；app `--bin app` **276 passed**（含 3 条字体单测）。
+- 未做：真实字重（Bold 走合成加粗，未加载 msyhbd/simhei）、
+  字形宽度按真实字体度量（换行/列宽仍用内嵌字体度量）。

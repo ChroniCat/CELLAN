@@ -21,6 +21,7 @@ mod ui_prefs;
 mod command;
 mod palette;
 mod ribbon;
+mod system_fonts;
 mod session_lock;
 mod single_instance;
 
@@ -25691,6 +25692,28 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        system_fonts::begin_frame();
+        // UI-14.1：每 30 帧检查工作簿是否引用了尚未加载的系统字体；
+        // 只有新增字体时才重建 FontDefinitions，避免每帧 set_fonts。
+        if ctx.cumulative_pass_nr() % 30 == 0 {
+            let mut seen = std::collections::HashSet::new();
+            let names: Vec<String> = self
+                .wb
+                .styles
+                .font_names()
+                .filter(|f| seen.insert(system_fonts::norm(f)))
+                .map(|f| f.to_string())
+                .collect();
+            if system_fonts::ensure(&names) {
+                if std::env::var("SC_FONT_LOG").is_ok() {
+                    eprintln!("[fonts] loaded {:?}", names);
+                }
+                ctx.set_fonts(font_defs());
+                if std::env::var("SC_FONT_LOG").is_ok() {
+                    ctx.fonts(|f| eprintln!("[fonts] bound={}", f.families().len()));
+                }
+            }
+        }
         // 验收探针：SC_KEYSEQ="alt+down,down,enter,ctrl+s" 按帧注入按键事件。
         // 本机是断开的 RDP 会话（前台窗口 hwnd 0x0），系统级按键投递不进去；
         // 这个探针让事件走真实窗口循环里的同一个 handle_keys，而不是另写一条路径。
@@ -27619,6 +27642,22 @@ fn family_named(key: &str) -> egui::FontFamily {
 
 /// 单元格字体族：按 style.font 选内嵌 family，未知字体回退默认
 fn cell_family(name: &str) -> egui::FontFamily {
+    // UI-14.1：工作簿用到且本机装了的字体走真实字形，否则按四族回退。
+    if std::env::var("SC_FONT_LOG").is_ok() {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+            std::sync::OnceLock::new();
+        let m = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let now = system_fonts::is_loaded(name);
+        if let Ok(mut m) = m.lock() {
+            if m.get(name) != Some(&now) {
+                m.insert(name.to_string(), now);
+                eprintln!("[fonts] cell {:?} sys={}", name, now);
+            }
+        }
+    }
+    if system_fonts::is_loaded(name) {
+        return family_named(&system_fonts::family_key(name));
+    }
     family_named(sheetcore::style::font_class(name).key())
 }
 
@@ -27638,6 +27677,10 @@ fn cell_text_align(halign: u8, value: &Value) -> egui::Align2 {
 /// 注册四套内嵌字体，并把自定义 family 都绑上——
 /// 少绑一个，遇到该字体的格子 egui 会直接 panic（FontFamily not bound）。
 fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_defs());
+}
+
+fn font_defs() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
@@ -27678,12 +27721,13 @@ fn install_fonts(ctx: &egui::Context) {
         family_named("latin"),
         vec!["inter".to_owned(), "noto-sans".to_owned()],
     );
+    system_fonts::apply(&mut fonts);
     fonts.families.insert(
         family_named("mono"),
         vec!["mono".to_owned(), "noto-sans".to_owned()],
     );
 
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 fn main() -> eframe::Result<()> {

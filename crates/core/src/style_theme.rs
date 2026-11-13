@@ -286,16 +286,29 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
     ]
 }
 
+/// `theme=` 用的是 clrMap 槽位，不是 clrScheme 的 XML 顺序：
+/// 0=bg1→lt1、1=tx1→dk1、2=bg2→lt2、3=tx2→dk2，4 起才是 accent1…
+/// Excel 默认字体 `<color theme="1"/>` 必须是黑色，不能直接拿 dk1/lt1 原始顺序。
+fn scheme_index(i: u8) -> usize {
+    match i {
+        0 => 1,
+        1 => 0,
+        2 => 3,
+        3 => 2,
+        n => n as usize,
+    }
+}
+
 /// 把主题解析结果套到一格样式上（颜色按本模块的 tint 公式重算）
 pub fn apply(cs: &mut CellStyle, xf: Option<&XfTheme>, palette: &[[u8; 3]]) {
     let Some(xf) = xf else { return };
     if let Some(t) = xf.font {
-        if let Some(base) = palette.get(t.idx as usize) {
+        if let Some(base) = palette.get(scheme_index(t.idx)) {
             cs.color = tint_rgb(*base, t.tint);
         }
     }
     if let Some(t) = xf.fill {
-        if let Some(base) = palette.get(t.idx as usize) {
+        if let Some(base) = palette.get(scheme_index(t.idx)) {
             cs.fill = Some(tint_rgb(*base, t.tint));
         }
     }
@@ -336,5 +349,20 @@ mod tests {
         let cells = parse_cell_styles(r#"<sheetData><row r="1"><c r="A1" s="1" t="s"><v>0</v></c><c r="B2"/></row></sheetData>"#);
         assert_eq!(cells.get(&(0, 0)), Some(&1u16));
         assert_eq!(cells.get(&(1, 1)), None);
+    }
+
+    #[test]
+    fn theme_slots_follow_clrmap() {
+        let palette = parse_palette(r#"<a:theme><a:clrScheme><a:dk1><a:sysClr lastClr="000000"/></a:dk1><a:lt1><a:sysClr lastClr="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:accent1><a:srgbClr val="4472C4"/></a:accent1></a:clrScheme></a:theme>"#);
+        let mut cs = CellStyle::default();
+        cs.color = [255, 255, 255];
+        apply(&mut cs, Some(&XfTheme { font: Some(ThemeRef { idx: 1, tint: 0.0 }), fill: None }), &palette);
+        assert_eq!(cs.color, [0, 0, 0], "theme=1 是 tx1/dk1");
+        let mut fill = CellStyle::default();
+        apply(&mut fill, Some(&XfTheme { font: None, fill: Some(ThemeRef { idx: 0, tint: 0.0 }) }), &palette);
+        assert_eq!(fill.fill, Some([255, 255, 255]), "theme=0 是 bg1/lt1");
+        let mut accent = CellStyle::default();
+        apply(&mut accent, Some(&XfTheme { font: Some(ThemeRef { idx: 4, tint: 0.0 }), fill: None }), &palette);
+        assert_eq!(accent.color, [0x44, 0x72, 0xC4]);
     }
 }

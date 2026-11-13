@@ -231,6 +231,16 @@ pub struct StyleTable {
     quotes: Vec<bool>,
 }
 
+impl StyleTable {
+    /// 工作簿里实际出现的字体名（去重前的原始顺序），供 UI 按需加载系统字体。
+    pub fn font_names(&self) -> impl Iterator<Item = &str> {
+        self.styles
+            .iter()
+            .map(|s| s.font.as_str())
+            .filter(|f| !f.trim().is_empty())
+    }
+}
+
 fn hash_of(s: &CellStyle) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

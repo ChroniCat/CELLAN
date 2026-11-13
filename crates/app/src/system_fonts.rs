@@ -1,0 +1,209 @@
+//! UI-14.1 系统字体加载与回退。
+//!
+//! 只按需加载工作簿里真正出现的字体名：优先在 Windows Fonts 目录找到同名/别名文件，
+//! 用 ttf-parser 在 TTC 里按 family 名选对 face；找不到就回落到内嵌的四族。
+//! 不做全目录扫描，避免启动时读几百 MB 字体。
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+use eframe::egui;
+use eframe::egui::FontData;
+
+pub fn family_key(name: &str) -> String {
+    format!("sys:{}", norm(name))
+}
+
+pub fn norm(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Excel 常见字体 → Windows 字体文件。注册表名的代码页不可靠，这里用确定映射；
+/// 其余字体用英文名去 Fonts 目录找同名 .ttf/.ttc。
+fn file_candidates(name: &str) -> Vec<&'static str> {
+    match norm(name).as_str() {
+        "宋体" | "simsun" | "新宋体" | "nsimsun" => vec!["simsun.ttc"],
+        "微软雅黑" | "microsoftyahei" | "microsoftyaheiui" => vec!["msyh.ttc", "msyhbd.ttc"],
+        "黑体" | "simhei" => vec!["simhei.ttf"],
+        "楷体" | "楷体_gb2312" | "kaiti" => vec!["simkai.ttf"],
+        "仿宋" | "fangsong" => vec!["simfang.ttf"],
+        "等线" | "dengxian" => vec!["Deng.ttf"],
+        "等线light" | "dengxianlight" => vec!["Dengl.ttf"],
+        "arial" => vec!["arial.ttf"],
+        "calibri" => vec!["calibri.ttf"],
+        "timesnewroman" | "times" => vec!["times.ttf"],
+        "cambria" => vec!["cambria.ttc"],
+        "consolas" => vec!["consola.ttf"],
+        "segoeui" => vec!["segoeui.ttf"],
+        "verdana" => vec!["verdana.ttf"],
+        "tahoma" => vec!["tahoma.ttf"],
+        "georgia" => vec!["georgia.ttf"],
+        "couriernew" => vec!["cour.ttf"],
+        _ => vec![],
+    }
+}
+
+fn fonts_dir() -> std::path::PathBuf {
+    let win = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    std::path::PathBuf::from(win).join("Fonts")
+}
+
+/// 在 TTC/TTF 里按 family 名找 face；找不到返回 0 号 face。
+fn face_index(data: &[u8], want: &str) -> Option<u32> {
+    let n = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    let want = norm(want);
+    for i in 0..n {
+        let Ok(face) = ttf_parser::Face::parse(data, i) else { continue };
+        for name in face.names() {
+            if !name.is_unicode() {
+                continue;
+            }
+            if let Some(s) = name.to_string() {
+                let s = norm(&s);
+                // 注册名常带 “Regular/Bold”，family 名本身是前缀
+                if s == want || s.starts_with(&want) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    if n > 0 { Some(0) } else { None }
+}
+
+pub fn load(name: &str) -> Option<(Vec<u8>, u32)> {
+    let dir = fonts_dir();
+    for f in file_candidates(name) {
+        let p = dir.join(f);
+        if let Ok(data) = std::fs::read(&p) {
+            let idx = face_index(&data, name).unwrap_or(0);
+            return Some((data, idx));
+        }
+    }
+    None
+}
+
+struct Loaded {
+    data: std::sync::Arc<[u8]>,
+    index: u32,
+}
+
+static LOADED: OnceLock<Mutex<HashMap<String, Loaded>>> = OnceLock::new();
+/// 已写入 FontDefinitions 但 egui 要到下一帧才生效的字体。
+static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// 当前帧真正可用的系统字体（egui 已装载）。
+static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn loaded() -> &'static Mutex<HashMap<String, Loaded>> {
+    LOADED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn is_loaded(name: &str) -> bool {
+    ACTIVE
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|m| m.contains(&norm(name)))
+        .unwrap_or(false)
+}
+
+/// 每帧开头调用：上一帧 `set_fonts` 的字体在这一帧真正可用。
+pub fn begin_frame() {
+    let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
+    let pending = PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+    let (Ok(mut a), Ok(mut p)) = (active.lock(), pending.lock()) else { return };
+    for k in p.drain() {
+        a.insert(k);
+    }
+}
+
+/// 返回是否新增了字体（调用方需要重设 FontDefinitions）。
+pub fn ensure(names: &[String]) -> bool {
+    if std::env::var("SC_FONT_LOG").is_ok() {
+        eprintln!("[fonts] ensure enter {} names", names.len());
+    }
+    let mut map = match loaded().lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mut changed = false;
+    for n in names {
+        let key = norm(n);
+        if key.is_empty() || map.contains_key(&key) {
+            continue;
+        }
+        if let Some((data, index)) = load(n) {
+            if std::env::var("SC_FONT_LOG").is_ok() {
+                eprintln!("[fonts] insert {} face {}", n, index);
+            }
+            map.insert(key, Loaded { data: data.into(), index });
+            changed = true;
+        }
+    }
+    if std::env::var("SC_FONT_LOG").is_ok() {
+        eprintln!("[fonts] ensure changed={} size={}", changed, map.len());
+    }
+    changed
+}
+
+pub fn apply(fonts: &mut egui::FontDefinitions) {
+    let map = match loaded().lock() {
+        Ok(m) => m,
+        Err(e) => {
+            if std::env::var("SC_FONT_LOG").is_ok() {
+                eprintln!("[fonts] lock poisoned: {e}");
+            }
+            return;
+        }
+    };
+    for (name, f) in map.iter() {
+        let key = format!("sys:{name}");
+        fonts.font_data.insert(
+            key.clone(),
+            FontData { font: std::borrow::Cow::Owned(f.data.to_vec()), index: f.index, tweak: Default::default() }.into(),
+        );
+        if std::env::var("SC_FONT_LOG").is_ok() {
+            eprintln!("[fonts] apply {:?} index={}", key, f.index);
+        }
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(key.clone().into()), vec![key.clone()]);
+        PENDING
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map(|mut p| p.insert(name.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_common_chinese_and_latin_fonts() {
+        let (data, idx) = load("宋体").expect("本机应有 simsun.ttc");
+        assert!(!data.is_empty());
+        assert_eq!(face_index(&data, "宋体"), Some(idx));
+        let (data, idx) = load("微软雅黑").expect("本机应有 msyh.ttc");
+        assert_eq!(face_index(&data, "微软雅黑"), Some(idx));
+        let (data, idx) = load("Arial").expect("本机应有 arial.ttf");
+        assert_eq!(face_index(&data, "Arial"), Some(idx));
+    }
+
+    #[test]
+    fn unknown_font_falls_back() {
+        assert!(load("绝对不存在的字体 XYZ").is_none());
+        assert!(!is_loaded("绝对不存在的字体 XYZ"));
+    }
+
+    #[test]
+    fn ensure_is_idempotent() {
+        assert!(ensure(&["宋体".to_string()]));
+        let mut d = egui::FontDefinitions::default();
+        apply(&mut d);
+        begin_frame();
+        assert!(is_loaded("宋体"));
+        assert!(!ensure(&["宋体".to_string()]));
+    }
+}
