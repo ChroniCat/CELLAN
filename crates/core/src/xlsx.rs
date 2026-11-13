@@ -1581,11 +1581,33 @@ fn save_plain(path: &Path, wb: &Workbook) -> Result<()> {
     save_plain_base(path, wb, None)
 }
 
-/// 保存子步骤的故障注入（验收专用）：`SC_FAIL_SAVE_STEP=名称[,名称]` 让指定子步骤返回错误。
-/// 未设置时完全不改变行为；用于验证「子步骤失败不得回报成功」。
+thread_local! {
+    /// 当前线程正在写的目标文件：让故障注入能只作用于某一次保存。
+    /// 不记录的话，并行跑的其它保存会跟着一起失败（测试互相污染）。
+    static SAVE_TARGET: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn note_save_target(path: &Path) {
+    let p = path.display().to_string();
+    SAVE_TARGET.with(|t| *t.borrow_mut() = p);
+}
+
+/// 保存子步骤的故障注入（验收专用）：`SC_FAIL_SAVE_STEP=名称[,名称]` 让指定子步骤返回错误；
+/// `名称@路径片段` 只对目标路径含该片段的那次保存生效。未设置时完全不改变行为，
+/// 用于验证「子步骤失败不得回报成功」。
 fn save_step<T>(step: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     if let Ok(spec) = std::env::var("SC_FAIL_SAVE_STEP") {
-        if spec.split(',').any(|s| s.trim() == step) {
+        let target = SAVE_TARGET.with(|t| t.borrow().clone());
+        let hit = spec.split(',').any(|raw| {
+            let raw = raw.trim();
+            match raw.split_once('@') {
+                Some((name, needle)) => {
+                    name == step && !needle.is_empty() && target.contains(needle)
+                }
+                None => raw == step,
+            }
+        });
+        if hit {
             return Err(anyhow::anyhow!("注入的保存子步骤失败: {step}"));
         }
     }
@@ -1633,6 +1655,7 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<()> {
+    note_save_target(path);
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
 
