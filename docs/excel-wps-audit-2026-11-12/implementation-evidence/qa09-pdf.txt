@@ -24,3 +24,11 @@
 
 ## 测试
 sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
+
+## QA-09.2 对象/重复标题（进行中）
+- `c16_pdf` 示例此前调用 `export_pdf`（不传源文件），PDF 里图片恒为 0；
+  改调 `export_pdf_from(..., Some(src))` 后 `objects.xlsx` 导出含 1 个 Image XObject。
+  产品内导出走的是 `export_pdf_from`，此问题仅存在于取证示例。
+- `print.xlsx` 两页均以标题行 2026 开头（顶端标题行重复），正文行 2..60 完整。
+- `objects2.xlsx` 强制 FitToPages 1×1，仍为 1 页，尚不能验证“对象+跨页标题”同一文件。
+- 未做：图表/文本框矢量目视、隐藏行/筛选数据不打印样本、WPS PDF 导出对拍。

@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
             .to_string()
     });
     let wb = sheetcore::xlsx::load(Path::new(&src))?;
-    let pages = sheetcore::print::export_pdf(&wb, 0, Path::new(&out), Path::new(&font))?;
+    let pages = sheetcore::print::export_pdf_from(&wb, 0, Path::new(&out), Path::new(&font), Some(Path::new(&src)))?;
     println!("pages={pages} out={out}");
     Ok(())
 }
