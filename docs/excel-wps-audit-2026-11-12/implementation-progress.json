@@ -4123,14 +4123,15 @@
       "source": "ui-requirements.md",
       "heading": "UI-10 查找对话框按钮和默认页签",
       "status": "待验收",
-      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。",
+      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
         "cb628f6",
-        "e8a52d7"
+        "e8a52d7",
+        "649828c"
       ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4139,18 +4140,33 @@
         "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
-        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --no-default-features --features glow --bin app modal_dialog_click_does_not_select_grid_behind -> 1 passed",
+        "cargo test -p app --offline --no-default-features --features glow --bin app -> 231 passed / 0 failed / 0 ignored / APP_EXIT=0",
+        "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored / CORE_EXIT=0",
+        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-dialog-open-replace.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-close-button-after.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-x-close-after.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-esc-focus-edit.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-prefix-clickthrough.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-after-esc.xlsx",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-start-b3.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-dialog-open.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-close-mouse.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-enter-moved-b4.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-chain-after.xlsx"
       ],
       "not_done": [
-        "真实鼠标点关闭/×、Esc、重新打开后焦点回网格与残余 Enter 未执行"
+        "Excel/WPS 同位置视觉对比尚未做；当前 GUI 证据为本机 app framebuffer/窗口 capture。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-      "updated_utc": "2026-11-13T06:30:31Z",
+      "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
+      "updated_utc": "2026-11-13T09:05:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4159,29 +4175,45 @@
           "acceptance_source": "ui-requirements.md / UI-10 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）。查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项断言 Ctrl+H/Ctrl+F 页签；全量 app 208 passed。",
+          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
             "cb628f6",
-            "e8a52d7"
+            "e8a52d7",
+            "649828c"
           ],
           "commands": [
             "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
-            "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
+            "cargo test -p app --offline --no-default-features --features glow --bin app modal_dialog_click_does_not_select_grid_behind -> 1 passed",
+            "cargo test -p app --offline --no-default-features --features glow --bin app -> 231 passed / 0 failed / 0 ignored / APP_EXIT=0",
+            "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored / CORE_EXIT=0",
+            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-dialog-open-replace.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-close-button-after.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-x-close-after.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-esc-focus-edit.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-prefix-clickthrough.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-after-esc.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-start-b3.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-dialog-open.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-close-mouse.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-chain-enter-moved-b4.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-focus-chain-after.xlsx"
           ],
           "not_done": [
-            "真实鼠标点关闭/×、Esc、重新打开后焦点回网格与残余 Enter 未执行"
+            "Excel/WPS 同位置视觉对比尚未做；当前 GUI 证据为本机 app framebuffer/窗口 capture。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-          "updated_utc": "2026-11-13T06:30:31Z"
+          "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
+          "updated_utc": "2026-11-13T09:05:00Z"
         }
       ]
     },

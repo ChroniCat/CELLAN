@@ -26,6 +26,7 @@
 !crates/core/tests/fixtures/c11_external_3d.xlsx
 !crates/core/tests/fixtures/c114_ext_book2.xlsx
 !docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/*.xlsx
+!docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-*.xlsx
 
 # Operating-system files
 .DS_Store

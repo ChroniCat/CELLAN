@@ -29,6 +29,85 @@ UI-10 查找对话框按钮与页签（2026-11-13 14:13 CST）
 - 命令：cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab
   -> 1 passed；全量 212 passed / 0 failed / 0 ignored，APP_EXIT=0。
 
-未完成
+未完成（历史记录，已于 17:00/17:05 补做）
 - 真实鼠标点“关闭/×”、Esc、重新打开后焦点回网格与残余 Enter 的 GUI 操作未执行；
   代码路径已修，但 UI-10 保持待验收，不以按钮出现或单测替代真实点击。
+- 17:00/17:05 已补：底部关闭、×、Esc、焦点回网格、B3→关闭→8/Enter→保存重载完整链；
+  详见文末两节。
+
+## 17:00 追加：真实 GUI 点击闭环（本机 1438×898 capture）
+
+夹具：`ui10_focus_gui.xlsx`（Sheet `Focus`，A1=7，B1=Amount，A2=Alpha/B2=10，
+A3=Beta/B3=20），全程只操作这份合成临时文件。窗口为 `target/debug/app.exe`
+（glow），`computer_use` 的 capture 尺寸 1438×898。
+
+### 发现的真实缺陷 1：关闭按钮点击穿透
+- 复现：A1 选中 → Ctrl+H 打开对话框 → 按原 capture 坐标点底栏“关闭”
+  (1038,561)。对话框关闭，但选区变成 O16（“关闭”正下方的格子）。
+- 再复现：A1 → Ctrl+H → 点标题栏× (885,344)，对话框关闭但选区变成 L4。
+- 证据：`ui10-prefix-clickthrough.png`（点×后选区为 L4）。
+- 根因：网格用原始 `primary_pressed()` + `press_origin()` 落选区，早于 / 独立于
+  egui 窗口的 pointer blocking；关闭按钮同一次按下既关窗又选中背后格子。
+- 修复：`SheetApp.dialog_modal`（`find.open`）在打开期间让网格 pane 只画不响应
+  （`Sense::hover()`、清 `grid_press`、禁用滚动和原始按下选区）。
+- 回归：新增 `modal_dialog_click_does_not_select_grid_behind`；modal=true 时点 C3
+  选区不变，modal=false 时同一点恢复选中 C3。修复前失败，修复后 1 passed。
+
+### 发现的真实缺陷 2：Esc/× 关闭后键盘焦点没有还给网格
+- 复现：Ctrl+H → Esc → 直接键入 9；屏幕状态仍是“就绪”，C3 没有进入编辑；
+  保存后 C3 仍为空。
+- 修复：`find_dialog` 关闭时 `ctx.memory_mut(|m| m.stop_text_input())`，
+  释放隐藏查找框的文本焦点。
+- 复验（修复后）：Ctrl+Home → 右右下下到 C3 → Ctrl+H → Esc → 键入 9，
+  `ui10-esc-focus-edit.png` 显示名称框 C3、编辑栏 9、状态“输入”。
+  Enter 提交 + Ctrl+S 后，用 openpyxl 读回夹具：A1=7、C3=9。
+- 保存件：`ui10-focus-after-esc.xlsx`，SHA-256
+  `8ba400e8595bd35514a7dc905a7a8f431e94524fca6fa704474b760107a39b99`。
+
+### 真实操作矩阵
+| 操作 | 方式 | 结果 | 证据 |
+|---|---|---|---|
+| Ctrl+H | 真实键盘 | 打开“替换”页 | `ui10-dialog-open-replace.png` |
+| 底栏“关闭” | 真实鼠标（capture 坐标 1038,561） | 关闭，A1 选区保持 | `ui10-close-button-after.png` |
+| 标题栏× | 真实鼠标（capture 坐标 885,344） | 关闭，C3 选区保持 | `ui10-x-close-after.png` |
+| Esc + 键入 | 真实键盘 | 焦点回网格，C3=9 已保存 | `ui10-esc-focus-edit.png`、xlsx |
+
+坐标说明：`computer_use` 的 coordinate 是相对 capture 窗口左上角；窗口每次
+`SwitchToThisWindow` 可能被系统挪动，必须使用同一次最新 capture 的坐标，不能
+复用旧窗口原点。直接 Win32 `SetCursorPos` 才需要 `ClientToScreen`/窗口偏移。
+
+### 测试
+- 专项：`cargo test -p app --offline --no-default-features --features glow --bin app
+  modal_dialog_click_does_not_select_grid_behind` → 1 passed。
+- 本轮修改后仍需全量 app/core 与 build 复核；UI-10 视觉/Excel-WPS 对比仍未做，
+  但真实键鼠关闭、×、Esc、焦点回落与保存值已闭环。
+
+## 17:05 追加：最新二进制完整键盘链（B3→关闭→8/Enter→保存重载）
+
+针对“原活动格值必须正确、只发生预期移动、邻格不得误改”的复核要求，使用全新夹具
+`ui10_focus_chain.xlsx`（A1=Name/B1=Amount，A2=Alpha/B2=10，A3=Beta/B3=20，
+B4/C3 空）重新跑一遍，不使用旧 C3 结果代替：
+
+1. 启动 commit `649828c` 的 glow 二进制，真实键盘 Ctrl+Home → 下、下、右，明确选中
+   **B3**；`ui10-chain-start-b3.png` 显示名称框 B3、编辑栏 20。
+2. Ctrl+H → `ui10-chain-dialog-open.png`，替换页打开，B3 仍是原活动格。
+3. 真实鼠标点底栏“关闭”（`computer_use` 相对 capture 坐标 1038,561）→
+   `ui10-chain-close-mouse.png`：对话框关闭，名称框仍 B3、编辑栏仍 20。
+4. 真实键盘输入 `8` + Enter → `ui10-chain-enter-moved-b4.png`：B3 显示 8，
+   名称框 B4，只向下移动一行；没有重新打开查找框。
+5. Ctrl+S 保存，openpyxl 重新加载：
+   - B3 = **8**
+   - B2 = **10**、A3 = **Beta**、B4 = **None**、C3 = **None**、A1/B1 不变
+   - 保存件 `ui10-focus-chain-after.xlsx`，SHA-256
+     `ec267057040c86ef832df7c76ed7364bdbaaed004442b944c5ce26118021fb92`。
+
+结论：最新二进制下“关闭→数字→Enter→原格写入→仅预期移动→保存重载值正确、
+邻格未误改”完整链通过。此前 47503→47506 的 C3=8 → None 是 stop_text_input
+修复前的旧二进制结果，保留为历史失败，不再当作当前状态。
+
+### 测试复核
+- `modal_dialog_click_does_not_select_grid_behind` → 1 passed（修复穿透）。
+- `cargo test -p app ... --bin app` → **231 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+- `cargo test -p sheetcore --offline` → **75 bins / 679 passed / 0 failed / 41 ignored**，CORE_EXIT=0。
+- `cargo build -p app --offline --no-default-features --features glow` → BUILD_EXIT=0。
+- 代码提交：`649828c fix: keep grid inert under find dialog and release focus on close`。

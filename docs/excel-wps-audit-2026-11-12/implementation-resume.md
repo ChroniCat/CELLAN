@@ -1,12 +1,17 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；当前代码检查点 `930ff80`（已有文件填充/保护逆向写回修复）。
-  之前 `b02c047` 是 UI-16 三处入口修复 + UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
+- 分支 `main`（`origin/main`）；当前代码检查点 `649828c`（查找对话框关闭穿透/焦点修复）。
+  之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
+  UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
 - 台账（`python scripts/audit_progress.py counts`）：任务 13 已验收 / 10 待验收 /
   5 实施中 / 33 待实施；切片 35 已验收 / 30 待验收 / 83 待实施。父项 13/61 未变。
-- 当前测试真值（16:16 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
-  CORE_EXIT=0；app **230 passed / 0 failed / 0 ignored**，APP_EXIT=0；
+- 当前测试真值（17:05 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **231 passed / 0 failed / 0 ignored**，APP_EXIT=0；
   `cargo build -p app --offline --no-default-features --features glow` 成功。
+- UI-10 真实键鼠完整链通过：B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载
+  B2/A3/B4/C3 不变；同时修掉关闭按钮点击穿透（modal 网格门禁）与关闭后隐藏查找框
+  吞键盘焦点（`stop_text_input`）。截图/xlsx 见 `ui10-find-dialog-close.txt` 17:05 节；
+  用户复核后可申请父项验收，不扩大到其他父项。
 - 15:47 监督三处 UI-16 入口已修：
   1. `copy_sheet_to` 插入前按 identity 保存视图，插入后按 identity 恢复原索引再切副本；
      复制到前方/同位均保留原 B/C 的 sel/extra_sel/scroll/zoom。
