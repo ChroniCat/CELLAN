@@ -248,6 +248,25 @@ impl EditState {
     }
 }
 
+/// 数据验证的警告/信息提示框（Excel 的「是/否/取消」与「确定」）。
+/// 停止样式不弹这个框：它留在编辑框里让用户重试。
+#[derive(Clone)]
+struct DvAlert {
+    r: u32,
+    c: u32,
+    buf: String,
+    /// true = 信息框（只有“确定”，确定后写入）；false = 警告框（是/否/取消）
+    info_only: bool,
+    title: String,
+    msg: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DvAlertChoice {
+    Primary,
+    Secondary,
+    Cancel,
+}
 /// 一帧编辑框的处置：保持编辑 / 提交（附带选区移动）/ 取消
 enum EditAct {
     Keep,
@@ -752,6 +771,10 @@ struct SheetApp {
     find_scan: Option<FindScan>,
     /// 上一帧有模态对话框：网格不得再处理这一帧的点击（否则点“关闭”会穿透选中背后的单元格）
     dialog_modal: bool,
+    /// 数据验证的“警告/信息”提示框：非停止样式时先问再写，不能直接落盘
+    dv_alert: Option<DvAlert>,
+    /// 用户已经确认过本次数据验证警告，下一次提交跳过验证（一次性）
+    dv_force_once: bool,
     /// 缩放
     zoom: f32,
     /// 功能区当前页签：XML 里的页签序号；100 表设计 / 101 图表工具
@@ -1482,6 +1505,8 @@ impl SheetApp {
             find: FindState::default(),
             find_scan: None,
             dialog_modal: false,
+            dv_alert: None,
+            dv_force_once: false,
             zoom: 1.0,
             ribbon_tab: std::env::var("SC_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             ribbon: ribbon::load(),
@@ -2501,6 +2526,15 @@ impl SheetApp {
                             self.find_open_new_session();
                         }
                         Ok("cf") => self.cf_mgr = true,
+                        Ok("dv") => {
+                            // 和菜单「数据验证 → 设置…」同一条路径：当前选区建草稿
+                            let (r1, c1, r2, c2) = self.sel_rect();
+                            let cur = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, r1, c1)
+                                .cloned();
+                            let mut draft = cur.unwrap_or_default();
+                            draft.ranges = vec![(r1, c1, r2, c2)];
+                            self.dv_edit = Some(draft);
+                        }
                         Ok("chart") => {
                             self.chart_mgr = true;
                             self.reload_charts();
@@ -6986,13 +7020,94 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// 提交当前编辑。缓冲的唯一所有者是 `self.editing`；数据验证不通过时不写、
     /// 不移动选区、保留编辑内容和协作租约（Excel 的「重试」）。返回是否真的写入。
+    /// 数据验证警告/信息框的选择：是/确定→写入；否→回编辑框；取消→放弃本次输入。
+    fn resolve_dv_alert(&mut self, choice: DvAlertChoice) {
+        let Some(a) = self.dv_alert.take() else { return };
+        let commit = a.info_only || choice == DvAlertChoice::Primary;
+        if commit {
+            self.sel = (a.r, a.c);
+            self.editing = Some(EditState::new(a.buf));
+            self.dv_force_once = true;
+            self.commit_edit(None);
+        } else if choice == DvAlertChoice::Secondary {
+            self.sel = (a.r, a.c);
+            self.editing = Some(EditState::new(a.buf));
+            self.status = a.msg;
+        } else {
+            self.status = format!("已取消输入：{}", a.msg);
+        }
+    }
+
+    /// 警告/信息提示框。信息样式只有“确定”（确定后写入），警告样式是“是/否/取消”。
+    fn dv_alert_window(&mut self, ctx: &egui::Context) {
+        let Some(a) = self.dv_alert.clone() else { return };
+        let mut choice: Option<DvAlertChoice> = None;
+        // 模态框期间 handle_keys 让路（dialog_modal），键盘在这里收：
+        // Enter = 默认按钮（是/确定），Esc = 取消（信息框的 Esc 等同确定）。
+        let key_choice = if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            Some(if a.info_only {
+                DvAlertChoice::Primary
+            } else {
+                DvAlertChoice::Cancel
+            })
+        } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
+            Some(DvAlertChoice::Primary)
+        } else {
+            None
+        };
+        egui::Window::new(a.title.clone())
+            .id(egui::Id::new("dv_alert"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(if a.info_only { "i" } else { "⚠" }).size(22.0),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(&a.msg);
+                        if !a.info_only {
+                            ui.label("是：接受这个值　否：回到编辑框　取消：不写入");
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if a.info_only {
+                        if ui_kit::primary_button(ui, "确定").clicked() {
+                            choice = Some(DvAlertChoice::Primary);
+                        }
+                    } else {
+                        if ui_kit::primary_button(ui, "是").clicked() {
+                            choice = Some(DvAlertChoice::Primary);
+                        }
+                        if ui_kit::secondary_button(ui, "否").clicked() {
+                            choice = Some(DvAlertChoice::Secondary);
+                        }
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            choice = Some(DvAlertChoice::Cancel);
+                        }
+                    }
+                });
+            });
+        if let Some(c) = choice.or(key_choice) {
+            self.resolve_dv_alert(c);
+        }
+    }
+
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) -> bool {
         let mut wrote = false;
+        // 用户在警告框里点了“是”：这一笔跳过验证（一次性）
+        let force = std::mem::replace(&mut self.dv_force_once, false);
         if let Some(ed) = self.editing.take() {
             let (r, c) = self.sel;
-            // 数据验证：不合规就不写入，编辑框留着让用户改（Excel 的「重试」）
+            // 数据验证：停止样式留在编辑框（Excel 的「重试」）；警告/信息样式先弹框，
+            // 确认后才写入；showErrorMessage=0 时按 Excel 语义静默放行。
             let mut rejected: Option<String> = None;
-            {
+            let mut pending_alert: Option<DvAlert> = None;
+            if !force {
                 let sheet = self.wb.sheet(self.sheet_idx);
                 if let Some(dv) = sheetcore::dv::find(&sheet.dv, r, c) {
                     let probe = if ed.buf.starts_with('=') {
@@ -7023,13 +7138,48 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         }
                     });
                     if !ok {
-                        let msg = match config_err {
+                        let msg = match &config_err {
                             Some(e) => format!("数据验证配置无效：{e}"),
                             None => sheetcore::dv::error_text(dv),
                         };
-                        rejected = Some(msg);
+                        match dv.verdict(false) {
+                            sheetcore::dv::DvVerdict::Reject => rejected = Some(msg),
+                            sheetcore::dv::DvVerdict::AcceptSilently => {
+                                // Excel 语义是静默放行，但配置坏了仍然要能看见诊断
+                                if let Some(e) = &config_err {
+                                    self.status = format!("数据验证配置无效：{e}");
+                                }
+                            }
+                            sheetcore::dv::DvVerdict::AskWarning => {
+                                pending_alert = Some(DvAlert {
+                                    r,
+                                    c,
+                                    buf: ed.buf.clone(),
+                                    info_only: false,
+                                    title: dv.error_title.clone(),
+                                    msg,
+                                });
+                            }
+                            sheetcore::dv::DvVerdict::InformThenAccept => {
+                                pending_alert = Some(DvAlert {
+                                    r,
+                                    c,
+                                    buf: ed.buf.clone(),
+                                    info_only: true,
+                                    title: dv.error_title.clone(),
+                                    msg,
+                                });
+                            }
+                            sheetcore::dv::DvVerdict::Accept => {}
+                        }
                     }
                 }
+            }
+            if let Some(alert) = pending_alert {
+                // 提示框期间不释放编辑租约：用户在框里选“是/否/取消”后才定稿
+                self.dv_alert = Some(alert);
+                self.editing = None;
+                return false;
             }
             if let Some(msg) = rejected {
                 self.status = msg;
@@ -14553,6 +14703,41 @@ let txn = self.txn_begin(&keys);
                     ui.add(egui::TextEdit::singleline(&mut draft.error_msg).desired_width(220.0));
                     ui.end_row();
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut draft.show_error, "显示错误警告");
+                    ui.add_enabled_ui(draft.show_error, |ui| {
+                        egui::ComboBox::from_id_salt("dv_style")
+                            .selected_text(draft.error_style.label())
+                            .show_ui(ui, |ui| {
+                                for st in [
+                                    sheetcore::dv::DvStyle::Stop,
+                                    sheetcore::dv::DvStyle::Warning,
+                                    sheetcore::dv::DvStyle::Information,
+                                ] {
+                                    if ui
+                                        .selectable_label(draft.error_style == st, st.label())
+                                        .clicked()
+                                    {
+                                        draft.error_style = st;
+                                    }
+                                }
+                            });
+                    });
+                });
+                dlg_section(ui, "输入提示");
+                egui::Grid::new("dv_prompt").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("显示输入提示");
+                    ui.checkbox(&mut draft.show_prompt, "");
+                    ui.end_row();
+                    ui.label("提示标题");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.prompt_title).desired_width(220.0),
+                    );
+                    ui.end_row();
+                    ui.label("提示内容");
+                    ui.add(egui::TextEdit::singleline(&mut draft.prompt_msg).desired_width(220.0));
+                    ui.end_row();
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -21931,6 +22116,40 @@ let txn = self.txn_begin(&keys);
             }
         }
 
+        // 数据验证输入提示：Excel 在选中格下方显示提示框（showInputMessage）
+        if !readonly && self.editing.is_none() {
+            let tip = {
+                let sh = self.wb.sheet(self.sheet_idx);
+                sheetcore::dv::find(&sh.dv, self.sel.0, self.sel.1)
+                    .and_then(|d| d.prompt_text())
+            };
+            if let Some(tip) = tip {
+                let (r, c) = self.sel;
+                let x = px_of(c) + 2.0;
+                let y = py_of(r + 1) + 3.0;
+                let w = 230.0;
+                let color = Color32::from_rgb(60, 60, 40);
+                let galley =
+                    painter.layout(tip.clone(), FontId::proportional(12.0), color, w - 12.0);
+                let h = galley.size().y + 10.0;
+                let rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, h));
+                if painter.clip_rect().intersects(rect) {
+                    painter.rect_filled(rect, 2.0, Color32::from_rgb(255, 255, 225));
+                    painter.rect_stroke(
+                        rect,
+                        2.0,
+                        Stroke::new(1.0, Color32::from_rgb(150, 150, 110)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.galley(rect.min + egui::vec2(6.0, 5.0), galley, color);
+                    dump.push(format!(
+                        "dv-prompt ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) text={:?}",
+                        r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, tip
+                    ));
+                }
+            }
+        }
+
         if !dump.is_empty() {
             self.dump_accum.push_str(&dump.join("\n"));
             self.dump_accum.push_str("
@@ -23822,7 +24041,7 @@ impl eframe::App for SheetApp {
         }
         let __cpu_t0 = std::time::Instant::now();
         // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
-        self.dialog_modal = self.find.open;
+        self.dialog_modal = self.find.open || self.dv_alert.is_some();
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -23928,6 +24147,36 @@ impl eframe::App for SheetApp {
                             parts[2],
                             sent,
                             self.peers_list.len()
+                        );
+                    }
+                }
+            }
+        }
+        // 无界面验收：SC_DV_TRY="r,c,文本" 走真实的编辑提交（数据验证警告/信息框会弹出）
+        if let Ok(spec) = std::env::var("SC_DV_TRY") {
+            static DONE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let at = std::env::var("SC_DV_TRY_AT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let ready = self.tasks.open_rx.is_none() && self.t0.elapsed().as_secs() >= at;
+            if ready && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let parts: Vec<&str> = spec.splitn(3, ',').collect();
+                if parts.len() == 3 {
+                    if let (Ok(r), Ok(c)) = (
+                        parts[0].trim().parse::<u32>(),
+                        parts[1].trim().parse::<u32>(),
+                    ) {
+                        self.sel = (r, c);
+                        self.editing = Some(EditState::new(parts[2].to_string()));
+                        let wrote = self.commit_edit(None);
+                        eprintln!(
+                            "[dv-try] ({r},{c})={:?} wrote={} alert={} status={:?}",
+                            parts[2],
+                            wrote,
+                            self.dv_alert.is_some(),
+                            self.status
                         );
                     }
                 }
@@ -24241,6 +24490,7 @@ impl eframe::App for SheetApp {
         self.encrypt_dialog_ui(ctx);
         self.size_dialog(ctx);
         self.color_popup_window(ctx);
+        self.dv_alert_window(ctx);
         // 缩放：Ctrl+滚轮
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if ctrl && wheel.abs() > 0.5 {
@@ -24753,6 +25003,21 @@ impl eframe::App for SheetApp {
                             .size(11.0)
                             .color(ui_kit::TEXT),
                     );
+                    // 消息区：Excel 在模式文字右边显示最近一次操作/诊断，长文本截断并带悬停全文
+                    if !self.status.is_empty() {
+                        ui.add_space(10.0);
+                        let room = (ui.available_width() - 260.0).max(120.0);
+                        ui.add_sized(
+                            [room, 18.0],
+                            egui::Label::new(
+                                egui::RichText::new(self.status.clone())
+                                    .size(11.0)
+                                    .color(ui_kit::TEXT),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(self.status.clone());
+                    }
                     if self.manual_calc {
                         ui.add_space(10.0);
                         let pending = self.wb.calc_pending;

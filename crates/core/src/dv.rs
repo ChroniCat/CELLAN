@@ -110,6 +110,48 @@ impl DvOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DvStyle {
+    Stop,
+    Warning,
+    Information,
+}
+
+impl DvStyle {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DvStyle::Stop => "停止",
+            DvStyle::Warning => "警告",
+            DvStyle::Information => "信息",
+        }
+    }
+    pub fn from_xml(s: &str) -> Self {
+        match s {
+            "warning" => DvStyle::Warning,
+            "information" => DvStyle::Information,
+            _ => DvStyle::Stop,
+        }
+    }
+    pub fn to_xml(&self) -> &'static str {
+        match self {
+            DvStyle::Stop => "stop",
+            DvStyle::Warning => "warning",
+            DvStyle::Information => "information",
+        }
+    }
+}
+
+/// 校验结果的处置：通过、静默放行、停止（留在编辑框）、警告（问是/否/取消）、
+/// 信息（先提示再接受）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DvVerdict {
+    Accept,
+    AcceptSilently,
+    Reject,
+    AskWarning,
+    InformThenAccept,
+}
+
 #[derive(Clone, Debug)]
 pub struct DataValidation {
     pub ranges: Vec<(u32, u32, u32, u32)>,
@@ -120,10 +162,50 @@ pub struct DataValidation {
     pub allow_blank: bool,
     /// false 表示隐藏下拉箭头（Excel 的 showDropDown="1" 反而是「不显示」）
     pub show_dropdown: bool,
+    pub error_style: DvStyle,
+    /// showErrorMessage；关掉时 Excel 不拦输入
+    pub show_error: bool,
+    /// showInputMessage；选中单元格时显示输入提示
+    pub show_prompt: bool,
     pub error_title: String,
     pub error_msg: String,
     pub prompt_title: String,
     pub prompt_msg: String,
+}
+
+impl DataValidation {
+    /// 不合规值的处置。show_error=false 时静默放行（Excel 的行为），
+    /// 否则按 errorStyle 分停止/警告/信息。
+    pub fn verdict(&self, valid: bool) -> DvVerdict {
+        if valid {
+            return DvVerdict::Accept;
+        }
+        if !self.show_error {
+            return DvVerdict::AcceptSilently;
+        }
+        match self.error_style {
+            DvStyle::Stop => DvVerdict::Reject,
+            DvStyle::Warning => DvVerdict::AskWarning,
+            DvStyle::Information => DvVerdict::InformThenAccept,
+        }
+    }
+
+    /// 选中格要显示的输入提示；开关关掉或内容为空时不显示。
+    pub fn prompt_text(&self) -> Option<String> {
+        if !self.show_prompt {
+            return None;
+        }
+        let t = self.prompt_title.trim();
+        let m = self.prompt_msg.trim();
+        if t.is_empty() && m.is_empty() {
+            return None;
+        }
+        Some(match (t.is_empty(), m.is_empty()) {
+            (false, false) => format!("{t}\n{m}"),
+            (false, true) => t.to_string(),
+            _ => m.to_string(),
+        })
+    }
 }
 
 impl Default for DataValidation {
@@ -136,6 +218,9 @@ impl Default for DataValidation {
             f2: String::new(),
             allow_blank: true,
             show_dropdown: true,
+            error_style: DvStyle::Stop,
+            show_error: true,
+            show_prompt: true,
             error_title: "输入值非法".into(),
             error_msg: "此单元格的值不符合验证规则".into(),
             prompt_title: String::new(),
@@ -496,6 +581,9 @@ pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
                         "operator" => dv.op = DvOp::from_xml(&v),
                         "allowBlank" => dv.allow_blank = v == "1" || v == "true",
                         "showDropDown" => show_dropdown_attr = Some(v == "1" || v == "true"),
+                        "showErrorMessage" => dv.show_error = v == "1" || v == "true",
+                        "showInputMessage" => dv.show_prompt = v == "1" || v == "true",
+                        "errorStyle" => dv.error_style = DvStyle::from_xml(&v),
                         "sqref" => {
                             dv.ranges = crate::cf::parse_sqref(&v);
                             has_range = !dv.ranges.is_empty();
@@ -524,6 +612,9 @@ pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
                         "operator" => dv.op = DvOp::from_xml(&v),
                         "allowBlank" => dv.allow_blank = v == "1" || v == "true",
                         "showDropDown" => show_dropdown_attr = Some(v == "1" || v == "true"),
+                        "showErrorMessage" => dv.show_error = v == "1" || v == "true",
+                        "showInputMessage" => dv.show_prompt = v == "1" || v == "true",
+                        "errorStyle" => dv.error_style = DvStyle::from_xml(&v),
                         "sqref" => {
                             dv.ranges = crate::cf::parse_sqref(&v);
                             has_range = !dv.ranges.is_empty();

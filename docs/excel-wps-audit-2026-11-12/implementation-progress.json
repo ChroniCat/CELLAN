@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T13:27:48Z",
+  "updated_utc": "2026-11-13T13:57:51Z",
   "tasks": [
     {
       "id": "C01",
@@ -2746,12 +2746,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C07.1 已验收；C07.2/C07.3 未实现。交接材料称工作区已有 C07.2 stop/warning/information 实现，实测 grep errorStyle/showErrorMessage/showInputMessage 在 crates/ 下零命中（仅需求文档提到），故按未实现接续。"
+        "C07.1/C07.2 已验收；C07.3（键盘下拉与保存集成）未做。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "C07.2：DataValidation 增加 errorStyle/showErrorMessage/showInputMessage，XML 读写与 Excel 往返，三种错误样式的交互分支与输入提示。",
-      "updated_utc": "2026-11-13T13:27:48Z",
+      "next": "C07.3：Alt+↓ 打开序列下拉、方向键/Enter/Esc、选择走与手输相同的编辑事务；保存后规则与提示属性一致。",
+      "updated_utc": "2026-11-13T13:57:51Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2790,17 +2790,41 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "DvStyle stop/warning/information + showErrorMessage/showInputMessage 进入 DataValidation；XML 读写与真实 xlsx 保存重开一致（warning 规则 showInputMessage=0 保住、提示文字逐字相等）；交互：停止留编辑框、警告是/否/取消（Enter=是，Esc=取消，确认前不写）、信息只有确定且确定后写入、showErrorMessage=0 静默放行；选中格画出输入提示框；配置坏时状态栏可见诊断（即使关闭错误警告）。",
+          "files": [
+            "crates/core/src/dv.rs",
+            "crates/core/src/patch.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c07_dv_style.rs",
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/core/tests/fixtures/c07/alerts.xlsx",
+            "scripts/c07_dv_alert_fixture.py"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c07_dv_style -- --test-threads=2 -> 3 passed",
+            "cargo test -p app --offline -j 2 --bin app dv_ -- --test-threads=2 -> 10 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 239 passed",
+            "cargo test -p app --offline -j 2 --test ui_regression -- --test-threads=2 -> 20 passed (101.36s)",
+            "cargo test -p sheetcore --offline -j 2 -- --test-threads=2 -> 79 bins / 731 passed / 0 failed / 9 ignored",
+            "cargo build -p app --offline -j 2 --no-default-features --features glow -> EXIT=0",
+            "GUI: app.exe alerts.xlsx + SC_DV_TRY/SC_SHOT/SC_DUMP 六张截图（提示框、停止、警告、信息、配置诊断、对话框）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-styles.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-prompt.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-stop.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-warning.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-information.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-config-error.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-dialog.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T13:57:51Z"
         },
         {
           "id": "C07.3",

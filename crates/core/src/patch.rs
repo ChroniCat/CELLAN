@@ -487,6 +487,15 @@ pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
             // Excel 语义：showDropDown=1 表示隐藏箭头
             out.push_str(" showDropDown=\"1\"");
         }
+        // 错误样式与提示开关必须显式写：OOXML 里缺省是 0，不写会让 Excel 关掉警告
+        out.push_str(&format!(
+            " showErrorMessage=\"{}\" showInputMessage=\"{}\"",
+            u8::from(d.show_error),
+            u8::from(d.show_prompt)
+        ));
+        if d.error_style != crate::dv::DvStyle::Stop {
+            out.push_str(&format!(" errorStyle=\"{}\"", d.error_style.to_xml()));
+        }
         if !d.error_title.is_empty() {
             out.push_str(&format!(" errorTitle=\"{}\"", esc(&d.error_title)));
         }

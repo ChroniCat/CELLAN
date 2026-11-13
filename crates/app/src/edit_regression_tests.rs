@@ -5772,3 +5772,129 @@ fn modal_dialog_click_does_not_select_grid_behind() {
     click_grid(&mut app, &ctx, pos);
     assert_eq!(app.sel, (2, 2), "对话框关闭后网格点击应恢复正常");
 }
+
+fn dv_rule(style: sheetcore::dv::DvStyle, show_error: bool) -> sheetcore::dv::DataValidation {
+    sheetcore::dv::DataValidation {
+        ranges: vec![(1, 1, 1, 1)],
+        kind: sheetcore::dv::DvKind::Whole,
+        op: sheetcore::dv::DvOp::Between,
+        f1: "1".into(),
+        f2: "10".into(),
+        error_style: style,
+        show_error,
+        error_title: "越界".into(),
+        error_msg: "只能填 1-10".into(),
+        ..Default::default()
+    }
+}
+
+fn app_with_rule(
+    ctx: &egui::Context,
+    style: sheetcore::dv::DvStyle,
+    show_error: bool,
+) -> SheetApp {
+    let mut app = SheetApp::new_with_context(ctx, None);
+    app.wb.sheets[0].dv.push(dv_rule(style, show_error));
+    app.wb.sheets[0].dv_dirty = true;
+    app
+}
+
+#[test]
+fn dv_warning_alert_defers_write_until_yes() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Warning, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "警告样式不能直接写入");
+    assert!(app.dv_alert.is_some(), "应弹出警告框");
+    assert!(app.editing.is_none(), "提示框期间编辑框收起");
+
+    // Enter = 是
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(99.0), "点是后写入");
+    assert!(app.dv_alert.is_none());
+}
+
+#[test]
+fn dv_warning_escape_cancels_entry() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Warning, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert!(app.dv_alert.is_some());
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "取消不写入");
+    assert!(app.dv_alert.is_none());
+    assert!(app.editing.is_none());
+}
+
+#[test]
+fn dv_information_accepts_after_acknowledge() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Information, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "信息框先提示");
+    assert!(app.dv_alert.as_ref().map(|a| a.info_only).unwrap_or(false));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(99.0), "确定后写入");
+    assert!(app.dv_alert.is_none());
+}
+
+#[test]
+fn dv_without_error_alert_writes_silently() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Stop, false);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(
+        app.wb.sheet(0).value(1, 1),
+        Value::Number(99.0),
+        "showErrorMessage=0 时按 Excel 静默放行"
+    );
+    assert!(app.dv_alert.is_none());
+}
+
+#[test]
+fn dv_stop_style_still_keeps_draft() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Stop, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty);
+    assert!(app.editing.is_some(), "停止样式留在编辑框");
+    assert!(app.dv_alert.is_none(), "停止样式不弹框");
+    assert!(app.status.contains("越界"), "{}", app.status);
+}
+
+#[test]
+fn dv_config_error_is_visible_even_without_error_alert() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+        ranges: vec![(1, 1, 1, 1)],
+        kind: sheetcore::dv::DvKind::List,
+        f1: "=不存在名称".into(),
+        show_error: false,
+        ..Default::default()
+    });
+    app.wb.sheets[0].dv_dirty = true;
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("甲".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(
+        app.wb.sheet(0).value(1, 1),
+        Value::Text("甲".into()),
+        "showErrorMessage=0 时不拦输入"
+    );
+    assert!(
+        app.status.contains("数据验证配置无效"),
+        "配置坏了必须能看见诊断：{}",
+        app.status
+    );
+}
