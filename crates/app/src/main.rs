@@ -1053,6 +1053,8 @@ struct SheetApp {
     dedup_dlg: Option<DedupDlg>,
     palette_open: bool,
     palette_q: String,
+    /// 功能区每组实测宽度（上一帧），窄窗口据此折叠分组
+    ribbon_group_w: std::collections::HashMap<String, f32>,
     /// 条件格式管理窗口
     cf_mgr: bool,
     /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
@@ -1802,6 +1804,7 @@ impl SheetApp {
             dedup_dlg: None,
             palette_open: false,
             palette_q: String::new(),
+            ribbon_group_w: std::collections::HashMap::new(),
             cf_mgr: false,
             last_import: None,
             room_lost: false,

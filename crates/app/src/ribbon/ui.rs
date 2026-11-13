@@ -180,8 +180,40 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
     };
     ui_kit::reset_groups();
-    for g in &tab.groups {
+    // UI-13.2：窄窗口把放不下的分组折叠成「组名 ▾」按钮，点开仍能执行全部命令。
+    // 宽度取上一帧实测值；首帧先完整画一遍，第二帧起稳定。
+    let avail = (ui.clip_rect().width() - 24.0).max(200.0);
+    let mut used = 0.0f32;
+    let mut i = 0usize;
+    while i < tab.groups.len() {
+        let g = &tab.groups[i];
+        let known = app.ribbon_group_w.get(&g.id).copied();
+        let w = known.unwrap_or(160.0);
+        if known.is_some() && used + w > avail && used > 0.0 {
+            if avail - used >= 92.0 {
+                ui.menu_button(format!("{} ▾", g.label), |ui| {
+                    nodes(app, ui, &g.children);
+                });
+                used += 84.0;
+                i += 1;
+                continue;
+            }
+            // 连折叠按钮都放不下：剩下的组统一进「更多」，杜绝被裁掉。
+            ui.menu_button("更多 ▾", |ui| {
+                for h in &tab.groups[i..] {
+                    ui.menu_button(&h.label, |ui| {
+                        nodes(app, ui, &h.children);
+                    });
+                }
+            });
+            break;
+        }
+        let x0 = ui.cursor().min.x;
         group(app, ui, g);
+        let w = (ui.cursor().min.x - x0).max(24.0);
+        app.ribbon_group_w.insert(g.id.clone(), w);
+        used += w;
+        i += 1;
     }
     // 原 group_l 的语义：点分组右下角斜箭头 → 打开单元格格式
     if app.fmt_pending {
