@@ -741,16 +741,10 @@ impl SheetApp {
                 self.dv_edit = Some(draft);
             }
             "FilterClear" => {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                sh.filter = None;
-                sh.filter_dirty = true;
-                self.wb.dirty = true;
-                self.status = "已清除筛选".into();
+                self.clear_filter_criteria();
             }
             "FilterReapply" => {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                sh.filter_dirty = true;
-                self.status = "已重新应用筛选".into();
+                self.reapply_filter();
             }
             "HeaderFooter" => self.hf_dlg = true,
             // ---------------------------------------------------- 文本框

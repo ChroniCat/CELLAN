@@ -1,0 +1,30 @@
+UI-18 筛选清除入口语义（2026-11-13 14:40 CST）
+
+问题
+- Ribbon FilterClear 只把 filter 置 None，不清 hidden_rows：条件隐藏行仍隐藏，且筛选箭头消失。
+- 右键“清除筛选”置 None 并清 hidden_rows；工具栏“清除筛选”同样把筛选器整个删掉。
+- 右键“重新应用”错误地调用 start_filter，实际会把筛选关闭。
+- 没有单独的“关闭筛选”入口，清除条件与关闭筛选无法区分。
+
+修改
+- 新增 clear_filter_criteria：保留 Filter、清空 allows/criteria、清空条件隐藏行
+  hidden_rows，不动 hidden_rows_user（手动隐藏行）。
+- 新增 disable_filter：filter=None、清空 hidden_rows，不动 hidden_rows_user；
+  再次点“筛选”开关走该入口。
+- 新增 reapply_filter：按当前条件重新计算 hidden_rows，不动手动隐藏行。
+- Ribbon FilterClear → clear_filter_criteria；FilterReapply → reapply_filter。
+- 数据菜单拆成“清除筛选条件 / 关闭筛选”；右键菜单拆成“清除筛选条件 / 重新应用 /
+  关闭筛选”，三个入口语义一致。
+
+验证
+- edit_regression_tests::filter_clear_keeps_filter_and_manual_hidden_rows：
+  真 Ribbon FilterClear 后 filter 仍在、allows/criteria 空、条件隐藏行恢复、
+  hidden_rows_user 第 5 行仍在；FilterReapply 重新隐藏 10；start_filter 关闭后 filter None。
+- edit_regression_tests::filter_clear_survives_save_reload：
+  清除条件后 xlsx save/load，filter 仍在且条件为空、hidden_rows 空、手动隐藏行保留。
+- 命令：cargo test -p app --offline --bin app filter_clear -> 2 passed；
+  全量 210 passed / 0 failed / 0 ignored，APP_EXIT=0。
+
+未完成
+- 没有真实 Excel/WPS 打开该 xlsx 目视确认箭头形态；没有真实鼠标点三个菜单入口。
+  UI-18 保持待验收，不用单测替代 GUI/Office 验收。

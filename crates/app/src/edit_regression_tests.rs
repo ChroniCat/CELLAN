@@ -3452,6 +3452,84 @@ fn find_dialog_and_results_window_render() {
 }
 
 /// UI-10：Ctrl+F/Ctrl+H 必须分别落到“查找/替换”页签，不能总是查找页。
+/// UI-18：清除条件保留筛选器/箭头，关闭筛选才移除；手动隐藏行走独立集合。
+#[test]
+fn filter_clear_keeps_filter_and_manual_hidden_rows() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let sh = app.wb.sheet_mut(0);
+    sh.set(0, 0, text("Name"));
+    sh.set(0, 1, text("Amount"));
+    sh.set(1, 0, text("A"));
+    sh.set(1, 1, number(10.0));
+    sh.set(2, 0, text("B"));
+    sh.set(2, 1, number(20.0));
+    sh.set(3, 0, text("C"));
+    sh.set(3, 1, number(30.0));
+    let mut f = sheetcore::sort_filter::Filter::new(0, 0, 3, 1);
+    f.criteria.insert(1, sheetcore::sort_filter::Criterion::new(
+        sheetcore::sort_filter::CmpOp::Gt, "15"));
+    sh.filter = Some(f.clone());
+    sh.hidden_rows = f.hidden_rows(sh);
+    sh.hidden_rows_user.insert(5);
+    assert!(sh.hidden_rows.contains(&1), "10 应被条件隐藏");
+
+    app.ribbon_action("FilterClear", &ctx);
+    let sh = app.wb.sheet(0);
+    assert!(sh.filter.is_some(), "清除条件后筛选箭头必须保留");
+    let f = sh.filter.as_ref().unwrap();
+    assert!(f.allows.is_empty() && f.criteria.is_empty());
+    assert!(sh.hidden_rows.is_empty(), "符合条件的所有行都必须恢复");
+    assert!(sh.hidden_rows_user.contains(&5), "手动隐藏行不能被误取消");
+    assert!(app.status.contains("筛选条件"));
+
+    // 重新加条件并用 Ribbon 重新应用；筛选范围含表头，A1 在内。
+    let sh = app.wb.sheet_mut(0);
+    sh.filter.as_mut().unwrap().criteria.insert(1,
+        sheetcore::sort_filter::Criterion::new(sheetcore::sort_filter::CmpOp::Gt, "15"));
+    app.ribbon_action("FilterReapply", &ctx);
+    assert!(app.wb.sheet(0).hidden_rows.contains(&1));
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&5));
+
+    app.sel = (0, 0);
+    app.start_filter();
+    assert!(app.wb.sheet(0).filter.is_none(), "再次点筛选必须关闭并移除箭头");
+    assert!(app.wb.sheet(0).hidden_rows.is_empty());
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&5));
+}
+
+/// UI-18：清除条件后保存/重开，筛选器（箭头）在、条件为空、手动隐藏行仍在。
+#[test]
+fn filter_clear_survives_save_reload() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let sh = app.wb.sheet_mut(0);
+    sh.set(0, 0, text("Name"));
+    sh.set(0, 1, text("Amount"));
+    sh.set(1, 0, text("A"));
+    sh.set(1, 1, number(10.0));
+    sh.set(2, 0, text("B"));
+    sh.set(2, 1, number(20.0));
+    let mut f = sheetcore::sort_filter::Filter::new(0, 0, 2, 1);
+    f.criteria.insert(1, sheetcore::sort_filter::Criterion::new(
+        sheetcore::sort_filter::CmpOp::Gt, "15"));
+    sh.filter = Some(f.clone());
+    sh.hidden_rows = f.hidden_rows(sh);
+    sh.hidden_rows_user.insert(4);
+    app.ribbon_action("FilterClear", &ctx);
+    let tmp = std::env::temp_dir().join(format!("ui18_filter_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    sheetcore::xlsx::save(&tmp, &app.wb).expect("save");
+    let back = sheetcore::xlsx::load(&tmp).expect("load");
+    let _ = std::fs::remove_file(&tmp);
+    let sh = back.sheet(0);
+    assert!(sh.filter.is_some(), "保存重开后筛选箭头应保留");
+    let f = sh.filter.as_ref().unwrap();
+    assert!(f.allows.is_empty() && f.criteria.is_empty());
+    assert!(sh.hidden_rows.is_empty());
+    assert!(sh.hidden_rows_user.contains(&4), "手动隐藏行应随文件保留");
+}
+
 #[test]
 fn ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab() {
     let ctx = egui::Context::default();

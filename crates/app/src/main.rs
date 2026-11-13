@@ -1032,6 +1032,8 @@ enum CtxAct {
     ClearContents,
     ToggleFilter,
     ClearFilter,
+    ReapplyFilter,
+    DisableFilter,
     SortAsc,
     SortDesc,
     SortCustom,
@@ -1202,8 +1204,9 @@ fn ctx_menu_rows(has_filter: bool) -> Vec<CtxRow> {
             Some(crate::ui_icons::Icon::Filter),
             if has_filter {
                 vec![
-                    CtxRow::item("清除筛选", None, "", CtxAct::ClearFilter),
-                    CtxRow::item("重新应用", None, "", CtxAct::ToggleFilter),
+                    CtxRow::item("清除筛选条件", None, "", CtxAct::ClearFilter),
+                    CtxRow::item("重新应用", None, "", CtxAct::ReapplyFilter),
+                    CtxRow::item("关闭筛选", None, "", CtxAct::DisableFilter),
                 ]
             } else {
                 vec![CtxRow::item("筛选", None, "", CtxAct::ToggleFilter)]
@@ -1427,8 +1430,7 @@ impl SheetApp {
             cycles_key: (u64::MAX, u64::MAX),
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
-            name_dropdown: false,
-            chart_sel: None,
+            name_dropdown: false,            chart_sel: None,
             chart_drag: None,
             protect_dlg: None,
             pw_prompt: None,
@@ -14455,16 +14457,21 @@ let txn = self.txn_begin(&keys);
             if ui
                 .add_enabled(
                     self.wb.sheet(self.sheet_idx).filter.is_some(),
-                    egui::Button::new("清除筛选"),
+                    egui::Button::new("清除筛选条件"),
                 )
                 .clicked()
             {
-                let sheet = self.wb.sheet_mut(self.sheet_idx);
-                sheet.filter = None;
-                sheet.hidden_rows.clear();
-                sheet.filter_dirty = true;
-                self.wb.dirty = true;
-                self.status = "已清除筛选".into();
+                self.clear_filter_criteria();
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    self.wb.sheet(self.sheet_idx).filter.is_some(),
+                    egui::Button::new("关闭筛选"),
+                )
+                .clicked()
+            {
+                self.disable_filter();
                 ui.close_menu();
             }
             ui.separator();
@@ -14511,8 +14518,61 @@ let txn = self.txn_begin(&keys);
         }
     }
 
+    /// 只清除筛选条件：保留筛选器（表头箭头仍在），恢复被筛选隐藏的行；
+    /// 手动隐藏的 hidden_rows_user 不能被一并取消。
+    fn clear_filter_criteria(&mut self) -> bool {
+        let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() else {
+            self.status = "当前工作表没有筛选".into();
+            return false;
+        };
+        f.allows.clear();
+        f.criteria.clear();
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        sh.hidden_rows.clear();
+        sh.filter_dirty = true;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = "已清除筛选条件（筛选箭头保留）".into();
+        true
+    }
+
+    /// 关闭筛选：移除筛选器和箭头，只恢复筛选隐藏行，不动手动隐藏行。
+    fn disable_filter(&mut self) -> bool {
+        if self.wb.sheet(self.sheet_idx).filter.is_none() {
+            self.status = "当前工作表没有筛选".into();
+            return false;
+        }
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        sh.filter = None;
+        sh.hidden_rows.clear();
+        sh.filter_dirty = true;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = "已关闭筛选（箭头已移除）".into();
+        true
+    }
+
+    /// 按当前条件重新计算筛选隐藏行，不动手动隐藏行。
+    fn reapply_filter(&mut self) -> bool {
+        let Some(f) = self.wb.sheet(self.sheet_idx).filter.clone() else {
+            self.status = "当前工作表没有筛选".into();
+            return false;
+        };
+        let hidden = f.hidden_rows(self.wb.sheet(self.sheet_idx));
+        let n = {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.hidden_rows = hidden;
+            sh.filter_dirty = true;
+            sh.hidden_rows.len()
+        };
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已重新应用筛选：隐藏 {n} 行");
+        true
+    }
+
     fn start_filter(&mut self) {
-        // 已在这个筛选区域内：再点一次就取消（Excel 的“筛选”是开关）
+        // 已在这个筛选区域内：再点一次就关闭筛选（Excel 的“筛选”是开关）
         let inside = {
             let sh = self.wb.sheet(self.sheet_idx);
             let (r, c) = self.sel;
@@ -14525,12 +14585,7 @@ let txn = self.txn_begin(&keys);
                 .unwrap_or(false)
         };
         if inside {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.filter = None;
-            sh.hidden_rows.clear();
-            sh.filter_dirty = true;
-            self.wb.dirty = true;
-            self.status = "已取消筛选".into();
+            self.disable_filter();
             return;
         }
         let (r, c) = self.sel;
@@ -17814,13 +17869,13 @@ let txn = self.txn_begin(&keys);
             CtxAct::ClearContents => self.clear_values(),
             CtxAct::ToggleFilter => self.start_filter(),
             CtxAct::ClearFilter => {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                sh.filter = None;
-                sh.hidden_rows.clear();
-                sh.filter_dirty = true;
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.status = "已取消筛选".into();
+                self.clear_filter_criteria();
+            }
+            CtxAct::ReapplyFilter => {
+                self.reapply_filter();
+            }
+            CtxAct::DisableFilter => {
+                self.disable_filter();
             }
             CtxAct::SortAsc => self.do_sort(self.sel.1, true),
             CtxAct::SortDesc => self.do_sort(self.sel.1, false),

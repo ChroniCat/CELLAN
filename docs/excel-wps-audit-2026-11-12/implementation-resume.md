@@ -1,8 +1,8 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `cb628f6`（UI-10 查找页签/关闭已提交）；C11 父项已验收。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 9 待验收 / 1 实施中 / 38 待实施；
-  切片 35 已验收 / 20 待验收 / 93 待实施。C11 父项已按用户 14:00 认可翻绿。
+- 分支 `main`（`origin/main`），HEAD `46c32ac`（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
+  切片 35 已验收 / 21 待验收 / 92 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
@@ -395,7 +395,7 @@
 - C22：绘制改为 `cell_text_align`，General 文本左、数字右、布尔/错误居中，显式对齐覆盖；
   专项 1 passed。合成工作簿 SC_SHOT 实测 A1 左、B1 右、C1 中、D1 中、E1/F1/G1 显式
   左/中/右；长文本仍按用户偏好默认裁剪，长文本多情况与 Excel 同位置像素对拍未做，C22 待验收。
-- 当前全量：app **208 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
+- 当前全量：app **210 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
   **75 bins / 678 passed / 0 failed / 41 ignored**。
 - 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
 - 已提交：`e81c221`（`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
@@ -409,4 +409,13 @@
 - 查找对话框“关闭”改为局部 close 意图，末尾 open && !close；名称管理器与加载问题窗口
   的同类末尾覆盖一并修复。
 - 新测试 ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab 通过；全量 app
-  **208 passed / 0 failed / 0 ignored**。真实鼠标关闭/×/Esc 与焦点回落未做，UI-10 待验收。
+  **210 passed / 0 failed / 0 ignored**。真实鼠标关闭/×/Esc 与焦点回落未做，UI-10 待验收。
+
+## 14:40 当前：UI-18 筛选入口语义
+
+- clear_filter_criteria 保留 filter/箭头，只清条件并恢复条件隐藏行；disable_filter 才移除
+  筛选器；reapply_filter 单独重算；hidden_rows_user 手动隐藏行不被清。
+- Ribbon FilterClear/FilterReapply、数据菜单、右键菜单统一到三个方法；右键“清除筛选”
+  不再误删筛选器，“重新应用”不再误关筛选。
+- 专项 2 passed（含 xlsx save/load 后箭头在、条件空、手动隐藏行保留）；全量 app
+  **210 passed / 0 failed / 0 ignored**。真实 Excel/WPS 目视与鼠标入口未做，UI-18 待验收。

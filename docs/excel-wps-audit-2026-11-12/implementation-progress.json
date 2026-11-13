@@ -1757,7 +1757,8 @@
         "cargo test -p app --offline --bin app find_ -> 8 passed",
         "cargo test -p app --offline --bin app ribbon_find_replace_clears_stale_scope_before_replace_all -> 1 passed",
         "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "implementation-evidence/ui05-find-replace.txt",
@@ -1772,7 +1773,7 @@
       "failures": [],
       "blocker": "",
       "next": "补真实键鼠点击查找对话框/取消/结果跳转，以及单次查找可取消；Ribbon 新会话清快照已完成。",
-      "updated_utc": "2026-11-13T06:22:00Z",
+      "updated_utc": "2026-11-13T06:42:00Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -3293,7 +3294,8 @@
       "commands": [
         "cargo test -p app --offline --bin app general_text_alignment_matches_excel_and_explicit_alignment_wins -> 1 passed",
         "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-general-alignment.txt"
@@ -3305,7 +3307,7 @@
       "failures": [],
       "blocker": "",
       "next": "补长文本裁剪/溢出切换截图，并在不干扰现有 Excel 实例的条件下做 Excel 同位置对拍。",
-      "updated_utc": "2026-11-13T06:22:00Z",
+      "updated_utc": "2026-11-13T06:42:00Z",
       "slices": [
         {
           "id": "C22.1",
@@ -4031,7 +4033,8 @@
       ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
-        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt"
@@ -4042,7 +4045,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-      "updated_utc": "2026-11-13T06:24:00Z",
+      "updated_utc": "2026-11-13T06:42:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4621,17 +4624,30 @@
       "scope": "app/main.rs + ribbon/actions.rs筛选",
       "source": "ui-requirements.md",
       "heading": "UI-18 筛选清除入口语义一致",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
-      "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "status": "待验收",
+      "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”，hidden_rows_user 手动隐藏行始终保留。两条专项断言覆盖入口与 xlsx save/load；全量 app 210 passed。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/ribbon/actions.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
+      "commits": [
+        "46c32ac"
+      ],
+      "commands": [
+        "cargo test -p app --offline --bin app filter_clear -> 2 passed",
+        "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt"
+      ],
+      "not_done": [
+        "真实 Excel/WPS 打开保存后的 xlsx 目视确认箭头；真实鼠标点三个菜单入口"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
+      "updated_utc": "2026-11-13T06:47:00Z",
       "slices": [
         {
           "id": "UI-18.1",
@@ -4639,17 +4655,30 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "待验收",
+          "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”，hidden_rows_user 手动隐藏行始终保留。两条专项断言覆盖入口与 xlsx save/load；全量 app 210 passed。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "46c32ac"
+          ],
+          "commands": [
+            "cargo test -p app --offline --bin app filter_clear -> 2 passed",
+            "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt"
+          ],
+          "not_done": [
+            "真实 Excel/WPS 打开保存后的 xlsx 目视确认箭头；真实鼠标点三个菜单入口"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
+          "updated_utc": "2026-11-13T06:47:00Z"
         }
       ]
     },
