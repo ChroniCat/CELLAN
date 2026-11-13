@@ -49,3 +49,11 @@ sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
   该夹具不能作为分页基准，需改用明确 Zoom 且无 FitToPages 的夹具。
 - 曾按“中文默认字体 13.5pt”临时把默认行高改 18px，实测与 Excel 14.25pt 不符，已回退，未提交。
 - `print.xlsx`（Calibri 11）Excel 行高 14.25pt；本项目分页仍差 1–2 行，根因未定，不能靠猜默认行高修。
+
+## 修复：未设置 fitToWidth 的文件被误当“适应一页宽”
+- `PageSetup::default().fit_width` 原为 1，而 `parse_page_setup` 用
+  `fit_to_page = fit_width > 0 || fit_height > 0` 判断；普通文件没有 fitToWidth 属性，
+  于是全部被误判为“1 页宽”，打印被无谓缩小（print.xlsx 从 100% 变成 85.8%）。
+- 默认改为 `fit_width: 0`；单测 `fit_to_page_shrinks_scale` 显式设 `fit_width = 1`。
+- print.xlsx 现在 `fit=false, scale=100`，仍 2 页；Excel 断点 48、本项目 45，
+  行高/可用高度差异仍未定，QA-09.1 继续实施中。

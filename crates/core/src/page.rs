@@ -43,7 +43,8 @@ impl Default for PageSetup {
             paper: 9, // A4
             scale: 100,
             fit_to_page: false,
-            fit_width: 1,
+            // 没有 fitToWidth 属性时不是“适应一页宽”；旧默认 1 会让所有普通文件被误缩放
+            fit_width: 0,
             fit_height: 0,
             margins: [0.7, 0.7, 0.75, 0.75, 0.3, 0.3],
             gridlines: false,
@@ -602,6 +603,7 @@ mod tests {
         let a = ps.scale_factor(&s);
         assert!((a - 1.0).abs() < 0.01, "100% 缩放");
         ps.fit_to_page = true;
+        ps.fit_width = 1;
         let b = ps.scale_factor(&s);
         assert!(b < 1.0, "调整为 1 页宽应缩小: {b}");
         assert!(b > 0.1);
