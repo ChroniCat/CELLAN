@@ -446,60 +446,101 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
     out.lines.push((px0, py0, px0 + pw, py0, 0.5, [120, 120, 120]));
     out.lines.push((px0, py0, px0, py0 + ph, 0.5, [120, 120, 120]));
 
-    let max_v = ch
-        .series
-        .iter()
-        .flat_map(|s| s.vals.iter())
-        .cloned()
-        .fold(0.0f64, f64::max)
-        .max(1e-9);
+    let max_of = |secondary: bool| {
+        ch.series
+            .iter()
+            .filter(|s| s.secondary == secondary)
+            .flat_map(|s| s.vals.iter())
+            .cloned()
+            .fold(0.0f64, f64::max)
+            .max(1e-9)
+    };
+    let max_main = max_of(false);
+    let max_sub = max_of(true);
+    let has_sub = ch.series.iter().any(|s| s.secondary);
     let n = ch.series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
-    match ch.kind {
-        ChartKind::Pie | ChartKind::Doughnut => {
-            let vals = ch.series.first().map(|s| s.vals.clone()).unwrap_or_default();
-            let total: f64 = vals.iter().sum::<f64>().max(1e-9);
-            let cx = px0 + pw / 2.0;
-            let cy = py0 + ph / 2.0;
-            let rad = (pw.min(ph) / 2.0 - 4.0).max(4.0);
-            let mut start = std::f32::consts::FRAC_PI_2;
-            for (i, v) in vals.iter().enumerate() {
-                let sweep = (*v / total) as f32 * std::f32::consts::TAU;
-                let steps = ((sweep / 0.15).ceil() as usize).max(2);
-                let mut pts = vec![(cx, cy)];
-                for k in 0..=steps {
-                    let t = start - sweep * (k as f32 / steps as f32);
-                    pts.push((cx + rad * t.cos(), cy + rad * t.sin()));
+    if matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut) {
+        let vals = ch.series.first().map(|s| s.vals.clone()).unwrap_or_default();
+        let total: f64 = vals.iter().sum::<f64>().max(1e-9);
+        let cx = px0 + pw / 2.0;
+        let cy = py0 + ph / 2.0;
+        let rad = (pw.min(ph) / 2.0 - 4.0).max(4.0);
+        let mut start_a = std::f32::consts::FRAC_PI_2;
+        for (i, v) in vals.iter().enumerate() {
+            let sweep = (*v / total) as f32 * std::f32::consts::TAU;
+            let steps = ((sweep / 0.15).ceil() as usize).max(2);
+            let mut pts = vec![(cx, cy)];
+            for k in 0..=steps {
+                let t = start_a - sweep * (k as f32 / steps as f32);
+                pts.push((cx + rad * t.cos(), cy + rad * t.sin()));
+            }
+            out.polys.push((pts, CHART_COLORS[i % CHART_COLORS.len()]));
+            start_a -= sweep;
+        }
+    } else {
+        // 每个系列按自己的图型画；柱/条系列按柱系列序号并排
+        let bar_slots: Vec<usize> = ch
+            .series
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                let k = series_kind(s, ch.kind);
+                matches!(k, ChartKind::Column | ChartKind::Bar | ChartKind::BarStacked)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let slot_count = bar_slots.len().max(1);
+        let groups = n.max(1);
+        let gw = pw / groups as f32;
+        let bw = (gw * 0.7 / slot_count as f32).max(1.5);
+        for (si, se) in ch.series.iter().enumerate() {
+            let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
+            let scale = if se.secondary { max_sub } else { max_main };
+            match series_kind(se, ch.kind) {
+                ChartKind::Line | ChartKind::Scatter => {
+                    let step = if se.vals.len() > 1 {
+                        pw / (se.vals.len() as f32 - 1.0)
+                    } else {
+                        0.0
+                    };
+                    let pts: Vec<(f32, f32)> = se
+                        .vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (px0 + step * i as f32, py0 + ph * (*v / scale) as f32))
+                        .collect();
+                    if pts.len() >= 2 {
+                        out.polys.push((pts, color));
+                    } else if let Some(p) = pts.first() {
+                        out.rects.push((p.0 - 1.5, p.1 - 1.5, 3.0, 3.0, color));
+                    }
                 }
-                out.polys.push((pts, CHART_COLORS[i % CHART_COLORS.len()]));
-                start -= sweep;
-            }
-        }
-        ChartKind::Line | ChartKind::Scatter => {
-            let step = if n > 0 { pw / (n as f32 - 1.0).max(1.0) } else { pw };
-            for (si, se) in ch.series.iter().enumerate() {
-                let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
-                let pts: Vec<(f32, f32)> = se
-                    .vals
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (px0 + step * i as f32, py0 + ph * (*v / max_v) as f32))
-                    .collect();
-                out.polys.push((pts, color));
-            }
-        }
-        _ => {
-            let groups = n.max(1);
-            let gw = pw / groups as f32;
-            let bw = (gw * 0.7 / ch.series.len().max(1) as f32).max(1.5);
-            for (si, se) in ch.series.iter().enumerate() {
-                let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
-                for (i, v) in se.vals.iter().enumerate() {
-                    let bh = ph * (*v / max_v) as f32;
-                    let bx = px0 + gw * (i as f32 + 0.15) + bw * si as f32;
-                    out.rects.push((bx, py0, bw, bh, color));
+                ChartKind::Area => {
+                    let step = if se.vals.len() > 1 {
+                        pw / (se.vals.len() as f32 - 1.0)
+                    } else {
+                        0.0
+                    };
+                    let mut pts = vec![(px0, py0)];
+                    for (i, v) in se.vals.iter().enumerate() {
+                        pts.push((px0 + step * i as f32, py0 + ph * (*v / scale) as f32));
+                    }
+                    pts.push((px0 + step * (se.vals.len().saturating_sub(1)) as f32, py0));
+                    out.polys.push((pts, color));
+                }
+                _ => {
+                    let slot = bar_slots.iter().position(|i| *i == si).unwrap_or(0);
+                    for (i, v) in se.vals.iter().enumerate() {
+                        let bh = ph * (*v / scale) as f32;
+                        let bx = px0 + gw * (i as f32 + 0.15) + bw * slot as f32;
+                        out.rects.push((bx, py0, bw, bh, color));
+                    }
                 }
             }
         }
+    }
+    if has_sub {
+        out.lines.push((px0 + pw, py0, px0 + pw, py0 + ph, 0.5, [120, 120, 120]));
     }
     if legend_w > 0.0 {
         let mut ly = y + h - 18.0;
@@ -830,5 +871,17 @@ fn fvalue_to_value(v: crate::formula::FValue) -> crate::model::Value {
             .map(|x| fvalue_to_value(x))
             .unwrap_or(Value::Empty),
         FValue::Lambda(_) => Value::Error(crate::formula::ErrKind::Value),
+    }
+}
+
+/// 系列的实际图型：系列自己指定的优先；组合图里没指定时，最后一条按折线、其余按柱
+fn series_kind(se: &crate::charts::Series, chart_kind: crate::charts::ChartKind) -> crate::charts::ChartKind {
+    use crate::charts::ChartKind;
+    if let Some(k) = se.kind {
+        return k;
+    }
+    match chart_kind {
+        ChartKind::Combo => ChartKind::Column,
+        k => k,
     }
 }

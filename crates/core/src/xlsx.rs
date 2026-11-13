@@ -447,6 +447,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         encryption: None,
         dirty: false,
         styles: crate::style::StyleTable::new(),
+        chart_edits: Vec::new(),
     };
 
     // 稀疏表旁路：声明区域大到离谱的表（有人在 A1048576/XFD1048576 留了格子），
@@ -2222,6 +2223,22 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         must_save!("fixups-drawing-props", crate::fixups::sanitize_drawings(path));
         must_save!("fixups-content-types", crate::fixups::ensure_content_types(path, &restore_base));
         must_save!("fixups-threaded", crate::fixups::restore_threaded_parts(path, &restore_base));
+        let chart_keep: Vec<String> = wb
+            .chart_edits
+            .iter()
+            .cloned()
+            .chain(
+                wb.sheets
+                    .iter()
+                    .flat_map(|s| s.charts.iter())
+                    .filter(|c| !c.ref_fixes.is_empty())
+                    .map(|c| c.part.clone()),
+            )
+            .collect();
+        must_save!(
+            "fixups-chart-parts",
+            crate::fixups::restore_chart_parts(path, &restore_base, &chart_keep)
+        );
     }
     // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
     let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb

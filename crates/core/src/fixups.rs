@@ -1481,3 +1481,28 @@ pub fn restore_threaded_parts(path: &Path, base: &Path) -> Result<usize> {
     }
     Ok(restored)
 }
+
+/// umya 重写 `xl/charts/chartN.xml` 会丢它没建模的属性（次轴 numFmt 等）。
+/// 用户没改过、也没因插删行列改过引用的图表，保存后按基准逐字节还原。
+pub fn restore_chart_parts(path: &Path, base: &Path, edited: &[String]) -> Result<usize> {
+    if base == path || !base.exists() {
+        return Ok(0);
+    }
+    let keep: Vec<String> = edited.to_vec();
+    let base_names = parts(base);
+    let saved_names = parts(path);
+    let mut restored = 0;
+    for name in base_names.iter().filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml")) {
+        if keep.iter().any(|k| k == name) || !saved_names.contains(name) {
+            continue;
+        }
+        let want = read_part(base, name)
+            .ok_or_else(|| anyhow::anyhow!("缺部件 {name}"))?;
+        let have = read_part(path, name).unwrap_or_default();
+        if want != have {
+            write_parts(path, &[(name.to_string(), want)])?;
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}

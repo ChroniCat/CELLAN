@@ -49,6 +49,8 @@ pub fn chart_from_selection(
             cat_ref: format!("'{}'!${}${}:${}${}", sheet_name, cat_col, r1 + 2, cat_col, r2 + 1),
             val_ref: format!("'{}'!${}${}:${}${}", sheet_name, range_col, r1 + 2, range_col, r2 + 1),
             color: None,
+            kind: None,
+            secondary: false,
         });
     }
     crate::charts::Chart {

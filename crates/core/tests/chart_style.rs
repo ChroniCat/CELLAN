@@ -15,6 +15,8 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$B$2:$B$3".into(),
                 color: Some([0xE0, 0x4A, 0x2F]),
+                kind: None,
+                secondary: false,
             },
             Series {
                 name: "二季".into(),
@@ -24,6 +26,8 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$C$2:$C$3".into(),
                 color: Some([0x2E, 0x86, 0xC1]),
+                kind: None,
+                secondary: false,
             },
         ],
         legend: true,

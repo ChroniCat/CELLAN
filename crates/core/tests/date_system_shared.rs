@@ -277,6 +277,8 @@ fn chart_values_keep_raw_numbers_when_cells_are_formatted() {
             cat_ref: "S!$A$1:$A$4".into(),
             val_ref: "S!$B$1:$B$4".into(),
             color: None,
+            kind: None,
+            secondary: false,
         }],
         legend: false,
         anchor: (0, 0, 5, 5),

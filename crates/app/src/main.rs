@@ -18915,6 +18915,7 @@ let txn = self.txn_begin(&keys);
                 if let Some(path) = self.wb.path.clone() {
                     match sheetcore::chart_write::replace_chart(&path, &ch.part, &nc) {
                         Ok(()) => {
+                            self.wb.chart_edits.push(ch.part.clone());
                             self.reload_charts();
                             self.status = format!("已改成{}", k.label());
                         }

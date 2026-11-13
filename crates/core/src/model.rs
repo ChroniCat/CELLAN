@@ -569,6 +569,8 @@ pub struct Workbook {
     /// 打开密码设置；另存时继续加密
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     pub dirty: bool,
+    /// 用户在应用里改过图表的部件名（保存时不要按基准还原这些部件）
+    pub chart_edits: Vec<String>,
 }
 
 impl Workbook {
@@ -593,6 +595,7 @@ impl Workbook {
             calc_pending: false,
             calc_pending_sheets: std::collections::BTreeSet::new(),
             dirty: false,
+            chart_edits: Vec::new(),
             styles: crate::style::StyleTable::new(),
         }
     }

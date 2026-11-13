@@ -51,6 +51,10 @@ pub struct Series {
     pub val_ref: String,
     /// 系列颜色（None = 用默认调色板）
     pub color: Option<[u8; 3]>,
+    /// 该系列自己的图型（组合图里柱/线混排）；None = 跟随图表主类型
+    pub kind: Option<ChartKind>,
+    /// 是否画在次坐标轴（axId 与主轴不同）
+    pub secondary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -504,6 +508,10 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut in_f = false;
     let mut saw_bar = false;
     let mut saw_line = false;
+    // 当前 chart 容器（barChart/lineChart…）：类型、axId、起始系列号
+    let mut plot: Option<(ChartKind, Vec<String>, usize)> = None;
+    let mut plot_dir = String::new();
+    let mut containers: Vec<(usize, usize, Vec<String>)> = Vec::new();
 
     loop {
         match r.read_event() {
@@ -511,34 +519,37 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                 let nm = e.name();
                 let name = local(nm.as_ref()).to_string();
                 match name.as_str() {
-                    "barChart" => {
+                    "barChart" | "bar3DChart" => {
                         saw_bar = true;
                         kind.get_or_insert(ChartKind::Column);
+                        plot = Some((ChartKind::Column, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
-                    "bar3DChart" => {
-                        kind.get_or_insert(ChartKind::Column);
-                    }
-                    "lineChart" => {
+                    "lineChart" | "line3DChart" => {
                         saw_line = true;
                         kind.get_or_insert(ChartKind::Line);
-                    }
-                    "line3DChart" => {
-                        kind.get_or_insert(ChartKind::Line);
+                        plot = Some((ChartKind::Line, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
                     "areaChart" => {
                         kind.get_or_insert(ChartKind::Area);
+                        plot = Some((ChartKind::Area, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
-                    "pieChart" => {
+                    "pieChart" | "pie3DChart" => {
                         kind.get_or_insert(ChartKind::Pie);
-                    }
-                    "pie3DChart" => {
-                        kind.get_or_insert(ChartKind::Pie);
+                        plot = Some((ChartKind::Pie, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
                     "doughnutChart" => {
                         kind.get_or_insert(ChartKind::Doughnut);
+                        plot = Some((ChartKind::Doughnut, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
                     "scatterChart" => {
                         kind.get_or_insert(ChartKind::Scatter);
+                        plot = Some((ChartKind::Scatter, Vec::new(), series.len()));
+                        plot_dir.clear();
                     }
                     "ser" => {
                         if cur.is_none() {
@@ -581,6 +592,15 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("val") {
                             bar_dir = crate::model::xml_unescape(&a.value.to_string());
+                            plot_dir = bar_dir.clone();
+                        }
+                    }
+                } else if name == "axId" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("val") {
+                            if let Some(p) = plot.as_mut() {
+                                p.1.push(crate::model::xml_unescape(&a.value.to_string()));
+                            }
                         }
                     }
                 } else if name == "legendPos" {
@@ -603,7 +623,8 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                 let text = buf.trim().to_string();
                 match name {
                     "ser" => {
-                        if let Some(s) = cur.take() {
+                        if let Some(mut s) = cur.take() {
+                            s.kind = plot.as_ref().map(|p| p.0);
                             series.push(s);
                         }
                     }
@@ -622,6 +643,16 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                                 s.val_ref = text.clone();
                             }
                         }
+                    }
+                    "barChart" | "bar3DChart" | "lineChart" | "line3DChart" | "areaChart"
+                    | "pieChart" | "pie3DChart" | "doughnutChart" | "scatterChart" => {
+                        if let Some((mut k, ids, start)) = plot.take() {
+                            if matches!(k, ChartKind::Column) && plot_dir == "bar" {
+                                k = ChartKind::Bar;
+                            }
+                            containers.push((start, series.len(), ids));
+                        }
+                        plot_dir.clear();
                     }
                     "v" => {
                         if let Some(s) = cur.as_mut() {
@@ -654,6 +685,16 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     }
 
     let mut k = kind?;
+    // 次坐标轴：不同 chart 容器用了不同的 axId 对。第一个容器当主轴。
+    if let Some((_, _, primary)) = containers.first() {
+        for (start, end, ids) in containers.iter().skip(1) {
+            if !primary.is_empty() && ids != primary {
+                for se in series.iter_mut().take(*end).skip(*start) {
+                    se.secondary = true;
+                }
+            }
+        }
+    }
     if matches!(k, ChartKind::Column) && bar_dir == "bar" {
         k = ChartKind::Bar;
     }
