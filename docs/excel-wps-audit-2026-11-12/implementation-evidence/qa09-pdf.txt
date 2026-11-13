@@ -32,3 +32,13 @@ sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
 - `print.xlsx` 两页均以标题行 2026 开头（顶端标题行重复），正文行 2..60 完整。
 - `objects2.xlsx` 强制 FitToPages 1×1，仍为 1 页，尚不能验证“对象+跨页标题”同一文件。
 - 未做：图表/文本框矢量目视、隐藏行/筛选数据不打印样本、WPS PDF 导出对拍。
+
+## QA-09.2 追加对拍（对象 + 跨页标题，仍未验收）
+- 新夹具 `work/qa09/objects3.xlsx`：`objects.xlsx` 加 A1「科目报表」、第 20..55 行数据，
+  打印区 A1:D55、顶端标题行 $1:$1、Zoom 100、关闭 FitToPages。
+- 本项目 PDF：2 页；`page_ops_with` 两页 texts 均含「科目报表」各 1 次，
+  第 1 页 Image XObject 1 个；文字提取到 12/18/9 与 201..554 全部数值。
+- Excel COM 导出同一文件只有 1 页（55 行在 13.5pt 行高下放得下），本项目按 19px 默认行高
+  分成 2 页——这是 QA-09.1 同一根因，仍未解决。
+- pdftotext 对 Excel 与本项目 PDF 都无法提取中文（Excel 导出同样只剩数字），
+  因此中文断行/重叠只能靠渲染图，当前无可用 rasterizer；不能据此判过。
