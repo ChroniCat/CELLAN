@@ -4059,7 +4059,8 @@
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "cb628f6"
+        "cb628f6",
+        "e8a52d7"
       ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4094,7 +4095,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "cb628f6"
+            "cb628f6",
+            "e8a52d7"
           ],
           "commands": [
             "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
