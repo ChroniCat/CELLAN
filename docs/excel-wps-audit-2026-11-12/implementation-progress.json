@@ -3957,7 +3957,7 @@
       "failures": [],
       "blocker": "",
       "next": "先验 UI-09.2 视口翻页；继续 UI-09.1 选择/格式快捷键与 UI-09.3 区域内 Tab/Enter。",
-      "updated_utc": "2026-11-13T07:05:00Z",
+      "updated_utc": "2026-11-13T07:08:00Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -3989,7 +3989,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "008b573"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet -> 1 passed",
             "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
@@ -4004,7 +4006,7 @@
           "failures": [],
           "blocker": "",
           "next": "真机窗口用 PageUp/Down 和 Ctrl+Page 复核，随后做 UI-09.1 基本选择/格式快捷键。",
-          "updated_utc": "2026-11-13T07:05:00Z"
+          "updated_utc": "2026-11-13T07:08:00Z"
         },
         {
           "id": "UI-09.3",
@@ -4646,7 +4648,8 @@
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "56f5a80"
+        "56f5a80",
+        "008b573"
       ],
       "commands": [
         "cargo test -p app --offline --bin app filter_clear -> 2 passed",
@@ -4662,7 +4665,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-      "updated_utc": "2026-11-13T07:05:00Z",
+      "updated_utc": "2026-11-13T07:08:00Z",
       "slices": [
         {
           "id": "UI-18.1",
@@ -4678,7 +4681,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "56f5a80"
+            "56f5a80",
+            "008b573"
           ],
           "commands": [
             "cargo test -p app --offline --bin app filter_clear -> 2 passed",
@@ -4693,7 +4697,7 @@
           "failures": [],
           "blocker": "",
           "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-          "updated_utc": "2026-11-13T06:47:00Z"
+          "updated_utc": "2026-11-13T07:08:00Z"
         }
       ]
     },
