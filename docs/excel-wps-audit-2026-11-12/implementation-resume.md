@@ -1,31 +1,65 @@
 # 恢复记录
 
-## 2026-11-14 检查点：C16 打印四切片已实现
+## 2026-11-14 检查点：C19/C20/UI-15.3 完成，监督 C15/C17 缺口关闭
 
-- 分支 `main`，HEAD `f31ce19` 已 push。
-- 台账：已验收 24 / 61；待验收 5（UI-01、C07、C15、C17、C16）；实施中 7；待实施 25。
-- C16（打印/PDF）四个切片全部实现，证据 `implementation-evidence/c16-print-layout.txt`、
-  `c16-objects.txt`：
-  - 新增 `crates/core/src/display.rs`：General 对齐、数字格式、[Red]、合并、折行、
-    垂直对齐、缩进、条件格式叠加，屏幕/预览/PDF 共用；
-  - `print::page_ops` 产 rects/lines/texts/polys/images，PDF 只多字形编码，
-    预览直接画同一份 ops；分页正文从标题之后开始，标题每页重复且不与正文/标题列重叠；
-  - 页眉页脚 `&L/&C/&R`、`&P`、`&N`；单段数字格式负号按 Excel 实测修正（`--987.65`）；
-  - 图片（JPEG DCTDecode / PNG 解 IDAT+过滤器后 FlateDecode）、图表（柱/条/折线/饼 +
-    标题/轴/图例）、文本框（EMU 换算 + 自动换行）；
-  - 修复真实 bug：图表锚点 `<xdr:from><xdr:col>` 解析失败导致锚点全变 (0,0,4,3)、
-    图表压住数据；修复后夹具解析 C1:I15。
-- 测试：sheetcore **766 passed**、app `--bin app` **263 passed**；c16_print 6 条、
-  c16_objects 3 条。PDF 用 pypdfium2 逐页取文本 + 渲染 PNG 核对（表格/图表/图片/文本框无重叠）。
-- Excel 对拍差异如实记录：Excel 在 `print_title_rows=1:2` 与合并标题重叠时，把合并标题
-  挪到第 2 页、并跳过合并换行块；我们按"标题每页重复、正文不重不漏"输出，不复刻该缺陷。
-- GUI 约束继续有效：真实键鼠/IME 未执行（RDP 不可用），C16 及此前四项均留待验收，
-  不用 `SC_*` 注入或截图冒充。
+- 分支 `main`，代码 HEAD `6d59ed7` 已 push（本文件随后单独提交，代码以该 SHA 为准）。
+- 台账（`implementation-progress.json`）：**已验收 24 / 61**、待验收 11、实施中 5、待实施 21。
+  已验收数仍是监督认可的 24，本轮新增只进「待验收」，未自行抬高。
+- 最近测试基线：sheetcore **810 passed**；app `--bin app` **266 passed**；
+  定向 `c19_advanced` 4、`c19_combo` 5、`c19_axes` 7、`c17_dxf_fill` 3、
+  `ui15_style` 3、`ui15_fixture` 1、`data_tools` 9。
+- 单 cargo 规则继续执行：所有命令 `-j 2`、测试 `--test-threads=2`，
+  `.cargo/config.toml build.jobs=2`、`RUST_TEST_THREADS=2` 保留。
+
+### 本轮完成（均待监督复核）
+
+- **C16 打印/PDF**：`display.rs` 共用显示模型、`print::page_ops` 分页/标题/页眉页脚、
+  PDF 图片（JPEG/PNG）、图表/文本框进打印；`c16_print` 6、`c16_objects` 3；HEAD `5fbaf94`。
+- **C18 样式保真**：主题色/tint（`style_theme.rs`）、图案与四边独立边框/对角线（`style_ext.rs`）、
+  quotePrefix 修复（`ensure_quote_prefix`）；Excel/WPS 回读一致。
+- **C21 部件保真**：线程批注/persons 按基准字节恢复；queryTable/customXml 原字节保留；
+  能力矩阵 `capability-matrix.md`；HEAD `34348ff`。
+- **C10 表格**：表头改名同步 `rename_table_column` 与结构化引用；转区域；Excel/WPS 对拍；
+  HEAD `568f325`。
+- **C19 图表**：C19.2 组合图逐系列类型/次轴（`marker=none` 修正）、C19.1 轴格式/散点真实 X/
+  空值占位、C19.3 雷达图 + chartex（瀑布/直方）原图保留与占位；Excel/WPS 类型 81/119/118
+  未降级；HEAD `6a339fb` 之后。
+- **C20 数据工具**：`collate.rs` 用 Windows zh-CN 排序键做拼音序（Excel 实测
+  `陈七,李四,王五,张三,赵六` 一致）；自定义序列排序；分列支持引号/连续分隔符/前导零/
+  日期识别/覆盖二次确认/右移一次/重算/撤销；HEAD `4f7168d`。
+- **UI-15.3**：`CellStyle.double_underline` / `vertical_text` 独立建模，
+  `<u val="double"/>`、`textRotation=255`，绘制两条线与逐字竖排，格式对话框开关；
+  Excel/WPS 回读 `UL=-4119 ORI=-4166`；HEAD `6d59ed7`。
+
+### 监督 04:14 三项缺口（本轮已关闭，父项仍待验收）
+
+1. **C15 Enter/Tab**：`advance_active` 现在逐候选格查 `sel_blocked_at`，
+   全部禁选时原地不动并提示；回归 `keyboard_advance_skips_cells_without_selection_permission`。
+2. **C15 名称框整块**：`rect_sel_blocked(a,b)` 逐格检查（>20 万格按权限位保守判断），
+   `A1:B2` 含锁定格整块拒绝；回归 `name_box_range_rejects_when_any_cell_is_forbidden`。
+3. **C17 对角颜色污染**：`parse_dxfs` 跟踪 `in_font/in_border/in_fill/skip_color`，
+   只有 `<fill>` 内 color 写填充；对角颜色只触发 `dxfs_unsupported` 告警；
+   `c17_dxf_fill` 三条含保存重开 `fill=None`。
+
+### 待监督复核清单（不改回已验收）
+
+UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验收；
+其中 UI-01/C07 的真实键鼠/IME 证据仍缺（RDP 不可用，如实保留缺口）。
+
+### 已知限制/风险
+
+- chartex 高级图种（瀑布/直方/树图/箱线等）只保留原图 + 占位，不能编辑；雷达图无填充与轴刻度。
+- 分列只有分隔符模式；固定宽度、逐列格式未做；日期只认 `yyyy-m-d` / `yyyy/m/d`。
+- 排序无笔画/部首与按行排序。
+- 双下划线只做普通单/双线，会计用 singleAccounting/doubleAccounting 未建模。
+- 条件格式未建模方向（对角/内部）保存会丢，已告警；本次只保证不污染填充。
+- C07.3 键盘下拉真实写入仍未证实（历史探针 B2=None，仅证明下拉可开）。
+- openpyxl 读不到本实现写出的图片，图片验收一律用 Excel COM。
+- 无 `SC_SHOT_EXIT` 时 GUI 不自退（历史 RUN=124），截图须配 `SC_SHOT_FRAMES`+`SC_SHOT_EXIT`。
 
 ## 下一步
 
-1. **C18 样式模型与未知样式保留**（待实施）：先做 C18.1 主题色/tint 解析——读
-   `xl/theme/theme1.xml` 的 `clrScheme`，`<color theme="n" tint="t"/>` 按 tint 公式解析成
-   RGB；保存时保留原始 theme/tint 属性，不能降级成 rgb。再评估图案填充与复杂边框。
-2. QA-06 公式语义矩阵（纯核心，可与 C18 并行排期）。
-3. 需要真实输入/IME 的项（UI-01、QA-04、UI-11、UI-24…）等可用桌面会话，不伪造。
+1. C12 透视多字段（C12.2/C12.3/C12.4）：字段面板、多行/多列/多值、两款 Office 可编辑往返。
+2. QA-01.3 扩展图表/透视/打印夹具，补齐三方 runner 的 manifest。
+3. UI-09 键盘导航剩余切片、UI-16 标签管理复核；UI-15 其余切片收尾。
+4. 需要真实输入/IME 的项（UI-01、QA-04、UI-11、UI-24…）等可用桌面会话，不伪造。
