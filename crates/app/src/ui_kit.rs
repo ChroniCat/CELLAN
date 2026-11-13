@@ -910,6 +910,11 @@ pub struct Dlg {
     anchor: Option<(egui::Align2, [f32; 2])>,
 }
 
+/// UI-13.3：窗口宽度不超过可用屏幕（左右各留 8px），避免小窗口下对话框被裁掉。
+pub fn dialog_width(width: f32, screen: egui::Rect) -> f32 {
+    width.clamp(200.0, (screen.width() - 16.0).max(200.0))
+}
+
 pub fn window(_ctx: &egui::Context, title: impl Into<String>, width: f32) -> Dlg {
     Dlg {
         title: title.into(),
@@ -973,9 +978,12 @@ impl Dlg {
                 );
                 p.min + egui::vec2(off[0], off[1])
             });
-        let mut w = ctx
+        let w = ctx
             .data(|d| d.get_temp::<f32>(id.with("w")))
             .unwrap_or(self.width);
+        let mut w = dialog_width(w, screen);
+        pos.x = pos.x.clamp(screen.left() + 4.0, (screen.right() - w - 4.0).max(screen.left() + 4.0));
+        pos.y = pos.y.clamp(screen.top() + 4.0, (screen.bottom() - 40.0).max(screen.top() + 4.0));
         let mut h = ctx
             .data(|d| d.get_temp::<f32>(id.with("h")))
             .unwrap_or(self.height);

@@ -5037,7 +5037,7 @@
       "scope": "app/ribbon/ui.rs, ui_kit.rs, main.rs标题布局",
       "source": "ui-requirements.md",
       "heading": "UI-13 小窗口与高DPI的Ribbon自适应",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5047,7 +5047,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T21:27:03Z",
       "slices": [
         {
           "id": "UI-13.1",
@@ -5091,17 +5091,24 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-13 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/ui_kit.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-dialog.txt"
+          ],
+          "not_done": [
+            "真实 100/125/150% DPI 未逐档目视"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:27:03Z"
         }
       ]
     },

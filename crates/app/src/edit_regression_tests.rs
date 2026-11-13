@@ -6921,6 +6921,15 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
     assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "编号", "标题保留");
 }
 
+/// UI-13.3：对话框宽度在小窗口内收缩，大屏保持原宽。
+#[test]
+fn dialog_width_fits_small_viewport() {
+    let small = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 640.0));
+    assert_eq!(crate::ui_kit::dialog_width(520.0, small), 344.0);
+    let big = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+    assert_eq!(crate::ui_kit::dialog_width(520.0, big), 520.0);
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();
