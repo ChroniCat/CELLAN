@@ -225,8 +225,10 @@ pub struct Out {
     pub rects: Vec<(f32, f32, f32, f32, [u8; 3])>,
     pub lines: Vec<(f32, f32, f32, f32, f32, [u8; 3])>,
     pub texts: Vec<TextOp>,
-    /// 图片：(x, y, w, h, 部件名或内存键)
-    pub images: Vec<(f32, f32, f32, f32, ImageRef)>,
+    /// 图片：(x, y, w, h, 名字, 原始字节, 扩展名)
+    pub images: Vec<(f32, f32, f32, f32, String, Vec<u8>, String)>,
+    /// 填充多边形（图表饼图/折线区域）
+    pub polys: Vec<(Vec<(f32, f32)>, [u8; 3])>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,14 +241,6 @@ pub struct TextOp {
     pub bold: bool,
     pub italic: bool,
     pub rotation: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ImageRef {
-    /// 打开文件里的 `xl/media/...`
-    Part(String),
-    /// 本会话插入的图片（PNG/JPEG 原始字节）
-    Data(std::sync::Arc<Vec<u8>>, String),
 }
 
 /// 每张表算一次条件格式的统计量，供逐格 overlay 使用
@@ -386,12 +380,235 @@ fn draw_view(
     }
 }
 
+/// 对象锚点换算：把 (r1,c1,r2,c2) 的格范围换成纸上的 pt 矩形（左上角）
+fn grid_rect(
+    sheet: &Sheet,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    sx: f32,
+    sy: f32,
+    px: f32,
+) -> (f32, f32, f32, f32) {
+    let x: f32 = (0..c1).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx;
+    let y_top: f32 = (0..r1).map(|r| sheet.rows.size(r) * px).sum::<f32>();
+    let w: f32 = (c1..=c2.max(c1)).map(|c| sheet.cols.size(c) * px).sum();
+    let h: f32 = (r1..=r2.max(r1)).map(|r| sheet.rows.size(r) * px).sum();
+    (x, sy - y_top - h, w, h)
+}
+
+const CHART_COLORS: [[u8; 3]; 6] = [
+    [68, 114, 196],
+    [237, 125, 49],
+    [165, 165, 165],
+    [255, 192, 0],
+    [91, 155, 213],
+    [112, 173, 71],
+];
+
+fn chart_text(out: &mut Out, x: f32, y: f32, size: f32, text: &str, color: [u8; 3]) {
+    out.texts.push(TextOp {
+        x,
+        baseline: y,
+        size,
+        text: text.to_string(),
+        color,
+        bold: false,
+        italic: false,
+        rotation: 0.0,
+    });
+}
+
+/// 图表：柱/条形/折线/饼。预览与 PDF 共用同一套矩形/折线指令。
+fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f32, out: &mut Out) {
+    use crate::charts::ChartKind;
+    let (a, b, c, d) = ch.anchor;
+    let (x, y, w, h) = grid_rect(sheet, a, b, c, d, sx, sy, px);
+    if w < 20.0 || h < 20.0 {
+        return;
+    }
+    out.rects.push((x, y, w, h, [255, 255, 255]));
+    out.lines.push((x, y, x + w, y, 0.6, [180, 180, 180]));
+    out.lines.push((x, y + h, x + w, y + h, 0.6, [180, 180, 180]));
+    out.lines.push((x, y, x, y + h, 0.6, [180, 180, 180]));
+    out.lines.push((x + w, y, x + w, y + h, 0.6, [180, 180, 180]));
+
+    let mut top = y + h - 6.0;
+    if !ch.title.is_empty() {
+        let tw = display::text_width(&ch.title, 10.0);
+        chart_text(out, x + (w - tw) / 2.0, top, 10.0, &ch.title, [40, 40, 40]);
+        top -= 14.0;
+    }
+    let legend_w = if ch.legend || !ch.legend_pos.is_empty() { 62.0f32 } else { 0.0 };
+    let plot = (x + 34.0, y + 18.0, (w - 44.0 - legend_w).max(20.0), (top - y - 24.0).max(20.0));
+    let (px0, py0, pw, ph) = plot;
+    out.lines.push((px0, py0, px0 + pw, py0, 0.5, [120, 120, 120]));
+    out.lines.push((px0, py0, px0, py0 + ph, 0.5, [120, 120, 120]));
+
+    let max_v = ch
+        .series
+        .iter()
+        .flat_map(|s| s.vals.iter())
+        .cloned()
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    let n = ch.series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
+    match ch.kind {
+        ChartKind::Pie | ChartKind::Doughnut => {
+            let vals = ch.series.first().map(|s| s.vals.clone()).unwrap_or_default();
+            let total: f64 = vals.iter().sum::<f64>().max(1e-9);
+            let cx = px0 + pw / 2.0;
+            let cy = py0 + ph / 2.0;
+            let rad = (pw.min(ph) / 2.0 - 4.0).max(4.0);
+            let mut start = std::f32::consts::FRAC_PI_2;
+            for (i, v) in vals.iter().enumerate() {
+                let sweep = (*v / total) as f32 * std::f32::consts::TAU;
+                let steps = ((sweep / 0.15).ceil() as usize).max(2);
+                let mut pts = vec![(cx, cy)];
+                for k in 0..=steps {
+                    let t = start - sweep * (k as f32 / steps as f32);
+                    pts.push((cx + rad * t.cos(), cy + rad * t.sin()));
+                }
+                out.polys.push((pts, CHART_COLORS[i % CHART_COLORS.len()]));
+                start -= sweep;
+            }
+        }
+        ChartKind::Line | ChartKind::Scatter => {
+            let step = if n > 0 { pw / (n as f32 - 1.0).max(1.0) } else { pw };
+            for (si, se) in ch.series.iter().enumerate() {
+                let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
+                let pts: Vec<(f32, f32)> = se
+                    .vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (px0 + step * i as f32, py0 + ph * (*v / max_v) as f32))
+                    .collect();
+                out.polys.push((pts, color));
+            }
+        }
+        _ => {
+            let groups = n.max(1);
+            let gw = pw / groups as f32;
+            let bw = (gw * 0.7 / ch.series.len().max(1) as f32).max(1.5);
+            for (si, se) in ch.series.iter().enumerate() {
+                let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
+                for (i, v) in se.vals.iter().enumerate() {
+                    let bh = ph * (*v / max_v) as f32;
+                    let bx = px0 + gw * (i as f32 + 0.15) + bw * si as f32;
+                    out.rects.push((bx, py0, bw, bh, color));
+                }
+            }
+        }
+    }
+    if legend_w > 0.0 {
+        let mut ly = y + h - 18.0;
+        for (i, se) in ch.series.iter().enumerate().take(6) {
+            let color = se.color.unwrap_or(CHART_COLORS[i % CHART_COLORS.len()]);
+            out.rects.push((x + w - legend_w + 4.0, ly, 8.0, 8.0, color));
+            chart_text(out, x + w - legend_w + 16.0, ly + 7.0, 7.5, &se.name, [60, 60, 60]);
+            ly -= 12.0;
+        }
+    }
+    if !ch.axis_y.is_empty() {
+        chart_text(out, x + 2.0, y + h - 16.0, 7.5, &ch.axis_y, [80, 80, 80]);
+    }
+    if !ch.axis_x.is_empty() {
+        chart_text(out, x + w / 2.0 - 10.0, y + 10.0, 7.5, &ch.axis_x, [80, 80, 80]);
+    }
+}
+
+/// 图片/图表/文本框：只画在包含其锚点的那一页
+fn draw_objects(
+    sheet: &Sheet,
+    span: &PageSpan,
+    sx: f32,
+    sy: f32,
+    px: f32,
+    source: Option<&Path>,
+    out: &mut Out,
+) {
+    let contains = |r: u32, c: u32| {
+        r >= span.rows.0 && r <= span.rows.1 && c >= span.cols.0 && c <= span.cols.1
+    };
+    for pic in &sheet.pictures {
+        let (r1, c1, r2, c2) = pic.rect;
+        if !contains(r1, c1) {
+            continue;
+        }
+        let bytes = match &pic.data {
+            Some(d) => Some(d.clone()),
+            None => source.and_then(|p| crate::pic::read_part(p, &pic.part)),
+        };
+        let Some(bytes) = bytes else { continue };
+        let (x, y, w, h) = grid_rect(sheet, r1, c1, r2, c2, sx, sy, px);
+        let stem = Path::new(&pic.part)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "pic".into());
+        let name: String = format!(
+            "Im{}",
+            stem.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()
+        );
+        out.images.push((x, y, w, h, name, bytes, pic.ext.clone()));
+    }
+    for ch in &sheet.charts {
+        if contains(ch.anchor.0, ch.anchor.1) {
+            draw_chart(sheet, ch, sx, sy, px, out);
+        }
+    }
+    for tb in &sheet.textboxes {
+        let (c1, dx1, r1, dy1) = tb.from;
+        let (c2, dx2, r2, dy2) = tb.to;
+        if !contains(r1, c1) {
+            continue;
+        }
+        const EMU_PX: f32 = 9525.0;
+        let x = (0..c1).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx + dx1 as f32 / EMU_PX * px;
+        let y_top = (0..r1).map(|r| sheet.rows.size(r) * px).sum::<f32>() + dy1 as f32 / EMU_PX * px;
+        let x2 = (0..c2).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx + dx2 as f32 / EMU_PX * px;
+        let y2 = (0..r2).map(|r| sheet.rows.size(r) * px).sum::<f32>() + dy2 as f32 / EMU_PX * px;
+        let w = (x2 - x).max(8.0);
+        let h = (y2 - y_top).max(8.0);
+        let yy = sy - y_top - h;
+        if let Some(fill) = tb.fill {
+            out.rects.push((x, yy, w, h, fill));
+        }
+        let size = tb.size.max(4.0);
+        let mut ty = yy + h - size;
+        for line in display::wrap_lines(&tb.text, (w - 4.0).max(4.0), size) {
+            out.texts.push(TextOp {
+                x: x + 2.0,
+                baseline: ty,
+                size,
+                text: line,
+                color: tb.color,
+                bold: tb.bold,
+                italic: tb.italic,
+                rotation: 0.0,
+            });
+            ty -= size * 1.2;
+        }
+    }
+}
+
 /// 生成一页的绘制指令（预览直接复用；PDF 再把文字编码成字形号）
 pub fn page_ops(
     wb: &Workbook,
     sheet_idx: usize,
     layout: &Layout,
     page_index: usize,
+) -> Out {
+    page_ops_with(wb, sheet_idx, layout, page_index, None)
+}
+
+/// 同上；`source` 是打开的工作簿路径，用来读取文件里的图片部件
+pub fn page_ops_with(
+    wb: &Workbook,
+    sheet_idx: usize,
+    layout: &Layout,
+    page_index: usize,
+    source: Option<&Path>,
 ) -> Out {
     let sheet = &wb.sheets[sheet_idx];
     let setup = &sheet.page;
@@ -529,6 +746,7 @@ pub fn page_ops(
             });
         }
     }
+    draw_objects(sheet, span, body_x0, y, px, source, &mut out);
     let _ = (pw, mb);
     out
 }
@@ -540,6 +758,17 @@ pub fn export_pdf(
     path: &Path,
     font_path: &Path,
 ) -> Result<usize> {
+    export_pdf_from(wb, sheet_idx, path, font_path, None)
+}
+
+/// 导出 PDF，并从 `source` 读取 xl/media 里的图片部件
+pub fn export_pdf_from(
+    wb: &Workbook,
+    sheet_idx: usize,
+    path: &Path,
+    font_path: &Path,
+    source: Option<&Path>,
+) -> Result<usize> {
     let Some(sheet) = wb.sheets.get(sheet_idx) else {
         anyhow::bail!("没有第 {sheet_idx} 张表");
     };
@@ -549,12 +778,21 @@ pub fn export_pdf(
     for (pi, _) in layout.pages.iter().enumerate() {
         let (pw, ph) = layout.page_size;
         doc.add_page(pw, ph);
-        let out = page_ops(wb, sheet_idx, &layout, pi);
+        let out = page_ops_with(wb, sheet_idx, &layout, pi, source);
         for (x, y, w, h, color) in out.rects {
             doc.page_mut().rect_fill(x, y, w, h, color);
         }
         for (x1, y1, x2, y2, lw, color) in out.lines {
             doc.page_mut().line(x1, y1, x2, y2, lw, color);
+        }
+        for (pts, color) in out.polys {
+            doc.page_mut().poly(&pts, color, true);
+        }
+        for (x, y, w, h, name, bytes, ext) in out.images {
+            if let Some(img) = crate::image_embed::make(&name, &ext, &bytes) {
+                let name = doc.add_image(img);
+                doc.page_mut().image(&name, x, y, w, h);
+            }
         }
         let encoded: Vec<(TextOp, String)> = {
             let font = doc.font();

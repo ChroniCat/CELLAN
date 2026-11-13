@@ -368,8 +368,10 @@ fn extract_cell(chunk: &str, tag: &str) -> Option<(u32, u32)> {
     })?;
     let start = open.0 + open.1.len();
     // 取到配对的结束标签，而不是下一个 '<'（那会是第一个子元素）
-    let end_pat = format!("</{tag}>");
-    let close = chunk[start..].find(&end_pat)? + start;
+    // 结束标签同样可能带 xdr: 前缀
+    let close = ["</xdr:", "</"]
+        .iter()
+        .find_map(|p| chunk[start..].find(&format!("{p}{tag}>")).map(|i| i + start))?;
     let body = &chunk[start..close];
     let col = tag_value(body, "col")?;
     let row = tag_value(body, "row")?;
@@ -377,9 +379,11 @@ fn extract_cell(chunk: &str, tag: &str) -> Option<(u32, u32)> {
 }
 
 fn tag_value(body: &str, tag: &str) -> Option<u32> {
-    let pat = format!("<{tag}>");
-    let i = body.find(&pat)?;
-    let start = i + pat.len();
+    // 子元素可能写成 <col> 或 <xdr:col>
+    let pat = ["<xdr:", "<"]
+        .iter()
+        .find_map(|p| body.find(&format!("{p}{tag}>")).map(|i| (i, p.to_string())))?;
+    let start = pat.0 + pat.1.len() + tag.len() + 1;
     let end = body[start..].find('<')? + start;
     body[start..end].trim().parse().ok()
 }

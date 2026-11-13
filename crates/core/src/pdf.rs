@@ -271,6 +271,35 @@ impl Page {
         ));
     }
 
+    /// 画一张已注册的图（名字来自 `Doc::add_image`）
+    pub fn image(&mut self, name: &str, x: f32, y: f32, w: f32, h: f32) {
+        self.ops.push_str(&format!(
+            "q {w:.2} 0 0 {h:.2} {x:.2} {y:.2} cm /{name} Do Q
+"
+        ));
+    }
+
+    /// 任意折线/多边形：闭合时用于饼图扇区填充
+    pub fn poly(&mut self, pts: &[(f32, f32)], rgb: [u8; 3], fill: bool) {
+        if pts.len() < 2 {
+            return;
+        }
+        self.ops.push_str(&format!(
+            "{:.3} {:.3} {:.3} rg 0 0 0 RG {:.2} {:.2} m ",
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0,
+            pts[0].0,
+            pts[0].1
+        ));
+        for p in &pts[1..] {
+            self.ops.push_str(&format!("{:.2} {:.2} l ", p.0, p.1));
+        }
+        self.ops.push_str(if fill { "h f
+" } else { "S
+" });
+    }
+
     /// 把字符串转成字形号 hex
     pub fn glyph_hex(font: &Font, s: &str) -> String {
         let mut out = String::with_capacity(s.len() * 4);
@@ -285,11 +314,37 @@ impl Page {
 pub struct Doc {
     pub pages: Vec<Page>,
     font: Font,
+    /// 已注册的图片：名字 → 要写进 PDF 的 XObject
+    pub images: Vec<PdfImage>,
+}
+
+/// 一张要嵌进 PDF 的位图
+#[derive(Clone, Debug)]
+pub struct PdfImage {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// 1 = 灰度，3 = RGB
+    pub colors: u8,
+    /// DCT（JPEG 原始字节）或 Flate（压缩后的 RGB 原始字节）
+    pub dct: bool,
+    pub data: Vec<u8>,
 }
 
 impl Doc {
     pub fn new(font: Font) -> Self {
-        Self { pages: Vec::new(), font }
+        Self { pages: Vec::new(), font, images: Vec::new() }
+    }
+
+    /// 注册一张图，返回内容流里用的名字（同名只注册一次）
+    pub fn add_image(&mut self, img: PdfImage) -> String {
+        if let Some(old) = self.images.iter().find(|x| x.name == img.name) {
+            let _ = old;
+            return img.name;
+        }
+        let name = img.name.clone();
+        self.images.push(img);
+        name
     }
 
     pub fn font(&self) -> &Font {
@@ -413,10 +468,22 @@ impl Doc {
             obj(&mut out, &mut offsets, body);
         }
 
+        let image_base = 8 + n_pages * 2;
+        let xobjects: String = if self.images.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = self
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, im)| format!("/{} {} 0 R", im.name, image_base + i))
+                .collect();
+            format!(" /XObject << {} >>", items.join(" "))
+        };
         for (i, p) in self.pages.iter().enumerate() {
             let content_id = page_ids[i] + 1;
             let body = format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F1 3 0 R >>{xobjects} >> /Contents {content_id} 0 R >>",
                 p.width, p.height
             );
             obj(&mut out, &mut offsets, body.into_bytes());
@@ -429,6 +496,28 @@ impl Doc {
         if self.pages.is_empty() {
             // 至少给一张空白页，避免生成非法 PDF
             let body = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> >>".to_vec();
+            obj(&mut out, &mut offsets, body);
+        }
+
+        for im in self.images.iter() {
+            let filter = if im.dct {
+                "/Filter /DCTDecode".to_string()
+            } else {
+                "/Filter /FlateDecode".to_string()
+            };
+            let cs = if im.colors == 1 { "/DeviceGray" } else { "/DeviceRGB" };
+            let mut body = format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {cs} /BitsPerComponent 8 {filter} /Length {} >>
+stream
+",
+                im.width,
+                im.height,
+                im.data.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(&im.data);
+            body.extend_from_slice(b"
+endstream");
             obj(&mut out, &mut offsets, body);
         }
 

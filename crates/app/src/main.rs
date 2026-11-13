@@ -5073,7 +5073,7 @@ impl SheetApp {
             let layout = sheetcore::print::paginate(sheet, &sheet.page);
             let total = layout.pages.len().max(1);
             let page_no = self.preview_page.min(total - 1);
-            let ops = sheetcore::print::page_ops(&self.wb, self.sheet_idx, &layout, page_no);
+            let ops = sheetcore::print::page_ops_with(&self.wb, self.sheet_idx, &layout, page_no, self.wb.path.as_deref());
             (layout, ops, page_no, total)
         };
         let span = layout
@@ -5216,7 +5216,7 @@ impl SheetApp {
                 .unwrap_or(0)
         ));
         let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &path, font) {
+        match sheetcore::print::export_pdf_from(&self.wb, self.sheet_idx, &path, font, self.wb.path.as_deref()) {
             Ok(_) => {
                 let p = path.to_string_lossy().to_string();
                 let r = std::process::Command::new("powershell")
@@ -5244,7 +5244,7 @@ impl SheetApp {
             return;
         };
         let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &path, font) {
+        match sheetcore::print::export_pdf_from(&self.wb, self.sheet_idx, &path, font, self.wb.path.as_deref()) {
             Ok(_) => self.status = format!("已导出 {}", path.display()),
             Err(e) => self.status = format!("导出失败：{e:#}"),
         }
@@ -18625,7 +18625,7 @@ let txn = self.txn_begin(&keys);
             self.status = "找不到 C:/Windows/Fonts/simhei.ttf，无法导出 PDF".into();
             return;
         }
-        match sheetcore::print::export_pdf(&self.wb, self.sheet_idx, &out, font) {
+        match sheetcore::print::export_pdf_from(&self.wb, self.sheet_idx, &out, font, self.wb.path.as_deref()) {
             Ok(n) => self.status = format!("已导出 {n} 页到 {}", out.display()),
             Err(e) => self.status = format!("导出失败：{e:#}"),
         }

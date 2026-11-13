@@ -1,0 +1,65 @@
+# C16.3 图片 / 图表 / 文本框进打印与 PDF
+
+日期：2026-11-14
+夹具：`crates/core/tests/fixtures/c16/objects.xlsx`（Excel 16.0 生成，`scripts/c16_objects_fixture.ps1`）
+数据 A1:B5，图表 C1:I15（簇状柱形），PNG 图片 A26:C30，文本框 A33:F38，打印区域 A1:H40。
+
+## 实现
+
+- `print::page_ops_with(..., source)`：把 `sheet.pictures / charts / textboxes` 转成同一份
+  绘制指令（rects/lines/texts/polys/images），只画在包含锚点的页上；
+- 图片：内存 `data` 优先，否则用 `pic::read_part(source, part)` 从 xl/media 读；
+- `pdf::Page::image/poly` + `pdf::Doc::add_image`：图片写成 `/XObject /Subtype /Image`，
+  JPEG 直接 `DCTDecode`，PNG 用 flate2 解 IDAT 并按 5 种过滤器还原为 RGB 再 `FlateDecode`
+  （RGBA 按白底合成）；饼图扇区用多边形填充；
+- 图表：柱/条/折线/面积/饼/圆环都按系列值缩放画在锚点矩形里，带标题、坐标轴、图例；
+- 文本框：EMU 偏移换算成 pt，背景填充 + 自动换行文字，颜色/粗斜体沿用文本框属性；
+- 应用导出时把 `wb.path` 作为 source 传入，预览同样传，保证打开文件里的图片也能出现。
+
+## 顺带修掉的真 bug：图表锚点解析
+
+`charts::parse_drawing_anchors` 的 `extract_cell` / `tag_value` 只认不带前缀的
+`<from><col>`，而 Excel 写的是 `<xdr:from><xdr:col>`，导致每个图表都退化成 (0,0,4,3)，
+打印时图表压在 A1:D5 数据上。修复后本夹具解析为 `(0, 2, 14, 8)` = C1:I15，与 Excel 一致。
+
+## 验证
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c16_objects -- --test-threads=2
+objects_are_parsed_from_the_excel_fixture ... ok   （含 anchor=(0,2,14,8)）
+page_ops_emit_picture_chart_and_textbox ... ok
+pdf_embeds_images_and_object_text ... ok
+test result: ok. 3 passed
+```
+
+PDF 结构：`/Subtype /Image`、`/FlateDecode`、页面资源 `/XObject` 均在；`bytes > 8000`。
+pypdfium2 渲染（scale=2，1191×1684）后目视核对：
+
+```text
+表格在左上；图表在右上（C1:I15），不覆盖数据；
+图片 A26:C30 带红色折线；文本框一行「打印文本框：图表与图片要和预览一致」；
+无重叠、无错位。
+```
+
+像素抽样：我们 blue≈9286（图表柱 + 图片边框）、red≈199（图片折线）；
+Excel 自己导出的同页 blue≈3115（柱形更细）——两者图表样式本来就不同（Excel 默认主题），
+这里比的是「对象出现、位置正确、不与单元内容重叠」，不是像素等同。
+
+无界面预览探针（不是交互验收）：
+
+```text
+SC_PREVIEW=1 → [preview] page=1/1 rows=(0, 39) cols=(0, 7) scale=0.86 paper=595x842
+截图 work/goal-logs/gui/c16-objects-preview.png
+```
+
+## 全量回归
+
+```text
+sheetcore 766 passed / 0 failed
+app --bin app 263 passed / 0 failed
+```
+
+## 状态
+
+C16.3 → 待验收。C16 的四个切片均已有实现与证据；真实键鼠点「打印预览/导出 PDF」
+在本机 RDP 不可用时未执行，按监督要求留待验收，不以 SC_* 注入或截图冒充。

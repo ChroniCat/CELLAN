@@ -26,6 +26,7 @@ pub mod page;
 pub mod patch;
 pub mod pdf;
 pub mod display;
+pub mod image_embed;
 pub mod print;
 pub mod protection;
 pub mod cells;
