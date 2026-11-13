@@ -43,6 +43,7 @@ pub mod consolidate;
 pub mod a11y;
 pub mod richtext;
 pub mod pivot;
+pub mod pivot_multi;
 pub mod refs;
 pub mod sheet_ops;
 pub mod pivot_xml;

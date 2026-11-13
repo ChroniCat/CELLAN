@@ -1072,6 +1072,10 @@ struct SheetApp {
     chart_mgr: bool,
     /// 透视表草稿
     pivot_edit: Option<sheetcore::pivot::PivotSpec>,
+    /// 多字段透视：编辑中的规格与输出锚点
+    pivot2_edit: Option<(sheetcore::pivot_multi::PivotSpec2, (u32, u32))>,
+    /// 最近一次多字段透视（表, 规格, 占用区域），刷新用
+    pivot2_last: Option<(usize, sheetcore::pivot_multi::PivotSpec2, (u32, u32, u32, u32))>,
     /// 透视表是否生成真正的 pivotTable 部件
     pivot_real: bool,
     /// 并排比较的第二个工作簿 + 表序号 + 滚动
@@ -1740,6 +1744,8 @@ impl SheetApp {
             chart_reload_src: false,
             chart_mgr: false,
             pivot_edit: None,
+            pivot2_edit: None,
+            pivot2_last: None,
             pivot_real: true,
             compare: {
                 let mut c = None;
@@ -19378,6 +19384,11 @@ let txn = self.txn_begin(&keys);
                         if ui_kit::secondary_button(ui, "取消").clicked() {
                             cancel = true;
                         }
+                        if ui_kit::secondary_button(ui, "多字段…").clicked() {
+                            let sp2 = sheetcore::pivot_multi::PivotSpec2::from_legacy(&spec);
+                            self.pivot2_edit = Some((sp2, self.sel));
+                            cancel = true;
+                        }
                         if ui_kit::primary_button(ui, "生成").clicked() {
                             apply = true;
                         }
@@ -19393,6 +19404,289 @@ let txn = self.txn_begin(&keys);
             self.generate_pivot(&spec);
         } else if !cancel && open {
             self.pivot_edit = Some(spec);
+        }
+    }
+
+    /// 清旧区域 → 重算 → 写网格 → 记录可刷新位置。
+    fn apply_pivot2(
+        &mut self,
+        spec: &sheetcore::pivot_multi::PivotSpec2,
+        pos: (u32, u32),
+        clear: Option<(u32, u32, u32, u32)>,
+        refresh: bool,
+    ) -> (u32, u32, u32, u32) {
+        if let Some(rect) = clear {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            for r in rect.0..=rect.2 {
+                for c in rect.1..=rect.3 {
+                    sh.remove(r, c);
+                }
+            }
+        }
+        let grid = sheetcore::pivot_multi::compute(self.wb.sheet(self.sheet_idx), spec);
+        let rect = sheetcore::pivot_multi::write_grid(self.wb.sheet_mut(self.sheet_idx), pos, &grid);
+        self.pivot2_last = Some((self.sheet_idx, spec.clone(), rect));
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "多字段透视已{}：{} 行 × {} 列（{} 个值字段）",
+            if refresh { "刷新" } else { "生成" },
+            rect.2 - rect.0 + 1,
+            rect.3 - rect.1 + 1,
+            spec.values.len()
+        );
+        rect
+    }
+
+    /// 多字段透视（C12.3）：行/列/值/筛选列表编辑，生成值化网格并可刷新。
+    fn pivot2_dialog(&mut self, ctx: &egui::Context) {
+        let Some((mut spec, at)) = self.pivot2_edit.take() else { return };
+        let mut open = true;
+        let mut apply = false;
+        let mut refresh = false;
+        let mut cancel = false;
+        let (sr1, sc1, _, sc2) = spec.source;
+        let fields: Vec<(u32, String)> = (sc1..=sc2)
+            .map(|c| {
+                (
+                    c,
+                    self.wb
+                        .sheet(self.sheet_idx)
+                        .get(sr1, c)
+                        .map(|x| x.value.display())
+                        .unwrap_or_else(|| cell_name(0, c)),
+                )
+            })
+            .collect();
+        let fname = |c: u32| {
+            fields
+                .iter()
+                .find(|(cc, _)| *cc == c)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default()
+        };
+        ui_kit::window(ctx, "多字段透视表（值）", 460.0)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "源区域 {}–{}；生成的是数值结果，刷新按当前数据重算",
+                        cell_name(spec.source.0, spec.source.1),
+                        cell_name(spec.source.2, spec.source.3)
+                    ))
+                    .weak()
+                    .size(11.0),
+                );
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("行字段");
+                    let n = spec.rows.len();
+                    for i in 0..n {
+                        egui::ComboBox::from_id_salt(format!("p2row{i}"))
+                            .selected_text(fname(spec.rows[i].col))
+                            .width(82.0)
+                            .show_ui(ui, |ui| {
+                                for (c, name) in fields.iter() {
+                                    if ui.selectable_label(spec.rows[i].col == *c, name).clicked() {
+                                        spec.rows[i].col = *c;
+                                    }
+                                }
+                            });
+                        if ui.small_button("↑").clicked() && i > 0 {
+                            spec.rows.swap(i, i - 1);
+                        }
+                        if ui.small_button("↓").clicked() && i + 1 < n {
+                            spec.rows.swap(i, i + 1);
+                        }
+                        if ui.small_button("×").clicked() {
+                            spec.rows.remove(i);
+                            break;
+                        }
+                    }
+                    ui.menu_button("+ 行", |ui| {
+                        for (c, name) in fields.iter() {
+                            if ui.button(name).clicked() {
+                                spec.rows.push(sheetcore::pivot_multi::AxisField::plain(*c));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("列字段");
+                    let n = spec.cols.len();
+                    for i in 0..n {
+                        egui::ComboBox::from_id_salt(format!("p2col{i}"))
+                            .selected_text(fname(spec.cols[i].col))
+                            .width(82.0)
+                            .show_ui(ui, |ui| {
+                                for (c, name) in fields.iter() {
+                                    if ui.selectable_label(spec.cols[i].col == *c, name).clicked() {
+                                        spec.cols[i].col = *c;
+                                    }
+                                }
+                            });
+                        if ui.small_button("↑").clicked() && i > 0 {
+                            spec.cols.swap(i, i - 1);
+                        }
+                        if ui.small_button("↓").clicked() && i + 1 < n {
+                            spec.cols.swap(i, i + 1);
+                        }
+                        if ui.small_button("×").clicked() {
+                            spec.cols.remove(i);
+                            break;
+                        }
+                    }
+                    ui.menu_button("+ 列", |ui| {
+                        for (c, name) in fields.iter() {
+                            if ui.button(name).clicked() {
+                                spec.cols.push(sheetcore::pivot_multi::AxisField::plain(*c));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("值字段");
+                    let n = spec.values.len();
+                    for i in 0..n {
+                        egui::ComboBox::from_id_salt(format!("p2val{i}"))
+                            .selected_text(fname(spec.values[i].col))
+                            .width(82.0)
+                            .show_ui(ui, |ui| {
+                                for (c, name) in fields.iter() {
+                                    if ui.selectable_label(spec.values[i].col == *c, name).clicked() {
+                                        spec.values[i].col = *c;
+                                    }
+                                }
+                            });
+                        egui::ComboBox::from_id_salt(format!("p2agg{i}"))
+                            .selected_text(spec.values[i].agg.label())
+                            .width(64.0)
+                            .show_ui(ui, |ui| {
+                                for a in [
+                                    sheetcore::pivot::Agg::Sum,
+                                    sheetcore::pivot::Agg::Count,
+                                    sheetcore::pivot::Agg::Avg,
+                                    sheetcore::pivot::Agg::Max,
+                                    sheetcore::pivot::Agg::Min,
+                                ] {
+                                    if ui.selectable_label(spec.values[i].agg == a, a.label()).clicked() {
+                                        spec.values[i].agg = a;
+                                    }
+                                }
+                            });
+                        if ui.small_button("×").clicked() {
+                            spec.values.remove(i);
+                            break;
+                        }
+                    }
+                    ui.menu_button("+ 值", |ui| {
+                        for (c, name) in fields.iter() {
+                            if ui.button(name).clicked() {
+                                spec.values.push(sheetcore::pivot_multi::ValueField {
+                                    col: *c,
+                                    agg: sheetcore::pivot::Agg::Sum,
+                                    label: None,
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("筛选");
+                    let n = spec.filters.len();
+                    for i in 0..n {
+                        egui::ComboBox::from_id_salt(format!("p2flt{i}"))
+                            .selected_text(fname(spec.filters[i].col))
+                            .width(82.0)
+                            .show_ui(ui, |ui| {
+                                for (c, name) in fields.iter() {
+                                    if ui.selectable_label(spec.filters[i].col == *c, name).clicked() {
+                                        spec.filters[i].col = *c;
+                                    }
+                                }
+                            });
+                        let mut keep = spec.filters[i].keep.join(",");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut keep)
+                                    .hint_text("保留值，逗号分隔；空=全部")
+                                    .desired_width(150.0),
+                            )
+                            .changed()
+                        {
+                            spec.filters[i].keep = keep
+                                .split([',', '，'])
+                                .map(|x| x.trim().to_string())
+                                .filter(|x| !x.is_empty())
+                                .collect();
+                        }
+                        if ui.small_button("×").clicked() {
+                            spec.filters.remove(i);
+                            break;
+                        }
+                    }
+                    ui.menu_button("+ 筛选", |ui| {
+                        for (c, name) in fields.iter() {
+                            if ui.button(name).clicked() {
+                                spec.filters.push(sheetcore::pivot_multi::FilterField {
+                                    col: *c,
+                                    keep: Vec::new(),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut spec.layout.tabular, "表格形式（每层标签都显示）");
+                    ui.checkbox(&mut spec.layout.subtotals, "小计");
+                    ui.checkbox(&mut spec.layout.grand_totals, "总计");
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                        if ui_kit::primary_button(ui, "生成").clicked() {
+                            apply = true;
+                        }
+                        let can_refresh = self.pivot2_last.is_some();
+                        if ui
+                            .add_enabled(can_refresh, egui::Button::new("刷新"))
+                            .clicked()
+                        {
+                            refresh = true;
+                            apply = true;
+                        }
+                    });
+                });
+            });
+        if apply {
+            if spec.rows.is_empty() && spec.values.is_empty() {
+                self.status = "多字段透视至少要有一个行字段或值字段".into();
+                self.pivot2_edit = Some((spec, at));
+                return;
+            }
+            let (pos, clear) = if refresh {
+                match self.pivot2_last.clone() {
+                    Some((si, _, rect)) if si == self.sheet_idx => ((rect.0, rect.1), Some(rect)),
+                    _ => (at, None),
+                }
+            } else {
+                (at, None)
+            };
+            self.apply_pivot2(&spec, pos, clear, refresh);
+        } else if !cancel && open {
+            self.pivot2_edit = Some((spec, at));
         }
     }
 
@@ -25576,6 +25870,7 @@ impl eframe::App for SheetApp {
         self.update_window_title(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
+        self.pivot2_dialog(ctx);
         self.renew_lock_if_needed();
         self.beat_lock();
         self.lock_probe(ctx);

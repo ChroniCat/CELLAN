@@ -1,0 +1,104 @@
+# C12.2 / C12.3 多字段透视模型与字段面板
+
+日期：2026-11-14
+
+## 1. 规格模型（C12.2）
+
+新增 `crates/core/src/pivot_multi.rs`，不改动旧 `PivotSpec`/`compute`（C12.1 的
+Count 语义与导入透视部件保持原样）：
+
+```rust
+pub struct PivotSpec2 {
+    source, rows: Vec<AxisField>, cols: Vec<AxisField>,
+    values: Vec<ValueField>, filters: Vec<FilterField>, layout: PivotLayout,
+}
+pub struct ValueField { col, agg, label }
+pub struct FilterField { col, keep: Vec<String> }   // keep 为空 = 全部
+pub struct PivotLayout { tabular, subtotals, grand_totals }
+```
+
+`compute` 返回 `PivotGrid { headers: Vec<Vec<String>>, rows, row_depth, col_labels,
+grand_total_row }`；`write_grid` 从指定锚点写入工作表并返回占用区域。
+
+行为：
+
+- 多行/多列：行路径、列路径各自排序（拼音序，和 Excel 中文排序一致）；
+- 多值：每个列叶子 × 每个值字段一列，表头最后一行是「字段名 + 汇总方式」；
+- 筛选：`keep` 内的原始显示值才计入；空 = 全部；
+- 小计：行字段 ≥ 2 时每个一级组末尾一行「<组> 小计」；
+- 总计：最后一行「总计」，按列叶子 × 值字段汇总；
+- Count 计非空（文本/数字都算），Sum/Avg 只吃数值，文本不参与求和；
+- 空单元格不产生 0 计入 Count；Avg 无数值时为 `#DIV/0!`。
+
+## 2. 与 Excel 真透视对拍（同数据、同字段）
+
+夹具 `crates/core/tests/fixtures/c12/multi.xlsx`（`scripts/c12_multi_fixture.ps1`）：
+数据 6 行，Excel 建真透视（行 地区+城市、列 产品、值 销售额求和+数量计数、
+筛选 状态=有效、表格布局），COM 读回：
+
+```text
+ROW 6  | 华北 | 北京 | 20 | 1 |    | 1 | 20 | 2
+ROW 7  | 华北 汇总 |  | 20 | 1 |  | 1 | 20 | 2
+ROW 8  | 华东 | 杭州 | 30 | 1 |    |   | 30 | 1
+ROW 9  |        | 上海 | 100 | 1 | 50 | 1 | 150 | 2
+ROW 10 | 华东 汇总 | | 130 | 2 | 50 | 1 | 180 | 3
+ROW 11 | 总计 |     | 150 | 3 | 50 | 2 | 200 | 5
+```
+
+本实现同数据同规格得到（`c12_multi` 断言）：
+
+```text
+华北 北京:       甲 20 / 1，乙 0 / 1
+华北 小计:       甲 20 / 1，乙 0 / 1
+华东 杭州:       甲 30 / 1
+华东 上海:       甲 100 / 1，乙 50 / 1
+华东 小计:       甲 130 / 2，乙 50 / 1
+总计:            甲 150 / 3，乙 50 / 2
+```
+
+可比的每个产品格子与总计一致（Excel 额外的「汇总」右侧列我们未生成，属于布局差异，
+不在数值上冲突）。行顺序按拼音：华北(bei) 在 华东(dong) 前，与 Excel 一致。
+
+单测 `crates/core/tests/c12_multi.rs` 5 条：
+
+```text
+two_row_fields_two_values_and_a_filter            ... ok
+subtotal_grand_total_and_filter_semantics         ... ok
+clearing_the_filter_keeps_all_rows_and_recomputes ... ok
+no_row_field_degrades_to_grand_total_only         ... ok
+write_grid_lands_values_at_the_target_anchor     ... ok
+```
+
+## 3. 字段面板与刷新（C12.3）
+
+透视对话框新增「多字段…」入口 → `pivot2_dialog`：
+
+- 行/列/值/筛选四个列表：每项可换字段、上下移动、删除，`+ 行/+ 列/+ 值/+ 筛选` 追加；
+- 值字段逐项选汇总方式（求和/计数/平均/最大/最小）；
+- 筛选逐项输入保留值（逗号分隔，空 = 全部）；
+- 布局开关：表格形式 / 小计 / 总计；
+- 生成：写值化网格并记住区域；刷新：清掉旧区域后按当前数据重算重写。
+
+app 回归 `multi_field_pivot_refresh_clears_old_cells`：生成后取消筛选再刷新，
+旧「总计」行被清掉重写、华北多出天津子行、区域不缩小 —— 1 passed。
+
+## 4. 保存与两款 Office 可编辑（C12.4 只完成值化部分）
+
+用同一模型生成 `C:/Windows/TEMP/sc_c12_multi_out.xlsx`（值化网格另存）：
+
+```text
+EXCEL A1=地区 C3=20 F5=            # 打开无修复
+EXCEL_EDITED=1                     # Excel 改 A1=地区(改) 并保存
+WPS   A1=地区(改) C3=20            # WPS 看到 Excel 的修改
+READ  A1=地区(改) C3=20            # 本实现重新加载也看到修改
+```
+
+即值化结果文件在 Excel/WPS 中可直接编辑并往返。
+
+**未完成**：真正的 pivotTable 部件仍是单行/单列/单值（`pivot_xml::attach` 只接受
+`PivotSpec`），多字段布局只能输出值化网格；因此「保存后字段列表仍可调整」的多字段
+真透视未实现，C12.4 保持待实施，不用值化网格冒充。
+
+## 5. 回归
+
+sheetcore **815 passed**；app `--bin app` **267 passed**。

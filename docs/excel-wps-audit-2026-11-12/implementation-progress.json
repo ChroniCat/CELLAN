@@ -3199,12 +3199,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C12.1 待验收；C12.2/C12.3/C12.4 未开始。"
+        "多字段真 pivotTable 部件未实现（仍单行/单列/单值），C12.4 待实施；多字段仅值化网格"
       ],
       "failures": [],
       "blocker": "",
       "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
-      "updated_utc": "2026-11-13T12:43:00Z",
+      "updated_utc": "2026-11-13T20:42:17Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3241,17 +3241,26 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/pivot_multi.rs",
+            "crates/core/tests/c12_multi.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/fixtures/c12/multi.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-multi.txt"
+          ],
+          "not_done": [
+            "多字段规格/结果/小计总计/筛选与 Excel 对拍"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T20:42:17Z"
         },
         {
           "id": "C12.3",
@@ -3259,17 +3268,26 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/pivot_multi.rs",
+            "crates/core/tests/c12_multi.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/fixtures/c12/multi.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-multi.txt"
+          ],
+          "not_done": [
+            "字段面板增删改序、生成与刷新；真实键鼠未执行"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T20:42:17Z"
         },
         {
           "id": "C12.4",
@@ -3283,11 +3301,13 @@
           "commits": [],
           "commands": [],
           "evidence": [],
-          "not_done": [],
+          "not_done": [
+            "值化网格 Excel/WPS 可编辑往返已验证；多字段真透视部件与字段拖拽未实现"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T20:42:17Z"
         }
       ]
     },

@@ -6736,6 +6736,69 @@ fn name_box_range_rejects_when_any_cell_is_forbidden() {
     assert_eq!(app.sel_end, (0, 1));
 }
 
+/// C12.3：多字段透视生成后刷新，旧区域被清掉，不留旧数，也不越界写。
+#[test]
+fn multi_field_pivot_refresh_clears_old_cells() {
+    use sheetcore::pivot::Agg;
+    use sheetcore::pivot_multi::{AxisField, FilterField, PivotLayout, PivotSpec2, ValueField};
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        for (c, h) in ["地区", "城市", "产品", "销售额", "数量", "状态"].iter().enumerate() {
+            sh.set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });
+        }
+        let rows: [(&str, &str, &str, f64, f64, &str); 4] = [
+            ("华东", "上海", "甲", 100.0, 1.0, "有效"),
+            ("华东", "上海", "乙", 50.0, 2.0, "有效"),
+            ("华北", "北京", "甲", 20.0, 4.0, "有效"),
+            ("华北", "天津", "甲", 30.0, 6.0, "无效"),
+        ];
+        for (i, (rg, ct, pd, amt, qty, st)) in rows.iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set(r, 0, Cell { value: Value::Text((*rg).into()), formula: None });
+            sh.set(r, 1, Cell { value: Value::Text((*ct).into()), formula: None });
+            sh.set(r, 2, Cell { value: Value::Text((*pd).into()), formula: None });
+            sh.set(r, 3, Cell { value: Value::Number(*amt), formula: None });
+            sh.set(r, 4, Cell { value: Value::Number(*qty), formula: None });
+            sh.set(r, 5, Cell { value: Value::Text((*st).into()), formula: None });
+        }
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 4, 5),
+        rows: vec![AxisField::plain(0), AxisField::plain(1)],
+        cols: vec![AxisField::plain(2)],
+        values: vec![
+            ValueField { col: 3, agg: Agg::Sum, label: None },
+            ValueField { col: 4, agg: Agg::Count, label: None },
+        ],
+        filters: vec![FilterField { col: 5, keep: vec!["有效".into()] }],
+        layout: PivotLayout::default(),
+    };
+    let rect = app.apply_pivot2(&spec, (10, 0), None, false);
+    assert_eq!(app.wb.sheet(0).get(12, 0).map(|c| c.value.display()).unwrap_or_default(), "华北");
+    assert_eq!(
+        app.wb.sheet(0).get(12, 2).map(|c| c.value.display()).unwrap_or_default(),
+        "20"
+    );
+    // 取消筛选后天津回来，总行数变多；刷新必须清掉旧网格
+    let mut spec2 = spec.clone();
+    spec2.filters.clear();
+    let rect2 = app.apply_pivot2(&spec2, (rect.0, rect.1), Some(rect), true);
+    assert!(rect2.2 >= rect.2, "加行后区域不应变小");
+    let old_bottom = app
+        .wb
+        .sheet(0)
+        .get(rect.2, rect.3)
+        .map(|c| c.value.display())
+        .unwrap_or_default();
+    assert_ne!(old_bottom, "总计", "旧总计行必须被清掉后重写");
+    let labels: Vec<String> = (rect2.0..=rect2.2)
+        .map(|r| app.wb.sheet(0).get(r, rect2.1).map(|c| c.value.display()).unwrap_or_default())
+        .collect();
+    assert!(labels.iter().any(|x| x == "总计"), "刷新后仍有总计行：{labels:?}");
+    assert!(labels.iter().any(|x| x.starts_with("华北")), "天津回来后华北增加子行");
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();
