@@ -5061,7 +5061,7 @@
       "scope": "app/ribbon/ui.rs, ui_kit.rs, main.rs标题布局",
       "source": "ui-requirements.md",
       "heading": "UI-13 小窗口与高DPI的Ribbon自适应",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5071,7 +5071,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T21:27:03Z",
+      "updated_utc": "2026-11-13T22:27:32Z",
       "slices": [
         {
           "id": "UI-13.1",
