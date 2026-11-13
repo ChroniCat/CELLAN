@@ -1329,3 +1329,125 @@ pub fn migrate_sheet_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
     crate::patch::append_entries(path, &pending)?;
     Ok(log)
 }
+
+/// quotePrefix 是 xf 上的未建模属性，umya 不认它：一旦保存时重建样式表就会丢。
+/// 保存后按「哪些格需要它」补一条带 quotePrefix="1" 的 xf，并把格的 s= 指过去。
+pub fn ensure_quote_prefix(path: &Path, sheets: &[(String, Vec<(u32, u32)>)]) -> Result<usize> {
+    if sheets.iter().all(|(_, cells)| cells.is_empty()) {
+        return Ok(0);
+    }
+    let Some(xml) = read_part(path, "xl/styles.xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(0);
+    };
+    let Some(start) = xml.find("<cellXfs") else { return Ok(0) };
+    let Some(gt) = xml[start..].find('>').map(|i| start + i) else { return Ok(0) };
+    let Some(end) = xml[start..].find("</cellXfs>").map(|i| start + i) else { return Ok(0) };
+    let block = &xml[gt + 1..end];
+    let mut xfs = split_xf(block);
+    let mut added = HashMap::<usize, usize>::new();
+    let mut total = 0usize;
+    for (part, cells) in sheets {
+        if cells.is_empty() {
+            continue;
+        }
+        let Some(bytes) = read_part_file(path, part) else { continue };
+        let Ok(mut sheet) = String::from_utf8(bytes) else { continue };
+        let mut touched = false;
+        for (r, c) in cells {
+            let name = cell_name(*r, *c);
+            let pat = format!("<c r=\"{name}\"");
+            let Some(pos) = sheet.find(&pat) else { continue };
+            let Some(tag_end) = sheet[pos..].find('>').map(|i| pos + i) else { continue };
+            let tag = sheet[pos..=tag_end].to_string();
+            // 保存时默认样式不写 s：这类格没有 s 属性，样式号按 0 处理
+            let had_s = tag.contains(" s=\"");
+            let old = attr_num(&tag, "s").unwrap_or(0);
+            let new_idx = *added.entry(old).or_insert_with(|| {
+                let mut base = xfs.get(old).cloned().unwrap_or_else(|| "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>".to_string());
+                if !base.contains("quotePrefix=") {
+                    if let Some(g) = base.find('>') {
+                        // 自闭合 <xf .../> 要把属性插在 / 前面
+                        let at = if base[..g].ends_with('/') { g - 1 } else { g };
+                        base.insert_str(at, " quotePrefix=\"1\"");
+                    }
+                }
+                xfs.push(base);
+                xfs.len() - 1
+            });
+            if new_idx != old || !had_s {
+                let new_tag = if had_s {
+                    tag.replacen(&format!(" s=\"{old}\""), &format!(" s=\"{new_idx}\""), 1)
+                } else {
+                    tag.replacen(&format!("<c r=\"{name}\""), &format!("<c r=\"{name}\" s=\"{new_idx}\""), 1)
+                };
+                sheet.replace_range(pos..=tag_end, &new_tag);
+                touched = true;
+                total += 1;
+            }
+        }
+        if touched {
+            write_parts(path, &[(part.clone(), sheet.into_bytes())])?;
+        }
+    }
+    if added.is_empty() {
+        return Ok(0);
+    }
+    let mut joined = String::new();
+    for xf in &xfs {
+        joined.push_str(xf);
+    }
+    let mut new_open = xml[start..=gt].to_string();
+    if let Some(cpos) = new_open.find("count=\"") {
+        let rest = &new_open[cpos + 7..];
+        if let Some(q) = rest.find('"') {
+            new_open.replace_range(cpos..cpos + 7 + q + 1, &format!("count=\"{}\"", xfs.len()));
+        }
+    }
+    let rebuilt = format!("{}{}{}{}", &xml[..start], new_open, joined, &xml[end..]);
+    write_parts(path, &[("xl/styles.xml".to_string(), rebuilt.into_bytes())])?;
+    Ok(total)
+}
+
+fn split_xf(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(p) = block[i..].find("<xf") {
+        let s = i + p;
+        let after = &block[s..];
+        let next = after.as_bytes().get(3).copied().unwrap_or(b'>');
+        if !(next == b' ' || next == b'>' || next == b'/') {
+            i = s + 3;
+            continue;
+        }
+        if let Some(gt) = after.find('>') {
+            if after[..gt].ends_with('/') {
+                out.push(after[..=gt].to_string());
+                i = s + gt + 1;
+                continue;
+            }
+        }
+        let Some(c) = after.find("</xf>") else { break };
+        out.push(after[..c + 5].to_string());
+        i = s + c + 5;
+    }
+    out
+}
+
+fn cell_name(r: u32, c: u32) -> String {
+    let mut n = c + 1;
+    let mut s = String::new();
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        s.insert(0, (b'A' + rem) as char);
+        n = (n - 1) / 26;
+    }
+    format!("{s}{}", r + 1)
+}
+
+fn attr_num(tag: &str, key: &str) -> Option<usize> {
+    let pat = format!("{key}=\"");
+    let i = tag.find(&pat)? + pat.len();
+    let rest = &tag[i..];
+    let e = rest.find('"')?;
+    rest[..e].parse().ok()
+}

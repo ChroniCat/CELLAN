@@ -219,6 +219,8 @@ pub struct StyleTable {
     patterns: Vec<Option<crate::style_ext::FillPattern>>,
     /// 与 styles 同长：对角线边框
     diags: Vec<Option<crate::style_ext::DiagBorder>>,
+    /// 与 styles 同长：该样式是否带 quotePrefix（未建模属性，保存后单独补）
+    quotes: Vec<bool>,
 }
 
 fn hash_of(s: &CellStyle) -> u64 {
@@ -263,6 +265,7 @@ impl StyleTable {
         self.themes.push(crate::style_theme::XfTheme::default());
         self.patterns.push(None);
         self.diags.push(None);
+        self.quotes.push(false);
         self.index.insert(k, id);
         id
     }
@@ -292,6 +295,16 @@ impl StyleTable {
         if let Some(slot) = self.diags.get_mut(id as usize) {
             *slot = Some(d);
         }
+    }
+
+    pub fn set_quote(&mut self, id: u16, q: bool) {
+        if let Some(slot) = self.quotes.get_mut(id as usize) {
+            *slot = q;
+        }
+    }
+
+    pub fn quote_of(&self, id: u16) -> bool {
+        self.quotes.get(id as usize).copied().unwrap_or(false)
     }
 
     pub fn diag_of(&self, id: u16) -> Option<&crate::style_ext::DiagBorder> {

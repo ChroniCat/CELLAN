@@ -36,6 +36,8 @@ pub struct StyleExt {
     /// 每个 cellXfs 的 fillId / borderId
     pub xf_fill: Vec<u16>,
     pub xf_border: Vec<u16>,
+    /// 每个 cellXfs 是否带 quotePrefix
+    pub xf_quote: Vec<bool>,
 }
 
 /// 解析 styles.xml 的 fills 与 borders（只取图案与对角线这两类未建模属性）
@@ -65,6 +67,8 @@ pub fn parse(xml: &str) -> StyleExt {
     for xf in split_items(&xfs, "xf") {
         out.xf_fill.push(num(&xf, "fillId").unwrap_or(0) as u16);
         out.xf_border.push(num(&xf, "borderId").unwrap_or(0) as u16);
+        let q = attr(&xf, "quotePrefix").map(|v| v == "1" || v == "true").unwrap_or(false);
+        out.xf_quote.push(q);
     }
     out
 }
@@ -193,6 +197,9 @@ pub fn attach(styles: &mut StyleTable, ext: &StyleExt, id: u16, xf_index: u16) {
         if let Some(p) = ext.patterns.get(*fill_id as usize).cloned().flatten() {
             styles.set_pattern(id, p);
         }
+    }
+    if ext.xf_quote.get(xf_index as usize).copied().unwrap_or(false) {
+        styles.set_quote(id, true);
     }
     if let Some(border_id) = ext.xf_border.get(xf_index as usize) {
         if let Some(d) = ext.diags.get(*border_id as usize).cloned().flatten() {

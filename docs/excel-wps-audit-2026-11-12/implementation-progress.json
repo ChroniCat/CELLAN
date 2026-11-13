@@ -3759,19 +3759,19 @@
       "scope": "core/style.rs, xlsx.rs, xls_style.rs",
       "source": "core-requirements.md",
       "heading": "C18 P1 样式模型与未知样式保留",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C18.1/C18.2 已实现并 Excel+WPS 复核；C18.3 仅验了「改数字格式不覆盖其他样式」，xf 未知属性（quotePrefix/pivotButton/extLst）保留未验"
+        "C18.1~C18.3 均已实现并留证据；pivotButton/extLst 等更冷门 xf 属性保留未逐项验证；屏幕/打印不绘制图案与对角线（原文限定样式模型/序列化）"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T18:43:42Z",
+      "updated_utc": "2026-11-13T18:53:22Z",
       "slices": [
         {
           "id": "C18.1",
@@ -3835,17 +3835,27 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/fixups.rs",
+            "crates/core/src/style_ext.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/tests/c18_unknown.rs",
+            "crates/core/tests/fixtures/c18/unknown.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-unknown-xf.txt"
+          ],
+          "not_done": [
+            "quotePrefix 读盘记入样式表，保存后按格补 xf 并重指 s=；改 B1 数字格式后 A1 仍带 quotePrefix，Excel/WPS 回读正常；pivotButton/extLst 未逐项验证"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T18:53:22Z"
         }
       ]
     },

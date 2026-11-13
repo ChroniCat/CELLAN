@@ -1,0 +1,64 @@
+# C18.3 未建模的 xf 属性：quotePrefix 保真
+
+日期：2026-11-14
+夹具：`crates/core/tests/fixtures/c18/unknown.xlsx`（Excel 16.0，`scripts/c18_unknown_fixture.ps1`）
+
+```text
+A1 输入 "'编号001"（前导单引号强制文本）→ A1 的 xf 带 quotePrefix="1"
+B1 12.5，格式 0.0
+```
+
+## 问题
+
+umya 不认识 `quotePrefix`：
+
+- 什么都不改保存：A1 的格没被重写，quotePrefix 侥幸留下；
+- 只改 B1 的数字格式再保存：umya 重建样式表，A1 变成默认样式（连 `s=` 都不写），
+  quotePrefix 彻底丢失，Excel 再打开就变成普通文本（前导单引号语义没了）。
+
+## 实现
+
+- `style_ext::parse` 同时读每个 xf 的 `quotePrefix`，`attach` 记进
+  `StyleTable.quotes`（按样式号）；
+- 保存尾部新增 `fixups::ensure_quote_prefix`：收集所有「样式带 quotePrefix」的格，
+  按工作表部件逐个找到 `<c r="A1">`，取其当前 `s=`（没有就按 0），
+  从 `cellXfs` 复制一条 xf 并插入 `quotePrefix="1"`（自闭合 `<xf/>` 插在 `/` 前），
+  把该格的 `s=` 指到新 xf，最后重算 `cellXfs count`。
+- 补两个坑：①保存时默认样式不写 `s=`，必须按 0 处理并补上属性；
+  ②`count` 重写时曾漏掉末尾引号，产出 `count="5""` 的坏 XML，已修正。
+
+## 验证
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c18_unknown -- --test-threads=2
+quote_flag_is_loaded ... ok
+quote_prefix_survives_plain_roundtrip ... ok
+quote_prefix_survives_unrelated_edit ... ok
+test result: ok. 3 passed
+```
+
+- 改 B1 数字格式为 0.000 后保存：styles.xml 仍含 `quotePrefix="1"`，A1 指向新增的 xf；
+- 重新加载：A1 仍是文本「编号001」；
+- 连续两次保存合法（同一路径往返）。
+
+两款 Office 回读（`scripts/c18_unknown_verify.ps1`）：
+
+```text
+EXCEL: A1='编号001' B1='12.500' B1FMT='0.000'
+WPS  : A1='编号001' B1='12.500' B1FMT='0.000'
+```
+
+（COM 的 Range.QuotePrefix 对前导单引号输入返回空/False，Excel 自己生成的原始文件也一样，
+所以以 XML 的 quotePrefix 与文本内容为准；两款 Office 都能无警告打开我们保存的文件。）
+
+## 范围与剩余
+
+- 已覆盖：quotePrefix（唯一会因样式表重建而丢、且能被 Excel 稳定生成的未建模 xf 属性）。
+- 未覆盖：`pivotButton`、`xf` 内嵌 `extLst` 等更冷门的属性——umya 不写也不读，
+  当前只在「该格样式未被改写」时靠基准文件保留，尚未逐项验证，已在台账 not_done 标明。
+- 主题 / 图案 / 对角线 / quotePrefix 四类同时存在的组合往返未单独造夹具；
+  当前测试分别覆盖，组合风险低但未实测。
+
+## 回归
+
+sheetcore **777 passed**、app `--bin app` **263 passed**。

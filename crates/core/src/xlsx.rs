@@ -2222,6 +2222,27 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         must_save!("fixups-drawing-props", crate::fixups::sanitize_drawings(path));
         must_save!("fixups-content-types", crate::fixups::ensure_content_types(path, &restore_base));
     }
+    // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
+    let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb
+        .sheets
+        .iter()
+        .filter_map(|sh| {
+            let part = sh.source_part.clone()?;
+            let cells: Vec<(u32, u32)> = sh
+                .iter()
+                .filter(|(r, _)| wb.styles.quote_of(sh.style_of(r.row, r.col)))
+                .map(|(r, _)| (r.row, r.col))
+                .collect();
+            if cells.is_empty() {
+                None
+            } else {
+                Some((part, cells))
+            }
+        })
+        .collect();
+    if !quote_parts.is_empty() {
+        must_save!("fixups-quote-prefix", crate::fixups::ensure_quote_prefix(path, &quote_parts));
+    }
 
     // 最后一步：没编辑过的表整段按基准恢复（放在所有补丁之后，覆盖 umya 的改写）
     if restore_base.exists() {
