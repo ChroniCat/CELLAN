@@ -1,5 +1,24 @@
 # 恢复记录
 
+## 20:27 当前检查点（QA-02 夹具 + QA-01.3 gridlines）
+
+- 分支 `main`，最新提交 `9d02f33`（QA-01 print_gridlines 修正）已 push；工作树干净。
+  近期链：`7493688`（app UI 夹具）→ `1faab09`（QA-02 ledger）→ `9d02f33`。
+- 台账：任务 **15 已验收 / 8 待验收 / 7 实施中 / 31 待实施**；
+  切片 **37 已验收 / 33 待验收 / 1 实施中 / 77 待实施**；父项 **15/61**。
+  计数来自 `python scripts/audit_progress.py counts`。
+- QA-02.1/02.2/02.3 现均 `待验收`：core CF/DV/pivot/PDF/table/style/refs/filter
+  23 个 ignored 恢复，app UI 8 个旧 ignored 全部恢复；真实结果
+  core **77 bins / 721 passed / 0 failed / 9 ignored**、app bin **232/0/0**、
+  app ui_regression **20/0/0**、build EXIT=0。剩余 9 个 core ignored 的
+  reason/owner/unlock 见 `qa02-ignored-ledger.md`；vba_source 仍缺真实 OLE 样本。
+- QA-01.3：`qa01_extended_roundtrip.py` 的 page 网格线改为
+  `PageSetup.PrintGridlines` 并加入断言；只重跑 3 条 page 路径，全 pass，
+  `print_gridlines=true`。证据 `qa01-extended-roundtrip-page-gridlines.json`。
+- UI-01 仍 `待验收`：真实 IME/硬件键盘未执行，不能把事件回归当完成。
+- 下一步：实现 UI-20 对象内存事务（先图片插入不即时写盘 + 撤销/保存），
+  或继续 QA 父项复核；不重开已验收 UI-18/UI-10。
+
 ## 19:40 QA-01/QA-02 当前检查点
 
 - 分支 `main`；最新提交 `45f3f0c`（QA-02 首批夹具），`3d8804f` 为 QA-01.2
