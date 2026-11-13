@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T05:37:03Z",
+  "updated_utc": "2026-11-13T05:47:49Z",
   "tasks": [
     {
       "id": "C01",
@@ -2645,7 +2645,7 @@
       "source": "core-requirements.md",
       "heading": "C11 P1 常用引用语法",
       "status": "实施中",
-      "acceptance": "C11.3/C11.4 已实施并进入待验收：@ 单行按公式列、整段引号 3D、3D xls 首尾索引、反向删除端点均已有专项/真实 Office 证据；反向专项改用真实顺序 First,Second,Third,Other + =SUM(Third:First!A1)，断言 pa>pz，删 First 得 Third:Second=50，删 Third 得 Second:First=30。另补外部工作簿三维引用这一 C11 合法但引擎尚未支持的组合：加载诊断可见、重算保留缓存、保存/重载仍保留；真正 REF/VALUE/NAME 仍按错误值写回。XLS 导出拒绝只是导出安全保护，不能替代这条输入/重算保护；父项仍未验收。",
+      "acceptance": "C11.3/C11.4 已实施并进入待验收：@ 单行按公式列、整段引号 3D、3D xls 首尾索引、反向删除端点均已有专项/真实 Office 证据；反向专项改用真实顺序 First,Second,Third,Other + =SUM(Third:First!A1)，断言 pa>pz，删 First 得 Third:Second=50，删 Third 得 Second:First=30。另补外部工作簿三维引用这一 C11 合法但引擎尚未支持的组合：加载诊断可见、重算保留缓存、保存/重载仍保留；真正 REF/VALUE/NAME 仍按错误值写回。XLS 导出拒绝只是导出安全保护，不能替代这条输入/重算保护；父项仍未验收。。\n补充字符串边界：双引号字符串及 `\"\"` 转义内的外部三维文本不由兼容分支保缓存；`=\"[1]First:Third!A1\"` 按文本、`=IF(TRUE,1/0,\"[1]First:Third!A1\")` 按真实 #DIV/0! 求值。",
       "files": [
         "crates/core/src/lib.rs",
         "crates/core/src/cf.rs",
@@ -2667,7 +2667,7 @@
         "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
         "cargo test -p sheetcore --offline xls_formula -> 11 passed (含 3D Ref3DPtg/Area3DPtg ixti)",
         "cargo test -p app --offline --bin app -> 202 passed / 0 failed / 0 ignored",
-        "cargo test -p sheetcore --offline --test c11_compat -> 3 passed",
+        "cargo test -p sheetcore --offline --test c11_compat -> 4 passed",
         "cargo test -p sheetcore --offline -> 75 bins / 677 passed / 0 failed / 41 ignored",
         "cargo test -p app --offline --bin app -> 204 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app actual_external_3d_fixture_opens_with_visible_compatibility_warning -> 1 passed"
@@ -2678,7 +2678,8 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-implicit-intersection.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-three-d-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-xls-compat.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-unsupported-cache.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-unsupported-cache.txt",
+        "c11-compat-string-boundaries.txt"
       ],
       "not_done": [
         "xls 3D 仅证明导出后 Office 可重算（probe Close(false)），不是 Office 保存往返",
@@ -2690,7 +2691,7 @@
       "failures": [],
       "blocker": "",
       "next": "独立复核 C11.3/C11.4 与反向真实顺序专项；继续全需求。",
-      "updated_utc": "2026-11-13T05:37:03Z",
+      "updated_utc": "2026-11-13T05:47:49Z",
       "slices": [
         {
           "id": "C11.1",

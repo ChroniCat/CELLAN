@@ -2748,6 +2748,24 @@ pub fn unsupported_reference_combo(src: &str) -> Option<&'static str> {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
+        // 双引号字符串里的 `[1]Sheet:Sheet!A1` 只是文本，不是引用。
+        // Excel 用连续两个双引号表示字符串内的一个双引号，必须成对跳过，
+        // 否则字符串结尾前的内容会被误当成外部工作簿三维引用。
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if bytes[i] != b'[' {
             i += 1;
             continue;

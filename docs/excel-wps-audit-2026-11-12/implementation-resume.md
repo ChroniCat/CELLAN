@@ -3,7 +3,7 @@
 - 分支 `main`（`origin/main`），HEAD `304ea01`（C11 外部三维缓存保护已提交）；本轮反向真实顺序与 C11 输入/重算保护见文末。
 - 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
   切片 33 已验收 / 20 待验收 / 95 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
-- 当前测试真值（13:35 后重跑）：core **75 bins / 677 passed / 0 failed / 41 ignored**，
+- 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **204 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
 - 当前未完成：C11.3/C11.4 待独立复核、C11 父项仍实施中；C10.2 live 按用户要求保留，
@@ -352,7 +352,19 @@
   “兼容提示”，打开后 60 保留；`recalc_all_force` 不覆盖缓存；保存重载仍
   公式/60/提示。真正的 `#REF!`/`#DIV/0!`/`#NAME?` 和未知函数仍按错误写回，
   不扩大到所有 parse 失败。`c11_compat` 3 passed；App 真实导入夹具测试通过。
-- 当前全量：core **75 bins / 677 passed / 0 failed / 41 ignored**；app
+- 当前全量：core **75 bins / 678 passed / 0 failed / 41 ignored**；app
   **204 passed / 0 failed / 0 ignored**。App 204 是新增兼容测试后的当前值，
   不把旧 202/674 或未完成的后台进程当最终绿。
 - C11.3/C11.4 仍是“待验收”；C11 父项不翻绿。
+
+
+## 13:45 当前：兼容检测跳过字符串
+
+- 用户 13:38 指出 `unsupported_reference_combo` 不跳双引号字符串，
+  `="[1]First:Third!A1"` 与 `=IF(TRUE,1/0,"[1]First:Third!A1")` 会被误判；
+  已改扫描器识别 `"` 字符串及 `""` 转义，字符串内的文本不再触发兼容缓存。
+- `c11_compat` 新增真实 recalc 负例：前者缓存 7 -> `Text("[1]First:Third!A1")`，
+  后者缓存 7 -> `Error(Div0)`；检测器三条字符串/转义断言均为 `None`。
+- 专项 **4 passed**；全量 core **75 bins / 678 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **204 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+- 未重做 Office 外部三维夹具，原 60 缓存链仍有效；父项 C11 保持待验收。

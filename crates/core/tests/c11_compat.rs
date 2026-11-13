@@ -94,10 +94,53 @@ fn genuine_ref_and_value_errors_are_not_treated_as_unsupported_cache() {
 }
 
 #[test]
+fn external_three_d_text_inside_strings_is_not_cache_preserved() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Other".into();
+    wb.sheets[0].set(
+        0,
+        0,
+        Cell {
+            value: Value::Number(7.0),
+            formula: Some("=\"[1]First:Third!A1\"".into()),
+        },
+    );
+    wb.sheets[0].set(
+        1,
+        0,
+        Cell {
+            value: Value::Number(7.0),
+            formula: Some("=IF(TRUE,1/0,\"[1]First:Third!A1\")".into()),
+        },
+    );
+    recalc_all_force(&mut wb);
+    assert_eq!(
+        wb.sheets[0].value(0, 0),
+        Value::Text("[1]First:Third!A1".into()),
+        "字符串里的外部三维文本必须按普通文本求值"
+    );
+    assert_eq!(
+        wb.sheets[0].value(1, 0),
+        Value::Error(ErrKind::Div0),
+        "字符串参数不能阻止 IF 分支的真实 #DIV/0!"
+    );
+}
+
+#[test]
 fn compatibility_detector_is_limited_to_external_three_d() {
     assert!(sheetcore::formula::unsupported_reference_combo("=SUM([1]First:Third!A1)").is_some());
     assert!(sheetcore::formula::unsupported_reference_combo("=SUM('[b.xlsx]First:Third'!A1)").is_some());
     assert!(sheetcore::formula::unsupported_reference_combo("=SUM([1]First!A1)").is_none());
     assert!(sheetcore::formula::unsupported_reference_combo("=SUM(First:Third!A1)").is_none());
     assert!(sheetcore::formula::unsupported_reference_combo("=FOO(1)").is_none());
+    assert!(sheetcore::formula::unsupported_reference_combo("=\"[1]First:Third!A1\"").is_none());
+    assert!(
+        sheetcore::formula::unsupported_reference_combo("=IF(TRUE,1/0,\"[1]First:Third!A1\")")
+            .is_none()
+    );
+    assert!(
+        sheetcore::formula::unsupported_reference_combo("=\"a\"\"[1]First:Third!A1\"\"b\"")
+            .is_none(),
+        "双写双引号是字符串内的转义引号，不能把后面文本当引用"
+    );
 }
