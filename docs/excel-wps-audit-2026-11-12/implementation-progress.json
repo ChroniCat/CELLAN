@@ -4530,7 +4530,9 @@
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
-      "commits": [],
+      "commits": [
+        "5e3c4e8"
+      ],
       "commands": [],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt"
@@ -4557,7 +4559,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "5e3c4e8"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app custom_format_previews_active_cell_value -> 1 passed",
             "cargo test -p app --offline --bin app -> 218 passed / 0 failed / 0 ignored"
