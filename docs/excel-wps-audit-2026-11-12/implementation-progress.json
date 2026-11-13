@@ -1017,7 +1017,8 @@
         "scripts/qa01_roundtrip.py"
       ],
       "commits": [
-        "fd91c28"
+        "fd91c28",
+        "3d8804f"
       ],
       "commands": [
         "python scripts/qa01_min_samples.py --out-dir crates/core/tests/fixtures/qa01 --manifest docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json -> generated",
@@ -1058,7 +1059,8 @@
             "crates/core/tests/fixtures/qa01/qa01_edit_min.xlsx"
           ],
           "commits": [
-            "fd91c28"
+            "fd91c28",
+            "3d8804f"
           ],
           "commands": [
             "python scripts/qa01_min_samples.py --out-dir crates/core/tests/fixtures/qa01 --manifest docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json -> generated",
@@ -1093,7 +1095,9 @@
             "crates/core/examples/qa01_roundtrip.rs",
             "scripts/qa01_roundtrip.py"
           ],
-          "commits": [],
+          "commits": [
+            "3d8804f"
+          ],
           "commands": [
             "cargo run -p sheetcore --offline --example qa01_roundtrip -- <fixture> <output> -> exit 0",
             "python scripts/qa01_roundtrip.py --fixture ... --manifest ... --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 3 paths, 0 differences"
@@ -1160,7 +1164,9 @@
         "scripts/qa02_notes_fixture.py",
         "scripts/qa02_extended_fixtures.py"
       ],
-      "commits": [],
+      "commits": [
+        "45f3f0c"
+      ],
       "commands": [
         "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
         "cargo test -p sheetcore --offline --test comments -> 2 passed / 0 failed / 0 ignored",
@@ -1205,7 +1211,9 @@
             "scripts/qa02_notes_fixture.py",
             "scripts/qa02_extended_fixtures.py"
           ],
-          "commits": [],
+          "commits": [
+            "45f3f0c"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
             "cargo test -p sheetcore --offline --test comments -> 2 passed / 0 failed / 0 ignored",

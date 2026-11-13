@@ -1,5 +1,26 @@
 # 恢复记录
 
+## 19:40 QA-01/QA-02 当前检查点
+
+- 分支 `main`；最新提交 `45f3f0c`（QA-02 首批夹具），`3d8804f` 为 QA-01.2
+  三方 runner；两者均已 push，工作树在子任务回传前应保持干净。
+- 台账：任务 **15 已验收 / 8 待验收 / 7 实施中 / 31 待实施**；
+  切片 **37 / 30 / 1 / 80**；父项 **15/61**。计数来自
+  `python scripts/audit_progress.py counts`，不凭记忆。
+- QA-01.1：最小公式/编辑夹具、manifest、Excel/WPS oracle 已落盘；QA-01.2：
+  `qa01_roundtrip` helper + `qa01_roundtrip.py` 三路径（Excel→本项目→Excel、
+  WPS→本项目→WPS、Excel→本项目→WPS）实际 `status=pass`、0 differences、
+  证据 `qa01-roundtrip.json`。两片均仅待验收，父项未完成；QA-01.3 未做。
+- QA-02.1：已把 9 个 core ignored 测试接到仓库内 `tests/fixtures/qa02/`：
+  array 2、comments 2、chart_insert 1、chart_kinds 1、page 2、freeze 1；
+  定向测试全绿，全量 core **76 bins / 694 passed / 0 failed / 32 ignored**。
+  另有 4 个并行子任务正在尝试恢复 CF/DV、pivot/pdf、table/style/format、
+  refs/sort 夹具；回传后必须逐项复核，不把子任务自报当验收。
+- 未完成：QA-01 父项仍缺样式/CF/DV/表格/图片/透视/命名/隐藏冻结/外链/打印/
+  .xls/.xlsm 的三方矩阵；QA-02.2/02.3 未开始；UI-15.3 仍待实施。
+- 下一条动作：接收子任务结果，核对其实际测试/夹具/diff；通过则并入
+  QA-02.1，继续 QA-01.3 或 QA-02.2；任何未复现项保持 ignored/未执行。
+
 - 分支 `main`（`origin/main`）；当前代码检查点 `639ee42`（UI-18 手动隐藏来源持久化 + `_FilterDatabase`/A&B 清理，`838035d` 代码提交）。
   之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
   UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
