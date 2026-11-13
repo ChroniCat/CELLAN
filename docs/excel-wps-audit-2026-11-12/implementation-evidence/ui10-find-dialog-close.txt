@@ -135,7 +135,8 @@ if !self.backstage && !self.dialog_modal {
 
 1. B2 填 `old`，`sel=(1,1)`；打开查找/替换框。
 2. 先跑一帧画出对话框；用真实 `egui::Id::new(("dlgwin", "查找与替换")).with("close")`
-   `request_focus`，把焦点放到标题栏关闭按钮（与 Tab 到达同一控件 Id）。
+   `request_focus`，把焦点放到标题栏关闭按钮（该 Id 即键盘焦点落到关闭按钮时的控件 Id；
+   这模拟 Tab 最终到达该按钮后的状态，不依赖无头环境不稳定的焦点遍历顺序）。
 3. 发送单个 Enter：对话框关闭，选区仍为 B2，没有推进到 B3。
 4. 下一帧发送文本 `9`，再发 Enter：B2 从 `old` 变为 `Number(9.0)`，
    证明关闭后键盘焦点确实回到网格，而非被隐藏控件吞掉。

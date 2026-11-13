@@ -5651,7 +5651,9 @@ fn enter_on_focused_dialog_close_does_not_advance_selection() {
     // 先让真实 update() 画出对话框；对话框标题决定关闭按钮的 Id。
     ui_frame(&mut app, &ctx, vec![]);
     let close_id = egui::Id::new(("dlgwin", "查找与替换")).with("close");
+    // 把真实键盘焦点放到对话框关闭按钮（Tab 最终到达的同一控件 Id）。
     ctx.memory_mut(|m| m.request_focus(close_id));
+    assert!(ctx.memory(|m| m.has_focus(close_id)), "关闭按钮应持有键盘焦点");
     ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
     assert!(!app.find.open, "焦点在关闭按钮时 Enter 必须关闭对话框");
     assert_eq!(app.sel, (1, 1), "关闭对话框的同一个 Enter 不能推进选区");
