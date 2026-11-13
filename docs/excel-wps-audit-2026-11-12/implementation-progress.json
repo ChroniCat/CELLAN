@@ -3949,8 +3949,8 @@
       "scope": "app/main.rs handle_keys/轴定位",
       "source": "ui-requirements.md",
       "heading": "UI-09 常用键盘导航和选择完整性",
-      "status": "待实施",
-      "acceptance": "",
+      "status": "实施中",
+      "acceptance": "UI-09.1/09.2/09.3 三项行为均有专项证据，但真机键盘、名称框焦点、IME 与 Office 目视仍待验收；父项不提前标已验收。",
       "files": [],
       "commits": [],
       "commands": [],
@@ -3958,8 +3958,8 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "UI-09.1/09.2 待真机复核；继续 UI-09.3 区域内 Tab/Enter 与隐藏行列边界。",
-      "updated_utc": "2026-11-13T06:37:15Z",
+      "next": "补 UI-09.1/09.2/09.3 的真实键鼠与视觉验收，再走父项验收。",
+      "updated_utc": "2026-11-13T06:44:17Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -4031,17 +4031,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "多格选区 Tab/Enter 在区域内循环并保留原始矩形；Shift 反向；隐藏行/列不落点；单格 Tab/Enter 跳过隐藏行列并在 XFD/1048576 边界停住；编辑提交 commit_edit(advance) 复用同一推进逻辑。专项 1 passed，全量 app 213 passed。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --offline --bin app tab_enter_cycle_inside_selection_and_stop_at_sheet_edges -> 1 passed",
+            "cargo test -p app --offline --bin app -> 213 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt"
+          ],
+          "not_done": [
+            "真实 720/1080 物理键盘 Tab/Enter、IME 编辑中提交、公式栏焦点推进未做 GUI 取证"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "在真实窗口补 720/1080 键盘与编辑提交取证；与 UI-16 选区状态合并后再评估 UI-09 父项。",
+          "updated_utc": "2026-11-13T06:44:17Z"
         }
       ]
     },

@@ -1038,6 +1038,64 @@ fn shift_enter_and_shift_tab_move_backwards() {
     assert_eq!(app.sel, (1, 1), "Shift+Tab 应向左");
 }
 
+/// UI-09.3：选区内的 Tab/Enter 循环、跳过隐藏行列，以及 XFD/1048576 边界。
+#[test]
+fn tab_enter_cycle_inside_selection_and_stop_at_sheet_edges() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("A1"));
+    app.wb.sheet_mut(0).set(2, 0, text("A3"));
+    app.wb.sheet_mut(0).rows.set(1, 0.0); // 第 2 行隐藏
+    app.sel = (0, 0);
+    app.sel_end = (2, 1); // A1:B3
+    app.nav_rect = None;
+
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!((app.sel, app.sel_rect()), ((0, 1), (0, 0, 2, 1)));
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.sel, (2, 0), "Tab 换行时必须跳过隐藏的第 2 行");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.sel, (0, 0), "Enter 到区域末行后回到首行");
+    assert_eq!(app.sel_rect(), (0, 0, 2, 1), "循环期间原始矩形仍保留");
+
+    app.sel = (0, 0);
+    app.sel_end = (0, 2); // A1:C1，B 在区域内
+    app.nav_rect = None;
+    app.wb.sheet_mut(0).cols.set(1, 0.0); // B 列隐藏
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.sel, (0, 2), "Tab 跳过隐藏 B 列");
+
+    // 编辑提交后也按选区推进，而不是固定下一行。
+    app.wb.sheet_mut(0).cols.set(1, 19.0);
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.nav_rect = None;
+    app.begin_edit(Some("值".into()));
+    assert!(app.editing.is_some());
+    // 网格编辑框的 Enter 由绘制层转成 commit_edit(advance)，这里直接走同一提交入口。
+    assert!(app.commit_edit(Some((1, 0))));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("值".into()));
+    assert_eq!(app.sel, (2, 0), "编辑提交 Enter 跳过隐藏行");
+
+    // 方向键也不能落到隐藏行。
+    app.nav_rect = None;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    assert_eq!(app.sel, (2, 0), "向下方向键必须跳过隐藏的第 2 行");
+
+    // 单格边界：XFD 列和 1048576 行不产生越界坐标。
+    app.nav_rect = None;
+    app.sel = (0, 16_383);
+    app.sel_end = (0, 16_383);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.sel, (0, 16_383), "XFD 处 Tab 不得越界");
+    app.sel = (1_048_575, 0);
+    app.sel_end = (1_048_575, 0);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.sel, (1_048_575, 0), "1048576 行处 Enter 不得越界");
+}
+
 #[test]
 fn ctrl_d_fills_down_and_ctrl_r_fills_right() {
     let ctx = egui::Context::default();

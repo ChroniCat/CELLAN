@@ -1,10 +1,10 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`）；代码修复 `4202fae`，文档记录提交 `c3711f3`；C11 父项已验收；UI-09 父项仍待真机复核。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
-  切片 35 已验收 / 23 待验收 / 90 待实施。C11 父项已按用户 14:00 认可翻绿。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 2 实施中 / 36 待实施；
+  切片 35 已验收 / 24 待验收 / 89 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（14:37 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
-  app **212 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
+  app **213 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
 - 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
   C10.2 live 按用户要求保留。
 
@@ -457,3 +457,12 @@
   C3:D5 -> C:D 列，远端旧多选块不再残留。
 - 专项两 test 各 1 passed；全量 app **212 passed / 0 failed / 0 ignored**。
   UI-09.1/09.2 仍待验收，等真机键盘/名称框焦点与滚轮视觉。
+
+## 14:44 当前：UI-09.3 区域内 Tab/Enter
+
+- 新增 nav_rect 保留矩形选区；Tab/Enter 在区域内循环，Shift 反向，跳过隐藏行/列。
+- 方向键也按可见行/列推进；单格 Tab/Enter 在 XFD/1048576 不越界；commit_edit
+  advance 复用同一推进逻辑。
+- 专项 `tab_enter_cycle_inside_selection_and_stop_at_sheet_edges` 1 passed；全量
+  app **213 passed / 0 failed / 0 ignored**。UI-09.1/09.2/09.3 均待验收，UI-09
+  父项转实施中，未标已验收。

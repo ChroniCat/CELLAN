@@ -842,6 +842,8 @@ struct SheetApp {
     paint_scale: f32,
     /// Ctrl+点击追加的多块选区
     extra_sel: Vec<(u32, u32, u32, u32)>,
+    /// Tab/Enter 在矩形选区内循环时保留的原始区域；None 表示普通单格导航
+    nav_rect: Option<(u32, u32, u32, u32)>,
     /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
     grid_press: Option<(u32, u32)>,
     /// 单元格右键菜单
@@ -1454,6 +1456,7 @@ impl SheetApp {
             fmt_pending: false,
             paint_scale: 1.0,
             extra_sel: Vec::new(),
+            nav_rect: None,
             grid_press: None,
             ctx_menu: None,
             ctx_rects: Vec::new(),
@@ -3822,6 +3825,7 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
+        self.begin_nav_rect();
         let (r, c) = self.sel;
         if let Some(holder) = self.lock_holder(r, c) {
             self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
@@ -6620,6 +6624,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if text.is_empty() {
             return;
         }
+        self.nav_rect = None;
         self.commit_edit(None);
         if self.editing.is_some() {
             return;
@@ -6823,10 +6828,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         if wrote {
             if let Some((dr, dc)) = advance {
-                let nr = (self.sel.0 as i64 + dr as i64).max(0) as u32;
-                let nc = (self.sel.1 as i64 + dc as i64).max(0) as u32;
-                self.sel = (nr, nc);
-                self.ensure_visible();
+                self.advance_active(dr as i32, dc as i32);
             }
         }
         wrote
@@ -6940,6 +6942,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.sel = (r, c);
         self.sel_end = (r, c);
         self.extra_sel.clear();
+        self.nav_rect = None;
     }
 
     /// Ctrl+PageUp/PageDown：在当前文档内切换可见工作表，跳过隐藏表。
@@ -6957,11 +6960,136 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 self.sel = (0, 0);
                 self.sel_end = (0, 0);
                 self.extra_sel.clear();
+                self.nav_rect = None;
                 self.scroll = Vec2::ZERO;
                 self.status = format!("当前工作表：{}", self.wb.sheet(self.sheet_idx).name);
                 return;
             }
         }
+    }
+
+    /// 开始区域的 Tab/Enter 循环：多格选区记下原始矩形，单格不启用。
+    fn begin_nav_rect(&mut self) {
+        if let Some((r1, c1, r2, c2)) = self.nav_rect {
+            if self.sel.0 < r1 || self.sel.0 > r2 || self.sel.1 < c1 || self.sel.1 > c2 {
+                self.nav_rect = None;
+            }
+        }
+        if self.nav_rect.is_none() {
+            let rect = self.sel_rect();
+            if rect.0 < rect.2 || rect.1 < rect.3 {
+                self.nav_rect = Some(rect);
+            }
+        }
+    }
+
+    /// 列方向的下一个可见列：与 next_visible_row 相同的边界回退语义。
+    fn next_visible_col(&self, from: u32, right: bool) -> u32 {
+        const MAX_COL: u32 = 16_383;
+        let (cols, _) = self.view_axes();
+        let visible = |c: u32| cols.size(c) > 0.0;
+        let mut c = from;
+        if right {
+            while c < MAX_COL {
+                c += 1;
+                if visible(c) {
+                    return c;
+                }
+            }
+            if visible(from) {
+                return from;
+            }
+            for c in (0..from).rev() {
+                if visible(c) {
+                    return c;
+                }
+            }
+        } else {
+            while c > 0 {
+                c -= 1;
+                if visible(c) {
+                    return c;
+                }
+            }
+            if visible(from) {
+                return from;
+            }
+            for c in (from + 1)..=MAX_COL {
+                if visible(c) {
+                    return c;
+                }
+            }
+        }
+        from
+    }
+
+    /// Enter/Tab 的活动格推进：多格选区在区域内循环，单格跳到下一个可见行/列。
+    fn advance_active(&mut self, dr: i32, dc: i32) {
+        self.begin_nav_rect();
+        if let Some((r1, c1, r2, c2)) = self.nav_rect {
+            let (mut r, mut c) = self.sel;
+            if r < r1 || r > r2 || c < c1 || c > c2 {
+                r = r1;
+                c = c1;
+            }
+            let (cols, rows) = self.view_axes();
+            let w = (c2 - c1 + 1) as u64;
+            let h = (r2 - r1 + 1) as u64;
+            let limit = w.saturating_mul(h).min(200_000);
+            for _ in 0..limit {
+                if dc > 0 {
+                    c += 1;
+                    if c > c2 {
+                        c = c1;
+                        if r < r2 {
+                            r += 1;
+                        } else {
+                            r = r1;
+                        }
+                    }
+                } else if dc < 0 {
+                    if c <= c1 {
+                        c = c2;
+                        if r > r1 {
+                            r -= 1;
+                        } else {
+                            r = r2;
+                        }
+                    } else {
+                        c -= 1;
+                    }
+                } else if dr > 0 {
+                    if r >= r2 {
+                        r = r1;
+                    } else {
+                        r += 1;
+                    }
+                } else if dr < 0 {
+                    if r <= r1 {
+                        r = r2;
+                    } else {
+                        r -= 1;
+                    }
+                }
+                if rows.size(r) > 0.0 && cols.size(c) > 0.0 {
+                    self.sel = (r, c);
+                    self.ensure_visible();
+                    return;
+                }
+            }
+            return;
+        }
+        let (nr, nc) = if dr != 0 {
+            (self.next_visible_row(self.sel.0, dr > 0), self.sel.1)
+        } else if dc != 0 {
+            (self.sel.0, self.next_visible_col(self.sel.1, dc > 0))
+        } else {
+            return;
+        };
+        self.sel = (nr, nc);
+        self.sel_end = (nr, nc);
+        self.extra_sel.clear();
+        self.ensure_visible();
     }
 
     /// Ctrl+A：第一次选当前数据区域，第二次在已选整块时选全表（Excel 的两段行为）。
@@ -6971,6 +7099,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), self.sel.0, self.sel.1);
         let already = self.sel == (r1, c1) && self.sel_end == (r2, c2);
         self.extra_sel.clear();
+        self.nav_rect = None;
         if already {
             self.sel = (0, 0);
             self.sel_end = (1_048_575, 16_383);
@@ -6987,6 +7116,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn select_whole_row(&mut self) {
         let (r1, _, r2, _) = self.sel_rect();
         self.extra_sel.clear();
+        self.nav_rect = None;
         self.sel = (r1, 0);
         self.sel_end = (r2, 16_383);
         self.ensure_visible();
@@ -7000,6 +7130,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn select_whole_col(&mut self) {
         let (_, c1, _, c2) = self.sel_rect();
         self.extra_sel.clear();
+        self.nav_rect = None;
         self.sel = (0, c1);
         self.sel_end = (1_048_575, c2);
         self.ensure_visible();
@@ -7309,20 +7440,36 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.clear_values();
         }
         if commit || dr != 0 || dc != 0 {
-            let nr = (self.sel.0 as i64 + dr).max(0) as u32;
-            let nc = (self.sel.1 as i64 + dc).max(0) as u32;
-            let extend = !commit
-                && (dr != 0 || dc != 0)
-                && ctx.input(|i| i.modifiers.shift);
-            if extend {
-                // Shift+方向：锚点留在 sel_end，只移动活动格
-                self.sel = (nr, nc);
+            if commit {
+                // Enter/Tab：有矩形选区时在区域内循环；单格跳到下一个可见行/列。
+                self.advance_active(dr as i32, dc as i32);
             } else {
-                self.sel = (nr, nc);
-                self.sel_end = (nr, nc);
-                self.extra_sel.clear();
+                self.nav_rect = None;
+                let nr = if dr > 0 {
+                    self.next_visible_row(self.sel.0, true)
+                } else if dr < 0 {
+                    self.next_visible_row(self.sel.0, false)
+                } else {
+                    self.sel.0
+                };
+                let nc = if dc > 0 {
+                    self.next_visible_col(self.sel.1, true)
+                } else if dc < 0 {
+                    self.next_visible_col(self.sel.1, false)
+                } else {
+                    self.sel.1
+                };
+                let extend = ctx.input(|i| i.modifiers.shift);
+                if extend {
+                    // Shift+方向：锚点留在 sel_end，只移动活动格
+                    self.sel = (nr, nc);
+                } else {
+                    self.sel = (nr, nc);
+                    self.sel_end = (nr, nc);
+                    self.extra_sel.clear();
+                }
+                self.ensure_visible();
             }
-            self.ensure_visible();
         }
         if start_edit {
             self.begin_edit(None);
@@ -7354,6 +7501,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// 规范化后的选区 (r1, c1, r2, c2)
     fn sel_rect(&self) -> (u32, u32, u32, u32) {
+        if let Some(rect) = self.nav_rect {
+            return rect;
+        }
         let (r1, r2) = (self.sel.0.min(self.sel_end.0), self.sel.0.max(self.sel_end.0));
         let (c1, c2) = (self.sel.1.min(self.sel_end.1), self.sel.1.max(self.sel_end.1));
         (r1, c1, r2, c2)
@@ -20447,6 +20597,7 @@ let txn = self.txn_begin(&keys);
                     let (_, _, _, c2) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
                     self.sel = (r, 0);
                     self.sel_end = (r, c2);
+                    self.nav_rect = None;
                     self.status = format!("已选中第 {} 行", r + 1);
                 }
             }
@@ -20470,6 +20621,7 @@ let txn = self.txn_begin(&keys);
                         self.sel = hit;
                         self.sel_end = hit;
                         self.extra_sel.clear();
+                        self.nav_rect = None;
                     }
                 }
                 self.ctx_menu = Some(CtxMenuState {
@@ -20542,6 +20694,7 @@ let txn = self.txn_begin(&keys);
                         if !shift && !ctrl {
                             self.extra_sel.clear();
                         }
+                        self.nav_rect = None;
                         self.sel = hit;
                         if !shift {
                             self.sel_end = hit;
