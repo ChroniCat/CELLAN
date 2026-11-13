@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `8cd81fe`（C06 代码与证据；C08 alert 普通 Open 证据）。
+- 分支 `main`（`origin/main`），HEAD `ae36de3`（C06 代码与证据；C08 alert 普通 Open 证据）。
 - 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 42 待实施；
   切片 28 已验收 / 18 待验收 / 102 待实施。
 - 当前测试真值（C06 修改后，09:39 重跑）：core 68 bins / 616 passed / 0 failed / 41 ignored，
