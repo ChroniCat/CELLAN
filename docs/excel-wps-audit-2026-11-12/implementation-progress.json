@@ -2545,7 +2545,7 @@
       "scope": "core/formula/value.rs, criteria paths",
       "source": "core-requirements.md",
       "heading": "C05 P1 空值、布尔、文本比较的 Excel 语义",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "空引用比较时按对方类型强制（0/\"\"/FALSE），跨类型排序 数字<文本<布尔，错误值任一侧传播；COUNTBLANK/IF/COUNTIF 等条件函数语义不回退。",
       "files": [
         "crates/core/src/formula/value.rs",
@@ -2558,13 +2558,11 @@
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05-comparison.txt"
       ],
-      "not_done": [
-        "Excel 16.0 / WPS 12.0 实机对拍矩阵未跑（夹具 %TEMP%\\sc_c05\\c05.xlsx 已生成）"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "用户复核；实机对拍待跑",
-      "updated_utc": "2026-11-12T20:40:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T15:50:11Z",
       "slices": [
         {
           "id": "C05.1",
@@ -2572,26 +2570,35 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "空引用比较时按对方类型强制（0/\"\"/FALSE），跨类型排序 数字<文本<布尔，错误值任一侧传播；COUNTBLANK/IF/COUNTIF 等条件函数语义不回退。",
+          "status": "已验收",
+          "acceptance": "比较矩阵 47 条与 Excel 16.0 / WPS 12.0 实算逐行一致（diff=0）；空值在比较/算术/聚合/条件匹配四个上下文的规则分开，COUNTBLANK/COUNTIF/SUMIF/IF 全部对拍。",
           "files": [
             "crates/core/src/formula/value.rs",
-            "crates/core/tests/comparison_semantics.rs"
+            "crates/core/src/formula/functions.rs",
+            "crates/core/tests/comparison_semantics.rs",
+            "crates/core/tests/c05_matrix.rs",
+            "crates/core/tests/fixtures/c05/matrix.tsv",
+            "scripts/excel_c05_probe.ps1"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test comparison_semantics -> 4 passed / 0 failed / 1 ignored"
+            "cargo test -p sheetcore --offline -j 2 --test c05_matrix -> 1 passed (47 rows)",
+            "cargo test -p sheetcore --offline -j 2 --test comparison_semantics -> 5 passed",
+            "Excel 16.0 + WPS 12.0 实算 matrix.tsv，diff=0"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05-comparison.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05-comparison.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05/probe-c05.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05/c05-crit.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05/c05-crit2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05/c05-crit3.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c05/c05-crit4.txt"
           ],
-          "not_done": [
-            "Excel 16.0 / WPS 12.0 实机对拍矩阵未跑（夹具 %TEMP%\\sc_c05\\c05.xlsx 已生成）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "用户复核；实机对拍待跑",
-          "updated_utc": "2026-11-12T20:40:00Z"
+          "next": "",
+          "updated_utc": "2026-11-13T15:50:11Z"
         }
       ]
     },

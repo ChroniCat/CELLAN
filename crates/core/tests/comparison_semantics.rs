@@ -98,10 +98,47 @@ fn conditional_aggregates_keep_their_blank_semantics() {
     assert_eq!(eval("=IF(A1=0,\"空\",\"非空\")"), FValue::Text("空".into()));
     assert_eq!(eval("=IF(A1=\"\",\"空\",\"非空\")"), FValue::Text("空".into()));
     assert_eq!(eval("=IF(A1,\"真\",\"假\")"), FValue::Text("假".into()));
-    // COUNTIF 用比较逻辑：空引用按 0 计
-    assert_eq!(eval("=COUNTIF(A1:A5,0)"), FValue::Number(1.0));
+    // COUNTIF 是条件匹配上下文，不等同于比较运算：
+    // Excel 16.0 / WPS 12.0 实测 COUNTIF(A1:A5,0) 在 A1 为空、A3=5 时是 0（空单元格不参与数字条件）。
+    assert_eq!(eval("=COUNTIF(A1:A5,0)"), FValue::Number(0.0));
 }
 
+
+/// 条件匹配的空值语义：空白只在条件是空文本时命中，数字条件一律跳过空白。
+/// 真值来自本机 Excel 16.0 与 WPS 12.0 实算（范围 A1:A6 = 空 / "文本" / 5 / TRUE / #N/A / 0）。
+#[test]
+fn criteria_matching_has_its_own_blank_rules() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(1, 0, Cell { value: Value::Text("文本".into()), formula: None });
+    wb.sheets[0].set(2, 0, Cell { value: Value::Number(5.0), formula: None });
+    wb.sheets[0].set(3, 0, Cell { value: Value::Bool(true), formula: None });
+    wb.sheets[0].set(4, 0, Cell { value: Value::Error(ErrKind::Na), formula: None });
+    wb.sheets[0].set(5, 0, Cell { value: Value::Number(0.0), formula: None });
+    let f = |x: &str| formula::eval_formula(&wb, 0, x);
+    assert_eq!(f("=COUNTIF(A1:A6,0)"), FValue::Number(1.0), "只有显式的 0 命中");
+    assert_eq!(f("=COUNTIF(A1:A6,\"<>0\")"), FValue::Number(5.0), "「不等于」把空白算进来");
+    assert_eq!(f("=COUNTIF(A1:A6,\">0\")"), FValue::Number(1.0));
+    assert_eq!(f("=COUNTIF(A1:A6,\"\")"), FValue::Number(1.0), "空文本条件只命中空白");
+    assert_eq!(f("=COUNTIF(A1:A6,\"<>\")"), FValue::Number(5.0), "空白不算非空");
+    assert_eq!(f("=COUNTIF(A1:A6,\"文本\")"), FValue::Number(1.0));
+    assert_eq!(f("=COUNTIF(A1:A6,\"<>文本\")"), FValue::Number(5.0));
+    assert_eq!(f("=SUMIF(A1:A6,0)"), FValue::Number(0.0), "SUMIF 同样跳过空白");
+    assert_eq!(f("=COUNTIF(A1:A6,\">=0\")"), FValue::Number(2.0));
+    // 文本数字与布尔：相等条件会带文本 "5"，关系条件只数真正的数字
+    let mut wb2 = Workbook::new_blank();
+    wb2.sheets[0].set(0, 0, Cell { value: Value::Text("5".into()), formula: None });
+    wb2.sheets[0].set(1, 0, Cell { value: Value::Number(5.0), formula: None });
+    wb2.sheets[0].set(2, 0, Cell { value: Value::Bool(true), formula: None });
+    wb2.sheets[0].set(3, 0, Cell { value: Value::Text("abc".into()), formula: None });
+    let g = |x: &str| formula::eval_formula(&wb2, 0, x);
+    assert_eq!(g("=COUNTIF(A1:A4,5)"), FValue::Number(2.0), "数字 5 与文本 5 都算");
+    assert_eq!(g("=COUNTIF(A1:A4,\">0\")"), FValue::Number(1.0), "关系条件只数数字");
+    assert_eq!(g("=COUNTIF(A1:A4,\">=5\")"), FValue::Number(1.0));
+    assert_eq!(g("=COUNTIF(A1:A4,TRUE)"), FValue::Number(1.0));
+    assert_eq!(g("=COUNTIF(A1:A4,\"abc\")"), FValue::Number(1.0));
+    assert_eq!(g("=SUMIF(A1:A4,\">0\")"), FValue::Number(5.0), "SUMIF 只加数字");
+}
 /// 生成给 Excel/WPS 实机算的矩阵夹具（C1.. 每行一条公式）
 #[test]
 #[ignore = "生成 C05 对拍夹具（Excel/WPS 实机计算）"]
@@ -120,6 +157,10 @@ fn make_c05_fixture() {
         "=A3<A2", "=A2<A4", "=A3<A4", "=A2>0", "=A4>9", "=A2=5", "=A3=\"5\"",
         "=A1=A5", "=A5=0", "=COUNTBLANK(A1:A5)", "=IF(A1=0,\"空\",\"非空\")",
         "=IF(A1=\"\",\"空\",\"非空\")", "=IF(A1,\"真\",\"假\")", "=COUNTIF(A1:A5,0)",
+        // 条件匹配上下文：空白/文本数字/布尔
+        "=COUNTIF(A1:A5,\"<>0\")", "=COUNTIF(A1:A5,\"\")", "=COUNTIF(A1:A5,\"<>\")",
+        "=COUNTIF(A1:A5,\"文本\")", "=COUNTIF(A1:A5,\"<>文本\")", "=SUMIF(A1:A5,0)",
+        "=COUNTIF(A1:A5,\">0\")", "=COUNTIF(A1:A5,\">=0\")", "=COUNTIF(A1:A5,\"abc\")",
     ];
     for (i, f) in formulas.iter().enumerate() {
         wb.sheets[0].set(i as u32, 2, Cell { value: Value::Empty, formula: Some((*f).into()) });
@@ -128,3 +169,4 @@ fn make_c05_fixture() {
     sheetcore::xlsx::save(&p, &wb).unwrap();
     println!("FIXTURE {} 共 {} 条公式", p.display(), formulas.len());
 }
+

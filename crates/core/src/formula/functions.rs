@@ -317,18 +317,20 @@ impl Crit {
     }
 
     pub(crate) fn matches(&self, v: &FValue) -> bool {
+        // 条件匹配里的空白有自己的规则（Excel 16.0 实测）：
+        //   COUNTIF(空单元格,0)=0、(">0")=0、(">=0")=0 —— 数字条件默认跳过空白；
+        //   COUNTIF(空单元格,"<>0")=1 —— 只有「不等于某值」把空白算进来；
+        //   COUNTIF(空单元格,"")=1、("<>")=0。
+        // 这跟比较运算 =A1=0 为 TRUE 是两套上下文，不能共用一套强制转换。
+        if matches!(v, FValue::Empty) && self.num.is_some() {
+            return self.op == "<>";
+        }
         if let Some(t) = self.num {
+            // Excel 16.0 实测：COUNTIF(range,">0") 只数真正的数字（文本 "5"、TRUE 都不算）；
+            // COUNTIF(range,5) 同时数数字 5 和文本 "5"；"<>x" 把非数字、布尔、错误都算进来。
             let n = match v {
                 FValue::Number(n) => *n,
-                FValue::Empty => 0.0,
-                FValue::Bool(b) => {
-                    if *b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                FValue::Text(s) => match s.trim().parse::<f64>() {
+                FValue::Text(s) if self.op == "=" || self.op == "<>" => match s.trim().parse::<f64>() {
                     Ok(n) => n,
                     Err(_) => return self.op == "<>",
                 },
