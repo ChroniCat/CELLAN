@@ -2518,7 +2518,8 @@
         "crates/core/tests/structured_references.rs"
       ],
       "commits": [
-        "b1f8f11"
+        "b1f8f11",
+        "a0f8284"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
@@ -2549,7 +2550,8 @@
             "crates/core/tests/structured_references.rs"
           ],
           "commits": [
-            "b1f8f11"
+            "b1f8f11",
+            "a0f8284"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
