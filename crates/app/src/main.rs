@@ -180,6 +180,26 @@ struct FmtState {
     border: [bool; 4],
 }
 
+/// 格式对话框打开时，选中区域里各格式字段是否存在差异；差异项显示“混合”。
+#[derive(Default, Clone)]
+struct FmtMixed {
+    font: bool,
+    size: bool,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    rotation: bool,
+    color: bool,
+    fill: bool,
+    halign: bool,
+    valign: bool,
+    wrap: bool,
+    indent: bool,
+    format: bool,
+    border: [bool; 4],
+}
+
 /// 编辑焦点在格内还是编辑栏。缓冲只有一个（`self.editing`），位置只决定谁拿焦点。
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum EditSpot {
@@ -870,6 +890,8 @@ struct SheetApp {
     fmt_state: FmtState,
     /// 打开对话框时的活动格样式；应用时只提交用户真正改过的字段。
     fmt_orig: FmtState,
+    /// 选中区域相对活动格哪些字段是混合值。
+    fmt_mixed: FmtMixed,
     fmt_tab: u8,
     /// 外部链接对话框
     xlink_dlg: bool,
@@ -1479,6 +1501,7 @@ impl SheetApp {
             fmt_dlg: false,
             fmt_state: FmtState::default(),
             fmt_orig: FmtState::default(),
+            fmt_mixed: FmtMixed::default(),
             fmt_tab: 0,
             xlink_dlg: false,
             rev: Vec::new(),
@@ -6618,8 +6641,51 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             ],
         };
         self.fmt_orig = self.fmt_state.clone();
+        let (r1, c1, r2, c2) = self.sel_rect();
+        self.fmt_mixed = self.fmt_mixed_for_rect(r1, c1, r2, c2);
         self.fmt_merge_pending = None;
         self.fmt_dlg = true;
+    }
+
+    /// 比较选中矩形内各格样式，供格式对话框显示“混合”。最多采样 20000 格，
+    /// 避免整表选区拖住 UI；采样范围内有任何差异就标记对应字段。
+    fn fmt_mixed_for_rect(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> FmtMixed {
+        let sh = self.wb.sheet(self.sheet_idx);
+        let first_id = sh.style_of(r1, c1);
+        let first = self.wb.styles.get(first_id).clone();
+        let mut m = FmtMixed::default();
+        let mut seen: u32 = 0;
+        'outer: for r in r1..=r2 {
+            for c in c1..=c2 {
+                if seen >= 20_000 {
+                    break 'outer;
+                }
+                seen += 1;
+                let id = sh.style_of(r, c);
+                if id == first_id {
+                    continue;
+                }
+                let s = self.wb.styles.get(id);
+                m.font |= s.font != first.font;
+                m.size |= (s.size - first.size).abs() > f32::EPSILON;
+                m.bold |= s.bold != first.bold;
+                m.italic |= s.italic != first.italic;
+                m.underline |= s.underline != first.underline;
+                m.strikethrough |= s.strikethrough != first.strikethrough;
+                m.rotation |= s.rotation != first.rotation;
+                m.color |= s.color != first.color;
+                m.fill |= s.fill != first.fill;
+                m.halign |= s.halign != first.halign;
+                m.valign |= s.valign != first.valign;
+                m.wrap |= s.wrap != first.wrap;
+                m.indent |= s.indent != first.indent;
+                m.format |= s.format != first.format;
+                for i in 0..4 {
+                    m.border[i] |= s.border[i] != first.border[i];
+                }
+            }
+        }
+        m
     }
 
     /// 提交格式对话框：只覆盖用户改过的字段；未改直接确定不产生事务。
@@ -16434,6 +16500,22 @@ let txn = self.txn_begin(&keys);
         let mut apply = false;
         let mut cancel = false;
         let st = self.fmt_state.clone();
+        let mixed = self.fmt_mixed.clone();
+        let orig = self.fmt_orig.clone();
+        let font_mixed = mixed.font && self.fmt_state.font == orig.font;
+        let size_mixed = mixed.size && (self.fmt_state.size - orig.size).abs() <= f32::EPSILON;
+        let style_mixed = (mixed.bold && self.fmt_state.bold == orig.bold)
+            || (mixed.italic && self.fmt_state.italic == orig.italic)
+            || (mixed.underline && self.fmt_state.underline == orig.underline)
+            || (mixed.strikethrough && self.fmt_state.strikethrough == orig.strikethrough);
+        let color_mixed = mixed.color && self.fmt_state.color == orig.color;
+        let fill_mixed = mixed.fill && self.fmt_state.fill == orig.fill;
+        let halign_mixed = mixed.halign && self.fmt_state.halign == orig.halign;
+        let valign_mixed = mixed.valign && self.fmt_state.valign == orig.valign;
+        let rotation_mixed = mixed.rotation && self.fmt_state.rotation == orig.rotation;
+        let wrap_mixed = mixed.wrap && self.fmt_state.wrap == orig.wrap;
+        let indent_mixed = mixed.indent && self.fmt_state.indent == orig.indent;
+        let format_mixed = mixed.format && self.fmt_state.format == orig.format;
         ui_kit::window(ctx, "设置单元格格式", 452.0)
             .open(&mut open)
             .resizable(false)
@@ -16470,10 +16552,12 @@ let txn = self.txn_begin(&keys);
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        dlg_cell_label(ui, "字体");
+                        dlg_cell_label(ui, if font_mixed { "字体（混合）" } else { "字体" });
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("fmt_dlg_font")
-                                .selected_text(if self.fmt_state.font.is_empty() {
+                                .selected_text(if font_mixed {
+                                    "混合".to_string()
+                                } else if self.fmt_state.font.is_empty() {
                                     "默认".to_string()
                                 } else {
                                     self.fmt_state.font.clone()
@@ -16498,6 +16582,9 @@ let txn = self.txn_begin(&keys);
                             let mut szv = self.fmt_state.size as f64;
                             if ui_kit::spin(ui, &mut szv, 6.0, 72.0, 1.0, 50.0) {
                                 self.fmt_state.size = szv as f32;
+                            }
+                            if size_mixed {
+                                ui.label(egui::RichText::new("混合").size(11.0).weak());
                             }
                         });
                         ui.end_row();
@@ -16556,13 +16643,20 @@ let txn = self.txn_begin(&keys);
                             {
                                 self.fmt_state.strikethrough = !self.fmt_state.strikethrough;
                             }
+                            if style_mixed {
+                                ui.label(egui::RichText::new("混合").size(11.0).weak());
+                            }
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("颜色").size(11.5).weak());
                             ui.color_edit_button_srgb(&mut self.fmt_state.color)
                                 .on_hover_text("字体颜色");
+                            if color_mixed {
+                                ui.label(egui::RichText::new("混合").size(11.0).weak());
+                            }
                             ui.add_space(10.0);
                             let mut has_fill = self.fmt_state.fill.is_some();
-                            if ui.checkbox(&mut has_fill, "填充").changed() {
+                            let fill_label = if fill_mixed { "填充（混合）" } else { "填充" };
+                            if ui.checkbox(&mut has_fill, fill_label).changed() {
                                 self.fmt_state.fill =
                                     if has_fill { Some([255, 255, 0]) } else { None };
                             }
@@ -16580,7 +16674,7 @@ let txn = self.txn_begin(&keys);
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
-                        dlg_cell_label(ui, "水平");
+                        dlg_cell_label(ui, if halign_mixed { "水平（混合）" } else { "水平" });
                         ui.horizontal(|ui| {
                             for (label, v) in
                                 [("常规", 0u8), ("左", 1), ("中", 2), ("右", 3)]
@@ -16588,7 +16682,8 @@ let txn = self.txn_begin(&keys);
                                 ui.selectable_value(&mut self.fmt_state.halign, v, label);
                             }
                             ui.add_space(12.0);
-                            ui.label(egui::RichText::new("垂直").size(11.5).weak());
+                            let vlabel = if valign_mixed { "垂直（混合）" } else { "垂直" };
+                            ui.label(egui::RichText::new(vlabel).size(11.5).weak());
                             for (label, v) in
                                 [("常规", 0u8), ("上", 1), ("中", 2), ("下", 3)]
                             {
@@ -16600,12 +16695,16 @@ let txn = self.txn_begin(&keys);
                         dlg_cell_label(ui, "方向");
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("fmt_dlg_rot")
-                                .selected_text(match self.fmt_state.rotation {
+                                .selected_text(if rotation_mixed {
+                                    "混合"
+                                } else {
+                                    match self.fmt_state.rotation {
                                     90 => "竖排（90°）",
                                     -90 => "竖排（-90°）",
                                     45 => "斜排（45°）",
                                     -45 => "斜排（-45°）",
                                     _ => "横排（0°）",
+                                    }
                                 })
                                 .width(120.0)
                                 .show_ui(ui, |ui| {
@@ -16625,11 +16724,13 @@ let txn = self.txn_begin(&keys);
                         dlg_cell_label(ui, "文本");
                         ui.horizontal(|ui| {
                             let mut wrap = self.fmt_state.wrap;
-                            if ui.checkbox(&mut wrap, "自动换行").changed() {
+                            let wrap_label = if wrap_mixed { "自动换行（混合）" } else { "自动换行" };
+                            if ui.checkbox(&mut wrap, wrap_label).changed() {
                                 self.fmt_state.wrap = wrap;
                             }
                             ui.add_space(12.0);
-                            ui.label(egui::RichText::new("缩进").size(11.5).weak());
+                            let ilabel = if indent_mixed { "缩进（混合）" } else { "缩进" };
+                            ui.label(egui::RichText::new(ilabel).size(11.5).weak());
                             let mut ind = self.fmt_state.indent as f64;
                             if ui_kit::spin(ui, &mut ind, 0.0, 15.0, 1.0, 50.0) {
                                 self.fmt_state.indent = ind as u8;
@@ -16648,7 +16749,9 @@ let txn = self.txn_begin(&keys);
                         dlg_cell_label(ui, "格式");
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("fmt_dlg_num")
-                                .selected_text(if self.fmt_state.format.is_empty() {
+                                .selected_text(if format_mixed {
+                                    "混合".to_string()
+                                } else if self.fmt_state.format.is_empty() {
                                     "常规".to_string()
                                 } else {
                                     self.fmt_state.format.clone()
@@ -16683,10 +16786,14 @@ let txn = self.txn_begin(&keys);
                                         }
                                     }
                                 });
-                            let sample = sheetcore::style::format_value_in(self.wb.date_system,
-                                &sheetcore::model::Value::Number(1234.5678),
-                                &self.fmt_state.format,
-                            );
+                            let sample = if format_mixed {
+                                "混合".to_string()
+                            } else {
+                                sheetcore::style::format_value_in(self.wb.date_system,
+                                    &sheetcore::model::Value::Number(1234.5678),
+                                    &self.fmt_state.format,
+                                )
+                            };
                             ui.label(
                                 egui::RichText::new(format!("示例  {sample}"))
                                     .monospace()
@@ -16710,6 +16817,13 @@ let txn = self.txn_begin(&keys);
                                 [("左", 0usize), ("右", 1), ("上", 2), ("下", 3)]
                             {
                                 let on = self.fmt_state.border[idx];
+                                let border_mixed = mixed.border[idx]
+                                    && self.fmt_state.border[idx] == orig.border[idx];
+                                let label = if border_mixed {
+                                    format!("{label}?")
+                                } else {
+                                    label.to_string()
+                                };
                                 if ui.selectable_label(on, label).clicked() {
                                     self.fmt_state.border[idx] = !on;
                                 }

@@ -1071,6 +1071,10 @@ fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
 
     // 只改数字格式：两格各自保留字体、字号、颜色、粗斜体。
     app.open_format_dialog();
+    assert!(app.fmt_mixed.font, "字体不同应标记混合");
+    assert!(app.fmt_mixed.color, "颜色不同应标记混合");
+    assert!(app.fmt_mixed.size, "字号不同应标记混合");
+    assert!(app.fmt_mixed.format, "数字格式不同应标记混合");
     app.fmt_state.format = "#,##0.00".into();
     app.apply_format_dialog();
     for (r, want_font, want_bold, want_italic, want_color, want_size) in [
@@ -1091,6 +1095,8 @@ fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
     app.sel = (0, 0);
     app.sel_end = (1, 0);
     app.open_format_dialog();
+    assert!(!app.fmt_mixed.format, "数字格式已统一，不应再报混合");
+    assert!(app.fmt_mixed.font, "字体仍不同，应保持混合");
     app.apply_format_dialog();
     assert_eq!(app.wb.sheet(0).style_of(0, 0), before.0);
     assert_eq!(app.wb.sheet(0).style_of(1, 0), before.1);

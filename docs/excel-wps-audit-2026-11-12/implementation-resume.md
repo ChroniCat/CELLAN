@@ -480,5 +480,6 @@
 - 新增 fmt_orig；apply_format_dialog 按字段 diff，只提交实际改动；直接确定不重写。
 - 混合两格只改数字格式后，字体/字号/颜色/粗斜体各自保留；边框只在开关变化时整组提交。
 - 专项 `format_dialog_preserves_unchanged_fields_and_mixed_cell_styles` 1 passed；
-  全量 app **215 passed / 0 failed / 0 ignored**。混合值显示、真实鼠标/Office 目视
-  和 UI-08.3 事务/撤销仍未完成，UI-08 父项保持实施中。
+  全量 app **215 passed / 0 failed / 0 ignored**。FmtMixed 已让字体/字号/字形/颜色/填充/
+  对齐/方向/换行/缩进/数字格式/四边分别显示“混合/？”；真实鼠标/Office 目视和
+  UI-08.3 事务/撤销仍未完成，UI-08 父项保持实施中。
