@@ -4378,17 +4378,22 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
           "files": [],
           "commits": [],
           "commands": [],
           "evidence": [],
-          "not_done": [],
+          "not_done": [
+            "对象+跨页标题同一夹具未建成",
+            "图表/文本框矢量目视未做",
+            "隐藏行/筛选数据未验证",
+            "WPS PDF 未对拍"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:45:34Z"
         },
         {
           "id": "QA-09.3",
