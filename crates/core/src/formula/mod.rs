@@ -1293,15 +1293,24 @@ impl<'a> Calc<'a> {
                     return v;
                 }
                 // 工作簿定义名称：底层存的是定义式（区域、常量或公式）
+                // 作用域：当前表的局部名称优先于工作簿名称（Excel 同名规则）
                 let hit = {
-                    let mut found = None;
+                    let mut local = None;
+                    let mut global = None;
                     for (nm, sh, body) in self.wb.names.iter() {
-                        if nm.eq_ignore_ascii_case(n) {
-                            found = Some((*sh, body.clone()));
-                            break;
+                        if !nm.eq_ignore_ascii_case(n) {
+                            continue;
+                        }
+                        match *sh {
+                            Some(s) if s == si => {
+                                local = Some((*sh, body.clone()));
+                                break;
+                            }
+                            Some(_) => {}
+                            None => global = Some((*sh, body.clone())),
                         }
                     }
-                    found
+                    local.or(global)
                 };
                 if let Some((sh, body)) = hit {
                     let si2 = sh.unwrap_or(si);

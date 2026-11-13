@@ -5778,7 +5778,7 @@
       "scope": "app名称管理/名称框 + core名称解析",
       "source": "ui-requirements.md",
       "heading": "UI-28 名称管理器和名称框闭环",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5788,7 +5788,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T21:07:30Z",
       "slices": [
         {
           "id": "UI-28.1",
@@ -5796,17 +5796,26 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-28 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/formula/mod.rs",
+            "crates/core/tests/ui28_names.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt"
+          ],
+          "not_done": [
+            "作用域复选框/名称框下拉/Enter 跳转未做真实鼠标键盘点选",
+            "保存后的名称未做 Excel/WPS COM 回读"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:07:30Z"
         }
       ]
     },

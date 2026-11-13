@@ -963,6 +963,8 @@ struct SheetApp {
     name_new: String,
     name_refers: String,
     name_edit_idx: Option<usize>,
+    /// 名称管理器：勾选后保存为当前工作表局部名称
+    name_scope_local: bool,
     name_err: String,
     /// 最近生成的透视表：(表索引, 规格, 结果区域)
     pivot_last: Option<(usize, sheetcore::pivot::PivotSpec, (u32, u32, u32, u32))>,
@@ -1734,6 +1736,7 @@ impl SheetApp {
             name_new: String::new(),
             name_refers: String::new(),
             name_edit_idx: None,
+            name_scope_local: false,
             name_err: String::new(),
             pivot_last: None,
             fmt_pending: false,
@@ -7560,12 +7563,23 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.ensure_visible();
             return;
         }
-        let hit = self
-            .wb
-            .names
-            .iter()
-            .find(|(n, _, _)| n.eq_ignore_ascii_case(&text))
-            .map(|(_, sh, body)| (*sh, body.clone()));
+        // 同名时当前表的局部名称优先，其次工作簿名称
+        let mut local = None;
+        let mut global = None;
+        for (n, sh, body) in self.wb.names.iter() {
+            if !n.eq_ignore_ascii_case(&text) {
+                continue;
+            }
+            match *sh {
+                Some(si) if si == self.sheet_idx => {
+                    local = Some((*sh, body.clone()));
+                    break;
+                }
+                Some(_) => {}
+                None => global = Some((*sh, body.clone())),
+            }
+        }
+        let hit = local.or(global);
         if let Some((_sh, body)) = hit {
             let body = body.trim_start_matches('=').to_string();
             let tail = body.rsplit('!').next().unwrap_or(&body).replace('$', "");
@@ -12143,6 +12157,7 @@ let txn = self.txn_begin(&keys);
                     ui.add(egui::TextEdit::singleline(&mut self.name_new).desired_width(120.0));
                     ui.label("引用");
                     ui.add(egui::TextEdit::singleline(&mut self.name_refers).desired_width(200.0));
+                    ui.checkbox(&mut self.name_scope_local, "仅当前工作表");
                     if ui.button(if self.name_edit_idx.is_some() { "保存" } else { "新建" }).clicked() {
                         submit = true;
                     }
@@ -12160,9 +12175,10 @@ let txn = self.txn_begin(&keys);
         self.name_mgr = open && !close;
         if let Some(i) = start_edit {
             let item = self.wb.names.get(i).cloned();
-            if let Some((name, _sheet, refers)) = item {
+            if let Some((name, sheet, refers)) = item {
                 self.name_new = name;
                 self.name_refers = refers;
+                self.name_scope_local = sheet == Some(self.sheet_idx);
                 self.name_edit_idx = Some(i);
             }
         }
@@ -12187,7 +12203,11 @@ let txn = self.txn_begin(&keys);
                 .names
                 .iter()
                 .enumerate()
-                .any(|(k, (n, _, _))| k != self.name_edit_idx.unwrap_or(usize::MAX) && n.eq_ignore_ascii_case(&name));
+                .any(|(k, (n, sh, _))| {
+                    k != self.name_edit_idx.unwrap_or(usize::MAX)
+                        && n.eq_ignore_ascii_case(&name)
+                        && *sh == if self.name_scope_local { Some(self.sheet_idx) } else { None }
+                });
             if !valid {
                 self.name_err = "名称要以字母/下划线开头，只能含字母数字下划线点；引用不能为空".into();
             } else if dup {
@@ -12197,9 +12217,14 @@ let txn = self.txn_begin(&keys);
                 match self.name_edit_idx.take() {
                     Some(i) if i < self.wb.names.len() => {
                         self.wb.names[i].0 = name;
+                        self.wb.names[i].1 = if self.name_scope_local { Some(self.sheet_idx) } else { None };
                         self.wb.names[i].2 = refers;
                     }
-                    _ => self.wb.names.push((name, None, refers)),
+                    _ => self.wb.names.push((
+                        name,
+                        if self.name_scope_local { Some(self.sheet_idx) } else { None },
+                        refers,
+                    )),
                 }
                 self.wb.names_dirty = true;
                 self.wb.dirty = true;
