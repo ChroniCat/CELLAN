@@ -48,6 +48,7 @@ pub mod pivot_xml;
 pub mod qtable;
 pub mod model;
 pub mod style;
+pub mod style_theme;
 pub mod sort_filter;
 pub mod store;
 pub mod structural;

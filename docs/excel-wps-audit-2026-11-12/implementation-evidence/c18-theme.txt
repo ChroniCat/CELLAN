@@ -1,0 +1,72 @@
+# C18.1 主题色与 tint：解析、保存保真、Excel 复核
+
+日期：2026-11-14
+触发：原合同 C18 要求「主题色/tint 与原始样式保留」。此前保存时把颜色一律写成
+`argb`，一改别的属性主题链接就丢了；读盘时也不区分「主题色 4 号 + tint 0.4」
+和「某个固定 RGB」。
+
+## Excel 真值
+
+`scripts/c18_theme_fixture.ps1` 用 Excel 16.0 建 `fixtures/c18/theme.xlsx`：
+
+```text
+A1 文本：字体「蓝色，着色 1，淡色 40%」  → COM Color=BGR DBA98E  = RGB #8EA9DB
+A1 填充：「橙色，着色 2，深色 25%」       → COM Color=BGR 1159C6  = RGB #C65911
+XML：<color theme="4" tint="0.39997558519241921"/>
+     <fgColor theme="5" tint="-0.249977111117893"/>
+B1：42，粗体（无主题）
+```
+
+## 实现
+
+新增 `crates/core/src/style_theme.rs`：
+
+- `parse_palette`：读 `xl/theme/theme1.xml` 的 `clrScheme`，按
+  dk1/lt1/dk2/lt2/accent1-6/hlink/folHlink 顺序得到 12 个主题色（支持 `sysClr lastClr`
+  与 `srgbClr val`）；
+- `tint_rgb`：RGB→HSL，`tint<0 → L*(1+tint)`，`tint>0 → L*(1-tint)+tint`，再转回；
+- `parse_xfs`：`fonts`/`fills`/`cellXfs` 三段对齐，得出每个 `xf` 的主题字体色与主题填充色；
+- `parse_cell_styles`：扫工作表 XML 的 `<c r="A1" s="12">`，得到每格对应的 xf 序号；
+- `apply`：把主题解析成 RGB 写进 `CellStyle`（保证界面/打印颜色正确）。
+
+`xlsx.rs`：
+
+- 读盘时 `style_theme::load(path, &parts)`，每格按 xf 套用解析结果，并把
+  `XfTheme` 记到 `StyleTable`（新增 `themes` 平行表 + `set_theme/theme_of`）；
+- 保存时若样式带主题引用，写 `<color theme=… tint=…>`（umya 的
+  `set_theme_index/set_tint`；填充经 `patternFill` 的 `fgColor` 写同样的属性），
+  否则仍写 `argb`。
+
+## 回归
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c18_theme -- --test-threads=2
+theme_color_and_tint_resolve_like_excel ... ok
+theme_refs_survive_save_and_reload ... ok
+editing_another_property_does_not_drop_theme ... ok
+test result: ok. 3 passed
+```
+
+- 解析：字体色 `#8F AAD C`（Excel `#8EA9DB`，±2 内；HSL 舍入差异，主题索引与 tint 精确相等）；
+- 保存解包：`theme="4"`、`theme="5"`、两条 tint 原值都在；
+- 改粗体后再保存：主题两条引用仍在，重开颜色不变。
+
+Excel COM 复核我们保存的文件（`sc_c18_theme_edit.xlsx`）：
+
+```text
+FONT_THEME=5  FONT_TINT=0.399975585192419  FONT_COLOR=DBA98E(BGR)=#8EA9DB  BOLD=True
+FILL_THEME=6  FILL_TINT=-0.249977111117893 FILL_COLOR=1159C6(BGR)=#C65911
+```
+
+Excel 把 theme 索引读成 5/6（`xlThemeColorAccent1/2`），tint 与颜色都保持——
+说明写出的不是「看起来一样的固定色」，而是真正的主题色。
+
+全量：sheetcore **771 passed**、app `--bin app` **263 passed**。
+
+## 状态与剩余
+
+- C18.1 → 待验收。
+- C18.2（图案填充/复杂边框）：未开始；当前 `CellStyle.fill` 只表示纯色，
+  `patternType`/`fgColor`/`bgColor` 双色图案尚未建模，边框也只到四边 style/color（无 diagonal）。
+- C18.3（修改单属性无损往返）：主题这一路已满足；`xf` 上的其它未知属性
+  （quotePrefix、pivotButton、extLst 等）仍走 umya 重建，尚未逐项验证。

@@ -3759,17 +3759,19 @@
       "scope": "core/style.rs, xlsx.rs, xls_style.rs",
       "source": "core-requirements.md",
       "heading": "C18 P1 样式模型与未知样式保留",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "C18.1 主题色/tint 已实现并 Excel 复核；C18.2 图案填充/复杂边框、C18.3 xf 未知属性无损待做"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T18:24:40Z",
       "slices": [
         {
           "id": "C18.1",
@@ -3777,17 +3779,27 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/style_theme.rs",
+            "crates/core/src/style.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/tests/c18_theme.rs",
+            "crates/core/tests/fixtures/c18/theme.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-theme.txt"
+          ],
+          "not_done": [
+            "读盘解析 theme+tint 成 RGB 并记录引用；保存按 theme 写回，改粗体不丢主题；Excel COM 回读 5/0.3999… 与 6/-0.2499…；等待复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T18:24:40Z"
         },
         {
           "id": "C18.2",

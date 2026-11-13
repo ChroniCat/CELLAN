@@ -573,6 +573,13 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     } else {
         None
     };
+    // 主题色：Excel 的 <color theme tint> 不能只当 RGB，读盘时记下索引与 tint
+    let theme_parts: Vec<String> = targets.values().cloned().collect();
+    let theme_book = if is_ooxml {
+        crate::style_theme::load(path, &theme_parts)
+    } else {
+        Default::default()
+    };
     for raw in raws {
         let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(raw.name.clone());
@@ -581,8 +588,19 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         for ((r, c), cell) in raw.cells {
             sheet.set(r, c, cell);
         }
-        for ((r, c), cs) in raw.styles {
+        let xf_map = targets
+            .get(&raw.name)
+            .and_then(|p| theme_book.cells.get(p));
+        for ((r, c), mut cs) in raw.styles {
+            let xf = xf_map
+                .and_then(|m| m.get(&(r, c)))
+                .and_then(|idx| theme_book.xfs.get(*idx as usize))
+                .copied();
+            crate::style_theme::apply(&mut cs, xf.as_ref(), &theme_book.palette);
             let id = wb.styles.intern(cs);
+            if let Some(x) = xf {
+                wb.styles.set_theme(id, x);
+            }
             if id != 0 {
                 sheet.set_style_loaded(r, c, id);
             }
@@ -1787,6 +1805,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         for (row, col) in style_targets {
             let sid = sheet.style_of(row, col);
             let st = wb.styles.get(sid);
+            let theme = wb.styles.theme_of(sid);
             let cell = ws.get_cell_mut((col + 1, row + 1));
             let s = cell.get_style_mut();
             {
@@ -1810,11 +1829,31 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     f.set_name(st.font.clone());
                 }
                 let mut col = umya_spreadsheet::Color::default();
-                col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", st.color[0], st.color[1], st.color[2]));
+                if let Some(t) = theme.font {
+                    // 主题色：保留 theme 索引与 tint，别降级成固定 RGB
+                    col.set_theme_index(t.idx as u32);
+                    col.set_tint(t.tint as f64);
+                } else {
+                    col.set_argb_str(format!(
+                        "FF{:02X}{:02X}{:02X}",
+                        st.color[0], st.color[1], st.color[2]
+                    ));
+                }
                 f.set_color(col);
             }
             if let Some(rgb) = st.fill {
-                s.set_background_color_solid(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+                if let Some(t) = theme.fill {
+                    let pf = s.get_fill_mut().get_pattern_fill_mut();
+                    pf.set_pattern_type(umya_spreadsheet::PatternValues::Solid);
+                    let c = pf.get_foreground_color_mut();
+                    c.set_theme_index(t.idx as u32);
+                    c.set_tint(t.tint as f64);
+                } else {
+                    s.set_background_color_solid(format!(
+                        "FF{:02X}{:02X}{:02X}",
+                        rgb[0], rgb[1], rgb[2]
+                    ));
+                }
             } else {
                 // 用户明确取消填充时，基准文件里的旧 fill 必须一起清掉；
                 // 只跳过设置会让 save→reload 继续显示旧颜色。

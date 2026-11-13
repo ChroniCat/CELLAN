@@ -213,6 +213,8 @@ impl CellStyle {
 pub struct StyleTable {
     styles: Vec<CellStyle>,
     index: HashMap<u64, u16>,
+    /// 与 styles 同长：每个样式号对应的主题色引用（读盘时记，保存时按它写回）
+    themes: Vec<crate::style_theme::XfTheme>,
 }
 
 fn hash_of(s: &CellStyle) -> u64 {
@@ -254,8 +256,20 @@ impl StyleTable {
         }
         let id = self.styles.len() as u16;
         self.styles.push(s);
+        self.themes.push(crate::style_theme::XfTheme::default());
         self.index.insert(k, id);
         id
+    }
+
+    /// 记录样式号的主题色引用（不参与去重键：主题不同的两格颜色已由解析结果区分）
+    pub fn set_theme(&mut self, id: u16, t: crate::style_theme::XfTheme) {
+        if let Some(slot) = self.themes.get_mut(id as usize) {
+            *slot = t;
+        }
+    }
+
+    pub fn theme_of(&self, id: u16) -> crate::style_theme::XfTheme {
+        self.themes.get(id as usize).copied().unwrap_or_default()
     }
 
     pub fn get(&self, id: u16) -> &CellStyle {
