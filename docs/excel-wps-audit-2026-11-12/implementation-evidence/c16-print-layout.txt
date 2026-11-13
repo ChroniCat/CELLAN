@@ -1,0 +1,111 @@
+# C16 打印：显示模型、分页与页眉页脚、预览/PDF 同源
+
+日期：2026-11-14
+范围：C16.1（数字格式与字体显示模型）、C16.2（合并/换行/对齐、分页重复标题）、
+C16.4（预览与 PDF 逐页一致）。C16.3（图片/图表/文本框）本轮未做，见状态。
+
+## 1. 显示模型（`crates/core/src/display.rs`，新增）
+
+预览和 PDF 现在都调 `print::page_ops`，`page_ops` 里每格走 `display::view_at_value`：
+
+- General 对齐按值类型：文本左、数字/日期右、布尔/错误居中（与屏幕一致）；
+- 数字格式走 `style::format_value_in`（含 `[Red]`、千分位、货币、百分比、日期系统）；
+- 合并区只画锚点，被盖住的格跳过，锚点跨列/跨行取总宽高；
+- 自动换行按格宽折行（CJK 1 字号 / ASCII 0.55 字号），行距 1.18，垂直对齐 上/中/下；
+- 缩进、旋转角、数据条、条件格式叠加（颜色/粗体/填充）都带进来；
+- 公式格缓存值为空时用 `formula::eval_formula` 算一次，打印显示结果而不是空白。
+
+新增回归 `crates/core/tests/c16_print.rs::display_model_resolves_alignment_formats_and_colors`：
+General 三种对齐、`25.6%`、`--987.65`、`¥1,234,567.89`、合并范围、折行行数。
+
+### 负号：按 Excel 实测改了一处
+
+COM 实测（`scripts/c16_negfmt.ps1`）：
+
+```text
+fmt=[(#,##0.00)]       -1234.5 → -(1,234.50)
+fmt=[Red]-#,##0.00     -987.654 → --987.65
+```
+
+单段格式对负数：先取绝对值套格式，再无条件补一个负号。旧实现只在结果不以 `-`
+开头时补，导致 `[Red]-#,##0.00` 少一个负号；现在与 Excel 一致（`style.rs`）。
+
+## 2. 分页与打印标题
+
+`print::paginate` 的正文范围改为「标题之后」：`title_rows=1:2` 时第一页正文从 0 基第 2 行开始，
+标题区单独画；续页可用高度扣掉标题高度，正文不会重复。
+
+`print::header_parts` 支持 `&L/&C/&R`、`&P`、`&N`、`&&`；没有分段标记时整段居中。
+页眉在纸张上边距上方，页脚在下边距处（未设页脚时自动「第 N / M 页」）。
+
+回归 `pagination_repeats_titles_and_starts_body_after_them` / `body_cells_are_not_duplicated_in_continuation_pages` /
+`csv_of_pages_matches_expected_row_split` / `empty_sheet_still_produces_one_page`。
+
+## 3. 与 Excel 的逐页对拍
+
+夹具 `crates/core/tests/fixtures/c16/print.xlsx`（`scripts/c16_print_fixture.py`）：
+合并标题、表头填充、三种数字格式、布尔/文本、合并换行区、50 行明细、`print_title_rows=1:2`、
+页眉「销售汇总 &P/&N」、页脚「内部资料 / 第 &P 页」、A4 纵向。
+
+导出：
+
+```text
+我们的 PDF：work/goal-logs/gui/…（测试内 $TMPDIR/sc_c16_print.pdf） 2 页
+Excel ExportAsFixedFormat：work/goal-logs/gui/c16-excel.pdf           2 页
+```
+
+pypdfium2 逐页取文本：
+
+| 项 | 我们 | Excel |
+| --- | --- | --- |
+| 页数 | 2 | 2 |
+| 页眉 `销售汇总 1/2`、`2/2` | 有 | 有 |
+| 表头 `产品 数量 单价 金额` | 每页 | 每页 |
+| `180.00` / `360.00` / `160.00` | 有 | 有 |
+| `25.6%` | 有 | 有 |
+| `--987.65` | 有（修复后） | 有 |
+| `¥1,234,567.89` | 有 | 有 |
+| `TRUE`、`左对齐文本` | 有 | 有 |
+| 页脚 `内部资料` / `第 2 页` | 有 | 有 |
+| 合并标题出现次数 | 2 页各 1 次 | 第 1 页 0 次、第 2 页 1 次 |
+| 合并换行区 | 第 1 页两行 | 两页都没有 |
+
+最后两行是 Excel 自己的怪异行为：`print_title_rows=1:2` 与合并区重叠时，Excel 把 A1:D1
+的合并标题挪到第 2 页才画，且跳过了 A8:D9 的合并换行块。我们按「标题每页重复、正文不重不漏」
+输出，不复刻这个缺陷，差异如实记录。
+
+## 4. 预览与 PDF 同源
+
+打印预览（`main.rs::print_preview_window`）不再自己遍历单元格，改为：
+
+```rust
+let layout = sheetcore::print::paginate(sheet, &sheet.page);
+let ops = sheetcore::print::page_ops(&self.wb, self.sheet_idx, &layout, page_no);
+// rects / lines / texts 逐条画到纸上，坐标按 ph 换算
+```
+
+PDF 走同一个 `page_ops`，只多一步字形编码（`Page::glyph_hex`）与 `text_styled`
+（粗体描边、斜体错切、旋转矩阵）。因此「预览与 PDF 逐页一致」是结构保证，不是两套代码凑出来。
+
+无界面探针证据（不是交互验收）：
+
+```text
+SC_PREVIEW=1 → [preview] page=1/2 rows=(2, 53) cols=(0, 5) scale=0.86 paper=595x842 cells=208
+截图 work/goal-logs/gui/c16-preview.png（1440×900，约 29% 非白像素）
+```
+
+## 5. 测试
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c16_print -- --test-threads=2
+test result: ok. 6 passed; 0 failed
+cargo test -p sheetcore（全量）  → 763 passed
+cargo test -p app --bin app      → 263 passed
+```
+
+## 状态
+
+- C16.1 / C16.2 / C16.4 → 待验收（本机 RDP 不可用，真实键鼠点预览/导出未执行，
+  不以 SC_* 注入冒充；实现与 PDF/Excel 对拍已就位，等复核）。
+- C16.3 图片/图表/文本框 → 待实施：`page_ops` 已留 `Out.images` 槽位，
+  但尚未把 `sheet.pictures/charts/textboxes` 转成绘制指令，PDF 也还没有 image XObject。

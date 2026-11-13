@@ -237,6 +237,40 @@ impl Page {
         ));
     }
 
+    /// 带样式的文字：粗体用描边模拟，斜体是文本矩阵错切，rotation 为逆时针角度。
+    pub fn text_styled(
+        &mut self,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        hex: &str,
+        rgb: [u8; 3],
+        bold: bool,
+        italic: bool,
+        rotation: f32,
+    ) {
+        let rad = rotation.to_radians();
+        let (sin, cos) = (rad.sin(), rad.cos());
+        let skew = if italic { 0.21 } else { 0.0 };
+        // [a b c d e f]：c 同时承担旋转的第二基与斜体错切
+        let a = cos;
+        let b = sin;
+        let c = -sin + skew * cos;
+        let d = cos;
+        let stroke = if bold {
+            format!("{:.3} {:.3} {:.3} RG {:.3} w 2 Tr ", rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0, size * 0.035)
+        } else {
+            String::new()
+        };
+        self.ops.push_str(&format!(
+            "BT {:.3} {:.3} {:.3} rg {stroke}/F1 {size:.2} Tf {a:.4} {b:.4} {c:.4} {d:.4} {x:.2} {baseline:.2} Tm <{hex}> Tj ET
+",
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0
+        ));
+    }
+
     /// 把字符串转成字形号 hex
     pub fn glyph_hex(font: &Font, s: &str) -> String {
         let mut out = String::with_capacity(s.len() * 4);

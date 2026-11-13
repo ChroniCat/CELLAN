@@ -5068,35 +5068,13 @@ impl SheetApp {
         let mut do_print = false;
         let mut do_export = false;
         // 先把要画的东西取出来，别在闭包里借 self
-        let (layout, cols, rows, texts, page_no, total) = {
+        let (layout, ops, page_no, total) = {
             let sheet = self.wb.sheet(self.sheet_idx);
             let layout = sheetcore::print::paginate(sheet, &sheet.page);
             let total = layout.pages.len().max(1);
             let page_no = self.preview_page.min(total - 1);
-            let span = layout
-                .pages
-                .get(page_no)
-                .cloned()
-                .unwrap_or(sheetcore::print::PageSpan { rows: (0, 0), cols: (0, 0) });
-            let mut texts: Vec<(u32, u32, String)> = Vec::new();
-            for r in span.rows.0..=span.rows.1 {
-                for c in span.cols.0..=span.cols.1 {
-                    if let Some(cell) = sheet.get(r, c) {
-                        let t = cell.value.display();
-                        if !t.is_empty() {
-                            texts.push((r, c, t));
-                        }
-                    }
-                }
-            }
-            (
-                layout,
-                sheet.cols.clone(),
-                sheet.rows.clone(),
-                texts,
-                page_no,
-                total,
-            )
+            let ops = sheetcore::print::page_ops(&self.wb, self.sheet_idx, &layout, page_no);
+            (layout, ops, page_no, total)
         };
         let span = layout
             .pages
@@ -5167,57 +5145,39 @@ impl SheetApp {
                         egui::StrokeKind::Inside,
                     );
 
-                    // 一页内容的原始尺寸（96 DPI 像素）
-                    let mut content_w = 0.0f32;
-                    for c in span.cols.0..=span.cols.1 {
-                        content_w += cols.size(c);
-                    }
-                    let mut content_h = 0.0f32;
-                    for r in span.rows.0..=span.rows.1 {
-                        content_h += rows.size(r);
-                    }
-                    let fit = (print_w * scale_preview / content_w.max(1.0))
-                        .min(print_h * scale_preview / content_h.max(1.0));
-                    let cell_scale = fit * scale_txt;
-
-                    let mut y = inner.min.y;
-                    for r in span.rows.0..=span.rows.1 {
-                        let h = rows.size(r) * cell_scale;
-                        if y > inner.max.y + 1.0 {
-                            break;
-                        }
-                        let mut x = inner.min.x;
-                        painter.line_segment(
-                            [egui::pos2(inner.min.x, y), egui::pos2(inner.max.x, y)],
-                            egui::Stroke::new(0.4, egui::Color32::from_gray(225)),
+                    // 与 PDF 完全同源：纸上的每个矩形/线段/文字都来自 print::page_ops
+                    let s_pt = page_h / ph;
+                    let to_xy = |x: f32, y: f32| {
+                        egui::pos2(page_rect.min.x + x * s_pt, page_rect.min.y + (ph - y) * s_pt)
+                    };
+                    for (x, y, w, h, color) in &ops.rects {
+                        let a = to_xy(*x, *y + *h);
+                        let b = to_xy(*x + *w, *y);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(a, b),
+                            0.0,
+                            egui::Color32::from_rgb(color[0], color[1], color[2]),
                         );
-                        for c in span.cols.0..=span.cols.1 {
-                            let w = cols.size(c) * cell_scale;
-                            if x > inner.max.x + 1.0 {
-                                break;
-                            }
-                            if let Some((_, _, t)) =
-                                texts.iter().find(|(rr, cc, _)| *rr == r && *cc == c)
-                            {
-                                let fs = (11.0 * cell_scale * 1.05).clamp(4.0, 15.0);
-                                let per = (fs * 0.62).max(1.0);
-                                let max_chars = ((w - 2.0).max(1.0) / per) as usize + 1;
-                                let clipped: String = t.chars().take(max_chars).collect();
-                                painter.text(
-                                    egui::pos2(x + 1.0, y + 1.0),
-                                    egui::Align2::LEFT_TOP,
-                                    clipped,
-                                    egui::FontId::proportional(fs),
-                                    egui::Color32::BLACK,
-                                );
-                            }
-                            painter.line_segment(
-                                [egui::pos2(x, y), egui::pos2(x, (y + h).min(inner.max.y))],
-                                egui::Stroke::new(0.4, egui::Color32::from_gray(225)),
-                            );
-                            x += w;
-                        }
-                        y += h;
+                    }
+                    for (x1, y1, x2, y2, lw, color) in &ops.lines {
+                        painter.line_segment(
+                            [to_xy(*x1, *y1), to_xy(*x2, *y2)],
+                            egui::Stroke::new(
+                                (lw * s_pt).max(0.4),
+                                egui::Color32::from_rgb(color[0], color[1], color[2]),
+                            ),
+                        );
+                    }
+                    for t in &ops.texts {
+                        let pos = to_xy(t.x, t.baseline);
+                        let fs = (t.size * s_pt).max(3.0);
+                        painter.text(
+                            pos,
+                            egui::Align2::LEFT_BOTTOM,
+                            t.text.clone(),
+                            egui::FontId::proportional(fs),
+                            egui::Color32::from_rgb(t.color[0], t.color[1], t.color[2]),
+                        );
                     }
                     if std::env::var("SC_PREVIEW").is_ok() {
                         eprintln!(
@@ -5229,7 +5189,7 @@ impl SheetApp {
                             scale_txt,
                             pw,
                             ph,
-                            texts.len()
+                            ops.texts.len()
                         );
                     }
                 });

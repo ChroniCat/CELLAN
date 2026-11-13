@@ -3456,12 +3456,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C16.1 待验收；C16.2/C16.3/C16.4 未开始。"
+        "C16.1/C16.2/C16.4 已实现并等待复核（真实键鼠预览/导出未执行，RDP 不可用）；C16.3 图片/图表/文本框尚未进打印"
       ],
       "failures": [],
       "blocker": "",
       "next": "继续 C16.2 颜色与样式，再补页眉页脚和逐页一致性。",
-      "updated_utc": "2026-11-13T12:26:00Z",
+      "updated_utc": "2026-11-13T18:00:16Z",
       "slices": [
         {
           "id": "C16.1",
@@ -3477,7 +3477,11 @@
             "crates/core/tests/pdf_export.rs",
             "crates/core/tests/fixtures/c16/number_formats.xlsx",
             "scripts/c16_number_format_fixture.py",
-            "crates/core/examples/c16_pdf.rs"
+            "crates/core/examples/c16_pdf.rs",
+            "crates/core/src/display.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print.rs",
+            "crates/core/tests/fixtures/c16/print.xlsx"
           ],
           "commits": [],
           "commands": [
@@ -3487,7 +3491,8 @@
             "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-number-format.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-number-format.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
           ],
           "not_done": [
             "负数 [Red] 颜色未绘制（C16.2）；没有逐页 Excel/WPS 视觉矩阵；pypdfium2 读回文本已记录，pdftotext 对 ¥ 有阅读器差异。"
@@ -3495,7 +3500,7 @@
           "failures": [],
           "blocker": "",
           "next": "监督复核 C16.1；随后做 C16.2 样式/颜色。",
-          "updated_utc": "2026-11-13T12:26:00Z"
+          "updated_utc": "2026-11-13T18:00:16Z"
         },
         {
           "id": "C16.2",
@@ -3503,17 +3508,28 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/display.rs",
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print.rs",
+            "crates/core/tests/fixtures/c16/print.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
+          ],
+          "not_done": [
+            "打印标题每页重复、正文不重不漏；单段负格式按 Excel 实测修正（--987.65）；等待复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T18:00:16Z"
         },
         {
           "id": "C16.3",
@@ -3539,17 +3555,28 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/display.rs",
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print.rs",
+            "crates/core/tests/fixtures/c16/print.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
+          ],
+          "not_done": [
+            "预览改为直接画 print::page_ops，与 PDF 同源；真实键鼠操作未执行，留待验收"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T18:00:16Z"
         }
       ]
     },

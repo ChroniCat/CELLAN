@@ -305,7 +305,9 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
                 (sections[0].as_str(), *n, false)
             };
             let mut out = render_section(val, sec);
-            if need_minus && !out.trim_start().starts_with('-') {
+            // Excel 单段格式对负数：先取绝对值套格式，再在最前面补一个负号
+            // （`(#,##0.00)` → `-(1,234.50)`；`[Red]-#,##0.00` → `--987.65`）
+            if need_minus {
                 out.insert(0, '-');
             }
             out

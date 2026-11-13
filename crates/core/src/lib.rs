@@ -25,6 +25,7 @@ pub mod notes;
 pub mod page;
 pub mod patch;
 pub mod pdf;
+pub mod display;
 pub mod print;
 pub mod protection;
 pub mod cells;
