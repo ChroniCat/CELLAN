@@ -448,3 +448,46 @@ fn xls_save_with_formula_succeeds() {
     }
 }
 
+
+#[test]
+fn compatibility_warning_is_visible_on_open() {
+    let mut app = app();
+    let (tx, rx) = mpsc::channel();
+    app.tasks.open_rx = Some(rx);
+    app.tasks.busy = true;
+    app.open_in_new_tab(PathBuf::new());
+    let mut diag = sheetcore::xlsx::LoadDiag::default();
+    diag.push(
+        Some("Other"),
+        "xl/worksheets/sheet1.xml",
+        "兼容提示",
+        "外部工作簿三维引用暂不参与重算；保留文件缓存".into(),
+        false,
+    );
+    tx.send(OpenMsg::Loaded(Box::new(book(1.0)), false, Box::new(diag))).unwrap();
+    app.switch_tab(0);
+    app.poll_open();
+    assert!(app.show_load_diag, "兼容诊断必须可见，不能只在状态栏一闪而过");
+    assert!(app.load_diag.as_ref().is_some_and(|d| d.problems.iter().any(|p| p.what == "兼容提示")));
+    assert!(!app.has_pending_save());
+}
+
+
+#[test]
+fn actual_external_3d_fixture_opens_with_visible_compatibility_warning() {
+    let mut app = app();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../core/tests/fixtures/c11_external_3d.xlsx");
+    app.open_path(fixture);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && (app.tasks.busy || app.tasks.open_rx.is_some()) {
+        app.poll_open();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    app.poll_open();
+    assert!(app.show_load_diag, "真实导入的兼容诊断必须可见");
+    let cell = app.wb.sheets[0].get(0, 0).expect("fixture A1");
+    assert_eq!(cell.formula.as_deref(), Some("=SUM([1]First:Third!A1)"));
+    assert_eq!(cell.value, Value::Number(60.0));
+    assert!(app.load_diag.as_ref().is_some_and(|d| d.problems.iter().any(|p| p.what == "兼容提示")));
+}

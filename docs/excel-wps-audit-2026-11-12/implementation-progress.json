@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T05:16:26Z",
+  "updated_utc": "2026-11-13T05:35:20Z",
   "tasks": [
     {
       "id": "C01",
@@ -2645,7 +2645,7 @@
       "source": "core-requirements.md",
       "heading": "C11 P1 常用引用语法",
       "status": "实施中",
-      "acceptance": "C11.1 整行加载原文、grid_of 校验、真实 range_reads 已由用户 11:13 认可；剩余 3 个确定性缺口已修：spill_shapes 可信锚点/精确形状（含 1×1、尾格/旁普通格）、cf 整行跳过结构化方括号、save/reload 使用实际加载公式且 Shift.n=1。C11.3/C11.4 未实施，父项待验收。",
+      "acceptance": "C11.3/C11.4 已实施并进入待验收：@ 单行按公式列、整段引号 3D、3D xls 首尾索引、反向删除端点均已有专项/真实 Office 证据；反向专项改用真实顺序 First,Second,Third,Other + =SUM(Third:First!A1)，断言 pa>pz，删 First 得 Third:Second=50，删 Third 得 Second:First=30。另补外部工作簿三维引用这一 C11 合法但引擎尚未支持的组合：加载诊断可见、重算保留缓存、保存/重载仍保留；真正 REF/VALUE/NAME 仍按错误值写回。XLS 导出拒绝只是导出安全保护，不能替代这条输入/重算保护；父项仍未验收。",
       "files": [
         "crates/core/src/lib.rs",
         "crates/core/src/cf.rs",
@@ -2665,25 +2665,31 @@
         "cargo test -p sheetcore --offline --test three_d -> 16 passed",
         "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
         "cargo test -p sheetcore --offline xls_formula -> 11 passed (含 3D Ref3DPtg/Area3DPtg ixti)",
-        "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored",
-        "cargo test -p app --offline --bin app -> 202 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 202 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test c11_compat -> 3 passed",
+        "cargo test -p sheetcore --offline -> 75 bins / 677 passed / 0 failed / 41 ignored",
+        "cargo test -p app --offline --bin app -> 204 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app actual_external_3d_fixture_opens_with_visible_compatibility_warning -> 1 passed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-implicit-intersection.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-three-d-refs.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-xls-compat.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-xls-compat.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-unsupported-cache.txt"
       ],
       "not_done": [
-        "C11.3/C11.4 当前标记待验收：本地专项、真实 Excel/WPS 样本已跑，但完整交叉矩阵和 WPS 删除全矩阵仍待独立复核",
         "xls 3D 仅证明导出后 Office 可重算（probe Close(false)），不是 Office 保存往返",
-        "不支持组合采用“保留模型/目标 + 兼容提示 + 另存 xlsx”的安全拒绝，不是把公式降级写入 .xls"
+        "不支持组合采用“保留模型/目标 + 兼容提示 + 另存 xlsx”的安全拒绝，不是把公式降级写入 .xls",
+        "C11.3/C11.4 仍待独立复核：完整交叉矩阵和 WPS 删除全矩阵未关闭；C11 父项不提前记绿",
+        "C11 原始输入/重算不支持语法保护只覆盖外部工作簿三维引用这一明确组合；不扩大到所有未知函数/所有 parse 失败",
+        "XLS 导出兼容拒绝是导出格式安全网（另存 .xlsx 可接受），不是 C11 输入/重算保护，两者证据分开"
       ],
       "failures": [],
       "blocker": "",
-      "next": "独立复核 C11.1/C11.2 剩余修复；之后实施 C11.3 隐式交集 @。",
-      "updated_utc": "2026-11-13T05:16:26Z",
+      "next": "独立复核 C11.3/C11.4 与反向真实顺序专项；继续全需求。",
+      "updated_utc": "2026-11-13T05:35:20Z",
       "slices": [
         {
           "id": "C11.1",
@@ -2781,7 +2787,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T05:16:26Z"
+          "updated_utc": "2026-11-13T05:35:20Z"
         },
         {
           "id": "C11.4",
@@ -2790,7 +2796,7 @@
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "三维引用解析/求值/依赖/复制；整段引号与转义撇号；改名和删除端点按删除前 order 在区间内找邻居，唯一成员耗尽整体 #REF!，反向首尾删除不写半截；中文引用和中文 3D 端点 UTF-8 安全；xls 用 Ref3DPtg/Area3DPtg + ixti 首尾索引。16 passed；Excel/WPS golden 60/66/50、quoted 60、xls 60→150、WPS 删 First=50 见证据。",
+          "acceptance": "三维引用解析/求值/依赖/复制；整段引号与转义撇号；改名和删除端点按删除前 order 在区间内找邻居，唯一成员耗尽整体 #REF!，反向首尾删除不写半截；中文引用和中文 3D 端点 UTF-8 安全；xls 用 Ref3DPtg/Area3DPtg + ixti 首尾索引。16 passed；Excel/WPS golden 60/66/50、quoted 60、xls 60→150、WPS 删 First=50 见证据。 反向专项已改为真实顺序 First,Second,Third,Other，公式 Third:First，pa>pz；删 First→Third:Second=50，删 Third→Second:First=30。",
           "files": [
             "crates/core/src/refs.rs",
             "crates/core/src/sheet_ops.rs",
@@ -2817,7 +2823,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T05:16:26Z"
+          "updated_utc": "2026-11-13T05:35:20Z"
         }
       ]
     },

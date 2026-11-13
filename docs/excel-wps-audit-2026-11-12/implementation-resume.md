@@ -1,14 +1,13 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `e846d75`；C11/C10 复核修复与 UTF-8 回归已提交。
+- 分支 `main`（`origin/main`），HEAD `136b81e`（C11.3/C11.4 与 XLS 兼容保护已提交）；本轮反向真实顺序与 C11 输入/重算保护见文末。
 - 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
-  切片 31 已验收 / 20 待验收 / 97 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
-- 当前测试真值（11:38 UTF-8 回归修复后重跑）：core 72 bins /
-  650 passed / 0 failed / 41 ignored，CORE_EXIT=0；app 201 passed / 0 failed /
-  APP_EXIT=0。GUI 快照未重跑，不作为当前证据。
-- 当前未完成：C11.3/C11.4 未实施、Office 实机未做；C10/C11 父项仍实施中。
-  C10.2/C10.3 与 C11.1/C11.2 的 11:38 认可项已关闭，不重复修；C10.2 live 按
-  用户要求保留。
+  切片 33 已验收 / 20 待验收 / 95 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
+- 当前测试真值（13:35 后重跑）：core **75 bins / 677 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **204 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
+  不作为当前证据。
+- 当前未完成：C11.3/C11.4 待独立复核、C11 父项仍实施中；C10.2 live 按用户要求保留，
+  C11.1/C11.2 已认可项不重复修。
 
 ## 12:35 当前：11:38 UTF-8 回归修复
 
@@ -333,3 +332,27 @@
   c11-three-d-refs、c11-xls-compat、c10-structured-escapes。
 - 未完成：完整反向/唯一/中文 Office 交叉矩阵、WPS 全函数矩阵、xls Office
   保存往返、C10.2/C10.3 与 C11 父项独立复核，均不能记绿。
+
+
+## 13:35 当前：反向真实顺序 + C11 输入/重算保护
+
+- 用户 13:14 指出旧反向测试/Excel 脚本是 `Third,Second,First`，`Third:First`
+  实际 `pa0<pz2`，并未覆盖 `pa>pz`。已把专项改成真实顺序
+  `First,Second,Third,Other`，公式 `=SUM(Third:First!A1)`，断言 `pa>pz`；
+  删 First 得 `=SUM(Third:Second!A1)=50`，删 Third 得
+  `=SUM(Second:First!A1)=30`。`three_d` 16 passed。
+- Excel 16.0 真实脚本 `c114_reverse_real.ps1`：输入 `Third:First` 后 COM
+  归一化为 `First:Third` 60；删 First → `Second:Third` 50，删 Third →
+  `First:Second` 30；证据保留“输入/COM 返回值”区别，不冒充引擎反向原文。
+- XLS 导出兼容拒绝保护已认可为**导出安全网**，标题改为“XLS 导出兼容保护”；
+  它不是 C11 原始输入/重算保护，父项 C11 保持待办。
+- 补 C11 原始输入/重算链：选择 **外部工作簿三维引用**
+  `=SUM([1]First:Third!A1)`（C11 合法、引擎确实未支持）。Excel 生成夹具
+  `crates/core/tests/fixtures/c11_external_3d.xlsx`；`load_diag` 给非致命
+  “兼容提示”，打开后 60 保留；`recalc_all_force` 不覆盖缓存；保存重载仍
+  公式/60/提示。真正的 `#REF!`/`#DIV/0!`/`#NAME?` 和未知函数仍按错误写回，
+  不扩大到所有 parse 失败。`c11_compat` 3 passed；App 真实导入夹具测试通过。
+- 当前全量：core **75 bins / 677 passed / 0 failed / 41 ignored**；app
+  **204 passed / 0 failed / 0 ignored**。App 204 是新增兼容测试后的当前值，
+  不把旧 202/674 或未完成的后台进程当最终绿。
+- C11.3/C11.4 仍是“待验收”；C11 父项不翻绿。

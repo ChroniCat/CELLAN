@@ -1075,6 +1075,15 @@ impl<'a> Calc<'a> {
             let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), Some(c), &raw).unwrap_or(raw);
             let normalized = crate::normalize_formula(&expanded);
             let body = normalized.as_str();
+            // 合法但尚未实现的引用组合：保留文件里的缓存，不让 parse 失败把
+            // 已知结果写成 #REF!/#VALUE!。只对明确的组合生效，真正的运算错误
+            //（包括本来就缓存为错误的格）仍走正常求值。
+            if let Some(_reason) = unsupported_reference_combo(body) {
+                let cached = to_fvalue(&cell.value);
+                if !matches!(cached, FValue::Error(_)) {
+                    return cached;
+                }
+            }
             if !self.visiting.insert(key) {
                 CYCLE_CELLS.with(|cells| {
                     cells.borrow_mut().insert(key);
@@ -2726,6 +2735,44 @@ pub fn parse(src: &str) -> Result<Node, ErrKind> {
         return Err(ErrKind::Value);
     }
     Ok(node)
+}
+
+/// 识别 C11 引用范围内、当前求值器尚未实现的合法组合。
+///
+/// 这里只列明确支持的兼容场景，不能把普通 parse 失败都算进来：真正的
+/// `#REF!`/`#VALUE!` 仍必须由运算产生。当前明确未实现的是**外部工作簿的
+/// 三维引用**（例如 `[1]First:Third!A1`）；它和普通外部单表引用不同，
+/// 需要跨外部链接的所有端点表展开，现阶段无法可靠求值。返回的说明会带进
+/// 加载诊断，并让重算保留文件里的缓存值。
+pub fn unsupported_reference_combo(src: &str) -> Option<&'static str> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let Some(rel) = src[i + 1..].find(']') else {
+            return None;
+        };
+        let after = i + 1 + rel + 1;
+        let mut j = after;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'!' => {
+                    if src[after..j].contains(':') {
+                        return Some("外部工作簿三维引用");
+                    }
+                    break;
+                }
+                // 括号/逗号/另一个方括号说明这里不是单一限定符，交给后续扫描。
+                b'(' | b')' | b',' | b'[' | b']' => break,
+                _ => j += 1,
+            }
+        }
+        i = after;
+    }
+    None
 }
 
 fn array_blocked(wb: &Workbook, si: usize, r: u32, c: u32, a: &value::Array, ignore_old_spills: bool) -> bool {

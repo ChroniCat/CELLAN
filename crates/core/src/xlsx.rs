@@ -960,6 +960,28 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         }
     }
     wb.load_incomplete = diag.has_fatal();
+    // C11：合法但引擎尚未实现的引用组合，必须在打开时就给出可见诊断；
+    // 重算会保留文件缓存，读入后不把已知结果覆盖成错误。
+    for sheet in &wb.sheets {
+        for (cref, cell) in sheet.iter() {
+            let Some(formula) = cell.formula.as_deref() else {
+                continue;
+            };
+            if let Some(reason) = crate::formula::unsupported_reference_combo(formula) {
+                diag.push(
+                    Some(&sheet.name),
+                    sheet.source_part.as_deref().unwrap_or("xl/worksheets"),
+                    "兼容提示",
+                    format!(
+                        "{} 的公式 {} 使用{reason}，当前版本暂不参与重算；保留文件里的缓存值，可另存为 .xlsx 或改为单工作簿引用。",
+                        crate::model::cell_name(cref.row, cref.col),
+                        formula
+                    ),
+                    false,
+                );
+            }
+        }
+    }
     Ok((wb, diag))
 }
 

@@ -1980,8 +1980,9 @@ impl SheetApp {
             match msg {
                 OpenMsg::Loaded(wb, big, diag) => {
                     self.deps_pending = big;
+                    let compat = diag.problems.iter().any(|p| !p.fatal && p.what == "兼容提示");
                     self.load_diag = if diag.is_complete() { None } else { Some(*diag) };
-                    if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
+                    if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) || compat {
                         self.status = self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default();
                         self.show_load_diag = true;
                     }

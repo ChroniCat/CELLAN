@@ -1,0 +1,59 @@
+# C11 输入/重算：合法但引擎尚不支持的引用组合（缓存保留链）
+
+状态：实现完成，待独立复核；父项 C11 仍未验收。日期：2026-11-13。
+
+## 选择的组合
+
+外部工作簿三维引用（C11 合法的三维引用，跨 `.xlsx` 外部链接）：
+
+```text
+=SUM('[c114_ext_book2.xlsx]First:Third'!A1)
+```
+
+Excel 16.0 实际输入并保存后，COM 返回的是归一化外部链接索引形式：
+
+```text
+=SUM([1]First:Third!A1)   60
+```
+
+这不是 `@A1` 缓存 7 的导出格式测试；`@` 引擎已经支持，不能拿它充当本条。
+
+## 实际导入 → 打开/重算 → 保存/重载
+
+夹具 `crates/core/tests/fixtures/c11_external_3d.xlsx` 由 Excel 16.0 生成，
+另带 `c114_ext_book2.xlsx`（First/Second/Third 的 A1=10/20/30）：
+
+```text
+LOAD   Other!A1 formula="=SUM([1]First:Third!A1)" value=60
+DIAG   [Other] 兼容提示 · A1 的公式 … 使用外部工作簿三维引用，当前版本暂不参与重算；
+       保留文件里的缓存值，可另存为 .xlsx 或改为单工作簿引用。fatal=false
+RECALC Other!A1 formula="=SUM([1]First:Third!A1)" value=60
+SAVE→RELOAD Other!A1 formula="=SUM([1]First:Third!A1)" value=60
+SAVE→RELOAD 诊断仍为 1 条非致命“兼容提示”
+```
+
+- 加载阶段：`xlsx::load_diag` 扫描公式，把该组合作为非致命 `兼容提示`
+  放入诊断；App 收到非致命兼容问题也打开“加载问题”窗口并显示状态。
+- 重算阶段：`Calc::cell_value` 只对**明确列出的**外部三维组合保留缓存；
+  `parse` 失败不再把已知 60 覆盖成 `#REF!`。
+- 保存/重载：`.xlsx` 写回原公式和缓存 60；再次打开仍识别并提示。
+- 真正错误：`=SUM(NoSuchSheet!A1)` 缓存 7 → 重算 `#REF!`；
+  `=1/0` 缓存 7 → `#DIV/0!`；`=NOSUCHFUNC(1)` → `#NAME?`。
+  这些不被“兼容缓存”保护吞掉。
+- 识别器有边界测试：普通外部单表引用、普通 3D、未知函数都不匹配。
+
+## 自动化
+
+```text
+cargo test -p sheetcore --offline --test c11_compat
+3 passed; 0 failed; 0 ignored
+
+cargo test -p app --offline --bin app actual_external_3d_fixture_opens_with_visible_compatibility_warning
+1 passed; 0 failed
+```
+
+## 边界
+
+只覆盖**外部工作簿三维引用**这一种明确组合；不把“所有未知函数/所有
+parse 失败”都转为保留缓存。若将来扩展其他合法但未支持的组合，必须
+逐项加入识别器和缓存保留测试，不能放宽成笼统的错误缓存兜底。

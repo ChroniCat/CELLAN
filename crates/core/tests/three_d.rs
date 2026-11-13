@@ -258,14 +258,14 @@ fn deleting_unique_member_of_three_d_span_is_whole_ref_error() {
 
 fn reverse_three_d_book() -> Workbook {
     let mut wb = Workbook::new_blank();
-    wb.sheets[0].name = "Third".into();
-    wb.sheets[0].set(0, 0, Cell { value: Value::Number(30.0), formula: None });
+    wb.sheets[0].name = "First".into();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Number(10.0), formula: None });
     let mut second = Sheet::new("Second");
     second.set(0, 0, Cell { value: Value::Number(20.0), formula: None });
     wb.sheets.push(second);
-    let mut first = Sheet::new("First");
-    first.set(0, 0, Cell { value: Value::Number(10.0), formula: None });
-    wb.sheets.push(first);
+    let mut third = Sheet::new("Third");
+    third.set(0, 0, Cell { value: Value::Number(30.0), formula: None });
+    wb.sheets.push(third);
     let mut other = Sheet::new("Other");
     other.set(0, 0, f("=SUM(Third:First!A1)"));
     wb.sheets.push(other);
@@ -275,7 +275,10 @@ fn reverse_three_d_book() -> Workbook {
 #[test]
 fn deleting_reverse_span_end_shrinks_toward_start() {
     let mut wb = reverse_three_d_book();
-    assert!(sheetcore::sheet_ops::delete_sheet(&mut wb, 2));
+    let pa = wb.sheets.iter().position(|s| s.name == "Third").unwrap();
+    let pz = wb.sheets.iter().position(|s| s.name == "First").unwrap();
+    assert!(pa > pz, "这是反向区间：Third 在 First 之后");
+    assert!(sheetcore::sheet_ops::delete_sheet(&mut wb, 0));
     assert_eq!(wb.sheets[2].get(0, 0).unwrap().formula.as_deref(), Some("=SUM(Third:Second!A1)"));
     recalc_all_force(&mut wb);
     assert_eq!(wb.sheets[2].value(0, 0), Value::Number(50.0));
@@ -284,7 +287,10 @@ fn deleting_reverse_span_end_shrinks_toward_start() {
 #[test]
 fn deleting_reverse_span_start_shrinks_toward_end() {
     let mut wb = reverse_three_d_book();
-    assert!(sheetcore::sheet_ops::delete_sheet(&mut wb, 0));
+    let pa = wb.sheets.iter().position(|s| s.name == "Third").unwrap();
+    let pz = wb.sheets.iter().position(|s| s.name == "First").unwrap();
+    assert!(pa > pz, "这是反向区间：Third 在 First 之后");
+    assert!(sheetcore::sheet_ops::delete_sheet(&mut wb, 2));
     assert_eq!(wb.sheets[2].get(0, 0).unwrap().formula.as_deref(), Some("=SUM(Second:First!A1)"));
     recalc_all_force(&mut wb);
     assert_eq!(wb.sheets[2].value(0, 0), Value::Number(30.0));

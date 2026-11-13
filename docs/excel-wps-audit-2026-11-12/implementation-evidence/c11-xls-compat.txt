@@ -1,6 +1,8 @@
-# C11 不支持引用组合：保留公式/缓存 + 兼容提示 + 保存仍保留
+# XLS 导出兼容保护（C11 辅助安全网）
 
-状态：链路已实现并验证；拒绝只是安全过渡，不把变造公式当成功保存。
+状态：XLS 导出拒绝保护已验收；这是**导出格式保护**，不能替代 C11 原始
+“输入/重算不支持语法时保留公式+缓存+可见诊断”的要求。后者见
+`c11-unsupported-cache.txt`；父项 C11 仍未验收。
 日期：2026-11-13。
 
 ## 实现
@@ -23,7 +25,7 @@ cargo test -p sheetcore --offline xls_write
 passed; 0 failed
 
 cargo test -p app --offline --bin app
-202 passed; 0 failed; 0 ignored
+204 passed; 0 failed; 0 ignored
 （含 unsupported_xls_save_keeps_formula_and_shows_compatibility_warning）
 ```
 
@@ -34,6 +36,12 @@ cargo test -p app --offline --bin app
 3. 错误文本包含“兼容提示”和单元格位置；
 4. 同一工作簿另存 `.xlsx` 后重新加载，公式 `=@A1` 和缓存 7 仍在；
 5. App 层失败保持 dirty，状态栏显示兼容提示。
+
+## 父项 C11 原始要求仍待办
+
+本文件的拒绝保护只证明 `.xls` 输出不会覆盖目标、App 保持 dirty 并提示；
+它不证明 C11 输入/重算时对合法但引擎不支持的引用组合保留公式与缓存。
+该链独立见 `c11-unsupported-cache.txt`，父项 C11 仍不翻绿。
 
 ## 边界
 

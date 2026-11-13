@@ -57,12 +57,25 @@ WPS 12.0 真实删除验证（2026-11-13 实跑）：
 WPS_DELETE Other!A1  =SUM(Second:Third!A1)  50
 ```
 
-Excel 16.0 真实删除验证（非本实现 golden）：
+Excel 16.0 真实顺序反向区间探针（2026-11-13，脚本 `c114_reverse_real.ps1`）：
 
 ```text
-=SUM(Third:First!A1) 60  -- 删 First 后 --> =SUM(Third:Second!A1) 50
-=SUM(Second:Second!A1) 20 -- 删 Second 后 --> 显示 #REF!（公式文本 =SUM(#REF!A1)）
+ORDER=First,Second,Third,Other
+PA=3 PZ=1                       # Excel 1-based；Third 在 First 之后，pa>pz
+输入 =SUM(Third:First!A1) 60    # COM 返回 =SUM(First:Third!A1) 60，Excel 会规范化方向
+删 First  -> =SUM(Second:Third!A1) 50
+删 Third  -> =SUM(First:Second!A1) 30
 ```
+
+引擎测试保留输入的反向写法（不先做 Excel 的端点归一化），在
+`First,Second,Third,Other` 顺序下断言 `pa>pz`，验证：
+
+```text
+=SUM(Third:First!A1) --删 First--> =SUM(Third:Second!A1) =50
+=SUM(Third:First!A1) --删 Third--> =SUM(Second:First!A1) =30
+```
+
+`Second:Second` 删唯一成员仍整段 `#REF!`（原探针）。
 
 整段引号 `c114_quoted.xlsx`（2026-11-13 实跑）：
 ```text
