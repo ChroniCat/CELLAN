@@ -1,0 +1,563 @@
+{
+  "schema": "qa01-three-party-roundtrip-v1",
+  "generated_utc": "2026-11-13T11:30:24Z",
+  "fixture": "F:\\finance-native-sheets-ready\\crates\\core\\tests\\fixtures\\qa01\\qa01_formula_min.xlsx",
+  "fixture_sha256": "d21a9c5c7147f0b9c9419759f3490826ee7abb87fbeb5da034fb7841384b7b3a",
+  "manifest": "F:\\finance-native-sheets-ready\\docs\\excel-wps-audit-2026-11-12\\implementation-evidence\\qa01-min-samples.json",
+  "core_exe": "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+  "paths": [
+    {
+      "id": "excel-project-excel",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\excel-input.xlsx",
+        "sha256": "c7890d653d4357270d25519fd7cfe619193e11b96e75063a0d4a768b88d02912",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "target": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\project-output.xlsx",
+        "sha256": "55ace0730134f10f547f273c67588c8a292e3081465c3ccf2ad58eaeb0186ec1",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\excel-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\01-excel-project-excel\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\01-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\01-excel-project-excel\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "55ace0730134f10f547f273c67588c8a292e3081465c3ccf2ad58eaeb0186ec1"
+      },
+      "expected": {
+        "A1": {
+          "type": "number",
+          "value": 1
+        },
+        "A2": {
+          "type": "number",
+          "value": 2
+        },
+        "A3": {
+          "type": "number",
+          "formula": "SUM(A1:A2)",
+          "value": 3
+        },
+        "B1": {
+          "type": "error",
+          "formula": "1/0",
+          "value": "#DIV/0!"
+        },
+        "B2": {
+          "type": "text",
+          "formula": "IFERROR(B1,\"ok\")",
+          "value": "ok"
+        },
+        "B3": {
+          "type": "number",
+          "formula": "A1+2",
+          "value": 3
+        },
+        "C1": {
+          "type": "text",
+          "value": "财务"
+        },
+        "C2": {
+          "type": "text",
+          "formula": "CONCATENATE(\"财\",\"务\")",
+          "value": "财务"
+        },
+        "D1": {
+          "type": "boolean",
+          "formula": "A1=1",
+          "value": true
+        },
+        "A4": {
+          "type": "number",
+          "formula": "DATE(1900,1,1)",
+          "value": 1
+        }
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "wps-project-wps",
+      "source": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\wps-input.xlsx",
+        "sha256": "98df94476c72fdb23ada5251631aa58674cd771479cb4ae5ba5d69cf537c2864",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\project-output.xlsx",
+        "sha256": "a4edc689fa70f6e29ba43d14cf212e392e1756b17c569bfdddc84f25345eb2e5",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\wps-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\02-wps-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\02-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\02-wps-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "a4edc689fa70f6e29ba43d14cf212e392e1756b17c569bfdddc84f25345eb2e5"
+      },
+      "expected": {
+        "A1": {
+          "type": "number",
+          "value": 1
+        },
+        "A2": {
+          "type": "number",
+          "value": 2
+        },
+        "A3": {
+          "type": "number",
+          "formula": "SUM(A1:A2)",
+          "value": 3
+        },
+        "B1": {
+          "type": "error",
+          "formula": "1/0",
+          "value": "#DIV/0!"
+        },
+        "B2": {
+          "type": "text",
+          "formula": "IFERROR(B1,\"ok\")",
+          "value": "ok"
+        },
+        "B3": {
+          "type": "number",
+          "formula": "A1+2",
+          "value": 3
+        },
+        "C1": {
+          "type": "text",
+          "value": "财务"
+        },
+        "C2": {
+          "type": "text",
+          "formula": "CONCATENATE(\"财\",\"务\")",
+          "value": "财务"
+        },
+        "D1": {
+          "type": "boolean",
+          "formula": "A1=1",
+          "value": true
+        },
+        "A4": {
+          "type": "number",
+          "formula": "DATE(1900,1,1)",
+          "value": 1
+        }
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "excel-project-wps",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\excel-input.xlsx",
+        "sha256": "0bbc1bda46e1d8931204d2d22c0702cbd89e1aede2d7efd6d6f76a6e56058cdf",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\project-output.xlsx",
+        "sha256": "8ad189a5288d9d70a2625fe6a71bc683eea93a3c3a30534b4c57ddc82b4f5a5c",
+        "values": {
+          "A1": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "1"
+          },
+          "A2": {
+            "value": 2.0,
+            "text": "2",
+            "formula": "2"
+          },
+          "A3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=SUM(A1:A2)"
+          },
+          "B1": {
+            "value": -2146826281,
+            "text": "#DIV/0!",
+            "formula": "=1/0"
+          },
+          "B2": {
+            "value": "ok",
+            "text": "ok",
+            "formula": "=IFERROR(B1,\"ok\")"
+          },
+          "B3": {
+            "value": 3.0,
+            "text": "3",
+            "formula": "=A1+2"
+          },
+          "C1": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "财务"
+          },
+          "C2": {
+            "value": "财务",
+            "text": "财务",
+            "formula": "=CONCATENATE(\"财\",\"务\")"
+          },
+          "D1": {
+            "value": true,
+            "text": "TRUE",
+            "formula": "=A1=1"
+          },
+          "A4": {
+            "value": 1.0,
+            "text": "1",
+            "formula": "=DATE(1900,1,1)"
+          }
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\excel-input.xlsx",
+          "C:\\Users\\Administrator\\AppData\\Local\\hermes\\cache\\scratch\\qa01_roundtrip_run\\03-excel-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\03-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\hermes\\\\cache\\\\scratch\\\\qa01_roundtrip_run\\\\03-excel-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "8ad189a5288d9d70a2625fe6a71bc683eea93a3c3a30534b4c57ddc82b4f5a5c"
+      },
+      "expected": {
+        "A1": {
+          "type": "number",
+          "value": 1
+        },
+        "A2": {
+          "type": "number",
+          "value": 2
+        },
+        "A3": {
+          "type": "number",
+          "formula": "SUM(A1:A2)",
+          "value": 3
+        },
+        "B1": {
+          "type": "error",
+          "formula": "1/0",
+          "value": "#DIV/0!"
+        },
+        "B2": {
+          "type": "text",
+          "formula": "IFERROR(B1,\"ok\")",
+          "value": "ok"
+        },
+        "B3": {
+          "type": "number",
+          "formula": "A1+2",
+          "value": 3
+        },
+        "C1": {
+          "type": "text",
+          "value": "财务"
+        },
+        "C2": {
+          "type": "text",
+          "formula": "CONCATENATE(\"财\",\"务\")",
+          "value": "财务"
+        },
+        "D1": {
+          "type": "boolean",
+          "formula": "A1=1",
+          "value": true
+        },
+        "A4": {
+          "type": "number",
+          "formula": "DATE(1900,1,1)",
+          "value": 1
+        }
+      },
+      "differences": [],
+      "status": "pass"
+    }
+  ],
+  "status": "pass"
+}

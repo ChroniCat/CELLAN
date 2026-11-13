@@ -1012,29 +1012,35 @@
         "scripts/qa01_min_oracle.py",
         "crates/core/tests/qa01_min_formula.rs",
         "crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx",
-        "crates/core/tests/fixtures/qa01/qa01_edit_min.xlsx"
+        "crates/core/tests/fixtures/qa01/qa01_edit_min.xlsx",
+        "crates/core/examples/qa01_roundtrip.rs",
+        "scripts/qa01_roundtrip.py"
       ],
-      "commits": [],
+      "commits": [
+        "fd91c28"
+      ],
       "commands": [
         "python scripts/qa01_min_samples.py --out-dir crates/core/tests/fixtures/qa01 --manifest docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json -> generated",
         "python scripts/qa01_min_oracle.py --fixture crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx --out docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json -> Excel 16.0 / WPS 12.0 values match",
-        "cargo test -p sheetcore --offline --test qa01_min_formula -> 2 passed / 0 failed / 0 ignored"
+        "cargo test -p sheetcore --offline --test qa01_min_formula -> 2 passed / 0 failed / 0 ignored",
+        "cargo run -p sheetcore --offline --example qa01_roundtrip -- <fixture> <output> -> exit 0",
+        "python scripts/qa01_roundtrip.py --fixture ... --manifest ... --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 3 paths, 0 differences"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.json"
       ],
       "not_done": [
-        "QA-01.2 完整 manifest/三方文件往返 runner 尚未建立。",
-        "QA-01.3 图表/透视/打印扩展夹具尚未建立。",
-        "本片仅覆盖最小公式与编辑工作簿基线；未覆盖修复提示、二次保存刷新等父项全部条件。",
-        "编辑样本尚未接入真实键盘/IME 路径。"
+        "仅覆盖最小 .xlsx 公式样本；.xls/.xlsm、图表/图片/透视/打印/命名区域/隐藏冻结/外链等类别的 runner 尚未建立。",
+        "未覆盖 Excel/WPS 修复提示、二次保存刷新、大簿和真实 UI 编辑路径。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "QA-01.1 已落盘待验收；继续 QA-01.2/3，父项保持实施中。",
-      "updated_utc": "2026-11-13T19:28:59Z",
+      "next": "QA-01.1/01.2 已落盘待验收；继续 QA-01.3 扩展类别，父项保持实施中。",
+      "updated_utc": "2026-11-13T19:32:00Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1051,7 +1057,9 @@
             "crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx",
             "crates/core/tests/fixtures/qa01/qa01_edit_min.xlsx"
           ],
-          "commits": [],
+          "commits": [
+            "fd91c28"
+          ],
           "commands": [
             "python scripts/qa01_min_samples.py --out-dir crates/core/tests/fixtures/qa01 --manifest docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json -> generated",
             "python scripts/qa01_min_oracle.py --fixture crates/core/tests/fixtures/qa01/qa01_formula_min.xlsx --out docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json -> Excel 16.0 / WPS 12.0 values match",
@@ -1079,17 +1087,29 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/examples/qa01_roundtrip.rs",
+            "scripts/qa01_roundtrip.py"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo run -p sheetcore --offline --example qa01_roundtrip -- <fixture> <output> -> exit 0",
+            "python scripts/qa01_roundtrip.py --fixture ... --manifest ... --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 3 paths, 0 differences"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.json"
+          ],
+          "not_done": [
+            "仅覆盖最小 .xlsx 公式样本；.xls/.xlsm、图表/图片/透视/打印/命名区域/隐藏冻结/外链等类别的 runner 尚未建立。",
+            "未覆盖 Excel/WPS 修复提示、二次保存刷新、大簿和真实 UI 编辑路径。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "继续 QA-01.3 图表/透视/打印扩展夹具；或按监督复核意见调整本 runner。",
+          "updated_utc": "2026-11-13T19:32:00Z"
         },
         {
           "id": "QA-01.3",
