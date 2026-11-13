@@ -3875,7 +3875,8 @@
       "files": [],
       "commits": [
         "2745438",
-        "fb2b55d"
+        "fb2b55d",
+        "f97377a"
       ],
       "commands": [],
       "evidence": [],
@@ -3931,7 +3932,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "fb2b55d"
+            "fb2b55d",
+            "f97377a"
           ],
           "commands": [
             "cargo test -p app --offline --bin app format_dialog_preserves_unchanged_fields_and_mixed_cell_styles -> 1 passed",
