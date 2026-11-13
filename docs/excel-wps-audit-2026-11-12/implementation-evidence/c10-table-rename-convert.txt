@@ -1,0 +1,64 @@
+# C10.2/C10.3 表格列改名与本表转区域（含公式改写、Excel/WPS 复核）
+
+日期：2026-11-14
+夹具：`crates/core/tests/fixtures/c10/table.xlsx`（Excel 16.0，`scripts/c10_table_fixture.ps1`）
+
+```text
+数据表：A1:C4，ListObject 名 Sales，列 Amount/Tax/Total
+E1 = SUM(Sales[Amount])              → 6
+E2 = Sales[[#This Row],[Amount]]*2   → 2
+```
+
+## 本次补的入口缺口
+
+表格结构模型、`rename_table_column`、`convert_table_to_range`、计算列填充此前已有实现与
+core 测试，但**「改表头文字」不会重命名表格列**：Excel 里把 A1 的 Amount 改成金额，
+表格列名、结构化引用、`SUM(Sales[金额])` 都会跟着变，我们只改了单元格文字。
+
+实现：`commit_edit` 写完格子后，如果该格落在某表格标题行且新值是文本，
+调用 `table::rename_table_column`，成功则刷新状态并全量重算（公式里的列名已改写）。
+
+回归（app）：
+
+```text
+editing_a_table_header_renames_the_column_and_fixes_formulas ... ok
+```
+
+- 表定义 `columns[0]` 从 Amount 变金额；
+- E1 公式从 `=SUM(Sales[Amount])` 变 `=SUM(Sales[金额])`。
+
+## 端到端：改名 → 保存 → 重开 → 转区域 → 保存
+
+`rename=true columns=["金额","Tax","Total"]` → 重开列名仍是金额；
+`converted=true tables=0`，公式已变 A1 形式：`E1=SUM(A2:A4)`、`E2=A2*2`。
+
+Excel 16.0 回读：
+
+```text
+RENAMED  : TABLES=1 COL1='金额' E1=6 E2=2 E1F='=SUM(Sales[金额])'
+CONVERTED: TABLES=0 COL1='<无表格>' E1=6 E2=2 E1F='=SUM(A2:A4)'
+```
+
+WPS 回读：
+
+```text
+WPS sc_c10_renamed.xlsx   TABLES=1 E1=6
+WPS sc_c10_converted.xlsx TABLES=0 E1=6
+```
+
+即：两款 Office 都认可「表格还在、列名已改、公式可算」与「表格对象已去掉、公式仍可算」。
+
+## 已有 core 回归（本轮复跑）
+
+```text
+cargo test -p sheetcore --test table_calculated  → 7 passed
+（含重命名保持 column id、改名后保存重开、转区域后公式可用、单表转换不影响其它表结构化引用）
+```
+
+## 状态
+
+C10.2（计算列/表扩展/列重命名）、C10.3（转换区域和保存往返）→ 待验收。
+计算列填充入口与表格扩展此前已在 `ribbon/actions.rs`、`commit_edit` 接通；
+本轮补的是表头改名入口与两款 Office 的端到端证据。
+
+全量：sheetcore **780 passed**、app `--bin app` **264 passed**。

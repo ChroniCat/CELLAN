@@ -6649,3 +6649,46 @@ fn selection_permissions_block_jumping_into_forbidden_cells() {
     assert!(!app.sel_blocked_at(0, 0));
     assert!(!app.sel_blocked_at(5, 5));
 }
+
+#[test]
+fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.tables.push(sheetcore::table::Table {
+            name: "Sales".into(),
+            display: "Sales".into(),
+            range: (0, 0, 3, 2),
+            columns: vec!["Amount".into(), "Tax".into(), "Total".into()],
+            column_ids: vec![1, 2, 3],
+            header_row: true,
+            totals_row: false,
+        });
+        for (c, h) in ["Amount", "Tax", "Total"].iter().enumerate() {
+            sh.set(0, c as u32, sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text((*h).into()),
+                formula: None,
+            });
+        }
+        for r in 1..=3 {
+            sh.set(r, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(r as f64), formula: None });
+            sh.set(r, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
+            sh.set(r, 2, sheetcore::model::Cell { value: sheetcore::model::Value::Number(4.0), formula: None });
+        }
+        sh.set(0, 4, sheetcore::model::Cell {
+            value: sheetcore::model::Value::Empty,
+            formula: Some("=SUM(Sales[Amount])".into()),
+        });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("金额".into()));
+    assert!(app.commit_edit(None), "表头改名应写入");
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.tables[0].columns[0], "金额", "表格列定义要跟着改");
+    assert_eq!(
+        sh.get(0, 4).and_then(|c| c.formula.as_deref()),
+        Some("=SUM(Sales[金额])"),
+        "结构化引用里的列名要一起改"
+    );
+}

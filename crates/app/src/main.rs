@@ -7558,6 +7558,35 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
             wrote = true;
             self.txn_end("编辑单元格", txn);
+            // 改表格标题行的文字 = 重命名该列（Excel 的行为），公式里的结构化引用跟着改
+            let mut renamed: Option<(String, String)> = None;
+            if let Some(Value::Text(v)) = self.wb.sheet(self.sheet_idx).get(r, c).map(|x| x.value.clone()) {
+                let tb = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .tables
+                    .iter()
+                    .find(|t| r == t.range.0 && c >= t.range.1 && c <= t.range.3)
+                    .cloned();
+                if let Some(tb) = tb {
+                    if let Some(old_col) = tb.columns.get((c - tb.range.1) as usize).cloned() {
+                        if old_col != v.as_ref()
+                            && sheetcore::table::rename_table_column(
+                                &mut self.wb,
+                                &tb.name,
+                                &old_col,
+                                v.as_ref(),
+                            )
+                        {
+                            renamed = Some((old_col, v.to_string()));
+                        }
+                    }
+                }
+            }
+            if let Some((old_col, new_col)) = renamed {
+                self.status = format!("已重命名表格列：{old_col} → {new_col}");
+                self.recalc_all_async();
+            }
             self.wb.dirty = true;
             let key = (self.sheet_idx, r, c);
             self.doc_gen = self.doc_gen.wrapping_add(1);
