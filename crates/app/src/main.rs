@@ -25399,7 +25399,8 @@ impl SheetApp {
                 painter.line_segment([egui::pos2(g.left(), g.top() + g.height() * 2.0 / 3.0), egui::pos2(g.right(), g.top() + g.height() * 2.0 / 3.0)], sw);
                 painter.line_segment([egui::pos2(g.left() + g.width() / 3.0, g.top()), egui::pos2(g.left() + g.width() / 3.0, g.bottom())], sw);
                 painter.line_segment([egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.top()), egui::pos2(g.left() + g.width() * 2.0 / 3.0, g.bottom())], sw);
-                // 自动保存开关（Excel 标题栏左侧）
+                // 自动保存开关（Excel 标题栏左侧）；宽度不足时先让位给文件名
+                if rect.width() >= 820.0 {
                 let as_r = Rect::from_min_size(
                     egui::pos2(rect.left() + 50.0, rect.center().y - 9.0),
                     Vec2::new(104.0, 18.0),
@@ -25422,6 +25423,7 @@ impl SheetApp {
                 );
                 if as_resp.on_hover_text("每 30 秒自动保存一次").clicked() {
                     self.autosave = !self.autosave;
+                }
                 }
                 // 快速访问工具栏：保存 / 撤销 / 重做。可用性、tooltip 文本和执行都取
                 // 自命令表，与快捷键、功能区共用同一份定义（UI-02.3）。
@@ -25468,6 +25470,8 @@ impl SheetApp {
                     fg,
                 );
                 // 搜索框（Excel 标题栏中部）
+                // 搜索框在窄窗口隐藏，避免和账户/窗口按钮重叠
+                if rect.width() >= 900.0 {
                 let sr = Rect::from_min_size(
                     egui::pos2(sx, rect.top() + 8.0),
                     Vec2::new(search_w, 32.0),
@@ -25500,6 +25504,7 @@ impl SheetApp {
                     self.find.find = self.search.clone();
                     self.find.tab = 0;
                     self.find_open_new_session();
+                }
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
                 let acc = Rect::from_min_size(

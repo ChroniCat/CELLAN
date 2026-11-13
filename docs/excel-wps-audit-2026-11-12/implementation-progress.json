@@ -5055,17 +5055,23 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-13 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-title.txt"
+          ],
+          "not_done": [
+            "125%/150% DPI 未逐档目视"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:28:46Z"
         },
         {
           "id": "UI-13.2",
