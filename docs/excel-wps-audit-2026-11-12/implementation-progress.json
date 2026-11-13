@@ -3539,17 +3539,19 @@
       "scope": "core/cf.rs, xlsx.rs",
       "source": "core-requirements.md",
       "heading": "C17 P1 条件格式阈值和优先级保真",
-      "status": "待实施",
+      "status": "已验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "x14 扩展条件格式不建模，编辑时警告不可无损"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T17:10:48Z",
       "slices": [
         {
           "id": "C17.1",
@@ -3557,17 +3559,40 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "CfRule 保存 priority；cfvo 区分 min/max/num/percent/percentile/formula（含公式原文），保存后类型与值不变；Dxf 增加差异数字格式与边框。",
+          "files": [
+            "crates/core/src/cf.rs",
+            "crates/core/src/patch.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c17_cf_priority.rs",
+            "crates/core/tests/fixtures/c17/priority.xlsx",
+            "crates/core/tests/fixtures/c17/x14bar.xlsx",
+            "scripts/excel_c17_cf_fixture.ps1",
+            "scripts/excel_c17_cf_verify.ps1"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c17_cf_priority -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 -- --test-threads=2 -> 750 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 262 passed",
+            "Excel COM 复核往返与改无关单元格后的 priority/cfvo/颜色一致"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-priority.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-overlay.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-original.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-our-save.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-unrelated-edit.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T17:10:48Z"
         },
         {
           "id": "C17.2",
@@ -3575,17 +3600,40 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "求值按全局 priority 升序（与 XML 顺序无关），stopIfTrue 对同一规则的多段范围同样终止；1000/1100/100000 上 percent 50 与 percentile 50 颜色不同，与 Excel 逐格一致。",
+          "files": [
+            "crates/core/src/cf.rs",
+            "crates/core/src/patch.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c17_cf_priority.rs",
+            "crates/core/tests/fixtures/c17/priority.xlsx",
+            "crates/core/tests/fixtures/c17/x14bar.xlsx",
+            "scripts/excel_c17_cf_fixture.ps1",
+            "scripts/excel_c17_cf_verify.ps1"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c17_cf_priority -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 -- --test-threads=2 -> 750 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 262 passed",
+            "Excel COM 复核往返与改无关单元格后的 priority/cfvo/颜色一致"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-priority.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-overlay.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-original.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-our-save.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-unrelated-edit.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T17:10:48Z"
         },
         {
           "id": "C17.3",
@@ -3593,17 +3641,42 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "保存往返后 Excel 读回 priority/stopIfTrue/cfvo 类型与颜色一致；改无关单元格后两者样式不变；含 x14 扩展时管理窗口明确警告不可无损编辑。",
+          "files": [
+            "crates/core/src/cf.rs",
+            "crates/core/src/patch.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c17_cf_priority.rs",
+            "crates/core/tests/fixtures/c17/priority.xlsx",
+            "crates/core/tests/fixtures/c17/x14bar.xlsx",
+            "scripts/excel_c17_cf_fixture.ps1",
+            "scripts/excel_c17_cf_verify.ps1"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c17_cf_priority -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 -- --test-threads=2 -> 750 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 262 passed",
+            "Excel COM 复核往返与改无关单元格后的 priority/cfvo/颜色一致"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-priority.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-cf-overlay.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-original.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-our-save.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-unrelated-edit.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png"
+          ],
+          "not_done": [
+            "Dxf 边框只保留四边同款形态；x14 扩展不建模，仅警告"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T17:10:48Z"
         }
       ]
     },

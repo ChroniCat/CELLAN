@@ -2649,6 +2649,7 @@ impl SheetApp {
                             self.reload_charts();
                         }
                         Ok("ps") => self.paste_special = true,
+                        Ok("cf") => self.cf_mgr = true,
                         Ok("about") => self.about_open = true,
                         Ok("spark") => self.spark_open_create(
                             sheetcore::sparkline::SparkKind::Line,
@@ -6159,6 +6160,19 @@ impl SheetApp {
     }
 
     /// 条件格式管理器：看规则、调顺序、删除、定位
+    /// 按当前块/规则的先后重新编号 priority（1 起）。只在用户显式调序/删除后调用，
+    /// 打开文件时不重排，保证 Excel 给的 priority 原样往返。
+    fn renumber_cf(&mut self) {
+        let sheet = self.wb.sheet_mut(self.sheet_idx);
+        let mut p = 1u32;
+        for b in sheet.cf.blocks.iter_mut() {
+            for r in b.rules.iter_mut() {
+                r.priority = p;
+                p += 1;
+            }
+        }
+    }
+
     fn cf_manager(&mut self, ctx: &egui::Context) {
         if !self.cf_mgr {
             return;
@@ -6169,10 +6183,20 @@ impl SheetApp {
         let mut down: Option<usize> = None;
         let mut goto: Option<(u32, u32, u32, u32)> = None;
         let blocks = self.wb.sheet(self.sheet_idx).cf.blocks.clone();
+        let unknown_ext = self.wb.sheet(self.sheet_idx).cf.unknown_ext;
         ui_kit::window(ctx, "条件格式管理", 460.0)
             .open(&mut open)
             .default_width(460.0)
             .show(ctx, |ui| {
+                if unknown_ext {
+                    ui.label(
+                        egui::RichText::new(
+                            "注意：此表含本应用未建模的扩展条件格式（x14），保存会丢掉该扩展，无法无损编辑。",
+                        )
+                        .color(egui::Color32::from_rgb(180, 95, 6)),
+                    );
+                    ui.separator();
+                }
                 if blocks.is_empty() {
                     ui.label("这张表还没有条件格式规则");
                 }
@@ -6207,7 +6231,7 @@ impl SheetApp {
                     });
                     for (ri, rule) in blk.rules.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            ui.label(format!("  · {}", rule.kind.describe()));
+                            ui.label(format!("  · [{}] {}", rule.priority, rule.kind.describe()));
                             if rule.stop {
                                 ui.label(egui::RichText::new("(命中即停)").weak());
                             }
@@ -6231,6 +6255,7 @@ impl SheetApp {
             }
             sheet.cf_dirty = true;
             self.wb.dirty = true;
+            self.renumber_cf();
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.status = "已删除一条条件格式规则".into();
         }
@@ -6238,6 +6263,7 @@ impl SheetApp {
             if bi > 0 {
                 self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi - 1);
                 self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
+                self.renumber_cf();
                 self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.status = "规则已上移（优先级更高）".into();
             }
@@ -6247,6 +6273,7 @@ impl SheetApp {
             if bi + 1 < n {
                 self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi + 1);
                 self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
+                self.renumber_cf();
                 self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.status = "规则已下移".into();
             }
@@ -14762,7 +14789,7 @@ let txn = self.txn_begin(&keys);
     }
 
     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
-        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill, font: None };
+        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill, font: None, num_fmt: None, border: None };
         let mut idx = None;
         if let Some(s0) = self.wb.sheets.first() {
             if let Some(i) = s0.cf.dxfs.iter().position(|d| *d == want) {
@@ -14785,9 +14812,18 @@ let txn = self.txn_begin(&keys);
     fn add_cf(&mut self, kind: sheetcore::cf::CfKind) {
         let (r1, c1, r2, c2) = self.sel_rect();
         let sheet = self.wb.sheet_mut(self.sheet_idx);
+        // 新规则排在最后：priority 取现有最大值 +1（Excel 新建规则也是追加到末尾）
+        let next = sheet
+            .cf
+            .blocks
+            .iter()
+            .flat_map(|b| b.rules.iter().map(|r| r.priority))
+            .max()
+            .unwrap_or(0)
+            + 1;
         sheet.cf.blocks.push(sheetcore::cf::CfBlock {
             ranges: vec![(r1, c1, r2, c2)],
-            rules: vec![sheetcore::cf::CfRule { kind, stop: false }],
+            rules: vec![sheetcore::cf::CfRule { kind, stop: false, priority: next }],
         });
         sheet.cf_dirty = true;
         self.wb.dirty = true;
@@ -14913,7 +14949,11 @@ let txn = self.txn_begin(&keys);
                     ("橙色", [255, 166, 76]),
                 ] {
                     if ui.button(label).clicked() {
-                        self.add_cf(sheetcore::cf::CfKind::Bar { color: rgb });
+                        self.add_cf(sheetcore::cf::CfKind::Bar {
+                            color: rgb,
+                            min: sheetcore::cf::Cfvo::min(),
+                            max: sheetcore::cf::Cfvo::max(),
+                        });
                         ui.close_menu();
                     }
                 }
@@ -14931,9 +14971,13 @@ let txn = self.txn_begin(&keys);
                 ] {
                     if ui.button(label).clicked() {
                         let levels = set.chars().next().unwrap().to_digit(10).unwrap_or(3) as usize;
-                        let mut th = vec![None];
+                        // 图标集分档在 Excel 里是 percent（不是绝对值）
+                        let mut th = vec![sheetcore::cf::Cfvo::min()];
                         for i in 1..levels {
-                            th.push(Some((i as f64) * 100.0 / levels as f64));
+                            th.push(sheetcore::cf::Cfvo::new(
+                                sheetcore::cf::CfvoKind::Percent,
+                                (i as f64) * 100.0 / levels as f64,
+                            ));
                         }
                         self.add_cf(sheetcore::cf::CfKind::IconSet {
                             set: set.to_string(),
@@ -14949,9 +14993,9 @@ let txn = self.txn_begin(&keys);
                 if ui.button("绿-黄-红").clicked() {
                     self.add_cf(sheetcore::cf::CfKind::Scale {
                         points: vec![
-                            (None, [99, 190, 123]),
-                            (Some(50.0), [255, 235, 132]),
-                            (None, [248, 105, 107]),
+                            (sheetcore::cf::Cfvo::min(), [99, 190, 123]),
+                            (sheetcore::cf::Cfvo::new(sheetcore::cf::CfvoKind::Percentile, 50.0), [255, 235, 132]),
+                            (sheetcore::cf::Cfvo::min(), [248, 105, 107]),
                         ],
                     });
                     ui.close_menu();
@@ -14959,9 +15003,9 @@ let txn = self.txn_begin(&keys);
                 if ui.button("红-黄-绿").clicked() {
                     self.add_cf(sheetcore::cf::CfKind::Scale {
                         points: vec![
-                            (None, [248, 105, 107]),
-                            (Some(50.0), [255, 235, 132]),
-                            (None, [99, 190, 123]),
+                            (sheetcore::cf::Cfvo::min(), [248, 105, 107]),
+                            (sheetcore::cf::Cfvo::new(sheetcore::cf::CfvoKind::Percentile, 50.0), [255, 235, 132]),
+                            (sheetcore::cf::Cfvo::min(), [99, 190, 123]),
                         ],
                     });
                     ui.close_menu();
@@ -14969,9 +15013,9 @@ let txn = self.txn_begin(&keys);
                 if ui.button("蓝-白-红").clicked() {
                     self.add_cf(sheetcore::cf::CfKind::Scale {
                         points: vec![
-                            (None, [93, 135, 202]),
-                            (Some(50.0), [255, 255, 255]),
-                            (None, [248, 105, 107]),
+                            (sheetcore::cf::Cfvo::min(), [93, 135, 202]),
+                            (sheetcore::cf::Cfvo::new(sheetcore::cf::CfvoKind::Percentile, 50.0), [255, 255, 255]),
+                            (sheetcore::cf::Cfvo::min(), [248, 105, 107]),
                         ],
                     });
                     ui.close_menu();
@@ -15453,6 +15497,23 @@ let txn = self.txn_begin(&keys);
                 painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
                 if dumping {
                     dump.push(format!("cf-fill ({},{}) rgb={:?}", r, c, f));
+                }
+            }
+            // 条件格式的差异边框：画在填充之上、文字之下
+            if let Some(b) = &ov.border {
+                let col = b
+                    .color
+                    .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                    .unwrap_or(Color32::from_rgb(60, 60, 60));
+                let w = match b.style.as_str() {
+                    "medium" => 2.0,
+                    "thick" => 3.0,
+                    "double" => 1.5,
+                    _ => 1.0,
+                };
+                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(w, col), egui::StrokeKind::Inside);
+                if dumping {
+                    dump.push(format!("cf-border ({},{}) style={} rgb={:?}", r, c, b.style, b.color));
                 }
             }
             if let Some((t, col)) = ov.bar {

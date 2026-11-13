@@ -184,7 +184,7 @@ fn conditional_overlay_carries_font() {
                 dxf: 0,
             },
             stop: false,
-        }],
+         priority: 1, }],
     });
     let sheet = &wb.sheets[0];
     let mut stats = CfStats::default();

@@ -129,7 +129,7 @@ fn metadata_references_and_pending_pivots_follow_sheet_identity() {
     let mut wb = workbook();
     wb.sheets[1].cf.blocks.push(CfBlock {
         ranges: vec![(0, 0, 0, 0)],
-        rules: vec![CfRule { kind: CfKind::Expr { formula: "Sheet1!A1>0".into(), dxf: 0 }, stop: false }],
+        rules: vec![CfRule { kind: CfKind::Expr { formula: "Sheet1!A1>0".into(), dxf: 0 }, stop: false, priority: 1 }],
     });
     wb.sheets[1].dv.push(DataValidation { f1: "Sheet1!$A$1".into(), ..Default::default() });
     let chart = sheetcore::chart_write::chart_from_selection(&wb.sheets[0], "Sheet1", (0, 0, 1, 1), "test", sheetcore::charts::ChartKind::Column);

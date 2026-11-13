@@ -111,14 +111,14 @@ fn write_new_rules_and_save() {
         wb.sheets[0]
             .cf
             .dxfs
-            .push(sheetcore::cf::Dxf { bold: true, color: None, fill: Some([198, 239, 206]), italic: false, font: None });
+            .push(sheetcore::cf::Dxf { bold: true, color: None, fill: Some([198, 239, 206]), italic: false, font: None, num_fmt: None, border: None });
         let sheet = &mut wb.sheets[0];
         sheet.cf.blocks.push(sheetcore::cf::CfBlock {
             ranges: vec![(1, 0, 4, 0)],
             rules: vec![sheetcore::cf::CfRule {
                 kind: CfKind::Text { contains: "乙".into(), dxf: dxf_idx },
                 stop: false,
-            }],
+             priority: 1, }],
         });
         sheet.cf_dirty = true;
     }

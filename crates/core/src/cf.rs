@@ -15,6 +15,17 @@ pub struct Dxf {
     pub fill: Option<[u8; 3]>,
     /// 字体名（dxf 的 <font><name val="…"/>），None 表示不改字体
     pub font: Option<String>,
+    /// 差异数字格式（dxf 的 <numFmt formatCode="…"/>），None 表示不改
+    pub num_fmt: Option<String>,
+    /// 差异边框（任一方向有 style 就记一条），None 表示不改边框
+    pub border: Option<DxfBorder>,
+}
+
+/// dxf 里的一条差异边框：所有写了的边共用一个 style/color（Excel 常见写法）
+#[derive(Clone, Debug, PartialEq)]
+pub struct DxfBorder {
+    pub style: String,
+    pub color: Option<[u8; 3]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +68,99 @@ impl CfOp {
     }
 }
 
+/// 条件格式阈值类型（OOXML cfvo/@type）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfvoKind {
+    Min,
+    Max,
+    Num,
+    Percent,
+    Percentile,
+    Formula,
+}
+
+/// 一个阈值：类型 + 数值（公式型把原文放在 formula）
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cfvo {
+    pub kind: CfvoKind,
+    pub val: f64,
+    pub formula: String,
+}
+
+impl Default for Cfvo {
+    fn default() -> Self {
+        Cfvo { kind: CfvoKind::Min, val: 0.0, formula: String::new() }
+    }
+}
+
+impl Cfvo {
+    pub fn new(kind: CfvoKind, val: f64) -> Self {
+        Cfvo { kind, val, formula: String::new() }
+    }
+    pub fn min() -> Self {
+        Cfvo::new(CfvoKind::Min, 0.0)
+    }
+    pub fn max() -> Self {
+        Cfvo::new(CfvoKind::Max, 0.0)
+    }
+    pub fn from_type(ty: &str, val: Option<f64>) -> Self {
+        let kind = match ty {
+            "max" => CfvoKind::Max,
+            "num" => CfvoKind::Num,
+            "percent" => CfvoKind::Percent,
+            "percentile" => CfvoKind::Percentile,
+            "formula" => CfvoKind::Formula,
+            _ => CfvoKind::Min,
+        };
+        Cfvo { kind, val: val.unwrap_or(0.0), formula: String::new() }
+    }
+    pub fn type_name(&self) -> &'static str {
+        match self.kind {
+            CfvoKind::Min => "min",
+            CfvoKind::Max => "max",
+            CfvoKind::Num => "num",
+            CfvoKind::Percent => "percent",
+            CfvoKind::Percentile => "percentile",
+            CfvoKind::Formula => "formula",
+        }
+    }
+    /// 求这个阈值在当前块数据下的实际数：percent 相对 min..max，percentile 取包含式分位
+    pub fn resolve(&self, min: f64, max: f64, sorted: &[f64]) -> f64 {
+        match self.kind {
+            CfvoKind::Min => min,
+            CfvoKind::Max => max,
+            CfvoKind::Num => self.val,
+            CfvoKind::Percent => min + (max - min) * (self.val / 100.0),
+            CfvoKind::Percentile => percentile_inc(sorted, self.val / 100.0),
+            CfvoKind::Formula => self
+                .formula
+                .trim_start_matches('=')
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(min),
+        }
+    }
+}
+
+/// Excel PERCENTILE.INC：k=(n-1)*p 线性插值
+pub fn percentile_inc(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let p = p.clamp(0.0, 1.0);
+    let k = (sorted.len() - 1) as f64 * p;
+    let lo = k.floor() as usize;
+    let hi = k.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        sorted[lo] + (sorted[hi] - sorted[lo]) * (k - lo as f64)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CfKind {
     CellIs { op: CfOp, a: String, b: String, dxf: usize },
@@ -65,10 +169,10 @@ pub enum CfKind {
     Top { top: bool, n: u32, percent: bool, dxf: usize },
     Avg { above: bool, dxf: usize },
     Expr { formula: String, dxf: usize },
-    Scale { points: Vec<(Option<f64>, [u8; 3])> },
-    Bar { color: [u8; 3] },
-    /// 图标集：set 是 OOXML 的 iconSet 名，thresholds 是分级下限（None = 区间最小值）
-    IconSet { set: String, reverse: bool, thresholds: Vec<Option<f64>>, show_value: bool },
+    Scale { points: Vec<(Cfvo, [u8; 3])> },
+    Bar { color: [u8; 3], min: Cfvo, max: Cfvo },
+    /// 图标集：set 是 OOXML 的 iconSet 名，thresholds 是各档下限（min/max/percent/…）
+    IconSet { set: String, reverse: bool, thresholds: Vec<Cfvo>, show_value: bool },
 }
 
 impl CfKind {
@@ -167,7 +271,8 @@ impl IconMark {
 pub struct CfRule {
     pub kind: CfKind,
     pub stop: bool,
-
+    /// Excel 的 priority：越小越先求值；0 表示未指定（保存时补号）
+    pub priority: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +285,9 @@ pub struct CfBlock {
 pub struct CfSheet {
     pub blocks: Vec<CfBlock>,
     pub dxfs: Vec<Dxf>,
+    /// 表里存在 x14 扩展条件格式（数据条/图标集扩展）；本实现不建模，保存会丢，
+    /// 界面上必须显示「不能无损编辑」的警告。
+    pub unknown_ext: bool,
 }
 
 /// 渲染叠加：条件格式作用在基础样式之上
@@ -194,6 +302,8 @@ pub struct Overlay {
     pub bar: Option<(f32, [u8; 3])>,
     /// 图标集
     pub icon: Option<IconMark>,
+    /// 条件格式带来的差异边框（填充/字体之外的第四个维度）
+    pub border: Option<DxfBorder>,
 }
 
 impl Overlay {
@@ -204,6 +314,7 @@ impl Overlay {
             && self.font.is_none()
             && self.bar.is_none()
             && self.icon.is_none()
+            && self.border.is_none()
     }
 }
 
@@ -336,7 +447,17 @@ where
 {
     let mut out = Overlay::default();
     let raw = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
+    // Excel 按 priority 求值，与 XML 里的先后无关；同优先级按出现顺序
+    let mut order: Vec<(u32, usize, usize)> = Vec::new();
     for (bi, block) in cf.blocks.iter().enumerate() {
+        for (ri, rule) in block.rules.iter().enumerate() {
+            order.push((rule.priority, bi, ri));
+        }
+    }
+    order.sort_by_key(|x| (x.0, x.1, x.2));
+    for (_, bi, ri) in order {
+        let block = &cf.blocks[bi];
+        let rule = &block.rules[ri];
         if !in_block(block, r, c) {
             continue;
         }
@@ -345,8 +466,7 @@ where
             .first()
             .map(|(r1, c1, _, _)| (*r1, *c1))
             .unwrap_or((0, 0));
-        for rule in block.rules.iter() {
-            let mut hit = false;
+        let mut hit = false;
             match &rule.kind {
                 CfKind::CellIs { op, a, b, dxf } => {
                     let av = parse_lit(a);
@@ -433,7 +553,11 @@ where
                 }
                 CfKind::Scale { points } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
-                        if let Some(rgb) = scale_color(points, *v, *min, *max) {
+                        let empty: Vec<f64> = Vec::new();
+                        let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
+                        let abs: Vec<(f64, [u8; 3])> =
+                            points.iter().map(|(t, c)| (t.resolve(*min, *max, sorted), *c)).collect();
+                        if let Some(rgb) = scale_color(&abs, *v) {
                             if out.fill.is_none() {
                                 out.fill = Some(rgb);
                             }
@@ -445,10 +569,13 @@ where
                         let (min, max) = (*min, *max);
                         if let Some((style, levels)) = IconMark::from_set(set) {
                             // 阈值是「各档下限」；第一档通常是最小值
+                            let empty: Vec<f64> = Vec::new();
+                            let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
                             let mut idx = 0u8;
                             for (i, th) in thresholds.iter().enumerate().skip(1) {
-                                if let Some(t) = th {
-                                    if *v >= *t {
+                                let t = th.resolve(min, max, sorted);
+                                {
+                                    if *v >= t {
                                         idx = i as u8;
                                     } else {
                                         break;
@@ -465,17 +592,20 @@ where
                         }
                     }
                 }
-                CfKind::Bar { color } => {
+                CfKind::Bar { color, min: lo, max: hi } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
-                        let span = (max - min).max(f64::MIN_POSITIVE);
-                        let t = ((v - min) / span).clamp(0.0, 1.0) as f32;
+                        let empty: Vec<f64> = Vec::new();
+                        let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
+                        let a = lo.resolve(*min, *max, sorted);
+                        let b = hi.resolve(*min, *max, sorted);
+                        let span = (b - a).max(f64::MIN_POSITIVE);
+                        let t = ((v - a) / span).clamp(0.0, 1.0) as f32;
                         out.bar = Some((t, *color));
                     }
                 }
             }
-            if hit && rule.stop {
-                return out;
-            }
+        if hit && rule.stop {
+            return out;
         }
     }
     out
@@ -498,16 +628,21 @@ fn apply_dxf(cf: &CfSheet, idx: usize, out: &mut Overlay) {
                 out.font = Some(f.clone());
             }
         }
+        if let Some(b) = &d.border {
+            if out.border.is_none() {
+                out.border = Some(b.clone());
+            }
+        }
         out.bold |= d.bold;
     }
 }
 
-fn scale_color(points: &[(Option<f64>, [u8; 3])], v: f64, min: f64, max: f64) -> Option<[u8; 3]> {
+fn scale_color(points: &[(f64, [u8; 3])], v: f64) -> Option<[u8; 3]> {
     if points.len() < 2 {
         return None;
     }
-    let lo = points.first().map(|p| p.0.unwrap_or(min)).unwrap_or(min);
-    let hi = points.last().map(|p| p.0.unwrap_or(max)).unwrap_or(max);
+    let lo = points.first().map(|p| p.0).unwrap_or(0.0);
+    let hi = points.last().map(|p| p.0).unwrap_or(0.0);
     if hi <= lo {
         return Some(points[0].1);
     }
@@ -519,8 +654,8 @@ fn scale_color(points: &[(Option<f64>, [u8; 3])], v: f64, min: f64, max: f64) ->
     }
     // 多段线性插值（2 色或 3 色）
     for w in points.windows(2) {
-        let (p0, c0) = (&w[0].0.unwrap_or(lo), w[0].1);
-        let (p1, c1) = (&w[1].0.unwrap_or(hi), w[1].1);
+        let (p0, c0) = (&w[0].0, w[0].1);
+        let (p1, c1) = (&w[1].0, w[1].1);
         let (p0, p1) = (*p0, *p1);
         if v >= p0 && v <= p1 && p1 > p0 {
             return Some(lerp_color(c0, c1, ((v - p0) / (p1 - p0)) as f32));
@@ -691,10 +826,11 @@ mod tests {
                 ranges: vec![(0, 0, 9, 0)],
                 rules: vec![CfRule {
                     kind: CfKind::CellIs { op: CfOp::Greater, a: "100".into(), b: String::new(), dxf: 0 },
-                    stop: false,
+                    stop: false, priority: 1,
                 }],
             }],
             dxfs: vec![Dxf { fill: Some([255, 199, 206]), color: Some([156, 0, 6]), ..Default::default() }],
+            unknown_ext: false,
         };
         let sh = sheet_with(&[(0, 0, 50.0), (1, 0, 150.0)]);
         let mut st = CfStats::default();
@@ -713,15 +849,16 @@ mod tests {
                 rules: vec![CfRule {
                     kind: CfKind::Scale {
                         points: vec![
-                            (None, [248, 105, 107]),
-                            (Some(50.0), [255, 235, 132]),
-                            (None, [99, 190, 123]),
+                            (Cfvo::min(), [248, 105, 107]),
+                            (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 235, 132]),
+                            (Cfvo::max(), [99, 190, 123]),
                         ],
                     },
-                    stop: false,
+                    stop: false, priority: 1,
                 }],
             }],
             dxfs: vec![],
+            unknown_ext: false,
         };
         let sh = sheet_with(&[(0, 0, 0.0), (1, 0, 50.0), (2, 0, 100.0)]);
         let mut st = CfStats::default();
@@ -739,9 +876,10 @@ mod tests {
         let cf = CfSheet {
             blocks: vec![CfBlock {
                 ranges: vec![(0, 0, 1, 0)],
-                rules: vec![CfRule { kind: CfKind::Bar { color: [99, 142, 198] }, stop: false }],
+                rules: vec![CfRule { kind: CfKind::Bar { color: [99, 142, 198], min: Cfvo::min(), max: Cfvo::max() }, stop: false, priority: 1 }],
             }],
             dxfs: vec![],
+            unknown_ext: false,
         };
         let sh = sheet_with(&[(0, 0, 10.0), (1, 0, 30.0)]);
         let mut st = CfStats::default();
@@ -756,10 +894,11 @@ mod tests {
             blocks: vec![CfBlock {
                 ranges: vec![(0, 0, 2, 0)],
                 rules: vec![
-                    CfRule { kind: CfKind::Text { contains: "急".into(), dxf: 0 }, stop: false },
+                    CfRule { kind: CfKind::Text { contains: "急".into(), dxf: 0 }, stop: false, priority: 1 },
                 ],
             }],
             dxfs: vec![Dxf { fill: Some([255, 235, 156]), ..Default::default() }],
+            unknown_ext: false,
         };
         let mut sh = Sheet::new("T");
         sh.set(0, 0, Cell { value: Value::Text("很急".into()), formula: None });
@@ -845,6 +984,24 @@ fn hex_rgb(s: &str) -> Option<[u8; 3]> {
 }
 
 /// 解析一张工作表里的 <conditionalFormatting>
+/// 是否含本实现未建模的扩展条件格式（x14 的 extLst / x14:conditionalFormatting）
+pub fn xml_has_cf_ext(xml: &str) -> bool {
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let n = e.name();
+                let n = n.as_ref();
+                if n.ends_with("extLst") || n.ends_with("conditionalFormatting") && n.contains(':') {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
 pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
     let mut out: Vec<CfBlock> = Vec::new();
     let mut r = Reader::from_str(xml);
@@ -853,7 +1010,8 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
     let mut cur_rule: Option<(String, HashMap<String, String>)> = None;
     let mut formulas: Vec<String> = Vec::new();
     let mut scale_colors: Vec<[u8; 3]> = Vec::new();
-    let mut cfvo: Vec<Option<f64>> = Vec::new();
+    let mut cfvo: Vec<Cfvo> = Vec::new();
+    let mut cfvo_open: Option<Cfvo> = None;
     let mut bar_color: Option<[u8; 3]> = None;
     let mut icon_set_name = String::new();
     let mut icon_reverse = false;
@@ -867,7 +1025,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
             Ok(Event::Start(e)) => {
                 let name = e.name();
                 let name = name.as_ref();
-                if name.ends_with("conditionalFormatting") {
+                if name.ends_with("conditionalFormatting") && !name.contains(':') {
                     let mut ranges = Vec::new();
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("sqref") {
@@ -875,7 +1033,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                         }
                     }
                     cur_block = Some(CfBlock { ranges, rules: Vec::new() });
-                } else if name.ends_with("cfRule") {
+                } else if name.ends_with("cfRule") && !name.contains(':') {
                     let mut attrs = HashMap::new();
                     for a in e.attributes().flatten() {
                         attrs.insert(a.key.as_ref().to_string(), crate::model::xml_unescape(&a.value.to_string()));
@@ -923,21 +1081,21 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                             }
                         }
                     } else if name.ends_with("cfvo") {
-                        // <cfvo type="percent" val="50"/>
+                        // <cfvo type="percent" val="50"/> 或 <cfvo type="formula">…</cfvo>
+                        let mut ty = String::new();
                         let mut val: Option<f64> = None;
-                        let mut is_min = false;
-                        let mut is_max = false;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
                             let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
                                 val = v.parse::<f64>().ok();
                             } else if k.ends_with("type") {
-                                is_min = v == "min";
-                                is_max = v == "max";
+                                ty = v;
                             }
                         }
-                        cfvo.push(if is_min || is_max { None } else { val });
+                        let cv = Cfvo::from_type(&ty, val);
+                        text_buf.clear();
+                        cfvo_open = Some(cv);
                     }
                 }
             }
@@ -961,20 +1119,27 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                             }
                         }
                     } else if name.ends_with("cfvo") {
+                        let mut ty = String::new();
                         let mut val: Option<f64> = None;
-                        let mut is_edge = false;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
                             let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
                                 val = v.parse::<f64>().ok();
                             } else if k.ends_with("type") {
-                                is_edge = v == "min" || v == "max";
+                                ty = v;
                             }
                         }
-                        cfvo.push(if is_edge { None } else { val });
+                        cfvo.push(Cfvo::from_type(&ty, val));
                         // <color> 紧跟在 cfvo 后面：先记着，交给下面统一收
                     }
+                }
+            }
+            // quick_xml 把 &gt; / &quot; 单独发成 GeneralRef，必须接住，否则公式里的 > 会丢
+            Ok(Event::GeneralRef(e)) => {
+                if depth_rule > 0 {
+                    let name: String = e.into_inner().to_string();
+                    text_buf.push_str(&crate::model::resolve_entity(&name));
                 }
             }
             Ok(Event::Text(t)) => {
@@ -986,7 +1151,13 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
             Ok(Event::End(e)) => {
                 let name = e.name();
                 let name = name.as_ref();
-                if name.ends_with("cfRule") {
+                if name.ends_with("cfvo") {
+                    if let Some(mut cv) = cfvo_open.take() {
+                        cv.formula = text_buf.trim().to_string();
+                        text_buf.clear();
+                        cfvo.push(cv);
+                    }
+                } else if name.ends_with("cfRule") {
                     if let (Some((_, attrs)), Some(block)) = (cur_rule.take(), cur_block.as_mut()) {
                         if let Some(mut kind) = build_rule(&attrs, &formulas, &cfvo, &last_color, bar_color, &icon_set_name, icon_reverse, icon_show) {
                             if let CfKind::Scale { points } = &mut kind {
@@ -994,13 +1165,18 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                                     *points = cfvo
                                         .iter()
                                         .zip(scale_colors.iter())
-                                        .map(|(v, c)| (*v, *c))
+                                        .map(|(v, c)| (v.clone(), *c))
                                         .collect();
                                 }
                             }
+                            let priority = attrs
+                                .get("priority")
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0);
                             block.rules.push(CfRule {
                                 kind,
                                 stop: attrs.get("stopIfTrue").map(|v| v == "1" || v == "true").unwrap_or(false),
+                                priority,
                             });
                         }
                     }
@@ -1030,7 +1206,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
 fn build_rule(
     attrs: &HashMap<String, String>,
     formulas: &[String],
-    cfvo: &[Option<f64>],
+    cfvo: &[Cfvo],
     last_color: &Option<[u8; 3]>,
     bar_color: Option<[u8; 3]>,
     icon_set: &str,
@@ -1071,7 +1247,11 @@ fn build_rule(
             // cfvo/color 交替：从 attrs 无法拿到，交给 scale_points（见调用方）
             CfKind::Scale { points: Vec::new() }
         }
-        "dataBar" => CfKind::Bar { color: bar_color.or(*last_color).unwrap_or([99, 142, 198]) },
+        "dataBar" => CfKind::Bar {
+            color: bar_color.or(*last_color).unwrap_or([99, 142, 198]),
+            min: cfvo.first().cloned().unwrap_or_else(Cfvo::min),
+            max: cfvo.get(1).cloned().unwrap_or_else(Cfvo::max),
+        },
         "iconSet" => CfKind::IconSet {
             set: if icon_set.is_empty() {
                 "3Arrows".to_string()
@@ -1105,7 +1285,11 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                 } else if cur.is_some() && name.ends_with("font") {
                     in_font = true;
                 } else if let Some(d) = cur.as_mut() {
-                    if name.ends_with("color") {
+                    if name.ends_with("numFmt") {
+                        if let Some(fc) = attr_val(&e, "formatCode") {
+                            d.num_fmt = Some(fc);
+                        }
+                    } else if name.ends_with("color") {
                         for a in e.attributes().flatten() {
                             if a.key.as_ref().ends_with("rgb") {
                                 if let Some(c) = hex_rgb(&a.value.to_string()) {
@@ -1132,12 +1316,28 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                 let name = e.name();
                 let name = name.as_ref();
                 if let Some(d) = cur.as_mut() {
-                    if name.to_ascii_lowercase().ends_with("color") {
+                    if name.ends_with("numFmt") {
+                        if let Some(fc) = attr_val(&e, "formatCode") {
+                            d.num_fmt = Some(fc);
+                        }
+                    } else if matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "left" | "right" | "top" | "bottom" | "start" | "end" | "vertical" | "horizontal"
+                    ) {
+                        // 差异边框的某一方向：只要求有 style（Excel 用 thin/medium/dashed…）
+                        if let Some(style) = attr_val(&e, "style") {
+                            if !style.is_empty() && style != "none" {
+                                d.border = Some(DxfBorder { style, color: d.border.as_ref().and_then(|b| b.color) });
+                            }
+                        }
+                    } else if name.to_ascii_lowercase().ends_with("color") {
                         for a in e.attributes().flatten() {
                             if a.key.as_ref().ends_with("rgb") {
                                 if let Some(c) = hex_rgb(&a.value.to_string()) {
-                                    if in_font {
+                    if in_font {
                                         d.color = Some(c);
+                                    } else if let Some(b) = d.border.as_mut() {
+                                        b.color = Some(c);
                                     } else {
                                         d.fill = Some(c);
                                     }

@@ -188,6 +188,19 @@ pub fn dxf_xml(d: &crate::cf::Dxf) -> String {
             f[0], f[1], f[2]
         ));
     }
+    if let Some(code) = &d.num_fmt {
+        out.push_str(&format!("<numFmt numFmtId=\"0\" formatCode=\"{}\"/>", esc(code)));
+    }
+    if let Some(b) = &d.border {
+        let col = b
+            .color
+            .map(|c| format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "<border><left style=\"{s}\">{col}</left><right style=\"{s}\">{col}</right><top style=\"{s}\">{col}</top><bottom style=\"{s}\">{col}</bottom></border>",
+            s = esc(&b.style)
+        ));
+    }
     out.push_str("</dxf>");
     out
 }
@@ -202,17 +215,59 @@ fn range_sqref(r: &(u32, u32, u32, u32)) -> String {
     )
 }
 
+fn cfvo_xml(c: &crate::cf::Cfvo) -> String {
+    use crate::cf::CfvoKind;
+    match c.kind {
+        CfvoKind::Min => "<cfvo type=\"min\"/>".to_string(),
+        CfvoKind::Max => "<cfvo type=\"max\"/>".to_string(),
+        CfvoKind::Formula => format!("<cfvo type=\"formula\" val=\"{}\"/>", esc(&c.formula)),
+        _ => format!("<cfvo type=\"{}\" val=\"{}\"/>", c.type_name(), crate::model::format_number(c.val)),
+    }
+}
+
+/// 按 Excel 的 priority 语义写出：priority 原样保留（0 的补号），
+/// 同表内按 priority 升序排列，XML 顺序不再是求值依据。
 pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
     use crate::cf::CfKind;
     let mut out = String::new();
-    let mut prio = 1;
+    // 先给所有规则一个最终 priority（未指定的按出现顺序补）
+    let mut next = 1u32;
+    let mut used: Vec<u32> = blocks
+        .iter()
+        .flat_map(|b| b.rules.iter().map(|r| r.priority).filter(|p| *p > 0))
+        .collect();
+    used.sort_unstable();
+    let mut assign: Vec<Vec<u32>> = Vec::new();
     for b in blocks {
+        let mut v = Vec::new();
+        for r in b.rules.iter() {
+            if r.priority > 0 {
+                v.push(r.priority);
+            } else {
+                while used.contains(&next) {
+                    next += 1;
+                }
+                used.push(next);
+                v.push(next);
+            }
+        }
+        assign.push(v);
+    }
+    // 块与块内规则都按 priority 升序（Excel 的存储顺序）
+    let mut block_order: Vec<usize> = (0..blocks.len()).collect();
+    block_order.sort_by_key(|i| assign[*i].iter().copied().min().unwrap_or(u32::MAX));
+    for bi in block_order {
+        let b = &blocks[bi];
         if b.ranges.is_empty() || b.rules.is_empty() {
             continue;
         }
+        let mut rule_order: Vec<usize> = (0..b.rules.len()).collect();
+        rule_order.sort_by_key(|i| assign[bi][*i]);
         let sqref: Vec<String> = b.ranges.iter().map(range_sqref).collect();
         out.push_str(&format!("<conditionalFormatting sqref=\"{}\">", sqref.join(" ")));
-        for rule in b.rules.iter() {
+        for ri in rule_order {
+            let rule = &b.rules[ri];
+            let prio = assign[bi][ri];
             let stop = if rule.stop { " stopIfTrue=\"1\"" } else { "" };
             match &rule.kind {
                 CfKind::CellIs { op, a, b: b2, dxf } => {
@@ -277,20 +332,8 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                 CfKind::Scale { points } => {
                     out.push_str(&format!("<cfRule type=\"colorScale\" priority=\"{prio}\"{stop}><colorScale>"));
                     // schema：先全部 <cfvo>，再全部 <color>，不能交错
-                    for (i, (v, _)) in points.iter().enumerate() {
-                        let ty = if i == 0 {
-                            "min"
-                        } else if i == points.len() - 1 {
-                            "max"
-                        } else {
-                            "percentile"
-                        };
-                        match (ty, v) {
-                            ("percentile", Some(p)) => out.push_str(&format!(
-                                "<cfvo type=\"percentile\" val=\"{p}\"/>"
-                            )),
-                            _ => out.push_str(&format!("<cfvo type=\"{ty}\"/>")),
-                        }
+                    for (v, _) in points.iter() {
+                        out.push_str(&cfvo_xml(v));
                     }
                     for (_, c) in points.iter() {
                         out.push_str(&format!(
@@ -307,31 +350,19 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                         if *reverse { " reverse=\"1\"" } else { "" },
                         if *show_value { 1 } else { 0 }
                     ));
-                    for (i, t) in thresholds.iter().enumerate() {
-                        let ty = if i == 0 {
-                            "min"
-                        } else if t.is_none() {
-                            "max"
-                        } else {
-                            "percent"
-                        };
-                        match (ty, t) {
-                            ("percent", Some(v)) => out.push_str(&format!(
-                                "<cfvo type=\"percent\" val=\"{v}\"/>"
-                            )),
-                            _ => out.push_str(&format!("<cfvo type=\"{ty}\"/>")),
-                        }
+                    for t in thresholds.iter() {
+                        out.push_str(&cfvo_xml(t));
                     }
                     out.push_str("</iconSet></cfRule>");
                 }
-                CfKind::Bar { color } => {
+                CfKind::Bar { color, min, max } => {
                     out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar>"));
-                    out.push_str("<cfvo type=\"min\"/><cfvo type=\"max\"/>");
+                    out.push_str(&cfvo_xml(min));
+                    out.push_str(&cfvo_xml(max));
                     out.push_str(&format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", color[0], color[1], color[2]));
                     out.push_str("</dataBar></cfRule>");
                 }
             }
-            prio += 1;
         }
         out.push_str("</conditionalFormatting>");
     }

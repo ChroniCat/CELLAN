@@ -33,6 +33,8 @@ pub struct SheetLayout {
     pub col_levels: Vec<(u32, u8)>,
     /// 条件格式
     pub cf: Vec<crate::cf::CfBlock>,
+    /// 是否有未建模的 x14 扩展条件格式
+    pub cf_ext: bool,
     /// 差异格式表
     pub dxfs: Vec<crate::cf::Dxf>,
     /// 数据验证
@@ -139,6 +141,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         let mut lay = parse_layout(&xml);
         lay.scenarios = crate::scenarios::parse(&xml);
         lay.cf = crate::cf::parse_cf_blocks(&xml);
+        lay.cf_ext = crate::cf::xml_has_cf_ext(&xml);
         lay.dxfs = dxfs.clone();
         lay.dv = crate::dv::parse_validations(&xml);
         if !lay.merges.is_empty()

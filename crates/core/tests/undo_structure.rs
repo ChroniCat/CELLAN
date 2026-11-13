@@ -61,7 +61,7 @@ fn structure_undo_restores_axes_notes_arrays_blank_cell_styles_and_validation() 
     sheet.merge_range(2, 0, 3, 1);
     sheet.notes.insert(CellRef::new(2, 0), sheetcore::notes::Note { r: 2, c: 0, text: "note".into(), author: "test".into() });
     sheet.arrays.push((CellRef::new(4, 0), (4, 0, 5, 0)));
-    sheet.cf.blocks.push(CfBlock { ranges: vec![(2, 0, 3, 0)], rules: vec![CfRule { kind: CfKind::Expr { formula: "A3>0".into(), dxf: 0 }, stop: false }] });
+    sheet.cf.blocks.push(CfBlock { ranges: vec![(2, 0, 3, 0)], rules: vec![CfRule { kind: CfKind::Expr { formula: "A3>0".into(), dxf: 0 }, stop: false, priority: 1 }] });
     sheet.dv.push(DataValidation { ranges: vec![(2, 0, 3, 0)], f1: "A3".into(), ..Default::default() });
     sheet.freeze = Some((2, 2));
     let original = sheet.clone();
@@ -90,7 +90,7 @@ fn structure_undo_restores_axes_notes_arrays_blank_cell_styles_and_validation() 
 fn structure_undo_restores_foreign_reference_metadata_and_pending_pivot_specifications() {
     use sheetcore::{cf::{CfBlock, CfRule, CfKind}, dv::DataValidation};
     let mut wb = seed();
-    wb.sheets[1].cf.blocks.push(CfBlock { ranges: vec![(0, 0, 1, 0)], rules: vec![CfRule { kind: CfKind::Expr { formula: "Sheet1!A1>0".into(), dxf: 0 }, stop: false }] });
+    wb.sheets[1].cf.blocks.push(CfBlock { ranges: vec![(0, 0, 1, 0)], rules: vec![CfRule { kind: CfKind::Expr { formula: "Sheet1!A1>0".into(), dxf: 0 }, stop: false, priority: 1 }] });
     wb.sheets[1].dv.push(DataValidation { f1: "Sheet1!$A$1".into(), ..Default::default() });
     let mut chart = sheetcore::chart_write::chart_from_selection(&wb.sheets[0], "Sheet1", (0, 0, 1, 1), "chart", sheetcore::charts::ChartKind::Column);
     chart.part = "xl/charts/chart1.xml".into();
