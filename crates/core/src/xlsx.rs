@@ -1772,6 +1772,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             }
             if let Some(rgb) = st.fill {
                 s.set_background_color_solid(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+            } else {
+                // 用户明确取消填充时，基准文件里的旧 fill 必须一起清掉；
+                // 只跳过设置会让 save→reload 继续显示旧颜色。
+                s.remove_fill();
             }
             let a = s.get_alignment_mut();
             a.set_horizontal(match st.halign {
@@ -1823,11 +1827,14 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             bs.set_top(make(&st.border[2]));
             bs.set_bottom(make(&st.border[3]));
             // 默认锁定=true、隐藏=false；只有非默认才写 <protection>，
-            // 避免给所有普通格生成无意义的 protection 节点。
+            // 避免给所有普通格生成无意义的 protection 节点。用户把这两个字段
+            // 改回默认时，必须删掉基准文件里原有的 <protection>，否则重开仍是旧值。
             if !st.locked || st.hidden {
                 let p = s.protection_mut();
                 p.set_locked(st.locked);
                 p.set_hidden(st.hidden);
+            } else {
+                s.remove_protection();
             }
         }
 

@@ -1293,6 +1293,49 @@ fn format_dialog_fill_and_protection_apply_to_selection() {
     }
 }
 
+/// UI-15.2：已有文件里的 fill / locked / hidden 被格式对话框改回默认后，
+/// 保存必须把旧节点删掉，重开不能还留着旧填充或旧保护。
+#[test]
+fn format_dialog_clears_fill_and_protection_on_existing_file() {
+    use sheetcore::style::CellStyle;
+    let ctx = egui::Context::default();
+    let path = crate::test_env::scratch("ui15-clear-existing").join("existing.xlsx");
+    let _ = std::fs::remove_file(&path);
+    let mut seed = sheetcore::model::Workbook::new_blank();
+    seed.sheets[0].set(0, 0, text("x"));
+    let sid = seed.styles.intern(CellStyle {
+        fill: Some([200, 10, 10]),
+        locked: false,
+        hidden: true,
+        ..CellStyle::default_dark()
+    });
+    seed.sheets[0].set_style(0, 0, sid);
+    sheetcore::xlsx::save_atomic(&path, &seed).expect("seed save");
+
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb = sheetcore::xlsx::load(&path).expect("load existing");
+    app.wb.path = Some(path.clone());
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_format_dialog();
+    assert_eq!(app.fmt_state.fill, Some([200, 10, 10]), "载入应读到旧填充");
+    assert!(!app.fmt_state.locked && app.fmt_state.hidden, "载入应读到旧保护");
+    app.fmt_state.fill = None;
+    app.fmt_touched.fill = true;
+    app.fmt_state.locked = true;
+    app.fmt_touched.locked = true;
+    app.fmt_state.hidden = false;
+    app.fmt_touched.hidden = true;
+    app.apply_format_dialog();
+    assert!(!app.fmt_dlg);
+    sheetcore::xlsx::save_atomic(&path, &app.wb).expect("save after format");
+    let back = sheetcore::xlsx::load(&path).expect("reload");
+    let st = back.styles.get(back.sheet(0).style_of(0, 0));
+    assert_eq!(st.fill, None, "重开后旧填充必须清掉");
+    assert!(st.locked, "重开后锁定必须恢复默认 true");
+    assert!(!st.hidden, "重开后隐藏必须恢复默认 false");
+}
+
 /// UI-16：每张表按 identity 恢复自己的选区/滚动/缩放，改名和重排不能串表。
 #[test]
 fn sheet_view_state_is_restored_by_stable_identity() {
