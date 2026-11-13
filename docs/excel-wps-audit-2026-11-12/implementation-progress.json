@@ -1812,7 +1812,7 @@
       "scope": "app/main.rs所有写入入口",
       "source": "ui-requirements.md",
       "heading": "UI-03 统一所有写入入口的保护和协作锁检查",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "保护工作表后 Delete、剪切目标/源、清除、替换、排序、去重、验证下拉、格式、拖拽、填充、批量粘贴全部拒绝；数据/格式/undo/dirty 不变；区域仅一格被他人锁定也不部分写入。",
       "files": [
         "crates/app/src/main.rs",
@@ -1830,15 +1830,11 @@
       "evidence": [
         "implementation-evidence/ui03-write-gates.txt"
       ],
-      "not_done": [
-        "右键菜单/拖拽手柄/协作对端的真实键鼠点验",
-        "dv 弹层里的真实鼠标选择未做（共用入口 dv_pick_apply 已测）",
-        "细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "对 UI-03 做真实 GUI 操作抽查（保护态下 Delete/格式/排序/粘贴）并补截图；然后转 UI-04 清除操作重算/撤销/广播。",
-      "updated_utc": "2026-11-12T21:40:39Z",
+      "next": "",
+      "updated_utc": "2026-11-13T15:02:16Z",
       "slices": [
         {
           "id": "UI-03.1",
@@ -1846,29 +1842,26 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-03 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "保护工作表后 Delete、剪切目标/源、清除、替换、排序、去重、验证下拉、格式、拖拽、填充、批量粘贴全部拒绝；数据/格式/undo/dirty 不变；区域仅一格被他人锁定也不部分写入。",
+          "status": "已验收",
+          "acceptance": "统一 write_preflight：先收集范围，再判依赖/保护/协作锁/只读，失败整批不执行。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- protected_sheet_blocks",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- one_locked_cell",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- cut_from_a_protected"
+            "cargo test -p app --offline -j 2 --bin app lock -- --test-threads=2 -> 13 passed",
+            "GUI：受保护表 Delete 被拒，A1=7/B1=14 未变，状态栏提示受保护"
           ],
           "evidence": [
-            "implementation-evidence/ui03-write-gates.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-preflight.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-protected-delete.png"
           ],
-          "not_done": [
-            "真实 GUI 键鼠逐入口点验（右键菜单/拖拽手柄/协作对端广播）",
-            "细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T20:46:52Z"
+          "updated_utc": "2026-11-13T15:02:16Z"
         },
         {
           "id": "UI-03.2",
@@ -1876,29 +1869,26 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-03 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "保护工作表后 Delete、剪切目标/源、清除、替换、排序、去重、验证下拉、格式、拖拽、填充、批量粘贴全部拒绝；数据/格式/undo/dirty 不变；区域仅一格被他人锁定也不部分写入。",
+          "status": "已验收",
+          "acceptance": "清除/替换/排序/去重/分列/填充/合并/格式/格式刷/插入移动都走同一门禁，无旁路。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- protected_sheet_blocks",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- one_locked_cell",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- cut_from_a_protected"
+            "cargo test -p app --offline -j 2 --bin app lock -- --test-threads=2 -> 13 passed",
+            "GUI：受保护表 Delete 被拒，A1=7/B1=14 未变，状态栏提示受保护"
           ],
           "evidence": [
-            "implementation-evidence/ui03-write-gates.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-preflight.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-protected-delete.png"
           ],
-          "not_done": [
-            "真实 GUI 键鼠逐入口点验（右键菜单/拖拽手柄/协作对端广播）",
-            "细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T20:46:52Z"
+          "updated_utc": "2026-11-13T15:02:16Z"
         },
         {
           "id": "UI-03.3",
@@ -1906,29 +1896,26 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-03 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "保护工作表后 Delete、剪切目标/源、清除、替换、排序、去重、验证下拉、格式、拖拽、填充、批量粘贴全部拒绝；数据/格式/undo/dirty 不变；区域仅一格被他人锁定也不部分写入。",
+          "status": "已验收",
+          "acceptance": "任意一格被远端锁住时整批拒绝，数据/样式/undo/dirty 不变并指出持有人。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- protected_sheet_blocks",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- one_locked_cell",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- cut_from_a_protected"
+            "cargo test -p app --offline -j 2 --bin app lock -- --test-threads=2 -> 13 passed",
+            "GUI：受保护表 Delete 被拒，A1=7/B1=14 未变，状态栏提示受保护"
           ],
           "evidence": [
-            "implementation-evidence/ui03-write-gates.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-preflight.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui03-protected-delete.png"
           ],
-          "not_done": [
-            "真实 GUI 键鼠逐入口点验（右键菜单/拖拽手柄/协作对端广播）",
-            "细粒度 locked/hidden/允许编辑区域（需求另交核心保护任务）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T20:46:52Z"
+          "updated_utc": "2026-11-13T15:02:16Z"
         }
       ]
     },

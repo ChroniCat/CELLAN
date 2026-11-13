@@ -3670,6 +3670,107 @@ fn one_locked_cell_blocks_multi_select_clear_format_and_sort() {
     assert!(app.status.contains("丙"), "应指出锁持有人：{}", app.status);
     drop(env);
 }
+/// UI-03 验收矩阵：区域里只有一格被远程锁住，移动/合并/分列/去重/填充/粘贴/插格
+/// 这些入口都必须整批拒绝——数据、样式、undo、dirty 全不变，状态栏指出锁持有人。
+#[test]
+fn every_write_entry_is_blocked_by_one_remote_lock() {
+    let env = crate::test_env::TestEnv::new("ui03_matrix");
+    let ctx = egui::Context::default();
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut SheetApp)>)> = vec![
+        ("拖拽移动", Box::new(|a: &mut SheetApp| a.move_selection_by(1, 0))),
+        ("合并", Box::new(|a: &mut SheetApp| a.toggle_merge(true))),
+        ("分列", Box::new(|a: &mut SheetApp| a.run_split(','))),
+        ("删除重复", Box::new(|a: &mut SheetApp| a.run_dedup())),
+        ("向下填充", Box::new(|a: &mut SheetApp| a.fill_to(2, true))),
+        ("选择性粘贴", Box::new(|a: &mut SheetApp| a.paste_special_apply_text(&egui::Context::default(), Some("9".into())))),
+        ("插入并移动", Box::new(|a: &mut SheetApp| a.shift_insert_by(3, 0))),
+    ];
+
+    for (name, run) in cases {
+        let mut app = seeded_app(&env, "lockmx");
+        app.net = Some(crate::net::host(95, "我".into(), "ui03mx".into(), 0, "t".into()).unwrap());
+        // 锁在 B2（(1,1)），选区 A1:B2 覆盖它
+        app.locks.request(0, 1, 1, 96, "丁", 0);
+        app.sel = (0, 0);
+        app.sel_end = (1, 1);
+        let before = snapshot(&app);
+        let depth = app.undo.depth();
+        // 2×2 剪贴板：选择性粘贴的目标区域是锚点 + 剪贴板尺寸，这样才会覆盖被锁的 B2
+        let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
+        let clip = Clip {
+            sheet: 0,
+            rect: (0, 0, 1, 1),
+            cells: vec![vec![cell("粘贴"), cell("粘贴")], vec![cell("粘贴"), cell("粘贴")]],
+            cut: false,
+        };
+        app.clip = Some(clip);
+
+        run(&mut app);
+
+        assert_eq!(snapshot(&app), before, "{name} 不能绕过远程锁");
+        assert_eq!(app.undo.depth(), depth, "{name} 不能产生撤销步");
+        assert!(!app.wb.dirty, "{name} 被拒绝后不能标脏");
+        assert!(app.status.contains("丁"), "{name} 应指出锁持有人：{}", app.status);
+    }
+    drop(env);
+}
+
+/// UI-03：粘贴/剪切/替换/验证下拉在远程锁下同样整批拒绝（与拖拽那组互补）。
+#[test]
+fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
+    let env = crate::test_env::TestEnv::new("ui03_matrix2");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "lockmx2");
+    app.net = Some(crate::net::host(97, "我".into(), "ui03mx2".into(), 0, "t".into()).unwrap());
+    // B1 与 B2 都被远程锁住：粘贴/剪切看整块，替换看被替换的那一格
+    app.locks.request(0, 0, 1, 98, "戊", 0);
+    app.locks.request(0, 1, 1, 98, "戊", 0);
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    let before = snapshot(&app);
+    let depth = app.undo.depth();
+
+    // 普通粘贴：2×2 内部剪贴板 → 目标覆盖 B2
+    let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 1, 1),
+        cells: vec![vec![cell("P"), cell("P")], vec![cell("P"), cell("P")]],
+        cut: false,
+    });
+    app.clip_paste(false, None);
+    assert_eq!(snapshot(&app), before, "粘贴不能绕过锁");
+    assert!(app.status.contains("戊"), "粘贴应指出锁持有人：{}", app.status);
+
+    // 剪切粘贴：源块里就有被锁格
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 1, 1),
+        cells: vec![vec![cell("C"), cell("C")], vec![cell("C"), cell("C")]],
+        cut: true,
+    });
+    app.clip_paste(false, None);
+    assert_eq!(snapshot(&app), before, "剪切源被锁时不能清源");
+
+    // 替换
+    app.find.find = "v01".into();
+    app.find.replace = "X".into();
+    app.sel = (0, 1);
+    app.replace_current();
+    assert_eq!(snapshot(&app), before, "替换不能绕过锁");
+    app.replace_all();
+    assert_eq!(snapshot(&app), before, "全部替换不能绕过锁");
+
+    // 验证下拉
+    app.sel = (1, 1);
+    assert!(!app.dv_pick_apply(1, 1, "v11"), "锁住时下拉选择必须拒绝");
+
+    assert_eq!(app.undo.depth(), depth, "被拒绝的操作不能进撤销栈");
+    assert!(!app.wb.dirty, "被拒绝的操作不能标脏");
+    drop(env);
+}
+
 /// UI-03：区域里只有一格被别人锁定，也整批不写（不做部分写入）。
 #[test]
 fn one_locked_cell_blocks_the_whole_clear() {
