@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T09:36:00Z",
+  "updated_utc": "2026-11-13T09:42:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -2334,8 +2334,8 @@
       "scope": "core/formula/functions.rs, style.rs",
       "source": "core-requirements.md",
       "heading": "C06 P1 本地时间与序列60兼容",
-      "status": "已验收",
-      "acceptance": "序列 59/60/61 分别为 1900-02-28/1900-02-29/1900-03-01，DATE(1900,2,29)=60，DAY/MONTH/YEAR/TEXT/单元格日期格式一致；NOW/TODAY 默认用系统本地时间，可用 with_clock_at 注入 UTC 秒与偏移，同一轮计算共享快照；模拟 Asia/Shanghai 00:30、时区变化和午夜均不依赖真实等待。Excel 16.0/WPS 12.0 实机 TEXT(60) 均为 1900-02-29、DAY(60)=29。",
+      "status": "待验收",
+      "acceptance": "实现完成并自测通过，待独立复核：序列 59/60/61 分别为 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY/MONTH/YEAR/TEXT 与单元格日期格式一致；NOW/TODAY 本地时间、with_clock_at 注入、同一轮快照；Excel 16.0/WPS 12.0 实机 TEXT(60)=1900-02-29、DAY(60)=29。",
       "files": [],
       "commits": [
         "8cd81fe"
@@ -2352,7 +2352,7 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "继续 C07 或剩余待验收项",
+      "next": "等待独立复核；复核通过后转已验收",
       "updated_utc": "2026-11-13T09:36:00Z",
       "slices": [
         {
@@ -2361,7 +2361,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "序列 59/60/61 分别对应 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY(60)=29、MONTH(60)=2、YEAR(60)=1900、TEXT/单元格格式均为 1900-02-29；1904 体系不接受虚构的 1900-02-29。",
           "files": [],
           "commits": [
@@ -2379,7 +2379,7 @@
           "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "等待独立复核",
           "updated_utc": "2026-11-13T09:36:00Z"
         },
         {
@@ -2388,7 +2388,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照。",
           "files": [],
           "commits": [
@@ -2405,7 +2405,7 @@
           "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "等待独立复核",
           "updated_utc": "2026-11-13T09:36:00Z"
         }
       ]

@@ -1,8 +1,8 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`），HEAD `8cd81fe`（C06 代码与证据；C08 alert 普通 Open 证据）。
-- 台账（`scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 42 待实施；
-  切片 30 已验收 / 16 待验收 / 102 待实施。
+- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 42 待实施；
+  切片 28 已验收 / 18 待验收 / 102 待实施。
 - 当前测试真值（C06 修改后，09:39 重跑）：core 68 bins / 616 passed / 0 failed / 41 ignored，
   CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
   GUI_EXIT=0。app/GUI 与 C06 修改后的 core 同树运行。
@@ -31,7 +31,7 @@
 - 未执行边界：“计算工作表”GUI 点选未单独取证（命令级 app 测试覆盖）；大表数组/循环引用
   对拍未执行；.xls 动态数组不在当前 BIFF 模型。UI-21 父项与 UI-21.1 均已验收。
 
-## 本轮：C06 本地时间与序列 60 兼容（已验收）
+## 本轮：C06 本地时间与序列 60 兼容（实现完成，待独立复核）
 
 - `date_to_serial_in`/`serial_to_date_in` 显式表示 1900-02-29 兼容日：59/60/61 →
   02-28/02-29/03-01，DATE(1900,2,29)=60；1904 体系不伪造该日。
