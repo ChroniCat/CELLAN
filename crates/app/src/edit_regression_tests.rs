@@ -2836,7 +2836,8 @@ fn failed_save_keeps_dirty_reports_the_step_and_allows_retry() {
     assert!(app.wb.dirty);
 
     // 注入保存子步骤失败：界面必须保留 dirty、给出可定位错误、不写盘
-    env.sc("SC_FAIL_SAVE_STEP", "layout");
+    // 只让本次保存失败：并行跑的其它保存（比如 filter/样式回归）不能被带下水
+    env.sc("SC_FAIL_SAVE_STEP", "layout@c133-retry");
     ui_frame(&mut app, &ctx, vec![ctrl_key(egui::Key::S, false)]);
     wait_save(&mut app);
     assert!(
@@ -5897,4 +5898,144 @@ fn dv_config_error_is_visible_even_without_error_alert() {
         "配置坏了必须能看见诊断：{}",
         app.status
     );
+}
+
+fn key_event_alt(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers { alt: true, ..Default::default() },
+    }
+}
+
+fn app_with_list(ratings: &str) -> (egui::Context, SheetApp) {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+        ranges: vec![(1, 1, 1, 1)],
+        kind: sheetcore::dv::DvKind::List,
+        f1: ratings.into(),
+        ..Default::default()
+    });
+    app.wb.sheets[0].dv_dirty = true;
+    app.sel = (1, 1);
+    (ctx, app)
+}
+
+#[test]
+fn dv_keyboard_dropdown_picks_with_arrows_and_is_undoable() {
+    let (ctx, mut app) = app_with_list("\"甲,乙,丙\"");
+    ui_frame(&mut app, &ctx, vec![key_event_alt(egui::Key::ArrowDown)]);
+    assert!(app.dv_open.is_some(), "Alt+↓ 应打开序列下拉");
+    assert_eq!(app.dv_hilite, 0, "没有当前值时高亮第一项");
+
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    assert_eq!(app.dv_hilite, 1);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowUp, false)]);
+    assert_eq!(app.dv_hilite, 0);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+
+    assert!(app.dv_open.is_none(), "选择后关闭");
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Text("乙".into()));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "下拉选择必须可撤销");
+}
+
+#[test]
+fn dv_keyboard_dropdown_escape_leaves_cell_unchanged() {
+    let (ctx, mut app) = app_with_list("\"甲,乙\"");
+    ui_frame(&mut app, &ctx, vec![key_event_alt(egui::Key::ArrowDown)]);
+    assert!(app.dv_open.is_some());
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.dv_open.is_none(), "Esc 关闭");
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "Esc 不写");
+    assert!(app.undo.depth() == (0, 0), "没有产生撤销记录");
+}
+
+#[test]
+fn dv_alt_down_without_list_reports_and_does_not_open() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    ui_frame(&mut app, &ctx, vec![key_event_alt(egui::Key::ArrowDown)]);
+    assert!(app.dv_open.is_none());
+    assert!(app.status.contains("没有可用的序列来源"), "{}", app.status);
+}
+
+#[test]
+fn dv_picked_value_survives_save_and_reload() {
+    let (ctx, mut app) = app_with_list("\"甲,乙\"");
+    ui_frame(&mut app, &ctx, vec![key_event_alt(egui::Key::ArrowDown)]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Text("乙".into()));
+
+    let out = std::env::current_exe()
+        .expect("test exe")
+        .parent()
+        .expect("test dir")
+        .join(format!("c07_dv_pick_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &app.wb).expect("保存");
+    let back = sheetcore::xlsx::load(&out).expect("重开");
+    assert_eq!(back.sheet(0).value(1, 1), Value::Text("乙".into()));
+    let rule = sheetcore::dv::find(&back.sheet(0).dv, 1, 1).expect("规则仍在");
+    assert_eq!(rule.kind, sheetcore::dv::DvKind::List);
+    let items = sheetcore::dv::list_items_wb(&back, 0, rule, 1, 1).expect("列表可解析");
+    assert_eq!(items, vec!["甲".to_string(), "乙".to_string()]);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn dv_information_escape_cancels_without_write_or_undo() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Information, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert!(app.dv_alert.as_ref().map(|a| a.info_only).unwrap_or(false));
+    let before = app.undo.depth();
+
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "信息框 Esc 不写入");
+    assert!(app.dv_alert.is_none(), "Esc 关闭提示框");
+    assert_eq!(app.undo.depth(), before, "取消不能留下撤销记录");
+    assert!(app.status.contains("已取消"), "状态栏要说明已取消：{}", app.status);
+
+    // 取消之后再输一个合法值：只应产生一条撤销记录
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("5".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(5.0));
+    assert_eq!(app.undo.depth(), (before.0 + 1, 0));
+}
+
+#[test]
+fn dv_information_cancel_button_discards_entry() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Information, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("99".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    let before = app.undo.depth();
+    // 提示框里的“取消”按钮走的是同一个 resolve_dv_alert
+    app.resolve_dv_alert(DvAlertChoice::Cancel);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty, "取消按钮不写入");
+    assert_eq!(app.undo.depth(), before);
+    assert!(!app.wb.dirty || app.wb.sheet(0).value(1, 1) == Value::Empty);
+}
+
+#[test]
+fn dv_information_ok_button_writes_once() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rule(&ctx, sheetcore::dv::DvStyle::Information, true);
+    app.sel = (1, 1);
+    app.editing = Some(EditState::new("7".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    app.resolve_dv_alert(DvAlertChoice::Primary);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(7.0), "确定后写入");
+    assert_eq!(app.undo.depth(), (1, 0), "只留一条撤销");
 }

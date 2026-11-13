@@ -255,7 +255,7 @@ struct DvAlert {
     r: u32,
     c: u32,
     buf: String,
-    /// true = 信息框（只有“确定”，确定后写入）；false = 警告框（是/否/取消）
+    /// true = 信息框（确定/取消，和 Excel 一样：取消不写入）；false = 警告框（是/否/取消）
     info_only: bool,
     title: String,
     msg: String,
@@ -681,6 +681,12 @@ struct SheetApp {
     cs_dlg: Option<ConsDlg>,
     /// 序列下拉：正在展开的单元格
     dv_open: Option<(u32, u32)>,
+    /// 序列下拉里键盘高亮的下标（Alt+↓ 打开后方向键移动）
+    dv_hilite: usize,
+    /// 验收探针：SC_KEYSEQ 逐帧注入的按键序列（无界面会话用）
+    key_seq: Vec<String>,
+    key_frames: u32,
+
     /// 批注编辑：(行, 列, 文本)
     note_edit: Option<(u32, u32, String)>,
     /// 跨表取数对话框：输入文本
@@ -1447,6 +1453,16 @@ impl SheetApp {
             ff_dlg: None,
             cs_dlg: None,
             dv_open: None,
+            dv_hilite: 0,
+            key_seq: std::env::var("SC_KEYSEQ")
+                .map(|v| {
+                    v.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            key_frames: 0,
             note_edit: None,
             link_dlg: None,
             macro_run_dlg: None,
@@ -4482,7 +4498,34 @@ impl SheetApp {
         };
     }
 
-    /// 验证下拉选中一项后真正写入（与网格内联逻辑同一个入口，便于门禁回归）。
+    /// 选中格可用的列表候选；没有列表验证或来源解析失败时为空。
+    fn dv_items(&self, r: u32, c: u32) -> Vec<String> {
+        let sheet = self.wb.sheet(self.sheet_idx);
+        match sheetcore::dv::find(&sheet.dv, r, c) {
+            Some(dv) if dv.kind == sheetcore::dv::DvKind::List => {
+                sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv, r, c).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Alt+↓ / 点击箭头：打开序列下拉，并把高亮放在当前值上（Excel 的行为）。
+    fn dv_open_for_selection(&mut self) {
+        let (r, c) = self.sel;
+        if self.editing.is_some() {
+            return;
+        }
+        let items = self.dv_items(r, c);
+        if items.is_empty() {
+            self.status = "当前单元格没有可用的序列来源".into();
+            return;
+        }
+        let cur = self.wb.sheet(self.sheet_idx).value(r, c).display();
+        self.dv_hilite = items.iter().position(|it| *it == cur).unwrap_or(0);
+        self.dv_open = Some((r, c));
+    }
+
+    /// 验证下拉选中一项后真正写入：和手输同一套门禁、撤销事务与广播。
     fn dv_pick_apply(&mut self, dr: u32, dc: u32, v: &str) -> bool {
         if !self.write_preflight(&[(dr, dc)], "选择验证下拉值") {
             self.dv_open = None;
@@ -4493,11 +4536,18 @@ impl SheetApp {
             formula: None,
         };
         let key = (self.sheet_idx, dr, dc);
-        self.wb.sheet_mut(self.sheet_idx).set(dr, dc, cell);
+        let txn = self.txn_begin(&[(dr, dc)]);
+        self.wb.sheet_mut(self.sheet_idx).set(dr, dc, cell.clone());
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.txn_end("选择验证下拉值", txn);
         self.deps.update_cell(&self.wb, key);
         sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
+        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+            let op = peer.local_set(self.sheet_idx, dr, dc, &cell);
+            net.broadcast_op(op);
+        }
+        self.status = format!("已选择 {v}");
         true
     }
 
@@ -5826,7 +5876,7 @@ impl SheetApp {
                             }
                         });
                         if dv.kind == sheetcore::dv::DvKind::List
-                            && sheetcore::dv::list_items_wb(&self.wb, si, dv).is_none()
+                            && sheetcore::dv::list_items_wb(&self.wb, si, dv, r, c).is_none()
                         {
                             config_bad = Some(format!("列表来源无法解析：{}", dv.f1));
                         }
@@ -7023,7 +7073,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     /// 数据验证警告/信息框的选择：是/确定→写入；否→回编辑框；取消→放弃本次输入。
     fn resolve_dv_alert(&mut self, choice: DvAlertChoice) {
         let Some(a) = self.dv_alert.take() else { return };
-        let commit = a.info_only || choice == DvAlertChoice::Primary;
+        // 只有“确定/是”才写入；取消（含信息框的 Esc）必须原样丢弃，
+        // 否则用户按 Esc 却被写进去，还会平白多一条撤销记录。
+        let commit = choice == DvAlertChoice::Primary;
         if commit {
             self.sel = (a.r, a.c);
             self.editing = Some(EditState::new(a.buf));
@@ -7038,18 +7090,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
-    /// 警告/信息提示框。信息样式只有“确定”（确定后写入），警告样式是“是/否/取消”。
+    /// 警告/信息提示框。信息样式是“确定/取消”（Excel：取消则不写入），
+    /// 警告样式是“是/否/取消”。Esc 一律等于取消。
     fn dv_alert_window(&mut self, ctx: &egui::Context) {
         let Some(a) = self.dv_alert.clone() else { return };
         let mut choice: Option<DvAlertChoice> = None;
         // 模态框期间 handle_keys 让路（dialog_modal），键盘在这里收：
-        // Enter = 默认按钮（是/确定），Esc = 取消（信息框的 Esc 等同确定）。
+        // Enter = 默认按钮（是/确定），Esc = 取消（三种样式一致，都不写入）。
         let key_choice = if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            Some(if a.info_only {
-                DvAlertChoice::Primary
-            } else {
-                DvAlertChoice::Cancel
-            })
+            Some(DvAlertChoice::Cancel)
         } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
             Some(DvAlertChoice::Primary)
         } else {
@@ -7068,7 +7117,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     );
                     ui.vertical(|ui| {
                         ui.label(&a.msg);
-                        if !a.info_only {
+                        if a.info_only {
+                            ui.label("确定：接受这个值　取消：不写入");
+                        } else {
                             ui.label("是：接受这个值　否：回到编辑框　取消：不写入");
                         }
                     });
@@ -7078,6 +7129,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     if a.info_only {
                         if ui_kit::primary_button(ui, "确定").clicked() {
                             choice = Some(DvAlertChoice::Primary);
+                        }
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            choice = Some(DvAlertChoice::Cancel);
                         }
                     } else {
                         if ui_kit::primary_button(ui, "是").clicked() {
@@ -7118,7 +7172,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     let mut calc = sheetcore::formula::Calc::new(&self.wb);
                     let mut config_err: Option<String> = None;
                     if dv.kind == sheetcore::dv::DvKind::List
-                        && sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv).is_none()
+                        && sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv, r, c).is_none()
                     {
                         config_err = Some(format!("列表来源无法解析：{}", dv.f1));
                     }
@@ -7752,6 +7806,49 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.cancel_edit();
             }
+            return;
+        }
+
+        // 序列下拉打开时键盘接管：↑↓ 移动、Enter 选、Esc 关（Excel 的下拉键盘行为）
+        if let Some((dr, dc)) = self.dv_open {
+            let items = self.dv_items(dr, dc);
+            if items.is_empty() {
+                self.dv_open = None;
+            } else {
+                if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    self.dv_open = None;
+                    self.status = "已关闭序列下拉（未写入）".into();
+                    return;
+                }
+                if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+                    self.dv_hilite = (self.dv_hilite + 1) % items.len();
+                    return;
+                }
+                if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+                    self.dv_hilite = (self.dv_hilite + items.len() - 1) % items.len();
+                    return;
+                }
+                if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    let v = items[self.dv_hilite.min(items.len() - 1)].clone();
+                    self.dv_open = None;
+                    self.dv_pick_apply(dr, dc, &v);
+                    return;
+                }
+            }
+        }
+        // Alt+↓：打开选中格的序列下拉。看事件自带的修饰键，别依赖全局 modifiers
+        // （合成/远端会话里 InputState.modifiers 可能没跟着按键事件更新）。
+        let alt_down = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { key: Key::ArrowDown, pressed: true, modifiers, .. }
+                        if modifiers.alt
+                )
+            })
+        });
+        if alt_down {
+            self.dv_open_for_selection();
             return;
         }
 
@@ -21870,7 +21967,7 @@ let txn = self.txn_begin(&keys);
                     Color32::from_rgb(70, 70, 70),
                 );
                 if dumping {
-                    dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv).map(|v| v.len()).unwrap_or(0)));
+                    dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv, self.sel.0, self.sel.1).map(|v| v.len()).unwrap_or(0)));
                 }
                 if !readonly && resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -21882,7 +21979,7 @@ let txn = self.txn_begin(&keys);
             }
         }
         if open_list {
-            self.dv_open = Some(self.sel);
+            self.dv_open_for_selection();
         }
 
         // 序列下拉列表
@@ -21891,11 +21988,11 @@ let txn = self.txn_begin(&keys);
                 let sheet = self.wb.sheet(self.sheet_idx);
                 sheetcore::dv::find(&sheet.dv, dr, dc).cloned()
             } {
-                let items = sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, &dv)
+                let items = sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, &dv, dr, dc)
                     .unwrap_or_default();
                 if !items.is_empty() {
                     let pos = egui::pos2(gx(dc), gy(dr) + rows.size(dr));
-                    let mut picked: Option<String> = None;
+                    let mut picked: Option<(usize, String)> = None;
                     let mut close = false;
                     egui::Area::new(egui::Id::new("dv_list"))
                         .fixed_pos(pos)
@@ -21903,14 +22000,28 @@ let txn = self.txn_begin(&keys);
                         .show(ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(120.0);
-                                for it in items.iter() {
-                                    if ui.button(it).clicked() {
-                                        picked = Some(it.clone());
-                                    }
-                                }
+                                // 限高 + 键盘高亮；UI-19 的虚拟化/搜索另算，这里只保证
+                                // 方向键选中的项一定在可视区内（否则键盘会选到看不见的项）
+                                egui::ScrollArea::vertical()
+                                    .max_height(260.0)
+                                    .show(ui, |ui| {
+                                        for (i, it) in items.iter().enumerate() {
+                                            let resp = ui.selectable_label(
+                                                i == self.dv_hilite,
+                                                it.as_str(),
+                                            );
+                                            if i == self.dv_hilite {
+                                                resp.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                            if resp.clicked() {
+                                                picked = Some((i, it.clone()));
+                                            }
+                                        }
+                                    });
                             });
                         });
-                    if let Some(v) = picked {
+                    if let Some((i, v)) = picked {
+                        self.dv_hilite = i;
                         if self.dv_pick_apply(dr, dc, &v) {
                             close = true;
                         }
@@ -24033,10 +24144,49 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 高 DPI 验收：SC_PPP=1.5 强制设备像素比（默认跟随系统）
-        if let Ok(v) = std::env::var("SC_PPP") {
-            if let Ok(f) = v.parse::<f32>() {
-                ctx.set_pixels_per_point(f.clamp(0.75, 3.0));
+        // 验收探针：SC_KEYSEQ="alt+down,down,enter,ctrl+s" 按帧注入按键事件。
+        // 本机是断开的 RDP 会话（前台窗口 hwnd 0x0），系统级按键投递不进去；
+        // 这个探针让事件走真实窗口循环里的同一个 handle_keys，而不是另写一条路径。
+        if !self.key_seq.is_empty() {
+            self.key_frames += 1;
+            let seq = self.key_seq.clone();
+            let mut all_done = true;
+            for (i, raw) in seq.iter().enumerate() {
+                // 支持 "120:escape" 指定帧；没写帧号就按 START + STEP*i 顺序发
+                let (at, spec) = match raw.split_once(':') {
+                    Some((n, rest)) if n.trim().parse::<u32>().is_ok() => {
+                        (n.trim().parse::<u32>().unwrap_or(0), rest.trim().to_string())
+                    }
+                    _ => (6 + 6 * i as u32, raw.trim().to_string()),
+                };
+                if self.key_frames == at {
+                    match parse_key_spec(&spec) {
+                        Some((mods, key)) => {
+                            eprintln!("[keyseq] frame {} -> {spec}", self.key_frames);
+                            let ev = egui::Event::Key {
+                                key,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: mods,
+                            };
+                            // 合成事件不带 RawInput.modifiers，这里一并补上，
+                            // 让用全局 modifiers 判断的快捷键（Ctrl+S 等）也走同一条路。
+                            ctx.input_mut(|inp| {
+                                inp.modifiers = mods;
+                                inp.events.push(ev);
+                            });
+                        }
+                        None => eprintln!("[keyseq] 无法解析 {spec}"),
+                    }
+                }
+                if self.key_frames <= at {
+                    all_done = false;
+                }
+            }
+            if all_done {
+                self.key_seq.clear();
+                eprintln!("[keyseq] 结束");
             }
         }
         let __cpu_t0 = std::time::Instant::now();
@@ -26151,4 +26301,29 @@ fn draw_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, bd: &sheetco
             painter.line_segment([a, b], egui::Stroke::new(w, color));
         }
     }
+}
+
+/// 把 "alt+down" / "ctrl+s" 这类写法转成（修饰键，按键）（验收探针用）。
+fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
+    let mut mods = egui::Modifiers::default();
+    let mut key = None;
+    for part in spec.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => mods.ctrl = true,
+            "alt" => mods.alt = true,
+            "shift" => mods.shift = true,
+            "down" => key = Some(egui::Key::ArrowDown),
+            "up" => key = Some(egui::Key::ArrowUp),
+            "enter" | "return" => key = Some(egui::Key::Enter),
+            "escape" | "esc" => key = Some(egui::Key::Escape),
+            "s" => key = Some(egui::Key::S),
+            other => eprintln!("[keyseq] 未知按键 {other}"),
+        }
+    }
+    // Windows 上 winit 会同时给出 ctrl 和 command；探针也照这个约定来，
+    // 否则 Ctrl+S 这类用 modifiers.command 判断的快捷键收不到。
+    if mods.ctrl {
+        mods.command = true;
+    }
+    key.map(|k| (mods, k))
 }

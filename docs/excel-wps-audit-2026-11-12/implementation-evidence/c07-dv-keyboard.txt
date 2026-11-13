@@ -1,0 +1,58 @@
+# C07.3 键盘下拉与保存集成
+
+日期：2026-11-13 23:2x CST
+范围：`crates/app/src/main.rs`（`dv_items`/`dv_open_for_selection`、`dv_pick_apply`、
+`handle_keys` 的下拉按键接管、下拉绘制、验收探针 `SC_KEYSEQ`）、
+`crates/app/src/edit_regression_tests.rs`（4 条新测试）、
+夹具 `crates/core/tests/fixtures/c07/keyboard.xlsx`（脚本 `scripts/c07_dv_keyboard_fixture.py`）。
+
+## 行为
+
+| 操作 | 结果 |
+| --- | --- |
+| Alt+↓（或点单元格右侧箭头） | 用 `dv_open_for_selection` 打开序列下拉；高亮落在当前值上，没有值就落在第一项 |
+| ↑ / ↓ | 移动高亮（循环），下拉带 ScrollArea 限高 260，高亮项自动滚进可视区 |
+| Enter | 用 `dv_pick_apply` 选中并关闭 |
+| Esc | 关闭且不写入 |
+| 选择后 | 走与手输相同的写入门禁：`write_preflight`（保护/协作租约）、`txn_begin/txn_end`
+（撤销 + 修订日志）、依赖重算、协作广播 |
+
+`dv_pick_apply` 之前直接 `set` 单元格，没有撤销事务、没有广播、没有门禁；本次补齐，
+所以"选一项"和"手输一个值"在撤销、协作、保护上是同一套语义。
+
+按键检测注意点：Alt+↓ 读事件自带的 `modifiers.alt`，不依赖 `InputState.modifiers`；
+`dv_open` 打开期间 `handle_keys` 先接管方向键/Enter/Esc，避免同时移动选区。
+
+## 测试
+
+```text
+cargo test -p app --offline -j 2 --bin app dv_ -- --test-threads=2
+-> 17 passed（C07.1/2/3 的 dv 回归全在这一组）
+
+含：dv_keyboard_dropdown_picks_with_arrows_and_is_undoable
+    dv_keyboard_dropdown_escape_leaves_cell_unchanged
+    dv_alt_down_without_list_reports_and_does_not_open
+    dv_picked_value_survives_save_and_reload   ← 选择后保存重开，值 + 规则都在
+```
+
+## 真实窗口取证
+
+本机是断开的 RDP 会话：`bring_to_front` 报 `foreground hwnd 0x0`，
+`computer_use` 的 PostMessage 投递也进不了 winit 的输入队列（实测 Alt+↓/↓/Enter/Ctrl+S
+全部无效，B2 始终为空）。因此用 `SC_KEYSEQ` 把按键事件注入**运行中的应用的真实帧循环**，
+由同一个 `handle_keys`/`dv_alert_window` 处理，再抓应用自身 framebuffer：
+
+| 证据 | 命令要点 | 结果 |
+| --- | --- | --- |
+| `c07-gui-dv-keyboard.png` | `SC_SEL=1,1 SC_KEYSEQ="30:alt+down,60:down" SC_SHOT_FRAMES=75` | B2 下方展开四项（苹果/香蕉/橙子/葡萄），高亮在"香蕉"（绿底） |
+| `c07-gui-dv-keyboard-picked.png` | `SC_KEYSEQ="30:alt+down,60:down,90:enter,150:ctrl+s" SC_SHOT_FRAMES=420` | B2 显示"香蕉"，状态栏"已选择 香蕉"，标题栏 `kb-run5.xlsx` 未保存星号消失 |
+
+保存集成不是看截图猜的：该次运行结束后用 openpyxl 读 `kb-run5.xlsx`，
+`B2=香蕉`；stderr 有 `[save] 已保存 ...`。用的正是 Ctrl+S 命令表路径。
+
+## 诚实边界
+
+- 系统级人工按键（SendInput/真实键盘）在本会话无法投递，上面是"事件注入到真实应用帧循环"，
+  比单元测试多走了真实窗口循环、真实下拉绘制与真实保存，但不是人工键鼠。
+  换到可交互桌面时，按同一组快捷键手测即可复验；本项没有把它记成"人工键鼠已验"。
+- 下拉的 500 项虚拟化、搜索、协作预检交互属于 UI-19，这里没做，也没写成已做。
