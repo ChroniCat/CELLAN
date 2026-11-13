@@ -1,8 +1,8 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `564b979`（BIFF CALCMODE 工作表流修正）；UI-21 验收证据待随下一提交入库。
-- 台账（`scripts/audit_progress.py counts`）：10 已验收 / 8 待验收 / 43 待实施；
-  切片 27 已验收 / 17 待验收 / 104 待实施。
+- 分支 `main`（`origin/main`），HEAD `842670e`（UI-21 证据精度修正；C08 验收证据待随下一提交入库）。
+- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 7 待验收 / 43 待实施；
+  切片 28 已验收 / 16 待验收 / 104 待实施。
 - 当前测试真值（08:41–08:45，work/hermes-ui21-final-20261113-084145）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
   app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / GUI_EXIT=0。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
@@ -29,6 +29,18 @@
   gui-initial-cached-10.png,gui-after-edit-pending.png,gui-after-f9.png}。
 - 未执行边界：“计算工作表”GUI 点选未单独取证（命令级 app 测试覆盖）；大表数组/循环引用
   对拍未执行；.xls 动态数组不在当前 BIFF 模型。UI-21 父项与 UI-21.1 均已验收。
+
+## 本轮：C08 无损更新自定义文档属性（已验收）
+
+- 实现已在 `external.rs`/`xlsx.rs`：按命名空间保留第三方属性、只重写 `_sc_src_*`；
+  四类属性与 `&<>"` 转义、删最后源只清本应用属性等 10 个测试通过（2 个需 Office 的 ignored）。
+- 实机补证：app 真实 `SC_SAVE_ASYNC` 保存 input.xlsx → app_saved.xlsx，仍含 5 项；
+  Excel 16.0 cscript 读取 5 项；Excel 另存后仍 5 项；WPS 12.0 读取 5 项，另存后
+  5 项原样并追加 WPS 自有 3 项。PowerShell 5.1 动态 COM 的 NullReferenceException
+  不是属性不可见，cscript late binding 正常。
+- 边界：Excel 属性对话框自定义页列表截图仍为空白（未作为通过证据）；Office 打开时
+  “无修复提示”未取得截图；刷新仍是模型层 `import_csv`，未点 UI 刷新按钮。
+- 证据：implementation-evidence/c08-custom-props.txt、c08-custom-props/。
 
 ## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
 

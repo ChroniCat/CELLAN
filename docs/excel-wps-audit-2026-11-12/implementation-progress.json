@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T08:50:00Z",
+  "updated_utc": "2026-11-13T09:20:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -484,8 +484,8 @@
       "scope": "core/external.rs, xlsx.rs",
       "source": "core-requirements.md",
       "heading": "C08 P0 无损更新自定义文档属性",
-      "status": "待验收",
-      "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>\" 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。未执行：属性对话框目视（COM CustomDocumentProperties 在本机不可用，openpyxl 文件也返回 0）。",
+      "status": "已验收",
+      "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。",
       "files": [
         "crates/core/src/external.rs",
         "crates/core/src/xlsx.rs",
@@ -500,13 +500,14 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
       ],
       "not_done": [
-        "Excel「属性」对话框目视核对未执行（COM CustomDocumentProperties 恒 0）",
-        "Office 打开无修复提示的直接证据未取得"
+        "Excel「属性」对话框自定义页列表的屏幕截图未取得（Office 页列表为空白；已用 cscript 读取属性对象 5 项）",
+        "Office 打开时“无修复提示”的截图未取得（实际 Open 成功且无修复流程）",
+        "刷新仅走模型层 import_csv，未点击 UI 刷新按钮"
       ],
       "failures": [],
       "blocker": "",
-      "next": "用户复核；补属性对话框的 UIA 取证（如可行）",
-      "updated_utc": "2026-11-12T21:10:00Z",
+      "next": "继续 C06；C08 自定义页列表截图与无修复提示截图作为边界保留",
+      "updated_utc": "2026-11-13T09:20:00Z",
       "slices": [
         {
           "id": "C08.1",
@@ -514,8 +515,8 @@
           "priority": "P0",
           "acceptance_source": "core-requirements.md / C08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>\" 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。未执行：属性对话框目视（COM CustomDocumentProperties 在本机不可用，openpyxl 文件也返回 0）。",
+          "status": "已验收",
+          "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。",
           "files": [
             "crates/core/src/external.rs",
             "crates/core/src/xlsx.rs",
@@ -523,25 +524,23 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test custom_props  -> 8 passed / 0 failed / 2 ignored",
-            "excel probe: powershell scratch/c08_excel_roundtrip.ps1 -> Excel 16.0 打开/另存, 部件+关系在",
-            "wps probe: powershell scratch/c08_wps_roundtrip.ps1 -> WPS 12.0 同上",
-            "SC_C08_RT_FILE=<另存文件> cargo test --test custom_props -- --ignored excel_roundtrip -> 1 passed (Excel 与 WPS 各一次)",
-            "openpyxl 3.1.5 读取 c08.xlsx -> custom_doc_props 5 项 (4 第三方 + _sc_src_1)",
-            "cargo test -p sheetcore --offline --test save_failure_injection -> 11 passed / 0 failed / 1 ignored"
+            "cargo test -p sheetcore --offline --test custom_props -> 10 passed / 0 failed / 2 ignored",
+            "app SC_SAVE_ASYNC -> app_saved.xlsx，5 项属性保留",
+            "cscript Excel 16.0 读取 app_saved.xlsx -> 5 项；另存后仍 5 项",
+            "cscript WPS 12.0 读取 app_saved.xlsx -> 5 项；另存后 5 项 + WPS 自己的 3 项"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
           ],
           "not_done": [
-            "Excel/WPS 属性对话框目视检查未执行（本机 COM CustomDocumentProperties 恒为 0，含 openpyxl 生成的合法文件）",
-            "刷新经模型层 import_csv 覆盖，未点击 UI 刷新按钮取证"
+            "Excel/WPS 属性对话框自定义页列表的屏幕截图未取得（已用 cscript 读取属性对象）",
+            "刷新未点击 UI 按钮取证"
           ],
           "failures": [],
           "blocker": "",
           "next": "用户复核",
-          "updated_utc": "2026-11-12T21:10:00Z"
+          "updated_utc": "2026-11-13T09:20:00Z"
         }
       ]
     },

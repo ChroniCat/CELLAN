@@ -100,11 +100,12 @@ M3 暴露了首版测试只覆盖值转义、没覆盖名称属性转义；已�
 
 六、未执行 / 限制（不得当作已通过）
 --------------------------------
-1. **Excel/WPS「文件 → 信息 → 属性 → 高级属性」对话框的目视检查未执行**。
-   本机 COM 的 `Workbook.CustomDocumentProperties` 在此环境不可用：连 openpyxl 生成的
-   合法带属性文件也返回 Count=0（同一脚本、同一 Excel 16.0），因此不能用它判定属性可见性。
-   替代证据：Excel/WPS 打开后另存，部件与字节原样保留；openpyxl 能读出 5 项。
-   「无修复提示」同理只有间接证据：打开无异常、数据正常、部件未被重写。
+1. **Excel/WPS「文件 → 信息 → 属性 → 高级属性」对话框的自定义页列表未能自动截图**。
+   本机 PowerShell 5.1 动态 COM 的 `Workbook.CustomDocumentProperties` 会报
+   NullReferenceException（不是属性不存在）；改用同机 `cscript` late binding 后，
+   Excel 16.0 与 WPS 12.0 都能逐项读出属性（见第十三节）。因此不再用 PowerShell
+   的 Count=0 推断属性不可见；属性对象可见性已有直接实测，只是自定义页列表的
+   屏幕截图仍为空白（UIA/窗口消息切页只得到空白页）。
 2. 刷新走的是模型层 `import_csv` + 保存，未点击 UI 的「刷新」按钮取证（按钮路径属
    C09/C13 的回归范围，不在 C08 断言内）。
 3. `.xls`（BIFF）自定义属性（SummaryInformation 的客户自定义节）未纳入：本需求正文只针对
@@ -166,5 +167,36 @@ M3 暴露了首版测试只覆盖值转义、没覆盖名称属性转义；已�
 结果：`cargo test -p sheetcore --test custom_props` → **10 passed / 0 failed / 2 ignored**。
 变异 M4（把判断改回 `root_raw.contains(...)`）→ 该用例失败，已还原。
 
-仍未执行：Excel「属性」对话框目视核对、以及 Office 打开时“无修复提示”的直接证据
-（本机 COM `CustomDocumentProperties` 恒为 0 属环境限制），保留待验收。
+仍未执行：Excel「属性」对话框自定义页列表的屏幕截图；Office 打开时“无修复提示”的
+直接截图也未取得。属性对象可见性已由第十三节的 cscript 实测替代，不再用 PowerShell
+的 `CustomDocumentProperties=0` 推断不可见。
+
+十三、08:57 实机补证：cscript late binding 读取属性对象
+------------------------------------------------------
+本机 PowerShell 5.1 动态 COM 绑定对 `Workbook.CustomDocumentProperties` 会抛
+`System.NullReferenceException`；这是绑定层问题。同一台机器用 cscript late binding
+读取 `Workbook.CustomDocumentProperties` 正常。
+
+1. 直接用 app 的真实异步保存路径（不是模型注入）：
+   `target/debug/app.exe work/c08_verify/input.xlsx`，
+   `SC_SAVE_ASYNC=work/c08_verify/app_saved.xlsx`。
+   日志 `[save] 已保存 .../app_saved.xlsx`；另存后 `docProps/custom.xml` 仍含
+   Customer/Revision/Reviewed/Approved/_sc_src_1 五项。
+2. Excel 16.0 读取 `app_saved.xlsx`：`excel count=5`，
+   Customer=original-metadata(type4)、Revision=42(type1)、
+   Reviewed=2024-03-01 08:30(type3)、Approved=True(type2)、
+   `_sc_src_1=CSV|C:/data/ledger.csv|,|1|0|0|2|2|auto||q34`(type4)。
+3. Excel 打开 `app_saved.xlsx` → B2=99 → SaveAs `app_excel_rt.xlsx` → 重新读取：
+   仍 `excel count=5`，五项名称/类型/值不变。
+4. WPS 12.0 读取同一个 `app_saved.xlsx`：`wps count=5`，五项名称/类型/值不变。
+5. WPS 打开 → B2=99 → SaveAs `app_wps_rt.xlsx` → 重新读取：
+   `wps count=8`，前五项原样，另加 WPS 自有的 ICV/KSOProductBuildVer/CalculationRule
+   （这正是第三方属性应被保留、WPS 自己追加属性的正常行为）。
+6. `cargo test -p sheetcore --offline --test custom_props` 当前源码：
+   **10 passed / 0 failed / 2 ignored**。
+
+缓存注意：同一个文件路径在 Excel 已被打开过后，直接再次读取该路径可能拿到旧的
+属性缓存（本次 `c08.xlsx` 直读为 3 项，复制成新文件名或读取 app 新保存的文件为 5 项）；
+因此验收证据使用新保存的 `app_saved.xlsx` 与 Office 另存产物，不把旧路径缓存结果
+当作属性内容。属性对话框自定义页列表仍只有空白截图，不能声称已目视核对列表；
+但 Excel/WPS 自身属性对象的读取结果已逐项实测。
