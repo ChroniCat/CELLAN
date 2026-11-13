@@ -186,7 +186,7 @@ pub fn export_pdf(
                 let mut x = ml;
                 for c in span.cols.0..=span.cols.1 {
                     let w = sheet.cols.size(c) * px;
-                    draw_cell(sheet, &wb.styles, r, c, x, y - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale);
+                    draw_cell(sheet, &wb.styles, r, c, x, y - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale, wb.date_system);
                     x += w;
                 }
                 y -= h;
@@ -201,7 +201,7 @@ pub fn export_pdf(
                 let _ = yy;
                 for r in span.rows.0..=span.rows.1 {
                     let h = sheet.rows.size(r) * px;
-                    draw_cell(sheet, &wb.styles, r, c, x, yy - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale);
+                    draw_cell(sheet, &wb.styles, r, c, x, yy - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale, wb.date_system);
                     yy -= h;
                 }
                 x += w;
@@ -217,7 +217,7 @@ pub fn export_pdf(
             let mut x = body_x0;
             for c in span.cols.0..=span.cols.1 {
                 let w = sheet.cols.size(c) * px;
-                draw_cell(sheet, &wb.styles, r, c, x, cursor_y - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale);
+                draw_cell(sheet, &wb.styles, r, c, x, cursor_y - h, w, h, &mut rects, &mut lines, &mut head_lines, px, layout.scale, wb.date_system);
                 x += w;
             }
             cursor_y -= h;
@@ -292,6 +292,7 @@ fn draw_cell(
     texts: &mut Vec<(f32, f32, f32, String, [u8; 3])>,
     px: f32,
     scale: f32,
+    date_system: crate::model::DateSystem,
 ) {
     let style = styles.get(sheet.style_of(r, c));
     // 底色
@@ -316,9 +317,12 @@ fn draw_cell(
     }
     // 文字
     let Some(cell) = sheet.get(r, c) else { return };
+    // 打印/PDF 必须走和屏幕相同的数字格式；直接用 Value::display()
+    // 会把日期、百分比、货币打印成原始序列号/小数。
     let text = match &cell.value {
         Value::Empty => return,
-        v => v.display(),
+        v if style.format.trim().is_empty() => v.display(),
+        v => crate::style::format_value_in(date_system, v, &style.format),
     };
     if text.is_empty() {
         return;

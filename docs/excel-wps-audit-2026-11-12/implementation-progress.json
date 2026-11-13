@@ -3155,7 +3155,7 @@
       "failures": [],
       "blocker": "",
       "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
-      "updated_utc": "2026-11-13T20:35:00Z",
+      "updated_utc": "2026-11-13T12:26:00Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3171,7 +3171,9 @@
           "commits": [],
           "commands": [
             "cargo test -p sheetcore --offline --lib pivot::tests:: -- --test-threads=1 -> 5 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored"
+            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline -> 77 bins / 723 passed / 0 failed / 9 ignored (EXIT=0)",
+            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-count.txt"
@@ -3182,7 +3184,7 @@
           "failures": [],
           "blocker": "",
           "next": "监督复核 C12.1 的 Count/空值回归；随后再做 C12.2 多字段规格。",
-          "updated_utc": "2026-11-13T20:35:00Z"
+          "updated_utc": "2026-11-13T12:26:00Z"
         },
         {
           "id": "C12.2",
@@ -3331,17 +3333,19 @@
       "scope": "core/print.rs + app页面预览",
       "source": "core-requirements.md",
       "heading": "C16 P1 打印和PDF必须反映工作表真实显示",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "C16.1 待验收；C16.2/C16.3/C16.4 未开始。"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "继续 C16.2 颜色与样式，再补页眉页脚和逐页一致性。",
+      "updated_utc": "2026-11-13T12:26:00Z",
       "slices": [
         {
           "id": "C16.1",
@@ -3349,17 +3353,33 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/core/tests/pdf_export.rs",
+            "crates/core/tests/fixtures/c16/number_formats.xlsx",
+            "scripts/c16_number_format_fixture.py",
+            "crates/core/examples/c16_pdf.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test pdf_export -> 3 passed / 0 failed / 0 ignored",
+            "cargo run -p sheetcore --offline --example c16_pdf -- ... -> pages=1",
+            "cargo test -p sheetcore --offline -> 77 bins / 723 passed / 0 failed / 9 ignored (EXIT=0)",
+            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-number-format.txt"
+          ],
+          "not_done": [
+            "负数 [Red] 颜色未绘制（C16.2）；没有逐页 Excel/WPS 视觉矩阵；pypdfium2 读回文本已记录，pdftotext 对 ¥ 有阅读器差异。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "监督复核 C16.1；随后做 C16.2 样式/颜色。",
+          "updated_utc": "2026-11-13T12:26:00Z"
         },
         {
           "id": "C16.2",

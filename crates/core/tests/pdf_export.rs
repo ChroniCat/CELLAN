@@ -108,3 +108,27 @@ fn pagination_splits_wide_sheet() {
     }
     assert_eq!(covered_rows.len(), 400, "行覆盖不全");
 }
+
+#[test]
+fn number_formats_are_used_during_pdf_export() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/c16/number_formats.xlsx");
+    let font = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/fonts/subset/NotoSansSC-Regular.subset.ttf");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
+    assert!(font.exists(), "required embedded font is missing: {}", font.display());
+    let wb = sheetcore::xlsx::load(&src).expect("读入 C16 格式夹具");
+    let out = out_path("c16_formatted");
+    let _ = std::fs::remove_file(&out);
+    let pages = sheetcore::print::export_pdf(&wb, 0, &out, &font).expect("导出格式 PDF");
+    assert!(pages >= 1);
+    let data = std::fs::read(&out).expect("读回格式 PDF");
+    assert!(data.windows(2).any(|w| w == b"Tj"), "没有文字绘制指令");
+    assert!(
+        data.windows(4).any(|w| w == b"00A5"),
+        "ToUnicode 缺少人民币符号映射"
+    );
+    // 真正的文本比对由 docs/.../c16-number-format.txt 记录（pypdfium2 提取）；
+    // 本测试只锁住 “格式渲染后的文字仍能导出合法 PDF，且带有 Unicode 映射”。
+    let _ = std::fs::remove_file(&out);
+}

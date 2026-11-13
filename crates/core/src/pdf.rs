@@ -281,9 +281,10 @@ impl Doc {
             out.extend_from_slice(b"\nendobj\n");
         };
 
-        // 1 catalog, 2 pages, 3 Type0, 4 CIDFont, 5 descriptor, 6 fontfile
+        // 1 catalog, 2 pages, 3 Type0, 4 CIDFont, 5 descriptor, 6 fontfile,
+        // 7 ToUnicode；页面对象从 8 开始。
         let n_pages = self.pages.len().max(1);
-        let page_ids: Vec<usize> = (0..n_pages).map(|i| 7 + i * 2).collect();
+        let page_ids: Vec<usize> = (0..n_pages).map(|i| 8 + i * 2).collect();
         let kids: Vec<String> = page_ids.iter().map(|id| format!("{id} 0 R")).collect();
 
         obj(
@@ -304,7 +305,7 @@ impl Doc {
         obj(
             &mut out,
             &mut offsets,
-            b"<< /Type /Font /Subtype /Type0 /BaseFont /Embedded /Encoding /Identity-H /DescendantFonts [4 0 R] >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /Embedded /Encoding /Identity-H /DescendantFonts [4 0 R] /ToUnicode 7 0 R >>".to_vec(),
         );
         // W 数组：所有字形宽度
         let mut w = String::from("[ 0 [");
@@ -344,6 +345,37 @@ impl Doc {
             .into_bytes();
             body.extend_from_slice(&self.font.data);
             body.extend_from_slice(b"\nendstream");
+            obj(&mut out, &mut offsets, body);
+        }
+
+        // ToUnicode：让 pdftotext / 辅助技术能读回字形对应的 Unicode。
+        // 没有它，Identity-H 字形号只能被当成乱码。
+        let mut gid_to_char: Vec<(u16, char)> = self
+            .font
+            .cmap
+            .iter()
+            .map(|(ch, gid)| (*gid, *ch))
+            .filter(|(_, ch)| !ch.is_control())
+            .collect();
+        gid_to_char.sort_unstable_by_key(|(gid, _)| *gid);
+        let mut cmap = String::from(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+        );
+        for chunk in gid_to_char.chunks(100) {
+            cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+            for (gid, ch) in chunk {
+                let mut buf = [0u16; 2];
+                let encoded = ch.encode_utf16(&mut buf);
+                let hex: String = encoded.iter().map(|u| format!("{u:04X}")).collect();
+                cmap.push_str(&format!("<{gid:04X}> <{hex}>\n"));
+            }
+            cmap.push_str("endbfchar\n");
+        }
+        cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+        {
+            let mut body = format!("<< /Length {} >>\nstream\n", cmap.len()).into_bytes();
+            body.extend_from_slice(cmap.as_bytes());
+            body.extend_from_slice(b"endstream");
             obj(&mut out, &mut offsets, body);
         }
 

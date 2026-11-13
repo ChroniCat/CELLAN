@@ -1,6 +1,6 @@
 # C12.1 透视计数空值修复
 
-日期：2026-11-13 20:35 CST
+日期：2026-11-13 20:25 CST
 范围：`crates/core/src/pivot.rs` 的 `compute` / `agg_value`。
 
 ## 复现的根因
@@ -43,3 +43,13 @@ cargo test -p sheetcore --offline --test pivot_file
 
 只完成 C12.1 的计数/空值语义。两层行字段、多值字段、筛选器、字段面板、
 Excel/WPS 可编辑往返仍未实现；C12 父项不能因此验收。
+
+
+## 全量回归
+
+```text
+cargo test -p sheetcore --offline
+-> 77 test binaries / 723 passed / 0 failed / 9 ignored (EXIT=0)
+```
+
+日志：`/tmp/c12_c16_core.log`。C12.1 的新增测试包含在这 723 个通过项中。
