@@ -5801,7 +5801,8 @@
           "files": [
             "crates/app/src/main.rs",
             "crates/core/src/formula/mod.rs",
-            "crates/core/tests/ui28_names.rs"
+            "crates/core/tests/ui28_names.rs",
+            "crates/core/src/patch.rs"
           ],
           "commits": [],
           "commands": [],
@@ -5809,13 +5810,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt"
           ],
           "not_done": [
-            "作用域复选框/名称框下拉/Enter 跳转未做真实鼠标键盘点选",
-            "保存后的名称未做 Excel/WPS COM 回读"
+            "作用域复选框/名称框下拉/Enter 跳转未做真实鼠标键盘点选"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:07:30Z"
+          "updated_utc": "2026-11-13T21:13:07Z"
         }
       ]
     },

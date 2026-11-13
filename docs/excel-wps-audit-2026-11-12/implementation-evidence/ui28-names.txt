@@ -30,5 +30,25 @@ names_survive_save_and_load ... ok
 
 - 「仅当前工作表」复选框、名称框下拉与 Enter 跳转只做了代码/模型验证，
   未用真实鼠标键盘点选（本机 RDP 输入注入不可用）；
-- 保存后的名称还未做 Excel/WPS COM 回读（只做了本实现 load/save 往返）；
+- 保存后的名称已做 Excel/WPS COM 回读（见下）；
 - 名称管理器未做删除引用确认（Excel 也不确认，删除后公式为 #NAME?）。
+
+
+## 2026-11-14 Excel/WPS 回读修正
+
+首次回读发现两个真实问题：
+
+1. `definedName` 正文带前导 `=`（`=0.13`）：Excel 直接报
+   「不能取得类 Workbooks 的 Open 属性」，WPS 虽打开但名称显示异常。
+   已在 `patch::write_user_names` 写盘时去掉前导 `=`（模型内仍可保存 `=...` 写法）；
+2. 同名局部/工作簿名称在 XML 中分别写 `localSheetId="0"` 与无该属性，Excel 接受。
+
+修正后同一文件 `C:/Windows/TEMP/sc_ui28_out.xlsx`：
+
+```text
+Excel COUNT=3 税率[]==0.13;'S1'!值[]=='S1'!$A$1;值[]=='S2'!$A$1
+WPS   COUNT=3 值[]=='S2'!$A$1;'S1'!值[]=='S1'!$A$1;税率[]==0.13
+```
+
+两款 Office 均无修复提示，工作簿名称「税率」与 S1 局部「值」都被识别。
+回归新增断言：workbook.xml 必须是 `<definedName name="税率">0.13</definedName>`（不带 `=`）。

@@ -36,6 +36,13 @@ fn names_survive_save_and_load() {
     let p = std::env::temp_dir().join("sc_ui28_names.xlsx");
     let _ = std::fs::remove_file(&p);
     sheetcore::xlsx::save(&p, &wb).unwrap();
+    {
+        use std::io::Read;
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&p).unwrap()).unwrap();
+        let mut x = String::new();
+        z.by_name("xl/workbook.xml").unwrap().read_to_string(&mut x).unwrap();
+        assert!(x.contains("<definedName name=\"税率\">0.13</definedName>"), "definedName 正文不能带 =：{x}");
+    }
     let got = sheetcore::xlsx::load(&p).unwrap();
     assert!(got.names.iter().any(|(n, sh, _)| n == "税率" && sh.is_none()));
     assert_eq!(text(&got, 0, 0, 1), "13");

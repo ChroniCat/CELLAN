@@ -1723,16 +1723,18 @@ pub fn write_user_names(path: &Path, names: &[(String, Option<usize>, String)]) 
         }
         let mut defs = String::new();
         for (name, local, text) in names {
+            // OOXML 的 definedName 正文不带前导 '='；带了 Excel 会拒绝打开
+            let body = text.trim_start_matches('=');
             match local {
                 Some(i) => defs.push_str(&format!(
                     "<definedName name=\"{}\" localSheetId=\"{i}\">{}</definedName>",
                     esc(name),
-                    esc(text)
+                    esc(body)
                 )),
                 None => defs.push_str(&format!(
                     "<definedName name=\"{}\">{}</definedName>",
                     esc(name),
-                    esc(text)
+                    esc(body)
                 )),
             }
         }
