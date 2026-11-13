@@ -1,0 +1,11 @@
+A1=1900-02-29|text=1900-02-29|fmt=General
+A2=29|text=29|fmt=General
+A3=2|text=2|fmt=General
+A4=1900|text=1900|fmt=General
+A5=1900-02-28|text=1900-02-28|fmt=General
+A6=1900-03-01|text=1900-03-01|fmt=General
+A7=60|text=#######|fmt=d/m/yyyy
+A8=46339|text=#######|fmt=d/m/yyyy
+A9=46339.3937146991|text=#######|fmt=d/m/yyyy h:mm
+ExcelVersion=16.0
+LocalNow=2026-11-13 09:26:57 +08:00

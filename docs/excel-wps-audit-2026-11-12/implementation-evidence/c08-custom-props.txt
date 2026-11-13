@@ -167,9 +167,9 @@ M3 暴露了首版测试只覆盖值转义、没覆盖名称属性转义；已�
 结果：`cargo test -p sheetcore --test custom_props` → **10 passed / 0 failed / 2 ignored**。
 变异 M4（把判断改回 `root_raw.contains(...)`）→ 该用例失败，已还原。
 
-仍未执行：Excel「属性」对话框自定义页列表的屏幕截图；Office 打开时“无修复提示”的
-直接截图也未取得。属性对象可见性已由第十三节的 cscript 实测替代，不再用 PowerShell
-的 `CustomDocumentProperties=0` 推断不可见。
+仍未执行：Excel「属性」对话框自定义页列表的屏幕截图（该截图不是 C08 原文验收项，
+09:26 独立复核明确不要求补空白属性页截图，也不作为门禁）；属性对象可见性已由第十
+三节的 cscript 实测替代，不再用 PowerShell 的 `CustomDocumentProperties=0` 推断不可见。
 
 十三、08:57 实机补证：cscript late binding 读取属性对象
 ------------------------------------------------------
@@ -200,3 +200,27 @@ M3 暴露了首版测试只覆盖值转义、没覆盖名称属性转义；已�
 因此验收证据使用新保存的 `app_saved.xlsx` 与 Office 另存产物，不把旧路径缓存结果
 当作属性内容。属性对话框自定义页列表仍只有空白截图，不能声称已目视核对列表；
 但 Excel/WPS 自身属性对象的读取结果已逐项实测。
+
+十四、09:34 补齐“无修复提示”：开启警告的普通 Open
+--------------------------------------------------
+按 09:26 独立复核，旧证据里的 `DisplayAlerts=False` 不能证明正常打开无修复提示。
+本轮改用**未改字节的 app_saved.xlsx 副本**（SHA-256
+c42e791537a2e89dfcf975ecc3bda87297e8db6a3918a3d6a10fe4bde3a7eb48），
+Excel 16.0 / WPS 12.0 均：
+
+- `DisplayAlerts=True`、`Visible=True`；
+- 普通 `Workbooks.Open(path)`，没有传 `CorruptLoad`，没有关警告；
+- Excel 返回 `OPEN_OK elapsed_ms=177`，WPS 返回 `OPEN_OK elapsed_ms=666`；
+- `Windows` 集合只有打开的文件窗口本身，没有修复/恢复对话框；
+- `Close($false)` 成功；副本打开前后 SHA-256 仍为
+  `c42e791537a2e89dfcf975ecc3bda87297e8db6a3918a3d6a10fe4bde3a7eb48`。
+
+日志：implementation-evidence/c08-custom-props/c08_open_alerts_excel.txt、
+c08_open_alerts_wps.txt。原始 app_saved.xlsx 未被修改。属性页列表截图仍空白，
+但 09:26 复核已明确该项不是原文门槛，不再作为待验收项。
+
+日期显示口径：`docProps/custom.xml` 里 `Reviewed` 存的是 UTC
+`2024-03-01T08:30:00Z`；Excel/WPS COM 在本机 +08:00 读成
+`2024-03-01 16:30`，只是同一时刻的本地显示，不是值被改写。app_saved.xlsx、
+app_excel_rt.xlsx、app_wps_rt.xlsx 三份 XML 的 Reviewed 文本都是
+`2024-03-01T08:30:00Z`。

@@ -98,7 +98,50 @@ use std::cell::Cell;
 
 thread_local! {
     static DATE_SYSTEM: Cell<DateSystem> = const { Cell::new(DateSystem::D1900) };
+    /// 验收注入：UTC Unix 秒 + 本地偏移秒；None 时读系统时钟/系统时区。
+    static CLOCK_OVERRIDE: Cell<Option<(i64, i32)>> = const { Cell::new(None) };
+    /// 一次 Calc 求值内固定的本地序列号，保证 NOW/TODAY 同轮取同一个时刻。
+    static NOW_SNAPSHOT: Cell<Option<f64>> = const { Cell::new(None) };
 }
+
+/// 在这段求值里使用指定的 UTC 时间和本地 UTC 偏移（秒）。
+/// 测试用它模拟 Asia/Shanghai 的 00:30、时区变化和午夜，不等待真实时间。
+pub fn with_clock_at<T>(unix_secs: i64, offset_seconds: i32, f: impl FnOnce() -> T) -> T {
+    let prev = CLOCK_OVERRIDE.with(|c| c.replace(Some((unix_secs, offset_seconds))));
+    let out = f();
+    CLOCK_OVERRIDE.with(|c| c.set(prev));
+    out
+}
+
+pub fn now_snapshot() -> Option<f64> {
+    NOW_SNAPSHOT.with(|c| c.get())
+}
+
+pub fn set_now_snapshot(v: Option<f64>) {
+    NOW_SNAPSHOT.with(|c| c.set(v));
+}
+
+/// 顶层重算开始前固定一次 NOW；返回进入前的值，结束时用 set_now_snapshot 还原。
+pub(crate) fn ensure_now_snapshot() -> Option<f64> {
+    if now_snapshot().is_some() {
+        return now_snapshot();
+    }
+    let prev = None;
+    set_now_snapshot(Some(now_serial_uncached()));
+    prev
+}
+
+fn clock_now() -> (i64, i32) {
+    if let Some(v) = CLOCK_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (secs, local_offset_seconds() as i32)
+}
+
 
 /// 由 `Calc::new` 设置、`Calc::drop` 恢复
 pub fn set_current_date_system(sys: DateSystem) {
@@ -121,6 +164,10 @@ pub fn date_to_serial_in(sys: DateSystem, y: i32, m: u32, d: u32) -> Option<f64>
     if !(1..=12).contains(&m) || d == 0 || d > 31 {
         return None;
     }
+    // Excel 的 1900 体系有虚构的 1900-02-29（序列 60），公历校验会拒绝它。
+    if !sys.is_1904() && y == 1900 && m == 2 && d == 29 {
+        return Some(60.0);
+    }
     if d > days_in_month(y, m) {
         return None;
     }
@@ -142,7 +189,11 @@ pub fn serial_to_date_in(sys: DateSystem, serial: f64) -> Option<(i32, u32, u32)
     if sys.is_1904() {
         return Some(civil_from_days(days_from_civil(1904, 1, 1) + d as i64));
     }
-    let days = if d < 61.0 { d - 25_568.0 } else { d - 25_569.0 };
+    // 1900 体系：序列 60 是 Excel 虚构的 1900-02-29；不能落到公历 03-01。
+    if d == 60.0 {
+        return Some((1900, 2, 29));
+    }
+    let days = if d < 60.0 { d - 25_568.0 } else { d - 25_569.0 };
     Some(civil_from_days(days as i64))
 }
 
@@ -202,19 +253,22 @@ fn local_offset_seconds() -> i64 {
     0
 }
 
-fn now_serial() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-        + local_offset_seconds() as f64;
-    let serial_1900 = secs / 86_400.0 + 25_569.0;
+fn now_serial_uncached() -> f64 {
+    let (secs, offset) = clock_now();
+    let local_secs = secs as f64 + offset as f64;
+    let serial_1900 = local_secs / 86_400.0 + 25_569.0;
     if current_date_system().is_1904() {
         serial_1900 - DateSystem::OFFSET
     } else {
         serial_1900
     }
+}
+
+pub(crate) fn now_serial() -> f64 {
+    if let Some(v) = now_snapshot() {
+        return v;
+    }
+    now_serial_uncached()
 }
 
 // ---------------------------------------------------------------- 条件匹配
@@ -1997,6 +2051,95 @@ const IMPLEMENTED: &[&str] = &[
     "ABS","ACOS","ACOSH","ACOT","AND","ARABIC","ARRAYTOTEXT","ASIN","ASINH","ATAN","ATAN2","ATANH","AVEDEV","AVERAGE","AVERAGEA","AVERAGEIF","BASE","BETA.DIST","BETA.INV","BETADIST","BETAINV","BIN2DEC","BIN2HEX","BIN2OCT","BINOM.DIST","BINOM.INV","BINOMDIST","BITAND","BITLSHIFT","BITOR","BITRSHIFT","BITXOR","CEILING","CEILING.MATH","CEILING.PRECISE","CHAR","CHIDIST","CHIINV","CHISQ.DIST","CHISQ.DIST.RT","CHISQ.INV","CHISQ.INV.RT","CHOOSE","CHOOSECOLS","CHOOSEROWS","CODE","COLUMN","COLUMNS","COMBIN","COMBINA","COMPLEX","CONCAT","CONCATENATE","CONFIDENCE","CONFIDENCE.NORM","CONFIDENCE.T","CORREL","COS","COSH","COT","COTH","COUNT","COUNTA","COUNTBLANK","COUNTIF","COUNTIFS","CRITBINOM","CSC","CSCH","CUMIPMT","CUMPRINC","DATE","DATEDIF","DAVERAGE","DAY","DAYS","DB","DCOUNT","DCOUNTA","DDB","DEC2BIN","DEC2HEX","DEC2OCT","DECIMAL","DEGREES","DELTA","DEVSQ","DGET","DMAX","DMIN","DOLLARDE","DOLLARFR","DPRODUCT","DROP","DSTDEV","DSTDEVP","DSUM","DVAR","DVARP","EDATE","EFFECT","EOMONTH","ERF","ERF.PRECISE","ERFC","ERFC.PRECISE","ERROR.TYPE","EVEN","EXACT","EXP","EXPAND","EXPON.DIST","EXPONDIST","F.DIST","F.DIST.RT","F.INV","F.INV.RT","FACT","FACTDOUBLE","FALSE","FDIST","FILTER","FIND","FINV","FISHER","FISHERINV","FLOOR","FLOOR.MATH","FLOOR.PRECISE","FV","FVSCHEDULE","GAMMA.DIST","GAMMA.INV","GAMMADIST","GAMMAINV","GAMMALN","GAMMALN.PRECISE","GCD","GEOMEAN","GESTEP","HARMEAN","HEX2BIN","HEX2DEC","HEX2OCT","HLOOKUP","HOUR","HSTACK","HYPGEOM.DIST","HYPGEOMDIST","IF","IFERROR","IFNA","IFS","IMABS","IMADD","IMAGINARY","IMARGUMENT","IMCONJUGATE","IMCOS","IMDIV","IMEXP","IMLN","IMLOG10","IMLOG2","IMMUL","IMPOWER","IMPRODUCT","IMREAL","IMSIN","IMSQRT","IMSUB","IMSUM","IMTAN","INDEX","INT","INTERCEPT","IPMT","IRR","ISBLANK","ISERR","ISERROR","ISEVEN","ISLOGICAL","ISNA","ISNONTEXT","ISNUMBER","ISO.CEILING","ISODD","ISREF","ISTEXT","KURT","LARGE","LCM","LEFT","LEN","LET","LN","LOG","LOG10","LOGINV","LOGNORM.DIST","LOGNORM.INV","LOGNORMDIST","LOOKUP","LOWER","MATCH","MAX","MAXA","MAXIFS","MEDIAN","MID","MIN","MINA","MINIFS","MINUTE","MIRR","MMULT","MOD","MODE","MONTH","MROUND","MULTINOMIAL","N","NA","NEGBINOM.DIST","NEGBINOMDIST","NETWORKDAYS","NOMINAL","NORM.DIST","NORM.INV","NORM.S.DIST","NORM.S.INV","NORMDIST","NORMINV","NORMSDIST","NORMSINV","NOT","NOW","NPER","NPV","OCT2BIN","OCT2DEC","OCT2HEX","ODD","OR","PDURATION","PERCENTILE","PERCENTILE.INC","PERMUT","PI","PMT","POISSON","POISSON.DIST","POWER","PPMT","PRODUCT","PROPER","PV","QUARTILE","QUARTILE.INC","QUOTIENT","RADIANS","RAND","RANDARRAY","RANDBETWEEN","RANK","RANK.EQ","RATE","REPLACE","REPT","RIGHT","ROMAN","ROUND","ROUNDDOWN","ROUNDUP","ROW","ROWS","RRI","SEARCH","SEC","SECH","SECOND","SEQUENCE","SERIESSUM","SIGN","SIN","SINH","SKEW","SKEW.P","SLN","SLOPE","SMALL","SORT","SORTBY","SQRT","SQRTPI","STANDARDIZE","STDEV","STDEV.P","STDEV.S","STDEVP","SUBSTITUTE","SUBTOTAL","SUM","SUMIF","SUMIFS","SUMPRODUCT","SUMSQ","SUMX2MY2","SUMX2PY2","SUMXMY2","SWITCH","SYD","T","T.DIST","T.DIST.2T","T.DIST.RT","T.INV","T.INV.2T","TAKE","TAN","TANH","TEXT","TEXTAFTER","TEXTBEFORE","TEXTJOIN","TIME","TINV","TOCOL","TODAY","TOROW","TRANSPOSE","TRIM","TRIMMEAN","TRUE","TRUNC","TYPE","UNICHAR","UNICODE","UNIQUE","UPPER","VALUE","VALUETOTEXT","VAR","VAR.P","VAR.S","VARP","VLOOKUP","VSTACK","WEEKDAY","WEEKNUM","WEIBULL","WEIBULL.DIST","WORKDAY","XIRR","XLOOKUP","XMATCH","XNPV","XOR","YEAR","YEARFRAC","Z.TEST","ZTEST","T.TEST","F.TEST","CHISQ.TEST","RSQ","FORECAST","FORECAST.LINEAR","STEYX","TREND","GROWTH","LINEST","PERCENTRANK","PERCENTRANK.INC","PERCENTILE.EXC","QUARTILE.EXC","RANK.AVG","CONVERT","VDB","DURATION","MDURATION","TBILLPRICE","TBILLYIELD","TBILLEQ","AMORLINC","AMORDEGRC","AVERAGEIFS","MODE.SNGL","MODE.MULT","AGGREGATE","FREQUENCY","PROB","STDEVA","VARA","COVARIANCE.P","COVARIANCE.S","COVARIANCE","PEARSON","HYPERLINK","ENCODEURL","TEXTSPLIT","WRAPROWS","WRAPCOLS","ISFORMULA","FORMULATEXT","SHEET","SHEETS","ADDRESS","INDIRECT","OFFSET","LAMBDA","MAP","REDUCE","SCAN","BYROW","BYCOL","MAKEARRAY","ISOMITTED",
     "ACOTH","GAMMA","GAUSS","PHI","PERMUTATIONA","BINOM.DIST.RANGE","COVAR","PERCENTOF","PERCENTRANK.EXC","LOGEST","MDETERM","MINVERSE","CLEAN","ASC","DOLLAR","FIXED","NUMBERVALUE","DAYS360","DATEVALUE","TIMEVALUE","ISOWEEKNUM","CELL","AREAS","INFO","COUPPCD","COUPNCD","COUPNUM","COUPDAYS","COUPDAYBS","COUPDAYSNC","PRICE","YIELD","DISC","INTRATE","RECEIVED","PRICEDISC","YIELDDISC","PRICEMAT","YIELDMAT","REGEXTEST","REGEXEXTRACT","REGEXREPLACE","NETWORKDAYS.INTL","WORKDAY.INTL","ODDFPRICE","ODDFYIELD","ODDLPRICE","ODDLYIELD","BESSELI","BESSELJ","BESSELK","BESSELY","FORECAST.ETS","FORECAST.ETS.CONFINT","FORECAST.ETS.SEASONALITY","FORECAST.ETS.STAT",
 ];
+
+#[cfg(test)]
+mod clock_and_serial60_tests {
+    use super::*;
+    use crate::formula::eval_formula;
+    use crate::model::{DateSystem, Workbook};
+
+    fn number(v: crate::formula::FValue) -> f64 {
+        match v {
+            crate::formula::FValue::Number(n) => n,
+            other => panic!("expected number, got {other:?}"),
+        }
+    }
+
+    fn text(v: crate::formula::FValue) -> String {
+        match v {
+            crate::formula::FValue::Text(s) => s,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serial_59_60_61_and_fictional_feb29_are_distinct() {
+        assert_eq!(serial_to_date_in(DateSystem::D1900, 59.0), Some((1900, 2, 28)));
+        assert_eq!(serial_to_date_in(DateSystem::D1900, 60.0), Some((1900, 2, 29)));
+        assert_eq!(serial_to_date_in(DateSystem::D1900, 61.0), Some((1900, 3, 1)));
+        assert_eq!(date_to_serial_in(DateSystem::D1900, 1900, 2, 29), Some(60.0));
+        assert_eq!(date_to_serial_in(DateSystem::D1900, 1900, 3, 1), Some(61.0));
+        // 1904 体系没有这个虚构日，不能凭空接受 1900-02-29。
+        assert_eq!(date_to_serial_in(DateSystem::D1904, 1900, 2, 29), None);
+    }
+
+    #[test]
+    fn day_month_year_and_text_agree_on_serial_60() {
+        let wb = Workbook::new_blank();
+        assert_eq!(number(eval_formula(&wb, 0, "=DAY(60)")), 29.0);
+        assert_eq!(number(eval_formula(&wb, 0, "=MONTH(60)")), 2.0);
+        assert_eq!(number(eval_formula(&wb, 0, "=YEAR(60)")), 1900.0);
+        assert_eq!(text(eval_formula(&wb, 0, "=TEXT(60,\"yyyy-mm-dd\")")), "1900-02-29");
+        assert_eq!(text(eval_formula(&wb, 0, "=TEXT(59,\"yyyy-mm-dd\")")), "1900-02-28");
+        assert_eq!(text(eval_formula(&wb, 0, "=TEXT(61,\"yyyy-mm-dd\")")), "1900-03-01");
+        assert_eq!(number(eval_formula(&wb, 0, "=DATE(1900,2,29)")), 60.0);
+        assert_eq!(
+            crate::style::format_value_in(
+                DateSystem::D1900,
+                &crate::model::Value::Number(60.0),
+                "yyyy-mm-dd"
+            ),
+            "1900-02-29"
+        );
+    }
+
+    #[test]
+    fn injected_clock_uses_local_midnight_not_utc_and_is_stable() {
+        let wb = Workbook::new_blank();
+        // 2024-03-01 00:30 Asia/Shanghai == 2024-02-29 16:30 UTC
+        let utc = days_from_civil(2024, 2, 29) * 86_400 + 16 * 3600 + 30 * 60;
+        let mar1 = date_to_serial_in(DateSystem::D1900, 2024, 3, 1).unwrap();
+        with_clock_at(utc, 8 * 3600, || {
+            assert_eq!(number(eval_formula(&wb, 0, "=TODAY()")), mar1);
+            let now = number(eval_formula(&wb, 0, "=NOW()"));
+            assert_eq!(now.floor(), mar1);
+            assert!((now - mar1 - (30.0 / (24.0 * 60.0))).abs() < 1e-9);
+            // 同一次求值里的两个 NOW 必须来自同一快照。
+            assert_eq!(number(eval_formula(&wb, 0, "=NOW()-NOW()")), 0.0);
+        });
+    }
+
+    #[test]
+    fn timezone_and_midnight_changes_do_not_leak_previous_snapshot() {
+        let wb = Workbook::new_blank();
+        let feb29 = date_to_serial_in(DateSystem::D1900, 2024, 2, 29).unwrap();
+        let mar1 = date_to_serial_in(DateSystem::D1900, 2024, 3, 1).unwrap();
+        // 本地 2024-02-29 23:59（UTC 15:59 +08:00）
+        let utc_before = days_from_civil(2024, 2, 29) * 86_400 + 15 * 3600 + 59 * 60;
+        with_clock_at(utc_before, 8 * 3600, || {
+            assert_eq!(number(eval_formula(&wb, 0, "=TODAY()")), feb29);
+        });
+        // 本地 2024-03-01 00:00（UTC 16:00 +08:00）
+        let utc_after = days_from_civil(2024, 2, 29) * 86_400 + 16 * 3600;
+        with_clock_at(utc_after, 8 * 3600, || {
+            assert_eq!(number(eval_formula(&wb, 0, "=TODAY()")), mar1);
+        });
+        // UTC 仍为 02-29 16:00 时，改注入 -5 小时时区应回到 02-29 11:00。
+        with_clock_at(utc_after, -5 * 3600, || {
+            assert_eq!(number(eval_formula(&wb, 0, "=TODAY()")), feb29);
+        });
+    }
+}
 
 #[cfg(test)]
 mod round_precision {

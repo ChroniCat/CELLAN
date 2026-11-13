@@ -1,10 +1,11 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `842670e`（UI-21 证据精度修正；C08 验收证据待随下一提交入库）。
-- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 7 待验收 / 43 待实施；
-  切片 28 已验收 / 16 待验收 / 104 待实施。
-- 当前测试真值（08:41–08:45，work/hermes-ui21-final-20261113-084145）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
-  app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / GUI_EXIT=0。
+- 分支 `main`（`origin/main`），HEAD `5699136`（C08 Office 往返夹具；C06 代码与证据待提交）。
+- 台账（`scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 42 待实施；
+  切片 30 已验收 / 16 待验收 / 102 待实施。
+- 当前测试真值（C06 修改后，09:39 重跑）：core 68 bins / 616 passed / 0 failed / 41 ignored，
+  CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
+  GUI_EXIT=0。app/GUI 与 C06 修改后的 core 同树运行。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
 
@@ -30,6 +31,18 @@
 - 未执行边界：“计算工作表”GUI 点选未单独取证（命令级 app 测试覆盖）；大表数组/循环引用
   对拍未执行；.xls 动态数组不在当前 BIFF 模型。UI-21 父项与 UI-21.1 均已验收。
 
+## 本轮：C06 本地时间与序列 60 兼容（已验收）
+
+- `date_to_serial_in`/`serial_to_date_in` 显式表示 1900-02-29 兼容日：59/60/61 →
+  02-28/02-29/03-01，DATE(1900,2,29)=60；1904 体系不伪造该日。
+- `with_clock_at(unix_secs, offset_seconds, f)` 注入时钟；NOW/TODAY 用本地偏移；
+  `Calc` 生命周期和 `recalc_all_force`/`recalc_sheet` 多遍重算共享 NOW 快照。
+- 测试 4 项：序列 59/60/61 与 TEXT/DAY/MONTH/YEAR/单元格格式；注入
+  Asia/Shanghai 00:30（UTC 前一天 16:30）；时区变化和午夜；同轮 NOW-NOW=0。
+- C06 后全量 core：68 bins / 616 passed / 0 failed / 41 ignored / CORE_EXIT=0。
+- 本机 Excel 16.0/WPS 12.0 空白工作簿对拍：TEXT(60)=1900-02-29、DAY(60)=29，
+  NOW/TODAY 用本机 +08:00；证据 implementation-evidence/c06-local-clock.txt。
+
 ## 本轮：C08 无损更新自定义文档属性（已验收）
 
 - 实现已在 `external.rs`/`xlsx.rs`：按命名空间保留第三方属性、只重写 `_sc_src_*`；
@@ -38,9 +51,16 @@
   Excel 16.0 cscript 读取 5 项；Excel 另存后仍 5 项；WPS 12.0 读取 5 项，另存后
   5 项原样并追加 WPS 自有 3 项。PowerShell 5.1 动态 COM 的 NullReferenceException
   不是属性不可见，cscript late binding 正常。
-- 边界：Excel 属性对话框自定义页列表截图仍为空白（未作为通过证据）；Office 打开时
-  “无修复提示”未取得截图；刷新仍是模型层 `import_csv`，未点 UI 刷新按钮。
-- 证据：implementation-evidence/c08-custom-props.txt、c08-custom-props/。
+- 最终边界：09:26 独立复核指出旧 `DisplayAlerts=False` 不能证明“无修复提示”；
+  09:34 用 app_saved.xlsx 原字节副本（SHA-256 c42e79…eb48）在 Excel/WPS
+  `DisplayAlerts=True、Visible=True` 的普通 `Workbooks.Open` 打开，均
+  177ms/666ms 返回，只有文件窗口，无修复/恢复对话框，打开前后哈希不变。
+  属性页列表截图仍空白，但复核已明确不是原文门槛；刷新只验证模型层 import_csv，
+  复核明确不要求补 UI 刷新。
+- 日期口径：XML 的 `Reviewed=2024-03-01T08:30:00Z`（UTC）在本机 COM 显示为
+  `2024-03-01 16:30`（+08:00），只是同一时刻的显示差异；三份文件 XML 文本未变。
+- 证据：implementation-evidence/c08-custom-props.txt、c08-custom-props/
+  （含 c08_open_alerts_excel.txt / c08_open_alerts_wps.txt）。
 
 ## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
 

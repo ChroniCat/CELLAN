@@ -719,8 +719,11 @@ pub struct Calc<'a> {
     cur_sheet: usize,
     /// 同一次重算的溢出稳定化阶段重放随机/时间采样，不反复生成新值。
     volatile_values: HashMap<(deps::CellKey, usize, String), FValue>,
-    volatile_counts: HashMap<deps::CellKey, usize>,    /// 进入时外层的日期体系，Drop 时恢复
+    volatile_counts: HashMap<deps::CellKey, usize>,
+    /// 进入时外层的日期体系，Drop 时恢复
     prev_system: crate::model::DateSystem,
+    /// 进入时外层的 NOW 快照，Drop 时恢复
+    prev_now: Option<f64>,
     /// 区域内容缓存：同一轮重算里同一块区域只物化一次
     range_cache: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<Vec<FValue>>>,
     /// 每张表的实际使用范围（最大行、最大列）
@@ -821,6 +824,7 @@ impl Arg {
 impl Drop for Calc<'_> {
     fn drop(&mut self) {
         functions::set_current_date_system(self.prev_system);
+        functions::set_now_snapshot(self.prev_now);
     }
 }
 
@@ -828,11 +832,16 @@ impl<'a> Calc<'a> {
     pub fn new(wb: &'a Workbook) -> Self {
         let prev_system = functions::current_date_system();
         functions::set_current_date_system(wb.date_system);
+        let prev_now = functions::now_snapshot();
+        if prev_now.is_none() {
+            let now = functions::now_serial();
+            functions::set_now_snapshot(Some(now));
+        }
         Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), scope: None,
             agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
             cache_order: std::collections::VecDeque::new(), agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
-            prev_system: functions::current_date_system() }
+            prev_system, prev_now }
     }
 
     fn sheet_index(&self, name: Option<&str>, cur: usize) -> Result<usize, ErrKind> {
@@ -2518,6 +2527,7 @@ pub fn recalc_all(wb: &mut Workbook) {
 
 /// 强制执行全量计算（F9 / 计算全部 / 切回自动模式）。
 pub fn recalc_all_force(wb: &mut Workbook) {
+    let prev_now = functions::ensure_now_snapshot();
     wb.calc_pending = false;
     wb.calc_pending_sheets.clear();
     let phase = std::env::var("SC_PHASE").is_ok();
@@ -2668,6 +2678,7 @@ pub fn recalc_all_force(wb: &mut Workbook) {
     if phase {
         eprintln!("[recalc] 总耗时 {:.2}s（{} 遍）", t_all.elapsed().as_secs_f64(), pass_done);
     }
+    functions::set_now_snapshot(prev_now);
 }
 
 /// 求单个单元格的值（测试与 UI 用）
@@ -2709,6 +2720,7 @@ pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
     if sheet >= wb.sheets.len() {
         return 0;
     }
+    let prev_now = functions::ensure_now_snapshot();
     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
         .iter()
         .filter(|(_, c)| c.formula.is_some())
@@ -2757,6 +2769,7 @@ pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
     }
     wb.calc_pending_sheets.remove(&sheet);
     wb.calc_pending = !wb.calc_pending_sheets.is_empty();
+    functions::set_now_snapshot(prev_now);
     count
 }
 

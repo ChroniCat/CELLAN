@@ -34,5 +34,14 @@ WPS 打开 app_saved.xlsx → B2=99 → SaveAs app_wps_rt.xlsx → 重新读取�
   直读为 3 项；复制为新文件名或读取 app 新保存文件为 5 项），所以验收使用新保存
   的 app_saved.xlsx 与 Office 另存产物，不拿旧路径缓存结果判定属性内容。
 - Excel“属性”对话框自定义页列表的屏幕截图仍为空白（UIA/窗口消息只切到空白页）；
-  未把这幅截图当作通过证据。自定义页的属性值由上面 Excel/WPS 自身对象模型读取；
-  “打开无修复提示”没有取得截图，但 Open 成功且未进入修复流程。
+  未把这幅截图当作通过证据。自定义页的属性值由上面 Excel/WPS 自身对象模型读取。
+- “打开无修复提示”的直接证据已补齐（09:34）：使用 app_saved.xlsx 的原字节副本
+  （SHA-256 c42e791537a2e89dfcf975ecc3bda87297e8db6a3918a3d6a10fe4bde3a7eb48），
+  Excel 16.0/WPS 12.0 在 DisplayAlerts=True、Visible=True 的普通 `Workbooks.Open`
+  路径下（没有设置 CorruptLoad，也没有关闭警告）分别 177ms/666ms 返回；工作簿
+  窗口只有 c08_open_excel.xlsx / c08_open_wps.xlsx 本身，没有修复/恢复对话框，
+  关闭成功，副本打开前后 SHA-256 相同。原始 app_saved.xlsx 未被修改。
+- 日期属性的 COM 显示与 XML 存储只是同一时刻的不同表示：docProps/custom.xml
+  存 `Reviewed = 2024-03-01T08:30:00Z`（UTC），Excel/WPS COM 在本机 +08:00
+  读作 `2024-03-01 16:30`（本地时间）；app_saved.xlsx、app_excel_rt.xlsx、
+  app_wps_rt.xlsx 的 XML 都保持同一 UTC 文本，不是把日期值改成了另一个时刻。

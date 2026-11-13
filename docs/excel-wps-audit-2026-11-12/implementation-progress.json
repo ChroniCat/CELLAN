@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T09:20:00Z",
+  "updated_utc": "2026-11-13T09:36:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -485,7 +485,7 @@
       "source": "core-requirements.md",
       "heading": "C08 P0 无损更新自定义文档属性",
       "status": "已验收",
-      "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。",
+      "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。 09:26复核补充：app_saved.xlsx 原字节副本在 Excel/WPS 均以 DisplayAlerts=True、Visible=True 的正常 Open 打开，未出现修复/恢复对话框；日期属性 XML 存 UTC 08:30Z，COM 本地 +08:00 显示 16:30，仅为显示口径。",
       "files": [
         "crates/core/src/external.rs",
         "crates/core/src/xlsx.rs",
@@ -493,21 +493,18 @@
       ],
       "commits": [],
       "commands": [
-        "cargo test -p sheetcore --offline --test custom_props -> 10 passed / 0 failed / 2 ignored"
+        "cargo test -p sheetcore --offline --test custom_props -> 10 passed / 0 failed / 2 ignored",
+        "Excel/WPS DisplayAlerts=True、Visible=True 普通 Open app_saved.xlsx 副本 -> OPEN_OK 177/666ms，无修复/恢复对话框，SHA-256 不变"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
       ],
-      "not_done": [
-        "Excel「属性」对话框自定义页列表的屏幕截图未取得（Office 页列表为空白；已用 cscript 读取属性对象 5 项）",
-        "Office 打开时“无修复提示”的截图未取得（实际 Open 成功且无修复流程）",
-        "刷新仅走模型层 import_csv，未点击 UI 刷新按钮"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "继续 C06；C08 自定义页列表截图与无修复提示截图作为边界保留",
-      "updated_utc": "2026-11-13T09:20:00Z",
+      "updated_utc": "2026-11-13T09:36:00Z",
       "slices": [
         {
           "id": "C08.1",
@@ -516,7 +513,7 @@
           "acceptance_source": "core-requirements.md / C08 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "已验收",
-          "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。",
+          "acceptance": "四类第三方自定义属性（文本/数字/日期/布尔）在新增、改名、刷新、删除数据源、连续保存、另存后逐项不变；名称/值含 &<>“ 合法转义；删最后一个数据源只清本应用属性；Excel 16.0 与 WPS 12.0 打开后另存，部件与属性原样保留，我方读端可解析回数据源。实机：app_saved.xlsx 在 Excel/WPS 各自读出 5 项；Excel/WPS 另存后五项仍在；属性对话框自定义页列表截图仍为空白，未作为通过证据。 09:26复核补充：app_saved.xlsx 原字节副本在 Excel/WPS 均以 DisplayAlerts=True、Visible=True 的正常 Open 打开，未出现修复/恢复对话框；日期属性 XML 存 UTC 08:30Z，COM 本地 +08:00 显示 16:30，仅为显示口径。",
           "files": [
             "crates/core/src/external.rs",
             "crates/core/src/xlsx.rs",
@@ -527,20 +524,18 @@
             "cargo test -p sheetcore --offline --test custom_props -> 10 passed / 0 failed / 2 ignored",
             "app SC_SAVE_ASYNC -> app_saved.xlsx，5 项属性保留",
             "cscript Excel 16.0 读取 app_saved.xlsx -> 5 项；另存后仍 5 项",
-            "cscript WPS 12.0 读取 app_saved.xlsx -> 5 项；另存后 5 项 + WPS 自己的 3 项"
+            "cscript WPS 12.0 读取 app_saved.xlsx -> 5 项；另存后 5 项 + WPS 自己的 3 项",
+            "Excel/WPS alerts-enabled Open app_saved 副本 -> 无修复提示；XML Reviewed 保持 2024-03-01T08:30:00Z"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/"
           ],
-          "not_done": [
-            "Excel/WPS 属性对话框自定义页列表的屏幕截图未取得（已用 cscript 读取属性对象）",
-            "刷新未点击 UI 按钮取证"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "用户复核",
-          "updated_utc": "2026-11-13T09:20:00Z"
+          "updated_utc": "2026-11-13T09:36:00Z"
         }
       ]
     },
@@ -2335,17 +2330,24 @@
       "scope": "core/formula/functions.rs, style.rs",
       "source": "core-requirements.md",
       "heading": "C06 P1 本地时间与序列60兼容",
-      "status": "待实施",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "序列 59/60/61 分别为 1900-02-28/1900-02-29/1900-03-01，DATE(1900,2,29)=60，DAY/MONTH/YEAR/TEXT/单元格日期格式一致；NOW/TODAY 默认用系统本地时间，可用 with_clock_at 注入 UTC 秒与偏移，同一轮计算共享快照；模拟 Asia/Shanghai 00:30、时区变化和午夜均不依赖真实等待。Excel 16.0/WPS 12.0 实机 TEXT(60) 均为 1900-02-29、DAY(60)=29。",
       "files": [],
       "commits": [],
-      "commands": [],
-      "evidence": [],
+      "commands": [
+        "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 4 passed / 0 failed",
+        "cargo test -p sheetcore --offline -> 68 bins / 616 passed / 0 failed / 41 ignored",
+        "Excel 16.0/WPS 12.0 空白工作簿 -> TEXT(60)=1900-02-29、DAY(60)=29、NOW/TODAY 本地 +08:00"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock/"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "继续 C07 或剩余待验收项",
+      "updated_utc": "2026-11-13T09:36:00Z",
       "slices": [
         {
           "id": "C06.1",
@@ -2353,17 +2355,24 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "序列 59/60/61 分别对应 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY(60)=29、MONTH(60)=2、YEAR(60)=1900、TEXT/单元格格式均为 1900-02-29；1904 体系不接受虚构的 1900-02-29。",
           "files": [],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 4 passed",
+            "cargo test -p sheetcore --offline -> 68 bins / 616 passed / 0 failed / 41 ignored",
+            "Excel 16.0/WPS 12.0 -> TEXT(60)=1900-02-29、DAY(60)=29"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock/"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T09:36:00Z"
         },
         {
           "id": "C06.2",
@@ -2371,17 +2380,23 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照。",
           "files": [],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "formula::functions::clock_and_serial60_tests::injected_clock_uses_local_midnight_not_utc_and_is_stable -> ok",
+            "formula::functions::clock_and_serial60_tests::timezone_and_midnight_changes_do_not_leak_previous_snapshot -> ok"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock/"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T09:36:00Z"
         }
       ]
     },

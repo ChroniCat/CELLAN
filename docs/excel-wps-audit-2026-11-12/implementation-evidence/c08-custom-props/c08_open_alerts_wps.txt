@@ -1,0 +1,6 @@
+COPY_SHA256=c42e791537a2e89dfcf975ecc3bda87297e8db6a3918a3d6a10fe4bde3a7eb48
+ALERTS_ENABLED=True
+OPEN_OK elapsed_ms=666
+WB name=c08_open_wps.xlsx sheets=1
+WPS_WINDOW=c08_open_wps.xlsx
+CLOSE_OK alerts=True
