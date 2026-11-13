@@ -18803,6 +18803,26 @@ let txn = self.txn_begin(&keys);
                                 srs.color = Some(c);
                             }
                             ui.label(&srs.name);
+                            let cur = srs.kind.map(|k| k.label()).unwrap_or("跟随图表");
+                            egui::ComboBox::from_id_salt(format!("sekind{}", srs.name_ref))
+                                .selected_text(cur)
+                                .width(84.0)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(srs.kind.is_none(), "跟随图表").clicked() {
+                                        srs.kind = None;
+                                    }
+                                    for k in [
+                                        sheetcore::charts::ChartKind::Column,
+                                        sheetcore::charts::ChartKind::Bar,
+                                        sheetcore::charts::ChartKind::Line,
+                                        sheetcore::charts::ChartKind::Area,
+                                    ] {
+                                        if ui.selectable_label(srs.kind == Some(k), k.label()).clicked() {
+                                            srs.kind = Some(k);
+                                        }
+                                    }
+                                });
+                            ui.checkbox(&mut srs.secondary, "次轴");
                         });
                     }
                 }

@@ -88,3 +88,23 @@ fn an_explicit_chart_type_change_is_not_reverted_by_save() {
     assert!(!xml.contains("<c:lineChart>"), "用户改过的图表不能被基准还原回去");
     assert!(xml.contains("<c:barChart>"));
 }
+
+#[test]
+fn writer_groups_series_by_kind_and_axis_pair() {
+    let wb = sheetcore::xlsx::load(&fixture()).expect("加载");
+    let ch = wb.sheets[0].charts[0].clone();
+    let xml = sheetcore::chart_write::chart_xml_for_test(&ch);
+    assert_eq!(xml.matches("<c:barChart>").count(), 1);
+    assert_eq!(xml.matches("<c:lineChart>").count(), 1);
+    assert!(xml.contains("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>"), "{xml}");
+    assert!(xml.contains("<c:axId val=\"3\"/><c:axId val=\"4\"/></c:lineChart>"), "{xml}");
+    assert!(xml.contains("<c:axPos val=\"r\"/>"), "次轴要画在右侧");
+    // 写出去再读回来，逐系列类型与次轴仍然成立
+    let work = std::env::temp_dir().join("sc_c19_write.xlsx");
+    let _ = std::fs::remove_file(&work);
+    std::fs::copy(fixture(), &work).unwrap();
+    sheetcore::chart_write::replace_chart(&work, &ch.part, &ch).expect("改写");
+    let back = sheetcore::charts::load_charts(&work, "销售").expect("读回");
+    assert_eq!(back[0].series[1].kind, Some(sheetcore::charts::ChartKind::Line));
+    assert!(back[0].series[1].secondary);
+}

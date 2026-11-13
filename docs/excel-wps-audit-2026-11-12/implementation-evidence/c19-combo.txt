@@ -53,14 +53,26 @@ WPS   SERIES=2 TYPE2=4 AXIS2=2
 
 即：两根系列、系列 2 仍是折线、仍在次坐标轴，原图未降级。
 
-## 4. 未做（不写成已验收）
+## 4. 逐系列编辑入口（本轮补）
 
-- 图表编辑对话框仍只能改整图类型/颜色/轴标题，**没有逐系列改类型、勾次轴**的入口；
-  `chart_write` 写组合图时按“前 N 条柱 + 其余线”自动分组，未按每系列标记分组。
+图表编辑对话框的系列行加了「图型」下拉（跟随图表/柱/条/折线/面积）与「次轴」勾选；
+`chart_write` 不再按“前 N 柱、其余线”切分，而是按（图型, 主轴/次轴）分组，
+每组一个 chart 容器、次轴组用 axId 3/4 并写右侧 valAx；折线系列写
+`<c:marker><c:symbol val="none"/></c:marker>`，Excel 才认成 xlLine(4) 而不是带标记的 65。
+
+```text
+writer_groups_series_by_kind_and_axis_pair ... ok
+EXCEL WRITER SERIES=2 TYPE2=4 AXIS2=2
+WPS   WRITER TYPE2=4 AXIS2=2
+```
+
+## 5. 未做（不写成已验收）
+
 - 次轴刻度未按 Excel 的 nice-number 规则取整（当前用数据最大值），趋势与量级一致，
   刻度标签未单独绘制。
-- 真实键鼠在对话框里操作未执行（RDP 不可用）。
+- 散点系列放在组合图里的 x/y 值语义未单独建模（沿用分类+数值）。
+- 真实键鼠在对话框里改系列类型/勾次轴未执行（RDP 不可用）。
 
 ## 5. 回归
 
-sheetcore **784 passed**、app `--bin app` **264 passed**。
+sheetcore **785 passed**、app `--bin app` **264 passed**。

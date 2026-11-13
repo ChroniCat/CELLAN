@@ -5927,7 +5927,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T19:20:43Z",
+      "updated_utc": "2026-11-13T19:33:22Z",
       "slices": [
         {
           "id": "C19.1",
@@ -5953,7 +5953,7 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C19 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
             "crates/core/src/charts.rs",
@@ -5970,12 +5970,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-combo.txt"
           ],
           "not_done": [
-            "解析/绘制/保存保真已验（Excel/WPS TYPE2=4 AXIS2=2）；逐系列改类型与勾次轴的对话框入口未接；次轴刻度未取整"
+            "逐系列类型/次轴：对话框入口+分组写出+Excel/WPS 回读 TYPE2=4 AXIS2=2；次轴刻度未取整、散点 x/y 未建模、真实键鼠未执行"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T19:20:43Z"
+          "updated_utc": "2026-11-13T19:33:22Z"
         },
         {
           "id": "C19.3",

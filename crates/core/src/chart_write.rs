@@ -115,7 +115,7 @@ fn series_body_at(ch: &crate::charts::Chart, offset: usize) -> String {
             out.push_str("<c:dLbls><c:showVal val=\"1\"/><c:showSerName val=\"0\"/><c:showCatName val=\"0\"/><c:showLegendKey val=\"0\"/></c:dLbls>");
         }
         if matches!(ch.kind, crate::charts::ChartKind::Line) {
-            out.push_str("<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/></c:marker>");
+            out.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>");
             out.push_str(&format!(
                 "<c:spPr><a:ln w=\"28575\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
             ));
@@ -272,27 +272,87 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
             }
             out.push_str(&format!("</c:{tag}>"));
         }
-        Combo => {
-            let split = ch.series.len().saturating_sub(1).max(1);
-            let mut bars = ch.clone();
-            bars.kind = Column;
-            bars.series = ch.series[..split.min(ch.series.len())].to_vec();
-            let mut line = ch.clone();
-            line.kind = Line;
-            line.series = ch.series[split.min(ch.series.len())..].to_vec();
-            out.push_str("<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>");
-            out.push_str(&series_body_at(&bars, 0));
-            out.push_str("<c:gapWidth val=\"150\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>");
-            out.push_str("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
-            out.push_str(&series_body_at(&line, split));
-            out.push_str("<c:marker val=\"1\"/><c:axId val=\"3\"/><c:axId val=\"4\"/></c:lineChart>");
-            // 主轴
-            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
-            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
-            // 次轴：右侧数值轴 + 隐藏的次分类轴
-            out.push_str("<c:valAx><c:axId val=\"4\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"r\"/><c:crossAx val=\"3\"/><c:crosses val=\"max\"/></c:valAx>");
-            out.push_str("<c:catAx><c:axId val=\"3\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"1\"/><c:axPos val=\"b\"/><c:crossAx val=\"4\"/></c:catAx>");
+        _ if matches!(ch.kind, Combo)
+            || ch
+                .series
+                .iter()
+                .any(|s| s.kind.is_some_and(|k| !matches!(k, Combo)) || s.secondary) =>
+        {
+            use crate::charts::ChartKind::*;
+            // 按（图型, 主轴/次轴）分组，每组一个 chart 容器
+            let mut groups: Vec<(crate::charts::ChartKind, bool, Vec<usize>)> = Vec::new();
+            for (i, se) in ch.series.iter().enumerate() {
+                let gk = match se.kind {
+                    Some(k) if !matches!(k, Combo) => k,
+                    _ => match ch.kind {
+                        Combo | Pie | Doughnut | Scatter => Column,
+                        k => k,
+                    },
+                };
+                match groups.iter_mut().find(|g| g.0 == gk && g.1 == se.secondary) {
+                    Some(g) => g.2.push(i),
+                    None => groups.push((gk, se.secondary, vec![i])),
+                }
+            }
+            let has_sub = groups.iter().any(|g| g.1);
+            let mut axis_of: Vec<(usize, usize)> = Vec::new();
+            for (gi, (gk, sub, idxs)) in groups.iter().enumerate() {
+                let mut tmp = ch.clone();
+                tmp.kind = *gk;
+                tmp.series = idxs.iter().filter_map(|i| ch.series.get(*i).cloned()).collect();
+                let first = *idxs.first().unwrap_or(&0);
+                let body = |tmp: &crate::charts::Chart| -> String {
+                    if matches!(gk, Scatter) {
+                        scatter_body(tmp)
+                    } else {
+                        series_body_at(tmp, first)
+                    }
+                };
+                let (a1, a2) = if *sub { (3usize, 4usize) } else { (1usize, 2usize) };
+                axis_of.push((a1, a2));
+                match gk {
+                    Bar | BarStacked | Column => {
+                        let dir = if matches!(gk, Bar) { "bar" } else { "col" };
+                        let grouping = if matches!(gk, BarStacked) { "stacked" } else { "clustered" };
+                        out.push_str(&format!("<c:barChart><c:barDir val=\"{dir}\"/><c:grouping val=\"{grouping}\"/><c:varyColors val=\"0\"/>"));
+                        out.push_str(&body(&tmp));
+                        out.push_str(&format!(
+                            "<c:gapWidth val=\"150\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:barChart>"
+                        ));
+                    }
+                    Area => {
+                        out.push_str("<c:areaChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
+                        out.push_str(&body(&tmp));
+                        out.push_str(&format!(
+                            "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:areaChart>"
+                        ));
+                    }
+                    Scatter => {
+                        out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
+                        out.push_str(&body(&tmp));
+                        out.push_str(&format!(
+                            "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:scatterChart>"
+                        ));
+                    }
+                    _ => {
+                        out.push_str("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
+                        out.push_str(&body(&tmp));
+                        out.push_str(&format!(
+                            "<c:marker val=\"0\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:lineChart>"
+                        ));
+                    }
+                }
+                let _ = gi;
+            }
+            let (p1, p2) = axis_of.first().copied().unwrap_or((1, 2));
+            out.push_str(&format!("<c:catAx><c:axId val=\"{p1}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"{p2}\"/></c:catAx>"));
+            out.push_str(&format!("<c:valAx><c:axId val=\"{p2}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"{p1}\"/></c:valAx>"));
+            if has_sub {
+                out.push_str("<c:valAx><c:axId val=\"4\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"r\"/><c:crossAx val=\"3\"/><c:crosses val=\"max\"/></c:valAx>");
+                out.push_str("<c:catAx><c:axId val=\"3\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"1\"/><c:axPos val=\"b\"/><c:crossAx val=\"4\"/></c:catAx>");
+            }
         }
+        Combo => {}
         Scatter => {
             out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
             out.push_str(&scatter_body(ch));
