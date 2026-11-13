@@ -34,6 +34,7 @@
 !crates/core/tests/fixtures/qa02_table_style/*.xlsx
 !crates/core/tests/fixtures/qa02_refs_filter/*.xlsx
 !crates/core/tests/fixtures/qa02_pivot_pdf/*.xlsx
+!crates/app/tests/fixtures/qa02_app/*.xlsx
 !crates/core/tests/fixtures/qa01_extended/*.xlsx
 
 # Operating-system files

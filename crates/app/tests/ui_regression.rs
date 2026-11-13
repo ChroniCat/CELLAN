@@ -16,6 +16,13 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+
+fn qa_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_app")
+        .join(name)
+}
+
 /// 本次测试进程专用的运行目录（QA-03.1）：dump、日志、合成工作簿都放这里，
 /// 不在系统临时目录里撒固定文件名，也不会与另一次运行互相覆盖。
 fn run_dir() -> &'static Path {
@@ -98,9 +105,9 @@ fn has_cell(dump: &str, r: u32, c: u32, text: &str) -> bool {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn grid_renders_cells_and_panes() {
-    let Some(dump) = dump_for("tests/test-work/table.xlsx", &[], Duration::from_secs(30)) else {
+    let src = qa_fixture("table.xlsx");
+    let Some(dump) = dump_for(&src.to_string_lossy(), &[], Duration::from_secs(30)) else {
         return;
     };
     assert!(
@@ -116,10 +123,10 @@ fn grid_renders_cells_and_panes() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn conditional_format_icons_render() {
+    let src = qa_fixture("icons.xlsx");
     let Some(dump) = dump_for(
-        "tests/test-work/icons.xlsx",
+        &src.to_string_lossy(),
         &[],
         Duration::from_secs(30),
     ) else {
@@ -134,11 +141,12 @@ fn conditional_format_icons_render() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn compare_mode_splits_into_two_panes() {
+    let left = qa_fixture("compare_left.xlsx");
+    let right = qa_fixture("table.xlsx");
     let Some(dump) = dump_for(
-        "tests/test-work/chart.xlsx",
-        &[("SC_COMPARE", "tests/test-work/table.xlsx")],
+        &left.to_string_lossy(),
+        &[("SC_COMPARE", &right.to_string_lossy())],
         Duration::from_secs(30),
     ) else {
         return;
@@ -151,9 +159,9 @@ fn compare_mode_splits_into_two_panes() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn pictures_are_drawn_at_anchor() {
-    let Some(dump) = dump_for("tests/test-work/pic.xlsx", &[], Duration::from_secs(30)) else {
+    let src = qa_fixture("pic.xlsx");
+    let Some(dump) = dump_for(&src.to_string_lossy(), &[], Duration::from_secs(30)) else {
         return;
     };
     let pics: Vec<&str> = dump.lines().filter(|l| l.starts_with("pic ")).collect();
@@ -213,9 +221,9 @@ fn locked_cell_is_marked() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn textbox_renders_and_moves() {
-    let src = Path::new("tests/test-work/table.xlsx");
+    let src = qa_fixture("table.xlsx");
+    let src = src.as_path();
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = run_dir().join(format!("ui_tb_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
@@ -250,9 +258,9 @@ fn textbox_renders_and_moves() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn textbox_drag_moves_model() {
-    let src = Path::new("tests/test-work/table.xlsx");
+    let src = qa_fixture("table.xlsx");
+    let src = src.as_path();
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = run_dir().join(format!("ui_tbdrag_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
@@ -301,9 +309,9 @@ fn textbox_drag_moves_model() {
 // ---------------------------------------------------------------- 数据分析四件套
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn subtotal_and_flashfill_apply() {
-    let src = Path::new("tests/test-work/table.xlsx");
+    let src = qa_fixture("table.xlsx");
+    let src = src.as_path();
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = run_dir().join(format!("ui_data_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();
@@ -371,10 +379,10 @@ fn sparklines_render_in_cells() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn sparkline_create_from_selection() {
     // 用两张表的普通文件，按 A1:E1 选区建柱形迷你图，落在 F1
-    let src = Path::new("tests/test-work/table.xlsx");
+    let src = qa_fixture("spark_table.xlsx");
+    let src = src.as_path();
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
     let tmp = run_dir().join(format!("ui_spark_{}.xlsx", std::process::id()));
     std::fs::copy(src, &tmp).unwrap();

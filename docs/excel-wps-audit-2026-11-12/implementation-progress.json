@@ -1222,7 +1222,13 @@
         "crates/core/tests/fixtures/qa02_refs_filter/table.xlsx",
         "crates/core/tests/fixtures/qa02_refs_filter/chart.xlsx",
         "crates/core/tests/fixtures/qa02_table_style/styled.xlsx",
-        "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx"
+        "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx",
+        "crates/app/tests/ui_regression.rs",
+        "scripts/qa02_app_fixtures.py",
+        "crates/app/tests/fixtures/qa02_app/table.xlsx",
+        "crates/app/tests/fixtures/qa02_app/icons.xlsx",
+        "crates/app/tests/fixtures/qa02_app/compare_left.xlsx",
+        "crates/app/tests/fixtures/qa02_app/spark_table.xlsx"
       ],
       "commits": [
         "45f3f0c",
@@ -1251,7 +1257,8 @@
         "cargo test -p sheetcore --offline --lib cf::tests::formula_relative_shift -- --exact -> 1 passed",
         "cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0",
         "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored, exit 0",
-        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
+        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
+        "cargo test -p app --offline --test ui_regression -> 19 passed / 0 failed / 1 ignored (SA screenshots/geometry only)"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt",
@@ -1263,7 +1270,7 @@
       "failures": [],
       "blocker": "",
       "next": "继续 QA-02.1 剩余 vba/app 夹具，再进入 QA-02.2/QA-02.3。",
-      "updated_utc": "2026-11-13T20:04:00Z",
+      "updated_utc": "2026-11-13T20:16:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1271,7 +1278,7 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
             "crates/core/tests/array_formula.rs",
@@ -1310,7 +1317,15 @@
             "crates/core/tests/fixtures/qa02_refs_filter/table.xlsx",
             "crates/core/tests/fixtures/qa02_refs_filter/chart.xlsx",
             "crates/core/tests/fixtures/qa02_table_style/styled.xlsx",
-            "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx"
+            "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx",
+            "crates/app/tests/ui_regression.rs",
+            "scripts/qa02_app_fixtures.py",
+            "crates/app/tests/fixtures/qa02_app/table.xlsx",
+            "crates/app/tests/fixtures/qa02_app/icons.xlsx",
+            "crates/app/tests/fixtures/qa02_app/compare_left.xlsx",
+            "crates/app/tests/fixtures/qa02_app/spark_table.xlsx",
+            "crates/app/tests/fixtures/qa02_app/pic.xlsx",
+            "crates/app/tests/fixtures/qa02_app/pixel.png"
           ],
           "commits": [
             "45f3f0c",
@@ -1339,20 +1354,22 @@
             "cargo test -p sheetcore --offline --lib cf::tests::formula_relative_shift -- --exact -> 1 passed",
             "cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0",
             "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored, exit 0",
-            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
+            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
+            "cargo test -p app --offline --test ui_regression -> 19 passed / 0 failed / 1 ignored (SA screenshots/geometry only)",
+            "cargo test -p app --offline --test ui_regression -> 20 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
           ],
           "not_done": [
-            "剩余 9 个 core ignored：comparison_semantics/custom_props/date_system/save_failure_injection 的人工生成或辅助进程项，以及 vba_source 的真实 OLE VBA 样本。",
-            "app/tests 的对象/UI 夹具尚未恢复。"
+            "core 仍有 8 个明确标记的人工生成/辅助进程 ignored 项（不是缺夹具）；vba_source 仍缺真实 OLE VBA 样本。",
+            "QA-02.2/QA-02.3 尚未开始。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "恢复 vba_source 与 app/tests 对象夹具，补齐剩余 ignored 的原因/责任人/解锁步骤台账。",
-          "updated_utc": "2026-11-13T20:04:00Z"
+          "next": "主实施者复核后收口 QA-02.1；按 QA-02.2/02.3 任务正文继续。",
+          "updated_utc": "2026-11-13T20:16:00Z"
         },
         {
           "id": "QA-02.2",
