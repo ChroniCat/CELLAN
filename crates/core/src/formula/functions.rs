@@ -122,13 +122,14 @@ pub fn set_now_snapshot(v: Option<f64>) {
 }
 
 /// 顶层重算开始前固定一次 NOW；返回进入前的值，结束时用 set_now_snapshot 还原。
-pub(crate) fn ensure_now_snapshot() -> Option<f64> {
-    if now_snapshot().is_some() {
-        return now_snapshot();
+/// 必须显式传入目标工作簿的日期体系：`now_serial_uncached` 默认读线程本地的
+/// D1900，若在 `Calc::new` 设置 D1904 之前先快照，会把 D1900 序列号泄漏给 1904 工作簿。
+pub(crate) fn ensure_now_snapshot_in(sys: DateSystem) -> Option<f64> {
+    if let Some(v) = now_snapshot() {
+        return Some(v);
     }
-    let prev = None;
-    set_now_snapshot(Some(now_serial_uncached()));
-    prev
+    set_now_snapshot(Some(now_serial_uncached_in(sys)));
+    None
 }
 
 fn clock_now() -> (i64, i32) {
@@ -254,10 +255,14 @@ fn local_offset_seconds() -> i64 {
 }
 
 fn now_serial_uncached() -> f64 {
+    now_serial_uncached_in(current_date_system())
+}
+
+fn now_serial_uncached_in(sys: DateSystem) -> f64 {
     let (secs, offset) = clock_now();
     let local_secs = secs as f64 + offset as f64;
     let serial_1900 = local_secs / 86_400.0 + 25_569.0;
-    if current_date_system().is_1904() {
+    if sys.is_1904() {
         serial_1900 - DateSystem::OFFSET
     } else {
         serial_1900
@@ -2117,6 +2122,55 @@ mod clock_and_serial60_tests {
             // 同一次求值里的两个 NOW 必须来自同一快照。
             assert_eq!(number(eval_formula(&wb, 0, "=NOW()-NOW()")), 0.0);
         });
+    }
+
+    fn recalc_now_book(sys: DateSystem, one_sheet: bool) -> Workbook {
+        // 2024-03-01 00:30 Asia/Shanghai == 2024-02-29 16:30 UTC
+        let utc = days_from_civil(2024, 2, 29) * 86_400 + 16 * 3600 + 30 * 60;
+        let mut wb = Workbook::new_blank();
+        wb.date_system = sys;
+        wb.sheets[0].set(0, 0, crate::model::Cell { value: crate::model::Value::Empty, formula: Some("=TODAY()".into()) });
+        wb.sheets[0].set(0, 1, crate::model::Cell { value: crate::model::Value::Empty, formula: Some("=NOW()".into()) });
+        wb.sheets[0].set(0, 2, crate::model::Cell { value: crate::model::Value::Empty, formula: Some("=NOW()-NOW()".into()) });
+        with_clock_at(utc, 8 * 3600, || {
+            if one_sheet {
+                crate::formula::recalc_sheet(&mut wb, 0);
+            } else {
+                crate::formula::recalc_all_force(&mut wb);
+            }
+        });
+        wb
+    }
+
+    #[test]
+    fn recalc_binds_now_snapshot_to_workbook_date_system() {
+        let mar1_1900 = date_to_serial_in(DateSystem::D1900, 2024, 3, 1).unwrap();
+        assert_eq!(mar1_1900, 45_352.0);
+        assert_eq!(mar1_1900 - DateSystem::OFFSET, 43_890.0);
+        for (sys, want_day) in [
+            (DateSystem::D1900, 45_352.0),
+            (DateSystem::D1904, 43_890.0),
+        ] {
+            for one_sheet in [false, true] {
+                let wb = recalc_now_book(sys, one_sheet);
+                assert_eq!(
+                    wb.sheets[0].value(0, 0),
+                    crate::model::Value::Number(want_day),
+                    "sys={sys:?} one_sheet={one_sheet}"
+                );
+                let want_now = want_day + 30.0 / (24.0 * 60.0);
+                let now = match wb.sheets[0].value(0, 1) {
+                    crate::model::Value::Number(n) => n,
+                    other => panic!("expected NOW number, got {other:?}"),
+                };
+                assert!((now - want_now).abs() < 1e-9, "sys={sys:?} NOW={now}");
+                assert_eq!(
+                    wb.sheets[0].value(0, 2),
+                    crate::model::Value::Number(0.0),
+                    "sys={sys:?} 同轮 NOW 快照不一致"
+                );
+            }
+        }
     }
 
     #[test]

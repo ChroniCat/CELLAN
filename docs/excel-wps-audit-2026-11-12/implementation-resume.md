@@ -1,11 +1,11 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `ae36de3`（C06 代码与证据；C08 alert 普通 Open 证据）。
-- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 42 待实施；
-  切片 28 已验收 / 18 待验收 / 102 待实施。
-- 当前测试真值（C06 修改后，09:39 重跑）：core 68 bins / 616 passed / 0 failed / 41 ignored，
+- 分支 `main`（`origin/main`），HEAD `b1f8f11`（C10.1 结构化引用；C06/C08 证据在前）。
+- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 1 实施中 / 41 待实施；
+  切片 28 已验收 / 19 待验收 / 101 待实施。
+- 当前测试真值（C06 修改后，09:39 重跑）：core 69 bins / 626 passed / 0 failed / 41 ignored，
   CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
-  GUI_EXIT=0。app/GUI 与 C06 修改后的 core 同树运行。
+  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10 未重跑 GUI。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
 
@@ -39,9 +39,25 @@
   `Calc` 生命周期和 `recalc_all_force`/`recalc_sheet` 多遍重算共享 NOW 快照。
 - 测试 4 项：序列 59/60/61 与 TEXT/DAY/MONTH/YEAR/单元格格式；注入
   Asia/Shanghai 00:30（UTC 前一天 16:30）；时区变化和午夜；同轮 NOW-NOW=0。
-- C06 后全量 core：68 bins / 616 passed / 0 failed / 41 ignored / CORE_EXIT=0。
+- C06 后全量 core：69 bins / 626 passed / 0 failed / 41 ignored / CORE_EXIT=0；
+  app 200/0；`c06-local-clock.txt` 与 `c06_core_fix.txt` 是当前日志。
+- 09:53 复核回归已修：`ensure_now_snapshot_in(wb.date_system)` 在 D1900/D1904
+  实际 `recalc_all_force` / `recalc_sheet` 前按目标体系生成快照；新增回归
+  `recalc_binds_now_snapshot_to_workbook_date_system`：注入 2024-02-29 16:30 UTC+08，
+  D1900=45352/45352.020833，D1904=43890/43890.020833，同一轮 NOW 差为 0。
 - 本机 Excel 16.0/WPS 12.0 空白工作簿对拍：TEXT(60)=1900-02-29、DAY(60)=29，
   NOW/TODAY 用本机 +08:00；证据 implementation-evidence/c06-local-clock.txt。
+
+## 本轮：C10.1 结构化引用语法与求值（实现完成，待独立复核）
+
+- `crates/core/src/table.rs` 新增 `expand_structured_at`：`#Data/#Headers/#Totals/#All`、
+  `@`/`#This Row`、列区间、特殊列名；表名可在公式体开头，不再要求 `start > 0`。
+- `formula/mod.rs` 顶层 `Node::Range` 返回数组（1×1 仍标量），`=Sales[Amount]` 得到 10/20；
+  `formula/deps.rs` 按公式行扫描当前行依赖。
+- 审计失败样本恢复：`=Sales[Amount]`、`=SUM(Sales[[#Data],[Amount]])` 均正确；`"Sales[Amount]"`
+  不被改写；9 项 `structured_references` 全过。
+- 全量：core 69 bins / 625 passed / 0 failed / 41 ignored；app 200/0。
+- 未完成：C10.2 计算列/表扩展/列重命名、C10.3 转换区域保存往返；C10 父项未验收。
 
 ## 本轮：C08 无损更新自定义文档属性（已验收）
 

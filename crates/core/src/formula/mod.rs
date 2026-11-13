@@ -2537,7 +2537,7 @@ pub fn recalc_all(wb: &mut Workbook) {
 
 /// 强制执行全量计算（F9 / 计算全部 / 切回自动模式）。
 pub fn recalc_all_force(wb: &mut Workbook) {
-    let prev_now = functions::ensure_now_snapshot();
+    let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     wb.calc_pending = false;
     wb.calc_pending_sheets.clear();
     let phase = std::env::var("SC_PHASE").is_ok();
@@ -2730,7 +2730,7 @@ pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
     if sheet >= wb.sheets.len() {
         return 0;
     }
-    let prev_now = functions::ensure_now_snapshot();
+    let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
         .iter()
         .filter(|(_, c)| c.formula.is_some())

@@ -2335,15 +2335,20 @@
       "source": "core-requirements.md",
       "heading": "C06 P1 本地时间与序列60兼容",
       "status": "待验收",
-      "acceptance": "实现完成并自测通过，待独立复核：序列 59/60/61 分别为 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY/MONTH/YEAR/TEXT 与单元格日期格式一致；NOW/TODAY 本地时间、with_clock_at 注入、同一轮快照；Excel 16.0/WPS 12.0 实机 TEXT(60)=1900-02-29、DAY(60)=29。",
-      "files": [],
+      "acceptance": "实现完成并自测通过，待独立复核：序列 59/60/61、DATE/TEXT/DAY/MONTH/YEAR、单元格格式；NOW/TODAY 本地时间与注入；D1900/D1904 实际 recalc_all_force/recalc_sheet 均使用工作簿体系快照（D1904 不得多 1462 天），同轮 NOW 一致。",
+      "files": [
+        "crates/core/src/formula/functions.rs",
+        "crates/core/src/formula/mod.rs",
+        "crates/core/src/style.rs"
+      ],
       "commits": [
         "8cd81fe"
       ],
       "commands": [
-        "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 4 passed / 0 failed",
-        "cargo test -p sheetcore --offline -> 68 bins / 616 passed / 0 failed / 41 ignored",
-        "Excel 16.0/WPS 12.0 空白工作簿 -> TEXT(60)=1900-02-29、DAY(60)=29、NOW/TODAY 本地 +08:00"
+        "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed / 0 failed",
+        "cargo test -p sheetcore --offline -> 69 bins / 626 passed / 0 failed / 41 ignored",
+        "cargo test -p app --offline --bin app -> 200 passed / 0 failed",
+        "Excel 16.0/WPS 12.0 -> TEXT(60)=1900-02-29、DAY(60)=29、NOW/TODAY 本地 +08:00"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock.txt",
@@ -2352,8 +2357,8 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "等待独立复核；复核通过后转已验收",
-      "updated_utc": "2026-11-13T09:36:00Z",
+      "next": "等待独立复核；C06 回归修复已补实际 D1900/D1904 重算测试",
+      "updated_utc": "2026-11-13T10:25:00Z",
       "slices": [
         {
           "id": "C06.1",
@@ -2368,8 +2373,8 @@
             "8cd81fe"
           ],
           "commands": [
-            "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 4 passed",
-            "cargo test -p sheetcore --offline -> 68 bins / 616 passed / 0 failed / 41 ignored",
+            "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed",
+            "cargo test -p sheetcore --offline -> 626 passed / 0 failed / 41 ignored",
             "Excel 16.0/WPS 12.0 -> TEXT(60)=1900-02-29、DAY(60)=29"
           ],
           "evidence": [
@@ -2380,7 +2385,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核",
-          "updated_utc": "2026-11-13T09:36:00Z"
+          "updated_utc": "2026-11-13T10:25:00Z"
         },
         {
           "id": "C06.2",
@@ -2389,14 +2394,14 @@
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照。",
+          "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照；D1900/D1904 的实际 recalc_all_force 与 recalc_sheet 都先绑定工作簿日期体系再建快照。",
           "files": [],
           "commits": [
             "8cd81fe"
           ],
           "commands": [
-            "formula::functions::clock_and_serial60_tests::injected_clock_uses_local_midnight_not_utc_and_is_stable -> ok",
-            "formula::functions::clock_and_serial60_tests::timezone_and_midnight_changes_do_not_leak_previous_snapshot -> ok"
+            "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed",
+            "recalc_binds_now_snapshot_to_workbook_date_system -> D1900 45352 / D1904 43890，两条重算路径 NOW 同轮一致"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c06-local-clock.txt",
@@ -2406,7 +2411,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核",
-          "updated_utc": "2026-11-13T09:36:00Z"
+          "updated_utc": "2026-11-13T10:25:00Z"
         }
       ]
     },
@@ -2504,7 +2509,9 @@
       "status": "实施中",
       "acceptance": "父项未完成：结构化引用完整语法/当前行/区域已实现（C10.1 待复核）；计算列、插入行扩展、字段重命名（C10.2）与转换区域保存往返（C10.3）未实施。",
       "files": [],
-      "commits": [],
+      "commits": [
+        "b1f8f11"
+      ],
       "commands": [],
       "evidence": [],
       "not_done": [],
@@ -2527,7 +2534,9 @@
             "crates/core/src/formula/deps.rs",
             "crates/core/tests/structured_references.rs"
           ],
-          "commits": [],
+          "commits": [
+            "b1f8f11"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test structured_references => 9 passed / 0 failed / 0 ignored",
             "cargo test -p sheetcore --offline => 625 passed / 0 failed / 41 ignored",

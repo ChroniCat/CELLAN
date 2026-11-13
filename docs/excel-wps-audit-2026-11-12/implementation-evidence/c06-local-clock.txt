@@ -1,7 +1,7 @@
 C06 本地时间与 1900 序列 60 兼容
 ================================
 
-状态：已验收（2026-11-13 09:30）
+状态：实现完成，待独立复核（2026-11-13 10:20；C06 回归修复后）
 范围：crates/core/src/formula/functions.rs、formula/mod.rs、style.rs 的日期格式化路径。
 
 一、实现
@@ -26,7 +26,8 @@ C06 本地时间与 1900 序列 60 兼容
 - day_month_year_and_text_agree_on_serial_60 ... ok
 - injected_clock_uses_local_midnight_not_utc_and_is_stable ... ok
 - timezone_and_midnight_changes_do_not_leak_previous_snapshot ... ok
-4 passed / 0 failed。
+- recalc_binds_now_snapshot_to_workbook_date_system ... ok
+5 passed / 0 failed。
 
 覆盖：
 - 59 -> 1900-02-28、60 -> 1900-02-29、61 -> 1900-03-01；DATE(1900,2,29)=60；
@@ -37,9 +38,13 @@ C06 本地时间与 1900 序列 60 兼容
 - 注入本地 2024-02-29 23:59、2024-03-01 00:00、同一 UTC 改为 -5h 三种上下文，
   TODAY 分别为 02-29、03-01、02-29；没有真实等待，也没有把上一时区快照泄漏到下一次。
 
-全量证据（2026-11-13 09:25 运行，修改后源码）：
-`cargo test -p sheetcore --offline` -> 68 bins / 616 passed / 0 failed / 41 ignored /
-CORE_EXIT=0（日志 implementation-evidence/c06-local-clock/c06_core_all2.log）。
+历史全量（2026-11-13 09:25，C06 首轮）：68 bins / 616 passed / 0 failed / 41 ignored /
+CORE_EXIT=0（日志 c06_core_all2.log，仅作历史）。
+
+回归修复后全量（2026-11-13 10:20，当前源码）：
+`cargo test -p sheetcore --offline` -> 69 bins / 626 passed / 0 failed / 41 ignored /
+CORE_EXIT=0（日志 c06_core_fix.txt）；`cargo test -p app --offline --bin app` ->
+200 passed / 0 failed / APP_EXIT=0（日志 c06_app_fix.txt）。
 
 三、本机 Office 对拍
 --------------------
@@ -63,3 +68,24 @@ WPS 12.0（Ket.Application，同样的空白工作簿）：
 结论：本应用与 Excel 16.0/WPS 12.0 在序列 59/60/61、DAY/MONTH/YEAR/TEXT/
 DATE 上逐项一致；NOW/TODAY 使用本地 +08:00 钟面。未执行项：没有把本机系统时区
 实际切换到其他时区（通过 `with_clock_at` 注入验证时区和午夜边界，未改系统设置）。
+
+
+五、09:53 复核回归修复：D1904 实际重算的 NOW 快照
+------------------------------------------------
+复核指出：`recalc_all_force` / `recalc_sheet` 原先在 `Calc::new` 设置
+`wb.date_system` 之前调用 `ensure_now_snapshot()`；`now_serial_uncached` 读线程
+本地的 `DATE_SYSTEM`，默认 D1900，因此 D1904 工作簿会拿到 D1900 序列号（多 1462 天）。
+直接 `eval_formula` 走 `Calc::new` 先设体系，所以旧测试没抓到。
+
+修复：
+- `now_serial_uncached_in(sys)` 显式按目标日期体系生成序列号；
+- `ensure_now_snapshot_in(sys)` 在快照时传入工作簿体系；
+- `recalc_all_force`、`recalc_sheet` 改为 `ensure_now_snapshot_in(wb.date_system)`。
+
+新增自动化回归 `recalc_binds_now_snapshot_to_workbook_date_system`，对
+D1900 与 D1904 分别走实际 `recalc_all_force` 和 `recalc_sheet`：
+- 注入 2024-02-29 16:30 UTC、+08:00（本地 2024-03-01 00:30）；
+- D1900：TODAY=45352、NOW=45352.020833…；
+- D1904：TODAY=43890、NOW=43890.020833…，不再得到 45352；
+- 两条路径的 `=NOW()-NOW()` 均 0，证明同一轮快照一致。
+修复前该测试会在 D1904 分支得到 45352（多 1462 天），而不是 43890。
