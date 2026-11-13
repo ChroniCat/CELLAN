@@ -4529,28 +4529,32 @@
       "source": "ui-requirements.md",
       "heading": "UI-15 格式对话框补全高频能力",
       "status": "实施中",
-      "acceptance": "UI-15.1 自定义格式与当前值预览已实现并专项/全量通过；填充/保护页、双下划线/竖排仍未实现，父项实施中。",
+      "acceptance": "UI-15.1 自定义格式/正负零三段已实现并专项、全量通过；UI-15.2 填充/保护页已实现（模板字段/protection OOXML 往返、混合页签、截图），真实鼠标与 Office 目视待验收；UI-15.3 双下划线/竖排仍未实现，父项实施中。",
       "files": [
         "crates/app/src/main.rs",
-        "crates/app/src/edit_regression_tests.rs"
+        "crates/app/src/edit_regression_tests.rs",
+        "crates/core/src/style.rs",
+        "crates/core/src/xlsx.rs"
       ],
       "commits": [
         "5e3c4e8",
-        "745e1ab"
+        "745e1ab",
+        "b02c047"
       ],
       "commands": [],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt"
       ],
       "not_done": [
         "真实鼠标输入/取消/Esc、Excel/WPS 保存重开目视未做",
-        "填充/保护页未实现",
-        "双下划线/竖排真实模型未实现"
+        "双下划线/竖排真实模型未实现",
+        "逐格 locked/hidden 的执行语义仍需在保护流程中专项验收"
       ],
       "failures": [],
       "blocker": "",
-      "next": "继续 UI-15.2 填充/保护页与 UI-15.3 双下划线/竖排。",
-      "updated_utc": "2026-11-13T07:30:19Z",
+      "next": "继续 UI-15.3 双下划线/竖排；随后补填充/保护页真实鼠标和 Office 目视。",
+      "updated_utc": "2026-11-13T07:58:00Z",
       "slices": [
         {
           "id": "UI-15.1",
@@ -4593,17 +4597,39 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "待验收",
+          "acceptance": "格式对话框新增填充/保护页；填充颜色和锁定/隐藏进入 CellStyle/xlsx 双向，混合字段按 FmtTouched 提交；核心 protection 往返 1 passed，app 事务 1 passed，全量 229；真实 framebuffer 两张已取证。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/core/src/style.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/tests/font_style.rs"
+          ],
+          "commits": [
+            "b02c047"
+          ],
+          "commands": [
+            "cargo test -p sheetcore --offline --test font_style cell_protection_roundtrip -> 1 passed",
+            "cargo test -p app --offline --bin app format_dialog_fill_and_protection_apply_to_selection -> 1 passed",
+            "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-fill.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png"
+          ],
+          "not_done": [
+            "真实鼠标填充页调色/保护页勾选/确定取消 Esc 未取证",
+            "Excel 365/WPS 保存重开目视未做",
+            "工作表保护后仅锁定格不可编辑的逐格执行语义尚未验收",
+            ".xls protection 编码未覆盖"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "真实鼠标操作、Office 目视与逐格保护执行语义。",
+          "updated_utc": "2026-11-13T07:58:00Z"
         },
         {
           "id": "UI-15.3",
@@ -4637,19 +4663,23 @@
       "source": "ui-requirements.md",
       "heading": "UI-16 工作表切换状态与标签管理",
       "status": "实施中",
-      "acceptance": "每表按 identity 保存/恢复 sel、sel_end、extra_sel、scroll、zoom；标签点击、Ctrl+Page 及查找/超链接/撤销等跳转统一走切换入口；标签右键菜单含移动/复制目标、隐藏/取消隐藏、工作表列表搜索；专项已通过，真实 GUI/Office 目视未做。",
+      "acceptance": "每表按 identity 保存/恢复 sel、sel_end、extra_sel、scroll、zoom；标签点击、Ctrl+Page 及查找/超链接/撤销等跳转统一走切换入口；复制到前方/同位先保存原视图并按 identity 恢复；隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；标签右键菜单含移动/复制目标、隐藏/取消隐藏、工作表列表搜索；真实 GUI/Office 目视未做。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "745e1ab"
+        "745e1ab",
+        "b02c047"
       ],
       "commands": [
         "cargo test -p app --offline --bin app sheet_view_state_is_restored_by_stable_identity -> 1 passed",
         "cargo test -p app --offline --bin app sheet_list_search_finds_one_of_thirty_sheets -> 1 passed",
         "cargo test -p app --offline --bin app sheet_move_and_copy_targets_preserve_active_identity -> 1 passed",
-        "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app copy_sheet_to_ -> 2 passed",
+        "cargo test -p app --offline --bin app hide_sheet_ -> 2 passed",
+        "cargo test -p app --offline --bin app cross_sheet_undo_clears_restored_extra_selection -> 1 passed",
+        "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
@@ -4661,7 +4691,7 @@
       "failures": [],
       "blocker": "",
       "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
-      "updated_utc": "2026-11-13T07:30:19Z",
+      "updated_utc": "2026-11-13T07:58:00Z",
       "slices": [
         {
           "id": "UI-16.1",
@@ -4670,19 +4700,23 @@
           "acceptance_source": "ui-requirements.md / UI-16 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "SheetViewState 按 identity 保存/恢复选区、extra_sel、滚动、缩放；Ctrl+Page 与标签入口统一；30 表搜索、移动/复制目标、隐藏/取消隐藏菜单已实现；三项专项通过，full app 223。",
+          "acceptance": "SheetViewState 按 identity 保存/恢复；Ctrl+Page 与标签入口统一；复制到前方/同位保留原 B/C 视图；标签菜单/Ribbon 隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；30 表搜索、移动/复制目标、隐藏/取消隐藏已实现；5 项专项通过，full app 229。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "745e1ab"
+            "745e1ab",
+            "b02c047"
           ],
           "commands": [
             "cargo test -p app --offline --bin app sheet_view_state_is_restored_by_stable_identity -> 1 passed",
             "cargo test -p app --offline --bin app sheet_list_search_finds_one_of_thirty_sheets -> 1 passed",
             "cargo test -p app --offline --bin app sheet_move_and_copy_targets_preserve_active_identity -> 1 passed",
-            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app copy_sheet_to_ -> 2 passed",
+            "cargo test -p app --offline --bin app hide_sheet_ -> 2 passed",
+            "cargo test -p app --offline --bin app cross_sheet_undo_clears_restored_extra_selection -> 1 passed",
+            "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
@@ -4693,8 +4727,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
-          "updated_utc": "2026-11-13T07:30:19Z"
+          "next": "补真实鼠标/Office 目视后再验收 UI-16.1。",
+          "updated_utc": "2026-11-13T07:58:00Z"
         }
       ]
     },

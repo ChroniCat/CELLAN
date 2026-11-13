@@ -1,18 +1,26 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；最近代码修复 `745e1ab`（混合字段明确选择、UI-15 三段格式、
-  UI-16 每表视图/标签菜单），上一轮四项修复 `5fd9ea3` 已由用户认可关闭。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 5 实施中 / 33 待实施；
-  切片 35 已验收 / 29 待验收 / 84 待实施。父项计数仍为 13/61，未提前翻绿。
-- 当前测试真值（15:28 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
-  app **223 passed / 0 failed / 0 ignored**，APP_EXIT=0。
-- 15:21 用户要求补的两项已实现：混合字段明确选择等于活动值也提交（FmtTouched）；
-  UI-15 正/负/零三段预览、保存 reload 后逐格预览一致，数值 framebuffer
-  `implementation-evidence/ui15-three-sections.png`。
-- UI-16 新增每表 identity 视图状态、Ctrl+Page/标签统一入口、移动/复制目标、隐藏/取消隐藏、
-  30 表搜索；三项专项通过，真实 GUI/Office 目视未做，保持待验收。
-- 当前未完成：真实鼠标/Office 目视（UI-08.2/15.1/16.1 等）；UI-16.1 已待验收；
-  UI-15.2/15.3、C22/UI-05/UI-06 及原队列继续。C10.2 live 按用户要求保留。
+- 分支 `main`（`origin/main`）；当前代码检查点 `b02c047`（UI-16 三处入口修复 + UI-15.2
+  填充/保护页）。上一轮 `745e1ab` 的混合字段明确选择与三段格式已获用户 15:47 认可。
+- 台账（`python scripts/audit_progress.py counts`）：任务 13 已验收 / 10 待验收 /
+  5 实施中 / 33 待实施；切片 35 已验收 / 30 待验收 / 83 待实施。父项 13/61 未变。
+- 当前测试真值（15:58 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **229 passed / 0 failed / 0 ignored**，APP_EXIT=0；
+  `cargo build -p app --offline --no-default-features --features glow` 成功。
+- 15:47 监督三处 UI-16 入口已修：
+  1. `copy_sheet_to` 插入前按 identity 保存视图，插入后按 identity 恢复原索引再切副本；
+     复制到前方/同位均保留原 B/C 的 sel/extra_sel/scroll/zoom。
+  2. `hide_current_sheet` 先 `commit_edit(None)`；验证拒绝时不改表/编辑文本/选区/隐藏状态；
+     标签菜单与 Ribbon `HideSheet` 共用；切表走 `switch_sheet_view`。
+  3. `do_undo` 跨表 switch 后清 `extra_sel`，后续 clear/Bold 不触历史远端区域。
+  五项新增回归均通过，full app 229。
+- UI-15.2 填充/保护页已实现并取证：CellStyle `locked/hidden` + xlsx protection 往返、
+  六页签、混合状态；核心往返 1 passed、app 事务 1 passed；截图
+  `ui15-fill-protection-fill.png` / `ui15-fill-protection-lock.png`；真实鼠标/Office、
+  逐格保护执行语义仍待验收。
+- 当前未完成：UI-16.1 真实 GUI/Office；UI-15.1/15.2 真实鼠标与 Office；UI-15.3
+  双下划线/竖排；其余原队列。下一步先安排一组已登记 GUI/Office 收敛（UI-10/UI-18），
+  再继续 UI-15.3。
 
 ## 12:35 当前：11:38 UTF-8 回归修复
 
