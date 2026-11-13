@@ -6032,17 +6032,19 @@
       "scope": "app/ribbon + 帮助/支持矩阵",
       "source": "core-requirements.md",
       "heading": "C21 P2 明确高级能力边界",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "入口改名+支持矩阵+宏/线程批注逐字节保留已完成；既有 queryTable/customXml 保留未逐项回归；真实键鼠未执行"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T19:01:44Z",
       "slices": [
         {
           "id": "C21.1",
@@ -6050,17 +6052,28 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C21 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/fixups.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/tests/c21_parts.rs",
+            "crates/core/tests/fixtures/c21/threaded_real.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c21-capability.txt",
+            "docs/excel-wps-audit-2026-11-12/capability-matrix.md"
+          ],
+          "not_done": [
+            "宏按钮/预测/快速填充改名；c21_parts 2 条（vbaProject 与线程批注逐字节保留）；矩阵文档已写；queryTable/customXml 未验；真实对话框未点开"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T19:01:44Z"
         }
       ]
     },

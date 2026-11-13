@@ -13106,7 +13106,7 @@ let txn = self.txn_begin(&keys);
         )?;
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!("快速填充：{}（填了 {} 格）", out.rule.label(), out.filled);
+        self.status = format!("规则快速填充：{}（填了 {} 格；按已识别规则，不是通用程序合成）", out.rule.label(), out.filled);
         Ok(self.status.clone())
     }
 
@@ -13185,7 +13185,7 @@ let txn = self.txn_begin(&keys);
         let Some(mut d) = self.fc_dlg.clone() else { return };
         let mut open = true;
         let mut ok = false;
-        ui_kit::window(ctx, "预测工作表", 430.0)
+        ui_kit::window(ctx, "线性预测工作表", 430.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -13203,7 +13203,7 @@ let txn = self.txn_begin(&keys);
                     }
                 });
                 ui.label(
-                    egui::RichText::new("用最小二乘线性回归外推；结果写到新工作表（期/原值/拟合值/预测值 + 回归参数）")
+                    egui::RichText::new("用最小二乘线性回归外推；结果写到新工作表（期/原值/拟合值/预测值 + 回归参数）。这是线性回归，不是 Excel 的 ETS/季节性预测。")
                         .size(10.5)
                         .weak(),
                 );
@@ -13323,7 +13323,7 @@ let txn = self.txn_begin(&keys);
         let Some(mut d) = self.ff_dlg.clone() else { return };
         let mut open = true;
         let mut ok = false;
-        ui_kit::window(ctx, "快速填充", 430.0)
+        ui_kit::window(ctx, "规则快速填充", 430.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -15282,7 +15282,7 @@ let txn = self.txn_begin(&keys);
                 ui.close_menu();
             }
             if ui
-                .add_enabled(self.wb.has_vba, egui::Button::new("运行宏…"))
+                .add_enabled(self.wb.has_vba, egui::Button::new("用本机 Excel 执行宏…"))
                 .on_hover_text("交给本机 Excel 执行（需要装了 Excel），跑完结果存回文件")
                 .clicked()
             {
@@ -16111,12 +16111,17 @@ let txn = self.txn_begin(&keys);
         let Some(mut text) = self.macro_run_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        ui_kit::window(ctx, "运行宏（借助本机 Excel）", 320.0)
+        ui_kit::window(ctx, "用本机 Excel 执行宏", 360.0)
             .collapsible(false)
             .resizable(false)
             .default_width(320.0)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("本应用不内置宏引擎，只把宏名转交本机 Excel 执行；不认识的宏不会自动运行。")
+                        .size(10.5)
+                        .weak(),
+                );
                 ui.label("填宏名，例如 Module1.MyMacro");
                 ui.add(
                     egui::TextEdit::singleline(&mut text)

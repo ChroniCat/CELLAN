@@ -1451,3 +1451,33 @@ fn attr_num(tag: &str, key: &str) -> Option<usize> {
     let e = rest.find('"')?;
     rest[..e].parse().ok()
 }
+
+/// 线程批注（xl/threadedComments/*、xl/persons/*）我们没建模，umya 会把
+/// person 列表清空、属性重排。保存后用基准文件里的字节原样覆盖，保证线程批注
+/// 与作者信息不退化；部件本身的存在/关系与 Content-Type 已由前面的补丁负责。
+pub fn restore_threaded_parts(path: &Path, base: &Path) -> Result<usize> {
+    if std::env::var("SC_NO_FIXUPS").is_ok() {
+        return Ok(0);
+    }
+    let mut restored = 0;
+    let names = parts(base);
+    let has_threaded = names.iter().any(|n| n.starts_with("xl/threadedComments/"));
+    for name in names {
+        let mirror_comments = has_threaded
+            && name.starts_with("xl/comments")
+            && name.ends_with(".xml");
+        if !(name.starts_with("xl/threadedComments/")
+            || name.starts_with("xl/persons/")
+            || mirror_comments)
+        {
+            continue;
+        }
+        let Some(body) = read_part_file(base, &name) else { continue };
+        if read_part_file(path, &name).as_deref() == Some(body.as_slice()) {
+            continue;
+        }
+        write_parts(path, &[(name, body)])?;
+        restored += 1;
+    }
+    Ok(restored)
+}

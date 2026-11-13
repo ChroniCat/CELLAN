@@ -2221,6 +2221,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         must_save!("fixups-workbook-rels", crate::fixups::migrate_workbook_rels(path, &restore_base));
         must_save!("fixups-drawing-props", crate::fixups::sanitize_drawings(path));
         must_save!("fixups-content-types", crate::fixups::ensure_content_types(path, &restore_base));
+        must_save!("fixups-threaded", crate::fixups::restore_threaded_parts(path, &restore_base));
     }
     // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
     let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb
