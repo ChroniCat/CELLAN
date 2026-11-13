@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `5bd5d8c`（UI-09.1 常用快捷键已提交）（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收；UI-09.2 视口翻页正在收尾。
+- 分支 `main`（`origin/main`），HEAD `188f0c9`（UI-09.1 常用快捷键已提交）（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收；UI-09.2 视口翻页正在收尾。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
   切片 35 已验收 / 23 待验收 / 90 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
