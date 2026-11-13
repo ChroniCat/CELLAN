@@ -1676,8 +1676,8 @@ impl SheetApp {
             view_new: None,
             views_open: false,
             unhide_open: false,
-            sheet_list_open: false,
-            sheet_list_query: String::new(),
+            sheet_list_open: std::env::var("SC_SHEET_LIST").map(|v| v == "1").unwrap_or(false),
+            sheet_list_query: std::env::var("SC_SHEET_LIST_Q").unwrap_or_default(),
             sheet_move_dlg: None,
             st_dlg: None,
             ff_dlg: None,
@@ -27391,7 +27391,7 @@ impl eframe::App for SheetApp {
                     // 工作表标签右键：和单元格菜单同一套自绘样式
                     if resp.secondary_clicked() {
                         if let Some(p) = resp.interact_pointer_pos() {
-                            goto = Some(i);
+                            // UI-16：右键标签只开菜单，不切活动表、不改当前选区
                             self.ctx_menu = Some(CtxMenuState {
                                 pos: p,
                                 frame: ui.ctx().cumulative_pass_nr(),

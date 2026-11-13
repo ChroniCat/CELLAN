@@ -1,0 +1,30 @@
+# UI-16 工作表切换状态与标签管理
+
+日期：2026-11-14
+
+- 所有切表入口（标签左键、工作表列表、Ctrl+PageUp/Down、隐藏后切换）统一走
+  `switch_sheet_view`：先 `commit_edit`，再 `remember_sheet_view`，按稳定 `identity`
+  存取 `SheetViewState`（sel/sel_end/extra_sel/scroll/zoom）。标签左键不再直接写
+  `sheet_idx` 和 `sel=(0,0)`。
+- 标签右键只开菜单，不再 `goto` 切表，不会用别的表替换当前选区；隐藏操作仍会先切到
+  目标表再提交/隐藏。
+- 标签菜单已有：插入/删除/重命名/复制/标签颜色、移动或复制…、隐藏工作表、取消隐藏…、
+  工作表列表…；`SheetMoveDlg` 支持移动到目标位置与复制。
+- 工作表列表（搜索）：
+  - 30 张表夹具 `work/qa16/many.xlsx`，搜索 `s25` 只列出 `S25`；
+  - 截图 `implementation-evidence/ui16/sheet-list-search.png`；
+  - 隐藏表不参与搜索，空搜索列出所有可见表。
+- 视图恢复实测（单测）：
+  - Sheet1 `Z100`、sel_end `AA101`、额外选区、scroll(123,456)、zoom 150%；
+    Sheet2 选 B2；来回切换各自恢复，不串表。
+  - 重命名后仍按 identity 恢复；删除中间表后剩余表不拿到被删表的视图。
+- 回归：
+  - `switching_sheets_restores_each_view_state`
+  - `sheet_views_survive_rename_and_delete`
+  - `sheet_list_search_finds_one_of_thirty_sheets`
+  - app `--bin app` **290 passed**。
+- 探针：`SC_SHEET_LIST`、`SC_SHEET_LIST_Q`。
+
+## 未做
+- 真实鼠标右键标签/拖动标签排序未做（RDP 注入不可用）；
+- 视图恢复只覆盖 sel/sel_end/extra_sel/scroll/zoom；工作表级打印/视图模式未纳入每个标签状态。

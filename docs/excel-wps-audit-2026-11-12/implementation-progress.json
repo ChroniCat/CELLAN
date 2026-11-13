@@ -5439,7 +5439,7 @@
       "scope": "app/main.rs SheetViewState/切表",
       "source": "ui-requirements.md",
       "heading": "UI-16 工作表切换状态与标签管理",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "每表按 identity 保存/恢复 sel、sel_end、extra_sel、scroll、zoom；标签点击、Ctrl+Page 及查找/超链接/撤销等跳转统一走切换入口；复制到前方/同位先保存原视图并按 identity 恢复；隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；标签右键菜单含移动/复制目标、隐藏/取消隐藏、工作表列表搜索；真实 GUI/Office 目视未做。",
       "files": [
         "crates/app/src/main.rs",
@@ -5468,7 +5468,7 @@
       "failures": [],
       "blocker": "",
       "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
-      "updated_utc": "2026-11-13T07:58:00Z",
+      "updated_utc": "2026-11-13T23:35:48Z",
       "slices": [
         {
           "id": "UI-16.1",
@@ -5496,16 +5496,17 @@
             "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-views.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png"
           ],
           "not_done": [
-            "真实鼠标点击标签、右键菜单各入口、移动/复制对话框、30 表列表滚动未取证",
-            "Excel/WPS 实际切表后视图保持对比未做"
+            "真实鼠标右键标签/拖动排序未做（RDP 注入不可用）",
+            "每表视图只含 sel/scroll/zoom，不含打印/视图模式"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标/Office 目视后再验收 UI-16.1。",
-          "updated_utc": "2026-11-13T07:58:00Z"
+          "updated_utc": "2026-11-13T23:35:48Z"
         }
       ]
     },

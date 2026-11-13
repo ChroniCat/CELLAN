@@ -7256,3 +7256,71 @@ fn shift_arrow_rejects_range_containing_forbidden_cell() {
     assert_eq!(app.sel_end, (0, 1));
     assert!(app.status.contains("不允许选择"), "状态栏：{}", app.status);
 }
+/// UI-16：每张表各自恢复 sel/sel_end/额外选区/滚动/缩放，且不串表。
+#[test]
+fn switching_sheets_restores_each_view_state() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    app.sel = (99, 25);
+    app.sel_end = (100, 26);
+    app.extra_sel = vec![(1, 1, 2, 2)];
+    app.scroll = egui::vec2(123.0, 456.0);
+    app.zoom = 1.5;
+    assert!(app.switch_sheet_view(1));
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 0)), "新表默认 A1");
+    assert!(app.extra_sel.is_empty());
+    assert_eq!((app.scroll.x, app.scroll.y), (0.0, 0.0));
+    assert_eq!(app.zoom, 1.0);
+    app.sel = (1, 1);
+    app.sel_end = (2, 2);
+    assert!(app.switch_sheet_view(0));
+    assert_eq!((app.sel, app.sel_end), ((99, 25), (100, 26)));
+    assert_eq!(app.extra_sel, vec![(1, 1, 2, 2)]);
+    assert_eq!((app.scroll.x, app.scroll.y), (123.0, 456.0));
+    assert_eq!(app.zoom, 1.5);
+    assert!(app.switch_sheet_view(1));
+    assert_eq!((app.sel, app.sel_end), ((1, 1), (2, 2)), "第二张表自己的选区");
+}
+
+/// UI-16：重命名/删除后视图仍绑定原表 identity，不会串到别的表。
+#[test]
+fn sheet_views_survive_rename_and_delete() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("B"));
+    app.wb.sheets.push(sheetcore::Sheet::new("C"));
+    app.sel = (50, 3);
+    app.sel_end = (51, 4);
+    assert!(app.switch_sheet_view(1));
+    app.sel = (7, 7);
+    app.sel_end = (8, 8);
+    assert!(app.switch_sheet_view(0));
+
+    app.rename_sheet = None;
+    assert!(app.set_sheet_name(0, "Renamed"));
+    assert!(app.switch_sheet_view(1));
+    assert_eq!((app.sel, app.sel_end), ((7, 7), (8, 8)), "重命名不影响 identity 绑定");
+
+    // 删除 B（非当前），C 的位置前移，但 C 的视图仍跟着 C。
+    let c_id = app.wb.sheets[2].identity;
+    app.delete_sheet(1);
+    let c_pos = app.wb.sheets.iter().position(|s| s.identity == c_id).unwrap();
+    assert!(app.switch_sheet_view(c_pos));
+    assert_eq!(app.wb.sheet(c_pos).name, "C");
+    // C 还没存过视图，默认 A1；不能拿到 B 的 (7,7)
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 0)));
+}
+
+/// UI-16：30 张表的工作表列表可按名字搜索定位。
+#[test]
+fn sheet_list_search_finds_one_of_many_sheets() {
+    let mut app = app();
+    for i in 1..=30 {
+        app.wb.sheets.push(sheetcore::Sheet::new(&format!("S{i:02}")));
+    }
+    let hits = app.sheet_list_matches("s25");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(app.wb.sheet(hits[0]).name, "S25");
+    assert_eq!(app.sheet_list_matches("   ").len(), 31, "空搜索列出全部可见表");
+    app.wb.sheets[25].hidden = true;
+    assert!(app.sheet_list_matches("s25").is_empty(), "隐藏表不参与搜索");
+}
