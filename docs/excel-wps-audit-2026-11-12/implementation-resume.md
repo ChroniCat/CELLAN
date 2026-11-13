@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `35f1149`；本轮 C11 复核修复和 C10.2/C10.3 尚未提交。
+- 分支 `main`（`origin/main`），HEAD `e846d75`；C11/C10 复核修复与 UTF-8 回归已提交。
 - 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
   切片 31 已验收 / 20 待验收 / 97 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
 - 当前测试真值（11:38 UTF-8 回归修复后重跑）：core 72 bins /
