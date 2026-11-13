@@ -46,6 +46,25 @@ fn file_candidates(name: &str) -> Vec<&'static str> {
     }
 }
 
+/// 真实粗体文件；没有粗体字面的字体（宋体/黑体）返回空，由调用方决定是否合成。
+fn bold_file_candidates(name: &str) -> Vec<&'static str> {
+    match norm(name).as_str() {
+        "微软雅黑" | "microsoftyahei" | "microsoftyaheiui" => vec!["msyhbd.ttc"],
+        "等线" | "dengxian" => vec!["Dengb.ttf"],
+        "arial" => vec!["arialbd.ttf"],
+        "calibri" => vec!["calibrib.ttf"],
+        "timesnewroman" | "times" => vec!["timesbd.ttf"],
+        "cambria" => vec!["cambriab.ttf"],
+        "consolas" => vec!["consolab.ttf"],
+        "segoeui" => vec!["segoeuib.ttf"],
+        "verdana" => vec!["verdanab.ttf"],
+        "tahoma" => vec!["tahomabd.ttf"],
+        "georgia" => vec!["georgiab.ttf"],
+        "couriernew" => vec!["courbd.ttf"],
+        _ => vec![],
+    }
+}
+
 fn fonts_dir() -> std::path::PathBuf {
     let win = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     std::path::PathBuf::from(win).join("Fonts")
@@ -74,8 +93,16 @@ fn face_index(data: &[u8], want: &str) -> Option<u32> {
 }
 
 pub fn load(name: &str) -> Option<(Vec<u8>, u32)> {
+    load_from(&file_candidates(name), name)
+}
+
+pub fn load_bold(name: &str) -> Option<(Vec<u8>, u32)> {
+    load_from(&bold_file_candidates(name), name)
+}
+
+fn load_from(files: &[&str], name: &str) -> Option<(Vec<u8>, u32)> {
     let dir = fonts_dir();
-    for f in file_candidates(name) {
+    for f in files {
         let p = dir.join(f);
         if let Ok(data) = std::fs::read(&p) {
             let idx = face_index(&data, name).unwrap_or(0);
@@ -92,12 +119,25 @@ struct Loaded {
 
 static LOADED: OnceLock<Mutex<HashMap<String, Loaded>>> = OnceLock::new();
 /// 已写入 FontDefinitions 但 egui 要到下一帧才生效的字体。
+static BOLD_LOADED: OnceLock<Mutex<HashMap<String, Loaded>>> = OnceLock::new();
 static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// 当前帧真正可用的系统字体（egui 已装载）。
 static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn loaded() -> &'static Mutex<HashMap<String, Loaded>> {
     LOADED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn is_bold_loaded(name: &str) -> bool {
+    ACTIVE
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|m| m.contains(&format!("bold:{}", norm(name))))
+        .unwrap_or(false)
+}
+
+pub fn bold_family_key(name: &str) -> String {
+    format!("sysbold:{}", norm(name))
 }
 
 pub fn is_loaded(name: &str) -> bool {
@@ -109,6 +149,10 @@ pub fn is_loaded(name: &str) -> bool {
 }
 
 /// 每帧开头调用：上一帧 `set_fonts` 的字体在这一帧真正可用。
+fn pending() -> &'static Mutex<HashSet<String>> {
+    PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 pub fn begin_frame() {
     let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
     let pending = PENDING.get_or_init(|| Mutex::new(HashSet::new()));
@@ -140,6 +184,15 @@ pub fn ensure(names: &[String]) -> bool {
             map.insert(key, Loaded { data: data.into(), index });
             changed = true;
         }
+        if let Some((data, index)) = load_bold(n) {
+            if let Ok(mut b) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                if !b.contains_key(&norm(n)) {
+                    b.insert(norm(n), Loaded { data: data.into(), index });
+                    changed = true;
+                    pending().lock().map(|mut p| p.insert(format!("bold:{}", norm(n))));
+                }
+            }
+        }
     }
     if std::env::var("SC_FONT_LOG").is_ok() {
         eprintln!("[fonts] ensure changed={} size={}", changed, map.len());
@@ -169,10 +222,20 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
         fonts
             .families
             .insert(egui::FontFamily::Name(key.clone().into()), vec![key.clone()]);
-        PENDING
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .map(|mut p| p.insert(name.clone()));
+        pending().lock().map(|mut p| p.insert(name.clone()));
+    }
+    if let Ok(bold) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        for (name, f) in bold.iter() {
+            let key = format!("sysbold:{name}");
+            fonts.font_data.insert(
+                key.clone(),
+                FontData { font: std::borrow::Cow::Owned(f.data.to_vec()), index: f.index, tweak: Default::default() }.into(),
+            );
+            fonts
+                .families
+                .insert(egui::FontFamily::Name(key.clone().into()), vec![key.clone()]);
+            pending().lock().map(|mut p| p.insert(format!("bold:{name}")));
+        }
     }
 }
 
@@ -189,6 +252,13 @@ mod tests {
         assert_eq!(face_index(&data, "微软雅黑"), Some(idx));
         let (data, idx) = load("Arial").expect("本机应有 arial.ttf");
         assert_eq!(face_index(&data, "Arial"), Some(idx));
+    }
+
+    #[test]
+    fn loads_real_bold_face_when_present() {
+        let (data, idx) = load_bold("微软雅黑").expect("本机应有 msyhbd.ttc");
+        assert_eq!(face_index(&data, "微软雅黑"), Some(idx));
+        assert!(load_bold("宋体").is_none(), "宋体没有粗体字面");
     }
 
     #[test]

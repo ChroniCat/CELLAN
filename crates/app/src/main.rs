@@ -5019,8 +5019,12 @@ impl SheetApp {
             // 和绘制用同一套字号/字族，量出来的才是真宽度
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0
                 * self.paint_scale;
-            let fam = cell_family(if st.font.is_empty() { "默认" } else { &st.font });
-            let font = egui::FontId::new(if st.bold { size + 0.8 } else { size }, fam);
+            let fname = if st.font.is_empty() { "默认" } else { &st.font };
+            let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
+            let font = egui::FontId::new(
+                if st.bold && !system_fonts::is_bold_loaded(fname) { size + 0.8 } else { size },
+                fam,
+            );
             let w = ctx.fonts(|f| {
                 f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
                     .size()
@@ -5076,8 +5080,12 @@ impl SheetApp {
             }
             let size =
                 (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0 * self.paint_scale;
-            let fam = cell_family(if st.font.is_empty() { "默认" } else { &st.font });
-            let font = egui::FontId::new(if st.bold { size + 0.8 } else { size }, fam);
+            let fname = if st.font.is_empty() { "默认" } else { &st.font };
+            let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
+            let font = egui::FontId::new(
+                if st.bold && !system_fonts::is_bold_loaded(fname) { size + 0.8 } else { size },
+                fam,
+            );
             let col_w = self.wb.sheet(self.sheet_idx).cols.size(c);
             let h = if st.wrap {
                 ctx.fonts(|f| {
@@ -16068,11 +16076,12 @@ let txn = self.txn_begin(&keys);
                 }
                 // 条件格式里指定的字体优先，其次单元格样式；未知字体回退默认
                 let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
-                let family = cell_family(font_name);
+                let bold = st.bold || cf_bold || table_header;
+                let family = if bold { cell_bold_family(font_name) } else { cell_family(font_name) };
                 // 样式里的 size 是磅值（Excel 的 11 磅 ≈ 14.7px），画到屏幕上要换算
                 let fs = (st.size * 4.0 / 3.0 * self.paint_scale).max(5.0);
                 let font = FontId::new(
-                    if st.bold || cf_bold || table_header { fs + 0.8 } else { fs },
+                    if bold && !system_fonts::is_bold_loaded(font_name) { fs + 0.8 } else { fs },
                     family.clone(),
                 );
                 let is_link = self
@@ -16110,6 +16119,11 @@ let txn = self.txn_begin(&keys);
                         .layout_no_wrap(txt.clone(), font.clone(), color)
                         .size()
                         .x;
+                    let fam_dbg = if bold && system_fonts::is_bold_loaded(font_name) {
+                        system_fonts::bold_family_key(font_name)
+                    } else {
+                        sheetcore::style::font_class(font_name).key().to_string()
+                    };
                     dump.push(format!(
                         "text ({},{}) {:?} at=({:.0},{:.0}) rgb={:?} size={:.1} bold={} font={:?} family={} w={:.1}",
                         r,
@@ -16121,7 +16135,7 @@ let txn = self.txn_begin(&keys);
                         st.size,
                         st.bold,
                         font_name,
-                        sheetcore::style::font_class(font_name).key(),
+                        fam_dbg,
                         w
                     ));
                 }
@@ -16145,9 +16159,13 @@ let txn = self.txn_begin(&keys);
                             let size = (run.size.unwrap_or(st.size) * 4.0 / 3.0
                                 * self.paint_scale)
                                 .max(5.0);
-                            let fam = cell_family(run.font.as_deref().unwrap_or(font_name));
+                            let run_name = run.font.as_deref().unwrap_or(font_name);
+                            let fam = if run.bold { cell_bold_family(run_name) } else { cell_family(run_name) };
                             (
-                                FontId::new(if run.bold { size + 0.8 } else { size }, fam),
+                                FontId::new(
+                                    if run.bold && !system_fonts::is_bold_loaded(run_name) { size + 0.8 } else { size },
+                                    fam,
+                                ),
                                 run.color
                                     .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
                                     .unwrap_or(color),
@@ -27659,6 +27677,26 @@ fn cell_family(name: &str) -> egui::FontFamily {
         return family_named(&system_fonts::family_key(name));
     }
     family_named(sheetcore::style::font_class(name).key())
+}
+
+/// 真实粗体族；字体没有粗体字面时仍用常规族（调用方保留尺寸补偿）。
+fn cell_bold_family(name: &str) -> egui::FontFamily {
+    if std::env::var("SC_FONT_LOG").is_ok() {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+            std::sync::OnceLock::new();
+        let m = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let now = system_fonts::is_bold_loaded(name);
+        if let Ok(mut m) = m.lock() {
+            if m.get(name) != Some(&now) {
+                m.insert(name.to_string(), now);
+                eprintln!("[fonts] bold {:?} real={}", name, now);
+            }
+        }
+    }
+    if system_fonts::is_bold_loaded(name) {
+        return family_named(&system_fonts::bold_family_key(name));
+    }
+    cell_family(name)
 }
 
 /// Excel 的 General 对齐：文本靠左，数字（含日期）靠右，布尔和错误居中。

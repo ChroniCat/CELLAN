@@ -5207,17 +5207,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/system_fonts.rs",
+            "crates/app/src/main.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-bold.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/real-bold.png"
+          ],
+          "not_done": [
+            "宋体/黑体无粗体字面仍合成",
+            "未按 ascent/descent 精算行高",
+            "PDF 粗体仍描边模拟"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T22:52:19Z"
         },
         {
           "id": "UI-14.3",
