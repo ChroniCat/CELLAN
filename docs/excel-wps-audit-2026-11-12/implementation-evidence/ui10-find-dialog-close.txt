@@ -111,3 +111,40 @@ B4/C3 空）重新跑一遍，不使用旧 C3 结果代替：
 - `cargo test -p sheetcore --offline` → **75 bins / 679 passed / 0 failed / 41 ignored**，CORE_EXIT=0。
 - `cargo build -p app --offline --no-default-features --features glow` → BUILD_EXIT=0。
 - 代码提交：`649828c fix: keep grid inert under find dialog and release focus on close`。
+
+## 17:25 追加：关闭按钮获得焦点时单个 Enter 的残余键路径
+
+监督指出 `egui 0.31 context.rs:1262` 的 `key_pressed` 只把 `clicked` 置真、
+不消费 Enter；`find_dialog` 关闭后 `stop_text_input()` 让同帧
+`ctx.wants_keyboard_input()` 变假，`update` 后段 `handle_keys` 会把同一个 Enter
+推进网格。该路径与鼠标关闭不同，必须单独覆盖。
+
+修复：`update` 中网格键盘处理改为
+
+```rust
+if !self.backstage && !self.dialog_modal {
+    self.handle_keys(ctx);
+}
+```
+
+`dialog_modal` 在帧首保存 `find.open`，因此关闭帧仍为 true：该帧既不处理指针，
+也不处理网格键盘；下一帧才恢复。
+
+真实 egui 窗口事件回归（`ui_frame` 走完整 `eframe::App::update`，不是直接调
+`handle_keys`）：`enter_on_focused_dialog_close_does_not_advance_selection`
+
+1. B2 填 `old`，`sel=(1,1)`；打开查找/替换框。
+2. 先跑一帧画出对话框；用真实 `egui::Id::new(("dlgwin", "查找与替换")).with("close")`
+   `request_focus`，把焦点放到标题栏关闭按钮（与 Tab 到达同一控件 Id）。
+3. 发送单个 Enter：对话框关闭，选区仍为 B2，没有推进到 B3。
+4. 下一帧发送文本 `9`，再发 Enter：B2 从 `old` 变为 `Number(9.0)`，
+   证明关闭后键盘焦点确实回到网格，而非被隐藏控件吞掉。
+
+负向验证：临时移除 `&& !self.dialog_modal` 后同一测试 FAILED（`ui10_enter_neg.log`），
+恢复后 1 passed。
+
+### 回归结果
+- 专项 `enter_on_focused_dialog_close_does_not_advance_selection` → 1 passed。
+- 全量 app → **232 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+- core 仍为 679 passed / 0 failed / 41 ignored；build glow EXIT=0。
+- 代码提交：`14b36af fix: consume dialog-closing Enter before grid navigation`。

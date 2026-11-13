@@ -4123,7 +4123,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-10 查找对话框按钮和默认页签",
       "status": "待验收",
-      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。",
+      "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
@@ -4131,7 +4131,8 @@
       "commits": [
         "cb628f6",
         "e8a52d7",
-        "649828c"
+        "649828c",
+        "14b36af"
       ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4144,7 +4145,10 @@
         "cargo test -p app --offline --no-default-features --features glow --bin app modal_dialog_click_does_not_select_grid_behind -> 1 passed",
         "cargo test -p app --offline --no-default-features --features glow --bin app -> 231 passed / 0 failed / 0 ignored / APP_EXIT=0",
         "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored / CORE_EXIT=0",
-        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
+        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
+        "cargo test -p app --offline --no-default-features --features glow --bin app enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed",
+        "cargo test -p app --offline --no-default-features --features glow --bin app -> 232 passed / 0 failed / 0 ignored / APP_EXIT=0",
+        "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
@@ -4166,7 +4170,7 @@
       "failures": [],
       "blocker": "",
       "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-      "updated_utc": "2026-11-13T09:05:00Z",
+      "updated_utc": "2026-11-13T09:30:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4175,7 +4179,7 @@
           "acceptance_source": "ui-requirements.md / UI-10 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。",
+          "acceptance": "Ctrl+H 直接打开“替换”页（find.tab=1），Ctrl+F 打开“查找”页（tab=0）；关闭再重开保留已有 find/replace 输入，不再清空替换文本；查找对话框底部关闭、右上角×、Esc 都走局部 close/open 意图，末尾统一写回，不再被覆盖；名称管理器和加载问题窗口的同类末尾覆盖一并修复。专项覆盖页签与输入保留；全量 app 212 passed。 17:05 真实键鼠闭环：原活动格 B3→Ctrl+H→底栏关闭→8/Enter→B3=8 且只移到 B4→保存重载邻格不变；modal 点击穿透与关闭后焦点两个缺陷已修并回归。 17:25 补充真实 egui 焦点关闭按钮+单 Enter 回归：对话框关闭后原选区不动，下一帧文本 9+Enter 写回 B2；移除键盘门禁的负向测试 FAILED。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -4183,7 +4187,8 @@
           "commits": [
             "cb628f6",
             "e8a52d7",
-            "649828c"
+            "649828c",
+            "14b36af"
           ],
           "commands": [
             "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4191,7 +4196,10 @@
             "cargo test -p app --offline --no-default-features --features glow --bin app modal_dialog_click_does_not_select_grid_behind -> 1 passed",
             "cargo test -p app --offline --no-default-features --features glow --bin app -> 231 passed / 0 failed / 0 ignored / APP_EXIT=0",
             "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored / CORE_EXIT=0",
-            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
+            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
+            "cargo test -p app --offline --no-default-features --features glow --bin app enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed",
+            "cargo test -p app --offline --no-default-features --features glow --bin app -> 232 passed / 0 failed / 0 ignored / APP_EXIT=0",
+            "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
@@ -4213,7 +4221,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-          "updated_utc": "2026-11-13T09:05:00Z"
+          "updated_utc": "2026-11-13T09:30:00Z"
         }
       ]
     },
