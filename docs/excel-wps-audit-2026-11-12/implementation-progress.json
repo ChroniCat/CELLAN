@@ -1742,7 +1742,8 @@
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "c0af4a3"
+        "c0af4a3",
+        "e81c221"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test search_matches",
@@ -1770,7 +1771,7 @@
       "failures": [],
       "blocker": "",
       "next": "补真实键鼠点击查找对话框/取消/结果跳转，以及单次查找可取消；Ribbon 新会话清快照已完成。",
-      "updated_utc": "2026-11-13T06:10:00Z",
+      "updated_utc": "2026-11-13T06:12:00Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -1888,7 +1889,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "e81c221"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test search_matches",
             "cargo test -p app --no-default-features --features glow --offline --bin app -- find_selection_scope",
@@ -3283,7 +3286,9 @@
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
-      "commits": [],
+      "commits": [
+        "e81c221"
+      ],
       "commands": [
         "cargo test -p app --offline --bin app general_text_alignment_matches_excel_and_explicit_alignment_wins -> 1 passed",
         "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored"
@@ -3298,7 +3303,7 @@
       "failures": [],
       "blocker": "",
       "next": "补长文本裁剪/溢出切换截图，并在不干扰现有 Excel 实例的条件下做 Excel 同位置对拍。",
-      "updated_utc": "2026-11-13T06:10:00Z",
+      "updated_utc": "2026-11-13T06:12:00Z",
       "slices": [
         {
           "id": "C22.1",
@@ -3312,7 +3317,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "e81c221"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app general_text_alignment_matches_excel_and_explicit_alignment_wins -> 1 passed"
           ],

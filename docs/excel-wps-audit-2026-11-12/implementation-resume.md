@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `c0af4a3`（UI-05 多选区查找已提交）；14:07 的 Ribbon 新会话修复与 C22 对齐尚未提交，见文末。
+- 分支 `main`（`origin/main`），HEAD `e81c221`（Ribbon 新会话清快照 + C22 General 对齐已提交）；C11 父项已验收。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；
   切片 35 已验收 / 19 待验收 / 94 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
@@ -398,7 +398,7 @@
 - 当前全量：app **207 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
   **75 bins / 678 passed / 0 failed / 41 ignored**。
 - 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
-- 尚未提交：`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
-  resume、c11-final-acceptance、ui05-ribbon-session、c22-general-alignment 与截图。
+- 已提交：`e81c221`（`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
+  resume、c11-final-acceptance、ui05-ribbon-session、c22-general-alignment）。
 - 下一步：提交/推送本批，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
   其余 P0/P1 任务）。
