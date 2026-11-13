@@ -66,3 +66,28 @@ sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
   两页均有标题行 2026 与页码 1/2、2/2；120/1.5/180.00、TRUE、行 2..60 数值齐全。
 - 未改动原始 xlsx（只读导出）；纸张 A4 纵向、页边距 0.75/0.75/1/1 与设置一致。
 - 仍缺：WPS PDF 对拍（QA-09.3）、PDF 页面位图渲染目视、字体子集体积优化。
+
+## QA-09.2 / QA-09.3 三方 PDF 对拍（2026-11-14）
+工具：PyMuPDF 2.1（`uv run --with pymupdf`），110dpi 渲染 + `get_text('words')`。
+
+### print.xlsx（数字/分页/标题）
+- 三份 PDF 均 2 页：本项目 `ours3.pdf`、Excel `excel2.pdf`、WPS `wps.pdf`。
+- 本项目与 WPS 的逐页文本**完全相等**（`ours_vs_wps_equal=true`）；与 Excel 词数相同
+  （p1 188、p2 60）、行标签数相同（39/12）、标题每页 1 次、无重复行、页码正确，
+  仅 Excel 第 1 页标题的提取顺序不同。
+- 三份均 0 个 word 越出页面边界；第 1 页尾行 48、第 2 页首行 49。
+- 像素对 Excel 的 MAE：p1 10.4、p2 3.8；对 WPS：p1 6.9、p2 2.6（字体渲染差异）。
+- 渲染图：`implementation-evidence/qa09/{ours3,excel2,wps}-p1.png`、`-p2.png`。
+
+### objects3.xlsx（对象 + 重复标题）
+- 本项目 `obj3c.pdf`：2 页；两页文本都以「科目报表」开头（各 1 次），
+  图片资源 1 个；第 1 页含 12/18/9、201.. 第 2 页 551..554，无缺行。
+- Excel 对该文件因 FitToPages 自动行为只导出 1 页，不作分页基准，仅用于对象存在性。
+
+### 指标 JSON
+`implementation-evidence/qa09/qa093.json`：pages/words/outside/title/rows/row_dup/pageno/images
+及 `ours_vs_wps_equal`、`ours_vs_excel_equal`。
+
+### 未做
+- 人工目视判读（vision 连续超时）；像素指标与文本层已覆盖，但没有“看图”结论。
+- 字体子集体积（4.4MB vs Excel 80KB）未优化；WPS 与 Excel 的字体回退差异未建模。

@@ -1,0 +1,90 @@
+{
+ "ours3": {
+  "pages": 2,
+  "detail": [
+   {
+    "page": 1,
+    "words": 188,
+    "outside": 0,
+    "title": 1,
+    "rows": 39,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   },
+   {
+    "page": 2,
+    "words": 60,
+    "outside": 0,
+    "title": 1,
+    "rows": 12,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   }
+  ]
+ },
+ "excel2": {
+  "pages": 2,
+  "detail": [
+   {
+    "page": 1,
+    "words": 188,
+    "outside": 0,
+    "title": 1,
+    "rows": 39,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   },
+   {
+    "page": 2,
+    "words": 60,
+    "outside": 0,
+    "title": 1,
+    "rows": 12,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   }
+  ]
+ },
+ "wps": {
+  "pages": 2,
+  "detail": [
+   {
+    "page": 1,
+    "words": 188,
+    "outside": 0,
+    "title": 1,
+    "rows": 39,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   },
+   {
+    "page": 2,
+    "words": 60,
+    "outside": 0,
+    "title": 1,
+    "rows": 12,
+    "row_dup": 0,
+    "pageno": true,
+    "images": 0
+   }
+  ]
+ },
+ "ours_vs_wps_equal": true,
+ "ours_vs_excel_equal": false,
+ "obj3c": {
+  "pages": 2,
+  "titles": [
+   1,
+   1
+  ],
+  "images": [
+   1,
+   1
+  ]
+ }
+}
