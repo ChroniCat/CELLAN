@@ -46,7 +46,8 @@ def inspect(product: str, path: Path, kind: str) -> tuple[dict | None, str | Non
                 "print_area": str(sheet.PageSetup.PrintArea),
                 "title_rows": str(sheet.PageSetup.PrintTitleRows),
                 "left_margin": float(sheet.PageSetup.LeftMargin),
-                "gridlines": bool(app.ActiveWindow.DisplayGridlines),
+                # 打印网格线，不是窗口屏幕网格线（ActiveWindow.DisplayGridlines）
+                "print_gridlines": bool(sheet.PageSetup.PrintGridlines),
             },
         }
         if kind == "chart":
@@ -127,7 +128,11 @@ def main() -> None:
     parser.add_argument("--core-exe", default="target/debug/examples/qa01_roundtrip.exe")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--kinds", default="chart,page", help="comma-separated: chart,page")
     args = parser.parse_args()
+    kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
+    if not kinds or any(k not in ("chart", "page") for k in kinds):
+        raise SystemExit(f"invalid --kinds: {args.kinds}")
     fixtures = Path(args.fixtures).resolve()
     core_exe = Path(args.core_exe).resolve()
     out_dir = Path(args.out_dir).resolve()
@@ -144,7 +149,7 @@ def main() -> None:
     out_json.parent.mkdir(parents=True, exist_ok=True)
 
     cases = []
-    for kind in ["chart", "page"]:
+    for kind in kinds:
         src_fixture = fixtures / f"{kind}.xlsx"
         if not src_fixture.exists():
             raise SystemExit(f"fixture missing: {src_fixture}")
@@ -181,6 +186,7 @@ def main() -> None:
                                 "zoom": 85,
                                 "print_area": "$A$1:$H$40",
                                 "title_rows": "$1:$2",
+                                "print_gridlines": True,
                             }.items():
                                 got = target_info["page"][key]
                                 if str(got) != str(want):

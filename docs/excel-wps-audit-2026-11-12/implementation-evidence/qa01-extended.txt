@@ -63,3 +63,25 @@ title_rows=`$1:$2`、left_margin=36pt（0.5in）、gridlines=true。
 证据：`implementation-evidence/qa01-extended-roundtrip.json`（逐路径命令、SHA-256、
 版本、对象/页面属性、差异数组）。这仍是快速路径，不等同于人工目视矩阵，
 也不把透视结果表当真实 pivotTable；父项仍未完成。
+
+## 20:25 CST print_gridlines 修正（监督复核）
+
+原脚本的 `page.gridlines` 读 `Application.ActiveWindow.DisplayGridlines`，是**屏幕窗口**
+的网格线显示状态，不是打印设置；比较字典也没有这个字段，所以实际没有断言。
+现改为：
+
+- `sheet.PageSetup.PrintGridlines`，JSON 字段名 `print_gridlines`（不再保留屏幕字段的误导名）；
+- 页面比较字典加入 `"print_gridlines": True`，三路径都必须为真才 `status=pass`。
+
+只重跑原 page 三条路径（不扩展 chart/矩阵）：
+
+```text
+python scripts/qa01_extended_roundtrip.py --kinds page ...
+-> 3 cases, status=pass
+page-excel-project-excel: print_gridlines src=True tgt=True, differences=[]
+page-wps-project-wps: print_gridlines src=True tgt=True, differences=[]
+page-excel-project-wps: print_gridlines src=True tgt=True, differences=[]
+```
+
+证据：`qa01-extended-roundtrip-page-gridlines.json`（本次 3 条 page 路径），
+原 `qa01-extended-roundtrip.json` 保留 6 条 chart/page 历史结果不覆盖。
