@@ -49,6 +49,7 @@ pub fn chart_from_selection(
             cat_ref: format!("'{}'!${}${}:${}${}", sheet_name, cat_col, r1 + 2, cat_col, r2 + 1),
             val_ref: format!("'{}'!${}${}:${}${}", sheet_name, range_col, r1 + 2, range_col, r2 + 1),
             color: None,
+            xv: Vec::new(),
             kind: None,
             secondary: false,
         });
@@ -66,6 +67,7 @@ pub fn chart_from_selection(
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt: String::new(),
         y_min: None,
         y_max: None,
     }
@@ -207,6 +209,19 @@ fn axis_fix(mut xml: String, ch: &crate::charts::Chart) -> String {
             "<c:axPos val=\"b\"/>",
             &format!("<c:axPos val=\"b\"/>{}", title(&ch.axis_x)),
         );
+    }
+    if !ch.y_fmt.is_empty() {
+        let nf = format!(
+            "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
+            esc(&ch.y_fmt)
+        );
+        let at = xml
+            .find("<c:majorGridlines/>")
+            .map(|p| p + "<c:majorGridlines/>".len())
+            .or_else(|| xml.find("<c:axPos val=\"l\"/>").map(|p| p + "<c:axPos val=\"l\"/>".len()));
+        if let Some(p) = at {
+            xml.insert_str(p, &nf);
+        }
     }
     if !ch.axis_y.is_empty() {
         xml = xml.replace(

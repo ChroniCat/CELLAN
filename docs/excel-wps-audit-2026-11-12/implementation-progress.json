@@ -5927,7 +5927,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T19:33:22Z",
+      "updated_utc": "2026-11-13T19:44:26Z",
       "slices": [
         {
           "id": "C19.1",
@@ -5935,17 +5935,27 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C19 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/charts.rs",
+            "crates/core/src/print.rs",
+            "crates/core/src/chart_write.rs",
+            "crates/core/tests/c19_axes.rs",
+            "fixtures/c19/axes.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-axes.txt"
+          ],
+          "not_done": [
+            "轴格式/整齐刻度/散点非等距X/负数空白错误值/保存保真已验；逐系列引用编辑入口与数据标签逐项选项未做；真实键鼠未执行"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T19:44:26Z"
         },
         {
           "id": "C19.2",

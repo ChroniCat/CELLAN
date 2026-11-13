@@ -620,6 +620,7 @@ fn chart_selection_exposes_the_chart_tools_tab() {
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt: String::new(),
         y_min: None,
         y_max: None,
     };
@@ -674,6 +675,7 @@ fn dragging_a_chart_moves_its_anchor_and_marks_dirty() {
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt: String::new(),
         y_min: None,
         y_max: None,
     };

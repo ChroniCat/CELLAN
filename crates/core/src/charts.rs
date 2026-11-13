@@ -51,6 +51,8 @@ pub struct Series {
     pub val_ref: String,
     /// 系列颜色（None = 用默认调色板）
     pub color: Option<[u8; 3]>,
+    /// 散点图的 X 值（xVal）；其它图型为空
+    pub xv: Vec<f64>,
     /// 该系列自己的图型（组合图里柱/线混排）；None = 跟随图表主类型
     pub kind: Option<ChartKind>,
     /// 是否画在次坐标轴（axId 与主轴不同）
@@ -79,6 +81,8 @@ pub struct Chart {
     pub axis_x: String,
     /// Y 轴标题
     pub axis_y: String,
+    /// 数值轴数字格式（valAx 的 numFmt formatCode），空 = 常规
+    pub y_fmt: String,
     /// Y 轴范围（None = 自动）
     pub y_min: Option<f64>,
     pub y_max: Option<f64>,
@@ -511,6 +515,10 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     // 当前 chart 容器（barChart/lineChart…）：类型、axId、起始系列号
     let mut plot: Option<(ChartKind, Vec<String>, usize)> = None;
     let mut plot_dir = String::new();
+    let mut in_x = false;
+    let mut in_valax = false;
+    let mut y_fmt = String::new();
+    let mut pt_idx: Option<usize> = None;
     let mut containers: Vec<(usize, usize, Vec<String>)> = Vec::new();
 
     loop {
@@ -556,10 +564,25 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                             cur = Some(Series::default());
                         }
                     }
+                    "pt" => {
+                        pt_idx = None;
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref() == "idx"
+                                || a.key.as_ref().ends_with(":idx")
+                                || a.key.as_ref().ends_with("idx")
+                            {
+                                pt_idx = crate::model::xml_unescape(&a.value.to_string())
+                                    .parse::<usize>()
+                                    .ok();
+                            }
+                        }
+                    }
                     "tx" => in_tx = true,
                     "f" => in_f = true,
                     "cat" => in_cat = true,
                     "val" | "yVal" => in_val = true,
+                    "xVal" => in_x = true,
+                    "valAx" => in_valax = true,
                     "dLbls" => in_dlbls = true,
                     "title" => in_title = true,
                     "legend" => legend = true,
@@ -593,6 +616,12 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                         if a.key.as_ref().ends_with("val") {
                             bar_dir = crate::model::xml_unescape(&a.value.to_string());
                             plot_dir = bar_dir.clone();
+                        }
+                    }
+                } else if name == "numFmt" && in_valax && y_fmt.is_empty() {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("formatCode") {
+                            y_fmt = crate::model::xml_unescape(&a.value.to_string());
                         }
                     }
                 } else if name == "axId" {
@@ -631,6 +660,8 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                     "tx" => in_tx = false,
                     "cat" => in_cat = false,
                     "val" | "yVal" => in_val = false,
+                    "xVal" => in_x = false,
+                    "valAx" => in_valax = false,
                     "title" => in_title = false,
                     "f" => {
                         in_f = false;
@@ -659,10 +690,37 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                             if in_tx && s.name.is_empty() {
                                 s.name = text.clone();
                             } else if in_cat {
-                                s.cats.push(text.clone());
+                                match pt_idx {
+                                    Some(i) => {
+                                        if s.cats.len() <= i {
+                                            s.cats.resize(i + 1, String::new());
+                                        }
+                                        s.cats[i] = text.clone();
+                                    }
+                                    None => s.cats.push(text.clone()),
+                                }
+                            } else if in_x {
+                                // 空值被 Excel 整个省掉，按 pt/@idx 放回原位，后面的值不会左移
+                                let v = text.parse::<f64>().unwrap_or(f64::NAN);
+                                match pt_idx {
+                                    Some(i) => {
+                                        if s.xv.len() <= i {
+                                            s.xv.resize(i + 1, f64::NAN);
+                                        }
+                                        s.xv[i] = v;
+                                    }
+                                    None => s.xv.push(v),
+                                }
                             } else if in_val {
-                                if let Ok(v) = text.parse::<f64>() {
-                                    s.vals.push(v);
+                                let v = text.parse::<f64>().unwrap_or(f64::NAN);
+                                match pt_idx {
+                                    Some(i) => {
+                                        if s.vals.len() <= i {
+                                            s.vals.resize(i + 1, f64::NAN);
+                                        }
+                                        s.vals[i] = v;
+                                    }
+                                    None => s.vals.push(v),
                                 }
                             }
                         } else if in_title && title.is_empty() {
@@ -717,6 +775,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt,
         y_min: None,
         y_max: None,
     };

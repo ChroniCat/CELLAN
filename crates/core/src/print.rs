@@ -455,10 +455,40 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
             .fold(0.0f64, f64::max)
             .max(1e-9)
     };
-    let max_main = max_of(false);
-    let max_sub = max_of(true);
+    let max_main = nice_max(max_of(false));
+    let max_sub = nice_max(max_of(true));
     let has_sub = ch.series.iter().any(|s| s.secondary);
     let n = ch.series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
+    if !matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut) {
+        // 数值轴刻度：按轴的数字格式显示（百分比轴显示 25% 而不是 0.25）
+        let tick = |v: f64| -> String {
+            if ch.y_fmt.is_empty() {
+                crate::model::format_number(v)
+            } else {
+                crate::style::format_value(&crate::model::Value::Number(v), &ch.y_fmt)
+            }
+        };
+        for k in 0..=4 {
+            let v = max_main * k as f64 / 4.0;
+            let txt = tick(v);
+            let tw = display::text_width(&txt, 7.0);
+            chart_text(out, px0 - tw - 3.0, py0 + ph * (k as f32 / 4.0) - 2.5, 7.0, &txt, [90, 90, 90]);
+        }
+        // 分类标签（散点用数值 X 轴，不画分类名）
+        let scatter = ch
+            .series
+            .iter()
+            .all(|se| matches!(series_kind(se, ch.kind), ChartKind::Scatter));
+        if !scatter && n > 0 && n <= 12 {
+            let gw = pw / n as f32;
+            if let Some(cats) = ch.series.iter().map(|se| &se.cats).find(|c| !c.is_empty()) {
+                for (i, c) in cats.iter().take(n).enumerate() {
+                    let tw = display::text_width(c, 7.0);
+                    chart_text(out, px0 + gw * (i as f32 + 0.5) - tw / 2.0, py0 - 9.0, 7.0, c, [90, 90, 90]);
+                }
+            }
+        }
+    }
     if matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut) {
         let vals = ch.series.first().map(|s| s.vals.clone()).unwrap_or_default();
         let total: f64 = vals.iter().sum::<f64>().max(1e-9);
@@ -498,16 +528,29 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
             let scale = if se.secondary { max_sub } else { max_main };
             match series_kind(se, ch.kind) {
                 ChartKind::Line | ChartKind::Scatter => {
-                    let step = if se.vals.len() > 1 {
-                        pw / (se.vals.len() as f32 - 1.0)
+                    let use_x = matches!(series_kind(se, ch.kind), ChartKind::Scatter)
+                        && se.xv.len() == se.vals.len()
+                        && !se.xv.is_empty();
+                    let (xmin, xspan) = if use_x {
+                        let lo = se.xv.iter().cloned().fold(f64::MAX, f64::min);
+                        let hi = se.xv.iter().cloned().fold(f64::MIN, f64::max);
+                        (lo, (hi - lo).max(1e-9))
                     } else {
-                        0.0
+                        (0.0, (se.vals.len().saturating_sub(1)).max(1) as f64)
                     };
                     let pts: Vec<(f32, f32)> = se
                         .vals
                         .iter()
                         .enumerate()
-                        .map(|(i, v)| (px0 + step * i as f32, py0 + ph * (*v / scale) as f32))
+                        .map(|(i, v)| {
+                            let fx = if use_x {
+                                (se.xv[i] - xmin) / xspan
+                            } else {
+                                i as f64 / xspan
+                            };
+                            (px0 + pw * fx as f32, py0 + ph * (*v / scale) as f32)
+                        })
+                        .filter(|p| p.0.is_finite() && p.1.is_finite())
                         .collect();
                     if pts.len() >= 2 {
                         out.polys.push((pts, color));
@@ -531,6 +574,9 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 _ => {
                     let slot = bar_slots.iter().position(|i| *i == si).unwrap_or(0);
                     for (i, v) in se.vals.iter().enumerate() {
+                        if !v.is_finite() {
+                            continue;
+                        }
                         let bh = ph * (*v / scale) as f32;
                         let bx = px0 + gw * (i as f32 + 0.15) + bw * slot as f32;
                         out.rects.push((bx, py0, bw, bh, color));
@@ -884,4 +930,18 @@ fn series_kind(se: &crate::charts::Series, chart_kind: crate::charts::ChartKind)
         ChartKind::Combo => ChartKind::Column,
         k => k,
     }
+}
+
+/// 坐标轴顶端取“整齐”数值（1/2/2.5/5×10^n），与 Excel 的百分比轴 0/25/50/75/100% 一致
+fn nice_max(v: f64) -> f64 {
+    if !(v > 0.0) || !v.is_finite() {
+        return 1.0;
+    }
+    let base = 10f64.powf(v.log10().floor());
+    for m in [1.0, 2.0, 2.5, 5.0, 10.0] {
+        if v <= m * base * (1.0 + 1e-9) {
+            return m * base;
+        }
+    }
+    base * 10.0
 }

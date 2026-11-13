@@ -327,6 +327,7 @@ fn chart_category_axis_uses_the_workbook_date_system() {
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt: String::new(),
         y_min: None,
         y_max: None,
     };

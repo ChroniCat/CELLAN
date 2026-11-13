@@ -277,6 +277,7 @@ fn chart_values_keep_raw_numbers_when_cells_are_formatted() {
             cat_ref: "S!$A$1:$A$4".into(),
             val_ref: "S!$B$1:$B$4".into(),
             color: None,
+            xv: Vec::new(),
             kind: None,
             secondary: false,
         }],
@@ -289,6 +290,7 @@ fn chart_values_keep_raw_numbers_when_cells_are_formatted() {
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
+        y_fmt: String::new(),
         y_min: None,
         y_max: None,
     };

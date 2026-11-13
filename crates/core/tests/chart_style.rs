@@ -15,6 +15,7 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$B$2:$B$3".into(),
                 color: Some([0xE0, 0x4A, 0x2F]),
+                xv: Vec::new(),
                 kind: None,
                 secondary: false,
             },
@@ -26,6 +27,7 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$C$2:$C$3".into(),
                 color: Some([0x2E, 0x86, 0xC1]),
+                xv: Vec::new(),
                 kind: None,
                 secondary: false,
             },
@@ -39,6 +41,7 @@ fn sample() -> Chart {
         ref_fixes: Vec::new(),
         axis_x: "月份".into(),
         axis_y: "件数".into(),
+        y_fmt: "0.0".into(),
         y_min: Some(0.0),
         y_max: Some(100.0),
     }
