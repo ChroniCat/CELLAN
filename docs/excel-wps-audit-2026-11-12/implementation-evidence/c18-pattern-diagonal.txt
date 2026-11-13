@@ -1,0 +1,62 @@
+# C18.2 图案填充 / 对角线边框保真
+
+日期：2026-11-14
+夹具：`crates/core/tests/fixtures/c18/pattern.xlsx`（Excel 16.0，`scripts/c18_pattern_fixture.ps1`）
+
+```text
+A1「图案填充」 Interior.Pattern = -4124 (xlPatternGray25) → XML patternType="lightGray"
+              <fgColor indexed="8"/>（自动黑色），无 bgColor
+B1「对角线」   Borders.Item(5) = xlDiagonalDown, LineStyle=1(thin), Color=BGR 0000FF → RGB 红
+              <border diagonalDown="1"><diagonal style="thin"><color rgb="FFFF0000"/>
+C1 1.5，NumberFormat 0.00%
+```
+
+## 实现
+
+`crates/core/src/style_ext.rs`：
+
+- `FillPattern { kind, fg, bg, fg_theme, bg_theme, fg_indexed, bg_indexed }`：
+  保存 `patternType` 原值（lightGray/gray125/darkTrellis…），前景/背景各自独立，
+  支持 rgb、theme+tint、indexed 三种色源；`patternType="none"` 不算图案。
+- `DiagBorder { style, color, color_theme, up, down }`：取 `<diagonal style=…>` 的
+  style 与内部 `<color>`，并读 `diagonalUp/diagonalDown`。
+- `parse` 同时给出每个 `cellXfs` 的 `fillId/borderId`，`attach` 按样式号挂到
+  `StyleTable` 的平行表（`patterns`/`diags`），不改热路径上的 `CellStyle`。
+- 保存：先按原 `patternType` 写 `patternFill`，fg/bg 分别写 rgb / theme+tint / indexed；
+  对角线写 `diagonalUp/Down` + `diagonal style` + 颜色。
+- 修掉一个解析缺陷：`split_items` 的 `<fill` 前缀会匹配 `<fills`、`<border` 会匹配
+  `<borders`，导致 fills 数组整体错位（此前恰好被第一个「伪条目」抵消，
+  一旦某个工作簿的 fill 顺序变化就会把 A 的图案挂到 B 上）。现在标签名后必须是
+  空白/`>`/`/` 才算。
+
+## 验证
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c18_pattern -- --test-threads=2
+pattern_and_diagonal_are_loaded ... ok
+pattern_and_diagonal_survive_editing_number_format ... ok
+test result: ok. 2 passed
+```
+
+- 读盘：A1 patternType=lightGray、fg indexed=8；B1 diagonal thin 红色、down=true、up=false；
+  C1 无图案/对角线。
+- 只把 C1 的数字格式改成 `0.000` 后保存：`patternType="lightGray"`、`indexed="8"`、
+  `diagonalDown="1"`、`diagonal style="thin"`、`FFFF0000` 全部还在；
+- 连续两次保存后重开，图案与对角线仍一致（无退化）。
+
+两款 Office 回读（`scripts/c18_pattern_verify.ps1`，打开第二次保存的文件）：
+
+```text
+EXCEL: PATTERN=-4124 DIAG_DOWN=1 DIAG_COLOR=0000FF(BGR)=#FF0000 FMT=0.000
+WPS  : PATTERN=-4124 DIAG_DOWN=1 DIAG_COLOR=0000FF(BGR)=#FF0000 FMT=0.000
+```
+
+## 范围说明
+
+C18 原文把本项限定为「样式模型/序列化及未知样式保留」，字体字形与换行归 UI-14；
+因此本切片交付的是<b>解析与写回保真</b>，屏幕/打印对图案与对角线的绘制不在本项内
+（当前屏幕只画纯色填充与四条边）。这一点在台账 not_done 里如实保留。
+
+## 回归
+
+sheetcore **774 passed**、app `--bin app` **263 passed**。

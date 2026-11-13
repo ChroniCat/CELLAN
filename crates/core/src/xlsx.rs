@@ -580,6 +580,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     } else {
         Default::default()
     };
+    // 图案填充 / 对角线：不进 CellStyle，按 fillId/borderId 挂到样式表
+    let ext_book = if is_ooxml {
+        crate::style_ext::load(path)
+    } else {
+        Default::default()
+    };
     for raw in raws {
         let t_sheet = std::time::Instant::now();
         let mut sheet = Sheet::new(raw.name.clone());
@@ -600,6 +606,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             let id = wb.styles.intern(cs);
             if let Some(x) = xf {
                 wb.styles.set_theme(id, x);
+            }
+            if let Some(idx) = xf_map.and_then(|m| m.get(&(r, c))).copied() {
+                crate::style_ext::attach(&mut wb.styles, &ext_book, id, idx);
             }
             if id != 0 {
                 sheet.set_style_loaded(r, c, id);
@@ -1858,6 +1867,28 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 // 用户明确取消填充时，基准文件里的旧 fill 必须一起清掉；
                 // 只跳过设置会让 save→reload 继续显示旧颜色。
                 s.remove_fill();
+            }
+            // 图案填充：patternType + 前景/背景各自独立，不能退化成纯色
+            if let Some(p) = wb.styles.pattern_of(sid).cloned() {
+                let pf = s.get_fill_mut().get_pattern_fill_mut();
+                if let Ok(kind) = p.kind.parse::<umya_spreadsheet::PatternValues>() {
+                    pf.set_pattern_type(kind);
+                }
+                apply_color(pf.get_foreground_color_mut(), p.fg, p.fg_theme);
+                apply_color(pf.get_background_color_mut(), p.bg, p.bg_theme);
+            }
+            // 对角线：style + 颜色 + 方向都要留住
+            if let Some(d) = wb.styles.diag_of(sid).cloned() {
+                let b = s.get_borders_mut();
+                b.set_diagonal_up(d.up);
+                b.set_diagonal_down(d.down);
+                let bd = b.diagonal_mut();
+                if let Ok(v) = d.style.parse::<umya_spreadsheet::BorderStyleValues>() {
+                    bd.set_style(v);
+                }
+                let mut dc = umya_spreadsheet::Color::default();
+                apply_color(&mut dc, Some(d.color), d.color_theme);
+                bd.set_color(dc);
             }
             let a = s.get_alignment_mut();
             a.set_horizontal(match st.halign {
@@ -3143,4 +3174,26 @@ fn col_name(mut c: u32) -> String {
         c = c / 26 - 1;
     }
     out
+}
+
+fn apply_color_ex(
+    c: &mut umya_spreadsheet::Color,
+    rgb: Option<[u8; 3]>,
+    theme: Option<(u8, f32)>,
+    indexed: Option<u8>,
+) {
+    if let Some(i) = indexed {
+        c.set_indexed(i as u32);
+        return;
+    }
+    apply_color(c, rgb, theme);
+}
+
+fn apply_color(c: &mut umya_spreadsheet::Color, rgb: Option<[u8; 3]>, theme: Option<(u8, f32)>) {
+    if let Some((i, t)) = theme {
+        c.set_theme_index(i as u32);
+        c.set_tint(t as f64);
+    } else if let Some(rgb) = rgb {
+        c.set_argb_str(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
+    }
 }

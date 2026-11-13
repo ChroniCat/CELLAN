@@ -215,6 +215,10 @@ pub struct StyleTable {
     index: HashMap<u64, u16>,
     /// 与 styles 同长：每个样式号对应的主题色引用（读盘时记，保存时按它写回）
     themes: Vec<crate::style_theme::XfTheme>,
+    /// 与 styles 同长：图案填充（未进 CellStyle，保存时按原 patternType 写回）
+    patterns: Vec<Option<crate::style_ext::FillPattern>>,
+    /// 与 styles 同长：对角线边框
+    diags: Vec<Option<crate::style_ext::DiagBorder>>,
 }
 
 fn hash_of(s: &CellStyle) -> u64 {
@@ -257,6 +261,8 @@ impl StyleTable {
         let id = self.styles.len() as u16;
         self.styles.push(s);
         self.themes.push(crate::style_theme::XfTheme::default());
+        self.patterns.push(None);
+        self.diags.push(None);
         self.index.insert(k, id);
         id
     }
@@ -270,6 +276,26 @@ impl StyleTable {
 
     pub fn theme_of(&self, id: u16) -> crate::style_theme::XfTheme {
         self.themes.get(id as usize).copied().unwrap_or_default()
+    }
+
+    pub fn set_pattern(&mut self, id: u16, p: crate::style_ext::FillPattern) {
+        if let Some(slot) = self.patterns.get_mut(id as usize) {
+            *slot = Some(p);
+        }
+    }
+
+    pub fn pattern_of(&self, id: u16) -> Option<&crate::style_ext::FillPattern> {
+        self.patterns.get(id as usize).and_then(|p| p.as_ref())
+    }
+
+    pub fn set_diag(&mut self, id: u16, d: crate::style_ext::DiagBorder) {
+        if let Some(slot) = self.diags.get_mut(id as usize) {
+            *slot = Some(d);
+        }
+    }
+
+    pub fn diag_of(&self, id: u16) -> Option<&crate::style_ext::DiagBorder> {
+        self.diags.get(id as usize).and_then(|d| d.as_ref())
     }
 
     pub fn get(&self, id: u16) -> &CellStyle {

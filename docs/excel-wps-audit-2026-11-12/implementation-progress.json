@@ -3766,12 +3766,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C18.1 主题色/tint 已实现并 Excel 复核；C18.2 图案填充/复杂边框、C18.3 xf 未知属性无损待做"
+        "C18.1/C18.2 已实现并 Excel+WPS 复核；C18.3 仅验了「改数字格式不覆盖其他样式」，xf 未知属性（quotePrefix/pivotButton/extLst）保留未验"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T18:24:40Z",
+      "updated_utc": "2026-11-13T18:43:42Z",
       "slices": [
         {
           "id": "C18.1",
@@ -3807,17 +3807,27 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/style_ext.rs",
+            "crates/core/src/style.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/tests/c18_pattern.rs",
+            "crates/core/tests/fixtures/c18/pattern.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-pattern-diagonal.txt"
+          ],
+          "not_done": [
+            "patternType/fg/bg(rgb/theme/indexed) 与 diagonal(style/color/up/down) 已建模并按 fillId/borderId 写回；改数字格式后不丢；屏幕/打印不绘制图案与对角线（C18 只要求模型与序列化）；等待复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T18:43:42Z"
         },
         {
           "id": "C18.3",
