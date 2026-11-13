@@ -32,13 +32,26 @@ def inspect(product: str, path: Path, kind: str) -> tuple[dict | None, str | Non
             pass
         book = app.Workbooks.Open(str(path), ReadOnly=True, UpdateLinks=0)
         sheet = book.Worksheets(1)
+        charts = 0
+        pivots: list[dict] = []
+        for si in range(1, int(book.Worksheets.Count) + 1):
+            sh = book.Worksheets(si)
+            charts += int(sh.ChartObjects().Count)
+            for pi in range(1, int(sh.PivotTables().Count) + 1):
+                pt = sh.PivotTables(pi)
+                fields = []
+                for fi in range(1, int(pt.PivotFields().Count) + 1):
+                    f = pt.PivotFields(fi)
+                    fields.append({"name": str(f.Name), "orientation": int(f.Orientation)})
+                pivots.append({"sheet": str(sh.Name), "name": str(pt.Name), "fields": fields})
         info: dict = {
             "product": product,
             "version": str(app.Version),
             "build": str(getattr(app, "Build", "")),
             "file": str(path),
             "sha256": sha256(path),
-            "chart_objects": int(sheet.ChartObjects().Count),
+            "chart_objects": charts,
+            "pivot_tables": pivots,
             "page": {
                 "orientation": int(sheet.PageSetup.Orientation),
                 "paper": int(sheet.PageSetup.PaperSize),
@@ -52,8 +65,9 @@ def inspect(product: str, path: Path, kind: str) -> tuple[dict | None, str | Non
         }
         if kind == "chart":
             info["chart_titles"] = [
-                str(sheet.ChartObjects(i + 1).Chart.ChartTitle.Text)
-                for i in range(sheet.ChartObjects().Count)
+                str(book.Worksheets(si).ChartObjects(ci + 1).Chart.ChartTitle.Text)
+                for si in range(1, int(book.Worksheets.Count) + 1)
+                for ci in range(int(book.Worksheets(si).ChartObjects().Count))
             ]
         return info, None
     except Exception as error:
@@ -128,10 +142,10 @@ def main() -> None:
     parser.add_argument("--core-exe", default="target/debug/examples/qa01_roundtrip.exe")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--kinds", default="chart,page", help="comma-separated: chart,page")
+    parser.add_argument("--kinds", default="chart,page,pivot", help="comma-separated: chart,page,pivot")
     args = parser.parse_args()
     kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
-    if not kinds or any(k not in ("chart", "page") for k in kinds):
+    if not kinds or any(k not in ("chart", "page", "pivot") for k in kinds):
         raise SystemExit(f"invalid --kinds: {args.kinds}")
     fixtures = Path(args.fixtures).resolve()
     core_exe = Path(args.core_exe).resolve()
@@ -179,6 +193,17 @@ def main() -> None:
                                 differences.append(f"target chart count is {target_info['chart_objects']}, expected 1")
                             if source_info["chart_titles"] != target_info["chart_titles"]:
                                 differences.append(f"chart title changed: {source_info['chart_titles']} -> {target_info['chart_titles']}")
+                        elif kind == "pivot":
+                            if not source_info["pivot_tables"]:
+                                differences.append("source has no pivot table")
+                            if len(source_info["pivot_tables"]) != len(target_info["pivot_tables"]):
+                                differences.append(
+                                    f"pivot count: {len(source_info['pivot_tables'])} -> {len(target_info['pivot_tables'])}"
+                                )
+                            elif source_info["pivot_tables"] != target_info["pivot_tables"]:
+                                differences.append(
+                                    f"pivot changed: {source_info['pivot_tables']} -> {target_info['pivot_tables']}"
+                                )
                         else:
                             for key, want in {
                                 "orientation": 2,  # xlLandscape
@@ -211,7 +236,11 @@ def main() -> None:
         "schema": "qa01-extended-roundtrip-v1",
         "generated_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "fixtures": str(fixtures),
-        "fixtures_sha256": {name: sha256(fixtures / name) for name in ["chart.xlsx", "page.xlsx"]},
+        "fixtures_sha256": {
+            name: sha256(fixtures / name)
+            for name in ["chart.xlsx", "page.xlsx", "pivot.xlsx"]
+            if (fixtures / name).exists()
+        },
         "core_exe": str(core_exe),
         "cases": cases,
         "status": "pass" if not failed else "fail",

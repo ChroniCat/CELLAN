@@ -85,3 +85,37 @@ page-excel-project-wps: print_gridlines src=True tgt=True, differences=[]
 
 证据：`qa01-extended-roundtrip-page-gridlines.json`（本次 3 条 page 路径），
 原 `qa01-extended-roundtrip.json` 保留 6 条 chart/page 历史结果不覆盖。
+
+
+## 2026-11-14 真 pivotTable 纳入三方矩阵
+
+补齐此前的两项空白：真实 pivotTable 部件（不是 compute 结果表）与 pivot 专用比较。
+
+- 夹具 `crates/core/tests/fixtures/qa01/ext/pivot.xlsx`：Excel COM 建 P1，
+  行字段 地区(1)+城市(1)、数据字段 销售额(0)，自检 `pivot=1 fields=3`；
+  sha256 前 16 位 `e769bf81dcc7cf5c`。
+- `scripts/qa01_extended_roundtrip.py`：`--kinds` 增加 `pivot`；inspect 遍历所有工作表，
+  读 `PivotTables→PivotFields(name,orientation)`；kind 只比本类属性：
+  chart 比数量+标题，page 比纸张/方向/缩放/打印区/标题行/打印网格线/左边距，
+  pivot 比透视表数量与字段名/方向。
+- 结果（JSON：`implementation-evidence/qa01/qa01-ext-pv2.json`、`qa01-ext-cp.json`）：
+
+```text
+pivot-excel-project-excel pass []
+pivot-wps-project-wps     pass []
+pivot-excel-project-wps   pass []
+chart-excel-project-excel pass []
+chart-wps-project-wps     pass []
+chart-excel-project-wps   pass []
+page-excel-project-excel  pass []
+page-wps-project-wps      pass []
+page-excel-project-wps    pass []
+```
+
+源/目标均读到：
+`{"sheet":"透视","name":"P1","fields":[{"name":"地区","orientation":1},
+{"name":"城市","orientation":1},{"name":"销售额","orientation":0}]}`。
+本项目 load/save 后 Excel 与 WPS 都能继续识别该透视表，字段方向未变，无修复记录。
+
+边界：runner 不做人工拖拽字段与缓存数值逐格对拍；`.xls/.xlsm`、样式/CF/DV/表格/
+图片/命名/隐藏冻结/外链等类别仍归 QA-01.2 与父项剩余范围。

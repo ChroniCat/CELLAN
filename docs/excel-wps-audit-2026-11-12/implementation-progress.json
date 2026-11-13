@@ -1058,7 +1058,7 @@
       "failures": [],
       "blocker": "",
       "next": "QA-01.3 继续补三方 Office 矩阵/真实 pivot；父项未完成。",
-      "updated_utc": "2026-11-13T20:25:00Z",
+      "updated_utc": "2026-11-13T20:49:13Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1142,16 +1142,14 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
-            "scripts/qa01_extended_samples.py",
-            "crates/core/tests/qa01_extended.rs",
-            "crates/core/tests/fixtures/qa01_extended/table.xlsx",
-            "crates/core/tests/fixtures/qa01_extended/chart.xlsx",
-            "crates/core/tests/fixtures/qa01_extended/page.xlsx",
             "scripts/qa01_extended_roundtrip.py",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip-page-gridlines.json"
+            "scripts/qa01_pivot_fixture.ps1",
+            "crates/core/tests/fixtures/qa01/ext/pivot.xlsx",
+            "crates/core/tests/fixtures/qa01/ext/chart.xlsx",
+            "crates/core/tests/fixtures/qa01/ext/page.xlsx"
           ],
           "commits": [],
           "commands": [
@@ -1161,17 +1159,17 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-samples.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip-page-gridlines.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-pv2.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-cp.json"
           ],
           "not_done": [
-            "仍未覆盖样式/CF/DV/表格/图片/真实 pivotTable/命名/隐藏冻结/外链/.xls/.xlsm 等完整三方矩阵。"
+            "三方 runner 只做打开/另存/属性对拍，不含人工拖拽字段与缓存逐格数值",
+            ".xls/.xlsm、样式/CF/DV/表格/图片/命名/隐藏冻结/外链等类别仍归 QA-01.2 与父项剩余范围"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实 pivotTable 部件及样式/CF/DV/表格/图片/命名/隐藏冻结/外链/.xls/.xlsm 三方夹具。",
-          "updated_utc": "2026-11-13T20:25:00Z"
+          "updated_utc": "2026-11-13T20:49:13Z"
         }
       ]
     },
