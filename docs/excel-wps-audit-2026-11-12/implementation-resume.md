@@ -1,11 +1,11 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；当前代码检查点 `b02c047`（UI-16 三处入口修复 + UI-15.2
-  填充/保护页）。上一轮 `745e1ab` 的混合字段明确选择与三段格式已获用户 15:47 认可。
+- 分支 `main`（`origin/main`）；当前代码检查点 `930ff80`（已有文件填充/保护逆向写回修复）。
+  之前 `b02c047` 是 UI-16 三处入口修复 + UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
 - 台账（`python scripts/audit_progress.py counts`）：任务 13 已验收 / 10 待验收 /
   5 实施中 / 33 待实施；切片 35 已验收 / 30 待验收 / 83 待实施。父项 13/61 未变。
-- 当前测试真值（15:58 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
-  CORE_EXIT=0；app **229 passed / 0 failed / 0 ignored**，APP_EXIT=0；
+- 当前测试真值（16:16 重跑）：core **75 bins / 679 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **230 passed / 0 failed / 0 ignored**，APP_EXIT=0；
   `cargo build -p app --offline --no-default-features --features glow` 成功。
 - 15:47 监督三处 UI-16 入口已修：
   1. `copy_sheet_to` 插入前按 identity 保存视图，插入后按 identity 恢复原索引再切副本；
@@ -15,7 +15,8 @@
   3. `do_undo` 跨表 switch 后清 `extra_sel`，后续 clear/Bold 不触历史远端区域。
   五项新增回归均通过，full app 229。
 - UI-15.2 填充/保护页已实现并取证：CellStyle `locked/hidden` + xlsx protection 往返、
-  六页签、混合状态；核心往返 1 passed、app 事务 1 passed；截图
+  六页签、混合状态；核心往返 1 passed、app 事务 1 passed；已有文件取消 fill/恢复默认保护
+  的回归在修复前失败、修复后 1 passed（930ff80）；全量 app 230；截图
   `ui15-fill-protection-fill.png` / `ui15-fill-protection-lock.png`；真实鼠标/Office、
   逐格保护执行语义仍待验收。
 - 当前未完成：UI-16.1 真实 GUI/Office；UI-15.1/15.2 真实鼠标与 Office；UI-15.3

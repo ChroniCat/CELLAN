@@ -44,3 +44,30 @@
 - 工作表保护目前仍由既有整表写入门禁处理；本切片保存并恢复每格 `locked/hidden`，
   但“保护后仅锁定格不可编辑”的逐格执行语义尚未在本切片验收中证明。
 - 未修改 `xls` 的 protection 编码；旧 `.xls` 往返不在本切片声称范围。
+
+## 16:12 监督复核后的已有文件逆向写回修复（930ff80）
+
+缺陷：`save_plain_base` 对 fill 只在 `Some` 时设置，对 protection 只在
+`!locked || hidden` 时设置；已有文件里的旧 `<fill>` / `<protection>` 会跟着基准样式
+留在 styles.xml，格式对话框把 fill 取消、locked/hidden 改回 `true/false` 后，内存正确但
+save→reload 仍是旧填充/旧保护。`apply_protection` 只处理工作表 XML，补不了 styles。
+
+修复：对 style_edits 中每个目标格，`st.fill == None` 时 `s.remove_fill()`；
+`st.locked && !st.hidden` 时 `s.remove_protection()`。其它未改样式字段不动。
+
+回归（不是只新建文件或内存断言）：
+`edit_regression_tests::format_dialog_clears_fill_and_protection_on_existing_file`
+1. 先生成带 `fill=rgb(200,10,10), locked=false, hidden=true` 的 xlsx；
+2. `xlsx::load` 进入已有文件，确认对话框读到旧三值；
+3. 真实调用 `open_format_dialog` → 清 fill、locked=true、hidden=false →
+   `apply_format_dialog`；
+4. `xlsx::save_atomic` → `xlsx::load`，断言 `fill=None`、`locked=true`、`hidden=false`。
+
+结果：
+- 修复前：`TEST_EXIT=101`，断言 `重开后旧填充必须清掉`，实际 `Some([200,10,10])`；
+- 修复后：`1 passed / 0 failed`；
+- 全量 app：`230 passed / 0 failed / 0 ignored`，`APP_EXIT=0`；
+- 全量 core：75 bins / `679 passed / 0 failed / 41 ignored`，`CORE_EXIT=0`。
+
+仍未做：真实鼠标点击格式页、Excel/WPS 目视；UI-15.3 双下划线/竖排未实现，不因本回归
+把 UI-15 父项翻绿。

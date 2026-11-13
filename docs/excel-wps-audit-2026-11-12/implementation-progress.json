@@ -4539,7 +4539,8 @@
       "commits": [
         "5e3c4e8",
         "745e1ab",
-        "b02c047"
+        "b02c047",
+        "930ff80"
       ],
       "commands": [],
       "evidence": [
@@ -4598,7 +4599,7 @@
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "格式对话框新增填充/保护页；填充颜色和锁定/隐藏进入 CellStyle/xlsx 双向，混合字段按 FmtTouched 提交；核心 protection 往返 1 passed，app 事务 1 passed，全量 229；真实 framebuffer 两张已取证。",
+          "acceptance": "填充/保护页；已有文件格式对话框取消 fill、恢复 locked=true/hidden=false 后 save/reload 清掉旧节点；专项 1 passed，修复前失败已取证；全量 app 230、core 679。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs",
@@ -4607,12 +4608,12 @@
             "crates/core/tests/font_style.rs"
           ],
           "commits": [
-            "b02c047"
+            "b02c047",
+            "930ff80"
           ],
           "commands": [
-            "cargo test -p sheetcore --offline --test font_style cell_protection_roundtrip -> 1 passed",
-            "cargo test -p app --offline --bin app format_dialog_fill_and_protection_apply_to_selection -> 1 passed",
-            "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored",
+            "cargo test -p app --offline --bin app format_dialog_clears_fill_and_protection_on_existing_file -> 1 passed（修复前同一测试 0 passed / 1 failed：旧 fill 仍为 Some([200,10,10])）",
+            "cargo test -p app --offline --bin app -> 230 passed / 0 failed / 0 ignored",
             "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored"
           ],
           "evidence": [
@@ -4629,7 +4630,7 @@
           "failures": [],
           "blocker": "",
           "next": "真实鼠标操作、Office 目视与逐格保护执行语义。",
-          "updated_utc": "2026-11-13T07:58:00Z"
+          "updated_utc": "2026-11-13T08:21:00Z"
         },
         {
           "id": "UI-15.3",
