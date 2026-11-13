@@ -26,6 +26,8 @@ pub struct UiPrefs {
     pub zh_variant: u8,
     /// 校对结果按类型分组显示
     pub proof_group: bool,
+    /// 状态栏统计项位掩码：1 平均、2 计数、4 数值计数、8 求和、16 最小、32 最大
+    pub stat_mask: u8,
 }
 
 impl Default for UiPrefs {
@@ -33,6 +35,7 @@ impl Default for UiPrefs {
         Self {
             zh_variant: 0,
             proof_group: true,
+            stat_mask: 0b00_1011,
         }
     }
 }
@@ -61,6 +64,11 @@ impl UiPrefs {
                     }
                 }
                 "proof_group" => me.proof_group = v == "1",
+                "stat_mask" => {
+                    if let Ok(n) = v.parse::<u8>() {
+                        me.stat_mask = n & 0b11_1111;
+                    }
+                }
                 _ => {}
             }
         }
@@ -80,8 +88,8 @@ impl UiPrefs {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "zh_variant={}\nproof_group={}\n",
-            self.zh_variant, self.proof_group as u8
+            "zh_variant={}\nproof_group={}\nstat_mask={}\n",
+            self.zh_variant, self.proof_group as u8, self.stat_mask
         );
         let _ = std::fs::write(p, text);
     }
@@ -113,12 +121,14 @@ mod tests {
         let p = UiPrefs {
             zh_variant: 2,
             proof_group: false,
+            stat_mask: 0b10_1000,
         };
         p.save_to(&file);
         let got = UiPrefs::load_from(&file);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got.zh_variant, 2);
         assert!(!got.proof_group);
+        assert_eq!(got.stat_mask, 0b10_1000);
     }
 }
 

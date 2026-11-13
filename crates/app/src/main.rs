@@ -1435,6 +1435,62 @@ fn ctx_menu_height(rows: &[CtxRow]) -> f32 {
     h + 4.0
 }
 
+/// 状态栏统计文本（C25）：按位掩码输出 Excel 同名项；无数值时只显示计数。
+pub(crate) fn status_stats_text(
+    sheet: &sheetcore::model::Sheet,
+    rect: (u32, u32, u32, u32),
+    mask: u8,
+) -> String {
+    fn num(v: f64) -> String {
+        let mut s = format!("{v:.4}");
+        while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
+            s.pop();
+        }
+        if s == "-0" {
+            s = "0".into();
+        }
+        s
+    }
+    let (r1, c1, r2, c2) = rect;
+    let (mut count, mut nums, mut sum) = (0u64, 0u64, 0f64);
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            let Some(cell) = sheet.get(r, c) else { continue };
+            if cell.is_blank() {
+                continue;
+            }
+            count += 1;
+            if let Value::Number(v) = &cell.value {
+                nums += 1;
+                sum += *v;
+                min = min.min(*v);
+                max = max.max(*v);
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if mask & 1 != 0 && nums > 0 {
+        parts.push(format!("平均值: {}", num(sum / nums as f64)));
+    }
+    if mask & 2 != 0 && count > 0 {
+        parts.push(format!("计数: {count}"));
+    }
+    if mask & 4 != 0 && nums > 0 {
+        parts.push(format!("数值计数: {nums}"));
+    }
+    if mask & 8 != 0 && nums > 0 {
+        parts.push(format!("求和: {}", num(sum)));
+    }
+    if mask & 16 != 0 && nums > 0 {
+        parts.push(format!("最小值: {}", num(min)));
+    }
+    if mask & 32 != 0 && nums > 0 {
+        parts.push(format!("最大值: {}", num(max)));
+    }
+    parts.join("    ")
+}
+
 impl SheetApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         Self::new_with_context(&cc.egui_ctx, initial)
@@ -26435,27 +26491,13 @@ impl eframe::App for SheetApp {
                 let (r1, c1, r2, c2) = self.sel_rect();
                 let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
                 let mut stat = String::new();
+                let mut stat_mask = self.prefs.stat_mask;
                 if cells > 1 && cells <= 200_000 {
-                    let (mut count, mut sum, mut num) = (0u64, 0f64, 0u64);
-                    let sheet = self.wb.sheet(self.sheet_idx);
-                    for rr in r1..=r2 {
-                        for cc in c1..=c2 {
-                            if let Some(cell) = sheet.get(rr, cc) {
-                                if !cell.is_blank() {
-                                    count += 1;
-                                    if let sheetcore::model::Value::Number(v) = &cell.value {
-                                        sum += *v;
-                                        num += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if num > 0 {
-                        stat = format!("平均值: {:.4}    计数: {}    求和: {:.4}", sum / num as f64, count, sum);
-                    } else if count > 0 {
-                        stat = format!("计数: {count}");
-                    }
+                    stat = status_stats_text(
+                        self.wb.sheet(self.sheet_idx),
+                        (r1, c1, r2, c2),
+                        stat_mask,
+                    );
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
@@ -26498,6 +26540,34 @@ impl eframe::App for SheetApp {
                         {
                             self.recalc_all_async();
                         }
+                    }
+                    if !stat.is_empty() {
+                        ui.add_space(10.0);
+                        let resp = ui.label(
+                            egui::RichText::new(stat.clone())
+                                .size(11.0)
+                                .color(ui_kit::TEXT),
+                        );
+                        resp.clone().on_hover_text("右键选择状态栏统计项");
+                        resp.context_menu(|ui| {
+                            for (bit, name) in [
+                                (1u8, "平均值"),
+                                (2, "计数"),
+                                (4, "数值计数"),
+                                (8, "求和"),
+                                (16, "最小值"),
+                                (32, "最大值"),
+                            ] {
+                                let mut on = stat_mask & bit != 0;
+                                if ui.checkbox(&mut on, name).changed() {
+                                    if on {
+                                        stat_mask |= bit;
+                                    } else {
+                                        stat_mask &= !bit;
+                                    }
+                                }
+                            }
+                        });
                     }
                     // 循环引用：Excel 在状态栏用红字提示「循环引用: C3」，点一下可以跳过去
                     if !self.cycles.is_empty() {
@@ -26677,6 +26747,10 @@ impl eframe::App for SheetApp {
                         }
                     });
                 });
+                if stat_mask != self.prefs.stat_mask {
+                    self.prefs.stat_mask = stat_mask;
+                    self.prefs.save();
+                }
             });
 
         // ---- 工作表标签条（32px，状态栏之上） ----

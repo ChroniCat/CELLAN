@@ -6799,6 +6799,31 @@ fn multi_field_pivot_refresh_clears_old_cells() {
     assert!(labels.iter().any(|x| x.starts_with("华北")), "天津回来后华北增加子行");
 }
 
+/// UI-25：状态栏统计按 Excel 定义：空白不计入计数，文本计入计数但不进数值统计。
+#[test]
+fn status_bar_stats_follow_excel_definitions() {
+    use crate::status_stats_text;
+    let mut sh = sheetcore::model::Sheet::new("S");
+    sh.set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    sh.set(1, 0, Cell { value: Value::Number(2.0), formula: None });
+    sh.set(2, 0, Cell { value: Value::Text("备注".into()), formula: None });
+    sh.set(1, 1, Cell { value: Value::Number(10.0), formula: None });
+    let all = status_stats_text(&sh, (0, 0, 2, 1), 0b11_1111);
+    assert!(all.contains("平均值: 4.3333"), "{all}");
+    assert!(all.contains("计数: 4"), "文本算计数、空白不算：{all}");
+    assert!(all.contains("数值计数: 3"), "{all}");
+    assert!(all.contains("求和: 13"), "{all}");
+    assert!(all.contains("最小值: 1"), "{all}");
+    assert!(all.contains("最大值: 10"), "{all}");
+    let only_count = status_stats_text(&sh, (0, 0, 2, 1), 2);
+    assert_eq!(only_count, "计数: 4");
+    let only_sum = status_stats_text(&sh, (0, 0, 2, 1), 8);
+    assert_eq!(only_sum, "求和: 13");
+    // 纯文本区域：数值项都不显示，只留计数
+    let txt = status_stats_text(&sh, (2, 0, 2, 0), 0b11_1111);
+    assert_eq!(txt, "计数: 1");
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();

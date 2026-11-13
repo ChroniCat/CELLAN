@@ -6336,7 +6336,7 @@
       "scope": "app状态栏/统计模型",
       "source": "ui-requirements.md",
       "heading": "UI-25 状态栏统计准确并可配置",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -6346,7 +6346,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T21:00:06Z",
       "slices": [
         {
           "id": "UI-25.1",
@@ -6354,17 +6354,27 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-25 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/ui_prefs.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-status.txt",
+            "work/goal-logs/ui25-statusbar3.png"
+          ],
+          "not_done": [
+            "右键复选菜单未做真实鼠标点选（RDP 注入不可用），仅逻辑与默认值验证",
+            "极小窗口/DPI 截断归 UI-13/UI-29"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:00:06Z"
         }
       ]
     }
