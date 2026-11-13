@@ -42,3 +42,24 @@ test result: ok. 3 passed; 0 failed; 0 ignored
 - `.xls/.xlsm`、图片、命名区域、外链、表格对象、CF/DV 的扩展夹具不在本片。
 
 本片保持实施中，等待父项后续补三方矩阵和真实 pivot 部件后再验收。
+
+## 19:44 CST 三方图表/打印快速路径
+
+```text
+python scripts/qa01_extended_roundtrip.py \
+  --fixtures crates/core/tests/fixtures/qa01_extended \
+  --core-exe target/debug/examples/qa01_roundtrip.exe \
+  --out-dir C:/Users/Administrator/AppData/Local/hermes/cache/scratch/qa01_ext_roundtrip2 \
+  --out C:/Users/Administrator/AppData/Local/hermes/cache/scratch/qa01_ext_roundtrip2.json
+EXIT=0, document status=pass
+```
+
+六个路径均通过：chart 的 Excel→本项目→Excel、WPS→本项目→WPS、Excel→本项目→WPS
+（源/目标 ChartObjects=1、标题「按部门金额」一致）；page 的三条路径均保持
+orientation=2、paper=8、zoom=85、print_area=`$A$1:$H$40`、
+title_rows=`$1:$2`、left_margin=36pt（0.5in）、gridlines=true。
+源/目标版本：Excel 16.0 build 20326，WPS 12.0 build 29690。
+
+证据：`implementation-evidence/qa01-extended-roundtrip.json`（逐路径命令、SHA-256、
+版本、对象/页面属性、差异数组）。这仍是快速路径，不等同于人工目视矩阵，
+也不把透视结果表当真实 pivotTable；父项仍未完成。
