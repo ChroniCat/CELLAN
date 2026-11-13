@@ -1,59 +1,56 @@
-UI-06 选择性粘贴 —— 状态：待验收（2026-11-13 06:10）
+# UI-06 选择性粘贴：公式语义、类型与样式
 
-一、已实现（crates/app/src/main.rs::paste_special_apply）
-- 源坐标：内部剪贴板按 clip.rect 为每格记录源表绝对坐标 (sr,sc)，转置时矩阵和坐标一起转置，
-  公式偏移始终用“目标绝对坐标 - 原始源坐标”，不再用转置后的下标猜源位置。
-- 公式：ps_kind=2 和“全部”都调用 sheetcore::refs::translate(f, dr, dc, 目标表名)：
-  相对引用平移、$ 锁定不变、负偏移变 #REF!；外部文本没有源坐标，按原文粘贴不偏移。
-- 全部：cell=src.clone() 后 **同时 set_style(src样式)**；公式/值/格式三样都过去。
-- 格式：ps_kind=3 只写样式，不改内容和公式。
-- 运算：目标原值 op 剪贴板值（+ - * /）；除数为 0 时写入 Value::Error(Div0) 显示 #DIV/0!，
-  不再静默保留原值；格式模式（只格式）不执行运算。
-- 外部文本：与普通粘贴共用 parse_clip_text → parse_tsv，保留中间空行、= 开头按公式解析；
-  不再 filter(!is_empty)。
-- 写入门禁仍在最前（write_preflight），整次粘贴一个事务；结束置 dirty/重算；
-  值/公式逐格 broadcast_op，全部/格式模式的样式 wire 走 broadcast_style（不是拿 dirty/重算冒充广播）。
+日期：2026-11-14 01:4x CST
+审计基线问题：公式分支不偏移；“全部”只在 dr/dc 非负时平移；转置用变换后索引算源位置；
+“全部”不写样式；除零静默保留；外部文本丢空行。
 
-二、用例（crates/app/src/edit_regression_tests.rs，4 passed）
-1) paste_special_formula_translates_negative_and_positive_offsets
-   C3 =A1+$B$1 → B2 得 =#REF!+$B$1；→ D4 得 =B2+$B$1；一次撤销只回退第二次。
-2) paste_special_transpose_keeps_original_source_coordinates
-   A1:A2（=A2 / =A3）转置到 C5:D5，得 C5=C6、D5=D6（按原始源坐标算偏移）。
-3) paste_special_all_keeps_format_and_divide_by_zero_is_an_error
-   全部：公式 + 加粗 + 黄色填充都到目标；5 ÷ 0 → #DIV/0!，撤销恢复 5。
-4) tsv_parsing_keeps_blank_rows_between_values
-   "甲\t1\n\n乙\t2\n" → 3 行，中间行是空值，末行“乙”。
-- 既有 paste_special_values_transpose_and_operations 仍通过（值/转置/加法）。
-- 全量 app：182 passed / 0 failed，APP_EXIT=0。
+## Excel 基准（本机 Excel 16.0 COM 实测）
 
-三、变异（转红后还原）
-M17 公式分支直接 clone 原文不 translate → 偏移用例 FAILED
-M18 转置用转置后下标算源坐标 → 转置用例 FAILED
-M19 “全部”不写样式 → 全部格式断言 FAILED
-M20 除零保留 a → #DIV/0! 断言 FAILED
-M21 parse_clip_text 过滤空行 → 空行用例 FAILED
+脚本 `scripts/excel_paste_special_probe.ps1`（隐藏实例，不碰用户文档），实际输出：
 
-四、未执行 / 仍需外部验收
-- 未与 Excel/WPS 实机对拍同一份选择性粘贴样本（需求要求“按实际 Excel 基准校验”，
-  当前期望值来自需求文字与 refs::translate 语义，尚未跑 Excel COM 真值）。
-- 未用真实系统剪贴板做跨应用选择性粘贴（内部 Clip + 文本解析已测）。
-- 跨工作簿样式 id 映射（UI-07 范围）未做；当前样式号按同簿解释。
-- 合并单元格、错误值、日期在“运算”下的行为未覆盖。
+```text
+C3==A1+$B$1
+B2==#REF!+$B$1
+D4==B2+$B$1
+D11==D11
+D12==D12
+```
 
-五、06:12 复核后补强（2026-11-13）
-1) 系统剪贴板优先级：paste_special_apply 先读系统文本，内部 Clip 只在系统文本仍等于
-   clip_copy 时写入的 clip_stamp 时优先；外部后复制 B 会走 parse_clip_text(B)。
-   验证 paste_special_prefers_newer_system_clipboard_over_stale_internal_clip：
-   app 复制 A → 注入外部 B → 选择性粘贴得 B；再 app 复制 A 后恢复内部坐标/格式。
-   （自动测试通过 paste_special_apply_text 注入系统文本，避免并行测试踩真实剪贴板；
-    真实跨应用路径仍需 GUI 手验。）
-2) “全部”补公式正负引用：paste_special_all_translates_formula_offsets
-   C3 =A1+$B$1 → B2 得 =#REF!+$B$1，→ D4 得 =B2+$B$1，并带加粗。
-3) 转置负位移：paste_special_transpose_negative_offset_is_ref_error
-   C3 =A1 转置到 B2 得 =#REF!。
-4) 全部粘贴的广播已实现（值/公式 broadcast_op + 样式 broadcast_style）；
-   现有自动测试未做双端 poll_net 断言，协作同步仍待验收。
-5) 06.3 运算对文本/错误值/日期、合并单元格的行为仍未覆盖；“只格式”不做运算已固定。
+即：C3 的 `=A1+$B$1` 以“公式”方式粘到 B2 得 `=#REF!+$B$1`（相对引用负偏移），
+粘到 D4 得 `=B2+$B$1`（相对平移、`$B$1` 不变）；A1:B1 两个自引用公式转置粘到 D11
+得到 D11/D12 各自 `=D11`/`=D12` —— 偏移始终按**原始源坐标**算。
 
-当前用例：paste_special 过滤 7 passed；全量 app 188 passed / 0 failed。
-未执行：Excel/WPS 实机对拍（含全部公式偏移与转置负位移）。
+## 实现要点
+
+- 源坐标来自 Clip.rect，与普通粘贴共用 `refs::translate`（相对平移、`$` 锁定、负偏移 #REF!）；
+- 转置：矩阵与源坐标一起转置，偏移用转置前的源坐标；
+- 粘贴内容 × 运算组合：Excel 语义“目标原值 op 剪贴板值”，除零写 `#DIV/0!`；
+- “全部”同时写单元格样式（字体/填充等）并广播 style；
+- 外部文本与普通粘贴共用 `parse_clip_text`，中间空行保留成空单元格；
+- 一次粘贴一个事务，值与样式一起撤销。
+
+## 回归（app bin）
+
+```text
+cargo test -p app --offline -j 2 --bin app paste_special -- --test-threads=2
+-> 12 passed / 0 failed
+```
+
+新增：
+- `paste_special_formula_shifts_relative_and_keeps_absolute`：C3→B2 `=#REF!+$B$1`、C3→D4 `=B2+$B$1`（与 COM 输出逐字一致）
+- `paste_special_all_carries_font_and_fill_and_undoes_once`：加粗+黄填充随“全部”过来，一次撤销同时还原值/样式
+- `paste_special_transpose_keeps_source_coordinates`：A1:B1 → D11/D12 得 `=D11`/`=D12`（与 COM 一致）
+- `paste_special_external_tsv_keeps_blank_rows`：`a\n\nb` 粘成 A1/B1 空/C1
+- `paste_special_divide_by_zero_reports_error`：8 ÷ 0 → `#DIV/0!`，不静默保留 8
+- 既有 `paste_special_values_transpose_and_operations`（数值/转置/加法）
+
+## 真实窗口
+
+`ui06-paste-special-dialog.png`：选择性粘贴对话框含“粘贴内容：全部/数值/公式/格式”、
+“转置（行列互换）”、“运算：无/加/减/乘/除”，当前单元格 C3 的编辑栏显示 `=A1+$B$1`。
+对话框“确定”调用的就是上面测试覆盖的 `paste_special_apply`。
+
+## 边界
+
+- 跨工作簿粘贴的样式映射仍是 UI-07；本切片只保证同簿内的内容/样式/运算语义。
+- 系统剪贴板跨应用行为不在本切片（UI-07）。

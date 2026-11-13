@@ -1895,6 +1895,148 @@ fn paste_special_values_transpose_and_operations() {
     assert_eq!(app.wb.sheet(0).value(10, 1), sheetcore::model::Value::Number(12.0));
 }
 
+/// UI-06：公式粘贴按目标位置平移相对引用、绝对引用不变。
+/// Excel 基准：C3 的 =A1+$B$1 粘到 B2 → =#REF!+$B$1；粘到 D4 → =B2+$B$1。
+#[test]
+fn paste_special_formula_shifts_relative_and_keeps_absolute() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let src = Cell { value: Value::Number(5.0), formula: Some("=A1+$B$1".into()) };
+    let clip = |rect: (u32, u32, u32, u32)| Clip {
+        sheet: 0,
+        rect,
+        cells: vec![vec![(src.clone(), 0)]],
+        cut: false,
+    };
+    app.ps_kind = 2;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+
+    // C3 (2,2) → B2 (1,1)：相对 A1 变成 -1,-1 → #REF!
+    app.clip = Some(clip((2, 2, 2, 2)));
+    app.sel = (1, 1);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(1, 1).and_then(|c| c.formula.clone()).as_deref(),
+        Some("=#REF!+$B$1"),
+        "负偏移必须变 #REF!，绝对引用保持"
+    );
+
+    // C3 (2,2) → D4 (3,3)：+1,+1 → B2
+    app.clip = Some(clip((2, 2, 2, 2)));
+    app.sel = (3, 3);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).get(3, 3).and_then(|c| c.formula.clone()).as_deref(),
+        Some("=B2+$B$1"),
+        "正偏移按目标位置平移"
+    );
+}
+
+/// UI-06：“全部”要连源字体和填充一起带过来，且一次撤销同时还原值与样式。
+#[test]
+fn paste_special_all_carries_font_and_fill_and_undoes_once() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // 源样式：加粗 + 黄色填充
+    let sid = app.wb.styles.intern(sheetcore::style::CellStyle {
+        bold: true,
+        fill: Some([255, 255, 0]),
+        ..Default::default()
+    });
+    let cell = Cell { value: Value::Number(9.0), formula: None };
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 0, 0),
+        cells: vec![vec![(cell, sid as u16)]],
+        cut: false,
+    });
+    app.ps_kind = 0;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+    app.sel = (4, 4);
+    let before_undo = app.undo.depth();
+    app.paste_special_apply(&ctx);
+
+    let pasted_sid = app.wb.sheet(0).style_of(4, 4);
+    let st = app.wb.styles.get(pasted_sid).clone();
+    assert!(st.bold, "“全部”必须保留源字体");
+    assert_eq!(st.fill, Some([255, 255, 0]), "“全部”必须保留源填充");
+    assert_eq!(app.undo.depth(), (before_undo.0 + 1, 0), "一次粘贴一步撤销");
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(4, 4), Value::Empty, "撤销恢复目标值");
+    let back = app.wb.styles.get(app.wb.sheet(0).style_of(4, 4)).clone();
+    assert!(!back.bold && back.fill.is_none(), "撤销同时恢复样式");
+}
+
+/// UI-06：转置后仍用源坐标算偏移，不能被转置后的下标带偏。
+#[test]
+fn paste_special_transpose_keeps_source_coordinates() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // 源 A1:B1，两个公式分别为 =A1 与 =B1
+    let f = |t: &str| (Cell { value: Value::Empty, formula: Some(t.into()) }, 0u16);
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (0, 0, 0, 1),
+        cells: vec![vec![f("=A1"), f("=B1")]],
+        cut: false,
+    });
+    app.ps_kind = 2;
+    app.ps_transpose = true;
+    app.ps_op = 0;
+    app.sel = (10, 3); // D11
+    app.paste_special_apply(&ctx);
+    // 转置后占 D11:D12：D11 来自 A1（+10,+3 → =D11），D12 来自 B1（+10,+2 → =D12）。
+    // 若用转置后的下标算偏移，D12 会被错当成 +10,+1 得到 =C12。
+    let d11 = app.wb.sheet(0).get(10, 3).and_then(|c| c.formula.clone());
+    let d12 = app.wb.sheet(0).get(11, 3).and_then(|c| c.formula.clone());
+    assert_eq!(d11.as_deref(), Some("=D11"), "A1 → D11 的偏移");
+    assert_eq!(d12.as_deref(), Some("=D12"), "B1 → D12 用原始源坐标，不是转置后的列");
+}
+
+/// UI-06：TSV 中间空行不能被压掉。
+#[test]
+fn paste_special_external_tsv_keeps_blank_rows() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.clip = None;
+    app.clip_stamp = None;
+    app.ps_kind = 1;
+    app.ps_transpose = false;
+    app.ps_op = 0;
+    app.sel = (0, 0);
+    app.paste_special_apply_text(&ctx, Some("a\n\nb".into()));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("a".into()));
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty, "中间空行要保留");
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Text("b".into()));
+}
+
+/// UI-06：除零不能静默成功，要写 #DIV/0!。
+#[test]
+fn paste_special_divide_by_zero_reports_error() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(8.0), formula: None });
+    app.clip = Some(Clip {
+        sheet: 0,
+        rect: (5, 5, 5, 5),
+        cells: vec![vec![(Cell { value: Value::Number(0.0), formula: None }, 0)]],
+        cut: false,
+    });
+    app.ps_kind = 1;
+    app.ps_transpose = false;
+    app.ps_op = 4;
+    app.sel = (0, 0);
+    app.paste_special_apply(&ctx);
+    assert_eq!(
+        app.wb.sheet(0).value(0, 0),
+        Value::Error(sheetcore::formula::ErrKind::Div0),
+        "除零必须写 #DIV/0!"
+    );
+}
+
 #[test]
 fn totals_row_adds_subtotal_and_removes_cleanly() {
     let ctx = egui::Context::default();

@@ -2570,6 +2570,7 @@ impl SheetApp {
                             self.chart_mgr = true;
                             self.reload_charts();
                         }
+                        Ok("ps") => self.paste_special = true,
                         Ok("about") => self.about_open = true,
                         Ok("spark") => self.spark_open_create(
                             sheetcore::sparkline::SparkKind::Line,
@@ -26359,6 +26360,18 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "delete" => key = Some(egui::Key::Delete),
             "backspace" => key = Some(egui::Key::Backspace),
             "z" => key = Some(egui::Key::Z),
+            "f" => key = Some(egui::Key::F),
+            "h" => key = Some(egui::Key::H),
+            "g" => key = Some(egui::Key::G),
+            "v" => key = Some(egui::Key::V),
+            "c" => key = Some(egui::Key::C),
+            "x" => key = Some(egui::Key::X),
+            "b" => key = Some(egui::Key::B),
+            "i" => key = Some(egui::Key::I),
+            "u" => key = Some(egui::Key::U),
+            "o" => key = Some(egui::Key::O),
+            "n" => key = Some(egui::Key::N),
+            "p" => key = Some(egui::Key::P),
             other => eprintln!("[keyseq] 未知按键 {other}"),
         }
     }

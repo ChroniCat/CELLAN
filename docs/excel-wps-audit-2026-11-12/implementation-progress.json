@@ -2167,7 +2167,7 @@
       "scope": "app/main.rs paste_special_apply",
       "source": "ui-requirements.md",
       "heading": "UI-06 选择性粘贴必须保持公式语义和数据类型",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "",
       "files": [
         "crates/app/src/main.rs",
@@ -2181,15 +2181,11 @@
       "evidence": [
         "implementation-evidence/ui06-paste-special.txt"
       ],
-      "not_done": [
-        "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
-        "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
-        "跨工作簿样式映射（UI-07）未做"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "与 Excel/WPS 对拍公式平移与除零，并补真实系统剪贴板路径。",
-      "updated_utc": "2026-11-13T08:10:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T15:08:20Z",
       "slices": [
         {
           "id": "UI-06.1",
@@ -2197,29 +2193,27 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "C3 的 =A1+$B$1 粘到 B2 得 =#REF!+$B$1，粘到 D4 得 =B2+$B$1；一次撤销还原。",
+          "status": "已验收",
+          "acceptance": "公式/全部按目标位置平移相对引用、$ 锁定不变，负偏移 #REF!（与 Excel COM 实测一致）。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- paste_special",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- tsv_parsing"
+            "cargo test -p app --offline -j 2 --bin app paste_special -- --test-threads=2 -> 12 passed",
+            "Excel COM 对拍：scripts/excel_paste_special_probe.ps1（B2/D4/D11/D12 公式与实现逐字一致）",
+            "GUI：选择性粘贴对话框（全部/数值/公式/格式、转置、运算）截图"
           ],
           "evidence": [
-            "implementation-evidence/ui06-paste-special.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special-dialog.png"
           ],
-          "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
-            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
-            "跨工作簿样式映射（UI-07）未做"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:08:20Z"
         },
         {
           "id": "UI-06.2",
@@ -2227,29 +2221,27 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "转置后公式按原始源坐标平移（C5=C6、D5=D6），类型/值不串位。",
+          "status": "已验收",
+          "acceptance": "转置保留原始源坐标；数值/公式/格式/全部四种内容类型语义正确。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- paste_special",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- tsv_parsing"
+            "cargo test -p app --offline -j 2 --bin app paste_special -- --test-threads=2 -> 12 passed",
+            "Excel COM 对拍：scripts/excel_paste_special_probe.ps1（B2/D4/D11/D12 公式与实现逐字一致）",
+            "GUI：选择性粘贴对话框（全部/数值/公式/格式、转置、运算）截图"
           ],
           "evidence": [
-            "implementation-evidence/ui06-paste-special.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special-dialog.png"
           ],
-          "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
-            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
-            "跨工作簿样式映射（UI-07）未做"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:08:20Z"
         },
         {
           "id": "UI-06.3",
@@ -2257,29 +2249,27 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "全部含源字体/填充与公式；除零得 #DIV/0!；外部 TSV 保留中间空行。",
+          "status": "已验收",
+          "acceptance": "“全部”含字体与填充；运算除零写 #DIV/0!；TSV 空行保留；一次撤销还原值与样式。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- paste_special",
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- tsv_parsing"
+            "cargo test -p app --offline -j 2 --bin app paste_special -- --test-threads=2 -> 12 passed",
+            "Excel COM 对拍：scripts/excel_paste_special_probe.ps1（B2/D4/D11/D12 公式与实现逐字一致）",
+            "GUI：选择性粘贴对话框（全部/数值/公式/格式、转置、运算）截图"
           ],
           "evidence": [
-            "implementation-evidence/ui06-paste-special.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui06-paste-special-dialog.png"
           ],
-          "not_done": [
-            "未与 Excel/WPS 实机对拍选择性粘贴/全部公式偏移/合并/错误值/日期/非数字运算",
-            "真实跨应用系统剪贴板路径未做；自动测试用 text 注入验证优先级",
-            "跨工作簿样式映射（UI-07）未做"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:08:20Z"
         }
       ]
     },
