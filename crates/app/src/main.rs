@@ -750,6 +750,8 @@ struct SheetApp {
     /// 查找替换
     find: FindState,
     find_scan: Option<FindScan>,
+    /// 上一帧有模态对话框：网格不得再处理这一帧的点击（否则点“关闭”会穿透选中背后的单元格）
+    dialog_modal: bool,
     /// 缩放
     zoom: f32,
     /// 功能区当前页签：XML 里的页签序号；100 表设计 / 101 图表工具
@@ -1479,6 +1481,7 @@ impl SheetApp {
             clip: None,
             find: FindState::default(),
             find_scan: None,
+            dialog_modal: false,
             zoom: 1.0,
             ribbon_tab: std::env::var("SC_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             ribbon: ribbon::load(),
@@ -17689,7 +17692,12 @@ let txn = self.txn_begin(&keys);
         if cancel_scan {
             self.cancel_find_scan();
         }
-        self.find.open = open && !close;
+        let now_open = open && !close;
+        self.find.open = now_open;
+        if !now_open {
+            // 对话框关闭后把键盘焦点还给网格；否则 Esc/× 后第一次键入仍被隐藏的查找框吃掉。
+            ctx.memory_mut(|m| m.stop_text_input());
+        }
     }
 
     /// “查找全部”结果列表：点击任意一项跳到该格。
@@ -19113,7 +19121,15 @@ let txn = self.txn_begin(&keys);
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
         self.last_view = avail;
-        let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
+        if self.dialog_modal {
+            self.grid_press = None;
+        }
+        let pane_sense = if self.dialog_modal {
+            egui::Sense::hover()
+        } else {
+            Sense::click_and_drag()
+        };
+        let (resp, painter) = ui.allocate_painter(avail, pane_sense);
         let origin = resp.rect.min;
         self.last_pane = origin;
         // 视图 → 标题：关掉列标/行号后表头占 0 像素，网格从左上角开始
@@ -19141,7 +19157,7 @@ let txn = self.txn_begin(&keys);
         painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
 
         // 滚轮
-        if resp.hovered() {
+        if resp.hovered() && !self.dialog_modal {
             let d = ui.input(|i| i.raw_scroll_delta);
             self.scroll -= d;
         }
@@ -21440,7 +21456,7 @@ let txn = self.txn_begin(&keys);
         // 按下即落锚点（Excel 的行为）。egui 的 clicked() 要等松开、drag_started() 要等超过阈值，
         // 只靠它们的话「快速点按后马上拖」会从上一个选区开始长，手感上也像延迟了一拍。
         if !readonly {
-            let pressed = ui.input(|i| i.pointer.primary_pressed());
+            let pressed = !self.dialog_modal && ui.input(|i| i.pointer.primary_pressed());
             if pressed {
                 if let Some(p) = ui.ctx().input(|i| i.pointer.press_origin()) {
                     let inside = p.x > origin.x + head_w && p.y > origin.y + hh && resp.rect.contains(p);
@@ -23778,6 +23794,8 @@ impl eframe::App for SheetApp {
             }
         }
         let __cpu_t0 = std::time::Instant::now();
+        // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
+        self.dialog_modal = self.find.open;
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

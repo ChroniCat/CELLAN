@@ -5630,3 +5630,20 @@ fn cross_sheet_undo_clears_restored_extra_selection() {
         "格式操作不能碰历史远端区域"
     );
 }
+
+/// 模态对话框存在时，关闭按钮同帧的点击不能穿透到网格选中背后的单元格。
+#[test]
+fn modal_dialog_click_does_not_select_grid_behind() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let pos = egui::pos2(
+        HEAD_W + app.wb.sheets[0].cols.pos(2) + 15.0,
+        HEAD_H + app.wb.sheets[0].rows.pos(2) + 10.0,
+    );
+    app.dialog_modal = true;
+    click_grid(&mut app, &ctx, pos);
+    assert_eq!(app.sel, (0, 0), "对话框打开时点击关闭不能选中背后的 C3");
+    app.dialog_modal = false;
+    click_grid(&mut app, &ctx, pos);
+    assert_eq!(app.sel, (2, 2), "对话框关闭后网格点击应恢复正常");
+}
