@@ -92,6 +92,15 @@ fn sheet_index(wb: &crate::Workbook, name: Option<&str>, cur: usize) -> usize {
     }
 }
 
+/// 三维引用 `Sheet1:Sheet3` 的 sheet 下标；端点缺失时返回空，让依赖图
+/// 保守地不把错误引用挂到别的表上。
+fn sheet_span(wb: &crate::Workbook, a: &str, b: &str) -> Vec<usize> {
+    let Some(ia) = wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(a)) else { return vec![] };
+    let Some(ib) = wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(b)) else { return vec![] };
+    let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
+    (lo..=hi).collect()
+}
+
 fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
     match node {
         Node::Ref(re) | Node::Spill(re) => {
@@ -99,30 +108,44 @@ fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
             if re.book.is_some() {
                 return;
             }
-            let sheet = sheet_index(wb, re.sheet.as_deref(), si);
+            let sheets = if let (Some(a), Some(b)) = (re.sheet.as_deref(), re.sheet2.as_deref()) {
+                sheet_span(wb, a, b)
+            } else {
+                vec![sheet_index(wb, re.sheet.as_deref(), si)]
+            };
             let r = re.row.max(0);
             let c = re.col.max(0);
-            out.push(Rect { sheet, r1: r, c1: c, r2: r, c2: c });
+            for sheet in sheets {
+                out.push(Rect { sheet, r1: r, c1: c, r2: r, c2: c });
+            }
         }
         Node::Range(a, b) => {
             if a.book.is_some() || b.book.is_some() {
                 return;
             }
-            let sheet = sheet_index(wb, a.sheet.as_deref().or(b.sheet.as_deref()), si);
-            out.push(Rect {
-                sheet,
-                r1: a.row.min(b.row).max(0),
-                c1: a.col.min(b.col).max(0),
-                r2: a.row.max(b.row).max(0),
-                c2: a.col.max(b.col).max(0),
-            });
+            let sheets = if let (Some(x), Some(y)) = (a.sheet.as_deref(), a.sheet2.as_deref()) {
+                sheet_span(wb, x, y)
+            } else if let (Some(x), Some(y)) = (b.sheet.as_deref(), b.sheet2.as_deref()) {
+                sheet_span(wb, x, y)
+            } else {
+                vec![sheet_index(wb, a.sheet.as_deref().or(b.sheet.as_deref()), si)]
+            };
+            for sheet in sheets {
+                out.push(Rect {
+                    sheet,
+                    r1: a.row.min(b.row).max(0),
+                    c1: a.col.min(b.col).max(0),
+                    r2: a.row.max(b.row).max(0),
+                    c2: a.col.max(b.col).max(0),
+                });
+            }
         }
         Node::Func(_, args) => {
             for a in args {
                 walk(a, si, wb, out);
             }
         }
-        Node::Unary(_, x) | Node::Percent(x) => walk(x, si, wb, out),
+        Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => walk(x, si, wb, out),
         Node::Binary(_, l, r) => {
             walk(l, si, wb, out);
             walk(r, si, wb, out);
@@ -142,7 +165,7 @@ fn dynamic(node: &Node, include_volatile: bool) -> bool {
         Node::Func(name, args) => matches!(name.as_str(), "INDIRECT" | "OFFSET")
             || (include_volatile && matches!(name.as_str(), "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"))
             || args.iter().any(|n| dynamic(n, include_volatile)),
-        Node::Unary(_, n) | Node::Percent(n) => dynamic(n, include_volatile),
+        Node::Implicit(n) | Node::Unary(_, n) | Node::Percent(n) => dynamic(n, include_volatile),
         Node::Binary(_, a, b) => dynamic(a, include_volatile) || dynamic(b, include_volatile),
         _ => false,
     }

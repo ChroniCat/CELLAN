@@ -511,6 +511,81 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
 /// Rename a local sheet qualifier, or replace a deleted sheet reference with
 /// `#REF!`. Strings, structured column names and external workbook references
 /// are copied intact. Coordinates keep their original spelling and `$` flags.
+/// 从 `i` 读一个表名（引号表名或裸标识符），返回 (名字, 结尾)。
+fn name_at(b: &[u8], formula: &str, i: usize) -> Option<(String, usize)> {
+    if b.get(i) == Some(&b'\'') {
+        let end = quoted_end(b, i, b'\'');
+        if end <= i + 1 || b.get(end - 1) != Some(&b'\'') {
+            return None;
+        }
+        return Some((formula[i + 1..end - 1].replace("''", "'"), end));
+    }
+    let mut end = i;
+    while b.get(end).is_some_and(|c| is_ident_byte(*c)) {
+        end += 1;
+    }
+    (end > i).then(|| (formula[i..end].to_owned(), end))
+}
+
+/// 识别 `Sheet1:Sheet3!` 的三维限定符。返回：
+/// (bang 之后的位置, 起始表名, 结束表名, 起始名结束, 结束名结束)。
+fn scan_3d(b: &[u8], formula: &str, i: usize) -> Option<(usize, String, String, usize, usize)> {
+    let (a, ea) = name_at(b, formula, i)?;
+    if b.get(ea) != Some(&b':') {
+        return None;
+    }
+    let (z, ez) = name_at(b, formula, ea + 1)?;
+    (b.get(ez) == Some(&b'!')).then_some((ez + 1, a, z, ea, ez))
+}
+
+/// 识别整段引号的三维区间：`'Start 1:End 3'!`。
+/// 返回 (bang 后位置, 起始名, 结束名, 结束引号后位置)。
+fn scan_quoted_3d(b: &[u8], formula: &str, i: usize) -> Option<(usize, String, String, usize)> {
+    if b.get(i) != Some(&b'\'') {
+        return None;
+    }
+    let qe = quoted_end(b, i, b'\'');
+    if qe <= i + 2 || b.get(qe) != Some(&b'!') || b.get(qe - 1) != Some(&b'\'') {
+        return None;
+    }
+    let content = &formula[i + 1..qe - 1];
+    let (a, z) = content.split_once(':')?;
+    if a.is_empty() || z.is_empty() || a.contains('[') || z.contains('[') {
+        return None;
+    }
+    Some((qe + 1, a.replace("''", "'"), z.replace("''", "'"), qe))
+}
+
+fn whole_3d_quote(a: &str, z: &str) -> String {
+    format!("'{}:{}'!", a.replace('\'', "''"), z.replace('\'', "''"))
+}
+
+/// 三维表名在公式里的显示形式；有空格、引号等字符时加单引号。
+fn quote_3d_sheet(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+}
+
+/// 删除端点时沿用原公式的引号风格，避免中文/空格名被改写成另一种
+/// 合法但用户没写过的形式。
+fn render_endpoint(name: &str, was_quoted: bool) -> String {
+    if was_quoted {
+        format!("'{}'", name.replace('\'', "''"))
+    } else if name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+    {
+        name.to_owned()
+    } else {
+        quote_3d_sheet(name)
+    }
+}
+
 pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
     let b = formula.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -549,6 +624,71 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
             out.extend_from_slice(&b[start..i]);
             continue;
         }
+        if let Some((after_bang, a, z, qe)) = scan_quoted_3d(b, formula, i) {
+            let hit_a = a.eq_ignore_ascii_case(old);
+            let hit_z = z.eq_ignore_ascii_case(old);
+            if let Some(new) = new {
+                let sa = if hit_a { new } else { a.as_str() };
+                let sz = if hit_z { new } else { z.as_str() };
+                out.extend_from_slice(whole_3d_quote(sa, sz).as_bytes());
+                i = after_bang;
+            } else if hit_a || hit_z {
+                out.extend_from_slice(b"#REF!");
+                i = consume_ref_after(b, after_bang, &identity);
+            } else {
+                out.extend_from_slice(&b[i..after_bang]);
+                i = after_bang;
+            }
+            continue;
+        }
+        if let Some((after_bang, a, z, ea, ez)) = scan_3d(b, formula, i) {
+            let hit_a = a.eq_ignore_ascii_case(old);
+            let hit_z = z.eq_ignore_ascii_case(old);
+            if let Some(new) = new {
+                if hit_a {
+                    out.extend_from_slice(quote_3d_sheet(new).as_bytes());
+                } else {
+                    out.extend_from_slice(&b[i..ea]);
+                }
+                out.push(b':');
+                if hit_z {
+                    out.extend_from_slice(quote_3d_sheet(new).as_bytes());
+                } else {
+                    out.extend_from_slice(&b[ea + 1..ez]);
+                }
+                out.push(b'!');
+                i = after_bang;
+            } else if hit_a || hit_z {
+                // 删除三维区间端点：整个三维引用失去端点，按 Excel 的
+                // 失败方式写成 #REF!，并吞掉后面的单元格/区域。
+                let mut j = after_bang;
+                if b[j..].starts_with(b"#REF!") {
+                    j += 5;
+                } else if let Some(reference) = parse_ref(b, j, &identity, None) {
+                    j = reference.end;
+                    // 三维引用也可能是 A1:B2/整行区间；吞掉第二个端点，
+                    // 否则会留下 `#REF!:B2` 这种不可解析的残片。
+                    if b.get(j) == Some(&b':') {
+                        if let Some(second) = parse_ref(b, j + 1, &identity, None) {
+                            j = second.end;
+                        }
+                    }
+                } else {
+                    while b.get(j).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+                        j += 1;
+                    }
+                }
+                if b.get(j) == Some(&b'#') {
+                    j += 1;
+                }
+                out.extend_from_slice(b"#REF!");
+                i = j;
+            } else {
+                out.extend_from_slice(&b[i..after_bang]);
+                i = after_bang;
+            }
+            continue;
+        }
         let name = if b[i] == b'\'' {
             i = quoted_end(b, i, b'\'');
             if i > start + 1 && b[i - 1] == b'\'' {
@@ -558,11 +698,17 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
             while b.get(i).is_some_and(|c| is_ident_byte(*c)) { i += 1; }
             Some(formula[start..i].to_owned())
         } else {
+            if b[i] >= 0x80 {
+                let ch = formula[i..].chars().next().expect("valid UTF-8");
+                let n = ch.len_utf8();
+                out.extend_from_slice(&b[i..i + n]);
+                i += n;
+                continue;
+            }
             i += 1;
             None
         };
         if b.get(i) == Some(&b'!') && name.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(old))
-            // Do not partially rewrite unsupported unquoted 3D qualifiers.
             && (start == 0 || !matches!(b[start - 1], b':' | b'#'))
         {
             if let Some(new) = new {
@@ -587,6 +733,184 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
         }
     }
     String::from_utf8(out).expect("reference rewriting preserves UTF-8")
+}
+
+/// 删除表格时，三维区间的端点要收缩到**删前区间内的相邻表**。
+/// 不能拿全局 next/prev：`Third:First` 的 end 在低索引侧，
+/// `Second:Second` 删掉唯一成员必须整段 `#REF!`，不能写半截。
+pub fn retarget_3d_endpoint(formula: &str, old: &str, order: &[String]) -> String {
+    let b = formula.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    let identity = Shift {
+        axis: Axis::Row,
+        at: 0,
+        n: 0,
+        delete: false,
+        target_sheet: String::new(),
+        own_sheet: String::new(),
+        translate: None,
+        row_filter: None,
+        col_filter: None,
+    };
+    while i < b.len() {
+        let start = i;
+        if b[i] == b'"' {
+            i = quoted_end(b, i, b'"');
+            out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        if let Some((after_bang, a, z, _qe)) = scan_quoted_3d(b, formula, i) {
+            let hit_a = a.eq_ignore_ascii_case(old);
+            let hit_z = z.eq_ignore_ascii_case(old);
+            if hit_a || hit_z {
+                let sa = if hit_a {
+                    neighbor_name(order, old, &a, &a, &z, true)
+                } else {
+                    Some(a.clone())
+                };
+                let sz = if hit_z {
+                    neighbor_name(order, old, &z, &a, &z, false)
+                } else {
+                    Some(z.clone())
+                };
+                match (sa, sz) {
+                    (Some(sa), Some(sz)) => {
+                        out.extend_from_slice(whole_3d_quote(&sa, &sz).as_bytes());
+                        i = after_bang;
+                    }
+                    _ => {
+                        out.extend_from_slice(b"#REF!");
+                        i = consume_ref_after(b, after_bang, &identity);
+                    }
+                }
+            } else {
+                out.extend_from_slice(&b[i..after_bang]);
+                i = after_bang;
+            }
+            continue;
+        }
+        if let Some((after_bang, a, z, ea, ez)) = scan_3d(b, formula, i) {
+            let hit_a = a.eq_ignore_ascii_case(old);
+            let hit_z = z.eq_ignore_ascii_case(old);
+            if hit_a || hit_z {
+                let sa = if hit_a {
+                    neighbor_name(order, old, &a, &a, &z, true)
+                } else {
+                    Some(a.clone())
+                };
+                let sz = if hit_z {
+                    neighbor_name(order, old, &z, &a, &z, false)
+                } else {
+                    Some(z.clone())
+                };
+                let (Some(sa), Some(sz)) = (sa, sz) else {
+                    out.extend_from_slice(b"#REF!");
+                    i = consume_ref_after(b, after_bang, &identity);
+                    continue;
+                };
+                if hit_a {
+                    out.extend_from_slice(
+                        render_endpoint(&sa, b.get(i) == Some(&b'\'')).as_bytes(),
+                    );
+                } else {
+                    out.extend_from_slice(&b[i..ea]);
+                }
+                out.push(b':');
+                if hit_z {
+                    out.extend_from_slice(
+                        render_endpoint(&sz, b.get(ea + 1) == Some(&b'\'')).as_bytes(),
+                    );
+                } else {
+                    out.extend_from_slice(&b[ea + 1..ez]);
+                }
+                out.push(b'!');
+                i = after_bang;
+            } else {
+                out.extend_from_slice(&b[i..after_bang]);
+                i = after_bang;
+            }
+            continue;
+        }
+        if b[i] >= 0x80 {
+            // UTF-8 字符必须整字前进；否则下一轮会从第二字节调用
+            // name_at/scan_3d，formula[i..end] 直接 panic。
+            let ch = formula[i..].chars().next().expect("valid UTF-8");
+            let n = ch.len_utf8();
+            out.extend_from_slice(&b[i..i + n]);
+            i += n;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("reference rewriting preserves UTF-8")
+}
+
+/// 删除 `endpoint` 时的收缩目标。返回 None 表示区间已无剩余成员，
+/// 整个三维引用必须变成 `#REF!`。
+fn neighbor_name(
+    order: &[String],
+    old: &str,
+    endpoint: &str,
+    a: &str,
+    z: &str,
+    start: bool,
+) -> Option<String> {
+    if !endpoint.eq_ignore_ascii_case(old) {
+        return Some(endpoint.to_owned());
+    }
+    let (Some(po), Some(pa), Some(pz)) = (
+        order.iter().position(|s| s.eq_ignore_ascii_case(old)),
+        order.iter().position(|s| s.eq_ignore_ascii_case(a)),
+        order.iter().position(|s| s.eq_ignore_ascii_case(z)),
+    ) else {
+        // 外部表或缺失端点：没有本地顺序可调整，保持原文更安全。
+        return Some(endpoint.to_owned());
+    };
+    let lo = pa.min(pz);
+    let hi = pa.max(pz);
+    if po < lo || po > hi {
+        return Some(endpoint.to_owned());
+    }
+    let candidates: Vec<usize> = (lo..=hi).filter(|p| *p != po).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let pick = if start {
+        if pa < pz {
+            candidates.iter().copied().filter(|p| *p > po).min()
+        } else {
+            candidates.iter().copied().filter(|p| *p < po).max()
+        }
+    } else if pz > pa {
+        candidates.iter().copied().filter(|p| *p < pz).max()
+    } else {
+        candidates.iter().copied().filter(|p| *p > pz).min()
+    };
+    pick.map(|p| order[p].clone())
+}
+
+fn consume_ref_after(b: &[u8], mut j: usize, identity: &Shift) -> usize {
+    if b[j..].starts_with(b"#REF!") {
+        return j + 5;
+    }
+    if let Some(reference) = parse_ref(b, j, identity, None) {
+        j = reference.end;
+        if b.get(j) == Some(&b':') {
+            if let Some(second) = parse_ref(b, j + 1, identity, None) {
+                j = second.end;
+            }
+        }
+    } else {
+        while b.get(j).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+            j += 1;
+        }
+    }
+    if b.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    j
 }
 
 fn quoted_end(b: &[u8], start: usize, quote: u8) -> usize {

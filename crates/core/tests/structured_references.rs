@@ -327,3 +327,67 @@ fn original_chinese_bare_current_row_formula_evaluates_two_rows() {
     assert!(dirty.contains(&(0, 1, 2)), "C2 依赖 A2/B2");
     assert!(dirty.contains(&(0, 2, 2)), "C3 依赖 A3/B3");
 }
+
+#[test]
+fn structured_reference_escapes_brackets_pound_apostrophe_and_at() {
+    let mut wb = Workbook::new_blank();
+    let sh = &mut wb.sheets[0];
+    sh.name = "Specials".into();
+    let cols = ["#OfItems", "At@Name", "Bracket]Close", "A'Quote", "A[Bracket"];
+    for (i, name) in cols.iter().enumerate() {
+        sh.set(0, i as u32, Cell { value: Value::Text(name.to_string().into()), formula: None });
+        sh.set(1, i as u32, Cell { value: Value::Number((i as f64 + 1.0) * 10.0), formula: None });
+    }
+    sh.tables.push(Table {
+        name: "Specials".into(),
+        display: "Specials".into(),
+        range: (0, 0, 1, 4),
+        columns: cols.iter().map(|s| s.to_string()).collect(),
+        column_ids: vec![1, 2, 3, 4, 5],
+        header_row: true,
+        totals_row: false,
+    });
+    let cases = [
+        ("=SUM(Specials['#OfItems])", 10.0),
+        ("=SUM(Specials[At'@Name])", 20.0),
+        ("=SUM(Specials[Bracket']Close])", 30.0),
+        ("=SUM(Specials[A''Quote])", 40.0),
+        ("=SUM(Specials[A'[Bracket])", 50.0),
+    ];
+    for (formula, expected) in cases {
+        let expanded = sheetcore::table::expand_structured(&wb, 0, formula).expect("expanded");
+        assert_eq!(expanded, format!("=SUM(A2)").replace("A2", &format!("{}{}", ["A","B","C","D","E"][(expected as usize / 10 - 1)], "2")), "{formula}");
+        wb.sheets[0].set(3, 9, Cell { value: Value::Empty, formula: Some(formula.into()) });
+        sheetcore::formula::recalc_all_force(&mut wb);
+        assert_eq!(wb.sheets[0].value(3, 9), Value::Number(expected), "{formula}");
+    }
+}
+
+#[test]
+fn rename_escaped_special_column_updates_formula_and_header() {
+    let mut wb = Workbook::new_blank();
+    let sh = &mut wb.sheets[0];
+    sh.name = "Specials".into();
+    sh.set(0, 0, Cell { value: Value::Text("#OfItems".into()), formula: None });
+    sh.set(0, 1, Cell { value: Value::Text("Amount".into()), formula: None });
+    sh.set(1, 0, Cell { value: Value::Number(10.0), formula: None });
+    sh.set(1, 1, Cell { value: Value::Number(20.0), formula: None });
+    sh.tables.push(Table {
+        name: "Specials".into(),
+        display: "Specials".into(),
+        range: (0, 0, 1, 1),
+        columns: vec!["#OfItems".into(), "Amount".into()],
+        column_ids: vec![1, 2],
+        header_row: true,
+        totals_row: false,
+    });
+    sh.set(3, 4, Cell { value: Value::Empty, formula: Some("=SUM(Specials['#OfItems])".into()) });
+    assert!(sheetcore::table::rename_table_column(&mut wb, "Specials", "#OfItems", "New#"));
+    assert_eq!(wb.sheets[0].get(0, 0).unwrap().value, Value::Text("New#".into()));
+    assert_eq!(
+        wb.sheets[0].get(3, 4).unwrap().formula.as_deref(),
+        Some("=SUM(Specials[New'#])")
+    );
+    sheetcore::formula::recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(3, 4), Value::Number(10.0));
+}

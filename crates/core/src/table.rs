@@ -372,6 +372,72 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
 ///
 /// 找不到表格时保留原文（让解析器报 #NAME?）；找到表格但列/区域非法时
 /// 返回 Excel 的错误值文本（`#REF!`/`#VALUE!`），不能静默改成别的区域。
+/// 结构化引用里的单引号是列名转义符，不是字符串/表名引号；
+/// 只有 `'Sheet 1'!` 这类真正的工作表限定符才应跳过。
+fn split_quoted_structured(text: &str) -> Vec<(bool, &str)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out: Vec<(bool, &str)> = Vec::new();
+    let mut start = 0usize;
+    let mut k = 0usize;
+    while k < chars.len() {
+        let (i, c) = chars[k];
+        if c == '"' {
+            if i > start {
+                out.push((false, &text[start..i]));
+            }
+            let mut end = i + c.len_utf8();
+            let mut j = k + 1;
+            while j < chars.len() {
+                let (p, q) = chars[j];
+                if q == '"' {
+                    if chars.get(j + 1).map(|(_, n)| *n == '"').unwrap_or(false) {
+                        j += 1;
+                    } else {
+                        end = p + q.len_utf8();
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            out.push((true, &text[i..end]));
+            start = end;
+            k = j + 1;
+            continue;
+        }
+        if c == '\'' {
+            // 先看这是否是 `'Sheet'!` / `'Start 1:End 3'!`。
+            let mut end = i + c.len_utf8();
+            let mut j = k + 1;
+            while j < chars.len() {
+                let (p, q) = chars[j];
+                if q == '\'' {
+                    if chars.get(j + 1).map(|(_, n)| *n == '\'').unwrap_or(false) {
+                        j += 1;
+                    } else {
+                        end = p + q.len_utf8();
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if j + 1 < chars.len() && chars[j + 1].1 == '!' {
+                if i > start {
+                    out.push((false, &text[start..i]));
+                }
+                out.push((true, &text[i..end]));
+                start = end;
+                k = j + 1;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    if start < text.len() {
+        out.push((false, &text[start..]));
+    }
+    out
+}
+
 pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
     expand_structured_at(wb, si, None, None, body)
 }
@@ -381,14 +447,50 @@ fn same_col_name(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// 结构化引用列名的转义：`[ ] # ' @` 在公式里用单引号转义。
+fn unescape_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            if let Some(next) = chars.get(i + 1) {
+                out.push(*next);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn escape_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '[' | ']' | '#' | '\'' | '@') {
+            out.push('\'');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn replace_col_token(text: &str, old: &str, new: &str) -> Option<String> {
     let lead = text.len() - text.trim_start().len();
     let trail = text.len() - text.trim_end().len();
     let core = &text[lead..text.len().saturating_sub(trail)];
-    if core.is_empty() || !same_col_name(core, old) {
+    let unescaped = unescape_ident(core);
+    if unescaped.is_empty() || !same_col_name(&unescaped, old) {
         return None;
     }
-    Some(format!("{}{}{}", &text[..lead], new, &text[text.len() - trail..]))
+    Some(format!(
+        "{}{}{}",
+        &text[..lead],
+        escape_ident(new),
+        &text[text.len() - trail..]
+    ))
 }
 
 /// 改写一个方括号组内部的列名；只替换完整列名，不碰 #Data/#This Row。
@@ -449,26 +551,31 @@ fn bracket_group(s: &str) -> Option<(String, usize)> {
     if !s.starts_with('[') {
         return None;
     }
+    let chars: Vec<char> = s.chars().collect();
     let mut depth = 0usize;
-    let mut in_quote = false;
-    for (i, ch) in s.char_indices() {
-        if in_quote {
-            if ch == '\'' {
-                in_quote = false;
-            }
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            // 结构化引用的单引号是转义符，后面的括号不参与深度计数。
+            i += 2;
             continue;
         }
-        match ch {
-            '\'' => in_quote = true,
+        match chars[i] {
             '[' => depth += 1,
             ']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some((s[1..i].to_string(), i + 1));
+                    let inner: String = chars[1..i].iter().collect();
+                    return Some((inner, s[..]
+                        .char_indices()
+                        .nth(i + 1)
+                        .map(|(pos, _)| pos)
+                        .unwrap_or(s.len())));
                 }
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -879,7 +986,7 @@ pub fn expand_structured_at(
     // `'Sales'!A1` 里的 `Sales` 是工作表名，也不能当表格展开。
     let mut out = String::with_capacity(body.len() + 16);
     let mut changed = false;
-    for (in_quote, seg) in crate::split_quoted(body) {
+    for (in_quote, seg) in split_quoted_structured(body) {
         if in_quote {
             out.push_str(seg);
             continue;
@@ -918,6 +1025,10 @@ fn expand_segment_at(
             let mut j = i;
             let mut depth = 0i32;
             while j < chars.len() {
+                if chars[j] == '\'' {
+                    j += 2;
+                    continue;
+                }
                 if chars[j] == '[' {
                     depth += 1;
                 } else if chars[j] == ']' {
@@ -966,6 +1077,10 @@ fn expand_segment_at(
                 let mut j = i;
                 let mut depth = 0i32;
                 while j < chars.len() {
+                    if chars[j] == '\'' {
+                        j += 2;
+                        continue;
+                    }
                     if chars[j] == '[' {
                         depth += 1;
                     } else if chars[j] == ']' {
@@ -1032,7 +1147,13 @@ fn split_specs(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut depth = 0i32;
-    for (i, ch) in chars.iter().enumerate() {
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            i += 2;
+            continue;
+        }
         match ch {
             '[' => depth += 1,
             ']' => depth -= 1,
@@ -1045,6 +1166,7 @@ fn split_specs(s: &str) -> Vec<String> {
             }
             _ => {}
         }
+        i += 1;
     }
     if start < chars.len() {
         let piece: String = chars[start..].iter().collect();
@@ -1058,8 +1180,13 @@ fn split_specs(s: &str) -> Vec<String> {
 fn split_colon(s: &str) -> Option<(String, String)> {
     let chars: Vec<char> = s.chars().collect();
     let mut depth = 0i32;
-    for (i, ch) in chars.iter().enumerate() {
-        match ch {
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            i += 2;
+            continue;
+        }
+        match chars[i] {
             '[' => depth += 1,
             ']' => depth -= 1,
             ':' if depth == 0 => {
@@ -1069,6 +1196,7 @@ fn split_colon(s: &str) -> Option<(String, String)> {
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -1100,16 +1228,21 @@ fn expand_table_spec(
         return "#REF!".to_string();
     }
     for raw in specs {
-        let mut tok = raw.trim().to_string();
-        if let Some(rest) = tok.strip_prefix('@') {
-            this_row = true;
-            tok = rest.trim().to_string();
+        let outer = raw.trim().to_string();
+        let mut escaped = outer.starts_with('\'');
+        let mut tok = unescape_ident(&outer);
+        if !escaped {
+            if let Some(rest) = tok.strip_prefix('@') {
+                this_row = true;
+                tok = rest.trim().to_string();
+                escaped = tok.starts_with('\'');
+            }
         }
         // 列区间 [Col1]:[Col2] 的冒号在方括号外，必须先切冒号，
         // 否则整串会被误当成一个 `[... ]` 说明符。
         if let Some((a, b)) = split_colon(&tok) {
-            let ca = strip_outer_brackets(&a).trim().to_string();
-            let cb = strip_outer_brackets(&b).trim().to_string();
+            let ca = unescape_ident(strip_outer_brackets(&a).trim());
+            let cb = unescape_ident(strip_outer_brackets(&b).trim());
             if ca.is_empty() || cb.is_empty() {
                 bad = true;
                 continue;
@@ -1134,13 +1267,15 @@ fn expand_table_spec(
         // 普通说明符去掉一层方括号：[#Data] / [Amount] / [@[Amount]]
         if tok.starts_with('[') && tok.ends_with(']') {
             tok = strip_outer_brackets(&tok).to_string();
+            escaped = tok.starts_with('\'');
+            tok = unescape_ident(&tok);
         }
         let up = tok.to_ascii_uppercase();
-        if up == "#THIS ROW" {
+        if !escaped && up == "#THIS ROW" {
             this_row = true;
             continue;
         }
-        if up.starts_with('#') {
+        if !escaped && up.starts_with('#') {
             let a = match up.as_str() {
                 "#DATA" => "data",
                 "#HEADERS" => "headers",

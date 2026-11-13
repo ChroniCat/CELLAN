@@ -1,0 +1,42 @@
+# C11 不支持引用组合：保留公式/缓存 + 兼容提示 + 保存仍保留
+
+状态：链路已实现并验证；拒绝只是安全过渡，不把变造公式当成功保存。
+日期：2026-11-13。
+
+## 实现
+
+- `xls_write::write` 在创建输出前编译所有工作表公式；`.xls` 的 BIFF
+  不能表达 `@` 隐式交集、`#` 动态数组等时返回错误，并附加：
+  `兼容提示：.xls 不能完整保存该公式/引用组合（工作表 Data）...`
+- `xlsx::save_atomic` 先写临时文件，失败不替换目标；核心 `xls_write`
+  只在全部工作表编译后才写 OLE，因此失败不改目标。
+- App `start_save` 失败恢复 `dirty=true`，状态栏显示错误（含兼容提示），
+  原工作簿模型里的公式和缓存值不变；用户可另存 `.xlsx`。
+- 这不是把不支持公式静默写成首表/错误值；也不会把旧的正确 `.xls`
+  覆盖成半成品。
+
+## 自动化
+
+```text
+cargo test -p sheetcore --offline xls_write
+（含 unsupported_formula_save_keeps_target_and_reports_compatibility）
+passed; 0 failed
+
+cargo test -p app --offline --bin app
+202 passed; 0 failed; 0 ignored
+（含 unsupported_xls_save_keeps_formula_and_shows_compatibility_warning）
+```
+
+测试断言：
+
+1. 目标 `.xls` 预先写入 `ORIGINAL`，保存失败后字节仍为 `ORIGINAL`；
+2. 模型里 `Data!A1` 的 `=@A1`、缓存 7 仍存在；
+3. 错误文本包含“兼容提示”和单元格位置；
+4. 同一工作簿另存 `.xlsx` 后重新加载，公式 `=@A1` 和缓存 7 仍在；
+5. App 层失败保持 dirty，状态栏显示兼容提示。
+
+## 边界
+
+- `.xls` 不能表达的组合仍不能“原样”写入 `.xls`；本实现选择保留源
+  模型/目标文件并提示另存，而不是伪造 BIFF 公式。后续若要更强兼容，
+  需要单独设计降级公式和回读提示，不能把本条当成已完成。

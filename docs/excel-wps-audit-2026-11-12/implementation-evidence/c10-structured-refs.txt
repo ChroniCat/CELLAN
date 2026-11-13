@@ -88,3 +88,7 @@ cargo test -p app --offline --bin app
 
 **保留边界**：特殊字符列名目前只覆盖空格、逗号、百分号；括号和结构化引用转义
 尚未覆盖，不能宣称完整 Excel 结构化引用语法。C10.1 仍待独立复核，父项 C10 未完成。
+
+## 2026-11-13 13:10 特殊字符转义补充
+
+C10.1 用户已认可；本轮只补 `[ ] # ' @` 转义：structured_references 14 passed；真实 Excel 探测见 `c10-structured-escapes.txt`。C10.2/C10.3 与父项仍未验收。

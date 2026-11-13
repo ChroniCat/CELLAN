@@ -63,3 +63,7 @@ cargo test -p app --offline --bin app
 - 未做 Excel/WPS 实机整行公式对拍；不能据此宣称 Office 兼容完成。
 - C11.3 隐式交集、C11.4 三维引用未实施；C11 父项仍未验收。
 - 特殊字符结构化列名的括号/转义边界沿用 C10.1 未覆盖状态。
+
+## 2026-11-13 13:10 当前回归
+
+C11.1 用户已认可不重开；当前全量 core 74 bins / 674 passed / 0 failed / 41 ignored，app 202 passed / 0 failed。上面的 650/201 是 11:38 历史快照，不再作为当前证据。

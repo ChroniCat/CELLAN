@@ -1,10 +1,10 @@
 //! 写老式 .xls（BIFF8）。
 //!
-//! 只写「值和格式」：数字、文本、布尔、字体/字号/加粗/颜色、数字格式、对齐、
-//! 换行、四边边框、底色、合并区、列宽、行高。
-//!
-//! **公式不写**：BIFF 的公式是 RPN 记号流，把 `=A1+B1` 原样塞进文件会让 Excel
-//! 认为文件损坏。带公式的工作簿直接报错，让调用方引导用户存 xlsx。
+//! 写值、格式和 BIFF 可表达的公式（数字、文本、布尔、字体/字号/加粗/颜色、
+//! 数字格式、对齐、换行、四边边框、底色、合并区、列宽、行高）。
+//! 公式必须编译成 BIFF 的 RPN 记号流；`@` 隐式交集、动态数组 `#` 等
+//! `.xls` 不能表达的语法会在写盘前报“兼容提示”，原文件和模型里的公式、
+//! 缓存值保持不变，调用方应引导用户另存为 `.xlsx`。
 //!
 //! 字符串用 LABEL 记录内联（不用 SST），省掉共享字符串表的分段逻辑；
 //! Excel 一直支持 LABEL。
@@ -620,7 +620,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     }
 
     for (i, s) in wb.sheets.iter().enumerate() {
-        sheets.push(sheet_stream(
+        let stream = sheet_stream(
             s,
             i,
             &sheet_names,
@@ -631,7 +631,15 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
             &mut tables,
             &mut cache,
             wb.calc_manual,
-        )?);
+        )
+        .with_context(|| {
+            format!(
+                "兼容提示：.xls 不能完整保存该公式/引用组合（工作表 {}）；\
+                 原文件和单元格里的公式、缓存值都保留，请另存为 .xlsx 或修改公式后重试",
+                s.name
+            )
+        })?;
+        sheets.push(stream);
     }
 
     // 全局流：前缀、标准字体/XF 块都来自内嵌的合法骨架（Excel 生成），
@@ -881,6 +889,42 @@ mod tests {
         let back = crate::xlsx::load(&p).unwrap();
         assert!(!back.calc_manual, "BIFF CALCMODE 自动模式应读回");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unsupported_formula_save_keeps_target_and_reports_compatibility() {
+        let dir = std::env::temp_dir().join(format!(
+            "sc_xls_unsupported_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("keep.xls");
+        std::fs::write(&target, b"ORIGINAL").unwrap();
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "Data".into();
+        wb.sheets[0].set(0, 0, crate::model::Cell {
+            value: Value::Number(7.0),
+            formula: Some("=@A1".into()),
+        });
+        let err = write(&target, &wb).expect_err("隐式交集不能写 .xls");
+        let text = format!("{err:#}");
+        assert!(text.contains("兼容提示"), "应给兼容提示：{text}");
+        assert!(text.contains("Data!A1"), "应指出单元格：{text}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"ORIGINAL", "失败不得覆盖目标");
+        assert_eq!(wb.sheets[0].get(0, 0).unwrap().formula.as_deref(), Some("=@A1"));
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(7.0));
+
+        // 同一工作簿用 xlsx 保存仍保留公式和缓存，不是只在内存里假装。
+        let xlsx = dir.join("keep.xlsx");
+        crate::xlsx::save(&xlsx, &wb).unwrap();
+        let back = crate::xlsx::load(&xlsx).unwrap();
+        assert_eq!(back.sheets[0].get(0, 0).unwrap().formula.as_deref(), Some("=@A1"));
+        assert_eq!(back.sheets[0].value(0, 0), Value::Number(7.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

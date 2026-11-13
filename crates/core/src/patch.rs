@@ -2635,7 +2635,25 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
             }
             x.replace_range(at..=pe, &newtag);
         } else {
-            x.insert_str(end, &format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>"));
+            // schema 顺序：tabColor → outlinePr → pageSetUpPr。不能紧贴
+            // <sheetPr> 开标签插入，否则会跑到已有的 outlinePr 前面。
+            fn after_child(xml: &str, start: usize, tag: &str) -> Option<usize> {
+                let rel = xml.get(start..)?.find(&format!("<{tag}"))?;
+                let at = start + rel;
+                let tail = &xml[at..];
+                let gt = tail.find('>')?;
+                if tail[..gt].ends_with('/') {
+                    Some(at + gt + 1)
+                } else {
+                    tail.find(&format!("</{tag}>"))
+                        .map(|e| at + e + format!("</{tag}>").len())
+                        .or(Some(at + gt + 1))
+                }
+            }
+            let at = after_child(&x, end, "outlinePr")
+                .or_else(|| after_child(&x, end, "tabColor"))
+                .unwrap_or(end);
+            x.insert_str(at, &format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>"));
         }
     } else {
         // 没有 sheetPr：作为 worksheet 的第一个子元素插入（不能插到 XML 声明后面）

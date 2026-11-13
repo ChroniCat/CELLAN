@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T12:35:00Z",
+  "updated_utc": "2026-11-13T05:11:25Z",
   "tasks": [
     {
       "id": "C01",
@@ -2524,22 +2524,23 @@
         "a0f8284"
       ],
       "commands": [
-        "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
+        "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
         "cargo test -p sheetcore --offline --test table_calculated -> 7 passed",
-        "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored",
-        "cargo test -p app --offline --bin app -> 201 passed / 0 failed (含 TableFillCalculated 生产入口)"
+        "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored",
+        "cargo test -p app --offline --bin app -> 202 passed / 0 failed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-calculated.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured/core.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-calculated/app.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-calculated/app.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-escapes.txt"
       ],
       "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "C10.2/C10.3 独立复核与 live；父项 C10 保持实施中。",
-      "updated_utc": "2026-11-13T12:35:00Z",
+      "updated_utc": "2026-11-13T05:11:25Z",
       "slices": [
         {
           "id": "C10.1",
@@ -2560,17 +2561,18 @@
             "a0f8284"
           ],
           "commands": [
-            "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
-            "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored"
+            "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
+            "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-escapes.txt"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "已认可；父项 C10 继续实施 C10.2/C10.3。",
-          "updated_utc": "2026-11-13T12:35:00Z"
+          "updated_utc": "2026-11-13T05:11:25Z"
         },
         {
           "id": "C10.2",
@@ -2656,24 +2658,29 @@
         "757d305"
       ],
       "commands": [
-        "cargo test -p sheetcore --offline --test whole_row_refs -> 7 passed",
-        "cargo test -p sheetcore --offline --test spill_refs -> 7 passed",
-        "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored",
-        "cargo test -p app --offline --bin app -> 201 passed / 0 failed"
+        "cargo test -p sheetcore --offline --test implicit_intersection -> 3 passed",
+        "cargo test -p sheetcore --offline --test three_d -> 16 passed",
+        "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
+        "cargo test -p sheetcore --offline xls_formula -> 11 passed (含 3D Ref3DPtg/Area3DPtg ixti)",
+        "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored",
+        "cargo test -p app --offline --bin app -> 202 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill-refs.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row/core.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row/app.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/core.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/app.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-implicit-intersection.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-three-d-refs.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-xls-compat.txt"
       ],
-      "not_done": [],
+      "not_done": [
+        "C11.3/C11.4 当前标记待验收：本地专项、真实 Excel/WPS 样本已跑，但完整交叉矩阵和 WPS 删除全矩阵仍待独立复核",
+        "xls 3D 仅证明导出后 Office 可重算（probe Close(false)），不是 Office 保存往返",
+        "不支持组合采用“保留模型/目标 + 兼容提示 + 另存 xlsx”的安全拒绝，不是把公式降级写入 .xls"
+      ],
       "failures": [],
       "blocker": "",
       "next": "独立复核 C11.1/C11.2 剩余修复；之后实施 C11.3 隐式交集 @。",
-      "updated_utc": "2026-11-13T12:35:00Z",
+      "updated_utc": "2026-11-13T05:11:25Z",
       "slices": [
         {
           "id": "C11.1",
@@ -2681,8 +2688,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "加载整行原文保留、grid_of 校验、真实 range_reads 已获用户 11:13 认可；剩余修复：cf 整行分支跳过方括号，save/reload 从实际加载公式复制且插入列 Shift.n=1。7 passed。",
+          "status": "已验收",
+          "acceptance": "加载整行原文保留、grid_of 校验、真实 range_reads 已获用户 11:13 认可；cf 整行分支跳过方括号、save/reload 从实际加载公式复制且插入列 Shift.n=1；用户 11:13/12:48 不重开。7 passed。",
           "files": [
             "crates/core/src/lib.rs",
             "crates/core/src/cf.rs",
@@ -2693,7 +2700,8 @@
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test whole_row_refs -> 7 passed",
-            "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored"
+            "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored",
+            "cargo test -p sheetcore --offline --test whole_row_refs -> 7 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row-refs.txt",
@@ -2704,7 +2712,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；不把 Office 实机当作已完成。",
-          "updated_utc": "2026-11-13T12:35:00Z"
+          "updated_utc": "2026-11-13T05:11:25Z"
         },
         {
           "id": "C11.2",
@@ -2712,8 +2720,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "grid_of 统一校验已获用户 11:13 认可；剩余修复：Sheet.spill_shapes 记录可信锚点/精确形状（1×1、尾格、旁普通格），materialized_spill 不再通过 spilled 邻接猜形状，逐表重算不重算无关 RAND。7 passed。",
+          "status": "已验收",
+          "acceptance": "grid_of 统一校验、Sheet.spill_shapes 精确形状、逐表重算不重算无关 RAND 已获用户 11:13/12:48 认可；不重开。7 passed。",
           "files": [
             "crates/core/src/formula/mod.rs",
             "crates/core/src/formula/deps.rs",
@@ -2725,7 +2733,8 @@
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test spill_refs -> 7 passed",
-            "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored"
+            "cargo test -p sheetcore --offline -> 72 bins / 650 passed / 0 failed / 41 ignored",
+            "cargo test -p sheetcore --offline --test spill_refs -> 7 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill-refs.txt",
@@ -2736,7 +2745,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；C11.3/C11.4 继续。",
-          "updated_utc": "2026-11-13T12:35:00Z"
+          "updated_utc": "2026-11-13T05:11:25Z"
         },
         {
           "id": "C11.3",
@@ -2744,17 +2753,28 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "@ 保留为 Node::Implicit；单格/单列/单行按公式位置求唯一交点，单行按公式列取同行（B2/B4=20），无交点/越界 #VALUE!；@A5# 取已物化 spill 左上角；依赖、复制和 save/reload 已覆盖。3 passed；Excel/WPS 输入/返回公式/值三列见证据。",
+          "files": [
+            "crates/core/src/formula/mod.rs",
+            "crates/core/src/formula/deps.rs",
+            "crates/core/tests/implicit_intersection.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test implicit_intersection -> 3 passed",
+            "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-implicit-intersection.txt"
+          ],
+          "not_done": [
+            "完整 Excel/WPS 交叉矩阵（目前只覆盖单格/单列/单行/二维/越界与 spill 组合）仍待独立复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T05:11:25Z"
         },
         {
           "id": "C11.4",
@@ -2762,17 +2782,33 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "三维引用解析/求值/依赖/复制；整段引号与转义撇号；改名和删除端点按删除前 order 在区间内找邻居，唯一成员耗尽整体 #REF!，反向首尾删除不写半截；中文引用和中文 3D 端点 UTF-8 安全；xls 用 Ref3DPtg/Area3DPtg + ixti 首尾索引。16 passed；Excel/WPS golden 60/66/50、quoted 60、xls 60→150、WPS 删 First=50 见证据。",
+          "files": [
+            "crates/core/src/refs.rs",
+            "crates/core/src/sheet_ops.rs",
+            "crates/core/src/formula/mod.rs",
+            "crates/core/src/formula/deps.rs",
+            "crates/core/src/xls_formula.rs",
+            "crates/core/tests/three_d.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test three_d -> 16 passed",
+            "cargo test -p sheetcore --offline xls_formula -> 11 passed"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-three-d-refs.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-xls-compat.txt"
+          ],
+          "not_done": [
+            "完整反向/唯一/中文 Office 交叉矩阵、WPS 全函数矩阵未跑",
+            "xls 3D 仅是导出后可重算，不是 Office 保存往返"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T05:11:25Z"
         }
       ]
     },

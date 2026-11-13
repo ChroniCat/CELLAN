@@ -22,6 +22,8 @@ pub struct RefExpr {
     /// 外部工作簿：`[1]` 或 `[预算.xlsx]` 里的那段；None 表示本簿
     pub book: Option<String>,
     pub sheet: Option<String>,
+    /// 三维引用的结束表名：`Sheet1:Sheet3!A1` 的 Sheet3
+    pub sheet2: Option<String>,
     pub row: i64, // 0-based
     pub col: i64,
     pub row_abs: bool,
@@ -56,6 +58,8 @@ pub enum Node {
     Ref(RefExpr),
     ///  spills  #：A1# 返回锚点动态数组的完整区域
     Spill(RefExpr),
+    /// 隐式交集运算符 `@`：按公式所在行/列与引用区域求交
+    Implicit(Box<Node>),
     Range(RefExpr, RefExpr),
     Func(String, Vec<Node>),
     Unary(bool, Box<Node>), // true = 负号
@@ -84,6 +88,7 @@ enum Tok {
     Colon,
     Bang,
     Hash,
+    At,
     Percent,
 }
 
@@ -162,6 +167,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                     i += 1;
                 }
                 out.push(Tok::Ident(name));
+            }
+            '@' => {
+                out.push(Tok::At);
+                i += 1;
             }
             '%' => {
                 out.push(Tok::Percent);
@@ -410,6 +419,10 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Node, ErrKind> {
+        if self.eat(&Tok::At) {
+            let e = self.parse_unary()?;
+            return Ok(Node::Implicit(Box::new(e)));
+        }
         if matches!(self.peek(), Some(Tok::Op("-"))) {
             self.pos += 1;
             let e = self.parse_unary()?;
@@ -602,6 +615,60 @@ impl Parser {
 
     /// name 可能是 "A1"、"$A$1"、"Sheet1"（后面跟 !）
     fn parse_ref_from(&mut self, name: String) -> Result<Node, ErrKind> {
+        // 三维引用：Sheet1:Sheet3!A1 / Sheet1:Sheet3!A1:B2。
+        // 必须在普通 A1 区域的冒号分支之前识别，否则 Sheet3! 会被当成
+        // 普通单元格区域的一部分。
+        if self.peek() == Some(&Tok::Colon) {
+            if let (Some(Tok::Ident(end_sheet)), Some(Tok::Bang)) =
+                (self.toks.get(self.pos + 1).cloned(), self.toks.get(self.pos + 2))
+            {
+                self.pos += 3; // ':' end_sheet '!'
+                let Some(Tok::Ident(cell)) = self.next() else {
+                    return Err(ErrKind::Ref);
+                };
+                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
+                start.sheet = Some(name);
+                start.sheet2 = Some(end_sheet.clone());
+                if self.eat(&Tok::Colon) {
+                    let Some(Tok::Ident(cell2)) = self.next() else {
+                        return Err(ErrKind::Ref);
+                    };
+                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
+                    end.sheet = start.sheet.clone();
+                    end.sheet2 = start.sheet2.clone();
+                    end.book = start.book.clone();
+                    return Ok(Node::Range(start, end));
+                }
+                if self.eat(&Tok::Hash) {
+                    return Ok(Node::Spill(start));
+                }
+                return Ok(Node::Ref(start));
+            }
+        }
+        // 整段引号的三维区间：`'Start 1:End 3'!A1`。lexer 会把
+        // 引号内整段内容作为一个 Ident 交到这里；Excel 允许这种写法，
+        // 且表名不能包含冒号，所以可以安全拆分。
+        if matches!(self.peek(), Some(Tok::Bang)) && name.contains(':') && !name.contains('[') {
+            if let Some((first, last)) = name.split_once(':') {
+                self.pos += 1;
+                let Some(Tok::Ident(cell)) = self.next() else {
+                    return Err(ErrKind::Ref);
+                };
+                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
+                start.sheet = Some(first.to_owned());
+                start.sheet2 = Some(last.to_owned());
+                if self.eat(&Tok::Colon) {
+                    let Some(Tok::Ident(cell2)) = self.next() else {
+                        return Err(ErrKind::Ref);
+                    };
+                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
+                    end.sheet = start.sheet.clone();
+                    end.sheet2 = start.sheet2.clone();
+                    return Ok(Node::Range(start, end));
+                }
+                return Ok(Node::Ref(start));
+            }
+        }
         if matches!(self.peek(), Some(Tok::Bang)) {
             self.pos += 1;
             let Some(Tok::Ident(cell)) = self.next() else {
@@ -708,7 +775,7 @@ pub fn parse_a1(s: &str) -> Option<RefExpr> {
     if row < 0 {
         return None;
     }
-    Some(RefExpr { book: None, sheet: None, row, col, row_abs, col_abs })
+    Some(RefExpr { book: None, sheet: None, sheet2: None, row, col, row_abs, col_abs })
 }
 
 // ---------------------------------------------------------------- 求值
@@ -878,6 +945,16 @@ impl<'a> Calc<'a> {
                 .position(|s| s.name.eq_ignore_ascii_case(n))
                 .ok_or(ErrKind::Ref),
         }
+    }
+
+    /// 三维引用包含的 sheet 下标（按当前表标签顺序，含首尾）。
+    fn three_d_indices(&self, r: &RefExpr) -> Result<Vec<usize>, ErrKind> {
+        let start = r.sheet.as_deref().ok_or(ErrKind::Ref)?;
+        let end = r.sheet2.as_deref().ok_or(ErrKind::Ref)?;
+        let a = self.wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(start)).ok_or(ErrKind::Ref)?;
+        let b = self.wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(end)).ok_or(ErrKind::Ref)?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        Ok((lo..=hi).collect())
     }
 
     /// 外部引用单格：从 links 的缓存里取；没有缓存（链接没解析过）就是 #REF!
@@ -1074,6 +1151,73 @@ impl<'a> Calc<'a> {
         }
     }
 
+    /// 隐式交集：单格引用直接取值；单列区域按公式行取同列，单行区域
+    /// 按公式列取同行；二维区域必须同时命中公式行和公式列。区域与公式
+    /// 没有唯一交点时按 Excel 返回 #VALUE!。`A1#` 的 `@` 目前取数组左上角，
+    /// 与 Excel 365 对动态数组的处理一致。
+    fn implicit_value(&mut self, n: &Node, si: usize) -> FValue {
+        match n {
+            Node::Range(a, b) => self.implicit_range(a, b, si),
+            // 单格引用 / Spill / 普通表达式：数组按左上角标量处理；这
+            // 与 `@A1` 在任意位置都返回 A1、`@A1#` 返回锚点值一致。
+            _ => self.eval_node(n, si).scalar(),
+        }
+    }
+
+    fn implicit_range(&mut self, a: &RefExpr, b: &RefExpr, si: usize) -> FValue {
+        // 外部工作簿没有本簿的几何边界；退回普通区域首值。
+        if a.book.is_some() || b.book.is_some() {
+            return match self.range_values(a, b, si) {
+                Ok(Arg::Range { values, .. }) => values.first().cloned().unwrap_or(FValue::Empty),
+                Ok(Arg::Val(v)) => v.scalar(),
+                Err(e) => FValue::Error(e),
+            };
+        }
+        let idx = match self.sheet_index(a.sheet.as_deref().or(b.sheet.as_deref()), si) {
+            Ok(i) => i,
+            Err(e) => return FValue::Error(e),
+        };
+        let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+        let (mut r2, mut c2) = (a.row.max(b.row).max(0) as u32, a.col.max(b.col).max(0) as u32);
+        let (max_r, max_c) = self.sheet_bounds(idx);
+        if r1 == 0 && r2 == 1_048_575 {
+            r2 = r2.min(max_r);
+        }
+        if c1 == 0 && c2 == 16_383 {
+            c2 = c2.min(max_c);
+        }
+        if r1 > r2 || c1 > c2 {
+            return FValue::Error(ErrKind::Value);
+        }
+        let (fr, fc) = (self.cur.0 as i64, self.cur.1 as i64);
+        let target = if r1 == r2 && c1 == c2 {
+            Some((r1, c1))
+        } else if r1 == r2 {
+            // 单行区域：Excel 的隐式交集按公式列取该行对应列，
+            // 不要求公式与区域同一行（`@A1:C1` 在 B2/B4 都取 B1）。
+            if fc >= c1 as i64 && fc <= c2 as i64 {
+                Some((r1, fc as u32))
+            } else {
+                None
+            }
+        } else if c1 == c2 {
+            // 单列区域：公式必须与区域同行（同一行），列不限。
+            if fr >= r1 as i64 && fr <= r2 as i64 {
+                Some((fr as u32, c1))
+            } else {
+                None
+            }
+        } else if fr >= r1 as i64 && fr <= r2 as i64 && fc >= c1 as i64 && fc <= c2 as i64 {
+            Some((fr as u32, fc as u32))
+        } else {
+            None
+        };
+        match target {
+            Some((r, c)) => self.cell_value(idx, r, c).scalar(),
+            None => FValue::Error(ErrKind::Value),
+        }
+    }
+
     fn range_values(&mut self, a: &RefExpr, b: &RefExpr, cur: usize) -> Result<Arg, ErrKind> {
         if a.book.is_some() || b.book.is_some() {
             return self.link_range(a, b);
@@ -1167,7 +1311,19 @@ impl<'a> Calc<'a> {
             Node::Text(s) => FValue::Text(s.as_str().into()),
             Node::Bool(b) => FValue::Bool(*b),
             Node::Err(e) => FValue::Error(*e),
+            Node::Implicit(e) => self.implicit_value(e, si),
             Node::Ref(r) => {
+                if r.sheet2.is_some() {
+                    let idxs = match self.three_d_indices(r) {
+                        Ok(v) => v,
+                        Err(e) => return FValue::Error(e),
+                    };
+                    let mut vals = Vec::with_capacity(idxs.len());
+                    for idx in idxs {
+                        vals.push(self.cell_value(idx, r.row.max(0) as u32, r.col.max(0) as u32).scalar());
+                    }
+                    return FValue::Array(std::rc::Rc::new(value::Array::new(vals.len(), 1, vals)));
+                }
                 if r.book.is_some() {
                     return self.link_cell(r);
                 }
@@ -1189,21 +1345,60 @@ impl<'a> Calc<'a> {
                     _ => FValue::Error(ErrKind::Ref),
                 }
             }
-            Node::Range(a, b) => match self.range_values(a, b, si) {
-                Ok(Arg::Range { values, rows, cols }) => {
-                    if rows == 1 && cols == 1 {
-                        values.first().cloned().unwrap_or(FValue::Empty)
-                    } else {
-                        FValue::Array(std::rc::Rc::new(value::Array::new(
-                            rows,
-                            cols,
-                            (*values).clone(),
-                        )))
+            Node::Range(a, b) => {
+                if a.sheet2.is_some() || b.sheet2.is_some() {
+                    let rep = if a.sheet2.is_some() { a } else { b };
+                    let idxs = match self.three_d_indices(rep) {
+                        Ok(v) => v,
+                        Err(e) => return FValue::Error(e),
+                    };
+                    let mut aa = a.clone();
+                    let mut bb = b.clone();
+                    for r in [&mut aa, &mut bb] {
+                        r.sheet = None;
+                        r.sheet2 = None;
+                        r.book = None;
+                    }
+                    let mut vals = Vec::new();
+                    let mut rows = 0usize;
+                    let mut cols = 0usize;
+                    for idx in idxs {
+                        match self.range_values(&aa, &bb, idx) {
+                            Ok(Arg::Range { values, rows: rr, cols: cc }) => {
+                                rows += rr;
+                                cols = cols.max(cc);
+                                vals.extend((*values).iter().cloned());
+                            }
+                            Ok(Arg::Val(v)) => {
+                                rows += 1;
+                                cols = cols.max(1);
+                                vals.push(v.scalar());
+                            }
+                            Err(e) => return FValue::Error(e),
+                        }
+                    }
+                    if vals.is_empty() {
+                        return FValue::Error(ErrKind::Ref);
+                    }
+                    FValue::Array(std::rc::Rc::new(value::Array::new(rows.max(1), cols.max(1), vals)))
+                } else {
+                    match self.range_values(a, b, si) {
+                        Ok(Arg::Range { values, rows, cols }) => {
+                            if rows == 1 && cols == 1 {
+                                values.first().cloned().unwrap_or(FValue::Empty)
+                            } else {
+                                FValue::Array(std::rc::Rc::new(value::Array::new(
+                                    rows,
+                                    cols,
+                                    (*values).clone(),
+                                )))
+                            }
+                        }
+                        Ok(_) => FValue::Error(ErrKind::Value),
+                        Err(e) => FValue::Error(e),
                     }
                 }
-                Ok(_) => FValue::Error(ErrKind::Value),
-                Err(e) => FValue::Error(e),
-            },
+            }
             Node::Unary(neg, e) => {
                 // 一元也走二维块：`=-SEQUENCE(2,2)` 必须得到 2×2 而不是 #VALUE!
                 let (rows, cols, vals) = self.operand_block(e, si);
@@ -1610,10 +1805,11 @@ impl<'a> Calc<'a> {
                 if r0 < 0 || c0 < 0 || h <= 0 || w <= 0 {
                     return FValue::Error(ErrKind::Ref);
                 }
-                let a = RefExpr { book: None, sheet: base.0.clone(), row: r0, col: c0, row_abs: false, col_abs: false };
+                let a = RefExpr { book: None, sheet: base.0.clone(), sheet2: None, row: r0, col: c0, row_abs: false, col_abs: false };
                 let b = RefExpr {
                     book: None,
                     sheet: base.0,
+                    sheet2: None,
                     row: r0 + h - 1,
                     col: c0 + w - 1,
                     row_abs: false,
@@ -1842,6 +2038,10 @@ impl<'a> Calc<'a> {
                 let ok_arity = if simple { nodes.len() == 1 } else { nodes.len() >= 2 };
                 if ok_arity {
                     if let Some((ra, rb)) = literal(&nodes[0]) {
+                        // 三维引用不是单张表的矩形，不能走单表区域聚合缓存。
+                        if ra.sheet2.is_some() || rb.sheet2.is_some() {
+                            return self.call_generic(name, nodes, si);
+                        }
                         // 外部引用不走这块区域缓存：交给通用路径按 links 求值
                         if ra.book.is_some() || rb.book.is_some() {
                             return self.call_generic(name, nodes, si);
@@ -2005,6 +2205,10 @@ impl<'a> Calc<'a> {
                 for n in nodes {
                     // 区域参数保留结构（SUM/COUNTIF 等需要）
                     if let Node::Range(a, b) = n {
+                        if a.sheet2.is_some() || b.sheet2.is_some() {
+                            args.push(Arg::Val(self.eval_node(n, si)));
+                            continue;
+                        }
                         match self.range_values(a, b, si) {
                             Ok(arg) => args.push(arg),
                             Err(e) => args.push(Arg::Val(FValue::Error(e))),
@@ -2145,8 +2349,8 @@ impl<'a> Calc<'a> {
             br = br.min(max_r as i64);
             bc = bc.min(max_c as i64);
         }
-        let a = &RefExpr { book: None, sheet: a.sheet.clone(), row: a.row.min(b.row), col: a.col.min(b.col), row_abs: false, col_abs: false };
-        let b = &RefExpr { book: None, sheet: b.sheet.clone(), row: br, col: bc, row_abs: false, col_abs: false };
+        let a = &RefExpr { book: None, sheet: a.sheet.clone(), sheet2: None, row: a.row.min(b.row), col: a.col.min(b.col), row_abs: false, col_abs: false };
+        let b = &RefExpr { book: None, sheet: b.sheet.clone(), sheet2: None, row: br, col: bc, row_abs: false, col_abs: false };
         let key = (
             si,
             a.row.min(b.row),
@@ -2177,6 +2381,10 @@ impl<'a> Calc<'a> {
         let mut args = Vec::with_capacity(nodes.len());
         for n in nodes {
             if let Node::Range(a, b) = n {
+                if a.sheet2.is_some() || b.sheet2.is_some() {
+                    args.push(Arg::Val(self.eval_node(n, si)));
+                    continue;
+                }
                 match self.range_values(a, b, si) {
                     Ok(arg) => args.push(arg),
                     Err(e) => args.push(Arg::Val(FValue::Error(e))),
@@ -2190,13 +2398,22 @@ impl<'a> Calc<'a> {
 
     fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
         match n {
-            Node::Ref(re) => match self.sheet_index(re.sheet.as_deref(), si) {
-                Ok(idx) => {
-                    let v = self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32).scalar();
-                    (1, 1, vec![v])
+            Node::Ref(re) => {
+                if re.sheet2.is_some() {
+                    return match self.eval_node(n, si) {
+                        FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
+                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
+                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                    };
                 }
-                Err(_) => (0, 0, vec![]),
-            },
+                match self.sheet_index(re.sheet.as_deref(), si) {
+                    Ok(idx) => {
+                        let v = self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32).scalar();
+                        (1, 1, vec![v])
+                    }
+                    Err(_) => (0, 0, vec![]),
+                }
+            }
             Node::Spill(re) => {
                 if re.book.is_some() {
                     return (1, 1, vec![FValue::Error(ErrKind::Ref)]);
@@ -2210,10 +2427,19 @@ impl<'a> Calc<'a> {
                     Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
                 }
             },
-            Node::Range(a, b) => match self.range_values(a, b, si) {
-                Ok(Arg::Range { values, rows, cols }) => (rows, cols, (*values).clone()),
-                _ => (0, 0, vec![]),
-            },
+            Node::Range(a, b) => {
+                if a.sheet2.is_some() || b.sheet2.is_some() {
+                    return match self.eval_node(n, si) {
+                        FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
+                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
+                        _ => (0, 0, vec![]),
+                    };
+                }
+                match self.range_values(a, b, si) {
+                    Ok(Arg::Range { values, rows, cols }) => (rows, cols, (*values).clone()),
+                    _ => (0, 0, vec![]),
+                }
+            }
             _ => match self.eval_node(n, si) {
                 FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
                 FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
@@ -2292,8 +2518,10 @@ impl<'a> Calc<'a> {
     /// 旧实现直接摊平成 Vec，长度相等就按 1×n 输出，纵向数组会被写成横的。
     fn operand_block(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
         if let Node::Range(a, b) = n {
-            if let Ok(Arg::Range { values, rows, cols }) = self.range_values(a, b, si) {
-                return (rows.max(1), cols.max(1), (*values).clone());
+            if a.sheet2.is_none() && b.sheet2.is_none() {
+                if let Ok(Arg::Range { values, rows, cols }) = self.range_values(a, b, si) {
+                    return (rows.max(1), cols.max(1), (*values).clone());
+                }
             }
         }
         match self.eval_node(n, si) {

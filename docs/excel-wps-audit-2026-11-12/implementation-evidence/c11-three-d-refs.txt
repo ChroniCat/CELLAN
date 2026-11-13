@@ -1,0 +1,92 @@
+# C11.4 三维引用与结构编辑：实现与当前验证
+
+状态：实现完成，待独立复核（父项 C11 仍未验收）。日期：2026-11-13。
+
+## 代码
+
+- `RefExpr.sheet2`、`parse` 识别 `Sheet1:Sheet3!A1`、整段引号
+  `'Start 1:End 3'!A1`；整段引号按第一个 `:` 拆首尾表，`''` 表示转义撇号。
+- `three_d_indices` 按当前标签顺序展开首尾之间所有表；`deps::sheet_span`
+  把 3D 引用作为跨表依赖；`Node::Ref`/`Node::Range` 3D 求值返回跨表数组。
+- `SUM` 对 3D 区域绕过单表区域缓存，按所有成员求和；`AVERAGE`/`MAX` 等
+  走通用数组路径。
+- `xls_formula::emit_ref/emit_area` 用 `ixti` 首尾索引，opcode 为
+  `0x3A`/`0x3B`（Ref3DPtg/Area3DPtg），不是 0x5A/0x5B。
+
+## 删除端点语义（12:48 修订）
+
+- `delete_sheet` 在 `remove` 前保存完整 `order` 快照，`retarget_3d_endpoint`
+  在删除前端点位置求“区间内仍存在的邻居”：
+  - `First:Third` 删 First -> `Second:Third`；
+  - 反向 `Third:First` 删 First -> `Third:Second`；
+  - 反向删 Third -> `Second:First`；
+  - `Second:Second` 删唯一成员 -> 整段 `#REF!`，不生成 `Third:First`；
+  - 端点不在区间/外部表 -> 保持原文，不凭空改。
+- UTF-8：扫描不命中后按整字符推进，`=中文!A1`、`='中文'!A1` 删无关表
+  不再从第二个字节切公式；`rewrite_sheet` 同样整字符兜底。
+
+## 自动化
+
+```text
+cargo test -p sheetcore --offline --test three_d
+16 passed; 0 failed; 0 ignored
+
+cargo test -p sheetcore --offline xls_formula
+11 passed; 0 failed; 0 ignored（含 three_d_ref_emits_ref3d_and_span_ixti）
+```
+
+覆盖：3D 求和/区域/缺失端点；改名（含整段引号改名在设公式之后）；
+转义撇号；save/reload；复制；插入/移动工作表；删除端点收缩；
+同端点唯一成员；反向首尾删除；普通中文引用和中文 3D 端点不 panic。
+
+## 真实 Office
+
+`c114_golden.xlsx`：
+
+```text
+Excel Other!A1  =SUM(First:Third!A1)     60
+Excel Other!A2  =SUM(First:Third!A1:B1)  66
+Excel Other!A3  =SUM(Second:Third!A1)    50   （已删 First）
+WPS Other!A1    =SUM(First:Third!A1)     60
+WPS Other!A2    =SUM(First:Third!A1:B1)  66
+WPS Other!A3    =SUM(Second:Third!A1)    50
+```
+
+WPS 12.0 真实删除验证（2026-11-13 实跑）：
+```text
+WPS_DELETE Other!A1  =SUM(Second:Third!A1)  50
+```
+
+Excel 16.0 真实删除验证（非本实现 golden）：
+
+```text
+=SUM(Third:First!A1) 60  -- 删 First 后 --> =SUM(Third:Second!A1) 50
+=SUM(Second:Second!A1) 20 -- 删 Second 后 --> 显示 #REF!（公式文本 =SUM(#REF!A1)）
+```
+
+整段引号 `c114_quoted.xlsx`（2026-11-13 实跑）：
+```text
+QUOTED_EXCEL  =SUM('Start 1:End 3'!A1)  60
+QUOTED_WPS    =SUM('Start 1:End 3'!A1)  60
+```
+改名 Start 1 -> Begin 后公式为 `=SUM('Begin:End 3'!A1)`，
+转义 `'Start 1''s:End 3'` 同步为 `'Begin''s:End 3'`（自动化覆盖）。
+
+## xls 3D
+
+`c114_golden.xls`（本实现导出）：
+
+```text
+Excel/WPS BEFORE Other!A1 =SUM(First:Third!A1) 60
+Excel/WPS 改 First!A1=100 + 重算，AFTER Other!A1 = 150
+```
+
+边界：这是“导出后 Office 可重算”，**不是 Office 保存往返**。脚本使用
+`Close(false)`；没有把 `.xls` 另存/再打开当作已完成的 Office 往返验收。
+WPS 仅覆盖本段 @/3D SUM 与删 First 的 50；不是 WPS 全部功能对拍。
+
+## 未完成/待复核
+
+- 反向/唯一成员/Chinese 的本地测试已实现并通过；真实 Office 仅取了
+  reverse-end + unique 的 COM 探测（见上），完整交叉矩阵仍待复核。
+- 3D 跨表在 WPS 的完整函数矩阵未跑；不宣称 WPS 全称已覆盖。

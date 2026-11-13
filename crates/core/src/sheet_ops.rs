@@ -42,7 +42,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, name: &str) -> bool {
     }
     let old = wb.sheets[idx].name.clone();
     wb.sheets[idx].name = name.to_owned();
-    rewrite_qualifiers(wb, &old, Some(name));
+    rewrite_qualifiers(wb, &old, Some(name), None);
     for (sheet, ..) in &mut wb.pivot_shifts {
         if sheet.eq_ignore_ascii_case(&old) { *sheet = name.to_owned(); }
     }
@@ -54,6 +54,9 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, name: &str) -> bool {
 /// become explicit errors, so later reuse of its name cannot retarget them.
 pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
     if wb.sheets.len() <= 1 || idx >= wb.sheets.len() { return false; }
+    // 删除前保留完整标签顺序：三维区间的邻居必须按原区间求，
+    // 不能用全局 prev/next（反向区间/唯一成员会取错）。
+    let order: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let old = wb.sheets.remove(idx).name;
     let before = wb.names.len();
     wb.names.retain(|(_, local, _)| *local != Some(idx));
@@ -63,7 +66,7 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
             if *i > idx { *i -= 1; wb.names_dirty = true; }
         }
     }
-    rewrite_qualifiers(wb, &old, None);
+    rewrite_qualifiers(wb, &old, None, Some(&order));
     wb.pivot_shifts.retain(|(sheet, ..)| !sheet.eq_ignore_ascii_case(&old));
     wb.pivots_pending.retain(|(sheet, ..)| *sheet != idx);
     for (sheet, ..) in &mut wb.pivots_pending {
@@ -90,20 +93,26 @@ pub fn move_sheet(wb: &mut Workbook, from: usize, to: usize) -> bool {
     true
 }
 
-fn rewrite_text(text: &mut String, old: &str, new: Option<&str>) -> bool {
-    let rewritten = rewrite_sheet(text, old, new);
-    let changed = *text != rewritten;
-    *text = rewritten;
-    changed
-}
-
-fn rewrite_qualifiers(wb: &mut Workbook, old: &str, new: Option<&str>) {
+fn rewrite_qualifiers(
+    wb: &mut Workbook,
+    old: &str,
+    new: Option<&str>,
+    three_d_order: Option<&[String]>,
+) {
+    let rw = |text: &str| -> String {
+        let adjusted = if let Some(order) = three_d_order {
+            crate::refs::retarget_3d_endpoint(text, old, order)
+        } else {
+            text.to_owned()
+        };
+        rewrite_sheet(&adjusted, old, new)
+    };
     for sheet in &mut wb.sheets {
         let cells: Vec<_> = sheet.iter().filter(|(_, c)| c.formula.is_some()).map(|(k, _)| k).collect();
         for key in cells {
             let cell = sheet.get_mut(key.row, key.col).unwrap();
             let formula = cell.formula.as_mut().unwrap();
-            let rewritten = rewrite_sheet(formula, old, new).into_boxed_str();
+            let rewritten = rw(formula).into_boxed_str();
             let changed = *formula != rewritten;
             *formula = rewritten;
             sheet.edited |= changed;
@@ -112,24 +121,38 @@ fn rewrite_qualifiers(wb: &mut Workbook, old: &str, new: Option<&str>) {
             for rule in &mut block.rules {
                 match &mut rule.kind {
                     crate::cf::CfKind::Expr { formula, .. } => {
-                        sheet.cf_dirty |= rewrite_text(formula, old, new);
+                        let rewritten = rw(formula);
+                        if *formula != rewritten {
+                            *formula = rewritten;
+                            sheet.cf_dirty = true;
+                        }
                     }
                     crate::cf::CfKind::CellIs { a, b, .. } => {
-                        sheet.cf_dirty |= rewrite_text(a, old, new);
-                        sheet.cf_dirty |= rewrite_text(b, old, new);
+                        for text in [a, b] {
+                            let rewritten = rw(text);
+                            if *text != rewritten {
+                                *text = rewritten;
+                                sheet.cf_dirty = true;
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
         }
         for dv in &mut sheet.dv {
-            sheet.dv_dirty |= rewrite_text(&mut dv.f1, old, new);
-            sheet.dv_dirty |= rewrite_text(&mut dv.f2, old, new);
+            for text in [&mut dv.f1, &mut dv.f2] {
+                let rewritten = rw(text);
+                if *text != rewritten {
+                    *text = rewritten;
+                    sheet.dv_dirty = true;
+                }
+            }
         }
         for chart in &mut sheet.charts {
             for series in &mut chart.series {
                 for text in [&mut series.name_ref, &mut series.cat_ref, &mut series.val_ref] {
-                    let rewritten = rewrite_sheet(text, old, new);
+                    let rewritten = rw(text);
                     if *text != rewritten {
                         chart.ref_fixes.push((text.clone(), rewritten.clone()));
                         *text = rewritten;
@@ -140,7 +163,11 @@ fn rewrite_qualifiers(wb: &mut Workbook, old: &str, new: Option<&str>) {
         }
     }
     for (_, _, text) in &mut wb.names {
-        wb.names_dirty |= rewrite_text(text, old, new);
+        let rewritten = rw(text);
+        if *text != rewritten {
+            *text = rewritten;
+            wb.names_dirty = true;
+        }
     }
     for source in &mut wb.sources {
         if let crate::external::Kind::Internal { sheet, .. } = &mut source.kind {

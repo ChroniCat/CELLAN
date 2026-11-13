@@ -1,0 +1,48 @@
+# C11.3 隐式交集 @：实现与当前验证
+
+状态：实现完成，待独立复核（父项 C11 仍未验收）。日期：2026-11-13。
+基线：C11.3 由 `待实施` 进入实现；不改变 C11.1/C11.2 已认可结论。
+
+## 代码
+
+- `formula/mod.rs`：`Tok::At`、`Node::Implicit`；`parse_unary` 保留 `@`；
+  `implicit_value`/`implicit_range` 按公式单元格求唯一交点。
+- 单行区域 `A1:C1` 按公式列取同一行（`@A1:C1` 在 B2/B4 都取 B1），
+  不再要求 `fr == r1`；单列按公式行；二维区域要求行列同时命中；
+  无唯一交点/越界返回 `#VALUE!`。
+- `@A5#` 只对已物化 spill 求左上角；复制/插行只平移内部 A1 引用。
+- `deps.rs` 将 `Node::Implicit` 递归纳入依赖；save/reload 保公式。
+
+## 自动化
+
+```text
+cargo test -p sheetcore --offline --test implicit_intersection
+3 passed; 0 failed; 0 ignored
+```
+
+覆盖：`=@A1` C2=10；`=@A1:A3` D2=20/D3=30/D4=#VALUE!；
+`=@A1:C1` B2=20/B4=20、E2/E4=#VALUE!；`=@A1:C3` F2=#VALUE!；
+`=@A5#` G2/G4=#VALUE!；依赖与 save/reload。
+
+## 真实 Office（输入原文 / COM 返回公式 / 显示值）
+
+`c113_golden.xlsx` 在 Excel 16.0（Build 20326）与 WPS 12.0 打开：
+
+```text
+Excel Data!B2  =A1:C1   20
+Excel Data!B4  =A1:C1   20
+Excel Data!C2  =@A1     10
+Excel Data!D2  =A1:A3   20
+Excel Data!D3  =A1:A3   30
+Excel Data!D4  =A1:A3   #VALUE!
+Excel Data!E2  =A1:C1   #VALUE!
+Excel Data!E4  =A1:C1   #VALUE!
+WPS Data!B2    =A1:C1   20
+WPS Data!B4    =A1:C1   20
+WPS Data!D2    =A1:A3   20
+WPS Data!D3    =A1:A3   30
+WPS Data!D4    =A1:A3   #VALUE!
+```
+
+说明：Excel/WPS 会把 `@` 规范化掉（COM 的 `Formula` 返回 `=A1:C1`），
+所以验收看“输入原文 + 返回公式 + 显示值”三列，不拿返回公式做字符串硬比。

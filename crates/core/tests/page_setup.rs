@@ -53,3 +53,12 @@ fn changes_survive_save() {
     assert_eq!(ps.title_rows, Some((0, 0)));
     assert!((ps.margins[0] - 0.25).abs() < 0.001);
 }
+
+#[test]
+fn page_setup_pr_is_inserted_after_outline_pr() {
+    let xml = r#"<worksheet><sheetPr><outlinePr summaryBelow="1" summaryRight="1" showOutlineSymbols="1"/></sheetPr><sheetData/></worksheet>"#;
+    let out = sheetcore::patch::set_page_setup(xml, &sheetcore::page::PageSetup::default());
+    let outline = out.find("<outlinePr").expect("outlinePr");
+    let page = out.find("<pageSetUpPr").expect("pageSetUpPr");
+    assert!(outline < page, "sheetPr 子元素顺序必须是 outlinePr→pageSetUpPr: {out}");
+}

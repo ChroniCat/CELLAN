@@ -354,6 +354,7 @@ impl Compiler<'_> {
             Node::Empty => out.push(0x16),
             Node::Ref(r) => self.emit_ref(r, out)?,
             Node::Spill(_) => bail!("动态数组溢出引用 A1# 不能写入 .xls"),
+            Node::Implicit(_) => bail!("隐式交集 @ 不能写入 .xls"),
             Node::Range(a, b) => self.emit_area(a, b, out)?,
             Node::Array(rows, cols, vals) => self.emit_array(*rows, *cols, vals, out)?,
             Node::Name(n) => {
@@ -466,9 +467,17 @@ impl Compiler<'_> {
 
     fn emit_ref(&mut self, r: &RefExpr, out: &mut Vec<u8>) -> Result<()> {
         let (row, col) = self.check_coords(r)?;
+        if let (Some(first), Some(last)) = (r.sheet.as_deref(), r.sheet2.as_deref()) {
+            let ixti = self.ixti_span(first, last)?;
+            out.push(0x3A);
+            out.extend_from_slice(&ixti.to_le_bytes());
+            out.extend_from_slice(&row.to_le_bytes());
+            out.extend_from_slice(&self.col_word(col, r).to_le_bytes());
+            return Ok(());
+        }
         if let Some(book) = r.book.clone() {
             let ixti = self.book_ixti(&book, r.sheet.as_deref())?;
-            out.push(0x5A);
+            out.push(0x3A);
             out.extend_from_slice(&ixti.to_le_bytes());
             out.extend_from_slice(&row.to_le_bytes());
             out.extend_from_slice(&self.col_word(col, r).to_le_bytes());
@@ -482,7 +491,7 @@ impl Compiler<'_> {
             }
             Some(sh) => {
                 let ixti = self.ixti(sh)?;
-                out.push(0x5A);
+                out.push(0x3A);
                 out.extend_from_slice(&ixti.to_le_bytes());
                 out.extend_from_slice(&row.to_le_bytes());
                 out.extend_from_slice(&self.col_word(col, r).to_le_bytes());
@@ -496,13 +505,17 @@ impl Compiler<'_> {
         let (r2, c2) = self.check_coords(b)?;
         let book = a.book.clone().or_else(|| b.book.clone());
         let sheet = a.sheet.clone().or_else(|| b.sheet.clone());
-        if let Some(book) = book {
+        if let (Some(first), Some(last)) = (a.sheet.as_deref(), b.sheet2.as_deref()) {
+            let ixti = self.ixti_span(first, last)?;
+            out.push(0x3B);
+            out.extend_from_slice(&ixti.to_le_bytes());
+        } else if let Some(book) = book {
             let ixti = self.book_ixti(&book, sheet.as_deref())?;
-            out.push(0x5B);
+            out.push(0x3B);
             out.extend_from_slice(&ixti.to_le_bytes());
         } else if let Some(sh) = sheet {
             let ixti = self.ixti(&sh)?;
-            out.push(0x5B);
+            out.push(0x3B);
             out.extend_from_slice(&ixti.to_le_bytes());
         } else {
             out.push(0x45);
@@ -533,6 +546,19 @@ impl Compiler<'_> {
             w |= 0x8000;
         }
         w
+    }
+
+    fn ixti_span(&mut self, first: &str, last: &str) -> Result<u16> {
+        let find = |s: &str| -> Result<usize> {
+            self.sheets
+                .iter()
+                .position(|x| x.eq_ignore_ascii_case(s))
+                .ok_or_else(|| anyhow::anyhow!("引用了不存在的工作表 {s}"))
+        };
+        let mut a = find(first)?;
+        let mut b = find(last)?;
+        if a > b { std::mem::swap(&mut a, &mut b); }
+        Ok(self.externs.add(0, a as u16, b as u16))
     }
 
     fn ixti(&mut self, sheet: &str) -> Result<u16> {
@@ -741,7 +767,7 @@ mod tests {
     fn cross_sheet_and_cross_book() {
         let mut f = Fix::new();
         let t = f.go("T!A1").unwrap();
-        assert_eq!(t[0], 0x5A);
+        assert_eq!(t[0], 0x3A);
         assert_eq!(u16::from_le_bytes([t[1], t[2]]), 0);
 
         f.books.push(BookSheets {
@@ -749,9 +775,24 @@ mod tests {
             sheets: vec!["Sheet1".into()],
         });
         let t = f.go("[book_b.xls]Sheet1!A1").unwrap();
-        assert_eq!(t[0], 0x5A);
+        assert_eq!(t[0], 0x3A);
         assert_eq!(u16::from_le_bytes([t[1], t[2]]), 1, "第一条外部簿");
         assert_eq!(f.externs.books.len(), 1);
+    }
+
+    #[test]
+    fn three_d_ref_emits_ref3d_and_span_ixti() {
+        let mut f = Fix::new();
+        f.sheets = vec!["First".into(), "Second".into(), "Third".into()];
+        let t = f.go("SUM(First:Third!A1)").unwrap();
+        // 0x3A = Ref3DPtg；不能用 0x5A（Excel 会显示 @ 并算 #REF!）。
+        assert_eq!(t[0], 0x3A);
+        let ixti = u16::from_le_bytes([t[1], t[2]]) as usize;
+        assert_eq!(f.externs.entries[ixti], (0, 0, 2), "ixti 必须覆盖 First..Third");
+        let t = f.go("SUM(First:Third!A1:B1)").unwrap();
+        assert_eq!(t[0], 0x3B);
+        let ixti = u16::from_le_bytes([t[1], t[2]]) as usize;
+        assert_eq!(f.externs.entries[ixti], (0, 0, 2), "Area3D 同样保留首尾表");
     }
 
     #[test]

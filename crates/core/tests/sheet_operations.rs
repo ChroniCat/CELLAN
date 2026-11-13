@@ -41,7 +41,12 @@ fn qualifier_rewrite_preserves_strings_external_links_and_table_columns() {
         "='O''Brien 新'!$A$1+'O''Brien 新'!B2+'O''Brien 新'!Local+Older!A1+\"Old!A1\"+[Book.xlsx]Old!A1+'[Book.xlsx]Old'!A1+T[Old!A1]+A1");
     assert_eq!(rewrite_sheet("='O''Brien 新'!$A$1+'O''Brien 新'!A:C+'O''Brien 新'!1:3", "O'Brien 新", Some("New")),
         "='New'!$A$1+'New'!A:C+'New'!1:3");
-    assert_eq!(rewrite_sheet("=Old:Other!A1+Other:Old!A1", "Old", Some("New")), "=Old:Other!A1+Other:Old!A1");
+    // C11.4：三维端点现在属于支持的语法，改名必须同时更新起点和终点；
+    // 其余位置（表名中间冒号）仍不能误当端点。
+    assert_eq!(
+        rewrite_sheet("=Old:Other!A1+Other:Old!A1", "Old", Some("New")),
+        "=New:Other!A1+Other:New!A1"
+    );
     assert_eq!(rewrite_sheet("=#REF!+REF!A1", "REF", Some("New")), "=#REF!+'New'!A1");
 }
 

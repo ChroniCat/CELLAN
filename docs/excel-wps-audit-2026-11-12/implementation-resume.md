@@ -309,3 +309,27 @@
   变异退回 `lines()+split_line` 得到 (3,2) 症状被抓。
 - round24 全量：core 585/0/41、app 147/0、gui 12/0/8。
 - 待补：编码/列类型预览对话框、Excel/WPS 三方对拍；C14 的工作线程注入、calamine 成功路径、Excel 加密包。
+
+## 13:10 当前：12:48 复核后的删除/UTF-8/兼容链
+
+- 工作树在 `a775380` 之上有未提交改动；本轮不把未提交状态当作已交付。
+- 删除 3D 端点改为按删除前完整 `order` 在区间内部求邻居：
+  `First:Third` 删 First -> `Second:Third`；反向 `Third:First` 删 First ->
+  `Third:Second`；删 Third -> `Second:First`；`Second:Second` 删唯一成员 ->
+  整段 `#REF!`，不会生成 `Third:First`。
+- `retarget_3d_endpoint` / `rewrite_sheet` 的 UTF-8 扫描按整字符推进；
+  `delete_sheet` 的 `=中文!A1`、`='中文'!A1`、中文 3D 端点已补实际删除测试。
+- `xls_write` 对 `.xls` 无法表达的 `@`/`#` 等返回带“兼容提示”的错误；
+  `xlsx::save_atomic`/核心写盘失败不覆盖目标；模型公式和缓存保持，App
+  保持 dirty 并在状态栏显示提示；另存 `.xlsx` 往返仍保留公式/缓存。
+- 当前实测：core **74 bins / 674 passed / 0 failed / 41 ignored**，
+  CORE_EXIT=0；app **202 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+  专项：implicit 3、three_d 16、structured 14、xls_formula 11、page_setup 1+2 ignored。
+- 真实 Office：@ B2/B4=20（Excel/WPS）；quoted 3D=60；Excel/WPS 删 First
+  后 50；Excel reverse-end=50、unique=#REF!；xls 改 First A1=100 后 60→150
+  （Close(false)，不是 Office 保存往返）。
+- 台账：C11.1/C11.2 已验收；C11.3/C11.4 待验收；切片 33 已验收 / 20 待验收 /
+  95 待实施；C10/C11 父项仍未验收。证据新增 c11-implicit-intersection、
+  c11-three-d-refs、c11-xls-compat、c10-structured-escapes。
+- 未完成：完整反向/唯一/中文 Office 交叉矩阵、WPS 全函数矩阵、xls Office
+  保存往返、C10.2/C10.3 与 C11 父项独立复核，均不能记绿。

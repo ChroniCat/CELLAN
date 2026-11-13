@@ -90,6 +90,42 @@ fn failed_or_disconnected_save_keeps_owner_dirty() {
 }
 
 #[test]
+fn unsupported_xls_save_keeps_formula_and_shows_compatibility_warning() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("sc_app_xls_compat_{}_{}", std::process::id(), stamp));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("keep.xls");
+    std::fs::write(&target, b"ORIGINAL").unwrap();
+    let mut app = app();
+    app.wb.sheets[0].set(
+        0,
+        0,
+        Cell {
+            value: Value::Number(7.0),
+            formula: Some("=@A1".into()),
+        },
+    );
+    app.wb.path = Some(target.clone());
+    app.wb.dirty = true;
+    app.save(false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.has_pending_save() && Instant::now() < deadline {
+        app.poll_save();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!app.has_pending_save(), "保存线程未结束");
+    assert_eq!(app.wb.sheets[0].get(0, 0).unwrap().formula.as_deref(), Some("=@A1"));
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(7.0));
+    assert!(app.wb.dirty, "保存失败必须保持脏位");
+    assert_eq!(std::fs::read(&target).unwrap(), b"ORIGINAL", "失败不得改写目标");
+    assert!(app.status.contains("兼容提示"), "应显示兼容提示：{}", app.status);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn loading_and_recalculation_follow_the_tab_that_started_them() {
     let mut app = app();
     let (tx, rx) = mpsc::channel();
