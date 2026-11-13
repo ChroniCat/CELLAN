@@ -132,13 +132,13 @@ fn data_validation_date_bounds_use_the_workbook_basis() {
     let rule = dv_between("DATE(1904,1,1)", "DATE(1904,1,5)");
     let sheet = Sheet::new("S");
     let ok_1904 = with_date_system(DateSystem::D1904, || {
-        (dv::validate(&rule, &Value::Number(3.0), &sheet, 0, 0, |_, _, _| true),
-         dv::validate(&rule, &Value::Number(9.0), &sheet, 0, 0, |_, _, _| true))
+        (dv::validate(&rule, &Value::Number(3.0), &sheet, 0, 0, |_, _, _| sheetcore::formula::FValue::Bool(true)),
+         dv::validate(&rule, &Value::Number(9.0), &sheet, 0, 0, |_, _, _| sheetcore::formula::FValue::Bool(true)))
     });
     assert_eq!(ok_1904, (true, false), "1904 簿：序列 3 在 1..4 之间应通过，9 应拒绝");
     let ok_1900 = with_date_system(DateSystem::D1900, || {
-        (dv::validate(&rule, &Value::Number(3.0), &sheet, 0, 0, |_, _, _| true),
-         dv::validate(&rule, &Value::Number(9.0), &sheet, 0, 0, |_, _, _| true))
+        (dv::validate(&rule, &Value::Number(3.0), &sheet, 0, 0, |_, _, _| sheetcore::formula::FValue::Bool(true)),
+         dv::validate(&rule, &Value::Number(9.0), &sheet, 0, 0, |_, _, _| sheetcore::formula::FValue::Bool(true)))
     });
     assert_eq!(ok_1900, (false, false), "1900 簿：同一 DATE() 是 1462+，3/9 都该拒绝");
 }

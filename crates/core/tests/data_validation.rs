@@ -43,14 +43,14 @@ fn validates_values() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
     let whole = dv::find(&sh.dv, 1, 1).unwrap();
-    let ok = |v: f64| dv::validate(whole, &Value::Number(v), sh, 1, 1, |_, _, _| true);
+    let ok = |v: f64| dv::validate(whole, &Value::Number(v), sh, 1, 1, |_, _, _| sheetcore::formula::FValue::Bool(true));
     assert!(ok(50.0));
     assert!(!ok(0.0), "0 小于下限");
     assert!(!ok(101.0), "101 超过上限");
     assert!(!ok(3.5), "整数验证不接受小数");
 
     let list = dv::find(&sh.dv, 1, 2).unwrap();
-    let ok_list = |s: &str| dv::validate(list, &Value::Text(s.into()), sh, 1, 2, |_, _, _| true);
+    let ok_list = |s: &str| dv::validate(list, &Value::Text(s.into()), sh, 1, 2, |_, _, _| sheetcore::formula::FValue::Bool(true));
     assert!(ok_list("B"));
     assert!(!ok_list("Z"));
 }

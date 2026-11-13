@@ -53,3 +53,42 @@ cargo test -p sheetcore --offline
 ```
 
 日志：`/tmp/c12_c16_core.log`。C12.1 的新增测试包含在这 723 个通过项中。
+
+
+## 20:43 监督指出的空组缺口
+
+监督指出：把 `data.entry` 移进“非空/可转数”分支会让某个分组整组全空时标签消失。
+已改为**先创建分组 entry，再决定是否纳值**；另外用本机 Excel 365 对拍全空组：
+
+夹具：
+
+- `Data!A1:B4`：`A/1`、`A/空`、`B/空`；
+- Excel 创建 PivotTable，行字段 `组`，数据字段 `值` 的 `Function=xlCount (-4112)`。
+
+实际读回（`cscript` late binding，Excel 16.0）：
+
+```text
+cell(2,4)=A      cell(2,5)=1
+cell(3,4)=B      cell(3,5)=EMPTY
+cell(4,4)=总计   cell(4,5)=1
+pivot_rows=4
+```
+
+结论：Excel 保留全空分组 **B 的标签**，但 Count 单元格为**空白**，不是 0。
+因此实现改为保留标签、空组 Count 返回 `Value::Empty`；单元测试断言
+`B` 行存在且第二格为 `Empty`。
+
+夹具 SHA-256：`c6ba2802d986077b65978bf35b5c9b8500d656492baac2b784c7da3aea86ec49`
+脚本：`C:/Users/Administrator/AppData/Local/hermes/cache/scratch/c12_pivot.vbs`
+输出：`/tmp/c12_pivot_office4.txt`
+
+## 20:43 全量回归
+
+```text
+cargo test -p sheetcore --offline
+-> 78 test binaries / 725 passed / 0 failed / 9 ignored (EXIT=0)
+cargo test -p app --offline --bin app
+-> 232 passed / 0 failed / 0 ignored (EXIT=0)
+```
+
+日志：`/tmp/fix_core_full2.log`、`/tmp/fix_app_full.log`。

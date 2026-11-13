@@ -187,6 +187,67 @@ pub fn list_items(dv: &DataValidation, sheet: &Sheet) -> Vec<String> {
     Vec::new()
 }
 
+/// 从工作簿上下文解析列表来源：内联、命名区域、跨表区域、单值区域。
+/// 返回 `None` 表示配置无法解析；调用方必须拒绝并给出诊断，不能当成“无限制”。
+pub fn list_items_wb(wb: &crate::model::Workbook, si: usize, dv: &DataValidation) -> Option<Vec<String>> {
+    let src = dv.f1.trim();
+    if src.is_empty() {
+        return Some(Vec::new());
+    }
+    if let Some(rest) = src.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        return Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    }
+    let mut expr = src.trim().trim_start_matches('=').trim();
+    // 命名区域（工作簿级或本表级）；名称不区分大小写。
+    let has_sheet = expr.contains('!');
+    if !has_sheet && !expr.contains(':') {
+        if let Some((_, _, target)) = wb
+            .names
+            .iter()
+            .rev()
+            .find(|(n, scope, _)| n.eq_ignore_ascii_case(expr) && (scope.is_none() || *scope == Some(si)))
+        {
+            expr = target.trim();
+        }
+    }
+    if let Some(rest) = expr.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        return Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+    }
+    // { "甲", "乙" } 形式的动态数组字面量。
+    if let Some(body) = expr.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        return Some(
+            body.split(',')
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        );
+    }
+    let (sheet_name, range) = match expr.rsplit_once('!') {
+        Some((s, r)) => (Some(s.trim().trim_matches('\'').to_string()), r.trim()),
+        None => (None, expr),
+    };
+    let target_sheet = match sheet_name.as_deref() {
+        Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
+        _ => wb.sheet(si),
+    };
+    let clean: String = range.chars().filter(|c| *c != '$').collect();
+    let (a, b) = clean.split_once(':').unwrap_or((clean.as_str(), clean.as_str()));
+    let (r1, c1) = parse_a1(a)?;
+    let (r2, c2) = parse_a1(b)?;
+    let mut out = Vec::new();
+    for r in r1.min(r2)..=r1.max(r2) {
+        for c in c1.min(c2)..=c1.max(c2) {
+            if let Some(v) = target_sheet.get(r, c) {
+                let t = v.value.display();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 fn parse_a1(s: &str) -> Option<(u32, u32)> {
     let mut col = 0u32;
     let mut row = 0u32;
@@ -247,10 +308,60 @@ fn cmp_ok(op: DvOp, v: f64, a: f64, b: Option<f64>) -> bool {
     }
 }
 
-/// 校验一个值是否合法。`formula_eval` 用于自定义公式。
-pub fn validate<F>(dv: &DataValidation, value: &Value, sheet: &Sheet, r: u32, c: u32, mut formula_eval: F) -> bool
+/// 求值一个数值边界。先尝试字面量/日期，再走公式求值器；
+/// 支持命名区域、`=A1*2` 这类阈值，而不是把无法解析的公式静默当 0。
+fn bound_value<F>(expr: &str, r: u32, c: u32, formula_eval: &mut F) -> Option<f64>
 where
-    F: FnMut(&str, u32, u32) -> bool,
+    F: FnMut(&str, u32, u32) -> crate::formula::FValue,
+{
+    let raw = expr.trim().trim_start_matches('=').trim();
+    if let Some(n) = parse_bound(raw) {
+        return Some(n);
+    }
+    match formula_eval(expr, r, c) {
+        crate::formula::FValue::Number(n) => Some(n),
+        crate::formula::FValue::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// 校验一个值是否合法。`formula_eval` 同时用于自定义公式和公式阈值。
+/// 这个入口只带当前表上下文；需要命名区域/跨表列表时用 `validate_wb`。
+pub fn validate<F>(dv: &DataValidation, value: &Value, sheet: &Sheet, r: u32, c: u32, formula_eval: F) -> bool
+where
+    F: FnMut(&str, u32, u32) -> crate::formula::FValue,
+{
+    validate_impl(dv, value, sheet, r, c, None, formula_eval)
+}
+
+/// 带工作簿上下文的校验入口：列表来源可解析为命名区域或跨表区域。
+pub fn validate_wb<F>(
+    wb: &crate::model::Workbook,
+    si: usize,
+    dv: &DataValidation,
+    value: &Value,
+    r: u32,
+    c: u32,
+    formula_eval: F,
+) -> bool
+where
+    F: FnMut(&str, u32, u32) -> crate::formula::FValue,
+{
+    let items = list_items_wb(wb, si, dv).unwrap_or_default();
+    validate_impl(dv, value, wb.sheet(si), r, c, Some(&items), formula_eval)
+}
+
+fn validate_impl<F>(
+    dv: &DataValidation,
+    value: &Value,
+    sheet: &Sheet,
+    r: u32,
+    c: u32,
+    resolved_list: Option<&[String]>,
+    mut formula_eval: F,
+) -> bool
+where
+    F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
     if matches!(value, Value::Empty) {
         return dv.allow_blank;
@@ -258,9 +369,14 @@ where
     match dv.kind {
         DvKind::Any => true,
         DvKind::List => {
-            let items = list_items(dv, sheet);
+            let items = match resolved_list {
+                Some(v) => v.to_vec(),
+                None => list_items(dv, sheet),
+            };
+            // 带工作簿上下文时，空列表意味着来源无法解析或确实没有候选；
+            // 不能像旧逻辑那样把非法值全部放行。
             if items.is_empty() {
-                return true;
+                return resolved_list.is_none();
             }
             let text = value.display();
             items.iter().any(|i| i == &text)
@@ -270,12 +386,19 @@ where
             if f.is_empty() {
                 return true;
             }
-            formula_eval(f, r, c)
+            matches!(formula_eval(f, r, c), crate::formula::FValue::Bool(true))
         }
         DvKind::TextLength => {
             let len = value.display().chars().count() as f64;
-            let a = parse_bound(&dv.f1).unwrap_or(0.0);
-            let b = if dv.op.needs_pair() { parse_bound(&dv.f2) } else { None };
+            let Some(a) = bound_value(&dv.f1, r, c, &mut formula_eval) else { return false };
+            let b = if dv.op.needs_pair() {
+                bound_value(&dv.f2, r, c, &mut formula_eval)
+            } else {
+                None
+            };
+            if dv.op.needs_pair() && b.is_none() {
+                return false;
+            }
             cmp_ok(dv.op, len, a, b)
         }
         DvKind::Whole | DvKind::Decimal | DvKind::Date | DvKind::Time => {
@@ -283,8 +406,15 @@ where
             if dv.kind == DvKind::Whole && (v.fract() != 0.0) {
                 return false;
             }
-            let a = parse_bound(&dv.f1).unwrap_or(0.0);
-            let b = if dv.op.needs_pair() { parse_bound(&dv.f2) } else { None };
+            let Some(a) = bound_value(&dv.f1, r, c, &mut formula_eval) else { return false };
+            let b = if dv.op.needs_pair() {
+                bound_value(&dv.f2, r, c, &mut formula_eval)
+            } else {
+                None
+            };
+            if dv.op.needs_pair() && b.is_none() {
+                return false;
+            }
             cmp_ok(dv.op, v, a, b)
         }
     }
@@ -437,9 +567,9 @@ mod tests {
         assert_eq!(list_items(&dv, &sh), vec!["甲", "乙"]);
         // 校验
         let items_dv = DataValidation { kind: DvKind::List, f1: "\"红,绿\"".into(), ..Default::default() };
-        assert!(validate(&items_dv, &Value::Text("红".into()), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&items_dv, &Value::Text("黄".into()), &sh, 0, 0, |_, _, _| true));
-        assert!(validate(&items_dv, &Value::Empty, &sh, 0, 0, |_, _, _| true), "空值默认允许");
+        assert!(validate(&items_dv, &Value::Text("红".into()), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&items_dv, &Value::Text("黄".into()), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(validate(&items_dv, &Value::Empty, &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)), "空值默认允许");
     }
 
     #[test]
@@ -452,10 +582,10 @@ mod tests {
             f2: "10".into(),
             ..Default::default()
         };
-        assert!(validate(&dv, &Value::Number(5.0), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&dv, &Value::Number(11.0), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&dv, &Value::Number(5.5), &sh, 0, 0, |_, _, _| true), "整型不接受小数");
-        assert!(!validate(&dv, &Value::Text("abc".into()), &sh, 0, 0, |_, _, _| true));
+        assert!(validate(&dv, &Value::Number(5.0), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&dv, &Value::Number(11.0), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&dv, &Value::Number(5.5), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)), "整型不接受小数");
+        assert!(!validate(&dv, &Value::Text("abc".into()), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
 
         let dv2 = DataValidation {
             kind: DvKind::Decimal,
@@ -463,8 +593,8 @@ mod tests {
             f1: "0".into(),
             ..Default::default()
         };
-        assert!(validate(&dv2, &Value::Number(0.5), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&dv2, &Value::Number(0.0), &sh, 0, 0, |_, _, _| true));
+        assert!(validate(&dv2, &Value::Number(0.5), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&dv2, &Value::Number(0.0), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
     }
 
     #[test]
@@ -476,12 +606,55 @@ mod tests {
             f1: "3".into(),
             ..Default::default()
         };
-        assert!(validate(&dv, &Value::Text("abc".into()), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&dv, &Value::Text("abcd".into()), &sh, 0, 0, |_, _, _| true));
+        assert!(validate(&dv, &Value::Text("abc".into()), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&dv, &Value::Text("abcd".into()), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
 
         let custom = DataValidation { kind: DvKind::Custom, f1: "MOD(A1,2)=0".into(), ..Default::default() };
-        assert!(validate(&custom, &Value::Number(4.0), &sh, 0, 0, |_, _, _| true));
-        assert!(!validate(&custom, &Value::Number(4.0), &sh, 0, 0, |_, _, _| false));
+        assert!(validate(&custom, &Value::Number(4.0), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate(&custom, &Value::Number(4.0), &sh, 0, 0, |_, _, _| crate::formula::FValue::Bool(false)));
+    }
+
+    #[test]
+    fn workbook_lists_and_formula_bounds() {
+        use crate::model::{Cell, Value, Workbook};
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        let mut list = crate::model::Sheet::default();
+        list.name = "列表".into();
+        list.set(0, 0, Cell { value: Value::Text("甲".into()), formula: None });
+        list.set(1, 0, Cell { value: Value::Text("乙".into()), formula: None });
+        wb.sheets.push(list);
+        wb.names.push(("甲乙".into(), None, "'列表'!$A$1:$A$2".into()));
+
+        let named = DataValidation { kind: DvKind::List, f1: "=甲乙".into(), ..Default::default() };
+        assert!(validate_wb(&wb, 0, &named, &Value::Text("甲".into()), 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate_wb(&wb, 0, &named, &Value::Text("丙".into()), 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+
+        // 跨表区域，不经过名称
+        let cross = DataValidation { kind: DvKind::List, f1: "列表!$A$1:$A$2".into(), ..Default::default() };
+        assert!(validate_wb(&wb, 0, &cross, &Value::Text("乙".into()), 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+        assert!(!validate_wb(&wb, 0, &cross, &Value::Text("甲2".into()), 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+
+        // 无法解析的名称必须拒绝，不能退回“全部允许”
+        let bad = DataValidation { kind: DvKind::List, f1: "=不存在".into(), ..Default::default() };
+        assert!(!validate_wb(&wb, 0, &bad, &Value::Text("甲".into()), 0, 0, |_, _, _| crate::formula::FValue::Bool(true)));
+
+        // 公式阈值 =A1；A1=1
+        let mut calc = crate::formula::Calc::new(&wb);
+        let bound = DataValidation {
+            kind: DvKind::Decimal,
+            op: DvOp::GreaterEq,
+            f1: "=$A$1".into(),
+            ..Default::default()
+        };
+        let mut eval = |f: &str, rr: u32, cc: u32| {
+            let shifted = crate::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+            crate::formula::parse(&shifted)
+                .map(|n| calc.eval_node(&n, 0))
+                .unwrap_or(crate::formula::FValue::Error(crate::formula::ErrKind::Value))
+        };
+        assert!(!validate_wb(&wb, 0, &bound, &Value::Number(0.0), 0, 1, &mut eval));
+        assert!(validate_wb(&wb, 0, &bound, &Value::Number(2.0), 0, 1, &mut eval));
     }
 
     #[test]

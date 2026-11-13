@@ -198,13 +198,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
             Some(Value::Empty) | None => (None, false),
             Some(other) => (other.display().parse::<f64>().ok(), true),
         };
-        // Count 的输入是“非空值个数”；其余汇总只保留可转成数字的值。
+        // 先建立分组标签，再决定是否纳值。否则某个标签下的值全为空时，
+        // 整行/整列会从结果里消失（Excel 仍保留标签并显示 Count=0）。
+        let entry = data.entry(key).or_default().entry(col_key).or_default();
         if spec.agg == Agg::Count {
             if nonempty {
-                data.entry(key).or_default().entry(col_key).or_default().push(PivotVal { n });
+                entry.push(PivotVal { n });
             }
         } else if let Some(n) = n {
-            data.entry(key).or_default().entry(col_key).or_default().push(PivotVal { n: Some(n) });
+            entry.push(PivotVal { n: Some(n) });
         }
     }
 
@@ -249,6 +251,8 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
 
 fn agg_value<T: std::borrow::Borrow<PivotVal>>(vals: &[T], agg: Agg) -> Value {
     if vals.is_empty() {
+        // 本机 Excel 365 对“整组全空”的 Count 显示空白，而不是 0；
+        // 但分组标签仍保留（由 compute 先建 entry 保证）。
         return Value::Empty;
     }
     let nums: Vec<f64> = vals.iter().filter_map(|v| v.borrow().n).collect();
@@ -343,8 +347,10 @@ mod tests {
         s.set(2, 1, Cell { value: Value::Text("x".into()), formula: None });
         s.set(3, 0, Cell { value: Value::Text("A".into()), formula: None });
         // B4 故意留空：Count 不应把空格算成 0
+        s.set(4, 0, Cell { value: Value::Text("B".into()), formula: None });
+        // B5 也留空：B 组整组无值，但标签必须保留，Count=0
         let spec = PivotSpec {
-            source: (0, 0, 3, 1),
+            source: (0, 0, 4, 1),
             row_field: 0,
             col_field: None,
             value_field: 1,
@@ -355,6 +361,8 @@ mod tests {
         let res = compute(&s, &spec);
         assert_eq!(res.rows[0][0], Value::Text("A".into()));
         assert_eq!(res.rows[0][1], Value::Number(2.0), "1 和 x 算两个，空格不算");
+        assert_eq!(res.rows[1][0], Value::Text("B".into()), "全空分组不能消失");
+        assert_eq!(res.rows[1][1], Value::Empty, "全空分组 Count 为空（Excel 实机）");
     }
 
     #[test]

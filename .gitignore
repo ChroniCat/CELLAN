@@ -38,6 +38,7 @@
 !crates/core/tests/fixtures/qa01_extended/*.xlsx
 
 !crates/core/tests/fixtures/c16/*.xlsx
+!crates/core/tests/fixtures/c07/*.xlsx
 
 # Operating-system files
 .DS_Store

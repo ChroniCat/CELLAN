@@ -47,7 +47,7 @@ def main() -> int:
         ws2.cell(row=1, column=col, value=value)
     wb.save(out / "spark_table.xlsx")
 
-    # 图片：C3:D8 的 twoCellAnchor，与 app UI 回归的 at=(2,1,7,3) 契约一致。
+    # 图片：B3:D8 的 twoCellAnchor，与 app UI 回归的 at=(2,1,7,3) 契约一致。
     pixel = out / "pixel.png"
     PILImage.new("RGB", (16, 16), (30, 120, 200)).save(pixel)
     wb = Workbook()

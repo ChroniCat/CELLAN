@@ -1,0 +1,69 @@
+# C07.1 命名列表 / 跨表区域 / 公式阈值
+
+日期：2026-11-13 20:35 CST
+范围：`crates/core/src/dv.rs`、`crates/app/src/main.rs` 的数据验证入口、合成夹具 `crates/core/tests/fixtures/c07/refs.xlsx`。
+
+## 修复前
+
+- `list_items` 只认内联 `"甲,乙"` 和本表 `A1:A2`；`=NamedList` 解析失败后返回空列表，
+  `validate` 又把空列表当成“无限制”直接放行，非法文本能通过。
+- `parse_bound` 只认数字和简单 `DATE(...)`；`=$A$1` 解析失败后按 0 比较，
+  `>=` 规则会把 0 接受或把合法值误拒。
+- 应用下拉开列表时同样只调用 `list_items`。
+
+## 修复
+
+1. 新增 `list_items_wb(wb, si, dv) -> Option<Vec<String>>`：
+   - 解析工作簿级/表级命名区域（大小写不敏感，后定义优先）；
+   - 解析跨表区域，支持 `列表!$A$1:$A$2` 与 `'Sheet Name'!A1:B2`；
+   - 支持单值区域、内联逗号列表、`{"甲","乙"}` 字面量；
+   - 无法解析返回 `None`，带工作簿入口按空列表拒绝，不再“全放行”。
+2. 新增 `validate_wb`，把 `list_items_wb` 的结果注入校验；
+   `validate` 保留给只有当前表上下文的调用者。
+3. 数值 `TextLength/Whole/Decimal/Date/Time` 的上下界改走 `bound_value`：
+   先试字面量/日期，再调用真实公式求值器；支持 `=$A$1`、命名区域、区域引用。
+   求值失败返回 `false`，不再静默按 0 处理。
+4. 应用的两处真实输入校验和下拉候选改用 `validate_wb` / `list_items_wb`。
+
+## 夹具
+
+`scripts/c07_dv_refs_fixture.py` 生成 `refs.xlsx`：
+
+- 工作表 `输入`：A1=1；B2 列表验证 `=甲乙`；C2 整数验证 `>=$A$1`；
+- 工作表 `列表`：A1=甲、A2=乙；
+- 工作簿名称：`甲乙 = 列表!$A$1:$A$2`。
+
+SHA-256：`442d7972a2ae9174ce872e3bbb7e65d2e95530092c079ad9d8f3801551b36b5a`
+
+## 实际执行
+
+```text
+cargo test -p sheetcore --offline --lib dv::tests:: -- --test-threads=1
+-> 5 passed; 0 failed; 0 ignored
+
+cargo test -p sheetcore --offline --test c07_dv_refs
+-> 1 passed; 0 failed; 0 ignored
+```
+
+`c07_dv_refs` 是“已有 xlsx → load → validate_wb”的真实文件路径，断言：
+
+- 命名列表 `甲` 通过、`丙` 拒绝；
+- 跨表区域 `乙` 通过、`甲2` 拒绝；
+- 不存在名称的列表拒绝，而不是全部放行；
+- `=$A$1` 且 A1=1 时 0 拒绝、2 通过。
+
+应用构建：
+
+```text
+cargo build -p app --offline --no-default-features --features glow
+-> EXIT=0
+```
+
+日志：`/tmp/c07_dv4.log`、`/tmp/c07_refs2.log`、`/tmp/c07_build2.log`。
+
+## 诚实边界
+
+- 这是 C07.1 的引用解析/求值，不包含 C07.2 的停止/警告/信息交互和输入提示开关；
+  C07.2 仍是待实施。
+- 还没有用 Excel/WPS 逐一验证下拉外观、错误样式和跨表名称修改后的刷新；
+  这些留到 C07.2/C07.3，不能据此把 C07 父项记完成。

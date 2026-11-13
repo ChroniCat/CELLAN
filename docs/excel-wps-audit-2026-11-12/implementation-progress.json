@@ -1274,7 +1274,7 @@
       "failures": [],
       "blocker": "",
       "next": "等待/接受 QA-02 复核；同时继续下一可执行任务（QA-03.2/03.3）。",
-      "updated_utc": "2026-11-13T20:22:00Z",
+      "updated_utc": "2026-11-13T12:48:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1426,11 +1426,11 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline -> 9 ignored listed with reason/owner/unlock",
-            "cargo test -p app --offline --test ui_regression -> 0 ignored"
+            "git clone --no-hardlinks <repo> <scratch>/qa02_clean_clone -> HEAD 70954b3, clean",
+            "cargo test --workspace --offline -> 79 result lines / 975 passed / 0 failed / 9 ignored (EXIT=0)"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-ledger.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-clean-clone.txt"
           ],
           "not_done": [
             "9 个 ignored 中 1 个 vba 真实样本仍未解锁；其余 8 个按 optional/COM/helper 分类。"
@@ -1438,7 +1438,7 @@
           "failures": [],
           "blocker": "",
           "next": "监督复核 ledger；提供 VBA 样本后才去 ignore。",
-          "updated_utc": "2026-11-13T20:22:00Z"
+          "updated_utc": "2026-11-13T12:48:00Z"
         }
       ]
     },
@@ -2737,17 +2737,19 @@
       "scope": "core/dv.rs + app验证入口",
       "source": "core-requirements.md",
       "heading": "C07 P1 数据验证引用解析、提示等级和错误处理",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "C07.1 待验收；C07.2/C07.3 未开始。"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "继续 C07.2 错误样式与提示。",
+      "updated_utc": "2026-11-13T12:43:00Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2755,17 +2757,33 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/dv.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c07_dv_refs.rs",
+            "crates/core/tests/fixtures/c07/refs.xlsx",
+            "scripts/c07_dv_refs_fixture.py"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --lib dv::tests:: -- --test-threads=1 -> 5 passed",
+            "cargo test -p sheetcore --offline --test c07_dv_refs -> 1 passed",
+            "cargo test -p sheetcore --offline -> 78 bins / 725 passed / 0 failed / 9 ignored",
+            "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
+            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-refs.txt"
+          ],
+          "not_done": [
+            "停止/警告/信息交互与输入提示开关（C07.2）未实现；未做 Excel/WPS 下拉外观与错误样式矩阵。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "监督复核 C07.1；随后实现 C07.2 errorStyle/输入提示。",
+          "updated_utc": "2026-11-13T12:43:00Z"
         },
         {
           "id": "C07.2",
@@ -3155,7 +3173,7 @@
       "failures": [],
       "blocker": "",
       "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
-      "updated_utc": "2026-11-13T12:26:00Z",
+      "updated_utc": "2026-11-13T12:43:00Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3170,21 +3188,21 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --lib pivot::tests:: -- --test-threads=1 -> 5 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline -> 77 bins / 723 passed / 0 failed / 9 ignored (EXIT=0)",
-            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
+            "cargo test -p sheetcore --offline --lib pivot::tests:: -- --test-threads=1 -> 5 passed",
+            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed",
+            "cargo test -p sheetcore --offline -> 78 bins / 725 passed / 0 failed / 9 ignored",
+            "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-count.txt"
           ],
           "not_done": [
-            "两层行字段/多值字段/筛选器/字段面板/Office 可编辑往返未实现。"
+            "两层行字段/多值字段/筛选器/字段面板/Office 可编辑往返未实现；本切片只覆盖 Count/空组。"
           ],
           "failures": [],
           "blocker": "",
           "next": "监督复核 C12.1 的 Count/空值回归；随后再做 C12.2 多字段规格。",
-          "updated_utc": "2026-11-13T12:26:00Z"
+          "updated_utc": "2026-11-13T12:43:00Z"
         },
         {
           "id": "C12.2",

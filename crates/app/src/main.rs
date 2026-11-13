@@ -5775,14 +5775,11 @@ impl SheetApp {
                         if matches!(cell.value, sheetcore::model::Value::Empty) {
                             continue;
                         }
-                        let ok = sheetcore::dv::validate(dv, &cell.value, sheet, r, c, |f, rr, cc| {
+                        let ok = sheetcore::dv::validate_wb(&self.wb, si, dv, &cell.value, r, c, |f, rr, cc| {
                             let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
                             match sheetcore::formula::parse(&shifted) {
-                                Ok(node) => matches!(
-                                    calc.eval_node(&node, si),
-                                    sheetcore::formula::FValue::Bool(true)
-                                ),
-                                Err(_) => true,
+                                Ok(node) => calc.eval_node(&node, si),
+                                Err(_) => sheetcore::formula::FValue::Bool(true),
                             }
                         });
                         if !ok {
@@ -6987,14 +6984,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         Value::parse_input(&ed.buf)
                     };
                     let mut calc = sheetcore::formula::Calc::new(&self.wb);
-                    let ok = sheetcore::dv::validate(dv, &probe, sheet, r, c, |f, rr, cc| {
+                    let ok = sheetcore::dv::validate_wb(&self.wb, self.sheet_idx, dv, &probe, r, c, |f, rr, cc| {
                         let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
                         match sheetcore::formula::parse(&shifted) {
-                            Ok(node) => matches!(
-                                calc.eval_node(&node, self.sheet_idx),
-                                sheetcore::formula::FValue::Bool(true)
-                            ),
-                            Err(_) => true,
+                            Ok(node) => calc.eval_node(&node, self.sheet_idx),
+                            Err(_) => sheetcore::formula::FValue::Bool(true),
                         }
                     });
                     if !ok {
@@ -21656,7 +21650,7 @@ let txn = self.txn_begin(&keys);
                     Color32::from_rgb(70, 70, 70),
                 );
                 if dumping {
-                    dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items(dv, self.wb.sheet(self.sheet_idx)).len()));
+                    dump.push(format!("dv-arrow ({},{}) at=({:.0},{:.0}) 选项数={}", self.sel.0, self.sel.1, btn.center().x, btn.center().y, sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv).map(|v| v.len()).unwrap_or(0)));
                 }
                 if !readonly && resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -21677,10 +21671,8 @@ let txn = self.txn_begin(&keys);
                 let sheet = self.wb.sheet(self.sheet_idx);
                 sheetcore::dv::find(&sheet.dv, dr, dc).cloned()
             } {
-                let items = {
-                    let sheet = self.wb.sheet(self.sheet_idx);
-                    sheetcore::dv::list_items(&dv, sheet)
-                };
+                let items = sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, &dv)
+                    .unwrap_or_default();
                 if !items.is_empty() {
                     let pos = egui::pos2(gx(dc), gy(dr) + rows.size(dr));
                     let mut picked: Option<String> = None;

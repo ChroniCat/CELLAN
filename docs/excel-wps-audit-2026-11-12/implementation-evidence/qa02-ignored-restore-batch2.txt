@@ -83,13 +83,13 @@ cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT
 - `icons.xlsx`：条件格式图标样式；
 - `compare_left.xlsx`：A1 产品；
 - `spark_table.xlsx`：一月/二月两张表，A1:E1 为数值；
-- `pic.xlsx` + `pixel.png`：单一图片，锚点 C3:D8，对应 dump `at=(2,1,7,3)`。
+- `pic.xlsx` + `pixel.png`：单一图片，锚点 B3:D8，对应 dump `at=(2,1,7,3)`。
 
 恢复 `grid_renders_cells_and_panes`、`conditional_format_icons_render`、
 `compare_mode_splits_into_two_panes`、`textbox_renders_and_moves`、
 `textbox_drag_moves_model`、`subtotal_and_flashfill_apply`、
 `sparkline_create_from_selection` 七个测试；图片测试也改为
-`pic.xlsx`（C3:D8 twoCellAnchor，16×16 PNG），不再缺夹具。
+`pic.xlsx`（B3:D8 twoCellAnchor，16×16 PNG），不再缺夹具。
 
 实际命令：
 

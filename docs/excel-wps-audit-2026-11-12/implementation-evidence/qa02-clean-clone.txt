@@ -1,0 +1,55 @@
+# QA-02.3 空白 clone 日常 suite 证明
+
+日期：2026-11-13 20:48 CST
+验收要求：空白 clone + 已安装依赖即可运行日常功能 suite；关键 P0/P1 功能不依赖本机散落 `tests/test-work` 文件；缺夹具明确失败。
+
+## 独立检出
+
+从当前提交 `70954b3` 做独立 clone，不使用原工作树：
+
+```text
+git clone --no-hardlinks F:/finance-native-sheets-ready \
+  C:/Users/Administrator/AppData/Local/hermes/cache/scratch/qa02_clean_clone
+cd .../qa02_clean_clone
+git status --porcelain  -> 空（干净检出）
+git rev-parse --short HEAD -> 70954b3
+```
+
+检出后没有复制原工作树的 `target/`、`work/` 或任何未跟踪文件。依赖使用本机已安装的
+Cargo registry，强制 `--offline`。
+
+## 运行
+
+```text
+C:/Users/Administrator/.cargo/bin/cargo.exe test --workspace --offline
+-> EXIT=0
+-> 79 test result 行：975 passed / 0 failed / 9 ignored
+```
+
+日志：`/tmp/qa02_clean_clone_suite.log`。
+
+Suite 覆盖 core 的 78 个测试 target（含 QA-01、QA-02 恢复的夹具）、app 的
+`src/main.rs` 单测（232 项）以及 app 集成测试；没有使用原目录的 `tests/test-work`
+或 `work/` 下的散落产物。
+
+## 运行后检查
+
+```text
+git status --porcelain -> 空
+find . -type d -name test-work -> 无输出
+```
+
+测试输出全部写到 `target/` 或 `current_exe().parent()` 的 PID 命名文件；没有在
+`tests/test-work` 留下生成物，也没有修改任何 tracked 文件。
+
+## 9 个 ignored
+
+全量仍为 9 个 core ignored，逐项原因/责任/解锁步骤见
+`docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-ledger.md`。
+本次不要求归零；`vba_source` 等依赖真实 OLE 样例的项继续保持未执行。
+
+## 边界
+
+- 这是空白 clone 的构建/单测/集成测试证明，不是 Excel/WPS 目视矩阵。
+- `7493688` 的 app 几何恢复和 `pictures_are_drawn_at_anchor` 仍按 20:38 监督意见
+  单独复核；本证明只回答 QA-02.3 的“干净检出可运行”要求。
