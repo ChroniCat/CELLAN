@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T05:11:25Z",
+  "updated_utc": "2026-11-13T05:16:26Z",
   "tasks": [
     {
       "id": "C01",
@@ -2521,7 +2521,8 @@
       ],
       "commits": [
         "b1f8f11",
-        "a0f8284"
+        "a0f8284",
+        "f1aea10"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
@@ -2540,7 +2541,7 @@
       "failures": [],
       "blocker": "",
       "next": "C10.2/C10.3 独立复核与 live；父项 C10 保持实施中。",
-      "updated_utc": "2026-11-13T05:11:25Z",
+      "updated_utc": "2026-11-13T05:16:26Z",
       "slices": [
         {
           "id": "C10.1",
@@ -2558,7 +2559,8 @@
           ],
           "commits": [
             "b1f8f11",
-            "a0f8284"
+            "a0f8284",
+            "f1aea10"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test structured_references -> 14 passed",
@@ -2572,7 +2574,7 @@
           "failures": [],
           "blocker": "",
           "next": "已认可；父项 C10 继续实施 C10.2/C10.3。",
-          "updated_utc": "2026-11-13T05:11:25Z"
+          "updated_utc": "2026-11-13T05:16:26Z"
         },
         {
           "id": "C10.2",
@@ -2655,7 +2657,8 @@
       ],
       "commits": [
         "1019016",
-        "757d305"
+        "757d305",
+        "f1aea10"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test implicit_intersection -> 3 passed",
@@ -2680,7 +2683,7 @@
       "failures": [],
       "blocker": "",
       "next": "独立复核 C11.1/C11.2 剩余修复；之后实施 C11.3 隐式交集 @。",
-      "updated_utc": "2026-11-13T05:11:25Z",
+      "updated_utc": "2026-11-13T05:16:26Z",
       "slices": [
         {
           "id": "C11.1",
@@ -2696,7 +2699,8 @@
             "crates/core/tests/whole_row_refs.rs"
           ],
           "commits": [
-            "1019016"
+            "1019016",
+            "f1aea10"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test whole_row_refs -> 7 passed",
@@ -2712,7 +2716,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；不把 Office 实机当作已完成。",
-          "updated_utc": "2026-11-13T05:11:25Z"
+          "updated_utc": "2026-11-13T05:16:26Z"
         },
         {
           "id": "C11.2",
@@ -2729,7 +2733,8 @@
             "crates/core/tests/spill_refs.rs"
           ],
           "commits": [
-            "757d305"
+            "757d305",
+            "f1aea10"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test spill_refs -> 7 passed",
@@ -2745,7 +2750,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；C11.3/C11.4 继续。",
-          "updated_utc": "2026-11-13T05:11:25Z"
+          "updated_utc": "2026-11-13T05:16:26Z"
         },
         {
           "id": "C11.3",
@@ -2760,7 +2765,9 @@
             "crates/core/src/formula/deps.rs",
             "crates/core/tests/implicit_intersection.rs"
           ],
-          "commits": [],
+          "commits": [
+            "f1aea10"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test implicit_intersection -> 3 passed",
             "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored"
@@ -2774,7 +2781,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T05:11:25Z"
+          "updated_utc": "2026-11-13T05:16:26Z"
         },
         {
           "id": "C11.4",
@@ -2792,7 +2799,9 @@
             "crates/core/src/xls_formula.rs",
             "crates/core/tests/three_d.rs"
           ],
-          "commits": [],
+          "commits": [
+            "f1aea10"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test three_d -> 16 passed",
             "cargo test -p sheetcore --offline xls_formula -> 11 passed"
@@ -2808,7 +2817,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T05:11:25Z"
+          "updated_utc": "2026-11-13T05:16:26Z"
         }
       ]
     },

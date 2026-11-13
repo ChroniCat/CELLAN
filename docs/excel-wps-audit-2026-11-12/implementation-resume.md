@@ -312,7 +312,7 @@
 
 ## 13:10 当前：12:48 复核后的删除/UTF-8/兼容链
 
-- 工作树在 `a775380` 之上有未提交改动；本轮不把未提交状态当作已交付。
+- HEAD `f1aea10`（C11.3/C11.4/C10 转义/兼容链已提交）；本轮改动已进入该提交，不再以未提交工作树记绿。
 - 删除 3D 端点改为按删除前完整 `order` 在区间内部求邻居：
   `First:Third` 删 First -> `Second:Third`；反向 `Third:First` 删 First ->
   `Third:Second`；删 Third -> `Second:First`；`Second:Second` 删唯一成员 ->
