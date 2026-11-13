@@ -28,3 +28,16 @@ UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 未完成
 - 没有真实 Excel/WPS 打开该 xlsx 目视确认箭头形态；没有真实鼠标点三个菜单入口。
   UI-18 保持待验收，不用单测替代 GUI/Office 验收。
+
+## 16:12 CST 实际 GUI 操作记录（未计入验收）
+
+- 用 `openpyxl` 生成合成夹具 `ui18_gui.xlsx`：A1:B4，A1/B1 为筛选表头，
+  `auto_filter.ref=A1:B4`，第 2 行手动隐藏。
+- 启动当前 glow 构建的 app 打开该文件；`computer_use capture`（pid 34208，
+  window_id 3224030）成功抓到 1438×898 真实窗口图像，见
+  `implementation-evidence/ui18-filter-gui-capture.png`：能看到 A1/B1 的筛选箭头、
+  第 2 行隐藏、底部 `Filter` 表标签。
+- 之后尝试用 `computer_use` 在“数据”页签坐标点击（背景投递与 foreground 各一次），
+  返回 `screen unchanged`；后续 `focus_app` 因 cua-driver session 结束被拒。
+  没有取得“点击真正改变 Ribbon/菜单”的证据，因此不把本轮算作 UI-18 的真实鼠标验收。
+- 仍未做：真实 Excel/WPS 目视、三个菜单入口点击。UI-18 保持待验收。

@@ -4842,15 +4842,17 @@
         "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png"
       ],
       "not_done": [
-        "真实 Excel/WPS 打开保存后的 xlsx 目视确认箭头；真实鼠标点三个菜单入口"
+        "真实鼠标点击三个菜单入口未取得可验证效果（本轮 capture 成功但点击返回 screen unchanged）",
+        "真实 Excel/WPS 打开保存后的 xlsx 目视箭头未做"
       ],
       "failures": [],
       "blocker": "",
       "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "updated_utc": "2026-11-13T08:25:00Z",
       "slices": [
         {
           "id": "UI-18.1",
@@ -4874,15 +4876,17 @@
             "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-gui-capture.png"
           ],
           "not_done": [
-            "真实 Excel/WPS 打开保存后的 xlsx 目视确认箭头；真实鼠标点三个菜单入口"
+            "真实鼠标点击三个菜单入口未取得可验证效果（本轮 capture 成功但点击返回 screen unchanged）",
+            "真实 Excel/WPS 打开保存后的 xlsx 目视箭头未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-          "updated_utc": "2026-11-13T07:08:00Z"
+          "updated_utc": "2026-11-13T08:25:00Z"
         }
       ]
     },
