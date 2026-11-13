@@ -63,6 +63,82 @@ fn threaded_comment_parts_survive_editing_a_normal_cell() {
 }
 
 #[test]
+fn query_table_and_custom_xml_survive_editing_a_normal_cell() {
+    // 先拿一份干净工作簿，挂上本应用生成的查询表与自定义 XML 部件
+    let src = fixture("threaded_real.xlsx");
+    let tmp = std::env::temp_dir().join("sc_c21_query_in.xlsx");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(&src, &tmp).unwrap();
+    let csv = std::env::temp_dir().join("sc_c21_query.csv");
+    std::fs::write(&csv, "月份,金额
+1月,10
+2月,20
+").unwrap();
+    sheetcore::qtable::attach_csv(&tmp, "Sheet1", (5, 0), 3, 2, &csv, true, ',').expect("挂查询表");
+    // 再补一个 customXml 部件（Excel 会原样保留）
+    {
+        use std::io::Write;
+        let bytes = std::fs::read(&tmp).unwrap();
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut items = Vec::new();
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut buf).unwrap();
+            items.push((name, buf));
+        }
+        drop(zin);
+        let mut out = std::fs::File::create(&tmp).unwrap();
+        let mut z = zip::ZipWriter::new(&mut out);
+        for (name, buf) in items {
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file(name.clone(), opts).unwrap();
+            if name == "[Content_Types].xml" {
+                let text = String::from_utf8(buf).unwrap().replace(
+                    "</Types>",
+                    "<Override PartName=\"/customXml/item1.xml\" ContentType=\"application/xml\"/></Types>",
+                );
+                z.write_all(text.as_bytes()).unwrap();
+            } else if name == "_rels/.rels" {
+                let text = String::from_utf8(buf).unwrap().replace(
+                    "</Relationships>",
+                    "<Relationship Id=\"rIdCX1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\" Target=\"customXml/item1.xml\"/></Relationships>",
+                );
+                z.write_all(text.as_bytes()).unwrap();
+            } else {
+                z.write_all(&buf).unwrap();
+            }
+        }
+        z.start_file("customXml/item1.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"<?xml version=\"1.0\"?><root xmlns=\"urn:c21\"><v>42</v></root>").unwrap();
+        z.finish().unwrap();
+    }
+    let before = parts(&tmp);
+    assert!(before.contains_key("xl/queryTables/queryTable1.xml"));
+    assert!(before.contains_key("customXml/item1.xml"));
+
+    let mut wb = sheetcore::xlsx::load(&tmp).expect("加载查询表夹具");
+    let sid = wb.sheets[0].style_of(0, 1);
+    let mut st = wb.styles.get(sid).clone();
+    st.italic = true;
+    let id = wb.styles.intern(st);
+    wb.sheets[0].set_style(0, 1, id);
+    let out = std::env::temp_dir().join("sc_c21_query_out.xlsx");
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
+
+    let after = parts(&out);
+    for need in ["xl/queryTables/queryTable1.xml", "xl/connections.xml", "customXml/item1.xml"] {
+        let a = after.get(need).unwrap_or_else(|| panic!("保存后丢了 {need}"));
+        let b = before.get(need).unwrap();
+        assert_eq!(a, b, "{need} 内容被改写");
+    }
+    let rels = String::from_utf8(after["xl/worksheets/_rels/sheet1.xml.rels"].clone()).unwrap();
+    assert!(rels.contains("queryTable1.xml"), "工作表 rels 丢了查询表关系");
+}
+
+#[test]
 fn vba_project_survives_editing_a_normal_cell() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/real_macro.xlsm");
     let before = parts(&src);

@@ -57,14 +57,24 @@ WPS  : 打开成功，同上
 （`CommentThreaded.Text` 在 COM 里是方法，PowerShell 直接取值打印出方法签名；
 所以以「对象存在 + 部件逐字节一致 + 无警告打开」为准，不拿方法签名当文本。）
 
-## 4. 未完成 / 未验证
+## 4. 查询表与 customXml（补充闭环）
 
-- 既有 queryTable / connections 部件在「改普通格再保存」后的保留未逐项回归；
-  应用只保证自己生成的连接（`qtable.rs`）。
-- `customXml/*` 依赖基准文件保留，未写断言。
+`qtable::attach_csv` 生成查询表与 connections，再注入一个 customXml 部件，随后
+加载、改 B1 斜体、保存：
+
+```text
+query_table_and_custom_xml_survive_editing_a_normal_cell ... ok
+```
+
+- `xl/queryTables/queryTable1.xml`、`xl/connections.xml`、`customXml/item1.xml`
+  逐字节不变，工作表 rels 仍有 queryTable 关系；
+- Excel 回读：`QT=1`（QueryTables.Count）、`CustomXMLParts.Count=3`（含注入项）、
+  `B1ITALIC=True`；WPS 回读：`WPS_QT=1 B1ITALIC=True`。
+
+## 5. 未完成 / 未验证
 - 界面改名只做了字符串级修改与 `cargo check`/`app --bin app` 回归；
   真实键鼠点开这些对话框在本机 RDP 不可用时没有执行，留待验收。
 
-## 5. 回归
+## 6. 回归
 
-sheetcore **779 passed**、app `--bin app` **263 passed**。
+sheetcore **780 passed**、app `--bin app` **263 passed**。

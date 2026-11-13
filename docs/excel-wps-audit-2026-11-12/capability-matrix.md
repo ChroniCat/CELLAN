@@ -44,8 +44,8 @@
 | `xl/vbaProject.bin` | 字节保留 |
 | `xl/threadedComments/*`、`xl/persons/*` | 从基准文件原字节恢复（测试 `c21_parts::threaded_comment_parts_survive_editing_a_normal_cell`） |
 | 线程批注工作簿里的 `xl/comments*.xml` 镜像 | 同上，原字节恢复（该场景下应用内不编辑批注） |
-| `customXml/*` | 由基准文件保留（未逐项回归） |
-| 既有 queryTable / connections | 未逐项回归；应用只保证自己生成的连接 |
+| `customXml/*` | 原字节保留，同一测试断言；Excel 回读 CustomXMLParts 仍含该部件 |
+| 既有 queryTable / connections | 原字节保留（测试 `c21_parts::query_table_and_custom_xml_survive_editing_a_normal_cell`；Excel/WPS 回读 QueryTables=1） |
 
 ## 不使用「完全兼容」
 

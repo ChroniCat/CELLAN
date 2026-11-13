@@ -6032,19 +6032,19 @@
       "scope": "app/ribbon + 帮助/支持矩阵",
       "source": "core-requirements.md",
       "heading": "C21 P2 明确高级能力边界",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "入口改名+支持矩阵+宏/线程批注逐字节保留已完成；既有 queryTable/customXml 保留未逐项回归；真实键鼠未执行"
+        "入口改名、支持矩阵、vba/线程批注/queryTable/customXml 逐字节保留均已验；界面改名未做真实键鼠目视确认"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T19:01:44Z",
+      "updated_utc": "2026-11-13T19:03:17Z",
       "slices": [
         {
           "id": "C21.1",
@@ -6052,7 +6052,7 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C21 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
@@ -6068,12 +6068,12 @@
             "docs/excel-wps-audit-2026-11-12/capability-matrix.md"
           ],
           "not_done": [
-            "宏按钮/预测/快速填充改名；c21_parts 2 条（vbaProject 与线程批注逐字节保留）；矩阵文档已写；queryTable/customXml 未验；真实对话框未点开"
+            "四个入口改名+矩阵；c21_parts 3 条（宏/线程批注/查询表+customXml 逐字节保留，Excel/WPS 回读）；真实对话框未键鼠点开"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T19:01:44Z"
+          "updated_utc": "2026-11-13T19:03:17Z"
         }
       ]
     },
