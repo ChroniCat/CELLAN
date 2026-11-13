@@ -160,19 +160,19 @@ fn structured_reference_does_not_change_strings_or_sheet_refs() {
 fn this_row_expands_to_current_formula_row() {
     let wb = sales_book();
     assert_eq!(
-        expand_structured_at(&wb, 0, Some(1), "Sales[[#This Row],[Amount]]").as_deref(),
+        expand_structured_at(&wb, 0, Some(1), Some(0), "Sales[[#This Row],[Amount]]").as_deref(),
         Some("B2")
     );
     assert_eq!(
-        expand_structured_at(&wb, 0, Some(2), "Sales[@[Amount]]").as_deref(),
+        expand_structured_at(&wb, 0, Some(2), Some(0), "Sales[@[Amount]]").as_deref(),
         Some("B3")
     );
     assert_eq!(
-        expand_structured_at(&wb, 0, Some(1), "Sales[@]").as_deref(),
+        expand_structured_at(&wb, 0, Some(1), Some(0), "Sales[@]").as_deref(),
         Some("A2:D2")
     );
     assert_eq!(
-        expand_structured_at(&wb, 0, Some(4), "Sales[@Amount]").as_deref(),
+        expand_structured_at(&wb, 0, Some(4), Some(0), "Sales[@Amount]").as_deref(),
         Some("#VALUE!"),
         "汇总行不在数据区，当前行引用应报错"
     );
@@ -223,4 +223,101 @@ fn current_row_really_calculates_per_row() {
     let f = "=Sales[@Amount]".to_string();
     wb.sheets[0].set(4, 5, Cell { value: Value::Empty, formula: Some(f.into()) });
     assert_eq!(format!("{:?}", eval_cell(&wb, 0, 4, 5)), "Error(Value)");
+}
+
+#[test]
+fn bare_current_row_formula_uses_formula_cell_table() {
+    let mut wb = sales_book();
+    wb.sheets[0].set(1, 3, Cell {
+        value: Value::Empty,
+        formula: Some("=[@Amount]*[@Tax]".into()),
+    });
+    wb.sheets[0].set(2, 3, Cell {
+        value: Value::Empty,
+        formula: Some("=[@Amount]*[@Tax]".into()),
+    });
+    sheetcore::formula::recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(1, 3), Value::Number(10.0));
+    assert_eq!(wb.sheets[0].value(2, 3), Value::Number(40.0));
+
+    let deps = sheetcore::formula::deps::Deps::build(&wb);
+    let dirty = deps.closure(&[(0, 1, 1)]);
+    assert!(dirty.contains(&(0, 1, 3)), "D2 依赖 B2/C2，D2 必须进 dirty");
+}
+
+#[test]
+fn bare_current_row_picks_table_by_formula_column_when_row_has_two_tables() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets[0].tables.push(Table {
+        name: "Left".into(),
+        display: "Left".into(),
+        range: (0, 0, 2, 1),
+        columns: vec!["Amount".into(), "Tax".into()],
+        header_row: true,
+        totals_row: false,
+    });
+    wb.sheets[0].tables.push(Table {
+        name: "Right".into(),
+        display: "Right".into(),
+        range: (0, 3, 2, 4),
+        columns: vec!["Rate".into(), "Out".into()],
+        header_row: true,
+        totals_row: false,
+    });
+    for (r, a, b, rate) in [(0u32, "Amount", "Tax", "Rate"), (1, "10", "0.1", "3"), (2, "20", "0.2", "4")] {
+        if r == 0 {
+            wb.sheets[0].set(r, 0, Cell { value: Value::Text(a.into()), formula: None });
+            wb.sheets[0].set(r, 1, Cell { value: Value::Text(b.into()), formula: None });
+            wb.sheets[0].set(r, 3, Cell { value: Value::Text(rate.into()), formula: None });
+            wb.sheets[0].set(r, 4, Cell { value: Value::Text("Out".into()), formula: None });
+        } else {
+            wb.sheets[0].set(r, 0, Cell { value: Value::Number(a.parse().unwrap()), formula: None });
+            wb.sheets[0].set(r, 1, Cell { value: Value::Number(b.parse().unwrap()), formula: None });
+            wb.sheets[0].set(r, 3, Cell { value: Value::Number(rate.parse().unwrap()), formula: None });
+        }
+    }
+    // E2 在 Right 表内，同一行也有 Left 表；必须取 Right.Rate=3，而不是 Left。
+    wb.sheets[0].set(1, 4, Cell {
+        value: Value::Empty,
+        formula: Some("=[@Rate]*2".into()),
+    });
+    sheetcore::formula::recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(1, 4), Value::Number(6.0));
+
+    let deps = sheetcore::formula::deps::Deps::build(&wb);
+    assert!(deps.closure(&[(0, 1, 3)]).contains(&(0, 1, 4)));
+}
+
+#[test]
+fn original_chinese_bare_current_row_formula_evaluates_two_rows() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets[0].tables.push(Table {
+        name: "Sales".into(),
+        display: "Sales".into(),
+        range: (0, 0, 2, 2),
+        columns: vec!["金额".into(), "税率".into(), "小计".into()],
+        header_row: true,
+        totals_row: false,
+    });
+    for (r, label) in ["金额", "税率", "小计"].iter().enumerate() {
+        wb.sheets[0].set(0, r as u32, Cell { value: Value::Text((*label).into()), formula: None });
+    }
+    for (r, amount, tax) in [(1u32, 100.0, 0.1), (2, 200.0, 0.2)] {
+        wb.sheets[0].set(r, 0, Cell { value: Value::Number(amount), formula: None });
+        wb.sheets[0].set(r, 1, Cell { value: Value::Number(tax), formula: None });
+        wb.sheets[0].set(r, 2, Cell {
+            value: Value::Empty,
+            formula: Some("=[@金额]*[@税率]".into()),
+        });
+    }
+    sheetcore::formula::recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(1, 2), Value::Number(10.0));
+    assert_eq!(wb.sheets[0].value(2, 2), Value::Number(40.0));
+
+    let deps = sheetcore::formula::deps::Deps::build(&wb);
+    let dirty = deps.closure(&[(0, 1, 0), (0, 2, 1)]);
+    assert!(dirty.contains(&(0, 1, 2)), "C2 依赖 A2/B2");
+    assert!(dirty.contains(&(0, 2, 2)), "C3 依赖 A3/B3");
 }

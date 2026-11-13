@@ -987,7 +987,7 @@ impl<'a> Calc<'a> {
             }
             let raw = f.strip_prefix('=').unwrap_or(f).to_string();
             // 结构化引用：Table1[列] → A1 区域
-            let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), &raw).unwrap_or(raw);
+            let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), Some(c), &raw).unwrap_or(raw);
             let normalized = crate::normalize_formula(&expanded);
             let body = normalized.as_str();
             if !self.visiting.insert(key) {
@@ -1081,7 +1081,7 @@ impl<'a> Calc<'a> {
                     let text = body.trim_start_matches('=').to_string();
                     if !text.is_empty() && !text.eq_ignore_ascii_case(n) {
                         let expanded =
-                            crate::table::expand_structured_at(self.wb, si2, Some(self.cur.0), &text).unwrap_or(text);
+                            crate::table::expand_structured_at(self.wb, si2, Some(self.cur.0), Some(self.cur.1), &text).unwrap_or(text);
                         if let Ok(node) = parse(&expanded) {
                             return self.eval_node(&node, si2);
                         }

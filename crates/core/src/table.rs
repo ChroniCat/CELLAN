@@ -362,14 +362,16 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
 /// 找不到表格时保留原文（让解析器报 #NAME?）；找到表格但列/区域非法时
 /// 返回 Excel 的错误值文本（`#REF!`/`#VALUE!`），不能静默改成别的区域。
 pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
-    expand_structured_at(wb, si, None, body)
+    expand_structured_at(wb, si, None, None, body)
 }
 
-/// 带当前公式行的结构化引用展开。`cur_row` 只影响 `@` / `#This Row`。
+/// 带当前公式位置的结构化引用展开。`cur_row`/`cur_col` 决定 `@` / `#This Row`
+/// 的归属表；同一行有多张表时必须用公式列定位，不能取第一张。
 pub fn expand_structured_at(
     wb: &crate::model::Workbook,
     si: usize,
     cur_row: Option<u32>,
+    cur_col: Option<u32>,
     body: &str,
 ) -> Option<String> {
     if !body.contains('[') {
@@ -384,7 +386,7 @@ pub fn expand_structured_at(
             out.push_str(seg);
             continue;
         }
-        match expand_segment_at(wb, si, cur_row, seg) {
+        match expand_segment_at(wb, si, cur_row, cur_col, seg) {
             Some(s) => {
                 out.push_str(&s);
                 changed = true;
@@ -400,6 +402,7 @@ fn expand_segment_at(
     wb: &crate::model::Workbook,
     si: usize,
     cur_row: Option<u32>,
+    cur_col: Option<u32>,
     body: &str,
 ) -> Option<String> {
     if !body.contains('[') {
@@ -411,6 +414,44 @@ fn expand_segment_at(
     let mut i = 0usize;
     while i < chars.len() {
         let ch = chars[i];
+        // 表内当前行简写：`[@金额]` / `[[#This Row],[金额]]`（没有表名）。
+        // 必须先按公式单元格定位所属表，否则同一行多张表会取错。
+        if ch == '[' {
+            let mut j = i;
+            let mut depth = 0i32;
+            while j < chars.len() {
+                if chars[j] == '[' {
+                    depth += 1;
+                } else if chars[j] == ']' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if j < chars.len() {
+                let inner: String = chars[i + 1..j].iter().collect();
+                if inner.trim_start().starts_with('@')
+                    || inner.to_ascii_uppercase().contains("#THIS ROW")
+                {
+                    let (Some(row), Some(col)) = (cur_row, cur_col) else {
+                        out.push_str("#VALUE!");
+                        changed = true;
+                        i = j + 1;
+                        continue;
+                    };
+                    if let Some((tbl, on_si)) = find_table_at(wb, si, row, col) {
+                        out.push_str(&expand_table_spec(wb, si, on_si, cur_row, &tbl, &inner));
+                    } else {
+                        out.push_str("#VALUE!");
+                    }
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '\\' {
             let start = i;
             while i < chars.len()
@@ -692,6 +733,21 @@ fn expand_table_spec(
         }
     };
     format!("{prefix}{}", ref_text(out_r1, abs_c1, out_r2, abs_c2))
+}
+
+fn find_table_at(
+    wb: &crate::model::Workbook,
+    si: usize,
+    row: u32,
+    col: u32,
+) -> Option<(Table, usize)> {
+    wb.sheets.get(si)?.tables.iter().find_map(|t| {
+        if t.range.0 <= row && row <= t.range.2 && t.range.1 <= col && col <= t.range.3 {
+            Some((t.clone(), si))
+        } else {
+            None
+        }
+    })
 }
 
 fn find_table(

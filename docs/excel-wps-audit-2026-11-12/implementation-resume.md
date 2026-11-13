@@ -1,13 +1,27 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `1019016`（C11.1 整行引用；C11.2 工作区未提交；C06/C10.1 在前）。
-- 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 2 实施中 / 40 待实施；
-  切片 28 已验收 / 21 待验收 / 99 待实施。
-- 当前测试真值（C11.1 修改后重跑）：core 71 bins / 633 passed / 0 failed / 41 ignored，
+- 分支 `main`（`origin/main`），HEAD `757d305`（C11.2 溢出引用；C11.1 在前；C10.1 裸当前行工作区未提交）。
+- 台账（`scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
+  切片 30 已验收 / 19 待验收 / 99 待实施。
+- 当前测试真值（C11.1 修改后重跑）：core 71 bins / 636 passed / 0 failed / 41 ignored，
   CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
   GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10/C11 未重跑 GUI。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
+
+## 10:25 复核：C06 已验收（第 12 项）
+
+- 用户认可 `cc3cec5` 的 `ensure_now_snapshot_in(wb.date_system)`；C06 / C06.1 / C06.2
+  转已验收，不重做。后续公共公式改动触及日期路径时重新打开。
+
+## 本轮追加：C10.1 原式裸当前行（实现完成，待独立复核）
+
+- 用户指出原样本是 `=[@金额]*[@税率]`（省略表名），此前 `Sales[@Amount]*Sales[@Tax]`
+  替代不能关闭。`expand_structured_at` 增加 `cur_col`；裸 `[@...]`/`[[#This Row],...]`
+  由 `find_table_at` 按公式单元格行+列定位所属表，同行多表不取错。
+- 新增中文原式两行测试、同行双表测试；`structured_references` 12 passed。
+- 特殊字符列名仍只覆盖空格/逗号/百分号，括号/结构化转义保留为未覆盖边界。
+- 全量 core 71 bins / 636 / 0 / 41；app 200/0。C10.1 仍待独立复核，父项 C10 未完成。
 
 ## 本轮追加：C11.2 溢出引用（实现完成，待独立复核）
 

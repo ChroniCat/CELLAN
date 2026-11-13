@@ -2334,8 +2334,8 @@
       "scope": "core/formula/functions.rs, style.rs",
       "source": "core-requirements.md",
       "heading": "C06 P1 本地时间与序列60兼容",
-      "status": "待验收",
-      "acceptance": "实现完成并自测通过，待独立复核：序列 59/60/61、DATE/TEXT/DAY/MONTH/YEAR、单元格格式；NOW/TODAY 本地时间与注入；D1900/D1904 实际 recalc_all_force/recalc_sheet 均使用工作簿体系快照（D1904 不得多 1462 天），同轮 NOW 一致。",
+      "status": "已验收",
+      "acceptance": "用户 10:25 复核认可 cc3cec5：显式 ensure_now_snapshot_in(wb.date_system) 真 1 pass；core 626/0/41 + app 200/0 EXIT0；D1900/D1904×recalc_all_force/recalc_sheet 含 NOW-NOW 一致；结合序列 60、本地时钟、Office 41558/62 原范围，C06 父项关闭（第 12 项）。",
       "files": [
         "crates/core/src/formula/functions.rs",
         "crates/core/src/formula/mod.rs",
@@ -2358,8 +2358,8 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "等待独立复核；C06 回归修复已补实际 D1900/D1904 重算测试",
-      "updated_utc": "2026-11-13T10:25:00Z",
+      "next": "已验收；若 C11 等公共公式改动触及日期路径，重新打开回归。",
+      "updated_utc": "2026-11-13T11:25:00Z",
       "slices": [
         {
           "id": "C06.1",
@@ -2367,8 +2367,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "序列 59/60/61 分别对应 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY(60)=29、MONTH(60)=2、YEAR(60)=1900、TEXT/单元格格式均为 1900-02-29；1904 体系不接受虚构的 1900-02-29。",
+          "status": "已验收",
+          "acceptance": "已随 C06 父项由用户 10:25 复核认可。",
           "files": [],
           "commits": [
             "8cd81fe",
@@ -2387,7 +2387,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核",
-          "updated_utc": "2026-11-13T10:25:00Z"
+          "updated_utc": "2026-11-13T11:25:00Z"
         },
         {
           "id": "C06.2",
@@ -2395,8 +2395,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照；D1900/D1904 的实际 recalc_all_force 与 recalc_sheet 都先绑定工作簿日期体系再建快照。",
+          "status": "已验收",
+          "acceptance": "已随 C06 父项由用户 10:25 复核认可。",
           "files": [],
           "commits": [
             "8cd81fe",
@@ -2414,7 +2414,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核",
-          "updated_utc": "2026-11-13T10:25:00Z"
+          "updated_utc": "2026-11-13T11:25:00Z"
         }
       ]
     },
@@ -2510,18 +2510,29 @@
       "source": "core-requirements.md",
       "heading": "C10 P1 完整结构化引用与表格计算列",
       "status": "实施中",
-      "acceptance": "父项未完成：结构化引用完整语法/当前行/区域已实现（C10.1 待复核）；计算列、插入行扩展、字段重命名（C10.2）与转换区域保存往返（C10.3）未实施。",
-      "files": [],
+      "acceptance": "C10.1 已补齐表内裸当前行 [@金额]*[@税率] 的求值/依赖，并按公式列区分同行多表；特殊字符列名仅覆盖空格/逗号/百分号，括号/结构化转义仍是未覆盖边界；C10.2/C10.3 未实施。",
+      "files": [
+        "crates/core/src/table.rs",
+        "crates/core/src/formula/deps.rs",
+        "crates/core/src/formula/mod.rs",
+        "crates/core/tests/structured_references.rs"
+      ],
       "commits": [
         "b1f8f11"
       ],
-      "commands": [],
-      "evidence": [],
+      "commands": [
+        "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
+        "cargo test -p sheetcore --offline -> 71 bins / 636 passed / 0 failed / 41 ignored",
+        "cargo test -p app --offline --bin app -> 200 passed / 0 failed"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "C10.2 列稳定标识、计算列自动填充、插入行自动扩展",
-      "updated_utc": "2026-11-13T10:10:00Z",
+      "next": "等待 C10.1 复核；C10.2/C10.3 继续。",
+      "updated_utc": "2026-11-13T11:25:00Z",
       "slices": [
         {
           "id": "C10.1",
@@ -2530,20 +2541,19 @@
           "acceptance_source": "core-requirements.md / C10 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "审计原始两条失败公式恢复：=Sales[Amount] 返回 10/20 两行数组；=SUM(Sales[[#Data],[Amount]])=30；[#Headers]/[#Totals]/[#All]/列区间/[@] 展开正确；引号内文本与工作表名不被改写。",
+          "acceptance": "原始 =[@金额]*[@税率] 在表内两行实际求值；同行多表按公式列定位；依赖命中；qualified 形式保留；特殊字符列名仅已覆盖空格/逗号/百分号，括号/结构化转义未覆盖。",
           "files": [
             "crates/core/src/table.rs",
-            "crates/core/src/formula/mod.rs",
             "crates/core/src/formula/deps.rs",
+            "crates/core/src/formula/mod.rs",
             "crates/core/tests/structured_references.rs"
           ],
           "commits": [
             "b1f8f11"
           ],
           "commands": [
-            "cargo test -p sheetcore --offline --test structured_references => 9 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline => 625 passed / 0 failed / 41 ignored",
-            "cargo test -p app --offline --bin app => 200 passed / 0 failed / 0 ignored"
+            "cargo test -p sheetcore --offline --test structured_references -> 12 passed",
+            "cargo test -p sheetcore --offline -> 636 passed / 0 failed / 41 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt"
@@ -2552,7 +2562,7 @@
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；父项继续 C10.2",
-          "updated_utc": "2026-11-13T10:10:00Z"
+          "updated_utc": "2026-11-13T11:25:00Z"
         },
         {
           "id": "C10.2",
@@ -2614,12 +2624,13 @@
         "crates/core/tests/spill_refs.rs"
       ],
       "commits": [
-        "1019016"
+        "1019016",
+        "757d305"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --test whole_row_refs -> 4 passed",
         "cargo test -p sheetcore --offline --test spill_refs -> 3 passed",
-        "cargo test -p sheetcore --offline -> 633 passed / 0 failed / 41 ignored",
+        "cargo test -p sheetcore --offline -> 636 passed / 0 failed / 41 ignored",
         "cargo test -p app --offline --bin app -> 200 passed / 0 failed"
       ],
       "evidence": [
@@ -2678,7 +2689,9 @@
             "crates/core/src/xls_formula.rs",
             "crates/core/tests/spill_refs.rs"
           ],
-          "commits": [],
+          "commits": [
+            "757d305"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test spill_refs -> 3 passed",
             "cargo test -p sheetcore --offline -> 633 passed / 0 failed / 41 ignored"
