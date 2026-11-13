@@ -1249,6 +1249,50 @@ fn custom_format_three_sections_preview_and_reload() {
     }
 }
 
+/// UI-15.2：填充/保护页写入真实样式，混合字段显式选择也覆盖整个选区。
+#[test]
+fn format_dialog_fill_and_protection_apply_to_selection() {
+    use sheetcore::style::CellStyle;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let a = CellStyle {
+        locked: true,
+        hidden: false,
+        fill: None,
+        ..CellStyle::default_dark()
+    };
+    let b = CellStyle {
+        locked: false,
+        hidden: true,
+        fill: Some([200, 10, 10]),
+        ..CellStyle::default_dark()
+    };
+    let aid = app.wb.styles.intern(a);
+    let bid = app.wb.styles.intern(b);
+    app.wb.sheet_mut(0).set_style(0, 0, aid);
+    app.wb.sheet_mut(0).set_style(1, 0, bid);
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.open_format_dialog();
+    assert!(app.fmt_mixed.fill);
+    assert!(app.fmt_mixed.locked, "锁定状态不同应显示混合");
+    assert!(app.fmt_mixed.hidden, "隐藏状态不同应显示混合");
+    app.fmt_state.fill = Some([10, 200, 10]);
+    app.fmt_touched.fill = true;
+    // 显式选回活动格的锁定/不隐藏，即使等于原值也必须应用。
+    app.fmt_state.locked = true;
+    app.fmt_touched.locked = true;
+    app.fmt_state.hidden = false;
+    app.fmt_touched.hidden = true;
+    app.apply_format_dialog();
+    for r in 0..2u32 {
+        let st = app.wb.styles.get(app.wb.sheet(0).style_of(r, 0));
+        assert_eq!(st.fill, Some([10, 200, 10]), "A{} 填充", r + 1);
+        assert!(st.locked, "A{} 应锁定", r + 1);
+        assert!(!st.hidden, "A{} 不应隐藏", r + 1);
+    }
+}
+
 /// UI-16：每张表按 identity 恢复自己的选区/滚动/缩放，改名和重排不能串表。
 #[test]
 fn sheet_view_state_is_restored_by_stable_identity() {
@@ -5378,4 +5422,168 @@ fn general_text_alignment_matches_excel_and_explicit_alignment_wins() {
     assert_eq!(cell_text_align(1, &Value::Number(1.5)), egui::Align2::LEFT_CENTER);
     assert_eq!(cell_text_align(2, &Value::Text("explicit".into())), egui::Align2::CENTER_CENTER);
     assert_eq!(cell_text_align(3, &Value::Text("right".into())), egui::Align2::RIGHT_CENTER);
+}
+
+/// UI-16 复核：复制到前方时，插入前按 identity 保存视图；插入后按 identity 找回
+/// 原活动表，再切副本。原 B/C 的选区、多选、滚动、缩放都不能被副本覆盖。
+#[test]
+fn copy_sheet_to_front_preserves_original_sheet_views() {
+    let mut app = app();
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 1, sheetcore::model::Sheet::new("B")));
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 2, sheetcore::model::Sheet::new("C")));
+    let a_id = app.wb.sheet(0).identity;
+    let b_id = app.wb.sheet(1).identity;
+    let c_id = app.wb.sheet(2).identity;
+    app.sel = (0, 0);
+    app.scroll = egui::vec2(3.0, 4.0);
+    app.zoom = 1.1;
+    app.remember_sheet_view();
+    assert!(app.switch_sheet_view(1));
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    app.extra_sel = vec![(2, 2, 3, 3)];
+    app.scroll = egui::vec2(5.0, 6.0);
+    app.zoom = 1.2;
+    app.remember_sheet_view();
+    assert!(app.switch_sheet_view(2));
+    app.sel = (99, 25);
+    app.sel_end = (99, 25);
+    app.extra_sel = vec![(4, 4, 5, 5)];
+    app.scroll = egui::vec2(7.0, 8.0);
+    app.zoom = 1.3;
+    app.remember_sheet_view();
+    assert_eq!(app.wb.sheet(2).identity, c_id);
+
+    assert!(app.copy_sheet_to(2, 0));
+    assert_eq!(app.sheet_idx, 0, "复制后活动表应是新副本");
+    assert_eq!(app.wb.sheet(0).name, "C (2)");
+    assert_eq!(app.wb.sheet(3).identity, c_id, "原 C 仍在末尾");
+    let b = app.sheet_views.get(&b_id).expect("B 视图");
+    assert_eq!((b.sel, b.sel_end), ((1, 1), (1, 1)));
+    assert_eq!(b.extra_sel, vec![(2, 2, 3, 3)]);
+    assert_eq!(b.scroll, egui::vec2(5.0, 6.0));
+    assert_eq!(b.zoom, 1.2);
+    let c = app.sheet_views.get(&c_id).expect("C 视图");
+    assert_eq!((c.sel, c.sel_end), ((99, 25), (99, 25)));
+    assert_eq!(c.extra_sel, vec![(4, 4, 5, 5)]);
+    assert_eq!(c.scroll, egui::vec2(7.0, 8.0));
+    assert_eq!(c.zoom, 1.3);
+    assert_eq!(app.sheet_views.get(&a_id).map(|v| v.sel), Some((0, 0)));
+    // 副本自己是新视图，不能继承原 C 的 Z100 选区。
+    assert_eq!(app.sel, (0, 0));
+    assert!(app.extra_sel.is_empty());
+}
+
+/// UI-16 复核：插入位置等于旧索引时不能走 switch 的 same-index 早返。
+#[test]
+fn copy_sheet_to_same_index_restores_original_view_before_switching() {
+    let mut app = app();
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 1, sheetcore::model::Sheet::new("B")));
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 2, sheetcore::model::Sheet::new("C")));
+    let b_id = app.wb.sheet(1).identity;
+    let c_id = app.wb.sheet(2).identity;
+    assert!(app.switch_sheet_view(1));
+    app.sel = (7, 2);
+    app.scroll = egui::vec2(11.0, 12.0);
+    app.zoom = 1.4;
+    app.remember_sheet_view();
+    assert!(app.switch_sheet_view(2));
+    app.sel = (99, 25);
+    app.extra_sel = vec![(20, 20, 21, 21)];
+    app.scroll = egui::vec2(13.0, 14.0);
+    app.zoom = 1.5;
+    app.remember_sheet_view();
+
+    assert!(app.copy_sheet_to(2, 2));
+    assert_eq!(app.sheet_idx, 2, "副本插在原 C 的位置");
+    assert_eq!(app.wb.sheet(2).name, "C (2)");
+    assert_eq!(app.wb.sheet(3).identity, c_id);
+    let c = app.sheet_views.get(&c_id).expect("原 C 视图");
+    assert_eq!(c.sel, (99, 25));
+    assert_eq!(c.extra_sel, vec![(20, 20, 21, 21)]);
+    assert_eq!(c.scroll, egui::vec2(13.0, 14.0));
+    assert_eq!(c.zoom, 1.5);
+    let b = app.sheet_views.get(&b_id).expect("B 视图");
+    assert_eq!(b.sel, (7, 2));
+    assert_eq!(b.scroll, egui::vec2(11.0, 12.0));
+    assert_eq!(b.zoom, 1.4);
+    assert_eq!(app.sel, (0, 0), "副本使用自己的默认视图");
+    assert!(app.extra_sel.is_empty());
+}
+
+/// UI-16 复核：标签栏右键隐藏必须先提交有效编辑。
+#[test]
+fn hide_sheet_context_commits_edit_before_switching() {
+    let mut app = app();
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 1, sheetcore::model::Sheet::new("Other")));
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.sel = (0, 0);
+    app.editing = Some(EditState::new("42".into()));
+    app.hide_current_sheet();
+    assert!(app.editing.is_none(), "隐藏前必须提交编辑");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(42.0));
+    assert!(app.wb.sheet(0).hidden);
+    assert_ne!(app.sheet_idx, 0, "隐藏后应切到下一张可见表");
+}
+
+/// UI-16 复核：Ribbon HideSheet 遇到数据验证拒绝时，原表、编辑文本、选区、
+/// 隐藏状态和视图字段都保持原样。
+#[test]
+fn hide_sheet_ribbon_rejects_invalid_edit_without_state_change() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 1, sheetcore::model::Sheet::new("Other")));
+    restrict_a1(&mut app);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.extra_sel = vec![(4, 4, 5, 5)];
+    app.scroll = egui::vec2(15.0, 16.0);
+    app.zoom = 1.6;
+    app.ribbon_action("HideSheet", &ctx);
+    assert!(app.wb.sheet(0).hidden == false, "验证拒绝不能隐藏");
+    assert_eq!(app.sheet_idx, 0, "验证拒绝不能切表");
+    assert_eq!(app.sel, (0, 0));
+    assert_eq!(app.extra_sel, vec![(4, 4, 5, 5)]);
+    assert_eq!(app.scroll, egui::vec2(15.0, 16.0));
+    assert_eq!(app.zoom, 1.6);
+    let ed = app.editing.as_ref().expect("编辑框必须保留");
+    assert_eq!(ed.buf, "99", "验证失败必须保留用户输入");
+}
+
+/// UI-16 复核：跨表撤销落点不能保留目标表旧的多选区；否则随后的清除/格式
+/// 会误伤历史远端区域。
+#[test]
+fn cross_sheet_undo_clears_restored_extra_selection() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    assert!(sheetcore::sheet_ops::insert_sheet(&mut app.wb, 1, sheetcore::model::Sheet::new("Other")));
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(9, 9, text("remote"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("2".into()));
+    assert!(app.commit_edit(None), "先建立跨表撤销历史");
+    app.extra_sel = vec![(9, 9, 9, 9)];
+    app.scroll = egui::vec2(17.0, 18.0);
+    app.zoom = 1.7;
+    assert!(app.switch_sheet_view(1));
+    assert_ne!(app.sheet_idx, 0);
+    let remote_style = app.wb.sheet(0).style_of(9, 9);
+
+    app.do_undo(false);
+    assert_eq!(app.sheet_idx, 0, "撤销应回到出事表");
+    assert!(app.extra_sel.is_empty(), "撤销落点必须清掉恢复的旧多选区");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+    app.clear_selection();
+    assert_eq!(
+        app.wb.sheet(0).value(9, 9),
+        Value::Text("remote".into()),
+        "清除内容不能碰历史远端区域"
+    );
+    app.ribbon_action("Bold", &ctx);
+    assert_eq!(
+        app.wb.sheet(0).style_of(9, 9),
+        remote_style,
+        "格式操作不能碰历史远端区域"
+    );
 }

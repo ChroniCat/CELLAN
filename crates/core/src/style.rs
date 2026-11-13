@@ -121,7 +121,7 @@ pub fn font_class(name: &str) -> FontClass {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
@@ -154,6 +154,40 @@ pub struct CellStyle {
     pub format: String,
     /// 左、右、上、下
     pub border: [Border; 4],
+    /// 单元格保护：Excel 默认锁定
+    #[serde(default = "default_locked")]
+    pub locked: bool,
+    /// 单元格保护：隐藏公式/内容
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+fn default_locked() -> bool {
+    true
+}
+
+impl Default for CellStyle {
+    fn default() -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            rotation: 0,
+            font: String::new(),
+            size: 0.0,
+            color: [0, 0, 0],
+            fill: None,
+            halign: 0,
+            valign: 0,
+            wrap: false,
+            indent: 0,
+            format: String::new(),
+            border: [Border::default(); 4],
+            locked: true,
+            hidden: false,
+        }
+    }
 }
 
 impl CellStyle {
@@ -199,6 +233,8 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.indent.hash(&mut h);
     s.format.hash(&mut h);
     s.border.hash(&mut h);
+    s.locked.hash(&mut h);
+    s.hidden.hash(&mut h);
     h.finish()
 }
 

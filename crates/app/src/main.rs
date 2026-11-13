@@ -178,6 +178,8 @@ struct FmtState {
     indent: u8,
     format: String,
     border: [bool; 4],
+    locked: bool,
+    hidden: bool,
 }
 
 /// 格式对话框打开时，选中区域里各格式字段是否存在差异；差异项显示“混合”。
@@ -198,6 +200,8 @@ struct FmtMixed {
     indent: bool,
     format: bool,
     border: [bool; 4],
+    locked: bool,
+    hidden: bool,
 }
 
 /// 用户在格式对话框里明确动过的字段；即使值等于活动格原值也必须应用。
@@ -218,6 +222,8 @@ struct FmtTouched {
     indent: bool,
     format: bool,
     border: [bool; 4],
+    locked: bool,
+    hidden: bool,
 }
 
 /// 编辑焦点在格内还是编辑栏。缓冲只有一个（`self.editing`），位置只决定谁拿焦点。
@@ -2479,7 +2485,13 @@ impl SheetApp {
                     }
                     // 无界面验收：SC_OPEN_DIALOG=format/revision/xlink 直接开对话框截图
                     match std::env::var("SC_OPEN_DIALOG").as_deref() {
-                        Ok("format") => self.open_format_dialog(),
+                        Ok("format") => {
+                            self.open_format_dialog();
+                            // 无界面视觉取证可指定页签；交互验收仍走真实点击。
+                            if let Ok(v) = std::env::var("SC_FMT_TAB") {
+                                self.fmt_tab = v.parse::<u8>().unwrap_or(0).min(5);
+                            }
+                        }
                         Ok("revision") => self.rev_open = true,
                         Ok("xlink") => self.xlink_dlg = true,
                         Ok("find") => {
@@ -6610,6 +6622,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if target != self.sheet_idx {
             self.switch_sheet_view(target);
         }
+        // 目标表自己的多选区不能带进这次撤销的落点；否则后续清除/格式会误伤远端区域。
+        self.extra_sel.clear();
         self.sel = (row, col);
         self.sel_end = (row, col);
         self.nav_rect = None;
@@ -6731,6 +6745,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 st.border[2].style != 0,
                 st.border[3].style != 0,
             ],
+            locked: st.locked,
+            hidden: st.hidden,
         };
         self.fmt_orig = self.fmt_state.clone();
         self.fmt_touched = FmtTouched::default();
@@ -6776,6 +6792,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 for i in 0..4 {
                     m.border[i] |= s.border[i] != first.border[i];
                 }
+                m.locked |= s.locked != first.locked;
+                m.hidden |= s.hidden != first.hidden;
             }
         }
         m
@@ -6811,6 +6829,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let want_wrap = st.wrap != orig.wrap || touched.wrap;
         let want_indent = st.indent != orig.indent || touched.indent;
         let want_format = st.format != orig.format || touched.format;
+        let want_locked = st.locked != orig.locked || touched.locked;
+        let want_hidden = st.hidden != orig.hidden || touched.hidden;
         let style_changed = border_changed
             || want_font
             || want_bold
@@ -6825,7 +6845,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             || want_valign
             || want_wrap
             || want_indent
-            || want_format;
+            || want_format
+            || want_locked
+            || want_hidden;
 
         if style_changed {
             let borders = st.border;
@@ -6870,6 +6892,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 if want_wrap { s.wrap = st.wrap; }
                 if want_indent { s.indent = st.indent; }
                 if want_format { s.format = format.clone(); }
+                if want_locked { s.locked = st.locked; }
+                if want_hidden { s.hidden = st.hidden; }
             });
             self.status = "已应用格式".into();
         } else {
@@ -11896,6 +11920,9 @@ let txn = self.txn_begin(&keys);
         if !self.can_change_sheets() {
             return false;
         }
+        // 插入会移动旧索引；先按稳定 identity 记住当前表视图，插完再按 ID 找回原表。
+        let active_id = self.wb.sheet(self.sheet_idx).identity;
+        self.remember_sheet_view();
         let mut copy = self.wb.sheets[from].clone();
         let base = copy.name.clone();
         let mut n = 2;
@@ -11923,6 +11950,14 @@ let txn = self.txn_begin(&keys);
             self.status = "复制工作表失败：名称无效或已存在".into();
             return false;
         }
+        // 插入点可能等于旧索引；不能直接拿旧 sheet_idx 去 switch（会被 same-index 当成
+        // 已切表而跳过 load_sheet_view）。先按 identity 恢复原活动表，再切到副本。
+        self.sheet_idx = self
+            .wb
+            .sheets
+            .iter()
+            .position(|s| s.identity == active_id)
+            .unwrap_or(at);
         self.switch_sheet_view(at);
         self.finish_sheet_change();
         self.status = format!("已复制为「{name}」");
@@ -12063,6 +12098,11 @@ let txn = self.txn_begin(&keys);
 
     /// 隐藏当前工作表（至少留一张可见）
     fn hide_current_sheet(&mut self) {
+        // 隐藏会切表，必须先提交正在编辑的内容；验证拒绝时保留原表、编辑文本、选区。
+        self.commit_edit(None);
+        if self.editing.is_some() {
+            return;
+        }
         let visible = self.wb.sheets.iter().filter(|s| !s.hidden).count();
         if visible <= 1 {
             self.status = "至少要留一张可见的工作表".into();
@@ -12076,7 +12116,7 @@ let txn = self.txn_begin(&keys);
         sh.hidden_dirty = true;
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        // 切到下一张可见表
+        // 切到下一张可见表，走统一入口（提交/清格式刷/加载视图）。
         if let Some(next) = self
             .wb
             .sheets
@@ -12084,7 +12124,7 @@ let txn = self.txn_begin(&keys);
             .enumerate()
             .position(|(k, s)| k != i && !s.hidden)
         {
-            self.load_sheet_view(next);
+            let _ = self.switch_sheet_view(next);
         }
         self.status = format!("已隐藏「{name}」；视图 → 取消隐藏 可以恢复");
     }
@@ -16987,6 +17027,12 @@ let txn = self.txn_begin(&keys);
         let format_mixed = mixed.format
             && !self.fmt_touched.format
             && self.fmt_state.format == orig.format;
+        let locked_mixed = mixed.locked
+            && !self.fmt_touched.locked
+            && self.fmt_state.locked == orig.locked;
+        let hidden_mixed = mixed.hidden
+            && !self.fmt_touched.hidden
+            && self.fmt_state.hidden == orig.hidden;
         ui_kit::window(ctx, "设置单元格格式", 452.0)
             .open(&mut open)
             .resizable(false)
@@ -17015,7 +17061,11 @@ let txn = self.txn_begin(&keys);
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 7.0);
                 ui.spacing_mut().button_padding = egui::Vec2::new(10.0, 4.0);
 
-                ui_kit::dialog_tabs(ui, &mut self.fmt_tab, &["数字", "对齐", "字体", "边框"]);
+                ui_kit::dialog_tabs(
+                    ui,
+                    &mut self.fmt_tab,
+                    &["数字", "对齐", "字体", "边框", "填充", "保护"],
+                );
                 ui.add_space(6.0);
                 if self.fmt_tab == 2 {
                 dlg_section(ui, "字体");
@@ -17366,6 +17416,66 @@ let txn = self.txn_begin(&keys);
                         ui.end_row();
                     });
 
+                }
+                if self.fmt_tab == 4 {
+                dlg_section(ui, "填充");
+                egui::Grid::new("fmt_g_fill")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        dlg_cell_label(ui, if fill_mixed { "背景（混合）" } else { "背景" });
+                        ui.horizontal(|ui| {
+                            let mut has_fill = self.fmt_state.fill.is_some();
+                            if ui.checkbox(&mut has_fill, "填充颜色").changed() {
+                                self.fmt_state.fill =
+                                    if has_fill { Some([255, 255, 0]) } else { None };
+                                self.fmt_touched.fill = true;
+                            }
+                            if let Some(f) = self.fmt_state.fill.as_mut() {
+                                let r = ui.color_edit_button_srgb(f);
+                                if r.changed() {
+                                    self.fmt_touched.fill = true;
+                                }
+                                r.on_hover_text("填充颜色");
+                            }
+                            if fill_mixed {
+                                ui.label(egui::RichText::new("混合").size(11.0).weak());
+                            }
+                        });
+                        ui.end_row();
+                    });
+                }
+                if self.fmt_tab == 5 {
+                dlg_section(ui, "保护");
+                egui::Grid::new("fmt_g_protect")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        dlg_cell_label(ui, "单元格");
+                        ui.horizontal(|ui| {
+                            let mut locked = self.fmt_state.locked;
+                            let label = if locked_mixed { "锁定（混合）" } else { "锁定" };
+                            if ui.checkbox(&mut locked, label).changed() {
+                                self.fmt_state.locked = locked;
+                                self.fmt_touched.locked = true;
+                            }
+                            ui.add_space(12.0);
+                            let mut hidden = self.fmt_state.hidden;
+                            let label = if hidden_mixed { "隐藏公式（混合）" } else { "隐藏公式" };
+                            if ui.checkbox(&mut hidden, label).changed() {
+                                self.fmt_state.hidden = hidden;
+                                self.fmt_touched.hidden = true;
+                            }
+                        });
+                        ui.end_row();
+                        dlg_cell_label(ui, "");
+                        ui.label(
+                            egui::RichText::new("保护选项在工作表保护后生效")
+                                .size(11.0)
+                                .weak(),
+                        );
+                        ui.end_row();
+                    });
                 }
                 ui.add_space(10.0);
                 ui.separator();

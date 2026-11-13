@@ -115,6 +115,36 @@ fn unknown_font_is_kept_not_rewritten() {
 }
 
 #[test]
+fn cell_protection_roundtrip() {
+    let path = tmp("protection_roundtrip.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(
+        0,
+        0,
+        Cell {
+            value: Value::Text("protected".into()),
+            formula: None,
+        },
+    );
+    let sid = wb.styles.intern(CellStyle {
+        locked: false,
+        hidden: true,
+        ..Default::default()
+    });
+    wb.sheets[0].set_style(0, 0, sid);
+    sheetcore::xlsx::save(&path, &wb).expect("保存");
+    let xml = part(&path, "xl/styles.xml");
+    assert!(xml.contains("<protection"), "styles.xml 缺少 protection：{xml}");
+    assert!(xml.contains("locked=\"0\"") || xml.contains("locked=\"false\""));
+    assert!(xml.contains("hidden=\"1\"") || xml.contains("hidden=\"true\""));
+
+    let back = sheetcore::xlsx::load(&path).expect("重开");
+    let st = back.styles.get(back.sheets[0].style_of(0, 0));
+    assert!(!st.locked, "locked=false 未保留");
+    assert!(st.hidden, "hidden=true 未保留");
+}
+
+#[test]
 fn dxf_font_roundtrip() {
     use sheetcore::cf::parse_dxfs;
     let xml = r#"<styleSheet><dxfs count="2"><dxf><font><b/><name val="微软雅黑"/></font></dxf><dxf><font><color rgb="FF9C0006"/></font><fill><patternFill patternType="solid"><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf></dxfs></styleSheet>"#;

@@ -1822,6 +1822,13 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             bs.set_right(make(&st.border[1]));
             bs.set_top(make(&st.border[2]));
             bs.set_bottom(make(&st.border[3]));
+            // 默认锁定=true、隐藏=false；只有非默认才写 <protection>，
+            // 避免给所有普通格生成无意义的 protection 节点。
+            if !st.locked || st.hidden {
+                let p = s.protection_mut();
+                p.set_locked(st.locked);
+                p.set_hidden(st.hidden);
+            }
         }
 
         // 合并区域：没有基准时整份重建；有基准时只在改过才同步
@@ -2671,6 +2678,10 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
                 }
             }
         }
+    }
+    if let Some(p) = &st.protection {
+        out.locked = p.locked;
+        out.hidden = p.hidden;
     }
     if let Some(a) = &st.alignment {
         out.halign = match a.horizontal {

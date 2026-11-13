@@ -31,3 +31,27 @@ UI-16 工作表切换状态与标签管理（2026-11-13 15:28 CST）
   30 表滚动的 GUI 取证未做。
 - Excel/WPS 实际切表后视图保持对比未做。
 - UI-16.1 保持待验收，父项实施中；不以专项绿色验收父项。
+
+## 15:47 监督复核后的三处入口修复
+
+1. 复制工作表插入位置：`copy_sheet_to` 在插入前按 `Sheet.identity` 保存当前视图；插入后
+   先按 identity 找回原活动表索引，再切副本，解决插入到前方/同位时旧 `sheet_idx` 指向
+   别的表、以及 `switch_sheet_view(at)` 的 same-index 早返。新增：
+   - `copy_sheet_to_front_preserves_original_sheet_views`：C 在 index 2 复制到 0，
+     原 B/C 的 sel/extra_sel/scroll/zoom 保留，副本为默认视图。
+   - `copy_sheet_to_same_index_restores_original_view_before_switching`：复制 C 到 index 2，
+     原 C 起来到 3，其 Z100/多选/滚动/缩放保留。
+   两项各 1 passed。
+2. 隐藏提交：`hide_current_sheet` 先 `commit_edit(None)`；数据验证拒绝时立即返回，
+   不改 `sheet_idx`、`hidden`、选区、编辑缓冲或视图字段。切下一张可见表改走
+   `switch_sheet_view`，不再直接 `load_sheet_view`。Ribbon `HideSheet` 与标签菜单
+   共用该函数。新增：
+   - `hide_sheet_context_commits_edit_before_switching`（标签菜单路径）1 passed；
+   - `hide_sheet_ribbon_rejects_invalid_edit_without_state_change`（Ribbon 路径）1 passed。
+3. 跨表撤销：`do_undo` 在 `switch_sheet_view(target)` 恢复目标表视图后统一清空
+   `extra_sel` 再设置落点，避免旧多选区残留。新增
+   `cross_sheet_undo_clears_restored_extra_selection` 1 passed：撤销后旧远端 I10 不被
+   `clear_selection` 清除、不被 Bold 改样式。
+
+验证：`cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored，
+APP_EXIT=0`。上述 5 项 UI-16 回归均通过；真实鼠标/Office 目视仍待验收。
