@@ -1,0 +1,73 @@
+# C20.1 中文排序、分列与高级数据工具
+
+日期：2026-11-14
+
+## 1. 中文排序（拼音 + 自定义序列）
+
+排序键新增 `SortMode`：
+
+```rust
+pub enum SortMode { Default, Pinyin, Custom(Vec<String>) }
+pub struct SortKey { col: u32, asc: bool, ignore_case: bool, mode: SortMode }
+```
+
+- `Pinyin`：`crates/core/src/collate.rs` 调 Windows `LCMapStringEx(locale="zh-CN",
+  LCMAP_SORTKEY)` 生成排序键，由系统 zh-CN 排序表决定顺序（非 Windows 退化为码位序）。
+- `Custom`：按序列里出现的位置排，不在序列里的按拼音排在后面。
+- 排序对话框新增「排序依据：字典序 / 中文拼音 / 自定义序列」；选自定义时输入序列
+  （默认「高,中,低」），支持中英文逗号、顿号、分号分隔。
+
+Excel 16.0 对同一份姓名做默认中文排序（`Range.Sort(Key, xlAscending)`）：
+
+```text
+EXCEL_SORTED=陈七,李四,王五,张三,赵六
+```
+
+本实现单测断言完全相同的顺序：
+
+```rust
+assert_eq!(got, vec!["陈七","李四","王五","张三","赵六"]);
+// pinyin_sort_matches_chinese_windows_order ... ok
+```
+
+自定义序列：
+
+```rust
+键 = Custom(["高","中","低"])；原值 低,高,中,未知,高
+结果 = 高,高,中,低,未知        // custom_sequence_orders_by_list_position ... ok
+```
+
+未做：笔画/部首排序（界面不提供该选项，不当成已实现）；Excel 的「按行排序」仍未建模。
+
+## 2. 分列
+
+`SplitOpts { delim, merge_consecutive, quote, detect_types, date_system }`，
+`text_to_columns_ex(sheet, region, &opts, dry_run) -> SplitReport`。
+
+- 引号：`甲,"乙,丙",丁` → 甲 / 乙,丙 / 丁；字段内 `""` 还原成一个引号。
+- 连续分隔符：`甲   乙  丙`（多空格，勾选「连续分隔符当一个」）→ 甲 / 乙 / 丙。
+- 前导零：`00123` 保存为文本，不会变成数字 123。
+- 日期：`2026-03-05` 识别为日期序列 46086，应用侧补 `yyyy-mm-dd` 数字格式；
+  斜杠写法 `2026/3/5` 同样识别。
+- 覆盖：先 `dry_run` 统计右侧紧邻区域会被覆盖的非空格数，返回给界面；
+  第一次点执行只提示「分列会覆盖右侧 N 个非空格子，再点一次确认」，第二次才写。
+- 右侧原有内容整体右移（整块只搬一次，从最右往左），不会逐行重复搬导致错位。
+- 写入后 `recalc_all` + 依赖图重建；写前 `txn_begin`、写后 `txn_end("分列")`，撤销同步。
+
+单测：
+
+```text
+split_respects_quotes_and_consecutive_delims ... ok
+split_keeps_leading_zeros_and_detects_dates   ... ok
+split_warns_before_overwriting_non_empty_cells... ok
+text_to_columns_splits_and_shifts             ... ok
+```
+
+未做/限制：
+- 固定宽度分列、跳过列、列数据格式逐列选择未做；只有分隔符模式。
+- 日期识别只认「4 位年 + 1/2 位月日」，不认 `03/05/2026` 这类区域格式。
+- 真实键鼠在对话框里勾选并二次确认未执行（RDP 不可用），入口由 UI 代码与单测覆盖。
+
+## 3. 回归
+
+`sheetcore` **803 passed**；app `--bin app` **264 passed**。

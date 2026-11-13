@@ -6,6 +6,7 @@ pub mod proof;
 pub mod cf;
 pub mod chart_write;
 pub mod charts;
+pub mod collate;
 pub mod cfb;
 pub mod vba_src;
 pub mod arr;

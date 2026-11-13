@@ -5,17 +5,47 @@
 
 use crate::model::{Cell, Sheet, Value};
 
+/// 文本排序方式（Excel 的“排序依据”）
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum SortMode {
+    /// 码位/字典序（旧行为）
+    #[default]
+    Default,
+    /// 中文拼音序：走系统 zh-CN 排序表，和 Excel 在中文 Windows 上一致
+    Pinyin,
+    /// 自定义序列（高/中/低）：列表里靠前的排前面，不在列表里的按拼音排在后面
+    Custom(Vec<String>),
+}
+
 /// 一个排序键
 #[derive(Clone, Debug, PartialEq)]
 pub struct SortKey {
     pub col: u32,
     pub asc: bool,
-    /// 中文按拼音排（做不到，这里退化为字典序）；true 时大小写不敏感
+    /// true 时大小写不敏感
     pub ignore_case: bool,
+    pub mode: SortMode,
+}
+
+impl SortKey {
+    /// 文本列默认：大小写不敏感、字典序
+    pub fn text(col: u32, asc: bool) -> Self {
+        Self {
+            col,
+            asc,
+            ignore_case: true,
+            mode: SortMode::Default,
+        }
+    }
 }
 
 /// 比较两个格子（空值永远排最后）
-fn cmp_cell(a: &Option<Cell>, b: &Option<Cell>, ignore_case: bool) -> std::cmp::Ordering {
+fn cmp_cell(
+    a: &Option<Cell>,
+    b: &Option<Cell>,
+    ignore_case: bool,
+    mode: &SortMode,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let av = a.as_ref().map(|c| c.value.clone()).unwrap_or(Value::Empty);
     let bv = b.as_ref().map(|c| c.value.clone()).unwrap_or(Value::Empty);
@@ -29,10 +59,26 @@ fn cmp_cell(a: &Option<Cell>, b: &Option<Cell>, ignore_case: bool) -> std::cmp::
         (_, Value::Number(_)) => Ordering::Greater,
         _ => {
             let (x, y) = (av.display(), bv.display());
-            if ignore_case {
-                x.to_lowercase().cmp(&y.to_lowercase())
+            let (x, y) = if ignore_case {
+                (x.to_lowercase(), y.to_lowercase())
             } else {
-                x.cmp(&y)
+                (x, y)
+            };
+            match mode {
+                SortMode::Default => x.cmp(&y),
+                SortMode::Pinyin => crate::collate::cmp_pinyin(&x, &y),
+                SortMode::Custom(list) => {
+                    let rank = |v: &str| -> Option<usize> {
+                        let t = v.trim();
+                        list.iter().position(|it| it.trim().eq_ignore_ascii_case(t))
+                    };
+                    match (rank(&x), rank(&y)) {
+                        (Some(i), Some(j)) => i.cmp(&j),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => crate::collate::cmp_pinyin(&x, &y),
+                    }
+                }
             }
         }
     }
@@ -77,7 +123,7 @@ pub fn sort_multi(
             }
             let a = Some(before[i][ci].0.clone());
             let b = Some(before[j][ci].0.clone());
-            let mut ord = cmp_cell(&a, &b, k.ignore_case);
+            let mut ord = cmp_cell(&a, &b, k.ignore_case, &k.mode);
             if !k.asc {
                 ord = ord.reverse();
             }
@@ -176,48 +222,185 @@ pub fn remove_duplicates(
 }
 
 /// 分列：按分隔符把每格拆到右边相邻列（右侧内容整体右移腾位置）
-pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: char) -> usize {
-    let (r1, c1, r2, c2) = region;
-    let mut splits: Vec<(u32, Vec<String>)> = Vec::new();
-    let mut max_parts = 1usize;
-    for r in r1..=r2 {
-        let text = sheet.get(r, c1).map(|c| c.value.display()).unwrap_or_default();
-        let parts: Vec<String> = text.split(delim).map(|s| s.trim().to_string()).collect();
-        max_parts = max_parts.max(parts.len());
-        splits.push((r, parts));
+/// 分列选项（Excel“分列”向导里的那些开关）
+#[derive(Clone, Debug)]
+pub struct SplitOpts {
+    pub delim: char,
+    /// 连续分隔符当一个（“a,,b” 或 “a   b” 不产生空列）
+    pub merge_consecutive: bool,
+    /// 双引号包起来的字段里不拆，`""` 表示一个引号
+    pub quote: bool,
+    /// 识别数字/日期；前导零（00123）保留为文本
+    pub detect_types: bool,
+    pub date_system: crate::model::DateSystem,
+}
+
+impl Default for SplitOpts {
+    fn default() -> Self {
+        Self {
+            delim: ',',
+            merge_consecutive: false,
+            quote: true,
+            detect_types: true,
+            date_system: crate::model::DateSystem::D1900,
+        }
     }
-    if max_parts <= 1 {
-        return 0;
+}
+
+/// 分列结果
+#[derive(Clone, Debug, Default)]
+pub struct SplitReport {
+    /// 写出去的格子数
+    pub written: usize,
+    /// 会覆盖掉右边原有非空格子的个数（执行前用于提示）
+    pub overwritten: usize,
+    /// 拆出来的最大列数
+    pub width: usize,
+    /// 识别成日期的格子（调用方补日期格式）
+    pub date_cells: Vec<(u32, u32)>,
+}
+
+/// 按选项拆一行文本
+pub fn split_fields(line: &str, opts: &SplitOpts) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if opts.quote && ch == '"' {
+            if in_quote && chars.peek() == Some(&'"') {
+                cur.push('"');
+                chars.next();
+            } else {
+                in_quote = !in_quote;
+            }
+            continue;
+        }
+        if !in_quote && ch == opts.delim {
+            if opts.merge_consecutive && cur.trim().is_empty() {
+                cur.clear();
+                continue;
+            }
+            out.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(ch);
     }
-    // 右侧整体右移 (max_parts - 1) 列，避免覆盖
-    let shift = (max_parts - 1) as u32;
-    let mut moved: Vec<(u32, u32, Cell, u16)> = Vec::new();
-    for r in r1..=r2 {
-        for c in (c1 + 1..=c2).rev() {
-            if let Some(cell) = sheet.get(r, c).cloned() {
-                moved.push((r, c + shift, cell, sheet.style_of(r, c)));
+    out.push(cur);
+    if opts.merge_consecutive {
+        out.retain(|x| !x.trim().is_empty());
+    }
+    out
+}
+
+fn detect_value(text: &str, opts: &SplitOpts) -> (Value, bool) {
+    let t = text.trim();
+    if !opts.detect_types || t.is_empty() {
+        return (Value::Text(text.to_string().into()), false);
+    }
+    // 前导零（00123、007）当文本，避免变成 123
+    if t.len() > 1 && t.starts_with('0') && t.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return (Value::Text(text.to_string().into()), false);
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        return (Value::Number(n), false);
+    }
+    // 日期：2026-03-05 / 2026/3/5
+    let norm = t.replace('/', "-");
+    let parts: Vec<&str> = norm.split('-').collect();
+    if parts.len() == 3 {
+        if let (Ok(y), Ok(m), Ok(d)) = (
+            parts[0].parse::<i32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+        ) {
+            if (1900..=9999).contains(&y) && parts[0].len() == 4 {
+                if let Some(serial) = crate::formula::date_to_serial_in(opts.date_system, y, m, d) {
+                    return (Value::Number(serial), true);
+                }
             }
         }
     }
+    (Value::Text(text.to_string().into()), false)
+}
+
+/// 分列：把区域每一行按分隔符拆开写回，右边原有的内容整体右移。
+///
+/// `dry_run` 为真时只统计会覆盖多少非空格子，不改表。
+pub fn text_to_columns_ex(
+    sheet: &mut Sheet,
+    region: (u32, u32, u32, u32),
+    opts: &SplitOpts,
+    dry_run: bool,
+) -> SplitReport {
+    let (r1, c1, r2, c2) = region;
+    let mut report = SplitReport::default();
+    let mut rows: Vec<(u32, Vec<String>)> = Vec::new();
     for r in r1..=r2 {
-        for c in c1 + 1..=c2 + shift {
-            sheet.set(r, c, Cell { value: Value::Empty, formula: None });
+        let text = sheet
+            .get(r, c1)
+            .map(|x| x.value.display())
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        let fields = split_fields(&text, opts);
+        report.width = report.width.max(fields.len());
+        rows.push((r, fields));
+    }
+    let shift = report.width.saturating_sub(1) as u32;
+    if dry_run {
+        for (r, fields) in &rows {
+            for (i, _) in fields.iter().enumerate().skip(1) {
+                let c = c1 + i as u32;
+                let occupied = sheet
+                    .get(*r, c)
+                    .map(|x| !matches!(x.value, Value::Empty) && !x.value.display().is_empty())
+                    .unwrap_or(false);
+                if occupied {
+                    report.overwritten += 1;
+                }
+            }
+        }
+        return report;
+    }
+    // 右侧被推开的列：整块只搬一次，从最右往左
+    if shift > 0 {
+        let last = sheet.used_bounds().map(|b| b.3).unwrap_or(c2).max(c2);
+        for cc in (c1 + 1..=last).rev() {
+            for rr in r1..=r2 {
+                if let Some(cell) = sheet.get(rr, cc).cloned() {
+                    sheet.set(rr, cc + shift, cell);
+                    let st = sheet.style_of(rr, cc);
+                    sheet.set_style(rr, cc + shift, st);
+                }
+            }
         }
     }
-    for (r, c, cell, st) in moved {
-        sheet.set(r, c, cell);
-        sheet.set_style(r, c, st);
-    }
-    for (r, parts) in splits {
-        for (i, part) in parts.iter().enumerate() {
-            sheet.set(
-                r,
-                c1 + i as u32,
-                Cell { value: Value::parse_input(part), formula: None },
-            );
+    for (r, fields) in &rows {
+        for (i, f) in fields.iter().enumerate() {
+            let c = c1 + i as u32;
+            let (v, is_date) = detect_value(f, opts);
+            if is_date {
+                report.date_cells.push((*r, c));
+            }
+            sheet.set(*r, c, Cell { value: v, formula: None });
+            report.written += 1;
         }
     }
-    max_parts
+    report
+}
+
+/// 兼容旧调用：单分隔符、不合并、不识别类型
+pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: char) -> usize {
+    let opts = SplitOpts {
+        delim,
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+        date_system: crate::model::DateSystem::D1900,
+    };
+    text_to_columns_ex(sheet, region, &opts, false).width
 }
 
 #[cfg(test)]
@@ -256,8 +439,8 @@ mod tests {
             &mut s,
             (0, 0, 3, 2),
             &[
-                SortKey { col: 0, asc: true, ignore_case: true },
-                SortKey { col: 2, asc: false, ignore_case: false },
+                SortKey::text(0, true),
+                SortKey::text(2, false),
             ],
             true,
         );
@@ -270,7 +453,7 @@ mod tests {
     #[test]
     fn sort_puts_empty_last() {
         let mut s = sheet_with(&[&["3"], &[""], &["1"]]);
-        sort_multi(&mut s, (0, 0, 2, 0), &[SortKey { col: 0, asc: true, ignore_case: true }], false);
+        sort_multi(&mut s, (0, 0, 2, 0), &[SortKey::text(0, true)], false);
         assert_eq!(col(&s, 0, 0, 2), vec!["1", "3", ""]);
     }
 
@@ -299,4 +482,88 @@ mod tests {
         // 原来的备注被推到右边
         assert_eq!(col(&s, 2, 0, 1), vec!["备注A", "备注B"]);
     }
+
+    fn col_text(s: &Sheet, c: u32, n: u32) -> Vec<String> {
+        (0..n)
+            .map(|r| s.get(r, c).map(|x| x.value.display()).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn pinyin_sort_matches_chinese_windows_order() {
+        let mut s = Sheet::new("S");
+        for (i, n) in ["张三", "李四", "王五", "赵六", "陈七"].iter().enumerate() {
+            s.set(i as u32, 0, Cell { value: Value::Text((*n).into()), formula: None });
+        }
+        let mut k = SortKey::text(0, true);
+        k.mode = SortMode::Pinyin;
+        sort_multi(&mut s, (0, 0, 4, 0), &[k], false);
+        let got = col_text(&s, 0, 5);
+        assert_eq!(got, vec!["陈七", "李四", "王五", "张三", "赵六"], "拼音序：{got:?}");
+    }
+
+    #[test]
+    fn custom_sequence_orders_by_list_position() {
+        let mut s = Sheet::new("S");
+        for (i, n) in ["低", "高", "中", "未知", "高"].iter().enumerate() {
+            s.set(i as u32, 0, Cell { value: Value::Text((*n).into()), formula: None });
+        }
+        let mut k = SortKey::text(0, true);
+        k.mode = SortMode::Custom(vec!["高".into(), "中".into(), "低".into()]);
+        sort_multi(&mut s, (0, 0, 4, 0), &[k], false);
+        let got = col_text(&s, 0, 5);
+        assert_eq!(got, vec!["高", "高", "中", "低", "未知"], "自定义序列：{got:?}");
+    }
+
+
+    #[test]
+    fn split_respects_quotes_and_consecutive_delims() {
+        let opts = SplitOpts { delim: ',', merge_consecutive: false, quote: true, ..Default::default() };
+        assert_eq!(
+            split_fields(r#"甲,"乙,丙",丁"#, &opts),
+            vec!["甲", "乙,丙", "丁"]
+        );
+        assert_eq!(split_fields(r#""他说""好""#, &opts), vec![r#"他说"好"#]);
+        let opts2 = SplitOpts { delim: ' ', merge_consecutive: true, quote: false, ..Default::default() };
+        assert_eq!(split_fields("甲   乙  丙", &opts2), vec!["甲", "乙", "丙"]);
+    }
+
+    #[test]
+    fn split_keeps_leading_zeros_and_detects_dates() {
+        let mut s = Sheet::new("S");
+        s.set(0, 0, Cell { value: Value::Text("00123".into()), formula: None });
+        s.set(1, 0, Cell { value: Value::Text("2026-03-05".into()), formula: None });
+        s.set(2, 0, Cell { value: Value::Text("12.50".into()), formula: None });
+        let opts = SplitOpts::default();
+        let rep = text_to_columns_ex(&mut s, (0, 0, 2, 0), &opts, false);
+        match &s.get(0, 0).unwrap().value {
+            Value::Text(t) => assert_eq!(t.as_ref(), "00123", "前导零必须保留为文本"),
+            v => panic!("00123 不应变成数字：{v:?}"),
+        }
+        match &s.get(1, 0).unwrap().value {
+            Value::Number(n) => assert!((*n - 46086.0).abs() < 0.001, "2026-03-05 的序列值：{n}"),
+            v => panic!("日期应识别为日期序列：{v:?}"),
+        }
+        assert_eq!(rep.date_cells, vec![(1, 0)]);
+        assert!(matches!(s.get(2, 0).unwrap().value, Value::Number(_)));
+    }
+
+    #[test]
+    fn split_warns_before_overwriting_non_empty_cells() {
+        let mut s = Sheet::new("S");
+        s.set(0, 0, Cell { value: Value::Text("甲,乙".into()), formula: None });
+        s.set(0, 1, Cell { value: Value::Text("原有".into()), formula: None });
+        s.set(0, 2, Cell { value: Value::Text("也有".into()), formula: None });
+        let opts = SplitOpts::default();
+        let dry = text_to_columns_ex(&mut s, (0, 0, 0, 0), &opts, true);
+        assert_eq!(dry.overwritten, 1, "只有紧邻的一格被覆盖，后面的整体右移");
+        assert_eq!(dry.written, 0);
+        assert_eq!(s.get(0, 1).unwrap().value.display(), "原有", "试算不能改表");
+        let rep = text_to_columns_ex(&mut s, (0, 0, 0, 0), &opts, false);
+        assert_eq!(rep.width, 2);
+        assert_eq!(s.get(0, 1).unwrap().value.display(), "乙");
+        assert_eq!(s.get(0, 2).unwrap().value.display(), "原有", "原有内容右移一列");
+        assert_eq!(s.get(0, 3).unwrap().value.display(), "也有");
+    }
+
 }

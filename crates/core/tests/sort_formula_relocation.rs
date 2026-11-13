@@ -50,8 +50,8 @@ fn quick_and_multikey_sorts_move_relative_refs_and_preserve_absolute_refs_on_sav
         let mut wb = xlsx::load(&path).unwrap();
         if multi {
             data_tools::sort_multi(&mut wb.sheets[0], (0, 0, 2, 3), &[
-                SortKey { col: 0, asc: true, ignore_case: true },
-                SortKey { col: 3, asc: true, ignore_case: true },
+                SortKey { col: 0, asc: true, ignore_case: true, mode: sheetcore::data_tools::SortMode::Default },
+                SortKey { col: 3, asc: true, ignore_case: true, mode: sheetcore::data_tools::SortMode::Default },
             ], true);
         } else {
             sort_filter::sort_region(&mut wb.sheets[0], (0, 0, 2, 3), 0, true).unwrap();
@@ -94,8 +94,8 @@ fn multikey_tie_break_moves_each_formula_by_its_actual_source_row() {
     }
     formula::recalc_all(&mut wb);
     let moved = data_tools::sort_multi(&mut wb.sheets[0], (0, 0, 2, 2), &[
-        SortKey { col: 0, asc: true, ignore_case: true },
-        SortKey { col: 1, asc: true, ignore_case: true },
+        SortKey { col: 0, asc: true, ignore_case: true, mode: sheetcore::data_tools::SortMode::Default },
+        SortKey { col: 1, asc: true, ignore_case: true, mode: sheetcore::data_tools::SortMode::Default },
     ], false);
     assert_eq!(moved, 2);
     formula::recalc_all(&mut wb);
@@ -136,7 +136,7 @@ fn both_sort_paths_leave_array_anchors_and_spill_ownership_intact() {
         // 只选中锚点而不含尾格，也不能搬走数组公式。
         assert!(sort_filter::sort_range(&mut wb.sheets[0], 0, 0, 1, 2, 0, true).is_err());
         assert_eq!(data_tools::sort_multi(&mut wb.sheets[0], (0, 0, 1, 2), &[
-            SortKey { col: 0, asc: true, ignore_case: true },
+            SortKey { col: 0, asc: true, ignore_case: true, mode: sheetcore::data_tools::SortMode::Default },
         ], false), 0);
         assert_eq!(wb.sheets[0].value(0, 0), Value::Number(2.0));
         assert_eq!(wb.sheets[0].value(1, 0), Value::Number(1.0));

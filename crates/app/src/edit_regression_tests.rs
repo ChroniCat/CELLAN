@@ -386,7 +386,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
         app.sel_end = (1, 1);
         if multi {
-            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into() });
+            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false });
         } else {
             app.do_sort(0, true);
         }
@@ -4038,7 +4038,22 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
     let cases: Vec<(&str, Box<dyn Fn(&mut SheetApp)>)> = vec![
         ("拖拽移动", Box::new(|a: &mut SheetApp| a.move_selection_by(1, 0))),
         ("合并", Box::new(|a: &mut SheetApp| a.toggle_merge(true))),
-        ("分列", Box::new(|a: &mut SheetApp| a.run_split(','))),
+        (
+            "分列",
+            Box::new(|a: &mut SheetApp| {
+                a.run_split(&DataDlg {
+                    tab: 1,
+                    keys: Vec::new(),
+                    header: false,
+                    delim: ",".into(),
+                    sort_mode: 0,
+                    custom: String::new(),
+                    merge_consecutive: false,
+                    quote: false,
+                    detect_types: false,
+                })
+            }),
+        ),
         ("删除重复", Box::new(|a: &mut SheetApp| a.run_dedup())),
         ("向下填充", Box::new(|a: &mut SheetApp| a.fill_to(2, true))),
         ("选择性粘贴", Box::new(|a: &mut SheetApp| a.paste_special_apply_text(&egui::Context::default(), Some("9".into())))),

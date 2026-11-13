@@ -93,6 +93,16 @@ struct DataDlg {
     keys: Vec<(u32, bool, bool)>,
     header: bool,
     delim: String,
+    /// 0 = 默认（字典序），1 = 拼音，2 = 自定义序列
+    sort_mode: u8,
+    /// 自定义序列，顿号/逗号分隔
+    custom: String,
+    /// 分列：连续分隔符当一个
+    merge_consecutive: bool,
+    /// 分列：引号内不拆
+    quote: bool,
+    /// 分列：识别数字/日期（前导零保留文本）
+    detect_types: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1020,6 +1030,8 @@ struct SheetApp {
     fill_drag: Option<(usize, u32, u32)>,
     /// 数据工具对话框：0=排序 1=分列
     data_dlg: Option<DataDlg>,
+    /// 分列覆盖二次确认：(文档代号, 会覆盖的格子数)
+    split_confirm: Option<(u64, usize)>,
     /// 条件格式管理窗口
     cf_mgr: bool,
     /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
@@ -1704,6 +1716,7 @@ impl SheetApp {
             rename_sheet: None,
             fill_drag: None,
             data_dlg: None,
+            split_confirm: None,
             cf_mgr: false,
             last_import: None,
             room_lost: false,
@@ -3767,6 +3780,11 @@ impl SheetApp {
                 keys: vec![(1, true, true), (2, false, true)],
                 header: true,
                 delim: ",".into(),
+                sort_mode: 0,
+                custom: String::new(),
+                merge_consecutive: false,
+                quote: true,
+                detect_types: true,
             };
             self.run_sort(&dlg);
             let order: Vec<String> = (1..=5)
@@ -3780,7 +3798,18 @@ impl SheetApp {
                 value: sheetcore::model::Value::Text("甲,1".into()), formula: None });
             self.sel = (0, 3);
             self.sel_end = (0, 3);
-            self.run_split(',');
+            let dlg = DataDlg {
+                tab: 1,
+                keys: Vec::new(),
+                header: false,
+                delim: ",".into(),
+                sort_mode: 0,
+                custom: String::new(),
+                merge_consecutive: false,
+                quote: true,
+                detect_types: true,
+            };
+            self.run_split(&dlg);
             let a = self.wb.sheet(self.sheet_idx).get(0, 3).map(|c| c.value.display()).unwrap_or_default();
             let b = self.wb.sheet(self.sheet_idx).get(0, 4).map(|c| c.value.display()).unwrap_or_default();
             eprintln!("[B2] 分列后 D1={a} E1={b}");
@@ -4971,7 +5000,17 @@ impl SheetApp {
         let (r1, c1, r2, c2) = self.sel_rect();
         let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
         let keys = (c1..=c2).map(|c| (c, true, c == c1)).collect();
-        self.data_dlg = Some(DataDlg { tab, keys, header, delim: ",".into() });
+        self.data_dlg = Some(DataDlg {
+            tab,
+            keys,
+            header,
+            delim: ",".into(),
+            sort_mode: 1,
+            custom: "高,中,低".into(),
+            merge_consecutive: true,
+            quote: true,
+            detect_types: true,
+        });
     }
 
     fn run_sort(&mut self, dlg: &DataDlg) {
@@ -4993,6 +5032,17 @@ impl SheetApp {
                 col: *c,
                 asc: *asc,
                 ignore_case: true,
+                mode: match dlg.sort_mode {
+                    1 => sheetcore::data_tools::SortMode::Pinyin,
+                    2 => sheetcore::data_tools::SortMode::Custom(
+                        dlg.custom
+                            .split(['，', ',', '、', ';'])
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect(),
+                    ),
+                    _ => sheetcore::data_tools::SortMode::Default,
+                },
             })
             .collect();
         if keys.is_empty() {
@@ -5037,20 +5087,54 @@ impl SheetApp {
         };
     }
 
-    fn run_split(&mut self, delim: char) {
+    fn run_split(&mut self, dlg: &DataDlg) {
         let (r1, c1, r2, c2) = self.sel_rect();
         if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "分列") {
             return;
         }
-        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
-        let n = sheetcore::data_tools::text_to_columns(
+        let opts = sheetcore::data_tools::SplitOpts {
+            delim: dlg.delim.chars().next().unwrap_or(','),
+            merge_consecutive: dlg.merge_consecutive,
+            quote: dlg.quote,
+            detect_types: dlg.detect_types,
+            date_system: self.wb.date_system,
+        };
+        let dry = sheetcore::data_tools::text_to_columns_ex(
             self.wb.sheet_mut(self.sheet_idx),
             (r1, c1, r2, c2),
-            delim,
+            &opts,
+            true,
         );
+        if dry.overwritten > 0 && self.split_confirm != Some((self.doc_gen, dry.overwritten)) {
+            self.split_confirm = Some((self.doc_gen, dry.overwritten));
+            self.status = format!(
+                "分列会覆盖右侧 {} 个非空格子，再点一次「执行」确认",
+                dry.overwritten
+            );
+            return;
+        }
+        self.split_confirm = None;
+        let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+        let report = sheetcore::data_tools::text_to_columns_ex(
+            self.wb.sheet_mut(self.sheet_idx),
+            (r1, c1, r2, c2),
+            &opts,
+            false,
+        );
+        let n = report.width;
+        if !report.date_cells.is_empty() {
+            let mut st = sheetcore::style::CellStyle::default();
+            st.format = "yyyy-mm-dd".into();
+            let id = self.wb.styles.intern(st);
+            for (r, c) in &report.date_cells {
+                self.wb.sheet_mut(self.sheet_idx).set_style(*r, *c, id);
+            }
+        }
         self.txn_end("分列", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        sheetcore::formula::recalc_all(&mut self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
         self.status = if n <= 1 {
             "没有找到分隔符".into()
         } else {
@@ -6301,12 +6385,61 @@ impl SheetApp {
                                 });
                         });
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("排序依据");
+                        egui::ComboBox::from_id_salt("sortmode")
+                            .selected_text(match dlg.sort_mode {
+                                1 => "中文拼音",
+                                2 => "自定义序列",
+                                _ => "字典序",
+                            })
+                            .width(100.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut dlg.sort_mode, 0, "字典序");
+                                ui.selectable_value(&mut dlg.sort_mode, 1, "中文拼音");
+                                ui.selectable_value(&mut dlg.sort_mode, 2, "自定义序列");
+                            });
+                    });
+                    if dlg.sort_mode == 2 {
+                        ui.horizontal(|ui| {
+                            ui.label("序列");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.custom)
+                                    .desired_width(220.0)
+                                    .hint_text("高,中,低"),
+                            );
+                        });
+                        ui.label(egui::RichText::new("序列里的项按书写顺序排，不在序列里的排在后面").weak());
+                    }
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("分隔符");
                         ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(60.0));
                     });
-                    ui.label(egui::RichText::new("按分隔符拆到右边相邻列，右侧内容整体右移").weak());
+                    ui.checkbox(&mut dlg.quote, "引号内的分隔符不拆（\"\" 表示一个引号）");
+                    ui.checkbox(&mut dlg.merge_consecutive, "连续分隔符当一个（多个空格不产生空列）");
+                    ui.checkbox(&mut dlg.detect_types, "识别数字/日期（前导零保留为文本）");
+                    let (r1, c1, _, _) = self.sel_rect();
+                    let sample = self
+                        .wb
+                        .sheet(self.sheet_idx)
+                        .get(r1, c1)
+                        .map(|x| x.value.display())
+                        .unwrap_or_default();
+                    if !sample.is_empty() {
+                        let opts = sheetcore::data_tools::SplitOpts {
+                            delim: dlg.delim.chars().next().unwrap_or(','),
+                            merge_consecutive: dlg.merge_consecutive,
+                            quote: dlg.quote,
+                            detect_types: dlg.detect_types,
+                            date_system: self.wb.date_system,
+                        };
+                        let fields = sheetcore::data_tools::split_fields(&sample, &opts);
+                        ui.label(
+                            egui::RichText::new(format!("预览：{} → {}", sample, fields.join(" | ")))
+                                .weak(),
+                        );
+                    }
                 }
                 ui.separator();
                 if ui.button("执行").clicked() {
@@ -6317,8 +6450,7 @@ impl SheetApp {
             if dlg.tab == 0 {
                 self.run_sort(&dlg);
             } else {
-                let ch = dlg.delim.chars().next().unwrap_or(',');
-                self.run_split(ch);
+                self.run_split(&dlg);
             }
         } else if open {
             self.data_dlg = Some(dlg);
@@ -19893,6 +20025,11 @@ let txn = self.txn_begin(&keys);
                     keys: vec![(self.sel.1, true, true)],
                     header: true,
                     delim: ",".into(),
+                    sort_mode: 1,
+                    custom: "高,中,低".into(),
+                    merge_consecutive: false,
+                    quote: true,
+                    detect_types: true,
                 });
             }
             CtxAct::FormatCells => self.open_format_dialog(),

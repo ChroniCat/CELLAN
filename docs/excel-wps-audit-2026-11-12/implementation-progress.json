@@ -6031,17 +6031,19 @@
       "scope": "core/data_tools.rs + app数据工具",
       "source": "core-requirements.md",
       "heading": "C20 P2 中文排序、分列与高级数据工具",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "中文拼音/自定义序列排序已做，笔画/部首与按行排序未做；分列仅分隔符模式，固定宽度/逐列格式未做；真实键鼠对话框操作未执行"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T20:10:58Z",
       "slices": [
         {
           "id": "C20.1",
@@ -6049,17 +6051,26 @@
           "priority": "P2",
           "acceptance_source": "core-requirements.md / C20 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/collate.rs",
+            "crates/core/src/data_tools.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/fixtures/c20/sort.xlsx"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c20-sort-split.txt"
+          ],
+          "not_done": [
+            "拼音序经 Excel 实测一致；自定义序列单测；分列引号/多空格/前导零/日期/覆盖二次确认/右移/重算/撤销；固定宽度分列与真实键鼠未做"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T20:10:58Z"
         }
       ]
     },
