@@ -4132,7 +4132,8 @@
         "cb628f6",
         "e8a52d7",
         "649828c",
-        "14b36af"
+        "14b36af",
+        "af71be7"
       ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4148,7 +4149,8 @@
         "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
         "cargo test -p app --offline --no-default-features --features glow --bin app enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed",
         "cargo test -p app --offline --no-default-features --features glow --bin app -> 232 passed / 0 failed / 0 ignored / APP_EXIT=0",
-        "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed"
+        "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed",
+        "enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed (asserts close button has focus)"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
@@ -4170,7 +4172,7 @@
       "failures": [],
       "blocker": "",
       "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-      "updated_utc": "2026-11-13T09:30:00Z",
+      "updated_utc": "2026-11-13T09:35:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4188,7 +4190,8 @@
             "cb628f6",
             "e8a52d7",
             "649828c",
-            "14b36af"
+            "14b36af",
+            "af71be7"
           ],
           "commands": [
             "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
@@ -4199,7 +4202,8 @@
             "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0",
             "cargo test -p app --offline --no-default-features --features glow --bin app enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed",
             "cargo test -p app --offline --no-default-features --features glow --bin app -> 232 passed / 0 failed / 0 ignored / APP_EXIT=0",
-            "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed"
+            "negative: remove && !self.dialog_modal -> enter_on_focused_dialog_close... FAILED; restore -> 1 passed",
+            "enter_on_focused_dialog_close_does_not_advance_selection -> 1 passed (asserts close button has focus)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt",
@@ -4221,7 +4225,7 @@
           "failures": [],
           "blocker": "",
           "next": "用户复核 649828c 与完整链证据后可申请 UI-10 父项验收；不扩大到其他父项。",
-          "updated_utc": "2026-11-13T09:30:00Z"
+          "updated_utc": "2026-11-13T09:35:00Z"
         }
       ]
     },

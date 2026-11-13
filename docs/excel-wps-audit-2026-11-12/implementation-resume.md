@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`）；当前代码检查点 `14b36af`（查找对话框关闭穿透/焦点/残余 Enter 修复）。
+- 分支 `main`（`origin/main`）；当前代码检查点 `af71be7`（查找对话框关闭穿透/焦点/残余 Enter 修复与焦点断言）。
   之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
   UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
 - 台账（`python scripts/audit_progress.py counts`）：任务 13 已验收 / 10 待验收 /

@@ -148,4 +148,5 @@ if !self.backstage && !self.dialog_modal {
 - 专项 `enter_on_focused_dialog_close_does_not_advance_selection` → 1 passed。
 - 全量 app → **232 passed / 0 failed / 0 ignored**，APP_EXIT=0。
 - core 仍为 679 passed / 0 failed / 41 ignored；build glow EXIT=0。
-- 代码提交：`14b36af fix: consume dialog-closing Enter before grid navigation`。
+- 代码提交：`14b36af fix: consume dialog-closing Enter before grid navigation`；
+  `af71be7 test: assert focused dialog close button holds keyboard focus`（测试内断言焦点确实在关闭按钮 Id 上）。
