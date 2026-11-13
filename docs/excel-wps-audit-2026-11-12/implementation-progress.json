@@ -5437,17 +5437,24 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt"
+          ],
+          "not_done": [
+            "真实鼠标调整级别未做"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T21:25:05Z"
         },
         {
           "id": "UI-17.2",

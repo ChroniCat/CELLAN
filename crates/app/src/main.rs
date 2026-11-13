@@ -6573,18 +6573,40 @@ impl SheetApp {
                 if dlg.tab == 0 {
                     ui.checkbox(&mut dlg.header, "首行是标题");
                     ui.separator();
-                    ui.label("按顺序勾选排序列（靠前的优先）：");
-                    for (c, asc, on) in dlg.keys.iter_mut() {
+                    ui.label("按从上到下的顺序比较，可调级别：");
+                    let mut up: Option<usize> = None;
+                    let mut down: Option<usize> = None;
+                    for i in 0..dlg.keys.len() {
+                        let (c, asc, on) = &mut dlg.keys[i];
+                        let cid = *c;
+                        let mut is_on = *on;
+                        let mut is_asc = *asc;
                         ui.horizontal(|ui| {
-                            ui.checkbox(on, format!("{} 列", cell_name(0, *c).trim_end_matches('1')));
-                            egui::ComboBox::from_id_salt(format!("ord{c}"))
-                                .selected_text(if *asc { "升序" } else { "降序" })
+                            ui.checkbox(&mut is_on, format!("{} 列", cell_name(0, cid).trim_end_matches('1')));
+                            egui::ComboBox::from_id_salt(format!("ord{cid}"))
+                                .selected_text(if is_asc { "升序" } else { "降序" })
                                 .width(70.0)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(asc, true, "升序");
-                                    ui.selectable_value(asc, false, "降序");
+                                    ui.selectable_value(&mut is_asc, true, "升序");
+                                    ui.selectable_value(&mut is_asc, false, "降序");
                                 });
+                            if ui.add_enabled(is_on && i > 0, egui::Button::new("↑").small()).clicked() {
+                                up = Some(i);
+                            }
+                            if ui
+                                .add_enabled(is_on && i + 1 < dlg.keys.len(), egui::Button::new("↓").small())
+                                .clicked()
+                            {
+                                down = Some(i);
+                            }
                         });
+                        dlg.keys[i] = (cid, is_asc, is_on);
+                    }
+                    if let Some(i) = up {
+                        dlg.keys.swap(i, i - 1);
+                    }
+                    if let Some(i) = down {
+                        dlg.keys.swap(i, i + 1);
                     }
                     ui.horizontal(|ui| {
                         ui.label("排序依据");

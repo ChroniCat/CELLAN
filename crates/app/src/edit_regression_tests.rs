@@ -6884,6 +6884,43 @@ fn dedup_uses_selected_columns_and_preview_matches_removed() {
     assert_eq!(b.status, "没有重复行");
 }
 
+/// UI-17.1：多级排序按级别顺序比较，选区内排序、选区外不动，标题不参与。
+#[test]
+fn multi_level_sort_respects_level_order_and_selection_range() {
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, Cell { value: Value::Text("编号".into()), formula: None });
+        sh.set(0, 1, Cell { value: Value::Text("组".into()), formula: None });
+        for (i, (n, g)) in [(1.0, "y"), (2.0, "x"), (3.0, "y"), (4.0, "x")].iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set(r, 0, Cell { value: Value::Number(*n), formula: None });
+            sh.set(r, 1, Cell { value: Value::Text((*g).into()), formula: None });
+        }
+        sh.set(5, 0, Cell { value: Value::Number(99.0), formula: None });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (4, 1);
+    let dlg = DataDlg {
+        tab: 0,
+        keys: vec![(1, true, true), (0, true, true)],
+        header: true,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+    };
+    app.run_sort(&dlg);
+    let order: Vec<String> = (1..=4)
+        .map(|r| app.wb.sheet(0).get(r, 0).map(|c| c.value.display()).unwrap_or_default())
+        .collect();
+    assert_eq!(order, vec!["2", "4", "1", "3"], "先组后编号");
+    assert_eq!(app.wb.sheet(0).get(5, 0).unwrap().value.display(), "99", "选区外不动");
+    assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "编号", "标题保留");
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();
