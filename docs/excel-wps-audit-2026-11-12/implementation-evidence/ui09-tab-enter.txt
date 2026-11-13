@@ -1,24 +1,30 @@
-UI-09.3 区域内 Tab/Enter 与边界隐藏行（2026-11-13 14:44 CST）
+UI-09.3 区域内 Tab/Enter、导航生命周期与边界（2026-11-13 15:01 CST）
 
 实现
 - 新增 nav_rect：多格选区按 Tab/Enter 时保留原始矩形，活动格在矩形内循环，
   sel_rect() 始终返回原始区域，不会把选区缩成一格。
-- Tab 向右、到右边界换到下一行首列；Enter 向下、到末行回到首行；Shift 反向。
+- Tab 向右、到右边界换到下一行首列；Enter 按行扫描，到末行换到下一列，
+  越过最后一列才回首格；Shift 反向。A1:B2 顺序为 A1→A2→B1→B2→A1。
 - 区域内逐格检查 rows.size/cols.size，隐藏行、隐藏列不成为落点；若区域内没有
   可见格则原地不动。
 - 单格 Tab/Enter 走 next_visible_col/next_visible_row，跳过隐藏行列并在
   XFD/1048576 边界停住，不再产生 1048576/16384 坐标。
 - 方向键也改用可见行/列推进，避免普通箭头落到隐藏格。
 - 编辑提交路径 commit_edit(advance) 复用同一 advance_active；点击、右键、名称框
-  跳转、翻页、切表和选择入口都清 nav_rect，避免旧区域残留。
+  跳转、查找跳转/查找全部定位、撤销/重做、翻页、切表、park/activate、reset_editor_state
+  都清 nav_rect。sel_rect 还会校验活动格是否仍在旧矩形内，防止漏清入口误用旧选区。
 
 验证
 - edit_regression_tests::tab_enter_cycle_inside_selection_and_stop_at_sheet_edges：
-  A1:B3 隐藏第 2 行，Tab B1 -> A3、Enter 回 A1；A1:C1 隐藏 B 列，Tab 到 C1；
-  编辑提交 Enter 跳过隐藏行；方向键跳隐藏行；XFD Tab 与 1048576 Enter 不越界。
+  A1:B2 完整 Enter 序列与 Shift 反向；A1:B3 隐藏第 2 行，Tab B1 -> A3、Enter 换列；
+  A1:C2 隐藏 B 列，Enter 跳过 B；A1:C1 Tab 到 C1；编辑提交 Enter 跳过隐藏行；
+  方向键跳隐藏行；XFD Tab 与 1048576 Enter 不越界。
+- nav_rect_is_invalidated_by_find_jump_undo_and_document_switch：A1:B2 Tab 后查找
+  跳 D10，nav_rect 清空，Delete 只清 D10，A1/B1 内容与粗体格式保留；
+  park/activate 与 reset_editor_state 后 nav_rect 均为 None。
 - 命令：cargo test -p app --offline --bin app tab_enter_cycle_inside_selection_and_stop_at_sheet_edges
   -> 1 passed。
-- 全量：cargo test -p app --offline --bin app -> 213 passed / 0 failed / 0 ignored，
+- 全量：cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored，
   APP_EXIT=0。
 
 未完成

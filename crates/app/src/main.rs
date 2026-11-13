@@ -6153,6 +6153,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.sel = (hit.row, hit.col);
         self.sel_end = (hit.row, hit.col);
         self.extra_sel.clear();
+        self.nav_rect = None;
         self.ensure_visible();
         let name = cell_name(hit.row, hit.col);
         let where_ = self.wb.sheet(self.sheet_idx).name.clone();
@@ -6521,6 +6522,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.sheet_idx = sheet.min(self.wb.sheets.len().saturating_sub(1));
         self.sel = (row, col);
         self.sel_end = (row, col);
+        self.nav_rect = None;
         self.ensure_visible();
         self.status = if redo {
             format!("重做：{}", applied.label)
@@ -6725,19 +6727,32 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
         if style_changed {
             let borders = st.border;
+            let side_changed = [
+                st.border[0] != orig.border[0],
+                st.border[1] != orig.border[1],
+                st.border[2] != orig.border[2],
+                st.border[3] != orig.border[3],
+            ];
+            let all_sides_changed = side_changed.iter().all(|x| *x);
             let font = st.font.clone();
             let format = st.format.clone();
             let (r1, c1, r2, c2) = self.sel_rect();
             self.apply_style_xy(move |s, r, c| {
                 if border_changed {
+                    // 只改用户真正切换过的边；其余边的粗细/颜色原样保留。
                     for (i, on) in borders.iter().enumerate() {
-                        s.border[i].style = if *on { 1 } else { 0 };
+                        if side_changed[i] {
+                            s.border[i].style = if *on { 1 } else { 0 };
+                        }
                     }
-                    // 与旧行为一致：整组开启时只画外框，内部边不画。
-                    if borders[0] && c > c1 { s.border[0].style = 0; }
-                    if borders[1] && c < c2 { s.border[1].style = 0; }
-                    if borders[2] && r > r1 { s.border[2].style = 0; }
-                    if borders[3] && r < r2 { s.border[3].style = 0; }
+                    // 四边同时由无到有（“外框”）时，内部边不画；只切换单边时
+                    // 不碰其他边，避免把已有粗线/颜色清掉。
+                    if all_sides_changed && borders.iter().all(|x| *x) {
+                        if c > c1 { s.border[0].style = 0; }
+                        if c < c2 { s.border[1].style = 0; }
+                        if r > r1 { s.border[2].style = 0; }
+                        if r < r2 { s.border[3].style = 0; }
+                    }
                 }
                 if want_font { s.font = font.clone(); }
                 if want_bold { s.bold = st.bold; }
@@ -7067,26 +7082,59 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         from
     }
 
-    /// PageUp/PageDown：按当前视口可见行数翻页，保留一行重叠；不落到隐藏行。
-    /// 视口本身也翻一页：向下时把新活动格放到视口顶部，向上时放到视口底部。
-    fn page_move(&mut self, down: bool) {
-        let step = self.visible_page_rows().saturating_sub(1).max(1);
-        let (mut r, c) = self.sel;
-        for _ in 0..step {
-            r = self.next_visible_row(r, down);
-        }
+    /// 当前视口首/末可见数据行；和活动格无关，用来按原视口边界翻页。
+    fn visible_page_bounds(&self) -> (u32, u32) {
         let (_, rows) = self.view_axes();
         let view_h = (self.last_view.y - HEAD_H).max(44.0);
-        let top = rows.pos(r);
-        self.scroll.y = if down {
-            top
-        } else {
-            (top + rows.size(r) - view_h).max(0.0)
-        };
+        let top = self.scroll.y;
+        let mut r = rows.index_at(top);
+        let mut first = None;
+        let mut last = self.sel.0;
+        let mut guard = 0u32;
+        while r <= 1_048_575 && rows.pos(r) < top + view_h && guard < 8192 {
+            if rows.size(r) > 0.0 {
+                first.get_or_insert(r);
+                last = r;
+            }
+            r += 1;
+            guard += 1;
+        }
+        (first.unwrap_or(self.sel.0), last)
+    }
+
+    /// PageUp/PageDown：按原视口边界翻页（保留一行重叠），同时保持活动格
+    /// 在页内的相对位置；不能把新活动格直接当作新视口首行，否则会跳过中间行。
+    fn page_move(&mut self, down: bool) {
+        let step = self.visible_page_rows().saturating_sub(1).max(1);
+        let (first, _last) = self.visible_page_bounds();
+        let (mut r, c) = self.sel;
+        let mut moved = 0u32;
+        for _ in 0..step {
+            let nr = self.next_visible_row(r, down);
+            if nr == r {
+                break;
+            }
+            r = nr;
+            moved += 1;
+        }
+        if moved > 0 {
+            // 视口首行跟着移动同样的可见行数，而不是贴着新活动格。
+            let mut top = first;
+            for _ in 0..moved {
+                let nt = self.next_visible_row(top, down);
+                if nt == top {
+                    break;
+                }
+                top = nt;
+            }
+            let (_, rows) = self.view_axes();
+            self.scroll.y = rows.pos(top);
+        }
         self.sel = (r, c);
         self.sel_end = (r, c);
         self.extra_sel.clear();
         self.nav_rect = None;
+        self.ensure_visible();
     }
 
     /// Ctrl+PageUp/PageDown：在当前文档内切换可见工作表，跳过隐藏表。
@@ -7203,16 +7251,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         c -= 1;
                     }
                 } else if dr > 0 {
-                    if r >= r2 {
-                        r = r1;
-                    } else {
+                    if r < r2 {
                         r += 1;
+                    } else if c < c2 {
+                        r = r1;
+                        c += 1;
+                    } else {
+                        r = r1;
+                        c = c1;
                     }
                 } else if dr < 0 {
-                    if r <= r1 {
-                        r = r2;
-                    } else {
+                    if r > r1 {
                         r -= 1;
+                    } else if c > c1 {
+                        r = r2;
+                        c -= 1;
+                    } else {
+                        r = r2;
+                        c = c2;
                     }
                 }
                 if rows.size(r) > 0.0 && cols.size(c) > 0.0 {
@@ -7645,8 +7701,12 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// 规范化后的选区 (r1, c1, r2, c2)
     fn sel_rect(&self) -> (u32, u32, u32, u32) {
-        if let Some(rect) = self.nav_rect {
-            return rect;
+        if let Some((r1, c1, r2, c2)) = self.nav_rect {
+            // 活动格已经离开矩形（查找/撤销/外部跳转）时，即使某个入口忘了清
+            // nav_rect，也不能再把旧矩形当成当前选区。
+            if self.sel.0 >= r1 && self.sel.0 <= r2 && self.sel.1 >= c1 && self.sel.1 <= c2 {
+                return (r1, c1, r2, c2);
+            }
         }
         let (r1, r2) = (self.sel.0.min(self.sel_end.0), self.sel.0.max(self.sel_end.0));
         let (c1, c2) = (self.sel.1.min(self.sel_end.1), self.sel.1.max(self.sel_end.1));
@@ -17105,6 +17165,7 @@ let txn = self.txn_begin(&keys);
             self.sel = (h.row, h.col);
             self.sel_end = (h.row, h.col);
             self.extra_sel.clear();
+            self.nav_rect = None;
             self.ensure_visible();
         }
         self.find.find_all_open = open;
@@ -22280,6 +22341,7 @@ fn elide(s: &str, max_chars: usize) -> String {
     /// 把当前文档从 self 上"取下来"
     fn park_current(&mut self) -> Box<ParkedDoc> {
         self.drop_merge_confirmation();
+        self.nav_rect = None;
         self.format_painter = None;
         self.painter_double = false;
         self.find_scan = None;
@@ -22328,6 +22390,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.deps = doc.deps;
         self.sel = doc.sel;
         self.sel_end = doc.sel_end;
+        self.nav_rect = None;
         self.sheet_idx = doc.sheet_idx;
         self.scroll = doc.scroll;
         self.zoom = doc.zoom;
@@ -22492,6 +22555,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         let sel = rc("SC_SEL").unwrap_or((0, 0));
         self.sel = sel;
         self.sel_end = rc("SC_SEL2").unwrap_or(sel);
+        self.nav_rect = None;
         self.sheet_idx = 0;
         self.scroll = Vec2::ZERO;
         self.cancel_edit();

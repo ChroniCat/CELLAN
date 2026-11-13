@@ -3871,7 +3871,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-08 修复边框方向与混合格式被覆盖",
       "status": "实施中",
-      "acceptance": "边框方向、格式对话框逐字段提交已实现并专项通过；混合值显示、UI-08.3 事务及真实 Office 目视未完成。",
+      "acceptance": "边框方向、混合值/单字段提交、按 side 无损提交均有专项证据；真实 GUI/Office 目视未完成，父项保持实施中。",
       "files": [],
       "commits": [
         "2745438",
@@ -3884,7 +3884,7 @@
       "failures": [],
       "blocker": "",
       "next": "实现 UI-08.2 格式草稿 dirty/mixed 与 UI-08.3 一次事务，再实测 Excel/WPS。",
-      "updated_utc": "2026-11-13T06:52:15Z",
+      "updated_utc": "2026-11-13T07:01:45Z",
       "slices": [
         {
           "id": "UI-08.1",
@@ -3956,17 +3956,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "按 side_changed 只提交用户切换的边；未改边保留 style/color；左粗红 style2 + 右双蓝 style4 + 上下无框，仅加下框后左右粗细颜色不变，下框 style1；专项 1 passed，全量 app 217。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --offline --bin app format_dialog_preserves_border_thickness_and_color_when_other_side_changes -> 1 passed",
+            "cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt"
+          ],
+          "not_done": [
+            "真实鼠标确定/取消、Excel/WPS 保存重开后的边框粗细颜色目视未做"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补真实鼠标与 Office 目视，再评估 UI-08 父项。",
+          "updated_utc": "2026-11-13T07:01:45Z"
         }
       ]
     },
@@ -3982,7 +3992,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-09 常用键盘导航和选择完整性",
       "status": "实施中",
-      "acceptance": "UI-09.1/09.2/09.3 三项行为均有专项证据，但真机键盘、名称框焦点、IME 与 Office 目视仍待验收；父项不提前标已验收。",
+      "acceptance": "UI-09.1/09.2/09.3 行为均有专项证据；真机键盘、名称框焦点、IME、查找跳转 GUI 与 Office 目视仍待验收，父项不提前标已验收。",
       "files": [],
       "commits": [
         "f19b932"
@@ -3993,7 +4003,7 @@
       "failures": [],
       "blocker": "",
       "next": "补 UI-09.1/09.2/09.3 的真实键鼠与视觉验收，再走父项验收。",
-      "updated_utc": "2026-11-13T06:44:17Z",
+      "updated_utc": "2026-11-13T07:01:45Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -4034,7 +4044,7 @@
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "PageUp/PageDown 按真实视口可见行数翻页，活动格到新视口首/末行且 scroll 同步，不落隐藏行；首末连续隐藏时停最近可见行；Ctrl+PageUp/PageDown 切可见表、跳过隐藏表、不改单元格。专项独立断言首/末可见行与 scroll；全量 app 212 passed。",
+          "acceptance": "PageUp/Down 按原视口首/末可见行翻页并保留一行重叠，活动格保持页内可见偏移；中部/底部/PageUp 用独立 visible_row_window 断言首末行、活动格与 scroll；Ctrl+Page 切表不改单元格。专项 1 passed，全量 app 217。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -4045,19 +4055,19 @@
           ],
           "commands": [
             "cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet -> 1 passed",
-            "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt"
           ],
           "not_done": [
-            "720/1080 真机窗口真实键盘与滚轮视觉重叠未做",
-            "Ctrl+PageUp 与 UI-16 每表选区合并未做"
+            "真实 720/1080 键盘重复与底部重叠视觉截图未做",
+            "Ctrl+Page 与 UI-16 每表选区合并未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "真机 720/1080 键盘复核；与 UI-16 每表选区合并后再评估父项。",
-          "updated_utc": "2026-11-13T06:37:15Z"
+          "updated_utc": "2026-11-13T07:01:45Z"
         },
         {
           "id": "UI-09.3",
@@ -4066,7 +4076,7 @@
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "多格选区 Tab/Enter 在区域内循环并保留原始矩形；Shift 反向；隐藏行/列不落点；单格 Tab/Enter 跳过隐藏行列并在 XFD/1048576 边界停住；编辑提交 commit_edit(advance) 复用同一推进逻辑。专项 1 passed，全量 app 213 passed。",
+          "acceptance": "A1:B2 Enter 按行扫描 A1→A2→B1→B2→A1，Shift 反向；Tab 换行；隐藏行/列跳过；XFD/1048576 边界不越界；commit_edit(advance) 复用；查找跳转、撤销/重做、park/activate、reset_editor_state 清 nav_rect，sel_rect 校验活动格。专项 1 passed，全量 app 217。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -4076,7 +4086,8 @@
           ],
           "commands": [
             "cargo test -p app --offline --bin app tab_enter_cycle_inside_selection_and_stop_at_sheet_edges -> 1 passed",
-            "cargo test -p app --offline --bin app -> 213 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app nav_rect_is_invalidated_by_find_jump_undo_and_document_switch -> 1 passed",
+            "cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt"
@@ -4086,8 +4097,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "在真实窗口补 720/1080 键盘与编辑提交取证；与 UI-16 选区状态合并后再评估 UI-09 父项。",
-          "updated_utc": "2026-11-13T06:44:17Z"
+          "next": "补真实窗口键盘/IME 与视觉验收，再评估 UI-09 父项。",
+          "updated_utc": "2026-11-13T07:01:45Z"
         }
       ]
     },

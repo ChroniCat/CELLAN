@@ -2,7 +2,7 @@
 
 - 分支 `main`（`origin/main`）；代码修复 `f97377a`（UI-08.2 混合值；前序 `fb2b55d`/`2745438`/`f19b932`/`4202fae`），文档记录提交 `c3711f3`；C11 父项已验收；UI-09 父项仍待真机复核。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 3 实施中 / 35 待实施；
-  切片 35 已验收 / 26 待验收 / 87 待实施。C11 父项已按用户 14:00 认可翻绿。
+  切片 35 已验收 / 27 待验收 / 86 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（14:37 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
   app **215 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
 - 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
@@ -483,3 +483,14 @@
   全量 app **215 passed / 0 failed / 0 ignored**。FmtMixed 已让字体/字号/字形/颜色/填充/
   对齐/方向/换行/缩进/数字格式/四边分别显示“混合/？”；真实鼠标/Office 目视和
   UI-08.3 事务/撤销仍未完成，UI-08 父项保持实施中。
+
+## 15:01 当前：UI-09/UI-08 独立审查四项
+
+- nav_rect：Enter A1:B2 改为 A1→A2→B1→B2→A1，Shift 反向；隐藏行列跳过。
+- 查找跳转/查找全部/撤销重做/park/activate/reset_editor_state 清 nav_rect；
+  sel_rect 校验活动格，补导航生命周期回归。
+- page_move 按旧视口首/末可见行翻页，活动格保持页内可见偏移；中部/底部/PageUp
+  用独立窗口断言，修正原“新活动格当视口首行”的跳行问题。
+- UI-08.3 按 side dirty 只写改动边，左粗红/右双蓝在只加下框后保留 style/color。
+- 专项：nav 1 passed、tab 1 passed、page 1 passed、border 1 passed；全量 app
+  **217 passed / 0 failed / 0 ignored**。以上均待验收，真实 GUI/Office 仍缺。

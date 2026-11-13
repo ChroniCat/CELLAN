@@ -37,6 +37,15 @@ fn visible_row_window(app: &SheetApp) -> (u32, u32) {
     (first, last)
 }
 
+/// 从视口首行到活动格之间跨过多少个可见行（隐藏行不占页内位置）。
+fn visible_row_offset(app: &SheetApp, first: u32, row: u32) -> u32 {
+    let (_, rows) = app.view_axes();
+    (first..=row)
+        .filter(|r| rows.size(*r) > 0.0)
+        .count()
+        .saturating_sub(1) as u32
+}
+
 fn formula(text: &str) -> Cell {
     Cell { value: Value::Empty, formula: Some(text.into()) }
 }
@@ -979,6 +988,40 @@ fn page_keys_follow_viewport_and_ctrl_page_switches_sheet() {
     let row_top1080 = app.view_axes().1.pos(app.sel.0);
     assert!((app.scroll.y - row_top1080).abs() < 0.5, "1080p scroll 未同步");
 
+    // 中部：活动格在页内偏移 10；翻页后视口首行是旧末行，活动格保持偏移 10。
+    app.last_view = egui::vec2(1000.0, 720.0);
+    app.scroll = egui::Vec2::ZERO;
+    app.sel = (10, 0);
+    app.sel_end = (10, 0);
+    let (mid_first0, mid_last0) = visible_row_window(&app);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
+    let (mid_first1, mid_last1) = visible_row_window(&app);
+    assert_eq!(mid_first1, mid_last0, "中部翻页仍以旧视口末行重叠");
+    let mid_offset = visible_row_offset(&app, mid_first0, 10);
+    assert_eq!(app.sel.0, mid_first1 + mid_offset, "活动格应保持可见页内偏移");
+    assert!(mid_last1 > mid_last0);
+    let mid_top = app.view_axes().1.pos(mid_first1);
+    assert!((app.scroll.y - mid_top).abs() < 0.5, "中部 scroll 应到旧末行");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageUp, false)]);
+    let (back_first, _) = visible_row_window(&app);
+    assert_eq!(back_first, mid_first0, "PageUp 应回到原页首");
+    assert_eq!(app.sel, (10, 0), "PageUp 应保持页内偏移并回原活动格");
+
+    // 底部页：同样从旧末行开始，不跳过中间行。
+    let rows_pos = app.view_axes().1.pos(900);
+    app.scroll = egui::Vec2::new(0.0, rows_pos);
+    app.sel = (910, 0);
+    app.sel_end = (910, 0);
+    let (bot_first0, bot_last0) = visible_row_window(&app);
+    assert_eq!(bot_first0, 900);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
+    let (bot_first1, _) = visible_row_window(&app);
+    assert_eq!(bot_first1, bot_last0, "底部翻页也必须保留一行重叠");
+    assert_eq!(app.sel.0, bot_first1 + 10, "底部页内偏移不变");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageUp, false)]);
+    assert_eq!(visible_row_window(&app).0, bot_first0, "底部 PageUp 回原页首");
+    assert_eq!(app.sel, (910, 0), "底部 PageUp 回原活动格");
+
     // 边界连续隐藏：首端停在最近可见行，末端也不落到隐藏的 1048574/1048575。
     app.wb.sheet_mut(0).rows.set(0, 0.0);
     app.wb.sheet_mut(0).rows.set(1, 0.0);
@@ -1104,6 +1147,80 @@ fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
     assert_eq!(app.wb.styles.get(before.1).format, "#,##0.00");
 }
 
+/// UI-08.3：对话框只切换一条边时，其他边的粗细和颜色不能被改成细灰线。
+#[test]
+fn format_dialog_preserves_border_thickness_and_color_when_other_side_changes() {
+    use sheetcore::style::{Border, BorderSide, CellStyle};
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut base = CellStyle::default_dark();
+    base.border[BorderSide::Left.idx()] = Border { style: 2, color: [200, 10, 10] };
+    base.border[BorderSide::Right.idx()] = Border { style: 4, color: [10, 10, 200] };
+    let id = app.wb.styles.intern(base);
+    app.wb.sheet_mut(0).set_style(0, 0, id);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+
+    app.open_format_dialog();
+    // 用户只加下框；原有左侧粗红线、右侧双蓝线不能被降成细灰线。
+    app.fmt_state.border[BorderSide::Bottom.idx()] = true;
+    app.apply_format_dialog();
+    let st = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0));
+    assert_eq!(st.border[BorderSide::Left.idx()], Border { style: 2, color: [200, 10, 10] });
+    assert_eq!(st.border[BorderSide::Right.idx()], Border { style: 4, color: [10, 10, 200] });
+    assert_eq!(st.border[BorderSide::Top.idx()], Border { style: 0, color: [0, 0, 0] });
+    assert_eq!(st.border[BorderSide::Bottom.idx()], Border { style: 1, color: [0, 0, 0] });
+}
+
+/// nav_rect 不能跨查找跳转、撤销焦点或文档切换残留；否则 Delete 会误清旧矩形。
+#[test]
+fn nav_rect_is_invalidated_by_find_jump_undo_and_document_switch() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("left"));
+    app.wb.sheet_mut(0).set(0, 1, text("right"));
+    app.wb.sheet_mut(0).set(9, 3, text("target"));
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert!(app.nav_rect.is_some(), "选区 Tab 后应记录原始矩形");
+
+    app.find.find = "target".into();
+    app.find_next(false);
+    assert_eq!(app.sel, (9, 3));
+    assert_eq!(app.nav_rect, None, "查找跳转必须清除旧导航矩形");
+    // 给 A1 一个非默认格式；跳转后的 Delete 不能借用旧矩形处理 A1:B2。
+    let style = sheetcore::style::CellStyle {
+        bold: true,
+        ..sheetcore::style::CellStyle::default_dark()
+    };
+    let style_id = app.wb.styles.intern(style);
+    app.wb.sheet_mut(0).set_style(0, 0, style_id);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Delete, false)]);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).bold);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("left".into()));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("right".into()));
+    assert_eq!(app.wb.sheet(0).value(9, 3), Value::Empty);
+
+    // 切文档：park/activate 清空，激活后旧矩形不会跟着进入新文档。
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    let parked = app.park_current();
+    assert_eq!(app.nav_rect, None);
+    app.activate_parked(parked);
+    assert_eq!(app.nav_rect, None, "激活文档后不能恢复上一份文档的导航矩形");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("left".into()));
+
+    // 新建/重置编辑状态也清空。
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.begin_nav_rect();
+    assert!(app.nav_rect.is_some());
+    app.reset_editor_state();
+    assert_eq!(app.nav_rect, None, "reset_editor_state 必须清空导航矩形");
+}
+
 /// UI-08.1：Ribbon 边框方向必须落到左/右/上/下正确下标，内外框不能写反。
 #[test]
 fn ribbon_border_commands_follow_left_right_top_bottom_order() {
@@ -1169,20 +1286,44 @@ fn ribbon_border_commands_follow_left_right_top_bottom_order() {
 fn tab_enter_cycle_inside_selection_and_stop_at_sheet_edges() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
-    app.wb.sheet_mut(0).set(0, 0, text("A1"));
-    app.wb.sheet_mut(0).set(2, 0, text("A3"));
-    app.wb.sheet_mut(0).rows.set(1, 0.0); // 第 2 行隐藏
     app.sel = (0, 0);
-    app.sel_end = (2, 1); // A1:B3
+    app.sel_end = (1, 1); // A1:B2
     app.nav_rect = None;
 
+    // Enter 是逐行扫描，不是只在一列里回绕：A1→A2→B1→B2→A1。
+    for want in [(1, 0), (0, 1), (1, 1), (0, 0)] {
+        run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+        assert_eq!(app.sel, want, "Enter 应按行扫描 A1:B2");
+        assert_eq!(app.sel_rect(), (0, 0, 1, 1), "循环期间原始矩形仍保留");
+    }
+    // Shift+Enter 反向：A1→B2→B1→A2→A1。
+    for want in [(1, 1), (0, 1), (1, 0), (0, 0)] {
+        run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, true)]);
+        assert_eq!(app.sel, want, "Shift+Enter 应按反行扫描");
+    }
+
+    // 隐藏行：A1:B3 隐藏第 2 行，Tab 换行跳过隐藏行；Enter 到末行后换列。
+    app.wb.sheet_mut(0).rows.set(1, 0.0);
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.nav_rect = None;
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
     assert_eq!((app.sel, app.sel_rect()), ((0, 1), (0, 0, 2, 1)));
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
     assert_eq!(app.sel, (2, 0), "Tab 换行时必须跳过隐藏的第 2 行");
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
-    assert_eq!(app.sel, (0, 0), "Enter 到区域末行后回到首行");
-    assert_eq!(app.sel_rect(), (0, 0, 2, 1), "循环期间原始矩形仍保留");
+    assert_eq!(app.sel, (0, 1), "Enter 到末行后应换到下一列，而不是只回绕行");
+
+    // 隐藏列：A1:C2 隐藏 B，Enter 仍按行扫描，跳过隐藏列。
+    app.wb.sheet_mut(0).rows.set(1, 19.0);
+    app.wb.sheet_mut(0).cols.set(1, 0.0);
+    app.sel = (0, 0);
+    app.sel_end = (1, 2);
+    app.nav_rect = None;
+    for want in [(1, 0), (0, 2), (1, 2), (0, 0)] {
+        run_keys(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+        assert_eq!(app.sel, want, "Enter 必须跳过隐藏列 B");
+    }
 
     app.sel = (0, 0);
     app.sel_end = (0, 2); // A1:C1，B 在区域内
@@ -1193,6 +1334,7 @@ fn tab_enter_cycle_inside_selection_and_stop_at_sheet_edges() {
 
     // 编辑提交后也按选区推进，而不是固定下一行。
     app.wb.sheet_mut(0).cols.set(1, 19.0);
+    app.wb.sheet_mut(0).rows.set(1, 0.0); // 恢复第 2 行隐藏
     app.sel = (0, 0);
     app.sel_end = (2, 1);
     app.nav_rect = None;
