@@ -54,6 +54,8 @@ pub enum Node {
     Bool(bool),
     Err(ErrKind),
     Ref(RefExpr),
+    ///  spills  #：A1# 返回锚点动态数组的完整区域
+    Spill(RefExpr),
     Range(RefExpr, RefExpr),
     Func(String, Vec<Node>),
     Unary(bool, Box<Node>), // true = 负号
@@ -81,6 +83,7 @@ enum Tok {
     Semi,
     Colon,
     Bang,
+    Hash,
     Percent,
 }
 
@@ -223,13 +226,17 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                 i += 1;
             }
             '#' => {
-                // 错误字面量 #N/A #REF! 等
+                // 错误字面量 #N/A #REF! 等；单独的 # 是动态数组溢出运算符 A1#。
                 let start = i;
                 i += 1;
                 while i < b.len() && (b[i].is_alphanumeric() || b[i] == '/' || b[i] == '!' || b[i] == '_') {
                     i += 1;
                 }
                 let lit: String = b[start..i].iter().collect();
+                if lit == "#" {
+                    out.push(Tok::Hash);
+                    continue;
+                }
                 let e = match lit.to_ascii_uppercase().as_str() {
                     "#NULL!" => ErrKind::Null,
                     "#DIV/0!" => ErrKind::Div0,
@@ -507,6 +514,9 @@ impl Parser {
                     end.sheet = start.sheet.clone();
                     return Ok(Node::Range(start, end));
                 }
+                if self.eat(&Tok::Hash) {
+                    return Ok(Node::Spill(start));
+                }
                 if self.eats_intersection() {
                     return Ok(Node::Err(ErrKind::Null));
                 }
@@ -611,6 +621,9 @@ impl Parser {
                 end.book = re.book.clone();
                 return Ok(Node::Range(re, end));
             }
+            if self.eat(&Tok::Hash) {
+                return Ok(Node::Spill(re));
+            }
             if self.eats_intersection() {
                 return Ok(Node::Err(ErrKind::Null));
             }
@@ -631,6 +644,9 @@ impl Parser {
                 return Ok(Node::Err(ErrKind::Null));
             }
             return Ok(Node::Range(start, end));
+        }
+        if self.eat(&Tok::Hash) {
+            return Ok(Node::Spill(start));
         }
         if self.eats_intersection() {
             return Ok(Node::Err(ErrKind::Null));
@@ -1084,6 +1100,21 @@ impl<'a> Calc<'a> {
                 match self.sheet_index(r.sheet.as_deref(), si) {
                     Ok(idx) if r.row >= 0 && r.col >= 0 => {
                         self.cell_value(idx, r.row as u32, r.col as u32).scalar()
+                    }
+                    _ => FValue::Error(ErrKind::Ref),
+                }
+            }
+            Node::Spill(r) => {
+                if r.book.is_some() {
+                    return FValue::Error(ErrKind::Ref);
+                }
+                match self.sheet_index(r.sheet.as_deref(), si) {
+                    Ok(idx) if r.row >= 0 && r.col >= 0 => {
+                        match self.cell_value(idx, r.row as u32, r.col as u32) {
+                            FValue::Array(a) => FValue::Array(a),
+                            FValue::Error(e) => FValue::Error(e),
+                            _ => FValue::Error(ErrKind::Ref),
+                        }
                     }
                     _ => FValue::Error(ErrKind::Ref),
                 }
@@ -2075,6 +2106,14 @@ impl<'a> Calc<'a> {
                     let v = self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32).scalar();
                     (1, 1, vec![v])
                 }
+                Err(_) => (0, 0, vec![]),
+            },
+            Node::Spill(re) => match self.sheet_index(re.sheet.as_deref(), si) {
+                Ok(idx) => match self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32) {
+                    FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
+                    FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
+                    v => (1, 1, vec![v]),
+                },
                 Err(_) => (0, 0, vec![]),
             },
             Node::Range(a, b) => match self.range_values(a, b, si) {

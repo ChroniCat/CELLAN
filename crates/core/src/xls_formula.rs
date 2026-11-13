@@ -353,6 +353,7 @@ impl Compiler<'_> {
             }
             Node::Empty => out.push(0x16),
             Node::Ref(r) => self.emit_ref(r, out)?,
+            Node::Spill(_) => bail!("动态数组溢出引用 A1# 不能写入 .xls"),
             Node::Range(a, b) => self.emit_area(a, b, out)?,
             Node::Array(rows, cols, vals) => self.emit_array(*rows, *cols, vals, out)?,
             Node::Name(n) => {

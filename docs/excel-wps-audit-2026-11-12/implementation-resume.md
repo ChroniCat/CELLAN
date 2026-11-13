@@ -1,13 +1,21 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `1019016`（C11.1 整行引用；C06/C10.1 在前）。
+- 分支 `main`（`origin/main`），HEAD `1019016`（C11.1 整行引用；C11.2 工作区未提交；C06/C10.1 在前）。
 - 台账（`scripts/audit_progress.py counts`）：11 已验收 / 8 待验收 / 2 实施中 / 40 待实施；
-  切片 28 已验收 / 20 待验收 / 100 待实施。
-- 当前测试真值（C11.1 修改后重跑）：core 70 bins / 630 passed / 0 failed / 41 ignored，
+  切片 28 已验收 / 21 待验收 / 99 待实施。
+- 当前测试真值（C11.1 修改后重跑）：core 71 bins / 633 passed / 0 failed / 41 ignored，
   CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
-  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10/C11.1 未重跑 GUI。
+  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10/C11 未重跑 GUI。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
+
+## 本轮追加：C11.2 溢出引用（实现完成，待独立复核）
+
+- 词法 `#` 区分错误字面量与 `A1#`；AST 增加 `Node::Spill`；求值从锚点
+  `cell_value` 取得数组，`SUM(A1#)` 随 `SEQUENCE` 扩大/缩小；非数组返回 #REF!。
+- Deps 将 spill 引用标为 dynamic，编辑时全量重算；`.xls` 明确拒绝写入 `A1#`。
+- `crates/core/tests/spill_refs.rs` 3 项；全量 core 71 bins / 633 / 0 / 41；app 200/0。
+- C11.3 隐式交集、C11.4 三维引用尚未实施，C11 父项未验收。
 
 ## 本轮：C11.1 整行引用（实现完成，待独立复核）
 

@@ -1,0 +1,53 @@
+# C11.2 溢出引用 `A1#`：实现与验证
+
+状态：实现完成，待独立复核（2026-11-13 11:05）
+父项：C11 未完成；C11.3/C11.4 未实施。
+
+## 审计基线
+
+`core-requirements.md` C11：`=SUM(A1#)` 当前返回 `Error(Name)`（`evidence/core-results.txt` 第 5 行），
+且要求不能用正则把字符串替换成固定范围。C11.2 只处理动态数组锚点的 `#` 区域引用。
+
+## 根因
+
+词法器把所有 `#` 都当错误字面量处理；AST 没有 `Spill` 节点；求值器没有“锚点数组 → 完整区域”的路径。
+
+## 实现
+
+- `crates/core/src/formula/mod.rs`
+  - 词法器：单独 `#` 产生 `Tok::Hash`，`#N/A`/`#REF!` 等错误字面量保持原逻辑；
+  - AST 新增 `Node::Spill(RefExpr)`；
+  - 解析器在单格引用、带表名引用、外部书名引用后接受 `#`；
+  - `eval_node::Spill` 通过锚点 `cell_value` 取得公式的 `FValue::Array`，返回完整数组；
+    锚点不是动态数组时返回 `#REF!`；外部簿溢出引用暂不支持；
+  - `grid_of` 同步支持 Spill，查找函数可看到完整数组；
+- `crates/core/src/formula/deps.rs`
+  - `Spill` 登记锚点单元格，并标为 dynamic，编辑时保守全量重算（区域大小会变）；
+- `crates/core/src/xls_formula.rs`
+  - `.xls` BIFF 不支持 `A1#` 时明确报错，不静默写坏公式。
+
+## 自动化验证
+
+命令：`cargo test -p sheetcore --offline --test spill_refs`
+结果：3 passed / 0 failed。
+
+- `spill_reference_tracks_anchor_array_and_shrinks`：
+  A1=`SEQUENCE(3,2)`，C1/D1=`SUM(A1#)`/`SUM(Data!A1#)`=21；
+  `=A1#` 返回 3×2 数组且 A3=5；
+  缩小为 `SEQUENCE(2,1)` 后 C1=3、旧 A3 被清；
+  再扩大为 `SEQUENCE(4,1)` 后 C1=10、A4=4。
+- `spill_on_non_array_is_ref_error`：A1 是普通值 5，`SUM(A1#)` 返回 `#REF!`。
+- `spill_ref_moves_on_row_insert_and_dependency_is_dynamic`：
+  `refs::rewrite("=SUM(A1#)", 插行)` -> `=SUM(A2#)`；Deps 要求全量重算。
+
+全量回归：
+- `cargo test -p sheetcore --offline` -> 71 bins / 633 passed / 0 failed / 41 ignored / CORE_EXIT=0
+  （日志 `c11-spill/core.txt`）。
+- `cargo test -p app --offline --bin app` -> 200 passed / 0 failed / APP_EXIT=0
+  （日志 `c11-spill/app.txt`）。
+
+## 未执行/边界
+
+- 未做 Excel/WPS 实机 `A1#` 对拍；父项 C11 的实机验收仍未完成。
+- `.xls` 明确拒绝溢出引用，未实现 BIFF 动态数组编码。
+- 未实现 C11.3 隐式交集、C11.4 三维引用。

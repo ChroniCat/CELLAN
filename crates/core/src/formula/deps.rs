@@ -94,7 +94,7 @@ fn sheet_index(wb: &crate::Workbook, name: Option<&str>, cur: usize) -> usize {
 
 fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
     match node {
-        Node::Ref(re) => {
+        Node::Ref(re) | Node::Spill(re) => {
             // 外部工作簿的引用不参与本簿依赖图
             if re.book.is_some() {
                 return;
@@ -138,6 +138,7 @@ pub fn refs_of(wb: &crate::Workbook, si: usize, formula: &str) -> Vec<Rect> {
 fn dynamic(node: &Node, include_volatile: bool) -> bool {
     match node {
         Node::Name(_) => true,
+        Node::Spill(_) => true,
         Node::Func(name, args) => matches!(name.as_str(), "INDIRECT" | "OFFSET")
             || (include_volatile && matches!(name.as_str(), "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"))
             || args.iter().any(|n| dynamic(n, include_volatile)),

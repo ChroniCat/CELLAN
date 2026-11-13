@@ -2604,29 +2604,35 @@
       "source": "core-requirements.md",
       "heading": "C11 P1 常用引用语法",
       "status": "实施中",
-      "acceptance": "C11.1 已完成整行引用规范化/求值/依赖/结构编辑并有自动化证据；C11.2–C11.4 未实施，父项待验收。",
+      "acceptance": "C11.1/C11.2 已完成并有自动化证据；C11.3/C11.4 未实施，父项待验收。",
       "files": [
         "crates/core/src/lib.rs",
-        "crates/core/tests/whole_row_refs.rs"
+        "crates/core/src/formula/mod.rs",
+        "crates/core/src/formula/deps.rs",
+        "crates/core/src/xls_formula.rs",
+        "crates/core/tests/whole_row_refs.rs",
+        "crates/core/tests/spill_refs.rs"
       ],
       "commits": [
         "1019016"
       ],
       "commands": [
-        "cargo test -p sheetcore --offline --test whole_row_refs -> 4 passed / 0 failed",
-        "cargo test -p sheetcore --offline -> 630 passed / 0 failed / 41 ignored",
+        "cargo test -p sheetcore --offline --test whole_row_refs -> 4 passed",
+        "cargo test -p sheetcore --offline --test spill_refs -> 3 passed",
+        "cargo test -p sheetcore --offline -> 633 passed / 0 failed / 41 ignored",
         "cargo test -p app --offline --bin app -> 200 passed / 0 failed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row-refs.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row/core.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row/app.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill-refs.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/core.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/app.txt"
       ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "复核 C11.1；之后实施 C11.2 溢出引用 #",
-      "updated_utc": "2026-11-13T10:45:00Z",
+      "next": "复核 C11.2；之后实施 C11.3 隐式交集 @",
+      "updated_utc": "2026-11-13T11:05:00Z",
       "slices": [
         {
           "id": "C11.1",
@@ -2664,17 +2670,30 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "A1# 随源数组扩大/缩小；锚点非数组返回 #REF!；结构化/字符串不受影响；依赖和插行改写正确；不写坏 .xls。",
+          "files": [
+            "crates/core/src/formula/mod.rs",
+            "crates/core/src/formula/deps.rs",
+            "crates/core/src/xls_formula.rs",
+            "crates/core/tests/spill_refs.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test spill_refs -> 3 passed",
+            "cargo test -p sheetcore --offline -> 633 passed / 0 failed / 41 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-whole-row-refs.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill-refs.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/core.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c11-spill/app.txt"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T11:05:00Z"
         },
         {
           "id": "C11.3",
