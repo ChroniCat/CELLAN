@@ -4352,7 +4352,7 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
             "crates/core/src/print.rs"
@@ -4363,14 +4363,14 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt"
           ],
           "not_done": [
-            "自动分页断点与 Excel 差 2 行（默认行高 19px vs 13.5pt）",
-            "PDF 字体子集未裁剪（4.4MB vs 80KB）",
-            "页眉页脚/合并/图片/图表样本未纳入"
+            "WPS PDF 未对拍（属 QA-09.3）",
+            "PDF 位图渲染目视未做",
+            "字体子集 4.4MB 未裁剪"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:44:23Z"
+          "updated_utc": "2026-11-13T22:00:52Z"
         },
         {
           "id": "QA-09.2",

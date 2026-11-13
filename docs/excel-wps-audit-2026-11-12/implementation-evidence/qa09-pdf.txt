@@ -57,3 +57,12 @@ sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
 - 默认改为 `fit_width: 0`；单测 `fit_to_page_shrinks_scale` 显式设 `fit_width = 1`。
 - print.xlsx 现在 `fit=false, scale=100`，仍 2 页；Excel 断点 48、本项目 45，
   行高/可用高度差异仍未定，QA-09.1 继续实施中。
+
+## QA-09.1 分页差异已关闭（2026-11-14）
+- 根因：项目默认行高 19px(14.25pt)，本机 Excel 对该工作簿的默认行高为 13.5pt=18px。
+  改 `DEFAULT_ROW_H=18.0` 后，print.xlsx 分页为 (2,47)/(48,59)，
+  即第 1 页 Excel 行 1..48、第 2 页 49..60，与 Excel `HPageBreaks` 断点 **$A$49 完全一致**。
+- 重新导出 `work/qa09/ours3.pdf`：2 页；第 1 页尾行 48，第 2 页首行 49，
+  两页均有标题行 2026 与页码 1/2、2/2；120/1.5/180.00、TRUE、行 2..60 数值齐全。
+- 未改动原始 xlsx（只读导出）；纸张 A4 纵向、页边距 0.75/0.75/1/1 与设置一致。
+- 仍缺：WPS PDF 对拍（QA-09.3）、PDF 页面位图渲染目视、字体子集体积优化。

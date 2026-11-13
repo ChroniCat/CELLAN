@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 /// Excel 96 DPI 的默认列宽（54 pt = 72 px）
 pub const DEFAULT_COL_W: f32 = 72.0;
 /// Excel 96 DPI 的默认行高（14.25 pt = 19 px）
-pub const DEFAULT_ROW_H: f32 = 19.0;
+pub const DEFAULT_ROW_H: f32 = 18.0;
 
 #[derive(Clone, Debug)]
 pub struct Axis {
