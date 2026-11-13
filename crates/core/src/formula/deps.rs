@@ -132,7 +132,7 @@ fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
 }
 
 pub fn refs_of(wb: &crate::Workbook, si: usize, formula: &str) -> Vec<Rect> {
-    dependencies(wb, si, formula).0
+    dependencies(wb, si, 0, formula).0
 }
 
 fn dynamic(node: &Node, include_volatile: bool) -> bool {
@@ -147,10 +147,10 @@ fn dynamic(node: &Node, include_volatile: bool) -> bool {
     }
 }
 
-fn dependencies(wb: &crate::Workbook, si: usize, formula: &str) -> (Vec<Rect>, bool, bool) {
+fn dependencies(wb: &crate::Workbook, si: usize, row: u32, formula: &str) -> (Vec<Rect>, bool, bool) {
     let raw = formula.strip_prefix('=').unwrap_or(formula);
     // 与求值入口保持相同的结构化引用展开和 OOXML/整列规范化。
-    let expanded = crate::table::expand_structured(wb, si, raw).unwrap_or_else(|| raw.to_owned());
+    let expanded = crate::table::expand_structured_at(wb, si, Some(row), raw).unwrap_or_else(|| raw.to_owned());
     let body = crate::normalize_formula(&expanded);
     let mut out = Vec::new();
     if let Ok(node) = super::parse(&body) {
@@ -168,7 +168,7 @@ impl Deps {
             for (cref, cell) in sheet.iter() {
                 if let Some(f) = cell.formula.as_deref() {
                     let key = (si, cref.row, cref.col);
-                    let (rects, dynamic, runtime) = dependencies(wb, si, f);
+                    let (rects, dynamic, runtime) = dependencies(wb, si, key.1, f);
                     if dynamic {
                         deps.dynamic.insert(key);
                     }
@@ -211,7 +211,7 @@ impl Deps {
             }
         }
         if let Some(f) = f {
-            let (rects, dynamic, runtime) = dependencies(wb, key.0, &f);
+            let (rects, dynamic, runtime) = dependencies(wb, key.0, key.1, &f);
             if dynamic {
                 self.dynamic.insert(key);
             }

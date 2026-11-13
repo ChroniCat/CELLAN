@@ -971,7 +971,7 @@ impl<'a> Calc<'a> {
             }
             let raw = f.strip_prefix('=').unwrap_or(f).to_string();
             // 结构化引用：Table1[列] → A1 区域
-            let expanded = crate::table::expand_structured(self.wb, si, &raw).unwrap_or(raw);
+            let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), &raw).unwrap_or(raw);
             let normalized = crate::normalize_formula(&expanded);
             let body = normalized.as_str();
             if !self.visiting.insert(key) {
@@ -1065,7 +1065,7 @@ impl<'a> Calc<'a> {
                     let text = body.trim_start_matches('=').to_string();
                     if !text.is_empty() && !text.eq_ignore_ascii_case(n) {
                         let expanded =
-                            crate::table::expand_structured(self.wb, si2, &text).unwrap_or(text);
+                            crate::table::expand_structured_at(self.wb, si2, Some(self.cur.0), &text).unwrap_or(text);
                         if let Ok(node) = parse(&expanded) {
                             return self.eval_node(&node, si2);
                         }
@@ -1089,7 +1089,17 @@ impl<'a> Calc<'a> {
                 }
             }
             Node::Range(a, b) => match self.range_values(a, b, si) {
-                Ok(Arg::Range { values, .. }) => values.first().cloned().unwrap_or(FValue::Empty),
+                Ok(Arg::Range { values, rows, cols }) => {
+                    if rows == 1 && cols == 1 {
+                        values.first().cloned().unwrap_or(FValue::Empty)
+                    } else {
+                        FValue::Array(std::rc::Rc::new(value::Array::new(
+                            rows,
+                            cols,
+                            (*values).clone(),
+                        )))
+                    }
+                }
                 Ok(_) => FValue::Error(ErrKind::Value),
                 Err(e) => FValue::Error(e),
             },

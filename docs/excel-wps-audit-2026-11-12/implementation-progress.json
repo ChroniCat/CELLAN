@@ -2501,8 +2501,8 @@
       "scope": "core/table.rs, refs.rs, structural.rs",
       "source": "core-requirements.md",
       "heading": "C10 P1 完整结构化引用与表格计算列",
-      "status": "待实施",
-      "acceptance": "",
+      "status": "实施中",
+      "acceptance": "父项未完成：结构化引用完整语法/当前行/区域已实现（C10.1 待复核）；计算列、插入行扩展、字段重命名（C10.2）与转换区域保存往返（C10.3）未实施。",
       "files": [],
       "commits": [],
       "commands": [],
@@ -2510,8 +2510,8 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "C10.2 列稳定标识、计算列自动填充、插入行自动扩展",
+      "updated_utc": "2026-11-13T10:10:00Z",
       "slices": [
         {
           "id": "C10.1",
@@ -2519,17 +2519,28 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C10 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "审计原始两条失败公式恢复：=Sales[Amount] 返回 10/20 两行数组；=SUM(Sales[[#Data],[Amount]])=30；[#Headers]/[#Totals]/[#All]/列区间/[@] 展开正确；引号内文本与工作表名不被改写。",
+          "files": [
+            "crates/core/src/table.rs",
+            "crates/core/src/formula/mod.rs",
+            "crates/core/src/formula/deps.rs",
+            "crates/core/tests/structured_references.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test structured_references => 9 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline => 625 passed / 0 failed / 41 ignored",
+            "cargo test -p app --offline --bin app => 200 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "等待独立复核；父项继续 C10.2",
+          "updated_utc": "2026-11-13T10:10:00Z"
         },
         {
           "id": "C10.2",
@@ -2546,7 +2557,7 @@
           "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "实施列稳定标识/计算列自动填充/插入行扩展",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {
@@ -2564,7 +2575,7 @@
           "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "实施转换区域与保存重开往返",
           "updated_utc": "2026-11-12T10:28:37Z"
         }
       ]

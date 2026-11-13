@@ -1,0 +1,65 @@
+# C10.1 结构化引用语法与求值
+
+状态：实现完成，待独立复核（父项 C10 未完成，C10.2/C10.3 未实施）
+日期：2026-11-13
+
+## 审计基线（修复前）
+
+`docs/excel-wps-audit-2026-11-12/evidence/core-results.txt` 中同一合成 Sales 表（Amount=10,20）：
+
+```text
+=SUM(Sales[Amount]) => Number(30.0)          # 已通过，作为回归基线
+=Sales[Amount] => Error(Value)              # 失败
+=SUM(Sales[[#Data],[Amount]]) => Error(Value) # 失败
+="Sales[Amount]" => Text("A2:A3")           # 引号内文本被错误改写
+```
+
+根因：`table.rs::expand_segment` 只识别 `标识符[列名]`，且要求 `start > 0`，所以公式体以表名开头时不展开；只取方括号内的扁平列名，不识别 `[#Data]`、`[#Headers]`、`[#Totals]`、`[#All]`、`[@列]`、`[#This Row]` 和 `[列1]:[列2]`。此外顶层 `Node::Range` 只取第一个值，`=Sales[Amount]` 即使展开也退化为标量。
+
+## 实现
+
+修改：
+
+- `crates/core/src/table.rs`
+  - 新增 `expand_structured_at(wb, si, cur_row, body)`，保留无行号兼容入口 `expand_structured`。
+  - 结构化引用读取允许表名位于公式体开头；表名标识符支持 `.`、`_`、`\`。
+  - 新增说明符解析：`Data`/`Headers`/`Totals`/`All`、`@`/`#This Row`、列区间、含空格/逗号/百分号的列名。
+  - 数据区、标题区、汇总区按 `header_row`/`totals_row` 和表格 `ref` 计算；跨表输出 `'工作表'!区域`。
+  - 非法区域/列返回 `#REF!`，当前行不在数据区返回 `#VALUE!`；找不到表名仍保留原文交给解析器报 `#NAME?`。
+- `crates/core/src/formula/mod.rs`
+  - 公式求值按当前单元格行调用 `expand_structured_at`，让 `[@...]` 每行引用自身。
+  - 顶层区域 `Node::Range` 返回二维 `FValue::Array`（1×1 仍为标量），使 `=Sales[Amount]` 得到 10/20 数组，而不是只取第一个值。
+- `crates/core/src/formula/deps.rs`
+  - 依赖扫描按公式所在行展开当前行引用；`Deps::build`/`update_cell` 传入单元格 row。
+
+## 自动化验证（当前树实测）
+
+```text
+cargo test -p sheetcore --offline --test structured_references
+9 passed; 0 failed; 0 ignored
+
+cargo test -p sheetcore --offline
+69 test binaries
+625 passed; 0 failed; 41 ignored
+
+cargo test -p app --offline --bin app
+200 passed; 0 failed; 0 ignored
+```
+
+原始日志：`implementation-evidence/c10-structured/core.txt`、`app.log`。
+
+`structured_references` 覆盖：
+
+1. `Sales[Amount]` 在公式体开头展开为 `B2:B4`；`SUM(Sales[Amount])` 为 `SUM(B2:B4)`。
+2. `[#Data]`、`[#Headers]`、`[#Totals]`、`[#All]` 和列区间 `[[Amount]:[Tax]]` 展开为正确区域。
+3. 引号内 `"Sales[Amount]"` 和工作表名 `'Sales'!A1` 不被展开。
+4. `[@Amount]`、`[[#This Row],[Amount]]`、`[@]` 按传入公式行取当前行；汇总行返回 `#VALUE!`。
+5. 跨表表格引用带 `'Data'!` 前缀。
+6. 含空格、逗号、百分号的列名不被逗号/空格拆分。
+7. 审计原始两行样本：`=Sales[Amount]` 返回 2×1 数组 `10,20`；`=SUM(Sales[Amount])` 和 `=SUM(Sales[[#Data],[Amount]])` 都为 `30`。
+
+## 未完成/边界
+
+- C10.2：列稳定标识、计算列自动填充、插入行自动扩展、列重命名更新公式尚未实施。
+- C10.3：转换区域、保存重开和 Excel/WPS 三方对拍尚未实施。
+- 当前只验证本实现求值；没有把 C10.1 宣称为父项 C10 完成。

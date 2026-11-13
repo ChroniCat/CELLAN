@@ -353,8 +353,25 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
 
 /// 结构化引用展开：`Table1[金额]` → `D2:D9`
 ///
-/// 只处理本表/跨表两种常见写法；找不到对应表格或列就原样返回（让解析器报错）。
+/// 支持 Excel 的结构化引用主体：
+/// - 裸列：`Table[金额]`（默认数据区，不含标题/汇总）
+/// - 区域：`Table[[#Data],[金额]]`、`#Headers`、`#Totals`、`#All`
+/// - 当前行：`Table[@金额]`、`Table[[#This Row],[金额]]`
+/// - 列区间：`Table[[金额]:[税额]]`
+///
+/// 找不到表格时保留原文（让解析器报 #NAME?）；找到表格但列/区域非法时
+/// 返回 Excel 的错误值文本（`#REF!`/`#VALUE!`），不能静默改成别的区域。
 pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
+    expand_structured_at(wb, si, None, body)
+}
+
+/// 带当前公式行的结构化引用展开。`cur_row` 只影响 `@` / `#This Row`。
+pub fn expand_structured_at(
+    wb: &crate::model::Workbook,
+    si: usize,
+    cur_row: Option<u32>,
+    body: &str,
+) -> Option<String> {
     if !body.contains('[') {
         return None;
     }
@@ -367,7 +384,7 @@ pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> 
             out.push_str(seg);
             continue;
         }
-        match expand_segment(wb, si, seg) {
+        match expand_segment_at(wb, si, cur_row, seg) {
             Some(s) => {
                 out.push_str(&s);
                 changed = true;
@@ -379,7 +396,12 @@ pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> 
 }
 
 /// 只展开一段**引号外**文本里的结构化引用。
-fn expand_segment(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
+fn expand_segment_at(
+    wb: &crate::model::Workbook,
+    si: usize,
+    cur_row: Option<u32>,
+    body: &str,
+) -> Option<String> {
     if !body.contains('[') {
         return None;
     }
@@ -389,16 +411,19 @@ fn expand_segment(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<
     let mut i = 0usize;
     while i < chars.len() {
         let ch = chars[i];
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '\\' {
             let start = i;
             while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                && (chars[i].is_ascii_alphanumeric()
+                    || chars[i] == '_'
+                    || chars[i] == '.'
+                    || chars[i] == '\\')
             {
                 i += 1;
             }
-            // 前面紧挨着字母/数字说明是长标识符的一部分，不动
             let name: String = chars[start..i].iter().collect();
-            if i < chars.len() && chars[i] == '[' && start > 0 {
+            // 表名可以出现在公式体开头（`Sales[Amount]`），不能要求 start > 0。
+            if i < chars.len() && chars[i] == '[' {
                 let mut j = i;
                 let mut depth = 0i32;
                 while j < chars.len() {
@@ -414,29 +439,11 @@ fn expand_segment(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<
                 }
                 if j < chars.len() {
                     let inner: String = chars[i + 1..j].iter().collect();
-                    let col = inner.trim().trim_start_matches('[').trim_end_matches(']').trim();
                     if let Some((tbl, on_si)) = find_table(wb, si, &name) {
-                        if let Some(idx) = tbl
-                            .columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(col))
-                        {
-                            let (r1, c1, r2, _) = tbl.range;
-                            let head = if tbl.header_row { 1 } else { 0 };
-                            let tail = if tbl.totals_row { 1 } else { 0 };
-                            let rr1 = r1 + head;
-                            let rr2 = r2.saturating_sub(tail);
-                            let colc = c1 + idx as u32;
-                            let rng = format!("{}{}:{}{}", col_label(colc), rr1 + 1, col_label(colc), rr2 + 1);
-                            if on_si == si {
-                                out.push_str(&rng);
-                            } else {
-                                out.push_str(&format!("'{}'!{rng}", wb.sheets[on_si].name));
-                            }
-                            changed = true;
-                            i = j + 1;
-                            continue;
-                        }
+                        out.push_str(&expand_table_spec(wb, si, on_si, cur_row, &tbl, &inner));
+                        changed = true;
+                        i = j + 1;
+                        continue;
                     }
                 }
             }
@@ -447,6 +454,244 @@ fn expand_segment(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<
         i += 1;
     }
     if changed { Some(out) } else { None }
+}
+
+fn sheet_prefix(wb: &crate::model::Workbook, on_si: usize, si: usize) -> String {
+    if on_si == si {
+        String::new()
+    } else {
+        format!("'{}'!", wb.sheets[on_si].name.replace('\'', "''"))
+    }
+}
+
+fn ref_text(r1: u32, c1: u32, r2: u32, c2: u32) -> String {
+    if r1 == r2 && c1 == c2 {
+        format!("{}{}", col_label(c1), r1 + 1)
+    } else {
+        format!(
+            "{}{}:{}{}",
+            col_label(c1),
+            r1 + 1,
+            col_label(c2),
+            r2 + 1
+        )
+    }
+}
+
+fn strip_outer_brackets(s: &str) -> &str {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('[') && t.ends_with(']') {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
+/// 按顶层逗号切分说明符；列名里的逗号在 `[...]` 内，不切。
+fn split_specs(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, ch) in chars.iter().enumerate() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let piece: String = chars[start..i].iter().collect();
+                if !piece.trim().is_empty() {
+                    out.push(piece);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < chars.len() {
+        let piece: String = chars[start..].iter().collect();
+        if !piece.trim().is_empty() {
+            out.push(piece);
+        }
+    }
+    out
+}
+
+fn split_colon(s: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut depth = 0i32;
+    for (i, ch) in chars.iter().enumerate() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ':' if depth == 0 => {
+                let a: String = chars[..i].iter().collect();
+                let b: String = chars[i + 1..].iter().collect();
+                return Some((a, b));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn expand_table_spec(
+    wb: &crate::model::Workbook,
+    si: usize,
+    on_si: usize,
+    cur_row: Option<u32>,
+    tbl: &Table,
+    inner: &str,
+) -> String {
+    let (r1, c1, r2, c2) = tbl.range;
+    let data_start = if tbl.header_row { r1 + 1 } else { r1 };
+    let data_end = if tbl.totals_row {
+        r2.saturating_sub(1)
+    } else {
+        r2
+    };
+    let col_count = (c2.saturating_sub(c1) + 1) as usize;
+    let mut area: Option<&str> = None;
+    let mut this_row = false;
+    let mut col_start: Option<usize> = None;
+    let mut col_end: Option<usize> = None;
+    let mut bad = false;
+
+    let specs = split_specs(inner);
+    if specs.is_empty() {
+        return "#REF!".to_string();
+    }
+    for raw in specs {
+        let mut tok = raw.trim().to_string();
+        if let Some(rest) = tok.strip_prefix('@') {
+            this_row = true;
+            tok = rest.trim().to_string();
+        }
+        // 列区间 [Col1]:[Col2] 的冒号在方括号外，必须先切冒号，
+        // 否则整串会被误当成一个 `[... ]` 说明符。
+        if let Some((a, b)) = split_colon(&tok) {
+            let ca = strip_outer_brackets(&a).trim().to_string();
+            let cb = strip_outer_brackets(&b).trim().to_string();
+            if ca.is_empty() || cb.is_empty() {
+                bad = true;
+                continue;
+            }
+            let ia = tbl
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&ca));
+            let ib = tbl
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&cb));
+            match (ia, ib) {
+                (Some(x), Some(y)) => {
+                    col_start = Some(x.min(y));
+                    col_end = Some(x.max(y));
+                }
+                _ => bad = true,
+            }
+            continue;
+        }
+        // 普通说明符去掉一层方括号：[#Data] / [Amount] / [@[Amount]]
+        if tok.starts_with('[') && tok.ends_with(']') {
+            tok = strip_outer_brackets(&tok).to_string();
+        }
+        let up = tok.to_ascii_uppercase();
+        if up == "#THIS ROW" {
+            this_row = true;
+            continue;
+        }
+        if up.starts_with('#') {
+            let a = match up.as_str() {
+                "#DATA" => "data",
+                "#HEADERS" => "headers",
+                "#TOTALS" => "totals",
+                "#ALL" => "all",
+                _ => {
+                    bad = true;
+                    continue;
+                }
+            };
+            if area.is_some() && area != Some(a) {
+                bad = true;
+            } else {
+                area = Some(a);
+            }
+            continue;
+        }
+        if tok.is_empty() {
+            // `Table[@]` / `Table[[#This Row]]`：当前行所有列，允许没有列名。
+            if this_row {
+                continue;
+            }
+            bad = true;
+            continue;
+        }
+        let idx = tbl.columns.iter().position(|c| c.eq_ignore_ascii_case(&tok));
+        match idx {
+            Some(x) => {
+                if col_start.is_some() {
+                    bad = true;
+                } else {
+                    col_start = Some(x);
+                    col_end = Some(x);
+                }
+            }
+            None => bad = true,
+        }
+    }
+
+    if bad {
+        return "#REF!".to_string();
+    }
+    if this_row && area.is_some() && area != Some("data") {
+        return "#REF!".to_string();
+    }
+
+    let (cs, ce) = match (col_start, col_end) {
+        (Some(a), Some(b)) => (a, b),
+        _ => (0, col_count.saturating_sub(1) as usize),
+    };
+    if col_count == 0 || cs >= col_count || ce >= col_count {
+        return "#REF!".to_string();
+    }
+    let abs_c1 = c1 + cs as u32;
+    let abs_c2 = c1 + ce as u32;
+    let prefix = sheet_prefix(wb, on_si, si);
+
+    let (out_r1, out_r2) = if this_row {
+        let Some(row) = cur_row else {
+            return "#VALUE!".to_string();
+        };
+        if row < data_start || row > data_end {
+            return "#VALUE!".to_string();
+        }
+        (row, row)
+    } else {
+        match area.unwrap_or("data") {
+            "all" => (r1, r2),
+            "headers" => {
+                if !tbl.header_row {
+                    return "#REF!".to_string();
+                }
+                (r1, r1)
+            }
+            "totals" => {
+                if !tbl.totals_row || r2 <= r1 {
+                    return "#REF!".to_string();
+                }
+                (r2, r2)
+            }
+            "data" => {
+                if data_start > data_end {
+                    return "#REF!".to_string();
+                }
+                (data_start, data_end)
+            }
+            _ => return "#REF!".to_string(),
+        }
+    };
+    format!("{prefix}{}", ref_text(out_r1, abs_c1, out_r2, abs_c2))
 }
 
 fn find_table(
