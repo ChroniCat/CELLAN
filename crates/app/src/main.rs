@@ -5762,6 +5762,7 @@ impl SheetApp {
         }
         let mut budget = 50_000usize;
         let mut calc = sheetcore::formula::Calc::new(&self.wb);
+        let mut config_bad: Option<String> = None;
         for dv in dv_list.iter() {
             for (r1, c1, r2, c2) in dv.ranges.iter().copied() {
                 for r in r1..=r2 {
@@ -5776,18 +5777,34 @@ impl SheetApp {
                             continue;
                         }
                         let ok = sheetcore::dv::validate_wb(&self.wb, si, dv, &cell.value, r, c, |f, rr, cc| {
-                            let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+                            let (ar, ac) = sheetcore::dv::range_anchor(dv, rr, cc);
+                            let shifted = sheetcore::cf::shift_formula(
+                                f.trim_start_matches('='),
+                                rr.saturating_sub(ar),
+                                cc.saturating_sub(ac),
+                            );
                             match sheetcore::formula::parse(&shifted) {
                                 Ok(node) => calc.eval_node(&node, si),
-                                Err(_) => sheetcore::formula::FValue::Bool(true),
+                                Err(e) => {
+                                    config_bad = Some(format!("公式阈值无法解析：{f}（{e}）"));
+                                    sheetcore::formula::FValue::Error(sheetcore::formula::ErrKind::Value)
+                                }
                             }
                         });
+                        if dv.kind == sheetcore::dv::DvKind::List
+                            && sheetcore::dv::list_items_wb(&self.wb, si, dv).is_none()
+                        {
+                            config_bad = Some(format!("列表来源无法解析：{}", dv.f1));
+                        }
                         if !ok {
                             self.invalid_cells.insert((r, c));
                         }
                     }
                 }
             }
+        }
+        if let Some(msg) = config_bad {
+            self.status = format!("数据验证配置无效：{msg}");
         }
     }
 
@@ -6984,15 +7001,33 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         Value::parse_input(&ed.buf)
                     };
                     let mut calc = sheetcore::formula::Calc::new(&self.wb);
+                    let mut config_err: Option<String> = None;
+                    if dv.kind == sheetcore::dv::DvKind::List
+                        && sheetcore::dv::list_items_wb(&self.wb, self.sheet_idx, dv).is_none()
+                    {
+                        config_err = Some(format!("列表来源无法解析：{}", dv.f1));
+                    }
                     let ok = sheetcore::dv::validate_wb(&self.wb, self.sheet_idx, dv, &probe, r, c, |f, rr, cc| {
-                        let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+                        let (ar, ac) = sheetcore::dv::range_anchor(dv, rr, cc);
+                        let shifted = sheetcore::cf::shift_formula(
+                            f.trim_start_matches('='),
+                            rr.saturating_sub(ar),
+                            cc.saturating_sub(ac),
+                        );
                         match sheetcore::formula::parse(&shifted) {
                             Ok(node) => calc.eval_node(&node, self.sheet_idx),
-                            Err(_) => sheetcore::formula::FValue::Bool(true),
+                            Err(e) => {
+                                config_err = Some(format!("公式阈值无法解析：{f}（{e}）"));
+                                sheetcore::formula::FValue::Error(sheetcore::formula::ErrKind::Value)
+                            }
                         }
                     });
                     if !ok {
-                        rejected = Some(sheetcore::dv::error_text(dv));
+                        let msg = match config_err {
+                            Some(e) => format!("数据验证配置无效：{e}"),
+                            None => sheetcore::dv::error_text(dv),
+                        };
+                        rejected = Some(msg);
                     }
                 }
             }

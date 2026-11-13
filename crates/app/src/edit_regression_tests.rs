@@ -2363,6 +2363,94 @@ fn clicking_another_cell_commits_the_draft() {
 }
 
 #[test]
+fn dv_anchor_handles_mixed_refs_and_bad_formula_is_reported() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = &mut app.wb.sheets[0];
+        sh.set(0, 0, number(10.0));
+        sh.set(1, 0, number(20.0));
+        sh.set(2, 0, number(30.0));
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 2, 2, 2)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::GreaterEq,
+            f1: "=$A1".into(),
+            ..Default::default()
+        });
+        sh.dv_dirty = true;
+    }
+    ui_frame(&mut app, &ctx, vec![]);
+    app.sel = (1, 2);
+    app.editing = Some(EditState::new("15".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 2), Value::Number(15.0), "C2 应以范围锚点比较 A1");
+    app.sel = (2, 2);
+    app.editing = Some(EditState::new("25".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(2, 2), Value::Number(25.0), "C3 应以范围锚点比较 A2");
+
+    {
+        let sh = &mut app.wb.sheets[0];
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 3, 1, 3)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::GreaterEq,
+            f1: "=1+".into(),
+            ..Default::default()
+        });
+        sh.dv_dirty = true;
+    }
+    app.doc_gen = app.doc_gen.wrapping_add(1);
+    app.sel = (1, 3);
+    app.editing = Some(EditState::new("2".into()));
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert_eq!(app.wb.sheet(0).value(1, 3), Value::Empty, "坏阈值不得当 1 放行");
+    assert!(app.status.contains("配置无效"), "应显示配置失败诊断：{}", app.status);
+}
+
+#[test]
+fn dv_scan_uses_range_anchor_and_reports_config_errors() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    {
+        let sh = &mut app.wb.sheets[0];
+        sh.set(0, 0, number(10.0));
+        sh.set(1, 0, number(20.0));
+        sh.set(1, 2, number(15.0));
+        sh.set(2, 2, number(25.0));
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 2, 2, 2)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::GreaterEq,
+            f1: "=$A1".into(),
+            ..Default::default()
+        });
+        sh.dv_dirty = true;
+    }
+    app.compute_invalid();
+    assert!(!app.invalid_cells.contains(&(1, 2)), "C2 不应比 A2");
+    assert!(!app.invalid_cells.contains(&(2, 2)), "C3 不应比 A3");
+
+    {
+        let sh = &mut app.wb.sheets[0];
+        sh.set(1, 3, number(2.0));
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 3, 1, 3)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::GreaterEq,
+            f1: "=1+".into(),
+            ..Default::default()
+        });
+        sh.dv_dirty = true;
+    }
+    app.doc_gen = app.doc_gen.wrapping_add(1);
+    app.compute_invalid();
+    assert!(app.invalid_cells.contains(&(1, 3)), "坏阈值应标记为不通过");
+    assert!(app.status.contains("配置无效"), "scan 应显示配置失败：{}", app.status);
+}
+
+#[test]
 fn rejected_validation_keeps_draft_and_position() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);

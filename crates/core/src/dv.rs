@@ -153,6 +153,15 @@ pub fn find<'a>(list: &'a [DataValidation], r: u32, c: u32) -> Option<&'a DataVa
     list.iter().find(|d| in_ranges(&d.ranges, r, c))
 }
 
+/// 数据验证公式的基准是规则范围左上角；相对/混合引用要按这个基准平移。
+pub fn range_anchor(dv: &DataValidation, r: u32, c: u32) -> (u32, u32) {
+    dv.ranges
+        .iter()
+        .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+        .map(|(r1, c1, _, _)| (*r1, *c1))
+        .unwrap_or((0, 0))
+}
+
 /// 序列来源：内联 "甲,乙" 或引用区域
 pub fn list_items(dv: &DataValidation, sheet: &Sheet) -> Vec<String> {
     let src = dv.f1.trim();
@@ -199,31 +208,37 @@ pub fn list_items_wb(wb: &crate::model::Workbook, si: usize, dv: &DataValidation
     }
     let mut expr = src.trim().trim_start_matches('=').trim();
     // 命名区域（工作簿级或本表级）；名称不区分大小写。
+    // 本表级优先于工作簿级，不能按定义顺序碰巧选到全局同名项。
     let has_sheet = expr.contains('!');
     if !has_sheet && !expr.contains(':') {
-        if let Some((_, _, target)) = wb
-            .names
-            .iter()
-            .rev()
-            .find(|(n, scope, _)| n.eq_ignore_ascii_case(expr) && (scope.is_none() || *scope == Some(si)))
-        {
-            expr = target.trim();
+        let mut global: Option<&str> = None;
+        for (n, scope, target) in wb.names.iter().rev() {
+            if !n.eq_ignore_ascii_case(expr) {
+                continue;
+            }
+            if *scope == Some(si) {
+                expr = target.trim();
+                global = None;
+                break;
+            }
+            if scope.is_none() && global.is_none() {
+                global = Some(target.trim());
+            }
+        }
+        if let Some(target) = global {
+            expr = target;
         }
     }
     if let Some(rest) = expr.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
         return Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
     }
-    // { "甲", "乙" } 形式的动态数组字面量。
-    if let Some(body) = expr.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
-        return Some(
-            body.split(',')
-                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        );
+    // 动态/普通公式源（如 FILTER(...)、SUMPRODUCT(...)）不是静态区域；
+    // 当前求值器不把数组字面量当成列表来源，宁可报配置失败。
+    if expr.contains('(') || expr.contains(')') || expr.contains('{') || expr.contains('}') {
+        return None;
     }
     let (sheet_name, range) = match expr.rsplit_once('!') {
-        Some((s, r)) => (Some(s.trim().trim_matches('\'').to_string()), r.trim()),
+        Some((s, r)) => (Some(unquote_sheet_name(s)), r.trim()),
         None => (None, expr),
     };
     let target_sheet = match sheet_name.as_deref() {
@@ -248,16 +263,36 @@ pub fn list_items_wb(wb: &crate::model::Workbook, si: usize, dv: &DataValidation
     Some(out)
 }
 
+fn unquote_sheet_name(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        // Excel 的 O'Brien 写作 'O''Brien'!A1
+        s[1..s.len() - 1].replace("''", "'")
+    } else {
+        s.to_string()
+    }
+}
+
 fn parse_a1(s: &str) -> Option<(u32, u32)> {
     let mut col = 0u32;
     let mut row = 0u32;
     let mut digits = false;
     for ch in s.chars() {
         if ch.is_ascii_alphabetic() && !digits {
-            col = col * 26 + (ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+            col = col
+                .checked_mul(26)?
+                .checked_add(ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1)?;
+            if col > 16_384 {
+                return None;
+            }
         } else if ch.is_ascii_digit() {
             digits = true;
-            row = row * 10 + (ch as u32 - '0' as u32);
+            row = row
+                .checked_mul(10)?
+                .checked_add(ch as u32 - '0' as u32)?;
+            if row > 1_048_576 {
+                return None;
+            }
         } else {
             return None;
         }
@@ -347,8 +382,12 @@ pub fn validate_wb<F>(
 where
     F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
-    let items = list_items_wb(wb, si, dv).unwrap_or_default();
-    validate_impl(dv, value, wb.sheet(si), r, c, Some(&items), formula_eval)
+    if dv.kind == DvKind::List {
+        let items = list_items_wb(wb, si, dv).unwrap_or_default();
+        validate_impl(dv, value, wb.sheet(si), r, c, Some(&items), formula_eval)
+    } else {
+        validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
+    }
 }
 
 fn validate_impl<F>(
@@ -655,6 +694,73 @@ mod tests {
         };
         assert!(!validate_wb(&wb, 0, &bound, &Value::Number(0.0), 0, 1, &mut eval));
         assert!(validate_wb(&wb, 0, &bound, &Value::Number(2.0), 0, 1, &mut eval));
+    }
+
+    #[test]
+    fn threshold_follows_referenced_cell_and_list_skips_blanks() {
+        use crate::model::{Cell, Value, Workbook};
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(10.0), formula: None });
+        let mut list = crate::model::Sheet::default();
+        list.name = "列表".into();
+        list.set(0, 0, Cell { value: Value::Text("甲".into()), formula: None });
+        list.set(1, 0, Cell { value: Value::Text("乙".into()), formula: None });
+        // A3/A4 留空：列表区域里的空白不得变成候选，也不得整段失效
+        wb.sheets.push(list);
+
+        // 单值区域
+        let single = DataValidation { kind: DvKind::List, f1: "=列表!$A$1".into(), ..Default::default() };
+        assert_eq!(list_items_wb(&wb, 0, &single).as_deref(), Some(&["甲".to_string()][..]));
+        // 含空白的多格区域
+        let gap = DataValidation { kind: DvKind::List, f1: "=列表!$A$1:$A$4".into(), ..Default::default() };
+        assert_eq!(
+            list_items_wb(&wb, 0, &gap).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string()][..]),
+            "空白跳过，不能变成空候选"
+        );
+        let mut ev = |_: &str, _: u32, _: u32| crate::formula::FValue::Bool(true);
+        assert!(validate_wb(&wb, 0, &gap, &Value::Text("乙".into()), 0, 0, &mut ev));
+        // 空白输入由 allow_blank 决定，不走候选列表
+        let strict = DataValidation { allow_blank: false, ..gap.clone() };
+        assert!(!validate_wb(&wb, 0, &strict, &Value::Empty, 0, 0, &mut ev), "allow_blank=false 时空值拒绝");
+
+        // 阈值引用 A1：改 A1 后同一规则立即跟着变
+        let bound = DataValidation {
+            kind: DvKind::Whole,
+            op: DvOp::GreaterEq,
+            f1: "=$A$1".into(),
+            ..Default::default()
+        };
+        let check = |wb: &Workbook, v: f64| {
+            let mut calc = crate::formula::Calc::new(wb);
+            let mut ev = |f: &str, rr: u32, cc: u32| {
+                let shifted = crate::cf::shift_formula(f.trim_start_matches('='), rr, cc);
+                crate::formula::parse(&shifted)
+                    .map(|n| calc.eval_node(&n, 0))
+                    .unwrap_or(crate::formula::FValue::Error(crate::formula::ErrKind::Value))
+            };
+            validate_wb(wb, 0, &bound, &Value::Number(v), 0, 2, &mut ev)
+        };
+        assert!(check(&wb, 10.0), "A1=10 时 10 通过");
+        assert!(!check(&wb, 9.0), "A1=10 时 9 拒绝");
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        assert!(check(&wb, 100.0), "A1 改成 100 后 100 通过");
+        assert!(!check(&wb, 11.0), "A1 改成 100 后 11 拒绝");
+    }
+
+    #[test]
+    fn unsafe_list_sources_do_not_panic_or_turn_into_values() {
+        let wb = crate::model::Workbook::new_blank();
+        for f1 in [
+            "=SUMPRODUCT(1,2)",
+            "=FILTER(A1:A2,A1:A2<>\"\")",
+            "=ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "=A1:A2:A3",
+            "=A999999999999999999999",
+        ] {
+            let dv = DataValidation { kind: DvKind::List, f1: f1.into(), ..Default::default() };
+            assert!(list_items_wb(&wb, 0, &dv).is_none(), "不应把 {f1} 当静态列表");
+        }
     }
 
     #[test]

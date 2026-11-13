@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-13T05:52:38Z",
+  "updated_utc": "2026-11-13T13:27:48Z",
   "tasks": [
     {
       "id": "C01",
@@ -1186,8 +1186,8 @@
       "scope": "core/tests + app/tests夹具",
       "source": "qa-requirements.md",
       "heading": "QA-02 P0 恢复被 ignored 的关键样本测试",
-      "status": "实施中",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "监督 2026-11-13 20:38/21:06 CST 确认：独立 `git clone --no-hardlinks`（HEAD 70954b3）在 scratch 运行 `cargo test --workspace --offline` 得到 975 passed / 0 failed / 9 ignored、EXIT=0；运行后 `git status --porcelain` 为空且无本机 `tests/test-work` 散落文件；恢复的 fixtures/严格断言和9 个 ignored 的原因/责任/解锁表齐备，原 QA02 范围验收通过（第 16/61 项）。",
       "files": [
         "crates/core/tests/array_formula.rs",
         "crates/core/tests/comments.rs",
@@ -1268,13 +1268,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
       ],
       "not_done": [
-        "QA-02.1 待监督复核；vba_source 仍缺真实样本。",
-        "QA-02.2/02.3 证据已写入，未获监督验收。"
+        "9 个 core ignored 保留原因/责任/解锁步骤（含缺真实 OLE VBA 样本），不要求归零；Office 目视矩阵不在原 QA02 范围。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "等待/接受 QA-02 复核；同时继续下一可执行任务（QA-03.2/03.3）。",
-      "updated_utc": "2026-11-13T12:48:00Z",
+      "next": "QA-02 已验收；继续其余父项。",
+      "updated_utc": "2026-11-13T13:24:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1282,8 +1281,8 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "监督 2026-11-13 20:38/21:06 CST 确认：独立 `git clone --no-hardlinks`（HEAD 70954b3）在 scratch 运行 `cargo test --workspace --offline` 得到 975 passed / 0 failed / 9 ignored、EXIT=0；运行后 `git status --porcelain` 为空且无本机 `tests/test-work` 散落文件；恢复的 fixtures/严格断言和9 个 ignored 的原因/责任/解锁表齐备，原 QA02 范围验收通过（第 16/61 项）。",
           "files": [
             "crates/core/tests/array_formula.rs",
             "crates/core/tests/comments.rs",
@@ -1364,7 +1363,8 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-clean-clone.txt"
           ],
           "not_done": [
             "core 仍有 8 个明确标记的人工生成/辅助进程 ignored 项（不是缺夹具）；vba_source 仍缺真实 OLE VBA 样本。",
@@ -1373,7 +1373,7 @@
           "failures": [],
           "blocker": "",
           "next": "主实施者复核后收口 QA-02.1；按 QA-02.2/02.3 任务正文继续。",
-          "updated_utc": "2026-11-13T20:16:00Z"
+          "updated_utc": "2026-11-13T13:24:00Z"
         },
         {
           "id": "QA-02.2",
@@ -1381,8 +1381,8 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "监督 2026-11-13 20:38/21:06 CST 确认：独立 `git clone --no-hardlinks`（HEAD 70954b3）在 scratch 运行 `cargo test --workspace --offline` 得到 975 passed / 0 failed / 9 ignored、EXIT=0；运行后 `git status --porcelain` 为空且无本机 `tests/test-work` 散落文件；恢复的 fixtures/严格断言和9 个 ignored 的原因/责任/解锁表齐备，原 QA02 范围验收通过（第 16/61 项）。",
           "files": [
             "crates/core/tests/conditional_format.rs",
             "crates/core/tests/data_validation.rs",
@@ -1403,7 +1403,8 @@
             "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-clean-clone.txt"
           ],
           "not_done": [
             "vba_source 仍缺真实 OLE VBA 样本；8 个 core ignored 是生成器/COM/辅助进程，不是日常夹具。"
@@ -1411,7 +1412,7 @@
           "failures": [],
           "blocker": "",
           "next": "监督复核 QA-02.2 的对象/输出夹具证据；无新增测试改写。",
-          "updated_utc": "2026-11-13T20:22:00Z"
+          "updated_utc": "2026-11-13T13:24:00Z"
         },
         {
           "id": "QA-02.3",
@@ -1419,8 +1420,8 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "监督 2026-11-13 20:38/21:06 CST 确认：独立 `git clone --no-hardlinks`（HEAD 70954b3）在 scratch 运行 `cargo test --workspace --offline` 得到 975 passed / 0 failed / 9 ignored、EXIT=0；运行后 `git status --porcelain` 为空且无本机 `tests/test-work` 散落文件；恢复的 fixtures/严格断言和9 个 ignored 的原因/责任/解锁表齐备，原 QA02 范围验收通过（第 16/61 项）。",
           "files": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-ledger.md"
           ],
@@ -1430,6 +1431,7 @@
             "cargo test --workspace --offline -> 79 result lines / 975 passed / 0 failed / 9 ignored (EXIT=0)"
           ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-clean-clone.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-clean-clone.txt"
           ],
           "not_done": [
@@ -1438,7 +1440,7 @@
           "failures": [],
           "blocker": "",
           "next": "监督复核 ledger；提供 VBA 样本后才去 ignore。",
-          "updated_utc": "2026-11-13T12:48:00Z"
+          "updated_utc": "2026-11-13T13:24:00Z"
         }
       ]
     },
@@ -2744,12 +2746,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C07.1 待验收；C07.2/C07.3 未开始。"
+        "C07.1 已验收；C07.2/C07.3 未实现。交接材料称工作区已有 C07.2 stop/warning/information 实现，实测 grep errorStyle/showErrorMessage/showInputMessage 在 crates/ 下零命中（仅需求文档提到），故按未实现接续。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "继续 C07.2 错误样式与提示。",
-      "updated_utc": "2026-11-13T12:43:00Z",
+      "next": "C07.2：DataValidation 增加 errorStyle/showErrorMessage/showInputMessage，XML 读写与 Excel 往返，三种错误样式的交互分支与输入提示。",
+      "updated_utc": "2026-11-13T13:27:48Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2757,8 +2759,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "命名/跨表/单值/内联列表；范围锚点相对/混合引用（C2:C3 >=$A1 首格/下一格）；坏阈值保留错误并显示配置失败诊断；仅 List 解析列表，parse_a1 有界安全；本表级名称优先、O'Brien 转义解码、动态公式不当数组字面量；真实 xlsx 夹具+生产 commit_edit/scan 回归。",
           "files": [
             "crates/core/src/dv.rs",
             "crates/app/src/main.rs",
@@ -2768,22 +2770,19 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --lib dv::tests:: -- --test-threads=1 -> 5 passed",
-            "cargo test -p sheetcore --offline --test c07_dv_refs -> 1 passed",
-            "cargo test -p sheetcore --offline -> 78 bins / 725 passed / 0 failed / 9 ignored",
-            "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
-            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
+            "cargo test -p sheetcore --offline -j 2 --lib dv::tests:: -- --test-threads=2 -> 7 passed / 0 failed / 268 filtered",
+            "cargo test -p sheetcore --offline -j 2 --test c07_dv_refs -- --test-threads=2 -> 2 passed / 0 failed",
+            "cargo test -p app --offline -j 2 --bin app dv_anchor_handles_mixed_refs_and_bad_formula_is_reported -- --test-threads=2 -> 1 passed",
+            "cargo test -p app --offline -j 2 --bin app dv_scan_uses_range_anchor_and_reports_config_errors -- --test-threads=2 -> 1 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-refs.txt"
           ],
-          "not_done": [
-            "停止/警告/信息交互与输入提示开关（C07.2）未实现；未做 Excel/WPS 下拉外观与错误样式矩阵。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "监督复核 C07.1；随后实现 C07.2 errorStyle/输入提示。",
-          "updated_utc": "2026-11-13T12:43:00Z"
+          "next": "",
+          "updated_utc": "2026-11-13T13:27:48Z"
         },
         {
           "id": "C07.2",
@@ -3181,8 +3180,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "监督确认 C12 空组修复：先建立分组标签再决定聚合纳值；A 组有值、B 组全空时 B 标签保留；本机 Excel 365 对拍 B 组 Count 为 EMPTY（非 0），实现返回 Value::Empty；旧 Count=0 注释已改。覆盖 count/空组切片，不扩多字段。",
           "files": [
             "crates/core/src/pivot.rs"
           ],
@@ -3197,12 +3196,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-count.txt"
           ],
           "not_done": [
-            "两层行字段/多值字段/筛选器/字段面板/Office 可编辑往返未实现；本切片只覆盖 Count/空组。"
+            "本切片只覆盖 Count/空组；C12.2 多字段、C12.3 筛选器、C12.4 Office 可编辑往返未开始。"
           ],
           "failures": [],
           "blocker": "",
           "next": "监督复核 C12.1 的 Count/空值回归；随后再做 C12.2 多字段规格。",
-          "updated_utc": "2026-11-13T12:43:00Z"
+          "updated_utc": "2026-11-13T13:24:00Z"
         },
         {
           "id": "C12.2",
