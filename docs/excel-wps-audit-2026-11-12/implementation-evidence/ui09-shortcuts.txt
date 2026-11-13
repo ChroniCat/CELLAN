@@ -1,0 +1,25 @@
+UI-09.1 常用选择/格式快捷键（2026-11-13 15:25 CST）
+
+实现
+- Ctrl+B/I/U：调用既有 Ribbon Bold/Italic/Underline 命令，走 apply_style 的
+  write_preflight→事务→undo，不用测试钩子直接改样式。
+- Ctrl+A：第一次取 current_region 作为选区；在已恰好选中该区域时再按一次选整表
+  （0,0..1048575,16383），状态栏明确提示；避免一次就选全表。
+- Ctrl+Space：整列；Shift+Space：整行；均保留当前行/列。
+- F5 或 Ctrl+G：置 name_focus_request，下一帧把焦点给名称框；名称框现有回车
+  goto_name 支持 A1、A1:B2 和定义名称。
+- 新增 name_focus_request 字段与名称框 request_focus 消费点。
+
+验证
+- edit_regression_tests::common_selection_and_format_shortcuts_work：
+  Ctrl+B 对 A1:B2 全选加粗、再按取消；Ctrl+I/U 生效；Ctrl+A 第一/第二次分别
+  为当前区域/全表；Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 都置名称框请求。
+- 命令：cargo test -p app --offline --bin app common_selection_and_format_shortcuts_work
+  -> 1 passed。
+- 全量：cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored，
+  APP_EXIT=0。
+
+未完成
+- 真实窗口按 F5/Ctrl+G 后名称框获得焦点、光标与 Esc 返回网格未做 GUI 取证。
+- F4（编辑中引用绝对/相对切换）、Shift+F10 右键菜单、F6 窗格循环仍属 UI-09.1
+  剩余项，不能因本轮四条快捷键通过就标父项验收。

@@ -808,6 +808,8 @@ struct SheetApp {
     ribbon_collapsed: bool,
     /// 名称框下拉（定义名称列表）
     name_dropdown: bool,
+    /// F5 / Ctrl+G 请求把焦点移到名称框（下一帧 UI 消费）
+    name_focus_request: bool,
     /// 表头右键菜单：(0=列 1=行, 索引, 屏幕位置)
     /// 选中的图表（图表工具上下文页签）
     chart_sel: Option<usize>,
@@ -1430,7 +1432,8 @@ impl SheetApp {
             cycles_key: (u64::MAX, u64::MAX),
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
-            name_dropdown: false,            chart_sel: None,
+            name_dropdown: false,            name_focus_request: false,
+            chart_sel: None,
             chart_drag: None,
             protect_dlg: None,
             pw_prompt: None,
@@ -6929,6 +6932,41 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
+    /// Ctrl+A：第一次选当前数据区域，第二次在已选整块时选全表（Excel 的两段行为）。
+    fn select_region_or_all(&mut self) {
+        self.commit_edit(None);
+        let (r1, c1, r2, c2) =
+            sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), self.sel.0, self.sel.1);
+        let already = self.sel == (r1, c1) && self.sel_end == (r2, c2);
+        if already {
+            self.sel = (0, 0);
+            self.sel_end = (1_048_575, 16_383);
+            self.scroll = Vec2::ZERO;
+            self.status = "已选择整个工作表".into();
+        } else {
+            self.sel = (r1, c1);
+            self.sel_end = (r2, c2);
+            self.ensure_visible();
+            self.status = format!("已选择当前区域 {}{}:{}{}", cell_name(r1, c1), "", cell_name(r2, c2), "");
+        }
+    }
+
+    fn select_whole_row(&mut self) {
+        let r = self.sel.0;
+        self.sel = (r, 0);
+        self.sel_end = (r, 16_383);
+        self.ensure_visible();
+        self.status = format!("已选择第 {} 行", r + 1);
+    }
+
+    fn select_whole_col(&mut self) {
+        let c = self.sel.1;
+        self.sel = (0, c);
+        self.sel_end = (1_048_575, c);
+        self.ensure_visible();
+        self.status = format!("已选择 {} 列", col_label(c));
+    }
+
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // 保存/打开/新建/打印/撤销/重做由 crate::command 的命令表统一处理
@@ -6979,6 +7017,46 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.cancel_edit();
             }
+            return;
+        }
+
+        // 常用选择/格式快捷键（编辑区由 TextEdit 优先处理，见上）
+        let ctrl_shortcut = ctx.input(|i| i.modifiers.command && !i.modifiers.alt);
+        if ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::B)) {
+            self.ribbon_action("Bold", ctx);
+            return;
+        }
+        if ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::I)) {
+            self.ribbon_action("Italic", ctx);
+            return;
+        }
+        if ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::U)) {
+            self.ribbon_action("Underline", ctx);
+            return;
+        }
+        if ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::A)) {
+            self.select_region_or_all();
+            return;
+        }
+        let (ctrl_space, shift_space) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::Space),
+                i.modifiers.shift && !i.modifiers.command && i.key_pressed(Key::Space),
+            )
+        });
+        if ctrl_space {
+            self.select_whole_col();
+            return;
+        }
+        if shift_space {
+            self.select_whole_row();
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::F5))
+            || (ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::G)))
+        {
+            self.name_focus_request = true;
+            self.status = "在名称框输入 A1、A1:B2 或定义名称，回车定位".into();
             return;
         }
 
@@ -23305,6 +23383,10 @@ impl eframe::App for SheetApp {
                     Vec2::new(inner.width(), 20.0),
                     egui::TextEdit::singleline(&mut self.name_buf).frame(false),
                 );
+                if self.name_focus_request {
+                    nb_resp.request_focus();
+                    self.name_focus_request = false;
+                }
                 if nb_resp.gained_focus() {
                     self.name_edit = true;
                 }

@@ -842,6 +842,50 @@ fn key_event(key: egui::Key, shift: bool) -> egui::Event {
 
 /// UI-09.2：PageUp/Down 按视口可见行数翻页（不是固定 20 行），跳过隐藏行；
 /// Ctrl+PageUp/Down 切可见工作表且不修改单元格。
+/// UI-09.1：Ctrl+B/I/U、Ctrl+A 两段选择、Ctrl/Shift+Space、F5/Ctrl+G 名称框。
+#[test]
+fn common_selection_and_format_shortcuts_work() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("A"));
+    app.wb.sheet_mut(0).set(0, 1, text("B"));
+    app.wb.sheet_mut(0).set(1, 0, number(1.0));
+    app.wb.sheet_mut(0).set(1, 1, number(2.0));
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::B)]);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).bold);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(1, 1)).bold);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::B)]);
+    assert!(!app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).bold);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::I)]);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).italic);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::U)]);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).underline);
+
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::A)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 1)), "第一次 Ctrl+A 选当前区域");
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::A)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1_048_575, 16_383)), "第二次 Ctrl+A 选全表");
+
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::Space)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (1_048_575, 1)), "Ctrl+Space 选整列");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Space, true)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 16_383)), "Shift+Space 选整行");
+
+    app.name_focus_request = false;
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::F5, false)]);
+    assert!(app.name_focus_request, "F5 应请求名称框焦点");
+    app.name_focus_request = false;
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::G)]);
+    assert!(app.name_focus_request, "Ctrl+G 应请求名称框焦点");
+}
+
 #[test]
 fn page_keys_follow_viewport_and_ctrl_page_switches_sheet() {
     let ctx = egui::Context::default();

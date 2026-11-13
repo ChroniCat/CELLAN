@@ -1,8 +1,8 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `008b573`（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收；UI-09.2 视口翻页正在收尾。
+- 分支 `main`（`origin/main`），HEAD `008b573`（UI-09.1/09.2 未提交）（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收；UI-09.2 视口翻页正在收尾。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
-  切片 35 已验收 / 22 待验收 / 91 待实施。C11 父项已按用户 14:00 认可翻绿。
+  切片 35 已验收 / 23 待验收 / 90 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
   不作为当前证据。
@@ -395,7 +395,7 @@
 - C22：绘制改为 `cell_text_align`，General 文本左、数字右、布尔/错误居中，显式对齐覆盖；
   专项 1 passed。合成工作簿 SC_SHOT 实测 A1 左、B1 右、C1 中、D1 中、E1/F1/G1 显式
   左/中/右；长文本仍按用户偏好默认裁剪，长文本多情况与 Excel 同位置像素对拍未做，C22 待验收。
-- 当前全量：app **211 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
+- 当前全量：app **212 passed / 0 failed / 0 ignored**，APP_EXIT=0；core 未改，沿用
   **75 bins / 678 passed / 0 failed / 41 ignored**。
 - 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
 - 已提交：`e81c221`（`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
@@ -429,3 +429,11 @@
   **211 passed / 0 failed / 0 ignored**。全量曾因 UI-18 save 测试使用 TEMP 与并行
   test_env 冲突而失败一次，已改 current_exe().parent() 后全绿。
 - UI-09.2 待真实 720/1080 键盘与滚动重叠目视；UI-09 父项未验收。
+
+## 15:25 当前：UI-09.1 常用选择/格式快捷键
+
+- Ctrl+B/I/U 接既有 Ribbon 样式命令；Ctrl+A 第一次当前区域、第二次全表；
+  Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 名称框焦点请求。
+- 专项 common_selection_and_format_shortcuts_work 1 passed；全量 app
+  **212 passed / 0 failed / 0 ignored**。F4、Shift+F10、F6 与名称框真实焦点
+  仍未做，UI-09.1/09.2 均为待验收。

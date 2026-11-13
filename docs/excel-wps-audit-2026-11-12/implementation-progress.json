@@ -1759,7 +1759,8 @@
         "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "implementation-evidence/ui05-find-replace.txt",
@@ -1774,7 +1775,7 @@
       "failures": [],
       "blocker": "",
       "next": "补真实键鼠点击查找对话框/取消/结果跳转，以及单次查找可取消；Ribbon 新会话清快照已完成。",
-      "updated_utc": "2026-11-13T07:05:00Z",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "UI-05.1",
@@ -3297,7 +3298,8 @@
         "cargo test -p app --offline --bin app -> 207 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-general-alignment.txt"
@@ -3309,7 +3311,7 @@
       "failures": [],
       "blocker": "",
       "next": "补长文本裁剪/溢出切换截图，并在不干扰现有 Excel 实例的条件下做 Excel 同位置对拍。",
-      "updated_utc": "2026-11-13T07:05:00Z",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "C22.1",
@@ -3956,8 +3958,8 @@
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "先验 UI-09.2 视口翻页；继续 UI-09.1 选择/格式快捷键与 UI-09.3 区域内 Tab/Enter。",
-      "updated_utc": "2026-11-13T07:08:00Z",
+      "next": "UI-09.1/09.2 待真机复核；继续 UI-09.3 区域内 Tab/Enter 与隐藏行列边界。",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -3965,17 +3967,28 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "Ctrl+B/I/U 通过既有 Ribbon 样式命令作用到当前选区；Ctrl+A 第一次当前区域、第二次全表；Ctrl+Space 整列、Shift+Space 整行；F5/Ctrl+G 请求名称框焦点。专项 1 passed，全量 app 212 passed。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --offline --bin app common_selection_and_format_shortcuts_work -> 1 passed",
+            "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-shortcuts.txt"
+          ],
+          "not_done": [
+            "F5/Ctrl+G 名称框真实焦点与 Esc 回网格未 GUI 取证",
+            "F4、Shift+F10、F6 未实现"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补 F4/Shift+F10/F6 或按依赖转 UI-09.3；先做真实键鼠名称框焦点。",
+          "updated_utc": "2026-11-13T07:25:00Z"
         },
         {
           "id": "UI-09.2",
@@ -4050,7 +4063,8 @@
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
         "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-find-dialog-close.txt"
@@ -4061,7 +4075,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-      "updated_utc": "2026-11-13T07:05:00Z",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4654,7 +4668,8 @@
       "commands": [
         "cargo test -p app --offline --bin app filter_clear -> 2 passed",
         "cargo test -p app --offline --bin app -> 210 passed / 0 failed / 0 ignored",
-        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored"
+        "cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored",
+        "cargo test -p app --offline --bin app -> 212 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt"
@@ -4665,7 +4680,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实 Excel/WPS 与键鼠复核箭头/三个入口；保留未验收。",
-      "updated_utc": "2026-11-13T07:08:00Z",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "UI-18.1",
