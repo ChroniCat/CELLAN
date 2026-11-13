@@ -192,14 +192,21 @@ pub fn dxf_xml(d: &crate::cf::Dxf) -> String {
         out.push_str(&format!("<numFmt numFmtId=\"0\" formatCode=\"{}\"/>", esc(code)));
     }
     if let Some(b) = &d.border {
-        let col = b
-            .color
-            .map(|c| format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", c[0], c[1], c[2]))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "<border><left style=\"{s}\">{col}</left><right style=\"{s}\">{col}</right><top style=\"{s}\">{col}</top><bottom style=\"{s}\">{col}</bottom></border>",
-            s = esc(&b.style)
-        ));
+        // 四边各自写各自的 style/颜色，不再拿最后一条套满四边
+        let mut border = String::from("<border>");
+        for (i, tag) in ["left", "right", "top", "bottom"].iter().enumerate() {
+            if let Some((style, color)) = &b.sides[i] {
+                border.push_str(&format!(
+                    "<{tag} style=\"{s}\"><color rgb=\"FF{:02X}{:02X}{:02X}\"/></{tag}>",
+                    color[0],
+                    color[1],
+                    color[2],
+                    s = esc(style)
+                ));
+            }
+        }
+        border.push_str("</border>");
+        out.push_str(&border);
     }
     out.push_str("</dxf>");
     out

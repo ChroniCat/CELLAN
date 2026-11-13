@@ -4051,6 +4051,25 @@ impl SheetApp {
         self.wb.styles.get(sid).locked
     }
 
+    /// 受保护表的选择权限：Excel 的「选定锁定单元格 / 选定未锁定单元格」被关掉时点不进去。
+    fn sel_blocked_at(&self, r: u32, c: u32) -> bool {
+        let Some(p) = self.wb.sheet(self.sheet_idx).protection.as_ref() else {
+            return false;
+        };
+        if !p.sheet {
+            return false;
+        }
+        if self.cell_locked_on(self.sheet_idx, r, c) {
+            !p.perms.select_locked
+        } else {
+            !p.perms.select_unlocked
+        }
+    }
+
+    fn block_selection(&mut self) {
+        self.status = "工作表受保护：不允许选择该区域的单元格（审阅 → 撤销保护后可改）".into();
+    }
+
     /// 选区里是否含锁定单元格；超大选区直接算「含锁定」，避免逐格扫描卡住界面
     fn rects_have_locked(&self, rects: &[(u32, u32, u32, u32)]) -> bool {
         let total: u64 = rects
@@ -6184,10 +6203,20 @@ impl SheetApp {
         let mut goto: Option<(u32, u32, u32, u32)> = None;
         let blocks = self.wb.sheet(self.sheet_idx).cf.blocks.clone();
         let unknown_ext = self.wb.sheet(self.sheet_idx).cf.unknown_ext;
+        let dxf_unsupported = self.wb.sheet(self.sheet_idx).cf.dxf_unsupported;
         ui_kit::window(ctx, "条件格式管理", 460.0)
             .open(&mut open)
             .default_width(460.0)
             .show(ctx, |ui| {
+                if dxf_unsupported {
+                    ui.label(
+                        egui::RichText::new(
+                            "注意：差异格式含未建模的边框方向（对角/内部/起止边），保存会丢掉这些边，无法无损编辑。",
+                        )
+                        .color(egui::Color32::from_rgb(180, 95, 6)),
+                    );
+                    ui.separator();
+                }
                 if unknown_ext {
                     ui.label(
                         egui::RichText::new(
@@ -7317,6 +7346,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 sheetcore::sparse::parse_ref(parts[1]),
             ) {
                 self.commit_edit(None);
+                if self.sel_blocked_at(a.0, a.1) {
+                    self.block_selection();
+                    return;
+                }
                 self.sel = a;
                 self.sel_end = b;
                 self.ensure_visible();
@@ -7324,6 +7357,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
         } else if let Some(a) = sheetcore::sparse::parse_ref(parts[0]) {
             self.commit_edit(None);
+            if self.sel_blocked_at(a.0, a.1) {
+                self.block_selection();
+                return;
+            }
             self.sel = a;
             self.sel_end = a;
             self.ensure_visible();
@@ -7353,6 +7390,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     }
                 }
                 self.commit_edit(None);
+                if self.sel_blocked_at(pos.0, pos.1) {
+                    self.block_selection();
+                    return;
+                }
                 self.sel = pos;
                 self.sel_end = pos;
                 self.ensure_visible();
@@ -8416,7 +8457,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     self.sel.1
                 };
                 let extend = ctx.input(|i| i.modifiers.shift);
-                if extend {
+                if self.sel_blocked_at(nr, nc) {
+                    self.block_selection();
+                } else if extend {
                     // Shift+方向：锚点留在 sel_end，只移动活动格
                     self.sel = (nr, nc);
                 } else {
@@ -15501,19 +15544,27 @@ let txn = self.txn_begin(&keys);
             }
             // 条件格式的差异边框：画在填充之上、文字之下
             if let Some(b) = &ov.border {
-                let col = b
-                    .color
-                    .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
-                    .unwrap_or(Color32::from_rgb(60, 60, 60));
-                let w = match b.style.as_str() {
-                    "medium" => 2.0,
-                    "thick" => 3.0,
-                    "double" => 1.5,
-                    _ => 1.0,
-                };
-                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(w, col), egui::StrokeKind::Inside);
-                if dumping {
-                    dump.push(format!("cf-border ({},{}) style={} rgb={:?}", r, c, b.style, b.color));
+                // 四边可以不同：按左/右/上/下分别画，不再用一条 rule 套满四边
+                for (si, side) in b.sides.iter().enumerate() {
+                    let Some((style, color)) = side else { continue };
+                    let col = Color32::from_rgb(color[0], color[1], color[2]);
+                    let w = match style.as_str() {
+                        "medium" | "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" => 2.0,
+                        "thick" => 3.0,
+                        "double" => 1.5,
+                        _ => 1.0,
+                    };
+                    let rr = rect.shrink(0.5);
+                    let (a, z) = match si {
+                        0 => (rr.left_top(), rr.left_bottom()),
+                        1 => (rr.right_top(), rr.right_bottom()),
+                        2 => (rr.left_top(), rr.right_top()),
+                        _ => (rr.left_bottom(), rr.right_bottom()),
+                    };
+                    painter.line_segment([a, z], Stroke::new(w, col));
+                    if dumping {
+                        dump.push(format!("cf-border ({},{}) side={} style={} rgb={:?}", r, c, si, style, color));
+                    }
                 }
             }
             if let Some((t, col)) = ov.bar {
@@ -22161,7 +22212,11 @@ let txn = self.txn_begin(&keys);
                 if dx >= 0.0 && dy >= 0.0 {
                     let c = col_at(pos.x);
                     let r = row_at(pos.y);
-                    self.sel_end = (r, c);
+                    if self.sel_blocked_at(r, c) {
+                        self.block_selection();
+                    } else {
+                        self.sel_end = (r, c);
+                    }
                 }
             }
         }
@@ -22439,11 +22494,15 @@ let txn = self.txn_begin(&keys);
                             self.extra_sel.clear();
                         }
                         self.nav_rect = None;
-                        self.sel = hit;
-                        if !shift {
-                            self.sel_end = hit;
+                        if self.sel_blocked_at(hit.0, hit.1) {
+                            self.block_selection();
+                        } else {
+                            self.sel = hit;
+                            if !shift {
+                                self.sel_end = hit;
+                            }
+                            self.grid_press = Some(hit);
                         }
-                        self.grid_press = Some(hit);
                     }
                 }
             }

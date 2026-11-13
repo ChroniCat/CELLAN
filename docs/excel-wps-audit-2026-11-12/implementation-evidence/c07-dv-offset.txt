@@ -1,0 +1,66 @@
+# C07 OFFSET 动态列表来源：与 Excel 16.0 对齐的三处语义
+
+日期：2026-11-14
+触发：监督复核认定 C07.1 原范围仍有缺口（不是扩需求）：
+① `OFFSET` 省略 height/width 时应继承 reference 尺寸，不能当 1；
+② 跨表 reference 不能改变 `COUNTA($A:$A)` 这类未限定参数所在的表上下文；
+③ 负数 height/width 的反向展开未覆盖。
+
+## Excel 16.0 实测（COM `Application.Evaluate`，主表/数据两张表）
+
+主表：A1:A4 = 甲/乙/丙/丁，B1:B2 = 1/2；数据：A1:A5 = 100/200/300/400/500。
+
+| 表达式（在主表求值） | Excel 结果 |
+| --- | --- |
+| `=ROWS(OFFSET($A$1:$A$3,0,0))` | **3**（继承 reference 的 3 行，不是 1） |
+| `=COLUMNS(OFFSET($A$1:$A$3,0,0))` | 1 |
+| `=ROWS(OFFSET($A$1:$A$3,1,0))` | 3（平移后仍继承） |
+| `=ROWS(OFFSET($A$3,0,0,-2,1))` | 2 |
+| `=ADDRESS(ROW(OFFSET($A$3,0,0,-2,1)),COLUMN(...))` | `$A$2,$A$3` |
+| `=ROWS(OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1))` | **2**（COUNTA 按主表 A 列算，不是数据表 5） |
+| `=ADDRESS(ROW(OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1)),...)` | `$A$1,$A$2` |
+
+数据验证端到端：
+
+```text
+dv1 C1:C2  formula==OFFSET($A$1:$A$3,0,0)             C1=2 valid=True
+dv2 D1     formula==OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1)
+           D1=200 valid=True    D1=400 valid=False   （高度 2 → 只到数据!A2）
+```
+
+## 代码改动（`crates/core/src/dv.rs::dynamic_source`）
+
+- `OFFSET` 分支先取 reference 的 `(ar, ac, ar2, ac2)`，`def_h = ar2-ar+1`、`def_w = ac2-ac+1`；
+  省略第 4/5 个参数时用默认尺寸，不再写死 1。
+- rows/cols/height/width 一律用 `wb.sheet(si)`（公式所在表）求值；reference 自己的表前缀
+  只决定 `collect_rect` 从哪张表取数。
+- 负数 height/width：`(r0+h+1 ..= r0)` 反向展开；越界按 `#REF!` 视为配置无效（返回 None），
+  不再静默截断成空列表。
+- reference 允许是名称：`parse_rect` 失败时查名称表，名称带表前缀则切换到该表。
+
+## 夹具与回归
+
+`scripts/c07_dv_offset_fixture.py` → `crates/core/tests/fixtures/c07/offset.xlsx`
+（主表 A1:A4、B1:B2，数据 A1:A5；C1:C2 / D1 / E1 三条列表验证）。
+
+`crates/core/tests/c07_dv_offset.rs`：
+
+```text
+offset_lists_keep_excel_semantics_after_a_roundtrip ... ok
+offset_source_as_a_whole_column_reference_stays_a_column ... ok
+test result: ok. 2 passed
+```
+
+同文件内另有 `dv::c07_offset_tests` 两条单测守住同样的语义：
+
+```text
+offset_inherits_reference_size_and_allows_negative_span ... ok
+offset_arguments_keep_the_rule_sheet_context ... ok
+```
+
+保存往返：`xlsx::save` 后重开，三条来源的候选列表与公式均不变（上面第一条测试内断言）。
+
+## 状态
+
+C07 父项按监督意见回退「待验收」：修复与回归已就位，等待复核；
+真实键鼠/IME 交互本机 RDP 不可用，未执行，不用 SC_* 注入冒充。

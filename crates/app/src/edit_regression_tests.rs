@@ -6594,3 +6594,58 @@ fn clear_entries_leave_identical_state() {
     assert_eq!(snap(&a), snap(&b), "Delete 与右键清除内容结果一致");
     assert_eq!(snap(&a), snap(&c), "Delete 与功能区清除内容结果一致");
 }
+
+/// C15：保护表的「选定锁定单元格 / 选定未锁定单元格」必须在真实选择入口生效，
+/// 不能只是配置项。这里走名称框定位入口，并直接核对门禁判定。
+#[test]
+fn selection_permissions_block_jumping_into_forbidden_cells() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(
+        0,
+        1,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Text("未锁".into()),
+            formula: None,
+        },
+    );
+    // B1 显式解锁（默认样式的 locked=true）
+    let mut st = app.wb.styles.get(app.wb.sheet(0).style_of(0, 1)).clone();
+    st.locked = false;
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(0, 1, sid);
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+
+    assert!(!app.sel_blocked_at(0, 1), "允许选未锁格");
+    assert!(app.sel_blocked_at(0, 0), "禁止选锁定格");
+
+    app.name_buf = "A1".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 1), "被拒后选区不能跳到锁定格");
+    assert!(app.status.contains("不允许选择"), "状态栏要说明原因：{}", app.status);
+
+    // 只关「选定未锁定」：未锁格也不能选
+    app.wb.sheet_mut(0).protection.as_mut().unwrap().perms.select_unlocked = false;
+    app.name_buf = "B1".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 1));
+    assert!(app.status.contains("不允许选择"));
+
+    // 两项都允许：入口恢复
+    let p = app.wb.sheet_mut(0).protection.as_mut().unwrap();
+    p.perms.select_locked = true;
+    p.perms.select_unlocked = true;
+    app.name_buf = "A1".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 0), "有权限时应能定位到锁定格");
+
+    // 未保护工作表：不受影响
+    app.wb.sheet_mut(0).protection = None;
+    assert!(!app.sel_blocked_at(0, 0));
+    assert!(!app.sel_blocked_at(5, 5));
+}

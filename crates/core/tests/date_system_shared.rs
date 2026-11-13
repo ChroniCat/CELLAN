@@ -78,6 +78,7 @@ fn cf_greater_than(lit: &str) -> CfSheet {
             }],
         }],
         unknown_ext: false,
+        dxf_unsupported: false,
         dxfs: vec![Dxf { bold: true, ..Default::default() }],
     }
 }

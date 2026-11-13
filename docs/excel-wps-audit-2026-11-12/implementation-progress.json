@@ -1606,7 +1606,7 @@
       "scope": "app/main.rs editing/commit_edit/draw_grid_pane",
       "source": "ui-requirements.md",
       "heading": "UI-01 修复真实键盘编辑提交链路",
-      "status": "已验收",
+      "status": "待验收",
       "acceptance": "[原始 ui-requirements.md UI-01 验收] 从真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值；**公式和中文输入法确认同测**；撤销一次恢复旧值；保存重开保持结果；非法验证输入不移动、不丢编辑内容。本机已用真实 update() 全窗事件路径覆盖除输入法外的全部条目，输入法候选交互未执行。",
       "files": [
         "crates/app/src/main.rs",
@@ -1623,11 +1623,13 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
       ],
-      "not_done": [],
+      "not_done": [
+        "中文 IME 实机确认未执行（RDP 会话不可用，系统键鼠/IME 注入无法验证）；按监督要求转 QA-04，UI-01 在 IME 确认前不算完成"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T14:48:54Z",
+      "next": "等待可用的真实桌面会话补中文 IME 输入确认",
+      "updated_utc": "2026-11-13T17:41:44Z",
       "slices": [
         {
           "id": "UI-01.1",
@@ -1635,7 +1637,7 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "缓冲唯一所有者；Enter/Tab/Shift 回车、Esc、F2、公式栏、点其它格、切工作表、名称框、保存、关窗口统一提交/取消；非法验证输入留在编辑框且不移动；撤销/保存重开验证。",
           "files": [
             "crates/app/src/main.rs",
@@ -1650,11 +1652,15 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.png"
           ],
-          "not_done": [],
-          "failures": [],
+          "not_done": [
+            "中文 IME 输入确认未执行，转 QA-04；不得用 SC_* 注入替代"
+          ],
+          "failures": [
+            "IME 实机确认缺失"
+          ],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T14:48:54Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         }
       ],
       "status_note": "独立审查更正：证据 ui01-edit-commit.txt 第 6 节明确「真实硬件键盘、中文 IME 候选窗…未执行」，原验收含输入法同测，故父任务与切片回到待验收（实现与已通过回归保留）"
@@ -2707,7 +2713,7 @@
       "scope": "core/dv.rs + app验证入口",
       "source": "core-requirements.md",
       "heading": "C07 P1 数据验证引用解析、提示等级和错误处理",
-      "status": "已验收",
+      "status": "待验收",
       "acceptance": "名称/跨表/动态列表解析、相对与绝对引用、空值与中文、列表空白与单值区域；停止/警告/信息三种提示与输入提示；配置失效可见诊断；键盘下拉与保存集成。",
       "files": [],
       "commits": [],
@@ -2718,11 +2724,13 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-styles.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-keyboard.txt"
       ],
-      "not_done": [],
+      "not_done": [
+        "OFFSET 语义已修复并补回归/夹具，等待监督复核；真实 GUI 键鼠交互未执行（RDP 不可用），另行留待验收"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T14:43:01Z",
+      "next": "等待监督复核 OFFSET 语义修复（省略 height/width 继承、跨表上下文、负高度）",
+      "updated_utc": "2026-11-13T17:41:44Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2730,7 +2738,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "列表来源：内联、名称（本表级优先）、跨表、单值/含空白区域、动态列表（OFFSET/INDIRECT/FILTER 非空/UNIQUE/SORT）、带括号工作表名；来源按规则范围左上角平移（C2:C3 用 =$A1:$A2 时 C3 看 A2:A3）；解析失败返回配置错误而非放行。真实 xlsx 保存重开一致。",
           "files": [
             "crates/core/src/dv.rs",
@@ -2738,7 +2746,10 @@
             "crates/core/tests/c07_dv_refs.rs",
             "crates/core/tests/fixtures/c07/dynamic.xlsx",
             "scripts/c07_dv_dynamic_fixture.py",
-            "scripts/excel_dv_source_probe.ps1"
+            "scripts/excel_dv_source_probe.ps1",
+            "crates/core/tests/c07_dv_offset.rs",
+            "crates/core/tests/fixtures/c07/offset.xlsx",
+            "scripts/c07_dv_offset_fixture.py"
           ],
           "commits": [],
           "commands": [
@@ -2749,13 +2760,19 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-refs.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-dynamic.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-dynamic.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-offset.txt"
           ],
-          "not_done": [],
+          "not_done": [
+            "OFFSET($A$1:$A$3,0,0) 省略 height/width 现继承 3 行（Excel 16.0 COM: ROWS=3）",
+            "跨表 reference 时 COUNTA($A:$A) 按公式所在表求值（COM: ROWS=2，400 被拒）",
+            "负数 height 反向展开（COM: OFFSET($A$3,0,0,-2,1)=$A$2:$A$3）",
+            "等待监督复核；真实键鼠/IME 未执行"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T14:43:01Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C07.2",
@@ -2763,7 +2780,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "停止/警告/信息三种样式 + 输入提示开关 + showErrorMessage 兼容策略；XML 双向与真实 xlsx 保存重开一致；信息级\"确定/取消\"，取消与 Esc 都不写入且不产生撤销记录；配置失效可见诊断。",
           "files": [
             "crates/core/src/dv.rs",
@@ -2795,7 +2812,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T14:43:01Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C07.3",
@@ -2803,7 +2820,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "Alt+↓ 打开序列下拉、↑↓ 移动并自动滚入可视区、Enter 选择、Esc 不写入；选择走与手输相同的门禁/撤销/广播；选择后 Ctrl+S 保存并在重开后值 + 规则都在。",
           "files": [
             "crates/app/src/main.rs",
@@ -2826,7 +2843,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T14:43:01Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         }
       ]
     },
@@ -3278,17 +3295,19 @@
       "scope": "core/style.rs, protection.rs, xlsx.rs + app命令检查",
       "source": "core-requirements.md",
       "heading": "C15 P1 工作表保护细粒度权限",
-      "status": "已验收",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "选择锁定/未锁定单元格权限已在鼠标按下、拖拽扩选、方向键、名称框定位四个入口执行；等待监督复核"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T16:20:50Z",
+      "next": "等待监督复核选择权限入口",
+      "updated_utc": "2026-11-13T17:41:44Z",
       "slices": [
         {
           "id": "C15.1",
@@ -3296,7 +3315,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "CellStyle 增加 locked/hidden 并与 styles.xml 双向读写；SheetProtection 的 15 个权限位按 Excel 实际编码（0=允许、缺失=禁止）解析与写回，导入导出往返一致。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3328,7 +3347,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T16:20:50Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C15.2",
@@ -3336,7 +3355,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "统一命令门禁：写入逐格判锁（选区含锁定格即拒），排序/插删行列/格式各有权限放行，撤销/快捷键/菜单走同一入口；保护是防误改，不宣称加密。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3346,7 +3365,8 @@
             "crates/app/src/ribbon/actions.rs",
             "crates/core/tests/c15_protection.rs",
             "crates/core/tests/fixtures/c15/protected.xlsx",
-            "scripts/excel_c15_protection_fixture.ps1"
+            "scripts/excel_c15_protection_fixture.ps1",
+            "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
@@ -3362,13 +3382,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-input-area-write.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-perms.txt"
           ],
-          "not_done": [],
+          "not_done": [
+            "选择锁定/未锁定权限已在点击、拖拽、方向键、名称框四个入口执行，回归 selection_permissions_block_jumping_into_forbidden_cells 通过；等待复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T16:20:50Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C15.3",
@@ -3376,7 +3399,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "保护对话框有 15 项勾选且默认同 Excel；Excel 生成夹具 → 本应用只改未锁定区 → 保存 → Excel 复核仍拒绝 A1、允许 B1、保留 formatCells。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3386,7 +3409,8 @@
             "crates/app/src/ribbon/actions.rs",
             "crates/core/tests/c15_protection.rs",
             "crates/core/tests/fixtures/c15/protected.xlsx",
-            "scripts/excel_c15_protection_fixture.ps1"
+            "scripts/excel_c15_protection_fixture.ps1",
+            "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
@@ -3402,13 +3426,14 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-input-area-write.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-perms.txt"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T16:20:50Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         }
       ]
     },
@@ -3539,19 +3564,19 @@
       "scope": "core/cf.rs, xlsx.rs",
       "source": "core-requirements.md",
       "heading": "C17 P1 条件格式阈值和优先级保真",
-      "status": "已验收",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "x14 扩展条件格式不建模，编辑时警告不可无损"
+        "Dxf 四边已逐边保真（style+color），对角/内部/起止边框不建模但标 unsupported 并在管理窗口提示；等待监督复核"
       ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T17:10:48Z",
+      "next": "等待监督复核逐边边框与扩展提示",
+      "updated_utc": "2026-11-13T17:41:44Z",
       "slices": [
         {
           "id": "C17.1",
@@ -3559,7 +3584,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "CfRule 保存 priority；cfvo 区分 min/max/num/percent/percentile/formula（含公式原文），保存后类型与值不变；Dxf 增加差异数字格式与边框。",
           "files": [
             "crates/core/src/cf.rs",
@@ -3571,7 +3596,9 @@
             "crates/core/tests/fixtures/c17/priority.xlsx",
             "crates/core/tests/fixtures/c17/x14bar.xlsx",
             "scripts/excel_c17_cf_fixture.ps1",
-            "scripts/excel_c17_cf_verify.ps1"
+            "scripts/excel_c17_cf_verify.ps1",
+            "crates/core/tests/c17_dxf_borders.rs",
+            "crates/core/tests/fixtures/c17/borders.xlsx"
           ],
           "commits": [],
           "commands": [
@@ -3586,13 +3613,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-original.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-our-save.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-excel-after-unrelated-edit.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-dxf-borders.txt"
           ],
-          "not_done": [],
+          "not_done": [
+            "四边边框逐边保存/解析已补；对角/内部边框不建模，仅提示；等待复核"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:10:48Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C17.2",
@@ -3600,7 +3630,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "求值按全局 priority 升序（与 XML 顺序无关），stopIfTrue 对同一规则的多段范围同样终止；1000/1100/100000 上 percent 50 与 percentile 50 颜色不同，与 Excel 逐格一致。",
           "files": [
             "crates/core/src/cf.rs",
@@ -3633,7 +3663,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:10:48Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         },
         {
           "id": "C17.3",
@@ -3641,7 +3671,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "已验收",
+          "status": "待验收",
           "acceptance": "保存往返后 Excel 读回 priority/stopIfTrue/cfvo 类型与颜色一致；改无关单元格后两者样式不变；含 x14 扩展时管理窗口明确警告不可无损编辑。",
           "files": [
             "crates/core/src/cf.rs",
@@ -3671,12 +3701,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c17-x14-warning.png"
           ],
           "not_done": [
-            "Dxf 边框只保留四边同款形态；x14 扩展不建模，仅警告"
+            "四边边框已逐边保真（不同 style/颜色不再互相覆盖）；对角/内部/起止边框不建模，加载时标 unsupported 并在管理窗口提示；x14 扩展仍只警告"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:10:48Z"
+          "updated_utc": "2026-11-13T17:41:44Z"
         }
       ]
     },

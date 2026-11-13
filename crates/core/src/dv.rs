@@ -667,34 +667,58 @@ fn dynamic_source(wb: &crate::model::Workbook, si: usize, expr: &str) -> Option<
         if parts.len() < 3 {
             return None;
         }
-        let (sheet_name, anchor) = split_sheet_prefix(&parts[0]);
+        // OFFSET 的其余参数在「公式所在表」里求值：跨表 reference 只决定从哪张表取数，
+        // 不会把 COUNTA($A:$A) 这类不带表名的参数换到 reference 的表上。
+        // 本机 Excel 16.0 实测：主表 A 列 2 个值、数据表 5 个值时
+        // =ROWS(OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1)) 得 2。
+        let ctx = wb.sheet(si);
+        let (mut sheet_name, anchor_txt) = split_sheet_prefix(&parts[0]);
+        let anchor = match parse_rect(&anchor_txt) {
+            Some(r) => r,
+            None => {
+                // reference 允许是名称：名称指向区域时按区域处理
+                let target = lookup_name(wb, si, anchor_txt.trim())?;
+                let t = target.trim().trim_start_matches('=').trim();
+                let (name_sheet, inner) = split_sheet_prefix(t);
+                if let Some(n) = name_sheet {
+                    sheet_name = Some(n);
+                }
+                parse_rect(&inner)?
+            }
+        };
         let sheet = match sheet_name.as_deref() {
             Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
             _ => wb.sheet(si),
         };
-        let (ar, ac, _, _) = parse_rect(&anchor)?;
-        let rows = eval_int(wb, sheet, &parts[1])?;
-        let cols = eval_int(wb, sheet, &parts[2])?;
-        let h = if parts.len() > 3 && !parts[3].is_empty() {
-            eval_int(wb, sheet, &parts[3])?
+        let (ar, ac, ar2, ac2) = anchor;
+        // 省略 height/width 时继承 reference 自身的行列数（不是 1）
+        let def_h = ar2 as i64 - ar as i64 + 1;
+        let def_w = ac2 as i64 - ac as i64 + 1;
+        let rows = eval_int(wb, ctx, &parts[1])?;
+        let cols = eval_int(wb, ctx, &parts[2])?;
+        let h = if parts.len() > 3 && !parts[3].trim().is_empty() {
+            eval_int(wb, ctx, &parts[3])?
         } else {
-            1
+            def_h
         };
-        let w = if parts.len() > 4 && !parts[4].is_empty() {
-            eval_int(wb, sheet, &parts[4])?
+        let w = if parts.len() > 4 && !parts[4].trim().is_empty() {
+            eval_int(wb, ctx, &parts[4])?
         } else {
-            1
+            def_w
         };
-        let r1 = ar as i64 + rows;
-        let c1 = ac as i64 + cols;
-        if r1 < 0 || c1 < 0 || h <= 0 || w <= 0 {
+        if h == 0 || w == 0 {
             return Some(Vec::new());
         }
-        let r1 = r1 as u32;
-        let c1 = c1 as u32;
-        let r2 = (r1 as i64 + h - 1).min(1_048_575) as u32;
-        let c2 = (c1 as i64 + w - 1).min(16_383) as u32;
-        return Some(collect_rect(sheet, (r1, c1, r2, c2)));
+        let r0 = ar as i64 + rows;
+        let c0 = ac as i64 + cols;
+        // 负数 height/width 向反方向展开：OFFSET($A$3,0,0,-2,1) = $A$2:$A$3
+        let (r1, r2) = if h > 0 { (r0, r0 + h - 1) } else { (r0 + h + 1, r0) };
+        let (c1, c2) = if w > 0 { (c0, c0 + w - 1) } else { (c0 + w + 1, c0) };
+        if r1 < 0 || c1 < 0 || r2 > 1_048_575 || c2 > 16_383 {
+            // 越界在 Excel 里是 #REF!，这里按配置无效拒绝
+            return None;
+        }
+        return Some(collect_rect(sheet, (r1 as u32, c1 as u32, r2 as u32, c2 as u32)));
     }
     None
 }
@@ -1379,5 +1403,83 @@ mod tests {
         assert_eq!(list[1].ranges.len(), 2);
         assert!(!list[1].show_dropdown, "showDropDown=1 表示隐藏箭头");
         assert_eq!(list[1].error_title, "越界");
+    }
+}
+
+#[cfg(test)]
+mod c07_offset_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value, Workbook};
+
+    fn blank() -> Workbook {
+        Workbook::new_blank()
+    }
+
+    fn put(sheet: &mut Sheet, r: u32, c: u32, v: Value) {
+        sheet.set(r, c, Cell { value: v, formula: None });
+    }
+
+    fn list(f1: &str) -> DataValidation {
+        DataValidation { kind: DvKind::List, f1: f1.into(), ..Default::default() }
+    }
+
+    /// OFFSET 省略 height/width 时继承 reference 的行列数；负数 height 反向展开。
+    /// Excel 16.0 实测：ROWS(OFFSET($A$1:$A$3,0,0))=3、
+    /// ROWS(OFFSET($A$3,0,0,-2,1))=2（$A$2:$A$3）。
+    #[test]
+    fn offset_inherits_reference_size_and_allows_negative_span() {
+        let mut wb = blank();
+        for (i, t) in ["甲", "乙", "丙", "丁"].iter().enumerate() {
+            put(&mut wb.sheets[0], i as u32, 0, Value::Text((*t).into()));
+        }
+        assert_eq!(
+            list_items_wb(&wb, 0, &list("=OFFSET($A$1:$A$3,0,0)"), 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string(), "丙".to_string()][..]),
+            "省略 height 必须继承 reference 的 3 行"
+        );
+        assert_eq!(
+            list_items_wb(&wb, 0, &list("=OFFSET($A$1:$A$3,1,0)"), 0, 0).as_deref(),
+            Some(&["乙".to_string(), "丙".to_string(), "丁".to_string()][..]),
+            "平移 1 行后仍是 3 行高"
+        );
+        assert_eq!(
+            list_items_wb(&wb, 0, &list("=OFFSET($A$3,0,0,-2,1)"), 0, 0).as_deref(),
+            Some(&["乙".to_string(), "丙".to_string()][..]),
+            "height=-2 从 A3 向上取 A2:A3"
+        );
+        assert_eq!(
+            list_items_wb(&wb, 0, &list("=OFFSET($A$1,0,0,2,2)"), 0, 0).as_deref(),
+            Some(&["甲".to_string(), "乙".to_string()][..]),
+            "单格 reference + 显式 2x2 只取 A 列两格非空"
+        );
+    }
+
+    /// 跨表 reference 只决定取哪张表，其余参数仍按公式所在表求值。
+    /// Excel 16.0 实测：主表 A 列 2 个值、数据表 5 个值时
+    /// =ROWS(OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1)) 得 2。
+    #[test]
+    fn offset_arguments_keep_the_rule_sheet_context() {
+        let mut wb = blank();
+        put(&mut wb.sheets[0], 0, 0, Value::Number(1.0));
+        put(&mut wb.sheets[0], 1, 0, Value::Number(2.0));
+        let mut data = Sheet::default();
+        data.name = "数据".into();
+        for (i, v) in [100.0, 200.0, 300.0, 400.0, 500.0].iter().enumerate() {
+            put(&mut data, i as u32, 0, Value::Number(*v));
+        }
+        wb.sheets.push(data);
+
+        let dv = list("=OFFSET(数据!$A$1,0,0,COUNTA($A:$A),1)");
+        assert_eq!(
+            list_items_wb(&wb, 0, &dv, 0, 0).as_deref(),
+            Some(&["100".to_string(), "200".to_string()][..]),
+            "高度取主表 COUNTA=2，不是数据表的 5；400/500 不能被接受"
+        );
+        // 明确带表名的 COUNTA 才用数据表
+        let dv2 = list("=OFFSET(数据!$A$1,0,0,COUNTA(数据!$A:$A),1)");
+        assert_eq!(
+            list_items_wb(&wb, 0, &dv2, 0, 0).as_deref(),
+            Some(&["100".to_string(), "200".to_string(), "300".to_string(), "400".to_string(), "500".to_string()][..])
+        );
     }
 }

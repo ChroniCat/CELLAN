@@ -760,6 +760,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.cf.unknown_ext = lay.cf_ext;
+                sheet.cf.dxf_unsupported = lay.dxf_ext;
                 sheet.dv = lay.dv.clone();
                 sheet.freeze = lay.freeze;
                 // 表格对象已经在上面补过筛选；工作表的 autoFilter 只在存在时覆盖，

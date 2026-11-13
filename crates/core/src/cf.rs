@@ -21,11 +21,11 @@ pub struct Dxf {
     pub border: Option<DxfBorder>,
 }
 
-/// dxf 里的一条差异边框：所有写了的边共用一个 style/color（Excel 常见写法）
-#[derive(Clone, Debug, PartialEq)]
+/// dxf 里的差异边框：左、右、上、下各边独立（Excel 允许四边不同 style/颜色）。
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct DxfBorder {
-    pub style: String,
-    pub color: Option<[u8; 3]>,
+    /// 0=左 1=右 2=上 3=下；`(style, color)`，color 缺省按黑色
+    pub sides: [Option<(String, [u8; 3])>; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +288,8 @@ pub struct CfSheet {
     /// 表里存在 x14 扩展条件格式（数据条/图标集扩展）；本实现不建模，保存会丢，
     /// 界面上必须显示「不能无损编辑」的警告。
     pub unknown_ext: bool,
+    /// 差异格式里含未建模的边框方向（对角/内部/起止边）；保存会丢，必须提示。
+    pub dxf_unsupported: bool,
 }
 
 /// 渲染叠加：条件格式作用在基础样式之上
@@ -831,6 +833,7 @@ mod tests {
             }],
             dxfs: vec![Dxf { fill: Some([255, 199, 206]), color: Some([156, 0, 6]), ..Default::default() }],
             unknown_ext: false,
+            dxf_unsupported: false,
         };
         let sh = sheet_with(&[(0, 0, 50.0), (1, 0, 150.0)]);
         let mut st = CfStats::default();
@@ -859,6 +862,7 @@ mod tests {
             }],
             dxfs: vec![],
             unknown_ext: false,
+            dxf_unsupported: false,
         };
         let sh = sheet_with(&[(0, 0, 0.0), (1, 0, 50.0), (2, 0, 100.0)]);
         let mut st = CfStats::default();
@@ -880,6 +884,7 @@ mod tests {
             }],
             dxfs: vec![],
             unknown_ext: false,
+            dxf_unsupported: false,
         };
         let sh = sheet_with(&[(0, 0, 10.0), (1, 0, 30.0)]);
         let mut st = CfStats::default();
@@ -899,6 +904,7 @@ mod tests {
             }],
             dxfs: vec![Dxf { fill: Some([255, 235, 156]), ..Default::default() }],
             unknown_ext: false,
+            dxf_unsupported: false,
         };
         let mut sh = Sheet::new("T");
         sh.set(0, 0, Cell { value: Value::Text("很急".into()), formula: None });
@@ -1177,7 +1183,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                                 kind,
                                 stop: attrs.get("stopIfTrue").map(|v| v == "1" || v == "true").unwrap_or(false),
                                 priority,
-                            });
+                             });
                         }
                     }
                     depth_rule = 0;
@@ -1273,94 +1279,116 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
     let mut in_dxfs = false;
     let mut cur: Option<Dxf> = None;
     let mut in_font = false;
+    let mut side: Option<usize> = None;
+
+    fn side_index(name: &str) -> Option<usize> {
+        match name {
+            "left" => Some(0),
+            "right" => Some(1),
+            "top" => Some(2),
+            "bottom" => Some(3),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_open(
+        e: &quick_xml::events::BytesStart<'_>,
+        empty: bool,
+        in_dxfs: &mut bool,
+        cur: &mut Option<Dxf>,
+        in_font: &mut bool,
+        side: &mut Option<usize>,
+    ) {
+        let name = e.name();
+        let name = name.as_ref().to_string();
+        let name = name.as_str();
+        if name.ends_with("dxfs") {
+            *in_dxfs = true;
+            return;
+        }
+        if *in_dxfs && name.ends_with("dxf") {
+            *cur = Some(Dxf::default());
+            return;
+        }
+        let Some(d) = cur.as_mut() else { return };
+        if name.ends_with("font") {
+            *in_font = true;
+        }
+        if name.ends_with("numFmt") {
+            if let Some(fc) = attr_val(e, "formatCode") {
+                d.num_fmt = Some(fc);
+            }
+            return;
+        }
+        let lname0 = name.to_ascii_lowercase();
+        if *in_font && lname0 == "name" {
+            if let Some(v) = attr_val(e, "val") {
+                d.font = Some(crate::style::normalize_font(&v));
+            }
+            return;
+        }
+        if *in_font && (lname0 == "b" || lname0.ends_with(":b")) {
+            d.bold = true;
+            return;
+        }
+        if *in_font && (lname0 == "i" || lname0.ends_with(":i")) {
+            d.italic = true;
+            return;
+        }
+        let lname = name.to_ascii_lowercase();
+        if let Some(idx) = side_index(&lname) {
+            if let Some(style) = attr_val(e, "style") {
+                if !style.is_empty() && style != "none" {
+                    let color = d
+                        .border
+                        .as_ref()
+                        .and_then(|b| b.sides[idx].clone())
+                        .map(|(_, c)| c)
+                        .unwrap_or([0, 0, 0]);
+                    d.border.get_or_insert_with(Default::default).sides[idx] = Some((style, color));
+                    if !empty {
+                        *side = Some(idx);
+                    }
+                }
+            }
+            return;
+        }
+        if lname.ends_with("color") {
+            for a in e.attributes().flatten() {
+                if a.key.as_ref().ends_with("rgb") {
+                    if let Some(c) = hex_rgb(&a.value.to_string()) {
+                        if *in_font {
+                            d.color = Some(c);
+                        } else if let Some(idx) = *side {
+                            if let Some(b) = d.border.as_mut() {
+                                if let Some(slot) = b.sides[idx].as_mut() {
+                                    slot.1 = c;
+                                }
+                            }
+                        } else {
+                            d.fill = Some(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     loop {
         match r.read_event() {
-            Ok(Event::Start(e)) => {
-                let name = e.name();
-                let name = name.as_ref();
-                if name.ends_with("dxfs") {
-                    in_dxfs = true;
-                } else if in_dxfs && name.ends_with("dxf") {
-                    cur = Some(Dxf::default());
-                } else if cur.is_some() && name.ends_with("font") {
-                    in_font = true;
-                } else if let Some(d) = cur.as_mut() {
-                    if name.ends_with("numFmt") {
-                        if let Some(fc) = attr_val(&e, "formatCode") {
-                            d.num_fmt = Some(fc);
-                        }
-                    } else if name.ends_with("color") {
-                        for a in e.attributes().flatten() {
-                            if a.key.as_ref().ends_with("rgb") {
-                                if let Some(c) = hex_rgb(&a.value.to_string()) {
-                                    if in_font {
-                                        d.color = Some(c);
-                                    } else {
-                                        d.fill = Some(c);
-                                    }
-                                }
-                            }
-                        }
-                    } else if name.ends_with("b") {
-                        d.bold = true;
-                    } else if name.ends_with("i") {
-                        d.italic = true;
-                    } else if in_font && name.ends_with("name") {
-                        if let Some(v) = attr_val(&e, "val") {
-                            d.font = Some(crate::style::normalize_font(&v));
-                        }
-                    }
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let name = e.name();
-                let name = name.as_ref();
-                if let Some(d) = cur.as_mut() {
-                    if name.ends_with("numFmt") {
-                        if let Some(fc) = attr_val(&e, "formatCode") {
-                            d.num_fmt = Some(fc);
-                        }
-                    } else if matches!(
-                        name.to_ascii_lowercase().as_str(),
-                        "left" | "right" | "top" | "bottom" | "start" | "end" | "vertical" | "horizontal"
-                    ) {
-                        // 差异边框的某一方向：只要求有 style（Excel 用 thin/medium/dashed…）
-                        if let Some(style) = attr_val(&e, "style") {
-                            if !style.is_empty() && style != "none" {
-                                d.border = Some(DxfBorder { style, color: d.border.as_ref().and_then(|b| b.color) });
-                            }
-                        }
-                    } else if name.to_ascii_lowercase().ends_with("color") {
-                        for a in e.attributes().flatten() {
-                            if a.key.as_ref().ends_with("rgb") {
-                                if let Some(c) = hex_rgb(&a.value.to_string()) {
-                    if in_font {
-                                        d.color = Some(c);
-                                    } else if let Some(b) = d.border.as_mut() {
-                                        b.color = Some(c);
-                                    } else {
-                                        d.fill = Some(c);
-                                    }
-                                }
-                            }
-                        }
-                    } else if name == "b" || name.ends_with(":b") {
-                        d.bold = true;
-                    } else if name == "i" || name.ends_with(":i") {
-                        d.italic = true;
-                    } else if in_font && name.ends_with("name") {
-                        if let Some(v) = attr_val(&e, "val") {
-                            d.font = Some(crate::style::normalize_font(&v));
-                        }
-                    }
-                }
-            }
+            Ok(Event::Start(e)) => on_open(&e, false, &mut in_dxfs, &mut cur, &mut in_font, &mut side),
+            Ok(Event::Empty(e)) => on_open(&e, true, &mut in_dxfs, &mut cur, &mut in_font, &mut side),
             Ok(Event::End(e)) => {
-                let name = e.name();
-                let name = name.as_ref();
+                let name = e.name().as_ref().to_string();
+                let name = name.as_str();
                 if name.ends_with("font") {
                     in_font = false;
+                } else if side_index(name).is_some() {
+                    side = None;
                 } else if name.ends_with("dxf") {
+                    side = None;
+                    in_font = false;
                     if let Some(d) = cur.take() {
                         out.push(d);
                     }
@@ -1368,14 +1396,36 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                     in_dxfs = false;
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
     out
 }
 
+/// 差异格式里出现未建模的边框方向（对角/内部/起止）：保存会丢，需要提示。
+pub fn dxfs_unsupported(xml: &str) -> bool {
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let name = name.as_ref().to_ascii_lowercase();
+                if matches!(
+                    name.as_str(),
+                    "diagonal" | "vertical" | "horizontal" | "start" | "end" | "outline"
+                ) && attr_val(&e, "style")
+                    .map(|s| !s.is_empty() && s != "none")
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
 #[cfg(test)]
 mod parse_tests {
     use super::*;

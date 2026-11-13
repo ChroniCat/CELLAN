@@ -1,0 +1,61 @@
+# C15 选择单元格权限：从「只序列化」到真实选择入口
+
+日期：2026-11-14
+触发：监督复核指出 `select_locked` / `select_unlocked` 之前只落在配置与 XML 属性上，
+真实选择入口（鼠标、键盘、名称框）没有执行，等于「能配但不生效」。
+
+## OOXML 语义（沿用本任务已实测的规则）
+
+`sheetProtection` 的布尔属性是「存在且为 0 = 允许，缺省 = 禁止」；
+选择两项是例外，Excel 默认允许，所以「禁止选择」写成 1：
+
+```xml
+<sheetProtection sheet="1" selectLockedCells="1"/>    <!-- 禁止选锁定格 -->
+<sheetProtection sheet="1" selectUnlockedCells="1"/>  <!-- 禁止选未锁格 -->
+```
+
+解析端 `ProtPerms` 仍按「true = 允许」存，`to_attrs` 反向写出。
+
+## 实现（`crates/app/src/main.rs`）
+
+新增两个方法：
+
+```rust
+fn sel_blocked_at(&self, r, c) -> bool   // 受保护表：锁定格看 select_locked，未锁格看 select_unlocked
+fn block_selection(&mut self)            // 状态栏：工作表受保护：不允许选择该区域的单元格
+```
+
+在四个真实选择入口执行：
+
+1. **鼠标按下**（`pointer.primary_pressed`）：命中格 / 合并区锚点被判 forbidden 时不改选区，
+   状态栏说明原因；
+2. **拖拽扩选**：拖到 forbidden 格时不更新 `sel_end`；
+3. **方向键 / Shift+方向**：目标格 forbidden 时不移动活动格；
+4. **名称框定位**（`goto_name`，含名称指向的区域）：目标 forbidden 时不跳转。
+
+受保护判定还要求 `protection.sheet == true`，避免 `sheet="0"` 的文件被误当受保护。
+
+## 回归
+
+`crates/app/src/edit_regression_tests.rs::selection_permissions_block_jumping_into_forbidden_cells`
+
+```text
+允许 select_locked=false / select_unlocked=true：
+  sel_blocked_at(0,1)=false（未锁 B1 可选）
+  sel_blocked_at(0,0)=true （锁定 A1 不可选）
+  名称框输入 A1 → 选区仍在 B1，状态栏含「不允许选择」
+关掉 select_unlocked：
+  B1 也不能选，名称框被拒
+两项都允许：
+  A1 可定位；未保护表一律放行
+```
+
+```text
+cargo test -p app --offline -j 2 --bin app selection_permissions -- --test-threads=2
+test result: ok. 1 passed; 0 failed
+```
+
+## 状态
+
+C15 已按监督意见回退「待验收」：入口与回归已补齐，等待复核；
+真实 GUI 键鼠操作在本机 RDP 会话不可用时未执行，不以 SC_* 探针或截图冒充。

@@ -35,6 +35,8 @@ pub struct SheetLayout {
     pub cf: Vec<crate::cf::CfBlock>,
     /// 是否有未建模的 x14 扩展条件格式
     pub cf_ext: bool,
+    /// 差异格式里是否有未建模的边框方向
+    pub dxf_ext: bool,
     /// 差异格式表
     pub dxfs: Vec<crate::cf::Dxf>,
     /// 数据验证
@@ -118,10 +120,10 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 
     // dxf 格式表（styles.xml，全局一份，挂到每张表上）
     let mut dxfs: Vec<crate::cf::Dxf> = Vec::new();
+    let mut styles_xml = String::new();
     if let Ok(mut f) = zip.by_name("xl/styles.xml") {
-        let mut xml = String::new();
-        let _ = f.read_to_string(&mut xml);
-        dxfs = crate::cf::parse_dxfs(&xml);
+        let _ = f.read_to_string(&mut styles_xml);
+        dxfs = crate::cf::parse_dxfs(&styles_xml);
     }
 
     let mut out: HashMap<String, SheetLayout> = HashMap::new();
@@ -143,6 +145,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         lay.cf = crate::cf::parse_cf_blocks(&xml);
         lay.cf_ext = crate::cf::xml_has_cf_ext(&xml);
         lay.dxfs = dxfs.clone();
+        lay.dxf_ext = crate::cf::dxfs_unsupported(&styles_xml);
         lay.dv = crate::dv::parse_validations(&xml);
         if !lay.merges.is_empty()
             || lay.col_default.is_some()
