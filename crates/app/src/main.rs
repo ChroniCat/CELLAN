@@ -868,6 +868,8 @@ struct SheetApp {
     /// 单元格格式对话框
     fmt_dlg: bool,
     fmt_state: FmtState,
+    /// 打开对话框时的活动格样式；应用时只提交用户真正改过的字段。
+    fmt_orig: FmtState,
     fmt_tab: u8,
     /// 外部链接对话框
     xlink_dlg: bool,
@@ -1476,6 +1478,7 @@ impl SheetApp {
             backstage_page: 0,
             fmt_dlg: false,
             fmt_state: FmtState::default(),
+            fmt_orig: FmtState::default(),
             fmt_tab: 0,
             xlink_dlg: false,
             rev: Vec::new(),
@@ -6614,8 +6617,83 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 st.border[3].style != 0,
             ],
         };
+        self.fmt_orig = self.fmt_state.clone();
         self.fmt_merge_pending = None;
         self.fmt_dlg = true;
+    }
+
+    /// 提交格式对话框：只覆盖用户改过的字段；未改直接确定不产生事务。
+    fn apply_format_dialog(&mut self) {
+        let st = self.fmt_state.clone();
+        let orig = self.fmt_orig.clone();
+        let border_changed = st.border != orig.border;
+        let want_font = st.font != orig.font;
+        let want_bold = st.bold != orig.bold;
+        let want_italic = st.italic != orig.italic;
+        let want_underline = st.underline != orig.underline;
+        let want_strike = st.strikethrough != orig.strikethrough;
+        let want_rotation = st.rotation != orig.rotation;
+        let want_size = (st.size - orig.size).abs() > f32::EPSILON;
+        let want_color = st.color != orig.color;
+        let want_fill = st.fill != orig.fill;
+        let want_halign = st.halign != orig.halign;
+        let want_valign = st.valign != orig.valign;
+        let want_wrap = st.wrap != orig.wrap;
+        let want_indent = st.indent != orig.indent;
+        let want_format = st.format != orig.format;
+        let style_changed = border_changed
+            || want_font
+            || want_bold
+            || want_italic
+            || want_underline
+            || want_strike
+            || want_rotation
+            || want_size
+            || want_color
+            || want_fill
+            || want_halign
+            || want_valign
+            || want_wrap
+            || want_indent
+            || want_format;
+
+        if style_changed {
+            let borders = st.border;
+            let font = st.font.clone();
+            let format = st.format.clone();
+            let (r1, c1, r2, c2) = self.sel_rect();
+            self.apply_style_xy(move |s, r, c| {
+                if border_changed {
+                    for (i, on) in borders.iter().enumerate() {
+                        s.border[i].style = if *on { 1 } else { 0 };
+                    }
+                    // 与旧行为一致：整组开启时只画外框，内部边不画。
+                    if borders[0] && c > c1 { s.border[0].style = 0; }
+                    if borders[1] && c < c2 { s.border[1].style = 0; }
+                    if borders[2] && r > r1 { s.border[2].style = 0; }
+                    if borders[3] && r < r2 { s.border[3].style = 0; }
+                }
+                if want_font { s.font = font.clone(); }
+                if want_bold { s.bold = st.bold; }
+                if want_italic { s.italic = st.italic; }
+                if want_underline { s.underline = st.underline; }
+                if want_strike { s.strikethrough = st.strikethrough; }
+                if want_rotation { s.rotation = st.rotation; }
+                if want_size { s.size = st.size; }
+                if want_color { s.color = st.color; }
+                if want_fill { s.fill = st.fill; }
+                if want_halign { s.halign = st.halign; }
+                if want_valign { s.valign = st.valign; }
+                if want_wrap { s.wrap = st.wrap; }
+                if want_indent { s.indent = st.indent; }
+                if want_format { s.format = format.clone(); }
+            });
+            self.status = "已应用格式".into();
+        } else {
+            self.status = "格式未修改".into();
+        }
+        self.fmt_dlg = false;
+        self.commit_fmt_merge();
     }
 
     /// 名称框：支持 A1、A1:B2、以及定义名称
@@ -16679,45 +16757,7 @@ let txn = self.txn_begin(&keys);
                 });
             });
         if apply {
-            let borders = st.border;
-            let (r1, c1, r2, c2) = self.sel_rect();
-            self.apply_style_xy(move |s, r, c| {
-                for (i, on) in borders.iter().enumerate() {
-                    s.border[i].style = if *on { 1 } else { 0 };
-                }
-                // 外框：内部边不画
-                if borders[0] && c > c1 {
-                    s.border[0].style = 0;
-                }
-                if borders[1] && c < c2 {
-                    s.border[1].style = 0;
-                }
-                if borders[2] && r > r1 {
-                    s.border[2].style = 0;
-                }
-                if borders[3] && r < r2 {
-                    s.border[3].style = 0;
-                }
-            });
-            self.apply_style(move |s| {
-                s.font = st.font.clone();
-                s.bold = st.bold;
-                s.italic = st.italic;
-                s.underline = st.underline;
-                s.strikethrough = st.strikethrough;
-                s.rotation = st.rotation;
-                s.size = st.size;
-                s.color = st.color;
-                s.fill = st.fill;
-                s.halign = st.halign;
-                s.valign = st.valign;
-                s.wrap = st.wrap;
-                s.indent = st.indent;
-                s.format = st.format.clone();
-            });
-            self.fmt_dlg = false;
-            self.status = "已应用格式".into();
-            self.commit_fmt_merge();
+            self.apply_format_dialog();
         }
         if cancel || !open {
             self.fmt_merge_pending = None;

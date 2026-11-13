@@ -1,0 +1,30 @@
+UI-08.2 格式对话框只提交改动字段（2026-11-13 14:52 CST）
+
+问题
+- open_format_dialog 只读活动格；确定时无条件 apply_style 覆盖字体、字号、颜色、
+  填充、对齐、换行、缩进、数字格式，打开后不改也重写一次。
+- 混合选区只改数字格式时，会把其他格的字体/颜色一起改成活动格的值。
+
+实现
+- 新增 fmt_orig 快照，打开时与 fmt_state 同时保存。
+- 确定逻辑抽到 apply_format_dialog：逐字段比较 fmt_state/fmt_orig，
+  只把真正变化的字体、字号、颜色、填充、对齐、换行、缩进、数字格式写入；
+  未改直接确定不调用 apply_style，不产生事务，状态显示“格式未修改”。
+- 边框作为一组处理：只有四边开关变化时才按原有“外框/内框”语义整组提交，
+  避免只改数字格式时覆盖各格不同的边框。
+- 字体、粗体、斜体等不再无条件写入活动格值；两格不同样式只改数字格式后
+  各自保留原字体、字号、颜色和粗斜体。
+
+验证
+- edit_regression_tests::format_dialog_preserves_unchanged_fields_and_mixed_cell_styles：
+  A1 红/宋体/13/粗体，A2 蓝/黑体/10/斜体；打开对话框只把 format 改成
+  #,##0.00，确定后两格字体/字号/颜色/粗斜体均保留，数字格式一致；
+  再打开不改直接确定，两格样式 id 和格式均不变。
+- 命令：cargo test -p app --offline --bin app format_dialog_preserves_unchanged_fields_and_mixed_cell_styles
+  -> 1 passed。
+- 全量：cargo test -p app --offline --bin app -> 215 passed / 0 failed / 0 ignored，
+  APP_EXIT=0。
+
+未完成
+- 对话框控件尚未把混合值显示为空白/“混合”提示；真实鼠标打开确定、取消、
+  Esc、Excel/WPS 目视仍未做。UI-08.2 保持待验收，父项不翻绿。

@@ -2,9 +2,9 @@
 
 - 分支 `main`（`origin/main`）；代码修复 `2745438`（UI-08.1；前序 `f19b932`/`4202fae`），文档记录提交 `c3711f3`；C11 父项已验收；UI-09 父项仍待真机复核。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 3 实施中 / 35 待实施；
-  切片 35 已验收 / 25 待验收 / 88 待实施。C11 父项已按用户 14:00 认可翻绿。
+  切片 35 已验收 / 26 待验收 / 87 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（14:37 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
-  app **214 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
+  app **215 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
 - 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
   C10.2 live 按用户要求保留。
 
@@ -474,3 +474,11 @@
 - 专项 `ribbon_border_commands_follow_left_right_top_bottom_order` 1 passed；
   全量 app **214 passed / 0 failed / 0 ignored**。格式对话框混合样式（UI-08.2）
   与未改属性保留（08.3）未做，UI-08 父项保持实施中。
+
+## 14:52 当前：UI-08.2 格式对话框
+
+- 新增 fmt_orig；apply_format_dialog 按字段 diff，只提交实际改动；直接确定不重写。
+- 混合两格只改数字格式后，字体/字号/颜色/粗斜体各自保留；边框只在开关变化时整组提交。
+- 专项 `format_dialog_preserves_unchanged_fields_and_mixed_cell_styles` 1 passed；
+  全量 app **215 passed / 0 failed / 0 ignored**。混合值显示、真实鼠标/Office 目视
+  和 UI-08.3 事务/撤销仍未完成，UI-08 父项保持实施中。

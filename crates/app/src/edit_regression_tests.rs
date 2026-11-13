@@ -1039,6 +1039,65 @@ fn shift_enter_and_shift_tab_move_backwards() {
 }
 
 /// UI-09.3：选区内的 Tab/Enter 循环、跳过隐藏行列，以及 XFD/1048576 边界。
+/// UI-08.2：格式对话框只提交改动字段；未改直接确定不重写样式。
+#[test]
+fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
+    use sheetcore::style::CellStyle;
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let dark = CellStyle::default_dark();
+    let red = CellStyle {
+        bold: true,
+        font: "宋体".into(),
+        color: [180, 20, 20],
+        format: "0.00".into(),
+        size: 13.0,
+        ..dark.clone()
+    };
+    let blue = CellStyle {
+        italic: true,
+        font: "黑体".into(),
+        color: [20, 20, 180],
+        format: "0".into(),
+        size: 10.0,
+        ..dark
+    };
+    let red_id = app.wb.styles.intern(red);
+    let blue_id = app.wb.styles.intern(blue);
+    app.wb.sheet_mut(0).set_style(0, 0, red_id);
+    app.wb.sheet_mut(0).set_style(1, 0, blue_id);
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+
+    // 只改数字格式：两格各自保留字体、字号、颜色、粗斜体。
+    app.open_format_dialog();
+    app.fmt_state.format = "#,##0.00".into();
+    app.apply_format_dialog();
+    for (r, want_font, want_bold, want_italic, want_color, want_size) in [
+        (0u32, "宋体", true, false, [180, 20, 20], 13.0f32),
+        (1u32, "黑体", false, true, [20, 20, 180], 10.0f32),
+    ] {
+        let st = app.wb.styles.get(app.wb.sheet(0).style_of(r, 0));
+        assert_eq!(st.format, "#,##0.00");
+        assert_eq!(st.font, want_font);
+        assert_eq!(st.bold, want_bold);
+        assert_eq!(st.italic, want_italic);
+        assert_eq!(st.color, want_color);
+        assert_eq!(st.size, want_size);
+    }
+
+    // 打开后不改直接确定：样式标识与格式都不变，不产生一次无意义重写。
+    let before = (app.wb.sheet(0).style_of(0, 0), app.wb.sheet(0).style_of(1, 0));
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.open_format_dialog();
+    app.apply_format_dialog();
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), before.0);
+    assert_eq!(app.wb.sheet(0).style_of(1, 0), before.1);
+    assert_eq!(app.wb.styles.get(before.0).format, "#,##0.00");
+    assert_eq!(app.wb.styles.get(before.1).format, "#,##0.00");
+}
+
 /// UI-08.1：Ribbon 边框方向必须落到左/右/上/下正确下标，内外框不能写反。
 #[test]
 fn ribbon_border_commands_follow_left_right_top_bottom_order() {
