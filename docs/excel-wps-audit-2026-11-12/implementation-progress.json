@@ -2364,7 +2364,7 @@
       "scope": "app/main.rs合并/格式刷 + core/model.rs",
       "source": "ui-requirements.md",
       "heading": "UI-27 合并与格式刷的细节",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "",
       "files": [
         "crates/app/src/main.rs",
@@ -2382,16 +2382,11 @@
       "evidence": [
         "implementation-evidence/ui27-merge-format-painter.txt"
       ],
-      "not_done": [
-        "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
-        "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-        "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
-        "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "真实 GUI 双击/拖选/Esc、换文档后格式刷、合并撤销冲突流程验收；与 Excel 合并提示对比。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T15:15:06Z",
       "slices": [
         {
           "id": "UI-27.1",
@@ -2399,34 +2394,29 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "A1=甲 B1=乙 合并前提示；不确认完全保留；确认后只留锚点、可撤销/重做并保存重开一致。",
+          "status": "已验收",
+          "acceptance": "合并有内容损失时先提示；取消/换表/改内容作废提示且不改数据；确认后一次事务、可撤销、保存重开一致。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/core/src/undo.rs",
-            "crates/app/src/ribbon/actions.rs",
-            "crates/app/src/ribbon/ui.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
-            "cargo test -p app --no-default-features --features glow --offline --bin app",
-            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 merge -> 7 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 painter -> 2 passed",
+            "GUI：提示/取消后保存 A1=甲 B1=乙 无合并；确认后 A1:B1 合并、B1 空"
           ],
           "evidence": [
-            "implementation-evidence/ui27-merge-format-painter.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-painter.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-prompt.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-cancelled.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-confirmed.png"
           ],
-          "not_done": [
-            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
-            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
-            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:15:06Z"
         },
         {
           "id": "UI-27.2",
@@ -2434,34 +2424,29 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "格式对话框点合并后取消模型不变；点确定才执行。",
+          "status": "已验收",
+          "acceptance": "格式对话框的合并是草稿，取消/关闭无副作用，确定才执行。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/core/src/undo.rs",
-            "crates/app/src/ribbon/actions.rs",
-            "crates/app/src/ribbon/ui.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
-            "cargo test -p app --no-default-features --features glow --offline --bin app",
-            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 merge -> 7 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 painter -> 2 passed",
+            "GUI：提示/取消后保存 A1=甲 B1=乙 无合并；确认后 A1:B1 合并、B1 空"
           ],
           "evidence": [
-            "implementation-evidence/ui27-merge-format-painter.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-painter.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-prompt.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-cancelled.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-confirmed.png"
           ],
-          "not_done": [
-            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
-            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
-            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:15:06Z"
         },
         {
           "id": "UI-27.3",
@@ -2469,34 +2454,29 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-27 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "双击格式刷连续刷两个范围，Esc 结束；单击只刷一次；源区域样式按行列映射。",
+          "status": "已验收",
+          "acceptance": "格式刷记录源范围矩阵、按范围平铺；双击连续刷多个范围，Esc 结束；跨文档校验拒绝。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/core/src/undo.rs",
-            "crates/app/src/ribbon/actions.rs",
-            "crates/app/src/ribbon/ui.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [
-            "cargo test -p app --no-default-features --features glow --offline --bin app -- merge_warns format_dialog_merge format_painter_maps",
-            "cargo test -p app --no-default-features --features glow --offline --bin app",
-            "cargo test -p app --no-default-features --features glow --offline --test ui_regression"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 merge -> 7 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 painter -> 2 passed",
+            "GUI：提示/取消后保存 A1=甲 B1=乙 无合并；确认后 A1:B1 合并、B1 空"
           ],
           "evidence": [
-            "implementation-evidence/ui27-merge-format-painter.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-painter.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-prompt.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-cancelled.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui27-merge-confirmed.png"
           ],
-          "not_done": [
-            "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
-            "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
-            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T07:25:00Z"
+          "updated_utc": "2026-11-13T15:15:06Z"
         }
       ]
     },

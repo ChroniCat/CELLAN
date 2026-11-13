@@ -689,6 +689,9 @@ struct SheetApp {
     /// SC_TYPE：逐帧注入文本（"60:123;120:456"），验收时走真实输入路径
     type_seq: Vec<(u32, String)>,
     type_frames: u32,
+    /// SC_CMD：逐帧派发功能区命令（"40:MergeCells;120:MergeCells"）
+    cmd_seq: Vec<(u32, String)>,
+    cmd_frames: u32,
 
     /// 批注编辑：(行, 列, 文本)
     note_edit: Option<(u32, u32, String)>,
@@ -1478,6 +1481,18 @@ impl SheetApp {
                 })
                 .unwrap_or_default(),
             type_frames: 0,
+            cmd_seq: std::env::var("SC_CMD")
+                .ok()
+                .map(|v| {
+                    v.split(';')
+                        .filter_map(|part| {
+                            let (n, cmd) = part.split_once(':')?;
+                            Some((n.trim().parse::<u32>().ok()?, cmd.trim().to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cmd_frames: 0,
             note_edit: None,
             link_dlg: None,
             macro_run_dlg: None,
@@ -24222,6 +24237,26 @@ impl eframe::App for SheetApp {
             if self.type_frames > last {
                 self.type_seq.clear();
                 eprintln!("[types] 结束");
+            }
+        }
+
+        if !self.cmd_seq.is_empty() {
+            self.cmd_frames += 1;
+            let mut hits = Vec::new();
+            for (at, cmd) in &self.cmd_seq {
+                if *at == self.cmd_frames {
+                    hits.push(cmd.clone());
+                }
+            }
+            for cmd in hits {
+                eprintln!("[cmd] frame {} -> {cmd}", self.cmd_frames);
+                let ctx2 = ctx.clone();
+                self.ribbon_action(&cmd, &ctx2);
+            }
+            let last = self.cmd_seq.iter().map(|(f, _)| *f).max().unwrap_or(0);
+            if self.cmd_frames > last {
+                self.cmd_seq.clear();
+                eprintln!("[cmd] 结束");
             }
         }
         let __cpu_t0 = std::time::Instant::now();
