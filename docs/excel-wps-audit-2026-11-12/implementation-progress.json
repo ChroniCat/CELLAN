@@ -6250,7 +6250,7 @@
       "scope": "app标题搜索/命令索引",
       "source": "ui-requirements.md",
       "heading": "UI-22 真正的命令搜索",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -6260,7 +6260,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T22:15:18Z",
       "slices": [
         {
           "id": "UI-22.1",
@@ -6268,17 +6268,26 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-22 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/palette.rs",
+            "crates/app/src/main.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-command-search.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette.png"
+          ],
+          "not_done": [
+            "真实键盘逐字输入与方向键选择未做",
+            "命令排序未做使用频率学习"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T22:15:18Z"
         }
       ]
     },

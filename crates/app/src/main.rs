@@ -19,6 +19,7 @@ mod update;
 mod error_opts;
 mod ui_prefs;
 mod command;
+mod palette;
 mod ribbon;
 mod session_lock;
 mod single_instance;
@@ -1050,6 +1051,8 @@ struct SheetApp {
     split_confirm: Option<(u64, usize)>,
     /// 删除重复对话框：区域、表头、参与比较的列
     dedup_dlg: Option<DedupDlg>,
+    palette_open: bool,
+    palette_q: String,
     /// 条件格式管理窗口
     cf_mgr: bool,
     /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
@@ -1797,6 +1800,8 @@ impl SheetApp {
             data_dlg: None,
             split_confirm: None,
             dedup_dlg: None,
+            palette_open: false,
+            palette_q: String::new(),
             cf_mgr: false,
             last_import: None,
             room_lost: false,
@@ -5211,6 +5216,65 @@ impl SheetApp {
         } else {
             format!("删除了 {removed} 行重复")
         };
+    }
+
+    /// UI-22：Ctrl+Q 命令搜索（数据来自 ribbon 控件，执行走同一 ribbon_action）。
+    fn command_palette(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Q)) {
+            self.palette_open = true;
+            self.palette_q.clear();
+        }
+        if !self.palette_open {
+            return;
+        }
+        let all = palette::entries(self);
+        let hits = palette::filter(&all, &self.palette_q);
+        let mut open = true;
+        let mut win_open = true;
+        let mut clicked = false;
+        let mut run: Option<String> = None;
+        egui::Window::new("命令搜索")
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut win_open)
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_q)
+                        .hint_text("输入命令名，如 冻结、居中、数据透视")
+                        .desired_width(f32::INFINITY),
+                );
+                te.request_focus();
+                ui.label(format!("{} 条结果（Enter 执行第一条，Esc 关闭）", hits.len()));
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    for e in hits.iter().take(40) {
+                        if ui
+                            .selectable_label(false, format!("{}    {}", e.label, e.path()))
+                            .clicked()
+                        {
+                            run = Some(e.action.clone());
+                            clicked = true;
+                        }
+                    }
+                });
+            });
+        if !win_open || clicked {
+            open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(e) = hits.first() {
+                run = Some(e.action.clone());
+                open = false;
+            }
+        }
+        if let Some(action) = run {
+            self.ribbon_action(&action, ctx);
+        }
+        self.palette_open = open;
     }
 
     fn dedup_dialog(&mut self, ctx: &egui::Context) {
@@ -25500,10 +25564,11 @@ impl SheetApp {
                         .frame(false)
                         .hint_text("搜索"),
                 );
-                if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    self.find.find = self.search.clone();
-                    self.find.tab = 0;
-                    self.find_open_new_session();
+                // 标题栏搜索框按 Excel 语义搜命令（UI-22），不是工作表查找；
+                // 工作表查找仍走 Ctrl+F 的查找栏。
+                if te.gained_focus() || te.changed() {
+                    self.palette_q = self.search.clone();
+                    self.palette_open = true;
                 }
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
@@ -26086,6 +26151,7 @@ impl eframe::App for SheetApp {
         self.pivot_dialog(ctx);
         self.pivot2_dialog(ctx);
         self.dedup_dialog(ctx);
+        self.command_palette(ctx);
         self.renew_lock_if_needed();
         self.beat_lock();
         self.lock_probe(ctx);
@@ -27874,6 +27940,7 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "g" => key = Some(egui::Key::G),
             "v" => key = Some(egui::Key::V),
             "c" => key = Some(egui::Key::C),
+            "q" => key = Some(egui::Key::Q),
             "x" => key = Some(egui::Key::X),
             "b" => key = Some(egui::Key::B),
             "i" => key = Some(egui::Key::I),
