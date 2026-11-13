@@ -16,6 +16,8 @@
   定向测试全绿，全量 core **76 bins / 694 passed / 0 failed / 32 ignored**。
   另有 4 个并行子任务正在尝试恢复 CF/DV、pivot/pdf、table/style/format、
   refs/sort 夹具；回传后必须逐项复核，不把子任务自报当验收。
+- 19:42 QA-01.3 已加图表/透视/打印扩展夹具（`qa01_extended` 3 tests passed）；
+  仍未做 Excel/WPS 三方矩阵与真实 pivotTable 部件。最新提交 `55d7a53`。
 - 未完成：QA-01 父项仍缺样式/CF/DV/表格/图片/透视/命名/隐藏冻结/外链/打印/
   .xls/.xlsm 的三方矩阵；QA-02.2/02.3 未开始；UI-15.3 仍待实施。
 - 下一条动作：接收子任务结果，核对其实际测试/夹具/diff；通过则并入
