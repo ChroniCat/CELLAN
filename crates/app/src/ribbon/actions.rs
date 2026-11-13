@@ -432,25 +432,25 @@ impl SheetApp {
             }
             "BordersAll" => self.apply_style(|s| s.set_all_borders(1, [128, 128, 128])),
             "BorderBottom" => self.apply_style(|s| {
-                s.border[2] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
                     style: 1,
                     color: [128, 128, 128],
                 }
             }),
             "BorderTop" => self.apply_style(|s| {
-                s.border[0] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
                     style: 1,
                     color: [128, 128, 128],
                 }
             }),
             "BorderLeft" => self.apply_style(|s| {
-                s.border[3] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
                     style: 1,
                     color: [128, 128, 128],
                 }
             }),
             "BorderRight" => self.apply_style(|s| {
-                s.border[1] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
                     style: 1,
                     color: [128, 128, 128],
                 }
@@ -458,13 +458,13 @@ impl SheetApp {
             "BorderOuter" => self.border_outer(1),
             "BorderThickOuter" => self.border_outer(2),
             "BorderThickBottom" => self.apply_style(|s| {
-                s.border[2] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
                     style: 2,
                     color: [128, 128, 128],
                 }
             }),
             "BorderDoubleBottom" => self.apply_style(|s| {
-                s.border[2] = sheetcore::style::Border {
+                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
                     style: 4,
                     color: [128, 128, 128],
                 }
@@ -473,13 +473,13 @@ impl SheetApp {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 self.apply_style_xy(|s, r, _c| {
                     if r > r1 && r <= r2 {
-                        s.border[0] = sheetcore::style::Border {
+                        s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
                             style: 1,
                             color: [128, 128, 128],
                         };
                     }
                     if r >= r1 && r < r2 {
-                        s.border[2] = sheetcore::style::Border {
+                        s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
                             style: 1,
                             color: [128, 128, 128],
                         };
@@ -490,13 +490,13 @@ impl SheetApp {
                 let (_r1, c1, _r2, c2) = self.sel_rect();
                 self.apply_style_xy(|s, _r, c| {
                     if c > c1 && c <= c2 {
-                        s.border[3] = sheetcore::style::Border {
+                        s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
                             style: 1,
                             color: [128, 128, 128],
                         };
                     }
                     if c >= c1 && c < c2 {
-                        s.border[1] = sheetcore::style::Border {
+                        s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
                             style: 1,
                             color: [128, 128, 128],
                         };

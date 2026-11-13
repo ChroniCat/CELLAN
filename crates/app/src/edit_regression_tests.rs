@@ -1039,6 +1039,67 @@ fn shift_enter_and_shift_tab_move_backwards() {
 }
 
 /// UI-09.3：选区内的 Tab/Enter 循环、跳过隐藏行列，以及 XFD/1048576 边界。
+/// UI-08.1：Ribbon 边框方向必须落到左/右/上/下正确下标，内外框不能写反。
+#[test]
+fn ribbon_border_commands_follow_left_right_top_bottom_order() {
+    use sheetcore::style::BorderSide;
+    fn side(app: &SheetApp, r: u32, c: u32, which: BorderSide) -> u8 {
+        app.wb.styles.get(app.wb.sheet(0).style_of(r, c)).border[which.idx()].style
+    }
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    for (action, which) in [
+        ("BorderBottom", BorderSide::Bottom),
+        ("BorderTop", BorderSide::Top),
+        ("BorderLeft", BorderSide::Left),
+        ("BorderRight", BorderSide::Right),
+    ] {
+        app.ribbon_action("BorderNone", &ctx);
+        app.ribbon_action(action, &ctx);
+        assert_eq!(side(&app, 0, 0, which), 1, "{action} 未落到 {which:?}");
+        for other in [BorderSide::Left, BorderSide::Right, BorderSide::Top, BorderSide::Bottom] {
+            if other != which {
+                assert_eq!(side(&app, 0, 0, other), 0, "{action} 误画 {other:?}");
+            }
+        }
+    }
+
+    app.ribbon_action("BorderNone", &ctx);
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.ribbon_action("BorderOuter", &ctx);
+    assert_eq!(side(&app, 0, 0, BorderSide::Top), 1);
+    assert_eq!(side(&app, 0, 0, BorderSide::Left), 1);
+    assert_eq!(side(&app, 0, 0, BorderSide::Right), 0);
+    assert_eq!(side(&app, 0, 0, BorderSide::Bottom), 0);
+    assert_eq!(side(&app, 0, 1, BorderSide::Top), 1);
+    assert_eq!(side(&app, 0, 1, BorderSide::Right), 1);
+    assert_eq!(side(&app, 1, 0, BorderSide::Bottom), 1);
+    assert_eq!(side(&app, 1, 0, BorderSide::Left), 1);
+    assert_eq!(side(&app, 1, 1, BorderSide::Bottom), 1);
+    assert_eq!(side(&app, 1, 1, BorderSide::Right), 1);
+
+    app.ribbon_action("BorderNone", &ctx);
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.ribbon_action("BorderInsideH", &ctx);
+    assert_eq!(side(&app, 0, 0, BorderSide::Bottom), 1);
+    assert_eq!(side(&app, 1, 0, BorderSide::Top), 1);
+    assert_eq!(side(&app, 0, 0, BorderSide::Top), 0);
+    assert_eq!(side(&app, 1, 0, BorderSide::Bottom), 0);
+
+    app.ribbon_action("BorderNone", &ctx);
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.ribbon_action("BorderInsideV", &ctx);
+    assert_eq!(side(&app, 0, 0, BorderSide::Right), 1);
+    assert_eq!(side(&app, 0, 1, BorderSide::Left), 1);
+    assert_eq!(side(&app, 0, 0, BorderSide::Left), 0);
+    assert_eq!(side(&app, 0, 1, BorderSide::Right), 0);
+}
+
 #[test]
 fn tab_enter_cycle_inside_selection_and_stop_at_sheet_edges() {
     let ctx = egui::Context::default();

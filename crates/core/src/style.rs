@@ -14,6 +14,22 @@ pub struct Border {
     pub color: [u8; 3],
 }
 
+/// 边框数组的命名下标，避免各处裸写 0/1/2/3 把左右、上下写反。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum BorderSide {
+    Left = 0,
+    Right = 1,
+    Top = 2,
+    Bottom = 3,
+}
+
+impl BorderSide {
+    pub fn idx(self) -> usize {
+        self as usize
+    }
+}
+
 impl Border {
     pub fn is_none(&self) -> bool {
         self.style == 0

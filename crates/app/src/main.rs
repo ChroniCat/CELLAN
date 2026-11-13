@@ -8185,10 +8185,10 @@ fn clear_values(&mut self) {
         let (r1, c1, r2, c2) = self.sel_rect();
         self.apply_style_xy(|s, r, c| {
             let b = sheetcore::style::Border { style, color: [128, 128, 128] };
-            if r == r1 { s.border[0] = b; }
-            if c == c2 { s.border[1] = b; }
-            if r == r2 { s.border[2] = b; }
-            if c == c1 { s.border[3] = b; }
+            if r == r1 { s.border[sheetcore::style::BorderSide::Top.idx()] = b; }
+            if c == c2 { s.border[sheetcore::style::BorderSide::Right.idx()] = b; }
+            if r == r2 { s.border[sheetcore::style::BorderSide::Bottom.idx()] = b; }
+            if c == c1 { s.border[sheetcore::style::BorderSide::Left.idx()] = b; }
         });
     }
 
