@@ -3696,7 +3696,7 @@
       "scope": "app/main.rs单元格文字绘制",
       "source": "core-requirements.md",
       "heading": "C22 P1 常规文本对齐和长文本裁剪",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "General 对齐按 Excel 约定：文本靠左、数字（含日期序列号）靠右、布尔/错误居中；显式 halign 左/中/右覆盖 General。crates/app/src/main.rs 新增 cell_text_align，绘制入口使用它。专项单测断言文本/数字/布尔/错误与显式对齐；SC_SHOT 合成工作簿 A1:G1 实测 A1 左、B1 123.45 右、C1 TRUE 中、D1 #DIV/0! 中、E1 左、F1 中、G1 右。长文本仍按用户既定偏好默认裁剪在格内（视图→显示→文字溢出可切 Excel 溢出）；长文本起点与真实 Excel 同位置像素对拍未做。",
       "files": [
         "crates/app/src/main.rs",
@@ -3716,14 +3716,11 @@
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-general-alignment.txt"
       ],
-      "not_done": [
-        "真实 Excel 365 同位置像素对拍未做（本机已有其他 Excel 实例，未强行复用）",
-        "长文本相邻空格/被占用两种情况下的真实鼠标与截图验收待补"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "补长文本裁剪/溢出切换截图，并在不干扰现有 Excel 实例的条件下做 Excel 同位置对拍。",
-      "updated_utc": "2026-11-13T07:25:00Z",
+      "next": "",
+      "updated_utc": "2026-11-13T16:39:32Z",
       "slices": [
         {
           "id": "C22.1",
@@ -3731,29 +3728,34 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C22 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "General 对齐按 Excel 约定：文本靠左、数字（含日期序列号）靠右、布尔/错误居中；显式 halign 左/中/右覆盖 General。crates/app/src/main.rs 新增 cell_text_align，绘制入口使用它。专项单测断言文本/数字/布尔/错误与显式对齐；SC_SHOT 合成工作簿 A1:G1 实测 A1 左、B1 123.45 右、C1 TRUE 中、D1 #DIV/0! 中、E1 左、F1 中、G1 右。长文本仍按用户既定偏好默认裁剪在格内（视图→显示→文字溢出可切 Excel 溢出）；长文本起点与真实 Excel 同位置像素对拍未做。",
+          "status": "已验收",
+          "acceptance": "General 文本左/数字右/布尔错误居中、显式覆盖；长文本仅向空邻格溢出，遇非空/合并/隐藏列在本列边界截断且开头可见；真实窗口与 Excel 16.0、WPS 12.0 逐行墨迹分段一致。",
           "files": [
             "crates/app/src/main.rs",
-            "crates/app/src/edit_regression_tests.rs"
+            "crates/app/src/edit_regression_tests.rs",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-fixture.xlsx",
+            "scripts/excel_c22_range_picture.ps1",
+            "scripts/wps_c22_range_picture.ps1"
           ],
           "commits": [
             "e81c221"
           ],
           "commands": [
-            "cargo test -p app --offline --bin app general_text_alignment_matches_excel_and_explicit_alignment_wins -> 1 passed"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 262 passed",
+            "cargo test -p app --offline -j 2 --test ui_regression -> 20 passed",
+            "GUI c22c.png + Excel/WPS CopyPicture 导出逐行墨迹分段一致"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-general-alignment.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-alignment-spill.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-general-text-spill.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-excel-range.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c22-wps-range.png"
           ],
-          "not_done": [
-            "真实 Excel 365 同位置像素对拍未做（本机已有其他 Excel 实例，未强行复用）",
-            "长文本相邻空格/被占用两种情况下的真实鼠标与截图验收待补"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补长文本裁剪/溢出切换截图，并在不干扰现有 Excel 实例的条件下做 Excel 同位置对拍。",
-          "updated_utc": "2026-11-13T06:08:00Z"
+          "next": "",
+          "updated_utc": "2026-11-13T16:39:32Z"
         }
       ]
     },

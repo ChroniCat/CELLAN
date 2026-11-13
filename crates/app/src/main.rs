@@ -1531,7 +1531,7 @@ impl SheetApp {
             open_requests: None,
             shared_current_file: None,
             show_start: false,
-            text_spill: false,
+            text_spill: true,
             confirm_close_target: None,
             tabs_done: false,
             paste_done: false,
@@ -15332,6 +15332,62 @@ let txn = self.txn_begin(&keys);
 
     /// 画一个单元格：底色、条件格式、文字、边框、批注标记。
     /// 冻结窗格要复用它，所以单独拎出来。
+    /// Excel 的文本溢出规则：常规/左对齐向右延伸，右对齐向左延伸，居中两侧；
+    /// 遇到第一个非空单元格、别的合并区或隐藏列就停在边界上。
+    /// 裁剪区永远从本格左边界开始（左对齐时文字起点始终可见）。
+    fn spill_clip(&self, r: u32, c: u32, rect: Rect, align: egui::Align2) -> Rect {
+        let sh = self.wb.sheet(self.sheet_idx);
+        let scale = self.paint_scale;
+        let (mr1, mc1, mr2, mc2) = sh.merge_at(r, c).unwrap_or((r, c, r, c));
+        let blocked_right = |cc: u32| -> bool {
+            if sh.hidden_cols.contains(&cc) {
+                return true;
+            }
+            if let Some((_, a, _, b)) = sh.merge_at(r, cc) {
+                // 本格右侧的合并区（锚点不在本格）会挡住溢出
+                if !(a == mc1 && b == mc2) {
+                    return true;
+                }
+            }
+            sh.get(mr1, cc)
+                .map(|x| x.formula.is_some() || !x.value.display().trim().is_empty())
+                .unwrap_or(false)
+        };
+        let blocked_left = |cc: u32| -> bool {
+            if sh.hidden_cols.contains(&cc) {
+                return true;
+            }
+            if let Some((_, a, _, b)) = sh.merge_at(r, cc) {
+                if !(a == mc1 && b == mc2) {
+                    return true;
+                }
+            }
+            sh.get(mr1, cc)
+                .map(|x| x.formula.is_some() || !x.value.display().trim().is_empty())
+                .unwrap_or(false)
+        };
+        let mut left = rect.min.x;
+        let mut right = rect.max.x;
+        if align != egui::Align2::RIGHT_CENTER {
+            let mut cc = mc2 + 1;
+            while cc < mc2.saturating_add(64) && !blocked_right(cc) {
+                right += sh.cols.size(cc) * scale;
+                cc += 1;
+            }
+        }
+        if align == egui::Align2::RIGHT_CENTER || align == egui::Align2::CENTER_CENTER {
+            let mut cc = mc1;
+            while cc > 0 && !blocked_left(cc - 1) {
+                cc -= 1;
+                left -= sh.cols.size(cc) * scale;
+            }
+        }
+        Rect::from_min_max(
+            egui::pos2(left, rect.min.y),
+            egui::pos2(right.max(left + rect.width()), rect.max.y),
+        )
+    }
+
     fn paint_cell(
         &self,
         painter: &egui::Painter,
@@ -15497,6 +15553,9 @@ let txn = self.txn_begin(&keys);
                 // 多行/自动换行要按单元格宽度排版并裁到格子里，
                 // 否则长地址会溢出到右边的发票号上（Excel 会裁掉）。
                 let multiline = st.wrap || txt.contains("\n");
+                if dumping {
+                    dump.push(format!("branch ({},{}) ml={} wrap={}", r, c, multiline, st.wrap));
+                }
                 let rich_runs = self
                     .wb
                     .sheet(self.sheet_idx)
@@ -15532,7 +15591,18 @@ let txn = self.txn_begin(&keys);
                         // Excel 的缩进 1 级约 3 个字符宽，按字号折算成像素
                     _ => rect.min.x + 4.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                     };
-                    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+                    let spill = if self.text_spill {
+                        self.spill_clip(r, c, rect, align)
+                    } else {
+                        rect
+                    };
+                    let clipped = painter.with_clip_rect(spill.intersect(painter.clip_rect()));
+                    if dumping {
+                        dump.push(format!(
+                            "textclip ({},{}) [{:.0},{:.0}] cell=[{:.0},{:.0}] rich",
+                            r, c, spill.min.x, spill.max.x, rect.min.x, rect.max.x
+                        ));
+                    }
                     for (i_run, (g, (_, c))) in galleys.into_iter().zip(fonts.iter()).enumerate() {
                         let w = g.size().x;
                         let gh = g.size().y;
@@ -15601,14 +15671,18 @@ let txn = self.txn_begin(&keys);
                     } else {
                         rect.center().y - gh / 2.0
                     };
+                    // Excel 只往空邻格溢出；被挡住就裁在本格边界，文字起点仍可见
                     let clip = if self.text_spill {
-                        Rect::from_min_max(
-                            egui::pos2(rect.min.x, rect.min.y),
-                            egui::pos2(painter.clip_rect().max.x, rect.max.y),
-                        )
+                        self.spill_clip(r, c, rect, align)
                     } else {
                         rect
                     };
+                    if dumping {
+                        dump.push(format!(
+                            "textclip ({},{}) [{:.0},{:.0}] cell=[{:.0},{:.0}]",
+                            r, c, clip.min.x, clip.max.x, rect.min.x, rect.max.x
+                        ));
+                    }
                     let clipped = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
                     if st.rotation != 0 {
                         // 文字旋转：TextShape 的 angle 绕原点转，所以把原点放在

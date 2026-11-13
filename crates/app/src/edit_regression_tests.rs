@@ -3806,6 +3806,62 @@ fn protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick() {
 }
 
 
+/// C22：文本溢出按 Excel 规则——邻格空才延伸，遇非空即止；左对齐起点永远可见，
+/// 换缩放比例只按列宽等比放大，不改变边界。
+#[test]
+fn spill_clip_follows_excel_neighbour_rules_and_scales_with_zoom() {
+    use egui::{pos2, vec2, Align2, Rect};
+    let env = crate::test_env::TestEnv::new("c22_spill");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "c22");
+    let (w1, w2) = {
+        let sh = app.wb.sheet(0);
+        (sh.cols.size(1), sh.cols.size(2))
+    };
+    let rect = Rect::from_min_size(pos2(100.0, 50.0), vec2(80.0, 20.0));
+
+    // B1 有内容（seeded 的 v01）：左对齐只能停在本格右边界
+    app.paint_scale = 1.0;
+    let clip = app.spill_clip(0, 0, rect, Align2::LEFT_CENTER);
+    assert_eq!(clip.min.x, 100.0, "左对齐起点必须在本格左边界");
+    assert_eq!(clip.max.x, 180.0, "右邻非空时不能溢出");
+
+    // 清空 B1、C1：连续两个空格都要算进去
+    app.wb.sheet_mut(0).set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Empty, formula: None });
+    app.wb.sheet_mut(0).set(0, 2, sheetcore::model::Cell { value: sheetcore::model::Value::Empty, formula: None });
+    // D1 放个内容当挡板，溢出应正好停在 C 的右边界
+    app.wb.sheet_mut(0).set(0, 3, sheetcore::model::Cell { value: sheetcore::model::Value::Text("挡".into()), formula: None });
+    let clip = app.spill_clip(0, 0, rect, Align2::LEFT_CENTER);
+    assert!((clip.max.x - (180.0 + w1 + w2)).abs() < 0.01, "两个空格应延伸两列：{}", clip.max.x);
+
+    // 居中：两侧都可以溢出
+    // C1 左邻 B1 已清空、右邻 D1 有挡板：居中只往左延伸
+    let cell_c = Rect::from_min_size(pos2(180.0, 50.0), vec2(80.0, 20.0));
+    let clip_center = app.spill_clip(0, 2, cell_c, Align2::CENTER_CENTER);
+    assert!(clip_center.min.x < 180.0, "居中左侧空白应延伸：{}", clip_center.min.x);
+
+    // 右对齐：只往左延伸，右边界不动
+    let clip_right = app.spill_clip(0, 2, cell_c, Align2::RIGHT_CENTER);
+    assert_eq!(clip_right.max.x, 260.0, "右对齐不能向右溢出");
+    assert!(clip_right.min.x < 180.0, "右对齐可向左溢出");
+
+    // 隐藏列要挡住溢出
+    app.wb.sheet_mut(0).hidden_cols.insert(2);
+    let clip_hidden = app.spill_clip(0, 0, rect, Align2::LEFT_CENTER);
+    assert!((clip_hidden.max.x - (180.0 + w1)).abs() < 0.01, "隐藏列 C 应挡住：{}", clip_hidden.max.x);
+    app.wb.sheet_mut(0).hidden_cols.remove(&2);
+
+    // 缩放 2 倍：延伸宽度等比翻倍，边界仍对齐列边界
+    app.paint_scale = 1.0;
+    let one = app.spill_clip(0, 0, rect, Align2::LEFT_CENTER);
+    app.paint_scale = 2.0;
+    let clip2 = app.spill_clip(0, 0, Rect::from_min_size(pos2(200.0, 100.0), vec2(160.0, 40.0)), Align2::LEFT_CENTER);
+    let ext1 = one.max.x - 180.0;
+    let ext2 = clip2.max.x - 360.0;
+    assert_eq!(one.max.x, clip.max.x, "one={} clip={} w1={} w2={}", one.max.x, clip.max.x, w1, w2);
+    assert!((ext2 - ext1 * 2.0).abs() < 0.01, "缩放后延伸宽度应等比：{ext1} vs {ext2}");
+    drop(env);
+}
 /// C15：受保护表上「锁定公式区 + 未锁输入区」，只允许改输入区；
 /// 排序/插入行要有对应权限才放行。
 #[test]
