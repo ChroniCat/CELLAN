@@ -42,3 +42,10 @@ sheetcore 全量通过（290 lib + 各集成）；app `--bin app` 272 passed。
   分成 2 页——这是 QA-09.1 同一根因，仍未解决。
 - pdftotext 对 Excel 与本项目 PDF 都无法提取中文（Excel 导出同样只剩数字），
   因此中文断行/重叠只能靠渲染图，当前无可用 rasterizer；不能据此判过。
+
+## 行高排查（2026-11-14）
+- `objects3.xlsx` 用 Excel COM 读：Zoom=100、FitToPagesWide/Tall=False、第 20 行 RowHeight=14.25pt（19px），
+  与项目默认行高一致；Excel 仍导出 1 页，说明 FitToPages 的 False 在 COM 里表示“自动”，
+  该夹具不能作为分页基准，需改用明确 Zoom 且无 FitToPages 的夹具。
+- 曾按“中文默认字体 13.5pt”临时把默认行高改 18px，实测与 Excel 14.25pt 不符，已回退，未提交。
+- `print.xlsx`（Calibri 11）Excel 行高 14.25pt；本项目分页仍差 1–2 行，根因未定，不能靠猜默认行高修。
