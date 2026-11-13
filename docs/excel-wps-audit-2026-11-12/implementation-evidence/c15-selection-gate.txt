@@ -1,0 +1,23 @@
+# C15 选择权限整块门禁（拖选 / Shift 点击 / Shift 方向键）
+
+日期：2026-11-14
+
+复核指出的绕过路径：拖选只查终点、Shift+点击只查命中点，`rect_sel_blocked` 只用于名称框。
+本轮把整块门禁接进生产选择入口：
+
+- 鼠标拖选：每帧用锚点 `sel` 到当前指针格做 `rect_sel_blocked`，含禁选格则拒绝扩展并提示。
+- Shift+点击：按下帧先用 `sel_end`→hit 整块检查，拒选时不让活动格移动；松开帧再次检查并退回锚点。
+- Ctrl+点击：命中的单格也过 `sel_blocked_at`，避免按下/松开路径绕过。
+- Shift+方向键：从 `sel_end` 到目标格整块检查，不是只查目标格。
+- 名称框沿用整块门禁；函数注释已改为“名称框、鼠标拖选、Shift+点击、Shift+方向键都走这里”，
+  不再写“和鼠标拖选一致”而实际未接入。
+
+真实指针事件回归（不是直接调函数）：
+- `drag_selection_rejects_range_containing_forbidden_cell`：B1/D1 解锁、C1 锁定且禁选锁定格，
+  按住 B1 拖到 D1，`sel_end` 停在 B1，状态栏提示“不允许选择”。
+- `shift_click_rejects_range_containing_forbidden_cell`：同样布局，Shift 点击 D1 被整块拒绝，
+  活动格退回 B1。
+- `shift_arrow_rejects_range_containing_forbidden_cell`：Shift+→ 试图经过 C1 被拒绝。
+- 既有 `shift_click_extends_selection`、`keyboard_advance_skips...`、`name_box_range_rejects...` 继续通过。
+
+测试：app `--bin app` **287 passed**；core lib **292 passed**。

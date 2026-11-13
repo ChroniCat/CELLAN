@@ -7084,3 +7084,175 @@ fn zoom_is_per_sheet() {
     app.switch_sheet_relative(1);
     assert_eq!(app.zoom, 1.5, "第二张表恢复 150%");
 }
+/// UI-25：多选、过滤可见性、隐藏行列、百万行稀疏选区。
+#[test]
+fn status_stats_cover_multi_rect_filter_and_sparse_edges() {
+    use crate::{status_stats_rects, status_stats_text};
+    let mut sh = sheetcore::model::Sheet::new("S");
+    for (r, c, v) in [
+        (0u32, 0u32, Value::Number(1.0)),
+        (2, 0, Value::Text("文本".into())),
+        (3, 0, Value::Number(3.0)),
+        (1_000_000, 0, Value::Number(5.0)),
+    ] {
+        sh.set(r, c, Cell { value: v, formula: None });
+    }
+    let none = std::collections::HashSet::new();
+    // A1 + A4 非连续选区：sum=4，两个数值，count=2
+    let multi = status_stats_rects(&sh, &[(0, 0, 0, 0), (3, 0, 3, 0)], 0b11_1111, &none);
+    assert!(multi.contains("求和: 4"), "{multi}");
+    assert!(multi.contains("数值计数: 2"), "{multi}");
+    assert!(multi.contains("平均值: 2"), "{multi}");
+
+    // 矩形本身的空白、文本都按 Excel 口径：count 计文本，数值项只吃 Number
+    let all = status_stats_text(&sh, (0, 0, 3, 0), 0b11_1111);
+    assert!(all.contains("计数: 3"), "{all}");
+    assert!(all.contains("数值计数: 2"), "{all}");
+
+    // 筛选隐藏的行不算；隐藏行/列也不算
+    let mut skip = std::collections::HashSet::new();
+    skip.insert(3u32);
+    let filtered = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8, &skip);
+    assert!(filtered.contains("求和: 1"), "{filtered}");
+    sh.rows.set(0, 0.0);
+    let hidden = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8, &none);
+    assert!(hidden.contains("求和: 3"), "隐藏 A1 后只剩 A4：{hidden}");
+
+    // 百万行稀疏选区：只碰实际存在的格，不需要逐坐标扫
+    let big = status_stats_rects(
+        &sh,
+        &[(0, 0, 1_048_575, 0)],
+        0b11_1111,
+        &std::collections::HashSet::new(),
+    );
+    assert!(big.contains("求和: 8"), "1 + 3 + 5：{big}");
+}
+/// UI-25：筛选隐藏的行必须从统计里排除（规则来自真实 Filter）。
+#[test]
+fn status_stats_follow_active_filter_hidden_rows() {
+    use crate::status_stats_rects;
+    let mut sh = sheetcore::model::Sheet::new("S");
+    sh.set(0, 0, Cell { value: Value::Text("类型".into()), formula: None });
+    sh.set(1, 0, Cell { value: Value::Text("A".into()), formula: None });
+    sh.set(1, 1, Cell { value: Value::Number(10.0), formula: None });
+    sh.set(2, 0, Cell { value: Value::Text("B".into()), formula: None });
+    sh.set(2, 1, Cell { value: Value::Number(20.0), formula: None });
+    let mut f = sheetcore::sort_filter::Filter::new(0, 0, 2, 1);
+    f.allows.insert(0, std::iter::once("A".to_string()).collect());
+    let hidden = f.hidden_rows(&sh);
+    assert!(hidden.contains(&2), "B 行应被筛掉：{hidden:?}");
+    let stat = status_stats_rects(&sh, &[(0, 0, 2, 1)], 0b11_1111, &hidden);
+    assert!(stat.contains("求和: 10"), "只统计可见的 A 行：{stat}");
+    assert!(stat.contains("计数: 3"), "表头+A 行类型+A 行数值：{stat}");
+}
+/// C15：B1/D1 解锁、C1 锁定且禁选锁定格时，鼠标拖选 B1→D1 不能把 C1 包进来。
+#[test]
+fn drag_selection_rejects_range_containing_forbidden_cell() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for c in [1u32, 3] {
+        let sid = app.wb.sheet(0).style_of(0, c);
+        let mut st = app.wb.styles.get(sid).clone();
+        st.locked = false;
+        let sid = app.wb.styles.intern(st);
+        app.wb.sheet_mut(0).set_style(0, c, sid);
+    }
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+
+    let x_b = HEAD_W + app.wb.sheets[0].cols.pos(1) + 15.0;
+    let x_d = HEAD_W + app.wb.sheets[0].cols.pos(3) + 15.0;
+    let y = HEAD_H + app.wb.sheets[0].rows.pos(0) + 10.0;
+    let run = |app: &mut SheetApp, ctx: &egui::Context, pos: egui::Pos2, pressed: Option<bool>| {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::default(),
+            });
+        }
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    };
+    run(&mut app, &ctx, egui::pos2(x_b, y), None);
+    run(&mut app, &ctx, egui::pos2(x_b, y), Some(true));
+    assert_eq!(app.sel, (0, 1), "B1 本身可选");
+    run(&mut app, &ctx, egui::pos2(x_d, y), None); // 按住拖到 D1
+    assert_eq!(app.sel_end, (0, 1), "整块含锁定的 C1，选区不能扩到 D1");
+    assert!(app.status.contains("不允许选择"), "状态栏：{}", app.status);
+}
+
+/// C15：Shift+点击 D1 同样按整块检查，不能只查终点。
+#[test]
+fn shift_click_rejects_range_containing_forbidden_cell() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for c in [1u32, 3] {
+        let sid = app.wb.sheet(0).style_of(0, c);
+        let mut st = app.wb.styles.get(sid).clone();
+        st.locked = false;
+        let sid = app.wb.styles.intern(st);
+        app.wb.sheet_mut(0).set_style(0, c, sid);
+    }
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+
+    let x_d = HEAD_W + app.wb.sheets[0].cols.pos(3) + 15.0;
+    let y = HEAD_H + app.wb.sheets[0].rows.pos(0) + 10.0;
+    let pos = egui::pos2(x_d, y);
+    let sh = egui::Modifiers { shift: true, ..Default::default() };
+    for pressed in [None, Some(true), Some(false)] {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            modifiers: sh,
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: sh,
+            });
+        }
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    }
+    assert_eq!(app.sel, (0, 1), "含锁定 C1 的 Shift 选区必须整块拒绝");
+    assert_eq!(app.sel_end, (0, 1));
+    assert!(app.status.contains("不允许选择"), "状态栏：{}", app.status);
+}
+/// C15：Shift+方向键扩选同样整块过门禁，不能跨过锁定的 C1 扩到 D1。
+#[test]
+fn shift_arrow_rejects_range_containing_forbidden_cell() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for c in [1u32, 3] {
+        let sid = app.wb.sheet(0).style_of(0, c);
+        let mut st = app.wb.styles.get(sid).clone();
+        st.locked = false;
+        let sid = app.wb.styles.intern(st);
+        app.wb.sheet_mut(0).set_style(0, c, sid);
+    }
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("pw");
+    prot.perms.select_locked = false;
+    prot.perms.select_unlocked = true;
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, true)]);
+    assert_eq!(app.sel, (0, 1), "经过锁定 C1 的 Shift 扩选必须拒绝");
+    assert_eq!(app.sel_end, (0, 1));
+    assert!(app.status.contains("不允许选择"), "状态栏：{}", app.status);
+}

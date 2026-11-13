@@ -988,6 +988,8 @@ struct SheetApp {
     extra_sel: Vec<(u32, u32, u32, u32)>,
     /// UI-16：按工作表 identity 保存的每表视图（切表时保存/恢复）
     sheet_views: std::collections::HashMap<u64, SheetViewState>,
+    /// UI-25：大选区统计的分帧任务
+    stats_job: Option<StatsJob>,
     /// Tab/Enter 在矩形选区内循环时保留的原始区域；None 表示普通单格导航
     nav_rect: Option<(u32, u32, u32, u32)>,
     /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
@@ -1455,60 +1457,157 @@ fn ctx_menu_height(rows: &[CtxRow]) -> f32 {
     h + 4.0
 }
 
-/// 状态栏统计文本（C25）：按位掩码输出 Excel 同名项；无数值时只显示计数。
+/// 状态栏统计累加器（UI-25）：计数=非空格；数值统计只吃 Number。
+#[derive(Default, Clone, Copy)]
+pub(crate) struct StatsAcc {
+    pub count: u64,
+    pub nums: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl StatsAcc {
+    fn add(&mut self, v: Option<f64>) {
+        self.count += 1;
+        if let Some(v) = v {
+            if self.nums == 0 {
+                self.min = v;
+                self.max = v;
+            } else {
+                self.min = self.min.min(v);
+                self.max = self.max.max(v);
+            }
+            self.nums += 1;
+            self.sum += v;
+        }
+    }
+
+    pub(crate) fn text(&self, mask: u8) -> String {
+        fn num(v: f64) -> String {
+            let mut s = format!("{v:.4}");
+            while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
+                s.pop();
+            }
+            if s == "-0" {
+                s = "0".into();
+            }
+            s
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if mask & 1 != 0 && self.nums > 0 {
+            parts.push(format!("平均值: {}", num(self.sum / self.nums as f64)));
+        }
+        if mask & 2 != 0 && self.count > 0 {
+            parts.push(format!("计数: {}", self.count));
+        }
+        if mask & 4 != 0 && self.nums > 0 {
+            parts.push(format!("数值计数: {}", self.nums));
+        }
+        if mask & 8 != 0 && self.nums > 0 {
+            parts.push(format!("求和: {}", num(self.sum)));
+        }
+        if mask & 16 != 0 && self.nums > 0 {
+            parts.push(format!("最小值: {}", num(self.min)));
+        }
+        if mask & 32 != 0 && self.nums > 0 {
+            parts.push(format!("最大值: {}", num(self.max)));
+        }
+        parts.join("    ")
+    }
+}
+
+/// 稀疏收集选区里的非空格：按 Store 里实际存在的格子迭代，
+/// 不是按矩形逐坐标扫（百万行稀疏表只碰真正有值的格）。
+/// 隐藏行/列和筛选掉的行不算；多选区每个格只算一次。
+pub(crate) fn collect_stats_values(
+    sheet: &sheetcore::model::Sheet,
+    rects: &[(u32, u32, u32, u32)],
+    skip_rows: &std::collections::HashSet<u32>,
+) -> Vec<Option<f64>> {
+    let mut out = Vec::new();
+    for (cr, cell) in sheet.iter() {
+        let (r, c) = (cr.row, cr.col);
+        if cell.is_blank()
+            || sheet.rows.size(r) <= 0.0
+            || sheet.cols.size(c) <= 0.0
+            || skip_rows.contains(&r)
+        {
+            continue;
+        }
+        if !rects
+            .iter()
+            .any(|&(r1, c1, r2, c2)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+        {
+            continue;
+        }
+        out.push(match &cell.value {
+            sheetcore::model::Value::Number(v) => Some(*v),
+            _ => None,
+        });
+    }
+    out
+}
+
+/// 多选区统计入口（状态栏用）。
+pub(crate) fn status_stats_rects(
+    sheet: &sheetcore::model::Sheet,
+    rects: &[(u32, u32, u32, u32)],
+    mask: u8,
+    skip_rows: &std::collections::HashSet<u32>,
+) -> String {
+    let mut acc = StatsAcc::default();
+    for v in collect_stats_values(sheet, rects, skip_rows) {
+        acc.add(v);
+    }
+    acc.text(mask)
+}
+
+/// 状态栏统计文本（C25）：单矩形兼容入口；按位掩码输出 Excel 同名项。
 pub(crate) fn status_stats_text(
     sheet: &sheetcore::model::Sheet,
     rect: (u32, u32, u32, u32),
     mask: u8,
 ) -> String {
-    fn num(v: f64) -> String {
-        let mut s = format!("{v:.4}");
-        while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
-            s.pop();
-        }
-        if s == "-0" {
-            s = "0".into();
-        }
-        s
-    }
-    let (r1, c1, r2, c2) = rect;
-    let (mut count, mut nums, mut sum) = (0u64, 0u64, 0f64);
-    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-    for r in r1..=r2 {
-        for c in c1..=c2 {
-            let Some(cell) = sheet.get(r, c) else { continue };
-            if cell.is_blank() {
-                continue;
+    status_stats_rects(sheet, &[rect], mask, &std::collections::HashSet::new())
+}
+
+/// UI-25：大选区分帧统计，避免一帧扫完整块导致界面卡死。
+pub(crate) struct StatsJob {
+    key: (usize, u64, Vec<(u32, u32, u32, u32)>, u8),
+    vals: Vec<Option<f64>>,
+    idx: usize,
+    acc: StatsAcc,
+    started: u64,
+}
+
+/// UI-25 状态栏统计菜单：六项开关 + 复制当前结果。
+fn stats_mask_menu(ui: &mut egui::Ui, mask: &mut u8, stat: &str) {
+    for (bit, name) in [
+        (1u8, "平均值"),
+        (2, "计数"),
+        (4, "数值计数"),
+        (8, "求和"),
+        (16, "最小值"),
+        (32, "最大值"),
+    ] {
+        let mut on = *mask & bit != 0;
+        if ui.checkbox(&mut on, name).changed() {
+            if on {
+                *mask |= bit;
+            } else {
+                *mask &= !bit;
             }
-            count += 1;
-            if let Value::Number(v) = &cell.value {
-                nums += 1;
-                sum += *v;
-                min = min.min(*v);
-                max = max.max(*v);
-            }
         }
     }
-    let mut parts: Vec<String> = Vec::new();
-    if mask & 1 != 0 && nums > 0 {
-        parts.push(format!("平均值: {}", num(sum / nums as f64)));
+    ui.separator();
+    if ui
+        .add_enabled(!stat.is_empty(), egui::Button::new("复制统计结果"))
+        .clicked()
+    {
+        ui.ctx().copy_text(stat.to_string());
+        ui.close_menu();
     }
-    if mask & 2 != 0 && count > 0 {
-        parts.push(format!("计数: {count}"));
-    }
-    if mask & 4 != 0 && nums > 0 {
-        parts.push(format!("数值计数: {nums}"));
-    }
-    if mask & 8 != 0 && nums > 0 {
-        parts.push(format!("求和: {}", num(sum)));
-    }
-    if mask & 16 != 0 && nums > 0 {
-        parts.push(format!("最小值: {}", num(min)));
-    }
-    if mask & 32 != 0 && nums > 0 {
-        parts.push(format!("最大值: {}", num(max)));
-    }
-    parts.join("    ")
 }
 
 impl SheetApp {
@@ -1729,7 +1828,16 @@ impl SheetApp {
             zh_preview_all_sheets: false,
             zh_preview_sheet: None,
             zh_preview_variant: ui_prefs::variant_from_u8(ui_prefs::UiPrefs::load().zh_variant),
-            prefs: ui_prefs::UiPrefs::load(),
+            prefs: {
+                let mut p = ui_prefs::UiPrefs::load();
+                // 无界面验收：SC_STAT_MASK=0 直接以「全关」启动，验证入口仍在
+                if let Ok(v) = std::env::var("SC_STAT_MASK") {
+                    if let Ok(m) = v.parse::<u8>() {
+                        p.stat_mask = m & 0b11_1111;
+                    }
+                }
+                p
+            },
             outline_set_dlg: false,
             proof_dlg: false,
             proof_list: Vec::new(),
@@ -1764,8 +1872,23 @@ impl SheetApp {
             pivot_last: None,
             fmt_pending: false,
             paint_scale: 1.0,
-            extra_sel: Vec::new(),
+            extra_sel: {
+                let mut v = Vec::new();
+                if let Ok(spec) = std::env::var("SC_EXTRA_SEL") {
+                    for one in spec.split(';') {
+                        let p: Vec<u32> = one
+                            .split(',')
+                            .filter_map(|x| x.trim().parse().ok())
+                            .collect();
+                        if p.len() == 4 {
+                            v.push((p[0], p[1], p[2], p[3]));
+                        }
+                    }
+                }
+                v
+            },
             sheet_views: std::collections::HashMap::new(),
+            stats_job: None,
             nav_rect: None,
             grid_press: None,
             ctx_menu: None,
@@ -4193,7 +4316,8 @@ impl SheetApp {
         }
     }
 
-    /// 名称框整块选区：任何一格被禁选就整批拒绝（和鼠标拖选一致）
+    /// 整块选区门禁：名称框、鼠标拖选、Shift+点击、Shift+方向键都走这里；
+    /// 任何一格被禁选就整批拒绝，不能只看起点/终点。
     fn rect_sel_blocked(&self, a: (u32, u32), b: (u32, u32)) -> bool {
         let (r1, c1) = (a.0.min(b.0), a.1.min(b.1));
         let (r2, c2) = (a.0.max(b.0), a.1.max(b.1));
@@ -5052,8 +5176,9 @@ impl SheetApp {
                     st.bold
                 );
             }
-            // 左边 4px 起始 + 右边留 6px，再加一点余量避免最后一个字被切
-            width = width.max(w + 16.0 + st.indent as f32 * size * 2.0);
+            // 列宽模型是「内容宽 + 内边距」；+5 与 Excel 的 5px 内边距一致。
+            // 注意保存仍按 px/8（既有文件兼容），所以输出字符数会略宽于 Excel。
+            width = width.max(w + 5.0 + st.indent as f32 * size * 2.0);
         }
         let width = width.clamp(24.0, 1500.0);
         {
@@ -5098,25 +5223,32 @@ impl SheetApp {
                 fam,
             );
             let col_w = self.wb.sheet(self.sheet_idx).cols.size(c);
-            let h = if st.wrap {
+            // Excel 自适应行高 = 文字高度 + 每折行 1px（单行 18+1=19px，
+            // 三行 54+3=57px，和本机 Excel 的 14.25pt / 42.75pt 对齐）。
+            let (h, lines) = if st.wrap {
                 ctx.fonts(|f| {
-                    f.layout(
+                    let g = f.layout(
                         txt.clone(),
                         font.clone(),
                         egui::Color32::BLACK,
                         (col_w - 6.0).max(8.0),
-                    )
-                    .size()
-                    .y
+                    );
+                    (g.size().y, g.rows.len().max(1))
                 })
             } else {
-                ctx.fonts(|f| {
-                    f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
-                        .size()
-                        .y
-                })
+                (
+                    ctx.fonts(|f| {
+                        f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
+                            .size()
+                            .y
+                    }),
+                    1,
+                )
             };
-            best = best.max(h + 5.0);
+            if std::env::var("SC_AUTOFIT").is_ok() {
+                eprintln!("[autofit] 行{row} c{c} galley={h:.1} lines={lines} wrap={}", st.wrap);
+            }
+            best = best.max(h + lines as f32);
         }
         let h = best.clamp(15.0, 409.0);
         {
@@ -8928,7 +9060,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     self.sel.1
                 };
                 let extend = ctx.input(|i| i.modifiers.shift);
-                if self.sel_blocked_at(nr, nc) {
+                let blocked = if extend {
+                    // Shift+方向键也是整块扩选，中间有禁选格就不能扩
+                    self.rect_sel_blocked(self.sel_end, (nr, nc))
+                } else {
+                    self.sel_blocked_at(nr, nc)
+                };
+                if blocked {
                     self.block_selection();
                 } else if extend {
                     // Shift+方向：锚点留在 sel_end，只移动活动格
@@ -23123,7 +23261,8 @@ let txn = self.txn_begin(&keys);
                 if dx >= 0.0 && dy >= 0.0 {
                     let c = col_at(pos.x);
                     let r = row_at(pos.y);
-                    if self.sel_blocked_at(r, c) {
+                    // 拖选按整块检查：起点和终点都允许不代表中间没有禁选格
+                    if self.rect_sel_blocked(self.sel, (r, c)) {
                         self.block_selection();
                     } else {
                         self.sel_end = (r, c);
@@ -23408,7 +23547,13 @@ let txn = self.txn_begin(&keys);
                             self.extra_sel.clear();
                         }
                         self.nav_rect = None;
-                        if self.sel_blocked_at(hit.0, hit.1) {
+                        let blocked = if shift {
+                            // Shift+按下：先按整块检查，别等松开才拒绝
+                            self.rect_sel_blocked(self.sel_end, hit)
+                        } else {
+                            self.sel_blocked_at(hit.0, hit.1)
+                        };
+                        if blocked {
                             self.block_selection();
                         } else {
                             self.sel = hit;
@@ -23515,8 +23660,11 @@ let txn = self.txn_begin(&keys);
                         .hyperlinks
                         .get(&hit)
                         .cloned();
+                    let shift = ui.input(|i| i.modifiers.shift);
                     if ctrl_click {
-                        if let Some(link) = link {
+                        if self.sel_blocked_at(hit.0, hit.1) {
+                            self.block_selection();
+                        } else if let Some(link) = link {
                             self.open_hyperlink(&link);
                         } else {
                             // Ctrl+点击：把当前选区固定下来，再从点中的格子起新选区
@@ -23528,12 +23676,23 @@ let txn = self.txn_begin(&keys);
                             self.sel_end = hit;
                             self.status = format!("已选 {} 块区域", self.extra_sel.len() + 1);
                         }
+                    } else if shift {
+                        // Shift+点击：从原锚点扩到点中的格子，整块过门禁
+                        if self.rect_sel_blocked(self.sel_end, hit) {
+                            self.block_selection();
+                            // 按下帧可能已经把活动格挪到 hit，这里退回锚点，
+                            // 否则 sel/sel_end 仍然组成一个含禁选格的矩形
+                            self.sel = self.sel_end;
+                        } else {
+                            self.extra_sel.clear();
+                            self.sel = hit;
+                        }
                     } else {
                         self.extra_sel.clear();
-                        // Shift+点击：从原选区锚点扩到点中的格子（Excel 的基本框选）
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        self.sel = hit;
-                        if !shift {
+                        if self.sel_blocked_at(hit.0, hit.1) {
+                            self.block_selection();
+                        } else {
+                            self.sel = hit;
                             self.sel_end = hit;
                         }
                     }
@@ -26827,16 +26986,78 @@ impl eframe::App for SheetApp {
                     0.0,
                     ui_kit::BORDER,
                 );
-                let (r1, c1, r2, c2) = self.sel_rect();
-                let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+                let rects = self.sel_rects();
+                let area: u64 = rects
+                    .iter()
+                    .map(|&(r1, c1, r2, c2)| {
+                        (r2.saturating_sub(r1) + 1) as u64
+                            * (c2.saturating_sub(c1) + 1) as u64
+                    })
+                    .sum();
                 let mut stat = String::new();
                 let mut stat_mask = self.prefs.stat_mask;
-                if cells > 1 && cells <= 200_000 {
-                    stat = status_stats_text(
-                        self.wb.sheet(self.sheet_idx),
-                        (r1, c1, r2, c2),
-                        stat_mask,
-                    );
+                let stat_frame = ui.ctx().cumulative_pass_nr();
+                if stat_mask != 0 && area > 0 {
+                    if area > 50_000 {
+                        let key = (self.sheet_idx, self.doc_gen, rects.clone(), stat_mask);
+                        let stale = self.stats_job.as_ref().map_or(true, |j| j.key != key);
+                        if stale {
+                            let skip = self
+                                .wb
+                                .sheet(self.sheet_idx)
+                                .filter
+                                .as_ref()
+                                .map(|f| f.hidden_rows(self.wb.sheet(self.sheet_idx)))
+                                .unwrap_or_default();
+                            let vals = collect_stats_values(
+                                self.wb.sheet(self.sheet_idx),
+                                &rects,
+                                &skip,
+                            );
+                            self.stats_job = Some(StatsJob {
+                                key,
+                                vals,
+                                idx: 0,
+                                acc: StatsAcc::default(),
+                                started: stat_frame,
+                            });
+                        }
+                        if let Some(job) = self.stats_job.as_mut() {
+                            let end = (job.idx + 200_000).min(job.vals.len());
+                            while job.idx < end {
+                                job.acc.add(job.vals[job.idx]);
+                                job.idx += 1;
+                            }
+                            let done = job.idx >= job.vals.len();
+                            // 至少跨一帧，用户能看到「计算中」而不是结果突然出现/消失
+                            if !done || stat_frame <= job.started {
+                                stat = if job.acc.count > 0 {
+                                    format!("计算中… 已处理 {} 格", job.acc.count)
+                                } else {
+                                    "计算中…".into()
+                                };
+                            } else {
+                                stat = job.acc.text(stat_mask);
+                            }
+                        }
+                    } else {
+                        self.stats_job = None;
+                        let skip = self
+                            .wb
+                            .sheet(self.sheet_idx)
+                            .filter
+                            .as_ref()
+                            .map(|f| f.hidden_rows(self.wb.sheet(self.sheet_idx)))
+                            .unwrap_or_default();
+                        stat = status_stats_rects(
+                            self.wb.sheet(self.sheet_idx),
+                            &rects,
+                            stat_mask,
+                            &skip,
+                        );
+                    }
+                } else {
+                    self.stats_job = None;
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
@@ -26848,7 +27069,13 @@ impl eframe::App for SheetApp {
                     // 消息区：Excel 在模式文字右边显示最近一次操作/诊断，长文本截断并带悬停全文
                     if !self.status.is_empty() {
                         ui.add_space(10.0);
-                        let room = (ui.available_width() - 260.0).max(120.0);
+                        // 给统计文本和右侧页面按钮留位置，否则长状态消息会把统计/菜单挤出屏幕
+                        let reserve = if stat.is_empty() {
+                            0.0
+                        } else {
+                            stat.chars().count() as f32 * 7.5 + 40.0
+                        };
+                        let room = (ui.available_width() - 260.0 - reserve).max(80.0);
                         ui.add_sized(
                             [room, 18.0],
                             egui::Label::new(
@@ -26880,32 +27107,29 @@ impl eframe::App for SheetApp {
                             self.recalc_all_async();
                         }
                     }
+                    // UI-25：即使六项全关、统计文本为空，入口也必须一直在，
+                    // 否则用户把 mask 关到 0 后就再也打不开菜单。
+                    ui.add_space(8.0);
+                    let stats_entry = ui.label(
+                        egui::RichText::new("统计 ▾")
+                            .size(11.0)
+                            .color(ui_kit::TEXT),
+                    );
+                    stats_entry
+                        .on_hover_text("选择状态栏统计项 / 复制结果")
+                        .context_menu(|ui| {
+                            stats_mask_menu(ui, &mut stat_mask, &stat);
+                        });
                     if !stat.is_empty() {
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
                         let resp = ui.label(
                             egui::RichText::new(stat.clone())
                                 .size(11.0)
                                 .color(ui_kit::TEXT),
                         );
-                        resp.clone().on_hover_text("右键选择状态栏统计项");
+                        resp.clone().on_hover_text("右键选择状态栏统计项 / 复制结果");
                         resp.context_menu(|ui| {
-                            for (bit, name) in [
-                                (1u8, "平均值"),
-                                (2, "计数"),
-                                (4, "数值计数"),
-                                (8, "求和"),
-                                (16, "最小值"),
-                                (32, "最大值"),
-                            ] {
-                                let mut on = stat_mask & bit != 0;
-                                if ui.checkbox(&mut on, name).changed() {
-                                    if on {
-                                        stat_mask |= bit;
-                                    } else {
-                                        stat_mask &= !bit;
-                                    }
-                                }
-                            }
+                            stats_mask_menu(ui, &mut stat_mask, &stat);
                         });
                     }
                     // 循环引用：Excel 在状态栏用红字提示「循环引用: C3」，点一下可以跳过去
@@ -27065,12 +27289,6 @@ impl eframe::App for SheetApp {
                                     }
                                 }
                             }
-                        }
-                        if !stat.is_empty() {
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(stat).size(11.0).color(ui_kit::TEXT),
-                            );
                         }
                         if !self.wb.links.is_empty() {
                             ui.add_space(8.0);

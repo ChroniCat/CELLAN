@@ -3402,22 +3402,15 @@
             "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-hidden-a1.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-visible-b1.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-input-area-write.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-perms.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-gate.txt"
           ],
           "not_done": [
-            "选择锁定/未锁定权限已在点击、拖拽、方向键、名称框四个入口执行，回归 selection_permissions_block_jumping_into_forbidden_cells 通过；等待复核"
+            "拖选/Shift点击/Shift方向键整块门禁已补，等待监督复核"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-13T23:32:57Z"
         },
         {
           "id": "C15.3",
@@ -5193,7 +5186,7 @@
       "scope": "app/fonts加载 + core/style.rs",
       "source": "ui-requirements.md",
       "heading": "UI-14 字体忠实度与行列度量",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -5203,7 +5196,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T23:32:57Z",
       "slices": [
         {
           "id": "UI-14.1",
@@ -5267,17 +5260,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-col.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row1.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row2.png"
+          ],
+          "not_done": [
+            "列宽比 Excel 宽 1.78 字符（默认字体度量差异），末字符完整",
+            "真实鼠标双击列边界未做（RDP 注入不可用）"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:32:57Z"
         }
       ]
     },
@@ -6506,7 +6509,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T21:00:06Z",
+      "updated_utc": "2026-11-13T23:32:57Z",
       "slices": [
         {
           "id": "UI-25.1",
@@ -6518,23 +6521,25 @@
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
-            "crates/app/src/ui_prefs.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
           "commands": [],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-status.txt",
-            "work/goal-logs/ui25-statusbar3.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-stats.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png"
           ],
           "not_done": [
-            "右键复选菜单未做真实鼠标点选（RDP 注入不可用），仅逻辑与默认值验证",
-            "极小窗口/DPI 截断归 UI-13/UI-29"
+            "真实鼠标 Ctrl 多选/右键菜单点选未做（RDP 注入不可用）",
+            "百万行密集选区分帧耗时未压测",
+            "手动隐藏与筛选隐藏同时存在的规则未与 Excel 逐项对拍"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:00:06Z"
+          "updated_utc": "2026-11-13T23:32:57Z"
         }
       ]
     }
