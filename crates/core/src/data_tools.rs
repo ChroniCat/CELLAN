@@ -160,6 +160,40 @@ pub fn sort_multi(
 }
 
 /// 删除重复行（按指定列判断），保留第一次出现；返回删除的行数
+/// 只统计重复行数，不改表（去重预览）。
+pub fn count_duplicates(
+    sheet: &Sheet,
+    region: (u32, u32, u32, u32),
+    cols: &[u32],
+    header: bool,
+) -> usize {
+    let (mut r1, c1, r2, c2) = region;
+    if header && r2 > r1 {
+        r1 += 1;
+    }
+    if r2 < r1 {
+        return 0;
+    }
+    let use_cols: Vec<u32> = if cols.is_empty() {
+        (c1..=c2).collect()
+    } else {
+        cols.to_vec()
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dup = 0usize;
+    for r in r1..=r2 {
+        let key: String = use_cols
+            .iter()
+            .map(|c| sheet.get(r, *c).map(|x| x.value.display()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1}");
+        if !seen.insert(key) {
+            dup += 1;
+        }
+    }
+    dup
+}
+
 pub fn remove_duplicates(
     sheet: &mut Sheet,
     region: (u32, u32, u32, u32),

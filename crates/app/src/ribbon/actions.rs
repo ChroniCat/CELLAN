@@ -823,7 +823,7 @@ impl SheetApp {
             }
             "Filter" => self.start_filter(),
             "MultiSort" => self.open_data_dlg(0),
-            "RemoveDuplicates" => self.run_dedup(),
+            "RemoveDuplicates" => self.open_dedup_dialog(),
             // ---------------------------------------------------- 数据分析四件套
             "ForecastSheet" => {
                 let (r1, c1, r2, c2) = self.sel_rect();

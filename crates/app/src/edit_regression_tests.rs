@@ -6856,6 +6856,34 @@ fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
     assert!(app.wb.sheet(0).get(0, 2).map(|c| c.is_blank()).unwrap_or(true), "新写日期列被撤销");
 }
 
+/// UI-17.2：去重按选中列判断，预览数等于实际删除数；不同列组合结果不同。
+#[test]
+fn dedup_uses_selected_columns_and_preview_matches_removed() {
+    let seed = |a: &mut SheetApp| {
+        let sh = a.wb.sheet_mut(0);
+        for (r, (x, y)) in [("甲", "1"), ("甲", "2"), ("乙", "1")].iter().enumerate() {
+            let row = r as u32 + 1;
+            sh.set(row, 0, Cell { value: Value::Text((*x).into()), formula: None });
+            sh.set(row, 1, Cell { value: Value::Text((*y).into()), formula: None });
+        }
+    };
+    let mut a = app();
+    seed(&mut a);
+    let rect = (1u32, 0u32, 3u32, 1u32);
+    let preview = sheetcore::data_tools::count_duplicates(a.wb.sheet(0), rect, &[0], false);
+    assert_eq!(preview, 1, "按第一列有一条重复");
+    a.apply_dedup(rect, false, &[0]);
+    assert_eq!(a.wb.sheet(0).get(2, 0).map(|c| c.value.display()).unwrap_or_default(), "乙", "保留行上移");
+    assert!(a.wb.sheet(0).get(3, 0).map(|c| c.is_blank()).unwrap_or(true), "尾部清空");
+
+    let mut b = app();
+    seed(&mut b);
+    let preview_all = sheetcore::data_tools::count_duplicates(b.wb.sheet(0), rect, &[], false);
+    assert_eq!(preview_all, 0, "两列都参与时没有重复");
+    b.apply_dedup(rect, false, &[]);
+    assert_eq!(b.status, "没有重复行");
+}
+
 #[test]
 fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let mut app = app();

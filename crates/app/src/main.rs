@@ -87,6 +87,14 @@ struct Clip {
 }
 
 #[derive(Clone)]
+struct DedupDlg {
+    rect: (u32, u32, u32, u32),
+    header: bool,
+    /// 与区域列一一对应
+    cols: Vec<bool>,
+}
+
+#[derive(Clone)]
 struct DataDlg {
     tab: u8,
     /// (列, 是否升序, 是否启用)
@@ -1040,6 +1048,8 @@ struct SheetApp {
     data_dlg: Option<DataDlg>,
     /// 分列覆盖二次确认：(文档代号, 会覆盖的格子数)
     split_confirm: Option<(u64, usize)>,
+    /// 删除重复对话框：区域、表头、参与比较的列
+    dedup_dlg: Option<DedupDlg>,
     /// 条件格式管理窗口
     cf_mgr: bool,
     /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
@@ -1786,6 +1796,7 @@ impl SheetApp {
             fill_drag: None,
             data_dlg: None,
             split_confirm: None,
+            dedup_dlg: None,
             cf_mgr: false,
             last_import: None,
             room_lost: false,
@@ -5159,17 +5170,37 @@ impl SheetApp {
         self.status = format!("已按 {} 个键排序（{} 行移动）", keys.len(), moved);
     }
 
+    /// 删除重复（旧入口/探针用）：全列比较、无对话框。
     fn run_dedup(&mut self) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
+        self.apply_dedup((r1, c1, r2, c2), header, &[]);
+    }
+
+    /// UI-17.2：打开去重对话框（选列 + 实时预览）。
+    fn open_dedup_dialog(&mut self) {
+        let rect = self.sel_rect();
+        let header = sheetcore::sort_filter::has_header(
+            self.wb.sheet(self.sheet_idx),
+            rect.0,
+            rect.1,
+            rect.2,
+            rect.3,
+        );
+        let cols = vec![true; (rect.3 - rect.1 + 1) as usize];
+        self.dedup_dlg = Some(DedupDlg { rect, header, cols });
+    }
+
+    fn apply_dedup(&mut self, rect: (u32, u32, u32, u32), header: bool, cols: &[u32]) {
+        let (r1, c1, r2, c2) = rect;
         if !self.write_preflight(&sheetcore::undo::rect_keys(r1, c1, r2, c2), "删除重复") {
             return;
         }
-        let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
         let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
         let removed = sheetcore::data_tools::remove_duplicates(
             self.wb.sheet_mut(self.sheet_idx),
-            (r1, c1, r2, c2),
-            &[],
+            rect,
+            cols,
             header,
         );
         self.txn_end("删除重复", txn);
@@ -5180,6 +5211,78 @@ impl SheetApp {
         } else {
             format!("删除了 {removed} 行重复")
         };
+    }
+
+    fn dedup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.dedup_dlg.take() else { return };
+        let (_, c1, _, c2) = dlg.rect;
+        let chosen: Vec<u32> = (c1..=c2)
+            .filter(|c| dlg.cols.get((c - c1) as usize).copied().unwrap_or(true))
+            .collect();
+        let dup = sheetcore::data_tools::count_duplicates(
+            self.wb.sheet(self.sheet_idx),
+            dlg.rect,
+            &chosen,
+            dlg.header,
+        );
+        let mut open = true;
+        let mut run = false;
+        ui_kit::window(ctx, "删除重复", 360.0)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.checkbox(&mut dlg.header, "数据包含标题");
+                ui.separator();
+                ui.label("用于判断重复的列：");
+                egui::Grid::new("dedup_cols").num_columns(2).show(ui, |ui| {
+                    for c in c1..=c2 {
+                        let i = (c - c1) as usize;
+                        let name = self
+                            .wb
+                            .sheet(self.sheet_idx)
+                            .get(dlg.rect.0, c)
+                            .map(|x| x.value.display())
+                            .unwrap_or_default();
+                        let label = if dlg.header && !name.is_empty() {
+                            format!("{} 列（{}）", col_label(c), name)
+                        } else {
+                            format!("{} 列", col_label(c))
+                        };
+                        let mut on = dlg.cols.get(i).copied().unwrap_or(true);
+                        ui.checkbox(&mut on, label);
+                        if i < dlg.cols.len() {
+                            dlg.cols[i] = on;
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.separator();
+                ui.label(if chosen.is_empty() {
+                    "至少要选一列".to_string()
+                } else if dup == 0 {
+                    "没有重复行".to_string()
+                } else {
+                    format!("预览：将删除 {dup} 行重复")
+                });
+                ui.separator();
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui
+                        .add_enabled(!chosen.is_empty(), egui::Button::new("执行"))
+                        .clicked()
+                    {
+                        run = true;
+                    }
+                });
+            });
+        if run {
+            self.apply_dedup(dlg.rect, dlg.header, &chosen);
+        } else if open {
+            self.dedup_dlg = Some(dlg);
+        }
     }
 
     fn run_split(&mut self, dlg: &DataDlg) {
@@ -25955,6 +26058,7 @@ impl eframe::App for SheetApp {
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
         self.pivot2_dialog(ctx);
+        self.dedup_dialog(ctx);
         self.renew_lock_if_needed();
         self.beat_lock();
         self.lock_probe(ctx);
