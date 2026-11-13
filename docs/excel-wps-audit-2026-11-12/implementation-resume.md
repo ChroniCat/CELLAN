@@ -1,11 +1,28 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `fab0fdb`（UI-27 复核修复已推送）。
-- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 6 待验收 / 46 待实施（本轮后待重算）；
-  切片 26 已验收 / 10 待验收 / 112 待实施（UI-05.4 待验收）。
-- 当前测试真值（round54/55）：core 68 bins / 599 passed / 0 failed / 41 ignored，CORE_EXIT=0；
-  app 192 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / GUI_EXIT=0。
-- 专项：`c14_guard` 16 passed；`search_matches` 7 passed。
+- 分支 `main`（`origin/main`），HEAD `e37888b`；本轮 UI-21 改动尚未提交。
+- 台账（`scripts/audit_progress.py counts`）：9 已验收 / 9 待验收 / 43 待实施；
+  切片 26 已验收 / 18 待验收 / 104 待实施。
+- 当前候选测试真值（08:00–08:06）：core 68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0；
+  app 200 passed / 0 failed / APP_ALL_EXIT=0；GUI 12 passed / 0 failed / 8 ignored / APP_ALL_EXIT=0（08:03/08:04/08:06 三轮；修复对话框测试扫描竞态）。
+- 专项：`c14_guard` 16 passed；`search_matches` 7 passed；UI-21 新增 spill/pending/prefix/xls 用例。
+- 旧 core 605/app 196 快照（07:24-25）早于 formula/patch/xls 修改，不再作为当前证据。
+
+## 本轮：UI-21 手动计算与工作表计算（待验收）
+
+- 三个 07:24 复核风险已补代码/用例：
+  1) recalc_sheet 先清目标表旧 spill/静态数组覆盖区，再多遍计算目标表依赖；缩小的旧尾格清空，
+     扩回不被旧尾格挡；另一表 RAND 缓存保持 999；
+  2) calc_pending_sheets 逐表记录，recalc_async(Some)/recalc_sheet 不再无条件清全簿；
+     两表都有未算编辑时计算第一表，第二表旧缓存和 pending 保留，F9 后才清；
+  3) set_calc_mode 按 local_name 找 x:workbook/x:calcPr，前缀 XML 往返；新增 zip 级读取。
+- BIFF .xls 不再是“另立切片”豁免：xls_write/xls_read 增加 CALCMODE(0x000D)，
+  手动/自动读回用例通过；xls 动态数组/溢出边界仍明确未验收。
+- 入口一致：Delete、排序、DV 下拉、选择性粘贴均补 app 测试，手动模式下保持缓存并置 pending。
+- 当前候选证据：core 612/0/41 CORE_EXIT0；app 200/0 APP_EXIT0；GUI 12/0/8 GUI_EXIT0；
+  SaveAs 单独复跑 1 passed（真实 #32770 Save As）；GUI 对话框测试扫描已串行化，避免并发覆盖 WANT。
+- 未执行：Excel/WPS 实机 calcPr/CALCMODE 对拍、真实 GUI 点击 F9/计算工作表/徽标、
+  大表循环引用/溢出与 Excel 对拍。UI-21 保持待验收。
 
 ## 本轮：UI-27 合并/格式对话框/格式刷（待验收）
 

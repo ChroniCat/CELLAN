@@ -715,14 +715,21 @@ impl SheetApp {
             }
             "ShowFormulas" => self.show_formulas = !self.show_formulas,
             "ErrorChecking" => self.open_error_check(),
-            "CalculateNow" | "CalculateSheet" => self.recalc_all_async(),
+            "CalculateNow" => self.recalc_all_async(),
+            "CalculateSheet" => self.recalc_sheet_async(self.sheet_idx),
             "CalcAuto" => {
                 self.manual_calc = false;
+                self.wb.calc_manual = false;
+                self.wb.calc_pending = false;
+                self.wb.calc_pending_sheets.clear();
+                self.wb.dirty = true;
                 self.recalc_all_async();
                 self.status = "计算选项：自动".into();
             }
             "CalcManual" => {
                 self.manual_calc = true;
+                self.wb.calc_manual = true;
+                self.wb.dirty = true;
                 self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
             }
             "WatchWindow" => self.watch_open = true,

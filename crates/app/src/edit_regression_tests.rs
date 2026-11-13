@@ -3946,13 +3946,23 @@ fn merge_confirmation_is_scoped_to_document_sheet_rect_and_content() {
     assert_eq!(app.wb.sheet(1).get(0, 1).unwrap().value, Value::Text("丁".into()));
     assert!(app.status.contains("再点一次"));
 
-    // Esc 是真实按键事件：清掉待确认，再点必须重新提示
+    // 合并警告仍在时启用格式刷，再按一次真实 Esc：两个挂起状态必须一起失效，
+    // 不能因为格式刷分支提前 return 而留下旧合并确认。
+    app.ribbon_action("FormatPainter", &ctx);
+    assert!(app.format_painter.is_some(), "格式刷应已启用");
+    assert!(app.merge_pending.is_some(), "格式刷不能悄悄清掉合并警告");
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
-    assert!(app.merge_pending.is_none(), "Esc 必须失效待确认");
-    assert!(app.status.contains("已取消未确认的合并"));
+    assert!(app.format_painter.is_none(), "Esc 必须结束格式刷");
+    assert!(app.merge_pending.is_none(), "Esc 必须同时失效待确认合并");
+    assert!(app.status.contains("格式刷与未确认的合并已取消"), "{}", app.status);
     app.toggle_merge(true);
-    assert!(app.wb.sheet(1).merges.is_empty());
-    assert!(app.status.contains("再点一次"));
+    assert!(app.wb.sheet(1).merges.is_empty(), "Esc 后不能沿用旧确认直接删内容");
+    assert!(app.status.contains("再点一次"), "{}", app.status);
+
+    // 只有合并警告、没有格式刷时，Esc 仍是原来的单义提示。
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.merge_pending.is_none());
+    assert!(app.status.contains("已取消未确认的合并"), "{}", app.status);
 }
 
 /// UI-27 复核：格式刷样式号不能跨文档解释；换簿后不套错样式、不新增撤销。
@@ -4009,6 +4019,39 @@ fn merge_undo_keeps_unrelated_merges_and_redo_restores_only_diff() {
     app.do_undo(true);
     assert!(app.wb.sheet(0).merges.contains(&(0, 0, 0, 1)));
     assert!(app.wb.sheet(0).merges.contains(&(3, 3, 4, 4)));
+}
+
+/// UI-27 复核：结构相交导致重做放弃时，同一动作的 CellDelta 也必须放弃。
+#[test]
+fn overlapping_merge_redo_conflict_keeps_values_and_both_structures_intact() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    app.toggle_merge(true);
+    assert!(app.merge_pending.is_some(), "第一次只提示");
+    app.toggle_merge(true);
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty);
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("乙".into()), "撤销恢复非锚点内容");
+    assert!(app.wb.sheet(0).merges.is_empty());
+
+    // B 端把刚恢复的 B1（现在是 B1:C1 的锚点，乙仍在）合并；A 端收到后状态如下。
+    app.wb.sheet_mut(0).merge_range(0, 1, 0, 2);
+    app.wb.dirty = false;
+    let depth_before = app.undo.depth();
+    app.do_undo(true);
+
+    assert_eq!(app.wb.sheet(0).merges, vec![(0, 1, 0, 2)], "结构相交时整组放弃，不能拆掉 B 的合并");
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("乙".into()), "B1 是另一合并的锚点，重做不能清空它");
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("甲".into()));
+    assert!(app.status.contains("合并结构与当前表冲突"), "{}", app.status);
+    assert!(app.status.contains("整体放弃"), "{}", app.status);
+    assert!(!app.wb.dirty, "冲突放弃不能把文档标脏");
+    assert_eq!(app.undo.depth(), depth_before, "冲突的重做应留在重做栈");
 }
 
 /// UI-27 复核：合并撤销/重做要广播结构；第二客户端后加的无关合并保留。
@@ -4079,4 +4122,282 @@ fn merge_undo_and_redo_broadcast_to_second_client_preserving_its_new_merge() {
     assert!(got_redo, "重做合并要广播，且不覆盖对端无关合并: {:?}", b.wb.sheet(0).merges);
     a.net.as_mut().unwrap().shutdown();
     b.net.as_mut().unwrap().shutdown();
+}
+
+/// UI-21：手动计算模式下编辑只标记待计算，F9 才更新依赖公式并保留手动模式。
+#[test]
+fn manual_calc_edit_marks_pending_and_f9_forces_recalculation() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0));
+
+    app.ribbon_action("CalcManual", &ctx);
+    assert!(app.manual_calc);
+    assert!(app.wb.calc_manual, "工作簿标志要同步，保存 calcPr 才正确");
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("5".into()));
+    assert!(app.commit_edit(None));
+
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(5.0));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0), "手动模式不能偷算依赖公式");
+    assert!(app.wb.calc_pending, "编辑后必须显示待计算");
+    assert!(app.status.contains("待计算") || app.wb.calc_pending);
+
+    app.recalc_all_async();
+    for _ in 0..300 {
+        app.poll_open();
+        if !app.tasks.busy && app.tasks.open_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(10.0), "F9 必须强制重算");
+    assert!(!app.wb.calc_pending);
+    assert!(app.wb.calc_manual, "强制重算后仍保留手动模式");
+    assert!(app.manual_calc);
+}
+
+/// UI-21：CalculateSheet 只算当前表，不因另一张表的 RAND 触发全局重算。
+#[test]
+fn calculate_sheet_command_keeps_unrelated_volatile_sheet_cached() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    // 先算第一张表，再放入带缓存 999 的易失表，避免初始 force 把 999 换成随机值。
+    let mut other = sheetcore::Sheet::new("易失表");
+    other.set(0, 0, Cell { value: Value::Number(999.0), formula: Some("=RAND()".into()) });
+    app.wb.sheets.push(other);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.ribbon_action("CalcManual", &ctx);
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("5".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0));
+
+    app.ribbon_action("CalculateSheet", &ctx);
+    for _ in 0..300 {
+        app.poll_open();
+        if !app.tasks.busy && app.tasks.open_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(10.0), "当前表要算");
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(999.0), "别的表的 RAND 不能被动");
+    assert!(app.wb.calc_manual);
+}
+
+/// UI-27 复核：结构相交的 redo 必须整组放弃，且不能把 Empty 广播给对端。
+#[test]
+fn overlapping_merge_redo_conflict_does_not_broadcast_or_touch_peer() {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = crate::net::host_on(listener, 1, "甲".into(), "doc".into(), "pw".into()).unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let peer = crate::net::join(2, "乙".into(), "doc".into(), &addr, "pw".into()).unwrap();
+    let mut a = app();
+    let mut b = app();
+    a.peer = Some(sheetcore::sync::Peer::new(1));
+    b.peer = Some(sheetcore::sync::Peer::new(2));
+    a.net = Some(host);
+    b.net = Some(peer);
+    for _ in 0..40 {
+        a.poll_net();
+        b.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // 两端同一份基准：A1=甲、B1=乙。
+    for app in [&mut a, &mut b] {
+        app.wb.sheet_mut(0).set(0, 0, text("甲"));
+        app.wb.sheet_mut(0).set(0, 1, text("乙"));
+    }
+    a.sel = (0, 0);
+    a.sel_end = (0, 1);
+    a.toggle_merge(true);
+    a.toggle_merge(true);
+    assert_eq!(a.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+    assert_eq!(a.wb.sheet(0).value(0, 1), Value::Empty);
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).merges == vec![(0, 0, 0, 1)]
+            && b.wb.sheet(0).value(0, 1) == Value::Empty
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(b.wb.sheet(0).merges, vec![(0, 0, 0, 1)]);
+
+    // A 撤销：B1=乙 与结构撤销都要到达 B。
+    a.do_undo(false);
+    for _ in 0..100 {
+        b.poll_net();
+        if b.wb.sheet(0).merges.is_empty()
+            && b.wb.sheet(0).value(0, 1) == Value::Text("乙".into())
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(b.wb.sheet(0).merges.is_empty());
+    assert_eq!(b.wb.sheet(0).value(0, 1), Value::Text("乙".into()));
+
+    // B 用恢复的乙作锚点合并 B1:C1；A 收到。
+    b.sel = (0, 1);
+    b.sel_end = (0, 2);
+    b.toggle_merge(true);
+    assert_eq!(b.wb.sheet(0).merges, vec![(0, 1, 0, 2)]);
+    for _ in 0..100 {
+        a.poll_net();
+        if a.wb.sheet(0).merges == vec![(0, 1, 0, 2)] {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(a.wb.sheet(0).merges, vec![(0, 1, 0, 2)]);
+
+    // A redo 与 B 的结构相交：整组放弃，且不得广播 Empty。
+    a.do_undo(true);
+    assert_eq!(a.wb.sheet(0).merges, vec![(0, 1, 0, 2)]);
+    assert_eq!(a.wb.sheet(0).value(0, 1), Value::Text("乙".into()));
+    assert!(a.status.contains("合并结构与当前表冲突"), "{}", a.status);
+    for _ in 0..20 {
+        b.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(b.wb.sheet(0).merges, vec![(0, 1, 0, 2)], "对端结构不能被拆");
+    assert_eq!(b.wb.sheet(0).value(0, 1), Value::Text("乙".into()), "对端锚点不能被清空");
+    a.net.as_mut().unwrap().shutdown();
+    b.net.as_mut().unwrap().shutdown();
+}
+
+/// UI-21：只算一张表不能清掉另一张表的待计算标记和旧缓存。
+#[test]
+fn calculate_sheet_keeps_other_sheet_pending_until_full_recalc() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
+    let mut second = sheetcore::Sheet::new("第二表");
+    second.set(0, 0, number(10.0));
+    second.set(0, 1, formula("=A1*2"));
+    app.wb.sheets.push(second);
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.ribbon_action("CalcManual", &ctx);
+
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("5".into()));
+    assert!(app.commit_edit(None));
+    app.sheet_idx = 1;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("20".into()));
+    assert!(app.commit_edit(None));
+    assert!(app.wb.calc_pending);
+    assert_eq!(app.wb.calc_pending_sheets.len(), 2);
+
+    app.sheet_idx = 0;
+    app.ribbon_action("CalculateSheet", &ctx);
+    for _ in 0..300 {
+        app.poll_open();
+        if !app.tasks.busy && app.tasks.open_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(1).value(0, 1), Value::Number(20.0), "第二表保持旧缓存");
+    assert!(app.wb.calc_pending, "只算一张表不能误清全簿待计算");
+    assert_eq!(app.wb.calc_pending_sheets.iter().copied().collect::<Vec<_>>(), vec![1]);
+
+    app.recalc_all_async();
+    for _ in 0..300 {
+        app.poll_open();
+        if !app.tasks.busy && app.tasks.open_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(app.wb.sheet(1).value(0, 1), Value::Number(40.0));
+    assert!(!app.wb.calc_pending);
+    assert!(app.wb.calc_pending_sheets.is_empty());
+}
+
+/// UI-21：手动模式下删除入口也必须走统一调度，保留旧缓存并置待计算。
+#[test]
+fn manual_mode_delete_keeps_cached_dependents_until_f9() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.ribbon_action("CalcManual", &ctx);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.ribbon_action("ClearContent", &ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0), "删除不能偷偷重算依赖");
+    assert!(app.wb.calc_pending);
+    assert!(app.wb.calc_pending_sheets.contains(&0));
+}
+
+/// UI-21：排序入口同样只置待计算，不在手动模式下自动重算。
+#[test]
+fn manual_mode_sort_marks_pending_without_recalculating() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(2.0));
+    app.wb.sheet_mut(0).set(1, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*10"));
+    app.wb.sheet_mut(0).set(1, 1, formula("=A2*10"));
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.ribbon_action("CalcManual", &ctx);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.do_sort(0, true);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(2.0));
+    assert!(app.wb.calc_pending);
+    assert!(app.wb.calc_pending_sheets.contains(&0));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(10.0), "手动排序保留搬行后的旧缓存，不得自动算 B 列");
+}
+
+/// UI-21：验证下拉写入和选择性粘贴也要遵守手动计算。
+#[test]
+fn manual_mode_dv_and_paste_keep_cached_values() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(1.0));
+    app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
+    sheetcore::formula::recalc_all_force(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.ribbon_action("CalcManual", &ctx);
+
+    assert!(app.dv_pick_apply(0, 0, "5"));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(5.0));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0), "下拉写入不能自动重算");
+    assert!(app.wb.calc_pending);
+
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.paste_special_apply_text(&ctx, Some("7".into()));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(7.0));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0), "粘贴不能自动重算");
+    assert!(app.wb.calc_pending);
 }

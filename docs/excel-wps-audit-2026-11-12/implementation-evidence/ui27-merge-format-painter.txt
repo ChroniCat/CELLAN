@@ -1,4 +1,4 @@
-UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:55）
+UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 07:25）
 
 一、已实现
 1) 合并（main.rs::toggle_merge）
@@ -10,7 +10,8 @@ UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:55）
 - 执行时删除非锚点内容（锚点值与格式保留），merge_range 拆相交旧合并；
   一个 undo Action 同时记录 MergeEdit(added/removed 差异) + 被删格 delta。
 - 撤销/重做只按差异增删合并，不整表覆盖 merges；动作之后新增的无关合并保留。
-  若恢复矩形与现有合并相交，跳过该项，避免结构撤销盖掉协作方后加的结构。
+  结构先完整规划再落盘：任一要恢复/新增的矩形与现有合并相交，整组放弃，并同时放弃
+  同一动作的 CellDelta（不删值、不广播），保证结构/内容原子一致。
 - 撤销恢复被删的每格内容/样式；重做再次删除；保存重开保留 merges 与锚点。
 - 协作：被删格 broadcast_op(Empty)，合并状态 broadcast_merge；do_undo/do_redo 按
   Applied.merge_changes 广播实际增删的合并矩形。
@@ -40,7 +41,12 @@ UI-27 合并与格式刷 —— 状态：待验收（2026-11-13 06:55）
   A1:B1 合并后新增 C3:D4，undo 只拆前者，redo 恢复两者。
 - merge_undo_and_redo_broadcast_to_second_client_preserving_its_new_merge
   双端 poll_net：合并到达；B 新增无关合并；A undo/redo 后 B 结构一致且无关合并保留。
-- 全量 app 192 passed / 0 failed；GUI 12 passed / 0 failed / 8 ignored。
+- overlapping_merge_redo_conflict_keeps_values_and_both_structures_intact
+  A1=甲 B1=乙 → A 合并 → undo 恢复乙 → B 合并 B1:C1（乙仍为锚点）→ A redo：
+  结构相交，整组放弃；A/B 的 B1 仍为乙，B 的 B1:C1 合并不被拆，A 不标脏、不广播。
+- merge_confirmation... 末尾新增真实键序：合并警告 → 启用格式刷 → 一次 Esc 同时清 painter 与
+  merge_pending，再次合并必须重新提示，不能沿用旧确认。
+- 全量 app 结果见本轮最终日志（原 192 基础上新增 2 项；GUI 仍 12 passed / 8 ignored）。
 
 三、变异（全红后还原）
 M22 跳过合并二次确认 → FAILED
@@ -56,7 +62,22 @@ M35 撤销/重做不广播 merge → merge_undo_and_redo... FAILED
 
 四、未执行（父项保持待验收）
 - 真实 GUI 双击 ribbon 格式刷、拖选两个目标范围、Esc 的真实鼠标键盘流程未自动化（当前命令级）。
-- 合并提示是状态栏二次点击，不是 Excel 的模态 MessageBox；未与 Excel/WPS 实机并排对比。
-- 真实 GUI 的换表/换簿后点击格式刷流程未自动化；当前为直接调用 apply_format_painter 的命令级 + 文档身份负例。
+- 合并没有 Excel 式模态 MessageBox，仍是状态栏二次点击；未与 Excel/WPS 实机并排对比。
+- 真实 GUI 的换表/换簿后点击格式刷流程未自动化；跨文档拒绝已有命令级负例，但真实点击流程未取证。
+- 真实 GUI 的合并撤销/重做、结构相交冲突提示流程未取证；当前双端 poll_net 证明的是同步协议而非 GUI。
 - 源区域超过 20 万格未限制（目标已限制）；真实 Excel/WPS 合并冲突（与后加合并相交）行为未对拍。
-- 合并撤销的协作同步已做双端 poll_net 断言；真实网络丢包/重连下的结构冲突未覆盖。
+
+
+五、07:00 复核后的两条原缺陷修复
+1) 结构冲突与内容原子化（core/undo.rs）
+- 旧逻辑：apply_merge_diff 逐项跳过相交结构，但 redo 仍遍历全部 CellDelta，把 B1=乙 清空，删掉另一合并的锚点。
+- 新逻辑：plan_merge_diff 先在 cloned merges 上完成全部 remove/add 校验，任一 remove 找不到或 add 与现有合并相交即返回 None；
+  undo/redo 收到 None 时把 Action 放回原栈，Applied.merge_conflict=true，不写任何单元格、不置 dirty、不广播。
+- 用例：overlapping_merge_redo_conflict_keeps_values_and_both_structures_intact（真实非锚点乙 + B1:C1 相交结构）。
+2) Esc 状态互斥（app/main.rs::handle_keys）
+- 旧逻辑：格式刷分支先清 painter 后 return，后面的 drop_merge_confirmation 永远不执行；
+  合并警告 → 启用格式刷 → Esc → 再合并会复用旧确认。
+- 新逻辑：把格式刷/合并确认合并在同一个 Esc 分支；一次 Esc 同时清 format_painter、painter_double、merge_pending、fmt_merge_pending。
+  只有合并警告时仍保持“已取消未确认的合并”文案。
+- 用例：merge_confirmation... 中追加真实 key_event(Escape) 顺序断言。
+- 状态：两条代码级缺陷已修复并有回归用例；UI-27 真实 GUI 仍未验收。

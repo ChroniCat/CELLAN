@@ -1945,7 +1945,7 @@
       "failures": [],
       "blocker": "",
       "next": "与 Excel/WPS 对拍公式平移与除零，并补真实系统剪贴板路径。",
-      "updated_utc": "2026-11-13T06:30:00Z",
+      "updated_utc": "2026-11-13T07:55:00Z",
       "slices": [
         {
           "id": "UI-06.1",
@@ -1975,7 +1975,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         },
         {
           "id": "UI-06.2",
@@ -2005,7 +2005,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         },
         {
           "id": "UI-06.3",
@@ -2035,7 +2035,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         }
       ]
     },
@@ -2151,13 +2151,13 @@
       "not_done": [
         "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
         "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-        "格式刷跨工作表/跨工作簿未覆盖",
-        "合并撤销的协作端 merge 状态未做双端 poll_net"
+        "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
+        "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
       ],
       "failures": [],
       "blocker": "",
-      "next": "真实 GUI 双击/拖选/Esc 验收；与 Excel 合并提示对比。",
-      "updated_utc": "2026-11-13T06:30:00Z",
+      "next": "真实 GUI 双击/拖选/Esc、换文档后格式刷、合并撤销冲突流程验收；与 Excel 合并提示对比。",
+      "updated_utc": "2026-11-13T07:25:00Z",
       "slices": [
         {
           "id": "UI-27.1",
@@ -2186,13 +2186,13 @@
           "not_done": [
             "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
             "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "格式刷跨工作表/跨工作簿未覆盖",
-            "合并撤销的协作端 merge 状态未做双端 poll_net"
+            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
+            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         },
         {
           "id": "UI-27.2",
@@ -2221,13 +2221,13 @@
           "not_done": [
             "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
             "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "格式刷跨工作表/跨工作簿未覆盖",
-            "合并撤销的协作端 merge 状态未做双端 poll_net"
+            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
+            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         },
         {
           "id": "UI-27.3",
@@ -2256,13 +2256,13 @@
           "not_done": [
             "真实 GUI 双击格式刷/拖选范围/Esc 未自动化",
             "合并没有 Excel 式模态确认框，未与 Excel/WPS 并排对比",
-            "格式刷跨工作表/跨工作簿未覆盖",
-            "合并撤销的协作端 merge 状态未做双端 poll_net"
+            "真实 GUI 跨文档/跨工作表切换后格式刷不套错样式未验收",
+            "真实 GUI 合并撤销/重做（含结构冲突提示）流程未验收"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T06:30:00Z"
+          "updated_utc": "2026-11-13T07:25:00Z"
         }
       ]
     },
@@ -4463,17 +4463,17 @@
       "scope": "app重算调度 + core/formula",
       "source": "ui-requirements.md",
       "heading": "UI-21 真正的手动计算与工作表计算",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
+      "status": "待验收",
+      "acceptance": "实现手动计算全局门与工作表级计算：手动模式所有输入/删除/排序/验证/粘贴保持缓存并标记待计算；F9/开始计算强制全量；计算工作表只算目标表且不误清其它表 pending；calcPr 与 BIFF CALCMODE 持久化；补 spill 清理、前缀 XML、双表 pending 及入口一致测试。",
+      "files": ["crates/core/src/model.rs", "crates/core/src/xlsx.rs", "crates/core/src/patch.rs", "crates/core/src/formula/mod.rs", "crates/core/src/xls_read.rs", "crates/core/src/xls_write.rs", "crates/core/src/undo.rs", "crates/app/src/main.rs", "crates/app/src/ribbon/actions.rs", "crates/app/src/edit_regression_tests.rs"],
       "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": ["C:/Users/Administrator/.cargo/bin/cargo.exe test -p sheetcore --offline", "C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline --bin app", "C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline --test ui_regression -- --nocapture"],
+      "evidence": ["implementation-evidence/ui21-manual-calc.txt"],
+      "not_done": ["真实 Excel 365/WPS 打开 calcPr=manual 的 xlsx 并核对缓存/F9 行为未执行", "真实 Excel/WPS 对 xls BIFF CALCMODE 的打开/另存往返未执行", "真实 GUI 点击 F9、计算工作表、状态栏徽标未单独取证", "大表数组溢出/循环引用与 Excel 的逐项对拍未执行", "旧 core 605/app 196 是 07:24 前快照，不作为本轮证据"],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "先以当前 core 612/0/41、app 200/0、GUI 12/0/8 为候选证据；继续真实 Excel/WPS 对拍与 GUI 点击路径，完成后再决定父项验收。",
+      "updated_utc": "2026-11-13T07:55:00Z",
       "slices": [
         {
           "id": "UI-21.1",
@@ -4481,17 +4481,17 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-21 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "手动模式统一调度、目标表 spill/依赖计算、逐表 pending、calcPr/CALCMODE 持久化与入口一致测试。",
+          "files": ["crates/core/src/model.rs", "crates/core/src/xlsx.rs", "crates/core/src/patch.rs", "crates/core/src/formula/mod.rs", "crates/core/src/xls_read.rs", "crates/core/src/xls_write.rs", "crates/core/src/undo.rs", "crates/app/src/main.rs", "crates/app/src/ribbon/actions.rs", "crates/app/src/edit_regression_tests.rs"],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": ["C:/Users/Administrator/.cargo/bin/cargo.exe test -p sheetcore --offline", "C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline --bin app", "C:/Users/Administrator/.cargo/bin/cargo.exe test -p app --offline --test ui_regression -- --nocapture"],
+          "evidence": ["implementation-evidence/ui21-manual-calc.txt"],
+          "not_done": ["真实 Excel 365/WPS 打开 calcPr=manual 的 xlsx 并核对缓存/F9 行为未执行", "真实 Excel/WPS 对 xls BIFF CALCMODE 的打开/另存往返未执行", "真实 GUI 点击 F9、计算工作表、状态栏徽标未单独取证", "大表数组溢出/循环引用与 Excel 的逐项对拍未执行", "旧 core 605/app 196 是 07:24 前快照，不作为本轮证据"],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "真实 Excel/WPS calcPr/CALCMODE 对拍；GUI 点击 F9/计算工作表/徽标。",
+          "updated_utc": "2026-11-13T07:55:00Z"
         }
       ]
     },

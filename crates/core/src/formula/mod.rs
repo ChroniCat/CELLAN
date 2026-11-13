@@ -2399,9 +2399,26 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
         }
 }
 
+/// 手动模式：把受影响的表记入待计算集合，供“计算工作表”逐表清理。
+pub fn mark_pending(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey]) {
+    let mut sheets: std::collections::BTreeSet<usize> =
+        seeds.iter().map(|(si, _, _)| *si).collect();
+    if !deps.is_empty() {
+        for (si, _, _) in deps.closure(seeds) {
+            sheets.insert(si);
+        }
+    }
+    wb.calc_pending_sheets.extend(sheets);
+    wb.calc_pending = !wb.calc_pending_sheets.is_empty();
+}
+
 /// 增量重算：只算受影响的公式单元格，其余用缓存值。
 /// 返回实际重算的格子数。
 pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey]) -> usize {
+    if wb.calc_manual {
+        mark_pending(wb, deps, seeds);
+        return 0;
+    }
     if std::env::var("SC_PROFILE").is_ok() {
         prof_reset();
     }
@@ -2426,7 +2443,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
             }
         }
         let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
-        recalc_all(wb);
+        recalc_all_force(wb);
         return count;
     }
     let mut dirty = deps.closure(seeds);
@@ -2455,7 +2472,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
     // 新公式可能第一次产生数组，此时尚无 spilled 标记。
     if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
         let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
-        recalc_all(wb);
+        recalc_all_force(wb);
         return count;
     }
     if std::env::var("SC_PROFILE").is_ok() {
@@ -2488,6 +2505,21 @@ fn spill_values(wb: &Workbook) -> HashMap<deps::CellKey, crate::Value> {
 /// 全量计算后物化数组，再计算读取溢出格的公式，直到溢出内容稳定。
 /// 非收敛的溢出循环显式记为循环引用，避免把尚未稳定的数字当成结果。
 pub fn recalc_all(wb: &mut Workbook) {
+    if wb.calc_manual {
+        wb.calc_pending_sheets = wb.sheets.iter().enumerate()
+            .filter(|(_, s)| s.iter().any(|(_, c)| c.formula.is_some()))
+            .map(|(i, _)| i)
+            .collect();
+        wb.calc_pending = !wb.calc_pending_sheets.is_empty();
+        return;
+    }
+    recalc_all_force(wb);
+}
+
+/// 强制执行全量计算（F9 / 计算全部 / 切回自动模式）。
+pub fn recalc_all_force(wb: &mut Workbook) {
+    wb.calc_pending = false;
+    wb.calc_pending_sheets.clear();
     let phase = std::env::var("SC_PHASE").is_ok();
     let t_all = std::time::Instant::now();
     let mut t_phase = std::time::Instant::now();
@@ -2669,4 +2701,224 @@ pub fn set_formula(sheet: &mut Sheet, r: u32, c: u32, formula: &str, cached: FVa
         }),
     };
     sheet.set(r, c, cell);
+}
+
+/// 只强制重算某张工作表：手动模式下“计算工作表”用。
+/// 不把其它表的无关易失函数拉进来。
+pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
+    if sheet >= wb.sheets.len() {
+        return 0;
+    }
+    let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
+        .iter()
+        .filter(|(_, c)| c.formula.is_some())
+        .map(|(k, _)| (sheet, k.row, k.col))
+        .collect();
+    // 文件里的 t="array" ref：先把旧结果区域登记为 spill，下面才能安全清掉，
+    // 否则第二次计算会被自己上次的结果挡住。
+    for (anchor, (r1, c1, r2, c2)) in wb.sheets[sheet].arrays.clone() {
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                let k = CellRef::new(r, c);
+                if k != anchor
+                    && wb.sheets[sheet].get(k.row, k.col).is_none_or(|c| c.formula.is_none())
+                {
+                    wb.sheets[sheet].spilled.insert(k);
+                }
+            }
+        }
+    }
+    let count = seeds.len();
+    let scope: std::collections::HashSet<deps::CellKey> = seeds.iter().copied().collect();
+    let mut volatile_values = std::collections::HashMap::new();
+    // 只重算目标表；其它表的 spill 和缓存一格不碰。
+    // 先清一次旧 spill（否则扩大数组会被旧尾格挡住），之后每遍都先读上一遍
+    // 写下的 spill 值，再清空并写新结果；这样依赖尾格的公式能追上。
+    clear_spills_sheet(wb, sheet);
+    let passes = count.saturating_add(1).max(2);
+    for pass in 0..passes {
+        let before = sheet_spill_values(wb, sheet);
+        let results = {
+            let mut calc = Calc::new(wb);
+            calc.scope = Some(scope.clone());
+            calc.volatile_values = std::mem::take(&mut volatile_values);
+            let out: Vec<_> = seeds
+                .iter()
+                .map(|(si, r, c)| (*si, *r, *c, calc.cell_value(*si, *r, *c)))
+                .collect();
+            volatile_values = std::mem::take(&mut calc.volatile_values);
+            out
+        };
+        clear_spills_sheet(wb, sheet);
+        write_back(wb, results);
+        if before == sheet_spill_values(wb, sheet) && pass > 0 {
+            break;
+        }
+    }
+    wb.calc_pending_sheets.remove(&sheet);
+    wb.calc_pending = !wb.calc_pending_sheets.is_empty();
+    count
+}
+
+fn sheet_spill_values(wb: &Workbook, sheet: usize) -> std::collections::BTreeMap<CellRef, crate::Value> {
+    wb.sheets[sheet]
+        .spilled
+        .iter()
+        .map(|k| (*k, wb.sheets[sheet].value(k.row, k.col)))
+        .collect()
+}
+
+fn clear_spills_sheet(wb: &mut Workbook, sheet: usize) {
+    let old: Vec<CellRef> = wb.sheets[sheet].spilled.drain().collect();
+    for key in old {
+        wb.sheets[sheet].set(key.row, key.col, Cell::default());
+    }
+}
+
+#[cfg(test)]
+mod calc_mode_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Workbook};
+
+    fn book() -> Workbook {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: crate::Value::Number(1.0), formula: None });
+        wb.sheets[0].set(0, 1, Cell {
+            value: crate::Value::Empty,
+            formula: Some("=A1*2".into()),
+        });
+        wb
+    }
+
+    #[test]
+    fn manual_mode_keeps_cached_values_until_forced() {
+        let mut wb = book();
+        recalc_all_force(&mut wb);
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(2.0));
+        wb.calc_manual = true;
+        wb.sheets[0].set(0, 0, Cell { value: crate::Value::Number(5.0), formula: None });
+        let deps = deps::Deps::build(&wb);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 0);
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(2.0), "手动模式保留旧值");
+        assert!(wb.calc_pending, "必须标记待计算");
+        recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(2.0), "recalc_all 在手动模式也不能偷算");
+        recalc_all_force(&mut wb);
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(10.0));
+        assert!(!wb.calc_pending);
+    }
+
+    #[test]
+    fn calculate_sheet_does_not_touch_unrelated_volatile_formula() {
+        let mut wb = book();
+        let mut other = Sheet::new("另一表");
+        other.set(0, 0, Cell {
+            value: crate::Value::Number(999.0),
+            formula: Some("=RAND()".into()),
+        });
+        wb.sheets.push(other);
+        let n = recalc_sheet(&mut wb, 0);
+        assert!(n >= 1, "至少算到第一张表的公式（依赖格可能一并计算）");
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(2.0));
+        assert_eq!(wb.sheets[1].value(0, 0), crate::Value::Number(999.0), "无关易失函数不能重算");
+    }
+
+    #[test]
+    fn calc_mode_roundtrips_through_xlsx_calc_pr() {
+        let dir = std::env::temp_dir().join(format!("sc_calc_mode_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let manual = dir.join("manual.xlsx");
+        let auto = dir.join("auto.xlsx");
+        let mut wb = book();
+        wb.calc_manual = true;
+        wb.calc_pending = true;
+        crate::xlsx::save_atomic(&manual, &wb).unwrap();
+        let (loaded, diag) = crate::xlsx::load_diag(&manual).unwrap();
+        assert!(diag.is_complete(), "{:?}", diag);
+        assert!(loaded.calc_manual, "保存后重开仍是手动计算");
+        assert!(!loaded.calc_pending, "加载不伪造待计算状态");
+        wb.calc_manual = false;
+        crate::xlsx::save_atomic(&auto, &wb).unwrap();
+        assert!(!crate::patch::read_calc_manual(&auto), "自动模式不写 manual");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod calc_sheet_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Workbook};
+
+    fn f(text: &str) -> Cell {
+        Cell { value: crate::Value::Empty, formula: Some(text.into()) }
+    }
+
+    #[test]
+    fn recalc_sheet_clears_shrinking_spill_tail_and_updates_dependents() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, f("=SEQUENCE(3,1)"));
+        wb.sheets[0].set(0, 1, f("=A3+10"));
+        let mut other = Sheet::new("易失表");
+        other.set(0, 0, Cell { value: crate::Value::Number(999.0), formula: Some("=RAND()".into()) });
+        wb.sheets.push(other);
+
+        assert!(recalc_sheet(&mut wb, 0) > 0);
+        assert_eq!(wb.sheets[0].value(0, 0), crate::Value::Number(1.0));
+        assert_eq!(wb.sheets[0].value(1, 0), crate::Value::Number(2.0));
+        assert_eq!(wb.sheets[0].value(2, 0), crate::Value::Number(3.0));
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(13.0));
+        assert_eq!(wb.sheets[1].value(0, 0), crate::Value::Number(999.0));
+        // 同样 3 行再算一次：旧 spill 不能把自己挡住。
+        recalc_sheet(&mut wb, 0);
+        assert_eq!(wb.sheets[0].value(2, 0), crate::Value::Number(3.0));
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(13.0));
+        assert!(!matches!(wb.sheets[0].value(0, 0), crate::Value::Error(ErrKind::Spill)));
+
+        // 缩到 2 行：旧 A3 必须清掉，B1 依赖 A3 也要跟着变。
+        wb.sheets[0].set(0, 0, f("=SEQUENCE(2,1)"));
+        recalc_sheet(&mut wb, 0);
+        assert_eq!(wb.sheets[0].value(1, 0), crate::Value::Number(2.0));
+        assert_eq!(wb.sheets[0].value(2, 0), crate::Value::Empty, "缩小的旧尾格要清空");
+        assert!(!wb.sheets[0].spilled.contains(&CellRef::new(2, 0)));
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(10.0));
+
+        // 再长回 3 行：旧尾格不能挡住新溢出，也不能留 #SPILL!。
+        wb.sheets[0].set(0, 0, f("=SEQUENCE(3,1)"));
+        recalc_sheet(&mut wb, 0);
+        assert_eq!(wb.sheets[0].value(2, 0), crate::Value::Number(3.0));
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(13.0));
+        assert!(!matches!(wb.sheets[0].value(0, 0), crate::Value::Error(ErrKind::Spill)));
+        assert_eq!(wb.sheets[1].value(0, 0), crate::Value::Number(999.0), "无关表 RAND 不能被碰");
+    }
+
+    #[test]
+    fn calculate_one_sheet_keeps_other_pending_and_old_cache() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: crate::Value::Number(1.0), formula: None });
+        wb.sheets[0].set(0, 1, f("=A1*2"));
+        let mut second = Sheet::new("第二表");
+        second.set(0, 0, Cell { value: crate::Value::Number(10.0), formula: None });
+        second.set(0, 1, f("=A1*2"));
+        wb.sheets.push(second);
+        recalc_all_force(&mut wb);
+
+        wb.calc_manual = true;
+        wb.sheets[0].set(0, 0, Cell { value: crate::Value::Number(5.0), formula: None });
+        wb.sheets[1].set(0, 0, Cell { value: crate::Value::Number(20.0), formula: None });
+        let deps = deps::Deps::build(&wb);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 0);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(1, 0, 0)]), 0);
+        assert!(wb.calc_pending_sheets.contains(&0) && wb.calc_pending_sheets.contains(&1));
+
+        recalc_sheet(&mut wb, 0);
+        assert_eq!(wb.sheets[0].value(0, 1), crate::Value::Number(10.0));
+        assert_eq!(wb.sheets[1].value(0, 1), crate::Value::Number(20.0), "第二表保持旧缓存");
+        assert!(wb.calc_pending, "只算一张表不能清掉全簿待计算");
+        assert_eq!(wb.calc_pending_sheets.iter().copied().collect::<Vec<_>>(), vec![1]);
+
+        recalc_sheet(&mut wb, 1);
+        assert_eq!(wb.sheets[1].value(0, 1), crate::Value::Number(40.0));
+        assert!(!wb.calc_pending);
+        assert!(wb.calc_pending_sheets.is_empty());
+    }
 }

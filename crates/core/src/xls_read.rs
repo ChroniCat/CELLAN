@@ -18,6 +18,7 @@ const FORMULA: u16 = 0x0006;
 const STRING: u16 = 0x0207;
 const SST: u16 = 0x00FC;
 const CONTINUE: u16 = 0x003C;
+const CALCMODE: u16 = 0x000D;
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
 
@@ -63,6 +64,29 @@ fn rk_value(rk: u32) -> f64 {
         v /= 100.0;
     }
     v
+}
+
+/// 读全局流 CALCMODE：0=手动，1=自动，2=自动（表除外）。
+pub fn read_calc_manual(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let Ok(cf) = crate::cfb::Compound::open(bytes) else { return false };
+    let Some(stream) = cf.stream_by_path("Workbook").or_else(|| cf.stream_by_path("Book")) else {
+        return false;
+    };
+    let mut i = 0usize;
+    while i + 4 <= stream.len() {
+        let t = u16le(&stream, i).unwrap();
+        let l = u16le(&stream, i + 2).unwrap() as usize;
+        if t == CALCMODE && l >= 2 {
+            return u16le(&stream, i + 4) == Some(0);
+        }
+        let n = (i + 4 + l).min(stream.len());
+        if n <= i {
+            break;
+        }
+        i = n;
+    }
+    false
 }
 
 /// 解析 `Workbook` 流里的表名与单元格值
@@ -331,8 +355,10 @@ pub fn load(path: &Path) -> Result<Workbook> {
         .ok_or_else(|| anyhow::anyhow!("没有 Workbook 流"))?;
     let parsed = read_stream(&stream)?;
     let date1904 = read_date1904(&stream);
+    let calc_manual = read_calc_manual(path);
 
     let mut wb = Workbook::new_blank();
+    wb.calc_manual = calc_manual;
     if date1904 {
         wb.date_system = crate::model::DateSystem::D1904;
     }

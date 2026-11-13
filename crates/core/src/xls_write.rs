@@ -18,6 +18,7 @@ use std::path::Path;
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
 const CODEPAGE: u16 = 0x0042;
+const CALCMODE: u16 = 0x000D;
 const FONT: u16 = 0x0031;
 const FORMAT: u16 = 0x041E;
 const XF: u16 = 0x00E0;
@@ -66,6 +67,32 @@ fn set_datemode(buf: &mut Vec<u8>, is_1904: bool) {
         let l0 = u16::from_le_bytes([buf[2], buf[3]]) as usize;
         let at = (4 + l0).min(buf.len());
         let rec_bytes = [0x22u8, 0x00, 0x02, 0x00, (want & 0xFF) as u8, (want >> 8) as u8];
+        buf.splice(at..at, rec_bytes);
+    }
+}
+
+/// 把全局流里的 CALCMODE(0x000D) 改成自动/手动；没有就在 BOF 之后插一条。
+fn set_calcmode(buf: &mut Vec<u8>, manual: bool) {
+    let want: u16 = if manual { 0 } else { 1 };
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let t = u16::from_le_bytes([buf[i], buf[i + 1]]);
+        let l = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        if t == CALCMODE && i + 6 <= buf.len() {
+            buf[i + 4] = (want & 0xFF) as u8;
+            buf[i + 5] = (want >> 8) as u8;
+            return;
+        }
+        let n = (i + 4 + l).min(buf.len());
+        if n <= i {
+            break;
+        }
+        i = n;
+    }
+    if buf.len() >= 4 {
+        let l0 = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        let at = (4 + l0).min(buf.len());
+        let rec_bytes = [0x0Du8, 0x00, 0x02, 0x00, (want & 0xFF) as u8, (want >> 8) as u8];
         buf.splice(at..at, rec_bytes);
     }
 }
@@ -632,6 +659,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     // 否则读端先撞上骨架里的 0。
     let mut prefix = TPL_PREFIX.to_vec();
     set_datemode(&mut prefix, wb.date_system.is_1904());
+    set_calcmode(&mut prefix, wb.calc_manual);
     g.extend_from_slice(&prefix);
     g.extend_from_slice(TPL_FONTS_XFS);
 
@@ -824,6 +852,23 @@ mod tests {
             Value::Number(n) => assert!((n - 3.0).abs() < 1e-9),
             v => panic!("应为 3，得到 {v:?}"),
         }
+    }
+
+    #[test]
+    fn round_trips_calc_mode_through_xls() {
+        let dir = std::env::temp_dir().join("sc_xls_calc_mode");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(format!("calc_{}.xls", std::process::id()));
+        let mut wb = sample();
+        wb.calc_manual = true;
+        write(&p, &wb).unwrap();
+        let back = crate::xlsx::load(&p).unwrap();
+        assert!(back.calc_manual, "BIFF CALCMODE 手动模式应读回");
+        wb.calc_manual = false;
+        write(&p, &wb).unwrap();
+        let back = crate::xlsx::load(&p).unwrap();
+        assert!(!back.calc_manual, "BIFF CALCMODE 自动模式应读回");
+        let _ = std::fs::remove_file(&p);
     }
 
 }

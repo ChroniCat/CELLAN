@@ -433,6 +433,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             crate::model::DateSystem::D1900
         },
         pivots_pending: Vec::new(),
+        calc_manual: crate::patch::read_calc_manual(path),
+        calc_pending: false,
+        calc_pending_sheets: std::collections::BTreeSet::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         decrypted: None,
@@ -703,6 +706,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         }
     }
     apply_xls_meta(path, &mut wb);
+    if is_cfb {
+        wb.calc_manual = crate::xls_read::read_calc_manual(path);
+    }
 
     // 合并单元格（已并行取到）
     {
@@ -2332,12 +2338,14 @@ fn apply_cf_patch(
                 return x.into_bytes();
             }
         }
-        if do_page && name == "xl/workbook.xml" {
+        if name == "xl/workbook.xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
-                let mut x = xml;
-                for (idx, sheet) in wb.sheets.iter().enumerate() {
-                    if sheet.page_dirty {
-                        x = crate::patch::set_print_names(&x, idx as u32, &sheet.name, &sheet.page);
+                let mut x = crate::patch::set_calc_mode(&xml, wb.calc_manual);
+                if do_page {
+                    for (idx, sheet) in wb.sheets.iter().enumerate() {
+                        if sheet.page_dirty {
+                            x = crate::patch::set_print_names(&x, idx as u32, &sheet.name, &sheet.page);
+                        }
                     }
                 }
                 return x.into_bytes();

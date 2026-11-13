@@ -814,6 +814,9 @@ mod real_dialogs {
     const WM_CLOSE: u32 = 0x0010;
     const WM_NULL: u32 = 0x0000;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    // EnumWindows 的 WANT 是模块级暂存；并发测试必须在整个扫描期间串行，
+    // 否则另一个对话框测试会在 set 与 EnumWindows 之间覆盖它，出现“没找到窗口”的假失败。
+    static DIALOG_SCAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn wide_text(f: unsafe extern "system" fn(isize, *mut u16, i32) -> i32, hwnd: isize) -> String {
         let mut buf = [0u16; 512];
@@ -822,6 +825,7 @@ mod real_dialogs {
     }
 
     fn dialog_windows(pid: u32) -> Vec<(isize, String, String)> {
+        let _scan = DIALOG_SCAN.lock().unwrap_or_else(|e| e.into_inner());
         static WANT: std::sync::Mutex<Option<(u32, Vec<(isize, String, String)>)>> =
             std::sync::Mutex::new(None);
         extern "system" fn cb(hwnd: isize, _l: isize) -> i32 {
@@ -847,6 +851,7 @@ mod real_dialogs {
 
     /// 该进程的可见主窗口（排除系统对话框 #32770 与 egui 的临时弹层）。
     fn main_window(pid: u32) -> Option<isize> {
+        let _scan = DIALOG_SCAN.lock().unwrap_or_else(|e| e.into_inner());
         static WANT2: std::sync::Mutex<Option<(u32, Option<isize>)>> = std::sync::Mutex::new(None);
         extern "system" fn cb2(hwnd: isize, _l: isize) -> i32 {
             let mut wpid = 0u32;

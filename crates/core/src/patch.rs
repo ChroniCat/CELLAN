@@ -2839,3 +2839,237 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
     crate::patch::append_entry(path, "xl/workbook.xml", out.as_bytes())?;
     Ok(())
 }
+
+/// 读取 workbook.xml 的 calcPr/@calcMode；手动模式返回 true。
+pub fn read_calc_manual(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    let Ok(mut zip) = zip::ZipArchive::new(file) else { return false };
+    let Ok(mut f) = zip.by_name("xl/workbook.xml") else { return false };
+    let mut xml = String::new();
+    if f.read_to_string(&mut xml).is_err() {
+        return false;
+    }
+    let mut r = Reader::from_str(&xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == "calcPr" => {
+                for a in e.attributes().flatten() {
+                    if a.key.local_name().as_ref() == "calcMode" {
+                        return a.value.eq_ignore_ascii_case("manual");
+                    }
+                }
+                return false;
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+struct ElementSpan {
+    start: usize,
+    end: usize,
+    qname: String,
+    self_closing: bool,
+}
+
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.')
+}
+
+/// 按 local_name 找元素，兼容 `<calcPr>` 与 `<x:calcPr>`；跳过注释/CDATA/PI。
+fn find_element(xml: &str, local: &str) -> Option<ElementSpan> {
+    let bytes = xml.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = xml[i..].find('<') {
+        let s = i + rel;
+        let rest = &xml[s..];
+        if rest.starts_with("<!--") {
+            let e = rest.find("-->")?;
+            i = s + e + 3;
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            let e = rest.find("]]>")?;
+            i = s + e + 3;
+            continue;
+        }
+        if rest.starts_with("<?") {
+            let e = rest.find("?>")?;
+            i = s + e + 2;
+            continue;
+        }
+        if rest.starts_with("<!") {
+            let e = rest.find('>')?;
+            i = s + e + 1;
+            continue;
+        }
+        let mut j = s + 1;
+        if bytes.get(j) == Some(&b'/') {
+            i = s + 1;
+            continue;
+        }
+        let name_start = j;
+        while j < bytes.len() && is_name_byte(bytes[j]) {
+            j += 1;
+        }
+        if j == name_start {
+            i = s + 1;
+            continue;
+        }
+        let qname = &xml[name_start..j];
+        let local_name = qname.rsplit(':').next().unwrap_or(qname);
+        let Some(rel_end) = xml[s..].find('>') else { return None };
+        let end = s + rel_end;
+        if local_name == local {
+            return Some(ElementSpan {
+                start: s,
+                end,
+                qname: qname.to_string(),
+                self_closing: xml[s..=end].trim_end().ends_with("/>"),
+            });
+        }
+        i = end + 1;
+    }
+    None
+}
+
+/// 写 workbook.xml 的 calcPr/@calcMode：手动模式加 calcMode="manual"，
+/// 自动模式删除该属性（Excel 默认 auto），保留 calcPr 里其它属性。
+/// 前缀感知：x:workbook / x:calcPr 不会被字面量匹配漏掉。
+pub fn set_calc_mode(xml: &str, manual: bool) -> String {
+    let Some(calc) = find_element(xml, "calcPr") else {
+        if !manual {
+            return xml.to_string();
+        }
+        let Some(root) = find_element(xml, "workbook") else {
+            return xml.to_string();
+        };
+        let prefix = root.qname.split_once(':').map(|(p, _)| format!("{p}:")).unwrap_or_default();
+        let tag = format!("<{prefix}calcPr calcId=\"191029\" calcMode=\"manual\"/>");
+        let close = format!("</{}>", root.qname);
+        return match xml.rfind(&close) {
+            Some(i) => format!("{}{}{}", &xml[..i], tag, &xml[i..]),
+            None => xml.to_string(),
+        };
+    };
+    let raw = &xml[calc.start..calc.end];
+    let mut tag = if calc.self_closing {
+        raw.trim_end().trim_end_matches('/').trim_end().to_string()
+    } else {
+        raw.trim_end().trim_end_matches('>').trim_end().to_string()
+    };
+    for key in ["calcMode", "fullCalcOnLoad"] {
+        loop {
+            let Some(k) = tag.find(key) else { break };
+            let after = &tag[k + key.len()..];
+            let Some(eq_rel) = after.find('=') else { break };
+            if !after[..eq_rel].trim().is_empty() {
+                break;
+            }
+            let attr_start = tag[..k].rfind(char::is_whitespace).map(|i| i).unwrap_or(k);
+            let rest = &tag[k + key.len() + eq_rel + 1..];
+            let rest = rest.trim_start();
+            let quote = rest.chars().next().unwrap_or('"');
+            let Some(qend) = rest[1..].find(quote) else { break };
+            let end_attr = tag.len() - rest.len() + 1 + qend + 1;
+            tag.replace_range(attr_start..end_attr, "");
+        }
+    }
+    if manual {
+        tag.push_str(" calcMode=\"manual\"");
+    }
+    let mut out = String::with_capacity(xml.len() + 32);
+    out.push_str(&xml[..calc.start]);
+    out.push_str(&tag);
+    out.push_str(if calc.self_closing { "/>" } else { ">" });
+    out.push_str(&xml[calc.end + 1..]);
+    out
+}
+
+#[cfg(test)]
+mod calc_mode_tests {
+    use super::set_calc_mode;
+
+    #[test]
+    fn inserts_manual_calc_pr_when_missing() {
+        let xml = "<workbook><sheets/></workbook>";
+        let out = set_calc_mode(xml, true);
+        assert!(out.contains("<calcPr"));
+        assert!(out.contains("calcMode=\"manual\""));
+        assert!(out.contains("</workbook>"));
+    }
+
+    #[test]
+    fn replaces_existing_calc_mode_and_drops_full_calc_on_load() {
+        let xml = "<workbook><calcPr calcId=\"123\" calcMode=\"auto\" fullCalcOnLoad=\"1\"/></workbook>";
+        let out = set_calc_mode(xml, true);
+        assert!(out.contains("calcId=\"123\""));
+        assert!(out.contains("calcMode=\"manual\""));
+        assert!(!out.contains("fullCalcOnLoad"));
+        assert_eq!(out.matches("calcMode=").count(), 1);
+    }
+
+    #[test]
+    fn auto_removes_manual_mode_but_keeps_other_attributes() {
+        let xml = "<workbook><calcPr calcId=\"123\" calcMode=\"manual\"/></workbook>";
+        let out = set_calc_mode(xml, false);
+        assert!(out.contains("calcId=\"123\""));
+        assert!(!out.contains("calcMode"));
+    }
+
+    #[test]
+    fn prefixed_workbook_and_calc_pr_are_handled() {
+        let xml = "<x:workbook xmlns:x=\"urn:test\"><x:sheets/><x:calcPr calcId=\"7\"/></x:workbook>";
+        let out = set_calc_mode(xml, true);
+        assert!(out.contains("<x:calcPr calcId=\"7\" calcMode=\"manual\"/>"), "{out}");
+        assert!(!out.contains("<calcPr"), "{out}");
+        let back = set_calc_mode(&out, false);
+        assert!(!back.contains("calcMode"), "{back}");
+        assert!(back.contains("<x:calcPr calcId=\"7\"/>"), "{back}");
+    }
+
+    #[test]
+    fn non_self_closing_calc_pr_is_not_double_closed() {
+        let xml = "<workbook><calcPr calcId=\"1\"></calcPr></workbook>";
+        let out = set_calc_mode(xml, true);
+        assert_eq!(out.matches("<calcPr").count(), 1);
+        assert!(out.contains("calcMode=\"manual\""));
+        assert!(out.contains("></calcPr>"));
+        assert!(!out.contains(">>"));
+    }
+
+    #[test]
+    fn prefixed_workbook_without_calc_pr_gets_prefixed_tag() {
+        let xml = "<x:workbook xmlns:x=\"urn:test\"><x:sheets/></x:workbook>";
+        let out = set_calc_mode(xml, true);
+        assert!(out.contains("<x:calcPr calcId=\"191029\" calcMode=\"manual\"/>"), "{out}");
+        assert!(!out.contains("<calcPr"), "{out}");
+    }
+}
+
+#[test]
+fn read_prefixed_calc_pr_from_zip() {
+    let path = std::env::temp_dir().join(format!(
+        "sc_calc_prefix_{}_{}.xlsx",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let file = std::fs::File::create(&path).unwrap();
+    let mut zw = zip::ZipWriter::new(file);
+    zw.start_file(
+        "xl/workbook.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zw.write_all(
+        b"<x:workbook xmlns:x=\"urn:test\"><x:calcPr calcId=\"7\" calcMode=\"manual\"/></x:workbook>",
+    )
+    .unwrap();
+    zw.finish().unwrap();
+    assert!(read_calc_manual(&path));
+    let _ = std::fs::remove_file(&path);
+}

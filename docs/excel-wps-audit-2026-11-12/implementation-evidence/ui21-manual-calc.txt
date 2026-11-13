@@ -1,0 +1,118 @@
+UI-21 手动计算与工作表计算 —— 状态：待验收（2026-11-13 07:55）
+
+一、实现
+
+1) 核心调度（core/model + core/formula + core/xlsx + core/patch）
+- Workbook 新增 calc_manual / calc_pending / calc_pending_sheets：
+  calc_pending_sheets 记录哪些工作表还有未算编辑，计算单表时只移除目标表，
+  不把全簿“待计算”提示误清掉。
+- recalc_all / recalc_dirty 在 calc_manual 时统一短路，只调用 mark_pending
+  标记受影响的表（按 seeds 和依赖闭包），返回 0；手输、Delete、排序、
+  验证下拉、粘贴等入口都走这一道门，不再由 app 各入口各自判断。
+- recalc_all_force 是 F9 / “开始计算” / 切回自动模式的强制入口，清空全簿
+  pending；recalc_sheet 只把目标表公式放进 Calc.scope，跨表公式读取缓存，
+  不会因为另一张表的 RAND/OFFSET 等易失函数而触发全簿重算。
+
+2) 工作表级 spill 计算（UI-21 风险 1）
+- recalc_sheet 不再直接 write_back 旧结果：先把目标表旧 spill 和静态数组
+  ref 覆盖区登记并清空，避免已有 SEQUENCE 尾格挡住扩大后的新数组
+  （误 #SPILL!）；随后按目标表多遍求值，让本表依赖 spill 尾格的公式在
+  数组写入后追上。
+- clear_spills_sheet 只操作目标表，别的表的 spill 与缓存一格不动。
+- 缩小时旧尾格会从 spilled 集合移除并写空；再次扩大时旧尾格已不是障碍。
+- 整个路径没有调用 recalc_all_force；目标表依赖用 scope 内多遍稳定计算。
+
+3) calcPr 前缀兼容（UI-21 风险 3）
+- set_calc_mode 不再用字面量 <calcPr / </workbook>：
+  find_element 按 local_name 扫描开始标签，跳过注释/CDATA/PI，保留
+  x:workbook、x:calcPr 等合法前缀；新插入的 calcPr 继承根元素前缀。
+- 手动模式写 calcMode="manual"，并移除 fullCalcOnLoad；自动模式删除
+  calcMode/manual 属性，保留 calcId 等其它属性。
+- read_calc_manual 用 local_name 读取，支持带前缀 calcPr；新增 zip 级
+  读取用例（read_prefixed_calc_pr_from_zip）。
+
+4) BIFF .xls 边界（不再把 BIFF 另立切片作为豁免）
+- xls_write 写全局 CALCMODE(0x000D)：manual→0、auto→1；
+- xls_read 读 CALCMODE，xlsx::load 在 CFB/.xls 分支回填 wb.calc_manual；
+- 往返用例 round_trips_calc_mode_through_xls 已覆盖手动/自动。
+- .xls 的数组溢出/动态数组不属于当前 BIFF 写入模型；这一点保留为
+  未执行边界，不能据此把 UI-21 父项标成已验收。
+
+5) App
+- “计算选项：手动”同步 self.manual_calc 与 wb.calc_manual，并置 dirty
+  （保存模式变更）；CalcAuto 同时清空 calc_pending_sheets 后走强制重算。
+- F9 / CalculateNow 走后台 recalc_all_force；CalculateSheet 走
+  recalc_sheet_async(self.sheet_idx)。
+- recalc_async 不再在 Some(sheet) 分支无条件 calc_pending=false；
+  单表计算只清目标表的 pending，另一张表仍有未算编辑时徽标继续显示。
+- 手动模式编辑后状态栏显示“手动计算 · 待计算（F9 重算）”，点击徽标
+  等同 F9；保存/另存写 wb.calc_manual；打开手动簿跳过打开时的自动
+  全量重算。
+
+二、Office 缓存模式说明
+
+- Excel 的 workbook.xml calcPr/@calcMode="manual" 表示打开后不自动重算
+  公式，单元格显示文件里上次保存的缓存 <v>，直到用户按 F9 或切换自动。
+- 本项目加载时读取 calcPr；manual 簿保留缓存、不自动 recalc_all，
+  因此显示与 Excel 手动模式一致；编辑后只把受影响表标 pending，
+  不把公式结果静默改掉。
+- 保存时继续写 calcMode="manual"；移除 fullCalcOnLoad，避免 Excel 打开
+  时反过来强制全算。calcId 保留，calcChain 不作为模式判定依据，Excel
+  可按需重建。
+- 自动模式移除 calcMode 属性（而不是写 auto），依靠 Excel 默认值，
+  并保留其它 calcPr 属性。
+
+三、测试（当前候选证据）
+
+- core（2026-11-13 08:00，work/hermes-ui21-core612-20261113-080055/core.log）：
+  68 bins / 612 passed / 0 failed / 41 ignored，CORE_EXIT=0。
+  新增/相关：
+  - patch::calc_mode_tests 6 项：插入缺失 calcPr、替换并移除
+    fullCalcOnLoad、自动移除 manual 保留 calcId、x:workbook/x:calcPr
+    前缀读写往返、带前缀根元素无 calcPr 时生成带前缀标签、非自闭合 calcPr 不重复闭合；
+  - patch::read_prefixed_calc_pr_from_zip：带前缀 calcPr 的 zip 真实读取；
+  - formula::calc_mode_tests 3 项：manual 缓存到强制重算、计算工作表
+    不碰无关 RAND、xlsx calcPr 保存重开；
+  - formula::calc_sheet_tests 2 项：
+    recalc_sheet_clears_shrinking_spill_tail_and_updates_dependents：
+    SEQUENCE(3,1) 重复计算仍正常→缩 2 行旧 A3 清空、B1=A3+10 更新→
+    再长回 3 行不误 #SPILL!；另一表 RAND 缓存 999 不变；
+    calculate_one_sheet_keeps_other_pending_and_old_cache：两张表都有
+    未算编辑时只算第一张，第二张旧缓存保持且 pending 仍为真，再算
+    第二张才清空；
+  - xls_write::round_trips_calc_mode_through_xls：BIFF CALCMODE 手动/
+    自动读回。
+
+- app（2026-11-13 08:06，work/hermes-ui21-all-20261113-080612/app_all.log）：
+  200 passed / 0 failed / 0 ignored，APP_ALL_EXIT=0。新增/相关：
+  - manual_calc_edit_marks_pending_and_f9_forces_recalculation
+  - calculate_sheet_command_keeps_unrelated_volatile_sheet_cached
+  - calculate_sheet_keeps_other_sheet_pending_until_full_recalc
+  - manual_mode_delete_keeps_cached_dependents_until_f9
+  - manual_mode_sort_marks_pending_without_recalculating
+  - manual_mode_dv_and_paste_keep_cached_values
+
+- GUI（2026-11-13 08:06，work/hermes-ui21-all-20261113-080612/app_all.log）：
+  12 passed / 0 failed / 8 ignored，APP_ALL_EXIT=0；另两轮
+  work/hermes-gui-racefix2-080347/test.log 与 racefix3-080445 同样
+  12/0/8，GUI_EXIT=0。
+  SaveAs 单独复跑 work/hermes-gui-saveas-20261113-075052/test.log：
+  真实 #32770 "Save As" 对话框出现，WM_CLOSE 后关闭，主窗口仍响应。
+  已定位旧 ID39878 的 11 pass/1 fail 不是应用对话框失效，而是测试自身
+  的并发竞态：dialog_windows/main_window 共用模块级 WANT 暂存，
+  set WANT 与 EnumWindows 之间可被另一个对话框测试覆盖，导致“没找到
+  窗口”的假失败。已在测试扫描全程加 DIALOG_SCAN 互斥，断言一条未删；
+  连续两轮整体 GUI 均 12/0/8 通过。旧文档 12 pass 仅历史，当前以本
+  日志为准。
+
+四、未执行 / 待验收
+
+- 未用 Excel 365 / WPS 实机打开 calcPr=manual 的 xlsx，核对缓存值、
+  F9 和另存后的 calcPr 往返；未对 BIFF CALCMODE 做 Excel/WPS 实机对拍。
+- 未在真实 GUI 点击 F9、计算工作表、点击状态栏徽标；当前为命令级与
+  app 测试路径，不能当作 GUI 验收。
+- 大表数组溢出、循环引用、动态数组缩小/扩大与 Excel 的逐项对拍未执行；
+  .xls 的数组溢出/动态数组不在当前 BIFF 写入模型内。
+- 真实 Excel/WPS 对 Delete、排序、DV、粘贴入口的行为对拍未完成。
+- 因此 UI-21 仅为待验收；旧 core 605/app 196 快照和旧 GUI 12/8 文档
+  不构成本轮最终证据。

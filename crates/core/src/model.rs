@@ -553,6 +553,12 @@ pub struct Workbook {
     pub decrypted: Option<PathBuf>,
     /// 日期体系（workbookPr/@date1904）
     pub date_system: DateSystem,
+    /// 手动计算模式（workbook.xml calcPr/@calcMode="manual"）
+    pub calc_manual: bool,
+    /// 手动模式下已有编辑但尚未重算，状态栏显示“待计算”
+    pub calc_pending: bool,
+    /// 手动模式下具体哪些工作表还有未算编辑；计算单表时不能误清别的表
+    pub calc_pending_sheets: std::collections::BTreeSet<usize>,
     /// 打开密码设置；另存时继续加密
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     pub dirty: bool,
@@ -576,6 +582,9 @@ impl Workbook {
             decrypted: None,
             encryption: None,
             date_system: DateSystem::D1900,
+            calc_manual: false,
+            calc_pending: false,
+            calc_pending_sheets: std::collections::BTreeSet::new(),
             dirty: false,
             styles: crate::style::StyleTable::new(),
         }

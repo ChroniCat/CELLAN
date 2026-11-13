@@ -1560,6 +1560,7 @@ impl SheetApp {
             self.tabs = vec![TabSlot::Active];
             self.active_tab = 0;
             self.wb = Workbook::new_blank();
+            self.manual_calc = false;
             self.reset_editor_state();
         } else {
             self.open_in_new_tab(PathBuf::new());
@@ -1679,7 +1680,9 @@ impl SheetApp {
                     }
                     let mut wb2 = wb;
                     let t = std::time::Instant::now();
-                    sheetcore::formula::recalc_all(&mut wb2);
+                    if !wb2.calc_manual {
+                        sheetcore::formula::recalc_all(&mut wb2);
+                    }
                     if prof {
                         eprintln!("[open] recalc {:.2}s", t.elapsed().as_secs_f64());
                     }
@@ -1720,7 +1723,9 @@ impl SheetApp {
                 Ok((wb, diag)) => {
                     let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(diag)));
                     let mut wb2 = wb;
-                    sheetcore::formula::recalc_all(&mut wb2);
+                    if !wb2.calc_manual {
+                        sheetcore::formula::recalc_all(&mut wb2);
+                    }
                     let deps = sheetcore::formula::deps::Deps::build(&wb2);
                     let _ = tx.send(OpenMsg::Recalced(Box::new(wb2), Box::new(deps)));
                 }
@@ -1731,8 +1736,18 @@ impl SheetApp {
         });
     }
 
-    /// 手动全量重算：复制一份到后台算，界面不冻结
+    /// 手动全量重算：复制一份到后台算，界面不冻结。
+    /// 显式 F9/“开始计算”必须绕过 calcMode=manual；算完仍保留手动模式标记。
     fn recalc_all_async(&mut self) {
+        self.recalc_async(None);
+    }
+
+    /// “计算工作表”：只把当前表及其下游拉进重算范围。
+    fn recalc_sheet_async(&mut self, sheet: usize) {
+        self.recalc_async(Some(sheet));
+    }
+
+    fn recalc_async(&mut self, sheet: Option<usize>) {
         if self.tasks.open_rx.is_some() || self.tasks.busy {
             self.status = "正在加载或重算，稍后再试".into();
             return;
@@ -1742,10 +1757,20 @@ impl SheetApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tasks.open_rx = Some(rx);
         self.tasks.busy = true;
-        self.status = "正在后台重算全部公式…".into();
+        self.status = match sheet {
+            Some(_) => "正在后台重算当前工作表…".into(),
+            None => "正在后台重算全部公式…".into(),
+        };
         std::thread::spawn(move || {
             let mut wb = wb;
-            sheetcore::formula::recalc_all(&mut wb);
+            let manual = wb.calc_manual;
+            wb.calc_manual = false;
+            match sheet {
+                Some(si) => { sheetcore::formula::recalc_sheet(&mut wb, si); }
+                None => sheetcore::formula::recalc_all_force(&mut wb),
+            }
+            wb.calc_manual = manual;
+            // 单表重算只清该表；全量重算由 recalc_all_force 清空。
             let deps = sheetcore::formula::deps::Deps::build(&wb);
             let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch));
         });
@@ -1961,6 +1986,8 @@ impl SheetApp {
                         self.show_load_diag = true;
                     }
                     self.wb = *wb;
+                    self.manual_calc = self.wb.calc_manual;
+                    self.wb.calc_pending = false;
                     self.wb_epoch += 1;
                     self.deps = sheetcore::formula::deps::Deps::empty();
                     self.sheet_idx = 0;
@@ -1991,7 +2018,11 @@ impl SheetApp {
                     self.views = ui_prefs::load_views(&self.views_key());
                     self.view_active = None;
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
-                    self.status = format!("已打开（{n} 个非空格），正在后台重算…");
+                    self.status = if self.manual_calc {
+                        format!("已打开（{n} 个非空格，手动计算：按 F9 重算）")
+                    } else {
+                        format!("已打开（{n} 个非空格），正在后台重算…")
+                    };
                     // 不完整时必须压过普通提示：用户第一眼就要知道这份文件没读全
                     if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
                         self.status = self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default();
@@ -2922,11 +2953,16 @@ impl SheetApp {
                     self.tasks.busy = false;
                     if epoch == self.wb_epoch {
                         self.wb = *wb;
+                        self.manual_calc = self.wb.calc_manual;
                         self.wb_epoch += 1;
                         self.deps = *deps;
                         self.cf_stats_gen = u64::MAX;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.status = "重算全部完成".into();
+                        self.status = if self.manual_calc {
+                            "重算完成（仍为手动计算模式）".into()
+                        } else {
+                            "重算全部完成".into()
+                        };
                         eprintln!("[open] 手动重算完成");
                     } else {
                         self.status = "重算结果已过期（期间有编辑），已丢弃".into();
@@ -2965,6 +3001,7 @@ impl SheetApp {
                     self.wb = *wb;
                     self.wb.path = path;
                     self.wb.dirty = dirty;
+                    self.manual_calc = self.wb.calc_manual;
                     self.deps = *deps;
                     self.tasks.busy = false;
                     self.tasks.needs_full = false;
@@ -2972,6 +3009,8 @@ impl SheetApp {
                     let n: usize = self.wb.sheets.iter().map(|s| s.len()).sum();
                     self.status = if self.load_diag.as_ref().is_some_and(|d| d.has_fatal()) {
                         self.load_diag.as_ref().map(|d| d.summary()).unwrap_or_default()
+                    } else if self.manual_calc {
+                        format!("已打开（{n} 个非空格，手动计算：按 F9 重算）")
                     } else {
                         format!("已打开并重算完成（{n} 个非空格）")
                     };
@@ -4178,6 +4217,10 @@ impl SheetApp {
         let deps = std::mem::replace(&mut self.deps, sheetcore::formula::deps::Deps::empty());
         if !self.manual_calc {
             sheetcore::formula::recalc_dirty(&mut self.wb, &deps, keys);
+        } else {
+            self.wb.calc_manual = true;
+            sheetcore::formula::mark_pending(&mut self.wb, &deps, keys);
+            self.status = "手动计算：已标记待计算（按 F9 或“开始计算”重算）".into();
         }
         self.deps = deps;
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
@@ -6323,6 +6366,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.status = if redo { "没有可重做的操作".into() } else { "没有可撤销的操作".into() };
             return;
         };
+        if applied.merge_conflict {
+            self.status = format!(
+                "{}：合并结构与当前表冲突，已整体放弃（结构、内容和广播均未改动）",
+                if redo { "重做" } else { "撤销" }
+            );
+            return;
+        }
         // 刷新类动作撤销/重做时把外源源尺寸一起还原
         if let Some(sizes) = &applied.refresh_sizes {
             for (name, rows, cols) in sizes {
@@ -6767,23 +6817,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         // 格式刷：Esc 结束（连续模式也结束）
         if self.editing.is_none()
-            && self.format_painter.is_some()
+            && (self.format_painter.is_some()
+                || self.merge_pending.is_some()
+                || self.fmt_merge_pending.is_some())
             && ctx.input(|i| i.key_pressed(Key::Escape))
         {
+            let had_painter = self.format_painter.is_some();
+            let had_merge = self.merge_pending.is_some() || self.fmt_merge_pending.is_some();
             self.format_painter = None;
             self.painter_double = false;
-            self.status = "格式刷已取消".into();
+            self.drop_merge_confirmation();
+            self.status = match (had_painter, had_merge) {
+                (true, true) => "格式刷与未确认的合并已取消".into(),
+                (true, false) => "格式刷已取消".into(),
+                _ => "已取消未确认的合并".into(),
+            };
             return;
         }
 
-        if self.editing.is_none()
-            && (self.merge_pending.is_some() || self.fmt_merge_pending.is_some())
-            && ctx.input(|i| i.key_pressed(Key::Escape))
-        {
-            self.drop_merge_confirmation();
-            self.status = "已取消未确认的合并".into();
-            return;
-        }
         if self.editing.is_none()
             && !self.extra_sel.is_empty()
             && ctx.input(|i| i.key_pressed(Key::Escape))
@@ -21438,6 +21489,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             self.tabs = vec![TabSlot::Active];
             self.active_tab = 0;
             self.wb = Workbook::new_blank();
+            self.manual_calc = false;
             self.reset_editor_state();
             self.status = "已新建空白工作簿".into();
         } else if pick {
@@ -21616,6 +21668,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.find.find_all.clear();
         self.find.find_all_open = false;
         self.wb = doc.wb;
+        self.manual_calc = self.wb.calc_manual;
         self.load_diag = doc.load_diag;
         self.undo = doc.undo;
         self.deps = doc.deps;
@@ -21691,6 +21744,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.reset_editor_state();
         if path.as_os_str().is_empty() {
             self.wb = Workbook::new_blank();
+            self.manual_calc = false;
             self.status = "已新建标签".into();
         } else {
             self.open_path(path);
@@ -23341,6 +23395,26 @@ impl eframe::App for SheetApp {
                             .size(11.0)
                             .color(ui_kit::TEXT),
                     );
+                    if self.manual_calc {
+                        ui.add_space(10.0);
+                        let pending = self.wb.calc_pending;
+                        let txt = if pending { "手动计算 · 待计算（F9 重算）" } else { "手动计算" };
+                        let color = if pending {
+                            egui::Color32::from_rgb(190, 110, 20)
+                        } else {
+                            ui_kit::TEXT
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(txt).size(11.0).color(color))
+                                    .frame(false),
+                            )
+                            .on_hover_text("点击按 F9 重算全部公式")
+                            .clicked()
+                        {
+                            self.recalc_all_async();
+                        }
+                    }
                     // 循环引用：Excel 在状态栏用红字提示「循环引用: C3」，点一下可以跳过去
                     if !self.cycles.is_empty() {
                         let c0 = self.cycles[0];
