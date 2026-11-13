@@ -1,10 +1,10 @@
 # 恢复记录
 
 - 分支 `main`（`origin/main`）；代码修复 `5fd9ea3`（本次四项；前序 `f97377a`/`fb2b55d`/`2745438`/`f19b932`/`4202fae`），文档记录提交 `889acc7`；C11 父项已验收；UI-09 父项仍待真机复核。
-- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 3 实施中 / 35 待实施；
-  切片 35 已验收 / 27 待验收 / 86 待实施。C11 父项已按用户 14:00 认可翻绿。
+- 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 4 实施中 / 34 待实施；
+  切片 35 已验收 / 28 待验收 / 85 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（15:01 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
-  app **217 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
+  app **218 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
 - 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
   C10.2 live 按用户要求保留。
 
@@ -494,3 +494,6 @@
 - UI-08.3 按 side dirty 只写改动边，左粗红/右双蓝在只加下框后保留 style/color。
 - 专项：nav 1 passed、tab 1 passed、page 1 passed、border 1 passed；全量 app
   **217 passed / 0 failed / 0 ignored**。以上均待验收，真实 GUI/Office 仍缺。
+- 15:12 UI-15.1：格式对话框增加自定义格式输入与“当前值”预览，活动值真实渲染；
+  自定义格式保存 xlsx 重开保留；专项 1 passed，全量 218；实机 framebuffer 已截。
+  UI-15.1 待验收，UI-15 父项实施中。

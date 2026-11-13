@@ -6691,6 +6691,16 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     /// 提交格式对话框：只覆盖用户改过的字段；未改直接确定不产生事务。
+    /// 格式对话框的“当前值”预览：用活动格真实值和草稿格式渲染。
+    fn format_dialog_preview(&self) -> String {
+        let v = self
+            .wb
+            .sheet(self.sheet_idx)
+            .value(self.sel.0, self.sel.1)
+            .clone();
+        sheetcore::style::format_value_in(self.wb.date_system, &v, &self.fmt_state.format)
+    }
+
     fn apply_format_dialog(&mut self) {
         let st = self.fmt_state.clone();
         let orig = self.fmt_orig.clone();
@@ -16846,16 +16856,28 @@ let txn = self.txn_begin(&keys);
                                         }
                                     }
                                 });
+                            let mut custom = self.fmt_state.format.clone();
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut custom)
+                                    .desired_width(150.0)
+                                    .hint_text("自定义格式"),
+                            );
+                            if r.changed() {
+                                self.fmt_state.format = custom;
+                            }
                             let sample = if format_mixed {
                                 "混合".to_string()
                             } else {
-                                sheetcore::style::format_value_in(self.wb.date_system,
-                                    &sheetcore::model::Value::Number(1234.5678),
-                                    &self.fmt_state.format,
-                                )
+                                self.format_dialog_preview()
                             };
                             ui.label(
                                 egui::RichText::new(format!("示例  {sample}"))
+                                    .monospace()
+                                    .size(11.5)
+                                    .weak(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("当前值  {}", self.format_dialog_preview()))
                                     .monospace()
                                     .size(11.5)
                                     .weak(),

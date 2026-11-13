@@ -1,0 +1,20 @@
+UI-15.1 自定义数字格式与当前值预览（2026-11-13 15:12 CST）
+
+实现
+- 格式对话框“数字”页在固定格式下拉旁增加自定义格式输入框，直接编辑
+  fmt_state.format；确定时沿用 UI-08.2 的逐字段比较，只提交真正变化的格式。
+- 新增 format_dialog_preview：取活动格真实 Value（不是固定 1234.5678），
+  按草稿格式和当前日期体系渲染；对话框同时显示“示例”和“当前值”。
+- 自定义格式输入支持负数段/颜色段/零段语法，例如
+  #,##0.00;[Red](#,##0.00);-。
+- 测试 custom_format_previews_active_cell_value：
+  A1=-1234.5，草稿自定义格式，断言当前值预览为 (1,234.50)；
+  确定后样式 format 正确；保存为 xlsx 再 load，自定义格式仍保留。
+- 15:12 实机 framebuffer：SC_SEL=A1、SC_OPEN_DIALOG=format、SC_SHOT
+  确认数字页存在带边框的自定义格式输入框、示例和当前值两行；
+  证据 implementation-evidence/ui15-custom-format.png。
+- 专项 1 passed；全量 app **218 passed / 0 failed / 0 ignored**，APP_EXIT=0。
+
+未完成
+- 真实鼠标在输入框键入、取消/Esc、Excel/WPS 保存重开目视未做。
+- UI-15.1 标待验收；UI-15 父项实施中，不因专项通过提前验收。

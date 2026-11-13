@@ -4524,17 +4524,26 @@
       "scope": "app/main.rs format_dialog + core/style.rs",
       "source": "ui-requirements.md",
       "heading": "UI-15 格式对话框补全高频能力",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
+      "status": "实施中",
+      "acceptance": "UI-15.1 自定义格式与当前值预览已实现并专项/全量通过；填充/保护页、双下划线/竖排仍未实现，父项实施中。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
       "commits": [],
       "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt"
+      ],
+      "not_done": [
+        "真实鼠标输入/取消/Esc、Excel/WPS 保存重开目视未做",
+        "填充/保护页未实现",
+        "双下划线/竖排真实模型未实现"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "继续 UI-15.2 填充/保护页与 UI-15.3 双下划线/竖排。",
+      "updated_utc": "2026-11-13T07:13:30Z",
       "slices": [
         {
           "id": "UI-15.1",
@@ -4542,17 +4551,28 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "待验收",
+          "acceptance": "数字页提供自定义格式输入与当前值/示例预览；活动值 -1234.5 在 #,##0.00;[Red](#,##0.00);- 下预览 (1,234.50)；确定后样式写回，保存 xlsx 重开保留；专项 1 passed，全量 app 218。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p app --offline --bin app custom_format_previews_active_cell_value -> 1 passed",
+            "cargo test -p app --offline --bin app -> 218 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.png"
+          ],
+          "not_done": [
+            "真实鼠标在格式输入框键入、取消/Esc、Excel/WPS 保存重开目视未做"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补真实鼠标与 Office 目视，再评估 UI-15 父项。",
+          "updated_utc": "2026-11-13T07:13:30Z"
         },
         {
           "id": "UI-15.2",

@@ -1147,6 +1147,29 @@ fn format_dialog_preserves_unchanged_fields_and_mixed_cell_styles() {
     assert_eq!(app.wb.styles.get(before.1).format, "#,##0.00");
 }
 
+/// UI-15.1：自定义数字格式用活动格当前值预览，并写回样式。
+#[test]
+fn custom_format_previews_active_cell_value() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, number(-1234.5));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_format_dialog();
+    app.fmt_state.format = "#,##0.00;[Red](#,##0.00);-".into();
+    assert_eq!(app.format_dialog_preview(), "(1,234.50)");
+    app.apply_format_dialog();
+    let st = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0));
+    assert_eq!(st.format, "#,##0.00;[Red](#,##0.00);-");
+    let path = crate::test_env::scratch("ui15-custom-format").join("custom.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &app.wb).unwrap();
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(
+        back.styles.get(back.sheet(0).style_of(0, 0)).format,
+        "#,##0.00;[Red](#,##0.00);-"
+    );
+}
+
 /// UI-08.3：对话框只切换一条边时，其他边的粗细和颜色不能被改成细灰线。
 #[test]
 fn format_dialog_preserves_border_thickness_and_color_when_other_side_changes() {
