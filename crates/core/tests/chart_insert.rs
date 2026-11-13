@@ -1,15 +1,18 @@
 //! 插入图表：生成部件并挂到表上，读回来能认出这张图
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qa02").join(name)
+}
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn insert_column_chart() {
-    let src = Path::new("tests/test-work/table.xlsx");
+    let src = fixture("table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let out = std::path::PathBuf::from(format!("tests/test-work/chart_out_{}.xlsx", std::process::id()));
+    let out = std::env::current_exe().expect("test exe").parent().expect("test dir").join(format!("chart_out_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
-    let wb = sheetcore::xlsx::load(src).expect("读入");
+    let wb = sheetcore::xlsx::load(&src).expect("读入");
     sheetcore::xlsx::save(&out, &wb).expect("先存一份");
 
     // 用 A1:C6 造图表：首行是系列名，首列是分类

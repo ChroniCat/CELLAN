@@ -1,0 +1,67 @@
+# QA-02.1 首批 ignored 夹具恢复
+
+日期：2026-11-13（CST）
+范围：QA-02 P0 的第一批；只恢复已有测试的合成夹具并把测试接入默认 suite，不声称全部 ignored 已恢复。
+
+## 恢复的测试
+
+| 测试文件 | 测试 | 原状态 | 现在 |
+|---|---|---|---|
+| `crates/core/tests/array_formula.rs` | `reads_array_formula_from_file` | ignored | 默认执行，1 passed |
+| `crates/core/tests/array_formula.rs` | `load_keeps_array_and_save_writes_it_back` | ignored | 默认执行，1 passed |
+| `crates/core/tests/comments.rs` | `reads_comments` | ignored | 默认执行，1 passed |
+| `crates/core/tests/comments.rs` | `add_edit_delete_and_save` | ignored | 默认执行，1 passed |
+| `crates/core/tests/chart_insert.rs` | `insert_column_chart` | ignored | 默认执行，1 passed |
+| `crates/core/tests/chart_kinds.rs` | `every_kind_inserts_and_deletes` | ignored | 默认执行，1 passed |
+| `crates/core/tests/page_setup.rs` | `reads_page_settings` | ignored | 默认执行，1 passed |
+| `crates/core/tests/page_setup.rs` | `changes_survive_save` | ignored | 默认执行，1 passed |
+| `crates/core/tests/freeze.rs` | `freeze_roundtrip` | ignored | 默认执行，1 passed |
+
+没有删除断言、降低断言或加 `skip`。测试路径由 `tests/test-work/...` 改为
+`tests/fixtures/qa02/...`；测试输出目录改为当前 test executable 的父目录，
+不再写固定 `tests/test-work` 路径。
+
+## 合成夹具
+
+- `crates/core/tests/fixtures/qa02/array.xlsx`：`数组` 表，B2:D2 CSE 数组公式。
+- `crates/core/tests/fixtures/qa02/notes.xlsx`：两条批注，B2 张三、A3 李四（含换行）。
+- `crates/core/tests/fixtures/qa02/table.xlsx`：姓名/部门/金额，6 行数据；供 chart/pivot 类测试。
+- `crates/core/tests/fixtures/qa02/page.xlsx`：A1:H40，横向 A3、85%、网格线、标题行 1:2。
+- `crates/core/tests/fixtures/qa02/freeze.xlsx`：`C2` 冻结，即 1 行 + 2 列。
+- 生成器：
+  - `scripts/qa02_array_fixture.py`
+  - `scripts/qa02_notes_fixture.py`
+  - `scripts/qa02_extended_fixtures.py`
+- 生成方式均为新路径，拒绝覆盖；只生成合成数据。
+
+## 实际命令与结果
+
+```text
+cargo test -p sheetcore --offline --test array_formula
+  test result: 2 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline --test comments
+  test result: 2 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline --test chart_insert
+  test result: 1 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline --test chart_kinds
+  test result: 1 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline --test page_setup
+  test result: 3 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline --test freeze
+  test result: 1 passed; 0 failed; 0 ignored
+cargo test -p sheetcore --offline
+  full: 76 bins / 694 passed / 0 failed / 32 ignored
+```
+
+（`page_setup` 的 3 项包含原有的 `page_setup_pr_is_inserted_after_outline_pr`；
+其中 2 项由 ignored 转默认。）
+
+## 尚未完成
+
+- `crates/core/tests` 仍有 32 个 ignored；`crates/app/tests` 的对象 fixture
+  （图片/文本框等）尚未恢复。
+- QA-02.2 的 P1 对象与输出夹具、QA-02.3 的剩余 skip 原因/解锁条件尚未做。
+- 本片只证明这 9 个测试可由仓库内合成夹具默认重建，不证明 QA-02 父项完成；
+  未把其它测试的缺少夹具记通过。
+
+本片状态：实施中，等待监督复核后再决定是否转待验收/已验收。

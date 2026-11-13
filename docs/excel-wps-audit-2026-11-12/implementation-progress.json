@@ -1142,17 +1142,44 @@
       "scope": "core/tests + app/tests夹具",
       "source": "qa-requirements.md",
       "heading": "QA-02 P0 恢复被 ignored 的关键样本测试",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
-      "files": [],
+      "files": [
+        "crates/core/tests/array_formula.rs",
+        "crates/core/tests/comments.rs",
+        "crates/core/tests/chart_insert.rs",
+        "crates/core/tests/chart_kinds.rs",
+        "crates/core/tests/page_setup.rs",
+        "crates/core/tests/freeze.rs",
+        "crates/core/tests/fixtures/qa02/array.xlsx",
+        "crates/core/tests/fixtures/qa02/notes.xlsx",
+        "crates/core/tests/fixtures/qa02/table.xlsx",
+        "crates/core/tests/fixtures/qa02/page.xlsx",
+        "crates/core/tests/fixtures/qa02/freeze.xlsx",
+        "scripts/qa02_array_fixture.py",
+        "scripts/qa02_notes_fixture.py",
+        "scripts/qa02_extended_fixtures.py"
+      ],
       "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": [
+        "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test comments -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test chart_insert -> 1 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test chart_kinds -> 1 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test freeze -> 1 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline -> 76 bins, 694 passed, 0 failed, 32 ignored"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt"
+      ],
+      "not_done": [
+        "QA-02.1 未收口；QA-02.2/QA-02.3 未开始。"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "完成 QA-02.1 剩余 P0/P1 夹具后进入 QA-02.2/QA-02.3。",
+      "updated_utc": "2026-11-13T19:39:58Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1160,17 +1187,45 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-02 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/tests/array_formula.rs",
+            "crates/core/tests/comments.rs",
+            "crates/core/tests/chart_insert.rs",
+            "crates/core/tests/chart_kinds.rs",
+            "crates/core/tests/page_setup.rs",
+            "crates/core/tests/freeze.rs",
+            "crates/core/tests/fixtures/qa02/array.xlsx",
+            "crates/core/tests/fixtures/qa02/notes.xlsx",
+            "crates/core/tests/fixtures/qa02/table.xlsx",
+            "crates/core/tests/fixtures/qa02/page.xlsx",
+            "crates/core/tests/fixtures/qa02/freeze.xlsx",
+            "scripts/qa02_array_fixture.py",
+            "scripts/qa02_notes_fixture.py",
+            "scripts/qa02_extended_fixtures.py"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test comments -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test chart_insert -> 1 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test chart_kinds -> 1 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test freeze -> 1 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline -> 76 bins, 694 passed, 0 failed, 32 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt"
+          ],
+          "not_done": [
+            "仅恢复 9 个核心测试；QA-02.2 的 P1 对象/输出夹具与 app/tests 对象夹具仍未恢复。",
+            "剩余 32 个 core ignored 的原因/责任人/解锁步骤台账尚未逐项补齐。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "继续恢复 P1 对象/输出夹具，并逐项建立剩余 ignored 的原因、解锁步骤台账。",
+          "updated_utc": "2026-11-13T19:39:58Z"
         },
         {
           "id": "QA-02.2",

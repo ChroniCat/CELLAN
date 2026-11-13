@@ -1,5 +1,10 @@
 //! 八种图表类型 + 删除
 use sheetcore::charts::ChartKind;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qa02").join(name)
+}
 
 fn kinds() -> Vec<ChartKind> {
     vec![
@@ -15,19 +20,14 @@ fn kinds() -> Vec<ChartKind> {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn every_kind_inserts_and_deletes() {
-    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    let src = fixture("table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
     for k in kinds() {
-        let mut wb = sheetcore::xlsx::load(src).expect("读入");
+        let mut wb = sheetcore::xlsx::load(&src).expect("读入");
         let name = wb.sheet(0).name.clone();
         let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
-        let out = std::path::PathBuf::from(format!(
-            "tests/test-work/ck_{:?}_{}.xlsx",
-            k,
-            std::process::id()
-        ));
+        let out = std::env::current_exe().expect("test exe").parent().expect("test dir").join(format!("ck_{:?}_{}.xlsx", k, std::process::id()));
         let _ = std::fs::remove_file(&out);
         sheetcore::xlsx::save(&out, &wb).expect("保存");
         let ch = sheetcore::chart_write::chart_from_selection(

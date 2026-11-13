@@ -29,6 +29,7 @@
 !docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-*.xlsx
 !docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-*.xlsx
 !crates/core/tests/fixtures/qa01/*.xlsx
+!crates/core/tests/fixtures/qa02/*.xlsx
 
 # Operating-system files
 .DS_Store

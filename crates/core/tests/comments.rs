@@ -2,13 +2,12 @@
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("tests/test-work/notes.xlsx");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qa02/notes.xlsx");
     assert!(p.exists(), "required test fixture is missing: {}", p.display());
-    Some(sheetcore::xlsx::load(p).expect("读入"))
+    Some(sheetcore::xlsx::load(&p).expect("读入"))
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_comments() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -28,11 +27,14 @@ fn reads_comments() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn add_edit_delete_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("tests/test-work/notes_edit.xlsx");
-    let _ = std::fs::remove_file(out);
+    let out = std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("test executable directory")
+        .join(format!("notes_edit_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&out);
 
     // 新增 C5、修改 B2、删除 A3
     wb.sheets[0].notes.insert(
@@ -45,9 +47,9 @@ fn add_edit_delete_and_save() {
     wb.sheets[0].notes.remove(&sheetcore::model::CellRef::new(2, 0));
     wb.sheets[0].notes_dirty = true;
 
-    sheetcore::xlsx::save(out, &wb).expect("保存");
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
 
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     let sh = back.sheet(0);
     let get = |r: u32, c: u32| sh.notes.get(&sheetcore::model::CellRef::new(r, c)).map(|n| n.text.clone());
     assert_eq!(get(4, 2), Some("新增的批注".to_string()), "新增的批注应保存");
