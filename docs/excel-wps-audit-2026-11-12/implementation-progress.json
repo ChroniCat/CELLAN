@@ -3143,17 +3143,19 @@
       "scope": "core/pivot.rs, pivot_xml.rs + app透视入口",
       "source": "core-requirements.md",
       "heading": "C12 P1 透视汇总正确性与多字段模型",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "C12.1 待验收；C12.2/C12.3/C12.4 未开始。"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
+      "updated_utc": "2026-11-13T20:35:00Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3161,17 +3163,26 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/core/src/pivot.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "cargo test -p sheetcore --offline --lib pivot::tests:: -- --test-threads=1 -> 5 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-count.txt"
+          ],
+          "not_done": [
+            "两层行字段/多值字段/筛选器/字段面板/Office 可编辑往返未实现。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "监督复核 C12.1 的 Count/空值回归；随后再做 C12.2 多字段规格。",
+          "updated_utc": "2026-11-13T20:35:00Z"
         },
         {
           "id": "C12.2",

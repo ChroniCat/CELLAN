@@ -1,0 +1,45 @@
+# C12.1 透视计数空值修复
+
+日期：2026-11-13 20:35 CST
+范围：`crates/core/src/pivot.rs` 的 `compute` / `agg_value`。
+
+## 复现的根因
+
+`compute` 原来把每个源行都放进 `Vec<f64>`：数字 push 实际值，非数字（包括空格和文本）
+在 `Agg::Count` 时 push `0.0`。于是：
+
+- 组 A 的三行 `1`、`x`、空白，Count 得到 **3**；
+- 空白格被当成数值 0 计数，文本 `x` 也被当成 0 计数；
+- 文本无法与真正的空值区分。
+
+## 修复
+
+- 收集值改为 `PivotVal { n: Option<f64> }`；
+- `Count` 只在源值非空时 push；空白（`Value::Empty` 或缺失单元格）不进入计数；
+- `Sum/Avg/Max/Min` 仍只对可解析的数字计算（保留原有文本数字解析行为）；
+- `Count` 直接返回非空条目数，不把缺失值折成 0。
+
+## 回归
+
+新增 `pivot::tests::count_ignores_blank_and_counts_text`：
+
+```text
+A2=1, A3=x, A4=空；row_field=部门，value_field=值，Agg::Count
+-> 组 A Count = 2
+```
+
+实际结果：
+
+```text
+cargo test -p sheetcore --offline --lib pivot::tests:: -- --test-threads=1
+-> 5 passed; 0 failed; 0 ignored; 267 filtered out
+cargo test -p sheetcore --offline --test pivot_file
+-> 2 passed; 0 failed; 0 ignored
+```
+
+日志：`/tmp/c12_count2.log`、`/tmp/c12_pivot_file.log`。
+
+## 边界
+
+只完成 C12.1 的计数/空值语义。两层行字段、多值字段、筛选器、字段面板、
+Excel/WPS 可编辑往返仍未实现；C12 父项不能因此验收。

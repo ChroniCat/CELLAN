@@ -159,6 +159,9 @@ pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
     out
 }
 
+#[derive(Clone, Copy)]
+struct PivotVal { n: Option<f64> }
+
 pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let (r1, c1, r2, c2) = spec.source;
     let header = |c: u32| {
@@ -170,8 +173,9 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let row_name = header(spec.row_field);
     let value_name = header(spec.value_field);
 
-    // 收集：行标签 → (列标签 → 值列表)
-    let mut data: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
+    // 收集：行标签 → (列标签 → 值列表)。Count 只数非空格（数字/文本都算），
+    // 空白格不能以 0 混进计数。
+    let mut data: BTreeMap<String, BTreeMap<String, Vec<PivotVal>>> = BTreeMap::new();
     for r in (r1 + 1)..=r2 {
         let raw = sheet
             .get(r, spec.row_field)
@@ -189,16 +193,18 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
             None => value_name.clone(),
         };
         let v = sheet.get(r, spec.value_field).map(|x| x.value.clone());
-        let n = match v {
-            Some(Value::Number(n)) => Some(n),
-            Some(other) => other.display().parse::<f64>().ok(),
-            None => None,
+        let (n, nonempty) = match v {
+            Some(Value::Number(n)) => (Some(n), true),
+            Some(Value::Empty) | None => (None, false),
+            Some(other) => (other.display().parse::<f64>().ok(), true),
         };
-        let entry = data.entry(key).or_default().entry(col_key).or_default();
-        if let Some(n) = n {
-            entry.push(n);
-        } else if spec.agg == Agg::Count {
-            entry.push(0.0);
+        // Count 的输入是“非空值个数”；其余汇总只保留可转成数字的值。
+        if spec.agg == Agg::Count {
+            if nonempty {
+                data.entry(key).or_default().entry(col_key).or_default().push(PivotVal { n });
+            }
+        } else if let Some(n) = n {
+            data.entry(key).or_default().entry(col_key).or_default().push(PivotVal { n: Some(n) });
         }
     }
 
@@ -219,7 +225,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     headers.extend(col_keys.iter().cloned());
 
     let mut rows = Vec::new();
-    let mut grand: Vec<Vec<f64>> = vec![Vec::new(); col_keys.len()];
+    let mut grand: Vec<Vec<PivotVal>> = vec![Vec::new(); col_keys.len()];
     for (key, m) in data.iter() {
         let mut line = vec![Value::Text(key.as_str().into())];
         for (i, ck) in col_keys.iter().enumerate() {
@@ -241,16 +247,17 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     PivotResult { headers, rows, row_name, value_name }
 }
 
-fn agg_value(vals: &[f64], agg: Agg) -> Value {
+fn agg_value<T: std::borrow::Borrow<PivotVal>>(vals: &[T], agg: Agg) -> Value {
     if vals.is_empty() {
         return Value::Empty;
     }
+    let nums: Vec<f64> = vals.iter().filter_map(|v| v.borrow().n).collect();
     match agg {
-        Agg::Sum => Value::Number(vals.iter().sum()),
+        Agg::Sum => Value::Number(nums.iter().sum()),
         Agg::Count => Value::Number(vals.len() as f64),
-        Agg::Avg => Value::Number(vals.iter().sum::<f64>() / vals.len() as f64),
-        Agg::Max => Value::Number(vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
-        Agg::Min => Value::Number(vals.iter().cloned().fold(f64::INFINITY, f64::min)),
+        Agg::Avg => Value::Number(nums.iter().sum::<f64>() / nums.len() as f64),
+        Agg::Max => Value::Number(nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+        Agg::Min => Value::Number(nums.iter().cloned().fold(f64::INFINITY, f64::min)),
     }
 }
 
@@ -323,6 +330,31 @@ mod tests {
         assert_eq!(res.rows[1][1], Value::Number(250.0));
         assert_eq!(res.rows[2][0], Value::Text("总计".into()));
         assert_eq!(res.rows[2][1], Value::Number(520.0));
+    }
+
+    #[test]
+    fn count_ignores_blank_and_counts_text() {
+        let mut s = Sheet::default();
+        s.set(0, 0, Cell { value: Value::Text("部门".into()), formula: None });
+        s.set(0, 1, Cell { value: Value::Text("值".into()), formula: None });
+        s.set(1, 0, Cell { value: Value::Text("A".into()), formula: None });
+        s.set(1, 1, Cell { value: Value::Number(1.0), formula: None });
+        s.set(2, 0, Cell { value: Value::Text("A".into()), formula: None });
+        s.set(2, 1, Cell { value: Value::Text("x".into()), formula: None });
+        s.set(3, 0, Cell { value: Value::Text("A".into()), formula: None });
+        // B4 故意留空：Count 不应把空格算成 0
+        let spec = PivotSpec {
+            source: (0, 0, 3, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Count,
+            group: GroupBy::None,
+            exclude: Vec::new(),
+        };
+        let res = compute(&s, &spec);
+        assert_eq!(res.rows[0][0], Value::Text("A".into()));
+        assert_eq!(res.rows[0][1], Value::Number(2.0), "1 和 x 算两个，空格不算");
     }
 
     #[test]
