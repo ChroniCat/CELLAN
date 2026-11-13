@@ -11,8 +11,14 @@ use std::path::Path;
 pub struct Picture {
     /// 落在哪几张格上 (r1, c1, r2, c2)
     pub rect: (u32, u32, u32, u32),
-    /// zip 里的部件名，例如 xl/media/image1.jpeg
+    /// zip 里的部件名，例如 xl/media/image1.jpeg；新插入的图在保存前就有稳定名字
     pub part: String,
+    /// 内存里的原始字节（新插入的图；从文件读出来的图这里为空，按 part 读）
+    pub data: Option<Vec<u8>>,
+    /// png / jpeg / gif / bmp
+    pub ext: String,
+    /// 可读名字（“图片 1”），写进 cNvPr
+    pub name: String,
 }
 
 fn attr(tag: &str, key: &str) -> Option<String> {
@@ -179,6 +185,12 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
                 draw_rels.get(&rid).map(|p| Picture {
                     rect: (r1, c1, r2, c2),
                     part: p.clone(),
+                    data: None,
+                    ext: p
+                        .rsplit_once('.')
+                        .map(|(_, e)| e.to_ascii_lowercase())
+                        .unwrap_or_else(|| "png".into()),
+                    name: String::new(),
                 })
             })
             .collect();

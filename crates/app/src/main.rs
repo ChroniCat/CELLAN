@@ -563,6 +563,16 @@ struct ChartDrag {
     anchor: (u32, u32, u32, u32),
 }
 
+/// 图片拖动/缩放：松手才进撤销栈
+struct PicDrag {
+    idx: usize,
+    /// 0=移动，5=右下角缩放（图片只给右下角一个手柄，和 Excel 一致）
+    mode: u8,
+    start: egui::Pos2,
+    rect: (f32, f32, f32, f32),
+    before: Vec<sheetcore::pic::Picture>,
+}
+
 /// 页面布局视图的几何：页纸尺寸、页间距、内容原点
 #[derive(Clone)]
 struct PageGeo {
@@ -902,6 +912,9 @@ struct SheetApp {
     chart_sel: Option<usize>,
     /// 正在拖动/缩放的图表
     chart_drag: Option<ChartDrag>,
+    /// 选中的图片（点击图内选中，Delete 删除）
+    pic_sel: Option<usize>,
+    pic_drag: Option<PicDrag>,
     /// 工作表保护对话框
     protect_dlg: Option<ProtectDlg>,
     /// 打开加密工作簿的口令框：(路径, 口令, 错误)
@@ -1613,6 +1626,8 @@ impl SheetApp {
             name_dropdown: false,            name_focus_request: false,
             chart_sel: None,
             chart_drag: None,
+            pic_sel: None,
+            pic_drag: None,
             protect_dlg: None,
             pw_prompt: None,
             enc_dlg: None,
@@ -2327,6 +2342,35 @@ impl SheetApp {
                             );
                         }
                     }
+                    if let Ok(v) = std::env::var("SC_PIC_SEL") {
+                        if let Ok(i) = v.parse::<usize>() {
+                            self.pic_sel = Some(i);
+                            eprintln!("[pic] 选中 {i}");
+                        }
+                    }
+                    if let Ok(p) = std::env::var("SC_INSERT_PIC") {
+                        self.insert_picture_file(std::path::Path::new(&p));
+                        eprintln!("[pic] 插入 {p} -> {:?}", self.status);
+                    }
+                    if let Ok(spec) = std::env::var("SC_PIC_RECT") {
+                        if let Some((idx, rect)) = spec.split_once(':') {
+                            let v: Vec<u32> = rect
+                                .split(',')
+                                .filter_map(|x| x.trim().parse::<u32>().ok())
+                                .collect();
+                            let i: usize = idx.trim().parse().unwrap_or(0);
+                            if v.len() == 4 {
+                                let before = self.wb.sheet(self.sheet_idx).pictures.clone();
+                                if let Some(pic) =
+                                    self.wb.sheet_mut(self.sheet_idx).pictures.get_mut(i)
+                                {
+                                    pic.rect = (v[0], v[1], v[2], v[3]);
+                                }
+                                self.pic_commit("移动图片", before);
+                                eprintln!("[pic] 改矩形 {spec}");
+                            }
+                        }
+                    }
                     if let Ok(v) = std::env::var("SC_TB_SEL") {
                         if let Ok(i) = v.parse::<usize>() {
                             self.tb_sel = Some(i);
@@ -2361,6 +2405,7 @@ impl SheetApp {
                                     snap_before: None,
                                     snap_after: None,
                                     by_site: 0,
+                                    pictures: None,
                                     shapes: Some(sheetcore::undo::ShapeEdit {
                                         sheet: self.sheet_idx,
                                         before,
@@ -3892,6 +3937,7 @@ impl SheetApp {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: None,
             deltas: vec![sheetcore::undo::CellDelta {
                 sheet: self.sheet_idx,
@@ -4097,6 +4143,7 @@ impl SheetApp {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: None,
             refresh_sizes: None,
         });
@@ -4357,6 +4404,7 @@ impl SheetApp {
             label: label.into(), deltas, focus: (si, r, c),
             merges: None,
             snap_before: None, snap_after: None, by_site: 0,
+            pictures: None,
             shapes: None,
             refresh_sizes: None,
         });
@@ -5154,6 +5202,102 @@ impl SheetApp {
         loaded
     }
 
+    /// 内存字节的图片纹理（新插入、尚未保存）
+    fn mem_texture(&mut self, key: &str, bytes: &[u8], ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if let Some(v) = self.img_cache.get(key) {
+            return v.clone();
+        }
+        let loaded = (|| {
+            let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+            Some(ctx.load_texture(key.to_string(), color, egui::TextureOptions::LINEAR))
+        })();
+        self.img_cache.insert(key.to_string(), loaded.clone());
+        loaded
+    }
+
+    /// 记录一次图片改动（插入/移动/缩放/删除）到撤销栈
+    fn pic_commit(&mut self, label: &str, before: Vec<sheetcore::pic::Picture>) {
+        let after = self.wb.sheet(self.sheet_idx).pictures.clone();
+        if before == after {
+            return;
+        }
+        self.wb.sheet_mut(self.sheet_idx).pictures_dirty = true;
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.undo.push(sheetcore::undo::Action {
+            label: label.into(),
+            merges: None,
+            deltas: Vec::new(),
+            focus: (self.sheet_idx, self.sel.0, self.sel.1),
+            snap_before: None,
+            snap_after: None,
+            by_site: 0,
+            pictures: Some(sheetcore::undo::PictureEdit {
+                sheet: self.sheet_idx,
+                before,
+                after,
+            }),
+            shapes: None,
+            refresh_sizes: None,
+        });
+    }
+
+    /// 从文件读一张图，放进内存模型（不写盘；保存时才写回）
+    fn insert_picture_file(&mut self, p: &std::path::Path) {
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| "png".into());
+        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp") {
+            self.status = format!("不支持的图片格式：{ext}");
+            return;
+        }
+        match std::fs::read(p) {
+            Ok(bytes) => {
+                let dims = match image::load_from_memory(&bytes) {
+                    Ok(img) => (img.width(), img.height()),
+                    Err(_) => {
+                        self.status = "这张图无法解码（文件可能损坏）".into();
+                        return;
+                    }
+                };
+                let (w, h) = dims;
+                let cols = ((w + 63) / 64).max(2);
+                let rows = ((h + 19) / 20).max(2);
+                let (r, c) = self.sel;
+                let before = self.wb.sheet(self.sheet_idx).pictures.clone();
+                let name = format!("图片 {}", before.len() + 1);
+                self.wb.sheet_mut(self.sheet_idx).pictures.push(sheetcore::pic::Picture {
+                    rect: (r, c, r + rows, c + cols),
+                    part: sheetcore::pic_write::memory_part(&bytes, &ext),
+                    data: Some(bytes),
+                    ext,
+                    name,
+                });
+                self.pic_commit("插入图片", before);
+                self.status = "已插入图片（保存后才写回文件，可撤销）".into();
+            }
+            Err(e) => self.status = format!("读图片失败：{e}"),
+        }
+    }
+
+    /// Delete 命中选中的图片：删除并进撤销栈
+    fn pic_delete(&mut self, i: usize) {
+        let before = self.wb.sheet(self.sheet_idx).pictures.clone();
+        if i >= before.len() {
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.pictures.remove(i);
+        }
+        self.pic_sel = None;
+        self.pic_commit("删除图片", before);
+        self.status = "已删除图片（可撤销）".into();
+    }
+
     /// 导入 CSV/TSV 到当前选区左上角
     fn import_csv(&mut self) {
         let Some(path) = rfd::FileDialog::new()
@@ -5526,6 +5670,7 @@ impl SheetApp {
                 snap_before: Some(snap_before),
                 snap_after: Some(snap_after),
                 by_site: 0,
+                pictures: None,
                 shapes: None,
                 refresh_sizes: Some((before_sizes, after_sizes)),
             });
@@ -6506,6 +6651,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 snap_before: None,
                 snap_after: None,
                 by_site: 0,
+                pictures: None,
                 shapes: None,
                 refresh_sizes: None,
             });
@@ -8126,7 +8272,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.cse_pending = true;
         }
         if clear {
-            self.clear_values();
+            if let Some(i) = self.pic_sel {
+                self.pic_delete(i);
+            } else {
+                self.clear_values();
+            }
         }
         if commit || dr != 0 || dc != 0 {
             if commit {
@@ -9864,6 +10014,7 @@ let txn = self.txn_begin(&keys);
                 snap_before: None,
                 snap_after: None,
                 by_site: 0,
+                pictures: None,
                 shapes: None,
                 refresh_sizes: None,
             });
@@ -12736,6 +12887,7 @@ let txn = self.txn_begin(&keys);
             snap_before: Some(before),
             snap_after: Some(after),
             by_site: 0,
+            pictures: None,
             shapes: None,
             refresh_sizes: None,
         });
@@ -13321,6 +13473,7 @@ let txn = self.txn_begin(&keys);
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: Some(sheetcore::undo::ShapeEdit {
                 sheet: self.sheet_idx,
                 before,
@@ -13367,6 +13520,7 @@ let txn = self.txn_begin(&keys);
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: Some(sheetcore::undo::ShapeEdit {
                 sheet: self.sheet_idx,
                 before,
@@ -13503,6 +13657,7 @@ let txn = self.txn_begin(&keys);
                 snap_before: None,
                 snap_after: None,
                 by_site: 0,
+                pictures: None,
                 shapes: Some(sheetcore::undo::ShapeEdit {
                 sheet: self.sheet_idx,
                     before: d.before,
@@ -13540,6 +13695,7 @@ let txn = self.txn_begin(&keys);
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: Some(sheetcore::undo::ShapeEdit {
                 sheet: self.sheet_idx,
                 before,
@@ -20805,8 +20961,14 @@ let txn = self.txn_begin(&keys);
             if !rect.intersects(clip) {
                 continue;
             }
-            let key = format!("{}#{i}", pic.part);
-            let tex = self.img_texture(&key, &pic.part, ctx);
+            let key = match pic.data.as_ref() {
+                Some(d) => format!("mem#{i}#{}#{}", pic.part, d.len()),
+                None => format!("{}#{i}", pic.part),
+            };
+            let tex = match pic.data.clone() {
+                Some(d) => self.mem_texture(&key, &d, ctx),
+                None => self.img_texture(&key, &pic.part, ctx),
+            };
             let p2 = painter.with_clip_rect(clip);
             match tex {
                 Some(t) => {
@@ -20831,6 +20993,28 @@ let txn = self.txn_begin(&keys);
                         dump.push(format!("pic-broken {} at=({},{},{},{})", pic.part, r1, c1, r2, c2));
                     }
                 }
+            }
+        }
+
+        // 选中的图片：画框 + 右下角缩放柄
+        if let Some(i) = self.pic_sel {
+            if let Some(pic) = pics.get(i) {
+                let (r1, c1, r2, c2) = pic.rect;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(px_of(c1), py_of(r1)),
+                    egui::pos2(px_of(c2), py_of(r2)),
+                );
+                let accent = Color32::from_rgb(64, 132, 214);
+                painter.rect_stroke(rect, 0.0, Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                let h = 6.0;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.right() - h, rect.bottom() - h),
+                        egui::pos2(rect.right() + h * 0.5, rect.bottom() + h * 0.5),
+                    ),
+                    0.0,
+                    accent,
+                );
             }
         }
 
@@ -21044,6 +21228,94 @@ let txn = self.txn_begin(&keys);
                 sh.charts_dirty = true;
                 self.wb.dirty = true;
                 self.status = "图表位置已更新（保存后写回 Excel）".into();
+            }
+
+            // 图片拖动 / 缩放（和图表同一套手柄判定；松手进撤销栈）
+            if resp.drag_started() && self.chart_drag.is_none() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let pics = self.wb.sheet(self.sheet_idx).pictures.clone();
+                    let mut started: Option<PicDrag> = None;
+                    if let Some(i) = self.pic_sel {
+                        if let Some(pic) = pics.get(i) {
+                            let (r1, c1, r2, c2) = pic.rect;
+                            let r = Rect::from_min_max(
+                                egui::pos2(px_of(c1), py_of(r1)),
+                                egui::pos2(px_of(c2), py_of(r2)),
+                            );
+                            if chart_handle_at(r, pos).is_some() {
+                                started = Some(PicDrag {
+                                    idx: i,
+                                    mode: 5,
+                                    start: pos,
+                                    rect: (r.left(), r.top(), r.right(), r.bottom()),
+                                    before: pics.clone(),
+                                });
+                            }
+                        }
+                    }
+                    if started.is_none() {
+                        for (i, pic) in pics.iter().enumerate().rev() {
+                            let (r1, c1, r2, c2) = pic.rect;
+                            let r = Rect::from_min_max(
+                                egui::pos2(px_of(c1), py_of(r1)),
+                                egui::pos2(px_of(c2), py_of(r2)),
+                            );
+                            if r.contains(pos) {
+                                self.pic_sel = Some(i);
+                                started = Some(PicDrag {
+                                    idx: i,
+                                    mode: 0,
+                                    start: pos,
+                                    rect: (r.left(), r.top(), r.right(), r.bottom()),
+                                    before: pics.clone(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    self.pic_drag = started;
+                }
+            }
+            if resp.dragged() {
+                if let (Some(d), Some(pos)) = (self.pic_drag.as_ref(), resp.interact_pointer_pos()) {
+                    let dx = pos.x - d.start.x;
+                    let dy = pos.y - d.start.y;
+                    let (mut x0, mut y0, mut x1, mut y1) = d.rect;
+                    if d.mode == 0 {
+                        x0 += dx;
+                        x1 += dx;
+                        y0 += dy;
+                        y1 += dy;
+                    } else {
+                        x1 += dx;
+                        y1 += dy;
+                    }
+                    if x1 - x0 >= 24.0 && y1 - y0 >= 16.0 {
+                        let c1 = col_at(x0 + 1.0);
+                        let r1 = row_at(y0 + 1.0);
+                        let c2 = col_at(x1 - 1.0).max(c1 + 1);
+                        let r2 = row_at(y1 - 1.0).max(r1 + 1);
+                        let idx = d.idx;
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        if let Some(pic) = sh.pictures.get_mut(idx) {
+                            pic.rect = (r1, c1, r2, c2);
+                        }
+                        self.status = format!(
+                            "图片{} {}",
+                            if d.mode == 0 { "移动" } else { "缩放" },
+                            cell_name(r1, c1)
+                        );
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                if let Some(d) = self.pic_drag.take() {
+                    self.pic_commit(
+                        if d.mode == 0 { "移动图片" } else { "缩放图片" },
+                        d.before,
+                    );
+                    self.status = "图片位置已更新（保存后写回 Excel）".into();
+                }
             }
         }
 
@@ -21872,6 +22144,7 @@ let txn = self.txn_begin(&keys);
 
         // 图表浮在单元格之上：先判断点是否落在图表里
         let mut chart_hit = false;
+        let mut pic_hit = false;
         if !readonly && resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let charts = self.wb.sheet(self.sheet_idx).charts.clone();
@@ -21891,11 +22164,36 @@ let txn = self.txn_begin(&keys);
                 if !chart_hit {
                     self.chart_sel = None;
                 }
+                // 图片在图表之下：图表没命中才轮到图片
+                if !chart_hit {
+                    let pics = self.wb.sheet(self.sheet_idx).pictures.clone();
+                    for (i, pic) in pics.iter().enumerate().rev() {
+                        let (pr1, pc1, pr2, pc2) = pic.rect;
+                        let rect = Rect::from_min_max(
+                            egui::pos2(px_of(pc1), py_of(pr1)),
+                            egui::pos2(px_of(pc2), py_of(pr2)),
+                        );
+                        if rect.contains(pos) {
+                            pic_hit = true;
+                            self.pic_sel = Some(i);
+                            let name = if pic.name.is_empty() {
+                                format!("图片 {}", i + 1)
+                            } else {
+                                pic.name.clone()
+                            };
+                            self.status = format!("已选中{name}（Delete 删除，拖动移动，右下角缩放）");
+                            break;
+                        }
+                    }
+                    if !pic_hit {
+                        self.pic_sel = None;
+                    }
+                }
             }
         }
 
         // 点击选中
-        if !readonly && resp.clicked() && !chart_hit {
+        if !readonly && resp.clicked() && !chart_hit && !pic_hit {
             // 点到别人正在编辑的格子，直接告诉他
             if let Some(pos) = resp.interact_pointer_pos() {
                 if pos.x > origin.x + head_w && pos.y > origin.y + hh {

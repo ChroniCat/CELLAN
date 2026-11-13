@@ -200,6 +200,7 @@ fn shape_undo_restores_textboxes() {
         snap_before: None,
         snap_after: None,
         by_site: 0,
+        pictures: None,
         shapes: Some(ShapeEdit {
             sheet: 0,
             before,

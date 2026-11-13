@@ -59,6 +59,14 @@ pub struct ShapeEdit {
     pub after: Vec<crate::textbox::TextBox>,
 }
 
+/// 图片改动的前后快照：图片不在格子模型里，整组前后状态回退
+#[derive(Clone, Debug)]
+pub struct PictureEdit {
+    pub sheet: usize,
+    pub before: Vec<crate::pic::Picture>,
+    pub after: Vec<crate::pic::Picture>,
+}
+
 /// 合并/取消合并：只记差异，不整表快照。撤销/重做按差异增删，
 /// 因此动作之后别人新增的无关合并不会被旧的整表列表覆盖。
 #[derive(Clone, Debug)]
@@ -128,6 +136,8 @@ pub struct Action {
     pub by_site: u32,
     /// 形状（文本框）改动；None = 普通格子动作
     pub shapes: Option<ShapeEdit>,
+    /// 图片改动（插入/移动/缩放/删除）；None = 不涉及图片
+    pub pictures: Option<PictureEdit>,
     /// 合并状态改动；None = 不涉及合并
     pub merges: Option<MergeEdit>,
     /// 刷新外部数据时的源尺寸（前, 后）：撤销/重做要一并还原，否则范围记录漂移
@@ -145,6 +155,7 @@ impl Action {
                     .unwrap_or(0),
             )
             .max(if self.shapes.is_some() { 1 } else { 0 })
+            .max(if self.pictures.is_some() { 1 } else { 0 })
             .max(if self.merges.is_some() { 1 } else { 0 })
     }
 
@@ -152,6 +163,7 @@ impl Action {
         self.deltas.is_empty()
             && self.snap_before.is_none()
             && self.shapes.is_none()
+            && self.pictures.is_none()
             && self.merges.is_none()
     }
 }
@@ -477,6 +489,24 @@ impl UndoStack {
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
+        if let Some(p) = action.pictures.clone() {
+            if let Some(sheet) = sheets.get_mut(p.sheet) {
+                sheet.pictures = p.before;
+                sheet.pictures_dirty = true;
+            }
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+                refresh_sizes: None,
+                merge_changes,
+                merge_conflict: false,
+            };
+            self.undone.push(Entry::Cells(action));
+            return Some(applied);
+        }
         if let Some(sh) = action.shapes.clone() {
             if let Some(sheet) = sheets.get_mut(sh.sheet) {
                 sheet.textboxes = sh.before;
@@ -581,6 +611,24 @@ impl UndoStack {
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
+        if let Some(p) = action.pictures.clone() {
+            if let Some(sheet) = sheets.get_mut(p.sheet) {
+                sheet.pictures = p.after;
+                sheet.pictures_dirty = true;
+            }
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+                refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
+                merge_changes,
+                merge_conflict: false,
+            };
+            self.done.push(Entry::Cells(action));
+            return Some(applied);
+        }
         if let Some(sh) = action.shapes.clone() {
             if let Some(sheet) = sheets.get_mut(sh.sheet) {
                 sheet.textboxes = sh.after;
@@ -715,6 +763,7 @@ mod tests {
             snap_before: None,
             snap_after: None,
             by_site: 0,
+            pictures: None,
             shapes: None,
             deltas: vec![CellDelta {
                 sheet: 0,

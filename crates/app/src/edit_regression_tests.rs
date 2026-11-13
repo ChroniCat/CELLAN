@@ -2037,6 +2037,53 @@ fn paste_special_divide_by_zero_reports_error() {
     );
 }
 
+/// UI-20：删图一步撤销、重做再删；撤销后图片回到原锚点。
+#[test]
+fn deleting_a_picture_is_one_undo_step_and_restores_its_anchor() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let png = vec![0x89u8, b'P', b'N', b'G'];
+    app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
+        rect: (2, 2, 6, 5),
+        part: "xl/media/sc0000000000000001.png".into(),
+        data: Some(png),
+        ext: "png".into(),
+        name: "图片 1".into(),
+    });
+    let depth = app.undo.depth();
+    app.pic_sel = Some(0);
+    app.pic_delete(0);
+    assert!(app.wb.sheet(0).pictures.is_empty(), "Delete 应删掉图片");
+    assert!(app.wb.sheet(0).pictures_dirty, "删图要标脏，保存时才写回");
+    assert_eq!(app.undo.depth(), (depth.0 + 1, 0), "一次删除一步撤销");
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).pictures.len(), 1, "撤销恢复图片");
+    assert_eq!(app.wb.sheet(0).pictures[0].rect, (2, 2, 6, 5), "锚点原样恢复");
+    app.do_undo(true);
+    assert!(app.wb.sheet(0).pictures.is_empty(), "重做再次删除");
+}
+
+/// UI-20：移动图片进撤销栈，撤销恢复原矩形。
+#[test]
+fn moving_a_picture_is_undoable() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
+        rect: (0, 0, 3, 3),
+        part: "xl/media/sc0000000000000002.png".into(),
+        data: Some(vec![1, 2, 3]),
+        ext: "png".into(),
+        name: "图片 1".into(),
+    });
+    let before = app.wb.sheet(0).pictures.clone();
+    app.wb.sheet_mut(0).pictures[0].rect = (8, 4, 12, 9);
+    app.pic_commit("移动图片", before);
+    assert_eq!(app.undo.depth(), (1, 0), "移动一步撤销");
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).pictures[0].rect, (0, 0, 3, 3), "撤销回到原位");
+}
+
 #[test]
 fn totals_row_adds_subtotal_and_removes_cleanly() {
     let ctx = egui::Context::default();

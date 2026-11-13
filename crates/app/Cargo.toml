@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 arboard = "3.7"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts"] }
 hex = "0.4.3"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
 quick-xml = "0.42"
 rfd = "0.17.2"
 serde_json = "1.0.154"

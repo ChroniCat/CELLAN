@@ -2285,7 +2285,7 @@
       "scope": "app对象命令 + core/pic_write.rs/图表保存",
       "source": "ui-requirements.md",
       "heading": "UI-20 对象编辑遵循文档保存与撤销",
-      "status": "待实施",
+      "status": "已验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -2295,7 +2295,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T15:40:55Z",
       "slices": [
         {
           "id": "UI-20.1",
@@ -2303,17 +2303,35 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-20 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "图片进内存模型，插入/移动/缩放/删除都走统一事务与撤销，不再即时改磁盘；保存时一次写回 drawing 与媒体。",
+          "files": [
+            "crates/core/src/pic.rs",
+            "crates/core/src/pic_write.rs",
+            "crates/core/src/model.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/core/tests/ui20_pictures.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test ui20_pictures -> 3 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 picture -> 2 passed",
+            "GUI：未保存插图后 sha256 不变；Excel COM shapes=1 tl=B3；移矩形后 tl=C7 br=G11；Delete 后 shapes=0"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-pictures.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-insert-unsaved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-saved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-gif.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T15:40:55Z"
         },
         {
           "id": "UI-20.2",
@@ -2321,17 +2339,35 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-20 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "未保存的新文档可直接插图，不保存关闭文件哈希不变；保存后 Excel 回读锚点一致（B3/C7/D6）。",
+          "files": [
+            "crates/core/src/pic.rs",
+            "crates/core/src/pic_write.rs",
+            "crates/core/src/model.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/core/tests/ui20_pictures.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test ui20_pictures -> 3 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 picture -> 2 passed",
+            "GUI：未保存插图后 sha256 不变；Excel COM shapes=1 tl=B3；移矩形后 tl=C7 br=G11；Delete 后 shapes=0"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-pictures.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-insert-unsaved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-saved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-gif.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T15:40:55Z"
         },
         {
           "id": "UI-20.3",
@@ -2339,17 +2375,35 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-20 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "移动/缩放/删除各一条撤销，撤销后再保存落盘旧锚点；删除保存后 Excel shapes=0；png/jpeg/gif/bmp 均可渲染。",
+          "files": [
+            "crates/core/src/pic.rs",
+            "crates/core/src/pic_write.rs",
+            "crates/core/src/model.rs",
+            "crates/core/src/undo.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/core/tests/ui20_pictures.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test ui20_pictures -> 3 passed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 picture -> 2 passed",
+            "GUI：未保存插图后 sha256 不变；Excel COM shapes=1 tl=B3；移矩形后 tl=C7 br=G11；Delete 后 shapes=0"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-pictures.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-insert-unsaved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-saved.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui20-gif.png"
+          ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T15:40:55Z"
         }
       ]
     },

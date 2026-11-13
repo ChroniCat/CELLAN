@@ -108,8 +108,10 @@ pub struct Sheet {
     pub arrays: Vec<(CellRef, (u32, u32, u32, u32))>,
     /// Excel 表格对象（ListObject）
     pub tables: Vec<crate::table::Table>,
-    /// 图片（只记位置和部件路径；保存时原样不动）
+    /// 图片（位置 + 部件或内存字节；编辑后由保存写回 drawing）
     pub pictures: Vec<crate::pic::Picture>,
+    /// 图片被增删改过，保存时要重写 drawing
+    pub pictures_dirty: bool,
     /// 正在从文件加载（加载期间的 set 不算编辑）
     pub loading: bool,
     /// 这张表被改过没有：没改过就整段沿用原文件的 XML，别让 umya 重写
@@ -224,6 +226,7 @@ impl Sheet {
             arrays: Vec::new(),
             tables: Vec::new(),
             pictures: Vec::new(),
+            pictures_dirty: false,
             loading: false,
             edited: false,
             styles_dirty: false,

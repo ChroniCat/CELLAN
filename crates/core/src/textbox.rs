@@ -107,7 +107,7 @@ fn anchor_of(cols: &Axis, rows: &Axis, x: f32, y: f32) -> (u32, i64, u32, i64) {
 
 // ---------------------------------------------------------------- 读
 
-fn attr(tag: &str, key: &str) -> Option<String> {
+pub(crate) fn attr(tag: &str, key: &str) -> Option<String> {
     let pat = format!("{key}=\"");
     let i = tag.find(&pat)? + pat.len();
     let rest = &tag[i..];
@@ -262,7 +262,7 @@ pub fn parse_drawing(xml: &str) -> Vec<TextBox> {
     out
 }
 
-fn find_tag<'a>(xml: &'a str, tag: &str) -> Option<String> {
+pub(crate) fn find_tag<'a>(xml: &'a str, tag: &str) -> Option<String> {
     let pat = format!("<{tag}");
     let i = xml.find(&pat)?;
     let gt = xml[i..].find('>').map(|e| i + e)?;
@@ -490,14 +490,14 @@ fn strip_shape_anchors(xml: &str) -> String {
 
 // ---------------------------------------------------------------- 存
 
-fn rels_part(sheet_part: &str) -> String {
+pub(crate) fn rels_part(sheet_part: &str) -> String {
     match sheet_part.rsplit_once('/') {
         Some((d, b)) => format!("{d}/_rels/{b}.rels"),
         None => format!("_rels/{sheet_part}.rels"),
     }
 }
 
-fn has_part(path: &Path, name: &str) -> bool {
+pub(crate) fn has_part(path: &Path, name: &str) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
@@ -507,7 +507,7 @@ fn has_part(path: &Path, name: &str) -> bool {
     zip.by_name(name).is_ok()
 }
 
-fn next_part_no(path: &Path, prefix: &str) -> u32 {
+pub(crate) fn next_part_no(path: &Path, prefix: &str) -> u32 {
     let Ok(file) = std::fs::File::open(path) else {
         return 1;
     };
@@ -529,7 +529,7 @@ fn next_part_no(path: &Path, prefix: &str) -> u32 {
 }
 
 /// 找到（没有就建）工作表对应的 drawing 部件；返回部件名与是否需要补关系
-fn ensure_drawing(
+pub(crate) fn ensure_drawing(
     path: &Path,
     sheet_part: &str,
     xml: &str,
@@ -678,7 +678,7 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
 }
 
 /// 已有 drawing 部件的改写记到 patch_sheet 队列（同一个部件只写一次）
-fn patch_sheet_drawing(queue: &mut Vec<(String, String)>, part: &str, body: String) {
+pub(crate) fn patch_sheet_drawing(queue: &mut Vec<(String, String)>, part: &str, body: String) {
     if let Some(e) = queue.iter_mut().find(|(n, _)| n == part) {
         e.1 = body;
     } else {
@@ -687,7 +687,7 @@ fn patch_sheet_drawing(queue: &mut Vec<(String, String)>, part: &str, body: Stri
 }
 
 /// 在 worksheet 里插入 `<drawing r:id>`（schema 顺序：legacyDrawing/tableParts/extLst 之前）
-fn insert_drawing_tag(xml: &str, rid: &str) -> String {
+pub(crate) fn insert_drawing_tag(xml: &str, rid: &str) -> String {
     if xml.contains("<drawing ") || xml.contains("<drawing/>") {
         return xml.to_string();
     }

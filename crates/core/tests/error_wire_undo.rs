@@ -87,6 +87,7 @@ fn undo_and_redo_restore_the_error_cell_verbatim() {
         snap_before: None,
         snap_after: None,
         by_site: 0,
+        pictures: None,
         shapes: None,
         refresh_sizes: None,
     });

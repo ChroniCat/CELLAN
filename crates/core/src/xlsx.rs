@@ -2279,6 +2279,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     must_save!("hyperlinks", crate::hyperlinks::apply(path, wb));
     must_save!("sparkline", crate::sparkline::apply(path, wb));
     must_save!("textbox", crate::textbox::apply(path, wb));
+    must_save!("picture", crate::pic_write::apply(path, wb));
     must_save!("sheet-states", crate::patch::apply_sheet_states(path, wb));
     must_save!("rich", crate::patch::apply_rich(path, wb));
     must_save!("page-setup", crate::patch::apply_page_setup(path, wb));

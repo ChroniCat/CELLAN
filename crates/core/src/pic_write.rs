@@ -218,3 +218,239 @@ pub fn insert_picture(
     })?;
     Ok(())
 }
+
+// ---------------------------------------------------------------- 统一保存
+
+/// 新插入图片的稳定部件名：内容哈希，重复保存不会增生媒体文件
+pub fn memory_part(bytes: &[u8], ext: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+    let ext = if ext == "jpg" { "jpeg".to_string() } else { ext };
+    format!("xl/media/sc{h:016x}.{ext}")
+}
+
+fn mime_of(ext: &str) -> &'static str {
+    match ext {
+        "jpeg" | "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+fn pic_anchor_xml(pic: &crate::pic::Picture, rid: &str) -> String {
+    let (r1, c1, r2, c2) = pic.rect;
+    let name = if pic.name.is_empty() { "图片" } else { pic.name.as_str() };
+    format!(
+        "<xdr:twoCellAnchor editAs=\"oneCell\">\
+<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+<xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
+<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\" name=\"{name}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>\
+<xdr:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>\
+<xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>\
+</xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"
+    )
+}
+
+/// 去掉所有含 `<xdr:pic>` 的锚点，保留图表/文本框等其他锚点
+fn strip_pic_anchors(xml: &str) -> String {
+    let mut x = xml.to_string();
+    for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
+        for prefix in ["xdr:", ""] {
+            let open = format!("<{prefix}{tag}");
+            let close = format!("</{prefix}{tag}>");
+            let mut from = 0usize;
+            loop {
+                let Some(rel) = x[from..].find(&open) else { break };
+                let start = from + rel;
+                let Some(endrel) = x[start..].find(&close) else { break };
+                let end = start + endrel + close.len();
+                let chunk = x[start..end].to_string();
+                if chunk.contains("<xdr:pic") || chunk.contains("<pic") {
+                    x.replace_range(start..end, "");
+                    from = start;
+                } else {
+                    from = end;
+                }
+            }
+        }
+    }
+    x
+}
+
+fn rewrite_drawing(xml: &str, anchors: &str) -> String {
+    let mut kept = strip_pic_anchors(xml);
+    if anchors.is_empty() {
+        return kept;
+    }
+    if let Some(i) = kept.rfind("</xdr:wsDr>") {
+        kept.insert_str(i, anchors);
+    } else if let Some(i) = kept.rfind("</wsDr>") {
+        kept.insert_str(i, anchors);
+    } else {
+        return format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">{anchors}</xdr:wsDr>"
+        );
+    }
+    kept
+}
+
+/// 画布关系里保留非图片关系（图表等），图片关系重建
+fn keep_other_rels(xml: &str) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    );
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<Relationship") {
+        let Some(endrel) = rest[pos..].find("/>") else { break };
+        let end = pos + endrel + 2;
+        let tag = &rest[pos..end];
+        if !(tag.contains("/image\"") || tag.contains("/image/")) {
+            out.push_str(tag);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str("</Relationships>");
+    out
+}
+
+fn empty_rels() -> String {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>"
+        .to_string()
+}
+
+/// 保存收尾：把内存里的图片写回各表 drawing（只处理 dirty 的表）
+pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    let targets = crate::patch::sheet_targets(path)?;
+    let mut additions: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut patch: Vec<(String, String)> = Vec::new();
+    let mut exts: Vec<String> = Vec::new();
+    let mut new_drawings: Vec<String> = Vec::new();
+    let mut touched = false;
+    for sheet in &wb.sheets {
+        if !sheet.pictures_dirty {
+            continue;
+        }
+        let Some(sheet_part) = targets.get(&sheet.name).cloned() else { continue };
+        let sheet_xml = crate::fixups::read_part_file(path, &sheet_part)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        let (draw_part, draw_rels, rid) =
+            crate::textbox::ensure_drawing(path, &sheet_part, &sheet_xml)?;
+        let existing = crate::fixups::read_part_file(path, &draw_part)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| {
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"></xdr:wsDr>"
+                    .to_string()
+            });
+        let old_rels = crate::fixups::read_part_file(path, &draw_rels)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(empty_rels);
+        let mut rels = keep_other_rels(&old_rels);
+        let mut anchors = String::new();
+        for (i, pic) in sheet.pictures.iter().enumerate() {
+            let rid_i = format!("rIdPic{}", i + 1);
+            if let Some(data) = pic.data.as_ref() {
+                let part = memory_part(data, &pic.ext);
+                if !crate::textbox::has_part(path, &part) {
+                    additions.push((part.clone(), data.clone()));
+                }
+            }
+            let fname = pic.part.rsplit('/').next().unwrap_or("image1.png").to_string();
+            let rel = format!(
+                "<Relationship Id=\"{rid_i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{fname}\"/>"
+            );
+            rels = rels.replace("</Relationships>", &format!("{rel}</Relationships>"));
+            let ext = if pic.ext.is_empty() {
+                fname.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_else(|| "png".into())
+            } else {
+                pic.ext.to_ascii_lowercase()
+            };
+            if !ext.is_empty() && !exts.contains(&ext) {
+                exts.push(ext);
+            }
+            anchors.push_str(&pic_anchor_xml(pic, &rid_i));
+        }
+        let body = rewrite_drawing(&existing, &anchors);
+        if crate::textbox::has_part(path, &draw_part) {
+            crate::textbox::patch_sheet_drawing(&mut patch, &draw_part, body);
+            patch.push((draw_rels.clone(), rels));
+        } else {
+            additions.push((draw_part.clone(), body.into_bytes()));
+            additions.push((draw_rels.clone(), rels.into_bytes()));
+            new_drawings.push(draw_part.clone());
+        }
+        if let Some(rid) = rid {
+            let srels_name = crate::textbox::rels_part(&sheet_part);
+            let mut srels = crate::fixups::read_part_file(path, &srels_name)
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(empty_rels);
+            let target = format!("../{}", draw_part.strip_prefix("xl/").unwrap_or(&draw_part));
+            let rel = format!(
+                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"{target}\"/>"
+            );
+            if !srels.contains(&format!("Id=\"{rid}\"")) {
+                srels = srels.replace("</Relationships>", &format!("{rel}</Relationships>"));
+            }
+            if crate::textbox::has_part(path, &srels_name) {
+                patch.push((srels_name, srels));
+            } else {
+                additions.push((srels_name, srels.into_bytes()));
+            }
+            patch.push((
+                sheet_part.clone(),
+                crate::textbox::insert_drawing_tag(&sheet_xml, &rid),
+            ));
+        }
+        touched = true;
+    }
+    if !touched {
+        return Ok(());
+    }
+    crate::chart_write::rewrite_with_additions_pub(path, additions, move |part, buf| {
+        if let Some((_, body)) = patch.iter().find(|(n, _)| n == part) {
+            return body.clone().into_bytes();
+        }
+        if part == "[Content_Types].xml" {
+            if let Ok(xml) = String::from_utf8(buf.clone()) {
+                let mut x = xml;
+                for d in &new_drawings {
+                    if !x.contains(&format!("PartName=\"/{d}\"")) {
+                        x = x.replace(
+                            "</Types>",
+                            &format!(
+                                "<Override PartName=\"/{d}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>"
+                            ),
+                        );
+                    }
+                }
+                for e in &exts {
+                    if !x.contains(&format!("Extension=\"{e}\"")) {
+                        x = x.replace(
+                            "</Types>",
+                            &format!(
+                                "<Default Extension=\"{e}\" ContentType=\"{}\"/></Types>",
+                                mime_of(e)
+                            ),
+                        );
+                    }
+                }
+                return x.into_bytes();
+            }
+        }
+        buf
+    })?;
+    Ok(())
+}
