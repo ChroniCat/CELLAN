@@ -693,7 +693,7 @@
               <labelControl id="ZoomPercent" fontSize="11"/>
               <slider id="ZoomSlider" sizeString="102" min="0.5" max="2.5"/>
             </box>
-            
+
           </box>
         </group>
         <group id="GroupSheetView" label="工作表视图">
@@ -755,6 +755,7 @@
               <button id="TableSelect" label="选择表格" imageMso="Table" screentip="选中整个表格区域" onAction="TableSelect" sizeString="100"/>
               <button id="TablePivot" label="数据透视表" imageMso="Pivot" screentip="按这个表格新建透视表" onAction="TablePivot" sizeString="100"/>
               <button id="TableToRange" label="转换为区域" imageMso="TableToRange" screentip="保留单元格内容，去掉表格对象" onAction="TableToRange" sizeString="100"/>
+              <button id="TableFillCalculated" label="填充计算列" imageMso="Fill" screentip="把该列已有的计算列公式填到其余数据行" onAction="TableFillCalculated" sizeString="100"/>
             </box>
             <box boxStyle="vertical">
               <button id="TableFilter" label="筛选" imageMso="Filter" screentip="在表格标题行上加筛选" onAction="Filter" sizeString="100"/>

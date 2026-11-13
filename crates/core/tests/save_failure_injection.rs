@@ -151,6 +151,7 @@ fn injected_failures_in_conditional_steps_abort_the_save() {
     );
     wb.sheets[0].set(1, 1, Cell { value: Value::Number(5.0), formula: None });
     wb.sheets[0].tables.push(sheetcore::table::Table {
+                column_ids: Vec::new(),
         name: "Sales".into(),
         display: "Sales".into(),
         range: (0, 0, 1, 1),

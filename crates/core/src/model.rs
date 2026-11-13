@@ -101,6 +101,9 @@ pub struct Sheet {
     pub cleared: std::collections::HashSet<CellRef>,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
     pub spilled: std::collections::HashSet<CellRef>,
+    /// 动态数组锚点 → 本次重算写回的精确形状 (rows, cols)。1×1 也记录；
+    /// 跨表只重算时用它识别可信锚点，不能靠 spilled 邻接尾格猜形状。
+    pub spill_shapes: std::collections::HashMap<CellRef, (u32, u32)>,
     /// 老式 CSE 数组公式：锚点 → 覆盖区域（保存时要写回 t="array" ref）
     pub arrays: Vec<(CellRef, (u32, u32, u32, u32))>,
     /// Excel 表格对象（ListObject）
@@ -217,6 +220,7 @@ impl Sheet {
             cells: Store::default(),
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
+            spill_shapes: std::collections::HashMap::new(),
             arrays: Vec::new(),
             tables: Vec::new(),
             pictures: Vec::new(),

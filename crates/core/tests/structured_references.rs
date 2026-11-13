@@ -8,6 +8,7 @@ fn sales_book() -> Workbook {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "Data".into();
     let mut t = Table {
+                column_ids: Vec::new(),
         name: "Sales".into(),
         display: "Sales".into(),
         range: (0, 0, 4, 3),
@@ -45,6 +46,7 @@ fn audit_two_row_samples_calculate_as_excel() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "Data".into();
     wb.sheets[0].tables.push(Table {
+                column_ids: Vec::new(),
         name: "Sales".into(),
         display: "Sales".into(),
         range: (0, 0, 2, 1),
@@ -119,6 +121,7 @@ fn structured_areas_headers_totals_all_and_column_range() {
 fn special_column_names_are_not_split_on_space_comma_or_percent() {
     let mut wb = sales_book();
     let t = Table {
+                column_ids: Vec::new(),
         name: "Rates".into(),
         display: "Rates".into(),
         range: (0, 4, 2, 5),
@@ -250,6 +253,7 @@ fn bare_current_row_picks_table_by_formula_column_when_row_has_two_tables() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "Data".into();
     wb.sheets[0].tables.push(Table {
+                column_ids: Vec::new(),
         name: "Left".into(),
         display: "Left".into(),
         range: (0, 0, 2, 1),
@@ -258,6 +262,7 @@ fn bare_current_row_picks_table_by_formula_column_when_row_has_two_tables() {
         totals_row: false,
     });
     wb.sheets[0].tables.push(Table {
+                column_ids: Vec::new(),
         name: "Right".into(),
         display: "Right".into(),
         range: (0, 3, 2, 4),
@@ -294,6 +299,7 @@ fn original_chinese_bare_current_row_formula_evaluates_two_rows() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "Data".into();
     wb.sheets[0].tables.push(Table {
+                column_ids: Vec::new(),
         name: "Sales".into(),
         display: "Sales".into(),
         range: (0, 0, 2, 2),

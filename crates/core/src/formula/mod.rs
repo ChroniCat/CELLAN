@@ -750,6 +750,8 @@ pub struct Calc<'a> {
     lookup_index: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<HashMap<String, usize>>>,
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
     scope: Option<std::collections::HashSet<self::deps::CellKey>>,
+    /// 区域物化实际读取的单元格数（测试/诊断用）
+    range_reads: usize,
     /// 区域聚合结果缓存：(sheet, r1, c1, r2, c2, 函数, 条件)
     agg_cache: HashMap<(usize, i64, i64, i64, i64, u8, String), FValue>,
     /// 区域缓存已占用的值数量，防止把逐行累积的区间全缓存下来
@@ -855,9 +857,15 @@ impl<'a> Calc<'a> {
         }
         Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), scope: None,
             agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
+            range_reads: 0,
             cache_order: std::collections::VecDeque::new(), agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
             prev_system, prev_now }
+    }
+
+    /// 本次求值实际读取的区域单元格数；用于验证整行/整列没有逐格扫全表。
+    pub fn range_reads(&self) -> usize {
+        self.range_reads
     }
 
     fn sheet_index(&self, name: Option<&str>, cur: usize) -> Result<usize, ErrKind> {
@@ -1018,6 +1026,54 @@ impl<'a> Calc<'a> {
         }
     }
 
+    /// 读取已经物化的溢出区域（用于只重算其他表时的跨表 `A1#`）。
+    /// 只承认重算写回时记录的锚点形状；1×1 数组同样有记录。`spilled`
+    /// 只保存非锚点尾格，不能拿来反推形状，也不能把尾格当锚点。
+    fn materialized_spill(&self, si: usize, r: u32, c: u32) -> Option<value::Array> {
+        let sh = self.wb.sheets.get(si)?;
+        let anchor = CellRef::new(r, c);
+        if let Some(&(rows, cols)) = sh.spill_shapes.get(&anchor) {
+            if rows == 0 || cols == 0 { return None; }
+            let data = (0..rows)
+                .flat_map(|rr| (0..cols).map(move |cc| to_fvalue(&sh.value(r + rr, c + cc))))
+                .collect();
+            return Some(value::Array::new(rows as usize, cols as usize, data));
+        }
+        if let Some(&(r1, c1, r2, c2)) =
+            sh.arrays.iter().find(|(a, _)| *a == anchor).map(|(_, r)| r)
+        {
+            let rows = (r2 - r1 + 1) as usize;
+            let cols = (c2 - c1 + 1) as usize;
+            let data = (r1..=r2)
+                .flat_map(|rr| (c1..=c2).map(move |cc| to_fvalue(&sh.value(rr, cc))))
+                .collect();
+            return Some(value::Array::new(rows, cols, data));
+        }
+        None
+    }
+
+    /// `A1#` 的统一取值：只有真正的动态数组/已物化数组才是数组；
+    /// 普通标量、外部书名和错误都按 Excel 语义传播/报 #REF!，不能把标量
+    /// 当成 1×1 数组（否则 BYROW(A1#,...) 会错误返回标量）。
+    fn spill_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
+        if self.wb.sheets.get(si).is_none() {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let key = (si, r, c);
+        let outside_scope = self.scope.as_ref().is_some_and(|scope| !scope.contains(&key));
+        if outside_scope {
+            if let Some(a) = self.materialized_spill(si, r, c) {
+                return FValue::Array(std::rc::Rc::new(a));
+            }
+            return FValue::Error(ErrKind::Ref);
+        }
+        match self.cell_value(si, r, c) {
+            FValue::Array(a) => FValue::Array(a),
+            FValue::Error(e) => FValue::Error(e),
+            _ => FValue::Error(ErrKind::Ref),
+        }
+    }
+
     fn range_values(&mut self, a: &RefExpr, b: &RefExpr, cur: usize) -> Result<Arg, ErrKind> {
         if a.book.is_some() || b.book.is_some() {
             return self.link_range(a, b);
@@ -1025,8 +1081,25 @@ impl<'a> Calc<'a> {
         let si = self.sheet_index(a.sheet.as_deref(), cur)?;
         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
         let (mut r2, mut c2) = (a.row.max(b.row).max(0) as u32, a.col.max(b.col).max(0) as u32);
-        // 整列/整行引用按表的实际使用范围裁剪，避免展开 104 万空单元格
+        // 整列/整行引用按表的实际使用范围裁剪，避免展开 104 万空单元格。
+        // `XFD` / `1048576` 是整行/整列的展开哨兵；即使面积还没到 20 万，
+        // 1:1 这类整行也不能逐格访问 16384 列。
         let (max_r, max_c) = self.sheet_bounds(si);
+        let full_cols = c1 == 0 && c2 == 16_383;
+        let full_rows = r1 == 0 && r2 == 1_048_575;
+        if full_cols {
+            c2 = c2.min(max_c);
+        }
+        if full_rows {
+            r2 = r2.min(max_r);
+        }
+        if r1 > r2 || c1 > c2 {
+            return Ok(Arg::Range {
+                values: std::rc::Rc::new(Vec::new()),
+                rows: 0,
+                cols: 0,
+            });
+        }
         let huge = (r2 as u64 - r1 as u64 + 1) as u64 * (c2 as u64 - c1 as u64 + 1) as u64 > 200_000;
         if huge {
             r2 = r2.min(max_r);
@@ -1049,6 +1122,7 @@ impl<'a> Calc<'a> {
                 let mut vals = Vec::with_capacity(rows * cols);
                 for r in r1..=r2 {
                     for c in c1..=c2 {
+                        self.range_reads += 1;
                         vals.push(self.cell_value(si, r, c).scalar());
                     }
                 }
@@ -1110,11 +1184,7 @@ impl<'a> Calc<'a> {
                 }
                 match self.sheet_index(r.sheet.as_deref(), si) {
                     Ok(idx) if r.row >= 0 && r.col >= 0 => {
-                        match self.cell_value(idx, r.row as u32, r.col as u32) {
-                            FValue::Array(a) => FValue::Array(a),
-                            FValue::Error(e) => FValue::Error(e),
-                            _ => FValue::Error(ErrKind::Ref),
-                        }
+                        self.spill_value(idx, r.row as u32, r.col as u32)
                     }
                     _ => FValue::Error(ErrKind::Ref),
                 }
@@ -1319,6 +1389,11 @@ impl<'a> Calc<'a> {
                             Some(n) => self.grid_of(n, si),
                             None => (0, 0, vec![]),
                         };
+                        if data.len() == 1 {
+                            if let FValue::Error(e) = data[0] {
+                                return FValue::Error(e);
+                            }
+                        }
                         let mut out = Vec::with_capacity(rows);
                         for r in 0..rows {
                             let row: Vec<FValue> = (0..cols).map(|c| data[r * cols + c].clone()).collect();
@@ -1333,6 +1408,11 @@ impl<'a> Calc<'a> {
                             Some(n) => self.grid_of(n, si),
                             None => (0, 0, vec![]),
                         };
+                        if data.len() == 1 {
+                            if let FValue::Error(e) = data[0] {
+                                return FValue::Error(e);
+                            }
+                        }
                         let mut out = Vec::with_capacity(cols);
                         for c in 0..cols {
                             let col: Vec<FValue> = (0..rows).map(|r| data[r * cols + c].clone()).collect();
@@ -2052,6 +2132,14 @@ impl<'a> Calc<'a> {
         let (max_r, max_c) = self.sheet_bounds(si);
         let mut br = a.row.max(b.row);
         let mut bc = a.col.max(b.col);
+        let full_cols = a.col.min(b.col) == 0 && bc == 16_383;
+        let full_rows = a.row.min(b.row) == 0 && br == 1_048_575;
+        if full_cols {
+            bc = bc.min(max_c as i64);
+        }
+        if full_rows {
+            br = br.min(max_r as i64);
+        }
         let area = (br - a.row.min(b.row) + 1).saturating_mul(bc - a.col.min(b.col) + 1);
         if area > 200_000 {
             br = br.min(max_r as i64);
@@ -2076,6 +2164,7 @@ impl<'a> Calc<'a> {
         let mut vals = Vec::with_capacity(rows * cols);
         for r in key.1..=key.3 {
             for c in key.2..=key.4 {
+                self.range_reads += 1;
                 vals.push(self.cell_value(si, r as u32, c as u32).scalar());
             }
         }
@@ -2108,13 +2197,18 @@ impl<'a> Calc<'a> {
                 }
                 Err(_) => (0, 0, vec![]),
             },
-            Node::Spill(re) => match self.sheet_index(re.sheet.as_deref(), si) {
-                Ok(idx) => match self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32) {
-                    FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                    FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                    v => (1, 1, vec![v]),
-                },
-                Err(_) => (0, 0, vec![]),
+            Node::Spill(re) => {
+                if re.book.is_some() {
+                    return (1, 1, vec![FValue::Error(ErrKind::Ref)]);
+                }
+                match self.sheet_index(re.sheet.as_deref(), si) {
+                    Ok(idx) => match self.spill_value(idx, re.row.max(0) as u32, re.col.max(0) as u32) {
+                        FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
+                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                    },
+                    Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                }
             },
             Node::Range(a, b) => match self.range_values(a, b, si) {
                 Ok(Arg::Range { values, rows, cols }) => (rows, cols, (*values).clone()),
@@ -2394,7 +2488,10 @@ pub fn serial_to_date_pub(serial: f64) -> Option<(i32, u32, u32)> {
 }
 
 pub fn parse(src: &str) -> Result<Node, ErrKind> {
-    let toks = lex(src)?;
+    // 整行引用只在这里展开，模型/文件里的公式保持 `1:3`，复制和结构编辑才能
+    // 按整行语义处理；求值阶段仍按实际使用区裁剪。
+    let src = crate::expand_whole_rows(src);
+    let toks = lex(&src)?;
     let mut p = Parser { toks, pos: 0 };
     let node = p.parse_expr()?;
     if p.pos != p.toks.len() {
@@ -2428,11 +2525,15 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                 FValue::Array(a) => {
                     // 检查溢出区域是否被别的数据占着
                     if array_blocked(wb, si, r, c, &a, false) {
+                        wb.sheets[si].spill_shapes.remove(&CellRef::new(r, c));
                         if let Some(cell) = wb.sheets[si].get_mut(r, c) {
                             cell.value = from_fvalue(&FValue::Error(ErrKind::Spill));
                         }
                         continue;
                     }
+                    wb.sheets[si]
+                        .spill_shapes
+                        .insert(CellRef::new(r, c), (a.rows as u32, a.cols as u32));
                     for i in 0..a.rows {
                         for j in 0..a.cols {
                             let key = CellRef::new(r + i as u32, c + j as u32);
@@ -2546,6 +2647,7 @@ fn clear_spills(wb: &mut Workbook) {
     for sheet in &mut wb.sheets {
         // `Sheet::set` 会把被用户覆盖的格子从 spilled 里摘掉，
         // 所以这里剩下的键一定还是上次溢出写的值，可以安全清掉。
+        sheet.spill_shapes.clear();
         let old: Vec<CellRef> = sheet.spilled.drain().collect();
         for key in old {
             // set(empty) 同时记录 cleared，保存时才能删除缩小后的旧尾部。
@@ -2751,6 +2853,22 @@ pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
     }
 }
 
+/// 与 `eval_formula` 相同，但返回区域物化实际读取的格数，供性能回归使用。
+pub fn eval_formula_reads(wb: &Workbook, si: usize, formula: &str) -> (FValue, usize) {
+    let raw = formula.strip_prefix('=').unwrap_or(formula).to_string();
+    let expanded = crate::table::expand_structured(wb, si, &raw).unwrap_or(raw);
+    let normalized = crate::normalize_formula(&expanded);
+    match parse(&normalized) {
+        Ok(node) => {
+            let mut calc = Calc::new(wb);
+            let v = calc.eval_node(&node, si);
+            let reads = calc.range_reads();
+            (v, reads)
+        }
+        Err(e) => (FValue::Error(e), 0),
+    }
+}
+
 pub fn set_formula(sheet: &mut Sheet, r: u32, c: u32, formula: &str, cached: FValue) {
     let cell = Cell {
         value: from_fvalue(&cached),
@@ -2831,6 +2949,7 @@ fn sheet_spill_values(wb: &Workbook, sheet: usize) -> std::collections::BTreeMap
 }
 
 fn clear_spills_sheet(wb: &mut Workbook, sheet: usize) {
+    wb.sheets[sheet].spill_shapes.clear();
     let old: Vec<CellRef> = wb.sheets[sheet].spilled.drain().collect();
     for key in old {
         wb.sheets[sheet].set(key.row, key.col, Cell::default());

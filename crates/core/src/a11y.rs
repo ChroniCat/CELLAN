@@ -180,6 +180,7 @@ mod tests {
         let mut wb = Workbook::new_blank();
         wb.sheets[0].name = "销售".into();
         wb.sheets[0].tables.push(crate::table::Table {
+                column_ids: Vec::new(),
             name: "T1".into(),
             display: "T1".into(),
             range: (0, 0, 3, 1),

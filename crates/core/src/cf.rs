@@ -167,7 +167,7 @@ impl IconMark {
 pub struct CfRule {
     pub kind: CfKind,
     pub stop: bool,
-    
+
 }
 
 #[derive(Clone, Debug, Default)]
@@ -538,6 +538,7 @@ pub fn shift_formula(f: &str, r: u32, c: u32) -> String {
     let mut out = String::new();
     let mut i = 0;
     let mut in_str = false;
+    let mut bracket_depth = 0usize;
     while i < chars.len() {
         let ch = chars[i];
         if ch == '"' {
@@ -545,6 +546,74 @@ pub fn shift_formula(f: &str, r: u32, c: u32) -> String {
             out.push(ch);
             i += 1;
             continue;
+        }
+        if !in_str && ch == '[' {
+            bracket_depth += 1;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if !in_str && ch == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        // 整行引用 `1:1` / `$1:$1`：复制时只随行偏移，横向复制不变。
+        // 必须在 A1 分支之前处理，否则以数字开头的行引用会被跳过；
+        // 结构化引用方括号里的 `[1:3]` 是列名，不是行引用。
+        if !in_str
+            && bracket_depth == 0
+            && (ch == '$' || ch.is_ascii_digit())
+            && (i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_'))
+        {
+            let mut j = i;
+            let a_abs = chars[j] == '$';
+            j += usize::from(a_abs);
+            let a0 = j;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let a1 = j;
+            if j > a0 && j < chars.len() && chars[j] == ':' {
+                j += 1;
+                let b_abs = j < chars.len() && chars[j] == '$';
+                j += usize::from(b_abs);
+                let b0 = j;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let b1 = j;
+                let end_ok = j == chars.len()
+                    || !(chars[j].is_ascii_alphanumeric()
+                        || chars[j] == '_'
+                        || chars[j] == '('
+                        || chars[j] == '$');
+                if j > b0 && end_ok {
+                    let parse = |s: &[char]| -> Option<u32> {
+                        s.iter().collect::<String>().parse::<u32>().ok()
+                    };
+                    if let (Some(r1), Some(r2)) =
+                        (parse(&chars[a0..a1]), parse(&chars[b0..b1]))
+                    {
+                        let nr1 = if a_abs { r1 } else { r1.saturating_add(r) };
+                        let nr2 = if b_abs { r2 } else { r2.saturating_add(r) };
+                        if nr1 == 0 || nr2 == 0 || nr1 > 1_048_576 || nr2 > 1_048_576 {
+                            out.push_str("#REF!");
+                        } else {
+                            out.push_str(&format!(
+                                "{}{}:{}{}",
+                                if a_abs { "$" } else { "" },
+                                nr1,
+                                if b_abs { "$" } else { "" },
+                                nr2
+                            ));
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
         }
         let starts_ref = !in_str && (ch == '$' || ch.is_ascii_alphabetic());
         // 前一个字符不能是字母数字或下划线（避免把名字截断）

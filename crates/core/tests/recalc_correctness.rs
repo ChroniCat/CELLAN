@@ -68,6 +68,7 @@ fn whole_columns_names_and_dynamic_references_follow_edits() {
 fn structured_references_share_evaluation_normalization() {
     let mut wb = Workbook::new_blank();
     wb.sheets[0].tables.push(sheetcore::table::Table {
+                column_ids: Vec::new(),
         name: "Sales".into(), display: "Sales".into(), range: (0, 0, 2, 0),
         columns: vec!["Amount".into()], header_row: true, totals_row: false,
     });

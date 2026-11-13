@@ -30,6 +30,7 @@ fn book_with_table_named(name: &str) -> Workbook {
         wb.sheets[0].set(r, c, Cell { value: v, formula: None });
     }
     wb.sheets[0].tables.push(sheetcore::table::Table {
+                column_ids: Vec::new(),
         name: name.into(),
         display: name.into(),
         range: (0, 0, 3, 0),

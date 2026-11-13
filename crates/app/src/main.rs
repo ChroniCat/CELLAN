@@ -5520,6 +5520,7 @@ impl SheetApp {
         }
         let name = format!("Table{n}");
         let t = sheetcore::table::Table {
+                column_ids: Vec::new(),
             name: name.clone(),
             display: name.clone(),
             range: (r1, c1, r2, c2),
@@ -13066,6 +13067,59 @@ let txn = self.txn_begin(&keys);
             .cloned()
     }
 
+    /// 表设计页的“填充计算列”：把当前选区所在列已有的计算列公式
+    /// 填到该表其余数据行。是明确的生产入口，不是只有测试调用。
+    fn fill_table_calculated_column(&mut self) {
+        self.commit_edit(None);
+        let Some(t) = self.table_at_sel() else {
+            self.status = "先把光标放在表格里".into();
+            return;
+        };
+        let Some(ci) = self.sel.1.checked_sub(t.range.1).map(|c| c as usize) else {
+            self.status = "当前列不在表格中".into();
+            return;
+        };
+        let Some(col_name) = t.columns.get(ci).cloned() else {
+            self.status = "当前列不在表格中".into();
+            return;
+        };
+        let data_start = if t.header_row { t.range.0 + 1 } else { t.range.0 };
+        let data_end = if t.totals_row {
+            t.range.2.saturating_sub(1)
+        } else {
+            t.range.2
+        };
+        if data_start > data_end {
+            self.status = "表格没有数据行".into();
+            return;
+        }
+        let keys: Vec<(u32, u32)> = (data_start..=data_end)
+            .map(|r| (r, t.range.1 + ci as u32))
+            .collect();
+        if !self.write_preflight(&keys, "填充计算列") {
+            return;
+        }
+        let txn = self.txn_begin(&keys);
+        let n = sheetcore::table::fill_calculated_column(
+            self.wb.sheet_mut(self.sheet_idx),
+            &t.name,
+            &col_name,
+        );
+        if n == 0 {
+            self.txn_end("填充计算列", txn);
+            self.status = format!("列 {col_name} 没有可复制的公式");
+            return;
+        }
+        self.txn_end("填充计算列", txn);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已填充 {n} 个计算列单元格");
+        let keys: Vec<(usize, u32, u32)> =
+            keys.into_iter().map(|(r, c)| (self.sheet_idx, r, c)).collect();
+        self.recalc_and_broadcast(&keys);
+    }
+
+
     fn chart_at_sel(&self) -> Option<sheetcore::charts::Chart> {
         let i = self.chart_sel?;
         self.wb.sheet(self.sheet_idx).charts.get(i).cloned()
@@ -16111,7 +16165,7 @@ let txn = self.txn_begin(&keys);
                                         }
                                     }
                                 });
-                            let sample = sheetcore::style::format_value_in(self.wb.date_system, 
+                            let sample = sheetcore::style::format_value_in(self.wb.date_system,
                                 &sheetcore::model::Value::Number(1234.5678),
                                 &self.fmt_state.format,
                             );

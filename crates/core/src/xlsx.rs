@@ -2409,6 +2409,7 @@ mod tests {
                 sh.set(2, c, Cell { value: Value::Text("b".into()), formula: None });
             }
             sh.tables.push(crate::table::Table {
+                column_ids: Vec::new(),
                 name: "Table1".into(),
                 display: "Table1".into(),
                 range: (0, 0, 2, 1),

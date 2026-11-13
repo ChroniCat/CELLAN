@@ -18,6 +18,8 @@ pub struct Table {
     pub range: (u32, u32, u32, u32),
     /// 列名，顺序与列一致
     pub columns: Vec<String>,
+    /// 列稳定标识（tableColumn/@id）；列重命名保持不变
+    pub column_ids: Vec<u32>,
     /// 首行是不是标题
     pub header_row: bool,
     /// 末行是不是汇总行
@@ -96,6 +98,7 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
         display: attr("displayName").unwrap_or_default(),
         range: parse_a1(&attr("ref")?)?,
         columns: Vec::new(),
+        column_ids: Vec::new(),
         header_row: attr("headerRowCount").map(|v| v != "0").unwrap_or(true),
         totals_row: attr("totalsRowCount").map(|v| v != "0").unwrap_or(false),
     };
@@ -111,6 +114,13 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
             let v = &tag[npos + 7..];
             if let Some(q) = v.find('"') {
                 t.columns.push(unescape(&v[..q]));
+            }
+        }
+        if let Some(ipos) = tag.find(" id=\"") {
+            let v = &tag[ipos + 5..];
+            if let Some(q) = v.find('"') {
+                let id = v[..q].parse::<u32>().unwrap_or(0);
+                t.column_ids.push(id);
             }
         }
         rest = &rest[pos + tag_end..];
@@ -191,22 +201,23 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Table>> {
 pub fn table_xml(t: &Table, id: u32) -> String {
     let mut cols = String::new();
     for (i, name) in t.columns.iter().enumerate() {
+        let id = t.column_ids.get(i).copied().unwrap_or(i as u32 + 1);
         if t.totals_row {
             if i == 0 {
                 cols.push_str(&format!(
                     "<tableColumn id=\"{}\" name=\"{}\" totalsRowLabel=\"总计\"/>",
-                    i + 1,
+                    id,
                     esc(name)
                 ));
             } else {
                 cols.push_str(&format!(
                     "<tableColumn id=\"{}\" name=\"{}\" totalsRowFunction=\"sum\"/>",
-                    i + 1,
+                    id,
                     esc(name)
                 ));
             }
         } else {
-            cols.push_str(&format!("<tableColumn id=\"{}\" name=\"{}\"/>", i + 1, esc(name)));
+            cols.push_str(&format!("<tableColumn id=\"{}\" name=\"{}\"/>", id, esc(name)));
         }
     }
     let count = t.columns.len();
@@ -364,6 +375,493 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
 pub fn expand_structured(wb: &crate::model::Workbook, si: usize, body: &str) -> Option<String> {
     expand_structured_at(wb, si, None, None, body)
 }
+
+/// 列名比较：表格列名在 Excel 中不区分大小写。
+fn same_col_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+fn replace_col_token(text: &str, old: &str, new: &str) -> Option<String> {
+    let lead = text.len() - text.trim_start().len();
+    let trail = text.len() - text.trim_end().len();
+    let core = &text[lead..text.len().saturating_sub(trail)];
+    if core.is_empty() || !same_col_name(core, old) {
+        return None;
+    }
+    Some(format!("{}{}{}", &text[..lead], new, &text[text.len() - trail..]))
+}
+
+/// 改写一个方括号组内部的列名；只替换完整列名，不碰 #Data/#This Row。
+fn rename_specs(inner: &str, old: &str, new: &str) -> String {
+    if let Some(v) = replace_col_token(inner, old, new) {
+        return v;
+    }
+    let bytes = inner.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let (body, end) = match bracket_group(&inner[i..]) {
+                Some(v) => v,
+                None => {
+                    out.push('[');
+                    i += 1;
+                    continue;
+                }
+            };
+            out.push('[');
+            out.push_str(&rename_specs(&body, old, new));
+            out.push(']');
+            i += end;
+        } else if bytes[i] == b'@' {
+            let rest = &inner[i + 1..];
+            if rest.starts_with('[') {
+                if let Some((body, end)) = bracket_group(rest) {
+                    out.push('@');
+                    out.push('[');
+                    out.push_str(&rename_specs(&body, old, new));
+                    out.push(']');
+                    i += 1 + end;
+                    continue;
+                }
+            }
+            let end = rest
+                .find(|ch: char| ch == ',' || ch == ']' || ch == ':')
+                .unwrap_or(rest.len());
+            let token = &rest[..end];
+            out.push('@');
+            match replace_col_token(token, old, new) {
+                Some(v) => out.push_str(&v),
+                None => out.push_str(token),
+            }
+            i += 1 + end;
+        } else {
+            let ch = inner[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// 返回方括号组的内部文本和整个组的字节长度。
+fn bracket_group(s: &str) -> Option<(String, usize)> {
+    if !s.starts_with('[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    for (i, ch) in s.char_indices() {
+        if in_quote {
+            if ch == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_quote = true,
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((s[1..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rewrite_table_column_refs(
+    text: &str,
+    table: &str,
+    old: &str,
+    new: &str,
+    bare_current_row: bool,
+) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if text.len() >= i + table.len()
+            && text.is_char_boundary(i)
+            && text.is_char_boundary(i + table.len())
+            && text[i..i + table.len()].eq_ignore_ascii_case(table)
+            && text[i + table.len()..].starts_with('[')
+            && (i == 0
+                || !text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        {
+            // 表名匹配不区分大小写，但输出保留用户原文的写法。
+            out.push_str(&text[i..i + table.len()]);
+            if let Some((body, end)) = bracket_group(&text[i + table.len()..]) {
+                out.push('[');
+                out.push_str(&rename_specs(&body, old, new));
+                out.push(']');
+                i += table.len() + end;
+                continue;
+            }
+        }
+        if bytes[i] == b'[' {
+            if let Some((body, end)) = bracket_group(&text[i..]) {
+                let is_current = body.trim_start().starts_with('@')
+                    || body.to_ascii_lowercase().contains("#this row");
+                if bare_current_row && is_current {
+                    out.push('[');
+                    out.push_str(&rename_specs(&body, old, new));
+                    out.push(']');
+                } else {
+                    out.push_str(&text[i..i + end]);
+                }
+                i += end;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 表格列重命名：更新表格定义及所有工作表中对该列的引用，保留稳定列 id。
+/// 只处理直接写出的列名；括号/单引号转义列名仍是未覆盖边界。
+pub fn rename_table_column(
+    wb: &mut crate::model::Workbook,
+    table_name: &str,
+    old: &str,
+    new: &str,
+) -> bool {
+    if old == new || new.trim().is_empty() {
+        return false;
+    }
+    let Some(si) = wb.sheets.iter().position(|s| {
+        s.tables.iter().any(|t| {
+            t.name.eq_ignore_ascii_case(table_name) || t.display.eq_ignore_ascii_case(table_name)
+        })
+    }) else {
+        return false;
+    };
+    let Some(ti) = wb.sheets[si].tables.iter().position(|t| {
+        t.name.eq_ignore_ascii_case(table_name) || t.display.eq_ignore_ascii_case(table_name)
+    }) else {
+        return false;
+    };
+    let (idx, actual_name) = {
+        let t = &wb.sheets[si].tables[ti];
+        let Some(idx) = t.columns.iter().position(|c| same_col_name(c, old)) else {
+            return false;
+        };
+        if t.columns
+            .iter()
+            .enumerate()
+            .any(|(j, c)| j != idx && same_col_name(c, new))
+        {
+            return false;
+        }
+        (idx, t.name.clone())
+    };
+    for sh in &mut wb.sheets {
+        let mut edits: Vec<(u32, u32, Box<str>)> = Vec::new();
+        for (cref, cell) in sh.iter() {
+            let Some(f) = cell.formula.as_deref() else { continue };
+            let inside = sh.tables.iter().any(|t| {
+                t.name.eq_ignore_ascii_case(&actual_name)
+                    && cref.row >= t.range.0
+                    && cref.row <= t.range.2
+                    && cref.col >= t.range.1
+                    && cref.col <= t.range.3
+            });
+            let nf = rewrite_table_column_refs(f, &actual_name, old, new, inside);
+            if nf != f {
+                edits.push((cref.row, cref.col, nf.into_boxed_str()));
+            }
+        }
+        for (r, c, f) in edits {
+            if let Some(cell) = sh.get_mut(r, c) {
+                cell.formula = Some(f);
+            }
+        }
+        if sh.iter().any(|(_, cell)| cell.formula.is_some()) {
+            sh.edited = true;
+        }
+    }
+    let (header_row, header_col) = {
+        let t = &wb.sheets[si].tables[ti];
+        if t.header_row {
+            (Some(t.range.0), t.range.1 + idx as u32)
+        } else {
+            (None, 0)
+        }
+    };
+    let t = &mut wb.sheets[si].tables[ti];
+    t.columns[idx] = new.to_string();
+    if t.column_ids.len() < t.columns.len() {
+        t.column_ids.resize(t.columns.len(), 0);
+        for (j, id) in t.column_ids.iter_mut().enumerate() {
+            if *id == 0 {
+                *id = j as u32 + 1;
+            }
+        }
+    }
+    if let Some(hr) = header_row {
+        let old_cell = wb.sheets[si].get(hr, header_col).cloned();
+        let mut cell = old_cell.unwrap_or_default();
+        cell.value = crate::model::Value::Text(new.into());
+        cell.formula = None;
+        wb.sheets[si].set(hr, header_col, cell);
+    }
+    wb.sheets[si].tables_dirty = true;
+    wb.sheets[si].edited = true;
+    true
+}
+
+/// 只转换引用目标表的结构化引用；其他表的裸 `[@X]` / `Other[Amount]`
+/// 原样保留。用于转换区域，不能调用全局 `expand_structured`。
+fn convert_target_table_refs(
+    wb: &crate::model::Workbook,
+    si: usize,
+    row: u32,
+    col: u32,
+    body: &str,
+    table_name: &str,
+    bare_inside: bool,
+) -> Option<String> {
+    fn name_len_at(s: &str, name: &str) -> Option<usize> {
+        let mut it = s.char_indices();
+        let mut end = 0usize;
+        for want in name.chars() {
+            let (i, ch) = it.next()?;
+            if !ch.eq_ignore_ascii_case(&want) {
+                return None;
+            }
+            end = i + ch.len_utf8();
+        }
+        Some(end)
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    let bytes = body.as_bytes();
+    let mut changed = false;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&body[start..i]);
+            continue;
+        }
+        // 显式表名：大小写不敏感，后面紧跟方括号组。
+        let prev_ok = i == 0
+            || !(body[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'));
+        if prev_ok {
+            if let Some(tlen) = name_len_at(&body[i..], table_name) {
+                let after = i + tlen;
+                if after < bytes.len() && bytes[after] == b'[' {
+                    if let Some((_, end)) = bracket_group(&body[after..]) {
+                        let token = &body[i..after + end];
+                        if let Some(exp) =
+                            expand_structured_at(wb, si, Some(row), Some(col), token)
+                        {
+                            out.push_str(&exp);
+                            changed = true;
+                            i = after + end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if bytes[i] == b'[' {
+            if let Some((_, end)) = bracket_group(&body[i..]) {
+                let bare_ok = bare_inside
+                    && (i == 0
+                        || !(body[..i]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ']')));
+                if bare_ok {
+                    let token = &body[i..i + end];
+                    if let Some(exp) =
+                        expand_structured_at(wb, si, Some(row), Some(col), token)
+                    {
+                        out.push_str(&exp);
+                        changed = true;
+                        i += end;
+                        continue;
+                    }
+                }
+                // 非目标表/非当前表裸引用：整组原样跳过，避免把内部列名当独立引用。
+                out.push_str(&body[i..i + end]);
+                i += end;
+                continue;
+            }
+        }
+        let ch = body[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if changed { Some(out) } else { None }
+}
+
+/// 把表格转换为普通区域：只展开引用目标表的公式，再移除目标 Table 对象。
+/// 其他表的结构化引用保持原文；数据、格式和值不动。
+pub fn convert_table_to_range(wb: &mut crate::model::Workbook, table_name: &str) -> bool {
+    let Some(si) = wb.sheets.iter().position(|s| {
+        s.tables.iter().any(|t| {
+            t.name.eq_ignore_ascii_case(table_name) || t.display.eq_ignore_ascii_case(table_name)
+        })
+    }) else {
+        return false;
+    };
+    let table_name = wb.sheets[si]
+        .tables
+        .iter()
+        .find(|t| {
+            t.name.eq_ignore_ascii_case(table_name) || t.display.eq_ignore_ascii_case(table_name)
+        })
+        .map(|t| t.name.clone())
+        .unwrap_or_default();
+    let mut edits: Vec<(usize, u32, u32, Box<str>)> = Vec::new();
+    for (sidx, sh) in wb.sheets.iter().enumerate() {
+        for (cref, cell) in sh.iter() {
+            let Some(f) = cell.formula.as_deref() else { continue; };
+            if !f.contains('[') { continue; }
+            let body = f.strip_prefix('=').unwrap_or(f);
+            let inside = sidx == si
+                && sh.tables.iter().any(|t| {
+                    t.name.eq_ignore_ascii_case(&table_name)
+                        && cref.row >= t.range.0
+                        && cref.row <= t.range.2
+                        && cref.col >= t.range.1
+                        && cref.col <= t.range.3
+                });
+            if let Some(e) =
+                convert_target_table_refs(wb, sidx, cref.row, cref.col, body, &table_name, inside)
+            {
+                let nf = format!("={}", e);
+                if nf != f {
+                    edits.push((sidx, cref.row, cref.col, nf.into_boxed_str()));
+                }
+            }
+        }
+    }
+    for (sidx, r, c, f) in edits {
+        if let Some(cell) = wb.sheets[sidx].get_mut(r, c) {
+            cell.formula = Some(f);
+        }
+        wb.sheets[sidx].edited = true;
+    }
+    let sh = &mut wb.sheets[si];
+    let before = sh.tables.len();
+    sh.tables.retain(|t| !t.name.eq_ignore_ascii_case(&table_name));
+    if sh.tables.len() == before {
+        return false;
+    }
+    sh.tables_dirty = true;
+    sh.edited = true;
+    true
+}
+
+/// 计算列自动填充：把表格该列已有的公式复制到同列其余数据行。
+/// 只处理公式，不覆盖已有公式；返回填充的单元格数。
+pub fn fill_calculated_column(
+    sheet: &mut crate::model::Sheet,
+    table_name: &str,
+    col_name: &str,
+) -> usize {
+    let Some(ti) = sheet.tables.iter().position(|t| {
+        t.name.eq_ignore_ascii_case(table_name) || t.display.eq_ignore_ascii_case(table_name)
+    }) else {
+        return 0;
+    };
+    let t = &sheet.tables[ti];
+    let Some(ci) = t.columns.iter().position(|c| same_col_name(c, col_name)) else {
+        return 0;
+    };
+    let col = t.range.1 + ci as u32;
+    let data_start = if t.header_row {
+        t.range.0 + 1
+    } else {
+        t.range.0
+    };
+    let data_end = if t.totals_row {
+        t.range.2.saturating_sub(1)
+    } else {
+        t.range.2
+    };
+    if data_start > data_end {
+        return 0;
+    }
+    let Some((src_row, src_formula)) = (data_start..=data_end).find_map(|r| {
+        let f = sheet.get(r, col)?.formula.as_deref()?;
+        Some((r, f.to_string()))
+    }) else {
+        return 0;
+    };
+    let mut filled = 0;
+    for r in data_start..=data_end {
+        if r == src_row || sheet.get(r, col).is_some_and(|c| c.formula.is_some()) {
+            continue;
+        }
+        let delta = r as i64 - src_row as i64;
+        let shift = crate::refs::Shift {
+            axis: crate::refs::Axis::Row,
+            translate: Some((delta, 0)),
+            target_sheet: sheet.name.clone(),
+            own_sheet: sheet.name.clone(),
+            ..Default::default()
+        };
+        let f = crate::refs::rewrite(&src_formula, &shift);
+        sheet.set(
+            r,
+            col,
+            crate::model::Cell {
+                value: crate::model::Value::Empty,
+                formula: Some(f.into_boxed_str()),
+            },
+        );
+        filled += 1;
+    }
+    if filled > 0 {
+        sheet.edited = true;
+    }
+    filled
+}
+
 
 /// 带当前公式位置的结构化引用展开。`cur_row`/`cur_col` 决定 `@` / `#This Row`
 /// 的归属表；同一行有多张表时必须用公式列定位，不能取第一张。
@@ -957,6 +1455,7 @@ mod sync_tests {
             display: "表1".into(),
             range: (0, 0, 1, 1),
             columns: vec!["产品".into(), "数量".into()],
+            column_ids: Vec::new(),
             header_row: true,
             totals_row: false,
         };

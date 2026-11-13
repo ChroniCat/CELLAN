@@ -1,4 +1,3 @@
-   Compiling sheetcore v0.1.0 (F:\finance-native-sheets-ready\crates\core)
 warning: unused import: `num`
  --> crates\core\src\formula\array.rs:3:33
   |
@@ -53,12 +52,6 @@ warning: unused doc comment
     |   rustdoc does not generate documentation for macro invocations
     |
     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
-
-warning: unused import: `Sheet`
-   --> crates\core\src\a11y.rs:161:30
-    |
-161 |     use crate::model::{Cell, Sheet, Value};
-    |                              ^^^^^
 
 warning: use of deprecated method `calamine::Xls::<RS>::worksheet_merge_cells`: use `merge_cells_by_sheet_name()` or `merge_cells_by_sheet_id()` instead
   --> crates\core\src\xlsx.rs:50:38
@@ -232,9 +225,9 @@ warning: unused variable: `err`
      |             ^^^ help: if this is intentional, prefix it with an underscore: `_err`
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1010:14
+    --> crates\core\src\formula\mod.rs:1082:14
      |
-1010 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+1082 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
      |              ----^^
      |              |
      |              help: remove this `mut`
@@ -242,37 +235,37 @@ warning: variable does not need to be mutable
      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1010:22
+    --> crates\core\src\formula\mod.rs:1082:22
      |
-1010 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+1082 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
      |                      ----^^
      |                      |
      |                      help: remove this `mut`
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1775:29
+    --> crates\core\src\formula\mod.rs:1886:29
      |
-1775 |                         let mut out = match name.as_str() {
+1886 |                         let mut out = match name.as_str() {
      |                             ----^^^
      |                             |
      |                             help: remove this `mut`
 
 warning: value assigned to `t_phase` is never read
-    --> crates\core\src\formula\mod.rs:2550:17
+    --> crates\core\src\formula\mod.rs:2691:17
      |
-2550 |                 t_phase = std::time::Instant::now();
+2691 |                 t_phase = std::time::Instant::now();
      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ...
-2687 |     mark!("结束");
+2828 |     mark!("结束");
      |     ------------- in this macro invocation
      |
      = help: maybe it is overwritten before being read?
      = note: this warning originates in the macro `mark` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:2734:9
+    --> crates\core\src\formula\mod.rs:2891:9
      |
-2734 |     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
+2891 |     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
      |         ----^^^^^
      |         |
      |         help: remove this `mut`
@@ -477,13 +470,16 @@ warning: constant `STYLE` is never used
 39 | const STYLE: u16 = 0x0293;
    |       ^^^^^
 
-warning: unused variable: `nonce`
-   --> crates\core\src\wire.rs:312:13
-    |
-312 |         let nonce = [0u8, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
-    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_nonce`
-
+   Compiling sheetcore v0.1.0 (F:\finance-native-sheets-ready\crates\core)
 warning: `sheetcore` (lib) generated 67 warnings (run `cargo fix --lib -p sheetcore` to apply 24 suggestions)
+warning: unused import: `sheetcore::model::Workbook`
+ --> crates\core\examples\expand_probe.rs:1:5
+  |
+1 | use sheetcore::model::Workbook;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
 warning: variable does not need to be mutable
   --> crates\core\tests\chart_kinds.rs:23:13
    |
@@ -494,6 +490,20 @@ warning: variable does not need to be mutable
    |
    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
+warning: unused import: `Sheet`
+   --> crates\core\src\a11y.rs:161:30
+    |
+161 |     use crate::model::{Cell, Sheet, Value};
+    |                              ^^^^^
+
+warning: unused variable: `nonce`
+   --> crates\core\src\wire.rs:312:13
+    |
+312 |         let nonce = [0u8, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_nonce`
+
+warning: `sheetcore` (example "expand_probe") generated 1 warning (run `cargo fix --example "expand_probe" -p sheetcore` to apply 1 suggestion)
+warning: `sheetcore` (test "chart_kinds") generated 1 warning (run `cargo fix --test "chart_kinds" -p sheetcore` to apply 1 suggestion)
 warning: variable does not need to be mutable
   --> crates\core\examples\chk_chartflow.rs:12:9
    |
@@ -504,31 +514,12 @@ warning: variable does not need to be mutable
    |
    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
-warning: `sheetcore` (example "chk_chartflow") generated 1 warning (run `cargo fix --example "chk_chartflow" -p sheetcore` to apply 1 suggestion)
-warning: `sheetcore` (test "chart_kinds") generated 1 warning (run `cargo fix --test "chart_kinds" -p sheetcore` to apply 1 suggestion)
-warning: function `read_string` is never used
- --> crates\core\examples\fn_map.rs:9:4
-  |
-9 | fn read_string(b: &[u8], at: usize) -> Option<String> {
-  |    ^^^^^^^^^^^
-  |
-  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
-
-warning: unused import: `ValueWire`
-   --> crates\core\tests\incremental.rs:162:37
-    |
-162 |     use sheetcore::sync::{Op, Peer, ValueWire};
-    |                                     ^^^^^^^^^
-    |
-    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: `sheetcore` (example "fn_map") generated 1 warning
-warning: `sheetcore` (test "incremental") generated 1 warning (run `cargo fix --test "incremental" -p sheetcore` to apply 1 suggestion)
 warning: `sheetcore` (lib test) generated 66 warnings (64 duplicates) (run `cargo fix --lib -p sheetcore --tests` to apply 2 suggestions)
+warning: `sheetcore` (example "chk_chartflow") generated 1 warning (run `cargo fix --example "chk_chartflow" -p sheetcore` to apply 1 suggestion)
 warning: unused import: `sheetcore::model::Workbook`
- --> crates\core\examples\expand_probe.rs:1:5
+ --> crates\core\tests\sparklines.rs:3:5
   |
-1 | use sheetcore::model::Workbook;
+3 | use sheetcore::model::Workbook;
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
@@ -541,27 +532,14 @@ warning: unused variable: `wb`
    |
    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
 
-warning: variable `missing` is assigned to, but never used
-   --> crates\core\examples\verify_formulas.rs:118:9
-    |
-118 |     let mut missing = 0usize;
-    |         ^^^^^^^^^^^
-    |
-    = note: consider using `_missing` instead
-    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+warning: function `read_string` is never used
+ --> crates\core\examples\fn_map.rs:9:4
+  |
+9 | fn read_string(b: &[u8], at: usize) -> Option<String> {
+  |    ^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-warning: value assigned to `missing` is never read
-   --> crates\core\examples\verify_formulas.rs:135:17
-    |
-135 |                 missing += 1;
-    |                 ^^^^^^^^^^^^
-    |
-    = help: maybe it is overwritten before being read?
-    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
-
-warning: `sheetcore` (example "verify_formulas") generated 2 warnings
-warning: `sheetcore` (test "comparison_semantics") generated 1 warning (run `cargo fix --test "comparison_semantics" -p sheetcore` to apply 1 suggestion)
-warning: `sheetcore` (example "expand_probe") generated 1 warning (run `cargo fix --example "expand_probe" -p sheetcore` to apply 1 suggestion)
 warning: use of deprecated method `umya_spreadsheet::Workbook::get_sheet_by_name_mut`: Use sheet_by_name_mut()
  --> crates\core\examples\dbg_notes.rs:5:19
   |
@@ -606,112 +584,134 @@ warning: use of deprecated method `umya_spreadsheet::CommentText::get_text`: Use
 8 |         println!("  {:?} {}: {:?}", c.get_coordinate(), c.get_author(), c.get_text().get_text());
   |                                                                                      ^^^^^^^^
 
-warning: unused import: `sheetcore::model::Workbook`
- --> crates\core\tests\sparklines.rs:3:5
-  |
-3 | use sheetcore::model::Workbook;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
-
-warning: `sheetcore` (example "dbg_notes") generated 7 warnings
+warning: `sheetcore` (example "fn_map") generated 1 warning
+warning: `sheetcore` (test "comparison_semantics") generated 1 warning (run `cargo fix --test "comparison_semantics" -p sheetcore` to apply 1 suggestion)
 warning: `sheetcore` (test "sparklines") generated 1 warning (run `cargo fix --test "sparklines" -p sheetcore` to apply 1 suggestion)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 09s
+warning: `sheetcore` (example "dbg_notes") generated 7 warnings
+warning: unused import: `ValueWire`
+   --> crates\core\tests\incremental.rs:162:37
+    |
+162 |     use sheetcore::sync::{Op, Peer, ValueWire};
+    |                                     ^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `missing` is assigned to, but never used
+   --> crates\core\examples\verify_formulas.rs:118:9
+    |
+118 |     let mut missing = 0usize;
+    |         ^^^^^^^^^^^
+    |
+    = note: consider using `_missing` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `missing` is never read
+   --> crates\core\examples\verify_formulas.rs:135:17
+    |
+135 |                 missing += 1;
+    |                 ^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sheetcore` (test "incremental") generated 1 warning (run `cargo fix --test "incremental" -p sheetcore` to apply 1 suggestion)
+warning: `sheetcore` (example "verify_formulas") generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 35s
      Running unittests src\lib.rs (target\debug\deps\sheetcore-adcc6de5b8090ba2.exe)
 
-running 264 tests
-test arr::tests::keeps_existing_array_flag ... ok
+running 265 tests
 test a11y::tests::default_name_detection ... ok
+test arr::tests::keeps_existing_array_flag ... ok
 test backup::tests::civil_dates_are_sane ... ok
 test arr::tests::adds_attribute_to_anchor ... ok
 test arr::tests::finds_array_formula_in_xml ... ok
-test arr::tests::parses_ranges ... ok
 test cf::parse_tests::sqref_lists ... ok
-test cf::parse_tests::parses_dxfs ... ok
-test backup::tests::first_save_has_no_history ... ok
+test arr::tests::parses_ranges ... ok
 test cf::tests::formula_relative_shift ... ok
-test a11y::tests::flags_merges_and_default_names ... ok
+test backup::tests::first_save_has_no_history ... ok
 test a11y::tests::flags_empty_textbox_and_sparkline_header ... ok
-test a11y::tests::flags_empty_header_when_table_present ... ok
-test a11y::tests::clean_sheet_reports_nothing ... ok
-test cf::tests::text_and_dup_rules ... ok
 test cf::tests::comparison_rule ... ok
 test cf::tests::data_bar_ratio ... ok
+test a11y::tests::flags_empty_header_when_table_present ... ok
+test cf::tests::color_scale_endpoints ... ok
+test cf::tests::text_and_dup_rules ... ok
 test cells::tests::delete_up_pulls_cells ... ok
+test cf::parse_tests::parses_dxfs ... ok
+test a11y::tests::flags_merges_and_default_names ... ok
 test cells::tests::insert_right_shifts_row ... ok
 test cells::tests::insert_down_moves_values_and_styles ... ok
-test cf::tests::color_scale_endpoints ... ok
+test a11y::tests::clean_sheet_reports_nothing ... ok
+test cf::parse_tests::parses_cell_is_and_scale ... ok
 test chart_write::anchor_tests::rewrites_chart_anchor_and_keeps_rid ... ok
 test chart_write::anchor_tests::leaves_other_anchors_alone ... ok
-test cf::parse_tests::parses_cell_is_and_scale ... ok
 test charts::anchor_tests::one_cell_anchor ... ok
 test charts::tests::bar_direction ... ok
-test charts::tests::parses_bar_chart ... ok
 test charts::tests::parses_pie_and_line ... ok
+test charts::tests::parses_bar_chart ... ok
 test clipboard_xmlss::tests::converts_relative_and_absolute ... ok
 test clipboard_xmlss::tests::keeps_strings_and_functions ... ok
 test clipboard_xmlss::tests::parses_merges_and_text ... ok
-test consolidate::tests::unknown_sheet_is_reported ... ok
-test consolidate::tests::sums_by_row_label ... ok
 test consolidate::tests::position_mode_aligns_by_offset ... ok
-test consolidate::tests::average_and_count ... ok
+test consolidate::tests::sums_by_row_label ... ok
 test clipboard_xmlss::tests::parses_real_clipboard_sample ... ok
+test consolidate::tests::average_and_count ... ok
+test consolidate::tests::unknown_sheet_is_reported ... ok
 test csv::tests::detects_tab_and_semicolon ... ok
-test dv::tests::whole_and_decimal_bounds ... ok
-test csv::tests::parses_simple_csv ... ok
+test csv::tests::handles_newline_inside_quotes ... ok
+test csv::tests::handles_quotes_and_commas_inside ... ok
 test csv::tests::skips_blank_lines ... ok
 test data_tools::tests::sort_puts_empty_last ... ok
-test data_tools::tests::multi_level_sort ... ok
+test data_tools::tests::remove_duplicates_keeps_first ... ok
 test data_tools::tests::text_to_columns_splits_and_shifts ... ok
 test dv::tests::list_inline_and_range ... ok
 test dv::tests::text_length_and_custom ... ok
-test dv::tests::parses_xml ... ok
-test csv::tests::handles_quotes_and_commas_inside ... ok
-test flashfill::tests::learns_concat_from_aux_column ... ok
-test errors::tests::finds_error_texts ... ok
-test errors::tests::ignored_cells_are_skipped ... ok
-test data_tools::tests::remove_duplicates_keeps_first ... ok
-test errors::tests::numeric_check_rejects_noise ... ok
-test errors::tests::finds_circular_references ... ok
-test flashfill::tests::refuses_when_no_rule_matches ... ok
+test csv::tests::parses_simple_csv ... ok
 test errors::tests::finds_number_as_text ... ok
-test flashfill::tests::learns_digits_only ... ok
-test flashfill::tests::learns_suffix_after_dash ... ok
-test csv::tests::handles_newline_inside_quotes ... ok
-test flashfill::tests::does_not_overwrite_existing_targets ... ok
+test dv::tests::whole_and_decimal_bounds ... ok
+test data_tools::tests::multi_level_sort ... ok
+test errors::tests::finds_error_texts ... ok
+test dv::tests::parses_xml ... ok
+test errors::tests::ignored_cells_are_skipped ... ok
+test errors::tests::finds_circular_references ... ok
 test flashfill::tests::refuses_without_examples ... ok
-test forecast::tests::forecast_range_is_linear_in_periods ... ok
+test flashfill::tests::does_not_overwrite_existing_targets ... ok
+test flashfill::tests::refuses_when_no_rule_matches ... ok
+test flashfill::tests::learns_concat_from_aux_column ... ok
+test flashfill::tests::learns_suffix_after_dash ... ok
+test errors::tests::numeric_check_rejects_noise ... ok
+test flashfill::tests::learns_digits_only ... ok
 test forecast::tests::fits_a_straight_line ... ok
-test forecast::tests::needs_two_points ... ok
+test forecast::tests::forecast_range_is_linear_in_periods ... ok
 test forecast::tests::handles_noise_and_reports_r2 ... ok
+test forecast::tests::needs_two_points ... ok
 test formula::calc_mode_tests::calculate_sheet_does_not_touch_unrelated_volatile_formula ... ok
 test formula::functions::clock_and_serial60_tests::serial_59_60_61_and_fictional_feb29_are_distinct ... ok
-test formula::functions::clock_and_serial60_tests::day_month_year_and_text_agree_on_serial_60 ... ok
 test formula::calc_mode_tests::manual_mode_keeps_cached_values_until_forced ... ok
-test formula::functions::clock_and_serial60_tests::injected_clock_uses_local_midnight_not_utc_and_is_stable ... ok
 test formula::functions::clock_and_serial60_tests::timezone_and_midnight_changes_do_not_leak_previous_snapshot ... ok
 test formula::functions::round_precision::matches_excel_fifteen_digit_arithmetic ... ok
-test formula::calc_sheet_tests::calculate_one_sheet_keeps_other_pending_and_old_cache ... ok
+test formula::functions::clock_and_serial60_tests::injected_clock_uses_local_midnight_not_utc_and_is_stable ... ok
 test formula::functions::round_precision::plain_rounding_is_unchanged ... ok
-test formula::calc_sheet_tests::recalc_sheet_clears_shrinking_spill_tail_and_updates_dependents ... ok
+test formula::functions::clock_and_serial60_tests::day_month_year_and_text_agree_on_serial_60 ... ok
 test hyperlinks::tests::parses_hyperlink_tags ... ok
+test formula::calc_sheet_tests::calculate_one_sheet_keeps_other_pending_and_old_cache ... ok
 test hyperlinks::tests::rels_part_path ... ok
 test layout::tests::excel_units ... ok
-test backup::tests::keeps_previous_version_before_overwrite ... ok
-test layout::tests::reset_to_default_removes_entry ... ok
+test formula::calc_sheet_tests::recalc_sheet_clears_shrinking_spill_tail_and_updates_dependents ... ok
 test layout::tests::shifted_by_custom_width ... ok
+test formula::functions::clock_and_serial60_tests::recalc_binds_now_snapshot_to_workbook_date_system ... ok
+test layout::tests::reset_to_default_removes_entry ... ok
 test layout::tests::uniform_when_empty ... ok
-test layout::tests::many_custom_widths ... ok
-test merges::tests::parses_merge_refs ... ok
 test merges::tests::parses_cols_and_rows ... ok
+test merges::tests::parses_merge_refs ... ok
+test layout::tests::many_custom_widths ... ok
 test merges::tests::parses_merge_xml ... ok
 test merges::tests::parses_outline_levels ... ok
 test merges::tests::parses_tab_color ... ok
 test model::tests::display_numbers ... ok
 test model::tests::labels ... ok
 test model::tests::parse ... ok
-test notes::tests::rela_paths ... ok
 test notes::tests::parses_comments_xml ... ok
+test notes::tests::rela_paths ... ok
 test page::tests::a4_portrait_printable ... ok
 test page::tests::fit_parsing_keeps_auto_direction ... ok
 test page::tests::landscape_swaps ... ok
@@ -721,21 +721,21 @@ test patch::calc_mode_tests::auto_removes_manual_mode_but_keeps_other_attributes
 test patch::calc_mode_tests::inserts_manual_calc_pr_when_missing ... ok
 test patch::calc_mode_tests::non_self_closing_calc_pr_is_not_double_closed ... ok
 test patch::calc_mode_tests::prefixed_workbook_and_calc_pr_are_handled ... ok
-test patch::calc_mode_tests::prefixed_workbook_without_calc_pr_gets_prefixed_tag ... ok
-test patch::calc_mode_tests::replaces_existing_calc_mode_and_drops_full_calc_on_load ... ok
 test page::tests::fit_height_limits_scale ... ok
-test patch::dv_tests::skips_any_kind ... ok
-test patch::dv_tests::whole_with_pair ... ok
+test patch::calc_mode_tests::prefixed_workbook_without_calc_pr_gets_prefixed_tag ... ok
 test page::tests::fit_to_page_shrinks_scale ... ok
-test page::tests::manual_row_break_is_included ... ok
-test patch::dv_tests::writes_and_replaces ... ok
-test patch::filter_tests::toggles_hidden_rows ... ok
+test patch::calc_mode_tests::replaces_existing_calc_mode_and_drops_full_calc_on_load ... ok
+test patch::dv_tests::skips_any_kind ... ok
 test page::tests::page_breaks_split_long_table ... ok
-test patch::filter_tests::writes_auto_filter ... ok
 test page::tests::two_pages_wide_is_looser_than_one ... ok
-test patch::freeze_tests::adds_pane_to_self_closing_view ... ok
+test patch::dv_tests::whole_with_pair ... ok
+test patch::dv_tests::writes_and_replaces ... ok
+test page::tests::manual_row_break_is_included ... ok
+test patch::filter_tests::toggles_hidden_rows ... ok
+test patch::filter_tests::writes_auto_filter ... ok
 test patch::freeze_tests::replaces_existing_and_clears ... ok
 test patch::page_tests::rewrites_sheet_page_elements ... ok
+test patch::freeze_tests::adds_pane_to_self_closing_view ... ok
 test patch::page_tests::writes_print_area_names ... ok
 test patch::tests::dxf_rendering ... ok
 test patch::tests::replaces_dxfs_section ... ok
@@ -771,49 +771,49 @@ test richtext::range_tests::formats_only_the_selection ... ok
 test richtext::sst_tests::parses_shared_string_runs ... ok
 test richtext::sst_tests::plain_shared_string_is_single_run ... ok
 test richtext::tests::patch_replaces_cell_and_keeps_style ... ok
-test scenarios::tests::capture_reads_selection ... ok
 test richtext::tests::runs_roundtrip ... ok
+test scenarios::tests::capture_reads_selection ... ok
 test scenarios::tests::value_text_formats_like_excel ... ok
-test scenarios::tests::roundtrip_xml ... ok
 test sort_filter::tests::blanks_go_last ... ok
 test sort_filter::tests::criteria_filter_by_text_and_number ... ok
-test sort_filter::tests::criterion_xml_operator_roundtrip ... ok
-test sort_filter::tests::filter_hides_non_matching_rows ... ok
+test scenarios::tests::roundtrip_xml ... ok
 test sort_filter::tests::region_expands_to_contiguous_block ... ok
+test sort_filter::tests::filter_hides_non_matching_rows ... ok
+test sort_filter::tests::criterion_xml_operator_roundtrip ... ok
+test sort_filter::tests::rejects_merged_range ... ok
 test sort_filter::tests::sorts_ascending_and_descending ... ok
 test sort_filter::tests::styles_move_with_rows ... ok
-test sort_filter::tests::rejects_merged_range ... ok
 test sort_filter::tests::unique_values_sorted ... ok
 test sparkline::tests::clearing_removes_ext_lst ... ok
 test sparkline::tests::data_ref_quotes_sheet ... ok
-test sparkline::tests::parse_ref_handles_quotes ... ok
 test sparkline::tests::keeps_other_extensions ... ok
-test sparkline::tests::parses_excel_groups ... ok
+test sparkline::tests::parse_ref_handles_quotes ... ok
 test sparse::tests::computes_declared_area ... ok
-test sparse::tests::parses_cell_refs ... ok
+test sparkline::tests::parses_excel_groups ... ok
 test sparkline::tests::roundtrip_replaces_old_ext ... ok
-test sparse::tests::formula_entities_are_unescaped ... ok
-test sparse::tests::shift_moves_relative_refs_only ... ok
-test sparse::tests::shared_formula_children_are_derived ... ok
-test store::tests::iterates_in_row_col_order ... ok
 test store::tests::cross_page_access ... ok
-test store::tests::set_remove_len ... ok
-test store::tests::sparse_page_does_not_allocate_full_height ... ok
-test style::tests::font_family_mapping ... ok
-test style::tests::date_time_and_currency_placements ... ok
+test sparse::tests::formula_entities_are_unescaped ... ok
+test sparse::tests::shared_formula_children_are_derived ... ok
+test sparse::tests::shift_moves_relative_refs_only ... ok
+test sparse::tests::parses_cell_refs ... ok
+test store::tests::iterates_in_row_col_order ... ok
 test style::tests::font_name_normalized_both_ways ... ok
-test style::tests::four_section_and_accounting_formats ... ok
 test style::tests::number_formats ... ok
+test store::tests::sparse_page_does_not_allocate_full_height ... ok
+test style::tests::date_time_and_currency_placements ... ok
+test style::tests::font_family_mapping ... ok
+test style::tests::four_section_and_accounting_formats ... ok
 test style::tests::scientific_fraction_and_optional_decimals ... ok
-test style::tests::styles_dedup ... ok
+test store::tests::set_remove_len ... ok
 test style::tests::styles_dedup_separates_fonts ... ok
+test style::tests::styles_dedup ... ok
 test style::tests::text_section_and_format_color ... ok
-test subtotal::tests::empty_or_bad_region_does_nothing ... ok
 test subtotal::tests::average_and_count_codes ... ok
-test subtotal::tests::groups_and_inserts_summary_rows ... ok
+test subtotal::tests::empty_or_bad_region_does_nothing ... ok
 test sync::tests::concurrent_same_cell_resolves_deterministically ... ok
-test sync::tests::deletions_sync_as_empty_writes ... ok
+test subtotal::tests::groups_and_inserts_summary_rows ... ok
 test subtotal::tests::unsorted_groups_are_split_like_excel ... ok
+test sync::tests::deletions_sync_as_empty_writes ... ok
 test sync::tests::later_edit_wins_over_earlier ... ok
 test sync::tests::snapshot_brings_new_peer_up_to_date ... ok
 test sync::tests::two_peers_converge ... ok
@@ -827,28 +827,28 @@ test undo::tests::guard_skips_cells_changed_by_others ... ok
 test undo::tests::limit_drops_oldest ... ok
 test undo::tests::new_action_clears_redo ... ok
 test undo::tests::undo_redo_single_cell ... ok
-test vba_src::tests::decodes_multi_chunk_containers ... ok
 test vba_src::tests::decompresses_uncompressed_chunk ... ok
+test vba_src::tests::decodes_multi_chunk_containers ... ok
 test vba_src::tests::rejects_non_cfb ... ok
-test wire::tests::rfc8439_block_vector ... ok
 test wire::tests::base64_round_trip ... ok
+test wire::tests::rfc8439_block_vector ... ok
 test wire::tests::rfc8439_encryption_vector ... ok
-test xlinks::tests::book_name_mapping ... ok
 test wire::tests::session_round_trip_and_tamper ... ok
+test xlinks::tests::book_name_mapping ... ok
 test xlinks::tests::external_ids_in_order ... ok
 test xlinks::tests::finds_books_in_typed_formula ... ok
 test xlinks::tests::joins_package_paths ... ok
 test xlinks::tests::rewrites_sheet_data_only ... ok
-test xlinks::tests::parses_sheet_names_and_cache ... ok
 test xls_formula::tests::absolute_ref_clears_flags ... ok
+test xlinks::tests::parses_sheet_names_and_cache ... ok
 test xls_formula::tests::arithmetic_becomes_rpn ... ok
 test xls_formula::tests::array_constant_fills_extra ... ok
 test xls_formula::tests::cross_sheet_and_cross_book ... ok
 test xls_formula::tests::defined_name_uses_ptgname ... ok
 test xls_formula::tests::fixed_arity_function_uses_ptgfunc ... ok
 test xls_formula::tests::function_uses_verified_index ... ok
-test xls_formula::tests::name_record_layout ... ok
 test xls_formula::tests::future_function_gets_xlfn_name ... ok
+test xls_formula::tests::name_record_layout ... ok
 test xls_formula::tests::refs_carry_relative_flags ... ok
 test xls_layout::tests::reads_colinfo_and_row_per_sheet ... ok
 test xls_style::tests::reads_font_xf_and_cell_style ... ok
@@ -857,25 +857,26 @@ test xlsx::gate_tests::rejects_content_before_the_root_too ... ok
 test xlsx::gate_tests::rejects_empty_multi_root_and_trailing_content ... ok
 test xlsx::gate_tests::text_inside_the_root_is_fine ... ok
 test revision::tests::log_lives_next_to_workbook ... ok
+test backup::tests::keeps_previous_version_before_overwrite ... ok
 test patch::read_prefixed_calc_pr_from_zip ... ok
-test backup::tests::prune_keeps_newest ... ok
-test xls_write::tests::writes_formula_records ... ok
-test xls_write::tests::round_trips_calc_mode_through_xls ... ok
 test xls_write::tests::round_trips_values_and_style_through_xls ... ok
+test protection::tests::sha512_matches_excel_reference ... ok
+test xls_write::tests::round_trips_calc_mode_through_xls ... ok
+test xls_write::tests::writes_formula_records ... ok
 test zhconv::tests::common_words ... ok
 test zhconv::tests::variants_taiwan_and_hongkong ... ok
 test zhconv::tests::unchanged_passes_through ... ok
 test zhconv::tests::mixed_text_keeps_ascii ... ok
+test backup::tests::prune_keeps_newest ... ok
 test revision::tests::append_and_load_last_entries ... ok
-test protection::tests::sha512_matches_excel_reference ... ok
-test xlsx::tests::manual_page_breaks_round_trip ... ok
-test xlsx::tests::roundtrip_save_then_load ... ok
 test xlsx::tests::formulas_keep_their_position_after_roundtrip ... ok
+test xlsx::tests::roundtrip_save_then_load ... ok
+test xlsx::tests::manual_page_breaks_round_trip ... ok
 test xlsx::tests::column_widths_heights_and_hidden_state_survive_save ... ok
+test xlsx::tests::deleted_cells_disappear_after_save ... ok
+test xlsx::tests::preserves_cells_when_saving_over_existing ... ok
 test table::sync_tests::sync_removes_and_reattaches_table_parts ... ok
 test xlsx::tests::table_filter_survives_save_without_duplicate_autofilter ... ok
-test xlsx::tests::preserves_cells_when_saving_over_existing ... ok
-test xlsx::tests::deleted_cells_disappear_after_save ... ok
 test formula::calc_mode_tests::calc_mode_roundtrips_through_xlsx_calc_pr ... ok
 test backup::tests::atomic_save_leaves_history ... ok
 test vba::tests::detects_and_restores_vba ... ok
@@ -885,18 +886,18 @@ test protection::tests::protect_and_verify ... ok
 test xlsx::tests::sheet_protection_survives_save_and_verifies ... ok
 test crypto::tests::encrypted_workbook_survives_save_and_reload ... ok
 
-test result: ok. 264 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.80s
+test result: ok. 265 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.52s
 
      Running tests\add_sheet_save.rs (target\debug\deps\add_sheet_save-9d67688a47e43c1a.exe)
 
 running 5 tests
 test excel_authored_base_keeps_sheets_after_adding_one ... ok
 test adding_a_sheet_in_the_middle_keeps_order_and_content ... ok
-test adding_a_sheet_and_saving_over_the_original_keeps_every_sheet ... ok
 test adding_a_sheet_then_save_atomic_keeps_every_sheet ... ok
 test adding_a_sheet_then_save_as_keeps_every_sheet ... ok
+test adding_a_sheet_and_saving_over_the_original_keeps_every_sheet ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
 
      Running tests\array_formula.rs (target\debug\deps\array_formula-721ed5eb5f4f5997.exe)
 
@@ -909,37 +910,37 @@ test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; fini
      Running tests\array_functions.rs (target\debug\deps\array_functions-65f1c76028b268c5.exe)
 
 running 9 tests
-test let_binds_names ... ok
 test array_result_feeds_scalar_functions ... ok
+test let_binds_names ... ok
 test transpose_and_mmult ... ok
 test spill_blocked_by_existing_data ... ok
 test take_drop_stack ... ok
 test filter_sort_unique ... ok
-test spill_is_cleared_on_recalc ... ok
 test sequence_spills_down_and_right ... ok
+test spill_is_cleared_on_recalc ... ok
 test spills_survive_save_and_reload ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
 
      Running tests\array_shape.rs (target\debug\deps\array_shape-1244433f0b05b7a9.exe)
 
 running 14 tests
 test a_column_array_times_scalar_stays_a_column ... ok
 test unary_and_percent_keep_shape_and_carry_errors_elementwise ... ok
-test filter_picks_the_direction_from_the_condition_grid ... ok
-test incompatible_shapes_are_a_value_error ... ok
-test sumproduct_requires_matching_shapes ... ok
 test filter_rejects_conditions_that_match_neither_axis ... ok
-test a_2x2_array_plus_scalar_keeps_its_shape ... ok
-test unary_minus_applies_to_every_element ... ok
 test comparison_and_concat_keep_the_operand_shape ... ok
-test a_column_plus_row_broadcasts_to_the_full_rectangle ... ok
+test unary_minus_applies_to_every_element ... ok
+test sumproduct_requires_matching_shapes ... ok
 test matching_shapes_multiply_elementwise ... ok
+test a_2x2_array_plus_scalar_keeps_its_shape ... ok
+test a_column_plus_row_broadcasts_to_the_full_rectangle ... ok
+test incompatible_shapes_are_a_value_error ... ok
+test filter_picks_the_direction_from_the_condition_grid ... ok
 test filter_uses_the_condition_shape_not_its_length ... ok
 test spill_anchor_shape_downstream_and_blocking ... ok
 test the_spilled_shape_survives_a_save_and_reopen ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
 
      Running tests\array_structure.rs (target\debug\deps\array_structure-ea0793fba718235d.exe)
 
@@ -950,7 +951,7 @@ test structure_change_outside_dynamic_array_does_not_create_spill_error ... ok
 test deleting_cse_anchor_before_first_recalc_removes_only_derived_tail ... ok
 test insert_delete_rows_columns_move_array_metadata_and_survive_reopen ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
 
      Running tests\backup_order.rs (target\debug\deps\backup_order-4426a55cfa1964dc.exe)
 
@@ -958,21 +959,21 @@ running 2 tests
 test list_and_prune_order_same_day_times_and_numeric_same_second_sequences ... ok
 test repeated_backups_keep_latest_content_after_pruning_sequence_holes ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
 
      Running tests\c14_guard.rs (target\debug\deps\c14_guard-703e915c4dd78477.exe)
 
 running 16 tests
 test real_excel_biff_uses_the_calamine_branch_and_never_scans_ooxml ... ok
 test healthy_biff_xls_has_no_fatal_diag_and_can_be_saved ... ok
+test side_scan_panic_is_fatal_and_source_bytes_are_untouched ... ok
+test drawing_pointing_at_a_missing_chart_is_reported ... ok
 test drawing_without_rels_is_reported ... ok
 test truncated_chart_xml_after_recognized_type_is_reported ... ok
 test drawing_rid_missing_from_rels_is_reported ... ok
-test truncated_sparse_sheet_is_fatal_not_partial ... ok
-test drawing_pointing_at_a_missing_chart_is_reported ... ok
-test side_scan_panic_is_fatal_and_source_bytes_are_untouched ... ok
-test core_save_refuses_to_overwrite_a_fatally_damaged_source ... ok
 test sparse_sheet_with_missing_shared_strings_is_fatal ... ok
+test truncated_sparse_sheet_is_fatal_not_partial ... ok
+test core_save_refuses_to_overwrite_a_fatally_damaged_source ... ok
 test editing_an_existing_external_link_persists_the_new_target ... ok
 test rescue_copy_keeps_formats_merges_and_notes_of_the_healthy_sheet ... ok
 test clearing_notes_keeps_rel_xml_well_formed_when_comments_rels_is_first ... ok
@@ -980,7 +981,7 @@ test clearing_notes_keeps_other_relationships_when_comments_rels_is_not_first ..
 test deleting_the_last_note_removes_it_from_the_saved_file ... ok
 test rescue_copy_of_an_encrypted_damaged_source_does_not_reuse_the_bad_package ... ok
 
-test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.26s
 
      Running tests\chart_insert.rs (target\debug\deps\chart_insert-bc9c9d4927cdb002.exe)
 
@@ -1040,34 +1041,34 @@ test result: ok. 1 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; fini
 running 10 tests
 test strict_parser_rejects_unclosed_and_trailing_junk_quotes ... ok
 test decode_failure_keeps_previous_data ... ok
-test explicit_encoding_is_never_silently_replaced_by_gb18030 ... ok
-test text_columns_keep_leading_zeros_and_long_accounts ... ok
-test newline_inside_quotes_is_one_field_for_import_and_refresh ... ok
-test shrinking_refresh_clears_only_its_own_old_region ... ok
 test bad_quote_on_refresh_keeps_previous_cells_untouched ... ok
+test explicit_encoding_is_never_silently_replaced_by_gb18030 ... ok
 test short_row_refresh_matches_first_import_for_the_same_rectangle ... ok
+test newline_inside_quotes_is_one_field_for_import_and_refresh ... ok
+test text_columns_keep_leading_zeros_and_long_accounts ... ok
+test shrinking_refresh_clears_only_its_own_old_region ... ok
 test decodes_bom_utf16_and_gb18030 ... ok
 test csv_options_survive_save_and_reload ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
 
      Running tests\custom_props.rs (target\debug\deps\custom_props-96ed99a7f55480be.exe)
 
 running 12 tests
 test excel_roundtrip_keeps_custom_props ... ignored, 需要先由 Excel/WPS 另存出文件（COM 驱动）
 test make_c08_fixture ... ignored, 生成 Excel/WPS 自定义属性对拍夹具（人工驱动的实机验收用）
+test repeated_saves_do_not_duplicate_or_drift ... ok
 test single_quoted_namespace_declarations_are_not_duplicated ... ok
 test names_and_values_with_markup_are_escaped ... ok
-test third_party_properties_survive_writing_sources ... ok
 test prefixed_properties_single_quotes_and_alt_type_prefix_survive ... ok
-test repeated_saves_do_not_duplicate_or_drift ... ok
+test third_party_properties_survive_writing_sources ... ok
 test base_argument_reads_props_from_the_original_file ... ok
 test sources_with_arbitrary_labels_land_in_the_app_namespace ... ok
 test deleting_the_last_source_removes_only_app_metadata ... ok
 test refreshing_a_csv_source_keeps_third_party_props ... ok
 test save_path_keeps_third_party_props_end_to_end ... ok
 
-test result: ok. 10 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 10 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.24s
 
      Running tests\data_validation.rs (target\debug\deps\data_validation-b90b56f9ece02c03.exe)
 
@@ -1085,26 +1086,26 @@ test excel_saved_1900_file_stays_1900 ... ignored, 需要先由 Excel/WPS 另存
 test excel_saved_file_keeps_the_date_system ... ignored, 需要先由 Excel/WPS 另存出文件（COM 驱动）
 test make_c04_export_fixture ... ignored, 生成 C04 另存新路径的夹具（Excel/WPS 实机打开用）
 test make_excel_fixtures ... ignored, 生成 Excel/WPS 对拍夹具（人工驱动的实机验收用）
-test today_is_offset_by_1462_in_the_1904_system ... ok
 test chart_category_axis_uses_the_workbook_date_system ... ok
-test the_same_calendar_date_gets_two_serials_that_differ_by_1462 ... ok
+test today_is_offset_by_1462_in_the_1904_system ... ok
 test both_systems_keep_their_own_leap_year_quirks ... ok
+test the_same_calendar_date_gets_two_serials_that_differ_by_1462 ... ok
 test date_functions_follow_the_workbook_system ... ok
 test xls_datetime_mode_survives_a_roundtrip ... ok
 test saved_styles_never_emit_zero_font_size_or_val_none ... ok
-test a_1900_workbook_does_not_gain_the_flag ... ok
-test a_1904_file_is_read_on_its_own_basis ... ok
 test saving_a_1904_workbook_writes_the_flag_and_reopens_without_drift ... ok
+test a_1904_file_is_read_on_its_own_basis ... ok
+test a_1900_workbook_does_not_gain_the_flag ... ok
 
-test result: ok. 10 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 10 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
      Running tests\date_system_shared.rs (target\debug\deps\date_system_shared-58d2f6c8a639f639.exe)
 
 running 8 tests
 test data_validation_date_bounds_use_the_workbook_basis ... ok
 test xmlss_datetime_is_rebased_on_the_target_workbook ... ok
-test xmlss_datetime_keeps_the_time_of_day_in_both_systems ... ok
 test number_formatting_follows_the_basis ... ok
+test xmlss_datetime_keeps_the_time_of_day_in_both_systems ... ok
 test chart_values_keep_raw_numbers_when_cells_are_formatted ... ok
 test conditional_format_date_literal_uses_the_workbook_basis ... ok
 test pivot_year_grouping_uses_the_workbook_basis ... ok
@@ -1131,7 +1132,7 @@ test xlsx_writes_errors_as_type_e_not_text ... ok
 test external_link_cache_keeps_error_type ... ok
 test xlsx_roundtrip_keeps_error_type_after_a_second_save ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
 
      Running tests\error_values.rs (target\debug\deps\error_values-02154211375a311e.exe)
 
@@ -1141,20 +1142,20 @@ test a_computed_error_is_an_error_value_not_text ... ok
 test iferror_catches_a_real_error ... ok
 test typed_text_that_looks_like_an_error_stays_text ... ok
 test sum_propagates_a_real_error_instead_of_skipping_it ... ok
-test full_recalc_keeps_the_error_type ... ok
 test all_traditional_errors_keep_their_kind ... ok
+test full_recalc_keeps_the_error_type ... ok
 test save_and_reload_keep_the_error_type ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
      Running tests\error_wire_undo.rs (target\debug\deps\error_wire_undo-392f057b87b54dcb.exe)
 
 running 6 tests
-test last_writer_wins_between_an_error_and_a_value ... ok
 test sheet_snapshot_roundtrips_error_cells ... ok
+test last_writer_wins_between_an_error_and_a_value ... ok
 test undo_and_redo_restore_the_error_cell_verbatim ... ok
-test text_that_looks_like_an_error_stays_text_on_the_wire ... ok
 test an_error_op_survives_json_and_applies_as_an_error ... ok
+test text_that_looks_like_an_error_stays_text_on_the_wire ... ok
 test the_network_envelope_carries_the_error_type ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -1178,10 +1179,10 @@ running 5 tests
 test reads_links_and_evaluates_from_cache ... ok
 test missing_source_keeps_file_cache ... ok
 test typed_formula_creates_link_and_parts ... ok
-test refresh_reads_source_and_writes_cache_back ... ok
 test untouched_file_keeps_link_parts ... ok
+test refresh_reads_source_and_writes_cache_back ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
 
      Running tests\font_style.rs (target\debug\deps\font_style-ba9ceffb2bce28a8.exe)
 
@@ -1193,7 +1194,7 @@ test unknown_font_is_kept_not_rewritten ... ok
 test font_survives_save_close_reopen ... ok
 test changing_bold_keeps_font ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running tests\format_edit.rs (target\debug\deps\format_edit-1828ddea6a515e9a.exe)
 
@@ -1207,15 +1208,15 @@ test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
      Running tests\formula_batch4.rs (target\debug\deps\formula_batch4-2a704f6293886616.exe)
 
 running 14 tests
-test financial_extras ... ok
 test reference_metadata ... ok
+test financial_extras ... ok
+test unit_conversion ... ok
+test reference_functions ... ok
 test hypothesis_tests ... ok
 test percentile_family ... ok
-test reference_functions ... ok
-test aggregate_and_text_arrays ... ok
-test lambda_family ... ok
 test regression_family ... ok
-test unit_conversion ... ok
+test lambda_family ... ok
+test aggregate_and_text_arrays ... ok
 test math_text_date_extras ... ok
 test bessel_and_odd_bonds ... ok
 test lookup_fast_path_matches_generic ... ok
@@ -1227,14 +1228,14 @@ test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
      Running tests\formula_extra.rs (target\debug\deps\formula_extra-213a4aea857353f0.exe)
 
 running 8 tests
-test normal_distribution ... ok
 test gamma_beta_and_conf ... ok
-test discrete_distributions ... ok
 test t_chisq_f_distributions ... ok
+test discrete_distributions ... ok
+test normal_distribution ... ok
+test engineering ... ok
 test financial_advanced ... ok
 test misc_math_and_text ... ok
 test database_functions ... ok
-test engineering ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -1242,40 +1243,40 @@ test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 14 tests
 test function_coverage_is_reported ... ok
-test arithmetic_and_precedence ... ok
 test financial_functions ... ok
-test errors_propagate ... ok
-test circular_reference_is_caught ... ok
-test cross_sheet_reference ... ok
 test comparisons_and_logic ... ok
+test errors_propagate ... ok
+test arithmetic_and_precedence ... ok
+test cross_sheet_reference ... ok
 test recalc_chain_in_workbook ... ok
 test math_and_rounding ... ok
 test date_functions ... ok
-test lookup_functions ... ok
-test conditional_aggregates ... ok
+test circular_reference_is_caught ... ok
 test text_functions ... ok
+test conditional_aggregates ... ok
 test ranges_and_aggregates ... ok
+test lookup_functions ... ok
 
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests\formula_strings.rs (target\debug\deps\formula_strings-d288bdfa45f8a55d.exe)
 
 running 13 tests
-test whole_column_reference_inside_a_string_is_not_expanded ... ok
 test escaped_quotes_keep_the_string_intact ... ok
 test xlfn_prefix_inside_a_string_is_not_stripped ... ok
+test whole_column_reference_inside_a_string_is_not_expanded ... ok
 test real_function_prefixes_are_still_normalized ... ok
-test single_quoted_sheet_name_is_not_mistaken_for_a_table ... ok
-test evaluated_strings_are_returned_verbatim ... ok
-test structured_reference_inside_a_string_is_not_expanded ... ok
-test prefix_inside_a_legal_name_is_not_stripped ... ok
 test numbers_in_strings_are_not_mistaken_for_references ... ok
+test evaluated_strings_are_returned_verbatim ... ok
+test single_quoted_sheet_name_is_not_mistaken_for_a_table ... ok
+test prefix_inside_a_legal_name_is_not_stripped ... ok
+test structured_reference_inside_a_string_is_not_expanded ... ok
 test quoted_sheet_name_reference_escapes_and_resolves ... ok
 test real_structured_reference_still_expands_and_calculates ... ok
 test xlookup_with_prefix_really_calculates ... ok
 test input_save_load_copy_keep_the_formula_text ... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
 
      Running tests\freeze.rs (target\debug\deps\freeze-f80cebeeae068dad.exe)
 
@@ -1301,8 +1302,8 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 5 tests
 test bare_lambda_displays_as_error ... ok
 test missing_argument_is_omitted ... ok
-test lambda_still_works_with_map_and_reduce ... ok
 test nested_lambdas ... ok
+test lambda_still_works_with_map_and_reduce ... ok
 test let_binds_lambda_and_calls_it ... ok
 
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -1310,26 +1311,26 @@ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests\load_diag.rs (target\debug\deps\load_diag-994ed3695de75e7d.exe)
 
 running 6 tests
+test broken_styles_are_reported_as_fatal ... ok
 test load_wrapper_still_returns_workbook_for_healthy_files ... ok
 test healthy_workbook_reports_nothing ... ok
-test broken_sheet_xml_is_fatal_not_silently_empty ... ok
-test missing_shared_strings_is_reported ... ok
 test missing_sheet_part_is_reported ... ok
-test broken_styles_are_reported_as_fatal ... ok
+test missing_shared_strings_is_reported ... ok
+test broken_sheet_xml_is_fatal_not_silently_empty ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
 
      Running tests\move_blocks.rs (target\debug\deps\move_blocks-9d95af0c79938bd7.exe)
 
 running 6 tests
 test move_to_same_place_is_noop ... ok
-test moves_row_block_down ... ok
-test moves_col_block ... ok
-test moves_two_rows_at_once ... ok
 test moves_row_block_up_keeps_height_and_note ... ok
+test moves_two_rows_at_once ... ok
+test moves_col_block ... ok
+test moves_row_block_down ... ok
 test removed_cell_stays_empty_after_save ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running tests\page_setup.rs (target\debug\deps\page_setup-7de0ff0702fc9444.exe)
 
@@ -1353,17 +1354,17 @@ running 12 tests
 test backup_failure_preserves_original_and_reports_error ... ok
 test shifted_styles_and_notes_use_new_coordinates_after_reopen ... ok
 test changed_named_ranges_preserve_unmodeled_workbook_metadata ... ok
-test rewritten_cross_sheet_reference_is_not_restored_from_old_package ... ok
 test reorder_retains_each_sheets_comment_relationships ... ok
-test swapped_names_and_new_sheet_do_not_reuse_another_sheets_part ... ok
-test replace_all_original_sheets_and_insert_new_sheet_in_middle ... ok
+test rewritten_cross_sheet_reference_is_not_restored_from_old_package ... ok
 test removing_all_user_names_keeps_builtin_print_names ... ok
+test swapped_names_and_new_sheet_do_not_reuse_another_sheets_part ... ok
 test rename_delete_reorder_preserve_sheet_identity_and_extensions ... ok
+test replace_all_original_sheets_and_insert_new_sheet_in_middle ... ok
 test renamed_print_names_and_existing_pivot_source_follow_sheet_identity ... ok
 test new_sheet_reusing_a_removed_or_renamed_name_has_no_old_content ... ok
 test structural_cells_survive_save_reopen_and_repeated_save ... ok
 
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
 
      Running tests\pivot_attachments.rs (target\debug\deps\pivot_attachments-cd9736a44795e0c1.exe)
 
@@ -1375,7 +1376,7 @@ test sparse_parts_and_unrelated_relationship_ids_are_never_overwritten ... ok
 test imported_cache_ids_part_numbers_and_table_names_are_independent ... ok
 test attachments_remain_discoverable_after_reopen_save_as_and_another_attach ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
 
      Running tests\pivot_file.rs (target\debug\deps\pivot_file-23122d0266bc08ff.exe)
 
@@ -1392,34 +1393,34 @@ test save_attaches_pending_pivot ... ignored, requires optional synthetic fixtur
 test writes_real_pivot_table ... ignored, requires optional synthetic fixtures under tests/test-work
 test pivot_parts_are_well_formed ... ok
 
-test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.11s
 
      Running tests\pivot_save_lifecycle.rs (target\debug\deps\pivot_save_lifecycle-6cd6ff3ebd69cd53.exe)
 
 running 9 tests
 test failing_second_attachment_leaves_atomic_target_and_live_model_unchanged ... ok
-test older_save_snapshot_cannot_consume_newer_pending_specs ... ok
 test cleanup_preserves_record_parts_shared_with_imported_caches ... ok
-test unmarked_cache_added_outside_pending_model_is_preserved ... ok
-test pending_created_after_old_structural_journal_uses_current_absolute_source ... ok
+test older_save_snapshot_cannot_consume_newer_pending_specs ... ok
 test direct_save_and_atomic_save_are_idempotent_without_acknowledgement ... ok
-test imported_and_multiple_new_pivots_keep_independent_caches_and_relationships ... ok
+test pending_created_after_old_structural_journal_uses_current_absolute_source ... ok
+test unmarked_cache_added_outside_pending_model_is_preserved ... ok
 test rename_reorder_and_delete_remove_only_owned_pivot_attachments ... ok
+test imported_and_multiple_new_pivots_keep_independent_caches_and_relationships ... ok
 test first_and_later_pivots_remain_registered_after_repeated_save_and_save_as ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
 
      Running tests\pivot_structure.rs (target\debug\deps\pivot_structure-b8b14d8f8ba61fe1.exe)
 
 running 6 tests
-test inserting_columns_moves_fields_and_output_and_undo_restores_them ... ok
-test deleting_an_unused_source_column_preserves_field_identity_and_output ... ok
 test row_edits_move_output_and_source_independently_with_undo ... ok
+test deleting_an_unused_source_column_preserves_field_identity_and_output ... ok
+test inserting_columns_moves_fields_and_output_and_undo_restores_them ... ok
 test deleting_an_essential_field_or_complete_region_removes_only_that_attachment_and_undo_restores_it ... ok
 test deleting_a_value_field_saves_without_attachment_and_undo_restores_it_on_disk ... ok
 test saved_pending_pivot_moves_source_fields_and_output_then_undo_restores_both ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
 
      Running tests\recalc_correctness.rs (target\debug\deps\recalc_correctness-bd5da0b90ecaa057.exe)
 
@@ -1430,10 +1431,10 @@ test typed_and_pasted_formulas_update_their_own_cache_and_dependents ... ok
 test replacing_a_spilled_cell_keeps_the_user_input ... ok
 test structured_references_share_evaluation_normalization ... ok
 test divergent_spill_cycle_returns_an_error_instead_of_partial_numbers ... ok
+test whole_columns_names_and_dynamic_references_follow_edits ... ok
 test blocked_array_retries_when_obstruction_is_cleared ... ok
 test spill_dependents_and_multiple_array_stages_stabilize ... ok
 test incremental_array_creation_shrink_and_replacement_clear_old_spills ... ok
-test whole_columns_names_and_dynamic_references_follow_edits ... ok
 test wide_ranges_and_long_dependency_chains_are_not_truncated ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
@@ -1441,13 +1442,13 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
      Running tests\refs_copy.rs (target\debug\deps\refs_copy-75c6869aadc6b5b0.exe)
 
 running 7 tests
-test deleting_entire_first_range_returns_ref_but_partial_ranges_shrink ... ok
-test copy_whole_axes_preserves_locks_and_ignores_other_axis_offset ... ok
 test copy_leaves_strings_functions_names_and_table_columns_unchanged ... ok
 test copy_preserves_each_absolute_axis ... ok
-test copy_moves_qualified_relative_refs_without_changing_sheet_names ... ok
-test copying_past_grid_edges_returns_ref_only_for_unlocked_axes ... ok
 test structural_edits_still_move_absolute_refs_only_on_target_sheet ... ok
+test copy_whole_axes_preserves_locks_and_ignores_other_axis_offset ... ok
+test copying_past_grid_edges_returns_ref_only_for_unlocked_axes ... ok
+test copy_moves_qualified_relative_refs_without_changing_sheet_names ... ok
+test deleting_entire_first_range_returns_ref_but_partial_ranges_shrink ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -1467,25 +1468,25 @@ test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fini
 running 1 test
 test roundtrip_keeps_everything ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
 
      Running tests\save_failure_injection.rs (target\debug\deps\save_failure_injection-fa2caed05cf549c5.exe)
 
 running 12 tests
 test child_save_worker ... ignored, helper process for killed_during_save_leaves_the_original_intact
-test encrypted_workbook_passes_the_gate_even_though_it_is_cfb ... ok
-test injected_chart_failures_abort_the_save ... ok
-test injected_failures_in_conditional_steps_abort_the_save ... ok
 test corrupted_temp_package_is_never_committed ... ok
-test injected_vba_restore_failure_aborts_saving_a_macro_workbook ... ok
+test injected_failures_in_conditional_steps_abort_the_save ... ok
+test occupancy::exclusive_handle_blocks_replacement_and_retry_succeeds ... ok
+test encrypted_workbook_passes_the_gate_even_though_it_is_cfb ... ok
 test injected_step_failures_do_not_report_success ... ok
+test injected_vba_restore_failure_aborts_saving_a_macro_workbook ... ok
 test integrity_gate_accepts_every_normal_save ... ok
 test killed_during_save_leaves_the_original_intact ... ok
+test injected_chart_failures_abort_the_save ... ok
 test readonly_target_is_not_silently_replaced ... ok
-test occupancy::exclusive_handle_blocks_replacement_and_retry_succeeds ... ok
 test relationship_targets_are_resolved_the_xml_way ... ok
 
-test result: ok. 11 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.21s
+test result: ok. 11 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.28s
 
      Running tests\save_replay.rs (target\debug\deps\save_replay-8489617a836e1577.exe)
 
@@ -1494,30 +1495,30 @@ test new_default_and_duplicated_sheets_have_distinct_identities ... ok
 test receipt_matches_identity_after_rename_reorder_delete_and_edits ... ok
 test first_save_receipt_preserves_a_picture_inserted_before_later_saves ... ok
 test newly_created_pivot_sources_do_not_drift_across_repeated_saves ... ok
-test sheet_insertions_keep_print_scopes_and_workbook_extensions ... ok
 test pivot_shifts_replay_from_imported_base_across_save_save_as_and_undo ... ok
+test sheet_insertions_keep_print_scopes_and_workbook_extensions ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
 
      Running tests\save_roundtrip.rs (target\debug\deps\save_roundtrip-c228d084de12260c.exe)
 
 running 1 test
 test roundtrip_all_sheets ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
 
      Running tests\search_matches.rs (target\debug\deps\search_matches-61880a8089c80c94.exe)
 
 running 7 tests
 test case_insensitive_replace_handles_unicode_length_change ... ok
 test replace_in_text_keeps_surrounding_text_and_case ... ok
-test formula_mode_matches_formula_text_value_mode_matches_display ... ok
-test value_mode_matches_formatted_display_text ... ok
-test column_order_and_selection_rect_filter ... ok
 test whole_cell_does_not_match_a_longer_text ... ok
+test formula_mode_matches_formula_text_value_mode_matches_display ... ok
+test column_order_and_selection_rect_filter ... ok
+test value_mode_matches_formatted_display_text ... ok
 test sparse_search_reaches_a300_and_the_last_cell_then_wraps ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
 
      Running tests\sheet_hidden.rs (target\debug\deps\sheet_hidden-6f5aac3e0fd3b6c9.exe)
 
@@ -1525,7 +1526,7 @@ running 2 tests
 test refuses_to_hide_every_sheet ... ok
 test hides_and_restores_a_sheet ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
 
      Running tests\sheet_operations.rs (target\debug\deps\sheet_operations-2fda0f543811a5f2.exe)
 
@@ -1538,7 +1539,7 @@ test deleted_sheet_remaps_surviving_names_before_structure_edits_and_save ... ok
 test renamed_formula_evaluates_and_survives_repeated_save ... ok
 test moved_local_names_follow_their_sheet_through_structure_edits_and_save ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
 
      Running tests\sort_filter.rs (target\debug\deps\sort_filter-ebe0829c3ba00ac6.exe)
 
@@ -1551,53 +1552,69 @@ test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; fini
      Running tests\sort_formula_relocation.rs (target\debug\deps\sort_formula_relocation-76164037a6e53258.exe)
 
 running 4 tests
-test both_sort_paths_leave_array_anchors_and_spill_ownership_intact ... ok
 test multikey_tie_break_moves_each_formula_by_its_actual_source_row ... ok
 test sorting_moves_sheet_qualified_relative_rows_but_keeps_absolute_rows ... ok
+test both_sort_paths_leave_array_anchors_and_spill_ownership_intact ... ok
 test quick_and_multikey_sorts_move_relative_refs_and_preserve_absolute_refs_on_save ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
 
      Running tests\sparklines.rs (target\debug\deps\sparklines-37b202b1d27cad6f.exe)
 
 running 5 tests
+test structural_insert_moves_anchor_and_source ... ok
 test reads_excel_sparklines ... ok
 test delete_anchor_row_drops_the_sparkline ... ok
-test structural_insert_moves_anchor_and_source ... ok
 test clearing_all_removes_the_extension ... ok
 test edit_and_save_roundtrip ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests\spill_refs.rs (target\debug\deps\spill_refs-cb9e7c4ee88a03ef.exe)
+
+running 7 tests
+test spill_ref_moves_on_row_insert_and_dependency_is_dynamic ... ok
+test spill_on_non_array_is_ref_error ... ok
+test spill_inside_byrow_rejects_scalars_and_propagates_errors ... ok
+test spill_external_book_does_not_fall_back_to_local_same_named_sheet ... ok
+test cross_sheet_spill_uses_recorded_anchor_shape_not_tail_guess ... ok
+test spill_reference_tracks_anchor_array_and_shrinks ... ok
+test cross_sheet_spill_is_available_when_only_dependent_sheet_is_recalculated ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests\structural_edit.rs (target\debug\deps\structural_edit-232b1f9a6e3f66cf.exe)
 
 running 9 tests
-test structure_only_leaves_cells_alone ... ok
-test row_heights_shift ... ok
-test insert_row_shifts_down ... ok
-test delete_turns_reference_into_ref_error ... ok
 test delete_row_removes_and_pulls_up ... ok
 test freeze_and_notes_follow_rows ... ok
-test cross_sheet_references_follow ... ok
+test delete_turns_reference_into_ref_error ... ok
 test insert_and_delete_cols ... ok
 test formulas_are_rewritten_on_insert ... ok
+test cross_sheet_references_follow ... ok
+test insert_row_shifts_down ... ok
+test row_heights_shift ... ok
+test structure_only_leaves_cells_alone ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests\structured_references.rs (target\debug\deps\structured_references-7c14bfb8745747b7.exe)
 
-running 9 tests
+running 12 tests
 test structured_reference_does_not_change_strings_or_sheet_refs ... ok
 test cross_sheet_structured_reference_is_qualified ... ok
 test bare_table_name_at_formula_start_expands ... ok
 test this_row_expands_to_current_formula_row ... ok
 test special_column_names_are_not_split_on_space_comma_or_percent ... ok
 test structured_areas_headers_totals_all_and_column_range ... ok
+test bare_current_row_picks_table_by_formula_column_when_row_has_two_tables ... ok
+test original_chinese_bare_current_row_formula_evaluates_two_rows ... ok
 test current_row_really_calculates_per_row ... ok
+test bare_current_row_formula_uses_formula_cell_table ... ok
 test audit_two_row_samples_calculate_as_excel ... ok
 test structured_areas_really_calculate ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
      Running tests\style_merge.rs (target\debug\deps\style_merge-587c7974e131448b.exe)
 
@@ -1606,6 +1623,19 @@ test style_and_merge_survive_save ... ignored, requires optional synthetic fixtu
 test number_format_display ... ok
 
 test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\table_calculated.rs (target\debug\deps\table_calculated-c40dafdec8acaeae.exe)
+
+running 7 tests
+test rename_table_column_does_not_panic_on_chinese_formula_slices ... ok
+test rename_table_column_updates_definition_and_formulas_and_preserves_ids ... ok
+test calculated_column_fill_copies_relative_formulas_to_other_rows ... ok
+test inserting_a_row_inside_a_table_expands_it_and_fills_calculated_column ... ok
+test converting_one_table_leaves_other_tables_structured_refs_untouched ... ok
+test converting_table_to_range_keeps_formulas_usable_after_reopen ... ok
+test renamed_table_column_and_ids_survive_save_and_reload ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 
      Running tests\table_object.rs (target\debug\deps\table_object-f4d68d0ba7663280.exe)
 
@@ -1625,14 +1655,14 @@ test new_workbook_gets_drawing_part ... ok
 test deleting_all_textboxes_removes_the_shape ... ok
 test editing_moves_and_rewrites_in_place ... ok
 
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 
      Running tests\undo_scope.rs (target\debug\deps\undo_scope-4c3b94a4e3262b46.exe)
 
 running 4 tests
+test switching_site_clears_history ... ok
 test collaboration_guard_skips_cells_changed_by_others ... ok
 test foreign_action_is_not_undone ... ok
-test switching_site_clears_history ... ok
 test my_action_is_undoable ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -1641,21 +1671,21 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 7 tests
 test structure_undo_restores_axes_notes_arrays_blank_cell_styles_and_validation ... ok
-test slice_only_undo_does_not_silently_consume_a_workbook_transaction ... ok
 test structure_undo_restores_foreign_reference_metadata_and_pending_pivot_specifications ... ok
+test slice_only_undo_does_not_silently_consume_a_workbook_transaction ... ok
 test structure_undo_restores_foreign_formulas_and_names_without_replacing_other_cells ... ok
 test undo_after_save_keeps_part_identity_and_removes_obsolete_coordinates_on_disk ... ok
-test saved_chart_references_follow_undo_and_redo_on_another_sheet ... ok
 test saved_pivot_delete_undo_and_redo_restore_exact_source_bounds ... ok
+test saved_chart_references_follow_undo_and_redo_on_another_sheet ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
 
      Running tests\vba_real.rs (target\debug\deps\vba_real-de6a81a89224236f.exe)
 
 running 3 tests
 test all_modules_decode ... ok
-test reads_real_vba_project ... ok
 test real_module_source_is_exact ... ok
+test reads_real_vba_project ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -1670,26 +1700,39 @@ test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
      Running tests\whole_col.rs (target\debug\deps\whole_col-e15ce65b79a3e6c2.exe)
 
 running 2 tests
-test vlookup_over_whole_columns ... ok
 test sum_over_whole_columns ... ok
+test vlookup_over_whole_columns ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\whole_row_refs.rs (target\debug\deps\whole_row_refs-723c0e04fe4affc5.exe)
+
+running 7 tests
+test whole_row_copy_and_cf_shift_keep_whole_row_semantics ... ok
+test whole_row_inside_structured_reference_is_not_rewritten ... ok
+test whole_row_reference_is_preserved_for_copy_and_edit_semantics ... ok
+test whole_row_is_a_dependency_and_moves_on_row_insert ... ok
+test whole_row_sum_reads_only_used_range_not_all_16384_columns ... ok
+test whole_row_sum_uses_used_range_and_is_sheet_scoped ... ok
+test whole_row_formula_survives_actual_save_and_reload ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 
      Running tests\xls_formula_cache.rs (target\debug\deps\xls_formula_cache-411d304d932909e2.exe)
 
 running 10 tests
 test a_plain_number_whose_low_word_is_ffff_survives ... ok
-test a_string_result_is_read_from_the_following_string_record ... ok
 test special_results_use_the_high_word_marker ... ok
+test a_string_result_is_read_from_the_following_string_record ... ok
 test requirement_three_stage_case_stays_div0 ... ok
 test seven_errors_are_typed_after_a_full_recalc ... ok
 test a_blocked_spill_reports_spill_and_recovers_after_the_blocker_is_removed ... ok
-test a_local_recalc_does_not_touch_an_unrelated_cached_cell ... ok
 test fixing_the_error_source_clears_dependents_incrementally ... ok
+test a_local_recalc_does_not_touch_an_unrelated_cached_cell ... ok
 test a_local_recalc_matches_a_full_recalc_over_the_whole_book ... ok
 test our_own_xls_roundtrip_covers_every_cached_type ... ok
 
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
    Doc-tests sheetcore
 warning: unnecessary parentheses around assigned value

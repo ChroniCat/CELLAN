@@ -1,4 +1,5 @@
 warning: app@0.1.0: 已把 app.ico 打进 exe（C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\rc.exe）
+   Compiling sheetcore v0.1.0 (F:\finance-native-sheets-ready\crates\core)
 warning: unused import: `num`
  --> crates\core\src\formula\array.rs:3:33
   |
@@ -226,9 +227,9 @@ warning: unused variable: `err`
      |             ^^^ help: if this is intentional, prefix it with an underscore: `_err`
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1010:14
+    --> crates\core\src\formula\mod.rs:1082:14
      |
-1010 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+1082 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
      |              ----^^
      |              |
      |              help: remove this `mut`
@@ -236,37 +237,37 @@ warning: variable does not need to be mutable
      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1010:22
+    --> crates\core\src\formula\mod.rs:1082:22
      |
-1010 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+1082 |         let (mut r1, mut c1) = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
      |                      ----^^
      |                      |
      |                      help: remove this `mut`
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:1775:29
+    --> crates\core\src\formula\mod.rs:1886:29
      |
-1775 |                         let mut out = match name.as_str() {
+1886 |                         let mut out = match name.as_str() {
      |                             ----^^^
      |                             |
      |                             help: remove this `mut`
 
 warning: value assigned to `t_phase` is never read
-    --> crates\core\src\formula\mod.rs:2550:17
+    --> crates\core\src\formula\mod.rs:2691:17
      |
-2550 |                 t_phase = std::time::Instant::now();
+2691 |                 t_phase = std::time::Instant::now();
      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ...
-2687 |     mark!("结束");
+2828 |     mark!("结束");
      |     ------------- in this macro invocation
      |
      = help: maybe it is overwritten before being read?
      = note: this warning originates in the macro `mark` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 warning: variable does not need to be mutable
-    --> crates\core\src\formula\mod.rs:2734:9
+    --> crates\core\src\formula\mod.rs:2891:9
      |
-2734 |     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
+2891 |     let mut seeds: Vec<deps::CellKey> = wb.sheets[sheet]
      |         ----^^^^^
      |         |
      |         help: remove this `mut`
@@ -472,6 +473,7 @@ warning: constant `STYLE` is never used
    |       ^^^^^
 
 warning: `sheetcore` (lib) generated 67 warnings (run `cargo fix --lib -p sheetcore` to apply 24 suggestions)
+   Compiling app v0.1.0 (F:\finance-native-sheets-ready\crates\app)
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
    --> crates\app\src\files.rs:704:21
     |
@@ -977,860 +979,860 @@ warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisf
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-    --> crates\app\src\main.rs:8553:51
+    --> crates\app\src\main.rs:8554:51
      |
-8553 | ...                   egui::Stroke::new(1.0, Color32::from_rgb(190, 190, 190)),
+8554 | ...                   egui::Stroke::new(1.0, Color32::from_rgb(190, 190, 190)),
      |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
      |
      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
      = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: use of deprecated associated function `eframe::egui::Frame::none`: Use `Frame::NONE` or `Frame::new()` instead.
-     --> crates\app\src\main.rs:11915:38
+     --> crates\app\src\main.rs:11916:38
       |
-11915 |                         egui::Frame::none()
+11916 |                         egui::Frame::none()
       |                                      ^^^^
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:11876:41
+     --> crates\app\src\main.rs:11877:41
       |
-11876 |                     .stroke(Stroke::new(1.0, ui_kit::BORDER))
+11877 |                     .stroke(Stroke::new(1.0, ui_kit::BORDER))
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:11900:46
+     --> crates\app\src\main.rs:11901:46
       |
-11900 |                         let st = Stroke::new(1.1, ui_kit::TEXT);
+11901 |                         let st = Stroke::new(1.1, ui_kit::TEXT);
       |                                              ^^^ help: explicitly specify the type as `f32`: `1.1_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12296:51
+     --> crates\app\src\main.rs:12297:51
       |
-12296 | ...                   egui::Stroke::new(1.0, ui_kit::BORDER),
+12297 | ...                   egui::Stroke::new(1.0, ui_kit::BORDER),
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12303:55
+     --> crates\app\src\main.rs:12304:55
       |
-12303 | ...                   egui::Stroke::new(2.0, ui_kit::ACCENT),
+12304 | ...                   egui::Stroke::new(2.0, ui_kit::ACCENT),
       |                                         ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12391:43
+     --> crates\app\src\main.rs:12392:43
       |
-12391 |                         egui::Stroke::new(1.0, ui_kit::BORDER),
+12392 |                         egui::Stroke::new(1.0, ui_kit::BORDER),
       |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12435:51
+     --> crates\app\src\main.rs:12436:51
       |
-12435 | ...                   egui::Stroke::new(2.0, ui_kit::ACCENT),
+12436 | ...                   egui::Stroke::new(2.0, ui_kit::ACCENT),
       |                                         ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12684:44
+     --> crates\app\src\main.rs:12685:44
       |
-12684 |                 let st = egui::Stroke::new(1.4, ui_kit::TEXT);
+12685 |                 let st = egui::Stroke::new(1.4, ui_kit::TEXT);
       |                                            ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:12804:49
+     --> crates\app\src\main.rs:12805:49
       |
-12804 | ...                   Stroke::new(1.0, ui_kit::BORDER),
+12805 | ...                   Stroke::new(1.0, ui_kit::BORDER),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13859:41
+     --> crates\app\src\main.rs:13913:41
       |
-13859 | ...                   Stroke::new(1.0, color),
+13913 | ...                   Stroke::new(1.0, color),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13866:41
+     --> crates\app\src\main.rs:13920:41
       |
-13866 | ...                   Stroke::new(1.0, color),
+13920 | ...                   Stroke::new(1.0, color),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13921:41
+     --> crates\app\src\main.rs:13975:41
       |
-13921 | ...                   Stroke::new(1.0, color),
+13975 | ...                   Stroke::new(1.0, color),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13928:41
+     --> crates\app\src\main.rs:13982:41
       |
-13928 | ...                   Stroke::new(1.0, color),
+13982 | ...                   Stroke::new(1.0, color),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13945:45
+     --> crates\app\src\main.rs:13999:45
       |
-13945 | ...                   Stroke::new(1.0, color),
+13999 | ...                   Stroke::new(1.0, color),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:13975:46
+     --> crates\app\src\main.rs:14029:46
       |
-13975 |                 let dash = egui::Stroke::new(1.5, color);
+14029 |                 let dash = egui::Stroke::new(1.5, color);
       |                                              ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14523:43
+     --> crates\app\src\main.rs:14577:43
       |
-14523 |                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)))
+14577 |                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)))
       |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14629:47
+     --> crates\app\src\main.rs:14683:47
       |
-14629 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)),
+14683 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)),
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14681:47
+     --> crates\app\src\main.rs:14735:47
       |
-14681 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)),
+14735 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)),
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14737:45
+     --> crates\app\src\main.rs:14791:45
       |
-14737 | ...                   1.0,
+14791 | ...                   1.0,
       |                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14751:67
+     --> crates\app\src\main.rs:14805:67
       |
-14751 | ...                   let s = egui::Stroke::new(1.6, egui::Color32::from_rgb(30, 30, 30));
+14805 | ...                   let s = egui::Stroke::new(1.6, egui::Color32::from_rgb(30, 30, 30));
       |                                                 ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14811:45
+     --> crates\app\src\main.rs:14865:45
       |
-14811 | ...                   1.0,
+14865 | ...                   1.0,
       |                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14818:67
+     --> crates\app\src\main.rs:14872:67
       |
-14818 | ...                   let s = egui::Stroke::new(1.6, egui::Color32::from_rgb(30, 30, 30));
+14872 | ...                   let s = egui::Stroke::new(1.6, egui::Color32::from_rgb(30, 30, 30));
       |                                                 ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14868:63
+     --> crates\app\src\main.rs:14922:63
       |
-14868 | ...                   .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 90, 90))),
+14922 | ...                   .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 90, 90))),
       |                                                 ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:14908:51
+     --> crates\app\src\main.rs:14962:51
       |
-14908 |                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)))
+14962 |                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)))
       |                                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:15873:47
+     --> crates\app\src\main.rs:15927:47
       |
-15873 |                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 198, 196)))
+15927 |                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 198, 196)))
       |                                               ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:17448:39
+     --> crates\app\src\main.rs:17502:39
       |
-17448 |                     egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+17502 |                     egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
       |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:17459:47
+     --> crates\app\src\main.rs:17513:47
       |
-17459 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 226, 226)),
+17513 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 226, 226)),
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:17591:43
+     --> crates\app\src\main.rs:17645:43
       |
-17591 |                         egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+17645 |                         egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
       |                                           ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:17618:51
+     --> crates\app\src\main.rs:17672:51
       |
-17618 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 150)),
+17672 | ...                   egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 150)),
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18140:37
+     --> crates\app\src\main.rs:18194:37
       |
-18140 |                         Stroke::new(1.0, Color32::from_rgb(196, 196, 196)),
+18194 |                         Stroke::new(1.0, Color32::from_rgb(196, 196, 196)),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18147:41
+     --> crates\app\src\main.rs:18201:41
       |
-18147 | ...                   Stroke::new(1.0, Color32::from_rgb(70, 110, 180)),
+18201 | ...                   Stroke::new(1.0, Color32::from_rgb(70, 110, 180)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18188:25
+     --> crates\app\src\main.rs:18242:25
       |
-18188 |             Stroke::new(1.0, grid_line)
+18242 |             Stroke::new(1.0, grid_line)
       |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18274:29
+     --> crates\app\src\main.rs:18328:29
       |
-18274 |                 Stroke::new(1.0, ui_kit::HEAD_LINE),
+18328 |                 Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18326:33
+     --> crates\app\src\main.rs:18380:33
       |
-18326 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
+18380 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18372:33
+     --> crates\app\src\main.rs:18426:33
       |
-18372 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
+18426 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18484:41
+     --> crates\app\src\main.rs:18538:41
       |
-18484 | ...                   Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+18538 | ...                   Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18493:41
+     --> crates\app\src\main.rs:18547:41
       |
-18493 | ...                   Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+18547 | ...                   Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18501:45
+     --> crates\app\src\main.rs:18555:45
       |
-18501 | ...                   Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+18555 | ...                   Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18513:33
+     --> crates\app\src\main.rs:18567:33
       |
-18513 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
+18567 |                     Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18528:25
+     --> crates\app\src\main.rs:18582:25
       |
-18528 |             Stroke::new(1.0, ui_kit::HEAD_LINE),
+18582 |             Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18535:25
+     --> crates\app\src\main.rs:18589:25
       |
-18535 |             Stroke::new(1.0, ui_kit::HEAD_LINE),
+18589 |             Stroke::new(1.0, ui_kit::HEAD_LINE),
       |                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18793:46
+     --> crates\app\src\main.rs:18847:46
       |
-18793 |                         let fs = Stroke::new(1.0, ink);
+18847 |                         let fs = Stroke::new(1.0, ink);
       |                                              ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18853:33
+     --> crates\app\src\main.rs:18907:33
       |
-18853 |                     Stroke::new(1.0, Color32::from_rgb(33, 122, 76)),
+18907 |                     Stroke::new(1.0, Color32::from_rgb(33, 122, 76)),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18860:37
+     --> crates\app\src\main.rs:18914:37
       |
-18860 |                         Stroke::new(1.0, Color32::WHITE),
+18914 |                         Stroke::new(1.0, Color32::WHITE),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18890:33
+     --> crates\app\src\main.rs:18944:33
       |
-18890 |                     Stroke::new(1.0, Color32::from_rgb(l[0], l[1], l[2])),
+18944 |                     Stroke::new(1.0, Color32::from_rgb(l[0], l[1], l[2])),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18934:33
+     --> crates\app\src\main.rs:18988:33
       |
-18934 |                     Stroke::new(1.0, ui_kit::ACCENT),
+18988 |                     Stroke::new(1.0, ui_kit::ACCENT),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:18956:37
+     --> crates\app\src\main.rs:19010:37
       |
-18956 |                         Stroke::new(1.0, ui_kit::ACCENT),
+19010 |                         Stroke::new(1.0, ui_kit::ACCENT),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19119:33
+     --> crates\app\src\main.rs:19173:33
       |
-19119 |                     Stroke::new(1.6, edge),
+19173 |                     Stroke::new(1.6, edge),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19128:33
+     --> crates\app\src\main.rs:19182:33
       |
-19128 |                     Stroke::new(1.6, edge),
+19182 |                     Stroke::new(1.6, edge),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19170:37
+     --> crates\app\src\main.rs:19224:37
       |
-19170 |                         Stroke::new(1.0, Color32::from_rgb(180, 120, 120)),
+19224 |                         Stroke::new(1.0, Color32::from_rgb(180, 120, 120)),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19211:37
+     --> crates\app\src\main.rs:19265:37
       |
-19211 |                         Stroke::new(1.5, ui_kit::ACCENT),
+19265 |                         Stroke::new(1.5, ui_kit::ACCENT),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19232:41
+     --> crates\app\src\main.rs:19286:41
       |
-19232 | ...                   Stroke::new(1.0, ui_kit::ACCENT),
+19286 | ...                   Stroke::new(1.0, ui_kit::ACCENT),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19414:41
+     --> crates\app\src\main.rs:19468:41
       |
-19414 | ...                   Stroke::new(1.0, dash),
+19468 | ...                   Stroke::new(1.0, dash),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19428:41
+     --> crates\app\src\main.rs:19482:41
       |
-19428 | ...                   Stroke::new(1.0, dash),
+19482 | ...                   Stroke::new(1.0, dash),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19495:29
+     --> crates\app\src\main.rs:19549:29
       |
-19495 |                 Stroke::new(1.5, ui_kit::ACCENT),
+19549 |                 Stroke::new(1.5, ui_kit::ACCENT),
       |                             ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19531:33
+     --> crates\app\src\main.rs:19585:33
       |
-19531 |                     Stroke::new(1.5, col),
+19585 |                     Stroke::new(1.5, col),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19555:29
+     --> crates\app\src\main.rs:19609:29
       |
-19555 |                 Stroke::new(2.0, Color32::from_rgb(33, 115, 70)),
+19609 |                 Stroke::new(2.0, Color32::from_rgb(33, 115, 70)),
       |                             ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19592:33
+     --> crates\app\src\main.rs:19646:33
       |
-19592 |                     Stroke::new(1.5, Color32::from_rgb(214, 48, 49)),
+19646 |                     Stroke::new(1.5, Color32::from_rgb(214, 48, 49)),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19614:33
+     --> crates\app\src\main.rs:19668:33
       |
-19614 |                     Stroke::new(1.0, Color32::from_rgb(214, 190, 90)),
+19668 |                     Stroke::new(1.0, Color32::from_rgb(214, 190, 90)),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19676:45
+     --> crates\app\src\main.rs:19730:45
       |
-19676 | ...                   Stroke::new(1.0, Color32::from_rgb(26, 115, 232)),
+19730 | ...                   Stroke::new(1.0, Color32::from_rgb(26, 115, 232)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19719:29
+     --> crates\app\src\main.rs:19773:29
       |
-19719 |                 Stroke::new(2.0, col),
+19773 |                 Stroke::new(2.0, col),
       |                             ^^^ help: explicitly specify the type as `f32`: `2.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:19880:33
+     --> crates\app\src\main.rs:19934:33
       |
-19880 |                     Stroke::new(1.5, Color32::from_rgb(120, 120, 120)),
+19934 |                     Stroke::new(1.5, Color32::from_rgb(120, 120, 120)),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.5_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21144:33
+     --> crates\app\src\main.rs:21198:33
       |
-21144 |                     Stroke::new(1.4, hc),
+21198 |                     Stroke::new(1.4, hc),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21148:33
+     --> crates\app\src\main.rs:21202:33
       |
-21148 |                     Stroke::new(1.4, hc),
+21202 |                     Stroke::new(1.4, hc),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21153:33
+     --> crates\app\src\main.rs:21207:33
       |
-21153 |                     Stroke::new(1.4, hc),
+21207 |                     Stroke::new(1.4, hc),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.4_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21178:41
+     --> crates\app\src\main.rs:21232:41
       |
-21178 | ...                   Stroke::new(1.0, border),
+21232 | ...                   Stroke::new(1.0, border),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21226:37
+     --> crates\app\src\main.rs:21280:37
       |
-21226 |                         Stroke::new(1.2, cc),
+21280 |                         Stroke::new(1.2, cc),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21230:37
+     --> crates\app\src\main.rs:21284:37
       |
-21230 |                         Stroke::new(1.2, cc),
+21284 |                         Stroke::new(1.2, cc),
       |                                     ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21248:33
+     --> crates\app\src\main.rs:21302:33
       |
-21248 |                     Stroke::new(1.3, pc),
+21302 |                     Stroke::new(1.3, pc),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.3_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21252:33
+     --> crates\app\src\main.rs:21306:33
       |
-21252 |                     Stroke::new(1.3, pc),
+21306 |                     Stroke::new(1.3, pc),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.3_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:21430:33
+     --> crates\app\src\main.rs:21484:33
       |
-21430 |                     Stroke::new(1.0, if r.hovered() { Color32::from_rgb(200, 200, 200) } else { Color32::from_rgb(232, 232, 232) }),
+21484 |                     Stroke::new(1.0, if r.hovered() { Color32::from_rgb(200, 200, 200) } else { Color32::from_rgb(232, 232, 232) }),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22242:44
+     --> crates\app\src\main.rs:22296:44
       |
-22242 |                 let sw = egui::Stroke::new(1.0, Color32::WHITE);
+22296 |                 let sw = egui::Stroke::new(1.0, Color32::WHITE);
       |                                            ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22324:39
+     --> crates\app\src\main.rs:22378:39
       |
-22324 |                     egui::Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+22378 |                     egui::Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
       |                                       ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22328:45
+     --> crates\app\src\main.rs:22382:45
       |
-22328 |                 let mst = egui::Stroke::new(1.2, Color32::from_rgb(96, 94, 92));
+22382 |                 let mst = egui::Stroke::new(1.2, Color32::from_rgb(96, 94, 92));
       |                                             ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22410:56
+     --> crates\app\src\main.rs:22464:56
       |
-22410 | ...                   let st = egui::Stroke::new(1.2, col);
+22464 | ...                   let st = egui::Stroke::new(1.2, col);
       |                                                  ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22415:138
+     --> crates\app\src\main.rs:22469:138
       |
-22415 | ...0, c.y + 4.0)], egui::Stroke::new(1.2, col));
+22469 | ...0, c.y + 4.0)], egui::Stroke::new(1.2, col));
       |                                      ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:22418:56
+     --> crates\app\src\main.rs:22472:56
       |
-22418 | ...                   let st = egui::Stroke::new(1.2, col);
+22472 | ...                   let st = egui::Stroke::new(1.2, col);
       |                                                  ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23063:33
+     --> crates\app\src\main.rs:23117:33
       |
-23063 |                     Stroke::new(1.0, ui_kit::BORDER),
+23117 |                     Stroke::new(1.0, ui_kit::BORDER),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23091:41
+     --> crates\app\src\main.rs:23145:41
       |
-23091 |                 let caret = Stroke::new(1.0, Color32::from_rgb(68, 68, 68));
+23145 |                 let caret = Stroke::new(1.0, Color32::from_rgb(68, 68, 68));
       |                                         ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23192:50
+     --> crates\app\src\main.rs:23246:50
       |
-23192 | ...                   let st = Stroke::new(1.3, col);
+23246 | ...                   let st = Stroke::new(1.3, col);
       |                                            ^^^ help: explicitly specify the type as `f32`: `1.3_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23203:50
+     --> crates\app\src\main.rs:23257:50
       |
-23203 | ...                   let st = Stroke::new(1.6, col);
+23257 | ...                   let st = Stroke::new(1.6, col);
       |                                            ^^^ help: explicitly specify the type as `f32`: `1.6_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23236:33
+     --> crates\app\src\main.rs:23290:33
       |
-23236 |                     Stroke::new(1.0, egui::Color32::from_rgb(224, 224, 224)),
+23290 |                     Stroke::new(1.0, egui::Color32::from_rgb(224, 224, 224)),
       |                                 ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23249:39
+     --> crates\app\src\main.rs:23303:39
       |
-23249 |                 let cst = Stroke::new(1.1, Color32::from_rgb(90, 90, 90));
+23303 |                 let cst = Stroke::new(1.1, Color32::from_rgb(90, 90, 90));
       |                                       ^^^ help: explicitly specify the type as `f32`: `1.1_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23521:50
+     --> crates\app\src\main.rs:23575:50
       |
-23521 | ...                   let st = Stroke::new(1.0, col);
+23575 | ...                   let st = Stroke::new(1.0, col);
       |                                            ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23541:53
+     --> crates\app\src\main.rs:23595:53
       |
-23541 | ...                   Stroke::new(1.0, col.gamma_multiply(0.55)),
+23595 | ...                   Stroke::new(1.0, col.gamma_multiply(0.55)),
       |                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23630:42
+     --> crates\app\src\main.rs:23684:42
       |
-23630 |                     let st = Stroke::new(1.0, Color32::from_rgb(120, 120, 120));
+23684 |                     let st = Stroke::new(1.0, Color32::from_rgb(120, 120, 120));
       |                                          ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:23703:38
+     --> crates\app\src\main.rs:23757:38
       |
-23703 |                 let st = Stroke::new(1.2, Color32::from_rgb(68, 68, 68));
+23757 |                 let st = Stroke::new(1.2, Color32::from_rgb(68, 68, 68));
       |                                      ^^^ help: explicitly specify the type as `f32`: `1.2_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:24079:21
+     --> crates\app\src\main.rs:24133:21
       |
-24079 |         Stroke::new(1.0, Color32::from_rgb(160, 160, 160)),
+24133 |         Stroke::new(1.0, Color32::from_rgb(160, 160, 160)),
       |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:24117:21
+     --> crates\app\src\main.rs:24171:21
       |
-24117 |         Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+24171 |         Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
       |                     ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:24502:72
+     --> crates\app\src\main.rs:24556:72
       |
-24502 |             painter.line_segment([a - off, b - off], egui::Stroke::new(1.0, color));
+24556 |             painter.line_segment([a - off, b - off], egui::Stroke::new(1.0, color));
       |                                                                        ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
-     --> crates\app\src\main.rs:24503:72
+     --> crates\app\src\main.rs:24557:72
       |
-24503 |             painter.line_segment([a + off, b + off], egui::Stroke::new(1.0, color));
+24557 |             painter.line_segment([a + off, b + off], egui::Stroke::new(1.0, color));
       |                                                                        ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
       |
       = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
       = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
 
 warning: unused variable: `ctx`
-   --> crates\app\src\edit_regression_tests.rs:989:9
-    |
-989 |     let ctx = egui::Context::default();
-    |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
-    |
-    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+    --> crates\app\src\edit_regression_tests.rs:1023:9
+     |
+1023 |     let ctx = egui::Context::default();
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
 
 warning: unused variable: `env`
-    --> crates\app\src\edit_regression_tests.rs:2599:15
+    --> crates\app\src\edit_regression_tests.rs:2633:15
      |
-2599 | fn seeded_app(env: &crate::test_env::TestEnv, tag: &str) -> SheetApp {
+2633 | fn seeded_app(env: &crate::test_env::TestEnv, tag: &str) -> SheetApp {
      |               ^^^ help: if this is intentional, prefix it with an underscore: `_env`
 
 warning: unused variable: `ctx`
-    --> crates\app\src\edit_regression_tests.rs:2674:9
+    --> crates\app\src\edit_regression_tests.rs:2708:9
      |
-2674 |     let ctx = egui::Context::default();
+2708 |     let ctx = egui::Context::default();
      |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
 
 warning: unused variable: `ctx`
-    --> crates\app\src\edit_regression_tests.rs:2704:9
+    --> crates\app\src\edit_regression_tests.rs:2738:9
      |
-2704 |     let ctx = egui::Context::default();
+2738 |     let ctx = egui::Context::default();
      |         ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
 
 warning: variable does not need to be mutable
-    --> crates\app\src\edit_regression_tests.rs:2907:9
+    --> crates\app\src\edit_regression_tests.rs:2941:9
      |
-2907 |     let mut cell = Cell { value: sheetcore::model::Value::Number(3.0), formula: Some("=SUM(A1:A2)".into()) };
+2941 |     let mut cell = Cell { value: sheetcore::model::Value::Number(3.0), formula: Some("=SUM(A1:A2)".into()) };
      |         ----^^^^
      |         |
      |         help: remove this `mut`
@@ -1899,72 +1901,72 @@ warning: unused variable: `i`
      |                      ^ help: if this is intentional, prefix it with an underscore: `_i`
 
 warning: variable does not need to be mutable
-    --> crates\app\src\main.rs:6786:20
+    --> crates\app\src\main.rs:6787:20
      |
-6786 |         let (cols, mut rows) = self.view_axes();
+6787 |         let (cols, mut rows) = self.view_axes();
      |                    ----^^^^
      |                    |
      |                    help: remove this `mut`
 
 warning: value assigned to `anchor` is never read
-    --> crates\app\src\main.rs:8697:26
+    --> crates\app\src\main.rs:8698:26
      |
-8697 |         let mut anchor = sheetcore::model::Cell::default();
+8698 |         let mut anchor = sheetcore::model::Cell::default();
      |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
 ...
-8701 |             anchor = sheet.get(r1, c1).cloned().unwrap_or_default();
+8702 |             anchor = sheet.get(r1, c1).cloned().unwrap_or_default();
      |             ------ `anchor` is overwritten here before the previous value is read
 
 warning: variable does not need to be mutable
-    --> crates\app\src\main.rs:9690:13
+    --> crates\app\src\main.rs:9691:13
      |
-9690 |         let mut put = |sh: &mut sheetcore::model::Sheet,
+9691 |         let mut put = |sh: &mut sheetcore::model::Sheet,
      |             ----^^^
      |             |
      |             help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> crates\app\src\main.rs:12266:21
+     --> crates\app\src\main.rs:12267:21
       |
-12266 |                 let mut swatch_row = |ui: &mut egui::Ui, title: &str, cur: &mut Option<[u8; 3]>| {
+12267 |                 let mut swatch_row = |ui: &mut egui::Ui, title: &str, cur: &mut Option<[u8; 3]>| {
       |                     ----^^^^^^^^^^
       |                     |
       |                     help: remove this `mut`
 
 warning: unused variable: `r`
-     --> crates\app\src\main.rs:14341:18
+     --> crates\app\src\main.rs:14395:18
       |
-14341 |             let (r, c) = self.sel;
+14395 |             let (r, c) = self.sel;
       |                  ^ help: if this is intentional, prefix it with an underscore: `_r`
 
 warning: variable does not need to be mutable
-     --> crates\app\src\main.rs:14542:25
+     --> crates\app\src\main.rs:14596:25
       |
-14542 |                     let mut menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool| -> bool {
+14596 |                     let mut menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool| -> bool {
       |                         ----^^^^^^^^
       |                         |
       |                         help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> crates\app\src\main.rs:23643:21
+     --> crates\app\src\main.rs:23697:21
       |
-23643 |                 let mut area = egui::ScrollArea::horizontal()
+23697 |                 let mut area = egui::ScrollArea::horizontal()
       |                     ----^^^^
       |                     |
       |                     help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> crates\app\src\main.rs:23611:21
+     --> crates\app\src\main.rs:23665:21
       |
-23611 |                 let mut del: Option<usize> = None;
+23665 |                 let mut del: Option<usize> = None;
       |                     ----^^^
       |                     |
       |                     help: remove this `mut`
 
 warning: variable does not need to be mutable
-     --> crates\app\src\main.rs:23613:21
+     --> crates\app\src\main.rs:23667:21
       |
-23613 |                 let mut mv: Option<(usize, i32)> = None;
+23667 |                 let mut mv: Option<(usize, i32)> = None;
       |                     ----^^
       |                     |
       |                     help: remove this `mut`
@@ -2039,57 +2041,57 @@ warning: fields `cf_v1` and `cf_v2` are never read
     |     ^^^^^
 
 warning: multiple methods are never used
-     --> crates\app\src\main.rs:8661:8
+     --> crates\app\src\main.rs:8662:8
       |
  1243 | impl SheetApp {
       | ------------- methods in this implementation
 ...
- 8661 |     fn outer_border(&mut self, style: u8, color: [u8; 3]) {
+ 8662 |     fn outer_border(&mut self, style: u8, color: [u8; 3]) {
       |        ^^^^^^^^^^^^
 ...
-11964 |     fn tb_rect_px(&self, tb: &sheetcore::textbox::TextBox) -> (f32, f32, f32, f32) {
+11965 |     fn tb_rect_px(&self, tb: &sheetcore::textbox::TextBox) -> (f32, f32, f32, f32) {
       |        ^^^^^^^^^^
 ...
-13074 |     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
+13128 |     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
       |        ^^^^^^
 ...
-13095 |     fn add_cf(&mut self, kind: sheetcore::cf::CfKind) {
+13149 |     fn add_cf(&mut self, kind: sheetcore::cf::CfKind) {
       |        ^^^^^^
 ...
-13109 |     fn clear_cf(&mut self) {
+13163 |     fn clear_cf(&mut self) {
       |        ^^^^^^^^
 ...
-13129 |     fn toolbar_cf(&mut self, ui: &mut egui::Ui) {
+13183 |     fn toolbar_cf(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^
 ...
-13303 |     fn toolbar_dv(&mut self, ui: &mut egui::Ui) {
+13357 |     fn toolbar_dv(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^
 ...
-13487 |     fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
+13541 |     fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^^^^
 ...
-14056 |     fn toolbar_view(&mut self, ui: &mut egui::Ui) {
+14110 |     fn toolbar_view(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^^^
 ...
-14092 |     fn set_freeze(&mut self, v: Option<(u32, u32)>) {
+14146 |     fn set_freeze(&mut self, v: Option<(u32, u32)>) {
       |        ^^^^^^^^^^
 ...
-14111 |     fn link_dialog(&mut self, ctx: &egui::Context) {
+14165 |     fn link_dialog(&mut self, ctx: &egui::Context) {
       |        ^^^^^^^^^^^
 ...
-14338 |     fn toolbar_data(&mut self, ui: &mut egui::Ui) {
+14392 |     fn toolbar_data(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^^^
 ...
-15130 |     fn toolbar_page(&mut self, ui: &mut egui::Ui) {
+15184 |     fn toolbar_page(&mut self, ui: &mut egui::Ui) {
       |        ^^^^^^^^^^^^
 ...
-15429 |     fn open_compare(&mut self) {
+15483 |     fn open_compare(&mut self) {
       |        ^^^^^^^^^^^^
 ...
-16510 |     fn export_pdf(&mut self) {
+16564 |     fn export_pdf(&mut self) {
       |        ^^^^^^^^^^
 ...
-16530 |     fn export_macro_part(&mut self) {
+16584 |     fn export_macro_part(&mut self) {
       |        ^^^^^^^^^^^^^^^^^
 
 warning: variant `QuickFolder` is never constructed
@@ -2104,9 +2106,9 @@ warning: variant `QuickFolder` is never constructed
     = note: `RowKind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
 
 warning: function `type_and_key` is never used
-    --> crates\app\src\edit_regression_tests.rs:1339:4
+    --> crates\app\src\edit_regression_tests.rs:1373:4
      |
-1339 | fn type_and_key(keys: &[(egui::Key, bool)], text: &str) -> Vec<egui::Event> {
+1373 | fn type_and_key(keys: &[(egui::Key, bool)], text: &str) -> Vec<egui::Event> {
      |    ^^^^^^^^^^^^
 
 warning: field `site` is never read
@@ -2277,125 +2279,125 @@ warning: function `accent` is never used
    |        ^^^^^^
 
 warning: `app` (bin "app" test) generated 200 warnings (run `cargo fix --bin "app" -p app --tests` to apply 161 suggestions)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.72s
      Running unittests src\main.rs (target\debug\deps\app-059f29197c1f8e3f.exe)
 
-running 200 tests
-test document_tests::drag_reordering_preserves_active_sheet_and_local_scope ... ok
-test document_tests::duplicate_insertion_keeps_existing_local_name_scopes ... ok
+running 201 tests
 test document_tests::stale_recalculation_still_respects_edits_after_switching_tabs ... ok
+test document_tests::saves_completing_out_of_order_keep_their_own_paths ... ok
+test document_tests::drag_reordering_preserves_active_sheet_and_local_scope ... ok
+test document_tests::duplicate_sheet_recalculates_its_array_without_false_obstruction ... ok
+test document_tests::failed_open_restores_dependencies_of_the_retained_document ... ok
+test document_tests::closing_a_saving_tab_waits_for_its_result ... ok
+test document_tests::duplicate_insertion_keeps_existing_local_name_scopes ... ok
+test edit_regression_tests::app_undo_restores_an_error_cell_after_a_real_edit ... ok
+test document_tests::loading_and_recalculation_follow_the_tab_that_started_them ... ok
+test document_tests::recalculation_cannot_restore_the_path_from_before_save_as ... ok
+test document_tests::rejected_edit_survives_tab_switch_new_tab_and_save ... ok
 test document_tests::sheet_handlers_update_references_dependencies_and_indexed_state ... ok
 test document_tests::opening_another_file_while_saving_preserves_the_saving_tab ... ok
-test document_tests::closing_a_saving_tab_waits_for_its_result ... ok
-test document_tests::rejected_edit_survives_tab_switch_new_tab_and_save ... ok
 test document_tests::save_completion_updates_its_parked_document_only ... ok
-test edit_regression_tests::app_undo_restores_an_error_cell_after_a_real_edit ... ok
-test document_tests::recalculation_cannot_restore_the_path_from_before_save_as ... ok
-test document_tests::loading_and_recalculation_follow_the_tab_that_started_them ... ok
-test edit_regression_tests::chart_selection_exposes_the_chart_tools_tab ... ok
-test document_tests::failed_save_in_the_close_frame_keeps_the_window_open ... ok
 test edit_regression_tests::command_tooltips_carry_their_registered_shortcut ... ok
-test edit_regression_tests::clear_contents_recalcs_dependents_and_one_undo_restores_all ... ok
-test edit_regression_tests::alt_enter_inserts_a_newline_in_the_cell_editor ... ok
+test edit_regression_tests::chart_selection_exposes_the_chart_tools_tab ... ok
 test edit_regression_tests::calculate_sheet_command_keeps_unrelated_volatile_sheet_cached ... ok
+test document_tests::failed_save_in_the_close_frame_keeps_the_window_open ... ok
 test edit_regression_tests::closing_parked_dirty_tabs_requires_confirmation_for_that_tab ... ok
-test document_tests::failed_open_restores_dependencies_of_the_retained_document ... ok
-test document_tests::saves_completing_out_of_order_keep_their_own_paths ... ok
-test document_tests::duplicate_sheet_recalculates_its_array_without_false_obstruction ... ok
+test edit_regression_tests::alt_enter_inserts_a_newline_in_the_cell_editor ... ok
+test edit_regression_tests::clear_contents_recalcs_dependents_and_one_undo_restores_all ... ok
+test document_tests::failed_or_disconnected_save_keeps_owner_dirty ... ok
 test edit_regression_tests::creating_a_refreshable_pivot_prevents_older_structure_undo_from_erasing_it ... ok
-test edit_regression_tests::clear_formats_and_clear_all_are_distinct_and_undoable ... ok
 test edit_regression_tests::cross_sheet_cut_undo_restores_both_sides_styles_and_dependencies ... ok
-test edit_regression_tests::ctrl_d_fills_down_and_ctrl_r_fills_right ... ok
+test edit_regression_tests::clear_formats_and_clear_all_are_distinct_and_undoable ... ok
+test edit_regression_tests::chinese_text_commits_once_without_duplication ... ok
 test edit_regression_tests::app_shortcuts_are_ignored_while_a_modal_dialog_is_open ... ok
 test edit_regression_tests::clear_multi_select_does_not_touch_the_gap ... ok
-test edit_regression_tests::ctrl_click_builds_multi_range_selection ... ok
-test edit_regression_tests::chinese_text_commits_once_without_duplication ... ok
-test document_tests::failed_or_disconnected_save_keeps_owner_dirty ... ok
+test edit_regression_tests::closing_the_window_keeps_a_rejected_draft ... ok
 test edit_regression_tests::calculate_sheet_keeps_other_sheet_pending_until_full_recalc ... ok
 test edit_regression_tests::closing_the_window_commits_pending_edit ... ok
-test edit_regression_tests::ctx_head_menu_rows_are_excel_like ... ok
-test edit_regression_tests::closing_the_window_keeps_a_rejected_draft ... ok
 test document_tests::xls_save_with_formula_succeeds ... ok
+test edit_regression_tests::ctx_head_menu_rows_are_excel_like ... ok
+test edit_regression_tests::ctrl_d_fills_down_and_ctrl_r_fills_right ... ok
 test edit_regression_tests::clicking_another_cell_commits_the_draft ... ok
-test edit_regression_tests::ctx_menu_rows_match_excel_cell_menu ... ok
 test edit_regression_tests::ctx_head_menu_hides_and_unhides_rows_and_cols ... ok
+test edit_regression_tests::ctx_menu_rows_match_excel_cell_menu ... ok
+test edit_regression_tests::ctx_menu_clear_contents_only_clears_values ... ok
+test edit_regression_tests::ctrl_click_builds_multi_range_selection ... ok
 test edit_regression_tests::ctx_menu_insert_and_delete_rows_are_real ... ok
 test edit_regression_tests::ctx_menu_paste_values_keeps_number_but_drops_formula ... ok
 test edit_regression_tests::ctx_menu_sort_asc_and_desc_are_real ... ok
 test edit_regression_tests::ctx_tab_menu_sets_and_clears_tab_color ... ok
-test edit_regression_tests::ctrl_n_while_editing_commits_the_draft_before_adding_a_document ... ok
 test edit_regression_tests::cut_and_undo_publish_source_clears_across_sheets ... ok
+test edit_regression_tests::ctrl_n_while_editing_commits_the_draft_before_adding_a_document ... ok
 test edit_regression_tests::ctrl_p_commits_the_draft_before_opening_print_preview ... ok
-test edit_regression_tests::ctx_menu_clear_contents_only_clears_values ... ok
 test edit_regression_tests::ctrl_p_opens_print_preview ... ok
-test edit_regression_tests::edits_after_close_prompt_require_a_new_confirmation ... ok
 test edit_regression_tests::drag_extends_selection_while_button_is_down ... ok
 test edit_regression_tests::dragging_a_chart_moves_its_anchor_and_marks_dirty ... ok
+test edit_regression_tests::edits_after_close_prompt_require_a_new_confirmation ... ok
 test edit_regression_tests::drag_moves_copy_and_shift_check_source_target_and_moved_ranges ... ok
 test edit_regression_tests::dragging_the_column_header_border_resizes_the_column ... ok
 test edit_regression_tests::dragging_the_row_header_border_resizes_the_row ... ok
 test edit_regression_tests::fill_down_limit_follows_neighbour_column ... ok
 test edit_regression_tests::find_all_collects_workbook_hits_with_sheet_and_position ... ok
 test edit_regression_tests::escape_discards_draft_without_touching_model ... ok
-test edit_regression_tests::find_selection_scope_and_column_order_are_honored ... ok
-test edit_regression_tests::f2_keeps_existing_formula_and_escape_restores_nothing ... ok
-test edit_regression_tests::escape_in_formula_bar_discards_draft ... ok
 test edit_regression_tests::find_dialog_and_results_window_render ... ok
+test edit_regression_tests::f2_keeps_existing_formula_and_escape_restores_nothing ... ok
+test edit_regression_tests::find_selection_scope_and_column_order_are_honored ... ok
+test edit_regression_tests::escape_in_formula_bar_discards_draft ... ok
 test edit_regression_tests::find_uses_formatted_values_and_formula_results_need_explicit_opt_in ... ok
-test edit_regression_tests::format_dialog_merge_is_deferred_until_ok ... ok
 test edit_regression_tests::format_painter_is_rejected_after_document_switch_even_with_same_style_id ... ok
+test edit_regression_tests::format_dialog_merge_is_deferred_until_ok ... ok
 test edit_regression_tests::hidden_rows_and_columns_collapse_to_zero_in_the_view ... ok
 test edit_regression_tests::format_painter_maps_range_continuous_and_escape ... ok
 test edit_regression_tests::horizontal_fill_gate_covers_the_real_target_column ... ok
-test edit_regression_tests::insert_cells_rewrites_formula_refs ... ok
 test edit_regression_tests::goto_name_commits_pending_edit_before_navigating ... ok
+test edit_regression_tests::insert_cells_rewrites_formula_refs ... ok
 test edit_regression_tests::fill_shortcuts_are_blocked_by_protection_tail_locks_and_pending_deps ... ok
-test edit_regression_tests::formula_bar_edit_uses_same_buffer_and_commits ... ok
 test edit_regression_tests::making_a_table_enables_filter_and_second_click_clears_it ... ok
+test edit_regression_tests::committed_value_survives_save_and_reload ... ok
+test document_tests::xls_save_as_uses_native_format_history_and_its_owning_tab ... ok
+test edit_regression_tests::formula_bar_edit_uses_same_buffer_and_commits ... ok
 test edit_regression_tests::manual_mode_dv_and_paste_keep_cached_values ... ok
 test edit_regression_tests::manual_mode_delete_keeps_cached_dependents_until_f9 ... ok
 test edit_regression_tests::manual_mode_sort_marks_pending_without_recalculating ... ok
-test edit_regression_tests::manual_calc_edit_marks_pending_and_f9_forces_recalculation ... ok
 test edit_regression_tests::merge_undo_keeps_unrelated_merges_and_redo_restores_only_diff ... ok
 test edit_regression_tests::merge_confirmation_is_scoped_to_document_sheet_rect_and_content ... ok
-test edit_regression_tests::committed_value_survives_save_and_reload ... ok
+test edit_regression_tests::manual_calc_edit_marks_pending_and_f9_forces_recalculation ... ok
 test edit_regression_tests::move_selection_by_shifts_values_and_formulas ... ok
 test edit_regression_tests::named_navigation_cannot_move_a_rejected_draft_to_another_sheet ... ok
-test document_tests::xls_save_as_uses_native_format_history_and_its_owning_tab ... ok
-test edit_regression_tests::long_find_scan_is_chunked_cancellable_and_commits_once ... ok
-test edit_regression_tests::one_undo_restores_previous_value_and_redo_reapplies ... ok
 test edit_regression_tests::csv_import_choices_persist_and_refresh_reuses_them ... ok
-test edit_regression_tests::overlapping_cut_is_one_reversible_transaction ... ok
+test edit_regression_tests::one_undo_restores_previous_value_and_redo_reapplies ... ok
 test edit_regression_tests::csv_import_dialog_renders_with_real_preview_before_any_write ... ok
 test document_tests::ordinary_app_save_keeps_real_file_history_and_later_edits ... ok
-test document_tasks::tests::background_save_acknowledges_only_snapshot_sheets_without_losing_new_edits ... ok
-test edit_regression_tests::overlapping_merge_redo_conflict_keeps_values_and_both_structures_intact ... ok
-test edit_regression_tests::paste_special_all_keeps_format_and_divide_by_zero_is_an_error ... ok
+test edit_regression_tests::overlapping_cut_is_one_reversible_transaction ... ok
 test edit_regression_tests::csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_source ... ok
-test edit_regression_tests::parking_a_document_cancels_its_find_scan ... ok
+test edit_regression_tests::long_find_scan_is_chunked_cancellable_and_commits_once ... ok
+test edit_regression_tests::overlapping_merge_redo_conflict_keeps_values_and_both_structures_intact ... ok
+test document_tasks::tests::background_save_acknowledges_only_snapshot_sheets_without_losing_new_edits ... ok
+test edit_regression_tests::paste_special_all_keeps_format_and_divide_by_zero_is_an_error ... ok
 test edit_regression_tests::paste_special_all_translates_formula_offsets ... ok
 test edit_regression_tests::page_layout_modes_render_and_keep_the_selection ... ok
+test edit_regression_tests::parking_a_document_cancels_its_find_scan ... ok
 test edit_regression_tests::paste_special_formula_translates_negative_and_positive_offsets ... ok
 test edit_regression_tests::paste_special_prefers_newer_system_clipboard_over_stale_internal_clip ... ok
-test edit_regression_tests::paste_special_transpose_keeps_original_source_coordinates ... ok
 test edit_regression_tests::paste_special_transpose_negative_offset_is_ref_error ... ok
-test edit_regression_tests::merge_warns_cancel_keeps_data_and_confirm_is_undoable ... ok
+test edit_regression_tests::paste_special_transpose_keeps_original_source_coordinates ... ok
 test edit_regression_tests::paste_special_values_transpose_and_operations ... ok
 test edit_regression_tests::pasting_an_excel_error_cell_keeps_it_an_error_value ... ok
 test edit_regression_tests::pivot_refresh_recomputes_in_place ... ok
 test edit_regression_tests::press_anchors_selection_before_release ... ok
 test edit_regression_tests::plain_range_filter_opens_from_header_arrow ... ok
+test edit_regression_tests::merge_warns_cancel_keeps_data_and_confirm_is_undoable ... ok
 test edit_regression_tests::ctrl_n_creates_a_blank_document_without_losing_the_current_one ... ok
 test edit_regression_tests::rejected_draft_keeps_its_cell_through_continued_drag_frames ... ok
 test edit_regression_tests::rejected_draft_keeps_its_cell_when_clicking_grid_or_headers ... ok
 test edit_regression_tests::chart_save_acknowledges_a_new_sheet_before_the_next_save ... ok
 test edit_regression_tests::replace_all_across_sheets_is_one_undo_step ... ok
-test edit_regression_tests::rejected_validation_keeps_draft_and_position ... ok
 test edit_regression_tests::replace_all_in_selection_spares_cells_outside_and_is_one_undo ... ok
-test edit_regression_tests::replace_all_uses_the_hit_sheet_not_the_active_sheet ... ok
+test edit_regression_tests::rejected_validation_keeps_draft_and_position ... ok
 test document_tasks::tests::saving_during_pivot_replacement_preserves_only_the_live_pending_attachment ... ok
-test edit_regression_tests::ctrl_o_opens_the_picked_file ... ok
+test edit_regression_tests::replace_all_uses_the_hit_sheet_not_the_active_sheet ... ok
 test edit_regression_tests::ribbon_buttons_and_command_table_share_one_enabled_predicate ... ok
+test edit_regression_tests::ctrl_o_opens_the_picked_file ... ok
 test edit_regression_tests::right_clicking_a_column_header_opens_the_header_menu ... ok
 test edit_regression_tests::selection_scope_survives_repeated_next_and_previous ... ok
 test edit_regression_tests::shift_arrows_extend_selection_and_plain_arrow_collapses ... ok
@@ -2410,6 +2412,7 @@ test edit_regression_tests::ctrl_s_does_not_save_when_validation_rejects_the_dra
 test edit_regression_tests::structural_undo_restores_cross_sheet_formulas_names_and_layout ... ok
 test edit_regression_tests::tab_commits_and_moves_right ... ok
 test edit_regression_tests::table_design_tab_is_offered_inside_a_table_range ... ok
+test edit_regression_tests::table_fill_calculated_column_is_a_real_command_entry ... ok
 test edit_regression_tests::totals_row_adds_subtotal_and_removes_cleanly ... ok
 test edit_regression_tests::tsv_parsing_keeps_blank_rows_between_values ... ok
 test edit_regression_tests::typed_text_commits_on_enter_through_full_window ... ok
@@ -2420,16 +2423,16 @@ test edit_regression_tests::protected_sheet_blocks_clearing_and_formatting ... o
 test files::tests::filter_matches_loaded_subtree ... ok
 test files::tests::lists_dirs_first_and_hides_system_entries ... ok
 test files::tests::missing_path_returns_none ... ok
-test edit_regression_tests::clear_all_broadcasts_style_and_content_to_a_second_client_and_undo_restores_both ... ok
+test edit_regression_tests::ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original ... ok
 test net::tests::host_and_client_exchange_ops ... ok
-test net::tests::right_password_connects ... ok
-test net::tests::wrong_password_is_denied ... ok
+test edit_regression_tests::cut_from_a_protected_sheet_cannot_be_pasted ... ok
+test edit_regression_tests::clear_all_broadcasts_style_and_content_to_a_second_client_and_undo_restores_both ... ok
 test office_clipboard::tests::entities_and_breaks ... ok
 test office_clipboard::tests::ignores_empty_rows ... ok
 test office_clipboard::tests::parses_excel_html_table ... ok
 test office_clipboard::tests::rgb_notation ... ok
-test edit_regression_tests::ctrl_shift_s_saves_to_a_new_path_and_keeps_the_original ... ok
-test edit_regression_tests::cut_from_a_protected_sheet_cannot_be_pasted ... ok
+test net::tests::wrong_password_is_denied ... ok
+test net::tests::right_password_connects ... ok
 test ribbon::tests::every_action_is_dispatched ... ok
 test ribbon::tests::every_group_has_children_or_launcher ... ok
 test ribbon::tests::parses_and_ids_are_unique ... ok
@@ -2444,8 +2447,8 @@ test spark_view::tests::reads_single_col_top_to_bottom ... ok
 test spark_view::tests::reads_single_row_left_to_right ... ok
 test spark_view::tests::winloss_and_column_draw_without_panic ... ok
 test session_lock::tests::write_then_read_roundtrip ... ok
-test edit_regression_tests::failed_save_keeps_dirty_reports_the_step_and_allows_retry ... ok
 test net::presence_tests::welcome_lists_the_host_as_a_peer ... ok
+test edit_regression_tests::failed_save_keeps_dirty_reports_the_step_and_allows_retry ... ok
 test edit_regression_tests::overlapping_merge_redo_conflict_does_not_broadcast_or_touch_peer ... ok
 test ui_icons::stroke_tests::line_centers_land_on_pixel_centers ... ok
 test ui_icons::stroke_tests::stroke_width_is_integral_device_pixels ... ok
@@ -2482,5 +2485,5 @@ test test_env::tests::each_guard_gets_its_own_directory ... ok
 test test_env::tests::drop_only_removes_the_guard_own_directory ... ok
 test test_env::tests::isolates_temp_and_restores_after_drop ... ok
 
-test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.40s
+test result: ok. 201 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s
 

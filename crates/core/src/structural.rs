@@ -44,6 +44,14 @@ fn shift_axis(v: u32, at: u32, n: u32, del: bool) -> Option<u32> {
     }
 }
 
+/// 行插入到表格数据区时，从相邻数据行复制计算列公式。
+struct TableRowFill {
+    row: u32,
+    col: u32,
+    formula: Box<str>,
+    style: Option<u16>,
+}
+
 impl Sheet {
     /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
     pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
@@ -418,10 +426,88 @@ impl Sheet {
         self.edited = true;
     }
 
+    /// 插入行前抓取表格计算列公式。插入点落在表体内（或表尾下一行）时，
+    /// Excel 会扩展表格并把上一数据行的计算列公式填到新行。
+    fn capture_table_row_fills(&self, at: u32, n: u32) -> Vec<TableRowFill> {
+        let mut out = Vec::new();
+        for t in &self.tables {
+            let (r1, c1, r2, c2) = t.range;
+            let data_start = if t.header_row { r1 + 1 } else { r1 };
+            let data_end = if t.totals_row { r2.saturating_sub(1) } else { r2 };
+            let max_insert = if t.totals_row { r2 } else { r2 + 1 };
+            if at <= r1 || at > max_insert || data_start > data_end {
+                continue;
+            }
+            let source = if at > data_start { at - 1 } else { data_start };
+            if source < data_start || source > data_end {
+                continue;
+            }
+            for col in c1..=c2 {
+                let Some(src) = self.get(source, col) else { continue };
+                let Some(formula) = src.formula.as_deref() else { continue };
+                let style = self.styles.get(&CellRef::new(source, col)).copied();
+                for k in 0..n {
+                    let row = at + k;
+                    let delta = row as i64 - source as i64;
+                    let shift = crate::refs::Shift {
+                        axis: crate::refs::Axis::Row,
+                        translate: Some((delta, 0)),
+                        target_sheet: self.name.clone(),
+                        own_sheet: self.name.clone(),
+                        ..Default::default()
+                    };
+                    out.push(TableRowFill {
+                        row,
+                        col,
+                        formula: crate::refs::rewrite(formula, &shift).into_boxed_str(),
+                        style,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn apply_table_row_fills(&mut self, fills: Vec<TableRowFill>) {
+        if fills.is_empty() {
+            return;
+        }
+        for f in fills {
+            self.set(
+                f.row,
+                f.col,
+                Cell { value: crate::model::Value::Empty, formula: Some(f.formula) },
+            );
+            if let Some(style) = f.style {
+                self.set_style(f.row, f.col, style);
+            }
+        }
+        self.tables_dirty = true;
+    }
+
+    fn adjust_tables_for_row_insert(&mut self, at: u32, n: u32) {
+        let mut changed = false;
+        for t in &mut self.tables {
+            let (r1, _, r2, _) = t.range;
+            if at <= r1 {
+                t.range.0 += n;
+                t.range.2 += n;
+                changed = true;
+            } else if at <= r2 + u32::from(!t.totals_row) {
+                t.range.2 += n;
+                changed = true;
+            }
+        }
+        if changed {
+            self.tables_dirty = true;
+        }
+    }
+
     pub fn insert_rows(&mut self, at: u32, n: u32) {
         if n == 0 {
             return;
         }
+        let fills = self.capture_table_row_fills(at, n);
         self.shift_array_metadata(true, at, n, false);
         self.rebuild(|r, c| Some((if r >= at { r + n } else { r }, c)));
         self.merges = self
@@ -445,6 +531,8 @@ impl Sheet {
             }
         }
         self.rows.insert_at(at, n);
+        self.adjust_tables_for_row_insert(at, n);
+        self.apply_table_row_fills(fills);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }

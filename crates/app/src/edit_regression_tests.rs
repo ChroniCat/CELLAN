@@ -522,6 +522,7 @@ fn table_design_tab_is_offered_inside_a_table_range() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).tables.push(sheetcore::table::Table {
+                column_ids: Vec::new(),
         name: "表1".into(),
         display: "表1".into(),
         range: (0, 0, 3, 2),
@@ -535,6 +536,39 @@ fn table_design_tab_is_offered_inside_a_table_range() {
     app.sel = (9, 9);
     app.sel_end = (9, 9);
     assert!(app.table_at_sel().is_none(), "表格外不显示");
+}
+
+#[test]
+fn table_fill_calculated_column_is_a_real_command_entry() {
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.tables.push(sheetcore::table::Table {
+            name: "Sales".into(),
+            display: "Sales".into(),
+            range: (0, 0, 3, 2),
+            columns: vec!["Amount".into(), "Tax".into(), "Total".into()],
+            column_ids: vec![1, 2, 3],
+            header_row: true,
+            totals_row: false,
+        });
+        sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Amount".into()), formula: None });
+        sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Tax".into()), formula: None });
+        sh.set(0, 2, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Total".into()), formula: None });
+        for r in 1..=3 {
+            sh.set(r, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Number(r as f64), formula: None });
+            sh.set(r, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Number(2.0), formula: None });
+        }
+        sh.set(1, 2, sheetcore::model::Cell { value: sheetcore::model::Value::Empty, formula: Some("=A2*B2".into()) });
+    }
+    app.sel = (1, 2);
+    app.sel_end = (1, 2);
+    app.fill_table_calculated_column();
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.get(2, 2).and_then(|c| c.formula.as_deref()), Some("=A3*B3"));
+    assert_eq!(sh.get(3, 2).and_then(|c| c.formula.as_deref()), Some("=A4*B4"));
+    assert_eq!(sh.get(2, 2).map(|c| c.value.clone()), Some(sheetcore::model::Value::Number(4.0)));
+    assert_eq!(sh.get(3, 2).map(|c| c.value.clone()), Some(sheetcore::model::Value::Number(6.0)));
 }
 
 #[test]

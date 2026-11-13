@@ -1,11 +1,42 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `4f49dda`（C10.1 裸当前行记录；C11.2/C11.1 在前）。
-- 台账（`scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
-  切片 30 已验收 / 19 待验收 / 99 待实施。
-- 当前测试真值（C11.1 修改后重跑）：core 71 bins / 636 passed / 0 failed / 41 ignored，
-  CORE_EXIT=0；app 200 passed / 0 failed / APP_EXIT=0；GUI 12 passed / 0 failed / 8 ignored /
-  GUI_EXIT=0 为 C10 前同一 GUI 入口的快照，C10/C11 未重跑 GUI。
+- 分支 `main`（`origin/main`），HEAD `35f1149`；本轮 C11 复核修复和 C10.2/C10.3 尚未提交。
+- 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
+  切片 31 已验收 / 20 待验收 / 97 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
+- 当前测试真值（11:38 UTF-8 回归修复后重跑）：core 72 bins /
+  650 passed / 0 failed / 41 ignored，CORE_EXIT=0；app 201 passed / 0 failed /
+  APP_EXIT=0。GUI 快照未重跑，不作为当前证据。
+- 当前未完成：C11.3/C11.4 未实施、Office 实机未做；C10/C11 父项仍实施中。
+  C10.2/C10.3 与 C11.1/C11.2 的 11:38 认可项已关闭，不重复修；C10.2 live 按
+  用户要求保留。
+
+## 12:35 当前：11:38 UTF-8 回归修复
+
+- 用户指出 `rewrite_table_column_refs` 用 `text[i..i+table.len()]` 只查总长度，
+  `Sales` 长度 5 在 `=[@金额]*[@税率]` 首次 `0..5` 切断“金”字，rename 遍历
+  全簿会 panic，无关中文公式也可触发。已改为先检查 `is_char_boundary`、
+  再做大小写匹配；新增中文裸当前行公式 + 无关中文公式/字符串回归。
+- `table_calculated` 7 passed；全量 core **650/0/41 EXIT=0**、app **201/0 EXIT=0**。
+- 用户 11:38 已认可 C11 上轮剩余修复与 C10 生产入口；C11.3/C11.4 和 Office
+  实机仍待做，父项 C10/C11 保持实施中，不把本轮当父项验收。
+
+## 12:05：11:13 有限复核的六项整改
+
+- C11.2：新增 `Sheet.spill_shapes` 记录可信锚点/精确形状（1×1 也记录）；
+  `materialized_spill` 移除从 `spilled` 邻接尾格猜形状；`A2#` 尾格和旁普通格
+  `B1#` 均 `#REF!`，不返回 5；逐表重算仍不重算无关 RAND。`spill_refs` 7 passed。
+- C11.1：`cf::shift_formula` 整行分支增加 `bracket_depth`，`SUM(Sales[1:3])`
+  下移不被改成 `Sales[2:4]`；save/reload 测试从实际加载公式复制，`Shift.at/n`
+  显式非零，不再用硬编码 raw。`whole_row_refs` 7 passed。
+- C10.3：转换区域改为目标表限定扫描，Sales 转换不再改 Other 的裸 `[@X]` 和
+  `Other[Amount]`；两表结果不变。`table_calculated` 6 passed。
+- C10.2：列重命名同步 header 单元格；表名匹配大小写不敏感；字符串不改；
+  保存重开表头/列定义/id/公式一致。
+- C10.2：`fill_calculated_column` 接入 `TableFillCalculated` 表设计按钮，
+  经 preflight/事务/重算；`TableToRange` 也改走 `convert_table_to_range`；
+  app 生产入口测试通过。
+- 全量 core 650/0/41、app 201/0；原始日志已复制到 c11-whole-row、c11-spill、
+  c10-table-calculated、c10-structured 证据目录。上述切片仍待独立复核，父项不翻绿。
 - Excel 16.0 与 WPS 12.0 实机：旧缓存保持（B1=10）→ 手动 Calculate（B1=14）→ 另存 .xls/.xlsx 再打开仍手动且 B1=14。
 - 旧 core 605/app 196、旧 GUI 12/8 快照均为历史，不再作为当前证据。
 
@@ -23,7 +54,7 @@
 - 特殊字符列名仍只覆盖空格/逗号/百分号，括号/结构化转义保留为未覆盖边界。
 - 全量 core 71 bins / 636 / 0 / 41；app 200/0。C10.1 仍待独立复核，父项 C10 未完成。
 
-## 本轮追加：C11.2 溢出引用（实现完成，待独立复核）
+## 历史：C11.2 溢出引用首版（已被 11:45 当前段覆盖）
 
 - 词法 `#` 区分错误字面量与 `A1#`；AST 增加 `Node::Spill`；求值从锚点
   `cell_value` 取得数组，`SUM(A1#)` 随 `SEQUENCE` 扩大/缩小；非数组返回 #REF!。
@@ -31,7 +62,7 @@
 - `crates/core/tests/spill_refs.rs` 3 项；全量 core 71 bins / 633 / 0 / 41；app 200/0。
 - C11.3 隐式交集、C11.4 三维引用尚未实施，C11 父项未验收。
 
-## 本轮：C11.1 整行引用（实现完成，待独立复核）
+## 历史：C11.1 整行引用首版（已被 11:45 当前段覆盖）
 
 - `normalize_formula` 新增整行展开：`1:3` → `A1:XFD3`、
   `$1:$3` → `A$1:XFD$3`、`Sheet!2:2` → `Sheet!A2:XFD2`；

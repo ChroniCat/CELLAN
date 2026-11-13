@@ -228,7 +228,7 @@ fn match_rows(chars: &[char], i: usize) -> Option<(usize, u32, u32, bool, bool)>
 
 /// 整行引用在 OOXML/公式里是 `1:3`；解析器只认 A1 区域，因此先展开成
 /// `A1:XFD3`（或绝对行 `A$1:XFD$3`），求值时再按实际使用范围裁剪。
-fn expand_whole_rows(text: &str) -> String {
+pub(crate) fn expand_whole_rows(text: &str) -> String {
     if !text.contains(':') {
         return text.to_string();
     }
@@ -280,7 +280,9 @@ pub fn normalize_formula(text: &str) -> String {
     if !text.contains("_xl") && !text.contains('!') && !text.contains(':') {
         return text.to_string();
     }
-    let text = expand_whole_rows(&expand_whole_cols(text));
+    // 整行引用必须保留原文（1:3），否则加载后复制/插列会把 A1:XFD3 当作
+    // 普通全宽区域平移，#REF 或漏掉 A 列。求值/依赖解析时再临时展开。
+    let text = expand_whole_cols(text);
     let mut out = String::with_capacity(text.len());
     for (in_quote, seg) in split_quoted(&text) {
         if in_quote {

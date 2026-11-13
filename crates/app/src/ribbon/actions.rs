@@ -1133,14 +1133,22 @@ impl SheetApp {
             }
             "TableToRange" => {
                 if let Some(t) = self.table_at_sel() {
-                    let sh = self.wb.sheet_mut(self.sheet_idx);
-                    sh.tables.retain(|x| x.name != t.name);
-                    sh.tables_dirty = true;
-                    self.wb.dirty = true;
-                    self.ribbon_tab = 1;
-                    self.status = "已转换为普通区域".into();
+                    let changed =
+                        sheetcore::table::convert_table_to_range(&mut self.wb, &t.name);
+                    if changed {
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.ribbon_tab = 1;
+                        // 公式文本已从结构化引用改成 A1，必须让依赖图与缓存值跟上；
+                        // 否则转换后的单元格仍显示旧缓存。
+                        self.recalc_all_async();
+                        self.status = "已转换为普通区域".into();
+                    } else {
+                        self.status = "没有可转换的表格".into();
+                    }
                 }
             }
+            "TableFillCalculated" => self.fill_table_calculated_column(),
             "ToggleTotals" => {
                 if let Some(t) = self.table_at_sel() {
                     self.toggle_totals_row(&t.name);

@@ -1217,6 +1217,7 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "ZoomIn" => Icon::ZoomIn,
         "Unfreeze" => Icon::Unfreeze,
         "TableToRange" => Icon::TableToRange,
+        "TableFillCalculated" => Icon::Fill,
         "SparkEdit" => Icon::SparkEdit,
         "ChartEdit" => Icon::ChartEdit,
         "PivotOptions" => Icon::PivotOptions,
