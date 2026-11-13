@@ -7035,3 +7035,52 @@ fn grid_zoom_scales_axes_and_hit_testing() {
     assert!((rows.size(0) - sheetcore::layout::DEFAULT_ROW_H * 0.5).abs() < 0.01);
     assert_eq!(app.zoom, 0.5, "缩放状态留在表格视图里");
 }
+
+/// UI-12.2：缩放前后左上角单元格和格内偏移都不变（含冻结窗格）。
+#[test]
+fn zoom_keeps_anchor_cell_with_and_without_freeze() {
+    let mut app = app();
+    let (cols, rows) = app.view_axes();
+    app.scroll = egui::vec2(cols.pos(5) + 9.0, rows.pos(3) + 4.0);
+    let anchor = (cols.index_at(app.scroll.x), rows.index_at(app.scroll.y));
+    let frac = ((app.scroll.x - cols.pos(anchor.0)) / cols.size(anchor.0),
+                (app.scroll.y - rows.pos(anchor.1)) / rows.size(anchor.1));
+    app.set_zoom(2.0);
+    let (cols2, rows2) = app.view_axes();
+    assert_eq!((cols2.index_at(app.scroll.x), rows2.index_at(app.scroll.y)), anchor);
+    assert!(((app.scroll.x - cols2.pos(anchor.0)) / cols2.size(anchor.0) - frac.0).abs() < 0.01);
+    assert!(((app.scroll.y - rows2.pos(anchor.1)) / rows2.size(anchor.1) - frac.1).abs() < 0.01);
+
+    // 冻结两行两列：锚点按「冻结宽度 + scroll」计算，缩放后仍命中同一格。
+    app.zoom = 1.0;
+    app.wb.sheets[0].freeze = Some((2, 2));
+    app.scroll = egui::vec2(17.0, 11.0);
+    let (cols, rows) = app.view_axes();
+    let fw = cols.pos(2);
+    let fh = rows.pos(2);
+    let anchor = (cols.index_at(fw + app.scroll.x), rows.index_at(fh + app.scroll.y));
+    app.set_zoom(1.5);
+    let (cols2, rows2) = app.view_axes();
+    let fw2 = cols2.pos(2);
+    let fh2 = rows2.pos(2);
+    assert_eq!(
+        (cols2.index_at(fw2 + app.scroll.x), rows2.index_at(fh2 + app.scroll.y)),
+        anchor,
+        "冻结区缩放后锚点不能跳到别的格"
+    );
+}
+/// UI-12.3：每张表各自记 zoom，切表回来不被别的表覆盖。
+#[test]
+fn zoom_is_per_sheet() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    app.set_zoom(2.0);
+    assert_eq!(app.zoom, 2.0);
+    app.switch_sheet_relative(1);
+    assert_eq!(app.zoom, 1.0, "新表默认 100%");
+    app.set_zoom(1.5);
+    app.switch_sheet_relative(-1);
+    assert_eq!(app.zoom, 2.0, "切回第一张表恢复它自己的 200%");
+    app.switch_sheet_relative(1);
+    assert_eq!(app.zoom, 1.5, "第二张表恢复 150%");
+}

@@ -4984,7 +4984,7 @@
       "scope": "app/main.rs/ribbon/actions.rs坐标变换",
       "source": "ui-requirements.md",
       "heading": "UI-12 缩放表格而非整个应用",
-      "status": "待实施",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -4994,7 +4994,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-13T23:11:36Z",
       "slices": [
         {
           "id": "UI-12.1",
@@ -5032,17 +5032,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/freeze-hit-200.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-100.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png"
+          ],
+          "not_done": [
+            "真实鼠标拖对象/列宽未做（RDP 注入不可用）"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:11:36Z"
         },
         {
           "id": "UI-12.3",
@@ -5050,17 +5060,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/freeze-hit-200.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-100.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png"
+          ],
+          "not_done": [
+            "真实鼠标拖对象/列宽未做（RDP 注入不可用）"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:11:36Z"
         }
       ]
     },

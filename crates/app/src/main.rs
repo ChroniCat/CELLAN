@@ -14776,7 +14776,7 @@ let txn = self.txn_begin(&keys);
                 });
             });
         if ok {
-            self.zoom = z;
+            self.set_zoom(z);
             self.zoom_dlg = None;
         } else if open {
             self.zoom_dlg = Some(z);
@@ -20421,6 +20421,35 @@ let txn = self.txn_begin(&keys);
         (cols, rows)
     }
 
+    /// UI-12.2：缩放时保持表格左上角那个单元格不动（Excel 的行为）。
+    /// 冻结区不随滚动，所以锚点按「冻结宽度 + scroll」换算。
+    fn set_zoom(&mut self, z: f32) {
+        let z = z.clamp(0.5, 2.5);
+        if (z - self.zoom).abs() < 0.0001 {
+            return;
+        }
+        let (cols, rows) = self.view_axes();
+        let (fx, fy) = {
+            // 模型里的 freeze 是 (冻结行数, 冻结列数)
+            let (fy, fx) = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
+            (fx.min(16_383), fy.min(1_048_575))
+        };
+        let fw = cols.pos(fx);
+        let fh = rows.pos(fy);
+        let ax = fw + self.scroll.x;
+        let ay = fh + self.scroll.y;
+        let cx = cols.index_at(ax);
+        let cy = rows.index_at(ay);
+        let fx_frac = ((ax - cols.pos(cx)) / cols.size(cx).max(1.0)).clamp(0.0, 1.0);
+        let fy_frac = ((ay - rows.pos(cy)) / rows.size(cy).max(1.0)).clamp(0.0, 1.0);
+        self.zoom = z;
+        let (cols2, rows2) = self.view_axes();
+        let fw2 = cols2.pos(fx);
+        let fh2 = rows2.pos(fy);
+        self.scroll.x = (cols2.pos(cx) + fx_frac * cols2.size(cx) - fw2).max(0.0);
+        self.scroll.y = (rows2.pos(cy) + fy_frac * rows2.size(cy) - fh2).max(0.0);
+    }
+
     /// 自绘单元格右键菜单（照本机 Excel 365 的条目、分组、行高与图标位）
     fn ctx_menu_window(&mut self, ctx: &egui::Context) {
         self.ctx_rects.clear();
@@ -21124,8 +21153,15 @@ let txn = self.txn_begin(&keys);
         if let Ok(spec) = std::env::var("SC_HIT") {
             static ONCE: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
+            let want_freeze = std::env::var("SC_FREEZE").ok().and_then(|v| {
+                let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (p.len() == 2 && !(p[0] == 0 && p[1] == 0)).then(|| (p[0], p[1]))
+            });
             let ready = self.tasks.open_rx.is_none()
-                && self.wb.sheets.iter().any(|s| s.len() > 0);
+                && self.wb.sheets.iter().any(|s| s.len() > 0)
+                && want_freeze.map_or(true, |f| {
+                    self.wb.sheet(self.sheet_idx).freeze == Some(f)
+                });
             if ready && !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 for one in spec.split(';') {
                     if let Some((xs, ys)) = one.split_once(',') {
@@ -26312,9 +26348,7 @@ impl eframe::App for SheetApp {
         let (ctrl, wheel) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if ctrl && wheel.abs() > 0.5 {
             let z = (self.zoom * (1.0 + wheel * 0.0015)).clamp(0.5, 2.5);
-            if (z - self.zoom).abs() > 0.001 {
-                self.zoom = z;
-            }
+            self.set_zoom(z);
         }
 
         // 无边框窗口：边缘缩放 + 自绘标题栏
@@ -26918,7 +26952,7 @@ impl eframe::App for SheetApp {
                             .on_hover_text("点击回到 100%")
                             .clicked()
                         {
-                            self.zoom = 1.0;
+                            self.set_zoom(1.0);
                         }
                         // 放大 / 滑杆 / 缩小（从右往左加，视觉上是 − 滑杆 +）
                         if ui
@@ -26931,11 +26965,12 @@ impl eframe::App for SheetApp {
                             )
                             .clicked()
                         {
-                            self.zoom = (self.zoom + 0.1).clamp(0.5, 2.5);
+                            let z = (self.zoom + 0.1).clamp(0.5, 2.5);
+                            self.set_zoom(z);
                         }
                         let mut z = self.zoom;
                         if zoom_bar(ui, &mut z) {
-                            self.zoom = z;
+                            self.set_zoom(z);
                         }
                         if ui
                             .add_sized(

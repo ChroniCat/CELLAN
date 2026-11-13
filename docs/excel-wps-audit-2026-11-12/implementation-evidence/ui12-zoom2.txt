@@ -1,0 +1,31 @@
+# UI-12.2/12.3 命中、冻结、对象与每表缩放
+
+日期：2026-11-14
+
+## 12.2 命中/轴/冻结
+- 缩放后只改轴几何；命中仍走 `col_at/row_at`，冻结区用 `body_x/body_y` 分开：
+  冻结区内不扣滚动量，正文区扣冻结宽高+滚动量。
+- 实测（`c10/table.xlsx`，200%，`SC_FREEZE=1,1`、`SC_SCROLL_Y=100`、`SC_HIT`）：
+  - 点 (50,290) → **A1**，`off=(0,100)`、`freeze=(1,1)`，冻结格没有跟着滚走；
+  - 点 (400,450) → **C8**，`cell_rect=(327,426,144,36)`，正文命中含冻结 36px + 滚动 100px。
+  - 截图 `implementation-evidence/ui12/freeze-hit-200.png`。
+- 缩放保持左上角锚点：`set_zoom()` 先记「冻结宽度+scroll」处的格与格内比例，缩放后反算 scroll。
+  100%→200%、带冻结 `(2,2)` 的 100%→150% 单测均命中同一格。
+- 滚动/冻结/选区/列宽拖拽全部使用缩放轴；拖拽增量 `/zoom` 折回模型。
+
+## 12.3 对象与每表状态
+- 图片/图表矩形由 `px_of/py_of`（缩放轴）算出，尺寸随 zoom；
+  实测红图 216×72 → 432×144（精确 2×），起点 (106,292)→(183,310)：
+  `object-100.png`、`object-200.png`。
+- 每表 zoom 存在 `sheet_views`：第一张 200%、第二张 150%，来回切表各自恢复；
+  单测 `zoom_is_per_sheet`。
+
+## 测试
+- `zoom_keeps_anchor_cell_with_and_without_freeze`
+- `zoom_is_per_sheet`
+- `grid_zoom_scales_axes_and_hit_testing`
+- app `--bin app` **282 passed**。
+
+## 未做
+- 真实鼠标拖图片/拖动列宽（RDP 注入不可用），只做了几何与截图；
+- 文本框内文字随 zoom 已乘字号，但文本框自动换行宽度未单独对拍 Excel。
