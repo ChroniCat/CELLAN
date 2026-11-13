@@ -1,11 +1,10 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `188f0c9`（UI-09.1 常用快捷键已提交）（UI-18 筛选入口已提交；UI-10 在其前）；C11 父项已验收；UI-09.2 视口翻页正在收尾。
+- 分支 `main`（`origin/main`），HEAD `4202fae`（UI-09.1/09.2 三处缺口修复已提交）；C11 父项已验收；UI-09 父项仍待真机复核。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 10 待验收 / 1 实施中 / 37 待实施；
   切片 35 已验收 / 23 待验收 / 90 待实施。C11 父项已按用户 14:00 认可翻绿。
-- 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
-  CORE_EXIT=0；app **205 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，
-  不作为当前证据。
+- 当前测试真值（14:37 重跑）：core 未改，沿用 **75 bins / 678 passed / 0 failed / 41 ignored**；
+  app **212 passed / 0 failed / 0 ignored**，APP_EXIT=0。GUI 快照未重跑，不作当前证据。
 - 当前未完成：C22 待验收；UI-05 的 Ribbon 新会话入口已修，真实鼠标/单次查找取消/结果虚拟滚动仍待；
   C10.2 live 按用户要求保留。
 

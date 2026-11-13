@@ -3974,7 +3974,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "5bd5d8c"
+            "5bd5d8c",
+            "4202fae"
           ],
           "commands": [
             "cargo test -p app --offline --bin app common_selection_and_format_shortcuts_work -> 1 passed",
@@ -4005,7 +4006,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "008b573"
+            "008b573",
+            "4202fae"
           ],
           "commands": [
             "cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet -> 1 passed",
