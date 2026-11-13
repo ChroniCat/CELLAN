@@ -1,13 +1,26 @@
 //! 样式与合并单元格：读进来、改一格、存出去，再读回来还在不在
 use sheetcore::model::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_table_style")
+        .join(name)
+}
+
+fn out_path(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("test executable directory")
+        .join(format!("qa02_table_style_{}_{}.xlsx", name, std::process::id()))
+}
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn style_and_merge_survive_save() {
-    let src = Path::new("tests/test-work/styled.xlsx");
+    let src = fixture("styled.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let mut wb = sheetcore::xlsx::load(src).expect("读入");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
 
     // 原始状态
     let merges_before = wb.sheets[0].merges.clone();
@@ -25,12 +38,12 @@ fn style_and_merge_survive_save() {
         value: Value::Text("改过的产品A".into()),
         formula: None,
     });
-    let out = Path::new("tests/test-work/styled_out.xlsx");
-    let _ = std::fs::remove_file(out);
-    sheetcore::xlsx::save(out, &wb).expect("保存");
+    let out = out_path("styled_out");
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
 
     // 读回来
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     assert_eq!(back.sheets[0].merges, merges_before, "合并区域应保留");
     assert_eq!(back.sheets[0].style_of(0, 0), a1_style, "A1 样式应保留");
     assert_eq!(back.styles.get(a1_style).fill, Some([31, 78, 120]));

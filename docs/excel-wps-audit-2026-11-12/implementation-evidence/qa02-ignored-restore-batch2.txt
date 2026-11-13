@@ -1,0 +1,73 @@
+# QA-02.1 第二批 ignored 夹具恢复（并发子任务，主实施者复核）
+
+日期：2026-11-13（CST）
+范围：QA-02 P0 的 CF/DV、PDF/透视、表格/样式、引用/筛选夹具。所有改动均由主实施者在当前工作树重新运行验证，不把子任务自报当验收。
+
+## 恢复的测试
+
+| 测试文件 | 测试数 | 夹具 | 结果 |
+|---|---:|---|---|
+| `conditional_format.rs` | 6 | `fixtures/qa02_cf_dv/cf.xlsx`、`icons.xlsx` | 6 passed / 0 ignored |
+| `data_validation.rs` | 3 | `fixtures/qa02_cf_dv/dv.xlsx` | 3 passed / 0 ignored |
+| `pdf_export.rs` | 2 | `fixtures/qa02_pivot_pdf/table.xlsx` + 内嵌字体 | 2 passed / 0 ignored |
+| `pivot_file.rs` | 2 | `fixtures/qa02_pivot_pdf/table.xlsx` | 2 passed / 0 ignored |
+| `pivot_real.rs` | 3 | 同上 | 3 passed / 0 ignored |
+| `refs_structural.rs` | 5 | `fixtures/qa02_refs_filter/table.xlsx`、`chart.xlsx` | 5 passed / 0 ignored |
+| `sort_filter.rs` | 2 | `fixtures/qa02_refs_filter/table.xlsx` | 2 passed / 0 ignored |
+| `format_edit.rs` | 3 | `fixtures/qa02_table_style/styled.xlsx` | 3 passed / 0 ignored |
+| `style_merge.rs` | 2 | 同上 | 2 passed / 0 ignored |
+| `table_object.rs` | 3 | `fixtures/qa02_table_style/table_obj.xlsx` | 3 passed / 0 ignored |
+
+所有测试路径改为 `env!("CARGO_MANIFEST_DIR")` 下的仓库夹具；输出写到
+`current_exe().parent()` 的带 PID 文件，不再写本机散落的 `tests/test-work`。
+没有删除断言或降低断言；`pivot_real` 的实质校验加强为解析 OPC 关系：
+pivotTable→cacheDefinition、workbook→cache、sheet→pivotTable、cache→records，
+并检查 Content_Types、XML 良构性。
+
+## 根因修复
+
+`cf::shift_formula` 在扫描字母列名时用 `col * 26 + ...`，遇到 `NOT(ISERROR(...))`
+这类长函数名会在 debug 构建下整数溢出 panic。改为 `saturating_mul/saturating_add`，
+超出 Excel 列上限后按普通字符原样输出；并在 `cf::tests::formula_relative_shift`
+加回归断言 `NOT(ISERROR(A1))` 下移一行仍保持文本。
+
+## 实际命令与结果
+
+```text
+cargo test -p sheetcore --offline --test conditional_format -> 6 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test data_validation -> 3 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test pdf_export -> 2 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test pivot_real -> 3 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test refs_structural -> 5 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test sort_filter -> 2 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test format_edit -> 3 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test style_merge -> 2 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --test table_object -> 3 passed / 0 failed / 0 ignored
+cargo test -p sheetcore --offline --lib cf::tests::formula_relative_shift -- --exact -> 1 passed
+cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0
+cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored, exit 0
+cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0
+```
+
+日志：`/tmp/child_conditional_format.log`、`/tmp/child_data_validation.log`、
+`/tmp/child_pdf_export.log`、`/tmp/child_pivot_file.log`、`/tmp/child_pivot_real.log`、
+`/tmp/child_refs_structural.log`、`/tmp/child_sort_filter.log`、
+`/tmp/child_format_edit.log`、`/tmp/child_style_merge.log`、
+`/tmp/child_table_object.log`、`/tmp/qa02_child_core_full2.log`、
+`/tmp/qa02_child_app_full.log`、`/tmp/qa02_child_build.log`。
+
+## 剩余 ignored（9）
+
+- `comparison_semantics.rs`、`custom_props.rs`、`date_system.rs`、`save_failure_injection.rs`
+  中的人工生成/辅助进程项：有明确生成或平台依赖原因，不是缺夹具。
+- `vba_source.rs`：仍需 `tests/test-work/vba_fixture2.bin` 的真实 OLE VBA 样本；
+  不能伪造，属 QA-02.2/02.3 的剩余项。
+
+## 边界
+
+- 本批是 QA-02.1 的核心夹具恢复，不是 QA-02 父项完成；`vba_source` 和 app/tests
+  对象夹具未恢复，父项保持实施中。
+- 自动化测试通过不等于 Office 实机验收；未据此改变任何已验收父项状态。
+
+本片状态：实施中/待监督复核。

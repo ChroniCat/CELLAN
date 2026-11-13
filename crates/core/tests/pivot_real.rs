@@ -1,12 +1,26 @@
 //! 真 pivotTable 部件：生成后文件仍能被读、被 Excel 识别（结构校验）
 use sheetcore::pivot::{Agg, PivotSpec};
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_pivot_pdf")
+        .join(name)
+}
+
+fn out_path(name: &str, ext: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("test executable directory")
+        .join(format!("qa02_pivot_{}_{}.{}", name, std::process::id(), ext))
+}
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn writes_real_pivot_table() {
-    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    let src = fixture("table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let mut wb = sheetcore::xlsx::load(src).expect("读入");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
     let spec = PivotSpec {
         source: region,
@@ -20,10 +34,7 @@ fn writes_real_pivot_table() {
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     // 输出放在 H1
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 7), &res);
-    let out = std::path::PathBuf::from(format!(
-        "tests/test-work/pivot_real_{}.xlsx",
-        std::process::id()
-    ));
+    let out = out_path("real_pivot", "xlsx");
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存");
     let vlabel = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
@@ -105,29 +116,10 @@ fn writes_real_pivot_table() {
 
 #[test]
 fn pivot_parts_are_well_formed() {
-    // 自建夹具：以前这个用例只断言「另一个用例的产物存在」然后删掉它，
-    // 既没解析 XML 也没检查关系引用，还因为 #[ignore] 从来不跑——等于没有。
-    let dir = std::env::temp_dir().join(format!("sheetcore-pivot-parts-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let src = dir.join("table.xlsx");
-
-    let mut wb = sheetcore::model::Workbook::new_blank();
-    {
-        let sh = wb.sheet_mut(0);
-        let rows = [("部门", "金额"), ("研发", "100"), ("研发", "50"), ("财务", "200")];
-        for (r, (a, b)) in rows.iter().enumerate() {
-            sh.set(r as u32, 1, sheetcore::model::Cell {
-                value: sheetcore::model::Value::Text((*a).into()),
-                formula: None,
-            });
-            sh.set(r as u32, 2, sheetcore::model::Cell {
-                value: sheetcore::model::Value::parse_input(b),
-                formula: None,
-            });
-        }
-    }
-    sheetcore::xlsx::save(&src, &wb).expect("保存夹具");
+    // 用仓库内的合成夹具（scripts/qa02_pivot_pdf.py 生成）；输出写到测试可执行
+    // 文件目录，文件名带用例名和进程号，不依赖其它用例留下的中间产物。
+    let src = fixture("table.xlsx");
+    assert!(src.exists(), "required test fixture is missing: {}", src.display());
 
     let mut wb = sheetcore::xlsx::load(&src).expect("读回夹具");
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
@@ -142,7 +134,8 @@ fn pivot_parts_are_well_formed() {
     };
     let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 7), &res);
-    let out = dir.join("pivot_parts.xlsx");
+    let out = out_path("parts", "xlsx");
+    let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存");
     let sheet_name = wb.sheet(0).name.clone();
     let vlabel = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
@@ -177,9 +170,17 @@ fn pivot_parts_are_well_formed() {
         "透视表的 ContentType 不对：{types:?}"
     );
 
-    // 3) pivotTable 的关系必须指向 cacheDefinition
-    let rels = read_part(&out, "xl/pivotTables/_rels/pivotTable1.xml.rels");
-    assert!(rels.contains("pivotCacheDefinition"), "pivotTable 没挂到 cacheDefinition 上：{rels}");
+    // 3) pivotTable 的关系必须指向 cacheDefinition（解析 rels，不靠子串猜测）
+    let table_rels = relationship_map(&out, "xl/pivotTables/pivotTable1.xml");
+    let (_, _kind, target) = table_rels
+        .iter()
+        .find(|(_, kind, _)| kind.ends_with("/pivotCacheDefinition"))
+        .expect("pivotTable 没挂到 cacheDefinition 上");
+    assert_eq!(
+        resolve_target("xl/pivotTables/pivotTable1.xml", target),
+        cache_part,
+        "pivotTable 的关系目标不对：{target}"
+    );
 
     // 4) 两个部件都是良构 XML（quick_xml 逐事件读到 EOF，不许报错）
     for part in [&cache_part, &table_part] {
@@ -212,13 +213,37 @@ fn pivot_parts_are_well_formed() {
     let back = sheetcore::xlsx::load(&out).expect("重新读入");
     assert_eq!(back.sheet(0).get(0, 7).unwrap().value.display(), "部门");
     let w = read_part(&out, "xl/workbook.xml");
-    assert!(w.contains("pivotCaches"), "workbook 没登记透视缓存");
-    assert!(
-        w.contains(&format!("cacheId=\"{cache_id}\"")),
-        "workbook 里的 cacheId 不是 {cache_id}"
-    );
+    let (registered, cache_rid) = registered_cache(&w).expect("workbook 没登记透视缓存");
+    assert_eq!(registered, cache_id, "workbook 里的 cacheId 不是 {cache_id}");
+    let wb_rels = relationship_map(&out, "xl/workbook.xml");
+    let (_, kind, target) = wb_rels
+        .iter()
+        .find(|(id, _, _)| *id == cache_rid)
+        .unwrap_or_else(|| panic!("workbook 缺少关系 {cache_rid}"));
+    assert!(kind.ends_with("/pivotCacheDefinition"), "缓存关系类型不对：{kind}");
+    assert_eq!(resolve_target("xl/workbook.xml", target), cache_part, "缓存关系目标不对");
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // 工作表关系必须指向 pivotTable 部件（OPC 里透视表是隐式关系）
+    let sheet_part = sheet_part(&out, &sheet_name);
+    let sheet_rels = relationship_map(&out, &sheet_part);
+    let (_, kind, target) = sheet_rels
+        .iter()
+        .find(|(_, kind, _)| kind.ends_with("/pivotTable"))
+        .expect("工作表没挂透视表");
+    assert!(kind.ends_with("/pivotTable"), "透视表关系类型不对：{kind}");
+    assert_eq!(resolve_target(&sheet_part, target), table_part, "透视表关系目标不对");
+
+    // 缓存自己的关系必须指向 records 部件，且该部件真的存在
+    let cache_rels = relationship_map(&out, &cache_part);
+    let (_, kind, target) = cache_rels
+        .iter()
+        .find(|(_, kind, _)| kind.ends_with("/pivotCacheRecords"))
+        .expect("缓存没挂 records");
+    assert!(kind.ends_with("/pivotCacheRecords"), "记录关系类型不对：{kind}");
+    let records_part = resolve_target(&cache_part, target);
+    assert!(names.iter().any(|n| *n == records_part), "缺少记录部件 {records_part}");
+
+    let _ = std::fs::remove_file(&out);
 }
 
 /// 把 [Content_Types].xml 解析成 PartName -> ContentType（真解析，不做字符串猜测）
@@ -263,12 +288,171 @@ fn read_part(path: &std::path::Path, name: &str) -> String {
     s
 }
 
+/// 解析 OPC 关系部件：owner 部件 -> [(Id, Type, Target)]
+fn relationship_map(path: &std::path::Path, owner: &str) -> Vec<(String, String, String)> {
+    let (dir, file) = owner.rsplit_once('/').expect("部件路径");
+    let part = format!("{dir}/_rels/{file}.rels");
+    let xml = read_part(path, &part);
+    let mut out = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut root = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if root.is_empty() {
+                    root = String::from_utf8_lossy(e.local_name().as_ref().as_bytes()).to_string();
+                }
+                if e.local_name().as_ref() != "Relationship" {
+                    continue;
+                }
+                let mut id = None;
+                let mut kind = None;
+                let mut target = None;
+                for a in e.attributes() {
+                    let a = a.unwrap_or_else(|e| panic!("{part} 属性不合法：{e}"));
+                    let v = a
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .unwrap_or_else(|e| panic!("{part} 属性值不合法：{e}"))
+                        .into_owned();
+                    match a.key.as_ref() {
+                        "Id" => id = Some(v),
+                        "Type" => kind = Some(v),
+                        "Target" => target = Some(v),
+                        _ => {}
+                    }
+                }
+                out.push((
+                    id.unwrap_or_else(|| panic!("{part} 的关系缺少 Id")),
+                    kind.unwrap_or_else(|| panic!("{part} 的关系缺少 Type")),
+                    target.unwrap_or_else(|| panic!("{part} 的关系缺少 Target")),
+                ));
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("{part} 不是良构 XML：{e}"),
+        }
+    }
+    assert_eq!(root, "Relationships", "{part} 根元素不对");
+    out
+}
+
+/// 关系里的相对目标 -> 包内部件名（不含前导 /）
+fn resolve_target(owner: &str, target: &str) -> String {
+    let mut pieces: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        owner
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.split('/').filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    for piece in target.split('/') {
+        match piece {
+            "" | "." => {}
+            ".." => {
+                assert!(pieces.pop().is_some(), "关系目标越出包根目录：{target}");
+            }
+            p => pieces.push(p),
+        }
+    }
+    pieces.join("/")
+}
+
+/// 从 workbook.xml 的 pivotCaches 里取 (cacheId, r:id)
+fn registered_cache(xml: &str) -> Option<(u32, String)> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut in_caches = false;
+    let mut found = None;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = e.local_name();
+                if name.as_ref() == "pivotCaches" {
+                    in_caches = true;
+                } else if in_caches && name.as_ref() == "pivotCache" {
+                    found = cache_attrs(&e);
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                if in_caches && e.local_name().as_ref() == "pivotCache" {
+                    found = cache_attrs(&e);
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) if e.local_name().as_ref() == "pivotCaches" => {
+                in_caches = false;
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("workbook.xml 不是良构 XML：{e}"),
+        }
+    }
+    found
+}
+
+fn cache_attrs(e: &quick_xml::events::BytesStart<'_>) -> Option<(u32, String)> {
+    let mut id = None;
+    let mut rid = None;
+    for a in e.attributes() {
+        let a = a.ok()?;
+        let v = a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok()?.into_owned();
+        match a.key.as_ref() {
+            "cacheId" => id = v.parse::<u32>().ok(),
+            "r:id" => rid = Some(v),
+            _ => {}
+        }
+    }
+    Some((id?, rid?))
+}
+
+/// 工作表名 -> 包内部件名（经 workbook.xml 的关系解析）
+fn sheet_part(path: &std::path::Path, sheet_name: &str) -> String {
+    let xml = read_part(path, "xl/workbook.xml");
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut rid = None;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e))
+                if e.local_name().as_ref() == "sheet" =>
+            {
+                let mut name = None;
+                let mut id = None;
+                for a in e.attributes() {
+                    let a = a.unwrap_or_else(|e| panic!("workbook.xml 属性不合法：{e}"));
+                    let v = a
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .unwrap_or_else(|e| panic!("workbook.xml 属性值不合法：{e}"))
+                        .into_owned();
+                    match a.key.as_ref() {
+                        "name" => name = Some(v),
+                        k if k.ends_with(":id") => id = Some(v),
+                        _ => {}
+                    }
+                }
+                if name.as_deref() == Some(sheet_name) {
+                    rid = id;
+                    break;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("workbook.xml 不是良构 XML：{e}"),
+        }
+    }
+    let rid = rid.unwrap_or_else(|| panic!("workbook 里找不到工作表 {sheet_name}"));
+    let rels = relationship_map(path, "xl/workbook.xml");
+    let (_, kind, target) = rels
+        .iter()
+        .find(|(id, _, _)| *id == rid)
+        .unwrap_or_else(|| panic!("找不到工作表关系 {rid}"));
+    assert!(kind.ends_with("/worksheet"), "工作表关系类型不对：{kind}");
+    resolve_target("xl/workbook.xml", target)
+}
+
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn save_attaches_pending_pivot() {
-    let src = std::path::Path::new("tests/test-work/table.xlsx");
+    let src = fixture("table.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let mut wb = sheetcore::xlsx::load(src).expect("读入");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
     let region = sheetcore::sort_filter::current_region(wb.sheet(0), 1, 1);
     let spec = PivotSpec {
         source: region,
@@ -283,7 +467,7 @@ fn save_attaches_pending_pivot() {
     let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (0, 8), &res);
     let name = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
     wb.pivots_pending.push((0, spec, res, rect, name));
-    let out = std::path::PathBuf::from(format!("tests/test-work/pivot_pending_{}.xlsx", std::process::id()));
+    let out = out_path("pending_pivot", "xlsx");
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存");
 

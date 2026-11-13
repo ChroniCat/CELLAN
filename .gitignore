@@ -30,6 +30,10 @@
 !docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-*.xlsx
 !crates/core/tests/fixtures/qa01/*.xlsx
 !crates/core/tests/fixtures/qa02/*.xlsx
+!crates/core/tests/fixtures/qa02_cf_dv/*.xlsx
+!crates/core/tests/fixtures/qa02_table_style/*.xlsx
+!crates/core/tests/fixtures/qa02_refs_filter/*.xlsx
+!crates/core/tests/fixtures/qa02_pivot_pdf/*.xlsx
 !crates/core/tests/fixtures/qa01_extended/*.xlsx
 
 # Operating-system files

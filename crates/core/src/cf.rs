@@ -628,7 +628,11 @@ pub fn shift_formula(f: &str, r: u32, c: u32) -> String {
             let col_start = j;
             let mut col = 0u32;
             while j < chars.len() && chars[j].is_ascii_alphabetic() {
-                col = col * 26 + (chars[j].to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+                // 超长名字（如 ISNUMBER、NOT）会让 col 溢出：饱和相加，随后由
+                // col <= 16384 的检查把它判成「不是引用」，按普通字符原样输出。
+                col = col
+                    .saturating_mul(26)
+                    .saturating_add(chars[j].to_ascii_uppercase() as u32 - 'A' as u32 + 1);
                 j += 1;
             }
             let has_col = j > col_start;
@@ -772,6 +776,8 @@ mod tests {
         assert_eq!(shift_formula("$A$1>B1", 1, 1), "$A$1>C2");
         assert_eq!(shift_formula("SUM(A1:A3)>0", 0, 1), "SUM(B1:B3)>0");
         assert_eq!(shift_formula("\"A1\"&A1", 1, 0), "\"A1\"&A2");
+        // Long function names used to overflow the column accumulator in debug builds.
+        assert_eq!(shift_formula("NOT(ISERROR(A1))", 1, 0), "NOT(ISERROR(A2))");
     }
 }
 

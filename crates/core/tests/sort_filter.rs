@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("tests/test-work/table.xlsx");
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qa02_refs_filter/table.xlsx");
     assert!(p.exists(), "required test fixture is missing: {}", p.display());
-    Some(sheetcore::xlsx::load(p).expect("读入"))
+    Some(sheetcore::xlsx::load(&p).expect("读入"))
 }
 
 fn names(wb: &sheetcore::model::Workbook) -> Vec<String> {
@@ -16,7 +16,6 @@ fn names(wb: &sheetcore::model::Workbook) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn sort_by_amount() {
     let Some(mut wb) = load() else { return };
     let region = current_region(wb.sheet(0), 2, 2);
@@ -29,11 +28,14 @@ fn sort_by_amount() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn filter_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("tests/test-work/table_filtered.xlsx");
-    let _ = std::fs::remove_file(out);
+    let out = std::env::current_exe()
+        .expect("test exe")
+        .parent()
+        .expect("test dir")
+        .join(format!("table_filtered_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&out);
 
     let mut f = Filter::new(0, 0, 5, 2);
     let mut allow = HashSet::new();
@@ -44,8 +46,8 @@ fn filter_and_save() {
     wb.sheets[0].filter_dirty = true;
     assert_eq!(wb.sheets[0].hidden_rows.len(), 3, "销售2 + 行政1 应被隐藏");
 
-    sheetcore::xlsx::save(out, &wb).expect("保存");
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     let sh = back.sheet(0);
     let f2 = sh.filter.as_ref().expect("autoFilter 应保存");
     assert_eq!(f2.range, (0, 0, 5, 2));

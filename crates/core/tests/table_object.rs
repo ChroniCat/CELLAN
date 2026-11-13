@@ -1,13 +1,27 @@
 //! Excel 表格对象：读得出来、存得回去、结构化引用能算。
 
 use sheetcore::table;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_table_style")
+        .join(name)
+}
+
+fn out_path(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("test executable directory")
+        .join(format!("qa02_table_style_{}_{}.xlsx", name, std::process::id()))
+}
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn reads_table_object() {
-    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    let path = fixture("table_obj.xlsx");
     assert!(path.exists(), "required test fixture is missing: {}", path.display());
-    let wb = sheetcore::xlsx::load(path).expect("加载失败");
+    let wb = sheetcore::xlsx::load(&path).expect("加载失败");
     let sheet = wb.sheets.iter().find(|s| s.name == "报价").expect("没有「报价」表");
     assert_eq!(sheet.tables.len(), 1, "{:?}", sheet.tables);
     let t = &sheet.tables[0];
@@ -17,11 +31,10 @@ fn reads_table_object() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn structured_reference_resolves() {
-    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    let path = fixture("table_obj.xlsx");
     assert!(path.exists(), "required test fixture is missing: {}", path.display());
-    let wb = sheetcore::xlsx::load(path).expect("加载失败");
+    let wb = sheetcore::xlsx::load(&path).expect("加载失败");
     let si = wb.sheets.iter().position(|s| s.name == "报价").unwrap();
     // 展开结果应该是数值列（C 列）且跳过标题行
     let expanded = table::expand_structured(&wb, si, "SUM(Table1[金额])").expect("没展开");
@@ -34,12 +47,11 @@ fn structured_reference_resolves() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn save_keeps_table_parts() {
-    let path = std::path::Path::new("tests/test-work/table_obj.xlsx");
+    let path = fixture("table_obj.xlsx");
     assert!(path.exists(), "required test fixture is missing: {}", path.display());
-    let wb = sheetcore::xlsx::load(path).expect("加载失败");
-    let out = std::env::temp_dir().join("table_obj_out.xlsx");
+    let wb = sheetcore::xlsx::load(&path).expect("加载失败");
+    let out = out_path("table_obj_out");
     let _ = std::fs::remove_file(&out);
     sheetcore::xlsx::save(&out, &wb).expect("保存失败");
 

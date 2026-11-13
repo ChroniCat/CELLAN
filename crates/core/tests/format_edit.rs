@@ -1,16 +1,29 @@
 //! 格式编辑：改样式、合并、边框 → 存盘 → 读回（含外部 openpyxl 复核）
 use sheetcore::model::Value;
 use sheetcore::style::{Border, CellStyle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_table_style")
+        .join(name)
+}
+
+fn out_path(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("test executable directory")
+        .join(format!("qa02_table_style_{}_{}.xlsx", name, std::process::id()))
+}
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn edit_style_merge_border_then_save() {
-    let src = Path::new("tests/test-work/styled.xlsx");
+    let src = fixture("styled.xlsx");
     assert!(src.exists(), "required test fixture is missing: {}", src.display());
-    let mut wb = sheetcore::xlsx::load(src).expect("读入");
-    let out = Path::new("tests/test-work/styled_edit.xlsx");
-    let _ = std::fs::remove_file(out);
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
+    let out = out_path("styled_edit");
+    let _ = std::fs::remove_file(&out);
 
     // 1) 给 B10:C11 刷成：加粗 + 黄底 + 全部细边框 + 数值格式
     for r in 9..=10u32 {
@@ -32,10 +45,10 @@ fn edit_style_merge_border_then_save() {
     // 3) 拆掉原有的 A8:C8
     wb.sheets[0].unmerge_range(7, 0, 7, 2);
 
-    sheetcore::xlsx::save(out, &wb).expect("保存");
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
 
     // 4) 读回核对
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     let sh = &back.sheets[0];
     assert!(sh.merges.contains(&(12, 1, 13, 2)), "新合并区域应存在: {:?}", sh.merges);
     assert!(!sh.merges.contains(&(7, 0, 7, 2)), "被拆的合并区域应消失");

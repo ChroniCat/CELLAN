@@ -1,16 +1,30 @@
 //! 数据验证：读、校验、改、存
 use sheetcore::dv::{self, DvKind, DvOp};
 use sheetcore::model::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_cf_dv")
+        .join(name)
+}
+
+/// 保存输出写到 test executable 旁边，不再写固定输出目录
+fn out_path(tag: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test exe")
+        .parent()
+        .expect("test dir")
+        .join(format!("{}_{}.xlsx", tag, std::process::id()))
+}
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("tests/test-work/dv.xlsx");
+    let p = fixture("dv.xlsx");
     assert!(p.exists(), "required test fixture is missing: {}", p.display());
-    Some(sheetcore::xlsx::load(p).expect("读入"))
+    Some(sheetcore::xlsx::load(&p).expect("读入"))
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn parses_from_file() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -25,7 +39,6 @@ fn parses_from_file() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn validates_values() {
     let Some(wb) = load() else { return };
     let sh = wb.sheet(0);
@@ -43,11 +56,10 @@ fn validates_values() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn add_and_save_roundtrip() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("tests/test-work/dv_edit.xlsx");
-    let _ = std::fs::remove_file(out);
+    let out = out_path("qa02_dv_edit");
+    let _ = std::fs::remove_file(&out);
 
     // 给 A2:A20 加一条文本长度验证
     wb.sheets[0].dv.push(dv::DataValidation {
@@ -58,9 +70,9 @@ fn add_and_save_roundtrip() {
         ..Default::default()
     });
     wb.sheets[0].dv_dirty = true;
-    sheetcore::xlsx::save(out, &wb).expect("保存");
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
 
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     let sh = back.sheet(0);
     let added = sh
         .dv

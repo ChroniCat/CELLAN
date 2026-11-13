@@ -1,15 +1,29 @@
 //! 条件格式：从真实 xlsx 读、算叠加、改完存回
 use sheetcore::cf::{compute_stats, overlay_at, CfKind, CfSheet, CfStats};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qa02_cf_dv")
+        .join(name)
+}
+
+/// 保存输出写到 test executable 旁边，不再写固定输出目录
+fn out_path(tag: &str) -> PathBuf {
+    std::env::current_exe()
+        .expect("test exe")
+        .parent()
+        .expect("test dir")
+        .join(format!("{}_{}.xlsx", tag, std::process::id()))
+}
 
 fn load() -> Option<sheetcore::model::Workbook> {
-    let p = Path::new("tests/test-work/cf.xlsx");
+    let p = fixture("cf.xlsx");
     assert!(p.exists(), "required test fixture is missing: {}", p.display());
-    Some(sheetcore::xlsx::load(p).expect("读入"))
+    Some(sheetcore::xlsx::load(&p).expect("读入"))
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn parses_rules_from_file() {
     let Some(wb) = load() else { return };
     let cf = &wb.sheets[0].cf;
@@ -38,7 +52,6 @@ fn parses_rules_from_file() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn overlay_matches_values() {
     let Some(wb) = load() else { return };
     let sheet = wb.sheet(0);
@@ -59,7 +72,6 @@ fn overlay_matches_values() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn expression_rule_uses_block_anchor() {
     let Some(wb) = load() else { return };
     let sheet = wb.sheet(0);
@@ -88,11 +100,10 @@ fn expression_rule_uses_block_anchor() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn write_new_rules_and_save() {
     let Some(mut wb) = load() else { return };
-    let out = Path::new("tests/test-work/cf_edit.xlsx");
-    let _ = std::fs::remove_file(out);
+    let out = out_path("qa02_cf_edit");
+    let _ = std::fs::remove_file(&out);
 
     // 追加一条：A 列包含"乙" → 加粗
     {
@@ -111,10 +122,10 @@ fn write_new_rules_and_save() {
         });
         sheet.cf_dirty = true;
     }
-    sheetcore::xlsx::save(out, &wb).expect("保存");
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
 
     // 读回来：新规则还在
-    let back = sheetcore::xlsx::load(out).expect("重新读入");
+    let back = sheetcore::xlsx::load(&out).expect("重新读入");
     let cf: &CfSheet = &back.sheets[0].cf;
     let found = cf.blocks.iter().any(|b| {
         b.rules.iter().any(|r| match &r.kind {
@@ -131,11 +142,10 @@ fn write_new_rules_and_save() {
 }
 
 #[test]
-#[ignore = "requires optional synthetic fixtures under tests/test-work"]
 fn icon_sets_resolve_levels() {
-    let p = std::path::Path::new("tests/test-work/icons.xlsx");
+    let p = fixture("icons.xlsx");
     assert!(p.exists(), "required test fixture is missing: {}", p.display());
-    let wb = sheetcore::xlsx::load(p).expect("读入");
+    let wb = sheetcore::xlsx::load(&p).expect("读入");
     let sheet = wb.sheet(0);
     let cf = &sheet.cf;
     let mut st = CfStats::default();

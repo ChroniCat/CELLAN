@@ -1199,7 +1199,30 @@
         "crates/core/tests/fixtures/qa02/freeze.xlsx",
         "scripts/qa02_array_fixture.py",
         "scripts/qa02_notes_fixture.py",
-        "scripts/qa02_extended_fixtures.py"
+        "scripts/qa02_extended_fixtures.py",
+        "crates/core/src/cf.rs",
+        "crates/core/tests/conditional_format.rs",
+        "crates/core/tests/data_validation.rs",
+        "crates/core/tests/pdf_export.rs",
+        "crates/core/tests/pivot_file.rs",
+        "crates/core/tests/pivot_real.rs",
+        "crates/core/tests/refs_structural.rs",
+        "crates/core/tests/sort_filter.rs",
+        "crates/core/tests/format_edit.rs",
+        "crates/core/tests/style_merge.rs",
+        "crates/core/tests/table_object.rs",
+        "scripts/qa02_cf_dv_fixtures.py",
+        "scripts/qa02_pivot_pdf.py",
+        "scripts/qa02_refs_filter_fixture.py",
+        "scripts/qa02_table_style_fixtures.py",
+        "crates/core/tests/fixtures/qa02_cf_dv/cf.xlsx",
+        "crates/core/tests/fixtures/qa02_cf_dv/icons.xlsx",
+        "crates/core/tests/fixtures/qa02_cf_dv/dv.xlsx",
+        "crates/core/tests/fixtures/qa02_pivot_pdf/table.xlsx",
+        "crates/core/tests/fixtures/qa02_refs_filter/table.xlsx",
+        "crates/core/tests/fixtures/qa02_refs_filter/chart.xlsx",
+        "crates/core/tests/fixtures/qa02_table_style/styled.xlsx",
+        "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx"
       ],
       "commits": [
         "45f3f0c",
@@ -1214,18 +1237,33 @@
         "cargo test -p sheetcore --offline --test freeze -> 1 passed / 0 failed / 0 ignored",
         "cargo test -p sheetcore --offline -> 76 bins, 694 passed, 0 failed, 32 ignored",
         "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored; non-circular B4:D4 fixture",
-        "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored; removed unrelated tests/test-work cleanup"
+        "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored; removed unrelated tests/test-work cleanup",
+        "cargo test -p sheetcore --offline --test conditional_format -> 6 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test data_validation -> 3 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test pdf_export -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test pivot_real -> 3 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test refs_structural -> 5 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test sort_filter -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test format_edit -> 3 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test style_merge -> 2 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --test table_object -> 3 passed / 0 failed / 0 ignored",
+        "cargo test -p sheetcore --offline --lib cf::tests::formula_relative_shift -- --exact -> 1 passed",
+        "cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0",
+        "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored, exit 0",
+        "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
       ],
       "not_done": [
-        "QA-02.1 未收口；QA-02.2/QA-02.3 未开始。"
+        "QA-02.1 尚未完全收口；QA-02.2/QA-02.3 未开始。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "完成 QA-02.1 剩余 P0/P1 夹具后进入 QA-02.2/QA-02.3。",
-      "updated_utc": "2026-11-13T19:55:00Z",
+      "next": "继续 QA-02.1 剩余 vba/app 夹具，再进入 QA-02.2/QA-02.3。",
+      "updated_utc": "2026-11-13T20:04:00Z",
       "slices": [
         {
           "id": "QA-02.1",
@@ -1249,7 +1287,30 @@
             "crates/core/tests/fixtures/qa02/freeze.xlsx",
             "scripts/qa02_array_fixture.py",
             "scripts/qa02_notes_fixture.py",
-            "scripts/qa02_extended_fixtures.py"
+            "scripts/qa02_extended_fixtures.py",
+            "crates/core/src/cf.rs",
+            "crates/core/tests/conditional_format.rs",
+            "crates/core/tests/data_validation.rs",
+            "crates/core/tests/pdf_export.rs",
+            "crates/core/tests/pivot_file.rs",
+            "crates/core/tests/pivot_real.rs",
+            "crates/core/tests/refs_structural.rs",
+            "crates/core/tests/sort_filter.rs",
+            "crates/core/tests/format_edit.rs",
+            "crates/core/tests/style_merge.rs",
+            "crates/core/tests/table_object.rs",
+            "scripts/qa02_cf_dv_fixtures.py",
+            "scripts/qa02_pivot_pdf.py",
+            "scripts/qa02_refs_filter_fixture.py",
+            "scripts/qa02_table_style_fixtures.py",
+            "crates/core/tests/fixtures/qa02_cf_dv/cf.xlsx",
+            "crates/core/tests/fixtures/qa02_cf_dv/icons.xlsx",
+            "crates/core/tests/fixtures/qa02_cf_dv/dv.xlsx",
+            "crates/core/tests/fixtures/qa02_pivot_pdf/table.xlsx",
+            "crates/core/tests/fixtures/qa02_refs_filter/table.xlsx",
+            "crates/core/tests/fixtures/qa02_refs_filter/chart.xlsx",
+            "crates/core/tests/fixtures/qa02_table_style/styled.xlsx",
+            "crates/core/tests/fixtures/qa02_table_style/table_obj.xlsx"
           ],
           "commits": [
             "45f3f0c",
@@ -1264,19 +1325,34 @@
             "cargo test -p sheetcore --offline --test freeze -> 1 passed / 0 failed / 0 ignored",
             "cargo test -p sheetcore --offline -> 76 bins, 694 passed, 0 failed, 32 ignored",
             "cargo test -p sheetcore --offline --test array_formula -> 2 passed / 0 failed / 0 ignored; non-circular B4:D4 fixture",
-            "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored; removed unrelated tests/test-work cleanup"
+            "cargo test -p sheetcore --offline --test page_setup -> 3 passed / 0 failed / 0 ignored; removed unrelated tests/test-work cleanup",
+            "cargo test -p sheetcore --offline --test conditional_format -> 6 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test data_validation -> 3 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test pdf_export -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test pivot_file -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test pivot_real -> 3 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test refs_structural -> 5 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test sort_filter -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test format_edit -> 3 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test style_merge -> 2 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --test table_object -> 3 passed / 0 failed / 0 ignored",
+            "cargo test -p sheetcore --offline --lib cf::tests::formula_relative_shift -- --exact -> 1 passed",
+            "cargo test -p sheetcore --offline -> 77 bins, 721 passed, 0 failed, 9 ignored, exit 0",
+            "cargo test -p app --offline --bin app -> 232 passed, 0 failed, 0 ignored, exit 0",
+            "cargo build -p app --offline --no-default-features --features glow -> BUILD_EXIT=0"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa02-ignored-restore-batch2.txt"
           ],
           "not_done": [
-            "仅恢复 9 个核心测试；QA-02.2 的 P1 对象/输出夹具与 app/tests 对象夹具仍未恢复。",
-            "剩余 32 个 core ignored 的原因/责任人/解锁步骤台账尚未逐项补齐。"
+            "剩余 9 个 core ignored：comparison_semantics/custom_props/date_system/save_failure_injection 的人工生成或辅助进程项，以及 vba_source 的真实 OLE VBA 样本。",
+            "app/tests 的对象/UI 夹具尚未恢复。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "继续恢复 P1 对象/输出夹具，并逐项建立剩余 ignored 的原因、解锁步骤台账。",
-          "updated_utc": "2026-11-13T19:55:00Z"
+          "next": "恢复 vba_source 与 app/tests 对象夹具，补齐剩余 ignored 的原因/责任人/解锁步骤台账。",
+          "updated_utc": "2026-11-13T20:04:00Z"
         },
         {
           "id": "QA-02.2",
