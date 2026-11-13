@@ -1679,7 +1679,11 @@ impl SheetApp {
             dialog_modal: false,
             dv_alert: None,
             dv_force_once: false,
-            zoom: 1.0,
+            zoom: std::env::var("SC_ZOOM")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|z| z.clamp(0.5, 2.5))
+                .unwrap_or(1.0),
             ribbon_tab: std::env::var("SC_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             ribbon: ribbon::load(),
             ribbon_popup: None,
@@ -5025,8 +5029,8 @@ impl SheetApp {
                 continue;
             }
             // 和绘制用同一套字号/字族，量出来的才是真宽度
-            let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0
-                * self.paint_scale;
+            // 自适应是模型尺寸：必须按 100% 度量，缩放/页面比例不能写进列宽
+            let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             let fname = if st.font.is_empty() { "默认" } else { &st.font };
             let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
             let font = egui::FontId::new(
@@ -5086,8 +5090,7 @@ impl SheetApp {
             if txt.is_empty() {
                 continue;
             }
-            let size =
-                (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0 * self.paint_scale;
+            let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             let fname = if st.font.is_empty() { "默认" } else { &st.font };
             let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
             let font = egui::FontId::new(
@@ -14774,7 +14777,6 @@ let txn = self.txn_begin(&keys);
             });
         if ok {
             self.zoom = z;
-            ctx.set_zoom_factor(z);
             self.zoom_dlg = None;
         } else if open {
             self.zoom_dlg = Some(z);
@@ -16087,7 +16089,7 @@ let txn = self.txn_begin(&keys);
                 let bold = st.bold || cf_bold || table_header;
                 let family = if bold { cell_bold_family(font_name) } else { cell_family(font_name) };
                 // 样式里的 size 是磅值（Excel 的 11 磅 ≈ 14.7px），画到屏幕上要换算
-                let fs = (st.size * 4.0 / 3.0 * self.paint_scale).max(5.0);
+                let fs = (st.size * 4.0 / 3.0 * self.paint_scale * self.zoom).max(5.0);
                 let font = FontId::new(
                     if bold && !system_fonts::is_bold_loaded(font_name) { fs + 0.8 } else { fs },
                     family.clone(),
@@ -16165,7 +16167,8 @@ let txn = self.txn_begin(&keys);
                         .iter()
                         .map(|run| {
                             let size = (run.size.unwrap_or(st.size) * 4.0 / 3.0
-                                * self.paint_scale)
+                                * self.paint_scale
+                                * self.zoom)
                                 .max(5.0);
                             let run_name = run.font.as_deref().unwrap_or(font_name);
                             let fam = if run.bold { cell_bold_family(run_name) } else { cell_family(run_name) };
@@ -20405,8 +20408,10 @@ let txn = self.txn_begin(&keys);
     /// 当前表的显示版式：隐藏的行/列按 0 尺寸（和 Excel 一样，不是删数据）
     fn view_axes(&self) -> (sheetcore::layout::Axis, sheetcore::layout::Axis) {
         let s = self.wb.sheet(self.sheet_idx);
-        let mut cols = s.cols.clone();
-        let mut rows = s.rows.clone();
+        // UI-12：缩放只作用于表格几何（行高/列宽/命中），不回写模型，也不缩放功能区。
+        let z = self.zoom.clamp(0.5, 2.5);
+        let mut cols = s.cols.scaled(z);
+        let mut rows = s.rows.scaled(z);
         for r in s.hidden_rows.iter().chain(s.hidden_rows_user.iter()) {
             rows.set(*r, 0.0);
         }
@@ -21936,7 +21941,7 @@ let txn = self.txn_begin(&keys);
                 );
             }
             if !tb.text.is_empty() {
-                let fs = (tb.size * 4.0 / 3.0 * self.paint_scale).max(6.0);
+                let fs = (tb.size * 4.0 / 3.0 * self.paint_scale * self.zoom).max(6.0);
                 let fam = cell_family("");
                 let font = FontId::new(if tb.bold { fs + 0.8 } else { fs }, fam);
                 let col = Color32::from_rgb(tb.color[0], tb.color[1], tb.color[2]);
@@ -23145,7 +23150,9 @@ let txn = self.txn_begin(&keys);
                     if in_col_head {
                         let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
                         if (p.x - (px_of(c) + cols.size(c))).abs() <= edge_zone + 2.0 {
-                            self.col_drag = Some((c, p.x, cols.size(c)));
+                            // 记模型宽度；拖动增量按 zoom 折回模型
+                            let raw_w = self.wb.sheet(self.sheet_idx).cols.size(c);
+                            self.col_drag = Some((c, p.x, raw_w));
                             self.sel = (0, c);
                             self.sel_end = (1_048_575, c);
                         } else {
@@ -23160,7 +23167,8 @@ let txn = self.txn_begin(&keys);
                     } else if in_row_head {
                         let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
                         if (p.y - (py_of(r) + rows.size(r))).abs() <= edge_zone + 2.0 {
-                            self.row_drag = Some((r, p.y, rows.size(r)));
+                            let raw_h = self.wb.sheet(self.sheet_idx).rows.size(r);
+                            self.row_drag = Some((r, p.y, raw_h));
                             self.sel = (r, 0);
                             self.sel_end = (r, 16_383);
                         } else {
@@ -23178,7 +23186,7 @@ let txn = self.txn_begin(&keys);
             }
             if let Some((c, start_x, start_w)) = self.col_drag {
                 if let Some(p) = ui.ctx().pointer_interact_pos() {
-                    let w = (start_w + (p.x - start_x)).clamp(8.0, 1500.0);
+                    let w = (start_w + (p.x - start_x) / self.zoom).clamp(8.0, 1500.0);
                     if (self.wb.sheet(self.sheet_idx).cols.size(c) - w).abs() > 0.3 {
                         let sh = self.wb.sheet_mut(self.sheet_idx);
                         sh.cols.set(c, w);
@@ -23198,7 +23206,7 @@ let txn = self.txn_begin(&keys);
             }
             if let Some((r, start_y, start_h)) = self.row_drag {
                 if let Some(p) = ui.ctx().pointer_interact_pos() {
-                    let h = (start_h + (p.y - start_y)).clamp(4.0, 600.0);
+                    let h = (start_h + (p.y - start_y) / self.zoom).clamp(4.0, 600.0);
                     if (self.wb.sheet(self.sheet_idx).rows.size(r) - h).abs() > 0.3 {
                         self.wb.sheet_mut(self.sheet_idx).rows.set(r, h);
                         self.wb.dirty = true;
@@ -26306,7 +26314,6 @@ impl eframe::App for SheetApp {
             let z = (self.zoom * (1.0 + wheel * 0.0015)).clamp(0.5, 2.5);
             if (z - self.zoom).abs() > 0.001 {
                 self.zoom = z;
-                ctx.set_zoom_factor(z);
             }
         }
 
@@ -26912,7 +26919,6 @@ impl eframe::App for SheetApp {
                             .clicked()
                         {
                             self.zoom = 1.0;
-                            ctx.set_zoom_factor(1.0);
                         }
                         // 放大 / 滑杆 / 缩小（从右往左加，视觉上是 − 滑杆 +）
                         if ui
@@ -26925,14 +26931,11 @@ impl eframe::App for SheetApp {
                             )
                             .clicked()
                         {
-                            let z = (self.zoom + 0.1).clamp(0.5, 2.5);
-                            self.zoom = z;
-                            ctx.set_zoom_factor(z);
+                            self.zoom = (self.zoom + 0.1).clamp(0.5, 2.5);
                         }
                         let mut z = self.zoom;
                         if zoom_bar(ui, &mut z) {
                             self.zoom = z;
-                            ctx.set_zoom_factor(z);
                         }
                         if ui
                             .add_sized(

@@ -5002,17 +5002,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/core/src/layout.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
           "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/zoom-100.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/zoom-200.png"
+          ],
+          "not_done": [
+            "缩放后左上角单元格不保持",
+            "对象/图片随 zoom 缩放未验证",
+            "冻结窗格滚动命中待 UI-12.2"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-13T23:05:27Z"
         },
         {
           "id": "UI-12.2",

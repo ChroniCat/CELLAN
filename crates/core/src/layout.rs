@@ -104,6 +104,17 @@ impl Axis {
         self.rebuild();
     }
 
+    /// 按缩放倍数复制一份轴：默认尺寸与自定义尺寸一起缩放，隐藏(0)仍是 0。
+    /// 只影响视图几何，不回写模型。
+    pub fn scaled(&self, z: f32) -> Self {
+        let mut out = Axis::new(self.default * z);
+        for (i, w) in self.sizes.iter() {
+            out.sizes.insert(*i, *w * z);
+        }
+        out.rebuild();
+        out
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (&u32, &f32)> {
         self.sizes.iter()
     }
@@ -200,5 +211,18 @@ mod tests {
         assert_eq!(col_width_to_px(9.0), 72.0);
         assert_eq!(pt_to_px(15.0), 20.0);
         assert_eq!(pt_to_px(30.0), 40.0);
+    }
+
+    #[test]
+    fn scaled_axis_scales_default_and_custom_but_not_hidden() {
+        let mut a = Axis::new(100.0);
+        a.set(2, 150.0);
+        a.set(3, 0.0);
+        let b = a.scaled(2.0);
+        assert_eq!(b.size(0), 200.0);
+        assert_eq!(b.size(2), 300.0);
+        assert_eq!(b.size(3), 0.0, "隐藏行/列缩放后仍是 0");
+        assert_eq!(b.pos(2), 400.0);
+        assert_eq!(a.size(0), 100.0, "原轴不能被改");
     }
 }

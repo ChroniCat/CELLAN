@@ -7018,3 +7018,20 @@ fn dv_filter_handles_large_lists() {
     assert_eq!(filter_dv_items(&items, "   ").len(), 5000);
     assert!(filter_dv_items(&items, "不存在").is_empty());
 }
+/// UI-12.1：缩放只改表格几何，几何=模型尺寸×zoom；功能区/对话框不参与。
+#[test]
+fn grid_zoom_scales_axes_and_hit_testing() {
+    let mut app = app();
+    app.zoom = 2.0;
+    let (cols, rows) = app.view_axes();
+    assert!((cols.size(0) - sheetcore::layout::DEFAULT_COL_W * 2.0).abs() < 0.01);
+    assert!((rows.size(0) - sheetcore::layout::DEFAULT_ROW_H * 2.0).abs() < 0.01);
+    assert_eq!(cols.index_at(sheetcore::layout::DEFAULT_COL_W * 2.0 - 0.5), 0);
+    assert_eq!(cols.index_at(sheetcore::layout::DEFAULT_COL_W * 2.0 + 0.5), 1);
+
+    app.zoom = 0.5;
+    let (cols, rows) = app.view_axes();
+    assert!((cols.size(0) - sheetcore::layout::DEFAULT_COL_W * 0.5).abs() < 0.01);
+    assert!((rows.size(0) - sheetcore::layout::DEFAULT_ROW_H * 0.5).abs() < 0.01);
+    assert_eq!(app.zoom, 0.5, "缩放状态留在表格视图里");
+}
