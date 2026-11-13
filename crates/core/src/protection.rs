@@ -10,7 +10,7 @@
 use base64::Engine;
 use sha2::{Digest, Sha512};
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SheetProtection {
     /// "SHA-512" 或空（旧格式）
     pub algorithm: String,
@@ -24,6 +24,168 @@ pub struct SheetProtection {
     pub sheet: bool,
     pub objects: bool,
     pub scenarios: bool,
+    /// 受保护时允许的操作（Excel「保护工作表」对话框里那组勾选）
+    pub perms: ProtPerms,
+}
+
+/// 受保护工作表上允许哪些操作，对应 `sheetProtection` 的布尔属性（true = 允许）。
+///
+/// OOXML 里这些属性缺省是 **0 = 禁止**，Excel 也只写「允许」的那几个；
+/// 所以解析时缺省一律 false，写回时显式写 0/1，避免重开后被别的软件按缺省值放宽。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtPerms {
+    pub select_locked: bool,
+    pub select_unlocked: bool,
+    pub format_cells: bool,
+    pub format_columns: bool,
+    pub format_rows: bool,
+    pub insert_columns: bool,
+    pub insert_rows: bool,
+    pub delete_columns: bool,
+    pub delete_rows: bool,
+    pub insert_links: bool,
+    pub sort: bool,
+    pub auto_filter: bool,
+    pub pivot_tables: bool,
+    pub edit_objects: bool,
+    pub edit_scenarios: bool,
+}
+
+impl Default for ProtPerms {
+    fn default() -> Self {
+        Self {
+            select_locked: false,
+            select_unlocked: false,
+            format_cells: false,
+            format_columns: false,
+            format_rows: false,
+            insert_columns: false,
+            insert_rows: false,
+            delete_columns: false,
+            delete_rows: false,
+            insert_links: false,
+            sort: false,
+            auto_filter: false,
+            pivot_tables: false,
+            edit_objects: false,
+            edit_scenarios: false,
+        }
+    }
+}
+
+impl ProtPerms {
+    /// Excel「保护工作表」默认勾选：允许选择锁定/未锁定单元格，其余全禁。
+    pub const fn select_only() -> Self {
+        Self {
+            select_locked: true,
+            select_unlocked: true,
+            format_cells: false,
+            format_columns: false,
+            format_rows: false,
+            insert_columns: false,
+            insert_rows: false,
+            delete_columns: false,
+            delete_rows: false,
+            insert_links: false,
+            sort: false,
+            auto_filter: false,
+            pivot_tables: false,
+            edit_objects: false,
+            edit_scenarios: false,
+        }
+    }
+
+    pub fn get(&self, op: ProtOp) -> bool {
+        match op {
+            ProtOp::SelectLockedCells => self.select_locked,
+            ProtOp::SelectUnlockedCells => self.select_unlocked,
+            ProtOp::FormatCells => self.format_cells,
+            ProtOp::FormatColumns => self.format_columns,
+            ProtOp::FormatRows => self.format_rows,
+            ProtOp::InsertColumns => self.insert_columns,
+            ProtOp::InsertRows => self.insert_rows,
+            ProtOp::DeleteColumns => self.delete_columns,
+            ProtOp::DeleteRows => self.delete_rows,
+            ProtOp::InsertHyperlinks => self.insert_links,
+            ProtOp::Sort => self.sort,
+            ProtOp::AutoFilter => self.auto_filter,
+            ProtOp::PivotTables => self.pivot_tables,
+            ProtOp::EditObjects => self.edit_objects,
+            ProtOp::EditScenarios => self.edit_scenarios,
+        }
+    }
+
+    /// Excel 实测写法（`AllowFormattingCells:=True` → `<sheetProtection sheet="1" formatCells="0"/>`）：
+    /// 这些属性的值是「保护开关」——`0` 表示允许，整条缺失表示禁止；默认值就是禁止，
+    /// 所以只写允许的那几条，和 Excel 保存出来的 XML 一字不差。
+    fn to_attrs(&self) -> String {
+        let mut s = String::new();
+        let allows = [
+            ("formatCells", self.format_cells),
+            ("formatColumns", self.format_columns),
+            ("formatRows", self.format_rows),
+            ("insertColumns", self.insert_columns),
+            ("insertRows", self.insert_rows),
+            ("deleteColumns", self.delete_columns),
+            ("deleteRows", self.delete_rows),
+            ("insertHyperlinks", self.insert_links),
+            ("sort", self.sort),
+            ("autoFilter", self.auto_filter),
+            ("pivotTables", self.pivot_tables),
+        ];
+        for (name, on) in allows {
+            if on {
+                s.push_str(&format!(" {name}=\"0\""));
+            }
+        }
+        // 选择单元格默认是允许的，所以「禁止选择」才需要显式写 1
+        if !self.select_locked {
+            s.push_str(" selectLockedCells=\"1\"");
+        }
+        if !self.select_unlocked {
+            s.push_str(" selectUnlockedCells=\"1\"");
+        }
+        s
+    }
+}
+
+/// 受保护表上的一次操作（用来查权限，不参与序列化）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtOp {
+    SelectLockedCells,
+    SelectUnlockedCells,
+    FormatCells,
+    FormatColumns,
+    FormatRows,
+    InsertColumns,
+    InsertRows,
+    DeleteColumns,
+    DeleteRows,
+    InsertHyperlinks,
+    Sort,
+    AutoFilter,
+    PivotTables,
+    EditObjects,
+    EditScenarios,
+}
+
+impl Default for SheetProtection {
+    /// 「存在保护」的默认值：打开保护、按 Excel 对话框默认只允许选择单元格。
+    /// `sheet` 显式给 true——模型里 `Some(protection)` 就代表这张表是受保护的，
+    /// 写成 sheet="0" 会让别的软件和本项目的解析都当成未保护。
+    fn default() -> Self {
+        Self {
+            algorithm: String::new(),
+            hash: String::new(),
+            salt: String::new(),
+            spin: 0,
+            legacy: None,
+            sheet: true,
+            objects: true,
+            scenarios: true,
+            perms: ProtPerms::select_only(),
+        }
+    }
 }
 
 impl SheetProtection {
@@ -41,7 +203,13 @@ impl SheetProtection {
             sheet: true,
             objects: true,
             scenarios: true,
+            perms: ProtPerms::select_only(),
         }
+    }
+
+    /// 这项操作是否被允许（非受保护表由调用方直接放行，不走这里）。
+    pub fn can(&self, op: ProtOp) -> bool {
+        self.perms.get(op)
     }
 
     pub fn verify(&self, pw: &str) -> bool {
@@ -62,19 +230,21 @@ impl SheetProtection {
     }
 
     pub fn to_xml(&self) -> String {
+        let mut attrs = String::new();
         if self.algorithm.eq_ignore_ascii_case("SHA-512") && !self.hash.is_empty() {
-            format!(
-                "<sheetProtection algorithmName=\"SHA-512\" hashValue=\"{}\" saltValue=\"{}\" spinCount=\"{}\" sheet=\"1\" objects=\"1\" scenarios=\"1\"/>",
+            attrs.push_str(&format!(
+                " algorithmName=\"SHA-512\" hashValue=\"{}\" saltValue=\"{}\" spinCount=\"{}\"",
                 self.hash, self.salt, self.spin.max(1)
-            )
+            ));
         } else if let Some(h) = self.legacy {
-            format!(
-                "<sheetProtection password=\"{:04X}\" sheet=\"1\" objects=\"1\" scenarios=\"1\"/>",
-                h
-            )
-        } else {
-            "<sheetProtection sheet=\"1\" objects=\"1\" scenarios=\"1\"/>".into()
+            attrs.push_str(&format!(" password=\"{:04X}\"", h));
         }
+        attrs.push_str(&format!(
+            " sheet=\"{}\" objects=\"{}\" scenarios=\"{}\"",
+            self.sheet as u8, self.objects as u8, self.scenarios as u8
+        ));
+        attrs.push_str(&self.perms.to_attrs());
+        format!("<sheetProtection{attrs}/>")
     }
 }
 
@@ -140,6 +310,31 @@ pub fn parse_tag(tag: &str) -> Option<SheetProtection> {
     if !sheet && hash.is_empty() && legacy.is_none() {
         return None;
     }
+    // 这些属性是「保护开关」：0/false = 允许，1/true = 禁止（Excel 只写允许的那几条）。
+    let allowed = |name: &str| -> bool {
+        matches!(attr(name).as_deref(), Some("0") | Some("false"))
+    };
+    let objects = attr("objects").map(|v| v == "1").unwrap_or(true);
+    let scenarios = attr("scenarios").map(|v| v == "1").unwrap_or(true);
+    let perms = ProtPerms {
+        // 选择默认允许：只有显式 1 才是禁止
+        select_locked: !matches!(attr("selectLockedCells").as_deref(), Some("1") | Some("true")),
+        select_unlocked: !matches!(attr("selectUnlockedCells").as_deref(), Some("1") | Some("true")),
+        format_cells: allowed("formatCells"),
+        format_columns: allowed("formatColumns"),
+        format_rows: allowed("formatRows"),
+        insert_columns: allowed("insertColumns"),
+        insert_rows: allowed("insertRows"),
+        delete_columns: allowed("deleteColumns"),
+        delete_rows: allowed("deleteRows"),
+        insert_links: allowed("insertHyperlinks"),
+        sort: allowed("sort"),
+        auto_filter: allowed("autoFilter"),
+        pivot_tables: allowed("pivotTables"),
+        // objects=1 表示对象受保护 → 不能编辑对象；反之可以
+        edit_objects: if attr("editObjects").is_some() { allowed("editObjects") } else { !objects },
+        edit_scenarios: if attr("editScenarios").is_some() { allowed("editScenarios") } else { !scenarios },
+    };
     Some(SheetProtection {
         algorithm,
         hash,
@@ -147,8 +342,9 @@ pub fn parse_tag(tag: &str) -> Option<SheetProtection> {
         spin,
         legacy,
         sheet,
-        objects: attr("objects").map(|v| v == "1").unwrap_or(true),
-        scenarios: attr("scenarios").map(|v| v == "1").unwrap_or(true),
+        objects,
+        scenarios,
+        perms,
     })
 }
 
@@ -168,6 +364,38 @@ mod tests {
         assert_eq!(hash_password("test", &salt, 100000), want);
     }
 
+    /// C15：15 个权限位必须原样往返（Excel 只写「允许」的属性，缺省=禁止）
+    #[test]
+    fn permission_flags_round_trip() {
+        // Excel 实测：允许的项写 "0"，禁止的项整条不写
+        let tag = "<sheetProtection algorithmName=\"SHA-512\" hashValue=\"h\" saltValue=\"s\" spinCount=\"100000\" sheet=\"1\" objects=\"0\" scenarios=\"1\" selectLockedCells=\"1\" formatCells=\"0\" insertRows=\"0\" deleteRows=\"0\" sort=\"0\" autoFilter=\"0\"/>";
+        let p = parse_tag(tag).expect("应解析出保护");
+        assert!(!p.perms.select_locked, "selectLockedCells=1 表示禁止选择锁定格");
+        assert!(p.perms.select_unlocked, "缺省允许选择未锁定格");
+        assert!(p.perms.format_cells);
+        assert!(!p.perms.format_columns, "缺省不允许设置列格式");
+        assert!(p.perms.insert_rows && p.perms.delete_rows && p.perms.sort && p.perms.auto_filter);
+        assert!(!p.perms.insert_columns);
+        assert!(p.perms.edit_objects, "objects=0 → 可编辑对象");
+        assert!(!p.perms.edit_scenarios, "scenarios=1 → 方案受保护");
+
+        let again = parse_tag(&p.to_xml()).expect("写回后应能再解析");
+        assert_eq!(again.perms, p.perms, "权限位往返不能丢");
+        assert_eq!(again.objects, p.objects);
+        assert_eq!(again.scenarios, p.scenarios);
+        assert_eq!(again.hash, p.hash);
+    }
+
+    /// 保护对话框默认值：只允许选择单元格
+    #[test]
+    fn default_protection_allows_only_selection() {
+        let p = SheetProtection::new_with_password("");
+        assert!(p.can(ProtOp::SelectLockedCells));
+        assert!(p.can(ProtOp::SelectUnlockedCells));
+        assert!(!p.can(ProtOp::FormatCells));
+        assert!(!p.can(ProtOp::Sort));
+        assert!(!p.can(ProtOp::InsertRows));
+    }
     #[test]
     fn protect_and_verify() {
         let p = SheetProtection::new_with_password("s3cret");

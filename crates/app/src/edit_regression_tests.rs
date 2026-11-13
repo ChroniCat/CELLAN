@@ -3806,6 +3806,117 @@ fn protected_sheet_blocks_delete_replace_dedup_fill_and_dv_pick() {
 }
 
 
+/// C15：受保护表上「锁定公式区 + 未锁输入区」，只允许改输入区；
+/// 排序/插入行要有对应权限才放行。
+#[test]
+fn protection_keeps_formula_area_locked_and_lets_permitted_actions_through() {
+    use sheetcore::protection::{ProtPerms, SheetProtection};
+    let env = crate::test_env::TestEnv::new("c15_perm_gate");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "c15");
+    // A1 保持默认锁定（模拟公式区），B1 解锁（模拟输入区）
+    {
+        let old = app.wb.sheet(0).style_of(0, 1);
+        let mut st = app.wb.styles.get(old).clone();
+        st.locked = false;
+        let id = app.wb.styles.intern(st);
+        app.wb.sheet_mut(0).set_style(0, 1, id);
+    }
+    let mut prot = SheetProtection::default();
+    prot.sheet = true;
+    prot.perms = ProtPerms::select_only();
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.wb.dirty = false;
+
+    // 锁定区：不能进入编辑，也不产生撤销
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("改公式区".into()));
+    assert!(app.editing.is_none(), "锁定单元格不能进入编辑");
+    assert!(app.status.contains("受保护"), "{}", app.status);
+
+    // 输入区：正常写入
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.begin_edit(Some("可输入".into()));
+    assert!(app.editing.is_some(), "未锁定单元格应可编辑：{}", app.status);
+    assert!(app.commit_edit(None));
+    assert_eq!(
+        app.wb.sheet(0).get(0, 1).map(|c| c.value.clone()),
+        Some(sheetcore::model::Value::Text("可输入".into()))
+    );
+    assert_eq!(app.undo.undo_label().as_deref(), Some("编辑单元格"));
+
+    // 默认权限下：格式、排序、插入行都被拒
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    let sid_before = app.wb.sheet(0).style_of(0, 0);
+    app.apply_style(|st| st.bold = true);
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), sid_before, "锁定格无格式权限不能改");
+    app.do_sort(0, true);
+    assert!(app.status.contains("受保护"), "{}", app.status);
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert!(app.status.contains("受保护"), "{}", app.status);
+
+    // 授予权限后：同样操作放行
+    {
+        let p = app.wb.sheet_mut(0).protection.as_mut().unwrap();
+        p.perms.format_cells = true;
+        p.perms.sort = true;
+        p.perms.insert_rows = true;
+    }
+    app.apply_style(|st| st.bold = true);
+    assert_ne!(app.wb.sheet(0).style_of(0, 0), sid_before, "有格式权限就能改锁定格");
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    let a1 = app.wb.sheet(0).get(0, 0).map(|c| c.value.clone());
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.wb.sheet(0).get(1, 0).map(|c| c.value.clone()), a1, "有插入行权限就能插行");
+    app.sel = (0, 0);
+    app.sel_end = (1, 1);
+    app.do_sort(0, true);
+    assert!(app.status.contains("排序") || app.undo.undo_label().as_deref() == Some("排序"), "{}", app.status);
+    drop(env);
+}
+
+/// C15：隐藏公式在受保护状态下不进公式栏；撤销保护后恢复。
+#[test]
+fn hidden_formula_is_masked_only_while_protected() {
+    use sheetcore::protection::{ProtPerms, SheetProtection};
+    let env = crate::test_env::TestEnv::new("c15_hidden_fx");
+    let ctx = egui::Context::default();
+    let mut app = seeded_app(&env, "c15h");
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        sheetcore::model::Cell {
+            value: sheetcore::model::Value::Number(3.0),
+            formula: Some("=1+2".into()),
+        },
+    );
+    let old = app.wb.sheet(0).style_of(0, 0);
+    let mut st = app.wb.styles.get(old).clone();
+    st.hidden = true;
+    let id = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(0, 0, id);
+
+    let masked = |app: &SheetApp| -> bool {
+        let si = app.sheet_idx;
+        app.wb.sheet(si).protection.is_some() && {
+            let sid = app.wb.sheet(si).style_of(0, 0);
+            app.wb.styles.get(sid).hidden
+        }
+    };
+    assert!(!masked(&app), "未保护时隐藏公式不生效");
+    let mut prot = SheetProtection::default();
+    prot.sheet = true;
+    prot.perms = ProtPerms::select_only();
+    app.wb.sheet_mut(0).protection = Some(prot);
+    assert!(masked(&app), "受保护 + 隐藏公式时公式栏应为空");
+    app.wb.sheet_mut(0).protection = None;
+    assert!(!masked(&app), "撤销保护后公式恢复可见");
+    drop(env);
+}
 /// UI-03：受保护时清除按钮/多选清除/格式/快速排序都不能改数据、样式、undo 或 dirty。
 #[test]
 fn protected_sheet_blocks_clear_buttons_multi_select_format_and_quick_sort() {

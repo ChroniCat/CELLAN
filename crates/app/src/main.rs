@@ -484,12 +484,26 @@ impl Default for SparkDlg {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ProtectDlg {
     unprotect: bool,
     pw: String,
     confirm: String,
     err: String,
+    /// 「允许此工作表的所有用户进行」那组勾选
+    perms: sheetcore::protection::ProtPerms,
+}
+
+impl Default for ProtectDlg {
+    fn default() -> Self {
+        Self {
+            unprotect: false,
+            pw: String::new(),
+            confirm: String::new(),
+            err: String::new(),
+            perms: sheetcore::protection::ProtPerms::select_only(),
+        }
+    }
 }
 
 /// 图表拖动/缩放的状态
@@ -2612,6 +2626,10 @@ impl SheetApp {
                             }
                         }
                         Ok("revision") => self.rev_open = true,
+                        Ok("protect") => {
+                            // 保护对话框：已有保护时是撤销态，先按未保护态给出勾选面板
+                            self.protect_dlg = Some(ProtectDlg::default());
+                        }
                         Ok("xlink") => self.xlink_dlg = true,
                         Ok("find") => {
                             self.find_open_new_session();
@@ -4016,11 +4034,53 @@ impl SheetApp {
             return true;
         }
         if self.wb.sheet(self.sheet_idx).protection.is_some() {
-            self.status = "工作表受保护：请先“审阅 → 撤销保护”".into();
-            true
-        } else {
-            false
+            let rects = self.sel_rects();
+            if self.rects_have_locked(&rects) {
+                self.status =
+                    "工作表受保护：选中区域含锁定单元格，只能在未锁定区域编辑".into();
+                return true;
+            }
         }
+        false
+    }
+
+    /// 受保护表上某格是否锁定（没有样式的格子按 Excel 默认视为锁定）
+    fn cell_locked_on(&self, sheet: usize, r: u32, c: u32) -> bool {
+        let sid = self.wb.sheet(sheet).style_of(r, c);
+        self.wb.styles.get(sid).locked
+    }
+
+    /// 选区里是否含锁定单元格；超大选区直接算「含锁定」，避免逐格扫描卡住界面
+    fn rects_have_locked(&self, rects: &[(u32, u32, u32, u32)]) -> bool {
+        let total: u64 = rects
+            .iter()
+            .map(|(r1, c1, r2, c2)| (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64)
+            .sum();
+        if total > 200_000 {
+            return true;
+        }
+        rects.iter().any(|(r1, c1, r2, c2)| {
+            (*r1..=*r2)
+                .any(|r| (*c1..=*c2).any(|c| self.cell_locked_on(self.sheet_idx, r, c)))
+        })
+    }
+
+    /// 受保护表是否允许这项操作（未受保护一律允许）
+    fn prot_can(&self, op: sheetcore::protection::ProtOp) -> bool {
+        match self.wb.sheet(self.sheet_idx).protection.as_ref() {
+            Some(p) => p.can(op),
+            None => true,
+        }
+    }
+
+    /// 需要整表权限的操作（插入/删除行列、排序、筛选）：没授权就拒绝并说明原因
+    fn prot_denied(&mut self, op: sheetcore::protection::ProtOp, what: &str) -> bool {
+        if self.wb.sheet(self.sheet_idx).protection.is_none() || self.prot_can(op) {
+            return false;
+        }
+        self.status =
+            format!("工作表受保护：没有「{what}」权限（审阅 → 撤销保护后可改）");
+        true
     }
 
     /// 统一写入门禁：所有直接改模型的入口先过这里。
@@ -4032,14 +4092,44 @@ impl SheetApp {
 
     /// 指定工作表的统一门禁（跨表剪切等场景不能只看当前表）
     fn write_preflight_on(&mut self, sheet: usize, keys: &[(u32, u32)], what: &str) -> bool {
+        self.write_preflight_on_op(sheet, keys, what, None)
+    }
+
+    /// 带权限类别的写入前检查：`Some(op)` 表示这次操作由该权限放行，
+    /// 不再逐格要求未锁定（Excel 的「排序」「插入行」等权限就是这样生效的）。
+    fn write_preflight_op(
+        &mut self,
+        keys: &[(u32, u32)],
+        what: &str,
+        op: sheetcore::protection::ProtOp,
+    ) -> bool {
+        self.write_preflight_on_op(self.sheet_idx, keys, what, Some(op))
+    }
+
+    fn write_preflight_on_op(
+        &mut self,
+        sheet: usize,
+        keys: &[(u32, u32)],
+        what: &str,
+        op: Option<sheetcore::protection::ProtOp>,
+    ) -> bool {
         if self.deps_pending {
             self.status = "大文件还在后台准备依赖图，稍等一下再操作".into();
             return false;
         }
-        if self.wb.sheet(sheet).protection.is_some() {
-            let name = self.wb.sheet(sheet).name.clone();
-            self.status = format!("工作表「{name}」受保护：不能{what}（先“审阅 → 撤销保护”）");
-            return false;
+        if let Some(p) = self.wb.sheet(sheet).protection.as_ref() {
+            let allowed = match op {
+                Some(op) => p.can(op),
+                None => !keys.iter().any(|(r, c)| self.cell_locked_on(sheet, *r, *c)),
+            };
+            if !allowed {
+                let name = self.wb.sheet(sheet).name.clone();
+                self.status = match op {
+                    Some(_) => format!("工作表「{name}」受保护：没有{what}的权限"),
+                    None => format!("工作表「{name}」受保护：目标区域含锁定单元格，不能{what}"),
+                };
+                return false;
+            }
         }
         for (r, c) in keys {
             if let Some(holder) = self.lock_holder_on(sheet, *r, *c) {
@@ -9851,7 +9941,16 @@ fn clear_selection(&mut self) {
 
     /// 同上，但闭包能拿到格子坐标（画边框要用）
     fn apply_style_xy<F: Fn(&mut sheetcore::style::CellStyle, u32, u32)>(&mut self, f: F) {
-        if self.edit_blocked() {
+        if self.deps_pending {
+            self.status = "大文件还在后台准备依赖图，稍等一下再编辑".into();
+            return;
+        }
+        if self.wb.sheet(self.sheet_idx).protection.is_some()
+            && !self.prot_can(sheetcore::protection::ProtOp::FormatCells)
+            && self.rects_have_locked(&self.sel_rects())
+        {
+            self.status =
+                "工作表受保护：选区含锁定单元格，且未授予「设置单元格格式」权限".into();
             return;
         }
         let rects = self.sel_rects();
@@ -9869,7 +9968,16 @@ fn clear_selection(&mut self) {
         }
                 keys.sort_unstable();
         keys.dedup();
-        if !self.write_preflight(&keys, "设置格式") {
+        // 受保护表上如果给了「设置单元格格式」权限，锁定格也要放行；
+        // 没给权限时锁定格在进入本函数前就已被拒，未锁定格照常可改。
+        let fmt_perm = self.wb.sheet(self.sheet_idx).protection.is_some()
+            && self.prot_can(sheetcore::protection::ProtOp::FormatCells);
+        let ok = if fmt_perm {
+            self.write_preflight_op(&keys, "设置格式", sheetcore::protection::ProtOp::FormatCells)
+        } else {
+            self.write_preflight(&keys, "设置格式")
+        };
+        if !ok {
             return;
         }
 let txn = self.txn_begin(&keys);
@@ -11822,6 +11930,48 @@ let txn = self.txn_begin(&keys);
                             .desired_width(180.0),
                     );
                 });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("允许此工作表的所有用户进行：").strong());
+                egui::ScrollArea::vertical()
+                    .max_height(210.0)
+                    .show(ui, |ui| {
+                        use sheetcore::protection::ProtPerms as P;
+                        let mut row = |ui: &mut egui::Ui, label: &str, v: &mut bool| {
+                            ui.checkbox(v, label);
+                        };
+                        let P {
+                            select_locked,
+                            select_unlocked,
+                            format_cells,
+                            format_columns,
+                            format_rows,
+                            insert_columns,
+                            insert_rows,
+                            delete_columns,
+                            delete_rows,
+                            insert_links,
+                            sort,
+                            auto_filter,
+                            pivot_tables,
+                            edit_objects,
+                            edit_scenarios,
+                        } = &mut d.perms;
+                        row(ui, "选定锁定单元格", select_locked);
+                        row(ui, "选定未锁定的单元格", select_unlocked);
+                        row(ui, "设置单元格格式", format_cells);
+                        row(ui, "设置列格式", format_columns);
+                        row(ui, "设置行格式", format_rows);
+                        row(ui, "插入列", insert_columns);
+                        row(ui, "插入行", insert_rows);
+                        row(ui, "删除列", delete_columns);
+                        row(ui, "删除行", delete_rows);
+                        row(ui, "插入超链接", insert_links);
+                        row(ui, "排序", sort);
+                        row(ui, "使用自动筛选", auto_filter);
+                        row(ui, "使用数据透视表", pivot_tables);
+                        row(ui, "编辑对象", edit_objects);
+                        row(ui, "编辑方案", edit_scenarios);
+                    });
             }
             if !d.err.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 60), &d.err);
@@ -11858,9 +12008,12 @@ let txn = self.txn_begin(&keys);
                 self.wb.dirty = true;
                 self.status = "已撤销工作表保护".into();
             } else {
-                sh.protection = Some(sheetcore::protection::SheetProtection::new_with_password(
-                    &d.pw,
-                ));
+                let mut p = sheetcore::protection::SheetProtection::new_with_password(&d.pw);
+                p.perms = d.perms;
+                // objects/scenarios 与「编辑对象/编辑方案」是同一件事的两种写法
+                p.objects = !d.perms.edit_objects;
+                p.scenarios = !d.perms.edit_scenarios;
+                sh.protection = Some(p);
                 sh.protect_dirty = true;
                 self.wb.dirty = true;
                 self.status = "工作表已保护".into();
@@ -15958,7 +16111,7 @@ let txn = self.txn_begin(&keys);
         let (r, c) = self.sel;
         let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-                if !self.write_preflight(&keys, "排序") {
+                if !self.write_preflight_op(&keys, "排序", sheetcore::protection::ProtOp::Sort) {
             return;
         }
 let txn = self.txn_begin(&keys);
@@ -17071,8 +17224,30 @@ let txn = self.txn_begin(&keys);
 
     /// 插入/删除行列：结构 + 撤销 + 协作广播
     fn structural(&mut self, op: sheetcore::structural::Structural) {
-        if self.edit_blocked() {
+        if self.deps_pending {
+            self.status = "大文件还在后台准备依赖图，稍等一下再操作".into();
             return;
+        }
+        {
+            use sheetcore::protection::ProtOp as P;
+            let need = match &op {
+                sheetcore::structural::Structural::InsertRows { .. } => Some((P::InsertRows, "插入行")),
+                sheetcore::structural::Structural::InsertCols { .. } => {
+                    Some((P::InsertColumns, "插入列"))
+                }
+                sheetcore::structural::Structural::DeleteRows { .. } => Some((P::DeleteRows, "删除行")),
+                sheetcore::structural::Structural::DeleteCols { .. } => {
+                    Some((P::DeleteColumns, "删除列"))
+                }
+                _ => None,
+            };
+            if let Some((perm, label)) = need {
+                if self.prot_denied(perm, label) {
+                    return;
+                }
+            } else if self.edit_blocked() {
+                return;
+            }
         }
         self.commit_edit(None);
         if self.editing.is_some() {
@@ -25439,6 +25614,12 @@ impl eframe::App for SheetApp {
                             .unwrap_or_else(|| cell.value.display()),
                         None => String::new(),
                     };
+                    // 受保护表上「隐藏公式」的格子：公式栏与编辑框都不给看
+                    let fx_hidden = self.wb.sheet(self.sheet_idx).protection.is_some() && {
+                        let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
+                        self.wb.styles.get(sid).hidden
+                    };
+                    let cur = if fx_hidden { String::new() } else { cur };
                     let mut child = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(ed_rect)

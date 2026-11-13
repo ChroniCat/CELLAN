@@ -1,0 +1,71 @@
+# C15 工作表保护细粒度权限
+
+日期：2026-11-14 00:1x CST
+审计基线：`CellStyle` 无 locked/hidden、`SheetProtection` 只有 sheet/objects/scenarios、
+`edit_blocked` 对整张受保护表一律拒绝，无法做「锁定公式区 + 开放输入区」。
+
+## 先从 Excel 校准语义（这一步推翻了我最初的写法）
+
+用 Excel 16.0 COM 建保护表并保存，直接看 `sheet1.xml`：
+
+| 建表方式 | Excel 写出的标签 |
+| --- | --- |
+| 只允许「设置单元格格式」 | `<sheetProtection sheet="1" formatCells="0"/>` |
+| 什么都不允许 | `<sheetProtection sheet="1"/>` |
+| 全部允许 | `... insertColumns="0" insertRows="0" ... sort="0" autoFilter="0"/>` |
+
+结论：这组属性的值是**保护开关**——`0` = 允许，整条缺失 = 禁止；Excel 只写允许的项。
+（`objects="1"`/`scenarios="1"` 相反：1 表示受保护。）行为实测：
+`AllowFormattingCells:=True` 时改锁定格字体成功、排序被拒；不传该参数时改字体被拒。
+
+第一版按「1 = 允许」实现是错的，本轮已按实机结果改正，并写成往返测试锁住。
+
+## 实现
+
+- `protection.rs`：`ProtPerms` 15 位；`to_xml` 只写允许项（`="0"`），禁止选择锁定/未锁定格写 `="1"`；
+  `parse_tag` 按上面的规则解析；`SheetProtection::default()` 显式 `sheet=true`（原来 `sheet="0"`
+  会被解析成未保护，抢救副本连带丢保护——本轮由 `c14_guard` 抓出来）。
+- 单元格级 `locked`/`hidden` 已在 `CellStyle`/styles.xml 里双向读写（`<protection hidden="1"/>`、
+  `<protection locked="0"/>`）。
+- 门禁：`edit_blocked` 改为「选区含锁定格才拒」；`write_preflight` 逐格判锁；
+  排序/插入删除行列走 `write_preflight_op`，由对应权限放行；格式操作在有 `formatCells`
+  权限时放行锁定格，否则只放行未锁定格。
+- 公式栏：受保护 + `hidden` 的格子公式栏留空。
+- 「保护工作表」对话框：15 个权限勾选，默认与 Excel 一致（只勾选择锁定/未锁定）。
+
+## 真实窗口（Excel 生成的夹具 `crates/core/tests/fixtures/c15/protected.xlsx`）
+
+| 场景 | 结果 | 证据 |
+| --- | --- | --- |
+| 选中 A1（隐藏公式） | 公式栏为空，名称框 A1 | `c15-formula-hidden-a1.png` |
+| 选中 B1（未锁定输入区） | 公式栏显示「输入区」 | `c15-formula-visible-b1.png` |
+| A1 输入 | 拒绝，状态栏「工作表受保护: 选中区域含锁定单元格，只能在未锁定区域编辑」，A1 仍为 3 | `c15-locked-write-blocked.png` |
+| B1 输入「现场输入」+ Ctrl+S | 落盘成功 | `c15-input-area-write.png` |
+| 保护对话框 | 15 项勾选，默认只勾「选定锁定/未锁定单元格」 | `c15-protect-dialog.png` |
+
+## 保存后交给 Excel 复核（对 `work/goal-logs/gui/c15-live.xlsx`）
+
+```text
+B1=现场输入            ← 本应用写入
+A1_VALUE=3             ← 公式 =1+2 未被破坏
+PROTECTED=True
+A1_LOCKED=True A1_HIDDEN=True
+B1_LOCKED=False
+A1_WRITE=denied        ← Excel 自己拒绝改锁定格
+B1_WRITE=ok            ← 未锁定区可改
+FMT=ok                 ← formatCells="0" 保留，Excel 仍允许改格式
+SORT=denied            ← 排序仍被拒
+```
+
+## 回归
+
+```text
+cargo test -p sheetcore --offline -j 2 --test c15_protection   -> 3 passed
+cargo test -p sheetcore --offline -j 2 --lib protection::      -> 5 passed
+cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 261 passed
+sheetcore 全量                                                 -> 745 passed
+ui_regression                                                  -> 20 passed
+```
+
+`NOTE`：ui_regression 第一次跑时 `ribbon_groups_aligned_and_fit` 在并行下量到 2 个分组，
+单独跑与第二次全量都通过；这是该测试已有的并行测量抖动，与本次改动无关（未改功能区）。
