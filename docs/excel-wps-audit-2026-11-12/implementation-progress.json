@@ -4026,7 +4026,9 @@
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
       ],
-      "commits": [],
+      "commits": [
+        "cb628f6"
+      ],
       "commands": [
         "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
         "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
@@ -4040,7 +4042,7 @@
       "failures": [],
       "blocker": "",
       "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-      "updated_utc": "2026-11-13T06:22:00Z",
+      "updated_utc": "2026-11-13T06:24:00Z",
       "slices": [
         {
           "id": "UI-10.1",
@@ -4054,7 +4056,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "cb628f6"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app ctrl_h_opens_replace_tab_and_ctrl_f_returns_to_find_tab -> 1 passed",
             "cargo test -p app --offline --bin app -> 208 passed / 0 failed / 0 ignored"
@@ -4068,7 +4072,7 @@
           "failures": [],
           "blocker": "",
           "next": "用真实键鼠验收关闭/×/Esc 和焦点回落；不把单测当 GUI 验收。",
-          "updated_utc": "2026-11-13T06:22:00Z"
+          "updated_utc": "2026-11-13T06:24:00Z"
         }
       ]
     },

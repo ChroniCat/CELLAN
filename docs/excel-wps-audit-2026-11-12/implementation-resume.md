@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `e81c221`（Ribbon 新会话清快照 + C22 General 对齐已提交）；C11 父项已验收。
+- 分支 `main`（`origin/main`），HEAD `cb628f6`（UI-10 查找页签/关闭已提交）；C11 父项已验收。
 - 台账（`python scripts/audit_progress.py counts`）：13 已验收 / 9 待验收 / 1 实施中 / 38 待实施；
   切片 35 已验收 / 20 待验收 / 93 待实施。C11 父项已按用户 14:00 认可翻绿。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 678 passed / 0 failed / 41 ignored**，
@@ -400,7 +400,7 @@
 - 台账：13 已验收 / 8 待验收 / 1 实施中 / 39 待实施；切片 35/19/0/94。
 - 已提交：`e81c221`（`main.rs`、`edit_regression_tests.rs`、`ribbon/actions.rs`、progress JSON、
   resume、c11-final-acceptance、ui05-ribbon-session、c22-general-alignment）。
-- 下一步：提交/推送本批，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
+- 下一步：提交/推送 UI-10，然后继续原 61/148（UI-05 真实鼠标/取消/虚拟滚动、C22 长文本、
   其余 P0/P1 任务）。
 
 ## 14:22 当前：UI-10 查找页签与关闭覆盖
