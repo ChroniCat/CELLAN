@@ -2342,7 +2342,8 @@
         "crates/core/src/style.rs"
       ],
       "commits": [
-        "8cd81fe"
+        "8cd81fe",
+        "cc3cec5"
       ],
       "commands": [
         "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed / 0 failed",
@@ -2370,7 +2371,8 @@
           "acceptance": "序列 59/60/61 分别对应 1900-02-28/1900-02-29/1900-03-01；DATE(1900,2,29)=60；DAY(60)=29、MONTH(60)=2、YEAR(60)=1900、TEXT/单元格格式均为 1900-02-29；1904 体系不接受虚构的 1900-02-29。",
           "files": [],
           "commits": [
-            "8cd81fe"
+            "8cd81fe",
+            "cc3cec5"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed",
@@ -2397,7 +2399,8 @@
           "acceptance": "NOW/TODAY 使用注入/系统本地时间；Asia/Shanghai 00:30（UTC 前一天16:30）TODAY 为本地当天且 NOW 不差 8 小时；时区变化和午夜前后不串快照；同一 Calc 内 NOW()-NOW()=0，多遍重算共享快照；D1900/D1904 的实际 recalc_all_force 与 recalc_sheet 都先绑定工作簿日期体系再建快照。",
           "files": [],
           "commits": [
-            "8cd81fe"
+            "8cd81fe",
+            "cc3cec5"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --lib formula::functions::clock_and_serial60_tests -> 5 passed",
