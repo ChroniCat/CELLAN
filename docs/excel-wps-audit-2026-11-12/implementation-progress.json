@@ -3952,7 +3952,9 @@
       "status": "实施中",
       "acceptance": "UI-09.1/09.2/09.3 三项行为均有专项证据，但真机键盘、名称框焦点、IME 与 Office 目视仍待验收；父项不提前标已验收。",
       "files": [],
-      "commits": [],
+      "commits": [
+        "f19b932"
+      ],
       "commands": [],
       "evidence": [],
       "not_done": [],
@@ -4037,7 +4039,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "f19b932"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app tab_enter_cycle_inside_selection_and_stop_at_sheet_edges -> 1 passed",
             "cargo test -p app --offline --bin app -> 213 passed / 0 failed / 0 ignored"
