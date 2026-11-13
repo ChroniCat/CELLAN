@@ -1,6 +1,6 @@
 # 恢复记录
 
-- 分支 `main`（`origin/main`），HEAD `136b81e`（C11.3/C11.4 与 XLS 兼容保护已提交）；本轮反向真实顺序与 C11 输入/重算保护见文末。
+- 分支 `main`（`origin/main`），HEAD `304ea01`（C11 外部三维缓存保护已提交）；本轮反向真实顺序与 C11 输入/重算保护见文末。
 - 台账（`python scripts/audit_progress.py counts`）：12 已验收 / 7 待验收 / 2 实施中 / 40 待实施；
   切片 33 已验收 / 20 待验收 / 95 待实施（C10.1 已按用户 10:49 认可翻为已验收）。
 - 当前测试真值（13:35 后重跑）：core **75 bins / 677 passed / 0 failed / 41 ignored**，
