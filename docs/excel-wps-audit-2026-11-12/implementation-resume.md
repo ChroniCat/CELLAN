@@ -1,5 +1,22 @@
 # 恢复记录
 
+## 2026-11-14 检查点：C12.2/C12.3、QA-01.3、UI-25 进待验收
+
+- 代码 HEAD `32e9390` 已 push；台账 **已验收 24 / 61** 不变，新增只进待验收。
+- 测试基线：sheetcore **815 passed**；app `--bin app` **268 passed**。
+- 单 cargo 继续：全部命令 `-j 2`、测试 `--test-threads=2`。
+- **C12.2/C12.3（待验收）**：新增 `pivot_multi.rs` 多行/多列/多值/筛选/小计/总计，
+  行与列用拼音序；与 Excel 真透视同数据对拍（北京 20/1、华东小计 130/2、总计 150/3），
+  `c12_multi` 5 条；透视对话框新增「多字段…」面板，生成/刷新先清旧区域；
+  值化网格 Excel/WPS 可编辑往返；**多字段真 pivotTable 部件未实现，C12.4 仍待实施**。
+- **QA-01.3（待验收）**：`qa01_extended_roundtrip.py` 增加 `pivot` 类别，
+  用 Excel COM 造真 pivotTable 夹具；chart/page/pivot 9/9 三方路径通过，
+  JSON 与证据入 `implementation-evidence/qa01*`。
+- **UI-25（待验收）**：状态栏统计按 Excel 口径（计数=非空格、数值统计只吃 Number），
+  默认平均/计数/求和，右键六项复选，`stat_mask` 持久化 `ui.ini`；
+  `fixtures/c10/table.xlsx` A2:E5 实测 `2.6 / 10 / 26`；app 268 passed。
+- 仍未关闭：C12.4 多字段真透视、QA-01 父项矩阵、C15/C17 等待监督复核。
+
 ## 2026-11-14 检查点：C19/C20/UI-15.3 完成，监督 C15/C17 缺口关闭
 
 - 分支 `main`，代码 HEAD `6d59ed7` 已 push（本文件随后单独提交，代码以该 SHA 为准）。
