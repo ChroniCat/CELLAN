@@ -3876,7 +3876,8 @@
       "commits": [
         "2745438",
         "fb2b55d",
-        "f97377a"
+        "f97377a",
+        "5fd9ea3"
       ],
       "commands": [],
       "evidence": [],
@@ -3962,7 +3963,9 @@
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
+          "commits": [
+            "5fd9ea3"
+          ],
           "commands": [
             "cargo test -p app --offline --bin app format_dialog_preserves_border_thickness_and_color_when_other_side_changes -> 1 passed",
             "cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored"
@@ -3995,7 +3998,8 @@
       "acceptance": "UI-09.1/09.2/09.3 行为均有专项证据；真机键盘、名称框焦点、IME、查找跳转 GUI 与 Office 目视仍待验收，父项不提前标已验收。",
       "files": [],
       "commits": [
-        "f19b932"
+        "f19b932",
+        "5fd9ea3"
       ],
       "commands": [],
       "evidence": [],
@@ -4051,7 +4055,8 @@
           ],
           "commits": [
             "008b573",
-            "4202fae"
+            "4202fae",
+            "5fd9ea3"
           ],
           "commands": [
             "cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet -> 1 passed",
@@ -4082,7 +4087,8 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "f19b932"
+            "f19b932",
+            "5fd9ea3"
           ],
           "commands": [
             "cargo test -p app --offline --bin app tab_enter_cycle_inside_selection_and_stop_at_sheet_edges -> 1 passed",
