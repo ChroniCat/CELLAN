@@ -25,9 +25,10 @@ UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 - 命令：cargo test -p app --offline --bin app filter_clear -> 2 passed；
   全量 210 passed / 0 failed / 0 ignored，APP_EXIT=0。
 
-未完成
-- 没有真实 Excel/WPS 打开该 xlsx 目视确认箭头形态；没有真实鼠标点三个菜单入口。
-  UI-18 保持待验收，不用单测替代 GUI/Office 验收。
+## 历史记录：16:12 时的未完成项（已由后续证据补齐，不删除）
+- 当时没有真实 Excel/WPS 打开该 xlsx 目视确认箭头形态；没有真实鼠标点三个菜单入口。
+  该状态是 16:12 的历史记录，后续 18:xx GUI 与 19:xx 持久化/Excel 读回已补齐；
+  UI-18 已于 19:24 由监督确认验收。
 
 ## 16:12 CST 实际 GUI 操作记录（未计入验收）
 
@@ -40,7 +41,7 @@ UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 - 之后尝试用 `computer_use` 在“数据”页签坐标点击（背景投递与 foreground 各一次），
   返回 `screen unchanged`；后续 `focus_app` 因 cua-driver session 结束被拒。
   没有取得“点击真正改变 Ribbon/菜单”的证据，因此不把本轮算作 UI-18 的真实鼠标验收。
-- 仍未做：真实 Excel/WPS 目视、三个菜单入口点击。UI-18 保持待验收。
+- 当时未做：真实 Excel/WPS 目视、三个菜单入口点击；这是历史记录，后续已补齐，UI-18 已验收。
 
 ## 19:06 CST 持久化来源闭环（真实保存链之后补）
 
@@ -107,7 +108,16 @@ UI-18 筛选清除入口语义（2026-11-13 14:21 CST）
 - 第三方 OOXML 没有 `_sc_manual_hidden` 时，无法从单个 `row hidden` 恢复
   “手动且筛选 overlap”的未知历史；本 App 保存的文件有来源信息，故不会丢。
 - 用户已确认 UI-18 原范围不额外要求独立 Excel/WPS 目视矩阵；未做的不再作为
-  本切片的硬门槛。UI-18 仍待监督复核，不自行记为已验收。
+  本切片的硬门槛。该句是 19:06 的待复核历史记录；19:24 监督已确认 UI-18 验收通过。
+### 19:24 CST 监督最终确认
+- UI-18 父项按原要求验收通过，第 15/61 项；不再追加 Office 矩阵或重开非重叠/转义名。
+- 复核依据：`49221` 专项 0、`49255` app 232/0/0、`49277/79` core 683/0/41、`49245` build 0；
+  既有 GUI 条件应用/清除/箭头保留/关闭箭头去/manual 保留，以及多入口统一证据。
+- 归档 overlap 件 `ui18-filter-overlap-source.xlsx` SHA-256
+  `b76a1c3e860127783705346935feafcb422d519395191e537301c9af74e3752d`：
+  manual 第 2/3 行仍隐、filter-only 第 5 行恢复，无 autoFilter。
+- 第三方无 `_sc_manual_hidden` 来源时无法恢复未知 overlap 历史；该限制诚实保留，不扩大声称。
+
 ### 证据件归档
 - `ui18-filter-bug-row2-row3.xlsx`（旧 bug：row2/row3 均 hidden）
 - `ui18-filter-fixed-row2-visible.xlsx`（修复：row2 visible，row3 hidden，无 autoFilter/FilterDatabase）

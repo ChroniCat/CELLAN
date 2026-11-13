@@ -4868,8 +4868,8 @@
       "scope": "app/main.rs + ribbon/actions.rs筛选",
       "source": "ui-requirements.md",
       "heading": "UI-18 筛选清除入口语义一致",
-      "status": "待验收",
-      "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。",
+      "status": "已验收",
+      "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。 监督 2026-11-13 19:24 CST 最终确认 UI-18 父项按原范围验收通过（第 15/61 项）；结合 GUI 条件应用/清除/关闭、真实保存、overlap 全序列 save/load 与 A&B 回归，不再追加 Office 矩阵。",
       "files": [
         "crates/app/src/edit_regression_tests.rs",
         "crates/app/src/main.rs",
@@ -4893,7 +4893,8 @@
         "cargo test -p sheetcore --offline --lib remove_filter_database_matches_escaped_sheet_name_and_keeps_other -> 1 passed",
         "cargo test -p sheetcore --offline --lib -> 271 passed / 0 failed / 0 ignored",
         "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
-        "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored"
+        "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored",
+        "supervisor confirmation 2026-11-13 19:24 CST -> 15/61"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
@@ -4904,13 +4905,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-db-escape.xlsx"
       ],
       "not_done": [
-        "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。",
-        "等待监督复核 UI-18 父项；不自行记为已验收。"
+        "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "等待监督复核；全量 core 结果补入。",
-      "updated_utc": "2026-11-13T19:13:05Z",
+      "next": "已验收；下一项按 task-index 选择依赖已满足的最高优先级任务。",
+      "updated_utc": "2026-11-13T19:24:19Z",
       "slices": [
         {
           "id": "UI-18.1",
@@ -4918,8 +4918,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。",
+          "status": "已验收",
+          "acceptance": "Ribbon FilterClear 只清 allows/criteria 并恢复条件隐藏行，保留 filter/箭头；disable_filter 才置 None；reapply_filter 重算隐藏行；数据菜单和右键菜单拆出“清除筛选条件/重新应用/关闭筛选”。保存时把 hidden_rows_user 作为隐藏 definedName `_sc_manual_hidden`（hidden=1，hex JSON）持久化；load 优先用它恢复手动来源，overlap 行在 clear/disable 后仍手动隐藏，filter-only 行恢复。第三方无该来源信息时只能按 row hidden 推断，不再声称恢复未知历史。真实保存链已在 18:33:54 落盘（mtime/size/hash 见证据）；close filter 后旧 bug row2 误留、FilterDatabase 残留，新 core 回归分别断言 row2 不 hidden、row3 保留、名称清理。A&B XML 转义匹配回归已补。 监督 2026-11-13 19:24 CST 最终确认 UI-18 父项按原范围验收通过（第 15/61 项）；结合 GUI 条件应用/清除/关闭、真实保存、overlap 全序列 save/load 与 A&B 回归，不再追加 Office 矩阵。",
           "files": [
             "crates/app/src/edit_regression_tests.rs",
             "crates/app/src/main.rs",
@@ -4943,7 +4943,8 @@
             "cargo test -p sheetcore --offline --lib remove_filter_database_matches_escaped_sheet_name_and_keeps_other -> 1 passed",
             "cargo test -p sheetcore --offline --lib -> 271 passed / 0 failed / 0 ignored",
             "cargo test -p app --offline --bin app -> 232 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored"
+            "cargo test -p sheetcore --offline -> 75 bins / 683 passed / 0 failed / 41 ignored",
+            "supervisor confirmation 2026-11-13 19:24 CST -> 15/61"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-clear.txt",
@@ -4954,13 +4955,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-filter-db-escape.xlsx"
           ],
           "not_done": [
-            "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。",
-            "等待监督复核 UI-18 父项；不自行记为已验收。"
+            "第三方 OOXML 无 _sc_manual_hidden 来源信息时，无法恢复未知的“手动且筛选 overlap”历史；本 App 保存的文件已持久化来源，不丢。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "等待监督复核；全量 core 结果补入。",
-          "updated_utc": "2026-11-13T19:13:05Z"
+          "next": "已验收；下一项按 task-index 选择依赖已满足的最高优先级任务。",
+          "updated_utc": "2026-11-13T19:24:19Z"
         }
       ]
     },

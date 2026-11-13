@@ -3,8 +3,8 @@
 - 分支 `main`（`origin/main`）；当前代码检查点 `639ee42`（UI-18 手动隐藏来源持久化 + `_FilterDatabase`/A&B 清理，`838035d` 代码提交）。
   之前 `930ff80` 是已有文件填充/保护逆向写回；`b02c047` 是 UI-16 三处入口修复 +
   UI-15.2 填充/保护页；`745e1ab` 已获 15:47 认可。
-- 台账（`python scripts/audit_progress.py counts`）：任务 **14 已验收** / 9 待验收 /
-  5 实施中 / 33 待实施；切片 **36 已验收** / 29 待验收 / 83 待实施。父项 **14/61**。
+- 台账（`python scripts/audit_progress.py counts`）：任务 **15 已验收** / 8 待验收 /
+  5 实施中 / 33 待实施；切片 **37 已验收** / 28 待验收 / 83 待实施。父项 **15/61**。
 - 当前测试真值（19:13 重跑）：core **75 bins / 683 passed / 0 failed / 41 ignored**，
   CORE_EXIT=0；app **232 passed / 0 failed / 0 ignored**，APP_EXIT=0；
   `cargo build -p app --offline --no-default-features --features glow` 成功。
@@ -26,6 +26,8 @@
 - UI-18 真实条件/清除/关闭 GUI 已获 18:10 局部认可；18:34–18:57 进一步确认
   实际持久化 bug（旧件 row2 filter-only 被写回 hidden、FilterDatabase 残留）并补齐
   手动来源持久化（`_sc_manual_hidden`）/overlap 回归，待监督复核。
+- UI-18 已于 19:24 由监督最终确认验收（第 15/61），不再追加 Office 矩阵；
+  第三方无来源信息限制保留。
 - 当前未完成：UI-16.1 真实 GUI/Office；UI-15.1/15.2 真实鼠标与 Office；
   UI-15.3 双下划线/竖排仍为待实施（早期尝试未保留）。
 
@@ -519,7 +521,13 @@
   自定义格式保存 xlsx 重开保留；专项 1 passed，全量 218；实机 framebuffer 已截。
   UI-15.1 待验收，UI-15 父项实施中。
 
-## 19:06 当前：UI-18 持久化来源闭环（待复核）
+## 19:24 监督确认 UI-18 验收（第 15/61）
+
+- 用户确认父项原范围通过；台账任务 15/61、切片 37/148。
+  证据 `ui18-filter-clear.txt`、overlap 归档 SHA `b76a1c3e...3752d`。
+  第三方无 `_sc_manual_hidden` 时不能恢复未知 overlap 历史，限制保留。
+
+## 19:06 当前：UI-18 持久化来源闭环（历史，已被 19:24 验收覆盖）
 
 - 真实保存触发已确认：`[save] 已保存 .../ui18_gui_fixed.xlsx`，mtime
   `2026-11-13 18:33:54.832679700 +0800`，size 5753，SHA-256
