@@ -840,6 +840,68 @@ fn key_event(key: egui::Key, shift: bool) -> egui::Event {
     }
 }
 
+/// UI-09.2：PageUp/Down 按视口可见行数翻页（不是固定 20 行），跳过隐藏行；
+/// Ctrl+PageUp/Down 切可见工作表且不修改单元格。
+#[test]
+fn page_keys_follow_viewport_and_ctrl_page_switches_sheet() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("keep"));
+    app.wb.sheets.push(sheetcore::Sheet::new("Second"));
+    app.wb.sheet_mut(1).set(0, 0, number(99.0));
+    app.last_view = egui::vec2(1000.0, 720.0);
+    app.scroll = egui::Vec2::ZERO;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+
+    // 720p：隐藏第 2/3 行，翻页必须跳过，而不是落到不可见格。
+    app.wb.sheet_mut(0).rows.set(1, 0.0);
+    app.wb.sheet_mut(0).rows.set(2, 0.0);
+    let n720 = app.visible_page_rows();
+    let mut expected720 = 0u32;
+    for _ in 0..n720.saturating_sub(1) {
+        expected720 = app.next_visible_row(expected720, true);
+    }
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
+    assert_eq!(app.sel.0, expected720, "PageDown 应按视口行数而不是固定 20 行");
+    assert!(app.sel.0 >= 3, "隐藏行 1/2 不能成为落点");
+
+    // 1080p：可见行更多，翻页步长应随之增大。
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.scroll = egui::Vec2::ZERO;
+    app.last_view = egui::vec2(1000.0, 1080.0);
+    let n1080 = app.visible_page_rows();
+    assert!(n1080 >= n720, "1080p 可见行数不应少于 720p");
+    let mut expected1080 = 0u32;
+    for _ in 0..n1080.saturating_sub(1) {
+        expected1080 = app.next_visible_row(expected1080, true);
+    }
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
+    assert_eq!(app.sel.0, expected1080);
+
+    // 到最大行不越界。
+    app.sel = (1_048_575, 0);
+    app.sel_end = (1_048_575, 0);
+    app.scroll = egui::Vec2::ZERO;
+    app.last_view = egui::vec2(1000.0, 720.0);
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::PageDown, false)]);
+    assert_eq!(app.sel.0, 1_048_575);
+
+    // Ctrl+PageDown/Up：只切可见表，不改单元格内容。
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    let a0 = app.wb.sheet(0).value(0, 0);
+    let b0 = app.wb.sheet(1).value(0, 0);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::PageDown)]);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.wb.sheet(0).value(0, 0), a0);
+    assert_eq!(app.wb.sheet(1).value(0, 0), b0);
+    run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::PageUp)]);
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!(app.wb.sheet(0).value(0, 0), a0);
+}
+
 #[test]
 fn shift_arrows_extend_selection_and_plain_arrow_collapses() {
     let ctx = egui::Context::default();
@@ -3517,7 +3579,11 @@ fn filter_clear_survives_save_reload() {
     sh.hidden_rows = f.hidden_rows(sh);
     sh.hidden_rows_user.insert(4);
     app.ribbon_action("FilterClear", &ctx);
-    let tmp = std::env::temp_dir().join(format!("ui18_filter_{}.xlsx", std::process::id()));
+    let tmp = std::env::current_exe()
+        .expect("test exe")
+        .parent()
+        .expect("test dir")
+        .join(format!("ui18_filter_{}.xlsx", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     sheetcore::xlsx::save(&tmp, &app.wb).expect("save");
     let back = sheetcore::xlsx::load(&tmp).expect("load");

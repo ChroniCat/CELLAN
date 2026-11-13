@@ -1,0 +1,32 @@
+UI-09.2 按视口翻页与切表（2026-11-13 15:05 CST）
+
+问题
+- PageUp/PageDown 固定 20 行，720p 与 1080p 没有差别，还会落到隐藏行。
+- Ctrl+PageUp/PageDown 没有切工作表分支，仍落入翻页。
+- 到 1048576 行没有显式边界断言。
+
+修改
+- visible_page_rows：按 last_view 高度、当前 scroll.y 与真实行高统计可见数据行，
+  跳过隐藏行（rows.size==0），最多 8192 个候选。
+- page_move：步长 = 可见行数 - 1（保留一行重叠），逐行调用 next_visible_row，
+  跳过隐藏行；PageUp 反向；到达 1048575 停住。
+- next_visible_row：上下查找第一个非隐藏行。
+- switch_sheet_relative：Ctrl+PageDown 向后、Ctrl+PageUp 向前，跳过隐藏表，循环；
+  切表前 commit_edit，只清选区/滚动，不修改任何单元格。
+- 清理 UI-18 保存重开测试的临时路径：改用 current_exe().parent()，避免并行 test_env
+  删除 TEMP 导致 page-setup 失败（这是本次全量跑出的真实回归）。
+
+验证
+- edit_regression_tests::page_keys_follow_viewport_and_ctrl_page_switches_sheet：
+  720p 隐藏第 2/3 行时 PageDown 落点等于可见行遍历结果且不落隐藏行；1080p 可见行数
+  不少于 720p 且落点按新视口计算；最大行不越界；Ctrl+PageDown 到第二表、
+  Ctrl+PageUp 回第一表，两张表 A1 内容均未变化。
+- 命令：cargo test -p app --offline --bin app page_keys_follow_viewport_and_ctrl_page_switches_sheet
+  -> 1 passed。
+- 全量：cargo test -p app --offline --bin app -> 211 passed / 0 failed / 0 ignored，APP_EXIT=0。
+- UI-18：filter_clear_survives_save_reload 在全量中通过，临时路径已修正。
+
+未完成
+- 没有在 720/1080 真机窗口用真实键盘重复；没有验证 PageUp 在滚动到底部的精确
+  重叠行视觉效果，也没有把 Ctrl+PageUp 与每表选区状态（UI-16）合并。
+  UI-09.2 保持待验收，UI-09 父项不翻绿。

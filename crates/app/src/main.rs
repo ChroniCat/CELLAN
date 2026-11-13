@@ -6857,6 +6857,78 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
+    /// 当前视口实际可见的数据行数（跳过隐藏行；含底部部分可见行）。
+    fn visible_page_rows(&self) -> u32 {
+        let (_, rows) = self.view_axes();
+        let view_h = (self.last_view.y - HEAD_H).max(44.0);
+        let top = self.scroll.y;
+        let mut r = rows.index_at(top);
+        let mut n = 0u32;
+        let mut guard = 0u32;
+        while r <= 1_048_575 && rows.pos(r) < top + view_h && guard < 8192 {
+            if rows.size(r) > 0.0 {
+                n += 1;
+            }
+            r += 1;
+            guard += 1;
+        }
+        n.max(1)
+    }
+
+    /// 下一个可见行/列，跳过隐藏（尺寸为 0）的行/列；到边界则停住。
+    fn next_visible_row(&self, from: u32, down: bool) -> u32 {
+        let (_, rows) = self.view_axes();
+        let mut r = from;
+        let mut guard = 0u32;
+        loop {
+            if down {
+                if r >= 1_048_575 { return r; }
+                r += 1;
+            } else {
+                if r == 0 { return r; }
+                r -= 1;
+            }
+            guard += 1;
+            if rows.size(r) > 0.0 || guard >= 1_048_576 {
+                return r;
+            }
+        }
+    }
+
+    /// PageUp/PageDown：按当前视口可见行数翻页，保留一行重叠；不落到隐藏行。
+    fn page_move(&mut self, down: bool) {
+        let step = self.visible_page_rows().saturating_sub(1).max(1);
+        let (mut r, c) = self.sel;
+        for _ in 0..step {
+            r = self.next_visible_row(r, down);
+        }
+        self.sel = (r, c);
+        self.sel_end = (r, c);
+        self.ensure_visible();
+    }
+
+    /// Ctrl+PageUp/PageDown：在当前文档内切换可见工作表，跳过隐藏表。
+    fn switch_sheet_relative(&mut self, delta: i32) {
+        let n = self.wb.sheets.len();
+        if n < 2 {
+            return;
+        }
+        self.commit_edit(None);
+        let mut i = self.sheet_idx as i32;
+        for _ in 0..n {
+            i = (i + delta).rem_euclid(n as i32);
+            if !self.wb.sheets[i as usize].hidden {
+                self.sheet_idx = i as usize;
+                self.sel = (0, 0);
+                self.sel_end = (0, 0);
+                self.extra_sel.clear();
+                self.scroll = Vec2::ZERO;
+                self.status = format!("当前工作表：{}", self.wb.sheet(self.sheet_idx).name);
+                return;
+            }
+        }
+    }
+
     /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // 保存/打开/新建/打印/撤销/重做由 crate::command 的命令表统一处理
@@ -7050,14 +7122,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.ensure_visible();
             return;
         }
+        if ctrl && (pgup || pgdn) {
+            self.switch_sheet_relative(if pgdn { 1 } else { -1 });
+            return;
+        }
         if pgup || pgdn {
             self.commit_edit(None);
-            let step = 20u32;
-            let (r, c) = self.sel;
-            let r = if pgdn { r.saturating_add(step) } else { r.saturating_sub(step) };
-            self.sel = (r, c);
-            self.sel_end = (r, c);
-            self.ensure_visible();
+            self.page_move(pgdn);
             return;
         }
         if ctrl && (ctx.input(|i| i.key_pressed(Key::ArrowUp))
