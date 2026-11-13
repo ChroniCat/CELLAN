@@ -3927,7 +3927,7 @@
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "fmt_orig 逐字段 diff，只提交变化属性；未改直接确定不重写；边框仅在开关变化时整组提交；混合选区各字段显示混合，两格只改数字格式后各自字体颜色保留。专项 1 passed，全量 app 215。",
+          "acceptance": "fmt_orig 逐字段 diff，只提交变化属性；未改直接确定不重写；边框仅在开关变化时整组提交；混合选区各字段显示混合，两格只改数字格式后各自字体颜色保留。专项 1 passed，全量 app 215。 15:04 实机 framebuffer 选中 A1:A2 打开格式对话框，数字页格式/示例显示“混合”。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -3941,7 +3941,8 @@
             "cargo test -p app --offline --bin app -> 215 passed / 0 failed / 0 ignored"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-mixed.png"
           ],
           "not_done": [
             "真实鼠标确定/取消/Esc、混合项显示截图与 Excel/WPS 目视未做"
@@ -3949,7 +3950,7 @@
           "failures": [],
           "blocker": "",
           "next": "补混合值显示和真实鼠标/Office 目视，再做 UI-08.3 一次事务与撤销。",
-          "updated_utc": "2026-11-13T06:54:36Z"
+          "updated_utc": "2026-11-13T07:06:30Z"
         },
         {
           "id": "UI-08.3",

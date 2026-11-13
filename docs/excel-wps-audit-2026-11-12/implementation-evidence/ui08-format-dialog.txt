@@ -32,3 +32,12 @@ UI-08.2 格式对话框只提交改动字段与混合值（2026-11-13 14:54 CST�
 未完成
 - 真实鼠标打开确定、取消、Esc、混合项显示截图和 Excel/WPS 目视仍未做。
   UI-08.2 保持待验收，父项不翻绿。
+
+## 15:04 真实 framebuffer：混合值显示
+- 用合成工作簿 ui08_gui_probe.xlsx（A1 红粗体宋体 13/0.00，A2 蓝常规黑体 10/0），
+  SC_SEL=0,0 / SC_SEL2=1,0 选中 A1:A2，SC_OPEN_DIALOG=format 打开对话框，
+  SC_SHOT 抓应用自身 framebuffer：1440×900 PNG。
+- 目视确认：对话框“数字”页的格式下拉与示例均为“混合”，选区名称框 A1:A2，
+  数字格式功能区显示活动格 0.00；这证明混合值进入真实 UI，不只是单元测试。
+- 证据：implementation-evidence/ui08-format-mixed.png。
+- 仍未做真实鼠标切字体/边框页、确定/取消/Esc，以及 Excel/WPS 目视；UI-08 父项不翻绿。
