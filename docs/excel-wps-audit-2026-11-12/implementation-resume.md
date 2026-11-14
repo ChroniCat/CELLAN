@@ -1,5 +1,27 @@
 # 恢复记录
 
+## 2026-11-14 检查点：UI-23 KeyTips/右键键盘，UI-08/09 待验收
+
+- 代码 HEAD `fb2ed65` 已 push（UI-23 实现 `ba1c22c` + 证据提交）。
+  单 cargo `-j 2`，测试 `--test-threads=2`。
+- 台账：**24 已验收 / 61**，26 待验收，3 实施中（QA-01、C12、UI-17），
+  8 待实施（QA-04/05/06/07、UI-11/24/29/30）。24/61 是台账计数，不是监督认可数。
+- 测试：app `--bin app` **305 passed / 0 failed**；sheetcore lib **295 passed**；
+  日志 `work/goal-logs/ui23-app-final.log` / `ui23-core-final.log`。
+- **UI-23**：Alt 页签后进入命令级 KeyTips；开始 B=所有框线、数据 F=筛选、
+  视图 F=冻结，Excel 16.0 保存回读分别 Borders=1,1,1,1、AutoFilterMode=True、
+  FreezePanes=True/SplitRow=1/SplitColumn=1。Shift+F10 打开当前对象菜单，
+  ↑↓/→/Enter/Esc 逐级操作；菜单和子菜单按窗口边缘内移、子菜单不覆盖父菜单。
+  证据 `implementation-evidence/ui23-keytips.txt` 与 `ui23/*.png`。
+  not_done：物理键盘/鼠标未执行；仅三个命令配置了 KeyTip。
+- **UI-08**：四方向/外框/内横线保存重开后 Excel 逐边回读通过；
+  格式对话框物理鼠标未执行，父项待验收。
+- **UI-09**：720p/1080p 真窗口 PageDown dump 步长 20/40 行，活动格/scroll 同步；
+  真实物理键盘/IME 未执行，父项待验收。
+- 仍未关闭：C12.4 真 pivotTable、QA-01 父项矩阵、UI-17 父项更新、
+  C15/C17 监督复核、UI-19 键盘下拉实证、UI-24 可访问性。
+- 下一优先：UI-24 对话框一致性/屏幕阅读；UI-11 公式输入辅助；C12.4。
+
 ## 2026-11-14 检查点：UI-07 三入口粘贴与 Excel/WPS 富文本往返
 
 - 代码 HEAD `16c865d` 已 push（UI-07 实现 `537dbe5` + 证据提交）。单 cargo `-j 2`，
