@@ -648,6 +648,8 @@ impl SheetApp {
             "InsertSlicer" => self.slicer_open(),
 
             // ---------------------------------------------------- 页面布局
+            // UI-26：页面设置入口（功能区/命令搜索/探针共用）
+            "PageSetup" => self.open_page_setup(),
             // UI-26：方向/纸型/边距不再循环切换，统一进页面设置做明确选择。
             "PageOrientation" | "PaperSize" | "PageMargins" => self.open_page_setup(),
             "TogglePrintGridlines" => {

@@ -5906,7 +5906,8 @@
             "crates/core/src/print.rs",
             "crates/core/tests/page_setup.rs",
             "crates/core/tests/pdf_export.rs",
-            "crates/app/src/edit_regression_tests.rs"
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/core/src/page.rs"
           ],
           "commits": [],
           "commands": [],

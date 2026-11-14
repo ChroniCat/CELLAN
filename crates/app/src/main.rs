@@ -1951,7 +1951,7 @@ impl SheetApp {
             cf_mgr: false,
             last_import: None,
             room_lost: false,
-            page_setup_open: std::env::var("SC_PAGE_DLG").map(|v| v == "1").unwrap_or(false),
+            page_setup_open: false,
             page_setup_draft: sheetcore::page::PageSetup::default(),
             page_setup_orig: None,
             page_setup_printers: Vec::new(),
@@ -12804,6 +12804,13 @@ let txn = self.txn_begin(&keys);
         let page = self.wb.sheet(self.sheet_idx).page.clone();
         let dirty = self.wb.sheet(self.sheet_idx).page_dirty;
         self.page_setup_orig = Some((page.clone(), dirty, self.wb.dirty));
+        if std::env::var("SC_PAGE_LOG").is_ok() {
+            eprintln!(
+                "[page] landscape={} paper={} fit={} w={} h={} scale={} titles={:?} margins={:?}",
+                page.landscape, page.paper, page.fit_to_page, page.fit_width, page.fit_height,
+                page.scale, page.title_rows, page.margins
+            );
+        }
         self.page_setup_draft = page;
         self.page_setup_open = true;
         if self.page_setup_printers.is_empty() {

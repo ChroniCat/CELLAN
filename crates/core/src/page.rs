@@ -240,12 +240,22 @@ pub fn parse_page_setup(xml: &str) -> PageSetup {
     let mut in_header = false;
     let mut in_footer = false;
     let mut buf = String::new();
+    let mut fit_flag = false;
+    let mut saw_fit_width = false;
+    let mut saw_fit_height = false;
     loop {
         match r.read_event() {
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
                 let nm = e.name();
                 let name = nm.as_ref();
-                if name.ends_with("pageSetup") {
+                if name.ends_with("pageSetUpPr") {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref() == "fitToPage" {
+                            let v = a.value.to_string();
+                            fit_flag = v == "1" || v == "true";
+                        }
+                    }
+                } else if name.ends_with("pageSetup") {
                     for a in e.attributes().flatten() {
                         let k = a.key.as_ref();
                         let v = crate::model::xml_unescape(&a.value.to_string());
@@ -255,16 +265,17 @@ pub fn parse_page_setup(xml: &str) -> PageSetup {
                             "scale" => ps.scale = v.parse().unwrap_or(100),
                             "fitToWidth" => {
                                 ps.fit_width = v.parse().unwrap_or(0);
+                                saw_fit_width = true;
                             }
                             "fitToHeight" => {
                                 ps.fit_height = v.parse().unwrap_or(0);
+                                saw_fit_height = true;
                             }
                             _ => {}
                         }
                     }
-                    // 只有某一方向的页数 >0 才是「调整为合适大小」；
-                    // fitToWidth="1" fitToHeight="0" = 1 页宽、高度自动
-                    ps.fit_to_page = ps.fit_width > 0 || ps.fit_height > 0;
+                    // pageSetUpPr@fitToPage 是权威开关；Excel 常省略默认的
+                    // fitToWidth="1"，只写 fitToHeight="0"（高度自动）。
                 } else if name.ends_with("pageMargins") {
                     for a in e.attributes().flatten() {
                         let k = a.key.as_ref();
@@ -329,6 +340,15 @@ pub fn parse_page_setup(xml: &str) -> PageSetup {
             _ => {}
         }
     }
+    if fit_flag {
+        if !saw_fit_width {
+            ps.fit_width = 1;
+        }
+        if !saw_fit_height {
+            ps.fit_height = 1;
+        }
+    }
+    ps.fit_to_page = fit_flag || ps.fit_width > 0 || ps.fit_height > 0;
     // 手动分页
     for (tag, is_row) in [("rowBreaks", true), ("colBreaks", false)] {
         let Some(start) = xml.find(&format!("<{tag}")) else { continue };
@@ -646,5 +666,22 @@ mod tests {
         ps.fit_height = 1;
         let by_h = ps.scale_factor(&s);
         assert!(by_h < 1.0, "100 行必须缩到一页: {by_h}");
+    }
+}
+
+#[cfg(test)]
+mod fit_flag_tests {
+    use super::*;
+
+    #[test]
+    fn excel_fit_flag_without_fit_width_means_one_page_wide() {
+        let xml = "<worksheet><sheetPr><pageSetUpPr fitToPage=\"1\"/></sheetPr>\
+            <pageSetup paperSize=\"9\" fitToHeight=\"0\" orientation=\"landscape\"/>\
+            </worksheet>";
+        let ps = parse_page_setup(xml);
+        assert!(ps.landscape);
+        assert!(ps.fit_to_page);
+        assert_eq!(ps.fit_width, 1, "Excel 省略默认的 fitToWidth=1");
+        assert_eq!(ps.fit_height, 0, "fitToHeight=0 是自动");
     }
 }
