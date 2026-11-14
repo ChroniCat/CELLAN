@@ -1,5 +1,22 @@
 # 恢复记录
 
+## 2026-11-14 检查点：UI-07 三入口粘贴与 Excel/WPS 富文本往返
+
+- 代码 HEAD `16c865d` 已 push（UI-07 实现 `537dbe5` + 证据提交）。单 cargo `-j 2`，
+  测试 `--test-threads=2`。
+- 台账计数仍为 **24 已验收 / 61**；UI-07 全系转 **待验收**（不是监督认可）。
+- 测试：sheetcore lib **295 passed**、全部 integration 0 failed；app `--bin app`
+  **302 passed**。日志 `work/goal-logs/ui07-final-app.log` / `ui07-final-core.log`。
+- **UI-07**：Ribbon/右键/Ctrl+V 共用 `clip_paste`；系统剪贴板比内部 clip 新时优先
+  Office 块（XMLSS→HTML），纯文本才退回 TSV。App→Excel/WPS 的 HTML 保留日期/金额
+  格式、粗体、填充、合并、单元格内换行；向外公式仍丢失（B2 缓存值 2469，已列明）。
+  Excel/WPS→App：XMLSS 保留公式/类型/字体/数字格式；WPS HTML 增加 class 样式、
+  数字实体、x:num/x:str、mso-number-format 解析，日期以序列号+格式存回。
+  证据 `implementation-evidence/ui07-clipboard.txt` 与 `ui07/*.png`。
+  not_done：物理鼠标右键点击/真实键盘 IME 未执行；向外公式保留未达成。
+- 仍未关闭：C12.4 真 pivotTable、QA-01 父项矩阵、C15/C17 监督复核、UI-19 键盘下拉实证。
+- 下一优先：UI-23 KeyTips/右键键盘操作；UI-24 可访问性；C12.4。
+
 ## 2026-11-14 检查点：UI-25 四项缺口、UI-14.3、C15 整块门禁
 
 - 代码 HEAD `8e58657` 已 push；单 cargo `-j 2`，测试 `--test-threads=2`。
