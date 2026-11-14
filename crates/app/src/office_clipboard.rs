@@ -7,6 +7,7 @@
 //!
 //! 直接调 Win32：项目里没有 windows crate，也不该为了几十行 API 引一整套。
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 #[link(name = "user32")]
@@ -84,6 +85,8 @@ pub struct OfficeCell {
     pub font: String,
     pub size: f32,
     pub num_format: String,
+    /// 原始值（HTML 的 x:num/x:str），text 保留显示文本用于比对
+    pub raw: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,6 +108,11 @@ impl OfficeBlock {
 /// 优先 **XML Spreadsheet**：它带公式（R1C1）、值类型、字体名/字号/数字格式；
 /// 没有这个格式（非 Excel 来源）才退回 HTML（带合并和底色，但没有公式）。
 pub fn read_table() -> Option<OfficeBlock> {
+    #[cfg(test)]
+    {
+        // 单测不读机器上的真实剪贴板；需要富格式时直接测 parse_html/convert_block。
+        return None;
+    }
     if let Some(b) = read_xmlss() {
         if !b.is_empty() {
             return Some(b);
@@ -134,9 +142,108 @@ pub fn read_table() -> Option<OfficeBlock> {
 }
 
 /// 解析 `<table>`：只认 tr/td，属性看 style 和 colspan/rowspan
+fn parse_style_classes(lower: &str, html: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(a) = lower.find("<style") else {
+        return map;
+    };
+    let Some(rel_b) = lower[a..].find("</style>") else {
+        return map;
+    };
+    let css = &html[a..a + rel_b];
+    let mut i = 0usize;
+    while let Some(rel) = css[i..].find('.') {
+        let at = i + rel;
+        let name_start = at + 1;
+        let name_end = css[name_start..]
+            .find(|c: char| c.is_whitespace() || c == '{' || c == ',')
+            .map(|p| name_start + p)
+            .unwrap_or(css.len());
+        let name = css[name_start..name_end].trim().to_lowercase();
+        if name.is_empty() {
+            i = at + 1;
+            continue;
+        }
+        let Some(brace_rel) = css[name_end..].find('{') else {
+            break;
+        };
+        let brace = name_end + brace_rel;
+        let Some(close_rel) = css[brace..].find('}') else {
+            break;
+        };
+        let close = brace + close_rel;
+        map.insert(name, css[brace + 1..close].trim().to_string());
+        i = close + 1;
+    }
+    map
+}
+
+/// CSS 声明里的原始值：`mso-number-format:"yyyy\\-mm\\-dd"` → `yyyy-mm-dd`
+fn style_value(style: &str, prop: &str) -> Option<String> {
+    let at = style.find(prop)?;
+    let rest = style[at + prop.len()..].trim_start_matches([':', ' ']);
+    let value: String = rest.chars().take_while(|c| *c != ';' && *c != '}').collect();
+    let value = value.trim().trim_matches(['"', '\'']).replace('\\', "");
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 解码 HTML 数字实体（WPS 会把中文写成 `&#31532;`）。
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        let mut ent = String::new();
+        while let Some(&n) = chars.peek() {
+            if n == ';' || ent.len() > 12 {
+                break;
+            }
+            ent.push(n);
+            chars.next();
+        }
+        if chars.peek() == Some(&';') {
+            chars.next();
+            let decoded = if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = ent.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                match ent.as_str() {
+                    "nbsp" => Some(' '),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "amp" => Some('&'),
+                    _ => None,
+                }
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+            } else {
+                out.push('&');
+                out.push_str(&ent);
+                out.push(';');
+            }
+        } else {
+            out.push('&');
+            out.push_str(&ent);
+        }
+    }
+    out
+}
+
 pub fn parse_html(html: &str) -> OfficeBlock {
     let mut block = OfficeBlock::default();
     let lower = html.to_lowercase();
+    let classes = parse_style_classes(&lower, html);
     let mut row: Vec<OfficeCell> = Vec::new();
     let mut i = 0usize;
     let bytes = lower.as_bytes();
@@ -160,7 +267,7 @@ pub fn parse_html(html: &str) -> OfficeBlock {
             } else {
                 ""
             };
-            row.push(parse_cell(attrs, inner));
+            row.push(parse_cell(attrs, inner, &classes));
             i = close + 5;
         } else if at("</table") {
             break;
@@ -176,7 +283,7 @@ pub fn parse_html(html: &str) -> OfficeBlock {
     block
 }
 
-fn parse_cell(attrs: &str, inner: &str) -> OfficeCell {
+fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> OfficeCell {
     let mut cell = OfficeCell { colspan: 1, rowspan: 1, ..Default::default() };
     if let Some(v) = attr_value(attrs, "colspan").and_then(|s| s.parse::<u32>().ok()) {
         cell.colspan = v.max(1);
@@ -184,7 +291,16 @@ fn parse_cell(attrs: &str, inner: &str) -> OfficeCell {
     if let Some(v) = attr_value(attrs, "rowspan").and_then(|s| s.parse::<u32>().ok()) {
         cell.rowspan = v.max(1);
     }
-    let style = attr_value(attrs, "style").unwrap_or_default().to_lowercase();
+    let mut style = attr_value(attrs, "style").unwrap_or_default();
+    if let Some(class) = attr_value(attrs, "class") {
+        for name in class.split_whitespace() {
+            if let Some(css) = classes.get(&name.to_lowercase()) {
+                style.push(';');
+                style.push_str(css);
+            }
+        }
+    }
+    let style = style.to_lowercase();
     cell.bold = style.contains("font-weight:700")
         || style.contains("font-weight:bold")
         || style.contains("font-weight: 700")
@@ -203,6 +319,14 @@ fn parse_cell(attrs: &str, inner: &str) -> OfficeCell {
     };
     if style.contains("border") && !style.contains("border:none") && !style.contains("border: none") {
         cell.border = Some(style_color(&style, "border-color").unwrap_or([0, 0, 0]));
+    }
+    if let Some(nf) = style_value(&style, "mso-number-format") {
+        cell.num_format = nf;
+    }
+    if let Some(v) = attr_value(attrs, "x:num") {
+        cell.raw = Some(clean_text(&v));
+    } else if attrs.to_lowercase().contains("x:str") {
+        cell.raw = Some(clean_text(inner));
     }
     cell.text = clean_text(inner);
     cell
@@ -287,13 +411,7 @@ fn clean_text(inner: &str) -> String {
             out.push(c);
         }
     }
-    let unescaped = out
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&");
+    let unescaped = decode_entities(&out);
     unescaped.trim().to_string()
 }
 
@@ -315,6 +433,23 @@ mod tests {
         assert_eq!(b.rows[0][0].colspan, 2, "合并列");
         assert_eq!(b.rows[1][2].halign, 3, "右对齐");
         assert_eq!(b.rows[1][2].color, Some([255, 0, 0]));
+    }
+
+    #[test]
+    fn parses_wps_class_styles_and_numeric_entities() {
+        let html = r#"<html><head><style>
+.et2 {font-weight:700; mso-number-format:'yyyy\-mm\-dd'; background:#FFFF00;}
+</style></head><body><table>
+<tr><td class=et2 x:num='46024'>2026-01-02</td></tr>
+<tr><td x:str>&#31532;&#19968;&#34892;<br>&#31532;&#20108;&#34892;</td></tr>
+</table></body></html>"#;
+        let b = parse_html(html);
+        assert!(b.rows[0][0].bold, "class 里的粗体");
+        assert_eq!(b.rows[0][0].fill, Some([255, 255, 0]), "class 里的底色");
+        assert_eq!(b.rows[0][0].num_format, "yyyy-mm-dd");
+        assert_eq!(b.rows[0][0].raw.as_deref(), Some("46024"));
+        assert_eq!(b.rows[1][0].text, "第一行\n第二行", "数字实体 + <br>");
+        assert_eq!(b.rows[1][0].raw.as_deref(), Some("第一行\n第二行"));
     }
 
     #[test]
@@ -383,6 +518,7 @@ pub(crate) fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock
                 font: c.style.font,
                 size: c.style.size,
                 num_format: c.style.num_format,
+                raw: None,
             });
         }
         rows.push(out);

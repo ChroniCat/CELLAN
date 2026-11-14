@@ -3,6 +3,9 @@
 use super::*;
 
 fn app() -> SheetApp {
+    // 单测共享真实系统剪贴板：每个用例先清空，避免上一个用例留下的文本/HTML
+    // 被当前用例当成“用户在外部复制的新内容”。
+    crate::clear_test_clipboard();
     SheetApp::new_with_context(&egui::Context::default(), None)
 }
 
@@ -48,6 +51,164 @@ fn visible_row_offset(app: &SheetApp, first: u32, row: u32) -> u32 {
 
 fn formula(text: &str) -> Cell {
     Cell { value: Value::Empty, formula: Some(text.into()) }
+}
+
+#[test]
+fn selection_html_carries_formula_format_merge_and_newlines() {
+    use sheetcore::style::CellStyle;
+    let mut app = app();
+    let mut st = CellStyle::default_dark();
+    st.format = "yyyy-mm-dd".into();
+    st.bold = true;
+    st.fill = Some([255, 255, 0]);
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(0, 0, sid);
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        Cell {
+            value: Value::Number(46024.0),
+            formula: None,
+        },
+    );
+    app.wb.sheet_mut(0).set(
+        0,
+        1,
+        Cell {
+            value: Value::Number(1234.5),
+            formula: Some("=A1*2".into()),
+        },
+    );
+    app.wb.sheet_mut(0).set(1, 0, text("第一行\n第二行"));
+    app.wb.sheet_mut(0).merges.push((0, 1, 0, 2));
+    let html = app.selection_html(0, (0, 0, 1, 2));
+    assert!(html.contains(r#"colspan="2""#), "合并单元格列跨度");
+    assert!(html.contains("mso-number-format:'yyyy-mm-dd'"), "日期格式");
+    assert!(html.contains("font-weight:bold"), "粗体");
+    assert!(html.contains("background:#FFFF00"), "填充");
+    assert!(html.contains(r#"x:fmla="=A1*2""#), "公式");
+    assert!(
+        html.contains(r#"<br style="mso-data-placement:same-cell;">"#),
+        "单元格内换行"
+    );
+    assert!(html.contains("2026-01-02") || html.contains("2026/1/2"), "日期显示文本");
+}
+
+#[test]
+fn paste_prefers_new_system_clipboard_over_stale_internal_clip() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.sel = (9, 9);
+    app.sel_end = (9, 9);
+    app.wb.sheets[0].set(9, 9, text("旧值"));
+    app.clip_copy(false, &ctx);
+    assert!(app.clip.is_some(), "内部 clip 已经建立");
+
+    // 模拟用户刚在 Excel 复制，系统剪贴板已经是新文本；内部 clip 仍指向“旧值”
+    crate::set_test_clipboard("2\t3\n4\t5\n");
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(2.0));
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(3.0));
+    assert_eq!(app.wb.sheets[0].value(1, 0), Value::Number(4.0));
+    assert_eq!(app.wb.sheets[0].value(1, 1), Value::Number(5.0));
+}
+
+#[test]
+fn internal_copy_paste_keeps_formula_merge_style_and_newline() {
+    use sheetcore::style::CellStyle;
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let mut st = CellStyle::default_dark();
+    st.bold = true;
+    st.format = "0.00".into();
+    let sid = app.wb.styles.intern(st);
+    app.wb.sheet_mut(0).set_style(1, 1, sid);
+    app.wb.sheet_mut(0).set(
+        1,
+        1,
+        Cell {
+            value: Value::Number(1234.5),
+            formula: Some("=A1*2".into()),
+        },
+    );
+    app.wb.sheet_mut(0).set(2, 0, text("第一行\n第二行"));
+    app.wb.sheet_mut(0).merges.push((1, 1, 1, 2));
+    app.sel = (1, 0);
+    app.sel_end = (2, 2);
+    app.clip_copy(false, &ctx);
+
+    app.sel = (5, 5);
+    app.sel_end = (5, 5);
+    app.clip_paste(false, None);
+    assert_eq!(
+        app.wb.sheets[0].value(5, 6),
+        Value::Number(0.0),
+        "内部粘贴后公式按目标位置重算"
+    );
+    assert_eq!(
+        app.wb.sheet(0).get(5, 6).and_then(|c| c.formula.clone()).is_some(),
+        true,
+        "内部粘贴保留公式"
+    );
+    assert!(
+        app.wb.sheet(0).merges.contains(&(5, 6, 5, 7)),
+        "内部粘贴保留合并"
+    );
+    assert_eq!(app.wb.sheets[0].value(6, 5).display(), "第一行\n第二行");
+    let target_style = app.wb.sheet(0).style_of(5, 6);
+    assert!(app.wb.styles.get(target_style).bold, "内部粘贴保留粗体");
+    assert_eq!(app.wb.styles.get(target_style).format, "0.00");
+}
+
+#[test]
+fn ribbon_context_and_shortcut_paste_share_the_latest_system_text() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    // 先在 App 里复制 1（建立内部 clip），再模拟 Excel 复制 2。
+    app.wb.sheets[0].set(9, 9, text("旧值"));
+    app.sel = (9, 9);
+    app.sel_end = (9, 9);
+    app.clip_copy(false, &ctx);
+    assert!(app.clip.is_some(), "内部 clip 1 已建立");
+    crate::set_test_clipboard("7\t8\n9\t10\n");
+    for (row, entry) in [(0u32, "ribbon"), (3, "context"), (6, "shortcut")] {
+        app.sel = (row, 0);
+        app.sel_end = (row, 0);
+        match entry {
+            "ribbon" => app.ribbon_action("Paste", &ctx),
+            "context" => app.ctx_menu_run(CtxAct::Paste, 0, &ctx),
+            _ => app.clip_paste(false, None),
+        }
+        assert_eq!(
+            app.wb.sheets[0].value(row, 0),
+            Value::Number(7.0),
+            "{entry} 入口应读到最新系统剪贴板"
+        );
+        assert_eq!(app.wb.sheets[0].value(row + 1, 1), Value::Number(10.0));
+    }
+}
+
+#[test]
+fn paste_keeps_empty_rows_and_quotes_from_external_tsv() {
+    let mut app = app();
+    app.clip = None;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clip_paste(false, Some("a\t\"b\tc\"\n\n1\t2\n".into()));
+    assert_eq!(app.wb.sheets[0].value(0, 0).display(), "a");
+    assert_eq!(app.wb.sheets[0].value(0, 1).display(), "b\tc");
+    assert_eq!(app.wb.sheets[0].value(1, 0), Value::Empty, "空行不能消失");
+    assert_eq!(app.wb.sheets[0].value(2, 0), Value::Number(1.0));
+}
+
+#[test]
+fn a1_formula_translation_handles_absolute_and_sheet_refs() {
+    assert_eq!(
+        sheetcore::clipboard_xmlss::a1_to_r1c1("=SUM($A$1:B2)+Sheet1!C3", 2, 2),
+        "=SUM(R1C1:R[-1]C[-1])+Sheet1!RC"
+    );
 }
 
 #[test]
@@ -1842,7 +2003,7 @@ fn cut_from_a_protected_sheet_cannot_be_pasted() {
     second.protection = Some(sheetcore::protection::SheetProtection::default());
     app.wb.sheets.push(second);
     let cells = vec![vec![(Cell { value: sheetcore::model::Value::Number(7.0), formula: None }, 0)]];
-    app.clip = Some(Clip { sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
+    app.clip = Some(Clip { merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
     app.sheet_idx = 0;
     app.sel = (2, 2);
     let before = snapshot(&app);
@@ -1865,7 +2026,7 @@ fn paste_special_values_transpose_and_operations() {
         vec![(num(1.0), 0), (num(2.0), 0)],
         vec![(num(3.0), 0), (num(4.0), 0)],
     ];
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells,
@@ -1904,7 +2065,7 @@ fn paste_special_formula_shifts_relative_and_keeps_absolute() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     let src = Cell { value: Value::Number(5.0), formula: Some("=A1+$B$1".into()) };
-    let clip = |rect: (u32, u32, u32, u32)| Clip {
+    let clip = |rect: (u32, u32, u32, u32)| Clip { merges: Vec::new(),
         sheet: 0,
         rect,
         cells: vec![vec![(src.clone(), 0)]],
@@ -1947,7 +2108,7 @@ fn paste_special_all_carries_font_and_fill_and_undoes_once() {
         ..Default::default()
     });
     let cell = Cell { value: Value::Number(9.0), formula: None };
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(cell, sid as u16)]],
@@ -1979,7 +2140,7 @@ fn paste_special_transpose_keeps_source_coordinates() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     // 源 A1:B1，两个公式分别为 =A1 与 =B1
     let f = |t: &str| (Cell { value: Value::Empty, formula: Some(t.into()) }, 0u16);
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 1),
         cells: vec![vec![f("=A1"), f("=B1")]],
@@ -2021,7 +2182,7 @@ fn paste_special_divide_by_zero_reports_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(8.0), formula: None });
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (5, 5, 5, 5),
         cells: vec![vec![(Cell { value: Value::Number(0.0), formula: None }, 0)]],
@@ -3268,6 +3429,7 @@ fn pasting_an_excel_error_cell_keeps_it_an_error_value() {
         font: String::new(),
         size: 0.0,
         num_format: String::new(),
+        raw: None,
     };
     // 真正走一遍 XMLSS 解析：Excel 的 ss:Type="Error" 必须映射成 kind=4
     let xml = r#"<?xml version="1.0"?>
@@ -3739,6 +3901,7 @@ fn refresh_is_one_undo_step_that_restores_values_rect_and_source_size() {
 }
 fn seeded_app(env: &crate::test_env::TestEnv, tag: &str) -> SheetApp {
     let _ = tag;
+    crate::clear_test_clipboard();
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     for r in 0..3u32 {
@@ -4071,7 +4234,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
         let depth = app.undo.depth();
         // 2×2 剪贴板：选择性粘贴的目标区域是锚点 + 剪贴板尺寸，这样才会覆盖被锁的 B2
         let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-        let clip = Clip {
+        let clip = Clip { merges: Vec::new(),
             sheet: 0,
             rect: (0, 0, 1, 1),
             cells: vec![vec![cell("粘贴"), cell("粘贴")], vec![cell("粘贴"), cell("粘贴")]],
@@ -4106,7 +4269,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
 
     // 普通粘贴：2×2 内部剪贴板 → 目标覆盖 B2
     let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("P"), cell("P")], vec![cell("P"), cell("P")]],
@@ -4117,7 +4280,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
     assert!(app.status.contains("戊"), "粘贴应指出锁持有人：{}", app.status);
 
     // 剪切粘贴：源块里就有被锁格
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("C"), cell("C")], vec![cell("C"), cell("C")]],
@@ -5102,7 +5265,7 @@ fn paste_special_formula_translates_negative_and_positive_offsets() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     let f = |s: &str| Cell { value: Value::Number(3.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(2, 2, f("=A1+$B$1")); // C3
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
@@ -5142,7 +5305,7 @@ fn paste_special_transpose_keeps_original_source_coordinates() {
     let f = |s: &str| Cell { value: Value::Number(1.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(0, 0, f("=A2")); // A1
     app.wb.sheet_mut(0).set(1, 0, f("=A3")); // A2
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 0),
         cells: vec![
@@ -5180,7 +5343,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: Some("=3+4".into()) });
     app.wb.sheet_mut(0).set_style(0, 0, sid);
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), sid)]],
@@ -5198,7 +5361,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     // 除以 0：显示 #DIV/0!，不能静默保留原值
     app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Number(5.0), formula: None });
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(0.0), formula: None });
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)]],
@@ -5367,7 +5530,7 @@ fn paste_special_all_translates_formula_offsets() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$1".into()) });
     app.wb.sheet_mut(0).set_style(2, 2, sid);
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), sid)]],
@@ -5399,7 +5562,7 @@ fn paste_special_transpose_negative_offset_is_ref_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(1.0), formula: Some("=A1".into()) }); // C3
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],

@@ -85,7 +85,66 @@ struct Clip {
     sheet: usize,
     rect: (u32, u32, u32, u32),
     cells: Vec<Vec<(sheetcore::model::Cell, u16)>>,
+    /// 选区内的合并区域，已裁到选区范围（0 基绝对坐标）
+    merges: Vec<(u32, u32, u32, u32)>,
     cut: bool,
+}
+
+/// 系统剪贴板快照（富格式由 office_clipboard 单独读取同一份系统剪贴板）。
+#[derive(Clone, Default)]
+struct SysClip {
+    text: String,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// 单测专用剪贴板：按线程隔离，避免并行用例互相污染。
+    static TEST_CLIP: std::cell::RefCell<Option<SysClip>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_clipboard(text: &str) {
+    TEST_CLIP.with(|c| *c.borrow_mut() = Some(SysClip { text: text.to_string() }));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_clipboard() {
+    TEST_CLIP.with(|c| *c.borrow_mut() = None);
+}
+
+fn clipboard_text() -> String {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.get_text().ok())
+        .unwrap_or_default()
+}
+
+fn read_system_clip() -> SysClip {
+    #[cfg(test)]
+    {
+        // 单测绝不读真实系统剪贴板，避免机器上残留的文本造成不确定性。
+        return TEST_CLIP.with(|c| c.borrow().clone()).unwrap_or_default();
+    }
+    #[cfg(not(test))]
+    {
+        SysClip { text: clipboard_text() }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '\n' => out.push_str("<br style=\"mso-data-placement:same-cell;\">"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1860,7 +1919,8 @@ impl SheetApp {
             cycles_key: (u64::MAX, u64::MAX),
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
-            name_dropdown: false,            name_focus_request: false,
+            name_dropdown: false,
+            name_focus_request: false,
             chart_sel: None,
             chart_drag: None,
             pic_sel: None,
@@ -4645,6 +4705,134 @@ impl SheetApp {
     }
 
     // ===== 剪贴板 =====
+    /// 选区 → Excel/WPS 可粘贴的 HTML 表格（含合并、字体、填充、边框、对齐、公式）。
+    fn selection_html(&self, si: usize, rect: (u32, u32, u32, u32)) -> String {
+        let (r1, c1, r2, c2) = rect;
+        let sh = self.wb.sheet(si);
+        let merges: Vec<(u32, u32, u32, u32)> = sh
+            .merges
+            .iter()
+            .filter(|(a, b, c, d)| *a >= r1 && *b >= c1 && *c <= r2 && *d <= c2)
+            .copied()
+            .collect();
+        let mut covered = std::collections::HashSet::new();
+        for &(a, b, c, d) in &merges {
+            for rr in a..=c {
+                for cc in b..=d {
+                    if (rr, cc) != (a, b) {
+                        covered.insert((rr, cc));
+                    }
+                }
+            }
+        }
+        let mut out = String::from(
+            "<table border=\"0\" cellspacing=\"0\" cellpadding=\"2\" style=\"border-collapse:collapse\">",
+        );
+        for r in r1..=r2 {
+            out.push_str("<tr>");
+            for c in c1..=c2 {
+                if covered.contains(&(r, c)) {
+                    continue;
+                }
+                let span = merges.iter().find(|(a, b, _, _)| *a == r && *b == c);
+                let (cs, rs) = match span {
+                    Some((_, _, er, ec)) => (ec - c + 1, er - r + 1),
+                    None => (1, 1),
+                };
+                let cell = sh.get(r, c).cloned().unwrap_or_default();
+                let sid = sh.style_of(r, c);
+                let st = self.wb.styles.get(sid);
+                let mut css = String::new();
+                if !st.font.is_empty() {
+                    css.push_str(&format!("font-family:{};", st.font.replace('"', "")));
+                }
+                if st.size > 0.0 {
+                    css.push_str(&format!("font-size:{}pt;", st.size));
+                }
+                if st.bold {
+                    css.push_str("font-weight:bold;");
+                }
+                if st.italic {
+                    css.push_str("font-style:italic;");
+                }
+                let mut deco = Vec::new();
+                if st.underline {
+                    deco.push("underline");
+                }
+                if st.strikethrough {
+                    deco.push("line-through");
+                }
+                if !deco.is_empty() {
+                    css.push_str(&format!("text-decoration:{};", deco.join(" ")));
+                }
+                css.push_str(&format!("color:#{:02X}{:02X}{:02X};", st.color[0], st.color[1], st.color[2]));
+                if let Some(fill) = st.fill {
+                    css.push_str(&format!("background:#{:02X}{:02X}{:02X};", fill[0], fill[1], fill[2]));
+                }
+                if !st.format.is_empty() {
+                    css.push_str(&format!("mso-number-format:'{}';", st.format.replace("\\", "").replace("'", "")));
+                }
+                match st.halign {
+                    1 => css.push_str("text-align:left;"),
+                    2 => css.push_str("text-align:center;"),
+                    3 => css.push_str("text-align:right;"),
+                    _ => {}
+                }
+                match st.valign {
+                    1 => css.push_str("vertical-align:top;"),
+                    2 => css.push_str("vertical-align:middle;"),
+                    3 => css.push_str("vertical-align:bottom;"),
+                    _ => {}
+                }
+                if st.wrap
+                    || sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
+                        .contains('\n')
+                {
+                    css.push_str("white-space:pre-wrap;");
+                }
+                for (i, b) in st.border.iter().enumerate() {
+                    if b.style > 0 {
+                        let width = match b.style {
+                            2 => "2px",
+                            3 | 4 => "3px",
+                            _ => "1px",
+                        };
+                        let side = ["left", "right", "top", "bottom"][i];
+                        css.push_str(&format!(
+                            "border-{side}:{width} solid #{:02X}{:02X}{:02X};",
+                            b.color[0], b.color[1], b.color[2]
+                        ));
+                    }
+                }
+                let mut attrs = String::new();
+                if cs > 1 {
+                    attrs.push_str(&format!(" colspan=\"{cs}\""));
+                }
+                if rs > 1 {
+                    attrs.push_str(&format!(" rowspan=\"{rs}\""));
+                }
+                if !css.is_empty() {
+                    attrs.push_str(&format!(" style=\"{css}\""));
+                }
+                if let Some(f) = &cell.formula {
+                    attrs.push_str(&format!(" x:fmla=\"{}\"", html_escape(f)));
+                }
+                if let sheetcore::model::Value::Number(n) = &cell.value {
+                    attrs.push_str(&format!(" x:num=\"{n}\""));
+                }
+                let text = html_escape(&sheetcore::style::format_value_in(
+                    self.wb.date_system,
+                    &cell.value,
+                    &st.format,
+                ));
+                out.push_str(&format!("<td{attrs}>{text}</td>"));
+            }
+            out.push_str("</tr>");
+        }
+        out.push_str("</table>");
+        out
+    }
+
     fn clip_copy(&mut self, cut: bool, ctx: &egui::Context) {
         let (r1, c1, r2, c2) = self.sel_rect();
         if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
@@ -4663,16 +4851,35 @@ impl SheetApp {
                     formula: None,
                 });
                 let st = self.wb.sheet(si).style_of(r, c);
-                line.push(cell.value.display());
+                let style = self.wb.styles.get(st);
+                line.push(sheetcore::style::format_value_in(
+                    self.wb.date_system,
+                    &cell.value,
+                    &style.format,
+                ));
                 row.push((cell, st));
             }
             tsv.push_str(&line.join("\t"));
             tsv.push('\n');
             cells.push(row);
         }
-        ctx.copy_text(tsv.clone());
+        let html = self.selection_html(si, (r1, c1, r2, c2));
+        if std::env::var("SC_CLIP_LOG").is_ok() {
+            eprintln!("[clip-html] {html}");
+        }
+        let html_ok = arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut cb| cb.set_html(html.clone(), Some(tsv.clone())).ok())
+            .is_some();
+        if !html_ok {
+            ctx.copy_text(tsv.clone());
+        }
         self.clip_stamp = Some(tsv);
-        self.clip = Some(Clip { sheet: si, rect: (r1, c1, r2, c2), cells, cut });
+        let merges = self.wb.sheet(si).merges.iter()
+            .filter(|(a, b, c, d)| *a >= r1 && *b >= c1 && *c <= r2 && *d <= c2)
+            .copied()
+            .collect();
+        self.clip = Some(Clip { sheet: si, rect: (r1, c1, r2, c2), cells, merges, cut });
         self.status = format!(
             "已{} {:?}（{} 行 × {} 列）",
             if cut { "剪切" } else { "复制" },
@@ -4687,10 +4894,33 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
+        // 所有入口共用同一份“最新系统剪贴板”：Ribbon/右键没传文本时主动读。
+        let sys = read_system_clip();
+        let text = text.or_else(|| {
+            if sys.text.is_empty() { None } else { Some(sys.text.clone()) }
+        });
         let (r, c) = self.sel;
         let si = self.sheet_idx;
+        // 三个入口（Ribbon/右键/Ctrl+V）共用这一份判断：系统剪贴板比内部 clip 新时，
+        // 富格式走 Office XMLSS/HTML，纯文本才退回 TSV。
+        let use_internal = match (&self.clip, &text) {
+            (Some(c), Some(t)) => self.clip_matches(t, c),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !use_internal && !values_only {
+            if let Some(block) = office_clipboard::read_table() {
+                if std::env::var("SC_CLIP_LOG").is_ok() {
+                    eprintln!("[clip] text={:?} block={:?}", text, Self::office_block_tsv(&block));
+                }
+                if self.paste_office_block(&block) {
+                    return;
+                }
+            }
+        }
         let mut tsv_paste = false;
         let mut rows: Vec<Vec<(sheetcore::model::Cell, u16)>> = Vec::new();
+        let mut pasted_merges: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut cut_src: Option<(usize, (u32, u32, u32, u32))> = None;
 
         if let Some(clip) = self.clip.clone() {
@@ -4724,6 +4954,20 @@ impl SheetApp {
                         out.push((cell, if values_only { 0 } else { *st }));
                     }
                     rows.push(out);
+                }
+                if !clip.merges.is_empty() {
+                    pasted_merges = clip
+                        .merges
+                        .iter()
+                        .map(|(a, b, c2, d)| {
+                            (
+                                (*a as i64 + dr).max(0) as u32,
+                                (*b as i64 + dc).max(0) as u32,
+                                (*c2 as i64 + dr).max(0) as u32,
+                                (*d as i64 + dc).max(0) as u32,
+                            )
+                        })
+                        .collect();
                 }
                 if clip.cut {
                     cut_src = Some((clip.sheet, clip.rect));
@@ -4787,6 +5031,19 @@ impl SheetApp {
                 }
             }
         }
+        if !values_only && !tsv_paste && !pasted_merges.is_empty() {
+            let sh = self.wb.sheet_mut(si);
+            let (dr1, dc1, dr2, dc2) = (r, c, r + h - 1, c + w - 1);
+            sh.merges.retain(|(a, b, c2, d)| {
+                !(*a <= dr2 && *c2 >= dr1 && *b <= dc2 && *d >= dc1)
+            });
+            for (a, b, c2, d) in &pasted_merges {
+                if *c2 > *a || *d > *b {
+                    sh.merges.push((*a, *b, *c2, *d));
+                }
+            }
+            sh.merges_dirty = true;
+        }
         for (i, row) in rows.iter().enumerate() {
             for (j, (cell, st)) in row.iter().enumerate() {
                 let rr = r + i as u32;
@@ -4830,8 +5087,13 @@ impl SheetApp {
         let mut expect = String::new();
         for row in clip.cells.iter() {
             let mut line = Vec::new();
-            for (cell, _) in row.iter() {
-                line.push(cell.value.display());
+            for (cell, st) in row.iter() {
+                let style = self.wb.styles.get(*st);
+                line.push(sheetcore::style::format_value_in(
+                    self.wb.date_system,
+                    &cell.value,
+                    &style.format,
+                ));
             }
             expect.push_str(&line.join("\t"));
             expect.push('\n');
@@ -4840,26 +5102,71 @@ impl SheetApp {
     }
 
     fn parse_tsv(text: &str) -> Vec<Vec<(sheetcore::model::Cell, u16)>> {
+        fn cell_of(field: &str, quoted: bool) -> (sheetcore::model::Cell, u16) {
+            let leading_zero = field.len() > 1
+                && field.starts_with('0')
+                && field[1..].chars().all(|c| c.is_ascii_digit());
+            let cell = if !quoted && field.starts_with('=') {
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text(field.into()),
+                    formula: Some(field.into()),
+                }
+            } else if quoted || leading_zero {
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Text(field.into()),
+                    formula: None,
+                }
+            } else {
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::parse_input(field),
+                    formula: None,
+                }
+            };
+            (cell, 0u16)
+        }
+
         let mut rows = Vec::new();
-        for line in text.lines() {
-            if line.is_empty() && rows.is_empty() {
-                continue;
-            }
-            let mut row = Vec::new();
-            for field in line.split('\t') {
-                let cell = if field.starts_with('=') {
-                    sheetcore::model::Cell {
-                        value: sheetcore::model::Value::Text(field.into()),
-                        formula: Some(field.into()),
+        let mut row: Vec<(sheetcore::model::Cell, u16)> = Vec::new();
+        let mut field = String::new();
+        let mut quoted = false;
+        let mut in_quotes = false;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if in_quotes {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        field.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
                     }
                 } else {
-                    sheetcore::model::Cell {
-                        value: sheetcore::model::Value::parse_input(field),
-                        formula: None,
-                    }
-                };
-                row.push((cell, 0u16));
+                    field.push(ch);
+                }
+                continue;
             }
+            match ch {
+                '"' => {
+                    in_quotes = true;
+                    quoted = true;
+                }
+                '\t' => {
+                    row.push(cell_of(&field, quoted));
+                    field.clear();
+                    quoted = false;
+                }
+                '\r' => {}
+                '\n' => {
+                    row.push(cell_of(&field, quoted));
+                    field.clear();
+                    quoted = false;
+                    rows.push(std::mem::take(&mut row));
+                }
+                _ => field.push(ch),
+            }
+        }
+        if !field.is_empty() || quoted || !row.is_empty() {
+            row.push(cell_of(&field, quoted));
             rows.push(row);
         }
         rows
@@ -6338,6 +6645,39 @@ impl SheetApp {
     }
 
 
+/// 富格式块和 TSV 文本是否来自同一次复制（用于识别过期 HTML）。
+fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
+    let width = block
+        .rows
+        .iter()
+        .map(|row| row.iter().map(|c| c.colspan.max(1) as usize).sum())
+        .max()
+        .unwrap_or(0);
+    let mut tsv = String::new();
+    for (i, row) in block.rows.iter().enumerate() {
+        if i > 0 {
+            tsv.push('\n');
+        }
+        let mut ci = 0usize;
+        for cell in row {
+            if ci > 0 {
+                tsv.push('\t');
+            }
+            tsv.push_str(&cell.text.replace('\r', ""));
+            ci += 1;
+            for _ in 1..cell.colspan.max(1) {
+                tsv.push('\t');
+                ci += 1;
+            }
+        }
+        while ci < width {
+            tsv.push('\t');
+            ci += 1;
+        }
+    }
+    tsv
+}
+
     /// 把从 Excel 复制来的块贴进来：值 + 格式 + 合并
     fn paste_office_block(&mut self, block: &office_clipboard::OfficeBlock) -> bool {
         if block.is_empty() {
@@ -6381,6 +6721,18 @@ impl SheetApp {
                                 Value::Text(text.into())
                             }
                         }
+                    }
+                } else if let Some(raw) = cell.raw.as_deref() {
+                    // HTML 的 x:num/x:str 是原始值；text 只是显示文本。日期按序列号
+                    // 存回，配合 mso-number-format 保持类型和显示都正确。
+                    if raw.is_empty() {
+                        Value::Empty
+                    } else if cell.kind == 2 {
+                        Value::Bool(raw == "1" || raw.eq_ignore_ascii_case("true"))
+                    } else if let Ok(n) = raw.replace(',', "").parse::<f64>() {
+                        Value::Number(n)
+                    } else {
+                        Value::Text(raw.into())
                     }
                 } else if text.is_empty() {
                     Value::Empty

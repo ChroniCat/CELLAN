@@ -287,6 +287,22 @@ pub fn parse(xml: &str) -> Block {
                     row.push(c);
                 }
             }
+            Ok(Event::GeneralRef(r)) => {
+                if in_data {
+                    if let Ok(Some(ch)) = r.resolve_char_ref() {
+                        text.push(ch);
+                    } else {
+                        match r.as_ref() {
+                            "amp" => text.push('&'),
+                            "lt" => text.push('<'),
+                            "gt" => text.push('>'),
+                            "quot" => text.push('"'),
+                            "apos" => text.push('\''),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Ok(Event::Text(t)) => {
                 if in_data {
                     let raw = t.as_ref().to_string();
@@ -381,6 +397,108 @@ fn normalize_num_format(f: &str) -> String {
 // ---------------------------------------------------------------- R1C1 → A1
 
 /// `=RC[-1]+R[1]C[-1]` 以 (row0,col0) 为基准折成 `=A1+A2`
+/// A1 公式 → R1C1（相对当前格）。给“复制到 Excel”的 XML Spreadsheet 用。
+///
+/// 只改单元格引用，字符串/函数名/数字原样保留；`$` 决定行列是否绝对。
+/// 支持 `Sheet1!A1`、`'参数 表'!A1:B2` 这类带表名的引用。
+pub fn a1_to_r1c1(f: &str, row0: u32, col0: u32) -> String {
+    let chars: Vec<char> = f.chars().collect();
+    let mut out = String::with_capacity(f.len() + 8);
+    let mut i = 0usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '"' {
+            in_double = !in_double;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if in_double || in_single {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        // 候选：[$]字母[$]数字；前一个字符不能是标识符的一部分
+        let prev_ok = i == 0
+            || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '.');
+        if prev_ok && (ch == '$' || ch.is_ascii_alphabetic()) {
+            let start = i;
+            let mut j = i;
+            let col_abs = chars[j] == '$';
+            if col_abs {
+                j += 1;
+            }
+            let letters_start = j;
+            while j < chars.len() && chars[j].is_ascii_alphabetic() && j - letters_start < 3 {
+                j += 1;
+            }
+            let letters_end = j;
+            if letters_end > letters_start {
+                let row_abs = j < chars.len() && chars[j] == '$';
+                let row_start = if row_abs { j + 1 } else { j };
+                let mut k = row_start;
+                while k < chars.len() && chars[k].is_ascii_digit() && k - row_start < 7 {
+                    k += 1;
+                }
+                if k > row_start {
+                    let next_ok = k >= chars.len()
+                        || !(chars[k].is_alphanumeric() || chars[k] == '_' || chars[k] == '(');
+                    let mut col: u32 = 0;
+                    let mut valid = true;
+                    for c in &chars[letters_start..letters_end] {
+                        let d = c.to_ascii_uppercase() as u32 - 'A' as u32 + 1;
+                        col = col * 26 + d;
+                        if col > 16_384 {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    let row: u32 = chars[row_start..k]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0);
+                    if valid && row >= 1 && row <= 1_048_576 && next_ok {
+                        let r = if row_abs {
+                            format!("R{row}")
+                        } else if row - 1 == row0 {
+                            "R".to_string()
+                        } else {
+                            format!("R[{}]", row as i64 - 1 - row0 as i64)
+                        };
+                        let c = if col_abs {
+                            format!("C{col}")
+                        } else if col - 1 == col0 {
+                            "C".to_string()
+                        } else {
+                            format!("C[{}]", col as i64 - 1 - col0 as i64)
+                        };
+                        out.push_str(&format!("{r}{c}"));
+                        i = k;
+                        continue;
+                    }
+                }
+            }
+            // 不是引用：原样输出到候选末尾，避免逐字重复扫描
+            let end = (start + 1).max(i + 1);
+            out.extend(chars[start..end].iter());
+            i = end;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
 pub fn r1c1_to_a1(f: &str, row0: u32, col0: u32) -> String {
     let chars: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len() + 8);
@@ -563,5 +681,26 @@ mod tests {
         assert_eq!(b.rows[0][0].text, "合计");
         assert_eq!(b.rows[0].len(), 4, "ss:Index=4 要补两格空");
         assert_eq!(b.rows[0][3].kind, Kind::Bool);
+    }
+
+    #[test]
+    fn keeps_char_refs_in_cell_text() {
+        let xml = r##"<Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet><Table>
+<Row><Cell><Data ss:Type="String">第一行&#10;第二行 &amp; 结束</Data></Cell></Row>
+</Table></Worksheet></Workbook>"##;
+        let b = parse(xml);
+        assert_eq!(b.rows[0][0].text, "第一行\n第二行 & 结束");
+    }
+
+    #[test]
+    fn a1_formula_converts_to_relative_r1c1() {
+        assert_eq!(a1_to_r1c1("=B1*2", 1, 1), "=R[-1]C*2");
+        assert_eq!(a1_to_r1c1("=SUM(A1:A4)", 3, 0), "=SUM(R[-3]C:RC)");
+        assert_eq!(a1_to_r1c1("=$A$1+C2", 0, 1), "=R1C1+R[1]C[1]");
+        assert_eq!(a1_to_r1c1("=Sheet1!A1", 0, 0), "=Sheet1!RC");
+        assert_eq!(a1_to_r1c1("='参数 表'!B2", 0, 0), "='参数 表'!R[1]C[1]");
+        // 字符串里的 A1 不动；A1:B2 两个端点都转
+        assert_eq!(a1_to_r1c1("=\"A1\"&A1", 0, 0), "=\"A1\"&RC");
+        assert_eq!(a1_to_r1c1("=A1:B2", 0, 0), "=RC:R[1]C[1]");
     }
 }
