@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-14T09:55:00Z",
+  "updated_utc": "2026-11-14T10:00:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -5674,16 +5674,27 @@
       "scope": "app/main.rs run_sort/run_dedup/分列",
       "source": "ui-requirements.md",
       "heading": "UI-17 排序去重与分列的范围和预览",
-      "status": "实施中",
-      "acceptance": "",
+      "status": "待验收",
+      "acceptance": "排序范围/级别顺序、按证件号去重预览、分列列类型/覆盖确认/完整撤销均有专项回归；真实鼠标交互未执行，父项转待验收。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-dedup.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
+      ],
+      "not_done": [
+        "真实鼠标调整级别未做",
+        "真实鼠标勾选与执行未做",
+        "真实鼠标点选与两次确认未执行",
+        "固定宽度分列未实现",
+        "真实鼠标调整排序级别/勾选去重/分列两次确认未执行（RDP 不可用）",
+        "固定宽度分列未实现（原 UI-17 合同只要求分隔符/引号/空字段/日期，已在契约内）"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
+      "next": "监督复核；补真实鼠标排序/去重/分列交互",
       "updated_utc": "2026-11-13T21:16:38Z",
       "slices": [
         {
@@ -5763,9 +5774,11 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:16:38Z"
+          "updated_utc": "2026-11-13T21:16:38Z",
+          "status_note": "随父项待监督复核。"
         }
-      ]
+      ],
+      "status_note": "三个切片待验收，父项同步待验收；固定宽度分列不在原合同验收范围。"
     },
     {
       "id": "UI-18",
