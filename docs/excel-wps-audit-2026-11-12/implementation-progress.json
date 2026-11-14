@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-14T09:12:00Z",
+  "updated_utc": "2026-11-14T09:20:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -4590,8 +4590,8 @@
       "scope": "app/ribbon/actions.rs + main.rs格式草稿",
       "source": "ui-requirements.md",
       "heading": "UI-08 修复边框方向与混合格式被覆盖",
-      "status": "实施中",
-      "acceptance": "边框方向、混合值/单字段提交、按 side 无损提交均有专项证据；真实 GUI/Office 目视未完成，父项保持实施中。",
+      "status": "待验收",
+      "acceptance": "边框方向、混合值/单字段提交、按 side 无损提交均有专项证据；真实 GUI/Office 目视未完成，父项保持实施中。 [2026-11-14] 四方向/外框/内横线已在 Excel 16.0 保存重开后逐边回读通过（ui08-office.txt）；格式对话框物理鼠标未执行。",
       "files": [],
       "commits": [
         "2745438",
@@ -4600,12 +4600,27 @@
         "5fd9ea3",
         "745e1ab"
       ],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "commands": [
+        "SC_SEL=\"0,0\" SC_CMD=\"20:Border<Dir>;60:FileSave\" work/qa08/one-<dir>.xlsx => Excel Borders 7/8/9/10 逐边正确",
+        "SC_SEL=\"0,0\" SC_CMD=\"20:BorderLeft;30:BorderRight;40:BorderTop;50:BorderBottom;80:FileSave\" => 四边 LineStyle=1, Weight=2, Color=8421504",
+        "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderOuter;60:FileSave\" => 只有外沿，内部无框",
+        "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderInsideH;60:FileSave\" => 只中间横线，两端无框",
+        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
+        "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
+      ],
+      "not_done": [
+        "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
+        "WPS 未单独目视边框，Excel 已逐边验证"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "实现 UI-08.2 格式草稿 dirty/mixed 与 UI-08.3 一次事务，再实测 Excel/WPS。",
+      "next": "监督复核；补真实鼠标格式对话框目视",
       "updated_utc": "2026-11-13T07:30:19Z",
       "slices": [
         {
@@ -4626,20 +4641,28 @@
             "2745438"
           ],
           "commands": [
-            "cargo test -p app --offline --bin app ribbon_border_commands_follow_left_right_top_bottom_order -> 1 passed",
-            "cargo test -p app --offline --bin app -> 214 passed / 0 failed / 0 ignored"
+            "SC_SEL=\"0,0\" SC_CMD=\"20:Border<Dir>;60:FileSave\" work/qa08/one-<dir>.xlsx => Excel Borders 7/8/9/10 逐边正确",
+            "SC_SEL=\"0,0\" SC_CMD=\"20:BorderLeft;30:BorderRight;40:BorderTop;50:BorderBottom;80:FileSave\" => 四边 LineStyle=1, Weight=2, Color=8421504",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderOuter;60:FileSave\" => 只有外沿，内部无框",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderInsideH;60:FileSave\" => 只中间横线，两端无框",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
+            "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实 Excel/WPS 四方向目视与保存重开未做",
-            "格式对话框混合样式与未改属性保留未做"
+            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
+            "WPS 未单独目视边框，Excel 已逐边验证"
           ],
           "failures": [],
           "blocker": "",
           "next": "先做 UI-08.2 格式草稿 dirty/mixed，再做 UI-08.3 事务与 Office 目视。",
-          "updated_utc": "2026-11-13T06:47:03Z"
+          "updated_utc": "2026-11-13T06:47:03Z",
+          "status_note": "随父项待监督复核；见 ui08-office.txt。"
         },
         {
           "id": "UI-08.2",
@@ -4659,22 +4682,28 @@
             "745e1ab"
           ],
           "commands": [
-            "cargo test -p app --offline --bin app format_dialog_preserves_unchanged_fields_and_mixed_cell_styles -> 1 passed",
-            "cargo test -p app --offline --bin app mixed_field_explicit_choice_equal_to_active_value_is_applied -> 1 passed",
-            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+            "SC_SEL=\"0,0\" SC_CMD=\"20:Border<Dir>;60:FileSave\" work/qa08/one-<dir>.xlsx => Excel Borders 7/8/9/10 逐边正确",
+            "SC_SEL=\"0,0\" SC_CMD=\"20:BorderLeft;30:BorderRight;40:BorderTop;50:BorderBottom;80:FileSave\" => 四边 LineStyle=1, Weight=2, Color=8421504",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderOuter;60:FileSave\" => 只有外沿，内部无框",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderInsideH;60:FileSave\" => 只中间横线，两端无框",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
+            "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed"
           ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-mixed.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实鼠标确定/取消/Esc 与 Office 目视未做",
-            "混合字段显式选择只做了状态层回归；真实下拉点击取证未做"
+            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
+            "WPS 未单独目视边框，Excel 已逐边验证"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标下拉选择、确定/取消/Esc 与 Excel/WPS 目视。",
-          "updated_utc": "2026-11-13T07:30:19Z"
+          "updated_utc": "2026-11-13T07:30:19Z",
+          "status_note": "随父项待监督复核；见 ui08-office.txt。"
         },
         {
           "id": "UI-08.3",
@@ -4692,21 +4721,31 @@
             "5fd9ea3"
           ],
           "commands": [
-            "cargo test -p app --offline --bin app format_dialog_preserves_border_thickness_and_color_when_other_side_changes -> 1 passed",
-            "cargo test -p app --offline --bin app -> 217 passed / 0 failed / 0 ignored"
+            "SC_SEL=\"0,0\" SC_CMD=\"20:Border<Dir>;60:FileSave\" work/qa08/one-<dir>.xlsx => Excel Borders 7/8/9/10 逐边正确",
+            "SC_SEL=\"0,0\" SC_CMD=\"20:BorderLeft;30:BorderRight;40:BorderTop;50:BorderBottom;80:FileSave\" => 四边 LineStyle=1, Weight=2, Color=8421504",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderOuter;60:FileSave\" => 只有外沿，内部无框",
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,1\" SC_CMD=\"20:BorderInsideH;60:FileSave\" => 只中间横线，两端无框",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
+            "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实鼠标确定/取消、Excel/WPS 保存重开后的边框粗细颜色目视未做"
+            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
+            "WPS 未单独目视边框，Excel 已逐边验证"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标与 Office 目视，再评估 UI-08 父项。",
-          "updated_utc": "2026-11-13T07:01:45Z"
+          "updated_utc": "2026-11-13T07:01:45Z",
+          "status_note": "随父项待监督复核；见 ui08-office.txt。"
         }
-      ]
+      ],
+      "status_note": "边框几何已真实 Excel 复核；混合字段单测通过；物理对话框交互未执行，父项待验收不标已验收。"
     },
     {
       "id": "UI-09",
