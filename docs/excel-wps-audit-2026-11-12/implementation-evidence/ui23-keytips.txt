@@ -1,6 +1,6 @@
 UI-23 完整 KeyTips 与右键菜单键盘操作（证据）
 日期：2026-11-14
-基线：UI-07/08/09 之后的工作树；app(glow) debug；Windows 11 / Excel 16.0
+提交：ba1c22c（UI-07/08/09 之后的工作树）；app(glow) debug；Windows 11 / Excel 16.0
 
 一、实现
 - Alt 第一阶段：页签显示 KeyTip（F/H/N/P/M/A/R/W），按字母切页签；Esc 退出。

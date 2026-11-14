@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-14T09:45:00Z",
+  "updated_utc": "2026-11-14T09:55:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -6554,7 +6554,9 @@
         "crates/app/assets/ribbon/customUI.xml",
         "crates/app/src/edit_regression_tests.rs"
       ],
-      "commits": [],
+      "commits": [
+        "ba1c22c"
+      ],
       "commands": [
         "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 305 passed, 0 failed",
         "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed",
@@ -6590,7 +6592,9 @@
           "status": "待验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
+          "commits": [
+            "ba1c22c"
+          ],
           "commands": [
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 305 passed, 0 failed",
             "cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 => 295 passed, 0 failed",
