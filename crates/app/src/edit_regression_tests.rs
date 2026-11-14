@@ -7591,3 +7591,137 @@ fn ribbon_page_break_inserts_both_directions() {
     assert!(app.wb.sheet(0).page.row_breaks.is_empty());
     assert!(app.wb.sheet(0).page.col_breaks.is_empty());
 }
+
+/// UI-23：Alt 页签 → 控件 KeyTip 直接执行；边框/筛选/冻结均可不用鼠标。
+#[test]
+fn keytips_reach_border_filter_and_freeze_from_tabs() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.keytips = true;
+    app.keytip_tab = Some(1); // 开始
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::B, false)]);
+    let st = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0));
+    assert_eq!(
+        st.border[sheetcore::style::BorderSide::Bottom.idx()].style,
+        1,
+        "Home+B 应执行所有框线"
+    );
+
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.wb.sheet_mut(0).set(1, 0, text("乙"));
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.keytips = true;
+    app.keytip_tab = Some(5); // 数据
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::F, false)]);
+    assert!(app.wb.sheet(0).filter.is_some(), "数据+F 应打开筛选");
+
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    app.keytips = true;
+    app.keytip_tab = Some(7); // 视图
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::F, false)]);
+    assert_eq!(app.wb.sheet(0).freeze, Some((1, 1)), "视图+F 应冻结 B2 以上/以左");
+}
+
+fn run_ctx_menu(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    input.events = events;
+    let _ = ctx.run(input, |ctx| app.ctx_menu_window(ctx));
+}
+
+/// UI-23：Shift+F10 打开菜单；方向键/Enter 执行；Esc 逐级退回；边缘菜单不出窗。
+#[test]
+fn shift_f10_menu_supports_keyboard_and_window_edges() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, text("甲"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    let f10 = egui::Event::Key {
+        key: egui::Key::F10,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers { shift: true, ..Default::default() },
+    };
+    run_keys(&mut app, &ctx, vec![f10]);
+    assert!(app.ctx_menu.is_some(), "Shift+F10 应打开单元格右键菜单");
+
+    // 放到窗口右下角，绘制后所有菜单矩形必须在 800×600 内
+    if let Some(m) = app.ctx_menu.as_mut() {
+        m.pos = egui::pos2(790.0, 590.0);
+    }
+    run_ctx_menu(&mut app, &ctx, vec![]);
+    for r in &app.ctx_rects {
+        assert!(r.left() >= 0.0 && r.top() >= 0.0, "菜单越左/上界: {r:?}");
+        assert!(r.right() <= 800.0 && r.bottom() <= 600.0, "菜单越右/下界: {r:?}");
+    }
+    // 子菜单也在右下角打开，仍不能越界
+    if let Some(m) = app.ctx_menu.as_mut() {
+        m.key = 7; // 插入（父项）
+        m.sub = Some(7);
+    }
+    run_ctx_menu(&mut app, &ctx, vec![]);
+    assert!(app.ctx_rects.len() >= 2, "应同时绘制主菜单和子菜单");
+    for r in &app.ctx_rects {
+        assert!(r.left() >= 0.0 && r.top() >= 0.0, "子菜单越左/上界: {r:?}");
+        assert!(r.right() <= 800.0 && r.bottom() <= 600.0, "子菜单越右/下界: {r:?}");
+    }
+    let parent = app.ctx_rects[0];
+    let submenu = *app.ctx_rects.last().unwrap();
+    assert!(
+        parent.intersect(submenu).area() <= 0.0,
+        "子菜单不能盖住父菜单可点击区域: parent={parent:?} sub={submenu:?}"
+    );
+    if let Some(m) = app.ctx_menu.as_mut() {
+        m.sub = None;
+        m.key = 0;
+    }
+
+    // 从 Cut 走 6 次 Down 到“清除内容”，Enter 执行
+    for _ in 0..6 {
+        run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    }
+    run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
+    assert!(app.ctx_menu.is_none(), "Enter 执行后菜单关闭");
+    assert!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default().is_empty(),
+        "清除内容应生效"
+    );
+}
+
+/// UI-23：子菜单 Right 展开、Esc 只退一级，再次 Esc 关闭整个菜单。
+#[test]
+fn context_submenu_escape_steps_back_one_level() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.ctx_menu = Some(CtxMenuState {
+        pos: egui::pos2(100.0, 100.0),
+        frame: 0,
+        sub: None,
+        kind: CtxKind::Cell,
+        idx: 0,
+        key: 0,
+        sub_key: 0,
+    });
+    // Cut→Copy→Paste→选择性粘贴→插入（父项，索引 7）
+    for _ in 0..4 {
+        run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+    }
+    run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, false)]);
+    assert!(app.ctx_menu.as_ref().and_then(|m| m.sub).is_some(), "Right 应展开插入子菜单");
+    run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    let m = app.ctx_menu.as_ref().expect("第一次 Esc 不应关闭整个菜单");
+    assert!(m.sub.is_none(), "第一次 Esc 只收起子菜单");
+    run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
+    assert!(app.ctx_menu.is_none(), "第二次 Esc 关闭菜单");
+}

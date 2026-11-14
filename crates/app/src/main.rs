@@ -924,6 +924,8 @@ struct SheetApp {
     fx_expanded: bool,
     /// Alt 键提示（KeyTips）：按 Alt 后页签上出现字母
     keytips: bool,
+    /// KeyTips 第二阶段：已选中的页签；None 表示仍在选页签
+    keytip_tab: Option<usize>,
     /// Alt 上一次的按下状态（egui 没有单独的 Alt 键事件）
     alt_down: bool,
     /// 允许文字溢出到右侧空列（Excel 默认；关闭则裁剪在格子里）
@@ -1380,6 +1382,10 @@ struct CtxMenuState {
     kind: CtxKind,
     /// 行号/列号，或工作表下标
     idx: usize,
+    /// 键盘焦点：顶层菜单行
+    key: usize,
+    /// 键盘焦点：子菜单行
+    sub_key: usize,
 }
 
 /// 工作表标签的 8 个颜色 + 无颜色（Excel 的「工作表标签颜色」）
@@ -1526,6 +1532,42 @@ fn ctx_menu_height(rows: &[CtxRow]) -> f32 {
         };
     }
     h + 4.0
+}
+
+fn ctx_row_focusable(rows: &[CtxRow], i: usize) -> bool {
+    rows.get(i)
+        .map(|r| !r.is_sep() && !r.strip && (r.act.is_some() || !r.children.is_empty()))
+        .unwrap_or(false)
+}
+
+/// 上下移动键盘焦点；跳过分隔线和粘贴图标条，首尾循环。
+fn next_ctx_row(rows: &[CtxRow], from: usize, dir: i32) -> Option<usize> {
+    let n = rows.len();
+    if n == 0 {
+        return None;
+    }
+    let mut i = from as i32;
+    for _ in 0..n {
+        i = (i + dir).rem_euclid(n as i32);
+        if ctx_row_focusable(rows, i as usize) {
+            return Some(i as usize);
+        }
+    }
+    None
+}
+
+fn ctx_row_top(rows: &[CtxRow], idx: usize, start: f32) -> f32 {
+    let mut y = start;
+    for r in rows.iter().take(idx) {
+        y += if r.strip {
+            CTX_STRIP_H
+        } else if r.is_sep() {
+            8.0
+        } else {
+            CTX_ROW_H
+        };
+    }
+    y
 }
 
 /// 状态栏统计累加器（UI-25）：计数=非空格；数值统计只吃 Number。
@@ -1866,6 +1908,7 @@ impl SheetApp {
             color_popup: None,
             fx_expanded: false,
             keytips: std::env::var("SC_KEYTIPS").is_ok(),
+            keytip_tab: None,
             alt_down: false,
             show_gridlines: std::env::var("SC_VIEW_OFF").is_err(),
             show_headings: std::env::var("SC_VIEW_OFF").is_err(),
@@ -9125,7 +9168,67 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         };
     }
 
-    /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑
+    /// 当前 KeyTips 页签下所有带 keytip 的可见命令（字母 → onAction）。
+    fn keytip_actions(&self) -> Vec<(char, String)> {
+        let Some(tab) = self.keytip_tab.and_then(|i| self.ribbon.tabs.get(i)) else {
+            return Vec::new();
+        };
+        fn collect(nodes: &[ribbon::Node], out: &mut Vec<(String, String, String)>) {
+            for n in nodes {
+                match n {
+                    ribbon::Node::Button(c) | ribbon::Node::Toggle(c) => {
+                        if let Some(k) = &c.keytip {
+                            out.push((k.clone(), c.action().to_string(), c.id.clone()));
+                        }
+                    }
+                    ribbon::Node::Split { ctl, .. }
+                    | ribbon::Node::DropDown { ctl, .. }
+                    | ribbon::Node::Gallery { ctl, .. }
+                    | ribbon::Node::ComboBox { ctl, .. }
+                    | ribbon::Node::EditBox { ctl, .. }
+                    | ribbon::Node::Slider { ctl, .. } => {
+                        if let Some(k) = &ctl.keytip {
+                            out.push((k.clone(), ctl.action().to_string(), ctl.id.clone()));
+                        }
+                    }
+                    ribbon::Node::Menu(m) => {
+                        if let Some(k) = &m.ctl.keytip {
+                            out.push((k.clone(), m.ctl.action().to_string(), m.ctl.id.clone()));
+                        }
+                    }
+                    ribbon::Node::Box { children, .. } => collect(children, out),
+                    ribbon::Node::Label(_) | ribbon::Node::Spacer(_) | ribbon::Node::Separator => {}
+                }
+            }
+        }
+        let mut flat = Vec::new();
+        for g in &tab.groups {
+            collect(&g.children, &mut flat);
+        }
+        let mut out = Vec::new();
+        for (k, action, id) in flat {
+            let Some(ch) = k.chars().next().map(|c| c.to_ascii_uppercase()) else {
+                continue;
+            };
+            let st = self.ctl_state(&id);
+            if !st.visible || !st.enabled || action.is_empty() {
+                continue;
+            }
+            // 边框拆分按钮的 keytip B 对应菜单里的“所有框线”，而不是主按钮的下框线
+            let action = if ch == 'B' && action == "BorderBottom" {
+                "BordersAll".to_string()
+            } else {
+                action
+            };
+            if out.iter().any(|(c, _): &(char, String)| *c == ch) {
+                continue;
+            }
+            out.push((ch, action));
+        }
+        out
+    }
+
+    /// 键盘：方向键移动、回车/制表符提交并移动、直接键入进入编辑。
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // 保存/打开/新建/打印/撤销/重做由 crate::command 的命令表统一处理
         // （见 `handle_command_keys`），这里只剩网格自身的按键。
@@ -9138,7 +9241,33 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.recalc_all_async();
             return;
         }
-        // 格式刷：Esc 结束（连续模式也结束）
+        // Shift+F10：在当前对象上打开单元格右键菜单（Excel 同款键盘入口）
+        if self.editing.is_none()
+            && self.ctx_menu.is_none()
+            && ctx.input(|i| i.modifiers.shift && i.key_pressed(Key::F10))
+        {
+            let pos = ctx
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| ctx.screen_rect().contains(*p))
+                .unwrap_or_else(|| ctx.screen_rect().center());
+            self.keytips = false;
+            self.keytip_tab = None;
+            self.ctx_menu = Some(CtxMenuState {
+                pos,
+                frame: ctx.cumulative_pass_nr(),
+                sub: None,
+                kind: CtxKind::Cell,
+                idx: 0,
+                key: 0,
+                sub_key: 0,
+            });
+            return;
+        }
+        // 右键菜单打开时，方向键/Enter/Esc 由菜单自己处理，不能穿透到网格
+        if self.ctx_menu.is_some() {
+            return;
+        }
+
         if self.editing.is_none()
             && (self.format_painter.is_some()
                 || self.merge_pending.is_some()
@@ -9271,46 +9400,90 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
         }
 
-        // Alt：显示页签字母提示（KeyTips），再按字母切换页签
+        // Alt：显示页签字母提示（KeyTips）；再按页签字母进入命令级 KeyTips
         let alt_now = ctx.input(|i| i.modifiers.alt);
         if alt_now && !self.alt_down {
             self.keytips = true;
+            self.keytip_tab = None;
         }
         self.alt_down = alt_now;
         if self.keytips {
-            let chosen = ctx.input(|i| {
-                let m = i.modifiers;
-                if m.alt || m.command || m.shift {
-                    return None;
+            // Esc 逐级返回：命令级 → 页签级 → 关闭
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                if self.keytip_tab.take().is_some() {
+                    self.keytips = true;
+                } else {
+                    self.keytips = false;
                 }
-                for (k, idx) in [
-                    (Key::F, 0usize),
-                    (Key::H, 1),
-                    (Key::N, 2),
-                    (Key::P, 3),
-                    (Key::M, 4),
-                    (Key::A, 5),
-                    (Key::R, 6),
-                    (Key::W, 7),
-                ] {
-                    if i.key_pressed(k) {
-                        return Some(idx);
+            } else if ctx.input(|i| i.pointer.any_click()) {
+                self.keytips = false;
+                self.keytip_tab = None;
+            } else if let Some(tab_idx) = self.keytip_tab {
+                // 第二阶段：当前页签内按控件 keytip 直接执行命令
+                let actions = self.keytip_actions();
+                let chosen = ctx.input(|i| {
+                    let m = i.modifiers;
+                    if m.alt || m.command || m.shift {
+                        return None;
+                    }
+                    actions.iter().find_map(|(ch, action)| {
+                        let key = char_to_key(*ch)?;
+                        if i.key_pressed(key) {
+                            Some(action.clone())
+                        } else {
+                            None
+                        }
+                    })
+                });
+                if let Some(action) = chosen {
+                    self.keytips = false;
+                    self.keytip_tab = None;
+                    self.ribbon_action(&action, ctx);
+                    return;
+                }
+                // 数字键继续支持，便于验收常用命令
+                let _ = tab_idx;
+            } else {
+                // 第一阶段：页签字母
+                let chosen = ctx.input(|i| {
+                    let m = i.modifiers;
+                    if m.alt || m.command || m.shift {
+                        return None;
+                    }
+                    for (k, idx) in [
+                        (Key::F, 0usize),
+                        (Key::H, 1),
+                        (Key::N, 2),
+                        (Key::P, 3),
+                        (Key::M, 4),
+                        (Key::A, 5),
+                        (Key::R, 6),
+                        (Key::W, 7),
+                    ] {
+                        if i.key_pressed(k) {
+                            return Some(idx);
+                        }
+                    }
+                    None
+                });
+                if let Some(idx) = chosen {
+                    if idx == 0 {
+                        self.keytips = false;
+                        self.backstage = true;
+                        self.backstage_page = 0;
+                    } else {
+                        self.ribbon_tab = idx;
+                        self.ribbon_collapsed = false;
+                        self.keytip_tab = Some(idx);
                     }
                 }
-                None
-            });
-            if let Some(idx) = chosen {
-                self.keytips = false;
-                if idx == 0 {
-                    self.backstage = true;
-                    self.backstage_page = 0;
-                } else {
-                    self.ribbon_tab = idx;
-                    self.ribbon_collapsed = false;
-                }
-            } else if ctx.input(|i| i.key_pressed(Key::Escape) || i.pointer.any_click()) {
-                self.keytips = false;
             }
+        }
+        if std::env::var("SC_KEYTIP_LOG").is_ok() && (self.keytips || self.keytip_tab.is_some()) {
+            eprintln!(
+                "[keytip] active={} tab={:?} ribbon_tab={}",
+                self.keytips, self.keytip_tab, self.ribbon_tab
+            );
         }
         let show_f_k = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Backtick));
         if show_f_k {
@@ -21420,7 +21593,8 @@ let txn = self.txn_begin(&keys);
     fn ctx_menu_window(&mut self, ctx: &egui::Context) {
         self.ctx_rects.clear();
         let Some(m0) = self.ctx_menu.as_ref() else { return };
-        let (pos, opened_frame, sub, kind0, idx0) = (m0.pos, m0.frame, m0.sub, m0.kind, m0.idx);
+        let (pos0, opened_frame, mut sub, kind0, idx0) = (m0.pos, m0.frame, m0.sub, m0.kind, m0.idx);
+        let (mut key, mut sub_key) = (m0.key, m0.sub_key);
         let has_filter = self.wb.sheet(self.sheet_idx).filter.is_some();
         let rows = match kind0 {
             CtxKind::Cell => ctx_menu_rows(has_filter),
@@ -21429,6 +21603,71 @@ let txn = self.txn_begin(&keys);
             CtxKind::Tab => ctx_tab_rows(),
         };
         let total_h = ctx_menu_height(&rows);
+        // 菜单不能超出窗口：Excel 在屏幕边缘会整体内移，项不被裁掉
+        let screen = ctx.screen_rect();
+        let pos = egui::pos2(
+            pos0.x.min(screen.right() - CTX_W - 4.0).max(screen.left() + 4.0),
+            pos0.y.min(screen.bottom() - total_h - 4.0).max(screen.top() + 4.0),
+        );
+        if !ctx_row_focusable(&rows, key) {
+            key = next_ctx_row(&rows, 0, 1).unwrap_or(0);
+        }
+        let mut key_action: Option<CtxAct> = None;
+        let mut close_menu = false;
+        let mut suppress_sub = false;
+        let (k_up, k_down, k_left, k_right, k_enter, k_esc) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::ArrowRight),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if let Some(si) = sub {
+            let kids = rows.get(si).map(|r| r.children.as_slice()).unwrap_or(&[]);
+            if k_up && !kids.is_empty() {
+                sub_key = (sub_key + kids.len() - 1) % kids.len();
+            } else if k_down && !kids.is_empty() {
+                sub_key = (sub_key + 1) % kids.len();
+            } else if k_enter {
+                if let Some(kid) = kids.get(sub_key) {
+                    key_action = kid.act;
+                }
+            } else if k_esc || k_left {
+                sub = None;
+                suppress_sub = true;
+            }
+        } else if k_down {
+            if let Some(i) = next_ctx_row(&rows, key, 1) {
+                key = i;
+            }
+        } else if k_up {
+            if let Some(i) = next_ctx_row(&rows, key, -1) {
+                key = i;
+            }
+        } else if k_enter || k_right {
+            if let Some(row) = rows.get(key) {
+                if !row.children.is_empty() {
+                    sub = Some(key);
+                    sub_key = 0;
+                } else {
+                    key_action = row.act;
+                }
+            }
+        } else if k_esc {
+            close_menu = true;
+        }
+        if close_menu {
+            self.ctx_menu = None;
+            return;
+        }
+        if let Some(a) = key_action {
+            self.ctx_menu = None;
+            self.ctx_menu_run(a, idx0, ctx);
+            return;
+        }
         let mut action: Option<CtxAct> = None;
         let mut sub_req: Option<(usize, f32)> = None;
         let mut rects: Vec<egui::Rect> = Vec::new();
@@ -21515,7 +21754,7 @@ let txn = self.txn_begin(&keys);
                         egui::vec2(CTX_W, CTX_ROW_H),
                     );
                     let r = ui.interact(rr, egui::Id::new(("ctx_row", i)), egui::Sense::click());
-                    let active = matches!(sub, Some(s) if s == i);
+                    let active = matches!(sub, Some(s) if s == i) || (sub.is_none() && key == i);
                     if r.hovered() || active {
                         p.rect_filled(
                             rr.shrink2(egui::vec2(4.0, 0.0)),
@@ -21575,12 +21814,26 @@ let txn = self.txn_begin(&keys);
                 }
             });
 
-        // 子菜单
-        if let Some((idx, top)) = sub_req {
+        // 子菜单（鼠标悬停或键盘 →/Enter 打开；键盘焦点优先）
+        let sub_show = sub_req.or_else(|| sub.map(|i| (i, ctx_row_top(&rows, i, pos.y + 4.0))));
+        if let Some((idx, top)) = sub_show {
             let kids = &rows[idx].children;
             let w = 172.0;
             let hh = kids.len() as f32 * CTX_ROW_H + 8.0;
-            let sp = egui::pos2(pos.x + CTX_W - 2.0, top - 3.0);
+            let mut sp = egui::pos2(pos.x + CTX_W - 2.0, top - 3.0);
+            if sp.x + w > screen.right() - 4.0 {
+                sp.x = (pos.x - w).max(screen.left() + 4.0);
+            }
+            if sp.y + hh > screen.bottom() - 4.0 {
+                // 下方放不下时放到父项上方，避免盖住父菜单的可点击行
+                sp.y = (top - hh + 3.0).max(screen.top() + 4.0);
+            }
+            if sub.is_none() {
+                sub = Some(idx);
+            }
+            if sub_key >= kids.len() {
+                sub_key = 0;
+            }
             egui::Area::new(egui::Id::new("ctx_sub_area"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(sp)
@@ -21612,7 +21865,7 @@ let txn = self.txn_begin(&keys);
                             egui::Id::new(("ctx_sub_row", k)),
                             egui::Sense::click(),
                         );
-                        if r.hovered() {
+                        if r.hovered() || sub_key == k {
                             p.rect_filled(rr.shrink2(egui::vec2(4.0, 0.0)), 2.0, hover_bg);
                         }
                         let mut text_x = sp.x + 14.0;
@@ -21653,9 +21906,8 @@ let txn = self.txn_begin(&keys);
             self.ctx_menu_run(a, idx0, ctx);
             return;
         }
-        // Esc / 点到菜单外面（打开那一帧的点击不算）
+        // 点到菜单外面（打开那一帧的点击不算）；键盘 Esc 已在上面逐级处理
         let now_frame = ctx.cumulative_pass_nr();
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let click_out = ctx.input(|i| {
             i.pointer.any_click()
                 && i.pointer
@@ -21663,12 +21915,20 @@ let txn = self.txn_begin(&keys);
                     .map(|p| !self.ctx_rects.iter().any(|r| r.contains(p)))
                     .unwrap_or(false)
         });
-        if esc || (click_out && now_frame != opened_frame) || now_frame > opened_frame + 1 && click_out {
+        if (click_out && now_frame != opened_frame) || now_frame > opened_frame + 1 && click_out {
             self.ctx_menu = None;
         }
-        // 子菜单：指针离开父菜单就收起
+        // 子菜单：鼠标悬停优先；键盘打开的子菜单保持，Esc/← 后不因指针仍在父项而重开
         if let Some(m) = self.ctx_menu.as_mut() {
-            m.sub = sub_req.map(|(i, _)| i);
+            if !suppress_sub {
+                if let Some((i, _)) = sub_req {
+                    sub = Some(i);
+                    sub_key = 0;
+                }
+            }
+            m.sub = sub;
+            m.key = key;
+            m.sub_key = sub_key;
         }
     }
 
@@ -24310,6 +24570,8 @@ let txn = self.txn_begin(&keys);
                     sub: None,
                     kind: CtxKind::Cell,
                     idx: 0,
+                    key: 0,
+                    sub_key: 0,
                 });
             }
         }
@@ -24746,6 +25008,8 @@ let txn = self.txn_begin(&keys);
                         sub: None,
                         kind: CtxKind::Cols,
                         idx: c as usize,
+                        key: 0,
+                        sub_key: 0,
                     });
                 } else if in_row_head {
                     let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
@@ -24757,6 +25021,8 @@ let txn = self.txn_begin(&keys);
                         sub: None,
                         kind: CtxKind::Rows,
                         idx: r as usize,
+                        key: 0,
+                        sub_key: 0,
                     });
                 }
             }
@@ -26940,6 +27206,8 @@ impl eframe::App for SheetApp {
                         sub,
                         kind,
                         idx,
+                        key: 0,
+                        sub_key: 0,
                     });
                 }
             }
@@ -28227,6 +28495,8 @@ impl eframe::App for SheetApp {
                                 sub: None,
                                 kind: CtxKind::Tab,
                                 idx: i,
+                                key: 0,
+                                sub_key: 0,
                             });
                         }
                     }
@@ -29126,6 +29396,38 @@ fn draw_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, bd: &sheetco
 }
 
 /// 把 "alt+down" / "ctrl+s" 这类写法转成（修饰键，按键）（验收探针用）。
+fn char_to_key(ch: char) -> Option<egui::Key> {
+    Some(match ch.to_ascii_uppercase() {
+        'A' => egui::Key::A,
+        'B' => egui::Key::B,
+        'C' => egui::Key::C,
+        'D' => egui::Key::D,
+        'E' => egui::Key::E,
+        'F' => egui::Key::F,
+        'G' => egui::Key::G,
+        'H' => egui::Key::H,
+        'I' => egui::Key::I,
+        'J' => egui::Key::J,
+        'K' => egui::Key::K,
+        'L' => egui::Key::L,
+        'M' => egui::Key::M,
+        'N' => egui::Key::N,
+        'O' => egui::Key::O,
+        'P' => egui::Key::P,
+        'Q' => egui::Key::Q,
+        'R' => egui::Key::R,
+        'S' => egui::Key::S,
+        'T' => egui::Key::T,
+        'U' => egui::Key::U,
+        'V' => egui::Key::V,
+        'W' => egui::Key::W,
+        'X' => egui::Key::X,
+        'Y' => egui::Key::Y,
+        'Z' => egui::Key::Z,
+        _ => return None,
+    })
+}
+
 fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
     let mut mods = egui::Modifiers::default();
     let mut key = None;
@@ -29147,6 +29449,7 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "end" => key = Some(egui::Key::End),
             "space" => key = Some(egui::Key::Space),
             "f2" => key = Some(egui::Key::F2),
+            "f10" => key = Some(egui::Key::F10),
             "left" => key = Some(egui::Key::ArrowLeft),
             "right" => key = Some(egui::Key::ArrowRight),
             "delete" => key = Some(egui::Key::Delete),
@@ -29156,6 +29459,7 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "h" => key = Some(egui::Key::H),
             "g" => key = Some(egui::Key::G),
             "v" => key = Some(egui::Key::V),
+            "w" => key = Some(egui::Key::W),
             "c" => key = Some(egui::Key::C),
             "q" => key = Some(egui::Key::Q),
             "x" => key = Some(egui::Key::X),

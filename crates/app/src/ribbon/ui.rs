@@ -37,7 +37,7 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         .collect();
     for (i, label, keytip) in tabs {
         let resp = ui_kit::tab_ex(ui, &label, app.ribbon_tab == i && i != 0, i == 0);
-        if app.keytips {
+        if app.keytips && app.keytip_tab.is_none() {
             if let Some(ch) = keytip.chars().next() {
                 let r = resp.rect;
                 let b = Rect::from_center_size(
@@ -332,6 +332,26 @@ fn measure(ui: &egui::Ui, text: &str, size: f32) -> f32 {
         .x
 }
 
+fn draw_keytip(ui: &egui::Ui, key: &str, rect: Rect) {
+    let Some(ch) = key.chars().next() else { return };
+    if std::env::var("SC_KEYTIP_LOG").is_ok() {
+        eprintln!("[keytip] draw {key} at {rect:?}");
+    }
+    let b = Rect::from_min_size(
+        egui::pos2(rect.right() - 15.0, rect.top() + 2.0),
+        Vec2::new(13.0, 11.0),
+    );
+    ui.painter()
+        .rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
+    ui.painter().text(
+        b.center(),
+        Align2::CENTER_CENTER,
+        ch.to_string(),
+        FontId::proportional(8.5),
+        Color32::WHITE,
+    );
+}
+
 fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
     let st = app.ctl_state(&c.id);
     if !st.visible {
@@ -394,6 +414,11 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
             }
         }
     });
+    if app.keytips && app.keytip_tab.is_some() && enabled {
+        if let Some(k) = &c.keytip {
+            draw_keytip(ui, k, resp.inner.rect);
+        }
+    }
     if resp.inner.double_clicked() && c.action() == "FormatPainter" {
         app.painter_double = true;
     }
@@ -415,12 +440,14 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
     let enabled = on_enabled(ctl, &st);
     let mut open = false;
     let mut pos = egui::pos2(0.0, 0.0);
+    let mut keytip_rect: Option<Rect> = None;
     let main_clicked;
 
     match ctl.size {
         Size::Large => {
             let w = ctl.width.unwrap_or(42.0);
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
+            keytip_rect = Some(r.rect);
             main_clicked = enabled && r.clicked();
             if ar.clicked() && enabled {
                 open = true;
@@ -473,6 +500,7 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
                     (main.inner, ar)
                 })
                 .inner;
+            keytip_rect = Some(mr.rect);
             main_clicked = mr.clicked();
             if ar.clicked() && enabled {
                 open = true;
@@ -481,6 +509,11 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
         }
     }
 
+    if app.keytips && app.keytip_tab.is_some() && enabled {
+        if let (Some(k), Some(r)) = (&ctl.keytip, keytip_rect) {
+            draw_keytip(ui, k, r);
+        }
+    }
     if main_clicked {
         let action = ctl.action().to_string();
         app.ribbon_action(&action, ui.ctx());

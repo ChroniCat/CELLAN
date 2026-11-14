@@ -389,6 +389,9 @@ fn read_node(e: &El) -> Result<Option<Node>, String> {
             if ctl.arrow.is_none() {
                 ctl.arrow = outer.arrow;
             }
+            if ctl.keytip.is_none() {
+                ctl.keytip = outer.keytip.clone();
+            }
             let menu = child(e, "menu")
                 .map(read_menu)
                 .transpose()?

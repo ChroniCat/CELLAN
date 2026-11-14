@@ -101,7 +101,7 @@
                   <button id="DoubleUnderlineItem" label="双下划线" onAction="DoubleUnderline"/>
                 </menu>
               </splitButton>
-              <splitButton id="BordersSplit" sizeString="39" arrowWidth="15">
+              <splitButton id="BordersSplit" sizeString="39" arrowWidth="15" keytip="B">
                 <button id="Borders" imageMso="Borders" screentip="下框线" onAction="BorderBottom"/>
                 <menu id="BordersMenu">
                   <button id="BorderBottom" label="下框线" onAction="BorderBottom"/>
@@ -109,7 +109,7 @@
                   <button id="BorderLeft" label="左框线" onAction="BorderLeft"/>
                   <button id="BorderRight" label="右框线" onAction="BorderRight"/>
                   <menuSeparator id="BordersSep1"/>
-                  <button id="BorderAll" label="所有框线" onAction="BordersAll"/>
+                  <button id="BorderAll" label="所有框线" keytip="B" onAction="BordersAll"/>
                   <button id="BorderOuter" label="外侧框线" onAction="BorderOuter"/>
                   <button id="BorderThickOuter" label="粗外侧框线" onAction="BorderThickOuter"/>
                   <button id="BorderThickBottom" label="粗底框线" onAction="BorderThickBottom"/>
@@ -593,7 +593,7 @@
             <button id="SortDescending" label="降序" imageMso="SortDesc" onAction="SortDescending" sizeString="100"/>
           </box>
           <box boxStyle="vertical">
-            <toggleButton id="DataFilter" label="筛选" imageMso="Filter" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
+            <toggleButton id="DataFilter" label="筛选" imageMso="Filter" keytip="F" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
             <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="100"/>
           </box>
           <box boxStyle="vertical">
@@ -708,7 +708,7 @@
           <box boxStyle="vertical">
             <toggleButton id="FreezeTopRow" label="冻结首行" imageMso="FreezeRow" screentip="滚动时第一行保持可见" onAction="FreezeTopRow" sizeString="96"/>
             <toggleButton id="FreezeFirstColumn" label="冻结首列" imageMso="FreezeCol" screentip="滚动时第一列保持可见" onAction="FreezeFirstColumn" sizeString="96"/>
-            <button id="FreezePanes" label="冻结窗格" imageMso="Freeze" screentip="冻结当前单元格上方的行与左侧的列" onAction="FreezePanes" sizeString="96"/>
+            <button id="FreezePanes" label="冻结窗格" imageMso="Freeze" keytip="F" screentip="冻结当前单元格上方的行与左侧的列" onAction="FreezePanes" sizeString="96"/>
           </box>
           <box boxStyle="vertical">
             <button id="Unfreeze" label="取消冻结" imageMso="Unfreeze" onAction="Unfreeze" sizeString="96"/>
