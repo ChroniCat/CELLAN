@@ -1,6 +1,6 @@
 UI-07 普通粘贴各入口共用真实系统剪贴板（证据）
 日期：2026-11-14
-基线：worktree HEAD 73c3b64 + 本切片未提交改动
+提交：537dbe5（父基线 73c3b64）
 环境：Windows 11 / Excel 16.0 (Excel.Application) / WPS 12.0 (KET.Application) / app(glow) debug
 夹具：work/qa07/source.xlsx（A1 日期 2026-01-02、B1 1234.50、B1:C1 合并、A2 单元格内两行、B2 =B1*2、A1 粗体+黄底）；work/qa07/blank.xlsx
 
