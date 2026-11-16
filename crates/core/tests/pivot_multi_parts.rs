@@ -665,3 +665,85 @@ fn calc_field_survives_save_and_reload() {
     let count: usize = cache[open..open + len].parse().unwrap();
     assert_eq!(count, cache.matches("<cacheField name=").count());
 }
+
+#[test]
+fn pinyin_collation_matches_excel_probe() {
+    let mut v: Vec<String> = ["深圳", "上海", "杭州", "广州", "北京"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.sort_by(|a, b| sheetcore::collate::cmp_pinyin(a, b));
+    assert_eq!(v, vec!["北京", "广州", "杭州", "上海", "深圳"]);
+    assert_eq!(
+        sheetcore::collate::cmp_pinyin("销售", "行政"),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[test]
+fn two_row_fields_match_excel_sort_probe() {
+    use sheetcore::{Cell, Value};
+    let mut wb = sheetcore::Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    let data = [
+        ("地区", "部门", "金额"),
+        ("深圳", "销售", "10"),
+        ("上海", "行政", "20"),
+        ("杭州", "销售", "30"),
+        ("广州", "行政", "40"),
+        ("北京", "销售", "50"),
+        ("北京", "行政", "60"),
+    ];
+    for (r, (a, b, c)) in data.iter().enumerate() {
+        for (col, v) in [a, b, c].iter().enumerate() {
+            let cell = if r == 0 || col == 2 {
+                let parsed: f64 = v.parse().unwrap_or(0.0);
+                if r == 0 {
+                    Cell { value: Value::Text((*v).to_string().into()), formula: None }
+                } else {
+                    Cell { value: Value::Number(parsed), formula: None }
+                }
+            } else {
+                Cell { value: Value::Text((*v).to_string().into()), formula: None }
+            };
+            wb.sheets[0].set(r as u32, col as u32, cell);
+        }
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 6, 2),
+        rows: vec![
+            AxisField { col: 0, group: sheetcore::pivot::GroupBy::None },
+            AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
+        ],
+        cols: vec![],
+        values: vec![ValueField {
+            col: 2,
+            agg: Agg::Sum,
+            label: Some("求和项:金额".into()),
+            show_as: sheetcore::pivot_multi::ShowAs::Normal,
+        }],
+        filters: vec![],
+        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
+    };
+    let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let mut rows: Vec<String> = Vec::new();
+    for r in &g.rows {
+        rows.push(r.iter().map(|v| v.display()).collect::<Vec<_>>().join("\t"));
+    }
+    // Excel 实测（sort-ref.tsv）：北京/广州/杭州/上海/深圳 + 「X 汇总」+ 总计
+    let expect = vec![
+        "北京\t销售\t50",
+        "北京\t行政\t60",
+        "北京 汇总\t\t110",
+        "广州\t行政\t40",
+        "广州 汇总\t\t40",
+        "杭州\t销售\t30",
+        "杭州 汇总\t\t30",
+        "上海\t行政\t20",
+        "上海 汇总\t\t20",
+        "深圳\t销售\t10",
+        "深圳 汇总\t\t10",
+        "总计\t\t210",
+    ];
+    assert_eq!(rows, expect);
+}

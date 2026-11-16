@@ -378,7 +378,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         if spec.layout.subtotals && spec.rows.len() >= 2 {
             let mut srow = vec![Value::Text(String::new().into()); total_cols];
             if !srow.is_empty() {
-                srow[0] = Value::Text(format!("{top} 小计").into());
+                srow[0] = Value::Text(format!("{top} 汇总").into());
             }
             for ci in 0..col_paths.len() {
                 for vi in 0..spec.values.len() {

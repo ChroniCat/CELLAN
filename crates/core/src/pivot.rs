@@ -225,6 +225,9 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         }
     }
 
+    // Excel 透视表按系统区域（中文拼音序）排标签，不是源表出现顺序
+    row_order.sort_by(|a, b| crate::collate::cmp_pinyin(a, b));
+    col_order.sort_by(|a, b| crate::collate::cmp_pinyin(a, b));
     let col_keys: Vec<String> = col_order;
 
     let mut headers = vec![row_name.clone()];
