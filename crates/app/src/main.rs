@@ -638,6 +638,17 @@ fn parse_calc_item(s: &str) -> Option<(String, Vec<String>)> {
     Some((name.to_string(), srcs))
 }
 
+/// 「名称=公式」→ (名称, 公式)；公式里可以有空格，空名字/空公式返回 None。
+fn parse_calc_field(s: &str) -> Option<(String, String)> {
+    let (name, formula) = s.split_once('=')?;
+    let name = name.trim().to_string();
+    let formula = formula.trim().to_string();
+    if name.is_empty() || formula.is_empty() {
+        return None;
+    }
+    Some((name, formula))
+}
+
 /// 拖动扩区域时的引用文本：跨表带 `表名!`，同表就是 `A1:B2`
 fn pick_range_label(sheet: Option<&str>, a: (u32, u32), b: (u32, u32)) -> String {
     // 单格不写 A1:A1（Excel 也只写 A1）
@@ -1948,6 +1959,8 @@ struct SheetApp {
     pivot2_last: Option<(usize, sheetcore::pivot_multi::PivotSpec2, (u32, u32, u32, u32))>,
     /// C12.4 计算项输入：「名称=项1+项2」，空表示不加
     pivot2_calc_item: String,
+    /// C12.4 计算字段输入：「名称=公式」，空表示不加
+    pivot2_calc_field: String,
     /// 透视表是否生成真正的 pivotTable 部件
     pivot_real: bool,
     /// 并排比较的第二个工作簿 + 表序号 + 滚动
@@ -2889,6 +2902,7 @@ impl SheetApp {
             pivot2_edit: None,
             pivot2_last: None,
             pivot2_calc_item: String::new(),
+            pivot2_calc_field: String::new(),
             pivot_real: true,
             compare: {
                 let mut c = None;
@@ -21942,6 +21956,14 @@ let txn = self.txn_begin(&keys);
                 self.undo.clear();
             }
         }
+        // C12.4 计算字段：登记到工作簿，保存时由 xlsx 写进 pivotCacheDefinition
+        if let Some((name, formula)) = parse_calc_field(&self.pivot2_calc_field) {
+            let si = self.sheet_idx;
+            self.wb
+                .pivot_calc_fields
+                .retain(|(s, n, _)| !(*s == si && *n == name));
+            self.wb.pivot_calc_fields.push((si, name, formula));
+        }
         self.pivot2_last = Some((self.sheet_idx, spec.clone(), rect));
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -22186,6 +22208,14 @@ let txn = self.txn_begin(&keys);
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut spec.layout.tabular, "表格形式（每层标签都显示）");
+                    ui.horizontal(|ui| {
+                        ui.label("计算字段");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pivot2_calc_field)
+                                .desired_width(220.0)
+                                .hint_text("名称=公式（如 总价=金额*2）"),
+                        );
+                    });
                     ui.horizontal(|ui| {
                         ui.label("计算项");
                         ui.add(

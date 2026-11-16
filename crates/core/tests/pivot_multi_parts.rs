@@ -634,3 +634,34 @@ fn calc_item_row_reaches_row_items_and_cache() {
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }
+
+#[test]
+fn calc_field_survives_save_and_reload() {
+    let fx = Fixture::new("calcfield-save");
+    let path = fx.file("calcfield-save.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_b();
+    let _ = attach(&path, &mut wb, &spec);
+    // 登记计算字段，走正常保存流程（xlsx 会在挂完透视表后写缓存定义）
+    wb.pivot_calc_fields.push((0, "总价".to_string(), "金额*2".to_string()));
+    sheetcore::xlsx::save(&path, &wb).expect("保存失败");
+
+    // 重新打开后缓存里仍有公式
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let cd = z
+        .file_names()
+        .find(|n| n.contains("pivotCacheDefinition"))
+        .unwrap()
+        .to_string();
+    let mut cache = String::new();
+    {
+        use std::io::Read;
+        z.by_name(&cd).unwrap().read_to_string(&mut cache).unwrap();
+    }
+    assert!(cache.contains("formula=\"金额*2\""), "{cache}");
+    assert!(cache.contains("databaseField=\"0\""), "{cache}");
+    let open = cache.find("<cacheFields count=\"").unwrap() + "<cacheFields count=\"".len();
+    let len = cache[open..].find('"').unwrap();
+    let count: usize = cache[open..open + len].parse().unwrap();
+    assert_eq!(count, cache.matches("<cacheField name=").count());
+}

@@ -9897,3 +9897,16 @@ fn parse_calc_item_reads_name_and_sources() {
     assert!(crate::parse_calc_item("合计=").is_none());
     assert!(crate::parse_calc_item("  ").is_none());
 }
+
+#[test]
+fn parse_calc_field_reads_name_and_formula() {
+    let (n, f) = crate::parse_calc_field("总价=金额*2").expect("应能解析");
+    assert_eq!(n, "总价");
+    assert_eq!(f, "金额*2");
+    // 公式里允许空格与等号后续内容
+    let (n2, f2) = crate::parse_calc_field(" 毛利 = 金额 - 成本 ").unwrap();
+    assert_eq!(n2, "毛利");
+    assert_eq!(f2, "金额 - 成本");
+    assert!(crate::parse_calc_field("=金额*2").is_none());
+    assert!(crate::parse_calc_field("总价=").is_none());
+}

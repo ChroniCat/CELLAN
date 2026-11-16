@@ -437,6 +437,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         } else {
             crate::model::DateSystem::D1900
         },
+        pivot_calc_fields: Vec::new(),
         pivots_pending: Vec::new(),
         pivots_pending2: Vec::new(),
         calc_manual: crate::patch::read_calc_manual(path),
@@ -2392,6 +2393,15 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         let sheet = wb.sheets.get(*si).context("多字段透视所属工作表不存在")?;
         crate::pivot_xml::attach2_for_session(path, &sheet.name, spec, grid, *rect, wb.pivot_session.token())
             .context("多字段透视部件写入失败")?;
+    }
+    // C12.4 计算字段：紧跟在透视表部件之后写缓存定义
+    if !wb.pivot_calc_fields.is_empty() {
+        let refs: Vec<(&str, &str)> = wb
+            .pivot_calc_fields
+            .iter()
+            .map(|(_, n, f)| (n.as_str(), f.as_str()))
+            .collect();
+        crate::pivot_xml::add_calculated_fields(path, &refs).context("计算字段写入失败")?;
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     must_save!("layout", crate::patch::apply_layout(path, wb));

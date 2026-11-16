@@ -558,6 +558,8 @@ pub struct Workbook {
         String,
     )>,
     /// 多字段透视：保存时挂真 pivotTable 部件（C12.4）
+    /// C12.4 计算字段：(工作表, 名称, 公式)，保存时写进透视缓存
+    pub pivot_calc_fields: Vec<(usize, String, String)>,
     pub pivots_pending2: Vec<(
         usize,
         crate::pivot_multi::PivotSpec2,
@@ -604,6 +606,7 @@ impl Workbook {
             pivot_session: Default::default(),
             names_dirty: false,
             pivots_pending: Vec::new(),
+            pivot_calc_fields: Vec::new(),
             pivots_pending2: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
