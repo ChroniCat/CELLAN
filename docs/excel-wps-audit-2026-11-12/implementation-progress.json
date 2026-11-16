@@ -6633,13 +6633,14 @@
       "acceptance": "",
       "files": [],
       "commits": [
-        "5460109"
+        "5460109",
+        "19d241e"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "UI-29.1 已验收（token + 跨 DPI 测量 + 修掉 accesskit 矩形双乘 ppp）；UI-29.2 图标/交互状态、UI-29.3 错误/空/加载状态未开始。",
-        "三端同场景 100%/150% 截图与标注尺寸未完成。"
+        "UI-29.1、UI-29.2 已验收；UI-29.3（错误/空/加载状态视觉）未开始。",
+        "三端同场景 100%/150% 截图与标注尺寸未完成（父项验收）。"
       ],
       "failures": [],
       "blocker": "",
@@ -6686,13 +6687,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-29 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "19d241e"
+          ],
+          "commands": [
+            "cargo test -p app every_icon_draws_ink_inside_its_box_at_four_sizes -> pass（修前 10 项失败）",
+            "cargo test -p app icon_stroke_width_never_drops_below_one_pixel -> pass",
+            "python work/probe/ui29/audit_sheet.py（16/20/24/32 + 24@150%）-> 空白 0、糊满 0",
+            "cargo test -p app -- --test-threads=2 -> 352 passed（work/goal-logs/ui292-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/ui29-icons.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/icons-16.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/icons-24.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/icons-24-ppp1.5.png"
+          ],
+          "not_done": [
+            "无人工视觉评审（vision_analyze 本轮连续超时），只有形状/像素统计。",
+            "墨量阈值是自定口径，只能保证有墨/不出界/没糊死，不能保证和 Excel 图标观感一致。",
+            "深色按钮悬停态的图标未单独截；工具提示文本不在本切片。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
