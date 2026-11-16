@@ -450,3 +450,43 @@ fn show_as_labels_and_xml_names_are_stable() {
     assert!(!ShowAs::DifferencePrev.percent_format());
     assert!(!ShowAs::Index.percent_format());
 }
+
+#[test]
+fn calculated_field_lands_in_cache_definition_like_excel() {
+    use sheetcore::pivot_xml;
+    let fx = Fixture::new("calcfield");
+    let path = fx.file("calcfield.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_b();
+    let _ = attach(&path, &mut wb, &spec);
+
+    let n = pivot_xml::add_calculated_fields(&path, &[("总价", "金额*2")]).unwrap();
+    // 缓存定义和透视表定义各改一处（pivotFields 条数必须跟着缓存字段数走）
+    assert_eq!(n, 2, "缓存定义 + 透视表定义");
+
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        let name = z
+            .file_names()
+            .find(|n| n.contains("pivotCacheDefinition"))
+            .unwrap()
+            .to_string();
+        z.by_name(&name).unwrap().read_to_string(&mut xml).unwrap();
+    }
+    // Excel 自己写的是：<cacheField name="总价" numFmtId="0" formula="金额*2" databaseField="0"/>
+    assert!(xml.contains("formula=\"金额*2\""), "{xml}");
+    assert!(xml.contains("databaseField=\"0\""));
+    // count 必须跟着加一，否则 Excel 认为字段数与定义不符
+    let open = xml.find("<cacheFields count=\"").unwrap() + "<cacheFields count=\"".len();
+    let len = xml[open..].find('"').unwrap();
+    let count: usize = xml[open..open + len].parse().unwrap();
+    let actual = xml.matches("<cacheField name=").count();
+    let pf_open = xml.find("<pivotFields count=\"");
+    assert_eq!(count, actual, "count 与条目数不一致");
+
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/calcfield-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
+}

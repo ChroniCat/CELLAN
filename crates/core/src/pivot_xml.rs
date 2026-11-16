@@ -535,6 +535,98 @@ pub fn set_pivot_layout(path: &std::path::Path, compact: bool) -> anyhow::Result
     Ok(changed)
 }
 
+/// 计算字段（Excel：cacheField 带 formula + databaseField="0"）
+///
+/// 只改缓存定义，缓存记录与数据区不动：Excel 打开后按公式自己算这一列。
+pub fn add_calculated_fields(
+    path: &std::path::Path,
+    calc: &[(&str, &str)],
+) -> anyhow::Result<usize> {
+    use std::io::{Read, Write};
+    if calc.is_empty() {
+        return Ok(0);
+    }
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name().to_string();
+        let mut buf = Vec::with_capacity(e.size() as usize);
+        e.read_to_end(&mut buf)?;
+        entries.push((name, buf));
+    }
+    drop(zip);
+    let mut changed = 0usize;
+    for (name, buf) in entries.iter_mut() {
+        if !name.contains("pivotCacheDefinition") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { continue };
+        let Some(open) = text.find("<cacheFields count=\"") else { continue };
+        let count_start = open + "<cacheFields count=\"".len();
+        let Some(count_len) = text[count_start..].find('"') else { continue };
+        let old_count: usize = text[count_start..count_start + count_len].parse().unwrap_or(0);
+        let Some(close) = text.find("</cacheFields>") else { continue };
+        let mut add = String::new();
+        for (n, f) in calc {
+            add.push_str(&format!(
+                "<cacheField name=\"{}\" numFmtId=\"0\" formula=\"{}\" databaseField=\"0\"/>",
+                esc(n),
+                esc(f)
+            ));
+        }
+        let mut out = String::with_capacity(text.len() + add.len());
+        out.push_str(&text[..count_start]);
+        out.push_str(&(old_count + calc.len()).to_string());
+        out.push_str(&text[count_start + count_len..close]);
+        out.push_str(&add);
+        out.push_str(&text[close..]);
+        *buf = out.into_bytes();
+        changed += 1;
+    }
+    // 透视表定义里的 pivotFields 条数必须与缓存字段数一致，否则 Excel 打不开（报「不能取得 Open 属性」）
+    for (name, buf) in entries.iter_mut() {
+        if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { continue };
+        let Some(open) = text.find("<pivotFields count=\"") else { continue };
+        let cs = open + "<pivotFields count=\"".len();
+        let Some(cl) = text[cs..].find('"') else { continue };
+        let old: usize = text[cs..cs + cl].parse().unwrap_or(0);
+        let Some(close) = text.find("</pivotFields>") else { continue };
+        let mut ins = String::new();
+        for _ in 0..calc.len() {
+            ins.push_str("<pivotField compact=\"0\" outline=\"0\" showAll=\"0\"/>");
+        }
+        let mut out = String::with_capacity(text.len() + ins.len());
+        out.push_str(&text[..cs]);
+        out.push_str(&(old + calc.len()).to_string());
+        out.push_str(&text[cs + cl..close]);
+        out.push_str(&ins);
+        out.push_str(&text[close..]);
+        *buf = out.into_bytes();
+        changed += 1;
+    }
+
+    if changed == 0 {
+        return Ok(0);
+    }
+    let tmp = path.with_extension("calc.tmp");
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
+        for (name, buf) in &entries {
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file(name.clone(), opts)?;
+            w.write_all(buf)?;
+        }
+        w.finish()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(changed)
+}
+
 fn set_attr(xml: &str, name: &str, val: &str) -> String {
     let pat = format!("{name}=\"");
     if let Some(i) = xml.find(&pat) {
