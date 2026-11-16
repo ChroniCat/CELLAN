@@ -39,6 +39,13 @@ impl SheetApp {
         let cur = self.current_style();
         match id {
             // 按钮的可用性与快捷键共用命令表里的同一个谓词
+            // 剪贴板空着时「粘贴」系列灰掉（Excel 行为）；剪切/复制对空单元格也有效，保持可用
+            "Paste" | "PasteMenu" | "PasteSpecial" | "PasteSplit" => {
+                st.enabled = crate::office_clipboard::has_pasteable();
+                if !st.enabled {
+                    st.tip = Some("剪贴板里没有可粘贴的内容".into());
+                }
+            }
             "Undo" => st.enabled = self.command_enabled("Undo"),
             "Redo" => st.enabled = self.command_enabled("Redo"),
             "FileSave" | "FileSaveAs" | "FileOpen" | "NewTab" | "FilePrintPreview"

@@ -79,3 +79,25 @@ Button  重做   enabled=False   at=298,37,26,26
 
 仍未解决的功能差异：功能区与右键菜单的其他命令没有运行期禁用
 （`Ctl.enabled` 恒 true），所以剪贴板为空时「剪切/复制/粘贴」照样可点。
+
+七、运行期禁用态：粘贴按钮随剪贴板灰化（同日续）
+------------------------------------------------
+之前记录的功能差异「剪贴板为空时粘贴照样可点」已修：
+- `office_clipboard::has_pasteable()`：只查格式是否可用（CF_UNICODETEXT / XML Spreadsheet /
+  HTML Format），不读数据；500ms 缓存，避免每帧开剪贴板。
+- `ctl_state` 对 `Paste` / `PasteMenu` / `PasteSpecial` / `PasteSplit` 用它决定 enabled，
+  禁用时 tooltip 变「剪贴板里没有可粘贴的内容」。
+- 剪切/复制**保持可用**（对空单元格也有效，和 Excel 一致）。
+
+外部 UIA 两向实测：
+```
+剪贴板为空：
+Button  粘贴        enabled=False  at=349,372,42,76
+Button  粘贴 选项   enabled=False  at=349,436,42,12
+
+Set-Clipboard 'hello paste' 之后：
+Button  粘贴        enabled=True   at=427,450,42,76
+Button  粘贴 选项   enabled=True   at=427,514,42,12
+```
+顺带修掉一个遗漏：大号拆分按钮的**主体**（`big_sized_split` 的 r）此前没有可访问名字，
+只有箭头有；现在 `split()` / `menu()` 的大按钮主体也发名字和 enabled。

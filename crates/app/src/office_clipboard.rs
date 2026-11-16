@@ -103,6 +103,49 @@ impl OfficeBlock {
     }
 }
 
+/// 剪贴板里有没有东西可粘贴（Excel 的「粘贴」按钮灰化条件）。
+///
+/// 只看格式是否可用，不读数据；每 500ms 最多查一次，避免每帧开剪贴板。
+pub fn has_pasteable() -> bool {
+    #[cfg(test)]
+    {
+        return false;
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+        let mut g = match CACHE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some((t, v)) = *g {
+            if t.elapsed() < Duration::from_millis(500) {
+                return v;
+            }
+        }
+        const CF_UNICODETEXT: u32 = 13;
+        let mut ok = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 };
+        if !ok {
+            unsafe {
+                let name = wide("XML Spreadsheet");
+                let fmt = RegisterClipboardFormatW(name.as_ptr());
+                ok = fmt != 0 && IsClipboardFormatAvailable(fmt) != 0;
+            }
+        }
+        if !ok {
+            unsafe {
+                let name = wide("HTML Format");
+                let fmt = RegisterClipboardFormatW(name.as_ptr());
+                ok = fmt != 0 && IsClipboardFormatAvailable(fmt) != 0;
+            }
+        }
+        *g = Some((Instant::now(), ok));
+        ok
+    }
+}
+
 /// 从系统剪贴板读 Excel 区域。
 ///
 /// 优先 **XML Spreadsheet**：它带公式（R1C1）、值类型、字体名/字号/数字格式；
