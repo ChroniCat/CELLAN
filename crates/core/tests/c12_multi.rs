@@ -43,8 +43,8 @@ fn spec() -> PivotSpec2 {
         rows: vec![AxisField::plain(0), AxisField::plain(1)],
         cols: vec![AxisField::plain(2)],
         values: vec![
-            ValueField { col: 3, agg: Agg::Sum, label: None },
-            ValueField { col: 4, agg: Agg::Count, label: None },
+            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 4, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
         ],
         filters: vec![FilterField { col: 5, keep: vec!["有效".into()] }],
         layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
