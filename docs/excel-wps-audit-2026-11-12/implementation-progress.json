@@ -7389,17 +7389,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ctx-menu.txt"
           ],
           "not_done": [
-            "禁用态未在 UIA 里验证出 IsEnabled=false（样本里没有稳定复现的禁用按钮）。",
-            "公式栏只有进入编辑态才生成 Edit 节点。",
-            "accesskit 0.17 不支持 SelectionItemPattern，选中态写进名字。",
-            "右键子菜单展开后的条目未单独 dump；没有 Role=Menu 容器节点。",
-            "剪切/复制/其他功能区命令仍恒为可用（Excel 里多数也常可用，但「删除工作表」「取消合并」这类应随状态灰化，未做）。",
-            "功能区折叠菜单：一级「组名 ▾/更多 ▾」弹出的分组入口在 accesskit 树里（Button，实测坐标 816,321…），但点开的二级命令列表不出现（COUNT 93 不变，无 条件格式/套用表格 等项），读屏只能到分组这一层。"
+            "二级菜单命令列表在 accesskit 树里未验证：ribbon 菜单走 ui.menu_button + 标准 ui.button（非自绘命中区），控件本身有名称；缺的是「展开菜单后读取 accesskit 树」的测试通道（当前脚手架只能写节点不能读树）。下一步：接 egui accesskit 输出 → 断言条件格式/套用表格/单元格样式 的二级命令名单。"
           ],
           "failures": [],
           "blocker": "",
           "next": "验右键菜单与禁用态；再考虑升级 accesskit。",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-16T22:01:58Z"
         },
         {
           "id": "UI-24.3",
