@@ -759,6 +759,13 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// 只拖动、不参与 Tab 焦点的 Sense（标题栏、缩放手柄、模态遮挡层都该用它）
+pub fn drag_only_sense() -> egui::Sense {
+    egui::Sense::from_bits_truncate(
+        egui::Sense::click_and_drag().bits() & !egui::Sense::FOCUSABLE.bits(),
+    )
+}
+
 /// UI-24.2：给自绘控件补可访问名字/角色/状态。
 /// 自绘控件（pill、功能区大按钮）在 UIA 里默认只是个空图元，Narrator 读不到名字。
 pub fn a11y_name(resp: &egui::Response, label: &str, enabled: bool, toggled: Option<bool>) {
@@ -987,6 +994,19 @@ impl Dlg {
         add: impl FnOnce(&mut egui::Ui) -> R,
     ) -> Option<egui::InnerResponse<R>> {
         let id = egui::Id::new(("dlgwin", &self.title));
+        // UI-24.1：记住打开前的焦点，关闭时还回去
+        let now0 = ctx.input(|i| i.time);
+        let seen = ctx.data(|d| d.get_temp::<f64>(id.with("shown"))).unwrap_or(-10.0);
+        if now0 - seen > 0.5 {
+            let before = ctx.memory(|m| m.focused());
+            ctx.data_mut(|d| {
+                if let Some(f) = before {
+                    d.insert_temp(id.with("focus_before"), f);
+                } else {
+                    d.remove::<egui::Id>(id.with("focus_before"));
+                }
+            });
+        }
         // UI-24.2：对话框在可访问树里要有 Dialog 角色和标题
         let title = self.title.clone();
         let _ = ctx.accesskit_node_builder(id.with("a11y"), |node| {
@@ -1038,7 +1058,8 @@ impl Dlg {
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let r = egui::Rect::from_min_size(screen.min, screen.size());
-                let resp = ui.interact(r, id.with("blocki"), egui::Sense::click_and_drag());
+                // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
+                let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
                 let _ = resp;
             });
         let out = egui::Area::new(id.with("area"))
@@ -1060,9 +1081,10 @@ impl Dlg {
                     .show(ui, |ui| {
                         ui.set_width(w);
                         // 标题栏
+                        // 标题栏只用来拖动，不该占 Tab 焦点
                         let (trect, tresp) = ui.allocate_exact_size(
                             egui::vec2(w, 30.0),
-                            egui::Sense::click_and_drag(),
+                            drag_only_sense(),
                         );
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
@@ -1146,7 +1168,7 @@ impl Dlg {
                                 egui::pos2(trect.right() - 14.0, bottom - 14.0),
                                 egui::vec2(14.0, 14.0),
                             );
-                            let g = ui.interact(gr, id.with("grip"), egui::Sense::drag());
+                            let g = ui.interact(gr, id.with("grip"), drag_only_sense());
                             let gc = Color32::from_rgb(160, 158, 156);
                             for k in 0..3 {
                                 let o = 3.0 + k as f32 * 3.0;
@@ -1173,11 +1195,30 @@ impl Dlg {
                     Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(179, 177, 175)),
                     egui::StrokeKind::Inside,
                 );
+                // UI-24.1：Tab/Shift+Tab 只在对话框这一层里转，不会跑到背景网格。
+                // 关闭这一帧要把模态层降回背景，否则下一帧背景控件仍被判“被模态挡住”，
+                // 会把刚还回去的焦点又 surrender 掉。
+                let closing = closed || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                let layer = ui.layer_id();
+                ui.memory_mut(|m| {
+                    if closing {
+                        m.set_modal_layer(egui::LayerId::background());
+                    } else {
+                        m.set_modal_layer(layer);
+                    }
+                });
                 fr.inner
             });
         if closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if let Some(p) = self.open {
                 unsafe { *p = false; }
+            }
+            // UI-24.1：关闭后焦点回到触发它的控件
+            if let Some(f) = ctx
+                .data(|d| d.get_temp::<egui::Id>(id.with("focus_before")))
+            {
+                ctx.memory_mut(|m| m.request_focus(f));
+                ctx.data_mut(|d| d.remove::<egui::Id>(id.with("focus_before")));
             }
         }
         ctx.data_mut(|d| {

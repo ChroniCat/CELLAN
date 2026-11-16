@@ -8568,3 +8568,156 @@ fn save_progress_carries_a_start_instant() {
     }
     let _ = std::fs::remove_file(&target);
 }
+
+fn run_frame(
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    open: &mut bool,
+    seen: &mut Vec<&'static str>,
+    grab: bool,
+) {
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(900.0, 700.0),
+    ));
+    raw.events = events;
+    ctx.run(raw, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let r = ui.add(egui::Button::new("背景按钮"));
+            if grab && ctx.memory(|m| m.focused()).is_none() {
+                r.request_focus();
+            }
+            if std::env::var("SC_FOCUS_DBG").is_ok() {
+                eprintln!("[dbg] bg id={:?} focused={:?}", r.id, ctx.memory(|m| m.focused()));
+            }
+            if r.has_focus() {
+                seen.push("bg");
+            }
+        });
+        ui_kit::window(ctx, "测试对话框", 320.0)
+            .open(open)
+            .show(ctx, |ui| {
+                let r = ui.add(egui::Button::new("确定"));
+                if std::env::var("SC_FOCUS_DBG").is_ok() {
+                    eprintln!("[dbg] dlg id={:?} focused={:?}", r.id, ctx.memory(|m| m.focused()));
+                }
+                if r.has_focus() {
+                    seen.push("dlg");
+                }
+            });
+    });
+}
+
+fn tab_event() -> egui::Event {
+    egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn esc_event() -> egui::Event {
+    egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+#[test]
+fn modal_dialog_traps_tab_focus_and_restores_it_on_escape() {
+    let ctx = egui::Context::default();
+    let mut open = true;
+    let mut seen: Vec<&'static str> = Vec::new();
+    // 第一帧：背景按钮拿到焦点
+    run_frame(&ctx, vec![], &mut open, &mut seen, true);
+    assert_eq!(seen.last(), Some(&"bg"), "背景按钮第一帧没拿到焦点");
+    // Tab：焦点必须离开背景、进入对话框（第一站是标题栏的关闭按钮）
+    seen.clear();
+    run_frame(&ctx, vec![tab_event()], &mut open, &mut seen, false);
+    run_frame(&ctx, vec![], &mut open, &mut seen, false);
+    assert!(
+        !seen.contains(&"bg"),
+        "Tab 之后焦点还在背景：{seen:?}（模态焦点没有锁住）"
+    );
+    assert!(
+        seen.is_empty(),
+        "焦点落到了对话框里的非按钮控件：{seen:?}"
+    );
+    // 继续 Tab：焦点在对话框内部循环，最多 6 步必须能到「确定」，且绝不回背景
+    seen.clear();
+    let mut steps = 0;
+    for _ in 0..6 {
+        steps += 1;
+        run_frame(&ctx, vec![tab_event()], &mut open, &mut seen, false);
+        run_frame(&ctx, vec![], &mut open, &mut seen, false);
+        if seen.contains(&"dlg") {
+            break;
+        }
+    }
+    assert!(
+        seen.contains(&"dlg"),
+        "Tab 循环 {steps} 步都没到「确定」：{seen:?}（对话框内容键盘不可达）"
+    );
+    assert!(!seen.contains(&"bg"), "Tab 焦点跑到背景：{seen:?}");
+    // Esc：对话框关闭，焦点回到背景按钮
+    seen.clear();
+    run_frame(&ctx, vec![esc_event()], &mut open, &mut seen, false);
+    assert!(!open, "Esc 没有关闭对话框");
+    run_frame(&ctx, vec![], &mut open, &mut seen, false);
+    assert!(
+        seen.contains(&"bg"),
+        "关闭后焦点没有回到触发控件：{seen:?}"
+    );
+}
+
+#[test]
+fn default_button_answers_enter_only_when_no_field_has_focus() {
+    let ctx = egui::Context::default();
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, clicked: &mut bool, focused_field: bool) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(600.0, 400.0),
+        ));
+        raw.events = events;
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if focused_field {
+                    let r = ui.text_edit_singleline(&mut String::new());
+                    if ctx.memory(|m| m.focused()).is_none() {
+                        r.request_focus();
+                    }
+                }
+                let b = ui_kit::primary_button(ui, "确定");
+                if b.clicked {
+                    *clicked = true;
+                }
+            });
+        });
+    }
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    // 没有输入框拿焦点：Enter 就是「确定」
+    let mut clicked = false;
+    frame(&ctx, vec![], &mut clicked, false);
+    frame(&ctx, vec![enter.clone()], &mut clicked, false);
+    assert!(clicked, "没有焦点时 Enter 没有触发默认按钮");
+
+    // 输入框拿焦点时：Enter 归输入框，不触发默认按钮
+    let ctx2 = egui::Context::default();
+    let mut clicked2 = false;
+    frame(&ctx2, vec![], &mut clicked2, true);
+    frame(&ctx2, vec![enter], &mut clicked2, true);
+    assert!(!clicked2, "输入框有焦点时 Enter 仍然触发了默认按钮");
+}
