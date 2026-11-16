@@ -8033,3 +8033,155 @@ fn ui114_committing_formula_records_recent_functions() {
     assert_eq!(list.first().map(|s| s.as_str()), Some("SUM"), "最后用到的函数排最前");
     assert!(list.contains(&"AVERAGE".to_string()), "同一条公式里的函数都记");
 }
+
+// ===== UI-11.5：拖动/Shift 扩区域引用、行号列标引用 =====
+
+fn click_grid_mods(
+    app: &mut SheetApp,
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    mods: egui::Modifiers,
+) {
+    for pressed in [None, Some(true), Some(false)] {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            modifiers: mods,
+            ..Default::default()
+        };
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerMoved(pos));
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: mods,
+            });
+        }
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    }
+}
+
+/// 按下 → 移动（越过拖动阈值）→ 再移动 → 松开
+fn drag_grid(app: &mut SheetApp, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+    let mut frame = |events: Vec<egui::Event>, mods: egui::Modifiers| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            modifiers: mods,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+    };
+    let m = egui::Modifiers::default();
+    frame(
+        vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: m,
+            },
+        ],
+        m,
+    );
+    let mid = egui::pos2((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
+    frame(vec![egui::Event::PointerMoved(mid)], m);
+    frame(vec![egui::Event::PointerMoved(to)], m);
+    frame(
+        vec![egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: m,
+        }],
+        m,
+    );
+}
+
+#[test]
+fn ui115_reference_text_helpers() {
+    assert_eq!(range_label((0, 0), (2, 1)), "A1:B3");
+    assert_eq!(range_label((2, 1), (0, 0)), "B3:A1", "锚点在前，和 Excel 一致");
+    assert_eq!(whole_col_label(1), "B:B");
+    assert_eq!(whole_row_label(2), "3:3");
+    let (buf, caret) = replace_char_span("=SUM(A1", (5, 7), "A1:B3");
+    assert_eq!(buf, "=SUM(A1:B3");
+    assert_eq!(caret, 10);
+    // 越界区间按长度夹住，不 panic
+    let (buf, _) = replace_char_span("=A1", (1, 99), "B2");
+    assert_eq!(buf, "=B2");
+}
+
+#[test]
+fn ui115_shift_click_extends_reference_to_range() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.editing = Some(EditState::new("=SUM(".into()));
+    let sheet = &app.wb.sheets[0];
+    let a1 = egui::pos2(HEAD_W + sheet.cols.pos(0) + 12.0, HEAD_H + sheet.rows.pos(0) + 8.0);
+    let b3 = egui::pos2(HEAD_W + sheet.cols.pos(1) + 12.0, HEAD_H + sheet.rows.pos(2) + 8.0);
+    click_grid(&mut app, &ctx, a1);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(A1");
+    assert_eq!(app.pick_rect, Some((0, 0, 0, 0)));
+    click_grid_mods(&mut app, &ctx, b3, egui::Modifiers::SHIFT);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(A1:B3", "Shift+点扩成区域");
+    assert_eq!(app.pick_rect, Some((0, 0, 2, 1)), "引用框跟着扩");
+    assert_eq!(app.sel, (0, 2), "取引用不动选区");
+}
+
+#[test]
+fn ui115_dragging_while_picking_rewrites_reference_to_range() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.editing = Some(EditState::new("=SUM(".into()));
+    let sheet = &app.wb.sheets[0];
+    let a1 = egui::pos2(HEAD_W + sheet.cols.pos(0) + 12.0, HEAD_H + sheet.rows.pos(0) + 8.0);
+    let c4 = egui::pos2(HEAD_W + sheet.cols.pos(2) + 12.0, HEAD_H + sheet.rows.pos(3) + 8.0);
+    drag_grid(&mut app, &ctx, a1, c4);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(A1:C4", "拖动 = 锚点到当前格");
+    assert_eq!(app.pick_rect, Some((0, 0, 3, 2)));
+    assert_eq!(app.sel, (0, 2), "拖引用不改选区");
+}
+
+#[test]
+fn ui115_header_click_inserts_whole_column_and_row_reference() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.editing = Some(EditState::new("=SUM(".into()));
+    let sheet = &app.wb.sheets[0];
+    let col_b = egui::pos2(HEAD_W + sheet.cols.pos(1) + 12.0, HEAD_H / 2.0);
+    click_grid(&mut app, &ctx, col_b);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(B:B", "列标 = 整列引用");
+    assert_eq!(app.pick_rect, Some((0, 1, 1_048_575, 1)));
+    app.editing.as_mut().unwrap().buf = "=SUM(".into();
+    app.editing.as_mut().unwrap().caret = 5;
+    app.pick_rect = None;
+    app.pick_anchor = None;
+    app.pick_span = None;
+    let sheet = &app.wb.sheets[0];
+    let row_3 = egui::pos2(HEAD_W / 2.0, HEAD_H + sheet.rows.pos(2) + 8.0);
+    click_grid(&mut app, &ctx, row_3);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(3:3", "行号 = 整行引用");
+    assert_eq!(app.pick_rect, Some((2, 0, 2, 16_383)));
+}

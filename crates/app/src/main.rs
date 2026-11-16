@@ -765,6 +765,33 @@ pub(crate) fn insert_reference(buf: &str, caret: usize, label: &str) -> (String,
     (out, start + label.chars().count())
 }
 
+/// UI-11.5：把缓冲里的 [s,e) 换成 text，返回新缓冲与新光标。
+pub(crate) fn replace_char_span(buf: &str, span: (usize, usize), text: &str) -> (String, usize) {
+    let chars: Vec<char> = buf.chars().collect();
+    let s = span.0.min(chars.len());
+    let e = span.1.max(s).min(chars.len());
+    let mut out: String = chars[..s].iter().collect();
+    out.push_str(text);
+    out.extend(chars[e..].iter());
+    (out, s + text.chars().count())
+}
+
+/// UI-11.5：两格之间的区域引用，锚点在前（从 B3 拖回 A1 显示 B3:A1，和 Excel 一致）。
+pub(crate) fn range_label(a: (u32, u32), b: (u32, u32)) -> String {
+    format!("{}:{}", cell_name(a.0, a.1), cell_name(b.0, b.1))
+}
+
+/// UI-11.5：整列引用 `A:A`。
+pub(crate) fn whole_col_label(c: u32) -> String {
+    let l = col_label(c);
+    format!("{l}:{l}")
+}
+
+/// UI-11.5：整行引用 `1:1`。
+pub(crate) fn whole_row_label(r: u32) -> String {
+    format!("{}:{}", r + 1, r + 1)
+}
+
 /// UI-11.3：公式里的引用片段（字符区间 + 调色序号），同一文本共用同色。
 pub(crate) fn ref_spans(buf: &str) -> Vec<(usize, usize, usize)> {
     let chars: Vec<char> = buf.chars().collect();
@@ -1719,6 +1746,9 @@ struct SheetApp {
     grid_press: Option<(u32, u32)>,
     /// UI-11.3：编辑公式时点选单元格建立的引用框（虚线/细框，不改变选区）
     pick_rect: Option<(u32, u32, u32, u32)>,
+    /// UI-11.5：拖动拾取引用时的锚点，以及已插入那串文本在缓冲里的字符区间
+    pick_anchor: Option<(u32, u32)>,
+    pick_span: Option<(usize, usize)>,
     /// 单元格右键菜单
     ctx_menu: Option<CtxMenuState>,
     /// 本帧菜单占用的矩形（判断点击是否落在外面）
@@ -2687,6 +2717,8 @@ impl SheetApp {
             nav_rect: None,
             grid_press: None,
             pick_rect: None,
+            pick_anchor: None,
+            pick_span: None,
             ctx_menu: None,
             ctx_rects: Vec::new(),
             cell_move: None,
@@ -9240,6 +9272,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let mut wrote = false;
         // 编辑结束（或退回重试）都清掉点选引用的细框
         self.pick_rect = None;
+        self.pick_anchor = None;
+        self.pick_span = None;
         // 用户在警告框里点了“是”：这一笔跳过验证（一次性）
         let force = std::mem::replace(&mut self.dv_force_once, false);
         if let Some(ed) = self.editing.take() {
@@ -9478,6 +9512,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn cancel_edit(&mut self) {
         self.editing = None;
         self.pick_rect = None;
+        self.pick_anchor = None;
+        self.pick_span = None;
         self.release_lock();
     }
 
@@ -25092,6 +25128,47 @@ let txn = self.txn_begin(&keys);
             );
         }
 
+        // UI-11.5：编辑公式时按行号/列标 = 整行/整列引用（A:A / 1:1）。
+        // 要在下面的「提交草稿」判断之前处理，否则这一按会先把编辑提交掉。
+        let mut header_ref_done = false;
+        if !readonly
+            && !self.dialog_modal
+            && (resp.drag_started() || resp.clicked())
+            && self
+                .editing
+                .as_ref()
+                .is_some_and(|ed| ed.buf.starts_with('='))
+        {
+            // clicked() 是松开那一帧，press_origin 已经清空，退回到指针位置
+            let press_at = ui
+                .ctx()
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| resp.interact_pointer_pos());
+            if let Some(p) = press_at {
+                let in_col_head = p.y < origin.y + hh && p.x >= origin.x + head_w;
+                let in_row_head = p.x < origin.x + head_w && p.y >= origin.y + hh;
+                if in_col_head || in_row_head {
+                    let (label, rect) = if in_col_head {
+                        let c = cols.index_at((off_x + p.x - (origin.x + head_w) - 1.0).max(0.0));
+                        (whole_col_label(c), (0u32, c, 1_048_575u32, c))
+                    } else {
+                        let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
+                        (whole_row_label(r), (r, 0u32, r, 16_383u32))
+                    };
+                    if let Some(ed) = self.editing.as_mut() {
+                        let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
+                        ed.buf = buf;
+                        ed.caret = caret;
+                        ed.caret_override = Some(caret);
+                    }
+                    self.pick_anchor = None;
+                    self.pick_span = None;
+                    self.pick_rect = Some(rect);
+                    self.status = format!("已插入引用 {label}");
+                    header_ref_done = true;
+                }
+            }
+        }
         // A rejected draft must keep its original cell and sheet coordinates.
         // UI-11.3：正在用鼠标给公式取引用时不提交（Excel 里点/拖格子是建引用，不是结束编辑）
         let picking_ref = self.pick_rect.is_some()
@@ -25104,6 +25181,41 @@ let txn = self.txn_begin(&keys);
             self.commit_edit(None);
             if self.editing.is_some() {
                 return;
+            }
+        }
+
+        // UI-11.5：按住拖动 = 把引用扩成「锚点:当前格」，原地改写上次插入的那串。
+        // 这里用全局指针状态而不是 resp.dragged()：这块是自绘面板，
+        // Response 的 drag 状态不会随指针按住而成立（既有拖动选区也走全局指针）。
+        if !readonly
+            && self.pick_anchor.is_some()
+            && self.pick_span.is_some()
+            && self
+                .editing
+                .as_ref()
+                .is_some_and(|ed| ed.buf.starts_with('='))
+            && ui.input(|i| i.pointer.primary_down())
+        {
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                if p.x > origin.x + head_w && p.y > origin.y + hh && resp.rect.contains(p) {
+                    let a = self.pick_anchor.unwrap();
+                    let span = self.pick_span.unwrap();
+                    let c = col_at(p.x);
+                    let r = row_at(p.y);
+                    if (r, c) != a {
+                        let label = range_label(a, (r, c));
+                        if let Some(ed) = self.editing.as_mut() {
+                            let (buf, caret) = replace_char_span(&ed.buf, span, &label);
+                            ed.buf = buf;
+                            ed.caret = caret;
+                            ed.caret_override = Some(caret);
+                        }
+                        self.pick_span = Some((span.0, span.0 + label.chars().count()));
+                        self.pick_rect =
+                            Some((a.0.min(r), a.1.min(c), a.0.max(r), a.1.max(c)));
+                        self.status = format!("已插入引用 {label}");
+                    }
+                }
             }
         }
 
@@ -25345,7 +25457,7 @@ let txn = self.txn_begin(&keys);
                     }
                 }
             }
-            if resp.drag_started() {
+            if resp.drag_started() && !header_ref_done {
                 // drag_started 在指针已经移动后才触发，起点要用按下时的位置
                 let press = ui
                     .ctx()
@@ -25575,15 +25687,37 @@ let txn = self.txn_begin(&keys);
                     {
                         let c = col_at(p.x);
                         let r = row_at(p.y);
-                        let label = cell_name(r, c);
-                        if let Some(ed) = self.editing.as_mut() {
-                            let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
-                            ed.buf = buf;
-                            ed.caret = caret;
-                            ed.caret_override = Some(caret);
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        if shift && self.pick_anchor.is_some() && self.pick_span.is_some() {
+                            // Shift+点：把上一次插入的单格引用扩成区域（锚点仍在第一次点的格）
+                            let a = self.pick_anchor.unwrap();
+                            let span = self.pick_span.unwrap();
+                            let label = range_label(a, (r, c));
+                            if let Some(ed) = self.editing.as_mut() {
+                                let (buf, caret) = replace_char_span(&ed.buf, span, &label);
+                                ed.buf = buf;
+                                ed.caret = caret;
+                                ed.caret_override = Some(caret);
+                            }
+                            self.pick_span = Some((span.0, span.0 + label.chars().count()));
+                            self.pick_rect =
+                                Some((a.0.min(r), a.1.min(c), a.0.max(r), a.1.max(c)));
+                            self.status = format!("已插入引用 {label}");
+                        } else {
+                            let label = cell_name(r, c);
+                            let mut span = None;
+                            if let Some(ed) = self.editing.as_mut() {
+                                let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
+                                ed.buf = buf;
+                                ed.caret = caret;
+                                ed.caret_override = Some(caret);
+                                span = Some((caret - label.chars().count(), caret));
+                            }
+                            self.pick_anchor = Some((r, c));
+                            self.pick_span = span;
+                            self.pick_rect = Some((r, c, r, c));
+                            self.status = format!("已插入引用 {label}");
                         }
-                        self.pick_rect = Some((r, c, r, c));
-                        self.status = format!("已插入引用 {label}");
                     }
                     // 正在编辑时不在按下这一拍改选区：草稿被数据验证拒绝时要留在原格
                     // （edit_regression_tests 里的两条用例守着这个不变量）
@@ -28434,43 +28568,73 @@ impl eframe::App for SheetApp {
                 self.save(false);
             }
         }
-        // 无界面验收：SC_REF_SIM="r,c[,frame]" 在指定帧把引用插进正在编辑的公式。
-        // 走的是和鼠标点选同一个 insert_reference（真实 egui 指针路径由
-        // ui113_clicking_grid_while_editing_formula_inserts_reference 用例覆盖；
-        // 这里只为出渲染证据：引用着色 + 点选细框）。
+        // 无界面验收：SC_REF_SIM="r,c[,frame]" 单格，或 "r1,c1,r2,c2[,frame]" 区域。
+        // 走的是和鼠标点选/拖动同一套 insert_reference / replace_char_span，
+        // 真实的 egui 指针路径由 ui113/ui115 的用例覆盖，这里只为出渲染证据。
         if let Ok(spec) = std::env::var("SC_REF_SIM") {
             static F: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let f = F.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut it = spec.split(',');
-            let r: Option<u32> = it.next().and_then(|s| s.trim().parse().ok());
-            let c: Option<u32> = it.next().and_then(|s| s.trim().parse().ok());
-            let at: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(12);
-            if let (Some(r), Some(c)) = (r, c) {
-                if f == at {
-                    let label = cell_name(r, c);
-                    if let Some(ed) = self.editing.as_mut() {
-                        let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
-                        ed.buf = buf;
-                        ed.caret = caret;
-                        ed.caret_override = Some(caret);
-                    }
-                    self.pick_rect = Some((r, c, r, c));
+            let nums: Vec<u32> = spec
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect();
+            let (cells, at) = match nums.len() {
+                5 => (&nums[..4], nums[4]),
+                4 => (&nums[..4], 12u32),
+                3 => (&nums[..2], nums[2]),
+                2 => (&nums[..2], 12u32),
+                _ => (&nums[..0], 12u32),
+            };
+            if f == at && (cells.len() == 2 || cells.len() == 4) {
+                let (r1, c1) = (cells[0], cells[1]);
+                let (r2, c2) = if cells.len() == 4 {
+                    (cells[2], cells[3])
+                } else {
+                    (r1, c1)
+                };
+                let label = if cells.len() == 4 {
+                    range_label((r1, c1), (r2, c2))
+                } else {
+                    cell_name(r1, c1)
+                };
+                if let Some(ed) = self.editing.as_mut() {
+                    let (buf, caret) = match self.pick_span {
+                        Some(span) => replace_char_span(&ed.buf, span, &label),
+                        None => insert_reference(&ed.buf, ed.caret, &label),
+                    };
+                    ed.buf = buf;
+                    ed.caret = caret;
+                    ed.caret_override = Some(caret);
                 }
-                if f == at + 2 {
-                    let buf = self
-                        .editing
+                self.pick_span = Some((
+                    self.editing
                         .as_ref()
-                        .map(|e| e.buf.clone())
-                        .unwrap_or_default();
-                    let spans: Vec<String> = ref_spans(&buf)
-                        .iter()
-                        .map(|(s, e, ci)| format!("{}..{}=#{}", s, e, ci))
-                        .collect();
-                    eprintln!(
-                        "[refsim] buf={:?} pick={:?} sel={:?} spans={:?}",
-                        buf, self.pick_rect, self.sel, spans
-                    );
-                }
+                        .map(|e| e.caret.saturating_sub(label.chars().count()))
+                        .unwrap_or(0),
+                    self.editing.as_ref().map(|e| e.caret).unwrap_or(0),
+                ));
+                self.pick_rect = Some((
+                    r1.min(r2),
+                    c1.min(c2),
+                    r1.max(r2),
+                    c1.max(c2),
+                ));
+                self.pick_anchor = Some((r1, c1));
+            }
+            if f == at + 2 {
+                let buf = self
+                    .editing
+                    .as_ref()
+                    .map(|e| e.buf.clone())
+                    .unwrap_or_default();
+                let spans: Vec<String> = ref_spans(&buf)
+                    .iter()
+                    .map(|(s, e, ci)| format!("{}..{}=#{}", s, e, ci))
+                    .collect();
+                eprintln!(
+                    "[refsim] buf={:?} pick={:?} sel={:?} spans={:?}",
+                    buf, self.pick_rect, self.sel, spans
+                );
             }
         }
         // 无界面验收：SC_DBLCLICK="x,y" 在应用内注入两次点击，走真实的双击判定
