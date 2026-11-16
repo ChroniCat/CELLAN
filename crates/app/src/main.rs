@@ -28292,6 +28292,14 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // QA-05.2：SC_PPP 强制指定缩放因子（DPI 验收用；不设就走系统值）
+        if let Ok(v) = std::env::var("SC_PPP") {
+            if let Ok(ppp) = v.parse::<f32>() {
+                if (ctx.pixels_per_point() - ppp).abs() > 0.001 {
+                    ctx.set_pixels_per_point(ppp);
+                }
+            }
+        }
         system_fonts::begin_frame();
         if ctx.cumulative_pass_nr() == 1 && std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[boot] first_frame {:.3}s", since_start());
@@ -30492,7 +30500,12 @@ fn scrollbar(
     }
     let max_scroll = (total - view).max(0.0);
     let frac = (view / total.max(1.0)).clamp(0.0, 1.0);
-    let thumb_len = (span * frac).clamp(24.0, span);
+    // 窄窗口下 span 可能小于 24：clamp(24.0, span) 会 min>max panic（QA-05.2 在 960×600@1.5 抓到）
+    let thumb_len = if span <= 24.0 {
+        span
+    } else {
+        (span * frac).max(24.0).min(span)
+    };
     let t = if max_scroll > 0.0 {
         (*scroll / max_scroll).clamp(0.0, 1.0)
     } else {
@@ -30529,6 +30542,11 @@ fn scrollbar(
 /// 状态栏上的缩放滑杆：Excel 是一条细轨道 + 圆钮
 fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(100.0, 21.0), Sense::click_and_drag());
+    // 窄窗口 + 高 DPI 时状态栏可能连 100pt 都分不出来，allocate 会给出退化的矩形；
+    // 直接按 rect 画 from_min_max(left+6, right-6) 会 min>max panic（QA-05.2 在 960×600@1.5 抓到）。
+    if rect.width() < 24.0 || rect.height() < 6.0 {
+        return false;
+    }
     let p = ui.painter();
     let cy = rect.center().y;
     let track = Color32::from_rgb(208, 208, 208);

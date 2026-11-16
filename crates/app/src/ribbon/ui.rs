@@ -460,7 +460,9 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
             // UI-24.2：大号拆分按钮的主体和箭头是两个点击区，各自要有名字
             if !label.is_empty() {
-                ui_kit::a11y_name(&r, &label, enabled, if ctl.keytip.is_some() { None } else { None });
+                let mut main = r.rect;
+                main.max.y = main.max.y.min(ar.rect.top());
+                ui_kit::a11y_name_rect(&r, &label, enabled, main, ui.ctx());
             }
             ui_kit::a11y_name(&ar, &format!("{label} 选项"), enabled, None);
             keytip_rect = Some(r.rect);
@@ -555,7 +557,11 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
         let w = m.ctl.width.unwrap_or(65.0);
         let ic = m.ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
         let (r, ar) = ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0));
-        ui_kit::a11y_name(&r, &label, on_enabled(&m.ctl, &st), None);
+        {
+            let mut main = r.rect;
+            main.max.y = main.max.y.min(ar.rect.top());
+            ui_kit::a11y_name_rect(&r, &label, on_enabled(&m.ctl, &st), main, ui.ctx());
+        }
         ui_kit::a11y_name(&ar, &format!("{label} 选项"), on_enabled(&m.ctl, &st), None);
         if (r.clicked() || ar.clicked()) && on_enabled(&m.ctl, &st) {
             app.ribbon_popup = Some(Popup {

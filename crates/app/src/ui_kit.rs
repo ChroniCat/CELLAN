@@ -759,6 +759,27 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// 同 `a11y_name`，但可访问矩形单独给（拆分按钮的主体不能把箭头区也算进去）
+pub fn a11y_name_rect(
+    resp: &egui::Response,
+    label: &str,
+    enabled: bool,
+    rect: egui::Rect,
+    ctx: &egui::Context,
+) {
+    a11y_name(resp, label, enabled, None);
+    let ppp = ctx.pixels_per_point();
+    let b = egui::accesskit::Rect {
+        x0: (rect.min.x * ppp) as f64,
+        y0: (rect.min.y * ppp) as f64,
+        x1: (rect.max.x * ppp) as f64,
+        y1: (rect.max.y * ppp) as f64,
+    };
+    let _ = ctx.accesskit_node_builder(resp.id, |node| {
+        node.set_bounds(b);
+    });
+}
+
 /// UI-24.2：给自绘控件指定可访问角色（Tab 页、菜单项等）
 pub fn a11y_role(
     resp: &egui::Response,
