@@ -905,3 +905,47 @@ fn page_filter_matches_excel_filter_ref() {
     assert_eq!(out.get(4, 1).unwrap().value.display(), "地区");
     assert_eq!(rect.0, 2, "rect 从标题区开始算");
 }
+
+#[test]
+#[ignore = "参考用：Excel 的两层列字段会插「A 汇总」「B 汇总」子总计列，我们尚未实现，见 c12-2-two-col-fields.md"]
+fn two_col_field_reference_dump() {
+    use sheetcore::{Cell, Value};
+    let mut wb = sheetcore::Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    for (c, h) in ["地区", "产品", "状态", "金额"].iter().enumerate() {
+        wb.sheets[0].set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });
+    }
+    let data = [
+        ("华东", "A", "有效", 10.0),
+        ("华北", "B", "有效", 20.0),
+        ("华东", "A", "无效", 30.0),
+        ("华北", "B", "有效", 40.0),
+        ("华东", "B", "无效", 50.0),
+        ("华北", "A", "有效", 60.0),
+    ];
+    for (i, (a, b, c, d)) in data.iter().enumerate() {
+        let r = i as u32 + 1;
+        wb.sheets[0].set(r, 0, Cell { value: Value::Text((*a).into()), formula: None });
+        wb.sheets[0].set(r, 1, Cell { value: Value::Text((*b).into()), formula: None });
+        wb.sheets[0].set(r, 2, Cell { value: Value::Text((*c).into()), formula: None });
+        wb.sheets[0].set(r, 3, Cell { value: Value::Number(*d), formula: None });
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![
+            AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
+            AxisField { col: 2, group: sheetcore::pivot::GroupBy::None },
+        ],
+        values: vec![ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    };
+    let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    for h in &g.headers {
+        eprintln!("HDR| {}", h.join("\t"));
+    }
+    for r in &g.rows {
+        eprintln!("ROW| {}", r.iter().map(|v| v.display()).collect::<Vec<_>>().join("\t"));
+    }
+}
