@@ -9920,3 +9920,99 @@ fn parse_calc_field_reads_name_and_formula() {
     assert!(crate::parse_calc_field("=金额*2").is_none());
     assert!(crate::parse_calc_field("总价=").is_none());
 }
+
+// ---------------------------------------------------------------- accesskit 读取通道
+
+/// 跑一帧并取出 accesskit 树里的 (role, label) 列表（UI-24.2 用）
+fn a11y_nodes(app: &mut SheetApp, ctx: &egui::Context) -> Vec<(String, String, Option<egui::Rect>)> {
+    ctx.enable_accesskit();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1440.0, 900.0),
+        )),
+        ..Default::default()
+    };
+    let out = ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame));
+    let mut v = Vec::new();
+    if let Some(up) = out.platform_output.accesskit_update {
+        for (id, node) in up.nodes {
+            let _ = id;
+            let b = node.bounds().map(|bb| {
+                egui::Rect::from_min_max(
+                    egui::pos2(bb.x0 as f32, bb.y0 as f32),
+                    egui::pos2(bb.x1 as f32, bb.y1 as f32),
+                )
+            });
+            v.push((format!("{:?}", node.role()), node.label().unwrap_or("").to_string(), b));
+        }
+    }
+    v
+}
+
+#[test]
+fn a11y_tree_reads_ribbon_group_names() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let nodes = a11y_nodes(&mut app, &ctx);
+    eprintln!("accesskit nodes = {}", nodes.len());
+    for (r, l, _) in nodes.iter().filter(|(_, l, _)| !l.is_empty()).filter(|(_, l, _)| l.contains("样式") || l.contains("表格") || l.contains("排序")) {
+        eprintln!("  {r} | {l}");
+    }
+    assert!(nodes.len() > 20, "树太小：{}", nodes.len());
+}
+
+#[test]
+fn a11y_secondary_menu_items_appear_when_open() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let nodes = a11y_nodes(&mut app, &ctx);
+    let hit = nodes
+        .iter()
+        .find(|(_, l, b)| l == "条件格式" && b.is_some())
+        .cloned();
+    let (_, _, rect) = hit.expect("一级入口「条件格式」没有 bounds");
+    let rect = rect.unwrap();
+    let p = rect.center();
+    // 点开菜单：按下 + 抬起，再跑两帧让 popup 展开
+    for _ in 0..2 {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1440.0, 900.0))),
+            ..Default::default()
+        };
+        input.events = vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    }
+    let after = a11y_nodes(&mut app, &ctx);
+    let names: Vec<String> = after.iter().map(|(_, l, _)| l.clone()).filter(|l| !l.is_empty()).collect();
+    eprintln!("after open: {} labelled nodes", names.len());
+    for n in names.iter().filter(|l| l.contains("规则") || l.contains("色阶") || l.contains("数据条") || l.contains("图标")) {
+        eprintln!("  MENU | {n}");
+    }
+    assert!(
+        names.iter().any(|l| l.contains("规则")),
+        "二级命令没进树：{:?}",
+        &names[..names.len().min(30)]
+    );
+
+    // 其余组的入口是 split 按钮/画廊（「… 选项」「… 展开」），点击目标是箭头热点，
+    // 本用例只覆盖纯菜单按钮；split/gallery 的二级内容待单独用例（见 UI-24.2 记录）。
+}
