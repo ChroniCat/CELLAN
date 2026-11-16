@@ -604,6 +604,36 @@ pub fn write_grid(sheet: &mut Sheet, at: (u32, u32), grid: &PivotGrid) -> (u32, 
     (r0, c0, r.saturating_sub(1), c0 + cols.saturating_sub(1))
 }
 
+/// 列方向上的一个槽位：列叶子，或某个上层项的子总计列
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColSlot {
+    Leaf(Vec<String>),
+    Subtotal { prefix: Vec<String>, label: String },
+}
+
+/// 由列叶子路径生成槽位表：列字段 ≥2 层且开小计时，每个上层项后插一列「<项> 汇总」。
+///
+/// Excel 的两层列字段就是这种排法（`A 无效 | A 有效 | A 汇总 | B 无效 | B 有效 | B 汇总`）。
+pub fn build_col_slots(col_paths: &[Vec<String>], subtotals: bool) -> Vec<ColSlot> {
+    let depth = col_paths.first().map(|p| p.len()).unwrap_or(0);
+    if !subtotals || depth < 2 {
+        return col_paths.iter().cloned().map(ColSlot::Leaf).collect();
+    }
+    let mut out: Vec<ColSlot> = Vec::new();
+    let mut i = 0;
+    while i < col_paths.len() {
+        let top = col_paths[i][0].clone();
+        out.push(ColSlot::Leaf(col_paths[i].clone()));
+        i += 1;
+        while i < col_paths.len() && col_paths[i][0] == top {
+            out.push(ColSlot::Leaf(col_paths[i].clone()));
+            i += 1;
+        }
+        out.push(ColSlot::Subtotal { prefix: vec![top.clone()], label: format!("{top} 汇总") });
+    }
+    out
+}
+
 /// 字段面板里可调序的轴
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {

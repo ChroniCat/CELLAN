@@ -949,3 +949,28 @@ fn two_col_field_reference_dump() {
         eprintln!("ROW| {}", r.iter().map(|v| v.display()).collect::<Vec<_>>().join("\t"));
     }
 }
+
+#[test]
+fn col_slots_insert_a_subtotal_after_each_top_group() {
+    use sheetcore::pivot_multi::{ColSlot, build_col_slots};
+    let paths: Vec<Vec<String>> = vec![
+        vec!["A".into(), "无效".into()],
+        vec!["A".into(), "有效".into()],
+        vec!["B".into(), "无效".into()],
+        vec!["B".into(), "有效".into()],
+    ];
+    let slots = build_col_slots(&paths, true);
+    let labels: Vec<String> = slots
+        .iter()
+        .map(|s| match s {
+            ColSlot::Leaf(p) => p.last().cloned().unwrap_or_default(),
+            ColSlot::Subtotal { label, .. } => label.clone(),
+        })
+        .collect();
+    assert_eq!(labels, vec!["无效", "有效", "A 汇总", "无效", "有效", "B 汇总"]);
+    // 关掉小计时只剩叶子
+    assert_eq!(build_col_slots(&paths, false).len(), 4);
+    // 单层列字段不插
+    let one: Vec<Vec<String>> = vec![vec!["A".into()], vec!["B".into()]];
+    assert_eq!(build_col_slots(&one, true).len(), 2);
+}
