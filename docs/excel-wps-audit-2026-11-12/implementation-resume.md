@@ -480,3 +480,14 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   不是渲染耗时。这条已写进证据，避免把「等事件」误当「滚动卡」。
 - 阈值追加进 `qa-requirements.md`（滚动帧间隔 p95 30.25ms，上限 36ms）。
 - 口径边界：程序改滚动位置，非 OS 滚轮事件；不含 GPU 呈现完成时刻。QA-07.2 置「待验收」。
+
+### 检查点二十一：QA-07.3 取消、进度、保存期可操作性
+- `e7f0218`：core 加 `recalc_all_force_impl(wb, cancel, progress)`（每 256 个公式查一次取消，
+  取消时不写回并置 `calc_pending`）；app 后台重算带 done/total，状态栏「正在重算 d/t（Esc 取消）」，
+  Esc 与探针共用同一 cancel 分支，收尾消息 `RecalcCancelled`；保存中状态栏显示已用时间。
+- `Store::Page::cols` 改 `Arc<Vec<Cell>>` 写时复制：整体 clone 只加引用计数，改到哪列才复制那列。
+- 实测 chain 1M：重算 3.15s（96 帧 p50 29.98ms）、300ms 取消 0.39s 收尾且不写回、
+  保存 11.51s（120 帧 p50 29.88ms）——窗口全程可操作。
+- **未解决**：保存瞬时峰值 core 1,186MB / GUI 1,923MB，根因是 umya 整份副本 + 序列化缓冲；
+  COW 只省掉 clone 那份（1993→1923MB）。
+- 测试：core 106 二进制 0 failed、app **339 passed**。

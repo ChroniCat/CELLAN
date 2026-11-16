@@ -4438,12 +4438,13 @@
       "files": [],
       "commits": [
         "acb5f87",
-        "d23d407"
+        "d23d407",
+        "e7f0218"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-07.1 实施中（基线已冻结，缺冷启动与 CPU update 单列）；QA-07.2 待验收；QA-07.3 待实施。"
+        "QA-07.1 实施中（缺冷启动/CPU update 单列）；QA-07.2 待验收；QA-07.3 实施中（取消与进度已做，保存峰值未降）。"
       ],
       "failures": [],
       "blocker": "",
@@ -4518,16 +4519,31 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "e7f0218"
+          ],
+          "commands": [
+            "SC_RECALC_PROBE=1 跑 release app（chain 1M）：重算 3.15s，期间 96 帧 p50 29.98/p95 31.08ms",
+            "SC_CANCEL_AFTER_MS=300：取消后 0.39s 收尾，状态「已取消重算（未写回，保持原值）」",
+            "SC_SAVE_PROBE=1（chain 1M）：保存 11.51s，期间 120 帧 p50 29.88/p95 31.17ms",
+            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed（work/goal-logs/qa07c-core.log）",
+            "cargo test -p app --bin app（--test-threads=2）-> 339 passed（work/goal-logs/qa07c-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07c-cancel-progress.txt"
+          ],
+          "not_done": [
+            "保存瞬时内存峰值未降：core chain 1M 1,186MB，GUI 1,923MB（umya 整份副本+序列化缓冲）。",
+            "取消只覆盖「重算全部」；单表重算 recalc_sheet 仍不可取消。",
+            "循环引用迭代计算期间不检查取消标志。",
+            "进度只有公式计数，没有按工作表分段。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "压保存峰值：绕开 umya 直接写 sheetData（骨架仍可沿用基准）；再补单表重算取消。",
           "updated_utc": "2026-11-12T10:28:37Z"
         }
       ]
