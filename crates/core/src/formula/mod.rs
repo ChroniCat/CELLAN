@@ -7,6 +7,7 @@ pub mod array;
 pub mod deps;
 pub mod dist;
 pub mod extra;
+pub mod fncat;
 pub mod functions;
 pub mod value;
 

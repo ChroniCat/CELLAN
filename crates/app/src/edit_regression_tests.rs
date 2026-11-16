@@ -9861,3 +9861,11 @@ fn wiz_range_label_builds_a1_or_range() {
     assert_eq!(crate::wiz_range_label((2, 1), (0, 0)), "A1:B3", "反向拖选要归一");
     assert_eq!(crate::wiz_range_label((3, 27), (3, 27)), "AB4");
 }
+
+#[test]
+fn wizard_help_url_encodes_function_name() {
+    let u = crate::help_url("VLOOKUP");
+    assert!(u.starts_with("https://support.microsoft.com/zh-cn/search/results?query=VLOOKUP%20"), "{u}");
+    // 空格必须被转义，否则链接断在空格处
+    assert!(!u.contains(' '), "{u}");
+}

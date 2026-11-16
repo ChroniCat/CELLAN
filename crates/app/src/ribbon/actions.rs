@@ -680,6 +680,7 @@ impl SheetApp {
                     args: Vec::new(),
                     scrolled: false,
                     editing,
+                    cat: String::new(),
                 });
             }
             "TracePrecedents" => self.trace_precedents(),

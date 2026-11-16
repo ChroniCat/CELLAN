@@ -371,6 +371,8 @@ struct FnWizard {
     scrolled: bool,
     /// 打开时已经有编辑会话（插入到光标处），否则从当前格新起一个公式
     editing: bool,
+    /// 类别筛选；空/"全部" 表示不过滤
+    cat: String,
 }
 
 /// 参数名来自函数签名：`SUM(number1,[number2],…)` → ["number1","number2（可选）"]。
@@ -616,6 +618,14 @@ fn formula_help_keys(
             || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
     });
     accept.then_some(*selected)
+}
+
+/// 向导里的「帮助」链接：Excel 自己也是跳官方文档
+fn help_url(name: &str) -> String {
+    format!(
+        "https://support.microsoft.com/zh-cn/search/results?query={}%20%E5%87%BD%E6%95%B0",
+        name
+    )
 }
 
 /// 选区 → 「A1」或「A1:B2」（向导拾取用）
@@ -20169,7 +20179,10 @@ let txn = self.txn_begin(&keys);
         let q = w.query.trim().to_ascii_uppercase();
         let mut list: Vec<&'static str> = sheetcore::formula::functions::implemented()
             .into_iter()
-            .filter(|n| q.is_empty() || n.contains(&q))
+            .filter(|n| {
+                (q.is_empty() || n.contains(&q))
+                    && (w.cat.is_empty() || sheetcore::formula::fncat::category(n) == w.cat)
+            })
             .collect();
         list.sort_unstable();
         if !q.is_empty() {
@@ -20192,6 +20205,23 @@ let txn = self.txn_begin(&keys);
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("fn_wizard_cat")
+                        .selected_text(if w.cat.is_empty() {
+                            "全部".to_string()
+                        } else {
+                            w.cat.clone()
+                        })
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(w.cat.is_empty(), "全部").clicked() {
+                                w.cat.clear();
+                            }
+                            for c in sheetcore::formula::fncat::CATEGORIES {
+                                if ui.selectable_label(w.cat == *c, *c).clicked() {
+                                    w.cat = (*c).to_string();
+                                }
+                            }
+                        });
                     ui.label("搜索函数");
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut w.query)
@@ -20236,7 +20266,11 @@ let txn = self.txn_begin(&keys);
                     ui.vertical(|ui| {
                         ui.set_min_width(280.0);
                         ui.set_max_width(300.0);
-                        ui.heading(&w.name);
+                        ui.horizontal(|ui| {
+                            ui.heading(&w.name);
+                            ui.hyperlink_to("帮助", help_url(&w.name))
+                                .on_hover_text("在浏览器里打开这个函数的官方说明");
+                        });
                         ui.label(function_desc(&w.name));
                         ui.add_space(4.0);
                         ui.label(
