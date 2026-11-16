@@ -618,6 +618,18 @@ fn formula_help_keys(
     accept.then_some(*selected)
 }
 
+/// 选区 → 「A1」或「A1:B2」（向导拾取用）
+fn wiz_range_label(a: (u32, u32), b: (u32, u32)) -> String {
+    let (r1, c1) = (a.0.min(b.0), a.1.min(b.1));
+    let (r2, c2) = (a.0.max(b.0), a.1.max(b.1));
+    let head = sheetcore::model::cell_name(r1, c1);
+    if (r1, c1) == (r2, c2) {
+        head
+    } else {
+        format!("{}:{}", head, sheetcore::model::cell_name(r2, c2))
+    }
+}
+
 fn apply_formula_pick(ed: &mut EditState, help: &FormulaHelp, idx: usize) {
     let Some(name) = help.selected(idx).map(str::to_string) else {
         return;
@@ -1764,6 +1776,9 @@ struct SheetApp {
     /// UI-11.5：拖动拾取引用时的锚点，以及已插入那串文本在缓冲里的字符区间
     pick_anchor: Option<(u32, u32)>,
     pick_span: Option<(usize, usize)>,
+    /// UI-11：向导里点「拾取」后，下一帧起在表格里松手就把区域填进该参数
+    wiz_pick: Option<usize>,
+    wiz_pick_time: f64,
     /// UI-11.6：编辑会话所属工作表与目标格（跨表取引用时视图会切到别的表）
     edit_sheet: Option<usize>,
     edit_sel: Option<(u32, u32)>,
@@ -2749,6 +2764,8 @@ impl SheetApp {
             pick_rect: None,
             pick_anchor: None,
             pick_span: None,
+            wiz_pick: None,
+            wiz_pick_time: 0.0,
             edit_sheet: None,
             edit_sel: None,
             ctx_menu: None,
@@ -20148,6 +20165,7 @@ let txn = self.txn_begin(&keys);
         if w.name.is_empty() {
             w.name = "SUM".into();
         }
+        let mut pick_req: Option<usize> = None;
         let q = w.query.trim().to_ascii_uppercase();
         let mut list: Vec<&'static str> = sheetcore::formula::functions::implemented()
             .into_iter()
@@ -20240,13 +20258,20 @@ let txn = self.txn_begin(&keys);
                                         ui.label(fn_arg_plain(label));
                                         ui.add(
                                             egui::TextEdit::singleline(&mut w.args[i])
-                                                .desired_width(180.0)
+                                                .desired_width(140.0)
                                                 .hint_text(if label.ends_with("（可选）") {
                                                     "可空"
                                                 } else {
                                                     ""
                                                 }),
                                         );
+                                        if ui
+                                            .small_button("拾取")
+                                            .on_hover_text("点这里，然后在表格里拖选区域")
+                                            .clicked()
+                                        {
+                                            pick_req = Some(i);
+                                        }
                                         ui.end_row();
                                     }
                                 });
@@ -20308,6 +20333,26 @@ let txn = self.txn_begin(&keys);
             }
         } else if !cancel && open {
             self.fn_wizard = Some(w);
+        }
+        if let Some(i) = pick_req {
+            self.wiz_pick = Some(i);
+            self.wiz_pick_time = ctx.input(|i| i.time);
+            self.status = "在表格里拖选区域，松手后填进参数".into();
+        }
+        // 拾取：松手那一帧把当前选区写成 A1 或 A1:B2
+        if let Some(i) = self.wiz_pick {
+            if ctx.input(|i| i.time) > self.wiz_pick_time
+                && ctx.input(|inp| inp.pointer.any_released())
+            {
+                let label = wiz_range_label(self.sel, self.sel_end);
+                if let Some(w) = self.fn_wizard.as_mut() {
+                    if i < w.args.len() {
+                        w.args[i] = label.clone();
+                    }
+                }
+                self.status = format!("拾取 {label}");
+                self.wiz_pick = None;
+            }
         }
     }
 

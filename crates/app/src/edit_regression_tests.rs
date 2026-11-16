@@ -9854,3 +9854,10 @@ fn large_selection_stats_are_not_empty() {
     let sync = crate::status_stats_rects(sh, &rects, 11);
     assert_eq!(sync, text, "同步/异步统计口径不一致");
 }
+
+#[test]
+fn wiz_range_label_builds_a1_or_range() {
+    assert_eq!(crate::wiz_range_label((0, 0), (0, 0)), "A1");
+    assert_eq!(crate::wiz_range_label((2, 1), (0, 0)), "A1:B3", "反向拖选要归一");
+    assert_eq!(crate::wiz_range_label((3, 27), (3, 27)), "AB4");
+}
