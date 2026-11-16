@@ -1042,7 +1042,8 @@
         "python scripts/qa01_extended_roundtrip.py --fixtures crates/core/tests/fixtures/qa01_extended --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 6/6 paths, 0 differences",
         "cd scripts && python -m unittest -v qa01_roundtrip_test.py -> 6 passed (type/error negative cases)",
         "python scripts/qa01_roundtrip.py (hardened compare) -> 3 paths pass, B1 IsError=true/error_code=-2146826281",
-        "python scripts/qa01_extended_roundtrip.py --kinds page ... -> 3 page cases pass; print_gridlines True in source/target"
+        "python scripts/qa01_extended_roundtrip.py --kinds page ... -> 3 page cases pass; print_gridlines True in source/target",
+        "scripts/qa01_matrix_runner.py 实跑 2026-11-17：12 夹具、往返 12/12、Excel+WPS 0 diff"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.txt",
@@ -1062,7 +1063,7 @@
       "failures": [],
       "blocker": "",
       "next": "父项保持实施中，等三个切片复核；不再新增夹具类别。",
-      "updated_utc": "2026-11-16T13:25:00Z",
+      "updated_utc": "2026-11-16T22:14:24Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1127,7 +1128,8 @@
             "cd scripts && python -m unittest -v qa01_roundtrip_test.py -> 6 passed (type/error negative cases)",
             "python scripts/qa01_roundtrip.py (hardened compare) -> 3 paths pass, B1 IsError=true/error_code=-2146826281",
             "cd scripts && python qa01_matrix_runner.py --out ../work/probe/qa01/matrix-full.json",
-            "结果：12 个夹具 × Excel/WPS，0 处意外差异；.xls 6 处为已登记损失（两侧一致）"
+            "结果：12 个夹具 × Excel/WPS，0 处意外差异；.xls 6 处为已登记损失（两侧一致）",
+            "python scripts/qa01_matrix_runner.py --out work/probe/qa01/matrix-run-1117.json -> 12/12 roundtrip ok, Excel diffs=0, WPS diffs=0 (76 类别位)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.txt",
@@ -1137,12 +1139,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix/matrix-summary.tsv"
           ],
           "not_done": [
-            "runner 已存在并 manifest 驱动（scripts/qa01_matrix_runner.py + scripts/qa01_manifest.json，12 个 entry：formats/shapes/smartart/media/chart-ext/table-ext/page-ext/metadata-ext/pivot-ext/pivot-multi/xlsm/xls），覆盖 Excel+WPS 双端快照与逐类 diff；尚缺：本次实跑结果入库、大簿与二次保存刷新场景、真实 UI 编辑路径。"
+            "大簿（106MB 级）与二次保存刷新后的第三方再读未纳入本 run；真实 UI 编辑路径未接入（无交互桌面）；父项证据链需人工复查。.xls 结构性对象按既定口径不保留（features-xls 只登记 values,numfmt）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "runner 已覆盖 12 类夹具；余下为父项的人工路径与复查条件。",
-          "updated_utc": "2026-11-16T22:11:54Z"
+          "updated_utc": "2026-11-16T22:14:24Z"
         },
         {
           "id": "QA-01.3",
