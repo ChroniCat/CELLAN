@@ -15,6 +15,7 @@ mod test_env;
 mod net;
 mod office_clipboard;
 mod recent;
+mod fnrecent;
 mod update;
 mod error_opts;
 mod ui_prefs;
@@ -347,6 +348,74 @@ impl EditState {
             caret_override: None,
         }
     }
+}
+
+/// UI-11.4：公式提交时记账「最近使用的函数」。
+/// 测试默认不写真实用户目录；要验这条线路的用例用 `TestEnv` 隔离 LOCALAPPDATA
+/// 并显式打开 `SC_FNRECENT_RECORD`。
+pub(crate) fn note_formula_use(text: &str) {
+    if cfg!(test) && std::env::var_os("SC_FNRECENT_RECORD").is_none() {
+        return;
+    }
+    fnrecent::record_formula(text);
+}
+
+/// UI-11.4：函数向导（搜索 + 参数填空）。
+#[derive(Clone, Default)]
+struct FnWizard {
+    query: String,
+    name: String,
+    args: Vec<String>,
+    /// 打开后把选中的函数滚进列表视野（只做一次）
+    scrolled: bool,
+    /// 打开时已经有编辑会话（插入到光标处），否则从当前格新起一个公式
+    editing: bool,
+}
+
+/// 参数名来自函数签名：`SUM(number1,[number2],…)` → ["number1","number2（可选）"]。
+fn fn_arg_names(name: &str) -> Vec<String> {
+    let sig = formula_signature(name);
+    let (Some(open), Some(close)) = (sig.find('('), sig.rfind(')')) else {
+        return Vec::new();
+    };
+    let inner = &sig[open + 1..close];
+    if inner.trim().is_empty() || inner.trim() == "参数…" {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty() && p != "…")
+        .map(|p| {
+            let opt = p.starts_with('[');
+            let p = p.trim_matches(|c| c == '[' || c == ']');
+            if opt {
+                format!("{p}（可选）")
+            } else {
+                p.to_string()
+            }
+        })
+        .collect()
+}
+
+/// 参数名去掉「（可选）」标记，用作输入框的值占位。
+fn fn_arg_plain(label: &str) -> &str {
+    label.trim_end_matches("（可选）")
+}
+
+/// 用向导里的参数拼出公式；一个参数都没填时给出 `=SUM()`（光标停在括号里）。
+fn fn_formula_from_args(name: &str, args: &[String]) -> String {
+    let used = args
+        .iter()
+        .rposition(|a| !a.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let inner = args[..used]
+        .iter()
+        .map(|a| a.trim().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("={name}({inner})")
 }
 
 /// 公式自动补全/参数提示。`start` 是当前标识符在缓冲里的字节位置。
@@ -1681,6 +1750,8 @@ struct SheetApp {
     fmt_tab: u8,
     /// 外部链接对话框
     xlink_dlg: bool,
+    /// UI-11.4：函数向导（插入函数）
+    fn_wizard: Option<FnWizard>,
     /// 修订记录（新的在后）
     rev: Vec<sheetcore::revision::Entry>,
     rev_open: bool,
@@ -2639,6 +2710,7 @@ impl SheetApp {
             fmt_touched: FmtTouched::default(),
             fmt_tab: 0,
             xlink_dlg: false,
+            fn_wizard: None,
             rev: Vec::new(),
             rev_open: false,
             rev_msg: String::new(),
@@ -9269,6 +9341,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     }
                     text = sheetcore::xlinks::raw_formula(&self.wb, &text);
                 }
+                crate::note_formula_use(&text);
                 Cell { value: Value::Text(text.as_str().into()), formula: Some(text.as_str().into()) }
             } else {
                 Cell { value: Value::parse_input(&ed.buf), formula: None }
@@ -20032,6 +20105,210 @@ let txn = self.txn_begin(&keys);
         }
     }
 
+    /// UI-11.4：把向导拼好的公式插到当前编辑光标处（没有编辑会话就从当前格新起）。
+    fn insert_formula_at_caret(&mut self, formula: &str) {
+        if self.editing.is_none() {
+            self.begin_edit(None);
+        }
+        let Some(ed) = self.editing.as_mut() else {
+            return;
+        };
+        let chars: Vec<char> = ed.buf.chars().collect();
+        let caret = ed.caret.min(chars.len());
+        // 光标左边正在输入的标识符整段替换（和点选引用同一手感）
+        let mut s = caret;
+        while s > 0 && (chars[s - 1].is_ascii_alphanumeric() || matches!(chars[s - 1], '_' | '.')) {
+            s -= 1;
+        }
+        let mut out: String = chars[..s].iter().collect();
+        // 已经在一段公式里：只插函数本身，不再叠一个等号
+        let mut text = formula.to_string();
+        if ed.buf.trim_start().starts_with('=') && text.starts_with('=') && (s > 0 || !ed.buf.is_empty()) {
+            text.remove(0);
+        }
+        out.push_str(&text);
+        out.extend(chars[caret..].iter());
+        let mut caret_new = s + text.chars().count();
+        if formula.ends_with("()") {
+            // 没填参数：光标停在括号里，等用户去点区域
+            caret_new -= 1;
+        }
+        ed.buf = out;
+        ed.caret = caret_new;
+        ed.caret_override = Some(caret_new);
+    }
+
+    /// UI-11.4：插入函数向导 —— 搜索 + 参数填空 + 插到光标处。
+    fn fn_wizard_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut w) = self.fn_wizard.take() else {
+            return;
+        };
+        if w.name.is_empty() {
+            w.name = "SUM".into();
+        }
+        let q = w.query.trim().to_ascii_uppercase();
+        let mut list: Vec<&'static str> = sheetcore::formula::functions::implemented()
+            .into_iter()
+            .filter(|n| q.is_empty() || n.contains(&q))
+            .collect();
+        list.sort_unstable();
+        if !q.is_empty() {
+            // 前缀命中的排前面
+            list.sort_by_key(|n| (!n.starts_with(q.as_str())) as u8);
+        }
+        let mut open = true;
+        let mut apply = false;
+        if !list.is_empty() && !list.iter().any(|n| **n == w.name) {
+            // 搜索把当前函数过滤掉了：选中第一个匹配项
+            w.name = list[0].to_string();
+            w.args.clear();
+            w.scrolled = false;
+        }
+        let mut cancel = false;
+        // 在画控件之前读回车：单行 TextEdit 拿到焦点后会消费这个按键事件
+        let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let dlg_out = ui_kit::window(ctx, "插入函数", 620.0)
+            .open(&mut open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("搜索函数");
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut w.query)
+                            .desired_width(220.0)
+                            .hint_text("输入函数名或首字母"),
+                    );
+                    ui_kit::autofocus(ui, &search);
+                    ui.weak(format!("{} 个", list.len()));
+                });
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 330.0),
+                    egui::Layout::left_to_right(egui::Align::TOP),
+                    |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_width(250.0)
+                        .id_salt("fn_wizard_list")
+                        .max_height(300.0)
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(300.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(244.0);
+                            // 关键：ScrollArea 会继承外层 horizontal 的布局，
+                            // 不显式 vertical 的话 400 行会被排成一行（窗口宽 4 万像素）
+                            ui.vertical(|ui| {
+                                for name in list.iter().take(400) {
+                                    let label = format!("{name:<14} {}", function_desc(name));
+                                    let resp = ui.selectable_label(w.name == **name, label);
+                                    if w.name == **name && !w.scrolled {
+                                        // 打开时把当前函数滚进视野（和 Excel 的对话框一致）
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                        w.scrolled = true;
+                                    }
+                                    if resp.clicked() {
+                                        w.name = (*name).to_string();
+                                        w.args.clear();
+                                    }
+                                }
+                            });
+                        });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(280.0);
+                        ui.set_max_width(300.0);
+                        ui.heading(&w.name);
+                        ui.label(function_desc(&w.name));
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(formula_signature(&w.name)).monospace(),
+                        );
+                        ui.add_space(6.0);
+                        let labels = fn_arg_names(&w.name);
+                        if labels.is_empty() {
+                            ui.weak("签名不固定：参数直接在编辑框里输入。");
+                        } else {
+                            if w.args.len() != labels.len() {
+                                w.args.resize(labels.len(), String::new());
+                            }
+                            egui::Grid::new("fn_wizard_args")
+                                .num_columns(2)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    for (i, label) in labels.iter().enumerate() {
+                                        ui.label(fn_arg_plain(label));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut w.args[i])
+                                                .desired_width(180.0)
+                                                .hint_text(if label.ends_with("（可选）") {
+                                                    "可空"
+                                                } else {
+                                                    ""
+                                                }),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(fn_formula_from_args(&w.name, &w.args))
+                                .monospace()
+                                .color(ui_kit::ACCENT),
+                        );
+                    });
+                });
+                ui.separator();
+                // Enter = 确定（Excel 里在向导里回车就是确定）
+                if enter_pressed {
+                    apply = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("确定").clicked() {
+                        apply = true;
+                    }
+                });
+            });
+        let dlg_rect = dlg_out.map(|r| r.response.rect);
+        let n_args = w.args.len();
+        if std::env::var("SC_WIZ_LOG").is_ok() {
+            eprintln!(
+                "[wiz] name={:?} matches={} args={} open={} apply={} last_view={:?} used={:?} rect={:?}",
+                w.name,
+                list.len(),
+                n_args,
+                open,
+                apply,
+                self.last_view,
+                ctx.used_rect(),
+                dlg_rect
+            );
+        }
+        if apply {
+            // 回车确定后要把这个按键吃掉：同一帧稍后画的格内编辑器
+            // 会把它当成「提交并下移」，导致刚插进去的公式被立刻写死。
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
+            let formula = fn_formula_from_args(&w.name, &w.args);
+            self.insert_formula_at_caret(&formula);
+            crate::fnrecent::record(&w.name);
+            self.status = format!("已插入函数 {}", w.name);
+            if std::env::var("SC_WIZ_LOG").is_ok() {
+                eprintln!(
+                    "[wiz] applied formula={:?} editing={:?} sel={:?}",
+                    formula,
+                    self.editing.as_ref().map(|e| (e.buf.clone(), e.caret)),
+                    self.sel
+                );
+            }
+        } else if !cancel && open {
+            self.fn_wizard = Some(w);
+        }
+    }
+
     /// 外部链接：看看有哪些、缓存多少格、需不需要更新
     fn xlink_dialog(&mut self, ctx: &egui::Context) {
         if !self.xlink_dlg {
@@ -27933,7 +28210,7 @@ impl eframe::App for SheetApp {
         }
         let __cpu_t0 = std::time::Instant::now();
         // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
-        self.dialog_modal = self.find.open || self.dv_alert.is_some();
+        self.dialog_modal = self.find.open || self.dv_alert.is_some() || self.fn_wizard.is_some();
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -28342,6 +28619,7 @@ impl eframe::App for SheetApp {
         }
         self.dv_dialog(ctx);
         self.xlink_dialog(ctx);
+        self.fn_wizard_dialog(ctx);
         self.revision_panel(ctx);
         self.note_dialog(ctx);
         self.hyperlink_dialog(ctx);

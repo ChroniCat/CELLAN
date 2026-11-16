@@ -7977,3 +7977,59 @@ fn ui113_alt_enter_inserts_newline_at_caret_not_at_end() {
     assert_eq!(ed.buf, "=A1\n&B1", "换行要插在光标处，不是缓冲末尾");
     assert_eq!(ed.caret, 4, "光标停在换行之后");
 }
+
+// ===== UI-11.4：函数向导 + 真实最近使用 =====
+
+#[test]
+fn ui114_wizard_arg_names_and_formula_build() {
+    assert_eq!(fn_arg_names("SUM"), vec!["number1", "number2（可选）"]);
+    let vl = fn_arg_names("VLOOKUP");
+    assert_eq!(vl.len(), 4, "{vl:?}");
+    assert_eq!(vl[3], "range_lookup（可选）");
+    assert!(fn_arg_names("NOW").is_empty(), "无参函数没有参数输入框");
+    assert_eq!(fn_formula_from_args("SUM", &["A1:A3".into(), String::new()]), "=SUM(A1:A3)");
+    assert_eq!(
+        fn_formula_from_args("IF", &["B1>0".into(), "1".into(), "0".into()]),
+        "=IF(B1>0,1,0)"
+    );
+    assert_eq!(fn_formula_from_args("SUM", &[]), "=SUM()");
+    assert_eq!(fn_arg_plain("number2（可选）"), "number2");
+}
+
+#[test]
+fn ui114_wizard_inserts_at_caret_without_double_equals() {
+    let mut app = app();
+    app.sel = (0, 4);
+    app.sel_end = (0, 4);
+    app.insert_formula_at_caret("=SUM(A1:A3)");
+    {
+        let ed = app.editing.as_ref().expect("向导要从当前格新起编辑");
+        assert_eq!(ed.buf, "=SUM(A1:A3)");
+        assert_eq!(ed.caret, 11, "光标停在公式末尾");
+    }
+    // 已经在一段公式里：只插函数体，不再叠等号
+    app.editing.as_mut().unwrap().buf = "=A1+".into();
+    app.editing.as_mut().unwrap().caret = 4;
+    app.insert_formula_at_caret("=SUM(B1)");
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=A1+SUM(B1)");
+    // 一个参数都没填：光标停在括号里
+    app.editing.as_mut().unwrap().buf = String::new();
+    app.editing.as_mut().unwrap().caret = 0;
+    app.insert_formula_at_caret("=SUM()");
+    assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM()");
+    assert_eq!(app.editing.as_ref().unwrap().caret, 5, "光标停在括号里");
+}
+
+#[test]
+fn ui114_committing_formula_records_recent_functions() {
+    let env = crate::test_env::TestEnv::new("ui114-recent");
+    env.sc("SC_FNRECENT_RECORD", "1");
+    let mut app = app();
+    app.sel = (0, 3);
+    app.sel_end = (0, 3);
+    app.editing = Some(EditState::new("=AVERAGE(A1:A2)+SUM(B1)".into()));
+    assert!(app.commit_edit(None), "公式要写进去");
+    let list = crate::fnrecent::load();
+    assert_eq!(list.first().map(|s| s.as_str()), Some("SUM"), "最后用到的函数排最前");
+    assert!(list.contains(&"AVERAGE".to_string()), "同一条公式里的函数都记");
+}

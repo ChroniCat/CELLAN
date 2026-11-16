@@ -797,7 +797,21 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 match &p.kind {
                     PopupKind::Menu(m) => {
-                        for it in &m.items {
+                        // UI-11.4：「最近使用的函数」按真实调用记录生成，不再用 XML 里写死的五项
+                        if m.ctl.id == "RecentFnMenu" {
+                            for name in crate::fnrecent::menu_items() {
+                                let r = ui.add(
+                                    egui::Button::new(egui::RichText::new(&name).size(12.0))
+                                        .min_size(Vec2::new(160.0, 22.0))
+                                        .frame(false),
+                                );
+                                if r.clicked() {
+                                    fire = Some(format!("InsertFn:{name}"));
+                                    close = true;
+                                }
+                            }
+                        }
+                        for it in m.items.iter().filter(|_| m.ctl.id != "RecentFnMenu") {
                             match it {
                                 MenuNode::Separator => {
                                     ui.separator();

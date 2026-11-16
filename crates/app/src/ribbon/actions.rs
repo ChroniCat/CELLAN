@@ -663,12 +663,15 @@ impl SheetApp {
 
             // ---------------------------------------------------- 公式
             "InsertFunction" => {
-                self.begin_edit(None);
-                if let Some(ed) = self.editing.as_mut() {
-                    if !ed.buf.starts_with('=') {
-                        ed.buf.insert(0, '=');
-                    }
-                }
+                // UI-11.4：打开函数向导（搜索 + 参数填空），确定后插到光标处
+                let editing = self.editing.is_some();
+                self.fn_wizard = Some(crate::FnWizard {
+                    query: String::new(),
+                    name: "SUM".into(),
+                    args: Vec::new(),
+                    scrolled: false,
+                    editing,
+                });
             }
             "TracePrecedents" => self.trace_precedents(),
             "TraceDependents" => self.trace_dependents(),
@@ -1144,6 +1147,13 @@ impl SheetApp {
             "StyleGood" => self.apply_style_preset("good"),
             "StyleBad" => self.apply_style_preset("bad"),
 
+            // UI-11.4：函数库「最近使用的函数」菜单项（InsertFn:NAME）
+            _ if action.starts_with("InsertFn:") => {
+                let name = action["InsertFn:".len()..].to_string();
+                self.insert_formula_at_caret(&format!("={name}()"));
+                crate::fnrecent::record(&name);
+                self.status = format!("已插入函数 {name}，接着点选参数区域");
+            }
             // 其余（字体/字号/下拉里带值的项）已在上面处理
             _ => {
                 if std::env::var("SC_RIBBON_LOG").is_ok() {
