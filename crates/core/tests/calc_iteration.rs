@@ -25,6 +25,7 @@ fn keeps_calc_mode_and_other_calcpr_attrs() {
 }
 
 use sheetcore::formula;
+use sheetcore::formula::deps;
 use sheetcore::{Cell, Value, Workbook};
 
 fn f(formula: &str) -> Cell {
@@ -72,4 +73,55 @@ fn iteration_settings_survive_save_and_reload() {
     assert!(back.calc_iterate, "iterate 丢里");
     assert_eq!(back.calc_max_iterations, 250);
     assert!((back.calc_max_change - 0.0005).abs() < 1e-12);
+}
+
+#[test]
+fn iteration_incremental_matches_full_recalc() {
+    let build = || {
+        let mut wb = Workbook::new_blank();
+        wb.calc_iterate = true;
+        wb.calc_max_iterations = 200;
+        wb.calc_max_change = 1e-9;
+        {
+            let s = &mut wb.sheets[0];
+            s.set(0, 0, f("=B1+1"));
+            s.set(0, 1, f("=A1/2"));
+            s.set(0, 2, f("=A1*2"));
+            s.set(0, 3, f("=C1+1"));
+        }
+        wb
+    };
+
+    // 全量：把 B1 改成 =A1/4，然后整簿重算
+    let mut full = build();
+    formula::recalc_all(&mut full);
+    full.sheets[0].set(0, 1, f("=A1/4"));
+    formula::recalc_all(&mut full);
+
+    // 增量：同样改 B1，只重算受影响格
+    let mut inc = build();
+    formula::recalc_all(&mut inc);
+    inc.sheets[0].set(0, 1, f("=A1/4"));
+    let graph = deps::Deps::build(&inc);
+    formula::recalc_dirty(&mut inc, &graph, &[(0, 0, 1)]);
+
+    let get = |wb: &Workbook, r: u32, c: u32| match wb.sheets[0].value(r, c) {
+        Value::Number(n) => n,
+        other => panic!("不是数字：{other:?}"),
+    };
+    for (r, c, name) in [(0u32, 0u32, "A1"), (0, 1, "B1"), (0, 2, "C1"), (0, 3, "D1")] {
+        let fv = get(&full, r, c);
+        let iv = get(&inc, r, c);
+        assert!(
+            (fv - iv).abs() <= 1e-6 * fv.abs().max(1.0),
+            "{name}: 全量 {fv} != 增量 {iv}"
+        );
+    }
+    eprintln!(
+        "[calciter-inc] A1={} B1={} C1={} D1={}",
+        get(&inc, 0, 0),
+        get(&inc, 0, 1),
+        get(&inc, 0, 2),
+        get(&inc, 0, 3)
+    );
 }

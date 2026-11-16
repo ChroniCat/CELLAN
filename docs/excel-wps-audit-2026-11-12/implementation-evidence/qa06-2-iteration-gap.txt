@@ -109,3 +109,21 @@ MaxChange 内，语义一致。
 
 - Excel 新建工作簿保存时并不写 `iterate` 属性（实测只写 `<calcPr calcId="191029"/>`），
   所以「Excel 能读回自己的 iterate 设置」这件事本身不成立，不能拿它当我们写坏的证据。
+
+## 2026-11-17 收口三：迭代模式下的增量一致（QA-06.2 最后一条）
+
+问题：`recalc_dirty` 只对脏闭包跑一遍，环上会在中途停下——实测改 `B1=A1/4` 后
+全量收敛 `A1=4/3`，增量停在 `A1=1.5`（差 12.5%），是真缺陷，不是口径差异。
+
+修法：`recalc_dirty` 在 `calc_iterate` 时把脏闭包反复算到不动点
+（`max|Δ| < calc_max_change` 或达 `calc_max_iterations`），普通模式仍只跑一遍。
+
+对拍（`iteration_incremental_matches_full_recalc`）：
+
+```
+[calciter-inc] A1=1.3333333334885538 B1=0.33333333348855376 C1=2.6666666669771075 D1=3.6666666669771075
+```
+
+全量 与 增量 四个格子逐一对上（容差 1e-6），A1=4/3、C1=8/3、D1=11/3 都是解析解。
+
+回归：core 107 个测试二进制 0 failed；app 361 passed。

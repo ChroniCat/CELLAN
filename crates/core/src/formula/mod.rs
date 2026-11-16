@@ -2939,28 +2939,58 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
     // 不需要拓扑排序：Calc 求值时递归拉取依赖，memo 保证每个格子只算一次
     let mut order: Vec<deps::CellKey> = dirty.iter().cloned().collect();
     order.sort_unstable();
-    let mut results = Vec::with_capacity(order.len());
-    {
-        let mut calc = Calc::new(wb);
-        calc.scope = Some(dirty.clone());
-        for (si, r, c) in &order {
-            let v = calc.cell_value(*si, *r, *c);
-            results.push((*si, *r, *c, v));
+    // 迭代模式：同一批脏格要反复算到不动点，否则环上只会停在中途（实测 1.5 而非 4/3）
+    let passes = if wb.calc_iterate {
+        wb.calc_max_iterations.max(1) as usize
+    } else {
+        1
+    };
+    let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
+    let mut last_count = 0usize;
+    for pass in 0..passes {
+        let mut results = Vec::with_capacity(order.len());
+        {
+            let mut calc = Calc::new(wb);
+            calc.scope = Some(dirty.clone());
+            for (si, r, c) in &order {
+                let v = calc.cell_value(*si, *r, *c);
+                results.push((*si, *r, *c, v));
+            }
         }
-    }
-    // 新公式可能第一次产生数组，此时尚无 spilled 标记。
-    if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
-        let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
-        recalc_all_force(wb);
-        return count;
+        // 新公式可能第一次产生数组，此时尚无 spilled 标记。
+        if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
+            let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
+            recalc_all_force(wb);
+            return count;
+        }
+        write_back(wb, results);
+        last_count = order.len();
+        if !wb.calc_iterate {
+            break;
+        }
+        let mut max_delta = 0.0f64;
+        for key in &order {
+            let cur = wb.sheets[key.0]
+                .get(key.1, key.2)
+                .map(|c| match c.value {
+                    crate::model::Value::Number(n) => n,
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0);
+            let prev = prev_nums.get(key).copied().unwrap_or(0.0);
+            max_delta = max_delta.max((cur - prev).abs());
+            prev_nums.insert(*key, cur);
+        }
+        if pass > 0 && max_delta < wb.calc_max_change {
+            break;
+        }
     }
     if std::env::var("SC_PROFILE").is_ok() {
         for (n, c, t) in prof_dump().into_iter().take(6) {
             eprintln!("  [edit] {n:<12} {c:>7} 次  {t:>7.3}s");
         }
     }
-    write_back(wb, results);
-    order.len()
+    last_count
 }
 
 fn clear_spills(wb: &mut Workbook) {

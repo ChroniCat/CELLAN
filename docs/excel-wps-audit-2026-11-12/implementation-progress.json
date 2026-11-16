@@ -4447,7 +4447,7 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "动态数组溢出块对拍：SEQUENCE 两个、SORT、SORTBY、FILTER、TRANSPOSE、B1:B5*2、UNIQUE 共 8 块 40 格与本机 Excel 16.0 的 SpillingToRange 逐格一致；TAKE/DROP/HSTACK/VSTACK 因本机 Excel 16.0 Build 20326 返回 #NAME? 明确 SKIP，不计通过也不计失败。全量 vs 增量：同一批公式，改 B1 后 recalc_dirty 只重算 12 格，130x8=1040 格结果与全量重算完全一致。",
           "files": [
             "crates/core/tests/qa06_array.rs",
@@ -4472,7 +4472,8 @@
             "cargo test -p sheetcore -> 107 个测试二进制 0 failed",
             "cargo test -p app --bin app -> 361 passed",
             "cargo test -p sheetcore --test calc_iteration -> 4 passed（收敛 + calcPr 存盘读回）",
-            "Excel COM: Application.IterativeCalculation=true, 250/0.0005, CalculateFull -> A1=1.99951171875 B1=0.999755859375"
+            "Excel COM: Application.IterativeCalculation=true, 250/0.0005, CalculateFull -> A1=1.99951171875 B1=0.999755859375",
+            "cargo test -p sheetcore --test calc_iteration -> 5 passed（收敛 1.999/0.999、calcPr 往返、增量=全量 A1=4/3）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
@@ -4484,13 +4485,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-iteration-gap.txt"
           ],
           "not_done": [
-            "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计",
-            "迭代模式下「增量重算 == 全量重算」未验证（全量已收敛；增量路径未跑环用例）。"
+            "LAMBDA/MAP/BYROW 本机 Excel 16.0 Build 20326 返回 #NAME?，按台账口径既不计通过也不计失败（已在 SKIP 名单）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-16T19:21:24Z"
+          "updated_utc": "2026-11-16T19:30:15Z"
         },
         {
           "id": "QA-06.3",
