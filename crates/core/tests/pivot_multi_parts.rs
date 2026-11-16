@@ -941,9 +941,28 @@ fn two_col_field_values_match_excel_with_subtotal_columns() {
         layout: PivotLayout::default(),
     };
     let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
-    for h in &g.headers {
-        eprintln!("HDR| {}", h.join("\t"));
-    }
+    // Excel 真值（twocol-ref.tsv）：A 无效/有效/A 汇总/B 无效/有效/B 汇总/总计
+    let rows: Vec<Vec<String>> = g.rows.iter().map(|r| r.iter().map(|v| v.display()).collect()).collect();
+    assert_eq!(rows[0][0], "华北");
+    assert_eq!(&rows[0][1..8], &["", "60", "60", "", "60", "60", "120"]);
+    assert_eq!(rows[1][0], "华东");
+    assert_eq!(&rows[1][1..8], &["30", "10", "40", "50", "", "50", "90"]);
+    assert_eq!(rows[2][0], "总计");
+    assert_eq!(&rows[2][1..8], &["30", "70", "100", "50", "60", "110", "210"]);
+
+    // 落盘并挂真部件：colItems 已按组写 <i t="default">，网格也有对应列
+    let fx = Fixture::new("twocol");
+    let path = fx.file("twocol.xlsx");
+    sheetcore::xlsx::save(&path, &wb).expect("保存失败");
+    let mut wb = wb;
+    wb.path = Some(path.clone());
+    let g2 = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let rect = sheetcore::pivot_multi::write_grid(&mut wb.sheets[0], (8, 0), &g2);
+    let _ = sheetcore::pivot_xml::attach2_for_session(&path, "Data", &spec, &g2, rect, "test")
+        .expect("附挂失败");
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/twocol-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
     for r in &g.rows {
         eprintln!("ROW| {}", r.iter().map(|v| v.display()).collect::<Vec<_>>().join("\t"));
     }
