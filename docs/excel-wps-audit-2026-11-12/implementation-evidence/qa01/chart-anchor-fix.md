@@ -46,3 +46,20 @@ if !edited.is_empty() && anchor_cells(&edited) == anchor_cells(&xml) {
 
 这条属于「resave 场景」才能暴露的缺陷：普通往返里两单元格锚点恰好被 Excel 归一化成同一显示尺寸，
 只有第三方（WPS）按原始尺寸报数时才看得见。说明 `--resave` 这一层是必要的，不是重复劳动。
+
+## 归因修正（同日，重要）
+
+后来发现 `--resave` 原来的比较口径是「原文件 vs Excel 重存后再由我们保存」，于是把
+**Excel 自己重存时的归一化**算到了我们头上。加入中间态快照后：
+
+```
+[chart-ext] resave: vs原文件 excel 0 / wps 1；vs Excel重存 excel 0 / wps 0
+```
+
+- **vs Excel 重存 = 0/0**：把第三方重存过的文件再读再写，我们完全保真；
+- **vs 原文件 = wps 1**：差异来自 **Excel 自己重存**（它把 oneCellAnchor 的 ext 归一化，
+  WPS 读到的高度就从 191 变 202），与我们无关。
+
+因此 `--resave` 的判定改为以「Excel 重存后的中间态」为基线，`diffs`（相对原文件）保留为信息字段。
+另外修了测试脚手架一个坑：目标文件已存在时我们的保存走**就地补丁**，会沿用旧部件
+（残留 twoCellAnchor 让 WPS 一直读到 202），现在 `our_roundtrip()` 每次先删目标文件。

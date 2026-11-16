@@ -181,6 +181,11 @@ def cargo_bin() -> str:
 
 
 def our_roundtrip(src: Path, dst: Path) -> tuple[bool, str]:
+    # 目标已存在时我们的保存会走「就地补丁」，旧文件里的锚点等部件会被沿用，
+    # 看起来像回归（chart-ext 实测：残留的 twoCellAnchor 让 WPS 一直读到 202）。
+    # 每次从干净目标开始，保证测的是「源文件 → 新文件」这条路径。
+    if dst.exists():
+        dst.unlink()
     cmd = [
         cargo_bin(), "run", "-q", "-p", "sheetcore", "--offline", "-j", "2",
         "--example", "pivot_roundtrip", "--", str(src), str(dst),
@@ -192,11 +197,34 @@ def our_roundtrip(src: Path, dst: Path) -> tuple[bool, str]:
     return ok, (proc.stdout + proc.stderr).strip().splitlines()[-1] if (proc.stdout or proc.stderr) else ""
 
 
+def excel_resave(path: Path) -> tuple[bool, str]:
+    """让 Excel 打开我们的副本并原样保存（模拟「第三方刷新后重存」）"""
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$xl=New-Object -ComObject Excel.Application;"
+        "$xl.Visible=$false;$xl.DisplayAlerts=$false;"
+        f"$wb=$xl.Workbooks.Open('{path.as_posix()}');"
+        "$wb.Save();$wb.Close($false);$xl.Quit();"
+        "'OK'"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True, text=True, timeout=300,
+        )
+        if out.returncode != 0:
+            return False, (out.stderr or out.stdout or "").strip()[:400]
+        return True, "ok"
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default=str(ROOT / "scripts" / "qa01_manifest.json"))
     ap.add_argument("--out", default=str(ROOT / "work" / "probe" / "qa01" / "matrix-result.json"))
     ap.add_argument("--only", default="")
+    ap.add_argument("--resave", action="store_true", help="再让 Excel 打开我们的副本保存一次，然后复测")
     args = ap.parse_args()
 
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
@@ -240,6 +268,32 @@ def main() -> int:
                 print("   !", line)
             for line in known[:8]:
                 print("   ~", line)
+        if args.resave:
+            rs, rnote = excel_resave(dst)
+            rec["resave"] = {"excel_ok": rs, "note": rnote}
+            if rs:
+                dst2 = tmp_dir / f"{entry['name']}-resaved{src.suffix}"
+                ok2, note2 = our_roundtrip(dst, dst2)
+                rec["resave"]["our_roundtrip_ok"] = ok2
+                rec["resave"]["note2"] = note2
+                if ok2:
+                    vs_orig, vs_resaved = {}, {}
+                    for product in ("excel", "wps"):
+                        base = snapshot(product, src)
+                        mid = snapshot(product, dst)      # Excel 重存后的中间态
+                        again = snapshot(product, dst2)   # 我们基于中间态再存的结果
+                        vs_orig[product] = diff(base, again)
+                        vs_resaved[product] = diff(mid, again)
+                    rec["resave"]["diffs"] = vs_orig            # 兼容旧字段：相对原文件
+                    rec["resave"]["diffs_vs_resaved"] = vs_resaved
+                    print(
+                        f"[{entry['name']}] resave: vs原文件 excel {len(vs_orig['excel'])} / wps {len(vs_orig['wps'])}；"
+                        f"vs Excel重存 excel {len(vs_resaved['excel'])} / wps {len(vs_resaved['wps'])}"
+                    )
+                else:
+                    print(f"[{entry['name']}] resave 后我们的往返失败：{note2}")
+            else:
+                print(f"[{entry['name']}] resave 失败：{rnote}")
         results.append(rec)
 
     payload = {
@@ -249,8 +303,17 @@ def main() -> int:
         "results": results,
     }
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    bad = [r for r in results if r.get("error") or not r.get("roundtrip", {}).get("ok")
-           or any(r.get(p, {}).get("diffs") for p in ("excel", "wps"))]
+    def _bad(r):
+        if r.get("error") or not r.get("roundtrip", {}).get("ok"):
+            return True
+        if any(r.get(p, {}).get("diffs") for p in ("excel", "wps")):
+            return True
+        rv = r.get("resave") or {}
+        if rv and (not rv.get("excel_ok") or not rv.get("our_roundtrip_ok")):
+            return True
+        return any((rv.get("diffs_vs_resaved") or {}).get(p) for p in ("excel", "wps"))
+
+    bad = [r for r in results if _bad(r)]
     print(f"entries={len(results)} with_diffs={len(bad)} -> {args.out}")
     return 1 if bad else 0
 
