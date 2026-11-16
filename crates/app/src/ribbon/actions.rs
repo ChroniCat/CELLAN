@@ -264,6 +264,7 @@ impl SheetApp {
 
     /// 命令分发：XML 的 onAction → 既有实现。
     pub fn ribbon_action(&mut self, action: &str, ctx: &egui::Context) {
+        self.unhandled_action = None;
         // 登记过的应用级命令（保存/另存为/打开/新建/打印/撤销/重做）只有一份实现，
         // 快捷键与菜单点击都落到这里。
         if self.command_exec(action, ctx) {
@@ -923,6 +924,28 @@ impl SheetApp {
                 self.rev_open = true;
                 self.status = "显示更改：列表里点「撤回」可还原".into();
             }
+            // UI-30：宏的三个入口从旧「审阅」菜单搬进 Ribbon（查看只读、运行走临时副本）
+            "MacroView" => {
+                if self.wb.has_vba {
+                    self.open_macro_view();
+                } else {
+                    self.status = "当前工作簿没有 VBA 宏，先打开一个 .xlsm 文件".into();
+                }
+            }
+            "MacroRun" => {
+                if self.wb.has_vba {
+                    self.macro_run_dlg = Some(String::new());
+                } else {
+                    self.status = "当前工作簿没有 VBA 宏，没有可运行的宏".into();
+                }
+            }
+            "MacroExport" => {
+                if self.wb.has_vba {
+                    self.export_macro_part();
+                } else {
+                    self.status = "当前工作簿没有 VBA 宏部件可导出".into();
+                }
+            }
             "PrevComment" => self.note_step(false),
             "NextComment" => self.note_step(true),
             "ShowComment" => self.note_show(),
@@ -1156,6 +1179,9 @@ impl SheetApp {
             }
             // 其余（字体/字号/下拉里带值的项）已在上面处理
             _ => {
+                // UI-30：未命中的命令必须留痕并让用户看见，不能只写环境变量日志。
+                self.unhandled_action = Some(action.to_string());
+                self.status = format!("这个命令还没有接入：{action}");
                 if std::env::var("SC_RIBBON_LOG").is_ok() {
                     eprintln!("[ribbon] 未实现的命令：{action}");
                 }

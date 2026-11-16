@@ -1894,6 +1894,8 @@ struct SheetApp {
     compare_window: bool,
     editing: Option<EditState>,
     status: String,
+    /// UI-30：最近一次未命中的 Ribbon 命令（测试与状态栏共用，不能只写环境变量日志）
+    unhandled_action: Option<String>,
     tree: FileTree,
     // ---- 协作 ----
     net: Option<net::Net>,
@@ -2826,6 +2828,7 @@ impl SheetApp {
             compare_window: std::env::var("SC_WIN").is_ok(),
             editing: None,
             status: "就绪".into(),
+            unhandled_action: None,
             // 文件树：最近列表只在启动和打开/保存时读，别每帧读盘
             tree: {
                 let mut t = FileTree::new();
@@ -18632,12 +18635,25 @@ let txn = self.txn_begin(&keys);
             self.status = "宏名不能为空（形如 Module1.MyMacro）".into();
             return;
         }
+        // 契约要求：宏只在隔离副本上跑，绝不改用户当前文件。
+        let copy = std::env::temp_dir().join(format!(
+            "sc_macro_run_{}_{}{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            path.extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_else(|| ".xlsm".into())
+        ));
+        if let Err(e) = std::fs::copy(&path, &copy) {
+            self.status = format!("复制隔离副本失败：{e}");
+            return;
+        }
         let ps = format!(
-            "$ErrorActionPreference='Stop'; $xl=New-Object -ComObject Excel.Application; \
-             $xl.Visible=$false; $xl.DisplayAlerts=$false; \
-             try {{ $wb=$xl.Workbooks.Open('{p}'); $xl.Run('{m}'); $wb.Save(); $wb.Close($false); \
-             Write-Output 'OK' }} finally {{ $xl.Quit() }}",
-            p = path.to_string_lossy().replace('\'', "''"),
+            "$ErrorActionPreference='Stop'; $xl=New-Object -ComObject Excel.Application;              $xl.Visible=$false; $xl.DisplayAlerts=$false;              try {{ $wb=$xl.Workbooks.Open('{p}'); $xl.Run('{m}'); $wb.Save(); $wb.Close($false);              Write-Output 'OK' }} finally {{ $xl.Quit() }}",
+            p = copy.to_string_lossy().replace('\'', "''"),
             m = macro_name.replace('\'', "''")
         );
         match std::process::Command::new("powershell")
@@ -18647,11 +18663,10 @@ let txn = self.txn_begin(&keys);
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout).to_string();
                 if text.contains("OK") {
-                    self.status = format!("宏 {macro_name} 执行完毕");
-                    if let Ok(fresh) = sheetcore::xlsx::load(&path) {
-                        self.wb = fresh;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                    }
+                    self.status = format!(
+                        "宏 {macro_name} 已在隔离副本上执行完毕，原文件未改动：{}",
+                        copy.display()
+                    );
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr).to_string();
                     let low = err.to_lowercase();

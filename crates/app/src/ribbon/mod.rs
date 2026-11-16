@@ -685,8 +685,31 @@ mod tests {
         assert_eq!(r.context[2].tab.label, "图表工具");
     }
 
-    /// XML 里声明的命令必须都能在 ribbon_action 里找到对应的臂。
-    /// （comboBox/editBox 的 onChange 不走命令分发，跳过。）
+    /// 从 ribbon_action 的 match 臂里抽出「精确命令名」集合。
+    /// 以前是 `region.contains("\"Save\"")` —— 子串匹配会被别的命令名或注释骗过，
+    /// 现在按 `"A" | "B" =>` 这种臂逐个取字面量。
+    fn dispatched_actions() -> BTreeSet<String> {
+        let src = include_str!("actions.rs");
+        let region = &src[src.find("pub fn ribbon_action").expect("没有 ribbon_action")..];
+        let mut out = BTreeSet::new();
+        for line in region.lines() {
+            let t = line.trim_start();
+            if !t.starts_with('"') {
+                continue;
+            }
+            let Some((lhs, _)) = t.split_once("=>") else { continue };
+            for part in lhs.split('|') {
+                let p = part.trim();
+                if p.starts_with('"') && p.ends_with('"') && p.len() >= 2 {
+                    out.insert(p[1..p.len() - 1].to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// UI-30：XML 里每个控件动作都必须有**精确**的 dispatch 臂。
+    /// 前缀带值的家族（fmt:/InsertFn:/zoom:/fitw:/fith:/scale:）单独认。
     #[test]
     fn every_action_is_dispatched() {
         fn walk(nodes: &[Node], out: &mut Vec<String>) {
@@ -727,21 +750,60 @@ mod tests {
                 walk(&g.children, &mut acts);
             }
         }
-        let src = include_str!("actions.rs");
-        let region = &src[src.find("pub fn ribbon_action").expect("没有 ribbon_action")..];
+        let arms = dispatched_actions();
+        // 自查：解析出来的是精确名，不能被前缀或注释混进来
+        assert!(!arms.contains("NoSuchCommand"), "解析把不存在的命令也算进来了");
+        assert!(
+            crate::command::COMMANDS.iter().any(|c| c.action == "FileSave"),
+            "命令表里连保存都没有"
+        );
+        let mut missing = Vec::new();
         for a in acts {
-            let known = if let Some(tail) = a.strip_prefix("fmt:") {
-                region.contains("strip_prefix(\"fmt:\")") || tail.is_empty()
-            } else if a.starts_with("InsertFn:") || a.starts_with("zoom:")
+            let known = arms.contains(&a)
+                || crate::command::COMMANDS.iter().any(|c| c.action == a)
+                || a.strip_prefix("fmt:").is_some()
+                || a.starts_with("InsertFn:")
+                || a.starts_with("zoom:")
                 || a.starts_with("fitw:")
                 || a.starts_with("fith:")
-                || a.starts_with("scale:")
-            {
-                true
-            } else {
-                region.contains(&format!("\"{a}\""))
-            };
-            assert!(known, "XML 动作「{a}」在 ribbon_action 里没有实现");
+                || a.starts_with("scale:");
+            if !known {
+                missing.push(a);
+            }
+        }
+        assert!(missing.is_empty(), "这些 XML 动作没有 dispatch 臂：{missing:?}");
+    }
+
+    /// UI-30：宏的三个入口必须在「审阅」页签的「宏」组里（原来只在没人调的旧菜单）。
+    #[test]
+    fn review_tab_exposes_macro_group() {
+        let r = load();
+        let tab = r
+            .tabs
+            .iter()
+            .find(|t| t.label == "审阅")
+            .expect("没有审阅页签");
+        let group = tab
+            .groups
+            .iter()
+            .find(|g| g.label == "宏")
+            .expect("审阅页签没有「宏」组");
+        let mut acts = Vec::new();
+        for child in &group.children {
+            match child {
+                Node::Button(c) | Node::Toggle(c) => acts.push(c.action().to_string()),
+                Node::Box { children, .. } => {
+                    for sub in children {
+                        if let Node::Button(c) | Node::Toggle(c) = sub {
+                            acts.push(c.action().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for want in ["MacroView", "MacroRun", "MacroExport"] {
+            assert!(acts.iter().any(|a| a == want), "宏组里缺 {want}：{acts:?}");
         }
     }
 

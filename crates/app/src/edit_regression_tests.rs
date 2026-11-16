@@ -8349,3 +8349,50 @@ fn ui116_whole_column_reference_is_also_qualified() {
     assert_eq!(app.qualify_ref(&crate::whole_col_label(2)), "Other!C:C");
     assert_eq!(app.qualify_ref(&crate::whole_row_label(4)), "Other!5:5");
 }
+
+// ---- UI-30：命令可达性与未命中留痕 ----
+
+#[test]
+fn unknown_ribbon_action_is_reported_to_the_user() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.ribbon_action("ThisCommandDoesNotExist", &ctx);
+    assert_eq!(
+        app.unhandled_action.as_deref(),
+        Some("ThisCommandDoesNotExist"),
+        "未命中的命令必须留在 unhandled_action 里，不能只写日志"
+    );
+    assert!(
+        app.status.contains("还没有接入"),
+        "状态栏要告诉用户，实际是：{}",
+        app.status
+    );
+    // 后续成功命令要把它清掉，避免一直挂着旧值
+    app.ribbon_action("Undo", &ctx);
+    assert!(app.unhandled_action.is_none(), "成功命令后应清空未命中标记");
+}
+
+#[test]
+fn macro_buttons_are_reachable_and_explain_missing_vba() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    assert!(!app.wb.has_vba, "默认工作簿不该带宏");
+    for action in ["MacroView", "MacroRun", "MacroExport"] {
+        app.ribbon_action(action, &ctx);
+        assert!(app.unhandled_action.is_none(), "{action} 没有 dispatch 臂");
+        assert!(
+            app.status.contains("没有 VBA"),
+            "{action} 对无宏文件要给明确提示，实际：{}",
+            app.status
+        );
+    }
+}
+
+#[test]
+fn macro_run_button_opens_the_runner_when_vba_exists() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.wb.has_vba = true;
+    app.ribbon_action("MacroRun", &ctx);
+    assert!(app.macro_run_dlg.is_some(), "运行宏按钮要打开宏名输入框");
+}

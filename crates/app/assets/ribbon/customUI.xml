@@ -665,6 +665,13 @@
             <button id="ReviewOnlinePeers" label="在线" imageMso="Online" screentip="查看在线协作者" onAction="ShowMembers" sizeString="66"/>
           </box>
         </group>
+        <group id="GroupMacro" label="宏">
+          <button id="MacroView" label="查看宏" size="large" imageMso="VisualBasicEditor" screentip="只读查看 VBA 源码（不执行）" onAction="MacroView"/>
+          <box boxStyle="vertical">
+            <button id="MacroRun" label="运行宏…" imageMso="MacroRun" screentip="把宏名交给本机 Excel 执行，跑在临时副本上" onAction="MacroRun" sizeString="92"/>
+            <button id="MacroExport" label="导出宏部件…" imageMso="MacroExport" screentip="把 vbaProject.bin 另存出来" onAction="MacroExport" sizeString="112"/>
+          </box>
+        </group>
       </tab>
 
       <!-- ======================================================== 视图 -->
