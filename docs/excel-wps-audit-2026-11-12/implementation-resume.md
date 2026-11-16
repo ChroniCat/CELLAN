@@ -321,3 +321,17 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 回归：`pivot_attachments` 6 passed、`pivot_save_lifecycle` 9 passed、`-p sheetcore` 全量 102 个二进制 0 failed。
 - 台账：C12.4 待实施 → 实施中；parents 24/3/28/6，slices 60/70/2/16（已验收未抬高）。
 - 剩余：多行/多列/多值字段仍未写进 pivotTable 部件（嵌套 rowItems、多个 dataFields）。
+
+## 2026-11-16 检查点八：C12.4 多字段真透视 + 接进保存链路
+
+- 提交 `41b448b`（多字段生成器）、`66d17f1`（保存队列接线）。
+- 先让 Excel 造三份黄金样本（`scripts/c12_make_pivots_multi.ps1`）：A=2 行字段、B=1 行+1 列+2 值、C=2 行+1 列。
+  关键结构：`colFields` 末尾 `<field x="-2"/>`（数据伪字段）、每个列路径 K 个 `<i>`（第 2 个起 `i="1"`）、
+  组尾 `<i t="default"><x/></i>`、`firstDataCol=行字段数`。
+- 新增 `crates/core/src/pivot_parts2.rs` 生成多字段三件套；`pivot_xml.rs` 抽出 `write_parts` 并加 `attach2_for_session`。
+- Excel 16.0 / WPS 12.0 双双确认：A `rows=[地区,产品]`、B `cols=[产品,值] data=[求和项:金额,求和项:数量]`、C `cols=[数量]`，
+  值与手算一致（华东A=40、华北B=60、B 用例 90/12 与 120/15、总计 210）。
+- 接线：`Workbook::pivots_pending2` + `xlsx::save` 附挂 + `sheet_ops` 下标重映射 + 面板 `apply_pivot2` 入队（同位置刷新不重复排队）。
+- 测试：`pivot_multi_parts` 4 passed、app `multi_field_pivot_from_panel_is_queued_for_real_parts` 1 passed；
+  全量 `-p sheetcore` 103 个二进制 0 failed、`-p app` 326 passed。
+- 剩余：多列字段（≥2）与折叠布局 `rowItems`、非求和聚合的缓存属性、Excel 改字段后存回的保真。
