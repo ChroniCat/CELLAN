@@ -439,3 +439,14 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 真机：`SC_TAB=6` + `SC_RIBBON_ACTION` 跑出三条状态；截图确认「宏」组可见。
 - 未做：全部启用按钮的穷举点击矩阵；旧菜单四个函数（已无调用点）尚未删除，
   删除前要核对 `set_freeze/export_pdf/open_compare` 与 Ribbon 侧等价。
+
+### 检查点十七：UI-30.1 旧菜单清理（先接能力再删代码）
+- `36d2966`：删除前逐项核对，发现三处能力只在旧菜单里：
+  并排比较（open_compare）、条件格式快捷规则（突出显示/项目选取/数据条/图标集/色阶/清除）、
+  数据验证工具（圈释无效/清除）。先补 Ribbon 入口再删：
+  视图→窗口组 CompareBooks / CompareSync；条件格式菜单 CfQuick（窗口直接列快捷规则）；
+  数据页签 DvQuick（窗口渲染验证工具）。
+- toolbar_cf/toolbar_dv 拆成 `*_items`，功能区菜单与窗口共用同一份实现，不复制逻辑。
+- 删除 toolbar_notes/view/data/page + set_freeze + export_pdf 共 **326 行**；
+  大括号配平脚本删除（识别注释/字符串/字符字面量），不是按行号切。
+- 测试：app **336 passed**、core **106** 二进制 0 failed；真机截图确认快捷规则窗口内容。
