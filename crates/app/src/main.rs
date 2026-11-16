@@ -28097,6 +28097,14 @@ impl SheetApp {
                         Vec2::splat(26.0),
                     );
                     let resp = ui.interact(b, egui::Id::new(("qat", i)), Sense::click());
+                    // UI-24.2：快速访问按钮要有名字和禁用态（撤销/重做会随历史变灰）
+                    let qname = match *action {
+                        "FileSave" => "保存",
+                        "Undo" => "撤销",
+                        "Redo" => "重做",
+                        _ => action,
+                    };
+                    ui_kit::a11y_name(&resp, qname, on, None);
                     if resp.hovered() {
                         painter.rect_filled(b, 3.0, hover);
                     }

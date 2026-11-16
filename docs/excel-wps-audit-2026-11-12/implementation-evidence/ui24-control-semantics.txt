@@ -64,3 +64,18 @@ DataGrid 工作表 Sheet1，选区 A1:A1，1 行 1 列，活动单元格 A1  at=
 --------
 - app 测试 **341 passed**（`work/goal-logs/ui242-app.log`）。
 - UIA 原始输出：`work/probe/qa07/uia-dd10.txt`（含上述全部条目）。
+
+六、补充：快速访问工具栏与禁用态实测（同日续）
+--------------------------------------------
+标题栏的保存/撤销/重做是自绘按钮（`qat`），之前 UIA 里完全没有。
+补 `a11y_name(..., on)` 后：
+```
+Button  保存   enabled=True    at=234,37,26,26
+Button  撤销   enabled=False   at=266,37,26,26    ← 刚打开没有历史，真正禁用
+Button  重做   enabled=False   at=298,37,26,26
+```
+这条同时证明了 disabled 状态确实能传到 UIA（`IsEnabled=False`），
+不再是「代码里有、没验过」。
+
+仍未解决的功能差异：功能区与右键菜单的其他命令没有运行期禁用
+（`Ctl.enabled` 恒 true），所以剪贴板为空时「剪切/复制/粘贴」照样可点。
