@@ -325,13 +325,362 @@ enum EditSpot {
 struct EditState {
     buf: String,
     spot: EditSpot,
+    /// 自动补全当前高亮项；缓冲区/候选变化时会被夹到范围内。
+    complete_idx: usize,
+    /// 最近一次处理 Alt+Enter 的帧，防止同一帧重复插入换行
+    alt_frame: u64,
 }
 
 impl EditState {
     fn new(buf: String) -> Self {
-        Self { buf, spot: EditSpot::Grid }
+        Self { buf, spot: EditSpot::Grid, complete_idx: 0, alt_frame: u64::MAX }
     }
 }
+
+/// 公式自动补全/参数提示。`start` 是当前标识符在缓冲里的字节位置。
+#[derive(Clone, Default)]
+struct FormulaHelp {
+    start: usize,
+    token: String,
+    suggestions: Vec<(String, String)>,
+    signature: Option<String>,
+}
+
+impl FormulaHelp {
+    fn selected(&self, idx: usize) -> Option<&str> {
+        self.suggestions.get(idx.min(self.suggestions.len().saturating_sub(1))).map(|x| x.0.as_str())
+    }
+}
+
+fn formula_signature(name: &str) -> String {
+    let n = name.to_ascii_uppercase();
+    let sig = match n.as_str() {
+        "SUM" => "SUM(number1,[number2],…)",
+        "SUMIF" => "SUMIF(range,criteria,[sum_range])",
+        "SUMIFS" => "SUMIFS(sum_range,criteria_range1,criteria1,…)",
+        "AVERAGE" => "AVERAGE(number1,[number2],…)",
+        "COUNT" => "COUNT(value1,[value2],…)",
+        "COUNTA" => "COUNTA(value1,[value2],…)",
+        "IF" => "IF(logical_test,[value_if_true],[value_if_false])",
+        "IFS" => "IFS(test1,value1,[test2,value2],…)",
+        "VLOOKUP" => "VLOOKUP(lookup_value,table_array,col_index_num,[range_lookup])",
+        "XLOOKUP" => "XLOOKUP(lookup_value,lookup_array,return_array,[if_not_found],[match_mode],[search_mode])",
+        "INDEX" => "INDEX(array,row_num,[column_num])",
+        "MATCH" => "MATCH(lookup_value,lookup_array,[match_type])",
+        "TEXT" => "TEXT(value,format_text)",
+        "ROUND" => "ROUND(number,num_digits)",
+        "DATE" => "DATE(year,month,day)",
+        "FILTER" => "FILTER(array,include,[if_empty])",
+        "UNIQUE" => "UNIQUE(array,[by_col],[exactly_once])",
+        "SORT" => "SORT(array,[sort_index],[sort_order],[by_col])",
+        "LET" => "LET(name1,value1,[name2,value2],…,calculation)",
+        _ => return format!("{n}(参数…)"),
+    };
+    sig.to_string()
+}
+
+fn function_desc(name: &str) -> &'static str {
+    match name {
+        "SUM" => "求和",
+        "SUMIF" => "条件求和",
+        "SUMIFS" => "多条件求和",
+        "AVERAGE" => "平均值",
+        "COUNT" => "数字计数",
+        "COUNTA" => "非空计数",
+        "IF" => "条件判断",
+        "IFS" => "多条件判断",
+        "VLOOKUP" => "纵向查找",
+        "XLOOKUP" => "查找",
+        "INDEX" => "索引取值",
+        "MATCH" => "定位",
+        "TEXT" => "格式化文本",
+        "ROUND" => "四舍五入",
+        "DATE" => "日期",
+        "FILTER" => "筛选",
+        "UNIQUE" => "去重",
+        "SORT" => "排序",
+        "LET" => "定义局部名称",
+        "NOW" => "当前时间",
+        "TODAY" => "今天",
+        "MAX" => "最大值",
+        "MIN" => "最小值",
+        _ => "函数",
+    }
+}
+
+/// 取 `=` 后正在输入的函数名前缀；不是公式、没有标识符或前缀是数字时返回 None。
+fn formula_token_start(buf: &str) -> Option<usize> {
+    if !buf.starts_with('=') {
+        return None;
+    }
+    let mut start = buf.len();
+    for (i, ch) in buf.char_indices().rev() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    if start == buf.len() {
+        return None;
+    }
+    let token = &buf[start..];
+    if token.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let prev = buf[..start].chars().last();
+    let ok = matches!(
+        prev,
+        None | Some('=') | Some('(') | Some(',') | Some('+') | Some('-') | Some('*')
+            | Some('/') | Some('^') | Some('&') | Some('<') | Some('>') | Some(':')
+            | Some(';') | Some('{')
+    );
+    if !ok {
+        return None;
+    }
+    Some(start)
+}
+
+/// 当前最内层未闭合函数的签名（只对已实现函数显示）。
+fn formula_open_signature(buf: &str) -> Option<String> {
+    if !buf.starts_with('=') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut open = None;
+    for (i, ch) in buf.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let mut start = open;
+    while start > 0 {
+        let ch = buf[..start].chars().next_back()?;
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+            start -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if start == open {
+        return None;
+    }
+    let name = buf[start..open].to_ascii_uppercase();
+    if sheetcore::formula::functions::implemented().iter().any(|f| *f == name) {
+        Some(formula_signature(&name))
+    } else {
+        None
+    }
+}
+
+fn formula_help(buf: &str) -> Option<FormulaHelp> {
+    let mut out = FormulaHelp::default();
+    if let Some(start) = formula_token_start(buf) {
+        let token = &buf[start..];
+        if token.chars().count() >= 2 {
+            let up = token.to_ascii_uppercase();
+            for f in sheetcore::formula::functions::implemented() {
+                if f.starts_with(&up) {
+                    out.suggestions.push((f.to_string(), function_desc(f).to_string()));
+                }
+            }
+            out.suggestions.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+            out.suggestions.truncate(8);
+            out.start = start;
+            out.token = token.to_string();
+        }
+    }
+    out.signature = formula_open_signature(buf);
+    if out.suggestions.is_empty() && out.signature.is_none() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 候选列表的键盘选择：↑↓ 改变高亮，Enter/Tab 接受；返回要接受的索引。
+fn formula_help_keys(
+    ctx: &egui::Context,
+    help: &FormulaHelp,
+    selected: &mut usize,
+) -> Option<usize> {
+    if help.suggestions.is_empty() {
+        return None;
+    }
+    *selected = (*selected).min(help.suggestions.len().saturating_sub(1));
+    let up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+    let down = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
+    if up {
+        *selected = if *selected == 0 {
+            help.suggestions.len() - 1
+        } else {
+            *selected - 1
+        };
+    }
+    if down {
+        *selected = (*selected + 1) % help.suggestions.len();
+    }
+    let accept = ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+            || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+    });
+    accept.then_some(*selected)
+}
+
+fn apply_formula_pick(ed: &mut EditState, help: &FormulaHelp, idx: usize) {
+    let Some(name) = help.selected(idx).map(str::to_string) else {
+        return;
+    };
+    if ed.buf.len() < help.start {
+        return;
+    }
+    if std::env::var("SC_FORMULA_LOG").is_ok() {
+        eprintln!(
+            "[formula] pick idx={} start={} token={:?} name={:?} before={:?}",
+            idx, help.start, help.token, name, ed.buf
+        );
+    }
+    ed.buf.replace_range(help.start.., &name);
+    // Excel 选中函数后补左括号，紧接着显示参数签名
+    if !ed.buf.ends_with('(') {
+        ed.buf.push('(');
+    }
+    ed.complete_idx = 0;
+}
+
+/// 在编辑框下方（放不下则上方）画候选/签名提示。
+fn draw_formula_help(
+    ctx: &egui::Context,
+    anchor: egui::Pos2,
+    above: bool,
+    help: &FormulaHelp,
+    selected: usize,
+) {
+    let screen = ctx.screen_rect();
+    let h = 22.0 * help.suggestions.len().min(8) as f32
+        + if help.suggestions.is_empty() { 0.0 } else { 6.0 }
+        + if help.signature.is_some() { 22.0 } else { 0.0 }
+        + 8.0;
+    let y = if above {
+        (anchor.y - h - 2.0).max(screen.top() + 4.0)
+    } else {
+        anchor.y.min(screen.bottom() - h - 4.0)
+    };
+    egui::Area::new(egui::Id::new("formula_complete"))
+        .fixed_pos(egui::pos2(anchor.x, y))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(250.0);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for (i, (name, desc)) in help.suggestions.iter().enumerate() {
+                    let mut rich = egui::RichText::new(format!("{name}    {desc}")).size(11.5);
+                    if i == selected {
+                        rich = rich.background_color(egui::Color32::from_rgb(212, 228, 246));
+                    }
+                    ui.label(rich);
+                }
+                if let Some(sig) = &help.signature {
+                    if !help.suggestions.is_empty() {
+                        ui.separator();
+                    }
+                    ui.label(
+                        egui::RichText::new(sig)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(90, 90, 90)),
+                    );
+                }
+            });
+        });
+}
+
+
+/// F4 循环当前末尾的 A1 引用：A1 → $A$1 → A$1 → $A1 → A1。
+fn cycle_formula_ref(buf: &mut String) -> bool {
+    let bytes = buf.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && !(bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'$') {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'$') {
+        start -= 1;
+    }
+    // 排除函数名/数字，只接受 [A-Za-z$]{1,3}[0-9]+ 且前后不是标识符
+    let token = &buf[start..end];
+    let tchars: Vec<char> = token.chars().collect();
+    let mut tpos = 0usize;
+    let mut letters = String::new();
+    while tpos < tchars.len() && (tchars[tpos] == '$' || tchars[tpos].is_ascii_alphabetic()) {
+        if tchars[tpos] != '$' {
+            letters.push(tchars[tpos].to_ascii_uppercase());
+        }
+        tpos += 1;
+    }
+    let rest: String = tchars[tpos..].iter().collect();
+    if letters.is_empty() || letters.len() > 3 || rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if start > 0 {
+        let prev = buf[..start].chars().next_back().unwrap_or(' ');
+        if prev.is_ascii_alphanumeric() || prev == '_' || prev == '.' {
+            return false;
+        }
+    }
+    if end < buf.len() {
+        let next = buf[end..].chars().next().unwrap_or(' ');
+        if next.is_ascii_alphanumeric() || next == '_' {
+            return false;
+        }
+    }
+    // 解析当前 $ 状态；A1→$A$1→A$1→$A1→A1
+    let chars: Vec<char> = token.chars().collect();
+    let mut ci = 0;
+    let col_abs = chars.get(ci) == Some(&'$');
+    if col_abs {
+        ci += 1;
+    }
+    let col_start = ci;
+    while ci < chars.len() && chars[ci].is_ascii_alphabetic() {
+        ci += 1;
+    }
+    let col = chars[col_start..ci].iter().collect::<String>();
+    let row_abs = chars.get(ci) == Some(&'$');
+    if row_abs {
+        ci += 1;
+    }
+    let row = chars[ci..].iter().collect::<String>();
+    let next = match (col_abs, row_abs) {
+        (false, false) => (true, true),
+        (true, true) => (false, true),
+        (false, true) => (true, false),
+        (true, false) => (false, false),
+    };
+    let mut out = String::new();
+    if next.0 {
+        out.push('$');
+    }
+    out.push_str(&col);
+    if next.1 {
+        out.push('$');
+    }
+    out.push_str(&row);
+    buf.replace_range(start..end, &out);
+    true
+}
+
 
 /// 数据验证的警告/信息提示框（Excel 的「是/否/取消」与「确定」）。
 /// 停止样式不弹这个框：它留在编辑框里让用户重试。
@@ -4639,7 +4988,7 @@ impl SheetApp {
                     None => String::new(),
                 }
             });
-            self.editing = Some(EditState { buf, spot });
+            self.editing = Some(EditState { buf, spot, complete_idx: 0, alt_frame: u64::MAX });
             return;
         };
         let name = self.my_name.clone();
@@ -9280,6 +9629,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         // Ctrl+F1：和 Excel 一样收起/展开功能区
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
             self.ribbon_collapsed = !self.ribbon_collapsed;
+        }
+        // F4：编辑公式时循环末尾引用的绝对/相对形式
+        if self.editing.is_some() && ctx.input(|i| i.key_pressed(Key::F4)) {
+            if let Some(ed) = self.editing.as_mut() {
+                if cycle_formula_ref(&mut ed.buf) {
+                    return;
+                }
+            }
         }
         // F9：Excel 同款“重算全部”，大文件走后台
         if self.editing.is_none() && ctx.input(|i| i.key_pressed(Key::F9)) {
@@ -24990,17 +25347,66 @@ let txn = self.txn_begin(&keys);
                     i.modifiers.shift,
                 )
             });
+            // 编辑前先处理自动补全的键盘选择，避免 Enter/Tab 被 TextEdit 先吃掉
+            let help0 = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf));
+            let mut pick = None;
+            if let Some(h) = &help0 {
+                if let Some(ed) = self.editing.as_mut() {
+                    pick = formula_help_keys(ctx, h, &mut ed.complete_idx);
+                }
+            }
+            let picked = pick.is_some();
+            if let (Some(h), Some(idx), Some(ed)) = (&help0, pick, self.editing.as_mut()) {
+                apply_formula_pick(ed, h, idx);
+            }
+            // Alt+Enter 这一帧用多行 TextEdit，让它按光标自然插换行
+            let multiline = multiline || alt_enter;
             let mut act = EditAct::Keep;
             if let Some(ed) = self.editing.as_mut() {
+                let before_len = ed.buf.len();
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                if std::env::var("SC_FORMULA_LOG").is_ok() {
+                    if let Some(st) = egui::TextEdit::load_state(ctx, egui::Id::new("grid_edit")) {
+                        eprintln!("[formula] loaded cursor={:?} buf={:?}", st.cursor.char_range(), ed.buf);
+                    } else {
+                        eprintln!("[formula] loaded no state buf={:?}", ed.buf);
+                    }
+                }
                 let out = if multiline {
-                    ui.put(rect, egui::TextEdit::multiline(&mut ed.buf))
+                    egui::TextEdit::multiline(&mut ed.buf)
+                        .id(egui::Id::new("grid_edit"))
+                        .desired_width(rect.width())
+                        .show(&mut child)
                 } else {
-                    ui.put(rect, egui::TextEdit::singleline(&mut ed.buf))
+                    egui::TextEdit::singleline(&mut ed.buf)
+                        .id(egui::Id::new("grid_edit"))
+                        .desired_width(rect.width())
+                        .show(&mut child)
                 };
-                out.request_focus();
+                out.response.request_focus();
+                if picked {
+                    // 补全替换了整段尾串，TextEdit 的旧光标还停在原位置；
+                    // 不搬到最后会让后续输入插进函数名中间。
+                    let mut st = out.state.clone();
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(ed.buf.chars().count()),
+                    )));
+                    st.store(ctx, egui::Id::new("grid_edit"));
+                    if std::env::var("SC_FORMULA_LOG").is_ok() {
+                        eprintln!("[formula] caret set id={:?} len={} out_id={:?}", egui::Id::new("grid_edit"), ed.buf.chars().count(), out.response.id);
+                    }
+                }
+                let cursor_after = out
+                    .cursor_range
+                    .map(|r| r.primary.ccursor.index)
+                    .unwrap_or(ed.buf.len());
                 if alt_enter {
-                    // Excel 的 Alt+Enter：单元格内换行
-                    ed.buf.push('\n');
+                    // 多行 TextEdit 已按光标插入；这里只阻止同一帧被当成提交
+                    ed.alt_frame = ctx.cumulative_pass_nr();
                 } else if ctx.input(|i| i.key_pressed(Key::Enter)) {
                     act = EditAct::Commit(Some((if shift { -1 } else { 1 }, 0)));
                 } else if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -25015,6 +25421,19 @@ let txn = self.txn_begin(&keys);
                     self.commit_edit(adv);
                 }
                 EditAct::Cancel => self.cancel_edit(),
+            }
+            if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::Grid) {
+                if let Some(h) = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf)) {
+                    let selected = self.editing.as_ref().map(|ed| ed.complete_idx).unwrap_or(0);
+                    let above = rect.bottom() + 170.0 > ctx.screen_rect().bottom();
+                    draw_formula_help(
+                        ctx,
+                        rect.left_bottom() + Vec2::new(0.0, 2.0),
+                        above,
+                        &h,
+                        selected,
+                    );
+                }
             }
         }
 
@@ -26509,7 +26928,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                             } else {
                                 initial
                             };
-                            self.editing = Some(EditState { buf, spot: self.pending_spot });
+                            self.editing = Some(EditState { buf, spot: self.pending_spot, complete_idx: 0, alt_frame: u64::MAX });
                             self.status = format!("正在编辑 {}", cell_name(r, c));
                         }
                     } else {
@@ -28032,6 +28451,25 @@ impl eframe::App for SheetApp {
                         .memory_mut(|m| m.request_focus(egui::Id::new("fx_edit")));
                 }
                 if self.editing.is_some() {
+                    let formula_active = self
+                        .editing
+                        .as_ref()
+                        .is_some_and(|ed| ed.spot == EditSpot::FormulaBar);
+                    let help0 = if formula_active {
+                        self.editing.as_ref().and_then(|ed| formula_help(&ed.buf))
+                    } else {
+                        None
+                    };
+                    let mut pick = None;
+                    if let Some(h) = &help0 {
+                        if let Some(ed) = self.editing.as_mut() {
+                            pick = formula_help_keys(ui.ctx(), h, &mut ed.complete_idx);
+                        }
+                    }
+                    let picked = pick.is_some();
+                    if let (Some(h), Some(idx), Some(ed)) = (&help0, pick, self.editing.as_mut()) {
+                        apply_formula_pick(ed, h, idx);
+                    }
                     if let Some(ed) = self.editing.as_mut() {
                         let mut child = ui.new_child(
                             egui::UiBuilder::new()
@@ -28054,6 +28492,15 @@ impl eframe::App for SheetApp {
                                     .frame(false),
                             )
                         };
+                        if picked {
+                            let id = egui::Id::new("fx_edit");
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(ed.buf.chars().count()),
+                                )));
+                                egui::TextEdit::store_state(ui.ctx(), id, st);
+                            }
+                        }
                         if ed.spot == EditSpot::FormulaBar {
                             te.request_focus();
                             // 编辑栏自己判 Enter：单行 TextEdit 在 Enter 时先失去焦点，
@@ -28061,6 +28508,18 @@ impl eframe::App for SheetApp {
                             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 commit = true;
                             }
+                        }
+                    }
+                    if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::FormulaBar) {
+                        if let Some(h) = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf)) {
+                            let selected = self.editing.as_ref().map(|ed| ed.complete_idx).unwrap_or(0);
+                            draw_formula_help(
+                                ui.ctx(),
+                                ed_rect.left_bottom() + Vec2::new(0.0, 2.0),
+                                false,
+                                &h,
+                                selected,
+                            );
                         }
                     }
                 } else {
@@ -29489,6 +29948,7 @@ fn parse_key_spec(spec: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "end" => key = Some(egui::Key::End),
             "space" => key = Some(egui::Key::Space),
             "f2" => key = Some(egui::Key::F2),
+            "f4" => key = Some(egui::Key::F4),
             "f10" => key = Some(egui::Key::F10),
             "left" => key = Some(egui::Key::ArrowLeft),
             "right" => key = Some(egui::Key::ArrowRight),

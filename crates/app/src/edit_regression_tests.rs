@@ -7817,3 +7817,24 @@ fn context_submenu_escape_steps_back_one_level() {
     run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
     assert!(app.ctx_menu.is_none(), "第二次 Esc 关闭菜单");
 }
+
+#[test]
+fn formula_autocomplete_and_f4_cycle_keep_editing_state() {
+    let help = formula_help("=SU").expect("=SU 应有 SUM/SUMIF 候选");
+    assert!(help.suggestions.iter().any(|(n, _)| n == "SUM"));
+    assert!(help.suggestions.iter().any(|(n, _)| n == "SUMIF"));
+    let sum = help.suggestions.iter().position(|(n, _)| n == "SUM").unwrap();
+    let mut ed = EditState::new("=SU".into());
+    apply_formula_pick(&mut ed, &help, sum);
+    assert_eq!(ed.buf, "=SUM(");
+    assert!(formula_help(&ed.buf).and_then(|h| h.signature).is_some());
+
+    let mut buf = "=A1".to_string();
+    for want in ["=$A$1", "=A$1", "=$A1", "=A1"] {
+        assert!(cycle_formula_ref(&mut buf), "应识别 A1 引用");
+        assert_eq!(buf, want);
+    }
+    let mut f = "=SUM(B2:C3)".to_string();
+    assert!(cycle_formula_ref(&mut f));
+    assert_eq!(f, "=SUM(B2:$C$3)", "只循环末尾引用");
+}
