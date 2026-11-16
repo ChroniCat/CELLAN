@@ -17,7 +17,13 @@
 - **UI-11（实施中，未验收）**：`=SU` 出 SUM/SUMIF 候选（↑↓/Tab/Enter）、`=SUM(` 参数签名、
   F4 四态循环只动末尾引用、Alt+Enter 改多行 TextEdit 按光标插入；
   接受候选后显式把光标搬到末尾（否则插进函数名中间）。证据 `ui11-formula-help.txt`。
-  未做：编辑中点选建立引用、引用彩色、函数向导/最近使用、真实 IME 候选。
+  - **UI-11.3（本轮，仍实施中）**：编辑公式时点格子 → 光标处建立/替换引用（`insert_reference`），
+  鼠标松开帧不提交、选区不动，被引用格描细蓝框（`pick_rect`）；引用按 Excel 四色上色
+  （`TextEdit::layouter` + `formula_layout_job`，同一文本同色，`Sheet2!$B$2`/`A1:B2` 整段）；
+  Alt+Enter 改成多行 TextEdit 按真实光标插行，并有真实事件用例。提交 `911ad41`，
+  app 测试 **313 passed**。GUI 实测 buf=`=A1+B1`、A1 蓝 B1 绿（像素复核）、B1 细框，
+  证据 `ui11-ref-pick.txt` + `ui113-probe/`。
+  未做：Shift/拖动扩区域引用、行号列标引用、跨表引用、函数向导/最近使用（11.4）、真实 IME。
 - 仍未关闭的父项与上一检查点相同；下一优先：C12.4 真 pivotTable、QA-01 父项矩阵、
   UI-11.3/11.4、UI-24 可访问性。
 

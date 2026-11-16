@@ -5039,25 +5039,32 @@
         "crates/app/src/edit_regression_tests.rs"
       ],
       "commits": [
-        "61c9b67"
+        "61c9b67",
+        "911ad41"
       ],
       "commands": [
-        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed / 0 failed",
-        "cargo build -p app --offline -j 2 --no-default-features --features glow -> BUILD_EXIT=0"
+        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 313 passed / 0 failed",
+        "cargo test ... -- ui113 -> 4 passed / 0 failed（点选引用、引用着色、layouter 进 galley、Alt+Enter 按光标插行）",
+        "cargo build -p app --offline -j 2 --no-default-features --features glow -> BUILD OK",
+        "app.exe + SC_TYPE/SC_REF_SIM/SC_SHOT -> buf=\"=A1+B1\"，A1 蓝 B1 绿，B1 外套细蓝框"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-ref-pick.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/ui113-edit.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/probe.log"
       ],
       "not_done": [
-        "=A1 编辑中点 B2 建立引用未实现",
-        "引用彩色高亮未实现",
-        "函数向导与真实最近使用未实现（UI-11.4）",
+        "Shift/拖动把引用扩成 A1:B2 未实现（每次点击只建单格引用）",
+        "点行号/列标建 A:A、1:1 引用未实现",
+        "跨工作表点选建 Sheet2!A1 未实现",
+        "函数向导与按真实使用记录的最近使用未实现（UI-11.4）",
         "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）"
       ],
       "failures": [],
       "blocker": "",
-      "next": "UI-11.3 引用拾取与彩色引用；UI-11.4 函数向导/最近使用",
-      "updated_utc": "2026-11-16T07:13:43Z",
+      "next": "UI-11.4 函数向导与真实最近使用",
+      "updated_utc": "2026-11-16T07:42:25Z",
       "slices": [
         {
           "id": "UI-11.1",
@@ -5074,18 +5081,19 @@
             "61c9b67"
           ],
           "commands": [
-            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 313 passed / 0 failed",
+            "cargo test ... -- ui113_alt_enter -> 1 passed（光标在 3 时 Alt+Enter → \"=A1\n&B1\"、光标 4）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
           ],
           "not_done": [
-            "Alt+Enter 已按光标插入（多行 TextEdit）；中文 IME 候选确认未实测"
+            "中文 IME 候选确认未实测（真实 IME 不可用）"
           ],
           "failures": [],
           "blocker": "",
           "next": "真实 IME 提交路径随 QA-04 一起验",
-          "updated_utc": "2026-11-16T07:13:43Z"
+          "updated_utc": "2026-11-16T07:42:25Z"
         },
         {
           "id": "UI-11.2",
@@ -5130,22 +5138,27 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
-            "61c9b67"
+            "61c9b67",
+            "911ad41"
           ],
           "commands": [
-            "cargo test -p app --offline -j 2 --bin app -- formula_autocomplete_and_f4 --test-threads=2 -> 1 passed（F4 四态 + 只动末尾引用）"
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 313 passed / 0 failed",
+            "cargo test ... -- ui113 -> 4 passed / 0 failed（点选引用、引用着色、layouter 进 galley、Alt+Enter 按光标插行）"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-ref-pick.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/ui113-edit.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/probe.log"
           ],
           "not_done": [
-            "点选单元格建立引用未实现",
-            "引用彩色高亮未实现"
+            "Shift/拖动把引用扩成 A1:B2 未实现（每次点击只建单格引用）",
+            "点行号/列标建 A:A、1:1 引用未实现",
+            "跨工作表点选建 Sheet2!A1 未实现"
           ],
           "failures": [],
           "blocker": "",
-          "next": "实现点选拾取与引用着色",
-          "updated_utc": "2026-11-16T07:13:43Z"
+          "next": "Shift/拖动扩成区域引用 + 行号列标引用 + 跨表引用",
+          "updated_utc": "2026-11-16T07:42:25Z"
         },
         {
           "id": "UI-11.4",
