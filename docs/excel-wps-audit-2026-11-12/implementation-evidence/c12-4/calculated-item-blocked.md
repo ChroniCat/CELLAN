@@ -82,3 +82,31 @@ Excel 直接判文件坏。
 
 下一步（未做）：让 `attach2_*` 把这一行同时写进 `rowItems` 与 `location`，
 并把该行标签在缓存里登记成 `<s f="1"/>`，才算真正打通。
+
+## 打通（同日，最终）
+
+上一节说的「三处一起扩」已落地：
+
+1. `append_calc_item_row` 把计算项算成网格里真的多一行（值 = 来源行之和）；
+2. `pivot_parts2::build` 在写 `rowItems` 时，**行标签在 sharedItems 里本来不存在**就会由 `idx_of`
+   追加一个新项——把这种「新追加的下标」记为计算项（`calc_marks`），于是：
+   - `cacheField` 里写 `<s v="华东华北" f="1"/>`；
+   - `pivotField` 的 `items` 里写 `<item f="1" x="2"/>`；
+   - `rowItems` 里天然就有 `<i><x v="2"/></i>`（因为这一行真的在网格里）；
+   - `location` 由 `write_grid` 的实际矩形算出，自动多一行。
+
+Excel 复测（`calcrow-ours.xlsx`）：
+
+```
+pivots=1 name=数据透视表1 rows=1 cols=1 data=1 range=A9:E14   ← 比原来 E13 多一行
+CalculatedItems().Count = 1
+CalculatedItems().Item(1).Name = 华东华北
+```
+
+即 Excel 既认了这个计算项，也把数据区按新行渲染。`pivot_multi_parts` **15 passed**、
+`pivot_real` 5 passed、`pivot_structure` 6 passed。
+
+## 仍未做
+
+- 界面上没有「计算项」入口（核心 API 已有：`append_calc_item_row`）；
+- 计算项公式是「若干项相加」，Excel 支持更复杂的项间表达式（乘法/除法）未做。

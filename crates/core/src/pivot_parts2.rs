@@ -124,6 +124,9 @@ pub fn build(
     let row_depth = spec.rows.len();
     let row_fields: Vec<usize> = spec.rows.iter().map(|f| (f.col - c1) as usize).collect();
     let mut row_items = String::new();
+    // 计算项：行标签在 sharedItems 里原本不存在，idx_of 会追加一个新项——它就是计算项
+    let mut calc_marks: std::collections::HashSet<(usize, usize)> = Default::default();
+    let base_len: Vec<usize> = shared.iter().map(|v| v.len()).collect();
     let mut prev_labels: Vec<String> = vec![String::new(); row_depth];
     for (ri, line) in grid.rows.iter().enumerate() {
         let labels: Vec<String> = (0..row_depth)
@@ -153,6 +156,9 @@ pub fn build(
             };
             let fi = row_fields[d];
             let idx = idx_of(&mut shared[fi], &label);
+            if idx >= base_len[fi] {
+                calc_marks.insert((fi, idx));
+            }
             row_items.push_str(&format!("<x v=\"{idx}\"/>"));
         }
         row_items.push_str("</i>");
@@ -277,7 +283,14 @@ pub fn build(
         } else {
             let items: String = shared[i]
                 .iter()
-                .map(|s| format!("<s v=\"{}\"/>", esc(s)))
+                .enumerate()
+                .map(|(k, s)| {
+                    if calc_marks.contains(&(i, k)) {
+                        format!("<s v=\"{}\" f=\"1\"/>", esc(s))
+                    } else {
+                        format!("<s v=\"{}\"/>", esc(s))
+                    }
+                })
                 .collect();
             caches.push_str(&format!(
                 "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems count=\"{}\">{items}</sharedItems></cacheField>",
@@ -325,10 +338,14 @@ pub fn build(
     );
 
     // ---------- pivotFields ----------
-    let items_for = |shared: &Vec<String>| -> String {
+    let items_for = |field: usize, shared: &Vec<String>| -> String {
         let mut out = String::new();
         for k in 0..shared.len() {
-            out.push_str(&format!("<item x=\"{k}\"/>"));
+            if calc_marks.contains(&(field, k)) {
+                out.push_str(&format!("<item f=\"1\" x=\"{k}\"/>"));
+            } else {
+                out.push_str(&format!("<item x=\"{k}\"/>"));
+            }
         }
         out.push_str("<item t=\"default\"/>");
         out
@@ -340,13 +357,13 @@ pub fn build(
             pfields.push_str(&format!(
                 "<pivotField axis=\"axisRow\" compact=\"0\" outline=\"0\" showAll=\"0\"><items count=\"{}\">{}</items></pivotField>",
                 shared[i].len() + 1,
-                items_for(&shared[i])
+                items_for(i, &shared[i])
             ));
         } else if col_field_set.contains(&i) {
             pfields.push_str(&format!(
                 "<pivotField axis=\"axisCol\" compact=\"0\" outline=\"0\" showAll=\"0\"><items count=\"{}\">{}</items></pivotField>",
                 shared[i].len() + 1,
-                items_for(&shared[i])
+                items_for(i, &shared[i])
             ));
         } else if value_cols.contains(&(c1 + i as u32)) {
             pfields.push_str("<pivotField dataField=\"1\" compact=\"0\" outline=\"0\" showAll=\"0\"/>");

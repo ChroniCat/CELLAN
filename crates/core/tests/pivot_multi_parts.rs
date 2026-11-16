@@ -585,3 +585,52 @@ fn calc_item_row_appends_sum_row_before_grand_total() {
     let after: Vec<String> = grid.rows[grid.grand_total_row.unwrap()].iter().map(|v| v.display()).collect();
     assert_eq!(after, grand_vals, "总计不应被计算项重复累加");
 }
+
+#[test]
+fn calc_item_row_reaches_row_items_and_cache() {
+    let fx = Fixture::new("calcrowxml");
+    let path = fx.file("calcrowxml.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_b();
+    let mut grid = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let at = sheetcore::pivot_multi::append_calc_item_row(&mut grid, "华东华北", &["华东", "华北"])
+        .expect("应能追加计算项行");
+    let rect = sheetcore::pivot_multi::write_grid(&mut wb.sheets[0], (8, 0), &grid);
+    let _ = sheetcore::pivot_xml::attach2_for_session(&path, "Data", &spec, &grid, rect, "test")
+        .expect("附挂失败");
+
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut cache = String::new();
+    let mut table = String::new();
+    {
+        use std::io::Read;
+        let cd = z.file_names().find(|n| n.contains("pivotCacheDefinition")).unwrap().to_string();
+        z.by_name(&cd).unwrap().read_to_string(&mut cache).unwrap();
+        let pt = z
+            .file_names()
+            .find(|n| n.starts_with("xl/pivotTables/") && n.ends_with(".xml"))
+            .unwrap()
+            .to_string();
+        z.by_name(&pt).unwrap().read_to_string(&mut table).unwrap();
+    }
+    assert!(cache.contains("<s v=\"华东华北\" f=\"1\"/>"), "缓存要标 f=1：{cache}");
+    // 计算项在 pivotField items 里带 f="1"
+    let frag = format!("<item f=\"1\" x=");
+    assert!(table.contains(&frag), "pivotField items 要标 f=1：{table}");
+    // rowItems 里也要有同一索引
+    let x = table
+        .split("<item f=\"1\" x=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap()
+        .to_string();
+    assert!(
+        table.contains(&format!("<i><x v=\"{x}\"/></i>")),
+        "rowItems 缺计算项行（x={x}）：{table}"
+    );
+    assert_eq!(at, 2, "两个普通行之后");
+
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/calcrow-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
+}
