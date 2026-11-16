@@ -109,6 +109,7 @@ impl SheetApp {
             "FreezeFirstColumn" => {
                 st.checked = self.wb.sheet(self.sheet_idx).freeze == Some((0, 1))
             }
+            "CompareSync" => st.checked = self.compare_sync,
             "NormalView" => st.checked = self.view_mode == 0,
             "PageLayoutView" => st.checked = self.view_mode == 1,
             "PageBreakPreview" => st.checked = self.view_mode == 2,
@@ -700,6 +701,9 @@ impl SheetApp {
                 self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
             }
             "WatchWindow" => self.watch_open = true,
+            // UI-30：旧「数据验证」菜单里的圈释/清除等，从功能区打开同一套窗口
+            "DvQuick" => self.dv_quick = true,
+            "CfQuick" => self.cf_quick = true,
             "DataValidation" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
                 let cur = sheetcore::dv::find(&self.wb.sheet(self.sheet_idx).dv, r1, c1).cloned();
@@ -1018,6 +1022,16 @@ impl SheetApp {
                     "已取消冻结".into()
                 } else {
                     format!("冻结在 {}：上方 {} 行、左侧 {} 列", cell_name(r, c), r, c)
+                };
+            }
+            // UI-30：旧「页面布局」菜单里的并排比较，搬到视图页签的窗口组
+            "CompareBooks" => self.open_compare(),
+            "CompareSync" => {
+                self.compare_sync = !self.compare_sync;
+                self.status = if self.compare_sync {
+                    "并排比较：同步滚动已打开".into()
+                } else {
+                    "并排比较：同步滚动已关闭".into()
                 };
             }
             "Unfreeze" => {

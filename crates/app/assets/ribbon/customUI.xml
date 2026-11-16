@@ -231,6 +231,7 @@
           <menu id="ConditionalFormatting" label="条件格式" size="large" sizeString="53" imageMso="Cf">
             <button id="ConditionalFormattingNew" label="新建规则…" onAction="ConditionalFormatting"/>
             <button id="ConditionalFormattingManage" label="管理规则…" onAction="ConditionalFormatting"/>
+            <button id="CfQuick" label="快捷规则…" onAction="CfQuick"/>
           </menu>
           <menu id="FormatAsTable" label="套用表格格式" size="large" sizeString="65" imageMso="Table">
             <button id="FormatAsTableNew" label="插入表格" onAction="FormatAsTable"/>
@@ -606,6 +607,7 @@
             <button id="RemoveDuplicates" label="删除重复项" imageMso="RemoveDup" onAction="RemoveDuplicates" sizeString="110"/>
             <button id="CFManager" label="条件格式" imageMso="Cf" onAction="CFManager" sizeString="110"/>
             <button id="DataValidationBtn" label="数据验证" imageMso="Validation" onAction="DataValidation" sizeString="110"/>
+          <button id="DvQuick" label="验证工具…" imageMso="ValidationCircleInvalid" screentip="圈释无效数据、清除验证" onAction="DvQuick" sizeString="104"/>
           </box>
           <box boxStyle="vertical">
             <button id="FlashFill" label="快速填充" imageMso="Fx" screentip="从示例反推规则并填充" onAction="FlashFill" sizeString="104"/>
@@ -721,6 +723,8 @@
             <button id="Unfreeze" label="取消冻结" imageMso="Unfreeze" onAction="Unfreeze" sizeString="96"/>
             <button id="HideSheet" label="隐藏" imageMso="EyeOff" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
             <button id="UnhideSheet" label="取消隐藏" imageMso="Eye" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
+            <button id="CompareBooks" label="并排比较…" imageMso="Compare" screentip="选一个文件只读并排比较" onAction="CompareBooks" sizeString="104"/>
+            <toggleButton id="CompareSync" label="同步滚动" imageMso="SyncScroll" screentip="两边滚动保持同步" onAction="CompareSync" sizeString="104"/>
           </box>
         </group>
         <group id="GroupViews" label="工作簿视图">

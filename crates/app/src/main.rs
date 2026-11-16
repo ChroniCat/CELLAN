@@ -1836,6 +1836,10 @@ struct SheetApp {
     ribbon_group_w: std::collections::HashMap<String, f32>,
     /// 条件格式管理窗口
     cf_mgr: bool,
+    /// UI-30：旧「条件格式」菜单的快捷规则，改成从功能区打开的窗口
+    cf_quick: bool,
+    /// UI-30：旧「数据验证」菜单，同上
+    dv_quick: bool,
     /// 上次导入的外部数据（路径, 起始行, 起始列），刷新用
     last_import: Option<(std::path::PathBuf, u32, u32)>,
     /// 房间断了（可以接任宿主）
@@ -2787,6 +2791,8 @@ impl SheetApp {
             palette_q: String::new(),
             ribbon_group_w: std::collections::HashMap::new(),
             cf_mgr: false,
+            cf_quick: false,
+            dv_quick: false,
             last_import: None,
             room_lost: false,
             page_setup_open: false,
@@ -7906,6 +7912,36 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                 p += 1;
             }
         }
+    }
+
+    /// UI-30：把旧菜单里的快捷规则原样放进窗口（规则数/数据条/图标集/色阶都在这里）
+    fn cf_quick_window(&mut self, ctx: &egui::Context) {
+        if !self.cf_quick {
+            return;
+        }
+        let mut open = true;
+        ui_kit::window(ctx, "条件格式快捷规则", 460.0)
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                self.toolbar_cf_items(ui);
+            });
+        self.cf_quick = open;
+    }
+
+    /// UI-30：数据验证快捷菜单（圈释无效、清除验证等）
+    fn dv_quick_window(&mut self, ctx: &egui::Context) {
+        if !self.dv_quick {
+            return;
+        }
+        let mut open = true;
+        ui_kit::window(ctx, "数据验证", 400.0)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                self.toolbar_dv_items(ui);
+            });
+        self.dv_quick = open;
     }
 
     fn cf_manager(&mut self, ctx: &egui::Context) {
@@ -17387,7 +17423,11 @@ let txn = self.txn_begin(&keys);
 
     /// 条件格式菜单
     fn toolbar_cf(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("条件格式", |ui| {
+        ui.menu_button("条件格式", |ui| self.toolbar_cf_items(ui));
+    }
+
+    fn toolbar_cf_items(&mut self, ui: &mut egui::Ui) {
+        
             ui.set_min_width(260.0);
             ui.menu_button("突出显示单元格规则", |ui| {
                 ui.horizontal(|ui| {
@@ -17563,13 +17603,17 @@ let txn = self.txn_begin(&keys);
             ui.separator();
             let n = self.wb.sheet(self.sheet_idx).cf.blocks.len();
             ui.label(format!("当前工作表有 {n} 条规则"));
-        });
+        
     }
 
 
     /// 数据验证菜单
     fn toolbar_dv(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("数据验证", |ui| {
+        ui.menu_button("数据验证", |ui| self.toolbar_dv_items(ui));
+    }
+
+    fn toolbar_dv_items(&mut self, ui: &mut egui::Ui) {
+        
             if ui.button("圈释无效数据").clicked() {
                 self.circle_invalid = true;
                 self.invalid_gen = u64::MAX;
@@ -17611,7 +17655,7 @@ let txn = self.txn_begin(&keys);
             ui.separator();
             let n = self.wb.sheet(self.sheet_idx).dv.len();
             ui.label(format!("当前工作表 {n} 条验证"));
-        });
+        
     }
 
     /// 数据验证对话框
@@ -17786,70 +17830,7 @@ let txn = self.txn_begin(&keys);
     }
 
 
-    /// 审阅菜单：新建/编辑/删除批注
-    fn toolbar_notes(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("审阅", |ui| {
-            ui.set_min_width(180.0);
-            if ui.button("修订记录…").on_hover_text("谁在什么时候改了哪格，可撤回").clicked() {
-                self.rev_open = true;
-                self.rev_msg.clear();
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(self.wb.has_vba, egui::Button::new("导出宏部件…"))
-                .on_hover_text("把 vbaProject.bin 另存出来")
-                .clicked()
-            {
-                self.export_macro_part();
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(self.wb.has_vba, egui::Button::new("查看宏代码…"))
-                .on_hover_text("只读展示 VBA 源码")
-                .clicked()
-            {
-                self.open_macro_view();
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(self.wb.has_vba, egui::Button::new("用本机 Excel 执行宏…"))
-                .on_hover_text("交给本机 Excel 执行（需要装了 Excel），跑完结果存回文件")
-                .clicked()
-            {
-                self.macro_run_dlg = Some(String::new());
-                ui.close_menu();
-            }
-            ui.separator();
-            let (r, c) = self.sel;
-            let cur = self
-                .wb
-                .sheet(self.sheet_idx)
-                .notes
-                .get(&sheetcore::model::CellRef::new(r, c))
-                .cloned();
-            let label = if cur.is_some() { "编辑批注…" } else { "新建批注…" };
-            if ui.button(label).clicked() {
-                let text = cur.as_ref().map(|n| n.text.clone()).unwrap_or_default();
-                self.note_edit = Some((r, c, text));
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(cur.is_some(), egui::Button::new("删除批注"))
-                .clicked()
-            {
-                let sheet = self.wb.sheet_mut(self.sheet_idx);
-                sheet.notes.remove(&sheetcore::model::CellRef::new(r, c));
-                sheet.notes_dirty = true;
-                self.wb.dirty = true;
-                self.status = "已删除批注".into();
-                ui.close_menu();
-            }
-            ui.separator();
-            let n = self.wb.sheet(self.sheet_idx).notes.len();
-            ui.label(format!("本表 {n} 条批注"));
-        });
-    }
+
 
     /// 批注编辑窗口
     fn note_dialog(&mut self, ctx: &egui::Context) {
@@ -18484,57 +18465,9 @@ let txn = self.txn_begin(&keys);
     }
 
 
-    /// 视图菜单：冻结窗格
-    fn toolbar_view(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("视图", |ui| {
-            ui.set_min_width(190.0);
-            let cur = self.wb.sheet(self.sheet_idx).freeze;
-            if ui.button("冻结首行").clicked() {
-                self.set_freeze(Some((1, 0)));
-                ui.close_menu();
-            }
-            if ui.button("冻结首列").clicked() {
-                self.set_freeze(Some((0, 1)));
-                ui.close_menu();
-            }
-            let (r, c) = self.sel;
-            if ui
-                .button(format!("冻结到当前单元格（{}{}）", cell_name(r, c), ""))
-                .clicked()
-            {
-                self.set_freeze(Some((r, c)));
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(cur.is_some(), egui::Button::new("取消冻结"))
-                .clicked()
-            {
-                self.set_freeze(None);
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(match cur {
-                Some((r, c)) => format!("当前冻结 {r} 行 / {c} 列"),
-                None => "未冻结".into(),
-            });
-        });
-    }
 
-    fn set_freeze(&mut self, v: Option<(u32, u32)>) {
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
-        sheet.freeze = match v {
-            Some((r, c)) if r == 0 && c == 0 => None,
-            other => other,
-        };
-        sheet.freeze_dirty = true;
-        self.wb.dirty = true;
-        self.scroll = Vec2::ZERO;
-        self.status = match v {
-            Some((r, c)) if r > 0 || c > 0 => format!("已冻结 {r} 行 / {c} 列"),
-            _ => "已取消冻结".to_string(),
-        };
-    }
+
+
 
 
 
@@ -18783,60 +18716,7 @@ let txn = self.txn_begin(&keys);
         };
     }
 
-    /// 数据菜单：排序与筛选
-    fn toolbar_data(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("数据", |ui| {
-            ui.set_min_width(200.0);
-            let (r, c) = self.sel;
-            if ui.button("升序排序").clicked() {
-                self.do_sort(c, true);
-                ui.close_menu();
-            }
-            if ui.button("降序排序").clicked() {
-                self.do_sort(c, false);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("筛选（当前区域）").clicked() {
-                self.start_filter();
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(
-                    self.wb.sheet(self.sheet_idx).filter.is_some(),
-                    egui::Button::new("清除筛选条件"),
-                )
-                .clicked()
-            {
-                self.clear_filter_criteria();
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(
-                    self.wb.sheet(self.sheet_idx).filter.is_some(),
-                    egui::Button::new("关闭筛选"),
-                )
-                .clicked()
-            {
-                self.disable_filter();
-                ui.close_menu();
-            }
-            ui.separator();
-            let n = match self.wb.sheet(self.sheet_idx).filter.as_ref() {
-                Some(f) => {
-                    let (a, b, c2, d) = f.range;
-                    format!(
-                        "筛选区域 {}-{}，隐藏 {} 行",
-                        format!("{}{}", cell_name(a, b), ""),
-                        format!("{}{}", cell_name(c2, d), ""),
-                        self.wb.sheet(self.sheet_idx).hidden_rows.len()
-                    )
-                }
-                None => "未启用筛选".into(),
-            };
-            ui.label(n);
-        });
-    }
+
 
     fn do_sort(&mut self, col: u32, asc: bool) {
         let (r, c) = self.sel;
@@ -19628,145 +19508,7 @@ let txn = self.txn_begin(&keys);
 
 
 
-    /// 页面布局菜单
-    fn toolbar_page(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("页面布局", |ui| {
-            ui.set_min_width(220.0);
-            let ps0 = self.wb.sheet(self.sheet_idx).page.clone();
-            if ui.button("页面设置…").clicked() {
-                self.open_page_setup();
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.menu_button(format!("纸张：{}", ps0.paper_label()), |ui| {
-                for (code, name) in [(9u16, "A4"), (8, "A3"), (10, "A5"), (1, "Letter"), (4, "Legal")] {
-                    if ui.selectable_label(ps0.paper == code, name).clicked() {
-                        self.set_page(|p| p.paper = code);
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.menu_button(if ps0.landscape { "方向：横向" } else { "方向：纵向" }, |ui| {
-                if ui.selectable_label(!ps0.landscape, "纵向").clicked() {
-                    self.set_page(|p| p.landscape = false);
-                    ui.close_menu();
-                }
-                if ui.selectable_label(ps0.landscape, "横向").clicked() {
-                    self.set_page(|p| p.landscape = true);
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button(format!("缩放：{}", if ps0.fit_to_page { "调整为 1 页宽".to_string() } else { format!("{}%", ps0.scale) }), |ui| {
-                if ui.selectable_label(ps0.fit_to_page, "调整为 1 页宽").clicked() {
-                    self.set_page(|p| {
-                        p.fit_to_page = true;
-                        p.fit_width = 1;
-                        p.fit_height = 0;
-                    });
-                    ui.close_menu();
-                }
-                for pct in [100u16, 85, 75, 50] {
-                    if ui.selectable_label(!ps0.fit_to_page && ps0.scale == pct, format!("{pct}%")).clicked() {
-                        self.set_page(move |p| {
-                            p.fit_to_page = false;
-                            p.scale = pct;
-                        });
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.menu_button("边距", |ui| {
-                for (name, m) in [
-                    ("常规", [0.7f32, 0.7, 0.75, 0.75, 0.3, 0.3]),
-                    ("窄", [0.25, 0.25, 0.75, 0.75, 0.3, 0.3]),
-                    ("宽", [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]),
-                ] {
-                    if ui.button(name).clicked() {
-                        self.set_page(move |p| p.margins = m);
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.separator();
-            if ui.checkbox(&mut { ps0.gridlines }, "打印网格线").clicked() {
-                let v = !ps0.gridlines;
-                self.set_page(move |p| p.gridlines = v);
-                ui.close_menu();
-            }
-            if ui.checkbox(&mut { ps0.headings }, "打印行号列标").clicked() {
-                let v = !ps0.headings;
-                self.set_page(move |p| p.headings = v);
-                ui.close_menu();
-            }
-            ui.separator();
-            let (r1, c1, r2, c2) = self.sel_rect();
-            if ui.button("把选区设为打印区域").clicked() {
-                self.set_page(move |p| p.print_area = Some((r1, c1, r2, c2)));
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(ps0.print_area.is_some(), egui::Button::new("取消打印区域"))
-                .clicked()
-            {
-                self.set_page(|p| p.print_area = None);
-                ui.close_menu();
-            }
-            let (sr, _sc) = self.sel;
-            if ui.button(format!("把第 {} 行设为顶端标题行", sr + 1)).clicked() {
-                self.set_page(move |p| p.title_rows = Some((0, sr)));
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(ps0.title_rows.is_some(), egui::Button::new("取消标题行"))
-                .clicked()
-            {
-                self.set_page(|p| p.title_rows = None);
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.checkbox(&mut self.show_pages, "显示分页虚线").clicked() {
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.separator();
-            if ui.button("导出 PDF…").clicked() {
-                self.export_pdf();
-                ui.close_menu();
-            }
-            if ui.button("打印预览").clicked() {
-                self.show_pages = true;
-                self.status = "分页虚线已显示（按当前页面设置）".into();
-                ui.close_menu();
-            }
-            if ui.button("并排比较…").clicked() {
-                self.open_compare();
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(self.compare.is_some(), egui::Button::new("关闭并排比较"))
-                .clicked()
-            {
-                self.compare = None;
-                self.compare_window = false;
-                self.status = "已关闭并排比较".into();
-                ui.close_menu();
-            }
-            if self.compare.is_some() {
-                ui.checkbox(&mut self.compare_sync, "同步纵向滚动");
-                if ui
-                    .checkbox(&mut self.compare_window, "在独立窗口中显示")
-                    .changed()
-                {
-                    ui.close_menu();
-                }
-            }
-            ui.label(format!(
-                "页数约 {}×{}",
-                sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx)).0.len() + 1,
-                sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx)).1.len() + 1
-            ));
-        });
-    }
+
 
     /// 用选区插入一张柱状图（首行标题、首列分类），写进文件后重新读图表
     fn insert_chart_from_selection(&mut self) {
@@ -21437,25 +21179,7 @@ let txn = self.txn_begin(&keys);
         }
     }
 
-    /// 导出当前工作表为 PDF
-    fn export_pdf(&mut self) {
-        let Some(out) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name(format!("{}.pdf", self.wb.sheet(self.sheet_idx).name))
-            .save_file()
-        else {
-            return;
-        };
-        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-        if !font.exists() {
-            self.status = "找不到 C:/Windows/Fonts/simhei.ttf，无法导出 PDF".into();
-            return;
-        }
-        match sheetcore::print::export_pdf_from(&self.wb, self.sheet_idx, &out, font, self.wb.path.as_deref()) {
-            Ok(n) => self.status = format!("已导出 {n} 页到 {}", out.display()),
-            Err(e) => self.status = format!("导出失败：{e:#}"),
-        }
-    }
+
 
     /// 把 vbaProject.bin 导出来
     fn export_macro_part(&mut self) {
@@ -29002,6 +28726,8 @@ impl eframe::App for SheetApp {
         self.find_all_window(ctx);
         self.data_dialog(ctx);
         self.cf_manager(ctx);
+        self.cf_quick_window(ctx);
+        self.dv_quick_window(ctx);
         if std::env::var("SC_PREVIEW").is_ok() && self.tasks.open_rx.is_none() {
             self.print_preview = true;
         }

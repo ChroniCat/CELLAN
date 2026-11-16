@@ -8396,3 +8396,30 @@ fn macro_run_button_opens_the_runner_when_vba_exists() {
     app.ribbon_action("MacroRun", &ctx);
     assert!(app.macro_run_dlg.is_some(), "运行宏按钮要打开宏名输入框");
 }
+
+#[test]
+fn legacy_cf_and_dv_menus_are_reachable_from_the_ribbon() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.ribbon_action("CfQuick", &ctx);
+    assert!(app.cf_quick, "条件格式快捷规则没打开");
+    assert!(app.unhandled_action.is_none(), "CfQuick 没有 dispatch 臂");
+    app.ribbon_action("DvQuick", &ctx);
+    assert!(app.dv_quick, "数据验证快捷设置没打开");
+    assert!(app.unhandled_action.is_none(), "DvQuick 没有 dispatch 臂");
+}
+
+#[test]
+fn cf_quick_window_renders_without_panicking() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.ribbon_action("CfQuick", &ctx);
+    let input = egui::RawInput::default();
+    let mut drawn = 0usize;
+    let _ = ctx.run(input, |ctx| {
+        app.cf_quick_window(ctx);
+        drawn += 1;
+    });
+    assert_eq!(drawn, 1);
+    assert!(app.cf_quick, "窗口自己不该被关掉");
+}
