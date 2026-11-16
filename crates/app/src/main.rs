@@ -3301,6 +3301,9 @@ impl SheetApp {
         for msg in msgs {
             match msg {
                 OpenMsg::Loaded(wb, big, diag) => {
+                    if std::env::var("SC_LOAD_PROF").is_ok() {
+                        eprintln!("[open] editable {:.3}s", since_start());
+                    }
                     self.deps_pending = big;
                     let compat = diag.problems.iter().any(|p| !p.fatal && p.what == "兼容提示");
                     self.load_diag = if diag.is_complete() { None } else { Some(*diag) };
@@ -28086,6 +28089,9 @@ impl eframe::App for SheetApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         system_fonts::begin_frame();
+        if ctx.cumulative_pass_nr() == 1 && std::env::var("SC_LOAD_PROF").is_ok() {
+            eprintln!("[boot] first_frame {:.3}s", since_start());
+        }
         // UI-11.6 无界面探针：SC_UI116=1 时在固定帧走一遍「编辑中切表取引用 → 回车写回原格」
         if std::env::var("SC_UI116").is_ok() {
             let pass = ctx.cumulative_pass_nr();
@@ -30407,7 +30413,16 @@ fn font_defs() -> egui::FontDefinitions {
     fonts
 }
 
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 距进程启动的秒数（SC_LOAD_PROF 探针用）
+fn since_start() -> f64 {
+    START.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+}
+
 fn main() -> eframe::Result<()> {
+    // QA-07：进程起点，用于量「冷启动 → 首帧」「打开 → 可编辑」
+    let _ = START.set(std::time::Instant::now());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial: Option<PathBuf> = None;
     let mut auto_host = false;

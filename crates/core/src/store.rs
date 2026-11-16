@@ -26,16 +26,18 @@ struct Page {
 
 impl Page {
     fn ensure(&mut self, r_off: u32, c: u32) {
-        if r_off >= self.n_rows {
-            self.n_rows = r_off + 1;
-        }
         if self.cols.len() <= c as usize {
             self.cols.resize_with(c as usize + 1, Vec::new);
         }
-        for col in self.cols.iter_mut() {
-            if col.len() < self.n_rows as usize {
-                col.resize_with(self.n_rows as usize, Cell::default);
-            }
+        // 只把**目标列**补到需要的行数。早先是把页里所有列都补到 n_rows，
+        // 稀疏远端行（比如 A1000000）会让每个被碰到的页给全部列各开 256 个槽，
+        // 1 万个散点就能吃到 130MB+（QA-07 基线实测 slots=3.4M × 40B）。
+        let col = &mut self.cols[c as usize];
+        if col.len() <= r_off as usize {
+            col.resize_with(r_off as usize + 1, Cell::default);
+        }
+        if r_off >= self.n_rows {
+            self.n_rows = r_off + 1;
         }
     }
 
@@ -71,6 +73,18 @@ pub struct Store {
 impl Store {
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// 诊断用：返回 (页数, 列基调槽数, 这些槽位里的 Cell 数)。
+    /// 稀疏远端行会让每个被碰到的页都按整页行数分配列槽，用这个核对内存来源。
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let mut slabs = 0usize;
+        let mut slots = 0usize;
+        for p in self.pages.values() {
+            slabs += p.cols.len();
+            slots += p.cols.iter().map(|c| c.capacity()).sum::<usize>();
+        }
+        (self.pages.len(), slabs, slots)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -252,6 +266,42 @@ mod tests {
 
     fn num(v: f64) -> Cell {
         Cell { value: Value::Number(v), formula: None }
+    }
+
+    #[test]
+    fn sparse_far_rows_do_not_allocate_full_page_slabs() {
+        // QA-07 基线发现：往 A1000000 这种远端格子写值，早先每页给所有列各开 256 槽，
+        // 1 万个散点 → 340 万个槽（约 137MB）。修好后每个散点只占自己那一列的少量槽。
+        let mut s = Store::default();
+        for i in 0..10_000u32 {
+            s.set(i * 104, 3, num(i as f64));
+        }
+        assert_eq!(s.len(), 10_000);
+        let (pages, _slabs, slots) = s.stats();
+        assert!(pages > 1000, "页数不真实：{pages}");
+        assert!(
+            slots < 1_200_000,
+            "稀疏写入的槽位数仍然过大：{slots}（页 {pages}）"
+        );
+        // 值必须都读得回来，且相邻页边界两侧都对
+        assert_eq!(s.get(0, 3).unwrap().value.clone(), Value::Number(0.0));
+        assert_eq!(s.get(104 * 9_999, 3).unwrap().value.clone(), Value::Number(9_999.0));
+        let n = s.iter().count();
+        assert_eq!(n, 10_000);
+    }
+
+    #[test]
+    fn dense_and_sparse_columns_coexist_in_one_page() {
+        // 同一页里 A 列密集、D 列只在远端有值：两列各自长度不同也不能读错
+        let mut s = Store::default();
+        for r in 0..256u32 {
+            s.set(r, 0, num(r as f64));
+        }
+        s.set(200, 3, num(42.0));
+        assert_eq!(s.get(200, 3).unwrap().value.clone(), Value::Number(42.0));
+        assert!(s.get(201, 3).is_none());
+        assert_eq!(s.get(255, 0).unwrap().value.clone(), Value::Number(255.0));
+        assert_eq!(s.iter().count(), 257);
     }
 
     #[test]

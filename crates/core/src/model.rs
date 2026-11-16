@@ -341,6 +341,11 @@ impl Sheet {
         self.cells.len()
     }
 
+    /// 诊断用：转发到 Store::stats（页数 / 列基调槽数 / 槽位里的 Cell 数）。
+    pub fn cells_stats(&self) -> (usize, usize, usize) {
+        self.cells.stats()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }
