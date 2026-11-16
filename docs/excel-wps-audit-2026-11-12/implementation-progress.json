@@ -4124,7 +4124,7 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-04.1 实施中（Ctrl+S/Z/Y 已补；原生输入受无交互桌面阻塞）；QA-04.2 IME 阻塞；QA-04.3 已验收（后台结果归属已修为 doc_gen+epoch 双条件）。"
+        "QA-04.3 已验收；QA-04.2 剪贴板四方向已通、IME 仍阻塞；QA-04.1 原生输入受无交互桌面阻塞。"
       ],
       "failures": [],
       "blocker": "",
@@ -4167,13 +4167,29 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
+          "status": "实施中",
+          "acceptance": "剪贴板四方向逐格比对全部一致；IME 端到端仍阻塞。",
+          "files": [
+            "crates/app/src/office_clipboard.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commands": [
+            "powershell -File work/probe/qa042/excel_to_app.ps1 -> Excel→app 15/15 一致",
+            "powershell -File work/probe/qa042/wps_to_app.ps1 -> WPS→app 15/15 一致",
+            "powershell -File work/probe/qa042/app_to_excel.ps1 -> app→Excel 15/15（含 =1+2）",
+            "powershell -File work/probe/qa042/app_to_wps.ps1 + excel_to_wps.ps1 -> app→WPS 与 Excel→WPS 逐格相同（WPS 丢公式是 WPS 限制）",
+            "cargo test -p app -- --test-threads=2 -> 357 passed（work/goal-logs/qa042-app2.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042-clipboard.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042/"
+          ],
+          "not_done": [
+            "中文 IME 候选/选词/Enter 不多跳格：本机无交互桌面，SendInput 无效，未测。",
+            "粘贴不带列宽/行高（与 Excel 默认行为一致，未做 Paste Special）。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",

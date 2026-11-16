@@ -9619,3 +9619,39 @@ fn find_all_window_with_no_hits_shows_empty_state() {
     );
 }
 
+#[test]
+fn pasting_text_that_looks_numeric_keeps_leading_zeros() {
+    // Excel 的 XMLSS 对文本格给 `ss:Type="String">00123`，对数字格给 `Type="Number"`。
+    // 只要按「文本长什么样」去 parse::<f64>，"00123" 就变成 123，前导零丢失。
+    let mut app = app();
+    app.sel = (0, 0);
+    let xml = r#"<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Worksheet ss:Name="Sheet1"><Table>
+  <Row>
+   <Cell ss:StyleID="s62"><Data ss:Type="String">00123</Data></Cell>
+   <Cell><Data ss:Type="Number">123</Data></Cell>
+   <Cell><Data ss:Type="String">1,234</Data></Cell>
+   <Cell><Data ss:Type="String">2023-03-15</Data></Cell>
+  </Row>
+ </Table></Worksheet></Workbook>"#;
+    let block = office_clipboard::convert_block(sheetcore::clipboard_xmlss::parse(xml));
+    assert!(app.paste_office_block(&block), "粘贴被拒绝");
+    assert_eq!(
+        app.wb.sheets[0].value(0, 0),
+        Value::Text("00123".into()),
+        "字符串 00123 被转成了数字"
+    );
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(123.0));
+    assert_eq!(
+        app.wb.sheets[0].value(0, 2),
+        Value::Text("1,234".into()),
+        "字符串带千分位必须保持文本"
+    );
+    assert_eq!(
+        app.wb.sheets[0].value(0, 3),
+        Value::Text("2023-03-15".into()),
+        "Type=String 的日期文本不能按日期序列号落格"
+    );
+}

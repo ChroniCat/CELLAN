@@ -19,11 +19,19 @@ unsafe extern "system" {
     fn RegisterClipboardFormatW(name: *const u16) -> u32;
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn EmptyClipboard() -> i32;
+    fn SetClipboardData(format: u32, mem: *mut c_void) -> *mut c_void;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GlobalLock(mem: *mut c_void) -> *mut c_void;
     fn GlobalUnlock(mem: *mut c_void) -> i32;
     fn GlobalSize(mem: *mut c_void) -> usize;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+    fn GlobalFree(mem: *mut c_void) -> *mut c_void;
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -597,4 +605,247 @@ fn read_format_raw(fmt: u32) -> Option<Vec<u8>> {
         CloseClipboard();
         Some(buf)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 写出：让 Excel/WPS 粘贴时也能拿到公式、数字格式和日期类型
+// ---------------------------------------------------------------------------
+
+/// `CF_HTML` 头：Excel/WPS 都按这四个偏移切片段，偏移是**字节**数（UTF-8）。
+fn cf_html(fragment: &str) -> Vec<u8> {
+    // CF_HTML 必须是完整文档：只给片段时 Excel 认得出格式却粘不动（报「无法粘贴数据」）。
+    // 行尾用运行时构造的 CRLF，避免源码里的转义被行尾处理吃掉。
+    let crlf = String::from_utf8(vec![13u8, 10u8]).unwrap();
+    let head_tpl = format!(
+        "Version:1.0{crlf}StartHTML:0000000000{crlf}EndHTML:0000000000{crlf}StartFragment:0000000000{crlf}EndFragment:0000000000{crlf}"
+    );
+    let doc_head = "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>";
+    let doc_tail = "</body></html>";
+    let marker_s = "<!--StartFragment-->";
+    let marker_e = "<!--EndFragment-->";
+    let sf = head_tpl.len() + doc_head.len() + marker_s.len();
+    let ef = sf + fragment.len();
+    let end = ef + marker_e.len() + doc_tail.len();
+    let text = format!(
+        "Version:1.0{crlf}StartHTML:{:010}{crlf}EndHTML:{:010}{crlf}StartFragment:{:010}{crlf}EndFragment:{:010}{crlf}{doc_head}{marker_s}{fragment}{marker_e}{doc_tail}",
+        head_tpl.len(),
+        end,
+        sf,
+        ef
+    );
+    debug_assert_eq!(text.len(), end, "CF_HTML 偏移算错");
+    text.into_bytes()
+}
+fn alloc_global(bytes: &[u8]) -> *mut c_void {
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
+        if h.is_null() {
+            return h;
+        }
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            GlobalFree(h);
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        GlobalUnlock(h);
+        h
+    }
+}
+
+/// 一次写入三种格式：XML Spreadsheet（公式/类型/格式）、HTML（底色/合并）、纯文本。
+///
+/// arboard 只能写 HTML/文本，没有 XMLSS flavor；Excel 粘 HTML 时公式会退化成值，
+/// 所以这里直接走 Win32，三种格式同一时刻落到剪贴板上。
+pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
+    let mut xmlss_bytes = xmlss.as_bytes().to_vec();
+    xmlss_bytes.push(0);
+    let mut text_utf16: Vec<u8> = Vec::with_capacity(text.len() * 2 + 2);
+    for u in text.encode_utf16() {
+        text_utf16.extend_from_slice(&u.to_le_bytes());
+    }
+    text_utf16.extend_from_slice(&[0, 0]);
+    let html_bytes = cf_html(html);
+
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        // 别的进程/本进程的 arboard 实例可能正开着剪贴板：重试几次再放弃。
+        let mut opened = false;
+        for _ in 0..8 {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        if !opened {
+            if std::env::var("SC_CLIP_LOG").is_ok() {
+                eprintln!("[clip] OpenClipboard 失败，错误 {}", std::io::Error::last_os_error());
+            }
+            return false;
+        }
+        EmptyClipboard();
+        let mut ok = true;
+        let mut put = |fmt: u32, bytes: &[u8]| {
+            let h = alloc_global(bytes);
+            if h.is_null() || SetClipboardData(fmt, h).is_null() {
+                if !h.is_null() {
+                    GlobalFree(h);
+                }
+                ok = false;
+            }
+        };
+        let xml_fmt = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
+        if xml_fmt != 0 {
+            put(xml_fmt, &xmlss_bytes);
+        }
+        let html_fmt = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
+        if html_fmt != 0 {
+            put(html_fmt, &html_bytes);
+        }
+        put(CF_UNICODETEXT, &text_utf16);
+        CloseClipboard();
+        ok
+    }
+}
+
+/// 把选区写成 XML Spreadsheet 文本（公式转 R1C1，日期写 DateTime，文本保前导零）。
+pub fn build_xmlss(
+    wb: &sheetcore::Workbook,
+    si: usize,
+    rect: (u32, u32, u32, u32),
+    style_key: &dyn Fn(&sheetcore::style::CellStyle) -> String,
+) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    let (r1, c1, r2, c2) = rect;
+    let sh = wb.sheet(si);
+    let mut ids: BTreeMap<String, usize> = BTreeMap::new();
+    let mut style_xml = String::new();
+    let mut id_of = |st: &sheetcore::style::CellStyle, ids: &mut BTreeMap<String, usize>| -> String {
+        let key = style_key(st);
+        if let Some(i) = ids.get(&key) {
+            return format!("sc{i}");
+        }
+        let i = ids.len();
+        ids.insert(key, i);
+        let _ = write!(
+            style_xml,
+            "<Style ss:ID=\"sc{i}\"><Alignment ss:Vertical=\"Center\"/><Font ss:FontName=\"{font}\" ss:Size=\"{size}\"{bold}{italic}{color}/>{fill}{fmt}</Style>",
+            font = if st.font.is_empty() { "等线".to_string() } else { st.font.clone() },
+            size = if st.size > 0.0 { st.size } else { 11.0 },
+            bold = if st.bold { " ss:Bold=\"1\"" } else { "" },
+            italic = if st.italic { " ss:Italic=\"1\"" } else { "" },
+            color = {
+                let c = st.color;
+                format!(" ss:Color=\"#{:02X}{:02X}{:02X}\"", c[0], c[1], c[2])
+            },
+            fill = st
+                .fill
+                .map(|f| format!(
+                    "<Interior ss:Color=\"#{:02X}{:02X}{:02X}\" ss:Pattern=\"Solid\"/>",
+                    f[0], f[1], f[2]
+                ))
+                .unwrap_or_default(),
+            fmt = if st.format.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<NumberFormat ss:Format=\"{}\"/>",
+                    st.format.replace('"', "&quot;")
+                )
+            }
+        );
+        format!("sc{i}")
+    };
+
+    let merges: Vec<(u32, u32, u32, u32)> = sh.merges.clone();
+    let covered = |r: u32, c: u32| {
+        merges
+            .iter()
+            .any(|(a, b, cc, dd)| r >= *a && c >= *b && r <= *cc && c <= *dd && (r, c) != (*a, *b))
+    };
+    let anchor_merge = |r: u32, c: u32| merges.iter().find(|(a, b, _, _)| *a == r && *b == c).copied();
+
+    let mut body = String::new();
+    for r in r1..=r2 {
+        body.push_str("<Row>");
+        for c in c1..=c2 {
+            if covered(r, c) {
+                continue;
+            }
+            let cell = sh.get(r, c).cloned().unwrap_or_default();
+            let st = wb.styles.get(sh.style_of(r, c));
+            let sid = id_of(&st, &mut ids);
+            let mut attrs = format!(" ss:StyleID=\"{sid}\"");
+            // merges 里是 (r1, c1, r2, c2)：横向跨列写 MergeAcross，纵向跨行写 MergeDown。
+            // 写反了 Excel 会直接拒绝整个 XML Spreadsheet（连值都粘不进来）。
+            if let Some((a, b, cc, dd)) = anchor_merge(r, c) {
+                if dd > b {
+                    let _ = write!(attrs, " ss:MergeAcross=\"{}\"", dd - b);
+                }
+                if cc > a {
+                    let _ = write!(attrs, " ss:MergeDown=\"{}\"", cc - a);
+                }
+            }
+            let (ty, data) = match &cell.value {
+                sheetcore::Value::Empty => ("String", String::new()),
+                sheetcore::Value::Number(n) => {
+                    let is_date = st.format.to_lowercase().contains('y')
+                        && (st.format.contains('-') || st.format.contains('/'));
+                    if is_date {
+                        match wb.serial_to_date(*n) {
+                            Some((y, m, d)) => {
+                                ("DateTime", format!("{y:04}-{m:02}-{d:02}T00:00:00.000"))
+                            }
+                            None => ("Number", format!("{n}")),
+                        }
+                    } else {
+                        ("Number", format!("{n}"))
+                    }
+                }
+                sheetcore::Value::Text(t) => ("String", t.to_string()),
+                sheetcore::Value::Bool(b) => ("Boolean", if *b { "1".into() } else { "0".into() }),
+                sheetcore::Value::Error(e) => ("Error", e.text().to_string()),
+            };
+            // 公式按 Excel 自己的写法放在 Cell 的 ss:Formula 属性上（A1 引用），
+            // Data 里放缓存值；写成 <ss:Formula> 子元素 Excel 会拒绝粘贴。
+            if let Some(f) = cell.formula.as_deref() {
+                let _ = write!(attrs, " ss:Formula=\"{}\"", xml_escape(f));
+            }
+            body.push_str("<Cell");
+            body.push_str(&attrs);
+            if data.is_empty() {
+                body.push_str("/>");
+            } else {
+                body.push('>');
+                let _ = write!(body, "<Data ss:Type=\"{ty}\">{}</Data>", xml_escape(&data));
+                body.push_str("</Cell>");
+            }
+        }
+        body.push_str("</Row>");
+    }
+    format!(
+        "<?xml version=\"1.0\"?>
+<?mso-application progid=\"Excel.Sheet\"?>
+<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"
+ xmlns:o=\"urn:schemas-microsoft-com:office:office\"
+ xmlns:x=\"urn:schemas-microsoft-com:office:excel\"
+ xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\"
+ xmlns:html=\"http://www.w3.org/TR/REC-html40\">
+<Styles><Style ss:ID=\"Default\" ss:Name=\"Normal\"><Alignment ss:Vertical=\"Center\"/><Borders/><Font ss:FontName=\"等线\" ss:Size=\"11\"/><Interior/><NumberFormat/><Protection/></Style>{style_xml}</Styles>
+<Worksheet ss:Name=\"{}\"><Table ss:ExpandedColumnCount=\"{cols}\" ss:ExpandedRowCount=\"{rows}\">{body}</Table></Worksheet>
+</Workbook>",
+        xml_escape(&sh.name),
+        cols = c2 - c1 + 1,
+        rows = r2 - r1 + 1
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }

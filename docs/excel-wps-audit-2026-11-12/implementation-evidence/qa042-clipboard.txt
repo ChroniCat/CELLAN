@@ -1,0 +1,81 @@
+# QA-04.2 剪贴板三方互通（Excel ↔ 本应用 ↔ WPS）
+
+日期：2026-11-17　被测构建：本机 release/glow
+
+## 1. 这一轮做到哪
+
+QA-04.2 的标题是「IME/剪贴板三方互通」。剪贴板部分（验收场景 ⑥：跨 Excel/WPS 复制含
+中文、日期、前导零、公式、合并、格式）本轮**四个方向全部跑通并逐格比对**；IME 部分仍受
+「本机无交互桌面」阻塞（见第 6 节），因此切片保持**实施中**，不是已验收。
+
+## 2. 样本
+
+一张 5 列 × 3 行的表，每列压一个验收点：
+
+| 位置 | 内容 | 覆盖点 |
+|---|---|---|
+| A1 | `00123`（文本格式 `@`） | 前导零 |
+| B1 | `中文测试` | 中文 |
+| C1 | 45000，格式 `yyyy-mm-dd` | 日期 |
+| D1 | `=1+2`（值 3） | 公式 |
+| E1 | `粗体`，加粗 + 黄底 + 四边细线 | 字体/底色/边框 |
+| A2:B2 | 合并 + `合并单元格` + 浅蓝底 | 合并 |
+| A3 | 42 | 普通数字 |
+
+## 3. 方法
+
+每个方向都用同一张表，并把**目标软件自己的粘贴结果**当黄金样本，而不是拿我们的回读当标准：
+
+1. 源程序建表 → `Range.Copy` → 在同一个文件里 `Paste` 到 A6（黄金样本）→ 存盘。
+2. 再做一次 `Range.Copy`，让剪贴板上留着刚生成的格式。
+3. 起本应用，`SC_PASTE_AT=5,0`（A6）+ `SC_PASTE_HTML=1` → 粘贴 → `SC_SAVE` 存盘。
+4. 两份文件都用 Excel COM 读同一区域，逐格比 `Value2 / Formula / NumberFormat /
+   Font.Bold / Interior.Color / MergeCells` 七项。
+
+反方向（本应用 → Excel/WPS）用 `SC_RIBBON_SEL=0,0,2,4` + `SC_RIBBON_ACTION=Copy`
+触发真实的复制命令，再由 Excel/WPS `Paste` 到空簿 A1，存盘后同样七项比对。
+
+## 4. 结果
+
+| 方向 | 比对 | 结果 |
+|---|---|---|
+| Excel → 本应用 | 15 格 × 7 项 vs Excel 自己粘到 A6 | **15/15 完全一致** |
+| WPS → 本应用 | 15 格 × 7 项 vs WPS 自己粘到 A6 | **15/15 完全一致** |
+| 本应用 → Excel | 15 格 × 7 项 vs 源区域 | **15/15 完全一致（含公式 `=1+2`）** |
+| 本应用 → WPS | 15 格 × 7 项 vs **Excel → WPS** 的同一份数据 | **15/15 一致** |
+
+WPS 那行的对照是专门的：`Excel → WPS` 单独跑了一遍（`excel_to_wps.ps1`），WPS 把 Excel 的
+剪贴板粘进来同样丢掉公式（`D1f=3`），所以「本应用 → WPS 丢公式」不是我们的缺陷，
+而是 WPS 不认任何来源的 XMLSS 公式。两边结果逐格相同。
+
+## 5. 过程中抓到的四个真实缺陷（都已修）
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 本应用 → Excel 粘出来公式变成值（`D1` 只有 3） | 复制只写了 HTML + 纯文本，没有 XML Spreadsheet flavor | 新增 `office_clipboard::write_office_clipboard`，用 Win32 一次写 XMLSS/HTML/UnicodeText 三种 flavor；`build_xmlss` 按选区生成（公式转 `ss:Formula` 属性、日期写 `DateTime`、文本保前导零） |
+| 2 | Excel 直接报「无法粘贴数据」，整块粘不进去 | XMLSS 里合并方向写反：`(r1,c1,r2,c2)` 当成 `(r1,c1,r2,c2)` 用时把**行差**写进了 `ss:MergeAcross`（A2:B2 写成 `MergeDown="1"`） | 换成 `MergeAcross = c2-c1`、`MergeDown = r2-r1`；修好后同一个文件 15/15 |
+| 3 | 从 Excel 粘 `00123` 变成数字 123 | 粘贴时按「文本长得像数字」`parse::<f64>()`，无视 XMLSS 的 `ss:Type="String"` | 只有 `kind == 0`（Number）才转数字；`String` 一律按文本落格，HTML 路径的 `x:str` 同样处理 |
+| 4 | Excel 认得出 HTML 格式却粘不动（报「无法粘贴数据」/「不能取得 Paste 属性」） | `CF_HTML` 只写了片段，没有 `<html><head><body>` 完整文档 | `cf_html` 生成完整文档并在头里按字节算 StartHTML/StartFragment/EndFragment |
+
+诊断过程记在 `work/probe/qa042/`：把 XMLSS 内容从文件灌进剪贴板的探针 + 逐项删属性
+（`v11` 去全部 Cell 属性通过、`v13/v14` 保留合并失败、`v15` 只去合并通过）定位到合并方向。
+这组变体文件保留在 `work/probe/qa042/v*.xml` 便于复现。
+
+## 6. 仍未完成
+
+- **中文 IME 端到端**（候选窗选词、Enter 不多跳格）：本会话 `GetForegroundWindow()=0`，
+  `SendInput` 静默失败，无法在有交互桌面的机器之外验证。与 QA-04.1 同一阻塞。
+- 「粘贴保留列宽/行高」不在本轮样本内（Excel 跨簿粘贴默认也不带列宽，需 Paste Special）。
+- 本应用 → WPS 的公式丢失与 Excel → WPS 完全相同，属 WPS 限制；若以后要求「WPS 也保留」，
+  只能改写 Biff8/Biff12，超出本轮范围。
+
+## 7. 复跑
+
+```powershell
+powershell -File work/probe/qa042/excel_to_app.ps1     # Excel 建表 + 黄金样本 + 起 app 粘
+powershell -File work/probe/qa042/dump_range.ps1 -Path ...\golden.xlsx -Range A6:E8
+powershell -File work/probe/qa042/app_to_excel.ps1     # app 复制 → Excel 粘
+powershell -File work/probe/qa042/wps_to_app.ps1       # WPS 建表 + 起 app 粘
+powershell -File work/probe/qa042/app_to_wps.ps1       # app 复制 → WPS 粘
+powershell -File work/probe/qa042/excel_to_wps.ps1     # 对照组：Excel 复制 → WPS 粘
+```

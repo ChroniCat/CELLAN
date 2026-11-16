@@ -5744,10 +5744,19 @@ impl SheetApp {
         if std::env::var("SC_CLIP_LOG").is_ok() {
             eprintln!("[clip-html] {html}");
         }
-        let html_ok = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut cb| cb.set_html(html.clone(), Some(tsv.clone())).ok())
-            .is_some();
+        // 三种 flavor 一起写：XMLSS 带公式/类型/数字格式，HTML 带底色/合并，纯文本兜底。
+        // 只写 HTML 时 Excel 粘到的公式会退化成值（D1 变成 3），三方互通会丢公式。
+        let style_key = |st: &sheetcore::style::CellStyle| {
+            format!(
+                "{}|{}|{}|{}|{:?}|{:?}|{}",
+                st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format
+            )
+        };
+        let xmlss = office_clipboard::build_xmlss(&self.wb, si, (r1, c1, r2, c2), &style_key);
+        if std::env::var("SC_CLIP_LOG").is_ok() {
+            eprintln!("[clip-xmlss] {}", &xmlss[..xmlss.len().min(400)]);
+        }
+        let html_ok = office_clipboard::write_office_clipboard(&xmlss, &html, &tsv);
         if !html_ok {
             ctx.copy_text(tsv.clone());
         }
@@ -7606,8 +7615,11 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         Value::Empty
                     } else if cell.kind == 2 {
                         Value::Bool(raw == "1" || raw.eq_ignore_ascii_case("true"))
-                    } else if let Ok(n) = raw.replace(',', "").parse::<f64>() {
-                        Value::Number(n)
+                    } else if cell.kind == 0 {
+                        match raw.replace(',', "").parse::<f64>() {
+                            Ok(n) => Value::Number(n),
+                            Err(_) => Value::Text(raw.into()),
+                        }
                     } else {
                         Value::Text(raw.into())
                     }
@@ -7635,8 +7647,13 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         }
                         None => Value::Text(text.into()),
                     }
-                } else if let Ok(n) = text.replace(',', "").parse::<f64>() {
-                    Value::Number(n)
+                } else if cell.kind == 0 {
+                    // 只有 XMLSS 标成 Number 的才按数字落格；Text 一律保持文本，
+                    // 否则 "00123" 这类前导零文本会被 f64 吃掉零（Excel 自己粘不丢）。
+                    match text.replace(',', "").parse::<f64>() {
+                        Ok(n) => Value::Number(n),
+                        Err(_) => Value::Text(text.into()),
+                    }
                 } else {
                     Value::Text(text.into())
                 };
@@ -26904,8 +26921,16 @@ let txn = self.txn_begin(&keys);
             return;
         }
         self.paste_done = true;
-        self.sel = (0, 0);
-        self.sel_end = (0, 0);
+        // SC_PASTE_AT="行,列"（0 基）指定粘贴左上角，默认 A1
+        let at = std::env::var("SC_PASTE_AT")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|x| x.trim().parse::<u32>().ok());
+                Some((it.next()??, it.next()??))
+            })
+            .unwrap_or((0, 0));
+        self.sel = at;
+        self.sel_end = at;
         match office_clipboard::read_table() {
             Some(block) => {
                 eprintln!("[paste] 读到表格 {} 行 × {} 列", block.rows.len(), block.cols());
@@ -26936,6 +26961,35 @@ let txn = self.txn_begin(&keys);
                 }
             }
             None => eprintln!("[paste] 剪贴板里没有 HTML 表格"),
+        }
+        // SC_PASTE_DUMP="r1,c1,r2,c2"：把粘贴结果按格打印，供三方对拍脚本比对
+        if let Ok(spec) = std::env::var("SC_PASTE_DUMP") {
+            let n: Vec<u32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if n.len() == 4 {
+                let sh = self.wb.sheet(self.sheet_idx);
+                for r in n[0]..=n[2] {
+                    for c in n[1]..=n[3] {
+                        let (val, formula, fmt, bold, fill) = match sh.get(r, c) {
+                            Some(cell) => {
+                                let sid = sh.style_of(r, c);
+                                let st = self.wb.styles.get(sid);
+                                (
+                                    cell.value.display(),
+                                    cell.formula.as_deref().unwrap_or("").to_string(),
+                                    st.format.clone(),
+                                    st.bold,
+                                    st.fill.map(|f| format!("{f:?}")).unwrap_or_default(),
+                                )
+                            }
+                            None => (String::new(), String::new(), String::new(), false, String::new()),
+                        };
+                        eprintln!(
+                            "[dump] ({r},{c}) v={val:?} f={formula:?} fmt={fmt:?} bold={bold} fill={fill:?}"
+                        );
+                    }
+                }
+                eprintln!("[dump] merges={:?}", sh.merges);
+            }
         }
         if std::env::var("SC_PASTE_CHECK").is_ok() {
             // 改一下被引用的格子，看粘进来的公式是不是活的
