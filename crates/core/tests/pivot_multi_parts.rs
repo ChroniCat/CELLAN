@@ -141,21 +141,25 @@ fn two_value_fields_register_two_data_fields() {
     );
 }
 
+/// 多值但无列字段：Excel 用纯 -2 数据轴表达（gold E 实测），我们照做而不是拒绝。
 #[test]
-fn multi_value_without_column_field_is_rejected_instead_of_written_broken() {
-    let f = Fixture::new("reject");
+fn multi_value_without_column_field_uses_pure_value_axis() {
+    let f = Fixture::new("purevalue");
     let path = f.file("c.xlsx");
     let mut wb = book(&path);
     let mut spec = spec_b();
     spec.cols.clear();
     let grid = pivot_multi::compute(&wb.sheets[0], &spec);
     let rect = pivot_multi::write_grid(&mut wb.sheets[0], (8, 0), &grid);
-    let err = sheetcore::pivot_xml::attach2_for_session(&path, "Data", &spec, &grid, rect, "test")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("多值透视必须带列字段"), "{err}");
+    let id = sheetcore::pivot_xml::attach2_for_session(&path, "Data", &spec, &grid, rect, "test")
+        .expect("纯值轴应可生成");
+    assert_eq!(id, 1);
+    let xml = String::from_utf8(
+        sheetcore::fixups::read_part(&path, "xl/pivotTables/pivotTable1.xml").expect("缺部件"),
+    )
+    .unwrap();
+    assert!(xml.contains("<colFields count=\"1\"><field x=\"-2\"/></colFields>"), "{xml}");
 }
-
 /// 保存路径：pivots_pending2 里的多字段透视必须真的写成 pivotTable 部件。
 #[test]
 fn save_attaches_multi_field_pivot_parts() {
@@ -213,4 +217,48 @@ fn two_column_fields_are_both_marked_as_axis_fields() {
     .unwrap();
     assert_eq!(xml.matches("axis=\"axisCol\"").count(), 2, "列字段标轴数量不对：{xml}");
     assert!(xml.contains("<field x=\"1\"/><field x=\"3\"/>"), "colFields 顺序不对：{xml}");
+}
+
+fn spec_e() -> PivotSpec2 {
+    PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![],
+        values: vec![
+            ValueField { col: 2, agg: Agg::Sum, label: None },
+            ValueField { col: 2, agg: Agg::Count, label: None },
+            ValueField { col: 2, agg: Agg::Avg, label: None },
+            ValueField { col: 2, agg: Agg::Max, label: None },
+            ValueField { col: 2, agg: Agg::Min, label: None },
+        ],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    }
+}
+
+/// 非求和聚合必须写 subtotal，否则 Excel 一律按求和重算；无列字段时列轴是纯 -2 数据轴。
+#[test]
+fn non_sum_aggregations_write_subtotal_attribute() {
+    let f = Fixture::new("aggs");
+    let path = f.file("e.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_e();
+    let (id, _rows) = attach(&path, &mut wb, &spec);
+    assert_eq!(id, 1);
+    let xml = String::from_utf8(
+        sheetcore::fixups::read_part(&path, "xl/pivotTables/pivotTable1.xml").expect("缺 pivotTable 部件"),
+    )
+    .unwrap();
+    for sub in ["count", "average", "max", "min"] {
+        assert!(
+            xml.contains(&format!("subtotal=\"{sub}\"")),
+            "缺 subtotal=\"{sub}\"：{xml}"
+        );
+    }
+    assert!(xml.contains("<dataFields count=\"5\">"), "数据字段数不对：{xml}");
+    assert!(
+        xml.contains("<colFields count=\"1\"><field x=\"-2\"/></colFields>"),
+        "纯值轴应只有 -2 列字段：{xml}"
+    );
+    assert_eq!(xml.matches("<i i=\"").count(), 5, "每个值字段应有一个列项：{xml}");
 }

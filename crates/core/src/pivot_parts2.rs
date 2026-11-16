@@ -60,9 +60,6 @@ pub fn build(
     if spec.values.is_empty() {
         bail!("多字段透视至少需要一个值字段");
     }
-    if spec.cols.is_empty() && spec.values.len() > 1 {
-        bail!("多值透视必须带列字段（Excel 用 -2 数据伪字段表达）");
-    }
     if spec.cols.len() > 1 && spec.values.len() > 1 {
         bail!("多列字段 + 多值字段的组合还没实测，暂不支持");
     }
@@ -172,8 +169,21 @@ pub fn build(
     let mut extra = String::new();
     let n_cols = spec.cols.len();
     if n_cols == 0 {
-        col_items.push_str("<i/>");
-        extra.push_str("<colItems count=\"1\"><i/></colItems>");
+        if k > 1 {
+            // Excel 的纯值轴：colFields 只有数据伪字段，每列一个 <i i="k">
+            let mut items = String::new();
+            for j in 0..k {
+                items.push_str(&format!("<i i=\"{j}\"><x v=\"{j}\"/></i>"));
+            }
+            col_count = k;
+            col_items = items.clone();
+            extra.push_str(&format!(
+                "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"{k}\">{items}</colItems>"
+            ));
+        } else {
+            col_items.push_str("<i/>");
+            extra.push_str("<colItems count=\"1\"><i/></colItems>");
+        }
     } else {
         let col_field_idx: Vec<usize> = spec.cols.iter().map(|f| (f.col - c1) as usize).collect();
         if grid.col_paths.is_empty() {
@@ -353,11 +363,20 @@ pub fn build(
                 .clone()
                 .unwrap_or_else(|| format!("{}{}", agg_label(v.agg), names[(v.col - c1) as usize].clone()));
             let short = label.rsplit_once(':').map(|(_, t)| t.to_string()).unwrap_or(label);
+            // 非求和聚合必须写 subtotal，否则 Excel 一律当求和
+            let sub = match v.agg {
+                Agg::Sum => "",
+                Agg::Count => " subtotal=\"count\"",
+                Agg::Avg => " subtotal=\"average\"",
+                Agg::Max => " subtotal=\"max\"",
+                Agg::Min => " subtotal=\"min\"",
+            };
             format!(
-                "<dataField name=\"{}{}\" fld=\"{}\" baseField=\"0\" baseItem=\"0\"/>",
+                "<dataField name=\"{}{}\" fld=\"{}\"{} baseField=\"0\" baseItem=\"0\"/>",
                 agg_label(v.agg),
                 esc(&short),
-                v.col - c1
+                v.col - c1,
+                sub
             )
         })
         .collect();

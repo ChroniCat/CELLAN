@@ -97,6 +97,33 @@ fn main() {
             filters: vec![],
             layout: PivotLayout::default(),
         },
+        // 1 行 + 5 种聚合、无列字段（Excel 的纯值轴 -2）
+        "E" => PivotSpec2 {
+            source: (0, 0, 6, 3),
+            rows: vec![AxisField { col: 0, group: GroupBy::None }],
+            cols: vec![],
+            values: vec![
+                ValueField { col: 2, agg: Agg::Sum, label: None },
+                ValueField { col: 2, agg: Agg::Count, label: None },
+                ValueField { col: 2, agg: Agg::Avg, label: None },
+                ValueField { col: 2, agg: Agg::Max, label: None },
+                ValueField { col: 2, agg: Agg::Min, label: None },
+            ],
+            filters: vec![],
+            layout: PivotLayout::default(),
+        },
+        // 1 行 + 1 列 + 2 值（求和 + 计数）：subtotal 与 -2 数据轴同时用
+        "F" => PivotSpec2 {
+            source: (0, 0, 6, 3),
+            rows: vec![AxisField { col: 0, group: GroupBy::None }],
+            cols: vec![AxisField { col: 1, group: GroupBy::None }],
+            values: vec![
+                ValueField { col: 2, agg: Agg::Sum, label: None },
+                ValueField { col: 2, agg: Agg::Count, label: None },
+            ],
+            filters: vec![],
+            layout: PivotLayout::default(),
+        },
         other => panic!("未知用例 {other}"),
     };
 
