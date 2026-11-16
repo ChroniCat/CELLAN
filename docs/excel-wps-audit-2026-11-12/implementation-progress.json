@@ -5081,7 +5081,7 @@
       "failures": [],
       "blocker": "",
       "next": "UI-11.6 跨工作表引用（Sheet2!A1）",
-      "updated_utc": "2026-11-16T08:35:29Z",
+      "updated_utc": "2026-11-16T08:37:08Z",
       "slices": [
         {
           "id": "UI-11.1",
@@ -5118,7 +5118,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "输入 =SU 出 SUM/SUMIF 等候选并可键盘选择；=SUM( 显示参数签名；候选接受后光标在末尾。",
           "files": [
             "crates/app/src/main.rs",
@@ -5128,19 +5128,19 @@
             "61c9b67"
           ],
           "commands": [
-            "cargo test -p app --offline -j 2 --bin app -- formula_autocomplete_and_f4 --test-threads=2 -> 1 passed"
+            "cargo test -p app --offline -j 2 --bin app -- formula_autocomplete_and_f4 --test-threads=2 -> 1 passed（=SU 出 SUM/SUMIF、接受后 =SUM( 且有签名、F4 循环）",
+            "cargo test ... -- ui112_autocomplete_can_be_driven_by_arrow_keys_and_enter -> 1 passed（真实 Key 事件：↓ 高亮下移、↑ 上移、首项再↑到末项、Enter/Tab 接受）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
           ],
           "not_done": [
-            "候选只来自 functions::implemented()，未做分类/模糊搜索",
-            "真实键盘上下键未实测"
+            "候选只来自 functions::implemented()，未做分类筛选与模糊搜索"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补函数分类与模糊匹配",
-          "updated_utc": "2026-11-16T07:13:43Z"
+          "next": "候选分类/模糊匹配",
+          "updated_utc": "2026-11-16T08:37:08Z"
         },
         {
           "id": "UI-11.3",
@@ -5148,7 +5148,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "编辑 =A1 时点 B2 变成引用而非意外提交；A1→$A$1→A$1→$A1→A1；引用彩色显示。",
           "files": [
             "crates/app/src/main.rs",
@@ -5156,26 +5156,30 @@
           ],
           "commits": [
             "61c9b67",
-            "911ad41"
+            "911ad41",
+            "b00d923"
           ],
           "commands": [
-            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 313 passed / 0 failed",
-            "cargo test ... -- ui113 -> 4 passed / 0 failed（点选引用、引用着色、layouter 进 galley、Alt+Enter 按光标插行）"
+            "cargo test ... -- ui113 -> 4 passed（点选建立引用、四色引用、layouter 进 galley、Alt+Enter 按光标）",
+            "cargo test ... -- ui115 -> 4 passed（Shift+点/拖动扩区域、行号列标整行整列引用、区域标签助手）",
+            "app.exe + SC_TYPE=\"6:=A1+\" + SC_REF_SIM=\"0,1,14\" -> buf=\"=A1+B1\"，A1 蓝 B1 绿，B1 外套细蓝框",
+            "app.exe + SC_REF_SIM=\"0,0,3,2,14\" -> buf=\"=SUM(A1:C4\"，A1:C4 套蓝框，选区不动"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-ref-pick.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/ui113-edit.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/probe.log"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/probe.log",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-range-ref.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log"
           ],
           "not_done": [
-            "Shift/拖动把引用扩成 A1:B2 未实现（每次点击只建单格引用）",
-            "点行号/列标建 A:A、1:1 引用未实现",
             "跨工作表点选建 Sheet2!A1 未实现"
           ],
           "failures": [],
           "blocker": "",
-          "next": "Shift/拖动扩成区域引用 + 行号列标引用 + 跨表引用",
-          "updated_utc": "2026-11-16T07:42:25Z"
+          "next": "跨工作表引用",
+          "updated_utc": "2026-11-16T08:37:08Z"
         },
         {
           "id": "UI-11.4",
@@ -5183,17 +5187,39 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/fnrecent.rs",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/ribbon/ui.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "7169cc6"
+          ],
+          "commands": [
+            "cargo test ... -- ui114 -> 3 passed（参数名解析/公式拼装、插到光标不叠等号、提交记账最近使用）",
+            "cargo test ... -- fnrecent -> 4 passed（MRU 去重、落盘、公式扫描、菜单兜底）",
+            "app.exe + SC_CMD=InsertFunction + SC_TYPE=\"14:AVERAGE\" + SC_KEYSEQ=\"26:enter\" -> 对话框 620x449，匹配 475→5，applied formula=\"=AVERAGE()\" caret=9"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-fn-wizard.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply3.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply3.log",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard9.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log"
+          ],
+          "not_done": [
+            "向导里点区域填参数未实现（确定后回到编辑态可点，但不是向导内直接取区域）",
+            "分类筛选、帮助链接未实现"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "向导内取参数区域",
+          "updated_utc": "2026-11-16T08:37:08Z"
         }
       ]
     },

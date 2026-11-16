@@ -8185,3 +8185,48 @@ fn ui115_header_click_inserts_whole_column_and_row_reference() {
     assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM(3:3", "行号 = 整行引用");
     assert_eq!(app.pick_rect, Some((2, 0, 2, 16_383)));
 }
+
+#[test]
+fn ui112_autocomplete_can_be_driven_by_arrow_keys_and_enter() {
+    let ctx = egui::Context::default();
+    let help = formula_help("=SU").expect("=SU 应有候选");
+    assert!(help.suggestions.len() >= 2, "至少 SUM / SUMIF 两个候选");
+    let mut selected = 0usize;
+
+    // 先跑一帧让 egui 初始化输入状态
+    let _ = ctx.run(egui::RawInput::default(), |_| {});
+
+    let key = |ctx: &egui::Context, k: egui::Key| {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |_| {});
+    };
+
+    key(&ctx, egui::Key::ArrowDown);
+    assert_eq!(formula_help_keys(&ctx, &help, &mut selected), None, "方向键只移动高亮");
+    assert_eq!(selected, 1, "下移一格");
+    key(&ctx, egui::Key::ArrowUp);
+    let _ = formula_help_keys(&ctx, &help, &mut selected);
+    assert_eq!(selected, 0, "上移回到第一个");
+    key(&ctx, egui::Key::ArrowUp);
+    let _ = formula_help_keys(&ctx, &help, &mut selected);
+    assert_eq!(selected, help.suggestions.len() - 1, "第一项再上移是最后一项");
+    key(&ctx, egui::Key::Enter);
+    assert_eq!(
+        formula_help_keys(&ctx, &help, &mut selected),
+        Some(help.suggestions.len() - 1),
+        "Enter 接受当前高亮"
+    );
+    key(&ctx, egui::Key::Tab);
+    assert_eq!(
+        formula_help_keys(&ctx, &help, &mut selected),
+        Some(help.suggestions.len() - 1),
+        "Tab 也能接受"
+    );
+}
