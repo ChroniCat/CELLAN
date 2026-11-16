@@ -6753,14 +6753,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/u29-1.5.txt"
           ],
           "not_done": [
-            "main.rs 的标题栏/状态栏/对话框 padding 仍是字面量，未迁移到 token（已在 ui29-tokens.md §3 列明）。",
+            "只测浅色主题；深色主题 token 未定义。",
+            "未做 Excel/WPS/本应用三端同场景截图对比（父项 UI-29 验收项）。",
+            "状态栏高度已迁到 tokens::size::STATUS_H；标题栏与对话框内仍有字面量（49 处/标题栏，逐处替换需同步视觉断言，按批次做）。",
             "只测浅色主题；深色主题 token 未定义。",
             "未做 Excel/WPS/本应用三端同场景截图对比（父项 UI-29 验收项）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-16T22:12:36Z"
         },
         {
           "id": "UI-29.2",

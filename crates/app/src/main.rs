@@ -30033,7 +30033,7 @@ impl eframe::App for SheetApp {
 
         // ---- 状态栏（22px，最底部） ----
         egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(if self.show_start { 0.0 } else { 22.0 })
+            .exact_height(if self.show_start { 0.0 } else { crate::tokens::size::STATUS_H })
             .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();

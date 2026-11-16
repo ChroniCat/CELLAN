@@ -55,6 +55,8 @@ pub mod size {
     pub const BTN_MIN_W: f32 = 75.0;
     /// 标准按钮高度
     pub const BTN_H: f32 = 24.0;
+    /// 状态栏高度（Excel 365 实测 22）
+    pub const STATUS_H: f32 = 22.0;
     /// 工作表标签高度（Excel 365 实测 32）
     pub const SHEET_TAB_H: f32 = 32.0;
     /// 工作表标签左右留白（字宽 + 26）
