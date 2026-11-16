@@ -97,44 +97,7 @@ fn attach_impl(
         path, sheet_name, spec, res, out_rect, value_label, cache_id, &plan.table_name, refreshed_by,
     )?;
 
-    // ---------- 写 zip ----------
-    let cache_part = format!("xl/pivotCache/pivotCacheDefinition{cache_id}.xml");
-    let table_part = format!("xl/pivotTables/pivotTable{table_idx}.xml");
-    let cache_rels = format!("xl/pivotCache/_rels/pivotCacheDefinition{cache_id}.xml.rels");
-    let cache_conn = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords\" Target=\"pivotCacheRecords{cache_id}.xml\"/>\
-</Relationships>"
-    );
-    let records_part = format!("xl/pivotCache/pivotCacheRecords{cache_id}.xml");
-
-    // A PivotTable is an implicit worksheet relationship, not a worksheet XML
-    // child. Its own relationship to the cache is also required by OPC.
-    let table_conn = format!(
-        "<Relationships xmlns=\"{PACKAGE_REL_NS}\"><Relationship Id=\"rId1\" Type=\"{REL_NS}/pivotCacheDefinition\" Target=\"../pivotCache/pivotCacheDefinition{cache_id}.xml\"/></Relationships>"
-    );
-    let workbook = add_cache_registration(&plan.workbook, cache_id, &plan.cache_rid)?;
-    let workbook_rels = add_relationship(&plan.workbook_rels, &plan.cache_rid,
-        "pivotCacheDefinition", &format!("pivotCache/pivotCacheDefinition{cache_id}.xml"))?;
-    let sheet_rels = add_relationship(&plan.sheet_rels, &plan.table_rid,
-        "pivotTable", &relative_target(&plan.sheet_part, &table_part))?;
-    let mut types = plan.types.clone();
-    for (part, kind) in [(&cache_part, "pivotCacheDefinition"), (&records_part, "pivotCacheRecords"), (&table_part, "pivotTable")] {
-        let mut tag = BytesStart::new("Override");
-        tag.push_attribute(("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types"));
-        tag.push_attribute(("PartName", format!("/{part}").as_str()));
-        tag.push_attribute(("ContentType", format!("application/vnd.openxmlformats-officedocument.spreadsheetml.{kind}+xml").as_str()));
-        types = append_element(&types, "Types", &[tag])?;
-    }
-    crate::patch::append_entries(path, &[
-        (cache_part, def.into_bytes()), (records_part, records.into_bytes()),
-        (cache_rels, cache_conn.into_bytes()), (table_part.clone(), def_table.into_bytes()),
-        (rels_path(&table_part), table_conn.into_bytes()),
-        ("xl/workbook.xml".into(), workbook), ("xl/_rels/workbook.xml.rels".into(), workbook_rels),
-        (rels_path(&plan.sheet_part), sheet_rels), ("[Content_Types].xml".into(), types),
-    ])?;
-    Ok(cache_id)
+    write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
 
 fn numeric_range(res: &PivotResult, col: usize) -> (Option<f64>, Option<f64>) {
@@ -432,4 +395,83 @@ impl AttachmentPlan {
         Ok(Self { cache_id, table_idx, table_name: format!("数据透视表{table_idx}"), cache_rid,
             table_rid, sheet_part, workbook, workbook_rels, sheet_rels, types })
     }
+}
+/// 把缓存三件套写进包，并注册 workbook/sheet 关系与内容类型。
+#[allow(clippy::too_many_arguments)]
+fn write_parts(
+    path: &Path,
+    plan: &AttachmentPlan,
+    cache_id: u32,
+    table_idx: u32,
+    def: String,
+    records: String,
+    def_table: String,
+) -> Result<u32> {
+    // ---------- 写 zip ----------
+    let cache_part = format!("xl/pivotCache/pivotCacheDefinition{cache_id}.xml");
+    let table_part = format!("xl/pivotTables/pivotTable{table_idx}.xml");
+    let cache_rels = format!("xl/pivotCache/_rels/pivotCacheDefinition{cache_id}.xml.rels");
+    let cache_conn = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords\" Target=\"pivotCacheRecords{cache_id}.xml\"/>\
+</Relationships>"
+    );
+    let records_part = format!("xl/pivotCache/pivotCacheRecords{cache_id}.xml");
+
+    // A PivotTable is an implicit worksheet relationship, not a worksheet XML
+    // child. Its own relationship to the cache is also required by OPC.
+    let table_conn = format!(
+        "<Relationships xmlns=\"{PACKAGE_REL_NS}\"><Relationship Id=\"rId1\" Type=\"{REL_NS}/pivotCacheDefinition\" Target=\"../pivotCache/pivotCacheDefinition{cache_id}.xml\"/></Relationships>"
+    );
+    let workbook = add_cache_registration(&plan.workbook, cache_id, &plan.cache_rid)?;
+    let workbook_rels = add_relationship(&plan.workbook_rels, &plan.cache_rid,
+        "pivotCacheDefinition", &format!("pivotCache/pivotCacheDefinition{cache_id}.xml"))?;
+    let sheet_rels = add_relationship(&plan.sheet_rels, &plan.table_rid,
+        "pivotTable", &relative_target(&plan.sheet_part, &table_part))?;
+    let mut types = plan.types.clone();
+    for (part, kind) in [(&cache_part, "pivotCacheDefinition"), (&records_part, "pivotCacheRecords"), (&table_part, "pivotTable")] {
+        let mut tag = BytesStart::new("Override");
+        tag.push_attribute(("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types"));
+        tag.push_attribute(("PartName", format!("/{part}").as_str()));
+        tag.push_attribute(("ContentType", format!("application/vnd.openxmlformats-officedocument.spreadsheetml.{kind}+xml").as_str()));
+        types = append_element(&types, "Types", &[tag])?;
+    }
+    crate::patch::append_entries(path, &[
+        (cache_part, def.into_bytes()), (records_part, records.into_bytes()),
+        (cache_rels, cache_conn.into_bytes()), (table_part.clone(), def_table.into_bytes()),
+        (rels_path(&table_part), table_conn.into_bytes()),
+        ("xl/workbook.xml".into(), workbook), ("xl/_rels/workbook.xml.rels".into(), workbook_rels),
+        (rels_path(&plan.sheet_part), sheet_rels), ("[Content_Types].xml".into(), types),
+    ])?;
+    Ok(cache_id)
+}
+
+/// 多字段透视（PivotSpec2 + PivotGrid）附挂入口。
+pub fn attach2_for_session(
+    path: &Path,
+    sheet_name: &str,
+    spec: &crate::pivot_multi::PivotSpec2,
+    grid: &crate::pivot_multi::PivotGrid,
+    out_rect: (u32, u32, u32, u32),
+    session: &str,
+) -> Result<u32> {
+    let (r1, c1, r2, c2) = spec.source;
+    ensure!(r1 <= r2 && c1 <= c2, "透视表源区域无效");
+    let (or1, oc1, or2, oc2) = out_rect;
+    ensure!(or1 <= or2 && oc1 <= oc2, "透视表输出区域无效");
+    let plan = AttachmentPlan::read(path, sheet_name)?;
+    let cache_id = plan.cache_id;
+    let table_idx = plan.table_idx;
+    let (def, records, def_table) = crate::pivot_parts2::build(
+        path,
+        sheet_name,
+        spec,
+        grid,
+        out_rect,
+        cache_id,
+        &plan.table_name,
+        &format!("sheetcore:{session}"),
+    )?;
+    write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }

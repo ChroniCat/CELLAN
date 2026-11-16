@@ -1,0 +1,77 @@
+C12.4 多字段透视部件：Excel 16.0 / WPS 12.0 逐例验证
+====================================================
+日期：2026-11-16
+代码：`crates/core/src/pivot_parts2.rs`（新增）、`crates/core/src/pivot_xml.rs`（抽出 `write_parts` + `attach2_for_session`）
+探针：`crates/core/examples/pivot_multi_probe.rs`、`scripts/c12_pivot_probe2.ps1`、`scripts/c12_make_pivots_multi.ps1`
+
+一、结构黄金样本
+----------------
+先让 Excel 自己造三份多字段透视表（`scripts/c12_make_pivots_multi.ps1`），读它们的 `pivotTable1.xml` 当模板：
+
+| 用例 | 布局 | 关键结构 |
+|------|------|----------|
+| A | 2 行字段 + 1 值，无列 | `rowItems` 每行 `<x>`/层；组尾 `<i t="default"><x/></i>`；`<colItems count="1"><i/></colItems>`；`firstDataRow="1" firstDataCol="2"` |
+| B | 1 行 + 1 列 + 2 值 | `colFields` 末尾 `<field x="-2"/>`（数据伪字段），每个列路径产出 2 个 `<i>`，第 2 个带 `i="1"`；`firstDataRow="3"` |
+| C | 2 行 + 1 列 + 1 值 | 列维度按叶子逐个 `<i>`，末尾 `<i t="grand"><x/></i>`；`firstDataCol="2"` |
+
+二、我们生成的三个文件，两家 Office 都认
+-----------------------------------------
+```
+Excel 16.0
+  A: PivotTables=1 rows=[地区,产品] cols=[]        data=[求和项:金额]                 range=A9:C16
+  B: PivotTables=1 rows=[地区]      cols=[产品,值]  data=[求和项:金额,求和项:数量]     range=A9:G14
+  C: PivotTables=1 rows=[地区,产品] cols=[数量]     data=[求和项:金额]                 range=A9:I17
+
+WPS 12.0 (KET.Application)
+  A: PivotTables=1 rows=[地区,产品] cols=[]        data=[求和项:金额]
+  B: PivotTables=1 rows=[地区]      cols=[产品,值]  data=[求和项:金额,求和项:数量]
+  C: PivotTables=1 rows=[地区,产品] cols=[数量]     data=[求和项:金额]
+```
+`cols=[产品,值]` 里的「值」就是 Excel 对多值字段的伪字段（XML 里 `x="-2"`），说明 2 个值字段是**真正的数据轴**，不是把两个数拼进一列。
+
+三、值对不对（按 6 条源记录重新聚合）
+--------------------------------------
+源数据：华东A 10/2、华北B 20/3、华东A 30/4、华北B 40/5、华东B 50/6、华北A 60/7（金额/数量）
+
+用例 A（行=地区×产品，值=金额）：
+```
+华东 A 40  B 50  小计 90
+华北 A 60  B 60  小计 120
+总计 210
+```
+用例 B（行=地区，列=产品 × 值=金额/数量）：
+```
+           A         B       汇总
+华东    40   6    50   6    90  12
+华北    60   7    60   8   120  15
+总计   100  13   110  14   210  27
+```
+用例 C（行=地区×产品，列=数量，值=金额）：
+```
+          2   3   4   5   6   7  总计
+华东 A   10      30                40
+华东 B                   50        50
+华北 A                       60    60
+华北 B        20      40           60
+总计     10  20  30  40  50  60   210
+```
+都跟手算一致；数量列的位置（哪个数量落在哪个产品下）也对。
+
+四、护栏
+--------
+- 行字段为空 → 直接 `Err("多字段透视至少需要一个行字段")`；
+- 列字段 > 1 个 → `Err`（Excel 的嵌套列轴语义还没实测，不硬凑）；
+- 多值但无列字段 → `Err("多值透视必须带列字段")`，而不是写一份 Excel 会修复的包；
+- 记录条数与 `recordCount` 不一致 → `Err`。
+
+五、回归
+--------
+- `cargo test -p sheetcore --test pivot_multi_parts` → 3 passed（2 行字段 / 2 值字段 / 多值无列拒绝）
+- `cargo test -p sheetcore` 全量 → 103 个测试二进制，0 failed（`work/goal-logs/c12-multi-core.log`）
+
+六、还没接上的
+--------------
+- **应用层还没把多字段透视排进保存队列**：`Workbook::pivots_pending` 仍是旧的单字段 `PivotSpec`，
+  所以从界面建的多字段透视保存后只有值化网格，没有 pivotTable 部件。生成器已经可用（example 走的同一条 `attach2_for_session`），
+  下一步是把 `pivots_pending2` 接进 `xlsx::save` 与字段面板。
+- 多列字段（≥2）与折叠/压缩布局的 `rowItems` 语义未实测。
