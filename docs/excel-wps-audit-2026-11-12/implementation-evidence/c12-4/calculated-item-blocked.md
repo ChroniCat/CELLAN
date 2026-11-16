@@ -45,3 +45,26 @@ Excel 的隐含要求还有差距，**不是夹具问题**。
 计算项**未完成**：XML 形状对得上但 Excel 不认，按「未实现」记，不计入 C12.4 完成项。
 下一步应先反查 Excel 真实修正点（例如把 cacheIndex/field 改成 1 复测，或对比我们与 Excel 文件的
 `pivotArea` 全属性差异），再决定是否继续。
+
+## 二分结果（同一夹具 compact-multi.xlsx 三个变体）
+
+| 变体 | 改动 | Excel 结果 |
+|---|---|---|
+| `ci-cache.xlsx` | 只改缓存（sharedItems 加 `<s f="1"/>` + `<calculatedItems>` 块） | **正常**：`pivots=1 rows=1 cols=1 data=1 range=A9:E13` |
+| `ci-table.xlsx` | 只改透视表（pivotField items 加 `<item f="1" x="2"/>`、count+1） | **打不开**：`不能取得类 Workbooks 的 Open 属性` |
+| `ci-both.xlsx` | 两处都改 | 打不开 |
+
+结论：**缓存侧写法是对的，问题在透视表侧**。
+
+进一步对比 Excel 自己的文件 `calcitem.xlsx`：
+
+```
+rowItems count="5"  <i><x/></i><i><x v="1"/></i><i><x v="2"/></i><i><x v="3"/></i><i t="grand"><x/></i>
+```
+
+它把计算项**同时写进了 rowItems**（第 4 个 `<i><x v="3"/></i>`），而且数据区确实多出一行。
+我们只往 pivotField 的 `items` 里加条目、没往 `rowItems`/数据区加对应行——定义与布局不一致，
+Excel 直接判文件坏。
+
+所以计算项不是「补两处 XML」的事：要先把计算项当成**真正的一行**算出来（值 = 被引用项之和），
+再让 `rowItems`、输出网格、`location` 一起扩一行。这一步没做，本轮到此为止。
