@@ -562,3 +562,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - UIA `InvokePattern` 真点「更多 ▾」，弹出 单元格/编辑/加载项，证明折叠不是摆设。
 - 未解决：状态栏缩放控件可访问矩形底部溢出 2-5px（未确认视觉裁切）；公式栏非编辑态无节点。
 - app 341 passed。
+
+### 检查点三十：QA-05.3 区域差异门槛与五态
+- `scripts/qa05_region_diff.py` 按六区域比对；门槛写入 `qa05-visual-spec.md`；
+  1.0 vs 1.25/1.5 六区域全 PASS，两个合成反例只在对应区域 FAIL。
+- 新增 `five_interaction_states_are_visually_distinct`：直接读绘制形状的填充/文字/描边色，
+  覆盖静止/hover/pressed/selected/disabled/focus，五色两两距离 ≥6。
+- **真缺陷**：功能区大按钮/小按钮没有键盘焦点指示（只有对话框有）；新增
+  `ui_kit::focus_ring`，`big_sized`/`color_button`/字体样式切换三处接上。
+- `SC_DUMP` 增加 `selrect`，实测缩放 1.0/1.25/1.5/2.0 选区 134/167.5/201/268 宽，无 1px 漂移。
+- app **342 passed**。

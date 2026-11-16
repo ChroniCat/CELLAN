@@ -4193,17 +4193,18 @@
       "scope": "scripts/截图 + 图像基线",
       "source": "qa-requirements.md",
       "heading": "QA-05 P1 视觉基线与 DPI 覆盖",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [
         "a3cd75f",
-        "7e52ed2"
+        "7e52ed2",
+        "1f9fa70"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-05.1 待验收（三档尺寸已出图并核对边界）；QA-05.2 待验收（四档 DPI 已量化）；QA-05.3 待实施。"
+        "QA-05.1/05.2/05.3 均已实现并进入待验收；缺真实系统 DPI 切换与人工视觉评审。"
       ],
       "failures": [],
       "blocker": "",
@@ -4278,13 +4279,27 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "1f9fa70"
+          ],
+          "commands": [
+            "python scripts/qa05_region_diff.py dpi5-1.0 vs dpi5-1.25/1.5 -> 六区域全 PASS（E125=0/E15=0）",
+            "反例：功能区下移 4px -> ribbon FAIL(11.03/10.16)、整条抹白状态栏 -> status FAIL(27.49/18.44)",
+            "cargo test -p app five_interaction_states_are_visually_distinct -> passed（五态色值+焦点圈）",
+            "SC_SEL/SC_SEL2 + SC_DUMP selrect：1.0/1.25/1.5/2.0 宽高 134/167.5/201/268、54/67.5/81/108"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/qa05-visual-spec.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-region-diff.txt"
+          ],
+          "not_done": [
+            "门槛是抗锯齿基线，字体/渲染器变化需重新冻结。",
+            "深色主题未纳入；2.0 DPI 未做同逻辑尺寸区域比对（屏幕放不下）。",
+            "没有 golden 设计图，只做度量与反例验证。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
