@@ -170,8 +170,8 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
         let v = ui.visuals().clone();
         ui.painter().rect_filled(
             egui::Rect::from_min_size(
-                egui::pos2(x, y + 4.0),
-                Vec2::new(1.0, GROUP_BODY_H),
+                egui::pos2(x, y + crate::tokens::space::GROUP_PAD_TOP),
+                Vec2::new(crate::tokens::stroke::HAIR, GROUP_BODY_H),
             ),
             0.0,
             if v.dark_mode {
@@ -183,18 +183,21 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
     }
     let out = ui
         .vertical(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+            ui.spacing_mut().item_spacing = Vec2::new(crate::tokens::space::HAIR, 0.0);
             // Excel 的命令区从分组顶往下 4px 才开始
-            ui.add_space(4.0);
+            ui.add_space(crate::tokens::space::GROUP_PAD_TOP);
             let row = ui.horizontal_top(|ui| {
-                ui.add_space(6.0);
+                ui.add_space(crate::tokens::space::GROUP_PAD_X);
                 ui.set_height(GROUP_BODY_H);
                 add(ui);
-                ui.allocate_exact_size(Vec2::new(6.0, 0.0), Sense::hover());
+                ui.allocate_exact_size(
+                    Vec2::new(crate::tokens::space::GROUP_PAD_X, 0.0),
+                    Sense::hover(),
+                );
             });
-            let w = row.response.rect.width().max(24.0);
-            // Excel 的组名紧贴功能区底边：4(顶) + 76(命令) + 8(间隙) + 14(字) = 102
-            ui.add_space(7.0);
+            let w = row.response.rect.width().max(crate::tokens::space::XXXL);
+            // Excel 的组名紧贴功能区底边：4(顶) + 76(命令) + 7(间隙) + 14(字) = 101
+            ui.add_space(crate::tokens::space::GROUP_LABEL_GAP);
             ui.allocate_ui_with_layout(
                 Vec2::new(w, GROUP_LABEL_H),
                 egui::Layout::top_down(egui::Align::Center),
@@ -204,7 +207,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
                     } else {
                         Color32::from_rgb(89, 89, 89)
                     };
-                    ui.label(RichText::new(title).size(12.0).color(c));
+                    ui.label(RichText::new(title).size(crate::tokens::text::BODY).color(c));
                 },
             );
         })
@@ -222,15 +225,19 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
             r.height()
         );
     }
-    ui.add_space(2.0);
+    ui.add_space(crate::tokens::space::HAIR);
     group_rect
 }
 
 /// 分组的“对话框启动器”：Excel 在分组右下角的斜箭头
 pub fn launcher_at(ui: &mut egui::Ui, group_rect: Rect, id: &str) -> bool {
-    let size = Vec2::new(12.0, 12.0);
+    let s = crate::tokens::icon::XS;
+    let size = Vec2::new(s, s);
     let rect = Rect::from_min_size(
-        egui::pos2(group_rect.right() - size.x - 1.0, group_rect.bottom() - size.y - 1.0),
+        egui::pos2(
+            group_rect.right() - size.x - crate::tokens::stroke::HAIR,
+            group_rect.bottom() - size.y - crate::tokens::stroke::HAIR,
+        ),
         size,
     );
     let resp = ui.interact(rect, egui::Id::new(("grp_launch", id)), Sense::click());
@@ -284,7 +291,8 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 3.0, bg);
+        ui.painter()
+        .rect_filled(rect, crate::tokens::radius::MD, bg);
     }
     focus_ring(ui, &resp, rect, 3.0);
     let col = if enabled {
@@ -784,12 +792,13 @@ pub fn a11y_name_rect(
     ctx: &egui::Context,
 ) {
     a11y_name(resp, label, enabled, None);
-    let ppp = ctx.pixels_per_point();
+    // rect 是 egui 的逻辑点：accesskit 树由 egui 统一乘 pixels_per_point，
+    // 这里再乘一次就会在 150%/200% 下把可访问矩形放大 ppp 倍（QA-05.2 只测 100% 时看不见）。
     let b = egui::accesskit::Rect {
-        x0: (rect.min.x * ppp) as f64,
-        y0: (rect.min.y * ppp) as f64,
-        x1: (rect.max.x * ppp) as f64,
-        y1: (rect.max.y * ppp) as f64,
+        x0: rect.min.x as f64,
+        y0: rect.min.y as f64,
+        x1: rect.max.x as f64,
+        y1: rect.max.y as f64,
     };
     let _ = ctx.accesskit_node_builder(resp.id, |node| {
         node.set_bounds(b);
@@ -857,17 +866,27 @@ impl BtnResp {
 }
 
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
-    let btn = egui::Button::new(RichText::new(label).color(ACCENT).size(12.0))
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, ACCENT))
-        .corner_radius(2.0)
-        .min_size(Vec2::new(75.0, 24.0));
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .color(ACCENT)
+            .size(crate::tokens::text::BODY),
+    )
+    .fill(Color32::WHITE)
+    .stroke(Stroke::new(crate::tokens::stroke::HAIR, ACCENT))
+    .corner_radius(crate::tokens::radius::SM)
+    .min_size(Vec2::new(
+        crate::tokens::size::BTN_MIN_W,
+        crate::tokens::size::BTN_H,
+    ));
     let resp = ui.add(btn);
     if resp.has_focus() {
         ui.painter().rect_stroke(
-            resp.rect.shrink(1.5),
-            1.5,
-            Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
+            resp.rect.shrink(crate::tokens::stroke::FOCUS),
+            crate::tokens::stroke::FOCUS,
+            Stroke::new(
+                crate::tokens::stroke::HAIR,
+                ACCENT.gamma_multiply(0.6),
+            ),
             egui::StrokeKind::Inside,
         );
     }
@@ -881,22 +900,35 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
 
 /// 次要按钮（取消/关闭）：白底灰边，和 Excel 对话框一致
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
-    let btn = egui::Button::new(RichText::new(label).color(TEXT).size(12.0))
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(179, 177, 175)))
-        .corner_radius(2.0)
-        .min_size(Vec2::new(75.0, 24.0));
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .color(TEXT)
+            .size(crate::tokens::text::BODY),
+    )
+    .fill(Color32::WHITE)
+    .stroke(Stroke::new(
+        crate::tokens::stroke::HAIR,
+        Color32::from_rgb(179, 177, 175),
+    ))
+    .corner_radius(crate::tokens::radius::SM)
+    .min_size(Vec2::new(
+        crate::tokens::size::BTN_MIN_W,
+        crate::tokens::size::BTN_H,
+    ));
     ui.add(btn)
 }
 
 /// 紧凑文字按钮（组里放"插入行"这种短命令）
 pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(12.0);
+    let font = FontId::proportional(crate::tokens::text::BODY);
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 12.0, 24.0);
+    let size = Vec2::new(
+        galley.size().x + crate::tokens::space::XL,
+        crate::tokens::size::BTN_H,
+    );
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = if resp.is_pointer_button_down_on() {
         if v.dark_mode { v.selection.bg_fill } else { PRESSED }
@@ -928,11 +960,14 @@ pub fn sheet_tab(
     color: Option<[u8; 3]>,
 ) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(12.0);
+    let font = FontId::proportional(crate::tokens::text::BODY);
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 26.0, 32.0);
+    let size = Vec2::new(
+        galley.size().x + crate::tokens::size::SHEET_TAB_PAD,
+        crate::tokens::size::SHEET_TAB_H,
+    );
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     // UI-24.2：工作表标签在 UIA 里是 Tab 页，名字就是工作表名
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active));

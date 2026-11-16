@@ -1,0 +1,103 @@
+WINDOW name='fixture.xlsx - Sheets Native' class='Window Class' rect=323,260,1280,800
+COUNT=157
+Button	保存	 enabled=True	 value=	 at=468,271,26,26
+Button	撤销	 enabled=False	 value=	 at=500,271,26,26
+Button	重做	 enabled=False	 value=	 at=532,271,26,26
+Edit	搜索命令	 enabled=True	 value=	 at=811,273,328,22
+Button	粘贴	 enabled=True	 value=	 at=349,372,42,64
+Button	粘贴 选项	 enabled=True	 value=	 at=349,436,42,12
+Button	剪切（Ctrl+X）	 enabled=True	 value=	 at=393,372,57,24
+Button	把当前单元格的格式复制到别处	 enabled=True	 value=	 at=393,424,69,24
+Text	剪贴板	 enabled=True	 value=	 at=394,455,35,15
+Edit	字体	 enabled=True	 value=思源黑体	 at=495,384,147,20
+Button	字体 下拉	 enabled=True	 value=	 at=644,383,15,22
+Edit	字号	 enabled=True	 value=11	 at=667,384,32,20
+Button	字号 下拉	 enabled=True	 value=	 at=686,383,15,22
+Button	增大字号	 enabled=True	 value=	 at=704,382,24,24
+Button	减小字号	 enabled=True	 value=	 at=730,382,24,24
+Button	加粗（Ctrl+B）	 enabled=True	 value=	 at=490,414,24,24
+Button	斜体（Ctrl+I）	 enabled=True	 value=	 at=516,414,24,24
+Text	字体	 enabled=True	 value=	 at=611,455,23,15
+Button	顶端对齐	 enabled=True	 value=	 at=770,382,24,24
+Button	垂直居中	 enabled=True	 value=	 at=796,382,24,24
+Button	底端对齐	 enabled=True	 value=	 at=822,382,24,24
+Button	自动换行	 enabled=True	 value=	 at=932,382,81,24
+Button	左对齐	 enabled=True	 value=	 at=770,414,24,24
+Button	居中	 enabled=True	 value=	 at=796,414,24,24
+Button	右对齐	 enabled=True	 value=	 at=822,414,24,24
+Button	减少缩进	 enabled=True	 value=	 at=850,414,24,24
+Button	增加缩进	 enabled=True	 value=	 at=876,414,24,24
+Text	对齐方式	 enabled=True	 value=	 at=877,455,47,15
+Button	百分比样式	 enabled=True	 value=	 at=1088,411,24,24
+Button	千位分隔样式	 enabled=True	 value=	 at=1114,411,24,24
+Button	增加小数位数	 enabled=True	 value=	 at=1144,411,24,24
+Button	减少小数位数	 enabled=True	 value=	 at=1170,411,24,24
+Text	数字	 enabled=True	 value=	 at=1109,455,23,15
+Button	样式 ▾	 enabled=True	 value=	 at=1204,368,53,24
+Button	插入	 enabled=True	 value=	 at=1263,372,42,64
+Button	插入 选项	 enabled=True	 value=	 at=1263,436,42,12
+Button	删除	 enabled=True	 value=	 at=1307,372,42,64
+Button	删除 选项	 enabled=True	 value=	 at=1307,436,42,12
+Button	格式	 enabled=True	 value=	 at=1351,372,42,64
+Button	格式 选项	 enabled=True	 value=	 at=1351,436,42,12
+Text	单元格	 enabled=True	 value=	 at=1311,455,35,15
+Button	编辑 ▾	 enabled=True	 value=	 at=1403,368,53,24
+Button	更多 ▾	 enabled=True	 value=	 at=1456,368,53,24
+Edit	名称框	 enabled=True	 value=A1	 at=337,483,76,20
+Text	seed	 enabled=True	 value=	 at=527,485,31,16
+Text	单元格模式 就绪	 enabled=True	 value=	 at=331,1043,80,13
+Text	已打开并重算完成（3 个非空格）	 enabled=True	 value=	 at=425,1041,840,18
+Text	统计 ▾	 enabled=True	 value=	 at=1277,1043,36,13
+Text	计数: 1	 enabled=True	 value=	 at=1325,1043,32,13
+Button	100%	 enabled=True	 value=	 at=1566,1038,28,24
+Button	+	 enabled=True	 value=	 at=1544,1040,18,24
+Button	−	 enabled=True	 value=	 at=1418,1041,18,24
+Button	工作表标签左移	 enabled=True	 value=	 at=339,1007,32,31
+Button	工作表标签右移	 enabled=True	 value=	 at=371,1007,32,31
+TabItem	Sheet1	 enabled=True	 value=	 at=435,1006,64,32
+DataItem	A1，seed，已选中	 enabled=True	 value=	 at=323,515,1263,474
+DataGrid	工作表 Sheet1，选区 A1:A1，1 行 1 列，活动单元格 A1	 enabled=True	 value=	 at=323,515,1263,474
+DataItem	列 A，已选中	 enabled=True	 value=	 at=352,515,72,19
+DataItem	列 B	 enabled=True	 value=	 at=424,515,72,19
+DataItem	列 C	 enabled=True	 value=	 at=496,515,72,19
+DataItem	列 D	 enabled=True	 value=	 at=568,515,72,19
+DataItem	列 E	 enabled=True	 value=	 at=640,515,72,19
+DataItem	列 F	 enabled=True	 value=	 at=712,515,72,19
+DataItem	列 G	 enabled=True	 value=	 at=784,515,72,19
+DataItem	列 H	 enabled=True	 value=	 at=856,515,72,19
+DataItem	列 I	 enabled=True	 value=	 at=928,515,72,19
+DataItem	列 J	 enabled=True	 value=	 at=1000,515,72,19
+DataItem	列 K	 enabled=True	 value=	 at=1072,515,72,19
+DataItem	列 L	 enabled=True	 value=	 at=1144,515,72,19
+DataItem	列 M	 enabled=True	 value=	 at=1216,515,72,19
+DataItem	列 N	 enabled=True	 value=	 at=1288,515,72,19
+DataItem	列 O	 enabled=True	 value=	 at=1360,515,72,19
+DataItem	列 P	 enabled=True	 value=	 at=1432,515,72,19
+DataItem	列 Q	 enabled=True	 value=	 at=1504,515,72,19
+DataItem	列 R	 enabled=True	 value=	 at=1576,515,72,19
+DataItem	第 1 行，已选中	 enabled=True	 value=	 at=323,534,29,18
+DataItem	第 2 行	 enabled=True	 value=	 at=323,552,29,18
+DataItem	第 3 行	 enabled=True	 value=	 at=323,570,29,18
+DataItem	第 4 行	 enabled=True	 value=	 at=323,588,29,18
+DataItem	第 5 行	 enabled=True	 value=	 at=323,606,29,18
+DataItem	第 6 行	 enabled=True	 value=	 at=323,624,29,18
+DataItem	第 7 行	 enabled=True	 value=	 at=323,642,29,18
+DataItem	第 8 行	 enabled=True	 value=	 at=323,660,29,18
+DataItem	第 9 行	 enabled=True	 value=	 at=323,678,29,18
+DataItem	第 10 行	 enabled=True	 value=	 at=323,696,29,18
+DataItem	第 11 行	 enabled=True	 value=	 at=323,714,29,18
+DataItem	第 12 行	 enabled=True	 value=	 at=323,732,29,18
+DataItem	第 13 行	 enabled=True	 value=	 at=323,750,29,18
+DataItem	第 14 行	 enabled=True	 value=	 at=323,768,29,18
+DataItem	第 15 行	 enabled=True	 value=	 at=323,786,29,18
+DataItem	第 16 行	 enabled=True	 value=	 at=323,804,29,18
+DataItem	第 17 行	 enabled=True	 value=	 at=323,822,29,18
+DataItem	第 18 行	 enabled=True	 value=	 at=323,840,29,18
+DataItem	第 19 行	 enabled=True	 value=	 at=323,858,29,18
+DataItem	第 20 行	 enabled=True	 value=	 at=323,876,29,18
+DataItem	第 21 行	 enabled=True	 value=	 at=323,894,29,18
+DataItem	第 22 行	 enabled=True	 value=	 at=323,912,29,18
+DataItem	第 23 行	 enabled=True	 value=	 at=323,930,29,18
+DataItem	第 24 行	 enabled=True	 value=	 at=323,948,29,18
+DataItem	第 25 行	 enabled=True	 value=	 at=323,966,29,18
+DataItem	第 26 行	 enabled=True	 value=	 at=323,984,29,18

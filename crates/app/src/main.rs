@@ -37,6 +37,7 @@ mod chart_view;
 mod spark_view;
 mod icons;
 mod ui_icons;
+mod tokens;
 mod ui_kit;
 mod ui_png;
 
@@ -23097,12 +23098,13 @@ let txn = self.txn_begin(&keys);
             r1n - r0 + 1,
             c1n - c0 + 1
         );
-        let ppp = ctx.pixels_per_point();
+        // 逻辑点直接给：accesskit 树由 egui 统一按 pixels_per_point 换算，
+        // 这里再乘 ppp 会在 125%/150%/200% 下把矩形放大一倍（真缺陷，UI-29.1 抓到）。
         let bounds = egui::accesskit::Rect {
-            x0: (resp.rect.min.x * ppp) as f64,
-            y0: (resp.rect.min.y * ppp) as f64,
-            x1: (resp.rect.max.x * ppp) as f64,
-            y1: (resp.rect.max.y * ppp) as f64,
+            x0: resp.rect.min.x as f64,
+            y0: resp.rect.min.y as f64,
+            x1: resp.rect.max.x as f64,
+            y1: resp.rect.max.y as f64,
         };
         let _ = ctx.accesskit_node_builder(resp.id.with("grid"), |node| {
             node.set_role(egui::accesskit::Role::Grid);
@@ -23120,12 +23122,11 @@ let txn = self.txn_begin(&keys);
         column: bool,
         selected: bool,
     ) {
-        let ppp = ctx.pixels_per_point();
         let bounds = egui::accesskit::Rect {
-            x0: (rect.min.x * ppp) as f64,
-            y0: (rect.min.y * ppp) as f64,
-            x1: (rect.max.x * ppp) as f64,
-            y1: (rect.max.y * ppp) as f64,
+            x0: rect.min.x as f64,
+            y0: rect.min.y as f64,
+            x1: rect.max.x as f64,
+            y1: rect.max.y as f64,
         };
         let _ = ctx.accesskit_node_builder(id, |node| {
             node.set_role(if column {
