@@ -1151,10 +1151,18 @@
             "crates/core/tests/fixtures/qa01/ext/chart.xlsx",
             "crates/core/tests/fixtures/qa01/ext/page.xlsx",
             "crates/core/examples/qa01_features.rs",
-            "scripts/qa01_features_probe.ps1"
+            "scripts/qa01_features_probe.ps1",
+            "crates/core/tests/qa01_media_roundtrip.rs",
+            "crates/core/tests/qa01_formats.rs",
+            "crates/core/tests/fixtures/qa01/formats/media.xlsx",
+            "crates/core/tests/fixtures/qa01/formats/features.xlsm",
+            "crates/core/tests/fixtures/qa01/formats/features.xls",
+            "crates/core/examples/xls_roundtrip.rs",
+            "scripts/qa01_media_probe.ps1"
           ],
           "commits": [
-            "56f9cc2"
+            "56f9cc2",
+            "3901d39"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored",
@@ -1165,7 +1173,12 @@
             "powershell -File scripts/qa01_features_probe.ps1 work/probe/qa01/features.xlsx KET.Application -> 16 项与 Excel 一致",
             "Excel 另存 + sheetcore load/save 后双端复测 -> 样式/CF/DV/表格/名称/冻结/隐藏全在",
             "cargo test -p sheetcore（--test-threads=2）-> 103 个测试二进制 0 failed",
-            "cargo test -p app --bin app（--test-threads=2）-> 330 passed"
+            "cargo test -p app --bin app（--test-threads=2）-> 330 passed",
+            "powershell -File scripts/qa01_media_probe.ps1 work/probe/qa01/media.xlsx Excel.Application -> pictures=1 shapes=2 links=1",
+            "sheetcore load+save 后 media-ours.xlsx 在 Excel/WPS 均 pictures=1 shapes=2 links=1，drawing 与图片逐字节一致",
+            "features.xlsm -> 我们另存 .xlsx -> Excel 16 项读数与原始 .xlsx 一致",
+            "features.xls -> 我们 load -> 另存 .xls -> Excel 打开：值/数字格式/粗体在，CF/DV/表格/名称/冻结/隐藏 不在（calamine 只给值）",
+            "cargo test -p sheetcore（--test-threads=2）-> 105 个测试二进制 0 failed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
@@ -1175,18 +1188,20 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/excel.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/wps.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/excel-rt.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/wps-rt.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/wps-rt.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media-formats.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-excel.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-excel-rt2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-wps-rt2.txt"
           ],
           "not_done": [
-            "图片/图形对象（drawing+media）三方夹具未做",
-            "外部链接（xlinks）三方夹具未做",
-            ".xls/.xlsm 输入夹具未做（只写 xlsx，这两类走打开再另存）",
-            "三方 runner 只做打开/另存/属性对拍，不含人工拖拽字段与缓存逐格数值"
+            ".xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留：读取走 calamine 只给值，属既定口径",
+            "图形对象只覆盖矩形与图片；图表组合、连接线、超链接形状未逐一覆盖"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补图片/图形对象、外部链接、.xls/.xlsm 三类夹具；本切片已覆盖样式/CF/DV/表格/命名/隐藏/冻结 7 类并含往返。",
-          "updated_utc": "2026-11-16T11:40:00Z"
+          "next": "图形对象扩到组合/连接线后可整体转「已验收」；.xls 边界需按原合同口径书面确认。",
+          "updated_utc": "2026-11-16T12:10:00Z"
         }
       ]
     },

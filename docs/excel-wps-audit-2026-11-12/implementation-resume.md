@@ -375,3 +375,19 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 探针坑：WPS 里 `ActiveWindow.SplitRow = SplitRow` 会清掉列分割，读到假 0，已删该行。
 - 测试：core 103 个测试二进制 0 failed；app 330 passed。
 - 剩余：图片/图形、外部链接、.xls/.xlsm 三类夹具；QA-01.3 与 QA-01 父项仍「待验收」。
+
+### 检查点十二：QA-01.3 收口（图片/形状/外链、.xlsm、.xls）
+- `3901d39`：加载不再把 textboxes 标脏 —— 之前保存会用文本框模型重写 drawing，
+  矩形变成 `txBox="1"`、off/ext 归零、style 丢失；现在 drawing1.xml 与图片逐字节保真。
+- `3901d39`：`.xlsm` 基准另存 `.xlsx` 后 Excel 报「文件格式或文件扩展名无效」——
+  `[Content_Types].xml` 仍声明 macroEnabled；新增 `fixups::normalise_workbook_ct` 按输出
+  扩展名归一（带 VBA 写 .xlsx 直接报错，不静默丢宏）；临时名 `.~x.xlsx.saving-<pid>`
+  的扩展名要还原，否则 .xlsm 被当未知格式。
+- `3901d39`：`.xls` 打开后另存 `.xlsx` 崩「读取基准工作簿目录失败」——二进制基准不是 zip，
+  现在按全新文件重建。
+- 实测：media.xlsx（1 图片 + 1 矩形 + 外链 42/EXT）经我们保存后 Excel/WPS 均
+  pictures=1 shapes=2 links=1，shape2 仍是 msoAutoShape 80×40。
+- `features.xlsm` → 我们另存 `.xlsx` → Excel 16 项读数与原始 `.xlsx` 完全一致。
+- `.xls` 边界（写进 not_done）：值/数字格式/粗体保留，CF/DV/表格/名称/冻结/隐藏 与
+  填充/边框颜色不保留 —— calamine 只给值。
+- 测试：core **105** 个测试二进制 0 failed（`qa01-core3.log`）；app **330 passed**（`qa01-app2.log`）。
