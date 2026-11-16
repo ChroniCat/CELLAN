@@ -1,4 +1,5 @@
 pub mod formula;
+pub mod mem;
 pub mod errors;
 pub mod scenarios;
 pub mod zhconv;

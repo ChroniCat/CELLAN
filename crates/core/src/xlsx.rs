@@ -1782,7 +1782,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
 
     if prof {
-        eprintln!("  [save] 读入原文件 {:.2}s", t_read.elapsed().as_secs_f64());
+        eprintln!(
+            "  [save] 读入原文件 {:.2}s rss {:.0}MB",
+            t_read.elapsed().as_secs_f64(),
+            crate::mem::rss_mb()
+        );
     }
     let t_build = std::time::Instant::now();
     for (idx, sheet) in wb.sheets.iter().enumerate() {
@@ -2072,12 +2076,20 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
 
     if prof {
-        eprintln!("  [save] 组装 DOM {:.2}s", t_build.elapsed().as_secs_f64());
+        eprintln!(
+            "  [save] 组装 DOM {:.2}s rss {:.0}MB",
+            t_build.elapsed().as_secs_f64(),
+            crate::mem::rss_mb()
+        );
     }
     let t_write = std::time::Instant::now();
     let out = write(&book, path).with_context(|| format!("写入失败 {}", path.display()));
     if prof {
-        eprintln!("  [save] 序列化+压缩 {:.2}s", t_write.elapsed().as_secs_f64());
+        eprintln!(
+            "  [save] 序列化+压缩 {:.2}s rss {:.0}MB",
+            t_write.elapsed().as_secs_f64(),
+            crate::mem::rss_mb()
+        );
     }
     out?;
 

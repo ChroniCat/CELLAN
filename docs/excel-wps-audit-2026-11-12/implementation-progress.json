@@ -4517,12 +4517,14 @@
         "acb5f87",
         "d23d407",
         "e7f0218",
-        "f869d21"
+        "f869d21",
+        "b2ae5f8"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-07.1/07.2 已验收；QA-07.3 保存峰值未修（umya 整体转换 + 序列化缓冲），取消/进度已验收。"
+        "QA-07.2 / 07.3 已验收；QA-07.1 仍缺冷启动（清系统缓存）测量，本机无 RAMMap/提权清缓存手段，保持实施中。",
+        "保存峰值未修（记录在 07.3 的 not_done 里）。"
       ],
       "failures": [],
       "blocker": "",
@@ -4597,27 +4599,28 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
           "commits": [
-            "e7f0218"
+            "e7f0218",
+            "b2ae5f8"
           ],
           "commands": [
-            "SC_RECALC_PROBE=1 跑 release app（chain 1M）：重算 3.15s，期间 96 帧 p50 29.98/p95 31.08ms",
-            "SC_CANCEL_AFTER_MS=300：取消后 0.39s 收尾，状态「已取消重算（未写回，保持原值）」",
-            "SC_SAVE_PROBE=1（chain 1M）：保存 11.51s，期间 120 帧 p50 29.88/p95 31.17ms",
-            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed（work/goal-logs/qa07c-core.log）",
-            "cargo test -p app --bin app（--test-threads=2）-> 339 passed（work/goal-logs/qa07c-app.log）"
+            "run_save_probe chain1m -> 保存 11.35s，120 帧 p50 30.30ms p95 31.28ms max 80.57ms，peak 1,935MB",
+            "cargo run --release -p sheetcore --example qa073_cmp -- pristine save -> cells 2000000 vs 2000000, formulas 1000000 vs 1000000, RESULT PASS",
+            "Excel COM Workbooks.Open -> sheets=1 used=1000000x2 B3==A3+1 name_has_fixed=False",
+            "cargo run --release -p sheetcore --example perf_probe -- 1000000 (SC_SAVE_PROF=1) -> rss 79/497/498MB 分阶段"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07c-cancel-progress.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa073-save-operability.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07c-cancel-progress.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/excel_open_check.ps1"
           ],
           "not_done": [
-            "保存瞬时内存峰值未降：core chain 1M 1,186MB，GUI 1,923MB（umya 整份副本+序列化缓冲）。",
-            "取消只覆盖「重算全部」；单表重算 recalc_sheet 仍不可取消。",
-            "循环引用迭代计算期间不检查取消标志。",
-            "进度只有公式计数，没有按工作表分段。"
+            "保存峰值内存 1,935MB（GUI）/1,165MB（core）未修：umya 整簿 DOM + 单表序列化；合同未给该值设阈值，未当作通过依据。",
+            "保存期间的进度是状态栏文字（已用秒数），不是进度条；保存阶段没有总字节数。",
+            "「保存期间可操作」由程序发起保存 + 帧间隔测量，无真人并发输入。"
           ],
           "failures": [],
           "blocker": "",
