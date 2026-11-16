@@ -5586,12 +5586,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
           ],
           "not_done": [
-            "候选只来自 functions::implemented()，未做分类筛选与模糊搜索"
+            "真实键盘/鼠标在候选列表里上下选择未验（无交互桌面）；模糊搜索已实现（前缀 0 / 词内 1 / 子序列 2 分级），用例 ui112_fuzzy_function_search_matches_subsequence_and_ranks_prefix_first。"
           ],
           "failures": [],
           "blocker": "",
           "next": "候选分类/模糊匹配",
-          "updated_utc": "2026-11-16T08:37:08Z"
+          "updated_utc": "2026-11-16T22:10:21Z"
         },
         {
           "id": "UI-11.3",
@@ -5625,12 +5625,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log"
           ],
           "not_done": [
-            "跨工作表点选建 Sheet2!A1 未实现"
+            "真实按住拖动跨表建 Sheet2!B2:C4 未验（无交互桌面）；代码路径与单测已覆盖（切表清锚点 + 带表名/引号的 pick_range_label）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "跨工作表引用",
-          "updated_utc": "2026-11-16T08:37:08Z"
+          "updated_utc": "2026-11-16T22:10:21Z"
         },
         {
           "id": "UI-11.4",
@@ -5664,13 +5664,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log"
           ],
           "not_done": [
-            "向导里点区域填参数未实现（确定后回到编辑态可点，但不是向导内直接取区域）",
-            "分类筛选、帮助链接未实现"
+            "向导内点区域填参数、分类筛选下拉、帮助链接均已实现（main.rs:20248 起，CATEGORIES/help_url/hyperlink_to；wiz_pick 取区域）；仅缺真人点击复核。"
           ],
           "failures": [],
           "blocker": "",
           "next": "向导内取参数区域",
-          "updated_utc": "2026-11-16T08:37:08Z"
+          "updated_utc": "2026-11-16T22:10:21Z"
         }
       ]
     },

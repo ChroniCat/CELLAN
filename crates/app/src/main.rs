@@ -566,18 +566,42 @@ fn formula_open_signature(buf: &str) -> Option<String> {
     }
 }
 
+/// 函数名匹配分级：前缀 0、词内连续 1、子序列 2（如 VLO → VLOOKUP），不匹配返回 None
+fn func_match_tier(name: &str, token_upper: &str) -> Option<u8> {
+    if name.starts_with(token_upper) {
+        return Some(0);
+    }
+    if name.contains(token_upper) {
+        return Some(1);
+    }
+    let mut it = name.chars();
+    if token_upper.chars().all(|c| it.any(|n| n == c)) {
+        return Some(2);
+    }
+    None
+}
+
 fn formula_help(buf: &str) -> Option<FormulaHelp> {
     let mut out = FormulaHelp::default();
     if let Some(start) = formula_token_start(buf) {
         let token = &buf[start..];
         if token.chars().count() >= 2 {
             let up = token.to_ascii_uppercase();
+            let mut ranked: Vec<(u8, &'static str)> = Vec::new();
             for f in sheetcore::formula::functions::implemented() {
-                if f.starts_with(&up) {
-                    out.suggestions.push((f.to_string(), function_desc(f).to_string()));
+                if let Some(tier) = func_match_tier(f, &up) {
+                    ranked.push((tier, f));
                 }
             }
-            out.suggestions.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+            // 0=前缀，1=词内连续，2=子序列；同级按长度、再按字典序
+            ranked.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(a.1.len().cmp(&b.1.len()))
+                    .then(a.1.cmp(b.1))
+            });
+            for (_, f) in ranked {
+                out.suggestions.push((f.to_string(), function_desc(f).to_string()));
+            }
             out.suggestions.truncate(8);
             out.start = start;
             out.token = token.to_string();

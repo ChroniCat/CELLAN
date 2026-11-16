@@ -10068,3 +10068,20 @@ fn a11y_split_button_arrows_open_their_galleries() {
     }
     eprintln!("验证到 {checked} 个入口");
 }
+
+#[test]
+fn ui112_fuzzy_function_search_matches_subsequence_and_ranks_prefix_first() {
+    // 前缀优先：=SU 里 SUM 在 SUMIF 前
+    let help = formula_help("=SU").expect("应有候选");
+    let names: Vec<&str> = help.suggestions.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.first().copied(), Some("SUM"), "{names:?}");
+    assert!(names.contains(&"SUMIF"), "{names:?}");
+
+    // 子序列：=VLO → VLOOKUP
+    let help = formula_help("=VLO").expect("子序列应命中");
+    let names: Vec<&str> = help.suggestions.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"VLOOKUP"), "{names:?}");
+
+    // 完全不匹配：不返回候选
+    assert!(formula_help("=ZZQ").is_none());
+}
