@@ -532,3 +532,10 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   `DataGrid … at=271,463,1423,574`、`Button 常规/标题/强调/好/差`。
 - 边界：右键菜单/筛选下拉/颜色面板未逐个验；禁用态未验出 IsEnabled=false；公式栏仅编辑态有 Edit。
 - app 341 passed。
+
+### 检查点二十六：右键菜单语义
+- 右键菜单每行发 `Role=MenuItem`（名字带快捷键与「有子菜单」），粘贴图标条 5 格各发 Button；
+  `SC_CTX_MENU=600,600` 实测：`MenuItem 剪切，Ctrl+X at=949,826,246,26`、`Button 粘贴公式` 等。
+- **查出功能差异**：功能区与右键菜单没有运行期禁用态，`Ctl.enabled` 恒 true，
+  剪贴板为空时「剪切/复制/粘贴」照样可点；因此 a11y disabled 路径无法用真实按钮验证。
+- app 341 passed。

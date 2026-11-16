@@ -7087,7 +7087,8 @@
         "284f63c",
         "2218a50",
         "d8a8619",
-        "1e72505"
+        "1e72505",
+        "d6067b7"
       ],
       "commands": [],
       "evidence": [],
@@ -7141,7 +7142,8 @@
           "files": [],
           "commits": [
             "284f63c",
-            "1e72505"
+            "1e72505",
+            "d6067b7"
           ],
           "commands": [
             "cargo build -p app --no-default-features --features glow（eframe 开 accesskit）",
@@ -7150,19 +7152,22 @@
             "uia_dump.ps1 -> Edit 搜索命令/字体/字号/名称框（带 value 与 bounds）",
             "uia_dump.ps1 -> Button 常规/标题/强调/好/差（画廊）、粘贴 选项、单元格样式 展开",
             "uia_dump.ps1 -> TabItem Sheet1（383,1054,64,32）、DataGrid bounds 271,463,1423,574（原为 ∞）",
-            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui242-app.log）"
+            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui242-app.log）",
+            "SC_CTX_MENU=600,600 + uia_dump.ps1 -> MenuItem 剪切，Ctrl+X / 插入，有子菜单；粘贴图标条 5 个 Button 有名字"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-a11y-uia.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dlg3.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-control-semantics.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dd10.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dd10.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ctx-menu.txt"
           ],
           "not_done": [
-            "右键菜单/筛选下拉/颜色面板等弹出层没有逐个 UIA 验证。",
             "禁用态未在 UIA 里验证出 IsEnabled=false（样本里没有稳定复现的禁用按钮）。",
             "公式栏只有进入编辑态才生成 Edit 节点。",
-            "accesskit 0.17 不支持 SelectionItemPattern，选中态写进名字。"
+            "accesskit 0.17 不支持 SelectionItemPattern，选中态写进名字。",
+            "功能区与右键菜单没有运行期禁用态（Ctl.enabled 恒为 true），a11y 的 disabled 路径无法用真实按钮验证；这也是与 Excel 灰化行为的功能差异。",
+            "右键子菜单展开后的条目未单独 dump；没有 Role=Menu 容器节点。"
           ],
           "failures": [],
           "blocker": "",
