@@ -362,3 +362,16 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   第 8 帧截图里名称框 A1、公式栏 `=1+Sheet2!B3`、底部 `Sheet2` 激活、状态栏「单元格模式 输入 / 已插入」。
 - 测试：4 条 `ui116_*`；app 全量 **330 passed**。
 - 边界：跨表拖动扩区域未做（需远端锚点），已写进 `not_done`。
+
+### 检查点十一：QA-01.3 特性矩阵（样式/CF/DV/表格/命名/隐藏/冻结）
+- `56f9cc2`：`crates/core/examples/qa01_features.rs` 造夹具，`scripts/qa01_features_probe.ps1` 双端逐项读对象模型。
+- Excel 16.0 与 WPS 12.0 的 16 项读数完全一致：加粗/底色、`#,##0.00`+下边框、
+  CF 2 条（cellIs / colorScale）、DV 列表+整数、表格 T1 `$A$1:$B$5`、`MyRange`、
+  冻结 1/1、隐藏第 7 行与 E 列。
+- Excel 另存 → 我们 `load+save` → 双端复测全部保留（往返成立）。
+- 抓出并修掉三个真实缺陷：dxfs 落在 `<extLst>` 之后（Excel 判包损坏）、
+  表格 `displayName` 用了单元格引用 T1（Excel 拒开）、新建工作簿冻结窗格保存即丢
+  （没有 `<sheetViews>` 就 return）。5 条回归测试入 core。
+- 探针坑：WPS 里 `ActiveWindow.SplitRow = SplitRow` 会清掉列分割，读到假 0，已删该行。
+- 测试：core 103 个测试二进制 0 failed；app 330 passed。
+- 剩余：图片/图形、外部链接、.xls/.xlsm 三类夹具；QA-01.3 与 QA-01 父项仍「待验收」。

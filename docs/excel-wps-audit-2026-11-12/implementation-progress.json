@@ -1149,27 +1149,44 @@
             "scripts/qa01_pivot_fixture.ps1",
             "crates/core/tests/fixtures/qa01/ext/pivot.xlsx",
             "crates/core/tests/fixtures/qa01/ext/chart.xlsx",
-            "crates/core/tests/fixtures/qa01/ext/page.xlsx"
+            "crates/core/tests/fixtures/qa01/ext/page.xlsx",
+            "crates/core/examples/qa01_features.rs",
+            "scripts/qa01_features_probe.ps1"
           ],
-          "commits": [],
+          "commits": [
+            "56f9cc2"
+          ],
           "commands": [
             "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored",
             "python scripts/qa01_extended_roundtrip.py --fixtures crates/core/tests/fixtures/qa01_extended --core-exe target/debug/examples/qa01_roundtrip.exe -> status pass, 6/6 paths, 0 differences",
-            "python scripts/qa01_extended_roundtrip.py --kinds page ... -> 3 page cases pass; print_gridlines True in source/target"
+            "python scripts/qa01_extended_roundtrip.py --kinds page ... -> 3 page cases pass; print_gridlines True in source/target",
+            "cargo run -p sheetcore --offline --example qa01_features -- work/probe/qa01/features.xlsx",
+            "powershell -File scripts/qa01_features_probe.ps1 work/probe/qa01/features.xlsx Excel.Application -> 16 项全对",
+            "powershell -File scripts/qa01_features_probe.ps1 work/probe/qa01/features.xlsx KET.Application -> 16 项与 Excel 一致",
+            "Excel 另存 + sheetcore load/save 后双端复测 -> 样式/CF/DV/表格/名称/冻结/隐藏全在",
+            "cargo test -p sheetcore（--test-threads=2）-> 103 个测试二进制 0 failed",
+            "cargo test -p app --bin app（--test-threads=2）-> 330 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-pv2.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-cp.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-cp.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features-matrix.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/excel.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/wps.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/excel-rt.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-features/wps-rt.txt"
           ],
           "not_done": [
-            "三方 runner 只做打开/另存/属性对拍，不含人工拖拽字段与缓存逐格数值",
-            ".xls/.xlsm、样式/CF/DV/表格/图片/命名/隐藏冻结/外链等类别仍归 QA-01.2 与父项剩余范围"
+            "图片/图形对象（drawing+media）三方夹具未做",
+            "外部链接（xlinks）三方夹具未做",
+            ".xls/.xlsm 输入夹具未做（只写 xlsx，这两类走打开再另存）",
+            "三方 runner 只做打开/另存/属性对拍，不含人工拖拽字段与缓存逐格数值"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补真实 pivotTable 部件及样式/CF/DV/表格/图片/命名/隐藏冻结/外链/.xls/.xlsm 三方夹具。",
-          "updated_utc": "2026-11-13T20:49:13Z"
+          "next": "补图片/图形对象、外部链接、.xls/.xlsm 三类夹具；本切片已覆盖样式/CF/DV/表格/命名/隐藏/冻结 7 类并含往返。",
+          "updated_utc": "2026-11-16T11:40:00Z"
         }
       ]
     },
