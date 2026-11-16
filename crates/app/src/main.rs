@@ -25009,6 +25009,13 @@ let txn = self.txn_begin(&keys);
                 Stroke::new(2.0, Color32::from_rgb(33, 115, 70)),
                 egui::StrokeKind::Inside,
             );
+            if dumping {
+                // QA-05.3：选区外框的实测几何，用来核对缩放后是否和格线对齐
+                dump.push(format!(
+                    "selrect at=({:.2},{:.2},{:.2},{:.2}) zoom={:.2}",
+                    sx, sy, sw, sh, self.zoom
+                ));
+            }
         }
 
         // 圈释无效数据：红椭圆
@@ -28292,6 +28299,32 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // QA-05.3：SC_PTR="x,y[,down]" 注入合成指针事件（测 hover / pressed 状态配色）
+        if let Ok(v) = std::env::var("SC_PTR") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() >= 2 {
+                if let (Ok(x), Ok(y)) = (parts[0].trim().parse::<f32>(), parts[1].trim().parse::<f32>()) {
+                    let down = parts.get(2).map(|d| d.trim() == "1").unwrap_or(false);
+                    ctx.input_mut(|i| {
+                        i.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+                        if down {
+                            i.events.push(egui::Event::PointerButton {
+                                pos: egui::pos2(x, y),
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            });
+                        }
+                    });
+                    ctx.request_repaint();
+                    if std::env::var("SC_PTR_LOG").is_ok() {
+                        let hp = ctx.input(|i| i.pointer.hover_pos());
+                        let down = ctx.input(|i| i.pointer.primary_down());
+                        eprintln!("[ptr] hover={hp:?} down={down}");
+                    }
+                }
+            }
+        }
         // QA-05.2：SC_PPP 强制指定缩放因子（DPI 验收用；不设就走系统值）
         if let Ok(v) = std::env::var("SC_PPP") {
             if let Ok(ppp) = v.parse::<f32>() {

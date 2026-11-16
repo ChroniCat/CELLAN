@@ -8721,3 +8721,208 @@ fn default_button_answers_enter_only_when_no_field_has_focus() {
     frame(&ctx2, vec![enter], &mut clicked2, true);
     assert!(!clicked2, "输入框有焦点时 Enter 仍然触发了默认按钮");
 }
+
+// ---------------------------------------------------------------------------
+// QA-05.3 五态：hover / pressed / selected / disabled / focus 必须能区分
+// ---------------------------------------------------------------------------
+
+fn walk_shapes(
+    shapes: &[egui::epaint::ClippedShape],
+    fills: &mut Vec<(egui::Rect, egui::Color32)>,
+    texts: &mut Vec<egui::Color32>,
+    strokes: &mut Vec<(egui::Rect, egui::Color32, f32)>,
+) {
+    fn rec(
+        s: &egui::Shape,
+        fills: &mut Vec<(egui::Rect, egui::Color32)>,
+        texts: &mut Vec<egui::Color32>,
+        strokes: &mut Vec<(egui::Rect, egui::Color32, f32)>,
+    ) {
+        match s {
+            egui::Shape::Rect(r) => {
+                fills.push((r.rect, r.fill));
+                if r.stroke.width > 0.0 {
+                    strokes.push((r.rect, r.stroke.color, r.stroke.width));
+                }
+            }
+            egui::Shape::Text(t) => {
+                for sec in &t.galley.job.sections {
+                    texts.push(sec.format.color);
+                }
+                if let Some(c) = t.override_text_color {
+                    texts.push(c);
+                }
+            }
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    rec(x, fills, texts, strokes);
+                }
+            }
+            _ => {}
+        }
+    }
+    for c in shapes {
+        rec(&c.shape, fills, texts, strokes);
+    }
+}
+
+#[test]
+fn five_interaction_states_are_visually_distinct() {
+    use egui::{Color32, Event, PointerButton, Pos2, Rect, pos2, vec2};
+
+    #[derive(Default)]
+    struct Snap {
+        fills: Vec<(Rect, Color32)>,
+        texts: Vec<Color32>,
+        strokes: Vec<(Rect, Color32, f32)>,
+    }
+
+    fn shot(events: Vec<Event>, disabled: bool, checked: bool) -> Snap {
+        shot_full(events, disabled, checked, false)
+    }
+
+    fn shot_full(events: Vec<Event>, disabled: bool, checked: bool, grab_focus: bool) -> Snap {
+        let ctx = egui::Context::default();
+        // 应用是浅色主题；Context::default() 默认深色，会让 hover/pressed 走另一套 token
+        ctx.set_visuals(egui::Visuals::light());
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0)));
+        // 先空跑一帧：egui 的命中测试用上一帧的控件矩形
+        let _warm = ctx.run(raw.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(vec2(200.0, 120.0), |ui| {
+                    let r = crate::ui_kit::big_sized(
+                        ui,
+                        crate::ui_icons::Icon::Paste,
+                        "粘贴",
+                        vec2(80.0, 60.0),
+                    );
+                    if grab_focus {
+                        r.request_focus();
+                    }
+                });
+            });
+        });
+        raw.events = events;
+        raw.time = Some(1.0);
+        raw.focused = true;
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(vec2(200.0, 120.0), |ui| {
+                    if checked {
+                        let _ = crate::ui_kit::check_row(ui, "已选中", true, !disabled, 120.0);
+                        return;
+                    }
+                    let add = |ui: &mut egui::Ui| {
+                        let r = crate::ui_kit::big_sized(
+                            ui,
+                            crate::ui_icons::Icon::Paste,
+                            "粘贴",
+                            vec2(80.0, 60.0),
+                        );
+                        if std::env::var("SC_STATE_DBG").is_ok() {
+                            eprintln!(
+                                "[dbg] rect={:?} hovered={} down={} pos={:?}",
+                                r.rect,
+                                r.hovered(),
+                                r.is_pointer_button_down_on(),
+                                ui.ctx().input(|i| i.pointer.latest_pos())
+                            );
+                        }
+                    };
+                    if disabled {
+                        ui.add_enabled_ui(false, |ui| add(ui));
+                    } else {
+                        add(ui);
+                    }
+                });
+            });
+        });
+        let mut s = Snap::default();
+        walk_shapes(&out.shapes, &mut s.fills, &mut s.texts, &mut s.strokes);
+        if std::env::var("SC_STATE_DBG").is_ok() {
+            eprintln!("[dbg] fills={:?}", s.fills);
+            eprintln!("[dbg] texts={:?}", s.texts);
+        }
+        s
+    }
+
+    let pos = |x: f32, y: f32| pos2(x, y);
+    let hover_ev = vec![Event::PointerMoved(pos(30.0, 40.0))];
+    let press_ev = vec![
+        Event::PointerMoved(pos(30.0, 40.0)),
+        Event::PointerButton {
+            pos: pos(30.0, 40.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+
+    let base = shot(vec![], false, false);
+    let hover = shot(hover_ev, false, false);
+    let press = shot(press_ev, false, false);
+    let dis = shot(vec![], true, false);
+    let sel = shot(vec![], false, true);
+    let foc = shot_full(vec![], false, false, true);
+
+    let has = |s: &Snap, c: Color32| s.fills.iter().any(|(_, f)| *f == c && *f != Color32::TRANSPARENT);
+
+    // 静止态没有底色块（不能和 hover 混淆）
+    assert!(
+        !has(&base, crate::ui_kit::HOVER) && !has(&base, crate::ui_kit::PRESSED),
+        "静止态就画了 hover/pressed 底色"
+    );
+    assert!(has(&hover, crate::ui_kit::HOVER), "hover 没有用 HOVER 底色");
+    assert!(
+        !has(&hover, crate::ui_kit::PRESSED),
+        "hover 态误用了 pressed 底色"
+    );
+    assert!(has(&press, crate::ui_kit::PRESSED), "pressed 没有用 PRESSED 底色");
+    assert!(has(&sel, crate::ui_kit::ACCENT), "selected 没有用 ACCENT 填充");
+
+    // focus：必须有主题绿描边圈（1.5px），并且不是填充色块
+    assert!(
+        foc
+            .strokes
+            .iter()
+            .any(|(_, c, w)| *c == crate::ui_kit::ACCENT && *w >= 1.0),
+        "focus 态没有焦点圈：{:?}",
+        foc.strokes
+    );
+
+    // disabled：文字必须落到 DISABLED 色
+    assert!(
+        dis.texts.iter().any(|c| *c == crate::ui_kit::DISABLED),
+        "disabled 态文字没有变灰：{:?}",
+        dis.texts
+    );
+
+    // 五种状态的颜色两两可区分（RGB 曼哈顿距离 >= 6）
+    let dist = |a: Color32, b: Color32| -> u32 {
+        let (a, b) = (a.to_array(), b.to_array());
+        (0..3)
+            .map(|i| (a[i] as i32 - b[i] as i32).unsigned_abs())
+            .sum()
+    };
+    let states = [
+        ("静止", Color32::WHITE),
+        ("hover", crate::ui_kit::HOVER),
+        ("pressed", crate::ui_kit::PRESSED),
+        ("selected", crate::ui_kit::ACCENT),
+        ("disabled", crate::ui_kit::DISABLED),
+    ];
+    for i in 0..states.len() {
+        for j in (i + 1)..states.len() {
+            let d = dist(states[i].1, states[j].1);
+            assert!(
+                d >= 6,
+                "{} 与 {} 的颜色太接近（距离 {d}）：{:?} vs {:?}",
+                states[i].0,
+                states[j].0,
+                states[i].1,
+                states[j].1
+            );
+        }
+    }
+}

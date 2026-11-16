@@ -286,6 +286,7 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
+    focus_ring(ui, &resp, rect, 3.0);
     let col = if enabled {
         text_color(&v)
     } else {
@@ -395,6 +396,19 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
     };
     ui_icons::draw_excel(ui.painter(), rect.shrink(4.0), icon, col, enabled);
     resp.on_hover_text(tip)
+}
+
+/// 键盘焦点圈：功能区自绘按钮此前完全没有焦点指示（QA-05.3 五态里缺 focus）。
+/// 只在拿到焦点时画，1.5px 主题绿内描边，和 hover/pressed 的底色互不冲突。
+pub fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, radius: f32) {
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            radius,
+            Stroke::new(1.5, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 /// 勾选行：自绘复选框（白底/勾选填主题绿+白勾），不再用「✓」字符
@@ -613,6 +627,7 @@ pub fn color_button(
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
+    focus_ring(ui, &resp, rect, 2.0);
     let fg = if enabled { text_color(&v) } else { DISABLED };
     let top = Rect::from_min_size(rect.min + Vec2::new(2.0, 1.0), Vec2::new(20.0, 18.0));
     if let Some(t) = letter {
@@ -669,6 +684,7 @@ pub fn text_toggle(
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
+    focus_ring(ui, &resp, rect, 3.0);
     let col = if enabled { text_color(&v) } else { DISABLED };
     let _ = italic;
     let pos = rect.center() - Vec2::new(0.0, 0.5);
