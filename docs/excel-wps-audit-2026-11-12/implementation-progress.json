@@ -5487,7 +5487,9 @@
         "cargo test -p app --bin app wiz_range_label -> 1 passed",
         "cargo test -p app --bin app -> 361 passed",
         "cargo test -p sheetcore --test fncat -> 2 passed（other=0）",
-        "cargo test -p app --bin app -> 363 passed"
+        "cargo test -p app --bin app -> 363 passed",
+        "cargo test -p app --bin app cross_sheet_drag -> 1 passed",
+        "cargo test -p app --bin app -> 364 passed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
@@ -5509,13 +5511,12 @@
       ],
       "not_done": [
         "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）",
-        "跨表拖动扩区域（Sheet2!B3:C4）未做：拖动建立在当前表坐标轴上，需要另存远端锚点",
-        "向导类别筛选（11 类，475 个函数 0 个落「其他」）与帮助链接已接线，待真人点击验收；跨表拖动扩区域（Sheet2!B3:C4）未做。"
+        "跨表拖动扩区域已接线（切表清锚点 + pick_range_label 带表名/引号），待真人按住拖动验收；UI-11 其余界面项待真人点击。"
       ],
       "failures": [],
       "blocker": "",
       "next": "UI-11.1 真 IME 端到端（需真输入法）；其余切片等复核",
-      "updated_utc": "2026-11-16T20:48:27Z",
+      "updated_utc": "2026-11-16T20:50:49Z",
       "slices": [
         {
           "id": "UI-11.1",

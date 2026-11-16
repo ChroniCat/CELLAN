@@ -9869,3 +9869,16 @@ fn wizard_help_url_encodes_function_name() {
     // 空格必须被转义，否则链接断在空格处
     assert!(!u.contains(' '), "{u}");
 }
+
+#[test]
+fn cross_sheet_drag_labels_carry_sheet_name() {
+    // 同表拖动：不带表名
+    assert_eq!(crate::pick_range_label(None, (1, 1), (3, 2)), "B2:C4");
+    // 跨表拖动：带表名（Sheet2）
+    assert_eq!(crate::pick_range_label(Some("Sheet2"), (1, 1), (3, 2)), "Sheet2!B2:C4");
+    // 名字里有空格要加单引号（Excel 规则）
+    assert_eq!(
+        crate::pick_range_label(Some("销售 数据"), (0, 0), (0, 0)),
+        "'销售 数据'!A1"
+    );
+}

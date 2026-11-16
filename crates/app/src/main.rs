@@ -620,6 +620,20 @@ fn formula_help_keys(
     accept.then_some(*selected)
 }
 
+/// 拖动扩区域时的引用文本：跨表带 `表名!`，同表就是 `A1:B2`
+fn pick_range_label(sheet: Option<&str>, a: (u32, u32), b: (u32, u32)) -> String {
+    // 单格不写 A1:A1（Excel 也只写 A1）
+    let core = if a == b {
+        cell_name(a.0, a.1)
+    } else {
+        range_label(a, b)
+    };
+    match sheet {
+        Some(n) => format!("{}!{}", sheet_ref_name(n), core),
+        None => core,
+    }
+}
+
 /// 向导里的「帮助」链接：Excel 自己也是跳官方文档
 fn help_url(name: &str) -> String {
     format!(
@@ -9751,6 +9765,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        // 跨表后原锚点在别的表上，引用区间不能横跨两张表：
+        // 清掉锚点，让这张表上的第一次点选/拖动重新立锚（Excel 同样把新表当起点）
+        self.pick_anchor = None;
+        self.pick_rect = None;
         self.status = format!("点选引用（回车写回 {back}）");
         true
     }
@@ -25446,7 +25464,16 @@ let txn = self.txn_begin(&keys);
                     let c = col_at(p.x);
                     let r = row_at(p.y);
                     if (r, c) != a {
-                        let label = range_label(a, (r, c));
+                        // 跨表拖动时引用要带表名（Sheet2!B2:C3），同表则只写 A1 风格
+                        let name = match self.edit_sheet {
+                            Some(es) if es != self.sheet_idx => self
+                                .wb
+                                .sheets
+                                .get(self.sheet_idx)
+                                .map(|s| s.name.clone()),
+                            _ => None,
+                        };
+                        let label = pick_range_label(name.as_deref(), a, (r, c));
                         if let Some(ed) = self.editing.as_mut() {
                             let (buf, caret) = replace_char_span(&ed.buf, span, &label);
                             ed.buf = buf;
