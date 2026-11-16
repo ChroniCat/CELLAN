@@ -745,6 +745,20 @@ fn parse_ref_token(chars: &[char], i: usize) -> Option<(usize, String)> {
 
 /// UI-11.3：点选单元格建立引用 —— 光标左侧若是引用/正在输入的引用就整段替换，
 /// 否则在光标处插入。返回新缓冲与新光标（字符下标）。Excel 同款行为。
+/// 工作表名在引用里的写法：名字含空格、标点、以数字开头等要加单引号（Excel 规则）。
+pub(crate) fn sheet_ref_name(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c > '\u{7f}');
+    if plain {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
+}
+
 pub(crate) fn insert_reference(buf: &str, caret: usize, label: &str) -> (String, usize) {
     let chars: Vec<char> = buf.chars().collect();
     let caret = caret.min(chars.len());
@@ -1749,6 +1763,9 @@ struct SheetApp {
     /// UI-11.5：拖动拾取引用时的锚点，以及已插入那串文本在缓冲里的字符区间
     pick_anchor: Option<(u32, u32)>,
     pick_span: Option<(usize, usize)>,
+    /// UI-11.6：编辑会话所属工作表与目标格（跨表取引用时视图会切到别的表）
+    edit_sheet: Option<usize>,
+    edit_sel: Option<(u32, u32)>,
     /// 单元格右键菜单
     ctx_menu: Option<CtxMenuState>,
     /// 本帧菜单占用的矩形（判断点击是否落在外面）
@@ -2719,6 +2736,8 @@ impl SheetApp {
             pick_rect: None,
             pick_anchor: None,
             pick_span: None,
+            edit_sheet: None,
+            edit_sel: None,
             ctx_menu: None,
             ctx_rects: Vec::new(),
             cell_move: None,
@@ -5324,6 +5343,9 @@ impl SheetApp {
         }
         self.begin_nav_rect();
         let (r, c) = self.sel;
+        // UI-11.6：编辑会话记住所属表与目标格，跨表取引用后仍写回原格
+        self.edit_sheet = Some(self.sheet_idx);
+        self.edit_sel = Some((r, c));
         if let Some(holder) = self.lock_holder(r, c) {
             self.status = format!("{} 正在编辑 {}，请稍后", holder, cell_name(r, c));
             return;
@@ -9270,6 +9292,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) -> bool {
         let mut wrote = false;
+        // UI-11.6：跨表取引用时视图停在别的表上，提交前先回到编辑所属表与原格
+        self.return_to_edit_origin();
         // 编辑结束（或退回重试）都清掉点选引用的细框
         self.pick_rect = None;
         self.pick_anchor = None;
@@ -9510,11 +9534,91 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// 取消编辑：丢弃缓冲、交还租约，不碰模型、不记撤销、不改 dirty。
     fn cancel_edit(&mut self) {
+        self.return_to_edit_origin();
         self.editing = None;
         self.pick_rect = None;
         self.pick_anchor = None;
         self.pick_span = None;
         self.release_lock();
+    }
+
+    /// UI-11.6：把视图切回编辑会话所属的工作表与原格（跨表取引用后提交/取消时用）。
+    fn return_to_edit_origin(&mut self) {
+        let Some(es) = self.edit_sheet else {
+            return;
+        };
+        if es != self.sheet_idx && es < self.wb.sheets.len() {
+            self.remember_sheet_view();
+            self.load_sheet_view(es);
+        }
+        if let Some(sel) = self.edit_sel {
+            self.sel = sel;
+        }
+        self.edit_sheet = None;
+        self.edit_sel = None;
+    }
+
+    /// UI-11.6：公式编辑中切工作表只换视图、不提交（Excel 里点另一张表页是接着取引用）。
+    fn switch_sheet_for_ref(&mut self, idx: usize) -> bool {
+        if idx >= self.wb.sheets.len() || idx == self.sheet_idx {
+            return true;
+        }
+        let formula_edit = self
+            .editing
+            .as_ref()
+            .is_some_and(|ed| ed.buf.starts_with('='));
+        if !formula_edit {
+            return self.switch_sheet_view(idx);
+        }
+        self.edit_sheet.get_or_insert(self.sheet_idx);
+        self.edit_sel.get_or_insert(self.sel);
+        self.remember_sheet_view();
+        self.load_sheet_view(idx);
+        let back = match (self.edit_sheet, self.edit_sel) {
+            (Some(es), Some((r, c))) => self
+                .wb
+                .sheets
+                .get(es)
+                .map(|s| format!("{}!{}", sheet_ref_name(&s.name), cell_name(r, c)))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.status = format!("点选引用（回车写回 {back}）");
+        true
+    }
+
+    /// UI-11.6：跨表引用要带上工作表名；名字含空格/符号时按 Excel 规则加单引号。
+    fn qualify_ref(&self, label: &str) -> String {
+        match self.edit_sheet {
+            Some(es) if es != self.sheet_idx => {
+                let name = self
+                    .wb
+                    .sheets
+                    .get(self.sheet_idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                format!("{}!{label}", sheet_ref_name(&name))
+            }
+            _ => label.to_string(),
+        }
+    }
+
+    /// UI-11.6：在表格上点一格 = 往公式缓冲里插引用（跨表时带表名）。
+    fn insert_pick_reference(&mut self, r: u32, c: u32) -> String {
+        let label = self.qualify_ref(&crate::cell_name(r, c));
+        let mut span = None;
+        if let Some(ed) = self.editing.as_mut() {
+            let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
+            ed.buf = buf;
+            ed.caret = caret;
+            ed.caret_override = Some(caret);
+            span = Some((caret - label.chars().count(), caret));
+        }
+        self.pick_anchor = Some((r, c));
+        self.pick_span = span;
+        self.pick_rect = Some((r, c, r, c));
+        self.status = format!("已插入引用 {label}");
+        label
     }
 
     /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
@@ -25171,6 +25275,7 @@ let txn = self.txn_begin(&keys);
                         let r = rows.index_at((off_y + p.y - (origin.y + hh) - 1.0).max(0.0));
                         (whole_row_label(r), (r, 0u32, r, 16_383u32))
                     };
+                    let label = self.qualify_ref(&label);
                     if let Some(ed) = self.editing.as_mut() {
                         let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
                         ed.buf = buf;
@@ -25720,19 +25825,8 @@ let txn = self.txn_begin(&keys);
                                 Some((a.0.min(r), a.1.min(c), a.0.max(r), a.1.max(c)));
                             self.status = format!("已插入引用 {label}");
                         } else {
-                            let label = cell_name(r, c);
-                            let mut span = None;
-                            if let Some(ed) = self.editing.as_mut() {
-                                let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
-                                ed.buf = buf;
-                                ed.caret = caret;
-                                ed.caret_override = Some(caret);
-                                span = Some((caret - label.chars().count(), caret));
-                            }
-                            self.pick_anchor = Some((r, c));
-                            self.pick_span = span;
-                            self.pick_rect = Some((r, c, r, c));
-                            self.status = format!("已插入引用 {label}");
+                            // UI-11.6：跨表取引用时标签带工作表名（Sheet2!A1）
+                            self.insert_pick_reference(r, c);
                         }
                     }
                     // 正在编辑时不在按下这一拍改选区：草稿被数据验证拒绝时要留在原格
@@ -28253,6 +28347,57 @@ impl eframe::App for SheetApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         system_fonts::begin_frame();
+        // UI-11.6 无界面探针：SC_UI116=1 时在固定帧走一遍「编辑中切表取引用 → 回车写回原格」
+        if std::env::var("SC_UI116").is_ok() {
+            let pass = ctx.cumulative_pass_nr();
+            if pass == 4 {
+                if self.wb.sheets.len() == 1 {
+                    self.wb.sheets.push(sheetcore::Sheet::new("Sheet2"));
+                }
+                self.wb.sheet_mut(1).set(2, 1, Cell {
+                    value: Value::Number(42.0),
+                    formula: None,
+                });
+                self.sheet_idx = 0;
+                self.sel = (0, 0);
+                self.sel_end = (0, 0);
+                self.begin_edit(Some("=1+".into()));
+                eprintln!(
+                    "[ui116] pass4 sheet={} editing={} buf={:?}",
+                    self.sheet_idx,
+                    self.editing.is_some(),
+                    self.editing.as_ref().map(|e| e.buf.clone()).unwrap_or_default()
+                );
+            } else if pass == 6 {
+                self.switch_sheet_for_ref(1);
+                let label = self.insert_pick_reference(2, 1);
+                eprintln!(
+                    "[ui116] pass6 sheet={} label={} buf={:?}",
+                    self.sheet_idx,
+                    label,
+                    self.editing.as_ref().map(|e| e.buf.clone()).unwrap_or_default()
+                );
+            } else if pass == 12 {
+                let ok = self.commit_edit(None);
+                let formula = self
+                    .wb
+                    .sheet(0)
+                    .get(0, 0)
+                    .and_then(|c| c.formula.clone())
+                    .unwrap_or_default();
+                let value = self
+                    .wb
+                    .sheet(0)
+                    .get(0, 0)
+                    .map(|c| c.value.display())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[ui116] pass12 ok={ok} sheet={} sel={:?} formula={} value={} status={}",
+                    self.sheet_idx, self.sel, formula, value, self.status
+                );
+                eprintln!("[ui116] done");
+            }
+        }
         // UI-14.1：每 30 帧检查工作簿是否引用了尚未加载的系统字体；
         // 只有新增字体时才重建 FontDefinitions，避免每帧 set_fonts。
         if ctx.cumulative_pass_nr() % 30 == 0 {
@@ -29825,8 +29970,17 @@ impl eframe::App for SheetApp {
                         self.tab_drag = None;
                     }
                     if resp.clicked() {
-                        self.commit_edit(None);
-                        goto = Some(i);
+                        // UI-11.6：公式编辑中点另一张表页是接着取引用，不结束编辑
+                        if self
+                            .editing
+                            .as_ref()
+                            .is_some_and(|ed| ed.buf.starts_with('='))
+                        {
+                            self.switch_sheet_for_ref(i);
+                        } else {
+                            self.commit_edit(None);
+                            goto = Some(i);
+                        }
                     }
                     // 双击工作表标签 = 重命名（Excel 的基础操作）
                     if resp.double_clicked() {

@@ -8273,3 +8273,79 @@ fn multi_field_pivot_from_panel_is_queued_for_real_parts() {
     assert_eq!(app.wb.pivots_pending2[0].3, rect2);
     assert!(app.status.contains("多字段透视已刷新"));
 }
+
+// ---------------- UI-11.6 跨工作表取引用 ----------------
+
+#[test]
+fn ui116_sheet_names_needing_quotes_are_escaped() {
+    assert_eq!(crate::sheet_ref_name("Sheet2"), "Sheet2");
+    assert_eq!(crate::sheet_ref_name("Data_1"), "Data_1");
+    assert_eq!(crate::sheet_ref_name("2024年"), "'2024年'", "数字开头要加引号");
+    assert_eq!(crate::sheet_ref_name("我的 表"), "'我的 表'", "含空格要加引号");
+    assert_eq!(crate::sheet_ref_name("it's"), "'it''s'", "内部单引号要翻倍");
+}
+
+#[test]
+fn ui116_picking_another_sheet_inserts_qualified_reference_and_writes_back() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets.push(sheetcore::Sheet::new("Sheet2"));
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("=1+".into()));
+    assert!(app.editing.is_some(), "应进入编辑");
+
+    assert!(app.switch_sheet_for_ref(1), "公式编辑中应允许切表");
+    assert_eq!(app.sheet_idx, 1, "视图应切到第二张表");
+    assert!(app.editing.is_some(), "切表不能结束编辑");
+
+    let label = app.insert_pick_reference(2, 1);
+    assert_eq!(label, "Sheet2!B3", "跨表引用要带工作表名");
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.clone()).unwrap_or_default(),
+        "=1+Sheet2!B3"
+    );
+
+    assert!(app.commit_edit(None), "提交应成功");
+    assert_eq!(app.sheet_idx, 0, "提交后要回到编辑所属工作表");
+    let f = app
+        .wb
+        .sheet(0)
+        .get(0, 0)
+        .and_then(|c| c.formula.clone())
+        .unwrap_or_default();
+    assert_eq!(&*f, "=1+Sheet2!B3", "公式要写回原格（带等号）");
+    assert!(app.wb.sheet(1).get(2, 1).is_none(), "引用不能写到源表那格");
+}
+
+#[test]
+fn ui116_cancel_returns_to_origin_sheet() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets.push(sheetcore::Sheet::new("Sheet2"));
+    app.sheet_idx = 0;
+    app.sel = (3, 2);
+    app.sel_end = (3, 2);
+    app.begin_edit(Some("=".into()));
+    assert!(app.switch_sheet_for_ref(1));
+    assert_eq!(app.sheet_idx, 1);
+    app.cancel_edit();
+    assert!(app.editing.is_none());
+    assert_eq!(app.sheet_idx, 0, "取消编辑也要回到原表");
+    assert_eq!(app.sel, (3, 2), "取消后光标回到被编辑的格");
+}
+
+#[test]
+fn ui116_whole_column_reference_is_also_qualified() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    app.sheet_idx = 0;
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.begin_edit(Some("=SUM(".into()));
+    assert!(app.switch_sheet_for_ref(1));
+    assert_eq!(app.qualify_ref(&crate::whole_col_label(2)), "Other!C:C");
+    assert_eq!(app.qualify_ref(&crate::whole_row_label(4)), "Other!5:5");
+}
