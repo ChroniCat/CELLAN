@@ -627,6 +627,126 @@ pub fn add_calculated_fields(
     Ok(changed)
 }
 
+/// 计算项（Excel：缓存 sharedItems 里加 `<s v="名字" f="1"/>`，再写 `<calculatedItems>`）
+///
+/// `field` 是轴上的字段名，`item_idx` 是它在 sharedItems 里的新下标，
+/// `field_idx` 是这个字段在缓存里的序号（0 起），`pivot_field_idx` 是 pivotTable 里对应 pivotField 的序号。
+pub fn add_calculated_item(
+    path: &std::path::Path,
+    field: &str,
+    item: &str,
+    formula: &str,
+    field_idx: usize,
+    item_idx: usize,
+    pivot_field_idx: usize,
+) -> anyhow::Result<usize> {
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name().to_string();
+        let mut buf = Vec::with_capacity(e.size() as usize);
+        e.read_to_end(&mut buf)?;
+        entries.push((name, buf));
+    }
+    drop(zip);
+    let mut changed = 0usize;
+
+    for (name, buf) in entries.iter_mut() {
+        if !name.contains("pivotCacheDefinition") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { continue };
+        // 注意：文本字段实际是 <cacheField name="X" numFmtId="0">，不能带 ">" 收尾
+        let Some(fpos) = text.find(&format!("<cacheField name=\"{}\"", esc(field))) else {
+            continue;
+        };
+        let Some(rel_end) = text[fpos..].find("</cacheField>") else { continue };
+        let field_end = fpos + rel_end;
+        let Some(rel_si) = text[fpos..field_end].find("<sharedItems") else { continue };
+        let si_start = fpos + rel_si;
+        // count 加一
+        let mut out = String::with_capacity(text.len() + 128);
+        out.push_str(&text[..field_end]);
+        out.push_str(&format!("<s v=\"{}\" f=\"1\"/>", esc(item)));
+        out.push_str(&text[field_end..]);
+        let count_pat = "<sharedItems count=\"";
+        if let Some(ci) = out[si_start..].find(count_pat) {
+            let cs = si_start + ci + count_pat.len();
+            if let Some(cl) = out[cs..].find('"') {
+                let old: usize = out[cs..cs + cl].parse().unwrap_or(0);
+                out.replace_range(cs..cs + cl, &(old + 1).to_string());
+            }
+        }
+        // calculatedItems 必须排在 extLst 之前
+        let anchor = out.find("<extLst").unwrap_or_else(|| out.rfind("</pivotCacheDefinition>").unwrap_or(out.len()));
+        let block = format!(
+            "<calculatedItems count=\"1\"><calculatedItem formula=\"{}\"><pivotArea cacheIndex=\"{}\" outline=\"0\" fieldPosition=\"0\"><references count=\"1\"><reference field=\"{}\" count=\"1\"><x v=\"{}\"/></reference></references></pivotArea></calculatedItem></calculatedItems>",
+            esc(formula), field_idx, field_idx, item_idx
+        );
+        out.insert_str(anchor, &block);
+        *buf = out.into_bytes();
+        changed += 1;
+    }
+
+    for (name, buf) in entries.iter_mut() {
+        if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { continue };
+        // 找第 pivot_field_idx 个 <pivotField ...>...</pivotField>
+        let mut idx = 0usize;
+        let mut start = 0usize;
+        let mut target: Option<(usize, usize)> = None;
+        // 注意：不能用 "<pivotField" 找，否则会先命中 "<pivotFields count=...>"
+        while let Some(p) = text[start..].find("<pivotField ") {
+            let abs = start + p;
+            let Some(rel_close) = text[abs..].find("</pivotField>") else { break };
+            let close = abs + rel_close;
+            if idx == pivot_field_idx {
+                target = Some((abs, close));
+                break;
+            }
+            idx += 1;
+            start = close + "</pivotField>".len();
+        }
+        let Some((ps, pe)) = target else { continue };
+        let Some(rel_def) = text[ps..pe].find("<item t=\"default\"/>") else { continue };
+        let insert_at = ps + rel_def;
+        let mut out = String::with_capacity(text.len() + 32);
+        out.push_str(&text[..insert_at]);
+        out.push_str(&format!("<item f=\"1\" x=\"{}\"/>", item_idx));
+        out.push_str(&text[insert_at..]);
+        if let Some(ci) = out[ps..].find("<items count=\"") {
+            let cs = ps + ci + "<items count=\"".len();
+            if let Some(cl) = out[cs..].find('"') {
+                let old: usize = out[cs..cs + cl].parse().unwrap_or(0);
+                out.replace_range(cs..cs + cl, &(old + 1).to_string());
+            }
+        }
+        *buf = out.into_bytes();
+        changed += 1;
+    }
+
+    if changed == 0 {
+        return Ok(0);
+    }
+    let tmp = path.with_extension("item.tmp");
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
+        for (name, buf) in &entries {
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file(name.clone(), opts)?;
+            w.write_all(buf)?;
+        }
+        w.finish()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(changed)
+}
+
 fn set_attr(xml: &str, name: &str, val: &str) -> String {
     let pat = format!("{name}=\"");
     if let Some(i) = xml.find(&pat) {

@@ -462,6 +462,7 @@ fn calculated_field_lands_in_cache_definition_like_excel() {
 
     let n = pivot_xml::add_calculated_fields(&path, &[("总价", "金额*2")]).unwrap();
     // 缓存定义和透视表定义各改一处（pivotFields 条数必须跟着缓存字段数走）
+    eprintln!("[calcitem] changed={n}");
     assert_eq!(n, 2, "缓存定义 + 透视表定义");
 
     let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
@@ -487,6 +488,54 @@ fn calculated_field_lands_in_cache_definition_like_excel() {
     assert_eq!(count, actual, "count 与条目数不一致");
 
     let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/calcfield-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
+}
+
+#[test]
+fn calculated_item_writes_cache_items_and_calculated_items_block() {
+    use sheetcore::pivot_xml;
+    let fx = Fixture::new("calcitem");
+    let path = fx.file("calcitem.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_b(); // 行=地区(col0)、列=产品(col1)、值=金额(col2)
+    let _ = attach(&path, &mut wb, &spec);
+
+    // 地区在缓存里是第 0 个字段；已有 2 个项，新项下标 2
+    let n = pivot_xml::add_calculated_item(&path, "地区", "华东华北", "地区[华东]+地区[华北]", 0, 2, 0)
+        .unwrap();
+    assert_eq!(n, 2, "缓存定义 + 透视表定义");
+
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut cache = String::new();
+    let mut table = String::new();
+    {
+        use std::io::Read;
+        let cd = z
+            .file_names()
+            .find(|n| n.contains("pivotCacheDefinition"))
+            .unwrap()
+            .to_string();
+        z.by_name(&cd).unwrap().read_to_string(&mut cache).unwrap();
+        let pt = z
+            .file_names()
+            .find(|n| n.starts_with("xl/pivotTables/") && n.ends_with(".xml"))
+            .unwrap()
+            .to_string();
+        z.by_name(&pt).unwrap().read_to_string(&mut table).unwrap();
+    }
+    assert!(cache.contains("<s v=\"华东华北\" f=\"1\"/>"), "{cache}");
+    assert!(
+        cache.contains("<calculatedItem formula=\"地区[华东]+地区[华北]\">"),
+        "{cache}"
+    );
+    // 计算项块必须排在 extLst 之前
+    if let (Some(ci), Some(el)) = (cache.find("<calculatedItems"), cache.find("<extLst")) {
+        assert!(ci < el, "calculatedItems 必须在 extLst 之前");
+    }
+    assert!(table.contains("<item f=\"1\" x=\"2\"/>"), "{table}");
+
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/calcitem-ours.xlsx");
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }
