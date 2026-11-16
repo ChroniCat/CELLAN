@@ -9251,3 +9251,182 @@ fn recalc_result_from_another_document_is_discarded_even_if_epoch_matches() {
         "归属正确的重算结果也被丢了"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UI-29.2 图标：16/20/24/32 四档都必须有墨、不能画出盒子、线宽不能糊成 0
+// ---------------------------------------------------------------------------
+
+fn icon_shapes(icon: crate::ui_icons::Icon, size: f32, color: bool) -> Vec<egui::Shape> {
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(size + 32.0, size + 32.0),
+    ));
+    let out = ctx.run(raw, |ctx| {
+        let p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("icon_audit"),
+        ));
+        let r = egui::Rect::from_min_size(egui::pos2(16.0, 16.0), egui::Vec2::splat(size));
+        if color {
+            crate::ui_icons::draw_excel(&p, r, icon, egui::Color32::BLACK, true);
+        } else {
+            crate::ui_icons::draw(&p, r, icon, egui::Color32::BLACK);
+        }
+    });
+    out.shapes.into_iter().map(|c| c.shape).collect()
+}
+
+fn shape_bbox(shapes: &[egui::Shape], acc: &mut Option<egui::Rect>) {
+    fn take(r: egui::Rect, acc: &mut Option<egui::Rect>) {
+        *acc = Some(match *acc {
+            Some(a) => a.union(r),
+            None => r,
+        });
+    }
+    for s in shapes {
+        match s {
+            egui::Shape::Rect(r) => take(r.rect, acc),
+            egui::Shape::Circle(c) => take(egui::Rect::from_center_size(c.center, egui::Vec2::splat(c.radius * 2.0)), acc),
+            egui::Shape::LineSegment { points, .. } => {
+                take(egui::Rect::from_two_pos(points[0], points[1]), acc)
+            }
+            egui::Shape::Path(p) => {
+                if let Some(first) = p.points.first() {
+                    let mut r = egui::Rect::from_min_max(*first, *first);
+                    for q in &p.points[1..] {
+                        r = r.union(egui::Rect::from_min_max(*q, *q));
+                    }
+                    take(r, acc);
+                }
+            }
+            egui::Shape::Vec(v) => shape_bbox(v, acc),
+            egui::Shape::Text(t) => take(t.galley.rect.translate(t.pos.to_vec2()), acc),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn every_icon_draws_ink_inside_its_box_at_four_sizes() {
+    let mut problems: Vec<String> = Vec::new();
+    for &size in &[16.0f32, 20.0, 24.0, 32.0] {
+        for icon in crate::ui_icons::ALL_ICONS {
+            for color in [false, true] {
+                let shapes = icon_shapes(icon, size, color);
+                let mut bbox = None;
+                shape_bbox(&shapes, &mut bbox);
+                let Some(bb) = bbox else {
+                    problems.push(format!("{icon:?} {size}px color={color}: 没有画出任何图形"));
+                    continue;
+                };
+                if shapes.is_empty() {
+                    problems.push(format!("{icon:?} {size}px: shape 列表为空"));
+                }
+                // 盒子在 (16,16)-(16+size,16+size)；允许 4% 外扩（draw_excel 会外扩）
+                let box_rect = egui::Rect::from_min_size(
+                    egui::pos2(16.0, 16.0),
+                    egui::Vec2::splat(size),
+                );
+                let slack = (size * 0.06).max(1.5);
+                if bb.min.x < box_rect.min.x - slack
+                    || bb.min.y < box_rect.min.y - slack
+                    || bb.max.x > box_rect.max.x + slack
+                    || bb.max.y > box_rect.max.y + slack
+                {
+                    problems.push(format!(
+                        "{icon:?} {size}px color={color}: 超出盒子 bbox={bb:?} box={box_rect:?}"
+                    ));
+                }
+                // 墨量：图形不能缩成点，也不能糊满整格
+                let ink = (bb.width() * bb.height()) / (size * size);
+                if ink < 0.06 {
+                    problems.push(format!("{icon:?} {size}px: 墨量太小 {ink:.3}"));
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "图标自检失败 {} 项：\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn icon_stroke_width_never_drops_below_one_pixel() {
+    let mut thin: Vec<String> = Vec::new();
+    for &size in &[16.0f32, 20.0, 24.0, 32.0] {
+        for icon in crate::ui_icons::ALL_ICONS {
+            let shapes = icon_shapes(icon, size, false);
+            let mut min_w = f32::MAX;
+            fn scan(s: &egui::Shape, min_w: &mut f32) {
+                match s {
+                    egui::Shape::Rect(r) if r.stroke.width > 0.0 => {
+                        *min_w = min_w.min(r.stroke.width)
+                    }
+                    egui::Shape::LineSegment { stroke, .. } => *min_w = min_w.min(stroke.width),
+                    egui::Shape::Path(p) if p.stroke.width > 0.0 => {
+                        *min_w = min_w.min(p.stroke.width)
+                    }
+                    egui::Shape::Vec(v) => {
+                        for x in v {
+                            scan(x, min_w);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for s in &shapes {
+                scan(s, &mut min_w);
+            }
+            if min_w < 0.99 {
+                thin.push(format!("{icon:?} {size}px: 线宽 {min_w:.2}"));
+            }
+        }
+    }
+    assert!(thin.is_empty(), "有 {} 处线宽小于 1px：\n{}", thin.len(), thin.join("\n"));
+}
+
+#[test]
+fn debug_icon_shape_dump() {
+    if std::env::var("SC_ICON_DBG").is_err() {
+        return;
+    }
+    for (name, icon) in [
+        ("Comma", crate::ui_icons::Icon::Comma),
+        ("FormulaView", crate::ui_icons::Icon::FormulaView),
+    ] {
+        for color in [false, true] {
+            let shapes = icon_shapes(icon, 32.0, color);
+            eprintln!("== {name} color={color}");
+            fn dump(s: &egui::Shape, depth: usize) {
+                let pad = "  ".repeat(depth);
+                match s {
+                    egui::Shape::Rect(r) => eprintln!("{pad}Rect {:?} stroke={}", r.rect, r.stroke.width),
+                    egui::Shape::Text(t) => eprintln!(
+                        "{pad}Text pos={:?} galley_rect={:?} text={:?}",
+                        t.pos, t.galley.rect, t.galley.text()
+                    ),
+                    egui::Shape::LineSegment { points, stroke } => {
+                        eprintln!("{pad}Line {:?}-{:?} w={}", points[0], points[1], stroke.width)
+                    }
+                    egui::Shape::Path(p) => eprintln!("{pad}Path {:?} w={}", p.points.first(), p.stroke.width),
+                    egui::Shape::Circle(c) => eprintln!("{pad}Circle {:?} r={}", c.center, c.radius),
+                    egui::Shape::Vec(v) => {
+                        eprintln!("{pad}Vec {}", v.len());
+                        for x in v {
+                            dump(x, depth + 1);
+                        }
+                    }
+                    other => eprintln!("{pad}{other:?}"),
+                }
+            }
+            for s in &shapes {
+                dump(s, 0);
+            }
+        }
+    }
+}

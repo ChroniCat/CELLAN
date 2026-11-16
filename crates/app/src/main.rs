@@ -30341,7 +30341,55 @@ impl eframe::App for SheetApp {
                 }
             }
         }
-        // 图标对照表：SC_ICON_SHEET=1 时在最上层画「位图 / 矢量」并排，配合 SC_SHOT 截图
+        // 图标对照表：SC_ICON_SHEET=16|20|24|32 时按该尺寸铺满全部图标，
+        // 每格带边框和名字，配合 SC_SHOT 截图做清晰度评审；=1 走旧的位图/矢量并排。
+        if let Ok(sheet) = std::env::var("SC_ICON_SHEET") {
+            if let Ok(sz) = sheet.parse::<f32>() {
+                let screen = ctx.screen_rect();
+                let p = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("icon_sheet_size"),
+                ));
+                p.rect_filled(screen, 0.0, Color32::WHITE);
+                let cols = 12usize;
+                let cell_w = (screen.width() / cols as f32).floor();
+                let cell_h = ((screen.height() - 34.0) / 12.0).floor();
+                p.text(
+                    egui::pos2(8.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("图标 {}px × {} 个", sz as i32, crate::ui_icons::ALL_ICONS.len()),
+                    egui::FontId::proportional(12.0),
+                    Color32::from_gray(60),
+                );
+                for (i, icon) in crate::ui_icons::ALL_ICONS.iter().enumerate() {
+                    let cx = (i % cols) as f32 * cell_w;
+                    let cy = 26.0 + (i / cols) as f32 * cell_h;
+                    p.rect_stroke(
+                        egui::Rect::from_min_size(
+                            egui::pos2(cx, cy),
+                            egui::vec2(cell_w - 1.0, cell_h - 1.0),
+                        ),
+                        0.0,
+                        egui::Stroke::new(1.0, Color32::from_gray(224)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let icon_rect = egui::Rect::from_min_size(
+                        egui::pos2(cx + 8.0, cy + 8.0),
+                        egui::Vec2::splat(sz),
+                    );
+                    crate::ui_icons::draw_excel(&p, icon_rect, *icon, Color32::from_gray(70), true);
+                    p.text(
+                        egui::pos2(cx + 8.0 + sz + 6.0, cy + 8.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{icon:?}"),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_gray(110),
+                    );
+                }
+                self.commit_edit_before_close(ctx);
+                return;
+            }
+        }
         if std::env::var("SC_ICON_SHEET").is_ok() {
             let screen = ctx.screen_rect();
             let p = ctx.layer_painter(egui::LayerId::new(

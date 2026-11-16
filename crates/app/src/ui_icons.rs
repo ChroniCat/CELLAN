@@ -432,6 +432,33 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     paint(p, rect, icon, Some(color));
 }
 
+/// 全部图标（由枚举顺序生成；新增图标后同步这里，测试会数个数）
+pub const ALL_ICONS: [Icon; 138] = [
+    Icon::Open, Icon::Save, Icon::SaveAs, Icon::Print, Icon::Undo, Icon::Redo,
+    Icon::Paste, Icon::Cut, Icon::Copy, Icon::Brush, Icon::Fill, Icon::FontColor,
+    Icon::AlignL, Icon::AlignC, Icon::AlignR, Icon::Top, Icon::Middle, Icon::Bottom,
+    Icon::Wrap, Icon::Merge, Icon::Border, Icon::Currency, Icon::Percent, Icon::Comma,
+    Icon::SortAsc, Icon::SortDesc, Icon::Filter, Icon::Find, Icon::Chart, Icon::Image,
+    Icon::Table, Icon::Comment, Icon::Pivot, Icon::Link, Icon::Revision, Icon::Zoom,
+    Icon::Calc, Icon::Sheet, Icon::Share, Icon::Fx, Icon::Sum, Icon::Grid,
+    Icon::Close, Icon::Plus, Icon::Refresh, Icon::DecInc, Icon::DecDec, Icon::FontGrow,
+    Icon::FontShrink, Icon::TextDir, Icon::HeaderFooter, Icon::DocLink, Icon::GroupRows, Icon::UngroupRows,
+    Icon::ShowDetail, Icon::HideDetail, Icon::Validation, Icon::SplitColumns, Icon::RemoveDup, Icon::Consolidate,
+    Icon::ImportCsv, Icon::ImportBook, Icon::WhatIf, Icon::OutlineLevels, Icon::GoalSeek, Icon::Scenario,
+    Icon::Eye, Icon::EyeOff, Icon::PageLayout, Icon::PageBreak, Icon::NormalView, Icon::ShowHeadings,
+    Icon::FormulaBar, Icon::TextSpill, Icon::ViewPane, Icon::Pin, Icon::NewView, Icon::ZoomSelection,
+    Icon::FormulaView, Icon::ErrorCheck, Icon::NameTag, Icon::WatchPane, Icon::Spelling, Icon::CommentPrev,
+    Icon::CommentNext, Icon::ShowComment, Icon::Online, Icon::AutoShare, Icon::Help, Icon::About,
+    Icon::Orientation, Icon::PaperSize, Icon::PrintGrid, Icon::PrintHeadings, Icon::PrintArea, Icon::PivotRefresh,
+    Icon::PivotOptions, Icon::ChartList, Icon::FolderPlus, Icon::AppDefault, Icon::AppAdd, Icon::PdfExport,
+    Icon::HostTakeover, Icon::UpdateCheck, Icon::FormatCells, Icon::TextVerticalDraw, Icon::TextBoxDraw, Icon::CalcSheet,
+    Icon::SheetRef, Icon::FilterReapply, Icon::SortDialog, Icon::ShowChanges, Icon::SheetViewSwitch, Icon::ZoomDialog,
+    Icon::ZoomIn, Icon::Unfreeze, Icon::TableToRange, Icon::SparkEdit, Icon::ChartEdit, Icon::RichText,
+    Icon::Freeze, Icon::FreezeRow, Icon::FreezeCol, Icon::Lock, Icon::Cf, Icon::Eraser,
+    Icon::ClearFmt, Icon::IndentInc, Icon::IndentDec, Icon::Symbol, Icon::ZhS, Icon::ZhT,
+    Icon::TraceIn, Icon::TraceOut, Icon::SparkLine, Icon::SparkColumn, Icon::SparkLoss, Icon::TextBox,
+];
+
 /// 图标总表：给「对照表」和自检用（位图 vs 矢量并排看）
 pub const SHEET_ICONS: [Icon; 46] = [
     Icon::AlignC, Icon::AlignL, Icon::AlignR, Icon::Border, Icon::Bottom, Icon::Brush,
@@ -630,7 +657,13 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
         // ---- 数字 ----
         Currency => pen.text("¥", 14.5, 12.0, 12.2, GREEN_D),
         Percent => pen.text("%", 13.5, 12.0, 12.2, GREEN_D),
-        Comma => pen.text(",", 16.4, 12.6, 21.0, GREEN_D),
+        Comma => {
+            // UI-29.2：以前是 FontId 画的「,」字号 21 网格单位，字形下伸到 y≈26，
+            // 16px 档会压到下面的标签上；改成矢量逗号，稳定落在 0..24 内。
+            pen.polyline(&[(12.4, 10.6), (11.6, 14.2), (10.6, 18.4)], 2.6, GREEN_D);
+            pen.dot(12.4, 10.6, 1.9, GREEN_D);
+            pen.dot(10.6, 18.4, 1.05, GREEN_D);
+        }
         DecInc => {
             pen.text("0.0", 8.6, 9.2, 12.6, INK);
             pen.bar(16.4, 6.4, 4.6, 1.3, INK);
@@ -1349,7 +1382,13 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.rrs(2.8, 4.0, 18.4, 14.0, 0.6, WHITE, INK, 1.15);
             pen.bar(3.0, 8.4, 18.0, 0.9, Color32::from_rgb(191, 191, 191));
             pen.bar(9.4, 4.2, 0.9, 13.6, Color32::from_rgb(191, 191, 191));
-            pen.text("fx", 15.4, 14.6, 8.0, Color32::from_rgb(33, 115, 70));
+            // UI-29.2：原来用 8 号字画 "fx"，行高约 25px（32px 档），顶边跑到框外
+            // 2.5px；改成矢量笔画，和网格线同粗，稳定留在 0..24。
+            let fx = Color32::from_rgb(33, 115, 70);
+            pen.polyline(&[(16.2, 17.4), (16.2, 11.9), (17.4, 11.2), (18.2, 11.7)], 1.3, fx);
+            pen.ln(14.8, 13.6, 19.4, 13.6, 1.15, fx);
+            pen.polyline(&[(20.1, 11.9), (23.4, 17.4)], 1.3, fx);
+            pen.polyline(&[(23.4, 11.9), (20.1, 17.4)], 1.3, fx);
         }
         ErrorCheck => {
             // 错误检查：格子右上角红三角 + 一个对勾
