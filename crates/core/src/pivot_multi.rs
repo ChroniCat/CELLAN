@@ -87,6 +87,8 @@ pub struct PivotGrid {
     pub value_cols: usize,
     /// 列的叶子标签
     pub col_labels: Vec<String>,
+    /// 列叶子的逐层路径（与 col_labels 一一对应，供 pivotTable 部件写嵌套 colItems）
+    pub col_paths: Vec<Vec<String>>,
     pub grand_total_row: Option<usize>,
 }
 
@@ -259,6 +261,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     for p in &col_paths {
         grid.col_labels.push(if p.is_empty() { String::new() } else { p.join(" / ") });
     }
+    grid.col_paths = col_paths.clone();
 
     let n_head = if spec.cols.is_empty() { 1 } else { spec.cols.len() + 1 };
     let total_cols = spec.rows.len() + col_paths.len() * spec.values.len();

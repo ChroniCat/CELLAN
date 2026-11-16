@@ -85,6 +85,18 @@ fn main() {
             filters: vec![],
             layout: PivotLayout::default(),
         },
+        // 1 行 + 2 列 + 1 值（多列字段，嵌套 colItems）
+        "D" => PivotSpec2 {
+            source: (0, 0, 6, 3),
+            rows: vec![AxisField { col: 0, group: GroupBy::None }],
+            cols: vec![
+                AxisField { col: 1, group: GroupBy::None },
+                AxisField { col: 3, group: GroupBy::None },
+            ],
+            values: vec![ValueField { col: 2, agg: Agg::Sum, label: None }],
+            filters: vec![],
+            layout: PivotLayout::default(),
+        },
         other => panic!("未知用例 {other}"),
     };
 

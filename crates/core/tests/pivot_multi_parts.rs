@@ -180,3 +180,37 @@ fn save_attaches_multi_field_pivot_parts() {
     let reopened = xlsx::load(&path).expect("重新打开失败");
     assert!(reopened.sheets[0].get(8, 0).is_some(), "透视表区域内容丢了");
 }
+
+fn spec_d() -> PivotSpec2 {
+    PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![
+            AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
+            AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
+        ],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None }],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    }
+}
+
+/// 两个列字段：每个列字段都要标 axisCol，colItems 按层嵌套（Excel 会因字段没标轴直接丢表）。
+#[test]
+fn two_column_fields_are_both_marked_as_axis_fields() {
+    let f = Fixture::new("2cols");
+    let path = f.file("d.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_d();
+    let (id, _rows) = attach(&path, &mut wb, &spec);
+    assert_eq!(id, 1);
+    let parts = pivot_parts(&path);
+    assert!(parts.iter().any(|p| p.ends_with("pivotTable1.xml")), "{parts:?}");
+    // 两个列字段都必须标成 axisCol，否则 Excel 会静默丢掉整张透视表
+    let xml = String::from_utf8(
+        sheetcore::fixups::read_part(&path, "xl/pivotTables/pivotTable1.xml").expect("缺 pivotTable 部件"),
+    )
+    .unwrap();
+    assert_eq!(xml.matches("axis=\"axisCol\"").count(), 2, "列字段标轴数量不对：{xml}");
+    assert!(xml.contains("<field x=\"1\"/><field x=\"3\"/>"), "colFields 顺序不对：{xml}");
+}

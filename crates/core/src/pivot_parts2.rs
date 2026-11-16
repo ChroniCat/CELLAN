@@ -57,14 +57,14 @@ pub fn build(
     if spec.rows.is_empty() {
         bail!("多字段透视至少需要一个行字段");
     }
-    if spec.cols.len() > 1 {
-        bail!("多字段透视暂只支持 0 或 1 个列字段");
-    }
     if spec.values.is_empty() {
         bail!("多字段透视至少需要一个值字段");
     }
     if spec.cols.is_empty() && spec.values.len() > 1 {
         bail!("多值透视必须带列字段（Excel 用 -2 数据伪字段表达）");
+    }
+    if spec.cols.len() > 1 && spec.values.len() > 1 {
+        bail!("多列字段 + 多值字段的组合还没实测，暂不支持");
     }
 
     let (r1, c1, r2, c2) = spec.source;
@@ -170,46 +170,66 @@ pub fn build(
     let mut col_items = String::new();
     let mut col_count = 1usize;
     let mut extra = String::new();
-    match spec.cols.first() {
-        Some(cf) => {
-            let ci = (cf.col - c1) as usize;
-            let labels: Vec<String> = grid.col_labels.clone();
-            if labels.is_empty() {
-                bail!("多字段透视：列字段没有任何叶子标签");
+    let n_cols = spec.cols.len();
+    if n_cols == 0 {
+        col_items.push_str("<i/>");
+        extra.push_str("<colItems count=\"1\"><i/></colItems>");
+    } else {
+        let col_field_idx: Vec<usize> = spec.cols.iter().map(|f| (f.col - c1) as usize).collect();
+        if grid.col_paths.is_empty() {
+            bail!("多字段透视：列字段没有任何叶子标签");
+        }
+        let paths = grid.col_paths.clone();
+        let mut items: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < paths.len() {
+            let head = paths[i].first().cloned().unwrap_or_default();
+            let group_start = i;
+            while i < paths.len() && paths[i].first().cloned().unwrap_or_default() == head {
+                i += 1;
             }
-            for label in &labels {
-                let idx = idx_of(&mut shared[ci], label);
-                for vi in 0..k {
-                    let data_attr = if vi == 0 {
-                        String::new()
-                    } else {
-                        format!(" i=\"{vi}\"")
-                    };
-                    col_items.push_str(&format!("<i{data_attr}><x v=\"{idx}\"/></i>"));
+            let group = &paths[group_start..i];
+            for (j, path) in group.iter().enumerate() {
+                if j == 0 {
+                    // 组首：每层都写明确的 <x>
+                    let mut xs = String::new();
+                    for d in 0..n_cols {
+                        let idx = idx_of(&mut shared[col_field_idx[d]], &path[d]);
+                        xs.push_str(&format!("<x v=\"{idx}\"/>"));
+                    }
+                    items.push(format!("<i>{xs}</i>"));
+                } else {
+                    // 同组后续：r 重复前 n_cols-1 层，只有最后一层变
+                    let idx = idx_of(&mut shared[col_field_idx[n_cols - 1]], &path[n_cols - 1]);
+                    items.push(format!("<i r=\"{}\"><x v=\"{idx}\"/></i>", n_cols - 1));
                 }
             }
-            for vi in 0..k {
-                let data_attr = if vi == 0 {
-                    String::new()
-                } else {
-                    format!(" i=\"{vi}\"")
-                };
-                col_items.push_str(&format!("<i t=\"grand\"{data_attr}><x/></i>"));
+            if spec.layout.subtotals && n_cols >= 2 {
+                // 组小计：外层各级写实际下标，最后一级留空 <x/>
+                let mut xs = String::new();
+                for d in 0..n_cols - 1 {
+                    let idx = idx_of(&mut shared[col_field_idx[d]], &group[0][d]);
+                    xs.push_str(&format!("<x v=\"{idx}\"/>"));
+                }
+                xs.push_str("<x/>");
+                items.push(format!("<i t=\"default\">{xs}</i>"));
             }
-            col_count = labels.len() * k + k;
-            let fields = if k > 1 {
-                format!("<colFields count=\"2\"><field x=\"{ci}\"/><field x=\"-2\"/></colFields>")
-            } else {
-                format!("<colFields count=\"1\"><field x=\"{ci}\"/></colFields>")
-            };
-            extra.push_str(&format!(
-                "{fields}<colItems count=\"{col_count}\">{col_items}</colItems>"
-            ));
+            i = i.max(group_start + 1);
         }
-        None => {
-            col_items.push_str("<i/>");
-            extra.push_str("<colItems count=\"1\"><i/></colItems>");
+        items.push("<i t=\"grand\"><x/></i>".to_string());
+        col_count = items.len();
+        col_items = items.join("");
+        let mut fields = String::new();
+        for f in &col_field_idx {
+            fields.push_str(&format!("<field x=\"{f}\"/>"));
         }
+        if k > 1 {
+            fields.push_str("<field x=\"-2\"/>");
+        }
+        extra.push_str(&format!(
+            "<colFields count=\"{}\">{fields}</colFields><colItems count=\"{col_count}\">{col_items}</colItems>",
+            n_cols + usize::from(k > 1)
+        ));
     }
 
     // ---------- 缓存字段与记录 ----------
@@ -282,7 +302,7 @@ pub fn build(
         out.push_str("<item t=\"default\"/>");
         out
     };
-    let col_i = spec.cols.first().map(|f| (f.col - c1) as usize);
+    let col_field_set: Vec<usize> = spec.cols.iter().map(|f| (f.col - c1) as usize).collect();
     let mut pfields = String::new();
     for i in 0..n_fields {
         if row_fields.contains(&i) {
@@ -291,7 +311,7 @@ pub fn build(
                 shared[i].len() + 1,
                 items_for(&shared[i])
             ));
-        } else if Some(i) == col_i {
+        } else if col_field_set.contains(&i) {
             pfields.push_str(&format!(
                 "<pivotField axis=\"axisCol\" compact=\"0\" outline=\"0\" showAll=\"0\"><items count=\"{}\">{}</items></pivotField>",
                 shared[i].len() + 1,
@@ -305,13 +325,12 @@ pub fn build(
     }
 
     // ---------- 表头/位置 ----------
-    let n_head = if spec.cols.is_empty() { 1 } else { 2 };
+    let n_head = if spec.cols.is_empty() { 1u32 } else { spec.cols.len() as u32 + 1 };
+    // 表头行数 = 列字段层数 + 1（值标签行）；多值时值轴再加一行
     let first_data_row = if spec.cols.is_empty() {
         1
-    } else if k > 1 {
-        3
     } else {
-        2
+        n_head + u32::from(k > 1)
     };
     let loc = format!(
         "{}{}:{}{}",
@@ -354,7 +373,6 @@ pub fn build(
     if rec_count != n_records {
         bail!("透视缓存记录数不一致：<r>={rec_count} recordCount={n_records}");
     }
-    let _ = n_head;
     Ok((cache, records, table))
 }
 
