@@ -7080,13 +7080,17 @@
       "scope": "app/ui_kit.rs + 可访问树",
       "source": "ui-requirements.md",
       "heading": "UI-24 对话框一致性和屏幕阅读支持",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
-      "commits": [],
+      "commits": [
+        "284f63c"
+      ],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "UI-24.1 待实施（模态焦点/默认按钮/关闭恢复）；UI-24.2 实施中（功能区+对话框+活动单元格已可读）；UI-24.3 待实施。"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
@@ -7116,16 +7120,30 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "284f63c"
+          ],
+          "commands": [
+            "cargo build -p app --no-default-features --features glow（eframe 开 accesskit）",
+            "powershell uia_dump.ps1 -> UIA 子树 115→126 元素，功能区按钮名/对话框 Pane/网格 DataItem 均可读",
+            "cargo test -p app --bin app（--test-threads=2）-> 339 passed（work/goal-logs/ui24-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-a11y-uia.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dlg3.txt"
+          ],
+          "not_done": [
+            "下拉/画廊/菜单项、状态栏、滚动条、拆分按钮箭头未逐个补可访问名。",
+            "网格只发布活动单元格一个 Cell 节点，整屏/整表可浏览未做。",
+            "Tab 焦点锁在模态内、Enter 默认按钮、关闭后焦点恢复（UI-24.1）未做。",
+            "未用 Narrator 实读（RDP 下无法自动化），证据是外部 UIAutomation 客户端枚举。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "补下拉/菜单项名字；做 UI-24.1 焦点锁与恢复；再让网格按可见行批量发布子节点。",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {

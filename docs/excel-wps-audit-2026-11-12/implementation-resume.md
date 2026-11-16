@@ -491,3 +491,15 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - **未解决**：保存瞬时峰值 core 1,186MB / GUI 1,923MB，根因是 umya 整份副本 + 序列化缓冲；
   COW 只省掉 clone 那份（1993→1923MB）。
 - 测试：core 106 二进制 0 failed、app **339 passed**。
+
+### 检查点二十二：UI-24.2 可访问树接入（accesskit）
+- `284f63c`：eframe 开 `accesskit` feature；`ui_kit::a11y_name` 给自绘控件补
+  WidgetInfo + accesskit 节点（Button/label/disabled/toggled），已接功能区按钮与 pill；
+  `Dlg::show` 注册 Role=Dialog + 标题；网格 `publish_grid_a11y` 发布活动单元格
+  （Role=Cell，名字「A1，0，已选中」，带值与公式）。
+- 外部验证：PowerShell UIAutomationClient 枚举窗口子树，功能区按钮从「无名字」变成
+  「剪切（Ctrl+X）/加粗（Ctrl+B）/…」，对话框显示 `Pane 数据验证` 及其按钮，
+  网格是 `DataItem A1，0，已选中`。原始 dump 在 `implementation-evidence/ui24/uia-dlg3.txt`。
+- 边界：只覆盖按钮/pill/对话框标题/活动单元格；下拉与菜单项、状态栏未补；
+  UI-24.1 焦点锁与恢复未做；未用 Narrator 实读（RDP 下无法自动化）。
+- app 339 passed。
