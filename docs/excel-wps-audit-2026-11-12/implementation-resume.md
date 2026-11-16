@@ -539,3 +539,9 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - **查出功能差异**：功能区与右键菜单没有运行期禁用态，`Ctl.enabled` 恒 true，
   剪贴板为空时「剪切/复制/粘贴」照样可点；因此 a11y disabled 路径无法用真实按钮验证。
 - app 341 passed。
+
+### 检查点二十七：粘贴按钮随剪贴板灰化
+- `has_pasteable()`（查格式不读数据、500ms 缓存）接入 `ctl_state` 的 Paste 系列；
+  空剪贴板 `Button 粘贴 enabled=False`，Set-Clipboard 后 `enabled=True`（外部 UIA 实测两向）。
+- 顺带补齐大号拆分按钮主体的可访问名（此前只有箭头有名字）。
+- app 341 passed。

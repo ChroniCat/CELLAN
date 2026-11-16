@@ -7089,7 +7089,8 @@
         "d8a8619",
         "1e72505",
         "d6067b7",
-        "d0f38ac"
+        "d0f38ac",
+        "3980de6"
       ],
       "commands": [],
       "evidence": [],
@@ -7145,7 +7146,8 @@
             "284f63c",
             "1e72505",
             "d6067b7",
-            "d0f38ac"
+            "d0f38ac",
+            "3980de6"
           ],
           "commands": [
             "cargo build -p app --no-default-features --features glow（eframe 开 accesskit）",
@@ -7156,7 +7158,9 @@
             "uia_dump.ps1 -> TabItem Sheet1（383,1054,64,32）、DataGrid bounds 271,463,1423,574（原为 ∞）",
             "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui242-app.log）",
             "SC_CTX_MENU=600,600 + uia_dump.ps1 -> MenuItem 剪切，Ctrl+X / 插入，有子菜单；粘贴图标条 5 个 Button 有名字",
-            "uia_dump.ps1 -> Button 保存 enabled=True / 撤销 enabled=False / 重做 enabled=False（快速访问工具栏）"
+            "uia_dump.ps1 -> Button 保存 enabled=True / 撤销 enabled=False / 重做 enabled=False（快速访问工具栏）",
+            "清空剪贴板 + uia_dump -> Button 粘贴 enabled=False；Set-Clipboard 后再 dump -> enabled=True",
+            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui242d-app.log）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-a11y-uia.txt",
@@ -7170,7 +7174,7 @@
             "公式栏只有进入编辑态才生成 Edit 节点。",
             "accesskit 0.17 不支持 SelectionItemPattern，选中态写进名字。",
             "右键子菜单展开后的条目未单独 dump；没有 Role=Menu 容器节点。",
-            "功能区与右键菜单除撤销/重做/保存外没有运行期禁用，剪贴板为空时剪切/复制/粘贴仍可点（功能差异）。"
+            "剪切/复制/其他功能区命令仍恒为可用（Excel 里多数也常可用，但「删除工作表」「取消合并」这类应随状态灰化，未做）。"
           ],
           "failures": [],
           "blocker": "",
