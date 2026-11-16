@@ -6584,17 +6584,22 @@
       "scope": "app/ribbon + 旧toolbar可达性",
       "source": "ui-requirements.md",
       "heading": "UI-30 清理旧菜单代码与命令可达性缺口",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
-      "commits": [],
+      "commits": [
+        "880e046"
+      ],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "UI-30.1 待验收（宏入口已可达、未命中命令留痕、宏只跑隔离副本）。",
+        "旧菜单四个函数未删除；全部启用按钮的穷举点击矩阵未做。"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "逐条移除旧菜单；补按钮点击矩阵。",
+      "updated_utc": "2026-11-16T13:55:00Z",
       "slices": [
         {
           "id": "UI-30.1",
@@ -6602,17 +6607,38 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-30 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "files": [
+            "crates/app/assets/ribbon/customUI.xml",
+            "crates/app/src/ribbon/actions.rs",
+            "crates/app/src/ribbon/mod.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "880e046"
+          ],
+          "commands": [
+            "cargo test -p app --bin app（--test-threads=2）-> 333 passed（work/goal-logs/ui30-app.log）",
+            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed（work/goal-logs/ui30-core.log）",
+            "SC_TAB=6 SC_RIBBON_ACTION=\"MacroView;MacroRun;MacroExport\" SC_RIBBON_LOG=1 -> 三个动作都出明确状态",
+            "SC_SHOT 截图：审阅页签「宏」组三个控件可见",
+            "python scripts/qa01_matrix_runner.py -> 12 个夹具 0 处意外差异（前一轮）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30-command-reachability.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30/ui30-ribbon3.png"
+          ],
+          "not_done": [
+            "「逐个点击全部启用按钮」的穷举点击验收未做：目前是「XML 动作必须有精确 dispatch 臂」+ 宏三个按钮真机点击。",
+            "旧菜单 toolbar_notes/toolbar_view/toolbar_data/toolbar_page 仍在源码里（已无调用点），按契约渐进删除，本轮未删。",
+            "删除前需逐项确认 set_freeze/export_pdf/open_compare 等只在旧菜单里被引用的实现与 Ribbon 侧等价。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "把旧菜单里独有实现逐条对照 Ribbon，等价即删；其余按钮的点击矩阵另立切片。",
+          "updated_utc": "2026-11-16T13:55:00Z"
         }
       ]
     },

@@ -426,3 +426,16 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - runner 自身修了两个比对口径（非产品缺陷）：外链按完整路径比会因副本目录不同而误报；
   名称按位置比会因我们追加 `_sc_manual_hidden` 记账名而错位 —— 改按字典比并过滤 `_sc_`。
 - 证据：`qa01-matrix-runner.txt` + `qa01-matrix/{matrix-full.json,matrix-summary.tsv}`。
+
+### 检查点十六：UI-30.1 命令可达性（宏入口 / 未命中留痕 / 隔离副本）
+- `880e046`：审阅页签新增「宏」组（MacroView / MacroRun / MacroExport），
+  三条 dispatch 臂在无宏文件时给明确提示；兜底分支改成写 `unhandled_action` +
+  状态栏「这个命令还没有接入：X」（不再只靠 `SC_RIBBON_LOG`）。
+- `run_macro_via_excel` 改为先复制到 `%TEMP%\sc_macro_run_<pid>_<ms>.<ext>` 再跑，
+  成功后状态栏给副本路径并注明原文件未改动；不再写回用户文件。
+- 测试从「源码子串包含」升级为「从 match 臂精确抽命令名 + 命令注册表 + 前缀家族」：
+  `every_action_is_dispatched` 缺失即失败；新增 4 条（未知命令留痕、宏三按钮提示、
+  有宏时打开运行框、审阅页签有宏组）。app **333 passed**、core **106** 二进制 0 failed。
+- 真机：`SC_TAB=6` + `SC_RIBBON_ACTION` 跑出三条状态；截图确认「宏」组可见。
+- 未做：全部启用按钮的穷举点击矩阵；旧菜单四个函数（已无调用点）尚未删除，
+  删除前要核对 `set_freeze/export_pdf/open_compare` 与 Ribbon 侧等价。
