@@ -41,3 +41,21 @@ $xl.MaxChange = 0.001            # 默认 0.001
 
 QA-06.2 的 not_done 保留这一条，并改写为可执行口径（见 implementation-progress.json）：
 需要实现迭代计算 + calcPr 往返 + 增量一致三件事，而不是「补测」。
+
+## 2026-11-17 追加实测：引擎对环的行为
+
+`A1 = B1+1`、`B1 = A1/2` 在 `formula::recalc_all` 之后：
+
+```
+thread 'circular_pair_converges_like_excels_iteration' panicked:
+不是数字：Error(Circular)
+```
+
+即引擎在 `Calc` 里对环返回 **`ErrKind::Circular`**，没有「上一轮值」的迭代语义；
+即使外面套了 `passes = formula_count + 1` 的多遍扫描，环上的格子也始终是错误值。
+
+Excel 同一对公式（迭代开启、MaxIterations=100、MaxChange=0.001）收敛到 `A1=2`、`B1=1`。
+
+轴点就在 `Calc::cell_value` 的环判定处：迭代开启时不能直接返回 Circular，
+而要取「上一次求值结果」（首轮取 0，Excel 口径）继续算，直到 `max|Δ| <= maxChange`
+或达到 `maxIterations`。用例已写成 `#[ignore]`，实现后去掉 ignore 即为验收开关。
