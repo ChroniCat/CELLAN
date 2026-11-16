@@ -7085,12 +7085,13 @@
       "files": [],
       "commits": [
         "284f63c",
-        "2218a50"
+        "2218a50",
+        "d8a8619"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮已实现并有测试，未做真实键盘复核）；UI-24.2 实施中（功能区+对话框+活动单元格已可读）；UI-24.3 待实施（网格坐标值/选区语义）。"
+        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮有测试，未做真实键盘复核）；UI-24.2 实施中（功能区+对话框+活动单元格可读）；UI-24.3 待验收（DataGrid+行列头+选区语义已 UIA 实测）。"
       ],
       "failures": [],
       "blocker": "",
@@ -7166,16 +7167,31 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "d8a8619"
+          ],
+          "commands": [
+            "uia_dump.ps1（默认选区）-> COUNT 115→168，出现 DataGrid 汇总 + 列标/行号 DataItem（31 条行头）",
+            "SC_SEL=1,1 SC_SEL2=3,2 -> DataGrid「选区 B2:C4，3 行 2 列，活动单元格 B2」",
+            "uia_selected.ps1 -> 列 B/列 C「已选中」、列 D 无；第 2/4 行「已选中」、第 5 行无；bounds 列宽 67/行高 18",
+            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui243-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-grid-semantics.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-sel4.txt"
+          ],
+          "not_done": [
+            "SelectionItemPattern 未暴露（accesskit 0.17 只给 selected 状态，UIA 适配层没映射），选中态写进名字。",
+            "选区变化不主动发 UIA 通知事件。",
+            "冻结区/合并单元格/隐藏行列没有特殊语义。",
+            "只有可见范围有节点，滚动后需下一帧重建。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "补选区变化的 UIA 通知（LiveRegion/NotificationEvent）；再评估 accesskit 版本升级是否值得。",
           "updated_utc": "2026-11-12T10:28:37Z"
         }
       ]

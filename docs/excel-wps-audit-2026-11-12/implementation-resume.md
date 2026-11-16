@@ -513,3 +513,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 测试：`modal_dialog_traps_tab_focus_and_restores_it_on_escape`、
   `default_button_answers_enter_only_when_no_field_has_focus`；app **341 passed**。
 - 边界：未用物理键盘在 GUI 复核（RDP），Shift+Tab 未单独断言。
+
+### 检查点二十四：UI-24.3 网格坐标与选区语义
+- `d8a8619`：网格发布 `Role=Grid` 汇总节点（工作表/选区范围/几行几列/活动单元格）；
+  可见列发 `ColumnHeader`（`列 B，已选中`）、可见行发 `RowHeader`（`第 2 行，已选中`），
+  带 accesskit bounds（已乘 pixels_per_point）。
+- 外部 UIA 实测：COUNT 115→168；`DataGrid 工作表 Sheet1，选区 B2:C4，3 行 2 列，活动单元格 B2`；
+  列 B/C 标已选中、列 D 不标；第 2/4 行标已选中、第 5 行不标；bounds 列宽 67、行高 18 与界面一致。
+- 已知限制：accesskit 0.17 不提供 SelectionItemPattern（UIA 报 no-pattern），选中态写进名字；
+  选区变化不发通知事件；无冻结/合并特殊语义。
+- app 341 passed。
