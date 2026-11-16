@@ -1800,7 +1800,9 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             let fv_ = opt_num(args, 4, 0.0)?;
             let t = opt_num(args, 5, 0.0)?;
             let p = pmt(rate, nper, pv_, fv_, t);
-            let balance = fv_after(rate, per - 1.0, p, pv_, t);
+            // fv() 是 FV 口径（余额与 pv 反号），这里要的是与 pv 同号的贷款余额。
+            // Excel：pv=-300000、rate=5%/12 时 IPMT 第 1 期 = +1250，PPMT = +360.46。
+            let balance = -fv_after(rate, per - 1.0, p, pv_, t);
             Ok(FValue::number(-(balance * rate)))
         }),
         "PPMT" => r(|| {
@@ -1811,7 +1813,8 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             let fv_ = opt_num(args, 4, 0.0)?;
             let t = opt_num(args, 5, 0.0)?;
             let p = pmt(rate, nper, pv_, fv_, t);
-            let interest = -(fv_after(rate, per - 1.0, p, pv_, t) * rate);
+            let balance = -fv_after(rate, per - 1.0, p, pv_, t);
+            let interest = -(balance * rate);
             Ok(FValue::number(p - interest))
         }),
         "NPV" => r(|| {
@@ -1978,20 +1981,81 @@ fn rand_f64() -> f64 {
     })
 }
 
+/// 按 y/m/d 记号逐个展开日期格式：`yyyy`/`yy`/`y`、`mm`/`m`、`dd`/`d`。
+/// 和 Excel 一样，格式里夹着的中文（如 `yyyy年m月d日`）原样保留；
+/// 双引号包裹的段落与反斜杠转义都按字面输出。
+/// 三字母以上的 m/d（`mmm` 月份名、`ddd` 星期名）依赖区域语言，这里按数值展开。
+fn format_date_tokens(fmt: &str, y: i32, m: u32, d: u32) -> Option<String> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' && i + 1 < chars.len() {
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        let lower = c.to_ascii_lowercase();
+        if !matches!(lower, 'y' | 'm' | 'd') {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && chars[j].to_ascii_lowercase() == lower {
+            j += 1;
+        }
+        let run = j - i;
+        match lower {
+            'y' => {
+                if run <= 2 {
+                    out.push_str(&format!("{:02}", y.rem_euclid(100)));
+                } else {
+                    out.push_str(&format!("{y:04}"));
+                }
+            }
+            'm' => {
+                if run >= 2 {
+                    out.push_str(&format!("{m:02}"));
+                } else {
+                    out.push_str(&m.to_string());
+                }
+            }
+            'd' => {
+                if run >= 2 {
+                    out.push_str(&format!("{d:02}"));
+                } else {
+                    out.push_str(&d.to_string());
+                }
+            }
+            _ => out.push(c),
+        }
+        i = j;
+    }
+    Some(out)
+}
+
 fn format_value(v: &FValue, fmt: &str) -> String {
     let n = match v.to_number() {
         Ok(n) => n,
         Err(_) => return v.display(),
     };
     // 常见占位符：0、0.00、#,##0、0%、0.00%、yyyy-mm-dd
-    if fmt.contains('y') || fmt.contains('m') || fmt.contains('d') {
+    if fmt.chars().any(|c| matches!(c, 'y' | 'Y' | 'm' | 'M' | 'd' | 'D')) {
         if let Some((y, m, d)) = serial_to_date(n) {
-            let mut out = fmt.to_string();
-            out = out.replace("yyyy", &format!("{y:04}"));
-            out = out.replace("yy", &format!("{:02}", y % 100));
-            out = out.replace("mm", &format!("{m:02}"));
-            out = out.replace("dd", &format!("{d:02}"));
-            return out;
+            if let Some(out) = format_date_tokens(fmt, y, m, d) {
+                return out;
+            }
         }
     }
     let percent = fmt.contains('%');

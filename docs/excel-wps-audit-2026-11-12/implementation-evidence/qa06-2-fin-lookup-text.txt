@@ -1,0 +1,76 @@
+QA-06.2/06.3 财务 / 查找 / 文本矩阵（102 条，含 3 个真实缺陷修复）
+==================================================================
+日期：2026-11-16
+起点：QA-06.1（错误/空值/日期 50 条，`c0177c9`）
+本轮：矩阵扩到 **102 条**，新增 fin 16 / lookup 14 / text 22 三组；对拍发现并修掉 3 个真实缺陷。
+
+一、链路
+--------
+1. `python scripts/qa06_extend_fin_lookup_text.py work/qa06`
+   追加查找表 D1:E5（k1..k5 / 10..50）、现金流 F1:F6（-1000,300,400,500,200,100）、
+   文本 H1:H4（"  Hello World  " / "Sheet1" / "a,b,c" / "中文ABC123"），重建夹具。
+2. `powershell -File scripts/qa06_excel_probe.ps1 F:/…/work/qa06`
+   → **Excel 16.0：102 条；WPS=12.0**（公式由 Excel COM 写入，避免 openpyxl 漏 `_xlfn`）。
+3. `python scripts/qa06_merge.py work/qa06` → `crates/core/tests/fixtures/qa06/matrix.tsv`（102 行）。
+4. `cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2`
+   → **2 passed**（qa06_1 覆盖全部 102 条；qa06_3 只跑 fin/lookup/text 并断言每组条数）。
+
+二、对拍揪出的真实缺陷（本引擎 ≠ Excel）
+----------------------------------------
+1. `IPMT` 符号反了
+   `=IPMT(0.05/12,1,360,-300000)`：本引擎 **-1250**，Excel **+1250**。
+   根因：用 `fv(rate, per-1, pmt, pv)` 当“贷款余额”，而 `fv()` 是 FV 口径（与 pv 反号），
+   余额取反后利息符号就反了。改为 `balance = -fv_after(...)`。
+2. `PPMT` 被 IPMT 的符号带错
+   `=PPMT(0.05/12,1,360,-300000)`：本引擎 **2860.4648690364193**，Excel **360.46486903641716**。
+   同一处根因：`p - interest` 里 interest 反号。修 IPMT 后同时归位。
+3. `CUMIPMT` 缺参数校验
+   `=CUMIPMT(0.05/12,360,-300000,1,12,0)`：本引擎 **14899.48**，Excel **#NUM!**。
+   Excel 规定 rate≤0、nper≤0、pv≤0 都返回 #NUM!；原实现只校验了 rate/start/end。
+   已补 `nper <= 0.0 || pv <= 0.0`（CUMPRINC 同一分支，一并修）。
+4. `TEXT` 的日期格式不认单字母 `m`/`d`
+   `=TEXT(45351,"yyyy年m月d日")`：本引擎 **2024年m月d日**，Excel **2024年2月29日**。
+   原实现只做 `replace("yyyy")/("yy")/("mm")/("dd")`，单字母 `m`/`d` 原样留着。
+   改为按记号扫描的 `format_date_tokens`：支持 y/yy/yyyy、m/mm、d/dd，
+   中文等非记号字符原样保留，`"..."` 段落与 `\` 转义按字面输出。
+
+三、容差口径（QA-06 要求写明）
+------------------------------
+- 错误码、布尔：按显示值严格比较；
+- 数字：按 Excel **Value2** 比较（不能用 Text：货币格显示 `$177.66`、日期格显示 `1/1/2025`/`########`、
+  平均值四舍五入到 15 位会造成假差异）；
+- 相对容差：默认 **1e-9**（绝对值下限 1e-9）；`IRR`/`XIRR`/`RATE` 这类迭代求根函数用 **1e-7**——
+  Excel 自己也是数值解，XIRR 本例 6.2154901981353765 vs 本引擎 6.215490233957333，相对差 5.8e-9，
+  属于两类求解器收敛末位差异，不是公式错误。
+
+四、Excel 与 WPS 12.0 的差异（只记录，不改数据）
+-----------------------------------------------
+```
+=NPV(0.1,F2:F6)+F1              Excel '$177.66'   WPS '$177.66 '   ← WPS 多尾空格
+=PV(0.05,10,-100)               Excel '$772.17'   WPS '$772.17 '
+=PPMT(0.05/12,1,360,-300000)    Excel '$360.46'   WPS '$360.46 '
+=EFFECT(0.1,12)                 Excel '0.104713'  WPS '#NAME?'     ← WPS 12.0 没实现 EFFECT
+=NOMINAL(0.1,12)                Excel '0.09569'   WPS '#NAME?'     ← 同上
+=EDATE(45351,1)                 Excel '45380'     WPS '########'
+=EOMONTH(45351,0)               Excel '45351'     WPS '########'
+```
+采用 Excel 16.0 为基准（与既有 C05/C07 用例同口径），WPS 缺函数处按 WPS 不支持处理，不压一致率。
+
+五、回归
+--------
+- `cargo test -p sheetcore --lib` → **295 passed / 0 failed**
+- `cargo test -p sheetcore`（101 个测试二进制）→ **0 failed**
+- `cargo test -p app --bin app` → **325 passed / 0 failed**
+  （IPMT/PPMT/TEXT 改动没有打破既有断言）
+
+六、证据
+--------
+- `implementation-evidence/qa06-2/matrix.tsv`（102 行对拍矩阵快照）
+- `implementation-evidence/qa06-2/{excel.tsv,wps.tsv,cases.json,probe-meta.json}`
+
+七、未覆盖
+----------
+- 数组/动态数组与溢出区域、增量重算一致性（QA-06.2 的“数组引用与增量一致”还没做，只做了标签意义上的 06.3）；
+- SUBTOTAL/AGGREGATE 在隐藏/筛选行下的口径；
+- 整列引用与跨表引用的相同输入对拍；
+- `mmm`/`ddd` 这类区域语言月份名/星期名（当前按数值展开）。

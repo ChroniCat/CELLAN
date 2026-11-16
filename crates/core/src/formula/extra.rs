@@ -734,7 +734,8 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let start = int_arg(args, 3)?;
             let end = int_arg(args, 4)?;
             let t = opt_num(args, 5, 0.0)?;
-            if rate <= 0.0 || start < 1 || end < start {
+            // Excel：rate<=0、nper<=0、pv<=0、start<1、start>end 都是 #NUM!
+            if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1 || end < start {
                 return Err(ErrKind::Num);
             }
             let pay = pmt_of(rate, nper, pv, 0.0, t);

@@ -55,6 +55,18 @@ fn book() -> Workbook {
     for i in 0..5 {
         s.set(i, 1, num((i + 1) as f64));
     }
+    // QA-06.3 追加的输入：查找表 D1:E5、现金流 F1:F6、文本 H1:H4
+    for (i, k) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
+        s.set(i as u32, 3, text(k));
+        s.set(i as u32, 4, num(10.0 * (i as f64 + 1.0)));
+    }
+    for (i, v) in [-1000.0, 300.0, 400.0, 500.0, 200.0, 100.0].iter().enumerate() {
+        s.set(i as u32, 5, num(*v));
+    }
+    s.set(0, 7, text("  Hello World  "));
+    s.set(1, 7, text("Sheet1"));
+    s.set(2, 7, text("a,b,c"));
+    s.set(3, 7, text("中文ABC123"));
     wb
 }
 
@@ -82,6 +94,17 @@ fn render(v: &FValue) -> String {
         }
         FValue::Empty => String::new(),
         other => other.display(),
+    }
+}
+
+/// 迭代求根类函数（IRR/XIRR/RATE）Excel 自己也是数值解，两个实现收敛到同一点但末位不同，
+/// 对这类函数用 1e-7 相对容差；其余按 1e-9。
+fn rel_tol(f: &str) -> f64 {
+    let u = f.to_uppercase();
+    if u.contains("XIRR") || u.contains("IRR(") || u.contains("RATE(") {
+        1e-7
+    } else {
+        1e-9
     }
 }
 
@@ -118,7 +141,7 @@ fn qa06_1_error_blank_date_matrix_matches_excel() {
                     .ok()
                     .or_else(|| excel.parse::<f64>().ok());
                 match cand {
-                    Some(e) => (*n - e).abs() <= 1e-9 * e.abs().max(1.0),
+                    Some(e) => (*n - e).abs() <= rel_tol(f) * e.abs().max(1.0),
                     None => false,
                 }
             }
@@ -149,5 +172,62 @@ fn qa06_1_error_blank_date_matrix_matches_excel() {
         "与 Excel 不一致 {} 条：\n{}",
         diffs.len(),
         diffs.join("\n")
+    );
+}
+
+#[test]
+fn qa06_3_fin_lookup_text_matrix_matches_excel() {
+    let tsv = include_str!("fixtures/qa06/matrix.tsv");
+    let wb = book();
+    let mut per_group = std::collections::BTreeMap::<String, usize>::new();
+    let mut diffs = Vec::new();
+
+    for line in tsv.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let (group, f, excel) = (cols[0], cols[1], cols[2].trim());
+        if !matches!(group, "fin" | "lookup" | "text") {
+            continue;
+        }
+        let excel_v2 = cols.get(3).map(|s| s.trim()).unwrap_or("");
+        let got = formula::eval_formula(&wb, 0, f);
+        *per_group.entry(group.to_string()).or_default() += 1;
+
+        let close = |n: f64, cand: Option<f64>| match cand {
+            Some(e) => (n - e).abs() <= rel_tol(f) * e.abs().max(1.0),
+            None => false,
+        };
+        let ok = match &got {
+            FValue::Error(_) | FValue::Bool(_) => render(&got) == excel,
+            FValue::Number(n) => {
+                // 显示值可能带货币符号或千分位，优先用 Value2
+                let cand = excel_v2
+                    .parse::<f64>()
+                    .ok()
+                    .or_else(|| excel.parse::<f64>().ok());
+                close(*n, cand)
+            }
+            other => render(other) == excel,
+        };
+        if !ok {
+            diffs.push(format!("[{group}] {f}: 本引擎 {:?} != Excel {:?}", render(&got), excel));
+        }
+    }
+
+    assert!(per_group.get("fin").copied().unwrap_or(0) >= 15, "{per_group:?}");
+    assert!(per_group.get("lookup").copied().unwrap_or(0) >= 14, "{per_group:?}");
+    assert!(per_group.get("text").copied().unwrap_or(0) >= 20, "{per_group:?}");
+    assert!(
+        diffs.is_empty(),
+        "与 Excel 不一致 {} 条：
+{}",
+        diffs.len(),
+        diffs.join("
+")
     );
 }

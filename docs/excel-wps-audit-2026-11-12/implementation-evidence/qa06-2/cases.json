@@ -1,0 +1,451 @@
+{
+ "inputs": {
+  "A1": null,
+  "A2": "文本",
+  "A3": 5,
+  "A4": true,
+  "A5": "#N/A",
+  "A6": "=\"\"",
+  "A7": 0,
+  "A8": 1.5,
+  "A9": 45351,
+  "A10": "5",
+  "A11": "#DIV/0!",
+  "A12": 45000,
+  "B1": 1,
+  "B2": 2,
+  "B3": 3,
+  "B4": 4,
+  "B5": 5,
+  "D1": "k1",
+  "E1": 10,
+  "D2": "k2",
+  "E2": 20,
+  "D3": "k3",
+  "E3": 30,
+  "D4": "k4",
+  "E4": 40,
+  "D5": "k5",
+  "E5": 50,
+  "F1": -1000,
+  "F2": 300,
+  "F3": 400,
+  "F4": 500,
+  "F5": 200,
+  "F6": 100,
+  "H1": "  Hello World  ",
+  "H2": "Sheet1",
+  "H3": "a,b,c",
+  "H4": "中文ABC123"
+ },
+ "cases": [
+  {
+   "group": "err",
+   "formula": "=A5+1"
+  },
+  {
+   "group": "err",
+   "formula": "=A11*2"
+  },
+  {
+   "group": "err",
+   "formula": "=SUM(A5,1)"
+  },
+  {
+   "group": "err",
+   "formula": "=IFERROR(A5+1,\"e\")"
+  },
+  {
+   "group": "err",
+   "formula": "=IFNA(A5,0)"
+  },
+  {
+   "group": "err",
+   "formula": "=ISERROR(A5)"
+  },
+  {
+   "group": "err",
+   "formula": "=ISERR(A5)"
+  },
+  {
+   "group": "err",
+   "formula": "=ISNA(A5)"
+  },
+  {
+   "group": "err",
+   "formula": "=ERROR.TYPE(A5)"
+  },
+  {
+   "group": "err",
+   "formula": "=1/0"
+  },
+  {
+   "group": "err",
+   "formula": "=NA()"
+  },
+  {
+   "group": "err",
+   "formula": "=VALUE(\"abc\")"
+  },
+  {
+   "group": "err",
+   "formula": "=A5&\"x\""
+  },
+  {
+   "group": "err",
+   "formula": "=COUNT(A5)"
+  },
+  {
+   "group": "err",
+   "formula": "=ISERROR(1/0)"
+  },
+  {
+   "group": "err",
+   "formula": "=IFERROR(1/0,\"z\")"
+  },
+  {
+   "group": "blank",
+   "formula": "=A1+1"
+  },
+  {
+   "group": "blank",
+   "formula": "=A1&\"x\""
+  },
+  {
+   "group": "blank",
+   "formula": "=A1=0"
+  },
+  {
+   "group": "blank",
+   "formula": "=A1=\"\""
+  },
+  {
+   "group": "blank",
+   "formula": "=A6=\"\""
+  },
+  {
+   "group": "blank",
+   "formula": "=ISBLANK(A1)"
+  },
+  {
+   "group": "blank",
+   "formula": "=ISBLANK(A6)"
+  },
+  {
+   "group": "blank",
+   "formula": "=COUNTBLANK(A1:A7)"
+  },
+  {
+   "group": "blank",
+   "formula": "=SUM(A1:A4,A6:A10)"
+  },
+  {
+   "group": "blank",
+   "formula": "=COUNTA(A1:A10)"
+  },
+  {
+   "group": "blank",
+   "formula": "=COUNT(A1:A10)"
+  },
+  {
+   "group": "blank",
+   "formula": "=A10+1"
+  },
+  {
+   "group": "blank",
+   "formula": "=A10&1"
+  },
+  {
+   "group": "blank",
+   "formula": "=TRUE+1"
+  },
+  {
+   "group": "blank",
+   "formula": "=SUM(A4)"
+  },
+  {
+   "group": "blank",
+   "formula": "=AVERAGE(A1:A4,A6:A10)"
+  },
+  {
+   "group": "blank",
+   "formula": "=COUNTBLANK(B1:B5)"
+  },
+  {
+   "group": "date",
+   "formula": "=DATE(2024,2,29)"
+  },
+  {
+   "group": "date",
+   "formula": "=DAY(45351)"
+  },
+  {
+   "group": "date",
+   "formula": "=YEAR(45351)"
+  },
+  {
+   "group": "date",
+   "formula": "=MONTH(45351)"
+  },
+  {
+   "group": "date",
+   "formula": "=DATE(1900,2,29)"
+  },
+  {
+   "group": "date",
+   "formula": "=YEAR(60)"
+  },
+  {
+   "group": "date",
+   "formula": "=DAY(60)"
+  },
+  {
+   "group": "date",
+   "formula": "=EDATE(45351,1)"
+  },
+  {
+   "group": "date",
+   "formula": "=EOMONTH(45351,0)"
+  },
+  {
+   "group": "date",
+   "formula": "=DATEDIF(45351,45382,\"d\")"
+  },
+  {
+   "group": "date",
+   "formula": "=TEXT(45351,\"yyyy-mm-dd\")"
+  },
+  {
+   "group": "date",
+   "formula": "=WEEKDAY(45351,2)"
+  },
+  {
+   "group": "date",
+   "formula": "=WEEKNUM(45351,2)"
+  },
+  {
+   "group": "date",
+   "formula": "=A9+1"
+  },
+  {
+   "group": "date",
+   "formula": "=DATE(2024,13,1)"
+  },
+  {
+   "group": "date",
+   "formula": "=DAYS(45382,45351)"
+  },
+  {
+   "group": "date",
+   "formula": "=DATEVALUE(\"2024-02-29\")"
+  },
+  {
+   "group": "fin",
+   "formula": "=NPV(0.1,F2:F6)+F1"
+  },
+  {
+   "group": "fin",
+   "formula": "=IRR(F1:F6)"
+  },
+  {
+   "group": "fin",
+   "formula": "=PMT(0.05/12,360,-300000)"
+  },
+  {
+   "group": "fin",
+   "formula": "=PV(0.05,10,-100)"
+  },
+  {
+   "group": "fin",
+   "formula": "=FV(0.05,10,-100)"
+  },
+  {
+   "group": "fin",
+   "formula": "=RATE(10,-100,800)"
+  },
+  {
+   "group": "fin",
+   "formula": "=NPER(0.05,-100,800)"
+  },
+  {
+   "group": "fin",
+   "formula": "=IPMT(0.05/12,1,360,-300000)"
+  },
+  {
+   "group": "fin",
+   "formula": "=PPMT(0.05/12,1,360,-300000)"
+  },
+  {
+   "group": "fin",
+   "formula": "=SLN(10000,1000,9)"
+  },
+  {
+   "group": "fin",
+   "formula": "=SYD(10000,1000,9,1)"
+  },
+  {
+   "group": "fin",
+   "formula": "=DDB(10000,1000,9,1)"
+  },
+  {
+   "group": "fin",
+   "formula": "=EFFECT(0.1,12)"
+  },
+  {
+   "group": "fin",
+   "formula": "=NOMINAL(0.1,12)"
+  },
+  {
+   "group": "fin",
+   "formula": "=CUMIPMT(0.05/12,360,-300000,1,12,0)"
+  },
+  {
+   "group": "fin",
+   "formula": "=XIRR(F1:F6,DATE(2024,1,1)+{0;31;59;90;120;151})"
+  },
+  {
+   "group": "lookup",
+   "formula": "=VLOOKUP(\"k3\",D1:E5,2,FALSE)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=VLOOKUP(\"k9\",D1:E5,2,FALSE)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=VLOOKUP(3.5,{1,10;2,20;3,30;4,40},2,TRUE)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=XLOOKUP(\"k4\",D1:D5,E1:E5)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=XLOOKUP(\"k9\",D1:D5,E1:E5,\"none\")"
+  },
+  {
+   "group": "lookup",
+   "formula": "=MATCH(\"k2\",D1:D5,0)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=MATCH(\"k9\",D1:D5,0)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=INDEX(E1:E5,3)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=INDEX(D1:E5,2,2)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=LOOKUP(\"k3\",D1:D5,E1:E5)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=HLOOKUP(2,{1,2,3;10,20,30},2,FALSE)"
+  },
+  {
+   "group": "lookup",
+   "formula": "=CHOOSE(2,\"a\",\"b\",\"c\")"
+  },
+  {
+   "group": "lookup",
+   "formula": "=INDIRECT(\"E3\")"
+  },
+  {
+   "group": "lookup",
+   "formula": "=OFFSET(E1,2,0)"
+  },
+  {
+   "group": "text",
+   "formula": "=LEFT(H2,5)"
+  },
+  {
+   "group": "text",
+   "formula": "=RIGHT(H2,1)"
+  },
+  {
+   "group": "text",
+   "formula": "=MID(H2,6,1)"
+  },
+  {
+   "group": "text",
+   "formula": "=LEN(H1)"
+  },
+  {
+   "group": "text",
+   "formula": "=TRIM(H1)"
+  },
+  {
+   "group": "text",
+   "formula": "=UPPER(H2)"
+  },
+  {
+   "group": "text",
+   "formula": "=LOWER(\"ABC\")"
+  },
+  {
+   "group": "text",
+   "formula": "=PROPER(\"hello world\")"
+  },
+  {
+   "group": "text",
+   "formula": "=SUBSTITUTE(H3,\",\",\";\")"
+  },
+  {
+   "group": "text",
+   "formula": "=FIND(\"W\",H1)"
+  },
+  {
+   "group": "text",
+   "formula": "=SEARCH(\"w\",H1)"
+  },
+  {
+   "group": "text",
+   "formula": "=REPLACE(H2,6,1,\"9\")"
+  },
+  {
+   "group": "text",
+   "formula": "=TEXTJOIN(\"-\",TRUE,\"a\",\"\",\"b\")"
+  },
+  {
+   "group": "text",
+   "formula": "=CONCAT(\"a\",1,TRUE)"
+  },
+  {
+   "group": "text",
+   "formula": "=VALUE(\"1,234.5\")"
+  },
+  {
+   "group": "text",
+   "formula": "=TEXT(1234.567,\"#,##0.00\")"
+  },
+  {
+   "group": "text",
+   "formula": "=TEXT(0.256,\"0.0%\")"
+  },
+  {
+   "group": "text",
+   "formula": "=TEXT(45351,\"yyyy年m月d日\")"
+  },
+  {
+   "group": "text",
+   "formula": "=EXACT(\"a\",\"A\")"
+  },
+  {
+   "group": "text",
+   "formula": "=LEN(H4)"
+  },
+  {
+   "group": "text",
+   "formula": "=MID(H4,3,3)"
+  },
+  {
+   "group": "text",
+   "formula": "=UNICODE(LEFT(H4,1))"
+  }
+ ]
+}
