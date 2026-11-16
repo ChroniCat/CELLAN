@@ -3446,17 +3446,19 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/G-2cols2values.xlsx",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggregations.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-E.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-F.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-F.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/wps-roundtrip.md"
           ],
           "not_done": [
             "折叠/压缩布局（compact=\"1\"）未做：界面没有暴露布局开关，PivotLayout 只有表格形式",
             "计算字段/计算项、显示值方式（占总计百分比等）未做",
-            "WPS 里改字段后再存回未做（改字段只用 Excel 验证，WPS 只做打开与字段复核）"
+            "WPS 改字段往返：WPS 保存侧把 pivotCacheDefinition 从 1300B 缩到 773B、sharedItems 3→2，Excel 回读 rows/cols/fields 全 0（WPS 自身缺陷，证据 c12-4/wps-roundtrip.md）。",
+            "待查：work/probe/c12/pivot-real.xlsx 在 Excel 里 PivotTables.Count=0（来源不明，需干净链路重造）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "C12 四切片齐；等用户按生产口径复核",
-          "updated_utc": "2026-11-16T10:39:10Z"
+          "updated_utc": "2026-11-16T19:47:19Z"
         }
       ]
     },
