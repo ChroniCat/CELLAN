@@ -4470,7 +4470,9 @@
             "cargo test -p sheetcore --test calc_iteration -> 2 passed（写/删 iterate,maxIterations,maxChange；保留 calcMode）",
             "cargo test -p sheetcore --test calc_iteration -> 3 passed（收敛 A1=1.9990234375/B1=0.9990234375）",
             "cargo test -p sheetcore -> 107 个测试二进制 0 failed",
-            "cargo test -p app --bin app -> 361 passed"
+            "cargo test -p app --bin app -> 361 passed",
+            "cargo test -p sheetcore --test calc_iteration -> 4 passed（收敛 + calcPr 存盘读回）",
+            "Excel COM: Application.IterativeCalculation=true, 250/0.0005, CalculateFull -> A1=1.99951171875 B1=0.999755859375"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
@@ -4483,12 +4485,12 @@
           ],
           "not_done": [
             "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计",
-            "迭代计算已能收敛（环取上一轮值 + maxChange 收敛判据，实测 A1=1.9990234375/B1=0.9990234375），但 calcPr/@iterate 与 Workbook 字段的装载/保存接线未做，打开开启迭代的工作簿仍走默认关闭。"
+            "迭代模式下「增量重算 == 全量重算」未验证（全量已收敛；增量路径未跑环用例）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-16T19:18:33Z"
+          "updated_utc": "2026-11-16T19:21:24Z"
         },
         {
           "id": "QA-06.3",

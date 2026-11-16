@@ -52,3 +52,24 @@ fn circular_pair_converges_like_excels_iteration() {
     assert!((a1 - 2.0).abs() < 1e-3, "A1={a1}");
     assert!((b1 - 1.0).abs() < 1e-3, "B1={b1}");
 }
+
+#[test]
+fn iteration_settings_survive_save_and_reload() {
+    let dir = std::env::temp_dir().join("sheets_native_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("calc_iter_roundtrip.xlsx");
+    let _ = std::fs::remove_file(&path);
+
+    let mut wb = Workbook::new_blank();
+    wb.calc_iterate = true;
+    wb.calc_max_iterations = 250;
+    wb.calc_max_change = 0.0005;
+    wb.sheets[0].set(0, 0, f("=B1+1"));
+    wb.sheets[0].set(0, 1, f("=A1/2"));
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert!(back.calc_iterate, "iterate 丢里");
+    assert_eq!(back.calc_max_iterations, 250);
+    assert!((back.calc_max_change - 0.0005).abs() < 1e-12);
+}

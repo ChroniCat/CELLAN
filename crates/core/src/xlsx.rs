@@ -418,9 +418,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         .unwrap_or(false);
     let manual_hidden = crate::patch::read_manual_hidden(path);
     let mut wb = Workbook {
-        calc_iterate: false,
-        calc_max_iterations: 100,
-        calc_max_change: 0.001,
         load_incomplete: false,
         names: {
             let mut names = crate::patch::read_defined_names(path);
@@ -443,6 +440,10 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         pivots_pending: Vec::new(),
         pivots_pending2: Vec::new(),
         calc_manual: crate::patch::read_calc_manual(path),
+        // calcPr/@iterate / maxIterations / maxChange（缺省 = 关闭 / 100 / 0.001）
+        calc_iterate: crate::patch::read_calc_iteration(path).map(|(i, _, _)| i).unwrap_or(false),
+        calc_max_iterations: crate::patch::read_calc_iteration(path).map(|(_, n, _)| n).unwrap_or(100),
+        calc_max_change: crate::patch::read_calc_iteration(path).map(|(_, _, c)| c).unwrap_or(0.001),
         calc_pending: false,
         calc_pending_sheets: std::collections::BTreeSet::new(),
         sheets: Vec::new(),
@@ -2624,6 +2625,12 @@ fn apply_cf_patch(
         if name == "xl/workbook.xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = crate::patch::set_calc_mode(&xml, wb.calc_manual);
+                x = crate::patch::set_calc_iteration(
+                    &x,
+                    wb.calc_iterate,
+                    wb.calc_max_iterations,
+                    wb.calc_max_change,
+                );
                 if do_page {
                     for (idx, sheet) in wb.sheets.iter().enumerate() {
                         if sheet.page_dirty {

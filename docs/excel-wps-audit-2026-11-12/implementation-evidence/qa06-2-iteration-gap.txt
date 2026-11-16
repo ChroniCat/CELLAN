@@ -79,3 +79,33 @@ test result: ok. 3 passed
 Excel 同参数收敛到 `A1=2`、`B1=1`，差值 9.77e-4，落在 `MaxChange=0.001` 内。
 
 回归：core 107 个测试二进制 0 failed；app 361 passed。
+
+## 2026-11-17 收口二：calcPr 接线 + Excel 侧外部验证
+
+接线（`crates/core/src/xlsx.rs`）：
+- 打开：`read_calc_iteration(path)` 填 `calc_iterate / calc_max_iterations / calc_max_change`（缺省 关闭/100/0.001）；
+- 保存：`set_calc_iteration()` 紧跟 `set_calc_mode()` 写回 calcPr。
+
+保存后的 `xl/workbook.xml` 实际内容：
+
+```
+<calcPr calcId="122211" iterate="1" maxIterations="250" maxChange="0.0005"/>
+```
+
+新增用例 `iteration_settings_survive_save_and_reload`（存盘再读回，三个值全等）→ 4 passed。
+
+### Excel 侧口径（重要）
+
+- `Application.IterativeCalculation` 是**应用级开关**：Excel 打开带 `iterate="1"` 的文件时
+  不会自动把它应用到当前实例（实测 `app_iterate=` 为空，环上格子直接是错误值 -2146826273）。
+- 手工把 Application 开关打开、重写两条公式并 `CalculateFull()` 后：
+
+```
+A1=1.99951171875  B1=0.999755859375     // MaxIterations=250, MaxChange=0.0005
+```
+
+本引擎同族参数（100 / 0.001）得到 `A1=1.9990234375 / B1=0.9990234375`，两者都落在各自
+MaxChange 内，语义一致。
+
+- Excel 新建工作簿保存时并不写 `iterate` 属性（实测只写 `<calcPr calcId="191029"/>`），
+  所以「Excel 能读回自己的 iterate 设置」这件事本身不成立，不能拿它当我们写坏的证据。
