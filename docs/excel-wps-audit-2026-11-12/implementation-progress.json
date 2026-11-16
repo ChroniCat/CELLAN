@@ -4466,7 +4466,8 @@
             "cargo test -p sheetcore --test qa06_array -- --test-threads=2 --nocapture -> 2 passed（溢出 40 格一致；增量 12 格、1040 格与全量一致）",
             "python scripts/qa06_array_fixture.py work/qa06a -> 12 锚点 + 3 溢出冲突",
             "powershell -File scripts/qa06_array_probe.ps1 F:/finance-native-sheets-ready/work/qa06a -> spill_conflict.tsv / spill_cleared.tsv",
-            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 -> 3 passed（冲突 3 条 + 恢复 12 格）"
+            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 -> 3 passed（冲突 3 条 + 恢复 12 格）",
+            "cargo test -p sheetcore --test calc_iteration -> 2 passed（写/删 iterate,maxIterations,maxChange；保留 calcMode）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
@@ -4479,7 +4480,7 @@
           ],
           "not_done": [
             "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计",
-            "迭代计算/循环引用：引擎没有实现（grep circular/iterat 0 命中），需要 ①环的强连通分量识别 ②按 MaxIterations/MaxChange 迭代到收敛 ③环外依赖在收敛后重取 ④calcPr 的 iterate/maxIterations/maxChange 双向往返；不是补测就能关闭。"
+            "迭代计算求解器未实现：calcPr 的 iterate/maxIterations/maxChange 已能读写（read_calc_iteration/set_calc_iteration + 2 条用例），但求值器仍无环检测与迭代收敛；还需 SCC 识别、按 MaxIterations/MaxChange 迭代、环外依赖收敛后重取。"
           ],
           "failures": [],
           "blocker": "",

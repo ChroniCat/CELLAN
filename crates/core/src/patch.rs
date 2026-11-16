@@ -3370,3 +3370,114 @@ fn freeze_on_sheet_without_sheet_views_creates_them() {
     assert!(!cleared.contains("<pane"), "{cleared}");
     assert!(cleared.contains("<sheetViews>"), "{cleared}");
 }
+
+/// 读取 workbook.xml 的迭代计算设置：`calcPr/@iterate`、`@maxIterations`、`@maxChange`。
+/// 没有 calcPr 或没有 iterate 属性时返回 None（Excel 默认关闭迭代）。
+pub fn read_calc_iteration(path: &Path) -> Option<(bool, u32, f64)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut f = zip.by_name("xl/workbook.xml").ok()?;
+    let mut xml = String::new();
+    f.read_to_string(&mut xml).ok()?;
+    let mut r = Reader::from_str(&xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == "calcPr" => {
+                let mut iterate: Option<bool> = None;
+                let mut max_iter = 100u32;
+                let mut max_change = 0.001f64;
+                for a in e.attributes().flatten() {
+                    let v = a.value;
+                    match a.key.local_name().as_ref() {
+                        "iterate" => iterate = Some(v == "1" || v.eq_ignore_ascii_case("true")),
+                        "maxIterations" => {
+                            if let Ok(n) = v.parse::<u32>() {
+                                max_iter = n.max(1);
+                            }
+                        }
+                        "maxChange" => {
+                            if let Ok(n) = v.parse::<f64>() {
+                                max_change = n.max(0.0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return iterate.map(|i| (i, max_iter, max_change));
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// 写 calcPr 的迭代计算三属性；`iterate=false` 时删掉这三个属性（Excel 默认关闭）。
+/// 前缀感知，保留 calcPr 里其它属性（calcMode/calcId/fullCalcOnLoad 等）。
+pub fn set_calc_iteration(xml: &str, iterate: bool, max_iterations: u32, max_change: f64) -> String {
+    let Some(calc) = find_element(xml, "calcPr") else {
+        if !iterate {
+            return xml.to_string();
+        }
+        let Some(root) = find_element(xml, "workbook") else {
+            return xml.to_string();
+        };
+        let prefix = root.qname.split_once(':').map(|(p, _)| format!("{p}:")).unwrap_or_default();
+        let tag = format!(
+            "<{prefix}calcPr calcId=\"191029\" iterate=\"1\" maxIterations=\"{}\" maxChange=\"{}\"/>",
+            max_iterations.max(1),
+            fmt_change(max_change)
+        );
+        let close = format!("</{}>", root.qname);
+        return match xml.rfind(&close) {
+            Some(i) => format!("{}{}{}", &xml[..i], tag, &xml[i..]),
+            None => xml.to_string(),
+        };
+    };
+    let raw = &xml[calc.start..calc.end];
+    let mut tag = if calc.self_closing {
+        raw.trim_end().trim_end_matches('/').trim_end().to_string()
+    } else {
+        raw.trim_end().trim_end_matches('>').trim_end().to_string()
+    };
+    for key in ["iterate", "maxIterations", "maxChange"] {
+        while let Some(k) = tag.find(key) {
+            let after = &tag[k + key.len()..];
+            let Some(eq_rel) = after.find('=') else { break };
+            if !after[..eq_rel].trim().is_empty() {
+                break;
+            }
+            let attr_start = tag[..k].rfind(char::is_whitespace).unwrap_or(k);
+            let mut end = k + key.len() + eq_rel + 1;
+            let bytes = tag.as_bytes();
+            let mut quote = None;
+            for (i, b) in bytes.iter().enumerate().skip(end) {
+                if *b == b'"' || *b == b'\'' {
+                    if quote.is_none() {
+                        quote = Some(*b);
+                    } else if Some(*b) == quote {
+                        end = i + 1;
+                        break;
+                    }
+                }
+            }
+            tag.replace_range(attr_start..end.min(tag.len()), "");
+            if !tag.trim_end().ends_with('/') && tag.trim_end().ends_with('>') {
+                tag = tag.trim_end().trim_end_matches('>').trim_end().to_string();
+            }
+        }
+    }
+    if iterate {
+        tag.push_str(&format!(
+            " iterate=\"1\" maxIterations=\"{}\" maxChange=\"{}\"",
+            max_iterations.max(1),
+            fmt_change(max_change)
+        ));
+    }
+    tag.push_str(if calc.self_closing { "/>" } else { ">" });
+    format!("{}{}{}", &xml[..calc.start], tag, &xml[calc.end..])
+}
+
+fn fmt_change(v: f64) -> String {
+    let s = format!("{v}");
+    if s.contains('e') || s.contains('E') { format!("{v:.10}").trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+}
