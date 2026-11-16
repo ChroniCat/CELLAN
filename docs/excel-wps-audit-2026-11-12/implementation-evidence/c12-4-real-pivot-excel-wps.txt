@@ -1,0 +1,74 @@
+C12.4 真 pivotTable 部件：Excel 16.0 / WPS 12.0 双向可编辑验证
+===============================================================
+日期：2026-11-16
+代码：`crates/core/src/pivot_parts.rs`（新增）、`crates/core/src/pivot_xml.rs`（改为调用它）
+探针：`crates/core/examples/pivot_excel_probe.rs`、`scripts/c12_pivot_probe2.ps1`、`scripts/c12_make_pivot.ps1`
+
+一、之前是不可用的（不是"没做"，是"做出来 Excel 打不开"）
+--------------------------------------------------------
+首次用 Excel 打开旧实现生成的 `pivot-real.xlsx`：
+
+```
+不能取得类 Workbooks 的 Open 属性
+CategoryInfo: OperationStopped: (:) [], COMException
+```
+
+拆包对照后发现四处硬伤（对照物是 Excel 自己造的 `excel-made.xlsx`，由 `scripts/c12_make_pivot.ps1` 生成）：
+
+| # | 位置 | 旧实现 | Excel 要求 |
+|---|------|--------|-----------|
+| 1 | `cacheField@name` | 用透视**输出**的列标题（`地区/A/B`） | 必须是**源表表头**（`地区/产品/金额`） |
+| 2 | `pivotCacheRecords` | `count="0"` 且空体，而 `recordCount="3"` | 每条源记录一条 `<r>`，条数与 `recordCount` 一致 |
+| 3 | `pivotField` | 没有 `<items>` 子元素 | 行/列字段必须带 `<items count="n+1">`，末项 `<item t="default"/>` |
+| 4 | `dataField@name` | `求和项:求和项:金额` | 聚合前缀只加一次 |
+
+另外 `rowItems/colItems` 里的 `<x v="k"/>` 指向 `sharedItems` 里不存在的下标，`colItems` 缺总计列。
+
+二、修好之后的实测（同一份文件，两个 Office）
+----------------------------------------------
+```
+Excel.Application 16.0
+  sheets=1
+  Data: PivotTables=1
+  name=数据透视表1 rows=[地区] cols=[产品] data=[求和项:金额]
+  range=A9:D13 src=Data!R1C1:R7C3
+  values:
+    地区   A   B  总计
+    华东   40  50  90
+    华北   60  60 120
+    总计  100 110 210
+
+KET.Application（WPS）12.0
+  Data: PivotTables=1
+  name=数据透视表1 rows=[地区] cols=[产品] data=[求和项:金额]
+  values 同上（40/50/90、60/60/120、100/110/210）
+```
+
+数据源是 6 行（华东A 10、华北B 20、华东A 30、华北B 40、华东B 50、华北A 60），
+所以 华东A=40、华北B=60、总计 A=100 / B=110 都对得上——说明 Excel/WPS 不是照抄我们写进去的值，
+而是**从 pivotCacheRecords 重新聚合**，透视表是活的、可刷新、可拖字段。
+
+三、可编辑性证据
+----------------
+- `PivotTables.Count = 1`：是真正的透视表对象，不是值化网格；
+- `RowFields/ColumnFields/DataFields` 都能读出字段名 地区/产品/求和项:金额；
+- `PivotCache().SourceData` 解析为 `Data!R1C1:R7C3`，缓存与源区对得上；
+- 表范围 `A9:D13` 由 Excel 自己算出来（含总计行列）。
+
+四、自检（防止再退化）
+----------------------
+`pivot_parts::build()` 返回前做一致性检查，不一致直接 `Err`，不再写出会让 Excel 修复的文件：
+- 记录条数 `<r>` 数量 == `recordCount`；
+- 值字段标签不得出现 `求和项:求和项:`。
+
+五、回归
+--------
+- `cargo test -p sheetcore --test pivot_attachments` → **6 passed**（含 OPC 关系图、非标准工作表路径、双透视表）
+- `cargo test -p sheetcore` 全量见 `work/goal-logs/c12-core-full.log`
+
+六、还没做的
+------------
+- **多字段模型**（多个行字段/列字段/值字段）仍未落进 pivotTable 部件：现在只支持 1 行 + 0/1 列 + 1 值；
+  多字段要写嵌套 `rowItems`（每层一个 `<x>`）与多 `dataFields`，属于 C12.4 剩余部分。
+- 值字段是"计数/平均/最大/最小"时的缓存类型（`count` 聚合要 `containsInteger` 等）未逐一实测。
+- `.xls`（BIFF8）里没有透视表部件，仍按值化网格处理，不在此项范围。

@@ -92,99 +92,10 @@ fn attach_impl(
     let n_fields = (spec.source.3 - spec.source.1 + 1) as usize;
     let headers: Vec<String> = res.headers.clone();
 
-    // ---------- 字段缓存 ----------
-    let mut caches = String::new();
-    for i in 0..n_fields {
-        let name = headers.get(i).cloned().unwrap_or_else(|| format!("字段{i}"));
-        if i as u32 == spec.value_field - spec.source.1 {
-            // 数值字段要带 min/max，Excel 用来定刻度
-            let (min, max) = numeric_range(res, i);
-            caches.push_str(&format!(
-                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\"{}{}/></cacheField>",
-                esc(&name),
-                min.map(|v| format!(" minValue=\"{v}\"")).unwrap_or_default(),
-                max.map(|v| format!(" maxValue=\"{v}\"")).unwrap_or_default()
-            ));
-        } else {
-            caches.push_str(&format!(
-                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"1\" containsBlank=\"1\"/></cacheField>",
-                esc(&name)
-            ));
-        }
-    }
-    let def = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<pivotCacheDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
-xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
-r:id=\"rId1\" refreshOnLoad=\"1\" refreshedBy=\"{}\" recordCount=\"{}\">\
-<cacheSource type=\"worksheet\"><worksheetSource ref=\"{src}\" sheet=\"{}\"/></cacheSource>\
-<cacheFields count=\"{n_fields}\">{caches}</cacheFields>\
-</pivotCacheDefinition>",
-        esc(refreshed_by), res.rows.len(),
-        esc(sheet_name)
-    );
-
-    // ---------- 透视表定义 ----------
-    let row_i = (spec.row_field - spec.source.1) as usize;
-    let val_i = (spec.value_field - spec.source.1) as usize;
-    let mut pfields = String::new();
-    for i in 0..n_fields {
-        if i == row_i {
-            pfields.push_str("<pivotField axis=\"axisRow\" showAll=\"0\" outline=\"1\"/>");
-        } else if Some(i as u32) == spec.col_field.map(|c| c - spec.source.1) {
-            pfields.push_str("<pivotField axis=\"axisCol\" showAll=\"0\" outline=\"1\"/>");
-        } else if i == val_i {
-            pfields.push_str("<pivotField dataField=\"1\" showAll=\"0\"/>");
-        } else {
-            pfields.push_str("<pivotField showAll=\"0\"/>");
-        }
-    }
-    let r2 = out_rect.2;
-    let c2 = out_rect.3;
-    let loc = format!(
-        "{}{}:{}{}",
-        col_name(out_rect.1),
-        out_rect.0 + 1,
-        col_name(c2),
-        r2 + 1
-    );
-    let mut extra = String::new();
-    if let Some(cf) = spec.col_field {
-        extra.push_str(&format!(
-            "<colFields count=\"1\"><field x=\"{}\"/></colFields><colItems count=\"1\"><i/></colItems>",
-            cf - spec.source.1
-        ));
-    } else {
-        extra.push_str("<colItems count=\"1\"><i/></colItems>");
-    }
-    // rowItems：每组一行，最后一行是总计（t="grand"）
-    let mut items = String::new();
-    for i in 0..res.rows.len() {
-        if i + 1 == res.rows.len() {
-            items.push_str("<i t=\"grand\"><x/></i>");
-        } else {
-            items.push_str(&format!("<i><x v=\"{i}\"/></i>"));
-        }
-    }
-    let def_table = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
-name=\"{}\" cacheId=\"{cache_id}\" dataCaption=\"值\" \
-updatedVersion=\"6\" minRefreshableVersion=\"3\" createdVersion=\"6\" \
-applyWidthHeightFormats=\"1\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" \
-indent=\"0\" outline=\"1\" outlineData=\"1\" multipleFieldFilters=\"0\">\
-<location ref=\"{loc}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/>\
-<pivotFields count=\"{n_fields}\">{pfields}</pivotFields>\
-<rowFields count=\"1\"><field x=\"{row_i}\"/></rowFields>\
-<rowItems count=\"{}\">{items}</rowItems>\
-{extra}\
-<dataFields count=\"1\"><dataField name=\"{}:{}\" fld=\"{val_i}\" baseField=\"0\" baseItem=\"0\"/></dataFields>\
-<pivotTableStyleInfo name=\"PivotStyleLight16\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/>\
-</pivotTableDefinition>",
-        esc(&plan.table_name), res.rows.len(),
-        agg_label(spec.agg),
-        esc(value_label)
-    );
+    // ---------- 缓存与透视表定义（pivot_parts.rs 负责三份 XML 的一致性）----------
+    let (def, records, def_table) = crate::pivot_parts::build(
+        path, sheet_name, spec, res, out_rect, value_label, cache_id, &plan.table_name, refreshed_by,
+    )?;
 
     // ---------- 写 zip ----------
     let cache_part = format!("xl/pivotCache/pivotCacheDefinition{cache_id}.xml");
@@ -195,11 +106,6 @@ indent=\"0\" outline=\"1\" outlineData=\"1\" multipleFieldFilters=\"0\">\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords\" Target=\"pivotCacheRecords{cache_id}.xml\"/>\
 </Relationships>"
-    );
-    let records = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<pivotCacheRecords xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
-xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" count=\"0\"/>"
     );
     let records_part = format!("xl/pivotCache/pivotCacheRecords{cache_id}.xml");
 

@@ -46,6 +46,7 @@ pub mod pivot;
 pub mod pivot_multi;
 pub mod refs;
 pub mod sheet_ops;
+pub mod pivot_parts;
 pub mod pivot_xml;
 pub mod qtable;
 pub mod model;
