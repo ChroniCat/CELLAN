@@ -186,3 +186,44 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 2. QA-01.3 扩展图表/透视/打印夹具，补齐三方 runner 的 manifest。
 3. UI-09 键盘导航剩余切片、UI-16 标签管理复核；UI-15 其余切片收尾。
 4. 需要真实输入/IME 的项（UI-01、QA-04、UI-11、UI-24…）等可用桌面会话，不伪造。
+
+## 2026-11-16 检查点二：UI-11.4 插入函数向导 + 真实最近使用
+
+- HEAD `7169cc6`（`feat(ui11): insert-function wizard with search, arg fields and live recent functions`）。
+- app 全量：`cargo test -p app --offline -j 2 --bin app -- --test-threads=2` → **320 passed / 0 failed / 0 ignored**（10.71s）。
+
+### 这一轮做完的
+
+1. 插入函数向导（`InsertFunction` / fx）：左列表是引擎真实实现的 475 个函数，可按名字或首字母搜索，
+   前缀命中排前；右侧名字/中文说明/签名 + 按签名解析的参数框（`[x]` 标「（可选）」）+ 实时公式预览；
+   空参数插 `=NAME()` 且光标停在括号里；已在公式里只插函数体不叠等号；Enter=确定、Esc=取消；搜索框自动聚焦、
+   当前函数自动滚进视野、按钮右对齐。
+2. 函数库「最近使用的函数」改成运行时读真实记录（`crates/app/src/fnrecent.rs`，
+   `%LOCALAPPDATA%\SheetsNative\fnrecent.txt`，MRU 最多 10 条，无记录才兜底 XML 那五项）；
+   公式提交时扫描真实函数调用记账，菜单点一下插 `=NAME()`。
+
+### 实测与踩坑
+
+- 对话框第一版把 475 行函数排成一行（ScrollArea 继承了外层 horizontal 布局），窗口宽 48893px 把网格盖白；
+  改 `allocate_ui_with_layout(vec2(avail, 330)) + ui.vertical` 后稳定在 620×449。
+- 回车确定后同一帧的格内编辑器又把 Enter 当「提交并下移」，A1 被写死、选区跳到 A2；
+  修法：确定时 `consume_key(Modifiers::NONE, Enter)`。
+- 探针实测：`SC_CMD=InsertFunction` + `SC_TYPE="14:AVERAGE"` + `SC_KEYSEQ="26:enter"` →
+  匹配数 475→5、`applied formula="=AVERAGE()" editing caret=9`，编辑栏与格内编辑器同串，状态栏「已插入函数 AVERAGE」。
+- 真实用户目录 `fnrecent.txt` 内容：`AVERAGE` / `SUM`（向导确定记一次 + 公式提交再记一次，顺序正确）。
+
+### 证据
+
+- `implementation-evidence/ui11-fn-wizard.txt`
+- `implementation-evidence/ui114-probe/{wizard-apply3.png,wizard-apply3.log,wizard9.png,wizard.png,wizard-apply.log,patch_wiz.py}`
+
+### 仍然没做（不抬高）
+
+- Shift/拖动把引用扩成 `A1:B2`、点行号列标建 `A:A`/`1:1`、跨工作表点选建 `Sheet2!A1`；
+- 向导里点区域填参数、分类筛选、帮助链接；
+- 真实中文 IME 候选确认（本机 RDP 不可用，继续待验收）。
+
+### 台账
+
+- parents 61：已验收 24 / 实施中 3 / 待验收 27 / 待实施 7；
+- slices 148：已验收 60 / 待验收 64 / 待实施 21 / 实施中 3（本轮未改变计数）。
