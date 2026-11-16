@@ -7403,7 +7403,10 @@
         "cargo test -p app --offline -j 2 --bin app -- status_stats ui25_context_menu_hidden --test-threads=2 -> 4 passed / 0 failed",
         "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed / 0 failed / 0 ignored",
         "powershell ui25-excel-uia2.ps1 -> Excel 16.0 状态栏：基准 2.333333333/4/7、手动隐藏行 2.5/3/5、隐藏B列 50.5/2/101、分级折叠行 7/1/7",
-        "app.exe + SC_HIDE_ROWS=2 / SC_HIDE_COLS=2 + SC_STAT_DUMP -> 与 Excel 三组数字逐项一致"
+        "app.exe + SC_HIDE_ROWS=2 / SC_HIDE_COLS=2 + SC_STAT_DUMP -> 与 Excel 三组数字逐项一致",
+        "SC_SEL=0,0 SC_SEL2=999999,0 values1m.xlsx -> stat=平均值 496.515/计数 1000/求和 496515，update p50 0.91ms p95 1.72ms",
+        "cargo test -p app --bin app -- large_selection_stats_are_not_empty -> ok",
+        "cargo test -p app --bin app -> 361 passed（work/goal-logs/ui25-stats-app2.log）"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-hidden-marker.txt",
@@ -7412,11 +7415,11 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-stats.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-dense-selection.txt"
       ],
       "not_done": [
         "真实鼠标 Ctrl 多选/右键点「隐藏行」未执行（RDP 注入不可用）；入口用同一 CtxAct 分发覆盖",
-        "百万行密集选区分帧耗时未压测（仅百万行稀疏表）",
         "筛选与手动隐藏重叠同一行时无法与 Excel 区分归因，按集合并集去重（结果口径一致）"
       ],
       "failures": [],

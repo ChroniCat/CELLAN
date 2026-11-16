@@ -9824,3 +9824,33 @@ fn every_dialog_primary_action_uses_the_default_button_helper() {
 ")
     );
 }
+
+#[test]
+fn large_selection_stats_are_not_empty() {
+    // 回归：百万行选区的状态栏统计曾经恒为空。根因是 collect_stats_values 里
+    // 额外用 rows.size(r) <= 0.0 过滤，把整表滤掉（行高不参与统计口径）。
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("work/probe/qa07/values1m.xlsx");
+    if !path.exists() {
+        eprintln!("[skip] 缺少 {}", path.display());
+        return;
+    }
+    let wb = sheetcore::xlsx::load(&path).expect("load values1m");
+    let sh = wb.sheet(0);
+    let rects = [(0u32, 0u32, 999_999u32, 0u32)];
+    let vals = crate::collect_stats_values(sh, &rects);
+    assert!(
+        !vals.is_empty(),
+        "百万行选区收集到 0 个值（状态栏会永远显示空）"
+    );
+    let mut acc = crate::StatsAcc::default();
+    for v in &vals {
+        acc.add(*v);
+    }
+    let text = acc.text(11);
+    assert!(text.contains("计数: 1000"), "统计文本不对：{text:?}");
+    // 同步路径（小选区）与异步路径必须一致
+    let sync = crate::status_stats_rects(sh, &rects, 11);
+    assert_eq!(sync, text, "同步/异步统计口径不一致");
+}

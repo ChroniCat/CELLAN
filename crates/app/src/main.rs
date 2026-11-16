@@ -2382,6 +2382,7 @@ pub(crate) fn collect_stats_values(
     let mut out = Vec::new();
     for (cr, cell) in sheet.iter() {
         let (r, c) = (cr.row, cr.col);
+        // 行高 0 的行按隐藏处理（部分写入方只给 ht=0 不给 hidden 标记，Excel 也不计入统计）
         if cell.is_blank() || sheet.rows.size(r) <= 0.0 || hidden.contains(&r) {
             continue;
         }
@@ -2423,7 +2424,10 @@ pub(crate) fn status_stats_text(
 
 /// UI-25：大选区分帧统计，避免一帧扫完整块导致界面卡死。
 pub(crate) struct StatsJob {
-    key: (usize, u64, Vec<(u32, u32, u32, u32)>, u8),
+    // (sheet, doc_gen, wb_epoch, rects, mask)
+    // wb_epoch 必须在里面：文件是异步装载的，统计可能先跑在空工作簿上，
+    // 只按 doc_gen 判新鲜会让「百万行选区统计」永远是 0（实测 count=0）。
+    key: (usize, u64, u64, Vec<(u32, u32, u32, u32)>, u8),
     vals: Vec<Option<f64>>,
     idx: usize,
     acc: StatsAcc,
@@ -29813,7 +29817,13 @@ impl eframe::App for SheetApp {
                 let stat_frame = ui.ctx().cumulative_pass_nr();
                 if stat_mask != 0 && area > 0 {
                     if area > 50_000 {
-                        let key = (self.sheet_idx, self.doc_gen, rects.clone(), stat_mask);
+                        let key = (
+                            self.sheet_idx,
+                            self.doc_gen,
+                            self.wb_epoch,
+                            rects.clone(),
+                            stat_mask,
+                        );
                         let stale = self.stats_job.as_ref().map_or(true, |j| j.key != key);
                         if stale {
                             let vals = collect_stats_values(self.wb.sheet(self.sheet_idx), &rects);
