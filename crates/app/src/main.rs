@@ -8239,7 +8239,8 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                     }
                 }
                 ui.separator();
-                if ui.button("执行").clicked() {
+                // 排序/分列对话框只有一个主动作：Enter 等同「执行」（Excel 里也是这样）
+                if ui_kit::primary_button(ui, "执行").clicked() {
                     run = true;
                 }
             });
@@ -15314,12 +15315,11 @@ let txn = self.txn_begin(&keys);
                             }
                         });
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked {
                         apply = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
                         open = false;
                     }
                 });
@@ -20260,12 +20260,12 @@ let txn = self.txn_begin(&keys);
                 if enter_pressed {
                     apply = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("取消").clicked() {
-                        cancel = true;
-                    }
-                    if ui.button("确定").clicked() {
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::primary_button(ui, "确定").clicked {
                         apply = true;
+                    }
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        cancel = true;
                     }
                 });
             });

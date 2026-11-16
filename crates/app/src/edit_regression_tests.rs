@@ -8619,6 +8619,18 @@ fn tab_event() -> egui::Event {
     }
 }
 
+fn shift_tab_event() -> egui::Event {
+    let mut m = egui::Modifiers::NONE;
+    m.shift = true;
+    egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: m,
+    }
+}
+
 fn esc_event() -> egui::Event {
     egui::Event::Key {
         key: egui::Key::Escape,
@@ -9653,5 +9665,162 @@ fn pasting_text_that_looks_numeric_keeps_leading_zeros() {
         app.wb.sheets[0].value(0, 3),
         Value::Text("2023-03-15".into()),
         "Type=String 的日期文本不能按日期序列号落格"
+    );
+}
+
+#[test]
+fn shift_tab_cycles_backwards_inside_modal_and_never_escapes() {
+    let ctx = egui::Context::default();
+    let mut open = true;
+    let mut seen: Vec<&'static str> = Vec::new();
+    run_frame(&ctx, vec![], &mut open, &mut seen, true);
+    assert_eq!(seen.last(), Some(&"bg"), "背景按钮第一帧没拿到焦点");
+    // Tab 前进到「确定」
+    let mut reached = false;
+    for _ in 0..6 {
+        seen.clear();
+        run_frame(&ctx, vec![tab_event()], &mut open, &mut seen, false);
+        run_frame(&ctx, vec![], &mut open, &mut seen, false);
+        if seen.contains(&"dlg") {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab 前进没到「确定」：{seen:?}");
+    // Shift+Tab：必须退到对话框内另一个控件，且不回背景。
+    // egui 的焦点迁移发生在下一帧开头，所以按 Tab 之后要多跑几帧再看结果。
+    seen.clear();
+    let mut moved = false;
+    // egui 的焦点迁移排在下一帧：按 Shift+Tab 的那一帧仍报旧焦点，
+    // 所以要先跑按键帧、清空记录，再看下一帧落到哪里。
+    for _ in 0..3 {
+        run_frame(&ctx, vec![shift_tab_event()], &mut open, &mut seen, false);
+        seen.clear();
+        run_frame(&ctx, vec![], &mut open, &mut seen, false);
+        assert!(!seen.contains(&"bg"), "Shift+Tab 把焦点退到背景：{seen:?}");
+        if !seen.contains(&"dlg") {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "Shift+Tab 没有从「确定」后退（焦点没动）：{seen:?}");
+    // 再 Shift+Tab 一圈回到「确定」，证明是反向循环而不是卡死
+    let mut back = false;
+    for _ in 0..6 {
+        run_frame(&ctx, vec![shift_tab_event()], &mut open, &mut seen, false);
+        seen.clear();
+        run_frame(&ctx, vec![], &mut open, &mut seen, false);
+        assert!(!seen.contains(&"bg"), "反向循环里焦点跑到背景：{seen:?}");
+        if seen.contains(&"dlg") {
+            back = true;
+            break;
+        }
+    }
+    assert!(back, "反向循环没回到「确定」：{seen:?}");
+}
+
+#[test]
+fn tabbing_into_scrolled_dialog_scrolls_the_focused_button_into_view() {
+    // 对话框高度固定 200，内容 40 个按钮；Tab 一路走到底时最后一个按钮必须被滚进视口，
+    // 否则焦点跑到看不见的地方（键盘用户以为 Tab 失灵）。
+    let ctx = egui::Context::default();
+    let mut open = true;
+    let mut last_rect: Option<egui::Rect> = None;
+    let mut body_rect: Option<egui::Rect> = None;
+    fn frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        open: &mut bool,
+        last_rect: &mut Option<egui::Rect>,
+        body_rect: &mut Option<egui::Rect>,
+    ) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        ));
+        raw.events = events;
+        ctx.run(raw, |ctx| {
+            ui_kit::window(ctx, "长对话框", 360.0)
+                .default_size([360.0, 200.0])
+                .open(open)
+                .show(ctx, |ui| {
+                    *body_rect = Some(ui.clip_rect());
+                    for i in 0..40 {
+                        let r = ui.add(egui::Button::new(format!("按钮 {i}")));
+                        if i == 0 && ctx.memory(|m| m.focused()).is_none() {
+                            r.request_focus();
+                        }
+                        if i == 39 {
+                            *last_rect = Some(r.rect);
+                        }
+                    }
+                });
+        });
+    }
+    frame(&ctx, vec![], &mut open, &mut last_rect, &mut body_rect);
+    frame(&ctx, vec![], &mut open, &mut last_rect, &mut body_rect);
+    let body0 = body_rect.expect("没有正文视口");
+    let last0 = last_rect.expect("没有最后一个按钮");
+    assert!(
+        !body0.contains_rect(last0),
+        "初始状态最后一个按钮就在视口内，用例失去意义（body {body0:?} last {last0:?}）"
+    );
+    // 连续 Tab 直到最后一个按钮拿到焦点
+    let mut reached = false;
+    for _ in 0..60 {
+        frame(&ctx, vec![tab_event()], &mut open, &mut last_rect, &mut body_rect);
+        frame(&ctx, vec![], &mut open, &mut last_rect, &mut body_rect);
+        if let (Some(b), Some(l)) = (body_rect, last_rect) {
+            if b.contains_rect(l) {
+                reached = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        reached,
+        "Tab 走完 40 个按钮，最后一个仍在视口外（没有自动滚动）：body {body_rect:?} last {last_rect:?}"
+    );
+}
+
+#[test]
+fn every_dialog_primary_action_uses_the_default_button_helper() {
+    // 默认按钮（Enter 触发）只在 ui_kit::primary_button 里实现。任何对话框的主按钮
+    // 写成 ui.button(...) 就会丢掉 Enter，也不会画焦点圈。
+    // 这条用例扫源码，把「对话框里剩下的裸主按钮」钉死。
+    let src = include_str!("main.rs");
+    let mut bad = Vec::new();
+    // 功能区下拉里的行内「应用」是菜单项（点完即关闭菜单），不是对话框默认按钮，
+    // 不在本规则的管辖范围内。
+    const MENU_FNS: [&str; 1] = ["toolbar_cf_items"];
+    let mut cur_fn = "";
+    for (n, line) in src.lines().enumerate() {
+        if line.starts_with("    fn ") {
+            cur_fn = line
+                .trim_start_matches("    fn ")
+                .split(['(', '<'])
+                .next()
+                .unwrap_or("");
+        }
+        if MENU_FNS.contains(&cur_fn) {
+            continue;
+        }
+        let t = line.trim();
+        if !t.starts_with("if ui.button(") && !t.starts_with("if ui.add(egui::Button::new(") {
+            continue;
+        }
+        for label in ["确定", "执行", "应用", "完成", "下一步", "导入"] {
+            if t.contains(&format!("\"{label}\"")) {
+                bad.push(format!("main.rs:{} {}", n + 1, t));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "这些对话框主按钮没有走 primary_button（Enter 无效、也没有焦点圈）：
+{}",
+        bad.join("
+")
     );
 }

@@ -7263,24 +7263,24 @@
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "实施中",
-          "acceptance": "",
+          "acceptance": "模态焦点锁定 + 正反向循环 + 默认按钮（Enter）+ 焦点自动滚入视口，四条均有可复跑的 egui 事件循环用例；物理键盘一项受环境阻塞。",
           "files": [],
           "commits": [
             "2218a50"
           ],
           "commands": [
             "cargo test -p app --bin app -- modal_dialog_traps（egui 真实 Context + Tab/Escape 事件）-> ok",
-            "cargo test -p app --bin app -- default_button_answers -> ok",
-            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui241b-app.log）"
+            "cargo test -p app --bin app -- shift_tab_cycles_backwards_inside_modal_and_never_escapes -> ok",
+            "cargo test -p app --bin app -- default_button_answers_enter_only_when_no_field_has_focus -> ok",
+            "cargo test -p app --bin app -- tabbing_into_scrolled_dialog_scrolls_the_focused_button_into_view -> ok（去掉滚动行则失败）",
+            "cargo test -p app --bin app -- every_dialog_primary_action_uses_the_default_button_helper -> ok",
+            "cargo test -p app --bin app（--test-threads=2）-> 360 passed（work/goal-logs/ui241c-app.log）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-modal-focus.txt"
           ],
           "not_done": [
-            "未用物理键盘在 GUI 里按 Tab（RDP 下无法注入），证据是 egui 事件循环测试。",
-            "Shift+Tab 反向循环未单独断言。",
-            "默认按钮只覆盖 primary_button；功能区没有默认按钮概念。",
-            "对话框内 ScrollArea 视口外控件 Tab 不会自动滚动到。"
+            "物理键盘在 GUI 里按 Tab/Shift+Tab：本机无交互桌面，SendInput 无效（与 QA-04.1 同一阻塞），证据为 egui 真实事件循环测试。"
           ],
           "failures": [],
           "blocker": "",

@@ -66,3 +66,36 @@ default_button_answers_enter_only_when_no_field_has_focus ... ok
 --------
 - app 测试 **341 passed**（`work/goal-logs/ui241b-app.log`）。
 - `SC_FOCUS_DBG=1` 可打印每帧 bg/dlg 的焦点 id，便于以后回归定位。
+
+## 补充（2026-11-17）：反向 Tab / 默认按钮 / 焦点滚动
+
+原 not_done 四条里三条已收口，第四条仍是环境阻塞。
+
+### 1. Shift+Tab 反向循环（新用例）
+`shift_tab_cycles_backwards_inside_modal_and_never_escapes`：
+Tab 前进到「确定」→ Shift+Tab 必退到对话框内另一个控件（不回背景）→ 再 Shift+Tab 一圈回到「确定」。
+实测坑：egui 的焦点迁移排在**下一帧**（按 Shift+Tab 的那一帧仍报旧焦点），
+所以断言必须「先跑按键帧 → 清空记录 → 再跑一帧看落到哪」。首版按同帧断言会误判成「焦点没动」。
+
+### 2. 默认按钮覆盖到全部对话框主按钮
+`ui_kit::primary_button` 是唯一实现「Enter = 默认按钮」的地方（且要求没有控件持有焦点、
+没有弹出层）。扫出并修掉 3 处裸按钮：
+- 移动或复制工作表（确定/取消原来用 `ui.button`，也没有 footer）
+- 函数向导（同上）
+- 排序/分列（「执行」）
+新增源码级用例 `every_dialog_primary_action_uses_the_default_button_helper`：
+扫 `main.rs` 里所有 `if ui.button("确定"/"执行"/"应用"/"完成"/"下一步"/"导入")`，
+命中即失败；`toolbar_cf_items` 里的行内「应用」是菜单项，显式排除。
+
+### 3. 对话框内 Tab 到视口外控件自动滚动
+`ui_kit::window` 的滚动分支里，每帧检查当前焦点控件的矩形，若不在 `clip_rect` 内就
+`scroll_to_rect(…, Align::Center)`。
+用例 `tabbing_into_scrolled_dialog_scrolls_the_focused_button_into_view`：360×200 的对话框塞 40 个按钮，
+Tab 走到底。**反向验证过**：把滚动那行改成 `false &&` 后用例失败
+（`last [[236.0 1120.0] - [287.0 1140.0]]` 在视口 `[[0 220] - [800 426]]` 之外），改回来通过。
+
+### 4. 仍未做
+物理键盘在 GUI 里按 Tab / Shift+Tab：本机 `GetForegroundWindow()=0`，SendInput 无效，
+与 QA-04.1 同一阻塞。证据仍是 egui 真实事件循环（`ctx.run` + `Event::Key{key:Tab}`）。
+
+app 全量 360 passed（`work/goal-logs/ui241c-app.log`）。

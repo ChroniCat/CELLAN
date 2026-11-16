@@ -1423,7 +1423,22 @@ impl Dlg {
                                 if h > 0.0 {
                                     egui::ScrollArea::vertical()
                                         .max_height(h)
-                                        .show(ui, add)
+                                        .show(ui, |ui| {
+                                            let r = add(ui);
+                                            // UI-24.1：Tab 走到滚动区外的控件时把它滚进视口，
+                                            // 否则键盘焦点会落在看不见的地方（Excel 也是自动跟随）。
+                                            if let Some(fid) = ui.memory(|m| m.focused()) {
+                                                if let Some(fr) = ui.ctx().read_response(fid) {
+                                                    if !ui.clip_rect().contains_rect(fr.rect) {
+                                                        ui.scroll_to_rect(
+                                                            fr.rect,
+                                                            Some(egui::Align::Center),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            r
+                                        })
                                         .inner
                                 } else {
                                     add(ui)
