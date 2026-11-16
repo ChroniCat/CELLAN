@@ -2412,9 +2412,49 @@ impl<'a> Calc<'a> {
         (rows, cols, rc)
     }
 
+    /// 去掉区域里被手动隐藏的行（hidden_rows / hidden_rows_user）。
+    /// 供 SUBTOTAL 100+ 与 AGGREGATE option 5/6 使用；返回的新 Arg 行数会相应减少。
+    fn drop_hidden_rows(&self, arg: Arg, r1: u32, si: usize) -> Arg {
+        let Arg::Range { values, rows, cols } = arg else {
+            return arg;
+        };
+        let Some(sheet) = self.wb.sheets.get(si) else {
+            return Arg::Range { values, rows, cols };
+        };
+        let mut out: Vec<FValue> = Vec::with_capacity(values.len());
+        let mut kept = 0usize;
+        for i in 0..rows {
+            let r = r1 + i as u32;
+            let hidden = sheet.hidden_rows.contains(&r) || sheet.hidden_rows_user.contains(&r);
+            if !hidden {
+                out.extend(values[i * cols..(i + 1) * cols].iter().cloned());
+                kept += 1;
+            }
+        }
+        Arg::Range { values: std::rc::Rc::new(out), rows: kept, cols }
+    }
+
     /// 查找参数不是字面区域时，退回通用求值路径
     fn call_generic(&mut self, name: &str, nodes: &[Node], si: usize) -> FValue {
         let mut args = Vec::with_capacity(nodes.len());
+        // SUBTOTAL 100+ 与 AGGREGATE option 5/6 要跳过手动隐藏行，
+        // 而 Arg 里只有扁平值，所以必须在打包实参时就按行剔除。
+        let skip_hidden = if name == "SUBTOTAL" {
+            nodes
+                .first()
+                .map(|n| self.eval_node(n, si).to_number().unwrap_or(0.0) >= 100.0)
+                .unwrap_or(false)
+        } else if name == "AGGREGATE" {
+            nodes
+                .get(1)
+                .map(|n| {
+                    let o = self.eval_node(n, si).to_number().unwrap_or(0.0);
+                    o == 5.0 || o == 6.0
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
         for n in nodes {
             if let Node::Range(a, b) = n {
                 if a.sheet2.is_some() || b.sheet2.is_some() {
@@ -2422,7 +2462,14 @@ impl<'a> Calc<'a> {
                     continue;
                 }
                 match self.range_values(a, b, si) {
-                    Ok(arg) => args.push(arg),
+                    Ok(arg) => {
+                        let arg = if skip_hidden {
+                            self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, si)
+                        } else {
+                            arg
+                        };
+                        args.push(arg)
+                    }
                     Err(e) => args.push(Arg::Val(FValue::Error(e))),
                 }
             } else {

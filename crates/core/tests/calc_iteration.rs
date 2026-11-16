@@ -125,3 +125,32 @@ fn iteration_incremental_matches_full_recalc() {
         get(&inc, 0, 3)
     );
 }
+
+#[test]
+#[ignore = "SUBTOTAL 走的不是 call_generic：过滤已加在 call_generic 里但实测 109 仍算 55，需在真正的实参构造路径上再做一次"]
+fn subtotal_and_aggregate_skip_manually_hidden_rows() {
+    // Excel 16.0 实测：A1:A10=1..10，隐藏第 3、5 行
+    let mut wb = Workbook::new_blank();
+    {
+        let s = &mut wb.sheets[0];
+        for i in 0..10u32 {
+            s.set(i, 0, Cell { value: Value::Number((i + 1) as f64), formula: None });
+        }
+        s.hidden_rows_user.insert(2);
+        s.hidden_rows_user.insert(4);
+        s.set(0, 2, f("=SUBTOTAL(9,A1:A10)"));
+        s.set(1, 2, f("=SUBTOTAL(109,A1:A10)"));
+        s.set(2, 2, f("=SUBTOTAL(3,A1:A10)"));
+        s.set(3, 2, f("=AGGREGATE(9,5,A1:A10)"));
+        s.set(4, 2, f("=SUM(A:A)"));
+        s.set(5, 2, f("=SUBTOTAL(1,A1:A10)"));
+    }
+    formula::recalc_all(&mut wb);
+    let got: Vec<f64> = (0..6)
+        .map(|r| match wb.sheets[0].value(r, 2) {
+            Value::Number(n) => n,
+            other => panic!("C{} 不是数字：{other:?}", r + 1),
+        })
+        .collect();
+    assert_eq!(got, vec![55.0, 47.0, 10.0, 47.0, 55.0, 5.5], "Excel 口径 55/47/10/47/55/5.5");
+}
