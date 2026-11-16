@@ -4564,14 +4564,15 @@
             "SC_PERF_DIR=work/probe/qa07 target/release/examples/perf_probe.exe --suite -> 9 组样本（work/probe/qa07/suite4-postfix.jsonl）",
             "SC_LOAD_PROF=1 + SC_SHOT/SC_SHOT_EXIT 跑 release app，5 次取 p50/p95（first_frame 0.64s，1M 值可编辑 4.09s）",
             "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed（work/goal-logs/qa07-core.log）",
-            "cargo test -p app --bin app（--test-threads=2）-> 337 passed（work/goal-logs/qa07-app.log）"
+            "cargo test -p app --bin app（--test-threads=2）-> 337 passed（work/goal-logs/qa07-app.log）",
+            "SC_FRAME_LOG=240 -> values 1M p50 17.84/p95 24.38ms；chain 1M p50 28.50/p95 29.16ms"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt"
           ],
           "not_done": [
-            "冷启动（清空系统文件缓存后的首次打开）未测；现有「冷」仅指新进程首次打开。",
-            "update() CPU 时间（SC_FRAME_LOG）本轮未在 release 下重跑，未与端到端时延并列记录。"
+            "冷启动（清空系统文件缓存后的首次打开）仍未测：本机无 RAMMap/提权清缓存手段，只能测新进程首次打开。",
+            "冷启动（清空系统文件缓存后的首次打开）未测；现有「冷」仅指新进程首次打开。"
           ],
           "failures": [],
           "blocker": "",
