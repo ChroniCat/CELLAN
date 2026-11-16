@@ -749,7 +749,7 @@ fn two_row_fields_match_excel_sort_probe() {
 }
 
 #[test]
-fn multi_value_grid_dump_for_reference() {
+fn multi_value_with_col_field_matches_excel() {
     use sheetcore::{Cell, Value};
     let mut wb = sheetcore::Workbook::new_blank();
     wb.sheets[0].name = "Data".into();
@@ -784,10 +784,48 @@ fn multi_value_grid_dump_for_reference() {
         layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
     };
     let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
-    for h in &g.headers {
-        eprintln!("HDR| {}", h.join("	"));
-    }
-    for r in &g.rows {
-        eprintln!("ROW| {}", r.iter().map(|v| v.display()).collect::<Vec<_>>().join("	"));
-    }
+    // 与 work/probe/c12/multival-ref.tsv（Excel 实测）逐格比对
+    let trim = |row: &Vec<String>| -> Vec<String> {
+        let mut r = row.clone();
+        while r.last().is_some_and(|x| x.is_empty()) {
+            r.pop();
+        }
+        r
+    };
+    let hdrs: Vec<Vec<String>> = g.headers.iter().map(trim).collect();
+    assert_eq!(hdrs[0], vec!["", "产品", "", "", "", "值"]);
+    assert_eq!(
+        hdrs[1],
+        vec!["", "A", "", "B", "", "求和项:金额汇总", "求和项:数量汇总"]
+    );
+    assert_eq!(
+        hdrs[2],
+        vec!["地区", "求和项:金额", "求和项:数量", "求和项:金额", "求和项:数量"]
+    );
+    let rows: Vec<Vec<String>> = g
+        .rows
+        .iter()
+        .map(|r| trim(&r.iter().map(|v| v.display()).collect::<Vec<_>>()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["华北", "60", "7", "60", "8", "120", "15"],
+            vec!["华东", "40", "6", "50", "6", "90", "12"],
+            vec!["总计", "100", "13", "110", "14", "210", "27"],
+        ]
+    );
+
+    // 落盘 + 挂真 pivotTable 部件，供 Excel 探针验证
+    let fx = Fixture::new("multival");
+    let path = fx.file("multival.xlsx");
+    sheetcore::xlsx::save(&path, &wb).expect("保存失败");
+    wb.path = Some(path.clone());
+    let g2 = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let rect = sheetcore::pivot_multi::write_grid(&mut wb.sheets[0], (8, 0), &g2);
+    let _ = sheetcore::pivot_xml::attach2_for_session(&path, "Data", &spec, &g2, rect, "test")
+        .expect("附挂失败");
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/multival-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
 }

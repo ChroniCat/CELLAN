@@ -41,3 +41,20 @@ ROW| 总计  100 13  110 14
 - 完成后用同一夹具跑 `pivot_parts2` + Excel 探针确认 `location` 与列数一致。
 
 **未完成前 C12.2 不计入验收。**
+
+## 已实现（同日）
+
+`pivot_multi::compute` 补齐上一节的 3 条差异：
+
+1. `grand_block = values.len()`（有列字段且 `grand_totals` 时），`total_cols = rows + col_paths*values + grand_block`；
+2. 表头改 3 行：字段名行（`产品` / `值`）、列标签行（`A` / `B` + 各值「…汇总」）、值名行（行字段名 + 各值名）；
+3. 明细行、小计行、总计行的右侧总计列按「跨所有列叶子求和」填值。
+
+`emit_row` 末尾按 `total_cols` 补空位（否则右侧总计列写不进去）。
+
+回归 `multi_value_with_col_field_matches_excel`：表头 3 行 + 3 个数据行逐格与
+`multival-ref.tsv` 比对（7 列全同）。`pivot_multi_parts` **19 passed**。
+
+Excel 探针：`multival-ours.xlsx → pivots=1 rows=1 cols=1 data=1 range=A9:G14`，
+即 Excel 认这个 3 行表头 + 7 列的透视表（`data=1` 是探针的 DataFields 计数口径，
+与之前 compact-multi 一致，不影响可读性）。

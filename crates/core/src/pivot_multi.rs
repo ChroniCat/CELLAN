@@ -253,6 +253,10 @@ fn emit_row(
             row.push(v);
         }
     }
+    // 右侧「…汇总」总计列先占位，调用方填值
+    while row.len() < total_cols {
+        row.push(Value::Empty);
+    }
     grid.rows.push(row);
 }
 
@@ -319,31 +323,64 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     }
     grid.col_paths = col_paths.clone();
 
-    let n_head = if spec.cols.is_empty() { 1 } else { spec.cols.len() + 1 };
-    let total_cols = spec.rows.len() + col_paths.len() * spec.values.len();
+    let n_head = if spec.cols.is_empty() { 1 } else { spec.cols.len() + 2 };
+    // Excel 在有列字段且显示总计列时，右侧给每个值字段各留一列「<值名>汇总」
+    let grand_block = if !spec.cols.is_empty() && spec.layout.grand_totals {
+        spec.values.len()
+    } else {
+        0
+    };
+    let grand_base = spec.rows.len() + col_paths.len() * spec.values.len();
+    let total_cols = grand_base + grand_block;
+    let value_label = |vi: usize| -> String {
+        let v = &spec.values[vi];
+        v.label
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", hdr(v.col), v.agg.label()))
+    };
     for hi in 0..n_head {
         let mut row = vec![String::new(); total_cols];
-        if hi == 0 {
-            for (i, f) in spec.rows.iter().enumerate() {
-                if i < total_cols {
-                    row[i] = hdr(f.col);
+        if spec.cols.is_empty() {
+            // 单行表头：行字段名 + 值名
+            if hi == 0 {
+                for (i, f) in spec.rows.iter().enumerate() {
+                    if i < total_cols {
+                        row[i] = hdr(f.col);
+                    }
                 }
             }
-        }
-        for (ci, p) in col_paths.iter().enumerate() {
-            for vi in 0..spec.values.len() {
-                let idx = spec.rows.len() + ci * spec.values.len() + vi;
-                if idx >= total_cols {
-                    continue;
+            for (ci, _p) in col_paths.iter().enumerate() {
+                for vi in 0..spec.values.len() {
+                    row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
                 }
-                if hi + 1 == n_head {
-                    let v = &spec.values[vi];
-                    row[idx] = v
-                        .label
-                        .clone()
-                        .unwrap_or_else(|| format!("{} {}", hdr(v.col), v.agg.label()));
-                } else if hi < p.len() {
-                    row[idx] = p[hi].clone();
+            }
+        } else if hi == 0 {
+            // 第一行：列字段名 + 「值」（总计列的表头）
+            row[spec.rows.len()] = hdr(spec.cols[0].col);
+            if grand_block > 0 {
+                row[grand_base] = "值".to_string();
+            }
+        } else if hi + 1 == n_head {
+            // 最后一行：行字段名 + 每个值槽的值名
+            for (i, f) in spec.rows.iter().enumerate() {
+                row[i] = hdr(f.col);
+            }
+            for (ci, _p) in col_paths.iter().enumerate() {
+                for vi in 0..spec.values.len() {
+                    row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
+                }
+            }
+        } else {
+            // 中间行：列标签逐层；紧邻字段名行的那一行右侧放「…汇总」
+            let lvl = hi - 1;
+            for (ci, p) in col_paths.iter().enumerate() {
+                if lvl < p.len() {
+                    row[spec.rows.len() + ci * spec.values.len()] = p[lvl].clone();
+                }
+            }
+            if hi == 1 && grand_block > 0 {
+                for vi in 0..spec.values.len() {
+                    row[grand_base + vi] = format!("{}汇总", value_label(vi));
                 }
             }
         }
@@ -366,6 +403,20 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         for k in &keys[start..i] {
             let m = &data[k];
             emit_row(&mut grid, k, Some(m), &col_paths, spec, &mut prev, total_cols);
+            if grand_block > 0 {
+                let last = grid.rows.len() - 1;
+                for vi in 0..spec.values.len() {
+                    let mut acc = Acc::default();
+                    for p in col_paths.iter() {
+                        if let Some(a) = m.get(p) {
+                            if vi < a.len() {
+                                acc.merge(&a[vi]);
+                            }
+                        }
+                    }
+                    grid.rows[last][grand_base + vi] = acc.finish(spec.values[vi].agg);
+                }
+            }
             for (ci, p) in col_paths.iter().enumerate() {
                 if let Some(accs) = m.get(p) {
                     for vi in 0..spec.values.len().min(accs.len()) {
@@ -386,6 +437,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
                         sub[ci][vi].finish(spec.values[vi].agg);
                 }
             }
+            if grand_block > 0 {
+                for vi in 0..spec.values.len() {
+                    let mut acc = Acc::default();
+                    for ci in 0..col_paths.len() {
+                        acc.merge(&sub[ci][vi]);
+                    }
+                    srow[grand_base + vi] = acc.finish(spec.values[vi].agg);
+                }
+            }
             grid.rows.push(srow);
             prev = vec![String::new(); spec.rows.len()];
         }
@@ -399,6 +459,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             for vi in 0..spec.values.len() {
                 grow[spec.rows.len() + ci * spec.values.len() + vi] =
                     grand[ci][vi].finish(spec.values[vi].agg);
+            }
+        }
+        if grand_block > 0 {
+            for vi in 0..spec.values.len() {
+                let mut acc = Acc::default();
+                for ci in 0..col_paths.len() {
+                    acc.merge(&grand[ci][vi]);
+                }
+                grow[grand_base + vi] = acc.finish(spec.values[vi].agg);
             }
         }
         grid.grand_total_row = Some(grid.rows.len());
