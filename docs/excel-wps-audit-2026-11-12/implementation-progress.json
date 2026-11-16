@@ -4516,12 +4516,13 @@
       "commits": [
         "acb5f87",
         "d23d407",
-        "e7f0218"
+        "e7f0218",
+        "f869d21"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-07.1 实施中（缺冷启动/CPU update 单列）；QA-07.2 待验收；QA-07.3 实施中（取消与进度已做，保存峰值未降）。"
+        "QA-07.1/07.2 已验收；QA-07.3 保存峰值未修（umya 整体转换 + 序列化缓冲），取消/进度已验收。"
       ],
       "failures": [],
       "blocker": "",
@@ -4565,25 +4566,25 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
           "commits": [
             "acb5f87",
-            "d23d407"
+            "d23d407",
+            "f869d21"
           ],
           "commands": [
-            "SC_PERF_DIR=work/probe/qa07 target/release/examples/perf_probe.exe --suite -> 9 组样本（work/probe/qa07/suite4-postfix.jsonl）",
-            "SC_LOAD_PROF=1 + SC_SHOT/SC_SHOT_EXIT 跑 release app，5 次取 p50/p95（first_frame 0.64s，1M 值可编辑 4.09s）",
-            "SC_SCROLL_PROBE=1 SC_SCROLL_EXIT=1 跑 release app，120 帧：values 1M 帧间隔 p50 20.13/p95 30.25ms；chain 1M 29.33/30.25ms；sparse 1M 16.66/16.77ms"
+            "cargo run --release -p sheetcore --example perf_probe -- 1000000 -> values 保存 2.07s / chain 保存 7.01s / 打开 1.469s&4.489s / 重算 1.495s",
+            "run_gui_probe values1m -> first_frame 0.727s editable 4.090s peak 192.4MB",
+            "run_gui_probe chain1m -Force -Frames 600 -> first_frame 0.616s load 5.73s editable 6.420s peak 731.1MB"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt",
-            "work/probe/qa07/scroll2-values-1000000.log"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa072-regression.txt"
           ],
           "not_done": [
-            "滚动是程序改滚动位置，未经 OS 滚轮事件投递；GPU 呈现完成时刻未测。",
-            "保存/重算期间窗口可操作与进度反馈未验（QA-07.3）。"
+            "chain 1M 打开→可编辑 6.42s 比基线 6.09s 高 5.4%，该场景无冻结上限，仅记录。",
+            "保存峰值内存（core 1,165MB / GUI 1,923MB）属 QA-07.3，仍未解决。"
           ],
           "failures": [],
           "blocker": "",
@@ -6634,13 +6635,14 @@
       "files": [],
       "commits": [
         "5460109",
-        "19d241e"
+        "19d241e",
+        "e24e6ba"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "UI-29.1、UI-29.2 已验收；UI-29.3（错误/空/加载状态视觉）未开始。",
-        "三端同场景 100%/150% 截图与标注尺寸未完成（父项验收）。"
+        "UI-29.1/29.2/29.3 三个切片已验收；父项剩余：Excel/WPS/本应用三端同场景 100%/150% 截图与标注尺寸。",
+        "三端截图受本机无交互桌面限制（Excel/WPS 窗口截图全白），需找可控截图通道或换机器补。"
       ],
       "failures": [],
       "blocker": "",
@@ -6721,13 +6723,30 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-29 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "e24e6ba"
+          ],
+          "commands": [
+            "cargo test -p app state_view_paints_title_detail_and_kind_color -> pass",
+            "cargo test -p app state_banner_shows_title_and_kind_background -> pass",
+            "cargo test -p app loading_overlay_draws_scrim_card_and_half_progress -> pass",
+            "cargo test -p app find_all_window_with_no_hits_shows_empty_state -> pass",
+            "cargo test -p app -- --test-threads=2 -> 356 passed（work/goal-logs/ui293-app.log）",
+            "scenario screenshots: SC_FIND_ALL_EMPTY / SC_DEMO_OVERLAY -> state-empty.png / state-loading.png"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/ui29-states.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/state-empty.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/state-loading.png"
+          ],
+          "not_done": [
+            "无人工视觉评审（vision_analyze 连续超时），结论来自形状断言与截图像素统计。",
+            "加载遮罩截图是探针注入的状态，不是真在打开 106MB 文件的中途截帧。",
+            "深色主题状态色未定义；瞬时提示仍走状态栏文字（与 Excel 一致）。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
