@@ -3293,19 +3293,47 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
+          "files": [
+            "crates/core/src/pivot_parts.rs",
+            "crates/core/src/pivot_xml.rs",
+            "crates/core/examples/pivot_excel_probe.rs",
+            "scripts/c12_make_pivot.ps1",
+            "scripts/c12_pivot_probe2.ps1"
+          ],
+          "commits": [
+            "9452130"
+          ],
+          "commands": [
+            "cargo run -p sheetcore --example pivot_excel_probe -- work/probe/c12/pivot-real.xlsx -> saved pivot_table_id=1 rows=3",
+            "powershell -File scripts/c12_pivot_probe2.ps1 <xlsx> Excel.Application -> PivotTables=1, rows=[地区] cols=[产品] data=[求和项:金额], 值 40/50/90、60/60/120、100/110/210",
+            "powershell -File scripts/c12_pivot_probe2.ps1 <xlsx> KET.Application（WPS 12.0）-> PivotTables=1，字段与值同上",
+            "powershell -File scripts/c12_make_pivot.ps1 -> 用 Excel 自己造 excel-made.xlsx 当结构黄金样本",
+            "cargo test -p sheetcore --test pivot_attachments -> 6 passed",
+            "cargo test -p sheetcore --test pivot_save_lifecycle -> 9 passed",
+            "cargo test -p sheetcore -> 102 个测试二进制全 ok / 0 failed"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/excel.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/wps.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/pivot-real.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/excel-made.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/ours-pivotTable1.xml",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/excel-pivotTable1.xml",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/ours-pivotCacheDefinition1.xml",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/excel-pivotCacheDefinition1.xml"
+          ],
           "not_done": [
-            "值化网格 Excel/WPS 可编辑往返已验证；多字段真透视部件与字段拖拽未实现"
+            "单行+单列+单值字段的真透视部件已通过 Excel 16.0 / WPS 12.0 打开并重算；多行字段/多列字段/多值字段仍未写进 pivotTable 部件（需要嵌套 rowItems 与多个 dataFields）",
+            "计数/平均/最大/最小等非求和聚合下的缓存属性（containsInteger 等）未逐一实测",
+            "#SPILL! 与 .xls(BIFF8) 不在本项范围"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T20:42:17Z"
+          "next": "把 pivot_multi 的多字段模型落进 pivot_parts：多行/列字段用嵌套 rowItems/colItems，多值字段写多个 dataFields 并在验证脚本里读 DataFields.Count",
+          "updated_utc": "2026-11-16T09:27:13Z"
         }
       ]
     },

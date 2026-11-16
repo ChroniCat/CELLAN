@@ -305,3 +305,19 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   探针改 `UTF8Encoding($false)`，Rust 侧再 `trim_start_matches('\u{feff}')` 兜底。
 - 证据：`implementation-evidence/qa06-2-array-spill.txt` 与 `qa06-2a/{blocks.tsv,anchor.tsv,probe-meta.json,qa06a.xlsx}`。
 - 台账：QA-06.2 → 待验收，QA-06 父项三个切片齐 → 待验收；父母 24/3/28/6，切片 60/1/70/17（未抬高已验收数）。
+
+## 2026-11-16 检查点七：C12.4 真 pivotTable 部件在 Excel/WPS 可用（单行+单列+单值）
+
+- 提交 `9452130`（`fix(pivot): emit valid pivotCache/pivotTable parts Excel and WPS accept as editable`）。
+- **先证伪再修**：旧实现生成的 xlsx 用 Excel 打开直接 `COMException: 不能取得类 Workbooks 的 Open 属性`——
+  等于"写了 pivot 部件但 Office 打不开"。对照物是 Excel 自己造的 `excel-made.xlsx`（`scripts/c12_make_pivot.ps1`）。
+- 四处硬伤：①`cacheField@name` 用了透视输出列标题而非源表表头；②`pivotCacheRecords` 空体却声明 `recordCount=3`；
+  ③行/列 `pivotField` 缺 `<items count=n+1><item t="default"/></items>`；④`dataField@name` 变成 `求和项:求和项:金额`。
+  另外 `rowItems/colItems` 的 `<x v=k/>` 指向不存在的 sharedItems 下标、`colItems` 缺总计列。
+- 新增 `crates/core/src/pivot_parts.rs` 统一生成三份 XML（读源表建缓存、记录与索引自洽、自检不一致就 `Err`），
+  `pivot_xml.rs` 改为调用它；`refreshedBy` 仍透传 `sheetcore:<session token>`，`pivot_save_lifecycle` 9 条全过。
+- 实测：Excel 16.0 与 WPS 12.0 都报 `PivotTables=1`、`rows=[地区] cols=[产品] data=[求和项:金额]`，
+  值 40/50/90、60/60/120、100/110/210 —— 是按 6 条 cache 记录重新聚合的，不是照抄静态值。
+- 回归：`pivot_attachments` 6 passed、`pivot_save_lifecycle` 9 passed、`-p sheetcore` 全量 102 个二进制 0 failed。
+- 台账：C12.4 待实施 → 实施中；parents 24/3/28/6，slices 60/70/2/16（已验收未抬高）。
+- 剩余：多行/多列/多值字段仍未写进 pivotTable 部件（嵌套 rowItems、多个 dataFields）。
