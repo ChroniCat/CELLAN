@@ -523,3 +523,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 已知限制：accesskit 0.17 不提供 SelectionItemPattern（UIA 报 no-pattern），选中态写进名字；
   选区变化不发通知事件；无冻结/合并特殊语义。
 - app 341 passed。
+
+### 检查点二十五：UI-24.2 控件语义补齐
+- `1e72505`：新增 `ui_kit::a11y_role`；工作表标签发 `Role=Tab`；自绘下拉/画廊条目/画廊箭头/
+  拆分箭头/名称框/标题栏搜索框/字体字号输入框全部补名字；`CellStylesGallery` 补 `label`
+  （否则箭头只能叫 id）；网格节点补 bounds（原来 UIA 里是 ∞）。
+- 关键实测：`Edit 字体=思源黑体`、`Edit 字号=11`、`Edit 名称框=A1`、`TabItem Sheet1`、
+  `DataGrid … at=271,463,1423,574`、`Button 常规/标题/强调/好/差`。
+- 边界：右键菜单/筛选下拉/颜色面板未逐个验；禁用态未验出 IsEnabled=false；公式栏仅编辑态有 Edit。
+- app 341 passed。
