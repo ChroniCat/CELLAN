@@ -642,3 +642,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   「异步装载前建的统计任务永不重建」→ key 加 wb_epoch；新增 `large_selection_stats_are_not_empty`。
 - 640×360 无越界（632/640）；折叠菜单弹出层不进 accesskit 树，转 UI-24.2。
 - app 361 passed。slices 68 已验收 / 5 实施中 / 75 待验收。
+
+### 检查点三十九：QA-06.3 查找边界 + TEXT 分段
+- 新增 22 条边界用例（通配符 * ?、错误值查找键、近似匹配重复值、TEXT 四段/颜色段/月份名/文本段），
+  合计 124 条与 Excel 16.0 全一致（`cargo test -p sheetcore --test qa06_matrix` 2 passed）。
+- 修 4 处真实缺陷：①两条查找路径（functions.rs 通用 + mod.rs 哈希快路）都没通配符；
+  ②错误值查找键被吞成 #N/A；③近似匹配重复值取第一个而非最后一个；④TEXT 只认第一段、
+  `[Red]` 被当字面、mmm/ddd 无月名、零段 `"零"` 被排成 `0`。
+- 坑：`qa06_excel_probe.ps1` 的 Open 不认相对路径（0x800A03EC 伪装成夹具损坏）；TEXT 字面文本要双引号加倍。
+- 回归：core 106 个测试二进制全 ok（`qa063-core.log`），app 361 passed（`qa063-app.log`）。
