@@ -8423,3 +8423,63 @@ fn cf_quick_window_renders_without_panicking() {
     assert_eq!(drawn, 1);
     assert!(app.cf_quick, "窗口自己不该被关掉");
 }
+
+/// UI-30 点击矩阵：把功能区 XML 里的每个动作都真跑一遍，任何落到兜底分支的
+/// 命令都会在 `unhandled_action` 里留下痕迹，测试直接失败。
+///
+/// 跳过的是**会阻塞在原生对话框/网络**的那几个（rfd 在测试里没人点会卡死），
+/// 它们各自另有覆盖：文件打开/保存走 command_exec 单测，导出与比较本轮加了
+/// 专门的 dispatch 测试，共享走 net 的独立测试。
+const CLICK_MATRIX_SKIP: &[&str] = &[
+    "FileOpen",       // rfd 打开对话框
+    "FileSaveAs",     // rfd 保存对话框
+    "FileSave",       // 无路径时转「另存为」对话框
+    "ExportPdf",      // rfd 选 PDF 路径
+    "CompareBooks",   // rfd 选比较文件
+    "MacroExport",    // rfd 选导出路径（有宏时）
+    "InsertPicture",  // rfd 选图片
+    "Share",          // 起局域网监听
+    "AutoShare",      // 同上
+    "ImportCsv",      // rfd 选 CSV
+    "CheckUpdate",    // 联网检查更新（测试里会等网络超时）
+    "ImportWorkbook", // rfd 选要导入的工作簿
+    "Hyperlink",      // rfd/链接对话框
+    "OpenInNewTab",   // rfd 打开文件
+];
+
+#[test]
+fn click_matrix_every_ribbon_action_is_handled() {
+    let actions = crate::ribbon::tests::xml_actions();
+    assert!(actions.len() > 100, "动作太少，解析可能失败：{}", actions.len());
+    let ctx = egui::Context::default();
+    let mut unrouted: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    for action in &actions {
+        if CLICK_MATRIX_SKIP.contains(&action.as_str()) {
+            skipped += 1;
+            continue;
+        }
+        let mut app = app();
+        if std::env::var("SC_MATRIX_LOG").is_ok() {
+            eprintln!("[matrix] {action}");
+        }
+        app.ribbon_action(action, &ctx);
+        if let Some(miss) = app.unhandled_action.clone() {
+            unrouted.push(format!("{action} -> {miss}"));
+        }
+    }
+    assert!(
+        unrouted.is_empty(),
+        "这些功能区动作点下去没有实现：{unrouted:#?}"
+    );
+    assert!(
+        skipped <= CLICK_MATRIX_SKIP.len(),
+        "跳过数超过名单：{skipped}"
+    );
+    let stale: Vec<&str> = CLICK_MATRIX_SKIP
+        .iter()
+        .copied()
+        .filter(|s| !actions.iter().any(|a| a == s))
+        .collect();
+    assert!(stale.is_empty(), "跳过名单里有 XML 里不存在的动作：{stale:?}");
+}

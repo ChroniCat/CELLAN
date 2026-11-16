@@ -601,7 +601,7 @@ fn local(e: &quick_xml::events::BytesStart<'_>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
@@ -706,6 +706,51 @@ mod tests {
             }
         }
         out
+    }
+
+    /// 收集 XML 里所有控件动作（按钮/开关/拆分的菜单项/下拉项）。
+    pub(crate) fn xml_actions() -> Vec<String> {
+        fn walk(nodes: &[Node], out: &mut Vec<String>) {
+            for n in nodes {
+                match n {
+                    Node::Button(c) | Node::Toggle(c) => out.push(c.action().to_string()),
+                    Node::Split { ctl, menu } => {
+                        out.push(ctl.action().to_string());
+                        walk_menu(menu, out);
+                    }
+                    Node::Menu(m) => walk_menu(m, out),
+                    Node::DropDown { items, .. } | Node::Gallery { items, .. } => {
+                        out.extend(items.iter().map(|i| i.id.clone()))
+                    }
+                    Node::Box { children, .. } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        fn walk_menu(m: &Menu, out: &mut Vec<String>) {
+            for i in &m.items {
+                match i {
+                    MenuNode::Button(c) | MenuNode::Toggle(c) => out.push(c.action().to_string()),
+                    MenuNode::Menu(sub) => walk_menu(sub, out),
+                    MenuNode::Separator => {}
+                }
+            }
+        }
+        let r = load();
+        let mut acts = Vec::new();
+        for t in &r.tabs {
+            for g in &t.groups {
+                walk(&g.children, &mut acts);
+            }
+        }
+        for c in &r.context {
+            for g in &c.tab.groups {
+                walk(&g.children, &mut acts);
+            }
+        }
+        acts.sort();
+        acts.dedup();
+        acts
     }
 
     /// UI-30：XML 里每个控件动作都必须有**精确**的 dispatch 臂。
