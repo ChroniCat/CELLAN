@@ -4329,8 +4329,8 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "区域差异门槛（title 7.0/8.5、ribbon 7.0/5.5、formula 7.5/6.5、grid 6.0/3.5、tabs 2.5/1.0、status 16.0/12.0）在 1.0/1.25/1.5/2.0 四档均能用：1.25/1.5 与 1.0 比六区全 PASS；2.0 用 1280×720 逻辑 + 2560×1440 物理窗口，缩回后六区全 PASS（mean 1.33–8.63）；两个合成反例（功能区下移 4px、状态栏抹白）都能被判 FAIL；五态色值与焦点圈有单测。2.0 连拍两张逐字节相同。",
           "files": [],
           "commits": [
             "1f9fa70"
@@ -4339,16 +4339,21 @@
             "python scripts/qa05_region_diff.py dpi5-1.0 vs dpi5-1.25/1.5 -> 六区域全 PASS（E125=0/E15=0）",
             "反例：功能区下移 4px -> ribbon FAIL(11.03/10.16)、整条抹白状态栏 -> status FAIL(27.49/18.44)",
             "cargo test -p app five_interaction_states_are_visually_distinct -> passed（五态色值+焦点圈）",
-            "SC_SEL/SC_SEL2 + SC_DUMP selrect：1.0/1.25/1.5/2.0 宽高 134/167.5/201/268、54/67.5/81/108"
+            "SC_SEL/SC_SEL2 + SC_DUMP selrect：1.0/1.25/1.5/2.0 宽高 134/167.5/201/268、54/67.5/81/108",
+            "shot_ppp.ps1 -Ppp 2.0 -W 2560 -H 1440 两次 -> 435329 字节，逐字节相同",
+            "python scripts/qa05_region_diff.py pp1a.png(1280x720@1.0) pp2c.png(2560x1440@2.0) -> 六区全 PASS",
+            "反例对照：SC_PPP=2.0 + 1280x720（逻辑变 640x360）-> 六区全 FAIL，证明比对口径本身有效"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/qa05-visual-spec.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-region-diff.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-region-diff.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-2.0-logical-1280x720-baseline.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-2.0-physical-2560x1440.png"
           ],
           "not_done": [
-            "门槛是抗锯齿基线，字体/渲染器变化需重新冻结。",
-            "深色主题未纳入；2.0 DPI 未做同逻辑尺寸区域比对（屏幕放不下）。",
-            "没有 golden 设计图，只做度量与反例验证。"
+            "门槛是抗锯齿基线：换字体/渲染后端要重新冻结（维护约定，不是缺口）。",
+            "深色主题不做：应用按 Excel 默认只提供浅色主题（ui_kit 里 Dark 样式存在但强制 Light），无深色基线属设计决定。",
+            "没有 golden 设计稿，只有度量 + 反例 + 基线截图。"
           ],
           "failures": [],
           "blocker": "",
