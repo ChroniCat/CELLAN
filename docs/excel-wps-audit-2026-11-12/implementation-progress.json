@@ -3405,7 +3405,8 @@
             "scripts/c12_pivot_probe2.ps1 F-edited-ours.xlsx (Excel + KET.Application) -> 双端 data=[求和项:金额,计数项:金额,最大值金额]",
             "cargo run -p sheetcore --example pivot_multi_probe -- G -> 2 列字段 × 2 值字段，cols=[产品,数量,值]",
             "cargo test -p sheetcore --test pivot_multi_parts -> 7 passed",
-            "cargo test -p sheetcore -> 103 个测试二进制 0 failed；-p app --bin app -> 326 passed"
+            "cargo test -p sheetcore --test pivot_real -> 3 passed（含版本属性断言）",
+            "Excel COM 只读打开 pivot-fixed.xlsx -> pivots=1"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt",
@@ -3447,18 +3448,19 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggregations.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-E.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-F.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/wps-roundtrip.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/wps-roundtrip.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4/pivot-cache-version-defect.md"
           ],
           "not_done": [
             "折叠/压缩布局（compact=\"1\"）未做：界面没有暴露布局开关，PivotLayout 只有表格形式",
             "计算字段/计算项、显示值方式（占总计百分比等）未做",
             "WPS 改字段往返：WPS 保存侧把 pivotCacheDefinition 从 1300B 缩到 773B、sharedItems 3→2，Excel 回读 rows/cols/fields 全 0（WPS 自身缺陷，证据 c12-4/wps-roundtrip.md）。",
-            "待查：work/probe/c12/pivot-real.xlsx 在 Excel 里 PivotTables.Count=0（来源不明，需干净链路重造）。"
+            "已修：pivotCacheDefinition 缺 createdVersion/refreshedVersion/minRefreshableVersion，Excel 静默丢弃透视表（证据 c12-4/pivot-cache-version-defect.md）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "C12 四切片齐；等用户按生产口径复核",
-          "updated_utc": "2026-11-16T19:47:19Z"
+          "updated_utc": "2026-11-16T19:51:09Z"
         }
       ]
     },

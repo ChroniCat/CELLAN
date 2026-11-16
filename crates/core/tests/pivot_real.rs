@@ -41,6 +41,19 @@ fn writes_real_pivot_table() {
     let sheet_name = wb.sheet(0).name.clone();
     let cache_id = sheetcore::pivot_xml::attach(&out, &sheet_name, &spec, &res, rect, &vlabel).expect("挂透视表");
     assert!(cache_id >= 1);
+    // Excel 只认带 refreshedVersion 的缓存：缺这三个属性时 PivotTables.Count 直接是 0
+    {
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut cd = String::new();
+        use std::io::Read;
+        z.by_name(&format!("xl/pivotCache/pivotCacheDefinition{cache_id}.xml"))
+            .unwrap()
+            .read_to_string(&mut cd)
+            .unwrap();
+        for attr in ["createdVersion=", "refreshedVersion=", "minRefreshableVersion="] {
+            assert!(cd.contains(attr), "缓存定义缺 {attr}：{cd}");
+        }
+    }
 
     // 结构检查
     let f = std::fs::File::open(&out).unwrap();
