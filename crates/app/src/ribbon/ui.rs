@@ -189,7 +189,8 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         let g = &tab.groups[i];
         let known = app.ribbon_group_w.get(&g.id).copied();
         let w = known.unwrap_or(160.0);
-        if known.is_some() && used + w > avail && used > 0.0 {
+        // 给「更多 ▾」预留 60pt：不留的话最后会画到裁切区外（760×420 实测溢出 11px）
+        if known.is_some() && used + w + 60.0 > avail && used > 0.0 {
             if avail - used >= 92.0 {
                 ui.menu_button(format!("{} ▾", g.label), |ui| {
                     nodes(app, ui, &g.children);
@@ -198,14 +199,27 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
                 i += 1;
                 continue;
             }
-            // 连折叠按钮都放不下：剩下的组统一进「更多」，杜绝被裁掉。
-            ui.menu_button("更多 ▾", |ui| {
-                for h in &tab.groups[i..] {
-                    ui.menu_button(&h.label, |ui| {
-                        nodes(app, ui, &h.children);
-                    });
-                }
-            });
+            // 连「组名 ▾」都放不下：剩下的组统一进「更多」。
+            // 极端窄（首组就超宽）时把「更多」钉在裁切区右侧，别让它画到窗口外。
+            let mut more = |ui: &mut egui::Ui| {
+                ui.menu_button("更多 ▾", |ui| {
+                    for h in &tab.groups[i..] {
+                        ui.menu_button(&h.label, |ui| {
+                            nodes(app, ui, &h.children);
+                        });
+                    }
+                });
+            };
+            let clip = ui.clip_rect();
+            if clip.right() - ui.cursor().min.x >= 60.0 {
+                more(ui);
+            } else {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2((clip.right() - 58.0).max(clip.left()), ui.cursor().min.y),
+                    egui::Vec2::new(56.0, 22.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| more(ui));
+            }
             break;
         }
         let x0 = ui.cursor().min.x;

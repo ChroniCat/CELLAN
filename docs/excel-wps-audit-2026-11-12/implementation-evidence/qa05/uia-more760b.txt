@@ -1,0 +1,61 @@
+WINDOW name='qa07-values-10000.xlsx - Sheets Native' class='Window Class' rect=167,104,760,420
+CLICKED=更多 ▾
+COUNT=109
+Button	保存	 enabled=True	 value=	 at=312,115,26,26
+Button	撤销	 enabled=False	 value=	 at=344,115,26,26
+Button	重做	 enabled=False	 value=	 at=376,115,26,26
+Button	粘贴	 enabled=True	 value=	 at=193,216,42,64
+Button	粘贴 选项	 enabled=True	 value=	 at=193,280,42,12
+Button	剪切（Ctrl+X）	 enabled=True	 value=	 at=237,216,57,24
+Button	把当前单元格的格式复制到别处	 enabled=True	 value=	 at=237,268,69,24
+Text	剪贴板	 enabled=True	 value=	 at=238,299,35,15
+Edit	字体	 enabled=True	 value=思源黑体	 at=339,228,147,20
+Button	字体 下拉	 enabled=True	 value=	 at=488,227,15,22
+Edit	字号	 enabled=True	 value=11	 at=511,228,32,20
+Button	字号 下拉	 enabled=True	 value=	 at=530,227,15,22
+Button	增大字号	 enabled=True	 value=	 at=548,226,24,24
+Button	减小字号	 enabled=True	 value=	 at=574,226,24,24
+Button	加粗（Ctrl+B）	 enabled=True	 value=	 at=334,258,24,24
+Button	斜体（Ctrl+I）	 enabled=True	 value=	 at=360,258,24,24
+Text	字体	 enabled=True	 value=	 at=455,299,23,15
+Button	对齐方式 ▾	 enabled=True	 value=	 at=608,212,77,24
+Button	百分比样式	 enabled=True	 value=	 at=732,255,24,24
+Button	千位分隔样式	 enabled=True	 value=	 at=758,255,24,24
+Button	增加小数位数	 enabled=True	 value=	 at=788,255,24,24
+Button	减少小数位数	 enabled=True	 value=	 at=814,255,24,24
+Text	数字	 enabled=True	 value=	 at=753,299,23,15
+Button	更多 ▾	 enabled=True	 value=	 at=848,212,53,24
+Button	样式	 enabled=True	 value=	 at=848,243,54,24
+Button	单元格	 enabled=True	 value=	 at=848,270,54,24
+Button	编辑	 enabled=True	 value=	 at=848,297,54,24
+Button	加载项	 enabled=True	 value=	 at=848,324,54,24
+Edit	名称框	 enabled=True	 value=A1	 at=181,327,76,20
+Text	0	 enabled=True	 value=	 at=371,329,8,16
+Text	单元格模式 就绪	 enabled=True	 value=	 at=175,507,80,13
+Text	已打开并重算完成（10000 个非空格）	 enabled=True	 value=	 at=269,505,177,18
+Text	统计 ▾	 enabled=True	 value=	 at=459,507,36,13
+Text	平均值: 0    计数: 1    求和: 0	 enabled=True	 value=	 at=507,507,136,13
+Button	100%	 enabled=True	 value=	 at=890,502,28,24
+Button	+	 enabled=True	 value=	 at=868,504,18,24
+Button	−	 enabled=True	 value=	 at=742,505,18,24
+Button	工作表标签左移	 enabled=True	 value=	 at=183,471,32,31
+Button	工作表标签右移	 enabled=True	 value=	 at=215,471,32,31
+TabItem	Sheet1	 enabled=True	 value=	 at=279,470,64,32
+DataItem	A1，0，已选中	 enabled=True	 value=	 at=167,359,743,94
+DataGrid	工作表 Sheet1，选区 A1:A1，1 行 1 列，活动单元格 A1	 enabled=True	 value=	 at=167,359,743,94
+DataItem	列 A，已选中	 enabled=True	 value=	 at=196,359,67,19
+DataItem	列 B	 enabled=True	 value=	 at=263,359,67,19
+DataItem	列 C	 enabled=True	 value=	 at=330,359,67,19
+DataItem	列 D	 enabled=True	 value=	 at=397,359,67,19
+DataItem	列 E	 enabled=True	 value=	 at=464,359,67,19
+DataItem	列 F	 enabled=True	 value=	 at=531,359,67,19
+DataItem	列 G	 enabled=True	 value=	 at=598,359,67,19
+DataItem	列 H	 enabled=True	 value=	 at=665,359,67,19
+DataItem	列 I	 enabled=True	 value=	 at=732,359,67,19
+DataItem	列 J	 enabled=True	 value=	 at=799,359,67,19
+DataItem	列 K	 enabled=True	 value=	 at=866,359,67,19
+DataItem	第 1 行，已选中	 enabled=True	 value=	 at=167,378,29,18
+DataItem	第 2 行	 enabled=True	 value=	 at=167,396,29,18
+DataItem	第 3 行	 enabled=True	 value=	 at=167,414,29,18
+DataItem	第 4 行	 enabled=True	 value=	 at=167,432,29,18
+DataItem	第 5 行	 enabled=True	 value=	 at=167,450,29,18
