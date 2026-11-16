@@ -1,0 +1,62 @@
+QA-06.2 动态数组溢出块对拍 + 全量/增量重算一致
+=================================================
+日期：2026-11-16
+用例：`crates/core/tests/qa06_array.rs`
+夹具：`work/qa06a/qa06a.xlsx`（`scripts/qa06_array_fixture.py`）
+矩阵：`crates/core/tests/fixtures/qa06a/blocks.tsv`（`scripts/qa06_array_probe.ps1` 用 Excel 实算导出）
+
+一、夹具
+--------
+```
+sheet "S": B1:B5 = 3,1,2,5,4     C1:C5 = b,a,c,e,d
+数组公式锚点放在 E1/E10/E20/...，间隔 ≥9 行，溢出块互不覆盖
+```
+
+二、Excel 实算结果（Excel 16.0 Build 20326）
+---------------------------------------------
+```
+E1    =SEQUENCE(3,2)            3x2   1 2 / 3 4 / 5 6
+E10   =SEQUENCE(2,3,10,5)       2x3   10 15 20 / 25 30 35
+E20   =SORT(B1:B5)              5x1   1 2 3 4 5
+E30   =SORTBY(B1:B5,C1:C5)      5x1   1 3 2 4 5
+E40   =FILTER(B1:B5,B1:B5>2)    3x1   3 5 4
+E50   =TAKE(B1:B5,2)            1x1   #NAME?   ← 本机 Excel 版本没有 TAKE
+E60   =DROP(B1:B5,3)            1x1   #NAME?   ← 同上
+E70   =TRANSPOSE(B1:B5)         1x5   3 1 2 5 4
+E80   =HSTACK(B1:B2,C1:C2)      1x1   #NAME?   ← 同上
+E90   =VSTACK(B1:B2,C1:C2)      1x1   #NAME?   ← 同上
+E100  =B1:B5*2                  5x1   6 2 4 10 8
+E110  =UNIQUE(B1:B5)            5x1   3 1 2 5 4
+```
+
+`TAKE`/`DROP`/`HSTACK`/`VSTACK` 在本机 Excel 16.0 (Build 20326) 里就是 `#NAME?`（该构建没有这四个函数），
+所以矩阵里明确 SKIP：既不算通过也不算失败，不拿“引擎实现了”冒充对拍通过。
+
+三、两个用例
+------------
+1. `qa06_2_spill_blocks_match_excel`
+   把同一批公式写进内存工作簿，`recalc_all` 后逐格比对 Excel 的 `SpillingToRange` 值。
+   实测：**核对 40 格全部一致**，跳过 4 条（上面四个 #NAME?）。
+   错误码按 `#N/A`/`#VALUE!`/`#DIV/0!`/`#REF!`/`#NAME?`/`#NUM!`/`#NULL!` 严格比较，数字相对 1e-9。
+2. `qa06_2_incremental_matches_full_recalc`
+   同一批公式：一份先按 B1=3 全量算再改成 B1=10 走 `recalc_dirty(deps, [(0,1,0)])`，
+   另一份直接按 B1=10 全量算；比较 130 行 × 8 列 = **1040 格**。
+   实测：`增量重算 12 格，1040 格与全量一致`。
+
+四、踩到的坑
+------------
+- PowerShell `Set-Content -Encoding UTF8` 会写 BOM，`include_str!` 出来的第一行变成 `\u{feff}E1`，
+  `&b.anchor[1..]` 直接 panic（“not a char boundary”）。
+  改：探针用 `UTF8Encoding($false)` 写、Rust 侧再 `trim_start_matches('\u{feff}')` 兜一层。
+- 数组公式必须用 `Formula2` 写（`Formula` 会被旧式 CSE 语义影响），写完后 `CalculateUntilAsyncQueriesDone`。
+
+五、回归
+--------
+- `cargo test -p sheetcore --test qa06_array` → **2 passed**
+- 既有 `array_functions/array_shape/array_structure/array_formula` 等测试未改动，全量 `-p sheetcore` 0 failed
+
+六、未覆盖
+----------
+- `#SPILL!` 冲突（溢出区域被占用）、溢出被删后的清理：`array_functions.rs` 已有单测，未进 Excel 对拍矩阵；
+- 迭代计算与循环引用下的增量一致；
+- `LAMBDA`/`MAP`/`BYROW`：本机 Excel 不支持（#NAME?），与既有口径一致，单列不计。
