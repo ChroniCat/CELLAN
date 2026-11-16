@@ -22606,6 +22606,16 @@ let txn = self.txn_begin(&keys);
                                 p.rect_filled(br, 2.0, egui::Color32::from_rgb(232, 232, 232));
                             }
                             ui_icons::draw(&p, br.shrink(6.0), *ic, ink);
+                            // UI-24.2：右键菜单里的粘贴图标也要有名字
+                            let pname = match a {
+                                CtxAct::Paste => "粘贴",
+                                CtxAct::PasteFormulas => "粘贴公式",
+                                CtxAct::PasteValues => "粘贴数值",
+                                CtxAct::PasteFormats => "粘贴格式",
+                                CtxAct::PasteTranspose => "转置",
+                                _ => "粘贴选项",
+                            };
+                            ui_kit::a11y_name(&r, pname, true, None);
                             if r.clicked() {
                                 action = Some(*a);
                             }
@@ -22618,6 +22628,23 @@ let txn = self.txn_begin(&keys);
                         egui::vec2(CTX_W, CTX_ROW_H),
                     );
                     let r = ui.interact(rr, egui::Id::new(("ctx_row", i)), egui::Sense::click());
+                    // UI-24.2：右键菜单行发布成 MenuItem（名字带快捷键与子菜单提示）
+                    {
+                        let mut nm = row.label.to_string();
+                        if !row.shortcut.is_empty() {
+                            nm.push_str("，");
+                            nm.push_str(row.shortcut);
+                        }
+                        if !row.children.is_empty() {
+                            nm.push_str("，有子菜单");
+                        }
+                        ui_kit::a11y_role(
+                            &r,
+                            &nm,
+                            egui::accesskit::Role::MenuItem,
+                            None,
+                        );
+                    }
                     let active = matches!(sub, Some(s) if s == i) || (sub.is_none() && key == i);
                     if r.hovered() || active {
                         p.rect_filled(
