@@ -1484,6 +1484,9 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "VLOOKUP" | "HLOOKUP" => r(|| {
             let needle = arg(args, 0);
+            if let FValue::Error(e) = needle {
+                return Err(e);
+            }
             let table = args.get(1).ok_or(ErrKind::Value)?;
             let idx = index_arg(args, 2)?;
             let approx = opt_bool(args, 3, true);
@@ -1499,16 +1502,24 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                 } else {
                     range_get(table, 0, i)
                 };
-                if let Ok(std::cmp::Ordering::Equal) = cell.compare(&needle) {
-                    best = Some(i);
-                    break;
-                }
-                if approx {
-                    if let Ok(o) = cell.compare(&needle) {
-                        if o == std::cmp::Ordering::Less {
-                            best = Some(i);
-                        }
+                // 精确匹配支持通配符（查找键是文本且含 * ? ~ 时按模式匹配）
+                let exact_hit = match (&cell, &needle) {
+                    (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => {
+                        wildcard_match_ci(b, a)
                     }
+                    _ => matches!(cell.compare(&needle), Ok(std::cmp::Ordering::Equal)),
+                };
+                if !approx {
+                    if exact_hit {
+                        best = Some(i);
+                        break;
+                    }
+                } else if let Ok(o) = cell.compare(&needle) {
+                    // 近似匹配：取最后一个 <= 查找值的位置（重复值时 Excel 取最后一个）
+                    if o == std::cmp::Ordering::Greater {
+                        break;
+                    }
+                    best = Some(i);
                 }
             }
             match best {
@@ -1522,12 +1533,21 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "MATCH" | "XMATCH" => r(|| {
             let needle = arg(args, 0);
+            if let FValue::Error(e) = needle {
+                return Err(e);
+            }
             let lookup = args.get(1).ok_or(ErrKind::Value)?;
             let match_type = opt_num(args, 2, 1.0)?;
             let vals = lookup.values();
             if match_type == 0.0 {
                 for (i, v) in vals.iter().enumerate() {
-                    if let Ok(std::cmp::Ordering::Equal) = v.compare(&needle) {
+                    let hit = match (v, &needle) {
+                        (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => {
+                            wildcard_match_ci(b, a)
+                        }
+                        _ => matches!(v.compare(&needle), Ok(std::cmp::Ordering::Equal)),
+                    };
+                    if hit {
                         return Ok(FValue::number((i + 1) as f64));
                     }
                 }
@@ -1550,13 +1570,26 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "XLOOKUP" => r(|| {
             let needle = arg(args, 0);
+            if let FValue::Error(e) = needle {
+                return Err(e);
+            }
             let lookup = args.get(1).ok_or(ErrKind::Value)?;
             let ret = args.get(2).ok_or(ErrKind::Value)?;
             let vals = lookup.values();
             let (rows, cols) = range_dims(ret);
             let vertical = rows >= cols;
+            // 第 5 参数 match_mode：0 精确、2 通配符、-1/1 近似（近似未实现，按精确处理）
+            let match_mode = if args.len() > 4 { opt_num(args, 4, 0.0)? } else { 0.0 };
             for (i, v) in vals.iter().enumerate() {
-                if let Ok(std::cmp::Ordering::Equal) = v.compare(&needle) {
+                let hit = match (v, &needle) {
+                    (FValue::Text(a), FValue::Text(b))
+                        if match_mode == 2.0 && is_wildcard(b) =>
+                    {
+                        wildcard_match_ci(b, a)
+                    }
+                    _ => matches!(v.compare(&needle), Ok(std::cmp::Ordering::Equal)),
+                };
+                if hit {
                     return Ok(if vertical { range_get(ret, i, 0) } else { range_get(ret, 0, i) });
                 }
             }
@@ -1985,6 +2018,14 @@ fn rand_f64() -> f64 {
 /// 和 Excel 一样，格式里夹着的中文（如 `yyyy年m月d日`）原样保留；
 /// 双引号包裹的段落与反斜杠转义都按字面输出。
 /// 三字母以上的 m/d（`mmm` 月份名、`ddd` 星期名）依赖区域语言，这里按数值展开。
+/// 由年月日算星期（0=周日），与 Excel 的 WEEKDAY(...,1) 一致。
+fn weekday_from_ymd(y: i32, m: u32, d: u32) -> usize {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let yy = if m < 3 { y - 1 } else { y };
+    let w = (yy + yy / 4 - yy / 100 + yy / 400 + T[(m as usize - 1).min(11)] + d as i32) % 7;
+    w.rem_euclid(7) as usize
+}
+
 fn format_date_tokens(fmt: &str, y: i32, m: u32, d: u32) -> Option<String> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
@@ -2025,17 +2066,27 @@ fn format_date_tokens(fmt: &str, y: i32, m: u32, d: u32) -> Option<String> {
                 }
             }
             'm' => {
-                if run >= 2 {
-                    out.push_str(&format!("{m:02}"));
-                } else {
-                    out.push_str(&m.to_string());
+                const MON: [&str; 12] = [
+                    "January", "February", "March", "April", "May", "June", "July", "August",
+                    "September", "October", "November", "December",
+                ];
+                match run {
+                    1 => out.push_str(&m.to_string()),
+                    2 => out.push_str(&format!("{m:02}")),
+                    3 => out.push_str(&MON[(m as usize - 1).min(11)][..3]),
+                    _ => out.push_str(MON[(m as usize - 1).min(11)]),
                 }
             }
             'd' => {
-                if run >= 2 {
-                    out.push_str(&format!("{d:02}"));
-                } else {
-                    out.push_str(&d.to_string());
+                const DAY: [&str; 7] = [
+                    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+                ];
+                let wd = weekday_from_ymd(y, m, d);
+                match run {
+                    1 => out.push_str(&d.to_string()),
+                    2 => out.push_str(&format!("{d:02}")),
+                    3 => out.push_str(&DAY[wd][..3]),
+                    _ => out.push_str(DAY[wd]),
                 }
             }
             _ => out.push(c),
@@ -2045,16 +2096,112 @@ fn format_date_tokens(fmt: &str, y: i32, m: u32, d: u32) -> Option<String> {
     Some(out)
 }
 
+/// Excel 查找通配符：`*` 任意串、`?` 单字符、`~` 转义下一个字符；大小写不敏感。
+fn wildcard_match_ci(pat: &str, s: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            '*' => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
+            '?' => !t.is_empty() && go(&p[1..], &t[1..]),
+            '~' if p.len() > 1 => {
+                !t.is_empty() && t[0].eq_ignore_ascii_case(&p[1]) && go(&p[2..], &t[1..])
+            }
+            c => !t.is_empty() && t[0].eq_ignore_ascii_case(&c) && go(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    go(&p, &t)
+}
+
+pub(crate) fn is_wildcard(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('~')
+}
+
+/// 按顶层 `;` 切分 TEXT 格式（引号内的分号不算分隔符）。Excel 最多 4 段：
+/// 正数;负数;零;文本。
+fn split_format_sections(fmt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for c in fmt.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                cur.push(c);
+            }
+            ';' if !in_quote => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// 去掉 `[Red]`/`[$-409]` 这类颜色与区域标记；`[h]`/`[m]`/`[s]` 是经过时长，本引擎不支持，一并去掉。
+fn strip_format_brackets(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn format_value(v: &FValue, fmt: &str) -> String {
-    let n = match v.to_number() {
-        Ok(n) => n,
-        Err(_) => return v.display(),
+    // TEXT 的分段语义：正数;负数;零;文本。文本值走第 4 段（@ 占位），
+    // 没有第 4 段就原样返回；`[Red]`/`[$-409]` 这类标记先剥掉。
+    let sections = split_format_sections(fmt);
+    if let FValue::Text(t) = v {
+        let sec = if sections.len() >= 4 {
+            strip_format_brackets(&sections[3])
+        } else {
+            strip_format_brackets(&sections[0])
+        };
+        let sec = sec.replace('"', "");
+        return if sec.contains('@') { sec.replace('@', t) } else { t.clone() };
+    }
+    if !matches!(v, FValue::Number(_) | FValue::Empty) {
+        return v.display();
+    }
+    let raw = v.to_number().unwrap_or(0.0);
+    let (sec_raw, is_neg) = if raw < 0.0 && sections.len() >= 2 {
+        (sections[1].clone(), true)
+    } else if raw == 0.0 && sections.len() >= 3 {
+        (sections[2].clone(), false)
+    } else {
+        (sections[0].clone(), raw < 0.0)
     };
+    let sec = strip_format_brackets(&sec_raw);
+    if sec.trim().eq_ignore_ascii_case("general") {
+        let d = v.display();
+        return if is_neg { format!("-{}", d.trim_start_matches('-')) } else { d };
+    }
+    let fmt: &str = sec.as_str();
+    // 负数段只对绝对值排版，负号由该段里的字面 '-' 提供（Excel 同一口径）
+    let sign = if is_neg && fmt.contains('-') { "-" } else { "" };
+    let n = if is_neg { raw.abs() } else { raw };
+    // 整段没有数字占位符（如零段写成 "零"）：按字面输出
+    let literal_only = !sec
+        .chars()
+        .any(|c| matches!(c, '0' | '#' | '?' | '.' | ',' | '%' | 'y' | 'Y' | 'm' | 'M' | 'd' | 'D'));
+    if literal_only {
+        return format!("{sign}{}", sec.replace('"', ""));
+    }
     // 常见占位符：0、0.00、#,##0、0%、0.00%、yyyy-mm-dd
     if fmt.chars().any(|c| matches!(c, 'y' | 'Y' | 'm' | 'M' | 'd' | 'D')) {
         if let Some((y, m, d)) = serial_to_date(n) {
             if let Some(out) = format_date_tokens(fmt, y, m, d) {
-                return out;
+                return format!("{sign}{out}");
             }
         }
     }
@@ -2110,7 +2257,7 @@ fn format_value(v: &FValue, fmt: &str) -> String {
     }
     val = 0.0;
     let _ = val;
-    s
+    format!("{sign}{s}")
 }
 
 /// 已实现的函数名列表（用于覆盖率统计与文档）

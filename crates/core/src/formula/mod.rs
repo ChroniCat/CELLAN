@@ -1894,6 +1894,16 @@ impl<'a> Calc<'a> {
                     && nodes.len() >= 2 =>
             {
                 let key = self.eval_node(&nodes[0], si);
+                // 查找键本身是错误值：Excel 直接把该错误抛出去（VLOOKUP(#DIV/0!,…) = #DIV/0!）
+                if let FValue::Error(e) = key {
+                    return FValue::Error(e);
+                }
+                // 文本查找键带通配符（* ? ~）时交给通用实现，哈希索引只支持等值
+                if let FValue::Text(t) = &key {
+                    if crate::formula::functions::is_wildcard(t) {
+                        return self.call_generic(name, nodes, si);
+                    }
+                }
                 let literal = |n: &Node| -> Option<(RefExpr, RefExpr)> {
                     match n {
                         Node::Range(a, b) => Some((a.clone(), b.clone())),
@@ -1951,11 +1961,10 @@ impl<'a> Calc<'a> {
                                 &data[i]
                             };
                             match cell.compare(&key) {
-                                Ok(std::cmp::Ordering::Equal) => {
-                                    best = Some(i);
-                                    break;
-                                }
+                                // 重复值：Excel 取最后一个相等的行，不能遇到就停
+                                Ok(std::cmp::Ordering::Equal) => best = Some(i),
                                 Ok(std::cmp::Ordering::Less) => best = Some(i),
+                                Ok(std::cmp::Ordering::Greater) => break,
                                 _ => {}
                             }
                         }

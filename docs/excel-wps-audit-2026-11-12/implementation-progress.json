@@ -4503,7 +4503,10 @@
             "powershell -File scripts/qa06_excel_probe.ps1 -> \"Excel 16.0：102 条；WPS=12.0\"",
             "cargo test -p sheetcore --test qa06_matrix -- --test-threads=2 -> 2 passed（fin 16 / lookup 14 / text 22 与 Excel 一致）",
             "cargo test -p sheetcore --lib -> 295 passed；-p sheetcore 全量 101 个测试二进制 0 failed",
-            "cargo test -p app --bin app -> 325 passed"
+            "cargo test -p app --bin app -> 325 passed",
+            "python scripts/qa06_extend_edges.py work/qa06 -> 124 条（新增 22 条边界）",
+            "powershell -File scripts/qa06_excel_probe.ps1 F:/finance-native-sheets-ready/work/qa06 -> Excel 16.0 124 条",
+            "cargo test -p sheetcore --test qa06_matrix -- --test-threads=2 -> 2 passed（矩阵 124 条全一致）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-fin-lookup-text.txt",
@@ -4511,11 +4514,10 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2/excel.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2/wps.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2/cases.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2/probe-meta.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2/probe-meta.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-3-lookup-wildcard-text-sections.txt"
           ],
           "not_done": [
-            "查找的边界（通配符 * ?、错误值作为查找键、近似匹配的重复值）未成矩阵",
-            "TEXT 的分段（;）、mmm/ddd 区域语言月份名/星期名未覆盖",
             "数组/动态数组与增量一致性属于 QA-06.2，仍未做"
           ],
           "failures": [],
