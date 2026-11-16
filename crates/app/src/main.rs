@@ -1630,22 +1630,37 @@ impl StatsAcc {
     }
 }
 
+/// UI-25：统计要排除的行 —— 手动隐藏、分级/组合隐藏、当前筛选隐藏。
+///
+/// 口径来自本机 Excel 16.0 (Build 20326) 状态栏 UIA 实测
+/// （`implementation-evidence/ui25-hidden-marker.txt`）：
+/// - 手动隐藏第 2 行后选 A1:A4（1,2,text,4）：计数 3、求和 5、平均 2.5（第 2 行排除）；
+/// - 折叠分级隐藏第 7-8 行后选 A6:A8（7,8）：计数 1、求和 7（同样排除）；
+/// - 手动隐藏 B 列后选 A1:B1（1,100）：计数 2、求和 101（隐藏列**仍计入**）。
+///
+/// 隐藏列因此不参与过滤：Excel 状态栏按行隐藏生效，和 SUBTOTAL 的行语义一致。
+pub(crate) fn stats_hidden_rows(sheet: &sheetcore::model::Sheet) -> std::collections::HashSet<u32> {
+    let mut skip = sheet.hidden_rows.clone();
+    skip.extend(sheet.hidden_rows_user.iter().copied());
+    if let Some(f) = &sheet.filter {
+        skip.extend(f.hidden_rows(sheet));
+    }
+    skip
+}
+
 /// 稀疏收集选区里的非空格：按 Store 里实际存在的格子迭代，
 /// 不是按矩形逐坐标扫（百万行稀疏表只碰真正有值的格）。
-/// 隐藏行/列和筛选掉的行不算；多选区每个格只算一次。
+/// 隐藏行（手动/分级/筛选）与行高 0 不算；隐藏列照 Excel 口径仍然计入。
+/// 多选区里同一格只算一次（按 Store 迭代天然唯一）。
 pub(crate) fn collect_stats_values(
     sheet: &sheetcore::model::Sheet,
     rects: &[(u32, u32, u32, u32)],
-    skip_rows: &std::collections::HashSet<u32>,
 ) -> Vec<Option<f64>> {
+    let hidden = stats_hidden_rows(sheet);
     let mut out = Vec::new();
     for (cr, cell) in sheet.iter() {
         let (r, c) = (cr.row, cr.col);
-        if cell.is_blank()
-            || sheet.rows.size(r) <= 0.0
-            || sheet.cols.size(c) <= 0.0
-            || skip_rows.contains(&r)
-        {
+        if cell.is_blank() || sheet.rows.size(r) <= 0.0 || hidden.contains(&r) {
             continue;
         }
         if !rects
@@ -1662,15 +1677,14 @@ pub(crate) fn collect_stats_values(
     out
 }
 
-/// 多选区统计入口（状态栏用）。
+/// 多选区统计入口（状态栏用）；隐藏行口径见 [`stats_hidden_rows`]。
 pub(crate) fn status_stats_rects(
     sheet: &sheetcore::model::Sheet,
     rects: &[(u32, u32, u32, u32)],
     mask: u8,
-    skip_rows: &std::collections::HashSet<u32>,
 ) -> String {
     let mut acc = StatsAcc::default();
-    for v in collect_stats_values(sheet, rects, skip_rows) {
+    for v in collect_stats_values(sheet, rects) {
         acc.add(v);
     }
     acc.text(mask)
@@ -1682,7 +1696,7 @@ pub(crate) fn status_stats_text(
     rect: (u32, u32, u32, u32),
     mask: u8,
 ) -> String {
-    status_stats_rects(sheet, &[rect], mask, &std::collections::HashSet::new())
+    status_stats_rects(sheet, &[rect], mask)
 }
 
 /// UI-25：大选区分帧统计，避免一帧扫完整块导致界面卡死。
@@ -2803,6 +2817,37 @@ impl SheetApp {
                                 );
                             }
                         }
+                    }
+                    // UI-25 证据：SC_HIDE_ROWS=2,3 / SC_HIDE_COLS=2 写和右键菜单相同的手动隐藏标记
+                    if let Ok(spec) = std::env::var("SC_HIDE_ROWS") {
+                        let rows: Vec<u32> = spec
+                            .split(',')
+                            .filter_map(|x| x.trim().parse::<u32>().ok())
+                            .filter(|r| *r > 0)
+                            .map(|r| r - 1)
+                            .collect();
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        for r in &rows {
+                            sh.hidden_rows_user.insert(*r);
+                        }
+                        sh.layout_dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        eprintln!("[ui25] 隐藏行（1 基）{:?}", rows.iter().map(|r| r + 1).collect::<Vec<_>>());
+                    }
+                    if let Ok(spec) = std::env::var("SC_HIDE_COLS") {
+                        let cols: Vec<u32> = spec
+                            .split(',')
+                            .filter_map(|x| x.trim().parse::<u32>().ok())
+                            .filter(|c| *c > 0)
+                            .map(|c| c - 1)
+                            .collect();
+                        let sh = self.wb.sheet_mut(self.sheet_idx);
+                        for c in &cols {
+                            sh.hidden_cols.insert(*c);
+                        }
+                        sh.layout_dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        eprintln!("[ui25] 隐藏列（1 基）{:?}", cols.iter().map(|c| c + 1).collect::<Vec<_>>());
                     }
                     if std::env::var("SC_UNHIDE").is_ok() {
                         self.unhide_open = true;
@@ -28099,18 +28144,7 @@ impl eframe::App for SheetApp {
                         let key = (self.sheet_idx, self.doc_gen, rects.clone(), stat_mask);
                         let stale = self.stats_job.as_ref().map_or(true, |j| j.key != key);
                         if stale {
-                            let skip = self
-                                .wb
-                                .sheet(self.sheet_idx)
-                                .filter
-                                .as_ref()
-                                .map(|f| f.hidden_rows(self.wb.sheet(self.sheet_idx)))
-                                .unwrap_or_default();
-                            let vals = collect_stats_values(
-                                self.wb.sheet(self.sheet_idx),
-                                &rects,
-                                &skip,
-                            );
+                            let vals = collect_stats_values(self.wb.sheet(self.sheet_idx), &rects);
                             self.stats_job = Some(StatsJob {
                                 key,
                                 vals,
@@ -28139,22 +28173,28 @@ impl eframe::App for SheetApp {
                         }
                     } else {
                         self.stats_job = None;
-                        let skip = self
-                            .wb
-                            .sheet(self.sheet_idx)
-                            .filter
-                            .as_ref()
-                            .map(|f| f.hidden_rows(self.wb.sheet(self.sheet_idx)))
-                            .unwrap_or_default();
-                        stat = status_stats_rects(
-                            self.wb.sheet(self.sheet_idx),
-                            &rects,
-                            stat_mask,
-                            &skip,
-                        );
+                        stat = status_stats_rects(self.wb.sheet(self.sheet_idx), &rects, stat_mask);
                     }
                 } else {
                     self.stats_job = None;
+                }
+                // UI-25 证据：无界面验收时把状态栏这一帧的统计文本、选区与隐藏标记落盘，
+                // 用于对照 Excel UIA 实测口径（截图在 RDP 下不可用）。
+                if let Ok(path) = std::env::var("SC_STAT_DUMP") {
+                    let sh = self.wb.sheet(self.sheet_idx);
+                    let hidden = stats_hidden_rows(sh);
+                    let mut hr: Vec<u32> = sh.hidden_rows_user.iter().copied().collect();
+                    let mut hf: Vec<u32> = sh.hidden_rows.iter().copied().collect();
+                    let mut hc: Vec<u32> = sh.hidden_cols.iter().copied().collect();
+                    let mut hs: Vec<u32> = hidden.iter().copied().collect();
+                    for v in [&mut hr, &mut hf, &mut hc, &mut hs] {
+                        v.sort_unstable();
+                    }
+                    let body = format!(
+                        "sheet={}\nrects={:?}\nmask={}\nhidden_rows_user={:?}\nhidden_rows={:?}\nhidden_cols={:?}\nhidden_for_stats={:?}\nstat={}\n",
+                        sh.name, rects, stat_mask, hr, hf, hc, hs, stat
+                    );
+                    let _ = std::fs::write(path, body);
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);

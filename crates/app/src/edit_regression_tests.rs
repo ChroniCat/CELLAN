@@ -7247,7 +7247,7 @@ fn zoom_is_per_sheet() {
     app.switch_sheet_relative(1);
     assert_eq!(app.zoom, 1.5, "第二张表恢复 150%");
 }
-/// UI-25：多选、过滤可见性、隐藏行列、百万行稀疏选区。
+/// UI-25：多选、隐藏行/列、筛选与百万行稀疏选区。
 #[test]
 fn status_stats_cover_multi_rect_filter_and_sparse_edges() {
     use crate::{status_stats_rects, status_stats_text};
@@ -7260,9 +7260,8 @@ fn status_stats_cover_multi_rect_filter_and_sparse_edges() {
     ] {
         sh.set(r, c, Cell { value: v, formula: None });
     }
-    let none = std::collections::HashSet::new();
     // A1 + A4 非连续选区：sum=4，两个数值，count=2
-    let multi = status_stats_rects(&sh, &[(0, 0, 0, 0), (3, 0, 3, 0)], 0b11_1111, &none);
+    let multi = status_stats_rects(&sh, &[(0, 0, 0, 0), (3, 0, 3, 0)], 0b11_1111);
     assert!(multi.contains("求和: 4"), "{multi}");
     assert!(multi.contains("数值计数: 2"), "{multi}");
     assert!(multi.contains("平均值: 2"), "{multi}");
@@ -7272,25 +7271,29 @@ fn status_stats_cover_multi_rect_filter_and_sparse_edges() {
     assert!(all.contains("计数: 3"), "{all}");
     assert!(all.contains("数值计数: 2"), "{all}");
 
-    // 筛选隐藏的行不算；隐藏行/列也不算
-    let mut skip = std::collections::HashSet::new();
-    skip.insert(3u32);
-    let filtered = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8, &skip);
-    assert!(filtered.contains("求和: 1"), "{filtered}");
+    // 手动隐藏行（右键 HideRows 只写 hidden_rows_user）不计入统计
+    sh.hidden_rows_user.insert(3);
+    let manual = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8);
+    assert!(manual.contains("求和: 1"), "隐藏 A4 后只剩 A1：{manual}");
+    sh.hidden_rows_user.clear();
+
+    // 行高 0（文件里 hidden 的行）同样不算
     sh.rows.set(0, 0.0);
-    let hidden = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8, &none);
+    let hidden = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8);
     assert!(hidden.contains("求和: 3"), "隐藏 A1 后只剩 A4：{hidden}");
+    sh.rows.set(0, 18.0);
+
+    // 隐藏列照 Excel 实测口径仍然计入（不是“隐藏就排除”）
+    sh.hidden_cols.insert(0);
+    let col_hidden = status_stats_rects(&sh, &[(0, 0, 3, 0)], 8);
+    assert!(col_hidden.contains("求和: 4"), "隐藏列仍计入：{col_hidden}");
+    sh.hidden_cols.clear();
 
     // 百万行稀疏选区：只碰实际存在的格，不需要逐坐标扫
-    let big = status_stats_rects(
-        &sh,
-        &[(0, 0, 1_048_575, 0)],
-        0b11_1111,
-        &std::collections::HashSet::new(),
-    );
-    assert!(big.contains("求和: 8"), "1 + 3 + 5：{big}");
+    let big = status_stats_rects(&sh, &[(0, 0, 1_048_575, 0)], 0b11_1111);
+    assert!(big.contains("求和: 9"), "1 + 3 + 5：{big}");
 }
-/// UI-25：筛选隐藏的行必须从统计里排除（规则来自真实 Filter）。
+/// UI-25：筛选隐藏的行必须从统计里排除（规则来自真实 Filter，宿主只写 filter 也要生效）。
 #[test]
 fn status_stats_follow_active_filter_hidden_rows() {
     use crate::status_stats_rects;
@@ -7304,9 +7307,98 @@ fn status_stats_follow_active_filter_hidden_rows() {
     f.allows.insert(0, std::iter::once("A".to_string()).collect());
     let hidden = f.hidden_rows(&sh);
     assert!(hidden.contains(&2), "B 行应被筛掉：{hidden:?}");
-    let stat = status_stats_rects(&sh, &[(0, 0, 2, 1)], 0b11_1111, &hidden);
+    sh.filter = Some(f);
+    let stat = status_stats_rects(&sh, &[(0, 0, 2, 1)], 0b11_1111);
     assert!(stat.contains("求和: 10"), "只统计可见的 A 行：{stat}");
     assert!(stat.contains("计数: 3"), "表头+A 行类型+A 行数值：{stat}");
+    // 宿主应用筛选时还会把 hidden_rows 同步下来，结果必须一致
+    sh.hidden_rows = hidden;
+    let again = status_stats_rects(&sh, &[(0, 0, 2, 1)], 0b11_1111);
+    assert_eq!(again, stat);
+}
+/// UI-25：隐藏行列的统计口径按本机 Excel 16.0 UIA 实测
+/// （`implementation-evidence/ui25-hidden-marker.txt`）：
+/// 手动隐藏行、分级折叠行排除；隐藏列**仍然计入**。
+#[test]
+fn status_stats_exclude_manual_and_outline_hidden_rows_but_keep_hidden_cols() {
+    use crate::status_stats_text;
+    let mut sh = sheetcore::model::Sheet::new("S");
+    sh.set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+    sh.set(1, 0, Cell { value: Value::Number(2.0), formula: None });
+    sh.set(2, 0, Cell { value: Value::Text("x".into()), formula: None });
+    sh.set(3, 0, Cell { value: Value::Number(4.0), formula: None });
+    sh.set(0, 1, Cell { value: Value::Number(100.0), formula: None });
+    // 基准：Excel 平均值 2.333333333 / 计数 4 / 求和 7
+    let base = status_stats_text(&sh, (0, 0, 3, 0), 0b11_1111);
+    assert!(base.contains("平均值: 2.3333"), "{base}");
+    assert!(base.contains("计数: 4"), "{base}");
+    assert!(base.contains("求和: 7"), "{base}");
+    // 手动隐藏第 2 行：Excel 平均值 2.5 / 计数 3 / 求和 5
+    sh.hidden_rows_user.insert(1);
+    let manual = status_stats_text(&sh, (0, 0, 3, 0), 0b11_1111);
+    assert!(manual.contains("平均值: 2.5"), "{manual}");
+    assert!(manual.contains("计数: 3"), "{manual}");
+    assert!(manual.contains("求和: 5"), "{manual}");
+    // 同一行同时被筛选标成 hidden_rows：集合去重，结果不变
+    sh.hidden_rows.insert(1);
+    assert_eq!(status_stats_text(&sh, (0, 0, 3, 0), 0b11_1111), manual);
+    sh.hidden_rows_user.clear();
+    sh.hidden_rows.clear();
+    // 分级/组合折叠只写 hidden_rows：A6:A8 = 7,8 折叠后 Excel 计数 1 / 求和 7
+    sh.set(5, 0, Cell { value: Value::Number(7.0), formula: None });
+    sh.set(6, 0, Cell { value: Value::Number(8.0), formula: None });
+    sh.hidden_rows.extend([6u32, 7]);
+    let outline = status_stats_text(&sh, (5, 0, 7, 0), 0b11_1111);
+    assert!(outline.contains("计数: 1"), "{outline}");
+    assert!(outline.contains("求和: 7"), "{outline}");
+    sh.hidden_rows.clear();
+    // 隐藏 B 列后选 A1:B1：Excel 计数 2 / 求和 101，隐藏列不排除
+    sh.hidden_cols.insert(1);
+    let cols = status_stats_text(&sh, (0, 0, 0, 1), 0b11_1111);
+    assert!(cols.contains("计数: 2"), "{cols}");
+    assert!(cols.contains("求和: 101"), "{cols}");
+}
+/// UI-25：真实右键菜单「隐藏行 / 隐藏列」写下的标记要直接进状态栏统计，
+/// 口径同 Excel 实测：隐藏行排除、隐藏列仍计入。
+#[test]
+fn ui25_context_menu_hidden_markers_drive_status_stats() {
+    use crate::status_stats_rects;
+    let ctx = egui::Context::default();
+    let mut app = app();
+    for (r, v) in [(0u32, 1.0), (1, 2.0), (2, 4.0)] {
+        app.wb
+            .sheet_mut(0)
+            .set(r, 0, Cell { value: Value::Number(v), formula: None });
+    }
+    app.wb
+        .sheet_mut(0)
+        .set(0, 1, Cell { value: Value::Number(100.0), formula: None });
+    let mask = 0b11_1111;
+    app.sel = (0, 0);
+    app.sel_end = (2, 0);
+    let base = status_stats_rects(app.wb.sheet(0), &app.sel_rects(), mask);
+    assert!(base.contains("求和: 7"), "{base}");
+    assert!(base.contains("计数: 3"), "{base}");
+    // 右键菜单「隐藏行」走的是同一个 CtxAct 分发；先选中第 2 行再隐藏
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.ctx_menu_run(CtxAct::HideRows, 1, &ctx);
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&1), "隐藏行应写 hidden_rows_user");
+    app.sel = (0, 0);
+    app.sel_end = (2, 0);
+    let hidden = status_stats_rects(app.wb.sheet(0), &app.sel_rects(), mask);
+    assert!(hidden.contains("求和: 5"), "隐藏第 2 行后 1+4：{hidden}");
+    assert!(hidden.contains("计数: 2"), "{hidden}");
+    // 选中 B1 再隐藏 B 列：Excel 口径隐藏列仍计入（1+100）
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.ctx_menu_run(CtxAct::HideCols, 1, &ctx);
+    assert!(app.wb.sheet(0).hidden_cols.contains(&1), "隐藏列应写 hidden_cols");
+    app.sel = (0, 0);
+    app.sel_end = (0, 1);
+    let cols = status_stats_rects(app.wb.sheet(0), &app.sel_rects(), mask);
+    assert!(cols.contains("求和: 101"), "隐藏列仍计入：{cols}");
+    assert!(cols.contains("计数: 2"), "{cols}");
 }
 /// C15：B1/D1 解锁、C1 锁定且禁选锁定格时，鼠标拖选 B1→D1 不能把 C1 包进来。
 #[test]
