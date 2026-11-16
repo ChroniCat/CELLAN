@@ -146,6 +146,8 @@ pub struct PivotGrid {
     /// 列叶子的逐层路径（与 col_labels 一一对应，供 pivotTable 部件写嵌套 colItems）
     pub col_paths: Vec<Vec<String>>,
     pub grand_total_row: Option<usize>,
+    /// 页筛选标题区：(字段名, 选中值)。Excel 会把它们渲染在透视表上方
+    pub page_filters: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -264,7 +266,14 @@ fn emit_row(
 pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     let (r1, _c1, r2, _c2) = spec.source;
     let hdr = |c: u32| header(sheet, r1, c);
+    let page_filters: Vec<(String, String)> = spec
+        .filters
+        .iter()
+        .filter(|f| !f.keep.is_empty())
+        .map(|f| (hdr(f.col), f.keep.join(", ")))
+        .collect();
     let mut grid = PivotGrid {
+        page_filters,
         row_depth: spec.rows.len(),
         value_cols: spec.values.len(),
         ..Default::default()
@@ -550,6 +559,21 @@ fn apply_show_as(grid: &mut PivotGrid, spec: &PivotSpec2) {
 pub fn write_grid(sheet: &mut Sheet, at: (u32, u32), grid: &PivotGrid) -> (u32, u32, u32, u32) {
     let (r0, c0) = at;
     let mut r = r0;
+    for (i, (name, val)) in grid.page_filters.iter().enumerate() {
+        sheet.set(
+            r + i as u32,
+            c0,
+            crate::model::Cell { value: Value::Text(name.clone().into()), formula: None },
+        );
+        sheet.set(
+            r + i as u32,
+            c0 + 1,
+            crate::model::Cell { value: Value::Text(val.clone().into()), formula: None },
+        );
+    }
+    if !grid.page_filters.is_empty() {
+        r += grid.page_filters.len() as u32 + 1; // 标题区 + 一空行
+    }
     for h in &grid.headers {
         for (i, s) in h.iter().enumerate() {
             if !s.is_empty() {

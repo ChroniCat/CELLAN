@@ -894,4 +894,14 @@ fn page_filter_matches_excel_filter_ref() {
         .collect();
     // Excel 实测（filter-ref.tsv）：华北 120、华东 10、总计 130
     assert_eq!(rows, vec!["华北\t120", "华东\t10", "总计\t130"]);
+
+    // 页筛选标题区：Excel 在透视表上方写「状态 | 有效」+ 一空行
+    assert_eq!(g.page_filters, vec![("状态".to_string(), "有效".to_string())]);
+    let mut out = sheetcore::Sheet::new("透视");
+    let rect = sheetcore::pivot_multi::write_grid(&mut out, (2, 1), &g);
+    assert_eq!(out.get(2, 1).unwrap().value.display(), "状态");
+    assert_eq!(out.get(2, 2).unwrap().value.display(), "有效");
+    assert!(out.get(3, 1).is_none(), "标题区和表头之间要空一行");
+    assert_eq!(out.get(4, 1).unwrap().value.display(), "地区");
+    assert_eq!(rect.0, 2, "rect 从标题区开始算");
 }

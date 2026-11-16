@@ -134,7 +134,14 @@ fn write_grid_lands_values_at_the_target_anchor() {
     let rect = write_grid(&mut out, (3, 2), &g);
     assert_eq!(rect.0, 3);
     assert_eq!(rect.1, 2);
-    assert_eq!(out.get(5, 2).unwrap().value.display(), "地区");
+    let mut hdr0 = None;
+    for r in 3..rect.2 + 3 {
+        if out.get(r, 2).map(|c| c.value.display()).as_deref() == Some("地区") {
+            hdr0 = Some(r);
+            break;
+        }
+    }
+    assert!(hdr0.is_some(), "应能找到表头首行");
     // 表头行数会变，按内容定位：最后一个表头行里有「销售额 求和」，「华北」行在第一列
     let mut hdr_row = None;
     let mut row_bj = None;
@@ -150,6 +157,7 @@ fn write_grid_lands_values_at_the_target_anchor() {
     let rb = row_bj.expect("应能找到华北行");
     assert_eq!(out.get(rb, 4).map(|c| c.value.display()).unwrap_or_default(), "20");
     // hue: 表头 2 行 + 数据行数
-    let expect_last = 3 + g.headers.len() as u32 + g.rows.len() as u32 - 1;
+    let expect_last =
+        3 + g.page_filters.len() as u32 + 1 + g.headers.len() as u32 + g.rows.len() as u32 - 1;
     assert_eq!(rect.2, expect_last);
 }

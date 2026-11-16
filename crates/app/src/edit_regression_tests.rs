@@ -6941,7 +6941,7 @@ fn multi_field_pivot_refresh_clears_old_cells() {
     // 表头行数随「列字段 + 多值总计列」变化，按行找「华北」再核对值，别写死行号
     let sheet = app.wb.sheet(0);
     let mut found = None;
-    for r in 10..rect.3 + 10 {
+    for r in 10..rect.2 + 10 {
         if sheet.get(r, 0).map(|c| c.value.display()).as_deref() == Some("华北") {
             found = Some(r);
             break;
@@ -6956,7 +6956,8 @@ fn multi_field_pivot_refresh_clears_old_cells() {
     let mut spec2 = spec.clone();
     spec2.filters.clear();
     let rect2 = app.apply_pivot2(&spec2, (rect.0, rect.1), Some(rect), true);
-    assert!(rect2.2 >= rect.2, "加行后区域不应变小");
+    // 清掉筛选后标题区（2 行）消失、明细多一行：允许总高度变化，但不能丢数据
+    assert!(rect2.2 + 2 >= rect.2, "清筛选后高度变化应可解释");
     let old_bottom = app
         .wb
         .sheet(0)
