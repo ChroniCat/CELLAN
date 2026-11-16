@@ -262,3 +262,18 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 跨工作表点选建 `Sheet2!A1`（点另一张表页会先结束当前编辑）；
 - 向导里点区域填参数、分类筛选、帮助链接；
 - 真实中文 IME（RDP 不可用，待验收）。
+
+## 2026-11-16 检查点四：QA-06.1 错误/空值/日期矩阵（Excel 与 WPS 实算对拍）
+
+- 提交 `c0177c9`（`test(qa06): error/blank/date matrix against real Excel 16.0 and WPS 12.0`）。
+- 夹具 `work/qa06/qa06.xlsx` 由 `scripts/qa06_fixture.py` 生成；公式不在 xlsx 里，由
+  `scripts/qa06_excel_probe.ps1` 用 Excel COM 逐条写进 C 列再 `Calculate()`——
+  openpyxl 直接写 `IFNA`/`DAYS` 会缺 `_xlfn.` 前缀，Excel 认成 `#NAME?`（第一版踩到）。
+- 实测：`Excel 16.0：50 条；WPS=12.0`；`cargo test --test qa06_matrix` → **1 passed**，
+  err 16 / blank 17 / date 17 全部与 Excel 一致。
+- 比较口径：错误码与布尔按显示值严格比对；数字按 Excel `Value2` 相对 1e-9 比较
+  （用 `Text` 会因格式把 11339.375 显示成 11339.38、日期显示成 `########`/`1/1/2025` 而产生假差异）。
+- Excel 与 WPS 语义全一致，两处 `########` 只是 WPS 列宽不足。
+- 证据：`implementation-evidence/qa06-1-error-blank-date.txt` 与 `qa06-1/{cases.json,excel.tsv,wps.tsv,probe-meta.json}`。
+- 台账：QA-06 父项 → 实施中，QA-06.1 → 待验收；父母 24/4/27/6，切片 60/1/68/19（未抬高已验收数）。
+- 下一步：QA-06.2 数组/动态数组与增量一致。

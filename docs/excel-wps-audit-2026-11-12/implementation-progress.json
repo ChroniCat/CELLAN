@@ -4121,17 +4121,34 @@
       "scope": "core/tests/公式golden",
       "source": "qa-requirements.md",
       "heading": "QA-06 P1 公式语义回归矩阵",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
-      "files": [],
+      "files": [
+        "crates/core/tests/qa06_matrix.rs",
+        "crates/core/tests/fixtures/qa06/matrix.tsv",
+        "scripts/qa06_fixture.py",
+        "scripts/qa06_excel_probe.ps1",
+        "scripts/qa06_merge.py"
+      ],
       "commits": [],
-      "commands": [],
-      "evidence": [],
+      "commands": [
+        "python scripts/qa06_fixture.py work/qa06 -> 50 条公式",
+        "powershell -File scripts/qa06_excel_probe.ps1 -> Excel 16.0 / WPS 12.0 各 50 条实算",
+        "python scripts/qa06_merge.py -> crates/core/tests/fixtures/qa06/matrix.tsv",
+        "cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2 -> 1 passed (50 条全部与 Excel 一致)"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-error-blank-date.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/cases.json",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/excel.tsv",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/wps.tsv",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "QA-06.2 数组/动态数组与增量一致",
+      "updated_utc": "2026-11-16T08:44:03Z",
       "slices": [
         {
           "id": "QA-06.1",
@@ -4139,17 +4156,36 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "待验收",
+          "acceptance": "错误传播（#N/A/#DIV/0!/#VALUE! 及 IFERROR/IFNA/ERROR.TYPE）、空值与空字符串（ISBLANK/COUNTBLANK/COUNTA/文本数字强转）、日期序号与 1900 系统（含虚构闰日 60、月份越界进位、EDATE/EOMONTH/DATEDIF/WEEKDAY/WEEKNUM）50 条，与本机 Excel 16.0 实算逐条一致；WPS 12.0 语义一致（两处仅列宽不足显示 ########）。矩阵由 Excel COM 生成，数字按 Value2 相对 1e-9 比较。",
+          "files": [
+            "crates/core/tests/qa06_matrix.rs",
+            "crates/core/tests/fixtures/qa06/matrix.tsv",
+            "scripts/qa06_fixture.py",
+            "scripts/qa06_excel_probe.ps1",
+            "scripts/qa06_merge.py"
+          ],
+          "commits": [
+            "c0177c9"
+          ],
+          "commands": [
+            "powershell -File scripts/qa06_excel_probe.ps1 F:/…/work/qa06 -> \"Excel 16.0：50 条；WPS=12.0\"",
+            "cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2 -> 1 passed / 0 failed（err 16 + blank 17 + date 17）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-error-blank-date.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/cases.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/excel.tsv",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/wps.tsv",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json"
+          ],
+          "not_done": [
+            "数组/动态数组与溢出区域、财务/查找/文本边界、SUBTOTAL/AGGREGATE 隐藏行口径、整列与跨表引用，留给 QA-06.2/06.3"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "QA-06.2",
+          "updated_utc": "2026-11-16T08:44:03Z"
         },
         {
           "id": "QA-06.2",
