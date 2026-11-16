@@ -9882,3 +9882,18 @@ fn cross_sheet_drag_labels_carry_sheet_name() {
         "'销售 数据'!A1"
     );
 }
+
+#[test]
+fn parse_calc_item_reads_name_and_sources() {
+    let (n, srcs) = crate::parse_calc_item("合计=华东+华北").expect("应能解析");
+    assert_eq!(n, "合计");
+    assert_eq!(srcs, vec!["华东".to_string(), "华北".to_string()]);
+    // 空格、空串都容忍
+    let (n2, s2) = crate::parse_calc_item(" 小计 = 研发 + 销售 ").unwrap();
+    assert_eq!(n2, "小计");
+    assert_eq!(s2, vec!["研发".to_string(), "销售".to_string()]);
+    // 缺名字/缺来源/没有等号 → None
+    assert!(crate::parse_calc_item("=华东+华北").is_none());
+    assert!(crate::parse_calc_item("合计=").is_none());
+    assert!(crate::parse_calc_item("  ").is_none());
+}

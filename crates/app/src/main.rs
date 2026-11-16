@@ -620,6 +620,24 @@ fn formula_help_keys(
     accept.then_some(*selected)
 }
 
+/// 「名称=项1+项2」→ (名称, 来源项)。空串或格式不对返回 None。
+fn parse_calc_item(s: &str) -> Option<(String, Vec<String>)> {
+    let (name, rest) = s.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let srcs: Vec<String> = rest
+        .split('+')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if srcs.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), srcs))
+}
+
 /// 拖动扩区域时的引用文本：跨表带 `表名!`，同表就是 `A1:B2`
 fn pick_range_label(sheet: Option<&str>, a: (u32, u32), b: (u32, u32)) -> String {
     // 单格不写 A1:A1（Excel 也只写 A1）
@@ -1928,6 +1946,8 @@ struct SheetApp {
     pivot2_edit: Option<(sheetcore::pivot_multi::PivotSpec2, (u32, u32))>,
     /// 最近一次多字段透视（表, 规格, 占用区域），刷新用
     pivot2_last: Option<(usize, sheetcore::pivot_multi::PivotSpec2, (u32, u32, u32, u32))>,
+    /// C12.4 计算项输入：「名称=项1+项2」，空表示不加
+    pivot2_calc_item: String,
     /// 透视表是否生成真正的 pivotTable 部件
     pivot_real: bool,
     /// 并排比较的第二个工作簿 + 表序号 + 滚动
@@ -2868,6 +2888,7 @@ impl SheetApp {
             pivot_edit: None,
             pivot2_edit: None,
             pivot2_last: None,
+            pivot2_calc_item: String::new(),
             pivot_real: true,
             compare: {
                 let mut c = None;
@@ -21896,7 +21917,14 @@ let txn = self.txn_begin(&keys);
                 }
             }
         }
-        let grid = sheetcore::pivot_multi::compute(self.wb.sheet(self.sheet_idx), spec);
+        let mut grid = sheetcore::pivot_multi::compute(self.wb.sheet(self.sheet_idx), spec);
+        // C12.4 计算项：按「名称=项1+项2」把若干行合成一行（真行，XML 三处会跟着长）
+        if let Some((name, srcs)) = parse_calc_item(&self.pivot2_calc_item) {
+            let refs: Vec<&str> = srcs.iter().map(|s| s.as_str()).collect();
+            if sheetcore::pivot_multi::append_calc_item_row(&mut grid, &name, &refs).is_none() {
+                self.status = format!("计算项「{name}」没找到来源项：{}", srcs.join("+"));
+            }
+        }
         let rect = sheetcore::pivot_multi::write_grid(self.wb.sheet_mut(self.sheet_idx), pos, &grid);
         if self.pivot_real {
             // C12.4：多字段透视也要在保存时挂真 pivotTable 部件，而不是只留值化网格
@@ -22158,6 +22186,14 @@ let txn = self.txn_begin(&keys);
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut spec.layout.tabular, "表格形式（每层标签都显示）");
+                    ui.horizontal(|ui| {
+                        ui.label("计算项");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pivot2_calc_item)
+                                .desired_width(220.0)
+                                .hint_text("名称=项1+项2（如 合计=华东+华北）"),
+                        );
+                    });
                     ui.checkbox(&mut spec.layout.subtotals, "小计");
                     ui.checkbox(&mut spec.layout.grand_totals, "总计");
                 });
