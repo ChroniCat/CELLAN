@@ -302,3 +302,27 @@ fn two_column_fields_with_two_values_expand_each_value() {
     // 行轴 1 个总计 + 列轴按 2 个值展开的 2 个 = 3
     assert_eq!(xml.matches("<i t=\"grand\"").count(), 3, "总计项数不对：{xml}");
 }
+
+#[test]
+fn compact_layout_reaches_the_xml_and_excel_reads_it() {
+    let fx = Fixture::new("compact");
+    let path = fx.file("compact.xlsx");
+    let mut wb = book(&path);
+    let mut spec = spec_b();
+    spec.layout.tabular = false; // 压缩形式
+    let _ = attach(&path, &mut wb, &spec);
+
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        z.by_name("xl/pivotTables/pivotTable1.xml").unwrap().read_to_string(&mut xml).unwrap();
+    }
+    assert!(xml.contains("compact=\"1\" compactData=\"1\""), "压缩布局没写进 XML：{xml}");
+    assert!(xml.contains("outline=\"0\" outlineData=\"0\""));
+
+    // 留一份给 Excel 探针（临时目录会被 Drop 清掉）
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/compact-multi.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
+}

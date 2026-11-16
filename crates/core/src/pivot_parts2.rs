@@ -402,11 +402,19 @@ pub fn build(
         })
         .collect();
 
-    let table = format!(
+    let mut table = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" name=\"{}\" cacheId=\"{cache_id}\" dataCaption=\"值\" updatedVersion=\"6\" minRefreshableVersion=\"3\" createdVersion=\"6\" applyWidthHeightFormats=\"1\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\" compact=\"0\" compactData=\"0\" multipleFieldFilters=\"0\"><location ref=\"{loc}\" firstHeaderRow=\"1\" firstDataRow=\"{first_data_row}\" firstDataCol=\"{row_depth}\"/><pivotFields count=\"{n_fields}\">{pfields}</pivotFields><rowFields count=\"{row_depth}\">{row_fields_xml}</rowFields><rowItems count=\"{}\">{row_items}</rowItems>{extra}<dataFields count=\"{k}\">{data_fields}</dataFields><pivotTableStyleInfo name=\"PivotStyleLight16\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
         esc(table_name),
         grid.rows.len()
     );
+
+    // 界面里的「压缩形式」必须落到 XML，否则 Excel 打开按大纲重排
+    if !spec.layout.tabular {
+        table = table.replace(
+            "outline=\"1\" outlineData=\"1\" compact=\"0\" compactData=\"0\"",
+            "outline=\"0\" outlineData=\"0\" compact=\"1\" compactData=\"1\"",
+        );
+    }
 
     // 自检：条数与索引自洽
     let rec_count = records.matches("<r>").count();
