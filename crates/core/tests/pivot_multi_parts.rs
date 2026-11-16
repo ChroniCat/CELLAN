@@ -155,3 +155,28 @@ fn multi_value_without_column_field_is_rejected_instead_of_written_broken() {
         .to_string();
     assert!(err.contains("多值透视必须带列字段"), "{err}");
 }
+
+/// 保存路径：pivots_pending2 里的多字段透视必须真的写成 pivotTable 部件。
+#[test]
+fn save_attaches_multi_field_pivot_parts() {
+    let f = Fixture::new("save2");
+    let path = f.file("save.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_a();
+    let grid = pivot_multi::compute(&wb.sheets[0], &spec);
+    let rect = pivot_multi::write_grid(&mut wb.sheets[0], (8, 0), &grid);
+    wb.pivots_pending2.push((0, spec.clone(), grid, rect));
+    xlsx::save(&path, &wb).expect("保存失败");
+
+    let parts = pivot_parts(&path);
+    assert!(
+        parts.iter().any(|p| p.ends_with("pivotTable1.xml")),
+        "保存后没有 pivotTable 部件：{parts:?}"
+    );
+    assert!(
+        parts.iter().any(|p| p.ends_with("pivotCacheRecords1.xml")),
+        "保存后没有缓存记录部件：{parts:?}"
+    );
+    let reopened = xlsx::load(&path).expect("重新打开失败");
+    assert!(reopened.sheets[0].get(8, 0).is_some(), "透视表区域内容丢了");
+}

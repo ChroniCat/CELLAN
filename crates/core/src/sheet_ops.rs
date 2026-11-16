@@ -26,6 +26,9 @@ pub fn insert_sheet(wb: &mut Workbook, idx: usize, mut sheet: Sheet) -> bool {
     for (i, ..) in &mut wb.pivots_pending {
         if *i >= idx { *i += 1; }
     }
+    for (i, ..) in &mut wb.pivots_pending2 {
+        if *i >= idx { *i += 1; }
+    }
     wb.sheets.insert(idx, sheet);
     wb.dirty = true;
     true
@@ -72,6 +75,10 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
     for (sheet, ..) in &mut wb.pivots_pending {
         if *sheet > idx { *sheet -= 1; }
     }
+    wb.pivots_pending2.retain(|(sheet, ..)| *sheet != idx);
+    for (sheet, ..) in &mut wb.pivots_pending2 {
+        if *sheet > idx { *sheet -= 1; }
+    }
     wb.dirty = true;
     true
 }
@@ -89,6 +96,7 @@ pub fn move_sheet(wb: &mut Workbook, from: usize, to: usize) -> bool {
         }
     }
     for (sheet, ..) in &mut wb.pivots_pending { *sheet = remap(*sheet); }
+    for (sheet, ..) in &mut wb.pivots_pending2 { *sheet = remap(*sheet); }
     wb.dirty = true;
     true
 }

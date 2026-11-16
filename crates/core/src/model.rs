@@ -552,6 +552,13 @@ pub struct Workbook {
         (u32, u32, u32, u32),
         String,
     )>,
+    /// 多字段透视：保存时挂真 pivotTable 部件（C12.4）
+    pub pivots_pending2: Vec<(
+        usize,
+        crate::pivot_multi::PivotSpec2,
+        crate::pivot_multi::PivotGrid,
+        (u32, u32, u32, u32),
+    )>,
     /// 样式表（单元格只存索引，见 Sheet.styles）
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
@@ -586,6 +593,7 @@ impl Workbook {
             pivot_session: Default::default(),
             names_dirty: false,
             pivots_pending: Vec::new(),
+            pivots_pending2: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
             decrypted: None,

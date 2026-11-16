@@ -8230,3 +8230,46 @@ fn ui112_autocomplete_can_be_driven_by_arrow_keys_and_enter() {
         "Tab 也能接受"
     );
 }
+
+/// C12.4：面板建出来的多字段透视要排进保存队列，保存时才挂真 pivotTable 部件。
+#[test]
+fn multi_field_pivot_from_panel_is_queued_for_real_parts() {
+    use sheetcore::pivot::{Agg, GroupBy};
+    use sheetcore::pivot_multi::{AxisField, PivotLayout, PivotSpec2, ValueField};
+
+    let mut app = app();
+    for (r, c, t) in [(0, 0, "地区"), (0, 1, "产品"), (0, 2, "金额")] {
+        app.wb.sheets[0].set(r, c, Cell { value: Value::Text(t.into()), formula: None });
+    }
+    for (i, (region, product, amount)) in
+        [("华东", "A", 10.0), ("华北", "B", 20.0), ("华东", "A", 30.0), ("华北", "B", 40.0)]
+            .into_iter()
+            .enumerate()
+    {
+        let r = i as u32 + 1;
+        app.wb.sheets[0].set(r, 0, Cell { value: Value::Text(region.into()), formula: None });
+        app.wb.sheets[0].set(r, 1, Cell { value: Value::Text(product.into()), formula: None });
+        app.wb.sheets[0].set(r, 2, number(amount));
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 4, 2),
+        rows: vec![
+            AxisField { col: 0, group: GroupBy::None },
+            AxisField { col: 1, group: GroupBy::None },
+        ],
+        cols: vec![],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None }],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    };
+    app.pivot_real = true;
+    app.sheet_idx = 0;
+    let rect = app.apply_pivot2(&spec, (8, 0), None, false);
+    assert_eq!(app.wb.pivots_pending2.len(), 1, "多字段透视没进保存队列");
+    assert_eq!(app.wb.pivots_pending2[0].3, rect);
+    // 同位置刷新：更新同一个附件，不能越排越多
+    let rect2 = app.apply_pivot2(&spec, (8, 0), Some(rect), true);
+    assert_eq!(app.wb.pivots_pending2.len(), 1, "刷新不该新增附件");
+    assert_eq!(app.wb.pivots_pending2[0].3, rect2);
+    assert!(app.status.contains("多字段透视已刷新"));
+}

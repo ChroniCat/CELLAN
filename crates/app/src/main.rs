@@ -21843,6 +21843,22 @@ let txn = self.txn_begin(&keys);
         }
         let grid = sheetcore::pivot_multi::compute(self.wb.sheet(self.sheet_idx), spec);
         let rect = sheetcore::pivot_multi::write_grid(self.wb.sheet_mut(self.sheet_idx), pos, &grid);
+        if self.pivot_real {
+            // C12.4：多字段透视也要在保存时挂真 pivotTable 部件，而不是只留值化网格
+            let si = self.sheet_idx;
+            if let Some(p) = self
+                .wb
+                .pivots_pending2
+                .iter_mut()
+                .find(|(s, _, _, r)| *s == si && *r == rect)
+            {
+                p.1 = spec.clone();
+                p.2 = grid.clone();
+            } else {
+                self.wb.pivots_pending2.push((si, spec.clone(), grid.clone(), rect));
+                self.undo.clear();
+            }
+        }
         self.pivot2_last = Some((self.sheet_idx, spec.clone(), rect));
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);

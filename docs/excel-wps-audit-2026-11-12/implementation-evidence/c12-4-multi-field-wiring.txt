@@ -1,0 +1,61 @@
+C12.4 多字段透视：接进保存链路（界面 → 保存 → 真 pivotTable 部件）
+=====================================================================
+日期：2026-11-16
+代码：
+- `crates/core/src/model.rs`  — 新增 `Workbook::pivots_pending2`
+- `crates/core/src/xlsx.rs`   — `save` 里对每个待挂多字段透视调 `attach2_for_session`
+- `crates/core/src/sheet_ops.rs` — 插入/删除/移动工作表时同步重映射下标
+- `crates/app/src/main.rs`    — `apply_pivot2` 在 `pivot_real` 打开时把 (规格, 网格, 矩形) 排进队列
+测试：`crates/core/tests/pivot_multi_parts.rs`、`crates/app/src/edit_regression_tests.rs`
+
+一、为什么要接这一步
+--------------------
+上一轮 `pivot_parts2` 能生成正确的 pivotTable 部件，但只有 `examples/pivot_multi_probe` 走得到；
+界面里建的多字段透视保存后仍然只有值化网格 —— 等于"生成器有了，用户拿不到"。这一轮把队列补齐：
+
+```
+字段面板 → apply_pivot2()
+            ├─ compute + write_grid（值化网格，立即显示）
+            └─ pivot_real 打开时 push 到 wb.pivots_pending2
+保存 → xlsx::save()
+            ├─ pivots_pending  （旧单字段，不变）
+            └─ pivots_pending2 （多字段）→ pivot_xml::attach2_for_session()
+```
+
+刷新同一位置的透视表时按（工作表, 输出矩形）更新同一条附件，不会越排越多。
+
+二、实测
+--------
+```
+cargo test -p sheetcore --test pivot_multi_parts
+  two_row_fields_emit_one_item_per_grid_row                 ok
+  two_value_fields_register_two_data_fields                 ok
+  multi_value_without_column_field_is_rejected_instead_of_written_broken  ok
+  save_attaches_multi_field_pivot_parts                     ok   ← 保存后包内确有
+                                                              pivotTable1.xml 与
+                                                              pivotCacheRecords1.xml，重开内容还在
+
+cargo test -p app --bin app multi_field_pivot_from_panel
+  multi_field_pivot_from_panel_is_queued_for_real_parts     ok   ← 面板生成后
+                                                              pivots_pending2.len()==1；
+                                                              同位置刷新仍为 1 且矩形更新
+```
+
+全量回归：
+```
+cargo test -p sheetcore -> 103 个测试二进制 0 failed（work/goal-logs/c12-wire-core.log）
+cargo test -p app --bin app -> 326 passed / 0 failed（work/goal-logs/c12-wire-app.log）
+```
+
+三、Excel/WPS 侧的证明
+----------------------
+部件生成逻辑与 `examples/pivot_multi_probe` 完全同一条 `attach2_for_session`，
+上一轮已用同一套参数在 Excel 16.0 与 WPS 12.0 打开验证：
+A（2 行字段）`rows=[地区,产品]`、B（2 值字段）`cols=[产品,值] data=[求和项:金额,求和项:数量]`、
+C（2 行 + 1 列）`cols=[数量]`，值与手算一致。见 `c12-4-multi-field-pivot.txt` 与 `c12-4-multi/`。
+
+四、还没覆盖
+------------
+- 多列字段（≥2 个列字段）与折叠/压缩布局的 `rowItems`（`<i t="default" r="n">`）语义；
+- 计数/平均/最大/最小作为值字段时的缓存属性（`containsInteger` 等）；
+- 透视表被拖动/改字段后由 Excel 存回，我们重新打开再保存时的保真（当前导入的透视表按 `pivots::restore_imported_parts` 原样保留）。

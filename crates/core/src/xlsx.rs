@@ -438,6 +438,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             crate::model::DateSystem::D1900
         },
         pivots_pending: Vec::new(),
+        pivots_pending2: Vec::new(),
         calc_manual: crate::patch::read_calc_manual(path),
         calc_pending: false,
         calc_pending_sheets: std::collections::BTreeSet::new(),
@@ -2359,6 +2360,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         let sheet = wb.sheets.get(*si).context("透视表所属工作表不存在")?;
         crate::pivot_xml::attach_for_session(path, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
             .context("透视表部件写入失败")?;
+    }
+    for (si, spec, grid, rect) in &wb.pivots_pending2 {
+        let sheet = wb.sheets.get(*si).context("多字段透视所属工作表不存在")?;
+        crate::pivot_xml::attach2_for_session(path, &sheet.name, spec, grid, *rect, wb.pivot_session.token())
+            .context("多字段透视部件写入失败")?;
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     must_save!("layout", crate::patch::apply_layout(path, wb));
