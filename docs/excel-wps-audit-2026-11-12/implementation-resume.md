@@ -616,3 +616,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   GUI 首帧 0.727s、可编辑 4.090s、峰值 192.4MB；chain 峰值 731.1MB —— 全部在限内。
   chain 打开→可编辑 6.42s（基线 6.09s，该场景无上限）如实记录。保存峰值仍归 QA-07.3。
 - app **356 passed**。切片 65 已验收 / 5 实施中 / 77 待验收 / 1 待实施。
+
+### 检查点三十六：QA-04.2 剪贴板三方互通
+- 新增 `office_clipboard::write_office_clipboard`（Win32 一次写 XMLSS/HTML/UnicodeText）、
+  `build_xmlss`（公式 → `ss:Formula` 属性、日期 → `DateTime`、文本保前导零、合并轴正确）。
+- 四个方向逐格比对：Excel→app 15/15、WPS→app 15/15、app→Excel 15/15（含公式）、
+  app→WPS 与 Excel→WPS 逐格相同（WPS 自身丢公式，已用对照组证明）。
+- 修 4 个真实缺陷：只写 HTML 无 XMLSS（公式丢）、MergeAcross/MergeDown 轴写反（Excel 整块拒粘）、
+  按「像数字」强转（00123→123）、CF_HTML 缺完整文档（Excel 粘不动）。
+- app 357 passed。QA-04.2 仍为实施中：IME 端到端受无交互桌面阻塞。
