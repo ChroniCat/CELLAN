@@ -36,3 +36,16 @@ after open: 104 labelled nodes
 
 UI-24.2 从「二级菜单缺标签（真实缺口）」改为「读取通道已建立；条件格式二级菜单已验证；
 split/gallery 组与真实屏幕阅读器未验」——不抬高为已验收。
+
+## split/gallery 箭头热区的无头点击（尝试记录）
+
+按 a11y 节点名直接点击箭头热区（`排序和筛选 选项` / `单元格样式 展开` / `套用表格格式 选项`）：
+
+- 点位来自 accesskit bounds 中心，注入 `PointerMoved` + 按下/抬起，只点一次（连点两次会把 popup 关掉）；
+- 结果：带标签节点 **111 → 101**，没有新增任何二级内容，说明 popup 未展开；
+- 对照组：同类注入对 `条件格式`（普通菜单按钮）有效，能展开并读到三条二级命令。
+
+判断：split/gallery 的展开走的是另一条状态（箭头 `Response` 的 clicked 与 ribbon 的下拉状态机），
+无头注入点击没触发；该用例已标 `#[ignore]` 并写明原因，不冒充已验证。
+
+`cargo test -p app a11y` → **2 passed, 1 ignored**。

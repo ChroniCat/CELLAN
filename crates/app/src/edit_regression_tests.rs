@@ -10016,3 +10016,55 @@ fn a11y_secondary_menu_items_appear_when_open() {
     // 其余组的入口是 split 按钮/画廊（「… 选项」「… 展开」），点击目标是箭头热点，
     // 本用例只覆盖纯菜单按钮；split/gallery 的二级内容待单独用例（见 UI-24.2 记录）。
 }
+
+/// 用 accesskit 节点名找到热区，点开后返回（展开前, 展开后）带标签节点数
+fn a11y_open_by_label(group: &str) -> Option<(usize, usize, Vec<String>)> {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let base = a11y_nodes(&mut app, &ctx);
+    let base_n = base.iter().filter(|(_, l, _)| !l.is_empty()).count();
+    let (_, _, rect) = base.iter().find(|(_, l, _)| l == group).cloned()?;
+    let p = rect?.center();
+    // 只点一次：连点两次会在第二轮把刚展开的 popup 又关掉
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1440.0, 900.0))),
+        ..Default::default()
+    };
+    input.events = vec![
+        egui::Event::PointerMoved(p),
+        egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+    ];
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    let idle = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1440.0, 900.0))),
+        ..Default::default()
+    };
+    let _ = ctx.run(idle, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    let after = a11y_nodes(&mut app, &ctx);
+    let names: Vec<String> = after.iter().map(|(_, l, _)| l.clone()).filter(|l| !l.is_empty()).collect();
+    let after_n = names.len();
+    Some((base_n, after_n, names))
+}
+
+#[test]
+#[ignore = "split/gallery 的箭头热区在无头注入下不展开（实测 111->101，未新增节点）；需真人或有头环境验证"]
+fn a11y_split_button_arrows_open_their_galleries() {
+    let mut checked = 0;
+    for group in ["排序和筛选 选项", "单元格样式 展开", "套用表格格式 选项"] {
+        let Some((b, a, names)) = a11y_open_by_label(group) else {
+            eprintln!("跳过（树里没有「{group}」）");
+            continue;
+        };
+        eprintln!("「{group}」: {b} -> {a}");
+        for n in names.iter().filter(|n| n.contains("序") || n.contains("筛选") || n.contains("样式") || n.contains("表")) {
+            eprintln!("   有 | {n}");
+        }
+        if a > b + 2 {
+            checked += 1;
+        }
+    }
+    eprintln!("验证到 {checked} 个入口");
+}
