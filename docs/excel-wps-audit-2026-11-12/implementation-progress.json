@@ -3313,17 +3313,21 @@
             "crates/core/tests/fixtures/c12/multi.xlsx"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p sheetcore --test pivot_multi_parts -> 22 passed（两行字段小计/多值/两层列字段/页筛选/子总计列）",
+            "Excel probe twocol-ours.xlsx -> range=A9:H14",
+            "Excel probe multival-ours.xlsx -> range=A9:G14"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-multi.txt"
           ],
           "not_done": [
-            "多字段规格/结果/小计总计/筛选与 Excel 对拍"
+            "与 Excel 的标签排序默认口径未定（两份 Excel 基准互斥：compact 基准=源出现顺序，新建探针=拼音序），引擎暂按源顺序并写显式 rowItems；真实键鼠/刷新交互未验。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T20:42:17Z"
+          "updated_utc": "2026-11-16T21:57:26Z"
         },
         {
           "id": "C12.3",
