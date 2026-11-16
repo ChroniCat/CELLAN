@@ -7084,12 +7084,13 @@
       "acceptance": "",
       "files": [],
       "commits": [
-        "284f63c"
+        "284f63c",
+        "2218a50"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "UI-24.1 待实施（模态焦点/默认按钮/关闭恢复）；UI-24.2 实施中（功能区+对话框+活动单元格已可读）；UI-24.3 待实施。"
+        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮已实现并有测试，未做真实键盘复核）；UI-24.2 实施中（功能区+对话框+活动单元格已可读）；UI-24.3 待实施（网格坐标值/选区语义）。"
       ],
       "failures": [],
       "blocker": "",
@@ -7102,16 +7103,29 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "2218a50"
+          ],
+          "commands": [
+            "cargo test -p app --bin app -- modal_dialog_traps（egui 真实 Context + Tab/Escape 事件）-> ok",
+            "cargo test -p app --bin app -- default_button_answers -> ok",
+            "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui241b-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-modal-focus.txt"
+          ],
+          "not_done": [
+            "未用物理键盘在 GUI 里按 Tab（RDP 下无法注入），证据是 egui 事件循环测试。",
+            "Shift+Tab 反向循环未单独断言。",
+            "默认按钮只覆盖 primary_button；功能区没有默认按钮概念。",
+            "对话框内 ScrollArea 视口外控件 Tab 不会自动滚动到。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "GUI 里用真实键盘复核 Tab/Enter；再补 Shift+Tab 断言。",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {

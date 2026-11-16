@@ -503,3 +503,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 边界：只覆盖按钮/pill/对话框标题/活动单元格；下拉与菜单项、状态栏未补；
   UI-24.1 焦点锁与恢复未做；未用 Narrator 实读（RDP 下无法自动化）。
 - app 339 passed。
+
+### 检查点二十三：UI-24.1 模态焦点 / 关闭恢复 / 默认按钮
+- `2218a50`：`Dlg::show` 打开首帧记住原焦点、关闭时还回去；帧末 `set_modal_layer(对话框层)`，
+  关闭帧把模态层降回 background（否则下一帧背景控件会 `surrender_focus` 冲掉还回去的焦点）；
+  新增 `drag_only_sense()` 给标题栏/缩放手柄/遮挡层去掉 FOCUSABLE。
+- 真实失败→通过：先报「Tab 之后焦点没有进对话框」，根因是遮挡层与标题栏都可聚焦；
+  再报「对话框内容键盘不可达」，最后报「关闭后焦点没有回到触发控件」，逐条修完。
+- 测试：`modal_dialog_traps_tab_focus_and_restores_it_on_escape`、
+  `default_button_answers_enter_only_when_no_field_has_focus`；app **341 passed**。
+- 边界：未用物理键盘在 GUI 复核（RDP），Shift+Tab 未单独断言。
