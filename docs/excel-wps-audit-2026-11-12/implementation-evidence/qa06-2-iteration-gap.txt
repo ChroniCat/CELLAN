@@ -1,0 +1,43 @@
+# QA-06.2 迭代计算/循环引用：现状核查（2026-11-17）
+
+## 结论
+
+本引擎**没有迭代计算能力**，不是「没测」，是「没有实现」。
+
+机械核查：
+
+```
+grep -rn "circular|iterat" crates/core/src/formula/mod.rs           -> 0 命中
+grep -rn "Iterative|iteration" crates/core/src crates/core/src/formula -> 0 命中
+```
+
+`formula::recalc_all` 走依赖图拓扑序，环上的节点没有迭代分支，也没有
+「最大迭代次数 / 最大变化量」这两个 Excel 参数。
+
+## Excel 侧口径（待对拍时按此建夹具）
+
+Excel 的迭代计算在「文件 → 选项 → 公式」里，对应对象模型：
+
+```powershell
+$xl.IterativeCalculation = $true
+$xl.MaxIterations = 100          # 默认 100
+$xl.MaxChange = 0.001            # 默认 0.001
+```
+
+典型收敛例：`A1 = B1 + 1`、`B1 = A1 / 2` → A1=2、B1=1（100 次内收敛）。
+关闭迭代时 Excel 对环返回 0 并弹警告，本引擎当前行为需要单独测。
+
+## 为什么没在本轮做掉
+
+这不是补一条用例，是给求值器加一个新阶段：
+1. 依赖图要能识别强连通分量（现在拓扑排序遇到环直接判错）；
+2. 环内节点要按 Excel 的「上一轮值」语义反复求值，直到 `max|Δ| <= MaxChange` 或达 `MaxIterations`；
+3. 增量重算要保证「环外依赖环」的单元格在收敛后再取一次值，否则增量与全量不一致；
+4. 还要把 `IterativeCalculation/MaxIterations/MaxChange` 落到工作簿设置（calcPr 的 `iterate/maxIterations/maxChange`），并在 UI 里可改。
+
+四项都做完才能说这条验收通过，半途写个「最多跑 100 次」的循环只会得到和 Excel 不一致的数。
+
+## 台账处理
+
+QA-06.2 的 not_done 保留这一条，并改写为可执行口径（见 implementation-progress.json）：
+需要实现迭代计算 + calcPr 往返 + 增量一致三件事，而不是「补测」。

@@ -4474,11 +4474,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/anchor.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/probe-meta.json",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/qa06a.xlsx",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-spill-conflict.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-spill-conflict.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-iteration-gap.txt"
           ],
           "not_done": [
-            "迭代计算/循环引用下的增量一致未覆盖",
-            "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计"
+            "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计",
+            "迭代计算/循环引用：引擎没有实现（grep circular/iterat 0 命中），需要 ①环的强连通分量识别 ②按 MaxIterations/MaxChange 迭代到收敛 ③环外依赖在收敛后重取 ④calcPr 的 iterate/maxIterations/maxChange 双向往返；不是补测就能关闭。"
           ],
           "failures": [],
           "blocker": "",
