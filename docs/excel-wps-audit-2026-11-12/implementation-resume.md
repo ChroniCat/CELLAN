@@ -545,3 +545,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   空剪贴板 `Button 粘贴 enabled=False`，Set-Clipboard 后 `enabled=True`（外部 UIA 实测两向）。
 - 顺带补齐大号拆分按钮主体的可访问名（此前只有箭头有名字）。
 - app 341 passed。
+
+### 检查点二十八：QA-05.2 四档 DPI
+- `a3cd75f`：新增 `SC_PPP`；`run_dpi_probe.ps1` 在逻辑 1280×800 下跑 1.0/1.25/1.5/2.0，
+  物理分辨率 1280×800→2560×1600；粘贴按钮物理尺寸 42×76→84×152 精确按 ppp 缩放。
+- **真崩溃**：960×600@1.5 panic `min > max, min = 24.0, max = 17.0`，根因滚动条
+  `clamp(24.0, span)`，span<24 时违反 clamp 前提；已修并加 zoom_bar 退化矩形保护。
+- 边界：SC_PPP 是 egui 的缩放机制，未做真实系统缩放/多显示器；vision 服务超时，
+  没有人工视觉基线，只有像素差与尺寸核对。
+- app 341 passed。

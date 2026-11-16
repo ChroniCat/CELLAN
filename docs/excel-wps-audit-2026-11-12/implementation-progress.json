@@ -4193,13 +4193,17 @@
       "scope": "scripts/截图 + 图像基线",
       "source": "qa-requirements.md",
       "heading": "QA-05 P1 视觉基线与 DPI 覆盖",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
-      "commits": [],
+      "commits": [
+        "a3cd75f"
+      ],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "QA-05.1 待实施（1440/1024/760 基线）；QA-05.2 待验收（四档 DPI 已出图并量化，未做真实系统缩放）；QA-05.3 待实施。"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
@@ -4229,16 +4233,29 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "a3cd75f"
+          ],
+          "commands": [
+            "run_dpi_probe.ps1 ppp=1.0/1.25/1.5/2.0（逻辑 1280×800）-> 4 张 PNG，物理 1280×800/1600×1000/1920×1200/2560×1600",
+            "UIA dump 各 DPI -> 命名按钮 40/33/29/21（宽度收组），粘贴按钮物理尺寸 42×76→52×95→63×114→84×152",
+            "960×600@1.5 启动 panic（min 24 > max 17）-> 修 scrollbar thumb clamp 后正常出图"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/dpi5-1.5.png"
+          ],
+          "not_done": [
+            "未在真实系统 125/150/200% 缩放或多显示器间切换验证（RDP 不可做）。",
+            "没有人工视觉基线评审（vision 服务本轮超时），只有像素差与尺寸核对。",
+            "760×420 以下与工具栏溢出菜单未覆盖。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "补 QA-05.1 的 1440/1024/760 三档基线；再考虑真实系统缩放的机器侧复测。",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {
