@@ -826,6 +826,179 @@ pub fn a11y_role(
     });
 }
 
+/// UI-29.3：空/错误/警告/信息四种状态的颜色，来自 Fluent 的状态色而不是随手取的灰。
+pub fn state_color(kind: StateKind) -> Color32 {
+    match kind {
+        StateKind::Empty => Color32::from_rgb(138, 136, 134),
+        StateKind::Error => Color32::from_rgb(196, 43, 28),
+        StateKind::Warn => Color32::from_rgb(157, 93, 0),
+        StateKind::Info => ACCENT,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StateKind {
+    Empty,
+    Error,
+    Warn,
+    Info,
+}
+
+/// 空/错误状态的统一版式：图标 + 标题 + 说明，垂直居中。
+/// 为什么统一：此前「查找全部 0 处」「加载问题」各写一套 label，字号/颜色/留白都不同。
+pub fn state_view(
+    ui: &mut egui::Ui,
+    kind: StateKind,
+    icon: crate::ui_icons::Icon,
+    title: &str,
+    detail: &str,
+) -> egui::Response {
+    let color = state_color(kind);
+    ui.vertical_centered(|ui| {
+        ui.add_space(crate::tokens::space::XL);
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::splat(crate::tokens::icon::XL),
+            Sense::hover(),
+        );
+        crate::ui_icons::draw(ui.painter(), rect, icon, color);
+        ui.add_space(crate::tokens::space::L);
+        ui.label(
+            RichText::new(title)
+                .size(crate::tokens::text::TITLE)
+                .color(color),
+        );
+        if !detail.is_empty() {
+            ui.add_space(crate::tokens::space::XS);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(detail)
+                        .size(crate::tokens::text::SMALL)
+                        .color(TEXT_WEAK),
+                )
+                .wrap(),
+            );
+        }
+        ui.add_space(crate::tokens::space::XL);
+        resp
+    })
+    .inner
+}
+
+/// UI-29.3：左对齐的状态条（对话框顶部、面板顶部用）。左边一条 3px 状态色。
+pub fn state_banner(
+    ui: &mut egui::Ui,
+    kind: StateKind,
+    title: &str,
+    detail: &str,
+) -> egui::Response {
+    let color = state_color(kind);
+    let bg = match kind {
+        StateKind::Empty => Color32::from_rgb(250, 250, 250),
+        StateKind::Error => Color32::from_rgb(253, 242, 240),
+        StateKind::Warn => Color32::from_rgb(255, 249, 240),
+        StateKind::Info => Color32::from_rgb(240, 248, 243),
+    };
+    let resp = egui::Frame::NONE
+        .fill(bg)
+        .inner_margin(egui::Margin::symmetric(
+            crate::tokens::space::L as i8,
+            crate::tokens::space::M as i8,
+        ))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (bar, _) = ui.allocate_exact_size(
+                    Vec2::new(crate::tokens::stroke::HAIR * 3.0, 28.0),
+                    Sense::hover(),
+                );
+                ui.painter().rect_filled(bar, 0.0, color);
+                ui.add_space(crate::tokens::space::L);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .size(crate::tokens::text::BODY)
+                            .color(color)
+                            .strong(),
+                    );
+                    if !detail.is_empty() {
+                        ui.label(
+                            RichText::new(detail)
+                                .size(crate::tokens::text::SMALL)
+                                .color(TEXT_WEAK),
+                        );
+                    }
+                });
+            });
+        })
+        .response;
+    resp
+}
+
+/// UI-29.3：加载遮罩。屏幕整体压暗一层（不吃鼠标以外的输入），中间一张卡片：
+/// 旋转弧 + 标题 + 说明 + 可选进度条。`progress=None` 表示不确定进度。
+pub fn loading_overlay(ctx: &egui::Context, title: &str, detail: &str, progress: Option<f32>) {
+    let screen = ctx.screen_rect();
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading_overlay"));
+    let p = ctx.layer_painter(layer);
+    p.rect_filled(screen, 0.0, Color32::from_black_alpha(40));
+    let card = egui::Rect::from_center_size(
+        screen.center(),
+        Vec2::new(320.0, if progress.is_some() { 132.0 } else { 116.0 }),
+    );
+    p.rect_filled(card, crate::tokens::radius::LG, Color32::WHITE);
+    p.rect_stroke(
+        card,
+        crate::tokens::radius::LG,
+        Stroke::new(crate::tokens::stroke::HAIR, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    // 旋转弧：8 段，按时间推进透明度
+    let t = ctx.input(|i| i.time) as f32;
+    let c = egui::pos2(card.center().x, card.min.y + 30.0);
+    for i in 0..8 {
+        let ang = t * 3.0 + i as f32 * std::f32::consts::TAU / 8.0;
+        let a = 0.15 + 0.85 * ((i as f32 / 8.0 + t * 1.5).fract());
+        let col = ACCENT.gamma_multiply(a);
+        let dir = egui::vec2(ang.cos(), ang.sin());
+        p.circle_filled(c + dir * 11.0, 2.0, col);
+    }
+    p.text(
+        egui::pos2(card.center().x, card.min.y + 58.0),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(crate::tokens::text::TITLE),
+        TEXT,
+    );
+    if !detail.is_empty() {
+        p.text(
+            egui::pos2(card.center().x, card.min.y + 78.0),
+            Align2::CENTER_CENTER,
+            detail,
+            FontId::proportional(crate::tokens::text::SMALL),
+            TEXT_WEAK,
+        );
+    }
+    if let Some(v) = progress {
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(card.min.x + 24.0, card.max.y - 30.0),
+            Vec2::new(card.width() - 48.0, 6.0),
+        );
+        p.rect_filled(bar, 3.0, Color32::from_rgb(237, 235, 233));
+        let fill = egui::Rect::from_min_size(
+            bar.min,
+            Vec2::new(bar.width() * v.clamp(0.0, 1.0), bar.height()),
+        );
+        p.rect_filled(fill, 3.0, ACCENT);
+    }
+    // 遮罩吃掉点击，避免用户在加载中误触下面的按钮
+    let _ = egui::Area::new(egui::Id::new("loading_overlay_block"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
+        });
+    ctx.request_repaint();
+}
+
 /// 只拖动、不参与 Tab 焦点的 Sense（标题栏、缩放手柄、模态遮挡层都该用它）
 pub fn drag_only_sense() -> egui::Sense {
     egui::Sense::from_bits_truncate(

@@ -2946,6 +2946,8 @@ impl SheetApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tasks.open_rx = Some(rx);
         self.tasks.busy = true;
+        self.tasks.open_label = Some(path.display().to_string());
+        self.tasks.open_started = Some(std::time::Instant::now());
         self.status = format!("正在打开 {}…", path.display());
         std::thread::spawn(move || {
             let tx2 = tx.clone();
@@ -3133,14 +3135,24 @@ impl SheetApp {
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
+                // UI-29.3：统一状态条（错误红 / 警告琥珀），不再各写一个 colored_label
                 if fatal > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 60, 40),
-                        format!("这个工作簿没有完整读入：{} 处问题，其中 {fatal} 处会丢数据。", diag.problems.len()),
+                    ui_kit::state_banner(
+                        ui,
+                        ui_kit::StateKind::Error,
+                        "这个工作簿没有完整读入",
+                        &format!(
+                            "{} 处问题，其中 {fatal} 处会丢数据；已禁止覆盖保存，需要保留当前内容请用「另存抢救副本」",
+                            diag.problems.len()
+                        ),
                     );
-                    ui.label("已禁止覆盖保存；需要保留当前内容请用「另存抢救副本」。");
                 } else {
-                    ui.label(format!("打开时有 {} 处读取问题（不影响保存）。", diag.problems.len()));
+                    ui_kit::state_banner(
+                        ui,
+                        ui_kit::StateKind::Warn,
+                        "打开时有读取问题（不影响保存）",
+                        &format!("{} 处", diag.problems.len()),
+                    );
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -4473,6 +4485,8 @@ impl SheetApp {
         }
         if finished {
             self.tasks.open_rx = None;
+            self.tasks.open_label = None;
+            self.tasks.open_started = None;
         }
     }
 
@@ -21170,7 +21184,17 @@ let txn = self.txn_begin(&keys);
             .resizable(true)
             .default_width(300.0)
             .show(ctx, |ui| {
-                ui.label(format!("共 {} 处（点击定位）", all.len()));
+                if all.is_empty() {
+                    ui_kit::state_view(
+                        ui,
+                        ui_kit::StateKind::Empty,
+                        crate::ui_icons::Icon::Find,
+                        "没有找到匹配内容",
+                        "换个关键字，或检查「区分大小写 / 单元格匹配」",
+                    );
+                } else {
+                    ui.label(format!("共 {} 处（点击定位）", all.len()));
+                }
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (i, h) in all.iter().take(500).enumerate() {
                         let sheet = self
@@ -30422,6 +30446,65 @@ impl eframe::App for SheetApp {
                     format!("{icon:?}"),
                     egui::FontId::proportional(9.0),
                     egui::Color32::from_gray(110),
+                );
+            }
+        }
+        // 探针：SC_DEMO_OVERLAY=1 时注入一次「正在打开」状态，用来截遮罩的图；
+        // 只在无界面取证时用，不影响正常路径。
+        if std::env::var("SC_DEMO_OVERLAY").is_ok() && self.tasks.open_label.is_none() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                let (_tx, rx) = std::sync::mpsc::channel();
+                self.tasks.open_rx = Some(rx);
+                self.tasks.busy = true;
+                self.tasks.open_label = Some("demo.xlsx".to_string());
+                self.tasks.open_started = Some(std::time::Instant::now());
+            }
+        }
+        if std::env::var("SC_FIND_ALL_EMPTY").is_ok() && !self.find.find_all_open {
+            static ONCE2: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE2.set(()).is_ok() {
+                self.find.find_all_open = true;
+                self.find.find_all.clear();
+            }
+        }
+        // UI-29.3：加载/重算遮罩。Esc 取消重算的按键处理在遮罩之前，所以遮罩不挡取消。
+        if self.tasks.busy && self.tasks.open_rx.is_some() {
+            if let Some(label) = self.tasks.open_label.clone() {
+                let secs = self
+                    .tasks
+                    .open_started
+                    .map(|t| t.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                ui_kit::loading_overlay(
+                    ctx,
+                    "正在打开",
+                    &format!("{label}（已等待 {secs:.1}s）"),
+                    None,
+                );
+            } else {
+                let done = self
+                    .tasks
+                    .recalc_done
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let total = self
+                    .tasks
+                    .recalc_total
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let p = if total > 0 {
+                    Some(done as f32 / total as f32)
+                } else {
+                    None
+                };
+                ui_kit::loading_overlay(
+                    ctx,
+                    "正在重算",
+                    &format!("{done} / {total} 个公式，Esc 取消"),
+                    p,
                 );
             }
         }

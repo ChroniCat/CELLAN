@@ -9430,3 +9430,192 @@ fn debug_icon_shape_dump() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// UI-29.3 空/错误/加载状态：组件本身 + 真实调用点
+// ---------------------------------------------------------------------------
+
+fn collect_texts(shapes: &[egui::Shape]) -> Vec<(String, egui::Color32)> {
+    fn rec(s: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match s {
+            egui::Shape::Text(t) => {
+                let color = t
+                    .override_text_color
+                    .or_else(|| t.galley.job.sections.first().map(|x| x.format.color))
+                    .unwrap_or(egui::Color32::PLACEHOLDER);
+                out.push((t.galley.text().to_string(), color));
+            }
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    rec(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in shapes {
+        rec(s, &mut out);
+    }
+    out
+}
+
+fn collect_fills(shapes: &[egui::Shape]) -> Vec<(egui::Rect, egui::Color32)> {
+    fn rec(s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match s {
+            egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT => out.push((r.rect, r.fill)),
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    rec(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in shapes {
+        rec(s, &mut out);
+    }
+    out
+}
+
+#[test]
+fn state_view_paints_title_detail_and_kind_color() {
+    let ctx = egui::Context::default();
+    ctx.set_visuals(egui::Visuals::light());
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(420.0, 320.0),
+    ));
+    let out = ctx.run(raw, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            crate::ui_kit::state_view(
+                ui,
+                crate::ui_kit::StateKind::Error,
+                crate::ui_icons::Icon::Find,
+                "没有找到匹配内容",
+                "换个关键字",
+            );
+        });
+    });
+    let texts = collect_texts(&out.shapes.iter().map(|c| c.shape.clone()).collect::<Vec<_>>());
+    assert!(texts.iter().any(|(t, _)| t.contains("没有找到匹配内容")), "标题没画出来: {texts:?}");
+    assert!(texts.iter().any(|(t, _)| t.contains("换个关键字")), "说明没画出来");
+    let want = crate::ui_kit::state_color(crate::ui_kit::StateKind::Error);
+    assert!(
+        texts.iter().any(|(t, c)| t.contains("没有找到匹配内容") && *c == want),
+        "标题没有用错误色"
+    );
+    // 三种状态的颜色必须两两不同，否则「可分辨」是假的
+    let e = crate::ui_kit::state_color(crate::ui_kit::StateKind::Error);
+    let w = crate::ui_kit::state_color(crate::ui_kit::StateKind::Warn);
+    let m = crate::ui_kit::state_color(crate::ui_kit::StateKind::Empty);
+    assert_ne!(e, w);
+    assert_ne!(e, m);
+    assert_ne!(w, m);
+}
+
+#[test]
+fn state_banner_shows_title_and_kind_background() {
+    let ctx = egui::Context::default();
+    ctx.set_visuals(egui::Visuals::light());
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(560.0, 220.0),
+    ));
+    let out = ctx.run(raw, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            crate::ui_kit::state_banner(
+                ui,
+                crate::ui_kit::StateKind::Warn,
+                "打开时有读取问题（不影响保存）",
+                "3 处",
+            );
+        });
+    });
+    let shapes: Vec<egui::Shape> = out.shapes.iter().map(|c| c.shape.clone()).collect();
+    let texts = collect_texts(&shapes);
+    assert!(
+        texts.iter().any(|(t, _)| t.contains("打开时有读取问题")),
+        "状态条标题没画出来"
+    );
+    let fills = collect_fills(&shapes);
+    assert!(
+        fills.iter().any(|(_, c)| *c == egui::Color32::from_rgb(255, 249, 240)),
+        "状态条没有用警告底色: {fills:?}"
+    );
+    assert!(
+        fills
+            .iter()
+            .any(|(_, c)| *c == crate::ui_kit::state_color(crate::ui_kit::StateKind::Warn)),
+        "状态条左侧色条缺失"
+    );
+}
+
+#[test]
+fn loading_overlay_draws_scrim_card_and_half_progress() {
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(800.0, 600.0),
+    ));
+    let out = ctx.run(raw, |ctx| {
+        crate::ui_kit::loading_overlay(ctx, "正在重算", "50 / 100 个公式，Esc 取消", Some(0.5));
+    });
+    let shapes: Vec<egui::Shape> = out.shapes.iter().map(|c| c.shape.clone()).collect();
+    let texts = collect_texts(&shapes);
+    assert!(texts.iter().any(|(t, _)| t.contains("正在重算")));
+    assert!(texts.iter().any(|(t, _)| t.contains("50 / 100")));
+    let fills = collect_fills(&shapes);
+    // 压暗层（半透明黑）
+    assert!(
+        fills.iter().any(|(_, c)| *c == egui::Color32::from_black_alpha(40)),
+        "没有画遮罩底"
+    );
+    // 白卡片
+    let card = fills
+        .iter()
+        .find(|(r, c)| *c == egui::Color32::WHITE && r.width() > 300.0 && r.height() > 100.0);
+    assert!(card.is_some(), "没有白卡片");
+    // 进度条填充：绿色、宽度约为轨道一半
+    let track = fills
+        .iter()
+        .find(|(r, c)| *c == egui::Color32::from_rgb(237, 235, 233) && r.height() <= 6.0);
+    let track = track.expect("没有进度条轨道");
+    let fill = fills
+        .iter()
+        .find(|(r, c)| *c == crate::ui_kit::ACCENT && r.height() <= 6.0)
+        .expect("没有进度填充");
+    let ratio = fill.0.width() / track.0.width();
+    assert!((ratio - 0.5).abs() < 0.05, "进度条比例 {ratio} 不是 0.5");
+}
+
+#[test]
+fn find_all_window_with_no_hits_shows_empty_state() {
+    let ctx = egui::Context::default();
+    ctx.set_visuals(egui::Visuals::light());
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.find.find_all_open = true;
+    app.find.find_all.clear();
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(900.0, 700.0),
+    ));
+    // egui 的 Window 第一帧只量尺寸（shape 全是 Noop），第二帧才真正画出来
+    let _warm = ctx.run(raw.clone(), |ctx| {
+        app.find_all_window(ctx);
+    });
+    let out = ctx.run(raw, |ctx| {
+        app.find_all_window(ctx);
+    });
+    let texts = collect_texts(&out.shapes.iter().map(|c| c.shape.clone()).collect::<Vec<_>>());
+    assert!(
+        texts.iter().any(|(t, _)| t.contains("没有找到匹配内容")),
+        "查找全部 0 处时没有走空状态: {texts:?}"
+    );
+}
+

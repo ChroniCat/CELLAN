@@ -21,6 +21,9 @@ pub(crate) struct DocumentTasks {
     pub recalc_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub recalc_done: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub recalc_total: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// UI-29.3：加载遮罩上显示的文件名与起始时刻（打开完成即清空）
+    pub open_label: Option<String>,
+    pub open_started: Option<Instant>,
 }
 
 pub(crate) struct PendingSave {
