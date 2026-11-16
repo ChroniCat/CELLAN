@@ -1,5 +1,26 @@
 # 恢复记录
 
+## 2026-11-16 检查点：UI-25 隐藏行列统计口径统一（Excel UIA 实测）、UI-11 公式辅助首批
+
+- 代码 HEAD `61c9b67` 已 push（UI-25 `fac2b22` + UI-11 `61c9b67`，本文件随后单独提交）。
+  单 cargo `-j 2`，测试 `--test-threads=2`。
+- 台账：**24 已验收 / 61**（数字不变）、27 待验收、3 实施中（QA-01、C12、UI-11）、7 待实施。
+- 测试：app `--bin app` **308 passed / 0 failed / 0 ignored**（`work/goal-logs/ui25-app-full.log`）。
+- **UI-25（仍待验收）**：最大缺口是统计只看筛选隐藏行，右键「隐藏行/隐藏列」写的
+  `hidden_rows_user` / `hidden_cols` 没进统计。用本机 Excel 16.0 状态栏 UIA 实测定口径：
+  **隐藏行（手动/筛选/分级折叠）不计，隐藏列仍计入**；计数含文本、数值项只吃数字。
+  新增 `stats_hidden_rows()` 作为唯一行过滤来源，删掉「列宽 0 就跳过」的错误判断；
+  大选区/普通两条状态栏路径共用同一入口。应用三组实测与 Excel 逐项一致
+  （2.3333/4/7、隐藏第 2 行 2.5/3/5、隐藏 B 列 50.5/2/101）。
+  证据 `implementation-evidence/ui25-hidden-marker.txt` + `ui25-probe/*.ps1`。
+  not_done：真实鼠标右键隐藏未执行、百万行密集选区未压测。
+- **UI-11（实施中，未验收）**：`=SU` 出 SUM/SUMIF 候选（↑↓/Tab/Enter）、`=SUM(` 参数签名、
+  F4 四态循环只动末尾引用、Alt+Enter 改多行 TextEdit 按光标插入；
+  接受候选后显式把光标搬到末尾（否则插进函数名中间）。证据 `ui11-formula-help.txt`。
+  未做：编辑中点选建立引用、引用彩色、函数向导/最近使用、真实 IME 候选。
+- 仍未关闭的父项与上一检查点相同；下一优先：C12.4 真 pivotTable、QA-01 父项矩阵、
+  UI-11.3/11.4、UI-24 可访问性。
+
 ## 2026-11-14 检查点：UI-23 KeyTips/右键键盘，UI-08/09 待验收
 
 - 代码 HEAD `fb2ed65` 已 push（UI-23 实现 `ba1c22c` + 证据提交）。

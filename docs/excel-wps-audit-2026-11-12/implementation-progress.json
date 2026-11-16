@@ -5032,17 +5032,32 @@
       "scope": "app/main.rs编辑会话 + 函数提示模块",
       "source": "ui-requirements.md",
       "heading": "UI-11 公式输入辅助和编辑焦点",
-      "status": "待实施",
-      "acceptance": "",
-      "files": [],
-      "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "status": "实施中",
+      "acceptance": "输入=SU有SUM/SUMIF等可键盘选择；=SUM(显示参数；编辑=A1时点B2变成引用而非意外提交；A1→$A$1→A$1→$A1→A1；中文候选Enter只确认候选；文本中间Alt+Enter插入原光标处。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
+      "commits": [
+        "61c9b67"
+      ],
+      "commands": [
+        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed / 0 failed",
+        "cargo build -p app --offline -j 2 --no-default-features --features glow -> BUILD_EXIT=0"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+      ],
+      "not_done": [
+        "=A1 编辑中点 B2 建立引用未实现",
+        "引用彩色高亮未实现",
+        "函数向导与真实最近使用未实现（UI-11.4）",
+        "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "UI-11.3 引用拾取与彩色引用；UI-11.4 函数向导/最近使用",
+      "updated_utc": "2026-11-16T07:13:43Z",
       "slices": [
         {
           "id": "UI-11.1",
@@ -5050,17 +5065,27 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "实施中",
+          "acceptance": "缓冲唯一所有者；Enter/Tab/Shift 回车、Esc、F2、公式栏、点其它格、切表、名称框、保存、关窗统一提交/取消；文本中间 Alt+Enter 按光标插入；中文 IME 不提前提交。",
+          "files": [
+            "crates/app/src/main.rs"
+          ],
+          "commits": [
+            "61c9b67"
+          ],
+          "commands": [
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+          ],
+          "not_done": [
+            "Alt+Enter 已按光标插入（多行 TextEdit）；中文 IME 候选确认未实测"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "真实 IME 提交路径随 QA-04 一起验",
+          "updated_utc": "2026-11-16T07:13:43Z"
         },
         {
           "id": "UI-11.2",
@@ -5068,17 +5093,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "实施中",
+          "acceptance": "输入 =SU 出 SUM/SUMIF 等候选并可键盘选择；=SUM( 显示参数签名；候选接受后光标在末尾。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "61c9b67"
+          ],
+          "commands": [
+            "cargo test -p app --offline -j 2 --bin app -- formula_autocomplete_and_f4 --test-threads=2 -> 1 passed"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+          ],
+          "not_done": [
+            "候选只来自 functions::implemented()，未做分类/模糊搜索",
+            "真实键盘上下键未实测"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "补函数分类与模糊匹配",
+          "updated_utc": "2026-11-16T07:13:43Z"
         },
         {
           "id": "UI-11.3",
@@ -5086,17 +5123,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "实施中",
+          "acceptance": "编辑 =A1 时点 B2 变成引用而非意外提交；A1→$A$1→A$1→$A1→A1；引用彩色显示。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
+          "commits": [
+            "61c9b67"
+          ],
+          "commands": [
+            "cargo test -p app --offline -j 2 --bin app -- formula_autocomplete_and_f4 --test-threads=2 -> 1 passed（F4 四态 + 只动末尾引用）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+          ],
+          "not_done": [
+            "点选单元格建立引用未实现",
+            "引用彩色高亮未实现"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "实现点选拾取与引用着色",
+          "updated_utc": "2026-11-16T07:13:43Z"
         },
         {
           "id": "UI-11.4",
@@ -6730,16 +6779,38 @@
       "source": "ui-requirements.md",
       "heading": "UI-25 状态栏统计准确并可配置",
       "status": "待验收",
-      "acceptance": "",
-      "files": [],
-      "commits": [],
-      "commands": [],
-      "evidence": [],
-      "not_done": [],
+      "acceptance": "A1=1,A2=空,A3=文本,A4=3，各指标与 Excel 基准一致；A1和A4非连续选区sum=4；过滤前后规则一致；百万行少量实际值统计不卡UI。**隐藏行列口径按本机 Excel 16.0 UIA 实测**：隐藏行（手动 hidden_rows_user / 分级 hidden_rows / 筛选）不计，隐藏列 hidden_cols 仍计入；应用实测 A1:A4(1,2,x,4) 基准 2.3333/4/7、隐藏第2行后 2.5/3/5、隐藏B列选A1:B1 50.5/2/101，与 Excel 逐项一致。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
+      "commits": [
+        "fac2b22"
+      ],
+      "commands": [
+        "cargo test -p app --offline -j 2 --bin app -- status_stats ui25_context_menu_hidden --test-threads=2 -> 4 passed / 0 failed",
+        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed / 0 failed / 0 ignored",
+        "powershell ui25-excel-uia2.ps1 -> Excel 16.0 状态栏：基准 2.333333333/4/7、手动隐藏行 2.5/3/5、隐藏B列 50.5/2/101、分级折叠行 7/1/7",
+        "app.exe + SC_HIDE_ROWS=2 / SC_HIDE_COLS=2 + SC_STAT_DUMP -> 与 Excel 三组数字逐项一致"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-hidden-marker.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-probe/ui25-excel-uia.ps1",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-probe/ui25-excel-uia2.ps1",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-stats.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png"
+      ],
+      "not_done": [
+        "真实鼠标 Ctrl 多选/右键点「隐藏行」未执行（RDP 注入不可用）；入口用同一 CtxAct 分发覆盖",
+        "百万行密集选区分帧耗时未压测（仅百万行稀疏表）",
+        "筛选与手动隐藏重叠同一行时无法与 Excel 区分归因，按集合并集去重（结果口径一致）"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T23:32:57Z",
+      "next": "等复核；如需继续，补真实鼠标右键与百万行密集压测",
+      "updated_utc": "2026-11-16T07:13:43Z",
       "slices": [
         {
           "id": "UI-25.1",
@@ -6748,28 +6819,38 @@
           "acceptance_source": "ui-requirements.md / UI-25 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "",
+          "acceptance": "A1=1,A2=空,A3=文本,A4=3，各指标与 Excel 基准一致；A1和A4非连续选区sum=4；过滤前后规则一致；百万行少量实际值统计不卡UI。**隐藏行列口径按本机 Excel 16.0 UIA 实测**：隐藏行（手动 hidden_rows_user / 分级 hidden_rows / 筛选）不计，隐藏列 hidden_cols 仍计入；应用实测 A1:A4(1,2,x,4) 基准 2.3333/4/7、隐藏第2行后 2.5/3/5、隐藏B列选A1:B1 50.5/2/101，与 Excel 逐项一致。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
-          "commits": [],
-          "commands": [],
+          "commits": [
+            "fac2b22"
+          ],
+          "commands": [
+            "cargo test -p app --offline -j 2 --bin app -- status_stats ui25_context_menu_hidden --test-threads=2 -> 4 passed / 0 failed",
+            "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 308 passed / 0 failed / 0 ignored",
+            "powershell ui25-excel-uia2.ps1 -> Excel 16.0 状态栏：基准 2.333333333/4/7、手动隐藏行 2.5/3/5、隐藏B列 50.5/2/101、分级折叠行 7/1/7",
+            "app.exe + SC_HIDE_ROWS=2 / SC_HIDE_COLS=2 + SC_STAT_DUMP -> 与 Excel 三组数字逐项一致"
+          ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-hidden-marker.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-probe/ui25-excel-uia.ps1",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-probe/ui25-excel-uia2.ps1",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-stats.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png"
           ],
           "not_done": [
-            "真实鼠标 Ctrl 多选/右键菜单点选未做（RDP 注入不可用）",
-            "百万行密集选区分帧耗时未压测",
-            "手动隐藏与筛选隐藏同时存在的规则未与 Excel 逐项对拍"
+            "真实鼠标 Ctrl 多选/右键点「隐藏行」未执行（RDP 注入不可用）；入口用同一 CtxAct 分发覆盖",
+            "百万行密集选区分帧耗时未压测（仅百万行稀疏表）",
+            "筛选与手动隐藏重叠同一行时无法与 Excel 区分归因，按集合并集去重（结果口径一致）"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T23:32:57Z"
+          "next": "等复核；如需继续，补真实鼠标右键与百万行密集压测",
+          "updated_utc": "2026-11-16T07:13:43Z"
         }
       ]
     }
