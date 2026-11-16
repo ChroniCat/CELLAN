@@ -4437,12 +4437,13 @@
       "acceptance": "",
       "files": [],
       "commits": [
-        "acb5f87"
+        "acb5f87",
+        "d23d407"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-07.1/07.2 实施中（首次基线已冻结）；QA-07.3 待实施。"
+        "QA-07.1 实施中（基线已冻结，缺冷启动与 CPU update 单列）；QA-07.2 待验收；QA-07.3 待实施。"
       ],
       "failures": [],
       "blocker": "",
@@ -4486,26 +4487,29 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [],
           "commits": [
-            "acb5f87"
+            "acb5f87",
+            "d23d407"
           ],
           "commands": [
             "SC_PERF_DIR=work/probe/qa07 target/release/examples/perf_probe.exe --suite -> 9 组样本（work/probe/qa07/suite4-postfix.jsonl）",
-            "SC_LOAD_PROF=1 + SC_SHOT/SC_SHOT_EXIT 跑 release app，5 次取 p50/p95（first_frame 0.64s，1M 值可编辑 4.09s）"
+            "SC_LOAD_PROF=1 + SC_SHOT/SC_SHOT_EXIT 跑 release app，5 次取 p50/p95（first_frame 0.64s，1M 值可编辑 4.09s）",
+            "SC_SCROLL_PROBE=1 SC_SCROLL_EXIT=1 跑 release app，120 帧：values 1M 帧间隔 p50 20.13/p95 30.25ms；chain 1M 29.33/30.25ms；sparse 1M 16.66/16.77ms"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt",
+            "work/probe/qa07/scroll2-values-1000000.log"
           ],
           "not_done": [
-            "滚动输入到呈现的 p50/p95 未测（需注入滚轮/键盘事件并逐帧打点）。",
-            "保存/重算期间窗口可操作与进度反馈未做交互验证（与 QA-07.3 一起）。"
+            "滚动是程序改滚动位置，未经 OS 滚轮事件投递；GPU 呈现完成时刻未测。",
+            "保存/重算期间窗口可操作与进度反馈未验（QA-07.3）。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "补滚动帧时延探针（注入滚动 + 逐帧打点），再补保存期交互。",
+          "next": "等复核；若要补 OS 级滚轮链路，需真实注入鼠标事件。",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {

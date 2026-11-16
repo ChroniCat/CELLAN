@@ -471,3 +471,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 阈值已冻结进 `qa-requirements.md` QA-07 验收段（含退化上限），证据 `qa07-first-baseline.txt`。
 - 测试：core **106** 二进制 0 failed、app **337 passed**。
 - 未做（不记通过）：滚动→呈现 p50/p95、冷启动（清系统缓存）、保存期间可操作性。
+
+### 检查点二十：QA-07.2 滚动帧时延
+- `d23d407`：`SC_SCROLL_PROBE=1` 装载完成后连续 120 帧每帧下移 60px 并 `request_repaint()`，
+  同时记「注入→下一帧开始（含呈现/vsync）」与「本帧 update() 墙钟」。
+- 结果：values 100k 16.65/16.97ms；values 1M 20.13/30.25ms；chain 1M 29.33/30.25ms；sparse 1M 16.66/16.77ms。
+- **踩坑**：第一版没 `request_repaint()` → 每帧 ~500ms，那是 eframe 等事件的空闲等待，
+  不是渲染耗时。这条已写进证据，避免把「等事件」误当「滚动卡」。
+- 阈值追加进 `qa-requirements.md`（滚动帧间隔 p95 30.25ms，上限 36ms）。
+- 口径边界：程序改滚动位置，非 OS 滚轮事件；不含 GPU 呈现完成时刻。QA-07.2 置「待验收」。
