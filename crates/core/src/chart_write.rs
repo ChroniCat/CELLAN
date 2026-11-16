@@ -821,6 +821,25 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
 }
 
 /// 把某张表第 ordinal 个图表的锚点写回 drawing 部件
+fn anchor_cells(xml: &str) -> (Vec<u32>, Vec<u32>) {
+    fn nums(xml: &str, tag: &str) -> Vec<u32> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(i) = xml[from..].find(&open) {
+            let s = from + i + open.len();
+            let Some(j) = xml[s..].find(&close) else { break };
+            if let Ok(v) = xml[s..s + j].trim().parse::<u32>() {
+                out.push(v);
+            }
+            from = s + j + close.len();
+        }
+        out
+    }
+    (nums(xml, "col"), nums(xml, "row"))
+}
+
 pub fn write_anchor(
     path: &Path,
     drawing_part: &str,
@@ -835,6 +854,11 @@ pub fn write_anchor(
         f.read_to_string(&mut xml)?;
     }
     let edited = rewrite_anchor_xml(&xml, ordinal, anchor);
+    // 锚点单元格没变就别重写：重写会把原来的 xdr:ext（精确尺寸）换成按单元格推的尺寸，
+    // WPS 侧会读成 191 -> 202 这种高度漂移（chart-ext resave 实测）。
+    if !edited.is_empty() && anchor_cells(&edited) == anchor_cells(&xml) {
+        return Ok(());
+    }
     if edited != xml {
         crate::patch::rewrite_zip(path, |name, buf| {
             if name == drawing_part {
