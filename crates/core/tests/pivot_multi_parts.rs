@@ -382,6 +382,53 @@ fn show_as_percentages_match_excel_semantics() {
 }
 
 #[test]
+fn show_as_difference_percent_diff_and_index_match_excel() {
+    use sheetcore::pivot_multi::ShowAs;
+    let fx = Fixture::new("showas2");
+    let path = fx.file("showas2.xlsx");
+    let mut wb = book(&path);
+    let mk = |sa: ShowAs| PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sa }],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    };
+    // 华北行 = A60 / B60（行合计 120）；A 列合计 100、B 列合计 110；全表 210
+    let cell = |g: &sheetcore::pivot_multi::PivotGrid, r: usize, c: usize| g.rows[r][g.row_depth + c].clone();
+
+    let d = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(ShowAs::DifferencePrev));
+    assert_eq!(cell(&d, 0, 0), sheetcore::Value::Empty, "第一列没有上一项");
+    assert_eq!(cell(&d, 0, 1), sheetcore::Value::Number(0.0), "60-60");
+
+    let pd = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(ShowAs::PercentDifferencePrev));
+    assert_eq!(cell(&pd, 0, 0), sheetcore::Value::Empty);
+    match cell(&pd, 0, 1) {
+        sheetcore::Value::Number(n) => assert!(n.abs() < 1e-12),
+        v => panic!("应为 0，实际 {v:?}"),
+    }
+
+    let ix = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(ShowAs::Index));
+    match cell(&ix, 0, 0) {
+        // 60 × 210 ÷ (120 × 100) = 1.05
+        sheetcore::Value::Number(n) => assert!((n - 1.05).abs() < 1e-12, "{n}"),
+        v => panic!("索引应为数字，实际 {v:?}"),
+    }
+
+    // XML：差/索引不带 numFmtId，差%带
+    let _ = attach(&path, &mut wb, &mk(ShowAs::Index));
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        z.by_name("xl/pivotTables/pivotTable1.xml").unwrap().read_to_string(&mut xml).unwrap();
+    }
+    assert!(xml.contains("showDataAs=\"index\""), "{xml}");
+    assert!(!xml.contains("numFmtId=\"10\""), "索引不该套百分比格式：{xml}");
+}
+
+#[test]
 fn show_as_labels_and_xml_names_are_stable() {
     use sheetcore::pivot_multi::ShowAs;
     assert_eq!(ShowAs::Normal.xml(), None);
@@ -393,4 +440,13 @@ fn show_as_labels_and_xml_names_are_stable() {
     assert_eq!(ShowAs::PercentOfRow.label(), "占行合计%");
     assert_eq!(ShowAs::PercentOfColumn.label(), "占列合计%");
     assert_eq!(ShowAs::PercentOfTotal.label(), "占总计%");
+    assert_eq!(ShowAs::DifferencePrev.xml(), Some("difference"));
+    assert_eq!(ShowAs::PercentDifferencePrev.xml(), Some("percent"));
+    assert_eq!(ShowAs::Index.xml(), Some("index"));
+    assert_eq!(ShowAs::DifferencePrev.label(), "与上一项差");
+    assert_eq!(ShowAs::PercentDifferencePrev.label(), "与上一项差%");
+    assert_eq!(ShowAs::Index.label(), "索引");
+    assert!(ShowAs::PercentDifferencePrev.percent_format());
+    assert!(!ShowAs::DifferencePrev.percent_format());
+    assert!(!ShowAs::Index.percent_format());
 }

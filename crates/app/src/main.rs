@@ -22078,6 +22078,9 @@ let txn = self.txn_begin(&keys);
                                     sheetcore::pivot_multi::ShowAs::PercentOfRow,
                                     sheetcore::pivot_multi::ShowAs::PercentOfColumn,
                                     sheetcore::pivot_multi::ShowAs::PercentOfTotal,
+                                    sheetcore::pivot_multi::ShowAs::DifferencePrev,
+                                    sheetcore::pivot_multi::ShowAs::PercentDifferencePrev,
+                                    sheetcore::pivot_multi::ShowAs::Index,
                                 ] {
                                     if ui
                                         .selectable_label(spec.values[i].show_as == sa, sa.label())

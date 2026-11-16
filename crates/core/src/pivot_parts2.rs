@@ -394,7 +394,11 @@ pub fn build(
             };
             // 显示值方式：Excel 写 showDataAs + numFmtId=10（0.00%）
             let show = match v.show_as.xml() {
-                Some(x) => format!(" showDataAs=\"{x}\" numFmtId=\"10\""),
+                // 只有百分比类才写 numFmtId="10"，差/索引与 Excel 一致地不写
+                Some(x) if v.show_as.percent_format() => {
+                    format!(" showDataAs=\"{x}\" numFmtId=\"10\"")
+                }
+                Some(x) => format!(" showDataAs=\"{x}\""),
                 None => String::new(),
             };
             format!(

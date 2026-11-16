@@ -29,6 +29,12 @@ pub enum ShowAs {
     PercentOfRow,
     PercentOfColumn,
     PercentOfTotal,
+    /// 与上一项（同一行里前一列）的差
+    DifferencePrev,
+    /// 与上一项的百分比差
+    PercentDifferencePrev,
+    /// Excel 的「索引」：(值 × 总计) ÷ (行合计 × 列合计)
+    Index,
 }
 
 impl ShowAs {
@@ -39,7 +45,21 @@ impl ShowAs {
             ShowAs::PercentOfRow => Some("percentOfRow"),
             ShowAs::PercentOfColumn => Some("percentOfColumn"),
             ShowAs::PercentOfTotal => Some("percentOfTotal"),
+            ShowAs::DifferencePrev => Some("difference"),
+            ShowAs::PercentDifferencePrev => Some("percent"),
+            ShowAs::Index => Some("index"),
         }
+    }
+
+    /// 这类显示值要不要套百分比格式（Excel 只给百分比类写 numFmtId="10"）
+    pub fn percent_format(self) -> bool {
+        matches!(
+            self,
+            ShowAs::PercentOfRow
+                | ShowAs::PercentOfColumn
+                | ShowAs::PercentOfTotal
+                | ShowAs::PercentDifferencePrev
+        )
     }
 
     /// 界面上的中文名
@@ -49,6 +69,9 @@ impl ShowAs {
             ShowAs::PercentOfRow => "占行合计%",
             ShowAs::PercentOfColumn => "占列合计%",
             ShowAs::PercentOfTotal => "占总计%",
+            ShowAs::DifferencePrev => "与上一项差",
+            ShowAs::PercentDifferencePrev => "与上一项差%",
+            ShowAs::Index => "索引",
         }
     }
 }
@@ -393,6 +416,15 @@ fn as_num(v: &Value) -> f64 {
     }
 }
 
+/// 分母为 0 时留空，与 Excel 一致
+fn ratio(v: f64, denom: f64) -> Value {
+    if denom.abs() > f64::EPSILON {
+        Value::Number(v / denom)
+    } else {
+        Value::Empty
+    }
+}
+
 /// 按 Excel 的 showDataAs 语义把聚合值换成比值（存 0.6 而不是 60，格式靠 numFmtId=10）
 fn apply_show_as(grid: &mut PivotGrid, spec: &PivotSpec2) {
     let rd = spec.rows.len();
@@ -414,24 +446,32 @@ fn apply_show_as(grid: &mut PivotGrid, spec: &PivotSpec2) {
         }
         let total: f64 = col_tot.iter().sum();
         for r in 0..grid.rows.len() {
-            let mut row_sum = 0.0;
-            for c in 0..ncols {
-                row_sum += as_num(&grid.rows[r][rd + c * vc + vi]);
-            }
+            let raw: Vec<f64> = (0..ncols)
+                .map(|c| as_num(&grid.rows[r][rd + c * vc + vi]))
+                .collect();
+            let row_sum: f64 = raw.iter().sum();
+            let mut prev: Option<f64> = None;
             for c in 0..ncols {
                 let idx = rd + c * vc + vi;
-                let v = as_num(&grid.rows[r][idx]);
-                let denom = match mode {
-                    ShowAs::PercentOfRow => row_sum,
-                    ShowAs::PercentOfColumn => col_tot[c],
-                    ShowAs::PercentOfTotal => total,
-                    ShowAs::Normal => 1.0,
+                let v = raw[c];
+                let new = match mode {
+                    ShowAs::PercentOfRow => ratio(v, row_sum),
+                    ShowAs::PercentOfColumn => ratio(v, col_tot[c]),
+                    ShowAs::PercentOfTotal => ratio(v, total),
+                    // 上一项差 / 上一项差% / 索引：第一列没有「上一项」，按 Excel 留空
+                    ShowAs::DifferencePrev => match prev {
+                        Some(p) => Value::Number(v - p),
+                        None => Value::Empty,
+                    },
+                    ShowAs::PercentDifferencePrev => match prev {
+                        Some(p) => ratio(v - p, p.abs()),
+                        None => Value::Empty,
+                    },
+                    ShowAs::Index => ratio(v * total, row_sum * col_tot[c]),
+                    ShowAs::Normal => Value::Number(v),
                 };
-                grid.rows[r][idx] = if denom.abs() > f64::EPSILON {
-                    Value::Number(v / denom)
-                } else {
-                    Value::Empty
-                };
+                grid.rows[r][idx] = new;
+                prev = Some(v);
             }
         }
     }

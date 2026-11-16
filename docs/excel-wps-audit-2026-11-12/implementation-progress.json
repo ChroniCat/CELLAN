@@ -3416,7 +3416,9 @@
             "cargo test -p sheetcore --test pivot_multi_parts -> 9 passed（含 show_as 三模式）",
             "Excel 回读 showas-ours.xlsx -> pivots=1 calc=8 fmt=0.00%",
             "cargo test -p sheetcore --test pivot_multi_parts -> 10 passed",
-            "cargo test -p app --bin app -> 361 passed"
+            "cargo test -p app --bin app -> 361 passed",
+            "cargo test -p sheetcore --test pivot_multi_parts -> 11 passed",
+            "cargo test -p app --bin app -> 364 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt",
@@ -3469,12 +3471,12 @@
             "布局开关已端到端：界面 layout.tabular → pivot_multi 排布 → pivot_parts2 的 compact/outline 属性；compact-multi.xlsx Excel 读取正常。待查：Excel 报 data=1 而 spec 有 2 个值字段。",
             "计算字段/计算项未做。",
             "显示值方式界面已接线（值字段行第三个下拉：值/占行合计%/占列合计%/占总计%），待真人点击验收（无桌面截图）。",
-            "显示值方式核心+界面已完成；baseField/baseItem（差异/累计/基于某项）未做；计算字段/计算项未做。"
+            "显示值方式：占行/列/总计%、与上一项差、与上一项差%、索引 均已实现并按 Excel XML 口径输出（百分比类才写 numFmtId=10）；baseField/baseItem 非默认基准未做。"
           ],
           "failures": [],
           "blocker": "",
           "next": "C12 四切片齐；等用户按生产口径复核",
-          "updated_utc": "2026-11-16T20:39:43Z"
+          "updated_utc": "2026-11-16T20:53:21Z"
         }
       ]
     },
