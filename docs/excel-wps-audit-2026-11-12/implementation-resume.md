@@ -651,3 +651,10 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   `[Red]` 被当字面、mmm/ddd 无月名、零段 `"零"` 被排成 `0`。
 - 坑：`qa06_excel_probe.ps1` 的 Open 不认相对路径（0x800A03EC 伪装成夹具损坏）；TEXT 字面文本要双引号加倍。
 - 回归：core 106 个测试二进制全 ok（`qa063-core.log`），app 361 passed（`qa063-app.log`）。
+
+### 检查点四十：QA-06.2 溢出冲突进矩阵
+- 夹具加 3 条溢出冲突（E130/E140/E150 + 占位 E132/E141/F150），探针两段导出
+  `spill_conflict.tsv`（Excel 中文版显示 `#溢出!`、HasSpill=False）与 `spill_cleared.tsv`。
+- 新增 `qa06_2_spill_conflict_and_recovery_match_excel`：占位时三个锚点均为 `ErrKind::Spill`；
+  清占位后 12 格与 Excel 实算一致。`cargo test -p sheetcore --test qa06_array` → **3 passed**。
+- QA-06.2 剩余：迭代计算/循环引用下的增量一致；LAMBDA/MAP/BYROW 本机 Excel #NAME? 不计。
