@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "purpose": "QA-01 三方矩阵：原文件 vs 我们 load+save 的副本，在 Excel 与 WPS 里逐类比对",
+  "entries": [
+    {
+      "name": "features",
+      "file": "crates/core/tests/fixtures/qa01/formats/features.xlsx",
+      "categories": [
+        "styles",
+        "cf",
+        "dv",
+        "table",
+        "names",
+        "freeze",
+        "hidden"
+      ]
+    },
+    {
+      "name": "shapes",
+      "file": "crates/core/tests/fixtures/qa01/formats/shapes.xlsx",
+      "categories": [
+        "shapes",
+        "connector",
+        "group",
+        "chart"
+      ]
+    },
+    {
+      "name": "smartart",
+      "file": "crates/core/tests/fixtures/qa01/formats/smartart.xlsx",
+      "categories": [
+        "smartart",
+        "3d",
+        "shapes"
+      ]
+    },
+    {
+      "name": "media",
+      "file": "crates/core/tests/fixtures/qa01/formats/media.xlsx",
+      "categories": [
+        "pictures",
+        "shapes",
+        "links"
+      ]
+    },
+    {
+      "name": "chart-ext",
+      "file": "crates/core/tests/fixtures/qa01/ext/chart.xlsx",
+      "categories": [
+        "chart",
+        "values"
+      ]
+    },
+    {
+      "name": "table-ext",
+      "file": "crates/core/tests/fixtures/qa01/ext/table.xlsx",
+      "categories": [
+        "table",
+        "cf",
+        "dv"
+      ]
+    },
+    {
+      "name": "page-ext",
+      "file": "crates/core/tests/fixtures/qa01/ext/page.xlsx",
+      "categories": [
+        "page",
+        "freeze",
+        "hidden"
+      ]
+    },
+    {
+      "name": "metadata-ext",
+      "file": "crates/core/tests/fixtures/qa01/ext/metadata.xlsx",
+      "categories": [
+        "metadata",
+        "values"
+      ]
+    },
+    {
+      "name": "pivot-ext",
+      "file": "crates/core/tests/fixtures/qa01/ext/pivot.xlsx",
+      "categories": [
+        "pivot"
+      ]
+    },
+    {
+      "name": "pivot-multi",
+      "file": "crates/core/tests/fixtures/qa01/pivot.xlsx",
+      "categories": [
+        "pivot"
+      ]
+    },
+    {
+      "name": "features-xlsm",
+      "file": "crates/core/tests/fixtures/qa01/formats/features.xlsm",
+      "categories": [
+        "styles",
+        "cf",
+        "dv",
+        "table",
+        "names",
+        "freeze",
+        "hidden"
+      ]
+    },
+    {
+      "name": "features-xls",
+      "file": "crates/core/tests/fixtures/qa01/formats/features.xls",
+      "categories": [
+        "values",
+        "numfmt"
+      ],
+      "known_loss": [
+        "cf",
+        "dv",
+        "tables",
+        "names",
+        "freeze",
+        "hidden",
+        "fill",
+        "border"
+      ]
+    }
+  ]
+}
