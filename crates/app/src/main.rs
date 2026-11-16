@@ -28092,6 +28092,46 @@ impl eframe::App for SheetApp {
         if ctx.cumulative_pass_nr() == 1 && std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[boot] first_frame {:.3}s", since_start());
         }
+        // QA-07.2：滚动帧时延探针（SC_SCROLL_PROBE=1）
+        if std::env::var("SC_SCROLL_PROBE").is_ok() {
+            let mut g = SCROLL_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            let p = g.get_or_insert_with(|| ScrollProbe {
+                active: false,
+                pending: None,
+                build: None,
+                times: Vec::new(),
+                builds: Vec::new(),
+                frames: 0,
+            });
+            if let Some(t0) = p.pending.take() {
+                p.times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            if !p.active && self.tasks.open_rx.is_none() && !self.wb.sheets.is_empty() {
+                p.active = true;
+                p.frames = 0;
+            }
+            if p.active {
+                if p.frames < 120 {
+                    // 每帧下移 60px，模拟滚轮一次一格；并请求连续重绘，
+                    // 否则 eframe 会等事件，量出来的只是空闲等待
+                    self.scroll.y += 60.0;
+                    p.pending = Some(std::time::Instant::now());
+                    p.build = Some(std::time::Instant::now());
+                    p.frames += 1;
+                    ctx.request_repaint();
+                } else {
+                    let (n, p50, p95, mx) = probe_stats(&mut p.times);
+                    let (bn, b50, b95, bmx) = probe_stats(&mut p.builds);
+                    eprintln!(
+                        "[scroll] 帧间隔 n={n} p50={p50:.2}ms p95={p95:.2}ms max={mx:.2}ms；update() n={bn} p50={b50:.2}ms p95={b95:.2}ms max={bmx:.2}ms"
+                    );
+                    if std::env::var("SC_SCROLL_EXIT").is_ok() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    p.frames += 1; // 只报一次
+                }
+            }
+        }
         // UI-11.6 无界面探针：SC_UI116=1 时在固定帧走一遍「编辑中切表取引用 → 回车写回原格」
         if std::env::var("SC_UI116").is_ok() {
             let pass = ctx.cumulative_pass_nr();
@@ -29999,6 +30039,15 @@ impl eframe::App for SheetApp {
             egui::Stroke::new(1.0 / ppp, egui::Color32::from_rgb(160, 158, 156)),
             egui::StrokeKind::Inside,
         );
+        // QA-07.2：本帧 update() 构建耗时（滚动探针）
+        if std::env::var("SC_SCROLL_PROBE").is_ok() {
+            let mut g = SCROLL_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = g.as_mut() {
+                if let Some(t0) = p.build.take() {
+                    p.builds.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+        }
         // 性能探针：SC_FRAME_LOG=N 强制连续重绘，收 N 帧真实帧间隔，打印 avg/p50/p95/max
         if let Ok(v) = std::env::var("SC_FRAME_LOG") {
             if let Ok(limit) = v.parse::<usize>() {
@@ -30414,6 +30463,32 @@ fn font_defs() -> egui::FontDefinitions {
 }
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// QA-07.2 滚动探针状态：把滚动位置往前推一屏，量「改滚动位置 → 下一帧开始」的墙钟。
+struct ScrollProbe {
+    active: bool,
+    /// 上一帧注入时刻，用来量「注入 → 下一帧开始」
+    pending: Option<std::time::Instant>,
+    /// 本帧 update() 起点，用来量纯构建耗时
+    build: Option<std::time::Instant>,
+    times: Vec<f64>,
+    builds: Vec<f64>,
+    frames: usize,
+}
+static SCROLL_PROBE: std::sync::Mutex<Option<ScrollProbe>> = std::sync::Mutex::new(None);
+
+/// 打印 p50/p95/max（毫秒），n 为样本数
+fn probe_stats(times: &mut Vec<f64>) -> (usize, f64, f64, f64) {
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = times.len();
+    if n == 0 {
+        return (0, 0.0, 0.0, 0.0);
+    }
+    let p50 = times[n / 2];
+    let p95 = times[((n as f64 * 0.95) as usize).min(n - 1)];
+    let mx = *times.last().unwrap();
+    (n, p50, p95, mx)
+}
 
 /// 距进程启动的秒数（SC_LOAD_PROF 探针用）
 fn since_start() -> f64 {
