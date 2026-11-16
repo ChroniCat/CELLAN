@@ -941,6 +941,13 @@ fn two_col_field_values_match_excel_with_subtotal_columns() {
         layout: PivotLayout::default(),
     };
     let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    // 表头 3 行，与 Excel 版式一致
+    let h: Vec<Vec<String>> = g.headers.iter().map(|r| r.clone()).collect();
+    assert_eq!(h.len(), 3);
+    assert_eq!(&h[0][0..3], &["求和项:金额", "产品", "状态"]);
+    assert_eq!(&h[1][1..8], &["A", "", "A 汇总", "B", "", "B 汇总", "总计"]);
+    assert_eq!(&h[2][0..6], &["地区", "无效", "有效", "", "无效", "有效"]);
+
     // Excel 真值（twocol-ref.tsv）：A 无效/有效/A 汇总/B 无效/有效/B 汇总/总计
     let rows: Vec<Vec<String>> = g.rows.iter().map(|r| r.iter().map(|v| v.display()).collect()).collect();
     assert_eq!(rows[0][0], "华北");

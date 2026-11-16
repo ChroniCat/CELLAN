@@ -347,7 +347,14 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     grid.col_paths = col_paths.clone();
     let slots = build_col_slots(&col_paths, spec.layout.subtotals);
 
-    let n_head = if spec.cols.is_empty() { 1 } else { spec.cols.len() + 2 };
+    let n_head = if spec.cols.is_empty() {
+        1
+    } else if spec.cols.len() >= 2 {
+        // Excel：值名 + 列字段名同行 / 上层标签 + 汇总 / 叶子标签
+        3
+    } else {
+        spec.cols.len() + 2
+    };
     // Excel 在有列字段且显示总计列时，右侧给每个值字段各留一列「<值名>汇总」
     let grand_block = if !spec.cols.is_empty() && spec.layout.grand_totals {
         spec.values.len()
@@ -377,6 +384,44 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
                 if matches!(slot, ColSlot::Leaf(_)) {
                     for vi in 0..spec.values.len() {
                         row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
+                    }
+                }
+            }
+        } else if spec.cols.len() >= 2 {
+            // Excel 的两层列字段版式（3 行）
+            if hi == 0 {
+                row[0] = value_label(0);
+                for (d, f) in spec.cols.iter().enumerate() {
+                    if spec.rows.len() + d < total_cols {
+                        row[spec.rows.len() + d] = hdr(f.col);
+                    }
+                }
+            } else if hi == 1 {
+                let mut prev_top = String::new();
+                for (ci, slot) in slots.iter().enumerate() {
+                    let cell = spec.rows.len() + ci * spec.values.len();
+                    match slot {
+                        ColSlot::Leaf(p) => {
+                            let top = p.first().cloned().unwrap_or_default();
+                            if top != prev_top {
+                                row[cell] = top.clone();
+                                prev_top = top;
+                            }
+                        }
+                        ColSlot::Subtotal { label, .. } => row[cell] = label.clone(),
+                    }
+                }
+                if grand_block > 0 {
+                    row[grand_base] = "总计".to_string();
+                }
+            } else {
+                for (i, f) in spec.rows.iter().enumerate() {
+                    row[i] = hdr(f.col);
+                }
+                for (ci, slot) in slots.iter().enumerate() {
+                    if let ColSlot::Leaf(p) = slot {
+                        row[spec.rows.len() + ci * spec.values.len()] =
+                            p.last().cloned().unwrap_or_default();
                     }
                 }
             }
