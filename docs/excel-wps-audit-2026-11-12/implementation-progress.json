@@ -1158,11 +1158,16 @@
             "crates/core/tests/fixtures/qa01/formats/features.xlsm",
             "crates/core/tests/fixtures/qa01/formats/features.xls",
             "crates/core/examples/xls_roundtrip.rs",
-            "scripts/qa01_media_probe.ps1"
+            "scripts/qa01_media_probe.ps1",
+            "crates/core/tests/qa01_shapes_edit.rs",
+            "crates/core/tests/fixtures/qa01/formats/shapes.xlsx",
+            "crates/core/examples/textbox_edit.rs",
+            "scripts/qa01_shapes_probe.ps1"
           ],
           "commits": [
             "56f9cc2",
-            "3901d39"
+            "3901d39",
+            "bcef26b"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored",
@@ -1178,7 +1183,11 @@
             "sheetcore load+save 后 media-ours.xlsx 在 Excel/WPS 均 pictures=1 shapes=2 links=1，drawing 与图片逐字节一致",
             "features.xlsm -> 我们另存 .xlsx -> Excel 16 项读数与原始 .xlsx 一致",
             "features.xls -> 我们 load -> 另存 .xls -> Excel 打开：值/数字格式/粗体在，CF/DV/表格/名称/冻结/隐藏 不在（calamine 只给值）",
-            "cargo test -p sheetcore（--test-threads=2）-> 105 个测试二进制 0 failed"
+            "cargo test -p sheetcore（--test-threads=2）-> 105 个测试二进制 0 failed",
+            "powershell -File scripts/qa01_shapes_probe.ps1 shapes.xlsx Excel.Application -> shapes=4 charts=1 type6 items=2",
+            "load+save 后 drawing/chart 部件逐字节一致，Excel/WPS 读数与源一致",
+            "textbox_edit BoxB 改字后保存 -> shapes=4、BoxB 仍 type1、组合 2 项、图表标题销量在",
+            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
@@ -1192,16 +1201,19 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media-formats.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-excel.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-excel-rt2.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-wps-rt2.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-wps-rt2.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes-matrix.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-excel.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-wps-rt.txt"
           ],
           "not_done": [
             ".xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留：读取走 calamine 只给值，属既定口径",
-            "图形对象只覆盖矩形与图片；图表组合、连接线、超链接形状未逐一覆盖"
+            "SmartArt / 三维形状 / 图表形状（形状里放图表）未覆盖"
           ],
           "failures": [],
           "blocker": "",
-          "next": "图形对象扩到组合/连接线后可整体转「已验收」；.xls 边界需按原合同口径书面确认。",
-          "updated_utc": "2026-11-16T12:10:00Z"
+          "next": "SmartArt/三维形状按需补夹具；.xls 边界需按原合同口径书面确认。",
+          "updated_utc": "2026-11-16T12:45:00Z"
         }
       ]
     },

@@ -391,3 +391,19 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - `.xls` 边界（写进 not_done）：值/数字格式/粗体保留，CF/DV/表格/名称/冻结/隐藏 与
   填充/边框颜色不保留 —— calamine 只给值。
 - 测试：core **105** 个测试二进制 0 failed（`qa01-core3.log`）；app **330 passed**（`qa01-app2.log`）。
+
+### 检查点十三：QA-01.3 图形矩阵（组合/连接线/内嵌图表 + 改字保存）
+- `bcef26b`：解析与重写都改成「组合/连接线不归我们管」。修前改一个字会出现
+  shapes 4→6（多出 type17 的 LinkAB/GroupAC）、矩形变文本框（`txBox="1"`、off/ext 归零、
+  `xdr:style` 消失）。
+- 命中形状改成**原地改**：只换 `<a:t>` 与 `sz/b/i`/`srgbClr`，Excel 的 spPr/prstGeom/style 全留；
+  空形状插字要放在 `<a:endParaRPr>` 之前（否则 Excel 忽略）。
+- 独立 `<xdr:sp>` 以模型为准（清空文本框时形状必须消失），外来块无条件保留 ——
+  既有 `deleting_all_textboxes_removes_the_shape` 继续守住。
+- 实测：shapes.xlsx（矩形 + 连接线 + 2 项组合 + 内嵌柱状图/标题「销量」）只读往返时
+  drawing/chart 部件逐字节一致；改 BoxB 文字后 Excel/WPS 均 shapes=4、BoxB 仍 type1、
+  组合 2 项、图表 1 系列标题在。
+- 顺手补 `.gitignore`：`tests/fixtures/qa01/formats/*` 之前被 `*.xlsx` 规则挡住没入库，
+  别人 clone 后测试会缺夹具。
+- 测试：core **106** 二进制 0 failed（`qa01-core5.log`）；app **330 passed**（`qa01-app3.log`）。
+- 剩余：SmartArt / 三维形状 / 图表形状未覆盖；`.xls` 结构性对象口径待确认。
