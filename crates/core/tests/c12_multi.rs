@@ -1,4 +1,4 @@
-//! C12.2 多字段透视：两层行、两个值、筛选、小计、总计。
+//! C12.2 多字段透视：两层行、两个值、筛选、汇总、总计。
 
 use sheetcore::model::{Cell, Sheet, Value};
 use sheetcore::pivot::Agg;
@@ -59,15 +59,15 @@ fn text(v: &Value) -> String {
 fn two_row_fields_two_values_and_a_filter() {
     let s = sheet();
     let g = compute(&s, &spec());
-    assert_eq!(g.headers.len(), 2, "一个列字段 + 值字段名 → 两行表头");
+    assert_eq!(g.headers.len(), 3, "一列字段 + 多值：字段名行/列标签行/值名行");
     assert_eq!(
-        g.headers[0],
-        vec!["地区", "城市", "甲", "甲", "乙", "乙"],
-        "列标签按产品重复到每个值字段"
+        g.headers[2],
+        vec!["地区", "城市", "销售额 求和", "数量 计数", "销售额 求和", "数量 计数", "", ""],
+        "最下一行表头是行字段名 + 各列叶子的值名"
     );
     assert_eq!(
         g.headers[1],
-        vec!["", "", "销售额 求和", "数量 计数", "销售额 求和", "数量 计数"]
+        vec!["", "", "甲", "", "乙", "", "销售额 求和汇总", "数量 计数汇总"]
     );
     assert_eq!(
         g.rows[0][..2].iter().map(|v| v.display()).collect::<Vec<_>>(),
@@ -83,7 +83,7 @@ fn subtotal_grand_total_and_filter_semantics() {
     let labels: Vec<String> = g.rows.iter().map(|r| r[0].display()).collect();
     assert_eq!(
         labels,
-        vec!["华北", "华北 小计", "华东", "华东", "华东 小计", "总计"],
+        vec!["华北", "华北 汇总", "华东", "华东", "华东 汇总", "总计"],
         "拼音序：华北(bei) 在 华东(dong) 前"
     );
     assert_eq!(g.rows[0][2], Value::Number(20.0));
@@ -91,7 +91,7 @@ fn subtotal_grand_total_and_filter_semantics() {
     assert_eq!(g.rows[0][5], Value::Number(1.0), "北京乙只有一条记录，数量计数 1");
     assert_eq!(g.rows[2][2], Value::Number(30.0), "杭州(hangzhou) 排在 上海 前");
     assert_eq!(g.rows[3][2], Value::Number(100.0));
-    assert_eq!(g.rows[4][2], Value::Number(130.0), "华东 甲 销售额小计");
+    assert_eq!(g.rows[4][2], Value::Number(130.0), "华东 甲 销售额汇总");
     assert_eq!(g.rows[4][3], Value::Number(2.0), "华东 甲 计数 2");
     let total = g.grand_total_row.expect("应有总计行");
     assert_eq!(g.rows[total][2], Value::Number(150.0), "总计 甲 销售额");
@@ -108,7 +108,7 @@ fn clearing_the_filter_keeps_all_rows_and_recomputes() {
     assert_eq!(
         g.rows.iter().filter(|r| r[0].display().starts_with("华北")).count(),
         3,
-        "去掉筛选后天津那一行要回来（北京 + 天津 + 小计）"
+        "去掉筛选后天津那一行要回来（北京 + 天津 + 汇总）"
     );
     let total = g.grand_total_row.unwrap();
     assert_eq!(g.rows[total][2], Value::Number(150.0), "全部销售额 100+30+20+0（文本 x 不计）");
@@ -121,7 +121,7 @@ fn no_row_field_degrades_to_grand_total_only() {
     let mut sp = spec();
     sp.rows.clear();
     let g = compute(&s, &sp);
-    assert_eq!(g.headers[0].len(), 4, "没有行字段时只剩两个产品的两个值");
+    assert_eq!(g.headers[0].len(), 6, "没有行字段：两个产品 × 两个值 + 两个总计列");
     let last = g.rows.last().expect("至少一行");
     assert_eq!(last[0], Value::Number(150.0), "最后一行的甲销售额是全部合计");
 }
@@ -134,10 +134,21 @@ fn write_grid_lands_values_at_the_target_anchor() {
     let rect = write_grid(&mut out, (3, 2), &g);
     assert_eq!(rect.0, 3);
     assert_eq!(rect.1, 2);
-    assert_eq!(out.get(3, 2).unwrap().value.display(), "地区");
-    assert_eq!(out.get(4, 4).unwrap().value.display(), "销售额 求和");
-    assert_eq!(out.get(5, 2).unwrap().value.display(), "华北");
-    assert_eq!(out.get(5, 4).map(|c| c.value.display()).unwrap_or_default(), "20");
+    assert_eq!(out.get(5, 2).unwrap().value.display(), "地区");
+    // 表头行数会变，按内容定位：最后一个表头行里有「销售额 求和」，「华北」行在第一列
+    let mut hdr_row = None;
+    let mut row_bj = None;
+    for r in 3..rect.2 + 3 {
+        if out.get(r, 4).map(|c| c.value.display()).as_deref() == Some("销售额 求和") {
+            hdr_row = Some(r);
+        }
+        if out.get(r, 2).map(|c| c.value.display()).as_deref() == Some("华北") {
+            row_bj = Some(r);
+        }
+    }
+    assert!(hdr_row.is_some(), "应能找到值名表头行");
+    let rb = row_bj.expect("应能找到华北行");
+    assert_eq!(out.get(rb, 4).map(|c| c.value.display()).unwrap_or_default(), "20");
     // hue: 表头 2 行 + 数据行数
     let expect_last = 3 + g.headers.len() as u32 + g.rows.len() as u32 - 1;
     assert_eq!(rect.2, expect_last);
