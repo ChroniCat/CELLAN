@@ -572,3 +572,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   `ui_kit::focus_ring`，`big_sized`/`color_button`/字体样式切换三处接上。
 - `SC_DUMP` 增加 `selrect`，实测缩放 1.0/1.25/1.5/2.0 选区 134/167.5/201/268 宽，无 1px 漂移。
 - app **342 passed**。
+
+### 检查点三十一：QA-04.1 原生快捷键（部分达成）
+- **真缺陷**：Ctrl+S/Ctrl+Z/Ctrl+Y/Ctrl+Shift+Z 从没绑键（只有 UI 能点）。新增
+  `handle_file_shortcuts` + 回归 `ctrl_z_and_ctrl_y_drive_undo_and_redo`。
+- 原生键盘实测（PostMessage WM_KEYDOWN → winit）：F2 出 `Edit 编辑栏`、Esc 节点消失、
+  Enter 选区 A1→A2、Down/Down/Right → B4。
+- **阻塞**：本机无交互桌面（GetForegroundWindow=0），SendInput/WM_CHAR/WM_IME_CHAR/
+  修饰键/鼠标消息全部无效 → QA-04.1 只能跑无修饰键子集，保持「实施中」。
+- app **343 passed**。

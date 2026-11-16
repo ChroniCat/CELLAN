@@ -4114,13 +4114,17 @@
       "scope": "app/tests + Windows自动化脚本",
       "source": "qa-requirements.md",
       "heading": "QA-04 P1 系统输入与真实交互端到端基线",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
-      "commits": [],
+      "commits": [
+        "6432676"
+      ],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "QA-04.1 实施中（Ctrl+S/Z/Y 已补；原生输入受无交互桌面阻塞）；QA-04.2 IME 三方互通阻塞；QA-04.3 未开始。"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
@@ -4132,16 +4136,28 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "实施中",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "6432676"
+          ],
+          "commands": [
+            "QM: PostMessage F2 -> UIA 出现 Edit 编辑栏；Esc -> 节点消失；Enter -> 选区 A1→A2；Down/Down/Right -> B4",
+            "cargo test -p app ctrl_z_and_ctrl_y_drive_undo_and_redo -> passed",
+            "cargo test -p app（--test-threads=2）-> 343 passed（work/goal-logs/qa041-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa04-native-input.txt"
+          ],
+          "not_done": [
+            "本机无可交互桌面（GetForegroundWindow=0）：SendInput、WM_CHAR、WM_IME_CHAR、修饰键组合、鼠标消息全部无效，原生输入用例只能跑无修饰键键盘子集。",
+            "②光标左右移动/草稿文本、③公式栏与格内一致、④拖选自动滚动、⑤筛选后复制粘贴、⑥跨 Excel/WPS 粘贴、⑦弹窗按键不泄漏、⑧多文档归属 均未在有交互会话中执行。",
+            "脚本已就绪：work/probe/qa04/{win_input,input_lib,scenario_nav,scenario_keys,scenario_b}.ps1。"
+          ],
           "failures": [],
           "blocker": "",
-          "next": "",
+          "next": "在交互桌面（本机登录会话）上补跑 QA-04.1 全场景；本机继续推进不依赖原生输入的切片。",
           "updated_utc": "2026-11-12T10:28:37Z"
         },
         {
