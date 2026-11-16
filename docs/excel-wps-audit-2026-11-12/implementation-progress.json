@@ -1094,15 +1094,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json"
           ],
           "not_done": [
-            "QA-01.2 完整 manifest/三方文件往返 runner 尚未建立。",
-            "QA-01.3 图表/透视/打印扩展夹具尚未建立。",
-            "本片仅覆盖最小公式与编辑工作簿基线；未覆盖修复提示、二次保存刷新等父项全部条件。",
-            "编辑样本尚未接入真实键盘/IME 路径。"
+            "最小公式与编辑夹具已建（qa01_formula_min.xlsx / qa01_edit_min.xlsx）；剩余：编辑样本接入真实键盘/IME 路径（无交互桌面阻塞）、修复提示与二次保存刷新、父项证据链人工复查。"
           ],
           "failures": [],
           "blocker": "",
           "next": "QA-01.2：建立 manifest 驱动、三条路径可复跑的 Excel/WPS 文件往返 runner；先读取现有 office-oracle 与 repro/run_office_oracle.py。",
-          "updated_utc": "2026-11-13T19:28:59Z"
+          "updated_utc": "2026-11-16T22:11:54Z"
         },
         {
           "id": "QA-01.2",
@@ -1140,13 +1137,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix/matrix-summary.tsv"
           ],
           "not_done": [
-            "未覆盖 Excel/WPS 修复提示、二次保存刷新、大簿与真实 UI 编辑路径（属父项其它切片）。",
-            ".xls 结构性对象（CF/DV/表格/名称/冻结/隐藏、填充/边框色）按既定边界不保留，已由 runner 逐条登记。"
+            "runner 已存在并 manifest 驱动（scripts/qa01_matrix_runner.py + scripts/qa01_manifest.json，12 个 entry：formats/shapes/smartart/media/chart-ext/table-ext/page-ext/metadata-ext/pivot-ext/pivot-multi/xlsm/xls），覆盖 Excel+WPS 双端快照与逐类 diff；尚缺：本次实跑结果入库、大簿与二次保存刷新场景、真实 UI 编辑路径。"
           ],
           "failures": [],
           "blocker": "",
           "next": "runner 已覆盖 12 类夹具；余下为父项的人工路径与复查条件。",
-          "updated_utc": "2026-11-16T13:25:00Z"
+          "updated_utc": "2026-11-16T22:11:54Z"
         },
         {
           "id": "QA-01.3",
@@ -1228,13 +1224,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-wps-rt.txt"
           ],
           "not_done": [
-            ".xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留：读取走 calamine 只给值，属既定口径",
-            "WPS 自身读不出 Excel 的 SmartArt 节点（源文件同样只给默认节点），非本实现问题，需按合同口径说明"
+            "扩展夹具已建立（fixtures/qa01/ext/ 下 chart/table/page/metadata/pivot 均存在，manifest 逐条登记）；.xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留属既定口径；WPS 读不出 Excel SmartArt 节点为对方限制（源文件同样如此）。剩余：把实跑 diff 结果与合同口径说明一起归档。"
           ],
           "failures": [],
           "blocker": "",
           "next": "图形与 SmartArt 已覆盖；余下只有 .xls 口径与 WPS SmartArt 读取限制两条说明项。",
-          "updated_utc": "2026-11-16T13:05:00Z"
+          "updated_utc": "2026-11-16T22:11:54Z"
         }
       ]
     },
