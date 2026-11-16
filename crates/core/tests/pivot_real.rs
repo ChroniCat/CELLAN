@@ -495,3 +495,43 @@ fn save_attaches_pending_pivot() {
     assert!(t.contains("计数项:"), "汇总方式没写对: {t}");
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+#[ignore = "离线夹具生成器：cargo test -- --ignored dump_pivot_variants"]
+fn dump_pivot_variants() {
+    use std::io::Read;
+    let dir = Path::new("F:/finance-native-sheets-ready/work/probe/c12/regen");
+    std::fs::create_dir_all(dir).unwrap();
+    let variants: [(&str, Option<u32>, Agg, u32); 3] = [
+        ("row_only", None, Agg::Sum, 2),
+        ("row_col", Some(0), Agg::Sum, 2),
+        ("row_col_count", Some(0), Agg::Count, 2),
+    ];
+    for (name, col, agg, value_field) in variants {
+        let src = fixture("table.xlsx");
+        let mut wb = sheetcore::xlsx::load(&src).expect("读入");
+        let region = sheetcore::sort_filter::current_region(wb.sheet(0), 0, 0);
+        let spec = PivotSpec {
+            source: region,
+            row_field: 1,
+            col_field: col,
+            value_field,
+            agg,
+            group: sheetcore::pivot::GroupBy::None,
+            exclude: Vec::new(),
+        };
+        let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
+        let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (8, 0), &res);
+        let out = dir.join(format!("{name}.xlsx"));
+        let _ = std::fs::remove_file(&out);
+        sheetcore::xlsx::save(&out, &wb).expect("保存");
+        let vlabel = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
+        let sheet_name = wb.sheet(0).name.clone();
+        sheetcore::pivot_xml::attach(&out, &sheet_name, &spec, &res, rect, &vlabel).expect("挂透视表");
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut cd = String::new();
+        z.by_name("xl/pivotCache/pivotCacheDefinition1.xml").unwrap().read_to_string(&mut cd).unwrap();
+        assert!(cd.contains("refreshedVersion="), "{name} 缺版本属性");
+        eprintln!("[variant] {}", out.display());
+    }
+}
