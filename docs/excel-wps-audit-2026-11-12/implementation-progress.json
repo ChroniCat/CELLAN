@@ -6629,13 +6629,18 @@
       "scope": "app/ui_kit.rs, ui_icons.rs, ribbon/ui.rs",
       "source": "ui-requirements.md",
       "heading": "UI-29 视觉规范以对照截图衡量",
-      "status": "待实施",
+      "status": "实施中",
       "acceptance": "",
       "files": [],
-      "commits": [],
+      "commits": [
+        "5460109"
+      ],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "UI-29.1 已验收（token + 跨 DPI 测量 + 修掉 accesskit 矩形双乘 ppp）；UI-29.2 图标/交互状态、UI-29.3 错误/空/加载状态未开始。",
+        "三端同场景 100%/150% 截图与标注尺寸未完成。"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
@@ -6647,13 +6652,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-29 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "5460109"
+          ],
+          "commands": [
+            "python work/probe/ui29/compare_scaling.py u29-1.0.txt 1.25 1.5 2.0 -> PASS（125%/150% 各 101 元素全达标，200% 55 元素全达标、41 个网格类因屏幕裁切排除）",
+            "cargo test -p app tokens_are_stable -> pass",
+            "cargo test -p app -- --test-threads=2 -> 349 passed（work/goal-logs/ui291-app.log）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/ui29-tokens.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-100.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-150.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/u29-1.0.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/u29-1.5.txt"
+          ],
+          "not_done": [
+            "main.rs 的标题栏/状态栏/对话框 padding 仍是字面量，未迁移到 token（已在 ui29-tokens.md §3 列明）。",
+            "只测浅色主题；深色主题 token 未定义。",
+            "未做 Excel/WPS/本应用三端同场景截图对比（父项 UI-29 验收项）。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",

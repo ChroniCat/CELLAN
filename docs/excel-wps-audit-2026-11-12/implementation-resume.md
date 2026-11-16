@@ -591,3 +591,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   epoch 撞车时按 doc_gen 丢弃（含「换回正确 doc_gen 必须被接受」反例）。
 - 边界：切标签走 API 不是真人点标签（单文档时无文档 TabItem，开第二个要走 rfd）。
 - app **348 passed**。
+
+### 检查点三十三：UI-29.1 design token + 跨 DPI 修正
+- 新增 `tokens.rs`（space/radius/stroke/text/size/icon），功能区组、分组启动器、
+  主/次按钮、pill、工作表标签接入；分组名间隙等按 Excel 实测值定档。
+- **真缺陷**：`a11y_name_rect`、网格 `Role=Grid`、行列头三处把逻辑点又乘了一次
+  `pixels_per_point`，accesskit 树本身已经乘过 → 150% 下读屏拿到 94×144 的粘贴按钮
+  （应为 63×96）、2841 宽的网格（比窗口还宽）。UI-24.2 只在 100% 验过所以没暴露。
+- 四档实测：125%/150% 各 101 个元素全按倍率；200% 55 个达标（41 个网格类因屏幕
+  高度裁切排除）；`compare_scaling.py` PASS。
+- app **349 passed**；证据 `ui29-tokens.md` + `ui29-100.png` / `ui29-150.png`。
