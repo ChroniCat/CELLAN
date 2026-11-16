@@ -1,0 +1,42 @@
+WINDOW name='qa07-values-10000.xlsx - Sheets Native' class='Window Class'
+COUNT=126
+Pane	数据验证	
+Button	圈释无效数据	
+Button	清除圈释	
+Button	设置…	
+Button	清除所选范围的验证	
+Text	当前工作表 0 条验证	
+Button	剪切（Ctrl+X）	
+Button	把当前单元格的格式复制到别处	
+Text	剪贴板	
+Button	增大字号	
+Button	减小字号	
+Button	加粗（Ctrl+B）	
+Button	斜体（Ctrl+I）	
+Text	字体	
+Button	顶端对齐	
+Button	垂直居中	
+Button	底端对齐	
+Button	自动换行	
+Button	左对齐	
+Button	居中	
+Button	右对齐	
+Button	减少缩进	
+Button	增加缩进	
+Text	对齐方式	
+Button	百分比样式	
+Button	千位分隔样式	
+Button	增加小数位数	
+Button	减少小数位数	
+Text	数字	
+Text	样式	
+Button	更多 ▾	
+Text	0	
+Text	单元格模式 就绪	
+Text	已打开并重算完成（10000 个非空格）	
+Text	统计 ▾	
+Text	平均值: 0    计数: 1    求和: 0	
+Button	100%	
+Button	+	
+Button	−	
+DataItem	A1，0，已选中	

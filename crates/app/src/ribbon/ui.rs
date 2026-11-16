@@ -359,6 +359,7 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
     }
     let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
     let tip = st.tip.clone().unwrap_or_else(|| tip_of(c));
+    let tip_a11y = tip.clone();
     let icon = c.image.as_deref().and_then(icon_of);
     let on = toggle && st.checked;
     let enabled = on_enabled(c, &st);
@@ -414,6 +415,16 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
             }
         }
     });
+    // UI-24.2：功能区按钮在 UIA 里要有名字/角色/禁用状态
+    {
+        let name = if tip_a11y.is_empty() { label.clone() } else { tip_a11y };
+        ui_kit::a11y_name(
+            &resp.inner,
+            &name,
+            enabled,
+            if toggle { Some(on) } else { None },
+        );
+    }
     if app.keytips && app.keytip_tab.is_some() && enabled {
         if let Some(k) = &c.keytip {
             draw_keytip(ui, k, resp.inner.rect);

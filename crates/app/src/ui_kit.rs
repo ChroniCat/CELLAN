@@ -759,6 +759,28 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// UI-24.2：给自绘控件补可访问名字/角色/状态。
+/// 自绘控件（pill、功能区大按钮）在 UIA 里默认只是个空图元，Narrator 读不到名字。
+pub fn a11y_name(resp: &egui::Response, label: &str, enabled: bool, toggled: Option<bool>) {
+    let text = label.to_string();
+    let text2 = text.clone();
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text2.clone()));
+    let _ = resp.ctx.accesskit_node_builder(resp.id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(text);
+        if !enabled {
+            node.set_disabled();
+        }
+        if let Some(t) = toggled {
+            node.set_toggled(if t {
+                egui::accesskit::Toggled::True
+            } else {
+                egui::accesskit::Toggled::False
+            });
+        }
+    });
+}
+
 /// 主按钮（确定/应用）：Excel 绿
 pub struct BtnResp {
     pub clicked: bool,
@@ -826,6 +848,7 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
         font,
         text_color(&v),
     );
+    a11y_name(&resp, if tip.is_empty() { label } else { tip }, true, None);
     if std::env::var("SC_UI_LOG").map(|v| v == "2").unwrap_or(false) {
         eprintln!("[ui]   pill {} w={:.1} x={:.1}", label, rect.width(), rect.min.x);
     }
@@ -964,6 +987,12 @@ impl Dlg {
         add: impl FnOnce(&mut egui::Ui) -> R,
     ) -> Option<egui::InnerResponse<R>> {
         let id = egui::Id::new(("dlgwin", &self.title));
+        // UI-24.2：对话框在可访问树里要有 Dialog 角色和标题
+        let title = self.title.clone();
+        let _ = ctx.accesskit_node_builder(id.with("a11y"), |node| {
+            node.set_role(egui::accesskit::Role::Dialog);
+            node.set_label(title);
+        });
         ctx.data_mut(|d| d.insert_temp(dialog_mark(), true));
         let screen = ctx.screen_rect();
         let mut pos = ctx

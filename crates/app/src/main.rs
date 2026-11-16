@@ -22971,6 +22971,53 @@ let txn = self.txn_begin(&keys);
             }
         }
     }
+    /// UI-24.2：活动单元格的可访问名字。自绘网格没有逐格控件，
+    /// 所以由这里手工建一个 Cell 节点：地址 + 显示值 + 是否选中 + 公式。
+    fn publish_grid_a11y(&self, ctx: &egui::Context, resp: &egui::Response) {
+        let (r, c) = self.sel;
+        let sh = self.wb.sheet(self.sheet_idx);
+        let addr = format!("{}{}", sheetcore::model::col_label(c), r + 1);
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let selected = r >= r1.min(r2) && r <= r1.max(r2) && c >= c1.min(c2) && c <= c1.max(c2);
+        let mut label = addr.clone();
+        if let Some(cell) = sh.get(r, c) {
+            let text = match &cell.value {
+                sheetcore::Value::Number(n) => {
+                    if n.fract() == 0.0 && n.abs() < 1e15 {
+                        format!("{}", *n as i64)
+                    } else {
+                        format!("{n}")
+                    }
+                }
+                sheetcore::Value::Text(t) => t.to_string(),
+                sheetcore::Value::Bool(b) => {
+                    if *b { "TRUE".into() } else { "FALSE".into() }
+                }
+                sheetcore::Value::Error(e) => format!("{e:?}"),
+                _ => String::new(),
+            };
+            if !text.is_empty() {
+                label.push_str("，");
+                label.push_str(&text);
+            }
+            if let Some(f) = &cell.formula {
+                label.push_str("，公式 ");
+                label.push_str(f);
+            }
+        }
+        if selected {
+            label.push_str("，已选中");
+        }
+        let label2 = label.clone();
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label2.clone())
+        });
+        let _ = ctx.accesskit_node_builder(resp.id, |node| {
+            node.set_role(egui::accesskit::Role::Cell);
+            node.set_label(label);
+        });
+    }
+
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
         self.last_view = avail;
@@ -22985,6 +23032,8 @@ let txn = self.txn_begin(&keys);
         let (resp, painter) = ui.allocate_painter(avail, pane_sense);
         let origin = resp.rect.min;
         self.last_pane = origin;
+        // UI-24：把活动单元格发布到可访问树（Narrator/UIA 读「A1、金额、已选中」）
+        self.publish_grid_a11y(ctx, &resp);
         // 视图 → 标题：关掉列标/行号后表头占 0 像素，网格从左上角开始
         // 列头高度：有列分级时每级留 11px 放 +/- 按钮
         let col_depth = self
