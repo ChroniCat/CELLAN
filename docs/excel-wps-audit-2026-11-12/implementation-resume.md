@@ -459,3 +459,15 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 过程中发现 `CheckUpdate` 会联网卡死、`ImportWorkbook`/`Hyperlink`/`OpenInNewTab` 会弹对话框。
 - 测试：app **337 passed**、core **106** 二进制 0 failed。
 - 边界：矩阵只证明「有实现、不落兜底」，不证明业务效果；14 个跳过项需真人点击。
+
+### 检查点十九：QA-07 首次性能基线（并修掉稀疏远端内存缺陷）
+- `acb5f87`：新增 `crates/core/examples/perf_probe.rs`，现场生成 values/chain/sparse × 1万/10万/100万
+  共 9 组样本，记录 build/load/recalc/改一格/save/另存/RSS/槽位数。
+- **真实缺陷**：`Store::Page::ensure` 把页内所有列都按整页补槽，远端稀疏行 1 万个散点 →
+  3,423,112 个槽位（约 137MB），RSS 169MB。改成只补目标列后 slots 855,778、RSS 57MB、build 48→13ms。
+  两条回归：`sparse_far_rows_do_not_allocate_full_page_slabs`、`dense_and_sparse_columns_coexist_in_one_page`。
+- GUI 层（release app）加 `[boot] first_frame` / `[open] editable` 打点，`SC_LOAD_PROF=1` 开启；
+  与 `SC_SHOT/SC_SHOT_EXIT` 配合可无人值守跑：1M 值首帧 p50 0.64s、打开→可编辑 p50 4.09s、峰值 190.5MB。
+- 阈值已冻结进 `qa-requirements.md` QA-07 验收段（含退化上限），证据 `qa07-first-baseline.txt`。
+- 测试：core **106** 二进制 0 failed、app **337 passed**。
+- 未做（不记通过）：滚动→呈现 p50/p95、冷启动（清系统缓存）、保存期间可操作性。
