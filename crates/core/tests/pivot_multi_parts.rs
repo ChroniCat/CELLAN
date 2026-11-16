@@ -907,8 +907,7 @@ fn page_filter_matches_excel_filter_ref() {
 }
 
 #[test]
-#[ignore = "参考用：Excel 的两层列字段会插「A 汇总」「B 汇总」子总计列，我们尚未实现，见 c12-2-two-col-fields.md"]
-fn two_col_field_reference_dump() {
+fn two_col_field_values_match_excel_with_subtotal_columns() {
     use sheetcore::{Cell, Value};
     let mut wb = sheetcore::Workbook::new_blank();
     wb.sheets[0].name = "Data".into();

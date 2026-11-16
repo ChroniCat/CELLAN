@@ -231,7 +231,7 @@ fn emit_row(
     grid: &mut PivotGrid,
     rpath: &[String],
     m: Option<&CellMap>,
-    col_paths: &[Vec<String>],
+    slots: &[ColSlot],
     spec: &PivotSpec2,
     prev: &mut [String],
     total_cols: usize,
@@ -245,13 +245,27 @@ fn emit_row(
             prev[i] = v;
         }
     }
-    for p in col_paths {
+    for slot in slots {
         for vi in 0..spec.values.len() {
-            let v = m
-                .and_then(|x| x.get(p))
-                .and_then(|accs| accs.get(vi))
-                .map(|a| a.finish(spec.values[vi].agg))
-                .unwrap_or(Value::Empty);
+            let v = match (m, slot) {
+                (Some(cells), ColSlot::Leaf(p)) => cells
+                    .get(p)
+                    .and_then(|accs| accs.get(vi))
+                    .map(|a| a.finish(spec.values[vi].agg))
+                    .unwrap_or(Value::Empty),
+                (Some(cells), ColSlot::Subtotal { prefix, .. }) => {
+                    let mut acc = Acc::default();
+                    for (p, accs) in cells.iter() {
+                        if p.starts_with(prefix) {
+                            if let Some(a) = accs.get(vi) {
+                                acc.merge(a);
+                            }
+                        }
+                    }
+                    acc.finish(spec.values[vi].agg)
+                }
+                (None, _) => Value::Empty,
+            };
             row.push(v);
         }
     }
@@ -331,6 +345,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         grid.col_labels.push(if p.is_empty() { String::new() } else { p.join(" / ") });
     }
     grid.col_paths = col_paths.clone();
+    let slots = build_col_slots(&col_paths, spec.layout.subtotals);
 
     let n_head = if spec.cols.is_empty() { 1 } else { spec.cols.len() + 2 };
     // Excel 在有列字段且显示总计列时，右侧给每个值字段各留一列「<值名>汇总」
@@ -339,7 +354,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     } else {
         0
     };
-    let grand_base = spec.rows.len() + col_paths.len() * spec.values.len();
+    let grand_base = spec.rows.len() + slots.len() * spec.values.len();
     let total_cols = grand_base + grand_block;
     let value_label = |vi: usize| -> String {
         let v = &spec.values[vi];
@@ -358,9 +373,11 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
                     }
                 }
             }
-            for (ci, _p) in col_paths.iter().enumerate() {
-                for vi in 0..spec.values.len() {
-                    row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
+            for (ci, slot) in slots.iter().enumerate() {
+                if matches!(slot, ColSlot::Leaf(_)) {
+                    for vi in 0..spec.values.len() {
+                        row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
+                    }
                 }
             }
         } else if hi == 0 {
@@ -374,7 +391,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             for (i, f) in spec.rows.iter().enumerate() {
                 row[i] = hdr(f.col);
             }
-            for (ci, _p) in col_paths.iter().enumerate() {
+            for (ci, _p) in slots.iter().enumerate() {
                 for vi in 0..spec.values.len() {
                     row[spec.rows.len() + ci * spec.values.len() + vi] = value_label(vi);
                 }
@@ -382,9 +399,17 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         } else {
             // 中间行：列标签逐层；紧邻字段名行的那一行右侧放「…汇总」
             let lvl = hi - 1;
-            for (ci, p) in col_paths.iter().enumerate() {
-                if lvl < p.len() {
-                    row[spec.rows.len() + ci * spec.values.len()] = p[lvl].clone();
+            for (ci, slot) in slots.iter().enumerate() {
+                match slot {
+                    ColSlot::Leaf(p) => {
+                        if lvl < p.len() {
+                            row[spec.rows.len() + ci * spec.values.len()] = p[lvl].clone();
+                        }
+                    }
+                    ColSlot::Subtotal { label, .. } if lvl + 1 == spec.cols.len() => {
+                        row[spec.rows.len() + ci * spec.values.len()] = label.clone();
+                    }
+                    ColSlot::Subtotal { .. } => {}
                 }
             }
             if hi == 1 && grand_block > 0 {
@@ -400,7 +425,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     let mut prev: Vec<String> = vec![String::new(); spec.rows.len()];
     let mut keys: Vec<Vec<String>> = data.keys().cloned().collect();
     keys.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")));
-    let mut grand: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; col_paths.len()];
+    let mut grand: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; slots.len()];
     let mut i = 0;
     while i < keys.len() {
         let top = keys[i].first().cloned().unwrap_or_default();
@@ -408,29 +433,30 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         while i < keys.len() && keys[i].first().cloned().unwrap_or_default() == top {
             i += 1;
         }
-        let mut sub: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; col_paths.len()];
+        let mut sub: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; slots.len()];
         for k in &keys[start..i] {
             let m = &data[k];
-            emit_row(&mut grid, k, Some(m), &col_paths, spec, &mut prev, total_cols);
+            emit_row(&mut grid, k, Some(m), &slots, spec, &mut prev, total_cols);
             if grand_block > 0 {
                 let last = grid.rows.len() - 1;
                 for vi in 0..spec.values.len() {
                     let mut acc = Acc::default();
-                    for p in col_paths.iter() {
-                        if let Some(a) = m.get(p) {
-                            if vi < a.len() {
-                                acc.merge(&a[vi]);
-                            }
+                    for (p, accs) in m.iter() {
+                        if vi < accs.len() {
+                            let _ = p;
+                            acc.merge(&accs[vi]);
                         }
                     }
                     grid.rows[last][grand_base + vi] = acc.finish(spec.values[vi].agg);
                 }
             }
-            for (ci, p) in col_paths.iter().enumerate() {
-                if let Some(accs) = m.get(p) {
-                    for vi in 0..spec.values.len().min(accs.len()) {
-                        sub[ci][vi].merge(&accs[vi]);
-                        grand[ci][vi].merge(&accs[vi]);
+            for (ci, slot) in slots.iter().enumerate() {
+                if let ColSlot::Leaf(p) = slot {
+                    if let Some(accs) = m.get(p) {
+                        for vi in 0..spec.values.len().min(accs.len()) {
+                            sub[ci][vi].merge(&accs[vi]);
+                            grand[ci][vi].merge(&accs[vi]);
+                        }
                     }
                 }
             }
@@ -440,7 +466,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             if !srow.is_empty() {
                 srow[0] = Value::Text(format!("{top} 汇总").into());
             }
-            for ci in 0..col_paths.len() {
+            for ci in 0..slots.len() {
                 for vi in 0..spec.values.len() {
                     srow[spec.rows.len() + ci * spec.values.len() + vi] =
                         sub[ci][vi].finish(spec.values[vi].agg);
@@ -464,7 +490,8 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         if !grow.is_empty() {
             grow[0] = Value::Text("总计".into());
         }
-        for ci in 0..col_paths.len() {
+        fill_subtotals(&slots, &mut grand);
+        for ci in 0..slots.len() {
             for vi in 0..spec.values.len() {
                 grow[spec.rows.len() + ci * spec.values.len() + vi] =
                     grand[ci][vi].finish(spec.values[vi].agg);
@@ -473,8 +500,10 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         if grand_block > 0 {
             for vi in 0..spec.values.len() {
                 let mut acc = Acc::default();
-                for ci in 0..col_paths.len() {
-                    acc.merge(&grand[ci][vi]);
+                for ci in 0..slots.len() {
+                    if matches!(slots[ci], ColSlot::Leaf(_)) {
+                        acc.merge(&grand[ci][vi]);
+                    }
                 }
                 grow[grand_base + vi] = acc.finish(spec.values[vi].agg);
             }
@@ -632,6 +661,24 @@ pub fn build_col_slots(col_paths: &[Vec<String>], subtotals: bool) -> Vec<ColSlo
         out.push(ColSlot::Subtotal { prefix: vec![top.clone()], label: format!("{top} 汇总") });
     }
     out
+}
+
+/// 子总计槽的累计值 = 该上层前缀下所有叶子的合计
+fn fill_subtotals(slots: &[ColSlot], acc: &mut [Vec<Acc>]) {
+    for (ci, slot) in slots.iter().enumerate() {
+        if let ColSlot::Subtotal { prefix, .. } = slot {
+            for (li, leaf) in slots.iter().enumerate() {
+                if let ColSlot::Leaf(p) = leaf {
+                    if p.starts_with(prefix) && li != ci {
+                        for vi in 0..acc[ci].len() {
+                            let v = acc[li][vi].clone();
+                            acc[ci][vi].merge(&v);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 字段面板里可调序的轴

@@ -42,3 +42,28 @@ ROW| 总计  30   70    50   60     210
 - `pivot_parts2` 的 `colItems` 要跟着加 `<i t="default">` 子总计节点，否则 Excel 打开会对不上。
 
 **未完成前 C12.2 不计入验收。** 参考用例 `two_col_field_reference_dump` 标了 `#[ignore]`，原因写在注解里。
+
+## 子总计列已实现（同日）
+
+`compute()` 的列方向改成槽位模型（`ColSlot::Leaf | Subtotal`）：
+
+- `build_col_slots()` 在每个上层组后插一个「<项> 汇总」槽；
+- 数据行、小计行、总计行的槽值：叶子取该路径的累计，子总计按 `prefix` 汇合组内叶子（`fill_subtotals`）；
+- 右侧「…汇总」总计列只对叶子槽求和，避免把子总计重复计入；
+- 表头的值名行只写给叶子槽（Excel 子总计列在该行留空）。
+
+现在数值与 Excel 逐格一致：
+
+```
+华北   -  60  60  -  60  60 120
+华东  30  10  40  50   -  50  90
+总计  30  70 100  50  60 110 210
+```
+
+用例 `two_col_field_values_match_excel_with_subtotal_columns` 断言这三行（含 A 汇总 100、B 汇总 110），
+`pivot_multi_parts` **21 passed + 1 ignored**。
+
+## 仍未做
+
+- **表头行数**：我们是 4 行、Excel 是 3 行（Excel 把值名放首行首列、列字段名同行展开）；
+- `pivot_parts2` 的 `colItems` 还没有 `<i t="default">` 子总计节点，Excel 打开时列定义与网格不一致，需补。
