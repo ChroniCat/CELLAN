@@ -852,3 +852,46 @@ fn move_axis_changes_nesting_and_ignores_out_of_range() {
     assert_ne!(nested.headers, swapped.headers, "交换层级后表头应变化");
     assert!(!move_axis(&mut spec, Axis::Rows, 0, -1));
 }
+
+#[test]
+fn page_filter_matches_excel_filter_ref() {
+    use sheetcore::{Cell, Value};
+    use sheetcore::pivot_multi::FilterField;
+    let mut wb = sheetcore::Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    let heads = ["地区", "产品", "金额", "状态"];
+    for (c, h) in heads.iter().enumerate() {
+        wb.sheets[0].set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });
+    }
+    let data = [
+        ("华东", "A", 10.0, "有效"),
+        ("华北", "B", 20.0, "有效"),
+        ("华东", "A", 30.0, "无效"),
+        ("华北", "B", 40.0, "有效"),
+        ("华东", "B", 50.0, "无效"),
+        ("华北", "A", 60.0, "有效"),
+    ];
+    for (i, (a, b, c, d)) in data.iter().enumerate() {
+        let r = i as u32 + 1;
+        wb.sheets[0].set(r, 0, Cell { value: Value::Text((*a).into()), formula: None });
+        wb.sheets[0].set(r, 1, Cell { value: Value::Text((*b).into()), formula: None });
+        wb.sheets[0].set(r, 2, Cell { value: Value::Number(*c), formula: None });
+        wb.sheets[0].set(r, 3, Cell { value: Value::Text((*d).into()), formula: None });
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        filters: vec![FilterField { col: 3, keep: vec!["有效".into()] }],
+        layout: PivotLayout::default(),
+    };
+    let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let rows: Vec<String> = g
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|v| v.display()).collect::<Vec<_>>().join("\t"))
+        .collect();
+    // Excel 实测（filter-ref.tsv）：华北 120、华东 10、总计 130
+    assert_eq!(rows, vec!["华北\t120", "华东\t10", "总计\t130"]);
+}
