@@ -21,12 +21,35 @@ impl AxisField {
     }
 }
 
-/// 值字段：列号 + 汇总方式 + 可选显示名
+/// 显示值方式（Excel: showDataAs 属性）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShowAs {
+    #[default]
+    Normal,
+    PercentOfRow,
+    PercentOfColumn,
+    PercentOfTotal,
+}
+
+impl ShowAs {
+    /// Excel 写在 `<dataField showDataAs="...">` 里的值
+    pub fn xml(self) -> Option<&'static str> {
+        match self {
+            ShowAs::Normal => None,
+            ShowAs::PercentOfRow => Some("percentOfRow"),
+            ShowAs::PercentOfColumn => Some("percentOfColumn"),
+            ShowAs::PercentOfTotal => Some("percentOfTotal"),
+        }
+    }
+}
+
+/// 值字段：列号 + 汇总方式 + 可选显示名 + 显示值方式
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValueField {
     pub col: u32,
     pub agg: Agg,
     pub label: Option<String>,
+    pub show_as: ShowAs,
 }
 
 /// 筛选字段：keep 为空表示全部
@@ -70,7 +93,7 @@ impl PivotSpec2 {
             source: spec.source,
             rows: vec![AxisField { col: spec.row_field, group: spec.group.clone() }],
             cols: spec.col_field.map(|c| vec![AxisField::plain(c)]).unwrap_or_default(),
-            values: vec![ValueField { col: spec.value_field, agg: spec.agg, label: None }],
+            values: vec![ValueField { col: spec.value_field, agg: spec.agg, label: None, show_as: ShowAs::Normal }],
             filters: Vec::new(),
             layout: PivotLayout::default(),
         }
@@ -348,7 +371,60 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         grid.grand_total_row = Some(grid.rows.len());
         grid.rows.push(grow);
     }
+    apply_show_as(&mut grid, spec);
     grid
+}
+
+/// 数字取值（非数字按 0）
+fn as_num(v: &Value) -> f64 {
+    match *v {
+        Value::Number(n) => n,
+        _ => 0.0,
+    }
+}
+
+/// 按 Excel 的 showDataAs 语义把聚合值换成比值（存 0.6 而不是 60，格式靠 numFmtId=10）
+fn apply_show_as(grid: &mut PivotGrid, spec: &PivotSpec2) {
+    let rd = spec.rows.len();
+    let vc = spec.values.len();
+    if vc == 0 {
+        return;
+    }
+    let ncols = grid.col_labels.len();
+    for vi in 0..vc {
+        let mode = spec.values[vi].show_as;
+        if mode == ShowAs::Normal {
+            continue;
+        }
+        let mut col_tot = vec![0.0f64; ncols];
+        if let Some(g) = grid.grand_total_row {
+            for c in 0..ncols {
+                col_tot[c] = as_num(&grid.rows[g][rd + c * vc + vi]);
+            }
+        }
+        let total: f64 = col_tot.iter().sum();
+        for r in 0..grid.rows.len() {
+            let mut row_sum = 0.0;
+            for c in 0..ncols {
+                row_sum += as_num(&grid.rows[r][rd + c * vc + vi]);
+            }
+            for c in 0..ncols {
+                let idx = rd + c * vc + vi;
+                let v = as_num(&grid.rows[r][idx]);
+                let denom = match mode {
+                    ShowAs::PercentOfRow => row_sum,
+                    ShowAs::PercentOfColumn => col_tot[c],
+                    ShowAs::PercentOfTotal => total,
+                    ShowAs::Normal => 1.0,
+                };
+                grid.rows[r][idx] = if denom.abs() > f64::EPSILON {
+                    Value::Number(v / denom)
+                } else {
+                    Value::Empty
+                };
+            }
+        }
+    }
 }
 
 /// 把网格写进工作表（从 at 开始），返回占用区域

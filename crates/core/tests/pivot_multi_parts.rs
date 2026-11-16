@@ -76,7 +76,7 @@ fn spec_a() -> PivotSpec2 {
             AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
         ],
         cols: vec![],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal }],
         filters: vec![],
         layout: PivotLayout::default(),
     }
@@ -88,8 +88,8 @@ fn spec_b() -> PivotSpec2 {
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None },
-            ValueField { col: 3, agg: Agg::Sum, label: None },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -193,7 +193,7 @@ fn spec_d() -> PivotSpec2 {
             AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
             AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
         ],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal }],
         filters: vec![],
         layout: PivotLayout::default(),
     }
@@ -225,11 +225,11 @@ fn spec_e() -> PivotSpec2 {
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None },
-            ValueField { col: 2, agg: Agg::Count, label: None },
-            ValueField { col: 2, agg: Agg::Avg, label: None },
-            ValueField { col: 2, agg: Agg::Max, label: None },
-            ValueField { col: 2, agg: Agg::Min, label: None },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Avg, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Max, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Min, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -272,8 +272,8 @@ fn spec_g() -> PivotSpec2 {
             AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
         ],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None },
-            ValueField { col: 2, agg: Agg::Count, label: None },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -323,6 +323,60 @@ fn compact_layout_reaches_the_xml_and_excel_reads_it() {
 
     // 留一份给 Excel 探针（临时目录会被 Drop 清掉）
     let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/compact-multi.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&path, keep).ok();
+}
+
+#[test]
+fn show_as_percentages_match_excel_semantics() {
+    let fx = Fixture::new("showas");
+    let path = fx.file("showas.xlsx");
+    let mut wb = book(&path);
+    // 行=地区、列=产品、值=金额；Excel 实测：300/行500=0.6、300/列300=1、300/总1050=0.285714
+    let mk = |sa: sheetcore::pivot_multi::ShowAs| PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
+        values: vec![ValueField {
+            col: 2,
+            agg: Agg::Sum,
+            label: None,
+            show_as: sa,
+        }],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    };
+    let num_at = |grid: &sheetcore::pivot_multi::PivotGrid, r: usize, c: usize| match grid.rows[r]
+        [grid.row_depth + c]
+    {
+        sheetcore::Value::Number(n) => n,
+        _ => f64::NAN,
+    };
+
+    // 华东/A = 10 + 30 = 40；华东行合计 = 40+50 = 90；A 列合计 = 40+30?（华北/A=60）→ 100；总 210
+    let row = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(sheetcore::pivot_multi::ShowAs::PercentOfRow));
+    // 行序按拼音：华北(bei) 在 华东(dong) 前；华北/A = 60，行合计 120，A 列合计 100，全表 210
+    assert!((num_at(&row, 0, 0) - 60.0 / 120.0).abs() < 1e-12, "percentOfRow");
+
+    let col = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(sheetcore::pivot_multi::ShowAs::PercentOfColumn));
+    assert!((num_at(&col, 0, 0) - 60.0 / 100.0).abs() < 1e-12, "percentOfColumn");
+
+    let tot = sheetcore::pivot_multi::compute(&wb.sheets[0], &mk(sheetcore::pivot_multi::ShowAs::PercentOfTotal));
+    assert!((num_at(&tot, 0, 0) - 60.0 / 210.0).abs() < 1e-12, "percentOfTotal");
+
+    // XML 必须带 showDataAs + numFmtId=10
+    let spec = mk(sheetcore::pivot_multi::ShowAs::PercentOfTotal);
+    let _ = attach(&path, &mut wb, &spec);
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        z.by_name("xl/pivotTables/pivotTable1.xml").unwrap().read_to_string(&mut xml).unwrap();
+    }
+    assert!(xml.contains("showDataAs=\"percentOfTotal\""), "{xml}");
+    assert!(xml.contains("numFmtId=\"10\""), "{xml}");
+
+    let keep = std::path::Path::new("F:/finance-native-sheets-ready/work/probe/c12/showas-ours.xlsx");
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }

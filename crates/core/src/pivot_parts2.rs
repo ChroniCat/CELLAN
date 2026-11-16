@@ -392,12 +392,18 @@ pub fn build(
                 Agg::Max => " subtotal=\"max\"",
                 Agg::Min => " subtotal=\"min\"",
             };
+            // 显示值方式：Excel 写 showDataAs + numFmtId=10（0.00%）
+            let show = match v.show_as.xml() {
+                Some(x) => format!(" showDataAs=\"{x}\" numFmtId=\"10\""),
+                None => String::new(),
+            };
             format!(
-                "<dataField name=\"{}{}\" fld=\"{}\"{} baseField=\"0\" baseItem=\"0\"/>",
+                "<dataField name=\"{}{}\" fld=\"{}\"{}{} baseField=\"0\" baseItem=\"0\"/>",
                 agg_label(v.agg),
                 esc(&short),
                 v.col - c1,
-                sub
+                sub,
+                show
             )
         })
         .collect();

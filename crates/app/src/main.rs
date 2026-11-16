@@ -21984,6 +21984,7 @@ let txn = self.txn_begin(&keys);
                                     col: *c,
                                     agg: sheetcore::pivot::Agg::Sum,
                                     label: None,
+                                    show_as: sheetcore::pivot_multi::ShowAs::Normal,
                                 });
                                 ui.close_menu();
                             }
