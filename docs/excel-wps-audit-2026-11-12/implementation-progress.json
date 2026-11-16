@@ -4118,12 +4118,13 @@
       "acceptance": "",
       "files": [],
       "commits": [
-        "6432676"
+        "6432676",
+        "961aed8"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-04.1 实施中（Ctrl+S/Z/Y 已补；原生输入受无交互桌面阻塞）；QA-04.2 IME 三方互通阻塞；QA-04.3 未开始。"
+        "QA-04.1 实施中（Ctrl+S/Z/Y 已补；原生输入受无交互桌面阻塞）；QA-04.2 IME 阻塞；QA-04.3 已验收（后台结果归属已修为 doc_gen+epoch 双条件）。"
       ],
       "failures": [],
       "blocker": "",
@@ -4184,13 +4185,27 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "961aed8"
+          ],
+          "commands": [
+            "cargo test -p app -- --test-threads=2 -> 348 passed（work/goal-logs/qa043-app.log）",
+            "switching_tabs_keeps_values_selection_scroll_and_dirty_per_document -> pass",
+            "undo_history_belongs_to_its_own_document -> pass",
+            "background_save_finishes_in_its_own_tab_after_switching -> pass",
+            "switching_tabs_cancels_inflight_recalc_and_keeps_other_doc_intact -> pass",
+            "recalc_result_from_another_document_is_discarded_even_if_epoch_matches -> pass"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa04-multidoc.txt"
+          ],
+          "not_done": [
+            "切换动作由 API 驱动，非真人点标签：文档标签条需已有两个标签，开第二个文档要走 rfd 对话框，本机无交互桌面无法点击。",
+            "未测两个大文档来回切的耗时、保存中关标签的确认路径、跨文档复制粘贴（后者归 QA-04.1 阻塞项）。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",

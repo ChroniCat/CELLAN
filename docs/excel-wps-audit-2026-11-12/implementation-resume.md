@@ -581,3 +581,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - **阻塞**：本机无交互桌面（GetForegroundWindow=0），SendInput/WM_CHAR/WM_IME_CHAR/
   修饰键/鼠标消息全部无效 → QA-04.1 只能跑无修饰键子集，保持「实施中」。
 - app **343 passed**。
+
+### 检查点三十二：QA-04.3 多文档/后台任务（已验收）
+- **真缺陷**：后台重算结果只按 `wb_epoch` 认领，而 epoch 是每个文档各自计数 ——
+  A 文档的 epoch 可能恰好等于 B 文档切回来后的 epoch，A 的重算结果会覆盖 B。
+- 修法：`RecalcedWb` 带 `doc_gen`，接收侧 `epoch && doc_gen` 双条件；切标签/开新标签前
+  置位 `tasks.recalc_cancel`，不等它回来。
+- 5 条回归：值/选区/滚动/脏、撤销历史归属、后台保存归属、切标签取消重算、
+  epoch 撞车时按 doc_gen 丢弃（含「换回正确 doc_gen 必须被接受」反例）。
+- 边界：切标签走 API 不是真人点标签（单文档时无文档 TabItem，开第二个要走 rfd）。
+- app **348 passed**。
