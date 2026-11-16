@@ -22,7 +22,6 @@ UI-30.1 点击矩阵：283 个功能区动作逐个真跑，269 个走完，14 �
   MacroExport                        —— rfd 选导出路径（无宏时走状态提示，已有测试）
   InsertPicture                      —— rfd 选图片
   ImportWorkbook / ImportCsv         —— rfd 选导入文件
-  ImportWorkbook / ImportCsv         —— 同上
   Hyperlink                          —— 链接输入/文件选择
   OpenInNewTab                       —— rfd 打开文件
   Share / AutoShare                  —— 真起局域网监听（网络副作用）

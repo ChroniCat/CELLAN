@@ -450,3 +450,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 删除 toolbar_notes/view/data/page + set_freeze + export_pdf 共 **326 行**；
   大括号配平脚本删除（识别注释/字符串/字符字面量），不是按行号切。
 - 测试：app **336 passed**、core **106** 二进制 0 failed；真机截图确认快捷规则窗口内容。
+
+### 检查点十八：UI-30.1 功能区点击矩阵
+- `b6779b8`：`click_matrix_every_ribbon_action_is_handled` 从 XML 收集 283 个动作，
+  每个动作新建干净 App 真跑 `ribbon_action`，落兜底即失败（`unhandled_action`）。
+- 269 个动作跑完 0 漏网；14 个跳过并逐条注明原因（rfd 原生对话框、共享监听、联网检查）。
+  跳过名单必须是 XML 里真实存在的动作，拼错即失败（初版凭印象写的 3 个假名字被当场抓出）。
+- 过程中发现 `CheckUpdate` 会联网卡死、`ImportWorkbook`/`Hyperlink`/`OpenInNewTab` 会弹对话框。
+- 测试：app **337 passed**、core **106** 二进制 0 failed。
+- 边界：矩阵只证明「有实现、不落兜底」，不证明业务效果；14 个跳过项需真人点击。
