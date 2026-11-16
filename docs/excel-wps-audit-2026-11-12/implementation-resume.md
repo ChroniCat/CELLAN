@@ -407,3 +407,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   别人 clone 后测试会缺夹具。
 - 测试：core **106** 二进制 0 failed（`qa01-core5.log`）；app **330 passed**（`qa01-app3.log`）。
 - 剩余：SmartArt / 三维形状 / 图表形状未覆盖；`.xls` 结构性对象口径待确认。
+
+### 检查点十四：QA-01.3 SmartArt / 三维形状
+- `1f4517e`：SmartArt 夹具（5 节点）+ 三维矩形（Depth 30 / rotX 25 / rotY 15）。
+- 只读往返：`xl/diagrams/{data1,layout1,quickStyle1,colors1,drawing1}.xml` 与 `drawing1.xml`
+  逐字节一致；Excel 读数与源相同（nodes:5、texts:节点一|节点二、depth:30）。
+- 改 Box3D 文字后保存：文字进、`<a:scene3d>`/`<a:sp3d` 在、SmartArt 图形框在。
+- WPS 对照：源文件在 WPS 里就是 `nodes:1 default`（且把普通形状也报 HasSmartArt），
+  产物读数与源一致 —— 属 WPS 读取端限制，登记进 not_done 而不是当成我们的缺陷。
+- 测试：core **106** 二进制 0 failed（`qa01-core6.log`）；app **330 passed**（`qa01-app4.log`）。

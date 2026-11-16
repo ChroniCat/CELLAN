@@ -1162,12 +1162,15 @@
             "crates/core/tests/qa01_shapes_edit.rs",
             "crates/core/tests/fixtures/qa01/formats/shapes.xlsx",
             "crates/core/examples/textbox_edit.rs",
-            "scripts/qa01_shapes_probe.ps1"
+            "scripts/qa01_shapes_probe.ps1",
+            "crates/core/tests/fixtures/qa01/formats/smartart.xlsx",
+            "scripts/qa01_smartart_probe.ps1"
           ],
           "commits": [
             "56f9cc2",
             "3901d39",
-            "bcef26b"
+            "bcef26b",
+            "1f4517e"
           ],
           "commands": [
             "cargo test -p sheetcore --offline --test qa01_extended -- --nocapture -> 3 passed / 0 failed / 0 ignored",
@@ -1187,7 +1190,10 @@
             "powershell -File scripts/qa01_shapes_probe.ps1 shapes.xlsx Excel.Application -> shapes=4 charts=1 type6 items=2",
             "load+save 后 drawing/chart 部件逐字节一致，Excel/WPS 读数与源一致",
             "textbox_edit BoxB 改字后保存 -> shapes=4、BoxB 仍 type1、组合 2 项、图表标题销量在",
-            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed"
+            "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed",
+            "powershell -File scripts/qa01_smartart_probe.ps1 smartart.xlsx Excel.Application -> nodes=5 texts:节点一|节点二; Box3D depth:30 rotX:25 rotY:15",
+            "load+save 后 diagrams/*.xml 与 drawing1.xml 逐字节一致",
+            "WPS 对源文件与产物的 SmartArt 读数相同（nodes:1 default）—— WPS 读取端限制"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
@@ -1204,16 +1210,19 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-media/media-wps-rt2.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes-matrix.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-excel.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-wps-rt.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-wps-rt.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart-3d.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-excel-source.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-wps-rt.txt"
           ],
           "not_done": [
             ".xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留：读取走 calamine 只给值，属既定口径",
-            "SmartArt / 三维形状 / 图表形状（形状里放图表）未覆盖"
+            "WPS 自身读不出 Excel 的 SmartArt 节点（源文件同样只给默认节点），非本实现问题，需按合同口径说明"
           ],
           "failures": [],
           "blocker": "",
-          "next": "SmartArt/三维形状按需补夹具；.xls 边界需按原合同口径书面确认。",
-          "updated_utc": "2026-11-16T12:45:00Z"
+          "next": "图形与 SmartArt 已覆盖；余下只有 .xls 口径与 WPS SmartArt 读取限制两条说明项。",
+          "updated_utc": "2026-11-16T13:05:00Z"
         }
       ]
     },
