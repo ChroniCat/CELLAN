@@ -1,0 +1,5 @@
+product=Microsoft Excel 16.0
+shapes=2
+smartart1=name:Diagram 1 nodes:5 texts:节点一|节点二||| w=300 h=200
+shape2=type1 name:Box3D w=100 h=60 depth:30 rotX:25 rotY:15
+diagram_count=1

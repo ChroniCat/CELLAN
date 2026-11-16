@@ -1,0 +1,47 @@
+QA-01.3 图形补充：SmartArt 与三维形状
+================================================================================
+日期：2026-11-16    Excel 16.0 (Build 20326)、WPS 12.0 (KET.Application)
+夹具：work/probe/qa01/smartart.xlsx（Excel 造）
+探针：scripts/qa01_smartart_probe.ps1
+回归：crates/core/tests/qa01_shapes_edit.rs（新增 2 条）
+
+一、夹具内容（Art 表）
+----------------------
+  Diagram 1   SmartArt（SmartArtLayouts.Item(1)），5 个节点，节点一=「节点一」、节点二=「节点二」
+  Box3D       矩形 + 三维：Depth=30、RotationX=25、RotationY=15
+
+二、只读往返（load+save）
+-------------------------
+包内部件：xl/diagrams/{data1,layout1,quickStyle1,colors1,drawing1}.xml + drawing1.xml
+→ 保存后全部**逐字节一致**，无缺件无多件。
+
+Excel 读数（源 / 产物完全相同）：
+  shapes=2
+  smartart1=Diagram 1 nodes:5 texts:节点一|节点二||| 300×200
+  shape2=type1 Box3D 100×60 depth:30 rotX:25 rotY:15
+  diagram_count=1
+
+三、WPS 读数与对照（这条不是我们的缺陷）
+----------------------------------------
+WPS 对**原始 Excel 文件**和我们的产物读数完全一样：
+  smartart1=Diagram 1 nodes:1 texts:default
+  smartart2=Box3D nodes:1 texts:default
+  diagram_count=2
+即 WPS 的 SmartArt 对象模型只给默认节点（它把非 SmartArt 形状也报成 HasSmartArt）。
+对照组说明问题在 WPS 读取端，不在我们保存端：源文件在 WPS 里就是这个读数。
+
+四、改字路径（三维形状）
+------------------------
+把 Box3D 文字改成「立体」→ 我们保存 → drawing1.xml 里：
+  文字已写入、`<a:scene3d>` 与 `<a:sp3d` 都在、SmartArt 的 `<xdr:graphicFrame>` 仍在。
+回归：qa01_shapes_edit.rs::editing_a_3d_shape_keeps_three_d_effect
+
+五、测试
+--------
+qa01_shapes_edit.rs（4 条）
+  group_children_and_connectors_are_not_parsed_as_textboxes
+  editing_one_shape_keeps_group_connector_and_chart
+  smartart_and_3d_parts_survive_roundtrip           ← 新增
+  editing_a_3d_shape_keeps_three_d_effect           ← 新增
+cargo test -p sheetcore（--test-threads=2）：106 个测试二进制 0 failed → work/goal-logs/qa01-core6.log
+cargo test -p app --bin app（--test-threads=2）：330 passed            → work/goal-logs/qa01-app4.log

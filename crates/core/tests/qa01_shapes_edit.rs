@@ -66,3 +66,65 @@ fn editing_one_shape_keeps_group_connector_and_chart() {
     );
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn smartart_and_3d_parts_survive_roundtrip() {
+    let src = std::path::Path::new("tests/fixtures/qa01/formats/smartart.xlsx");
+    let out = std::env::temp_dir().join(format!(
+        "sc_smartart_{}_{}.xlsx",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let wb = sheetcore::xlsx::load(src).expect("打开 SmartArt 夹具失败");
+    sheetcore::xlsx::save(&out, &wb).expect("保存失败");
+
+    for part in [
+        "xl/drawings/drawing1.xml",
+        "xl/diagrams/data1.xml",
+        "xl/diagrams/layout1.xml",
+        "xl/diagrams/quickStyle1.xml",
+        "xl/diagrams/colors1.xml",
+        "xl/diagrams/drawing1.xml",
+    ] {
+        let before = read_part(src, part).unwrap_or_else(|| panic!("源文件缺 {part}"));
+        let after = read_part(&out, part).unwrap_or_else(|| panic!("保存后缺 {part}"));
+        assert_eq!(before, after, "{part} 必须逐字节一致");
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn editing_a_3d_shape_keeps_three_d_effect() {
+    let src = std::path::Path::new("tests/fixtures/qa01/formats/smartart.xlsx");
+    let out = std::env::temp_dir().join(format!(
+        "sc_shape3d_{}_{}.xlsx",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut wb = sheetcore::xlsx::load(src).expect("打开夹具失败");
+    wb.path = Some(src.to_path_buf());
+    {
+        let sh = &mut wb.sheets[0];
+        let tb = sh
+            .textboxes
+            .iter_mut()
+            .find(|t| t.name == "Box3D")
+            .expect("夹具里应该有 Box3D");
+        tb.text = "立体".into();
+        sh.textboxes_dirty = true;
+    }
+    sheetcore::xlsx::save(&out, &wb).expect("保存失败");
+    let draw = read_part(&out, "xl/drawings/drawing1.xml").expect("drawing 丢了");
+    let draw = String::from_utf8_lossy(&draw).to_string();
+    assert!(draw.contains("立体"), "文字没写进去");
+    assert!(draw.contains("<a:scene3d>"), "三维场景被洗掉了");
+    assert!(draw.contains("<a:sp3d"), "三维形状属性被洗掉了");
+    assert!(draw.contains("<xdr:graphicFrame"), "SmartArt 图形框被删了");
+    let _ = std::fs::remove_file(&out);
+}
