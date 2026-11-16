@@ -32,7 +32,7 @@ fn f(formula: &str) -> Cell {
 }
 
 #[test]
-#[ignore = "迭代求解器未实现：引擎当前对环返回 Error(Circular)，Excel 在迭代开启时收敛到 2/1"]
+#[ignore = "迭代求解器进行中：分支已接（calc_iterate 时环取上一轮值），但多遍扫描之间不回写结果，A1 停在 1、B1 停在 0"]
 fn circular_pair_converges_like_excels_iteration() {
     // Excel：迭代开启、MaxIterations=100、MaxChange=0.001 时 A1=B1+1 / B1=A1/2 → 2 / 1
     let mut wb = Workbook::new_blank();
@@ -41,6 +41,7 @@ fn circular_pair_converges_like_excels_iteration() {
         s.set(0, 0, f("=B1+1"));
         s.set(0, 1, f("=A1/2"));
     }
+    wb.calc_iterate = true;
     formula::recalc_all(&mut wb);
     let num = |v: Value| match v {
         Value::Number(n) => n,

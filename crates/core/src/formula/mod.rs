@@ -1088,6 +1088,15 @@ impl<'a> Calc<'a> {
                 CYCLE_CELLS.with(|cells| {
                     cells.borrow_mut().insert(key);
                 });
+                if self.wb.calc_iterate {
+                    // 迭代计算：环上的格子取「上一轮的值」（首轮取 0，与 Excel 一致），
+                    // 外层多遍扫描会把结果逐步推近不动点。
+                    let prev = to_fvalue(&cell.value);
+                    return match prev {
+                        FValue::Error(_) | FValue::Empty => FValue::number(0.0),
+                        v => v,
+                    };
+                }
                 return FValue::Error(ErrKind::Circular);
             }
             let previous = (self.cur_sheet, self.cur);
@@ -3035,7 +3044,12 @@ pub fn recalc_all_force_impl(
     let formula_count: usize = wb.sheets.iter()
         .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
     // 无环的溢出依赖链每遍至少推进一个公式；再多一遍确认稳定。
-    let passes = formula_count.saturating_add(1).max(2);
+    // 迭代计算：环上按上一轮值反复推进，最多 calc_max_iterations 遍（Excel 默认 100）
+    let passes = if wb.calc_iterate {
+        (wb.calc_max_iterations.max(2)) as usize
+    } else {
+        formula_count.saturating_add(1).max(2)
+    };
     let force_two = std::env::var("SC_TWOPASS").is_ok();
     let mut volatile_values = HashMap::new();
     let mut previous_arrays: HashMap<deps::CellKey, FValue> = HashMap::new();

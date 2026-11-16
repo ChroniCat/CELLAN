@@ -574,6 +574,12 @@ pub struct Workbook {
     pub date_system: DateSystem,
     /// 手动计算模式（workbook.xml calcPr/@calcMode="manual"）
     pub calc_manual: bool,
+    /// 迭代计算（calcPr/@iterate）：环上的格子用上一轮值反复求值
+    pub calc_iterate: bool,
+    /// 迭代上限（calcPr/@maxIterations，Excel 默认 100）
+    pub calc_max_iterations: u32,
+    /// 迭代收敛阈值（calcPr/@maxChange，Excel 默认 0.001）
+    pub calc_max_change: f64,
     /// 手动模式下已有编辑但尚未重算，状态栏显示“待计算”
     pub calc_pending: bool,
     /// 手动模式下具体哪些工作表还有未算编辑；计算单表时不能误清别的表
@@ -605,6 +611,9 @@ impl Workbook {
             encryption: None,
             date_system: DateSystem::D1900,
             calc_manual: false,
+            calc_iterate: false,
+            calc_max_iterations: 100,
+            calc_max_change: 0.001,
             calc_pending: false,
             calc_pending_sheets: std::collections::BTreeSet::new(),
             dirty: false,
