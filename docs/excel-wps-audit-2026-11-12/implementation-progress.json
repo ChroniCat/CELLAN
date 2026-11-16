@@ -4197,12 +4197,13 @@
       "acceptance": "",
       "files": [],
       "commits": [
-        "a3cd75f"
+        "a3cd75f",
+        "7e52ed2"
       ],
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-05.1 待实施（1440/1024/760 基线）；QA-05.2 待验收（四档 DPI 已出图并量化，未做真实系统缩放）；QA-05.3 待实施。"
+        "QA-05.1 待验收（三档尺寸已出图并核对边界）；QA-05.2 待验收（四档 DPI 已量化）；QA-05.3 待实施。"
       ],
       "failures": [],
       "blocker": "",
@@ -4215,13 +4216,26 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
+          "status": "待验收",
           "acceptance": "",
           "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "commits": [
+            "7e52ed2"
+          ],
+          "commands": [
+            "run_size_probe.ps1 1440x900/1024x768/760x420 -> 三张同尺寸 PNG，零尺寸节点 0",
+            "uia_dump 各尺寸 -> 功能区最右 1421/987/734；修复前 760 档溢出 771>760",
+            "uia_dump -Click \"更多 ▾\" -> CLICKED，弹出 单元格/编辑/加载项"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-sizes.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/size-760x420.png"
+          ],
+          "not_done": [
+            "状态栏缩放控件可访问矩形比窗口底边多 2-5px，未确认是否视觉裁切（vision 不可用）。",
+            "公式栏非编辑态无 Edit 节点；760 档搜索框隐藏后能否从「更多」到达未验。",
+            "没有 golden 图基线，只做尺寸/边界/可访问树核对。"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
