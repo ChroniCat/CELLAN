@@ -3454,13 +3454,13 @@
           "not_done": [
             "折叠/压缩布局（compact=\"1\"）未做：界面没有暴露布局开关，PivotLayout 只有表格形式",
             "计算字段/计算项、显示值方式（占总计百分比等）未做",
-            "WPS 改字段往返：WPS 保存侧把 pivotCacheDefinition 从 1300B 缩到 773B、sharedItems 3→2，Excel 回读 rows/cols/fields 全 0（WPS 自身缺陷，证据 c12-4/wps-roundtrip.md）。",
+            "WPS 改字段往返：可读写（pivots=1、rows/cols/data 各 1），但 WPS 保存后丢一个字段（源有 产品 列字段，回来只剩 地区），缓存 1300B→773B、sharedItems 3→2；WPS 侧降级，证据 c12-4/wps-roundtrip.md 更正节。",
             "更正：之前「pivotCacheDefinition 缺版本属性导致 Excel 丢弃透视表」是探针假象（错误写法 $ws.PivotTables.Item(1)）；稳定探针下 pivot-real 与 multi-A/D 均 pivots=1。版本属性保留为加固，不记为缺陷修复。"
           ],
           "failures": [],
           "blocker": "",
           "next": "C12 四切片齐；等用户按生产口径复核",
-          "updated_utc": "2026-11-16T19:57:29Z"
+          "updated_utc": "2026-11-16T19:57:42Z"
         }
       ]
     },
