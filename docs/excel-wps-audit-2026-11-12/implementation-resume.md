@@ -292,3 +292,16 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 证据：`implementation-evidence/qa06-2-fin-lookup-text.txt` 与 `qa06-2/{matrix.tsv,excel.tsv,wps.tsv,cases.json,probe-meta.json}`。
 - 台账：QA-06.3 → 待验收；父母 24/4/27/6，切片 60/1/69/18（未抬高已验收数）。
 - 下一步：QA-06.2 数组/动态数组与增量一致。
+
+## 2026-11-16 检查点六：QA-06.2 动态数组溢出对拍 + 增量一致（QA-06 三切片齐）
+
+- 提交 `f508125`（`test(qa06): dynamic-array spill blocks vs Excel and incremental/full recalc parity`）。
+- 夹具 12 个数组公式锚点（E1/E10/…，间隔 ≥9 行）；Excel 实算经 `SpillingToRange` 导出块：
+  SEQUENCE×2、SORT、SORTBY、FILTER、TRANSPOSE、`B1:B5*2`、UNIQUE 共 **8 块 40 格与本机 Excel 逐格一致**。
+- `TAKE`/`DROP`/`HSTACK`/`VSTACK` 在本机 Excel 16.0 Build 20326 返回 **#NAME?**（该构建没有这些函数），
+  矩阵里明确 SKIP：不算通过也不算失败，不拿“引擎实现了”冒充对拍通过。
+- 增量一致：改 B1 后 `recalc_dirty` 只重算 **12 格**，130×8=**1040 格**与全量重算逐格相同。
+- 坑：PowerShell `Set-Content -Encoding UTF8` 写 BOM → `&b.anchor[1..]` 报 "not a char boundary"；
+  探针改 `UTF8Encoding($false)`，Rust 侧再 `trim_start_matches('\u{feff}')` 兜底。
+- 证据：`implementation-evidence/qa06-2-array-spill.txt` 与 `qa06-2a/{blocks.tsv,anchor.tsv,probe-meta.json,qa06a.xlsx}`。
+- 台账：QA-06.2 → 待验收，QA-06 父项三个切片齐 → 待验收；父母 24/3/28/6，切片 60/1/70/17（未抬高已验收数）。

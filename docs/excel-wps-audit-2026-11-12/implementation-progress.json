@@ -4121,7 +4121,7 @@
       "scope": "core/tests/公式golden",
       "source": "qa-requirements.md",
       "heading": "QA-06 P1 公式语义回归矩阵",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [
         "crates/core/tests/qa06_matrix.rs",
@@ -4144,11 +4144,13 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/wps.tsv",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json"
       ],
-      "not_done": [],
+      "not_done": [
+        "#SPILL! 冲突、迭代计算下的增量一致、LAMBDA 系列（本机 Excel 不支持）未覆盖"
+      ],
       "failures": [],
       "blocker": "",
-      "next": "QA-06.2 数组/动态数组与增量一致",
-      "updated_utc": "2026-11-16T08:58:16Z",
+      "next": "",
+      "updated_utc": "2026-11-16T09:01:20Z",
       "slices": [
         {
           "id": "QA-06.1",
@@ -4193,17 +4195,38 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待实施",
-          "acceptance": "",
-          "files": [],
-          "commits": [],
-          "commands": [],
-          "evidence": [],
-          "not_done": [],
+          "status": "待验收",
+          "acceptance": "动态数组溢出块对拍：SEQUENCE 两个、SORT、SORTBY、FILTER、TRANSPOSE、B1:B5*2、UNIQUE 共 8 块 40 格与本机 Excel 16.0 的 SpillingToRange 逐格一致；TAKE/DROP/HSTACK/VSTACK 因本机 Excel 16.0 Build 20326 返回 #NAME? 明确 SKIP，不计通过也不计失败。全量 vs 增量：同一批公式，改 B1 后 recalc_dirty 只重算 12 格，130x8=1040 格结果与全量重算完全一致。",
+          "files": [
+            "crates/core/tests/qa06_array.rs",
+            "crates/core/tests/fixtures/qa06a/blocks.tsv",
+            "scripts/qa06_array_fixture.py",
+            "scripts/qa06_array_probe.ps1"
+          ],
+          "commits": [
+            "f508125"
+          ],
+          "commands": [
+            "python scripts/qa06_array_fixture.py work/qa06a -> 12 个数组公式锚点",
+            "powershell -File scripts/qa06_array_probe.ps1 -> \"Excel 16.0：12 个数组块\"（4 条本机 #NAME? 标记 SKIP）",
+            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 --nocapture -> 2 passed（溢出 40 格一致；增量 12 格、1040 格与全量一致）"
+          ],
+          "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/blocks.tsv",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/anchor.tsv",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/probe-meta.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/qa06a.xlsx"
+          ],
+          "not_done": [
+            "#SPILL! 冲突与溢出清理只在单测里，未进 Excel 对拍矩阵",
+            "迭代计算/循环引用下的增量一致未覆盖",
+            "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-16T09:01:20Z"
         },
         {
           "id": "QA-06.3",
