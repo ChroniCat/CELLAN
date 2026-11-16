@@ -32,3 +32,13 @@ EXIT=0
 - 这是**合成大簿**，不是原始 106MB / 21 表压力样本（该文件在本机已不存在）；
 - 大簿的性能指标（打开/保存耗时）属 QA-07，不以此 run 代替；
 - 二次保存组合正在单独跑（`qa01-large-resave.log`）。
+
+## 大簿 + 二次保存（同日）
+
+```
+[large-synth] resave: vs原文件 excel 0 / wps 0；vs Excel重存 excel 0 / wps 0
+entries=1 with_diffs=0   EXIT=0
+```
+
+20 万行夹具走「我们保存 → Excel 重存 → 我们再保存 → 双端快照」后**两个基线都是 0**：
+大簿与第三方重存这两条缺口同时关闭。产物：`matrix-large-resave-1117.json`。

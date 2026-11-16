@@ -1129,7 +1129,9 @@
             "python scripts/qa01_roundtrip.py (hardened compare) -> 3 paths pass, B1 IsError=true/error_code=-2146826281",
             "cd scripts && python qa01_matrix_runner.py --out ../work/probe/qa01/matrix-full.json",
             "结果：12 个夹具 × Excel/WPS，0 处意外差异；.xls 6 处为已登记损失（两侧一致）",
-            "python scripts/qa01_matrix_runner.py --out work/probe/qa01/matrix-run-1117.json -> 12/12 roundtrip ok, Excel diffs=0, WPS diffs=0 (76 类别位)"
+            "python scripts/qa01_matrix_runner.py --out work/probe/qa01/matrix-run-1117.json -> 12/12 roundtrip ok, Excel diffs=0, WPS diffs=0 (76 类别位)",
+            "resave 全量：11/11 夹具 vs Excel重存 0/0（.xls 显式跳过）",
+            "大簿 200k 行：往返 + resave 双端 0 diff（matrix-large-1117.json / matrix-large-resave-1117.json）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-roundtrip.txt",
@@ -1139,12 +1141,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix/matrix-summary.tsv"
           ],
           "not_done": [
-            "大簿（106MB 级）与二次保存刷新后的第三方再读未纳入本 run；真实 UI 编辑路径未接入（无交互桌面）；父项证据链需人工复查。.xls 结构性对象按既定口径不保留（features-xls 只登记 values,numfmt）。"
+            "原始 106MB / 21 表压力样本本机已不存在，需你提供路径再跑一遍（现用合成 200k 行夹具，双端 0 diff）；真实 UI 编辑后再存未接入（无交互桌面）；父项证据链需人工复查。"
           ],
           "failures": [],
           "blocker": "",
           "next": "runner 已覆盖 12 类夹具；余下为父项的人工路径与复查条件。",
-          "updated_utc": "2026-11-16T22:14:24Z"
+          "updated_utc": "2026-11-16T22:47:09Z"
         },
         {
           "id": "QA-01.3",
