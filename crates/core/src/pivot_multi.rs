@@ -41,6 +41,16 @@ impl ShowAs {
             ShowAs::PercentOfTotal => Some("percentOfTotal"),
         }
     }
+
+    /// 界面上的中文名
+    pub fn label(self) -> &'static str {
+        match self {
+            ShowAs::Normal => "值",
+            ShowAs::PercentOfRow => "占行合计%",
+            ShowAs::PercentOfColumn => "占列合计%",
+            ShowAs::PercentOfTotal => "占总计%",
+        }
+    }
 }
 
 /// 值字段：列号 + 汇总方式 + 可选显示名 + 显示值方式

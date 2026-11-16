@@ -380,3 +380,17 @@ fn show_as_percentages_match_excel_semantics() {
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }
+
+#[test]
+fn show_as_labels_and_xml_names_are_stable() {
+    use sheetcore::pivot_multi::ShowAs;
+    assert_eq!(ShowAs::Normal.xml(), None);
+    assert_eq!(ShowAs::PercentOfRow.xml(), Some("percentOfRow"));
+    assert_eq!(ShowAs::PercentOfColumn.xml(), Some("percentOfColumn"));
+    assert_eq!(ShowAs::PercentOfTotal.xml(), Some("percentOfTotal"));
+    // 界面文案（改了要同步截图验收）
+    assert_eq!(ShowAs::Normal.label(), "值");
+    assert_eq!(ShowAs::PercentOfRow.label(), "占行合计%");
+    assert_eq!(ShowAs::PercentOfColumn.label(), "占列合计%");
+    assert_eq!(ShowAs::PercentOfTotal.label(), "占总计%");
+}

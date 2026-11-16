@@ -21972,6 +21972,24 @@ let txn = self.txn_begin(&keys);
                                     }
                                 }
                             });
+                        egui::ComboBox::from_id_salt(format!("p2sa{i}"))
+                            .selected_text(spec.values[i].show_as.label())
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for sa in [
+                                    sheetcore::pivot_multi::ShowAs::Normal,
+                                    sheetcore::pivot_multi::ShowAs::PercentOfRow,
+                                    sheetcore::pivot_multi::ShowAs::PercentOfColumn,
+                                    sheetcore::pivot_multi::ShowAs::PercentOfTotal,
+                                ] {
+                                    if ui
+                                        .selectable_label(spec.values[i].show_as == sa, sa.label())
+                                        .clicked()
+                                    {
+                                        spec.values[i].show_as = sa;
+                                    }
+                                }
+                            });
                         if ui.small_button("×").clicked() {
                             spec.values.remove(i);
                             break;
