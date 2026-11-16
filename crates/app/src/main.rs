@@ -1991,8 +1991,8 @@ enum OpenMsg {
     Recalced(Box<Workbook>, Box<sheetcore::formula::deps::Deps>),
     /// 大文件只把依赖图备好，不阻塞打开（缓存值先显示）
     DepsReady(Box<sheetcore::formula::deps::Deps>),
-    /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch）
-    RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64),
+    /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch 与 doc_gen）
+    RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64, u64),
     /// 后台重算被取消（未写回，模型保持原值）
     RecalcCancelled,
     Failed(String),
@@ -3076,6 +3076,7 @@ impl SheetApp {
         }
         let wb = self.wb.clone();
         let epoch = self.wb_epoch;
+        let doc_gen = self.doc_gen;
         let (tx, rx) = std::sync::mpsc::channel();
         self.tasks.open_rx = Some(rx);
         self.tasks.busy = true;
@@ -3109,7 +3110,7 @@ impl SheetApp {
             wb.calc_manual = manual;
             // 单表重算只清该表；全量重算由 recalc_all_force 清空。
             let deps = sheetcore::formula::deps::Deps::build(&wb);
-            let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch));
+            let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch, doc_gen));
         });
     }
 
@@ -4383,12 +4384,14 @@ impl SheetApp {
                     finished = true;
                     continue;
                 }
-                OpenMsg::RecalcedWb(wb, deps, epoch) => {
+                OpenMsg::RecalcedWb(wb, deps, epoch, doc_gen) => {
                     self.tasks.recalc_cancel = None;
                     self.tasks.recalc_done = None;
                     self.tasks.recalc_total = None;
                     self.tasks.busy = false;
-                    if epoch == self.wb_epoch {
+                    // 归属判定：epoch 只在本文档内有意义，跨文档要连 doc_gen 一起比，
+                    // 否则「A 文档的重算结果」可能落到 epoch 恰好相同的 B 文档上。
+                    if epoch == self.wb_epoch && doc_gen == self.doc_gen {
                         self.wb = *wb;
                         self.manual_calc = self.wb.calc_manual;
                         self.wb_epoch += 1;
@@ -27530,6 +27533,16 @@ fn elide(s: &str, max_chars: usize) -> String {
     }
 
     /// 切到某个标签
+    /// 切标签/开新标签前把还在跑的「重算全部」取消：结果属于旧文档，
+    /// 不能等它回来再靠 epoch 撞运气（epoch 是每个文档各自计数，可能撞上）。
+    fn cancel_bg_recalc_on_switch(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(c) = self.tasks.recalc_cancel.as_ref() {
+            c.store(true, Ordering::Relaxed);
+            self.status = "切换文档，已取消未完成的重算".into();
+        }
+    }
+
     fn switch_tab(&mut self, idx: usize) {
         if idx == self.active_tab || idx >= self.tabs.len() {
             return;
@@ -27543,6 +27556,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             return;
         }
         self.drop_merge_confirmation();
+        self.cancel_bg_recalc_on_switch();
         let parked = self.park_current();
         self.tabs[self.active_tab] = TabSlot::Parked(parked);
         let target = std::mem::replace(&mut self.tabs[idx], TabSlot::Active);
@@ -27579,6 +27593,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             return;
         }
         self.drop_merge_confirmation();
+        self.cancel_bg_recalc_on_switch();
         let parked = self.park_current();
         self.tabs[self.active_tab] = TabSlot::Parked(parked);
         self.tabs.push(TabSlot::Active);

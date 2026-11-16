@@ -8986,3 +8986,268 @@ fn ctrl_z_and_ctrl_y_drive_undo_and_redo() {
     let redone2 = app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default();
     assert_eq!(redone2, "7", "Ctrl+Shift+Z 没有重做");
 }
+
+// ---------------------------------------------------------------------------
+// QA-04.3 多文档：值/选区/滚动/脏标记/撤销/后台任务必须各归各的标签
+// ---------------------------------------------------------------------------
+
+#[test]
+fn switching_tabs_keeps_values_selection_scroll_and_dirty_per_document() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // 文档 1：写值 + 挪选区 + 滚一段 + 标脏
+    app.wb.sheet_mut(0).set(0, 0, text("doc1"));
+    app.wb.dirty = true;
+    app.sel = (3, 2);
+    app.sel_end = (3, 2);
+    app.zoom = 1.0;
+    app.scroll = egui::vec2(120.0, 240.0);
+
+    app.open_in_new_tab(std::path::PathBuf::new());
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active_tab, 1);
+    assert!(
+        app.wb.sheet(0).get(0, 0).is_none(),
+        "新标签应该是空白文档"
+    );
+    assert_eq!(app.sel, (0, 0), "新标签选区应回到 A1");
+    assert_eq!(app.scroll.y, 0.0, "新标签滚动应回到顶部");
+
+    // 文档 2：写值
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("doc2".into()));
+    app.commit_edit(None);
+    assert!(app.wb.dirty);
+
+    app.switch_tab(0);
+    assert_eq!(app.active_tab, 0);
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("doc1".to_string()),
+        "切回来拿到的不是文档 1 的内容"
+    );
+    assert_eq!(app.sel, (3, 2), "文档 1 的选区没被记住");
+    assert!(app.scroll.y > 200.0, "文档 1 的滚动位置没被记住");
+    assert!(app.wb.dirty, "文档 1 的未保存标记丢了");
+
+    app.switch_tab(1);
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("doc2".to_string()),
+        "文档 2 的内容没被记住"
+    );
+    assert_eq!(app.sel, (0, 0), "文档 2 选区不该跟着文档 1");
+}
+
+#[test]
+fn undo_history_belongs_to_its_own_document() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("keep"));
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.editing = Some(EditState::new("d1".into()));
+    app.commit_edit(None);
+
+    app.open_in_new_tab(std::path::PathBuf::new());
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("d2".into()));
+    app.commit_edit(None);
+
+    // 在文档 2 撤销：只回退文档 2
+    app.do_undo(false);
+    let d2 = app.wb.sheet(0).get(0, 0).map(|c| c.value.display());
+    assert_eq!(d2, None, "文档 2 撤销没有生效");
+    app.switch_tab(0);
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("keep".to_string()),
+        "文档 2 的撤销把文档 1 改了"
+    );
+    assert_eq!(
+        app.wb.sheet(0).get(0, 1).map(|c| c.value.display()),
+        Some("d1".to_string()),
+        "文档 1 自己的编辑丢了"
+    );
+    // 切回文档 2 再重做：历史必须还是文档 2 的
+    app.switch_tab(1);
+    app.do_undo(true);
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("d2".to_string()),
+        "文档 2 的重做历史没保住"
+    );
+}
+
+#[test]
+fn background_save_finishes_in_its_own_tab_after_switching() {
+    let dir = std::env::temp_dir().join(format!("sc_qa043_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path1 = dir.join("doc1.xlsx");
+    sheetcore::xlsx::save(&path1, &sheetcore::model::Workbook::new_blank()).expect("造空文件");
+
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.path = Some(path1.clone());
+    app.wb.sheet_mut(0).set(0, 0, text("saved1"));
+    app.wb.dirty = true;
+
+    app.save(false);
+    assert!(app.tasks.saving.is_some(), "保存应在后台进行，而不是同步阻塞");
+
+    // 保存还在跑的时候开新标签并写点东西
+    app.open_in_new_tab(std::path::PathBuf::new());
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("dirty2".into()));
+    app.commit_edit(None);
+    assert!(app.wb.dirty, "文档 2 应该是脏的");
+
+    // 等文档 1 的后台保存结束（最多 10 秒）
+    let t0 = std::time::Instant::now();
+    while app.tabs.iter().any(|t| {
+        matches!(t, TabSlot::Parked(d) if d.tasks.saving.is_some())
+    }) && t0.elapsed().as_secs() < 10
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 每帧都要真的收一次后台保存结果（和主循环一样），否则挂起标签的 saving 永远不清
+        app.poll_save();
+    }
+
+    // 文档 1：文件里应该有值、脏标记清掉
+    let wb = sheetcore::xlsx::load(&path1).expect("读回文档 1");
+    assert_eq!(
+        wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("saved1".to_string()),
+        "后台保存没有把文档 1 写进文件"
+    );
+    app.switch_tab(0);
+    assert!(!app.wb.dirty, "文档 1 保存完成后脏标记应清掉");
+
+    // 文档 2：脏标记和内容不受文档 1 保存影响
+    app.switch_tab(1);
+    assert!(app.wb.dirty, "文档 2 的脏标记被别人的保存清掉了");
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("dirty2".to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn switching_tabs_cancels_inflight_recalc_and_keeps_other_doc_intact() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("1"));
+    // 长链：A2=A1+1 … A20001=A20000+1，够让后面切标签时它还没算完
+    for r in 1..20_000u32 {
+        app.wb
+            .sheet_mut(0)
+            .set(r, 0, formula(&format!("=A{}+1", r)));
+    }
+    app.wb.dirty = true;
+
+    app.recalc_async(None);
+    assert!(app.tasks.busy, "重算应在后台跑");
+
+    // 立刻开新标签：旧文档的重算必须被取消，且不能落到新文档上
+    app.open_in_new_tab(std::path::PathBuf::new());
+    assert!(
+        !app.tasks.busy,
+        "切到新标签后旧文档的重算状态不该带过来"
+    );
+    // 取消信号必须真的打到旧文档自己的标志位上（状态栏随后会被「已新建标签」覆盖）
+    match &app.tabs[0] {
+        TabSlot::Parked(doc) => {
+            let flag = doc
+                .tasks
+                .recalc_cancel
+                .as_ref()
+                .expect("旧文档应保留自己的重算取消标志");
+            assert!(
+                flag.load(std::sync::atomic::Ordering::Relaxed),
+                "切标签时没有把取消标志置位"
+            );
+        }
+        TabSlot::Active => panic!("旧文档应被挂起成 Parked"),
+    }
+
+    // 新文档写值，等几帧确认没有被旧结果覆盖
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("newdoc".into()));
+    app.commit_edit(None);
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(900.0, 700.0),
+        ));
+        let _ = ctx.run(input, |_c| {});
+    }
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("newdoc".to_string()),
+        "旧文档的重算结果覆盖了新文档"
+    );
+    assert_eq!(
+        app.wb.sheet(0).get(1, 0).map(|c| c.value.display()),
+        None,
+        "新文档被塞进了旧文档的公式结果"
+    );
+}
+
+#[test]
+fn recalc_result_from_another_document_is_discarded_even_if_epoch_matches() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheet_mut(0).set(0, 0, text("doc1"));
+    let doc1_gen = app.doc_gen;
+
+    app.open_in_new_tab(std::path::PathBuf::new());
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("doc2".into()));
+    app.commit_edit(None);
+    assert_ne!(doc1_gen, app.doc_gen, "前提：两个文档的 doc_gen 不同");
+
+    // 伪造一条「文档 1 的重算结果」：epoch 故意用当前文档的，只有 doc_gen 是旧的
+    let mut foreign = sheetcore::model::Workbook::new_blank();
+    foreign.sheet_mut(0).set(0, 0, text("FOREIGN"));
+    let deps = sheetcore::formula::deps::Deps::build(&foreign);
+    let epoch_now = app.wb_epoch;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tasks.open_rx = Some(rx);
+    tx.send(OpenMsg::RecalcedWb(Box::new(foreign), Box::new(deps), epoch_now, doc1_gen))
+        .unwrap();
+    app.poll_open();
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("doc2".to_string()),
+        "别的文档的重算结果被套用到当前文档"
+    );
+
+    // 同一条消息，doc_gen 换成当前文档：必须被接受，证明拦截理由确实是归属而不是永远拒绝
+    let mut mine = sheetcore::model::Workbook::new_blank();
+    mine.sheet_mut(0).set(0, 0, text("MINE"));
+    let deps2 = sheetcore::formula::deps::Deps::build(&mine);
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    app.tasks.open_rx = Some(rx2);
+    tx2.send(OpenMsg::RecalcedWb(
+        Box::new(mine),
+        Box::new(deps2),
+        app.wb_epoch,
+        app.doc_gen,
+    ))
+    .unwrap();
+    app.poll_open();
+    assert_eq!(
+        app.wb.sheet(0).get(0, 0).map(|c| c.value.display()),
+        Some("MINE".to_string()),
+        "归属正确的重算结果也被丢了"
+    );
+}
