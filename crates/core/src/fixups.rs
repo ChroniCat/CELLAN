@@ -1506,3 +1506,33 @@ pub fn restore_chart_parts(path: &Path, base: &Path, edited: &[String]) -> Resul
     }
     Ok(restored)
 }
+
+/// 让 [Content_Types].xml 里 workbook 的主类型和输出扩展名一致。
+///
+/// Excel 认扩展名：`.xlsx` 里声明 `macroEnabled.main+xml`（或反过来）会报
+/// 「文件格式或文件扩展名无效」，哪怕包本身结构完整。
+pub fn normalise_workbook_ct(path: &std::path::Path, macro_enabled: bool) -> anyhow::Result<()> {
+    let Some(bytes) = read_part_file(path, "[Content_Types].xml") else {
+        return Ok(());
+    };
+    let Ok(xml) = String::from_utf8(bytes) else {
+        return Ok(());
+    };
+    let want = if macro_enabled {
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
+    } else {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+    };
+    let mut out = xml.clone();
+    for old in [
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    ] {
+        out = out.replace(old, want);
+    }
+    if out == xml {
+        return Ok(());
+    }
+    crate::patch::append_entry(path, "[Content_Types].xml", out.as_bytes())?;
+    Ok(())
+}

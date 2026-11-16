@@ -919,7 +919,10 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     let tbs = crate::textbox::load(path, part);
                     if !tbs.is_empty() {
                         sheet.textboxes = tbs;
-                        sheet.textboxes_dirty = true;
+                        // 只读快照：不标脏。标脏会让 textbox::apply 用我们的文本框模型
+                        // 重写整个 drawing，把 Excel 的形状几何/样式洗掉
+                        // （实测矩形被写成 txBox="1" + off/ext 归零）。
+                        sheet.textboxes_dirty = false;
                     }
                 }
             }
@@ -1719,6 +1722,14 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         Some(p) => p,
         None => path.to_path_buf(),
     };
+    // .xls / .xlsb 这类二进制基准不是 zip 包：不能当包结构模板，
+    // 否则 prepare_base 读 xl/workbook.xml 直接失败（“读取基准工作簿目录失败”）。
+    // 这种情况按全新文件从模型重建。
+    let original_base = if crate::fixups::read_part(&original_base, "xl/workbook.xml").is_some() {
+        original_base
+    } else {
+        path.to_path_buf()
+    };
     // Reconcile the package manifest before umya reads it. This retains the
     // original worksheet parts even when their visible names/order have changed.
     let prepared_base = structure::prepare_base(&original_base, path, wb)?;
@@ -2419,6 +2430,35 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // staged 补丁之前，加表/改名时会出现「Content-Types 声明 /xl/worksheets/sheet2.xml，
     // 包里只有 native-sheet-…」——verify_saved_package 抓到的正是这个（Excel 会判包损坏）。
     must_save!("prune-content-types-final", crate::fixups::prune_content_types(path));
+    // 输出扩展名必须和包的主类型一致：.xlsm 的基准另存成 .xlsx 时，
+    // [Content_Types].xml 里仍是 macroEnabled，Excel 直接报
+    // 「文件格式或文件扩展名无效」。带宏的另存 .xlsx 属于必然丢宏，拒绝。
+    // save_atomic 先写 ".~name.xlsx.saving-1234" 这样的临时文件，
+    // 扩展名得从临时名里还原，否则会把 .xlsm 误判成未知格式。
+    let logical_ext = {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let logical = match name.strip_prefix(".~").and_then(|r| r.split_once(".saving-")) {
+            Some((head, _)) => head.to_string(),
+            None => name,
+        };
+        std::path::Path::new(&logical)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    };
+    let wants_macro = logical_ext.as_deref() == Some("xlsm");
+    let target_is_xlsx = logical_ext.as_deref() == Some("xlsx");
+    if target_is_xlsx && crate::vba::has_macros(path) {
+        anyhow::bail!("这份工作簿带 VBA 宏，只能另存为 .xlsm（写成 .xlsx 会丢宏）");
+    }
+    if wants_macro || target_is_xlsx {
+        must_save!(
+            "content-type-main",
+            crate::fixups::normalise_workbook_ct(path, wants_macro)
+        );
+    }
     // 最后一步：外链关系按原文恢复，避免 URL 被归一、TargetMode 被丢
     must_save!("restore-external-rels", crate::notes::restore_external_rels(path, &external_rels));
     Ok(())

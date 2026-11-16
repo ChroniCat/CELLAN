@@ -1,0 +1,10 @@
+product=Microsoft Excel 12.0
+sheet=Media
+pictures=1
+shapes=2
+shape1=13 name=Picture 2 w=32 h=32
+shape2=1 name=Rectangle 3 w=80 h=40
+links=1 all=ext-src.xlsx
+a2.formula=='F:\finance-native-sheets-ready\work\probe\qa01\[ext-src.xlsx]Sheet1'!$A$1
+a2.value=42
+a3.value=EXT
