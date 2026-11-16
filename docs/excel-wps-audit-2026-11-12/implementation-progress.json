@@ -3316,18 +3316,19 @@
           "commands": [
             "cargo test -p sheetcore --test pivot_multi_parts -> 22 passed（两行字段小计/多值/两层列字段/页筛选/子总计列）",
             "Excel probe twocol-ours.xlsx -> range=A9:H14",
-            "Excel probe multival-ours.xlsx -> range=A9:G14"
+            "Excel probe multival-ours.xlsx -> range=A9:G14",
+            "scripts/c12_sort_ab.ps1 -> A/B 拼音序、C 按值升序；既有文件按 rowItems"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-multi.txt"
           ],
           "not_done": [
-            "与 Excel 的标签排序默认口径未定（两份 Excel 基准互斥：compact 基准=源出现顺序，新建探针=拼音序），引擎暂按源顺序并写显式 rowItems；真实键鼠/刷新交互未验。"
+            "真实键鼠/刷新交互未验（环境无交互桌面）；如需「与 Excel 新建一致的默认排序」，需在面板加拼音排序选项（口径已由 A/B/C 实验定论：新建=拼音，既有文件=按 rowItems）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-16T21:57:26Z"
+          "updated_utc": "2026-11-16T21:58:16Z"
         },
         {
           "id": "C12.3",
