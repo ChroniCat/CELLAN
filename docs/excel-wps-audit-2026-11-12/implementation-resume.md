@@ -335,3 +335,10 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 测试：`pivot_multi_parts` 4 passed、app `multi_field_pivot_from_panel_is_queued_for_real_parts` 1 passed；
   全量 `-p sheetcore` 103 个二进制 0 failed、`-p app` 326 passed。
 - 剩余：多列字段（≥2）与折叠布局 `rowItems`、非求和聚合的缓存属性、Excel 改字段后存回的保真。
+
+### 检查点八补充：两个列字段 + 保真
+- `5b4719c`：列轴推广到 N 层（`<i r="k">` 重复外层、组小计 `<i t="default">`、grand）；
+  踩坑：`pivotFields` 只给第一个列字段标 `axisCol` → Excel 报「不能取得类 Workbooks 的 Open 属性」，
+  必须把所有列字段都标轴。修后 Excel/WPS 均 `cols=[产品,数量]`，值 10/30/60 与汇总 40/60/100/110/210 正确。
+- `61132d7`：保真链路 —— Excel 打开我们的多字段透视并另存 → 我们 `xlsx::load`+`save` → Excel/WPS 仍 `PivotTables=1`。
+- 回归：`pivot_multi_parts` 5 passed；`-p sheetcore` 103 二进制 0 failed；`-p app` 326 passed。

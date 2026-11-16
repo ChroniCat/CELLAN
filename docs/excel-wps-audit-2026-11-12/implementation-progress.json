@@ -3311,7 +3311,9 @@
           "commits": [
             "9452130",
             "41b448b",
-            "66d17f1"
+            "66d17f1",
+            "61132d7",
+            "5b4719c"
           ],
           "commands": [
             "cargo run -p sheetcore --example pivot_excel_probe -- work/probe/c12/pivot-real.xlsx -> saved pivot_table_id=1 rows=3",
@@ -3327,7 +3329,10 @@
             "cargo test -p sheetcore --test pivot_multi_parts -> 4 passed（含保存后包内确有 pivotTable1.xml/pivotCacheRecords1.xml）",
             "cargo test -p app --bin app multi_field_pivot_from_panel -> 1 passed（面板生成后 pivots_pending2.len()==1，刷新不重复排队）",
             "cargo test -p sheetcore -> 103 个测试二进制 0 failed",
-            "cargo test -p app --bin app -> 326 passed / 0 failed"
+            "cargo test -p app --bin app -> 326 passed / 0 failed",
+            "cargo run -p sheetcore --example pivot_multi_probe -- D <xlsx> -> 1 行 + 2 列 + 1 值的嵌套 colItems",
+            "cargo test -p sheetcore --test pivot_multi_parts -> 5 passed（含两列字段双双标轴、包内 pivotTable1.xml 断言）",
+            "cargo test -p sheetcore -> 103 个测试二进制 0 failed；-p app --bin app -> 326 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt",
@@ -3349,17 +3354,26 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi/multi-wps-C.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi/A-2rows.xlsx",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi/B-2values.xlsx",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi/C-2rows1col.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi/C-2rows1col.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-two-column-fields.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/multi-D.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/multi-wps-D.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/multi-D.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/D-1row2cols.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-pivot-roundtrip.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-roundtrip/rt-ours.xlsx"
           ],
           "not_done": [
-            "单字段、1~2 个行字段、1 个列字段、1~2 个值字段的真透视部件已在 Excel 16.0 / WPS 12.0 验证可编辑可重算，并已接进保存队列；多列字段（≥2）与折叠/压缩布局的 rowItems 语义仍未实测",
-            "计数/平均/最大/最小作为值字段时的缓存属性（containsInteger 等）未逐一实测",
-            "Excel 改字段后存回、我们再打开再保存的保真未端到端验证"
+            "已实测：单字段、1~2 行字段、1~2 列字段、1~2 值字段的真透视部件，Excel 16.0 与 WPS 12.0 均可打开、可重算、字段结构正确；已接进保存队列；导入件经 Excel 另存 + 我们保存仍保住",
+            "多列字段 + 多值字段的组合未实测（生成器显式拒绝，不写坏包）",
+            "折叠/压缩布局（compact=\"1\"）的 rowItems/colItems 未实测",
+            "计数/平均/最大/最小作为值字段的缓存属性未逐一实测",
+            "Excel 里真的改字段/布局后再存回，我们重新打开保存的保真未验证"
           ],
           "failures": [],
           "blocker": "",
-          "next": "Excel 里把多字段透视改字段/拖布局后存回，再打开保存，确认导入部件保真；并补多列字段用例",
-          "updated_utc": "2026-11-16T09:53:39Z"
+          "next": "折叠/压缩布局与非求和聚合的缓存属性；随后收 C12 剩余切片",
+          "updated_utc": "2026-11-16T10:09:47Z"
         }
       ]
     },
