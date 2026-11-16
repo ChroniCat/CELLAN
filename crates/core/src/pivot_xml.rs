@@ -475,3 +475,77 @@ pub fn attach2_for_session(
     )?;
     write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
+
+/// 切换透视表布局（压缩 compact / 大纲 outline），只改 pivotTable*.xml 的四个属性。
+///
+/// Excel 的「压缩形式」= `compact="1" compactData="1" outline="0" outlineData="0"`；
+/// 「大纲形式」= 我们生成时用的默认组合。实测 Excel 对两种组合都能正常打开并读回字段。
+pub fn set_pivot_layout(path: &std::path::Path, compact: bool) -> anyhow::Result<usize> {
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name().to_string();
+        let mut buf = Vec::with_capacity(e.size() as usize);
+        e.read_to_end(&mut buf)?;
+        entries.push((name, buf));
+    }
+    drop(zip);
+    let mut changed = 0usize;
+    for (name, buf) in entries.iter_mut() {
+        if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(buf) else { continue };
+        if !text.contains("<pivotTableDefinition") {
+            continue;
+        }
+        let (c, cd, o, od) = if compact {
+            ("1", "1", "0", "0")
+        } else {
+            ("0", "0", "1", "1")
+        };
+        let mut out = text.to_string();
+        for (attr, val) in [
+            ("compact", c),
+            ("compactData", cd),
+            ("outline", o),
+            ("outlineData", od),
+        ] {
+            out = set_attr(&out, attr, val);
+        }
+        if out != *text {
+            *buf = out.into_bytes();
+            changed += 1;
+        }
+    }
+    let tmp = path.with_extension("layout.tmp");
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
+        for (name, buf) in &entries {
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file(name.clone(), opts)?;
+            w.write_all(buf)?;
+        }
+        w.finish()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(changed)
+}
+
+fn set_attr(xml: &str, name: &str, val: &str) -> String {
+    let pat = format!("{name}=\"");
+    if let Some(i) = xml.find(&pat) {
+        let start = i + pat.len();
+        if let Some(len) = xml[start..].find('"') {
+            let mut s = String::with_capacity(xml.len());
+            s.push_str(&xml[..start]);
+            s.push_str(val);
+            s.push_str(&xml[start + len..]);
+            return s;
+        }
+    }
+    xml.to_string()
+}

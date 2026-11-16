@@ -535,3 +535,57 @@ fn dump_pivot_variants() {
         eprintln!("[variant] {}", out.display());
     }
 }
+
+#[test]
+fn pivot_layout_switches_between_compact_and_outline() {
+    use std::io::Read;
+    let src = fixture("table.xlsx");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
+    let region = sheetcore::sort_filter::current_region(wb.sheet(0), 0, 0);
+    let spec = PivotSpec {
+        source: region,
+        row_field: 1,
+        col_field: Some(0),
+        value_field: 2,
+        agg: Agg::Sum,
+        group: sheetcore::pivot::GroupBy::None,
+        exclude: Vec::new(),
+    };
+    let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
+    let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (8, 0), &res);
+    let out = out_path("layout", "xlsx");
+    let _ = std::fs::remove_file(&out);
+    sheetcore::xlsx::save(&out, &wb).expect("保存");
+    let vlabel = wb.sheet(0).get(0, 2).map(|c| c.value.display()).unwrap_or_default();
+    let sheet_name = wb.sheet(0).name.clone();
+    sheetcore::pivot_xml::attach(&out, &sheet_name, &spec, &res, rect, &vlabel).expect("挂透视表");
+
+    let read_pt = |path: &std::path::Path| -> String {
+        let mut z = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut s = String::new();
+        z.by_name("xl/pivotTables/pivotTable1.xml").unwrap().read_to_string(&mut s).unwrap();
+        s
+    };
+    let before = read_pt(&out);
+    assert!(before.contains("compact=\"0\""), "默认应是大纲形式");
+
+    let n = sheetcore::pivot_xml::set_pivot_layout(&out, true).expect("切压缩");
+    assert_eq!(n, 1);
+    let compact = read_pt(&out);
+    assert!(compact.contains("compact=\"1\""), "compact: {compact}");
+    assert!(compact.contains("compactData=\"1\""));
+    assert!(compact.contains("outline=\"0\""));
+    // 留一份 compact 产物给 Excel 探针
+    let keep = Path::new("F:/finance-native-sheets-ready/work/probe/c12/compact-ours.xlsx");
+    let _ = std::fs::remove_file(keep);
+    std::fs::copy(&out, keep).ok();
+
+    sheetcore::pivot_xml::set_pivot_layout(&out, false).expect("切回大纲");
+    let outline = read_pt(&out);
+    assert!(outline.contains("compact=\"0\"") && outline.contains("outline=\"1\""));
+
+    // 切完仍是合法包
+    let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    assert!(z.by_name("xl/pivotCache/pivotCacheDefinition1.xml").is_ok());
+    eprintln!("[layout] ok {}", out.display());
+}
