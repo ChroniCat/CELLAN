@@ -67,3 +67,34 @@ diff lines = 2 / 14
   `sharedItems` 映射，定位名字丢失点。
 
 产物：`work/probe/c12/layout/ours.tsv`、`ref.tsv`、`ref-compact.xlsx`、`compact-ours.xlsx`。
+
+## 定位到根因：Excel 打开时把我们整张透视表重建了（cacheId 变了）
+
+对比 `compact-ours.xlsx` 与 Excel `RowAxisLayout(1)` 之后的 `ref-compact.xlsx` 的
+`pivotTable1.xml`：
+
+| 项 | ours | ref |
+|---|---|---|
+| `cacheId` | **1** | **5** |
+| `location ref` | A9:F13（5 行 6 列） | A9:G14（6 行 7 列） |
+| `colItems count` | 5 | 6（多 `<i t="grand">`） |
+| `rowItems` | `<x v="0"/>` → `<x v="2"/>` | `<x/>` → `<x v="1"/>` |
+| `updatedVersion` | 6 | 8 |
+
+`cacheId` 从 1 变成 5 说明 Excel **重新建了一个 pivot cache 并重建整张透视表**——
+它不是「渲染我们的定义」，而是「按缓存重算一遍」。所以：
+
+- 12/14 行相同，是因为两边都从同一份 cache 记录算出来的，不是我们定义被采纳；
+- 表头显示「部门/姓名」而不是「行标签/列标签」，也是重建后的结果；
+- 真正的缺陷在我们这一侧：**有列字段时，写出的 `location`/`firstDataRow` 少算了一行
+  列字段表头，`colItems` 也少了总计项**（ours 5 条 vs ref 6 条）。定义与单元格不一致，
+  Excel 只能重建。
+
+## 结论与下一步
+
+- 缺陷性质：`pivot_xml::attach` 在 `col_field.is_some()` 时按「单行表头」生成 `location`
+  和 `firstDataRow`，而 `pivot::write_to` 写的是两行表头（列字段名 + 值字段名）。
+- 下一步修：按 `has_col_field` 计算 `firstHeaderRow=2`/`firstDataRow=3`，`location` 行数 +1，
+  `colItems` 补 `<i t="grand">`，再跑同一套 `c12_layout_compare.ps1` 验证 `cacheId` 保持为 1
+  （不重建）且 TSV 14/14 全同。
+- 在修好之前，本条**不算验收**：现在只是"Excel 能用缓存重建出正确结果"。
