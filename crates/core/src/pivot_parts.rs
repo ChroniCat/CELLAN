@@ -142,8 +142,10 @@ pub fn build(
     match col_i {
         Some(ci) => {
             if res.headers.len() > 1 {
-                col_count = res.headers.len() - 1;
-                for h in res.headers.iter().skip(1) {
+                // headers 末尾在有列字段时是「总计」列，它不是列字段的取值
+                let data_cols = res.headers.len() - 1 - usize::from(res.col_name.is_some());
+                col_count = data_cols + 1; // +1 = 末尾 grand 总计项
+                for h in res.headers.iter().skip(1).take(data_cols) {
                     let idx = match shared[ci].iter().position(|s| s == h) {
                         Some(pos) => pos,
                         None => {
@@ -153,6 +155,7 @@ pub fn build(
                     };
                     col_items.push_str(&format!("<i><x v=\"{idx}\"/></i>"));
                 }
+                col_items.push_str("<i t=\"grand\"><x/></i>");
             } else {
                 col_count = 1;
                 col_items.push_str("<i t=\"grand\"><x/></i>");
@@ -222,7 +225,7 @@ pub fn build(
         r2 + 1
     );
     let cache = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><pivotCacheDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\" refreshOnLoad=\"1\" refreshedBy=\"{}\" createdVersion=\"8\" refreshedVersion=\"8\" minRefreshableVersion=\"3\" recordCount=\"{n_records}\"><cacheSource type=\"worksheet\"><worksheetSource ref=\"{src}\" sheet=\"{}\"/></cacheSource><cacheFields count=\"{n_fields}\">{caches}</cacheFields></pivotCacheDefinition>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><pivotCacheDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\" refreshedBy=\"{}\" createdVersion=\"8\" refreshedVersion=\"8\" minRefreshableVersion=\"3\" recordCount=\"{n_records}\"><cacheSource type=\"worksheet\"><worksheetSource ref=\"{src}\" sheet=\"{}\"/></cacheSource><cacheFields count=\"{n_fields}\">{caches}</cacheFields></pivotCacheDefinition>",
         esc(refreshed_by),
         esc(sheet_name)
     );
@@ -279,8 +282,9 @@ pub fn build(
         .rsplit_once(':')
         .map(|(_, tail)| tail)
         .unwrap_or(label);
+    let (first_header_row, first_data_row) = if col_i.is_some() { ("2", "3") } else { ("1", "2") };
     let table = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" name=\"{}\" cacheId=\"{cache_id}\" dataCaption=\"值\" updatedVersion=\"6\" minRefreshableVersion=\"3\" createdVersion=\"6\" applyWidthHeightFormats=\"1\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\" compact=\"0\" compactData=\"0\" multipleFieldFilters=\"0\"><location ref=\"{loc}\" firstHeaderRow=\"1\" firstDataRow=\"2\" firstDataCol=\"1\"/><pivotFields count=\"{n_fields}\">{pfields}</pivotFields><rowFields count=\"1\"><field x=\"{row_i}\"/></rowFields><rowItems count=\"{}\">{row_items}</rowItems>{extra}<dataFields count=\"1\"><dataField name=\"{}{}\" fld=\"{val_i}\" baseField=\"0\" baseItem=\"0\"/></dataFields><pivotTableStyleInfo name=\"PivotStyleLight16\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" name=\"{}\" cacheId=\"{cache_id}\" dataCaption=\"值\" updatedVersion=\"6\" minRefreshableVersion=\"3\" createdVersion=\"6\" applyWidthHeightFormats=\"1\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\" compact=\"0\" compactData=\"0\" multipleFieldFilters=\"0\"><location ref=\"{loc}\" firstHeaderRow=\"{first_header_row}\" firstDataRow=\"{first_data_row}\" firstDataCol=\"1\"/><pivotFields count=\"{n_fields}\">{pfields}</pivotFields><rowFields count=\"1\"><field x=\"{row_i}\"/></rowFields><rowItems count=\"{}\">{row_items}</rowItems>{extra}<dataFields count=\"1\"><dataField name=\"{}{}\" fld=\"{val_i}\" baseField=\"0\" baseItem=\"0\"/></dataFields><pivotTableStyleInfo name=\"PivotStyleLight16\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
         esc(table_name),
         res.rows.len(),
         agg_label(spec.agg),

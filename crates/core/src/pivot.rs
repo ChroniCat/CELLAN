@@ -84,6 +84,10 @@ pub struct PivotResult {
     /// 行字段名
     pub row_name: String,
     pub value_name: String,
+    /// 列字段名（有列字段时 Excel 的第二行表头要用它）
+    pub col_name: Option<String>,
+    /// 值字段标题，形如「求和项:金额」
+    pub value_caption: String,
 }
 
 /// 计算透视结果
@@ -172,6 +176,8 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     };
     let row_name = header(spec.row_field);
     let value_name = header(spec.value_field);
+    let col_name = spec.col_field.map(|c| header(c));
+    let value_caption = format!("{}:{}", agg_prefix(spec.agg), value_name);
 
     // 收集：行标签 → (列标签 → 值列表)。Count 只数非空格（数字/文本都算），
     // 空白格不能以 0 混进计数。
@@ -225,15 +231,25 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
 
     let mut headers = vec![row_name.clone()];
     headers.extend(col_keys.iter().cloned());
+    if spec.col_field.is_some() {
+        headers.push("总计".to_string());
+    }
 
     let mut rows = Vec::new();
     let mut grand: Vec<Vec<PivotVal>> = vec![Vec::new(); col_keys.len()];
+    let mut grand_all: Vec<PivotVal> = Vec::new();
     for (key, m) in data.iter() {
         let mut line = vec![Value::Text(key.as_str().into())];
+        let mut row_vals: Vec<PivotVal> = Vec::new();
         for (i, ck) in col_keys.iter().enumerate() {
             let vals = m.get(ck).cloned().unwrap_or_default();
             grand[i].extend(vals.iter().copied());
+            row_vals.extend(vals.iter().copied());
             line.push(agg_value(&vals, spec.agg));
+        }
+        if spec.col_field.is_some() {
+            grand_all.extend(row_vals.iter().copied());
+            line.push(agg_value(&row_vals, spec.agg));
         }
         rows.push(line);
     }
@@ -243,10 +259,24 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         for i in 0..col_keys.len() {
             total.push(agg_value(&grand[i], spec.agg));
         }
+        if spec.col_field.is_some() {
+            total.push(agg_value(&grand_all, spec.agg));
+        }
         rows.push(total);
     }
 
-    PivotResult { headers, rows, row_name, value_name }
+    PivotResult { headers, rows, row_name, value_name, col_name, value_caption }
+}
+
+/// Excel 值字段标题的前缀
+pub fn agg_prefix(agg: Agg) -> &'static str {
+    match agg {
+        Agg::Sum => "求和项",
+        Agg::Count => "计数项",
+        Agg::Avg => "平均值项",
+        Agg::Max => "最大值项",
+        Agg::Min => "最小值项",
+    }
 }
 
 fn agg_value<T: std::borrow::Borrow<PivotVal>>(vals: &[T], agg: Agg) -> Value {
@@ -268,22 +298,30 @@ fn agg_value<T: std::borrow::Borrow<PivotVal>>(vals: &[T], agg: Agg) -> Value {
 /// 把结果写到指定位置，返回占用的矩形
 pub fn write_to(sheet: &mut Sheet, at: (u32, u32), res: &PivotResult) -> (u32, u32, u32, u32) {
     let (r0, c0) = at;
+    // 有列字段时 Excel 的表头是两行：第一行「值字段标题 + 列字段名」，第二行「行字段名 + 列取值 + 总计」
+    let head = if let Some(cn) = &res.col_name {
+        sheet.set(r0, c0, Cell { value: Value::Text(res.value_caption.as_str().into()), formula: None });
+        sheet.set(r0, c0 + 1, Cell { value: Value::Text(cn.as_str().into()), formula: None });
+        r0 + 1
+    } else {
+        r0
+    };
     for (i, h) in res.headers.iter().enumerate() {
         sheet.set(
-            r0,
+            head,
             c0 + i as u32,
             Cell { value: Value::Text(h.as_str().into()), formula: None },
         );
     }
     for (ri, line) in res.rows.iter().enumerate() {
         for (ci, v) in line.iter().enumerate() {
-            sheet.set(r0 + 1 + ri as u32, c0 + ci as u32, Cell { value: v.clone(), formula: None });
+            sheet.set(head + 1 + ri as u32, c0 + ci as u32, Cell { value: v.clone(), formula: None });
         }
     }
     (
         r0,
         c0,
-        r0 + res.rows.len() as u32,
+        head + res.rows.len() as u32,
         c0 + res.headers.len().saturating_sub(1) as u32,
     )
 }

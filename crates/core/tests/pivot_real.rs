@@ -77,7 +77,8 @@ fn writes_real_pivot_table() {
         )
         .unwrap();
         assert!(s.contains("worksheetSource"), "缺少数据源");
-        assert!(s.contains("refreshOnLoad=\"1\""));
+        // 不写 refreshOnLoad：写了 Excel 每次打开都重建透视表（cacheId 变、表头变兜底文案）
+        assert!(!s.contains("refreshOnLoad"), "不应强制刷新：{s}");
         assert!(s.contains("cacheField name=\"部门\""), "字段名没写对: {s}");
         assert!(
             s.contains(&format!("sheet=\"{}\"", sheet_name)),

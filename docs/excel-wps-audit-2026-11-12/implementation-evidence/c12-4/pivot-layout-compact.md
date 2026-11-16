@@ -128,3 +128,40 @@ diff lines = 2 / 14
    `<i t="grand"><x/></i>` 且 `col_count` +1。
 
 验收判据（写在台账里）：`c12_layout_compare.ps1` 重跑后 `cacheId` 保持 1（Excel 不重建）+ TSV 14/14 全同。
+
+## 修复后重跑（同日）：几何与表头全对齐，只剩中文排序
+
+三处同批改完（`pivot.rs` / `pivot_parts.rs`）：
+
+1. `compute`：有列字段时 headers 追加「总计」列、每行加行内总计，返回 `col_name` 与
+   `value_caption`（如「求和项:金额」）；
+2. `write_to`：有列字段时写两行表头（第一行「值字段标题 + 列字段名」，第二行「行字段名 + 列取值 + 总计」），
+   数据从第三行起，rect +1 行 +1 列；
+3. `pivot_parts`：`firstHeaderRow="2"`、`firstDataRow="3"`、`colItems` 末尾补 `<i t="grand">`。
+
+另外**去掉 `refreshOnLoad="1"`**——这是之前 Excel 每次打开都重建（cacheId 1→5、表头退化成
+「行标签/列标签」）的真凶。Excel 自己保存的透视缓存并不写这个属性。
+
+重跑 `c12_layout_compare.ps1`：
+
+```
+compact-ours.xlsx  cacheId=1  location A9:G14  firstHeaderRow=2 firstDataRow=3
+ref-compact.xlsx   cacheId=0  location A9:G14
+diff 2 / 14
+L12 ours='行政 ... 50 ... 50'      ref='销售 ... 100 ... 400 ... 500'
+L13 ours='销售 ... 100 ... 400 ... 500'  ref='行政 ... 50 ... 50'
+```
+
+- 表头行（L9/L10）**已完全一致**，不再出现「行标签/列标签」；
+- 数据内容逐格一致，唯一差异是**两行顺序**：我们把「行政」排在「销售」前，Excel 排「销售」在前。
+
+### 剩余缺陷：中文行标签排序
+
+我们的 `compute` 用 `BTreeMap<String>`，即 Unicode 码点序（行 U+884C < 销 U+9500 → 行政在前）。
+Excel 按**拼音排序**（xiao < xing → 销售在前）。要一致必须引入拼音排序键（或按 Excel 的
+locale 排序规则），这是一个独立改动，未做。
+
+### 结论
+
+- 几何/表头/总计列：**已修**，Excel 不再重建（cacheId 保持 1，location 与表头行数与我们定义一致）；
+- 中文排序：**未修**，明确登记；修好之前 C12.4 的压缩布局按「内容一致、顺序不一致」记录，不算全同。
