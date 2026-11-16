@@ -81,3 +81,11 @@ UIA 实测（A1 选中）：`Edit 名称框 value=A1` / `Edit 编辑栏 value=00
 - 连拍两张逐字节相同（渲染确定性），六区域差异全部 `mean 0.00 / big 0.00`：
   title / ribbon / formula / grid / tabs / status 全 PASS。
 - 复跑：`python scripts/qa05_region_diff.py <基线> <新图>`，门槛见 `qa05-visual-spec.md`。
+
+## 补充 2（2026-11-17）：640×360 与折叠菜单
+
+- 640×360（UIA `uia-640.txt`）：43 个节点，零尺寸 0；最右 **632/640**、最下 360/360（状态栏贴底），**无越界**。
+  分组已折叠成 `数字 ▾` + `更多 ▾` 两个入口，仍能容纳。
+- 点「更多 ▾」（UIA Invoke）：`CLICKED`，节点数 55→93，但树里**没有 MenuItem/Menu 角色**，
+  弹出的分组菜单内容不进 accesskit 树 —— 这是真实的可访问性缺口（读屏用户只能用鼠标点），
+  记在 UI-24.2 名下继续处理，不当作已覆盖。
