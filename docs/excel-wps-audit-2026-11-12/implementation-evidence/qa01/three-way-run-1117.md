@@ -16,9 +16,13 @@ python scripts/qa01_matrix_runner.py --out work/probe/qa01/matrix-run-1117.json
 | 我们的 load→save 往返 | **12/12 ok** |
 | Excel 侧逐类 diff | **0**（12 个夹具 × 各自类别，共 76 个类别位） |
 | WPS 侧逐类 diff | **0** |
-| known_loss | 空（本次夹具未触发 `.xls` 结构性对象口径） |
+| known_loss | **features-xls 双端各 6 处**（names.MyRange、cf×2、freeze.split_col/row、hidden_cols/rows）——属既定 `.xls` 口径 |
 
 `products`: `Excel.Application` + `ket.Application`（真 COM，不是模拟）。
+
+> 更正：本文最初写「known_loss 空」，与 JSON 不符。实际 `features-xls` 在 Excel 与 WPS 两侧各有 6 条已登记损失
+> （`names.MyRange`、`sheets[0].cf`、`freeze.split_col`、`freeze.split_row`、`hidden_cols`、`hidden_rows`），
+> 正是 `.xls` 结构性对象不保留的既定口径。已按 JSON 改正。
 
 ## 口径说明（不掩盖的边界）
 
