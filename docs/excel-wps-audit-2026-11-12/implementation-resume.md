@@ -342,3 +342,14 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   必须把所有列字段都标轴。修后 Excel/WPS 均 `cols=[产品,数量]`，值 10/30/60 与汇总 40/60/100/110/210 正确。
 - `61132d7`：保真链路 —— Excel 打开我们的多字段透视并另存 → 我们 `xlsx::load`+`save` → Excel/WPS 仍 `PivotTables=1`。
 - 回归：`pivot_multi_parts` 5 passed；`-p sheetcore` 103 二进制 0 failed；`-p app` 326 passed。
+
+### 检查点九：C12.4 收口（可编辑往返 + 非求和聚合 + 多列多值）
+- `3432c15`：`dataField@subtotal`（count/average/max/min）+ 无列字段的纯 `-2` 值轴。
+  发现的真实缺陷：界面能选计数/平均/最大/最小，但部件缺 `subtotal`，Excel 一律按求和重算。
+- `bb19c63`：多列字段 × 多值字段（`colFields` 末尾 `-2`、每叶按值展开、小计/总计按值展开）+ 可编辑往返证明。
+- 可编辑往返链路：Excel 打开我们的透视 → `AddDataField(最大值金额)` → `SaveAs` → 我们 `load+save` →
+  Excel 与 WPS 都仍是 3 个数据字段（`求和项:金额,计数项:金额,最大值金额`）。这才叫「可编辑往返」，不是「能打开」。
+- 用例：A(2 行) B(2 值) C(2 行 1 列) D(2 列) E(5 聚合纯值轴) F(1 行 1 列 2 值) G(2 列 2 值)，全部 Excel+WPS 双端实测。
+- 回归：`pivot_multi_parts` 7 passed；`-p sheetcore` 103 二进制 0 failed；`-p app` 326 passed。
+- 台账：C12.4 → 待验收，C12 → 待验收（C12.1 已验收、C12.2/12.3 待验收）。
+- 未做且已记录：折叠布局（界面无开关）、计算字段/显示值方式、WPS 内改字段往返。

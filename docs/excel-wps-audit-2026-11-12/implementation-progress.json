@@ -3190,7 +3190,7 @@
       "scope": "core/pivot.rs, pivot_xml.rs + app透视入口",
       "source": "core-requirements.md",
       "heading": "C12 P1 透视汇总正确性与多字段模型",
-      "status": "实施中",
+      "status": "待验收",
       "acceptance": "",
       "files": [],
       "commits": [],
@@ -3202,7 +3202,7 @@
       "failures": [],
       "blocker": "",
       "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
-      "updated_utc": "2026-11-13T20:42:17Z",
+      "updated_utc": "2026-11-16T10:39:10Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3293,7 +3293,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "待验收",
           "acceptance": "",
           "files": [
             "crates/core/src/pivot_parts.rs",
@@ -3313,7 +3313,9 @@
             "41b448b",
             "66d17f1",
             "61132d7",
-            "5b4719c"
+            "5b4719c",
+            "3432c15",
+            "bb19c63"
           ],
           "commands": [
             "cargo run -p sheetcore --example pivot_excel_probe -- work/probe/c12/pivot-real.xlsx -> saved pivot_table_id=1 rows=3",
@@ -3332,6 +3334,12 @@
             "cargo test -p app --bin app -> 326 passed / 0 failed",
             "cargo run -p sheetcore --example pivot_multi_probe -- D <xlsx> -> 1 行 + 2 列 + 1 值的嵌套 colItems",
             "cargo test -p sheetcore --test pivot_multi_parts -> 5 passed（含两列字段双双标轴、包内 pivotTable1.xml 断言）",
+            "cargo test -p sheetcore -> 103 个测试二进制 0 failed；-p app --bin app -> 326 passed",
+            "powershell -File scripts/c12_edit_probe.ps1 multi-F.xlsx F-edited.xlsx -> Excel 加数据字段 最大值金额，before/after 两行证明编辑被接受",
+            "cargo run -p sheetcore --example pivot_roundtrip -- F-edited.xlsx F-edited-ours.xlsx",
+            "scripts/c12_pivot_probe2.ps1 F-edited-ours.xlsx (Excel + KET.Application) -> 双端 data=[求和项:金额,计数项:金额,最大值金额]",
+            "cargo run -p sheetcore --example pivot_multi_probe -- G -> 2 列字段 × 2 值字段，cols=[产品,数量,值]",
+            "cargo test -p sheetcore --test pivot_multi_parts -> 7 passed",
             "cargo test -p sheetcore -> 103 个测试二进制 0 failed；-p app --bin app -> 326 passed"
           ],
           "evidence": [
@@ -3361,19 +3369,29 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/multi-D.xlsx",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-2cols/D-1row2cols.xlsx",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-pivot-roundtrip.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-roundtrip/rt-ours.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-roundtrip/rt-ours.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable-roundtrip.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/multi-G.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/multi-G.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/multi-wps-G.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/F-edited.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/F-edited-ours.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/F-edited-ours.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/F-edited-ours-wps.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-editable/G-2cols2values.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggregations.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-E.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-aggs/multi-F.txt"
           ],
           "not_done": [
-            "已实测：单字段、1~2 行字段、1~2 列字段、1~2 值字段的真透视部件，Excel 16.0 与 WPS 12.0 均可打开、可重算、字段结构正确；已接进保存队列；导入件经 Excel 另存 + 我们保存仍保住",
-            "多列字段 + 多值字段的组合未实测（生成器显式拒绝，不写坏包）",
-            "折叠/压缩布局（compact=\"1\"）的 rowItems/colItems 未实测",
-            "计数/平均/最大/最小作为值字段的缓存属性未逐一实测",
-            "Excel 里真的改字段/布局后再存回，我们重新打开保存的保真未验证"
+            "折叠/压缩布局（compact=\"1\"）未做：界面没有暴露布局开关，PivotLayout 只有表格形式",
+            "计算字段/计算项、显示值方式（占总计百分比等）未做",
+            "WPS 里改字段后再存回未做（改字段只用 Excel 验证，WPS 只做打开与字段复核）"
           ],
           "failures": [],
           "blocker": "",
-          "next": "折叠/压缩布局与非求和聚合的缓存属性；随后收 C12 剩余切片",
-          "updated_utc": "2026-11-16T10:09:47Z"
+          "next": "C12 四切片齐；等用户按生产口径复核",
+          "updated_utc": "2026-11-16T10:39:10Z"
         }
       ]
     },
