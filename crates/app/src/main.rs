@@ -329,11 +329,23 @@ struct EditState {
     complete_idx: usize,
     /// 最近一次处理 Alt+Enter 的帧，防止同一帧重复插入换行
     alt_frame: u64,
+    /// 光标位置（字符下标）：点选单元格建立引用时按它插入/替换
+    caret: usize,
+    /// 下一步要把 TextEdit 的光标强制搬到这个字符位置（补全/点选引用后）
+    caret_override: Option<usize>,
 }
 
 impl EditState {
     fn new(buf: String) -> Self {
-        Self { buf, spot: EditSpot::Grid, complete_idx: 0, alt_frame: u64::MAX }
+        let caret = buf.chars().count();
+        Self {
+            buf,
+            spot: EditSpot::Grid,
+            complete_idx: 0,
+            alt_frame: u64::MAX,
+            caret,
+            caret_override: None,
+        }
     }
 }
 
@@ -555,6 +567,238 @@ fn apply_formula_pick(ed: &mut EditState, help: &FormulaHelp, idx: usize) {
         ed.buf.push('(');
     }
     ed.complete_idx = 0;
+}
+
+/// UI-11.3：A1 引用判定（列 1-3 个字母、行 1-7 位数字，$ 可选，行号不能是 0）。
+fn is_a1_ref(s: &str) -> bool {
+    let b: Vec<char> = s.chars().collect();
+    if b.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    if b[i] == '$' {
+        i += 1;
+    }
+    let cs = i;
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let letters = i - cs;
+    if !(1..=3).contains(&letters) {
+        return false;
+    }
+    if i < b.len() && b[i] == '$' {
+        i += 1;
+    }
+    let ds = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > ds && i == b.len() && b[ds] != '0'
+}
+
+/// 引用或 `A1:B2` 范围，可带 `Sheet!` / `'My Sheet'!` 前缀。
+fn looks_like_ref(tok: &str) -> bool {
+    let tail = match tok.rfind('!') {
+        Some(i) => &tok[i + 1..],
+        None => tok,
+    };
+    let parts: Vec<&str> = tail.split(':').collect();
+    !parts.is_empty() && parts.len() <= 2 && parts.iter().all(|p| is_a1_ref(p))
+}
+
+/// 从 `pos` 起解析一个 A1 引用（含可选 `$`），返回结束的字符下标。
+fn a1_end(chars: &[char], pos: usize) -> Option<usize> {
+    let mut i = pos;
+    if i < chars.len() && chars[i] == '$' {
+        i += 1;
+    }
+    let cs = i;
+    while i < chars.len() && chars[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if !(1..=3).contains(&(i - cs)) {
+        return None;
+    }
+    if i < chars.len() && chars[i] == '$' {
+        i += 1;
+    }
+    let ds = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == ds || chars[ds] == '0' {
+        return None;
+    }
+    Some(i)
+}
+
+/// 从 `i` 起解析「[可选表名!]引用[:引用]」，返回结束下标与原文。
+fn parse_ref_token(chars: &[char], i: usize) -> Option<(usize, String)> {
+    let mut j = i;
+    if i < chars.len() && chars[i] == '\'' {
+        let mut k = i + 1;
+        while k < chars.len() && chars[k] != '\'' {
+            k += 1;
+        }
+        if k >= chars.len() {
+            return None;
+        }
+        j = k + 1;
+        if j >= chars.len() || chars[j] != '!' {
+            return None;
+        }
+    } else {
+        let mut k = j;
+        while k < chars.len()
+            && (chars[k].is_alphanumeric() || matches!(chars[k], '_' | '.'))
+        {
+            k += 1;
+        }
+        if k > i && k < chars.len() && chars[k] == '!' {
+            j = k;
+        }
+    }
+    if j != i {
+        if j >= chars.len() || chars[j] != '!' {
+            return None;
+        }
+        j += 1;
+    }
+    let mut end = a1_end(chars, j)?;
+    if end < chars.len() && chars[end] == ':' {
+        if let Some(e2) = a1_end(chars, end + 1) {
+            end = e2;
+        }
+    }
+    Some((end, chars[i..end].iter().collect()))
+}
+
+/// UI-11.3：点选单元格建立引用 —— 光标左侧若是引用/正在输入的引用就整段替换，
+/// 否则在光标处插入。返回新缓冲与新光标（字符下标）。Excel 同款行为。
+pub(crate) fn insert_reference(buf: &str, caret: usize, label: &str) -> (String, usize) {
+    let chars: Vec<char> = buf.chars().collect();
+    let caret = caret.min(chars.len());
+    let mut start = caret;
+    while start > 0 {
+        let ch = chars[start - 1];
+        if ch.is_alphanumeric() || matches!(ch, '$' | '_' | '.' | '!' | ':' | '\'') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let left: String = chars[start..caret].iter().collect();
+    let start = if looks_like_ref(&left) { start } else { caret };
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(label);
+    out.extend(chars[caret..].iter());
+    (out, start + label.chars().count())
+}
+
+/// UI-11.3：公式里的引用片段（字符区间 + 调色序号），同一文本共用同色。
+pub(crate) fn ref_spans(buf: &str) -> Vec<(usize, usize, usize)> {
+    let chars: Vec<char> = buf.chars().collect();
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let boundary = i == 0
+            || !(chars[i - 1].is_alphanumeric()
+                || matches!(chars[i - 1], '_' | '$' | '.' | '\''));
+        if !boundary {
+            i += 1;
+            continue;
+        }
+        if let Some((end, text)) = parse_ref_token(&chars, i) {
+            let right_ok = end == chars.len()
+                || !(chars[end].is_alphanumeric() || matches!(chars[end], '_' | '$'));
+            if right_ok {
+                let ci = match seen.iter().position(|t| t == &text) {
+                    Some(p) => p,
+                    None => {
+                        seen.push(text);
+                        seen.len() - 1
+                    }
+                };
+                out.push((i, end, ci));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 引用配色（Excel 习惯的多引用颜色循环）。
+fn ref_color(idx: usize) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 4] = [
+        egui::Color32::from_rgb(31, 111, 208),
+        egui::Color32::from_rgb(26, 138, 59),
+        egui::Color32::from_rgb(138, 63, 176),
+        egui::Color32::from_rgb(161, 92, 0),
+    ];
+    PALETTE[idx % PALETTE.len()]
+}
+
+/// UI-11.3：编辑框的着色版排版 —— 公式里的引用按出现顺序上色，其余部分正常色。
+/// 非公式文本原样一段，避免影响普通输入。
+pub(crate) fn formula_layout_job(
+    text: &str,
+    font: egui::FontId,
+    normal: egui::Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    if !text.starts_with('=') {
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat { font_id: font, color: normal, ..Default::default() },
+        );
+        return job;
+    }
+    let byte_of: Vec<usize> = text
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut last = 0usize;
+    for (s, e, ci) in ref_spans(text) {
+        if s < last || e > byte_of.len() {
+            continue;
+        }
+        let (bs, be) = (byte_of[s], byte_of[e]);
+        if bs > last {
+            job.append(
+                &text[last..bs],
+                0.0,
+                egui::TextFormat { font_id: font.clone(), color: normal, ..Default::default() },
+            );
+        }
+        job.append(
+            &text[bs..be],
+            0.0,
+            egui::TextFormat { font_id: font.clone(), color: ref_color(ci), ..Default::default() },
+        );
+        last = be;
+    }
+    if last < text.len() {
+        job.append(
+            &text[last..],
+            0.0,
+            egui::TextFormat { font_id: font, color: normal, ..Default::default() },
+        );
+    }
+    if std::env::var("SC_FORMULA_LOG").is_ok() {
+        let cs: Vec<String> = job
+            .sections
+            .iter()
+            .map(|s| format!("{:?}={:?}", s.byte_range, s.format.color))
+            .collect();
+        eprintln!("[lay] text={text:?} secs={cs:?}");
+    }
+    job
 }
 
 /// 在编辑框下方（放不下则上方）画候选/签名提示。
@@ -1404,6 +1648,8 @@ struct SheetApp {
     nav_rect: Option<(u32, u32, u32, u32)>,
     /// 表格上按下的那一刻锚定的格子（松开清空）：拖动扩选区靠它立即生效
     grid_press: Option<(u32, u32)>,
+    /// UI-11.3：编辑公式时点选单元格建立的引用框（虚线/细框，不改变选区）
+    pick_rect: Option<(u32, u32, u32, u32)>,
     /// 单元格右键菜单
     ctx_menu: Option<CtxMenuState>,
     /// 本帧菜单占用的矩形（判断点击是否落在外面）
@@ -2369,6 +2615,7 @@ impl SheetApp {
             stats_job: None,
             nav_rect: None,
             grid_press: None,
+            pick_rect: None,
             ctx_menu: None,
             ctx_rects: Vec::new(),
             cell_move: None,
@@ -4988,7 +5235,15 @@ impl SheetApp {
                     None => String::new(),
                 }
             });
-            self.editing = Some(EditState { buf, spot, complete_idx: 0, alt_frame: u64::MAX });
+            let caret = buf.chars().count();
+            self.editing = Some(EditState {
+                buf,
+                spot,
+                complete_idx: 0,
+                alt_frame: u64::MAX,
+                caret,
+                caret_override: None,
+            });
             return;
         };
         let name = self.my_name.clone();
@@ -8911,6 +9166,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) -> bool {
         let mut wrote = false;
+        // 编辑结束（或退回重试）都清掉点选引用的细框
+        self.pick_rect = None;
         // 用户在警告框里点了“是”：这一笔跳过验证（一次性）
         let force = std::mem::replace(&mut self.dv_force_once, false);
         if let Some(ed) = self.editing.take() {
@@ -9147,6 +9404,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     /// 取消编辑：丢弃缓冲、交还租约，不碰模型、不记撤销、不改 dirty。
     fn cancel_edit(&mut self) {
         self.editing = None;
+        self.pick_rect = None;
         self.release_lock();
     }
 
@@ -24558,7 +24816,14 @@ let txn = self.txn_begin(&keys);
         }
 
         // A rejected draft must keep its original cell and sheet coordinates.
-        if !readonly && (resp.clicked() || resp.drag_started() || resp.dragged()) && self.editing.is_some() {
+        // UI-11.3：正在用鼠标给公式取引用时不提交（Excel 里点/拖格子是建引用，不是结束编辑）
+        let picking_ref = self.pick_rect.is_some()
+            && self.editing.as_ref().is_some_and(|ed| ed.buf.starts_with('='));
+        if !readonly
+            && (resp.clicked() || resp.drag_started() || resp.dragged())
+            && self.editing.is_some()
+            && !picking_ref
+        {
             self.commit_edit(None);
             if self.editing.is_some() {
                 return;
@@ -24999,7 +25264,10 @@ let txn = self.txn_begin(&keys);
                     .contains(p);
                     let on_tb = tb_rects.iter().any(|(_, r)| r.contains(p));
                     // 正在编辑的格子（内联编辑器浮在格子上）：点进去是放光标，不能改选区
-                    let on_editor = self.editing.is_some()
+                    let on_editor = self
+                        .editing
+                        .as_ref()
+                        .is_some_and(|ed| ed.spot == EditSpot::Grid)
                         && Rect::from_min_max(
                             egui::pos2(px_of(self.sel.1), py_of(self.sel.0)),
                             egui::pos2(px_of(self.sel.1 + 1), py_of(self.sel.0 + 1)),
@@ -25014,6 +25282,32 @@ let txn = self.txn_begin(&keys);
                         )
                         .contains(p)
                     });
+                    // UI-11.3：编辑公式时点选单元格 = 在光标处建立引用（Excel 行为），
+                    // 不提交草稿、也不改选区；Esc 仍取消整次编辑。
+                    let editing_formula = self
+                        .editing
+                        .as_ref()
+                        .is_some_and(|ed| ed.buf.starts_with('='));
+                    if inside
+                        && !on_border
+                        && !on_handle
+                        && !on_tb
+                        && !on_chart
+                        && !on_editor
+                        && editing_formula
+                    {
+                        let c = col_at(p.x);
+                        let r = row_at(p.y);
+                        let label = cell_name(r, c);
+                        if let Some(ed) = self.editing.as_mut() {
+                            let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
+                            ed.buf = buf;
+                            ed.caret = caret;
+                            ed.caret_override = Some(caret);
+                        }
+                        self.pick_rect = Some((r, c, r, c));
+                        self.status = format!("已插入引用 {label}");
+                    }
                     // 正在编辑时不在按下这一拍改选区：草稿被数据验证拒绝时要留在原格
                     // （edit_regression_tests 里的两条用例守着这个不变量）
                     if inside
@@ -25128,7 +25422,10 @@ let txn = self.txn_begin(&keys);
                     }
                 }
             }
-            if let Some(pos) = resp.interact_pointer_pos() {
+            // UI-11.3：这一下点击刚给公式插了引用 → 不提交、不搬选区（Excel 的取引用模式）
+            let ref_pick = self.pick_rect.is_some()
+                && self.editing.as_ref().is_some_and(|ed| ed.buf.starts_with('='));
+            if let Some(pos) = resp.interact_pointer_pos().filter(|_| !ref_pick) {
                 let dx = pos.x - (origin.x + head_w);
                 let dy = pos.y - (origin.y + hh);
                 if dx >= 0.0 && dy >= 0.0 {
@@ -25376,15 +25673,23 @@ let txn = self.txn_begin(&keys);
                         eprintln!("[formula] loaded no state buf={:?}", ed.buf);
                     }
                 }
+                let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let mut job = formula_layout_job(text, font, ui_kit::TEXT);
+                    job.wrap.max_width = wrap_width;
+                    ui.fonts(|f| f.layout_job(job))
+                };
                 let out = if multiline {
                     egui::TextEdit::multiline(&mut ed.buf)
                         .id(egui::Id::new("grid_edit"))
                         .desired_width(rect.width())
+                        .layouter(&mut layouter)
                         .show(&mut child)
                 } else {
                     egui::TextEdit::singleline(&mut ed.buf)
                         .id(egui::Id::new("grid_edit"))
                         .desired_width(rect.width())
+                        .layouter(&mut layouter)
                         .show(&mut child)
                 };
                 out.response.request_focus();
@@ -25396,14 +25701,20 @@ let txn = self.txn_begin(&keys);
                         egui::text::CCursor::new(ed.buf.chars().count()),
                     )));
                     st.store(ctx, egui::Id::new("grid_edit"));
+                    ed.caret = ed.buf.chars().count();
                     if std::env::var("SC_FORMULA_LOG").is_ok() {
                         eprintln!("[formula] caret set id={:?} len={} out_id={:?}", egui::Id::new("grid_edit"), ed.buf.chars().count(), out.response.id);
                     }
+                } else if let Some(pos) = ed.caret_override.take() {
+                    // 点选单元格插入引用后，把光标搬到引用后面
+                    let mut st = out.state.clone();
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(pos.min(ed.buf.chars().count())),
+                    )));
+                    st.store(ctx, egui::Id::new("grid_edit"));
+                } else if let Some(r) = out.cursor_range {
+                    ed.caret = r.primary.ccursor.index;
                 }
-                let cursor_after = out
-                    .cursor_range
-                    .map(|r| r.primary.ccursor.index)
-                    .unwrap_or(ed.buf.len());
                 if alt_enter {
                     // 多行 TextEdit 已按光标插入；这里只阻止同一帧被当成提交
                     ed.alt_frame = ctx.cumulative_pass_nr();
@@ -25421,6 +25732,19 @@ let txn = self.txn_begin(&keys);
                     self.commit_edit(adv);
                 }
                 EditAct::Cancel => self.cancel_edit(),
+            }
+            // UI-11.3：点选建立引用时给被引用的格子描细框（编辑中的选区本身不动）
+            if let Some((pr1, pc1, pr2, pc2)) = self.pick_rect {
+                let r = Rect::from_min_max(
+                    egui::pos2(px_of(pc1), py_of(pr1)),
+                    egui::pos2(px_of(pc2 + 1), py_of(pr2 + 1)),
+                );
+                ui.painter().rect_stroke(
+                    r.shrink(0.5),
+                    0.0,
+                    egui::Stroke::new(1.5, ref_color(0)),
+                    egui::StrokeKind::Inside,
+                );
             }
             if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::Grid) {
                 if let Some(h) = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf)) {
@@ -26928,7 +27252,15 @@ fn elide(s: &str, max_chars: usize) -> String {
                             } else {
                                 initial
                             };
-                            self.editing = Some(EditState { buf, spot: self.pending_spot, complete_idx: 0, alt_frame: u64::MAX });
+                            let caret = buf.chars().count();
+                            self.editing = Some(EditState {
+                                buf,
+                                spot: self.pending_spot,
+                                complete_idx: 0,
+                                alt_frame: u64::MAX,
+                                caret,
+                                caret_override: None,
+                            });
                             self.status = format!("正在编辑 {}", cell_name(r, c));
                         }
                     } else {
@@ -27825,6 +28157,45 @@ impl eframe::App for SheetApp {
                 self.save(false);
             }
         }
+        // 无界面验收：SC_REF_SIM="r,c[,frame]" 在指定帧把引用插进正在编辑的公式。
+        // 走的是和鼠标点选同一个 insert_reference（真实 egui 指针路径由
+        // ui113_clicking_grid_while_editing_formula_inserts_reference 用例覆盖；
+        // 这里只为出渲染证据：引用着色 + 点选细框）。
+        if let Ok(spec) = std::env::var("SC_REF_SIM") {
+            static F: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let f = F.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut it = spec.split(',');
+            let r: Option<u32> = it.next().and_then(|s| s.trim().parse().ok());
+            let c: Option<u32> = it.next().and_then(|s| s.trim().parse().ok());
+            let at: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(12);
+            if let (Some(r), Some(c)) = (r, c) {
+                if f == at {
+                    let label = cell_name(r, c);
+                    if let Some(ed) = self.editing.as_mut() {
+                        let (buf, caret) = insert_reference(&ed.buf, ed.caret, &label);
+                        ed.buf = buf;
+                        ed.caret = caret;
+                        ed.caret_override = Some(caret);
+                    }
+                    self.pick_rect = Some((r, c, r, c));
+                }
+                if f == at + 2 {
+                    let buf = self
+                        .editing
+                        .as_ref()
+                        .map(|e| e.buf.clone())
+                        .unwrap_or_default();
+                    let spans: Vec<String> = ref_spans(&buf)
+                        .iter()
+                        .map(|(s, e, ci)| format!("{}..{}=#{}", s, e, ci))
+                        .collect();
+                    eprintln!(
+                        "[refsim] buf={:?} pick={:?} sel={:?} spans={:?}",
+                        buf, self.pick_rect, self.sel, spans
+                    );
+                }
+            }
+        }
         // 无界面验收：SC_DBLCLICK="x,y" 在应用内注入两次点击，走真实的双击判定
         if let Ok(spec) = std::env::var("SC_DBLCLICK") {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -28476,29 +28847,48 @@ impl eframe::App for SheetApp {
                                 .max_rect(ed_rect)
                                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
+                        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let mut job = formula_layout_job(text, font, ui_kit::TEXT);
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts(|f| f.layout_job(job))
+                        };
                         let te = if self.fx_expanded {
                             child.add_sized(
                                 Vec2::new(ed_rect.width(), ed_rect.height()),
                                 egui::TextEdit::multiline(&mut ed.buf)
                                     .id(egui::Id::new("fx_edit"))
                                     .frame(false)
-                                    .desired_rows(3),
+                                    .desired_rows(3)
+                                    .layouter(&mut layouter),
                             )
                         } else {
                             child.add_sized(
                                 Vec2::new(ed_rect.width(), 24.0),
                                 egui::TextEdit::singleline(&mut ed.buf)
                                     .id(egui::Id::new("fx_edit"))
-                                    .frame(false),
+                                    .frame(false)
+                                    .layouter(&mut layouter),
                             )
                         };
-                        if picked {
-                            let id = egui::Id::new("fx_edit");
-                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
+                        // 补全/点选引用后把光标搬到指定位置；否则每帧记录真实光标
+                        let fx_id = egui::Id::new("fx_edit");
+                        if picked || ed.caret_override.is_some() {
+                            let target = ed
+                                .caret_override
+                                .take()
+                                .unwrap_or_else(|| ed.buf.chars().count());
+                            let target = target.min(ed.buf.chars().count());
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
                                 st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                                    egui::text::CCursor::new(ed.buf.chars().count()),
+                                    egui::text::CCursor::new(target),
                                 )));
-                                egui::TextEdit::store_state(ui.ctx(), id, st);
+                                egui::TextEdit::store_state(ui.ctx(), fx_id, st);
+                            }
+                            ed.caret = target;
+                        } else if let Some(st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
+                            if let Some(r) = st.cursor.char_range() {
+                                ed.caret = r.primary.index;
                             }
                         }
                         if ed.spot == EditSpot::FormulaBar {

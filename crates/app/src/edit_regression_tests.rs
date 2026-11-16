@@ -7838,3 +7838,142 @@ fn formula_autocomplete_and_f4_cycle_keep_editing_state() {
     assert!(cycle_formula_ref(&mut f));
     assert_eq!(f, "=SUM(B2:$C$3)", "只循环末尾引用");
 }
+
+// ===== UI-11.3：编辑公式时点选单元格建立引用 + 引用着色 =====
+
+#[test]
+fn ui113_insert_reference_matches_excel_pick_semantics() {
+    // 光标左边是引用：整段替换（Excel 里 `=A1` 点 B2 → `=B2`）
+    assert_eq!(insert_reference("=A1", 3, "B2"), ("=B2".to_string(), 3));
+    // 函数括号/运算符后：原位置插入
+    assert_eq!(insert_reference("=SUM(", 5, "A1"), ("=SUM(A1".to_string(), 7));
+    assert_eq!(insert_reference("=A1+", 4, "B2"), ("=A1+B2".to_string(), 6));
+    // 正在键入的引用被替换，光标停在引用末尾
+    assert_eq!(insert_reference("=SUM(A1", 7, "C3"), ("=SUM(C3".to_string(), 7));
+    // 区域引用整体替换（光标停在 `)` 前）
+    assert_eq!(insert_reference("=SUM(A1:B2)", 10, "D4"), ("=SUM(D4)".to_string(), 7));
+    // 刚敲完 `=`：插在等号后
+    assert_eq!(insert_reference("=A1", 1, "B2"), ("=B2A1".to_string(), 3));
+    // 不带等号的普通文本不替换标识符以外的内容
+    assert_eq!(insert_reference("abc ", 4, "B2"), ("abc B2".to_string(), 6));
+}
+
+#[test]
+fn ui113_ref_spans_colour_references_and_share_colour_per_text() {
+    let src = "=SUM(A1:B2)+A1*$C$3";
+    let chars: Vec<char> = src.chars().collect();
+    let spans = ref_spans(src);
+    let got: Vec<String> = spans.iter().map(|(s, e, _)| chars[*s..*e].iter().collect()).collect();
+    assert_eq!(got, vec!["A1:B2", "A1", "$C$3"], "函数名/运算符不算引用");
+    assert_ne!(spans[0].2, spans[1].2, "不同范围的引用换色");
+    assert_ne!(spans[0].2, spans[2].2, "不同引用换色");
+    // 同一文本的重复引用共用颜色（Excel 同款）
+    let rep = ref_spans("=A1+A1");
+    assert_eq!(rep.len(), 2);
+    assert_eq!(rep[0].2, rep[1].2);
+
+    // 非公式文本不着色；公式按引用切段
+    let font = egui::FontId::proportional(13.0);
+    let plain = formula_layout_job("abc", font.clone(), egui::Color32::WHITE);
+    assert_eq!(plain.sections.len(), 1);
+    let job = formula_layout_job(src, font, egui::Color32::WHITE);
+    assert_eq!(job.sections.len(), 6, "=SUM( / A1:B2 / )+ / A1 / * / $C$3");
+    assert_eq!(job.sections[1].format.color, ref_color(spans[0].2));
+    // 带表名的引用整段上色
+    let q = "='My Sheet'!A1+Sheet2!$B$2";
+    let qc: Vec<char> = q.chars().collect();
+    let qsp: Vec<String> = ref_spans(q).iter().map(|(s, e, _)| qc[*s..*e].iter().collect()).collect();
+    assert_eq!(qsp, vec!["'My Sheet'!A1", "Sheet2!$B$2"]);
+}
+
+#[test]
+fn ui113_clicking_grid_while_editing_formula_inserts_reference() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets[0].set(0, 0, number(3.0)); // A1
+    app.wb.sheets[0].set(1, 1, number(10.0)); // B2
+    app.sel = (0, 2); // C1 里写公式，避免引用到自己
+    app.sel_end = (0, 2);
+    app.editing = Some(EditState::new("=A1+".into()));
+    let pos = egui::pos2(
+        HEAD_W + app.wb.sheets[0].cols.pos(1) + 15.0,
+        HEAD_H + app.wb.sheets[0].rows.pos(1) + 10.0,
+    );
+    click_grid(&mut app, &ctx, pos);
+    {
+        let ed = app.editing.as_ref().expect("点选引用不能结束编辑");
+        assert_eq!(ed.buf, "=A1+B2");
+        assert_eq!(ed.caret, 6);
+    }
+    assert_eq!(app.sel, (0, 2), "编辑格不能被点选带走");
+    assert_eq!(app.pick_rect, Some((1, 1, 1, 1)), "被引用格子要有细框");
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(13.0));
+    assert_eq!(app.pick_rect, None, "提交后细框要清掉");
+}
+
+#[test]
+fn ui113_textedit_layouter_keeps_ref_colours_in_galley() {
+    let ctx = egui::Context::default();
+    let mut buf = String::from("=A1+B1");
+    let mut colors: Vec<egui::Color32> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut layouter = |ui: &egui::Ui, text: &str, w: f32| {
+        texts.push(text.to_string());
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut job = formula_layout_job(text, font, ui_kit::TEXT);
+        job.wrap.max_width = w;
+        ui.fonts(|f| f.layout_job(job))
+    };
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let out = egui::TextEdit::singleline(&mut buf)
+                .layouter(&mut layouter)
+                .show(ui);
+            colors = out.galley.job.sections.iter().map(|s| s.format.color).collect();
+        });
+    });
+    eprintln!("[galley] texts={texts:?} colors={colors:?}");
+    assert!(colors.contains(&ref_color(0)), "A1 应为第一种引用色");
+    assert!(colors.contains(&ref_color(1)), "B1 应为第二种引用色");
+}
+
+#[test]
+fn ui113_alt_enter_inserts_newline_at_caret_not_at_end() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 7);
+    app.sel_end = (0, 7);
+    app.editing = Some(EditState::new("=A1&B1".into()));
+    let id = egui::Id::new("grid_edit");
+    let mut st = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+        egui::text::CCursor::new(3),
+    )));
+    egui::TextEdit::store_state(&ctx, id, st);
+    app.editing.as_mut().unwrap().caret = 3;
+    run_grid_frame(&mut app, &ctx, vec![]);
+    let alt_enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::ALT,
+    };
+    // egui 的 i.modifiers 取自 RawInput.modifiers，不跟随 Key 事件里的修饰键
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+        modifiers: egui::Modifiers::ALT,
+        ..Default::default()
+    };
+    input.events = vec![alt_enter];
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+    });
+    run_grid_frame(&mut app, &ctx, vec![]);
+    let ed = app.editing.as_ref().expect("Alt+Enter 不能结束编辑");
+    assert_eq!(ed.buf, "=A1\n&B1", "换行要插在光标处，不是缓冲末尾");
+    assert_eq!(ed.caret, 4, "光标停在换行之后");
+}
