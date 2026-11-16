@@ -36,6 +36,9 @@
 !crates/core/tests/fixtures/qa02_pivot_pdf/*.xlsx
 !crates/app/tests/fixtures/qa02_app/*.xlsx
 !crates/core/tests/fixtures/qa01_extended/*.xlsx
+!crates/core/tests/fixtures/qa01/formats/*.xlsx
+!crates/core/tests/fixtures/qa01/formats/*.xls
+!crates/core/tests/fixtures/qa01/formats/*.xlsm
 
 !crates/core/tests/fixtures/c16/*.xlsx
 !crates/core/tests/fixtures/c07/*.xlsx

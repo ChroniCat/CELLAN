@@ -1,0 +1,75 @@
+QA-01.3 图形矩阵：组合 / 连接线 / 预设几何 / 内嵌图表（含改字后保存）
+================================================================================
+日期：2026-11-16    Excel 16.0 (Build 20326)、WPS 12.0 (KET.Application)
+夹具：work/probe/qa01/shapes.xlsx（Excel 造）
+探针：scripts/qa01_shapes_probe.ps1
+往返：crates/core/examples/pivot_roundtrip.rs（只 load+save）
+改字：crates/core/examples/textbox_edit.rs（改一个形状文字后保存）
+回归：crates/core/tests/qa01_shapes_edit.rs
+
+一、夹具内容（Shapes 表）
+-------------------------
+  BoxB     矩形 80×40（红/绿填充）
+  LinkAB   直线连接线（msoConnectorStraight）
+  GroupAC  组合：BoxA（矩形）+ OvalC（椭圆 msoShapeOval），2 个子形状
+  ChartD   内嵌柱状图（xlColumnClustered），1 个系列，标题「销量」，240×160
+  数据      G1:H4 = 类别/值：A 10、B 20、C 30
+
+二、只读往返（load+save，不动内容）
+-----------------------------------
+部件逐字节一致：xl/drawings/drawing1.xml、xl/drawings/_rels、xl/charts/chart1.xml、
+xl/charts/style1.xml、xl/charts/colors1.xml、xl/charts/_rels。
+
+Excel / WPS 读数（源与产物完全一致）：
+  shapes=4  charts=1
+  shape1=type1 BoxB 80×40
+  shape2=type1? -> 连接线 LinkAB 60×0（Type 1 = msoLine 家族，名字与尺寸保持）
+  shape3=type6 GroupAC 80×130 items=2
+  shape4=type3 ChartD 240×160
+  chart1=name:ChartD series:1 title:销量 240×160
+
+三、改一个字后保存（dirty 路径，最容易被写坏）
+----------------------------------------------
+把 BoxB 的文字改成「改过的文字」→ 我们保存 → Excel / WPS：
+  shapes=4（没有多出、没有少）
+  BoxB 仍是 type1（矩形，不是文本框），文本读到「改过的文字」
+  LinkAB 仍是连接线，GroupAC 仍 type6 items=2，ChartD 仍是图表 + 标题 + 1 系列
+  drawing1.xml 里 BoxB 的 extLst、`<xdr:cNvSpPr/>`、`a:off/a:ext`、`prstGeom prst="rect"`、
+  `xdr:style` 全部保留 —— 只换 `<a:t>` 与 rPr 属性。
+
+四、这一轮抓到的真实缺陷（都已修 + 回归）
+------------------------------------------
+1) 组合被拆平 / 形状被复制
+   现象（修前 shapes-edited.xlsx）：shapes 从 4 变 6，多出 type17 的 LinkAB 和 GroupAC。
+   根因：parse_drawing 把组合里的子形状和连接线也当成独立文本框读进模型；
+   rewrite_drawing 又只排除 pic/graphicFrame，于是组合块被按文本框重写，
+   而模型里「没人认领」的 LinkAB/GroupAC 被当成新形状追加。
+   修：解析与重写都以「组合/连接线不归我们管」为准；外来块整段保留，
+   并且按名字销账，防止追加重复。
+
+2) 改一个字把矩形写成文本框
+   现象（修前）：BoxB 保存后 Type 从 1 变 17，cNvSpPr 变 `txBox="1"`，
+   `a:off/a:ext` 归零，`xdr:style` 消失。
+   根因：命中形状一律用 anchor_xml 重写。
+   修：原地改 —— 只替换 `<a:t>` 文本、按模型调 `sz/b/i` 与 srgbClr；
+   Excel 的 spPr/prstGeom/style 一律保留。只有结构不认识时才退回整块重写。
+
+3) 空形状插字插错位置
+   现象：BoxB 本来没有文字（Excel 写 `<a:p><a:endParaRPr/></a:p>`），
+   我们插入 `<a:r>` 时落在 endParaRPr 之后，Excel 直接忽略 → 打开是空文本。
+   根因：`<a:endParaRPr>` 必须是 `<a:p>` 的最后一个子元素。
+   修：插在 endParaRPr 之前。
+
+4) 清空所有文本框的既有语义要保住
+   重写逻辑改成「以模型为准」后，独立 `<xdr:sp>` 没被认领就要删掉
+   （清空文本框时形状必须消失）；外来块无条件保留。
+   这条由既有测试 deleting_all_textboxes_removes_the_shape 守住。
+
+五、测试
+--------
+qa01_shapes_edit.rs
+  group_children_and_connectors_are_not_parsed_as_textboxes   → 只认出 BoxB
+  editing_one_shape_keeps_group_connector_and_chart           → 文字进、组合/连接线/图表在、没有 txBox="1"
+textbox（既有）5 条全过（含清空语义、图片保留、解析往返）
+cargo test -p sheetcore（--test-threads=2）：106 个测试二进制 0 failed → work/goal-logs/qa01-core5.log
+cargo test -p app --bin app（--test-threads=2）：330 passed            → work/goal-logs/qa01-app3.log

@@ -1,0 +1,8 @@
+product=Microsoft Excel 16.0
+shapes=4
+charts=1
+  shape1=type1 name=BoxB w=80 h=40
+  shape2=type1 name=LinkAB w=60 h=0
+  shape3=type6 name=GroupAC w=80 h=130 items=2
+  shape4=type3 name=ChartD w=240 h=160
+chart1=name:ChartD series:1 title:销量 w=240 h=160

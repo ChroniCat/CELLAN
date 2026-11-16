@@ -180,8 +180,13 @@ pub fn parse_drawing(xml: &str) -> Vec<TextBox> {
                 if !(chunk.contains("<xdr:sp") || chunk.contains("<sp ")) {
                     continue;
                 }
-                // 图表是 graphicFrame，图片是 xdr:pic；这里只认形状
-                if chunk.contains("<xdr:pic") || chunk.contains("<xdr:graphicFrame") {
+                // 图表是 graphicFrame，图片是 xdr:pic；组合里的子形状、连接线也不归我们管，
+                // 当成独立文本框会在保存时被复制/拆平（实测 shapes 4 → 6）。
+                if chunk.contains("<xdr:pic")
+                    || chunk.contains("<xdr:graphicFrame")
+                    || chunk.contains("<xdr:grpSp")
+                    || chunk.contains("<xdr:cxnSp")
+                {
                     continue;
                 }
                 let Some((f, t)) = anchor_pair(chunk) else {
@@ -442,50 +447,303 @@ pub fn new_drawing_xml(list: &[TextBox]) -> String {
     )
 }
 
-/// 把 drawing XML 里所有形状（`<xdr:sp>` 锚点）换成模型里的这一批，图片/图表原样保留
+/// 把 drawing XML 里属于我们的形状锚点换成模型里的这一批。
+///
+/// 只动「纯 `<xdr:sp>` 锚点」：图片（`<xdr:pic`）、图表（`<xdr:graphicFrame`）、
+/// 组合（`<xdr:grpSp`）、连接线（`<xdr:cxnSp`）整块原样保留 —— 以前只排除
+/// pic/graphicFrame，组合会被拆成普通文本框。
+///
+/// 名字能对上的形状，如果文本和锚点几何都没变，也整块保留：我们的 `anchor_xml`
+/// 写不出 Excel 的 spPr 细节（off/ext、style、effectLst），无改动的形状不该被重写。
 pub fn rewrite_drawing(xml: &str, list: &[TextBox]) -> String {
-    let mut kept = strip_shape_anchors(xml);
-    let mut body = String::new();
-    for tb in list {
-        body.push_str(&anchor_xml(tb));
+    let mut out = String::with_capacity(xml.len() + 256);
+    let mut rest = xml;
+    let mut used = vec![false; list.len()];
+    while let Some((start, _)) = next_anchor(rest) {
+        out.push_str(&rest[..start]);
+        let Some(len) = anchor_len(&rest[start..]) else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let block = &rest[start..start + len];
+        let foreign = block.contains("<xdr:pic")
+            || block.contains("<xdr:graphicFrame")
+            || block.contains("<xdr:grpSp")
+            || block.contains("<xdr:cxnSp");
+        let mut handled = false;
+        let name = anchor_name(block);
+        if let Some(name) = name.as_deref() {
+            if let Some(k) = list.iter().position(|tb| tb.name == name) {
+                used[k] = true;
+                if foreign {
+                    // 图片/图表/组合/连接线：整块保留，绝不能按文本框重写
+                    out.push_str(block);
+                } else if block_matches(block, &list[k]) {
+                    out.push_str(block);
+                } else if let Some(edited) = edit_block(block, &list[k]) {
+                    // 原地改文字/字号，保住 Excel 的 spPr、prstGeom、style
+                    out.push_str(&edited);
+                } else {
+                    out.push_str(&anchor_xml(&list[k]));
+                }
+                handled = true;
+            }
+        }
+        if !handled {
+            // 独立 `<xdr:sp>` 以模型为准：模型里没有它就等于用户删了（清空文本框时
+            // 必须整块消失）。外来块（图片/图表/组合/连接线）无条件保留。
+            let own_shape = !foreign && block.contains("<xdr:sp");
+            if !own_shape {
+                out.push_str(block);
+            }
+        }
+        rest = &rest[start + len..];
     }
-    if body.is_empty() {
-        return kept;
+    out.push_str(rest);
+    let mut add = String::new();
+    for (k, tb) in list.iter().enumerate() {
+        if !used[k] {
+            add.push_str(&anchor_xml(tb));
+        }
     }
-    if let Some(i) = kept.rfind("</xdr:wsDr>") {
-        kept.insert_str(i, &body);
-    } else if let Some(i) = kept.rfind("</wsDr>") {
-        kept.insert_str(i, &body);
+    if !add.is_empty() {
+        if let Some(i) = out.rfind("</xdr:wsDr>") {
+            out.insert_str(i, &add);
+        } else if let Some(i) = out.rfind("</wsDr>") {
+            out.insert_str(i, &add);
+        }
     }
-    kept
+    out
 }
 
-fn strip_shape_anchors(xml: &str) -> String {
-    let mut x = xml.to_string();
-    for tag in ["twoCellAnchor", "oneCellAnchor"] {
+/// 找下一个锚点起始位置（两种前缀都认）
+fn next_anchor(xml: &str) -> Option<(usize, usize)> {
+    let mut best: Option<usize> = None;
+    for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
         for prefix in ["xdr:", ""] {
             let open = format!("<{prefix}{tag}");
-            let close = format!("</{prefix}{tag}>");
-            let mut from = 0usize;
-            loop {
-                let Some(rel) = x[from..].find(&open) else { break };
-                let start = from + rel;
-                let Some(endrel) = x[start..].find(&close) else { break };
-                let end = start + endrel + close.len();
-                let chunk = x[start..end].to_string();
-                let is_shape = (chunk.contains("<xdr:sp") || chunk.contains("<sp "))
-                    && !chunk.contains("<xdr:pic")
-                    && !chunk.contains("<xdr:graphicFrame");
-                if is_shape {
-                    x.replace_range(start..end, "");
-                    from = start;
-                } else {
-                    from = end;
+            if let Some(i) = xml.find(&open) {
+                // 排除 <twoCellAnchorXxx> 这种更长名字
+                let after = xml[i + open.len()..].chars().next();
+                if !matches!(after, Some(' ') | Some('>') | Some('/')) {
+                    continue;
                 }
+                best = Some(best.map_or(i, |b: usize| b.min(i)));
             }
         }
     }
-    x
+    best.map(|i| (i, 0))
+}
+
+/// 从锚点起点算出整块长度（含闭合标签）
+fn anchor_len(xml: &str) -> Option<usize> {
+    let mut used_tag: Option<String> = None;
+    for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
+        for prefix in ["xdr:", ""] {
+            let open = format!("<{prefix}{tag}");
+            if xml.starts_with(&open) {
+                used_tag = Some(format!("{prefix}{tag}"));
+            }
+        }
+    }
+    let tag = used_tag?;
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    // 自闭合
+    let head_end = xml.find('>')?;
+    if xml[..head_end].ends_with('/') {
+        return Some(head_end + 1);
+    }
+    let mut depth = 1usize;
+    let mut from = head_end + 1;
+    let open_bytes = format!("<{tag}");
+    let close_bytes = format!("</{tag}>");
+    while depth > 0 {
+        let next_open = xml[from..].find(&open_bytes).map(|x| from + x);
+        let next_close = xml[from..].find(&close_bytes).map(|x| from + x);
+        // 忽略自闭合的 open
+        let next_open = next_open.filter(|&ix| {
+            let end = xml[ix..].find('>').map(|e| ix + e).unwrap_or(ix);
+            !xml[ix..end].ends_with('/')
+        });
+        match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                from = o + open_bytes.len();
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                from = c + close_bytes.len();
+                if depth == 0 {
+                    return Some(from);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(from)
+}
+
+/// 命中形状的「原地改」：只换文字，并按模型调整 rPr（字号/粗体/斜体/颜色）。
+/// 返回 None 表示结构不认识，让调用方退回整块重写。
+fn edit_block(block: &str, tb: &TextBox) -> Option<String> {
+    // 空形状（Excel 写 <a:p/>，没有 <a:t>）：把文字插进第一个段落，仍然保留整块
+    if !block.contains("<a:t") {
+        // <a:endParaRPr> 必须是 <a:p> 的最后一个子元素，文字要插在它前面
+        let para_end = block.find("</a:p>")?;
+        let p = match block[..para_end].rfind("<a:endParaRPr") {
+            Some(i) => i,
+            None => para_end,
+        };
+        let run = format!("<a:r><a:t>{}</a:t></a:r>", esc(&tb.text));
+        let mut out = String::with_capacity(block.len() + run.len());
+        out.push_str(&block[..p]);
+        out.push_str(&run);
+        out.push_str(&block[p..]);
+        return Some(tune_runs(&out, tb));
+    }
+    let mut out = String::with_capacity(block.len() + tb.text.len());
+    let mut rest = block;
+    let mut done = false;
+    while let Some(i) = rest.find("<a:t") {
+        out.push_str(&rest[..i]);
+        let seg = &rest[i..];
+        let gt = seg.find('>')?;
+        let close = seg.find("</a:t>")?;
+        out.push_str(&seg[..=gt]);
+        if !done {
+            out.push_str(&esc(&tb.text));
+            done = true;
+        }
+        out.push_str("</a:t>");
+        rest = &seg[close + 6..];
+    }
+    out.push_str(rest);
+    Some(tune_runs(&out, tb))
+}
+
+/// 把 `<a:rPr>` 的字号/粗体/斜体/颜色对齐模型；没有 rPr 就不动
+fn tune_runs(xml: &str, tb: &TextBox) -> String {
+    let mut out = String::with_capacity(xml.len() + 32);
+    let mut rest = xml;
+    while let Some(i) = rest.find("<a:rPr") {
+        out.push_str(&rest[..i]);
+        let seg = &rest[i..];
+        let Some(gt) = seg.find('>') else {
+            out.push_str(seg);
+            return out;
+        };
+        let mut tag = seg[..=gt].to_string();
+        let self_closing = tag.ends_with("/>");
+        // 字号：sz 以 1/100 磅计
+        if tb.size > 0.0 {
+            tag = set_attr(&tag, "sz", &format!("{}", (tb.size * 100.0).round() as i64));
+        }
+        tag = set_attr(&tag, "b", if tb.bold { "1" } else { "0" });
+        tag = set_attr(&tag, "i", if tb.italic { "1" } else { "0" });
+        let _ = self_closing;
+        out.push_str(&tag);
+        rest = &seg[gt + 1..];
+        // 颜色：紧跟着的 solidFill/srgbClr
+        if let Some(rel) = rest.find("</a:rPr>") {
+            let inner = &rest[..rel];
+            if let Some(cp) = inner.find("<a:srgbClr val=\"") {
+                let val = format!("{:02X}{:02X}{:02X}", tb.color[0], tb.color[1], tb.color[2]);
+                let mut new_inner = inner.to_string();
+                let p = cp + "<a:srgbClr val=\"".len();
+                if let Some(q) = new_inner[p..].find('"') {
+                    new_inner.replace_range(p..p + q, &val);
+                }
+                out.push_str(&new_inner);
+            } else {
+                out.push_str(inner);
+            }
+            out.push_str("</a:rPr>");
+            rest = &rest[rel + "</a:rPr>".len()..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn set_attr(tag: &str, name: &str, value: &str) -> String {
+    let pat = format!(" {name}=\"");
+    if let Some(i) = tag.find(&pat) {
+        let p = i + pat.len();
+        if let Some(q) = tag[p..].find('"') {
+            let mut t = tag.to_string();
+            t.replace_range(p..p + q, value);
+            return t;
+        }
+    }
+    let self_closing = tag.ends_with("/>");
+    let insert_at = if self_closing { tag.len() - 2 } else { tag.len() - 1 };
+    let mut t = tag.to_string();
+    t.insert_str(insert_at, &format!(" {name}=\"{value}\""));
+    t
+}
+
+fn anchor_name(block: &str) -> Option<String> {
+    let i = block.find("<xdr:cNvPr").or_else(|| block.find("<cNvPr"))?;
+    let tag_end = block[i..].find('>').map(|e| i + e)?;
+    let tag = &block[i..=tag_end];
+    let p = tag.find("name=\"")? + 6;
+    let rest = &tag[p..];
+    let q = rest.find('"')?;
+    Some(crate::model::xml_unescape(&rest[..q]))
+}
+
+/// 文本与锚点几何都没变 → 保留原块（我们的 anchor_xml 写不出 Excel 的细节）
+fn block_matches(block: &str, tb: &TextBox) -> bool {
+    if anchor_text(block) != tb.text {
+        return false;
+    }
+    anchor_points(block).map(|(f, t)| f == tb.from && t == tb.to).unwrap_or(false)
+}
+
+fn anchor_text(block: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0usize;
+    loop {
+        let Some(i) = block[from..].find("<a:t") else { break };
+        let i = from + i;
+        let Some(gt) = block[i..].find('>').map(|e| i + e) else { break };
+        let Some(end) = block[gt..].find("</a:t>").map(|e| gt + e) else { break };
+        out.push_str(&crate::model::xml_unescape(&block[gt + 1..end]));
+        from = end + 6;
+    }
+    out
+}
+
+/// 取 <xdr:from> / <xdr:to> 里的四个整数（col, colOff, row, rowOff）
+fn anchor_points(block: &str) -> Option<((u32, i64, u32, i64), (u32, i64, u32, i64))> {
+    let from = point_after(block, "from")?;
+    let to = point_after(block, "to")?;
+    Some((from, to))
+}
+
+fn point_after(block: &str, tag: &str) -> Option<(u32, i64, u32, i64)> {
+    let i = block.find(&format!("<xdr:{tag}>")).or_else(|| block.find(&format!("<{tag}>")))?;
+    let seg = &block[i..];
+    let end = seg.find(&format!("</{tag}>")).or_else(|| seg.find(&format!("</xdr:{tag}>")))?;
+    let seg = &seg[..end];
+    let grab = |name: &str| -> Option<i64> {
+        let p = seg.find(&format!("<{name}>"))?;
+        let rest = &seg[p + name.len() + 2..];
+        let q = rest.find('<')?;
+        rest[..q].trim().parse::<i64>().ok()
+    };
+    // 兼容带 xdr: 前缀的子元素
+    let grab2 = |name: &str| -> Option<i64> {
+        grab(name).or_else(|| grab(&format!("xdr:{name}")))
+    };
+    Some((
+        grab2("col")? as u32,
+        grab2("colOff")?,
+        grab2("row")? as u32,
+        grab2("rowOff")?,
+    ))
 }
 
 // ---------------------------------------------------------------- 存
