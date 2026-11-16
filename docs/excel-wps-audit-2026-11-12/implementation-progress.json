@@ -5215,7 +5215,8 @@
         "61c9b67",
         "911ad41",
         "7169cc6",
-        "b00d923"
+        "b00d923",
+        "42aa56f"
       ],
       "commands": [
         "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 324 passed / 0 failed / 0 ignored（9.71s）",
@@ -5226,7 +5227,9 @@
         "app.exe + SC_TYPE/SC_REF_SIM/SC_SHOT -> buf=\"=A1+B1\"，A1 蓝 B1 绿，B1 外套细蓝框",
         "app.exe + SC_CMD=InsertFunction + SC_TYPE=\"14:AVERAGE\" + SC_KEYSEQ=\"26:enter\" -> 对话框 620x449，匹配数 475→5，applied formula=\"=AVERAGE()\" editing caret=9，编辑栏与格内编辑器同串，状态栏「已插入函数 AVERAGE」",
         "cargo test ... -- ui115 -> 4 passed（区域/整行整列标签、Shift+点扩区域、拖动扩区域、行号列标插入引用）",
-        "app.exe + SC_TYPE=\"6:=SUM(\" + SC_REF_SIM=\"0,0,3,2,14\" -> buf=\"=SUM(A1:C4\" pick=(0,0,3,2) sel=(0,4) spans=[\"5..10=#0\"]，A1:C4 套蓝框"
+        "app.exe + SC_TYPE=\"6:=SUM(\" + SC_REF_SIM=\"0,0,3,2,14\" -> buf=\"=SUM(A1:C4\" pick=(0,0,3,2) sel=(0,4) spans=[\"5..10=#0\"]，A1:C4 套蓝框",
+        "SC_UI116=1 SC_SHOT=... app.exe multi-A.xlsx -> pass6 sheet=1 buf=\"=1+Sheet2!B3\"；pass12 写回 Data!A1 value=43",
+        "cargo test -p app --bin app ui116 -> 4 passed；全量 330 passed"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
@@ -5241,17 +5244,20 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-range-ref.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-6-cross-sheet.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/shot.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/probe2.log"
       ],
       "not_done": [
-        "跨工作表点选建 Sheet2!A1 未实现（点另一张表页会先结束当前编辑）",
         "向导里点区域填参数、以及向导的分类筛选/帮助链接未实现",
-        "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）"
+        "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）",
+        "跨表拖动扩区域（Sheet2!B3:C4）未做：拖动建立在当前表坐标轴上，需要另存远端锚点"
       ],
       "failures": [],
       "blocker": "",
-      "next": "UI-11.6 跨工作表引用（Sheet2!A1）",
-      "updated_utc": "2026-11-16T08:37:08Z",
+      "next": "UI-11.1 真 IME 端到端（需真输入法）；其余切片等复核",
+      "updated_utc": "2026-11-16T10:54:30Z",
       "slices": [
         {
           "id": "UI-11.1",

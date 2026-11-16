@@ -353,3 +353,12 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 回归：`pivot_multi_parts` 7 passed；`-p sheetcore` 103 二进制 0 failed；`-p app` 326 passed。
 - 台账：C12.4 → 待验收，C12 → 待验收（C12.1 已验收、C12.2/12.3 待验收）。
 - 未做且已记录：折叠布局（界面无开关）、计算字段/显示值方式、WPS 内改字段往返。
+
+### 检查点十：UI-11.6 跨工作表取引用
+- `42aa56f`：`edit_sheet`/`edit_sel` 记住编辑所属表与目标格；公式编辑中点别的表页只切视图
+  （`switch_sheet_for_ref`），提交/取消前 `return_to_edit_origin()` 切回原表原格；
+  引用标签统一 `qualify_ref()` 加 `表名!` 前缀，名字含空格/标点/数字开头按 Excel 规则加单引号。
+- 探针（真 GUI）：`[ui116] pass6 sheet=1 label=Sheet2!B3 buf="=1+Sheet2!B3"` → `pass12 formula==1+Sheet2!B3 value=43`；
+  第 8 帧截图里名称框 A1、公式栏 `=1+Sheet2!B3`、底部 `Sheet2` 激活、状态栏「单元格模式 输入 / 已插入」。
+- 测试：4 条 `ui116_*`；app 全量 **330 passed**。
+- 边界：跨表拖动扩区域未做（需远端锚点），已写进 `not_done`。
