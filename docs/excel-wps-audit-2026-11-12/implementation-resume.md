@@ -416,3 +416,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - WPS 对照：源文件在 WPS 里就是 `nodes:1 default`（且把普通形状也报 HasSmartArt），
   产物读数与源一致 —— 属 WPS 读取端限制，登记进 not_done 而不是当成我们的缺陷。
 - 测试：core **106** 二进制 0 failed（`qa01-core6.log`）；app **330 passed**（`qa01-app4.log`）。
+
+### 检查点十五：QA-01.2 manifest 驱动三方 runner
+- `3c6767f`：`scripts/qa01_matrix_runner.py` + `scripts/qa01_manifest.json`，
+  对每个夹具跑「源快照 → 我们 load+save → 副本快照」，Excel 与 WPS 各一遍，逐字段 diff。
+- 快照字段：工作表/UsedRange、CF、DV、表格、名称（名字→引用）、页面设置、冻结、隐藏行列、
+  图片、形状（类型/名字/宽高/组合项/SmartArt 节点）、图表（系列/标题）、外链（按文件名）、透视（字段/方向）。
+- 12 个夹具 0 处意外差异；`.xls` 6 处为已登记损失（两侧一致），`.xlsm` 0 处。
+- runner 自身修了两个比对口径（非产品缺陷）：外链按完整路径比会因副本目录不同而误报；
+  名称按位置比会因我们追加 `_sc_manual_hidden` 记账名而错位 —— 改按字典比并过滤 `_sc_`。
+- 证据：`qa01-matrix-runner.txt` + `qa01-matrix/{matrix-full.json,matrix-summary.tsv}`。
