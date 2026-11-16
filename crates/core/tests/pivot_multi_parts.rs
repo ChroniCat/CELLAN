@@ -262,3 +262,43 @@ fn non_sum_aggregations_write_subtotal_attribute() {
     );
     assert_eq!(xml.matches("<i i=\"").count(), 5, "每个值字段应有一个列项：{xml}");
 }
+
+fn spec_g() -> PivotSpec2 {
+    PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![
+            AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
+            AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
+        ],
+        values: vec![
+            ValueField { col: 2, agg: Agg::Sum, label: None },
+            ValueField { col: 2, agg: Agg::Count, label: None },
+        ],
+        filters: vec![],
+        layout: PivotLayout::default(),
+    }
+}
+
+/// 两个列字段 + 两个值字段：colFields 末尾要有 -2，每个叶子按值展开，总计按值展开。
+#[test]
+fn two_column_fields_with_two_values_expand_each_value() {
+    let f = Fixture::new("2cols2vals");
+    let path = f.file("g.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_g();
+    let (id, _rows) = attach(&path, &mut wb, &spec);
+    assert_eq!(id, 1);
+    let xml = String::from_utf8(
+        sheetcore::fixups::read_part(&path, "xl/pivotTables/pivotTable1.xml").expect("缺部件"),
+    )
+    .unwrap();
+    assert!(
+        xml.contains("<colFields count=\"3\"><field x=\"1\"/><field x=\"3\"/><field x=\"-2\"/></colFields>"),
+        "colFields 不对：{xml}"
+    );
+    // 每个叶子 2 个值 → 4 个叶子 8 项；加 2 个组小计 + 2 个总计 = 12 项（还有 2 个一级组）
+    assert!(xml.contains("i=\"1\""), "缺少第二个值的列项：{xml}");
+    // 行轴 1 个总计 + 列轴按 2 个值展开的 2 个 = 3
+    assert_eq!(xml.matches("<i t=\"grand\"").count(), 3, "总计项数不对：{xml}");
+}

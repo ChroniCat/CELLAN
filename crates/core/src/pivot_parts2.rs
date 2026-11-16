@@ -60,9 +60,6 @@ pub fn build(
     if spec.values.is_empty() {
         bail!("多字段透视至少需要一个值字段");
     }
-    if spec.cols.len() > 1 && spec.values.len() > 1 {
-        bail!("多列字段 + 多值字段的组合还没实测，暂不支持");
-    }
 
     let (r1, c1, r2, c2) = spec.source;
     let wb = crate::xlsx::load(path).context("透视表：读取源工作簿失败")?;
@@ -201,32 +198,56 @@ pub fn build(
             let group = &paths[group_start..i];
             for (j, path) in group.iter().enumerate() {
                 if j == 0 {
-                    // 组首：每层都写明确的 <x>
+                    // 组首：每层都写明确的 <x>；多值时最后补一个值轴的 <x/>（值 0）
                     let mut xs = String::new();
                     for d in 0..n_cols {
                         let idx = idx_of(&mut shared[col_field_idx[d]], &path[d]);
                         xs.push_str(&format!("<x v=\"{idx}\"/>"));
                     }
+                    if k > 1 {
+                        xs.push_str("<x/>");
+                    }
                     items.push(format!("<i>{xs}</i>"));
                 } else {
                     // 同组后续：r 重复前 n_cols-1 层，只有最后一层变
                     let idx = idx_of(&mut shared[col_field_idx[n_cols - 1]], &path[n_cols - 1]);
-                    items.push(format!("<i r=\"{}\"><x v=\"{idx}\"/></i>", n_cols - 1));
+                    let tail = if k > 1 { "<x/>" } else { "" };
+                    items.push(format!("<i r=\"{}\"><x v=\"{idx}\"/>{}</i>", n_cols - 1, tail));
+                }
+                if k > 1 {
+                    // 同一列的其余值：r 重复全部列层，i="k" 标记第几个值
+                    for v in 1..k {
+                        items.push(format!("<i r=\"{n_cols}\" i=\"{v}\"><x v=\"{v}\"/></i>"));
+                    }
                 }
             }
             if spec.layout.subtotals && n_cols >= 2 {
-                // 组小计：外层各级写实际下标，最后一级留空 <x/>
+                // 组小计：外层各级写实际下标，最后一级留空 <x/>；多值再按值展开
                 let mut xs = String::new();
                 for d in 0..n_cols - 1 {
                     let idx = idx_of(&mut shared[col_field_idx[d]], &group[0][d]);
                     xs.push_str(&format!("<x v=\"{idx}\"/>"));
                 }
                 xs.push_str("<x/>");
-                items.push(format!("<i t=\"default\">{xs}</i>"));
+                if k > 1 {
+                    items.push(format!("<i t=\"default\">{xs}</i>"));
+                    for v in 1..k {
+                        items.push(format!("<i t=\"default\" i=\"{v}\">{xs}</i>"));
+                    }
+                } else {
+                    items.push(format!("<i t=\"default\">{xs}</i>"));
+                }
             }
             i = i.max(group_start + 1);
         }
-        items.push("<i t=\"grand\"><x/></i>".to_string());
+        if k > 1 {
+            items.push("<i t=\"grand\"><x/></i>".to_string());
+            for v in 1..k {
+                items.push(format!("<i t=\"grand\" i=\"{v}\"><x/></i>"));
+            }
+        } else {
+            items.push("<i t=\"grand\"><x/></i>".to_string());
+        }
         col_count = items.len();
         col_items = items.join("");
         let mut fields = String::new();

@@ -1,0 +1,76 @@
+C12.4 可编辑往返：Excel 改字段 → 我们保存 → Excel/WPS 仍在；多列+多值
+======================================================================
+日期：2026-11-16
+代码：`crates/core/src/pivot_parts2.rs`（多列字段 × 多值字段的嵌套 colItems）
+脚本：`scripts/c12_edit_probe.ps1`（Excel 改字段）、`crates/core/examples/pivot_roundtrip.rs`
+探针：`scripts/c12_pivot_probe2.ps1`、`crates/core/examples/pivot_multi_probe.rs` 用例 G
+
+一、可编辑性（这是 C12.4「可编辑往返」的核心）
+---------------------------------------------
+不是「能打开」就算，而是**在 Excel 里真的改字段并保存**，再走一遍我们的保存链路，最后两家 Office 复核：
+
+```
+multi-F.xlsx（我们生成：rows=[地区] cols=[产品,值] data=[求和/计数]）
+   │ Excel COM：AddDataField(金额, 最大值, -4136) + RefreshTable + SaveAs
+   ▼
+F-edited.xlsx        before=求和项:金额|计数项:金额
+                     after =求和项:金额|计数项:金额|最大值金额      ← Excel 接受了编辑并重算
+   │ 我们 xlsx::load + xlsx::save
+   ▼
+F-edited-ours.xlsx
+   │ Excel 16.0：PivotTables=1 rows=[地区] cols=[产品,值] data=[求和项:金额,计数项:金额,最大值金额]
+   │ WPS 12.0  ：PivotTables=1 rows=[地区] cols=[产品,值] data=[求和项:金额,计数项:金额,最大值金额]
+```
+也就是说：Excel 里加的数据字段、改后的聚合方式，经我们保存后**没有丢、没有退化**。
+
+二、多列字段 × 多值字段（原来是被显式拒绝的组合）
+-------------------------------------------------
+Excel 黄金样本 `gold/G-2cols2values.xlsx` 给出的结构：
+```
+<colFields count="3"><field x="1"/><field x="3"/><field x="-2"/></colFields>
+<colItems count="18">
+  <i><x/><x/><x/></i>                 (A,数量2,值0)
+  <i r="2" i="1"><x v="1"/></i>       (A,数量2,值1)
+  <i r="1"><x v="2"/><x/></i>         (A,数量4,值0)
+  ...
+  <i t="default"><x/></i>             A 汇总 值0
+  <i t="default" i="1"><x/></i>       A 汇总 值1
+  ...
+  <i t="grand"><x/></i> / <i t="grand" i="1"><x/></i>
+```
+规则：组首叶子写全部层 `<x>` + 值轴 `<x/>`；同组后续 `r="{层数-1}"` 换最后一层 + `<x/>`；
+同一叶子的其余值 `r="{层数}" i="k"`；小计与总计按值各展开一项。
+
+实测 `multi-G.xlsx`：
+```
+Excel: PivotTables=1 rows=[地区] cols=[产品,数量,值] data=[求和项:金额,计数项:金额] range=A9:S15
+  华东  A/2 → 10/1   A/4 → 30/1   A汇总 40/2   B/6 → 50/1   B汇总 50/1   总计 90/3
+  华北  A/7 → 60/1   A汇总 60/1   B/3 → 20/1   B/5 → 40/1   B汇总 60/2   总计 120/3
+  总计  100/3、110/3、210/6
+WPS 12.0: 同上，rows=[地区] cols=[产品,数量,值] data=[求和项:金额,计数项:金额]
+```
+手算：华东 A 两条(10,30)、B 一条(50)，华北 A 一条(60)、B 两条(20,40) —— 和/计数逐格对上。
+之前这条组合会直接 `bail!("多列字段 + 多值字段的组合还没实测，暂不支持")`，现在按黄金样本实现并双端验证。
+
+三、回归
+--------
+- `cargo test -p sheetcore --test pivot_multi_parts` → **7 passed**
+  新增 `two_column_fields_with_two_values_expand_each_value`（colFields=`1,3,-2`、值轴 `i="1"` 齐全、总计项 3 个）
+- `cargo test -p sheetcore` → 103 个测试二进制 0 failed（`work/goal-logs/c12-G-core.log`）
+- `cargo test -p app --bin app` → 326 passed（`work/goal-logs/c12-G-app.log`）
+
+四、C12.4 覆盖面小结
+--------------------
+| 维度 | 已实测 |
+|------|--------|
+| 行字段 | 1、2 个 |
+| 列字段 | 0、1、2 个 |
+| 值字段 | 1～5 个（求和/计数/平均/最大/最小） |
+| 组合 | 单字段、多行、多列、多值、纯值轴、多列+多值 |
+| 保真 | 导入件 Excel 另存 → 我们保存 → 双端仍可编辑；Excel 改字段 → 我们保存 → 双端字段不丢 |
+
+五、未覆盖（不在 C12.4 合同内，但要写清）
+-----------------------------------------
+- 折叠布局（`compact="1"`）：界面没有暴露布局开关，`PivotLayout` 只有表格形式；
+- 计算字段/计算项、显示值方式（占总计百分比等）、按值筛选；
+- 在 WPS 里改字段后再存回（本轮改字段只用 Excel 做，WPS 只做打开/读字段复核）。
