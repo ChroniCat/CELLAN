@@ -4373,7 +4373,7 @@
       "scope": "core/tests/公式golden",
       "source": "qa-requirements.md",
       "heading": "QA-06 P1 公式语义回归矩阵",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "",
       "files": [
         "crates/core/tests/qa06_matrix.rs",
@@ -4397,12 +4397,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json"
       ],
       "not_done": [
-        "#SPILL! 冲突、迭代计算下的增量一致、LAMBDA 系列（本机 Excel 不支持）未覆盖"
+        "LAMBDA/MAP/BYROW/REDUCE 等本机 Excel 16.0 Build 20326 不支持（#NAME?），按台账口径不计通过也不计失败。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-16T09:01:20Z",
+      "updated_utc": "2026-11-16T19:42:06Z",
       "slices": [
         {
           "id": "QA-06.1",
@@ -4410,7 +4410,7 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "错误传播（#N/A/#DIV/0!/#VALUE! 及 IFERROR/IFNA/ERROR.TYPE）、空值与空字符串（ISBLANK/COUNTBLANK/COUNTA/文本数字强转）、日期序号与 1900 系统（含虚构闰日 60、月份越界进位、EDATE/EOMONTH/DATEDIF/WEEKDAY/WEEKNUM）50 条，与本机 Excel 16.0 实算逐条一致；WPS 12.0 语义一致（两处仅列宽不足显示 ########）。矩阵由 Excel COM 生成，数字按 Value2 相对 1e-9 比较。",
           "files": [
             "crates/core/tests/qa06_matrix.rs",
@@ -4425,7 +4425,8 @@
           "commands": [
             "powershell -File scripts/qa06_excel_probe.ps1 F:/…/work/qa06 -> \"Excel 16.0：50 条；WPS=12.0\"",
             "cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2 -> 1 passed / 0 failed（err 16 + blank 17 + date 17）",
-            "powershell -File scripts/qa06_subtotal_probe.ps1 F:/finance-native-sheets-ready/work/qa06h -> 7 条 Excel 实算"
+            "powershell -File scripts/qa06_subtotal_probe.ps1 F:/finance-native-sheets-ready/work/qa06h -> 7 条 Excel 实算",
+            "cargo test -p sheetcore --test calc_iteration -- subtotal_and_aggregate -> 7 条与 Excel 一致（55/47/10/47/55/5.5/101）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-error-blank-date.txt",
@@ -4437,13 +4438,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-subtotal.tsv"
           ],
           "not_done": [
-            "SUBTOTAL 109–111 系列与 AGGREGATE option 5/6 未按隐藏行过滤：Excel 实测 SUBTOTAL(9)=55/SUBTOTAL(109)=47/AGGREGATE(9,5)=47，引擎当前一律 55（读码核对，待实现）。",
-            "数组/动态数组溢出已转 QA-06.2 并验收；查找/文本边界已转 QA-06.3 并验收。"
+            "LAMBDA/MAP/BYROW 本机 Excel #NAME?（按台账不计）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "QA-06.2",
-          "updated_utc": "2026-11-16T19:31:22Z"
+          "updated_utc": "2026-11-16T19:42:06Z"
         },
         {
           "id": "QA-06.2",
@@ -4502,7 +4502,7 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-06 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "财务 16 条（NPV/IRR/XIRR/PMT/PV/FV/RATE/NPER/IPMT/PPMT/CUMIPMT/SLN/SYD/DDB/EFFECT/NOMINAL）、查找 14 条（VLOOKUP 精确与近似、XLOOKUP、MATCH、INDEX、LOOKUP、HLOOKUP、CHOOSE、INDIRECT、OFFSET）、文本 22 条（LEFT/RIGHT/MID/LEN/TRIM/UPPER/LOWER/PROPER/SUBSTITUTE/FIND/SEARCH/REPLACE/TEXTJOIN/CONCAT/VALUE/TEXT/EXACT/UNICODE，含中文）全部与本机 Excel 16.0 实算一致；过程中修掉 IPMT/PPMT 符号、CUMIPMT pv 校验、TEXT 单字母 m/d 三个真实缺陷。相对容差：默认 1e-9，IRR/XIRR/RATE 迭代求根用 1e-7（Excel 自身也是数值解）。",
           "files": [
             "crates/core/tests/qa06_matrix.rs",
@@ -4534,12 +4534,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-3-lookup-wildcard-text-sections.txt"
           ],
           "not_done": [
-            "数组/动态数组与增量一致性属于 QA-06.2，仍未做"
+            "数组/动态数组与增量一致已转 QA-06.2 并验收；LAMBDA 系列本机 Excel #NAME?（不计）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "QA-06.2 数组/动态数组与增量一致",
-          "updated_utc": "2026-11-16T08:58:16Z"
+          "updated_utc": "2026-11-16T19:42:06Z"
         }
       ]
     },

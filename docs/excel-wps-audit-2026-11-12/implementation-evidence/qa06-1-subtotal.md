@@ -32,3 +32,24 @@
 ```powershell
 powershell -File scripts/qa06_subtotal_probe.ps1 F:/finance-native-sheets-ready/work/qa06h
 ```
+
+## 2026-11-17 实现与对拍（已通过）
+
+改造点：`mod.rs` 的 `Node::Func` 实参构造路径（不是 `call_generic`，那是另一条路）新增
+`skip_hidden` 判定与 `drop_hidden_rows()`：
+
+- `SUBTOTAL` 首参 ≥ 100 → 按 `hidden_rows`/`hidden_rows_user` 剔除整行后再打包 `Arg::Range`；
+- `AGGREGATE` 第二参 5/6 → 同样剔除；
+- 1–11 系列保持包含隐藏行（Excel 口径）。
+
+用例 `subtotal_and_aggregate_skip_manually_hidden_rows`（7 条 Excel 实测值）：
+
+```
+[55, 47, 10, 47, 55, 5.5, 101]   // 全部一致
+test result: ok. 6 passed
+```
+
+其中 101 是跨表 `=S2!A1+1`，覆盖整列 `SUM(A:A)=55` 与跨表引用两条非缺口项。
+
+坑：函数实参有两条构造路径（`call_generic` 与 `Node::Func` 主路径），只改前者时
+`SUBTOTAL(109)` 仍算 55——与 VLOOKUP 撞 `mod.rs` 哈希快路同一类问题。

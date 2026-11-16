@@ -2237,6 +2237,23 @@ impl<'a> Calc<'a> {
                     }
                     return self.apply_lambda_val(&lam, vals, si);
                 }
+                // SUBTOTAL 100+ / AGGREGATE option 5|6 先按隐藏行过滤，再打包实参
+                let skip_hidden = if name == "SUBTOTAL" {
+                    nodes
+                        .first()
+                        .map(|n| self.eval_node(n, si).to_number().unwrap_or(0.0) >= 100.0)
+                        .unwrap_or(false)
+                } else if name == "AGGREGATE" {
+                    nodes
+                        .get(1)
+                        .map(|n| {
+                            let o = self.eval_node(n, si).to_number().unwrap_or(0.0);
+                            o == 5.0 || o == 6.0
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 let mut args = Vec::with_capacity(nodes.len());
                 for n in nodes {
                     // 区域参数保留结构（SUM/COUNTIF 等需要）
@@ -2246,7 +2263,14 @@ impl<'a> Calc<'a> {
                             continue;
                         }
                         match self.range_values(a, b, si) {
-                            Ok(arg) => args.push(arg),
+                            Ok(arg) => {
+                                let arg = if skip_hidden {
+                                    self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, si)
+                                } else {
+                                    arg
+                                };
+                                args.push(arg)
+                            }
                             Err(e) => args.push(Arg::Val(FValue::Error(e))),
                         }
                     } else {
