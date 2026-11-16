@@ -23016,6 +23016,57 @@ let txn = self.txn_begin(&keys);
             node.set_role(egui::accesskit::Role::Cell);
             node.set_label(label);
         });
+        // UI-24.3：整个网格的选区语义（工作表、范围、几行几列）
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let (r0, r1n) = (r1.min(r2), r1.max(r2));
+        let (c0, c1n) = (c1.min(c2), c1.max(c2));
+        let range = format!(
+            "{}{}:{}{}",
+            sheetcore::model::col_label(c0),
+            r0 + 1,
+            sheetcore::model::col_label(c1n),
+            r1n + 1
+        );
+        let sheet = self.wb.sheet(self.sheet_idx).name.clone();
+        let summary = format!(
+            "工作表 {sheet}，选区 {range}，{} 行 {} 列，活动单元格 {addr}",
+            r1n - r0 + 1,
+            c1n - c0 + 1
+        );
+        let _ = ctx.accesskit_node_builder(resp.id.with("grid"), |node| {
+            node.set_role(egui::accesskit::Role::Grid);
+            node.set_label(summary);
+        });
+    }
+
+    /// UI-24.3：行号/列标发布成 RowHeader / ColumnHeader（带选中状态与屏幕坐标）
+    fn publish_header_a11y(
+        ctx: &egui::Context,
+        id: egui::Id,
+        rect: egui::Rect,
+        label: String,
+        column: bool,
+        selected: bool,
+    ) {
+        let ppp = ctx.pixels_per_point();
+        let bounds = egui::accesskit::Rect {
+            x0: (rect.min.x * ppp) as f64,
+            y0: (rect.min.y * ppp) as f64,
+            x1: (rect.max.x * ppp) as f64,
+            y1: (rect.max.y * ppp) as f64,
+        };
+        let _ = ctx.accesskit_node_builder(id, |node| {
+            node.set_role(if column {
+                egui::accesskit::Role::ColumnHeader
+            } else {
+                egui::accesskit::Role::RowHeader
+            });
+            node.set_label(label);
+            node.set_bounds(bounds);
+            if selected {
+                node.set_selected(true);
+            }
+        });
     }
 
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
@@ -23514,6 +23565,20 @@ let txn = self.txn_begin(&keys);
             guard += 1;
             let x = gx(c);
             let w = cols.size(c);
+            if self.show_headings {
+                Self::publish_header_a11y(
+                    ctx,
+                    resp.id.with(("ch", c)),
+                    Rect::from_min_size(egui::pos2(x, origin.y), Vec2::new(w, hh)),
+                    if c >= sc1 && c <= sc2 {
+                        format!("列 {}，已选中", col_label(c))
+                    } else {
+                        format!("列 {}", col_label(c))
+                    },
+                    true,
+                    c >= sc1 && c <= sc2,
+                );
+            }
             if x + w > origin.x + head_w + frozen_w {
                 if c >= sc1 && c <= sc2 {
                     painter.rect_filled(
@@ -23647,6 +23712,20 @@ let txn = self.txn_begin(&keys);
             guard += 1;
             let y = gy(r);
             let h = rows.size(r);
+            if self.show_headings && h >= 1.0 {
+                Self::publish_header_a11y(
+                    ctx,
+                    resp.id.with(("rh", r)),
+                    Rect::from_min_size(egui::pos2(origin.x, y), Vec2::new(head_w, h)),
+                    if r >= sr1 && r <= sr2 {
+                        format!("第 {} 行，已选中", r + 1)
+                    } else {
+                        format!("第 {} 行", r + 1)
+                    },
+                    false,
+                    r >= sr1 && r <= sr2,
+                );
+            }
             if h < 1.0 {
                 r += 1;
                 continue;
