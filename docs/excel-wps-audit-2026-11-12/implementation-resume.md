@@ -688,3 +688,20 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 已知限制：计算字段会写进所有 `pivotCacheDefinition`（多透视表场景未支持）。
 - 测试：`pivot_multi_parts` 16 passed、app 366 passed。
 - 台账状态未改：C12.4 仍「待验收」，C12/C12.2/C12.3 仍「待验收/实施中」。
+
+### C12.2/C12.3 对拍与实现（2026-11-17，第二轮）
+
+已与 Excel 真值逐格对上并入库的：
+
+- 多值 × 列字段：3 行表头 + 每个值一列「…汇总」（`multival-ref.tsv`，`multi_value_with_col_field_matches_excel`）；
+- 两行字段小计：标签改为「汇总」（`sort-ref.tsv` 对拍 12 行全同）；
+- 页筛选：语义 120/10/130 一致 + 标题区「状态 | 有效」+ 空行（`filter-ref.tsv`，`page_filter_matches_excel_filter_ref`）；
+- 面板调序抽成 `pivot_multi::move_axis`，带层级语义用例。
+
+未完成（已写证据、不计验收）：
+
+- 两层列字段的**每上层子总计列**（A 汇总/B 汇总）与 3 行表头形状（`c12-2-two-col-fields.md`）；
+- Excel 新建透视时的默认标签排序口径（两份 Excel 基准互斥，`c12-2-two-rows-excel.md` 第四轮）；
+- 真实键鼠/IME（环境无交互桌面）。
+
+台账状态未改：C12/C12.2/C12.3/C12.4 仍为待验收/实施中。
