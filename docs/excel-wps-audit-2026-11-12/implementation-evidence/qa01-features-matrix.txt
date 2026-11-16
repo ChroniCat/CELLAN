@@ -1,0 +1,96 @@
+QA-01.3 特性矩阵：样式 / 条件格式 / 数据验证 / 表格 / 命名区域 / 隐藏 / 冻结
+================================================================================
+日期：2026-11-16
+执行机：Excel 16.0 (Build 20326)、WPS 12.0（KET.Application，Version 报 "Microsoft Excel 12.0"）
+夹具：crates/core/examples/qa01_features.rs → work/probe/qa01/features.xlsx
+探针：scripts/qa01_features_probe.ps1（逐项读对象模型，不靠肉眼）
+第二次探针：Excel 打开另存 → 我们 load+save → 再探（往返保真）
+
+一、夹具内容
+------------
+Feat 表
+  A1:D1  表头（加粗 + 底色 DD EBF7）
+  A2:D5  4 行数据：甲/乙/丙/丁、金额 10/25/7.5/40、类别 A/B/A/C、整数 5/15/50/99
+  B2:B5  数字格式 #,##0.00 + 下边框（thin，颜色 C00000）
+  CF     B2:B5 两条：cellIs greaterThan 20（dxf 红底 FFC7CE）、colorScale 3 色阶
+  DV     C3:C5 列表 "A,B,C"；D3:D5 整数 1..100（between）
+  表格   T1 = A1:B5（表头行，TableStyleMedium2）
+  名称   MyRange = Feat!$A$2:$A$5（工作簿级）
+  窗格   冻结 B2（xSplit=1 ySplit=1）
+  行列   第 7 行隐藏、E 列隐藏
+
+二、双端探针结果（首存、无往返）
+--------------------------------
+key                         Excel 16.0                      WPS 12.0
+product=Microsoft Excel 16.0 / 12.0（WPS 自报版本串）        —
+sheet                       Feat                            Feat
+a1.bold                     True                            True
+a1.fill                     16247773 (=DD EBF7)             16247773
+b2.numfmt                   #,##0.00                        #,##0.00
+b2.border_bottom            1 color=192 (BGR 192 = C00000)  1 color=192
+cf.count                    2                               2
+cf.types                    1,3（cellIs、colorScale）        1,3
+dv.c2.type                  3（xlValidateList） formula=A,B,C 3 formula=A,B,C
+dv.d2.type                  1（whole）op=1 f1=1 f2=100       1 op=1 f1=1 f2=100
+listobjects.count           1                               1
+listobjects.name/range      T1 $A$1:$B$5                    T1 $A$1:$B$5
+names.count                 2（MyRange + 内部 _sc_manual_hidden）同
+name=MyRange                =Feat!$A$2:$A$5                 =Feat!$A$2:$A$5
+freeze.splitrow/splitcol    1 / 1                           1 / 1
+hidden.row7                 True                            True
+hidden.colE                 True                            True
+
+三、往返（Excel 另存 → 我们 load+save）
+---------------------------------------
+features.xlsx →(Excel SaveAs)→ features-rt-excel.xlsx →(sheetcore load+save)→ features-rt-ours.xlsx
+Excel 与 WPS 对 features-rt-ours.xlsx 的读数与第二节逐项一致（样式/CF/DV/表格/名称/冻结/隐藏全在）。
+日志：excel-rt.txt、wps-rt.txt
+
+四、这一轮抓到的三个真实缺陷（都已修 + 有回归）
+------------------------------------------------
+1) styles.xml 里 <dxfs> 被写在 <extLst> 之后
+   现象：只要保存带条件格式的新文件，Excel 打不开（COMException: 不能取得类 Workbooks 的
+   Open 属性；包本身不报错，是被判损坏）。
+   根因：patch::replace_dxfs 的「已有 dxfs 就原地替换」分支保留了 umya 把 dxfs 排在
+   <extLst> 后面的位置；另外「没有 dxfs」分支插在 </styleSheet> 前，同样落到了 extLst 后面。
+   CT_Stylesheet 的顺序要求 dxfs 在 tableStyles / extLst 之前。
+   修：先摘掉旧段，再统一插到 <tableStyles / <extLst 之前。
+   回归：patch.rs::dxfs_already_at_tail_is_moved_before_table_styles、
+         patch.rs::empty_dxfs_placeholder_is_replaced_not_duplicated。
+
+2) 表格 displayName 用了单元格引用（T1）
+   现象：带表格对象的新文件 Excel 打不开；把 displayName 改成 T1_ 立刻能开（对照实验
+   u-display.xlsx OK / only-table.xlsx FAIL）。
+   根因：Excel 拒绝把形如 A1、T1 的字符串当表格 displayName。我们直接照抄了 name。
+   修：写部件时判定 A1 / R1C1 形态，命中则追加下划线（与 Excel 自己另存的行为一致）。
+   回归：table.rs::table_display_name_looking_like_a_cell_reference_gets_underscore、
+         table.rs::table_display_name_that_is_not_a_cell_reference_is_kept。
+
+3) 新工作簿冻结窗格保存即丢
+   现象：冻结 B2 后保存，Excel/WPS 重开都没有分割线（pane 元素根本不在 XML 里）。
+   根因：set_freeze_xml 只在已有 <sheetView> 上挂 <pane>；新建工作簿的 sheet XML 没有
+   <sheetViews>，于是直接 return。
+   修：没有 <sheetViews> 时按 schema 顺序补 <sheetViews><sheetView workbookViewId="0">
+   <pane .../></sheetView></sheetViews>（插在 <sheetFormatPr / <cols / <sheetData 之前）。
+   回归：patch.rs::freeze_on_sheet_without_sheet_views_creates_them。
+
+五、探针本身的一个坑（记录，避免误判）
+--------------------------------------
+最初 WPS 读到 freeze.splitcol=0。原因不是文件：探针里写了
+`$app.ActiveWindow.SplitRow = $app.ActiveWindow.SplitRow`（本意是激活窗口），
+WPS 在赋值时把列分割清掉，于是读到假的 0。去掉这行后 WPS 读到 1/1。
+对照：WPS 自己冻结另存的文件 wps-freeze.xlsx（state="frozenSplit"）读 1/1；
+Excel 另存的 gold-freeze.xlsx（state="frozen"）WPS 也读 1/1。
+
+六、测试与构建
+--------------
+cargo test -p sheetcore（--test-threads=2）      103 个测试二进制，0 failed  → work/goal-logs/qa01-core.log
+cargo test -p app --bin app（--test-threads=2）  330 passed / 0 failed       → work/goal-logs/qa01-app.log
+新增回归 5 条（patch 3 + table 2）。
+
+七、QA-01.3 还差什么（不抬高状态）
+----------------------------------
+- 图片 / 图形对象夹具（drawing + media）三方对照；
+- 外部链接（xlinks）夹具三方对照；
+- .xls / .xlsm 输入夹具（我们只写 xlsx，这两类走「打开再另存」路径）。
+以上补齐前 QA-01.3 与 QA-01 父项都保持「待验收」。

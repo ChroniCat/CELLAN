@@ -438,29 +438,35 @@ pub fn replace_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> String {
     }
     body.push_str("</dxfs>");
 
-    // 已有 dxfs：整段替换
-    if let Some(start) = xml.find("<dxfs") {
-        let end = xml[start..]
+    // 1) 先摘掉旧段：umya 写出来的 styles.xml 里 dxfs 就排在 <extLst> 后面，
+    //    只做「原地替换」会把它留在非法位置（CT_Stylesheet 要求 dxfs 在
+    //    tableStyles / extLst 之前），Excel 会直接判整个包损坏。
+    let mut rest = xml.to_string();
+    if let Some(start) = rest.find("<dxfs") {
+        let end = rest[start..]
             .find("</dxfs>")
-            .map(|i| start + i + "</dxfs>".len())
-            .or_else(|| xml[start..].find("/>").map(|i| start + i + 2));
+            .map(|k| start + k + "</dxfs>".len())
+            .or_else(|| rest[start..].find("/>").map(|k| start + k + 2));
         if let Some(end) = end {
-            let mut out = String::with_capacity(xml.len() + body.len());
-            out.push_str(&xml[..start]);
-            out.push_str(&body);
-            out.push_str(&xml[end..]);
-            return out;
+            rest.replace_range(start..end, "");
         }
     }
-    // 没有：插在 </styleSheet> 前
-    if let Some(i) = xml.find("</styleSheet>") {
-        let mut out = String::with_capacity(xml.len() + body.len());
-        out.push_str(&xml[..i]);
-        out.push_str(&body);
-        out.push_str(&xml[i..]);
-        return out;
+
+    // 2) 按 schema 顺序插回去
+    let anchor = rest
+        .find("<tableStyles")
+        .or_else(|| rest.find("<extLst"))
+        .or_else(|| rest.find("</styleSheet>"));
+    match anchor {
+        Some(k) => {
+            let mut out = String::with_capacity(rest.len() + body.len());
+            out.push_str(&rest[..k]);
+            out.push_str(&body);
+            out.push_str(&rest[k..]);
+            out
+        }
+        None => xml.to_string(),
     }
-    xml.to_string()
 }
 
 #[cfg(test)]
@@ -709,7 +715,23 @@ pub fn set_freeze_xml(xml: &str, freeze: Option<(u32, u32)>) -> String {
         }
         from = i + 1;
     }
-    let Some(i) = found else { return base };
+    let Some(i) = found else {
+        // 新工作簿的 sheet XML 没有 <sheetViews>：以前直接放弃，冻结窗格
+        // 在新文件上保存后等于没设。这里按 schema 顺序补出来。
+        let anchor = base
+            .find("<sheetFormatPr")
+            .or_else(|| base.find("<cols"))
+            .or_else(|| base.find("<sheetData"));
+        let Some(at) = anchor else { return base };
+        let block = format!(
+            "<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>"
+        );
+        let mut out = String::with_capacity(base.len() + block.len());
+        out.push_str(&base[..at]);
+        out.push_str(&block);
+        out.push_str(&base[at..]);
+        return out;
+    };
     let Some(gt_rel) = base[i..].find('>') else { return base };
     let gt = i + gt_rel;
     let self_closing = gt > i && base[..gt].ends_with('/');
@@ -3295,4 +3317,56 @@ fn read_prefixed_calc_pr_from_zip() {
     zw.finish().unwrap();
     assert!(read_calc_manual(&path));
     let _ = std::fs::remove_file(&path);
+}
+
+
+// ---- QA-01 特性矩阵带出来的三个缺陷回归 ----
+
+#[test]
+fn dxfs_already_at_tail_is_moved_before_table_styles() {
+    // umya 写出来的样子：dxfs 排在 <extLst> 后面
+    let xml = concat!(
+        "<styleSheet><cellXfs/><dxfs count=\"0\"/><tableStyles count=\"0\"/>",
+        "<extLst><ext uri=\"{X}\"/></extLst></styleSheet>"
+    );
+    let dxf = crate::cf::Dxf { bold: true, ..Default::default() };
+    let out = replace_dxfs(xml, &[dxf]);
+    assert_eq!(out.matches("<dxfs").count(), 1, "只能有一份 dxfs：{out}");
+    let d = out.find("<dxfs").unwrap();
+    let ts = out.find("<tableStyles").unwrap();
+    let ex = out.find("<extLst").unwrap();
+    assert!(d < ts && d < ex, "dxfs 必须在 tableStyles/extLst 之前：{out}");
+    assert!(out.contains("count=\"1\""), "{out}");
+}
+
+#[test]
+fn empty_dxfs_placeholder_is_replaced_not_duplicated() {
+    let xml = "<styleSheet><cellXfs/><dxfs count=\"0\"/><tableStyles/></styleSheet>";
+    let out = replace_dxfs(xml, &[]);
+    assert_eq!(out.matches("<dxfs").count(), 1, "{out}");
+    assert!(out.contains("<dxfs count=\"0\"></dxfs>"), "{out}");
+}
+
+#[test]
+fn freeze_on_sheet_without_sheet_views_creates_them() {
+    // 新建工作簿的 sheet XML 没有 <sheetViews>，以前冻结直接丢掉
+    let xml = concat!(
+        "<worksheet><dimension ref=\"A1\"/><sheetFormatPr defaultRowHeight=\"15\"/>",
+        "<cols><col min=\"1\" max=\"1\" width=\"9\"/></cols><sheetData/></worksheet>"
+    );
+    let out = set_freeze_xml(xml, Some((1, 2)));
+    assert!(out.contains("<sheetViews><sheetView workbookViewId=\"0\">"), "{out}");
+    assert!(
+        out.contains("<pane xSplit=\"2\" ySplit=\"1\" topLeftCell=\"C2\""),
+        "{out}"
+    );
+    // 顺序：sheetViews 在 sheetFormatPr 之前、sheetData 之前
+    let v = out.find("<sheetViews").unwrap();
+    let f = out.find("<sheetFormatPr").unwrap();
+    let d = out.find("<sheetData").unwrap();
+    assert!(v < f && v < d, "{out}");
+    // 清除时整段仍然合法
+    let cleared = set_freeze_xml(&out, None);
+    assert!(!cleared.contains("<pane"), "{cleared}");
+    assert!(cleared.contains("<sheetViews>"), "{cleared}");
 }

@@ -52,6 +52,33 @@ fn col_num(s: &str) -> Option<u32> {
     if any { Some(n - 1) } else { None }
 }
 
+/// 表格 displayName 不能是单元格引用（A1 或 R1C1 形式）。
+fn looks_like_cell_ref(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > 12 {
+        return false;
+    }
+    // A1：1-3 个字母 + 1-7 位数字
+    let letters = b.iter().take_while(|c| c.is_ascii_alphabetic()).count();
+    if (1..=3).contains(&letters) {
+        let rest = &s[letters..];
+        if !rest.is_empty() && rest.len() <= 7 && rest.bytes().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    // R1C1：R<数字>C<数字>
+    let up = s.to_ascii_uppercase();
+    if let Some(rest) = up.strip_prefix('R') {
+        if let Some((r, c)) = rest.split_once('C') {
+            return !r.is_empty()
+                && !c.is_empty()
+                && r.bytes().all(|x| x.is_ascii_digit())
+                && c.bytes().all(|x| x.is_ascii_digit());
+        }
+    }
+    false
+}
+
 pub fn a1(r: (u32, u32, u32, u32)) -> String {
     format!("{}{}:{}{}", col_label(r.1), r.0 + 1, col_label(r.3), r.2 + 1)
 }
@@ -221,6 +248,15 @@ pub fn table_xml(t: &Table, id: u32) -> String {
         }
     }
     let count = t.columns.len();
+    // Excel 拒绝把单元格引用当表格 displayName（T1、A1 这类）：
+    // 用 name="T1" displayName="T1" 写出来的包 Excel 直接判损坏，
+    // 必须像 Excel 自己那样退化成 "T1_"。
+    let raw_display = if t.display.is_empty() { t.name.clone() } else { t.display.clone() };
+    let display_fixed = if looks_like_cell_ref(&raw_display) {
+        format!("{raw_display}_")
+    } else {
+        raw_display
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"{id}\" \
@@ -236,7 +272,7 @@ showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
         } else {
             a1(t.range)
         },
-        display = esc(if t.display.is_empty() { &t.name } else { &t.display }),
+        display = esc(&display_fixed),
         range = a1(t.range),
         count = count,
         cols = cols
@@ -1615,4 +1651,41 @@ mod sync_tests {
         assert_eq!(back.sheets[0].tables.len(), 1, "重新 attach 后能读回表格");
         assert_eq!(back.sheets[0].value(1, 1), Value::Number(3.0), "内容不能丢");
     }
+}
+
+
+// ---- QA-01：表格 displayName 不能是单元格引用 ----
+
+#[test]
+fn table_display_name_looking_like_a_cell_reference_gets_underscore() {
+    let t = crate::table::Table {
+        name: "T1".into(),
+        display: "T1".into(),
+        range: (0, 0, 4, 1),
+        columns: vec!["名称".into(), "金额".into()],
+        column_ids: Vec::new(),
+        header_row: true,
+        totals_row: false,
+    };
+    let xml = crate::table::table_xml(&t, 1);
+    assert!(
+        xml.contains("name=\"T1\" displayName=\"T1_\""),
+        "T1 是单元格引用，displayName 必须退化：{xml}"
+    );
+    assert!(xml.contains("ref=\"A1:B5\""), "{xml}");
+}
+
+#[test]
+fn table_display_name_that_is_not_a_cell_reference_is_kept() {
+    let t = crate::table::Table {
+        name: "Sales".into(),
+        display: "Sales".into(),
+        range: (0, 0, 4, 1),
+        columns: vec!["名称".into(), "金额".into()],
+        column_ids: Vec::new(),
+        header_row: true,
+        totals_row: false,
+    };
+    let xml = crate::table::table_xml(&t, 1);
+    assert!(xml.contains("displayName=\"Sales\""), "{xml}");
 }
