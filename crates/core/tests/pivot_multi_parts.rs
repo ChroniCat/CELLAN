@@ -539,3 +539,49 @@ fn calculated_item_writes_cache_items_and_calculated_items_block() {
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }
+
+#[test]
+fn calc_item_row_appends_sum_row_before_grand_total() {
+    let fx = Fixture::new("calcrow");
+    let path = fx.file("calcrow.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_b();
+    let mut grid = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    let before_rows = grid.rows.len();
+    let grand_before = grid.grand_total_row.expect("应有总计行");
+    let grand_vals: Vec<String> = grid.rows[grand_before].iter().map(|v| v.display()).collect();
+
+    // 地区两个项合成一行：值应为两行之各列相加
+    let at = sheetcore::pivot_multi::append_calc_item_row(&mut grid, "华东华北", &["华东", "华北"])
+        .expect("应能找到两个来源行");
+    assert_eq!(grid.rows.len(), before_rows + 1);
+    assert_eq!(at, grand_before, "计算项插在总计行之前");
+    assert_eq!(grid.grand_total_row, Some(grand_before + 1), "总计行下标要后移");
+    assert_eq!(grid.rows[at][0].display(), "华东华北");
+
+    // 逐列核对：新行 = 两来源行之和
+    let rd = grid.row_depth;
+    let src: Vec<usize> = [0usize, 1]
+        .iter()
+        .copied()
+        .filter(|&r| r != at && r < grid.rows.len())
+        .collect();
+    for c in rd..grid.rows[at].len() {
+        let mut sum = 0.0;
+        let mut any = false;
+        for &r in &src {
+            if let sheetcore::Value::Number(n) = grid.rows[r][c] {
+                sum += n;
+                any = true;
+            }
+        }
+        match grid.rows[at][c] {
+            sheetcore::Value::Number(n) if any => assert!((n - sum).abs() < 1e-9, "列 {c}"),
+            sheetcore::Value::Empty => assert!(!any, "列 {c} 不该是空"),
+            ref v => panic!("列 {c} 意外值 {v:?}"),
+        }
+    }
+    // 总计不受计算项影响（本来就已经含这两行）
+    let after: Vec<String> = grid.rows[grid.grand_total_row.unwrap()].iter().map(|v| v.display()).collect();
+    assert_eq!(after, grand_vals, "总计不应被计算项重复累加");
+}

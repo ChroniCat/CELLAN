@@ -510,3 +510,51 @@ pub fn write_grid(sheet: &mut Sheet, at: (u32, u32), grid: &PivotGrid) -> (u32, 
         .unwrap_or(0) as u32;
     (r0, c0, r.saturating_sub(1), c0 + cols.saturating_sub(1))
 }
+
+/// 计算项：在网格里追加一行「若干行标签之和」（Excel 的计算项就是这么落地的：
+/// rowItems 与数据区都要多一行，只改 XML 定义会让 Excel 判文件坏）。
+///
+/// 返回新行在 `rows` 里的下标；找不到任何来源行时返回 None。
+pub fn append_calc_item_row(grid: &mut PivotGrid, name: &str, sources: &[&str]) -> Option<usize> {
+    let rd = grid.row_depth.max(1);
+    let idxs: Vec<usize> = grid
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(r, row)| {
+            Some(*r) != grid.grand_total_row
+                && row
+                    .first()
+                    .is_some_and(|v| sources.iter().any(|s| v.display() == **s))
+        })
+        .map(|(r, _)| r)
+        .collect();
+    if idxs.is_empty() {
+        return None;
+    }
+    let width = grid.rows.first().map(|r| r.len()).unwrap_or(0);
+    let mut line = vec![Value::Empty; width];
+    if !line.is_empty() {
+        line[0] = Value::Text(name.into());
+    }
+    for c in rd..width {
+        let mut sum = 0.0;
+        let mut any = false;
+        for &r in &idxs {
+            if let Value::Number(n) = grid.rows[r][c] {
+                sum += n;
+                any = true;
+            }
+        }
+        if any {
+            line[c] = Value::Number(sum);
+        }
+    }
+    // 插在总计行之前（Excel 里计算项也是排在普通项之后、总计之前）
+    let at = grid.grand_total_row.unwrap_or(grid.rows.len());
+    grid.rows.insert(at, line);
+    if let Some(g) = grid.grand_total_row.as_mut() {
+        *g += 1;
+    }
+    Some(at)
+}

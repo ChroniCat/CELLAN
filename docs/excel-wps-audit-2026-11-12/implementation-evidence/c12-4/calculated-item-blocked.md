@@ -68,3 +68,17 @@ Excel 直接判文件坏。
 
 所以计算项不是「补两处 XML」的事：要先把计算项当成**真正的一行**算出来（值 = 被引用项之和），
 再让 `rowItems`、输出网格、`location` 一起扩一行。这一步没做，本轮到此为止。
+
+## 第一步：把计算项算成真行（已做）
+
+`pivot_multi::append_calc_item_row(grid, name, sources)`：
+
+- 按行标签找到来源行（可多个），逐列相加生成新行；
+- 插在**总计行之前**（Excel 里计算项排在普通项之后、总计之前），`grand_total_row` 下标后移；
+- 总计行**不重复累加**（它本来就包含这些来源行）。
+
+用例 `calc_item_row_appends_sum_row_before_grand_total`：行数 +1、新行位于总计前、逐列等于来源行之和、
+总计前后一致。`pivot_multi_parts` 14 passed。
+
+下一步（未做）：让 `attach2_*` 把这一行同时写进 `rowItems` 与 `location`，
+并把该行标签在缓存里登记成 `<s f="1"/>`，才算真正打通。
