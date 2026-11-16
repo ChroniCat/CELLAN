@@ -277,3 +277,18 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 - 证据：`implementation-evidence/qa06-1-error-blank-date.txt` 与 `qa06-1/{cases.json,excel.tsv,wps.tsv,probe-meta.json}`。
 - 台账：QA-06 父项 → 实施中，QA-06.1 → 待验收；父母 24/4/27/6，切片 60/1/68/19（未抬高已验收数）。
 - 下一步：QA-06.2 数组/动态数组与增量一致。
+
+## 2026-11-16 检查点五：QA-06.3 财务/查找/文本矩阵 + 3 个真实缺陷
+
+- 提交 `504c9e8`（`fix(calc): IPMT/PPMT sign, CUMIPMT pv guard, TEXT year-month-day tokens; extend qa06 matrix to 102`）。
+- 矩阵从 50 条扩到 **102 条**（fin 16 / lookup 14 / text 22 新增），Excel 16.0 与 WPS 12.0 都实算。
+- 对拍揪出并修掉 3 个真缺陷：
+  1. `IPMT` 符号反（余额误用 `fv()`，它与 pv 反号）→ `-1250` 变 `+1250`；
+  2. `PPMT` 被同一根因带错 `2860.46` → `360.46`；
+  3. `CUMIPMT` 缺 `nper<=0 / pv<=0` 校验，Excel 返回 `#NUM!` 而本引擎照算 → 已补（CUMPRINC 同步）。
+  另有 `TEXT(45351,"yyyy年m月d日")` 只输出 `2024年m月d日`：改成按记号扫描的 `format_date_tokens`。
+- 容差写进用例：默认相对 1e-9，`IRR`/`XIRR`/`RATE` 用 1e-7（Excel 自己也是数值解）。
+- 回归：`-p sheetcore --lib` 295 passed、`-p sheetcore` 101 个测试二进制 0 failed、`-p app --bin app` 325 passed。
+- 证据：`implementation-evidence/qa06-2-fin-lookup-text.txt` 与 `qa06-2/{matrix.tsv,excel.tsv,wps.tsv,cases.json,probe-meta.json}`。
+- 台账：QA-06.3 → 待验收；父母 24/4/27/6，切片 60/1/69/18（未抬高已验收数）。
+- 下一步：QA-06.2 数组/动态数组与增量一致。
