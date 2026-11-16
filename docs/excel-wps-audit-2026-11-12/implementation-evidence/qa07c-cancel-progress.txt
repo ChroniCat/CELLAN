@@ -1,0 +1,65 @@
+QA-07.3 取消 / 进度反馈 / 保存期可操作性（2026-11-16）
+================================================================================
+一、做了什么
+------------
+1. core：`formula::recalc_all_force_impl(wb, cancel, progress)` —— 全量重算可取消、
+   可上报进度。每 256 个公式检查一次取消标志；取消时**不写回**（模型保持原值），
+   并置 `wb.calc_pending = true`，界面据此提示「待计算」。
+   `recalc_all_force` 保留原签名，内部转调（传 None）。
+2. app：
+   - 后台重算（F9 / 重算全部）登记 `Arc<AtomicBool>` 取消标志与 done/total 计数；
+   - 状态栏每帧显示「正在重算 d/t（Esc 取消）」，Esc 与探针都走同一个 cancel 分支；
+   - 取消后回 `OpenMsg::RecalcCancelled`，状态「已取消重算（未写回，保持原值）」；
+   - 保存中状态栏显示「正在保存到 xxx… N.Ns（窗口可继续操作）」。
+3. 顺带修的内存问题：`Store::Page::cols` 改为 `Arc<Vec<Cell>>` 写时复制。
+   工作簿整体 clone（保存快照、后台重算）只加引用计数，改到哪列才复制那一列（≤256 格）。
+
+二、实测（release，本机）
+------------------------
+样本：`qa07-chain-1000000.xlsx`（100 万公式 `=A{r}+1`）
+
+| 场景 | 用时 | 窗口帧间隔 p50/p95 | 收尾状态 |
+|---|---|---|---|
+| 后台全量重算（不取消） | 3.15 s | 29.98 / 31.08 ms | 重算全部完成 |
+| 后台全量重算 + 300ms 取消 | 0.39 s | 30.48 / 74.93 ms | 已取消重算（未写回，保持原值） |
+| 保存（后台） | 11.51 s | 29.88 / 31.17 ms | 已保存 … |
+
+- 重算期间 96 帧、保存期间 120 帧都有真实帧间隔 ≈30ms（约 33fps），说明**窗口没有被卡住**；
+  空闲时是 16.7ms（60fps），重算/保存占用 CPU 后降到 30ms，仍在可操作范围。
+- 取消是「立刻生效」：300ms 触发，0.39s 全流程结束（含收尾消息与一帧重绘）。
+- 取消后 B1 保持文件里的旧值 `1`，没有被写回半截结果。
+
+三、发现但**没有**解决的问题：保存的瞬时内存峰值
+------------------------------------------------
+`perf_probe` 加采样线程（每 20ms 读工作集）后测到：
+
+| 场景 | 稳态 RSS | 保存期峰值 |
+|---|---|---|
+| core 保存 chain 1M（12.29MB 文件） | 140 MB | **1,186 MB** |
+| GUI 保存 chain 1M | — | **1,923 MB** |
+| GUI 后台重算 chain 1M | — | 1,169 MB |
+
+原因定位（不是猜）：保存链路把模型整体转成 `umya_spreadsheet::Workbook` 再序列化，
+100 万格会同时存在「我们的模型 + umya 的模型 + 序列化缓冲」。COW 只压掉了 clone 那一份，
+对 umya 建的整份副本无效（实测峰值 1993MB → 1923MB，只动了几十兆）。
+要真正压下去需要绕开 umya 直接写 `sheetData`（我们已经能替换 sheetData，但骨架仍走 umya）。
+**这条记为未完成**，不写成已解决。
+
+四、验证
+--------
+- core 新增 2 条取消测试：`cancel_stops_before_writeback_and_marks_pending`、
+  `full_run_after_cancel_computes_everything`；store 新增 COW 测试
+  `clone_shares_columns_until_written`；app 新增
+  `background_recalc_exposes_progress_and_honours_cancel`、`save_progress_carries_a_start_instant`。
+- core 全量 **106** 个测试二进制 0 failed（`work/goal-logs/qa07c-core.log`）；
+  app 测试见下一次提交日志。
+- 探针：`SC_RECALC_PROBE=1`（自动发起重算并记帧间隔）、`SC_CANCEL_AFTER_MS=300`（走同一个
+  cancel 分支）、`SC_SAVE_PROBE=1`；日志 `work/probe/qa07/recalc3.log`、
+  `recalc-cancel3.log`、`save-probe-chain2.log`。
+
+五、仍未做
+----------
+- 保存峰值内存没降下来（见第三节）。
+- 取消只覆盖「重算全部」；单表重算 `recalc_sheet` 仍是不可取消的同步调用。
+- 循环引用迭代计算（`SC_TWOPASS` 等）期间不检查取消标志。
+- "进度"只有公式计数，没有按工作表分段的进度。

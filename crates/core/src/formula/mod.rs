@@ -2980,6 +2980,17 @@ pub fn recalc_all(wb: &mut Workbook) {
 
 /// 强制执行全量计算（F9 / 计算全部 / 切回自动模式）。
 pub fn recalc_all_force(wb: &mut Workbook) {
+    let _ = recalc_all_force_impl(wb, None, None);
+}
+
+/// 全量计算的实现：可在公式循环里检查取消标志并把进度写进两个原子计数。
+/// 返回 `false` 表示被取消（此时写回还没发生，模型保持原值，并标 `calc_pending`）。
+pub fn recalc_all_force_impl(
+    wb: &mut Workbook,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
+) -> bool {
+    use std::sync::atomic::Ordering;
     let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     wb.calc_pending = false;
     wb.calc_pending_sheets.clear();
@@ -3035,13 +3046,29 @@ pub fn recalc_all_force(wb: &mut Workbook) {
             .collect();
 
         mark!("收集公式");
+        if let Some((done, total)) = progress {
+            total.store(formulas.len(), Ordering::Relaxed);
+            done.store(0, Ordering::Relaxed);
+        }
         let mut results: Vec<(usize, u32, u32, FValue)> = Vec::with_capacity(formulas.len());
         {
             let mut calc = Calc::new(wb);
             calc.volatile_values = std::mem::take(&mut volatile_values);
             let profile = std::env::var("SC_PROFILE").is_ok();
             let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
-            for (si, r, c) in formulas {
+            for (i, (si, r, c)) in formulas.into_iter().enumerate() {
+                if let Some(flag) = cancel {
+                    // 每 256 个公式查一次，取消时立刻放弃本轮（尚未写回）
+                    if i % 256 == 0 && flag.load(Ordering::Relaxed) {
+                        drop(calc);
+                        wb.calc_pending = true;
+                        functions::set_now_snapshot(prev_now);
+                        return false;
+                    }
+                }
+                if let Some((done, _)) = progress {
+                    done.store(i, Ordering::Relaxed);
+                }
                 let t0 = std::time::Instant::now();
                 let v = calc.cell_value(si, r, c);
                 if profile {
@@ -3131,7 +3158,12 @@ pub fn recalc_all_force(wb: &mut Workbook) {
     if phase {
         eprintln!("[recalc] 总耗时 {:.2}s（{} 遍）", t_all.elapsed().as_secs_f64(), pass_done);
     }
+    if let Some((done, total)) = progress {
+        let n = total.load(Ordering::Relaxed);
+        done.store(n, Ordering::Relaxed);
+    }
     functions::set_now_snapshot(prev_now);
+    true
 }
 
 /// 求单个单元格的值（测试与 UI 用）
@@ -3324,6 +3356,68 @@ mod calc_mode_tests {
         crate::xlsx::save_atomic(&auto, &wb).unwrap();
         assert!(!crate::patch::read_calc_manual(&auto), "自动模式不写 manual");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod recalc_cancel_tests {
+    use super::*;
+    use crate::model::{Cell, Workbook};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn chain(n: u32) -> Workbook {
+        let mut wb = Workbook::new_blank();
+        for r in 0..n {
+            wb.sheets[0].set(r, 0, Cell { value: crate::Value::Number(r as f64), formula: None });
+            wb.sheets[0].set(r, 1, Cell {
+                value: crate::Value::Empty,
+                formula: Some(format!("=A{}+1", r + 1).into()),
+            });
+        }
+        wb
+    }
+
+    #[test]
+    fn cancel_stops_before_writeback_and_marks_pending() {
+        let mut wb = chain(50_000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let c2 = cancel.clone();
+        // 立刻取消：必须在写回之前退出，模型里的 B 列仍是空值
+        c2.store(true, Ordering::Relaxed);
+        let ok = recalc_all_force_impl(
+            &mut wb,
+            Some(&cancel),
+            Some((&done, &total)),
+        );
+        assert!(!ok, "取消后仍报告完成");
+        assert!(wb.calc_pending, "取消后没有标 calc_pending，界面不会提示需重算");
+        assert!(total.load(Ordering::Relaxed) > 0, "没有写入总进度");
+        let b1 = wb.sheets[0].get(0, 1).map(|c| c.value.clone());
+        assert!(
+            matches!(b1, Some(crate::Value::Empty) | None),
+            "取消后仍写回了部分结果：{b1:?}"
+        );
+    }
+
+    #[test]
+    fn full_run_after_cancel_computes_everything() {
+        let mut wb = chain(2_000);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let ok = recalc_all_force_impl(&mut wb, Some(&cancel), None);
+        assert!(!ok);
+        // 恢复：不取消再跑一次，结果必须完全正确
+        cancel.store(false, Ordering::Relaxed);
+        let done = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let ok = recalc_all_force_impl(&mut wb, Some(&cancel), Some((&done, &total)));
+        assert!(ok);
+        assert_eq!(done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
+        let last = wb.sheets[0].get(1_999, 1).unwrap().value.clone();
+        assert_eq!(last, crate::Value::Number(2_000.0));
+        assert!(!wb.calc_pending);
     }
 }
 

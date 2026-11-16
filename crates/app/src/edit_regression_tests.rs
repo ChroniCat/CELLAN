@@ -8483,3 +8483,88 @@ fn click_matrix_every_ribbon_action_is_handled() {
         .collect();
     assert!(stale.is_empty(), "跳过名单里有 XML 里不存在的动作：{stale:?}");
 }
+
+#[test]
+fn background_recalc_exposes_progress_and_honours_cancel() {
+    use std::sync::atomic::Ordering;
+    let mut app = app();
+    // 2 万个公式，足够在取消之前跑起来
+    for r in 0..20_000u32 {
+        app.wb.sheets[0].set(
+            r,
+            0,
+            sheetcore::Cell {
+                value: sheetcore::Value::Number(r as f64),
+                formula: None,
+            },
+        );
+        app.wb.sheets[0].set(
+            r,
+            1,
+            sheetcore::Cell {
+                value: sheetcore::Value::Empty,
+                formula: Some(format!("=A{}+1", r + 1).into()),
+            },
+        );
+    }
+    app.recalc_async(None);
+    let cancel = app.tasks.recalc_cancel.clone().expect("没有登记取消标志");
+    let total = app.tasks.recalc_total.clone().expect("没有登记进度总数");
+    assert!(app.tasks.busy, "后台重算没有把 busy 置位，界面会以为空闲");
+
+    // 等它跑起来（至少写进一次总进度）
+    let mut saw_total = false;
+    for _ in 0..200 {
+        if total.load(Ordering::Relaxed) > 0 {
+            saw_total = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(saw_total, "重算没有暴露总进度，状态栏无从显示 x/y");
+
+    // 取消：必须在收尾消息里拿到 RecalcCancelled
+    cancel.store(true, Ordering::Relaxed);
+    let mut got_cancel = false;
+    for _ in 0..400 {
+        let msg = app
+            .tasks
+            .open_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        match msg {
+            Some(crate::OpenMsg::RecalcCancelled) => {
+                got_cancel = true;
+                break;
+            }
+            Some(_) => continue,
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+    assert!(got_cancel, "取消后没有回 RecalcCancelled，界面会一直转圈");
+}
+
+#[test]
+fn save_progress_carries_a_start_instant() {
+    let mut app = app();
+    let target = std::env::temp_dir().join(format!(
+        "sc_save_progress_{}.xlsx",
+        std::process::id()
+    ));
+    app.tasks.start_save(&mut app.wb, target.clone());
+    let started = app.tasks.saving.as_ref().map(|p| p.started);
+    assert!(started.is_some(), "保存任务没有开始时间，状态栏算不出已用时间");
+    // 等保存收尾，避免临时文件与线程泄漏到其它测试
+    for _ in 0..400 {
+        if app.tasks.saving.is_none() {
+            break;
+        }
+        if let Some(p) = app.tasks.saving.as_ref() {
+            if p.rx.try_recv().is_ok() {
+                app.tasks.saving = None;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_file(&target);
+}

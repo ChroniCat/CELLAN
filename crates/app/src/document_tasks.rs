@@ -17,11 +17,17 @@ pub(crate) struct DocumentTasks {
     pub saving: Option<PendingSave>,
     pub pending_host: bool,
     pub pending_join: Option<String>,
+    /// 后台全量重算的取消标志与进度（QA-07.3）：Esc 置位，状态栏读计数
+    pub recalc_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub recalc_done: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    pub recalc_total: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 pub(crate) struct PendingSave {
     pub target: PathBuf,
     pub rx: Receiver<Result<SaveReceipt, String>>,
+    /// 开始保存的时刻，状态栏据此显示已用时间（QA-07.3 进度反馈）
+    pub started: Instant,
 }
 
 impl DocumentTasks {
@@ -31,7 +37,7 @@ impl DocumentTasks {
         // Save As must still inherit parts from the file that was opened.
         snapshot.path = wb.path.clone().filter(|p| p.exists());
         let (tx, rx) = mpsc::channel();
-        self.saving = Some(PendingSave { target: target.clone(), rx });
+        self.saving = Some(PendingSave { target: target.clone(), rx, started: Instant::now() });
         // Subsequent edits set this back to true. Completion never clears it.
         wb.dirty = false;
         std::thread::spawn(move || {

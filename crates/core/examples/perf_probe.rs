@@ -24,6 +24,38 @@ fn rss_mb() -> f64 {
     0.0
 }
 
+/// 采样线程：每 20ms 读一次工作集，记录峰值（保存/重算这类瞬时峰值靠首尾读数测不到）
+struct PeakSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    peak: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeakSampler {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let peak = std::sync::Arc::new(AtomicU64::new(0));
+        let (s2, p2) = (stop.clone(), peak.clone());
+        let handle = std::thread::spawn(move || {
+            while !s2.load(Ordering::Relaxed) {
+                let cur = (rss_mb() * 1024.0) as u64;
+                p2.fetch_max(cur, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        Self { stop, peak, handle: Some(handle) }
+    }
+    fn finish(mut self) -> f64 {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.peak.load(Ordering::Relaxed) as f64 / 1024.0
+    }
+}
+
 fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
@@ -106,10 +138,12 @@ fn suite_one(kind: &str, cells: usize, wb: Workbook, dir: &std::path::Path) -> S
     drop(wb);
 
     let t = Instant::now();
+    let sampler = PeakSampler::start();
     if let Err(e) = sheetcore::xlsx::save(&path, &built) {
         return format!("{{\"kind\":\"{kind}\",\"cells\":{cells},\"error\":\"save {e}\"}}");
     }
     let save_ms = ms(t.elapsed());
+    let peak_save = sampler.finish();
     let rss_save = rss_mb();
     drop(built);
 
@@ -161,7 +195,7 @@ fn suite_one(kind: &str, cells: usize, wb: Workbook, dir: &std::path::Path) -> S
         "{{\"kind\":\"{kind}\",\"cells\":{cells},\"build_ms\":{build_ms:.1},\"save_ms\":{save_ms:.1},\
          \"load_ms\":{load_ms:.1},\"recalc_ms\":{recalc_ms:.1},\"edit_ms\":{edit_ms:.1},\
          \"save2_ms\":{save2_ms:.1},\"file_mb\":{size:.2},\"rss_mb\":{rss:.1},\
-         \"rss_build_mb\":{rss_build:.1},\"rss_save_mb\":{rss_save:.1},\"rss_load_mb\":{rss_load:.1},         \"pages\":{pages},\"slabs\":{slabs},\"slots\":{slots}}}"
+         \"rss_build_mb\":{rss_build:.1},\"rss_save_mb\":{rss_save:.1},\"rss_load_mb\":{rss_load:.1},         \"pages\":{pages},\"slabs\":{slabs},\"slots\":{slots},\"peak_save_mb\":{peak_save:.0}}}"
 
     )
 }

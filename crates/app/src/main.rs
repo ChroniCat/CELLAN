@@ -1993,6 +1993,8 @@ enum OpenMsg {
     DepsReady(Box<sheetcore::formula::deps::Deps>),
     /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch）
     RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64),
+    /// 后台重算被取消（未写回，模型保持原值）
+    RecalcCancelled,
     Failed(String),
 }
 
@@ -3081,13 +3083,28 @@ impl SheetApp {
             Some(_) => "正在后台重算当前工作表…".into(),
             None => "正在后台重算全部公式…".into(),
         };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.tasks.recalc_cancel = Some(cancel.clone());
+        self.tasks.recalc_done = Some(done.clone());
+        self.tasks.recalc_total = Some(total.clone());
         std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
             let mut wb = wb;
             let manual = wb.calc_manual;
             wb.calc_manual = false;
-            match sheet {
-                Some(si) => { sheetcore::formula::recalc_sheet(&mut wb, si); }
-                None => sheetcore::formula::recalc_all_force(&mut wb),
+            let finished_all = match sheet {
+                Some(si) => { sheetcore::formula::recalc_sheet(&mut wb, si); true }
+                None => sheetcore::formula::recalc_all_force_impl(
+                    &mut wb,
+                    Some(&cancel),
+                    Some((&done, &total)),
+                ),
+            };
+            if !finished_all || cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(OpenMsg::RecalcCancelled);
+                return;
             }
             wb.calc_manual = manual;
             // 单表重算只清该表；全量重算由 recalc_all_force 清空。
@@ -4357,7 +4374,19 @@ impl SheetApp {
                         self.try_auto_join();
                     }
                 }
+                OpenMsg::RecalcCancelled => {
+                    self.tasks.busy = false;
+                    self.tasks.recalc_cancel = None;
+                    self.tasks.recalc_done = None;
+                    self.tasks.recalc_total = None;
+                    self.status = "已取消重算（未写回，保持原值）".into();
+                    finished = true;
+                    continue;
+                }
                 OpenMsg::RecalcedWb(wb, deps, epoch) => {
+                    self.tasks.recalc_cancel = None;
+                    self.tasks.recalc_done = None;
+                    self.tasks.recalc_total = None;
                     self.tasks.busy = false;
                     if epoch == self.wb_epoch {
                         self.wb = *wb;
@@ -28092,6 +28121,50 @@ impl eframe::App for SheetApp {
         if ctx.cumulative_pass_nr() == 1 && std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[boot] first_frame {:.3}s", since_start());
         }
+        // QA-07.3：后台重算的进度与 Esc 取消；保存中的已用时间
+        {
+            use std::sync::atomic::Ordering;
+            if let (Some(cancel), Some(done), Some(total)) = (
+                self.tasks.recalc_cancel.clone(),
+                self.tasks.recalc_done.clone(),
+                self.tasks.recalc_total.clone(),
+            ) {
+                let cancelled = cancel.load(Ordering::Relaxed);
+                if !cancelled && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel.store(true, Ordering::Relaxed);
+                    self.status = "正在取消重算…".into();
+                } else if !cancelled {
+                    let d = done.load(Ordering::Relaxed);
+                    let t = total.load(Ordering::Relaxed);
+                    if t > 0 {
+                        self.status = format!("正在重算 {d}/{t}（Esc 取消）");
+                    }
+                }
+                // QA-07.3 探针：按 SC_CANCEL_AFTER_MS 模拟 Esc（走同一个 cancel 分支）
+                if let Ok(ms) = std::env::var("SC_CANCEL_AFTER_MS") {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        let mut g = RECALC_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(rp) = g.as_ref() {
+                            if rp.start.elapsed().as_millis() as u64 >= ms
+                                && !cancel.load(Ordering::Relaxed)
+                            {
+                                eprintln!("[recalc] 探针在 {ms}ms 触发取消");
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(p) = self.tasks.saving.as_ref() {
+                self.status = format!(
+                    "正在保存到 {}… {:.1}s（窗口可继续操作）",
+                    p.target
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    p.started.elapsed().as_secs_f32()
+                );
+            }
+        }
         // QA-07.2：滚动帧时延探针（SC_SCROLL_PROBE=1）
         if std::env::var("SC_SCROLL_PROBE").is_ok() {
             let mut g = SCROLL_PROBE.lock().unwrap_or_else(|e| e.into_inner());
@@ -30039,6 +30112,70 @@ impl eframe::App for SheetApp {
             egui::Stroke::new(1.0 / ppp, egui::Color32::from_rgb(160, 158, 156)),
             egui::StrokeKind::Inside,
         );
+        // QA-07.3 重算探针：装载完成后自动发起一次后台全量重算
+        if std::env::var("SC_RECALC_PROBE").is_ok()
+            && self.tasks.open_rx.is_none()
+            && !self.wb.sheets.is_empty()
+        {
+            let mut g = RECALC_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                let now = std::time::Instant::now();
+                *g = Some(RecalcProbe { start: now, last_frame: now, frames: 0, gaps: Vec::new() });
+                drop(g);
+                eprintln!("[recalc] 探针发起后台全量重算");
+                self.recalc_async(None);
+            } else if self.tasks.busy == false {
+                let rp = g.take().unwrap();
+                let b1 = self.wb.sheets[0]
+                    .get(0, 1)
+                    .map(|c| format!("{:?}", c.value))
+                    .unwrap_or_else(|| "空".into());
+                let (n, p50, p95, mx) = probe_stats(&mut rp.gaps.clone());
+                eprintln!(
+                    "[recalc] 收尾 用时 {:.2}s 帧数={} 帧间隔 p50={p50:.2}ms p95={p95:.2}ms max={mx:.2}ms 状态={} B1={}",
+                    rp.start.elapsed().as_secs_f32(),
+                    rp.frames,
+                    self.status,
+                    b1
+                );
+                if std::env::var("SC_RECALC_EXIT").is_ok() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        // 重算进行中：记帧间隔，证明窗口还在画
+        if std::env::var("SC_RECALC_PROBE").is_ok() {
+            let mut g = RECALC_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rp) = g.as_mut() {
+                if rp.frames > 0 {
+                    rp.gaps.push(rp.last_frame.elapsed().as_secs_f64() * 1000.0);
+                }
+                rp.last_frame = std::time::Instant::now();
+                rp.frames += 1;
+                // 不请求重绘的话 eframe 只在有输入时画，量出来的是空闲间隔
+                ctx.request_repaint();
+            }
+        }
+        // QA-07.3 保存探针：装载完成后发起一次保存，量保存期间帧时延
+        if std::env::var("SC_SAVE_PROBE").is_ok() && self.tasks.open_rx.is_none() && !self.wb.sheets.is_empty() {
+            let mut g = SAVE_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                *g = Some(std::time::Instant::now());
+                drop(g);
+                eprintln!("[save] 探针发起保存");
+                self.save(false);
+            } else if self.tasks.saving.is_none() {
+                let t = g.take().unwrap();
+                eprintln!(
+                    "[save] 收尾 用时 {:.2}s 状态={}",
+                    t.elapsed().as_secs_f32(),
+                    self.status
+                );
+                if std::env::var("SC_SAVE_EXIT").is_ok() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
         // QA-07.2：本帧 update() 构建耗时（滚动探针）
         if std::env::var("SC_SCROLL_PROBE").is_ok() {
             let mut g = SCROLL_PROBE.lock().unwrap_or_else(|e| e.into_inner());
@@ -30476,6 +30613,17 @@ struct ScrollProbe {
     frames: usize,
 }
 static SCROLL_PROBE: std::sync::Mutex<Option<ScrollProbe>> = std::sync::Mutex::new(None);
+
+/// QA-07.3 重算探针：发起后台重算、按时间取消、报告进度与收尾
+struct RecalcProbe {
+    start: std::time::Instant,
+    last_frame: std::time::Instant,
+    frames: usize,
+    gaps: Vec<f64>,
+}
+static RECALC_PROBE: std::sync::Mutex<Option<RecalcProbe>> = std::sync::Mutex::new(None);
+/// QA-07.3 保存探针：保存期间窗口是否还能画
+static SAVE_PROBE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// 打印 p50/p95/max（毫秒），n 为样本数
 fn probe_stats(times: &mut Vec<f64>) -> (usize, f64, f64, f64) {

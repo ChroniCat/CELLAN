@@ -22,7 +22,11 @@ fn book(number: f64) -> Workbook {
 
 fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<sheetcore::xlsx::SaveReceipt, String>> {
     let (tx, rx) = mpsc::channel();
-    app.tasks.saving = Some(document_tasks::PendingSave { target: target.into(), rx });
+    app.tasks.saving = Some(document_tasks::PendingSave {
+        target: target.into(),
+        rx,
+        started: std::time::Instant::now(),
+    });
     app.wb.dirty = false;
     tx
 }

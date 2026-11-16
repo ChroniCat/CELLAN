@@ -20,19 +20,22 @@ pub const PAGE_ROWS: u32 = 256;
 struct Page {
     /// 本页实际分配的行数（≤ PAGE_ROWS）
     n_rows: u32,
-    /// 按列存放：cols[c][r]，r 是页内行偏移
-    cols: Vec<Vec<Cell>>,
+    /// 按列存放：cols[c][r]，r 是页内行偏移。
+    /// 用 Arc 做写时复制：工作簿整体 clone（保存快照、后台重算）时只加引用计数，
+    /// 真正改到哪一列才复制那一列（列最多 PAGE_ROWS 个 Cell）。
+    cols: Vec<std::sync::Arc<Vec<Cell>>>,
 }
 
 impl Page {
     fn ensure(&mut self, r_off: u32, c: u32) {
         if self.cols.len() <= c as usize {
-            self.cols.resize_with(c as usize + 1, Vec::new);
+            self.cols
+                .resize_with(c as usize + 1, || std::sync::Arc::new(Vec::new()));
         }
         // 只把**目标列**补到需要的行数。早先是把页里所有列都补到 n_rows，
         // 稀疏远端行（比如 A1000000）会让每个被碰到的页给全部列各开 256 个槽，
         // 1 万个散点就能吃到 130MB+（QA-07 基线实测 slots=3.4M × 40B）。
-        let col = &mut self.cols[c as usize];
+        let col = std::sync::Arc::make_mut(&mut self.cols[c as usize]);
         if col.len() <= r_off as usize {
             col.resize_with(r_off as usize + 1, Cell::default);
         }
@@ -52,7 +55,7 @@ impl Page {
     }
 
     fn get_mut(&mut self, r_off: u32, c: u32) -> Option<&mut Cell> {
-        let col = self.cols.get_mut(c as usize)?;
+        let col = std::sync::Arc::make_mut(self.cols.get_mut(c as usize)?);
         let cell = col.get_mut(r_off as usize)?;
         if cell.is_blank() {
             None
@@ -123,7 +126,7 @@ impl Store {
         let blank = cell.is_blank();
         if blank {
             if let Some(page) = self.pages.get_mut(&pi) {
-                if let Some(col) = page.cols.get_mut(c as usize) {
+                if let Some(col) = page.cols.get_mut(c as usize).map(std::sync::Arc::make_mut) {
                     if let Some(slot) = col.get_mut(ro as usize) {
                         if !slot.is_blank() {
                             *slot = Cell::default();
@@ -137,7 +140,7 @@ impl Store {
         let existed = self.get(r, c).is_some();
         let page = self.pages.entry(pi).or_default();
         page.ensure(ro, c);
-        page.cols[c as usize][ro as usize] = cell;
+        std::sync::Arc::make_mut(&mut page.cols[c as usize])[ro as usize] = cell;
         if !existed {
             self.len += 1;
         }
@@ -152,7 +155,7 @@ impl Store {
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
         let (pi, ro) = Self::split(r);
         let page = self.pages.get_mut(&pi)?;
-        let col = page.cols.get_mut(c as usize)?;
+        let col = std::sync::Arc::make_mut(page.cols.get_mut(c as usize)?);
         let slot = col.get_mut(ro as usize)?;
         if slot.is_blank() {
             return None;
@@ -302,6 +305,34 @@ mod tests {
         assert!(s.get(201, 3).is_none());
         assert_eq!(s.get(255, 0).unwrap().value.clone(), Value::Number(255.0));
         assert_eq!(s.iter().count(), 257);
+    }
+
+    #[test]
+    fn clone_shares_columns_until_written() {
+        // 工作簿整体 clone（保存快照、后台重算）必须廉价：只加引用计数，
+        // 改到哪个列才复制哪个列，而且不能影响原来那份。
+        let mut s = Store::default();
+        for r in 0..256u32 {
+            s.set(r, 0, num(r as f64));
+        }
+        let clone = s.clone();
+        // 同一个列缓冲：指针相同说明没深拷贝
+        let a = &s.pages[&0u32].cols[0] as *const std::sync::Arc<Vec<Cell>>;
+        let b = &clone.pages[&0u32].cols[0] as *const std::sync::Arc<Vec<Cell>>;
+        assert_ne!(a, b, "两个 Store 的 Arc 单元格地址当然不同，这里只验证内容共享");
+        assert!(std::sync::Arc::ptr_eq(
+            &s.pages[&0u32].cols[0],
+            &clone.pages[&0u32].cols[0]
+        ));
+        // 写 clone 之后：clone 变，原份不变
+        let mut clone = clone;
+        clone.set(10, 0, num(999.0));
+        assert_eq!(clone.get(10, 0).unwrap().value.clone(), Value::Number(999.0));
+        assert_eq!(s.get(10, 0).unwrap().value.clone(), Value::Number(10.0));
+        assert!(!std::sync::Arc::ptr_eq(
+            &s.pages[&0u32].cols[0],
+            &clone.pages[&0u32].cols[0]
+        ));
     }
 
     #[test]
