@@ -4424,22 +4424,26 @@
           ],
           "commands": [
             "powershell -File scripts/qa06_excel_probe.ps1 F:/…/work/qa06 -> \"Excel 16.0：50 条；WPS=12.0\"",
-            "cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2 -> 1 passed / 0 failed（err 16 + blank 17 + date 17）"
+            "cargo test -p sheetcore --offline -j 2 --test qa06_matrix -- --test-threads=2 -> 1 passed / 0 failed（err 16 + blank 17 + date 17）",
+            "powershell -File scripts/qa06_subtotal_probe.ps1 F:/finance-native-sheets-ready/work/qa06h -> 7 条 Excel 实算"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-error-blank-date.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/cases.json",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/excel.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/wps.tsv",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1/probe-meta.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-subtotal.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-1-subtotal.tsv"
           ],
           "not_done": [
-            "数组/动态数组与溢出区域、财务/查找/文本边界、SUBTOTAL/AGGREGATE 隐藏行口径、整列与跨表引用，留给 QA-06.2/06.3"
+            "SUBTOTAL 109–111 系列与 AGGREGATE option 5/6 未按隐藏行过滤：Excel 实测 SUBTOTAL(9)=55/SUBTOTAL(109)=47/AGGREGATE(9,5)=47，引擎当前一律 55（读码核对，待实现）。",
+            "数组/动态数组溢出已转 QA-06.2 并验收；查找/文本边界已转 QA-06.3 并验收。"
           ],
           "failures": [],
           "blocker": "",
           "next": "QA-06.2",
-          "updated_utc": "2026-11-16T08:44:03Z"
+          "updated_utc": "2026-11-16T19:31:22Z"
         },
         {
           "id": "QA-06.2",
