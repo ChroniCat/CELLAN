@@ -678,3 +678,13 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
   QA-07 父项（同因）、UI-29 父项（Excel/WPS 窗口截图全白）、UI-30 父项（14 个需真人点击）。
 - **口径待合同确认**：QA-01 父项（`.xls` 结构性对象不保留、WPS 读不出 SmartArt）。
 
+### C12.4 计算字段/计算项收口（2026-11-17）
+
+- 计算项：`append_calc_item_row`（网格真行）+ `pivot_parts2` 的 `calc_marks`（新追加的 sharedItems
+  下标自动标 `f="1"`）→ `sharedItems` / `pivotField items` / `rowItems` / `location` 一起长。
+  Excel 回读 `calcrow-ours.xlsx`：`range=A9:E14`（多一行）、`CalculatedItems().Count=1`、`Item(1).Name=华东华北`。
+- 计算字段：对话框「计算字段：名称=公式」→ `Workbook::pivot_calc_fields` → 保存时 `add_calculated_fields`，
+  `calc_field_survives_save_and_reload` 走真实 `xlsx::save` 断言 `formula="金额*2"` 与 `cacheFields@count`。
+- 已知限制：计算字段会写进所有 `pivotCacheDefinition`（多透视表场景未支持）。
+- 测试：`pivot_multi_parts` 16 passed、app 366 passed。
+- 台账状态未改：C12.4 仍「待验收」，C12/C12.2/C12.3 仍「待验收/实施中」。

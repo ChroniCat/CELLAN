@@ -3262,7 +3262,7 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "多字段真 pivotTable 部件未实现（仍单行/单列/单值），C12.4 待实施；多字段仅值化网格"
+        "多字段 grid 与 pivotTable 部件均已实现（rowFields/colFields/dataFields/pivotFields 同步、两行表头、总计列、compact/outline、showDataAs、计算字段、计算项）；仍缺：baseField/baseItem 非默认基准、多透视表共存时计算字段只应写对应缓存、C12.2/C12.3 对拍与真人点击验收。"
       ],
       "failures": [],
       "blocker": "",
