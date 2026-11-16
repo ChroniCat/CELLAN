@@ -5044,16 +5044,19 @@
       "commits": [
         "61c9b67",
         "911ad41",
-        "7169cc6"
+        "7169cc6",
+        "b00d923"
       ],
       "commands": [
-        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 320 passed / 0 failed / 0 ignored（10.71s）",
+        "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 324 passed / 0 failed / 0 ignored（9.71s）",
         "cargo test ... -- ui113 -> 4 passed / 0 failed（点选引用、引用着色、layouter 进 galley、Alt+Enter 按光标插行）",
         "cargo test ... -- ui114 -> 3 passed / 0 failed（参数名解析/公式拼装、插到光标且不叠等号、提交记账最近使用）",
         "cargo test ... -- fnrecent -> 4 passed（MRU 去重、落盘位置、公式扫描只认真实调用、菜单兜底）",
         "cargo build -p app --offline -j 2 --no-default-features --features glow -> BUILD OK",
         "app.exe + SC_TYPE/SC_REF_SIM/SC_SHOT -> buf=\"=A1+B1\"，A1 蓝 B1 绿，B1 外套细蓝框",
-        "app.exe + SC_CMD=InsertFunction + SC_TYPE=\"14:AVERAGE\" + SC_KEYSEQ=\"26:enter\" -> 对话框 620x449，匹配数 475→5，applied formula=\"=AVERAGE()\" editing caret=9，编辑栏与格内编辑器同串，状态栏「已插入函数 AVERAGE」"
+        "app.exe + SC_CMD=InsertFunction + SC_TYPE=\"14:AVERAGE\" + SC_KEYSEQ=\"26:enter\" -> 对话框 620x449，匹配数 475→5，applied formula=\"=AVERAGE()\" editing caret=9，编辑栏与格内编辑器同串，状态栏「已插入函数 AVERAGE」",
+        "cargo test ... -- ui115 -> 4 passed（区域/整行整列标签、Shift+点扩区域、拖动扩区域、行号列标插入引用）",
+        "app.exe + SC_TYPE=\"6:=SUM(\" + SC_REF_SIM=\"0,0,3,2,14\" -> buf=\"=SUM(A1:C4\" pick=(0,0,3,2) sel=(0,4) spans=[\"5..10=#0\"]，A1:C4 套蓝框"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
@@ -5065,19 +5068,20 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply3.log",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard9.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-range-ref.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log"
       ],
       "not_done": [
-        "Shift/拖动把引用扩成 A1:B2 未实现（每次点击只建单格引用）",
-        "点行号/列标建 A:A、1:1 引用未实现",
-        "跨工作表点选建 Sheet2!A1 未实现",
+        "跨工作表点选建 Sheet2!A1 未实现（点另一张表页会先结束当前编辑）",
         "向导里点区域填参数、以及向导的分类筛选/帮助链接未实现",
         "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）"
       ],
       "failures": [],
       "blocker": "",
-      "next": "UI-11.5 Shift/拖动扩区域引用与行号列标引用",
-      "updated_utc": "2026-11-16T08:19:53Z",
+      "next": "UI-11.6 跨工作表引用（Sheet2!A1）",
+      "updated_utc": "2026-11-16T08:35:29Z",
       "slices": [
         {
           "id": "UI-11.1",

@@ -227,3 +227,38 @@ UI-01、C07、C15、C17、C16、C18、C21、C10、C19、C20、UI-15 均为待验
 
 - parents 61：已验收 24 / 实施中 3 / 待验收 27 / 待实施 7；
 - slices 148：已验收 60 / 待验收 64 / 待实施 21 / 实施中 3（本轮未改变计数）。
+
+## 2026-11-16 检查点三：UI-11.5 拖动/Shift 区域引用 + 行号列标引用
+
+- HEAD `b00d923`（`feat(ui11): drag/shift range picking and whole row/column references`）。
+- app 全量：**324 passed / 0 failed / 0 ignored**（9.71s）。
+
+### 做完的
+
+1. Shift+点：先点一格插入 `A1`，按住 Shift 再点另一格把刚才那串原地改写成 `A1:B3`（锚点在前，反向拖就是 `B3:A1`），
+   引用框跟着扩，选区不动。
+2. 按住拖动：按下即落锚点，指针移到别的格就 `replace_char_span` 原地改成「锚点:当前格」。
+   自绘面板上 `Response::dragged()` 不成立，判定改用 `i.pointer.primary_down()` + `pointer_interact_pos()`。
+3. 行号/列标：编辑公式时按列标插 `B:B`、按行号插 `3:3`，引用框覆盖整列/整行。
+   这段必须排在「按下即提交草稿」之前，否则这一按先提交编辑；`clicked()` 帧 `press_origin` 已清空，要退回 `interact_pointer_pos()`。
+4. `commit_edit` / `cancel_edit` 一并清 `pick_anchor` / `pick_span`。
+
+### 实测
+
+- 新增 4 条用例：`ui115_reference_text_helpers`、`ui115_shift_click_extends_reference_to_range`、
+  `ui115_dragging_while_picking_rewrites_reference_to_range`、`ui115_header_click_inserts_whole_column_and_row_reference`。
+- GUI：`SC_TYPE="6:=SUM(" + SC_REF_SIM="0,0,3,2,14"` → `buf="=SUM(A1:C4"`、`pick=(0,0,3,2)`、`spans=["5..10=#0"]`，
+  截图里 A1:C4 套一圈蓝框、选区仍在 E1。`SC_REF_SIM` 现支持单格与区域两种写法。
+- 应用内追加的指针事件赶不上当帧 `begin_pass`（`i.pointer.*` 读不到），所以删掉了刚加的 `SC_REF_DRAG`/`SC_HEAD_PICK` 两个无效探针；
+  拖动的真实指针语义由 egui 集成用例保证（直接喂 RawInput 跑 `draw_grid_pane`）。
+
+### 证据
+
+- `implementation-evidence/ui11-range-ref.txt`
+- `implementation-evidence/ui115-probe/{range.png,range.log}`
+
+### 仍然没做
+
+- 跨工作表点选建 `Sheet2!A1`（点另一张表页会先结束当前编辑）；
+- 向导里点区域填参数、分类筛选、帮助链接；
+- 真实中文 IME（RDP 不可用，待验收）。
