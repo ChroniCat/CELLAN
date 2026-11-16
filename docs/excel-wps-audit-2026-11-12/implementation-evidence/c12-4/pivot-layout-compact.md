@@ -98,3 +98,33 @@ diff lines = 2 / 14
   `colItems` 补 `<i t="grand">`，再跑同一套 `c12_layout_compare.ps1` 验证 `cacheId` 保持为 1
   （不重建）且 TSV 14/14 全同。
 - 在修好之前，本条**不算验收**：现在只是"Excel 能用缓存重建出正确结果"。
+
+## 几何实测（决定修法前必须先量）
+
+`pivot_real::dump_geometry_for_row_col` 打印真实结果：
+
+```
+[geom] row_only headers=["部门","金额"]                                   rows=4 rect=(20,0,24,1) → A21:B25
+[geom] row_col  headers=["部门","张三","李四","王五","赵六","钱七"]        rows=4 rect=(20,0,24,5) → A21:F25
+```
+
+对照 `ours.tsv` 里 Excel 渲染出的形状（7 列、2 行表头）：
+
+| 项 | 我们写出 | Excel 期望 |
+|---|---|---|
+| 表头 | 1 行（6 格） | 2 行（列字段名行 + 行字段名/值名行） |
+| 合计列 | 无 | 有（第 7 列「总计」） |
+| 合计行 | 有（第 5 行） | 有 |
+
+所以缺陷不止 XML 属性：`pivot::compute` 在有列字段时**根本没生成总计列和列字段表头行**，
+`write_to` 自然也就少写；XML 只是如实地把「少一列一行」记录下来，Excel 打开发现不一致 → 重建。
+
+## 修法（三处必须同批改，否则定义与单元格继续错位）
+
+1. `pivot::compute`：`col_field.is_some()` 时 headers 增加「总计」列，并返回两行表头模型
+   （列字段名行 + 现有 headers）；
+2. `pivot::write_to`：写两行表头，数据从第三行起，rect 相应 +1 行 +1 列；
+3. `pivot_parts`：`firstHeaderRow="2"`、`firstDataRow="3"`、`location` +1 行、`colItems` 补
+   `<i t="grand"><x/></i>` 且 `col_count` +1。
+
+验收判据（写在台账里）：`c12_layout_compare.ps1` 重跑后 `cacheId` 保持 1（Excel 不重建）+ TSV 14/14 全同。

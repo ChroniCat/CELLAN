@@ -589,3 +589,31 @@ fn pivot_layout_switches_between_compact_and_outline() {
     assert!(z.by_name("xl/pivotCache/pivotCacheDefinition1.xml").is_ok());
     eprintln!("[layout] ok {}", out.display());
 }
+
+#[test]
+fn dump_geometry_for_row_col() {
+    let src = fixture("table.xlsx");
+    let mut wb = sheetcore::xlsx::load(&src).expect("读入");
+    let region = sheetcore::sort_filter::current_region(wb.sheet(0), 0, 0);
+    for (tag, col) in [("row_only", None), ("row_col", Some(0u32))] {
+        let spec = PivotSpec {
+            source: region,
+            row_field: 1,
+            col_field: col,
+            value_field: 2,
+            agg: Agg::Sum,
+            group: sheetcore::pivot::GroupBy::None,
+            exclude: Vec::new(),
+        };
+        let res = sheetcore::pivot::compute(wb.sheet(0), &spec);
+        let rect = sheetcore::pivot::write_to(wb.sheet_mut(0), (20, 0), &res);
+        eprintln!(
+            "[geom] {tag} headers={} peak_row_cells={} rows={} rect={:?}",
+            res.headers.len(),
+            res.headers.len(),
+            res.rows.len(),
+            rect
+        );
+        eprintln!("[geom] {tag} headers={:?}", res.headers);
+    }
+}
