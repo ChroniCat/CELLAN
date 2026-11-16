@@ -59,3 +59,23 @@ Excel 同一对公式（迭代开启、MaxIterations=100、MaxChange=0.001）收
 轴点就在 `Calc::cell_value` 的环判定处：迭代开启时不能直接返回 Circular，
 而要取「上一次求值结果」（首轮取 0，Excel 口径）继续算，直到 `max|Δ| <= maxChange`
 或达到 `maxIterations`。用例已写成 `#[ignore]`，实现后去掉 ignore 即为验收开关。
+
+## 2026-11-17 收口：迭代求解器已通
+
+三处改动（`crates/core/src/formula/mod.rs`）：
+1. 环判定分叉：`calc_iterate` 时返回「上一轮值」（空/错误按 0，Excel 首轮口径）；
+2. 多遍循环的提前退出条件加 `!calc_iterate` 守卫——环上没有溢出，原条件第一遍就 break，
+   导致「100 遍」形同虚设（实测 A1 停在 1、B1 停在 0）；
+3. 循环末尾按 `CYCLE_CELLS` 记的格子算 `max|Δ|`，小于 `calc_max_change` 即收敛退出；
+   同时收尾清理不再把环上格子改写成 `Circular`（那是「不稳定」口径，不是迭代口径）。
+
+实测（`A1=B1+1`、`B1=A1/2`、`calc_iterate=true`、默认 100 次 / 0.001）：
+
+```
+[calciter] A1=1.9990234375 B1=0.9990234375
+test result: ok. 3 passed
+```
+
+Excel 同参数收敛到 `A1=2`、`B1=1`，差值 9.77e-4，落在 `MaxChange=0.001` 内。
+
+回归：core 107 个测试二进制 0 failed；app 361 passed。

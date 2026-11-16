@@ -4467,7 +4467,10 @@
             "python scripts/qa06_array_fixture.py work/qa06a -> 12 锚点 + 3 溢出冲突",
             "powershell -File scripts/qa06_array_probe.ps1 F:/finance-native-sheets-ready/work/qa06a -> spill_conflict.tsv / spill_cleared.tsv",
             "cargo test -p sheetcore --test qa06_array -- --test-threads=2 -> 3 passed（冲突 3 条 + 恢复 12 格）",
-            "cargo test -p sheetcore --test calc_iteration -> 2 passed（写/删 iterate,maxIterations,maxChange；保留 calcMode）"
+            "cargo test -p sheetcore --test calc_iteration -> 2 passed（写/删 iterate,maxIterations,maxChange；保留 calcMode）",
+            "cargo test -p sheetcore --test calc_iteration -> 3 passed（收敛 A1=1.9990234375/B1=0.9990234375）",
+            "cargo test -p sheetcore -> 107 个测试二进制 0 failed",
+            "cargo test -p app --bin app -> 361 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
@@ -4480,12 +4483,12 @@
           ],
           "not_done": [
             "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计",
-            "迭代计算求解器未实现：calcPr 的 iterate/maxIterations/maxChange 已能读写（read_calc_iteration/set_calc_iteration + 2 条用例），但求值器仍无环检测与迭代收敛；还需 SCC 识别、按 MaxIterations/MaxChange 迭代、环外依赖收敛后重取。"
+            "迭代计算已能收敛（环取上一轮值 + maxChange 收敛判据，实测 A1=1.9990234375/B1=0.9990234375），但 calcPr/@iterate 与 Workbook 字段的装载/保存接线未做，打开开启迭代的工作簿仍走默认关闭。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-16T09:01:20Z"
+          "updated_utc": "2026-11-16T19:18:33Z"
         },
         {
           "id": "QA-06.3",

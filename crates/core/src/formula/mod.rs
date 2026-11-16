@@ -3054,6 +3054,8 @@ pub fn recalc_all_force_impl(
     let mut volatile_values = HashMap::new();
     let mut previous_arrays: HashMap<deps::CellKey, FValue> = HashMap::new();
     let mut pass_done = 0usize;
+    // 迭代模式：记录环上格子每遍的数值，用来判收敛
+    let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
     for _pass in 0..passes {
         pass_done += 1;
         let before_spills = spill_values(wb);
@@ -3150,7 +3152,9 @@ pub fn recalc_all_force_impl(
             eprintln!("[checksum] pass {} 数值格 {} 合计 {:.6}", _pass + 1, cnt, sum);
         }
         let after_spills = spill_values(wb);
-        if before_spills == after_spills && (!force_two || _pass > 0) {
+        // 普通模式：溢出块稳定即停。迭代模式不能在这里停——环上格子没有溢出，
+        // 一停就只跑一遍，永远到不了不动点。
+        if !wb.calc_iterate && before_spills == after_spills && (!force_two || _pass > 0) {
             break;
         }
         if let Some(mut final_results) = final_results {
@@ -3168,7 +3172,9 @@ pub fn recalc_all_force_impl(
             clear_spills(wb);
             for (si, r, c, value) in &mut final_results {
                 let key = (*si, *r, *c);
-                if affected.contains(&key) {
+                // 迭代计算时环上格子每遍都在变，它们不属于「不稳定」，而是收敛过程本身；
+                // 这里只清理溢出/动态引用牵连的格子，否则收敛值会被改回 #REF!
+                if affected.contains(&key) && !wb.calc_iterate {
                     *value = FValue::Error(ErrKind::Circular);
                     CYCLE_CELLS.with(|cells| { cells.borrow_mut().insert(key); });
                 }
@@ -3176,6 +3182,26 @@ pub fn recalc_all_force_impl(
             write_back(wb, final_results);
         }
         previous_arrays = arrays;
+        if wb.calc_iterate {
+            let mut max_delta = 0.0f64;
+            let cycle_now: Vec<deps::CellKey> =
+                CYCLE_CELLS.with(|cells| cells.borrow().iter().copied().collect());
+            for key in cycle_now {
+                let cur = wb.sheets[key.0]
+                    .get(key.1, key.2)
+                    .map(|c| match c.value {
+                        crate::model::Value::Number(n) => n,
+                        _ => 0.0,
+                    })
+                    .unwrap_or(0.0);
+                let prev = prev_nums.get(&key).copied().unwrap_or(0.0);
+                max_delta = max_delta.max((cur - prev).abs());
+                prev_nums.insert(key, cur);
+            }
+            if _pass > 0 && max_delta < wb.calc_max_change {
+                break;
+            }
+        }
     }
     mark!("结束");
     if phase {
