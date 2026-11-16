@@ -747,3 +747,47 @@ fn two_row_fields_match_excel_sort_probe() {
     ];
     assert_eq!(rows, expect);
 }
+
+#[test]
+fn multi_value_grid_dump_for_reference() {
+    use sheetcore::{Cell, Value};
+    let mut wb = sheetcore::Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    let heads = ["地区", "产品", "金额", "数量"];
+    for (c, h) in heads.iter().enumerate() {
+        wb.sheets[0].set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });
+    }
+    let data = [
+        ("华东", "A", 10.0, 2.0),
+        ("华北", "B", 20.0, 3.0),
+        ("华东", "A", 30.0, 4.0),
+        ("华北", "B", 40.0, 5.0),
+        ("华东", "B", 50.0, 6.0),
+        ("华北", "A", 60.0, 7.0),
+    ];
+    for (i, (a, b, c, d)) in data.iter().enumerate() {
+        let r = i as u32 + 1;
+        wb.sheets[0].set(r, 0, Cell { value: Value::Text((*a).into()), formula: None });
+        wb.sheets[0].set(r, 1, Cell { value: Value::Text((*b).into()), formula: None });
+        wb.sheets[0].set(r, 2, Cell { value: Value::Number(*c), formula: None });
+        wb.sheets[0].set(r, 3, Cell { value: Value::Number(*d), formula: None });
+    }
+    let spec = PivotSpec2 {
+        source: (0, 0, 6, 3),
+        rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
+        cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
+        values: vec![
+            ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:数量".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal },
+        ],
+        filters: vec![],
+        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
+    };
+    let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    for h in &g.headers {
+        eprintln!("HDR| {}", h.join("	"));
+    }
+    for r in &g.rows {
+        eprintln!("ROW| {}", r.iter().map(|v| v.display()).collect::<Vec<_>>().join("	"));
+    }
+}
