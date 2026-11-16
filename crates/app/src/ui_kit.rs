@@ -759,6 +759,27 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// UI-24.2：给自绘控件指定可访问角色（Tab 页、菜单项等）
+pub fn a11y_role(
+    resp: &egui::Response,
+    label: &str,
+    role: egui::accesskit::Role,
+    selected: Option<bool>,
+) {
+    let text = label.to_string();
+    let text2 = text.clone();
+    resp.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, text2.clone())
+    });
+    let _ = resp.ctx.accesskit_node_builder(resp.id, |node| {
+        node.set_role(role);
+        node.set_label(text);
+        if let Some(v) = selected {
+            node.set_selected(v);
+        }
+    });
+}
+
 /// 只拖动、不参与 Tab 焦点的 Sense（标题栏、缩放手柄、模态遮挡层都该用它）
 pub fn drag_only_sense() -> egui::Sense {
     egui::Sense::from_bits_truncate(
@@ -876,6 +897,8 @@ pub fn sheet_tab(
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
     let size = Vec2::new(galley.size().x + 26.0, 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // UI-24.2：工作表标签在 UIA 里是 Tab 页，名字就是工作表名
+    a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active));
     let tab_rgb = color.map(|c| Color32::from_rgb(c[0], c[1], c[2]));
     if let Some(fill) = tab_rgb {
         // 有颜色的标签：整块铺色；深色配白字

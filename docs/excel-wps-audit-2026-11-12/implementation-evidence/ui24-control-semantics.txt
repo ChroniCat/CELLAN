@@ -1,0 +1,66 @@
+UI-24.2 控件语义补齐：下拉/组合框/画廊/名称框/编辑栏/标签条/网格定位
+================================================================================
+日期：2026-11-16
+
+一、这一轮补的洞
+----------------
+上一轮只发布了功能区按钮、pill、对话框标题、活动单元格。用 UIA 枚举后发现
+**自绘的下拉、组合框、画廊、名称框、工作表标签条全都不可见**，网格节点
+bounds 是 `∞,∞,-∞,-∞`（辅助工具无法定位）。
+
+| 控件 | 之前 | 现在 |
+|---|---|---|
+| 字体框 | 树里没有（自绘 TextEdit + 空串） | `Edit 字体 = 思源黑体` |
+| 字号框 | 无 | `Edit 字号 = 11` |
+| 名称框 | 无 | `Edit 名称框 = A1` |
+| 标题栏搜索框 | `Edit ""`（无名） | `Edit 搜索命令` |
+| 自绘下拉（数字格式等） | 无 | `Button 常规`（值 + 说明） |
+| 画廊条目（单元格样式） | 无 | `Button 常规/标题/强调/好/差`，带 bounds |
+| 画廊展开箭头 | 无 | `Button 单元格样式 展开` |
+| 拆分按钮箭头 | 无 | `Button 粘贴 选项` / `条件格式 选项` / `套用表格格式 选项` |
+| 工作表标签 | 无 | `TabItem Sheet1`，bounds 383,1054,64,32 |
+| 标签条左右滚动 | 无 | `Button 工作表标签左移 / 右移` |
+| 网格 | `at=∞,∞,-∞,-∞` | `DataGrid … at=271,463,1423,574` |
+
+二、怎么做的
+------------
+1. `ui_kit::a11y_role(resp, label, role, selected)`：任意角色 + 选中态的通用发布。
+2. `ui_kit::sheet_tab` 里发 `Role=Tab` + `active` 作为 selected。
+3. `ribbon::ui::dropdown` 自绘分支发 `Button`（名字 = 当前值 + tooltip）。
+4. `ribbon::ui::gallery` 每个条目发 `Button`（名字 = 条目名），箭头发 `「{label} 展开」`；
+   给 `customUI.xml` 的 CellStylesGallery 补 `label="单元格样式"`，否则箭头只能叫 id。
+5. `split()` / `menu()` 的 `big_sized_split` 箭头各发一个 `Button`（`{label} 选项`）。
+6. `font_combo`：默认字体时输入框以前是空串（读屏念不出来），现在填真实字体名
+   「思源黑体」；字体/字号输入框各加 label。
+7. 名称框、标题栏搜索框加 label；公式栏 TextEdit 也加了 label（当前未进入编辑态时不生成 Edit）。
+8. 网格节点 set_bounds(pane rect × pixels_per_point)。
+
+三、外部 UIA 实测（PowerShell UIAutomationClient）
+------------------------------------------------
+```
+Edit    搜索命令   value=            at=657,39,328,22
+Edit    字体       value=思源黑体    at=261,150,147,20
+Edit    字号       value=11          at=433,150,32,20
+Edit    名称框     value=A1          at=103,249,76,20
+Button  常规                        at=1099,139,63,63     ← 画廊「常规」样式
+Button  标题 / 强调 / 好 / 差        (同上，逐个 65px 递进)
+Button  单元格样式 展开
+Button  粘贴 选项 / 条件格式 选项 / 套用表格格式 选项
+TabItem Sheet1                      at=383,1054,64,32
+Button  工作表标签左移 / 右移         at=287/319,1055,32,31
+DataGrid 工作表 Sheet1，选区 A1:A1，1 行 1 列，活动单元格 A1  at=271,463,1423,574
+```
+菜单项本来就是真 `egui::Button`（`BordersMenu` 展开后是 `Button 右框线/所有框线/…`），
+所以菜单不需要改。
+
+四、边界
+--------
+- 右键菜单、筛选下拉、颜色面板这些**弹出层没有逐个验**（有的自绘、有的用 egui 原生）。
+- 没有验证禁用态在 UIA 里真的出现 `IsEnabled=false`（样本里没有稳定可复现的禁用按钮）。
+- 公式栏只有在进入编辑态才生成 Edit 节点，非编辑态是绘制文本。
+- accesskit 0.17 不支持 SelectionItemPattern（上一轮已记录），选中态一律写进名字或 selected 状态位。
+
+五、验证
+--------
+- app 测试 **341 passed**（`work/goal-logs/ui242-app.log`）。
+- UIA 原始输出：`work/probe/qa07/uia-dd10.txt`（含上述全部条目）。

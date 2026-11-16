@@ -236,7 +236,7 @@
           <menu id="FormatAsTable" label="套用表格格式" size="large" sizeString="65" imageMso="Table">
             <button id="FormatAsTableNew" label="插入表格" onAction="FormatAsTable"/>
           </menu>
-          <gallery id="CellStylesGallery" sizeString="349" columns="5">
+          <gallery id="CellStylesGallery" label="单元格样式" sizeString="349" columns="5">
             <item id="StyleNormal" label="常规"/>
             <item id="StyleTitle" label="标题"/>
             <item id="StyleHeading" label="强调"/>

@@ -23033,9 +23033,17 @@ let txn = self.txn_begin(&keys);
             r1n - r0 + 1,
             c1n - c0 + 1
         );
+        let ppp = ctx.pixels_per_point();
+        let bounds = egui::accesskit::Rect {
+            x0: (resp.rect.min.x * ppp) as f64,
+            y0: (resp.rect.min.y * ppp) as f64,
+            x1: (resp.rect.max.x * ppp) as f64,
+            y1: (resp.rect.max.y * ppp) as f64,
+        };
         let _ = ctx.accesskit_node_builder(resp.id.with("grid"), |node| {
             node.set_role(egui::accesskit::Role::Grid);
             node.set_label(summary);
+            node.set_bounds(bounds);
         });
     }
 
@@ -28121,6 +28129,10 @@ impl SheetApp {
                         .frame(false)
                         .hint_text("搜索"),
                 );
+                // UI-24.2：标题栏搜索框在 UIA 里要有名字
+                let _ = ui.ctx().accesskit_node_builder(te.id, |node| {
+                    node.set_label("搜索命令".to_string());
+                });
                 // 标题栏搜索框按 Excel 语义搜命令（UI-22），不是工作表查找；
                 // 工作表查找仍走 Ctrl+F 的查找栏。
                 if te.gained_focus() || te.changed() {
@@ -29212,6 +29224,10 @@ impl eframe::App for SheetApp {
                     Vec2::new(inner.width(), 20.0),
                     egui::TextEdit::singleline(&mut self.name_buf).frame(false),
                 );
+                // UI-24.2：名称框在 UIA 里要有名字（否则只念「编辑 A1」）
+                let _ = ui.ctx().accesskit_node_builder(nb_resp.id, |node| {
+                    node.set_label("名称框".to_string());
+                });
                 if self.name_focus_request {
                     nb_resp.request_focus();
                     self.name_focus_request = false;
@@ -29462,6 +29478,10 @@ impl eframe::App for SheetApp {
                                     .layouter(&mut layouter),
                             )
                         };
+                        // UI-24.2：编辑栏在 UIA 里要有名字（值本身由 TextEdit 的 Value 给出）
+                        let _ = ui.ctx().accesskit_node_builder(te.id, |node| {
+                            node.set_label("编辑栏".to_string());
+                        });
                         // 补全/点选引用后把光标搬到指定位置；否则每帧记录真实光标
                         let fx_id = egui::Id::new("fx_edit");
                         if picked || ed.caret_override.is_some() {
@@ -29908,6 +29928,12 @@ impl eframe::App for SheetApp {
                         Vec2::new(32.0, 31.0),
                     );
                     let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), Sense::click());
+                    ui_kit::a11y_name(
+                        &resp,
+                        if *dir == "left" { "工作表标签左移" } else { "工作表标签右移" },
+                        true,
+                        None,
+                    );
                     if resp.hovered() {
                         ui.painter().rect_filled(b, 0.0, ui_kit::HOVER);
                     }

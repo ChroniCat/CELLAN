@@ -458,6 +458,7 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
         Size::Large => {
             let w = ctl.width.unwrap_or(42.0);
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
+            ui_kit::a11y_name(&ar, &format!("{label} 选项"), enabled, None);
             keytip_rect = Some(r.rect);
             main_clicked = enabled && r.clicked();
             if ar.clicked() && enabled {
@@ -550,6 +551,7 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
         let w = m.ctl.width.unwrap_or(65.0);
         let ic = m.ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
         let (r, ar) = ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0));
+        ui_kit::a11y_name(&ar, &format!("{label} 选项"), true, None);
         if (r.clicked() || ar.clicked()) && on_enabled(&m.ctl, &st) {
             app.ribbon_popup = Some(Popup {
                 kind: PopupKind::Menu(m.clone()),
@@ -663,8 +665,17 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
             egui::pos2(rect.right() - 8.0, rect.center().y),
             if enabled { Color32::from_rgb(68, 68, 68) } else { ui_kit::DISABLED },
         );
-        r.on_hover_text(tip)
+        r.on_hover_text(tip.clone())
     });
+    // UI-24.2：自绘下拉在 UIA 里要有名字（当前值 + 说明）
+    {
+        let name = if tip.is_empty() {
+            format!("{text}（下拉）")
+        } else {
+            format!("{text}，{tip}")
+        };
+        ui_kit::a11y_name(&clicked.inner, &name, on_enabled(c, &st), None);
+    }
     if clicked.inner.clicked() {
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
@@ -921,8 +932,14 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
     let cur = app.current_style();
     ui.spacing_mut().interact_size.y = 21.0;
     let fid = egui::Id::new("font_edit");
+    // UI-24.2：框里要显示真实的字体名（默认字体时以前是空串，读屏读不到）
+    let shown_font = if cur.font.is_empty() {
+        "思源黑体".to_string()
+    } else {
+        cur.font.clone()
+    };
     if !ui.memory(|m| m.has_focus(fid)) {
-        app.font_buf = cur.font.clone();
+        app.font_buf = shown_font;
     }
     let mut lost = false;
     let mut arrow_pos = egui::pos2(0.0, 0.0);
@@ -970,7 +987,12 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
             );
         }
         lost = fr.lost_focus();
+        // UI-24.2：输入框在 UIA 里要有名字，否则读屏只念「编辑 思源黑体」
+        let _ = ui.ctx().accesskit_node_builder(fid, |node| {
+            node.set_label("字体".to_string());
+        });
         let ar = ui.interact(arrow_rect, egui::Id::new("font_arrow"), Sense::click());
+        ui_kit::a11y_name(&ar, "字体 下拉", true, None);
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
         ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
@@ -1068,7 +1090,11 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
             )
             .on_hover_text("字号（磅），回车应用");
         lost = sr.lost_focus();
+        let _ = ui.ctx().accesskit_node_builder(sid, |node| {
+            node.set_label("字号".to_string());
+        });
         let ar = ui.interact(arrow_rect, egui::Id::new("size_arrow"), Sense::click());
+        ui_kit::a11y_name(&ar, "字号 下拉", true, None);
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
         ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
@@ -1162,6 +1188,7 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
             Vec2::new(tw - 2.0, 63.0),
         );
         let resp = ui.interact(r, ui.id().with(("gal", &c.id, i)), Sense::click());
+        ui_kit::a11y_name(&resp, &it.label, enabled, None);
         let (bg, fg, bold) = style_preview(&it.id);
         let bg = if resp.hovered() { bg.gamma_multiply(0.94) } else { bg };
         ui.painter().rect(
@@ -1215,6 +1242,15 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     }
     let arrow_rect = Rect::from_min_max(egui::pos2(rect.right() - arrow_w, rect.top()), rect.max);
     let ar = ui.interact(arrow_rect, ui.id().with(("galarrow", &c.id)), Sense::click());
+    {
+        let base = c
+            .label
+            .clone()
+            .or_else(|| st.tip.clone())
+            .unwrap_or_else(|| tip_of(c));
+        let base = if base.is_empty() { c.id.clone() } else { base };
+        ui_kit::a11y_name(&ar, &format!("{base} 展开"), enabled, None);
+    }
     if ar.hovered() {
         ui.painter().rect_filled(arrow_rect, 2.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
