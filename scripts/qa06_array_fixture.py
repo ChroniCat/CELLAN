@@ -9,6 +9,14 @@ sheet "S"：
 import os
 import sys
 
+# 溢出冲突：锚点下方/右侧先放一个占位值，Excel 应报 #SPILL!；清掉占位后应正常溢出。
+# (formula, anchor_row, blocker_cell)
+BLOCKED = [
+    ("=SEQUENCE(3)", 130, "E132"),
+    ("=SEQUENCE(2,2)", 140, "E141"),
+    ("=TRANSPOSE(B1:B5)", 150, "F150"),
+]
+
 CASES = [
     ("=SEQUENCE(3,2)", 1),
     ("=SEQUENCE(2,3,10,5)", 10),
@@ -39,13 +47,18 @@ def main():
     for i, v in enumerate(["b", "a", "c", "e", "d"], start=1):
         ws[f"C{i}"] = v
         ws[f"C{i}"].number_format = "@"
+    for _formula, _row, blocker in BLOCKED:
+        ws[blocker] = "X"
     # 公式留给 Excel 写（见 ps1），这里只写锚点表
     wb.save(os.path.join(out, "qa06a.xlsx"))
 
     with open(os.path.join(out, "anchor.tsv"), "w", encoding="utf-8", newline="\n") as f:
         for formula, row in CASES:
             f.write(f"E{row}\t{formula}\n")
-    print(f"夹具 {out}/qa06a.xlsx，{len(CASES)} 个数组公式锚点")
+    with open(os.path.join(out, "blocked.tsv"), "w", encoding="utf-8", newline="\n") as f:
+        for formula, row, blocker in BLOCKED:
+            f.write(f"E{row}\t{blocker}\t{formula}\n")
+    print(f"夹具 {out}/qa06a.xlsx，{len(CASES)} 个数组公式锚点 + {len(BLOCKED)} 个溢出冲突")
 
 
 if __name__ == "__main__":

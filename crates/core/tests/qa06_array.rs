@@ -217,3 +217,151 @@ fn qa06_2_incremental_matches_full_recalc() {
     );
     eprintln!("[qa06a] 增量重算 {n} 格，{cells} 格与全量一致");
 }
+
+// ---------------------------------------------------------------- 溢出冲突与恢复
+
+struct ClearBlock {
+    anchor: String,
+    rows: usize,
+    cols: usize,
+    values: Vec<String>,
+}
+
+fn spill_cleared_tsv() -> &'static str {
+    include_str!("fixtures/qa06a/spill_cleared.tsv").trim_start_matches('\u{feff}')
+}
+
+fn parse_cleared() -> Vec<ClearBlock> {
+    let mut out = Vec::new();
+    for line in spill_cleared_tsv().lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        out.push(ClearBlock {
+            anchor: cols[0].to_string(),
+            rows: cols[2].parse().unwrap_or(0),
+            cols: cols[3].parse().unwrap_or(0),
+            values: cols[4..].iter().map(|s| s.to_string()).collect(),
+        });
+    }
+    out
+}
+
+fn parse_conflict() -> Vec<(String, String, bool)> {
+    let tsv = include_str!("fixtures/qa06a/spill_conflict.tsv").trim_start_matches('\u{feff}');
+    let mut out = Vec::new();
+    for line in tsv.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        out.push((cols[0].to_string(), cols[1].to_string(), cols[2] == "True"));
+    }
+    out
+}
+
+fn anchor_formula(anchor: &str) -> String {
+    for line in spill_cleared_tsv().lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 2 && cols[0] == anchor {
+            return cols[1].to_string();
+        }
+    }
+    panic!("spill_cleared.tsv 缺少 {anchor}");
+}
+
+#[test]
+fn qa06_2_spill_conflict_and_recovery_match_excel() {
+    let cleared = parse_cleared();
+    let conflict = parse_conflict();
+    assert!(cleared.len() >= 3, "溢出恢复块太少：{}", cleared.len());
+
+    // 占位格：E132 / E141 / F150（与 scripts/qa06_array_fixture.py 的 BLOCKED 一致）
+    let blockers: [(u32, u32); 3] = [(131, 4), (140, 4), (149, 5)];
+
+    let mut wb = Workbook::new_blank();
+    {
+        let s = &mut wb.sheets[0];
+        for (i, v) in [3.0, 1.0, 2.0, 5.0, 4.0].iter().enumerate() {
+            s.set(i as u32, 1, num(*v));
+        }
+        for (i, v) in ["b", "a", "c", "e", "d"].iter().enumerate() {
+            s.set(i as u32, 2, text(v));
+        }
+        for b in &cleared {
+            let row: u32 = b.anchor[1..].parse().unwrap();
+            s.set(row - 1, 4, f(&anchor_formula(&b.anchor)));
+        }
+        for (r, c) in blockers {
+            s.set(r, c, text("X"));
+        }
+    }
+    formula::recalc_all(&mut wb);
+
+    let mut diffs = Vec::new();
+    for (anchor, excel_text, has_spill) in &conflict {
+        let row: u32 = anchor[1..].parse().unwrap();
+        match wb.sheets[0].value(row - 1, 4) {
+            Value::Error(sheetcore::formula::ErrKind::Spill) => {
+                if *has_spill {
+                    diffs.push(format!("{anchor} 占位时本引擎 #SPILL!，但 Excel 仍在溢出"));
+                }
+            }
+            other => diffs.push(format!(
+                "{anchor} 占位时应为 #SPILL!，实际 {:?}（Excel 显示 {excel_text}）",
+                other
+            )),
+        }
+    }
+
+    // 清掉占位值后重算，溢出块应与 Excel 清占位后的实算逐格一致
+    {
+        let s = &mut wb.sheets[0];
+        for (r, c) in blockers {
+            s.set(r, c, Cell { value: Value::Empty, formula: None });
+        }
+    }
+    formula::recalc_all(&mut wb);
+
+    let mut checked = 0usize;
+    for b in &cleared {
+        let row: u32 = b.anchor[1..].parse().unwrap();
+        for r in 0..b.rows {
+            for c in 0..b.cols {
+                let v = wb.sheets[0].value(row - 1 + r as u32, 4 + c as u32);
+                let got = match &v {
+                    Value::Error(e) => err_text(e).to_string(),
+                    other => render(other),
+                };
+                let want = &b.values[r * b.cols + c];
+                checked += 1;
+                let ok = &got == want
+                    || matches!(
+                        (&v, want.parse::<f64>()),
+                        (Value::Number(n), Ok(e)) if (*n - e).abs() <= 1e-9 * e.abs().max(1.0)
+                    );
+                if !ok {
+                    diffs.push(format!(
+                        "{} 清占位后 格({},{}) 本引擎 {:?} != Excel {:?}",
+                        b.anchor, r, c, got, want
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        diffs.is_empty(),
+        "溢出冲突/恢复不一致 {} 处：\n{}",
+        diffs.len(),
+        diffs.join("\n")
+    );
+    eprintln!(
+        "[qa06a-spill] 占位冲突 {} 条一致；清占位后核对 {checked} 格",
+        conflict.len()
+    );
+}

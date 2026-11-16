@@ -67,6 +67,63 @@ foreach ($o in $out) {
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllLines((Join-Path $dir 'blocks.tsv'), $lines, $utf8NoBom)
 
+# ---- 溢出冲突：读被占位时的锚点文本，再清掉占位重算，读回真实溢出块 ----
+$blockedFile = Join-Path $dir 'blocked.tsv'
+if (Test-Path $blockedFile) {
+    $blocked = @(Get-Content $blockedFile -Encoding UTF8 | Where-Object { $_.Trim() -ne '' })
+    $conflictLines = @()
+    foreach ($line in $blocked) {
+        $ws.Range($line.Split("`t")[0]).Formula2 = $line.Split("`t")[2]
+    }
+    $ws.Calculate()
+    foreach ($line in $blocked) {
+        $parts = $line.Split("`t")
+        $addr = $parts[0]
+        $blocker = $parts[1]
+        $formula = $parts[2]
+        $ws.Range($addr).Formula2 = $formula
+        $cell = $ws.Range($addr)
+        $has = $false
+        try { $has = $cell.HasSpill } catch {}
+        $conflictLines += (($addr, [string]$cell.Text, [string]$has) -join "`t")
+    }
+    [IO.File]::WriteAllLines((Join-Path $dir 'spill_conflict.tsv'), $conflictLines, $utf8NoBom)
+
+    foreach ($line in $blocked) {
+        $parts = $line.Split("`t")
+        $ws.Range($parts[1]).ClearContents() | Out-Null
+    }
+    $ws.Calculate()
+    $cleared = @()
+    foreach ($line in $blocked) {
+        $parts = $line.Split("`t")
+        $cell = $ws.Range($parts[0])
+        $rng = $null
+        if ($cell.HasSpill) { $rng = $cell.SpillingToRange } else { $rng = $cell }
+        $rows = $rng.Rows.Count
+        $cols = $rng.Columns.Count
+        $vals = @()
+        for ($r = 1; $r -le $rows; $r++) {
+            for ($c = 1; $c -le $cols; $c++) {
+                $vals += (CellVal $rng.Cells.Item($r, $c))
+            }
+        }
+        $cleared += [pscustomobject]@{
+            anchor  = $parts[0]
+            formula = [string]$cell.Formula2
+            rows    = $rows
+            cols    = $cols
+            values  = $vals
+        }
+    }
+    $clearLines = @()
+    foreach ($o in $cleared) {
+        $clearLines += (($o.anchor, $o.formula, $o.rows, $o.cols) + $o.values) -join "`t"
+    }
+    [IO.File]::WriteAllLines((Join-Path $dir 'spill_cleared.tsv'), $clearLines, $utf8NoBom)
+    "溢出冲突 $($blocked.Count) 条：$(($conflictLines) -join ' | ')"
+}
+
 $meta = [pscustomobject]@{
     when  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
     excel = $xl.Version

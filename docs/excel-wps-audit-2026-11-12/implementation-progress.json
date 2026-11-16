@@ -4453,7 +4453,9 @@
             "crates/core/tests/qa06_array.rs",
             "crates/core/tests/fixtures/qa06a/blocks.tsv",
             "scripts/qa06_array_fixture.py",
-            "scripts/qa06_array_probe.ps1"
+            "scripts/qa06_array_probe.ps1",
+            "crates/core/tests/fixtures/qa06a/spill_conflict.tsv",
+            "crates/core/tests/fixtures/qa06a/spill_cleared.tsv"
           ],
           "commits": [
             "f508125"
@@ -4461,17 +4463,20 @@
           "commands": [
             "python scripts/qa06_array_fixture.py work/qa06a -> 12 个数组公式锚点",
             "powershell -File scripts/qa06_array_probe.ps1 -> \"Excel 16.0：12 个数组块\"（4 条本机 #NAME? 标记 SKIP）",
-            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 --nocapture -> 2 passed（溢出 40 格一致；增量 12 格、1040 格与全量一致）"
+            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 --nocapture -> 2 passed（溢出 40 格一致；增量 12 格、1040 格与全量一致）",
+            "python scripts/qa06_array_fixture.py work/qa06a -> 12 锚点 + 3 溢出冲突",
+            "powershell -File scripts/qa06_array_probe.ps1 F:/finance-native-sheets-ready/work/qa06a -> spill_conflict.tsv / spill_cleared.tsv",
+            "cargo test -p sheetcore --test qa06_array -- --test-threads=2 -> 3 passed（冲突 3 条 + 恢复 12 格）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-array-spill.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/blocks.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/anchor.tsv",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/probe-meta.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/qa06a.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2a/qa06a.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa06-2-spill-conflict.txt"
           ],
           "not_done": [
-            "#SPILL! 冲突与溢出清理只在单测里，未进 Excel 对拍矩阵",
             "迭代计算/循环引用下的增量一致未覆盖",
             "LAMBDA/MAP/BYROW 本机 Excel 不支持（#NAME?），单列不计"
           ],
