@@ -22035,11 +22035,21 @@ let txn = self.txn_begin(&keys);
                                     }
                                 }
                             });
-                        if ui.small_button("↑").clicked() && i > 0 {
-                            spec.rows.swap(i, i - 1);
+                        if ui.small_button("↑").clicked() {
+                            sheetcore::pivot_multi::move_axis(
+                                &mut spec,
+                                sheetcore::pivot_multi::Axis::Rows,
+                                i,
+                                -1,
+                            );
                         }
-                        if ui.small_button("↓").clicked() && i + 1 < n {
-                            spec.rows.swap(i, i + 1);
+                        if ui.small_button("↓").clicked() {
+                            sheetcore::pivot_multi::move_axis(
+                                &mut spec,
+                                sheetcore::pivot_multi::Axis::Rows,
+                                i,
+                                1,
+                            );
                         }
                         if ui.small_button("×").clicked() {
                             spec.rows.remove(i);
@@ -22069,11 +22079,21 @@ let txn = self.txn_begin(&keys);
                                     }
                                 }
                             });
-                        if ui.small_button("↑").clicked() && i > 0 {
-                            spec.cols.swap(i, i - 1);
+                        if ui.small_button("↑").clicked() {
+                            sheetcore::pivot_multi::move_axis(
+                                &mut spec,
+                                sheetcore::pivot_multi::Axis::Cols,
+                                i,
+                                -1,
+                            );
                         }
-                        if ui.small_button("↓").clicked() && i + 1 < n {
-                            spec.cols.swap(i, i + 1);
+                        if ui.small_button("↓").clicked() {
+                            sheetcore::pivot_multi::move_axis(
+                                &mut spec,
+                                sheetcore::pivot_multi::Axis::Cols,
+                                i,
+                                1,
+                            );
                         }
                         if ui.small_button("×").clicked() {
                             spec.cols.remove(i);

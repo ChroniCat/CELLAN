@@ -6938,9 +6938,18 @@ fn multi_field_pivot_refresh_clears_old_cells() {
         layout: PivotLayout::default(),
     };
     let rect = app.apply_pivot2(&spec, (10, 0), None, false);
-    assert_eq!(app.wb.sheet(0).get(12, 0).map(|c| c.value.display()).unwrap_or_default(), "华北");
+    // 表头行数随「列字段 + 多值总计列」变化，按行找「华北」再核对值，别写死行号
+    let sheet = app.wb.sheet(0);
+    let mut found = None;
+    for r in 10..rect.3 + 10 {
+        if sheet.get(r, 0).map(|c| c.value.display()).as_deref() == Some("华北") {
+            found = Some(r);
+            break;
+        }
+    }
+    let row = found.expect("网格里应有「华北」行");
     assert_eq!(
-        app.wb.sheet(0).get(12, 2).map(|c| c.value.display()).unwrap_or_default(),
+        sheet.get(row, 2).map(|c| c.value.display()).unwrap_or_default(),
         "20"
     );
     // 取消筛选后天津回来，总行数变多；刷新必须清掉旧网格

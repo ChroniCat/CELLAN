@@ -830,3 +830,25 @@ fn multi_value_with_col_field_matches_excel() {
     let _ = std::fs::remove_file(keep);
     std::fs::copy(&path, keep).ok();
 }
+
+#[test]
+fn move_axis_changes_nesting_and_ignores_out_of_range() {
+    use sheetcore::pivot_multi::{Axis, move_axis};
+    let fx = Fixture::new("moveaxis");
+    let path = fx.file("moveaxis.xlsx");
+    let wb = book(&path);
+    let mut spec = spec_b();
+    let before = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    // 单行字段时不能上移
+    assert!(!move_axis(&mut spec, Axis::Rows, 0, -1));
+    assert!(!move_axis(&mut spec, Axis::Rows, 0, 1));
+    // 追加一个行字段后调序会改变层级
+    spec.rows.push(AxisField { col: 1, group: sheetcore::pivot::GroupBy::None });
+    let nested = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    assert_ne!(before.headers, nested.headers, "加第二个行字段后表头应变化");
+    assert!(move_axis(&mut spec, Axis::Rows, 1, -1));
+    let swapped = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
+    assert_eq!(spec.rows[0].col, 1);
+    assert_ne!(nested.headers, swapped.headers, "交换层级后表头应变化");
+    assert!(!move_axis(&mut spec, Axis::Rows, 0, -1));
+}

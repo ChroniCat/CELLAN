@@ -580,6 +580,27 @@ pub fn write_grid(sheet: &mut Sheet, at: (u32, u32), grid: &PivotGrid) -> (u32, 
     (r0, c0, r.saturating_sub(1), c0 + cols.saturating_sub(1))
 }
 
+/// 字段面板里可调序的轴
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Axis {
+    Rows,
+    Cols,
+}
+
+/// 面板上的 ↑/↓：交换同一轴内两个字段的位置（即改变层级），越界返回 false。
+pub fn move_axis(spec: &mut PivotSpec2, axis: Axis, i: usize, delta: isize) -> bool {
+    let v = match axis {
+        Axis::Rows => &mut spec.rows,
+        Axis::Cols => &mut spec.cols,
+    };
+    let j = i as isize + delta;
+    if j < 0 || j as usize >= v.len() {
+        return false;
+    }
+    v.swap(i, j as usize);
+    true
+}
+
 /// 计算项：在网格里追加一行「若干行标签之和」（Excel 的计算项就是这么落地的：
 /// rowItems 与数据区都要多一行，只改 XML 定义会让 Excel 判文件坏）。
 ///
