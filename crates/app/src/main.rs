@@ -29747,6 +29747,7 @@ impl eframe::App for SheetApp {
                             .max_rect(ed_rect)
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
+                    let fx_a11y = cur.clone();
                     let resp = child
                         .add(
                             egui::Label::new(
@@ -29758,6 +29759,13 @@ impl eframe::App for SheetApp {
                             .sense(egui::Sense::click()),
                         )
                         .interact(egui::Sense::click());
+                    // UI-24.2/QA-05.1：编辑栏空闲时也要在 UIA 里是 Edit（Excel 就是这样），
+                    // 只读实现是 Label，所以显式给 TextInput 角色 + 值。
+                    let _ = ui.ctx().accesskit_node_builder(resp.id, |node| {
+                        node.set_role(egui::accesskit::Role::TextInput);
+                        node.set_label("编辑栏".to_string());
+                        node.set_value(fx_a11y);
+                    });
                     if resp.clicked() {
                         self.focus_edit(EditSpot::FormulaBar);
                     }
@@ -29965,10 +29973,14 @@ impl eframe::App for SheetApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
+                        // 状态栏只有 22px 高：控件一律压到 18px，否则按钮会顶出面板底边
+                        // （UIA 实测 100% 按钮曾是 1440×900 下 y=1216..1240，底边 1238）。
+                        ui.spacing_mut().interact_size.y = 18.0;
                         // 缩放百分比
                         let ztext = format!("{:.0}%", self.zoom * 100.0);
                         if ui
-                            .add(
+                            .add_sized(
+                                [44.0, 18.0],
                                 egui::Button::new(
                                     egui::RichText::new(ztext).size(11.0).color(ui_kit::TEXT),
                                 )

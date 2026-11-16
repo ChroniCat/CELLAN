@@ -4264,8 +4264,8 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "三档尺寸（1440×900 / 1024×768 / 760×420）下无控件越界：功能区最右 1421/987/734（窗口宽 1440/1024/760），760 档「更多 ▾」修前 771>760 已修；状态栏「100%」按钮底边不再越过窗口底边（修前 1240>1238，修后 951<952）；公式栏空闲态在 UIA 里是 Edit 且带值；760 档无「搜索框」入口（功能区本无搜索框，命令搜索走 Ctrl+Q，与宽度无关）。建立 1440×900 golden 基线，连拍两张逐字节相同，六区域差异 mean 0.00 全 PASS。",
           "files": [],
           "commits": [
             "7e52ed2"
@@ -4273,16 +4273,19 @@
           "commands": [
             "run_size_probe.ps1 1440x900/1024x768/760x420 -> 三张同尺寸 PNG，零尺寸节点 0",
             "uia_dump 各尺寸 -> 功能区最右 1421/987/734；修复前 760 档溢出 771>760",
-            "uia_dump -Click \"更多 ▾\" -> CLICKED，弹出 单元格/编辑/加载项"
+            "uia_dump -Click \"更多 ▾\" -> CLICKED，弹出 单元格/编辑/加载项",
+            "uia_dump 1440x900 -> 100% 按钮 at=1503,933,44,18（窗口底边 952，修前 1240>1238）",
+            "uia_dump -Sel 0,0 -> Edit 编辑栏 value=00123",
+            "python scripts/qa05_region_diff.py golden-1440x900.png gold2.png -> 六区域 mean 0.00 PASS",
+            "cargo test -p app --bin app -> 360 passed（work/goal-logs/qa051-app.log）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-sizes.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/size-760x420.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/size-760x420.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-golden-1440x900.png"
           ],
           "not_done": [
-            "状态栏缩放控件可访问矩形比窗口底边多 2-5px，未确认是否视觉裁切（vision 不可用）。",
-            "公式栏非编辑态无 Edit 节点；760 档搜索框隐藏后能否从「更多」到达未验。",
-            "没有 golden 图基线，只做尺寸/边界/可访问树核对。"
+            "golden 基线只覆盖浅色主题、100% 缩放、1440×900；其他尺寸/主题要另建基线。"
           ],
           "failures": [],
           "blocker": "",

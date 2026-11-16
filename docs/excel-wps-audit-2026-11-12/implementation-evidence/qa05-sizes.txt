@@ -55,3 +55,29 @@ Button 加载项 at=848,324,54,24
 - app 测试 **341 passed**（`work/goal-logs/qa051-app.log`）。
 - 原始材料：`work/probe/qa05/size-*.png`、`work/probe/qa05/uia-s2-*.txt`、
   `work/probe/qa05/uia-more760b.txt`（含 CLICKED 与折叠组）。
+
+## 补充（2026-11-17）：三条 not_done 收口
+
+### 1. 状态栏缩放控件溢出窗口底边（已修）
+UIA 实测（1440×900，`uia_dump.ps1`）：
+- 修前：窗口 `rect=401,338,1440,900`（底边 1238），`100%` 按钮 `at=1804,1216,28,24`（底边 **1240**，多 2px）。
+- 根因：状态栏面板固定 22px，而按钮走默认 `interact_size.y`（24），垂直居中后上下各顶 1px。
+- 修法：状态栏缩放那一行 `ui.spacing_mut().interact_size.y = 18.0`，`100%` 按钮改 `add_sized([44,18])`。
+- 修后：窗口 `rect=115,52,1440,900`（底边 952），按钮 `at=1503,933,44,18`（底边 **951**）→ 不再越界。
+
+### 2. 公式栏空闲态在 UIA 里是 Edit（已补）
+原来空闲态只是一个 `Label`（文本），UIA 树里没有 Edit 节点，屏幕阅读器读不到当前单元格内容。
+现在给这个 Label 显式挂 accesskit `Role::TextInput` + `label="编辑栏"` + `value=<单元格显示文本>`。
+UIA 实测（A1 选中）：`Edit 名称框 value=A1` / `Edit 编辑栏 value=00123 at=397,355,37,16`。
+
+### 3. 760 档「搜索框」的真相
+功能区**没有**搜索框（代码里只有字体/字号两个输入框和 Ctrl+Q 命令搜索），所以「隐藏后能否从更多到达」
+这个前提不成立。命令搜索走 Ctrl+Q 全局浮层（`command_palette`），与窗口宽度无关，760×420 下同样可用；
+字体/字号框在 760 档仍可见（UIA：`Edit 字体` / `Edit 字号` 均在树里）。
+
+### 4. golden 图基线（已建）
+- 基线：`qa05-golden-1440x900.png`（1440×900、100% 缩放、fixture.xlsx）
+- `sha256=f1c148ca39bccc1239486e4d422c2a7d7ce6469648548b8e2fc9e88d8e518892`
+- 连拍两张逐字节相同（渲染确定性），六区域差异全部 `mean 0.00 / big 0.00`：
+  title / ribbon / formula / grid / tabs / status 全 PASS。
+- 复跑：`python scripts/qa05_region_diff.py <基线> <新图>`，门槛见 `qa05-visual-spec.md`。
