@@ -8800,6 +8800,36 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     /// 撤销 / 重做
+    /// QA-04.1：文件级快捷键。实测发现 Ctrl+S / Ctrl+Z / Ctrl+Y 此前完全没绑键，
+    /// 只有功能区和快速访问按钮能点到（`grep "Key::Z"` 只命中自动化按键解析）。
+    /// 返回 true 表示这一帧的按键已被消费。
+    fn handle_file_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if self.editing.is_some() {
+            return false; // 编辑态交给 TextEdit 自己处理文本级撤销
+        }
+        let (save, undo, redo_y, shift) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(Key::S),
+                i.modifiers.command && i.key_pressed(Key::Z),
+                i.modifiers.command && i.key_pressed(Key::Y),
+                i.modifiers.shift,
+            )
+        });
+        if save {
+            self.save(shift);
+            return true;
+        }
+        if undo {
+            self.do_undo(shift);
+            return true;
+        }
+        if redo_y {
+            self.do_undo(true);
+            return true;
+        }
+        false
+    }
+
     fn do_undo(&mut self, redo: bool) {
         if self.editing.is_some() {
             return;
@@ -10296,6 +10326,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
         // 常用选择/格式快捷键（编辑区由 TextEdit 优先处理，见上）
         let ctrl_shortcut = ctx.input(|i| i.modifiers.command && !i.modifiers.alt);
+        // 文件级快捷键（Ctrl+S / Ctrl+Z / Ctrl+Y）单独抽出来，便于用真实 egui 事件做回归
+        if self.handle_file_shortcuts(ctx) {
+            return;
+        }
         if ctrl_shortcut && ctx.input(|i| i.key_pressed(Key::B)) {
             self.ribbon_action("Bold", ctx);
             return;

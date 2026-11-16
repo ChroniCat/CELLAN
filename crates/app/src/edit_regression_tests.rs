@@ -8926,3 +8926,63 @@ fn five_interaction_states_are_visually_distinct() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// QA-04.1 文件级快捷键：Ctrl+Z / Ctrl+Y 必须真的生效（此前完全没绑键）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_z_and_ctrl_y_drive_undo_and_redo() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.editing = Some(EditState::new("7".into()));
+    app.commit_edit(None);
+    let before = app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default();
+    assert_eq!(before, "7", "前提：先写进一个值");
+
+    let key = |k: egui::Key, mods: egui::Modifiers| egui::Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    };
+    let ctrl = egui::Modifiers { command: true, ..Default::default() };
+    let ctrl_shift = egui::Modifiers { command: true, shift: true, ..Default::default() };
+
+    fn run(
+        app: &mut SheetApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mods: egui::Modifiers,
+    ) {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        input.events = events;
+        input.modifiers = mods;
+        let _ = ctx.run(input, |ctx| {
+            app.handle_file_shortcuts(ctx);
+        });
+    }
+
+    run(&mut app, &ctx, vec![key(egui::Key::Z, ctrl)], ctrl);
+    let undone = app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default();
+    assert_ne!(undone, "7", "Ctrl+Z 没有撤销刚写入的值");
+
+    run(&mut app, &ctx, vec![key(egui::Key::Y, ctrl)], ctrl);
+    let redone = app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default();
+    assert_eq!(redone, "7", "Ctrl+Y 没有重做");
+
+    // Ctrl+Shift+Z 也当重做：先撤销，再用 Shift 组合键重做
+    run(&mut app, &ctx, vec![key(egui::Key::Z, ctrl)], ctrl);
+    run(&mut app, &ctx, vec![key(egui::Key::Z, ctrl_shift)], ctrl_shift);
+    let redone2 = app.wb.sheet(0).get(0, 0).map(|c| c.value.display()).unwrap_or_default();
+    assert_eq!(redone2, "7", "Ctrl+Shift+Z 没有重做");
+}
