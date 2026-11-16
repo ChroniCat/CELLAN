@@ -182,6 +182,9 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     // 收集：行标签 → (列标签 → 值列表)。Count 只数非空格（数字/文本都算），
     // 空白格不能以 0 混进计数。
     let mut data: BTreeMap<String, BTreeMap<String, Vec<PivotVal>>> = BTreeMap::new();
+    // Excel 透视表默认按「源表出现顺序」排列行/列标签，不排序
+    let mut row_order: Vec<String> = Vec::new();
+    let mut col_order: Vec<String> = Vec::new();
     for r in (r1 + 1)..=r2 {
         let raw = sheet
             .get(r, spec.row_field)
@@ -206,6 +209,12 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         };
         // 先建立分组标签，再决定是否纳值。否则某个标签下的值全为空时，
         // 整行/整列会从结果里消失（Excel 仍保留标签，全空组的 Count 显示空白）。
+        if !row_order.iter().any(|k| k == &key) {
+            row_order.push(key.clone());
+        }
+        if !col_order.iter().any(|k| k == &col_key) {
+            col_order.push(col_key.clone());
+        }
         let entry = data.entry(key).or_default().entry(col_key).or_default();
         if spec.agg == Agg::Count {
             if nonempty {
@@ -216,18 +225,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         }
     }
 
-    let mut col_keys: Vec<String> = Vec::new();
-    for m in data.values() {
-        for k in m.keys() {
-            if !col_keys.contains(k) {
-                col_keys.push(k.clone());
-            }
-        }
-    }
-    col_keys.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.cmp(b),
-    });
+    let col_keys: Vec<String> = col_order;
 
     let mut headers = vec![row_name.clone()];
     headers.extend(col_keys.iter().cloned());
@@ -238,7 +236,8 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let mut rows = Vec::new();
     let mut grand: Vec<Vec<PivotVal>> = vec![Vec::new(); col_keys.len()];
     let mut grand_all: Vec<PivotVal> = Vec::new();
-    for (key, m) in data.iter() {
+    for key in row_order.iter() {
+        let m = &data[key];
         let mut line = vec![Value::Text(key.as_str().into())];
         let mut row_vals: Vec<PivotVal> = Vec::new();
         for (i, ck) in col_keys.iter().enumerate() {
@@ -266,6 +265,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     }
 
     PivotResult { headers, rows, row_name, value_name, col_name, value_caption }
+}
+
+/// 排序键：非 ASCII 文本按 GBK 编码比较（GB2312 一级汉字按拼音排列，与 Excel 中文排序一致）
+fn collate_key(s: &str) -> Vec<u8> {
+    if s.is_ascii() {
+        return s.as_bytes().to_vec();
+    }
+    let (bytes, _, _) = encoding_rs::GBK.encode(s);
+    bytes.into_owned()
 }
 
 /// Excel 值字段标题的前缀
@@ -416,11 +424,14 @@ mod tests {
             exclude: Vec::new(),
         };
         let res = compute(&s, &spec);
-        assert_eq!(res.headers, vec!["部门", "1月", "2月"]);
+        // 有列字段时 Excel 末尾多一列「总计」
+        assert_eq!(res.headers, vec!["部门", "1月", "2月", "总计"]);
         assert_eq!(res.rows[0][1], Value::Number(120.0), "研发 1月 100+20");
         assert_eq!(res.rows[0][2], Value::Number(150.0));
         assert_eq!(res.rows[1][1], Value::Number(200.0));
         assert_eq!(res.rows[1][2], Value::Number(50.0));
+        assert_eq!(res.rows[0][3], Value::Number(270.0), "研发 总计 100+150+20");
+        assert_eq!(res.rows[1][3], Value::Number(250.0), "销售 总计 200+50");
     }
 
     #[test]

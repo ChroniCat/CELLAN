@@ -3408,7 +3408,9 @@
             "cargo test -p sheetcore --test pivot_real -> 3 passed（含版本属性断言）",
             "Excel COM 只读打开 pivot-fixed.xlsx -> pivots=1",
             "cargo test -p sheetcore --test pivot_real -> 5 passed",
-            "c12_layout_compare.ps1 -> 表头行一致，diff 2/14 仅两行顺序（行政/销售）"
+            "c12_layout_compare.ps1 -> 表头行一致，diff 2/14 仅两行顺序（行政/销售）",
+            "c12_layout_compare.ps1 -> rows 14 14 diff 0 SAME",
+            "cargo test -p sheetcore -> 107 二进制 0 failed；app 361 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt",
@@ -3459,12 +3461,12 @@
             "WPS 改字段往返：可读写（pivots=1、rows/cols/data 各 1），但 WPS 保存后丢一个字段（源有 产品 列字段，回来只剩 地区），缓存 1300B→773B、sharedItems 3→2；WPS 侧降级，证据 c12-4/wps-roundtrip.md 更正节。",
             "更正：之前「pivotCacheDefinition 缺版本属性导致 Excel 丢弃透视表」是探针假象（错误写法 $ws.PivotTables.Item(1)）；稳定探针下 pivot-real 与 multi-A/D 均 pivots=1。版本属性保留为加固，不记为缺陷修复。",
             "已修：有列字段时的两行表头/总计列/colItems grand/去 refreshOnLoad（Excel 不再重建，cacheId 保持 1，表头一致）。",
-            "未修：中文行标签排序——我们按 Unicode 码点（行政<销售），Excel 按拼音（销售<行政），需引入拼音排序键。"
+            "压缩布局已验收：两行表头/总计列/colItems grand/去 refreshOnLoad + 出现顺序排序，TSV 14/14 全同，Excel 不再重建（cacheId 保持 1）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "C12 四切片齐；等用户按生产口径复核",
-          "updated_utc": "2026-11-16T20:06:35Z"
+          "updated_utc": "2026-11-16T20:24:38Z"
         }
       ]
     },

@@ -165,3 +165,28 @@ locale 排序规则），这是一个独立改动，未做。
 
 - 几何/表头/总计列：**已修**，Excel 不再重建（cacheId 保持 1，location 与表头行数与我们定义一致）；
 - 中文排序：**未修**，明确登记；修好之前 C12.4 的压缩布局按「内容一致、顺序不一致」记录，不算全同。
+
+## 收口：TSV 14/14 全同（2026-11-17）
+
+排序问题查清了一半、修对了另一半：
+
+- **不是拼音排序**。第一次尝试按 GBK 编码排序（GB2312 一级字库≈拼音序），结果列标签变成
+  「李四/钱七/王五/张三/赵六」，与 Excel 的「张三/李四/王五/赵六/钱七」也不符——说明 Excel
+  在这张透视表上根本没排序。
+- **Excel 默认按源表出现顺序**排列行/列标签（透视表创建时未加排序规则）。
+  我们把 `BTreeMap` 迭代改成记录首次出现的 `row_order`/`col_order`，两个维度都按出现顺序输出。
+
+重跑 `c12_layout_compare.ps1`：
+
+```
+rows 14 14 diff 0
+SAME
+```
+
+即 `ours.tsv` 与 Excel `RowAxisLayout(1)` 后的 `ref.tsv` **14 行 7 列逐字节相同**，
+表头、总计列、总计行、缩进全部一致。
+
+回归：`pivot_real` 5 passed、`pivot_structure` 7 passed、`pivot_multi_parts` 4 passed、
+`pivot_file` 6 passed、core 全量 **107 个测试二进制 0 failed**、app **361 passed**。
+
+产物：`c12-4/layout-ours-after-fix.tsv`、`c12-4/layout-ref-after-fix.tsv`。
