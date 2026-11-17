@@ -7464,15 +7464,16 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
-          "acceptance": "活动单元格已暴露 UIA SelectionItemPattern（IsSelected=True），行号/列标同；HelpText 给出「第 r 行、第 c 列、合并 A1:B2、冻结窗格内、隐藏行/隐藏列」；网格为 DataGrid 且带选区摘要。UIA 选中事件已在本仓库 vendored 适配层实现，但本会话 UIA 事件回调全为 0，未取得观测证据。",
+          "status": "已验收",
+          "acceptance": "单元格经 UIA 暴露 DataItem/Cell 语义：Name=单元格名、HelpText=行列/合并/冻结/隐藏、SelectionItemPattern.IsSelected 可读；网格节点名含工作表/选区/活动单元格；选区移动由真实 UIA 客户端收到 ElementSelected 事件。",
           "files": [
             "crates/app/src/main.rs",
             "vendor/accesskit_windows/src/node.rs",
             "vendor/accesskit_windows/src/adapter.rs",
             "Cargo.toml",
             "crates/core/tests/fixtures/qa09/a11y.xlsx",
-            "scripts/make_qa09_fixtures.py"
+            "scripts/make_qa09_fixtures.py",
+            "scripts/uia_event_probe.cs"
           ],
           "commits": [
             "d8a8619"
@@ -7480,18 +7481,19 @@
           "commands": [
             "cargo build -q -p app --offline -j 2",
             "SC_SEL=0,0 target/debug/app.exe crates/core/tests/fixtures/qa09/a11y.xlsx + powershell work/probe/uia_a11y_check.ps1",
-            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0"
+            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0",
+            "C# STA UIA 客户端按 PID 挂 SelectionItemPattern.ElementSelectedEvent + SC_SEL_STEP -> 24 条 EVENT DataItem，A1/A2/A3/A4 随选区变化"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-3-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-3-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-3-events-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-3-events.txt"
           ],
-          "not_done": [
-            "UIA 选中事件回调未能在本会话观测（AutomationFocusChangedEventHandler 同样 0 回调，环境不投递 UIA 事件）；实现已在 vendor/accesskit_windows 的 node_added 补发 ElementSelected。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补选区变化的 UIA 通知（LiveRegion/NotificationEvent）；再评估 accesskit 版本升级是否值得。",
-          "updated_utc": "2026-11-17T15:50:00Z"
+          "next": "",
+          "updated_utc": "2026-11-17T18:10:00Z"
         }
       ]
     },
