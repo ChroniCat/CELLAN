@@ -94,3 +94,22 @@ Excel COM 回读 wps-ribbon4.xlsx：
 cargo test -p app --offline -j 2 --bin app -- --test-threads=2 → 302 passed, 0 failed
 cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 → 295 passed, 0 failed
 日志：work/goal-logs/ui07-app10.log、work/goal-logs/ui07-core2.log
+
+十、2026-11-18 Excel→Excel 原生剪贴板格式复核
+用 C# STA 客户端在 Excel 复制 `A1=5, B1==A1*2, B2==SUM(A1:B1)` 后抓取全部格式：
+  Biff12: id=50157 bytes=6360  — 实际是 XLSB 包（xl/workbook.bin、xl/worksheets/sheet1.bin），不是 xlsx zip
+  Biff8: id=50135 bytes=13824  — CFB / Workbook 流
+  Embed Source: id=49163 bytes=13824
+  XML Spreadsheet: id=50011 bytes=926 — 只有缓存值，没有 <Cell ss:Formula>
+  HTML Format: id=49261 bytes=4460 — 只有显示值
+实测：
+  1) 把 Excel 自己产生的 Biff8（13824B）放回剪贴板再粘贴：B2formula=10，公式丢失，只有值。
+  2) 本项目 xls_write 生成的 biff8_formula.xls 在 Excel 打开时 B1formula==A1*2，
+     但经 Biff8 剪贴板粘贴仍只得到值；说明 Biff8 剪贴板通道本身不承载公式。
+  3) 只设置 Biff12（Excel 自己的 6360B XLSB）后 Excel 粘贴无响应/超时；
+     说明单独 Biff12 不足以让 Excel 完成粘贴，正常复制还依赖 Embed Source 等组合格式。
+  4) 本项目之前的 biff12_src.xlsx 是 xlsx zip，不符合 Biff12 的 XLSB 包结构，
+     因此 Excel 粘贴卡住并非样式/calcChain 缺项，而是格式语义不对。
+结论：App→Excel 的普通粘贴要保留公式，必须写 XLSB（Biff12）或 OLE Embed Source；
+当前 core 只有 xlsb 读取（calamine），没有 xlsb 写入器，Biff8/XML/HTML 都不行。
+这项仍是未通过，不计入已验收。
