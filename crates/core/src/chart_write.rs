@@ -6,6 +6,38 @@ use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::path::Path;
 
+/// 数据标签 XML：按 Excel 的元素顺序写 showVal/showCatName/showSerName/showPercent/
+/// showLegendKey/leaderLines/dLblPos，位置串直接用 OOXML 的值（ctr/outEnd/...）。
+fn any_labels(ch: &crate::charts::Chart) -> bool {
+    let o = &ch.label_opts;
+    ch.show_labels
+        || o.show_cat
+        || o.show_ser
+        || o.show_pct
+        || o.show_legend_key
+        || o.leader_lines
+        || !o.position.is_empty()
+}
+
+fn dlbls_xml(ch: &crate::charts::Chart) -> String {
+    let o = &ch.label_opts;
+    let b = |v: bool| if v { "1" } else { "0" };
+    let mut s = String::from("<c:dLbls>");
+    s.push_str(&format!("<c:showVal val=\"{}\"/>", b(ch.show_labels)));
+    s.push_str(&format!("<c:showCatName val=\"{}\"/>", b(o.show_cat)));
+    s.push_str(&format!("<c:showSerName val=\"{}\"/>", b(o.show_ser)));
+    s.push_str(&format!("<c:showPercent val=\"{}\"/>", b(o.show_pct)));
+    s.push_str(&format!("<c:showLegendKey val=\"{}\"/>", b(o.show_legend_key)));
+    if o.leader_lines {
+        s.push_str("<c:showLeaderLines val=\"1\"/>");
+    }
+    if !o.position.is_empty() {
+        s.push_str(&format!("<c:dLblPos val=\"{}\"/>", esc(&o.position)));
+    }
+    s.push_str("</c:dLbls>");
+    s
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -64,6 +96,7 @@ pub fn chart_from_selection(
         part: String::new(),
         drawing: String::new(),
         show_labels: false,
+        label_opts: Default::default(),
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
@@ -89,12 +122,28 @@ fn series_body_at(ch: &crate::charts::Chart, offset: usize) -> String {
             Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
             None => PALETTE[i % PALETTE.len()].to_string(),
         };
+        // CT_BarSer / CT_LineSer 的子元素顺序：idx, order, tx, spPr, [marker], dLbls, cat, val。
+        // dLbls 必须排在 cat/val 之前，否则 Excel 直接判文件损坏（实测打开即 COMException）。
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
         out.push_str(&format!(
             "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
             esc(&s.name_ref),
             esc(&s.name)
         ));
+        let line = matches!(ch.kind, crate::charts::ChartKind::Line);
+        if line {
+            out.push_str(&format!(
+                "<c:spPr><a:ln w=\"28575\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
+            ));
+            out.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>");
+        } else {
+            out.push_str(&format!(
+                "<c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></c:spPr>"
+            ));
+        }
+        if any_labels(ch) {
+            out.push_str(&dlbls_xml(ch));
+        }
         out.push_str(&format!(
             "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{}\"/>",
             esc(&s.cat_ref),
@@ -113,19 +162,6 @@ fn series_body_at(ch: &crate::charts::Chart, offset: usize) -> String {
             out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
         }
         out.push_str("</c:numCache></c:numRef></c:val>");
-        if ch.show_labels {
-            out.push_str("<c:dLbls><c:showVal val=\"1\"/><c:showSerName val=\"0\"/><c:showCatName val=\"0\"/><c:showLegendKey val=\"0\"/></c:dLbls>");
-        }
-        if matches!(ch.kind, crate::charts::ChartKind::Line) {
-            out.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>");
-            out.push_str(&format!(
-                "<c:spPr><a:ln w=\"28575\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
-            ));
-        } else {
-            out.push_str(&format!(
-                "<c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></c:spPr>"
-            ));
-        }
         out.push_str("</c:ser>");
     }
     out
@@ -138,13 +174,20 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
             Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
             None => PALETTE[i % PALETTE.len()].to_string(),
         };
+        // CT_ScatterSer 顺序：idx, order, tx, spPr, marker, dLbls, xVal, yVal
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
         out.push_str(&format!(
             "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
             esc(&s.name_ref),
             esc(&s.name)
         ));
-        // X：分类能转数字就用，否则用序号
+        out.push_str(&format!(
+            "<c:spPr><a:ln w=\"19050\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
+        ));
+        out.push_str("<c:marker><c:symbol val=\"circle\"/></c:marker>");
+        if any_labels(ch) {
+            out.push_str(&dlbls_xml(ch));
+        }
         out.push_str("<c:xVal><c:numRef><c:f>");
         out.push_str(&esc(&s.cat_ref));
         out.push_str("</c:f><c:numCache><c:formatCode>General</c:formatCode>");
@@ -163,16 +206,11 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
             out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
         }
         out.push_str("</c:numCache></c:numRef></c:yVal>");
-        if ch.show_labels {
-            out.push_str("<c:dLbls><c:showVal val=\"1\"/></c:dLbls>");
-        }
-        out.push_str(&format!(
-            "<c:spPr><a:ln w=\"19050\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
-        ));
         out.push_str("</c:ser>");
     }
     out
 }
+
 
 
 /// 坐标轴标题与 Y 轴范围的补丁：在生成好的 XML 上做替换，避免改动大段字面量
@@ -233,6 +271,7 @@ fn axis_fix(mut xml: String, ch: &crate::charts::Chart) -> String {
 }
 
 /// 测试用：直接拿到整段 chart XML
+
 pub fn chart_xml_for_test(ch: &crate::charts::Chart) -> String {
     chart_xml(ch)
 }
@@ -561,6 +600,20 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = xml;
                 if !x.contains("<drawing ") {
+                    // 工作表根常常没有 xmlns:r（只有 drawing/超链接才用得上）。直接写 r:id
+                    // 会变成未绑定前缀，Excel 打开即报「不能取得 Workbooks 的 Open 属性」。
+                    // 跳过 <?xml ... ?> 声明：它的 '>' 也在，直接 find('>') 会把属性插进声明里
+                    let decl_end = x.find("?>").map(|i| i + 2).unwrap_or(0);
+                    if let Some(rel) = x[decl_end..].find('>') {
+                        let root_end = decl_end + rel;
+                        if !x[..root_end].contains("xmlns:r=") {
+                            let head = format!(
+                                "{} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+                                &x[..root_end]
+                            );
+                            x = format!("{head}{}", &x[root_end..]);
+                        }
+                    }
                     let tag = format!("<drawing r:id=\"rId{next_rid}\"/>");
                     if let Some(i) = x.find("</worksheet>") {
                         x = format!("{}{}{}", &x[..i], tag, &x[i..]);

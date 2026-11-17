@@ -21651,7 +21651,76 @@ let txn = self.txn_begin(&keys);
                     ui.text_edit_singleline(&mut ch.title);
                     ui.end_row();
                     ui.label("数据标签");
-                    ui.checkbox(&mut ch.show_labels, "显示数值");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut ch.show_labels, "值");
+                        ui.checkbox(&mut ch.label_opts.show_cat, "类别");
+                        ui.checkbox(&mut ch.label_opts.show_ser, "系列");
+                        ui.checkbox(&mut ch.label_opts.show_pct, "百分比");
+                        ui.checkbox(&mut ch.label_opts.show_legend_key, "图例项");
+                        ui.checkbox(&mut ch.label_opts.leader_lines, "引导线");
+                    });
+                    ui.end_row();
+                    ui.label("标签位置");
+                    egui::ComboBox::from_id_salt("dlbl_pos")
+                        .selected_text(match ch.label_opts.position.as_str() {
+                            "ctr" => "居中",
+                            "inBase" => "轴内侧",
+                            "inEnd" => "数据标签内",
+                            "outEnd" => "数据标签外",
+                            "bestFit" => "最佳位置",
+                            "l" => "靠左",
+                            "r" => "靠右",
+                            "t" => "靠上",
+                            "b" => "靠下",
+                            _ => "默认",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (k, label) in [
+                                ("", "默认"),
+                                ("ctr", "居中"),
+                                ("inBase", "轴内侧"),
+                                ("inEnd", "数据标签内"),
+                                ("outEnd", "数据标签外"),
+                                ("bestFit", "最佳位置"),
+                                ("l", "靠左"),
+                                ("r", "靠右"),
+                                ("t", "靠上"),
+                                ("b", "靠下"),
+                            ] {
+                                if ui.selectable_label(ch.label_opts.position == k, label).clicked() {
+                                    ch.label_opts.position = k.to_string();
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("系列引用");
+                    ui.collapsing("逐系列引用（高级）", |ui| {
+                        for (i, se) in ch.series.iter_mut().enumerate() {
+                            ui.label(format!("系列{}", i + 1));
+                            ui.horizontal(|ui| {
+                                ui.label("名称");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut se.name_ref)
+                                        .desired_width(210.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("分类");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut se.cat_ref)
+                                        .desired_width(210.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("数值");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut se.val_ref)
+                                        .desired_width(210.0),
+                                );
+                            });
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("图例");
@@ -21775,6 +21844,7 @@ let txn = self.txn_begin(&keys);
                 fresh.legend = ch.legend;
                 fresh.legend_pos = ch.legend_pos.clone();
                 fresh.show_labels = ch.show_labels;
+                fresh.label_opts = ch.label_opts.clone();
                 fresh.axis_x = ch.axis_x.clone();
                 fresh.axis_y = ch.axis_y.clone();
                 fresh.y_min = ch.y_min;

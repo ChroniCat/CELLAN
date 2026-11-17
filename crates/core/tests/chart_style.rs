@@ -38,6 +38,7 @@ fn sample() -> Chart {
         part: String::new(),
         drawing: String::new(),
         show_labels: false,
+        label_opts: sheetcore::charts::LabelOpts::default(),
         ref_fixes: Vec::new(),
         axis_x: "月份".into(),
         axis_y: "件数".into(),

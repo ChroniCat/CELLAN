@@ -65,6 +65,23 @@ pub struct Series {
     pub secondary: bool,
 }
 
+/// 数据标签的逐项选项（Excel「设置数据标签格式」里的那组勾选）
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LabelOpts {
+    /// 类别名称
+    pub show_cat: bool,
+    /// 系列名称
+    pub show_ser: bool,
+    /// 百分比（饼图/圆环）
+    pub show_pct: bool,
+    /// 图例项标识
+    pub show_legend_key: bool,
+    /// 引导线（饼图）
+    pub leader_lines: bool,
+    /// 标签位置：ctr/inBase/outEnd/bestFit/l/r/t/b，空=默认
+    pub position: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Chart {
     pub kind: ChartKind,
@@ -79,8 +96,10 @@ pub struct Chart {
     pub part: String,
     /// 所属 drawing 部件路径
     pub drawing: String,
-    /// 显示数据标签
+    /// 显示数据标签（数值）
     pub show_labels: bool,
+    /// 数据标签的其它选项
+    pub label_opts: LabelOpts,
     /// 引用被改写后要回写到 chart 部件里的 (旧, 新) 对
     pub ref_fixes: Vec<(String, String)>,
     /// X 轴标题
@@ -240,6 +259,7 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
                 part: String::new(),
                 drawing: String::new(),
                 show_labels: false,
+            label_opts: Default::default(),
                 ref_fixes: Vec::new(),
                 axis_x: String::new(),
                 axis_y: String::new(),
@@ -523,6 +543,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut stacked = false;
     let mut in_dlbls = false;
     let mut show_labels = false;
+    let mut label_opts = LabelOpts::default();
     let mut bar_dir = String::new();
     let mut title = String::new();
     let mut series: Vec<Series> = Vec::new();
@@ -635,6 +656,34 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                             && crate::model::xml_unescape(&a.value.to_string()) == "1"
                         {
                             show_labels = true;
+                        }
+                    }
+                } else if matches!(
+                    name.as_str(),
+                    "showCatName"
+                        | "showSerName"
+                        | "showPercent"
+                        | "showLegendKey"
+                        | "showLeaderLines"
+                ) {
+                    let on = e.attributes().flatten().any(|a| {
+                        a.key.as_ref().ends_with("val")
+                            && crate::model::xml_unescape(&a.value.to_string()) == "1"
+                    });
+                    if on {
+                        match name.as_str() {
+                            "showCatName" => label_opts.show_cat = true,
+                            "showSerName" => label_opts.show_ser = true,
+                            "showPercent" => label_opts.show_pct = true,
+                            "showLegendKey" => label_opts.show_legend_key = true,
+                            "showLeaderLines" => label_opts.leader_lines = true,
+                            _ => {}
+                        }
+                    }
+                } else if name == "dLblPos" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("val") {
+                            label_opts.position = crate::model::xml_unescape(&a.value.to_string());
                         }
                     }
                 } else if name == "grouping" {
@@ -806,6 +855,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         part: String::new(),
         drawing: String::new(),
         show_labels,
+        label_opts,
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
