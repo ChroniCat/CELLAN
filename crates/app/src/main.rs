@@ -4527,6 +4527,25 @@ impl SheetApp {
                             }
                         }
                     }
+                    // 无界面验收：SC_PRINT_TO=<打印机名> / SC_PRINT_COPIES=N
+                    // 走与“打印”按钮相同的 print_to_printer（PDF→一个 PrintDocument 作业）
+                    if let Ok(printer) = std::env::var("SC_PRINT_TO") {
+                        static PRINT_ONCE: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !PRINT_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            self.page_setup_printer = printer;
+                            if let Ok(c) = std::env::var("SC_PRINT_COPIES") {
+                                if let Ok(c) = c.trim().parse::<u32>() {
+                                    self.print_copies = c.clamp(1, 99);
+                                }
+                            }
+                            self.print_to_printer();
+                            eprintln!("[print] {}", self.status);
+                            if std::env::var("SC_PRINT_EXIT").is_ok() {
+                                std::process::exit(0);
+                            }
+                        }
+                    }
                     // 无界面验收：SC_EXPORT_PDF=<路径> 走与导出对话框相同的函数
                     if let Ok(out) = std::env::var("SC_EXPORT_PDF") {
                         let p = PathBuf::from(&out);
@@ -7205,36 +7224,52 @@ impl SheetApp {
         };
         match export {
             Ok(n) => {
-                let p = path.to_string_lossy().replace('\'', "''");
-                let printer = self.page_setup_printer.replace('\'', "''");
+                // 份数必须交给驱动：一个 PrintDocument 作业设置 Copies=N。
+                // 旧实现循环起 N 个 Start-Process -Verb PrintTo，实际是 N 个单份作业，
+                // 驱动看不到 Copies，也会在真实打印机上产生 N 个队列项。
+                const PRINT_HELPER: &str = include_str!("../../../scripts/print_pdf.ps1");
+                let helper = path.with_extension("ps1");
                 let copies = self.print_copies.clamp(1, 99);
-                let script = if printer.is_empty() {
-                    format!("Start-Process -FilePath '{p}' -Verb Print")
-                } else {
-                    format!(
-                        "Start-Process -FilePath '{p}' -Verb PrintTo -ArgumentList '\"{printer}\"'"
-                    )
-                };
-                let mut ok = 0u32;
-                let mut last_err = String::new();
-                for _ in 0..copies {
-                    match std::process::Command::new("powershell")
-                        .args(["-NoProfile", "-Command", &script])
-                        .spawn()
-                    {
-                        Ok(_) => ok += 1,
-                        Err(e) => last_err = e.to_string(),
+                let submitted = std::fs::write(&helper, PRINT_HELPER).and_then(|_| {
+                    let mut cmd = std::process::Command::new("powershell");
+                    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                        .arg(&helper)
+                        .arg("-Path")
+                        .arg(&path)
+                        .arg("-Printer")
+                        .arg(&self.page_setup_printer)
+                        .arg("-Copies")
+                        .arg(copies.to_string());
+                    cmd.output()
+                });
+                let (ok, detail) = match submitted {
+                    Ok(out) if out.status.success() => {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        let line = text
+                            .lines()
+                            .find(|l| l.starts_with("PRINTED=1"))
+                            .unwrap_or("PRINTED=1");
+                        (true, line.to_string())
                     }
-                }
-                self.status = if ok == 0 {
-                    format!("打印失败：{last_err}")
-                } else {
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        (false, err.lines().last().unwrap_or("打印助手失败").to_string())
+                    }
+                    Err(e) => (false, e.to_string()),
+                };
+                let _ = std::fs::remove_file(&helper);
+                self.status = if ok {
                     let target = if self.page_setup_printer.is_empty() {
                         "系统默认打印机".to_string()
                     } else {
                         self.page_setup_printer.clone()
                     };
-                    format!("已提交 {ok} 份到 {target}（{n} 页）：{}", path.display())
+                    format!(
+                        "已提交 1 个打印任务（{copies} 份，{n} 页）到 {target}：{}（{detail}）",
+                        path.display()
+                    )
+                } else {
+                    format!("打印失败：{detail}")
                 };
             }
             Err(e) => self.status = format!("生成打印文件失败：{e:#}"),

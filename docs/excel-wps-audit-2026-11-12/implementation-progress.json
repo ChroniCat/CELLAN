@@ -6670,16 +6670,19 @@
             "crates/core/src/page.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "SC_PRINT_TO=SheetNativeTest2 SC_PRINT_COPIES=3 SC_PRINT_EXIT=1 target/debug/app.exe ... -> 1 job, Copies=3"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26-page-setup.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26/page-setup.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26/page-setup.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa26-copies-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa26-print-job.log"
           ],
           "not_done": [
-            "真打印机出纸未验证（本机无可用打印机）",
-            "份数按 N 个打印任务提交，未向驱动传 Copies",
-            "真实鼠标拖动/滑块未做（RDP 注入不可用）",
-            "WPS 仅对页面数，未重新做 PDF 像素对拍"
+            "真打印机出纸/份数肉眼核对未验证（本机有 Canon 队列，但不能无人值守出纸）；",
+            "真实鼠标拖动/滑块未做（RDP 输入注入不可用）；",
+            "WPS 仅对页面数，未重新做 PDF 像素对拍。"
           ],
           "failures": [],
           "blocker": "",
