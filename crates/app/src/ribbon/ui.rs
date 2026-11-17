@@ -317,11 +317,19 @@ fn compact_width(g: &Group) -> f32 {
 /// 这种组不要硬压，交给「组名 ▾」菜单，保证文字完整。
 fn compact_needs_text(list: &[Node]) -> bool {
     let no_icon_long = |c: &Ctl| {
-        c.image.is_none()
-            && c.label
-                .as_deref()
-                .map(|s| s.chars().count() > 2)
-                .unwrap_or(false)
+        let long = c
+            .label
+            .as_deref()
+            .map(|s| s.chars().count() > 2)
+            .unwrap_or(false);
+        // 超过 5 个汉字的命令即使有图标也不要压成纯图标：截断或只剩图标
+        // 都会让命令难以辨认；这类组退到「组名 ▾」保证文字可读。
+        let very_long = c
+            .label
+            .as_deref()
+            .map(|s| s.chars().count() > 5)
+            .unwrap_or(false);
+        (c.image.is_none() && long) || very_long
     };
     list.iter().any(|n| match n {
         Node::Button(c) | Node::Toggle(c) => no_icon_long(c),
