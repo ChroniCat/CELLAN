@@ -597,11 +597,20 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                     (cx + r * ang.cos(), cy + r * ang.sin())
                 })
                 .collect();
+            // 填充雷达（radarStyle=filled）：Excel 用 50% 透明度的面，这里按白色混 50% 近似
+            if ch.radar_style == "filled" && pts.len() >= 3 {
+                let mix = |c: u8| ((c as u16 + 255) / 2) as u8;
+                let fill = [mix(color[0]), mix(color[1]), mix(color[2])];
+                out.polys.push((pts.clone(), fill));
+            }
             for k in 0..pts.len() {
                 let a = pts[k];
                 let b = pts[(k + 1) % pts.len()];
                 out.lines.push((a.0, a.1, b.0, b.1, 1.2, color));
-                out.rects.push((a.0 - 1.5, a.1 - 1.5, 3.0, 3.0, color));
+                // 填充雷达不画数据点标记（Excel 的 filled 样式没有 marker）
+                if ch.radar_style != "filled" {
+                    out.rects.push((a.0 - 1.5, a.1 - 1.5, 3.0, 3.0, color));
+                }
             }
         }
     } else {

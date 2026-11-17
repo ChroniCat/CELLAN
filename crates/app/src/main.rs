@@ -21723,6 +21723,31 @@ let txn = self.txn_begin(&keys);
                     });
                     ui.end_row();
 
+                    if ch.kind == sheetcore::charts::ChartKind::Radar {
+                        ui.label("雷达样式");
+                        egui::ComboBox::from_id_salt("radar_style")
+                            .selected_text(match ch.radar_style.as_str() {
+                                "standard" => "标准",
+                                "filled" => "填充",
+                                _ => "带数据标记",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (k, label) in [
+                                    ("standard", "标准"),
+                                    ("marker", "带数据标记"),
+                                    ("filled", "填充"),
+                                ] {
+                                    if ui
+                                        .selectable_label(ch.radar_style == k, label)
+                                        .clicked()
+                                    {
+                                        ch.radar_style = k.to_string();
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    }
+
                     ui.label("图例");
                     egui::ComboBox::from_id_salt("legend_pos")
                         .selected_text(match ch.legend_pos.as_str() {

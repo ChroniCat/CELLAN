@@ -325,6 +325,7 @@ fn chart_category_axis_uses_the_workbook_date_system() {
         drawing: String::new(),
         show_labels: false,
         label_opts: sheetcore::charts::LabelOpts::default(),
+        radar_style: String::new(),
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),

@@ -288,6 +288,7 @@ fn chart_values_keep_raw_numbers_when_cells_are_formatted() {
         drawing: String::new(),
         show_labels: false,
         label_opts: sheetcore::charts::LabelOpts::default(),
+        radar_style: String::new(),
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),

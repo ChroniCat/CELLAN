@@ -110,6 +110,7 @@ pub fn chart_from_selection(
         drawing: String::new(),
         show_labels: false,
         label_opts: Default::default(),
+        radar_style: String::new(),
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
@@ -430,7 +431,13 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
         }
         Combo => {}
         Radar => {
-            out.push_str("<c:radarChart><c:radarStyle val=\"marker\"/><c:varyColors val=\"0\"/>");
+            let style = match ch.radar_style.as_str() {
+                "standard" | "marker" | "filled" => ch.radar_style.as_str(),
+                _ => "marker",
+            };
+            out.push_str(&format!(
+                "<c:radarChart><c:radarStyle val=\"{style}\"/><c:varyColors val=\"0\"/>"
+            ));
             out.push_str(&series_body(ch));
             out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:radarChart>");
             out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
@@ -461,21 +468,28 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
     axis_fix(out, ch)
 }
 
-fn drawing_xml(ch: &crate::charts::Chart, rid: &str) -> String {
+/// 一个图表的 oneCellAnchor 片段（追加到已有 drawing 时复用）
+fn anchor_xml(ch: &crate::charts::Chart, rid: &str, docpr: u32) -> String {
     let (r1, c1, _, _) = ch.anchor;
+    format!(
+        "<xdr:oneCellAnchor><xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+         <xdr:ext cx=\"5400000\" cy=\"2900000\"/>\
+         <xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{docpr}\" name=\"图表 {docpr}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\
+         <xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\
+         <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">\
+         <c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
+         <xdr:clientData/></xdr:oneCellAnchor>"
+    )
+}
+
+fn drawing_xml(ch: &crate::charts::Chart, rid: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
          xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
          xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" \
-         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-         <xdr:oneCellAnchor><xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
-         <xdr:ext cx=\"5400000\" cy=\"2900000\"/>\
-         <xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"图表 1\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\
-         <xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\
-         <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">\
-         <c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
-         <xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">{}</xdr:wsDr>",
+        anchor_xml(ch, rid, 2)
     )
 }
 
@@ -582,6 +596,113 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         Some((d, b)) => format!("{d}/_rels/{b}.rels"),
         None => return Err(anyhow::anyhow!("工作表路径异常")),
     };
+
+    // 表上已挂着 drawing 时，新图表要作为新锚点追加进同一个 drawing。
+    // 另建 drawingN 只会留下没有工作表引用的孤儿部件：Excel 打开看不到图，
+    // 我们自己的 load 也读不到（chart 部件没被任何 sheet 引用）。
+    let existing_drawing = {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        let mut sheet_xml = String::new();
+        if let Ok(mut f) = zip.by_name(&sheet_path) {
+            let _ = f.read_to_string(&mut sheet_xml);
+        }
+        let rid = sheet_xml
+            .split("<drawing r:id=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .map(|s| s.to_string());
+        rid.and_then(|rid| {
+            let mut rels = String::new();
+            if let Ok(mut f) = zip.by_name(&sheet_rels_part) {
+                let _ = f.read_to_string(&mut rels);
+            }
+            rels.split("<Relationship ")
+                .find(|c| c.contains(&format!("Id=\"{rid}\"")))
+                .and_then(|c| c.split("Target=\"").nth(1))
+                .and_then(|c| c.split('"').next())
+                .map(|t| {
+                    if let Some(rest) = t.strip_prefix("../") {
+                        format!("xl/{rest}")
+                    } else if let Some(rest) = t.strip_prefix('/') {
+                        rest.to_string()
+                    } else {
+                        format!("xl/worksheets/{t}")
+                    }
+                })
+        })
+    };
+    if let Some(dpart) = existing_drawing {
+        let mut dxml = String::new();
+        let mut drels = String::new();
+        let mut drels_part = String::new();
+        {
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+            zip.by_name(&dpart)?.read_to_string(&mut dxml)?;
+            drels_part = match dpart.rsplit_once('/') {
+                Some((d, b)) => format!("{d}/_rels/{b}.rels"),
+                None => String::new(),
+            };
+            if let Ok(mut f) = zip.by_name(&drels_part) {
+                let _ = f.read_to_string(&mut drels);
+            }
+        }
+        let max_rel = drels
+            .split("Id=\"rId")
+            .skip(1)
+            .filter_map(|c| c.split('"').next().and_then(|n| n.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(0);
+        let rid = format!("rId{}", max_rel + 1);
+        let docpr = dxml
+            .split("<xdr:cNvPr id=\"")
+            .skip(1)
+            .filter_map(|c| c.split('"').next().and_then(|n| n.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(1)
+            + 1;
+        let anchor = anchor_xml(ch, &rid, docpr);
+        let new_drawing = dxml.replace("</xdr:wsDr>", &format!("{anchor}</xdr:wsDr>"));
+        if new_drawing == dxml {
+            anyhow::bail!("drawing 结构不认识，无法追加图表锚点");
+        }
+        let new_rels = drels.replace(
+            "</Relationships>",
+            &format!("<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart{chart_no}.xml\"/></Relationships>"),
+        );
+        let chart_name = format!("chart{chart_no}.xml");
+        let additions = vec![(
+            format!("xl/charts/chart{chart_no}.xml"),
+            chart_xml(ch).into_bytes(),
+        )];
+        let dpart_c = dpart.clone();
+        let drels_c = drels_part.clone();
+        let new_drawing_c = new_drawing.into_bytes();
+        let new_rels_c = new_rels.into_bytes();
+        rewrite_with_additions_pub(path, additions, move |name, buf| {
+            // 已有条目不能靠 additions 覆盖（那里只追加新名字），必须在闭包里替换
+            if name == dpart_c {
+                return new_drawing_c.clone();
+            }
+            if name == drels_c {
+                return new_rels_c.clone();
+            }
+            if name == "[Content_Types].xml" {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    let mut x = xml;
+                    if !x.contains(&chart_name) {
+                        x = x.replace(
+                            "</Types>",
+                            &format!("<Override PartName=\"/xl/charts/{chart_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/></Types>"),
+                        );
+                    }
+                    return x.into_bytes();
+                }
+                return buf;
+            }
+            buf
+        })?;
+        return Ok(());
+    }
 
     let chart_body = chart_xml(ch);
     let drawing_body = drawing_xml(ch, "rId1");
@@ -886,7 +1007,7 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
         .unwrap_or_else(|| "2".into());
     let p = pre;
     let new = format!(
-        "<{p}twoCellAnchor editAs=\"oneCell\"><{p}from><{p}col>{c1}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r1}</{p}row><{p}rowOff>0</{p}rowOff></{p}from><{p}to><{p}col>{c2}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r2}</{p}row><{p}rowOff>0</{p}rowOff></{p}to><{p}graphicFrame macro=\"\"><{p}nvGraphicFramePr><{p}cNvPr id=\"{id}\" name=\"{name}\"/><{p}cNvGraphicFramePr/></{p}nvGraphicFramePr><{p}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{p}xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></{p}graphicFrame><{p}clientData/></{p}twoCellAnchor>"
+        "<{p}twoCellAnchor editAs=\"oneCell\"><{p}from><{p}col>{c1}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r1}</{p}row><{p}rowOff>0</{p}rowOff></{p}from><{p}to><{p}col>{c2}</{p}col><{p}colOff>0</{p}colOff><{p}row>{r2}</{p}row><{p}rowOff>0</{p}rowOff></{p}to><{p}graphicFrame macro=\"\"><{p}nvGraphicFramePr><{p}cNvPr id=\"{id}\" name=\"{name}\"/><{p}cNvGraphicFramePr/></{p}nvGraphicFramePr><{p}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{p}xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic></{p}graphicFrame><{p}clientData/></{p}twoCellAnchor>"
     );
     let mut out = String::with_capacity(xml.len() + new.len());
     out.push_str(&xml[..s0]);

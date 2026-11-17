@@ -100,6 +100,8 @@ pub struct Chart {
     pub show_labels: bool,
     /// 数据标签的其它选项
     pub label_opts: LabelOpts,
+    /// 雷达样式：standard / marker / filled（其它图型为空）
+    pub radar_style: String,
     /// 引用被改写后要回写到 chart 部件里的 (旧, 新) 对
     pub ref_fixes: Vec<(String, String)>,
     /// X 轴标题
@@ -260,6 +262,7 @@ pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
                 drawing: String::new(),
                 show_labels: false,
             label_opts: Default::default(),
+            radar_style: String::new(),
                 ref_fixes: Vec::new(),
                 axis_x: String::new(),
                 axis_y: String::new(),
@@ -544,6 +547,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
     let mut in_dlbls = false;
     let mut show_labels = false;
     let mut label_opts = LabelOpts::default();
+    let mut radar_style = String::new();
     let mut bar_dir = String::new();
     let mut title = String::new();
     let mut series: Vec<Series> = Vec::new();
@@ -678,6 +682,12 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
                             "showLegendKey" => label_opts.show_legend_key = true,
                             "showLeaderLines" => label_opts.leader_lines = true,
                             _ => {}
+                        }
+                    }
+                } else if name == "radarStyle" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("val") {
+                            radar_style = crate::model::xml_unescape(&a.value.to_string());
                         }
                     }
                 } else if name == "dLblPos" {
@@ -856,6 +866,7 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
         drawing: String::new(),
         show_labels,
         label_opts,
+        radar_style,
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),

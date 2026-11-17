@@ -44,6 +44,7 @@ fn secondary_axis_gets_its_own_nice_ticks() {
         drawing: String::new(),
         show_labels: false,
         label_opts: Default::default(),
+        radar_style: String::new(),
         ref_fixes: Vec::new(),
         axis_x: String::new(),
         axis_y: String::new(),
