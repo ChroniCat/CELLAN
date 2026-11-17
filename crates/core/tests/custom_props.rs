@@ -107,6 +107,7 @@ fn has(xml: &str, needle: &str) -> bool {
 #[test]
 fn third_party_properties_survive_writing_sources() {
     let dir = std::env::temp_dir().join(format!("sc_c08_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
 
@@ -126,6 +127,7 @@ fn third_party_properties_survive_writing_sources() {
 #[test]
 fn repeated_saves_do_not_duplicate_or_drift() {
     let dir = std::env::temp_dir().join(format!("sc_c08_rep_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
 
@@ -148,6 +150,7 @@ fn repeated_saves_do_not_duplicate_or_drift() {
 #[test]
 fn deleting_the_last_source_removes_only_app_metadata() {
     let dir = std::env::temp_dir().join(format!("sc_c08_del_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
     write_sources(&p, &[src(1, "C:/a.csv")]).unwrap();
@@ -178,6 +181,7 @@ fn deleting_the_last_source_removes_only_app_metadata() {
 #[test]
 fn names_and_values_with_markup_are_escaped() {
     let dir = std::env::temp_dir().join(format!("sc_c08_esc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let mut wb = Workbook::new_blank();
     wb.sheets[0].name = "S".into();
@@ -213,6 +217,7 @@ fn names_and_values_with_markup_are_escaped() {
 fn save_path_keeps_third_party_props_end_to_end() {
     // 走真实保存入口：Workbook.sources + xlsx::save
     let dir = std::env::temp_dir().join(format!("sc_c08_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
 
@@ -246,6 +251,7 @@ fn save_path_keeps_third_party_props_end_to_end() {
 fn base_argument_reads_props_from_the_original_file() {
     // umya 重写包之后新包里可能没有 custom.xml；这时必须从基准文件读第三方属性
     let dir = std::env::temp_dir().join(format!("sc_c08_base_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let base = book_with_props(&dir);
 
@@ -266,6 +272,7 @@ fn base_argument_reads_props_from_the_original_file() {
 #[ignore = "生成 Excel/WPS 自定义属性对拍夹具（人工驱动的实机验收用）"]
 fn make_c08_fixture() {
     let dir = std::env::temp_dir().join("sc_c08_excel");
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
     let mut wb = sheetcore::xlsx::load(&p).unwrap();
@@ -305,6 +312,7 @@ fn excel_roundtrip_keeps_custom_props() {
 fn refreshing_a_csv_source_keeps_third_party_props() {
     // 刷新数据源 = import_csv 覆盖目标区 + 保存；属性区不得被动到
     let dir = std::env::temp_dir().join(format!("sc_c08_ref_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
     let csv = dir.join("ledger.csv");
@@ -332,6 +340,7 @@ fn sources_with_arbitrary_labels_land_in_the_app_namespace() {
     // 老代码允许 Source.name 是任意文字（例如「导入1」），写出去后读端只认 _sc_src_ 前缀，
     // 于是这个源保存后直接消失。写端必须把名字归一到应用命名空间。
     let dir = std::env::temp_dir().join(format!("sc_c08_label_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_props(&dir);
 
@@ -355,6 +364,7 @@ fn sources_with_arbitrary_labels_land_in_the_app_namespace() {
 #[test]
 fn prefixed_properties_single_quotes_and_alt_type_prefix_survive() {
     let dir = std::env::temp_dir().join(format!("sc_c08_pref_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // PID 会复用，残留 target.xlsx 会让断言假失败
     let _ = std::fs::create_dir_all(&dir);
     let p = book_with_prefixed_props(&dir);
     write_sources(&p, &[src(1, "C:/data/a.csv")]).unwrap();

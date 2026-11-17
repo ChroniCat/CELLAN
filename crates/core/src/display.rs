@@ -163,6 +163,20 @@ pub fn wrap_lines(text: &str, width_pt: f32, size: f32) -> Vec<String> {
     wrap_lines_with(text, width_pt, size, None)
 }
 
+/// Excel 的折行模型。
+///
+/// 实测（`work/probe/wrapmeas.*`，6 组列宽/字号/缩进组合 + Excel 导出 PDF 反解）：
+/// 可容纳字数 = floor(列宽 × 0.88 ÷ (0.975 × 字号))，缩进按 3 个 `0` 的宽度扣一次。
+/// 列宽是 Excel `Columns.Width` 的 pt 值，和我们 `layout` 里的 px×0.75 一致。
+pub fn wrap_lines_excel(
+    text: &str,
+    width_pt: f32,
+    size: f32,
+    metric: Option<&(dyn Fn(char, f32) -> f32 + Send + Sync)>,
+) -> Vec<String> {
+    wrap_scaled(text, width_pt * 0.88, size, metric, 0.975)
+}
+
 /// 同上，但可传入真字体度量（导出 PDF 时用；预览/屏幕传 None 走估算）
 pub fn wrap_lines_with(
     text: &str,
@@ -170,14 +184,24 @@ pub fn wrap_lines_with(
     size: f32,
     metric: Option<&(dyn Fn(char, f32) -> f32 + Send + Sync)>,
 ) -> Vec<String> {
+    wrap_scaled(text, width_pt, size, metric, 1.0)
+}
+
+fn wrap_scaled(
+    text: &str,
+    width_pt: f32,
+    size: f32,
+    metric: Option<&(dyn Fn(char, f32) -> f32 + Send + Sync)>,
+    adv_scale: f32,
+) -> Vec<String> {
     let mut out = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         let mut w = 0.0f32;
         for ch in para.chars() {
             let cw = match metric {
-                Some(f) => f(ch, size),
-                None => char_width(ch, size),
+                Some(f) => f(ch, size) * adv_scale,
+                None => char_width(ch, size) * adv_scale,
             };
             if w + cw > width_pt && !line.is_empty() {
                 out.push(std::mem::take(&mut line));

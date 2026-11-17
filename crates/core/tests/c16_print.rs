@@ -196,3 +196,32 @@ fn title_rows_repeat_on_every_page_and_body_never_repeats() {
     }
     assert!(seen.len() > 20, "应覆盖全部数据行，实际 {} 行", seen.len());
 }
+
+#[test]
+fn wrap_char_counts_match_excel_measurements() {
+    // 夹具由 openpyxl 生成，6 张表分别是 (列宽,字号,缩进)：
+    // (12,10,0) (24,10,0) (24,10,1) (24,14,0) (40,10,0) (18,11,0)
+    // 期望值来自 Excel 16.0 ExportAsFixedFormat 的 PDF 实测每行字数。
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/c16/wrap.xlsx");
+    let wb = sheetcore::xlsx::load(&path).expect("加载 wrap 夹具");
+    let want = [6usize, 12, 11, 9, 21, 8];
+    for (i, w) in want.iter().enumerate() {
+        let sh = &wb.sheets[i];
+        let width = sh.cols.size(0) * 0.75;
+        let view = sheetcore::display::view_at(&wb, sh, 0, 0, None).expect("A1 有内容");
+        let indent = view.indent as f32 * 3.0 * sheetcore::display::char_width('0', view.size);
+        let lines = sheetcore::display::wrap_lines_excel(
+            &view.text,
+            (width - 4.0 - indent).max(4.0),
+            view.size,
+            None,
+        );
+        assert_eq!(
+            lines[0].chars().count(),
+            *w,
+            "sheet{i} 首行字数（列宽 {width:.1} 字号 {} 缩进 {}）",
+            view.size,
+            view.indent
+        );
+    }
+}

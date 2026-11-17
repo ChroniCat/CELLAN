@@ -363,10 +363,17 @@ fn draw_view(
         return;
     }
     let size = (view.size * scale).max(3.0);
-    // Excel 的缩进单位是「3 个 0 的宽度」（不是 0.6 个字号）；差这一截会让自动换行多塞两个字
-    let pad = 2.0 * scale + view.indent as f32 * 3.0 * display::char_width('0', size);
+    // Excel 的缩进单位是「3 个 0 的宽度」（不是 0.6 个字号），且只扣一次；
+    // 折行预算与字宽另有 0.88 / 0.975 的实测系数，见 display::wrap_lines_excel。
+    let pad = 2.0 * scale;
+    let indent = view.indent as f32 * 3.0 * display::char_width('0', size);
     let mut lines_txt = if view.wrap {
-        display::wrap_lines_with(&view.text, (cw - pad * 2.0).max(4.0), size, out.metric.as_deref())
+        display::wrap_lines_excel(
+            &view.text,
+            (cw - pad * 2.0 - indent).max(4.0),
+            size,
+            out.metric.as_deref(),
+        )
     } else {
         view.text.split('\n').map(|s| s.to_string()).collect()
     };
