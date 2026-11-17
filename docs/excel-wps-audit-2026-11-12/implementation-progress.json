@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-17T09:43:45Z",
+  "updated_utc": "2026-11-17T09:45:19Z",
   "tasks": [
     {
       "id": "C01",
@@ -3424,15 +3424,16 @@
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md"
+      ],
       "not_done": [
-        "选择锁定/未锁定单元格权限已在鼠标按下、拖拽扩选、方向键、名称框定位四个入口执行；等待监督复核",
-        "Enter/Tab advance_active 与名称框整块选区门禁已补；真实键鼠未目视"
+        "真实键鼠在窗口内点选锁定/未锁定单元格未执行（无交互桌面，阻塞项）"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核选择权限入口",
-      "updated_utc": "2026-11-13T20:26:43Z",
+      "updated_utc": "2026-11-17T09:45:19Z",
       "slices": [
         {
           "id": "C15.1",
@@ -3440,7 +3441,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "CellStyle 增加 locked/hidden 并与 styles.xml 双向读写；SheetProtection 的 15 个权限位按 Excel 实际编码（0=允许、缺失=禁止）解析与写回，导入导出往返一致。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3454,25 +3455,27 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
-            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied",
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 261 passed",
-            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied"
+            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
+            "powershell scripts/c15_recheck.ps1 -> fixture/ours both protected=True A1 denied B1 ok"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-hidden-a1.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-visible-b1.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-input-area-write.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-17T09:45:19Z"
         },
         {
           "id": "C15.2",
@@ -3480,7 +3483,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "统一命令门禁：写入逐格判锁（选区含锁定格即拒），排序/插删行列/格式各有权限放行，撤销/快捷键/菜单走同一入口；保护是防误改，不宣称加密。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3495,21 +3498,21 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
-            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied",
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 261 passed",
-            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied"
+            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
+            "powershell scripts/c15_recheck.ps1 -> fixture/ours both protected=True A1 denied B1 ok"
           ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-gate.txt"
           ],
-          "not_done": [
-            "拖选/Shift点击/Shift方向键整块门禁已补，等待监督复核"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T23:32:57Z"
+          "updated_utc": "2026-11-17T09:45:19Z"
         },
         {
           "id": "C15.3",
@@ -3517,7 +3520,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "保护对话框有 15 项勾选且默认同 Excel；Excel 生成夹具 → 本应用只改未锁定区 → 保存 → Excel 复核仍拒绝 A1、允许 B1、保留 formatCells。",
           "files": [
             "crates/core/src/protection.rs",
@@ -3532,26 +3535,28 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
-            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied",
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 261 passed",
-            "Excel COM 复核 c15-live.xlsx：A1_WRITE=denied B1_WRITE=ok FMT=ok SORT=denied"
+            "cargo test -p sheetcore --offline -j 2 --lib protection:: -> 5 passed",
+            "cargo test -p sheetcore --offline -j 2 --test c15_protection -> 3 passed",
+            "powershell scripts/c15_recheck.ps1 -> fixture/ours both protected=True A1 denied B1 ok"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-hidden-a1.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-formula-visible-b1.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-input-area-write.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-locked-write-blocked.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protect-dialog.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protected-fixture.xlsx",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-perms.txt"
           ],
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-17T09:45:19Z"
         }
       ]
     },
