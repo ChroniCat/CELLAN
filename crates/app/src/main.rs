@@ -6555,7 +6555,8 @@ impl SheetApp {
 
     /// 按内容自适应列宽
     fn autofit_col(&mut self, ctx: &egui::Context, col: u32) {
-        let mut width: f32 = 24.0;
+        let mut width: f32 = 17.0;
+        let mut saw_text = false;
         let (_, _, r2, _) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
         for r in 0..=r2.min(5000) {
             let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, col) else {
@@ -6569,31 +6570,31 @@ impl SheetApp {
             if txt.is_empty() {
                 continue;
             }
+            saw_text = true;
             // 列宽要按 Excel 的口径算，不能用屏幕字体的 galley：
-            //   Excel 用 Carlito/Calibri 度量文字（1 字符 = 7px @96dpi），
-            //   存盘 width 用 8px/字符，显示时再 +5px 内边距。
-            // 直接拿 egui 的 Inter/Noto 宽度会宽 15% 上下，存回去 Excel 就偏宽。
+            // Excel AutoFit 是「字符单位 + 固定内边距」，不是按字形 advance
+            // 求和；用 Carlito 的 text_width 再除 7 会差 1–1.5 字符。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
-            let text_px = sheetcore::display::text_width(&txt, size);
-            // 实测（Excel 16.0 Build 20326，本机 96dpi）：ColumnWidth = (text_px - 3) / 7
-            let chars = ((text_px - 3.0) / 7.0).max(0.0);
+            let chars = sheetcore::display::excel_autofit_chars(&txt);
             let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {
                 eprintln!(
-                    "[autofit]   r{r} txt={:?} len={} text_px={:.1} chars={:.2} size={:.1} bold={}",
+                    "[autofit]   r{r} txt={:?} len={} chars={:.2} size={:.1} bold={}",
                     txt.chars().take(12).collect::<String>(),
                     txt.chars().count(),
-                    text_px,
                     chars,
                     size,
                     st.bold
                 );
             }
-            // 列宽模型是「内容宽 + 内边距」；+5 与 Excel 的 5px 内边距一致。
-            // 注意保存仍按 px/8（既有文件兼容），所以输出字符数会略宽于 Excel。
-            width = width.max(w + 5.0 + st.indent as f32 * size * 2.0);
+            // 列宽模型是「内容宽 + 内边距」；chars 已含等线的 0.88 内边距。
+            width = width.max(w + st.indent as f32 * size * 2.0);
         }
-        let width = width.clamp(24.0, 1500.0);
+        if !saw_text {
+            width = 72.0; // 空列保持 Excel 的默认列宽，不要缩成单字符
+        }
+        // 单字符内容 Excel 给 1.88 字符（约 20px），不能被 24px 下限顶到 2.38。
+        let width = width.clamp(17.0, 1500.0);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             sh.cols.set(col, width);

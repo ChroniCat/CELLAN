@@ -240,6 +240,41 @@ pub fn text_width(s: &str, size: f32) -> f32 {
     s.chars().map(|c| char_width(c, size)).sum()
 }
 
+/// Excel AutoFit 的列宽（字符单位），按本机 Excel 16.0 Build 20326 实测反解。
+///
+/// 目标字体是中文版 Excel 的 Normal 样式 **等线 11**（不是 Calibri）：
+/// ASCII 每个字符记 1、CJK 记 2，固定内边距 0.88；超过 9 个字符后每字符
+/// 再加 0.125 的像素量化。例：`1`→1.88、`1234.5678`→9.88、
+/// `12345678901`→12.13、`1.23457E+14`→12.13。
+/// （若 Normal 被改成 Calibri，Excel 会给 1.54/11.69；这不是本项目默认环境。）
+/// 存盘时 `width` 就是这个值，不能拿 Carlito 的 `text_width` 再除 7。
+pub fn excel_autofit_chars(s: &str) -> f32 {
+    let mut ascii = 0.0f32;
+    let mut cjk = 0usize;
+    for c in s.chars() {
+        if (c as u32) >= 0x2e80 {
+            cjk += 1;
+        } else {
+            ascii += 1.0;
+        }
+    }
+    let units = ascii + cjk as f32 * 2.0;
+    let base = units + 0.88 + 0.125 * (units - 9.0).max(0.0);
+    // 纯 CJK 串的像素量化和 ASCII 不同（中/中文/中文字 实测 2.75/4.63/6.5）。
+    if ascii == 0.0 && cjk > 0 {
+        let k = cjk as f32;
+        let w = if cjk <= 4 {
+            1.875 * k + 0.875
+        } else {
+            // 5 个以上汉字：Excel 按 2 字符/个继续加宽（实测 10.38/12.38）
+            8.375 + 2.0 * (k - 4.0)
+        };
+        w.max(1.88)
+    } else {
+        base
+    }
+}
+
 /// 单个字符的排版宽度。
 ///
 /// 拉丁/数字优先用内嵌 Carlito（与 Calibri 度量兼容）的真实 advance，

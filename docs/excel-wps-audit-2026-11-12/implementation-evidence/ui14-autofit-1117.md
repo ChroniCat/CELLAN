@@ -43,3 +43,54 @@ cargo test -q -p app --bin app -- --test-threads=1      → APP_EXIT=0（378 pas
 
 改动测试期望：`merges::parses_cols_and_rows` 16 字符 → 133px；`xls_layout` 同步；
 `xls_write` 往返列宽 140px 保持不变。
+
+## 2026-11-18 第二次逐字符对拍（本机 Excel 16.0）
+
+上一版把 AutoFit 改成 `text_width/7` 后，A/B 对齐但 11 位数字/科学计数仍有
+1–1.5 字符差。重做 46 行字符串的 Excel `AutoFit()` 标定。这里有一个容易
+踩的前提：**Excel 的 ColumnWidth 以当前 Workbook 的 Normal 字体为单位**。
+
+- 本机中文版 Excel 新建工作簿的 Normal 是 **等线 11**：
+  `1`→1.88、11 位数字→12.13（与台账里 `1.23457E+14` 的 12.13/76.5pt 一致）；
+- 把 Normal 换成 Calibri 11 再 AutoFit，同一字符串会变成 1.54/11.69。
+  第一版标定误用了后者，不能代表本项目的默认环境。
+
+以下以 **等线 11** 为准（`work/probe/excel_autofit_calib2.out`）。Excel 不是
+按字形 advance 求和：ASCII 每字符 1、CJK 每字符 2，固定加 0.88；超过 9 个
+字符后每字符再加 0.125 的像素量化。
+
+| 文本 | Excel ColumnWidth（等线） | 旧实现 |
+|---|---:|---:|
+| `1` | 1.88 | 2.38 |
+| `111111111` | 9.88 | 9.54 |
+| `1111111111` | 11.00 | 10.49 |
+| `11111111111` | 12.13 | 11.86（多 +5） |
+| `1234.5678` | 9.88 | 9.21 |
+| `1.23457E+14` | 12.13 | 11.27（差 0.42，char 数差 1.04） |
+| `中文字` | 6.50 | — |
+| `中文文字中文` | 12.38 | — |
+| `Hello World` | 12.13 | — |
+
+修正：
+
+- `crates/core/src/display.rs::excel_autofit_chars` 按上述单位公式实现；
+  纯 CJK 串另按实测曲线（1 个=2.75、2 个=4.63、3 个=6.50、4 个=8.38、
+  5 个以上每个 +2）处理；
+- `crates/app/src/main.rs::autofit_col` 用它，去掉重复的 `+5`，最小宽度从
+  24px 降到 17px（单字符列），空列仍保持 72px；
+- 新增 `crates/core/tests/autofit_width.rs`，把 31 个代表值固化成断言。
+
+端到端（`SC_AUTOFIT=c:N` + openpyxl 读回，用当前 Normal=等线的 Excel 取值）：
+
+| 列 | 文本 | app | Excel |
+|---|---|---:|---:|
+| A | `12345678901` | 12.13 | 12.13 |
+| B | `1234.5678` | 9.88 | 9.88 |
+| C | `0.1` | 3.88 | 3.88 |
+| D | `1` | 1.88 | 1.88 |
+| E | `1.23457E+14` | 12.13 | 12.13 |
+
+`cargo test -p sheetcore --test autofit_width`：1 passed。
+
+仍未做：真实鼠标双击列边界（无交互桌面）；带缩进/加粗/多行/合并列的
+AutoFit 未逐项对拍（缩进仍沿用 `indent×size×2` 估算）。

@@ -6008,7 +6008,7 @@
           ],
           "not_done": [
             "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数",
-            "AutoFit 后 px→char 保存口径与 Excel 逐字符对拍未做（显示文本与量宽字符数已对）"
+            "AutoFit 列宽已按 Excel 16.0（Normal=等线 11）46 字符串标定对齐（1/9/10/11/12 位、科学计数、CJK、负号；端到端 5 列 12.13/9.88/3.88/1.88/12.13 全等，测试 autofit_width）；Normal=Calibri 的 1.54/11.69 是另一套单位，已有注释。缩进/加粗/多行/合并列未逐项对拍。"
           ],
           "failures": [],
           "blocker": "",
@@ -6128,12 +6128,13 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-fill.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-xlsx-1118.md"
           ],
           "not_done": [
             "真实鼠标填充页调色/保护页勾选/确定取消 Esc 未取证",
             "Excel 365/WPS 保存重开目视未做",
-            "逐格锁定语义：.xls 已用 Excel COM 验证（A1 未锁定可写、B1 锁定被拒、口令可解除）；.xlsx 与真实鼠标路径未做"
+            ".xlsx 逐格锁定已用 Excel COM 验证（A1 锁定被拒、B1 未锁定可写、往返后保护与值保留）；仍缺真实鼠标在格式对话框保护页勾选/确定/取消。"
           ],
           "failures": [],
           "blocker": "",
