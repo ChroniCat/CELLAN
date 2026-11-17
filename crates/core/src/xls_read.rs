@@ -19,6 +19,9 @@ const STRING: u16 = 0x0207;
 const SST: u16 = 0x00FC;
 const CONTINUE: u16 = 0x003C;
 const CALCMODE: u16 = 0x000D;
+/// 工作表保护：PROTECT(0x0012) + PASSWORD(0x0013)
+const PROTECT: u16 = 0x0012;
+const PASSWORD: u16 = 0x0013;
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
 
@@ -96,6 +99,8 @@ pub struct SheetData {
     pub name: String,
     pub cells: Vec<(u32, u32, Cell)>,
     pub merges: Vec<(u32, u32, u32, u32)>,
+    /// .xls 的 PROTECT/PASSWORD（只有旧式 16 位哈希）
+    pub protection: Option<crate::protection::SheetProtection>,
 }
 
 /// BIFF8 错误码 → ErrKind（与 xls_write::biff_error_code 互为反函数）
@@ -176,6 +181,7 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
             name: n.clone(),
             cells: Vec::new(),
             merges: Vec::new(),
+            protection: None,
         })
         .collect();
 
@@ -228,6 +234,27 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
                             push(r, c1 + k as u32, Value::Number(rk_value(rk)));
                         }
                     }
+                }
+                PROTECT if body.len() >= 2 => {
+                    let g = u16le(body, 0).unwrap();
+                    let mut p = out[si]
+                        .protection
+                        .clone()
+                        .unwrap_or_else(crate::protection::SheetProtection::default);
+                    p.sheet = g & 0x0001 != 0;
+                    p.objects = g & 0x0002 != 0;
+                    p.scenarios = g & 0x0004 != 0;
+                    out[si].protection = Some(p);
+                }
+                PASSWORD if body.len() >= 2 => {
+                    let h = u16le(body, 0).unwrap();
+                    let mut p = out[si]
+                        .protection
+                        .clone()
+                        .unwrap_or_else(crate::protection::SheetProtection::default);
+                    p.sheet = true;
+                    p.legacy = Some(h);
+                    out[si].protection = Some(p);
                 }
                 LABEL if body.len() >= 8 => {
                     let r = u16le(body, 0).unwrap() as u32;
@@ -372,6 +399,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
             sh.set(r, c, cell);
         }
         sh.merges = sd.merges;
+        sh.protection = sd.protection;
         wb.sheets.push(sh);
     }
     if wb.sheets.is_empty() {

@@ -272,6 +272,8 @@ impl SheetApp {
 
     /// 命令分发：XML 的 onAction → 既有实现。
     pub fn ribbon_action(&mut self, action: &str, ctx: &egui::Context) {
+        // UI-22.1：功能区点按与命令搜索共用同一份使用频率
+        crate::cmdusage::touch(action);
         self.unhandled_action = None;
         // 登记过的应用级命令（保存/另存为/打开/新建/打印/撤销/重做）只有一份实现，
         // 快捷键与菜单点击都落到这里。

@@ -1520,8 +1520,10 @@ fn sheet_view_state_is_restored_by_stable_identity() {
     app.extra_sel = vec![(3, 3, 4, 4)];
     app.scroll = egui::vec2(123.0, 456.0);
     app.zoom = 1.5;
+    app.view_mode = 2;
     assert!(app.switch_sheet_view(1));
     assert_eq!(app.sel, (0, 0), "新表不能继承上一表的选区");
+    assert_eq!(app.view_mode, 0, "新表默认普通视图");
     assert_eq!(app.scroll, Vec2::ZERO);
     assert_eq!(app.zoom, 1.0);
     assert!(app.switch_sheet_view(0));
@@ -1529,6 +1531,7 @@ fn sheet_view_state_is_restored_by_stable_identity() {
     assert_eq!(app.extra_sel, vec![(3, 3, 4, 4)]);
     assert_eq!(app.scroll, egui::vec2(123.0, 456.0));
     assert!((app.zoom - 1.5).abs() < f32::EPSILON);
+    assert_eq!(app.view_mode, 2, "分页预览要随表恢复");
 
     // 改名后 identity 不变，仍恢复原状态；重排后也不串到别的表。
     app.wb.sheets[0].name = "Renamed".into();

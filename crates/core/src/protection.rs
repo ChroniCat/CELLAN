@@ -266,11 +266,15 @@ pub fn hash_password(pw: &str, salt: &[u8], spin: u32) -> Vec<u8> {
 
 /// 旧格式（BIFF8 / 早期 xlsx）的 16 位哈希
 pub fn legacy_hash(pw: &str) -> u16 {
+    // Excel/BIFF8 口径（MS-OFFCRYPTO 的 worksheet verifier）：
+    // 从最后一个字符往前，每步先循环左移一位再异或字符；最后再移一位，
+    // 异或长度与 0xCE4B。s3cret → 0xDBFF、password → 0x83AF（Excel 文件实测）。
     let mut hash: u16 = 0;
-    for ch in pw.chars() {
-        hash ^= ch as u16;
+    for ch in pw.chars().rev() {
         hash = ((hash >> 14) & 0x01) | ((hash << 1) & 0x7FFF);
+        hash ^= ch as u16;
     }
+    hash = ((hash >> 14) & 0x01) | ((hash << 1) & 0x7FFF);
     hash ^= pw.chars().count() as u16;
     hash ^= 0xCE4B;
     hash
@@ -396,6 +400,13 @@ mod tests {
         assert!(!p.can(ProtOp::Sort));
         assert!(!p.can(ProtOp::InsertRows));
     }
+    #[test]
+    fn legacy_hash_matches_excel_vector() {
+        // Excel 生成的受保护 .xls 里 PASSWORD 记录就是 0xFFDB。
+        assert_eq!(legacy_hash("s3cret"), 0xDBFF);
+        assert_eq!(legacy_hash(""), 0xCE4B);
+    }
+
     #[test]
     fn protect_and_verify() {
         let p = SheetProtection::new_with_password("s3cret");

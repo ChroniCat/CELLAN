@@ -15,6 +15,7 @@ mod test_env;
 mod net;
 mod office_clipboard;
 mod recent;
+mod cmdusage;
 mod fnrecent;
 mod update;
 mod error_opts;
@@ -2104,6 +2105,8 @@ struct SheetViewState {
     extra_sel: Vec<(u32, u32, u32, u32)>,
     scroll: Vec2,
     zoom: f32,
+    /// UI-16.1：普通/页面布局/分页预览是每张表各自的视图状态
+    view_mode: u8,
 }
 
 impl Default for SheetViewState {
@@ -2114,6 +2117,7 @@ impl Default for SheetViewState {
             extra_sel: Vec::new(),
             scroll: Vec2::ZERO,
             zoom: 1.0,
+            view_mode: 0,
         }
     }
 }
@@ -6798,7 +6802,9 @@ impl SheetApp {
             return;
         }
         let all = palette::entries(self);
-        let hits = palette::filter(&all, &self.palette_q);
+        let mut hits = palette::filter(&all, &self.palette_q);
+        // UI-22.1：常用命令排前面（相同查询下次数多的优先）
+        crate::cmdusage::rank(&mut hits, &crate::cmdusage::load());
         let mut open = true;
         let mut win_open = true;
         let mut clicked = false;
@@ -10204,6 +10210,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 extra_sel: self.extra_sel.clone(),
                 scroll: self.scroll,
                 zoom: self.zoom,
+                view_mode: self.view_mode,
             },
         );
     }
@@ -10242,6 +10249,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.extra_sel = view.extra_sel;
         self.scroll = view.scroll;
         self.zoom = view.zoom;
+        self.view_mode = view.view_mode;
         self.nav_rect = None;
     }
 

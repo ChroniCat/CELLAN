@@ -12,6 +12,13 @@ pub struct Entry {
     pub tab: String,
 }
 
+impl AsRef<str> for Entry {
+    /// 使用频率按 action 记，不按显示名（改名不丢历史）
+    fn as_ref(&self) -> &str {
+        &self.action
+    }
+}
+
 impl Entry {
     pub fn path(&self) -> String {
         format!("{} › {}", self.tab, self.group)

@@ -16,6 +16,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const BOF: u16 = 0x0809;
+/// BIFF8 工作表保护：PROTECT(0x0012) + 旧式 16 位口令哈希 PASSWORD(0x0013)
+const PROTECT: u16 = 0x0012;
+const PASSWORD: u16 = 0x0013;
 const EOF: u16 = 0x000A;
 const CODEPAGE: u16 = 0x0042;
 const CALCMODE: u16 = 0x000D;
@@ -560,6 +563,17 @@ fn sheet_stream(
             b.extend_from_slice(&w16(*c2 as u16));
         }
         rec(&mut out, MERGEDCELLS, &b);
+    }
+
+    // Excel 自己把 PROTECT/PASSWORD 放在工作表流末尾（EOF 之前）；放前面会被判损坏。
+    if let Some(p) = sheet.protection.as_ref().filter(|p| p.sheet) {
+        // BIFF8 与 Excel 实测都只写 fLocked=1；对象/方案保护是另外的记录，
+        // 这里不冒充支持，避免给 Excel 一个自相矛盾的保护组合。
+        let grbit = 0x0001u16;
+        rec(&mut out, PROTECT, &w16(grbit));
+        if let Some(h) = p.legacy {
+            rec(&mut out, PASSWORD, &w16(h));
+        }
     }
 
     rec(&mut out, EOF, &[]);

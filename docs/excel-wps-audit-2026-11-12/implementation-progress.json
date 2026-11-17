@@ -6029,7 +6029,7 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt"
       ],
       "not_done": [
-        "双下划线/竖排已建模并经 Excel/WPS 回读；自定义数字格式已验；真实键鼠对话框未执行"
+        "UI-15.1 待验收（真实鼠标输入/取消/Excel-WPS 重开目视未做）；UI-15.2 待验收（.xls 保护编码已双向实测，真实鼠标对话框与逐格权限语义未做）；UI-15.3 待验收（双下划线/竖排已回读，真实键鼠未执行）。"
       ],
       "failures": [],
       "blocker": "",
@@ -6084,7 +6084,11 @@
             "crates/app/src/edit_regression_tests.rs",
             "crates/core/src/style.rs",
             "crates/core/src/xlsx.rs",
-            "crates/core/tests/font_style.rs"
+            "crates/core/tests/font_style.rs",
+            "crates/core/src/xls_write.rs",
+            "crates/core/src/xls_read.rs",
+            "crates/core/src/protection.rs",
+            "crates/core/tests/ui152_xls_protect.rs"
           ],
           "commits": [
             "b02c047",
@@ -6093,23 +6097,26 @@
           "commands": [
             "cargo test -p app --offline --bin app format_dialog_clears_fill_and_protection_on_existing_file -> 1 passed（修复前同一测试 0 passed / 1 failed：旧 fill 仍为 Some([200,10,10])）",
             "cargo test -p app --offline --bin app -> 230 passed / 0 failed / 0 ignored",
-            "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored"
+            "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored",
+            "cargo test -p sheetcore --lib -- protection:: -> 6 passed",
+            "cargo test -p sheetcore --test ui152_xls_protect -> 2 passed",
+            "Excel COM 打开本程序 .xls: ProtectContents=True, Unprotect(s3cret) ok"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-fill.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-1117.md"
           ],
           "not_done": [
             "真实鼠标填充页调色/保护页勾选/确定取消 Esc 未取证",
             "Excel 365/WPS 保存重开目视未做",
-            "工作表保护后仅锁定格不可编辑的逐格执行语义尚未验收",
-            ".xls protection 编码未覆盖"
+            "工作表保护后仅锁定格不可编辑的逐格执行语义尚未验收"
           ],
           "failures": [],
           "blocker": "",
           "next": "真实鼠标操作、Office 目视与逐格保护执行语义。",
-          "updated_utc": "2026-11-13T08:21:00Z"
+          "updated_utc": "2026-11-17T16:20:00Z"
         },
         {
           "id": "UI-15.3",
@@ -6175,8 +6182,7 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
       ],
       "not_done": [
-        "真实鼠标点击标签、右键菜单各入口、移动/复制对话框、30 表列表滚动未取证",
-        "Excel/WPS 实际切表后视图保持对比未做"
+        "UI-16.1 待验收（每表 view_mode 已实现并有回归；真实鼠标右键标签/拖动排序未做）。"
       ],
       "failures": [],
       "blocker": "",
@@ -6193,6 +6199,8 @@
           "acceptance": "SheetViewState 按 identity 保存/恢复；Ctrl+Page 与标签入口统一；复制到前方/同位保留原 B/C 视图；标签菜单/Ribbon 隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；30 表搜索、移动/复制目标、隐藏/取消隐藏已实现；5 项专项通过，full app 229。",
           "files": [
             "crates/app/src/main.rs",
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [
@@ -6206,20 +6214,21 @@
             "cargo test -p app --offline --bin app copy_sheet_to_ -> 2 passed",
             "cargo test -p app --offline --bin app hide_sheet_ -> 2 passed",
             "cargo test -p app --offline --bin app cross_sheet_undo_clears_restored_extra_selection -> 1 passed",
-            "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored",
+            "cargo test -p app --bin app -- sheet_view_state_is_restored_by_stable_identity --test-threads=1 -> 1 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-views.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md"
           ],
           "not_done": [
-            "真实鼠标右键标签/拖动排序未做（RDP 注入不可用）",
-            "每表视图只含 sel/scroll/zoom，不含打印/视图模式"
+            "真实鼠标右键标签/拖动排序未做（RDP 注入不可用）"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标/Office 目视后再验收 UI-16.1。",
-          "updated_utc": "2026-11-13T23:35:48Z"
+          "updated_utc": "2026-11-17T16:20:00Z"
         }
       ]
     },
@@ -6329,8 +6338,7 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
           ],
           "not_done": [
-            "真实鼠标点选与两次确认未执行",
-            "固定宽度分列未实现"
+            "真实鼠标点选与两次确认未执行"
           ],
           "failures": [],
           "blocker": "",
@@ -7192,7 +7200,9 @@
       "commits": [],
       "commands": [],
       "evidence": [],
-      "not_done": [],
+      "not_done": [
+        "UI-22.1 待验收（使用频率学习已实现并持久化；真实键盘逐字输入/方向键选择未做）。"
+      ],
       "failures": [],
       "blocker": "",
       "next": "",
@@ -7208,22 +7218,28 @@
           "acceptance": "",
           "files": [
             "crates/app/src/palette.rs",
-            "crates/app/src/main.rs"
+            "crates/app/src/main.rs",
+            "crates/app/src/cmdusage.rs",
+            "crates/app/src/palette.rs",
+            "crates/app/src/main.rs",
+            "crates/app/src/ribbon/actions.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p app --bin app -- cmdusage --test-threads=1 -> 2 passed"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-command-search.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md"
           ],
           "not_done": [
-            "真实键盘逐字输入与方向键选择未做",
-            "命令排序未做使用频率学习"
+            "真实键盘逐字输入与方向键选择未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T22:15:18Z"
+          "updated_utc": "2026-11-17T16:20:00Z"
         }
       ]
     },
