@@ -101,6 +101,17 @@ impl Font {
     pub fn text_width(&self, s: &str, size: f32) -> f32 {
         s.chars().map(|c| self.width_of(c, size)).sum()
     }
+
+    /// 把 cmap/hmtx 摘出来做成可共享的度量闭包（打印排版用，避免借用冲突）
+    pub fn metric(&self) -> std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync> {
+        let cmap = self.cmap.clone();
+        let widths = self.widths.clone();
+        std::sync::Arc::new(move |ch: char, size: f32| {
+            let g = *cmap.get(&ch).unwrap_or(&0) as usize;
+            let w = *widths.get(g).unwrap_or(&500) as f32;
+            w / 1000.0 * size
+        })
+    }
 }
 
 fn parse_cmap(data: &[u8], cmap_off: usize) -> HashMap<char, u16> {

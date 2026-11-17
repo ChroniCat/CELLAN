@@ -227,7 +227,7 @@ pub fn header_parts(text: &str, page: usize, total: usize) -> (String, String, S
 }
 
 /// 页面绘制指令（预览与 PDF 共用；PDF 在这里统一编码字形）
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct Out {
     pub rects: Vec<(f32, f32, f32, f32, [u8; 3])>,
     pub lines: Vec<(f32, f32, f32, f32, f32, [u8; 3])>,
@@ -236,6 +236,17 @@ pub struct Out {
     pub images: Vec<(f32, f32, f32, f32, String, Vec<u8>, String)>,
     /// 填充多边形（图表饼图/折线区域）
     pub polys: Vec<(Vec<(f32, f32)>, [u8; 3])>,
+    /// 真字体度量（导出 PDF 时挂上）；None 时退回 display::text_width 的估算
+    pub metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+}
+
+impl Out {
+    fn tw(&self, s: &str, size: f32) -> f32 {
+        match &self.metric {
+            Some(f) => s.chars().map(|c| f(c, size)).sum(),
+            None => display::text_width(s, size),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +365,7 @@ fn draw_view(
     let size = (view.size * scale).max(3.0);
     let pad = 2.0 * scale + view.indent as f32 * size * 0.6;
     let mut lines_txt = if view.wrap {
-        display::wrap_lines(&view.text, (cw - pad * 2.0).max(4.0), size)
+        display::wrap_lines_with(&view.text, (cw - pad * 2.0).max(4.0), size, out.metric.as_deref())
     } else {
         view.text.split('\n').map(|s| s.to_string()).collect()
     };
@@ -372,7 +383,7 @@ fn draw_view(
         _ => bottom - (ch - total_h) - size * 0.28,
     };
     for line in &lines_txt {
-        let tw = display::text_width(line, size);
+        let tw = out.tw(line, size);
         let tx = match view.halign {
             1 => x + (cw - tw) / 2.0,
             2 => x + cw - pad - tw,
@@ -452,13 +463,13 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
         } else {
             format!("{}（保留原图，不能在此编辑）", ch.title)
         };
-        let tw = display::text_width(&label, 9.0);
+        let tw = out.tw(&label, 9.0);
         chart_text(out, x + (w - tw) / 2.0, y + h / 2.0, 9.0, &label, [120, 90, 40]);
         return;
     }
     let mut top = y + h - 6.0;
     if !ch.title.is_empty() {
-        let tw = display::text_width(&ch.title, 10.0);
+        let tw = out.tw(&ch.title, 10.0);
         chart_text(out, x + (w - tw) / 2.0, top, 10.0, &ch.title, [40, 40, 40]);
         top -= 14.0;
     }
@@ -490,11 +501,22 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 crate::style::format_value(&crate::model::Value::Number(v), &ch.y_fmt)
             }
         };
-        for k in 0..=4 {
-            let v = max_main * k as f64 / 4.0;
+        // 刻度步长取「整齐数」（Excel 的 0/5/10/15/20/25，而不是固定五等分）
+        let step = nice_step(max_main / 5.0);
+        let n_steps = ((max_main / step).ceil() as usize).clamp(1, 12);
+        for k in 0..=n_steps {
+            let v = step * k as f64;
             let txt = tick(v);
-            let tw = display::text_width(&txt, 7.0);
-            chart_text(out, px0 - tw - 3.0, py0 + ph * (k as f32 / 4.0) - 2.5, 7.0, &txt, [90, 90, 90]);
+            let tw = out.tw(&txt, 7.0);
+            let frac = (v / max_main) as f32;
+            chart_text(
+                out,
+                px0 - tw - 3.0,
+                py0 + ph * frac - 2.5,
+                7.0,
+                &txt,
+                [90, 90, 90],
+            );
         }
         // 分类标签（散点用数值 X 轴，不画分类名）
         let scatter = ch
@@ -505,7 +527,7 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
             let gw = pw / n as f32;
             if let Some(cats) = ch.series.iter().map(|se| &se.cats).find(|c| !c.is_empty()) {
                 for (i, c) in cats.iter().take(n).enumerate() {
-                    let tw = display::text_width(c, 7.0);
+                    let tw = out.tw(c, 7.0);
                     chart_text(out, px0 + gw * (i as f32 + 0.5) - tw / 2.0, py0 - 9.0, 7.0, c, [90, 90, 90]);
                 }
             }
@@ -709,7 +731,7 @@ fn draw_objects(
         }
         let size = tb.size.max(4.0);
         let mut ty = yy + h - size;
-        for line in display::wrap_lines(&tb.text, (w - 4.0).max(4.0), size) {
+        for line in display::wrap_lines_with(&tb.text, (w - 4.0).max(4.0), size, out.metric.as_deref()) {
             out.texts.push(TextOp {
                 x: x + 2.0,
                 baseline: ty,
@@ -743,6 +765,18 @@ pub fn page_ops_with(
     page_index: usize,
     source: Option<&Path>,
 ) -> Out {
+    page_ops_metric(wb, sheet_idx, layout, page_index, source, None)
+}
+
+/// 同上，并挂上真字体度量（导出 PDF 用；预览传 None）
+pub fn page_ops_metric(
+    wb: &Workbook,
+    sheet_idx: usize,
+    layout: &Layout,
+    page_index: usize,
+    source: Option<&Path>,
+    metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+) -> Out {
     let sheet = &wb.sheets[sheet_idx];
     let setup = &sheet.page;
     let (pw, ph) = layout.page_size;
@@ -750,6 +784,7 @@ pub fn page_ops_with(
     let px = layout.scale * 0.75;
     let span = &layout.pages[page_index];
     let mut out = Out::default();
+    out.metric = metric;
 
     let mut cf_state: Option<CfState> = None;
     if !sheet.cf.blocks.is_empty() {
@@ -766,7 +801,7 @@ pub fn page_ops_with(
             if seg.is_empty() {
                 continue;
             }
-            let tw = display::text_width(&seg, 9.0);
+            let tw = out.tw(&seg, 9.0);
             let tx = match align {
                 1 => (pw - tw) / 2.0,
                 2 => pw - mr - tw,
@@ -861,7 +896,7 @@ pub fn page_ops_with(
             if seg.is_empty() {
                 continue;
             }
-            let tw = display::text_width(&seg, 8.5);
+            let tw = out.tw(&seg, 8.5);
             let tx = match align {
                 1 => (pw - tw) / 2.0,
                 2 => pw - mr - tw,
@@ -925,6 +960,9 @@ pub fn export_pdf_pages_from(
         None => (0, total.saturating_sub(1)),
     };
     let font = Font::load(font_path)?;
+    // 暂不启用真字体度量：Excel 排版按 Calibri 度量，我们用 Noto 会把右对齐推得更偏
+    // （实测 ¥ 列偏差 26.5pt → 35.0pt）。度量闭包保留在 Font::metric()，等换度量兼容字体再挂。
+    let metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>> = None;
     let mut doc = Doc::new(font);
     let mut exported = 0usize;
     for pi in first..=last {
@@ -934,7 +972,7 @@ pub fn export_pdf_pages_from(
         exported += 1;
         let (pw, ph) = layout.page_size;
         doc.add_page(pw, ph);
-        let out = page_ops_with(wb, sheet_idx, &layout, pi, source);
+        let out = page_ops_metric(wb, sheet_idx, &layout, pi, source, metric.clone());
         for (x, y, w, h, color) in out.rects {
             doc.page_mut().rect_fill(x, y, w, h, color);
         }
@@ -999,6 +1037,20 @@ fn series_kind(se: &crate::charts::Series, chart_kind: crate::charts::ChartKind)
         ChartKind::Combo => ChartKind::Column,
         k => k,
     }
+}
+
+/// 刻度步长向上取「整齐数」：1/2/2.5/5×10^n
+fn nice_step(x: f64) -> f64 {
+    if !(x > 0.0) || !x.is_finite() {
+        return 1.0;
+    }
+    let base = 10f64.powf(x.log10().floor());
+    for m in [1.0, 2.0, 2.5, 5.0, 10.0] {
+        if x <= m * base * (1.0 + 1e-9) {
+            return m * base;
+        }
+    }
+    base * 10.0
 }
 
 /// 坐标轴顶端取“整齐”数值（1/2/2.5/5×10^n），与 Excel 的百分比轴 0/25/50/75/100% 一致

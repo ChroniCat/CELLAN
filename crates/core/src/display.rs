@@ -160,12 +160,31 @@ fn format_value(sys: DateSystem, v: &Value, st: &CellStyle) -> String {
 /// 按格宽折行（按字符估算宽度：CJK 约 1 个字号，ASCII 约 0.55）。
 /// 返回至少一行；`\n` 强制换行。
 pub fn wrap_lines(text: &str, width_pt: f32, size: f32) -> Vec<String> {
+    wrap_lines_with(text, width_pt, size, None)
+}
+
+/// 同上，但可传入真字体度量（导出 PDF 时用；预览/屏幕传 None 走估算）
+pub fn wrap_lines_with(
+    text: &str,
+    width_pt: f32,
+    size: f32,
+    metric: Option<&(dyn Fn(char, f32) -> f32 + Send + Sync)>,
+) -> Vec<String> {
     let mut out = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         let mut w = 0.0f32;
         for ch in para.chars() {
-            let cw = if (ch as u32) > 0x2e80 { size } else { size * 0.55 };
+            let cw = match metric {
+                Some(f) => f(ch, size),
+                None => {
+                    if (ch as u32) > 0x2e80 {
+                        size
+                    } else {
+                        size * 0.55
+                    }
+                }
+            };
             if w + cw > width_pt && !line.is_empty() {
                 out.push(std::mem::take(&mut line));
                 w = 0.0;
