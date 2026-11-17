@@ -25,7 +25,9 @@ fn percent_ticks_are_drawn_with_the_axis_format() {
     let out = sheetcore::print::page_ops_with(&wb, 0, &layout, 0, Some(&fixture()));
     let texts: Vec<&str> = out.texts.iter().map(|t| t.text.as_str()).collect();
     assert!(texts.iter().any(|t| t.ends_with('%')), "刻度应显示百分比：{texts:?}");
-    assert!(texts.contains(&"25%"), "0.9 的轴应有 25% 刻度：{texts:?}");
+    // Excel COM 实测：MaximumScale=1 MajorUnit=0.1 → 0/10%/…/100%
+    assert!(texts.contains(&"10%"), "0.9 的百分比轴应按 10% 一格：{texts:?}");
+    assert!(texts.contains(&"100%"), "上限 1.0 应有 100% 刻度：{texts:?}");
 }
 
 #[test]

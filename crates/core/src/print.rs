@@ -501,8 +501,10 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 crate::style::format_value(&crate::model::Value::Number(v), &ch.y_fmt)
             }
         };
-        // 刻度步长取「整齐数」（Excel 的 0/5/10/15/20/25，而不是固定五等分）
-        let step = nice_step(max_main / 5.0);
+        // 刻度步长取「整齐数」（Excel 的 0/5/10/15/20/25，而不是固定五等分）。
+        // 百分比轴 Excel 默认 10 格（max=1 → 0/10%/…/100%），数值轴常见 5 格。
+        let want = if ch.y_fmt.contains('%') { 10.0 } else { 5.0 };
+        let step = nice_step(max_main / want);
         let n_steps = ((max_main / step).ceil() as usize).clamp(1, 12);
         for k in 0..=n_steps {
             let v = step * k as f64;

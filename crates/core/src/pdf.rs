@@ -36,6 +36,11 @@ impl Font {
     /// 从 TTF 读出来（不支持 TTC 集合，调用方传单体字体）
     pub fn load(path: &Path) -> Result<Font> {
         let data = std::fs::read(path).with_context(|| format!("读字体失败 {}", path.display()))?;
+        Font::parse(data)
+    }
+
+    /// 从内存里的 TTF 字节解析（内嵌子集字体走这条）
+    pub fn parse(data: Vec<u8>) -> Result<Font> {
         anyhow::ensure!(data.len() > 12, "字体文件太小");
         anyhow::ensure!(
             &data[0..4] == b"\x00\x01\x00\x00" || &data[0..4] == b"true",
@@ -100,6 +105,19 @@ impl Font {
 
     pub fn text_width(&self, s: &str, size: f32) -> f32 {
         s.chars().map(|c| self.width_of(c, size)).sum()
+    }
+
+    /// 字形宽度（em 的千分比）；字体里没有这个字返回 None
+    pub fn advance(&self, ch: char) -> Option<f32> {
+        let g = *self.cmap.get(&ch)? as usize;
+        if g == 0 {
+            return None;
+        }
+        let w = *self.widths.get(g)? as f32;
+        if w <= 0.0 {
+            return None;
+        }
+        Some(w / 1000.0)
     }
 
     /// 把 cmap/hmtx 摘出来做成可共享的度量闭包（打印排版用，避免借用冲突）

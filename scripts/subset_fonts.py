@@ -19,6 +19,8 @@ FONTS = [
     ("NotoSerifSC-Regular.ttf", "NotoSerifSC-Regular.subset.ttf"),
     ("Inter-Regular.ttf", "Inter-Regular.subset.ttf"),
     ("JetBrainsMono-Regular.ttf", "JetBrainsMono-Regular.subset.ttf"),
+    # Carlito：度量与 Calibri 兼容（SIL OFL）。只用于排版宽度计算，不含 CJK 字形。
+    ("Carlito-Regular.ttf", "Carlito-Regular.subset.ttf"),
 ]
 
 

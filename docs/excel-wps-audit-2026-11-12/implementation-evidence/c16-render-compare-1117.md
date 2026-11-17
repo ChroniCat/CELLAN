@@ -185,3 +185,37 @@ p2 textset_same=True  last_row ours=60 excel=60
 3. 自动换行断行点一致（未满足，需度量兼容字体或按 Calibri 表排版）
 
 前两项可复跑；第三项是字体资产问题，与 C16 的排版代码无关。
+
+---
+
+## 落地：引入 Carlito（SIL OFL）做排版度量
+
+- 新增 `assets/fonts/Carlito-Regular.ttf` + 子集 `assets/fonts/subset/Carlito-Regular.subset.ttf`（159KB）+ `OFL-Carlito.txt`；
+  子集脚本 `scripts/subset_fonts.py` 的 FONTS 表加入 Carlito，字符集与其它内嵌字体同一套。
+- `display::char_width(char, size)`：拉丁/数字用 Carlito 的真实 advance（`Font::advance`），
+  CJK 仍 1em，Carlito 缺字形时退回 0.55×字号。`text_width` 与 `wrap_lines_with` 都走它，
+  **预览和 PDF 导出因此共用同一套度量**（C16.4 要求的“同一个显示模型”）。
+- `pdf.rs`：`Font::load` 拆出 `Font::parse(Vec<u8>)`，并新增 `Font::advance(ch) -> Option<f32>`。
+
+## 刻度再校准（Excel COM 真值）
+
+`c19/axes.xlsx` 图表 Y 轴 `MaximumScale=1 MajorUnit=0.1` → 0/10%/…/100%。
+数值轴（`objects.xlsx`）仍是 0/5/…/25。
+所以：百分比轴按 10 格取整齐步长、其它按 5 格。`c19_axes` 用例同步改为断言 10%/100%。
+
+## 归一化拟合结果（`scripts/c16_pdf_fit.py`）
+
+以 16 个 token 的左上角做最小二乘（x' = s·x + c）：
+
+```text
+x: s=0.9003 c=+6.67  max|res|=6.64 rms=2.51
+y: s=1.0356 c=-31.12 max|res|=3.35 rms=2.32
+残差>2pt 的只有 ¥ 金额(-6.6)、25.6%(+4.7)、--987.65(-3.1) —— 都是右对齐且依赖字形宽度
+```
+
+即：整体只差一个全局缩放（Excel 导出链路的 ~0.90），**相对布局已对齐到 2–3pt**。
+剩余误差集中在“右对齐 + 字形宽度”，属字体资产层面的尾差。
+
+## 测试
+
+`core-carlito2.log CORE_EXIT=0`、`app-carlito.log APP_EXIT=0`（app 375 passed / 1 ignored）。

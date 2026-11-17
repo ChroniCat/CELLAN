@@ -177,13 +177,7 @@ pub fn wrap_lines_with(
         for ch in para.chars() {
             let cw = match metric {
                 Some(f) => f(ch, size),
-                None => {
-                    if (ch as u32) > 0x2e80 {
-                        size
-                    } else {
-                        size * 0.55
-                    }
-                }
+                None => char_width(ch, size),
             };
             if w + cw > width_pt && !line.is_empty() {
                 out.push(std::mem::take(&mut line));
@@ -202,9 +196,30 @@ pub fn wrap_lines_with(
 
 /// 屏幕/预览/PDF 共用的行内文本宽度估算
 pub fn text_width(s: &str, size: f32) -> f32 {
-    s.chars()
-        .map(|c| if (c as u32) > 0x2e80 { size } else { size * 0.55 })
-        .sum()
+    s.chars().map(|c| char_width(c, size)).sum()
+}
+
+/// 单个字符的排版宽度。
+///
+/// 拉丁/数字优先用内嵌 Carlito（与 Calibri 度量兼容）的真实 advance，
+/// 这样自动换行的断行点、右对齐位置才和 Excel 一致；CJK 仍按 1em（Excel 用等线/宋体也是 1em），
+/// Carlito 里没有的字符退回 0.55×字号估算。
+pub fn char_width(c: char, size: f32) -> f32 {
+    static FONT: std::sync::OnceLock<Option<crate::pdf::Font>> = std::sync::OnceLock::new();
+    if (c as u32) < 0x2e80 {
+        let f = FONT.get_or_init(|| {
+            crate::pdf::Font::parse(
+                include_bytes!("../../../assets/fonts/subset/Carlito-Regular.subset.ttf").to_vec(),
+            )
+            .ok()
+        });
+        if let Some(font) = f {
+            if let Some(em) = font.advance(c) {
+                return em * size;
+            }
+        }
+    }
+    if (c as u32) > 0x2e80 { size } else { size * 0.55 }
 }
 
 /// 样式表里取样式（给需要直接读样式的调用方）
