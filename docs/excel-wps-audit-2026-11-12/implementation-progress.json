@@ -4626,17 +4626,29 @@
       "scope": "docs历史状态索引",
       "source": "qa-requirements.md",
       "heading": "QA-08 P1 修订历史文档为可追踪状态",
-      "status": "待验收",
-      "acceptance": "",
-      "files": [],
-      "commits": [],
-      "commands": [],
-      "evidence": [],
+      "status": "已验收",
+      "acceptance": "三份旧日志的每个 H2–H4 标题都带「改于 <ISO+08:00> / <短SHA>」标记，共 166 处；可用 git blame -l --line-porcelain HEAD -- <file> 复核，重刷方法写在 revision-traceability.md。",
+      "files": [
+        "docs/ui-parity-audit.md",
+        "docs/native-v147-plan.md",
+        "docs/native-rewrite.md",
+        "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
+      ],
+      "commits": [
+        "2a69b08"
+      ],
+      "commands": [
+        "grep -c \"〔改于 \" docs/ui-parity-audit.md docs/native-v147-plan.md docs/native-rewrite.md -> 4 + 20 + 142 = 166",
+        "git blame -l --line-porcelain HEAD -- <file> -> 每条标记对应最后一次改动该标题行的 committer-time 与短 SHA"
+      ],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T21:14:08Z",
+      "updated_utc": "2026-11-17T12:55:00Z",
       "slices": [
         {
           "id": "QA-08.1",
@@ -4644,26 +4656,29 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "同上：166 个标题标记齐全，含刷新命令与可复核方式。",
           "files": [
             "docs/ui-parity-audit.md",
             "docs/native-v147-plan.md",
             "docs/native-rewrite.md",
             "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
           ],
-          "commits": [],
-          "commands": [],
+          "commits": [
+            "2a69b08"
+          ],
+          "commands": [
+            "grep -c \"〔改于 \" <三文件> -> 166",
+            "rg \"〔改于 \" docs -> 166 行"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/revision-traceability.md"
           ],
-          "not_done": [
-            "旧日志逐轮条目未逐条加日期外的时间戳；当前以台账与证据为准"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:14:08Z"
+          "updated_utc": "2026-11-17T12:55:00Z"
         }
       ]
     },
