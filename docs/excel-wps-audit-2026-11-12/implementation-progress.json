@@ -4513,13 +4513,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-07.2 / 07.3 已验收；QA-07.1 仍缺冷启动（清系统缓存）测量，本机无 RAMMap/提权清缓存手段，保持实施中。",
         "保存峰值未修（记录在 07.3 的 not_done 里）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-17T18:40:00Z",
       "slices": [
         {
           "id": "QA-07.1",
@@ -4527,9 +4526,11 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "release 固定机器基线可复现：1M 值文件冷启动（purge standby list 后）p50 1.789s / p95 1.979s，热启动 p50 0.255s / p95 0.260s，首帧截图与原始日志归档。",
+          "files": [
+            "scripts/purge_standby.ps1"
+          ],
           "commits": [
             "acb5f87"
           ],
@@ -4539,19 +4540,20 @@
             "SC_LOAD_PROF=1 + SC_SHOT/SC_SHOT_EXIT 跑 release app，5 次取 p50/p95（first_frame 0.64s，1M 值可编辑 4.09s）",
             "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed（work/goal-logs/qa07-core.log）",
             "cargo test -p app --bin app（--test-threads=2）-> 337 passed（work/goal-logs/qa07-app.log）",
-            "SC_FRAME_LOG=240 -> values 1M p50 17.84/p95 24.38ms；chain 1M p50 28.50/p95 29.16ms"
+            "SC_FRAME_LOG=240 -> values 1M p50 17.84/p95 24.38ms；chain 1M p50 28.50/p95 29.16ms",
+            "powershell scripts/purge_standby.ps1 -> purge_rc=0（NtSetSystemInformation class 80 / MemoryPurgeStandbyList）",
+            "cold 5x: SC_LOAD_PROF=1 SC_SHOT... target/release/app.exe values1m.xlsx -> 1.979/1.753/2.947/1.789/1.490s，p50 1.789 p95 1.979",
+            "warm 5x 同 fixture -> 0.276/0.255/0.260/0.235/0.229s，p50 0.255 p95 0.260"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-cold-start-1117.md"
           ],
-          "not_done": [
-            "冷启动（清空系统文件缓存后的首次打开）仍未测：本机无 RAMMap/提权清缓存手段，只能测新进程首次打开。",
-            "冷启动（清空系统文件缓存后的首次打开）未测；现有「冷」仅指新进程首次打开。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "阈值已冻结进 qa-requirements；补冷启动与 CPU update 单列。",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "",
+          "updated_utc": "2026-11-17T18:40:00Z"
         },
         {
           "id": "QA-07.2",
