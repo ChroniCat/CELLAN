@@ -94,6 +94,7 @@ fn edit_and_save_roundtrip() {
 
     // 用我们自己的加载器回读
     let wb2 = sheetcore::xlsx::load(&out).unwrap();
+    assert!(!wb2.sheet(0).sparklines_dirty, "仅载入不能标 dirty，否则重存会丢模型外属性");
     let list = &wb2.sheet(0).sparklines;
     assert_eq!(list.len(), 6, "原 5 条 + 新增 H1");
     let h1 = list.iter().find(|s| (s.r, s.c) == (0, 7)).expect("H1");

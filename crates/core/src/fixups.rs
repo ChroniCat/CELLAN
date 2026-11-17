@@ -1048,9 +1048,10 @@ pub fn ensure_content_types(path: &Path, base: &Path) -> Result<Vec<String>> {
             let name = part.trim_start_matches('/').to_string();
             let exists = parts.iter().any(|p| p == &name);
             let declared = new_ct.contains(&format!("PartName=\"{part}\""));
-            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-            let has_default = new_ct.contains(&format!("Extension=\"{ext}\""));
-            if exists && !declared && !has_default {
+            // 不能因为存在同扩展名的 Default 就跳过 Override：Default 的
+            // `xml -> application/xml` 不是 worksheet/chart 的具体类型，
+            // 少这一条 Excel 会判整包损坏（WPS 不校验，照样能开）。
+            if exists && !declared {
                 add.push_str(tag);
                 added += 1;
             }

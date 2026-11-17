@@ -28,7 +28,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    sheetcore::formula::recalc_all(&mut wb);
+    // 纯文件往返不重算：重算会把动态数组表标成 edited，保存时重写公式
+    // （_xlfn 前缀/溢出缓存丢失）。公式由打开端自己重算。
     if let Err(error) = sheetcore::xlsx::save(&output, &wb) {
         eprintln!("save failed: {error}");
         std::process::exit(1);

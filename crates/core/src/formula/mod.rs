@@ -3112,6 +3112,10 @@ pub fn recalc_all_force_impl(
 ) -> bool {
     use std::sync::atomic::Ordering;
     let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
+    // 重算不是用户编辑：记下 edited，写回后再恢复。否则未改过的表
+    // （尤其是动态数组表）会被当成 dirty，保存时整表重写，_xlfn 前缀
+    // 和溢出缓存都会丢，Excel 打不开/结果不对。
+    let edited_before: Vec<bool> = wb.sheets.iter().map(|s| s.edited).collect();
     wb.calc_pending = false;
     wb.calc_pending_sheets.clear();
     let phase = std::env::var("SC_PHASE").is_ok();
@@ -3189,6 +3193,9 @@ pub fn recalc_all_force_impl(
                     if i % 256 == 0 && flag.load(Ordering::Relaxed) {
                         drop(calc);
                         wb.calc_pending = true;
+                        for (sheet, was) in wb.sheets.iter_mut().zip(edited_before.iter()) {
+                            sheet.edited = *was;
+                        }
                         functions::set_now_snapshot(prev_now);
                         return false;
                     }
@@ -3312,6 +3319,9 @@ pub fn recalc_all_force_impl(
     if let Some((done, total)) = progress {
         let n = total.load(Ordering::Relaxed);
         done.store(n, Ordering::Relaxed);
+    }
+    for (sheet, was) in wb.sheets.iter_mut().zip(edited_before.iter()) {
+        sheet.edited = *was;
     }
     functions::set_now_snapshot(prev_now);
     true
@@ -3579,6 +3589,19 @@ mod calc_sheet_tests {
 
     fn f(text: &str) -> Cell {
         Cell { value: crate::Value::Empty, formula: Some(text.into()) }
+    }
+
+    #[test]
+    fn recalc_does_not_mark_sheet_edited() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell {
+            value: crate::Value::Empty,
+            formula: Some("=1+1".into()),
+        });
+        wb.sheets[0].edited = false;
+        recalc_all(&mut wb);
+        assert!(!wb.sheets[0].edited, "重算不是用户编辑，不能标 dirty");
+        assert_eq!(wb.sheets[0].value(0, 0), crate::Value::Number(2.0));
     }
 
     #[test]

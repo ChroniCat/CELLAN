@@ -950,8 +950,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                                 // 渲染层按 (列, 行) 二分查找，这里保证有序
                                 list.sort_by_key(|s| (s.c, s.r));
                                 sheet.sparklines = list;
-                                // 模型外的属性不保证原样保留，载入即标记重写
-                                sheet.sparklines_dirty = true;
+                                // 载入不标 dirty：未编辑的表要按基准原样保留，
+                                // 否则 sparklineGroup 的 lineWeight/xr2:uid 等
+                                // 模型外属性会在重写时丢掉（Excel 会判损坏）。
                             }
                         }
                     }
