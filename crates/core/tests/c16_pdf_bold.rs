@@ -111,3 +111,29 @@ fn page_ops_honours_vmetric() {
     let b2 = with_tall.texts.iter().find(|t| t.text.contains("粗体")).unwrap().baseline;
     assert!((b2 - b0).abs() > 0.05, "换字体度量后基线没变（vmetric 没生效）");
 }
+
+#[test]
+fn pdf_embeds_only_glyphs_actually_used() {
+    let regular = std::fs::read(assets().join("NotoSansSC-Regular.subset.ttf")).unwrap();
+    let full_len = regular.len();
+    let font = Font::parse(regular).unwrap();
+    let hex = sheetcore::pdf::Page::glyph_hex(&font, "销售汇总");
+    let mut doc = sheetcore::pdf::Doc::new(font);
+    doc.add_page(595.0, 842.0);
+    doc.page_mut()
+        .text_styled_face("F1", 50.0, 100.0, 11.0, &hex, [0, 0, 0], false, 0.0);
+    let path = std::env::temp_dir().join(format!("sheetcore_pdf_subset_{}.pdf", std::process::id()));
+    doc.write(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    // 整份 PDF（含 ToUnicode/Widths）应远小于完整字体，更远小于原来的 5.7MB
+    assert!(
+        bytes.len() < full_len / 2,
+        "PDF {} 字节，完整字体 {} 字节，字体没被裁",
+        bytes.len(),
+        full_len
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("/FontFile2"), "字体流应当还在");
+    assert!(text.contains("/F1"), "文字应使用 F1");
+}

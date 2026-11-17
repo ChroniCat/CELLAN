@@ -1,0 +1,550 @@
+{
+ "print": {
+  "file": "crates/core/tests/fixtures/c16/print.xlsx",
+  "pages": 2,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   true,
+   true
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   56.0,
+   506.8
+  ],
+  "ink_x_range": [
+   54.0,
+   541.7
+  ],
+  "export_log": [
+   "[pdf] 已导出 2 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_print.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "row_tokens": {
+   "missing": [],
+   "duplicates": {},
+   "distinct": 51
+  },
+  "titles_each_page": [
+   true,
+   true
+  ],
+  "page_num_each_page": [
+   true,
+   true
+  ],
+  "row_split": [
+   [
+    "行1010550",
+    "行11115"
+   ],
+   [
+    "行454522",
+    "行4646231058"
+   ]
+  ],
+  "text_len": [
+   555,
+   243
+  ],
+  "peers": {
+   "wps": {
+    "pages": 2,
+    "text_equal": false,
+    "len": [
+     798,
+     798
+    ],
+    "same_char_ratio": 0.896,
+    "words_missing_in_pdf": 2,
+    "words_extra_in_pdf": 2,
+    "sample_missing": [
+     [
+      "这一格用来自动换行：打印与预览必须按同一个显示模型折行",
+      1
+     ],
+     [
+      "，不能各算一套。",
+      1
+     ]
+    ],
+    "sample_extra": [
+     [
+      "这一格用来自动换行：打印与预览必须按同一个显示模型折行，不",
+      1
+     ],
+     [
+      "能各算一套。",
+      1
+     ]
+    ]
+   },
+   "excel": {
+    "pages": 2,
+    "text_equal": false,
+    "len": [
+     798,
+     798
+    ],
+    "same_char_ratio": 0.393,
+    "words_missing_in_pdf": 2,
+    "words_extra_in_pdf": 2,
+    "sample_missing": [
+     [
+      "这一格用来自动换行：打印与预览必须按同一个显示模型折行",
+      1
+     ],
+     [
+      "，不能各算一套。",
+      1
+     ]
+    ],
+    "sample_extra": [
+     [
+      "这一格用来自动换行：打印与预览必须按同一个显示模型折",
+      1
+     ],
+     [
+      "行，不能各算一套。",
+      1
+     ]
+    ]
+   }
+  }
+ },
+ "objects": {
+  "file": "crates/core/tests/fixtures/c16/objects.xlsx",
+  "pages": 1,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   null
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   52.4,
+   444.4
+  ],
+  "ink_x_range": [
+   52.4,
+   444.4
+  ],
+  "export_log": [
+   "[pdf] 已导出 1 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_objects.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "images_page1": [
+   [
+    70.4,
+    414.0,
+    166.4,
+    478.0
+   ]
+  ],
+  "drawings_page1": 11,
+  "textbox_present": true,
+  "text_len": [
+   58
+  ],
+  "peers": {
+   "wps": {
+    "pages": 1,
+    "text_equal": false,
+    "len": [
+     58,
+     36
+    ],
+    "same_char_ratio": 0.328,
+    "words_missing_in_pdf": 11,
+    "words_extra_in_pdf": 0,
+    "sample_missing": [
+     [
+      "一月",
+      1
+     ],
+     [
+      "二月",
+      1
+     ],
+     [
+      "三月",
+      1
+     ],
+     [
+      "四月",
+      1
+     ],
+     [
+      "季度销量",
+      1
+     ]
+    ],
+    "sample_extra": []
+   },
+   "excel": {
+    "pages": 1,
+    "text_equal": false,
+    "len": [
+     58,
+     58
+    ],
+    "same_char_ratio": 0.707,
+    "words_missing_in_pdf": 0,
+    "words_extra_in_pdf": 0,
+    "sample_missing": [],
+    "sample_extra": []
+   }
+  }
+ },
+ "number_formats": {
+  "file": "crates/core/tests/fixtures/c16/number_formats.xlsx",
+  "pages": 1,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   null
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   56.0,
+   267.9
+  ],
+  "ink_x_range": [
+   56.0,
+   267.9
+  ],
+  "export_log": [
+   "[pdf] 已导出 1 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_number_formats.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "text_len": [
+   38
+  ]
+ },
+ "wrap": {
+  "file": "crates/core/tests/fixtures/c16/wrap.xlsx",
+  "pages": 1,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   null
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   56.0,
+   116.0
+  ],
+  "ink_x_range": [
+   56.0,
+   116.0
+  ],
+  "export_log": [
+   "[pdf] 已导出 1 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_wrap.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "text_len": [
+   6
+  ]
+ },
+ "hidden": {
+  "file": "crates/core/tests/fixtures/qa09/hidden.xlsx",
+  "pages": 1,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   true
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   56.0,
+   168.0
+  ],
+  "ink_x_range": [
+   56.0,
+   316.7
+  ],
+  "export_log": [
+   "[pdf] 已导出 1 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_hidden.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "hidden_absent": true,
+  "visible_present": true,
+  "text_len": [
+   53
+  ],
+  "peers": {
+   "excel": {
+    "pages": 1,
+    "text_equal": false,
+    "len": [
+     53,
+     52
+    ],
+    "same_char_ratio": 0.34,
+    "words_missing_in_pdf": 1,
+    "words_extra_in_pdf": 1,
+    "sample_missing": [
+     [
+      "隐藏行列打印样本",
+      1
+     ]
+    ],
+    "sample_extra": [
+     [
+      "隐藏行列打印样",
+      1
+     ]
+    ]
+   }
+  }
+ },
+ "fit_width": {
+  "file": "crates/core/tests/fixtures/qa09/fit_width.xlsx",
+  "pages": 1,
+  "page_size": [
+   0.0,
+   0.0,
+   595.3,
+   841.9
+  ],
+  "words_outside_page": 0,
+  "overlapping_word_pairs": 0,
+  "fonts": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "non_embedded": [
+   [
+    "Embedded",
+    "Type0",
+    "ttf"
+   ],
+   [
+    "EmbeddedBold",
+    "Type0",
+    "ttf"
+   ]
+  ],
+  "page_labels": [
+   null
+  ],
+  "body_inside_margins": true,
+  "body_x_range": [
+   54.8,
+   536.8
+  ],
+  "ink_x_range": [
+   54.8,
+   536.8
+  ],
+  "export_log": [
+   "[pdf] 已导出 1 页 F:\\finance-native-sheets-ready\\work\\probe\\qa09\\app_fit_width.pdf"
+  ],
+  "source_sha_unchanged": true,
+  "last_col_present": true,
+  "last_col_x": 515.0,
+  "text_len": [
+   2385
+  ],
+  "peers": {
+   "excel": {
+    "pages": 1,
+    "text_equal": true,
+    "len": [
+     2385,
+     2385
+    ],
+    "same_char_ratio": 1.0,
+    "words_missing_in_pdf": 9,
+    "words_extra_in_pdf": 1,
+    "sample_missing": [
+     [
+      "第10列标题",
+      1
+     ],
+     [
+      "第11列标题",
+      1
+     ],
+     [
+      "第12列标题",
+      1
+     ],
+     [
+      "第13列标题",
+      1
+     ],
+     [
+      "第14列标题",
+      1
+     ]
+    ],
+    "sample_extra": [
+     [
+      "第10列标题第11列标题第12列标题第13列标题第14列标题第15列标题第16列标题第17列标题第18列标题",
+      1
+     ]
+    ]
+   }
+  }
+ }
+}

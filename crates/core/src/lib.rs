@@ -1,3 +1,4 @@
+pub mod font_subset;
 pub mod formula;
 pub mod mem;
 pub mod errors;

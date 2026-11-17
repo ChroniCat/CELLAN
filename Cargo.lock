@@ -3262,6 +3262,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ttf-parser",
  "umya-spreadsheet",
  "windows-sys 0.52.0",
  "zip 8.6.0",

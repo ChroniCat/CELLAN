@@ -48,6 +48,24 @@ fn margins_pt(setup: &PageSetup) -> (f32, f32, f32, f32) {
     (m[0] * 72.0, m[1] * 72.0, m[2] * 72.0, m[3] * 72.0)
 }
 
+/// 行高：隐藏行（手动隐藏或筛选隐藏）不占打印高度
+fn row_h(sheet: &Sheet, r: u32) -> f32 {
+    if sheet.hidden_rows.contains(&r) || sheet.hidden_rows_user.contains(&r) {
+        0.0
+    } else {
+        sheet.rows.size(r)
+    }
+}
+
+/// 列宽：隐藏列不占打印宽度
+fn col_w(sheet: &Sheet, c: u32) -> f32 {
+    if sheet.hidden_cols.contains(&c) {
+        0.0
+    } else {
+        sheet.cols.size(c)
+    }
+}
+
 /// 分页：按列宽/行高累加，超出可打印区就换页。
 ///
 /// 打印标题（顶端标题行 / 左侧标题列）每页重复，正文从标题之后开始：
@@ -73,7 +91,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
 
     let mut scale = if setup.fit_to_page {
         let target_w = printable.0 * setup.fit_width.max(1) as f32;
-        let total_w: f32 = (c1..=c2).map(|c| sheet.cols.size(c)).sum();
+        let total_w: f32 = (c1..=c2).map(|c| col_w(sheet, c)).sum();
         if total_w > 0.0 {
             (target_w / (total_w * 0.75)).min(1.0)
         } else {
@@ -84,7 +102,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     };
     if setup.fit_to_page && setup.fit_height > 0 {
         let target_h = printable.1 * setup.fit_height as f32;
-        let total_h: f32 = (r1..=r2).map(|r| sheet.rows.size(r)).sum();
+        let total_h: f32 = (r1..=r2).map(|r| row_h(sheet, r)).sum();
         if total_h > 0.0 {
             scale = scale.min((target_h / (total_h * 0.75)).min(1.0));
         }
@@ -94,11 +112,11 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     let title_rows = setup.title_rows.map(|(a, b)| (a, b.min(r2))).filter(|(a, b)| a <= b);
     let title_cols = setup.title_cols.map(|(a, b)| (a, b.min(c2))).filter(|(a, b)| a <= b);
     let head_rows_h: f32 = match title_rows {
-        Some((a, b)) => (a..=b).map(|r| sheet.rows.size(r) * px).sum(),
+        Some((a, b)) => (a..=b).map(|r| row_h(sheet, r) * px).sum(),
         None => 0.0,
     };
     let head_cols_w: f32 = match title_cols {
-        Some((a, b)) => (a..=b).map(|c| sheet.cols.size(c) * px).sum(),
+        Some((a, b)) => (a..=b).map(|c| col_w(sheet, c) * px).sum(),
         None => 0.0,
     };
 
@@ -117,7 +135,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
             if last_row > row && setup.row_breaks.contains(&last_row) {
                 break;
             }
-            let h = sheet.rows.size(last_row) * px;
+            let h = row_h(sheet, last_row) * px;
             if used + h > body_top && last_row > row {
                 break;
             }
@@ -133,7 +151,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
                 if last_col > col && setup.col_breaks.contains(&last_col) {
                     break;
                 }
-                let w = sheet.cols.size(last_col) * px;
+                let w = col_w(sheet, last_col) * px;
                 if wused + w > body_left && last_col > col {
                     break;
                 }
@@ -340,8 +358,8 @@ fn draw_cell(
     let (mut cw, mut ch) = (w, h);
     if let Some((r1, c1, r2, c2)) = view.merge {
         if (r1, c1) == (r, c) {
-            cw = (c1..=c2).map(|cc| sheet.cols.size(cc) * px).sum();
-            ch = (r1..=r2).map(|rr| sheet.rows.size(rr) * px).sum();
+            cw = (c1..=c2).map(|cc| col_w(sheet, cc) * px).sum();
+            ch = (r1..=r2).map(|rr| row_h(sheet, rr) * px).sum();
         }
     }
     let top = y_bottom + ch - h;
@@ -452,10 +470,10 @@ fn grid_rect(
     // anchor 语义：to 是边界格（不含），from/to 各带 EMU 偏移；1px = 9525 EMU。
     // 不用「逐格累加」——那会把 to 也画进去，图片比 Excel 宽一整列。
     let e = |v: i64| v as f32 / 9525.0;
-    let x1 = sheet.cols.pos(c1) + e(off[0]);
-    let x2 = sheet.cols.pos(c2) + e(off[2]);
-    let t1 = sheet.rows.pos(r1) + e(off[1]);
-    let t2 = sheet.rows.pos(r2) + e(off[3]);
+    let x1: f32 = (0..c1).map(|c| col_w(sheet, c)).sum::<f32>() + e(off[0]);
+    let x2: f32 = (0..c2).map(|c| col_w(sheet, c)).sum::<f32>() + e(off[2]);
+    let t1: f32 = (0..r1).map(|r| row_h(sheet, r)).sum::<f32>() + e(off[1]);
+    let t2: f32 = (0..r2).map(|r| row_h(sheet, r)).sum::<f32>() + e(off[3]);
     let (xa, xb) = (x1 * px + sx, x2 * px + sx);
     let (ta, tb) = (t1 * px, t2 * px);
     let w = (xb - xa).max(1.0);
@@ -791,10 +809,10 @@ fn draw_objects(
             continue;
         }
         const EMU_PX: f32 = 9525.0;
-        let x = (0..c1).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx + dx1 as f32 / EMU_PX * px;
-        let y_top = (0..r1).map(|r| sheet.rows.size(r) * px).sum::<f32>() + dy1 as f32 / EMU_PX * px;
-        let x2 = (0..c2).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx + dx2 as f32 / EMU_PX * px;
-        let y2 = (0..r2).map(|r| sheet.rows.size(r) * px).sum::<f32>() + dy2 as f32 / EMU_PX * px;
+        let x = (0..c1).map(|c| col_w(sheet, c) * px).sum::<f32>() + sx + dx1 as f32 / EMU_PX * px;
+        let y_top = (0..r1).map(|r| row_h(sheet, r) * px).sum::<f32>() + dy1 as f32 / EMU_PX * px;
+        let x2 = (0..c2).map(|c| col_w(sheet, c) * px).sum::<f32>() + sx + dx2 as f32 / EMU_PX * px;
+        let y2 = (0..r2).map(|r| row_h(sheet, r) * px).sum::<f32>() + dy2 as f32 / EMU_PX * px;
         let w = (x2 - x).max(8.0);
         let h = (y2 - y_top).max(8.0);
         let yy = sy - y_top - h;
@@ -913,10 +931,16 @@ pub fn page_ops_metrics(
     let mut y = ph - mt;
     if let Some((ta, tb)) = setup.title_rows {
         for r in ta..=tb.min(span.rows.1).max(ta) {
-            let h = sheet.rows.size(r) * px;
+            let h = row_h(sheet, r) * px;
+            if h <= 0.0 {
+                continue;
+            }
             let mut x = ml;
             for c in span.cols.0..=span.cols.1 {
-                let w = sheet.cols.size(c) * px;
+                let w = col_w(sheet, c) * px;
+                if w <= 0.0 {
+                    continue;
+                }
                 draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, y - h, w, h, px, layout.scale, &mut out);
                 x += w;
             }
@@ -927,10 +951,16 @@ pub fn page_ops_metrics(
         Some((ca, cb)) => {
             let mut x = ml;
             for c in ca..=cb.min(span.cols.1).max(ca) {
-                let w = sheet.cols.size(c) * px;
+                let w = col_w(sheet, c) * px;
+                if w <= 0.0 {
+                    continue;
+                }
                 let mut yy = y;
                 for r in span.rows.0..=span.rows.1 {
-                    let h = sheet.rows.size(r) * px;
+                    let h = row_h(sheet, r) * px;
+                    if h <= 0.0 {
+                        continue;
+                    }
                     draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, yy - h, w, h, px, layout.scale, &mut out);
                     yy -= h;
                 }
@@ -945,10 +975,16 @@ pub fn page_ops_metrics(
     let body_x0 = ml + title_w;
     let mut cursor_y = y;
     for r in span.rows.0..=span.rows.1 {
-        let h = sheet.rows.size(r) * px;
+        let h = row_h(sheet, r) * px;
+        if h <= 0.0 {
+            continue;
+        }
         let mut x = body_x0;
         for c in span.cols.0..=span.cols.1 {
-            let w = sheet.cols.size(c) * px;
+            let w = col_w(sheet, c) * px;
+            if w <= 0.0 {
+                continue;
+            }
             draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, cursor_y - h, w, h, px, layout.scale, &mut out);
             x += w;
         }
@@ -959,22 +995,22 @@ pub fn page_ops_metrics(
     if setup.gridlines {
         let mut body_w = 0.0f32;
         for c in span.cols.0..=span.cols.1 {
-            body_w += sheet.cols.size(c) * px;
+            body_w += col_w(sheet, c) * px;
         }
         let mut body_h = 0.0f32;
         for r in span.rows.0..=span.rows.1 {
-            body_h += sheet.rows.size(r) * px;
+            body_h += row_h(sheet, r) * px;
         }
         let mut x = body_x0;
         for c in span.cols.0..=span.cols.1 {
             out.lines.push((x, y - body_h, x, y, 0.4, [205, 205, 205]));
-            x += sheet.cols.size(c) * px;
+            x += col_w(sheet, c) * px;
         }
         out.lines.push((x, y - body_h, x, y, 0.4, [205, 205, 205]));
         let mut yy = y;
         for r in span.rows.0..=span.rows.1 {
             out.lines.push((body_x0, yy, body_x0 + body_w, yy, 0.4, [205, 205, 205]));
-            yy -= sheet.rows.size(r) * px;
+            yy -= row_h(sheet, r) * px;
         }
         out.lines.push((body_x0, yy, body_x0 + body_w, yy, 0.4, [205, 205, 205]));
     }

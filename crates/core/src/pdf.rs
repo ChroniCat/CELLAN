@@ -6,7 +6,7 @@
 //! - 内容流用路径（矩形/线）与文字两种原语，够画网格、填色、单元格文字、页眉页脚。
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// 嵌入的字体
@@ -234,6 +234,22 @@ pub struct Page {
     pub width: f32,
     pub height: f32,
     pub ops: String,
+    /// 本页用到的常规/粗体字形号（写 PDF 时按它裁字体）
+    used: HashSet<u16>,
+    used_bold: HashSet<u16>,
+}
+
+/// 内容流里的字形号是 4 位十六进制一串；记下来供字体裁剪
+fn note_glyphs(hex: &str, set: &mut HashSet<u16>) {
+    let b = hex.as_bytes();
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        let part = &hex[i..i + 4];
+        if let Ok(g) = u16::from_str_radix(part, 16) {
+            set.insert(g);
+        }
+        i += 4;
+    }
 }
 
 /// Flate 压缩（PDF 流）；压缩失败就原样返回，导出不能因此失败
@@ -292,7 +308,13 @@ end
 
 impl Page {
     pub fn new(width: f32, height: f32) -> Self {
-        Self { width, height, ops: String::new() }
+        Self {
+            width,
+            height,
+            ops: String::new(),
+            used: HashSet::new(),
+            used_bold: HashSet::new(),
+        }
     }
 
     pub fn rect_fill(&mut self, x: f32, y: f32, w: f32, h: f32, rgb: [u8; 3]) {
@@ -319,6 +341,7 @@ impl Page {
 
     /// 文字：`hex` 是各字符字形号的 2 字节大端拼接
     pub fn text(&mut self, x: f32, baseline: f32, size: f32, hex: &str, rgb: [u8; 3]) {
+        note_glyphs(hex, &mut self.used);
         self.ops.push_str(&format!(
             "BT {:.3} {:.3} {:.3} rg /F1 {size:.2} Tf 1 0 0 1 {x:.2} {baseline:.2} Tm <{hex}> Tj ET\n",
             rgb[0] as f32 / 255.0,
@@ -340,6 +363,7 @@ impl Page {
         italic: bool,
         rotation: f32,
     ) {
+        note_glyphs(hex, if face == "F2" { &mut self.used_bold } else { &mut self.used });
         let rad = rotation.to_radians();
         let (sin, cos) = (rad.sin(), rad.cos());
         let skew = if italic { 0.21 } else { 0.0 };
@@ -369,6 +393,8 @@ impl Page {
         italic: bool,
         rotation: f32,
     ) {
+        let _ = bold;
+        note_glyphs(hex, &mut self.used);
         let rad = rotation.to_radians();
         let (sin, cos) = (rad.sin(), rad.cos());
         let skew = if italic { 0.21 } else { 0.0 };
@@ -499,6 +525,21 @@ impl Doc {
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
+        // 按实际用到的字形裁字体（gid 不变，ToUnicode/Widths 不用改）。
+        let mut used: HashSet<u16> = HashSet::new();
+        let mut used_bold: HashSet<u16> = HashSet::new();
+        for p in &self.pages {
+            used.extend(p.used.iter().copied());
+            used_bold.extend(p.used_bold.iter().copied());
+        }
+        let regular_data = crate::font_subset::subset(&self.font.data, &used)
+            .filter(|v| v.len() < self.font.data.len())
+            .unwrap_or_else(|| self.font.data.clone());
+        let bold_data = self.bold.as_ref().map(|bf| {
+            crate::font_subset::subset(&bf.data, &used_bold)
+                .filter(|v| v.len() < bf.data.len())
+                .unwrap_or_else(|| bf.data.clone())
+        });
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
         let mut offsets: Vec<usize> = Vec::new();
@@ -565,13 +606,13 @@ impl Doc {
             .into_bytes(),
         );
         {
-            let (packed, _) = compress_stream(&self.font.data);
+            let (packed, _) = compress_stream(&regular_data);
             let mut body: Vec<u8> = format!(
                 "<< /Length {} /Length1 {} /Filter /FlateDecode >>
 stream
 ",
                 packed.len(),
-                self.font.data.len()
+                regular_data.len()
             )
             .into_bytes();
             body.extend_from_slice(&packed);
@@ -717,13 +758,13 @@ endstream");
                 )
                 .into_bytes(),
             );
-            let (packed, _) = compress_stream(&bf.data);
+            let (packed, _) = compress_stream(bold_data.as_deref().unwrap_or(&bf.data));
             let mut body: Vec<u8> = format!(
                 "<< /Length {} /Length1 {} /Filter /FlateDecode >>
 stream
 ",
                 packed.len(),
-                bf.data.len()
+                bold_data.as_ref().map(|v| v.len()).unwrap_or(bf.data.len())
             )
             .into_bytes();
             body.extend_from_slice(&packed);

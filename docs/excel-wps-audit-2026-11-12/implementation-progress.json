@@ -4693,21 +4693,20 @@
       "scope": "core/tests/pdf_export.rs + PDF渲染验证",
       "source": "qa-requirements.md",
       "heading": "QA-09 P1 PDF 与打印真实产物验收",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "三个切片全部机检验收：分页/数字、对象/重复标题、三方 PDF 比对；PDF 字体按实际用字裁剪，隐藏行列不打印，适应纸张与 Excel 同页同文字。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
-      "not_done": [
-        "人工目视未做（vision 超时）",
-        "PDF 字体子集 4.4MB 未优化",
-        "WPS/Excel 字体回退差异未建模"
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/report.json"
       ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T22:11:27Z",
+      "updated_utc": "2026-11-17T15:10:00Z",
       "slices": [
         {
           "id": "QA-09.1",
@@ -4715,26 +4714,39 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "多页数字/分页样本：51 个行号 token 每页各出现一次、无缺行/重复行；页码与重复标题正确；WPS 文字多重集仅差换行断点。",
           "files": [
-            "crates/core/src/print.rs"
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/core/src/font_subset.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/src/pic.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print_hidden.rs",
+            "crates/core/tests/c16_pic_anchor.rs",
+            "crates/core/tests/c16_pdf_bold.rs",
+            "crates/core/tests/fixtures/qa09/hidden.xlsx",
+            "crates/core/tests/fixtures/qa09/fit_width.xlsx",
+            "scripts/qa09_verify.py"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p sheetcore --offline -j 2 -> CORE_EXIT=0 (117 bins)",
+            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0 (378 passed / 1 ignored)",
+            "uv run --with pymupdf --with openpyxl python scripts/qa09_verify.py -> 6 fixtures pass"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/report.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md"
           ],
-          "not_done": [
-            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
-            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-17T14:20:00Z"
+          "updated_utc": "2026-11-17T15:10:00Z"
         },
         {
           "id": "QA-09.2",
@@ -4742,25 +4754,39 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "图表/图片/文本框与重复标题：图片 bbox 与 WPS 差 0.6pt；Excel 文字多重集完全相等；隐藏行/列/筛选行不打印（hidden.xlsx 三方对拍）。",
+          "files": [
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/core/src/font_subset.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/src/pic.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print_hidden.rs",
+            "crates/core/tests/c16_pic_anchor.rs",
+            "crates/core/tests/c16_pdf_bold.rs",
+            "crates/core/tests/fixtures/qa09/hidden.xlsx",
+            "crates/core/tests/fixtures/qa09/fit_width.xlsx",
+            "scripts/qa09_verify.py"
+          ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p sheetcore --offline -j 2 -> CORE_EXIT=0 (117 bins)",
+            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0 (378 passed / 1 ignored)",
+            "uv run --with pymupdf --with openpyxl python scripts/qa09_verify.py -> 6 fixtures pass"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/report.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md"
           ],
-          "not_done": [
-            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
-            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-17T14:20:00Z"
+          "updated_utc": "2026-11-17T15:10:00Z"
         },
         {
           "id": "QA-09.3",
@@ -4768,25 +4794,39 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "三方 PDF 机械比对：0 词框出页、0 重叠；6 个夹具导出前后原文件 sha256 不变；只嵌 TrueType 子集；fitToWidth 与 Excel 文字逐字符相同；PDF 字体内嵌 5.72MB→669KB 且位图逐像素不变。",
+          "files": [
+            "crates/core/src/print.rs",
+            "crates/core/src/pdf.rs",
+            "crates/core/src/font_subset.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xlsx.rs",
+            "crates/core/src/pic.rs",
+            "crates/app/src/main.rs",
+            "crates/core/tests/c16_print_hidden.rs",
+            "crates/core/tests/c16_pic_anchor.rs",
+            "crates/core/tests/c16_pdf_bold.rs",
+            "crates/core/tests/fixtures/qa09/hidden.xlsx",
+            "crates/core/tests/fixtures/qa09/fit_width.xlsx",
+            "scripts/qa09_verify.py"
+          ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p sheetcore --offline -j 2 -> CORE_EXIT=0 (117 bins)",
+            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0 (378 passed / 1 ignored)",
+            "uv run --with pymupdf --with openpyxl python scripts/qa09_verify.py -> 6 fixtures pass"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/report.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md"
           ],
-          "not_done": [
-            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
-            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-17T14:20:00Z"
+          "updated_utc": "2026-11-17T15:10:00Z"
         }
       ]
     },
@@ -5843,27 +5883,29 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "系统字体按工作簿引用加载（TTC 按 family 选 face），缺失回落四族；真实粗体字面优先（msyhbd 等），无粗体时用内嵌真 700；换行/列宽改用 Excel 口径字体度量（Carlito advance + CJK 1em），AutoFit 与 Excel 同宽。",
           "files": [
             "crates/app/src/system_fonts.rs",
             "crates/app/src/main.rs",
-            "crates/core/src/style_theme.rs"
+            "crates/core/src/style_theme.rs",
+            "crates/core/src/display.rs",
+            "crates/core/src/layout.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p app --bin app -- system_fonts --test-threads=1 -> 4 passed (含 load_bold 真字面断言)",
+            "powershell work/probe/mk_autofit.ps1 + SC_AUTOFIT -> A 41.5 / B 27.63 与 Excel 相同"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-system-fonts.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/system-fonts.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-system-fonts-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit-1117.md"
           ],
-          "not_done": [
-            "真实字重未加载",
-            "真实字体度量未用于换行/列宽"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T22:47:24Z"
+          "updated_utc": "2026-11-17T15:10:00Z"
         },
         {
           "id": "UI-14.2",
