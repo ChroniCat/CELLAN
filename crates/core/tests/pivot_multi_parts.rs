@@ -726,7 +726,7 @@ fn two_row_fields_match_excel_sort_probe() {
             base: None,
         }],
         filters: vec![],
-        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
+        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true, ..Default::default() },
     };
     let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
     let mut rows: Vec<String> = Vec::new();
@@ -784,7 +784,7 @@ fn multi_value_with_col_field_matches_excel() {
             ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:数量".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
         ],
         filters: vec![],
-        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
+        layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true, ..Default::default() },
     };
     let g = sheetcore::pivot_multi::compute(&wb.sheets[0], &spec);
     // 与 work/probe/c12/multival-ref.tsv（Excel 实测）逐格比对

@@ -94,6 +94,21 @@ pub struct FilterField {
     pub keep: Vec<String>,
 }
 
+/// 行/列标签的排序口径
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AxisSort {
+    /// 拼音序（Excel 新建数据透视表的默认行为，A/B/C 实验已定论）
+    Pinyin,
+    /// 数据源出现顺序（Excel 打开既有文件时按 cache 的 rowItems 顺序）
+    Source,
+}
+
+impl Default for AxisSort {
+    fn default() -> Self {
+        AxisSort::Pinyin
+    }
+}
+
 /// 布局
 #[derive(Clone, Debug, PartialEq)]
 pub struct PivotLayout {
@@ -103,11 +118,18 @@ pub struct PivotLayout {
     pub subtotals: bool,
     /// 是否显示总计行
     pub grand_totals: bool,
+    /// 标签排序口径
+    pub sort: AxisSort,
 }
 
 impl Default for PivotLayout {
     fn default() -> Self {
-        Self { tabular: true, subtotals: true, grand_totals: true }
+        Self {
+            tabular: true,
+            subtotals: true,
+            grand_totals: true,
+            sort: AxisSort::Pinyin,
+        }
     }
 }
 
@@ -297,6 +319,9 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
 
     // 收集：行路径 → 列路径 → 每个值字段的累计
     let mut data: BTreeMap<Vec<String>, CellMap> = BTreeMap::new();
+    // 首次出现序号：排序口径切到「数据源顺序」时用
+    let mut row_first: std::collections::HashMap<Vec<String>, usize> = Default::default();
+    let mut col_first: std::collections::HashMap<Vec<String>, usize> = Default::default();
     for r in (r1 + 1)..=r2 {
         let mut keep = true;
         for f in &spec.filters {
@@ -323,6 +348,11 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             .iter()
             .map(|f| group_key(&get(f.col), &f.group))
             .collect();
+        // 数据源顺序（Excel 打开既有文件时的 rowItems 口径）
+        let next = row_first.len();
+        row_first.entry(row_path.clone()).or_insert(next);
+        let nextc = col_first.len();
+        col_first.entry(col_path.clone()).or_insert(nextc);
         let entry = data.entry(row_path).or_default().entry(col_path).or_default();
         entry.resize(spec.values.len(), Acc::default());
         for (i, vf) in spec.values.iter().enumerate() {
@@ -339,7 +369,12 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             }
         }
     }
-    col_paths.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")));
+    match spec.layout.sort {
+        AxisSort::Pinyin => {
+            col_paths.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")))
+        }
+        AxisSort::Source => col_paths.sort_by_key(|k| col_first.get(k).cloned().unwrap_or(usize::MAX)),
+    }
     if col_paths.is_empty() && spec.cols.is_empty() {
         col_paths.push(Vec::new());
     }
@@ -471,7 +506,12 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     // 逐组输出 + 小计 + 总计
     let mut prev: Vec<String> = vec![String::new(); spec.rows.len()];
     let mut keys: Vec<Vec<String>> = data.keys().cloned().collect();
-    keys.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")));
+    match spec.layout.sort {
+        AxisSort::Pinyin => {
+            keys.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")))
+        }
+        AxisSort::Source => keys.sort_by_key(|k| row_first.get(k).cloned().unwrap_or(usize::MAX)),
+    }
     let mut grand: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; slots.len()];
     let mut i = 0;
     while i < keys.len() {

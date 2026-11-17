@@ -22573,6 +22573,35 @@ let txn = self.txn_begin(&keys);
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut spec.layout.tabular, "表格形式（每层标签都显示）");
+                    ui.label("排序依据");
+                    egui::ComboBox::from_id_salt("p2sort")
+                        .selected_text(match spec.layout.sort {
+                            sheetcore::pivot_multi::AxisSort::Pinyin => "拼音",
+                            sheetcore::pivot_multi::AxisSort::Source => "数据源顺序",
+                        })
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for (v, label, hint) in [
+                                (
+                                    sheetcore::pivot_multi::AxisSort::Pinyin,
+                                    "拼音",
+                                    "Excel 新建数据透视表的默认排序",
+                                ),
+                                (
+                                    sheetcore::pivot_multi::AxisSort::Source,
+                                    "数据源顺序",
+                                    "与 Excel 打开既有文件时 rowItems 的顺序一致",
+                                ),
+                            ] {
+                                if ui
+                                    .selectable_label(spec.layout.sort == v, label)
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    spec.layout.sort = v;
+                                }
+                            }
+                        });
                     ui.horizontal(|ui| {
                         ui.label("计算字段");
                         ui.add(
