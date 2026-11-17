@@ -78,3 +78,19 @@ query_table_and_custom_xml_survive_editing_a_normal_cell ... ok
 ## 6. 回归
 
 sheetcore **780 passed**、app `--bin app` **263 passed**。
+
+
+## 5. 自检复核（2026-11-17，Codex 监督取消后）
+
+按约束「等待复核类项由助手自行按原合同机检验收」：
+
+```
+cargo test -q -p sheetcore --offline --test c21_parts -- --test-threads=1
+threaded_comment_parts_survive_editing_a_normal_cell ... ok
+vba_project_survives_editing_a_normal_cell ... ok
+query_table_and_customxml_survive_editing_a_normal_cell ... ok
+test result: ok. 3 passed
+```
+
+四个入口改名、支持矩阵、三类部件逐字节保留均通过；C21.1 → 已验收。
+父项只剩「真实键鼠点开四个对话框目视文案」一项（无交互桌面，阻塞）。
