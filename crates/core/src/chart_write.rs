@@ -790,6 +790,85 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     Ok(())
 }
 
+/// 按系列引用重新读取缓存值（分类 / 数值 / 散点的 x）。
+///
+/// 对话框里允许改「名称/分类/数值」三个引用；写盘前必须走这里：
+/// - 引用语法或区域不存在 → Err（调用方不要写出，避免把坏引用落盘）
+/// - 区域合法但取不到数 → Err
+/// 散点要求 X/Y 成对：任一不是数值的行整行丢弃。
+pub fn refresh_series_from_refs(
+    wb: &crate::model::Workbook,
+    sheet_name: &str,
+    ch: &mut crate::charts::Chart,
+) -> Result<()> {
+    let find_sheet = |name: Option<&str>| -> Result<&crate::model::Sheet> {
+        let n = name.unwrap_or(sheet_name);
+        wb.sheets
+            .iter()
+            .find(|s| s.name == n)
+            .ok_or_else(|| anyhow::anyhow!("找不到工作表 {n}"))
+    };
+    let num = |v: &crate::model::Value| -> Option<f64> {
+        match v {
+            crate::model::Value::Number(n) => Some(*n),
+            other => other.display().trim().parse::<f64>().ok(),
+        }
+    };
+    for (i, se) in ch.series.iter_mut().enumerate() {
+        let (sn, vr) = crate::sparkline::parse_ref(&se.val_ref)
+            .ok_or_else(|| anyhow::anyhow!("系列{} 数值引用无效：{}", i + 1, se.val_ref))?;
+        let sheet = find_sheet(sn.as_deref())?;
+        let mut vals = Vec::new();
+        let mut cats = Vec::new();
+        let mut xv = Vec::new();
+        let cat_ref = if se.cat_ref.trim().is_empty() {
+            None
+        } else {
+            let (cn, cr) = crate::sparkline::parse_ref(&se.cat_ref)
+                .ok_or_else(|| anyhow::anyhow!("系列{} 分类引用无效：{}", i + 1, se.cat_ref))?;
+            if cn.as_deref().map(|n| n != sheet.name).unwrap_or(false) {
+                anyhow::bail!(
+                    "系列{} 的分类与数值不在同一张表（{} vs {}）",
+                    i + 1,
+                    cn.unwrap_or_default(),
+                    sheet.name
+                );
+            }
+            Some(cr)
+        };
+        let rows = vr.2.saturating_sub(vr.0) + 1;
+        for k in 0..rows {
+            let r = vr.0 + k;
+            let y = sheet.get(r, vr.1).and_then(|c| num(&c.value));
+            let xcell = cat_ref.and_then(|cr| {
+                let rr = cr.0 + k.min(cr.2.saturating_sub(cr.0));
+                sheet.get(rr, cr.1)
+            });
+            if let Some(c) = xcell {
+                cats.push(c.value.display());
+            }
+            if ch.kind == crate::charts::ChartKind::Scatter {
+                let x = xcell.and_then(|c| num(&c.value));
+                if let (Some(x), Some(y)) = (x, y) {
+                    xv.push(x);
+                    vals.push(y);
+                }
+            } else if let Some(y) = y {
+                vals.push(y);
+            }
+        }
+        if vals.is_empty() {
+            anyhow::bail!("系列{} 的数值区域取不到任何数字：{}", i + 1, se.val_ref);
+        }
+        se.cats = cats;
+        se.vals = vals;
+        if ch.kind == crate::charts::ChartKind::Scatter {
+            se.xv = xv;
+        }
+    }
+    Ok(())
+}
+
 /// 只把 chart 部件里的引用字符串换掉，其它内容原样保留
 pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -> Result<()> {
     use std::io::Read;

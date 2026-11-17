@@ -50,3 +50,4 @@ desktop.ini
 __pycache__/
 *.pyc
 !crates/core/tests/fixtures/c16/*.xlsx
+!crates/core/tests/fixtures/c19/*.xlsx

@@ -19884,6 +19884,12 @@ let txn = self.txn_begin(&keys);
             return;
         };
         let name = self.wb.sheet(self.sheet_idx).name.clone();
+        // 逐系列引用可能被手改过：先按引用重读缓存，引用不合法就拒绝写出
+        let mut ch = ch;
+        if let Err(e) = sheetcore::chart_write::refresh_series_from_refs(&self.wb, &name, &mut ch) {
+            self.status = format!("图表引用无效：{e}");
+            return;
+        }
         match sheetcore::xlsx::save_atomic_with_receipt(&path, &self.wb) {
             Ok(receipt) => receipt.apply_to(&mut self.wb),
             Err(e) => {
