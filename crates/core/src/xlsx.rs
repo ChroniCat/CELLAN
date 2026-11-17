@@ -2396,12 +2396,24 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
     // C12.4 计算字段：紧跟在透视表部件之后写缓存定义
     if !wb.pivot_calc_fields.is_empty() {
-        let refs: Vec<(&str, &str)> = wb
-            .pivot_calc_fields
-            .iter()
-            .map(|(_, n, f)| (n.as_str(), f.as_str()))
-            .collect();
-        crate::pivot_xml::add_calculated_fields(path, &refs).context("计算字段写入失败")?;
+        // 按工作表分组：多透视表共存时只写各自缓存，不再污染别人的 pivotCacheDefinition
+        let mut by_sheet: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
+            std::collections::BTreeMap::new();
+        for (si, n, f) in &wb.pivot_calc_fields {
+            let name = wb
+                .sheets
+                .get(*si)
+                .map(|s| s.name.as_str())
+                .unwrap_or_default();
+            by_sheet
+                .entry(name)
+                .or_default()
+                .push((n.as_str(), f.as_str()));
+        }
+        for (sheet, refs) in by_sheet {
+            crate::pivot_xml::add_calculated_fields_on(path, sheet, &refs)
+                .context("计算字段写入失败")?;
+        }
     }
     // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
     must_save!("layout", crate::patch::apply_layout(path, wb));

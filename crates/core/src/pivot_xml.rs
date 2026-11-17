@@ -538,8 +538,129 @@ pub fn set_pivot_layout(path: &std::path::Path, compact: bool) -> anyhow::Result
 /// 计算字段（Excel：cacheField 带 formula + databaseField="0"）
 ///
 /// 只改缓存定义，缓存记录与数据区不动：Excel 打开后按公式自己算这一列。
+
+/// 解析 `sheet` 上透视表对应的 (缓存定义部件, 透视表部件) 清单。
+fn sheet_cache_targets(entries: &[(String, Vec<u8>)], sheet: &str) -> (Vec<String>, Vec<String>) {
+    fn text_of<'a>(entries: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, b)| std::str::from_utf8(b).ok())
+    }
+    fn attr(tag: &str, key: &str) -> Option<String> {
+        let pat = format!("{key}=\"");
+        let i = tag.find(&pat)? + pat.len();
+        let j = tag[i..].find('"')?;
+        Some(tag[i..i + j].to_string())
+    }
+    /// 把 `../pivotTables/x.xml` 之类的相对 target 归一化成 zip 内的绝对名。
+    fn join(base_dir: &str, target: &str) -> String {
+        let mut parts: Vec<&str> = if target.starts_with('/') {
+            Vec::new()
+        } else {
+            base_dir.split('/').filter(|p| !p.is_empty()).collect()
+        };
+        for seg in target.trim_start_matches('/').split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        parts.join("/")
+    }
+
+    let mut caches = Vec::new();
+    let mut tables = Vec::new();
+    let Some(wb) = text_of(entries, "xl/workbook.xml") else {
+        return (caches, tables);
+    };
+    let Some(wbrels) = text_of(entries, "xl/_rels/workbook.xml.rels") else {
+        return (caches, tables);
+    };
+    let mut sheet_part = None;
+    for tag in wb.split('<').filter(|t| t.starts_with("sheet ")) {
+        if attr(tag, "name").as_deref() != Some(sheet) {
+            continue;
+        }
+        let Some(rid) = attr(tag, "r:id") else { continue };
+        for rel in wbrels.split('<').filter(|t| t.starts_with("Relationship ")) {
+            if attr(rel, "Id").as_deref() != Some(rid.as_str()) {
+                continue;
+            }
+            if let Some(t) = attr(rel, "Target") {
+                sheet_part = Some(join("xl", &t));
+            }
+        }
+    }
+    let Some(sheet_part) = sheet_part else {
+        return (caches, tables);
+    };
+    // 工作表 rels：找到它挂的 pivotTable 部件
+    let (dir, file) = match sheet_part.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("xl", sheet_part.as_str()),
+    };
+    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let Some(srels) = text_of(entries, &rels_name) else {
+        return (caches, tables);
+    };
+    let mut table_caches: Vec<String> = Vec::new();
+    for rel in srels.split('<').filter(|t| t.starts_with("Relationship ")) {
+        let Some(t) = attr(rel, "Target") else { continue };
+        let part = join(dir, &t);
+        if !part.starts_with("xl/pivotTables/") {
+            continue;
+        }
+        if let Some(xml) = text_of(entries, &part) {
+            for tag in xml.split('<').filter(|s| s.starts_with("pivotTableDefinition ")) {
+                if let Some(cid) = attr(tag, "cacheId") {
+                    table_caches.push(cid);
+                }
+            }
+        }
+        tables.push(part);
+    }
+    // cacheId → 缓存定义部件（workbook.xml 的 pivotCaches + rels）
+    for tag in wb.split('<').filter(|t| t.starts_with("pivotCache ")) {
+        let Some(cid) = attr(tag, "cacheId") else { continue };
+        if !table_caches.iter().any(|c| c == &cid) {
+            continue;
+        }
+        let Some(rid) = attr(tag, "r:id") else { continue };
+        for rel in wbrels.split('<').filter(|t| t.starts_with("Relationship ")) {
+            if attr(rel, "Id").as_deref() != Some(rid.as_str()) {
+                continue;
+            }
+            if let Some(t) = attr(rel, "Target") {
+                caches.push(join("xl", &t));
+            }
+        }
+    }
+    (caches, tables)
+}
+
 pub fn add_calculated_fields(
     path: &std::path::Path,
+    calc: &[(&str, &str)],
+) -> anyhow::Result<usize> {
+    add_calculated_fields_inner(path, None, calc)
+}
+
+/// 只把计算字段写进 `sheet` 上那张透视表所属的缓存（多透视表共存时不再污染别人的缓存）。
+pub fn add_calculated_fields_on(
+    path: &std::path::Path,
+    sheet: &str,
+    calc: &[(&str, &str)],
+) -> anyhow::Result<usize> {
+    add_calculated_fields_inner(path, Some(sheet), calc)
+}
+
+fn add_calculated_fields_inner(
+    path: &std::path::Path,
+    sheet: Option<&str>,
     calc: &[(&str, &str)],
 ) -> anyhow::Result<usize> {
     use std::io::{Read, Write};
@@ -557,10 +678,16 @@ pub fn add_calculated_fields(
         entries.push((name, buf));
     }
     drop(zip);
+    let targets = sheet.map(|sh| sheet_cache_targets(&entries, sh));
     let mut changed = 0usize;
     for (name, buf) in entries.iter_mut() {
         if !name.contains("pivotCacheDefinition") || !name.ends_with(".xml") {
             continue;
+        }
+        if let Some((caches, _)) = &targets {
+            if !caches.iter().any(|c| c == name) {
+                continue;
+            }
         }
         let Ok(text) = std::str::from_utf8(buf) else { continue };
         let Some(open) = text.find("<cacheFields count=\"") else { continue };
@@ -589,6 +716,11 @@ pub fn add_calculated_fields(
     for (name, buf) in entries.iter_mut() {
         if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
             continue;
+        }
+        if let Some((_, tables)) = &targets {
+            if !tables.iter().any(|t| t == name) {
+                continue;
+            }
         }
         let Ok(text) = std::str::from_utf8(buf) else { continue };
         let Some(open) = text.find("<pivotFields count=\"") else { continue };

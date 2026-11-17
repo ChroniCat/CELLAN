@@ -999,3 +999,70 @@ fn col_slots_insert_a_subtotal_after_each_top_group() {
     let one: Vec<Vec<String>> = vec![vec!["A".into()], vec!["B".into()]];
     assert_eq!(build_col_slots(&one, true).len(), 2);
 }
+
+#[test]
+fn scoped_calc_field_touches_only_its_own_cache() {
+    use sheetcore::pivot_xml;
+    let f = Fixture::new("scope");
+    let path = f.file("two.xlsx");
+    let mut wb = book(&path);
+    let spec = spec_a();
+    let _ = attach(&path, &mut wb, &spec);
+
+    // 第二张表：同样数据 + 自己的透视表（另一个缓存）
+    let mut sh2 = sheetcore::model::Sheet::new("Data2");
+    for (r, c) in [(0u32, 0u32)] {
+        let _ = (r, c);
+    }
+    for (i, h) in ["地区", "产品", "金额", "数量"].iter().enumerate() {
+        sh2.set(0, i as u32, text(h));
+    }
+    for (i, (r, p, a, q)) in [
+        ("华东", "A", 10.0, 2.0),
+        ("华北", "B", 20.0, 3.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let row = i as u32 + 1;
+        sh2.set(row, 0, text(r));
+        sh2.set(row, 1, text(p));
+        sh2.set(row, 2, num(*a));
+        sh2.set(row, 3, num(*q));
+    }
+    wb.sheets.push(sh2);
+    xlsx::save(&path, &wb).unwrap();
+    let grid = pivot_multi::compute(&wb.sheets[1], &spec);
+    let rect = pivot_multi::write_grid(&mut wb.sheets[1], (8, 0), &grid);
+    let _ = pivot_xml::attach2_for_session(&path, "Data2", &spec, &grid, rect, "test").unwrap();
+
+    let count = |part_kind: &str| -> Vec<usize> {
+        use std::io::Read;
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        for i in 0..z.len() {
+            let mut e = z.by_index(i).unwrap();
+            let n = e.name().to_string();
+            if !n.contains(part_kind) || !n.ends_with(".xml") {
+                continue;
+            }
+            let mut s = String::new();
+            e.read_to_string(&mut s).unwrap();
+            out.push(s.matches("<cacheField ").count());
+        }
+        out
+    };
+    let before = count("pivotCacheDefinition");
+    assert_eq!(before.len(), 2, "应有两个缓存：{before:?}");
+
+    let n = pivot_xml::add_calculated_fields_on(&path, "Data", &[("总价", "金额*2")]).unwrap();
+    assert_eq!(n, 2, "只改 Data 的缓存定义 + 透视表定义，实际 {n}");
+    let after = count("pivotCacheDefinition");
+    let changed: Vec<usize> = before
+        .iter()
+        .zip(after.iter())
+        .filter(|(b, a)| b != a)
+        .map(|(b, a)| *a - *b)
+        .collect();
+    assert_eq!(changed, vec![1], "只有一张缓存的字段数 +1：before={before:?} after={after:?}");
+}
