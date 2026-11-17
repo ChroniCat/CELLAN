@@ -22325,6 +22325,77 @@ let txn = self.txn_begin(&keys);
                                     }
                                 }
                             });
+                        // 自定义基准：Excel 的「基准字段 / 基准项」
+                        if matches!(
+                            spec.values[i].show_as,
+                            sheetcore::pivot_multi::ShowAs::DifferencePrev
+                                | sheetcore::pivot_multi::ShowAs::PercentDifferencePrev
+                        ) {
+                            let axis_cols: Vec<u32> = spec
+                                .rows
+                                .iter()
+                                .map(|f| f.col)
+                                .chain(spec.cols.iter().map(|f| f.col))
+                                .collect();
+                            let cur = spec.values[i].base.clone();
+                            let label = cur
+                                .as_ref()
+                                .map(|(c, it)| format!("{}={}", fname(*c), it))
+                                .unwrap_or_else(|| "上一项".to_string());
+                            egui::ComboBox::from_id_salt(format!("p2base{i}"))
+                                .selected_text(label)
+                                .width(120.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(cur.is_none(), "上一项（默认）")
+                                        .clicked()
+                                    {
+                                        spec.values[i].base = None;
+                                    }
+                                    for c in axis_cols.iter().copied() {
+                                        let first = self
+                                            .wb
+                                            .sheet(self.sheet_idx)
+                                            .get(spec.source.0 + 1, c)
+                                            .map(|x| x.value.display())
+                                            .unwrap_or_default();
+                                        if ui
+                                            .selectable_label(
+                                                matches!(&cur, Some((bc, _)) if *bc == c),
+                                                format!("以 {} 的「{}」为基准", fname(c), first),
+                                            )
+                                            .clicked()
+                                        {
+                                            spec.values[i].base = Some((c, first));
+                                        }
+                                    }
+                                });
+                            if let Some((bc, item)) = spec.values[i].base.clone() {
+                                let mut items: Vec<String> = Vec::new();
+                                {
+                                    let sh = self.wb.sheet(self.sheet_idx);
+                                    for r in (spec.source.0 + 1)..=spec.source.2 {
+                                        let t = sh
+                                            .get(r, bc)
+                                            .map(|x| x.value.display())
+                                            .unwrap_or_default();
+                                        if !t.is_empty() && !items.contains(&t) {
+                                            items.push(t);
+                                        }
+                                    }
+                                }
+                                egui::ComboBox::from_id_salt(format!("p2baseitem{i}"))
+                                    .selected_text(item.clone())
+                                    .width(96.0)
+                                    .show_ui(ui, |ui| {
+                                        for it in items {
+                                            if ui.selectable_label(item == it, &it).clicked() {
+                                                spec.values[i].base = Some((bc, it.clone()));
+                                            }
+                                        }
+                                    });
+                            }
+                        }
                         if ui.small_button("×").clicked() {
                             spec.values.remove(i);
                             break;
@@ -22338,6 +22409,7 @@ let txn = self.txn_begin(&keys);
                                     agg: sheetcore::pivot::Agg::Sum,
                                     label: None,
                                     show_as: sheetcore::pivot_multi::ShowAs::Normal,
+                                    base: None,
                                 });
                                 ui.close_menu();
                             }

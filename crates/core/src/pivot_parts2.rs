@@ -418,13 +418,28 @@ pub fn build(
                 Some(x) => format!(" showDataAs=\"{x}\""),
                 None => String::new(),
             };
+            // 自定义基准：baseField = 该字段在 pivotFields 里的序号，
+            // baseItem = 该字段 sharedItems 里项的下标（Excel COM 样本确认，见 evidence/c12-4）
+            let (bf, bi) = match &v.base {
+                Some((col, item)) => {
+                    let idx = col.saturating_sub(c1) as usize;
+                    let pos = shared
+                        .get(idx)
+                        .and_then(|sh| sh.iter().position(|s| s == item))
+                        .unwrap_or(0);
+                    (idx.to_string(), pos.to_string())
+                }
+                None => ("0".to_string(), "0".to_string()),
+            };
             format!(
-                "<dataField name=\"{}{}\" fld=\"{}\"{}{} baseField=\"0\" baseItem=\"0\"/>",
+                "<dataField name=\"{}{}\" fld=\"{}\"{}{} baseField=\"{}\" baseItem=\"{}\"/>",
                 agg_label(v.agg),
                 esc(&short),
                 v.col - c1,
                 sub,
-                show
+                show,
+                bf,
+                bi
             )
         })
         .collect();

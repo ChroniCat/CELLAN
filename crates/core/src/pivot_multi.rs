@@ -83,6 +83,8 @@ pub struct ValueField {
     pub agg: Agg,
     pub label: Option<String>,
     pub show_as: ShowAs,
+    /// 自定义基准（显示值方式用）：(源列, 项标签)；None = 与上一项/默认基准
+    pub base: Option<(u32, String)>,
 }
 
 /// 筛选字段：keep 为空表示全部
@@ -126,7 +128,7 @@ impl PivotSpec2 {
             source: spec.source,
             rows: vec![AxisField { col: spec.row_field, group: spec.group.clone() }],
             cols: spec.col_field.map(|c| vec![AxisField::plain(c)]).unwrap_or_default(),
-            values: vec![ValueField { col: spec.value_field, agg: spec.agg, label: None, show_as: ShowAs::Normal }],
+            values: vec![ValueField { col: spec.value_field, agg: spec.agg, label: None, show_as: ShowAs::Normal, base: None }],
             filters: Vec::new(),
             layout: PivotLayout::default(),
         }

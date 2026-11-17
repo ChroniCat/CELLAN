@@ -6935,8 +6935,8 @@ fn multi_field_pivot_refresh_clears_old_cells() {
         rows: vec![AxisField::plain(0), AxisField::plain(1)],
         cols: vec![AxisField::plain(2)],
         values: vec![
-            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 4, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal , base: None },
+            ValueField { col: 4, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal , base: None },
         ],
         filters: vec![FilterField { col: 5, keep: vec!["有效".into()] }],
         layout: PivotLayout::default(),
@@ -8280,7 +8280,7 @@ fn multi_field_pivot_from_panel_is_queued_for_real_parts() {
             AxisField { col: 1, group: GroupBy::None },
         ],
         cols: vec![],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal , base: None }],
         filters: vec![],
         layout: PivotLayout::default(),
     };

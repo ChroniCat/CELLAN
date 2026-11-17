@@ -76,7 +76,7 @@ fn spec_a() -> PivotSpec2 {
             AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
         ],
         cols: vec![],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None }],
         filters: vec![],
         layout: PivotLayout::default(),
     }
@@ -88,8 +88,8 @@ fn spec_b() -> PivotSpec2 {
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 3, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -193,7 +193,7 @@ fn spec_d() -> PivotSpec2 {
             AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
             AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
         ],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None }],
         filters: vec![],
         layout: PivotLayout::default(),
     }
@@ -225,11 +225,11 @@ fn spec_e() -> PivotSpec2 {
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 2, agg: Agg::Avg, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 2, agg: Agg::Max, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 2, agg: Agg::Min, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 2, agg: Agg::Avg, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 2, agg: Agg::Max, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 2, agg: Agg::Min, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -272,8 +272,8 @@ fn spec_g() -> PivotSpec2 {
             AxisField { col: 3, group: sheetcore::pivot::GroupBy::None },
         ],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 2, agg: Agg::Count, label: None, show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
         ],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -342,6 +342,7 @@ fn show_as_percentages_match_excel_semantics() {
             agg: Agg::Sum,
             label: None,
             show_as: sa,
+            base: None,
         }],
         filters: vec![],
         layout: PivotLayout::default(),
@@ -391,7 +392,7 @@ fn show_as_difference_percent_diff_and_index_match_excel() {
         source: (0, 0, 6, 3),
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sa }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: None, show_as: sa, base: None }],
         filters: vec![],
         layout: PivotLayout::default(),
     };
@@ -722,6 +723,7 @@ fn two_row_fields_match_excel_sort_probe() {
             agg: Agg::Sum,
             label: Some("求和项:金额".into()),
             show_as: sheetcore::pivot_multi::ShowAs::Normal,
+            base: None,
         }],
         filters: vec![],
         layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
@@ -778,8 +780,8 @@ fn multi_value_with_col_field_matches_excel() {
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![AxisField { col: 1, group: sheetcore::pivot::GroupBy::None }],
         values: vec![
-            ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal },
-            ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:数量".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal },
+            ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
+            ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:数量".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None },
         ],
         filters: vec![],
         layout: PivotLayout { tabular: true, subtotals: true, grand_totals: true },
@@ -882,7 +884,7 @@ fn page_filter_matches_excel_filter_ref() {
         source: (0, 0, 6, 3),
         rows: vec![AxisField { col: 0, group: sheetcore::pivot::GroupBy::None }],
         cols: vec![],
-        values: vec![ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        values: vec![ValueField { col: 2, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None }],
         filters: vec![FilterField { col: 3, keep: vec!["有效".into()] }],
         layout: PivotLayout::default(),
     };
@@ -936,7 +938,7 @@ fn two_col_field_values_match_excel_with_subtotal_columns() {
             AxisField { col: 1, group: sheetcore::pivot::GroupBy::None },
             AxisField { col: 2, group: sheetcore::pivot::GroupBy::None },
         ],
-        values: vec![ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal }],
+        values: vec![ValueField { col: 3, agg: Agg::Sum, label: Some("求和项:金额".into()), show_as: sheetcore::pivot_multi::ShowAs::Normal, base: None }],
         filters: vec![],
         layout: PivotLayout::default(),
     };
@@ -1113,4 +1115,53 @@ fn calc_item_expr_supports_multiply_and_subtract() {
     )
     .expect("应插入计算项行");
     assert_eq!(g2.rows[at3].last(), Some(&Value::Number(-30.0)), "90-120");
+}
+
+#[test]
+fn custom_base_field_and_item_written_like_excel() {
+    use sheetcore::pivot_multi::ShowAs;
+    let fx = Fixture::new("base");
+    let src = fx.file("src.xlsx");
+    let mut wb = Workbook::new_blank();
+    {
+        let sh = &mut wb.sheets[0];
+        sh.name = "Data".into();
+        sh.set(0, 0, text("地区"));
+        sh.set(0, 1, text("产品"));
+        sh.set(0, 2, text("金额"));
+        let rows = [("华东", "A", 10.0), ("华东", "B", 20.0), ("华东", "A", 30.0),
+                    ("华北", "A", 40.0), ("华北", "B", 50.0), ("华北", "A", 60.0)];
+        for (i, (r, p, v)) in rows.iter().enumerate() {
+            let row = i as u32 + 1;
+            sh.set(row, 0, text(r));
+            sh.set(row, 1, text(p));
+            sh.set(row, 2, num(*v));
+        }
+    }
+    xlsx::save(&src, &wb).unwrap();
+    let mut spec = PivotSpec2 {
+        source: (0, 0, 6, 2),
+        rows: vec![AxisField::plain(0)],
+        cols: vec![AxisField::plain(1)],
+        values: vec![ValueField {
+            col: 2,
+            agg: Agg::Sum,
+            label: None,
+            show_as: ShowAs::DifferencePrev,
+            base: Some((1, "A".to_string())),
+        }],
+        filters: Vec::new(),
+        layout: PivotLayout::default(),
+    };
+    let grid = pivot_multi::compute(&wb.sheets[0], &spec);
+    let rect = pivot_multi::write_grid(&mut wb.sheets[0], (5, 5), &grid);
+    let (_cache, _rec, pt) = sheetcore::pivot_parts2::build(
+        &src, "Data", &spec, &grid, rect, 1, "PT1", "test").unwrap();
+    // baseField = 产品 在 pivotFields 的序号 1；baseItem = A 在 sharedItems 的 0
+    assert!(pt.contains(r#"showDataAs="difference" baseField="1" baseItem="0""#), "pt={pt}");
+    // 未设基准时仍写 Excel 的默认 0/0
+    spec.values[0].base = None;
+    let (_c2, _r2, pt2) = sheetcore::pivot_parts2::build(
+        &src, "Data", &spec, &grid, rect, 1, "PT1", "test").unwrap();
+    assert!(pt2.contains(r#"baseField="0" baseItem="0""#));
 }
