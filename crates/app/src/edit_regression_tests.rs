@@ -10372,3 +10372,49 @@ fn bold_routing_prefers_real_faces_and_falls_back_to_same_family() {
         assert!(!synth);
     }
 }
+
+/// UI-25.1：百万格**密集**选区的统计准备与分帧累加耗时。
+/// 本机 RDP/软件 GPU 的帧间隔不可信（同一 3 行文件也会 280ms 一次），
+/// 所以这里只量统计本身的计算量：一次性收集 + 每帧 20 万格的累加。
+#[test]
+fn dense_million_selection_stats_cost_is_bounded() {
+    use std::time::Instant;
+    let mut sh = sheetcore::model::Sheet::new("Dense");
+    for r in 0..1_000_000u32 {
+        sh.set(
+            r,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Number(r as f64 * 1.5),
+                formula: None,
+            },
+        );
+    }
+    let rects = [(0, 0, 999_999, 0)];
+    let t0 = Instant::now();
+    let vals = crate::collect_stats_values(&sh, &rects);
+    let collect_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(vals.len(), 1_000_000);
+
+    let mut acc = crate::StatsAcc::default();
+    let mut idx = 0usize;
+    let mut worst = 0.0f64;
+    while idx < vals.len() {
+        let t = Instant::now();
+        let end = (idx + 200_000).min(vals.len());
+        while idx < end {
+            acc.add(vals[idx]);
+            idx += 1;
+        }
+        worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    assert_eq!(acc.count, 1_000_000);
+    assert_eq!(acc.nums, 1_000_000);
+    assert!((acc.sum - 749_999_250_000.0).abs() < 1.0);
+    eprintln!(
+        "[ui25.1] dense collect={collect_ms:.1}ms worst_slice={worst:.1}ms total_slices={:.1}ms",
+        (vals.len() / 200_000) as f64
+    );
+    // 单帧 20 万格的累加不能到几百毫秒；收集是一次性的（切选区时发生）
+    assert!(worst < 300.0, "20 万格单帧累加 {worst:.1}ms 过慢");
+}

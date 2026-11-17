@@ -29125,6 +29125,29 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // UI-25.1 无界面验收：SC_FRAME_TIMES=<path> 逐帧记「距上一帧的毫秒数」，
+        // 用来量百万格密集选区时状态栏分帧统计有没有把一帧卡死。
+        if let Ok(path) = std::env::var("SC_FRAME_TIMES") {
+            use std::sync::{Mutex, OnceLock};
+            static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+            let cell = LAST.get_or_init(|| Mutex::new(None));
+            let mut g = cell.lock().unwrap();
+            let now = std::time::Instant::now();
+            if let Some(prev) = *g {
+                let ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(f, "{:.3}", ms);
+                }
+            }
+            *g = Some(now);
+            // 没有输入时 egui 会休眠，帧间隔会把休眠算进去；压测必须连续重绘
+            ctx.request_repaint();
+        }
         // UI-24.3 无界面验收：SC_SEL_STEP=毫秒:r,c;r,c;… 定时移动选区
         if self.a11y_step.is_none() {
             if let Ok(v) = std::env::var("SC_SEL_STEP") {

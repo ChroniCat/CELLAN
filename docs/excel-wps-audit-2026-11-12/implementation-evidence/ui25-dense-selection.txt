@@ -69,3 +69,28 @@ SC_SEL='0,0' SC_SEL2='999999,0' SC_FRAME_LOG=200 SC_FRAME_EXIT=1 `
   SC_STAT_DUMP=...\stat1m.txt .\target\release\app.exe ...\values1m.xlsx
 cargo test -p app --bin app -- large_selection_stats_are_not_empty
 ```
+
+## 6. 2026-11-17 补：真正 1,000,000 个**有值**格的密集选区
+
+上一轮的 values1m 是 1,000×1,000 区域但只有 1,000 个数值，选区 A1:A1000000
+实际统计 1,000 格，严格说仍是稀疏。本轮重做：
+
+- 夹具 `work/probe/qa01/dense-1m.xlsx`（6.4MB，Dense 表，A1:A1000000
+  每格都有数值 `i*1.5`）；
+- app（debug）`SC_SEL=0,0 SC_SEL2=999999,0`，状态栏最终读回：
+  `平均值: 749999.25    计数: 1000000    求和: 749999250000`（与公式一致）；
+- 本机 RDP/软件 GPU 下 `SC_FRAME_TIMES` 的帧间隔不可用作代码性能：
+  同一张只有 3 行的 `general_fit.xlsx` 也出现 6ms/5ms/82ms/280ms 的周期性
+  stall（无输入、无统计、无 CF），是呈现层限制，不是本程序计算；
+- 因此另加确定性单测 `dense_million_selection_stats_cost_is_bounded`，
+  直接量统计本身（debug 构建）：
+
+```
+[ui25.1] dense collect=80.9ms worst_slice=1.1ms total_slices=5.0ms
+```
+
+即：一次 100 万格收集 80.9ms（仅在切选区时发生一次），之后按 20 万/帧
+累加，最差一帧 **1.1ms**，五帧完成；不会把一帧卡到几百毫秒。
+
+结论：百万格密集选区的**统计计算**满足分帧要求；GUI 整体帧率在本机
+RDP/软件 GPU 下无法作为验收读数，已如实排除而不是拿 280ms 当程序性能。
