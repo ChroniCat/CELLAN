@@ -70,3 +70,18 @@ fn pdf_embeds_images_and_object_text() {
     assert!(text.contains("/XObject"), "页面资源缺 XObject");
     assert!(bytes.len() > 8000, "PDF 太小：{}", bytes.len());
 }
+
+#[test]
+fn value_axis_ticks_use_excel_nice_steps() {
+    // Excel 对这份夹具的数值轴是 0/5/10/15/20/25（不是五等分的 0/6.25/12.5/18.75/25）
+    let wb = sheetcore::xlsx::load(&fixture()).expect("加载对象夹具");
+    let sh = &wb.sheets[0];
+    let layout = print::paginate(sh, &sh.page);
+    let out = print::page_ops_with(&wb, 0, &layout, 0, Some(&fixture()));
+    let texts: Vec<&str> = out.texts.iter().map(|t| t.text.as_str()).collect();
+    for want in ["0", "5", "10", "15", "20", "25"] {
+        assert!(texts.contains(&want), "缺刻度 {want}：{texts:?}");
+    }
+    assert!(!texts.contains(&"6.25"), "不应再出现五等分刻度：{texts:?}");
+    assert_eq!(texts.iter().filter(|t| **t == "季度销量").count(), 1, "图表标题只画一次");
+}

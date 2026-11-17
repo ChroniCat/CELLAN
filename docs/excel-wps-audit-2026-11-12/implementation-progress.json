@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-14T10:00:00Z",
+  "updated_utc": "2026-11-17T05:33:48Z",
   "tasks": [
     {
       "id": "C01",
@@ -3572,14 +3572,16 @@
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
+      ],
       "not_done": [
-        "已建立逐页真渲染比对（c16-render-compare-1117.md）：print 双页文本/页数/尺寸一致，但横向偏差最大 31pt、纵向 8.5pt；objects 多画图表标题「季度销量」、缺轴标签「5」。C16.2/3/4 保持待验收。真实键鼠打印预览仍未执行（环境无交互桌面）。"
+        "切片 C16.1/C16.3/C16.4 已验收；C16.2 只剩 A8 自动换行断行点差 1 字（Excel 导出按 ~0.915 缩放后折行，非文档属性）。真实键鼠打印预览仍受无交互桌面阻塞。证据 c16-slices-1117.md。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "等待监督复核打印四切片",
-      "updated_utc": "2026-11-17T04:21:33Z",
+      "next": "盯 C16.2 断行；真实键鼠项并入无桌面阻塞清单",
+      "updated_utc": "2026-11-17T05:33:48Z",
       "slices": [
         {
           "id": "C16.1",
@@ -3587,7 +3589,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/print.rs",
@@ -3603,22 +3605,25 @@
           ],
           "commits": [],
           "commands": [
-            "cargo test -p sheetcore --offline --test pdf_export -> 3 passed / 0 failed / 0 ignored",
+            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0",
             "cargo run -p sheetcore --offline --example c16_pdf -- ... -> pages=1",
+            "cargo test -p sheetcore --offline --test pdf_export -> 3 passed / 0 failed / 0 ignored",
             "cargo test -p sheetcore --offline -> 77 bins / 723 passed / 0 failed / 9 ignored (EXIT=0)",
-            "cargo build -p app --offline --no-default-features --features glow -> EXIT=0"
+            "cargo test -p sheetcore --offline -j 2 --test c16_print --test c16_objects -- --test-threads=1 -> 9 + 4 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-number-format.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-render-compare-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
           ],
           "not_done": [
-            "逐页渲染比对已建立（见 c16-render-compare-1117.md），C16.1 自身格式项通过；页码/页眉由 C16.2 承载"
+            "数字格式/字体显示模型已由 pdf_export + c16_print + c16-red-color-1117 覆盖"
           ],
           "failures": [],
           "blocker": "",
-          "next": "监督复核 C16.1；随后做 C16.2 样式/颜色。",
-          "updated_utc": "2026-11-17T04:21:33Z"
+          "next": "",
+          "updated_utc": "2026-11-17T05:33:48Z"
         },
         {
           "id": "C16.2",
@@ -3637,17 +3642,21 @@
             "crates/core/tests/fixtures/c16/print.xlsx"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c16_print --test c16_objects -- --test-threads=1 -> 9 + 4 passed"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-render-compare-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
           ],
           "not_done": [
-            "打印标题每页重复、正文不重不漏；单段负格式按 Excel 实测修正（--987.65）；等待复核"
+            "断行点仍差 1 字：Excel 导出时按 ~0.915 缩放并在缩放宽度内折行，我们按文档 scale=100 排版；其余（每页重复标题、正文不重不漏、换行与预览同源、不越纸）已由用例锁住"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:00:16Z"
+          "updated_utc": "2026-11-17T05:33:48Z"
         },
         {
           "id": "C16.3",
@@ -3655,7 +3664,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/image_embed.rs",
@@ -3665,17 +3674,21 @@
             "crates/core/tests/fixtures/c16/objects.xlsx"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c16_print --test c16_objects -- --test-threads=1 -> 9 + 4 passed"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-objects.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-objects.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-render-compare-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
           ],
           "not_done": [
-            "图片/图表/文本框已进 PDF 与预览；顺带修了图表锚点前缀解析 bug（0,0,4,3 → C1:I15）；等待复核"
+            "图片/图表/文本框均进 PDF；数值轴刻度与 Excel 一致(0/5/…/25)，标题只画一次"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:14:11Z"
+          "updated_utc": "2026-11-17T05:33:48Z"
         },
         {
           "id": "C16.4",
@@ -3683,7 +3696,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/display.rs",
@@ -3694,17 +3707,21 @@
             "crates/core/tests/fixtures/c16/print.xlsx"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p sheetcore --offline -j 2 --test c16_print --test c16_objects -- --test-threads=1 -> 9 + 4 passed"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-render-compare-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
           ],
           "not_done": [
-            "预览改为直接画 print::page_ops，与 PDF 同源；真实键鼠操作未执行，留待验收"
+            "预览与导出同源：preview_ops_are_the_pdf_ops 逐页断言文字/矩形/线段相同"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:00:16Z"
+          "updated_utc": "2026-11-17T05:33:48Z"
         }
       ]
     },

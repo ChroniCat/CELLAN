@@ -128,3 +128,71 @@ fn pdf_export_writes_every_page() {
     assert_eq!(text.matches("/Type /Page\n").count() + text.matches("/Type /Page ").count(), n, "页对象数应与页数一致");
     assert!(bytes.len() > 5000, "PDF 太小：{}", bytes.len());
 }
+
+// ---- C16 验收补测（2026-11-17）----
+
+#[test]
+fn preview_ops_are_the_pdf_ops() {
+    // 预览 sidebar 调 page_ops_with，导出调 page_ops_metric(.., None)：
+    // 两者必须逐项相同，否则“预览与 PDF 一致”只是口号。
+    let wb = sheetcore::xlsx::load(&fixture()).expect("加载");
+    let layout = print::paginate(&wb.sheets[0], &wb.sheets[0].page);
+    for page in 0..layout.pages.len() {
+        let a = print::page_ops_with(&wb, 0, &layout, page, Some(&fixture()));
+        let b = print::page_ops_metric(&wb, 0, &layout, page, Some(&fixture()), None);
+        assert_eq!(a.texts.len(), b.texts.len(), "page {page} 文本条数");
+        assert_eq!(a.rects, b.rects);
+        assert_eq!(a.lines, b.lines);
+        for (x, y) in a.texts.iter().zip(b.texts.iter()) {
+            assert_eq!(x.text, y.text);
+            assert!((x.x - y.x).abs() < 0.01 && (x.baseline - y.baseline).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+fn every_op_stays_inside_the_page() {
+    // 合并格换行必须被行高裁掉，不能画到纸外
+    let wb = sheetcore::xlsx::load(&fixture()).expect("加载");
+    let layout = print::paginate(&wb.sheets[0], &wb.sheets[0].page);
+    let (pw, ph) = layout.page_size;
+    for page in 0..layout.pages.len() {
+        let out = print::page_ops_with(&wb, 0, &layout, page, Some(&fixture()));
+        for t in &out.texts {
+            assert!(
+                t.x >= 0.0 && t.baseline >= 0.0 && t.x <= pw && t.baseline <= ph,
+                "page {page} 文本越界 {:?} ({}, {})",
+                t.text,
+                t.x,
+                t.baseline
+            );
+        }
+        for r in &out.rects {
+            assert!(r.0 >= -1.0 && r.1 >= -1.0 && r.0 + r.2 <= pw + 1.0, "page {page} 矩形越界 {r:?}");
+        }
+    }
+}
+
+#[test]
+fn title_rows_repeat_on_every_page_and_body_never_repeats() {
+    let wb = sheetcore::xlsx::load(&fixture()).expect("加载");
+    let layout = print::paginate(&wb.sheets[0], &wb.sheets[0].page);
+    assert!(layout.pages.len() >= 2, "夹具应至少两页");
+    for page in 0..layout.pages.len() {
+        let texts = texts_of(&wb, &layout, page);
+        assert!(texts.contains(&"产品".to_string()), "page {page} 缺表头「产品」");
+        assert!(texts.contains(&"金额".to_string()), "page {page} 缺表头「金额」");
+    }
+    // 正文行不重复：每页的「行NN」集合两两不相交
+    let mut seen = std::collections::HashSet::new();
+    for page in 0..layout.pages.len() {
+        for t in texts_of(&wb, &layout, page) {
+            if let Some(num) = t.strip_prefix('行') {
+                if num.chars().all(|c| c.is_ascii_digit()) {
+                    assert!(seen.insert(t.clone()), "「{t}」在多个页面重复出现");
+                }
+            }
+        }
+    }
+    assert!(seen.len() > 20, "应覆盖全部数据行，实际 {} 行", seen.len());
+}
