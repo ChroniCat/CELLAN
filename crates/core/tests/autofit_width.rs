@@ -67,3 +67,24 @@ fn styled_autofit_matches_excel_indent_and_bold() {
         );
     }
 }
+
+#[test]
+fn wrapped_autofit_uses_longest_line() {
+    // work/probe/excel_autofit_wrap3.out：Excel 自动换行取最长一行
+    let cases = [
+        ("1\n22", 2.88),
+        ("中文\n中文文字", 8.38),
+        ("中文文字中文", 12.38),
+    ];
+    for (s, want) in cases {
+        let got = sheetcore::display::excel_autofit_chars_wrapped(s, false, 0, true);
+        assert!(
+            (got - want).abs() < 0.02,
+            "{s:?}: got {got}, want {want}"
+        );
+    }
+    assert_eq!(
+        sheetcore::display::excel_autofit_chars_wrapped("1\n22", false, 0, false),
+        sheetcore::display::excel_autofit_chars_styled("1\n22", false, 0)
+    );
+}

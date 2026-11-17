@@ -5989,7 +5989,7 @@
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 用 Carlito/CJK 1em 度量并换算成 Excel 字符数；文本列 AutoFit 与 Excel 完全一致。",
+          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 用 Carlito/CJK 1em 度量并换算成 Excel 字符数；AutoFit 已覆盖等线 11、缩进/粗体、自动换行取最长行、合并格跳过。",
           "files": [
             "crates/app/src/main.rs",
             "crates/core/src/layout.rs",
@@ -6007,7 +6007,10 @@
             "powershell work/probe/read_widths.ps1 -Path widths_out2.xlsx -> 9 列宽度与输入逐列相同",
             "SC_AUTOFIT=c:{0,1,2} SC_AUTOFIT_SAVE=... -> Excel 读回 41.5 / 27.63（Excel AutoFit 41.5 / 27.63）",
             "cargo test -p sheetcore --lib -- style::tests::general -> 2 passed",
-            "SC_AUTOFIT=c:0 -> 1.23457E+14 len=11 chars=10.65（Excel 同值 10.63 字符）"
+            "SC_AUTOFIT=c:0 -> 1.23457E+14 len=11 chars=10.65（Excel 同值 10.63 字符）",
+            "cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2 => 3 passed",
+            "SC_AUTOFIT=c:5 app.exe autofit_wrap3.xlsx => F=2.88（Excel 2.88）；SC_AUTOFIT=c:7 合并列保持默认 72px",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 386 passed, 0 failed, 1 ignored; APP_EXIT=0 (app-ui14-wrap.log)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
@@ -6020,7 +6023,7 @@
           ],
           "not_done": [
             "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数",
-            "AutoFit 已按等线 11 标定：46 个字符串 + 缩进/粗体（3 字符/级、+0.37）+ 端到端 5 列全等；长数字缩进仍有 0.37–0.62 像素量化差，多行/合并列/非 11 号字号未逐项对拍。"
+            "非 11 号字号的 AutoFit 未实现；10 位 ASCII 数字串 Excel 7.88 与等线 11 公式 11.0 的量化差未反解（多行纯 CJK/短串已对齐，不能扩大成所有字符串精确）"
           ],
           "failures": [],
           "blocker": "",

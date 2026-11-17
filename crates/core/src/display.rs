@@ -284,6 +284,22 @@ pub fn excel_autofit_chars_styled(s: &str, bold: bool, indent: u8) -> f32 {
         + indent as f32 * 3.0
 }
 
+/// 自动换行格的 AutoFit：Excel 取**最长一行**，不是整段所有字符相加。
+/// `1\n22` 实测列宽 2.88（不是 4.75）；`中文\n中文文字` 取 4 个汉字 8.38。
+pub fn excel_autofit_chars_wrapped(
+    s: &str,
+    bold: bool,
+    indent: u8,
+    wrap: bool,
+) -> f32 {
+    if !wrap {
+        return excel_autofit_chars_styled(s, bold, indent);
+    }
+    s.split('\n')
+        .map(|line| excel_autofit_chars_styled(line, bold, indent))
+        .fold(0.0f32, f32::max)
+}
+
 /// 单个字符的排版宽度。
 ///
 /// 拉丁/数字优先用内嵌 Carlito（与 Calibri 度量兼容）的真实 advance，

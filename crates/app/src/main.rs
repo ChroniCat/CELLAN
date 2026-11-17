@@ -6563,7 +6563,16 @@ impl SheetApp {
         let mut width: f32 = 17.0;
         let mut saw_text = false;
         let (_, _, r2, _) = self.wb.sheet(self.sheet_idx).used_bounds().unwrap_or((0, 0, 0, 0));
+        // Excel 的 AutoFit 不参与合并格：合并区宽度由用户/列宽决定，
+        // 对合并格按整段文字加宽会把普通列撑得过大。
+        let merges = self.wb.sheet(self.sheet_idx).merges.clone();
         for r in 0..=r2.min(5000) {
+            if merges
+                .iter()
+                .any(|(a, b, c, d)| r >= *a && r <= *c && col >= *b && col <= *d)
+            {
+                continue;
+            }
             let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, col) else {
                 continue;
             };
@@ -6581,7 +6590,12 @@ impl SheetApp {
             // 求和；用 Carlito 的 text_width 再除 7 会差 1–1.5 字符。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             // 缩进按 3 字符/级、粗体按 +0.37 计入；不能再额外乘字号。
-            let chars = sheetcore::display::excel_autofit_chars_styled(&txt, st.bold, st.indent);
+            let chars = sheetcore::display::excel_autofit_chars_wrapped(
+                &txt,
+                st.bold,
+                st.indent,
+                st.wrap,
+            );
             let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {
                 eprintln!(

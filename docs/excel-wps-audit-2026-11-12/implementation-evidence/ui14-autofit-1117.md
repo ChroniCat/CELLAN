@@ -112,3 +112,23 @@ Excel 实测（`work/probe/excel_autofit_indent2.out`，Normal=等线 11）：
 
 仍未做：真实鼠标双击列边界（无交互桌面）；多行/合并列、非 11 号的字号
 未逐项对拍（字号对 AutoFit 的影响本轮只记录，不实现）。
+
+## 自动换行与合并格（2026-11-18 第四次对拍）
+
+Excel 实测（`work/probe/excel_autofit_wrap3.out`，单元格 等线 11、wrap=True）：
+
+| 单元格 | 内容 | Excel ColumnWidth | app |
+|---|---|---:|---:|
+| F1 | `1\n22` | 2.88 | 2.88 |
+| D1 | `第一行\n第二行` | 6.50 | 6.50（最长行 3 汉字） |
+| E1 | `中文文字中文` | 12.38 | 12.38 |
+| H1:I1 | 合并 + 长中文 | 8.38（AutoFit 不动合并区） | 72px 默认，未加宽 |
+
+实现：`display::excel_autofit_chars_wrapped(s, bold, indent, wrap)` 在 wrap=True 时取
+`split('\n')` 的最长一行；`autofit_col` 跳过任何落在 `sh.merges` 里的格子，
+避免合并区长文本把普通列撑宽。回归 `wrapped_autofit_uses_longest_line` 3 passed；
+端到端 F 列 `SC_AUTOFIT=c:5` 保存回读 `F=2.88`。
+
+仍未做：真实鼠标双击列边界；非 11 号字号的 AutoFit；该夹具里 10 位 ASCII 数字串
+Excel 给 7.88、等线 11 公式给 11.0，说明 ASCII 比例字体的量化尚未完全反解，
+不能把多行/合并的对齐扩大成“所有字符串已精确”。
