@@ -3574,12 +3574,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "C16.1~C16.4 均已实现并留证据；真实键鼠打印预览/导出未执行（RDP 不可用），等待复核"
+        "已建立逐页真渲染比对（c16-render-compare-1117.md）：print 双页文本/页数/尺寸一致，但横向偏差最大 31pt、纵向 8.5pt；objects 多画图表标题「季度销量」、缺轴标签「5」。C16.2/3/4 保持待验收。真实键鼠打印预览仍未执行（环境无交互桌面）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核打印四切片",
-      "updated_utc": "2026-11-17T03:34:16Z",
+      "updated_utc": "2026-11-17T04:21:33Z",
       "slices": [
         {
           "id": "C16.1",
@@ -3613,12 +3613,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
           ],
           "not_done": [
-            "没有逐页 Excel/WPS 视觉矩阵（需人工/渲染器比对）；pypdfium2 读回文本已记录。（原「负数 [Red] 颜色未绘制」记录已更正：PDF 内容流实测红/蓝各 1 次，见 evidence/c16-red-color-1117.md）"
+            "逐页渲染比对已建立（见 c16-render-compare-1117.md），C16.1 自身格式项通过；页码/页眉由 C16.2 承载"
           ],
           "failures": [],
           "blocker": "",
           "next": "监督复核 C16.1；随后做 C16.2 样式/颜色。",
-          "updated_utc": "2026-11-17T03:34:16Z"
+          "updated_utc": "2026-11-17T04:21:33Z"
         },
         {
           "id": "C16.2",

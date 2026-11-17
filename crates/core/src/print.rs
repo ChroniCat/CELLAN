@@ -353,12 +353,17 @@ fn draw_view(
     }
     let size = (view.size * scale).max(3.0);
     let pad = 2.0 * scale + view.indent as f32 * size * 0.6;
-    let lines_txt = if view.wrap {
+    let mut lines_txt = if view.wrap {
         display::wrap_lines(&view.text, (cw - pad * 2.0).max(4.0), size)
     } else {
         view.text.split('\n').map(|s| s.to_string()).collect()
     };
     let line_h = size * 1.18;
+    // Excel 打印按行高裁剪：放不下的行不画（自动行高时本来就放得下，等于空操作）
+    let fit = ((ch / line_h).floor() as usize).max(1);
+    if lines_txt.len() > fit {
+        lines_txt.truncate(fit);
+    }
     let total_h = line_h * lines_txt.len() as f32;
     let bottom = top + ch;
     let mut ty = match view.valign {
