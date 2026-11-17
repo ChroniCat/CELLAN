@@ -6697,6 +6697,7 @@ impl SheetApp {
                 ignore_case: true,
                 mode: match dlg.sort_mode {
                     1 => sheetcore::data_tools::SortMode::Pinyin,
+                    3 => sheetcore::data_tools::SortMode::Stroke,
                     2 => sheetcore::data_tools::SortMode::Custom(
                         dlg.custom
                             .split(['，', ',', '、', ';'])
@@ -8388,6 +8389,7 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                             .selected_text(match dlg.sort_mode {
                                 1 => "中文拼音",
                                 2 => "自定义序列",
+                                3 => "中文笔画",
                                 _ => "字典序",
                             })
                             .width(100.0)
@@ -8395,13 +8397,10 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                                 ui.selectable_value(&mut dlg.sort_mode, 0, "字典序");
                                 ui.selectable_value(&mut dlg.sort_mode, 1, "中文拼音");
                                 ui.selectable_value(&mut dlg.sort_mode, 2, "自定义序列");
-                                ui.add_enabled(
-                                    false,
-                                    egui::SelectableLabel::new(false, "笔画（本版本不支持）"),
-                                )
-                                .on_disabled_hover_text(
-                                    "笔画排序需要离线笔画数表（授权可分发），本版本不含；Excel/WPS 的笔画序不能拿拼音序近似",
-                                );
+                                ui.selectable_value(&mut dlg.sort_mode, 3, "中文笔画")
+                                    .on_hover_text(
+                                        "按 Excel 笔画排序（xlStroke）的实测顺序；表外字符退回拼音序",
+                                    );
                             });
                     });
                     if dlg.sort_mode == 2 {

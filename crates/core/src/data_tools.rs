@@ -13,6 +13,8 @@ pub enum SortMode {
     Default,
     /// 中文拼音序：走系统 zh-CN 排序表，和 Excel 在中文 Windows 上一致
     Pinyin,
+    /// 中文笔画序：`assets/stroke_order.bin`（Excel xlStroke 实测顺序）
+    Stroke,
     /// 自定义序列（高/中/低）：列表里靠前的排前面，不在列表里的按拼音排在后面
     Custom(Vec<String>),
 }
@@ -67,6 +69,7 @@ fn cmp_cell(
             match mode {
                 SortMode::Default => x.cmp(&y),
                 SortMode::Pinyin => crate::collate::cmp_pinyin(&x, &y),
+                SortMode::Stroke => crate::collate::cmp_stroke(&x, &y),
                 SortMode::Custom(list) => {
                     let rank = |v: &str| -> Option<usize> {
                         let t = v.trim();
