@@ -189,6 +189,20 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         let g = &tab.groups[i];
         let known = app.ribbon_group_w.get(&g.id).copied();
         let w = known.unwrap_or(160.0);
+        let compact_w = compact_width(g);
+        // UI-13.2 二级压缩：整组放不下时，先把大按钮收成小图标网格；
+        // 小图标也放不下，才退化成「组名 ▾」/「更多 ▾」。
+        let full_fits = known.is_some() && used + w + 60.0 <= avail;
+        let compact_fits = known.is_some()
+            && compact_w + 12.0 <= avail - used
+            && compact_w + 12.0 < w;
+        if known.is_some() && !full_fits && compact_fits {
+            let x0 = ui.cursor().min.x;
+            group_compact(app, ui, g);
+            used += (ui.cursor().min.x - x0).max(24.0);
+            i += 1;
+            continue;
+        }
         // 给「更多 ▾」预留 60pt：不留的话最后会画到裁切区外（760×420 实测溢出 11px）
         if known.is_some() && used + w + 60.0 > avail && used > 0.0 {
             if avail - used >= 92.0 {
@@ -263,6 +277,157 @@ fn group(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
 fn nodes(app: &mut SheetApp, ui: &mut egui::Ui, list: &[Node]) {
     for n in list {
         node(app, ui, n);
+    }
+}
+
+/// UI-13.2：计一个分组里真正可点击的控件数（忽略说明文字和空白）。
+fn compact_leaf_count(list: &[Node]) -> usize {
+    list.iter()
+        .map(|n| match n {
+            Node::Button(_)
+            | Node::Toggle(_)
+            | Node::Split { .. }
+            | Node::Menu(_)
+            | Node::DropDown { .. }
+            | Node::Gallery { .. }
+            | Node::ComboBox { .. }
+            | Node::EditBox { .. }
+            | Node::Slider { .. } => 1,
+            Node::Box { children, .. } => compact_leaf_count(children),
+            Node::Label(_) | Node::Spacer(_) | Node::Separator => 0,
+        })
+        .sum()
+}
+
+/// 小图标网格的目标宽度：按控件数选 3/4 列，避免又占满整条功能区。
+fn compact_width(g: &Group) -> f32 {
+    let n = compact_leaf_count(&g.children);
+    let cols: f32 = if n >= 6 { 4.0 } else { 3.0 };
+    (cols * 52.0 + 10.0).min(210.0)
+}
+
+/// Excel 的二级压缩：分组内的大按钮改成 24px 小按钮，排成 3–4 列的小网格。
+/// 组名仍然在底部，命令一个不少；真正放不下时才由调用方退化成「组名 ▾」。
+fn group_compact(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
+    let w = compact_width(g);
+    let x0 = ui.cursor().min.x;
+    let mut leaves = Vec::new();
+    compact_leaves(&g.children, &mut leaves);
+    let cols = if leaves.len() >= 6 { 4 } else { 3 };
+    let body = |app: &mut SheetApp, ui: &mut egui::Ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(w, 76.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(w);
+                ui.set_max_width(w);
+                for row in leaves.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
+                        for n in row {
+                            node_compact(app, ui, n);
+                        }
+                    });
+                }
+            },
+        );
+    };
+    match &g.launcher {
+        Some(l) => {
+            // 紧凑组也要保留右下角的对话框启动器，否则“格式单元格”会丢。
+            let hit = ui_kit::group_l(ui, &g.label, &g.id, |ui| body(app, ui));
+            if hit {
+                let action = l.action().to_string();
+                app.ribbon_action(&action, ui.ctx());
+            }
+        }
+        None => {
+            let _ = ui_kit::group(ui, &g.label, |ui| body(app, ui));
+        }
+    }
+    if std::env::var("SC_PANEL_LOG").is_ok() {
+        eprintln!(
+            "[compact] {:20} leaves={} target_w={w:.0} actual={:.0} h={:.0}",
+            g.label,
+            compact_leaf_count(&g.children),
+            ui.cursor().min.x - x0,
+            ui.min_rect().height()
+        );
+    }
+}
+
+fn compact_leaves<'a>(list: &'a [Node], out: &mut Vec<&'a Node>) {
+    for n in list {
+        match n {
+            Node::Box { children, .. } => compact_leaves(children, out),
+            Node::Button(_)
+            | Node::Toggle(_)
+            | Node::Split { .. }
+            | Node::Menu(_)
+            | Node::DropDown { .. }
+            | Node::Gallery { .. }
+            | Node::ComboBox { .. }
+            | Node::EditBox { .. }
+            | Node::Slider { .. } => out.push(n),
+            Node::Label(_) | Node::Spacer(_) | Node::Separator => {}
+        }
+    }
+}
+
+fn node_compact(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
+    match n {
+        Node::Button(c) => {
+            let mut c = c.clone();
+            c.size = Size::Normal;
+            button(app, ui, &c, false);
+        }
+        Node::Toggle(c) => {
+            let mut c = c.clone();
+            c.size = Size::Normal;
+            button(app, ui, &c, true);
+        }
+        Node::Split { ctl, menu } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            split(app, ui, &ctl, menu);
+        }
+        Node::Menu(m) => {
+            let mut m = m.clone();
+            m.ctl.size = Size::Normal;
+            menu(app, ui, &m);
+        }
+        Node::DropDown { ctl, items } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            dropdown(app, ui, &ctl, items);
+        }
+        Node::Gallery { ctl, items, .. } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            ctl.width = Some(ctl.width.unwrap_or(120.0).min(120.0));
+            gallery(app, ui, &ctl, items);
+        }
+        Node::ComboBox { ctl, items, width } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            combo(app, ui, &ctl, items, (*width).min(120.0));
+        }
+        Node::EditBox {
+            ctl,
+            hint,
+            password,
+            width,
+        } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            edit(app, ui, &ctl, hint, *password, (*width).min(120.0));
+        }
+        Node::Slider { ctl, min, max } => {
+            let mut ctl = ctl.clone();
+            ctl.size = Size::Normal;
+            slider(app, ui, &ctl, *min, *max);
+        }
+        Node::Box { .. } | Node::Label(_) | Node::Spacer(_) | Node::Separator => {}
     }
 }
 
@@ -1464,4 +1629,31 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "TextBox" => Icon::TextBox,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn compact_alignment_group_has_a_bounded_grid() {
+        let ribbon = crate::ribbon::load();
+        let home = ribbon
+            .tabs
+            .iter()
+            .find(|t| t.label == "开始")
+            .expect("Home tab");
+        let g = home
+            .groups
+            .iter()
+            .find(|g| g.label == "对齐方式")
+            .expect("alignment group");
+        let n = compact_leaf_count(&g.children);
+        assert!(n >= 8, "对齐方式应有足够多的命令，实际 {n}");
+        let w = compact_width(g);
+        assert!((72.0..=210.0).contains(&w), "紧凑组宽度越界: {w}");
+        let mut leaves = Vec::new();
+        compact_leaves(&g.children, &mut leaves);
+        assert_eq!(leaves.len(), n, "扁平化后控件数必须一致");
+    }
 }
