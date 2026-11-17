@@ -275,6 +275,15 @@ pub fn excel_autofit_chars(s: &str) -> f32 {
     }
 }
 
+/// 带样式的 AutoFit：Excel 的缩进按 3 个字符/级计入，粗体再补 0.37
+/// （等线 11 实测：`1`=1.88、粗体=2.25、缩进 1=4.88、缩进 2=7.88）。
+/// 这是 AutoFit 的列宽，不是画布上的文字 advance；不要拿它去乘字号。
+pub fn excel_autofit_chars_styled(s: &str, bold: bool, indent: u8) -> f32 {
+    excel_autofit_chars(s)
+        + if bold { 0.37 } else { 0.0 }
+        + indent as f32 * 3.0
+}
+
 /// 单个字符的排版宽度。
 ///
 /// 拉丁/数字优先用内嵌 Carlito（与 Calibri 度量兼容）的真实 advance，

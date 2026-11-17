@@ -6575,20 +6575,22 @@ impl SheetApp {
             // Excel AutoFit 是「字符单位 + 固定内边距」，不是按字形 advance
             // 求和；用 Carlito 的 text_width 再除 7 会差 1–1.5 字符。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
-            let chars = sheetcore::display::excel_autofit_chars(&txt);
+            // 缩进按 3 字符/级、粗体按 +0.37 计入；不能再额外乘字号。
+            let chars = sheetcore::display::excel_autofit_chars_styled(&txt, st.bold, st.indent);
             let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {
                 eprintln!(
-                    "[autofit]   r{r} txt={:?} len={} chars={:.2} size={:.1} bold={}",
+                    "[autofit]   r{r} txt={:?} len={} chars={:.2} size={:.1} bold={} indent={}",
                     txt.chars().take(12).collect::<String>(),
                     txt.chars().count(),
                     chars,
                     size,
-                    st.bold
+                    st.bold,
+                    st.indent
                 );
             }
             // 列宽模型是「内容宽 + 内边距」；chars 已含等线的 0.88 内边距。
-            width = width.max(w + st.indent as f32 * size * 2.0);
+            width = width.max(w);
         }
         if !saw_text {
             width = 72.0; // 空列保持 Excel 的默认列宽，不要缩成单字符

@@ -92,5 +92,23 @@ cargo test -q -p app --bin app -- --test-threads=1      → APP_EXIT=0（378 pas
 
 `cargo test -p sheetcore --test autofit_width`：1 passed。
 
-仍未做：真实鼠标双击列边界（无交互桌面）；带缩进/加粗/多行/合并列的
-AutoFit 未逐项对拍（缩进仍沿用 `indent×size×2` 估算）。
+## 缩进与粗体（2026-11-18 第三次对拍）
+
+Excel 实测（`work/probe/excel_autofit_indent2.out`，Normal=等线 11）：
+
+| 单元格 | 样式 | Excel ColumnWidth | app |
+|---|---|---:|---:|
+| `1` | 普通 | 1.88 | 1.88 |
+| `1` | 粗体 | 2.25 | 2.25 |
+| `1` | 缩进 1 | 4.88 | 4.88 |
+| `1` | 缩进 2 | 7.88 | 7.88 |
+| `1` | 粗体 + 缩进 1 | 5.25 | 5.25 |
+| `12345678901` | 缩进 1 | 15.50 | 15.13 |
+| `12345678901` | 缩进 2 | 18.75 | 18.13 |
+
+新增 `excel_autofit_chars_styled(s, bold, indent)`：缩进按 **3 字符/级**，
+粗体 **+0.37**，不再用旧的 `indent×size×2` 像素估算；app 的 `autofit_col`
+改为直接用它。长数字缩进仍有 0.37–0.62 的像素量化偏差，未冒充逐位精确。
+
+仍未做：真实鼠标双击列边界（无交互桌面）；多行/合并列、非 11 号的字号
+未逐项对拍（字号对 AutoFit 的影响本轮只记录，不实现）。

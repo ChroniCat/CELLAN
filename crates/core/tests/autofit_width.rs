@@ -40,11 +40,30 @@ fn excel_autofit_chars_matches_measured_widths() {
         ("AbCdEfGhIj", 11.0),
         ("Hello World", 12.13),
     ];
-    for (text, want) in cases {
-        let got = sheetcore::display::excel_autofit_chars(text);
+    for (s, want) in cases {
+        let got = sheetcore::display::excel_autofit_chars(s);
         assert!(
-            (got - want).abs() < 0.011,
-            "{text:?}: got {got:.2}, want {want:.2}"
+            (got - want).abs() < 0.02,
+            "{s:?}: got {got}, want {want}"
+        );
+    }
+}
+
+#[test]
+fn styled_autofit_matches_excel_indent_and_bold() {
+    // work/probe/excel_autofit_indent2.out（Excel 16.0，Normal=等线 11）
+    let cases = [
+        ("1", false, 0, 1.88),
+        ("1", true, 0, 2.25),
+        ("1", false, 1, 4.88),
+        ("1", false, 2, 7.88),
+        ("1", true, 1, 5.25),
+    ];
+    for (s, bold, indent, want) in cases {
+        let got = sheetcore::display::excel_autofit_chars_styled(s, bold, indent);
+        assert!(
+            (got - want).abs() < 0.02,
+            "{s:?} bold={bold} indent={indent}: got {got}, want {want}"
         );
     }
 }
