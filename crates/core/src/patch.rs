@@ -2135,8 +2135,9 @@ pub fn set_cols_xml(xml: &str, wanted: &[(u32, f32, bool)]) -> String {
     }
     for &(c, px, hidden) in wanted {
         let idx = c + 1;
-        // Excel 的 ColumnWidth 与 Range.Width 差 5px 内边距：写文件用 px/8
-        let width = (px / 8.0 * 100.0).round() / 100.0;
+        // 内部 px 含 5px 内边距（显示宽 = 字符数×8+5）；写回文件要去掉它，否则
+        // 每存一次 Excel 就宽 0.625 字符
+        let width = (((px - 5.0) / 8.0) * 100.0).round() / 100.0;
         let width = width.max(0.0);
         if let Some(pos) = tags.iter().position(|(a, b, _)| *a <= idx && idx <= *b) {
             let (a, b, attrs) = tags[pos].clone();

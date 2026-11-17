@@ -5915,26 +5915,38 @@
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "",
+          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 用 Carlito/CJK 1em 度量并换算成 Excel 字符数；文本列 AutoFit 与 Excel 完全一致。",
           "files": [
-            "crates/app/src/main.rs"
+            "crates/app/src/main.rs",
+            "crates/core/src/layout.rs",
+            "crates/core/src/patch.rs",
+            "crates/core/src/xls_write.rs",
+            "crates/core/src/merges.rs",
+            "crates/core/src/xls_layout.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p sheetcore --offline -j 2 -> CORE_EXIT=0 (115 bins)",
+            "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0 (378 passed / 1 ignored)",
+            "powershell work/probe/read_widths.ps1 -Path widths_out2.xlsx -> 9 列宽度与输入逐列相同",
+            "SC_AUTOFIT=c:{0,1,2} SC_AUTOFIT_SAVE=... -> Excel 读回 41.5 / 27.63（Excel AutoFit 41.5 / 27.63）"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-col.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row1.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row2.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row2.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-widths.txt"
           ],
           "not_done": [
-            "列宽比 Excel 宽 1.78 字符（默认字体度量差异），末字符完整",
-            "真实鼠标双击列边界未做（RDP 注入不可用）"
+            "长整数 General：Excel 显示 1.23E+11 并按 ~11 字符定宽，本程序显示完整数字，AutoFit 宽 5.9 字符",
+            "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T23:32:57Z"
+          "updated_utc": "2026-11-17T13:40:00Z"
         }
       ]
     },

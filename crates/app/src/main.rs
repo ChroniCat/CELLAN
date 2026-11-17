@@ -6519,27 +6519,22 @@ impl SheetApp {
             if txt.is_empty() {
                 continue;
             }
-            // 和绘制用同一套字号/字族，量出来的才是真宽度
-            // 自适应是模型尺寸：必须按 100% 度量，缩放/页面比例不能写进列宽
+            // 列宽要按 Excel 的口径算，不能用屏幕字体的 galley：
+            //   Excel 用 Carlito/Calibri 度量文字（1 字符 = 7px @96dpi），
+            //   存盘 width 用 8px/字符，显示时再 +5px 内边距。
+            // 直接拿 egui 的 Inter/Noto 宽度会宽 15% 上下，存回去 Excel 就偏宽。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
-            let fname = if st.font.is_empty() { "默认" } else { &st.font };
-            let font = if st.bold {
-                let (fam, sz, _) = bold_font(fname, size);
-                egui::FontId::new(sz, fam)
-            } else {
-                egui::FontId::new(size, cell_family(fname))
-            };
-            let w = ctx.fonts(|f| {
-                f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
-                    .size()
-                    .x
-            });
+            let text_px = sheetcore::display::text_width(&txt, size);
+            // 实测（Excel 16.0 Build 20326，本机 96dpi）：ColumnWidth = (text_px - 3) / 7
+            let chars = ((text_px - 3.0) / 7.0).max(0.0);
+            let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {
                 eprintln!(
-                    "[autofit]   r{r} txt={:?} len={} galley={:.1} size={:.1} bold={}",
+                    "[autofit]   r{r} txt={:?} len={} text_px={:.1} chars={:.2} size={:.1} bold={}",
                     txt.chars().take(12).collect::<String>(),
                     txt.chars().count(),
-                    w,
+                    text_px,
+                    chars,
                     size,
                     st.bold
                 );

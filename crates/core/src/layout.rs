@@ -134,16 +134,21 @@ impl Axis {
     }
 }
 
-/// Excel 列宽单位（字符数）→ 像素。默认字体 11pt 时 1 字符 ≈ 7px，再加 5px 内边距。
+/// Excel 列宽单位（字符数）→ 像素。
+///
+/// 本机 Excel 16.0 实测（96dpi，Calibri/宋体 11pt）：显示宽 = 字符数 × 8 + 5px。
+/// 8 来自 `Truncate(((256*w + Truncate(128/MDW))/256)*MDW)` 且 MDW=8 的像素量化，
+/// +5 是单元格内边距；默认列宽 8.38 字符 → 72px。
 pub fn excel_width_to_px(w: f32) -> f32 {
-    // 默认列宽 / StandardWidth：8.38 字符 = 72px（含 5px 内边距）
     (w * 8.0 + 5.0).round().max(8.0)
 }
 
-/// `<col width="21.25">` → 170px。OOXML 里显式列宽不含 5px 内边距，
-/// 和 Excel 的 Range.Width 实测一致（8.38 是默认宽度，走上面的函数）。
+/// `<col width="21.25">` → 175px（21.25×8+5）。默认宽度 8.38 走同一公式。
 pub fn col_width_to_px(w: f32) -> f32 {
-    (w * 8.0).round().max(0.0)
+    if w <= 0.0 {
+        return 0.0;
+    }
+    (w * 8.0 + 5.0).round()
 }
 
 /// 行高单位是磅（pt）→ 像素（96 DPI）
@@ -207,8 +212,8 @@ mod tests {
     #[test]
     fn excel_units() {
         assert_eq!(excel_width_to_px(8.43), 72.0);
-        assert_eq!(col_width_to_px(21.25), 170.0);
-        assert_eq!(col_width_to_px(9.0), 72.0);
+        assert_eq!(col_width_to_px(21.25), 175.0);
+        assert_eq!(col_width_to_px(9.0), 77.0);
         assert_eq!(pt_to_px(15.0), 20.0);
         assert_eq!(pt_to_px(30.0), 40.0);
     }

@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(out.sheets[0].cols.len(), 1);
         assert_eq!(out.sheets[0].cols[0].0, 0);
         assert_eq!(out.sheets[0].cols[0].1, 2);
-        assert!((out.sheets[0].cols[0].2 - 128.0).abs() < 2.0);
+        assert!((out.sheets[0].cols[0].2 - 133.0).abs() < 2.0); // 16 字符 × 8 + 5
         assert_eq!(out.sheets[0].rows.len(), 1);
         assert!((out.sheets[0].rows[0].1 - 40.0).abs() < 1.5);
         assert!(out.sheets[1].cols.is_empty());

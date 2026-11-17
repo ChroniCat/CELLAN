@@ -514,7 +514,7 @@ mod tests {
         let lay = parse_layout(xml);
         assert_eq!(lay.col_widths.len(), 3, "第 1-3 列应为自定义宽度");
         assert_eq!(lay.col_widths[0].0, 0);
-        assert!((lay.col_widths[0].1 - 128.0).abs() < 1.0);
+        assert!((lay.col_widths[0].1 - 133.0).abs() < 1.0); // 16 字符 × 8 + 5
         assert_eq!(lay.row_heights, vec![(1, 40.0)]);
         assert!(lay.merges.is_empty());
     }
