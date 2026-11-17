@@ -3664,7 +3664,7 @@
       "failures": [],
       "blocker": "",
       "next": "等待监督复核打印四切片",
-      "updated_utc": "2026-11-13T18:14:11Z",
+      "updated_utc": "2026-11-17T03:34:16Z",
       "slices": [
         {
           "id": "C16.1",
@@ -3698,12 +3698,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-print-layout.txt"
           ],
           "not_done": [
-            "负数 [Red] 颜色未绘制（C16.2）；没有逐页 Excel/WPS 视觉矩阵；pypdfium2 读回文本已记录，pdftotext 对 ¥ 有阅读器差异。"
+            "没有逐页 Excel/WPS 视觉矩阵（需人工/渲染器比对）；pypdfium2 读回文本已记录。（原「负数 [Red] 颜色未绘制」记录已更正：PDF 内容流实测红/蓝各 1 次，见 evidence/c16-red-color-1117.md）"
           ],
           "failures": [],
           "blocker": "",
           "next": "监督复核 C16.1；随后做 C16.2 样式/颜色。",
-          "updated_utc": "2026-11-13T18:00:16Z"
+          "updated_utc": "2026-11-17T03:34:16Z"
         },
         {
           "id": "C16.2",
