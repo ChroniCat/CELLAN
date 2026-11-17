@@ -238,6 +238,8 @@ pub struct Out {
     pub polys: Vec<(Vec<(f32, f32)>, [u8; 3])>,
     /// 真字体度量（导出 PDF 时挂上）；None 时退回 display::text_width 的估算
     pub metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+    /// 真纵向度量（导出 PDF 时挂上）：size(pt) → (ascender, descender)，单位 pt，都取正
+    pub vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
 }
 
 impl Out {
@@ -265,6 +267,29 @@ pub struct TextOp {
 struct CfState {
     cf: crate::cf::CfSheet,
     stats: crate::cf::CfStats,
+}
+
+/// 单元格首行基线的位置（PDF 坐标，y 向上；`top` 是下边、`top + ch` 是上边）。
+/// 只用字体真度量算：ascender/descender 决定行高，也决定顶/底对齐时留多少。
+/// `valign`：0 = 靠上，1 = 居中，2 = 靠下；多行时 `total_h = line_h × 行数`。
+pub fn cell_baseline(
+    valign: u8,
+    top: f32,
+    ch: f32,
+    total_h: f32,
+    line_h: f32,
+    asc: f32,
+    desc: f32,
+) -> f32 {
+    let bottom = top + ch;
+    match valign {
+        // 0 = 靠上：首行基线在顶边下 ascender 处
+        0 => bottom - asc,
+        // 1 = 居中：整块文字的视觉中心（含 asc/desc 不对称）对准格子中心
+        1 => bottom - (ch - total_h) / 2.0 - asc,
+        // 2 = 靠下：末行基线在底边上 descender 处
+        _ => top + desc + (total_h - line_h),
+    }
 }
 
 fn draw_cell(
@@ -377,7 +402,11 @@ fn draw_view(
     } else {
         view.text.split('\n').map(|s| s.to_string()).collect()
     };
-    let line_h = size * 1.18;
+    let (asc, desc) = match &out.vmetric {
+        Some(f) => f(size),
+        None => (size * 0.92, size * 0.26),
+    };
+    let line_h = asc + desc;
     // Excel 打印按行高裁剪：放不下的行不画（自动行高时本来就放得下，等于空操作）
     let fit = ((ch / line_h).floor() as usize).max(1);
     if lines_txt.len() > fit {
@@ -385,11 +414,8 @@ fn draw_view(
     }
     let total_h = line_h * lines_txt.len() as f32;
     let bottom = top + ch;
-    let mut ty = match view.valign {
-        0 => bottom - size * 0.92,
-        1 => bottom - (ch - total_h) / 2.0 - size * 0.92,
-        _ => bottom - (ch - total_h) - size * 0.28,
-    };
+    let mut ty = cell_baseline(view.valign, top, ch, total_h, line_h, asc, desc);
+    let _ = bottom;
     for line in &lines_txt {
         let tw = out.tw(line, size);
         let tx = match view.halign {
@@ -768,7 +794,11 @@ fn draw_objects(
             out.rects.push((x, yy, w, h, fill));
         }
         let size = tb.size.max(4.0);
-        let mut ty = yy + h - size;
+        let (tb_asc, tb_desc) = match &out.vmetric {
+            Some(f) => f(size),
+            None => (size * 0.92, size * 0.26),
+        };
+        let mut ty = yy + h - tb_asc;
         for line in display::wrap_lines_with(&tb.text, (w - 4.0).max(4.0), size, out.metric.as_deref()) {
             out.texts.push(TextOp {
                 x: x + 2.0,
@@ -780,7 +810,7 @@ fn draw_objects(
                 italic: tb.italic,
                 rotation: 0.0,
             });
-            ty -= size * 1.2;
+            ty -= tb_asc + tb_desc;
         }
     }
 }
@@ -815,6 +845,19 @@ pub fn page_ops_metric(
     source: Option<&Path>,
     metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
 ) -> Out {
+    page_ops_metrics(wb, sheet_idx, layout, page_index, source, metric, None)
+}
+
+/// 同上，再挂上纵向度量（ascender/descender）：行高与基线按真字体算，不再用字号乘常数
+pub fn page_ops_metrics(
+    wb: &Workbook,
+    sheet_idx: usize,
+    layout: &Layout,
+    page_index: usize,
+    source: Option<&Path>,
+    metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+    vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
+) -> Out {
     let sheet = &wb.sheets[sheet_idx];
     let setup = &sheet.page;
     let (pw, ph) = layout.page_size;
@@ -823,6 +866,7 @@ pub fn page_ops_metric(
     let span = &layout.pages[page_index];
     let mut out = Out::default();
     out.metric = metric;
+    out.vmetric = vmetric;
 
     let mut cf_state: Option<CfState> = None;
     if !sheet.cf.blocks.is_empty() {
@@ -998,10 +1042,38 @@ pub fn export_pdf_pages_from(
         None => (0, total.saturating_sub(1)),
     };
     let font = Font::load(font_path)?;
-    // 暂不启用真字体度量：Excel 排版按 Calibri 度量，我们用 Noto 会把右对齐推得更偏
-    // （实测 ¥ 列偏差 26.5pt → 35.0pt）。度量闭包保留在 Font::metric()，等换度量兼容字体再挂。
+    export_pdf_pages_with_fonts(wb, sheet_idx, path, font, None, source, pages)
+}
+
+/// 与 `export_pdf_pages_from` 相同，但直接给字体对象，并可带一套真粗体字体。
+/// 粗体文字改用第二条嵌入字体（/F2）下发真 700 字形，不再是描边模拟。
+pub fn export_pdf_pages_with_fonts(
+    wb: &Workbook,
+    sheet_idx: usize,
+    path: &Path,
+    font: Font,
+    bold: Option<Font>,
+    source: Option<&Path>,
+    pages: Option<(usize, usize)>,
+) -> Result<usize> {
+    let Some(sheet) = wb.sheets.get(sheet_idx) else {
+        anyhow::bail!("没有第 {sheet_idx} 张表");
+    };
+    let layout = paginate(sheet, &sheet.page);
+    let total = layout.pages.len();
+    let (first, last) = match pages {
+        Some((a, b)) => (a.min(total.saturating_sub(1)), b.min(total.saturating_sub(1))),
+        None => (0, total.saturating_sub(1)),
+    };
+    let (asc_em, desc_em) = font.em_metrics();
+    let vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>> = Some(
+        std::sync::Arc::new(move |size: f32| (asc_em * size, desc_em * size)),
+    );
     let metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>> = None;
     let mut doc = Doc::new(font);
+    if let Some(b) = bold {
+        doc.set_bold_font(b);
+    }
     let mut exported = 0usize;
     for pi in first..=last {
         if pi >= total {
@@ -1010,7 +1082,15 @@ pub fn export_pdf_pages_from(
         exported += 1;
         let (pw, ph) = layout.page_size;
         doc.add_page(pw, ph);
-        let out = page_ops_metric(wb, sheet_idx, &layout, pi, source, metric.clone());
+        let out = page_ops_metrics(
+            wb,
+            sheet_idx,
+            &layout,
+            pi,
+            source,
+            metric.clone(),
+            vmetric.clone(),
+        );
         for (x, y, w, h, color) in out.rects {
             doc.page_mut().rect_fill(x, y, w, h, color);
         }
@@ -1026,19 +1106,27 @@ pub fn export_pdf_pages_from(
                 doc.page_mut().image(&name, x, y, w, h);
             }
         }
-        let encoded: Vec<(TextOp, String)> = {
-            let font = doc.font();
-            out
-                .texts
-                .into_iter()
-                .map(|t| {
-                    let hex = Page::glyph_hex(font, &t.text);
-                    (t, hex)
-                })
-                .collect()
-        };
-        for (t, hex) in encoded {
-            doc.page_mut().text_styled(t.x, t.baseline, t.size, &hex, t.color, t.bold, t.italic, t.rotation);
+        let has_bold = doc.bold_font().is_some();
+        let encoded: Vec<(TextOp, String, bool)> = out
+            .texts
+            .into_iter()
+            .map(|t| {
+                let use_bold_face = t.bold && has_bold;
+                let font = doc.font_for(use_bold_face);
+                let hex = Page::glyph_hex(font, &t.text);
+                (t, hex, use_bold_face)
+            })
+            .collect();
+        for (t, hex, use_bold_face) in encoded {
+            if use_bold_face {
+                doc.page_mut().text_styled_face(
+                    "F2", t.x, t.baseline, t.size, &hex, t.color, t.italic, t.rotation,
+                );
+            } else {
+                doc.page_mut().text_styled(
+                    t.x, t.baseline, t.size, &hex, t.color, t.bold, t.italic, t.rotation,
+                );
+            }
         }
     }
     let n = exported;

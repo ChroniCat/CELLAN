@@ -10294,3 +10294,76 @@ fn run_split_skips_column_and_shifts_left() {
     assert_eq!(a.wb.sheets[0].value(0, 1).display(), "丙", "跳过的列不占位，后面的列左移");
     assert_eq!(a.wb.sheets[0].value(0, 2).display(), "");
 }
+
+/// UI-14.2：粗体必须是真 700 字面，不是把常规字面放大。
+/// 这里直接解析内嵌子集的 OS/2 字重，并确认四套粗体各自与常规字面字节不同。
+#[test]
+fn embedded_bold_faces_are_real_700() {
+    use ttf_parser::Face;
+    let faces: [(&str, &[u8], &[u8], char); 4] = [
+        ("sans", FONT_SANS, FONT_SANS_BOLD, '国'),
+        ("serif", FONT_SERIF, FONT_SERIF_BOLD, '国'),
+        ("latin", FONT_LATIN, FONT_LATIN_BOLD, 'A'),
+        ("mono", FONT_MONO, FONT_MONO_BOLD, 'A'),
+    ];
+    for (name, reg, bold, probe) in faces {
+        assert_ne!(reg, bold, "{name}: 粗体与常规是同一份字节");
+        let rf = Face::parse(reg, 0).expect("regular face");
+        let bf = Face::parse(bold, 0).expect("bold face");
+        assert_eq!(rf.weight().to_number(), 400, "{name}: 常规字面不是 400");
+        assert_eq!(bf.weight().to_number(), 700, "{name}: 粗体字面不是 700");
+        let has = |f: &Face, c: char| f.glyph_index(c).is_some();
+        assert!(has(&bf, probe), "{name}: 粗体子集缺 {probe:?} 字形");
+    }
+}
+
+/// UI-14.2：五套 `*-bold` family 都注册进了 egui，且真的指向 700 字面。
+/// 少注册一套，对应字体的粗体就会掉回默认字族（界面上看不出加粗）。
+#[test]
+fn bold_families_are_registered_with_real_bold_data() {
+    let defs = font_defs();
+    for fam in ["default-bold", "cjk-sans-bold", "cjk-serif-bold", "latin-bold", "mono-bold"] {
+        let list = defs
+            .families
+            .get(&family_named(fam))
+            .unwrap_or_else(|| panic!("{fam} 未注册"));
+        assert!(!list.is_empty(), "{fam} 是空字族");
+        for key in list {
+            assert!(defs.font_data.contains_key(key), "{fam} 引用了未注册的 {key}");
+        }
+    }
+    // 粗体族必须真的引用 700 数据：取每族首个字体，解析字重
+    for (fam, key) in [
+        ("default-bold", "inter-bold"),
+        // cjk-sans-bold 的拉丁首选 Inter Bold，中文回退 Noto Sans SC Bold
+        ("cjk-sans-bold", "inter-bold"),
+        ("cjk-serif-bold", "noto-serif-bold"),
+        ("mono-bold", "mono-bold"),
+    ] {
+        let data = &defs.font_data[key];
+        let face = ttf_parser::Face::parse(data.font.as_ref(), 0).expect("face");
+        assert_eq!(face.weight().to_number(), 700, "{fam}/{key}");
+        let list = &defs.families[&family_named(fam)];
+        assert_eq!(list.first().map(String::as_str), Some(key), "{fam} 首选项不是 {key}");
+    }
+}
+
+/// 系统没装这个字体时，粗体走内嵌 700 族；装了常规字面但没粗体时走同族（Excel 也是合成）。
+#[test]
+fn bold_routing_prefers_real_faces_and_falls_back_to_same_family() {
+    // 未安装的字体（Calibri 在本机没有）：必须拿到内嵌 bold 族
+    if !system_fonts::is_loaded("Calibri") {
+        let (fam, size, synth) = bold_font("Calibri", 14.0);
+        let want = family_named(&format!("{}-bold", sheetcore::style::font_class("Calibri").key()));
+        assert_eq!(fam, want);
+        assert_eq!(size, 14.0);
+        assert!(!synth);
+    }
+    // 本机装了常规宋体但没有粗体：改用内嵌 700 宋体族，不把字号放大冒充粗体
+    if system_fonts::is_loaded("宋体") && !system_fonts::is_bold_loaded("宋体") {
+        let (fam, size, synth) = bold_font("宋体", 14.0);
+        assert_eq!(fam, family_named("cjk-serif-bold"));
+        assert_eq!(size, 14.0);
+        assert!(!synth);
+    }
+}

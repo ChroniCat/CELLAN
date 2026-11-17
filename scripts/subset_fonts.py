@@ -19,6 +19,12 @@ FONTS = [
     ("NotoSerifSC-Regular.ttf", "NotoSerifSC-Regular.subset.ttf"),
     ("Inter-Regular.ttf", "Inter-Regular.subset.ttf"),
     ("JetBrainsMono-Regular.ttf", "JetBrainsMono-Regular.subset.ttf"),
+    # 真 700 字面（SIL OFL）：粗体不再用「字号 +0.8」冒充。原始文件不入库，
+    # 由 Google Fonts 的可变字体实例化（wght=700）后本脚本裁子集。
+    ("NotoSansSC-Bold.ttf", "NotoSansSC-Bold.subset.ttf"),
+    ("NotoSerifSC-Bold.ttf", "NotoSerifSC-Bold.subset.ttf"),
+    ("Inter-Bold.ttf", "Inter-Bold.subset.ttf"),
+    ("JetBrainsMono-Bold.ttf", "JetBrainsMono-Bold.subset.ttf"),
     # Carlito：度量与 Calibri 兼容（SIL OFL）。只用于排版宽度计算，不含 CJK 字形。
     ("Carlito-Regular.ttf", "Carlito-Regular.subset.ttf"),
 ]

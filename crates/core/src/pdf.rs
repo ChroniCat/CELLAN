@@ -93,6 +93,13 @@ impl Font {
         })
     }
 
+    /// 字体自身的纵向度量（in em）：ascender、descender（都取正值）。
+    /// 行高/基线要按它算，不能拿「字号 × 常数」估。
+    pub fn em_metrics(&self) -> (f32, f32) {
+        let upm = self.units_per_em.max(1) as f32;
+        (self.ascender as f32 / upm, (-self.descender as f32) / upm)
+    }
+
     pub fn gid(&self, ch: char) -> u16 {
         self.cmap.get(&ch).copied().unwrap_or(0)
     }
@@ -229,6 +236,60 @@ pub struct Page {
     pub ops: String,
 }
 
+/// Flate 压缩（PDF 流）；压缩失败就原样返回，导出不能因此失败
+fn compress_stream(data: &[u8]) -> (Vec<u8>, bool) {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    if enc.write_all(data).is_ok() {
+        if let Ok(v) = enc.finish() {
+            return (v, true);
+        }
+    }
+    (data.to_vec(), false)
+}
+
+/// 生成 ToUnicode CMap：让 pdftotext / 辅助技术能读回字形号对应的 Unicode。
+fn tounicode_cmap(font: &Font) -> String {
+    let mut gid_to_char: Vec<(u16, char)> = font
+        .cmap
+        .iter()
+        .map(|(ch, gid)| (*gid, *ch))
+        .filter(|(_, ch)| !ch.is_control())
+        .collect();
+    gid_to_char.sort_unstable_by_key(|(gid, _)| *gid);
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+",
+    );
+    for chunk in gid_to_char.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar
+", chunk.len()));
+        for (gid, ch) in chunk {
+            let mut buf = [0u16; 2];
+            let encoded = ch.encode_utf16(&mut buf);
+            let hex: String = encoded.iter().map(|u| format!("{u:04X}")).collect();
+            cmap.push_str(&format!("<{gid:04X}> <{hex}>
+"));
+        }
+        cmap.push_str("endbfchar
+");
+    }
+    cmap.push_str("endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+");
+    cmap
+}
+
 impl Page {
     pub fn new(width: f32, height: f32) -> Self {
         Self { width, height, ops: String::new() }
@@ -266,7 +327,37 @@ impl Page {
         ));
     }
 
-    /// 带样式的文字：粗体用描边模拟，斜体是文本矩阵错切，rotation 为逆时针角度。
+    /// 带样式的文字：斜体是文本矩阵错切，rotation 为逆时针角度。
+    /// `face` 是字体资源名（"F1" 常规 / "F2" 真粗体）。
+    pub fn text_styled_face(
+        &mut self,
+        face: &str,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        hex: &str,
+        rgb: [u8; 3],
+        italic: bool,
+        rotation: f32,
+    ) {
+        let rad = rotation.to_radians();
+        let (sin, cos) = (rad.sin(), rad.cos());
+        let skew = if italic { 0.21 } else { 0.0 };
+        let a = cos;
+        let b = sin;
+        let c = -sin + skew * cos;
+        let d = cos;
+        self.ops.push_str(&format!(
+            "BT {:.3} {:.3} {:.3} rg /{face} {size:.2} Tf {a:.4} {b:.4} {c:.4} {d:.4} {x:.2} {baseline:.2} Tm <{hex}> Tj ET
+",
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0
+        ));
+    }
+
+    /// 带样式的文字：斜体是文本矩阵错切，rotation 为逆时针角度。
+    /// 兼容入口：粗体仍走描边（没有第二条字体时的退化路径）。
     pub fn text_styled(
         &mut self,
         x: f32,
@@ -343,6 +434,8 @@ impl Page {
 pub struct Doc {
     pub pages: Vec<Page>,
     font: Font,
+    /// 真粗体字体（可选）。没有时 `text_styled` 仍用描边模拟。
+    bold: Option<Font>,
     /// 已注册的图片：名字 → 要写进 PDF 的 XObject
     pub images: Vec<PdfImage>,
 }
@@ -362,7 +455,24 @@ pub struct PdfImage {
 
 impl Doc {
     pub fn new(font: Font) -> Self {
-        Self { pages: Vec::new(), font, images: Vec::new() }
+        Self { pages: Vec::new(), font, bold: None, images: Vec::new() }
+    }
+
+    /// 挂上真粗体字体：粗体文字改用 /F2 的真 700 字形，不再描边。
+    pub fn set_bold_font(&mut self, font: Font) {
+        self.bold = Some(font);
+    }
+
+    pub fn bold_font(&self) -> Option<&Font> {
+        self.bold.as_ref()
+    }
+
+    /// 取实际下发字形号用的字体（粗体且挂了真粗体时用 bold）
+    pub fn font_for(&self, bold: bool) -> &Font {
+        match (bold, self.bold.as_ref()) {
+            (true, Some(f)) => f,
+            _ => &self.font,
+        }
     }
 
     /// 注册一张图，返回内容流里用的名字（同名只注册一次）
@@ -455,14 +565,18 @@ impl Doc {
             .into_bytes(),
         );
         {
+            let (packed, _) = compress_stream(&self.font.data);
             let mut body: Vec<u8> = format!(
-                "<< /Length {} /Length1 {} >>\nstream\n",
-                self.font.data.len(),
+                "<< /Length {} /Length1 {} /Filter /FlateDecode >>
+stream
+",
+                packed.len(),
                 self.font.data.len()
             )
             .into_bytes();
-            body.extend_from_slice(&self.font.data);
-            body.extend_from_slice(b"\nendstream");
+            body.extend_from_slice(&packed);
+            body.extend_from_slice(b"
+endstream");
             obj(&mut out, &mut offsets, body);
         }
 
@@ -498,6 +612,10 @@ impl Doc {
         }
 
         let image_base = 8 + n_pages * 2;
+        // 粗体字体对象排在页面与图片之后；页面资源要提前知道它的对象号。
+        // 常规字体固定占 1..7，每页 2 个对象，图片各 1 个，空文档还有 1 个占位页对象。
+        let blank_page = usize::from(self.pages.is_empty());
+        let bold_base = image_base + self.images.len() + blank_page;
         let xobjects: String = if self.images.is_empty() {
             String::new()
         } else {
@@ -511,8 +629,13 @@ impl Doc {
         };
         for (i, p) in self.pages.iter().enumerate() {
             let content_id = page_ids[i] + 1;
+            let fonts_res = if self.bold.is_some() {
+                format!("/Font << /F1 3 0 R /F2 {bold_base} 0 R >>")
+            } else {
+                "/Font << /F1 3 0 R >>".to_string()
+            };
             let body = format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F1 3 0 R >>{xobjects} >> /Contents {content_id} 0 R >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << {fonts_res}{xobjects} >> /Contents {content_id} 0 R >>",
                 p.width, p.height
             );
             obj(&mut out, &mut offsets, body.into_bytes());
@@ -547,6 +670,72 @@ stream
             body.extend_from_slice(&im.data);
             body.extend_from_slice(b"
 endstream");
+            obj(&mut out, &mut offsets, body);
+        }
+
+        // 真粗体字体：与常规字体同样的 5 个对象（Type0 / CIDFont / 描述符 / FontFile2 / ToUnicode）
+        if let Some(bf) = &self.bold {
+            let id0 = bold_base;
+            let upm = bf.units_per_em.max(1) as f32;
+            obj(
+                &mut out,
+                &mut offsets,
+                format!(
+                    "<< /Type /Font /Subtype /Type0 /BaseFont /EmbeddedBold /Encoding /Identity-H /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
+                    id0 + 1,
+                    id0 + 4
+                )
+                .into_bytes(),
+            );
+            let mut w = String::from("[ 0 [");
+            for x in bf.widths.iter() {
+                w.push_str(&format!("{x} "));
+            }
+            w.push_str("] ]");
+            obj(
+                &mut out,
+                &mut offsets,
+                format!(
+                    "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /EmbeddedBold /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {} 0 R /DW 1000 /W {w} /CIDToGIDMap /Identity >>",
+                    id0 + 2
+                )
+                .into_bytes(),
+            );
+            obj(
+                &mut out,
+                &mut offsets,
+                format!(
+                    "<< /Type /FontDescriptor /FontName /EmbeddedBold /Flags 4 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {:.0} /Descent {:.0} /CapHeight {:.0} /StemV 140 /FontFile2 {} 0 R >>",
+                    bf.bbox[0] as f32 * 1000.0 / upm,
+                    bf.bbox[1] as f32 * 1000.0 / upm,
+                    bf.bbox[2] as f32 * 1000.0 / upm,
+                    bf.bbox[3] as f32 * 1000.0 / upm,
+                    bf.ascender as f32 * 1000.0 / upm,
+                    bf.descender as f32 * 1000.0 / upm,
+                    bf.ascender as f32 * 1000.0 / upm * 0.7,
+                    id0 + 3
+                )
+                .into_bytes(),
+            );
+            let (packed, _) = compress_stream(&bf.data);
+            let mut body: Vec<u8> = format!(
+                "<< /Length {} /Length1 {} /Filter /FlateDecode >>
+stream
+",
+                packed.len(),
+                bf.data.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(&packed);
+            body.extend_from_slice(b"
+endstream");
+            obj(&mut out, &mut offsets, body);
+            let cmap = tounicode_cmap(bf);
+            let mut body = format!("<< /Length {} >>
+stream
+", cmap.len()).into_bytes();
+            body.extend_from_slice(cmap.as_bytes());
+            body.extend_from_slice(b"endstream");
             obj(&mut out, &mut offsets, body);
         }
 

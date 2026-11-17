@@ -6523,11 +6523,12 @@ impl SheetApp {
             // 自适应是模型尺寸：必须按 100% 度量，缩放/页面比例不能写进列宽
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             let fname = if st.font.is_empty() { "默认" } else { &st.font };
-            let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
-            let font = egui::FontId::new(
-                if st.bold && !system_fonts::is_bold_loaded(fname) { size + 0.8 } else { size },
-                fam,
-            );
+            let font = if st.bold {
+                let (fam, sz, _) = bold_font(fname, size);
+                egui::FontId::new(sz, fam)
+            } else {
+                egui::FontId::new(size, cell_family(fname))
+            };
             let w = ctx.fonts(|f| {
                 f.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::BLACK)
                     .size()
@@ -6584,11 +6585,12 @@ impl SheetApp {
             }
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             let fname = if st.font.is_empty() { "默认" } else { &st.font };
-            let fam = if st.bold { cell_bold_family(fname) } else { cell_family(fname) };
-            let font = egui::FontId::new(
-                if st.bold && !system_fonts::is_bold_loaded(fname) { size + 0.8 } else { size },
-                fam,
-            );
+            let font = if st.bold {
+                let (fam, sz, _) = bold_font(fname, size);
+                egui::FontId::new(sz, fam)
+            } else {
+                egui::FontId::new(size, cell_family(fname))
+            };
             let col_w = self.wb.sheet(self.sheet_idx).cols.size(c);
             // Excel 自适应行高 = 文字高度 + 每折行 1px（单行 18+1=19px，
             // 三行 54+3=57px，和本机 Excel 的 14.25pt / 42.75pt 对齐）。
@@ -7162,15 +7164,21 @@ impl SheetApp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         ));
-        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-        match sheetcore::print::export_pdf_pages_from(
-            &self.wb,
-            self.sheet_idx,
-            &path,
-            font,
-            self.wb.path.as_deref(),
-            pages,
-        ) {
+        let regular = sheetcore::pdf::Font::parse(FONT_SANS.to_vec());
+        let bold = sheetcore::pdf::Font::parse(FONT_SANS_BOLD.to_vec()).ok();
+        let export = match regular {
+            Ok(regular) => sheetcore::print::export_pdf_pages_with_fonts(
+                &self.wb,
+                self.sheet_idx,
+                &path,
+                regular,
+                bold,
+                self.wb.path.as_deref(),
+                pages,
+            ),
+            Err(e) => Err(e),
+        };
+        match export {
             Ok(n) => {
                 let p = path.to_string_lossy().replace('\'', "''");
                 let printer = self.page_setup_printer.replace('\'', "''");
@@ -7216,10 +7224,24 @@ impl SheetApp {
         else {
             return;
         };
-        let font = std::path::Path::new("C:/Windows/Fonts/simhei.ttf");
-        match sheetcore::print::export_pdf_from(&self.wb, self.sheet_idx, &path, font, self.wb.path.as_deref()) {
-            Ok(_) => self.status = format!("已导出 {}", path.display()),
-            Err(e) => self.status = format!("导出失败：{e:#}"),
+        // PDF 用内嵌 SIL OFL 字体的常规+粗体两套（不再嵌 Windows 的 simhei.ttf）：
+        // 粗体走 /F2 的真 700 字形，随包可分发。
+        let regular = sheetcore::pdf::Font::parse(FONT_SANS.to_vec());
+        let bold = sheetcore::pdf::Font::parse(FONT_SANS_BOLD.to_vec()).ok();
+        match (regular, bold) {
+            (Ok(regular), bold) => match sheetcore::print::export_pdf_pages_with_fonts(
+                &self.wb,
+                self.sheet_idx,
+                &path,
+                regular,
+                bold,
+                self.wb.path.as_deref(),
+                None,
+            ) {
+                Ok(_) => self.status = format!("已导出 {}", path.display()),
+                Err(e) => self.status = format!("导出失败：{e:#}"),
+            },
+            (Err(e), _) => self.status = format!("导出失败：内嵌字体解析失败 {e:#}"),
         }
     }
 
@@ -18301,6 +18323,7 @@ let txn = self.txn_begin(&keys);
         dumping: bool,
         dump: &mut Vec<String>,
     ) {
+
         let sid = self.wb.sheet(self.sheet_idx).style_of(r, c);
         let st = self.wb.styles.get(sid);
         // 表格样式（TableStyleMedium2）：标题行深绿白字、数据行隔行浅绿
@@ -18421,13 +18444,14 @@ let txn = self.txn_begin(&keys);
                 // 条件格式里指定的字体优先，其次单元格样式；未知字体回退默认
                 let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
                 let bold = st.bold || cf_bold || table_header;
-                let family = if bold { cell_bold_family(font_name) } else { cell_family(font_name) };
                 // 样式里的 size 是磅值（Excel 的 11 磅 ≈ 14.7px），画到屏幕上要换算
                 let fs = (st.size * 4.0 / 3.0 * self.paint_scale * self.zoom).max(5.0);
-                let font = FontId::new(
-                    if bold && !system_fonts::is_bold_loaded(font_name) { fs + 0.8 } else { fs },
-                    family.clone(),
-                );
+                let (family, fs_bold, _synth_bold) = if bold {
+                    bold_font(font_name, fs)
+                } else {
+                    (cell_family(font_name), fs, false)
+                };
+                let font = FontId::new(fs_bold, family.clone());
                 let is_link = self
                     .wb
                     .sheet(self.sheet_idx)
@@ -18505,12 +18529,17 @@ let txn = self.txn_begin(&keys);
                                 * self.zoom)
                                 .max(5.0);
                             let run_name = run.font.as_deref().unwrap_or(font_name);
-                            let fam = if run.bold { cell_bold_family(run_name) } else { cell_family(run_name) };
+                            // 富文本 run 没写 b 时继承单元格字重（Excel 的语义），
+                            // 只认 run.bold 的话整格粗体会在富文本路径里丢掉
+                            let rb = run.bold || st.bold;
+                            let (fam, fsz, synth) = if rb {
+                                bold_font(run_name, size)
+                            } else {
+                                (cell_family(run_name), size, false)
+                            };
+                            let _ = synth;
                             (
-                                FontId::new(
-                                    if run.bold && !system_fonts::is_bold_loaded(run_name) { size + 0.8 } else { size },
-                                    fam,
-                                ),
+                                FontId::new(fsz, fam),
                                 run.color
                                     .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
                                     .unwrap_or(color),
@@ -18551,11 +18580,8 @@ let txn = self.txn_begin(&keys);
                         } else {
                             rect.center().y - gh / 2.0
                         };
-                        let is_run_bold = runs.get(i_run).map(|r| r.bold).unwrap_or(false);
+
                         clipped.galley(egui::pos2(x, y), g.clone(), *c);
-                        if is_run_bold {
-                            clipped.galley(egui::pos2(x + 0.6, y), g, *c);
-                        }
                         x += w;
                     }
                 } else if multiline && !st.vertical_text {
@@ -18577,7 +18603,7 @@ let txn = self.txn_begin(&keys);
                     let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
                     let uw = galley.size().x;
                     let uh = galley.size().y;
-                    clipped.galley(egui::pos2(x, top), galley, color);
+                    clipped.galley(egui::pos2(x, top), galley.clone(), color);
                     if st.underline {
                         let uy = top + uh - 1.0;
                         clipped.line_segment(
@@ -18657,11 +18683,6 @@ let txn = self.txn_begin(&keys);
                         ));
                     } else {
                         clipped.galley(egui::pos2(x0, y0), g.clone(), color);
-                        if st.bold {
-                            // egui 没有粗体字形：同一串再画一遍、右移 0.6px，
-                            // 笔画厚度才接近 Excel 的 Bold（只把字号 +0.8 显不出粗）
-                            clipped.galley(egui::pos2(x0 + 0.6, y0), g, color);
-                        }
                     }
                     if st.underline && st.rotation == 0 {
                         let uy = y0 + gh - 1.0;
@@ -24896,8 +24917,8 @@ let txn = self.txn_begin(&keys);
             }
             if !tb.text.is_empty() {
                 let fs = (tb.size * 4.0 / 3.0 * self.paint_scale * self.zoom).max(6.0);
-                let fam = cell_family("");
-                let font = FontId::new(if tb.bold { fs + 0.8 } else { fs }, fam);
+                let (fam, fsz, _) = if tb.bold { bold_font("", fs) } else { (cell_family(""), fs, false) };
+                let font = FontId::new(fsz, fam);
                 let col = Color32::from_rgb(tb.color[0], tb.color[1], tb.color[2]);
                 let max_w = (w - 8.0).max(8.0);
                 let galley = pt.layout(tb.text.clone(), font, col, max_w);
@@ -31558,6 +31579,16 @@ const FONT_SANS: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSansSC
 const FONT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Regular.subset.ttf");
 const FONT_LATIN: &[u8] = include_bytes!("../../../assets/fonts/subset/Inter-Regular.subset.ttf");
 const FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/subset/JetBrainsMono-Regular.subset.ttf");
+/// 真 700 字面（SIL OFL，来自 Google Fonts 可变字体实例化后裁子集）。
+/// 粗体优先用它们，而不是把常规字面放大 —— 后者在 100% 缩放下会被像素对齐吃掉。
+const FONT_SANS_BOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/subset/NotoSansSC-Bold.subset.ttf");
+const FONT_SERIF_BOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Bold.subset.ttf");
+const FONT_LATIN_BOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/subset/Inter-Bold.subset.ttf");
+const FONT_MONO_BOLD: &[u8] =
+    include_bytes!("../../../assets/fonts/subset/JetBrainsMono-Bold.subset.ttf");
 
 /// UI-19：序列下拉的大小写不敏感子串过滤（空白查询返回全部）。
 fn filter_dv_items(items: &[String], query: &str) -> Vec<String> {
@@ -31599,24 +31630,19 @@ fn cell_family(name: &str) -> egui::FontFamily {
 }
 
 /// 真实粗体族；字体没有粗体字面时仍用常规族（调用方保留尺寸补偿）。
-fn cell_bold_family(name: &str) -> egui::FontFamily {
-    if std::env::var("SC_FONT_LOG").is_ok() {
-        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-            std::sync::OnceLock::new();
-        let m = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let now = system_fonts::is_bold_loaded(name);
-        if let Ok(mut m) = m.lock() {
-            if m.get(name) != Some(&now) {
-                m.insert(name.to_string(), now);
-                eprintln!("[fonts] bold {:?} real={}", name, now);
-            }
-        }
-    }
+/// 粗体三元组：字族 / 实际字号 / 是否需要合成加粗（再画一遍）。
+/// 优先级与用户口径一致：系统有真 bold → 用它；系统根本没这个字体 → 内嵌 700 字面；
+/// 系统只有常规字面 → 同族 + 合成加粗（Excel 对宋体/黑体也是这么干的）。
+fn bold_font(name: &str, size: f32) -> (egui::FontFamily, f32, bool) {
     if system_fonts::is_bold_loaded(name) {
-        return family_named(&system_fonts::bold_family_key(name));
+        return (family_named(&system_fonts::bold_family_key(name)), size, false);
     }
-    cell_family(name)
+    // 没有真 bold 字面时一律用内嵌 700 字面（宋体/黑体也一样）：
+    // 不把常规字面放大冒充，也不依赖 egui 并不提供的合成加粗。
+    let class = sheetcore::style::font_class(name).key();
+    (family_named(&format!("{class}-bold")), size, false)
 }
+
 
 /// Excel 的 General 对齐：文本靠左，数字（含日期）靠右，布尔和错误居中。
 /// 显式 halign 覆盖 General；1/2/3 分别对应左/中/右。
@@ -31651,6 +31677,22 @@ fn font_defs() -> egui::FontDefinitions {
     fonts
         .font_data
         .insert("mono".to_owned(), egui::FontData::from_static(FONT_MONO).into());
+    fonts.font_data.insert(
+        "noto-sans-bold".to_owned(),
+        egui::FontData::from_static(FONT_SANS_BOLD).into(),
+    );
+    fonts.font_data.insert(
+        "noto-serif-bold".to_owned(),
+        egui::FontData::from_static(FONT_SERIF_BOLD).into(),
+    );
+    fonts.font_data.insert(
+        "inter-bold".to_owned(),
+        egui::FontData::from_static(FONT_LATIN_BOLD).into(),
+    );
+    fonts.font_data.insert(
+        "mono-bold".to_owned(),
+        egui::FontData::from_static(FONT_MONO_BOLD).into(),
+    );
 
     // 界面默认：拉丁走 Inter，中文回退思源黑体，再往后是 egui 自带的字体/emoji
     let prop = fonts
@@ -31677,6 +31719,40 @@ fn font_defs() -> egui::FontDefinitions {
     fonts.families.insert(
         family_named("latin"),
         vec!["inter".to_owned(), "noto-sans".to_owned()],
+    );
+    // 粗体族：拉丁用 Inter Bold，中文回退思源黑/宋 700；末尾再挂常规字面，
+    // 子集里没有的字至少还能显示（否则 egui 画成豆腐块）。
+    fonts.families.insert(
+        family_named("default-bold"),
+        vec![
+            "inter-bold".to_owned(),
+            "noto-sans-bold".to_owned(),
+            "noto-sans".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        family_named("cjk-sans-bold"),
+        vec![
+            "inter-bold".to_owned(),
+            "noto-sans-bold".to_owned(),
+            "noto-sans".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        family_named("cjk-serif-bold"),
+        vec!["noto-serif-bold".to_owned(), "noto-serif".to_owned()],
+    );
+    fonts.families.insert(
+        family_named("latin-bold"),
+        vec![
+            "inter-bold".to_owned(),
+            "noto-sans-bold".to_owned(),
+            "inter".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        family_named("mono-bold"),
+        vec!["mono-bold".to_owned(), "mono".to_owned(), "noto-sans".to_owned()],
     );
     system_fonts::apply(&mut fonts);
     fonts.families.insert(
