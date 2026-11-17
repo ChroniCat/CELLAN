@@ -751,6 +751,93 @@ pub fn move_axis(spec: &mut PivotSpec2, axis: Axis, i: usize, delta: isize) -> b
 /// rowItems 与数据区都要多一行，只改 XML 定义会让 Excel 判文件坏）。
 ///
 /// 返回新行在 `rows` 里的下标；找不到任何来源行时返回 None。
+/// 计算项表达式里的运算符。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// 按表达式算一行计算项（支持 + - * /，先乘除后加减）。
+///
+/// `terms` 第一项之前的运算符忽略。任一来源项找不到就返回 None，不改网格。
+pub fn append_calc_item_expr(
+    grid: &mut PivotGrid,
+    name: &str,
+    terms: &[(ItemOp, String)],
+) -> Option<usize> {
+    let rd = grid.row_depth.max(1);
+    // 两层行字段时同名项既有明细行也有「<项> 汇总」行：优先取汇总行，
+    // 否则「华东*2」只会算出第一条明细（Excel 里计算项是对整组求和）。
+    let find = |item: &str| -> Option<usize> {
+        let sub_label = format!("{item} 汇总");
+        let is_live = |r: usize, row: &Vec<Value>| Some(r) != grid.grand_total_row;
+        if let Some(r) = grid.rows.iter().enumerate().position(|(r, row)| {
+            is_live(r, row) && row.first().is_some_and(|v| v.display() == sub_label)
+        }) {
+            return Some(r);
+        }
+        grid.rows.iter().enumerate().position(|(r, row)| {
+            is_live(r, row) && row.first().is_some_and(|v| v.display() == item)
+        })
+    };
+    let rows: Vec<usize> = terms.iter().map(|(_, it)| find(it)).collect::<Option<Vec<_>>>()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let width = grid.rows.first().map(|r| r.len()).unwrap_or(0);
+    let mut line = vec![Value::Empty; width];
+    if !line.is_empty() {
+        line[0] = Value::Text(name.into());
+    }
+    for c in rd..width {
+        let vals: Vec<Option<f64>> = rows
+            .iter()
+            .map(|&r| match grid.rows[r][c] {
+                Value::Number(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        if vals.iter().all(|v| v.is_none()) {
+            continue;
+        }
+        // 第一遍：乘除合并（缺失值当 0 处理，除零保留 0 避免 NaN 落盘）
+        let mut folded: Vec<(ItemOp, f64)> = Vec::new();
+        for (i, (op, _)) in terms.iter().enumerate() {
+            let v = vals[i].unwrap_or(0.0);
+            if i > 0 && matches!(op, ItemOp::Mul | ItemOp::Div) {
+                if let Some(last) = folded.last_mut() {
+                    last.1 = if matches!(op, ItemOp::Mul) {
+                        last.1 * v
+                    } else if v == 0.0 {
+                        0.0
+                    } else {
+                        last.1 / v
+                    };
+                    continue;
+                }
+            }
+            folded.push((*op, v));
+        }
+        let mut acc = folded[0].1;
+        for (op, v) in folded.iter().skip(1) {
+            acc = match op {
+                ItemOp::Sub => acc - v,
+                _ => acc + v,
+            };
+        }
+        line[c] = Value::Number(acc);
+    }
+    let at = grid.grand_total_row.unwrap_or(grid.rows.len());
+    grid.rows.insert(at, line);
+    if let Some(g) = grid.grand_total_row.as_mut() {
+        *g += 1;
+    }
+    Some(at)
+}
+
 pub fn append_calc_item_row(grid: &mut PivotGrid, name: &str, sources: &[&str]) -> Option<usize> {
     let rd = grid.row_depth.max(1);
     let idxs: Vec<usize> = grid

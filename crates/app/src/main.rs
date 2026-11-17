@@ -644,22 +644,39 @@ fn formula_help_keys(
     accept.then_some(*selected)
 }
 
-/// 「名称=项1+项2」→ (名称, 来源项)。空串或格式不对返回 None。
-fn parse_calc_item(s: &str) -> Option<(String, Vec<String>)> {
+/// 「名称=项1+项2*项3」→ (名称, [(运算符, 来源项)…])。空串或格式不对返回 None。
+///
+/// 第一项前面的运算符没有意义，统一记成 `+`。
+fn parse_calc_item(s: &str) -> Option<(String, Vec<(char, String)>)> {
     let (name, rest) = s.split_once('=')?;
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    let srcs: Vec<String> = rest
-        .split('+')
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect();
-    if srcs.is_empty() {
+    let mut out: Vec<(char, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut op = '+';
+    for ch in rest.chars() {
+        match ch {
+            '+' | '-' | '*' | '/' => {
+                let item = cur.trim();
+                if !item.is_empty() {
+                    out.push((op, item.to_string()));
+                }
+                cur.clear();
+                op = ch;
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let item = cur.trim();
+    if !item.is_empty() {
+        out.push((op, item.to_string()));
+    }
+    if out.is_empty() {
         return None;
     }
-    Some((name.to_string(), srcs))
+    Some((name.to_string(), out))
 }
 
 /// 「名称=公式」→ (名称, 公式)；公式里可以有空格，空名字/空公式返回 None。
@@ -21957,10 +21974,23 @@ let txn = self.txn_begin(&keys);
         }
         let mut grid = sheetcore::pivot_multi::compute(self.wb.sheet(self.sheet_idx), spec);
         // C12.4 计算项：按「名称=项1+项2」把若干行合成一行（真行，XML 三处会跟着长）
-        if let Some((name, srcs)) = parse_calc_item(&self.pivot2_calc_item) {
-            let refs: Vec<&str> = srcs.iter().map(|s| s.as_str()).collect();
-            if sheetcore::pivot_multi::append_calc_item_row(&mut grid, &name, &refs).is_none() {
-                self.status = format!("计算项「{name}」没找到来源项：{}", srcs.join("+"));
+        if let Some((name, terms)) = parse_calc_item(&self.pivot2_calc_item) {
+            use sheetcore::pivot_multi::ItemOp;
+            let ops: Vec<(ItemOp, String)> = terms
+                .iter()
+                .map(|(op, item)| {
+                    let op = match op {
+                        '-' => ItemOp::Sub,
+                        '*' => ItemOp::Mul,
+                        '/' => ItemOp::Div,
+                        _ => ItemOp::Add,
+                    };
+                    (op, item.clone())
+                })
+                .collect();
+            if sheetcore::pivot_multi::append_calc_item_expr(&mut grid, &name, &ops).is_none() {
+                let shown: Vec<&str> = terms.iter().map(|(_, s)| s.as_str()).collect();
+                self.status = format!("计算项「{name}」没找到来源项：{}", shown.join(" / "));
             }
         }
         let rect = sheetcore::pivot_multi::write_grid(self.wb.sheet_mut(self.sheet_idx), pos, &grid);

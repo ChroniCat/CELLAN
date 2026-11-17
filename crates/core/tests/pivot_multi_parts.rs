@@ -1066,3 +1066,51 @@ fn scoped_calc_field_touches_only_its_own_cache() {
         .collect();
     assert_eq!(changed, vec![1], "只有一张缓存的字段数 +1：before={before:?} after={after:?}");
 }
+
+#[test]
+fn calc_item_expr_supports_multiply_and_subtract() {
+    use sheetcore::pivot_multi::{ItemOp, append_calc_item_expr};
+    let fx = Fixture::new("calcexpr");
+    let path = fx.file("c.xlsx");
+    let wb = book(&path);
+    let spec = spec_a();
+    // 金额合计：华东 90（「华东 汇总」行），华北 120
+    let mut grid = pivot_multi::compute(&wb.sheets[0], &spec);
+    assert!(
+        append_calc_item_expr(&mut grid, "净额", &[(ItemOp::Add, "不存在".to_string())]).is_none(),
+        "来源项不存在应失败"
+    );
+    let at = append_calc_item_expr(
+        &mut grid,
+        "平方",
+        &[
+            (ItemOp::Add, "华东".to_string()),
+            (ItemOp::Mul, "华东".to_string()),
+        ],
+    )
+    .expect("应插入计算项行");
+    assert_eq!(grid.rows[at].last(), Some(&Value::Number(8100.0)), "90*90");
+
+    let mut g2 = pivot_multi::compute(&wb.sheets[0], &spec);
+    let at2 = append_calc_item_expr(
+        &mut g2,
+        "两倍减华北",
+        &[
+            (ItemOp::Add, "华东".to_string()),
+            (ItemOp::Mul, "2".to_string()),
+            (ItemOp::Sub, "华北".to_string()),
+        ],
+    );
+    assert!(at2.is_none(), "「2」不是项目名");
+
+    let at3 = append_calc_item_expr(
+        &mut g2,
+        "华东减华北",
+        &[
+            (ItemOp::Add, "华东".to_string()),
+            (ItemOp::Sub, "华北".to_string()),
+        ],
+    )
+    .expect("应插入计算项行");
+    assert_eq!(g2.rows[at3].last(), Some(&Value::Number(-30.0)), "90-120");
+}
