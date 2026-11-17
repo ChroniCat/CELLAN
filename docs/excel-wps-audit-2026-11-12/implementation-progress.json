@@ -3963,19 +3963,17 @@
       "scope": "core/style.rs, xlsx.rs, xls_style.rs",
       "source": "core-requirements.md",
       "heading": "C18 P1 样式模型与未知样式保留",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
-      "not_done": [
-        "C18.1~C18.3 均已实现并留证据；pivotButton/extLst 等更冷门 xf 属性保留未逐项验证；屏幕/打印不绘制图案与对角线（原文限定样式模型/序列化）"
-      ],
+      "evidence": "implementation-evidence/c18-review-1117.md（主题 tint 双端一致 / 图案-对角线双端一致 / 复杂边框等 5 属性 0 差异 / quotePrefix+pivotButton+extLst+dxf 保真 / 连续两次保存 + 双端打开）",
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T18:53:22Z",
+      "updated_utc": "2026-11-17T03:30:28Z",
       "slices": [
         {
           "id": "C18.1",
@@ -3983,7 +3981,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/style_theme.rs",
@@ -3997,13 +3995,11 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-theme.txt"
           ],
-          "not_done": [
-            "读盘解析 theme+tint 成 RGB 并记录引用；保存按 theme 写回，改粗体不丢主题；Excel COM 回读 5/0.3999… 与 6/-0.2499…；等待复核"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:24:40Z"
+          "updated_utc": "2026-11-17T03:30:28Z"
         },
         {
           "id": "C18.2",
@@ -4011,7 +4007,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/style_ext.rs",
@@ -4025,13 +4021,11 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-pattern-diagonal.txt"
           ],
-          "not_done": [
-            "patternType/fg/bg(rgb/theme/indexed) 与 diagonal(style/color/up/down) 已建模并按 fillId/borderId 写回；改数字格式后不丢；屏幕/打印不绘制图案与对角线（C18 只要求模型与序列化）；等待复核"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:43:42Z"
+          "updated_utc": "2026-11-17T03:30:28Z"
         },
         {
           "id": "C18.3",
@@ -4039,7 +4033,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C18 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/src/fixups.rs",
@@ -4053,13 +4047,11 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c18-unknown-xf.txt"
           ],
-          "not_done": [
-            "quotePrefix 读盘记入样式表，保存后按格补 xf 并重指 s=；改 B1 数字格式后 A1 仍带 quotePrefix，Excel/WPS 回读正常；pivotButton/extLst 未逐项验证"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T18:53:22Z"
+          "updated_utc": "2026-11-17T03:30:28Z"
         }
       ]
     },
