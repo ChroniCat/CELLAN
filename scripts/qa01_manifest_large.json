@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "purpose": "QA-01 大簿场景（合成夹具，200k 行；不是原始 106MB 压力样本）",
+  "entries": [
+    {
+      "name": "large-synth",
+      "file": "work/probe/qa01/large-synth.xlsx",
+      "categories": ["values", "cf", "dv", "table", "freeze", "page"]
+    }
+  ]
+}

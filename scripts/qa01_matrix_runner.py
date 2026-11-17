@@ -268,6 +268,13 @@ def main() -> int:
                 print("   !", line)
             for line in known[:8]:
                 print("   ~", line)
+        if args.resave and src.suffix.lower() == ".xls":
+            # 旧 BIFF 文件：Excel 重存会改容器/格式，且本次实测重存后目标文件消失，
+            # 无法作为「第三方重存」基线。.xls 的结构性对象本来就在既定口径外，这里显式跳过。
+            rec["resave"] = {"skipped": True, "reason": ".xls 旧格式：Excel 重存不作为基线（口径见 QA-01.3）"}
+            results.append(rec)
+            print(f"[{entry['name']}] resave 跳过（.xls 口径）")
+            continue
         if args.resave:
             rs, rnote = excel_resave(dst)
             rec["resave"] = {"excel_ok": rs, "note": rnote}
@@ -309,6 +316,8 @@ def main() -> int:
         if any(r.get(p, {}).get("diffs") for p in ("excel", "wps")):
             return True
         rv = r.get("resave") or {}
+        if rv.get("skipped"):
+            return False
         if rv and (not rv.get("excel_ok") or not rv.get("our_roundtrip_ok")):
             return True
         return any((rv.get("diffs_vs_resaved") or {}).get(p) for p in ("excel", "wps"))
