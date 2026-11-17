@@ -10,3 +10,8 @@ edition = "2021"
 opt-level = 2
 lto = "thin"
 codegen-units = 4
+
+# 0.24.1 的 SelectionItemPattern 不认 Cell/RowHeader/ColumnHeader（上游 0.35 只加了
+# GridCell），这里本地打一行补丁，让 UIA 的 IsSelected 对网格单元格与行列标可用。
+[patch.crates-io]
+accesskit_windows = { path = "vendor/accesskit_windows" }

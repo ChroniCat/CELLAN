@@ -17,6 +17,7 @@ os.makedirs(OUT, exist_ok=True)
 def hidden():
     wb = Workbook()
     ws = wb.active
+    assert ws is not None
     ws.title = "隐藏打印"
     ws["A1"] = "隐藏行列打印样本"
     ws["A1"].font = Font(bold=True, size=14)
@@ -43,9 +44,26 @@ def hidden():
     wb.save(os.path.join(OUT, "hidden.xlsx"))
 
 
+def a11y():
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "无障碍"
+    ws["A1"] = "合并标题"
+    ws.merge_cells("A1:B2")
+    ws["C3"] = "冻结右下"
+    ws.freeze_panes = "C3"
+    ws["A6"] = "隐藏行"
+    ws.row_dimensions[6].hidden = True
+    ws["D2"] = "隐藏列"
+    ws.column_dimensions["D"].hidden = True
+    wb.save(os.path.join(OUT, "a11y.xlsx"))
+
+
 def fit_width():
     wb = Workbook()
     ws = wb.active
+    assert ws is not None
     ws.title = "适应纸张"
     for c in range(1, 19):
         ws.cell(row=1, column=c, value=f"第{c}列标题")
@@ -63,5 +81,6 @@ def fit_width():
 
 if __name__ == "__main__":
     hidden()
+    a11y()
     fit_width()
     print("wrote", OUT)

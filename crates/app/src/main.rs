@@ -1562,6 +1562,15 @@ struct CsvDlg {
     err: Option<String>,
 }
 
+/// SC_SEL_STEP="1500:0,0;1,1;2,2"：启动 1.5s 后每 1.5s 移到下一个单元格，
+/// 仅用于无界面/UI Automation 验收选中事件，正常启动不生效。
+struct A11yStep {
+    t0: std::time::Instant,
+    idx: usize,
+    path: Vec<(u32, u32)>,
+    ms: u64,
+}
+
 struct SheetApp {
     wb: Workbook,
     /// C14：本次打开的结构化诊断。带致命问题时禁止覆盖保存，只允许另存抢救副本。
@@ -1583,6 +1592,8 @@ struct SheetApp {
     dump_once: bool,
     /// 一帧里多个面板的绘制记录
     dump_accum: String,
+    /// 无界面验收钩子：按时间步进选区，用来观察 UIA 选中事件
+    a11y_step: Option<A11yStep>,
     /// 条件格式统计缓存（按 doc_gen 失效）
     cf_stats: sheetcore::cf::CfStats,
     cf_stats_gen: u64,
@@ -2646,6 +2657,7 @@ impl SheetApp {
             last_pane: egui::Pos2::ZERO,
             dump_once: true,
             dump_accum: String::new(),
+            a11y_step: None,
             cf_stats: sheetcore::cf::CfStats::default(),
             cf_stats_gen: u64::MAX,
             cf_v1: "100".into(),
@@ -3495,7 +3507,7 @@ impl SheetApp {
                     self.deps = sheetcore::formula::deps::Deps::empty();
                     self.sheet_idx = 0;
                     // 调试：SC_SEL=r,c 时保留启动时的选区，便于无界面验证
-                    if std::env::var("SC_SEL").is_err() {
+                    if std::env::var("SC_SEL").is_err() && std::env::var("SC_SEL_STEP").is_err() {
                         self.sel = (0, 0);
                     } else {
                         self.ensure_visible();
@@ -23739,13 +23751,60 @@ let txn = self.txn_begin(&keys);
         if selected {
             label.push_str("，已选中");
         }
-        let label2 = label.clone();
-        resp.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label2.clone())
-        });
-        let _ = ctx.accesskit_node_builder(resp.id, |node| {
+        // UI-24.3：GridCell 才能让 UIA 暴露 SelectionItemPattern（IsSelected），
+        // Row/Column 用 GridItemPattern 需要 accesskit_windows 上游支持，见证据文档。
+        let mut desc = Vec::new();
+        let (mut rspan, mut cspan) = (1usize, 1usize);
+        if let Some((mr1, mc1, mr2, mc2)) = sh.merge_at(r, c) {
+            rspan = (mr2 - mr1 + 1) as usize;
+            cspan = (mc2 - mc1 + 1) as usize;
+            if rspan > 1 || cspan > 1 {
+                desc.push(format!(
+                    "合并 {}{}:{}{}",
+                    sheetcore::model::col_label(mc1),
+                    mr1 + 1,
+                    sheetcore::model::col_label(mc2),
+                    mr2 + 1
+                ));
+            }
+        }
+        if let Some((fr, fc)) = sh.freeze {
+            if r < fr || c < fc {
+                desc.push("冻结窗格内".to_string());
+            }
+        }
+        if sh.hidden_rows.contains(&r) || sh.hidden_rows_user.contains(&r) {
+            desc.push("隐藏行".to_string());
+        }
+        if sh.hidden_cols.contains(&c) {
+            desc.push("隐藏列".to_string());
+        }
+        let mut desc = format!("第 {} 行，第 {} 列", r + 1, c + 1)
+            + if desc.is_empty() { "" } else { "，" }
+            + &desc.join("，");
+        // 每个单元格一个稳定 id：选区移动时旧节点消失、新节点出现，
+        // accesskit_windows 会在 Grid 容器上派发 SelectionItem 选中事件。
+        let cell_id = egui::Id::new(("sheets_cell_a11y", self.sheet_idx, r, c));
+        let _ = ctx.accesskit_node_builder(cell_id, |node| {
             node.set_role(egui::accesskit::Role::Cell);
             node.set_label(label);
+            node.set_selected(selected);
+            node.set_row_index(r as usize);
+            node.set_column_index(c as usize);
+            if rspan > 1 {
+                node.set_row_span(rspan);
+            }
+            if cspan > 1 {
+                node.set_column_span(cspan);
+            }
+            node.set_description(desc.clone());
+            node.set_placeholder(desc);
+            node.set_bounds(egui::accesskit::Rect {
+                x0: resp.rect.min.x as f64,
+                y0: resp.rect.min.y as f64,
+                x1: resp.rect.max.x as f64,
+                y1: resp.rect.max.y as f64,
+            });
         });
         // UI-24.3：整个网格的选区语义（工作表、范围、几行几列）
         let (r1, c1, r2, c2) = self.sel_rect();
@@ -23772,10 +23831,11 @@ let txn = self.txn_begin(&keys);
             x1: resp.rect.max.x as f64,
             y1: resp.rect.max.y as f64,
         };
-        let _ = ctx.accesskit_node_builder(resp.id.with("grid"), |node| {
+        let _ = ctx.accesskit_node_builder(resp.id, |node| {
             node.set_role(egui::accesskit::Role::Grid);
             node.set_label(summary);
             node.set_bounds(bounds);
+            node.set_multiselectable();
         });
     }
 
@@ -29052,6 +29112,45 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // UI-24.3 无界面验收：SC_SEL_STEP=毫秒:r,c;r,c;… 定时移动选区
+        if self.a11y_step.is_none() {
+            if let Ok(v) = std::env::var("SC_SEL_STEP") {
+                if let Some((ms, rest)) = v.split_once(':') {
+                    if let Ok(ms) = ms.trim().parse::<u64>() {
+                        let path: Vec<(u32, u32)> = rest
+                            .split(';')
+                            .filter_map(|p| p.split_once(','))
+                            .filter_map(|(a, b)| {
+                                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                            })
+                            .collect();
+                        if !path.is_empty() {
+                            self.a11y_step = Some(A11yStep {
+                                t0: std::time::Instant::now(),
+                                idx: 0,
+                                path,
+                                ms,
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(st) = self.a11y_step.as_mut() {
+            let want = (st.t0.elapsed().as_millis() as u64 / st.ms.max(1)) as usize;
+            if want >= st.path.len() {
+                self.a11y_step = None;
+            } else if want > st.idx {
+                let (r, c) = st.path[want];
+                self.sel = (r, c);
+                self.sel_end = (r, c);
+                self.nav_rect = None;
+                st.idx = want;
+                ctx.request_repaint();
+            }
+        }
+
         // QA-05.3：SC_PTR="x,y[,down]" 注入合成指针事件（测 hover / pressed 状态配色）
         if let Ok(v) = std::env::var("SC_PTR") {
             let parts: Vec<&str> = v.split(',').collect();
