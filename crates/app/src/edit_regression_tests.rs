@@ -10085,3 +10085,47 @@ fn ui112_fuzzy_function_search_matches_subsequence_and_ranks_prefix_first() {
     // 完全不匹配：不返回候选
     assert!(formula_help("=ZZQ").is_none());
 }
+
+#[test]
+fn a11y_split_menu_items_appear_when_popup_forced_open() {
+    // split/gallery 的箭头热区在无头注入下点不开（见 a11y_split_button_arrows…），
+    // 这里直接设置 ribbon_popup，验证「菜单真的渲染时，二级命令会进 accesskit 树」。
+    let mut app = app();
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let cases: [(&str, &[&str]); 3] = [
+        ("SortFilter", &["升序", "降序", "自定义排序…", "筛选"]),
+        ("FindSelect", &["查找…", "替换…", "转到…"]),
+        ("FormatAsTable", &["插入表格"]),
+    ];
+    for (id, wants) in cases {
+        let menu = app.ribbon.find_menu(id).unwrap_or_else(|| panic!("找不到 {id} 菜单"));
+        app.ribbon_popup = Some(crate::ribbon::ui::Popup {
+            kind: crate::ribbon::ui::PopupKind::Menu(menu),
+            pos: egui::pos2(320.0, 140.0),
+            opened_at: 0.0,
+        });
+        // 两帧：第一帧建立 Area/弹层，第二帧内容才稳定进树
+        let _ = a11y_nodes(&mut app, &ctx);
+        let nodes = a11y_nodes(&mut app, &ctx);
+        let names: Vec<String> = nodes.iter().map(|(_, l, _)| l.clone()).filter(|l| !l.is_empty()).collect();
+        for want in wants {
+            assert!(names.iter().any(|n| n == want), "{id} 菜单项「{want}」没进树：{:?}", &names[..names.len().min(20)]);
+        }
+        app.ribbon_popup = None;
+    }
+
+    // 画廊：PopupKind::Items，内容来自 find_dropdown
+    let items = app.ribbon.find_dropdown("CellStylesGallery").expect("找不到单元格样式画廊");
+    app.ribbon_popup = Some(crate::ribbon::ui::Popup {
+        kind: crate::ribbon::ui::PopupKind::Items(items),
+        pos: egui::pos2(320.0, 140.0),
+        opened_at: 0.0,
+    });
+    let _ = a11y_nodes(&mut app, &ctx);
+    let nodes = a11y_nodes(&mut app, &ctx);
+    let names: Vec<String> = nodes.iter().map(|(_, l, _)| l.clone()).filter(|l| !l.is_empty()).collect();
+    for want in ["常规", "标题", "强调", "好", "差"] {
+        assert!(names.iter().any(|n| n == want), "画廊项「{want}」没进树：{:?}", &names[..names.len().min(20)]);
+    }
+}

@@ -297,6 +297,9 @@ impl Ribbon {
                     {
                         return Some(items.clone());
                     }
+                    Node::Gallery { ctl, items, .. } if ctl.id == id => {
+                        return Some(items.clone());
+                    }
                     Node::Box { children, .. } => {
                         if let Some(v) = walk(children, id) {
                             return Some(v);

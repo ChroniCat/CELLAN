@@ -7380,7 +7380,8 @@
             "uia_dump.ps1 -> Button 保存 enabled=True / 撤销 enabled=False / 重做 enabled=False（快速访问工具栏）",
             "清空剪贴板 + uia_dump -> Button 粘贴 enabled=False；Set-Clipboard 后再 dump -> enabled=True",
             "cargo test -p app --bin app（--test-threads=2）-> 341 passed（work/goal-logs/ui242d-app.log）",
-            "cargo test -p app a11y_ => 2 passed（198 节点；条件格式展开后 104 带标签节点，二级命令齐全）"
+            "cargo test -p app a11y_ => 2 passed（198 节点；条件格式展开后 104 带标签节点，二级命令齐全）",
+            "cargo test -p app a11y => 3 passed + 1 ignored；app 全量 370 passed"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-a11y-uia.txt",
@@ -7390,12 +7391,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ctx-menu.txt"
           ],
           "not_done": [
-            "split 按钮/画廊组的二级内容（套用表格格式 选项 / 单元格样式 展开 / 排序和筛选 选项）未验证：点击热点是箭头子区域，整体中心点击不展开；真实屏幕阅读器（NVDA/讲述人）未测（无交互桌面）。条件格式二级菜单已验证进树（管理规则…/快捷规则…/新建规则…）。"
+            "真实屏幕阅读器（NVDA/讲述人）与真实鼠标点箭头展开未测：本机无可交互桌面（Start-Process 都失败）。已用 ribbon_popup 直接驱动验证：排序和筛选/查找和选择/套用表格格式 三个菜单、单元格样式画廊的二级项全部进 accesskit 树；find_dropdown 已支持 Gallery。"
           ],
           "failures": [],
           "blocker": "",
           "next": "验右键菜单与禁用态；再考虑升级 accesskit。",
-          "updated_utc": "2026-11-16T22:07:29Z"
+          "updated_utc": "2026-11-17T00:54:33Z"
         },
         {
           "id": "UI-24.3",

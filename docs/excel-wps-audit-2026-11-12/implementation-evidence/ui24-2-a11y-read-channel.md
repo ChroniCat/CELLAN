@@ -49,3 +49,27 @@ split/gallery 组与真实屏幕阅读器未验」——不抬高为已验收。
 无头注入点击没触发；该用例已标 `#[ignore]` 并写明原因，不冒充已验证。
 
 `cargo test -p app a11y` → **2 passed, 1 ignored**。
+
+## split / 菜单 / 画廊：直接驱动弹层后的树验证（同日，最终）
+
+箭头热区无头点击确实点不开，但**弹层内容本身是可访问的**——改成直接设置 `app.ribbon_popup`
+（和真实点击走同一个 `Popup` 结构）后跑两帧读树：
+
+| 入口 | 类型 | 期望项 | 结果 |
+|---|---|---|---|
+| `SortFilter` 排序和筛选 | Menu | 升序 / 降序 / 自定义排序… / 筛选 | ✅ 全部进树 |
+| `FindSelect` 查找和选择 | Menu | 查找… / 替换… / 转到… | ✅ |
+| `FormatAsTable` 套用表格格式 | Menu | 插入表格 | ✅ |
+| `CellStylesGallery` 单元格样式 | Gallery（`PopupKind::Items`） | 常规 / 标题 / 强调 / 好 / 差 | ✅ |
+
+用例：`a11y_split_menu_items_appear_when_popup_forced_open`。
+
+顺带补了一处真实缺口：`Ribbon::find_dropdown()` 只认 `DropDown`/`ComboBox`，**不认 `Gallery`**，
+所以画廊内容无法从外部取到（测试和未来的键盘/朗读路径都受影响）。已加 `Node::Gallery` 分支。
+
+`cargo test -p app` → **370 passed, 1 ignored**。
+
+## UI-24.2 剩余
+
+- 真实屏幕阅读器（NVDA/讲述人）端到端朗读：无交互桌面，未测；
+- 箭头热区的真实鼠标点击（Excel 里点箭头展开）：同上，环境阻塞。
