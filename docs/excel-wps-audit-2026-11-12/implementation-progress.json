@@ -5837,11 +5837,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-home.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-formulas.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-1024-home.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-1366-home.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-1366-home.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-data.png"
           ],
           "not_done": [
             "真实鼠标展开“更多”逐项点击未做",
-            "小图标二级压缩已实现：整组放不下时先压成 3–4 列小按钮，仍有启动器；760/1024/1366 截图已核读，余下真实鼠标展开“更多”逐项点击未做。"
+            "小图标二级压缩已实现：760 Home 对齐方式为纯图标网格，760 数据页获取数据为 2 图标+分列，长标签且无图标的组退回“组名 ▾”；纯图标名称只靠 screentip，真实鼠标/DPI 目视未做。"
           ],
           "failures": [],
           "blocker": "",

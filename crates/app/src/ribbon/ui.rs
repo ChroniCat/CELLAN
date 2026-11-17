@@ -195,7 +195,14 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         let full_fits = known.is_some() && used + w + 60.0 <= avail;
         let compact_fits = known.is_some()
             && compact_w + 12.0 <= avail - used
-            && compact_w + 12.0 < w;
+            && compact_w + 12.0 < w
+            && !compact_needs_text(&g.children);
+        if std::env::var("SC_PANEL_LOG").is_ok() {
+            eprintln!(
+                "[layout] {:14} known={known:?} w={w:.0} used={used:.0} avail={avail:.0} compact={compact_w:.0}"
+                , g.label
+            );
+        }
         if known.is_some() && !full_fits && compact_fits {
             let x0 = ui.cursor().min.x;
             group_compact(app, ui, g);
@@ -306,6 +313,30 @@ fn compact_width(g: &Group) -> f32 {
     (cols * 52.0 + 10.0).min(210.0)
 }
 
+/// 压缩态把长标签收成图标；若控件本身没有图标，会变成空白按钮。
+/// 这种组不要硬压，交给「组名 ▾」菜单，保证文字完整。
+fn compact_needs_text(list: &[Node]) -> bool {
+    let no_icon_long = |c: &Ctl| {
+        c.image.is_none()
+            && c.label
+                .as_deref()
+                .map(|s| s.chars().count() > 2)
+                .unwrap_or(false)
+    };
+    list.iter().any(|n| match n {
+        Node::Button(c) | Node::Toggle(c) => no_icon_long(c),
+        Node::Split { ctl, .. } => no_icon_long(ctl),
+        Node::Menu(m) => no_icon_long(&m.ctl),
+        Node::DropDown { ctl, .. }
+        | Node::Gallery { ctl, .. }
+        | Node::ComboBox { ctl, .. }
+        | Node::EditBox { ctl, .. }
+        | Node::Slider { ctl, .. } => no_icon_long(ctl),
+        Node::Box { children, .. } => compact_needs_text(children),
+        Node::Label(_) | Node::Spacer(_) | Node::Separator => false,
+    })
+}
+
 /// Excel 的二级压缩：分组内的大按钮改成 24px 小按钮，排成 3–4 列的小网格。
 /// 组名仍然在底部，命令一个不少；真正放不下时才由调用方退化成「组名 ▾」。
 fn group_compact(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
@@ -375,42 +406,68 @@ fn compact_leaves<'a>(list: &'a [Node], out: &mut Vec<&'a Node>) {
 }
 
 fn node_compact(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
+    // 压缩态是“小图标”，不是把大按钮等比缩小：标签超过两个汉字就只画图标，
+    // 完整文字放进 screentip，避免 52px 宽按钮把“自动求和”截成“自动”。
+    let icon_ctl = |c: &Ctl| -> Ctl {
+        let mut c = c.clone();
+        c.size = Size::Normal;
+        c.width = Some(28.0);
+        if let Some(label) = c.label.take() {
+            if label.chars().count() > 2 {
+                if c.screentip.is_none() && c.supertip.is_none() {
+                    c.screentip = Some(label);
+                }
+            } else {
+                c.label = Some(label);
+            }
+        }
+        c
+    };
     match n {
         Node::Button(c) => {
-            let mut c = c.clone();
-            c.size = Size::Normal;
+            let c = icon_ctl(c);
             button(app, ui, &c, false);
         }
         Node::Toggle(c) => {
-            let mut c = c.clone();
-            c.size = Size::Normal;
+            let c = icon_ctl(c);
             button(app, ui, &c, true);
         }
         Node::Split { ctl, menu } => {
-            let mut ctl = ctl.clone();
-            ctl.size = Size::Normal;
+            let mut ctl = icon_ctl(ctl);
+            ctl.width = Some(28.0);
             split(app, ui, &ctl, menu);
         }
         Node::Menu(m) => {
             let mut m = m.clone();
             m.ctl.size = Size::Normal;
+            m.ctl.width = Some(28.0);
+            if let Some(label) = m.ctl.label.take() {
+                if label.chars().count() > 2 {
+                    if m.ctl.screentip.is_none() && m.ctl.supertip.is_none() {
+                        m.ctl.screentip = Some(label);
+                    }
+                } else {
+                    m.ctl.label = Some(label);
+                }
+            }
             menu(app, ui, &m);
         }
         Node::DropDown { ctl, items } => {
             let mut ctl = ctl.clone();
             ctl.size = Size::Normal;
+            ctl.width = Some(ctl.width.unwrap_or(84.0).min(84.0));
             dropdown(app, ui, &ctl, items);
         }
         Node::Gallery { ctl, items, .. } => {
             let mut ctl = ctl.clone();
             ctl.size = Size::Normal;
-            ctl.width = Some(ctl.width.unwrap_or(120.0).min(120.0));
+            ctl.width = Some(ctl.width.unwrap_or(100.0).min(100.0));
             gallery(app, ui, &ctl, items);
         }
         Node::ComboBox { ctl, items, width } => {
             let mut ctl = ctl.clone();
             ctl.size = Size::Normal;
-            combo(app, ui, &ctl, items, (*width).min(120.0));
+            combo(app, ui, &ctl, items, (*width).min(90.0));
         }
         Node::EditBox {
             ctl,
@@ -420,7 +477,7 @@ fn node_compact(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
         } => {
             let mut ctl = ctl.clone();
             ctl.size = Size::Normal;
-            edit(app, ui, &ctl, hint, *password, (*width).min(120.0));
+            edit(app, ui, &ctl, hint, *password, (*width).min(90.0));
         }
         Node::Slider { ctl, min, max } => {
             let mut ctl = ctl.clone();
