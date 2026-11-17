@@ -547,7 +547,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
         app.sel_end = (1, 1);
         if multi {
-            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false });
+            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, split_fixed: false, widths: String::new() });
         } else {
             app.do_sort(0, true);
         }
@@ -4214,6 +4214,8 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
                     merge_consecutive: false,
                     quote: false,
                     detect_types: false,
+                    split_fixed: false,
+                    widths: String::new(),
                 })
             }),
         ),
@@ -7015,6 +7017,8 @@ fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
         merge_consecutive: false,
         quote: true,
         detect_types: true,
+        split_fixed: false,
+        widths: String::new(),
     };
     app.run_split(&dlg);
     assert!(app.status.contains("覆盖"), "第一次应只预览：{}", app.status);
@@ -7084,6 +7088,8 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
         merge_consecutive: false,
         quote: false,
         detect_types: false,
+        split_fixed: false,
+        widths: String::new(),
     };
     app.run_sort(&dlg);
     let order: Vec<String> = (1..=4)
@@ -10145,4 +10151,53 @@ fn a11y_split_menu_items_appear_when_popup_forced_open() {
     for want in ["常规", "标题", "强调", "好", "差"] {
         assert!(names.iter().any(|n| n == want), "画廊项「{want}」没进树：{:?}", &names[..names.len().min(20)]);
     }
+}
+
+#[test]
+fn run_split_fixed_width_writes_columns() {
+    let mut a = app();
+    a.wb.sheets[0].set(0, 0, Cell { value: Value::Text("ABCDEF".into()), formula: None });
+    a.sel = (0, 0);
+    a.sel_end = (0, 0);
+    a.run_split(&DataDlg {
+        tab: 1,
+        keys: Vec::new(),
+        header: false,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+        split_fixed: true,
+        widths: "2,2".into(),
+    });
+    // 第一段落回原列，后续列往右写；断点之后的剩余部分并入最后一列（Excel 语义）
+    assert_eq!(a.wb.sheets[0].value(0, 0).display(), "AB");
+    assert_eq!(a.wb.sheets[0].value(0, 1).display(), "CDEF");
+    assert_eq!(a.wb.sheets[0].value(0, 2).display(), "");
+
+}
+
+#[test]
+fn run_split_fixed_width_rejects_bad_widths() {
+    let mut a = app();
+    a.wb.sheets[0].set(0, 0, Cell { value: Value::Text("ABCDEF".into()), formula: None });
+    a.sel = (0, 0);
+    a.sel_end = (0, 0);
+    a.run_split(&DataDlg {
+        tab: 1,
+        keys: Vec::new(),
+        header: false,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+        split_fixed: true,
+        widths: "2,0".into(),
+    });
+    assert!(a.status.contains("正整数"), "应提示宽度非法：{}", a.status);
+    assert_eq!(a.wb.sheets[0].value(0, 0).display(), "ABCDEF", "非法宽度不改数据");
 }

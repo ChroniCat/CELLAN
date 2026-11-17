@@ -174,6 +174,10 @@ struct DataDlg {
     quote: bool,
     /// 分列：识别数字/日期（前导零保留文本）
     detect_types: bool,
+    /// 分列方式：false=按分隔符，true=按固定宽度
+    split_fixed: bool,
+    /// 固定宽度（每列字符数，逗号分隔，如 "10,20,15"）
+    widths: String,
 }
 
 #[derive(Clone, Default)]
@@ -5072,6 +5076,8 @@ impl SheetApp {
                 sort_mode: 0,
                 custom: String::new(),
                 merge_consecutive: false,
+                split_fixed: false,
+                widths: String::new(),
                 quote: true,
                 detect_types: true,
             };
@@ -5095,6 +5101,8 @@ impl SheetApp {
                 sort_mode: 0,
                 custom: String::new(),
                 merge_consecutive: false,
+                split_fixed: false,
+                widths: String::new(),
                 quote: true,
                 detect_types: true,
             };
@@ -6609,6 +6617,8 @@ impl SheetApp {
             sort_mode: 1,
             custom: "高,中,低".into(),
             merge_consecutive: true,
+            split_fixed: false,
+            widths: String::new(),
             quote: true,
             detect_types: true,
         });
@@ -6841,12 +6851,24 @@ impl SheetApp {
 
     fn run_split(&mut self, dlg: &DataDlg) {
         let (r1, c1, r2, c2) = self.sel_rect();
+        let fixed = if dlg.split_fixed {
+            match sheetcore::data_tools::parse_fixed_widths(&dlg.widths) {
+                Some(w) => Some(w),
+                None => {
+                    self.status = "固定宽度要写正整数，逗号分隔，如 10,20,15".into();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let opts = sheetcore::data_tools::SplitOpts {
             delim: dlg.delim.chars().next().unwrap_or(','),
-            merge_consecutive: dlg.merge_consecutive,
-            quote: dlg.quote,
+            merge_consecutive: dlg.merge_consecutive && fixed.is_none(),
+            quote: dlg.quote && fixed.is_none(),
             detect_types: dlg.detect_types,
             date_system: self.wb.date_system,
+            fixed_widths: fixed,
         };
         let dry = sheetcore::data_tools::text_to_columns_ex(
             self.wb.sheet_mut(self.sheet_idx),
@@ -8331,11 +8353,27 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                     }
                 } else {
                     ui.horizontal(|ui| {
-                        ui.label("分隔符");
-                        ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(60.0));
+                        ui.radio_value(&mut dlg.split_fixed, false, "按分隔符");
+                        ui.radio_value(&mut dlg.split_fixed, true, "按固定宽度");
                     });
-                    ui.checkbox(&mut dlg.quote, "引号内的分隔符不拆（\"\" 表示一个引号）");
-                    ui.checkbox(&mut dlg.merge_consecutive, "连续分隔符当一个（多个空格不产生空列）");
+                    if dlg.split_fixed {
+                        ui.horizontal(|ui| {
+                            ui.label("每列字符数");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.widths)
+                                    .desired_width(140.0)
+                                    .hint_text("10,20,15"),
+                            );
+                        });
+                        ui.label(egui::RichText::new("从选中列左边开始按字符数切，剩余部分留在最后一列").weak());
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("分隔符");
+                            ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(60.0));
+                        });
+                        ui.checkbox(&mut dlg.quote, "引号内的分隔符不拆（\"\" 表示一个引号）");
+                        ui.checkbox(&mut dlg.merge_consecutive, "连续分隔符当一个（多个空格不产生空列）");
+                    }
                     ui.checkbox(&mut dlg.detect_types, "识别数字/日期（前导零保留为文本）");
                     let (r1, c1, _, _) = self.sel_rect();
                     let sample = self
@@ -8345,12 +8383,18 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         .map(|x| x.value.display())
                         .unwrap_or_default();
                     if !sample.is_empty() {
+                        let fixed = if dlg.split_fixed {
+                            sheetcore::data_tools::parse_fixed_widths(&dlg.widths)
+                        } else {
+                            None
+                        };
                         let opts = sheetcore::data_tools::SplitOpts {
                             delim: dlg.delim.chars().next().unwrap_or(','),
-                            merge_consecutive: dlg.merge_consecutive,
-                            quote: dlg.quote,
+                            merge_consecutive: dlg.merge_consecutive && fixed.is_none(),
+                            quote: dlg.quote && fixed.is_none(),
                             detect_types: dlg.detect_types,
                             date_system: self.wb.date_system,
+                            fixed_widths: fixed,
                         };
                         let fields = sheetcore::data_tools::split_fields(&sample, &opts);
                         ui.label(
@@ -23235,6 +23279,8 @@ let txn = self.txn_begin(&keys);
                     sort_mode: 1,
                     custom: "高,中,低".into(),
                     merge_consecutive: false,
+                    split_fixed: false,
+                    widths: String::new(),
                     quote: true,
                     detect_types: true,
                 });

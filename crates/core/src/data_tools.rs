@@ -267,6 +267,8 @@ pub struct SplitOpts {
     /// 识别数字/日期；前导零（00123）保留为文本
     pub detect_types: bool,
     pub date_system: crate::model::DateSystem,
+    /// 固定宽度模式：每列占几个字符（按字符数，不按字节）；None = 按分隔符拆
+    pub fixed_widths: Option<Vec<usize>>,
 }
 
 impl Default for SplitOpts {
@@ -277,6 +279,7 @@ impl Default for SplitOpts {
             quote: true,
             detect_types: true,
             date_system: crate::model::DateSystem::D1900,
+            fixed_widths: None,
         }
     }
 }
@@ -296,6 +299,9 @@ pub struct SplitReport {
 
 /// 按选项拆一行文本
 pub fn split_fields(line: &str, opts: &SplitOpts) -> Vec<String> {
+    if let Some(widths) = &opts.fixed_widths {
+        return split_fixed(line, widths);
+    }
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
@@ -433,6 +439,7 @@ pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: c
         quote: false,
         detect_types: false,
         date_system: crate::model::DateSystem::D1900,
+        fixed_widths: None,
     };
     text_to_columns_ex(sheet, region, &opts, false).width
 }
@@ -600,4 +607,77 @@ mod tests {
         assert_eq!(s.get(0, 3).unwrap().value.display(), "也有");
     }
 
+}
+
+/// 固定宽度分列：按字符数切（Excel 的「固定宽度」也是按显示宽度，这里按字符数，
+/// 中日韩全角字符一个算一个，够用且可预测）。空段保留成空串，行为与 Excel 一致。
+pub fn split_fixed(line: &str, widths: &[usize]) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for &w in widths {
+        if w == 0 {
+            continue;
+        }
+        let end = (at + w).min(chars.len());
+        out.push(chars[at..end].iter().collect::<String>());
+        at = end;
+        if at >= chars.len() {
+            break;
+        }
+    }
+    // Excel 里最后一列的右边界是「文本末尾」，断点之后的剩余部分留在最后一列
+    if at < chars.len() {
+        let tail: String = chars[at..].iter().collect();
+        match out.last_mut() {
+            Some(last) => last.push_str(&tail),
+            None => out.push(tail),
+        }
+    }
+    out
+}
+
+/// 「10,20,30」→ [10,20,30]；有任何非正数或非数字就返回 None。
+pub fn parse_fixed_widths(s: &str) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in s.split([',', '，', ' ']).filter(|p| !p.trim().is_empty()) {
+        let v: usize = part.trim().parse().ok()?;
+        if v == 0 {
+            return None;
+        }
+        out.push(v);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+#[cfg(test)]
+mod fixed_width_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_width_splits_by_char_count() {
+        // 断点之后的剩余部分并入最后一列（Excel 的最后一列右边界到文本末尾）
+        assert_eq!(split_fixed("ABCDEFG", &[3, 2]), vec!["ABC", "DEFG"]);
+        assert_eq!(split_fixed("甲1乙2丙", &[2, 2]), vec!["甲1", "乙2丙"]);
+        assert_eq!(split_fixed("AB", &[4, 4]), vec!["AB"], "短于宽度时不补空格");
+        assert_eq!(split_fixed("", &[3]), vec![""]);
+    }
+
+    #[test]
+    fn fixed_width_parse_rejects_zero_and_garbage() {
+        assert_eq!(parse_fixed_widths("10,20,15"), Some(vec![10, 20, 15]));
+        assert_eq!(parse_fixed_widths(" 10 ， 20 "), Some(vec![10, 20]));
+        assert_eq!(parse_fixed_widths("10,0"), None);
+        assert_eq!(parse_fixed_widths("10,x"), None);
+        assert_eq!(parse_fixed_widths(""), None);
+    }
+
+    #[test]
+    fn fixed_width_mode_bypasses_delimiters() {
+        let opts = SplitOpts {
+            fixed_widths: Some(vec![3, 3]),
+            ..Default::default()
+        };
+        assert_eq!(split_fields("AB,CD,EF", &opts), vec!["AB,", "CD,EF"]);
+    }
 }
