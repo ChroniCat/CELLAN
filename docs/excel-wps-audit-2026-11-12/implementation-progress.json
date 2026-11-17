@@ -2902,7 +2902,7 @@
       "scope": "core/table.rs, refs.rs, structural.rs",
       "source": "core-requirements.md",
       "heading": "C10 P1 完整结构化引用与表格计算列",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "C10.1 已由用户 10:49 认可；C10.2/C10.3 于 11:13 复核后补目标表限定转换、表头同步、大小写不敏感列引用、计算列生产入口。6 个专项测试和 app 生产入口已通过，但 live/独立复核仍未完成；特殊字符列名仍只覆盖空格/逗号/百分号，括号/结构化转义未覆盖。 11:38 另修 `rewrite_table_column_refs` 的 UTF-8 字节切片 panic：先检查 char boundary，再在中文裸公式/无关中文公式重命名时原样保留；新增回归，专项 7 passed。",
       "files": [
         "crates/core/src/table.rs",
@@ -2923,20 +2923,12 @@
         "cargo test -p sheetcore --offline -> 74 bins / 674 passed / 0 failed / 41 ignored",
         "cargo test -p app --offline --bin app -> 202 passed / 0 failed"
       ],
-      "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-refs.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-calculated.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured/core.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-calculated/app.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-structured-escapes.txt"
-      ],
-      "not_done": [
-        "C10.2/C10.3 已补表头改名入口并两款 Office 复核；C10 三个切片等待复核"
-      ],
+      "evidence": "implementation-evidence/c10-review-1117.md（24 tests + Excel/WPS 改名/转区域回读）",
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "C10.2/C10.3 独立复核与 live；父项 C10 保持实施中。",
-      "updated_utc": "2026-11-13T19:06:54Z",
+      "updated_utc": "2026-11-17T04:17:44Z",
       "slices": [
         {
           "id": "C10.1",
@@ -2977,7 +2969,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C10 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "11:13 复核后：目标表限定转换不会改其他表引用；列重命名同步表头/定义/id/公式；fill_calculated_column 已接 TableFillCalculated 生产入口。6 个专项测试通过，live/独立复核仍未完成。 11:38：中文裸当前行公式不再 panic，无关中文公式保持。",
           "files": [
             "crates/app/src/main.rs",
@@ -2990,16 +2982,12 @@
             "cargo test -p sheetcore --offline --test table_calculated -> 7 passed",
             "cargo test -p app --offline --bin app -> 201 passed / 0 failed"
           ],
-          "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-rename-convert.txt"
-          ],
-          "not_done": [
-            "改名入口：表头文字提交即重命名列并改写结构化引用；转区域入口在表设计页；Excel/WPS 复核表格数、列名、公式与值"
-          ],
+          "evidence": "implementation-evidence/c10-review-1117.md（24 tests + Excel/WPS 改名/转区域回读）",
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；C10.2 live 按用户要求保留。",
-          "updated_utc": "2026-11-13T19:06:54Z"
+          "updated_utc": "2026-11-17T04:17:44Z"
         },
         {
           "id": "C10.3",
@@ -3007,7 +2995,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C10 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "11:13 复核后：目标表限定转换不会改其他表引用；列重命名同步表头/定义/id/公式；fill_calculated_column 已接 TableFillCalculated 生产入口。6 个专项测试通过，live/独立复核仍未完成。",
           "files": [
             "crates/app/src/main.rs",
@@ -3020,16 +3008,12 @@
             "cargo test -p sheetcore --offline --test table_calculated -> 7 passed",
             "cargo test -p app --offline --bin app -> 201 passed / 0 failed"
           ],
-          "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c10-table-rename-convert.txt"
-          ],
-          "not_done": [
-            "改名入口：表头文字提交即重命名列并改写结构化引用；转区域入口在表设计页；Excel/WPS 复核表格数、列名、公式与值"
-          ],
+          "evidence": "implementation-evidence/c10-review-1117.md（24 tests + Excel/WPS 改名/转区域回读）",
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "等待独立复核；C10.2 live 按用户要求保留。",
-          "updated_utc": "2026-11-13T19:06:54Z"
+          "updated_utc": "2026-11-17T04:17:44Z"
         }
       ]
     },
