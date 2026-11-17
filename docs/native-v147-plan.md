@@ -18,7 +18,7 @@
 
 （历史原文，非当前状态）这三项当时都还没做。下面是先做过的实测（不是推测），以及据此定的方案。
 
-## 0. 实测结论：三条前提要先纠正
+## 0. 实测结论：三条前提要先纠正  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 **① 外部引用现在算不了。** `=[1]预算!A1`、`=SUM([1]预算!A1:A3)`、`=[ext_plan_src2.xlsx]预算!A1`、
 `='[ext_plan_src2.xlsx]预算'!A1` 四种写法在 `eval_formula` 里分别是 #VALUE! / #VALUE! / #VALUE! / #REF!。
@@ -43,9 +43,9 @@
 → 主路走 **XML Spreadsheet**（R1C1 文本，直接可转 A1），HTML 留作兜底，BIFF 不做。
 只有「源头只放 Biff、没有 XML Spreadsheet」的旧环境才需要 ptg 解码器，那种情况先记为已知限制。
 
-## 1. 跨工作簿引用
+## 1. 跨工作簿引用  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
-### 文件格式（实测样本）
+### 文件格式（实测样本）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 ```
 xl/worksheets/sheet1.xml:
@@ -76,7 +76,7 @@ xl/externalLinks/_rels/externalLink1.xml.rels:
 - 工作表 XML 里的 `[N]` 是**链接序号（1 起）**，不是文件名；文件名只在 externalLink 的 rels 里。
 - 缓存是「被引用表的已用区域」，值是 `<v>`，文本用 `t="str"`，没有公式。
 
-### 数据模型（crates/core）
+### 数据模型（crates/core）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 ```rust
 pub struct ExternalBook {
@@ -90,7 +90,7 @@ pub struct ExternalBook {
 // Workbook.links: Vec<ExternalBook>
 ```
 
-### 公式链路（crates/core/src/formula）
+### 公式链路（crates/core/src/formula）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 1. 词法：`'['` 分支读到 `']'`，产出 `Tok::Book(String)`（`预算.xlsx` 或 `1`）。
 2. 语法：`[..]Sheet!A1`、`[..]Sheet!A1:B2`、`'[..]Sheet'!A1` → `Node::Ref{ book: Option<usize>, sheet, row, col }`；
@@ -100,7 +100,7 @@ pub struct ExternalBook {
 4. **显示**：公式栏把 `[1]` 显示成 `[ext_plan_src2.xlsx]`（读时把序号换成文件名），
    **写回必须还原成 `[N]`**（Excel 只认序号形式）。这条要单测锁死。
 
-### 更新机制
+### 更新机制  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 - **打开**：默认沿用文件里的缓存（和 Excel「不更新链接」一致，快且离线可用）。
 - **更新链接**（数据页 → 编辑链接… → 更新）：按 target 解析真实路径（先工作簿同目录，再绝对 URL），
@@ -108,35 +108,35 @@ pub struct ExternalBook {
 - **存盘**：`refreshed` 的表重写 `sheetDataSet`（sheetNames/rels/CT 原样）；没刷新过就一个字节都不动。
 - 目标文件缺失：状态列显示「文件缺失」，求值继续用缓存，不把 #REF! 写回。
 
-### 界面
+### 界面  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 - 数据页 →「编辑链接…」：表格（文件名 / 绝对路径 / 状态：已缓存·已刷新·缺失 / 工作表数），
   按钮：更新、全部更新、断开链接（把公式替换成当前值）。
 - 状态栏：`外部链接 2 个（1 个缺失）`。
 
-### 验收（Excel COM）
+### 验收（Excel COM）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 1. 打开 `ext_plan_main2.xlsx` → 重算后 A1=10、A2=60、A3=21、A4=预算元、A5=30（和 Excel 一致）。
 2. 把源文件 A1 改成 100 → 点更新链接 → A1=100、A2=150（Excel 里同样操作结果一致）→ 保存。
 3. 用 Excel 打开保存后的文件：链接数 1，值为新值，公式显示 `'[ext_plan_src2.xlsx]预算'!A1`。
 4. 回归：不带外部引用的文件另存，包内部件与基准逐字节相同（现有测试 basis）。
 
-## 2. 修订跟踪（单元格级）
+## 2. 修订跟踪（单元格级）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
-### 先排除 Excel 的旧式修订
+### 先排除 Excel 的旧式修订  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 Excel 的 Track Changes 绑定「共享工作簿」+ `<revisions>` 部件，Excel 365 已弃用、LibreOffice 也不认。
 做出来既不互操作、又难维护。**改做应用级修订日志**：能回答「谁、什么时候、改了哪格、之前是什么」，
 并且能撤回——这正是用户要的「单元格级改动历史」，且复用现有撤销/协作设施。
 
-### 切入点（代码里已经找好）
+### 切入点（代码里已经找好）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 所有编辑都汇聚到 `SheetApp::txn_end(label, before)`（约 20 处调用），它已经拿到
 `CellDelta { before, after, before_style, after_style }`；结构性改动走
 `snap_before/snap_after` 快照。远端改动在 `Msg::Op / StyleOp / MergeOp / Structural` 的应用处。
 → 在 `txn_end` 末尾 append 一条修订；远端在应用处 append（带 site/name）。
 
-### 存储（随文件走，不进 xlsx）
+### 存储（随文件走，不进 xlsx）  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 ```
 <工作簿同目录>/.~sheetflow-history/<文件名>/revisions.jsonl
@@ -151,7 +151,7 @@ Excel 的 Track Changes 绑定「共享工作簿」+ `<revisions>` 部件，Exce
 - 不进 xlsx：Excel 不认识自定义部件，我们的 `prune_orphans` 也会清掉它；放同目录还有个好处——
   共享盘上换个人打开也能看到历史（和现有 `.~sheetflow-history` 版本备份同一个目录）。
 
-### 界面
+### 界面  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 审阅页 →「修订记录」：
 - 列表：时间、人、位置（`Sheet1!B10`）、动作、前后值摘要；按人/类型/时间段过滤。
@@ -159,19 +159,19 @@ Excel 的 Track Changes 绑定「共享工作簿」+ `<revisions>` 部件，Exce
   不等就提示冲突（协作场景不硬盖别人的新值）。
 - 撤回本身也记一条 `kind:"revert"`。
 
-### 协作
+### 协作  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 宿主 append；新加入者连上后拉最后 200 条填充面板（不参与求值，纯展示）。
 
-### 验收
+### 验收  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 - 连改 3 格 → 3 条记录，前后值正确；撤回第 2 条 → 值回退、新增 revert 记录。
 - 两人协作：对方的改动进日志，who 正确（用现有两台进程的会话测法）。
 - 152 MB / 43 万格文件改一格：日志追加 < 1 KB，保存耗时不变（日志异步写）。
 
-## 3. 带公式的剪贴板
+## 3. 带公式的剪贴板  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
-### 方案：XML Spreadsheet 主路 + HTML 兜底
+### 方案：XML Spreadsheet 主路 + HTML 兜底  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 实测样本（1,318 B，UTF-8）：
 
@@ -193,7 +193,7 @@ Excel 的 Track Changes 绑定「共享工作簿」+ `<revisions>` 部件，Exce
 - `<Cell ss:Index>` 跳过空格、`ss:MergeAcross/MergeDown` 是合并、`ss:Formula` 是 R1C1、
   `<Data ss:Type>` 是 Number/String/Boolean/DateTime/Error。
 
-### 实现步骤
+### 实现步骤  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 1. `office_clipboard.rs`：加 `read_format_raw`（二进制不能按 NUL 截断）+ 注册 `"XML Spreadsheet"`；
    `read_table()` 先试 XML SS，失败再走 HTML。
@@ -206,14 +206,14 @@ Excel 的 Track Changes 绑定「共享工作簿」+ `<revisions>` 部件，Exce
    `Cell { value: 缓存值, formula }`，粘完统一 `recalc_all`（一次事务，撤销仍是一步）。
 4. 保留 HTML 路径不动（无公式时的行为完全不变），XML SS 解析失败自动回落。
 
-### 验收
+### 验收  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 - 从 Excel 复制 `A1=1, A2=2, B1==A1+A2, B2==A1*10` → 粘到我们这：B1/B2 是公式（不是 3/10），
   改 A1 → B1 跟着变；存盘后用 Excel 打开 B1 仍是 `=A1+A2`。
 - 复制带合并/底色/粗体/数字格式的区域：结果与 HTML 路径一致或更好（字体名现在也能带上）。
 - 复制纯文本/网页表格：仍走旧路径，行为不变（回归）。
 
-## 建议顺序
+## 建议顺序  〔改于 2026-11-09T16:56+08:00 / 2e6b685〕
 
 | 顺序 | 项 | 改动面 | 主要风险 |
 |---|---|---|---|

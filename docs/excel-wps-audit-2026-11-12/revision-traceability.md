@@ -41,3 +41,27 @@
 rg -n "90/257|123/257|这三项都还没做|已全部实现" docs/
 rg -n '"status"' docs/excel-wps-audit-2026-11-12/implementation-progress.json
 ```
+
+## 旧日志的时间锚点（2026-11-17 补齐）
+
+三份旧文（`ui-parity-audit.md`、`native-v147-plan.md`、`native-rewrite.md`）的每个
+二~四级标题后都加了标记：
+
+```text
+〔改于 2026-11-06T17:28+08:00 / 2ffdbeb〕
+```
+
+- 时间 = 该标题行最后一次被改动的提交时间（`git blame` 的 committer-time，+08:00）；
+- `2ffdbeb` = 那次提交的短 SHA，可直接 `git show 2ffdbeb -- <文件>` 定位；
+- 标记加完后单独提交（本次），之后标题若再变，`git blame` 会指向新提交，标记即过时，
+  需要按同样方法重刷——用脚本重刷：见本文件末尾命令。
+
+这样「旧日志逐轮条目」不再只有日期，而是每条可追到具体提交与时刻；
+当前状态仍以 `implementation-progress.json` 为准（时间锚点只解决可追踪性，不改结论）。
+
+复核命令：
+
+```bash
+git blame -l --line-porcelain HEAD -- docs/native-rewrite.md | grep -A2 '^[0-9a-f]\{40\}'
+rg -n "〔改于 " docs/
+```
