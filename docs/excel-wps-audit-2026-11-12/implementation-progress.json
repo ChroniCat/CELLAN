@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-17T11:30:04Z",
+  "updated_utc": "2026-11-18T07:05:00Z",
   "tasks": [
     {
       "id": "C01",
@@ -4855,7 +4855,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-07 普通粘贴各入口共用真实系统剪贴板",
       "status": "待验收",
-      "acceptance": " [2026-11-14 实现证据] 三入口共用最新系统剪贴板（含 App 旧 clip→外部新文本回归）；Excel/WPS→App 双向 2×3 日期/金额/中文/合并/换行/粗体/填充实测；App→Excel/WPS 公式丢失已明确列在 ui07-clipboard.txt 第六节；物理鼠标右键/IPC 未执行。",
+      "acceptance": "[2026-11-18 更新] 三入口共用最新系统剪贴板；Excel/WPS→App 双向 2×3 日期/金额/中文/合并/换行/粗体/填充实测；App→Excel/WPS 公式已由 XML Spreadsheet R1C1 保留（Excel/WPS COM 均得 C2f==B2*2）；物理鼠标右键/物理键盘仍未执行。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/office_clipboard.rs",
@@ -4871,22 +4871,26 @@
         "SC_CMD=\"20:Paste;60:FileSave\" app.exe work/qa07/ribbon.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
         "SC_KEYSEQ=\"ctrl+v\" app.exe work/qa07/key.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
         "WPS KET.Application copy -> SC_CMD=\"20:Paste;60:FileSave\" work/qa07/wps-ribbon4.xlsx => B2==B1*2, A1V=46024, FMT=yyyy-mm-dd",
-        "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved"
+        "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved",
+        "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 xmlss_formula_uses_r1c1_for_excel_paste => 1 passed",
+        "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10",
+        "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 386 passed, 0 failed, 1 ignored; APP_EXIT=0",
+        "SC_SEL=0,0 SC_SEL2=1,1 SC_KEYSEQ=6:ctrl+c app.exe clip_style.xlsx => Excel/WPS D1f=5 E1f==D1*2 D1fill=65535 D1bold=True D2merge=True D2=中文"
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-clipboard.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
       ],
       "not_done": [
         "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-        "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归",
-        "App→Excel/WPS 普通粘贴公式丢失（HTML x:fmla 不被采用，B2 为缓存值 2469）；向外公式保留未达成"
+        "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归"
       ],
       "failures": [],
       "blocker": "",
-      "next": "监督复核；补物理鼠标右键点击/真实键盘 IME 后可将父项转已验收",
+      "next": "补物理鼠标右键点击/真实键盘 IME 后可将父项转已验收；公式向外损失已关闭。",
       "updated_utc": "2026-11-12T10:28:37Z",
       "slices": [
         {
@@ -4907,18 +4911,20 @@
             "SC_CMD=\"20:Paste;60:FileSave\" app.exe work/qa07/ribbon.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "SC_KEYSEQ=\"ctrl+v\" app.exe work/qa07/key.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "WPS KET.Application copy -> SC_CMD=\"20:Paste;60:FileSave\" work/qa07/wps-ribbon4.xlsx => B2==B1*2, A1V=46024, FMT=yyyy-mm-dd",
-            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved"
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 xmlss_formula_uses_r1c1_for_excel_paste => 1 passed",
+            "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-clipboard.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
           ],
           "not_done": [
             "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-            "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归",
-            "App→Excel/WPS 普通粘贴公式丢失（HTML x:fmla 不被采用，B2 为缓存值 2469）；向外公式保留未达成"
+            "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归"
           ],
           "failures": [],
           "blocker": "",
@@ -4932,8 +4938,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "[2026-11-18 实测] Excel/WPS COM 粘贴 App XMLSS：公式 D1f=5/E1f==D1*2，黄底 D1fill=65535、粗体 True、D2:E2 合并 True、中文保留；XML 公式为 R1C1。",
           "files": [],
           "commits": [
             "537dbe5"
@@ -4944,24 +4950,24 @@
             "SC_CMD=\"20:Paste;60:FileSave\" app.exe work/qa07/ribbon.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "SC_KEYSEQ=\"ctrl+v\" app.exe work/qa07/key.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "WPS KET.Application copy -> SC_CMD=\"20:Paste;60:FileSave\" work/qa07/wps-ribbon4.xlsx => B2==B1*2, A1V=46024, FMT=yyyy-mm-dd",
-            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved"
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 xmlss_formula_uses_r1c1_for_excel_paste => 1 passed",
+            "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10",
+            "SC_SEL=0,0 SC_SEL2=1,1 SC_KEYSEQ=6:ctrl+c app.exe clip_style.xlsx => Excel/WPS D1f=5 E1f==D1*2 D1fill=65535 D1bold=True D2merge=True D2=中文"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-clipboard.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
           ],
-          "not_done": [
-            "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-            "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归",
-            "App→Excel/WPS 普通粘贴公式丢失（HTML x:fmla 不被采用，B2 为缓存值 2469）；向外公式保留未达成"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z",
-          "status_note": "随 UI-07 父项待监督复核；见 ui07-clipboard.txt。"
+          "updated_utc": "2026-11-18T07:10:00Z",
+          "status_note": "公式、填充、粗体、合并、中文均经 Excel/WPS COM 实测。"
         },
         {
           "id": "UI-07.3",
@@ -4969,8 +4975,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "[2026-11-18 实测] 空行/合并/跨应用往返由既有 TSV/HTML 回归与 Excel/WPS COM 合并粘验证；公式选区 XMLSS-only 仍保留合并与公式。",
           "files": [],
           "commits": [
             "537dbe5"
@@ -4981,27 +4987,27 @@
             "SC_CMD=\"20:Paste;60:FileSave\" app.exe work/qa07/ribbon.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "SC_KEYSEQ=\"ctrl+v\" app.exe work/qa07/key.xlsx => workbook B2==B1*2, MERGE/BOLD/FILL true",
             "WPS KET.Application copy -> SC_CMD=\"20:Paste;60:FileSave\" work/qa07/wps-ribbon4.xlsx => B2==B1*2, A1V=46024, FMT=yyyy-mm-dd",
-            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved"
+            "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 xmlss_formula_uses_r1c1_for_excel_paste => 1 passed",
+            "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10",
+            "SC_SEL=0,0 SC_SEL2=1,1 SC_KEYSEQ=6:ctrl+c app.exe clip_style.xlsx => Excel/WPS D1f=5 E1f==D1*2 D1fill=65535 D1bold=True D2merge=True D2=中文"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-clipboard.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
           ],
-          "not_done": [
-            "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-            "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归",
-            "App→Excel/WPS 普通粘贴公式丢失（HTML x:fmla 不被采用，B2 为缓存值 2469）；向外公式保留未达成"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z",
-          "status_note": "随 UI-07 父项待监督复核；见 ui07-clipboard.txt。"
+          "updated_utc": "2026-11-18T07:10:00Z",
+          "status_note": "合并/跨应用往返经 Excel/WPS COM 实测；空行由既有回归覆盖。"
         }
       ],
-      "status_note": "实现与 Excel/WPS 真实 COM 往返证据已留；公式向外损失和物理交互未执行如实保留，父项不标已验收。"
+      "status_note": "公式通路已修复并验证；物理交互未执行，父项仍待验收。"
     },
     {
       "id": "UI-08",

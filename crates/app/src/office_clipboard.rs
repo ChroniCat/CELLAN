@@ -516,6 +516,27 @@ mod tests {
     }
 
     #[test]
+    fn xmlss_formula_uses_r1c1_for_excel_paste() {
+        let mut wb = sheetcore::Workbook::new_blank();
+        wb.sheets[0].set(
+            0,
+            0,
+            sheetcore::Cell { value: sheetcore::Value::Number(5.0), formula: None },
+        );
+        wb.sheets[0].set(
+            0,
+            1,
+            sheetcore::Cell { value: sheetcore::Value::Number(10.0), formula: Some("=A1*2".into()) },
+        );
+        let xml = build_xmlss(&wb, 0, (0, 0, 0, 1), &|_| "k".to_string());
+        assert!(
+            xml.contains(r#"ss:Formula="=RC[-1]*2""#),
+            "XML Spreadsheet 必须写 R1C1 公式，Excel 才会按公式粘贴: {xml}"
+        );
+        assert!(!xml.contains(r#"ss:Formula="=A1*2""#), "不能写 A1 公式");
+    }
+
+    #[test]
     fn rgb_notation() {
         assert_eq!(style_color("background-color:rgb(1,2,3)", "background-color"), Some([1, 2, 3]));
     }
@@ -667,6 +688,12 @@ pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
     }
     text_utf16.extend_from_slice(&[0, 0]);
     let html_bytes = cf_html(html);
+    // WPS 看到 HTML/UnicodeText 会优先走它们，而 HTML 的 x:fmla 不会被普通粘贴采用，
+    // 于是公式退化成缓存值。带公式的选区只给 XMLSS，让 WPS/Excel 走 R1C1 公式通路；
+    // 不带公式的选区仍保留 HTML/文本，以保住底色/合并和跨应用纯文本兜底。
+    let has_formula = xmlss.contains("ss:Formula=");
+    let include_html = !has_formula;
+    let include_text = !has_formula;
 
     const CF_UNICODETEXT: u32 = 13;
     unsafe {
@@ -701,10 +728,12 @@ pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
             put(xml_fmt, &xmlss_bytes);
         }
         let html_fmt = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
-        if html_fmt != 0 {
+        if include_html && html_fmt != 0 {
             put(html_fmt, &html_bytes);
         }
-        put(CF_UNICODETEXT, &text_utf16);
+        if include_text {
+            put(CF_UNICODETEXT, &text_utf16);
+        }
         CloseClipboard();
         ok
     }
@@ -809,10 +838,11 @@ pub fn build_xmlss(
                 sheetcore::Value::Bool(b) => ("Boolean", if *b { "1".into() } else { "0".into() }),
                 sheetcore::Value::Error(e) => ("Error", e.text().to_string()),
             };
-            // 公式按 Excel 自己的写法放在 Cell 的 ss:Formula 属性上（A1 引用），
-            // Data 里放缓存值；写成 <ss:Formula> 子元素 Excel 会拒绝粘贴。
+            // XML Spreadsheet 的 ss:Formula 是 R1C1 语法；写成 A1 Excel 会忽略公式，
+            // 只把 Data 里的缓存值粘进来。这里按当前格折成 R1C1。
             if let Some(f) = cell.formula.as_deref() {
-                let _ = write!(attrs, " ss:Formula=\"{}\"", xml_escape(f));
+                let r1c1 = sheetcore::clipboard_xmlss::a1_to_r1c1(f, r, c);
+                let _ = write!(attrs, " ss:Formula=\"{}\"", xml_escape(&r1c1));
             }
             body.push_str("<Cell");
             body.push_str(&attrs);

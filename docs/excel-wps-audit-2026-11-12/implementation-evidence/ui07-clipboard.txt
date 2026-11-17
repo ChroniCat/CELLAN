@@ -113,3 +113,20 @@ cargo test -p sheetcore --offline -j 2 --lib -- --test-threads=2 → 295 passed,
 结论：App→Excel 的普通粘贴要保留公式，必须写 XLSB（Biff12）或 OLE Embed Source；
 当前 core 只有 xlsb 读取（calamine），没有 xlsb 写入器，Biff8/XML/HTML 都不行。
 这项仍是未通过，不计入已验收。
+（2026-11-18 补充：MIME 为 XML Spreadsheet 的 `ss:Formula` R1C1 通路已打通，见第十一节；
+本节的结论只针对 Biff8/Biff12/Embed Source 原生命令。）
+
+十一、2026-11-18 公式向外修复（XML Spreadsheet 的 R1C1）
+根因：本项目 `office_clipboard::build_xmlss` 把 A1 公式直接写进 `ss:Formula`；
+       实测 Excel 只认 R1C1（`ss:Formula="=RC[-1]*2"`），A1 写法会被忽略，只粘 Data 缓存值。
+修复：`build_xmlss` 对每个公式调用 `sheetcore::clipboard_xmlss::a1_to_r1c1(f, r, c)`。
+回归：`office_clipboard::tests::xmlss_formula_uses_r1c1_for_excel_paste` 1 passed，
+     并断言 XML 不含 `ss:Formula="=A1*2"`。
+端到端（app 自身生成剪贴板，非手工 XML）：
+  SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c SC_CLIP_DUMP=work/probe/clip_app.xmlss
+  生成：<Cell ... ss:Formula="=RC[-1]*2">
+  Excel COM 直接粘贴（不经过 ClipFmt）：B2f=5 B2v=5 C2f==B2*2 C2v=10
+  WPS COM 粘贴：B2f=5 B2v=5 C2f==B2*2 C2v=10
+结论：App→Excel/WPS 普通粘贴的公式保留已打通；HTML 的 x:fmla 仍不被普通粘贴采用，
+     现在由 XML Spreadsheet 的 R1C1 承担公式通路。
+仍未验收：物理鼠标右键、物理键盘 Ctrl+V、IME 输入；以现有结论不把父项 UI-07 标已验收。

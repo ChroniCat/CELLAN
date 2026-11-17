@@ -5955,6 +5955,11 @@ impl SheetApp {
             )
         };
         let xmlss = office_clipboard::build_xmlss(&self.wb, si, (r1, c1, r2, c2), &style_key);
+        if let Ok(path) = std::env::var("SC_CLIP_DUMP") {
+            if let Err(e) = std::fs::write(&path, &xmlss) {
+                eprintln!("[clip] dump failed: {e}");
+            }
+        }
         if std::env::var("SC_CLIP_LOG").is_ok() {
             eprintln!("[clip-xmlss] {}", &xmlss[..xmlss.len().min(400)]);
         }
