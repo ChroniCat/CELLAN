@@ -7749,6 +7749,58 @@ fn keytips_reach_border_filter_and_freeze_from_tabs() {
     assert_eq!(app.wb.sheet(0).freeze, Some((1, 1)), "视图+F 应冻结 B2 以上/以左");
 }
 
+/// UI-23.1：Excel 的组内序列（如格式刷 FP）要先按 F 收窄，再按 P 执行。
+#[test]
+fn keytips_support_two_stage_sequences() {
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.keytips = true;
+    app.keytip_tab = Some(1); // 开始
+    app.keytip_prefix.clear();
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::F, false)]);
+    assert_eq!(app.keytip_prefix, "F", "F 应只收窄，不执行");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::P, false)]);
+    assert!(app.format_painter.is_some(), "FP 应执行格式刷");
+    assert!(app.keytip_prefix.is_empty());
+    assert!(!app.keytips);
+}
+
+#[test]
+fn keytips_cover_home_controls_uniquely() {
+    let app = app();
+    let tab = &app.ribbon.tabs[1];
+    fn walk(nodes: &[crate::ribbon::Node], out: &mut Vec<String>) {
+        for n in nodes {
+            use crate::ribbon::Node;
+            let ctl = match n {
+                Node::Button(c) | Node::Toggle(c) => Some(c),
+                Node::Split { ctl, .. }
+                | Node::DropDown { ctl, .. }
+                | Node::Gallery { ctl, .. }
+                | Node::ComboBox { ctl, .. }
+                | Node::EditBox { ctl, .. }
+                | Node::Slider { ctl, .. } => Some(ctl),
+                Node::Menu(m) => Some(&m.ctl),
+                Node::Box { children, .. } => { walk(children, out); None }
+                Node::Label(_) | Node::Spacer(_) | Node::Separator => None,
+            };
+            if let Some(c) = ctl {
+                if !c.action().is_empty() {
+                    out.push(c.keytip.clone().unwrap_or_default());
+                }
+            }
+        }
+    }
+    let mut keys = Vec::new();
+    for g in &tab.groups { walk(&g.children, &mut keys); }
+    assert!(keys.len() > 20, "开始页命令数 {}", keys.len());
+    assert!(keys.iter().all(|k| !k.is_empty()), "还有没 keytip 的命令");
+    let mut uniq = std::collections::HashSet::new();
+    for k in &keys { assert!(uniq.insert(k.clone()), "keytip 重复: {k}"); }
+}
+
 fn run_ctx_menu(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(

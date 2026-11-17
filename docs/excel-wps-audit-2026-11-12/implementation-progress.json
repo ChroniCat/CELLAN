@@ -7312,9 +7312,7 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png"
       ],
       "not_done": [
-        "真实物理键盘 Alt/Shift+F10/方向键/Enter 未执行，SC_KEYSEQ 为 egui 事件注入",
-        "真实鼠标在右下角单元格右键未执行，边界由 800×600 单测坐标覆盖",
-        "仅有边框/筛选/冻结三个控件配置 KeyTip，其余 Ribbon 控件字母提示未补全"
+        "真实物理键盘 Alt/Shift+F10/方向键/Enter 未执行（SC_KEYSEQ 为 egui 事件注入）；KeyTips 已按 Excel UIA AccessKey 补齐两级序列，仅剩真实输入取证。"
       ],
       "failures": [],
       "blocker": "",
@@ -7347,12 +7345,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/ctx-final.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-border-final.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-filter-final.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23-keytips-1117.md"
           ],
           "not_done": [
             "真实物理键盘 Alt/Shift+F10/方向键/Enter 未执行，SC_KEYSEQ 为 egui 事件注入",
-            "真实鼠标在右下角单元格右键未执行，边界由 800×600 单测坐标覆盖",
-            "仅有边框/筛选/冻结三个控件配置 KeyTip，其余 Ribbon 控件字母提示未补全"
+            "真实鼠标在右下角单元格右键未执行，边界由 800×600 单测坐标覆盖"
           ],
           "failures": [],
           "blocker": "",

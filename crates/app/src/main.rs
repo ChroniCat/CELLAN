@@ -1772,6 +1772,8 @@ struct SheetApp {
     keytips: bool,
     /// KeyTips 第二阶段：已选中的页签；None 表示仍在选页签
     keytip_tab: Option<usize>,
+    /// 命令级 KeyTips 已输入的前缀（Excel 的 "F" → "P" 两级序列）
+    keytip_prefix: String,
     /// Alt 上一次的按下状态（egui 没有单独的 Alt 键事件）
     alt_down: bool,
     /// 允许文字溢出到右侧空列（Excel 默认；关闭则裁剪在格子里）
@@ -2804,6 +2806,7 @@ impl SheetApp {
             fx_expanded: false,
             keytips: std::env::var("SC_KEYTIPS").is_ok(),
             keytip_tab: None,
+            keytip_prefix: String::new(),
             alt_down: false,
             show_gridlines: std::env::var("SC_VIEW_OFF").is_err(),
             show_headings: std::env::var("SC_VIEW_OFF").is_err(),
@@ -10511,8 +10514,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         };
     }
 
-    /// 当前 KeyTips 页签下所有带 keytip 的可见命令（字母 → onAction）。
-    fn keytip_actions(&self) -> Vec<(char, String)> {
+    /// 当前 KeyTips 页签下所有带 keytip 的可见命令（序列 → onAction）。
+    fn keytip_actions(&self) -> Vec<(String, String)> {
         let Some(tab) = self.keytip_tab.and_then(|i| self.ribbon.tabs.get(i)) else {
             return Vec::new();
         };
@@ -10550,23 +10553,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         let mut out = Vec::new();
         for (k, action, id) in flat {
-            let Some(ch) = k.chars().next().map(|c| c.to_ascii_uppercase()) else {
+            let k = k.to_ascii_uppercase();
+            if k.is_empty() {
                 continue;
-            };
+            }
             let st = self.ctl_state(&id);
             if !st.visible || !st.enabled || action.is_empty() {
                 continue;
             }
             // 边框拆分按钮的 keytip B 对应菜单里的“所有框线”，而不是主按钮的下框线
-            let action = if ch == 'B' && action == "BorderBottom" {
+            let action = if k == "B" && action == "BorderBottom" {
                 "BordersAll".to_string()
             } else {
                 action
             };
-            if out.iter().any(|(c, _): &(char, String)| *c == ch) {
+            if out.iter().any(|(x, _): &(String, String)| *x == k) {
                 continue;
             }
-            out.push((ch, action));
+            out.push((k, action));
         }
         out
     }
@@ -10760,44 +10764,53 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if alt_now && !self.alt_down {
             self.keytips = true;
             self.keytip_tab = None;
+            self.keytip_prefix.clear();
         }
         self.alt_down = alt_now;
         if self.keytips {
-            // Esc 逐级返回：命令级 → 页签级 → 关闭
+            // Esc 逐级返回：命令前缀 → 命令级 → 页签级 → 关闭
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                if self.keytip_tab.take().is_some() {
+                if !self.keytip_prefix.is_empty() {
+                    self.keytip_prefix.clear();
+                } else if self.keytip_tab.take().is_some() {
                     self.keytips = true;
                 } else {
                     self.keytips = false;
+                    self.keytip_prefix.clear();
                 }
             } else if ctx.input(|i| i.pointer.any_click()) {
                 self.keytips = false;
                 self.keytip_tab = None;
-            } else if let Some(tab_idx) = self.keytip_tab {
-                // 第二阶段：当前页签内按控件 keytip 直接执行命令
+                self.keytip_prefix.clear();
+            } else if self.keytip_tab.is_some() {
+                // 第二阶段：当前页签内按控件 keytip 序列执行命令。
+                // Excel 的 "F" 后面还有组内字母（如 FP），所以先按前缀收窄，
+                // 恰好命中完整序列才执行；Backspace 退回上一级。
                 let actions = self.keytip_actions();
-                let chosen = ctx.input(|i| {
-                    let m = i.modifiers;
-                    if m.alt || m.command || m.shift {
-                        return None;
-                    }
-                    actions.iter().find_map(|(ch, action)| {
-                        let key = char_to_key(*ch)?;
-                        if i.key_pressed(key) {
-                            Some(action.clone())
-                        } else {
-                            None
-                        }
-                    })
-                });
-                if let Some(action) = chosen {
-                    self.keytips = false;
-                    self.keytip_tab = None;
-                    self.ribbon_action(&action, ctx);
+                if ctx.input(|i| i.key_pressed(Key::Backspace))
+                    && !self.keytip_prefix.is_empty()
+                {
+                    self.keytip_prefix.pop();
                     return;
                 }
-                // 数字键继续支持，便于验收常用命令
-                let _ = tab_idx;
+                if let Some(ch) = pressed_key_char(ctx) {
+                    let cand = format!("{}{}", self.keytip_prefix, ch);
+                    let exact = actions
+                        .iter()
+                        .find(|(k, _)| k == &cand)
+                        .map(|(_, a)| a.clone());
+                    if let Some(action) = exact {
+                        self.keytips = false;
+                        self.keytip_tab = None;
+                        self.keytip_prefix.clear();
+                        self.ribbon_action(&action, ctx);
+                        return;
+                    }
+                    if actions.iter().any(|(k, _)| k.starts_with(&cand)) {
+                        self.keytip_prefix = cand;
+                        return;
+                    }
+                }
             } else {
                 // 第一阶段：页签字母
                 let chosen = ctx.input(|i| {
@@ -10830,6 +10843,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                         self.ribbon_tab = idx;
                         self.ribbon_collapsed = false;
                         self.keytip_tab = Some(idx);
+                        self.keytip_prefix.clear();
                     }
                 }
             }
@@ -32224,8 +32238,42 @@ fn draw_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, bd: &sheetco
 }
 
 /// 把 "alt+down" / "ctrl+s" 这类写法转成（修饰键，按键）（验收探针用）。
+fn pressed_key_char(ctx: &egui::Context) -> Option<char> {
+    if ctx.input(|i| i.modifiers.alt || i.modifiers.command || i.modifiers.shift) {
+        return None;
+    }
+    const KEYS: &[(egui::Key, char)] = &[
+        (egui::Key::A, 'A'), (egui::Key::B, 'B'), (egui::Key::C, 'C'),
+        (egui::Key::D, 'D'), (egui::Key::E, 'E'), (egui::Key::F, 'F'),
+        (egui::Key::G, 'G'), (egui::Key::H, 'H'), (egui::Key::I, 'I'),
+        (egui::Key::J, 'J'), (egui::Key::K, 'K'), (egui::Key::L, 'L'),
+        (egui::Key::M, 'M'), (egui::Key::N, 'N'), (egui::Key::O, 'O'),
+        (egui::Key::P, 'P'), (egui::Key::Q, 'Q'), (egui::Key::R, 'R'),
+        (egui::Key::S, 'S'), (egui::Key::T, 'T'), (egui::Key::U, 'U'),
+        (egui::Key::V, 'V'), (egui::Key::W, 'W'), (egui::Key::X, 'X'),
+        (egui::Key::Y, 'Y'), (egui::Key::Z, 'Z'),
+        (egui::Key::Num0, '0'), (egui::Key::Num1, '1'), (egui::Key::Num2, '2'),
+        (egui::Key::Num3, '3'), (egui::Key::Num4, '4'), (egui::Key::Num5, '5'),
+        (egui::Key::Num6, '6'), (egui::Key::Num7, '7'), (egui::Key::Num8, '8'),
+        (egui::Key::Num9, '9'),
+    ];
+    KEYS.iter()
+        .find(|(k, _)| ctx.input(|i| i.key_pressed(*k)))
+        .map(|(_, ch)| *ch)
+}
+
 fn char_to_key(ch: char) -> Option<egui::Key> {
     Some(match ch.to_ascii_uppercase() {
+        '0' => egui::Key::Num0,
+        '1' => egui::Key::Num1,
+        '2' => egui::Key::Num2,
+        '3' => egui::Key::Num3,
+        '4' => egui::Key::Num4,
+        '5' => egui::Key::Num5,
+        '6' => egui::Key::Num6,
+        '7' => egui::Key::Num7,
+        '8' => egui::Key::Num8,
+        '9' => egui::Key::Num9,
         'A' => egui::Key::A,
         'B' => egui::Key::B,
         'C' => egui::Key::C,

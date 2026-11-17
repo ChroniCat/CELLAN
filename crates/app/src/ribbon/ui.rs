@@ -347,20 +347,23 @@ fn measure(ui: &egui::Ui, text: &str, size: f32) -> f32 {
 }
 
 fn draw_keytip(ui: &egui::Ui, key: &str, rect: Rect) {
-    let Some(ch) = key.chars().next() else { return };
+    if key.is_empty() {
+        return;
+    }
     if std::env::var("SC_KEYTIP_LOG").is_ok() {
         eprintln!("[keytip] draw {key} at {rect:?}");
     }
+    let w = (key.chars().count() as f32 * 5.0 + 6.0).max(13.0);
     let b = Rect::from_min_size(
-        egui::pos2(rect.right() - 15.0, rect.top() + 2.0),
-        Vec2::new(13.0, 11.0),
+        egui::pos2(rect.right() - w - 2.0, rect.top() + 2.0),
+        Vec2::new(w, 11.0),
     );
     ui.painter()
         .rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
     ui.painter().text(
         b.center(),
         Align2::CENTER_CENTER,
-        ch.to_string(),
+        key.to_string(),
         FontId::proportional(8.5),
         Color32::WHITE,
     );
@@ -441,7 +444,9 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
     }
     if app.keytips && app.keytip_tab.is_some() && enabled {
         if let Some(k) = &c.keytip {
-            draw_keytip(ui, k, resp.inner.rect);
+            if app.keytip_prefix.is_empty() || k.starts_with(&app.keytip_prefix) {
+                draw_keytip(ui, k, resp.inner.rect);
+            }
         }
     }
     if resp.inner.double_clicked() && c.action() == "FormatPainter" {
@@ -543,7 +548,9 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
 
     if app.keytips && app.keytip_tab.is_some() && enabled {
         if let (Some(k), Some(r)) = (&ctl.keytip, keytip_rect) {
-            draw_keytip(ui, k, r);
+            if app.keytip_prefix.is_empty() || k.starts_with(&app.keytip_prefix) {
+                draw_keytip(ui, k, r);
+            }
         }
     }
     if main_clicked {

@@ -62,21 +62,21 @@
       <!-- ======================================================== 开始 -->
       <tab id="TabHome" label="开始" keytip="H">
         <group id="GroupClipboard" label="剪贴板">
-          <splitButton id="PasteSplit" size="large" sizeString="42" imageMso="Paste" label="粘贴">
-            <button id="Paste" label="粘贴" imageMso="Paste" onAction="Paste"/>
+          <splitButton id="PasteSplit" size="large" sizeString="42" imageMso="Paste" label="粘贴" keytip="V">
+            <button id="Paste" label="粘贴" imageMso="Paste" onAction="Paste" keytip="V"/>
             <menu id="PasteMenu">
               <button id="PasteSpecial" label="选择性粘贴…" onAction="PasteSpecial"/>
             </menu>
           </splitButton>
           <box boxStyle="vertical" paddingTop="0" gap="2">
-            <button id="Cut" label="剪切" imageMso="Cut" screentip="剪切（Ctrl+X）" onAction="Cut" sizeString="57"/>
+            <button id="Cut" label="剪切" imageMso="Cut" screentip="剪切（Ctrl+X）" onAction="Cut" sizeString="57" keytip="X"/>
             <splitButton id="CopySplit" sizeString="81" arrowWidth="24">
-              <button id="Copy" label="复制" imageMso="Copy" sizeString="57" screentip="复制（Ctrl+C）" onAction="Copy"/>
+              <button id="Copy" label="复制" imageMso="Copy" sizeString="57" screentip="复制（Ctrl+C）" onAction="Copy" keytip="C"/>
               <menu id="CopyMenu">
-                <button id="CopyItem" label="复制" onAction="Copy"/>
+                <button id="CopyItem" label="复制" onAction="Copy" keytip="C"/>
               </menu>
             </splitButton>
-            <button id="FormatPainter" label="格式刷" imageMso="Brush" screentip="把当前单元格的格式复制到别处" onAction="FormatPainter" sizeString="69"/>
+            <button id="FormatPainter" label="格式刷" imageMso="Brush" screentip="把当前单元格的格式复制到别处" onAction="FormatPainter" sizeString="69" keytip="FP"/>
           </box>
         </group>
 
@@ -97,7 +97,7 @@
               <splitButton id="UnderlineSplit" sizeString="39" arrowWidth="15">
                 <toggleButton id="Underline" imageMso="Underline" screentip="下划线（Ctrl+U）" onAction="Underline"/>
                 <menu id="UnderlineMenu">
-                  <button id="UnderlineItem" label="下划线" onAction="Underline"/>
+                  <button id="UnderlineItem" label="下划线" onAction="Underline" keytip="3"/>
                   <button id="DoubleUnderlineItem" label="双下划线" onAction="DoubleUnderline"/>
                 </menu>
               </splitButton>
@@ -134,7 +134,7 @@
               <splitButton id="PhoneticSplit" sizeString="39" arrowWidth="15" enabled="false">
                 <button id="PhoneticGuide" sizeString="24" imageMso="Symbol" enabled="false" screentip="显示拼音字段（尚未实现）"/>
                 <menu id="PhoneticMenu">
-                  <button id="PhoneticShow" label="显示拼音字段" enabled="false" onAction="Noop"/>
+                  <button id="PhoneticShow" label="显示拼音字段" enabled="false" onAction="Noop" keytip="G"/>
                 </menu>
               </splitButton>
             </box>
@@ -153,7 +153,7 @@
                 <toggleButton id="AlignBottom" imageMso="Bottom" screentip="底端对齐" onAction="AlignBottom"/>
               </box>
               <spacer sizeString="2"/>
-              <menu id="TextDirection" label="方向" imageMso="TextDirection" sizeString="62" screentip="文字方向">
+              <menu id="TextDirection" label="方向" imageMso="TextDirection" sizeString="62" screentip="文字方向" keytip="FQ">
                 <button id="TextVertical" label="竖排文字" imageMso="TextVerticalDraw" onAction="TextVertical"/>
                 <button id="TextRotateUp" label="逆时针旋转文字" onAction="TextRotateUp"/>
                 <button id="TextRotateDown" label="顺时针旋转文字" onAction="TextRotateDown"/>
@@ -161,7 +161,7 @@
                 <button id="TextAlignDialog" label="设置单元格对齐方式…" onAction="FormatCellsDialog"/>
               </menu>
               <spacer sizeString="18"/>
-              <toggleButton id="WrapText" label="自动换行" imageMso="Wrap" sizeString="81" screentip="自动换行" onAction="WrapText"/>
+              <toggleButton id="WrapText" label="自动换行" imageMso="Wrap" sizeString="81" screentip="自动换行" onAction="WrapText" keytip="W"/>
             </box>
             <box boxStyle="horizontal">
               <box boxStyle="horizontal">
@@ -176,9 +176,9 @@
               </box>
               <spacer sizeString="12"/>
               <splitButton id="MergeSplit" sizeString="117" arrowWidth="24">
-                <button id="MergeCenter" label="合并后居中" imageMso="Merge" sizeString="93" screentip="合并后居中" onAction="MergeCenter"/>
+                <button id="MergeCenter" label="合并后居中" imageMso="Merge" sizeString="93" screentip="合并后居中" onAction="MergeCenter" keytip="M"/>
                 <menu id="MergeMenu">
-                  <button id="MergeCenterItem" label="合并后居中" onAction="MergeCenter"/>
+                  <button id="MergeCenterItem" label="合并后居中" onAction="MergeCenter" keytip="M"/>
                   <button id="MergeCellsItem" label="合并单元格" onAction="MergeCells"/>
                   <button id="UnmergeCellsItem" label="取消合并" onAction="UnmergeCells"/>
                   <menuSeparator id="MergeSep1"/>
@@ -228,15 +228,15 @@
           <dialogBoxLauncher>
             <button id="StylesLauncher" screentip="设置单元格格式（Ctrl+1）" onAction="FormatDialogLauncher"/>
           </dialogBoxLauncher>
-          <menu id="ConditionalFormatting" label="条件格式" size="large" sizeString="53" imageMso="Cf">
+          <menu id="ConditionalFormatting" label="条件格式" size="large" sizeString="53" imageMso="Cf" keytip="L">
             <button id="ConditionalFormattingNew" label="新建规则…" onAction="ConditionalFormatting"/>
             <button id="ConditionalFormattingManage" label="管理规则…" onAction="ConditionalFormatting"/>
             <button id="CfQuick" label="快捷规则…" onAction="CfQuick"/>
           </menu>
-          <menu id="FormatAsTable" label="套用表格格式" size="large" sizeString="65" imageMso="Table">
+          <menu id="FormatAsTable" label="套用表格格式" size="large" sizeString="65" imageMso="Table" keytip="T">
             <button id="FormatAsTableNew" label="插入表格" onAction="FormatAsTable"/>
           </menu>
-          <gallery id="CellStylesGallery" label="单元格样式" sizeString="349" columns="5">
+          <gallery id="CellStylesGallery" label="单元格样式" sizeString="349" columns="5" keytip="J">
             <item id="StyleNormal" label="常规"/>
             <item id="StyleTitle" label="标题"/>
             <item id="StyleHeading" label="强调"/>
@@ -247,8 +247,8 @@
 
         <group id="GroupCells" label="单元格">
           <box boxStyle="horizontal" paddingTop="2">
-            <splitButton id="InsertSplit" size="large" sizeString="42" imageMso="Plus" label="插入">
-              <button id="InsertCells" label="插入" imageMso="Plus" onAction="InsertRow"/>
+            <splitButton id="InsertSplit" size="large" sizeString="42" imageMso="Plus" label="插入" keytip="I">
+              <button id="InsertCells" label="插入" imageMso="Plus" onAction="InsertRow" keytip="I"/>
               <menu id="InsertMenu">
                 <button id="InsertRowsItem" label="插入行" onAction="InsertRow"/>
                 <button id="InsertColumnsItem" label="插入列" onAction="InsertColumn"/>
@@ -257,8 +257,8 @@
                 <button id="InsertCellsRightItem" label="插入单元格（右移）" onAction="InsertCellsRight"/>
               </menu>
             </splitButton>
-            <splitButton id="DeleteSplit" size="large" sizeString="42" imageMso="Close" label="删除">
-              <button id="DeleteCells" label="删除" imageMso="Close" onAction="DeleteRow"/>
+            <splitButton id="DeleteSplit" size="large" sizeString="42" imageMso="Close" label="删除" keytip="D">
+              <button id="DeleteCells" label="删除" imageMso="Close" onAction="DeleteRow" keytip="D"/>
               <menu id="DeleteMenu">
                 <button id="DeleteRowsItem" label="删除行" onAction="DeleteRow"/>
                 <button id="DeleteColumnsItem" label="删除列" onAction="DeleteColumn"/>
@@ -267,8 +267,8 @@
                 <button id="DeleteCellsLeftItem" label="删除单元格（左移）" onAction="DeleteCellsLeft"/>
               </menu>
             </splitButton>
-            <splitButton id="FormatSplit" size="large" sizeString="42" imageMso="Brush" label="格式">
-              <button id="FormatCells" label="格式" imageMso="FormatCells" onAction="FormatCellsDialog"/>
+            <splitButton id="FormatSplit" size="large" sizeString="42" imageMso="Brush" label="格式" keytip="O">
+              <button id="FormatCells" label="格式" imageMso="FormatCells" onAction="FormatCellsDialog" keytip="O"/>
               <menu id="FormatMenu">
                 <button id="FormatCellsItem" label="设置单元格格式…" onAction="FormatCellsDialog"/>
                 <menuSeparator id="FormatSep1"/>
@@ -282,31 +282,31 @@
         <group id="GroupEditing" label="编辑">
           <box boxStyle="vertical" paddingTop="0" gap="2">
             <splitButton id="AutoSumSplit" sizeString="105" arrowWidth="24">
-              <button id="AutoSum" label="自动求和" imageMso="Sum" sizeString="81" screentip="对上方连续数字求和" onAction="AutoSum"/>
+              <button id="AutoSum" label="自动求和" imageMso="Sum" sizeString="81" screentip="对上方连续数字求和" onAction="AutoSum" keytip="U"/>
               <menu id="AutoSumMenu">
                 <button id="SumItem" label="求和" onAction="AutoSum"/>
                 <button id="AverageItem" label="平均值" onAction="AutoAverage"/>
                 <button id="CountItem" label="计数" onAction="AutoCount"/>
               </menu>
             </splitButton>
-            <menu id="FillMenu" label="填充" sizeString="69" imageMso="Fill" screentip="填充">
+            <menu id="FillMenu" label="填充" sizeString="69" imageMso="Fill" screentip="填充" keytip="FI">
               <button id="FillDownItem" label="向下填充" onAction="FillDown"/>
               <button id="FillRightItem" label="向右填充" onAction="FillRight"/>
             </menu>
-            <menu id="ClearMenu" label="清除" sizeString="69" imageMso="Eraser" screentip="清除">
+            <menu id="ClearMenu" label="清除" sizeString="69" imageMso="Eraser" screentip="清除" keytip="E">
               <button id="ClearAllItem" label="全部清除" onAction="ClearContent"/>
               <button id="ClearFormatsItem" label="清除格式" onAction="ClearFormat"/>
               <button id="ClearContentsItem" label="清除内容" onAction="ClearValues"/>
             </menu>
           </box>
-          <menu id="SortFilter" label="排序和筛选" size="large" sizeString="65" imageMso="Filter">
+          <menu id="SortFilter" label="排序和筛选" size="large" sizeString="65" imageMso="Filter" keytip="S">
             <button id="SortFilterAsc" label="升序" onAction="SortAscending"/>
             <button id="SortFilterDesc" label="降序" onAction="SortDescending"/>
             <button id="SortFilterCustom" label="自定义排序…" onAction="MultiSort"/>
             <menuSeparator id="SortFilterSep"/>
             <button id="SortFilterToggle" label="筛选" onAction="Filter"/>
           </menu>
-          <menu id="FindSelect" label="查找和选择" size="large" sizeString="65" imageMso="Find">
+          <menu id="FindSelect" label="查找和选择" size="large" sizeString="65" imageMso="Find" keytip="FD">
             <button id="FindItem" label="查找…" onAction="FindReplace"/>
             <button id="ReplaceItem" label="替换…" onAction="FindReplace"/>
             <button id="GotoItem" label="转到…" onAction="FindReplace"/>
@@ -314,14 +314,14 @@
         </group>
 
         <group id="GroupAddIns" label="加载项">
-          <button id="AddIns" label="加载项" size="large" sizeString="42" imageMso="Grid" enabled="false" screentip="加载项（尚未实现）" onAction="Noop"/>
+          <button id="AddIns" label="加载项" size="large" sizeString="42" imageMso="Grid" enabled="false" screentip="加载项（尚未实现）" onAction="Noop" keytip="Z1"/>
         </group>
       </tab>
 
       <!-- ======================================================== 插入 -->
       <tab id="TabInsert" label="插入" keytip="N">
         <group id="GroupHeaderFooter" label="文本">
-          <button id="InsertTextBox" label="文本框" size="large" imageMso="TextBox" screentip="在当前单元格上放一个文本框" onAction="InsertTextBox"/>
+          <button id="InsertTextBox" label="文本框" size="large" imageMso="TextBox" screentip="在当前单元格上放一个文本框" onAction="InsertTextBox" keytip="X"/>
           <box boxStyle="vertical">
             <button id="DrawTextBox" label="绘制横排文本框" imageMso="TextBoxDraw" screentip="在表格上拖出一个横排文本框" onAction="DrawTextBox" sizeString="124"/>
             <button id="EditTextBox" label="编辑文本框" imageMso="FontColor" screentip="改文字/字号/颜色/填充" onAction="EditTextBox" sizeString="124"/>
@@ -336,18 +336,18 @@
           <button id="ColumnChart" label="柱状图" size="large" imageMso="Chart" screentip="按选区插一张柱状图" onAction="ColumnChart"/>
           <box boxStyle="vertical">
             <button id="ChartManagerBtn" label="图表管理" imageMso="ChartList" onAction="ChartManager" sizeString="92"/>
-            <button id="InsertPivotTable" label="数据透视表" imageMso="Pivot" screentip="把选区做成数据透视表" onAction="InsertPivot" sizeString="92"/>
+            <button id="InsertPivotTable" label="数据透视表" imageMso="Pivot" screentip="把选区做成数据透视表" onAction="InsertPivot" sizeString="92" keytip="V"/>
           </box>
         </group>
         <group id="GroupIllustrations" label="插图">
-          <button id="InsertPicture" label="图片" size="large" imageMso="Image" onAction="InsertPicture"/>
+          <button id="InsertPicture" label="图片" size="large" imageMso="Image" onAction="InsertPicture" keytip="P"/>
         </group>
         <group id="GroupTables" label="表格">
-          <button id="InsertTable" label="表格" size="large" imageMso="Table" screentip="把选区转成表格对象" onAction="InsertTable"/>
-          <button id="InsertComment" label="批注" size="large" imageMso="Comment" onAction="InsertComment"/>
+          <button id="InsertTable" label="表格" size="large" imageMso="Table" screentip="把选区转成表格对象" onAction="InsertTable" keytip="T"/>
+          <button id="InsertComment" label="批注" size="large" imageMso="Comment" onAction="InsertComment" keytip="Z1"/>
         </group>
         <group id="GroupSymbols" label="符号">
-          <button id="InsertSymbol" label="符号" size="large" imageMso="Symbol" screentip="插入特殊符号" onAction="InsertSymbol"/>
+          <button id="InsertSymbol" label="符号" size="large" imageMso="Symbol" screentip="插入特殊符号" onAction="InsertSymbol" keytip="ZS"/>
         </group>
         <group id="GroupPivot" label="透视表">
           <box boxStyle="vertical">
@@ -356,31 +356,31 @@
           </box>
         </group>
         <group id="GroupLinks" label="链接">
-          <button id="InsertWorkbookLinks" label="链接" size="large" imageMso="WorkbookLinks" screentip="跨工作簿引用：查看、更新缓存" onAction="WorkbookLinks"/>
+          <button id="InsertWorkbookLinks" label="链接" size="large" imageMso="WorkbookLinks" screentip="跨工作簿引用：查看、更新缓存" onAction="WorkbookLinks" keytip="ZL"/>
         </group>
         <group id="GroupFilters" label="筛选器">
           <button id="InsertSlicer" label="切片器" size="large" imageMso="Filter" screentip="给当前透视表加一个可勾选的切片器" onAction="InsertSlicer"/>
         </group>
         <group id="GroupSparklines" label="迷你图">
-          <button id="SparkLine" label="折线" size="large" imageMso="SparkLine" screentip="在单元格里放一张一排数据的折线（迷你图）" onAction="SparkLine"/>
-          <button id="SparkColumn" label="柱形" size="large" imageMso="SparkColumn" screentip="在单元格里放一张一排数据的柱形（迷你图）" onAction="SparkColumn"/>
-          <button id="SparkWinLoss" label="盈亏" size="large" imageMso="SparkLoss" screentip="在单元格里放盈亏迷你图：正负一目了然" onAction="SparkWinLoss"/>
+          <button id="SparkLine" label="折线" size="large" imageMso="SparkLine" screentip="在单元格里放一张一排数据的折线（迷你图）" onAction="SparkLine" keytip="SL"/>
+          <button id="SparkColumn" label="柱形" size="large" imageMso="SparkColumn" screentip="在单元格里放一张一排数据的柱形（迷你图）" onAction="SparkColumn" keytip="SO"/>
+          <button id="SparkWinLoss" label="盈亏" size="large" imageMso="SparkLoss" screentip="在单元格里放盈亏迷你图：正负一目了然" onAction="SparkWinLoss" keytip="SW"/>
         </group>
       </tab>
 
       <!-- ======================================================== 页面布局 -->
       <tab id="TabPageLayout" label="页面布局" keytip="P">
         <group id="GroupPageSetup" label="页面设置">
-          <button id="PageOrientation" label="纸张方向" size="large" imageMso="Orientation" onAction="PageOrientation"/>
+          <button id="PageOrientation" label="纸张方向" size="large" imageMso="Orientation" onAction="PageOrientation" keytip="O"/>
           <box boxStyle="vertical">
             <button id="PaperSize" label="纸张：A4" imageMso="PaperSize" screentip="切换纸张大小" onAction="PaperSize" sizeString="110"/>
             <button id="PageMargins" label="页边距：常规" imageMso="PageLayout" screentip="在常规 / 窄 / 宽之间切换" onAction="PageMargins" sizeString="110"/>
           </box>
-          <menu id="PrintAreaMenu" label="打印区域" sizeString="72" screentip="设置或取消打印区域">
+          <menu id="PrintAreaMenu" label="打印区域" sizeString="72" screentip="设置或取消打印区域" keytip="R">
             <button id="SetPrintArea" label="设置打印区域" onAction="PrintAreaSet"/>
             <button id="ClearPrintArea" label="取消打印区域" onAction="PrintAreaClear"/>
           </menu>
-          <menu id="PageBreaksMenu" label="分隔符" sizeString="60" screentip="插入或删除分页符">
+          <menu id="PageBreaksMenu" label="分隔符" sizeString="60" screentip="插入或删除分页符" keytip="B">
             <button id="InsertPageBreak" label="插入分页符" onAction="PageBreakInsert"/>
             <button id="RemovePageBreak" label="删除分页符" onAction="PageBreakRemove"/>
           </menu>
@@ -424,8 +424,8 @@
         </group>
         <group id="GroupGridlines" label="网格线">
           <box boxStyle="vertical">
-            <toggleButton id="ViewGridlines" label="查看" onAction="ShowGridlines" sizeString="60"/>
-            <toggleButton id="PrintGridlinesToggle" label="打印" onAction="TogglePrintGridlines" sizeString="60"/>
+            <toggleButton id="ViewGridlines" label="查看" onAction="ShowGridlines" sizeString="60" keytip="YVG"/>
+            <toggleButton id="PrintGridlinesToggle" label="打印" onAction="TogglePrintGridlines" sizeString="60" keytip="YPG"/>
           </box>
         </group>
         <group id="GroupHeadings" label="标题">
@@ -450,21 +450,21 @@
         <group id="GroupFunctionLibrary" label="函数库">
           <button id="InsertFunction" label="插入函数" imageMso="Fx" onAction="InsertFunction" sizeString="72"/>
           <box boxStyle="horizontal">
-            <menu id="AutoSumMenu2" label="自动求和" sizeString="72" imageMso="Sum">
+            <menu id="AutoSumMenu2" label="自动求和" sizeString="72" imageMso="Sum" keytip="U">
               <button id="SumFn" label="求和 (SUM)" onAction="InsertFn:SUM"/>
               <button id="AvgFn" label="平均值 (AVERAGE)" onAction="InsertFn:AVERAGE"/>
               <button id="CountFn" label="计数 (COUNT)" onAction="InsertFn:COUNT"/>
               <button id="MaxFn" label="最大值 (MAX)" onAction="InsertFn:MAX"/>
               <button id="MinFn" label="最小值 (MIN)" onAction="InsertFn:MIN"/>
             </menu>
-            <menu id="RecentFnMenu" label="最近使用的函数" sizeString="96">
+            <menu id="RecentFnMenu" label="最近使用的函数" sizeString="96" keytip="R">
               <button id="FnSum" label="SUM" onAction="InsertFn:SUM"/>
               <button id="FnIf" label="IF" onAction="InsertFn:IF"/>
               <button id="FnVlookup" label="VLOOKUP" onAction="InsertFn:VLOOKUP"/>
               <button id="FnCountif" label="COUNTIF" onAction="InsertFn:COUNTIF"/>
               <button id="FnSumif" label="SUMIF" onAction="InsertFn:SUMIF"/>
             </menu>
-            <menu id="FnFinancialMenu" label="财务" sizeString="56">
+            <menu id="FnFinancialMenu" label="财务" sizeString="56" keytip="I">
               <button id="FnPmt" label="PMT" onAction="InsertFn:PMT"/>
               <button id="FnFv" label="FV" onAction="InsertFn:FV"/>
               <button id="FnPv" label="PV" onAction="InsertFn:PV"/>
@@ -472,7 +472,7 @@
               <button id="FnNpv" label="NPV" onAction="InsertFn:NPV"/>
               <button id="FnIrr" label="IRR" onAction="InsertFn:IRR"/>
             </menu>
-            <menu id="FnLogicalMenu" label="逻辑" sizeString="56">
+            <menu id="FnLogicalMenu" label="逻辑" sizeString="56" keytip="L">
               <button id="FnIf2" label="IF" onAction="InsertFn:IF"/>
               <button id="FnAnd" label="AND" onAction="InsertFn:AND"/>
               <button id="FnOr" label="OR" onAction="InsertFn:OR"/>
@@ -481,7 +481,7 @@
             </menu>
           </box>
           <box boxStyle="horizontal">
-            <menu id="FnTextMenu" label="文本" sizeString="56">
+            <menu id="FnTextMenu" label="文本" sizeString="56" keytip="T">
               <button id="FnLeft" label="LEFT" onAction="InsertFn:LEFT"/>
               <button id="FnRight" label="RIGHT" onAction="InsertFn:RIGHT"/>
               <button id="FnMid" label="MID" onAction="InsertFn:MID"/>
@@ -489,7 +489,7 @@
               <button id="FnText" label="TEXT" onAction="InsertFn:TEXT"/>
               <button id="FnConcat" label="CONCAT" onAction="InsertFn:CONCAT"/>
             </menu>
-            <menu id="FnDateMenu" label="日期和时间" sizeString="88">
+            <menu id="FnDateMenu" label="日期和时间" sizeString="88" keytip="E">
               <button id="FnToday" label="TODAY" onAction="InsertFn:TODAY"/>
               <button id="FnNow" label="NOW" onAction="InsertFn:NOW"/>
               <button id="FnDate" label="DATE" onAction="InsertFn:DATE"/>
@@ -497,7 +497,7 @@
               <button id="FnMonth" label="MONTH" onAction="InsertFn:MONTH"/>
               <button id="FnDay" label="DAY" onAction="InsertFn:DAY"/>
             </menu>
-            <menu id="FnLookupMenu" label="查找与引用" sizeString="88">
+            <menu id="FnLookupMenu" label="查找与引用" sizeString="88" keytip="O">
               <button id="FnVlookup2" label="VLOOKUP" onAction="InsertFn:VLOOKUP"/>
               <button id="FnHlookup" label="HLOOKUP" onAction="InsertFn:HLOOKUP"/>
               <button id="FnIndex" label="INDEX" onAction="InsertFn:INDEX"/>
@@ -505,7 +505,7 @@
               <button id="FnOffset" label="OFFSET" onAction="InsertFn:OFFSET"/>
               <button id="FnIndirect" label="INDIRECT" onAction="InsertFn:INDIRECT"/>
             </menu>
-            <menu id="FnMathMenu" label="数学和三角函数" sizeString="112">
+            <menu id="FnMathMenu" label="数学和三角函数" sizeString="112" keytip="G">
               <button id="FnSum2" label="SUM" onAction="InsertFn:SUM"/>
               <button id="FnRound" label="ROUND" onAction="InsertFn:ROUND"/>
               <button id="FnAbs" label="ABS" onAction="InsertFn:ABS"/>
@@ -513,7 +513,7 @@
               <button id="FnMod" label="MOD" onAction="InsertFn:MOD"/>
               <button id="FnSqrt" label="SQRT" onAction="InsertFn:SQRT"/>
             </menu>
-            <menu id="FnOtherMenu" label="其他函数" sizeString="72">
+            <menu id="FnOtherMenu" label="其他函数" sizeString="72" keytip="Q">
               <button id="FnRand" label="RAND" onAction="InsertFn:RAND"/>
               <button id="FnRow" label="ROW" onAction="InsertFn:ROW"/>
               <button id="FnColumn" label="COLUMN" onAction="InsertFn:COLUMN"/>
@@ -523,26 +523,26 @@
         </group>
         <group id="GroupFormulaAuditing" label="公式审核">
           <box boxStyle="vertical">
-            <button id="TracePrecedents" label="追踪引用单元格" imageMso="TraceIn" onAction="TracePrecedents" sizeString="132"/>
-            <button id="TraceDependents" label="追踪从属单元格" imageMso="TraceOut" onAction="TraceDependents" sizeString="132"/>
+            <button id="TracePrecedents" label="追踪引用单元格" imageMso="TraceIn" onAction="TracePrecedents" sizeString="132" keytip="P"/>
+            <button id="TraceDependents" label="追踪从属单元格" imageMso="TraceOut" onAction="TraceDependents" sizeString="132" keytip="D"/>
             <button id="RemoveArrows" label="移去箭头" imageMso="Eraser" screentip="清除追踪线" onAction="RemoveArrows" sizeString="132"/>
           </box>
           <box boxStyle="vertical">
-            <toggleButton id="ShowFormulas" label="显示公式" imageMso="FormulaView" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96"/>
+            <toggleButton id="ShowFormulas" label="显示公式" imageMso="FormulaView" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96" keytip="H"/>
             <button id="ErrorChecking" label="错误检查" imageMso="ErrorCheck" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
-            <button id="WatchWindow" label="监视窗口" imageMso="WatchPane" onAction="WatchWindow" sizeString="96"/>
+            <button id="WatchWindow" label="监视窗口" imageMso="WatchPane" onAction="WatchWindow" sizeString="96" keytip="W"/>
           </box>
         </group>
         <group id="GroupCalculation" label="计算">
-          <button id="CalculateNow" label="开始计算" size="large" imageMso="Calc" onAction="CalculateNow"/>
-          <menu id="CalcOptionsMenu" label="计算选项" sizeString="88">
+          <button id="CalculateNow" label="开始计算" size="large" imageMso="Calc" onAction="CalculateNow" keytip="B"/>
+          <menu id="CalcOptionsMenu" label="计算选项" sizeString="88" keytip="X">
             <button id="CalcAuto" label="自动" onAction="CalcAuto"/>
             <button id="CalcManual" label="手动" onAction="CalcManual"/>
           </menu>
-          <button id="CalculateSheet" label="计算工作表" imageMso="CalcSheet" onAction="CalculateSheet" sizeString="96"/>
+          <button id="CalculateSheet" label="计算工作表" imageMso="CalcSheet" onAction="CalculateSheet" sizeString="96" keytip="J"/>
         </group>
         <group id="GroupNames" label="名称">
-          <button id="NameManager" label="名称管理器" size="large" imageMso="NameTag" onAction="NameManager"/>
+          <button id="NameManager" label="名称管理器" size="large" imageMso="NameTag" onAction="NameManager" keytip="N"/>
         </group>
         <group id="GroupArea" label="区域">
           <box boxStyle="vertical">
@@ -562,8 +562,8 @@
         </group>
         <group id="GroupForecast" label="预测">
           <box boxStyle="vertical">
-            <button id="ForecastSheet" label="预测工作表" imageMso="Chart" screentip="线性回归外推到新工作表" onAction="ForecastSheet" sizeString="118"/>
-            <button id="SubtotalBtn" label="分类汇总" imageMso="Sum" screentip="按列分组插入 SUBTOTAL 小计" onAction="Subtotal" sizeString="118"/>
+            <button id="ForecastSheet" label="预测工作表" imageMso="Chart" screentip="线性回归外推到新工作表" onAction="ForecastSheet" sizeString="118" keytip="FC"/>
+            <button id="SubtotalBtn" label="分类汇总" imageMso="Sum" screentip="按列分组插入 SUBTOTAL 小计" onAction="Subtotal" sizeString="118" keytip="B"/>
           </box>
         </group>
         <group id="GroupOutline" label="分级显示">
@@ -590,16 +590,16 @@
         </group>
         <group id="GroupSortFilter" label="排序和筛选">
           <box boxStyle="vertical">
-            <button id="SortAscending" label="升序" imageMso="SortAsc" onAction="SortAscending" sizeString="100"/>
-            <button id="SortDescending" label="降序" imageMso="SortDesc" onAction="SortDescending" sizeString="100"/>
+            <button id="SortAscending" label="升序" imageMso="SortAsc" onAction="SortAscending" sizeString="100" keytip="SA"/>
+            <button id="SortDescending" label="降序" imageMso="SortDesc" onAction="SortDescending" sizeString="100" keytip="SD"/>
           </box>
           <box boxStyle="vertical">
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" keytip="F" screentip="按当前区域启用筛选" onAction="Filter" sizeString="100"/>
-            <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="100"/>
+            <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="100" keytip="SS"/>
           </box>
           <box boxStyle="vertical">
-            <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="88"/>
-            <button id="FilterReapply" label="重新应用" imageMso="FilterReapply" onAction="FilterReapply" sizeString="88"/>
+            <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="88" keytip="C"/>
+            <button id="FilterReapply" label="重新应用" imageMso="FilterReapply" onAction="FilterReapply" sizeString="88" keytip="Y"/>
           </box>
         </group>
         <group id="GroupDataTools" label="数据工具">
@@ -610,7 +610,7 @@
           <button id="DvQuick" label="验证工具…" imageMso="ValidationCircleInvalid" screentip="圈释无效数据、清除验证" onAction="DvQuick" sizeString="104"/>
           </box>
           <box boxStyle="vertical">
-            <button id="FlashFill" label="快速填充" imageMso="Fx" screentip="从示例反推规则并填充" onAction="FlashFill" sizeString="104"/>
+            <button id="FlashFill" label="快速填充" imageMso="Fx" screentip="从示例反推规则并填充" onAction="FlashFill" sizeString="104" keytip="FF"/>
             <button id="Consolidate" label="合并计算" imageMso="Consolidate" screentip="按行/列标签把多张表汇总" onAction="Consolidate" sizeString="104"/>
           </box>
         </group>
@@ -627,7 +627,7 @@
         <group id="GroupZh" label="中文简繁转换">
           <box boxStyle="vertical">
             <splitButton id="ConvertTraditionalSplit">
-              <button id="ConvertTraditional" label="简转繁" imageMso="ZhS" screentip="通用繁体；右侧箭头选地区" onAction="ConvertTraditional" sizeString="74"/>
+              <button id="ConvertTraditional" label="简转繁" imageMso="ZhS" screentip="通用繁体；右侧箭头选地区" onAction="ConvertTraditional" sizeString="74" keytip="Y2"/>
               <menu id="ConvertTraditionalMenu">
                 <button id="ToGeneric" label="通用繁体" onAction="ToGeneric"/>
                 <button id="ToTaiwan" label="台湾正体" onAction="ToTaiwan"/>
@@ -636,19 +636,19 @@
                 <button id="ZhPreview" label="预览…" onAction="ZhPreview"/>
               </menu>
             </splitButton>
-            <button id="ConvertSimplified" label="繁转简" imageMso="ZhT" screentip="把选区里的繁体转成简体" onAction="ConvertSimplified" sizeString="92"/>
+            <button id="ConvertSimplified" label="繁转简" imageMso="ZhT" screentip="把选区里的繁体转成简体" onAction="ConvertSimplified" sizeString="92" keytip="Y1"/>
           </box>
         </group>
         <group id="GroupComments" label="批注">
-          <button id="NewComment" label="新建批注" size="large" imageMso="Comment" onAction="NewComment"/>
+          <button id="NewComment" label="新建批注" size="large" imageMso="Comment" onAction="NewComment" keytip="C"/>
           <box boxStyle="vertical">
-            <button id="PrevComment" label="上一条批注" imageMso="CommentPrev" onAction="PrevComment" sizeString="104"/>
-            <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104"/>
-            <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104"/>
+            <button id="PrevComment" label="上一条批注" imageMso="CommentPrev" onAction="PrevComment" sizeString="104" keytip="V"/>
+            <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104" keytip="N"/>
+            <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104" keytip="H1"/>
           </box>
         </group>
         <group id="GroupA11y" label="辅助功能">
-          <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker"/>
+          <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker" keytip="A"/>
         </group>
         <group id="GroupInsertText" label="文本">
           <button id="RichText" label="富文本" size="large" imageMso="RichText" onAction="RichText"/>
@@ -658,7 +658,7 @@
         </group>
         <group id="GroupChanges" label="修订">
           <button id="ReviewTrackChanges" label="修订记录" size="large" imageMso="Revision" onAction="TrackChanges"/>
-          <button id="ShowChangesBtn" label="显示更改" size="large" imageMso="ShowChanges" screentip="逐条查看改动并可撤回" onAction="ShowChanges"/>
+          <button id="ShowChangesBtn" label="显示更改" size="large" imageMso="ShowChanges" screentip="逐条查看改动并可撤回" onAction="ShowChanges" keytip="G"/>
         </group>
         <group id="GroupReviewShare" label="共享">
           <button id="ReviewShare" label="共享" size="large" imageMso="Share" onAction="Share"/>
@@ -680,23 +680,23 @@
       <tab id="TabView" label="视图" keytip="W">
         <group id="GroupShow" label="显示">
           <box boxStyle="vertical">
-            <toggleButton id="ShowGridlines" label="网格线" imageMso="Grid" screentip="显示单元格之间的浅灰网格线" onAction="ShowGridlines" sizeString="96"/>
-            <toggleButton id="ShowHeadings" label="标题" imageMso="ShowHeadings" screentip="显示列标和行号" onAction="ShowHeadings" sizeString="96"/>
+            <toggleButton id="ShowGridlines" label="网格线" imageMso="Grid" screentip="显示单元格之间的浅灰网格线" onAction="ShowGridlines" sizeString="96" keytip="VG"/>
+            <toggleButton id="ShowHeadings" label="标题" imageMso="ShowHeadings" screentip="显示列标和行号" onAction="ShowHeadings" sizeString="96" keytip="VH"/>
           </box>
           <box boxStyle="vertical">
-            <toggleButton id="ShowFormulaBar" label="编辑栏" imageMso="FormulaBar" screentip="显示名称框和 fx 输入行" onAction="ShowFormulaBar" sizeString="96"/>
+            <toggleButton id="ShowFormulaBar" label="编辑栏" imageMso="FormulaBar" screentip="显示名称框和 fx 输入行" onAction="ShowFormulaBar" sizeString="96" keytip="VF"/>
             <toggleButton id="TextSpill" label="文字溢出" imageMso="TextSpill" screentip="长文本允许越过右边界（Excel 默认）；关闭则裁剪在格子里" onAction="TextSpill" sizeString="96"/>
           </box>
           <button id="ViewPrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
-            <button id="Zoom100" label="100%" imageMso="Zoom100" screentip="回到实际大小" onAction="Zoom100" sizeString="110"/>
+            <button id="Zoom100" label="100%" imageMso="Zoom100" screentip="回到实际大小" onAction="Zoom100" sizeString="110" keytip="J"/>
             <button id="ToggleFileTree" label="显示文件列表" imageMso="ViewPane" screentip="左侧文件树" onAction="ToggleFileTree" sizeString="110"/>
           </box>
         </group>
         <group id="GroupZoom" label="缩放">
           <box boxStyle="vertical">
-            <button id="ZoomDialog" label="缩放..." imageMso="ZoomDialog" onAction="ZoomDialog" sizeString="96"/>
-            <button id="ZoomToSelection" label="缩放到选定区域" imageMso="ZoomSelection" onAction="ZoomToSelection" sizeString="120"/>
+            <button id="ZoomDialog" label="缩放..." imageMso="ZoomDialog" onAction="ZoomDialog" sizeString="96" keytip="Q"/>
+            <button id="ZoomToSelection" label="缩放到选定区域" imageMso="ZoomSelection" onAction="ZoomToSelection" sizeString="120" keytip="G"/>
             <box boxStyle="horizontal">
               <button id="ZoomIn" imageMso="ZoomIn" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>
@@ -707,11 +707,11 @@
         </group>
         <group id="GroupSheetView" label="工作表视图">
           <box boxStyle="vertical">
-            <button id="ViewSwitch" label="切换工作表视图" imageMso="SheetViewSwitch" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118"/>
-            <button id="ViewKeep" label="保留" imageMso="Pin" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118"/>
-            <button id="ViewExit" label="退出" imageMso="Close" screentip="退出视图模式（不改变当前状态）" onAction="ViewExit" sizeString="118"/>
+            <button id="ViewSwitch" label="切换工作表视图" imageMso="SheetViewSwitch" screentip="列出已保存的视图" onAction="ViewSwitch" sizeString="118" keytip="VC"/>
+            <button id="ViewKeep" label="保留" imageMso="Pin" screentip="把当前缩放/冻结/选区存进当前视图" onAction="ViewKeep" sizeString="118" keytip="VK"/>
+            <button id="ViewExit" label="退出" imageMso="Close" screentip="退出视图模式（不改变当前状态）" onAction="ViewExit" sizeString="118" keytip="VE"/>
           </box>
-          <button id="ViewNew" label="新建" size="large" imageMso="NewView" screentip="新建一个工作表视图" onAction="ViewNew"/>
+          <button id="ViewNew" label="新建" size="large" imageMso="NewView" screentip="新建一个工作表视图" onAction="ViewNew" keytip="VN"/>
         </group>
         <group id="GroupWindow" label="窗口">
           <box boxStyle="vertical">
@@ -721,17 +721,17 @@
           </box>
           <box boxStyle="vertical">
             <button id="Unfreeze" label="取消冻结" imageMso="Unfreeze" onAction="Unfreeze" sizeString="96"/>
-            <button id="HideSheet" label="隐藏" imageMso="EyeOff" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96"/>
+            <button id="HideSheet" label="隐藏" imageMso="EyeOff" screentip="隐藏当前工作表" onAction="HideSheet" sizeString="96" keytip="H"/>
             <button id="UnhideSheet" label="取消隐藏" imageMso="Eye" screentip="把隐藏的工作表恢复显示" onAction="UnhideSheet" sizeString="96"/>
             <button id="CompareBooks" label="并排比较…" imageMso="Compare" screentip="选一个文件只读并排比较" onAction="CompareBooks" sizeString="104"/>
-            <toggleButton id="CompareSync" label="同步滚动" imageMso="SyncScroll" screentip="两边滚动保持同步" onAction="CompareSync" sizeString="104"/>
+            <toggleButton id="CompareSync" label="同步滚动" imageMso="SyncScroll" screentip="两边滚动保持同步" onAction="CompareSync" sizeString="104" keytip="VS"/>
           </box>
         </group>
         <group id="GroupViews" label="工作簿视图">
           <box boxStyle="vertical">
-            <toggleButton id="NormalView" label="普通" imageMso="NormalView" screentip="普通视图" onAction="NormalView" sizeString="96"/>
-            <toggleButton id="PageLayoutView" label="页面布局" imageMso="PageLayout" screentip="按打印页显示，含页边距和页眉页脚" onAction="PageLayoutView" sizeString="96"/>
-            <toggleButton id="PageBreakPreview" label="分页预览" imageMso="PageBreak" screentip="显示分页符和页码" onAction="PageBreakPreview" sizeString="96"/>
+            <toggleButton id="NormalView" label="普通" imageMso="NormalView" screentip="普通视图" onAction="NormalView" sizeString="96" keytip="L"/>
+            <toggleButton id="PageLayoutView" label="页面布局" imageMso="PageLayout" screentip="按打印页显示，含页边距和页眉页脚" onAction="PageLayoutView" sizeString="96" keytip="P"/>
+            <toggleButton id="PageBreakPreview" label="分页预览" imageMso="PageBreak" screentip="显示分页符和页码" onAction="PageBreakPreview" sizeString="96" keytip="I"/>
           </box>
         </group>
         <group id="GroupViewChanges" label="修订">
@@ -740,7 +740,7 @@
       </tab>
 
       <!-- ======================================================== 帮助 -->
-      <tab id="TabHelp" label="帮助" keytip="H">
+      <tab id="TabHelp" label="帮助" keytip="Y">
         <group id="GroupHelp" label="帮助">
           <button id="Help" label="使用说明" size="large" imageMso="Help" onAction="Help"/>
         </group>

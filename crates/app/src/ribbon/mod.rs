@@ -334,7 +334,101 @@ fn read_tab(e: &El) -> Result<Tab, String> {
     for g in e.children.iter().filter(|c| c.name == "group") {
         tab.groups.push(read_group(g)?);
     }
+    fill_missing_keytips(&mut tab);
     Ok(tab)
+}
+
+/// UI-23.1：XML 里未写 keytip 的控件补一个页签内唯一的序列。
+///
+/// Excel 的真实 AccessKey 是从 UIA 抄回来的（customUI 里显式写 keytip），
+/// 自研控件没有 Excel 对应项，才走这里。自动键从数字开头，避开显式的
+/// 单字母/多字母前缀，避免“按 P 直接执行了某个自研命令，导致 PA 永远到不了”。
+fn fill_missing_keytips(tab: &mut Tab) {
+    use std::collections::HashSet;
+    fn collect(nodes: &[Node], used: &mut HashSet<String>, first: &mut HashSet<char>) {
+        for n in nodes {
+            let ctl = match n {
+                Node::Button(c) | Node::Toggle(c) => Some(c),
+                Node::Split { ctl, .. }
+                | Node::DropDown { ctl, .. }
+                | Node::Gallery { ctl, .. }
+                | Node::ComboBox { ctl, .. }
+                | Node::EditBox { ctl, .. }
+                | Node::Slider { ctl, .. } => Some(ctl),
+                Node::Menu(m) => Some(&m.ctl),
+                Node::Box { children, .. } => {
+                    collect(children, used, first);
+                    None
+                }
+                Node::Label(_) | Node::Spacer(_) | Node::Separator => None,
+            };
+            if let Some(c) = ctl {
+                if let Some(k) = c.keytip.as_deref().filter(|k| !k.is_empty()) {
+                    let k = k.to_ascii_uppercase();
+                    if let Some(ch) = k.chars().next() {
+                        first.insert(ch);
+                    }
+                    used.insert(k);
+                }
+            }
+        }
+    }
+    fn assign(
+        nodes: &mut [Node],
+        used: &mut HashSet<String>,
+        first: &HashSet<char>,
+    ) {
+        for n in nodes {
+            let ctl = match n {
+                Node::Button(c) | Node::Toggle(c) => Some(c),
+                Node::Split { ctl, .. }
+                | Node::DropDown { ctl, .. }
+                | Node::Gallery { ctl, .. }
+                | Node::ComboBox { ctl, .. }
+                | Node::EditBox { ctl, .. }
+                | Node::Slider { ctl, .. } => Some(ctl),
+                Node::Menu(m) => Some(&mut m.ctl),
+                Node::Box { children, .. } => {
+                    assign(children, used, first);
+                    None
+                }
+                Node::Label(_) | Node::Spacer(_) | Node::Separator => None,
+            };
+            let Some(c) = ctl else { continue };
+            if c.action().is_empty() || c.keytip.as_deref().is_some_and(|k| !k.is_empty()) {
+                continue;
+            }
+            let mut picked = None;
+            let candidates = ('0'..='9').chain('A'..='Z');
+            'outer: for c1 in candidates.clone() {
+                if first.contains(&c1) {
+                    continue;
+                }
+                for c2 in ('0'..='9').chain('A'..='Z') {
+                    let key = format!("{c1}{c2}");
+                    let clash = used.iter().any(|u| {
+                        u == &key || u.starts_with(&key) || key.starts_with(u)
+                    });
+                    if !clash {
+                        picked = Some(key);
+                        break 'outer;
+                    }
+                }
+            }
+            if let Some(key) = picked {
+                c.keytip = Some(key.clone());
+                used.insert(key);
+            }
+        }
+    }
+    let mut used = HashSet::new();
+    let mut first = HashSet::new();
+    for g in &tab.groups {
+        collect(&g.children, &mut used, &mut first);
+    }
+    for g in &mut tab.groups {
+        assign(&mut g.children, &mut used, &mut first);
+    }
 }
 
 fn read_group(e: &El) -> Result<Group, String> {
