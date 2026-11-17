@@ -363,7 +363,8 @@ fn draw_view(
         return;
     }
     let size = (view.size * scale).max(3.0);
-    let pad = 2.0 * scale + view.indent as f32 * size * 0.6;
+    // Excel 的缩进单位是「3 个 0 的宽度」（不是 0.6 个字号）；差这一截会让自动换行多塞两个字
+    let pad = 2.0 * scale + view.indent as f32 * 3.0 * display::char_width('0', size);
     let mut lines_txt = if view.wrap {
         display::wrap_lines_with(&view.text, (cw - pad * 2.0).max(4.0), size, out.metric.as_deref())
     } else {
