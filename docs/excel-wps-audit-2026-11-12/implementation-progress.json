@@ -4268,12 +4268,11 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/dpi5-1.5.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/dpi5-1.5.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
           ],
           "not_done": [
-            "未在真实系统 125/150/200% 缩放或多显示器间切换验证（RDP 不可做）。",
-            "没有人工视觉基线评审（vision 服务本轮超时），只有像素差与尺寸核对。",
-            "760×420 以下的尺寸覆盖补到 640×360（无越界）；但折叠菜单弹出层不进 accesskit 树，键盘/读屏可达性未解决（转 UI-24.2）。"
+            "真实系统 125/150/200% 缩放与多显示器切换未做（RDP 不可做）；100/125/150% 的布局等比已用 SC_PPP+framebuffer 放大验证，逻辑 pane 三档一致，虽同源但仍不算真实系统 DPI。"
           ],
           "failures": [],
           "blocker": "",
@@ -5805,7 +5804,8 @@
           "commits": [],
           "commands": [],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-title.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-title.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
           ],
           "not_done": [
             "125%/150% DPI 未逐档目视"
@@ -5858,7 +5858,8 @@
           "commits": [],
           "commands": [],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-dialog.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-dialog.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
           ],
           "not_done": [
             "真实 100/125/150% DPI 未逐档目视"
