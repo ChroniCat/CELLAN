@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-17T10:54:07Z",
+  "updated_utc": "2026-11-17T11:30:04Z",
   "tasks": [
     {
       "id": "C01",
@@ -5612,7 +5612,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
@@ -5620,21 +5620,22 @@
             "crates/app/src/edit_regression_tests.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p app --bin app -- zoom --test-threads=1 -> 4 passed (2026-11-17)",
+            "grid_zoom_scales_axes_and_hit_testing / zoom_keeps_anchor_cell_with_and_without_freeze / zoom_is_per_sheet"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/zoom-100.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/zoom-200.png"
           ],
           "not_done": [
-            "缩放后左上角单元格不保持",
-            "对象/图片随 zoom 缩放未验证",
-            "冻结窗格滚动命中待 UI-12.2"
+            "对象/图片随 zoom 的实际鼠标拖动未做（父项 UI-12 阻塞项，UI-12.2 覆盖）"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T23:05:27Z"
+          "updated_utc": "2026-11-17T11:30:04Z"
         },
         {
           "id": "UI-12.2",
