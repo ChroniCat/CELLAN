@@ -8395,6 +8395,13 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                                 ui.selectable_value(&mut dlg.sort_mode, 0, "字典序");
                                 ui.selectable_value(&mut dlg.sort_mode, 1, "中文拼音");
                                 ui.selectable_value(&mut dlg.sort_mode, 2, "自定义序列");
+                                ui.add_enabled(
+                                    false,
+                                    egui::SelectableLabel::new(false, "笔画（本版本不支持）"),
+                                )
+                                .on_disabled_hover_text(
+                                    "笔画排序需要离线笔画数表（授权可分发），本版本不含；Excel/WPS 的笔画序不能拿拼音序近似",
+                                );
                             });
                     });
                     if dlg.sort_mode == 2 {
