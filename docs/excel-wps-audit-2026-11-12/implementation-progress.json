@@ -2787,12 +2787,12 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-keyboard.txt"
       ],
       "not_done": [
-        "OFFSET 语义已修复并补回归/夹具，等待监督复核；真实 GUI 键鼠交互未执行（RDP 不可用），另行留待验收"
+        "C07.1/C07.2 已验收（见 c07-review-1117.md）；C07.3 只剩真实键盘下拉操作未测（环境无交互桌面），保存侧往返已验"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核 OFFSET 语义修复（省略 height/width 继承、跨表上下文、负高度）",
-      "updated_utc": "2026-11-13T17:41:44Z",
+      "updated_utc": "2026-11-17T04:16:58Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2800,7 +2800,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "列表来源：内联、名称（本表级优先）、跨表、单值/含空白区域、动态列表（OFFSET/INDIRECT/FILTER 非空/UNIQUE/SORT）、带括号工作表名；来源按规则范围左上角平移（C2:C3 用 =$A1:$A2 时 C3 看 A2:A3）；解析失败返回配置错误而非放行。真实 xlsx 保存重开一致。",
           "files": [
             "crates/core/src/dv.rs",
@@ -2820,21 +2820,12 @@
             "cargo test -p sheetcore --offline -j 2 -- --test-threads=2 -> 80 bins / 735 passed / 0 failed / 9 ignored",
             "Excel COM 实测来源语义：scripts/excel_dv_source_probe.ps1（相对平移、OFFSET、名称、括号表名、INDIRECT）"
           ],
-          "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-refs.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-dynamic.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-offset.txt"
-          ],
-          "not_done": [
-            "OFFSET($A$1:$A$3,0,0) 省略 height/width 现继承 3 行（Excel 16.0 COM: ROWS=3）",
-            "跨表 reference 时 COUNTA($A:$A) 按公式所在表求值（COM: ROWS=2，400 被拒）",
-            "负数 height 反向展开（COM: OFFSET($A$3,0,0,-2,1)=$A$2:$A$3）",
-            "等待监督复核；真实键鼠/IME 未执行"
-          ],
+          "evidence": "implementation-evidence/c07-review-1117.md",
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-17T04:16:58Z"
         },
         {
           "id": "C07.2",
@@ -2842,7 +2833,7 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "停止/警告/信息三种样式 + 输入提示开关 + showErrorMessage 兼容策略；XML 双向与真实 xlsx 保存重开一致；信息级\"确定/取消\"，取消与 Esc 都不写入且不产生撤销记录；配置失效可见诊断。",
           "files": [
             "crates/core/src/dv.rs",
@@ -2860,21 +2851,12 @@
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 -> 247 passed",
             "GUI：信息框 确定/取消、Esc 取消不写、停止留编辑框、警告是/否/取消、配置诊断（截图见 evidence）"
           ],
-          "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-styles.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-information.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-information-cancel.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-warning.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-stop.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-prompt.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-config-error.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-dialog.png"
-          ],
+          "evidence": "implementation-evidence/c07-review-1117.md",
           "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-17T04:16:58Z"
         },
         {
           "id": "C07.3",
