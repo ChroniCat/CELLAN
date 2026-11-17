@@ -444,15 +444,23 @@ fn grid_rect(
     c1: u32,
     r2: u32,
     c2: u32,
+    off: [i64; 4],
     sx: f32,
     sy: f32,
     px: f32,
 ) -> (f32, f32, f32, f32) {
-    let x: f32 = (0..c1).map(|c| sheet.cols.size(c) * px).sum::<f32>() + sx;
-    let y_top: f32 = (0..r1).map(|r| sheet.rows.size(r) * px).sum::<f32>();
-    let w: f32 = (c1..=c2.max(c1)).map(|c| sheet.cols.size(c) * px).sum();
-    let h: f32 = (r1..=r2.max(r1)).map(|r| sheet.rows.size(r) * px).sum();
-    (x, sy - y_top - h, w, h)
+    // anchor 语义：to 是边界格（不含），from/to 各带 EMU 偏移；1px = 9525 EMU。
+    // 不用「逐格累加」——那会把 to 也画进去，图片比 Excel 宽一整列。
+    let e = |v: i64| v as f32 / 9525.0;
+    let x1 = sheet.cols.pos(c1) + e(off[0]);
+    let x2 = sheet.cols.pos(c2) + e(off[2]);
+    let t1 = sheet.rows.pos(r1) + e(off[1]);
+    let t2 = sheet.rows.pos(r2) + e(off[3]);
+    let (xa, xb) = (x1 * px + sx, x2 * px + sx);
+    let (ta, tb) = (t1 * px, t2 * px);
+    let w = (xb - xa).max(1.0);
+    let h = (tb - ta).max(1.0);
+    (xa, sy - tb, w, h)
 }
 
 const CHART_COLORS: [[u8; 3]; 6] = [
@@ -481,7 +489,7 @@ fn chart_text(out: &mut Out, x: f32, y: f32, size: f32, text: &str, color: [u8; 
 fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f32, out: &mut Out) {
     use crate::charts::ChartKind;
     let (a, b, c, d) = ch.anchor;
-    let (x, y, w, h) = grid_rect(sheet, a, b, c, d, sx, sy, px);
+    let (x, y, w, h) = grid_rect(sheet, a, b, c, d, [0; 4], sx, sy, px);
     if w < 20.0 || h < 20.0 {
         return;
     }
@@ -760,7 +768,7 @@ fn draw_objects(
             None => source.and_then(|p| crate::pic::read_part(p, &pic.part)),
         };
         let Some(bytes) = bytes else { continue };
-        let (x, y, w, h) = grid_rect(sheet, r1, c1, r2, c2, sx, sy, px);
+        let (x, y, w, h) = grid_rect(sheet, r1, c1, r2, c2, pic.off, sx, sy, px);
         let stem = Path::new(&pic.part)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())

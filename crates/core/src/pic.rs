@@ -11,6 +11,8 @@ use std::path::Path;
 pub struct Picture {
     /// 落在哪几张格上 (r1, c1, r2, c2)
     pub rect: (u32, u32, u32, u32),
+    /// from/to 的 EMU 偏移（dx1, dy1, dx2, dy2）；新插入/拖动后为 0
+    pub off: [i64; 4],
     /// zip 里的部件名，例如 xl/media/image1.jpeg；新插入的图在保存前就有稳定名字
     pub part: String,
     /// 内存里的原始字节（新插入的图；从文件读出来的图这里为空，按 part 读）
@@ -53,8 +55,31 @@ fn cell_of(chunk: &str, which: &str) -> Option<(u32, u32)> {
     Some((r, c))
 }
 
+/// anchor 里 from/to 的 colOff/rowOff（EMU）
+fn off_of(chunk: &str, which: &str) -> (i64, i64) {
+    let start = match chunk.find(&format!("<xdr:{which}")) {
+        Some(v) => v,
+        None => return (0, 0),
+    };
+    let seg = &chunk[start..];
+    let end = seg
+        .find(&format!("</xdr:{which}>"))
+        .or_else(|| seg.find(&format!("</{which}>")))
+        .unwrap_or(seg.len());
+    let body = &seg[..end];
+    let text = |key: &str| -> i64 {
+        let Some(i) = body.find(&format!("<xdr:{key}>")).or_else(|| body.find(&format!("<{key}>"))) else {
+            return 0;
+        };
+        let Some((_, rest)) = body[i..].split_once('>') else { return 0 };
+        let Some(end) = rest.find('<') else { return 0 };
+        rest[..end].trim().parse().unwrap_or(0)
+    };
+    (text("colOff"), text("rowOff"))
+}
+
 /// 从 drawing XML 里挑出图片（不含图表）
-pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, String)> {
+pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
     let mut out = Vec::new();
     // 逐个 anchor 扫：带 xdr: 前缀和不带的都要认
     for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
@@ -91,7 +116,9 @@ pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, String)> {
                                 fc + (cx / 104.0).round().max(1.0) as u32,
                             )
                         });
-                        out.push((fr, fc, tr.max(fr + 1), tc.max(fc + 1), rid));
+                        let (fx, fy) = off_of(chunk, "from");
+                        let (tx, ty) = off_of(chunk, "to");
+                        out.push((fr, fc, tr.max(fr + 1), tc.max(fc + 1), [fx, fy, tx, ty], rid));
                     }
                 }
                 from = end;
@@ -181,9 +208,10 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
         }
         let list: Vec<Picture> = parse_drawing(&drawing_xml)
             .into_iter()
-            .filter_map(|(r1, c1, r2, c2, rid)| {
+            .filter_map(|(r1, c1, r2, c2, off, rid)| {
                 draw_rels.get(&rid).map(|p| Picture {
                     rect: (r1, c1, r2, c2),
+                    off,
                     part: p.clone(),
                     data: None,
                     ext: p
@@ -222,7 +250,14 @@ mod tests {
         let v = parse_drawing(xml);
         assert_eq!(v.len(), 1);
         assert_eq!((v[0].0, v[0].1, v[0].2, v[0].3), (2, 1, 9, 4));
-        assert_eq!(v[0].4, "rId1");
+        assert_eq!(v[0].4, [0, 0, 0, 0]);
+        assert_eq!(v[0].5, "rId1");
+
+        // from/to 的 EMU 偏移要带出来：打印/屏幕靠它把图片放到 Excel 同一位置
+        let xml = r#"<xdr:wsDr xmlns:xdr="x"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>152400</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>127000</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>609600</xdr:colOff><xdr:row>9</xdr:row><xdr:rowOff>133350</xdr:rowOff></xdr:to><xdr:pic><xdr:blipFill><a:blip r:embed="rId2"/></xdr:blipFill></xdr:pic></xdr:twoCellAnchor></xdr:wsDr>"#;
+        let v = parse_drawing(xml);
+        assert_eq!(v[0].4, [152400, 127000, 609600, 133350]);
+        assert_eq!(v[0].5, "rId2");
     }
 
     #[test]

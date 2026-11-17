@@ -4723,17 +4723,18 @@
           "commits": [],
           "commands": [],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
           ],
           "not_done": [
-            "WPS PDF 未对拍（属 QA-09.3）",
-            "PDF 位图渲染目视未做",
-            "字体子集 4.4MB 未裁剪"
+            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
+            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T22:00:52Z"
+          "updated_utc": "2026-11-17T14:20:00Z"
         },
         {
           "id": "QA-09.2",
@@ -4748,16 +4749,18 @@
           "commands": [],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
           ],
           "not_done": [
-            "人工目视未做（vision 超时）",
-            "PDF 字体子集体积未优化"
+            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
+            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T22:11:17Z"
+          "updated_utc": "2026-11-17T14:20:00Z"
         },
         {
           "id": "QA-09.3",
@@ -4772,16 +4775,18 @@
           "commands": [],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09-pdf.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/qa093.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-pic-anchor-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/pdf-objects-bbox.json"
           ],
           "not_done": [
-            "人工目视未做（vision 超时）",
-            "PDF 字体子集体积未优化"
+            "人工/视觉目视未做（vision 超时）；已用 PyMuPDF 渲染 150dpi 位图做机械像素差与文字流比对",
+            "PDF 字体仍是 GB2312 子集整体嵌入（Flate 后 5.69MB），未按文档实际用字裁剪"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T22:11:17Z"
+          "updated_utc": "2026-11-17T14:20:00Z"
         }
       ]
     },

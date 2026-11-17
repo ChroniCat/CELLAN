@@ -18,6 +18,8 @@ pub struct SheetLayout {
     pub col_default: Option<f32>,
     /// 行号（0-based）→ 像素高
     pub row_heights: Vec<(u32, f32)>,
+    /// `<sheetFormatPr defaultRowHeight="14.25">` → 像素（Excel/WPS 的整表默认行高）
+    pub row_default: Option<f32>,
     /// 隐藏的列（0-based）
     pub hidden_cols: Vec<u32>,
     /// 手动隐藏的行（0-based）
@@ -151,6 +153,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
             || !lay.row_heights.is_empty()
+            || lay.row_default.is_some()
             || lay.outline_pr.is_some()
             || !lay.scenarios.is_empty()
             || !lay.ignored_errors.is_empty()
@@ -281,6 +284,17 @@ fn parse_layout(xml: &str) -> SheetLayout {
                         } else if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
                             for c in (min - 1)..max {
                                 out.col_widths.push((c, px));
+                            }
+                        }
+                    }
+                } else if name == "sheetFormatPr" {
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("defaultRowHeight") {
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if let Ok(pt) = v.parse::<f32>() {
+                                if pt > 0.0 {
+                                    out.row_default = Some(crate::layout::pt_to_px(pt));
+                                }
                             }
                         }
                     }

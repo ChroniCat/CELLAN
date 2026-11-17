@@ -760,6 +760,10 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 if let Some(w) = lay.col_default {
                     sheet.cols.set_default(w);
                 }
+                // 整表默认行高（sheetFormatPr）：不读会让每行都差 1px，打印越往下越偏
+                if let Some(h) = lay.row_default {
+                    sheet.rows.set_default(h);
+                }
                 for (c, w) in lay.col_widths.iter() {
                     sheet.cols.set(*c, *w);
                 }

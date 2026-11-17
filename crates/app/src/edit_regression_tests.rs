@@ -2212,6 +2212,7 @@ fn deleting_a_picture_is_one_undo_step_and_restores_its_anchor() {
     let png = vec![0x89u8, b'P', b'N', b'G'];
     app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
         rect: (2, 2, 6, 5),
+        off: [0; 4],
         part: "xl/media/sc0000000000000001.png".into(),
         data: Some(png),
         ext: "png".into(),
@@ -2238,6 +2239,7 @@ fn moving_a_picture_is_undoable() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
         rect: (0, 0, 3, 3),
+        off: [0; 4],
         part: "xl/media/sc0000000000000002.png".into(),
         data: Some(vec![1, 2, 3]),
         ext: "png".into(),

@@ -4508,6 +4508,14 @@ impl SheetApp {
                             }
                         }
                     }
+                    // 无界面验收：SC_EXPORT_PDF=<路径> 走与导出对话框相同的函数
+                    if let Ok(out) = std::env::var("SC_EXPORT_PDF") {
+                        let p = PathBuf::from(&out);
+                        self.export_pdf_to(&p);
+                        if std::env::var("SC_EXPORT_PDF_EXIT").is_ok() {
+                            std::process::exit(0);
+                        }
+                    }
                     if let Ok(out) = std::env::var("SC_SAVE") {
                         let target = PathBuf::from(&out);
                         // 基准沿用打开时的原文件（和另存为的语义一致），不覆盖 wb.path
@@ -7219,6 +7227,11 @@ impl SheetApp {
         else {
             return;
         };
+        self.export_pdf_to(&path);
+    }
+
+    /// 导出当前工作表为 PDF（对话框与 SC_EXPORT_PDF 共用同一条路径）
+    fn export_pdf_to(&mut self, path: &std::path::Path) {
         // PDF 用内嵌 SIL OFL 字体的常规+粗体两套（不再嵌 Windows 的 simhei.ttf）：
         // 粗体走 /F2 的真 700 字形，随包可分发。
         let regular = sheetcore::pdf::Font::parse(FONT_SANS.to_vec());
@@ -7227,16 +7240,25 @@ impl SheetApp {
             (Ok(regular), bold) => match sheetcore::print::export_pdf_pages_with_fonts(
                 &self.wb,
                 self.sheet_idx,
-                &path,
+                path,
                 regular,
                 bold,
                 self.wb.path.as_deref(),
                 None,
             ) {
-                Ok(_) => self.status = format!("已导出 {}", path.display()),
-                Err(e) => self.status = format!("导出失败：{e:#}"),
+                Ok(n) => {
+                    self.status = format!("已导出 {}", path.display());
+                    eprintln!("[pdf] 已导出 {} 页 {}", n, path.display());
+                }
+                Err(e) => {
+                    self.status = format!("导出失败：{e:#}");
+                    eprintln!("[pdf] 导出失败 {e:#}");
+                }
             },
-            (Err(e), _) => self.status = format!("导出失败：内嵌字体解析失败 {e:#}"),
+            (Err(e), _) => {
+                self.status = format!("导出失败：内嵌字体解析失败 {e:#}");
+                eprintln!("[pdf] 内嵌字体解析失败 {e:#}");
+            }
         }
     }
 
@@ -7331,6 +7353,7 @@ impl SheetApp {
                 let name = format!("图片 {}", before.len() + 1);
                 self.wb.sheet_mut(self.sheet_idx).pictures.push(sheetcore::pic::Picture {
                     rect: (r, c, r + rows, c + cols),
+                    off: [0; 4],
                     part: sheetcore::pic_write::memory_part(&bytes, &ext),
                     data: Some(bytes),
                     ext,
@@ -24014,6 +24037,16 @@ let txn = self.txn_begin(&keys);
                 gy(r)
             }
         };
+        // 图片 anchor：from/to 的 EMU 偏移要算进去，否则整块图比 Excel 偏一格宽
+        let pic_zoom = self.zoom.clamp(0.5, 2.5);
+        let pic_rect = |p: &sheetcore::pic::Picture| {
+            let (r1, c1, r2, c2) = p.rect;
+            let e = |v: i64| v as f32 / 9525.0 * pic_zoom;
+            egui::Rect::from_min_max(
+                egui::pos2(px_of(c1) + e(p.off[0]), py_of(r1) + e(p.off[1])),
+                egui::pos2(px_of(c2) + e(p.off[2]), py_of(r2) + e(p.off[3])),
+            )
+        };
         // 点击命中的反向映射：页面视图里屏幕坐标要跨过页间距找回列/行
         let col_at = |x: f32| -> u32 {
             if pg.is_some() {
@@ -25155,11 +25188,7 @@ let txn = self.txn_begin(&keys);
         // 图片（在单元格之上、图表之下）
         let pics = self.wb.sheet(self.sheet_idx).pictures.clone();
         for (i, pic) in pics.iter().enumerate() {
-            let (r1, c1, r2, c2) = pic.rect;
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(px_of(c1), py_of(r1)),
-                egui::pos2(px_of(c2), py_of(r2)),
-            );
+            let rect = pic_rect(pic);
             let clip = egui::Rect::from_min_max(
                 egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + avail.y),
@@ -25185,7 +25214,7 @@ let txn = self.txn_begin(&keys);
                         egui::Color32::WHITE,
                     );
                     if dumping {
-                        dump.push(format!("pic {} at=({},{},{},{})", pic.part, r1, c1, r2, c2));
+                        dump.push(format!("pic {} at=({},{},{},{})", pic.part, pic.rect.0, pic.rect.1, pic.rect.2, pic.rect.3));
                     }
                 }
                 None => {
@@ -25196,7 +25225,7 @@ let txn = self.txn_begin(&keys);
                         egui::StrokeKind::Inside,
                     );
                     if dumping {
-                        dump.push(format!("pic-broken {} at=({},{},{},{})", pic.part, r1, c1, r2, c2));
+                        dump.push(format!("pic-broken {} at=({},{},{},{})", pic.part, pic.rect.0, pic.rect.1, pic.rect.2, pic.rect.3));
                     }
                 }
             }
@@ -25205,11 +25234,7 @@ let txn = self.txn_begin(&keys);
         // 选中的图片：画框 + 右下角缩放柄
         if let Some(i) = self.pic_sel {
             if let Some(pic) = pics.get(i) {
-                let (r1, c1, r2, c2) = pic.rect;
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(px_of(c1), py_of(r1)),
-                    egui::pos2(px_of(c2), py_of(r2)),
-                );
+                let rect = pic_rect(pic);
                 let accent = Color32::from_rgb(64, 132, 214);
                 painter.rect_stroke(rect, 0.0, Stroke::new(1.5, accent), egui::StrokeKind::Inside);
                 let h = 6.0;
@@ -25443,11 +25468,7 @@ let txn = self.txn_begin(&keys);
                     let mut started: Option<PicDrag> = None;
                     if let Some(i) = self.pic_sel {
                         if let Some(pic) = pics.get(i) {
-                            let (r1, c1, r2, c2) = pic.rect;
-                            let r = Rect::from_min_max(
-                                egui::pos2(px_of(c1), py_of(r1)),
-                                egui::pos2(px_of(c2), py_of(r2)),
-                            );
+                            let r = pic_rect(pic);
                             if chart_handle_at(r, pos).is_some() {
                                 started = Some(PicDrag {
                                     idx: i,
@@ -25461,11 +25482,7 @@ let txn = self.txn_begin(&keys);
                     }
                     if started.is_none() {
                         for (i, pic) in pics.iter().enumerate().rev() {
-                            let (r1, c1, r2, c2) = pic.rect;
-                            let r = Rect::from_min_max(
-                                egui::pos2(px_of(c1), py_of(r1)),
-                                egui::pos2(px_of(c2), py_of(r2)),
-                            );
+                            let r = pic_rect(pic);
                             if r.contains(pos) {
                                 self.pic_sel = Some(i);
                                 started = Some(PicDrag {
@@ -25505,6 +25522,7 @@ let txn = self.txn_begin(&keys);
                         let sh = self.wb.sheet_mut(self.sheet_idx);
                         if let Some(pic) = sh.pictures.get_mut(idx) {
                             pic.rect = (r1, c1, r2, c2);
+                            pic.off = [0; 4];
                         }
                         self.status = format!(
                             "图片{} {}",
@@ -26534,11 +26552,7 @@ let txn = self.txn_begin(&keys);
                 if !chart_hit {
                     let pics = self.wb.sheet(self.sheet_idx).pictures.clone();
                     for (i, pic) in pics.iter().enumerate().rev() {
-                        let (pr1, pc1, pr2, pc2) = pic.rect;
-                        let rect = Rect::from_min_max(
-                            egui::pos2(px_of(pc1), py_of(pr1)),
-                            egui::pos2(px_of(pc2), py_of(pr2)),
-                        );
+                        let rect = pic_rect(pic);
                         if rect.contains(pos) {
                             pic_hit = true;
                             self.pic_sel = Some(i);
