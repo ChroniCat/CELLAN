@@ -528,6 +528,25 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 [90, 90, 90],
             );
         }
+        // 次坐标轴刻度：Excel 在右侧另起一套「整齐」刻度，与主轴同一取整规则
+        if has_sub {
+            let want2 = if ch.y_fmt.contains('%') { 10.0 } else { 5.0 };
+            let step2 = nice_step(max_sub / want2);
+            let n2 = ((max_sub / step2).ceil() as usize).clamp(1, 12);
+            for k in 0..=n2 {
+                let v = step2 * k as f64;
+                let txt = tick(v);
+                let frac = (v / max_sub) as f32;
+                chart_text(
+                    out,
+                    px0 + pw + 3.0,
+                    py0 + ph * frac - 2.5,
+                    7.0,
+                    &txt,
+                    [90, 90, 90],
+                );
+            }
+        }
         // 分类标签（散点用数值 X 轴，不画分类名）
         let scatter = ch
             .series

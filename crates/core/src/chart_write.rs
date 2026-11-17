@@ -59,16 +59,29 @@ pub fn chart_from_selection(
             .unwrap_or_else(|| format!("系列{}", c - c1));
         let mut cats = Vec::new();
         let mut vals = Vec::new();
+        let mut xv = Vec::new();
+        let num = |v: &crate::model::Value| -> Option<f64> {
+            match v {
+                crate::model::Value::Number(n) => Some(*n),
+                other => other.display().trim().parse::<f64>().ok(),
+            }
+        };
         for r in (r1 + 1)..=r2 {
-            if let Some(v) = sheet.get(r, c1) {
+            let cell = sheet.get(r, c1);
+            if let Some(v) = cell {
                 cats.push(v.value.display());
             }
-            if let Some(v) = sheet.get(r, c) {
-                if let crate::model::Value::Number(n) = v.value {
-                    vals.push(n);
-                } else if let Ok(n) = v.value.display().parse::<f64>() {
-                    vals.push(n);
+            let y = sheet.get(r, c).and_then(|v| num(&v.value));
+            // 散点图是 (x,y) 成对数据：X 不是数值的行整行丢弃，保证 xv/vals 一一对应；
+            // 其它图型沿用原语义（第一列当分类名，空值跳过）。
+            if kind == crate::charts::ChartKind::Scatter {
+                let x = cell.and_then(|v| num(&v.value));
+                if let (Some(x), Some(y)) = (x, y) {
+                    xv.push(x);
+                    vals.push(y);
                 }
+            } else if let Some(y) = y {
+                vals.push(y);
             }
         }
         let range_col = crate::model::col_label(c);
@@ -81,7 +94,7 @@ pub fn chart_from_selection(
             cat_ref: format!("'{}'!${}${}:${}${}", sheet_name, cat_col, r1 + 2, cat_col, r2 + 1),
             val_ref: format!("'{}'!${}${}:${}${}", sheet_name, range_col, r1 + 2, range_col, r2 + 1),
             color: None,
-            xv: Vec::new(),
+            xv,
             kind: None,
             secondary: false,
         });
@@ -188,12 +201,21 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
         if any_labels(ch) {
             out.push_str(&dlbls_xml(ch));
         }
+        // 有建模的 X（xv 与 vals 等长）就用它，否则退回分类列解析/序号
+        let xs: Vec<f64> = if !s.xv.is_empty() && s.xv.len() == s.vals.len() {
+            s.xv.clone()
+        } else {
+            s.cats
+                .iter()
+                .enumerate()
+                .map(|(k, c)| c.trim().parse::<f64>().unwrap_or(k as f64 + 1.0))
+                .collect()
+        };
         out.push_str("<c:xVal><c:numRef><c:f>");
         out.push_str(&esc(&s.cat_ref));
         out.push_str("</c:f><c:numCache><c:formatCode>General</c:formatCode>");
-        out.push_str(&format!("<c:ptCount val=\"{}\"/>", s.cats.len()));
-        for (k, c) in s.cats.iter().enumerate() {
-            let x = c.trim().parse::<f64>().unwrap_or(k as f64 + 1.0);
+        out.push_str(&format!("<c:ptCount val=\"{}\"/>", xs.len()));
+        for (k, x) in xs.iter().enumerate() {
             out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{x}</c:v></c:pt>"));
         }
         out.push_str("</c:numCache></c:numRef></c:xVal>");
