@@ -174,10 +174,14 @@ struct DataDlg {
     quote: bool,
     /// 分列：识别数字/日期（前导零保留文本）
     detect_types: bool,
+    /// 排序方向：false=按列（默认），true=按行（用光标所在行为关键字）
+    sort_by_row: bool,
     /// 分列方式：false=按分隔符，true=按固定宽度
     split_fixed: bool,
     /// 固定宽度（每列字符数，逗号分隔，如 "10,20,15"）
     widths: String,
+    /// 逐列格式（逗号分隔：常规/文本/日期/跳过），空=全常规
+    col_modes: String,
 }
 
 #[derive(Clone, Default)]
@@ -681,6 +685,22 @@ fn parse_calc_item(s: &str) -> Option<(String, Vec<(char, String)>)> {
         return None;
     }
     Some((name.to_string(), out))
+}
+
+/// 「常规,文本,日期,跳过」→ Vec<ColMode>；空串返回 None（=全部常规）
+fn parse_col_modes(s: &str) -> Option<Vec<sheetcore::data_tools::ColMode>> {
+    use sheetcore::data_tools::ColMode;
+    let mut out = Vec::new();
+    for part in s.split([',', '，']).map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        out.push(match part {
+            "常规" | "常规格式" => ColMode::General,
+            "文本" => ColMode::Text,
+            "日期" => ColMode::Date,
+            "跳过" | "不导入" => ColMode::Skip,
+            _ => return None,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// 「名称=公式」→ (名称, 公式)；公式里可以有空格，空名字/空公式返回 None。
@@ -5076,8 +5096,10 @@ impl SheetApp {
                 sort_mode: 0,
                 custom: String::new(),
                 merge_consecutive: false,
-                split_fixed: false,
+                sort_by_row: false,
+            split_fixed: false,
                 widths: String::new(),
+            col_modes: String::new(),
                 quote: true,
                 detect_types: true,
             };
@@ -5101,8 +5123,10 @@ impl SheetApp {
                 sort_mode: 0,
                 custom: String::new(),
                 merge_consecutive: false,
-                split_fixed: false,
+                sort_by_row: false,
+            split_fixed: false,
                 widths: String::new(),
+            col_modes: String::new(),
                 quote: true,
                 detect_types: true,
             };
@@ -6617,8 +6641,10 @@ impl SheetApp {
             sort_mode: 1,
             custom: "高,中,低".into(),
             merge_consecutive: true,
+            sort_by_row: false,
             split_fixed: false,
             widths: String::new(),
+            col_modes: String::new(),
             quote: true,
             detect_types: true,
         });
@@ -6633,6 +6659,32 @@ impl SheetApp {
             self.wb.sheet(self.sheet_idx), (r1, c1, r2, c2),
         ) {
             self.status = error;
+            return;
+        }
+        if dlg.sort_by_row {
+            let key_row = self.sel.0.clamp(r1, r2.max(r1));
+            let asc = dlg.keys.first().map(|(_, a, _)| *a).unwrap_or(true);
+            let txn = self.txn_begin(&sheetcore::undo::rect_keys(r1, c1, r2, c2));
+            let res = sheetcore::sort_filter::sort_region_by_row(
+                self.wb.sheet_mut(self.sheet_idx),
+                (r1, c1, r2, c2),
+                key_row,
+                asc,
+            );
+            match res {
+                Ok(()) => {
+                    self.txn_end("按行排序", txn);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    sheetcore::formula::recalc_all(&mut self.wb);
+                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                    self.status = format!("已按第 {} 行排序（重排列）", key_row + 1);
+                }
+                Err(e) => {
+                    self.undo.clear();
+                    self.status = e;
+                }
+            }
             return;
         }
         let keys: Vec<sheetcore::data_tools::SortKey> = dlg
@@ -6869,6 +6921,7 @@ impl SheetApp {
             detect_types: dlg.detect_types,
             date_system: self.wb.date_system,
             fixed_widths: fixed,
+            col_modes: parse_col_modes(&dlg.col_modes),
         };
         let dry = sheetcore::data_tools::text_to_columns_ex(
             self.wb.sheet_mut(self.sheet_idx),
@@ -8289,6 +8342,10 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             .show(ctx, |ui| {
                 if dlg.tab == 0 {
                     ui.checkbox(&mut dlg.header, "首行是标题");
+                    ui.checkbox(&mut dlg.sort_by_row, "按行排序（以光标所在行为关键字，重排各列）");
+                    if dlg.sort_by_row {
+                        ui.label(egui::RichText::new("Excel 里关键字行在「选项→按行排序」里选；这里用光标所在行代替").weak());
+                    }
                     ui.separator();
                     ui.label("按从上到下的顺序比较，可调级别：");
                     let mut up: Option<usize> = None;
@@ -8374,6 +8431,15 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         ui.checkbox(&mut dlg.quote, "引号内的分隔符不拆（\"\" 表示一个引号）");
                         ui.checkbox(&mut dlg.merge_consecutive, "连续分隔符当一个（多个空格不产生空列）");
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("列格式");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.col_modes)
+                                .desired_width(180.0)
+                                .hint_text("常规,文本,日期,跳过"),
+                        );
+                    });
+                    ui.label(egui::RichText::new("按列从左到右写：常规 / 文本 / 日期 / 跳过（跳过=该列不导入，后面的列左移）").weak());
                     ui.checkbox(&mut dlg.detect_types, "识别数字/日期（前导零保留为文本）");
                     let (r1, c1, _, _) = self.sel_rect();
                     let sample = self
@@ -8395,6 +8461,7 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                             detect_types: dlg.detect_types,
                             date_system: self.wb.date_system,
                             fixed_widths: fixed,
+                            col_modes: parse_col_modes(&dlg.col_modes),
                         };
                         let fields = sheetcore::data_tools::split_fields(&sample, &opts);
                         ui.label(
@@ -23279,8 +23346,10 @@ let txn = self.txn_begin(&keys);
                     sort_mode: 1,
                     custom: "高,中,低".into(),
                     merge_consecutive: false,
-                    split_fixed: false,
+                    sort_by_row: false,
+            split_fixed: false,
                     widths: String::new(),
+            col_modes: String::new(),
                     quote: true,
                     detect_types: true,
                 });

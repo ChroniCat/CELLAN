@@ -269,6 +269,21 @@ pub struct SplitOpts {
     pub date_system: crate::model::DateSystem,
     /// 固定宽度模式：每列占几个字符（按字符数，不按字节）；None = 按分隔符拆
     pub fixed_widths: Option<Vec<usize>>,
+    /// 逐列格式（Excel「列数据格式」）：None = 全部走 detect_types
+    pub col_modes: Option<Vec<ColMode>>,
+}
+
+/// 分列的逐列格式
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColMode {
+    /// 常规：按 detect_types 猜
+    General,
+    /// 文本：原样保留字符串（不转数字/日期）
+    Text,
+    /// 日期：能解析成日期就写序列号
+    Date,
+    /// 不导入此列：该列丢掉，后面的列左移
+    Skip,
 }
 
 impl Default for SplitOpts {
@@ -280,6 +295,7 @@ impl Default for SplitOpts {
             detect_types: true,
             date_system: crate::model::DateSystem::D1900,
             fixed_widths: None,
+            col_modes: None,
         }
     }
 }
@@ -385,7 +401,15 @@ pub fn text_to_columns_ex(
             continue;
         }
         let fields = split_fields(&text, opts);
-        report.width = report.width.max(fields.len());
+        let kept = match &opts.col_modes {
+            Some(modes) => fields
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| modes.get(*i).copied().unwrap_or(ColMode::General) != ColMode::Skip)
+                .count(),
+            None => fields.len(),
+        };
+        report.width = report.width.max(kept);
         rows.push((r, fields));
     }
     let shift = report.width.saturating_sub(1) as u32;
@@ -418,14 +442,34 @@ pub fn text_to_columns_ex(
         }
     }
     for (r, fields) in &rows {
+        let mut out_c = c1;
         for (i, f) in fields.iter().enumerate() {
-            let c = c1 + i as u32;
-            let (v, is_date) = detect_value(f, opts);
-            if is_date {
-                report.date_cells.push((*r, c));
+            let mode = opts
+                .col_modes
+                .as_ref()
+                .and_then(|m| m.get(i).copied())
+                .unwrap_or(ColMode::General);
+            if mode == ColMode::Skip {
+                continue;
             }
-            sheet.set(*r, c, Cell { value: v, formula: None });
+            let (v, is_date) = match mode {
+                ColMode::Text => (Value::Text(f.clone().into()), false),
+                ColMode::Date => {
+                    let (v, d) = detect_value(f, opts);
+                    if d {
+                        (v, true)
+                    } else {
+                        (Value::Text(f.clone().into()), false)
+                    }
+                }
+                _ => detect_value(f, opts),
+            };
+            if is_date {
+                report.date_cells.push((*r, out_c));
+            }
+            sheet.set(*r, out_c, Cell { value: v, formula: None });
             report.written += 1;
+            out_c += 1;
         }
     }
     report
@@ -440,6 +484,7 @@ pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: c
         detect_types: false,
         date_system: crate::model::DateSystem::D1900,
         fixed_widths: None,
+        col_modes: None,
     };
     text_to_columns_ex(sheet, region, &opts, false).width
 }
@@ -679,5 +724,43 @@ mod fixed_width_tests {
             ..Default::default()
         };
         assert_eq!(split_fields("AB,CD,EF", &opts), vec!["AB,", "CD,EF"]);
+    }
+}
+
+#[cfg(test)]
+mod col_mode_tests {
+    use super::*;
+    use crate::model::Cell;
+
+    fn sheet_with(line: &str) -> Sheet {
+        let mut s = Sheet::new("T");
+        s.set(0, 0, Cell { value: Value::Text(line.into()), formula: None });
+        s
+    }
+
+    #[test]
+    fn col_modes_text_date_skip() {
+        let mut s = sheet_with("00123,2024-01-02,尾巴");
+        let opts = SplitOpts {
+            delim: ',',
+            col_modes: Some(vec![ColMode::Text, ColMode::Date, ColMode::Skip]),
+            ..Default::default()
+        };
+        let rep = text_to_columns_ex(&mut s, (0, 0, 0, 0), &opts, false);
+        assert_eq!(rep.width, 2, "跳过列不计宽度");
+        assert_eq!(s.get(0, 0).unwrap().value.display(), "00123", "文本列保留前导零");
+        assert!(matches!(s.get(0, 0).unwrap().value, Value::Text(_)), "文本列是字符串");
+        assert!(matches!(s.get(0, 1).unwrap().value, Value::Number(_)), "日期列是序列号");
+        assert!(matches!(s.get(0, 2).map(|c| c.value.clone()), None | Some(Value::Empty)), "跳过列不写");
+        assert_eq!(rep.written, 2);
+    }
+
+    #[test]
+    fn col_modes_none_keeps_previous_behaviour() {
+        let mut s = sheet_with("1,2");
+        let opts = SplitOpts { delim: ',', ..Default::default() };
+        let rep = text_to_columns_ex(&mut s, (0, 0, 0, 0), &opts, false);
+        assert_eq!(rep.width, 2);
+        assert!(matches!(s.get(0, 1).unwrap().value, Value::Number(_)), "默认仍识别数字");
     }
 }

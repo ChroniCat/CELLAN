@@ -115,6 +115,118 @@ pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u3
     Ok(())
 }
 
+/// 按行排序：以 `row` 这一行的值为关键字，重排区域内的**列**（Excel 的「按行排序」）。
+///
+/// 与按列排序对称：调用方负责决定 `row` 落在数据行还是表头行。
+pub fn sort_range_by_row(
+    sheet: &mut Sheet,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    row: u32,
+    asc: bool,
+) -> Result<(), String> {
+    if c2 <= c1 {
+        return Ok(());
+    }
+    if row < r1 || row > r2 {
+        return Err("排序关键字行不在选区里".into());
+    }
+    validate_sort_region(sheet, (r1, c1, r2, c2))?;
+
+    let mut cols: Vec<(Option<(u8, f64, String)>, u32)> = Vec::new();
+    for c in c1..=c2 {
+        let k = sheet.get(row, c).and_then(|x| key_of(&x.value));
+        cols.push((k, c));
+    }
+    cols.sort_by(|a, b| match (&a.0, &b.0) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => {
+            let ord = x
+                .0
+                .cmp(&y.0)
+                .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| x.2.cmp(&y.2));
+            if asc { ord } else { ord.reverse() }
+        }
+    });
+
+    let height = (r2 - r1 + 1) as usize;
+    let mut base: Vec<(Vec<Option<Cell>>, Vec<u16>)> = Vec::with_capacity(height);
+    for c in c1..=c2 {
+        let mut col = Vec::with_capacity(height);
+        let mut st = Vec::with_capacity(height);
+        for r in r1..=r2 {
+            col.push(sheet.get(r, c).cloned());
+            st.push(sheet.style_of(r, c));
+        }
+        base.push((col, st));
+    }
+
+    for (i, (_, src)) in cols.iter().enumerate() {
+        let dst = c1 + i as u32;
+        let (col, st) = &base[(*src - c1) as usize];
+        for (j, r) in (r1..=r2).enumerate() {
+            match &col[j] {
+                Some(cell) => {
+                    let mut out = cell.clone();
+                    if *src != dst {
+                        if let Some(f) = cell.formula.as_deref() {
+                            out.formula = Some(crate::refs::translate(
+                                f,
+                                0,
+                                dst as i64 - *src as i64,
+                                &sheet.name,
+                            ).into_boxed_str());
+                        }
+                    }
+                    sheet.set(r, dst, out);
+                }
+                None => {
+                    sheet.set(r, dst, Cell::default());
+                }
+            }
+            sheet.set_style(r, dst, st[j]);
+        }
+    }
+    Ok(())
+}
+
+/// 区域第一列是不是表头列：整列都是非空文本，且右侧出现过数字（按行排序时跳过它）
+pub fn has_header_col(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
+    if c2 <= c1 {
+        return false;
+    }
+    let all_text = (r1..=r2).all(|r| {
+        matches!(
+            sheet.get(r, c1).map(|x| &x.value),
+            Some(Value::Text(t)) if !t.is_empty()
+        )
+    });
+    if !all_text {
+        return false;
+    }
+    (c1 + 1..=c2).any(|c| (r1..=r2).any(|r| matches!(sheet.get(r, c).map(|x| &x.value), Some(Value::Number(_)))))
+}
+
+/// 带表头列判断的按行排序
+pub fn sort_region_by_row(
+    sheet: &mut Sheet,
+    region: (u32, u32, u32, u32),
+    row: u32,
+    asc: bool,
+) -> Result<(), String> {
+    let (r1, c1, r2, c2) = region;
+    if has_header_col(sheet, r1, c1, r2, c2) {
+        sort_range_by_row(sheet, r1, c1 + 1, r2, c2, row, asc)
+    } else {
+        sort_range_by_row(sheet, r1, c1, r2, c2, row, asc)
+    }
+}
+
 /// 区域第一行是不是表头：整行都是非空文本，且下面出现过数字
 pub fn has_header(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
     if r2 <= r1 {
@@ -552,5 +664,36 @@ mod tests {
         let s = sheet();
         let u = unique_values(&s, (0, 0, 4, 1), 0);
         assert_eq!(u, vec!["张三", "李四", "王五", "赵六"]);
+    }
+    #[test]
+    fn sort_region_by_row_reorders_columns_and_keeps_header_col() {
+        let mut s = Sheet::new("S");
+        // A 列是行标题（文本），B..D 是数据
+        let rows = [
+            ("一月", 30.0, 10.0, 20.0),
+            ("二月", 5.0, 40.0, 15.0),
+            ("三月", 12.0, 7.0, 25.0),
+        ];
+        for (i, (label, a, b, c)) in rows.iter().enumerate() {
+            let r = i as u32;
+            s.set(r, 0, crate::model::Cell { value: Value::Text((*label).into()), formula: None });
+            s.set(r, 1, crate::model::Cell { value: Value::Number(*a), formula: None });
+            s.set(r, 2, crate::model::Cell { value: Value::Number(*b), formula: None });
+            s.set(r, 3, crate::model::Cell { value: Value::Number(*c), formula: None });
+        }
+        // 以第 3 行（r=2，值 12 / 7 / 25）为关键字升序 → 列顺序应收成 7,12,25
+        sort_region_by_row(&mut s, (0, 0, 2, 3), 2, true).unwrap();
+        let row2: Vec<String> = (0..4).map(|c| s.get(2, c).map(|x| x.value.display()).unwrap_or_default()).collect();
+        assert_eq!(row2, vec!["三月", "7", "12", "25"], "标题列不动，数据列按第 3 行升序");
+        let row0: Vec<String> = (1..4).map(|c| s.get(0, c).map(|x| x.value.display()).unwrap_or_default()).collect();
+        assert_eq!(row0, vec!["10", "30", "20"], "整列跟着移动");
+    }
+
+    #[test]
+    fn sort_region_by_row_rejects_key_row_outside() {
+        let mut s = Sheet::new("S");
+        s.set(0, 0, crate::model::Cell { value: Value::Number(1.0), formula: None });
+        s.set(0, 1, crate::model::Cell { value: Value::Number(2.0), formula: None });
+        assert!(sort_region_by_row(&mut s, (0, 0, 0, 1), 5, true).is_err());
     }
 }

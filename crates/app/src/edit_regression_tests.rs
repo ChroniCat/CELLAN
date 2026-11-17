@@ -547,7 +547,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
         app.sel_end = (1, 1);
         if multi {
-            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, split_fixed: false, widths: String::new() });
+            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new() });
         } else {
             app.do_sort(0, true);
         }
@@ -4214,8 +4214,10 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
                     merge_consecutive: false,
                     quote: false,
                     detect_types: false,
+                    sort_by_row: false,
                     split_fixed: false,
                     widths: String::new(),
+                    col_modes: String::new(),
                 })
             }),
         ),
@@ -7017,8 +7019,10 @@ fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
         merge_consecutive: false,
         quote: true,
         detect_types: true,
+        sort_by_row: false,
         split_fixed: false,
         widths: String::new(),
+        col_modes: String::new(),
     };
     app.run_split(&dlg);
     assert!(app.status.contains("覆盖"), "第一次应只预览：{}", app.status);
@@ -7088,8 +7092,10 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
         merge_consecutive: false,
         quote: false,
         detect_types: false,
+        sort_by_row: false,
         split_fixed: false,
         widths: String::new(),
+        col_modes: String::new(),
     };
     app.run_sort(&dlg);
     let order: Vec<String> = (1..=4)
@@ -10169,8 +10175,10 @@ fn run_split_fixed_width_writes_columns() {
         merge_consecutive: false,
         quote: false,
         detect_types: false,
+        sort_by_row: false,
         split_fixed: true,
         widths: "2,2".into(),
+        col_modes: String::new(),
     });
     // 第一段落回原列，后续列往右写；断点之后的剩余部分并入最后一列（Excel 语义）
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "AB");
@@ -10195,9 +10203,90 @@ fn run_split_fixed_width_rejects_bad_widths() {
         merge_consecutive: false,
         quote: false,
         detect_types: false,
+        sort_by_row: false,
         split_fixed: true,
         widths: "2,0".into(),
+        col_modes: String::new(),
     });
     assert!(a.status.contains("正整数"), "应提示宽度非法：{}", a.status);
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "ABCDEF", "非法宽度不改数据");
+}
+
+#[test]
+fn run_sort_by_row_reorders_columns() {
+    let mut a = app();
+    let data = [
+        ("一月", 30.0, 10.0, 20.0),
+        ("二月", 5.0, 40.0, 15.0),
+        ("三月", 12.0, 7.0, 25.0),
+    ];
+    for (i, (label, x, y, z)) in data.iter().enumerate() {
+        let r = i as u32;
+        a.wb.sheets[0].set(r, 0, Cell { value: Value::Text((*label).into()), formula: None });
+        a.wb.sheets[0].set(r, 1, Cell { value: Value::Number(*x), formula: None });
+        a.wb.sheets[0].set(r, 2, Cell { value: Value::Number(*y), formula: None });
+        a.wb.sheets[0].set(r, 3, Cell { value: Value::Number(*z), formula: None });
+    }
+    a.sel = (2, 0);
+    a.sel_end = (2, 3);
+    a.run_sort(&DataDlg {
+        tab: 0,
+        keys: vec![(0, true, true)],
+        header: false,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+        sort_by_row: true,
+        split_fixed: false,
+        widths: String::new(),
+        col_modes: String::new(),
+    });
+    let row2: Vec<String> = (0..4)
+        .map(|c| a.wb.sheets[0].value(2, c).display())
+        .collect();
+    assert_eq!(row2, vec!["三月", "7", "12", "25"], "status={}", a.status);
+    let row0: Vec<String> = (0..4)
+        .map(|c| a.wb.sheets[0].value(0, c).display())
+        .collect();
+    assert_eq!(row0, vec!["一月", "30", "10", "20"], "整列跟着移动");
+}
+
+#[test]
+fn parse_col_modes_reads_names() {
+    use sheetcore::data_tools::ColMode;
+    assert_eq!(
+        crate::parse_col_modes("常规,文本,日期,跳过"),
+        Some(vec![ColMode::General, ColMode::Text, ColMode::Date, ColMode::Skip])
+    );
+    assert_eq!(crate::parse_col_modes(""), None);
+    assert_eq!(crate::parse_col_modes("随便"), None);
+}
+
+#[test]
+fn run_split_skips_column_and_shifts_left() {
+    let mut a = app();
+    a.wb.sheets[0].set(0, 0, Cell { value: Value::Text("甲,乙,丙".into()), formula: None });
+    a.sel = (0, 0);
+    a.sel_end = (0, 0);
+    a.run_split(&DataDlg {
+        tab: 1,
+        keys: Vec::new(),
+        header: false,
+        delim: ",".into(),
+        sort_mode: 0,
+        custom: String::new(),
+        merge_consecutive: false,
+        quote: false,
+        detect_types: false,
+        sort_by_row: false,
+        split_fixed: false,
+        widths: String::new(),
+        col_modes: "常规,跳过,常规".into(),
+    });
+    assert_eq!(a.wb.sheets[0].value(0, 0).display(), "甲");
+    assert_eq!(a.wb.sheets[0].value(0, 1).display(), "丙", "跳过的列不占位，后面的列左移");
+    assert_eq!(a.wb.sheets[0].value(0, 2).display(), "");
 }
