@@ -81,6 +81,20 @@ pub fn view_at_value(
     overlay: Option<&Overlay>,
     value_override: Option<&Value>,
 ) -> Option<CellView> {
+    view_at_value_fit(wb, sheet, r, c, overlay, value_override, None)
+}
+
+/// 打印路径用：General 显示按单元格可用字符数（合并宽度）决定，
+/// 否则默认 8.43 列宽的长整数会在 PDF 里显示完整数字、屏幕上却是科学计数。
+pub fn view_at_value_fit(
+    wb: &Workbook,
+    sheet: &Sheet,
+    r: u32,
+    c: u32,
+    overlay: Option<&Overlay>,
+    value_override: Option<&Value>,
+    cap: Option<usize>,
+) -> Option<CellView> {
     let cell = sheet.get(r, c);
     let st: &CellStyle = wb.styles.get(sheet.style_of(r, c));
     let has_style = st.fill.is_some()
@@ -98,7 +112,10 @@ pub fn view_at_value(
     let text = if matches!(value, Value::Empty) {
         String::new()
     } else {
-        format_value(wb.date_system, &value, st)
+        match cap {
+            Some(c) => crate::style::format_value_in_fit(wb.date_system, &value, &st.format, c),
+            None => format_value(wb.date_system, &value, st),
+        }
     };
     // 富文本用纯文本兜底：逐段字体是屏幕层的富文本路径，打印暂不拆段
     let text = match sheet.rich.get(&(r, c)) {

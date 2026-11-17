@@ -1,0 +1,623 @@
+{
+  "schema": "qa01-extended-roundtrip-v1",
+  "generated_utc": "2026-11-17T15:00:30Z",
+  "fixtures": "F:\\finance-native-sheets-ready\\crates\\core\\tests\\fixtures\\qa01\\ext",
+  "fixtures_sha256": {
+    "chart.xlsx": "b88736e49fc28901a4e9276f65597a3a81e0652eca5dce58a201fa370e2e0249",
+    "page.xlsx": "db53c194eff926cb3e58a10db40651c0aeb5274bbfa22633904ba98328b61e1a",
+    "pivot.xlsx": "e769bf81dcc7cf5c091047ac10c597f2677cf1a3a710f5062fb9d6f6366727a6"
+  },
+  "core_exe": "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+  "cases": [
+    {
+      "id": "chart-excel-project-excel",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-excel\\excel-input.xlsx",
+        "sha256": "b47cf9a8c7aa2b0bd9ed6b4cba5fce1d3a6aff5c007401149d20a7e1a734e1ce",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "target": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-excel\\project-output.xlsx",
+        "sha256": "84e8a179b7897cf5cf2967adccf5fcd43a22481e167d29610e6737b14dc26b26",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-excel\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-excel\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-excel-project-excel\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "84e8a179b7897cf5cf2967adccf5fcd43a22481e167d29610e6737b14dc26b26"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "chart-wps-project-wps",
+      "source": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-wps-project-wps\\wps-input.xlsx",
+        "sha256": "e6c025b9e25cb72f64d07d7820e7021b9a0c0296baeba0187183225b0debab93",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-wps-project-wps\\project-output.xlsx",
+        "sha256": "05e1bad92e06bffaf95a708ee7988e061a20d88a4ab7884440a19e33471a6cba",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-wps-project-wps\\wps-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-wps-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-wps-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "05e1bad92e06bffaf95a708ee7988e061a20d88a4ab7884440a19e33471a6cba"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "chart-excel-project-wps",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-wps\\excel-input.xlsx",
+        "sha256": "b8a10af69a1102ef673e975c9426818052f91e90a998d1dfe5ef79d036966333",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-wps\\project-output.xlsx",
+        "sha256": "4322c9da3ff254c06bebe0acd57feb75eae43f873d5985396b90fd822ded098c",
+        "chart_objects": 1,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 54.0,
+          "print_gridlines": false
+        },
+        "chart_titles": [
+          "按部门金额"
+        ]
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-wps\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\chart-excel-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\chart-excel-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "4322c9da3ff254c06bebe0acd57feb75eae43f873d5985396b90fd822ded098c"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "page-excel-project-excel",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-excel\\excel-input.xlsx",
+        "sha256": "6c8603551ecdbe47e9885e1b35bd8f184e58697fb7b93a30cfedf58fd69e3ace",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "target": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-excel\\project-output.xlsx",
+        "sha256": "3cfce2824e2221c0794a5d4f5e1a9f54701b45fd2f1fa42838a8b59dfbd92170",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-excel\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-excel\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-excel-project-excel\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "3cfce2824e2221c0794a5d4f5e1a9f54701b45fd2f1fa42838a8b59dfbd92170"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "page-wps-project-wps",
+      "source": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-wps-project-wps\\wps-input.xlsx",
+        "sha256": "c2444438635a12b411a1620dd351718d420786a5915f34ae5370998241eafa1f",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-wps-project-wps\\project-output.xlsx",
+        "sha256": "65ec619067f45768392b5cc44068e1c93abcf1e74dcd9571ac5f089163bd1551",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-wps-project-wps\\wps-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-wps-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-wps-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "65ec619067f45768392b5cc44068e1c93abcf1e74dcd9571ac5f089163bd1551"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "page-excel-project-wps",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-wps\\excel-input.xlsx",
+        "sha256": "0fe52e42d47de2d953b20c1ffe114132d66bb946984fbe5dd93a1fed13818776",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-wps\\project-output.xlsx",
+        "sha256": "78f53921b32b6db87540d5773f63ff5129fda52c95efaa4ba5db0c0735e027d0",
+        "chart_objects": 0,
+        "pivot_tables": [],
+        "page": {
+          "orientation": 2,
+          "paper": 8,
+          "zoom": 85,
+          "print_area": "$A$1:$H$40",
+          "title_rows": "$1:$2",
+          "left_margin": 36.0,
+          "print_gridlines": true
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-wps\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\page-excel-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\page-excel-project-wps\\\\project-output.xlsx\",\"sheets\":1}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "78f53921b32b6db87540d5773f63ff5129fda52c95efaa4ba5db0c0735e027d0"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "pivot-excel-project-excel",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-excel\\excel-input.xlsx",
+        "sha256": "94315f9a750eff2ec679705018d4b6415aa521939b3727b14fc316eae7f4b845",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.4,
+          "print_gridlines": false
+        }
+      },
+      "target": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-excel\\project-output.xlsx",
+        "sha256": "7c8d3080f47ac211b0ba3376cf01848dfbb08630d8737d6dc949b4048d961f43",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.4,
+          "print_gridlines": false
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-excel\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-excel\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-excel-project-excel\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-excel-project-excel\\\\project-output.xlsx\",\"sheets\":2}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "7c8d3080f47ac211b0ba3376cf01848dfbb08630d8737d6dc949b4048d961f43"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "pivot-wps-project-wps",
+      "source": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-wps-project-wps\\wps-input.xlsx",
+        "sha256": "ac2574dda9479aa6687d14711b447294ec32686722f4eaceab93137877fde4b5",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.39999999999999,
+          "print_gridlines": false
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-wps-project-wps\\project-output.xlsx",
+        "sha256": "2b7d363bb3f862e133fc45f07510549dc02e0e410b8bac535d0420320b4baf7c",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.39999999999999,
+          "print_gridlines": false
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-wps-project-wps\\wps-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-wps-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-wps-project-wps\\\\wps-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-wps-project-wps\\\\project-output.xlsx\",\"sheets\":2}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "2b7d363bb3f862e133fc45f07510549dc02e0e410b8bac535d0420320b4baf7c"
+      },
+      "differences": [],
+      "status": "pass"
+    },
+    {
+      "id": "pivot-excel-project-wps",
+      "source": {
+        "product": "excel",
+        "version": "16.0",
+        "build": "20326.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-wps\\excel-input.xlsx",
+        "sha256": "e1277583c63c35233befa9c0b9ee041eb77bdb84b3b9fc80ee2dd22509e531a7",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.4,
+          "print_gridlines": false
+        }
+      },
+      "target": {
+        "product": "wps",
+        "version": "12.0",
+        "build": "29690.0",
+        "file": "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-wps\\project-output.xlsx",
+        "sha256": "b9e1c6e07a5968f19d7de9606eb2a5a1df7cca602b899dc9aced8ba1ddd1d05a",
+        "chart_objects": 0,
+        "pivot_tables": [
+          {
+            "sheet": "透视",
+            "name": "P1",
+            "fields": [
+              {
+                "name": "地区",
+                "orientation": 1
+              },
+              {
+                "name": "城市",
+                "orientation": 1
+              },
+              {
+                "name": "销售额",
+                "orientation": 0
+              }
+            ]
+          }
+        ],
+        "page": {
+          "orientation": 1,
+          "paper": 9,
+          "zoom": 100,
+          "print_area": "",
+          "title_rows": "",
+          "left_margin": 50.39999999999999,
+          "print_gridlines": false
+        }
+      },
+      "core": {
+        "command": [
+          "F:\\finance-native-sheets-ready\\target\\debug\\examples\\qa01_roundtrip.exe",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-wps\\excel-input.xlsx",
+          "F:\\finance-native-sheets-ready\\work\\probe\\qa01\\ext15\\pivot-excel-project-wps\\project-output.xlsx"
+        ],
+        "exit": 0,
+        "stdout": "{\"date_system\":\"D1900\",\"input\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-excel-project-wps\\\\excel-input.xlsx\",\"output\":\"F:\\\\finance-native-sheets-ready\\\\work\\\\probe\\\\qa01\\\\ext15\\\\pivot-excel-project-wps\\\\project-output.xlsx\",\"sheets\":2}\n",
+        "stderr": "",
+        "output_exists": true,
+        "output_sha256": "b9e1c6e07a5968f19d7de9606eb2a5a1df7cca602b899dc9aced8ba1ddd1d05a"
+      },
+      "differences": [],
+      "status": "pass"
+    }
+  ],
+  "status": "pass"
+}

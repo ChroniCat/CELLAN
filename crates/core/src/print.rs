@@ -350,9 +350,23 @@ fn draw_cell(
             }
         }
     }
-    let Some(view) =
-        display::view_at_value(wb, sheet, r, c, overlay.as_ref(), eff.as_ref())
-    else {
+    let cap = {
+        let c2 = sheet
+            .merge_at(r, c)
+            .map(|(_, _, _, c2)| c2)
+            .unwrap_or(c);
+        let px: f32 = (c..=c2).map(|cc| col_w(sheet, cc)).sum();
+        (((px - 5.0) / 8.0).floor().max(1.0)) as usize
+    };
+    let Some(view) = display::view_at_value_fit(
+        wb,
+        sheet,
+        r,
+        c,
+        overlay.as_ref(),
+        eff.as_ref(),
+        Some(cap),
+    ) else {
         return;
     };
     let (mut cw, mut ch) = (w, h);

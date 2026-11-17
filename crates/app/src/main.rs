@@ -18458,6 +18458,11 @@ let txn = self.txn_begin(&keys);
             }
         }
         if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
+            // UI-14.3：常规格式按当前列宽决定显示（放不下就科学计数），
+            // 宽度换算回字符数：px = 字符×8+5，再按缩放折回逻辑像素。
+            let cap = (((rect.width() / self.zoom.max(0.01)) - 5.0) / 8.0)
+                .floor()
+                .max(1.0) as usize;
             let txt = if self.show_formulas {
                 match &cell.formula {
                     Some(f) => {
@@ -18467,10 +18472,10 @@ let txn = self.txn_begin(&keys);
                             format!("={f}")
                         }
                     }
-                    None => sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format),
+                    None => sheetcore::style::format_value_fit(&cell.value, &st.format, cap),
                 }
             } else {
-                sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
+                sheetcore::style::format_value_fit(&cell.value, &st.format, cap)
             };
             if !txt.is_empty() {
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);

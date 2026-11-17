@@ -354,10 +354,132 @@ pub fn format_value_in(
     crate::formula::with_date_system(sys, || format_value(v, fmt))
 }
 
+/// Excel「常规」在列宽放不下时的显示规则（实测 Excel 16.0）：
+/// 最多 11 个字符；整数 11 位以内原样、12 位起科学计数；小数按可用宽度
+/// 四舍五入并去掉尾零；有效位不足 3 位时改科学计数；科学计数尾零同样去掉。
+pub fn general_display(n: f64, cap: usize) -> String {
+    if n == 0.0 {
+        return "0".into();
+    }
+    if !n.is_finite() {
+        return n.to_string();
+    }
+    let cap = cap.max(4);
+    let neg = n < 0.0;
+    let a = n.abs();
+    let avail = cap.saturating_sub(usize::from(neg));
+    // 用 15 位有效数字定指数，避免 log10 在 1eN 边界上的浮点误差
+    let sci = format!("{a:.15e}");
+    let (mant, exp_s) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp_s.parse().unwrap_or(0);
+    let _ = mant;
+    let exp_chars = if exp.abs() >= 100 { 5 } else { 4 }; // E+11 / E+100
+    // 列够宽时 Excel 的 11 字符上限只算数字主体，负号另占一格；
+    // 窄列（默认 8.43）则连负号一起算进总宽。
+    let sci_avail = if neg && cap < 11 { cap - 1 } else { cap };
+    let mut out;
+    if exp >= 0 {
+        let int_digits = exp as usize + 1;
+        if int_digits <= 11.min(avail) {
+            if a.fract() == 0.0 {
+                out = format!("{a:.0}");
+            } else {
+                let decimals = avail.saturating_sub(int_digits + 1);
+                out = trim_zeros(format!("{a:.decimals$}"));
+                if out.is_empty() {
+                    out = "0".into();
+                }
+            }
+        } else {
+            let mut decimals = sci_avail.saturating_sub(1 + 1 + exp_chars);
+            decimals = decimals.min(5);
+            out = sci_text(a, exp, decimals);
+            // 9.999…E+10 四舍五入后会变成 1E+11，指数要进位
+            if out.starts_with("10") {
+                out = sci_text(a, exp + 1, decimals);
+            }
+        }
+    } else {
+        let decimals_avail = avail.saturating_sub(2);
+        let leading = (-exp - 1) as usize;
+        // 固定小数至少能写出 3 位有效数字，否则 Excel 改科学计数
+        if leading + 3 <= decimals_avail {
+            let decimals = decimals_avail.min(15);
+            out = trim_zeros(format!("{a:.decimals$}"));
+            if out.is_empty() {
+                out = "0".into();
+            }
+        } else {
+            let mut decimals = sci_avail.saturating_sub(1 + 1 + exp_chars);
+            decimals = decimals.min(5);
+            out = sci_text(a, exp, decimals);
+        }
+    }
+    if neg {
+        out.insert(0, '-');
+    }
+    out
+}
+
+fn trim_zeros(mut s: String) -> String {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn sci_text(a: f64, exp: i32, decimals: usize) -> String {
+    let mant = a / 10f64.powi(exp);
+    let m = trim_zeros(format!("{mant:.decimals$}"));
+    signed_exp(&m, exp, decimals, a)
+}
+
+fn signed_exp(m: &str, exp: i32, decimals: usize, _a: f64) -> String {
+    // 四舍五入把 9.99 变 10.0 时进位（调用方还会再校正一次）
+    let mut m = m.to_string();
+    let mut exp = exp;
+    if m.starts_with("10") {
+        if let Ok(v) = m.parse::<f64>() {
+            m = trim_zeros(format!("{:.decimals$}", v / 10.0));
+            exp += 1;
+        }
+    }
+    format!("{}E{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
+}
+
+/// 带列宽上限的通用入口：只有「常规」受 cap 影响，其他格式原样走 format_value。
+pub fn format_value_in_fit(
+    sys: crate::model::DateSystem,
+    v: &crate::model::Value,
+    fmt: &str,
+    cap: usize,
+) -> String {
+    crate::formula::with_date_system(sys, || format_value_fit(v, fmt, cap))
+}
+
+pub fn format_value_fit(v: &crate::model::Value, fmt: &str, cap: usize) -> String {
+    use crate::model::Value;
+    if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
+        return match v {
+            Value::Number(n) => general_display(*n, cap),
+            other => other.display(),
+        };
+    }
+    format_value(v, fmt)
+}
+
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     use crate::model::Value;
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
-        return v.display();
+        return match v {
+            Value::Number(n) => general_display(*n, 11),
+            other => other.display(),
+        };
     }
     // Excel 的内建 14 号格式是「系统区域短日期」，不同机器显示不同；
     // 读盘时它被还原成 mm-dd-yy，这里按系统设置换成本机的写法（和 Excel 一致）。
@@ -1101,6 +1223,49 @@ fn format_date_in(sys: crate::model::DateSystem, serial: f64, fmt: &str) -> Opti
 mod tests {
     use super::*;
     use crate::model::Value;
+
+    #[test]
+    fn general_matches_excel_width_measurements() {
+        // Excel 16.0 实测：宽列（cap 11）与默认列宽 8.43（cap 8）
+        let wide: &[(f64, &str)] = &[
+            (1.0, "1"),
+            (1234567890.0, "1234567890"),
+            (12345678901.0, "12345678901"),
+            (123456789012.0, "1.23457E+11"),
+            (0.1, "0.1"),
+            (1234.5678, "1234.5678"),
+            (0.000012345, "0.000012345"),
+            (1.23456789012, "1.23456789"),
+            (-123456789012.0, "-1.23457E+11"),
+            (100000000000.0, "1E+11"),
+            (99999999999.0, "99999999999"),
+        ];
+        for (v, want) in wide {
+            assert_eq!(&general_display(*v, 11), want, "wide {v}");
+        }
+        let narrow: &[(f64, &str)] = &[
+            (1234567890.0, "1.23E+09"),
+            (12345678901.0, "1.23E+10"),
+            (123456789012.0, "1.23E+11"),
+            (1234.5678, "1234.568"),
+            (0.000012345, "1.23E-05"),
+            (1.23456789012, "1.234568"),
+            (-123456789012.0, "-1.2E+11"),
+            (100000000000.0, "1E+11"),
+            (99999999999.0, "1E+11"),
+        ];
+        for (v, want) in narrow {
+            assert_eq!(&general_display(*v, 8), want, "narrow {v}");
+        }
+    }
+
+    #[test]
+    fn general_fit_is_ignored_for_explicit_formats() {
+        let n = |v: f64| Value::Number(v);
+        assert_eq!(format_value_fit(&n(1234.5), "0.00", 8), "1234.50");
+        assert_eq!(format_value_fit(&n(123456789012.0), "", 8), "1.23E+11");
+        assert_eq!(format_value_fit(&n(123456789012.0), "General", 11), "1.23457E+11");
+    }
 
     #[test]
     fn four_section_and_accounting_formats() {

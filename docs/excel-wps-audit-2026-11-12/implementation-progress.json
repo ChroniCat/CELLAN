@@ -1154,8 +1154,8 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "扩展夹具 chart/table/page/metadata/pivot 全部存在且在 manifest 登记；三方往返 9/9 pass、差异为 0；特性矩阵 5 夹具 × Excel/WPS 意外差异 0、已登记损失 0；实跑 JSON 与口径说明归档。",
           "files": [
             "scripts/qa01_extended_roundtrip.py",
             "scripts/qa01_pivot_fixture.ps1",
@@ -1205,7 +1205,9 @@
             "cargo test -p sheetcore（--test-threads=2）-> 106 个测试二进制 0 failed",
             "powershell -File scripts/qa01_smartart_probe.ps1 smartart.xlsx Excel.Application -> nodes=5 texts:节点一|节点二; Box3D depth:30 rotX:25 rotY:15",
             "load+save 后 diagrams/*.xml 与 drawing1.xml 逐字节一致",
-            "WPS 对源文件与产物的 SmartArt 读数相同（nodes:1 default）—— WPS 读取端限制"
+            "WPS 对源文件与产物的 SmartArt 读数相同（nodes:1 default）—— WPS 读取端限制",
+            "python scripts/qa01_extended_roundtrip.py --kinds chart,page,pivot -> 9 cases pass / 0 differences",
+            "uv run --with pywin32 python scripts/qa01_matrix_runner.py --only table-ext,metadata-ext,page-ext,chart-ext,pivot-ext -> entries=5 with_diffs=0"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
@@ -1225,15 +1227,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-shapes/shapes-wps-rt.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart-3d.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-excel-source.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-wps-rt.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-smartart/smartart-wps-rt.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-ext-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-1117-roundtrip.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01/qa01-ext-1117-matrix.json"
           ],
-          "not_done": [
-            "扩展夹具已建立（fixtures/qa01/ext/ 下 chart/table/page/metadata/pivot 均存在，manifest 逐条登记）；.xls 结构性对象（CF/DV/表格/名称/冻结/隐藏）与填充/边框颜色不保留属既定口径；WPS 读不出 Excel SmartArt 节点为对方限制（源文件同样如此）。剩余：把实跑 diff 结果与合同口径说明一起归档。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "图形与 SmartArt 已覆盖；余下只有 .xls 口径与 WPS SmartArt 读取限制两条说明项。",
-          "updated_utc": "2026-11-16T22:11:54Z"
+          "next": "",
+          "updated_utc": "2026-11-17T17:10:00Z"
         }
       ]
     },
@@ -5969,14 +5972,18 @@
             "crates/core/src/patch.rs",
             "crates/core/src/xls_write.rs",
             "crates/core/src/merges.rs",
-            "crates/core/src/xls_layout.rs"
+            "crates/core/src/xls_layout.rs",
+            "crates/core/src/style.rs",
+            "crates/app/src/main.rs"
           ],
           "commits": [],
           "commands": [
             "cargo test -q -p sheetcore --offline -j 2 -> CORE_EXIT=0 (115 bins)",
             "cargo test -q -p app --bin app -- --test-threads=1 -> APP_EXIT=0 (378 passed / 1 ignored)",
             "powershell work/probe/read_widths.ps1 -Path widths_out2.xlsx -> 9 列宽度与输入逐列相同",
-            "SC_AUTOFIT=c:{0,1,2} SC_AUTOFIT_SAVE=... -> Excel 读回 41.5 / 27.63（Excel AutoFit 41.5 / 27.63）"
+            "SC_AUTOFIT=c:{0,1,2} SC_AUTOFIT_SAVE=... -> Excel 读回 41.5 / 27.63（Excel AutoFit 41.5 / 27.63）",
+            "cargo test -p sheetcore --lib -- style::tests::general -> 2 passed",
+            "SC_AUTOFIT=c:0 -> 1.23457E+14 len=11 chars=10.65（Excel 同值 10.63 字符）"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
@@ -5984,16 +5991,17 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row1.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row2.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-widths.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-widths.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-3-general-1117.md"
           ],
           "not_done": [
-            "长整数 General：Excel 显示 1.23E+11 并按 ~11 字符定宽，本程序显示完整数字，AutoFit 宽 5.9 字符",
-            "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数"
+            "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数",
+            "AutoFit 后 px→char 保存口径与 Excel 逐字符对拍未做（显示文本与量宽字符数已对）"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-17T13:40:00Z"
+          "updated_utc": "2026-11-17T16:55:00Z"
         }
       ]
     },
