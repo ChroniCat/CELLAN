@@ -2893,7 +2893,9 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-keyboard.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-keyboard-picked.png"
           ],
-          "not_done": [],
+          "not_done": [
+            "真实物理键盘 Alt+↓/↑↓/Enter/Esc 与 Ctrl+S 未做（本机无交互桌面，SC_KEYSEQ 为 egui 事件注入，不算物理键盘）"
+          ],
           "failures": [],
           "blocker": "",
           "next": "",
@@ -7383,7 +7385,7 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮有测试，未做真实键盘复核）；UI-24.2 已外部 UIA 实测（按钮/对话框/编辑框/下拉/画廊/标签条/网格）；UI-24.3 实施中（SelectionItemPattern、合并/冻结/隐藏语义已 UIA 实测；选中事件因环境不投递 UIA 事件未观测）。"
+        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮有测试，未做真实键盘复核）；UI-24.2 已外部 UIA 实测（按钮/对话框/编辑框/下拉/画廊/标签条/网格）；UI-24.3 已验收（SelectionItemPattern、合并/冻结/隐藏语义 + 24 条真实 ElementSelected 事件）。"
       ],
       "failures": [],
       "blocker": "",
