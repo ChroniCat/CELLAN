@@ -93,6 +93,8 @@ struct XfRec {
     borders: [u8; 4],
     /// 四条边的颜色（RGB），顺序同上
     border_colors: [[u8; 3]; 4],
+    /// XF 保护位 bit0（true=锁定）
+    locked: bool,
 }
 
 /// 调色板索引 → RGB（BIFF8 默认 56 色；64=自动，其他越界按黑）
@@ -278,6 +280,7 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
                     },
                     halign: xf.halign,
                     wrap: xf.wrap,
+                    locked: xf.locked,
                     ..Default::default()
                 };
                 for (i, code) in xf.borders.iter().enumerate() {
@@ -304,6 +307,7 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
                         && st.valign == 0
                         && !st.wrap
                         && st.format.is_empty()
+                        && st.locked
                         && st.fill.is_none()
                         && st.border.iter().all(|b| b.style == 0);
                     if same {
@@ -409,6 +413,7 @@ fn parse_xf(b: &[u8]) -> Option<XfRec> {
         palette_rgb(color(b[14])),
         palette_rgb(color(b[13])),
     ];
+    let locked = u16le(b, 4).unwrap_or(1) & 0x0001 != 0;
     Some(XfRec {
         font: ifnt,
         format: ifmt,
@@ -416,6 +421,7 @@ fn parse_xf(b: &[u8]) -> Option<XfRec> {
         wrap,
         borders,
         border_colors,
+        locked,
     })
 }
 

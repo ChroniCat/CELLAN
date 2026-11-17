@@ -169,6 +169,8 @@ struct XfKey {
     wrap: bool,
     borders: [u8; 4],
     fill: Option<u8>,
+    /// UI-15.2：XF 的保护位 bit0=locked（受保护表里未锁定的格子要能编辑）
+    locked: bool,
 }
 
 /// FORMULA 记录里的 8 字节缓存值（MS-XLS Xnum）；文本还要跟一条 STRING 记录。
@@ -321,6 +323,7 @@ impl Tables {
                 biff_border(st.border[3].style),
             ],
             fill: st.fill.map(near_index),
+            locked: st.locked,
         };
         if let Some(id) = self.xf_ids.get(&key) {
             return *id;
@@ -373,7 +376,7 @@ fn xf_record(x: &XfKey) -> Vec<u8> {
     let mut b = vec![0u8; 20];
     b[0..2].copy_from_slice(&x.font.to_le_bytes());
     b[2..4].copy_from_slice(&x.format.to_le_bytes());
-    b[4..6].copy_from_slice(&w16(1)); // flags: locked
+    b[4..6].copy_from_slice(&w16(if x.locked { 1 } else { 0 })); // bit0 locked
     b[6] = (x.halign & 0x07) | if x.wrap { 0x08 } else { 0 };
     b[9] = 0x20;
     // 线型：byte10 低四位=左、高四位=下；byte11 低四位=右、高四位=上

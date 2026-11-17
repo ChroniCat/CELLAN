@@ -6096,7 +6096,8 @@
             "crates/core/src/xls_write.rs",
             "crates/core/src/xls_read.rs",
             "crates/core/src/protection.rs",
-            "crates/core/tests/ui152_xls_protect.rs"
+            "crates/core/tests/ui152_xls_protect.rs",
+            "crates/core/src/xls_style.rs"
           ],
           "commits": [
             "b02c047",
@@ -6108,7 +6109,8 @@
             "cargo test -p sheetcore --offline -> 75 bins / 679 passed / 0 failed / 41 ignored",
             "cargo test -p sheetcore --lib -- protection:: -> 6 passed",
             "cargo test -p sheetcore --test ui152_xls_protect -> 2 passed",
-            "Excel COM 打开本程序 .xls: ProtectContents=True, Unprotect(s3cret) ok"
+            "Excel COM 打开本程序 .xls: ProtectContents=True, Unprotect(s3cret) ok",
+            "Excel COM prot_unlock.xls -> protect=True, A1_write_ok, B1_write_denied, Unprotect(s3cret) ok"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt",
@@ -6119,7 +6121,7 @@
           "not_done": [
             "真实鼠标填充页调色/保护页勾选/确定取消 Esc 未取证",
             "Excel 365/WPS 保存重开目视未做",
-            "工作表保护后仅锁定格不可编辑的逐格执行语义尚未验收"
+            "逐格锁定语义：.xls 已用 Excel COM 验证（A1 未锁定可写、B1 锁定被拒、口令可解除）；.xlsx 与真实鼠标路径未做"
           ],
           "failures": [],
           "blocker": "",
