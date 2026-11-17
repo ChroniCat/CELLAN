@@ -4913,14 +4913,18 @@
             "WPS KET.Application copy -> SC_CMD=\"20:Paste;60:FileSave\" work/qa07/wps-ribbon4.xlsx => B2==B1*2, A1V=46024, FMT=yyyy-mm-dd",
             "SC_SEL=\"0,0\" SC_SEL2=\"1,2\" SC_KEYSEQ=\"ctrl+c\" -> Excel/WPS Paste => excel-out2.xlsx/wps-out2.xlsx 2x3, formula lost, rest preserved",
             "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 xmlss_formula_uses_r1c1_for_excel_paste => 1 passed",
-            "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10"
+            "SC_SEL=0,0 SC_SEL2=0,1 SC_KEYSEQ=6:ctrl+c app.exe clip_app.xlsx => dump ss:Formula=\"=RC[-1]*2\"; Excel/WPS paste C2f==B2*2 C2v=10",
+            "computer_use cua-driver: click A1(80,284), Shift+Right, UIA Invoke #28 Copy, click D1(302,284), UIA Invoke #25 Paste => D1 formula =C1*2 value 0 (b1 source =A1*2 value 10); status 已复制 (0,1,0,1)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-clipboard.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua-ui-1118.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/b1-copied.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/d1-formula-paste.png"
           ],
           "not_done": [
             "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
@@ -4929,8 +4933,8 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z",
-          "status_note": "随 UI-07 父项待监督复核；见 ui07-clipboard.txt。"
+          "updated_utc": "2026-11-18T07:30:00Z",
+          "status_note": "真实 UIA Ribbon 复制/粘贴已机检（D1 公式 =C1*2）；物理右键菜单/物理 Ctrl+V 仍缺（computer_use key chord 会落成字面 c/v，foreground 不可用）。"
         },
         {
           "id": "UI-07.2",
