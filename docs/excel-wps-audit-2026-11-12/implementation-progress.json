@@ -6498,22 +6498,26 @@
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
-            "crates/app/src/edit_regression_tests.rs"
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/app/src/main.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -p app --bin app -- dv_filter_100k_items_is_frame_cheap --nocapture -> worst=13.5ms"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-dv.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19/dropdown.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19/dropdown.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-1-1117.md"
           ],
           "not_done": [
             "真实鼠标点选/中文IME搜索未做",
-            "10万项GUI滚动计时未做"
+            "10 万项列表过滤已量（debug 最坏 13.5ms），真实鼠标滚动/逐帧计时受本机 RDP 帧率限制未做"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T23:01:48Z"
+          "updated_utc": "2026-11-17T17:50:00Z"
         }
       ]
     },

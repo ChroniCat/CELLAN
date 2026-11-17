@@ -1854,6 +1854,8 @@ struct SheetApp {
     ribbon_collapsed: bool,
     /// 名称框下拉（定义名称列表）
     name_dropdown: bool,
+    /// UI-19.1：序列下拉打开时缓存全部项，避免每帧重算公式来源/重新分配 10 万个 String
+    dv_cache: Vec<String>,
     /// F5 / Ctrl+G 请求把焦点移到名称框（下一帧 UI 消费）
     name_focus_request: bool,
     /// 表头右键菜单：(0=列 1=行, 索引, 屏幕位置)
@@ -2856,6 +2858,7 @@ impl SheetApp {
             error_marks_key: (u64::MAX, u64::MAX),
             ribbon_collapsed: std::env::var("SC_RIB_COLLAPSE").is_ok(),
             name_dropdown: false,
+            dv_cache: Vec::new(),
             name_focus_request: false,
             chart_sel: None,
             chart_drag: None,
@@ -6382,6 +6385,7 @@ impl SheetApp {
         let cur = self.wb.sheet(self.sheet_idx).value(r, c).display();
         self.dv_query.clear();
         self.dv_hilite = items.iter().position(|it| *it == cur).unwrap_or(0);
+        self.dv_cache = items;
         self.dv_open = Some((r, c));
     }
 
@@ -26787,9 +26791,10 @@ let txn = self.txn_begin(&keys);
                 let sheet = self.wb.sheet(self.sheet_idx);
                 sheetcore::dv::find(&sheet.dv, dr, dc).cloned()
             } {
-                let all_items = self.dv_items(dr, dc);
-                let items = self.dv_visible_items(dr, dc);
-                if !all_items.is_empty() {
+                // 打开时已缓存；每帧只按搜索词过滤，不再重算公式/清单来源。
+                let all_count = self.dv_cache.len();
+                let items = filter_dv_items(&self.dv_cache, &self.dv_query);
+                if !self.dv_cache.is_empty() {
                     let pos = egui::pos2(gx(dc), gy(dr) + rows.size(dr));
                     let mut picked: Option<(usize, String)> = None;
                     let mut close = false;
@@ -26807,7 +26812,7 @@ let txn = self.txn_begin(&keys);
                                 if te.changed() {
                                     self.dv_hilite = 0;
                                 }
-                                ui.label(format!("{}/{} 项", items.len(), all_items.len()));
+                                ui.label(format!("{}/{} 项", items.len(), all_count));
                                 if items.is_empty() {
                                     ui.weak("无匹配项（退格清除搜索）");
                                     return;

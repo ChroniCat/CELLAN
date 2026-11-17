@@ -10418,3 +10418,24 @@ fn dense_million_selection_stats_cost_is_bounded() {
     // 单帧 20 万格的累加不能到几百毫秒；收集是一次性的（切选区时发生）
     assert!(worst < 300.0, "20 万格单帧累加 {worst:.1}ms 过慢");
 }
+
+/// UI-19.1：10 万项序列下拉的每帧过滤成本（打开时缓存，之后只过滤）。
+#[test]
+fn dv_filter_100k_items_is_frame_cheap() {
+    use std::time::Instant;
+    let all: Vec<String> = (0..100_000).map(|i| format!("项目{i:06}")).collect();
+    let mut worst = 0.0f64;
+    for q in ["", "9", "项目09", "无匹配"] {
+        let t = Instant::now();
+        let hit = crate::filter_dv_items(&all, q);
+        worst = worst.max(t.elapsed().as_secs_f64() * 1000.0);
+        match q {
+            "" => assert_eq!(hit.len(), 100_000),
+            "9" => assert_eq!(hit.iter().filter(|s| s.contains('9')).count(), hit.len()),
+            "项目09" => assert!(hit.len() > 0),
+            _ => assert!(hit.is_empty()),
+        }
+    }
+    eprintln!("[ui19.1] filter 100k worst={worst:.1}ms");
+    assert!(worst < 50.0, "10 万项过滤 {worst:.1}ms 超过一帧预算");
+}
