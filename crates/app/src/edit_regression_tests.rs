@@ -1486,6 +1486,26 @@ fn custom_format_previews_active_cell_value() {
     );
 }
 
+/// UI-15.1：取消只丢弃草稿，不改样式、不标脏、不记撤销。
+#[test]
+fn custom_format_cancel_leaves_workbook_untouched() {
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(1234.5));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.wb.dirty = false;
+    let before = app.wb.sheet(0).style_of(0, 0);
+    let undo_before = app.undo.depth();
+    app.open_format_dialog();
+    app.fmt_state.format = "#,##0.00;[Red](#,##0.00);\"-\"".into();
+    app.fmt_state.bold = !app.fmt_state.bold;
+    app.cancel_format_dialog();
+    assert_eq!(app.wb.sheet(0).style_of(0, 0), before, "取消不得改样式");
+    assert!(!app.wb.dirty, "取消不得标脏");
+    assert_eq!(app.undo.depth(), undo_before, "取消不得记撤销");
+    assert!(!app.fmt_dlg, "取消应关闭对话框");
+}
+
 /// UI-15.1：自定义格式的正/负/零三段预览，并在保存重开后保持一致。
 #[test]
 fn custom_format_three_sections_preview_and_reload() {

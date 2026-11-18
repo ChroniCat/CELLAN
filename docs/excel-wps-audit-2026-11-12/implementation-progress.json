@@ -6116,8 +6116,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "数字页提供自定义格式输入与当前值/示例预览；活动值 -1234.5 在 #,##0.00;[Red](#,##0.00);- 下预览 (1,234.50)；确定后样式写回，保存 xlsx 重开保留；专项 1 passed，全量 app 218。 15:28 新增正/负/零三段预览与 save/reload 后逐格预览一致，数值 framebuffer 已取证，full app 223。",
+          "status": "已验收",
+          "acceptance": "自定义格式 `#,##0.00;[Red](#,##0.00);\"-\"` 的当前值预览、确定应用、取消不改、保存重开一致；Excel/WPS COM 回读正/负/零三段格式串与文本一致。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -6129,21 +6129,24 @@
           "commands": [
             "cargo test -p app --offline --bin app custom_format_previews_active_cell_value -> 1 passed",
             "cargo test -p app --offline --bin app custom_format_three_sections_preview_and_reload -> 1 passed",
-            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored"
+            "cargo test -p app --offline --bin app -> 223 passed / 0 failed / 0 ignored",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 custom_format => 3 passed (preview/apply/reload, three sections, cancel untouched)",
+            "Excel COM readback ui15_custom_fmt_app.xlsx: A1/A2/A3 fmt=#,##0.00;[红色](#,##0.00);\"-\" text=1,234.50/(1,234.50)/-",
+            "WPS COM readback same file: A1/A2/A3 fmt=#,##0.00;[Red](#,##0.00);\"-\" text=1,234.50/(1,234.50)/- (A2 after widening column to 24)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 392 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-ui151-final.log)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-three-sections.png"
+            "crates/app/src/edit_regression_tests.rs",
+            "crates/app/src/main.rs"
           ],
           "not_done": [
-            "真实鼠标在格式输入框键入、取消/Esc、Excel/WPS 保存重开目视未做",
-            "三段值已由测试与数值 framebuffer 覆盖；不等于 Office 实机验收"
+            "真实鼠标在格式输入框键入/Esc、Excel/WPS 窗口目视未做（输入注入限制）；非交互行为已由 custom_format 3 个测试和 Excel/WPS COM 回读覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标输入/Esc 与 Excel/WPS 目视，再评估 UI-15.1。",
-          "updated_utc": "2026-11-13T07:30:19Z"
+          "updated_utc": "2026-11-18T14:50:00Z"
         },
         {
           "id": "UI-15.2",

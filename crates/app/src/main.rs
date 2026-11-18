@@ -9522,6 +9522,12 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         sheetcore::style::format_value_in(self.wb.date_system, &v, &self.fmt_state.format)
     }
 
+    /// 取消格式对话框：草稿只存在于 `fmt_state`，不碰文档/撤销/脏标记。
+    fn cancel_format_dialog(&mut self) {
+        self.fmt_merge_pending = None;
+        self.fmt_dlg = false;
+    }
+
     fn apply_format_dialog(&mut self) {
         let st = self.fmt_state.clone();
         let orig = self.fmt_orig.clone();
@@ -21524,8 +21530,7 @@ let txn = self.txn_begin(&keys);
             self.apply_format_dialog();
         }
         if cancel || !open {
-            self.fmt_merge_pending = None;
-            self.fmt_dlg = false;
+            self.cancel_format_dialog();
         }
     }
 
