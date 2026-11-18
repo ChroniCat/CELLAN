@@ -5993,7 +5993,7 @@
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 覆盖等线 11（含缩进/粗体）、自动换行取最长行、合并格跳过，并新增 Excel 实测的非 11 字号曲线（8/9/10/11/12/14/16/18/20/24，纯 CJK 与 ASCII 两条）。",
+          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 覆盖等线 11（含缩进/粗体）、自动换行取最长行、合并格跳过；非 11 字号有 Excel 实测曲线（8–24）；真实鼠标双击列边界已用 foreground SendInput 触发并落盘。",
           "files": [
             "crates/app/src/main.rs",
             "crates/core/src/layout.rs",
@@ -6020,7 +6020,8 @@
             "powershell work/probe/excel_autofit_size_matrix2.ps1 -> 17 strings x 10 sizes AutoFit: excel_autofit_size_matrix2.out",
             "cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2 => 5 passed",
             "SC_AUTOFIT=c:0 SC_AUTOFIT_SAVE=autofit_size_out.xlsx app.exe cua_autofit_size.xlsx => A(中文文字中文,14) width 16.01 / Excel 16.00; c:1 (1,8)=1.63; c:2 (123456789012,14)=15.88",
-            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 386 passed, 0 failed, 1 ignored; APP_EXIT=0 (app-autofit-size.log)"
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 386 passed, 0 failed, 1 ignored; APP_EXIT=0 (app-autofit-size.log)",
+            "computer_use foreground click (81,301) -> namebox A2; double-click (101,264) on A/B header boundary -> status A 列宽已自适应：36px; save -> mouse_probe.xlsx <col width=3.88 customWidth=1>"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
@@ -6029,16 +6030,17 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-row2.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit-1117.md",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/autofit-widths.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-3-general-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-3-general-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-double-click-1118.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/double-click-autofit.png"
           ],
           "not_done": [
-            "真实鼠标双击列边界未做（RDP 输入注入不可用），AutoFit 由 SC_AUTOFIT 驱动同一函数",
             "非采样字号（如 13/15）按相邻档线性插值；非 11 号粗体/缩进按 size/11 比例缩放，未逐项实测；10 位 ASCII 数字串 Excel 7.88 与等线 11 公式 11.0 的量化差未反解（多行纯 CJK/短串已对齐，不能扩大成所有字符串精确）"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-18T08:30:00Z"
+          "updated_utc": "2026-11-18T09:00:00Z"
         }
       ]
     },

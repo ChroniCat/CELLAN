@@ -1,0 +1,29 @@
+# UI-14.3 真实鼠标双击列边界 AutoFit（2026-11-18）
+
+## 环境
+
+- 本机 Windows 11 / Excel 16.0 Build 20326；app.exe debug（wgpu/glow 与本次无关）。
+- 单实例端口未被占用；窗口用 `SetWindowPos` 固定到 `(0,0,1440,900)`，客户区截图 1438×898。
+- 夹具：`work/probe/mouse_probe.xlsx`，A1=`aaa`、A2=`bbb`，等线 11；A 列初始默认 72px。
+
+## 操作
+
+- `computer_use` 以 **foreground SendInput** 点击 A2 屏幕坐标 `(81,301)`；名称框由 `A1` 变为 `A2`，证明坐标命中真实网格。
+- 列头行实测 y=254–270，A/B 分界线 x=100；对 `(101,264)` 发送 foreground **double-click**。
+- app 状态栏变为 `A 列宽已自适应：36px`，名称框显示 `A1:A2`（双击列边界同时选中 A 列）。
+- 点击 Ribbon「保存」后读回 `work/probe/mouse_probe.xlsx`：
+  `<col min="1" max="1" width="3.88" customWidth="1"/>`，文件 `2026-11-18 10:31:02` 已更新。
+
+## 结论
+
+真实鼠标双击列边界已触发 `autofit_col` 并落盘：`aaa`（3 个 ASCII 字符）按等线 11
+AutoFit 得到 3.88 字符列宽（`3.88×8+5≈36px`），与 `SC_AUTOFIT` 同一函数、同一结果。
+这不是 UIA Invoke 按钮，也不是 `SC_KEYSEQ` 事件注入；是 foreground `SendInput` 的
+双击 + 保存按钮点击。
+
+截图：`ui14/double-click-autofit.png`（状态栏和名称框可见）。
+
+## 仍未做
+
+- 非采样字号（13/15 等）只是相邻档插值；非 11 号粗体/缩进未逐项实测。
+- 10 位 ASCII 在 wrap 夹具中的量化差（Excel 7.88 vs 等线 11 公式 11.0）未完全反解。
