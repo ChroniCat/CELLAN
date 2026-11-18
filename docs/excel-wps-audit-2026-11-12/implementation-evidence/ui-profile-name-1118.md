@@ -37,7 +37,7 @@ Windows 用户名相同（或克隆镜像共用 Administrator）的机器，右�
 
 - `dist/SheetsNative-1.68-1118.zip`（`aff46e1`，glow + static CRT），解压后的
   `SheetsNative.exe` 已用 `SC_SHOT` 冒烟启动并生成 1440×900 截图；
-- release 标题栏同样显示 `Admin...计部-AI`，账户入口可见。
+- release 标题栏同样显示 `Admin...计部-AI`，账户入口可见（`ui-profile-release-1118.png`）。
 
 ### 自动化
 
