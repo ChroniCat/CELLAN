@@ -6325,7 +6325,10 @@
       "acceptance": "排序范围/级别顺序、按证件号去重预览、分列列类型/覆盖确认/完整撤销均有专项回归；真实鼠标交互未执行，父项转待验收。",
       "files": [],
       "commits": [],
-      "commands": [],
+      "commands": [
+        "cargo test -q -p sheetcore --offline --lib fixed_width => 3 passed; fixed_width_splits_by_char_count / fixed_width_parse_rejects_zero_and_garbage / fixed_width_mode_bypasses_delimiters pass",
+        "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 run_split_fixed_width => run_split_fixed_width_writes_columns / run_split_fixed_width_rejects_bad_widths pass"
+      ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-dedup.txt",
@@ -6335,14 +6338,12 @@
         "真实鼠标调整级别未做",
         "真实鼠标勾选与执行未做",
         "真实鼠标点选与两次确认未执行",
-        "固定宽度分列未实现",
-        "真实鼠标调整排序级别/勾选去重/分列两次确认未执行（RDP 不可用）",
-        "固定宽度分列未实现（原 UI-17 合同只要求分隔符/引号/空字段/日期，已在契约内）"
+        "真实鼠标调整排序级别/勾选去重/分列两次确认未执行（RDP 不可用）"
       ],
       "failures": [],
       "blocker": "",
       "next": "监督复核；补真实鼠标排序/去重/分列交互",
-      "updated_utc": "2026-11-13T21:16:38Z",
+      "updated_utc": "2026-11-18T14:15:00Z",
       "slices": [
         {
           "id": "UI-17.1",
