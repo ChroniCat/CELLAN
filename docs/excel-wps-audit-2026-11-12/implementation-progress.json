@@ -3232,21 +3232,24 @@
       "scope": "core/pivot.rs, pivot_xml.rs + app透视入口",
       "source": "core-requirements.md",
       "heading": "C12 P1 透视汇总正确性与多字段模型",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "多字段行/列/值、pivotTable 部件、baseField/baseItem、多透视表计算字段隔离、中文排序口径均由切片证据覆盖；物理点字段面板未做。",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-sort-1117.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-sort-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-multi-field-pivot.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-pivot-roundtrip.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c12-4-real-pivot-excel-wps.txt"
       ],
       "not_done": [
-        "多字段 grid 与 pivotTable 部件、baseField/baseItem、多透视表计算字段隔离（scoped_calc_field_touches_only_its_own_cache）均已验；C12.2/C12.3 排序口径与面板已验；只剩真实键鼠点字段面板/刷新（无交互桌面）"
+        "真实键鼠点透视字段面板/刷新未做（输入注入限制）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "继续 C12.2 多字段模型，先读 pivot_xml/pivot UI 现有数据流。",
-      "updated_utc": "2026-11-17T09:57:33Z",
+      "updated_utc": "2026-11-18T16:15:00Z",
       "slices": [
         {
           "id": "C12.1",
@@ -3440,21 +3443,24 @@
       "scope": "core/style.rs, protection.rs, xlsx.rs + app命令检查",
       "source": "core-requirements.md",
       "heading": "C15 P1 工作表保护细粒度权限",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "工作表保护、逐格 locked/hidden 与 Excel/WPS 写入门禁一致；A1 锁定被拒、B1 未锁定可写；.xlsx/.xls 保存回读。",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-review-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-protection.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c15-selection-perms.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-xlsx-1118.md"
       ],
       "not_done": [
-        "真实键鼠在窗口内点选锁定/未锁定单元格未执行（无交互桌面，阻塞项）"
+        "真实键鼠在窗口内点选锁定/未锁定单元格未做（输入注入限制）；Excel/WPS COM 已逐格验证。"
       ],
       "failures": [],
       "blocker": "",
       "next": "等待监督复核选择权限入口",
-      "updated_utc": "2026-11-17T09:45:19Z",
+      "updated_utc": "2026-11-18T16:15:00Z",
       "slices": [
         {
           "id": "C15.1",
@@ -3593,21 +3599,23 @@
       "scope": "core/print.rs + app页面预览",
       "source": "core-requirements.md",
       "heading": "C16 P1 打印和PDF必须反映工作表真实显示",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "四切片全部已验收：页面设置/打印区域/重复标题/缩放；PDF 与屏幕同一 Layout.pages，120 行每行恰好一次；Excel/WPS PDF 行数/列几何已对拍。",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-slices-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c16-render-compare-1117.md",
+        "crates/core/tests/print_pagination.rs"
       ],
       "not_done": [
-        "四切片 C16.1/.2/.3/.4 全部已验收（证据 c16-slices-1117.md + c16-render-compare-1117.md）。父项整体验收还差“真实键鼠点打印预览”这一步，受无交互桌面阻塞；Excel 导出 PDF 的绝对坐标另有一个 ~0.915 导出缩放，已归因为导出链路属性、与实现无关。"
+        "真实键鼠点打印预览未做（输入注入限制）；PDF 导出绝对坐标有约 0.915 的 Excel 导出链路缩放，已归因。"
       ],
       "failures": [],
       "blocker": "",
       "next": "盯 C16.2 断行；真实键鼠项并入无桌面阻塞清单",
-      "updated_utc": "2026-11-17T05:50:30Z",
+      "updated_utc": "2026-11-18T16:15:00Z",
       "slices": [
         {
           "id": "C16.1",
