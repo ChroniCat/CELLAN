@@ -734,7 +734,7 @@ fn ribbon_groups_aligned_and_fit() {
     let wb = sheetcore::model::Workbook::new_blank();
     sheetcore::xlsx::save(&p, &wb).unwrap();
 
-    let log = ui_log_for(p.to_str().unwrap(), &[("SC_UI_LOG", "1")], Duration::from_secs(45));
+    let log = ui_log_for(p.to_str().unwrap(), &[("SC_UI_LOG", "1"), ("SC_WIN_W", "1920")], Duration::from_secs(45));
     // 取最后一帧：从最后一次出现"剪贴板"开始，读满 7 个组
     let mut groups: Vec<(String, f32, f32, f32, f32)> = Vec::new();
     let mut started = false;
