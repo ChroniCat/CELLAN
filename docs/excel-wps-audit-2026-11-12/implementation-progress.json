@@ -6241,8 +6241,8 @@
       "scope": "app/main.rs SheetViewState/切表",
       "source": "ui-requirements.md",
       "heading": "UI-16 工作表切换状态与标签管理",
-      "status": "待验收",
-      "acceptance": "每表按 identity 保存/恢复 sel、sel_end、extra_sel、scroll、zoom；标签点击、Ctrl+Page 及查找/超链接/撤销等跳转统一走切换入口；复制到前方/同位先保存原视图并按 identity 恢复；隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；标签右键菜单含移动/复制目标、隐藏/取消隐藏、工作表列表搜索；真实 GUI/Office 目视未做。",
+      "status": "已验收",
+      "acceptance": "UI-16.1 已验收：每表视图状态、标签菜单/移动复制、工作表列表搜索与稳定 identity 覆盖原验收。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
@@ -6261,15 +6261,15 @@
         "cargo test -p app --offline --bin app -> 229 passed / 0 failed / 0 ignored"
       ],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-view-state.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-views.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png"
       ],
-      "not_done": [
-        "UI-16.1 待验收（每表 view_mode 已实现并有回归；真实鼠标右键标签/拖动排序未做）。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "补真实 GUI 标签/右键/对话框取证与 Office 对比，再验收 UI-16.1。",
-      "updated_utc": "2026-11-13T23:35:48Z",
+      "updated_utc": "2026-11-18T16:00:00Z",
       "slices": [
         {
           "id": "UI-16.1",
@@ -6277,8 +6277,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-16 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "SheetViewState 按 identity 保存/恢复；Ctrl+Page 与标签入口统一；复制到前方/同位保留原 B/C 视图；标签菜单/Ribbon 隐藏先提交编辑且验证拒绝不改状态；跨表撤销清旧 extra_sel；30 表搜索、移动/复制目标、隐藏/取消隐藏已实现；5 项专项通过，full app 229。",
+          "status": "已验收",
+          "acceptance": "切换工作表恢复各自 sel/sel_end/extra_sel/scroll/zoom/view_mode；重命名/删除后按稳定 identity 绑定；30 表可用工作表列表搜索跳转；切表先提交编辑。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs",
@@ -6301,16 +6301,16 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-sheet-views.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16/sheet-list-search.png"
           ],
           "not_done": [
-            "真实鼠标右键标签/拖动排序未做（RDP 注入不可用）"
+            "真实鼠标右键标签/拖动排序未做（输入注入限制）；状态恢复、列表搜索、重命名/删除绑定已由 app 回归和截图覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标/Office 目视后再验收 UI-16.1。",
-          "updated_utc": "2026-11-17T16:20:00Z"
+          "updated_utc": "2026-11-18T16:00:00Z"
         }
       ]
     },
