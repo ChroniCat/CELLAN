@@ -1786,6 +1786,10 @@ struct SheetApp {
     show_formula_bar: bool,
     /// 关于窗口
     about_open: bool,
+    /// 账户 / 显示名称窗口
+    profile_open: bool,
+    profile_draft: String,
+    profile_msg: String,
     /// 符号对话框
     symbol_dlg: bool,
     /// 显示公式（Ctrl+`）：单元格里画公式文本而不是结果
@@ -2817,6 +2821,9 @@ impl SheetApp {
             show_headings: std::env::var("SC_VIEW_OFF").is_err(),
             show_formula_bar: true,
             about_open: false,
+            profile_open: false,
+            profile_draft: String::new(),
+            profile_msg: String::new(),
             symbol_dlg: false,
             show_formulas: false,
             trace_arrows: Vec::new(),
@@ -3026,7 +3033,7 @@ impl SheetApp {
             auto_tick: None,
             auto_probe: None,
             auto_share: true,
-            my_name: default_name(),
+            my_name: load_display_name(),
             last_cursor: None,
             joined_doc: false,
             deps: sheetcore::formula::deps::Deps::empty(),
@@ -10882,7 +10889,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         // 模态对话框自己消费 Enter/Esc；不能把同一次按键再漏给网格。
         // `dialog_modal` 只覆盖查找/数据验证/函数向导，格式对话框用独立
         // `fmt_dlg` 开关，必须在 handle_keys 这里一并挡住。
-        if self.dialog_modal || self.fmt_dlg {
+        if self.dialog_modal || self.fmt_dlg || self.profile_open {
             return;
         }
 
@@ -14316,6 +14323,135 @@ let txn = self.txn_begin(&keys);
         }
         if !open {
             self.symbol_dlg = false;
+        }
+    }
+
+    /// 应用右上角账户窗口里的显示名。
+    ///
+    /// 名字同时用于协作光标、编辑占用卡、修订记录和本机 UI；改名后立即广播给
+    /// 在线参与者，下一次启动从 ui.ini 恢复。空名字不覆盖当前值。
+    fn apply_display_name(&mut self, raw: &str) -> bool {
+        let name = clean_user_name(raw);
+        if name.is_empty() {
+            self.profile_msg = "显示名称不能为空".into();
+            return false;
+        }
+        if name == self.my_name {
+            self.profile_msg.clear();
+            self.status = "显示名称未改变".into();
+            return true;
+        }
+        self.my_name = name.clone();
+        self.prefs.user_name = name.clone();
+        self.prefs.save();
+        // 名字变了，下一帧必须重发光标，否则别人看到的还是旧名字。
+        self.last_cursor = None;
+        if let Some(me) = self.peer.as_ref().map(|p| p.site) {
+            if let Some(e) = self.peers_list.iter_mut().find(|e| e.0 == me) {
+                e.1 = name.clone();
+            }
+        }
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if let Some(net) = self.net.as_ref() {
+            net.rename(&name);
+        }
+        // 宿主刷新占用卡，后加入的人从卡里读到的也是新名字。
+        if hosting {
+            if let Some(path) = self.wb.path.clone() {
+                let addr = format!("{}:{}", local_ip_hint(), net::port());
+                let _ = session_lock::write(&path, &addr, &name);
+                self.lock_beat = Some(std::time::Instant::now());
+            }
+        }
+        self.profile_msg.clear();
+        self.status = format!("显示名称已改为「{name}」");
+        true
+    }
+
+    /// 右上角账户窗口：设置本机在协作/修订里显示的名字。
+    fn account_window(&mut self, ctx: &egui::Context) {
+        if !self.profile_open {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut about = false;
+        let initial = self
+            .my_name
+            .chars()
+            .next()
+            .unwrap_or('U')
+            .to_uppercase()
+            .to_string();
+        ui_kit::window(ctx, "账户", 440.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(r.center(), 19.0, Color32::from_rgb(0, 120, 212));
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initial,
+                        FontId::proportional(18.0),
+                        Color32::WHITE,
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("本机显示名称").size(14.0).strong());
+                        ui.label(
+                            egui::RichText::new("只保存在这台电脑，不需要账号或登录")
+                                .size(11.0)
+                                .color(ui_kit::TEXT_WEAK),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("协作/修订中显示为：").size(11.5));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.profile_draft)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如：张三 / Alice"),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "用于协作光标、编辑占用和修订记录。默认名带计算机名，避免共用 Administrator 时重名。",
+                    )
+                    .size(11.0)
+                    .color(ui_kit::TEXT_WEAK),
+                );
+                if !self.profile_msg.is_empty() {
+                    ui.colored_label(Color32::from_rgb(196, 43, 28), &self.profile_msg);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    open = false;
+                }
+                ui.add_space(4.0);
+                if ui.button("关于 Sheets Native").clicked() {
+                    about = true;
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui.button("取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "保存").clicked() {
+                        save = true;
+                    }
+                });
+            });
+        let draft = self.profile_draft.clone();
+        if save && self.apply_display_name(&draft) {
+            self.profile_open = false;
+        }
+        if about {
+            self.profile_open = false;
+            self.about_open = true;
+        }
+        if !open {
+            self.profile_open = false;
         }
     }
 
@@ -28950,6 +29086,17 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.peers_list.push((site, name, color));
                     self.status = format!("在线 {} 人", self.peers_list.len());
                 }
+                net::NetEvent::PeerRenamed(site, name) => {
+                    eprintln!("[net] peer renamed: {name}#{site}");
+                    if let Some(e) = self.peers_list.iter_mut().find(|e| e.0 == site) {
+                        e.1 = name.clone();
+                    } else {
+                        self.peers_list.push((site, name.clone(), (site % 7) as u8));
+                    }
+                    if site != self.peer.as_ref().map(|p| p.site).unwrap_or(0) {
+                        self.status = format!("{name} 改了显示名称");
+                    }
+                }
                 net::NetEvent::PeerLeft(site) => {
                     self.peers_list.retain(|(s, _, _)| *s != site);
                     self.remote.remove(&site);
@@ -29060,8 +29207,67 @@ fn rel_time(ts: u64) -> String {
     }
 }
 
+/// 账户名只能是单行、有限长度；UI/协作/占用卡共用同一份清洗逻辑。
+fn clean_user_name(raw: &str) -> String {
+    let mut out: String = raw.chars().filter(|c| !c.is_control()).collect();
+    out = out.trim().chars().take(32).collect();
+    out
+}
+
+/// 首次启动的默认名：用户名 + 计算机名。
+///
+/// 只显示 Windows 用户名时，克隆镜像/共用 Administrator 的机器会全部显示成
+/// 同一个名字；带机器名后，即使账号相同也能在协作列表里区分。用户可在右上角
+/// 账户窗口改成自己的真实姓名，改动只保存在本机。
 fn default_name() -> String {
-    std::env::var("USERNAME").unwrap_or_else(|_| "用户".into())
+    if let Ok(v) = std::env::var("SC_USER_NAME") {
+        let v = clean_user_name(&v);
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let user = clean_user_name(&std::env::var("USERNAME").unwrap_or_else(|_| "用户".into()));
+    let user = if user.is_empty() { "用户".to_string() } else { user };
+    let host = clean_user_name(
+        &std::env::var("COMPUTERNAME").unwrap_or_else(|_| String::new()),
+    );
+    if host.is_empty() {
+        user
+    } else {
+        format!("{user}@{host}")
+    }
+}
+
+/// 已保存的显示名优先；没有保存过才用系统默认名。
+fn load_display_name() -> String {
+    if let Ok(v) = std::env::var("SC_USER_NAME") {
+        let v = clean_user_name(&v);
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let saved = clean_user_name(&ui_prefs::UiPrefs::load().user_name);
+    if saved.is_empty() {
+        default_name()
+    } else {
+        saved
+    }
+}
+
+/// 顶部窄区域用中间省略，保留首尾（默认名的机器后缀一定要看得见）。
+fn elide_middle(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".into();
+    }
+    let left = (max_chars - 1) / 2;
+    let right = max_chars - 1 - left;
+    let head: String = chars[..left].iter().collect();
+    let tail: String = chars[chars.len() - right..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 fn local_ip_hint() -> String {
@@ -29324,8 +29530,8 @@ impl SheetApp {
                 }
                 // 账户按钮（Excel 标题栏右侧头像）
                 let acc = Rect::from_min_size(
-                    egui::pos2(rect.right() - 48.0 * 3.0 - 92.0, rect.center().y - 14.0),
-                    Vec2::new(88.0, 28.0),
+                    egui::pos2(rect.right() - 48.0 * 3.0 - 132.0, rect.center().y - 14.0),
+                    Vec2::new(128.0, 28.0),
                 );
                 let aresp = ui.interact(acc, egui::Id::new("account"), Sense::click());
                 if aresp.hovered() {
@@ -29333,7 +29539,7 @@ impl SheetApp {
                 }
                 let ac = egui::pos2(acc.left() + 14.0, acc.center().y);
                 painter.circle_filled(ac, 11.0, Color32::from_rgb(0, 120, 212));
-                let user = std::env::var("USERNAME").unwrap_or_else(|_| "U".into());
+                let user = self.my_name.clone();
                 painter.text(
                     ac,
                     egui::Align2::CENTER_CENTER,
@@ -29344,12 +29550,18 @@ impl SheetApp {
                 painter.text(
                     egui::pos2(ac.x + 16.0, acc.center().y),
                     egui::Align2::LEFT_CENTER,
-                    if user.len() > 8 { &user[..8] } else { &user },
+                    elide_middle(&user, 11),
                     FontId::proportional(11.0),
                     fg,
                 );
-                if aresp.on_hover_text("账户").clicked() {
-                    self.about_open = true;
+                // UIA：账户按钮读屏要能读到当前显示名
+                let _ = ui.ctx().accesskit_node_builder(aresp.id, |node| {
+                    node.set_label(format!("账户：{user}"));
+                });
+                if aresp.on_hover_text(format!("账户：{user}")).clicked() {
+                    self.profile_draft = self.my_name.clone();
+                    self.profile_msg.clear();
+                    self.profile_open = true;
                 }
                 // 窗口按钮
                 let bw = 48.0;
@@ -29411,9 +29623,16 @@ impl SheetApp {
                     }
                 }
                 // 空白处拖动 / 双击最大化（避开顶部 5px 缩放边）
+                // 搜索框和账户按钮必须排除在外，否则后注册的拖动层会吞掉点击，
+                // 账户窗口就永远打不开（搜索结果同样点不进去）。
+                let drag_right = if rect.width() >= 900.0 {
+                    sx - 8.0
+                } else {
+                    acc.left() - 8.0
+                };
                 let drag = Rect::from_min_max(
-                    egui::pos2(rect.left() + 130.0, rect.top() + 5.0),
-                    egui::pos2(rect.right() - bw * 3.0, rect.bottom() - 2.0),
+                    egui::pos2(rect.left() + 306.0, rect.top() + 5.0),
+                    egui::pos2(drag_right.max(rect.left() + 306.0), rect.bottom() - 2.0),
                 );
                 let dr = ui.interact(drag, egui::Id::new("title_drag"), Sense::click_and_drag());
                 if dr.drag_started() {
@@ -29784,6 +30003,7 @@ impl eframe::App for SheetApp {
         self.dialog_modal = self.find.open
             || self.dv_alert.is_some()
             || self.fmt_dlg
+            || self.profile_open
             || (self.fn_wizard.is_some() && self.wiz_pick.is_none());
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
@@ -30282,6 +30502,7 @@ impl eframe::App for SheetApp {
         self.rich_dialog(ctx);
         self.hyperlink_dialog(ctx);
         self.paste_special_dialog(ctx);
+        self.account_window(ctx);
         self.about_window(ctx);
         self.zoom_dialog(ctx);
         self.watch_window(ctx);

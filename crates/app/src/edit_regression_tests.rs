@@ -116,6 +116,40 @@ fn paste_prefers_new_system_clipboard_over_stale_internal_clip() {
 }
 
 #[test]
+fn display_name_is_cleaned_and_elided_without_byte_panics() {
+    assert_eq!(clean_user_name("  张三\n李四\t "), "张三李四");
+    // 中间省略必须按字符切，不能像旧代码那样按字节切中文名字。
+    let short = elide_middle("张三张三张三", 5);
+    assert_eq!(short.chars().count(), 5);
+    assert!(short.contains('…'));
+    let host = elide_middle("Admin@DESKTOP-ABC", 11);
+    assert!(host.ends_with("ABC"), "默认名的机器后缀必须保留：{host}");
+}
+
+#[test]
+fn display_name_is_persisted_and_used_by_a_fresh_app() {
+    let env = crate::test_env::TestEnv::new("profile-display-name");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    assert!(app.apply_display_name("  张三\n "));
+    assert_eq!(app.my_name, "张三");
+    assert_eq!(ui_prefs::UiPrefs::load().user_name, "张三");
+    // 新进程/新窗口不会丢掉名字；这是“所有人都是 Administrator”的根因修正。
+    let app2 = SheetApp::new_with_context(&egui::Context::default(), None);
+    assert_eq!(app2.my_name, "张三");
+    drop(env);
+}
+
+#[test]
+fn sc_user_name_overrides_saved_profile_for_deployment() {
+    let env = crate::test_env::TestEnv::new("profile-sc-user-name");
+    env.sc("SC_USER_NAME", "李四");
+    let app = SheetApp::new_with_context(&egui::Context::default(), None);
+    assert_eq!(app.my_name, "李四");
+    drop(env);
+}
+
+#[test]
 fn filtered_copy_compacts_visible_rows_and_paste_skips_filtered_rows() {
     let mut app = app();
     let ctx = egui::Context::default();

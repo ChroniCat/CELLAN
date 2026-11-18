@@ -28,6 +28,8 @@ pub struct UiPrefs {
     pub proof_group: bool,
     /// 状态栏统计项位掩码：1 平均、2 计数、4 数值计数、8 求和、16 最小、32 最大
     pub stat_mask: u8,
+    /// 本机在协作/修订里显示的名字；空表示用系统默认名
+    pub user_name: String,
 }
 
 impl Default for UiPrefs {
@@ -36,6 +38,7 @@ impl Default for UiPrefs {
             zh_variant: 0,
             proof_group: true,
             stat_mask: 0b00_1011,
+            user_name: String::new(),
         }
     }
 }
@@ -69,6 +72,7 @@ impl UiPrefs {
                         me.stat_mask = n & 0b11_1111;
                     }
                 }
+                "user_name" => me.user_name = v.to_string(),
                 _ => {}
             }
         }
@@ -88,8 +92,11 @@ impl UiPrefs {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "zh_variant={}\nproof_group={}\nstat_mask={}\n",
-            self.zh_variant, self.proof_group as u8, self.stat_mask
+            "zh_variant={}\nproof_group={}\nstat_mask={}\nuser_name={}\n",
+            self.zh_variant,
+            self.proof_group as u8,
+            self.stat_mask,
+            self.user_name.chars().filter(|c| !c.is_control()).collect::<String>()
         );
         let _ = std::fs::write(p, text);
     }
@@ -122,6 +129,7 @@ mod tests {
             zh_variant: 2,
             proof_group: false,
             stat_mask: 0b10_1000,
+            user_name: "张三".into(),
         };
         p.save_to(&file);
         let got = UiPrefs::load_from(&file);
@@ -129,6 +137,7 @@ mod tests {
         assert_eq!(got.zh_variant, 2);
         assert!(!got.proof_group);
         assert_eq!(got.stat_mask, 0b10_1000);
+        assert_eq!(got.user_name, "张三");
     }
 }
 

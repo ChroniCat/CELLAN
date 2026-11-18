@@ -29,6 +29,8 @@ pub enum NetEvent {
     Connected,
     Welcome { peers: Vec<(u32, String, u8)> },
     PeerJoined(u32, String, u8),
+    /// 在线参与者的显示名变了
+    PeerRenamed(u32, String),
     PeerLeft(u32),
     Ops(Vec<Op>),
     Cursor(Cursor),
@@ -321,6 +323,16 @@ impl Net {
         if let Ok(s) = serde_json::to_string(&Msg::CursorMsg(cur)) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
+    }
+
+    /// 在线改显示名：客户端发给宿主，宿主转发给其他客户端；本机也收一条事件，
+    /// 让成员列表立刻更新。协议不改变 site，已有连接不需要重连。
+    pub fn rename(&self, name: &str) {
+        let msg = Msg::Rename { site: self.site, name: name.to_string() };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+        let _ = self.evt_tx.send(NetEvent::PeerRenamed(self.site, name.to_string()));
     }
 
     pub fn shutdown(&self) {
@@ -640,6 +652,26 @@ pub fn host_on(
                                     }
                                 }
                                 let _ = evt_tx.send(NetEvent::Cursor(c));
+                            }
+                            Msg::Rename { site, name } => {
+                                // 只信连接握手时的 site，不能允许客户端借 Rename 改别人的名字。
+                                let site = hello_site.unwrap_or(site);
+                                let color = (site % 7) as u8;
+                                peer_names
+                                    .lock()
+                                    .unwrap()
+                                    .insert(site, (name.clone(), color));
+                                let line = serde_json::to_string(&Msg::Rename {
+                                    site,
+                                    name: name.clone(),
+                                })
+                                .unwrap();
+                                for (s, ptx) in peers.lock().unwrap().iter() {
+                                    if Some(*s) != hello_site && *s != site {
+                                        let _ = ptx.send(line.clone());
+                                    }
+                                }
+                                let _ = evt_tx.send(NetEvent::PeerRenamed(site, name));
                             }
                             Msg::Structural { site: _site, sheet, op } => {
                                 shift_state(&state, &styles, sheet, &op);
@@ -1040,6 +1072,9 @@ pub fn join(
                         Msg::Hello { site: s, name: n, .. } => {
                             let _ = evt_tx.send(NetEvent::PeerJoined(s, n, (s % 7) as u8));
                         }
+                        Msg::Rename { site: s, name: n } => {
+                            let _ = evt_tx.send(NetEvent::PeerRenamed(s, n));
+                        }
                         Msg::Bye { site: s } => {
                             let _ = evt_tx.send(NetEvent::PeerLeft(s));
                         }
@@ -1137,6 +1172,33 @@ mod tests {
         assert!(
             wait_for(&host_net, 3, |e| matches!(e, NetEvent::Ops(v) if v.iter().any(|o| o.value == ValueWire::Number(42.0)))),
             "宿主没收到操作"
+        );
+    }
+
+    #[test]
+    fn rename_is_relayed_to_host_and_other_clients() {
+        let (host_net, port) = host_for_test(1, "A", "doc", "");
+        let addr = format!("127.0.0.1:{port}");
+        let c1 = join(2, "B".into(), "doc".into(), &addr, String::new()).expect("join c1");
+        assert!(wait_for(&c1, 3, |e| matches!(e, NetEvent::Welcome { .. })));
+        let c2 = join(3, "C".into(), "doc".into(), &addr, String::new()).expect("join c2");
+        assert!(wait_for(&c2, 3, |e| matches!(e, NetEvent::Welcome { .. })));
+        // 等宿主处理完 c2 的 Hello，避免它在收到 Rename 前还没登记 3。
+        std::thread::sleep(Duration::from_millis(150));
+        c1.rename("B-改名");
+        assert!(
+            wait_for(&host_net, 3, |e| matches!(
+                e,
+                NetEvent::PeerRenamed(2, n) if n == "B-改名"
+            )),
+            "宿主没收到改名"
+        );
+        assert!(
+            wait_for(&c2, 3, |e| matches!(
+                e,
+                NetEvent::PeerRenamed(2, n) if n == "B-改名"
+            )),
+            "其他客户端没收到转发"
         );
     }
 

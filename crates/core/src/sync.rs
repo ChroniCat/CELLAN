@@ -195,6 +195,8 @@ pub enum Msg {
     ChallengeSalt { nonce: u64, salt: String },
     Denied { reason: String },
     Hello { site: u32, name: String, doc: String, proof: String },
+    /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
+    Rename { site: u32, name: String },
     Welcome { site: u32, doc: String, peers: Vec<(u32, String, u8)> },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
