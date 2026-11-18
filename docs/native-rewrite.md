@@ -3186,3 +3186,17 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 **验收**：`SC_TABS=第二个文件` → 标签数 2，`SC_SWITCH_TAB=0` 切回后文档与标题都回到第一个；
 104 单测 + 17 UI 回归通过（文本框拖动用例改成从 dump 里的 pane 矩形换算，不再写死屏幕坐标）。
 
+### 第五十五轮：界面精致度（2026-11-19）  〔改于 2026-11-19T05:39+08:00 / 972bc8f〕
+
+目标：把「土 / 廉价 / 像网页」拆成可逐条验收的结构问题，按 Excel 365 同尺寸基准修完。
+
+- **功能区响应式**：1440 宽不再截断最右组，8 个分组全部显示（组宽合计 1372，改前 1825 只显示 5 组 + 「更多」）；样式库在紧凑模式收成「单元格样式 ▾」下拉。
+- **开始页**：左栏 240px 文件导航；四个内置模板（空白 / 销售明细 / 家庭预算 / 项目排期）都是**真正的工作簿**——公式、数字格式、列宽、冻结窗格齐全，`templates::build` 内直接 `recalc_all`；卡片预览取模板前 3×4 格的真实底色与文字，不是装饰插画。
+- **最近文件**：读 xlsx 包内 `docProps/thumbnail.jpeg` 显示文件真实缩略图（`xlsx::read_part` 只解压这一个部件，不解压整本），没有缩略图的文件回落表格图标；已用注入缩略图的 `thumb_demo.xlsx` 实测通过。
+- **搜索**：最近列表按文件名/路径实时过滤，带清除按钮与 Esc；无匹配时给「没有匹配…」空状态，不和「还没有最近文件」混用一句文案。
+- **右边界**：模板行、最近列表、右上操作按钮统一到同一条竖线；有右栏时模板行不再横跨到右栏上方，窄窗（<700）自动落成 2×2。
+- **图标**：补 `NewFile / MacroRun / MacroExport / VisualBasicEditor / Compare / SyncScroll / ValidationCircleInvalid` 映射；删除顶部高光与 `lighten()` 渐变，排序、文字方向、合并、粘贴按 Excel 语义重画。188 个 `imageMso` 里除 B/I/U 文字按钮外没有两个命令共用同一图形；新增 `every_ribbon_image_resolves_to_an_icon` 防回归。
+- **字号**：界面只留 20 / 14 / 12 / 11 四档，清掉 12.5、13.5 半像素字号；标题用内嵌 700 字重（egui 的 `strong()` 只改颜色，不改字形），活动页签按 Excel 实测墨量加粗。
+- **版本号**：`update::VERSION` 由 `1.37` 改为 `1.40`，与本文档最新发布号一致；开始页/标题栏/关于框读的都是这一个常量。
+
+**验收**：`cargo test -p app --test ui_regression` **20 passed / 0 failed**（133.86s）；`templates::tests::every_template_builds_and_recalcs` 通过；`every_ribbon_image_resolves_to_an_icon` 通过；1440/1920 截图 `work/uiaudit/final2_1440.png`、`final2_1920.png`、开始页 `home10.png`；无界面钩子 `SC_HOME_TEMPLATE=1`（直接建模板）、`SC_HOME_QUERY=qa041`（预置搜索）可复现。
