@@ -5925,9 +5925,16 @@ impl SheetApp {
             return;
         }
         let si = self.sheet_idx;
+        // Excel 的筛选复制只带走可见行；hidden_rows 是被筛选/分级折叠掉的行，
+        // hidden_rows_user 是用户手动隐藏的行，Excel 仍会复制后者。
+        let filter_hidden = self.wb.sheet(si).hidden_rows.clone();
+        let visible_rows: Vec<u32> = (r1..=r2)
+            .filter(|r| !filter_hidden.contains(r))
+            .collect();
+        let filtered_copy = visible_rows.len() != (r2 - r1 + 1) as usize;
         let mut cells = Vec::new();
         let mut tsv = String::new();
-        for r in r1..=r2 {
+        for &r in &visible_rows {
             let mut row = Vec::new();
             let mut line = Vec::new();
             for c in c1..=c2 {
@@ -5947,6 +5954,33 @@ impl SheetApp {
             tsv.push_str(&line.join("\t"));
             tsv.push('\n');
             cells.push(row);
+        }
+        if filtered_copy {
+            // XMLSS/HTML 不能表达非连续行；筛选复制先按 Excel 的可见单元格语义
+            // 压紧成纯文本，保证粘贴不把隐藏行带回来，也不让 Excel 误用带隐藏行的块。
+            ctx.copy_text(tsv.clone());
+            self.clip_stamp = Some(tsv.clone());
+            let compact = (
+                0u32,
+                0u32,
+                visible_rows.len().saturating_sub(1) as u32,
+                (c2 - c1) as u32,
+            );
+            self.clip = Some(Clip {
+                sheet: si,
+                rect: compact,
+                cells,
+                merges: Vec::new(),
+                cut,
+            });
+            self.status = format!(
+                "已{}可见行（{} 行 × {} 列；筛选隐藏 {} 行）",
+                if cut { "剪切" } else { "复制" },
+                visible_rows.len(),
+                c2 - c1 + 1,
+                (r2 - r1 + 1) as usize - visible_rows.len()
+            );
+            return;
         }
         let html = self.selection_html(si, (r1, c1, r2, c2));
         if std::env::var("SC_CLIP_LOG").is_ok() {
@@ -10843,6 +10877,12 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.cancel_edit();
             }
+            return;
+        }
+        // 模态对话框自己消费 Enter/Esc；不能把同一次按键再漏给网格。
+        // `dialog_modal` 只覆盖查找/数据验证/函数向导，格式对话框用独立
+        // `fmt_dlg` 开关，必须在 handle_keys 这里一并挡住。
+        if self.dialog_modal || self.fmt_dlg {
             return;
         }
 
@@ -29743,6 +29783,7 @@ impl eframe::App for SheetApp {
         // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
         self.dialog_modal = self.find.open
             || self.dv_alert.is_some()
+            || self.fmt_dlg
             || (self.fn_wizard.is_some() && self.wiz_pick.is_none());
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
@@ -30479,6 +30520,11 @@ impl eframe::App for SheetApp {
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     self.name_edit = false;
                     if enter {
+                        // 名称框的回车已经用于定位；不能让同一个 Enter 再被
+                        // 网格 handle_keys 当成“下移一格”。
+                        ctx.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                        });
                         self.goto_name();
                     }
                 }

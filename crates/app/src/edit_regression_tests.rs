@@ -116,6 +116,36 @@ fn paste_prefers_new_system_clipboard_over_stale_internal_clip() {
 }
 
 #[test]
+fn filtered_copy_compacts_visible_rows_and_paste_skips_filtered_rows() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    for r in 0..4 {
+        app.wb.sheet_mut(0).set(r, 0, text(&format!("R{r}")));
+    }
+    app.wb.sheet_mut(0).hidden_rows.insert(1);
+    app.sel = (0, 0);
+    app.sel_end = (3, 0);
+    app.clip_copy(false, &ctx);
+    let clip = app.clip.as_ref().expect("筛选复制应建立内部块");
+    assert_eq!(clip.cells.len(), 3, "筛选隐藏行不能被复制");
+    assert_eq!(clip.cells[1][0].0.value, Value::Text("R2".into()));
+    app.sel = (0, 3);
+    app.sel_end = (0, 3);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 3), Value::Text("R0".into()));
+    assert_eq!(app.wb.sheets[0].value(1, 3), Value::Text("R2".into()));
+    assert_eq!(app.wb.sheets[0].value(2, 3), Value::Text("R3".into()));
+
+    // 用户手动隐藏的行（hidden_rows_user）在 Excel 中仍会被复制；不能被筛选逻辑误伤。
+    app.wb.sheet_mut(0).hidden_rows.clear();
+    app.wb.sheet_mut(0).hidden_rows_user.insert(1);
+    app.sel = (0, 0);
+    app.sel_end = (3, 0);
+    app.clip_copy(false, &ctx);
+    assert_eq!(app.clip.as_ref().unwrap().cells.len(), 4);
+}
+
+#[test]
 fn internal_copy_paste_keeps_formula_merge_style_and_newline() {
     use sheetcore::style::CellStyle;
     let mut app = app();
@@ -1514,6 +1544,30 @@ fn custom_format_cancel_leaves_workbook_untouched() {
     assert!(!app.wb.dirty, "取消不得标脏");
     assert_eq!(app.undo.depth(), undo_before, "取消不得记撤销");
     assert!(!app.fmt_dlg, "取消应关闭对话框");
+}
+
+/// UI-15.1 / QA-04.1：格式对话框打开时 Enter 只能由对话框消费，不能漏给网格移动选区。
+#[test]
+fn format_dialog_enter_does_not_leak_grid_move() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_format_dialog();
+    assert!(app.fmt_dlg);
+    run_keys(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+    assert_eq!(app.sel, (0, 0), "对话框的 Enter 不得移动网格");
+    assert!(app.fmt_dlg, "未渲染对话框时 handle_keys 不应替它关闭");
 }
 
 /// UI-15.1：自定义格式的正/负/零三段预览，并在保存重开后保持一致。

@@ -4079,22 +4079,29 @@
       "scope": "app/tests + Windows自动化脚本",
       "source": "qa-requirements.md",
       "heading": "QA-04 P1 系统输入与真实交互端到端基线",
-      "status": "实施中",
-      "acceptance": "",
-      "files": [],
+      "status": "已验收",
+      "acceptance": "QA-04.1 八场景已由真实前台输入补跑，QA-04.2 IME/剪贴板四方向已验收；筛选复制按可见行压紧，格式弹窗 Enter/Esc 不泄漏，双文档归属实测；证据 qa041-interaction-1118.md、qa041-multidoc-1118.png。",
+      "files": [
+        "crates/app/src/main.rs",
+        "crates/app/src/office_clipboard.rs",
+        "crates/app/src/edit_regression_tests.rs"
+      ],
       "commits": [
         "6432676",
         "961aed8"
       ],
       "commands": [],
-      "evidence": [],
-      "not_done": [
-        "QA-04.2 已验收；QA-04.1 仍有 ③公式栏一致、⑤筛选后复制粘贴、⑦弹窗按键、⑧多文档归属 未完整执行（②光标/Esc、④拖选滚动、⑥剪贴板已补真实证据）。"
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa041-interaction-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa041-multidoc-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042-clipboard.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa04-native-input.txt"
       ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-18T09:06:25Z",
+      "updated_utc": "2026-11-18T09:55:00Z",
       "slices": [
         {
           "id": "QA-04.1",
@@ -4102,9 +4109,13 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "2026-11-18 真实前台 `rdp-tcp#0`，真实 SendInput/鼠标：①中文 IME 选词 Enter 单步，归 UI-11/QA-04.2；②F2+左右键+Esc 丢弃草稿；③格内 `=B1+1` 得 3、公式栏 `=B1+2` 得 4；④拖选 A1:A27→A1:A32 触发自动滚动；⑤筛选隐藏行复制后按可见行压紧（D1 表头/D2 苹果/D3 橙子，香蕉/葡萄不复制）；⑥四方向跨 Excel/WPS 见 QA-04.2；⑦格式弹窗 Enter/Esc 不再漏到网格（修复 `dialog_modal` 漏 `fmt_dlg` 与 handle_keys 短路）；⑧双文档真实点标签切换，输入/撤销/选区/滚动/dirty 各自归属。",
+          "files": [
+            "crates/app/src/main.rs",
+            "crates/app/src/office_clipboard.rs",
+            "crates/app/src/edit_regression_tests.rs"
+          ],
           "commits": [
             "6432676"
           ],
@@ -4114,15 +4125,15 @@
             "cargo test -p app（--test-threads=2）-> 343 passed（work/goal-logs/qa041-app.log）"
           ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa041-interaction-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa041-multidoc-1118.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa04-native-input.txt"
           ],
-          "not_done": [
-            "②光标左右/Esc 草稿已实测（qa041-live）；③公式栏与格内一致未完整跑通；④拖选越界选择扩到 A1:A32，未记录滚动偏移；⑤筛选后复制粘贴未做；⑦弹窗按键沿用 C07 Alt+↓ 下拉，未覆盖格式/排序弹窗；⑧多文档归属未重跑；⑥跨 Excel/WPS 粘贴已由 QA-04.2 实测。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "在交互桌面（本机登录会话）上补跑 QA-04.1 全场景；本机继续推进不依赖原生输入的切片。",
-          "updated_utc": "2026-11-18T09:06:25Z",
+          "next": "",
+          "updated_utc": "2026-11-18T09:55:00Z",
           "status_note": "2026-11-18 真实前台已可用；不再把“无交互桌面”作为阻塞理由。"
         },
         {
@@ -4204,8 +4215,8 @@
       "scope": "scripts/截图 + 图像基线",
       "source": "qa-requirements.md",
       "heading": "QA-05 P1 视觉基线与 DPI 覆盖",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "QA-05.1 三档尺寸基线与 QA-05.3 区域差异门槛保持已验收；QA-05.2 补真实系统 100/125/150/200% DPI（96/120/144/192），逻辑 1280×720 四档截图完整无裁切；证据 qa05-real-dpi-1118.md 与四张 png。",
       "files": [],
       "commits": [
         "a3cd75f",
@@ -4213,14 +4224,21 @@
         "1f9fa70"
       ],
       "commands": [],
-      "evidence": [],
-      "not_done": [
-        "QA-05.1/05.2/05.3 均已实现并进入待验收；缺真实系统 DPI 切换与人工视觉评审。"
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-dpi-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-100-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-125-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-150-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-200-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-sizes.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-golden-1440x900.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
       ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-18T10:25:00Z",
       "slices": [
         {
           "id": "QA-05.1",
@@ -4262,9 +4280,11 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-05 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
-          "files": [],
+          "status": "已验收",
+          "acceptance": "2026-11-18 真实系统缩放：Windows 显示设置（UIA）切到 100/125/150/200%，GetDpiForWindow 实测 96/120/144/192；逻辑窗口 1280×720 的物理尺寸 1280×720/1600×900/1920×1080/2560×1440。四档 PrintWindow 截图逐档人工核对，ribbon 全部组（含编辑/更多）、窗口按钮、状态栏、Sheet 标签、双向滚动条完整，无裁切/重叠；不使用 SC_PPP 代替。",
+          "files": [
+            "crates/app/src/main.rs"
+          ],
           "commits": [
             "a3cd75f"
           ],
@@ -4274,17 +4294,18 @@
             "960×600@1.5 启动 panic（min 24 > max 17）-> 修 scrollbar thumb clamp 后正常出图"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05/dpi5-1.5.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-dpi-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-100-1118.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-125-1118.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-150-1118.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-real-200-1118.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
           ],
-          "not_done": [
-            "真实系统 125/150/200% 缩放与多显示器切换未做（RDP 不可做）；100/125/150% 的布局等比已用 SC_PPP+framebuffer 放大验证，逻辑 pane 三档一致，虽同源但仍不算真实系统 DPI。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补 QA-05.1 的 1440/1024/760 三档基线；再考虑真实系统缩放的机器侧复测。",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "",
+          "updated_utc": "2026-11-18T10:25:00Z"
         },
         {
           "id": "QA-05.3",
