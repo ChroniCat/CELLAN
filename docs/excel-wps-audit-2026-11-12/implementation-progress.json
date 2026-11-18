@@ -7048,19 +7048,23 @@
       "scope": "core/charts.rs + app/chart_view.rs",
       "source": "core-requirements.md",
       "heading": "C19 P2 图表种类与编辑模型",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "图表种类/编辑模型已由切片覆盖：柱/折线/饼/散点/雷达等类型、标签、序列和保存往返。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-labels-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-radar-chartex-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c19-secondary-1117.md"
+      ],
       "not_done": [
-        "真实键鼠打开图表对话框（插图表/改图型/改标签/切雷达样式）未执行——无交互桌面，阻塞项"
+        "真实键鼠打开图表对话框未做（输入注入限制）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-17T09:43:45Z",
+      "updated_utc": "2026-11-18T16:30:00Z",
       "slices": [
         {
           "id": "C19.1",
@@ -7177,21 +7181,23 @@
       "scope": "core/data_tools.rs + app数据工具",
       "source": "core-requirements.md",
       "heading": "C20 P2 中文排序、分列与高级数据工具",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "中文排序、分隔符/固定宽度分列与高级数据工具由 C20.1 及 UI-17 证据覆盖；固定宽度有 core/app 回归。",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c20-stroke-1117.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c20-sort-split.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
       ],
       "not_done": [
-        "真实键鼠操作排序对话框/固定宽度分列未执行（无交互桌面，阻塞项）"
+        "真实键鼠操作排序/分列对话框未做（输入注入限制）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-17T10:29:46Z",
+      "updated_utc": "2026-11-18T16:30:00Z",
       "slices": [
         {
           "id": "C20.1",
@@ -7237,19 +7243,21 @@
       "scope": "app/ribbon + 帮助/支持矩阵",
       "source": "core-requirements.md",
       "heading": "C21 P2 明确高级能力边界",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "四个改名后的高级入口及边界文案由 C21.1 静态/专项证据覆盖。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c21-capability.txt"
+      ],
       "not_done": [
-        "真实键鼠点开四个改名后的入口目视文案未执行（无交互桌面，阻塞项）"
+        "真实键鼠点开入口目视文案未做（输入注入限制）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-17T10:54:07Z",
+      "updated_utc": "2026-11-18T16:30:00Z",
       "slices": [
         {
           "id": "C21.1",
