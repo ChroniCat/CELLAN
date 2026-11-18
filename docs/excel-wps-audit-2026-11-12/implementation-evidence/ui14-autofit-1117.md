@@ -232,3 +232,16 @@ CJK5/等线/indent2、1/宋体/indent1、1/等线13/indent1；`SC_AUTOFIT=c:0..4
 `autofit_width.rs` 新增 `eline_styled_autofit_matches_measured_deltas`（10 个文件级
 真值），目标测试 **6 passed**。C 列 16.99 vs 17.00 是存盘把 141px 折回字符宽时的
 0.01 舍入；像素宽度同为 141px。
+
+## PDF/分页行覆盖（2026-11-18 第八次对拍）
+
+UI-14 原始验收要求“导出 PDF 与屏幕行数一致”。PDF 导出和打印预览消费同一个
+`print::paginate` 的 `Layout.pages`，新增 `crates/core/tests/print_pagination.rs`：
+
+- 120 行正文 + 顶端标题行（标题不重复进正文），`print_area=(0,0,120,0)`；
+- 断言分页后正文 1..120 每行**恰好出现一次**，无漏行/重复；
+- 对每页调用 `print::page_ops_with`，断言每行文本在该页恰好生成一次；
+- `cargo test -p sheetcore --test print_pagination` = **1 passed**。
+
+PDF 的绝对坐标与 Excel 导出 PDF 有约 0.9x 的导出链路缩放（Excel 自身导出属性，
+非版面模型差异）；同一 `Layout` 的行集合和行顺序与屏幕一致。

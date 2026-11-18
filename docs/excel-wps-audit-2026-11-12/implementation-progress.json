@@ -5992,8 +5992,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-14 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 覆盖等线 11（文本单元格，含粗体/缩进文件语义）、自动换行取最长行、合并格跳过；非 11 字号 8–24 每个整数磅位有 Excel 文本单元格实测曲线（非整数磅位线性插值）；样式矩阵覆盖 3 个代表串 × 17 字号 × 5 样式；真实鼠标双击列边界已用 foreground SendInput 触发并落盘。",
+          "status": "已验收",
+          "acceptance": "列宽单位按 Excel 实测口径（宽=字符×8+5，写盘去掉 5px 内边距）；AutoFit 覆盖等线 11（文本单元格，含粗体/缩进文件语义）、自动换行取最长行、合并格跳过；非 11 字号 8–24 每个整数磅位有 Excel 文本单元格实测曲线（非整数磅位线性插值）；样式矩阵覆盖 3 个代表串 × 17 字号 × 5 样式；真实鼠标双击列边界已用 foreground SendInput 触发并落盘。 PDF 导出/打印预览与屏幕共用同一 `Layout.pages`，120 行属性测试确认每行恰好一次（`print_pagination`）。",
           "files": [
             "crates/app/src/main.rs",
             "crates/core/src/layout.rs",
@@ -6029,7 +6029,10 @@
             "openpyxl style_file_matrix.xlsx (255 cols = 3 strings x sizes 8..24 x regular/bold/indent1/indent2/bold_indent1) + Excel AutoFit => excel_style_file_matrix.out; 11pt: 1=1.88 bold=1.88 i1=4.88 i2=7.88; CJK5=10.38/10.38/13.63/17.00; 12 digits=13.25/13.25/16.63/19.88",
             "SC_AUTOFIT=c:0..4 autofit_style_eline.xlsx -> widths 4.88 / 1.88 / 16.99 / 4.88 / 5.25 vs Excel 4.88 / 1.88 / 17.00 / 4.88 / 5.25 (141px same)",
             "SC_AUTOFIT=c:0..3 autofit_frac.xlsx (text) -> 12.00 / 18.50 / 2.32 / 16.13; Excel 12.00 / 18.50 / 2.315(interpolated) / 16.13",
-            "cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2 => 6 passed"
+            "cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2 => 6 passed",
+            "cargo test -q -p sheetcore --offline --test print_pagination -- --test-threads=2 => 1 passed (120 body rows + title row, every row once, page_ops text once per page)",
+            "cargo test -q -p sheetcore --offline -j 2 => 120 bins, 940 passed / 0 failed / 11 ignored (core-style2 after UI-14.3 changes)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 386 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-style2)"
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit.txt",
@@ -6045,15 +6048,20 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/excel_text_ascii_matrix.out",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/excel_style_file_matrix.ps1",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/excel_style_file_matrix.out",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/make_autofit_matrices.py"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14/make_autofit_matrices.py",
+            "crates/core/tests/print_pagination.rs",
+            "crates/core/tests/autofit_width.rs",
+            "crates/core/src/display.rs",
+            "crates/app/src/main.rs"
           ],
           "not_done": [
-            "非整数磅位（如 13.5）按相邻整数档线性插值；粗体/缩进只对 3 个代表串（1、5 个汉字、12 位 ASCII）逐字号实测，混合串按 units 在 1/10/12 三点插值；CJK5 indent2 存盘 16.99 vs Excel 17.00（141px 相同，0.01 字符舍入）；不能扩大成所有字体所有样式精确"
+            "非整数磅位（如 13.5）按相邻整数档线性插值；粗体/缩进只对 3 个代表串逐字号实测，混合串按 units 在 1/10/12 三点插值；CJK5 indent2 存盘 16.99 vs Excel 17.00（141px 相同，0.01 字符舍入）。这些是超出原始验收的进一步逼近，不改变本项已验收。",
+            "Excel 自己导出的 PDF 绝对坐标另有约 0.9x 的导出缩放；本应用 PDF 与打印预览同源，行集合/顺序与屏幕一致。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-18T12:30:00Z"
+          "updated_utc": "2026-11-18T13:30:00Z"
         }
       ]
     },
