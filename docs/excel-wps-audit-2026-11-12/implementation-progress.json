@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T06:26:18Z",
+  "updated_utc": "2026-11-18T08:28:02Z",
   "tasks": [
     {
       "id": "C01",
@@ -4878,7 +4878,8 @@
         "crates/core/src/clipboard_xmlss.rs"
       ],
       "commits": [
-        "537dbe5"
+        "537dbe5",
+        "b57bfde"
       ],
       "commands": [
         "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
@@ -4906,7 +4907,7 @@
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-18T08:25:27Z",
+      "updated_utc": "2026-11-18T08:28:02Z",
       "slices": [
         {
           "id": "UI-07.1",
@@ -4918,7 +4919,8 @@
           "acceptance": "[2026-11-18 物理键盘实测] 物理 Ctrl+V 写入 A1=PASTE_SAVE 并保存；物理 Ctrl+C 后 B2 粘贴得 PASTE_FIXED；Ribbon/右键/键盘三入口统一。",
           "files": [],
           "commits": [
-            "537dbe5"
+            "537dbe5",
+            "b57bfde"
           ],
           "commands": [
             "cargo test -p app --offline -j 2 --bin app -- --test-threads=2 => 302 passed, 0 failed",
@@ -4948,7 +4950,7 @@
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-18T08:25:27Z",
+          "updated_utc": "2026-11-18T08:28:02Z",
           "status_note": "系统 Paste/Copy 事件入口已补齐，物理键盘验证通过。"
         },
         {
