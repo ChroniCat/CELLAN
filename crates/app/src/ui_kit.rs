@@ -1161,8 +1161,16 @@ pub fn sheet_tab(
             .text(rect.center(), Align2::CENTER_CENTER, name, font, color);
         return resp;
     }
+    // Excel 365 的活动标签是「顶部两角 3px 圆角 + 白底 + 底部 2px 绿线」，
+    // 直角白块看起来像旧版 Windows 控件。
+    let top_round = egui::CornerRadius {
+        nw: 3,
+        ne: 3,
+        sw: 0,
+        se: 0,
+    };
     if active {
-        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+        ui.painter().rect_filled(rect, top_round, Color32::WHITE);
         let bar = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.bottom() - 2.0),
             Vec2::new(rect.width(), 2.0),
@@ -1170,7 +1178,7 @@ pub fn sheet_tab(
         ui.painter().rect_filled(bar, 0.0, ACCENT);
     } else if resp.hovered() {
         ui.painter()
-            .rect_filled(rect, 0.0, v.widgets.hovered.weak_bg_fill);
+            .rect_filled(rect, top_round, v.widgets.hovered.weak_bg_fill);
     }
     let color = if active {
         TEXT

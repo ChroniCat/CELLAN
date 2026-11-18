@@ -14,6 +14,7 @@
       <!-- ======================================================== 文件 -->
       <tab id="TabFile" label="文件" keytip="F">
         <group id="GroupFile" label="文件">
+          <button id="FileNew" label="新建" size="large" imageMso="Plus" screentip="新建空白工作簿（Ctrl+N）" onAction="NewTab"/>
           <button id="FileOpen" label="打开" size="large" imageMso="Open" onAction="FileOpen"/>
           <button id="FileSave" label="保存" size="large" imageMso="Save" onAction="FileSave"/>
           <button id="FileSaveAs" label="另存为" size="large" imageMso="SaveAs" onAction="FileSaveAs"/>

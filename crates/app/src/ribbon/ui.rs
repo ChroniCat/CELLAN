@@ -183,11 +183,20 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
     // UI-13.2：窄窗口把放不下的分组折叠成「组名 ▾」按钮，点开仍能执行全部命令。
     // 宽度取上一帧实测值；首帧先完整画一遍，第二帧起稳定。
     let avail = (ui.clip_rect().width() - 24.0).max(200.0);
+    // Excel 在 1440 宽会把常规按钮收成纯图标、把样式库收成下拉；
+    // 我们原来是把最后一组直接裁掉，观感像「没做完」。1720 以下统一紧凑。
+    app.ribbon_compact = avail < 1720.0;
     let mut used = 0.0f32;
     let mut i = 0usize;
     while i < tab.groups.len() {
         let g = &tab.groups[i];
-        let known = app.ribbon_group_w.get(&g.id).copied();
+        // 紧凑/完整两种布局的组宽分开缓存，否则来回变宽时会拿错上一帧的值
+        let cache_key = if app.ribbon_compact {
+            format!("{}#c", g.id)
+        } else {
+            g.id.clone()
+        };
+        let known = app.ribbon_group_w.get(&cache_key).copied();
         let w = known.unwrap_or(160.0);
         let compact_w = compact_width(g);
         // UI-13.2 二级压缩：整组放不下时，先把大按钮收成小图标网格；
@@ -246,7 +255,7 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         let x0 = ui.cursor().min.x;
         group(app, ui, g);
         let w = (ui.cursor().min.x - x0).max(24.0);
-        app.ribbon_group_w.insert(g.id.clone(), w);
+        app.ribbon_group_w.insert(cache_key, w);
         used += w;
         i += 1;
     }
@@ -265,14 +274,14 @@ fn group(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
     let before = if dbg { ui.min_rect() } else { Rect::NOTHING };
     match &g.launcher {
         Some(l) => {
-            let hit = ui_kit::group_l(ui, &g.label, &g.id, |ui| nodes(app, ui, &g.children));
+            let hit = ui_kit::group_l(ui, &g.label, &g.id, |ui| nodes_auto(app, ui, &g.children));
             if hit {
                 let action = l.action().to_string();
                 app.ribbon_action(&action, ui.ctx());
             }
         }
         None => {
-            ui_kit::group(ui, &g.label, |ui| nodes(app, ui, &g.children));
+            ui_kit::group(ui, &g.label, |ui| nodes_auto(app, ui, &g.children));
         }
     }
     if dbg {
@@ -284,6 +293,69 @@ fn group(app: &mut SheetApp, ui: &mut egui::Ui, g: &Group) {
 fn nodes(app: &mut SheetApp, ui: &mut egui::Ui, list: &[Node]) {
     for n in list {
         node(app, ui, n);
+    }
+}
+
+/// 功能区组专用：紧凑模式下把常规按钮压成「纯图标 24px」，
+/// 弹层里的菜单仍走 `nodes`，不受影响。
+fn nodes_auto(app: &mut SheetApp, ui: &mut egui::Ui, list: &[Node]) {
+    for n in list {
+        if app.ribbon_compact {
+            node_narrow(app, ui, n);
+        } else {
+            node(app, ui, n);
+        }
+    }
+}
+
+fn node_narrow(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
+    match n {
+        Node::Button(c) | Node::Toggle(c)
+            if c.size != Size::Large && c.label.is_some() && c.image.is_some() =>
+        {
+            let mut c2 = c.clone();
+            c2.label = None;
+            c2.width = Some(24.0);
+            let toggle = matches!(n, Node::Toggle(_));
+            button(app, ui, &c2, toggle);
+        }
+        Node::Split { ctl, menu } if ctl.size != Size::Large && ctl.image.is_some() => {
+            let mut c2 = ctl.clone();
+            c2.label = None;
+            c2.width = Some(24.0);
+            c2.arrow = Some(15.0);
+            split(app, ui, &c2, menu);
+        }
+        Node::Menu(m) if m.ctl.size != Size::Large && m.ctl.image.is_some() => {
+            let mut m2 = m.clone();
+            m2.ctl.label = None;
+            m2.ctl.width = Some(24.0);
+            menu(app, ui, &m2);
+        }
+        // 样式库整条 349px，1440 下必须收成「单元格样式 ▾」下拉
+        Node::Gallery { ctl, items, .. } => gallery_compact(app, ui, ctl, items),
+        Node::Box {
+            vertical,
+            top,
+            gap,
+            children,
+        } => {
+            if *vertical {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = *gap;
+                    if *top > 0.0 {
+                        ui.add_space(*top);
+                    }
+                    nodes_auto(app, ui, children);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    nodes_auto(app, ui, children);
+                });
+            }
+        }
+        _ => node(app, ui, n),
     }
 }
 
@@ -1530,6 +1602,54 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     }
     if let Some(a) = fire {
         app.ribbon_action(&a, ui.ctx());
+    }
+}
+
+/// 紧凑模式的样式库：整条 349px 的缩略图放不下，收成一个
+/// 「单元格样式 ▾」下拉；菜单项仍是原来的 Style* 命令。
+fn gallery_compact(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
+    let st = app.ctl_state(&c.id);
+    if !st.visible {
+        return;
+    }
+    let label = c
+        .label
+        .clone()
+        .or_else(|| st.label.clone())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "样式".to_string());
+    let enabled = on_enabled(c, &st);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(100.0, 24.0), Sense::click());
+    ui_kit::a11y_name(&resp, &label, enabled, None);
+    if resp.hovered() && enabled {
+        ui.painter()
+            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let col = if enabled {
+        ui.visuals().text_color()
+    } else {
+        ui_kit::DISABLED
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        &label,
+        FontId::proportional(12.0),
+        col,
+    );
+    let cx = rect.right() - 10.0;
+    let cy = rect.center().y;
+    let stk = egui::Stroke::new(1.1, col);
+    ui.painter()
+        .line_segment([egui::pos2(cx - 3.0, cy - 1.5), egui::pos2(cx, cy + 1.5)], stk);
+    ui.painter()
+        .line_segment([egui::pos2(cx, cy + 1.5), egui::pos2(cx + 3.0, cy - 1.5)], stk);
+    if resp.clicked() && enabled {
+        app.ribbon_popup = Some(Popup {
+            kind: PopupKind::Items(items.to_vec()),
+            pos: rect.left_bottom(),
+            opened_at: ui.input(|i| i.time),
+        });
     }
 }
 
