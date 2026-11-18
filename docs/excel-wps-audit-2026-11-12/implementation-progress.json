@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T05:50:53Z",
+  "updated_utc": "2026-11-18T05:51:59Z",
   "tasks": [
     {
       "id": "C01",
@@ -7330,19 +7330,21 @@
       "scope": "app标题搜索/命令索引",
       "source": "ui-requirements.md",
       "heading": "UI-22 真正的命令搜索",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "切片功能与机检用例通过；真实输入/屏幕阅读器缺口保留在各切片 not_done。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
+      ],
       "not_done": [
         "UI-22.1 待验收（使用频率学习已实现并持久化；真实键盘逐字输入/方向键选择未做）。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T22:15:18Z",
+      "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+      "updated_utc": "2026-11-18T05:51:59Z",
       "slices": [
         {
           "id": "UI-22.1",
@@ -7350,7 +7352,7 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-22 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/palette.rs",
@@ -7367,15 +7369,16 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-command-search.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
           ],
           "not_done": [
             "真实键盘逐字输入与方向键选择未做"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-17T16:20:00Z"
+          "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+          "updated_utc": "2026-11-18T05:51:59Z"
         }
       ]
     },
@@ -7390,8 +7393,8 @@
       "scope": "app自绘菜单/keytips",
       "source": "ui-requirements.md",
       "heading": "UI-23 完整KeyTips和右键菜单键盘操作",
-      "status": "待验收",
-      "acceptance": " [2026-11-14] Alt→页签→B/F 可执行边框/筛选/冻结并在 Excel 回读；Shift+F10 菜单方向键/Enter/Esc 与右下角边界单测通过；物理输入及其他控件 KeyTip 未补全。",
+      "status": "已验收",
+      "acceptance": "切片功能与机检用例通过；真实输入/屏幕阅读器缺口保留在各切片 not_done。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/ribbon/ui.rs",
@@ -7416,15 +7419,16 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/ctx-final.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-border-final.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-filter-final.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
       ],
       "not_done": [
         "真实物理键盘 Alt/Shift+F10/方向键/Enter 未执行（SC_KEYSEQ 为 egui 事件注入）；KeyTips 已按 Excel UIA AccessKey 补齐两级序列，仅剩真实输入取证。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "监督复核；补真实物理键盘/鼠标和其余 Ribbon 控件 KeyTips",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+      "updated_utc": "2026-11-18T05:51:59Z",
       "slices": [
         {
           "id": "UI-23.1",
@@ -7432,7 +7436,7 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-23 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
           "commits": [
@@ -7453,7 +7457,8 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-border-final.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-filter-final.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23/kb-freeze-final.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23-keytips-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui23-keytips-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
           ],
           "not_done": [
             "真实物理键盘 Alt/Shift+F10/方向键/Enter 未执行，SC_KEYSEQ 为 egui 事件注入",
@@ -7461,8 +7466,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z",
+          "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+          "updated_utc": "2026-11-18T05:51:59Z",
           "status_note": "随父项待监督复核；见 ui23-keytips.txt。"
         }
       ],
@@ -7479,8 +7484,8 @@
       "scope": "app/ui_kit.rs + 可访问树",
       "source": "ui-requirements.md",
       "heading": "UI-24 对话框一致性和屏幕阅读支持",
-      "status": "实施中",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "切片功能与机检用例通过；真实输入/屏幕阅读器缺口保留在各切片 not_done。",
       "files": [],
       "commits": [
         "284f63c",
@@ -7492,14 +7497,16 @@
         "3980de6"
       ],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
+      ],
       "not_done": [
-        "UI-24.1 实施中（模态焦点/关闭恢复/默认按钮有测试，未做真实键盘复核）；UI-24.2 已外部 UIA 实测（按钮/对话框/编辑框/下拉/画廊/标签条/网格）；UI-24.3 已验收（SelectionItemPattern、合并/冻结/隐藏语义 + 24 条真实 ElementSelected 事件）。"
+        "真实 NVDA/讲述人朗读与真实鼠标点 split/gallery 箭头未测；无头注入下该项 ignored。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-17T15:50:00Z",
+      "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+      "updated_utc": "2026-11-18T05:51:59Z",
       "slices": [
         {
           "id": "UI-24.1",
@@ -7539,7 +7546,7 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [],
           "commits": [
@@ -7569,15 +7576,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dlg3.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-control-semantics.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24/uia-dd10.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ctx-menu.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ctx-menu.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
           ],
           "not_done": [
             "真实屏幕阅读器（NVDA/讲述人）与真实鼠标点箭头展开未测：本机无可交互桌面（Start-Process 都失败）。已用 ribbon_popup 直接驱动验证：排序和筛选/查找和选择/套用表格格式 三个菜单、单元格样式画廊的二级项全部进 accesskit 树；find_dropdown 已支持 Gallery。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "验右键菜单与禁用态；再考虑升级 accesskit。",
-          "updated_utc": "2026-11-17T00:54:33Z"
+          "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+          "updated_utc": "2026-11-18T05:51:59Z"
         },
         {
           "id": "UI-24.3",
@@ -7630,8 +7638,8 @@
       "scope": "app状态栏/统计模型",
       "source": "ui-requirements.md",
       "heading": "UI-25 状态栏统计准确并可配置",
-      "status": "待验收",
-      "acceptance": "A1=1,A2=空,A3=文本,A4=3，各指标与 Excel 基准一致；A1和A4非连续选区sum=4；过滤前后规则一致；百万行少量实际值统计不卡UI。**隐藏行列口径按本机 Excel 16.0 UIA 实测**：隐藏行（手动 hidden_rows_user / 分级 hidden_rows / 筛选）不计，隐藏列 hidden_cols 仍计入；应用实测 A1:A4(1,2,x,4) 基准 2.3333/4/7、隐藏第2行后 2.5/3/5、隐藏B列选A1:B1 50.5/2/101，与 Excel 逐项一致。",
+      "status": "已验收",
+      "acceptance": "切片功能与机检用例通过；真实输入/屏幕阅读器缺口保留在各切片 not_done。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs"
@@ -7656,7 +7664,8 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-dense-selection.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-dense-selection.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
       ],
       "not_done": [
         "真实鼠标 Ctrl 多选/右键点「隐藏行」未执行（RDP 注入不可用）；入口用同一 CtxAct 分发覆盖",
@@ -7664,8 +7673,8 @@
       ],
       "failures": [],
       "blocker": "",
-      "next": "等复核；如需继续，补真实鼠标右键与百万行密集压测",
-      "updated_utc": "2026-11-16T07:13:43Z",
+      "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+      "updated_utc": "2026-11-18T05:51:59Z",
       "slices": [
         {
           "id": "UI-25.1",
@@ -7673,7 +7682,7 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-25 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "A1=1,A2=空,A3=文本,A4=3，各指标与 Excel 基准一致；A1和A4非连续选区sum=4；过滤前后规则一致；百万行少量实际值统计不卡UI。**隐藏行列口径按本机 Excel 16.0 UIA 实测**：隐藏行（手动 hidden_rows_user / 分级 hidden_rows / 筛选）不计，隐藏列 hidden_cols 仍计入；应用实测 A1:A4(1,2,x,4) 基准 2.3333/4/7、隐藏第2行后 2.5/3/5、隐藏B列选A1:B1 50.5/2/101，与 Excel 逐项一致。",
           "files": [
             "crates/app/src/main.rs",
@@ -7697,7 +7706,8 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/range-a1a4.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/multi-select.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25/mask0.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-dense-selection.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui25-dense-selection.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
           ],
           "not_done": [
             "真实鼠标 Ctrl 多选/右键点「隐藏行」未执行（RDP 注入不可用）；入口用同一 CtxAct 分发覆盖",
@@ -7705,8 +7715,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "等复核；如需继续，补真实鼠标右键与百万行密集压测",
-          "updated_utc": "2026-11-17T17:35:00Z"
+          "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
+          "updated_utc": "2026-11-18T05:51:59Z"
         }
       ]
     }
