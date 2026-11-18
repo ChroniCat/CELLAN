@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T06:15:09Z",
+  "updated_utc": "2026-11-18T06:26:18Z",
   "tasks": [
     {
       "id": "C01",
@@ -4897,16 +4897,17 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/ribbon-paste.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md"
       ],
       "not_done": [
-        "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-        "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归"
+        "真实物理键盘 Ctrl+V 未通（合成 Ctrl 的 modifiers 未进入 egui）；物理右键粘贴已验。",
+        "三入口共用 clip_paste 已回归。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "补物理鼠标右键点击/真实键盘 IME 后可将父项转已验收；公式向外损失已关闭。",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "next": "补物理键盘 Ctrl+V 后可将父项转已验收。",
+      "updated_utc": "2026-11-18T06:26:18Z",
       "slices": [
         {
           "id": "UI-07.1",
@@ -4915,7 +4916,7 @@
           "acceptance_source": "ui-requirements.md / UI-07 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "待验收",
-          "acceptance": "",
+          "acceptance": "三入口共用系统剪贴板；物理右键菜单“粘贴”已由硬件 mouse_event 打开并点选，A1 从 Amount 变为 PASTE_RCLICK2；Ctrl+V 物理键盘仍待补。",
           "files": [],
           "commits": [
             "537dbe5"
@@ -4939,16 +4940,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua-ui-1118.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/b1-copied.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/d1-formula-paste.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/d1-formula-paste.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md"
           ],
           "not_done": [
-            "真实硬件鼠标右键“粘贴”点击未执行（RDP 输入注入不可用）；右键动作由 ctx_menu_run(CtxAct::Paste,0) 回归覆盖",
-            "真实键盘 Ctrl+V 为 SC_KEYSEQ 注入 egui 事件，非物理键盘；三入口共用 clip_paste 已回归"
+            "真实物理键盘 Ctrl+V 仍未通：合成 Ctrl 的 modifiers 未进入 egui（cmd=false）；右键粘贴已物理验证。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-18T07:30:00Z",
+          "next": "补物理键盘 Ctrl+V；右键菜单其它项未逐项点选。",
+          "updated_utc": "2026-11-18T06:26:18Z",
           "status_note": "真实 UIA Ribbon 复制/粘贴已机检（D1 公式 =C1*2）；物理右键菜单/物理 Ctrl+V 仍缺（computer_use key chord 会落成字面 c/v，foreground 不可用）。"
         },
         {
