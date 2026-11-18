@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T05:51:59Z",
+  "updated_utc": "2026-11-18T06:15:09Z",
   "tasks": [
     {
       "id": "C01",
@@ -7331,20 +7331,18 @@
       "source": "ui-requirements.md",
       "heading": "UI-22 真正的命令搜索",
       "status": "已验收",
-      "acceptance": "切片功能与机检用例通过；真实输入/屏幕阅读器缺口保留在各切片 not_done。",
+      "acceptance": "命令搜索 Ctrl+Q、逐字输入、方向键选择、Enter 执行、Esc 回网格均已真实键盘验证；使用频率排序已持久化。",
       "files": [],
       "commits": [],
       "commands": [],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
       ],
-      "not_done": [
-        "UI-22.1 待验收（使用频率学习已实现并持久化；真实键盘逐字输入/方向键选择未做）。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
-      "updated_utc": "2026-11-18T05:51:59Z",
+      "next": "已验收（2026-11-18）",
+      "updated_utc": "2026-11-18T06:15:09Z",
       "slices": [
         {
           "id": "UI-22.1",
@@ -7353,7 +7351,7 @@
           "acceptance_source": "ui-requirements.md / UI-22 验收中与本切片有关的条目",
           "depends_on": [],
           "status": "已验收",
-          "acceptance": "",
+          "acceptance": "Ctrl+Q 打开命令搜索；真实键盘逐字输入“冻结”得到 4 条结果；Down 选中第二条，Enter 执行 FreezeFirstColumn；Esc 后 Down 活动格 A1→A2。",
           "files": [
             "crates/app/src/palette.rs",
             "crates/app/src/main.rs",
@@ -7370,15 +7368,15 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-command-search.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui16-ui22-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-23-24-25-review-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22-physical-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui22/palette-arrow-1118.png"
           ],
-          "not_done": [
-            "真实键盘逐字输入与方向键选择未做"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "已验收（2026-11-18 机检）；真实键盘/鼠标/屏幕阅读器见 not_done。",
-          "updated_utc": "2026-11-18T05:51:59Z"
+          "next": "已验收（2026-11-18 真实键盘）",
+          "updated_utc": "2026-11-18T06:15:09Z"
         }
       ]
     },

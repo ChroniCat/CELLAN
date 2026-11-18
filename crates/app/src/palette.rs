@@ -106,6 +106,14 @@ pub fn filter(entries: &[Entry], query: &str) -> Vec<Entry> {
         .collect()
 }
 
+/// 方向键移动命中下标：空结果固定在 0，越界钳制，不环绕。
+pub fn step_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +134,14 @@ mod tests {
         assert_eq!(filter(&sample(), "视图 窗口").len(), 1);
         assert_eq!(filter(&sample(), "").len(), 3);
         assert!(filter(&sample(), "不存在").is_empty());
+    }
+
+    #[test]
+    fn arrow_index_clamps_and_empty_stays_zero() {
+        assert_eq!(step_index(0, 4, 1), 1);
+        assert_eq!(step_index(0, 4, -1), 0);
+        assert_eq!(step_index(3, 4, 1), 3);
+        assert_eq!(step_index(0, 0, 1), 0);
+        assert_eq!(step_index(0, 0, -1), 0);
     }
 }

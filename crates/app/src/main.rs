@@ -1984,6 +1984,8 @@ struct SheetApp {
     dedup_dlg: Option<DedupDlg>,
     palette_open: bool,
     palette_q: String,
+    /// UI-22.1：方向键选中的结果下标（0 起），查询变化时回到第一条
+    palette_idx: usize,
     /// 功能区每组实测宽度（上一帧），窄窗口据此折叠分组
     ribbon_group_w: std::collections::HashMap<String, f32>,
     /// 条件格式管理窗口
@@ -2960,6 +2962,7 @@ impl SheetApp {
             dedup_dlg: None,
             palette_open: false,
             palette_q: String::new(),
+            palette_idx: 0,
             ribbon_group_w: std::collections::HashMap::new(),
             cf_mgr: false,
             cf_quick: false,
@@ -6852,6 +6855,7 @@ impl SheetApp {
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Q)) {
             self.palette_open = true;
             self.palette_q.clear();
+            self.palette_idx = 0;
         }
         if !self.palette_open {
             return;
@@ -6860,6 +6864,24 @@ impl SheetApp {
         let mut hits = palette::filter(&all, &self.palette_q);
         // UI-22.1：常用命令排前面（相同查询下次数多的优先）
         crate::cmdusage::rank(&mut hits, &crate::cmdusage::load());
+        let max_idx = hits.len().saturating_sub(1);
+        self.palette_idx = self.palette_idx.min(max_idx);
+        // UI-22 验收要求方向键选择，不能只让 Enter 永远执行第一条。
+        let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        let up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let nav_moved = (down || up) && !hits.is_empty();
+        if std::env::var("SC_PALETTE_LOG").is_ok() {
+            eprintln!(
+                "[palette] down={down} up={up} idx={} hits={}",
+                self.palette_idx,
+                hits.len()
+            );
+        }
+        if down && !hits.is_empty() {
+            self.palette_idx = palette::step_index(self.palette_idx, hits.len(), 1);
+        } else if up && !hits.is_empty() {
+            self.palette_idx = palette::step_index(self.palette_idx, hits.len(), -1);
+        }
         let mut open = true;
         let mut win_open = true;
         let mut clicked = false;
@@ -6876,34 +6898,52 @@ impl SheetApp {
                         .hint_text("输入命令名，如 冻结、居中、数据透视")
                         .desired_width(f32::INFINITY),
                 );
+                if te.changed() {
+                    self.palette_idx = 0;
+                }
                 te.request_focus();
                 ui.label(format!("{} 条结果（Enter 执行第一条，Esc 关闭）", hits.len()));
                 egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for e in hits.iter().take(40) {
-                        if ui
-                            .selectable_label(false, format!("{}    {}", e.label, e.path()))
-                            .clicked()
-                        {
+                    for (i, e) in hits.iter().take(40).enumerate() {
+                        let selected = i == self.palette_idx;
+                        let resp = ui.selectable_label(
+                            selected,
+                            format!("{}    {}", e.label, e.path()),
+                        );
+                        if selected && nav_moved {
+                            resp.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if resp.clicked() {
                             run = Some(e.action.clone());
                             clicked = true;
                         }
                     }
                 });
             });
-        if !win_open || clicked {
-            open = false;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if !win_open || clicked || esc {
             open = false;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            if let Some(e) = hits.first() {
+            if let Some(e) = hits.get(self.palette_idx) {
                 run = Some(e.action.clone());
                 open = false;
             }
         }
         if let Some(action) = run {
+            if std::env::var("SC_PALETTE_LOG").is_ok() {
+                eprintln!("[palette] run={action}");
+            }
             self.ribbon_action(&action, ctx);
+        }
+        if !open && (esc || !win_open) {
+            // Esc/关闭按钮把键盘交还网格：命令搜索的 TextEdit 必须同时 surrender，
+            // 只 stop_text_input 不够，下一帧 wants_keyboard_input 仍会吞掉方向键。
+            if let Some(id) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+            ctx.memory_mut(|m| m.stop_text_input());
+            self.clear_grid_focus = true;
         }
         self.palette_open = open;
     }
