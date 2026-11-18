@@ -33,6 +33,12 @@ Windows 用户名相同（或克隆镜像共用 Administrator）的机器，右�
 - 账户窗口完整显示 `Administrator@设计部-AI`，字段、说明、保存/取消和“关于 Sheets Native”均可见；
 - 窗口不是 UIA 可枚举的 egui 模态，因此以真实 `PrintWindow` 截图为准。
 
+### 发布包
+
+- `dist/SheetsNative-1.68-1118.zip`（`aff46e1`，glow + static CRT），解压后的
+  `SheetsNative.exe` 已用 `SC_SHOT` 冒烟启动并生成 1440×900 截图；
+- release 标题栏同样显示 `Admin...计部-AI`，账户入口可见。
+
 ### 自动化
 
 ```text
