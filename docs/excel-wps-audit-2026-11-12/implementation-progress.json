@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T08:55:53Z",
+  "updated_utc": "2026-11-18T09:06:25Z",
   "tasks": [
     {
       "id": "C01",
@@ -4089,12 +4089,12 @@
       "commands": [],
       "evidence": [],
       "not_done": [
-        "QA-04.3 已验收；QA-04.2 剪贴板四方向已通、IME 仍阻塞；QA-04.1 原生输入受无交互桌面阻塞。"
+        "QA-04.2 已验收；QA-04.1 仍有 ③公式栏一致、⑤筛选后复制粘贴、⑦弹窗按键、⑧多文档归属 未完整执行（②光标/Esc、④拖选滚动、⑥剪贴板已补真实证据）。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-18T09:06:25Z",
       "slices": [
         {
           "id": "QA-04.1",
@@ -4117,14 +4117,13 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa04-native-input.txt"
           ],
           "not_done": [
-            "本机无可交互桌面（GetForegroundWindow=0）：SendInput、WM_CHAR、WM_IME_CHAR、修饰键组合、鼠标消息全部无效，原生输入用例只能跑无修饰键键盘子集。",
-            "②光标左右移动/草稿文本、③公式栏与格内一致、④拖选自动滚动、⑤筛选后复制粘贴、⑥跨 Excel/WPS 粘贴、⑦弹窗按键不泄漏、⑧多文档归属 均未在有交互会话中执行。",
-            "脚本已就绪：work/probe/qa04/{win_input,input_lib,scenario_nav,scenario_keys,scenario_b}.ps1。"
+            "②光标左右/Esc 草稿已实测（qa041-live）；③公式栏与格内一致未完整跑通；④拖选越界选择扩到 A1:A32，未记录滚动偏移；⑤筛选后复制粘贴未做；⑦弹窗按键沿用 C07 Alt+↓ 下拉，未覆盖格式/排序弹窗；⑧多文档归属未重跑；⑥跨 Excel/WPS 粘贴已由 QA-04.2 实测。"
           ],
           "failures": [],
           "blocker": "",
           "next": "在交互桌面（本机登录会话）上补跑 QA-04.1 全场景；本机继续推进不依赖原生输入的切片。",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-18T09:06:25Z",
+          "status_note": "2026-11-18 真实前台已可用；不再把“无交互桌面”作为阻塞理由。"
         },
         {
           "id": "QA-04.2",
@@ -4191,7 +4190,8 @@
           "next": "",
           "updated_utc": "2026-11-12T10:28:37Z"
         }
-      ]
+      ],
+      "status_note": "真实交互会话已恢复；IME/剪贴板/Alt+↓已实测，剩余原生输入场景待做。"
     },
     {
       "id": "QA-05",
