@@ -161,6 +161,30 @@ Excel 实测：`work/probe/excel_autofit_size_matrix2.ps1` 对 17 个字符串
 `cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1`
 = **386 passed / 0 failed / 1 ignored / APP_EXIT=0**（`app-autofit-size.log`）。
 
-仍未做：非整数/未采样字号（如 13、15）只是插值；粗体/缩进在非 11 号只按
-`size/11` 比例缩放，未逐项实测；真实鼠标双击列边界仍缺。不能把这三档
-端到端值扩大成“所有字号、所有字体已精确”。
+仍未做：非整数/未采样字号（如 13.5）才做相邻档插值；粗体/缩进在非 11 号只按
+`size/11` 比例缩放，未逐项实测；真实鼠标双击列边界已补在 `ui14-double-click-1118.txt`。
+不能把这三档端到端值扩大成“所有字号、所有字体已精确”。
+
+## 8–24 逐磅位曲线（2026-11-18 第六次对拍）
+
+为消掉“13/15 等未采样字号只是插值”的问题，把采样扩到 8–24 **每个整数磅位**：
+
+`work/probe/excel_autofit_size_matrix3.ps1` 对同一组 17 个字符串
+（`1`…12 个 `1`、`中`…5 个汉字）× 17 个字号（8…24）逐项设
+`Font.Name=等线`、`Font.Size=字号`、重置 `ColumnWidth=8.43` 后 `AutoFit()`，
+输出 `work/probe/excel_autofit_size_matrix3.out`（289 行）。`AUTOFIT_SIZE_CURVES`
+已换成 17 档逐磅位实测；只有非整数磅位（如 13.5）才在相邻整数档之间线性插值。
+
+端到端（`work/probe/autofit_frac.xlsx`，等线；`SC_AUTOFIT=c:N` 后读回
+`work/probe/autofit_frac_outN.xlsx` 的 `<col width>`）：
+
+| 列 | 文本 | 字号 | app 存盘宽度 | Excel AutoFit |
+|---|---|---:|---:|---:|
+| A | `中文文字中` | 13 | 12.00 | 12.00 |
+| B | `111111111111` | 15 | 17.13 | 17.13 |
+| C | `1` | 13.5 | 2.32 | 2.315（13=2.25、14=2.38 插值） |
+| D | `中文文字中` | 17 | 16.13 | 16.13 |
+
+`autofit_uses_excel_size_curves` 新增 13/15/17/19/21/22/23 三组真值，并把插值断言
+改成 13.5（2.315）。`cargo test -q -p sheetcore --offline --test autofit_width --
+--test-threads=2` = **5 passed**。

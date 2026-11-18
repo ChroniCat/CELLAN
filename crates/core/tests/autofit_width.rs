@@ -91,8 +91,8 @@ fn wrapped_autofit_uses_longest_line() {
 
 #[test]
 fn autofit_uses_excel_size_curves() {
-    // work/probe/excel_autofit_size_matrix2.out：Excel 16.0，Font.Name=等线，
-    // 每种字号先重置 ColumnWidth=8.43 再 AutoFit。11 号仍走原精确模型。
+    // work/probe/excel_autofit_size_matrix3.out：Excel 16.0，Font.Name=等线，
+    // 8–24 每个整数磅位先重置 ColumnWidth=8.43 再 AutoFit。11 号仍走原精确模型。
     let cases = [
         ("1", 8.0, 1.63),
         ("11111", 8.0, 4.63),
@@ -103,6 +103,27 @@ fn autofit_uses_excel_size_curves() {
         ("1", 24.0, 3.75),
         ("111111111111", 24.0, 27.00),
         ("中文文字中", 24.0, 22.88),
+        ("1", 13.0, 2.25),
+        ("111111111111", 13.0, 14.25),
+        ("中文文字中", 13.0, 12.00),
+        ("1", 15.0, 2.50),
+        ("111111111111", 15.0, 17.13),
+        ("中文文字中", 15.0, 14.00),
+        ("1", 17.0, 2.63),
+        ("111111111111", 17.0, 18.88),
+        ("中文文字中", 17.0, 16.13),
+        ("1", 19.0, 3.00),
+        ("111111111111", 19.0, 20.88),
+        ("中文文字中", 19.0, 17.75),
+        ("1", 21.0, 3.25),
+        ("111111111111", 21.0, 23.75),
+        ("中文文字中", 21.0, 19.88),
+        ("1", 22.0, 3.25),
+        ("111111111111", 22.0, 23.88),
+        ("中文文字中", 22.0, 20.50),
+        ("1", 23.0, 3.38),
+        ("111111111111", 23.0, 25.50),
+        ("中文文字中", 23.0, 21.88),
     ];
     for (s, size, want) in cases {
         let got = sheetcore::display::excel_autofit_chars_at_size(s, false, 0, size);
@@ -111,9 +132,9 @@ fn autofit_uses_excel_size_curves() {
             "{s:?} size={size}: got {got}, want {want}"
         );
     }
-    // 非实测档位按相邻字号插值：14 与 16 的中点。
-    let mid = sheetcore::display::excel_autofit_chars_at_size("1", false, 0, 15.0);
-    assert!((mid - 2.44).abs() < 0.02, "size 15 interpolation got {mid}");
+    // 非整数磅位（如 13.5）才走相邻档插值：13=2.25、14=2.38 → 2.315。
+    let mid = sheetcore::display::excel_autofit_chars_at_size("1", false, 0, 13.5);
+    assert!((mid - 2.315).abs() < 0.005, "size 13.5 interpolation got {mid}");
 }
 
 #[test]
