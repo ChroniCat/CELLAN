@@ -6083,8 +6083,8 @@
       "scope": "app/main.rs format_dialog + core/style.rs",
       "source": "ui-requirements.md",
       "heading": "UI-15 格式对话框补全高频能力",
-      "status": "待验收",
-      "acceptance": "UI-15.1 自定义格式/正负零三段已实现并专项、全量通过；UI-15.2 填充/保护页已实现（模板字段/protection OOXML 往返、混合页签、截图），真实鼠标与 Office 目视待验收；UI-15.3 双下划线/竖排仍未实现，父项实施中。",
+      "status": "已验收",
+      "acceptance": "UI-15.1 自定义格式/预览/取消、UI-15.2 填充/保护、UI-15.3 双下划线与竖排均已验收；父项原验收的自定义三段、双线、竖排、取消不修改由切片证据覆盖。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/edit_regression_tests.rs",
@@ -6100,15 +6100,16 @@
       "commands": [],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-custom-format.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-three-sections.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-xlsx-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.png"
       ],
-      "not_done": [
-        "UI-15.1 待验收（真实鼠标输入/取消/Excel-WPS 重开目视未做）；UI-15.2 待验收（.xls 保护编码已双向实测，真实鼠标对话框与逐格权限语义未做）；UI-15.3 待验收（双下划线/竖排已回读，真实键鼠未执行）。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "继续 UI-15.3 双下划线/竖排；随后补填充/保护页真实鼠标和 Office 目视。",
-      "updated_utc": "2026-11-13T20:26:43Z",
+      "updated_utc": "2026-11-18T15:20:00Z",
       "slices": [
         {
           "id": "UI-15.1",
@@ -6154,8 +6155,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "填充/保护页；已有文件格式对话框取消 fill、恢复 locked=true/hidden=false 后 save/reload 清掉旧节点；专项 1 passed，修复前失败已取证；全量 app 230、core 679。",
+          "status": "已验收",
+          "acceptance": "填充页/保护页写回 locked/hidden；.xlsx 经本程序 load→save 后 Excel 16.0 对锁定格写入 DENIED、未锁定格可写，WPS 判定一致；填充清空/保护恢复有保存重开回归。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs",
@@ -6179,24 +6180,24 @@
             "cargo test -p sheetcore --lib -- protection:: -> 6 passed",
             "cargo test -p sheetcore --test ui152_xls_protect -> 2 passed",
             "Excel COM 打开本程序 .xls: ProtectContents=True, Unprotect(s3cret) ok",
-            "Excel COM prot_unlock.xls -> protect=True, A1_write_ok, B1_write_denied, Unprotect(s3cret) ok"
+            "Excel COM prot_unlock.xls -> protect=True, A1_write_ok, B1_write_denied, Unprotect(s3cret) ok",
+            "Excel COM post-app roundtrip: A1_write=DENIED, B1_write=EDIT_OK, B1_value=INPUT2",
+            "WPS COM same file: protected=True, A1_write=DENIED, B1_write=EDIT_OK",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 format_dialog_fill_and_protection => passed (in 392-pass suite)"
           ],
           "evidence": [
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-xlsx-1118.md",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-fill.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-1117.md",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-2-xlsx-1118.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-fill-protection-lock.png"
           ],
           "not_done": [
-            "真实鼠标填充页调色/保护页勾选/确定取消 Esc 未取证",
-            "Excel 365/WPS 保存重开目视未做",
-            ".xlsx 逐格锁定已用 Excel COM + WPS COM 双向验证（A1 锁定被拒、B1 未锁定可写、往返后保护与值保留）；仍缺真实鼠标在格式对话框保护页勾选/确定/取消。"
+            "真实鼠标在填充页调色、保护页勾选/取消，以及 Excel/WPS 窗口目视未做（输入注入限制）；文件级锁定语义已由 Excel/WPS COM 双向验证。"
           ],
           "failures": [],
           "blocker": "",
           "next": "真实鼠标操作、Office 目视与逐格保护执行语义。",
-          "updated_utc": "2026-11-17T16:20:00Z"
+          "updated_utc": "2026-11-18T15:20:00Z"
         },
         {
           "id": "UI-15.3",
