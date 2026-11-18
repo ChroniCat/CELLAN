@@ -6024,7 +6024,7 @@
             "computer_use foreground click (81,301) -> namebox A2; double-click (101,264) on A/B header boundary -> status A 列宽已自适应：36px; save -> mouse_probe.xlsx <col width=3.88 customWidth=1>",
             "powershell work/probe/excel_autofit_size_matrix3.ps1 -> 17 strings x sizes 8..24 AutoFit: excel_autofit_size_matrix3.out (289 lines)",
             "cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2 => 5 passed (13/15/17/19/21/22/23 exact + 13.5 interpolation)",
-            "SC_AUTOFIT=c:{0,1,2,3} autofit_frac.xlsx -> out widths 12.00 (中文文字中,13), 17.13 (12x1,15), 2.32 (1,13.5), 16.13 (中文文字中,17); Excel 12.00/17.13/2.315/16.13",
+            "SC_AUTOFIT=c:{0,1,2,3} autofit_frac.xlsx (text cells) -> 12.00 / 18.50 / 2.32 / 16.13; Excel 12.00 / 18.50 / 2.315(interpolated) / 16.13; earlier 17.13 was a numeric-cell misread, corrected in 570f4f0",
             "openpyxl text_ascii_matrix.xlsx (204 cols) + Excel AutoFit => excel_text_ascii_matrix.out; 12 text digits size11=13.25, size15=18.50 (numeric COM 12.38/17.13 invalid)",
             "openpyxl style_file_matrix.xlsx (255 cols = 3 strings x sizes 8..24 x regular/bold/indent1/indent2/bold_indent1) + Excel AutoFit => excel_style_file_matrix.out; 11pt: 1=1.88 bold=1.88 i1=4.88 i2=7.88; CJK5=10.38/10.38/13.63/17.00; 12 digits=13.25/13.25/16.63/19.88",
             "SC_AUTOFIT=c:0..4 autofit_style_eline.xlsx -> widths 4.88 / 1.88 / 16.99 / 4.88 / 5.25 vs Excel 4.88 / 1.88 / 17.00 / 4.88 / 5.25 (141px same)",
