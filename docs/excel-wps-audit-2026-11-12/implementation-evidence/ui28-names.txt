@@ -52,3 +52,35 @@ WPS   COUNT=3 值[]=='S2'!$A$1;'S1'!值[]=='S1'!$A$1;税率[]==0.13
 
 两款 Office 均无修复提示，工作簿名称「税率」与 S1 局部「值」都被识别。
 回归新增断言：workbook.xml 必须是 `<definedName name="税率">0.13</definedName>`（不带 `=`）。
+
+## 2026-11-18 名称框行为补齐（未做物理下拉）
+
+原实现把名称体按单格解析：`销售额='Sheet1'!$A$1:$B$3` 只能选中 A1，金额六格
+选不中；名称管理器也只校验名称非空，`Sheet1!A1:`/`BOGUS` 会静默保存。
+
+本次修改 `crates/app/src/main.rs`：
+
+- `goto_name` 支持单格和区域（`A1:B2`、`$A$1:$B$3`，可带表名），选中矩形的
+  `sel`/`sel_end`，跨表名称先切换工作表；
+- `valid_defined_name` 拒绝 A1 地址（`A1`、`$A$1`、`XFD1048576`）、R1C1
+  （`R1C1`/`r12c3`）以及单独的 `R`/`C`；
+- `valid_name_refers` 校验引用：已存在表的单格/区域、`={...}` 常量、
+  `=SUM(...)` 公式或纯数字；未知表、`A1:`、`BOGUS` 一律报错不保存。
+
+新增 app 回归（`crates/app/src/edit_regression_tests.rs`）：
+
+```text
+name_box_selects_named_range_and_prefers_local_scope ... ok
+name_box_selects_named_range_across_sheets ... ok
+defined_names_reject_cell_addresses_and_reserved_rc ... ok
+defined_name_refers_reject_malformed_or_unknown_sheets ... ok
+```
+
+`cargo test -p app --bin app -- --test-threads=1 name_box` = 3 passed；
+`defined_name` = 2 passed。
+
+仍未做：真实鼠标点开名称框下拉、真实 Enter 键提交（输入注入限制），因此
+UI-28.1 保持待验收；但名称框按 Enter 调用的 `goto_name` 行为已由上述测试覆盖。
+
+全量回归（当前 HEAD + 本次改动）：`cargo test -p app --bin app -- --test-threads=1`
+= **390 passed / 0 failed / 1 ignored**（391 total）。

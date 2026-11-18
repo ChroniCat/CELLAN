@@ -6785,17 +6785,21 @@
             "crates/core/src/patch.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 name_box => 3 passed (named range A1:B3, local scope precedence, cross-sheet switch)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 defined_name => 2 passed (A1/$A$1/XFD1048576/R1C1/R/C rejected; bad refs Sheet1!A1:, BOGUS, unknown sheet rejected)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 390 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-ui28-final.log)"
+          ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt"
           ],
           "not_done": [
-            "作用域复选框/名称框下拉/Enter 跳转未做真实鼠标键盘点选"
+            "真实鼠标点开名称框下拉、真实 Enter 提交未做（输入注入限制）；名称框 Enter 调用的 goto_name 已由 app 回归覆盖：单格/区域/跨表、局部优先、A1/R1C1 拒绝、错误引用拒绝。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:13:07Z"
+          "updated_utc": "2026-11-18T14:05:00Z"
         }
       ]
     },

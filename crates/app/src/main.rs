@@ -9621,6 +9621,85 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.commit_fmt_merge();
     }
 
+    /// 名称管理器：名称是否是保留的单元格地址（A1、$A$1、R1C1、R、C）。
+    fn reserved_cell_name(name: &str) -> bool {
+        let n = name.trim();
+        if n.is_empty() {
+            return true;
+        }
+        let up = n.to_ascii_uppercase();
+        if up == "R" || up == "C" {
+            return true;
+        }
+        if sheetcore::sparse::parse_ref(&n.replace('$', "")).is_some() {
+            return true;
+        }
+        let Some(rest) = up.strip_prefix('R') else {
+            return false;
+        };
+        let Some((row, col)) = rest.split_once('C') else {
+            return false;
+        };
+        !row.is_empty()
+            && !col.is_empty()
+            && row.bytes().all(|b| b.is_ascii_digit())
+            && col.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    fn valid_defined_name(name: &str) -> bool {
+        let n = name.trim();
+        n.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            && !Self::reserved_cell_name(n)
+    }
+
+    /// 名称引用：单格/区域（可带表名）或 `={...}` 常量/`=公式(...)`。
+    /// 明显错误的引用（如 `Sheet1!A1:`、`BOGUS`）不能静默保存。
+    fn valid_name_refers(&self, raw: &str) -> bool {
+        let s = raw.trim();
+        if s.is_empty() {
+            return false;
+        }
+        if let Some(rest) = s.strip_prefix('=') {
+            let r = rest.trim();
+            if r.starts_with('{') {
+                return r.ends_with('}');
+            }
+            if r.contains('(') {
+                return r.ends_with(')');
+            }
+            if r.parse::<f64>().is_ok() {
+                return true;
+            }
+        }
+        let (sheet_part, range_part) = match s.rsplit_once('!') {
+            Some((sheet, range)) => (Some(sheet), range),
+            None => (None, s),
+        };
+        if let Some(sheet) = sheet_part {
+            let nm = sheet.trim_matches(|c| c == '\'');
+            if !self
+                .wb
+                .sheets
+                .iter()
+                .any(|sh| sh.name.eq_ignore_ascii_case(nm))
+            {
+                return false;
+            }
+        }
+        let clean = range_part.replace('$', "");
+        let mut pieces = clean.split(':');
+        let first = pieces.next();
+        let second = pieces.next();
+        let extra = pieces.next();
+        let a = first.and_then(sheetcore::sparse::parse_ref);
+        let b = match second {
+            Some(s) => sheetcore::sparse::parse_ref(s),
+            None => a,
+        };
+        extra.is_none() && a.is_some() && b.is_some()
+    }
+
     /// 名称框：支持 A1、A1:B2、以及定义名称
     fn goto_name(&mut self) {
         let text = self.name_buf.trim().to_string();
@@ -9678,31 +9757,47 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         let hit = local.or(global);
         if let Some((_sh, body)) = hit {
-            let body = body.trim_start_matches('=').to_string();
-            let tail = body.rsplit('!').next().unwrap_or(&body).replace('$', "");
-            if let Some(pos) = sheetcore::sparse::parse_ref(&tail) {
-                if let Some((sheet, _)) = body.rsplit_once('!') {
-                    let nm = sheet.trim_matches(|c| c == '\'');
-                    if let Some(idx) = self
-                        .wb
-                        .sheets
-                        .iter()
-                        .position(|s| s.name.eq_ignore_ascii_case(nm))
-                    {
-                        if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
-                            return;
+            let body = body.trim_start_matches('=').trim();
+            // 名称体可以是单格或区域：`Sheet1!$A$1:$B$3`、`$A$1:$B$3`、`A1`。
+            let (sheet_part, range_part) = match body.rsplit_once('!') {
+                Some((s, r)) => (Some(s), r),
+                None => (None, body),
+            };
+            let clean = range_part.replace('$', "");
+            let mut pieces = clean.split(':');
+            let first = pieces.next();
+            let second = pieces.next();
+            let extra = pieces.next();
+            let a = first.and_then(sheetcore::sparse::parse_ref);
+            let b = match second {
+                Some(s) => sheetcore::sparse::parse_ref(s),
+                None => a,
+            };
+            if extra.is_none() {
+                if let (Some(a), Some(b)) = (a, b) {
+                    if let Some(sheet) = sheet_part {
+                        let nm = sheet.trim_matches(|c| c == '\'');
+                        if let Some(idx) = self
+                            .wb
+                            .sheets
+                            .iter()
+                            .position(|s| s.name.eq_ignore_ascii_case(nm))
+                        {
+                            if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
+                                return;
+                            }
                         }
                     }
-                }
-                self.commit_edit(None);
-                if self.sel_blocked_at(pos.0, pos.1) {
-                    self.block_selection();
+                    self.commit_edit(None);
+                    if self.rect_sel_blocked(a, b) {
+                        self.block_selection();
+                        return;
+                    }
+                    self.sel = a;
+                    self.sel_end = b;
+                    self.ensure_visible();
                     return;
                 }
-                self.sel = pos;
-                self.sel_end = pos;
-                self.ensure_visible();
-                return;
             }
         }
         self.status = format!("找不到名称：{text}");
@@ -14546,10 +14641,7 @@ let txn = self.txn_begin(&keys);
         if submit {
             let name = self.name_new.trim().to_string();
             let refers = self.name_refers.trim().to_string();
-            let valid = !name.is_empty()
-                && name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-                && !refers.is_empty();
+            let valid = Self::valid_defined_name(&name) && self.valid_name_refers(&refers);
             let dup = self
                 .wb
                 .names
@@ -14561,7 +14653,7 @@ let txn = self.txn_begin(&keys);
                         && *sh == if self.name_scope_local { Some(self.sheet_idx) } else { None }
                 });
             if !valid {
-                self.name_err = "名称要以字母/下划线开头，只能含字母数字下划线点；引用不能为空".into();
+                self.name_err = "名称要以字母/下划线开头且不能是 A1/R1C1；引用要写成 Sheet1!$A$1:$B$3、={...} 或 =SUM(...)".into();
             } else if dup {
                 self.name_err = "名称已存在".into();
             } else {

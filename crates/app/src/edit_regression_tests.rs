@@ -434,6 +434,89 @@ fn rejected_draft_keeps_its_cell_when_clicking_grid_or_headers() {
 }
 
 #[test]
+fn name_box_selects_named_range_and_prefers_local_scope() {
+    let mut app = app();
+    let sheet = app.wb.sheets[0].name.clone();
+    app.wb.names.push((
+        "销售额".into(),
+        None,
+        format!("'{sheet}'!$A$1:$B$3"),
+    ));
+    app.name_buf = "销售额".into();
+    app.goto_name();
+    assert_eq!(app.sel, (0, 0), "全局名称应选中左上角");
+    assert_eq!(app.sel_end, (2, 1), "全局名称应选中 A1:B3 六格");
+
+    // 当前表局部名称优先于同名全局名称。
+    app.wb.names.push((
+        "销售额".into(),
+        Some(0),
+        format!("'{sheet}'!$C$2:$D$4"),
+    ));
+    app.name_buf = "销售额".into();
+    app.goto_name();
+    assert_eq!(app.sel, (1, 2), "局部名称应覆盖全局名称");
+    assert_eq!(app.sel_end, (3, 3), "局部名称应选中 C2:D4");
+}
+
+#[test]
+fn name_box_selects_named_range_across_sheets() {
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    app.wb.names.push((
+        "跨表销售额".into(),
+        None,
+        "'Other'!$B$2:$C$4".into(),
+    ));
+    app.name_buf = "跨表销售额".into();
+    app.goto_name();
+    assert_eq!(app.sheet_idx, 1, "名称体带表名时应切到目标表");
+    assert_eq!(app.sel, (1, 1));
+    assert_eq!(app.sel_end, (3, 2));
+}
+
+#[test]
+fn defined_names_reject_cell_addresses_and_reserved_rc() {
+    for bad in ["A1", "$A$1", "XFD1048576", "R1C1", "r12c3", "R", "C", "1Name", "A-B"] {
+        assert!(
+            !SheetApp::valid_defined_name(bad),
+            "{bad:?} 不应作为定义名称"
+        );
+    }
+    for good in ["销售额", "Tax_Rate", "_local", "Q1.2026"] {
+        assert!(
+            SheetApp::valid_defined_name(good),
+            "{good:?} 应允许作为定义名称"
+        );
+    }
+}
+
+#[test]
+fn defined_name_refers_reject_malformed_or_unknown_sheets() {
+    let app = app();
+    let sheet = app.wb.sheets[0].name.clone();
+    for good in [
+        format!("'{sheet}'!$A$1:$B$3"),
+        format!("{sheet}!A1"),
+        "$C$2:$D$4".to_string(),
+        "={1;2}".to_string(),
+        "=SUM(A1:A3)".to_string(),
+        "=42".to_string(),
+    ] {
+        assert!(app.valid_name_refers(&good), "{good:?} 应是合法引用");
+    }
+    for bad in [
+        "BOGUS".to_string(),
+        "Sheet1!A1:".to_string(),
+        "'不存在'!A1".to_string(),
+        "A1:".to_string(),
+        "={1;2".to_string(),
+    ] {
+        assert!(!app.valid_name_refers(&bad), "{bad:?} 不应保存");
+    }
+}
+
+#[test]
 fn named_navigation_cannot_move_a_rejected_draft_to_another_sheet() {
     let mut app = app();
     app.wb.sheets.push(sheetcore::Sheet::new("Other"));
