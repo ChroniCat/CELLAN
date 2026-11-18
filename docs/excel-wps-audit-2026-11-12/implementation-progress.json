@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T04:46:57Z",
+  "updated_utc": "2026-11-18T04:58:09Z",
   "tasks": [
     {
       "id": "C01",
@@ -5568,8 +5568,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "输入 =SU 出 SUM/SUMIF 等候选并可键盘选择；=SUM( 显示参数签名；候选接受后光标在末尾。",
+          "status": "已验收",
+          "acceptance": "输入 =SU 出现 SUM/SUMIF/SUMSQ/SUMIFS 等 8 个候选；真实 Down 从 SUM 移到 SUMIF，Enter 接受为 =SUMIF(；截图显示 SUMIF(range,criteria,[sum_range]) 参数提示；接受后继续键入 A1 得到 =SUMIF(A1，证明光标在末尾。 [2026-11-18 物理键盘补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5582,14 +5582,13 @@
             "cargo test ... -- ui112_autocomplete_can_be_driven_by_arrow_keys_and_enter -> 1 passed（真实 Key 事件：↓ 高亮下移、↑ 上移、首项再↑到末项、Enter/Tab 接受）"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui112-physical-1118.md"
           ],
-          "not_done": [
-            "真实键盘/鼠标在候选列表里上下选择未验（无交互桌面）；模糊搜索已实现（前缀 0 / 词内 1 / 子序列 2 分级），用例 ui112_fuzzy_function_search_matches_subsequence_and_ranks_prefix_first。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "候选分类/模糊匹配",
+          "next": "已验收（2026-11-18）；父项仍保留 UI-11.1 IME、11.3 拖动、11.4 向导点击。",
           "updated_utc": "2026-11-16T22:10:21Z"
         },
         {
