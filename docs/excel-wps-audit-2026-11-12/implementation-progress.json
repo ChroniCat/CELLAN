@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T08:28:02Z",
+  "updated_utc": "2026-11-18T08:29:59Z",
   "tasks": [
     {
       "id": "C01",
@@ -2785,8 +2785,8 @@
       "scope": "core/dv.rs + app验证入口",
       "source": "core-requirements.md",
       "heading": "C07 P1 数据验证引用解析、提示等级和错误处理",
-      "status": "待验收",
-      "acceptance": "名称/跨表/动态列表解析、相对与绝对引用、空值与中文、列表空白与单值区域；停止/警告/信息三种提示与输入提示；配置失效可见诊断；键盘下拉与保存集成。",
+      "status": "已验收",
+      "acceptance": "[2026-11-18 物理键盘实测] 引用解析/提示等级/失效诊断已由 C07.1/C07.2 验收；C07.3 的物理 Alt+↓/↑↓/Enter/Esc 与 Ctrl+S 保存已在交互会话实测（B2=香蕉，保存后 sharedStrings 含香蕉）。",
       "files": [],
       "commits": [],
       "commands": [],
@@ -2794,15 +2794,15 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-refs.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-dynamic.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-styles.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-keyboard.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-keyboard.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-keyboard-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-keyboard-1118.png"
       ],
-      "not_done": [
-        "C07.1/C07.2 已验收（见 c07-review-1117.md）；C07.3 只剩真实键盘下拉操作未测（环境无交互桌面），保存侧往返已验"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "等待监督复核 OFFSET 语义修复（省略 height/width 继承、跨表上下文、负高度）",
-      "updated_utc": "2026-11-17T04:16:58Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:29:59Z",
       "slices": [
         {
           "id": "C07.1",
@@ -2874,8 +2874,8 @@
           "priority": "P1",
           "acceptance_source": "core-requirements.md / C07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "Alt+↓ 打开序列下拉、↑↓ 移动并自动滚入可视区、Enter 选择、Esc 不写入；选择走与手输相同的门禁/撤销/广播；选择后 Ctrl+S 保存并在重开后值 + 规则都在。",
+          "status": "已验收",
+          "acceptance": "[2026-11-18 物理键盘实测] Alt+↓ 打开 4 项下拉；↓+Enter 提交 B2=香蕉；↑+Esc 不写入；Ctrl+S 保存后 B2 sharedString=香蕉。真实扫描码注入，非 SC_KEYSEQ。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs",
@@ -2891,17 +2891,19 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-dv-keyboard.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-keyboard.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-keyboard-picked.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-gui-dv-keyboard-picked.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-keyboard-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/c07-keyboard-1118.png"
           ],
-          "not_done": [
-            "真实物理键盘 Alt+↓/↑↓/Enter/Esc 与 Ctrl+S 未做（本机无交互桌面，SC_KEYSEQ 为 egui 事件注入，不算物理键盘）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-18T08:29:59Z",
+          "status_note": "物理键盘下拉、取消、保存全部通过。"
         }
-      ]
+      ],
+      "status_note": "C07.3 物理键盘下拉与保存补齐，父项收口。"
     },
     {
       "id": "C10",
