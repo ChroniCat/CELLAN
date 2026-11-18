@@ -6759,17 +6759,19 @@
       "scope": "app名称管理/名称框 + core名称解析",
       "source": "ui-requirements.md",
       "heading": "UI-28 名称管理器和名称框闭环",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "UI-28.1 已验收：名称作用域、名称框区域定位、非法名称和错误引用的行为均有 app/core 回归与证据。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T21:07:30Z",
+      "updated_utc": "2026-11-18T14:30:00Z",
       "slices": [
         {
           "id": "UI-28.1",
@@ -6777,8 +6779,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-28 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "定义销售额=Sheet1!$A$1:$B$3 后，名称框 Enter 调用的 goto_name 选中 A1:B3 六格；S1/S2 同名局部名称分别解析到各自范围；A1/$A$1/XFD1048576/R1C1/R/C 被拒；Sheet1!A1:、BOGUS、未知表引用被拒。",
           "files": [
             "crates/app/src/main.rs",
             "crates/core/src/formula/mod.rs",
@@ -6789,18 +6791,20 @@
           "commands": [
             "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 name_box => 3 passed (named range A1:B3, local scope precedence, cross-sheet switch)",
             "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 defined_name => 2 passed (A1/$A$1/XFD1048576/R1C1/R/C rejected; bad refs Sheet1!A1:, BOGUS, unknown sheet rejected)",
-            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 390 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-ui28-final.log)"
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 391 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-ui28-final2.log)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 local_names => 1 passed (same local name on S1/S2 resolves per sheet)"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui28-names.txt",
+            "crates/app/src/edit_regression_tests.rs"
           ],
           "not_done": [
-            "真实鼠标点开名称框下拉、真实 Enter 提交未做（输入注入限制）；名称框 Enter 调用的 goto_name 已由 app 回归覆盖：单格/区域/跨表、局部优先、A1/R1C1 拒绝、错误引用拒绝。"
+            "真实鼠标展开名称框下拉未点选；名称框 Enter 提交调用的 goto_name 行为已由 app 回归覆盖（单格/区域/跨表、局部优先、保留名称、错误引用）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-18T14:05:00Z"
+          "updated_utc": "2026-11-18T14:30:00Z"
         }
       ]
     },

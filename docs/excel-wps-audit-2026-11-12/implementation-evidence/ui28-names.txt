@@ -84,3 +84,10 @@ UI-28.1 保持待验收；但名称框按 Enter 调用的 `goto_name` 行为已�
 
 全量回归（当前 HEAD + 本次改动）：`cargo test -p app --bin app -- --test-threads=1`
 = **390 passed / 0 failed / 1 ignored**（391 total）。
+
+补充：S1 与 S2 各定义同名局部名称 `值`（S1 A1:A2、S2 C3:D4），
+`local_names_with_same_text_resolve_per_sheet` 在两个表分别选中各自范围；原验收的
+“不同表同名局部名称解析正确”由该用例覆盖。
+
+最终全量（含同名局部名称用例）：`cargo test -p app --bin app -- --test-threads=1`
+= **391 passed / 0 failed / 1 ignored**（392 total，APP_EXIT=0）。

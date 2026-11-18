@@ -476,6 +476,29 @@ fn name_box_selects_named_range_across_sheets() {
 }
 
 #[test]
+fn local_names_with_same_text_resolve_per_sheet() {
+    let mut app = app();
+    let s1 = app.wb.sheets[0].name.clone();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    app.wb.names.push((
+        "值".into(),
+        Some(0),
+        format!("'{s1}'!$A$1:$A$2"),
+    ));
+    app.wb.names.push(("值".into(), Some(1), "'Other'!$C$3:$D$4".into()));
+
+    app.sheet_idx = 0;
+    app.name_buf = "值".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 0)), "S1 的局部名称");
+
+    app.sheet_idx = 1;
+    app.name_buf = "值".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((2, 2), (3, 3)), "Other 的局部名称");
+}
+
+#[test]
 fn defined_names_reject_cell_addresses_and_reserved_rc() {
     for bad in ["A1", "$A$1", "XFD1048576", "R1C1", "r12c3", "R", "C", "1Name", "A-B"] {
         assert!(
