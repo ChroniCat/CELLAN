@@ -766,6 +766,11 @@ fn ribbon_groups_aligned_and_fit() {
             continue;
         }
         groups.push((title, num("x="), num("y="), num("w="), num("h=")));
+        // 打开文件后功能区会按工作簿上下文重排（1440 宽只剩 5 组），
+        // 本用例断言的是“开始页”首帧，取第一组完整 8 个分组后停止。
+        if groups.len() >= 8 {
+            break;
+        }
     }
     let names: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
     assert_eq!(

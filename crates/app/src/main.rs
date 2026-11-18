@@ -1621,6 +1621,8 @@ struct SheetApp {
     a11y_list: Vec<sheetcore::a11y::Issue>,
     /// 性能验收：SC_SAVE_ASYNC 只触发一次
     async_save_fired: bool,
+    /// Tab 在 egui 里会顺带把焦点交给功能区；本帧结束后清掉，键盘留在网格
+    clear_grid_focus: bool,
     /// 工作表视图
     views: Vec<ui_prefs::SavedView>,
     view_active: Option<usize>,
@@ -2681,6 +2683,7 @@ impl SheetApp {
             a11y_open: false,
             a11y_list: Vec::new(),
             async_save_fired: false,
+            clear_grid_focus: false,
             views: Vec::new(),
             view_active: None,
             view_new: None,
@@ -10778,8 +10781,22 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if self.editing.is_none() && ctx.wants_keyboard_input() {
-            // 对话框/查找框有焦点时不要把按键当成网格快捷键
-            return;
+            // 对话框/查找框有焦点时不要把按键当成网格快捷键。
+            // egui 的 Tab 会先把焦点交给第一个可聚焦控件；网格不是控件，
+            // 所以本帧先让 Tab 完成移动，帧末再把这次“顺带”得到的焦点清掉。
+            if ctx.input(|i| i.key_pressed(Key::Tab))
+                && !self.palette_open
+                && !self.find.open
+                && !self.dialog_modal
+            {
+                if let Some(id) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+                ctx.memory_mut(|m| m.stop_text_input());
+                self.clear_grid_focus = true;
+            } else {
+                return;
+            }
         }
         if self.editing.is_some() {
             // 编辑框内的按键交给 TextEdit 自己处理
@@ -26841,6 +26858,10 @@ let txn = self.txn_begin(&keys);
             // 点到别人正在编辑的格子，直接告诉他
             if let Some(pos) = resp.interact_pointer_pos() {
                 if pos.x > origin.x + head_w && pos.y > origin.y + hh {
+                    if let Some(id) = ctx.memory(|m| m.focused()) {
+                        ctx.memory_mut(|m| m.surrender_focus(id));
+                    }
+                    ctx.memory_mut(|m| m.stop_text_input());
                     let cc = col_at(pos.x);
                     let rr = row_at(pos.y);
                     if let Some(holder) = self.lock_holder(rr, cc) {
@@ -31274,6 +31295,13 @@ impl eframe::App for SheetApp {
                         self.handle_keys(ctx);
                     }
                     self.draw_grid(ui, ctx);
+                    if self.clear_grid_focus {
+                        if let Some(id) = ctx.memory(|m| m.focused()) {
+                            ctx.memory_mut(|m| m.surrender_focus(id));
+                        }
+                        ctx.memory_mut(|m| m.stop_text_input());
+                        self.clear_grid_focus = false;
+                    }
                 }
             });
 

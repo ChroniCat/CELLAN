@@ -6817,6 +6817,20 @@ fn dv_information_ok_button_writes_once() {
 }
 
 #[test]
+fn first_tab_after_startup_moves_cell_instead_of_leaving_focus_in_ribbon() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    ui_frame(&mut app, &ctx, vec![]);
+    // egui 会在第一次 Tab 时把焦点交给第一个可聚焦控件；这不等于用户点在网格上，
+    // 不能因此吞掉“提交并右移”。
+    ui_frame(&mut app, &ctx, vec![key_event(egui::Key::Tab, false)]);
+    assert_eq!(app.sel, (0, 1), "首次 Tab 应移动单元格");
+    assert!(!ctx.wants_keyboard_input(), "Tab 后不应把焦点留在功能区控件");
+}
+
+#[test]
 fn f2_replace_then_tab_commits_and_moves_right() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);

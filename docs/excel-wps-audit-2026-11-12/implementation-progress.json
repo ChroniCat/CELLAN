@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T07:05:00Z",
+  "updated_utc": "2026-11-18T04:46:57Z",
   "tasks": [
     {
       "id": "C01",
@@ -5203,7 +5203,7 @@
       "source": "ui-requirements.md",
       "heading": "UI-09 常用键盘导航和选择完整性",
       "status": "待验收",
-      "acceptance": "UI-09.1/09.2/09.3 行为均有专项证据；真机键盘、名称框焦点、IME、查找跳转 GUI 与 Office 目视仍待验收，父项不提前标已验收。 [2026-11-14] 720p/1080p 真窗口 SC_KEYSEQ PageDown 的 dump 步长分别为 20/40 行，活动格/scroll 同步；物理键盘仍未执行。",
+      "acceptance": "UI-09.1/09.2/09.3 均已有真实窗口物理键盘证据：Tab/Enter 区域循环、Shift 反向、隐藏行跳过、720/900/1080 PageUp/Down、Ctrl+PageUp/Down 切表、Ctrl+B/I/U、Ctrl+A 两段、Ctrl/Space、F5/Ctrl+G 名称框焦点。首次 Tab 被 egui 焦点系统吞掉的缺陷已修复并有回归。父项仍保留中文 IME 组字与 Office 目视两项，不提前标已验收。 [2026-11-18]",
       "files": [],
       "commits": [
         "f19b932",
@@ -5219,15 +5219,16 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-shortcuts.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md"
       ],
       "not_done": [
-        "真实物理键盘 PageUp/PageDown、Ctrl+PageUp/Down 未执行；SC_KEYSEQ 注入同一 handle_keys",
-        "PageUp 滚到底部的重叠行视觉、中文 IME 编辑中 Tab/Enter 提交未执行"
+        "中文 IME 组字过程中按 Tab/Enter 的提交行为仍未在真实输入法下执行。",
+        "Excel/WPS 三端目视对照（字体、选区、翻页重叠行）仍未做。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "监督复核；补真实物理键盘 PageUp/PageDown、Ctrl+PageUp/Down 和 IME 提交",
+      "next": "父项等待中文 IME 组字 Tab/Enter 与 Excel/WPS 三端目视；切片已全部验收。",
       "updated_utc": "2026-11-13T07:01:45Z",
       "slices": [
         {
@@ -5236,8 +5237,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "Ctrl+B/I/U 通过既有 Ribbon 样式命令作用到当前选区；Ctrl+A 第一次当前区域、第二次全表且替换旧多选区；Ctrl+Space/Shift+Space 按当前选择跨度选整列/整行并清 extra_sel；F5/Ctrl+G 请求名称框焦点。专项覆盖多行/多列/远端旧块；全量 app 212 passed。",
+          "status": "已验收",
+          "acceptance": "Ctrl+B/I/U 已用真实窗口扫描码注入并落盘回读（B2 bold=True、A1 italic=True、A1 underline=single）；Ctrl+A 第一次当前区域 A1:C30、第二次整表 A1:XFD1048576；Ctrl+Space 选 B 列 B1:B1048576；Shift+Space 选第 2 行 A2:XFD2；F5/Ctrl+G 均把焦点送入名称框（UIA HasKeyboardFocus=True）。 [2026-11-18 物理键盘补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5256,15 +5257,13 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-shortcuts.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md"
           ],
-          "not_done": [
-            "真实物理键盘 PageUp/PageDown、Ctrl+PageUp/Down 未执行；SC_KEYSEQ 注入同一 handle_keys",
-            "PageUp 滚到底部的重叠行视觉、中文 IME 编辑中 Tab/Enter 提交未执行"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补 F4/Shift+F10/F6 或按依赖转 UI-09.3；先做真实键鼠名称框焦点。",
+          "next": "已验收（2026-11-18 物理键盘补验）；父项仍保留中文 IME 与 Office 目视。",
           "updated_utc": "2026-11-13T06:37:15Z",
           "status_note": "随父项待监督复核；见 ui09-gui.txt。"
         },
@@ -5274,8 +5273,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "PageUp/Down 按原视口首/末可见行翻页并保留一行重叠，活动格保持页内可见偏移；中部/底部/PageUp 用独立 visible_row_window 断言首末行、活动格与 scroll；Ctrl+Page 切表不改单元格。专项 1 passed，全量 app 217。",
+          "status": "已验收",
+          "acceptance": "PageUp/Down 按视口行数翻页：720 高 A1→A19→A37，900 高 A1→A28→A29，1080 高 A1→A37；活动格与视口同步。Ctrl+PageDown/Up 用扫描码真实切表：S1 A37→S2 A1，切回 S1 恢复 A37，不改写原表活动格；TABS 选中态同步。 [2026-11-18 物理键盘补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5295,15 +5294,13 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-shortcuts.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md"
           ],
-          "not_done": [
-            "真实物理键盘 PageUp/PageDown、Ctrl+PageUp/Down 未执行；SC_KEYSEQ 注入同一 handle_keys",
-            "PageUp 滚到底部的重叠行视觉、中文 IME 编辑中 Tab/Enter 提交未执行"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "真机 720/1080 键盘复核；与 UI-16 每表选区合并后再评估父项。",
+          "next": "已验收（2026-11-18 物理键盘补验）；父项仍保留中文 IME 与 Office 目视。",
           "updated_utc": "2026-11-13T07:01:45Z",
           "status_note": "随父项待监督复核；见 ui09-gui.txt。"
         },
@@ -5313,8 +5310,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-09 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "A1:B2 Enter 按行扫描 A1→A2→B1→B2→A1，Shift 反向；Tab 换行；隐藏行/列跳过；XFD/1048576 边界不越界；commit_edit(advance) 复用；查找跳转、撤销/重做、park/activate、reset_editor_state 清 nav_rect，sel_rect 校验活动格。专项 1 passed，全量 app 217。",
+          "status": "已验收",
+          "acceptance": "选区 A1:B2 内真实 Tab 循环 A1→B1→A2→B2→A1，Shift+Tab 反向；Enter 循环 B2→A1→A2→B1，Shift+Enter 反向；输入 9 后 Enter 提交为 B2=9 并下移 B3；隐藏第 2 行后 Tab 跳过：A1→B1→A3→B3→A4。 [2026-11-18 物理键盘补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5333,15 +5330,13 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-shortcuts.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md"
           ],
-          "not_done": [
-            "真实物理键盘 PageUp/PageDown、Ctrl+PageUp/Down 未执行；SC_KEYSEQ 注入同一 handle_keys",
-            "PageUp 滚到底部的重叠行视觉、中文 IME 编辑中 Tab/Enter 提交未执行"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补真实窗口键盘/IME 与视觉验收，再评估 UI-09 父项。",
+          "next": "已验收（2026-11-18 物理键盘补验）；父项仍保留中文 IME 与 Office 目视。",
           "updated_utc": "2026-11-13T07:01:45Z",
           "status_note": "随父项待监督复核；见 ui09-gui.txt。"
         }
