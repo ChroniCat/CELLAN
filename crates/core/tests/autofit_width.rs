@@ -88,3 +88,47 @@ fn wrapped_autofit_uses_longest_line() {
         sheetcore::display::excel_autofit_chars_styled("1\n22", false, 0)
     );
 }
+
+#[test]
+fn autofit_uses_excel_size_curves() {
+    // work/probe/excel_autofit_size_matrix2.out：Excel 16.0，Font.Name=等线，
+    // 每种字号先重置 ColumnWidth=8.43 再 AutoFit。11 号仍走原精确模型。
+    let cases = [
+        ("1", 8.0, 1.63),
+        ("11111", 8.0, 4.63),
+        ("111111111111", 8.0, 9.25),
+        ("中", 14.0, 3.50),
+        ("中文文字", 14.0, 10.75),
+        ("111111111111", 14.0, 15.88),
+        ("1", 24.0, 3.75),
+        ("111111111111", 24.0, 27.00),
+        ("中文文字中", 24.0, 22.88),
+    ];
+    for (s, size, want) in cases {
+        let got = sheetcore::display::excel_autofit_chars_at_size(s, false, 0, size);
+        assert!(
+            (got - want).abs() < 0.02,
+            "{s:?} size={size}: got {got}, want {want}"
+        );
+    }
+    // 非实测档位按相邻字号插值：14 与 16 的中点。
+    let mid = sheetcore::display::excel_autofit_chars_at_size("1", false, 0, 15.0);
+    assert!((mid - 2.44).abs() < 0.02, "size 15 interpolation got {mid}");
+}
+
+#[test]
+fn wrapped_autofit_respects_size() {
+    let cases = [
+        ("1\n22", 8.0, 2.38),
+        ("中文\n中文文字", 14.0, 10.75),
+        ("1\n22", 14.0, 3.63),
+    ];
+    for (s, size, want) in cases {
+        let got =
+            sheetcore::display::excel_autofit_chars_wrapped_at_size(s, false, 0, true, size);
+        assert!(
+            (got - want).abs() < 0.02,
+            "{s:?} size={size}: got {got}, want {want}"
+        );
+    }
+}

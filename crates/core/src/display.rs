@@ -284,6 +284,95 @@ pub fn excel_autofit_chars_styled(s: &str, bold: bool, indent: u8) -> f32 {
         + indent as f32 * 3.0
 }
 
+/// Excel 16.0（Normal=等线 11）对**不同字号**做 AutoFit 的实测列宽。
+/// 每一档是 `(字号, ASCII 等宽字符数曲线, 纯 CJK 字符数曲线)`。
+/// 数据来源：`work/probe/excel_autofit_size_matrix2.out`；每条曲线按单元格
+/// `Font.Name=等线`、`Font.Size=字号`、`ColumnWidth=8.43` 后 `AutoFit()` 读取。
+/// 11 号仍走 `excel_autofit_chars` 的精确模型（含纯 CJK 的像素量化）。
+const AUTOFIT_SIZE_CURVES: &[(f32, &[(f32, f32)], &[(f32, f32)])] = &[
+    (8.0, &[(1.0,1.63),(2.0,2.38),(3.0,3.13),(4.0,3.88),(5.0,4.63),(6.0,5.38),(7.0,6.13),(8.0,6.88),(9.0,7.63),(10.0,8.38),(11.0,9.13),(12.0,9.25)], &[(1.0,2.25),(2.0,3.63),(3.0,5.00),(4.0,6.38),(5.0,7.75)]),
+    (9.0, &[(1.0,1.63),(2.0,2.38),(3.0,3.13),(4.0,3.88),(5.0,4.63),(6.0,5.38),(7.0,6.13),(8.0,6.88),(9.0,7.63),(10.0,8.38),(11.0,9.13),(12.0,9.38)], &[(1.0,2.38),(2.0,3.88),(3.0,5.38),(4.0,6.88),(5.0,8.38)]),
+    (10.0, &[(1.0,1.75),(2.0,2.63),(3.0,3.50),(4.0,4.38),(5.0,5.25),(6.0,6.13),(7.0,7.00),(8.0,7.88),(9.0,8.75),(10.0,9.63),(11.0,10.63),(12.0,10.88)], &[(1.0,2.50),(2.0,4.13),(3.0,5.75),(4.0,7.38),(5.0,9.00)]),
+    (11.0, &[(1.0,1.88),(2.0,2.88),(3.0,3.88),(4.0,4.88),(5.0,5.88),(6.0,6.88),(7.0,7.88),(8.0,8.88),(9.0,9.88),(10.0,11.00),(11.0,12.13),(12.0,12.38)], &[(1.0,2.75),(2.0,4.63),(3.0,6.50),(4.0,8.38),(5.0,10.38)]),
+    (12.0, &[(1.0,1.88),(2.0,2.88),(3.0,3.88),(4.0,4.88),(5.0,5.88),(6.0,6.88),(7.0,7.88),(8.0,8.88),(9.0,9.88),(10.0,11.00),(11.0,12.13),(12.0,12.50)], &[(1.0,2.88),(2.0,4.88),(3.0,6.88),(4.0,8.88),(5.0,11.00)]),
+    (14.0, &[(1.0,2.38),(2.0,3.63),(3.0,4.88),(4.0,6.13),(5.0,7.38),(6.0,8.63),(7.0,9.88),(8.0,11.25),(9.0,12.63),(10.0,14.00),(11.0,15.50),(12.0,15.88)], &[(1.0,3.50),(2.0,5.88),(3.0,8.25),(4.0,10.75),(5.0,13.38)]),
+    (16.0, &[(1.0,2.50),(2.0,3.88),(3.0,5.25),(4.0,6.63),(5.0,8.00),(6.0,9.38),(7.0,10.88),(8.0,12.38),(9.0,13.88),(10.0,15.50),(11.0,17.00),(12.0,17.38)], &[(1.0,3.75),(2.0,6.38),(3.0,9.00),(4.0,11.88),(5.0,14.75)]),
+    (18.0, &[(1.0,3.00),(2.0,4.63),(3.0,6.25),(4.0,7.88),(5.0,9.50),(6.0,11.25),(7.0,13.00),(8.0,14.88),(9.0,16.63),(10.0,18.50),(11.0,20.25),(12.0,20.50)], &[(1.0,4.38),(2.0,7.38),(3.0,10.38),(4.0,13.75),(5.0,17.13)]),
+    (20.0, &[(1.0,3.13),(2.0,4.88),(3.0,6.63),(4.0,8.38),(5.0,10.13),(6.0,12.13),(7.0,14.00),(8.0,16.00),(9.0,17.88),(10.0,19.88),(11.0,21.75),(12.0,22.38)], &[(1.0,4.75),(2.0,8.13),(3.0,11.63),(4.0,15.38),(5.0,19.13)]),
+    (24.0, &[(1.0,3.75),(2.0,5.88),(3.0,8.00),(4.0,10.13),(5.0,12.50),(6.0,14.88),(7.0,17.25),(8.0,19.50),(9.0,21.88),(10.0,24.25),(11.0,26.63),(12.0,27.00)], &[(1.0,5.63),(2.0,9.63),(3.0,14.00),(4.0,18.50),(5.0,22.88)]),
+];
+
+fn interpolate_autofit_curve(points: &[(f32, f32)], x: f32) -> f32 {
+    if points.len() == 1 {
+        return points[0].1;
+    }
+    if x <= points[0].0 {
+        return points[0].1;
+    }
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        if x <= x1 {
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+        }
+    }
+    let (x0, y0) = points[points.len() - 2];
+    let (x1, y1) = points[points.len() - 1];
+    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+}
+
+fn autofit_size_width(s: &str, size: f32) -> Option<f32> {
+    let mut ascii = 0.0f32;
+    let mut cjk = 0usize;
+    for c in s.chars() {
+        if (c as u32) >= 0x2e80 {
+            cjk += 1;
+        } else {
+            ascii += 1.0;
+        }
+    }
+    let units = ascii + cjk as f32 * 2.0;
+    let curve_width = |curve: &(f32, &[(f32, f32)], &[(f32, f32)])| {
+        if ascii == 0.0 && cjk > 0 {
+            interpolate_autofit_curve(curve.2, cjk as f32)
+        } else {
+            interpolate_autofit_curve(curve.1, units)
+        }
+    };
+    if size <= AUTOFIT_SIZE_CURVES[0].0 {
+        return Some(curve_width(&AUTOFIT_SIZE_CURVES[0]));
+    }
+    let last = AUTOFIT_SIZE_CURVES.len() - 1;
+    if size >= AUTOFIT_SIZE_CURVES[last].0 {
+        return Some(curve_width(&AUTOFIT_SIZE_CURVES[last]));
+    }
+    for pair in AUTOFIT_SIZE_CURVES.windows(2) {
+        let lo = &pair[0];
+        let hi = &pair[1];
+        if size <= hi.0 {
+            let t = (size - lo.0) / (hi.0 - lo.0);
+            let w0 = curve_width(lo);
+            let w1 = curve_width(hi);
+            return Some(w0 + (w1 - w0) * t);
+        }
+    }
+    None
+}
+
+/// 非 11 号字号的 AutoFit：按 Excel 实测字号曲线取宽度。
+/// 11 号保留原精确模型；其他字号在相邻实测档之间线性插值。
+/// 字体加粗/缩进的偏移按字号比例缩放（11 号仍走原 +0.37/+3.0）。
+pub fn excel_autofit_chars_at_size(s: &str, bold: bool, indent: u8, size: f32) -> f32 {
+    if (size - 11.0).abs() < 0.01 {
+        return excel_autofit_chars_styled(s, bold, indent);
+    }
+    if let Some(w) = autofit_size_width(s, size) {
+        let scale = size / 11.0;
+        return w + if bold { 0.37 * scale } else { 0.0 } + indent as f32 * 3.0 * scale;
+    }
+    excel_autofit_chars_styled(s, bold, indent)
+}
+
 /// 自动换行格的 AutoFit：Excel 取**最长一行**，不是整段所有字符相加。
 /// `1\n22` 实测列宽 2.88（不是 4.75）；`中文\n中文文字` 取 4 个汉字 8.38。
 pub fn excel_autofit_chars_wrapped(
@@ -297,6 +386,22 @@ pub fn excel_autofit_chars_wrapped(
     }
     s.split('\n')
         .map(|line| excel_autofit_chars_styled(line, bold, indent))
+        .fold(0.0f32, f32::max)
+}
+
+/// 带字号与换行的 AutoFit：按行取最大，且字号不是 11 时使用实测曲线。
+pub fn excel_autofit_chars_wrapped_at_size(
+    s: &str,
+    bold: bool,
+    indent: u8,
+    wrap: bool,
+    size: f32,
+) -> f32 {
+    if !wrap {
+        return excel_autofit_chars_at_size(s, bold, indent, size);
+    }
+    s.split('\n')
+        .map(|line| excel_autofit_chars_at_size(line, bold, indent, size))
         .fold(0.0f32, f32::max)
 }
 

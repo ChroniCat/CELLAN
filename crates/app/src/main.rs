@@ -6589,12 +6589,14 @@ impl SheetApp {
             // Excel AutoFit 是「字符单位 + 固定内边距」，不是按字形 advance
             // 求和；用 Carlito 的 text_width 再除 7 会差 1–1.5 字符。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
-            // 缩进按 3 字符/级、粗体按 +0.37 计入；不能再额外乘字号。
-            let chars = sheetcore::display::excel_autofit_chars_wrapped(
+            let font_size = if st.size > 0.0 { st.size } else { 11.0 };
+            // 缩进按 3 字符/级、粗体按 +0.37 计入；字号走 Excel 实测曲线。
+            let chars = sheetcore::display::excel_autofit_chars_wrapped_at_size(
                 &txt,
                 st.bold,
                 st.indent,
                 st.wrap,
+                font_size,
             );
             let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {

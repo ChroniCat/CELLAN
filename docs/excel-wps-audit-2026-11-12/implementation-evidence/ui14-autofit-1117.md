@@ -132,3 +132,35 @@ Excel 实测（`work/probe/excel_autofit_wrap3.out`，单元格 等线 11、wrap
 仍未做：真实鼠标双击列边界；非 11 号字号的 AutoFit；该夹具里 10 位 ASCII 数字串
 Excel 给 7.88、等线 11 公式给 11.0，说明 ASCII 比例字体的量化尚未完全反解，
 不能把多行/合并的对齐扩大成“所有字符串已精确”。
+
+## 非 11 号字号曲线（2026-11-18 第五次对拍）
+
+Excel 实测：`work/probe/excel_autofit_size_matrix2.ps1` 对 17 个字符串
+（`1`…12 个 `1`、`中`…5 个汉字）× 10 个字号（8/9/10/11/12/14/16/18/20/24）
+逐项设 `Font.Name=等线`、`Font.Size=字号`、重置 `ColumnWidth=8.43` 后
+`AutoFit()`，输出 `work/probe/excel_autofit_size_matrix2.out`。每档曲线已固化在
+`crates/core/src/display.rs::AUTOFIT_SIZE_CURVES`。
+
+端到端（`work/probe/cua_autofit_size.xlsx`，字体 等线；`SC_AUTOFIT=c:N` 后读回
+保存文件的 `<col width>`）：
+
+| 列 | 文本 | 字号 | app chars | app 存盘宽度 | Excel ColumnWidth |
+|---|---|---:|---:|---:|---:|
+| A | `中文文字中文` | 14 | 16.01 | 16.01 | 16.00（四舍五入到 0.01 档） |
+| B | `1` | 8 | 1.63 | 1.63 | 1.63 |
+| C | `123456789012` | 14 | 15.88 | 15.88 | 15.88 |
+
+实现：`excel_autofit_chars_at_size` / `excel_autofit_chars_wrapped_at_size`；
+11 号仍走原 `excel_autofit_chars_styled` 精确模型，其他字号按相邻实测档
+线性插值；纯 CJK 与 ASCII/混合串使用两条独立曲线。`autofit_col` 传入
+`st.size`（Excel 字号，不用屏幕 px）。
+
+新增断言 `autofit_uses_excel_size_curves`、`wrapped_autofit_respects_size`；
+`cargo test -q -p sheetcore --offline --test autofit_width -- --test-threads=2`
+= **5 passed**；app 全量
+`cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1`
+= **386 passed / 0 failed / 1 ignored / APP_EXIT=0**（`app-autofit-size.log`）。
+
+仍未做：非整数/未采样字号（如 13、15）只是插值；粗体/缩进在非 11 号只按
+`size/11` 比例缩放，未逐项实测；真实鼠标双击列边界仍缺。不能把这三档
+端到端值扩大成“所有字号、所有字体已精确”。
