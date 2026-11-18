@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T04:58:09Z",
+  "updated_utc": "2026-11-18T05:11:03Z",
   "tasks": [
     {
       "id": "C01",
@@ -5597,8 +5597,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "编辑 =A1 时点 B2 变成引用而非意外提交；A1→$A$1→A$1→$A1→A1；引用彩色显示。",
+          "status": "已验收",
+          "acceptance": "真实鼠标在编辑 =A1 时点 B2：活动格仍 A1、公式变 =B2、状态“已插入引用 B2”，B2 蓝色引用边框；真实 F4 四次回读 A1→$A$1→A$1→$A1→A1；B2 同样循环 $B$2→B$2→$B2→B2。 [2026-11-18 物理补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5620,14 +5620,15 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-probe/probe.log",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-range-ref.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui113-physical-1118.md"
           ],
           "not_done": [
-            "真实按住拖动跨表建 Sheet2!B2:C4 未验（无交互桌面）；代码路径与单测已覆盖（切表清锚点 + 带表名/引号的 pick_range_label）。"
+            "真实按住拖动跨表建 Sheet2!B2:C4 未验（本机交互桌面无法稳定保持按住拖动）；代码路径与单测已覆盖（切表清锚点 + 带表名/引号的 pick_range_label）。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "跨工作表引用",
+          "next": "已验收（2026-11-18）；仅保留跨表按住拖动未验。",
           "updated_utc": "2026-11-16T22:10:21Z"
         },
         {
