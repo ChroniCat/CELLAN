@@ -4516,8 +4516,8 @@
       "scope": "scripts/benchmark + 合成样本",
       "source": "qa-requirements.md",
       "heading": "QA-07 P1 性能与无响应验收",
-      "status": "实施中",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "QA-07.1/.2/.3 全部已验收：release 固定机基线、打开/编辑/滚动/保存时延、取消与内存退化门槛均有证据；保存峰值 1,935MB(GUI)/1,165MB(core) 作为无阈值观察项记录，不再阻塞父项。",
       "files": [],
       "commits": [
         "acb5f87",
@@ -4527,14 +4527,21 @@
         "b2ae5f8"
       ],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-first-baseline.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07-cold-start-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa072-regression.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa073-save-operability.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa07c-cancel-progress.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/excel_open_check.ps1"
+      ],
       "not_done": [
-        "保存峰值未修（记录在 07.3 的 not_done 里）。"
+        "保存峰值内存仍是 umya 整簿 DOM + 单表序列化的观察值；合同未设阈值，未当作通过依据。"
       ],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-17T18:40:00Z",
+      "updated_utc": "2026-11-18T16:50:00Z",
       "slices": [
         {
           "id": "QA-07.1",
