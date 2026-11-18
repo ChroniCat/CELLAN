@@ -6204,8 +6204,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-15 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "双下划线是独立 xf（`<u val=\"double\"/>`），竖排是 `textRotation=\"255\"` 而非 rotation=90；Excel/WPS 回读 -4119/-4166；本应用 framebuffer 实测 A1 两条下划线、B1 财务报表字符正立纵排。",
           "files": [
             "crates/core/src/style.rs",
             "crates/core/src/xlsx.rs",
@@ -6214,17 +6214,23 @@
             "crates/core/tests/ui15_fixture.rs"
           ],
           "commits": [],
-          "commands": [],
+          "commands": [
+            "SC_SHOT on ui153_visual.xlsx => B1 stacked vertically; A1 dark pixel rows y390 and y392-393 under AAA",
+            "Excel COM: A1_UL=-4119 A1_ORI=-4166; WPS COM: A1_ORI=-4166 (existing ui15 fixture)",
+            "cargo test -q -p app --bin app --offline -j 2 -- --test-threads=1 => 392 passed / 0 failed / 1 ignored / APP_EXIT=0 (app-ui153-final.log)"
+          ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui15-double-vertical.png",
+            "crates/app/src/main.rs"
           ],
           "not_done": [
-            "双下划线独立 xf；竖排 textRotation=255 非 rotation=90；Excel/WPS 回读 -4119/-4166；真实键鼠未执行"
+            "真实鼠标在格式对话框勾选/取消未做（输入注入限制）；绘制与读写模型已由 framebuffer + Excel/WPS COM 回读覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T20:26:43Z"
+          "updated_utc": "2026-11-18T15:10:00Z"
         }
       ]
     },

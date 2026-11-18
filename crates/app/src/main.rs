@@ -18739,7 +18739,8 @@ let txn = self.txn_begin(&keys);
                     .rich
                     .get(&(r, c))
                     .cloned();
-                if let Some(runs) = rich_runs.filter(|_| !multiline) {
+                // 竖排必须走普通文本路径；富文本分支按 run 横排，会吞掉 textRotation=255。
+                if let Some(runs) = rich_runs.filter(|_| !multiline && !st.vertical_text) {
                     // 富文本：逐段排版、按段推进 x（Excel 的 run 顺序就是显示顺序）
                     let fonts: Vec<(FontId, Color32)> = runs
                         .iter()
@@ -18802,6 +18803,20 @@ let txn = self.txn_begin(&keys);
                         };
 
                         clipped.galley(egui::pos2(x, y), g.clone(), *c);
+                        if st.underline {
+                            let uy = y + gh - 1.0;
+                            clipped.line_segment(
+                                [egui::pos2(x, uy), egui::pos2(x + w, uy)],
+                                Stroke::new(1.0, color),
+                            );
+                            if st.double_underline {
+                                let uy2 = uy + 2.0;
+                                clipped.line_segment(
+                                    [egui::pos2(x, uy2), egui::pos2(x + w, uy2)],
+                                    Stroke::new(1.0, color),
+                                );
+                            }
+                        }
                         x += w;
                     }
                 } else if multiline && !st.vertical_text {
