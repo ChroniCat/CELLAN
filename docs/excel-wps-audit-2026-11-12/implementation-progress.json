@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T08:52:39Z",
+  "updated_utc": "2026-11-18T08:55:53Z",
   "tasks": [
     {
       "id": "C01",
@@ -5473,7 +5473,7 @@
       "scope": "app/main.rs编辑会话 + 函数提示模块",
       "source": "ui-requirements.md",
       "heading": "UI-11 公式输入辅助和编辑焦点",
-      "status": "实施中",
+      "status": "已验收",
       "acceptance": "输入=SU有SUM/SUMIF等可键盘选择；=SUM(显示参数；编辑=A1时点B2变成引用而非意外提交；A1→$A$1→A$1→$A1→A1；中文候选Enter只确认候选；文本中间Alt+Enter插入原光标处。",
       "files": [
         "crates/app/src/main.rs",
@@ -5526,16 +5526,15 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/shot.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/probe2.log",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-physical-1118.md",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-pick-1118.png"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-pick-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-ime-parity-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-excel-ime-1118.png"
       ],
-      "not_done": [
-        "中文 IME 候选确认未实测（真实 IME 不可用）",
-        "UI-11.3 跨表按住拖动仍待真人按住拖选；单击切表+引用已验。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "UI-11.1 真 IME 端到端（需真输入法）；UI-11.2/11.3/11.4 已验收",
-      "updated_utc": "2026-11-18T05:50:53Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:55:53Z",
       "slices": [
         {
           "id": "UI-11.1",
@@ -5680,7 +5679,8 @@
           "next": "已验收（2026-11-18）；仅保留帮助链接/真实 IME。",
           "updated_utc": "2026-11-18T05:41:21Z"
         }
-      ]
+      ],
+      "status_note": "中文 IME 与本机 Excel 对拍：Space 选候选、Enter 提交原始组合串并单步移动，Excel 同结果；其余切片已验收。"
     },
     {
       "id": "UI-12",
