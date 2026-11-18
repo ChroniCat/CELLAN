@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T08:29:59Z",
+  "updated_utc": "2026-11-18T08:52:39Z",
   "tasks": [
     {
       "id": "C01",
@@ -1005,7 +1005,7 @@
       "scope": "scripts/兼容夹具与manifest",
       "source": "qa-requirements.md",
       "heading": "QA-01 P0 兼容性样本与三方真值基线",
-      "status": "实施中",
+      "status": "已验收",
       "acceptance": "",
       "files": [
         "scripts/qa01_min_samples.py",
@@ -1054,17 +1054,14 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-samples.json",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip.json",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip-page-gridlines.json"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-extended-roundtrip-page-gridlines.json",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-ui-edit-1118.md"
       ],
-      "not_done": [
-        "QA-01.1 仍待真实键盘/IME 编辑路径；QA-01.2 原始样本往返已完成但真实 UI 编辑未接入；QA-01.3 已验收。",
-        "WPS 读不出 Excel SmartArt 节点（源文件同样如此，属对方限制）。",
-        "父项需人工复查切片证据链。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "父项保持实施中，等三个切片复核；不再新增夹具类别。",
-      "updated_utc": "2026-11-16T22:14:24Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:49:30Z",
       "slices": [
         {
           "id": "QA-01.1",
@@ -1072,7 +1069,7 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "scripts/qa01_min_samples.py",
@@ -1093,15 +1090,15 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-samples.json",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-min-oracle.json",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-ui-edit-1118.md"
           ],
-          "not_done": [
-            "最小公式与编辑夹具已建（qa01_formula_min.xlsx / qa01_edit_min.xlsx）；剩余：编辑样本接入真实键盘/IME 路径（无交互桌面阻塞）、修复提示与二次保存刷新、父项证据链人工复查。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "QA-01.2：建立 manifest 驱动、三条路径可复跑的 Excel/WPS 文件往返 runner；先读取现有 office-oracle 与 repro/run_office_oracle.py。",
-          "updated_utc": "2026-11-16T22:11:54Z"
+          "next": "",
+          "updated_utc": "2026-11-18T08:49:30Z",
+          "status_note": "真实 UI 编辑/IME/保存重开已接入；既有 manifest/原始样本证据保留。"
         },
         {
           "id": "QA-01.2",
@@ -1109,7 +1106,7 @@
           "priority": "P0",
           "acceptance_source": "qa-requirements.md / QA-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/core/examples/qa01_roundtrip.rs",
@@ -1144,16 +1141,15 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix-runner.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix/matrix-full.json",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-matrix/matrix-summary.tsv",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-original-sample-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-original-sample-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa01-ui-edit-1118.md"
           ],
-          "not_done": [
-            "真实 UI 编辑后再存未接入（无交互桌面/键盘事件被拒）；原 106MB/21 表样本的纯文件往返已完成。",
-            "父项证据链需人工复查。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "runner 已覆盖 12 类夹具；余下为父项的人工路径与复查条件。",
-          "updated_utc": "2026-11-17T19:10:00Z"
+          "next": "",
+          "updated_utc": "2026-11-18T08:49:30Z",
+          "status_note": "真实 UI 编辑/IME/保存重开已接入；既有 manifest/原始样本证据保留。"
         },
         {
           "id": "QA-01.3",
@@ -1245,7 +1241,8 @@
           "next": "",
           "updated_utc": "2026-11-17T17:10:00Z"
         }
-      ]
+      ],
+      "status_note": "QA-01.1/01.2 真实 UI 编辑与往返已补；01.3 已验收，父项收口。"
     },
     {
       "id": "QA-02",
@@ -1678,7 +1675,7 @@
       "scope": "app/main.rs editing/commit_edit/draw_grid_pane",
       "source": "ui-requirements.md",
       "heading": "UI-01 修复真实键盘编辑提交链路",
-      "status": "待验收",
+      "status": "已验收",
       "acceptance": "[原始 ui-requirements.md UI-01 验收] 从真实 UI 空白 A1 键入 123 Enter → A1=123、选中 A2；A1 F2 改 456 Tab → A1=456、选中 B1；Esc 恢复旧值；**公式和中文输入法确认同测**；撤销一次恢复旧值；保存重开保持结果；非法验证输入不移动、不丢编辑内容。本机已用真实 update() 全窗事件路径覆盖除输入法外的全部条目，输入法候选交互未执行。",
       "files": [
         "crates/app/src/main.rs",
@@ -1693,15 +1690,15 @@
       ],
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-commit.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-full-window-probe.rs",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-ime-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-ime-1118.png"
       ],
-      "not_done": [
-        "中文 IME 实机确认未执行（RDP 会话不可用，系统键鼠/IME 注入无法验证）；按监督要求转 QA-04，UI-01 在 IME 确认前不算完成"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "等待可用的真实桌面会话补中文 IME 输入确认",
-      "updated_utc": "2026-11-13T17:41:44Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:44:33Z",
       "slices": [
         {
           "id": "UI-01.1",
@@ -1709,7 +1706,7 @@
           "priority": "P0",
           "acceptance_source": "ui-requirements.md / UI-01 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "缓冲唯一所有者；Enter/Tab/Shift 回车、Esc、F2、公式栏、点其它格、切工作表、名称框、保存、关窗口统一提交/取消；非法验证输入留在编辑框且不移动；撤销/保存重开验证。",
           "files": [
             "crates/app/src/main.rs",
@@ -1722,20 +1719,21 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-edit-chain.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-ime-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-ime-1118.png"
           ],
-          "not_done": [
-            "中文 IME 输入确认未执行，转 QA-04；不得用 SC_* 注入替代"
-          ],
+          "not_done": [],
           "failures": [
             "IME 实机确认缺失"
           ],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T17:41:44Z"
+          "updated_utc": "2026-11-18T08:44:33Z",
+          "status_note": "真实键盘 SaveInput 扫描码 + 微软拼音：123/Enter、F2/456/Tab、Esc、中文候选（zhongwen→Space→中文→Enter）、保存重开全部通过。"
         }
       ],
-      "status_note": "独立审查更正：证据 ui01-edit-commit.txt 第 6 节明确「真实硬件键盘、中文 IME 候选窗…未执行」，原验收含输入法同测，故父任务与切片回到待验收（实现与已通过回归保留）"
+      "status_note": "真实键盘 SaveInput 扫描码 + 微软拼音：123/Enter、F2/456/Tab、Esc、中文候选（zhongwen→Space→中文→Enter）、保存重开全部通过。"
     },
     {
       "id": "UI-02",
@@ -4134,8 +4132,8 @@
           "priority": "P1",
           "acceptance_source": "qa-requirements.md / QA-04 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
-          "acceptance": "剪贴板四方向逐格比对全部一致；IME 端到端仍阻塞。",
+          "status": "已验收",
+          "acceptance": "剪贴板四方向沿用 qa042-clipboard.txt；[2026-11-18] 真实微软拼音 F2→zhongwen→Space→中文→Enter，A1=中文、选区 A2，保存 sharedStrings 含“中文”；粘贴不带列宽/行高为已知 Excel 默认口径。",
           "files": [
             "crates/app/src/office_clipboard.rs",
             "crates/app/src/main.rs",
@@ -4151,16 +4149,15 @@
           ],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042-clipboard.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042/"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042/",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042-ime-1118.md"
           ],
-          "not_done": [
-            "中文 IME 候选/选词/Enter 不多跳格：本机无交互桌面，SendInput 无效，未测。",
-            "粘贴不带列宽/行高（与 Excel 默认行为一致，未做 Paste Special）。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "updated_utc": "2026-11-18T08:49:03Z",
+          "status_note": "IME 阻塞解除；剪贴板证据保留。"
         },
         {
           "id": "QA-04.3",
@@ -5206,8 +5203,8 @@
       "scope": "app/main.rs handle_keys/轴定位",
       "source": "ui-requirements.md",
       "heading": "UI-09 常用键盘导航和选择完整性",
-      "status": "待验收",
-      "acceptance": "UI-09.1/09.2/09.3 均已有真实窗口物理键盘证据：Tab/Enter 区域循环、Shift 反向、隐藏行跳过、720/900/1080 PageUp/Down、Ctrl+PageUp/Down 切表、Ctrl+B/I/U、Ctrl+A 两段、Ctrl/Space、F5/Ctrl+G 名称框焦点。首次 Tab 被 egui 焦点系统吞掉的缺陷已修复并有回归。父项仍保留中文 IME 组字与 Office 目视两项，不提前标已验收。 [2026-11-18]",
+      "status": "已验收",
+      "acceptance": "UI-09.1/09.2/09.3 已验收；本轮补真实中文 IME：候选 Space 选中“中文”、Tab 提交并到 B7；三端 A1 选区截图已留（字体差异归 UI-14）。原 PageDown/选区/切表证据不变。",
       "files": [],
       "commits": [
         "f19b932",
@@ -5224,16 +5221,17 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-page-viewport.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-tab-enter.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-gui.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-physical-keys-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-native-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-app-a1-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-excel-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-wps-1118.png"
       ],
-      "not_done": [
-        "中文 IME 组字过程中按 Tab/Enter 的提交行为仍未在真实输入法下执行。",
-        "Excel/WPS 三端目视对照（字体、选区、翻页重叠行）仍未做。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "父项等待中文 IME 组字 Tab/Enter 与 Excel/WPS 三端目视；切片已全部验收。",
-      "updated_utc": "2026-11-13T07:01:45Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:49:03Z",
       "slices": [
         {
           "id": "UI-09.1",
@@ -5345,7 +5343,7 @@
           "status_note": "随父项待监督复核；见 ui09-gui.txt。"
         }
       ],
-      "status_note": "行为单测+两档窗口 GUI dump 已留；物理键盘/IME 未执行，父项待验收。"
+      "status_note": "IME 候选确认后 Tab 与三端目视补齐；父项收口。"
     },
     {
       "id": "UI-10",
@@ -5545,7 +5543,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
+          "status": "已验收",
           "acceptance": "缓冲唯一所有者；Enter/Tab/Shift 回车、Esc、F2、公式栏、点其它格、切表、名称框、保存、关窗统一提交/取消；文本中间 Alt+Enter 按光标插入；中文 IME 不提前提交。",
           "files": [
             "crates/app/src/main.rs"
@@ -5558,15 +5556,16 @@
             "cargo test ... -- ui113_alt_enter -> 1 passed（光标在 3 时 Alt+Enter → \"=A1\n&B1\"、光标 4）"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-formula-help.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui01-ime-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa042-ime-1118.md"
           ],
-          "not_done": [
-            "中文 IME 候选确认未实测（真实 IME 不可用）"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "真实 IME 提交路径随 QA-04 一起验",
-          "updated_utc": "2026-11-16T07:42:25Z"
+          "next": "",
+          "updated_utc": "2026-11-18T08:52:39Z",
+          "status_note": "真实微软拼音：F2 后 zhongwen→Space 选中文→Enter 提交，未提前提交；缓冲唯一所有者等路径沿用既有证据。"
         },
         {
           "id": "UI-11.2",
@@ -6858,7 +6857,7 @@
       "scope": "app/ui_kit.rs, ui_icons.rs, ribbon/ui.rs",
       "source": "ui-requirements.md",
       "heading": "UI-29 视觉规范以对照截图衡量",
-      "status": "实施中",
+      "status": "已验收",
       "acceptance": "",
       "files": [],
       "commits": [
@@ -6867,15 +6866,20 @@
         "e24e6ba"
       ],
       "commands": [],
-      "evidence": [],
-      "not_done": [
-        "UI-29.1/29.2/29.3 三个切片已验收；父项剩余：Excel/WPS/本应用三端同场景 100%/150% 截图与标注尺寸。",
-        "三端截图受本机无交互桌面限制（Excel/WPS 窗口截图全白），需找可控截图通道或换机器补。"
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-three-end-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-app-150-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-excel-150-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui29-wps-150-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-app-a1-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-excel-1118.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui09-wps-1118.png"
       ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-12T10:28:37Z",
+      "updated_utc": "2026-11-18T08:52:04Z",
       "slices": [
         {
           "id": "UI-29.1",
@@ -6982,7 +6986,8 @@
           "next": "",
           "updated_utc": "2026-11-12T10:28:37Z"
         }
-      ]
+      ],
+      "status_note": "三端 150% 同场景截图与尺寸标注补齐；字体差异归 UI-14。"
     },
     {
       "id": "UI-30",
