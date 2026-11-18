@@ -5896,17 +5896,23 @@
       "scope": "app/fonts加载 + core/style.rs",
       "source": "ui-requirements.md",
       "heading": "UI-14 字体忠实度与行列度量",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "三个切片全部已验收：UI-14.1 系统字体加载/回退、UI-14.2 真 700 字重与字形测量、UI-14.3 换行/自动行列尺寸/PDF 度量；父项原验收的字体差异、金额/身份证/长标题换行、AutoFit 末字符和 PDF 屏幕行数由切片证据链覆盖。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-system-fonts-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-bold-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-autofit-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-3-general-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui14-double-click-1118.txt"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T23:32:57Z",
+      "updated_utc": "2026-11-18T13:45:00Z",
       "slices": [
         {
           "id": "UI-14.1",
