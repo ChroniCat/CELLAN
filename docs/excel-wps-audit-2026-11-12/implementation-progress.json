@@ -4869,8 +4869,8 @@
       "scope": "app/office_clipboard.rs + main.rs + ribbon/actions.rs",
       "source": "ui-requirements.md",
       "heading": "UI-07 普通粘贴各入口共用真实系统剪贴板",
-      "status": "待验收",
-      "acceptance": "[2026-11-18 更新] 三入口共用最新系统剪贴板；Excel/WPS→App 双向 2×3 日期/金额/中文/合并/换行/粗体/填充实测；App→Excel/WPS 公式已由 XML Spreadsheet R1C1 保留（Excel/WPS COM 均得 C2f==B2*2）；物理鼠标右键/物理键盘仍未执行。",
+      "status": "已验收",
+      "acceptance": "[2026-11-18 物理键盘实测] Ribbon/右键/物理 Ctrl+V 三入口共用最新系统剪贴板；物理 Ctrl+C 后 B2 粘贴得 PASTE_FIXED，A1 保存后 XML sharedStrings=PASTE_SAVE；修复 egui Event::Paste 无 Key::V 时被丢弃的入口。",
       "files": [
         "crates/app/src/main.rs",
         "crates/app/src/office_clipboard.rs",
@@ -4898,16 +4898,15 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/key-paste.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07/wps-ribbon4.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-formula-paste-1118.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-ctrlv-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-ctrlv-1118.png"
       ],
-      "not_done": [
-        "真实物理键盘 Ctrl+V 未通（合成 Ctrl 的 modifiers 未进入 egui）；物理右键粘贴已验。",
-        "三入口共用 clip_paste 已回归。"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "补物理键盘 Ctrl+V 后可将父项转已验收。",
-      "updated_utc": "2026-11-18T06:26:18Z",
+      "next": "",
+      "updated_utc": "2026-11-18T08:25:27Z",
       "slices": [
         {
           "id": "UI-07.1",
@@ -4915,8 +4914,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-07 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "三入口共用系统剪贴板；物理右键菜单“粘贴”已由硬件 mouse_event 打开并点选，A1 从 Amount 变为 PASTE_RCLICK2；Ctrl+V 物理键盘仍待补。",
+          "status": "已验收",
+          "acceptance": "[2026-11-18 物理键盘实测] 物理 Ctrl+V 写入 A1=PASTE_SAVE 并保存；物理 Ctrl+C 后 B2 粘贴得 PASTE_FIXED；Ribbon/右键/键盘三入口统一。",
           "files": [],
           "commits": [
             "537dbe5"
@@ -4941,16 +4940,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua-ui-1118.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/b1-copied.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-cua/d1-formula-paste.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-rightclick-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-ctrlv-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui07-ctrlv-1118.png"
           ],
-          "not_done": [
-            "真实物理键盘 Ctrl+V 仍未通：合成 Ctrl 的 modifiers 未进入 egui（cmd=false）；右键粘贴已物理验证。"
-          ],
+          "not_done": [],
           "failures": [],
           "blocker": "",
-          "next": "补物理键盘 Ctrl+V；右键菜单其它项未逐项点选。",
-          "updated_utc": "2026-11-18T06:26:18Z",
-          "status_note": "真实 UIA Ribbon 复制/粘贴已机检（D1 公式 =C1*2）；物理右键菜单/物理 Ctrl+V 仍缺（computer_use key chord 会落成字面 c/v，foreground 不可用）。"
+          "next": "",
+          "updated_utc": "2026-11-18T08:25:27Z",
+          "status_note": "系统 Paste/Copy 事件入口已补齐，物理键盘验证通过。"
         },
         {
           "id": "UI-07.2",
@@ -5027,7 +5026,7 @@
           "status_note": "合并/跨应用往返经 Excel/WPS COM 实测；空行由既有回归覆盖。"
         }
       ],
-      "status_note": "公式通路已修复并验证；物理交互未执行，父项仍待验收。"
+      "status_note": "物理 Ctrl+V/Ctrl+C 已在交互会话实测；系统事件入口与物理键盘入口统一。"
     },
     {
       "id": "UI-08",

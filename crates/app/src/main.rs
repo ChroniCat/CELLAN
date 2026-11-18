@@ -11047,6 +11047,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 "显示结果".into()
             };
         }
+        let (copy_evt, cut_evt, paste_evt) = ctx.input(|i| {
+            (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
         let (copy_k, cut_k, paste_k, paste_v_k, find_k, repl_k) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::C),
@@ -11057,15 +11064,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 i.modifiers.command && i.key_pressed(Key::H),
             )
         });
-        if copy_k {
+        if copy_k || copy_evt {
             self.clip_copy(false, ctx);
             return;
         }
-        if cut_k {
+        if cut_k || cut_evt {
             self.clip_copy(true, ctx);
             return;
         }
-        if paste_k || paste_v_k {
+        if paste_k || paste_v_k || paste_evt {
             // 从 Excel 复制过来的块：HTML 里有格式与合并，优先走这条
             if paste_k && !paste_v_k {
                 if let Some(block) = office_clipboard::read_table() {

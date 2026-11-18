@@ -204,6 +204,16 @@ fn paste_keeps_empty_rows_and_quotes_from_external_tsv() {
 }
 
 #[test]
+fn system_paste_event_commits_without_key_v() {
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    ui_frame(&mut app, &ctx, vec![]);
+    ui_frame(&mut app, &ctx, vec![egui::Event::Paste("PASTE_EVENT".into())]);
+    assert_eq!(app.wb.sheet(0).value(0, 0).display(), "PASTE_EVENT");
+    assert!(app.editing.is_none(), "system Paste event must land in the cell, not stay in edit mode");
+}
+
+#[test]
 fn a1_formula_translation_handles_absolute_and_sheet_refs() {
     assert_eq!(
         sheetcore::clipboard_xmlss::a1_to_r1c1("=SUM($A$1:B2)+Sheet1!C3", 2, 2),
