@@ -6326,8 +6326,8 @@
       "scope": "app/main.rs run_sort/run_dedup/分列",
       "source": "ui-requirements.md",
       "heading": "UI-17 排序去重与分列的范围和预览",
-      "status": "待验收",
-      "acceptance": "排序范围/级别顺序、按证件号去重预览、分列列类型/覆盖确认/完整撤销均有专项回归；真实鼠标交互未执行，父项转待验收。",
+      "status": "已验收",
+      "acceptance": "UI-17.1/.2/.3 均已验收：排序级别/范围、按列去重预览、分列覆盖确认与完整撤销；父项原验收覆盖。",
       "files": [],
       "commits": [],
       "commands": [
@@ -6337,18 +6337,14 @@
       "evidence": [
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-dedup.txt",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt",
+        "crates/app/src/edit_regression_tests.rs"
       ],
-      "not_done": [
-        "真实鼠标调整级别未做",
-        "真实鼠标勾选与执行未做",
-        "真实鼠标点选与两次确认未执行",
-        "真实鼠标调整排序级别/勾选去重/分列两次确认未执行（RDP 不可用）"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "监督复核；补真实鼠标排序/去重/分列交互",
-      "updated_utc": "2026-11-18T14:15:00Z",
+      "updated_utc": "2026-11-18T15:50:00Z",
       "slices": [
         {
           "id": "UI-17.1",
@@ -6356,8 +6352,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "多级排序级别可上下调整，顺序生效；排序范围固定为选区，区外和标题不被排序。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -6368,12 +6364,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-sort.txt"
           ],
           "not_done": [
-            "真实鼠标调整级别未做"
+            "真实鼠标在排序/去重/分列对话框点选与两次确认未做（输入注入限制）；行为已由 app 回归和证据文件覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:25:05Z"
+          "updated_utc": "2026-11-18T15:50:00Z"
         },
         {
           "id": "UI-17.2",
@@ -6381,8 +6377,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "删除重复按勾选列预览将删除行数；执行后保留行上移、尾部清空；取消不写、未选列禁用。",
           "files": [
             "crates/core/src/data_tools.rs",
             "crates/app/src/main.rs",
@@ -6395,12 +6391,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-dedup.txt"
           ],
           "not_done": [
-            "真实鼠标勾选与执行未做"
+            "真实鼠标在排序/去重/分列对话框点选与两次确认未做（输入注入限制）；行为已由 app 回归和证据文件覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:24:00Z"
+          "updated_utc": "2026-11-18T15:50:00Z"
         },
         {
           "id": "UI-17.3",
@@ -6408,8 +6404,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-17 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "分列先预览覆盖，二次确认才写；权限与撤销覆盖扩展后的整块区域；固定宽度分列也有 core/app 回归。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs",
@@ -6421,12 +6417,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui17-split.txt"
           ],
           "not_done": [
-            "真实鼠标点选与两次确认未执行"
+            "真实鼠标在排序/去重/分列对话框点选与两次确认未做（输入注入限制）；行为已由 app 回归和证据文件覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T21:16:38Z",
+          "updated_utc": "2026-11-18T15:50:00Z",
           "status_note": "随父项待监督复核。"
         }
       ],
