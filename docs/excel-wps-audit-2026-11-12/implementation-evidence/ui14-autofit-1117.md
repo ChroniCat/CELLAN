@@ -181,10 +181,54 @@ Excel 实测：`work/probe/excel_autofit_size_matrix2.ps1` 对 17 个字符串
 | 列 | 文本 | 字号 | app 存盘宽度 | Excel AutoFit |
 |---|---|---:|---:|---:|
 | A | `中文文字中` | 13 | 12.00 | 12.00 |
-| B | `111111111111` | 15 | 17.13 | 17.13 |
+| B | `111111111111` | 15 | 18.50 | 18.50（文本单元格） |
 | C | `1` | 13.5 | 2.32 | 2.315（13=2.25、14=2.38 插值） |
 | D | `中文文字中` | 17 | 16.13 | 16.13 |
+
+**更正（2026-11-18 第七次对拍）**：B 之前的 17.13 是对 **数值**单元格
+（`Value2` 12 位数字被 Excel 显示成科学计数法）测的；xlsx 里作为文本的
+`111111111111` 在 15 号是 **18.50**。AutoFit 必须按“文件里实际显示成什么”测，
+不能把 COM 直接赋值的数字串当文本。
 
 `autofit_uses_excel_size_curves` 新增 13/15/17/19/21/22/23 三组真值，并把插值断言
 改成 13.5（2.315）。`cargo test -q -p sheetcore --offline --test autofit_width --
 --test-threads=2` = **5 passed**。
+
+## 文本单元格与样式矩阵（2026-11-18 第七次对拍）
+
+第六次的 COM 矩阵有个口径错误：`Value2="111111111111"` 会被 Excel 当 **数值**，
+General 显示成 `1.11111E+11`，AutoFit 只有 12.38/17.13；而 xlsx 里作为**文本**的
+同一串在 11/15 号是 **13.25/18.50**。因此重做了两个 **文件级** 矩阵（openpyxl 写成
+`t="inlineStr"`，Excel 打开后逐列重置 `ColumnWidth=8.43` 再 `AutoFit()`）：
+
+- `text_ascii_matrix.xlsx`：`1`…12 个 `1` × 字号 8…24，204 列；
+  输出 `excel_text_ascii_matrix.out`（204 行）。`AUTOFIT_SIZE_CURVES` 的 ASCII 曲线
+  已全部换成此文本口径；CJK 曲线仍用 `excel_autofit_size_matrix3.out`（汉字不会被数值化）。
+- `style_file_matrix.xlsx`：3 个串（`1`、`中文文字中`、`111111111111`）× 字号 8…24
+  × 5 样式（regular/bold/indent1/indent2/bold_indent1），255 列；输出
+  `excel_style_file_matrix.out`（255 行）。`ELINE_STYLE_DELTAS` 用这份数据，
+  粗体按 0/0.125/… 的像素量化，缩进按文件语义 3 字符/级（COM 直接设
+  `IndentLevel` 的 1.5 不适用于打开文件，已作为反例记录）。
+
+11 号文件级真值：
+
+| 串 | regular | bold | indent1 | indent2 |
+|---|---:|---:|---:|---:|
+| `1` | 1.88 | 1.88 | 4.88 | 7.88 |
+| `中文文字中` | 10.38 | 10.38 | 13.63 | 17.00 |
+| `111111111111` | 13.25 | 13.25 | 16.63 | 19.88 |
+
+端到端（`autofit_style_eline.xlsx`，五列分别 1/等线/indent1、1/等线/bold、
+CJK5/等线/indent2、1/宋体/indent1、1/等线13/indent1；`SC_AUTOFIT=c:0..4`）：
+
+| 列 | app 存盘 | Excel AutoFit |
+|---|---:|---:|
+| A `1` 等线 indent1 | 4.88 | 4.88 |
+| B `1` 等线 bold | 1.88 | 1.88 |
+| C `中文文字中` 等线 indent2 | 16.99 | 17.00 |
+| D `1` 宋体 indent1 | 4.88 | 4.88 |
+| E `1` 等线13 indent1 | 5.25 | 5.25 |
+
+`autofit_width.rs` 新增 `eline_styled_autofit_matches_measured_deltas`（10 个文件级
+真值），目标测试 **6 passed**。C 列 16.99 vs 17.00 是存盘把 141px 折回字符宽时的
+0.01 舍入；像素宽度同为 141px。

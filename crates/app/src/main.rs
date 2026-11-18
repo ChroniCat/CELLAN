@@ -6590,13 +6590,15 @@ impl SheetApp {
             // 求和；用 Carlito 的 text_width 再除 7 会差 1–1.5 字符。
             let size = (if st.size > 0.0 { st.size } else { 11.0 }) * 4.0 / 3.0;
             let font_size = if st.size > 0.0 { st.size } else { 11.0 };
-            // 缩进按 3 字符/级、粗体按 +0.37 计入；字号走 Excel 实测曲线。
-            let chars = sheetcore::display::excel_autofit_chars_wrapped_at_size(
+            let font = if st.font.trim().is_empty() { "等线" } else { st.font.as_str() };
+            // 缩进按 xlsx 文件语义 3 字符/级；粗体按等线/宋体的实测像素量化增量。
+            let chars = sheetcore::display::excel_autofit_chars_wrapped_at_size_font(
                 &txt,
                 st.bold,
                 st.indent,
                 st.wrap,
                 font_size,
+                font,
             );
             let w = chars * 8.0 + 5.0;
             if std::env::var("SC_AUTOFIT").is_ok() {
