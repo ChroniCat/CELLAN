@@ -675,15 +675,7 @@ impl SheetApp {
             // ---------------------------------------------------- 公式
             "InsertFunction" => {
                 // UI-11.4：打开函数向导（搜索 + 参数填空），确定后插到光标处
-                let editing = self.editing.is_some();
-                self.fn_wizard = Some(crate::FnWizard {
-                    query: String::new(),
-                    name: "SUM".into(),
-                    args: Vec::new(),
-                    scrolled: false,
-                    editing,
-                    cat: String::new(),
-                });
+                self.open_fn_wizard();
             }
             "TracePrecedents" => self.trace_precedents(),
             "TraceDependents" => self.trace_dependents(),

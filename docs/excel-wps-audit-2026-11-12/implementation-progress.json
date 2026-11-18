@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T05:11:03Z",
+  "updated_utc": "2026-11-18T05:41:21Z",
   "tasks": [
     {
       "id": "C01",
@@ -5637,8 +5637,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-11 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "真实 fx 控件打开插入函数向导；类别下拉 12 类，选“统计”后 141 个函数；列表选中 AVERAGE，确定后编辑栏 =AVERAGE()（原格 S1-A1 未被拼成前缀）；UIA 点“拾取”后真实鼠标拖选 B25:B28，参数框回读 B25:B28，确定后 =SUM(B25:B28)。[2026-11-18 真实控件/鼠标补验]",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/fnrecent.rs",
@@ -5660,15 +5660,20 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply3.log",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard9.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply.log",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-physical-1118.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-ui-1118-live.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-category-1118.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-apply-fixed-1118.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-pick-1118.png"
           ],
           "not_done": [
-            "向导内点区域填参数、分类筛选下拉、帮助链接均已实现（main.rs:20248 起，CATEGORIES/help_url/hyperlink_to；wiz_pick 取区域）；仅缺真人点击复核。"
+            "“帮助”超链接真实打开默认浏览器未复核；URL 编码已有单测。真实中文 IME 在向导搜索框未测。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "向导内取参数区域",
-          "updated_utc": "2026-11-16T22:10:21Z"
+          "next": "已验收（2026-11-18）；仅保留帮助链接/真实 IME。",
+          "updated_utc": "2026-11-18T05:41:21Z"
         }
       ]
     },

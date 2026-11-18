@@ -20627,7 +20627,8 @@ let txn = self.txn_begin(&keys);
     /// UI-11.4：把向导拼好的公式插到当前编辑光标处（没有编辑会话就从当前格新起）。
     fn insert_formula_at_caret(&mut self, formula: &str) {
         if self.editing.is_none() {
-            self.begin_edit(None);
+            // 不在编辑态时向导是「替换当前格」，不能把已有单元格文本当成前缀。
+            self.begin_edit(Some(String::new()));
         }
         let Some(ed) = self.editing.as_mut() else {
             return;
@@ -20655,6 +20656,18 @@ let txn = self.txn_begin(&keys);
         ed.buf = out;
         ed.caret = caret_new;
         ed.caret_override = Some(caret_new);
+    }
+
+    /// UI-11.4：功能区「插入函数」与编辑栏 fx 共用同一个入口。
+    fn open_fn_wizard(&mut self) {
+        self.fn_wizard = Some(FnWizard {
+            query: String::new(),
+            name: "SUM".into(),
+            args: Vec::new(),
+            scrolled: false,
+            editing: self.editing.is_some(),
+            cat: String::new(),
+        });
     }
 
     /// UI-11.4：插入函数向导 —— 搜索 + 参数填空 + 插到光标处。
@@ -20693,6 +20706,7 @@ let txn = self.txn_begin(&keys);
         let dlg_out = ui_kit::window(ctx, "插入函数", 620.0)
             .open(&mut open)
             .resizable(true)
+            .block_background(self.wiz_pick.is_none())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("fn_wizard_cat")
@@ -29680,7 +29694,9 @@ impl eframe::App for SheetApp {
         }
         let __cpu_t0 = std::time::Instant::now();
         // 查找/替换打开时网格只画不响应；关闭按钮的点击不能穿透到背后的格子。
-        self.dialog_modal = self.find.open || self.dv_alert.is_some() || self.fn_wizard.is_some();
+        self.dialog_modal = self.find.open
+            || self.dv_alert.is_some()
+            || (self.fn_wizard.is_some() && self.wiz_pick.is_none());
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -30601,9 +30617,9 @@ impl eframe::App for SheetApp {
                 let row_resp = ui.interact(ed_rect, egui::Id::new("fx_row"), Sense::click());
                 if row_resp.clicked() && self.editing.is_none() {
                     self.focus_edit(EditSpot::FormulaBar);
-                    // 当帧就把焦点给编辑栏，下一帧的按键/上屏不会丢第一个字符
-                    ui.ctx()
-                        .memory_mut(|m| m.request_focus(egui::Id::new("fx_edit")));
+                    // 不要在 TextEdit 还没画出来的这一帧 request_focus("fx_edit")：
+                    // accesskit 会把「已聚焦但不在节点表里的 id」当成致命错误。
+                    // 下一帧 TextEdit 绘制时会自己 request_focus（见 ed.spot == FormulaBar 分支）。
                 }
                 if self.editing.is_some() {
                     let formula_active = self
@@ -30748,16 +30764,8 @@ impl eframe::App for SheetApp {
                 } else if cancel {
                     self.cancel_edit();
                 } else if fx_click {
-                    if self.editing.is_none() {
-                        self.begin_edit_at(None, EditSpot::FormulaBar);
-                        ui.ctx()
-                            .memory_mut(|m| m.request_focus(egui::Id::new("fx_edit")));
-                        if let Some(ed) = self.editing.as_mut() {
-                            if !ed.buf.starts_with('=') {
-                                ed.buf.insert(0, '=');
-                            }
-                        }
-                    }
+                    // Excel 的 fx 打开插入函数向导；不在这里直接抢编辑栏焦点。
+                    self.open_fn_wizard();
                 }
             });
         }

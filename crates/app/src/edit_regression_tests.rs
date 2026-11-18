@@ -8241,6 +8241,14 @@ fn ui114_wizard_inserts_at_caret_without_double_equals() {
     app.insert_formula_at_caret("=SUM()");
     assert_eq!(app.editing.as_ref().unwrap().buf, "=SUM()");
     assert_eq!(app.editing.as_ref().unwrap().caret, 5, "光标停在括号里");
+    // 不在编辑态时向导是替换当前格，不能把原有文本当成前缀
+    app.cancel_edit();
+    app.wb.sheet_mut(0).set(0, 4, text("S1-E1"));
+    app.insert_formula_at_caret("=SUM(A1:A3)");
+    {
+        let ed = app.editing.as_ref().expect("向导应从空缓冲新起");
+        assert_eq!(ed.buf, "=SUM(A1:A3)", "旧单元格文本不能混进公式");
+    }
 }
 
 #[test]

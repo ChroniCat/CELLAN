@@ -1206,6 +1206,8 @@ pub struct Dlg {
     open: Option<*mut bool>,
     resizable: bool,
     anchor: Option<(egui::Align2, [f32; 2])>,
+    /// 插入函数向导「拾取」期间要临时放行背景点击，否则模态层会把拖选吃掉
+    block_background: bool,
 }
 
 /// UI-13.3：窗口宽度不超过可用屏幕（左右各留 8px），避免小窗口下对话框被裁掉。
@@ -1221,6 +1223,7 @@ pub fn window(_ctx: &egui::Context, title: impl Into<String>, width: f32) -> Dlg
         open: None,
         resizable: false,
         anchor: None,
+        block_background: true,
     }
 }
 
@@ -1250,6 +1253,11 @@ impl Dlg {
     }
     pub fn anchor(mut self, a: egui::Align2, offset: [f32; 2]) -> Self {
         self.anchor = Some((a, offset));
+        self
+    }
+    /// 拾取区域时放行背景点击（对话框仍置顶，只是不再吞掉表格拖选）
+    pub fn block_background(mut self, v: bool) -> Self {
+        self.block_background = v;
         self
     }
     pub fn frame(self, _f: egui::Frame) -> Self {
@@ -1321,15 +1329,17 @@ impl Dlg {
             d.insert_temp(egui::Id::new("dlg_born"), born);
         });
         // 模态遮挡：对话框打开时吞掉背景点击
-        egui::Area::new(id.with("block"))
-            .order(egui::Order::Middle)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                let r = egui::Rect::from_min_size(screen.min, screen.size());
-                // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
-                let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
-                let _ = resp;
-            });
+        if self.block_background {
+            egui::Area::new(id.with("block"))
+                .order(egui::Order::Middle)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    let r = egui::Rect::from_min_size(screen.min, screen.size());
+                    // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
+                    let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
+                    let _ = resp;
+                });
+        }
         let out = egui::Area::new(id.with("area"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
