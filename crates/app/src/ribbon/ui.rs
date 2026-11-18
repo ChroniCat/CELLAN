@@ -1711,6 +1711,13 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "PdfExport" => Icon::PdfExport,
         "HostTakeover" => Icon::HostTakeover,
         "UpdateCheck" => Icon::UpdateCheck,
+        "NewFile" => Icon::NewFile,
+        "MacroRun" => Icon::MacroRun,
+        "MacroExport" => Icon::Macro,
+        "VisualBasicEditor" => Icon::Code,
+        "Compare" => Icon::Compare,
+        "SyncScroll" => Icon::SyncScroll,
+        "ValidationCircleInvalid" => Icon::InvalidCircle,
         "FormatCells" => Icon::FormatCells,
         "TextVerticalDraw" => Icon::TextVerticalDraw,
         "TextBoxDraw" => Icon::TextBoxDraw,
@@ -1840,5 +1847,28 @@ mod compact_tests {
         let mut leaves = Vec::new();
         compact_leaves(&g.children, &mut leaves);
         assert_eq!(leaves.len(), n, "扁平化后控件数必须一致");
+    }
+
+    /// 功能区里每个 imageMso 都要有专属图标。
+    /// 漏映射时绘制端会退回同一个蓝色网格（`unwrap_or(Icon::Grid)`），
+    /// 用户看到的就是「几个功能共用一枚占位图」，这种缺失必须在测试里挡住。
+    #[test]
+    fn every_ribbon_image_resolves_to_an_icon() {
+        let xml = include_str!("../../assets/ribbon/customUI.xml");
+        let mut missing = Vec::new();
+        for part in xml.split("imageMso=\"").skip(1) {
+            let name = part.split('"').next().unwrap_or_default();
+            // 加粗/斜体/下划线是文字按钮，本来就没有图形图标
+            if matches!(name, "Bold" | "Italic" | "Underline") {
+                continue;
+            }
+            if icon_of(name).is_none() {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "这些 imageMso 没映射图标，会退化成同一个网格占位图：{missing:?}"
+        );
     }
 }

@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 当前版本。发版时改这里 + 共享目录里的 manifest。
-pub const VERSION: &str = "1.37";
+pub const VERSION: &str = "1.40";
 
 #[derive(Clone, Debug)]
 pub struct Remote {

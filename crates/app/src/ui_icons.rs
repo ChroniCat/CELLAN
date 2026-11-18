@@ -166,6 +166,20 @@ pub enum Icon {
     SparkLoss,
     /// 文本框：带文字线的方框 + 角上的小 T
     TextBox,
+    /// 新建文件：空白页 + 绿色加号（和「插入」的纯加号分开）
+    NewFile,
+    /// 宏：代码页 + 绿色播放三角
+    Macro,
+    /// 运行宏：绿色播放键
+    MacroRun,
+    /// VBA 编辑器：代码窗口
+    Code,
+    /// 并排比较：两页 + 对向箭头
+    Compare,
+    /// 同步滚动：两页 + 上下双箭头
+    SyncScroll,
+    /// 标识无效数据：红圈 + 感叹号
+    InvalidCircle,
 }
 
 // ---------------------------------------------------------------- 色板
@@ -204,11 +218,6 @@ fn dev_stroke(w_logical: f32, ppp: f32) -> f32 {
 fn snap_center(v: f32, ppp: f32, wdev: f32) -> f32 {
     let off = if (wdev.round() as i32) & 1 == 1 { 0.5 } else { 0.0 };
     ((v * ppp - off).round() + off) / ppp
-}
-
-fn lighten(c: Color32, f: f32) -> Color32 {
-    let l = |v: u8| (v as f32 + (255.0 - v as f32) * f).min(255.0) as u8;
-    Color32::from_rgb(l(c.r()), l(c.g()), l(c.b()))
 }
 
 // ---------------------------------------------------------------- 画笔
@@ -292,14 +301,8 @@ impl Pen<'_> {
         let cr = self.px(rad);
         if self.filled() {
             self.p.rect_filled(rect, cr, fill);
-            // 顶部一道浅色高光：和 Excel 图标一样有光源方向，块面才不呆
-            if h * self.s >= 10.0 {
-                let hl = Rect::from_min_max(
-                    egui::pos2(rect.left() + cr + 0.6, rect.top() + 1.0),
-                    egui::pos2(rect.right() - cr - 0.6, rect.top() + 2.0),
-                );
-                self.p.rect_filled(hl, 0.5, lighten(fill, 0.4));
-            }
+            // Fluent 2 是平涂：不再加顶部高光条。
+            // 高光 + 渐变会让 32px 图标在浅色功能区里显脏，也是一眼「旧 Office」的来源。
         }
         self.p.rect_stroke(
             rect,
@@ -433,7 +436,7 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 }
 
 /// 全部图标（由枚举顺序生成；新增图标后同步这里，测试会数个数）
-pub const ALL_ICONS: [Icon; 138] = [
+pub const ALL_ICONS: [Icon; 145] = [
     Icon::Open, Icon::Save, Icon::SaveAs, Icon::Print, Icon::Undo, Icon::Redo,
     Icon::Paste, Icon::Cut, Icon::Copy, Icon::Brush, Icon::Fill, Icon::FontColor,
     Icon::AlignL, Icon::AlignC, Icon::AlignR, Icon::Top, Icon::Middle, Icon::Bottom,
@@ -457,6 +460,8 @@ pub const ALL_ICONS: [Icon; 138] = [
     Icon::Freeze, Icon::FreezeRow, Icon::FreezeCol, Icon::Lock, Icon::Cf, Icon::Eraser,
     Icon::ClearFmt, Icon::IndentInc, Icon::IndentDec, Icon::Symbol, Icon::ZhS, Icon::ZhT,
     Icon::TraceIn, Icon::TraceOut, Icon::SparkLine, Icon::SparkColumn, Icon::SparkLoss, Icon::TextBox,
+    Icon::NewFile, Icon::Macro, Icon::MacroRun, Icon::Code, Icon::Compare, Icon::SyncScroll,
+    Icon::InvalidCircle,
 ];
 
 /// 图标总表：给「对照表」和自检用（位图 vs 矢量并排看）
@@ -637,17 +642,17 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.polyline(&[(13.6, 9.2), (18.0, 12.4), (13.6, 15.6)], 1.8, INK);
         }
         Merge => {
-            // 一个大格 + 中间虚线 + 两侧向内箭头 + 底部居中短横（表示「合并后居中」）
-            pen.rro(3.4, 4.2, 17.2, 11.6, 0.8, INK, 1.2);
-            for (k, y) in [0.0_f32, 2.9, 5.8, 8.7].iter().enumerate() {
-                let yy = 4.9 + y;
-                if k % 2 == 0 {
-                    pen.ln(11.2, yy, 12.8, yy, 0.9, GRAY_D);
-                }
+            // 合并后居中：外框 + 中间虚线 + 相向箭头 + 下方居中文字线
+            pen.rro(3.4, 3.8, 17.2, 10.2, 0.6, INK, 1.15);
+            for y in [5.0_f32, 8.0, 11.0] {
+                pen.ln(12.0, y, 12.0, y + 1.4, 0.9, GRAY_D);
             }
-            pen.arrow((9.4, 10.0), (-1.0, 0.0), 2.6, INK);
-            pen.arrow((14.6, 10.0), (1.0, 0.0), 2.6, INK);
-            pen.bar(8.6, 18.2, 6.8, 1.6, INK);
+            pen.ln(7.0, 8.9, 10.6, 8.9, 1.4, INK);
+            pen.arrow((11.6, 8.9), (1.0, 0.0), 2.2, INK);
+            pen.ln(17.0, 8.9, 13.4, 8.9, 1.4, INK);
+            pen.arrow((12.4, 8.9), (-1.0, 0.0), 2.2, INK);
+            pen.bar(8.4, 17.4, 7.2, 1.7, INK);
+            pen.bar(10.2, 20.4, 3.6, 1.5, GRAY_D);
         }
         Border => {
             pen.rrs(3.6, 3.6, 16.8, 16.8, 0.8, WHITE, INK, 1.8);
@@ -677,18 +682,18 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
 
         // ---- 排序 / 筛选 / 查找 ----
         SortAsc => {
-            pen.rule(4.0, 6.2, 8.0, GRAY_D);
-            pen.rule(4.0, 10.8, 6.0, GRAY_D);
-            pen.rule(4.0, 15.4, 4.0, GRAY_D);
-            pen.bar(17.0, 6.0, 1.8, 12.0, INK);
-            pen.arrow((17.9, 4.2), (0.0, -1.0), 3.6, INK);
+            // Excel 365：左边 A 在上、Z 在下，右边一支向下箭头（A→Z）
+            pen.text("A", 8.6, 8.0, 6.4, INK);
+            pen.text("Z", 8.6, 8.0, 13.8, GRAY_D);
+            pen.bar(18.0, 5.4, 1.6, 12.4, GRAY_D);
+            pen.arrow((18.8, 20.2), (0.0, 1.0), 3.8, GREEN_D);
         }
         SortDesc => {
-            pen.rule(4.0, 6.2, 4.0, GRAY_D);
-            pen.rule(4.0, 10.8, 6.0, GRAY_D);
-            pen.rule(4.0, 15.4, 8.0, GRAY_D);
-            pen.bar(17.0, 5.8, 1.8, 12.0, INK);
-            pen.arrow((17.9, 19.6), (0.0, 1.0), 3.6, INK);
+            // Z→A：Z 在上、A 在下，箭头朝上
+            pen.text("Z", 8.6, 8.0, 6.4, INK);
+            pen.text("A", 8.6, 8.0, 13.8, GRAY_D);
+            pen.bar(18.0, 6.2, 1.6, 12.4, GRAY_D);
+            pen.arrow((18.8, 3.8), (0.0, -1.0), 3.8, GREEN_D);
         }
         Filter => {
             // Excel 365：深灰漏斗线稿，浅灰内面，不加蓝
@@ -1627,10 +1632,10 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             }
         }
         TextDir => {
-            // 竖排文字：一个 A + 向下的折线箭头（Excel 的「方向」图标）
-            pen.text("A", 8.2, 9.0, 12.0, INK);
-            pen.ln(17.6, 4.0, 17.6, 18.0, 1.5, GRAY_D);
-            pen.arrow((17.6, 19.6), (0.0, 1.0), 3.2, GRAY_D);
+            // 文字方向：A + 90° 折线旋转箭头；和字号增减的「A + 直箭头」分开
+            pen.text("A", 8.4, 8.2, 9.6, INK);
+            pen.polyline(&[(14.2, 5.8), (19.2, 5.8), (19.2, 17.2)], 1.6, GRAY_D);
+            pen.arrow((19.2, 19.4), (0.0, 1.0), 3.4, GREEN_D);
         }
         FontGrow => {
             // Excel：一个 A + 右侧向上的小箭头（不要加号，16px 下三个元素会糊成一团）
@@ -1642,6 +1647,59 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.text("A", 9.4, 9.0, 13.0, INK);
             pen.bar(17.2, 7.2, 1.7, 9.4, GREEN_D);
             pen.arrow((18.05, 18.4), (0.0, 1.0), 3.4, GREEN_D);
+        }
+        NewFile => {
+            // 空白页 + 右下绿色加号：文件级「新建」，不是表格里的「插入行」
+            pen.rrs(4.6, 2.8, 12.4, 15.4, 0.8, WHITE, GRAY_D, 1.1);
+            pen.poly(
+                &[(11.8, 3.0), (16.8, 8.0), (11.8, 8.0)],
+                Color32::from_rgb(242, 242, 242),
+                GRAY_D,
+                0.9,
+            );
+            pen.bar(7.2, 10.6, 6.2, 1.0, GRAY);
+            pen.bar(7.2, 13.4, 4.2, 1.0, GRAY);
+            pen.dot(18.2, 18.2, 3.6, GREEN_D);
+            pen.bar(17.5, 15.6, 1.4, 5.2, WHITE);
+            pen.bar(15.6, 17.5, 5.2, 1.4, WHITE);
+        }
+        Macro => {
+            pen.rrs(4.0, 3.4, 12.2, 15.4, 0.6, WHITE, GRAY_D, 1.1);
+            pen.bar(6.4, 6.8, 7.0, 1.0, GRAY);
+            pen.bar(6.4, 9.8, 5.0, 1.0, GRAY);
+            pen.poly(&[(15.0, 14.4), (15.0, 21.2), (21.2, 17.8)], GREEN_D, GREEN_D, 0.6);
+        }
+        MacroRun => {
+            pen.ring(12.0, 12.0, 8.8, 1.6, GREEN_D);
+            pen.poly(&[(9.8, 7.8), (9.8, 16.2), (16.8, 12.0)], GREEN_D, GREEN_D, 0.6);
+        }
+        Code => {
+            pen.rrs(3.0, 4.4, 18.0, 15.2, 0.7, WHITE, GRAY_D, 1.1);
+            pen.bar(3.3, 4.5, 17.4, 2.6, Color32::from_rgb(237, 237, 237));
+            pen.polyline(&[(9.2, 10.4), (6.8, 12.8), (9.2, 15.2)], 1.5, INK);
+            pen.polyline(&[(14.8, 10.4), (17.2, 12.8), (14.8, 15.2)], 1.5, INK);
+            pen.ln(13.4, 9.4, 10.8, 16.2, 1.4, GREEN_D);
+        }
+        Compare => {
+            pen.rro(3.0, 4.4, 7.4, 15.2, 0.5, GRAY_D, 1.0);
+            pen.rro(13.6, 4.4, 7.4, 15.2, 0.5, GRAY_D, 1.0);
+            pen.ln(8.4, 8.6, 11.4, 8.6, 1.4, GREEN_D);
+            pen.arrow((12.6, 8.6), (1.0, 0.0), 2.2, GREEN_D);
+            pen.ln(15.6, 15.4, 12.6, 15.4, 1.4, GREEN_D);
+            pen.arrow((11.4, 15.4), (-1.0, 0.0), 2.2, GREEN_D);
+        }
+        SyncScroll => {
+            pen.rro(3.0, 4.0, 7.2, 16.0, 0.5, GRAY_D, 1.0);
+            pen.rro(13.8, 4.0, 7.2, 16.0, 0.5, GRAY_D, 1.0);
+            pen.bar(11.5, 7.0, 1.0, 10.0, GREEN_D);
+            pen.arrow((12.0, 5.4), (0.0, -1.0), 2.8, GREEN_D);
+            pen.arrow((12.0, 18.6), (0.0, 1.0), 2.8, GREEN_D);
+        }
+        InvalidCircle => {
+            pen.rro(4.2, 4.2, 13.0, 13.0, 0.6, GRAY, 1.0);
+            pen.ring(12.0, 12.0, 7.6, 1.8, RED);
+            pen.bar(11.2, 7.8, 1.6, 6.0, RED);
+            pen.dot(12.0, 16.2, 1.1, RED);
         }
     }
 }

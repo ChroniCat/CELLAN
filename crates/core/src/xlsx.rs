@@ -3336,3 +3336,18 @@ fn apply_color(c: &mut umya_spreadsheet::Color, rgb: Option<[u8; 3]>, theme: Opt
         c.set_argb_str(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
     }
 }
+
+/// 只读 OOXML 包里的一个部件，不解压整本工作簿。
+/// 开始页用它取 `docProps/thumbnail.jpeg`；文件没有这个部件时返回 None。
+pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut entry = zip.by_name(name).ok()?;
+    if entry.size() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}

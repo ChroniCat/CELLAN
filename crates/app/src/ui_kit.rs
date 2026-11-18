@@ -7,7 +7,7 @@
 //! 所有尺寸集中在这里，别再往各处写魔法数字。
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Vec2,
+    self, Align2, Color32, FontFamily, FontId, Rect, Response, RichText, Sense, Stroke, Vec2,
 };
 use crate::ui_icons::{self, Icon};
 use std::cell::Cell;
@@ -17,6 +17,20 @@ use std::cell::Cell;
 pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
+
+/// 界面字号只留四档。10.5 / 12.5 / 13.5 这类半像素字号会把中文糊成一层灰，
+/// 同一屏里字号档位越多，越像「随手拼出来的页面」。
+pub const T_TITLE: f32 = 20.0;
+pub const T_H2: f32 = 14.0;
+pub const T_BODY: f32 = 12.0;
+pub const T_SMALL: f32 = 11.0;
+
+/// 真 700 字重（内嵌 Noto Sans SC Bold / Inter Bold）。
+/// egui 的 `RichText::strong()` 只改颜色、不换字形，标题看起来和正文一样细；
+/// 这也是「界面没有层次」的直接原因。
+pub fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("default-bold".into()))
+}
 /// 禁用态：Excel 的禁用图标是中性灰 #A6A6A6，比正文浅、比分隔线深
 pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 /// 列头/行头与网格的分界线：Excel 实测 #ABABAB，比普通控件边框深
@@ -697,14 +711,14 @@ pub fn text_toggle(
     let _ = italic;
     let pos = rect.center() - Vec2::new(0.0, 0.5);
     ui.painter()
-        .text(pos, Align2::CENTER_CENTER, label, FontId::proportional(13.5), col);
+        .text(pos, Align2::CENTER_CENTER, label, FontId::proportional(13.0), col);
     if strong {
         // 小字号下用 0.55px 重描模拟加粗，比换字体更稳定
         ui.painter().text(
             pos + Vec2::new(0.55, 0.0),
             Align2::CENTER_CENTER,
             label,
-            FontId::proportional(13.5),
+            FontId::proportional(13.0),
             col,
         );
     }
@@ -721,7 +735,12 @@ pub fn text_toggle(
 /// 文件页签常驻绿色文字
 pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
     let v = ui.visuals().clone();
-    let font = FontId::proportional(12.0);
+    // Excel 365 实测：活动页签的墨量约是非活动的 1.7 倍（真加粗，不是只换颜色）
+    let font = if active {
+        bold(12.0)
+    } else {
+        FontId::proportional(12.0)
+    };
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
@@ -1391,7 +1410,7 @@ impl Dlg {
                             egui::pos2(trect.left() + 12.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &self.title,
-                            FontId::proportional(12.5),
+                            FontId::proportional(12.0),
                             TEXT,
                         );
                         // 关闭按钮
