@@ -5,7 +5,7 @@
   "source_date": "2026-11-12",
   "branch": "main",
   "note": "状态只能是：待实施/实施中/待验收/阻塞/已验收。已实现未验证只能标待验收。父任务全部切片+整体验收通过后才能标已验收。",
-  "updated_utc": "2026-11-18T05:41:21Z",
+  "updated_utc": "2026-11-18T05:50:53Z",
   "tasks": [
     {
       "id": "C01",
@@ -5522,16 +5522,18 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui115-probe/range.log",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui11-6-cross-sheet.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/shot.png",
-        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/probe2.log"
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui116-probe/probe2.log",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-physical-1118.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui114-probe/wizard-pick-1118.png"
       ],
       "not_done": [
-        "中文 IME 候选确认未实测（沿用 UI-01/QA-04 边界，不计通过）",
-        "跨表拖动扩区域已接线（切表清锚点 + pick_range_label 带表名/引号），待真人按住拖动验收；UI-11 其余界面项待真人点击。"
+        "中文 IME 候选确认未实测（真实 IME 不可用）",
+        "UI-11.3 跨表按住拖动仍待真人按住拖选；单击切表+引用已验。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "UI-11.1 真 IME 端到端（需真输入法）；其余切片等复核",
-      "updated_utc": "2026-11-16T20:50:49Z",
+      "next": "UI-11.1 真 IME 端到端（需真输入法）；UI-11.2/11.3/11.4 已验收",
+      "updated_utc": "2026-11-18T05:50:53Z",
       "slices": [
         {
           "id": "UI-11.1",
@@ -5688,17 +5690,19 @@
       "scope": "app/main.rs/ribbon/actions.rs坐标变换",
       "source": "ui-requirements.md",
       "heading": "UI-12 缩放表格而非整个应用",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "各切片已按原合同机检验收；真实鼠标/系统 DPI 等不可用项保留在各切片 not_done。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T23:11:36Z",
+      "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+      "updated_utc": "2026-11-18T05:50:14Z",
       "slices": [
         {
           "id": "UI-12.1",
@@ -5737,7 +5741,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
@@ -5749,15 +5753,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom2.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/freeze-hit-200.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-100.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "真实鼠标拖对象/列宽未做（RDP 注入不可用）"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T23:11:36Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         },
         {
           "id": "UI-12.3",
@@ -5765,7 +5770,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-12 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
@@ -5777,15 +5782,16 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-zoom2.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/freeze-hit-200.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-100.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12/object-200.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "真实鼠标拖对象/列宽未做（RDP 注入不可用）"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T23:11:36Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         }
       ]
     },
@@ -5798,17 +5804,19 @@
       "scope": "app/ribbon/ui.rs, ui_kit.rs, main.rs标题布局",
       "source": "ui-requirements.md",
       "heading": "UI-13 小窗口与高DPI的Ribbon自适应",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "各切片已按原合同机检验收；真实鼠标/系统 DPI 等不可用项保留在各切片 not_done。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T22:27:32Z",
+      "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+      "updated_utc": "2026-11-18T05:50:14Z",
       "slices": [
         {
           "id": "UI-13.1",
@@ -5816,7 +5824,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-13 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs"
@@ -5825,15 +5833,16 @@
           "commands": [],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-title.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "125%/150% DPI 未逐档目视"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T21:28:46Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         },
         {
           "id": "UI-13.2",
@@ -5841,7 +5850,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-13 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/ribbon/ui.rs",
@@ -5858,7 +5867,8 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-formulas.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-1024-home.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-1366-home.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-data.png"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-2/ribbon-760-data.png",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "真实鼠标展开“更多”逐项点击未做",
@@ -5866,8 +5876,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-17T20:42:13Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         },
         {
           "id": "UI-13.3",
@@ -5875,7 +5885,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-13 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/ui_kit.rs",
@@ -5885,15 +5895,16 @@
           "commands": [],
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui13-dialog.txt",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa05-dpi-scaling-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "真实 100/125/150% DPI 未逐档目视"
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-13T21:27:03Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         }
       ]
     },
@@ -6562,17 +6573,19 @@
       "scope": "app/main.rs验证下拉",
       "source": "ui-requirements.md",
       "heading": "UI-19 数据验证下拉的可用性与事务",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "各切片已按原合同机检验收；真实鼠标/系统 DPI 等不可用项保留在各切片 not_done。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
-      "next": "",
-      "updated_utc": "2026-11-13T23:01:48Z",
+      "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+      "updated_utc": "2026-11-18T05:50:14Z",
       "slices": [
         {
           "id": "UI-19.1",
@@ -6580,7 +6593,7 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-19 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
+          "status": "已验收",
           "acceptance": "",
           "files": [
             "crates/app/src/main.rs",
@@ -6594,7 +6607,8 @@
           "evidence": [
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-dv.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19/dropdown.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-1-1117.md"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui19-1-1117.md",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui12-ui13-ui19-review-1118.md"
           ],
           "not_done": [
             "真实鼠标点选/中文IME搜索未做",
@@ -6602,8 +6616,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "",
-          "updated_utc": "2026-11-17T17:50:00Z"
+          "next": "已验收（2026-11-18 机检）；真实鼠标/系统 DPI/IME 见 not_done。",
+          "updated_utc": "2026-11-18T05:50:14Z"
         }
       ]
     },
@@ -6977,8 +6991,8 @@
       "scope": "app/ribbon + 旧toolbar可达性",
       "source": "ui-requirements.md",
       "heading": "UI-30 清理旧菜单代码与命令可达性缺口",
-      "status": "实施中",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "旧菜单死代码已删除并先接走 CompareBooks/CompareSync/CfQuick/DvQuick；283 动作点击矩阵与旧菜单可达性用例通过。",
       "files": [],
       "commits": [
         "880e046",
@@ -6986,15 +7000,16 @@
         "b6779b8"
       ],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ui30-review-1118.md"
+      ],
       "not_done": [
-        "UI-30.1 待验收：宏入口、CF/DV 快捷窗口、并排比较、旧菜单删除、283 动作点击矩阵。",
-        "14 个对话框/网络动作需真人点击补验。"
+        "14 个文件对话框/导入/共享/联网检查动作未真人点击；点击矩阵不等于业务效果人工复核。"
       ],
       "failures": [],
       "blocker": "",
-      "next": "逐条移除旧菜单；补按钮点击矩阵。",
-      "updated_utc": "2026-11-16T14:20:00Z",
+      "next": "已验收（2026-11-18 机检）；真实键盘/文件对话框见 not_done。",
+      "updated_utc": "2026-11-18T05:50:45Z",
       "slices": [
         {
           "id": "UI-30.1",
@@ -7002,8 +7017,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-30 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "旧菜单删除、四个替代入口接入；283 动作点击矩阵与 legacy_cf_dv 可达性用例通过。",
           "files": [
             "crates/app/assets/ribbon/customUI.xml",
             "crates/app/src/ribbon/actions.rs",
@@ -7034,7 +7049,8 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30/ui30-ribbon3.png",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30-legacy-menu-removal.txt",
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30/ui30-cfquick2.png",
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30-click-matrix.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui30-click-matrix.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ui30-review-1118.md"
           ],
           "not_done": [
             "被跳过的 14 个动作（文件对话框/导入/共享/联网检查）未做真人点击，只做静态臂校验与个别专项测试。",
@@ -7042,8 +7058,8 @@
           ],
           "failures": [],
           "blocker": "",
-          "next": "UI-30.1 证据链齐全，等复核；被跳过的对话框动作需有人值守 GUI 会话补点。",
-          "updated_utc": "2026-11-16T14:45:00Z"
+          "next": "已验收（2026-11-18 机检）；真实键盘/文件对话框见 not_done。",
+          "updated_utc": "2026-11-18T05:50:45Z"
         }
       ]
     },
@@ -7491,8 +7507,8 @@
           "priority": "P2",
           "acceptance_source": "ui-requirements.md / UI-24 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "实施中",
-          "acceptance": "模态焦点锁定 + 正反向循环 + 默认按钮（Enter）+ 焦点自动滚入视口，四条均有可复跑的 egui 事件循环用例；物理键盘一项受环境阻塞。",
+          "status": "已验收",
+          "acceptance": "模态焦点锁定/正反向循环/默认按钮/焦点滚入视口四项事件循环用例通过；物理键盘一项保留 not_done。",
           "files": [],
           "commits": [
             "2218a50"
@@ -7506,15 +7522,16 @@
             "cargo test -p app --bin app（--test-threads=2）-> 360 passed（work/goal-logs/ui241c-app.log）"
           ],
           "evidence": [
-            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-modal-focus.txt"
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-modal-focus.txt",
+            "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui24-ui30-review-1118.md"
           ],
           "not_done": [
             "物理键盘在 GUI 里按 Tab/Shift+Tab：本机无交互桌面，SendInput 无效（与 QA-04.1 同一阻塞），证据为 egui 真实事件循环测试。"
           ],
           "failures": [],
           "blocker": "",
-          "next": "GUI 里用真实键盘复核 Tab/Enter；再补 Shift+Tab 断言。",
-          "updated_utc": "2026-11-12T10:28:37Z"
+          "next": "已验收（2026-11-18 机检）；真实键盘/文件对话框见 not_done。",
+          "updated_utc": "2026-11-18T05:50:45Z"
         },
         {
           "id": "UI-24.2",
