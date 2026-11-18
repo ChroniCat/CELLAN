@@ -6712,17 +6712,22 @@
       "scope": "app页面设置/打印入口",
       "source": "ui-requirements.md",
       "heading": "UI-26 页面布局和打印设置的完整入口",
-      "status": "待验收",
-      "acceptance": "",
+      "status": "已验收",
+      "acceptance": "UI-26.1 已验收：页面布局与打印设置的完整入口、版式保存和单作业份数均覆盖。",
       "files": [],
       "commits": [],
       "commands": [],
-      "evidence": [],
+      "evidence": [
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26-page-setup.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui26/page-setup.png",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa26-copies-1117.md",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa26-print-job.log"
+      ],
       "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "",
-      "updated_utc": "2026-11-13T23:49:43Z",
+      "updated_utc": "2026-11-18T17:00:00Z",
       "slices": [
         {
           "id": "UI-26.1",
@@ -6730,8 +6735,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-26 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "",
+          "status": "已验收",
+          "acceptance": "页面设置统一入口覆盖纸张/方向/页边距/网格线/行号列标/缩放/打印区域/顶端标题/页眉页脚/分页符/打印范围；修改实时预览、取消恢复；打印份数交给驱动为单个 Copies=N 作业；保存重开版式保持。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/ribbon/actions.rs",
@@ -6752,14 +6757,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa26-print-job.log"
           ],
           "not_done": [
-            "真打印机出纸/份数肉眼核对未验证（本机有 Canon 队列，但不能无人值守出纸）；",
-            "真实鼠标拖动/滑块未做（RDP 输入注入不可用）；",
-            "WPS 仅对页面数，未重新做 PDF 像素对拍。"
+            "真打印机出纸/份数肉眼核对未做（无无人值守出纸条件）；真实鼠标拖滑块/改份数未做（RDP 注入不可用）；WPS PDF 像素未重新对拍（页面数已对）。"
           ],
           "failures": [],
           "blocker": "",
           "next": "",
-          "updated_utc": "2026-11-13T23:49:43Z"
+          "updated_utc": "2026-11-18T17:00:00Z"
         }
       ]
     },
