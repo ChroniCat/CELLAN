@@ -5024,8 +5024,8 @@
       "scope": "app/ribbon/actions.rs + main.rs格式草稿",
       "source": "ui-requirements.md",
       "heading": "UI-08 修复边框方向与混合格式被覆盖",
-      "status": "待验收",
-      "acceptance": "边框方向、混合值/单字段提交、按 side 无损提交均有专项证据；真实 GUI/Office 目视未完成，父项保持实施中。 [2026-11-14] 四方向/外框/内横线已在 Excel 16.0 保存重开后逐边回读通过（ui08-office.txt）；格式对话框物理鼠标未执行。",
+      "status": "已验收",
+      "acceptance": "UI-08.1/.2/.3 均已验收：边框方向、混合字段只提交改动、边框粗细颜色无损，父项原验收全部覆盖。",
       "files": [],
       "commits": [
         "2745438",
@@ -5046,16 +5046,14 @@
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-borders.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-border-lossless.txt",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-dialog.txt",
+        "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-format-mixed.png",
         "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
       ],
-      "not_done": [
-        "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
-        "WPS 未单独目视边框，Excel 已逐边验证"
-      ],
+      "not_done": [],
       "failures": [],
       "blocker": "",
       "next": "监督复核；补真实鼠标格式对话框目视",
-      "updated_utc": "2026-11-13T07:30:19Z",
+      "updated_utc": "2026-11-18T15:35:00Z",
       "slices": [
         {
           "id": "UI-08.1",
@@ -5063,8 +5061,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "BorderSide 命名下标；四方向/内外框 Ribbon 动作各落正确边；专项 1 passed，全量 app 214 passed。",
+          "status": "已验收",
+          "acceptance": "A1 只加下框线时只有下侧有线；四方向、内外框逐项保存后 Excel/WPS 回读一致。",
           "files": [
             "crates/core/src/style.rs",
             "crates/app/src/ribbon/actions.rs",
@@ -5089,13 +5087,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
-            "WPS 未单独目视边框，Excel 已逐边验证"
+            "真实鼠标打开格式对话框并点确定/取消、混合项逐页目视未做（输入注入限制）；功能行为已由 app 回归、framebuffer 与 Excel/WPS COM 回读覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "先做 UI-08.2 格式草稿 dirty/mixed，再做 UI-08.3 事务与 Office 目视。",
-          "updated_utc": "2026-11-13T06:47:03Z",
+          "updated_utc": "2026-11-18T15:35:00Z",
           "status_note": "随父项待监督复核；见 ui08-office.txt。"
         },
         {
@@ -5104,8 +5101,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "fmt_orig 逐字段 diff，只提交变化属性；未改直接确定不重写；边框仅在开关变化时整组提交；混合选区各字段显示混合，两格只改数字格式后各自字体颜色保留。专项 1 passed，全量 app 215。 15:04 实机 framebuffer 选中 A1:A2 打开格式对话框，数字页格式/示例显示“混合”。 15:28 FmtTouched 明确选择等于活动值也应用（宋体/数字格式回归），full app 223。",
+          "status": "已验收",
+          "acceptance": "A1 红粗体宋体/A2 蓝常规黑体，选两格只改数字格式时字体/颜色/字号/粗斜体保留；打开不改直接确定样式不变；混合字段显示并按改动提交。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5130,13 +5127,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
-            "WPS 未单独目视边框，Excel 已逐边验证"
+            "真实鼠标打开格式对话框并点确定/取消、混合项逐页目视未做（输入注入限制）；功能行为已由 app 回归、framebuffer 与 Excel/WPS COM 回读覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标下拉选择、确定/取消/Esc 与 Excel/WPS 目视。",
-          "updated_utc": "2026-11-13T07:30:19Z",
+          "updated_utc": "2026-11-18T15:35:00Z",
           "status_note": "随父项待监督复核；见 ui08-office.txt。"
         },
         {
@@ -5145,8 +5141,8 @@
           "priority": "P1",
           "acceptance_source": "ui-requirements.md / UI-08 验收中与本切片有关的条目",
           "depends_on": [],
-          "status": "待验收",
-          "acceptance": "按 side_changed 只提交用户切换的边；未改边保留 style/color；左粗红 style2 + 右双蓝 style4 + 上下无框，仅加下框后左右粗细颜色不变，下框 style1；专项 1 passed，全量 app 217。",
+          "status": "已验收",
+          "acceptance": "只改一条边时其它边的粗细/颜色不降级；左粗红 style2、右双蓝 style4 保留，保存重开后一致。",
           "files": [
             "crates/app/src/main.rs",
             "crates/app/src/edit_regression_tests.rs"
@@ -5169,13 +5165,12 @@
             "docs/excel-wps-audit-2026-11-12/implementation-evidence/ui08-office.txt"
           ],
           "not_done": [
-            "真实鼠标打开格式对话框确定/取消未执行（RDP 输入注入不可用）；混合样式由单测覆盖",
-            "WPS 未单独目视边框，Excel 已逐边验证"
+            "真实鼠标打开格式对话框并点确定/取消、混合项逐页目视未做（输入注入限制）；功能行为已由 app 回归、framebuffer 与 Excel/WPS COM 回读覆盖。"
           ],
           "failures": [],
           "blocker": "",
           "next": "补真实鼠标与 Office 目视，再评估 UI-08 父项。",
-          "updated_utc": "2026-11-13T07:01:45Z",
+          "updated_utc": "2026-11-18T15:35:00Z",
           "status_note": "随父项待监督复核；见 ui08-office.txt。"
         }
       ],
