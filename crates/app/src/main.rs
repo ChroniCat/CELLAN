@@ -1671,6 +1671,8 @@ struct SheetApp {
     /// 没带文件启动时显示最近文件
     show_start: bool,
     confirm_close_target: Option<(usize, u64)>,
+    close_confirm_open: bool,
+    force_quit: bool,
     tabs_done: bool,
     paste_done: bool,
     pending_tab_switch: Option<usize>,
@@ -2085,7 +2087,7 @@ struct SheetApp {
     // ---- 协作 ----
     net: Option<net::Net>,
     peer: Option<Peer>,
-    remote: HashMap<u32, (String, u8, u32, u32)>,
+    remote: HashMap<u32, (usize, String, u8, u32, u32)>,
     peers_list: Vec<(u32, String, u8)>,
     join_addr: String,
     room_password: String,
@@ -2096,7 +2098,7 @@ struct SheetApp {
     /// 网盘文件打开后自动开房/加入（静默，不必点共享）
     auto_share: bool,
     my_name: String,
-    last_cursor: Option<(u32, u32)>,
+    last_cursor: Option<(usize, u32, u32)>,
     joined_doc: bool,
     /// 依赖图：编辑后只重算受影响的公式
     deps: sheetcore::formula::deps::Deps,
@@ -2780,6 +2782,8 @@ impl SheetApp {
             show_start: false,
             text_spill: true,
             confirm_close_target: None,
+            close_confirm_open: false,
+            force_quit: false,
             tabs_done: false,
             paste_done: false,
             pending_tab_switch: None,
@@ -3092,6 +3096,22 @@ impl SheetApp {
                 "about" => {
                     app.about_open = true;
                 }
+                "format" => {
+                    app.open_format_dialog();
+                }
+                "find" => {
+                    app.find.open = true;
+                    app.find.tab = 1;
+                }
+                "palette" => {
+                    app.palette_open = true;
+                }
+                "members" => {
+                    app.members_open = true;
+                }
+                "close_confirm" => {
+                    app.close_confirm_open = true;
+                }
                 _ => {}
             }
         }
@@ -3373,7 +3393,7 @@ impl SheetApp {
         let mut open = self.show_load_diag;
         let mut close = false;
         let fatal = diag.problems.iter().filter(|p| p.fatal).count();
-        egui::Window::new("加载问题")
+        ui_kit::window(ctx, "工作簿加载诊断", 560.0)
             .open(&mut open)
             .resizable(true)
             .default_width(560.0)
@@ -4867,7 +4887,7 @@ impl SheetApp {
         })
     }
 
-    /// 窗口关闭前把编辑缓冲落进模型；数据验证不通过时取消关闭（草稿不能顺手丢）。
+    /// 窗口关闭前把编辑缓冲落进模型；若有未保存改动则弹出对标 Excel/WPS 的保存确认框。
     fn commit_edit_before_close(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
@@ -4876,6 +4896,88 @@ impl SheetApp {
             self.commit_edit(None);
             if self.editing.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                return;
+            }
+        }
+        if self.force_quit {
+            return;
+        }
+        let headless_exit = std::env::var("SC_SHOT").is_ok()
+            || std::env::var("SC_DUMP").is_ok()
+            || std::env::var("SC_EXIT_AFTER_SHOT").is_ok()
+            || std::env::var("SC_FRAME_EXIT").is_ok()
+            || std::env::var("SC_SAVE_EXIT").is_ok()
+            || std::env::var("SC_RECALC_EXIT").is_ok()
+            || std::env::var("SC_NO_CLOSE_PROMPT").is_ok()
+            || std::env::var("SC_LOCK").is_ok()
+            || std::env::var("SC_LOCK_TRY").is_ok();
+        let any_dirty = self.has_open_workbook
+            && (self.wb.dirty
+                || self
+                    .tabs
+                    .iter()
+                    .any(|t| matches!(t, TabSlot::Parked(d) if d.wb.dirty)));
+        if !headless_exit && any_dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirm_open = true;
+        }
+    }
+
+    fn close_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm_open {
+            return;
+        }
+        let mut open = true;
+        let mut action = 0u8; // 1=save&quit, 2=discard&quit, 3=cancel
+        let doc_title = self
+            .wb
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未命名.xlsx".to_string());
+        ui_kit::window(ctx, "保存更改", 420.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui_kit::state_banner(
+                    ui,
+                    ui_kit::StateKind::Warn,
+                    &format!("是否保存对「{doc_title}」的更改？"),
+                    "如果不保存，最近所做的编辑与格式修改将会丢失。",
+                );
+                ui.add_space(12.0);
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        action = 3;
+                    }
+                    if ui_kit::secondary_button(ui, "不保存").clicked() {
+                        action = 2;
+                    }
+                    if ui_kit::primary_button(ui, "保存并退出").clicked() {
+                        action = 1;
+                    }
+                });
+            });
+        match action {
+            1 => {
+                self.close_confirm_open = false;
+                self.save(false);
+                if !self.wb.dirty || self.tasks.saving.is_some() {
+                    self.force_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            2 => {
+                self.close_confirm_open = false;
+                self.force_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            3 => {
+                self.close_confirm_open = false;
+            }
+            _ => {
+                self.close_confirm_open = open;
             }
         }
     }
@@ -5099,7 +5201,7 @@ impl SheetApp {
         self.c2_done = true;
         let mut members: Vec<String> = Vec::new();
         for (site, name, _) in self.peers_list.iter() {
-            let pos = self.remote.get(site).map(|(_, _, r, c)| format!("({r},{c})"));
+            let pos = self.remote.get(site).map(|(_, _, _, r, c)| format!("({r},{c})"));
             members.push(format!("{name}#{site}@{pos:?}"));
         }
         eprintln!("[C2] 成员 {} 人: {:?}", members.len(), members);
@@ -6993,39 +7095,183 @@ impl SheetApp {
         let mut win_open = true;
         let mut clicked = false;
         let mut run: Option<String> = None;
-        egui::Window::new("命令搜索")
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut win_open)
+        let screen = ctx.screen_rect();
+        let pw = 516.0f32.min((screen.width() - 24.0).max(280.0));
+        let px = screen.center().x - pw * 0.5;
+        let py = (screen.top() + 56.0).min((screen.bottom() - 120.0).max(screen.top() + 8.0));
+        // 轻柔背景遮罩：点击空白处即可收起命令搜索面板
+        egui::Area::new(egui::Id::new("cmd_palette_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                ui.set_width(460.0);
-                let te = ui.add(
-                    egui::TextEdit::singleline(&mut self.palette_q)
-                        .hint_text("输入命令名，如 冻结、居中、数据透视")
-                        .desired_width(f32::INFINITY),
-                );
-                if te.changed() {
-                    self.palette_idx = 0;
+                let r = egui::Rect::from_min_size(screen.min, screen.size());
+                ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(15, 23, 42, 26));
+                if ui.interact(r, egui::Id::new("cmd_palette_bg_click"), egui::Sense::click()).clicked() {
+                    win_open = false;
                 }
-                te.request_focus();
-                ui.label(format!("{} 条结果（Enter 执行第一条，Esc 关闭）", hits.len()));
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for (i, e) in hits.iter().take(40).enumerate() {
-                        let selected = i == self.palette_idx;
-                        let resp = ui.selectable_label(
-                            selected,
-                            format!("{}    {}", e.label, e.path()),
+            });
+        egui::Area::new(egui::Id::new("cmd_palette_card"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(px, py))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 14],
+                        blur: 34,
+                        spread: 0,
+                        color: Color32::from_black_alpha(36),
+                    })
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(pw - 28.0);
+                        // 顶部搜索输入舱
+                        let (srect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 38.0),
+                            Sense::hover(),
                         );
-                        if selected && nav_moved {
-                            resp.scroll_to_me(Some(egui::Align::Center));
+                        ui.painter().rect(
+                            srect,
+                            7.0,
+                            Color32::from_rgb(248, 250, 253),
+                            Stroke::new(1.5, ui_kit::BRAND_NAVY),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui_icons::draw(
+                            ui.painter(),
+                            Rect::from_center_size(
+                                egui::pos2(srect.left() + 18.0, srect.center().y),
+                                Vec2::splat(15.0),
+                            ),
+                            Icon::Find,
+                            ui_kit::BRAND_NAVY,
+                        );
+                        let inner_te = Rect::from_min_max(
+                            egui::pos2(srect.left() + 34.0, srect.top() + 5.0),
+                            egui::pos2(srect.right() - 10.0, srect.bottom() - 5.0),
+                        );
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(inner_te)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        let te = child.add(
+                            egui::TextEdit::singleline(&mut self.palette_q)
+                                .frame(false)
+                                .font(FontId::proportional(13.0))
+                                .hint_text(
+                                    egui::RichText::new("搜索功能命令，如：冻结窗格、条件格式、数据透视表、共享…")
+                                        .size(12.5)
+                                        .color(Color32::from_rgb(148, 163, 184)),
+                                )
+                                .desired_width(inner_te.width()),
+                        );
+                        if te.changed() {
+                            self.palette_idx = 0;
                         }
-                        if resp.clicked() {
-                            run = Some(e.action.clone());
-                            clicked = true;
-                        }
-                    }
-                });
+                        te.request_focus();
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("匹配 {} 项命令", hits.len()))
+                                    .size(11.0)
+                                    .color(ui_kit::TEXT_WEAK),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new("↑↓ 选择   Enter 执行   Esc 关闭")
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(148, 163, 184)),
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(308.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                if hits.is_empty() {
+                                    ui.add_space(18.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("没有找到匹配的命令")
+                                                .size(12.5)
+                                                .color(ui_kit::TEXT_WEAK),
+                                        );
+                                    });
+                                    ui.add_space(18.0);
+                                }
+                                for (i, e) in hits.iter().take(40).enumerate() {
+                                    let selected = i == self.palette_idx;
+                                    let rw = ui.available_width();
+                                    let (rrect, resp) = ui.allocate_exact_size(
+                                        Vec2::new(rw, 31.0),
+                                        Sense::click(),
+                                    );
+                                    if selected {
+                                        ui.painter().rect_filled(
+                                            rrect,
+                                            6.0,
+                                            Color32::from_rgb(235, 243, 255),
+                                        );
+                                        let bar = Rect::from_min_size(
+                                            egui::pos2(rrect.left() + 2.0, rrect.top() + 6.0),
+                                            Vec2::new(3.0, rrect.height() - 12.0),
+                                        );
+                                        ui.painter().rect_filled(bar, 1.5, ui_kit::BRAND_NAVY);
+                                    } else if resp.hovered() {
+                                        ui.painter().rect_filled(rrect, 6.0, ui_kit::HOVER);
+                                    }
+                                    ui_kit::paint_medium(
+                                        ui.painter(),
+                                        egui::pos2(rrect.left() + 12.0, rrect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &e.label,
+                                        12.5,
+                                        if selected { ui_kit::BRAND_NAVY } else { ui_kit::TEXT },
+                                    );
+                                    let path_str = e.path();
+                                    let pg = ui.painter().layout_no_wrap(
+                                        path_str.clone(),
+                                        FontId::proportional(11.0),
+                                        ui_kit::TEXT_WEAK,
+                                    );
+                                    let chip = Rect::from_min_size(
+                                        egui::pos2(
+                                            rrect.right() - pg.size().x - 20.0,
+                                            rrect.center().y - 10.0,
+                                        ),
+                                        Vec2::new(pg.size().x + 12.0, 20.0),
+                                    );
+                                    ui.painter().rect_filled(
+                                        chip,
+                                        4.0,
+                                        if selected {
+                                            Color32::from_rgb(219, 234, 254)
+                                        } else {
+                                            Color32::from_rgb(241, 245, 249)
+                                        },
+                                    );
+                                    ui.painter().text(
+                                        chip.center(),
+                                        Align2::CENTER_CENTER,
+                                        path_str,
+                                        FontId::proportional(11.0),
+                                        if selected { ui_kit::BRAND_NAVY } else { ui_kit::TEXT_WEAK },
+                                    );
+                                    if selected && nav_moved {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if resp.clicked() {
+                                        run = Some(e.action.clone());
+                                        clicked = true;
+                                    }
+                                }
+                            });
+                    });
             });
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if !win_open || clicked || esc {
@@ -7720,13 +7966,15 @@ impl SheetApp {
 
     fn csv_dlg_ui(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.csv_dlg.take() else { return };
+        let mut win_open = true;
         let mut close = false;
         let mut import = false;
         let mut changed = false;
-        egui::Window::new("导入 CSV")
+        ui_kit::window(ctx, "导入 CSV 文本向导", 600.0)
+            .open(&mut win_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(560.0)
+            .default_width(600.0)
             .show(ctx, |ui| {
                 ui.label(format!("文件：{}", dlg.path.display()));
                 ui.horizontal(|ui| {
@@ -7819,7 +8067,7 @@ impl SheetApp {
             let cols: Vec<u32> = d.text_cols.iter().copied().collect();
             self.csv_dlg = None;
             self.import_csv_choice(&path, delim, header, enc, quote, &cols);
-        } else if close {
+        } else if close || !win_open {
             self.csv_dlg = None;
         }
     }
@@ -8307,79 +8555,377 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
         self.status = format!("已创建表格 {}（{}）", name, sheetcore::table::a1((r1, c1, r2, c2)));
     }
 
-    /// 在线成员：谁在哪儿，点一下跳过去
+    /// 局域网实时协作中心：展示共享盘自动连线状态、本机地址、在线成员 ID、单元格编辑锁及跨表一键定位
     fn members_window(&mut self, ctx: &egui::Context) {
         if !self.members_open {
             return;
         }
         let mut open = true;
-        let mut jump: Option<(u32, u32)> = None;
-        ui_kit::window(ctx, "在线成员", 260.0)
+        let mut jump: Option<(usize, u32, u32)> = None;
+        let mut do_host = false;
+        let mut do_join = false;
+        let mut do_leave = false;
+        let mut do_fw = false;
+        let mut toggle_dir_share: Option<bool> = None;
+
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        let connected = self.net.is_some();
+        let me = self.net.as_ref().map(|n| n.site);
+        let host_addr = if hosting {
+            Some(format!("{}:{}", local_ip_hint(), self.active_net_port()))
+        } else {
+            self.wb
+                .path
+                .as_ref()
+                .and_then(|p| session_lock::read(p))
+                .map(|i| i.host)
+                .or_else(|| {
+                    if !self.join_addr.trim().is_empty() {
+                        Some(self.join_addr.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+        };
+
+        ui_kit::window(ctx, "局域网实时协作", 408.0)
             .open(&mut open)
-            .default_width(260.0)
+            .default_width(408.0)
             .show(ctx, |ui| {
-                dlg_section(ui, "当前共享成员");
-                let me = self.net.as_ref().map(|n| n.site);
-                if self.peers_list.is_empty() && self.net.is_none() {
-                    ui.label("当前没有共享");
-                }
-                for (site, name, color) in self.peers_list.clone() {
-                    let is_me = Some(site) == me;
-                    ui.horizontal(|ui| {
-                        let c = match color % 7 {
-                            0 => egui::Color32::from_rgb(230, 81, 0),
-                            1 => egui::Color32::from_rgb(0, 121, 107),
-                            2 => egui::Color32::from_rgb(106, 27, 154),
-                            3 => egui::Color32::from_rgb(2, 119, 189),
-                            4 => egui::Color32::from_rgb(198, 40, 40),
-                            5 => egui::Color32::from_rgb(46, 125, 50),
-                            _ => egui::Color32::from_rgb(255, 143, 0),
-                        };
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 4.5, c);
-                        let label = if is_me {
-                            format!("{name}（我）")
-                        } else {
-                            name.clone()
-                        };
-                        ui.add_sized(
-                            [120.0, 18.0],
-                            egui::Label::new(label).truncate(),
+                // 1. 顶部实时会话状态卡片
+                let (bg_col, bd_col, dot_col, headline, subline) = if hosting {
+                    (
+                        Color32::from_rgb(240, 253, 244),
+                        Color32::from_rgb(187, 247, 208),
+                        Color32::from_rgb(22, 163, 74),
+                        format!("正在主持局域网实时协同 · 在线 {} 人", self.peers_list.len().max(1)),
+                        "同事打开共享网盘中的同一份文件将自动连入，无需手动配置服务器。".to_string(),
+                    )
+                } else if connected {
+                    (
+                        Color32::from_rgb(239, 246, 255),
+                        Color32::from_rgb(191, 219, 254),
+                        ui_kit::BRAND_NAVY,
+                        format!("已接入局域网协同会话 · 在线 {} 人", self.peers_list.len().max(1)),
+                        "所有修改实时毫秒级同步；他人正在编辑的单元格将自动锁定禁用。".to_string(),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(248, 250, 252),
+                        ui_kit::CARD_BORDER,
+                        Color32::from_rgb(148, 163, 184),
+                        "当前尚未开启实时协同".to_string(),
+                        "将工作簿放入局域网共享盘/企业云同步盘，或点击下方按钮立即开启协作。".to_string(),
+                    )
+                };
+                egui::Frame::NONE
+                    .fill(bg_col)
+                    .stroke(Stroke::new(1.0, bd_col))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (drect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                            ui.painter().circle_filled(drect.center(), 4.2, dot_col);
+                            ui_kit::paint_medium(
+                                ui.painter(),
+                                egui::pos2(drect.right() + 6.0, drect.center().y),
+                                Align2::LEFT_CENTER,
+                                &headline,
+                                12.5,
+                                ui_kit::TEXT,
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(subline)
+                                .size(11.5)
+                                .color(ui_kit::TEXT_WEAK),
                         );
-                        // 远端光标位置
-                        let pos = self
-                            .remote
-                            .get(&site)
-                            .map(|(_, _, r, c)| (*r, *c))
-                            .or(if is_me { Some(self.sel) } else { None });
-                        if let Some((r, c)) = pos {
-                            if !is_me {
-                                if ui
-                                    .small_button(format!("{}", cell_name(r, c)))
-                                    .on_hover_text("跳到他所在的位置")
-                                    .clicked()
-                                {
-                                    jump = Some((r, c));
-                                }
-                            } else {
-                                ui.label(egui::RichText::new(cell_name(r, c)).weak());
+                        if let Some(addr) = &host_addr {
+                            if connected {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("会话地址：{addr}"))
+                                            .monospace()
+                                            .size(11.5)
+                                            .color(ui_kit::TEXT),
+                                    );
+                                    if ui_kit::pill(ui, "复制地址", "复制 IP:端口 发给同事手动加入").clicked() {
+                                        ctx.copy_text(addr.clone());
+                                        self.status = format!("已复制协作地址：{addr}");
+                                    }
+                                });
                             }
                         }
                     });
+
+                // 2. 网盘/共享文件夹协同目录识别与一键标记
+                if let Some(path) = self.wb.path.clone() {
+                    ui.add_space(4.0);
+                    let marked = session_lock::is_dir_marked_shared(&path);
+                    let auto_net = session_lock::is_network_path(&path);
+                    ui.horizontal(|ui| {
+                        let mut flag = marked || auto_net;
+                        let chk = ui.checkbox(
+                            &mut flag,
+                            egui::RichText::new("将所在文件夹设为网盘协同目录（打开即自动连线）").size(12.0),
+                        );
+                        if chk.changed() {
+                            toggle_dir_share = Some(flag);
+                        }
+                    });
                 }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("位置来自对方的选区广播，没动过的人不显示")
-                        .weak()
-                        .size(10.0),
-                );
+
+                ui.add_space(6.0);
+                dlg_section(ui, "在线协作成员与锁定状态");
+
+                if !connected {
+                    ui.horizontal(|ui| {
+                        if ui_kit::primary_button(ui, "开启局域网共享").clicked() {
+                            do_host = true;
+                        }
+                        if ui_kit::secondary_button(ui, "放行防火墙").clicked() {
+                            do_fw = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("或输入同事的宿主地址手动加入：")
+                            .size(11.5)
+                            .color(ui_kit::TEXT_WEAK),
+                    );
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 78.0).max(140.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(w, 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let r = ui_kit::text_input(
+                                    ui,
+                                    &mut self.join_addr,
+                                    "例如 192.168.1.20:7878",
+                                );
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    do_join = true;
+                                }
+                            },
+                        );
+                        if ui_kit::secondary_button(ui, "加入").clicked() {
+                            do_join = true;
+                        }
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(210.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            for (site, name, color) in self.peers_list.clone() {
+                                let is_me = Some(site) == me;
+                                let c = ui_kit::peer_color(color);
+                                // 检查该成员是否正在锁定编辑某格
+                                let locked_cell = self
+                                    .locks
+                                    .iter()
+                                    .find(|(_, h)| h.site == site)
+                                    .map(|((sh, r, cc), _)| (sh, r, cc));
+                                let cursor_cell = self
+                                    .remote
+                                    .get(&site)
+                                    .map(|(sh, _, _, r, cc)| (*sh, *r, *cc))
+                                    .or(if is_me {
+                                        Some((self.sheet_idx, self.sel.0, self.sel.1))
+                                    } else {
+                                        None
+                                    });
+                                let target = locked_cell.or(cursor_cell);
+                                let rw = ui.available_width();
+                                let (row_rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(rw, 38.0),
+                                    Sense::hover(),
+                                );
+                                ui.painter().rect(
+                                    row_rect,
+                                    7.0,
+                                    Color32::from_rgb(250, 251, 253),
+                                    Stroke::new(1.0, Color32::from_rgb(228, 233, 241)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                // 彩色圆形首字头像
+                                let av = Rect::from_center_size(
+                                    egui::pos2(row_rect.left() + 20.0, row_rect.center().y),
+                                    Vec2::splat(24.0),
+                                );
+                                ui.painter().circle_filled(av.center(), 12.0, c);
+                                let initial: String = name
+                                    .chars()
+                                    .next()
+                                    .map(|ch| ch.to_uppercase().to_string())
+                                    .unwrap_or_else(|| "U".to_string());
+                                ui_kit::paint_medium(
+                                    ui.painter(),
+                                    av.center(),
+                                    Align2::CENTER_CENTER,
+                                    &initial,
+                                    11.5,
+                                    Color32::WHITE,
+                                );
+                                let disp_name = if is_me {
+                                    format!("{name}（我）")
+                                } else {
+                                    name.clone()
+                                };
+                                ui_kit::paint_medium(
+                                    ui.painter(),
+                                    egui::pos2(av.right() + 9.0, row_rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    &disp_name,
+                                    12.0,
+                                    ui_kit::TEXT,
+                                );
+                                if let Some((sh, r, cc)) = target {
+                                    let sh_name = self
+                                        .wb
+                                        .sheets
+                                        .get(sh)
+                                        .map(|s| s.name.as_str())
+                                        .unwrap_or("Sheet1");
+                                    let loc_txt = if locked_cell.is_some() {
+                                        format!("编辑中 {}!{}", sh_name, cell_name(r, cc))
+                                    } else {
+                                        format!("{}!{}", sh_name, cell_name(r, cc))
+                                    };
+                                    let right_edge = if is_me {
+                                        row_rect.right() - 10.0
+                                    } else {
+                                        row_rect.right() - 52.0
+                                    };
+                                    let lg = ui.painter().layout_no_wrap(
+                                        loc_txt.clone(),
+                                        FontId::proportional(11.0),
+                                        Color32::PLACEHOLDER,
+                                    );
+                                    let extra_icon = if locked_cell.is_some() { 14.0 } else { 0.0 };
+                                    let pill_w = lg.size().x + 14.0 + extra_icon;
+                                    let pill_r = Rect::from_min_size(
+                                        egui::pos2(right_edge - pill_w, row_rect.center().y - 10.5),
+                                        Vec2::new(pill_w, 21.0),
+                                    );
+                                    let (pbg, pfg) = if locked_cell.is_some() {
+                                        (
+                                            Color32::from_rgb(254, 243, 199),
+                                            Color32::from_rgb(180, 83, 9),
+                                        )
+                                    } else {
+                                        (
+                                            Color32::from_rgb(238, 242, 248),
+                                            ui_kit::TEXT_WEAK,
+                                        )
+                                    };
+                                    ui.painter().rect_filled(pill_r, 5.0, pbg);
+                                    let mut tx_left = pill_r.left() + 7.0;
+                                    if locked_cell.is_some() {
+                                        ui_kit::draw_padlock(
+                                            ui.painter(),
+                                            Rect::from_center_size(
+                                                egui::pos2(tx_left + 5.0, pill_r.center().y),
+                                                Vec2::splat(11.0),
+                                            ),
+                                            pfg,
+                                        );
+                                        tx_left += 14.0;
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(tx_left, pill_r.center().y),
+                                        Align2::LEFT_CENTER,
+                                        loc_txt,
+                                        FontId::proportional(11.0),
+                                        pfg,
+                                    );
+                                    if !is_me {
+                                        let jrect = Rect::from_min_size(
+                                            egui::pos2(row_rect.right() - 46.0, row_rect.center().y - 11.0),
+                                            Vec2::new(38.0, 22.0),
+                                        );
+                                        let jresp = ui.interact(
+                                            jrect,
+                                            egui::Id::new(("peer_jump", site)),
+                                            Sense::click(),
+                                        );
+                                        ui.painter().rect(
+                                            jrect,
+                                            5.0,
+                                            if jresp.hovered() { ui_kit::HOVER } else { Color32::WHITE },
+                                            Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            jrect.center(),
+                                            Align2::CENTER_CENTER,
+                                            "定位",
+                                            FontId::proportional(11.0),
+                                            ui_kit::BRAND_NAVY,
+                                        );
+                                        if jresp.on_hover_text("跳转到该成员当前所在工作表与单元格").clicked() {
+                                            jump = Some((sh, r, cc));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui_kit::footer(ui, |ui| {
+                        if ui_kit::secondary_button(ui, "断开协作").clicked() {
+                            do_leave = true;
+                        }
+                        if ui_kit::secondary_button(ui, "放行防火墙").clicked() {
+                            do_fw = true;
+                        }
+                    });
+                }
             });
-        if let Some((r, c)) = jump {
+
+        if let Some(en) = toggle_dir_share {
+            if let Some(path) = self.wb.path.clone() {
+                match session_lock::set_dir_marked_shared(&path, en) {
+                    Ok(()) => {
+                        if en && self.net.is_none() {
+                            self.start_host_auto(&path);
+                        }
+                        self.status = if en {
+                            "已将当前目录设为网盘协同共享目录，同事打开同一文件即自动连线".into()
+                        } else {
+                            "已取消当前目录的协同共享标记".into()
+                        };
+                    }
+                    Err(e) => self.status = format!("设置协同目录失败：{e}"),
+                }
+            }
+        }
+        if do_host {
+            self.start_host();
+        }
+        if do_join {
+            self.join_shared();
+        }
+        if do_leave {
+            self.leave_session();
+        }
+        if do_fw {
+            self.open_firewall_port();
+        }
+        if let Some((sh, r, c)) = jump {
+            if sh < self.wb.sheets.len() && sh != self.sheet_idx {
+                let _ = self.switch_sheet_view(sh);
+            }
             self.sel = (r, c);
             self.sel_end = (r, c);
             self.ensure_visible();
-            self.status = format!("已跳到 {}", cell_name(r, c));
+            self.status = format!("已定位到 {}", cell_name(r, c));
         }
         self.members_open = open;
     }
@@ -9999,48 +10545,52 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         } else {
             None
         };
-        egui::Window::new(a.title.clone())
-            .id(egui::Id::new("dv_alert"))
+        let mut win_open = true;
+        ui_kit::window(ctx, a.title.clone(), 420.0)
+            .open(&mut win_open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_max_width(380.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(if a.info_only { "i" } else { "⚠" }).size(22.0),
-                    );
-                    ui.vertical(|ui| {
-                        ui.label(&a.msg);
-                        if a.info_only {
-                            ui.label("确定：接受这个值　取消：不写入");
-                        } else {
-                            ui.label("是：接受这个值　否：回到编辑框　取消：不写入");
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui_kit::state_banner(
+                    ui,
                     if a.info_only {
-                        if ui_kit::primary_button(ui, "确定").clicked() {
-                            choice = Some(DvAlertChoice::Primary);
-                        }
+                        ui_kit::StateKind::Empty
+                    } else {
+                        ui_kit::StateKind::Warn
+                    },
+                    &a.msg,
+                    if a.info_only {
+                        "点击「确定」接受此输入值，或点击「取消」放弃写入。"
+                    } else {
+                        "点击「是」接受此输入值，「否」返回继续修改，「取消」放弃写入。"
+                    },
+                );
+                ui.add_space(10.0);
+                ui_kit::footer(ui, |ui| {
+                    if a.info_only {
                         if ui_kit::secondary_button(ui, "取消").clicked() {
                             choice = Some(DvAlertChoice::Cancel);
                         }
-                    } else {
-                        if ui_kit::primary_button(ui, "是").clicked() {
+                        if ui_kit::primary_button(ui, "确定").clicked() {
                             choice = Some(DvAlertChoice::Primary);
+                        }
+                    } else {
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            choice = Some(DvAlertChoice::Cancel);
                         }
                         if ui_kit::secondary_button(ui, "否").clicked() {
                             choice = Some(DvAlertChoice::Secondary);
                         }
-                        if ui_kit::secondary_button(ui, "取消").clicked() {
-                            choice = Some(DvAlertChoice::Cancel);
+                        if ui_kit::primary_button(ui, "是").clicked() {
+                            choice = Some(DvAlertChoice::Primary);
                         }
                     }
                 });
             });
+        if !win_open && choice.is_none() {
+            choice = Some(DvAlertChoice::Cancel);
+        }
         if let Some(c) = choice.or(key_choice) {
             self.resolve_dv_alert(c);
         }
@@ -12809,50 +13359,63 @@ fn clear_selection(&mut self) {
         let mut open = true;
         let mut pick: Option<Color32> = None;
         let mut clear_fill = false;
-        egui::Window::new(title)
-            .id(egui::Id::new("color_popup"))
+        let cur_rgb = if for_font {
+            Some(self.current_style().color)
+        } else {
+            self.current_style().fill
+        };
+        ui_kit::window(ctx, title, 232.0)
+            .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_pos(ctx.screen_rect().center() - egui::vec2(90.0, 120.0))
             .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("主题与标准色")
+                        .size(11.0)
+                        .color(ui_kit::TEXT_WEAK),
+                );
                 let colors: [u32; 20] = [
                     0xFFFFFF, 0x000000, 0xE7E6E6, 0x44546A, 0x4472C4,
                     0xED7D31, 0xA5A5A5, 0xFFC000, 0x5B9BD5, 0x70AD47,
                     0x255E91, 0x9E480E, 0x636363, 0x997300, 0x264478,
                     0x43682B, 0xFF0000, 0xFFC0CB, 0xFFD700, 0x00B050,
                 ];
-                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                 for row in 0..4 {
                     ui.horizontal(|ui| {
                         for col in 0..5 {
                             let hex = colors[row * 5 + col];
-                            let c = Color32::from_rgb(
+                            let rgb = [
                                 ((hex >> 16) & 0xFF) as u8,
                                 ((hex >> 8) & 0xFF) as u8,
                                 (hex & 0xFF) as u8,
-                            );
+                            ];
+                            let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                            let is_cur = cur_rgb == Some(rgb);
                             let (rect, resp) =
-                                ui.allocate_exact_size(egui::vec2(24.0, 20.0), egui::Sense::click());
-                            ui.painter().rect_filled(rect, 2.0, c);
-                            ui.painter().rect_stroke(
-                                rect,
-                                2.0,
-                                egui::Stroke::new(1.0, Color32::from_rgb(190, 190, 190)),
-                                egui::StrokeKind::Inside,
-                            );
+                                ui.allocate_exact_size(egui::vec2(33.0, 24.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 4.0, c);
+                            let bd = if is_cur {
+                                egui::Stroke::new(2.0, ui_kit::BRAND_NAVY)
+                            } else if resp.hovered() {
+                                egui::Stroke::new(1.5, ui_kit::ACCENT)
+                            } else {
+                                egui::Stroke::new(1.0, Color32::from_rgb(203, 213, 225))
+                            };
+                            ui.painter().rect_stroke(rect, 4.0, bd, egui::StrokeKind::Inside);
                             if resp.clicked() {
                                 pick = Some(c);
                             }
                         }
                     });
                 }
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 ui.separator();
-                if !for_font && ui.button("无填充颜色").clicked() {
+                if !for_font && ui_kit::popup_item(ui, "无填充颜色", true, 180.0).clicked() {
                     clear_fill = true;
                 }
-                if ui.button("更多颜色…").clicked() {
-                    // 简易取色：打开系统色板
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("自定义颜色：").size(12.0));
                     let mut c = if for_font {
                         Color32::from_rgb(
                             self.current_style().color[0],
@@ -12866,7 +13429,7 @@ fn clear_selection(&mut self) {
                     if ui.color_edit_button_srgba(&mut c).changed() {
                         pick = Some(c);
                     }
-                }
+                });
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             open = false;
@@ -18205,41 +18768,78 @@ let txn = self.txn_begin(&keys);
                                 ui.label(egui::RichText::new("把当前工作表按打印版式导出成 PDF。").size(12.0).color(ui_kit::TEXT_WEAK));
                             }
                             5 => {
-                                ui.label(egui::RichText::new("共享").size(26.0).color(ui_kit::TEXT));
+                                ui.label(egui::RichText::new("局域网实时共享").size(26.0).color(ui_kit::TEXT));
                                 ui.add_space(10.0);
                                 if self.net.is_none() {
-                                    if ui_kit::primary_button(ui, "共享到局域网").clicked() {
-                                        self.start_host();
-                                        close = true;
-                                    }
-                                    ui.add_space(6.0);
-                                    ui.label(egui::RichText::new("不经过服务器：同事通过共享盘或局域网直接连到这台机器。").size(12.0).color(ui_kit::TEXT_WEAK));
-                                } else {
+                                    ui.horizontal(|ui| {
+                                        if ui_kit::primary_button(ui, "共享到局域网").clicked() {
+                                            self.start_host();
+                                            self.members_open = true;
+                                            close = true;
+                                        }
+                                        if ui_kit::secondary_button(ui, "加入他人会话…").clicked() {
+                                            self.members_open = true;
+                                            close = true;
+                                        }
+                                    });
+                                    ui.add_space(8.0);
                                     ui.label(
-                                        egui::RichText::new(format!("已共享 · 在线 {} 人", self.peers_list.len()))
-                                            .size(13.0),
+                                        egui::RichText::new(
+                                            "无需中心服务器或账号：将工作簿放到局域网共享盘 / 企业云同步盘（如群晖、OneDrive、坚果云、WPS网盘），团队成员同时打开同一份文件即可自动连线并实时同步修改；他人正在编辑的单元格会自动标记 ID 并锁定禁用。",
+                                        )
+                                        .size(12.0)
+                                        .color(ui_kit::TEXT_WEAK),
                                     );
-                                    if let Some(addr) = self
-                                        .wb
-                                        .path
-                                        .as_ref()
-                                        .and_then(|p| session_lock::read(p))
-                                        .map(|i| i.host)
-                                    {
-                                        ui.label(
-                                            egui::RichText::new(format!("本机地址：{addr}"))
-                                                .size(12.0)
-                                                .color(ui_kit::TEXT_WEAK),
-                                        );
+                                } else {
+                                    let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+                                    let addr = if hosting {
+                                        Some(format!("{}:{}", local_ip_hint(), self.active_net_port()))
+                                    } else {
+                                        self.wb
+                                            .path
+                                            .as_ref()
+                                            .and_then(|p| session_lock::read(p))
+                                            .map(|i| i.host)
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · 在线 {} 人",
+                                            if hosting { "正在主持共享" } else { "已加入协作" },
+                                            self.peers_list.len().max(1)
+                                        ))
+                                        .size(14.0)
+                                        .color(ui_kit::ACCENT),
+                                    );
+                                    if let Some(addr) = addr {
+                                        ui.add_space(4.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("协作地址：{addr}"))
+                                                    .monospace()
+                                                    .size(12.5)
+                                                    .color(ui_kit::TEXT),
+                                            );
+                                            if ui_kit::secondary_button(ui, "复制地址").clicked() {
+                                                ctx.copy_text(addr.clone());
+                                                self.status = format!("已复制协作地址：{addr}");
+                                            }
+                                        });
                                     }
-                                    if ui_kit::primary_button(ui, "查看成员").clicked() {
-                                        self.members_open = true;
-                                    }
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui_kit::primary_button(ui, "打开协作面板").clicked() {
+                                            self.members_open = true;
+                                            close = true;
+                                        }
+                                        if ui_kit::secondary_button(ui, "断开协作").clicked() {
+                                            self.leave_session();
+                                        }
+                                    });
                                 }
-                                ui.add_space(8.0);
+                                ui.add_space(12.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "同事连不上时，通常是本机防火墙没放行协作端口。",
+                                        "提示：若跨机器同事无法连入，请点击下方按钮放行本机 TCP 协作端口。",
                                     )
                                     .size(12.0)
                                     .color(ui_kit::TEXT_WEAK),
@@ -19491,23 +20091,38 @@ let txn = self.txn_begin(&keys);
                 }
             }
         }
-        // 别人正在编辑：虚线框 + 角标
+        // 别人正在编辑：暖琥珀禁用底纹 + 斜纹锁定纹理 + 醒目边框（明确传达「已禁用不可改」）
         if let Some(site) = self.net.as_ref().map(|n| n.site) {
             if self.locks.is_locked_by_other(self.sheet_idx, r, c, site) {
-                let color = egui::Color32::from_rgb(230, 120, 30);
-                let dash = egui::Stroke::new(1.5, color);
-                painter.add(egui::Shape::dashed_line(
-                    &[
-                        rect.left_top(),
-                        rect.right_top(),
-                        rect.right_bottom(),
-                        rect.left_bottom(),
-                        rect.left_top(),
-                    ],
-                    dash,
-                    5.0,
-                    3.0,
-                ));
+                painter.rect_filled(
+                    rect.shrink(0.5),
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(245, 158, 11, 30),
+                );
+                // 轻柔斜纹底影，不遮挡数值阅读，同时一眼区分禁用锁定态
+                let inner = rect.shrink(1.5);
+                if inner.width() > 4.0 && inner.height() > 4.0 {
+                    let stripe_p = painter.with_clip_rect(inner.intersect(painter.clip_rect()));
+                    let st = egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(217, 119, 6, 30),
+                    );
+                    let h = inner.height();
+                    let mut x0 = inner.left() - h;
+                    while x0 < inner.right() {
+                        stripe_p.line_segment(
+                            [egui::pos2(x0, inner.bottom()), egui::pos2(x0 + h, inner.top())],
+                            st,
+                        );
+                        x0 += 9.0;
+                    }
+                }
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.8, egui::Color32::from_rgb(217, 119, 6)),
+                    egui::StrokeKind::Inside,
+                );
                 if dumping {
                     dump.push(format!(
                         "locked ({r},{c}) by={:?}",
@@ -21573,29 +22188,11 @@ let txn = self.txn_begin(&keys);
         let hidden_mixed = mixed.hidden
             && !self.fmt_touched.hidden
             && self.fmt_state.hidden == orig.hidden;
-        ui_kit::window(ctx, "设置单元格格式", 452.0)
+        ui_kit::window(ctx, "设置单元格格式", 492.0)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-            .frame(
-                egui::Frame::window(&ctx.style())
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 198, 196)))
-                    .corner_radius(4.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 18,
-                        spread: 0,
-                        color: egui::Color32::from_black_alpha(32),
-                    })
-                    .inner_margin(egui::Margin {
-                        left: 16,
-                        right: 16,
-                        top: 10,
-                        bottom: 12,
-                    }),
-            )
             .show(ctx, |ui| {
                 ui.set_width(452.0);
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 7.0);
@@ -22117,17 +22714,14 @@ let txn = self.txn_begin(&keys);
         let mut do_count = false;
         let mut do_list = false;
         let mut cancel_scan = false;
-        ui_kit::window(ctx, "查找与替换", 380.0)
+        ui_kit::window(ctx, "查找与替换", 484.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
                 ui_kit::dialog_tabs(ui, &mut self.find.tab, &["查找", "替换"]);
-                ui.add_space(6.0);
-                ui_kit::field(ui, "查找", |ui| {
-                    let r = ui.add_sized(
-                        [ui.available_width(), 22.0],
-                        egui::TextEdit::singleline(&mut self.find.find),
-                    );
+                ui.add_space(4.0);
+                ui_kit::field(ui, "查找内容", |ui| {
+                    let r = ui_kit::text_input(ui, &mut self.find.find, "输入要查找的文本或数值…");
                     ui_kit::autofocus(ui, &r);
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         do_find = true;
@@ -22135,24 +22729,25 @@ let txn = self.txn_begin(&keys);
                 });
                 if self.find.tab == 1 {
                     ui_kit::field(ui, "替换为", |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), 22.0],
-                            egui::TextEdit::singleline(&mut self.find.replace),
-                        );
+                        let _ = ui_kit::text_input(ui, &mut self.find.replace, "输入替换后的新内容…");
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.add_space(68.0);
+                    ui.add_space(72.0);
                     ui.checkbox(&mut self.find.match_case, "区分大小写");
-                    ui.checkbox(&mut self.find.whole_cell, "整格匹配");
-                    ui.checkbox(&mut self.find.replace_formula_results, "替换公式结果")
-                        .on_hover_text("值模式命中公式结果时，允许把公式替换成常量");
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.find.whole_cell, "单元格完全匹配");
+                    if self.find.tab == 1 {
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.find.replace_formula_results, "替换公式结果")
+                            .on_hover_text("值模式命中公式结果时，允许把公式替换成常量");
+                    }
                 });
                 ui.horizontal(|ui| {
-                    ui.add_space(68.0);
-                    ui.label("范围");
+                    ui.add_space(72.0);
+                    ui.label(egui::RichText::new("范围").color(ui_kit::TEXT_WEAK));
                     egui::ComboBox::from_id_salt("find_scope")
-                        .width(112.0)
+                        .width(104.0)
                         .selected_text(match self.find.scope {
                             1 => "整个工作簿",
                             2 => "当前选区",
@@ -22163,32 +22758,26 @@ let txn = self.txn_begin(&keys);
                             ui.selectable_value(&mut self.find.scope, 1, "整个工作簿");
                             ui.selectable_value(&mut self.find.scope, 2, "当前选区");
                         });
-                    ui.label("查找");
+                    ui.label(egui::RichText::new("对象").color(ui_kit::TEXT_WEAK));
                     egui::ComboBox::from_id_salt("find_mode")
-                        .width(78.0)
+                        .width(72.0)
                         .selected_text(if self.find.in_formula { "公式" } else { "值" })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.find.in_formula, false, "值");
                             ui.selectable_value(&mut self.find.in_formula, true, "公式");
                         });
-                    ui.label("顺序");
+                    ui.label(egui::RichText::new("顺序").color(ui_kit::TEXT_WEAK));
                     egui::ComboBox::from_id_salt("find_order")
-                        .width(78.0)
+                        .width(72.0)
                         .selected_text(if self.find.order_column { "按列" } else { "按行" })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.find.order_column, false, "按行");
                             ui.selectable_value(&mut self.find.order_column, true, "按列");
                         });
-                    if ui_kit::pill(ui, "查找全部", "列出范围内全部命中，可点击跳转").clicked() {
-                        do_list = true;
-                    }
-                    if ui_kit::pill(ui, "统计", "统计当前范围命中数").clicked() {
-                        do_count = true;
-                    }
                 });
                 if let Some(scan) = self.find_scan.as_ref() {
                     ui.horizontal(|ui| {
-                        ui.add_space(68.0);
+                        ui.add_space(72.0);
                         ui.label(format!("正在扫描 {}/{} 格", scan.at, scan.keys.len()));
                         if ui_kit::secondary_button(ui, "取消").clicked() {
                             cancel_scan = true;
@@ -22196,16 +22785,22 @@ let txn = self.txn_begin(&keys);
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.add_space(68.0);
+                    ui.add_space(72.0);
+                    if ui_kit::pill(ui, "查找全部", "列出范围内全部命中，可点击跳转").clicked() {
+                        do_list = true;
+                    }
+                    if ui_kit::pill(ui, "统计数量", "统计当前范围命中数").clicked() {
+                        do_count = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("命中 {} 处", self.find.hits))
-                                .size(11.0)
-                                .weak(),
+                                .size(11.5)
+                                .color(ui_kit::TEXT_WEAK),
                         );
                     });
                 });
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -22224,7 +22819,7 @@ let txn = self.txn_begin(&keys);
                         if ui_kit::primary_button(ui, "查找下一个").clicked() {
                             do_find = true;
                         }
-                        if ui.button("上一个").clicked() {
+                        if ui_kit::secondary_button(ui, "上一个").clicked() {
                             do_prev = true;
                         }
                     });
@@ -22276,10 +22871,10 @@ let txn = self.txn_begin(&keys);
         let mut open = true;
         let mut pick: Option<sheetcore::search::Hit> = None;
         let all = &self.find.find_all;
-        egui::Window::new("查找全部")
+        ui_kit::window(ctx, "查找全部结果", 360.0)
             .open(&mut open)
             .resizable(true)
-            .default_width(300.0)
+            .default_width(360.0)
             .show(ctx, |ui| {
                 if all.is_empty() {
                     ui_kit::state_view(
@@ -23978,10 +24573,10 @@ let txn = self.txn_begin(&keys);
         let mut action: Option<CtxAct> = None;
         let mut sub_req: Option<(usize, f32)> = None;
         let mut rects: Vec<egui::Rect> = Vec::new();
-        let fg = egui::Color32::from_rgb(32, 32, 32);
-        let grey = egui::Color32::from_rgb(120, 120, 120);
-        let ink = egui::Color32::from_rgb(56, 56, 56);
-        let hover_bg = egui::Color32::from_rgb(242, 242, 242);
+        let fg = ui_kit::TEXT;
+        let grey = ui_kit::TEXT_WEAK;
+        let ink = egui::Color32::from_rgb(51, 65, 85);
+        let hover_bg = ui_kit::HOVER;
 
         egui::Area::new(egui::Id::new("ctx_menu_area"))
             .order(egui::Order::Foreground)
@@ -23991,17 +24586,18 @@ let txn = self.txn_begin(&keys);
                 rects.push(rect);
                 ui.allocate_rect(rect, egui::Sense::hover());
                 let p = ui.painter().clone();
-                // 阴影 + 白底 + 1px 边框（Excel 的菜单没有圆角）
-                p.rect_filled(
-                    rect.translate(egui::vec2(2.0, 2.0)),
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                // 现代 Excel 365 / WPS 悬浮右键菜单：柔和弥散阴影 + 8px 圆角纯白卡 + 1px CARD_BORDER
+                p.rect_stroke(
+                    rect.expand(1.5),
+                    9.5,
+                    egui::Stroke::new(3.0, egui::Color32::from_black_alpha(12)),
+                    egui::StrokeKind::Outside,
                 );
-                p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                p.rect_filled(rect, 8.0, egui::Color32::WHITE);
                 p.rect_stroke(
                     rect,
-                    0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+                    8.0,
+                    egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
                     egui::StrokeKind::Inside,
                 );
                 let mut y = pos.y + 4.0;
@@ -24009,24 +24605,24 @@ let txn = self.txn_begin(&keys);
                     if row.is_sep() {
                         p.line_segment(
                             [
-                                egui::pos2(pos.x + 8.0, y + 3.5),
-                                egui::pos2(pos.x + CTX_W - 8.0, y + 3.5),
+                                egui::pos2(pos.x + 10.0, y + 3.5),
+                                egui::pos2(pos.x + CTX_W - 10.0, y + 3.5),
                             ],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 226, 226)),
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(232, 236, 242)),
                         );
                         y += 8.0;
                         continue;
                     }
                     if row.strip {
-                        // 粘贴选项：Excel 在菜单里放一排图标按钮
+                        // 粘贴选项快捷图标条
                         let strip = egui::Rect::from_min_size(
                             egui::pos2(pos.x, y),
                             egui::vec2(CTX_W, CTX_STRIP_H),
                         );
                         p.rect_filled(
                             strip.shrink2(egui::vec2(6.0, 2.0)),
-                            2.0,
-                            egui::Color32::from_rgb(247, 247, 247),
+                            5.0,
+                            egui::Color32::from_rgb(246, 248, 252),
                         );
                         let icons = [
                             (CtxAct::Paste, crate::ui_icons::Icon::Paste),
@@ -24046,7 +24642,7 @@ let txn = self.txn_begin(&keys);
                                 egui::Sense::click(),
                             );
                             if r.hovered() {
-                                p.rect_filled(br, 2.0, egui::Color32::from_rgb(232, 232, 232));
+                                p.rect_filled(br, 4.0, ui_kit::HOVER);
                             }
                             ui_icons::draw(&p, br.shrink(6.0), *ic, ink);
                             // UI-24.2：右键菜单里的粘贴图标也要有名字
@@ -24091,8 +24687,8 @@ let txn = self.txn_begin(&keys);
                     let active = matches!(sub, Some(s) if s == i) || (sub.is_none() && key == i);
                     if r.hovered() || active {
                         p.rect_filled(
-                            rr.shrink2(egui::vec2(4.0, 0.0)),
-                            2.0,
+                            rr.shrink2(egui::vec2(5.0, 1.0)),
+                            5.0,
                             hover_bg,
                         );
                     }
@@ -24128,12 +24724,10 @@ let txn = self.txn_begin(&keys);
                         );
                     }
                     if has_children {
-                        p.text(
-                            egui::pos2(pos.x + CTX_W - 9.0, y + CTX_ROW_H / 2.0),
-                            egui::Align2::RIGHT_CENTER,
-                            "›",
-                            egui::FontId::proportional(13.0),
-                            egui::Color32::from_rgb(90, 90, 90),
+                        ui_kit::caret_right(
+                            ui,
+                            egui::pos2(pos.x + CTX_W - 13.0, y + CTX_ROW_H / 2.0),
+                            egui::Color32::from_rgb(100, 116, 139),
                         );
                         if r.hovered() || matches!(sub, Some(s) if s == i) {
                             sub_req = Some((i, rr.top()));
@@ -24176,16 +24770,17 @@ let txn = self.txn_begin(&keys);
                     rects.push(rect);
                     ui.allocate_rect(rect, egui::Sense::hover());
                     let p = ui.painter().clone();
-                    p.rect_filled(
-                        rect.translate(egui::vec2(2.0, 2.0)),
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
+                    p.rect_stroke(
+                        rect.expand(1.5),
+                        9.5,
+                        egui::Stroke::new(3.0, egui::Color32::from_black_alpha(12)),
+                        egui::StrokeKind::Outside,
                     );
-                    p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                    p.rect_filled(rect, 8.0, egui::Color32::WHITE);
                     p.rect_stroke(
                         rect,
-                        0.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(198, 198, 198)),
+                        8.0,
+                        egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
                         egui::StrokeKind::Inside,
                     );
                     let mut y = sp.y + 4.0;
@@ -24200,7 +24795,7 @@ let txn = self.txn_begin(&keys);
                             egui::Sense::click(),
                         );
                         if r.hovered() || sub_key == k {
-                            p.rect_filled(rr.shrink2(egui::vec2(4.0, 0.0)), 2.0, hover_bg);
+                            p.rect_filled(rr.shrink2(egui::vec2(5.0, 1.0)), 5.0, hover_bg);
                         }
                         let mut text_x = sp.x + 14.0;
                         if let Some(rgb) = kid.swatch {
@@ -26758,38 +27353,170 @@ let txn = self.txn_begin(&keys);
             }
         }
 
-        // 远端光标
-        for (name, color, rr, cc) in self.remote.values() {
-            let x = gx(*cc);
-            let y = gy(*rr);
-            if x + cols.size(*cc) < origin.x + head_w || y + rows.size(*rr) < origin.y + hh {
-                continue;
-            }
-            if x > origin.x + avail.x || y > origin.y + avail.y {
-                continue;
-            }
-            let col = match color % 7 {
-                0 => Color32::from_rgb(230, 81, 0),
-                1 => Color32::from_rgb(0, 121, 107),
-                2 => Color32::from_rgb(106, 27, 154),
-                3 => Color32::from_rgb(2, 119, 189),
-                4 => Color32::from_rgb(198, 40, 40),
-                5 => Color32::from_rgb(46, 125, 50),
-                _ => Color32::from_rgb(255, 143, 0),
+        // 远端同事实时选区光标与单元格编辑锁定名牌（显示同事 ID + 禁用锁定标识）
+        {
+            let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+            let min_vx = origin.x + head_w;
+            let min_vy = origin.y + hh;
+            let max_vx = origin.x + avail.x;
+            let max_vy = origin.y + avail.y;
+            let cell_visual_rect = |rr: u32, cc: u32| -> Rect {
+                if let Some(&(r1, c1, r2, c2)) = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .merges
+                    .iter()
+                    .find(|&&(r1, c1, r2, c2)| rr >= r1 && rr <= r2 && cc >= c1 && cc <= c2)
+                {
+                    let x0 = gx(c1);
+                    let y0 = gy(r1);
+                    let x1 = gx(c2) + cols.size(c2);
+                    let y1 = gy(r2) + rows.size(r2);
+                    Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+                } else {
+                    Rect::from_min_size(
+                        egui::pos2(gx(cc), gy(rr)),
+                        Vec2::new(cols.size(cc), rows.size(rr)),
+                    )
+                }
             };
-            painter.rect_stroke(
-                Rect::from_min_size(egui::pos2(x, y), Vec2::new(cols.size(*cc), rows.size(*rr))),
-                0.0,
-                Stroke::new(2.0, col),
-                egui::StrokeKind::Inside,
-            );
-            painter.text(
-                egui::pos2(x + 2.0, y - 2.0),
-                Align2::LEFT_BOTTOM,
-                name,
-                FontId::proportional(10.0),
-                col,
-            );
+
+            // 鼠标悬停到他人锁定的单元格时切换为「禁止操作」指针并弹出悬浮说明
+            if let Some(hp) = resp.hover_pos() {
+                if hp.x > min_vx && hp.y > min_vy && hp.x < max_vx && hp.y < max_vy {
+                    let hc = col_at(hp.x);
+                    let hr = row_at(hp.y);
+                    let (ar, ac) = self
+                        .wb
+                        .sheet(self.sheet_idx)
+                        .merges
+                        .iter()
+                        .find(|&&(r1, c1, r2, c2)| hr >= r1 && hr <= r2 && hc >= c1 && hc <= c2)
+                        .map(|&(r1, c1, _, _)| (r1, c1))
+                        .unwrap_or((hr, hc));
+                    if self.lock_holder(ar, ac).is_some() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                    }
+                }
+            }
+
+            // 1) 绘制本表其他在线成员的实时选区边框与彩色 ID 胶囊标签
+            for (&psite, (sh, name, color, rr, cc)) in self.remote.iter() {
+                if *sh != self.sheet_idx || psite == my_site {
+                    continue;
+                }
+                let crect = cell_visual_rect(*rr, *cc);
+                if crect.right() < min_vx
+                    || crect.bottom() < min_vy
+                    || crect.left() > max_vx
+                    || crect.top() > max_vy
+                {
+                    continue;
+                }
+                let col = ui_kit::peer_color(*color);
+                let same_locked = self
+                    .locks
+                    .holder(self.sheet_idx, *rr, *cc)
+                    .is_some_and(|h| h.site == psite);
+                if !same_locked {
+                    painter.rect_stroke(
+                        crect,
+                        1.0,
+                        Stroke::new(2.0, col),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            egui::pos2(crect.right() - 5.0, crect.bottom() - 5.0),
+                            Vec2::splat(5.0),
+                        ),
+                        1.0,
+                        col,
+                    );
+                    let ng = painter.layout_no_wrap(
+                        name.clone(),
+                        FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    let tag_w = (ng.size().x + 12.0).max(28.0);
+                    let tag_h = 18.0;
+                    let tx = crect.left().max(min_vx + 1.0).min((max_vx - tag_w - 2.0).max(min_vx + 1.0));
+                    let ty = if crect.top() - tag_h - 1.0 >= min_vy {
+                        crect.top() - tag_h - 1.0
+                    } else {
+                        (crect.bottom() + 1.0).min(max_vy - tag_h - 1.0)
+                    };
+                    let tag_rect = Rect::from_min_size(egui::pos2(tx, ty), Vec2::new(tag_w, tag_h));
+                    painter.rect_filled(tag_rect.expand(1.0), 5.0, Color32::from_white_alpha(220));
+                    painter.rect_filled(tag_rect, 4.0, col);
+                    ui_kit::paint_medium(
+                        &painter,
+                        tag_rect.center(),
+                        Align2::CENTER_CENTER,
+                        name,
+                        11.0,
+                        Color32::WHITE,
+                    );
+                }
+            }
+
+            // 2) 绘制他人正在编辑并锁定禁用的单元格徽章（挂锁图标 + 用户 ID + 正在编辑）
+            if my_site != 0 {
+                let mut other_locks: Vec<(u32, u32, u32, String)> = self
+                    .locks
+                    .iter()
+                    .filter(|((sh, _, _), h)| *sh == self.sheet_idx && h.site != my_site)
+                    .map(|((_, lr, lc), h)| (lr, lc, h.site, h.name.clone()))
+                    .collect();
+                other_locks.sort_by_key(|(lr, lc, _, _)| (*lr, *lc));
+                for (lr, lc, _lsite, lname) in other_locks {
+                    let crect = cell_visual_rect(lr, lc);
+                    if crect.right() < min_vx
+                        || crect.bottom() < min_vy
+                        || crect.left() > max_vx
+                        || crect.top() > max_vy
+                    {
+                        continue;
+                    }
+                    let label = format!("{lname} 正在编辑");
+                    let lg = painter.layout_no_wrap(
+                        label.clone(),
+                        FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    let badge_w = lg.size().x + 26.0;
+                    let badge_h = 19.0;
+                    let bx = crect
+                        .left()
+                        .max(min_vx + 1.0)
+                        .min((max_vx - badge_w - 2.0).max(min_vx + 1.0));
+                    let by = if crect.top() - badge_h - 1.0 >= min_vy {
+                        crect.top() - badge_h - 1.0
+                    } else {
+                        (crect.bottom() + 1.0).min(max_vy - badge_h - 1.0)
+                    };
+                    let brect = Rect::from_min_size(egui::pos2(bx, by), Vec2::new(badge_w, badge_h));
+                    let lock_bg = Color32::from_rgb(180, 83, 9);
+                    painter.rect_filled(brect.expand(1.0), 5.5, Color32::from_white_alpha(235));
+                    painter.rect_filled(brect, 4.5, lock_bg);
+                    ui_kit::draw_padlock(
+                        &painter,
+                        Rect::from_center_size(
+                            egui::pos2(brect.left() + 10.0, brect.center().y),
+                            Vec2::splat(11.0),
+                        ),
+                        Color32::WHITE,
+                    );
+                    ui_kit::paint_medium(
+                        &painter,
+                        egui::pos2(brect.left() + 19.0, brect.center().y),
+                        Align2::LEFT_CENTER,
+                        &label,
+                        11.0,
+                        Color32::WHITE,
+                    );
+                }
+            }
         }
 
         // UI-11.5：编辑公式时按行号/列标 = 整行/整列引用（A:A / 1:1）。
@@ -28030,13 +28757,46 @@ let txn = self.txn_begin(&keys);
         }
     }
 
+    fn active_net_port(&self) -> u16 {
+        self.net
+            .as_ref()
+            .filter(|n| n.port > 0)
+            .map(|n| n.port)
+            .unwrap_or_else(net::port)
+    }
+
+    fn leave_session(&mut self) {
+        self.release_lock();
+        let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if let Some(n) = self.net.take() {
+            n.shutdown();
+        }
+        if hosting {
+            if let Some(p) = self.wb.path.clone() {
+                session_lock::remove(&p);
+                session_lock::release_election(&p);
+            }
+        }
+        self.peer = None;
+        self.remote.clear();
+        self.peers_list.clear();
+        self.locks = sheetcore::sync::LockTable::default();
+        self.pending_edit = None;
+        self.my_lock = None;
+        self.last_cursor = None;
+        self.room_lost = false;
+        self.status = "已退出局域网协作会话".into();
+    }
+
     /// 宿主没了：以当前手里的数据接任，同事用新地址重新加入
     fn promote_to_host(&mut self) {
         // 只有客户端能接任；先彻底丢掉旧连接（含重连线程）
-        if self.join_addr.is_empty() {
+        if self.join_addr.is_empty() && self.net.is_none() {
             return;
         }
-        self.net = None;
+        if let Some(n) = self.net.take() {
+            n.shutdown();
+        }
         self.peer = None;
         self.remote.clear();
         self.locks = sheetcore::sync::LockTable::default();
@@ -28045,10 +28805,11 @@ let txn = self.txn_begin(&keys);
         self.room_lost = false;
         self.start_host();
         if self.net.is_some() {
+            let port = self.active_net_port();
             self.status = format!(
                 "已接任宿主，同事请用这个地址重新加入：{}:{}",
                 local_ip_hint(),
-                net::port()
+                port
             );
             eprintln!("[net] {}{}", "接任宿主 ", self.status);
         }
@@ -28057,14 +28818,15 @@ let txn = self.txn_begin(&keys);
     /// 放行协作端口：弹 UAC 让用户确认，成功后同事才连得进来。
     /// 只在用户点按钮时执行，不改任何安全设置里的其它项。
     fn open_firewall_port(&mut self) {
-        let port = net::port();
+        let port = self.active_net_port();
         let rule = format!(
-            "advfirewall firewall add rule name=\"CELLAN 协作\" dir=in action=allow protocol=TCP localport={port}"
+            "advfirewall firewall add rule name=\"CELLAN 协作\" dir=in action=allow protocol=TCP localport=7878-7898"
         );
         #[cfg(windows)]
         let res = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 &format!("Start-Process netsh -ArgumentList '{rule}' -Verb RunAs -Wait"),
             ])
@@ -28073,17 +28835,18 @@ let txn = self.txn_begin(&keys);
         let res: std::io::Result<std::process::ExitStatus> =
             Err(std::io::Error::new(std::io::ErrorKind::Other, "仅 Windows"));
         self.status = match res {
-            Ok(s) if s.success() => format!("已为协作端口 {port} 添加防火墙入站规则"),
+            Ok(s) if s.success() => format!("已为协作端口段 7878-7898（当前 {port}）添加防火墙入站规则"),
             Ok(_) => "防火墙规则没有加上（可能取消了 UAC 授权）".into(),
             Err(e) => format!("打开防火墙设置失败：{e}"),
         };
         eprintln!("[net] {}", self.status);
     }
+
     fn start_host(&mut self) {
         let site = rand_site();
-        let port = net::port();
-        match net::host(site, self.my_name.clone(), self.wb.title(), port, self.room_password.clone()) {
+        match net::host_auto(site, self.my_name.clone(), self.wb.title(), self.room_password.clone()) {
             Ok(n) => {
+                let port = n.port;
                 let mut peer = Peer::new(site);
                 // 把所有工作表的内容都放进初始快照
                 let mut all: Vec<(usize, u32, u32, sheetcore::Cell)> = Vec::new();
@@ -28100,6 +28863,31 @@ let txn = self.txn_begin(&keys);
                 for op in peer.snapshot() {
                     n.broadcast_op(op);
                 }
+                // 中小规模工作簿顺手下发非默认样式快照，使通过 IP 直接加入的同事也拥有一致样式
+                let total_styled: usize = self.wb.sheets.iter().map(|s| s.styles.len()).sum();
+                if total_styled > 0 && total_styled <= 2500 {
+                    for (si, sheet) in self.wb.sheets.iter().enumerate() {
+                        let items: Vec<(u32, u32, sheetcore::style::CellStyle)> = sheet
+                            .styles
+                            .iter()
+                            .filter(|(_, sid)| **sid != 0)
+                            .map(|(cr, sid)| (cr.row, cr.col, self.wb.styles.get(*sid).clone()))
+                            .collect();
+                        if !items.is_empty() {
+                            n.broadcast_style(si, items);
+                        }
+                    }
+                }
+                // 立即登记宿主自身当前选区光标，后加入同事一进房间就能看见宿主 ID 标签
+                n.broadcast_cursor(Cursor {
+                    sheet: self.sheet_idx,
+                    site,
+                    name: self.my_name.clone(),
+                    color: (site % 7) as u8,
+                    row: self.sel.0,
+                    col: self.sel.1,
+                });
+                self.last_cursor = Some((self.sheet_idx, self.sel.0, self.sel.1));
                 self.peer = Some(peer);
                 self.net = Some(n);
                 self.undo.set_site(site);
@@ -28110,7 +28898,7 @@ let txn = self.txn_begin(&keys);
                     self.lock_beat = Some(std::time::Instant::now());
                 }
                 self.status = format!("已共享，同事可加入：{}:{}", local_ip_hint(), port);
-            eprintln!("[net] {}", self.status);
+                eprintln!("[net] {}", self.status);
             }
             Err(e) => self.status = format!("共享失败: {e}"),
         }
@@ -28237,10 +29025,12 @@ let txn = self.txn_begin(&keys);
         }
         self.start_host();
         if let Some(info) = session_lock::read(path) {
-            let mine = format!("{}:{}", local_ip_hint(), net::port());
+            let mine = format!("{}:{}", local_ip_hint(), self.active_net_port());
             if info.host != mine && session_lock::is_fresh(&info) && !session_lock::is_mine(&info) {
                 eprintln!("[net] 检测到另一个宿主，改加入 {}", info.host);
-                self.net = None;
+                if let Some(n) = self.net.take() {
+                    n.shutdown();
+                }
                 self.peer = None;
                 self.peers_list.clear();
                 self.join_lock(&info);
@@ -28293,7 +29083,7 @@ let txn = self.txn_begin(&keys);
         if !due {
             return;
         }
-        let addr = format!("{}:{}", local_ip_hint(), net::port());
+        let addr = format!("{}:{}", local_ip_hint(), self.active_net_port());
         let _ = session_lock::write(&path, &addr, &self.my_name);
         self.lock_beat = Some(std::time::Instant::now());
     }
@@ -30799,22 +31589,47 @@ fn elide(s: &str, max_chars: usize) -> String {
                     } else {
                         self.peers_list.push((site, name.clone(), (site % 7) as u8));
                     }
+                    if let Some(r) = self.remote.get_mut(&site) {
+                        r.1 = name.clone();
+                    }
+                    let held: Vec<(usize, u32, u32)> = self
+                        .locks
+                        .iter()
+                        .filter(|(_, h)| h.site == site)
+                        .map(|(k, _)| k)
+                        .collect();
+                    let now = self.lock_now();
+                    for (sh, r, c) in held {
+                        self.locks.release(sh, r, c, site);
+                        self.locks.request(sh, r, c, site, &name, now);
+                    }
                     if site != self.peer.as_ref().map(|p| p.site).unwrap_or(0) {
-                        self.status = format!("{name} 改了显示名称");
+                        self.status = format!("{name} 更新了显示名称");
                     }
                 }
                 net::NetEvent::PeerLeft(site) => {
                     self.peers_list.retain(|(s, _, _)| *s != site);
                     self.remote.remove(&site);
-                    self.status = format!("有人离开，在线 {} 人", self.peers_list.len());
+                    let held: Vec<(usize, u32, u32)> = self
+                        .locks
+                        .iter()
+                        .filter(|(_, h)| h.site == site)
+                        .map(|(k, _)| k)
+                        .collect();
+                    for (sh, r, c) in held {
+                        self.locks.release(sh, r, c, site);
+                    }
+                    self.status = format!("成员离开，当前在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::Ops(ops) => {
                     eprintln!("[net] ops: {}", ops.len());
                     let is_snapshot = !self.joined_doc;
                     if is_snapshot {
-                        // 第一次收到的是宿主全量快照，本地旧内容要清掉
+                        // 第一次收到的是宿主全量快照，所有工作表本地旧单元格先清空再对齐宿主
                         self.joined_doc = true;
-                        self.wb.sheet_mut(self.sheet_idx).clear();
+                        for sh in &mut self.wb.sheets {
+                            sh.clear();
+                        }
                     }
                     let before_ops: Vec<Option<sheetcore::model::Cell>> = if is_snapshot {
                         Vec::new()
@@ -30842,27 +31657,27 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if !ops_snapshot.is_empty() {
                         self.record_remote_ops(&ops_snapshot, before_ops);
                     }
-                    if !touched.is_empty() {
-                        if is_snapshot {
-                            if let Some(peer) = self.peer.as_ref() {
-                                peer.apply_all_to_workbook(&mut self.wb);
-                            }
-                            sheetcore::formula::recalc_all(&mut self.wb);
-                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
-                        } else {
-                            if let Some(peer) = self.peer.as_ref() {
-                                let keys: Vec<(usize, u32, u32)> =
-                                    touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
-                                peer.apply_list_to_workbook(&mut self.wb, &keys);
-                            }
-                            let seeds: Vec<sheetcore::formula::deps::CellKey> =
-                                touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
-                            for k in &seeds {
-                                self.deps.update_cell(&self.wb, *k);
-                            }
-                            sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &seeds);
+                    if is_snapshot {
+                        if let Some(peer) = self.peer.as_ref() {
+                            peer.apply_all_to_workbook(&mut self.wb);
                         }
+                        sheetcore::formula::recalc_all(&mut self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    } else if !touched.is_empty() {
+                        if let Some(peer) = self.peer.as_ref() {
+                            let keys: Vec<(usize, u32, u32)> =
+                                touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
+                            peer.apply_list_to_workbook(&mut self.wb, &keys);
+                        }
+                        let seeds: Vec<sheetcore::formula::deps::CellKey> =
+                            touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
+                        for k in &seeds {
+                            self.deps.update_cell(&self.wb, *k);
+                        }
+                        sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &seeds);
                         self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
                     }
                 }
                 net::NetEvent::Cursor(c) => {
@@ -30870,8 +31685,8 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if std::env::var("SC_C2").is_ok() {
                         eprintln!("[C2] 收到光标 site={} sheet={} ({},{}) 我={} 当前表={}", c.site, c.sheet, c.row, c.col, me, self.sheet_idx);
                     }
-                    if c.site != me && c.sheet == self.sheet_idx {
-                        self.remote.insert(c.site, (c.name, c.color, c.row, c.col));
+                    if c.site != me {
+                        self.remote.insert(c.site, (c.sheet, c.name, c.color, c.row, c.col));
                     }
                 }
                 net::NetEvent::Disconnected(msg) => {
@@ -31014,8 +31829,12 @@ fn local_ip_hint() -> String {
 
 impl Drop for SheetApp {
     fn drop(&mut self) {
-        // 退出时把占用卡撤掉，同事下次打开就不会去找一个已经消失的地址
+        self.release_lock();
+        // 退出时把占用卡撤掉并礼貌关闭网络连接，同事立即清理光标与租约，不留幽灵状态
         let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
+        if let Some(n) = self.net.take() {
+            n.shutdown();
+        }
         if hosting {
             if let Some(p) = self.wb.path.clone() {
                 session_lock::remove(&p);
@@ -31323,22 +32142,49 @@ impl SheetApp {
                     egui::pos2(rect.left() + name_x, rect.top() + 4.0),
                     egui::pos2(name_right.max(rect.left() + name_x + 40.0), rect.bottom() - 4.0),
                 );
+                let title_font = if self.show_start {
+                    ui_kit::ui_bold_in(ctx, 14.5)
+                } else {
+                    ui_kit::medium_in(ctx, 12.0)
+                };
+                let title_col = if !dark {
+                    Color32::from_rgb(15, 23, 42)
+                } else {
+                    fg
+                };
+                let avail_tw = name_rect.width().max(24.0);
+                let full_g = painter.layout_no_wrap(self.last_title.clone(), title_font.clone(), title_col);
+                let shown_title = if full_g.size().x <= avail_tw {
+                    self.last_title.clone()
+                } else {
+                    let chars: Vec<char> = self.last_title.chars().collect();
+                    let mut lo = 0usize;
+                    let mut hi = chars.len();
+                    while lo < hi {
+                        let mid = (lo + hi + 1) / 2;
+                        let cand: String = chars[..mid].iter().collect::<String>() + "…";
+                        let g = painter.layout_no_wrap(cand, title_font.clone(), title_col);
+                        if g.size().x <= avail_tw {
+                            lo = mid;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    chars[..lo].iter().collect::<String>() + "…"
+                };
                 let clipped = painter.with_clip_rect(name_rect);
                 clipped.text(
                     egui::pos2(name_rect.left(), name_rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    &self.last_title,
-                    if self.show_start {
-                        ui_kit::ui_bold_in(ctx, 14.5)
-                    } else {
-                        ui_kit::medium_in(ctx, 12.0)
-                    },
-                    if !dark {
-                        Color32::from_rgb(15, 23, 42)
-                    } else {
-                        fg
-                    },
+                    &shown_title,
+                    title_font,
+                    title_col,
                 );
+                if shown_title != self.last_title {
+                    let _ = ui
+                        .interact(name_rect, egui::Id::new("title_hover"), Sense::hover())
+                        .on_hover_text(&self.last_title);
+                }
                 // 搜索框（胶囊圆角卡片 + 矢量放大镜 + 快捷键角标）
                 if show_search {
                     let sr = Rect::from_min_size(
@@ -31894,6 +32740,7 @@ impl eframe::App for SheetApp {
             || self.fmt_dlg
             || self.profile_open
             || self.about_open
+            || self.close_confirm_open
             || (self.fn_wizard.is_some() && self.wiz_pick.is_none());
         // 无界面验收：SC_DRAG_SEL="x1,y1,x2,y2" 注入真实的按下→拖动→松开，验证「按下即落锚点」
         if let Ok(spec) = std::env::var("SC_DRAG_SEL") {
@@ -32390,10 +33237,10 @@ impl eframe::App for SheetApp {
         self.rename_dialog(ctx);
         self.format_dialog(ctx);
         self.rich_dialog(ctx);
-        self.hyperlink_dialog(ctx);
         self.paste_special_dialog(ctx);
         self.account_window(ctx);
         self.about_window(ctx);
+        self.close_confirm_dialog(ctx);
         self.zoom_dialog(ctx);
         self.watch_window(ctx);
         self.header_footer_dialog(ctx);
@@ -32476,12 +33323,13 @@ impl eframe::App for SheetApp {
                     |ui| {
                         ui.add_space(4.0);
                         if self.net.is_some() {
-                            if ui_kit::labeled_w(
+                            if ui_kit::labeled_tint(
                                 ui,
                                 Icon::Share,
-                                &format!("在线 {}", self.peers_list.len()),
-                                90.0,
-                                "查看在线协作者",
+                                &format!("在线 {} 人", self.peers_list.len().max(1)),
+                                92.0,
+                                ui_kit::ACCENT,
+                                "查看在线协作者、锁定的单元格与连接状态",
                             )
                             .clicked()
                             {
@@ -32498,6 +33346,7 @@ impl eframe::App for SheetApp {
                         .clicked()
                         {
                             self.start_host();
+                            self.members_open = true;
                         }
                         if ui_kit::labeled_w(
                             ui,
@@ -32693,40 +33542,37 @@ impl eframe::App for SheetApp {
                     let mut close = false;
                     let mut pick: Option<String> = None;
                     let pop_pos = egui::pos2(nb.left(), nb.bottom() + 2.0);
-                    egui::Area::new(egui::Id::new("name_list"))
+                    let area = egui::Area::new(egui::Id::new("name_list"))
                         .fixed_pos(pop_pos)
                         .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(180.0);
+                            ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(190.0);
                                 if self.wb.names.is_empty() {
                                     ui.label(
-                                        egui::RichText::new("没有定义名称").size(11.5).weak(),
+                                        egui::RichText::new("尚未定义名称").size(11.5).color(ui_kit::TEXT_WEAK),
                                     );
                                 }
                                 for (n, _, body) in &self.wb.names {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new(format!("{n}   ={body}"))
-                                                    .size(11.5),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
+                                    if ui_kit::popup_item(ui, &format!("{n}   ={body}"), true, 178.0).clicked() {
                                         pick = Some(n.clone());
                                     }
                                 }
                             });
                         });
+                    let outside = !cresp.clicked()
+                        && ctx.input(|i| i.pointer.any_click())
+                        && !ctx
+                            .input(|i| i.pointer.interact_pos())
+                            .map(|p| area.response.rect.contains(p))
+                            .unwrap_or(false);
                     if let Some(n) = pick {
                         self.name_buf = n;
                         self.name_dropdown = false;
                         self.goto_name();
                         close = true;
                     }
-                    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    if outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
                         close = true;
                     }
                     if close {
@@ -32746,6 +33592,7 @@ impl eframe::App for SheetApp {
                 let mut commit = false;
                 let mut cancel = false;
                 let mut fx_click = false;
+                let locked_by_other = self.lock_holder(r, c);
                 let editing = self.editing.is_some();
                 let btn_kinds: &[&str] = &["cancel", "ok", "fx"];
                 let slot = |kind: &str| -> f32 {
@@ -32760,7 +33607,7 @@ impl eframe::App for SheetApp {
                         egui::pos2(slot(kind), rect.top() + 9.0),
                         Vec2::splat(24.0),
                     );
-                    let active = editing || *kind == "fx";
+                    let active = editing || (*kind == "fx" && locked_by_other.is_none());
                     let resp = ui.interact(
                         b,
                         egui::Id::new(("fxbtn", *kind)),
@@ -32851,11 +33698,87 @@ impl eframe::App for SheetApp {
                     self.fx_expanded = !self.fx_expanded;
                 }
 
-                // 输入行
+                // 输入行（若当前格被同事锁定编辑，切换为醒目的只读禁用状态并显示锁定者 ID）
                 let ed_rect = Rect::from_min_max(
-                    egui::pos2(fx_left + 92.0, rect.top() + 8.0),
-                    egui::pos2(rect.right() - 26.0, rect.bottom() - 8.0),
+                    egui::pos2(fx_left + 92.0, rect.top() + 7.0),
+                    egui::pos2(rect.right() - 26.0, rect.bottom() - 7.0),
                 );
+                if let Some(holder) = &locked_by_other {
+                    painter.rect(
+                        ed_rect,
+                        5.0,
+                        Color32::from_rgb(255, 251, 235),
+                        Stroke::new(1.0, Color32::from_rgb(252, 211, 77)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let cur = match self.wb.sheet(self.sheet_idx).get(r, c) {
+                        Some(cell) => cell
+                            .formula
+                            .as_deref()
+                            .map(|f| sheetcore::xlinks::display_formula(&self.wb, f))
+                            .unwrap_or_else(|| cell.value.display()),
+                        None => String::new(),
+                    };
+                    let badge_txt = format!("{holder} 正在编辑 · 此格已锁定禁用");
+                    let bg = painter.layout_no_wrap(
+                        badge_txt.clone(),
+                        FontId::proportional(11.5),
+                        Color32::from_rgb(180, 83, 9),
+                    );
+                    let pill_w = bg.size().x + 28.0;
+                    let pill_rect = Rect::from_min_size(
+                        egui::pos2(
+                            (ed_rect.right() - pill_w - 6.0).max(ed_rect.left() + 6.0),
+                            ed_rect.center().y - 10.5,
+                        ),
+                        Vec2::new(pill_w, 21.0),
+                    );
+                    let val_clip = Rect::from_min_max(
+                        egui::pos2(ed_rect.left() + 8.0, ed_rect.top()),
+                        egui::pos2((pill_rect.left() - 8.0).max(ed_rect.left() + 8.0), ed_rect.bottom()),
+                    );
+                    if val_clip.width() > 8.0 {
+                        painter.with_clip_rect(val_clip).text(
+                            egui::pos2(val_clip.left(), ed_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            &cur,
+                            FontId::proportional(13.0),
+                            Color32::from_rgb(100, 116, 139),
+                        );
+                    }
+                    painter.rect_filled(pill_rect, 4.5, Color32::from_rgb(254, 243, 199));
+                    ui_kit::draw_padlock(
+                        &painter,
+                        Rect::from_center_size(
+                            egui::pos2(pill_rect.left() + 11.0, pill_rect.center().y),
+                            Vec2::splat(11.5),
+                        ),
+                        Color32::from_rgb(180, 83, 9),
+                    );
+                    ui_kit::paint_medium(
+                        &painter,
+                        egui::pos2(pill_rect.left() + 21.0, pill_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        &badge_txt,
+                        11.5,
+                        Color32::from_rgb(180, 83, 9),
+                    );
+                    let lresp = ui.interact(ed_rect, egui::Id::new("fx_locked_row"), Sense::click());
+                    if lresp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                    }
+                    if lresp.clicked() {
+                        self.status = format!(
+                            "{holder} 正在编辑 {}，当前单元格已锁定禁用",
+                            cell_name(r, c)
+                        );
+                    }
+                    let _ = ui.ctx().accesskit_node_builder(lresp.id, |node| {
+                        node.set_role(egui::accesskit::Role::TextInput);
+                        node.set_label(format!("编辑栏（已锁定：{holder} 正在编辑）"));
+                        node.set_value(cur);
+                    });
+                } else {
                 // 整条输入行都可点：Excel 里点编辑栏空白处就进入编辑，
                 // 点到的不是文字也要算（标签本身的命中区只有文字那么宽）。
                 let row_resp = ui.interact(ed_rect, egui::Id::new("fx_row"), Sense::click());
@@ -33002,6 +33925,7 @@ impl eframe::App for SheetApp {
                     if resp.clicked() {
                         self.focus_edit(EditSpot::FormulaBar);
                     }
+                }
                 }
                 if commit {
                     self.commit_edit(Some((1, 0)));
@@ -33546,10 +34470,11 @@ impl eframe::App for SheetApp {
             });
 
         self.tree.pump();
-        // 选区变化时把光标位置广播出去
+        // 选区或工作表变化时把光标位置广播出去（支持多表跨页实时追踪）
         if let (Some(net), Some(peer)) = (self.net.as_ref(), self.peer.as_ref()) {
-            if self.last_cursor != Some(self.sel) {
-                self.last_cursor = Some(self.sel);
+            let cur_pos = (self.sheet_idx, self.sel.0, self.sel.1);
+            if self.last_cursor != Some(cur_pos) {
+                self.last_cursor = Some(cur_pos);
                 net.broadcast_cursor(Cursor {
                     sheet: self.sheet_idx,
                     site: peer.site,
@@ -34447,6 +35372,37 @@ fn install_ui_system_fonts(fonts: &mut egui::FontDefinitions) {
     uib.push("noto-sans-bold".to_owned());
     uib.push("noto-sans".to_owned());
     fonts.families.insert(family_named("ui-bold"), uib);
+
+    // 为所有单元格西文字族及动态挂载的 sys:* / sysbold:* 注入完整系统微软雅黑中文回退（覆盖生僻汉字与 Calibri/Arial 工作簿）
+    let has_msyh = fonts.font_data.contains_key("sys-ui-msyh");
+    let has_msyh_b = fonts.font_data.contains_key("sys-ui-msyh-b");
+    if has_msyh || has_msyh_b {
+        for (fam, list) in fonts.families.iter_mut() {
+            if let egui::FontFamily::Name(nm) = fam {
+                let s = nm.as_ref();
+                let is_bold_fam = s.starts_with("sysbold:") || s.ends_with("-bold");
+                let is_cell_fam = s.starts_with("sys:")
+                    || is_bold_fam
+                    || matches!(s, "default" | "latin" | "cjk-sans");
+                if is_cell_fam {
+                    if is_bold_fam && has_msyh_b && !list.iter().any(|x| x == "sys-ui-msyh-b") {
+                        let pos = list
+                            .iter()
+                            .position(|x| x == "noto-sans-bold" || x == "noto-sans")
+                            .unwrap_or(list.len());
+                        list.insert(pos, "sys-ui-msyh-b".to_owned());
+                    }
+                    if has_msyh && !list.iter().any(|x| x == "sys-ui-msyh") {
+                        let pos = list
+                            .iter()
+                            .position(|x| x == "noto-sans")
+                            .unwrap_or(list.len());
+                        list.insert(pos, "sys-ui-msyh".to_owned());
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn font_defs() -> egui::FontDefinitions {

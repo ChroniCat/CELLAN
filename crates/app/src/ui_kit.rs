@@ -339,22 +339,33 @@ pub fn apply_theme(ctx: &egui::Context) {
     base.spacing.button_padding = Vec2::new(7.0, 2.0);
     base.spacing.interact_size.y = 24.0;
     base.spacing.scroll.floating = false;
-    base.spacing.scroll.bar_width = 12.0;
+    base.spacing.scroll.foreground_color = false;
+    base.spacing.scroll.bar_width = 8.0;
     base.spacing.scroll.bar_inner_margin = 2.0;
     base.spacing.scroll.bar_outer_margin = 0.0;
     base.spacing.scroll.handle_min_length = 24.0;
-    base.spacing.menu_margin = egui::Margin {
-        left: 4,
-        right: 4,
-        top: 4,
-        bottom: 4,
-    };
+    base.spacing.menu_margin = egui::Margin::same(6);
 
     let mut light = base.clone();
     light.visuals = {
         let mut v = egui::Visuals::light();
         v.panel_fill = Color32::WHITE;
         v.window_fill = Color32::WHITE;
+        v.window_corner_radius = egui::CornerRadius::same(8);
+        v.menu_corner_radius = egui::CornerRadius::same(8);
+        v.window_stroke = Stroke::new(1.0, CARD_BORDER);
+        v.popup_shadow = egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(26),
+        };
+        v.window_shadow = egui::epaint::Shadow {
+            offset: [0, 10],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(32),
+        };
         v.extreme_bg_color = Color32::from_rgb(249, 250, 251);
         v.faint_bg_color = Color32::from_rgb(246, 247, 249);
         v.widgets.noninteractive.bg_fill = Color32::WHITE;
@@ -412,6 +423,56 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Light, light);
     // Excel 默认浅色；界面按浅色做像素对齐
     ctx.set_theme(egui::ThemePreference::Light);
+}
+
+/// 统一商用下拉菜单 / 气泡浮层外壳（8px 圆角、柔和弥散投影、1px CARD_BORDER）
+pub fn popup_frame(style: &egui::Style) -> egui::Frame {
+    let dark = style.visuals.dark_mode;
+    egui::Frame::NONE
+        .fill(if dark { style.visuals.window_fill } else { Color32::WHITE })
+        .stroke(Stroke::new(
+            1.0,
+            if dark { Color32::from_rgb(62, 68, 79) } else { CARD_BORDER },
+        ))
+        .corner_radius(egui::CornerRadius::same(8))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(if dark { 64 } else { 26 }),
+        })
+        .inner_margin(egui::Margin::same(6))
+}
+
+/// 浮层菜单标准行（27px 舒适行高、左对齐、5px 圆角悬停高亮）
+pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(12.0),
+        Color32::PLACEHOLDER,
+    );
+    let w = (galley.size().x + 24.0).max(min_w).max(ui.available_width());
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
+    if enabled && resp.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 5.0, PRESSED);
+    } else if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, HOVER);
+    }
+    let col = if !enabled {
+        DISABLED
+    } else {
+        text_color(ui.visuals())
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        col,
+    );
+    a11y_name(&resp, label, enabled, None);
+    resp
 }
 
 /// 一个功能区小组：内容 + 底部组名（上下充裕留白，绝不紧贴悬浮卡片边线）
@@ -1727,45 +1788,45 @@ impl Dlg {
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 224, 232)))
+                    .stroke(Stroke::new(1.0, CARD_BORDER))
                     .corner_radius(10.0)
                     .shadow(egui::epaint::Shadow {
-                        offset: [0, 10],
-                        blur: 28,
+                        offset: [0, 12],
+                        blur: 32,
                         spread: 0,
-                        color: Color32::from_black_alpha(36),
+                        color: Color32::from_black_alpha(34),
                     })
                     .inner_margin(egui::Margin::same(0));
                 let fr = frame
                     .show(ui, |ui| {
                         ui.set_width(w);
-                        // 标题栏（42px 留白现代顶栏 + 内嵌 28×28 圆角关闭按钮）
+                        // 标题栏（44px 现代微灰白顶栏 + 13.5px 中黑标题 + 内嵌 28×28 圆角关闭按钮）
                         let (trect, tresp) = ui.allocate_exact_size(
-                            egui::vec2(w, 42.0),
+                            egui::vec2(w, 44.0),
                             drag_only_sense(),
                         );
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
                                 trect.min,
-                                egui::vec2(w, 42.0),
+                                egui::vec2(w, 44.0),
                             ),
                             egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 },
-                            Color32::WHITE,
+                            Color32::from_rgb(250, 251, 253),
                         );
                         ui.painter().line_segment(
                             [
                                 egui::pos2(trect.left() + 1.0, trect.bottom() - 0.5),
                                 egui::pos2(trect.right() - 1.0, trect.bottom() - 0.5),
                             ],
-                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(238, 240, 244)),
+                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(230, 234, 241)),
                         );
                         paint_medium(
                             ui.painter(),
                             egui::pos2(trect.left() + 20.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &self.title,
-                            13.0,
-                            Color32::from_rgb(17, 24, 39),
+                            13.5,
+                            TEXT,
                         );
                         // 内嵌圆角关闭按钮（替代老式铺满顶栏右角的红块）
                         let crect = egui::Rect::from_center_size(
@@ -1871,12 +1932,6 @@ impl Dlg {
                         }
                         (inner, tresp)
                     });
-                ui.painter().rect_stroke(
-                    fr.response.rect.shrink(0.5),
-                    4.0,
-                    Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(179, 177, 175)),
-                    egui::StrokeKind::Inside,
-                );
                 // UI-24.1：Tab/Shift+Tab 只在对话框这一层里转，不会跑到背景网格。
                 // 关闭这一帧要把模态层降回背景，否则下一帧背景控件仍被判“被模态挡住”，
                 // 会把刚还回去的焦点又 surrender 掉。
@@ -1925,17 +1980,19 @@ pub fn autofocus(ui: &mut egui::Ui, resp: &Response) {
     }
 }
 
-/// 带常驻上下微调箭头的数字框（20px 高）
+/// 带常驻上下微调箭头的现代数字步进框（28px 高、6px 圆角、双折线 V 型箭头）
 pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
     let v0 = *v;
+    let step_w = 20.0;
+    let half_h = rect.height() * 0.5;
     let a = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - 12.0, rect.top()),
-        Vec2::new(12.0, 10.0),
+        egui::pos2(rect.right() - step_w, rect.top() + 1.0),
+        Vec2::new(step_w - 1.0, half_h - 1.0),
     );
     let b = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - 12.0, rect.top() + 10.0),
-        Vec2::new(12.0, 10.0),
+        egui::pos2(rect.right() - step_w, rect.top() + half_h),
+        Vec2::new(step_w - 1.0, half_h - 1.0),
     );
     let ar = ui.interact(a, ui.id().with(("spinup", rect.left() as i32)), Sense::click());
     let br = ui.interact(b, ui.id().with(("spindn", rect.left() as i32)), Sense::click());
@@ -1945,11 +2002,17 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
     if br.clicked() {
         *v = (*v - step).max(min);
     }
+    let hovered = ui.rect_contains_pointer(rect);
+    let border_col = if hovered {
+        Color32::from_rgb(176, 186, 200)
+    } else {
+        CARD_BORDER
+    };
     ui.painter().rect(
         rect,
-        2.0,
-        Color32::WHITE,
-        Stroke::new(1.0, Color32::from_rgb(171, 169, 167)),
+        6.0,
+        Color32::from_rgb(250, 251, 253),
+        Stroke::new(1.0, border_col),
         egui::StrokeKind::Inside,
     );
     let txt = if (step.fract()).abs() < 1e-9 {
@@ -1958,86 +2021,109 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
         format!("{:.1}", *v)
     };
     ui.painter().text(
-        egui::pos2(rect.left() + 6.0, rect.center().y),
+        egui::pos2(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         txt,
         FontId::proportional(12.0),
         TEXT,
     );
-    let cc = Color32::from_rgb(68, 68, 68);
-    let st = Stroke::new(1.0, cc);
-    for (r, up) in [(a, true), (b, false)] {
-        if (up && ar.hovered()) || (!up && br.hovered()) {
-            ui.painter().rect_filled(r, 0.0, HOVER);
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.right() - step_w, rect.top() + 3.0),
+            egui::pos2(rect.right() - step_w, rect.bottom() - 3.0),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(228, 232, 240)),
+    );
+    for (r, up, hv) in [(a, true, ar.hovered()), (b, false, br.hovered())] {
+        if hv {
+            ui.painter().rect_filled(r.shrink(1.0), 3.0, HOVER);
         }
         let c = r.center();
-        let dy = if up { 1.5 } else { -1.5 };
-        ui.painter().line_segment(
-            [egui::pos2(c.x - 3.0, c.y + dy), egui::pos2(c.x + 3.0, c.y - dy)],
-            st,
+        let st = Stroke::new(
+            1.3,
+            if hv { TEXT } else { Color32::from_rgb(100, 116, 139) },
         );
+        if up {
+            ui.painter().line_segment([egui::pos2(c.x - 3.2, c.y + 1.4), egui::pos2(c.x, c.y - 1.6)], st);
+            ui.painter().line_segment([egui::pos2(c.x, c.y - 1.6), egui::pos2(c.x + 3.2, c.y + 1.4)], st);
+        } else {
+            ui.painter().line_segment([egui::pos2(c.x - 3.2, c.y - 1.4), egui::pos2(c.x, c.y + 1.6)], st);
+            ui.painter().line_segment([egui::pos2(c.x, c.y + 1.6), egui::pos2(c.x + 3.2, c.y - 1.4)], st);
+        }
     }
     ui.painter().line_segment(
-        [egui::pos2(a.left(), a.bottom()), egui::pos2(a.right(), a.bottom())],
-        Stroke::new(1.0, Color32::from_rgb(200, 198, 196)),
+        [egui::pos2(a.left() + 2.0, a.bottom()), egui::pos2(a.right() - 2.0, a.bottom())],
+        Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
     );
     let _ = resp;
     (*v - v0).abs() > 1e-9
 }
 
-/// 对话框标签页（Excel 的文件夹式页签）
+/// 对话框标签页（现代 Excel 365 / WPS 扁平下划线胶囊页签）
 pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
     let top = ui.cursor().top();
     let left = ui.cursor().left();
     let right = left + ui.available_width();
+    let tab_h = 32.0;
     ui.painter().line_segment(
-        [egui::pos2(left, top + 25.5), egui::pos2(right, top + 25.5)],
-        Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
+        [
+            egui::pos2(left, top + tab_h - 0.5),
+            egui::pos2(right, top + tab_h - 0.5),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(226, 232, 240)),
     );
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         for (i, t) in tabs.iter().enumerate() {
             let galley = ui.painter().layout_no_wrap(
                 (*t).to_owned(),
-                FontId::proportional(12.0),
+                FontId::proportional(12.5),
                 Color32::PLACEHOLDER,
             );
-            let w = galley.size().x + 26.0;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
+            let w = galley.size().x + 24.0;
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, tab_h), Sense::click());
             let on = *sel as usize == i;
             if on {
-                ui.painter().rect(
-                    rect,
-                    0.0,
-                    Color32::WHITE,
-                    Stroke::new(1.0, Color32::from_rgb(179, 177, 175)),
-                    egui::StrokeKind::Inside,
-                );
                 ui.painter().rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0),
-                        egui::pos2(rect.right() - 1.0, rect.bottom()),
-                    ),
-                    0.0,
-                    Color32::WHITE,
+                    rect.shrink2(Vec2::new(1.0, 3.0)),
+                    6.0,
+                    Color32::from_rgb(240, 247, 243),
                 );
-            } else if resp.hovered() {
-                ui.painter()
-                    .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-            }
-            let col = if on {
-                TEXT
+                let bar = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
+                    Vec2::new((rect.width() - 16.0).max(12.0), 2.5),
+                );
+                ui.painter().rect_filled(bar, 1.25, ACCENT);
+                paint_medium(
+                    ui.painter(),
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    t,
+                    12.5,
+                    ACCENT,
+                );
             } else {
-                ui.visuals().weak_text_color()
-            };
-            ui.painter()
-                .text(rect.center(), Align2::CENTER_CENTER, *t, FontId::proportional(12.0), col);
+                if resp.hovered() {
+                    ui.painter().rect_filled(
+                        rect.shrink2(Vec2::new(1.0, 3.0)),
+                        6.0,
+                        HOVER,
+                    );
+                }
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    *t,
+                    FontId::proportional(12.5),
+                    if resp.hovered() { TEXT } else { TEXT_WEAK },
+                );
+            }
             if resp.clicked() {
                 *sel = i as u8;
             }
         }
     });
-    ui.add_space(2.0);
+    ui.add_space(6.0);
 }
 
 /// 表单的一行：定宽字段名 + 内容
@@ -2052,6 +2138,72 @@ pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
         );
         add(ui);
     });
+}
+
+/// 协同协作者高辨识度配色板（深色饱和度调优，确保白字名牌对比度 > 4.5:1）
+pub fn peer_color(idx: u8) -> Color32 {
+    match idx % 7 {
+        0 => Color32::from_rgb(217, 70, 31),
+        1 => Color32::from_rgb(13, 148, 136),
+        2 => Color32::from_rgb(124, 58, 237),
+        3 => Color32::from_rgb(2, 132, 199),
+        4 => Color32::from_rgb(190, 18, 60),
+        5 => Color32::from_rgb(22, 163, 74),
+        _ => Color32::from_rgb(180, 83, 9),
+    }
+}
+
+/// 纯矢量绘制清晰小挂锁图标（杜绝内嵌字体子集缺失 U+1F512 导致方框乱码）
+pub fn draw_padlock(painter: &egui::Painter, rect: Rect, col: Color32) {
+    let s = rect.width().min(rect.height());
+    if s < 6.0 {
+        return;
+    }
+    let cx = rect.center().x;
+    let top = rect.center().y - s * 0.44;
+    let body = Rect::from_center_size(
+        egui::pos2(cx, top + s * 0.62),
+        Vec2::new(s * 0.72, s * 0.50),
+    );
+    let sw = (s * 0.12).max(1.15);
+    // 锁梁半圆弧 + 双竖腿
+    let r_shackle = s * 0.21;
+    let shackle_cy = body.top() - s * 0.12;
+    painter.line_segment(
+        [
+            egui::pos2(cx - r_shackle, body.top() + 0.5),
+            egui::pos2(cx - r_shackle, shackle_cy),
+        ],
+        Stroke::new(sw, col),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(cx + r_shackle, body.top() + 0.5),
+            egui::pos2(cx + r_shackle, shackle_cy),
+        ],
+        Stroke::new(sw, col),
+    );
+    let segs = 8;
+    for k in 0..segs {
+        let a0 = std::f32::consts::PI * (1.0 + k as f32 / segs as f32);
+        let a1 = std::f32::consts::PI * (1.0 + (k + 1) as f32 / segs as f32);
+        painter.line_segment(
+            [
+                egui::pos2(cx + r_shackle * a0.cos(), shackle_cy + r_shackle * a0.sin()),
+                egui::pos2(cx + r_shackle * a1.cos(), shackle_cy + r_shackle * a1.sin()),
+            ],
+            Stroke::new(sw, col),
+        );
+    }
+    // 锁体圆角实心块（或描边）
+    painter.rect(
+        body,
+        (s * 0.12).max(1.5),
+        col.gamma_multiply(0.22),
+        Stroke::new(sw, col),
+        egui::StrokeKind::Inside,
+    );
+    painter.circle_filled(body.center(), (s * 0.08).max(0.9), col);
 }
 
 #[cfg(test)]

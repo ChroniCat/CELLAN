@@ -3290,3 +3290,28 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
   - 主页与后台页引入 `HomeRecentEntry` 内存缓存（`recent_cache`），彻底消除每帧重复读取 `recent.txt` 与 `std::fs::metadata()` 磁盘调用，并对 `\\` / `//` 局域网共享盘路径跳过阻塞式 `stat` 与缩略图读取；空闲重绘唤醒分层节流（协同/后台任务 `120ms`、本地文件锁心跳 `1500ms`、纯浏览静止 `5000ms`）。
 
 **验收**：`sheetcore` 全量测试通过，`app` 单测 **404 passed / 0 failed / 1 ignored**，`ui_regression` **20 passed / 0 failed**；静态发行版 `SC_SCROLL_PROBE=1` 连续滚动 120 帧实测帧间隔 `p50 = 16.67ms`（满帧 60Hz VSync），**单帧 `update()` 构建耗时 `p50 = 0.47ms`、`p95 = 1.12ms`**。
+
+### 第六十一轮：对标 Excel / WPS 弹窗与浮层菜单精细打磨、局域网网盘多人实时协同与锁定单元格禁用加固（2026-11-19）
+
+目标：全面对标 Microsoft Excel 365 与 WPS 表格的商用弹窗/菜单交互细节，消除残留的原生粗糙窗体与边框瑕疵；同时对核心特色功能——「局域网内同时打开共享网盘中的同一份文件、实时同步修改、直观显示其他用户 ID 并严格禁用正在被他人编辑的单元格」做全链路审计、漏洞清零与多进程实机验收。
+
+- **对标 Excel 365 / WPS 的弹窗、页签、步进框与浮层菜单体系升级**：
+  - **模态弹窗双层断裂圆角修复（`ui_kit::Dlg`）**：移除 `Dlg::show` 中叠加在 `10px` 圆角白卡之上的 `4px` 圆角灰框（`fr.response.rect.shrink(0.5)`），统一为单层 `1px` `CARD_BORDER`、`44px` 微灰白顶栏与柔和弥散投影。
+  - **现代扁平胶囊页签与双折线数字步进框**：重写 `ui_kit::dialog_tabs`（`32px` 高、悬停圆角浅底、选中态翡翠绿字重与 `2.5px` 圆角底指示条）与 `ui_kit::spin`（`28px` 高、`6px` 圆角、清晰双折线 V 型微调箭头）；将 `base.spacing.scroll.foreground_color` 设为 `false`、`bar_width = 8.0`，彻底消除弹窗滚动条粗黑滑块。
+  - **全量清零裸 `egui::Window::new` 并精修核心对话框**：
+    1. **命令搜索面板（`Ctrl+Q` / 顶栏搜索框）**：重制为 `516px` 居中悬浮 Spotlight 搜索舱，配深海蓝聚焦搜索栏、快捷键提示、左侧选中竖条与右侧功能区路径胶囊（`开始 › 样式`）。
+    2. **查找与替换（`Ctrl+F`）及查找全部结果**：拓宽至 `484px`，采用 `ui_kit::text_input` 与双行均衡排布选项/下拉框，补齐标准次要按钮「上一个」，并将「查找全部结果」迁入统一 `ui_kit::window`。
+    3. **设置单元格格式（`Ctrl+1`）**：修正外框宽度为 `492px`（匹配 `452px` 内容区 + 左右各 `20px` 呼吸边距），根治右侧贴边裁切。
+    4. **右键上下文菜单、功能区下拉浮层与颜色面板**：新增 `ui_kit::popup_frame` / `popup_item`（`8px` 圆角、柔和阴影、`27px` 行高与点击外部自动收起），升级右键菜单 `ctx_menu_window` 圆角描边与矢量右箭头，并将颜色选择器、CSV 导入向导、数据验证警告框、加载诊断窗全部统一至 `ui_kit::window`；补齐非无头模式下未保存退出时的「保存更改」确认弹窗。
+- **局域网共享网盘 / 企业云同步盘多人实时协同与单元格锁定禁用闭环**：
+  - **网盘与共享目录全场景自动识别（`session_lock.rs`）**：除 UNC（`\\NAS\...`）与 SMB 映射网络盘（`DRIVE_REMOTE`）外，新增 Windows Cloud Filter 重解析点属性检测、主流企业同步盘路径识别（`OneDrive`、`SynologyDrive`、`Seafile`、`坚果云/Nutstore`、`WPS网盘`、`企业微盘`、`百度企业网盘`、`飞书`、`钉钉` 等）及显式目录标记文件 `.cellan-share`（支持在「局域网实时协作」面板一键将任意本地共享目录标记为协同目录）。
+  - **多端口防冲突监听与后加入成员状态即时补齐（`net.rs`）**：
+    1. 新增 `net::host_auto` 自动在 `7878..=7898` 端口段顺序探测绑定并写入真实 `Net::port` 至 `.~sheetflow-<文件名>.lock` 心跳卡，解决同机打开多份共享表格时的端口占用失败。
+    2. 修复后加入成员「看不见既有单元格锁与既有同事光标」的盲区：`Msg::Hello` 握手在全量快照后立即下发当前所有未过期 `Msg::LockOk` 编辑租约与 `Msg::CursorMsg` 在线成员光标；成员断线或租约超时同时通知宿主本地 UI 与其余全部客户端释放锁并广播 `Msg::Bye`，根除三人及以上协同时的幽灵锁与幽灵光标。
+  - **跨工作表实时追踪、同事 ID 胶囊名牌与锁定单元格强禁用反馈（`main.rs`）**：
+    1. `self.remote` 与 `self.last_cursor` 完整纳入 `sheet_idx` 维度，跨表切换实时同步光标，改名/离线即时同步刷新 `peers_list`、`remote` 与 `locks`；标题栏超长协同标题支持二分法精确 `…` 省略与悬停全称提示。
+    2. **同事光标与编辑锁视觉呈现**：同表在线同事显示 `2px` 高辨识度彩色选区框（自动适配合并单元格）与白字圆角 **`[<用户ID>]`** 胶囊名牌（首行自动下翻防遮挡）；他人正在编辑的单元格绘制**暖琥珀禁用底纹 + 细斜纹锁定纹理 + `1.8px` 琥珀实框 + 纯矢量挂锁图标徽章 `[🔒 <用户ID> 正在编辑]`**，鼠标悬停切换为 `NotAllowed` 禁止指针。
+    3. **编辑栏联动禁用与全入口写入拦截**：选中被他人锁定的单元格时，顶部编辑栏自动切换为琥珀色只读禁用态并右侧展示 **`🔒 <用户ID> 正在编辑 · 此格已锁定禁用`**，禁用 `fx` 向导与双击/`F2`/直接键入/粘贴/删除/填充/刷格式等一切写入操作；重构 `408px`「局域网实时协作」中心面板，集中展示会话地址一键复制、协同目录开关、在线成员彩色头像、实时锁定格标识与跨表 `[定位]` 跳转。
+- **顺带根治西文字体工作簿中文问号隐患（`system_fonts.rs`）**：为动态挂载的 Windows 系统字体族（`sys:calibri`、`sys:arial` 等及 `sysbold:*`）自动串接系统微软雅黑（`sys-ui-msyh` / `sys-ui-msyh-b`）与内嵌思源黑体回退链，彻底解决保存重开或外部导入 `Calibri` / `Arial` 工作簿时汉字缺失回退变成 `????` 的缺陷。
+
+**验收**：`sheetcore` 全量测试通过，`app` 单测 **407 passed / 0 failed / 1 ignored**（含 `late_joiner_immediately_receives_active_locks_and_cursors`、`network_and_cloud_sync_paths_detected_and_share_marker_works`、`latin_system_font_chains_cjk_fallback`），`ui_regression` **20 passed / 0 failed**（含 `another_participants_lock_is_drawn_then_disappears_after_release`）；三进程同开 `.cellan-share` 共享目录同一份《2026部门经营预算.xlsx》零配置自动连线、实时数据同步、单元格互斥锁定与禁用态真机截图核验通过。

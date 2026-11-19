@@ -1162,19 +1162,15 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
         .fixed_pos(p.pos)
         .order(egui::Order::Foreground)
         .show(&ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(180.0);
+            ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                ui.set_min_width(188.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 match &p.kind {
                     PopupKind::Menu(m) => {
                         // UI-11.4：「最近使用的函数」按真实调用记录生成，不再用 XML 里写死的五项
                         if m.ctl.id == "RecentFnMenu" {
                             for name in crate::fnrecent::menu_items() {
-                                let r = ui.add(
-                                    egui::Button::new(egui::RichText::new(&name).size(12.0))
-                                        .min_size(Vec2::new(160.0, 22.0))
-                                        .frame(false),
-                                );
+                                let r = ui_kit::popup_item(ui, &name, true, 176.0);
                                 if r.clicked() {
                                     fire = Some(format!("InsertFn:{name}"));
                                     close = true;
@@ -1184,7 +1180,17 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                         for it in m.items.iter().filter(|_| m.ctl.id != "RecentFnMenu") {
                             match it {
                                 MenuNode::Separator => {
-                                    ui.separator();
+                                    ui.add_space(2.0);
+                                    let w = ui.available_width().max(176.0);
+                                    let (sr, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(sr.left() + 6.0, sr.center().y),
+                                            egui::pos2(sr.right() - 6.0, sr.center().y),
+                                        ],
+                                        egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+                                    );
+                                    ui.add_space(2.0);
                                 }
                                 MenuNode::Button(c) => {
                                     let st = app.ctl_state(&c.id);
@@ -1193,11 +1199,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                     }
                                     let label =
                                         st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
-                                    let btn =
-                                        egui::Button::new(egui::RichText::new(&label).size(12.0))
-                                            .min_size(Vec2::new(160.0, 22.0))
-                                            .frame(false);
-                                    let r = ui.add_enabled(st.enabled, btn);
+                                    let r = ui_kit::popup_item(ui, &label, st.enabled, 176.0);
                                     if r.clicked() {
                                         fire = Some(c.action().to_string());
                                         close = true;
@@ -1218,20 +1220,16 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                 }
                                 MenuNode::Menu(sub) => {
                                     let label = sub.ctl.label.clone().unwrap_or_default();
-                                    let r = ui.add(
-                                        egui::Button::new(egui::RichText::new(label).size(12.0))
-                                            .min_size(Vec2::new(160.0, 22.0))
-                                            .frame(false),
-                                    );
+                                    let r = ui_kit::popup_item(ui, &label, true, 176.0);
                                     ui_kit::caret_right(
                                         ui,
-                                        egui::pos2(r.rect.right() - 9.0, r.rect.center().y),
-                                        Color32::from_rgb(68, 68, 68),
+                                        egui::pos2(r.rect.right() - 10.0, r.rect.center().y),
+                                        Color32::from_rgb(100, 116, 139),
                                     );
                                     if r.clicked() {
                                         app.ribbon_popup = Some(Popup {
                                             kind: PopupKind::Menu(sub.clone()),
-                                            pos: egui::pos2(r.rect.right(), r.rect.top()),
+                                            pos: egui::pos2(r.rect.right() + 2.0, r.rect.top()),
                                             opened_at: ui.input(|i| i.time),
                                         });
                                     }
@@ -1241,11 +1239,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                     }
                     PopupKind::Items(items) => {
                         for it in items {
-                            let r = ui.add(
-                                egui::Button::new(egui::RichText::new(&it.label).size(12.0))
-                                    .min_size(Vec2::new(160.0, 22.0))
-                                    .frame(false),
-                            );
+                            let r = ui_kit::popup_item(ui, &it.label, true, 176.0);
                             if r.clicked() {
                                 fire = Some(it.id.clone());
                                 close = true;
@@ -1360,12 +1354,12 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let ctx = ui.ctx().clone();
         let mut pick: Option<String> = None;
         let mut close = false;
-        egui::Area::new(egui::Id::new("font_list"))
-            .fixed_pos(arrow_pos)
+        let area = egui::Area::new(egui::Id::new("font_list"))
+            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(170.0);
+                ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(176.0);
                     egui::ScrollArea::vertical()
                         .max_height(320.0)
                         .show(ui, |ui| {
@@ -1391,7 +1385,13 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         if let Some(p) = pick {
             app.apply_style(move |s| s.font = p.clone());
         }
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let outside = !arrow_clicked
+            && ctx.input(|i| i.pointer.any_click())
+            && !ctx
+                .input(|i| i.pointer.interact_pos())
+                .map(|p| area.response.rect.contains(p))
+                .unwrap_or(false);
+        if close || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.font_menu = false;
         }
     }
@@ -1464,12 +1464,12 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let ctx = ui.ctx().clone();
         let mut pick: Option<f32> = None;
         let mut close = false;
-        egui::Area::new(egui::Id::new("size_list"))
-            .fixed_pos(arrow_pos)
+        let area = egui::Area::new(egui::Id::new("size_list"))
+            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(90.0);
+                ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(92.0);
                     egui::ScrollArea::vertical()
                         .max_height(300.0)
                         .show(ui, |ui| {
@@ -1494,7 +1494,13 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         if let Some(p) = pick {
             app.apply_style(move |s| s.size = p);
         }
-        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let outside = !arrow_clicked
+            && ctx.input(|i| i.pointer.any_click())
+            && !ctx
+                .input(|i| i.pointer.interact_pos())
+                .map(|p| area.response.rect.contains(p))
+                .unwrap_or(false);
+        if close || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.size_menu = false;
         }
     }

@@ -154,27 +154,125 @@ pub fn release_election(file: &Path) {
     let _ = std::fs::remove_file(elect_path(file));
 }
 
-/// 路径是不是网盘/共享目录：UNC 或映射的网络驱动器
+pub const SHARED_MARKER: &str = ".cellan-share";
+
+/// 判断文件所在目录（或上一级目录）是否已显式标记为局域网协同目录
+pub fn is_dir_marked_shared(file: &Path) -> bool {
+    let Some(dir) = file.parent() else {
+        return false;
+    };
+    if dir.join(SHARED_MARKER).exists() {
+        return true;
+    }
+    dir.parent()
+        .map(|p| p.join(SHARED_MARKER).exists())
+        .unwrap_or(false)
+}
+
+/// 将当前文件所在目录显式标记/取消标记为局域网协同共享目录（支持本机共享盘符或自定义同步盘）
+pub fn set_dir_marked_shared(file: &Path, enabled: bool) -> std::io::Result<()> {
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let marker = dir.join(SHARED_MARKER);
+    if enabled {
+        let mut f = std::fs::File::create(&marker)?;
+        let _ = f.write_all(b"cellan-lan-share=1\n");
+        Ok(())
+    } else {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// 路径是不是网盘/共享目录：支持 UNC、SMB 映射网络盘、主流企业云盘/同步盘（OneDrive / 群晖 / 坚果云 / WPS云盘 / 微盘 / 飞书 / 百度企业网盘等）及显式标记的协同目录。
 pub fn is_network_path(file: &Path) -> bool {
     let text = file.to_string_lossy();
-    if text.starts_with("\\\\") {
+    if text.starts_with("\\\\") || text.starts_with("//") {
+        return true;
+    }
+    if is_dir_marked_shared(file) {
         return true;
     }
     #[cfg(windows)]
     {
-        let Some(root) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) else {
-            return false;
-        };
-        let root = format!("{root}:\\");
-        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        if let Some(root) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+            let root = format!("{root}:\\");
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+            }
+            // DRIVE_REMOTE = 4（映射的局域网 SMB/WebDAV 驱动器）
+            if unsafe { GetDriveTypeW(wide.as_ptr()) == 4 } {
+                return true;
+            }
         }
-        // DRIVE_REMOTE = 4
-        return unsafe { GetDriveTypeW(wide.as_ptr()) == 4 };
     }
-    #[cfg(not(windows))]
+    // 排除系统临时目录（单测/UI 回归沙箱在 %TEMP% 下运行，避免误触发静默建房）
+    let lower = text.to_lowercase();
+    if lower.contains("\\appdata\\local\\temp\\")
+        || lower.contains("/appdata/local/temp/")
+        || lower.contains("sheets-native-")
+    {
+        return false;
+    }
+    // Windows Cloud Filter / 同步盘重解析点与脱机占位属性检测
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const CLOUD_MASK: u32 = 0x0000_0400 // FILE_ATTRIBUTE_REPARSE_POINT
+            | 0x0004_0000 // FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | 0x0008_0000 // FILE_ATTRIBUTE_PINNED
+            | 0x0010_0000 // FILE_ATTRIBUTE_UNPINNED
+            | 0x0040_0000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+        if let Ok(md) = std::fs::symlink_metadata(file) {
+            if md.file_attributes() & CLOUD_MASK != 0 {
+                return true;
+            }
+        }
+        if let Some(parent) = file.parent() {
+            if let Ok(md) = std::fs::symlink_metadata(parent) {
+                if md.file_attributes() & CLOUD_MASK != 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    // 主流企业网盘 / 局域网同步盘目录特征匹配
+    const CLOUD_TOKENS: &[&str] = &[
+        "onedrive",
+        "synologydrive",
+        "synology",
+        "seafile",
+        "nextcloud",
+        "owncloud",
+        "nutstore",
+        "坚果云",
+        "wpscloud",
+        "wps网盘",
+        "weiyun",
+        "wedrive",
+        "微盘",
+        "企业微盘",
+        "baidunetdisk",
+        "企业网盘",
+        "同步盘",
+        "共享盘",
+        "dropbox",
+        "iclouddrive",
+        "feishu",
+        "dingtalk",
+        "resilio",
+        "syncthing",
+    ];
+    for comp in file.components() {
+        let seg = comp.as_os_str().to_string_lossy().to_lowercase();
+        if CLOUD_TOKENS.iter().any(|tok| seg.contains(tok)) {
+            return true;
+        }
+    }
     false
 }
 
@@ -229,7 +327,7 @@ beat={}
         let info = read(&f).unwrap();
         assert!(!is_fresh(&info), "超过 {} 秒就不该再去找这个地址", STALE_SECS);
         remove(&f);
-    }
+    }
 
     #[test]
     fn election_is_exclusive_and_releasable() {
@@ -243,4 +341,25 @@ beat={}
         release_election(&f);
     }
 
+    #[test]
+    fn network_and_cloud_sync_paths_detected_and_share_marker_works() {
+        assert!(is_network_path(Path::new(r"\\NAS01\财务部\2026预算.xlsx")));
+        assert!(is_network_path(Path::new("C:/Users/Alice/OneDrive/预算.xlsx")));
+        assert!(is_network_path(Path::new("D:/SynologyDrive/部门台账/回款.xlsx")));
+        assert!(is_network_path(Path::new("E:/我的坚果云/协同表.xlsx")));
+        assert!(is_network_path(Path::new("E:/WPS网盘/项目排期.xlsx")));
+        assert!(!is_network_path(Path::new("D:/本地个人文档/草稿.xlsx")));
+
+        let sub = crate::test_env::scratch("share-marker-test");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = sub.join("team.xlsx");
+        std::fs::write(&f, b"x").unwrap();
+        set_dir_marked_shared(&f, false).unwrap();
+        assert!(!is_dir_marked_shared(&f));
+        set_dir_marked_shared(&f, true).unwrap();
+        assert!(is_dir_marked_shared(&f));
+        assert!(is_network_path(&f), "标记了 .cellan-share 的目录必须被识别为协同目录");
+        set_dir_marked_shared(&f, false).unwrap();
+        assert!(!is_dir_marked_shared(&f));
+    }
 }

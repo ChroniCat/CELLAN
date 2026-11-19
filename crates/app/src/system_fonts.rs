@@ -219,10 +219,16 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
         if std::env::var("SC_FONT_LOG").is_ok() {
             eprintln!("[fonts] apply {:?} index={}", key, f.index);
         }
+        let mut chain = vec![key.clone()];
+        for fb in ["sys-ui-msyh", "noto-sans"] {
+            if fonts.font_data.contains_key(fb) && !chain.iter().any(|x| x == fb) {
+                chain.push(fb.to_owned());
+            }
+        }
         fonts
             .families
-            .insert(egui::FontFamily::Name(key.clone().into()), vec![key.clone()]);
-        pending().lock().map(|mut p| p.insert(name.clone()));
+            .insert(egui::FontFamily::Name(key.clone().into()), chain);
+        let _ = pending().lock().map(|mut p| p.insert(name.clone()));
     }
     if let Ok(bold) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         for (name, f) in bold.iter() {
@@ -231,10 +237,16 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
                 key.clone(),
                 FontData { font: std::borrow::Cow::Owned(f.data.to_vec()), index: f.index, tweak: Default::default() }.into(),
             );
+            let mut chain = vec![key.clone()];
+            for fb in ["sys-ui-msyh-b", "noto-sans-bold", "sys-ui-msyh", "noto-sans"] {
+                if fonts.font_data.contains_key(fb) && !chain.iter().any(|x| x == fb) {
+                    chain.push(fb.to_owned());
+                }
+            }
             fonts
                 .families
-                .insert(egui::FontFamily::Name(key.clone().into()), vec![key.clone()]);
-            pending().lock().map(|mut p| p.insert(format!("bold:{name}")));
+                .insert(egui::FontFamily::Name(key.clone().into()), chain);
+            let _ = pending().lock().map(|mut p| p.insert(format!("bold:{name}")));
         }
     }
 }
@@ -275,5 +287,23 @@ mod tests {
         begin_frame();
         assert!(is_loaded("宋体"));
         assert!(!ensure(&["宋体".to_string()]));
+    }
+
+    #[test]
+    fn latin_system_font_chains_cjk_fallback() {
+        let _ = ensure(&["Arial".to_string()]);
+        let mut d = egui::FontDefinitions::default();
+        d.font_data
+            .insert("noto-sans".to_owned(), egui::FontData::from_static(&[]).into());
+        apply(&mut d);
+        let fam = d
+            .families
+            .get(&egui::FontFamily::Name("sys:arial".into()))
+            .expect("sys:arial 必须存在");
+        assert_eq!(fam.first().map(String::as_str), Some("sys:arial"));
+        assert!(
+            fam.iter().any(|k| k == "noto-sans"),
+            "西文系统字体族必须串接中文回退字库以防保存重开后汉字变成问号，实际: {fam:?}"
+        );
     }
 }

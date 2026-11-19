@@ -63,11 +63,13 @@ pub struct Net {
     cmd: Sender<Cmd>,
     pub events: Receiver<NetEvent>,
     pub hosting: bool,
+    pub port: u16,
     pub addr: String,
     alive: Arc<AtomicBool>,
     state: Option<Arc<Mutex<Vec<Op>>>>,
-    /// 宿主自己也是参与者：本地租约表 + 事件入口
+    /// 宿主自己也是参与者：本地租约表 + 光标表 + 事件入口
     host_locks: Option<Arc<Mutex<sheetcore::sync::LockTable>>>,
+    host_cursors: Option<Arc<Mutex<HashMap<u32, Cursor>>>>,
     host_styles:
         Option<Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
@@ -320,6 +322,9 @@ impl Net {
     }
 
     pub fn broadcast_cursor(&self, cur: Cursor) {
+        if let Some(hc) = &self.host_cursors {
+            hc.lock().unwrap().insert(cur.site, cur.clone());
+        }
         if let Ok(s) = serde_json::to_string(&Msg::CursorMsg(cur)) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
@@ -328,6 +333,11 @@ impl Net {
     /// 在线改显示名：客户端发给宿主，宿主转发给其他客户端；本机也收一条事件，
     /// 让成员列表立刻更新。协议不改变 site，已有连接不需要重连。
     pub fn rename(&self, name: &str) {
+        if let Some(hc) = &self.host_cursors {
+            if let Some(cur) = hc.lock().unwrap().get_mut(&self.site) {
+                cur.name = name.to_string();
+            }
+        }
         let msg = Msg::Rename { site: self.site, name: name.to_string() };
         if let Ok(s) = serde_json::to_string(&msg) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
@@ -341,7 +351,7 @@ impl Net {
     }
 }
 
-/// 启动宿主：监听端口，校验口令，转发所有操作
+/// 启动宿主：监听指定端口，校验口令，转发所有操作
 pub fn host(
     site: u32,
     name: String,
@@ -352,6 +362,33 @@ pub fn host(
     // 生产路径：真的绑 0.0.0.0（局域网可连），端口来自配置。
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     host_on(listener, site, name, doc, password)
+}
+
+/// 启动宿主（支持多工作簿/同机多实例端口自动顺延）：
+/// 若显式指定了 `SC_NET_PORT` 则严格绑定该端口；否则优先尝试 7878..=7898，全满时退回随机空闲端口，
+/// 实际端口会写入 `.~sheetflow-*.lock` 占用卡，彻底消除同机打开多份网盘表时的端口冲突。
+pub fn host_auto(
+    site: u32,
+    name: String,
+    doc: String,
+    password: String,
+) -> std::io::Result<Net> {
+    if let Ok(v) = std::env::var("SC_NET_PORT") {
+        if let Ok(explicit_port) = v.trim().parse::<u16>() {
+            return host(site, name, doc, explicit_port, password);
+        }
+    }
+    let mut last_err = None;
+    for candidate in DEFAULT_PORT..=DEFAULT_PORT.saturating_add(20) {
+        match TcpListener::bind(("0.0.0.0", candidate)) {
+            Ok(listener) => return host_on(listener, site, name, doc, password),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match TcpListener::bind(("0.0.0.0", 0)) {
+        Ok(listener) => host_on(listener, site, name, doc, password),
+        Err(e) => Err(last_err.unwrap_or(e)),
+    }
 }
 
 /// 用调用方已经绑定好的 listener 起宿主。测试用它绑 `0.0.0.0:0`——
@@ -408,7 +445,9 @@ pub fn host_on(
     let structs_for_self = structs.clone();
     let locks: Arc<Mutex<sheetcore::sync::LockTable>> =
         Arc::new(Mutex::new(sheetcore::sync::LockTable::new(20_000)));
+    let cursors: Arc<Mutex<HashMap<u32, Cursor>>> = Arc::new(Mutex::new(HashMap::new()));
     let locks_for_self = locks.clone();
+    let cursors_for_self = cursors.clone();
     let styles_for_self = styles.clone();
     let evt_tx_self = evt_tx.clone();
     let t0 = std::time::Instant::now();
@@ -422,6 +461,7 @@ pub fn host_on(
         let locks = locks.clone();
         let peers = peers.clone();
         let alive = alive.clone();
+        let evt_tx = evt_tx.clone();
         let now_ms = now_ms;
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(5));
@@ -435,6 +475,7 @@ pub fn host_on(
                 for ptx in peers.lock().unwrap().values() {
                     let _ = ptx.send(line.clone());
                 }
+                let _ = evt_tx.send(NetEvent::LockRelease { site, sheet, row, col });
             }
         });
     }
@@ -450,6 +491,7 @@ pub fn host_on(
         let password = password.clone();
         let alive = alive.clone();
         let locks_outer = locks.clone();
+        let cursors_outer = cursors.clone();
         let styles_outer = styles.clone();
         let structs_outer = structs.clone();
         let now_ms_outer = now_ms;
@@ -465,6 +507,7 @@ pub fn host_on(
                 let doc_name = doc_name.clone();
                 let password = password.clone();
                 let locks = locks_outer.clone();
+                let cursors = cursors_outer.clone();
                 let styles = styles_outer.clone();
                 let structs = structs_outer.clone();
                 let now_ms = now_ms_outer;
@@ -617,6 +660,40 @@ pub fn host_on(
                                         }
                                     }
                                 }
+                                {
+                                    // 下发当前所有未过期的单元格编辑租约，确保后加入成员立即看到谁锁了哪格并禁用它
+                                    let active_locks: Vec<(usize, u32, u32, u32, String)> = {
+                                        let mut lt = locks.lock().unwrap();
+                                        let _ = lt.expire(now_ms());
+                                        lt.iter()
+                                            .map(|((sh, r, c), h)| (sh, r, c, h.site, h.name.clone()))
+                                            .collect()
+                                    };
+                                    for (sheet, row, col, lsite, lname) in active_locks {
+                                        let _ = tx.send(
+                                            serde_json::to_string(&Msg::LockOk {
+                                                site: lsite,
+                                                name: lname,
+                                                sheet,
+                                                row,
+                                                col,
+                                            })
+                                            .unwrap(),
+                                        );
+                                    }
+                                }
+                                {
+                                    // 下发所有在线成员的实时选区光标，后加入者无需等待对方移动鼠标即可看见同事 ID 标签
+                                    let active_cursors: Vec<Cursor> =
+                                        cursors.lock().unwrap().values().cloned().collect();
+                                    for cur in active_cursors {
+                                        if cur.site != site {
+                                            let _ = tx.send(
+                                                serde_json::to_string(&Msg::CursorMsg(cur)).unwrap(),
+                                            );
+                                        }
+                                    }
+                                }
                                 peers.lock().unwrap().insert(site, tx.clone());
                                 peer_names.lock().unwrap().insert(site, (name.clone(), color));
                                 let _ = evt_tx.send(NetEvent::PeerJoined(site, name.clone(), color));
@@ -644,6 +721,7 @@ pub fn host_on(
                                 let _ = evt_tx.send(NetEvent::Ops(vec![op]));
                             }
                             Msg::CursorMsg(c) => {
+                                cursors.lock().unwrap().insert(c.site, c.clone());
                                 let line =
                                     serde_json::to_string(&Msg::CursorMsg(c.clone())).unwrap();
                                 for (s, ptx) in peers.lock().unwrap().iter() {
@@ -661,6 +739,9 @@ pub fn host_on(
                                     .lock()
                                     .unwrap()
                                     .insert(site, (name.clone(), color));
+                                if let Some(cur) = cursors.lock().unwrap().get_mut(&site) {
+                                    cur.name = name.clone();
+                                }
                                 let line = serde_json::to_string(&Msg::Rename {
                                     site,
                                     name: name.clone(),
@@ -809,10 +890,7 @@ pub fn host_on(
                                     });
                                 }
                             }
-                            Msg::Bye { site } => {
-                                peers.lock().unwrap().remove(&site);
-                                peer_names.lock().unwrap().remove(&site);
-                                let _ = evt_tx.send(NetEvent::PeerLeft(site));
+                            Msg::Bye { site: _ } => {
                                 break;
                             }
                             _ => {}
@@ -821,7 +899,8 @@ pub fn host_on(
                     if let Some(site) = hello_site {
                         peers.lock().unwrap().remove(&site);
                         peer_names.lock().unwrap().remove(&site);
-                        // 人走了，锁必须放掉，否则格子会一直灰着
+                        cursors.lock().unwrap().remove(&site);
+                        // 人走了，锁必须放掉并通知宿主与其他全部客户端，绝不残留幽灵锁或幽灵光标
                         let mine: Vec<(usize, u32, u32)> = locks
                             .lock()
                             .unwrap()
@@ -838,6 +917,11 @@ pub fn host_on(
                             for ptx in peers.lock().unwrap().values() {
                                 let _ = ptx.send(line.clone());
                             }
+                            let _ = evt_tx.send(NetEvent::LockRelease { site, sheet, row, col });
+                        }
+                        let bye = serde_json::to_string(&Msg::Bye { site }).unwrap();
+                        for ptx in peers.lock().unwrap().values() {
+                            let _ = ptx.send(bye.clone());
                         }
                         let _ = evt_tx.send(NetEvent::PeerLeft(site));
                     }
@@ -851,10 +935,12 @@ pub fn host_on(
         cmd: cmd_tx,
         events: evt_rx,
         hosting: true,
+        port,
         addr: format!("0.0.0.0:{port}"),
         alive,
         state: Some(state),
         host_locks: Some(locks_for_self),
+        host_cursors: Some(cursors_for_self),
         host_styles: Some(styles_for_self),
         host_structs: Some(structs_for_self),
         evt_tx: evt_tx_self,
@@ -1106,10 +1192,12 @@ pub fn join(
         cmd: cmd_tx,
         events: evt_rx,
         hosting: false,
+        port: sock.port(),
         addr: addr.to_string(),
         alive,
         state: None,
         host_locks: None,
+        host_cursors: None,
         host_styles: None,
         host_structs: None,
         evt_tx: evt_tx_clone,
@@ -1275,6 +1363,63 @@ mod presence_tests {
             peers.iter().any(|(s, _, _)| *s == 11),
             "Welcome 里必须包含宿主站点 11，实际 {peers:?}"
         );
+        drop(client);
+        drop(host_net);
+    }
+
+    #[test]
+    fn late_joiner_immediately_receives_active_locks_and_cursors() {
+        let (host_net, port) = host_for_test(11, "王芳@财务部", "budget.xlsx", "");
+        host_net.broadcast_cursor(Cursor {
+            site: 11,
+            name: "王芳@财务部".into(),
+            sheet: 0,
+            row: 6,
+            col: 3,
+            color: 4,
+        });
+        host_net.request_lock(0, 6, 3, "王芳@财务部");
+        std::thread::sleep(Duration::from_millis(120));
+
+        let client = join(
+            22,
+            "张明@审计组".into(),
+            "budget.xlsx".into(),
+            &format!("127.0.0.1:{port}"),
+            String::new(),
+        )
+        .expect("后加入成员应能连上宿主");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got_lock = false;
+        let mut got_cursor = false;
+        while std::time::Instant::now() < deadline && (!got_lock || !got_cursor) {
+            if let Ok(ev) = client.events.recv_timeout(Duration::from_millis(200)) {
+                match ev {
+                    NetEvent::LockOk {
+                        site: 11,
+                        name,
+                        sheet: 0,
+                        row: 6,
+                        col: 3,
+                    } if name == "王芳@财务部" => {
+                        got_lock = true;
+                    }
+                    NetEvent::Cursor(c)
+                        if c.site == 11
+                            && c.name == "王芳@财务部"
+                            && c.sheet == 0
+                            && c.row == 6
+                            && c.col == 3 =>
+                    {
+                        got_cursor = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(got_lock, "后加入成员必须立即收到既有单元格锁 LockOk");
+        assert!(got_cursor, "后加入成员必须立即收到既有同事光标 Cursor");
         drop(client);
         drop(host_net);
     }
