@@ -1,4 +1,4 @@
-# Sheets Native
+# LANCell
 
 面向 Windows 的 Rust 原生电子表格桌面应用，包含桌面界面（`crates/app`）和表格核心（`crates/core`）。
 
