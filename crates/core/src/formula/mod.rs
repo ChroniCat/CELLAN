@@ -2090,7 +2090,40 @@ impl<'a> Calc<'a> {
                         let crit = if simple {
                             String::new()
                         } else {
-                            self.eval_node(&nodes[1], si2).to_text().unwrap_or_default()
+                            // 条件表达式（如 A5）的默认工作表必须是公式所在的当前表 si，绝不能误落到被聚合表 si2！
+                            self.eval_node(&nodes[1], si).to_text().unwrap_or_default()
+                        };
+                        let sum_spec = if name == "SUMIF" {
+                            match nodes.get(2) {
+                                None => None,
+                                Some(n2) => match literal(n2) {
+                                    Some((sa, sb))
+                                        if sa.sheet2.is_none()
+                                            && sb.sheet2.is_none()
+                                            && sa.book.is_none()
+                                            && sb.book.is_none() =>
+                                    {
+                                        match self.sheet_index(sa.sheet.as_deref(), si) {
+                                            Ok(sidx) => Some((sidx, sa, sb)),
+                                            Err(e) => return FValue::Error(e),
+                                        }
+                                    }
+                                    _ => return self.call_generic(name, nodes, si),
+                                },
+                            }
+                        } else {
+                            None
+                        };
+                        let cache_crit = if let Some((sidx, ref sa, ref sb)) = sum_spec {
+                            format!(
+                                "{crit}\0{sidx}:{}:{}:{}:{}",
+                                sa.row.min(sb.row),
+                                sa.col.min(sb.col),
+                                sa.row.max(sb.row),
+                                sa.col.max(sb.col)
+                            )
+                        } else {
+                            crit.clone()
                         };
                         let (rows, cols) = (
                             (ra.row.max(rb.row) - ra.row.min(rb.row) + 1).max(0),
@@ -2111,7 +2144,7 @@ impl<'a> Calc<'a> {
                                 "MAX" => 6,
                                 _ => 7,
                             },
-                            crit.clone(),
+                            cache_crit,
                         );
                         if let Some(v) = self.agg_cache.get(&key) {
                             self.agg_hits += 1;
@@ -2185,16 +2218,10 @@ impl<'a> Calc<'a> {
                                 // SUMIF：第三个参数是和区域，可能跨表
                                 let c = functions::Crit::parse(&crit);
                                 let sum_vals: Option<std::rc::Rc<Vec<FValue>>> =
-                                    match nodes.get(2).and_then(|n| literal(n)) {
-                                        Some((sa, sb)) => {
-                                            let sidx =
-                                                self.sheet_index(sa.sheet.as_deref(), si2).unwrap_or(si2);
-                                            let (sr, sc, sd) = self.cached_grid(sidx, &sa, &sb);
-                                            let _ = (sr, sc);
-                                            Some(sd)
-                                        }
-                                        None => None,
-                                    };
+                                    sum_spec.map(|(sidx, sa, sb)| {
+                                        let (_sr, _sc, sd) = self.cached_grid(sidx, &sa, &sb);
+                                        sd
+                                    });
                                 let mut t = 0.0;
                                 for (i, v) in data.iter().enumerate() {
                                     if c.matches(v) {

@@ -716,7 +716,8 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
         }
         match c.size {
             Size::Large => {
-                let w = c.width.unwrap_or(42.0);
+                let tw = if label.is_empty() { 0.0 } else { measure(ui, &label, 12.0) };
+                let w = c.width.unwrap_or(44.0).max(tw + 14.0);
                 let ic = icon.unwrap_or(Icon::Grid);
                 let r = ui_kit::big_sized(ui, ic, &label, Vec2::new(w, 76.0));
                 if !tip.is_empty() {
@@ -729,9 +730,8 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
                 if label.is_empty() {
                     ui_kit::small_on(ui, icon.unwrap_or(Icon::Grid), on, &tip)
                 } else {
-                    let w = c.width.unwrap_or_else(|| {
-                        (16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0).max(24.0)
-                    });
+                    let min_w = (16.0 + 5.0 + measure(ui, &label, 12.0) + 12.0).max(24.0);
+                    let w = c.width.unwrap_or(min_w).max(min_w);
                     ui_kit::labeled_w_on(ui, icon.unwrap_or(Icon::Grid), &label, w, on, &tip)
                 }
             }
@@ -780,7 +780,8 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
 
     match ctl.size {
         Size::Large => {
-            let w = ctl.width.unwrap_or(42.0);
+            let tw = if label.is_empty() { 0.0 } else { measure(ui, &label, 12.0) };
+            let w = ctl.width.unwrap_or(44.0).max(tw + 14.0);
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
             // UI-24.2：大号拆分按钮的主体和箭头是两个点击区，各自要有名字
             if !label.is_empty() {
@@ -820,9 +821,9 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
                             }
                             _ if label.is_empty() => ui_kit::small_on(ui, icon, on, &tip),
                             _ => {
-                                let w = ctl.width.unwrap_or_else(|| {
-                                    (16.0 + 4.0 + measure(ui, &label, 12.0) + 10.0).max(24.0)
-                                });
+                                let min_w =
+                                    (16.0 + 5.0 + measure(ui, &label, 12.0) + 10.0).max(24.0);
+                                let w = ctl.width.unwrap_or(min_w).max(min_w);
                                 ui_kit::labeled_w_on(ui, icon, &label, w, on, &tip)
                             }
                         }
@@ -880,7 +881,8 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
     let tip = tip_of(&m.ctl);
     let icon = m.ctl.image.as_deref().and_then(icon_of);
     if m.ctl.size == Size::Large {
-        let w = m.ctl.width.unwrap_or(65.0);
+        let tw = if label.is_empty() { 0.0 } else { measure(ui, &label, 12.0) };
+        let w = m.ctl.width.unwrap_or(62.0).max(tw + 14.0);
         let ic = m.ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
         let (r, ar) = ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0));
         {
@@ -899,13 +901,14 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
         return;
     }
     let clicked = ui.add_enabled_ui(on_enabled(&m.ctl, &st), |ui| {
-        let w = m.ctl.width.unwrap_or_else(|| {
-            if icon.is_some() {
-                (16.0 + 4.0 + measure(ui, &label, 12.0) + 16.0).max(24.0)
-            } else {
-                (measure(ui, &label, 12.0) + 26.0).max(24.0)
-            }
-        });
+        let min_w = if label.is_empty() {
+            24.0
+        } else if icon.is_some() {
+            (16.0 + 5.0 + measure(ui, &label, 12.0) + 14.0).max(24.0)
+        } else {
+            (measure(ui, &label, 12.0) + 24.0).max(24.0)
+        };
+        let w = m.ctl.width.unwrap_or(min_w).max(min_w);
         if let Some(ic) = icon {
             ui_kit::labeled_w(ui, ic, &label, w, &tip)
         } else {
@@ -973,25 +976,33 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         let width = c
             .width
             .unwrap_or_else(|| 96.0_f32.max(measure(ui, &text, 12.0) + 30.0));
-        let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 21.0), Sense::click());
+        let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
         let enabled = ui.is_enabled();
         let hover = r.hovered() && enabled;
         ui.painter().rect(
             rect,
-            2.0,
-            if enabled { ui.visuals().extreme_bg_color } else { ui_kit::HOVER },
+            5.0,
+            if !enabled {
+                ui_kit::HOVER
+            } else if hover {
+                Color32::from_rgb(244, 247, 251)
+            } else {
+                Color32::from_rgb(250, 251, 253)
+            },
             egui::Stroke::new(
                 1.0,
-                if enabled { ui_kit::BORDER } else { Color32::from_rgb(224, 224, 224) },
+                if !enabled {
+                    Color32::from_rgb(226, 232, 240)
+                } else if hover {
+                    Color32::from_rgb(176, 188, 204)
+                } else {
+                    ui_kit::CARD_BORDER
+                },
             ),
             egui::StrokeKind::Inside,
         );
-        if hover {
-            ui.painter()
-                .rect_filled(rect.shrink(1.0), 1.0, ui.visuals().widgets.hovered.weak_bg_fill);
-        }
         ui.painter().text(
-            egui::pos2(rect.left() + 5.0, rect.center().y),
+            egui::pos2(rect.left() + 7.0, rect.center().y),
             Align2::LEFT_CENTER,
             &text,
             FontId::proportional(12.0),
@@ -1285,18 +1296,18 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
-            2.0,
-            Color32::WHITE,
-            egui::Stroke::new(1.0, ui_kit::BORDER),
+            5.0,
+            Color32::from_rgb(250, 251, 253),
+            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
-            egui::pos2(crect.right() - 16.0, crect.top() + 1.0),
+            egui::pos2(crect.right() - 18.0, crect.top() + 1.0),
             egui::pos2(crect.right() - 1.0, crect.bottom() - 1.0),
         );
         let text_rect = Rect::from_min_max(
-            egui::pos2(crect.left() + 5.0, crect.top() + 1.0),
-            egui::pos2(crect.right() - 18.0, crect.bottom() - 1.0),
+            egui::pos2(crect.left() + 7.0, crect.top() + 1.0),
+            egui::pos2(crect.right() - 19.0, crect.bottom() - 1.0),
         );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -1400,18 +1411,18 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, width: f32) {
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
-            2.0,
-            Color32::WHITE,
-            egui::Stroke::new(1.0, ui_kit::BORDER),
+            5.0,
+            Color32::from_rgb(250, 251, 253),
+            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
-            egui::pos2(crect.right() - 16.0, crect.top() + 1.0),
+            egui::pos2(crect.right() - 18.0, crect.top() + 1.0),
             egui::pos2(crect.right() - 1.0, crect.bottom() - 1.0),
         );
         let text_rect = Rect::from_min_max(
-            egui::pos2(crect.left() + 5.0, crect.top() + 1.0),
-            egui::pos2(crect.right() - 18.0, crect.bottom() - 1.0),
+            egui::pos2(crect.left() + 7.0, crect.top() + 1.0),
+            egui::pos2(crect.right() - 19.0, crect.bottom() - 1.0),
         );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -1511,7 +1522,7 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     if !st.visible {
         return;
     }
-    let w = c.width.unwrap_or(349.0);
+    let w = c.width.unwrap_or(330.0).min(330.0);
     let enabled = on_enabled(c, &st);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 65.0), Sense::hover());
     let arrow_w = 24.0;
@@ -1623,8 +1634,8 @@ fn menu_chevron(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut e
         .line_segment([egui::pos2(cx, cy + 1.5), egui::pos2(cx + 3.0, cy - 1.5)], stk);
 }
 
-/// 紧凑模式的样式库：整条 349px 的缩略图放不下，收成一个
-/// 「单元格样式 ▾」下拉；菜单项仍是原来的 Style* 命令。
+/// 紧凑模式的样式库：整条 349px 的缩略图放不下时，收成与「条件格式 / 套用表格格式」同高的
+/// 76px 大号拆分按钮（不再是一条悬浮在顶边的 24px 裸文字按钮），三枚样式命令整齐并排。
 fn gallery_compact(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     let st = app.ctl_state(&c.id);
     if !st.visible {
@@ -1635,37 +1646,24 @@ fn gallery_compact(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item
         .clone()
         .or_else(|| st.label.clone())
         .filter(|l| !l.is_empty())
-        .unwrap_or_else(|| "样式".to_string());
+        .unwrap_or_else(|| "单元格样式".to_string());
     let enabled = on_enabled(c, &st);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(100.0, 24.0), Sense::click());
-    ui_kit::a11y_name(&resp, &label, enabled, None);
-    if resp.hovered() && enabled {
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    let tw = measure(ui, &label, 12.0);
+    let w = (tw + 14.0).max(62.0);
+    let ic = c.image.as_deref().and_then(icon_of).unwrap_or(Icon::FormatCells);
+    let (r, ar) = ui.add_enabled_ui(enabled, |ui| {
+        ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0))
+    }).inner;
+    {
+        let mut main = r.rect;
+        main.max.y = main.max.y.min(ar.rect.top());
+        ui_kit::a11y_name_rect(&r, &label, enabled, main, ui.ctx());
     }
-    let col = if enabled {
-        ui.visuals().text_color()
-    } else {
-        ui_kit::DISABLED
-    };
-    ui.painter().text(
-        egui::pos2(rect.left() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        &label,
-        FontId::proportional(12.0),
-        col,
-    );
-    let cx = rect.right() - 10.0;
-    let cy = rect.center().y;
-    let stk = egui::Stroke::new(1.1, col);
-    ui.painter()
-        .line_segment([egui::pos2(cx - 3.0, cy - 1.5), egui::pos2(cx, cy + 1.5)], stk);
-    ui.painter()
-        .line_segment([egui::pos2(cx, cy + 1.5), egui::pos2(cx + 3.0, cy - 1.5)], stk);
-    if resp.clicked() && enabled {
+    ui_kit::a11y_name(&ar, &format!("{label} 展开"), enabled, None);
+    if (r.clicked() || ar.clicked()) && enabled {
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
-            pos: rect.left_bottom(),
+            pos: egui::pos2(r.rect.left(), ar.rect.bottom()),
             opened_at: ui.input(|i| i.time),
         });
     }

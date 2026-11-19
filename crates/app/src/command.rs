@@ -132,6 +132,15 @@ pub const COMMANDS: &[Command] = &[
         enabled: can_shell,
     },
     Command {
+        action: "CloseTab",
+        label: "关闭工作簿",
+        key: egui::Key::W,
+        shift: false,
+        on_start: false,
+        in_cell_edit: true,
+        enabled: can_save,
+    },
+    Command {
         action: "PrintPreview",
         label: "打印预览",
         key: egui::Key::P,
@@ -210,9 +219,15 @@ impl SheetApp {
             return None;
         }
         match action {
-            "FileSave" | "FileSaveAs" if self.tasks.saving.is_some() => Some("正在保存，完成后再试"),
-            "FileSave" | "FileSaveAs" if self.tasks.open_rx.is_some() => Some("正在加载，完成后再试"),
-            "FileSave" | "FileSaveAs" | "PrintPreview" if self.show_start => Some("先打开一个工作簿"),
+            "FileSave" | "FileSaveAs" | "CloseTab" if self.tasks.saving.is_some() => {
+                Some("正在保存，完成后再试")
+            }
+            "FileSave" | "FileSaveAs" | "CloseTab" if self.tasks.open_rx.is_some() => {
+                Some("正在加载，完成后再试")
+            }
+            "FileSave" | "FileSaveAs" | "CloseTab" | "PrintPreview" if self.show_start => {
+                Some("先打开一个工作簿")
+            }
             "FileOpen" | "NewTab" if self.tasks.open_rx.is_some() => Some("正在加载，完成后再试"),
             "Undo" => Some("没有可撤销的操作"),
             "Redo" => Some("没有可重做的操作"),
@@ -244,6 +259,10 @@ impl SheetApp {
             "FileSaveAs" => self.save(true),
             "FileOpen" => self.open_dialog(),
             "NewTab" => self.new_document(),
+            "CloseTab" => {
+                let idx = self.active_tab;
+                self.close_tab(idx);
+            }
             "PrintPreview" => {
                 self.preview_page = 0;
                 self.print_preview = true;

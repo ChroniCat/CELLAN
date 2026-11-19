@@ -38,28 +38,48 @@ impl Axis {
         self.rebuild();
     }
 
+    /// 批量将指定行/列尺寸设为 0（筛选/手动隐藏）：一次性写入后只 rebuild 一遍，
+    /// 避免在数万行筛选表上逐行 `set(r, 0.0)` 退化成 O(N²)。
+    pub fn hide_many(&mut self, indices: impl IntoIterator<Item = u32>) {
+        let mut changed = false;
+        for i in indices {
+            if self.sizes.insert(i, 0.0) != Some(0.0) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild();
+        }
+    }
+
     fn rebuild(&mut self) {
         self.prefix.clear();
+        self.prefix.reserve(self.sizes.len());
         let mut extra = 0.0;
         for (i, w) in self.sizes.iter() {
-            self.prefix.push((*i, extra));
             extra += *w - self.default;
+            self.prefix.push((*i, extra));
         }
     }
 
     /// 第 i 项的起点（相对内容原点）
+    #[inline]
     pub fn pos(&self, i: u32) -> f32 {
         i as f32 * self.default + self.extra_before(i)
     }
 
+    #[inline]
     fn extra_before(&self, i: u32) -> f32 {
-        // 找最后一个 < i 的自定义项
-        let idx = self.prefix.partition_point(|(k, _)| *k < i);
-        if idx == 0 {
+        if self.prefix.is_empty() {
             return 0.0;
         }
-        let (k, extra) = self.prefix[idx - 1];
-        extra + (self.sizes[&k] - self.default)
+        // 找最后一个 < i 的自定义项；prefix 直接保存「含该项在内的累计额外偏移」，省掉二次 BTreeMap 查找
+        let idx = self.prefix.partition_point(|(k, _)| *k < i);
+        if idx == 0 {
+            0.0
+        } else {
+            self.prefix[idx - 1].1
+        }
     }
 
     pub fn size(&self, i: u32) -> f32 {

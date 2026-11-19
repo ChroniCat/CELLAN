@@ -22,15 +22,14 @@ pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
 pub const BRAND_NAVY: Color32 = Color32::from_rgb(27, 53, 129);
 pub const BRAND_MINT: Color32 = Color32::from_rgb(9, 189, 141);
 
-/// 悬浮卡片：白底 + 1px 边 + 8px 圆角，卡片之间透出统一冷中性灰蓝 PAGE_BG（与品牌深海蓝/翡翠绿同色温，消除暖褐灰撞色）。
-pub const PAGE_BG: Color32 = Color32::from_rgb(241, 243, 246);
-pub const CARD_BORDER: Color32 = Color32::from_rgb(222, 226, 234);
-/// 卡片顶部页签条：比卡片略深，活动页签的白卡才会「浮」出来
-pub const TABSTRIP_BG: Color32 = Color32::from_rgb(234, 237, 242);
-/// 页签条与白色命令区之间的 1px 分界线（活动页签处留空，让白卡和命令区连成一体）
-pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(222, 226, 234);
+/// 悬浮卡片：纯白四圆角卡片浮于冷灰蓝 PAGE_BG 之上，配清晰利落的 1px CARD_BORDER。
+pub const PAGE_BG: Color32 = Color32::from_rgb(240, 243, 248);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(205, 213, 224);
+/// 页签栏底色（Fluent 架构下直接与 PAGE_BG 融为一体，消除双拼色断层边框）
+pub const TABSTRIP_BG: Color32 = Color32::from_rgb(240, 243, 248);
+pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(205, 213, 224);
 /// 灰底上的悬停色：与冷灰底拉开明确明度差
-pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(226, 230, 238);
+pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(225, 231, 240);
 /// 卡片圆角：功能区/网格 8px，编辑栏 6px
 pub const CARD_R: u8 = 8;
 
@@ -277,34 +276,34 @@ pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 /// 列头/行头与网格的分界线：Excel 实测 #ABABAB，比普通控件边框深
 pub const HEAD_LINE: Color32 = Color32::from_rgb(171, 171, 171);
 /// 功能区分组之间的竖线
-pub const SEP: Color32 = Color32::from_rgb(224, 224, 224);
-pub const TEXT: Color32 = Color32::from_rgb(29, 29, 29);
-pub const TEXT_WEAK: Color32 = Color32::from_rgb(96, 96, 96);
-pub const HEADER_BG: Color32 = Color32::from_rgb(240, 240, 240);
-pub const HEADER_SEL: Color32 = Color32::from_rgb(225, 225, 225);
-pub const GRID_LINE: Color32 = Color32::from_rgb(217, 217, 217);
-/// 页签行底色（Excel 是 #F3F2F1，活动页签白底盖在上面）
-pub const TABBAR_BG: Color32 = Color32::from_rgb(243, 242, 241);
-/// 标题栏底色：Excel 实测 240,240,240
-pub const TITLE_BG: Color32 = Color32::from_rgb(240, 240, 240);
-pub const HOVER: Color32 = Color32::from_rgb(243, 242, 241);
-pub const PRESSED: Color32 = Color32::from_rgb(237, 235, 233);
-pub const STATUS_BG: Color32 = Color32::from_rgb(245, 245, 245);
+pub const SEP: Color32 = Color32::from_rgb(228, 232, 240);
+pub const TEXT: Color32 = Color32::from_rgb(23, 31, 46);
+pub const TEXT_WEAK: Color32 = Color32::from_rgb(100, 116, 139);
+pub const HEADER_BG: Color32 = Color32::from_rgb(245, 247, 250);
+pub const HEADER_SEL: Color32 = Color32::from_rgb(226, 232, 240);
+pub const GRID_LINE: Color32 = Color32::from_rgb(220, 225, 232);
+/// 页签行底色
+pub const TABBAR_BG: Color32 = Color32::from_rgb(240, 243, 248);
+/// 标题栏底色
+pub const TITLE_BG: Color32 = Color32::from_rgb(240, 243, 248);
+pub const HOVER: Color32 = Color32::from_rgb(239, 243, 249);
+pub const PRESSED: Color32 = Color32::from_rgb(228, 234, 243);
+pub const STATUS_BG: Color32 = Color32::from_rgb(245, 247, 250);
 
 /// 标题栏（自绘，含快速访问工具栏和窗口按钮）
-pub const TITLE_H: f32 = 48.0;
-/// 页签行
-pub const TAB_H: f32 = 30.0;
-/// 功能区（不含页签行）
-pub const RIBBON_BODY_H: f32 = 102.0;
+pub const TITLE_H: f32 = 46.0;
+/// 页签行（直接铺在 PAGE_BG 上）
+pub const TAB_H: f32 = 28.0;
+/// 功能区纯白悬浮卡片高度（含顶部 6px 与底部 8px 呼吸留白，杜绝组名贴底边）
+pub const RIBBON_BODY_H: f32 = 110.0;
 /// 功能区总高
 pub const RIBBON_H: f32 = TAB_H + RIBBON_BODY_H;
 /// 编辑栏（名称框 + fx + 输入行）
-pub const FX_H: f32 = 44.0;
-/// 命令区高度：Excel 的大按钮就是 76 高，命令区从分组顶 +4 开始
+pub const FX_H: f32 = 42.0;
+/// 命令区高度：大按钮 76 高
 pub const GROUP_BODY_H: f32 = 76.0;
-/// 分组名那一行（文字贴底，和 Excel 一样离功能区底边 0~2px）
-pub const GROUP_LABEL_H: f32 = 14.0;
+/// 分组名行高（居中绘制，下方仍留 8px 卡片呼吸边距）
+pub const GROUP_LABEL_H: f32 = 16.0;
 
 thread_local! {
     static GROUP_FIRST: Cell<bool> = const { Cell::new(true) };
@@ -415,18 +414,18 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Light);
 }
 
-/// 一个功能区小组：内容 + 底部组名；组间是一条竖细线（Excel 无外框）
+/// 一个功能区小组：内容 + 底部组名（上下充裕留白，绝不紧贴悬浮卡片边线）
 pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) -> Rect {
     let first = GROUP_FIRST.with(|c| c.replace(false));
     if !first {
-        // Excel 的组是紧挨着的：分隔线画在两组交界处，不额外占宽
+        // 分隔线画在两组交界处，上下收进卡片内留出呼吸感
         let x = ui.cursor().left();
         let y = ui.cursor().top();
         let v = ui.visuals().clone();
         ui.painter().rect_filled(
             egui::Rect::from_min_size(
-                egui::pos2(x, y + crate::tokens::space::GROUP_PAD_TOP),
-                Vec2::new(crate::tokens::stroke::HAIR, GROUP_BODY_H),
+                egui::pos2(x, y + 10.0),
+                Vec2::new(crate::tokens::stroke::HAIR, RIBBON_BODY_H - 20.0),
             ),
             0.0,
             if v.dark_mode {
@@ -438,32 +437,30 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
     }
     let out = ui
         .vertical(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(crate::tokens::space::HAIR, 0.0);
-            // Excel 的命令区从分组顶往下 4px 才开始
-            ui.add_space(crate::tokens::space::GROUP_PAD_TOP);
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+            // 顶部留 6px 呼吸间距，使首行下拉框/大按钮不贴卡片上边线
+            ui.add_space(6.0);
             let row = ui.horizontal_top(|ui| {
-                ui.add_space(crate::tokens::space::GROUP_PAD_X);
+                ui.add_space(8.0);
                 ui.set_height(GROUP_BODY_H);
                 add(ui);
-                ui.allocate_exact_size(
-                    Vec2::new(crate::tokens::space::GROUP_PAD_X, 0.0),
-                    Sense::hover(),
-                );
+                ui.allocate_exact_size(Vec2::new(8.0, 0.0), Sense::hover());
             });
             let w = row.response.rect.width().max(crate::tokens::space::XXXL);
-            // Excel 的组名紧贴功能区底边：4(顶) + 76(命令) + 7(间隙) + 14(字) = 101
-            ui.add_space(crate::tokens::space::GROUP_LABEL_GAP);
-            ui.allocate_ui_with_layout(
-                Vec2::new(w, GROUP_LABEL_H),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    let c = if ui.visuals().dark_mode {
-                        ui.visuals().weak_text_color()
-                    } else {
-                        Color32::from_rgb(89, 89, 89)
-                    };
-                    ui.label(RichText::new(title).size(crate::tokens::text::BODY).color(c));
-                },
+            // 6(顶) + 76(命令) + 4(间隙) + 16(组名居中行) = 102，距 110 高卡片底边留足 8px 白边！
+            ui.add_space(4.0);
+            let (lbl_rect, _) = ui.allocate_exact_size(Vec2::new(w, GROUP_LABEL_H), Sense::hover());
+            let c = if ui.visuals().dark_mode {
+                ui.visuals().weak_text_color()
+            } else {
+                Color32::from_rgb(100, 116, 139)
+            };
+            ui.painter().text(
+                lbl_rect.center(),
+                Align2::CENTER_CENTER,
+                title,
+                FontId::proportional(11.0),
+                c,
             );
         })
         .response;
@@ -484,43 +481,46 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
     group_rect
 }
 
-/// 分组的“对话框启动器”：Excel 在分组右下角的斜箭头
+/// 分组的“对话框启动器”：与底部组名水平居中对齐，离右分隔线与底边线均留出充足边距
 pub fn launcher_at(ui: &mut egui::Ui, group_rect: Rect, id: &str) -> bool {
-    let s = crate::tokens::icon::XS;
+    let s = 14.0;
     let size = Vec2::new(s, s);
-    let rect = Rect::from_min_size(
+    let rect = Rect::from_center_size(
         egui::pos2(
-            group_rect.right() - size.x - crate::tokens::stroke::HAIR,
-            group_rect.bottom() - size.y - crate::tokens::stroke::HAIR,
+            group_rect.right() - 10.0,
+            group_rect.bottom() - GROUP_LABEL_H * 0.5,
         ),
         size,
     );
     let resp = ui.interact(rect, egui::Id::new(("grp_launch", id)), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, HOVER);
+    }
     let c = if resp.hovered() {
-        ACCENT
+        BRAND_NAVY
     } else {
-        Color32::from_rgb(120, 120, 120)
+        Color32::from_rgb(148, 163, 184)
     };
     let p = ui.painter();
-    let st = Stroke::new(1.0, c);
+    let st = Stroke::new(1.1, c);
     p.line_segment(
         [
-            egui::pos2(rect.left() + 3.0, rect.bottom() - 3.0),
-            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+            egui::pos2(rect.left() + 3.5, rect.bottom() - 3.5),
+            egui::pos2(rect.right() - 3.5, rect.top() + 3.5),
         ],
         st,
     );
     p.line_segment(
         [
-            egui::pos2(rect.right() - 6.0, rect.top() + 3.0),
-            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - 7.0, rect.top() + 3.5),
+            egui::pos2(rect.right() - 3.5, rect.top() + 3.5),
         ],
         st,
     );
     p.line_segment(
         [
-            egui::pos2(rect.right() - 3.0, rect.top() + 6.0),
-            egui::pos2(rect.right() - 3.0, rect.top() + 3.0),
+            egui::pos2(rect.right() - 3.5, rect.top() + 7.0),
+            egui::pos2(rect.right() - 3.5, rect.top() + 3.5),
         ],
         st,
     );
@@ -546,23 +546,22 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter()
-        .rect_filled(rect, crate::tokens::radius::MD, bg);
+        ui.painter().rect_filled(rect, 5.0, bg);
     }
-    focus_ring(ui, &resp, rect, 3.0);
+    focus_ring(ui, &resp, rect, 5.0);
     let col = if enabled {
         text_color(&v)
     } else {
         DISABLED
     };
-    let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
+    let icon_size = 30.0_f32.min(size.y - 26.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
+        egui::pos2(rect.center().x, rect.top() + 7.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
     ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
     ui.painter().text(
-        egui::pos2(rect.center().x, rect.bottom() - 7.0),
+        egui::pos2(rect.center().x, rect.bottom() - 12.0),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
@@ -571,7 +570,7 @@ pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Resp
     resp
 }
 
-/// 同上，可指定按钮尺寸（样式组的 66×76 也用 split）
+/// 同上，可指定按钮尺寸（大号拆分/下拉按钮，仅悬停时显现分割细线，消除常态碎线杂乱感）
 pub fn big_sized_split(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -581,16 +580,16 @@ pub fn big_sized_split(
     let v = ui.visuals().clone();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    // Excel 的大 split 是底部一条 12px 的箭头带，不是右侧竖条
     let arrow_rect = Rect::from_min_size(
-        egui::pos2(rect.left(), rect.bottom() - 12.0),
-        Vec2::new(rect.width(), 12.0),
+        egui::pos2(rect.left(), rect.bottom() - 14.0),
+        Vec2::new(rect.width(), 14.0),
     );
     let aresp = ui.interact(
         arrow_rect,
         egui::Id::new(("bigsplit", rect.left().to_bits(), rect.top().to_bits())),
         Sense::click(),
     );
+    let hovered_any = resp.hovered() || aresp.hovered();
     let over_arrow = arrow_rect.contains(resp.hover_pos().unwrap_or(rect.center()));
     let bg = if !enabled {
         Color32::TRANSPARENT
@@ -602,37 +601,39 @@ pub fn big_sized_split(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 3.0, bg);
+        ui.painter().rect_filled(rect, 5.0, bg);
     }
     let col = if enabled {
         text_color(&v)
     } else {
         DISABLED
     };
-    let icon_size = 32.0_f32.min(size.y - 22.0).max(16.0);
+    let icon_size = 28.0_f32.min(size.y - 28.0).max(16.0);
     let icon_rect = Rect::from_center_size(
         egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
     ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
     ui.painter().text(
-        egui::pos2(rect.center().x, rect.bottom() - 22.0),
+        egui::pos2(rect.center().x, rect.bottom() - 21.0),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
         col,
     );
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left() + 2.0, rect.bottom() - 12.0),
-            egui::pos2(rect.right() - 2.0, rect.bottom() - 12.0),
-        ],
-        Stroke::new(1.0, BORDER),
-    );
+    if hovered_any && enabled {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + 4.0, rect.bottom() - 13.5),
+                egui::pos2(rect.right() - 4.0, rect.bottom() - 13.5),
+            ],
+            Stroke::new(1.0, Color32::from_rgb(203, 213, 225)),
+        );
+    }
     caret(
         ui,
-        egui::pos2(rect.center().x, rect.bottom() - 6.0),
-        col,
+        egui::pos2(rect.center().x, rect.bottom() - 7.0),
+        if enabled { Color32::from_rgb(100, 116, 139) } else { DISABLED },
     );
     (resp, aresp)
 }
@@ -973,80 +974,58 @@ pub fn text_toggle(
     resp.on_hover_text(tip)
 }
 
-/// 文件页签常驻绿色文字
+/// Fluent 风格功能区页签：直接浮在 PAGE_BG 上，活动页签用 2.5px 主题绿圆角短横条标记，
+/// 下方命令区独立收为完整四圆角纯白卡片，彻底告别「半灰半白双拼断层框」。
 pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
     let v = ui.visuals().clone();
-    // Excel 365 实测：活动页签的墨量约是非活动的 1.7 倍（真加粗，不是只换颜色）；「文件」入口同样加粗稳住左侧起点
     let font = if active || green {
-        medium_in(ui.ctx(), 12.0)
+        medium_in(ui.ctx(), 12.5)
     } else {
-        FontId::proportional(12.0)
+        FontId::proportional(12.5)
     };
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
-    let size = Vec2::new(galley.size().x + 20.0, TAB_H);
+    let text_w = galley.size().x;
+    let size = Vec2::new(text_w + 20.0, TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    // 悬浮卡片式页签：活动页签是一张上圆角白卡，底边向下延伸 1px 盖掉页签条底部分界线，
-    // 真正和下方的白色命令区融成同一张纸；上/左/右描 1px 细边增加纸张厚度感。
-    if active && !green {
-        let tab_r = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + 3.0),
-            egui::pos2(rect.right(), rect.bottom() + 1.0),
-        );
-        let top_rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-        ui.painter().rect(
-            tab_r,
-            top_rad,
-            Color32::WHITE,
-            Stroke::new(1.0, TABSTRIP_LINE),
-            egui::StrokeKind::Inside,
-        );
-        // 抹掉底边那条 1px 描边，使活动页签与白色命令区无缝贯通
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(tab_r.left() + 1.0, tab_r.bottom() - 1.5),
-                egui::pos2(tab_r.right() - 1.0, tab_r.bottom() + 0.5),
-            ),
-            0.0,
-            Color32::WHITE,
-        );
-    } else if green {
-        let pill = rect.shrink2(Vec2::new(2.0, 5.0));
+    if green {
+        let pill = rect.shrink2(Vec2::new(2.0, 3.0));
         let fill = if resp.hovered() {
-            Color32::from_rgba_unmultiplied(33, 115, 70, 28)
+            Color32::from_rgba_unmultiplied(33, 115, 70, 32)
         } else {
-            Color32::from_rgba_unmultiplied(33, 115, 70, 15)
+            Color32::from_rgba_unmultiplied(33, 115, 70, 18)
         };
         ui.painter().rect_filled(pill, 5.0, fill);
-    } else if resp.hovered() {
+    } else if resp.hovered() && !active {
         ui.painter().rect_filled(
-            rect.shrink2(Vec2::new(2.0, 4.0)),
+            rect.shrink2(Vec2::new(2.0, 3.0)),
             5.0,
-            Color32::from_rgb(228, 226, 224),
+            HOVER_ON_PAGE,
         );
     }
     let col = if green {
         ACCENT
     } else if active {
-        TEXT
+        if v.dark_mode { Color32::WHITE } else { Color32::from_rgb(15, 23, 42) }
     } else if v.dark_mode {
         v.weak_text_color()
     } else {
-        Color32::from_rgb(68, 68, 68)
+        Color32::from_rgb(71, 85, 105)
     };
     if active || green {
-        paint_medium(ui.painter(), rect.center(), Align2::CENTER_CENTER, name, 12.0, col);
+        paint_medium(ui.painter(), rect.center(), Align2::CENTER_CENTER, name, 12.5, col);
     } else {
         ui.painter()
             .text(rect.center(), Align2::CENTER_CENTER, name, font, col);
     }
     if active && !green {
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
-            Vec2::new((rect.width() - 16.0).max(8.0), 2.0),
+        let bar_w = (text_w + 4.0).max(16.0);
+        let bar = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.bottom() - 2.0),
+            Vec2::new(bar_w, 2.6),
         );
-        ui.painter().rect_filled(bar, 1.0, ACCENT);
+        ui.painter().rect_filled(bar, 1.5, ACCENT);
     }
     resp
 }
