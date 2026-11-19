@@ -1,5 +1,6 @@
-LANCell 使用说明
+CELLAN 使用说明
 ================
+Concurrent Engine for Local-first, Lock-free Async Networks
 
 版本：1.70
 
@@ -12,8 +13,8 @@ LANCell 使用说明
 
 使用
 ----
-- 双击 LANCell.exe 即可，免安装、单文件；设置和最近文件写在
-  %LOCALAPPDATA%\LANCell（首次升级会自动迁移旧目录配置），不会在 exe 旁边生成东西。
+- 双击 CELLAN.exe 即可，免安装、单文件；设置和最近文件写在
+  %LOCALAPPDATA%\CELLAN（首次升级会自动迁移旧目录配置），不会在 exe 旁边生成东西。
 - 右上角账户按钮可以修改本机显示名称；协作光标、编辑占用和修订记录都用
   这个名字。默认名带计算机名，避免多人共用 Administrator 时显示成同一个人。
 - 支持 .xlsx / .xlsm / .xls / .csv；保存保持 Excel 兼容格式。
@@ -30,7 +31,7 @@ LANCell 使用说明
 更新（可选）
 ------------
 默认不联网检查更新。要用共享目录自动更新，在
-%LOCALAPPDATA%\LANCell\update.txt 写共享目录路径，并在目录里放
+%LOCALAPPDATA%\CELLAN\update.txt 写共享目录路径，并在目录里放
 manifest.txt（version / exe / sha256 三行）。不配就完全离线。
 
 许可

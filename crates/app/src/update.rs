@@ -7,7 +7,7 @@
 //! manifest.txt 只有三行：
 //! ```text
 //! version=1.70
-//! exe=LANCell-1.70.exe
+//! exe=CELLAN-1.70.exe
 //! sha256=<64 位十六进制>
 //! ```
 //!
@@ -18,7 +18,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 产品正式名称（标题栏、开始页、关于窗口、应用数据目录共用）
-pub const APP_NAME: &str = "LANCell";
+pub const APP_NAME: &str = "CELLAN";
+
+/// 产品英文全称（关于窗口、文档与元数据展示）
+pub const APP_FULL_NAME: &str = "Concurrent Engine for Local-first, Lock-free Async Networks";
 
 /// 当前版本（全应用唯一版本常量：开始页、关于窗口、检查更新、打包元数据共用）。
 pub const VERSION: &str = "1.70";
@@ -30,28 +33,30 @@ pub struct Remote {
     pub sha256: String,
 }
 
-/// 应用级配置目录 `%LOCALAPPDATA%\LANCell`。
-/// 首次升级时若 `%LOCALAPPDATA%\LANCell` 尚未建立而旧目录 `%LOCALAPPDATA%\SheetsNative` 存在，
-/// 自动把已有的配置/最近文件拷贝过来，老用户的显示名与最近列表不丢。
+/// 应用级配置目录 `%LOCALAPPDATA%\CELLAN`。
+/// 首次升级时若 `%LOCALAPPDATA%\CELLAN` 尚未建立，按先后顺序从旧目录 `LANCell` 或 `SheetsNative`
+/// 自动拷贝已有配置与最近文件列表，老用户的显示名与最近记录无缝保留。
 pub fn app_dir_in(base: &Path) -> PathBuf {
     let d = base.join(APP_NAME);
     if !d.exists() {
-        let legacy = base.join("SheetsNative");
         let _ = std::fs::create_dir_all(&d);
-        if legacy.is_dir() {
-            for name in [
-                "ui.ini",
-                "recent.txt",
-                "update.txt",
-                "roots.txt",
-                "fnrecent.txt",
-                "cmdusage.txt",
-                "errorcheck.ini",
-            ] {
-                let src = legacy.join(name);
-                let dst = d.join(name);
-                if src.is_file() && !dst.exists() {
-                    let _ = std::fs::copy(&src, &dst);
+        for legacy_name in ["LANCell", "SheetsNative"] {
+            let legacy = base.join(legacy_name);
+            if legacy.is_dir() {
+                for name in [
+                    "ui.ini",
+                    "recent.txt",
+                    "update.txt",
+                    "roots.txt",
+                    "fnrecent.txt",
+                    "cmdusage.txt",
+                    "errorcheck.ini",
+                ] {
+                    let src = legacy.join(name);
+                    let dst = d.join(name);
+                    if src.is_file() && !dst.exists() {
+                        let _ = std::fs::copy(&src, &dst);
+                    }
                 }
             }
         }
@@ -227,18 +232,22 @@ mod tests {
 
     #[test]
     fn version_matches_cargo_package_and_migrates_legacy_profile() {
-        assert_eq!(APP_NAME, "LANCell");
+        assert_eq!(APP_NAME, "CELLAN");
+        assert_eq!(
+            APP_FULL_NAME,
+            "Concurrent Engine for Local-first, Lock-free Async Networks"
+        );
         let pkg = env!("CARGO_PKG_VERSION");
         assert!(
             pkg.starts_with(&format!("{VERSION}.")),
             "Cargo.toml version ({pkg}) 必须与 update::VERSION ({VERSION}) 对齐"
         );
-        let root = crate::test_env::scratch("lancell-migrate");
+        let root = crate::test_env::scratch("cellan-migrate");
         let legacy = root.join("SheetsNative");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("ui.ini"), "user_name=王五\n").unwrap();
         let migrated = app_dir_in(&root);
-        assert_eq!(migrated, root.join("LANCell"));
+        assert_eq!(migrated, root.join("CELLAN"));
         assert_eq!(
             std::fs::read_to_string(migrated.join("ui.ini")).unwrap(),
             "user_name=王五\n"

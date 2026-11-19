@@ -25,7 +25,7 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let rc_file = out.join("app.rc");
     let res_file = out.join("app.res");
-    // rc 的路径里反斜杠要转义，用正斜杠最稳；同时打入 VERSIONINFO，让资源管理器与任务管理器显示 LANCell 与统一版本号
+    // rc 的路径里反斜杠要转义，用正斜杠最稳；同时打入 VERSIONINFO，让资源管理器与任务管理器显示 CELLAN 与统一版本号
     let ico_arg = ico.display().to_string().replace('\\', "/");
     let pkg_ver = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.70.0".into());
     let parts: Vec<u32> = pkg_ver
@@ -53,12 +53,12 @@ BEGIN\n\
     BEGIN\n\
         BLOCK \"040904b0\"\n\
         BEGIN\n\
-            VALUE \"CompanyName\", \"LANCell\\0\"\n\
-            VALUE \"FileDescription\", \"LANCell\\0\"\n\
+            VALUE \"CompanyName\", \"CELLAN\\0\"\n\
+            VALUE \"FileDescription\", \"CELLAN - Concurrent Engine for Local-first, Lock-free Async Networks\\0\"\n\
             VALUE \"FileVersion\", \"{maj}.{min}.{pat}.0\\0\"\n\
-            VALUE \"InternalName\", \"LANCell\\0\"\n\
-            VALUE \"OriginalFilename\", \"LANCell.exe\\0\"\n\
-            VALUE \"ProductName\", \"LANCell\\0\"\n\
+            VALUE \"InternalName\", \"CELLAN\\0\"\n\
+            VALUE \"OriginalFilename\", \"CELLAN.exe\\0\"\n\
+            VALUE \"ProductName\", \"CELLAN\\0\"\n\
             VALUE \"ProductVersion\", \"{short_ver}\\0\"\n\
         END\n\
     END\n\

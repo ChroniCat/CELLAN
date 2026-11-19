@@ -1,6 +1,6 @@
 //! 最近打开的文件 + 启动页数据。
 //!
-//! 存 `%LOCALAPPDATA%\LANCell\recent.txt`，一行一个路径，新的在上面。
+//! 存 `%LOCALAPPDATA%\CELLAN\recent.txt`，一行一个路径，新的在上面。
 //! 只留能打开得到的：文件被删或网盘断开时自动剔除，免得启动页一堆死链。
 
 use std::path::{Path, PathBuf};
@@ -90,7 +90,7 @@ mod tests {
         let a = d.join("a.xlsx");
         std::fs::write(&a, b"x").unwrap();
         touch(&a);
-        let store = env.profile().join("LANCell").join("recent.txt");
+        let store = env.profile().join("CELLAN").join("recent.txt");
         assert!(
             store.is_file(),
             "recent.txt 必须落在本次运行目录：{}",

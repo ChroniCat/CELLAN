@@ -1,6 +1,6 @@
 //! UI-22.1：命令使用频率。
 //!
-//! 存 `%LOCALAPPDATA%\LANCell\cmdusage.txt`，一行 `action<TAB>count`。
+//! 存 `%LOCALAPPDATA%\CELLAN\cmdusage.txt`，一行 `action<TAB>count`。
 //! 命令搜索结果按「用得多的在前、同频按名字」排，重启后仍然有效。
 
 use std::collections::HashMap;

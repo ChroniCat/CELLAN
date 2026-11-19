@@ -106,8 +106,8 @@ pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
         .rsplit(['\\', '/'])
         .next()
         .filter(|s| !s.is_empty())
-        .unwrap_or("LANCell.exe");
-    let prog_id = "LANCell.Workbook";
+        .unwrap_or("CELLAN.exe");
+    let prog_id = "CELLAN.Workbook";
     let run = |args: &[&str]| -> std::io::Result<()> {
         let out = std::process::Command::new("reg")
             .args(args)
@@ -120,7 +120,7 @@ pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
         Ok(())
     };
     // ProgID：说明这是什么样的文件、用什么命令打开
-    run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}"), "/ve", "/d", "Excel 工作表（LANCell）", "/f"])?;
+    run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}"), "/ve", "/d", "Excel 工作表（CELLAN）", "/f"])?;
     run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}\\DefaultIcon"), "/ve", "/d", &format!("{exe},0"), "/f"])?;
     run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}\\shell\\open\\command"), "/ve", "/d", &format!("\"{exe}\" \"%1\""), "/f"])?;
     // 挂到 .xlsx / .xlsm 上：出现在"打开方式"列表里
@@ -136,7 +136,7 @@ pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
 /// 把 .xlsx 直接指到我们（Windows 10 起系统仍会要求用户确认一次默认应用）
 pub fn set_default(exe: &std::path::Path) -> std::io::Result<()> {
     register_association(exe)?;
-    let prog_id = "LANCell.Workbook";
+    let prog_id = "CELLAN.Workbook";
     for ext in ["xlsx", "xlsm"] {
         let _ = std::process::Command::new("reg")
             .args([

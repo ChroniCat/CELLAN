@@ -18,24 +18,23 @@ pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
 
-/// LANCell 品牌双色：外圈 8 节点深海蓝 + 中心协同核心翡翠绿（取自官方矢量标志）。
+/// CELLAN 品牌双色：外圈 8 节点深海蓝 + 中心协同核心翡翠绿（取自官方矢量标志）。
 pub const BRAND_NAVY: Color32 = Color32::from_rgb(27, 53, 129);
 pub const BRAND_MINT: Color32 = Color32::from_rgb(9, 189, 141);
 
-/// 悬浮卡片：白底 + 1px 边 + 8px 圆角，卡片之间透出 PAGE_BG。
-/// Excel/WPS 的现代外壳都是「灰底白卡」，靠色差和极轻的投影分层，不靠粗边框。
-pub const PAGE_BG: Color32 = Color32::from_rgb(243, 242, 241);
-pub const CARD_BORDER: Color32 = Color32::from_rgb(227, 225, 223);
+/// 悬浮卡片：白底 + 1px 边 + 8px 圆角，卡片之间透出统一冷中性灰蓝 PAGE_BG（与品牌深海蓝/翡翠绿同色温，消除暖褐灰撞色）。
+pub const PAGE_BG: Color32 = Color32::from_rgb(241, 243, 246);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(222, 226, 234);
 /// 卡片顶部页签条：比卡片略深，活动页签的白卡才会「浮」出来
-pub const TABSTRIP_BG: Color32 = Color32::from_rgb(237, 235, 233);
+pub const TABSTRIP_BG: Color32 = Color32::from_rgb(234, 237, 242);
 /// 页签条与白色命令区之间的 1px 分界线（活动页签处留空，让白卡和命令区连成一体）
-pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(227, 225, 223);
-/// 灰底上的悬停色：HOVER(243,242,241) 和 PAGE_BG 几乎同色，放在灰底上等于没有反馈
-pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(234, 232, 230);
+pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(222, 226, 234);
+/// 灰底上的悬停色：与冷灰底拉开明确明度差
+pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(226, 230, 238);
 /// 卡片圆角：功能区/网格 8px，编辑栏 6px
 pub const CARD_R: u8 = 8;
 
-/// 纯矢量绘制 LANCell 品牌标志（240×240 归一化坐标系，任意尺寸亚像素圆角与抗锯齿）。
+/// 纯矢量绘制 CELLAN 品牌标志（240×240 归一化坐标系，任意尺寸亚像素圆角与抗锯齿）。
 /// 结构：3×3 圆角矩阵，外圈 8 格深蓝正交环连，左上独立蓝触点、左下斜向蓝桥接，
 /// 中心翡翠绿核心向右上下伸出双绿触点接入右列节点。
 pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
@@ -174,9 +173,19 @@ pub fn bold_in(ctx: &egui::Context, size: f32) -> FontId {
     }
 }
 
+/// 系统原生 UI 粗体（拉丁走 Segoe UI Bold 700，中文走 Microsoft YaHei UI Bold 700，回退内嵌 Bold）。
+/// 与正文 `Microsoft YaHei UI` + `Segoe UI` 同属一套字族骨架，彻底消除混用思源黑体造成的字面大小跳变。
+pub fn ui_bold_in(ctx: &egui::Context, size: f32) -> FontId {
+    let b = FontId::new(size, FontFamily::Name("ui-bold".into()));
+    if ctx.fonts(|f| f.families().contains(&b.family)) {
+        b
+    } else {
+        bold_in(ctx, size)
+    }
+}
+
 /// 500~600 中黑字重（拉丁走 Segoe UI Semibold 600，中文走 Microsoft YaHei UI）。
-/// 小字号（12~15px）标题/按钮/分组名如果直接上 700 Bold，灰阶抗锯齿会把中文横画糊成黑墨团；
-/// 用 `ui-medium` 字族配合 `paint_medium` 的亚像素微增重，既有商用软件的扎实字重，又保持笔画通透。
+/// 小字号（12~13px）按钮/页签/文件名使用单遍原生渲染，彻底杜绝亚像素双描造成的竖画重影发虚。
 pub fn medium_in(ctx: &egui::Context, size: f32) -> FontId {
     let m = FontId::new(size, FontFamily::Name("ui-medium".into()));
     if ctx.fonts(|f| f.families().contains(&m.family)) {
@@ -186,7 +195,8 @@ pub fn medium_in(ctx: &egui::Context, size: f32) -> FontId {
     }
 }
 
-/// 绘制商用 UI 级 Medium（约 530 字重）文本：拉丁采用真 Semibold，中文叠加 0.36px 轻墨微增重，不糊笔画。
+/// 绘制商用 UI 层级强调文本：17px 及以上大字号主标题走同族真 Bold（`ui-bold`），
+/// 16px 及以下章节标题/按钮/文件名走单遍通透 `ui-medium`（拉丁 Semibold + 雅黑 UI），避免小字号中文粗体笔画粘连。
 pub fn paint_medium(
     painter: &egui::Painter,
     pos: egui::Pos2,
@@ -195,12 +205,71 @@ pub fn paint_medium(
     size: f32,
     col: Color32,
 ) {
-    let font = medium_in(painter.ctx(), size);
-    painter.text(pos, align, text, font.clone(), col);
-    let sub_a = (col.a() as f32 * 0.34).round() as u8;
-    if sub_a > 0 {
-        let sub_col = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), sub_a);
-        painter.text(pos + Vec2::new(0.38, 0.0), align, text, font, sub_col);
+    let font = if size >= 17.0 {
+        ui_bold_in(painter.ctx(), size)
+    } else {
+        medium_in(painter.ctx(), size)
+    };
+    painter.text(pos, align, text, font, col);
+}
+
+/// 统一 1.45px 线性几何图标（0=主页, 1=新建工作簿, 2=打开文件夹），纯单色线条无杂色填充，适配深浅按钮与侧栏。
+pub fn draw_clean_icon(painter: &egui::Painter, rect: Rect, kind: u8, col: Color32) {
+    let s = rect.width().min(rect.height());
+    let sq = Rect::from_center_size(rect.center(), Vec2::splat(s));
+    let px = |u: f32| sq.left() + u * s;
+    let py = |v: f32| sq.top() + v * s;
+    let st = Stroke::new(1.45, col);
+    match kind {
+        0 => {
+            // 主页：对称屋脊 + 墙体 + 门框
+            painter.line_segment([egui::pos2(px(0.14), py(0.48)), egui::pos2(px(0.50), py(0.17))], st);
+            painter.line_segment([egui::pos2(px(0.50), py(0.17)), egui::pos2(px(0.86), py(0.48))], st);
+            painter.line_segment([egui::pos2(px(0.24), py(0.43)), egui::pos2(px(0.24), py(0.84))], st);
+            painter.line_segment([egui::pos2(px(0.76), py(0.43)), egui::pos2(px(0.76), py(0.84))], st);
+            painter.line_segment([egui::pos2(px(0.24), py(0.84)), egui::pos2(px(0.76), py(0.84))], st);
+            painter.line_segment([egui::pos2(px(0.42), py(0.84)), egui::pos2(px(0.42), py(0.58))], st);
+            painter.line_segment([egui::pos2(px(0.42), py(0.58)), egui::pos2(px(0.58), py(0.58))], st);
+            painter.line_segment([egui::pos2(px(0.58), py(0.58)), egui::pos2(px(0.58), py(0.84))], st);
+        }
+        1 => {
+            // 新建工作簿：折角文档 + 居中十字加号
+            let l = px(0.21);
+            let r = px(0.79);
+            let t = py(0.12);
+            let b = py(0.88);
+            let fold = s * 0.21;
+            painter.line_segment([egui::pos2(l, t), egui::pos2(r - fold, t)], st);
+            painter.line_segment([egui::pos2(r - fold, t), egui::pos2(r, t + fold)], st);
+            painter.line_segment([egui::pos2(r, t + fold), egui::pos2(r, b)], st);
+            painter.line_segment([egui::pos2(r, b), egui::pos2(l, b)], st);
+            painter.line_segment([egui::pos2(l, b), egui::pos2(l, t)], st);
+            painter.line_segment([egui::pos2(r - fold, t), egui::pos2(r - fold, t + fold)], st);
+            painter.line_segment([egui::pos2(r - fold, t + fold), egui::pos2(r, t + fold)], st);
+            let cx = px(0.50);
+            let cy = py(0.58);
+            let arm = s * 0.14;
+            painter.line_segment([egui::pos2(cx - arm, cy), egui::pos2(cx + arm, cy)], st);
+            painter.line_segment([egui::pos2(cx, cy - arm), egui::pos2(cx, cy + arm)], st);
+        }
+        _ => {
+            // 打开文件夹：现代平顶耳标文件夹
+            let l = px(0.14);
+            let r = px(0.86);
+            let t = py(0.22);
+            let tab_b = py(0.35);
+            let b = py(0.82);
+            painter.line_segment([egui::pos2(l, t), egui::pos2(px(0.41), t)], st);
+            painter.line_segment([egui::pos2(px(0.41), t), egui::pos2(px(0.49), tab_b)], st);
+            painter.line_segment([egui::pos2(px(0.49), tab_b), egui::pos2(r, tab_b)], st);
+            painter.line_segment([egui::pos2(r, tab_b), egui::pos2(r, b)], st);
+            painter.line_segment([egui::pos2(r, b), egui::pos2(l, b)], st);
+            painter.line_segment([egui::pos2(l, b), egui::pos2(l, t)], st);
+            painter.line_segment(
+                [egui::pos2(l, py(0.44)), egui::pos2(r, py(0.44))],
+                Stroke::new(1.0, col.gamma_multiply(0.55)),
+            );
+        }
     }
 }
 /// 禁用态：Excel 的禁用图标是中性灰 #A6A6A6，比正文浅、比分隔线深

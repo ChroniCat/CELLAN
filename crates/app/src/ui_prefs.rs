@@ -1,4 +1,4 @@
-//! 界面偏好：写在 `%LOCALAPPDATA%\LANCell\ui.ini`。
+//! 界面偏好：写在 `%LOCALAPPDATA%\CELLAN\ui.ini`。
 //!
 //! 和错误检查选项一样是应用级设置（不跟文件走），只放「下次打开还想保持」的开关。
 

@@ -1,6 +1,6 @@
 //! UI-11.4：函数「最近使用」记录。
 //!
-//! 存 `%LOCALAPPDATA%\LANCell\fnrecent.txt`，一行一个函数名，新的在上面。
+//! 存 `%LOCALAPPDATA%\CELLAN\fnrecent.txt`，一行一个函数名，新的在上面。
 //! 只有真的在公式里用过的函数才进榜（Excel「最近使用的函数」同款语义），
 //! XML 里那五项只在还没有任何记录时兜底，免得菜单一开始是空的。
 
@@ -109,7 +109,7 @@ mod tests {
     fn store_lives_under_isolated_profile() {
         let env = TestEnv::new("fnrecent-store");
         record("AVERAGE");
-        let store = env.profile().join("LANCell").join("fnrecent.txt");
+        let store = env.profile().join("CELLAN").join("fnrecent.txt");
         assert!(store.is_file(), "fnrecent.txt 必须落在本次运行目录");
         assert!(std::fs::read_to_string(&store).unwrap().contains("AVERAGE"));
     }

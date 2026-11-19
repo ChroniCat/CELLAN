@@ -1,7 +1,8 @@
 [package]
 name = "sheetcore"
-version = "0.1.0"
+version = "1.70.0"
 edition = "2024"
+description = "CELLAN Core Spreadsheet & Peer Sync Engine"
 
 [lib]
 name = "sheetcore"

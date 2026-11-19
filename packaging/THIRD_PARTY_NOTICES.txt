@@ -1,12 +1,13 @@
-LANCell 第三方组件与字体许可声明
+CELLAN 第三方组件与字体许可声明
 ================================
+Concurrent Engine for Local-first, Lock-free Async Networks
 
 本程序是内部使用的表格工具，二进制中链接/内嵌了以下开源组件。
 分发本程序时请保留本文件。
 
 一、内嵌字体（SIL Open Font License 1.1）
 ----------------------------------------
-The following font subsets are embedded in LANCell:
+The following font subsets are embedded in CELLAN:
   - Noto Sans SC (subset) — (c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
   - Noto Serif SC (subset) — (c) 2017-2024 Adobe (http://www.adobe.com/).
   - Inter (subset) — Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
