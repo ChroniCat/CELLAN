@@ -75,8 +75,7 @@ fn read_dir_entries(path: &Path) -> Option<Vec<Entry>> {
 }
 
 fn roots_store() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join("SheetsNative").join("roots.txt")
+    crate::update::app_dir().join("roots.txt")
 }
 
 fn load_roots() -> Vec<PathBuf> {

@@ -1,4 +1,4 @@
-//! 错误检查选项的持久化：写在 `%LOCALAPPDATA%\SheetsNative\errorcheck.ini`。
+//! 错误检查选项的持久化：写在 `%LOCALAPPDATA%\LANCell\errorcheck.ini`。
 //!
 //! 和 Excel 一样是「应用级」设置（不是跟文件走）：背景检查开关、标记颜色、规则开关。
 
@@ -26,8 +26,7 @@ impl Default for ErrorCheckOptions {
 }
 
 fn path() -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
-    Some(std::path::Path::new(&base).join("SheetsNative").join("errorcheck.ini"))
+    Some(crate::update::app_dir_opt()?.join("errorcheck.ini"))
 }
 
 impl ErrorCheckOptions {
@@ -98,7 +97,7 @@ mod tests {
         assert!(back.check_errors);
         assert!(!back.check_text);
         assert_eq!(back.color, [200, 0, 0]);
-        let file = env.profile().join("SheetsNative").join("errorcheck.ini");
+        let file = env.profile().join("LANCell").join("errorcheck.ini");
         assert!(file.is_file(), "选项必须写在隔离 profile 下：{}", file.display());
     }
 }

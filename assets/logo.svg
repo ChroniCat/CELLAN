@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <!-- LANCell Official Vector Brand Logo -->
+  <g fill="#09BD8D" stroke="#09BD8D" stroke-linecap="round">
+    <line x1="136" y1="104" x2="190" y2="50" stroke-width="8.4"/>
+    <line x1="136" y1="136" x2="190" y2="190" stroke-width="8.4"/>
+    <circle cx="163" cy="77" r="10.4" stroke="none"/>
+    <circle cx="163" cy="163" r="10.4" stroke="none"/>
+    <rect x="86" y="86" width="68" height="68" rx="13.5" ry="13.5" stroke="none"/>
+  </g>
+  <g fill="#1B3581" stroke="#1B3581" stroke-linecap="round">
+    <line x1="34" y1="34" x2="206" y2="34" stroke-width="8.2" stroke-linecap="butt"/>
+    <line x1="34" y1="206" x2="206" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
+    <line x1="34" y1="34" x2="34" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
+    <line x1="206" y1="34" x2="206" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
+    <line x1="50" y1="50" x2="77" y2="77" stroke-width="8.4"/>
+    <line x1="50" y1="136" x2="104" y2="190" stroke-width="8.4"/>
+    <circle cx="77" cy="77" r="10.4" stroke="none"/>
+    <circle cx="77" cy="163" r="10.4" stroke="none"/>
+  </g>
+  <g fill="#1B3581">
+    <rect x="0" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="86" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="172" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="0" y="86" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="172" y="86" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="0" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="86" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
+    <rect x="172" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
+  </g>
+</svg>

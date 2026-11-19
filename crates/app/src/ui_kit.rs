@@ -18,16 +18,104 @@ pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
 
+/// LANCell 品牌双色：外圈 8 节点深海蓝 + 中心协同核心翡翠绿（取自官方矢量标志）。
+pub const BRAND_NAVY: Color32 = Color32::from_rgb(27, 53, 129);
+pub const BRAND_MINT: Color32 = Color32::from_rgb(9, 189, 141);
+
 /// 悬浮卡片：白底 + 1px 边 + 8px 圆角，卡片之间透出 PAGE_BG。
 /// Excel/WPS 的现代外壳都是「灰底白卡」，靠色差和极轻的投影分层，不靠粗边框。
 pub const PAGE_BG: Color32 = Color32::from_rgb(243, 242, 241);
 pub const CARD_BORDER: Color32 = Color32::from_rgb(227, 225, 223);
 /// 卡片顶部页签条：比卡片略深，活动页签的白卡才会「浮」出来
 pub const TABSTRIP_BG: Color32 = Color32::from_rgb(237, 235, 233);
+/// 页签条与白色命令区之间的 1px 分界线（活动页签处留空，让白卡和命令区连成一体）
+pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(227, 225, 223);
 /// 灰底上的悬停色：HOVER(243,242,241) 和 PAGE_BG 几乎同色，放在灰底上等于没有反馈
 pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(234, 232, 230);
 /// 卡片圆角：功能区/网格 8px，编辑栏 6px
 pub const CARD_R: u8 = 8;
+
+/// 纯矢量绘制 LANCell 品牌标志（240×240 归一化坐标系，任意尺寸亚像素圆角与抗锯齿）。
+/// 结构：3×3 圆角矩阵，外圈 8 格深蓝正交环连，左上独立蓝触点、左下斜向蓝桥接，
+/// 中心翡翠绿核心向右上下伸出双绿触点接入右列节点。
+pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
+    let side = rect.width().min(rect.height());
+    if side < 6.0 {
+        return;
+    }
+    let sq = Rect::from_center_size(rect.center(), Vec2::splat(side));
+    let tx = |x: f32| sq.left() + x / 240.0 * side;
+    let ty = |y: f32| sq.top() + y / 240.0 * side;
+    let ts = |v: f32| v / 240.0 * side;
+
+    // 22~28px 小尺寸下略增连线墨量，避免亚像素笔画变淡
+    let boost = if side <= 24.0 { 1.22 } else if side <= 32.0 { 1.10 } else { 1.0 };
+    let w_orth = ts(8.2 * boost).max(1.1);
+    let w_diag = ts(8.4 * boost).max(1.15);
+    let r_node = ts(10.4 * if side <= 24.0 { 1.10 } else { 1.0 }).max(1.35);
+    let r_cell = ts(13.5);
+
+    let fill_rrect = |p: &egui::Painter, x0: f32, y0: f32, w: f32, h: f32, r: f32, col: Color32| {
+        let rx = r.min(w * 0.45).min(h * 0.45);
+        let corners = [
+            (x0 + w - rx, y0 + rx, -std::f32::consts::FRAC_PI_2),
+            (x0 + w - rx, y0 + h - rx, 0.0),
+            (x0 + rx, y0 + h - rx, std::f32::consts::FRAC_PI_2),
+            (x0 + rx, y0 + rx, std::f32::consts::PI),
+        ];
+        const SEG: usize = 5;
+        let mut pts = Vec::with_capacity(4 * (SEG + 1));
+        for (cx, cy, a0) in corners {
+            for k in 0..=SEG {
+                let a = a0 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                pts.push(egui::pos2(cx + rx * a.cos(), cy + rx * a.sin()));
+            }
+        }
+        p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+    };
+
+    // 1. 中心翡翠绿斜向双触点与核心格（先画，使右上下斜线自然藏入右列深蓝圆角格底下）
+    let st_green = Stroke::new(w_diag, BRAND_MINT);
+    painter.line_segment([egui::pos2(tx(136.0), ty(104.0)), egui::pos2(tx(190.0), ty(50.0))], st_green);
+    painter.line_segment([egui::pos2(tx(136.0), ty(136.0)), egui::pos2(tx(190.0), ty(190.0))], st_green);
+    painter.circle_filled(egui::pos2(tx(163.0), ty(77.0)), r_node, BRAND_MINT);
+    painter.circle_filled(egui::pos2(tx(163.0), ty(163.0)), r_node, BRAND_MINT);
+    fill_rrect(painter, tx(86.0), ty(86.0), ts(68.0), ts(68.0), r_cell, BRAND_MINT);
+
+    // 2. 外圈正交蓝桥 + 左上触点 + 左下斜桥
+    let st_orth = Stroke::new(w_orth, BRAND_NAVY);
+    let st_diag = Stroke::new(w_diag, BRAND_NAVY);
+    for (x1, y1, x2, y2) in [
+        (34.0, 34.0, 206.0, 34.0),
+        (34.0, 206.0, 206.0, 206.0),
+        (34.0, 34.0, 34.0, 206.0),
+        (206.0, 34.0, 206.0, 206.0),
+    ] {
+        painter.line_segment([egui::pos2(tx(x1), ty(y1)), egui::pos2(tx(x2), ty(y2))], st_orth);
+    }
+    painter.line_segment([egui::pos2(tx(50.0), ty(50.0)), egui::pos2(tx(77.0), ty(77.0))], st_diag);
+    painter.line_segment([egui::pos2(tx(50.0), ty(136.0)), egui::pos2(tx(104.0), ty(190.0))], st_diag);
+    painter.circle_filled(egui::pos2(tx(77.0), ty(77.0)), r_node, BRAND_NAVY);
+    painter.circle_filled(egui::pos2(tx(77.0), ty(163.0)), r_node, BRAND_NAVY);
+
+    // 3. 外圈 8 枚深蓝圆角单元
+    for r in 0..3 {
+        for c in 0..3 {
+            if (r, c) == (1, 1) {
+                continue;
+            }
+            fill_rrect(
+                painter,
+                tx(c as f32 * 86.0),
+                ty(r as f32 * 86.0),
+                ts(68.0),
+                ts(68.0),
+                r_cell,
+                BRAND_NAVY,
+            );
+        }
+    }
+}
 
 /// 把一块已经画满（直角）的区域收成圆角卡片：四角先用页面底色「抠」掉，再描 1px 边。
 /// egui 的裁切只有矩形，网格、表头、滚动条又各自直角铺色，只能事后盖住四个角。
@@ -74,6 +162,16 @@ pub const T_SMALL: f32 = 11.0;
 /// 这也是「界面没有层次」的直接原因。
 pub fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("default-bold".into()))
+}
+
+/// 单测若直接构造裸 `egui::Context::default()`（未调用 `install_fonts`），回落到 Proportional，避免缺失字族 panic。
+pub fn bold_in(ctx: &egui::Context, size: f32) -> FontId {
+    let b = bold(size);
+    if ctx.fonts(|f| f.families().contains(&b.family)) {
+        b
+    } else {
+        FontId::proportional(size)
+    }
 }
 /// 禁用态：Excel 的禁用图标是中性灰 #A6A6A6，比正文浅、比分隔线深
 pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
@@ -168,17 +266,17 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.widgets.inactive.weak_bg_fill = Color32::WHITE;
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(171, 169, 167));
         v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
         v.widgets.hovered.bg_fill = Color32::from_rgb(237, 235, 233);
         v.widgets.hovered.weak_bg_fill = HOVER;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(140, 138, 136));
         v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
         v.widgets.active.bg_fill = Color32::from_rgb(225, 223, 221);
         v.widgets.active.weak_bg_fill = PRESSED;
         v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
         v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.active.corner_radius = egui::CornerRadius::same(2);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(4);
         v.widgets.open = v.widgets.active;
         v.selection.bg_fill = Color32::from_rgb(204, 228, 215);
         v.selection.stroke = Stroke::new(1.0, ACCENT);
@@ -779,9 +877,9 @@ pub fn text_toggle(
 /// 文件页签常驻绿色文字
 pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
     let v = ui.visuals().clone();
-    // Excel 365 实测：活动页签的墨量约是非活动的 1.7 倍（真加粗，不是只换颜色）
-    let font = if active {
-        bold(12.0)
+    // Excel 365 实测：活动页签的墨量约是非活动的 1.7 倍（真加粗，不是只换颜色）；「文件」入口同样加粗稳住左侧起点
+    let font = if active || green {
+        bold_in(ui.ctx(), 12.0)
     } else {
         FontId::proportional(12.0)
     };
@@ -790,20 +888,43 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
     let size = Vec2::new(galley.size().x + 20.0, TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    // 悬浮卡片式页签：活动页签是一张白卡，只圆上面两角，底边和命令区连成一片；
-    // 页签条本身是浅灰，白卡才有「浮起来」的层次。绿线仍然是 Excel 的活动标记。
+    // 悬浮卡片式页签：活动页签是一张上圆角白卡，底边向下延伸 1px 盖掉页签条底部分界线，
+    // 真正和下方的白色命令区融成同一张纸；上/左/右描 1px 细边增加纸张厚度感。
     if active && !green {
+        let tab_r = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 3.0),
+            egui::pos2(rect.right(), rect.bottom() + 1.0),
+        );
+        let top_rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+        ui.painter().rect(
+            tab_r,
+            top_rad,
+            Color32::WHITE,
+            Stroke::new(1.0, TABSTRIP_LINE),
+            egui::StrokeKind::Inside,
+        );
+        // 抹掉底边那条 1px 描边，使活动页签与白色命令区无缝贯通
         ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
+            egui::Rect::from_min_max(
+                egui::pos2(tab_r.left() + 1.0, tab_r.bottom() - 1.5),
+                egui::pos2(tab_r.right() - 1.0, tab_r.bottom() + 0.5),
+            ),
+            0.0,
             Color32::WHITE,
         );
-    }
-    if resp.hovered() && !active {
+    } else if green {
+        let pill = rect.shrink2(Vec2::new(2.0, 5.0));
+        let fill = if resp.hovered() {
+            Color32::from_rgba_unmultiplied(33, 115, 70, 28)
+        } else {
+            Color32::from_rgba_unmultiplied(33, 115, 70, 15)
+        };
+        ui.painter().rect_filled(pill, 5.0, fill);
+    } else if resp.hovered() {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 4.0)),
-            6.0,
-            HOVER_ON_PAGE,
+            5.0,
+            Color32::from_rgb(228, 226, 224),
         );
     }
     let col = if green {
@@ -817,12 +938,12 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
     };
     ui.painter()
         .text(rect.center(), Align2::CENTER_CENTER, name, font, col);
-    if active {
+    if active && !green {
         let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.bottom() - 2.0),
-            Vec2::new(rect.width(), 2.0),
+            egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
+            Vec2::new((rect.width() - 16.0).max(8.0), 2.0),
         );
-        ui.painter().rect_filled(bar, 0.0, ACCENT);
+        ui.painter().rect_filled(bar, 1.0, ACCENT);
     }
     resp
 }
@@ -1423,13 +1544,13 @@ impl Dlg {
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(Color32::WHITE)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(4.0)
+                    .stroke(Stroke::new(1.0, CARD_BORDER))
+                    .corner_radius(8.0)
                     .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 18,
+                        offset: [0, 6],
+                        blur: 20,
                         spread: 0,
-                        color: Color32::from_black_alpha(32),
+                        color: Color32::from_black_alpha(28),
                     })
                     .inner_margin(egui::Margin::same(0));
                 let fr = frame
@@ -1438,35 +1559,35 @@ impl Dlg {
                         // 标题栏
                         // 标题栏只用来拖动，不该占 Tab 焦点
                         let (trect, tresp) = ui.allocate_exact_size(
-                            egui::vec2(w, 30.0),
+                            egui::vec2(w, 34.0),
                             drag_only_sense(),
                         );
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
                                 trect.min,
-                                egui::vec2(w, 30.0),
+                                egui::vec2(w, 34.0),
                             ),
-                            0.0,
-                            Color32::WHITE,
+                            egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
+                            Color32::from_rgb(250, 249, 248),
                         );
                         ui.painter().line_segment(
                             [
-                                egui::pos2(trect.left(), trect.bottom() - 0.5),
-                                egui::pos2(trect.right(), trect.bottom() - 0.5),
+                                egui::pos2(trect.left() + 1.0, trect.bottom() - 0.5),
+                                egui::pos2(trect.right() - 1.0, trect.bottom() - 0.5),
                             ],
-                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(225, 223, 221)),
+                            Stroke::new(1.0 / ctx.pixels_per_point(), CARD_BORDER),
                         );
                         ui.painter().text(
-                            egui::pos2(trect.left() + 12.0, trect.center().y),
+                            egui::pos2(trect.left() + 14.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &self.title,
-                            FontId::proportional(12.0),
+                            bold_in(ctx, 12.0),
                             TEXT,
                         );
                         // 关闭按钮
                         let crect = egui::Rect::from_min_size(
                             egui::pos2(trect.right() - 46.0, trect.top()),
-                            egui::vec2(46.0, 30.0),
+                            egui::vec2(46.0, 34.0),
                         );
                         let cresp = ui.interact(
                             crect,
@@ -1474,8 +1595,11 @@ impl Dlg {
                             egui::Sense::click(),
                         );
                         if cresp.hovered() {
-                            ui.painter()
-                                .rect_filled(crect, 0.0, Color32::from_rgb(232, 17, 35));
+                            ui.painter().rect_filled(
+                                crect,
+                                egui::CornerRadius { nw: 0, ne: 8, sw: 0, se: 0 },
+                                Color32::from_rgb(196, 43, 28),
+                            );
                         }
                         let cc = cresp.hovered().then_some(Color32::WHITE).unwrap_or(TEXT);
                         let k = 4.5;

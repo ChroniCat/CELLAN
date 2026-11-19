@@ -102,7 +102,12 @@ pub fn claim(
 /// 注册为 .xlsx 的打开方式（当前用户，不需要管理员）
 pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
     let exe = exe.display().to_string();
-    let prog_id = "SheetFlow.Native.Sheet";
+    let exe_name = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("LANCell.exe");
+    let prog_id = "LANCell.Workbook";
     let run = |args: &[&str]| -> std::io::Result<()> {
         let out = std::process::Command::new("reg")
             .args(args)
@@ -115,13 +120,13 @@ pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
         Ok(())
     };
     // ProgID：说明这是什么样的文件、用什么命令打开
-    run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}"), "/ve", "/d", "Excel 工作表（Sheets Native）", "/f"])?;
+    run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}"), "/ve", "/d", "Excel 工作表（LANCell）", "/f"])?;
     run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}\\DefaultIcon"), "/ve", "/d", &format!("{exe},0"), "/f"])?;
     run(&["add", &format!("HKCU\\Software\\Classes\\{prog_id}\\shell\\open\\command"), "/ve", "/d", &format!("\"{exe}\" \"%1\""), "/f"])?;
     // 挂到 .xlsx / .xlsm 上：出现在"打开方式"列表里
     for ext in ["xlsx", "xlsm"] {
         run(&["add", &format!("HKCU\\Software\\Classes\\.{ext}\\OpenWithProgids"), "/v", prog_id, "/t", "REG_NONE", "/d", "", "/f"])?;
-        run(&["add", &format!("HKCU\\Software\\Classes\\Applications\\app.exe\\shell\\open\\command"), "/ve", "/d", &format!("\"{exe}\" \"%1\""), "/f"])?;
+        run(&["add", &format!("HKCU\\Software\\Classes\\Applications\\{exe_name}\\shell\\open\\command"), "/ve", "/d", &format!("\"{exe}\" \"%1\""), "/f"])?;
     }
     // 让资源管理器立刻认到新关联
     let _ = std::process::Command::new("ie4uinit.exe").arg("-show").spawn();
@@ -131,7 +136,7 @@ pub fn register_association(exe: &std::path::Path) -> std::io::Result<()> {
 /// 把 .xlsx 直接指到我们（Windows 10 起系统仍会要求用户确认一次默认应用）
 pub fn set_default(exe: &std::path::Path) -> std::io::Result<()> {
     register_association(exe)?;
-    let prog_id = "SheetFlow.Native.Sheet";
+    let prog_id = "LANCell.Workbook";
     for ext in ["xlsx", "xlsm"] {
         let _ = std::process::Command::new("reg")
             .args([

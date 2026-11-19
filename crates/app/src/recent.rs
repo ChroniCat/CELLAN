@@ -1,6 +1,6 @@
 //! 最近打开的文件 + 启动页数据。
 //!
-//! 存 `%LOCALAPPDATA%\SheetsNative\recent.txt`，一行一个路径，新的在上面。
+//! 存 `%LOCALAPPDATA%\LANCell\recent.txt`，一行一个路径，新的在上面。
 //! 只留能打开得到的：文件被删或网盘断开时自动剔除，免得启动页一堆死链。
 
 use std::path::{Path, PathBuf};
@@ -8,10 +8,7 @@ use std::path::{Path, PathBuf};
 pub const MAX: usize = 12;
 
 fn store() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    let d = PathBuf::from(base).join("SheetsNative");
-    let _ = std::fs::create_dir_all(&d);
-    d.join("recent.txt")
+    crate::update::app_dir().join("recent.txt")
 }
 
 pub fn load() -> Vec<PathBuf> {
@@ -93,7 +90,7 @@ mod tests {
         let a = d.join("a.xlsx");
         std::fs::write(&a, b"x").unwrap();
         touch(&a);
-        let store = env.profile().join("SheetsNative").join("recent.txt");
+        let store = env.profile().join("LANCell").join("recent.txt");
         assert!(
             store.is_file(),
             "recent.txt 必须落在本次运行目录：{}",

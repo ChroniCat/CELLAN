@@ -1,4 +1,4 @@
-//! 界面偏好：写在 `%LOCALAPPDATA%\SheetsNative\ui.ini`。
+//! 界面偏好：写在 `%LOCALAPPDATA%\LANCell\ui.ini`。
 //!
 //! 和错误检查选项一样是应用级设置（不跟文件走），只放「下次打开还想保持」的开关。
 
@@ -44,8 +44,7 @@ impl Default for UiPrefs {
 }
 
 fn path() -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
-    Some(std::path::Path::new(&base).join("SheetsNative").join("ui.ini"))
+    Some(crate::update::app_dir_opt()?.join("ui.ini"))
 }
 
 impl UiPrefs {
@@ -154,7 +153,6 @@ pub struct SavedView {
 }
 
 fn views_path(key: &str) -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
     // 文件名用「路径的十六进制摘要」，避免中文/空格/超长路径出问题
     let mut h: u64 = 1469598103934665603;
     for b in key.as_bytes() {
@@ -162,8 +160,7 @@ fn views_path(key: &str) -> Option<std::path::PathBuf> {
         h = h.wrapping_mul(1099511628211);
     }
     Some(
-        std::path::Path::new(&base)
-            .join("SheetsNative")
+        crate::update::app_dir_opt()?
             .join("views")
             .join(format!("{h:016x}.ini")),
     )

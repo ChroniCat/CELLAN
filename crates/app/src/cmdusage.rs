@@ -1,16 +1,13 @@
 //! UI-22.1：命令使用频率。
 //!
-//! 存 `%LOCALAPPDATA%\SheetsNative\cmdusage.txt`，一行 `action<TAB>count`。
+//! 存 `%LOCALAPPDATA%\LANCell\cmdusage.txt`，一行 `action<TAB>count`。
 //! 命令搜索结果按「用得多的在前、同频按名字」排，重启后仍然有效。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn store() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    let d = PathBuf::from(base).join("SheetsNative");
-    let _ = std::fs::create_dir_all(&d);
-    d.join("cmdusage.txt")
+    crate::update::app_dir().join("cmdusage.txt")
 }
 
 /// 读取 action → 次数；坏行直接跳过，不让统计文件把命令面板弄坏。

@@ -6,8 +6,8 @@
 //!
 //! manifest.txt 只有三行：
 //! ```text
-//! version=1.38
-//! exe=SheetsNative-1.38.exe
+//! version=1.70
+//! exe=LANCell-1.70.exe
 //! sha256=<64 位十六进制>
 //! ```
 //!
@@ -17,8 +17,11 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 当前版本。发版时改这里 + 共享目录里的 manifest。
-pub const VERSION: &str = "1.40";
+/// 产品正式名称（标题栏、开始页、关于窗口、应用数据目录共用）
+pub const APP_NAME: &str = "LANCell";
+
+/// 当前版本（全应用唯一版本常量：开始页、关于窗口、检查更新、打包元数据共用）。
+pub const VERSION: &str = "1.70";
 
 #[derive(Clone, Debug)]
 pub struct Remote {
@@ -27,11 +30,45 @@ pub struct Remote {
     pub sha256: String,
 }
 
-fn app_dir() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    let d = PathBuf::from(base).join("SheetsNative");
-    let _ = std::fs::create_dir_all(&d);
+/// 应用级配置目录 `%LOCALAPPDATA%\LANCell`。
+/// 首次升级时若 `%LOCALAPPDATA%\LANCell` 尚未建立而旧目录 `%LOCALAPPDATA%\SheetsNative` 存在，
+/// 自动把已有的配置/最近文件拷贝过来，老用户的显示名与最近列表不丢。
+pub fn app_dir_in(base: &Path) -> PathBuf {
+    let d = base.join(APP_NAME);
+    if !d.exists() {
+        let legacy = base.join("SheetsNative");
+        let _ = std::fs::create_dir_all(&d);
+        if legacy.is_dir() {
+            for name in [
+                "ui.ini",
+                "recent.txt",
+                "update.txt",
+                "roots.txt",
+                "fnrecent.txt",
+                "cmdusage.txt",
+                "errorcheck.ini",
+            ] {
+                let src = legacy.join(name);
+                let dst = d.join(name);
+                if src.is_file() && !dst.exists() {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
+    } else {
+        let _ = std::fs::create_dir_all(&d);
+    }
     d
+}
+
+pub fn app_dir() -> PathBuf {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+    app_dir_in(Path::new(&base))
+}
+
+pub fn app_dir_opt() -> Option<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(app_dir_in(Path::new(&base)))
 }
 
 fn settings() -> PathBuf {
@@ -186,5 +223,26 @@ mod tests {
         let (v, e, s) = parse_manifest(text).unwrap();
         assert_eq!((v.as_str(), e.as_str(), s.as_str()), ("1.38", "a.exe", "abc123"));
         assert!(parse_manifest("version=1.0").is_none(), "缺字段应当拒绝");
+    }
+
+    #[test]
+    fn version_matches_cargo_package_and_migrates_legacy_profile() {
+        assert_eq!(APP_NAME, "LANCell");
+        let pkg = env!("CARGO_PKG_VERSION");
+        assert!(
+            pkg.starts_with(&format!("{VERSION}.")),
+            "Cargo.toml version ({pkg}) 必须与 update::VERSION ({VERSION}) 对齐"
+        );
+        let root = crate::test_env::scratch("lancell-migrate");
+        let legacy = root.join("SheetsNative");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("ui.ini"), "user_name=王五\n").unwrap();
+        let migrated = app_dir_in(&root);
+        assert_eq!(migrated, root.join("LANCell"));
+        assert_eq!(
+            std::fs::read_to_string(migrated.join("ui.ini")).unwrap(),
+            "user_name=王五\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

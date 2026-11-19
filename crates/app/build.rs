@@ -25,9 +25,50 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let rc_file = out.join("app.rc");
     let res_file = out.join("app.res");
-    // rc 的路径里反斜杠要转义，用正斜杠最稳
+    // rc 的路径里反斜杠要转义，用正斜杠最稳；同时打入 VERSIONINFO，让资源管理器与任务管理器显示 LANCell 与统一版本号
     let ico_arg = ico.display().to_string().replace('\\', "/");
-    if std::fs::write(&rc_file, format!("1 ICON \"{ico_arg}\"\n")).is_err() {
+    let pkg_ver = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.70.0".into());
+    let parts: Vec<u32> = pkg_ver
+        .split('.')
+        .filter_map(|x| x.parse::<u32>().ok())
+        .collect();
+    let (maj, min, pat) = (
+        parts.first().copied().unwrap_or(1),
+        parts.get(1).copied().unwrap_or(70),
+        parts.get(2).copied().unwrap_or(0),
+    );
+    let short_ver = format!("{maj}.{min}");
+    let rc_body = format!(
+        "1 ICON \"{ico_arg}\"\n\
+1 VERSIONINFO\n\
+FILEVERSION {maj},{min},{pat},0\n\
+PRODUCTVERSION {maj},{min},{pat},0\n\
+FILEFLAGSMASK 0x3fL\n\
+FILEFLAGS 0x0L\n\
+FILEOS 0x40004L\n\
+FILETYPE 0x1L\n\
+FILESUBTYPE 0x0L\n\
+BEGIN\n\
+    BLOCK \"StringFileInfo\"\n\
+    BEGIN\n\
+        BLOCK \"040904b0\"\n\
+        BEGIN\n\
+            VALUE \"CompanyName\", \"LANCell\\0\"\n\
+            VALUE \"FileDescription\", \"LANCell\\0\"\n\
+            VALUE \"FileVersion\", \"{maj}.{min}.{pat}.0\\0\"\n\
+            VALUE \"InternalName\", \"LANCell\\0\"\n\
+            VALUE \"OriginalFilename\", \"LANCell.exe\\0\"\n\
+            VALUE \"ProductName\", \"LANCell\\0\"\n\
+            VALUE \"ProductVersion\", \"{short_ver}\\0\"\n\
+        END\n\
+    END\n\
+    BLOCK \"VarFileInfo\"\n\
+    BEGIN\n\
+        VALUE \"Translation\", 0x409, 1200\n\
+    END\n\
+END\n"
+    );
+    if std::fs::write(&rc_file, rc_body).is_err() {
         return;
     }
     let status = Command::new(&rc)
