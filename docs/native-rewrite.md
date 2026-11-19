@@ -3201,3 +3201,17 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 - **版本号**：`update::VERSION` 由 `1.37` 改为 `1.40`，与本文档最新发布号一致；开始页/标题栏/关于框读的都是这一个常量。
 
 **验收**：`cargo test -p app --test ui_regression` **20 passed / 0 failed**（133.86s）；`templates::tests::every_template_builds_and_recalcs` 通过；`every_ribbon_image_resolves_to_an_icon` 通过；1440/1920 截图 `work/uiaudit/final2_1440.png`、`final2_1920.png`、开始页 `home10.png`；无界面钩子 `SC_HOME_TEMPLATE=1`（直接建模板）、`SC_HOME_QUERY=qa041`（预置搜索）可复现。
+
+### 第五十六轮：悬浮卡片外壳收尾（2026-11-19）
+
+目标：把上一轮只做了一半的「灰底白卡」外壳做完——之前只有功能区和编辑栏是卡片，网格、工作表标签条、状态栏还是贴边铺满，上下两套语言。
+
+- **网格卡片**：`CentralPanel` 底色改 `PAGE_BG`，网格（含表头、滚动条）画进左右各缩 6px、下留 2px 的子 ui；画完由新增的 `ui_kit::card_outline` 用页面底色「抠」掉四个 8px 圆角并描 1px `CARD_BORDER`。egui 只有矩形裁切，网格/表头/滚动条各自直角铺色，只能事后盖角。开始页仍是无边框白底，不受影响。
+- **工作表标签条 / 状态栏**：底色 `STATUS_BG` → `PAGE_BG`，去掉手画的上边线；活动工作表标签改成上下各留 3px 的 5px 圆角白卡 + 1px 卡片边 + 底部内缩 2px 绿线，有颜色的标签同样收成圆角块（活动时加 1.5px 绿描边）。命中区域仍是整格。
+- **面板分隔线**：`doctabs / ribbon / formula / tabs / statusbar` 全部 `.show_separator_line(false)`。egui 默认的面板分隔线会横穿卡片之间那条 6px 灰缝，上一轮截图 `card2_fx.png` 里就能看到。
+- **多文档标签条**：底色统一用 `PAGE_BG`，去掉底边线，和下面的功能区卡片同处一层灰底。
+- **灰底悬停色**：`HOVER(243,242,241)` 与 `PAGE_BG` 几乎同色，放在灰底上等于没有悬停反馈；新增 `HOVER_ON_PAGE(234,232,230)`，用于工作表标签、标签滚动按钮、新建工作表「+」、状态栏按钮和功能区页签。
+- **1440 功能区回退修复**：卡片四周留白让命令区窄了 30px（avail 1416 → 1386），最后一组「加载项」(58px) 被挤进「更多」。原因是为「更多 ▾」预留的 60pt 对最后一组也生效——最后一组后面没有东西可折叠，不需要预留。改为只在还有后续组时预留，1440 下 8 组完整显示（used 1314 + 58 = 1372 ≤ 1386）。
+- **「▾」方块字**：内嵌字体子集没有 U+25BE，「加载项 ▾」「更多 ▾」一直显示成「□」。改成 `menu_chevron`：文字后留空，手画与「单元格样式」下拉同款的 V 形箭头。
+
+**验收**：`cargo test -p app --no-default-features --features glow` 单测 **403 passed / 0 failed / 1 ignored**，`ui_regression` **20 passed / 0 failed**（102s）；截图 `work/uiaudit/r56/card4_1440.png`、`card4_1920.png`、`card4_1100.png`、`card4_800.png`（窄窗「数字 ▾ / 更多 ▾」箭头正常）、`card4_tabs.png`（多文档标签条）；改前对照 `before_1440.png`；局部放大 `z4_*.png`（`zoom.py` 生成）。
