@@ -28182,7 +28182,7 @@ let txn = self.txn_begin(&keys);
         if self.show_start || self.tabs.len() <= 1 {
             return;
         }
-        let strip_bg = Color32::from_rgb(243, 242, 241);
+        let strip_bg = ui_kit::PAGE_BG;
         let border = Color32::from_rgb(208, 208, 208);
         let mut go_home = false;
         let mut do_switch: Option<usize> = None;
@@ -28202,18 +28202,13 @@ let txn = self.txn_begin(&keys);
             }
         }
         egui::TopBottomPanel::top("doctabs")
+            // 卡片之间透出页面底色，egui 默认的面板分隔线会横穿这条缝
+            .show_separator_line(false)
             .exact_height(30.0)
             .frame(egui::Frame::NONE.fill(strip_bg))
             .show(ctx, |ui| {
+                // 底边线去掉：下面紧接的是浮在同一层灰底上的功能区卡片，再画线就成了双重分隔
                 let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    Rect::from_min_max(
-                        egui::pos2(rect.left(), rect.bottom() - 1.0),
-                        rect.right_bottom(),
-                    ),
-                    0.0,
-                    Color32::from_rgb(225, 223, 221),
-                );
                 let mut x = rect.left() + 8.0;
                 let cy = rect.center().y;
                 // 首页按钮
@@ -31263,144 +31258,196 @@ impl eframe::App for SheetApp {
         self.doc_tabs(ctx);
 
         if !self.show_start {
+        // 悬浮卡片：整条功能区（页签行 + 命令区）是一张白卡，浮在浅灰页面底色上。
+        // 之前是整块铺满、上下贴边，和 WPS/现代 Office 的「灰底白卡」不是一套语言。
+        let card_pad = 6.0;
+        let body_h = if self.ribbon_collapsed {
+            0.0
+        } else {
+            ui_kit::RIBBON_BODY_H
+        };
         egui::TopBottomPanel::top("ribbon")
-            .exact_height(
-                ui_kit::TAB_H
-                    + if self.ribbon_collapsed {
-                        1.0
-                    } else {
-                        ui_kit::RIBBON_BODY_H + 1.0
-                    },
-            )
-            .frame(egui::Frame::NONE.fill(ui_kit::TABBAR_BG))
+            // 卡片之间透出页面底色，egui 默认的面板分隔线会横穿这条缝
+            .show_separator_line(false)
+            .exact_height(card_pad * 2.0 + ui_kit::TAB_H + body_h)
+            .frame(egui::Frame::NONE.fill(ui_kit::PAGE_BG))
             .show(ctx, |ui| {
-                let full = ui.max_rect();
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                ui.allocate_ui_with_layout(
-                    Vec2::new(full.width(), ui_kit::TAB_H),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(12.0);
-                        ribbon::ui::tabs(self, ui);
-                        ribbon::ui::context_tabs(self, ui);
+                egui::Frame::NONE
+                    .fill(Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .corner_radius(8.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 2],
+                        blur: 6,
+                        spread: 0,
+                        color: Color32::from_black_alpha(22),
+                    })
+                    .outer_margin(egui::Margin {
+                        left: 6,
+                        right: 6,
+                        top: 6,
+                        bottom: 6,
+                    })
+                    .show(ui, |ui| {
+                        let avail = ui.max_rect();
+                        let card = Rect::from_min_size(
+                            avail.min,
+                            Vec2::new(avail.width(), ui_kit::TAB_H + body_h),
+                        );
+                        // 卡片顶部的页签条：浅灰、跟着卡片圆角裁切
+                        ui.painter().with_clip_rect(card).rect_filled(
+                            Rect::from_min_max(
+                                card.min,
+                                egui::pos2(card.right(), card.top() + ui_kit::TAB_H),
+                            ),
+                            egui::CornerRadius {
+                                nw: 8,
+                                ne: 8,
+                                sw: 0,
+                                se: 0,
+                            },
+                            ui_kit::TABSTRIP_BG,
+                        );
+                        let mut tab_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(Rect::from_min_max(
+                                    egui::pos2(card.left() + 8.0, card.top()),
+                                    egui::pos2(
+                                        card.right() - 8.0,
+                                        card.top() + ui_kit::TAB_H,
+                                    ),
+                                ))
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        tab_ui.add_space(4.0);
+                        ribbon::ui::tabs(self, &mut tab_ui);
+                        ribbon::ui::context_tabs(self, &mut tab_ui);
                         // Excel 在页签行右端常驻“共享”（绿色）：我们对应的是协作入口
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(12.0);
-                            if self.net.is_some() {
-                                if ui_kit::labeled_w(
+                        tab_ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(4.0);
+                                if self.net.is_some() {
+                                    if ui_kit::labeled_w(
+                                        ui,
+                                        Icon::Share,
+                                        &format!("在线 {}", self.peers_list.len()),
+                                        90.0,
+                                        "查看在线协作者",
+                                    )
+                                    .clicked()
+                                    {
+                                        self.members_open = true;
+                                    }
+                                } else if ui_kit::labeled_tint(
                                     ui,
                                     Icon::Share,
-                                    &format!("在线 {}", self.peers_list.len()),
-                                    90.0,
-                                    "查看在线协作者",
+                                    "共享",
+                                    64.0,
+                                    ui_kit::ACCENT,
+                                    "把当前文件共享到局域网（不经过服务器）",
                                 )
                                 .clicked()
                                 {
-                                    self.members_open = true;
+                                    self.start_host();
                                 }
-                            } else if ui_kit::labeled_tint(
-                                ui,
-                                Icon::Share,
-                                "共享",
-                                64.0,
-                                ui_kit::ACCENT,
-                                "把当前文件共享到局域网（不经过服务器）",
-                            )
-                            .clicked()
-                            {
-                                self.start_host();
-                            }
-                            if ui_kit::labeled_w(
-                                ui,
-                                Icon::Comment,
-                                "批注",
-                                54.0,
-                                "新建或编辑批注",
-                            )
-                            .clicked()
-                            {
-                                let (r, c) = self.sel;
-                                let key = sheetcore::model::CellRef::new(r, c);
-                                let cur = self
-                                    .wb
-                                    .sheet(self.sheet_idx)
-                                    .notes
-                                    .get(&key)
-                                    .map(|n| n.text.clone())
-                                    .unwrap_or_default();
-                                self.note_edit = Some((r, c, cur));
-                            }
-                            // 含宏提示和上面的按钮放进同一组：以前这里是第二个
-                            // right_to_left 布局，右侧已被前一占满，结果「在线」和「协作 · N 人」叠字。
-                            if self.wb.has_vba {
-                                ui.label(
-                                    egui::RichText::new("含宏（保留不执行）")
-                                        .size(10.5)
-                                        .color(egui::Color32::from_rgb(180, 110, 0)),
-                                );
-                            }
-                        });
-                    },
-                );
-                // Excel：页签条是浅灰，命令区是纯白。整块铺 TABBAR_BG 会让功能区发灰、显脏。
-                let body_top = ui.cursor().top();
-                let body_rect = Rect::from_min_max(
-                    egui::pos2(full.left(), body_top),
-                    egui::pos2(full.right(), body_top + ui_kit::RIBBON_BODY_H),
-                );
-                ui.painter().rect_filled(body_rect, 0.0, Color32::WHITE);
-                if !self.ribbon_collapsed {
-                    // 命令区画在一个**尺寸固定**的子 ui 里：内容再高也撑不到父面板，
-                    // 否则某个组多堆几行就会把编辑栏往下顶、中间留出一条空白带。
-                    let mut body_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(body_rect)
-                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                    );
-                    body_ui.set_clip_rect(body_rect);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("ribbon_scroll")
-                        .auto_shrink([false, false])
-                        .max_height(ui_kit::RIBBON_BODY_H)
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(&mut body_ui, |ui| {
-                            ui.set_height(ui_kit::RIBBON_BODY_H);
-                            ui.horizontal_top(|ui| {
-                                ui.add_space(20.0);
-                                ribbon::ui::body(self, ui);
-                            });
-                        });
-                }
-                // 父 ui 只承认这一块，命令区内部溢出不影响后续面板
-                ui.allocate_rect(body_rect, egui::Sense::hover());
-                ui.painter().rect_filled(
-                    Rect::from_min_max(
-                        egui::pos2(full.left(), full.bottom() - 1.0),
-                        full.right_bottom(),
-                    ),
-                    0.0,
-                    ui_kit::BORDER,
-                );
+                                if ui_kit::labeled_w(
+                                    ui,
+                                    Icon::Comment,
+                                    "批注",
+                                    54.0,
+                                    "新建或编辑批注",
+                                )
+                                .clicked()
+                                {
+                                    let (r, c) = self.sel;
+                                    let key = sheetcore::model::CellRef::new(r, c);
+                                    let cur = self
+                                        .wb
+                                        .sheet(self.sheet_idx)
+                                        .notes
+                                        .get(&key)
+                                        .map(|n| n.text.clone())
+                                        .unwrap_or_default();
+                                    self.note_edit = Some((r, c, cur));
+                                }
+                                // 含宏提示和上面的按钮放进同一组：以前这里是第二个
+                                // right_to_left 布局，右侧已被前一占满，结果「在线」和「协作 · N 人」叠字。
+                                if self.wb.has_vba {
+                                    ui.label(
+                                        egui::RichText::new("含宏（保留不执行）")
+                                            .size(10.5)
+                                            .color(egui::Color32::from_rgb(180, 110, 0)),
+                                    );
+                                }
+                            },
+                        );
+                        if !self.ribbon_collapsed {
+                            // 命令区画在一个**尺寸固定**的子 ui 里：内容再高也撑不到父面板，
+                            // 否则某个组多堆几行就会把编辑栏往下顶、中间留出一条空白带。
+                            let body_rect = Rect::from_min_max(
+                                egui::pos2(
+                                    card.left() + 8.0,
+                                    card.top() + ui_kit::TAB_H,
+                                ),
+                                egui::pos2(card.right() - 8.0, card.bottom()),
+                            );
+                            let mut body_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(body_rect)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                            );
+                            body_ui.set_clip_rect(body_rect);
+                            egui::ScrollArea::horizontal()
+                                .id_salt("ribbon_scroll")
+                                .auto_shrink([false, false])
+                                .max_height(ui_kit::RIBBON_BODY_H)
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .show(&mut body_ui, |ui| {
+                                    ui.set_height(ui_kit::RIBBON_BODY_H);
+                                    ui.horizontal_top(|ui| {
+                                        ui.add_space(12.0);
+                                        ribbon::ui::body(self, ui);
+                                    });
+                                });
+                        }
+                        // 父 ui 只承认这张卡片，命令区内部溢出不影响后续面板
+                        ui.allocate_rect(card, egui::Sense::hover());
+                    });
             });
-
         }
 
         // ---- 编辑栏：名称框 + ×/✓/fx + 输入行（44px） ----
         if self.show_formula_bar && !self.show_start {
+        // 编辑栏也是一张悬浮卡片：和功能区分开，中间透出页面底色。
         egui::TopBottomPanel::top("formula")
-            .exact_height(if self.fx_expanded { 88.0 } else { ui_kit::FX_H })
-            .frame(egui::Frame::NONE.fill(Color32::WHITE))
+            // 卡片之间透出页面底色，egui 默认的面板分隔线会横穿这条缝
+            .show_separator_line(false)
+            .exact_height((if self.fx_expanded { 88.0 } else { ui_kit::FX_H }) + 12.0)
+            .frame(egui::Frame::NONE.fill(ui_kit::PAGE_BG))
             .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::WHITE)
+                    .stroke(egui::Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .corner_radius(6.0)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 1],
+                        blur: 3,
+                        spread: 0,
+                        color: Color32::from_black_alpha(14),
+                    })
+                    .outer_margin(egui::Margin {
+                        left: 6,
+                        right: 6,
+                        top: 6,
+                        bottom: 6,
+                    })
+                    .show(ui, |ui| {
                 let rect = ui.max_rect();
                 let painter = ui.painter().clone();
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        egui::pos2(rect.left(), rect.bottom() - 1.0),
-                        rect.right_bottom(),
-                    ),
-                    0.0,
-                    ui_kit::BORDER,
-                );
                 let (r, c) = self.sel;
                 if !self.name_edit {
                     let (r1, c1, r2, c2) = self.sel_rect();
@@ -31789,20 +31836,19 @@ impl eframe::App for SheetApp {
                     // Excel 的 fx 打开插入函数向导；不在这里直接抢编辑栏焦点。
                     self.open_fn_wizard();
                 }
+                ui.allocate_rect(rect, egui::Sense::hover());
+                    });
             });
         }
 
         // ---- 状态栏（22px，最底部） ----
+        // 悬浮卡片外壳：状态栏不再是一条带上边线的灰带，直接坐在页面底色上。
         egui::TopBottomPanel::bottom("statusbar")
+            // 卡片之间透出页面底色，egui 默认的面板分隔线会横穿这条缝
+            .show_separator_line(false)
             .exact_height(if self.show_start { 0.0 } else { crate::tokens::size::STATUS_H })
-            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .frame(egui::Frame::NONE.fill(ui_kit::PAGE_BG))
             .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 1.0)),
-                    0.0,
-                    ui_kit::BORDER,
-                );
                 let rects = self.sel_rects();
                 let area: u64 = rects
                     .iter()
@@ -32044,7 +32090,7 @@ impl eframe::App for SheetApp {
                             );
                             let resp = ui.interact(b, egui::Id::new(("viewbtn", i)), Sense::click());
                             if resp.hovered() {
-                                ui.painter().rect_filled(b, 2.0, ui_kit::HOVER);
+                                ui.painter().rect_filled(b, 2.0, ui_kit::HOVER_ON_PAGE);
                             }
                             let on = match i {
                                 0 => !self.print_preview && !self.show_pages,
@@ -32132,16 +32178,14 @@ impl eframe::App for SheetApp {
             });
 
         // ---- 工作表标签条（32px，状态栏之上） ----
+        // 和状态栏一样坐在页面底色上；上边线去掉，网格卡片自己的边框就是分界。
         egui::TopBottomPanel::bottom("tabs")
+            // 卡片之间透出页面底色，egui 默认的面板分隔线会横穿这条缝
+            .show_separator_line(false)
             .exact_height(if self.show_start { 0.0 } else { 32.0 })
-            .frame(egui::Frame::NONE.fill(ui_kit::STATUS_BG))
+            .frame(egui::Frame::NONE.fill(ui_kit::PAGE_BG))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 1.0)),
-                    0.0,
-                    ui_kit::BORDER,
-                );
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let mut goto: Option<usize> = None;
                 let mut del: Option<usize> = None;
@@ -32165,7 +32209,7 @@ impl eframe::App for SheetApp {
                     );
                     if resp.hovered() && can {
                         ui.painter()
-                            .rect_filled(b.shrink(4.0), 3.0, ui_kit::HOVER);
+                            .rect_filled(b.shrink(4.0), 3.0, ui_kit::HOVER_ON_PAGE);
                     }
                     if resp.clicked() && can {
                         let delta = if *dir == "left" { -180.0 } else { 180.0 };
@@ -32260,7 +32304,7 @@ impl eframe::App for SheetApp {
                 );
                 let nresp = ui.interact(nb, egui::Id::new("newsheet"), Sense::click());
                 if nresp.hovered() {
-                    ui.painter().rect_filled(nb, 0.0, ui_kit::HOVER);
+                    ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, ui_kit::HOVER_ON_PAGE);
                 }
                 let c = nb.center();
                 let st = Stroke::new(1.2, Color32::from_rgb(68, 68, 68));
@@ -32321,7 +32365,11 @@ impl eframe::App for SheetApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(if self.show_start {
+                egui::Frame::NONE
+            } else {
+                egui::Frame::NONE.fill(ui_kit::PAGE_BG)
+            })
             .show(ctx, |ui| {
                 if !self.backstage {
                     // 应用级命令（保存/打开/新建/打印/撤销）先过命令表：
@@ -32336,7 +32384,31 @@ impl eframe::App for SheetApp {
                         // 否则焦点在关闭按钮上按 Enter 会同时激活按钮并推进选区。
                         self.handle_keys(ctx);
                     }
-                    self.draw_grid(ui, ctx);
+                    // 网格也是一张悬浮卡片：左右各 6px 透出页面底色，上方紧接编辑栏卡片的
+                    // 下边距，下方留 2px 给工作表标签条。网格/表头/滚动条照旧直角铺满，
+                    // 画完再由 card_outline 抠圆角、描边。
+                    let avail = ui.available_rect_before_wrap();
+                    let card = Rect::from_min_max(
+                        egui::pos2(avail.left() + 6.0, avail.top()),
+                        egui::pos2(avail.right() - 6.0, avail.bottom() - 2.0),
+                    );
+                    let inner = card.shrink(1.0);
+                    let mut grid_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    grid_ui.set_clip_rect(inner.intersect(ui.clip_rect()));
+                    self.draw_grid(&mut grid_ui, ctx);
+                    ui_kit::card_outline(
+                        ui.painter(),
+                        card,
+                        ui_kit::CARD_R as f32,
+                        ui_kit::PAGE_BG,
+                        ui_kit::CARD_BORDER,
+                    );
+                    // 父 ui 只占位、不注册控件：Sense::hover 的整块矩形会盖在网格上面抢 hover
+                    ui.advance_cursor_after_rect(avail);
                     if self.clear_grid_focus {
                         if let Some(id) = ctx.memory(|m| m.focused()) {
                             ctx.memory_mut(|m| m.surrender_focus(id));

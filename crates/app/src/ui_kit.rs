@@ -18,6 +18,50 @@ pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
 
+/// 悬浮卡片：白底 + 1px 边 + 8px 圆角，卡片之间透出 PAGE_BG。
+/// Excel/WPS 的现代外壳都是「灰底白卡」，靠色差和极轻的投影分层，不靠粗边框。
+pub const PAGE_BG: Color32 = Color32::from_rgb(243, 242, 241);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(227, 225, 223);
+/// 卡片顶部页签条：比卡片略深，活动页签的白卡才会「浮」出来
+pub const TABSTRIP_BG: Color32 = Color32::from_rgb(237, 235, 233);
+/// 灰底上的悬停色：HOVER(243,242,241) 和 PAGE_BG 几乎同色，放在灰底上等于没有反馈
+pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(234, 232, 230);
+/// 卡片圆角：功能区/网格 8px，编辑栏 6px
+pub const CARD_R: u8 = 8;
+
+/// 把一块已经画满（直角）的区域收成圆角卡片：四角先用页面底色「抠」掉，再描 1px 边。
+/// egui 的裁切只有矩形，网格、表头、滚动条又各自直角铺色，只能事后盖住四个角。
+pub fn card_outline(painter: &egui::Painter, rect: Rect, r: f32, bg: Color32, border: Color32) {
+    use egui::epaint::{Mesh, Shape};
+    let mut mesh = Mesh::default();
+    // (角点, 圆心)：每个角从角点向四分之一圆弧做扇形
+    let corners = [
+        (rect.left_top(), egui::pos2(rect.left() + r, rect.top() + r), 180.0f32),
+        (rect.right_top(), egui::pos2(rect.right() - r, rect.top() + r), 270.0),
+        (rect.right_bottom(), egui::pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (rect.left_bottom(), egui::pos2(rect.left() + r, rect.bottom() - r), 90.0),
+    ];
+    const SEG: usize = 8;
+    for (corner, c, start) in corners {
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(corner, bg);
+        for k in 0..=SEG {
+            let a = (start + 90.0 * k as f32 / SEG as f32).to_radians();
+            mesh.colored_vertex(egui::pos2(c.x + r * a.cos(), c.y + r * a.sin()), bg);
+        }
+        for k in 0..SEG as u32 {
+            mesh.add_triangle(base, base + 1 + k, base + 2 + k);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(r as u8),
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// 界面字号只留四档。10.5 / 12.5 / 13.5 这类半像素字号会把中文糊成一层灰，
 /// 同一屏里字号档位越多，越像「随手拼出来的页面」。
 pub const T_TITLE: f32 = 20.0;
@@ -746,15 +790,20 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
         .layout_no_wrap(name.to_owned(), font.clone(), Color32::PLACEHOLDER);
     let size = Vec2::new(galley.size().x + 20.0, TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    // Excel 的活动页签是白底：和下面的功能区连成一片，只有底部 2px 绿线
+    // 悬浮卡片式页签：活动页签是一张白卡，只圆上面两角，底边和命令区连成一片；
+    // 页签条本身是浅灰，白卡才有「浮起来」的层次。绿线仍然是 Excel 的活动标记。
     if active && !green {
-        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
+            Color32::WHITE,
+        );
     }
     if resp.hovered() && !active {
         ui.painter().rect_filled(
-            rect.shrink2(Vec2::new(4.0, 3.0)),
-            2.0,
-            v.widgets.hovered.weak_bg_fill,
+            rect.shrink2(Vec2::new(2.0, 4.0)),
+            6.0,
+            HOVER_ON_PAGE,
         );
     }
     let col = if green {
@@ -1163,10 +1212,17 @@ pub fn sheet_tab(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     // UI-24.2：工作表标签在 UIA 里是 Tab 页，名字就是工作表名
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active));
+    // 悬浮卡片外壳：标签条是页面灰底，标签画成上下各留 3px 的圆角小卡，
+    // 和上面的网格卡片、功能区卡片同一套语言；命中区域仍是整格，不影响点击/拖动。
+    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
+    let rad = egui::CornerRadius::same(5);
     let tab_rgb = color.map(|c| Color32::from_rgb(c[0], c[1], c[2]));
     if let Some(fill) = tab_rgb {
         // 有颜色的标签：整块铺色；深色配白字
-        ui.painter().rect_filled(rect, 0.0, fill);
+        ui.painter().rect_filled(chip, rad, fill);
+        if active {
+            ui.painter().rect_stroke(chip, rad, Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+        }
         let lum = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32;
         let mut color = if lum > 165.0 {
             Color32::from_rgb(30, 30, 30)
@@ -1180,24 +1236,18 @@ pub fn sheet_tab(
             .text(rect.center(), Align2::CENTER_CENTER, name, font, color);
         return resp;
     }
-    // Excel 365 的活动标签是「顶部两角 3px 圆角 + 白底 + 底部 2px 绿线」，
-    // 直角白块看起来像旧版 Windows 控件。
-    let top_round = egui::CornerRadius {
-        nw: 3,
-        ne: 3,
-        sw: 0,
-        se: 0,
-    };
     if active {
-        ui.painter().rect_filled(rect, top_round, Color32::WHITE);
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.bottom() - 2.0),
-            Vec2::new(rect.width(), 2.0),
-        );
-        ui.painter().rect_filled(bar, 0.0, ACCENT);
-    } else if resp.hovered() {
+        // 活动页：白卡 + 1px 卡片边 + 底部内缩的 2px 绿线（Excel 的活动标记保留）
         ui.painter()
-            .rect_filled(rect, top_round, v.widgets.hovered.weak_bg_fill);
+            .rect(chip, rad, Color32::WHITE, Stroke::new(1.0, CARD_BORDER), egui::StrokeKind::Inside);
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(chip.left() + 8.0, chip.bottom() - 3.0),
+            Vec2::new((chip.width() - 16.0).max(4.0), 2.0),
+        );
+        ui.painter().rect_filled(bar, 1.0, ACCENT);
+    } else if resp.hovered() {
+        let hover = if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER_ON_PAGE };
+        ui.painter().rect_filled(chip, rad, hover);
     }
     let color = if active {
         TEXT

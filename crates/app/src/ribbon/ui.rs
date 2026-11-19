@@ -201,7 +201,10 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         let compact_w = compact_width(g);
         // UI-13.2 二级压缩：整组放不下时，先把大按钮收成小图标网格；
         // 小图标也放不下，才退化成「组名 ▾」/「更多 ▾」。
-        let full_fits = known.is_some() && used + w + 60.0 <= avail;
+        // 「更多 ▾」的 60pt 只在后面还有组时才需要预留：最后一组放得下就照常画，
+        // 否则悬浮卡片收窄 28px 后，1440 宽下 58px 的「加载项」会被白白挤进「更多」。
+        let reserve = if i + 1 < tab.groups.len() { 60.0 } else { 0.0 };
+        let full_fits = known.is_some() && used + w + reserve <= avail;
         let compact_fits = known.is_some()
             && compact_w + 12.0 <= avail - used
             && compact_w + 12.0 < w
@@ -220,9 +223,9 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
             continue;
         }
         // 给「更多 ▾」预留 60pt：不留的话最后会画到裁切区外（760×420 实测溢出 11px）
-        if known.is_some() && used + w + 60.0 > avail && used > 0.0 {
+        if known.is_some() && used + w + reserve > avail && used > 0.0 {
             if avail - used >= 92.0 {
-                ui.menu_button(format!("{} ▾", g.label), |ui| {
+                menu_chevron(ui, &g.label, |ui| {
                     nodes(app, ui, &g.children);
                 });
                 used += 84.0;
@@ -232,7 +235,7 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
             // 连「组名 ▾」都放不下：剩下的组统一进「更多」。
             // 极端窄（首组就超宽）时把「更多」钉在裁切区右侧，别让它画到窗口外。
             let mut more = |ui: &mut egui::Ui| {
-                ui.menu_button("更多 ▾", |ui| {
+                menu_chevron(ui, "更多", |ui| {
                     for h in &tab.groups[i..] {
                         ui.menu_button(&h.label, |ui| {
                             nodes(app, ui, &h.children);
@@ -1603,6 +1606,21 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     if let Some(a) = fire {
         app.ribbon_action(&a, ui.ctx());
     }
+}
+
+/// 「组名 ▾」「更多 ▾」折叠按钮。内嵌字体子集里没有 U+25BE，直接写「▾」会显示成方块，
+/// 所以文字后面留空，再手画一个和「单元格样式」下拉同款的 V 形箭头。
+fn menu_chevron(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let ir = ui.menu_button(format!("{label}    "), add_contents);
+    let rect = ir.response.rect;
+    let col = ui.visuals().text_color();
+    let cx = rect.right() - 11.0;
+    let cy = rect.center().y;
+    let stk = egui::Stroke::new(1.1, col);
+    ui.painter()
+        .line_segment([egui::pos2(cx - 3.0, cy - 1.5), egui::pos2(cx, cy + 1.5)], stk);
+    ui.painter()
+        .line_segment([egui::pos2(cx, cy + 1.5), egui::pos2(cx + 3.0, cy - 1.5)], stk);
 }
 
 /// 紧凑模式的样式库：整条 349px 的缩略图放不下，收成一个
