@@ -28227,20 +28227,13 @@ let txn = self.txn_begin(&keys);
                 } else {
                     Color32::from_rgb(68, 68, 68)
                 };
-                let hx = home.center();
-                ui.painter().line_segment(
-                    [egui::pos2(hx.x - 6.0, hx.y), egui::pos2(hx.x, hx.y - 6.0)],
-                    Stroke::new(1.4, hc),
-                );
-                ui.painter().line_segment(
-                    [egui::pos2(hx.x, hx.y - 6.0), egui::pos2(hx.x + 6.0, hx.y)],
-                    Stroke::new(1.4, hc),
-                );
-                ui.painter().rect_stroke(
-                    Rect::from_min_size(egui::pos2(hx.x - 5.0, hx.y - 1.0), Vec2::new(10.0, 7.0)),
-                    1.0,
-                    Stroke::new(1.4, hc),
-                    egui::StrokeKind::Inside,
+                // 走统一图标体系（Fluent 2 家），别再手搓屋顶 + 方块墙体：
+                // 手搓版本转角是尖的、比例偏扁，和旁边圆角标签不是一套东西。
+                ui_icons::draw_mono(
+                    ui.painter(),
+                    Rect::from_center_size(home.center(), Vec2::splat(16.0)),
+                    ui_icons::Icon::Home,
+                    hc,
                 );
                 if hresp.clicked() {
                     go_home = true;

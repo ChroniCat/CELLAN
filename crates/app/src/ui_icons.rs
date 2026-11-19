@@ -54,6 +54,8 @@ pub enum Icon {
     Fx,
     Sum,
     Grid,
+    /// 文档标签条左侧的「回开始页」
+    Home,
     Close,
     Plus,
     Refresh,
@@ -436,7 +438,7 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 }
 
 /// 全部图标（由枚举顺序生成；新增图标后同步这里，测试会数个数）
-pub const ALL_ICONS: [Icon; 145] = [
+pub const ALL_ICONS: [Icon; 146] = [
     Icon::Open, Icon::Save, Icon::SaveAs, Icon::Print, Icon::Undo, Icon::Redo,
     Icon::Paste, Icon::Cut, Icon::Copy, Icon::Brush, Icon::Fill, Icon::FontColor,
     Icon::AlignL, Icon::AlignC, Icon::AlignR, Icon::Top, Icon::Middle, Icon::Bottom,
@@ -461,7 +463,7 @@ pub const ALL_ICONS: [Icon; 145] = [
     Icon::ClearFmt, Icon::IndentInc, Icon::IndentDec, Icon::Symbol, Icon::ZhS, Icon::ZhT,
     Icon::TraceIn, Icon::TraceOut, Icon::SparkLine, Icon::SparkColumn, Icon::SparkLoss, Icon::TextBox,
     Icon::NewFile, Icon::Macro, Icon::MacroRun, Icon::Code, Icon::Compare, Icon::SyncScroll,
-    Icon::InvalidCircle,
+    Icon::InvalidCircle, Icon::Home,
 ];
 
 /// 图标总表：给「对照表」和自检用（位图 vs 矢量并排看）
@@ -507,6 +509,12 @@ pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: 
     // Excel 的图形比 24 网格画得满：外扩 4%，32px 时约多 2.5px
     let r = rect.expand(rect.width() * 0.04);
     paint(p, r, icon, if enabled { None } else { Some(color) });
+}
+
+/// 单色绘制：忽略图标内置配色，整枚用 `color`。
+/// 给标签条/标题栏这类「只用中性灰」的场景，别再用 `enabled=false` 冒充。
+pub fn draw_mono(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    paint(p, rect.expand(rect.width() * 0.04), icon, Some(color));
 }
 
 fn paint(p: &Painter, rect: Rect, icon: Icon, mono: Option<Color32>) {
@@ -920,6 +928,15 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.bar(4.0, 11.4, 16.0, 1.3, BLUE);
             pen.bar(11.4, 4.0, 1.3, 16.0, BLUE);
             pen.bar(4.0, 4.4, 15.6, 3.4, BLUE_XL);
+        }
+        Home => {
+            // Fluent 2 家：屋顶、两侧墙、地面、门。墙顶接在屋顶斜边上，
+            // 不靠「画到差不多」留一道缝；16px 下门是最后消失的一笔。
+            pen.polyline(&[(3.4, 10.6), (12.0, 3.6), (20.6, 10.6)], 1.4, INK);
+            pen.ln(5.4, 8.8, 5.4, 20.2, 1.4, INK);
+            pen.ln(18.6, 8.8, 18.6, 20.2, 1.4, INK);
+            pen.ln(5.4, 20.2, 18.6, 20.2, 1.4, INK);
+            pen.rro(9.6, 14.6, 4.8, 5.6, 0.7, INK, 1.2);
         }
         Close => {
             pen.ln(6.8, 6.8, 17.2, 17.2, 1.8, INK);
