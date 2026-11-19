@@ -173,6 +173,36 @@ pub fn bold_in(ctx: &egui::Context, size: f32) -> FontId {
         FontId::proportional(size)
     }
 }
+
+/// 500~600 中黑字重（拉丁走 Segoe UI Semibold 600，中文走 Microsoft YaHei UI）。
+/// 小字号（12~15px）标题/按钮/分组名如果直接上 700 Bold，灰阶抗锯齿会把中文横画糊成黑墨团；
+/// 用 `ui-medium` 字族配合 `paint_medium` 的亚像素微增重，既有商用软件的扎实字重，又保持笔画通透。
+pub fn medium_in(ctx: &egui::Context, size: f32) -> FontId {
+    let m = FontId::new(size, FontFamily::Name("ui-medium".into()));
+    if ctx.fonts(|f| f.families().contains(&m.family)) {
+        m
+    } else {
+        FontId::proportional(size)
+    }
+}
+
+/// 绘制商用 UI 级 Medium（约 530 字重）文本：拉丁采用真 Semibold，中文叠加 0.36px 轻墨微增重，不糊笔画。
+pub fn paint_medium(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: Align2,
+    text: &str,
+    size: f32,
+    col: Color32,
+) {
+    let font = medium_in(painter.ctx(), size);
+    painter.text(pos, align, text, font.clone(), col);
+    let sub_a = (col.a() as f32 * 0.34).round() as u8;
+    if sub_a > 0 {
+        let sub_col = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), sub_a);
+        painter.text(pos + Vec2::new(0.38, 0.0), align, text, font, sub_col);
+    }
+}
 /// 禁用态：Excel 的禁用图标是中性灰 #A6A6A6，比正文浅、比分隔线深
 pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 /// 列头/行头与网格的分界线：Excel 实测 #ABABAB，比普通控件边框深
@@ -257,26 +287,26 @@ pub fn apply_theme(ctx: &egui::Context) {
         let mut v = egui::Visuals::light();
         v.panel_fill = Color32::WHITE;
         v.window_fill = Color32::WHITE;
-        v.extreme_bg_color = Color32::WHITE;
-        v.faint_bg_color = Color32::from_rgb(247, 247, 247);
+        v.extreme_bg_color = Color32::from_rgb(249, 250, 251);
+        v.faint_bg_color = Color32::from_rgb(246, 247, 249);
         v.widgets.noninteractive.bg_fill = Color32::WHITE;
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(232, 235, 240));
         v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.inactive.bg_fill = Color32::from_rgb(243, 242, 241);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(245, 247, 250);
         v.widgets.inactive.weak_bg_fill = Color32::WHITE;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(171, 169, 167));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(214, 218, 224));
         v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-        v.widgets.hovered.bg_fill = Color32::from_rgb(237, 235, 233);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(238, 241, 246);
         v.widgets.hovered.weak_bg_fill = HOVER;
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(140, 138, 136));
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(180, 186, 196));
         v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-        v.widgets.active.bg_fill = Color32::from_rgb(225, 223, 221);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.active.bg_fill = Color32::from_rgb(229, 233, 240);
         v.widgets.active.weak_bg_fill = PRESSED;
-        v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT);
+        v.widgets.active.bg_stroke = Stroke::new(1.5, BRAND_NAVY);
         v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-        v.widgets.active.corner_radius = egui::CornerRadius::same(4);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(6);
         v.widgets.open = v.widgets.active;
         v.selection.bg_fill = Color32::from_rgb(204, 228, 215);
         v.selection.stroke = Stroke::new(1.0, ACCENT);
@@ -879,7 +909,7 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
     let v = ui.visuals().clone();
     // Excel 365 实测：活动页签的墨量约是非活动的 1.7 倍（真加粗，不是只换颜色）；「文件」入口同样加粗稳住左侧起点
     let font = if active || green {
-        bold_in(ui.ctx(), 12.0)
+        medium_in(ui.ctx(), 12.0)
     } else {
         FontId::proportional(12.0)
     };
@@ -936,8 +966,12 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
     } else {
         Color32::from_rgb(68, 68, 68)
     };
-    ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, name, font, col);
+    if active || green {
+        paint_medium(ui.painter(), rect.center(), Align2::CENTER_CENTER, name, 12.0, col);
+    } else {
+        ui.painter()
+            .text(rect.center(), Align2::CENTER_CENTER, name, font, col);
+    }
     if active && !green {
         let bar = egui::Rect::from_min_size(
             egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
@@ -963,12 +997,41 @@ pub fn hairline(ui: &mut egui::Ui) {
     );
 }
 
-/// 对话框底部的按钮行（右对齐）
+/// 对话框底部的按钮行（右对齐，统一 12px 呼吸留白与细分割线）
 pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(4.0);
-    ui.separator();
+    ui.add_space(10.0);
+    let r = ui.available_rect_before_wrap();
+    ui.painter().line_segment(
+        [egui::pos2(r.left(), r.top()), egui::pos2(r.right(), r.top())],
+        Stroke::new(1.0, Color32::from_rgb(236, 239, 243)),
+    );
+    ui.add_space(12.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         add(ui);
+    });
+}
+
+/// 对话框底部左右双栏按钮行（左侧放轻量辅助入口，右侧放主次操作按钮）
+pub fn footer_split(
+    ui: &mut egui::Ui,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(10.0);
+    let r = ui.available_rect_before_wrap();
+    ui.painter().line_segment(
+        [egui::pos2(r.left(), r.top()), egui::pos2(r.right(), r.top())],
+        Stroke::new(1.0, Color32::from_rgb(236, 239, 243)),
+    );
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        left(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            right(ui);
+        });
     });
 }
 
@@ -1228,28 +1291,34 @@ impl BtnResp {
 }
 
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
-    let btn = egui::Button::new(
-        RichText::new(label)
-            .color(ACCENT)
-            .size(crate::tokens::text::BODY),
-    )
-    .fill(Color32::WHITE)
-    .stroke(Stroke::new(crate::tokens::stroke::HAIR, ACCENT))
-    .corner_radius(crate::tokens::radius::SM)
-    .min_size(Vec2::new(
-        crate::tokens::size::BTN_MIN_W,
-        crate::tokens::size::BTN_H,
-    ));
-    let resp = ui.add(btn);
+    let resp = ui
+        .scope(|ui| {
+            let w = &mut ui.visuals_mut().widgets;
+            w.inactive.weak_bg_fill = ACCENT;
+            w.inactive.bg_fill = ACCENT;
+            w.inactive.bg_stroke = Stroke::NONE;
+            w.hovered.weak_bg_fill = Color32::from_rgb(26, 97, 58);
+            w.hovered.bg_fill = Color32::from_rgb(26, 97, 58);
+            w.hovered.bg_stroke = Stroke::NONE;
+            w.active.weak_bg_fill = Color32::from_rgb(20, 77, 46);
+            w.active.bg_fill = Color32::from_rgb(20, 77, 46);
+            w.active.bg_stroke = Stroke::NONE;
+            let btn = egui::Button::new(
+                RichText::new(label)
+                    .font(medium_in(ui.ctx(), crate::tokens::text::BODY))
+                    .color(Color32::WHITE),
+            )
+            .corner_radius(6.0)
+            .min_size(Vec2::new(84.0, 32.0));
+            ui.add(btn)
+        })
+        .inner;
     if resp.has_focus() {
         ui.painter().rect_stroke(
-            resp.rect.shrink(crate::tokens::stroke::FOCUS),
-            crate::tokens::stroke::FOCUS,
-            Stroke::new(
-                crate::tokens::stroke::HAIR,
-                ACCENT.gamma_multiply(0.6),
-            ),
-            egui::StrokeKind::Inside,
+            resp.rect.expand(2.0),
+            7.5,
+            Stroke::new(1.5, ACCENT.gamma_multiply(0.55)),
+            egui::StrokeKind::Outside,
         );
     }
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -1260,24 +1329,85 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
     }
 }
 
-/// 次要按钮（取消/关闭）：白底灰边，和 Excel 对话框一致
+/// 次要按钮（取消/关闭）：与主按钮严格同高同宽（84×32）、6px 圆角、白底细灰边
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
-    let btn = egui::Button::new(
-        RichText::new(label)
-            .color(TEXT)
-            .size(crate::tokens::text::BODY),
-    )
-    .fill(Color32::WHITE)
-    .stroke(Stroke::new(
-        crate::tokens::stroke::HAIR,
-        Color32::from_rgb(179, 177, 175),
-    ))
-    .corner_radius(crate::tokens::radius::SM)
-    .min_size(Vec2::new(
-        crate::tokens::size::BTN_MIN_W,
-        crate::tokens::size::BTN_H,
-    ));
-    ui.add(btn)
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = Color32::WHITE;
+        w.inactive.bg_fill = Color32::WHITE;
+        w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 214, 222));
+        w.hovered.weak_bg_fill = Color32::from_rgb(245, 247, 250);
+        w.hovered.bg_fill = Color32::from_rgb(245, 247, 250);
+        w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(184, 190, 200));
+        w.active.weak_bg_fill = Color32::from_rgb(236, 239, 244);
+        w.active.bg_fill = Color32::from_rgb(236, 239, 244);
+        w.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(164, 172, 184));
+        let btn = egui::Button::new(
+            RichText::new(label)
+                .color(Color32::from_rgb(52, 58, 68))
+                .size(crate::tokens::text::BODY),
+        )
+        .corner_radius(6.0)
+        .min_size(Vec2::new(84.0, 32.0));
+        ui.add(btn)
+    })
+    .inner
+}
+
+/// 商用表单单行输入框：34px 舒适高度、左右 10px 内边距、浅灰底悬停提亮、聚焦深海蓝外发光圈
+pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
+    let desired_w = ui.available_width().max(120.0);
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(desired_w, 34.0), Sense::hover());
+    let bg_slot = ui.painter().add(egui::Shape::Noop);
+    let focused_id = ui.memory(|m| m.focused());
+    let inner = outer.shrink2(Vec2::new(10.0, 6.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let te_resp = child.add(
+        egui::TextEdit::singleline(buf)
+            .frame(false)
+            .desired_width(inner.width())
+            .font(FontId::proportional(12.0))
+            .hint_text(
+                RichText::new(hint)
+                    .size(12.0)
+                    .color(Color32::from_rgb(156, 163, 175)),
+            ),
+    );
+    let has_focus = te_resp.has_focus() || focused_id == Some(te_resp.id);
+    let hovered = ui.rect_contains_pointer(outer);
+    let bg = if has_focus {
+        Color32::WHITE
+    } else if hovered {
+        Color32::from_rgb(252, 252, 253)
+    } else {
+        Color32::from_rgb(248, 249, 251)
+    };
+    let border = if has_focus {
+        Stroke::new(1.5, BRAND_NAVY)
+    } else if hovered {
+        Stroke::new(1.0, Color32::from_rgb(180, 186, 198))
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(216, 220, 228))
+    };
+    ui.painter().set(
+        bg_slot,
+        egui::Shape::rect_filled(outer, egui::CornerRadius::same(6), bg),
+    );
+    let p = ui.painter();
+    if has_focus {
+        p.rect_stroke(
+            outer.expand(1.5),
+            7.5,
+            Stroke::new(2.5, Color32::from_rgba_unmultiplied(27, 53, 129, 28)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    p.rect_stroke(outer, 6.0, border, egui::StrokeKind::Inside);
+    te_resp
 }
 
 /// 紧凑文字按钮（组里放"插入行"这种短命令）
@@ -1526,13 +1656,18 @@ impl Dlg {
             d.insert_temp(id.with("shown"), now);
             d.insert_temp(egui::Id::new("dlg_born"), born);
         });
-        // 模态遮挡：对话框打开时吞掉背景点击
+        // 模态遮挡：半透明深灰蓝遮罩压暗底层密集网格线，让弹窗干净浮出，并吞掉背景点击
         if self.block_background {
             egui::Area::new(id.with("block"))
                 .order(egui::Order::Middle)
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {
                     let r = egui::Rect::from_min_size(screen.min, screen.size());
+                    ui.painter().rect_filled(
+                        r,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(15, 23, 42, 36),
+                    );
                     // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
                     let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
                     let _ = resp;
@@ -1544,50 +1679,50 @@ impl Dlg {
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, CARD_BORDER))
-                    .corner_radius(8.0)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 224, 232)))
+                    .corner_radius(10.0)
                     .shadow(egui::epaint::Shadow {
-                        offset: [0, 6],
-                        blur: 20,
+                        offset: [0, 10],
+                        blur: 28,
                         spread: 0,
-                        color: Color32::from_black_alpha(28),
+                        color: Color32::from_black_alpha(36),
                     })
                     .inner_margin(egui::Margin::same(0));
                 let fr = frame
                     .show(ui, |ui| {
                         ui.set_width(w);
-                        // 标题栏
-                        // 标题栏只用来拖动，不该占 Tab 焦点
+                        // 标题栏（42px 留白现代顶栏 + 内嵌 28×28 圆角关闭按钮）
                         let (trect, tresp) = ui.allocate_exact_size(
-                            egui::vec2(w, 34.0),
+                            egui::vec2(w, 42.0),
                             drag_only_sense(),
                         );
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(
                                 trect.min,
-                                egui::vec2(w, 34.0),
+                                egui::vec2(w, 42.0),
                             ),
-                            egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
-                            Color32::from_rgb(250, 249, 248),
+                            egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 },
+                            Color32::WHITE,
                         );
                         ui.painter().line_segment(
                             [
                                 egui::pos2(trect.left() + 1.0, trect.bottom() - 0.5),
                                 egui::pos2(trect.right() - 1.0, trect.bottom() - 0.5),
                             ],
-                            Stroke::new(1.0 / ctx.pixels_per_point(), CARD_BORDER),
+                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(238, 240, 244)),
                         );
-                        ui.painter().text(
-                            egui::pos2(trect.left() + 14.0, trect.center().y),
+                        paint_medium(
+                            ui.painter(),
+                            egui::pos2(trect.left() + 20.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &self.title,
-                            bold_in(ctx, 12.0),
-                            TEXT,
+                            13.0,
+                            Color32::from_rgb(17, 24, 39),
                         );
-                        // 关闭按钮
-                        let crect = egui::Rect::from_min_size(
-                            egui::pos2(trect.right() - 46.0, trect.top()),
-                            egui::vec2(46.0, 34.0),
+                        // 内嵌圆角关闭按钮（替代老式铺满顶栏右角的红块）
+                        let crect = egui::Rect::from_center_size(
+                            egui::pos2(trect.right() - 24.0, trect.center().y),
+                            egui::vec2(28.0, 28.0),
                         );
                         let cresp = ui.interact(
                             crect,
@@ -1597,13 +1732,17 @@ impl Dlg {
                         if cresp.hovered() {
                             ui.painter().rect_filled(
                                 crect,
-                                egui::CornerRadius { nw: 0, ne: 8, sw: 0, se: 0 },
-                                Color32::from_rgb(196, 43, 28),
+                                6.0,
+                                Color32::from_rgb(241, 243, 247),
                             );
                         }
-                        let cc = cresp.hovered().then_some(Color32::WHITE).unwrap_or(TEXT);
-                        let k = 4.5;
-                        let st = Stroke::new(1.1, cc);
+                        let cc = if cresp.hovered() {
+                            Color32::from_rgb(17, 24, 39)
+                        } else {
+                            Color32::from_rgb(107, 114, 128)
+                        };
+                        let k = 4.2;
+                        let st = Stroke::new(1.25, cc);
                         ui.painter().line_segment(
                             [crect.center() + egui::vec2(-k, -k), crect.center() + egui::vec2(k, k)],
                             st,
@@ -1619,18 +1758,19 @@ impl Dlg {
                         if tresp.dragged() {
                             pos += tresp.drag_delta();
                         }
-                        // 内容
+                        // 内容（20px 左右呼吸边距，26px 舒适控件高度）
                         let body = egui::Frame::none().inner_margin(egui::Margin {
-                            left: 16,
-                            right: 16,
-                            top: 10,
-                            bottom: 12,
+                            left: 20,
+                            right: 20,
+                            top: 16,
+                            bottom: 18,
                         });
                         let inner = body
                             .show(ui, |ui| {
-                                ui.set_width(w - 32.0);
-                                ui.set_max_width(w - 32.0);
-                                ui.spacing_mut().interact_size.y = 20.0;
+                                ui.set_width(w - 40.0);
+                                ui.set_max_width(w - 40.0);
+                                ui.spacing_mut().interact_size.y = 26.0;
+                                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                                 if h > 0.0 {
                                     egui::ScrollArea::vertical()
                                         .max_height(h)
