@@ -3215,3 +3215,18 @@ OneDrive 这类“本地同步文件夹”不是网络驱动器，不会被判�
 - **「▾」方块字**：内嵌字体子集没有 U+25BE，「加载项 ▾」「更多 ▾」一直显示成「□」。改成 `menu_chevron`：文字后留空，手画与「单元格样式」下拉同款的 V 形箭头。
 
 **验收**：`cargo test -p app --no-default-features --features glow` 单测 **403 passed / 0 failed / 1 ignored**，`ui_regression` **20 passed / 0 failed**（102s）；截图 `work/uiaudit/r56/card4_1440.png`、`card4_1920.png`、`card4_1100.png`、`card4_800.png`（窄窗「数字 ▾ / 更多 ▾」箭头正常）、`card4_tabs.png`（多文档标签条）；改前对照 `before_1440.png`；局部放大 `z4_*.png`（`zoom.py` 生成）。
+
+### 第五十七轮：LANCell 正式定名、矢量品牌标志、版本号统一与界面质感打磨（2026-11-19）
+
+目标：确立产品正式名称 **LANCell**，按官方标志原图重建纯矢量标志体系，收敛全仓四处打架的版本号，并系统性消除残留界面瑕疵、提升卡片与控件质感。
+
+- **品牌更名（LANCell）**：标题栏、开始页、关于窗口、窗口标题（`<文件名> - LANCell`）、Windows 文件关联（`LANCell.Workbook` / `Excel 工作表（LANCell）`）、防火墙规则（`LANCell 协作`）、PE `VERSIONINFO` 元数据、打包目录（`dist/LANCell/LANCell.exe`）与说明文档全部统一为 **LANCell**。配置目录迁至 `%LOCALAPPDATA%\LANCell`，`update::app_dir_in` 在首次升级时自动拷贝旧目录 `%LOCALAPPDATA%\SheetsNative` 下的 `ui.ini / recent.txt / update.txt / roots.txt / fnrecent.txt / cmdusage.txt / errorcheck.ini`，老用户显示名与最近列表无缝保留。
+- **矢量品牌标志**：建立 `240×240` 标准矢量源 `assets/logo.svg`（外圈 8 枚 `#1B3581` 深海蓝圆角单元 + 四边正交桥 + 左上独立蓝触点 + 左下斜向蓝桥；中心 `#09BD8D` 翡翠绿核心格向右上下伸出双绿触点接入右列节点），同步生成 8× 超采样抗锯齿多尺寸 `assets/app.ico`（16/24/32/48/64/128/256）、`app32.png`、`app64.png`、`app256.png`；应用内新增 `ui_kit::draw_brand_logo` 纯矢量亚像素圆角渲染，在标题栏（22px）、开始页（28px）、关于窗口（42px）任意缩放与高分屏下均保持锐利边缘。
+- **版本号统一（1.70）**：删除 `main.rs` 独立的 `APP_VERSION = "1.67"`，全仓唯一版本源收敛到 `update::VERSION = "1.70"`（严格高于历史发行包 `1.68`，避免共享盘自动更新误判回退），同步对齐 `crates/app/Cargo.toml`（`1.70.0`）、`build.rs` Win32 `VERSIONINFO`、`packaging/使用说明.txt` 与 `版本.txt`，并新增单测 `version_matches_cargo_package_and_migrates_legacy_profile` 防止 `Cargo.toml` 与 `update::VERSION` 再次脱节。
+- **界面细节与质感打磨**：
+  1. **状态栏叠字与缩放修复**：选区统计（`计数 / 求和`）移入右侧布局并配 1px 竖分隔线，左侧状态提示自然紧跟「就绪」左对齐截断，彻底修复 `计数: 1` 压在「普通视图」图标上的重叠缺陷；修复状态栏「−」按钮误调 `ctx.set_zoom_factor` 缩放整套 UI 而非工作表网格的缺陷。
+  2. **开始页版式对齐与防越界**：标题行、四张模板卡与下方双栏区统一对齐 `[left, left + content_w]` 外边界，消除右上方留白空洞并修复「销售明细」说明文字超出卡片右边框的问题；左栏当前导航项改用白卡胶囊 + 左侧短强调条，右侧信息卡升级为白底细边卡片。
+  3. **标题栏、功能区与编辑栏**：工作簿视图下标题栏与页面共用 `PAGE_BG` 底色、去掉横贯整窗底边线，消除顶部三线堆叠；修复最小化「—」图标下沉 4px 偏位与开始页标题栏中部无法拖动窗口的问题；搜索框改为圆角胶囊配矢量放大镜与角标；快速访问工具栏重绘 Fluent 回弯撤销/重做箭头（替换原方括号残形）；功能区页签条增加 `TABSTRIP_LINE` 底线并由活动白卡无缝桥接贯通，重描卡片四角 1px 外框；编辑栏补齐常驻浅灰 `× / ✓ / fx` 组与竖分隔线，统一功能区—编辑栏—网格之间严格相等的 6px 间距。
+  4. **网格、滚动条与模态框**：网格左上角全选格补齐 `◢` 斜三角角标；滚动条改为无粗黑描边的圆角胶囊滑块与细线箭头；`ui_kit::Dlg` 模态框统一升级为 8px 圆角、浅灰顶栏、粗体标题（含裸测试 `Context` 安全回退 `bold_in`）与右上圆角关闭态。
+
+**验收**：`cargo test -p app --no-default-features --features glow` 单测 **404 passed / 0 failed / 1 ignored**，`ui_regression` **20 passed / 0 failed**；截图 `work/uiaudit/r56/lancell_home.png`、`lancell_1440.png`、`lancell_1920.png`、`lancell_tabs.png`、矢量标志对照 `logo_compare_v2.png` 及 3× 局部放大 `zl_*.png`。
