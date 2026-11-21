@@ -134,6 +134,63 @@ fn ai_retry_retains_tool_results_and_undo_ids() {
 }
 
 #[test]
+fn ai_first_manual_inspection_recalculates_if_precedent_changes() {
+    let mut chat = Conversation::new();
+    chat.app.manual_calc = true;
+    chat.app.wb.calc_manual = true;
+    let input = |n| Cell { value: Value::Number(n), formula: None };
+    chat.app.wb.sheet_mut(0).set(0, 0, input(1.0));
+    chat.app.wb.sheet_mut(0).set(0, 1, Cell {
+        value: Value::Empty,
+        formula: Some("A1*2".into()),
+    });
+    chat.app.fast_recalc_cells(&[(0, 0, 0), (0, 0, 1)]);
+    chat.app.start_ai_prompt("读取 B1".into());
+    let (first, _) = chat.request();
+    respond(first, tool_event("inspect_sheet", json!({"range":"B1"})));
+    chat.poll_until(|app| app.ai.status_hint.starts_with("正在核对表格计算结果"));
+
+    chat.app.wb.sheet_mut(0).set(0, 0, input(3.0));
+    chat.app.fast_recalc_cells(&[(0, 0, 0)]);
+    chat.app.doc_gen += 1;
+    let (second, request) = chat.request();
+    let observation = request["messages"].as_array().unwrap().last().unwrap();
+    let result: JsonValue = serde_json::from_str(observation["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["cells"][0]["value"], "6");
+    assert_eq!(chat.app.wb.sheet(0).value(0, 1), Value::Empty);
+    respond(second, json!({"choices":[{"delta":{"content":"B1 是 6"}}]}));
+    chat.poll_until(|app| !app.ai.busy);
+}
+
+#[test]
+fn ai_write_samples_follow_the_written_sheet_after_reordering() {
+    let mut chat = Conversation::new();
+    let target = chat.app.wb.sheet(0).name.clone();
+    chat.app.add_sheet();
+    let number = |n| Cell { value: Value::Number(n), formula: None };
+    chat.app.wb.sheet_mut(1).set(0, 0, number(80.0));
+    for row in 0..1300 {
+        chat.app.wb.sheet_mut(0).set(row, 4, number(10.0));
+    }
+    chat.app.start_ai_prompt("填入序列并核对".into());
+    let (first, _) = chat.request();
+    respond(first, tool_event("fill_formula_range", json!({
+        "sheet": target, "range":"A1", "top_left_formula":"=SEQUENCE(2)"
+    })));
+    chat.poll_until(|app| app.ai.status_hint.starts_with("正在核对表格计算结果"));
+
+    chat.app.move_sheet(0, 1);
+    assert_eq!(chat.app.wb.sheet(1).name, target);
+    let (second, request) = chat.request();
+    let observation = request["messages"].as_array().unwrap().last().unwrap();
+    let result: JsonValue = serde_json::from_str(observation["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["samples"][0]["value"], "1");
+    assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Number(80.0));
+    respond(second, json!({"choices":[{"delta":{"content":"已核对"}}]}));
+    chat.poll_until(|app| !app.ai.busy);
+}
+
+#[test]
 fn ai_workbook_data_is_returned_only_after_a_real_tool_call() {
     let mut chat = Conversation::new();
     chat.app.wb.sheet_mut(0).set(
@@ -217,16 +274,18 @@ fn ai_clear_waits_for_approval_and_uses_displayed_selection() {
 
 #[test]
 fn ai_rejected_or_stale_approval_preserves_cells() {
-    for workbook_changed in [false, true] {
+    let number = |n| Cell {
+        value: Value::Number(n),
+        formula: None,
+    };
+    // (edit made while the card is open, approved, expected A1 afterwards)
+    for (edit, approved, expected) in [
+        (None, false, Value::Number(8.0)),
+        (Some((0, 0, 9.0)), true, Value::Number(9.0)),
+        (Some((4, 2, 1.0)), true, Value::Empty),
+    ] {
         let mut chat = Conversation::new();
-        chat.app.wb.sheet_mut(0).set(
-            0,
-            0,
-            Cell {
-                value: Value::Number(8.0),
-                formula: None,
-            },
-        );
+        chat.app.wb.sheet_mut(0).set(0, 0, number(8.0));
         chat.app.start_ai_prompt("清空 A1".into());
         let (first, _) = chat.request();
         respond(
@@ -237,12 +296,26 @@ fn ai_rejected_or_stale_approval_preserves_cells() {
             ),
         );
         chat.poll_until(|app| app.ai.confirmation_label.is_some());
-        if workbook_changed {
+        if let Some((row, col, n)) = edit {
+            // A collaborator or the user edits a cell before the card is answered.
+            chat.app.wb.sheet_mut(0).set(row, col, number(n));
             chat.app.doc_gen += 1;
         }
-        chat.app.answer_ai_confirmation(workbook_changed, &chat.ctx);
-        assert!(!chat.app.ai.busy);
-        assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Number(8.0));
+        chat.app.answer_ai_confirmation(approved, &chat.ctx);
+        if expected == Value::Empty {
+            // Only the approved target matters: an unrelated edit does not cancel it.
+            let (next, _) = chat.request();
+            respond(next, json!({"choices":[{"delta":{"content":"已清空"}}]}));
+            chat.poll_until(|app| !app.ai.busy);
+            assert_eq!(chat.app.wb.sheet(0).value(4, 2), Value::Number(1.0));
+        } else {
+            assert!(!chat.app.ai.busy);
+        }
+        assert_eq!(chat.app.wb.sheet(0).value(0, 0), expected);
+        if approved && expected != Value::Empty {
+            let error = chat.app.ai.messages.last().unwrap().error.clone().unwrap();
+            assert!(error.contains("变化"), "{error}");
+        }
     }
 }
 
@@ -259,12 +332,11 @@ fn ai_reports_invalid_call_to_model_and_refuses_edits_at_round_limit() {
         let (stream, request) = chat.request();
         let messages = request["messages"].as_array().unwrap();
         if round == 2 {
-            assert!(
-                messages.last().unwrap()["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("解析失败")
-            );
+            let repair = messages.last().unwrap();
+            assert!(repair["content"].as_str().unwrap().contains("解析失败"));
+            // Some chat templates reject a system message anywhere but first.
+            assert_eq!(repair["role"], "user");
+            assert!(messages.iter().skip(1).all(|m| m["role"] != "system"));
         } else {
             assert_eq!(messages.last().unwrap()["role"], "tool");
         }

@@ -486,6 +486,7 @@ fn ai_config_defaults_and_roundtrip() {
     assert_eq!(def.base_url, "https://deepseek.hollantex.net/v1");
     assert_eq!(def.model, "deepseek-v4.1-flash");
     assert!(def.native_tools);
+    assert!(!def.allow_unframed_text);
     assert!(def.api_key.is_empty());
     assert!(!def.data_consent, "默认未确认数据外发");
 
@@ -502,6 +503,7 @@ fn ai_config_defaults_and_roundtrip() {
         api_key: "secret-key".into(),
         model: "deepseek-v4".into(),
         native_tools: false,
+        allow_unframed_text: true,
         data_consent: true,
     };
     custom.save_to(&file);

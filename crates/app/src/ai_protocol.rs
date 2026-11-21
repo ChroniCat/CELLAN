@@ -168,6 +168,7 @@ enum TextState {
 pub(super) struct StreamAssembler {
     line_buf: Vec<u8>,
     event: String,
+    has_event_fields: bool,
     data: String,
     pending: String,
     state: TextState,
@@ -176,7 +177,7 @@ pub(super) struct StreamAssembler {
     tagged_calls: Vec<Result<ToolCallSpec, String>>,
     native_calls: BTreeMap<usize, FunctionDelta>,
     native_reasoning: Option<String>,
-    done: bool,
+    saw_done: bool,
     finish_reason: Option<String>,
     wake_ctx: Option<egui::Context>,
 }
@@ -186,6 +187,7 @@ impl StreamAssembler {
         Self {
             line_buf: Vec::new(),
             event: String::new(),
+            has_event_fields: false,
             data: String::new(),
             pending: String::new(),
             state: TextState::Visible,
@@ -194,7 +196,7 @@ impl StreamAssembler {
             tagged_calls: Vec::new(),
             native_calls: BTreeMap::new(),
             native_reasoning: None,
-            done: false,
+            saw_done: false,
             finish_reason: None,
             wake_ctx,
         }
@@ -210,33 +212,86 @@ impl StreamAssembler {
             let raw: Vec<_> = self.line_buf.drain(..=pos).collect();
             let line = std::str::from_utf8(&raw).map_err(|_| "模型流包含无效 UTF-8")?;
             self.read_line(line.trim_end_matches(['\n', '\r']), tx)?;
-            if self.done {
+            if self.saw_done {
                 return Ok(true);
             }
         }
-        Ok(false)
+        // A gateway may omit [DONE]. Process any following complete events already in
+        // this read so an actual marker or error after the final choice is still observed.
+        // A tool result can change the workbook. Keep reading until [DONE] or clean EOF
+        // in that case, so a later service error can still discard the whole tool batch.
+        Ok(self.finish_reason.is_some()
+            && !self.has_tool_call()
+            && self.line_buf.is_empty()
+            && self.data.is_empty()
+            && !self.has_event_fields)
+    }
+
+    pub(super) fn saw_done(&self) -> bool {
+        self.saw_done
+    }
+
+    pub(super) fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
+    fn has_tool_call(&self) -> bool {
+        self.finish_reason() == Some("tool_calls")
+            || self.state == TextState::Tool
+            || !self.tagged_calls.is_empty()
+            || !self.native_calls.is_empty()
+    }
+
+    /// Some gateways leave a plain-text terminal data line open indefinitely. Only this
+    /// case may be closed after an idle grace period. Tools require [DONE] or clean EOF.
+    pub(super) fn has_unframed_terminal(&self) -> bool {
+        if self.has_event_fields
+            || !self.line_buf.is_empty()
+            || self.data.is_empty()
+            || self.state != TextState::Visible
+            || !self.pending.is_empty()
+            || self.has_tool_call()
+        {
+            return false;
+        }
+        if self.data.trim() == "[DONE]" {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<JsonValue>(&self.data) else {
+            return false;
+        };
+        let choice = &value["choices"][0];
+        let delta = choice.get("delta").or_else(|| choice.get("message"));
+        choice["finish_reason"] == "stop"
+            && delta.is_none_or(|d| {
+                d["tool_calls"].is_null()
+                    && d["function_call"].is_null()
+                    && !d["content"].as_str().is_some_and(|s| s.contains("<tool_call>"))
+            })
     }
 
     fn read_line(&mut self, line: &str, tx: &Sender<StreamMsg>) -> Result<(), String> {
         if let Some(value) = line.strip_prefix("data:") {
             if !self.data.is_empty() {
-                // Legacy gateways put complete JSON objects on adjacent data lines.
-                // A partial JSON object can still span multiple SSE data fields.
-                if serde_json::from_str::<JsonValue>(&self.data).is_ok() {
+                // Legacy streams put independent JSON objects on adjacent data lines.
+                // A complete first object followed by more JSON cannot be a multiline object.
+                if !value.trim().is_empty()
+                    && (self.data.trim() == "[DONE]"
+                        || serde_json::from_str::<JsonValue>(&self.data).is_ok())
+                {
                     self.dispatch(tx)?;
                 } else {
                     self.data.push('\n');
                 }
             }
             self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
-            // Some gateways omit the empty line after the terminal marker and keep the socket open.
-            if self.data.trim() == "[DONE]" {
-                self.dispatch(tx)?;
-            }
-        } else if let Some(event) = line.strip_prefix("event:") {
-            self.event = event.trim().to_owned();
         } else if line.is_empty() {
             self.dispatch(tx)?;
+        } else {
+            self.has_event_fields = true;
+            if let Some(event) = line.strip_prefix("event:") {
+                self.event = event.trim().to_owned();
+            }
         }
         Ok(())
     }
@@ -244,6 +299,7 @@ impl StreamAssembler {
     fn dispatch(&mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
         let data = std::mem::take(&mut self.data);
         let event = std::mem::take(&mut self.event);
+        self.has_event_fields = false;
         if event == "error" {
             return Err(format!(
                 "模型服务在生成过程中返回错误：{}",
@@ -257,7 +313,7 @@ impl StreamAssembler {
             return Ok(());
         }
         if data.trim() == "[DONE]" {
-            self.done = true;
+            self.saw_done = true;
             return Ok(());
         }
         let value: JsonValue = serde_json::from_str(&data).map_err(|_| "模型流返回了无效 JSON")?;
@@ -272,6 +328,9 @@ impl StreamAssembler {
                 "模型服务在生成过程中返回错误：{}",
                 error_detail(&error.to_string())
             ));
+        }
+        if self.finish_reason.is_some() {
+            return Ok(()); // Subsequent metadata may report an error or carry [DONE], but no more choices.
         }
         let Some(choice) = value["choices"]
             .as_array()
@@ -300,19 +359,18 @@ impl StreamAssembler {
                 for (position, call) in calls.iter().enumerate() {
                     let idx = call["index"].as_u64().map_or(position, |n| n as usize);
                     let parts = self.native_calls.entry(idx).or_default();
-                    parts.id.push_str(call["id"].as_str().unwrap_or_default());
-                    parts
-                        .name
-                        .push_str(call["function"]["name"].as_str().unwrap_or_default());
+                    merge_identifier(&mut parts.id, call["id"].as_str());
+                    merge_identifier(&mut parts.name, call["function"]["name"].as_str());
                     parts
                         .arguments
                         .push_str(call["function"]["arguments"].as_str().unwrap_or_default());
                 }
             }
         }
-        if let Some(reason) = choice["finish_reason"].as_str() {
+        if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
+            self.finish_reason = Some(reason.to_owned());
             match reason {
-                "stop" | "tool_calls" => self.finish_reason = Some(reason.to_owned()),
+                "stop" | "tool_calls" => {}
                 "length" => {
                     return Err("模型回复达到长度上限，已保留收到的正文，本轮工具未执行".into());
                 }
@@ -387,17 +445,25 @@ impl StreamAssembler {
         self.pending.drain(..consumed);
     }
 
-    pub(super) fn finish(mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
-        if !self.done {
+    pub(super) fn finish(&mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
+        if !self.saw_done {
             let bytes = std::mem::take(&mut self.line_buf);
             let line = std::str::from_utf8(&bytes).map_err(|_| "模型流包含无效 UTF-8")?;
-            self.read_line(line.trim_end_matches('\r'), tx)?;
+            if !line.is_empty() {
+                self.read_line(line.trim_end_matches('\r'), tx)?;
+            }
             self.dispatch(tx)?;
         }
-        if !self.done && self.finish_reason.is_none() {
+        if !self.saw_done && self.finish_reason.is_none() {
             return Err("模型连接在返回完成标记前断开，已保留收到的正文，本轮工具未执行".into());
         }
         self.scan(true, tx);
+        // Nesting is counted so a tag merely mentioned while thinking cannot end the section
+        // early and expose drafted tool calls. The price is that an unbalanced reply stays in
+        // the thinking section; say so instead of reporting an empty answer.
+        if matches!(self.state, TextState::Thinking(_)) {
+            return Err("模型的思考段没有闭合（缺少 </think>），为安全起见本轮工具未执行".into());
+        }
         let native_reasoning = if self.native_calls.is_empty() {
             None
         } else {
@@ -449,6 +515,15 @@ impl StreamAssembler {
             return Err("回复声明调用工具，但未提供调用内容".into());
         }
         Ok(calls)
+    }
+}
+
+/// OpenAI sends a call's id and name once; some gateways repeat them in every fragment.
+/// Only genuinely split values are concatenated.
+fn merge_identifier(current: &mut String, fragment: Option<&str>) {
+    match fragment {
+        Some(part) if !part.is_empty() && part != current.as_str() => current.push_str(part),
+        _ => {}
     }
 }
 
@@ -576,6 +651,164 @@ mod tests {
             calls[0].as_json()["function"]["arguments"],
             r#"{"range":"B2"}"#
         );
+    }
+
+    #[test]
+    fn ai_native_fragments_that_repeat_id_and_name_are_not_concatenated() {
+        let piece = |args: &str| {
+            json!({"tool_calls":[{"index":0,"id":"call_rep","type":"function",
+                "function":{"name":"inspect_sheet","arguments":args}}]})
+        };
+        let split_name = json!({"tool_calls":[{"index":1,"id":"call_","function":{"name":"eval_","arguments":"{\"formula\":"}}]});
+        let split_rest = json!({"tool_calls":[{"index":1,"id":"split","function":{"name":"preview","arguments":"\"=1\"}"}}]});
+        let events = [
+            frame(piece("{\"range\":"), JsonValue::Null),
+            frame(piece("\"A1\"}"), JsonValue::Null),
+            frame(split_name, JsonValue::Null),
+            frame(split_rest, json!("tool_calls")),
+        ]
+        .concat();
+        let Some(StreamMsg::RoundDone { tool_calls: Ok(calls), .. }) = collect(&events).unwrap().pop() else {
+            panic!("tool round expected")
+        };
+        assert_eq!((calls[0].id.as_str(), calls[0].spec.name.as_str()), ("call_rep", "inspect_sheet"));
+        assert_eq!(calls[0].spec.arguments["range"], "A1");
+        assert_eq!((calls[1].id.as_str(), calls[1].spec.name.as_str()), ("call_split", "eval_preview"));
+    }
+
+    #[test]
+    fn ai_final_choice_frame_completes_without_done_or_trailing_blank_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = StreamAssembler::new(None);
+        let last = json!({"choices":[{"delta":{"content":"完成"},"finish_reason":"stop"}]});
+        // An empty finish_reason is "not finished yet", not an unknown reason.
+        let open = json!({"choices":[{"delta":{"content":"已"},"finish_reason":""}]});
+        assert!(!stream.feed_bytes(format!("data: {open}\n\n").as_bytes(), &tx).unwrap());
+        assert!(!stream.feed_bytes(format!("data: {last}\n").as_bytes(), &tx).unwrap());
+        assert!(stream.has_unframed_terminal());
+        stream.finish(&tx).unwrap();
+        assert_eq!(stream.finish_reason(), Some("stop"));
+        assert!(!stream.saw_done());
+        assert!(matches!(
+            rx.try_iter().last(),
+            Some(StreamMsg::RoundDone { visible_content, .. }) if visible_content == "已完成"
+        ));
+    }
+
+    #[test]
+    fn ai_sse_event_type_after_data_applies_to_the_whole_event() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = StreamAssembler::new(None);
+        let data = br#"data: {"message":"quota exceeded","choices":[{"delta":{"content":"ignored"},"finish_reason":"stop"}]}"#;
+        stream.feed_bytes(data, &tx).unwrap();
+        stream.feed_bytes(b"\n", &tx).unwrap();
+        assert!(stream.has_unframed_terminal());
+        stream.feed_bytes(b"eve", &tx).unwrap();
+        assert!(!stream.has_unframed_terminal());
+        stream.feed_bytes(b"nt: error\n", &tx).unwrap();
+        assert!(!stream.has_unframed_terminal());
+        let error = stream.feed_bytes(b"\n", &tx).unwrap_err();
+        assert!(error.contains("quota exceeded"));
+        assert!(rx.try_recv().is_err());
+        assert!(stream.finish_reason().is_none());
+        assert!(!stream.saw_done());
+    }
+
+    #[test]
+    fn ai_stream_idle_cannot_release_unframed_tool_calls() {
+        let call = json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"inspect_sheet","arguments":"{}"}}]});
+        for (previous, last, reason) in [
+            (json!({}), call.clone(), "tool_calls"),
+            (json!({}), call.clone(), "stop"),
+            (call, json!({}), "stop"),
+            (json!({"content":"<tool_"}), json!({"content":"call>{\"name\":\"inspect_sheet\"}</tool_call>"}), "stop"),
+            (json!({}), json!({"content":"<tool_call>{\"name\":\"inspect_sheet\"}</tool_call>"}), "stop"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let mut stream = StreamAssembler::new(None);
+            stream.feed_bytes(frame(previous, JsonValue::Null).as_bytes(), &tx).unwrap();
+            let last = frame(last, json!(reason));
+            assert!(!stream.feed_bytes(last.strip_suffix('\n').unwrap().as_bytes(), &tx).unwrap());
+            assert!(!stream.has_unframed_terminal());
+            assert!(!stream.feed_bytes(b"\n", &tx).unwrap());
+            stream.finish(&tx).unwrap();
+            assert!(matches!(rx.try_iter().last(), Some(StreamMsg::RoundDone { tool_calls: Ok(calls), .. }) if calls.len() == 1));
+        }
+    }
+
+    #[test]
+    fn ai_sse_distinguishes_done_and_finish_reason_in_the_same_read() {
+        let (tx, _) = mpsc::channel();
+        let encoded = frame(json!({"content":"hello"}), json!("stop"));
+        for (tail, saw_done) in [("", false), ("data: [DONE]\n\n", true)] {
+            let mut stream = StreamAssembler::new(None);
+            assert!(stream.feed_bytes(format!("{encoded}{tail}").as_bytes(), &tx).unwrap());
+            stream.finish(&tx).unwrap();
+            assert_eq!(stream.finish_reason(), Some("stop"));
+            assert_eq!(stream.saw_done(), saw_done);
+        }
+        let mut stream = StreamAssembler::new(None);
+        let data = frame(json!({"content":"hello"}), JsonValue::Null) + "data: [DONE]";
+        assert!(!stream.feed_bytes(data.as_bytes(), &tx).unwrap());
+        stream.finish(&tx).unwrap();
+        assert!(stream.finish_reason().is_none());
+        assert!(stream.saw_done());
+    }
+
+    #[test]
+    fn ai_terminal_choice_waits_for_a_following_event_already_in_progress() {
+        let (tx, rx) = mpsc::channel();
+        let last = frame(json!({"content":"hello"}), json!("stop"));
+        let mut stream = StreamAssembler::new(None);
+        let partial = format!("{last}data: {{\"mess");
+        assert!(!stream.feed_bytes(partial.as_bytes(), &tx).unwrap());
+        assert!(!stream.has_unframed_terminal());
+        let error = stream.feed_bytes(b"age\":\"late error\"}\nevent: error\n\n", &tx).unwrap_err();
+        assert!(error.contains("late error"));
+        assert!(matches!(rx.try_iter().collect::<Vec<_>>().as_slice(), [StreamMsg::ContentDelta(_)]));
+
+        let mut stream = StreamAssembler::new(None);
+        assert!(!stream.feed_bytes(format!("{last}data: [DO").as_bytes(), &tx).unwrap());
+        assert!(stream.feed_bytes(b"NE]\n\n", &tx).unwrap());
+        assert!(stream.saw_done());
+
+        let mut stream = StreamAssembler::new(None);
+        assert!(!stream.feed_bytes(partial.as_bytes(), &tx).unwrap());
+        assert!(stream.finish(&tx).is_err()); // EOF cannot hide a malformed trailing event.
+    }
+
+    #[test]
+    fn ai_tool_choice_waits_for_later_errors_and_a_verified_end() {
+        let tool = json!({"tool_calls":[{"id":"c","function":{"name":"inspect_sheet","arguments":"{}"}}]});
+        let last = frame(tool, json!("tool_calls"));
+        for send_done in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let mut stream = StreamAssembler::new(None);
+            assert!(!stream.feed_bytes(last.as_bytes(), &tx).unwrap());
+            assert!(rx.try_recv().is_err());
+            if send_done {
+                assert!(stream.feed_bytes(b"data: [DONE]\n\n", &tx).unwrap());
+            }
+            stream.finish(&tx).unwrap();
+            assert_eq!(stream.saw_done(), send_done);
+            assert!(matches!(rx.try_recv(), Ok(StreamMsg::RoundDone { tool_calls: Ok(calls), .. }) if calls.len() == 1));
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut stream = StreamAssembler::new(None);
+        assert!(!stream.feed_bytes(last.as_bytes(), &tx).unwrap());
+        let error = stream.feed_bytes(b"event: error\ndata: {\"message\":\"tool failed\"}\n\n", &tx).unwrap_err();
+        assert!(error.contains("tool failed"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ai_unclosed_thinking_section_is_reported_and_runs_no_tools() {
+        let reply = frame(
+            json!({"content":"<think>先想想 <think> 这个标签 </think> 然后 <tool_call>{\"name\":\"set_cells\",\"arguments\":{}}</tool_call>"}),
+            json!("stop"),
+        );
+        let error = collect(&reply).err().expect("unbalanced thinking must fail");
+        assert!(error.contains("</think>"), "{error}");
     }
 
     #[test]
