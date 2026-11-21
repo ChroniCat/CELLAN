@@ -2190,6 +2190,8 @@ struct SheetApp {
         )>,
     >,
     bg_recalc_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Formulas done / total for a full background recalculation (valid while `bg_recalc_rx` is set).
+    bg_recalc_progress: std::sync::Arc<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>,
     /// 大文件依赖图还在后台准备，先别让用户编辑
     deps_pending: bool,
     /// Background channels move with their owning document when switching tabs.
@@ -3399,6 +3401,7 @@ impl SheetApp {
             bg_deps_rx: None,
             bg_recalc_rx: None,
             bg_recalc_cancel: None,
+            bg_recalc_progress: Default::default(),
             deps_pending: false,
             tasks: DocumentTasks::default(),
             doc_gen: 0,
@@ -7677,9 +7680,17 @@ impl SheetApp {
         }
     }
 
+    /// Formulas done / total of the running full background recalculation, if known.
+    fn silent_recalc_progress(&self) -> Option<(usize, usize)> {
+        use std::sync::atomic::Ordering;
+        let total = self.bg_recalc_progress.1.load(Ordering::Relaxed);
+        (self.bg_recalc_rx.is_some() && total > 0)
+            .then(|| (self.bg_recalc_progress.0.load(Ordering::Relaxed), total))
+    }
+
     fn start_silent_recalc(&mut self, ctx: &egui::Context) {
-        let pending_recalc = !self.wb.calc_manual && self.tasks.recalc_pending()
-            && !self.ai_calculation_in_progress();
+        // The assistant waits for this job instead of calculating its own copy.
+        let pending_recalc = !self.wb.calc_manual && self.tasks.recalc_pending();
         if pending_recalc
             && self.bg_recalc_rx.is_none()
             && !self.tasks.busy
@@ -7701,6 +7712,9 @@ impl SheetApp {
             let doc_gen = self.doc_gen;
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.bg_recalc_cancel = Some(cancel.clone());
+            let progress: std::sync::Arc<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)> =
+                Default::default();
+            self.bg_recalc_progress = progress.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             self.bg_recalc_rx = Some(rx);
             let wake = ctx.clone();
@@ -7713,7 +7727,8 @@ impl SheetApp {
                     }
                     None
                 } else {
-                    if !sheetcore::formula::recalc_all_force_impl(&mut wb2, Some(&cancel), None)
+                    let (done, total): &(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize) = &progress;
+                    if !sheetcore::formula::recalc_all_force_impl(&mut wb2, Some(&cancel), Some((done, total)))
                         || cancel.load(Ordering::Relaxed) { return; }
                     Some(Box::new(sheetcore::formula::deps::Deps::build(&wb2)))
                 };

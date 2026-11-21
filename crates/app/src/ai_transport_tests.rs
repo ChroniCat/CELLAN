@@ -111,6 +111,39 @@ fn chunked_delta_and_done_are_delivered_while_the_server_is_still_open() {
 }
 
 #[test]
+fn final_choice_frame_completes_while_the_server_keeps_the_socket_open() {
+    let c = client();
+    let mut server = accept_request(&c.listener);
+    server.write_all(HEADERS).unwrap();
+    chunk(&mut server, DELTA);
+    assert_next_delta(&c, "hello");
+    // No [DONE], no trailing blank line, no zero chunk and no FIN.
+    chunk(
+        &mut server,
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+    );
+    assert!(matches!(
+        c.events.recv_timeout(DEADLINE),
+        Ok(StreamMsg::RoundDone { visible_content, .. }) if visible_content == "hello"
+    ));
+    c.result.recv_timeout(DEADLINE).unwrap().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn only_failures_before_a_connection_existed_are_replayed_via_proxy() {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let replay = platform::replayable_send_failure;
+    assert!(replay(ERROR_WINHTTP_NAME_NOT_RESOLVED, false));
+    assert!(replay(ERROR_WINHTTP_CANNOT_CONNECT, false));
+    // A firewall silently dropping direct connections only surfaces as a timeout.
+    assert!(replay(ERROR_WINHTTP_TIMEOUT, false));
+    // Once connected, the POST may have reached the server.
+    assert!(!replay(ERROR_WINHTTP_TIMEOUT, true));
+    assert!(!replay(ERROR_WINHTTP_CONNECTION_ERROR, true));
+}
+
+#[test]
 fn truncated_chunked_reply_keeps_the_displayed_delta_and_is_not_replayed() {
     let c = client();
     let mut server = accept_request(&c.listener);

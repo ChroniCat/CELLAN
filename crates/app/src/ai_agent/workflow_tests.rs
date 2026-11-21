@@ -217,16 +217,18 @@ fn ai_clear_waits_for_approval_and_uses_displayed_selection() {
 
 #[test]
 fn ai_rejected_or_stale_approval_preserves_cells() {
-    for workbook_changed in [false, true] {
+    let number = |n| Cell {
+        value: Value::Number(n),
+        formula: None,
+    };
+    // (edit made while the card is open, approved, expected A1 afterwards)
+    for (edit, approved, expected) in [
+        (None, false, Value::Number(8.0)),
+        (Some((0, 0, 9.0)), true, Value::Number(9.0)),
+        (Some((4, 2, 1.0)), true, Value::Empty),
+    ] {
         let mut chat = Conversation::new();
-        chat.app.wb.sheet_mut(0).set(
-            0,
-            0,
-            Cell {
-                value: Value::Number(8.0),
-                formula: None,
-            },
-        );
+        chat.app.wb.sheet_mut(0).set(0, 0, number(8.0));
         chat.app.start_ai_prompt("清空 A1".into());
         let (first, _) = chat.request();
         respond(
@@ -237,12 +239,26 @@ fn ai_rejected_or_stale_approval_preserves_cells() {
             ),
         );
         chat.poll_until(|app| app.ai.confirmation_label.is_some());
-        if workbook_changed {
+        if let Some((row, col, n)) = edit {
+            // A collaborator or the user edits a cell before the card is answered.
+            chat.app.wb.sheet_mut(0).set(row, col, number(n));
             chat.app.doc_gen += 1;
         }
-        chat.app.answer_ai_confirmation(workbook_changed, &chat.ctx);
-        assert!(!chat.app.ai.busy);
-        assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Number(8.0));
+        chat.app.answer_ai_confirmation(approved, &chat.ctx);
+        if expected == Value::Empty {
+            // Only the approved target matters: an unrelated edit does not cancel it.
+            let (next, _) = chat.request();
+            respond(next, json!({"choices":[{"delta":{"content":"已清空"}}]}));
+            chat.poll_until(|app| !app.ai.busy);
+            assert_eq!(chat.app.wb.sheet(0).value(4, 2), Value::Number(1.0));
+        } else {
+            assert!(!chat.app.ai.busy);
+        }
+        assert_eq!(chat.app.wb.sheet(0).value(0, 0), expected);
+        if approved && expected != Value::Empty {
+            let error = chat.app.ai.messages.last().unwrap().error.clone().unwrap();
+            assert!(error.contains("变化"), "{error}");
+        }
     }
 }
 
@@ -259,12 +275,11 @@ fn ai_reports_invalid_call_to_model_and_refuses_edits_at_round_limit() {
         let (stream, request) = chat.request();
         let messages = request["messages"].as_array().unwrap();
         if round == 2 {
-            assert!(
-                messages.last().unwrap()["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("解析失败")
-            );
+            let repair = messages.last().unwrap();
+            assert!(repair["content"].as_str().unwrap().contains("解析失败"));
+            // Some chat templates reject a system message anywhere but first.
+            assert_eq!(repair["role"], "user");
+            assert!(messages.iter().skip(1).all(|m| m["role"] != "system"));
         } else {
             assert_eq!(messages.last().unwrap()["role"], "tool");
         }

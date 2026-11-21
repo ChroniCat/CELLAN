@@ -220,17 +220,15 @@ impl StreamAssembler {
     fn read_line(&mut self, line: &str, tx: &Sender<StreamMsg>) -> Result<(), String> {
         if let Some(value) = line.strip_prefix("data:") {
             if !self.data.is_empty() {
-                // Legacy gateways put complete JSON objects on adjacent data lines.
-                // A partial JSON object can still span multiple SSE data fields.
-                if serde_json::from_str::<JsonValue>(&self.data).is_ok() {
-                    self.dispatch(tx)?;
-                } else {
-                    self.data.push('\n');
-                }
+                // Complete events are dispatched below, so this is a JSON object that
+                // spans several SSE data fields.
+                self.data.push('\n');
             }
             self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
-            // Some gateways omit the empty line after the terminal marker and keep the socket open.
-            if self.data.trim() == "[DONE]" {
+            // Legacy gateways put complete objects on adjacent data lines, and some omit the
+            // empty line after the last frame while keeping the socket open: don't wait for it.
+            let data = self.data.trim();
+            if data == "[DONE]" || serde_json::from_str::<JsonValue>(data).is_ok_and(|v| v.is_object()) {
                 self.dispatch(tx)?;
             }
         } else if let Some(event) = line.strip_prefix("event:") {
@@ -300,19 +298,22 @@ impl StreamAssembler {
                 for (position, call) in calls.iter().enumerate() {
                     let idx = call["index"].as_u64().map_or(position, |n| n as usize);
                     let parts = self.native_calls.entry(idx).or_default();
-                    parts.id.push_str(call["id"].as_str().unwrap_or_default());
-                    parts
-                        .name
-                        .push_str(call["function"]["name"].as_str().unwrap_or_default());
+                    merge_identifier(&mut parts.id, call["id"].as_str());
+                    merge_identifier(&mut parts.name, call["function"]["name"].as_str());
                     parts
                         .arguments
                         .push_str(call["function"]["arguments"].as_str().unwrap_or_default());
                 }
             }
         }
-        if let Some(reason) = choice["finish_reason"].as_str() {
+        if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
             match reason {
-                "stop" | "tool_calls" => self.finish_reason = Some(reason.to_owned()),
+                "stop" | "tool_calls" => {
+                    self.finish_reason = Some(reason.to_owned());
+                    // The final choice frame completes the reply even when a gateway never
+                    // sends [DONE] and keeps the connection open.
+                    self.done = true;
+                }
                 "length" => {
                     return Err("模型回复达到长度上限，已保留收到的正文，本轮工具未执行".into());
                 }
@@ -398,6 +399,12 @@ impl StreamAssembler {
             return Err("模型连接在返回完成标记前断开，已保留收到的正文，本轮工具未执行".into());
         }
         self.scan(true, tx);
+        // Nesting is counted so a tag merely mentioned while thinking cannot end the section
+        // early and expose drafted tool calls. The price is that an unbalanced reply stays in
+        // the thinking section; say so instead of reporting an empty answer.
+        if matches!(self.state, TextState::Thinking(_)) {
+            return Err("模型的思考段没有闭合（缺少 </think>），为安全起见本轮工具未执行".into());
+        }
         let native_reasoning = if self.native_calls.is_empty() {
             None
         } else {
@@ -449,6 +456,15 @@ impl StreamAssembler {
             return Err("回复声明调用工具，但未提供调用内容".into());
         }
         Ok(calls)
+    }
+}
+
+/// OpenAI sends a call's id and name once; some gateways repeat them in every fragment.
+/// Only genuinely split values are concatenated.
+fn merge_identifier(current: &mut String, fragment: Option<&str>) {
+    match fragment {
+        Some(part) if !part.is_empty() && part != current.as_str() => current.push_str(part),
+        _ => {}
     }
 }
 
@@ -576,6 +592,55 @@ mod tests {
             calls[0].as_json()["function"]["arguments"],
             r#"{"range":"B2"}"#
         );
+    }
+
+    #[test]
+    fn ai_native_fragments_that_repeat_id_and_name_are_not_concatenated() {
+        let piece = |args: &str| {
+            json!({"tool_calls":[{"index":0,"id":"call_rep","type":"function",
+                "function":{"name":"inspect_sheet","arguments":args}}]})
+        };
+        let split_name = json!({"tool_calls":[{"index":1,"id":"call_","function":{"name":"eval_","arguments":"{\"formula\":"}}]});
+        let split_rest = json!({"tool_calls":[{"index":1,"id":"split","function":{"name":"preview","arguments":"\"=1\"}"}}]});
+        let events = [
+            frame(piece("{\"range\":"), JsonValue::Null),
+            frame(piece("\"A1\"}"), JsonValue::Null),
+            frame(split_name, JsonValue::Null),
+            frame(split_rest, json!("tool_calls")),
+        ]
+        .concat();
+        let Some(StreamMsg::RoundDone { tool_calls: Ok(calls), .. }) = collect(&events).unwrap().pop() else {
+            panic!("tool round expected")
+        };
+        assert_eq!((calls[0].id.as_str(), calls[0].spec.name.as_str()), ("call_rep", "inspect_sheet"));
+        assert_eq!(calls[0].spec.arguments["range"], "A1");
+        assert_eq!((calls[1].id.as_str(), calls[1].spec.name.as_str()), ("call_split", "eval_preview"));
+    }
+
+    #[test]
+    fn ai_final_choice_frame_completes_without_done_or_trailing_blank_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut stream = StreamAssembler::new(None);
+        let last = json!({"choices":[{"delta":{"content":"完成"},"finish_reason":"stop"}]});
+        // An empty finish_reason is "not finished yet", not an unknown reason.
+        let open = json!({"choices":[{"delta":{"content":"已"},"finish_reason":""}]});
+        assert!(!stream.feed_bytes(format!("data: {open}\n\n").as_bytes(), &tx).unwrap());
+        assert!(stream.feed_bytes(format!("data: {last}\n").as_bytes(), &tx).unwrap());
+        stream.finish(&tx).unwrap();
+        assert!(matches!(
+            rx.try_iter().last(),
+            Some(StreamMsg::RoundDone { visible_content, .. }) if visible_content == "已完成"
+        ));
+    }
+
+    #[test]
+    fn ai_unclosed_thinking_section_is_reported_and_runs_no_tools() {
+        let reply = frame(
+            json!({"content":"<think>先想想 <think> 这个标签 </think> 然后 <tool_call>{\"name\":\"set_cells\",\"arguments\":{}}</tool_call>"}),
+            json!("stop"),
+        );
+        let error = collect(&reply).err().expect("unbalanced thinking must fail");
+        assert!(error.contains("</think>"), "{error}");
     }
 
     #[test]

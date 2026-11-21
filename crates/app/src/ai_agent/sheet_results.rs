@@ -1,7 +1,7 @@
 use super::{cell_name, formula, json, range_label, FValue, JsonValue, SheetApp, Value};
 use eframe::egui;
 use sheetcore::Workbook;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 pub(super) enum AiToolOutput {
@@ -15,45 +15,196 @@ impl From<(String, JsonValue)> for AiToolOutput {
     }
 }
 
+type ToolRead = Box<dyn FnOnce(WorkbookToolView<'_>) -> (String, JsonValue) + Send>;
+type SnapshotDone = ((String, JsonValue), Arc<Workbook>);
+
+/// A calculated copy kept while manual calculation prevents updating the visible workbook.
+/// `replay` lists cells the assistant wrote after the copy was calculated.
+pub(super) struct AiCalcBase {
+    revision: (u64, u64, u64),
+    wb: Arc<Workbook>,
+    replay: Vec<(usize, u32, u32)>,
+}
+
 pub(super) struct AiToolCalculation {
-    pub rx: mpsc::Receiver<(String, JsonValue)>,
-    cancel: Arc<AtomicBool>,
+    kind: CalcKind,
+}
+
+enum CalcKind {
+    /// Automatic calculation: the app's background job (incremental where possible)
+    /// writes its result into the live workbook, then the tool reads that.
+    Live(Option<ToolRead>),
+    /// Manual calculation: calculate a private copy without touching the visible values.
+    Snapshot {
+        rx: mpsc::Receiver<SnapshotDone>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<(AtomicUsize, AtomicUsize)>,
+        revision: (u64, u64, u64),
+    },
 }
 
 impl Drop for AiToolCalculation {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if let CalcKind::Snapshot { cancel, .. } = &self.kind {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
+pub(super) enum CalcPoll {
+    Pending(Option<(usize, usize)>),
+    Ready(String, JsonValue),
+    Failed(String),
+}
+
 impl SheetApp {
+    pub(super) fn ai_calc_revision(&self) -> (u64, u64, u64) {
+        (self.doc_uid, self.doc_gen, self.wb_epoch)
+    }
+
+    fn ai_values_calculated(&self) -> bool {
+        !self.wb.calc_pending && !self.tasks.recalc_pending()
+    }
+
+    /// Whether cells written after `ai_calc_base` was calculated can be recalculated alone.
+    fn ai_incremental_safe(&self) -> bool {
+        self.deps_built
+            && !self.deps.requires_full_recalc()
+            && !self.wb.calc_iterate
+            && !self.wb.sheets.iter().any(|s| {
+                !s.spilled.is_empty() || !s.spill_shapes.is_empty() || !s.arrays.is_empty()
+            })
+    }
+
     pub(super) fn with_calculated_ai_view(
         &mut self,
         ctx: &egui::Context,
         read: impl FnOnce(WorkbookToolView<'_>) -> (String, JsonValue) + Send + 'static,
     ) -> AiToolOutput {
         let sheet_idx = self.sheet_idx;
-        if !self.wb.calc_pending && !self.tasks.recalc_pending() {
+        if self.ai_values_calculated() {
             return read(WorkbookToolView { wb: &self.wb, sheet_idx }).into();
         }
-        // Verify the revision observed by this tool. The live workbook keeps its calculation
-        // mode, pending jobs and any edits made while the snapshot is calculating.
-        self.cancel_silent_recalc();
-        let mut snapshot = self.wb.clone();
+        if !self.wb.calc_manual {
+            // Reuse the regular background recalculation instead of cancelling it and
+            // calculating the whole workbook again; its result also clears the pending state.
+            if !self.tasks.recalc_pending() {
+                self.request_silent_bg_recalc();
+            }
+            ctx.request_repaint();
+            return AiToolOutput::Calculating(AiToolCalculation {
+                kind: CalcKind::Live(Some(Box::new(read))),
+            });
+        }
+        let revision = self.ai_calc_revision();
+        let base = self.ai.calc_base.take().filter(|b| b.revision == revision);
+        if let Some(cached) = base.as_ref().filter(|b| b.replay.is_empty()) {
+            let result = read(WorkbookToolView { wb: &cached.wb, sheet_idx });
+            self.ai.calc_base = base;
+            return result.into();
+        }
+        let incremental = base.filter(|_| self.ai_incremental_safe()).map(|base| {
+            let mut copy = (*base.wb).clone();
+            copy.styles = self.wb.styles.clone();
+            for &(si, r, c) in &base.replay {
+                let live = self.wb.sheet(si);
+                let target = copy.sheet_mut(si);
+                match live.get(r, c) {
+                    Some(cell) => target.set(r, c, cell.clone()),
+                    None => {
+                        let _ = target.remove(r, c);
+                    }
+                }
+                target.set_style(r, c, live.style_of(r, c));
+            }
+            (copy, self.deps.clone(), base.replay)
+        });
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
+        let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let (worker_cancel, worker_progress) = (cancel.clone(), progress.clone());
+        let full = incremental.is_none().then(|| self.wb.clone());
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
-            if formula::recalc_all_force_impl(&mut snapshot, Some(&worker_cancel), None)
-                && !worker_cancel.load(Ordering::Relaxed)
-            {
-                let result = read(WorkbookToolView { wb: &snapshot, sheet_idx });
-                let _ = tx.send(result);
+            let calculated = match (incremental, full) {
+                (Some((mut copy, deps, seeds)), _) => {
+                    // The copy mirrors manual mode; calculate only the written cells' closure.
+                    copy.calc_manual = false;
+                    let ok = formula::recalc_dirty_cancelable(&mut copy, &deps, &seeds, &worker_cancel);
+                    copy.calc_manual = true;
+                    ok.then_some(copy)
+                }
+                (None, Some(mut copy)) => {
+                    let (done, total) = (&worker_progress.0, &worker_progress.1);
+                    formula::recalc_all_force_impl(&mut copy, Some(&worker_cancel), Some((done, total)))
+                        .then_some(copy)
+                }
+                (None, None) => None,
+            };
+            if let Some(copy) = calculated.filter(|_| !worker_cancel.load(Ordering::Relaxed)) {
+                let result = read(WorkbookToolView { wb: &copy, sheet_idx });
+                let _ = tx.send((result, Arc::new(copy)));
             }
             wake.request_repaint();
         });
-        AiToolOutput::Calculating(AiToolCalculation { rx, cancel })
+        AiToolOutput::Calculating(AiToolCalculation {
+            kind: CalcKind::Snapshot { rx, cancel, progress, revision },
+        })
+    }
+
+    /// Cells written by the assistant keep a manual-mode calculated copy reusable.
+    pub(super) fn note_ai_written_cells(&mut self, before: (u64, u64, u64), sheet: usize, keys: &[(u32, u32)]) {
+        let after = self.ai_calc_revision();
+        match self.ai.calc_base.as_mut() {
+            Some(base) if base.revision == before && self.wb.calc_manual => {
+                base.replay.extend(keys.iter().map(|&(r, c)| (sheet, r, c)));
+                base.revision = after;
+            }
+            _ => self.ai.calc_base = None,
+        }
+    }
+
+    pub(super) fn poll_ai_calculation(
+        &mut self,
+        job: &mut AiToolCalculation,
+        ctx: &egui::Context,
+    ) -> CalcPoll {
+        match &mut job.kind {
+            CalcKind::Live(read) => {
+                if self.wb.calc_manual {
+                    return CalcPoll::Failed("计算模式在核对期间已切换为手动".into());
+                }
+                if !self.ai_values_calculated() {
+                    if !self.tasks.recalc_pending() {
+                        self.request_silent_bg_recalc();
+                    }
+                    // Idempotent with the frame loop; also drives the job in headless tests.
+                    self.poll_silent_recalc();
+                    self.start_silent_recalc(ctx);
+                    if !self.ai_values_calculated() {
+                        return CalcPoll::Pending(self.silent_recalc_progress());
+                    }
+                }
+                let Some(read) = read.take() else {
+                    return CalcPoll::Failed("公式复核任务已结束".into());
+                };
+                let (label, result) = read(WorkbookToolView { wb: &self.wb, sheet_idx: self.sheet_idx });
+                CalcPoll::Ready(label, result)
+            }
+            CalcKind::Snapshot { rx, progress, revision, .. } => match rx.try_recv() {
+                Ok(((label, result), wb)) => {
+                    if *revision == self.ai_calc_revision() {
+                        self.ai.calc_base = Some(AiCalcBase { revision: *revision, wb, replay: Vec::new() });
+                    }
+                    CalcPoll::Ready(label, result)
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let total = progress.1.load(Ordering::Relaxed);
+                    CalcPoll::Pending((total > 0).then(|| (progress.0.load(Ordering::Relaxed), total)))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => CalcPoll::Failed("公式复核任务意外退出".into()),
+            },
+        }
     }
 }
 
@@ -233,15 +384,30 @@ mod tests {
     use super::*;
     use crate::ai_agent::{build_workbook_context, ToolCallSpec};
     use sheetcore::Cell;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn tool(name: &str, arguments: JsonValue) -> ToolCallSpec {
         ToolCallSpec { name: name.into(), arguments }
     }
 
-    fn calculated(output: AiToolOutput) -> JsonValue {
-        let AiToolOutput::Calculating(job) = output else { panic!("pending formula caches require calculation") };
-        job.rx.recv_timeout(Duration::from_secs(10)).expect("calculation finished").1
+    fn calculated(app: &mut SheetApp, ctx: &egui::Context, output: AiToolOutput) -> JsonValue {
+        let AiToolOutput::Calculating(mut job) = output else { panic!("pending formula caches require calculation") };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match app.poll_ai_calculation(&mut job, ctx) {
+                CalcPoll::Ready(_, result) => return result,
+                CalcPoll::Failed(error) => panic!("{error}"),
+                CalcPoll::Pending(_) => {
+                    assert!(Instant::now() < deadline, "calculation did not finish");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn immediate(output: AiToolOutput) -> JsonValue {
+        let AiToolOutput::Ready(_, result) = output else { panic!("calculated values must be reused") };
+        result
     }
 
     #[test]
@@ -253,14 +419,26 @@ mod tests {
         let output = app.execute_ai_tool(&tool("set_cells", json!({"edits": [
             {"cell":"A1","value":4}, {"cell":"B1","formula":"=A1*3"}, {"cell":"C1","formula":"=1/0"}
         ]})), &ctx);
-        let written = calculated(output);
+        let written = calculated(&mut app, &ctx, output);
         assert_eq!(written["samples"][1]["value"], "12");
         assert_eq!(written["errors"], json!(["C1=#DIV/0!"]));
         assert!(app.wb.calc_manual && app.wb.calc_pending);
         assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty);
-        assert!(build_workbook_context(&app).contains("待重算"));
+        assert!(build_workbook_context(&app, app.sheet_idx, app.sel_rect()).contains("待重算"));
+        // The calculated copy is reused while nothing else changed.
         let output = app.execute_ai_tool(&tool("inspect_sheet", json!({"range":"B1"})), &ctx);
-        assert_eq!(calculated(output)["cells"][0]["value"], "12");
+        assert_eq!(immediate(output)["cells"][0]["value"], "12");
+        // A later write is replayed onto that copy and only its dependents are recalculated.
+        let output = app.execute_ai_tool(&tool("set_cells", json!({"edits": [{"cell":"A1","value":5}]})), &ctx);
+        assert_eq!(calculated(&mut app, &ctx, output)["samples"][0]["value"], "5");
+        let output = app.execute_ai_tool(&tool("inspect_sheet", json!({"range":"B1"})), &ctx);
+        assert_eq!(immediate(output)["cells"][0]["value"], "15");
+        assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty, "manual mode keeps visible values");
+        // Any other change makes the copy unusable.
+        app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(6.0), formula: None });
+        app.doc_gen += 1;
+        let output = app.execute_ai_tool(&tool("inspect_sheet", json!({"range":"B1"})), &ctx);
+        assert_eq!(calculated(&mut app, &ctx, output)["cells"][0]["value"], "18");
     }
 
     #[test]
@@ -273,9 +451,12 @@ mod tests {
         let output = app.execute_ai_tool(&tool("fill_formula_range", json!({
             "range":"A1", "top_left_formula":"=SEQUENCE(2)"
         })), &ctx);
-        assert_eq!(calculated(output)["samples"][0]["value"], "1");
+        assert_eq!(calculated(&mut app, &ctx, output)["samples"][0]["value"], "1");
+        // The background job wrote its result into the live workbook, so the next read is immediate.
+        assert!(!app.wb.calc_pending && !app.tasks.recalc_pending());
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(2.0));
         let output = app.execute_ai_tool(&tool("inspect_sheet", json!({"range":"A2"})), &ctx);
-        assert_eq!(calculated(output)["cells"][0]["value"], "2");
+        assert_eq!(immediate(output)["cells"][0]["value"], "2");
     }
 
     #[test]

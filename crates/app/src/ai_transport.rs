@@ -211,8 +211,8 @@ pub(super) fn stream_post(
         };
         trace.log(route, end);
         cancel.check()?;
-        // WinHttpConnect doesn't actually open a socket until SendRequest. Only
-        // DNS/connect failures there can be replayed without duplicating a POST.
+        // WinHttpConnect doesn't actually open a socket until SendRequest. Only failures
+        // before a TCP connection existed can be replayed without duplicating a POST.
         #[cfg(windows)]
         if route == "direct" && trace.connect_failed {
             continue;
@@ -272,6 +272,15 @@ mod platform {
         tx: mpsc::Sender<Event>,
         body: Vec<u8>,
         buffer: Vec<u8>,
+        connected: std::sync::Arc<AtomicBool>,
+    }
+
+    /// Whether a failed send can be replayed through the proxy without duplicating a POST.
+    /// A timeout counts only if no TCP connection was ever made (e.g. a firewall silently
+    /// dropping direct connections on a proxy-only network).
+    pub(super) fn replayable_send_failure(code: u32, connected: bool) -> bool {
+        matches!(code, ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT)
+            || (code == ERROR_WINHTTP_TIMEOUT && !connected)
     }
 
     unsafe extern "system" fn callback(
@@ -300,7 +309,16 @@ mod platform {
                 status,
                 size: unsafe { *info.cast::<u32>() },
             },
-            _ => Event::Complete { status, size },
+            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
+            | WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
+            | WINHTTP_CALLBACK_STATUS_READ_COMPLETE => Event::Complete { status, size },
+            WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER => {
+                unsafe { &(*ctx).connected }.store(true, Ordering::Release);
+                return;
+            }
+            // Informational notifications (WinHTTP may deliver the whole connect group)
+            // complete no API call; forwarding them would fail the pending wait.
+            _ => return,
         };
         let _ = unsafe { &(*ctx).tx }.send(event);
     }
@@ -364,10 +382,12 @@ mod platform {
                 let _ = events.send(Event::Cancel);
             }
         })?;
+        let connected = std::sync::Arc::new(AtomicBool::new(false));
         let mut ctx = Box::new(Context {
             tx: events,
             body: body.to_vec(),
             buffer: vec![0; BUFFER_BYTES],
+            connected: connected.clone(),
         });
         let body_ptr = ctx.body.as_ptr();
         let read_ptr = ctx.buffer.as_mut_ptr();
@@ -387,7 +407,8 @@ mod platform {
             }
             return Err(err);
         }
-        let notifications = WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
+        let notifications = WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER
+            | WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
             | WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
             | WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE
             | WINHTTP_CALLBACK_STATUS_READ_COMPLETE
@@ -435,10 +456,7 @@ mod platform {
             )
         };
         if let Err(code) = wait(send, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE) {
-            trace.connect_failed = matches!(
-                code,
-                ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT
-            );
+            trace.connect_failed = replayable_send_failure(code, connected.load(Ordering::Acquire));
             return Err(win_error("发送请求失败", code));
         }
         cancel.check()?;

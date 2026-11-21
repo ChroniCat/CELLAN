@@ -162,6 +162,8 @@ pub struct AiState {
     pub messages: Vec<AiMessage>,
     wire_history: VecDeque<(String, String)>,
     active_round: Option<ActiveTurn>,
+    /// Manual calculation only: calculated copy reused by later reads in the same turn.
+    calc_base: Option<AiCalcBase>,
     confirmation_label: Option<String>,
     pub busy: bool,
     pub round: usize,
@@ -190,6 +192,7 @@ impl Default for AiState {
             messages: Vec::new(),
             wire_history: VecDeque::new(),
             active_round: None,
+            calc_base: None,
             confirmation_label: None,
             busy: false,
             round: 0,
@@ -360,7 +363,7 @@ fn system_prompt() -> &'static str {
 }
 
 mod sheet_results;
-use sheet_results::{AiToolCalculation, AiToolOutput, WorkbookToolView, WrittenCells};
+use sheet_results::{AiCalcBase, AiToolCalculation, AiToolOutput, CalcPoll, WorkbookToolView, WrittenCells};
 
 fn checked_address(address: &str) -> Option<(u32, u32)> {
     let address = address.trim().strip_prefix('$').unwrap_or(address.trim());
@@ -384,10 +387,11 @@ fn checked_ai_range(range: &str) -> Option<(u32, u32, u32, u32)> {
     Some((ra.min(rb), ca.min(cb), ra.max(rb), ca.max(cb)))
 }
 
-fn build_workbook_context(app: &SheetApp) -> String {
+/// `sheet_idx` and `selection` are the view the model was given when the question was asked.
+fn build_workbook_context(app: &SheetApp, sheet_idx: usize, selection: (u32, u32, u32, u32)) -> String {
     let mut out = String::new();
-    let (r1, c1, r2, c2) = app.sel_rect();
-    let active_sh = app.wb.sheet(app.sheet_idx);
+    let (r1, c1, r2, c2) = selection;
+    let active_sh = app.wb.sheet(sheet_idx);
     out.push_str(&format!("当前工作簿：{}\n", app.wb.title()));
     out.push_str("工作表列表：\n");
     for (idx, sh) in app.wb.sheets.iter().enumerate() {
@@ -395,7 +399,7 @@ fn build_workbook_context(app: &SheetApp) -> String {
             .used_bounds()
             .map(|(a, b, c, d)| range_label((a, b), (c, d)))
             .unwrap_or_else(|| "空表".into());
-        let mark = if idx == app.sheet_idx { "（当前活动）" } else { "" };
+        let mark = if idx == sheet_idx { "（当前活动）" } else { "" };
         out.push_str(&format!("- {}{}: 已用范围 {}\n", sh.name, mark, bounds));
     }
     out.push_str(&format!(
@@ -520,10 +524,22 @@ impl SheetApp {
     fn execute_ai_tool(&mut self, tc: &ToolCallSpec, ctx: &egui::Context) -> AiToolOutput {
         let checkpoint = self.undo.checkpoint();
         let output = match tc.name.as_str() {
-            "inspect_workbook" => AiToolOutput::Ready(
-                "读取工作簿概览".into(),
-                json!({"ok": true, "overview": build_workbook_context(self)}),
-            ),
+            "inspect_workbook" => {
+                // Pinned by the turn; direct calls (tests, older turns) fall back to the live view.
+                let sheet = tc.arguments["sheet"]
+                    .as_str()
+                    .and_then(|name| self.resolve_sheet_index(Some(name)))
+                    .unwrap_or(self.sheet_idx);
+                let selection = tc.arguments["selection"]
+                    .as_str()
+                    .and_then(checked_ai_range)
+                    .or_else(|| (sheet == self.sheet_idx).then(|| self.sel_rect()))
+                    .unwrap_or((0, 0, 0, 0));
+                AiToolOutput::Ready(
+                    "读取工作簿概览".into(),
+                    json!({"ok": true, "overview": build_workbook_context(self, sheet, selection)}),
+                )
+            }
             "inspect_sheet" | "search_cells" | "eval_preview" => {
                 let tc = tc.clone();
                 self.with_calculated_ai_view(ctx, move |view| match tc.name.as_str() {
@@ -533,13 +549,17 @@ impl SheetApp {
                 })
             }
             "set_cells" | "fill_formula_range" => {
+                let before = self.ai_calc_revision();
                 let write = if tc.name == "set_cells" {
                     self.tool_set_cells(&tc.arguments)
                 } else {
                     self.tool_fill_formula_range(&tc.arguments)
                 };
                 match write {
-                    Ok(written) => self.with_calculated_ai_view(ctx, move |view| written.result(view.wb)),
+                    Ok(written) => {
+                        self.note_ai_written_cells(before, written.sheet, &written.keys);
+                        self.with_calculated_ai_view(ctx, move |view| written.result(view.wb))
+                    }
                     Err(result) => result.into(),
                 }
             }
