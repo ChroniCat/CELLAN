@@ -340,7 +340,7 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
     for (si, other) in wb.sheets.iter().enumerate().filter(|(si, _)| *si != sheet) {
         let shift = Shift { axis, at, n, delete, target_sheet: target.name.clone(), own_sheet: other.name.clone(), translate: None, row_filter: None, col_filter: None };
         let changes = |f: &str| crate::refs::rewrite(f, &shift) != f;
-        let cells: Vec<_> = other.iter().filter(|(_, c)| c.formula.as_deref().is_some_and(changes))
+        let cells: Vec<_> = other.foreign_formula_cells(&target.name).filter(|(_, c)| c.formula.as_deref().is_some_and(changes))
             .map(|(key, c)| (key, c.clone())).collect();
         let cf = other.cf.blocks.iter().any(|block| block.rules.iter().any(|rule| match &rule.kind {
             crate::cf::CfKind::Expr { formula, .. } => changes(formula),

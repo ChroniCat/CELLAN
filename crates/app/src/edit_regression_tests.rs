@@ -95,6 +95,29 @@ fn selection_html_carries_formula_format_merge_and_newlines() {
 }
 
 #[test]
+fn external_plain_text_does_not_reuse_a_large_cut_selection() {
+    let _env = crate::test_env::TestEnv::new("external-text-after-large-cut");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    for row in 0..16_000 {
+        app.wb.sheets[0].set(row, 0, number(f64::from(row)));
+    }
+    app.sel = (0, 0);
+    app.sel_end = (15_999, 0);
+    app.clip_copy(true, &ctx);
+    crate::set_test_clipboard("external");
+    app.sel = (0, 1);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 1).display(), "external");
+    assert_eq!(app.wb.sheets[0].value(15_999, 0), Value::Number(15_999.0));
+    assert!(app.wb.sheets[0].get(1, 1).is_none());
+    // An external TSV made entirely of separators is still newer than the cut block.
+    app.clip_paste(false, Some("\t\n".into()));
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Empty);
+    assert_eq!(app.wb.sheets[0].value(15_999, 0), Value::Number(15_999.0));
+}
+
+#[test]
 fn paste_prefers_new_system_clipboard_over_stale_internal_clip() {
     let mut app = app();
     let ctx = egui::Context::default();
@@ -775,6 +798,59 @@ fn structural_undo_restores_cross_sheet_formulas_names_and_layout() {
     app.editing = Some(EditState::new("30".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(30.0));
+}
+
+#[test]
+fn large_structural_edits_preserve_cross_sheet_undo_and_save_pending_calculation() {
+    let _env = crate::test_env::TestEnv::new("large-structural");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.wb.sheets[0].name = "Source data".into();
+    app.wb.sheets[0].set(1, 0, number(41.0));
+    let mut large = sheetcore::Sheet::new("Large");
+    for r in 0..10_000 { large.set(r, 0, number(r as f64)); }
+    large.get_mut(9_999, 0).unwrap().formula = Some("='sOurCe DaTa'!A2".into());
+    app.wb.sheets.push(large);
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert!(app.tasks.needs_full && !app.deps_built);
+    assert_eq!(app.wb.sheets[1].get(9_999, 0).unwrap().formula.as_deref(), Some("='sOurCe DaTa'!A3"));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[1].get(9_999, 0).unwrap().formula.as_deref(), Some("='sOurCe DaTa'!A2"));
+    app.do_undo(true);
+    assert_eq!(app.wb.sheets[1].get(9_999, 0).unwrap().formula.as_deref(), Some("='sOurCe DaTa'!A3"));
+    app.wb.calc_manual = true;
+    app.manual_calc = true;
+    app.structural(sheetcore::structural::Structural::DeleteRows { at: 0, n: 1 });
+    assert!(app.wb.calc_pending && !app.tasks.needs_full);
+    assert_eq!(app.wb.sheets[1].get(9_999, 0).unwrap().formula.as_deref(), Some("='sOurCe DaTa'!A2"));
+}
+
+#[test]
+fn inserting_rows_rewrites_both_conditional_format_thresholds_and_undo_restores_them() {
+    use sheetcore::cf::{CfBlock, CfKind, CfOp, CfRule};
+    let _env = crate::test_env::TestEnv::new("conditional-threshold-structure");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut dependent = sheetcore::Sheet::new("Report");
+    dependent.cf.blocks.push(CfBlock {
+        ranges: vec![(0, 0, 3, 0)],
+        rules: vec![CfRule {
+            kind: CfKind::CellIs {
+                op: CfOp::Between, a: "Sheet1!$A$1".into(), b: "Sheet1!$B$2+1".into(), dxf: 0
+            },
+            stop: false, priority: 1,
+        }],
+    });
+    app.wb.sheets.push(dependent);
+    let thresholds = |app: &SheetApp| {
+        let CfKind::CellIs { a, b, .. } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else { unreachable!() };
+        (a.clone(), b.clone())
+    };
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(thresholds(&app), ("Sheet1!$A$2".into(), "Sheet1!$B$3+1".into()));
+    assert!(app.wb.sheet(1).cf_dirty);
+    app.do_undo(false);
+    assert_eq!(thresholds(&app), ("Sheet1!$A$1".into(), "Sheet1!$B$2+1".into()));
 }
 
 fn run_grid_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
@@ -2234,7 +2310,7 @@ fn cut_from_a_protected_sheet_cannot_be_pasted() {
     second.protection = Some(sheetcore::protection::SheetProtection::default());
     app.wb.sheets.push(second);
     let cells = vec![vec![(Cell { value: sheetcore::model::Value::Number(7.0), formula: None }, 0)]];
-    app.clip = Some(Clip { merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
     app.sheet_idx = 0;
     app.sel = (2, 2);
     let before = snapshot(&app);
@@ -2257,7 +2333,7 @@ fn paste_special_values_transpose_and_operations() {
         vec![(num(1.0), 0), (num(2.0), 0)],
         vec![(num(3.0), 0), (num(4.0), 0)],
     ];
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells,
@@ -2296,7 +2372,7 @@ fn paste_special_formula_shifts_relative_and_keeps_absolute() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     let src = Cell { value: Value::Number(5.0), formula: Some("=A1+$B$1".into()) };
-    let clip = |rect: (u32, u32, u32, u32)| Clip { merges: Vec::new(),
+    let clip = |rect: (u32, u32, u32, u32)| Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect,
         cells: vec![vec![(src.clone(), 0)]],
@@ -2339,7 +2415,7 @@ fn paste_special_all_carries_font_and_fill_and_undoes_once() {
         ..Default::default()
     });
     let cell = Cell { value: Value::Number(9.0), formula: None };
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(cell, sid as u16)]],
@@ -2371,7 +2447,7 @@ fn paste_special_transpose_keeps_source_coordinates() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     // 源 A1:B1，两个公式分别为 =A1 与 =B1
     let f = |t: &str| (Cell { value: Value::Empty, formula: Some(t.into()) }, 0u16);
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 1),
         cells: vec![vec![f("=A1"), f("=B1")]],
@@ -2413,7 +2489,7 @@ fn paste_special_divide_by_zero_reports_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(8.0), formula: None });
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (5, 5, 5, 5),
         cells: vec![vec![(Cell { value: Value::Number(0.0), formula: None }, 0)]],
@@ -4475,7 +4551,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
         let depth = app.undo.depth();
         // 2×2 剪贴板：选择性粘贴的目标区域是锚点 + 剪贴板尺寸，这样才会覆盖被锁的 B2
         let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-        let clip = Clip { merges: Vec::new(),
+        let clip = Clip { source_rows: None, merges: Vec::new(),
             sheet: 0,
             rect: (0, 0, 1, 1),
             cells: vec![vec![cell("粘贴"), cell("粘贴")], vec![cell("粘贴"), cell("粘贴")]],
@@ -4510,7 +4586,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
 
     // 普通粘贴：2×2 内部剪贴板 → 目标覆盖 B2
     let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("P"), cell("P")], vec![cell("P"), cell("P")]],
@@ -4521,7 +4597,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
     assert!(app.status.contains("戊"), "粘贴应指出锁持有人：{}", app.status);
 
     // 剪切粘贴：源块里就有被锁格
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("C"), cell("C")], vec![cell("C"), cell("C")]],
@@ -5264,7 +5340,7 @@ fn filter_clear_keeps_filter_and_manual_hidden_rows() {
     f.criteria.insert(1, sheetcore::sort_filter::Criterion::new(
         sheetcore::sort_filter::CmpOp::Gt, "15"));
     sh.filter = Some(f.clone());
-    sh.hidden_rows = f.hidden_rows(sh);
+    sh.hidden_rows = f.hidden_rows(sh).into();
     sh.hidden_rows_user.insert(5);
     sh.set(0, 3, sheetcore::Cell { value: Value::Number(50.0), formula: Some("=SUBTOTAL(9,B2:B4)".into()) });
     assert!(sh.hidden_rows.contains(&1), "10 应被条件隐藏");
@@ -5312,7 +5388,7 @@ fn filter_clear_survives_save_reload() {
     f.criteria.insert(1, sheetcore::sort_filter::Criterion::new(
         sheetcore::sort_filter::CmpOp::Gt, "15"));
     sh.filter = Some(f.clone());
-    sh.hidden_rows = f.hidden_rows(sh);
+    sh.hidden_rows = f.hidden_rows(sh).into();
     sh.hidden_rows_user.insert(4);
     app.ribbon_action("FilterClear", &ctx);
     let tmp = std::env::current_exe()
@@ -5510,7 +5586,7 @@ fn paste_special_formula_translates_negative_and_positive_offsets() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     let f = |s: &str| Cell { value: Value::Number(3.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(2, 2, f("=A1+$B$1")); // C3
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
@@ -5550,7 +5626,7 @@ fn paste_special_transpose_keeps_original_source_coordinates() {
     let f = |s: &str| Cell { value: Value::Number(1.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(0, 0, f("=A2")); // A1
     app.wb.sheet_mut(0).set(1, 0, f("=A3")); // A2
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 0),
         cells: vec![
@@ -5588,7 +5664,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: Some("=3+4".into()) });
     app.wb.sheet_mut(0).set_style(0, 0, sid);
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), sid)]],
@@ -5606,7 +5682,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     // 除以 0：显示 #DIV/0!，不能静默保留原值
     app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Number(5.0), formula: None });
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(0.0), formula: None });
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)]],
@@ -5775,7 +5851,7 @@ fn paste_special_all_translates_formula_offsets() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$1".into()) });
     app.wb.sheet_mut(0).set_style(2, 2, sid);
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), sid)]],
@@ -5807,7 +5883,7 @@ fn paste_special_transpose_negative_offset_is_ref_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(1.0), formula: Some("=A1".into()) }); // C3
-    app.clip = Some(Clip { merges: Vec::new(),
+    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
@@ -7589,7 +7665,7 @@ fn status_stats_follow_active_filter_hidden_rows() {
     assert!(stat.contains("求和: 10"), "只统计可见的 A 行：{stat}");
     assert!(stat.contains("计数: 3"), "表头+A 行类型+A 行数值：{stat}");
     // 宿主应用筛选时还会把 hidden_rows 同步下来，结果必须一致
-    sh.hidden_rows = hidden;
+    sh.hidden_rows = hidden.into();
     let again = status_stats_rects(&sh, &[(0, 0, 2, 1)], 0b11_1111);
     assert_eq!(again, stat);
 }
@@ -9955,7 +10031,7 @@ fn find_all_window_with_no_hits_shows_empty_state() {
     ctx.set_visuals(egui::Visuals::light());
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.find.find_all_open = true;
-    app.find.find_all.clear();
+    app.find.find_all = Default::default();
     let mut raw = egui::RawInput::default();
     raw.screen_rect = Some(egui::Rect::from_min_size(
         egui::Pos2::ZERO,
@@ -10751,4 +10827,67 @@ fn dv_filter_100k_items_is_frame_cheap() {
     }
     eprintln!("[ui19.1] filter 100k worst={worst:.1}ms");
     assert!(worst < 50.0, "10 万项过滤 {worst:.1}ms 超过一帧预算");
+}
+
+#[test]
+fn filtered_cut_tracks_source_rows_for_formulas_clearing_and_undo() {
+    let _env = crate::test_env::TestEnv::new("filtered-cut-origin");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let sh = app.wb.sheet_mut(0);
+    sh.set(0, 0, text("keep A1"));
+    sh.set(1, 0, text("keep A2"));
+    sh.set(9, 1, formula("=A10"));
+    sh.set(10, 1, text("hidden"));
+    sh.set(11, 1, formula("=A12"));
+    sh.hidden_rows.insert(10);
+    app.sel = (9, 1);
+    app.sel_end = (11, 1);
+    app.clip_copy(true, &ctx);
+    let from_windows = app.clip_stamp.as_ref().unwrap().replace('\n', "\r\n");
+    app.sel = (19, 3);
+    app.sel_end = app.sel;
+    app.clip_paste(false, Some(from_windows));
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.value(0, 0), Value::Text("keep A1".into()));
+    assert_eq!(sh.value(1, 0), Value::Text("keep A2".into()));
+    assert_eq!(sh.value(10, 1), Value::Text("hidden".into()));
+    assert!(sh.get(9, 1).is_none() && sh.get(11, 1).is_none());
+    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=C20"));
+    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=C21"));
+    app.do_undo(false);
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.get(9, 1).unwrap().formula.as_deref(), Some("=A10"));
+    assert_eq!(sh.get(11, 1).unwrap().formula.as_deref(), Some("=A12"));
+    assert!(sh.get(19, 3).is_none() && sh.get(20, 3).is_none());
+}
+
+#[test]
+fn visible_axes_reuse_geometry_and_refresh_for_same_size_visibility_edits() {
+    let _env = crate::test_env::TestEnv::new("view-axis-cache");
+    let mut app = app();
+    app.wb.sheet_mut(0).hidden_rows.extend(10..90_000);
+    let (cols, rows) = app.view_axes();
+    assert_eq!(rows.size(10), 0.0);
+    let again = app.view_axes();
+    assert!(std::sync::Arc::ptr_eq(&cols, &again.0));
+    assert!(std::sync::Arc::ptr_eq(&rows, &again.1));
+    let snapshot = app.wb.clone();
+    let sh = app.wb.sheet_mut(0);
+    sh.hidden_rows.remove(&10);
+    sh.hidden_rows.insert(9);
+    sh.hidden_cols.insert(2);
+    let (changed_cols, changed_rows) = app.view_axes();
+    assert_eq!(changed_rows.size(9), 0.0);
+    assert!(changed_rows.size(10) > 0.0);
+    assert_eq!(changed_cols.size(2), 0.0);
+    app.wb = snapshot;
+    assert_eq!(app.view_axes().1.size(10), 0.0);
+    let sh = app.wb.sheet_mut(0);
+    sh.rows.set(1, 30.0);
+    sh.hidden_rows_user.insert(2);
+    app.set_zoom(1.5);
+    let (_, rows) = app.view_axes();
+    assert_eq!(rows.size(1), 45.0);
+    assert_eq!(rows.size(2), 0.0);
 }

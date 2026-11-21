@@ -3,7 +3,54 @@
 //! 位置计算不能按 `i * 默认宽` 算——一旦某列被拉宽，后面所有列都要顺移。
 //! 这里维护「自定义项 + 累计偏移」，位置查询是 O(log n)，改一项是 O(n)（改尺寸很少发生）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn layout_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A snapshot can share a set of hidden indices until its first edit.
+/// Revisions distinguish divergent snapshots even if they hide the same number of rows.
+#[derive(Clone, Debug)]
+pub struct HiddenIndices {
+    indices: std::sync::Arc<HashSet<u32>>,
+    revision: u64,
+}
+
+impl From<HashSet<u32>> for HiddenIndices {
+    fn from(indices: HashSet<u32>) -> Self {
+        Self { indices: std::sync::Arc::new(indices), revision: layout_revision() }
+    }
+}
+
+impl Default for HiddenIndices {
+    fn default() -> Self { HashSet::new().into() }
+}
+
+impl HiddenIndices {
+    pub fn revision(&self) -> u64 { self.revision }
+}
+
+impl PartialEq for HiddenIndices {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision || self.indices == other.indices
+    }
+}
+
+impl std::ops::Deref for HiddenIndices {
+    type Target = HashSet<u32>;
+    fn deref(&self) -> &Self::Target { &self.indices }
+}
+
+impl std::ops::DerefMut for HiddenIndices {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.revision = layout_revision();
+        std::sync::Arc::make_mut(&mut self.indices)
+    }
+}
+
 
 /// Excel 96 DPI 的默认列宽（54 pt = 72 px）
 pub const DEFAULT_COL_W: f32 = 72.0;
@@ -12,6 +59,7 @@ pub const DEFAULT_ROW_H: f32 = 18.0;
 
 #[derive(Clone, Debug)]
 pub struct Axis {
+    revision: u64,
     default: f32,
     sizes: BTreeMap<u32, f32>,
     /// 与 sizes 同序的累计偏移：(索引, 该索引之前的额外偏移)
@@ -26,8 +74,10 @@ impl Default for Axis {
 
 impl Axis {
     pub fn new(default: f32) -> Self {
-        Self { default, sizes: BTreeMap::new(), prefix: Vec::new() }
+        Self { revision: layout_revision(), default, sizes: BTreeMap::new(), prefix: Vec::new() }
     }
+
+    pub fn revision(&self) -> u64 { self.revision }
 
     pub fn set(&mut self, i: u32, size: f32) {
         if (size - self.default).abs() < 0.01 {
@@ -53,6 +103,7 @@ impl Axis {
     }
 
     fn rebuild(&mut self) {
+        self.revision = layout_revision();
         self.prefix.clear();
         self.prefix.reserve(self.sizes.len());
         let mut extra = 0.0;

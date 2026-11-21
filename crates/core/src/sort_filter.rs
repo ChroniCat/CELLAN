@@ -474,28 +474,32 @@ impl Filter {
         if r2 > used_max_r.saturating_add(64) {
             r2 = used_max_r.saturating_add(1).min(r2);
         }
-        for r in (r1 + 1)..=r2 {
-            for (col, allowed) in self.allows.iter() {
-                if *col < c1 || *col > c2 {
-                    continue;
-                }
-                let v = sheet.get(r, *col).map(|c| c.value.display()).unwrap_or_default();
-                if !allowed.contains(&v) {
-                    out.insert(r);
-                    break;
+        let columns: std::collections::BTreeSet<_> = self.allows.keys().chain(self.criteria.keys())
+            .copied().filter(|&c| c >= c1 && c <= c2).collect();
+        let passes = |col: u32, text: &str| {
+            self.allows.get(&col).is_none_or(|a| a.contains(text))
+                && self.criteria.get(&col).is_none_or(|rule| rule.matches(text))
+        };
+        if r1 >= r2 { return out; }
+        let first = r1 + 1;
+        if let Some(&required) = columns.iter().find(|&&c| !passes(c, "")) {
+            // Every visible row must have a matching cell in this column. Emit hidden
+            // gaps directly instead of looking up every empty cell in every filter.
+            let mut next = first;
+            for (key, cell) in sheet.iter_rect((first, required, r2, required)) {
+                if passes(required, &cell.value.display()) && columns.iter().all(|&c| {
+                    c == required || passes(c, &sheet.get(key.row, c).map(|v| v.value.display()).unwrap_or_default())
+                }) {
+                    out.extend(next..key.row);
+                    next = key.row.saturating_add(1);
                 }
             }
-            if out.contains(&r) {
-                continue;
-            }
-            for (col, crit) in self.criteria.iter() {
-                if *col < c1 || *col > c2 {
-                    continue;
-                }
-                let v = sheet.get(r, *col).map(|c| c.value.display()).unwrap_or_default();
-                if !crit.matches(&v) {
-                    out.insert(r);
-                    break;
+            out.extend(next..=r2);
+        } else {
+            // Empty rows satisfy all filters. Only stored cells can disqualify a row.
+            for col in columns {
+                for (key, cell) in sheet.iter_rect((first, col, r2, col)) {
+                    if !passes(col, &cell.value.display()) { out.insert(key.row); }
                 }
             }
         }
@@ -511,22 +515,68 @@ impl Filter {
 
 /// 某列在筛选区域里的去重值（按显示文本，排序后返回）
 pub fn unique_values(sheet: &Sheet, range: (u32, u32, u32, u32), col: u32) -> Vec<String> {
-    let (r1, _, mut r2, _) = range;
-    let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
-    if r2 > used_max_r.saturating_add(64) {
-        r2 = used_max_r.saturating_add(1).min(r2);
+    FilterColumn::new(sheet, range, col).choices().0
+}
+
+/// Shares the source column's pages; a pending popup never retains drawings or other columns.
+#[derive(Clone)]
+pub struct FilterColumn {
+    pages: Vec<(u32, std::sync::Arc<Vec<Cell>>)>,
+    header: u32,
+    last: u32,
+}
+
+impl FilterColumn {
+    pub fn new(sheet: &Sheet, range: (u32, u32, u32, u32), col: u32) -> Self {
+        let mut pages = sheet.column_pages(col);
+        pages.retain(|(base, cells)| *base <= range.2 && base.saturating_add(cells.len() as u32) > range.0.saturating_add(1));
+        pages.sort_unstable_by_key(|(base, _)| *base);
+        Self { pages, header: range.0, last: range.2 }
     }
-    let mut set: HashSet<String> = HashSet::new();
-    for r in (r1 + 1)..=r2 {
-        let v = sheet.get(r, col).map(|c| c.value.display()).unwrap_or_default();
-        set.insert(v);
+
+    pub fn same_pages(&self, other: &Self) -> bool {
+        self.header == other.header && self.last == other.last && self.pages.len() == other.pages.len()
+            && self.pages.iter().zip(&other.pages).all(|((a, x), (b, y))| a == b && std::sync::Arc::ptr_eq(x, y))
     }
-    let mut out: Vec<String> = set.into_iter().collect();
-    out.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a.cmp(b),
-    });
-    out
+
+    pub fn choices(self) -> (Vec<String>, bool) {
+        self.choices_while(|| true).unwrap()
+    }
+
+    pub fn choices_while(self, keep: impl Fn() -> bool) -> Option<(Vec<String>, bool)> {
+        let mut unique = HashSet::new();
+        let mut populated = 0;
+        for (base, cells) in self.pages {
+            if !keep() { return None; }
+            let start = self.header.saturating_add(1).saturating_sub(base) as usize;
+            if self.last < base || start >= cells.len() { continue; }
+            let end = ((self.last - base) as usize + 1).min(cells.len());
+            for cell in cells.iter().take(end).skip(start) {
+                if !cell.is_blank() {
+                    populated += 1;
+                    unique.insert(cell.value.display());
+                }
+            }
+        }
+        if populated < self.last.saturating_sub(self.header) {
+            unique.insert(String::new());
+        }
+        let mut nonempty = unique.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).peekable();
+        let numeric = nonempty.peek().is_some() && nonempty.all(|s| s.parse::<f64>().is_ok());
+        // A total ordering also handles mixed numeric and text columns consistently.
+        let mut choices: Vec<_> = unique.into_iter().map(|s| (s.parse::<f64>().ok(), s)).collect();
+        if !keep() { return None; }
+        choices.sort_unstable_by(|(an, a), (bn, b)| {
+            use std::cmp::Ordering;
+            match (an, bn) {
+                (Some(x), Some(y)) => x.total_cmp(y).then_with(|| a.cmp(b)),
+                (Some(_), None) if !b.is_empty() => Ordering::Less,
+                (None, Some(_)) if !a.is_empty() => Ordering::Greater,
+                _ => a.cmp(b),
+            }
+        });
+        keep().then(|| (choices.into_iter().map(|(_, s)| s).collect(), numeric))
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +721,27 @@ mod tests {
         // 远处空格自成一块
         let (r1, c1, r2, c2) = current_region(&s, 20, 5);
         assert_eq!((r1, c1, r2, c2), (20, 5, 20, 5));
+    }
+
+    #[test]
+    fn sparse_filter_preserves_blank_criteria_and_one_trailing_row() {
+        let mut sh = Sheet::new("Sparse");
+        let cell = |s: &str| Cell { value: Value::Text(s.into()), formula: None };
+        sh.set(0, 0, cell("Header"));
+        sh.set(17, 0, cell("drop"));
+        sh.set(9000, 0, cell("keep"));
+        sh.set(9000, 1, cell("no"));
+        let mut f = Filter::new(0, 0, 1_048_575, 1);
+        f.allows.insert(0, ["".into(), "keep".into()].into_iter().collect());
+        assert_eq!(f.hidden_rows(&sh), [17].into_iter().collect());
+        f.allows.insert(1, ["".into()].into_iter().collect());
+        assert_eq!(f.hidden_rows(&sh), [17,9000].into_iter().collect());
+        f.allows.insert(0, ["keep".into()].into_iter().collect());
+        assert_eq!(f.hidden_rows(&sh), (1..=9001).collect());
+        f.allows.remove(&1);
+        let hidden = f.hidden_rows(&sh);
+        assert_eq!(hidden.len(), 9000);
+        assert!(hidden.contains(&9001) && !hidden.contains(&9000));
     }
 
     #[test]

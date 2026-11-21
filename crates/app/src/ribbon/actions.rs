@@ -1447,7 +1447,7 @@ impl SheetApp {
             "SymDegreeC" => self.insert_quick_symbol('℃'),
             "SymStar" => self.insert_quick_symbol('★'),
             "SymCircle1" => self.insert_quick_symbol('①'),
-            "DvCircleInvalid" => { self.circle_invalid = true; self.invalid_gen = u64::MAX; self.compute_invalid(); self.status = format!("已圈出 {} 个不合规单元格", self.invalid_cells.len()); }
+            "DvCircleInvalid" => self.show_invalid(ctx),
             "DvClearCircles" => { self.circle_invalid = false; self.invalid_cells.clear(); self.status = "已清除无效数据圈释".into(); }
             "DvClearValidation" => self.clear_dv_in_sel(),
 

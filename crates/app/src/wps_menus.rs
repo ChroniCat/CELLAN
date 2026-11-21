@@ -699,7 +699,7 @@ impl SheetApp {
     }
 
     fn render_clip_cells_to_rgba(&self, clip: &Clip) -> (u32, u32, Vec<u8>) {
-        if clip.sheet < self.wb.sheets.len() && !clip.cells.is_empty() {
+        if clip.source_rows.is_none() && clip.sheet < self.wb.sheets.len() && !clip.cells.is_empty() {
             return self.render_range_to_rgba(clip.sheet, clip.rect);
         }
         self.render_matrix_to_rgba(&clip.cells)
@@ -767,6 +767,7 @@ impl SheetApp {
         self.clip_pic = None;
         self.clip_stamp = Some(tsv);
         self.clip = Some(Clip {
+            source_rows: None,
             sheet: self.sheet_idx,
             rect: (r1, c1, r2, c2),
             cells,
@@ -876,9 +877,9 @@ impl SheetApp {
         let sys = crate::read_system_clip();
         let ext_text = if sys.text.is_empty() { None } else { Some(sys.text) };
         let internal: Option<Clip> = match (&self.clip, &ext_text) {
-            (Some(clip), Some(t)) if !t.trim_end().is_empty() => {
+            (Some(clip), Some(t)) => {
                 let same = match &self.clip_stamp {
-                    Some(stamp) => t.replace("\r\n", "\n").trim_end() == stamp.replace("\r\n", "\n").trim_end(),
+                    Some(stamp) => crate::copied_text_matches(stamp, t),
                     None => true,
                 };
                 if same { Some(clip.clone()) } else { None }
@@ -887,10 +888,10 @@ impl SheetApp {
             (None, _) => None,
         };
         let (matrix, coords, src_sheet_idx, src_rect, src_col_widths) = if let Some(clip) = internal {
-            let (sr1, sc1, _, sc2) = clip.rect;
+            let (_, sc1, _, sc2) = clip.rect;
             let mut coords = Vec::with_capacity(clip.cells.len());
             for (i, row) in clip.cells.iter().enumerate() {
-                coords.push((0..row.len()).map(|j| (sr1 + i as u32, sc1 + j as u32)).collect());
+                coords.push((0..row.len()).map(|j| (clip.source_row(i), sc1 + j as u32)).collect());
             }
             let widths: Vec<f32> = if clip.sheet < self.wb.sheets.len() {
                 (sc1..=sc2).map(|c| self.wb.sheet(clip.sheet).cols.size(c)).collect()
@@ -1099,8 +1100,9 @@ impl SheetApp {
             self.status = "源工作表已不存在".into();
             return;
         }
-        let (sr1, sc1, sr2, sc2) = clip.rect;
-        let rows = sr2 - sr1 + 1;
+        let (_, sc1, _, sc2) = clip.rect;
+        let rows = clip.cells.len() as u32;
+        if rows == 0 { return; }
         let cols = sc2 - sc1 + 1;
         if (rows as u64) * (cols as u64) > 200_000 {
             self.status = "粘贴链接范围过大（最多 20 万格）".into();
@@ -1121,7 +1123,7 @@ impl SheetApp {
         let mut touched = Vec::new();
         for i in 0..rows {
             for j in 0..cols {
-                let (sr, sc) = (sr1 + i, sc1 + j);
+                let (sr, sc) = (clip.source_row(i as usize), sc1 + j);
                 let (dr, dc) = (r0 + i, c0 + j);
                 let target_ref = if clip.sheet == si {
                     format!("={}", cell_name(sr, sc))
@@ -2274,17 +2276,7 @@ impl SheetApp {
     }
 
     pub(crate) fn clear_dv_in_sel(&mut self) {
-        let (r1, c1, r2, c2) = self.sel_rect();
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
-        let before = sheet.dv.len();
-        sheet.dv.retain(|d| {
-            !d.ranges
-                .iter()
-                .any(|&(a, b, cc, d2)| a <= r2 && cc >= r1 && b <= c2 && d2 >= c1)
-        });
-        if sheet.dv.len() != before {
-            sheet.dv_dirty = true;
-            self.wb.dirty = true;
+        if self.replace_validation_rule(self.sel_rect(), None) {
             self.status = "已清除所选范围的数据验证".into();
         } else {
             self.status = "所选范围没有数据验证".into();

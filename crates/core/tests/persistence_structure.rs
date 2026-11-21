@@ -16,6 +16,34 @@ impl Drop for Fixture {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
 }
 fn number(n: f64) -> Cell { Cell { value: Value::Number(n), formula: None } }
+
+#[test]
+fn foreign_structural_fast_path_agrees_with_the_reference_rewriter() {
+    let original = [
+        "=SUM(数据!A2:A5)", "='O''Brien!明细'!$D$3", "=sAlEs!2:4",
+        "='Unused'!B1+数据!E2", "=INDIRECT(\"Sales!A1\")", "='[1]Sales'!B3",
+        "=SUM(Orders[Sales])+A2", "=SalesTax!A2", "=SUM(数据!A:A)",
+    ];
+    for name in ["数据", "O'Brien!明细", "Sales", "Not present"] {
+        let mut sheet = Sheet::new("Other");
+        for (i, src) in original.iter().enumerate() {
+            // Both set() and an existing cell mutated via get_mut() can add a reference.
+            let r = 300 * i as u32;
+            let mut cell = number(1.0);
+            if i % 2 == 0 { cell.formula = Some((*src).into()); }
+            sheet.set(r, 0, cell);
+            if i % 2 == 1 { sheet.get_mut(r, 0).unwrap().formula = Some((*src).into()); }
+        }
+        let shift = sheetcore::refs::Shift {
+            target_sheet: name.into(), own_sheet: sheet.name.clone(), n: 2, ..Default::default()
+        };
+        sheet.rewrite_references(&shift);
+        for (i, src) in original.iter().enumerate() {
+            assert_eq!(sheet.get(300 * i as u32, 0).unwrap().formula.as_deref(),
+                       Some(sheetcore::refs::rewrite(src, &shift).as_str()));
+        }
+    }
+}
 fn names(wb: &Workbook) -> Vec<&str> { wb.sheets.iter().map(|s| s.name.as_str()).collect() }
 fn assert_cells(expected: &Sheet, actual: &Sheet) {
     for r in 0..8 {

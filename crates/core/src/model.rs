@@ -97,6 +97,10 @@ pub struct Sheet {
     pub source_part: Option<String>,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
     cells: Store,
+    /// Cell storage revision represented by the current OOXML source part.
+    /// Recalculation can change formula caches without marking a user edit.
+    pub(crate) saved_cells: Option<crate::store::CellVersion>,
+    display_style_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: std::collections::HashSet<CellRef>,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
@@ -157,11 +161,11 @@ pub struct Sheet {
     /// 自动筛选
     pub filter: Option<crate::sort_filter::Filter>,
     /// 被筛选隐藏的行（渲染时按高度 0 处理）
-    pub hidden_rows: std::collections::HashSet<u32>,
+    pub hidden_rows: crate::layout::HiddenIndices,
     /// 用户手动隐藏的行（和筛选隐藏分开，筛选重算不会清掉）
-    pub hidden_rows_user: std::collections::HashSet<u32>,
+    pub hidden_rows_user: crate::layout::HiddenIndices,
     /// 用户手动隐藏的列
-    pub hidden_cols: std::collections::HashSet<u32>,
+    pub hidden_cols: crate::layout::HiddenIndices,
     /// 列宽/行高/隐藏状态被改过：保存时要重写 <cols> 和行属性
     pub layout_dirty: bool,
     /// 方案管理器里的方案（写进 <scenarios>）
@@ -228,6 +232,8 @@ impl Sheet {
             identity: next_sheet_identity(),
             source_part: None,
             cells: Store::default(),
+            saved_cells: None,
+            display_style_revision: 0,
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
             spill_shapes: std::collections::HashMap::new(),
@@ -257,9 +263,9 @@ impl Sheet {
             freeze: None,
             freeze_dirty: false,
             filter: None,
-            hidden_rows: std::collections::HashSet::new(),
-            hidden_rows_user: std::collections::HashSet::new(),
-            hidden_cols: std::collections::HashSet::new(),
+            hidden_rows: Default::default(),
+            hidden_rows_user: Default::default(),
+            hidden_cols: Default::default(),
             layout_dirty: false,
             scenarios: Vec::new(),
             scenarios_dirty: false,
@@ -298,6 +304,7 @@ impl Sheet {
     pub fn renew_identity(&mut self) {
         self.identity = next_sheet_identity();
         self.source_part = None;
+        self.saved_cells = None;
     }
 
     pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {
@@ -307,6 +314,23 @@ impl Sheet {
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
         self.cells.get_mut(r, c)
     }
+
+    pub(crate) fn foreign_formula_cells<'a>(&'a self, sheet_name: &'a str) -> impl Iterator<Item = (CellRef, &'a Cell)> {
+        let quoted = format!("'{}'", sheet_name.replace('\'', "''"));
+        self.cells.foreign_formula_cells().filter(move |(_, cell)| {
+            // Every qualified local reference accepted by the rewriter ends in
+            // one of these spellings before '!'. It handles final token boundaries,
+            // strings and external books itself, so a false positive stays harmless.
+            let formula = cell.formula.as_deref().unwrap();
+            formula.match_indices('!').any(|(end, _)| {
+                [sheet_name.as_bytes(), quoted.as_bytes()].iter().any(|name| {
+                    end >= name.len() && formula.as_bytes()[end-name.len()..end].eq_ignore_ascii_case(name)
+                })
+            })
+        })
+    }
+
+    pub fn has_formulas(&self) -> bool { self.cells.has_formulas() }
 
     pub fn value(&self, r: u32, c: u32) -> Value {
         self.cells.get(r, c).map(|x| x.value.clone()).unwrap_or_default()
@@ -377,6 +401,51 @@ impl Sheet {
 
     pub fn cell_revision(&self) -> u64 { self.cells.revision() }
 
+    pub(crate) fn cell_version(&self) -> &crate::store::CellVersion { &self.cells.version }
+
+    pub(crate) fn cell_data_needs_save(&self) -> bool {
+        self.edited || !self.cleared.is_empty() || match &self.saved_cells {
+            Some(saved) => saved != self.cell_version(),
+            None => !self.spilled.is_empty(),
+        }
+    }
+
+    pub(crate) fn has_pending_sheet_metadata(&self) -> bool {
+        self.styles_dirty || self.row_styles_dirty || self.col_styles_dirty || !self.style_edits.is_empty()
+            || self.pictures_dirty || self.merges_dirty || self.cf_dirty || self.dv_dirty
+            || self.notes_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
+            || self.ignored_errors_dirty || self.outline_pr_dirty || self.filter_dirty || self.page_dirty
+            || self.charts_dirty || self.tab_color_dirty || self.tables_dirty || self.protect_dirty
+            || self.rich_dirty || self.hyperlinks_dirty || self.sparklines_dirty || self.textboxes_dirty
+            || self.hidden_dirty
+    }
+
+    pub(crate) fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
+        if self.get(r, c).is_some_and(|cell| cell.value != value) {
+            self.cells.set_formula_cache(r, c, value);
+        }
+    }
+
+    pub fn display_style_revision(&self) -> u64 { self.display_style_revision }
+
+    pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.cells.stored_cells()
+    }
+
+    /// Retain only the data and number formats needed for background text search.
+    pub fn search_snapshot(&self) -> Self {
+        let mut snapshot = Self::new(&self.name);
+        snapshot.cells = self.cells.clone();
+        snapshot.styles = self.styles.clone();
+        snapshot.row_styles = self.row_styles.clone();
+        snapshot.col_styles = self.col_styles.clone();
+        snapshot
+    }
+
+    pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<Vec<Cell>>)> {
+        self.cells.column_pages(col)
+    }
+
     /// Install only the fields written by formula evaluation. UI metadata and
     /// save receipts belong to the live sheet even if calculation was in flight.
     pub fn take_calculation(&mut self, result: &mut Sheet) {
@@ -388,6 +457,11 @@ impl Sheet {
 
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter()
+    }
+
+    /// Occupied cells in a rectangle, ordered by row and then column.
+    pub fn iter_rect(&self, rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.cells.iter_rect(rect)
     }
 
     pub fn values(&self) -> impl Iterator<Item = &Cell> {
@@ -438,6 +512,7 @@ impl Sheet {
 
     /// 用户改样式（标记脏，保存时回写）
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -457,6 +532,7 @@ impl Sheet {
 
     /// 从文件载入样式（不算用户修改）
     pub fn set_style_loaded(&mut self, r: u32, c: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         let key = CellRef::new(r, c);
         if id == 0 {
             if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
@@ -471,6 +547,7 @@ impl Sheet {
 
     /// 用户设置整列样式（稀疏）
     pub fn set_col_style(&mut self, c: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -485,6 +562,7 @@ impl Sheet {
 
     /// 从文件载入整列样式（不算用户修改）
     pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if id == 0 {
             self.col_styles.remove(&c);
         } else {
@@ -494,6 +572,7 @@ impl Sheet {
 
     /// 用户设置整行样式（稀疏）
     pub fn set_row_style(&mut self, r: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -508,6 +587,7 @@ impl Sheet {
 
     /// 从文件载入整行样式（不算用户修改）
     pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
+        self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if id == 0 {
             self.row_styles.remove(&r);
         } else {
