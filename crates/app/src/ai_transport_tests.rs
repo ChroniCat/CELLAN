@@ -17,6 +17,10 @@ struct Client {
 }
 
 fn client() -> Client {
+    client_with_unframed_text(false)
+}
+
+fn client_with_unframed_text(allow_unframed_text: bool) -> Client {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let ep = ParsedUrl {
         https: false,
@@ -29,7 +33,15 @@ fn client() -> Client {
     let cancel = Arc::new(RequestCancel::default());
     let token = cancel.clone();
     thread::spawn(move || {
-        let _ = send_result.send(stream_post(&ep, "", b"{}", &token, &tx, None));
+        let _ = send_result.send(stream_post(
+            &ep,
+            "",
+            b"{}",
+            &token,
+            &tx,
+            None,
+            allow_unframed_text,
+        ));
     });
     Client {
         listener,
@@ -111,8 +123,8 @@ fn chunked_delta_and_done_are_delivered_while_the_server_is_still_open() {
 }
 
 #[test]
-fn final_choice_frame_completes_while_the_server_keeps_the_socket_open() {
-    let c = client();
+fn legacy_text_gateway_completes_without_a_blank_line_while_the_socket_stays_open() {
+    let c = client_with_unframed_text(true);
     let mut server = accept_request(&c.listener);
     server.write_all(HEADERS).unwrap();
     chunk(&mut server, DELTA);
@@ -129,18 +141,94 @@ fn final_choice_frame_completes_while_the_server_keeps_the_socket_open() {
     c.result.recv_timeout(DEADLINE).unwrap().unwrap();
 }
 
+#[test]
+fn late_error_field_in_the_same_event_wins_over_the_apparent_stop() {
+    let c = client();
+    let mut server = accept_request(&c.listener);
+    server.write_all(HEADERS).unwrap();
+    chunk(&mut server, DELTA);
+    assert_next_delta(&c, "hello");
+    chunk(&mut server, b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"message\":\"late error\"}\n");
+    // A TCP or HTTP chunk boundary and a long pause are both valid within an SSE event.
+    assert!(matches!(
+        c.result
+            .recv_timeout(UNFRAMED_TERMINAL_GRACE + Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    chunk(&mut server, b"event: error\n\n");
+    assert!(
+        c.result
+            .recv_timeout(DEADLINE)
+            .unwrap()
+            .unwrap_err()
+            .contains("late error")
+    );
+    assert!(
+        !c.events
+            .try_iter()
+            .any(|e| matches!(e, StreamMsg::RoundDone { .. }))
+    );
+}
+
+#[test]
+fn attempt_records_the_done_marker_separately_from_the_choice_finish_reason() {
+    let stop = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    for (end, saw_done, reason) in [
+        ("data: [DONE]\n\n".to_owned(), true, None),
+        (stop.to_owned(), false, Some("stop")),
+        (format!("{stop}data: [DONE]\n\n"), true, Some("stop")),
+    ] {
+        let bytes = [DELTA, end.as_bytes()].concat();
+        let mut source = bytes.as_slice();
+        let (tx, _) = mpsc::channel();
+        let mut trace = Attempt::new();
+        receive_body(
+            200,
+            |buf, _| source.read(buf).map_err(|e| e.to_string()),
+            &mut trace,
+            &tx,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(trace.saw_done, saw_done);
+        assert_eq!(trace.finish_reason.as_deref(), reason);
+    }
+}
+
 #[cfg(windows)]
 #[test]
-fn only_failures_before_a_connection_existed_are_replayed_via_proxy() {
+fn winhttp_proxy_replay_requires_a_failure_before_the_post_could_be_sent() {
     use windows_sys::Win32::Networking::WinHttp::*;
     let replay = platform::replayable_send_failure;
-    assert!(replay(ERROR_WINHTTP_NAME_NOT_RESOLVED, false));
-    assert!(replay(ERROR_WINHTTP_CANNOT_CONNECT, false));
-    // A firewall silently dropping direct connections only surfaces as a timeout.
-    assert!(replay(ERROR_WINHTTP_TIMEOUT, false));
-    // Once connected, the POST may have reached the server.
-    assert!(!replay(ERROR_WINHTTP_TIMEOUT, true));
-    assert!(!replay(ERROR_WINHTTP_CONNECTION_ERROR, true));
+    assert!(replay(ERROR_WINHTTP_NAME_NOT_RESOLVED, 0));
+    assert!(replay(ERROR_WINHTTP_CANNOT_CONNECT, 0));
+    assert!(replay(
+        ERROR_WINHTTP_TIMEOUT,
+        WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER
+    ));
+    assert!(!replay(ERROR_WINHTTP_TIMEOUT, 0));
+
+    // On a pooled connection WinHTTP reports SENDING_REQUEST and REQUEST_SENT without
+    // CONNECTED_TO_SERVER. An earlier DNS/connect notification must never reopen replay.
+    for observed in [
+        WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER,
+        WINHTTP_CALLBACK_STATUS_SENDING_REQUEST,
+        WINHTTP_CALLBACK_STATUS_SENDING_REQUEST | WINHTTP_CALLBACK_STATUS_REQUEST_SENT,
+        WINHTTP_CALLBACK_STATUS_RESOLVING_NAME | WINHTTP_CALLBACK_STATUS_SENDING_REQUEST,
+    ] {
+        for code in [
+            ERROR_WINHTTP_TIMEOUT,
+            ERROR_WINHTTP_CANNOT_CONNECT,
+            ERROR_WINHTTP_NAME_NOT_RESOLVED,
+            ERROR_WINHTTP_CONNECTION_ERROR,
+        ] {
+            assert!(
+                !replay(code, observed),
+                "observed={observed:#x} error={code}"
+            );
+        }
+    }
 }
 
 #[test]

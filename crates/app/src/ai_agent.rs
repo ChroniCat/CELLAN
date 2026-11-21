@@ -34,6 +34,7 @@ pub struct AiConfig {
     pub api_key: String,
     pub model: String,
     pub native_tools: bool,
+    pub allow_unframed_text: bool,
     /// 用户是否已确认「表格内容会发送到上面的模型服务」。未确认前不发任何请求。
     pub data_consent: bool,
 }
@@ -47,6 +48,7 @@ impl Default for AiConfig {
             api_key: String::new(),
             model: DEFAULT_MODEL.into(),
             native_tools: true,
+            allow_unframed_text: false,
             data_consent: false,
         }
     }
@@ -79,6 +81,7 @@ impl AiConfig {
                 "api_key" => cfg.api_key = if v == "@builtin" { String::new() } else { v.into() },
                 "model" if !v.is_empty() => cfg.model = v.to_string(),
                 "native_tools" => cfg.native_tools = v != "0",
+                "allow_unframed_text" => cfg.allow_unframed_text = v == "1",
                 "data_consent" => cfg.data_consent = v == "1",
                 _ => {}
             }
@@ -98,13 +101,14 @@ impl AiConfig {
             let _ = std::fs::create_dir_all(parent);
         }
         let body = format!(
-            "provider_id={}\ndisplay_name={}\nbase_url={}\napi_key={}\nmodel={}\nnative_tools={}\ndata_consent={}\n",
+            "provider_id={}\ndisplay_name={}\nbase_url={}\napi_key={}\nmodel={}\nnative_tools={}\nallow_unframed_text={}\ndata_consent={}\n",
             self.provider_id.trim(),
             self.display_name.trim(),
             self.base_url.trim(),
             self.api_key.trim(),
             self.model.trim(),
             u8::from(self.native_tools),
+            u8::from(self.allow_unframed_text),
             if self.data_consent { "1" } else { "0" },
         );
         let _ = std::fs::write(path, body);
@@ -339,6 +343,7 @@ fn spawn_completion_round(
             &cancel,
             &tx,
             wake_ctx.clone(),
+            cfg.allow_unframed_text,
         );
         if let Err(e) = res {
             send_wake(&tx, StreamMsg::Failed(e), wake_ctx.as_ref());
@@ -542,11 +547,11 @@ impl SheetApp {
             }
             "inspect_sheet" | "search_cells" | "eval_preview" => {
                 let tc = tc.clone();
-                self.with_calculated_ai_view(ctx, move |view| match tc.name.as_str() {
+                self.with_calculated_ai_view(ctx, Box::new(move |view| match tc.name.as_str() {
                     "inspect_sheet" => view.tool_inspect_sheet(&tc.arguments),
                     "search_cells" => view.tool_search_cells(&tc.arguments),
                     _ => view.tool_eval_preview(&tc.arguments),
-                })
+                }))
             }
             "set_cells" | "fill_formula_range" => {
                 let before = self.ai_calc_revision();
@@ -557,8 +562,8 @@ impl SheetApp {
                 };
                 match write {
                     Ok(written) => {
-                        self.note_ai_written_cells(before, written.sheet, &written.keys);
-                        self.with_calculated_ai_view(ctx, move |view| written.result(view.wb))
+                        self.note_ai_written_cells(before, written.sheet_id, &written.keys);
+                        self.with_calculated_ai_view(ctx, Box::new(move |view| written.result(view.wb)))
                     }
                     Err(result) => result.into(),
                 }
@@ -710,7 +715,7 @@ impl SheetApp {
         self.doc_gen = self.doc_gen.wrapping_add(1);
 
         Ok(WrittenCells {
-            sheet: si,
+            sheet_id: self.wb.sheet(si).identity,
             label: format!("写入 {} 个单元格", parsed.len()),
             metadata: json!({"ok": true, "written": parsed.len()}),
             sample_limit: 12,
@@ -798,7 +803,7 @@ impl SheetApp {
 
         let span = range_label((r1, c1), (r2, c2));
         Ok(WrittenCells {
-            sheet: si,
+            sheet_id: self.wb.sheet(si).identity,
             label: format!("填充公式 {sh_name}!{span}"),
             metadata: json!({"ok": true, "range": span, "count": keys.len()}),
             sample_limit: 8,
@@ -1121,6 +1126,8 @@ impl SheetApp {
                             ui_kit::text_input(ui, &mut self.ai.draft_cfg.model, "deepseek-v4.1-flash");
                             ui.checkbox(&mut self.ai.draft_cfg.native_tools, "原生工具调用")
                                 .on_hover_text("仅支持文本对话的接口可关闭此项，使用文本工具协议。");
+                            ui.checkbox(&mut self.ai.draft_cfg.allow_unframed_text, "兼容缺少 SSE 结束空行的旧网关")
+                                .on_hover_text("仅当网关省略事件末尾的空行并保持连接时启用。纯文本结束帧在短暂无数据后即可完成。");
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("API Key").size(11.0).color(ui_kit::TEXT_WEAK));
                                 if !self.ai.draft_cfg.has_api_key() {

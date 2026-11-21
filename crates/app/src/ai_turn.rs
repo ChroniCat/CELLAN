@@ -18,12 +18,30 @@ pub(super) struct AiView {
     rect: Rect,
 }
 
-/// Cells this turn read, wrote or is waiting to change, with a fingerprint of their
-/// constants and formula text. Recalculated results are deliberately not part of it.
+/// A confirmation protects the inputs. Once a tool reports values, its calculated
+/// values and number formats also belong to the observation.
 struct Footprint {
     sheet: u64,
     rect: Rect,
+    values: bool,
     hash: Option<u64>,
+}
+
+struct ReadObservation {
+    call: ToolCallSpec,
+    sheet: Option<u64>,
+    hash: Option<u64>,
+}
+
+enum PendingCalculation {
+    Tool { call: WireToolCall, sheet: Option<u64>, job: AiToolCalculation },
+    Validate { action: TurnAction, job: AiToolCalculation },
+}
+
+enum TurnAction {
+    Finish { visible: String, reasoning: Option<String>, calls: Result<Vec<WireToolCall>, String> },
+    Confirm,
+    Retry,
 }
 
 pub(super) struct ActiveTurn {
@@ -31,9 +49,12 @@ pub(super) struct ActiveTurn {
     cfg: AiConfig,
     messages: Vec<JsonValue>,
     pending_calls: VecDeque<WireToolCall>,
-    calculation: Option<(WireToolCall, AiToolCalculation)>,
+    calculation: Option<PendingCalculation>,
     view: AiView,
     footprint: Vec<Footprint>,
+    reads: Vec<ReadObservation>,
+    awaiting_write_results: bool,
+    retry_check: std::cell::Cell<Option<((u64, u64), bool)>>,
     // Workbook revision at which `footprint` was last verified.
     revision: (u64, u64),
     // On retry, replace just the streamed text from the failed completion.
@@ -53,33 +74,71 @@ fn bounded(mut text: String, bytes: usize) -> String {
     text
 }
 
-/// Order-independent fingerprint of the constants and formula text inside `rect`.
-fn region_hash(sheet: &sheetcore::Sheet, rect: Rect) -> u64 {
-    let cell_hash = |r: u32, c: u32, cell: &Cell| {
+fn read_hash(result: &JsonValue) -> u64 {
+    let mut hash = DefaultHasher::new();
+    if let Some(hits) = result["hits"].as_array() {
+        // The sparse store may reorder unchanged search hits when another page is inserted.
+        let mut hits: Vec<_> = hits.iter().collect();
+        hits.sort_unstable_by_key(|hit| (hit["sheet"].as_str(), hit["cell"].as_str()));
+        hits.hash(&mut hash);
+        result["has_more"].hash(&mut hash);
+    } else {
+        result.hash(&mut hash);
+    }
+    hash.finish()
+}
+
+/// Hash stored cells without expanding sparse selections such as entire columns.
+fn region_hash(
+    wb: &sheetcore::Workbook,
+    si: usize,
+    rect: Rect,
+    values: bool,
+    calculated: bool,
+) -> Option<u64> {
+    let sheet = wb.sheet(si);
+    let mut needs_calculation = false;
+    let mut cell_hash = |r: u32, c: u32, cell: &Cell| {
         let mut h = DefaultHasher::new();
         (r, c).hash(&mut h);
-        match (&cell.formula, &cell.value) {
-            (Some(f), _) => (1u8, f).hash(&mut h),
-            (None, Value::Number(n)) => (2u8, n.to_bits()).hash(&mut h),
-            (None, Value::Text(t)) => (3u8, t).hash(&mut h),
-            (None, Value::Bool(b)) => (4u8, b).hash(&mut h),
-            (None, Value::Error(e)) => (5u8, e.text()).hash(&mut h),
-            (None, Value::Empty) => 6u8.hash(&mut h),
+        cell.formula.hash(&mut h);
+        if values {
+            if !calculated && !needs_calculation {
+                needs_calculation = cell.formula.is_some()
+                    || sheet.spilled.contains(&sheetcore::model::CellRef::new(r, c));
+            }
+            wb.styles.get(sheet.style_of(r, c)).format.hash(&mut h);
+        }
+        if values || cell.formula.is_none() {
+            match &cell.value {
+                Value::Number(n) => (2u8, n.to_bits()).hash(&mut h),
+                Value::Text(t) => (3u8, t).hash(&mut h),
+                Value::Bool(b) => (4u8, b).hash(&mut h),
+                Value::Error(e) => (5u8, e.text()).hash(&mut h),
+                Value::Empty => 6u8.hash(&mut h),
+            }
         }
         h.finish()
     };
+    // Calls on the wire use sheet names. An old name must not silently resolve to
+    // a different sheet while a confirmation card is open.
+    let mut identity = DefaultHasher::new();
+    sheet.name.hash(&mut identity);
+    if values {
+        wb.date_system.is_1904().hash(&mut identity);
+    }
+    let mut sum = identity.finish();
     let (mut r1, mut c1, mut r2, mut c2) = rect;
     let mut area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
     if area > 4096 {
         // Large targets such as whole columns: only the used part can hold content.
-        let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else { return 0 };
+        let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else { return Some(sum) };
         (r1, c1, r2, c2) = (r1.max(ur1), c1.max(uc1), r2.min(ur2), c2.min(uc2));
         if r1 > r2 || c1 > c2 {
-            return 0;
+            return Some(sum);
         }
         area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
     }
-    let mut sum = 0u64;
     if area <= sheet.len() as u64 {
         for r in r1..=r2 {
             for c in c1..=c2 {
@@ -95,7 +154,7 @@ fn region_hash(sheet: &sheetcore::Sheet, rect: Rect) -> u64 {
             }
         }
     }
-    sum
+    (calculated || !needs_calculation).then_some(sum)
 }
 
 impl AiState {
@@ -106,8 +165,9 @@ impl AiState {
         if let Some(turn) = &mut self.active_round {
             let mut updated = turn.cfg.clone();
             updated.native_tools = cfg.native_tools;
+            updated.allow_unframed_text = cfg.allow_unframed_text;
             if updated == *cfg {
-                turn.cfg.native_tools = cfg.native_tools;
+                turn.cfg = updated;
             }
         }
     }
@@ -132,13 +192,15 @@ impl AiState {
 }
 
 impl SheetApp {
-    /// A background recalculation only changes formula results, which the footprint ignores.
+    /// Recalculation requested by an AI write completes that write's baseline. Other
+    /// recalculations must be compared with the values previously shown to the model.
     pub(crate) fn ai_recalculated(&mut self, previous_gen: u64) {
         if self.ai.bound_doc_uid == Some(self.doc_uid)
-            && let Some(turn) = &mut self.ai.active_round
+            && let Some(turn) = &self.ai.active_round
+            && turn.awaiting_write_results
             && turn.revision == (previous_gen, self.wb_epoch)
         {
-            turn.revision.0 = self.doc_gen;
+            self.refresh_ai_baseline();
         }
     }
 
@@ -193,6 +255,9 @@ impl SheetApp {
             calculation: None,
             view: self.ai_view_now(),
             footprint: Vec::new(),
+            reads: Vec::new(),
+            awaiting_write_results: false,
+            retry_check: Default::default(),
             revision: (self.doc_gen, self.wb_epoch),
             content_start: 0,
             reasoning_start: 0,
@@ -261,7 +326,19 @@ impl SheetApp {
         !self.ai.busy
             && self.ai.bound_doc_uid == Some(self.doc_uid)
             && self.ai.active_round.as_ref().is_some_and(|turn| {
-                turn.cfg == self.ai.cfg && self.ai_turn_conflict(turn).is_none()
+                if turn.cfg != self.ai.cfg {
+                    return false;
+                }
+                let revision = (self.doc_gen, self.wb_epoch);
+                if let Some((checked, valid)) = turn.retry_check.get()
+                    && checked == revision
+                {
+                    return valid;
+                }
+                // A stale manual calculation is checked in the background when retry is clicked.
+                let valid = self.ai_validation_needs_calculation(turn) || self.ai_turn_conflict(turn).is_none();
+                turn.retry_check.set(Some((revision, valid)));
+                valid
             })
     }
 
@@ -269,6 +346,11 @@ impl SheetApp {
         if !self.can_retry_ai_round() {
             return;
         }
+        let ctx = self.ai.ui_ctx.clone().unwrap_or_default();
+        self.validate_ai_action(TurnAction::Retry, &ctx);
+    }
+
+    fn resume_failed_ai_round(&mut self) {
         let Some(turn) = &self.ai.active_round else {
             return;
         };
@@ -326,8 +408,18 @@ impl SheetApp {
             return;
         }
         let calculation = self.ai.active_round.as_mut().and_then(|t| t.calculation.take());
-        if let Some((call, mut job)) = calculation {
-            match self.poll_ai_calculation(&mut job, ctx) {
+        if let Some(mut calculation) = calculation {
+            let job = match &mut calculation {
+                PendingCalculation::Tool { call, sheet, job } => {
+                    if self.ai_read_sheet(&call.spec) != *sheet {
+                        self.fail_ai_round("核对期间工具的目标工作表已变化，本轮已终止。".into(), false);
+                        return;
+                    }
+                    job
+                }
+                PendingCalculation::Validate { job, .. } => job,
+            };
+            match self.poll_ai_calculation(job, ctx) {
                 CalcPoll::Pending(progress) => {
                     self.ai.status_hint = match progress {
                         Some((done, total)) => format!(
@@ -337,15 +429,20 @@ impl SheetApp {
                         None => "正在核对表格计算结果…".into(),
                     };
                     if let Some(turn) = self.ai.active_round.as_mut() {
-                        turn.calculation = Some((call, job));
+                        turn.calculation = Some(calculation);
                     }
                 }
                 CalcPoll::Failed(error) => self.fail_ai_round(format!("{error}，本轮已终止。"), false),
-                CalcPoll::Ready(label, result) => match self.ai_turn_still_valid() {
-                    Err(conflict) => self.fail_ai_round(format!("{conflict}，本轮已终止。"), false),
-                    Ok(()) => {
-                        self.record_ai_tool_result(&call, label, result);
-                        self.continue_ai_tools(ctx, false);
+                CalcPoll::Ready(label, result) => match calculation {
+                    PendingCalculation::Validate { action, .. } => self.validate_ai_action(action, ctx),
+                    PendingCalculation::Tool { call, .. } => {
+                        // poll_ai_calculation only returns observations from a current calculated view.
+                        if let Err(conflict) = self.ai_turn_still_valid() {
+                            self.fail_ai_round(format!("{conflict}，本轮已终止。"), false);
+                        } else {
+                            self.record_ai_tool_result(&call, label, result);
+                            self.continue_ai_tools(ctx, false);
+                        }
                     }
                 },
             }
@@ -394,6 +491,50 @@ impl SheetApp {
         calls: Result<Vec<WireToolCall>, String>,
         ctx: &egui::Context,
     ) {
+        self.validate_ai_action(TurnAction::Finish { visible, reasoning: native_reasoning, calls }, ctx);
+    }
+
+    fn ai_validation_needs_calculation(&self, turn: &ActiveTurn) -> bool {
+        turn.revision.1 == self.wb_epoch
+            && turn.revision.0 != self.doc_gen
+            && self.ai_calculated_workbook().is_none()
+            && (turn.reads.iter().any(|r| r.call.name != "inspect_workbook")
+                || turn.footprint.iter().any(|f| f.values
+                    && (f.hash.is_none() || self.ai_region_hash(f) != f.hash)))
+    }
+
+    fn validate_ai_action(&mut self, action: TurnAction, ctx: &egui::Context) {
+        let Some(turn) = self.ai.active_round.as_ref() else {
+            return;
+        };
+        if self.ai_validation_needs_calculation(turn)
+            && let AiToolOutput::Calculating(job) = self.with_calculated_ai_view(
+                ctx, Box::new(|_| (String::new(), JsonValue::Null)),
+            )
+        {
+            self.ai.active_round.as_mut().unwrap().calculation = Some(PendingCalculation::Validate { action, job });
+            self.ai.busy = true;
+            self.ai.status_hint = "正在核对已读取的表格数据…".into();
+            return;
+        }
+        if let Err(conflict) = self.ai_turn_still_valid() {
+            self.fail_ai_round(format!("{conflict}，本轮已终止，请重新提问。"), false);
+            return;
+        }
+        match action {
+            TurnAction::Finish { visible, reasoning, calls } => self.apply_ai_round(visible, reasoning, calls, ctx),
+            TurnAction::Confirm => self.continue_ai_tools(ctx, true),
+            TurnAction::Retry => self.resume_failed_ai_round(),
+        }
+    }
+
+    fn apply_ai_round(
+        &mut self,
+        visible: String,
+        native_reasoning: Option<String>,
+        calls: Result<Vec<WireToolCall>, String>,
+        ctx: &egui::Context,
+    ) {
         if matches!(&calls, Ok(calls) if calls.is_empty()) {
             if let Some(turn) = self.ai.active_round.take() {
                 if let Some(last) = self.ai.messages.last_mut() {
@@ -411,10 +552,6 @@ impl SheetApp {
                 format!("已达到 {MAX_TOOL_ROUNDS} 轮上限，最后一轮的工具调用未执行。"),
                 false,
             );
-            return;
-        }
-        if let Err(conflict) = self.ai_turn_still_valid() {
-            self.fail_ai_round(format!("{conflict}，本轮工具未执行，请重新提问。"), false);
             return;
         }
         let Some(turn) = self.ai.active_round.as_mut() else {
@@ -470,11 +607,7 @@ impl SheetApp {
             return;
         }
         // The card showed resolved targets; they are part of the footprint.
-        if let Err(conflict) = self.ai_turn_still_valid() {
-            self.fail_ai_round(format!("{conflict}，待确认的操作已终止。"), false);
-            return;
-        }
-        self.continue_ai_tools(ctx, true);
+        self.validate_ai_action(TurnAction::Confirm, ctx);
     }
 
     fn continue_ai_tools(&mut self, ctx: &egui::Context, mut approved: bool) {
@@ -514,14 +647,22 @@ impl SheetApp {
                     Ok(None) => {}
                 }
             }
+            let sheet = self.ai_read_sheet(&call.spec);
             match self.execute_ai_tool(&call.spec, ctx) {
                 AiToolOutput::Ready(label, result) => {
                     self.record_ai_tool_result(&call, label, result)
                 }
                 AiToolOutput::Calculating(calculation) => {
-                    self.refresh_ai_baseline();
+                    // Writes have already happened; calculation only reads back their results.
+                    // Protect the written inputs while the calculation is running.
+                    let wrote_cells = matches!(call.spec.name.as_str(), "set_cells" | "fill_formula_range");
+                    if wrote_cells {
+                        self.note_ai_footprint(&call.spec, &JsonValue::Null);
+                        self.refresh_ai_baseline();
+                    }
                     if let Some(turn) = self.ai.active_round.as_mut() {
-                        turn.calculation = Some((call, calculation));
+                        turn.awaiting_write_results = wrote_cells;
+                        turn.calculation = Some(PendingCalculation::Tool { call, job: calculation, sheet });
                     }
                     self.ai.status_hint = "正在核对表格计算结果…".into();
                     return;
@@ -533,6 +674,10 @@ impl SheetApp {
     /// Fill omitted sheet and range arguments from the view the model was given.
     pub(super) fn pin_ai_call(&self, view: AiView, call: &mut ToolCallSpec) -> Result<(), String> {
         let name = call.name.as_str();
+        // Search without a sheet covers the workbook. An explicitly empty name means
+        // the active sheet; bind it to the view the model was given.
+        let search_active = name == "search_cells"
+            && call.arguments["sheet"].as_str().is_some_and(|s| s.trim().is_empty());
         let takes_sheet = matches!(
             name,
             "inspect_workbook"
@@ -543,7 +688,7 @@ impl SheetApp {
                 | "style_range"
                 | "data_operation"
         );
-        let Some(args) = call.arguments.as_object_mut().filter(|_| takes_sheet) else {
+        let Some(args) = call.arguments.as_object_mut().filter(|_| takes_sheet || search_active) else {
             return Ok(());
         };
         let omitted = |value: Option<&JsonValue>| {
@@ -560,6 +705,18 @@ impl SheetApp {
             }
         } else if args.get("sheet").is_some_and(|v| !v.is_string()) {
             return Err("工作表名称无效".into());
+        }
+        if name == "inspect_workbook" {
+            let index = self.resolve_sheet_index(args.get("sheet").and_then(JsonValue::as_str))
+                .ok_or("未找到指定工作表")?;
+            if args.get("selection").and_then(JsonValue::as_str).and_then(checked_ai_range).is_none() {
+                let rect = if self.wb.sheet(index).identity == view.sheet {
+                    view.rect
+                } else {
+                    (0, 0, 0, 0)
+                };
+                args.insert("selection".into(), json!(range_label((rect.0, rect.1), (rect.2, rect.3))));
+            }
         }
         if name == "data_operation" && omitted(args.get("range")) {
             args.insert("range".into(), json!(label));
@@ -578,25 +735,6 @@ impl SheetApp {
                 let rect = result["range"].as_str().and_then(checked_ai_range);
                 if let (Some(si), Some(rect)) = (sheet(&result["sheet"]), rect) {
                     regions.push((identity(si), rect));
-                }
-            }
-            "search_cells" => {
-                for hit in result["hits"].as_array().into_iter().flatten() {
-                    let at = hit["cell"].as_str().and_then(checked_address);
-                    if let (Some(si), Some((r, c))) = (sheet(&hit["sheet"]), at) {
-                        regions.push((identity(si), (r, c, r, c)));
-                    }
-                }
-            }
-            "inspect_workbook" => {
-                if let Some(si) = sheet(&args["sheet"]) {
-                    let small = |&(r1, c1, r2, c2): &Rect| u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1) <= 256;
-                    if let Some(rect) = args["selection"].as_str().and_then(checked_ai_range).filter(small) {
-                        regions.push((identity(si), rect));
-                    }
-                    if let Some((r1, c1, r2, c2)) = self.wb.sheet(si).used_bounds() {
-                        regions.push((identity(si), (r1, c1, r2.min(r1 + 5), c2.min(c1 + 11))));
-                    }
                 }
             }
             "set_cells" => {
@@ -624,17 +762,44 @@ impl SheetApp {
         let Some(turn) = self.ai.active_round.as_mut() else {
             return;
         };
-        let mut known: HashSet<_> = turn.footprint.iter().map(|f| (f.sheet, f.rect)).collect();
+        let values = !result.is_null();
+        let mut known: HashSet<_> = turn.footprint.iter().map(|f| (f.sheet, f.rect, f.values)).collect();
         for (sheet, rect) in regions {
-            if known.insert((sheet, rect)) {
-                turn.footprint.push(Footprint { sheet, rect, hash: None });
+            if known.insert((sheet, rect, values)) {
+                turn.footprint.push(Footprint { sheet, rect, values, hash: None });
             }
         }
     }
 
-    fn ai_region_hash(&self, sheet: u64, rect: Rect) -> Option<u64> {
-        let index = self.ai_sheet_by_identity(sheet)?;
-        Some(region_hash(self.wb.sheet(index), rect))
+    fn ai_region_hash(&self, f: &Footprint) -> Option<u64> {
+        let calculated = self.ai_calculated_workbook();
+        let wb = if f.values { calculated.unwrap_or(&self.wb) } else { &self.wb };
+        let index = wb.sheets.iter().position(|s| s.identity == f.sheet)?;
+        region_hash(wb, index, f.rect, f.values, calculated.is_some())
+    }
+
+    fn ai_read_sheet(&self, call: &ToolCallSpec) -> Option<u64> {
+        let name = call.arguments["sheet"].as_str()?;
+        self.resolve_sheet_index(Some(name)).map(|index| self.wb.sheet(index).identity)
+    }
+
+    // Re-run a read against a current calculated view. The complete search result
+    // includes absence of matches, and a preview may use dynamic or cross-sheet references.
+    fn ai_read_hash(&self, call: &ToolCallSpec) -> Option<u64> {
+        if call.name == "inspect_workbook" {
+            let index = self.resolve_sheet_index(call.arguments["sheet"].as_str())?;
+            let rect = call.arguments["selection"].as_str().and_then(checked_ai_range)?;
+            let overview = build_workbook_context(self, index, rect);
+            return Some(read_hash(&json!({"ok":true, "overview":overview})));
+        }
+        let wb = self.ai_calculated_workbook()?;
+        let view = WorkbookToolView { wb, sheet_idx: self.sheet_idx };
+        let (_, result) = match call.name.as_str() {
+            "search_cells" => view.tool_search_cells(&call.arguments),
+            "eval_preview" => view.tool_eval_preview(&call.arguments),
+            _ => return None,
+        };
+        Some(read_hash(&result))
     }
 
     /// The assistant itself changed the workbook (or it was verified): take a new baseline.
@@ -642,22 +807,33 @@ impl SheetApp {
         let Some(turn) = self.ai.active_round.as_ref() else {
             return;
         };
+        let revision = (self.doc_gen, self.wb_epoch);
+        let updated = turn.revision != revision || turn.awaiting_write_results;
         let hashes: Vec<_> = turn
             .footprint
             .iter()
-            .map(|f| self.ai_region_hash(f.sheet, f.rect))
+            .map(|f| if updated || f.hash.is_none() { self.ai_region_hash(f) } else { f.hash })
             .collect();
-        let revision = (self.doc_gen, self.wb_epoch);
+        let reads: Vec<_> = turn.reads.iter().map(|read| {
+            if updated || read.hash.is_none() {
+                self.ai_read_hash(&read.call)
+            } else {
+                read.hash
+            }
+        }).collect();
         if let Some(turn) = self.ai.active_round.as_mut() {
             for (footprint, hash) in turn.footprint.iter_mut().zip(hashes) {
                 footprint.hash = hash;
             }
+            for (read, hash) in turn.reads.iter_mut().zip(reads) {
+                read.hash = hash;
+            }
+            turn.retry_check.set(None);
             turn.revision = revision;
         }
     }
 
     /// Why the workbook no longer matches what this turn observed or prepared, if it doesn't.
-    /// Edits elsewhere, collaborators' changes to other cells and recalculation are fine.
     fn ai_turn_conflict(&self, turn: &ActiveTurn) -> Option<String> {
         if turn.revision.1 != self.wb_epoch {
             return Some("工作簿在 AI 处理期间已重新载入".into());
@@ -668,17 +844,30 @@ impl SheetApp {
         if self.ai_sheet_by_identity(turn.view.sheet).is_none() {
             return Some("提问时的活动工作表在 AI 处理期间被删除".into());
         }
+        for read in &turn.reads {
+            if self.ai_read_sheet(&read.call) != read.sheet
+                || read.hash.is_none()
+                || self.ai_read_hash(&read.call) != read.hash
+            {
+                let what = match read.call.name.as_str() {
+                    "search_cells" => "搜索结果",
+                    "inspect_workbook" => "工作簿概览",
+                    _ => "公式试算结果",
+                };
+                return Some(format!("{what}在 AI 处理期间发生了变化或有待重算"));
+            }
+        }
         let changed = turn
             .footprint
             .iter()
-            .find(|f| self.ai_region_hash(f.sheet, f.rect) != f.hash)?;
+            .find(|f| f.hash.is_none() || self.ai_region_hash(f) != f.hash)?;
         let name = self
             .ai_sheet_by_identity(changed.sheet)
             .map(|i| self.wb.sheet(i).name.clone())
             .unwrap_or_default();
         let (r1, c1, r2, c2) = changed.rect;
         Some(format!(
-            "「{name}」{} 在 AI 处理期间发生了变化",
+            "「{name}」{} 在 AI 处理期间发生了变化或有待重算",
             range_label((r1, c1), (r2, c2))
         ))
     }
@@ -705,8 +894,23 @@ impl SheetApp {
                 turn.view = view;
             }
         }
-        self.record_ai_observation(call.id.clone(), label, result);
         self.refresh_ai_baseline();
+        let sheet = self.ai_read_sheet(&call.spec);
+        if let Some(turn) = self.ai.active_round.as_mut() {
+            turn.awaiting_write_results = false;
+            if matches!(call.spec.name.as_str(), "search_cells" | "eval_preview" | "inspect_workbook") {
+                let hash = Some(read_hash(&result));
+                if let Some(read) = turn.reads.iter_mut().find(|r| {
+                    r.call.name == call.spec.name && r.call.arguments == call.spec.arguments
+                }) {
+                    read.hash = hash;
+                    read.sheet = sheet;
+                } else {
+                    turn.reads.push(ReadObservation { call: call.spec.clone(), sheet, hash });
+                }
+            }
+        }
+        self.record_ai_observation(call.id.clone(), label, result);
     }
 
     fn record_ai_observation(&mut self, id: String, label: String, result: JsonValue) {
@@ -760,6 +964,9 @@ mod tests {
             calculation: None,
             view: app.ai_view_now(),
             footprint: Vec::new(),
+            reads: Vec::new(),
+            awaiting_write_results: false,
+            retry_check: Default::default(),
             revision: (app.doc_gen, app.wb_epoch),
             content_start: 0,
             reasoning_start: 0,
@@ -781,6 +988,15 @@ mod tests {
         Cell {
             value: Value::Number(n),
             formula: None,
+        }
+    }
+
+    fn finish_calculations(app: &mut SheetApp, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.ai.active_round.as_ref().is_some_and(|turn| turn.calculation.is_some()) {
+            assert!(Instant::now() < deadline, "{}", app.ai.status_hint);
+            app.poll_ai(ctx);
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -908,6 +1124,263 @@ mod tests {
     }
 
     #[test]
+    fn ai_confirmation_rejects_reuse_of_the_displayed_sheet_name() {
+        let ctx = egui::Context::default();
+        let mut app = pending_app(&ctx);
+        let original = app.wb.sheet(0).name.clone();
+        app.add_sheet();
+        let other = app.sheet_idx;
+        app.wb.sheet_mut(0).set(0, 0, number(10.0));
+        app.wb.sheet_mut(other).set(0, 0, number(80.0));
+        app.finish_ai_round(String::new(), None, Ok(vec![call("clear", "data_operation",
+            json!({"op":"clear_contents", "sheet":original, "range":"A1"}),
+        )]), &ctx);
+        assert!(app.ai.confirmation_label.is_some());
+        assert!(app.set_sheet_name(0, "Archive"));
+        assert!(app.set_sheet_name(other, &original));
+        app.answer_ai_confirmation(true, &ctx);
+        assert!(app.ai.messages.last().unwrap().error.is_some());
+        assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(10.0));
+        assert_eq!(app.wb.sheet(other).value(0, 0), Value::Number(80.0));
+    }
+
+    #[test]
+    fn ai_inspection_rechecks_calculated_and_formatted_results() {
+        for change_format in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = pending_app(&ctx);
+            app.wb.sheet_mut(0).set(0, 0, number(10.0));
+            app.wb.sheet_mut(0).set(0, 1, Cell {
+                formula: Some("A1*2".into()), value: Value::Number(20.0),
+            });
+            app.finish_ai_round(String::new(), None, Ok(vec![call("read", "inspect_sheet",
+                json!({"range":"B1"}),
+            )]), &ctx);
+            if change_format {
+                let mut style = app.wb.styles.get(0).clone();
+                style.format = "0.00%".into();
+                let index = app.wb.styles.intern(style);
+                app.wb.sheet_mut(0).set_style(0, 1, index);
+            } else {
+                app.wb.sheet_mut(0).set(0, 0, number(30.0));
+                sheetcore::formula::recalc_all(&mut app.wb);
+                assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(60.0));
+            }
+            app.doc_gen += 1;
+            app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+                json!({"edits":[{"cell":"C1","value":20}]}),
+            )]), &ctx);
+            assert!(app.ai.status_hint.contains("B1"), "{}", app.ai.status_hint);
+            assert_eq!(app.wb.sheet(0).value(0, 2), Value::Empty);
+        }
+    }
+
+    #[test]
+    fn ai_search_detects_new_matches_and_accepts_unrelated_edits() {
+        for (initial_hit, matching_edit) in [(false, false), (false, true), (true, true)] {
+            let ctx = egui::Context::default();
+            let mut app = pending_app(&ctx);
+            let invoice = Cell { value: Value::Text("Invoice 17".into()), formula: None };
+            if initial_hit {
+                app.wb.sheet_mut(0).set(0, 0, invoice.clone());
+            }
+            app.finish_ai_round(String::new(), None, Ok(vec![call("search", "search_cells",
+                json!({"query":"invoice 17"}),
+            )]), &ctx);
+            app.wb.sheet_mut(0).set(300, 0, if matching_edit { invoice } else { number(3.0) });
+            app.doc_gen += 1;
+            app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+                json!({"edits":[{"cell":"C1","value":1}]}),
+            )]), &ctx);
+            assert_eq!(app.wb.sheet(0).value(0, 2),
+                if matching_edit { Value::Empty } else { Value::Number(1.0) });
+            assert_eq!(app.ai.messages.last().unwrap().error.is_some(), matching_edit);
+            app.stop_ai_generation();
+        }
+    }
+
+    #[test]
+    fn ai_preview_rechecks_its_result_before_editing() {
+        for (column, conflict) in [(0, true), (1, false)] {
+            let ctx = egui::Context::default();
+            let mut app = pending_app(&ctx);
+            app.wb.sheet_mut(0).set(0, 0, number(4.0));
+            app.finish_ai_round(String::new(), None, Ok(vec![call("preview", "eval_preview",
+                json!({"formula":"=A1*2"}),
+            )]), &ctx);
+            app.wb.sheet_mut(0).set(0, column, number(10.0));
+            app.doc_gen += 1;
+            app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+                json!({"edits":[{"cell":"C1","value":8}]}),
+            )]), &ctx);
+            assert_eq!(app.wb.sheet(0).value(0, 2),
+                if conflict { Value::Empty } else { Value::Number(8.0) });
+            assert_eq!(app.ai.messages.last().unwrap().error.is_some(), conflict);
+            app.stop_ai_generation();
+        }
+    }
+
+    #[test]
+    fn ai_revalidates_manual_values_before_finishing_confirming_or_retrying() {
+        for action in ["finish", "confirm", "retry"] {
+            for related_edit in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = pending_app(&ctx);
+                app.wb.sheet_mut(0).set(0, 0, number(4.0));
+                app.wb.sheet_mut(0).set(0, 1, Cell {
+                    formula: Some("A1*2".into()), value: Value::Empty,
+                });
+                app.wb.sheet_mut(0).set(0, 2, number(1.0));
+                app.wb.calc_manual = true;
+                app.wb.calc_pending = true;
+                app.finish_ai_round(String::new(), None, Ok(vec![
+                    call("read", "inspect_sheet", json!({"range":"B1"})),
+                    call("search", "search_cells", json!({"query":"8"})),
+                ]), &ctx);
+                finish_calculations(&mut app, &ctx);
+                assert_eq!(app.ai.messages.last().unwrap().tool_logs.len(), 2);
+                if action == "confirm" {
+                    app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+                        json!({"edits":[{"cell":"C1","value":8}]}),
+                    )]), &ctx);
+                    assert!(app.ai.confirmation_label.is_some());
+                } else if action == "retry" {
+                    app.fail_ai_round("本地测试中断".into(), true);
+                }
+                app.wb.sheet_mut(0).set(if related_edit { 0 } else { 5 }, 0, number(20.0));
+                app.doc_gen += 1;
+                match action {
+                    "confirm" => app.answer_ai_confirmation(true, &ctx),
+                    "retry" => {
+                        assert!(app.can_retry_ai_round());
+                        app.retry_failed_ai_round();
+                    }
+                    _ => app.finish_ai_round("结果为 8".into(), None, Ok(vec![]), &ctx),
+                }
+                assert!(matches!(app.ai.active_round.as_ref().unwrap().calculation,
+                    Some(PendingCalculation::Validate { .. })));
+                finish_calculations(&mut app, &ctx);
+                let last = app.ai.messages.last().unwrap();
+                assert_eq!(last.error.is_some(), related_edit, "{action}: {}", app.ai.status_hint);
+                assert_eq!(app.wb.sheet(0).value(0, 2),
+                    Value::Number(if action == "confirm" && !related_edit { 8.0 } else { 1.0 }));
+                assert_eq!(last.undo_ids.len(), usize::from(action == "confirm" && !related_edit));
+                if action == "finish" && !related_edit {
+                    assert_eq!(app.ai.status_hint, "已完成");
+                }
+                app.stop_ai_generation();
+            }
+        }
+    }
+
+    #[test]
+    fn ai_scoped_reads_keep_the_sheet_identity_even_when_the_result_is_unchanged() {
+        for tool in ["search_cells", "eval_preview"] {
+            let ctx = egui::Context::default();
+            let mut app = pending_app(&ctx);
+            app.add_sheet();
+            let target = app.sheet_idx;
+            let name = app.wb.sheet(target).name.clone();
+            app.add_sheet();
+            let replacement = app.sheet_idx;
+            let args = json!({"sheet":name, "query":"unmatched invoice", "formula":"=1"});
+            app.finish_ai_round(String::new(), None, Ok(vec![call("read", tool, args)]), &ctx);
+            assert!(app.set_sheet_name(target, "Archive"));
+            assert!(app.set_sheet_name(replacement, &name));
+            app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+                json!({"sheet":name, "edits":[{"cell":"A1","value":1}]}),
+            )]), &ctx);
+            assert!(app.ai.messages.last().unwrap().error.is_some());
+            assert_eq!(app.wb.sheet(replacement).value(0, 0), Value::Empty);
+        }
+    }
+
+    #[test]
+    fn ai_first_pending_read_rejects_name_reuse_and_accepts_sheet_moves() {
+        for (tool, reuse_name) in [("inspect_sheet", true), ("eval_preview", true), ("inspect_sheet", false)] {
+            let ctx = egui::Context::default();
+            let mut app = pending_app(&ctx);
+            app.add_sheet();
+            let other = app.sheet_idx;
+            let original = app.wb.sheet(0).name.clone();
+            app.wb.sheet_mut(0).set(0, 0, number(4.0));
+            app.wb.sheet_mut(other).set(0, 0, number(90.0));
+            app.wb.calc_manual = true;
+            app.wb.calc_pending = true;
+            app.finish_ai_round(String::new(), None, Ok(vec![call("read", tool,
+                json!({"sheet":original, "range":"A1", "formula":"=A1"}),
+            )]), &ctx);
+            assert!(app.ai.active_round.as_ref().unwrap().calculation.is_some());
+            if reuse_name {
+                assert!(app.set_sheet_name(0, "Archive"));
+                assert!(app.set_sheet_name(other, &original));
+            } else {
+                app.move_sheet(0, 1);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.ai.active_round.as_ref().is_some_and(|t| t.calculation.is_some()) {
+                assert!(Instant::now() < deadline);
+                app.poll_ai(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if reuse_name {
+                assert!(app.ai.status_hint.contains("工作表已变化"), "{}", app.ai.status_hint);
+                assert!(app.ai.messages.last().unwrap().tool_logs.is_empty());
+            } else {
+                let turn = app.ai.active_round.as_ref().unwrap();
+                let result = turn.messages.iter().find(|m| m["role"] == "tool").unwrap();
+                let observation: JsonValue = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+                assert_eq!(observation["cells"][0]["value"], "4");
+                app.stop_ai_generation();
+            }
+        }
+    }
+
+    #[test]
+    fn ai_overview_keeps_its_view_and_rechecks_other_sheets_used_ranges() {
+        let ctx = egui::Context::default();
+        let mut app = pending_app(&ctx);
+        app.add_sheet();
+        let other = app.sheet_idx;
+        let observed = app.wb.sheet(0).name.clone();
+        app.sheet_idx = 0;
+        app.finish_ai_round(String::new(), None, Ok(vec![call("read", "inspect_workbook",
+            json!({"sheet":observed}),
+        )]), &ctx);
+        app.sheet_idx = other;
+        app.sel = (40, 50);
+        app.sel_end = app.sel;
+        app.doc_gen += 1;
+        assert!(app.ai_turn_still_valid().is_ok());
+        app.wb.sheet_mut(other).set(200, 20, number(4.0));
+        app.doc_gen += 1;
+        app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+            json!({"sheet":observed, "edits":[{"cell":"C1","value":1}]}),
+        )]), &ctx);
+        assert!(app.ai.status_hint.contains("概览"), "{}", app.ai.status_hint);
+        assert_eq!(app.wb.sheet(0).value(0, 2), Value::Empty);
+    }
+
+    #[test]
+    fn ai_search_rechecks_whether_the_first_thirty_matches_were_exhaustive() {
+        let ctx = egui::Context::default();
+        let mut app = pending_app(&ctx);
+        for row in 0..30 {
+            app.wb.sheet_mut(0).set(row, 0, number(17.0));
+        }
+        app.finish_ai_round(String::new(), None, Ok(vec![call("search", "search_cells",
+            json!({"query":"17"}),
+        )]), &ctx);
+        app.wb.sheet_mut(0).set(30, 0, number(17.0));
+        app.doc_gen += 1;
+        app.finish_ai_round(String::new(), None, Ok(vec![call("write", "set_cells",
+            json!({"edits":[{"cell":"C1","value":30}]}),
+        )]), &ctx);
+        assert!(app.ai.status_hint.contains("搜索"), "{}", app.ai.status_hint);
+        assert_eq!(app.wb.sheet(0).value(0, 2), Value::Empty);
+    }
+
+    #[test]
     fn ai_omitted_targets_follow_the_view_given_to_the_model() {
         let ctx = egui::Context::default();
         let mut app = pending_app(&ctx);
@@ -984,13 +1457,16 @@ mod tests {
             );
             let sheet = app.wb.sheet(0).name.clone();
             let read = call("read", "inspect_sheet", json!({"sheet": sheet, "range": "A1:B1"}));
-            app.note_ai_footprint(&read.spec, &json!({"sheet": sheet, "range": "A1:B1"}));
+            // A1 was previously observed. B1's formula has not been read until its
+            // pending calculation finishes below.
+            app.note_ai_footprint(&read.spec, &json!({"sheet": sheet, "range": "A1"}));
             app.refresh_ai_baseline();
             app.wb.calc_pending = true;
             let AiToolOutput::Calculating(job) = app.execute_ai_tool(&read.spec, &ctx) else {
                 panic!("pending values need calculation")
             };
-            app.ai.active_round.as_mut().unwrap().calculation = Some((read, job));
+            let sheet = app.ai_read_sheet(&read.spec);
+            app.ai.active_round.as_mut().unwrap().calculation = Some(PendingCalculation::Tool { call: read, job, sheet });
             app.sel = (8, 8);
             app.sel_end = app.sel;
             if observed_cell_changed {
