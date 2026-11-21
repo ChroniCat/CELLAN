@@ -18,6 +18,9 @@ sha2 = "0.11.1"
 sheetcore = { version = "1.70.0", path = "../core" }
 ttf-parser = "0.25"
 
+[target.'cfg(windows)'.dependencies]
+mimalloc = "0.1.52"
+
 [features]
 default = ["wgpu"]
 wgpu = ["eframe/wgpu"]

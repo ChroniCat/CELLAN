@@ -844,6 +844,11 @@ impl SheetApp {
                 self.status = "计算选项：自动".into();
             }
             "CalcManual" => {
+                self.cancel_silent_recalc();
+                if self.tasks.recalc_pending() {
+                    self.wb.calc_pending = true;
+                    self.wb.calc_pending_sheets.extend(0..self.wb.sheets.len());
+                }
                 self.manual_calc = true;
                 self.wb.calc_manual = true;
                 self.wb.dirty = true;

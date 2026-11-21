@@ -3,7 +3,7 @@
 //! 只做柱状图（Excel 最常用），数据来自选区：首行当系列名、首列当分类。
 
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// 数据标签 XML：按 Excel 的元素顺序写 showVal/showCatName/showSerName/showPercent/
@@ -522,49 +522,29 @@ fn next_index(zip: &mut zip::ZipArchive<std::fs::File>, prefix: &str) -> u32 {
 }
 
 /// 重写 zip：既能改已有条目，也能追加新条目
-pub(crate) fn rewrite_with_additions_pub<F>(path: &Path, additions: Vec<(String, Vec<u8>)>, mut f: F) -> Result<()>
+pub(crate) fn rewrite_with_additions_pub<F>(
+    path: &Path,
+    additions: Vec<(String, Vec<u8>)>,
+    targets: &[&str],
+    mut edit: F,
+) -> Result<()>
 where
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let tmp = path.with_extension("charttmp");
-    let existing: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
-        .collect();
-    {
-        let out = std::fs::File::create(&tmp)?;
-        let mut zw = zip::ZipWriter::new(out);
-        let opts = || {
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
-        };
-        for i in 0..zip.len() {
-            let (name, mut buf) = {
-                let mut e = zip.by_index(i)?;
-                let name = e.name().to_string();
-                let mut b = Vec::new();
-                e.read_to_end(&mut b)?;
-                (name, b)
-            };
-            buf = f(&name, buf);
-            zw.start_file(name, opts())?;
-            zw.write_all(&buf)?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut pending: Vec<_> = additions.into_iter()
+        .filter(|(name, _)| zip.index_for_name(name).is_none()).collect();
+    for &name in targets {
+        let Some(index) = zip.index_for_name(name) else { continue };
+        let mut original = Vec::new();
+        zip.by_index(index)?.read_to_end(&mut original)?;
+        let updated = edit(name, original.clone());
+        if updated != original {
+            pending.push((name.to_owned(), updated));
         }
-        for (name, body) in additions.into_iter() {
-            if existing.contains(&name) {
-                continue;
-            }
-            zw.start_file(name, opts())?;
-            zw.write_all(&body)?;
-        }
-        zw.finish()?;
     }
     drop(zip);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
+    crate::patch::append_entries(path, &pending)
 }
 
 /// 把图表写进文件（新增 chart/drawing 部件，并挂到工作表上）
@@ -689,7 +669,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         let drels_c = drels_part.clone();
         let new_drawing_c = new_drawing.into_bytes();
         let new_rels_c = new_rels.into_bytes();
-        rewrite_with_additions_pub(path, additions, move |name, buf| {
+        rewrite_with_additions_pub(path, additions, &[&dpart, &drels_part, "[Content_Types].xml"], move |name, buf| {
             // 已有条目不能靠 additions 覆盖（那里只追加新名字），必须在闭包里替换
             if name == dpart_c {
                 return new_drawing_c.clone();
@@ -738,7 +718,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
     let chart_name = format!("chart{chart_no}.xml");
-    rewrite_with_additions_pub(path, additions, move |name, buf| {
+    rewrite_with_additions_pub(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
         if name == sheet_rels2 {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 if !xml.contains(&drawing_name) {
@@ -1008,7 +988,7 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
     // 删部件本身，并去掉内容类型里的 Override（否则 Excel 会认为包坏了）
     crate::patch::remove_entry(path, chart_part)?;
     let part_name = format!("/{chart_part}");
-    crate::patch::rewrite_zip(path, |name, buf| {
+    crate::patch::rewrite_zip_where(path, |part| part == "[Content_Types].xml", |name, buf| {
         if name == "[Content_Types].xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut out = String::new();
@@ -1123,12 +1103,7 @@ pub fn write_anchor(
     }
     let edited = rewrite_anchor_xml(&xml, ordinal, anchor);
     if edited != xml {
-        crate::patch::rewrite_zip(path, |name, buf| {
-            if name == drawing_part {
-                return edited.clone().into_bytes();
-            }
-            buf
-        })?;
+        crate::patch::append_entry(path, drawing_part, edited.as_bytes())?;
     }
     Ok(())
 }

@@ -14,6 +14,10 @@ pub struct Hyperlink {
     pub location: String,
     pub tooltip: String,
     pub external: bool,
+    /// Inclusive distance from the anchor to the end of an OOXML ref rectangle.
+    pub span: (u32, u32),
+    /// Additional OOXML attributes such as display.
+    pub attributes: Vec<(String, String)>,
 }
 
 /// 工作表 XML 里的 `<hyperlink>` 原始条目
@@ -24,50 +28,121 @@ pub struct RawLink {
     pub rid: Option<String>,
     pub location: Option<String>,
     pub tooltip: Option<String>,
+    pub span: (u32, u32),
+    pub attributes: Vec<(String, String)>,
+}
+
+fn namespaces(tag: &quick_xml::events::BytesStart<'_>, out: &mut HashMap<String, String>) {
+    for attr in tag.attributes().flatten() {
+        if let Some(prefix) = attr.key.as_ref().strip_prefix("xmlns:") {
+            out.insert(prefix.to_owned(), crate::model::xml_unescape(&attr.value));
+        }
+    }
+}
+
+fn visit_links(xml: &str, mut visit: impl FnMut(usize, usize, &quick_xml::events::BytesStart<'_>, &HashMap<String, String>)) {
+    use quick_xml::events::Event;
+    if !xml.contains("hyperlink") { return; }
+    let mut bindings = HashMap::new();
+    let mut head = quick_xml::Reader::from_str(xml);
+    loop {
+        match head.read_event() {
+            Ok(Event::Start(root)) => { namespaces(&root, &mut bindings); break; }
+            Ok(Event::Eof) | Err(_) => return,
+            _ => {}
+        }
+    }
+    let offset = xml.find("</sheetData>").map_or(0, |i| i + "</sheetData>".len());
+    let mut reader = quick_xml::Reader::from_str(&xml[offset..]);
+    loop {
+        let start = offset + reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == "hyperlinks" =>
+                namespaces(&e, &mut bindings),
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == "hyperlink" =>
+                visit(start, offset + reader.buffer_position() as usize, &e, &bindings),
+            Ok(Event::Start(e)) if e.local_name().as_ref() == "hyperlink" => {
+                if reader.read_to_end(e.name()).is_err() { break; }
+                visit(start, offset + reader.buffer_position() as usize, &e, &bindings);
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == "hyperlinks" => break,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
 }
 
 pub fn parse_sheet(xml: &str) -> Vec<RawLink> {
     let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(i) = xml[from..].find("<hyperlink ") {
-        let i = from + i;
-        let Some(gt) = xml[i..].find('>').map(|e| i + e) else {
-            break;
-        };
-        let tag = &xml[i..=gt];
-        let attr = |name: &str| -> Option<String> {
-            let pat = format!("{name}=\"");
-            let p = tag.find(&pat)? + pat.len();
-            let rest = &tag[p..];
-            let q = rest.find('"')?;
-            Some(rest[..q].to_string())
-        };
-        if let Some((r, c)) = attr("ref").as_deref().and_then(parse_a1) {
-            out.push(RawLink {
-                r,
-                c,
-                rid: attr("r:id"),
-                location: attr("location"),
-                tooltip: attr("tooltip"),
-            });
+    visit_links(xml, |_, _, tag, inherited| {
+        let mut link = RawLink::default();
+        let mut anchor = None;
+        let mut bindings = inherited.clone();
+        namespaces(tag, &mut bindings);
+        for a in tag.attributes().flatten() {
+            let name = a.key.as_ref();
+            let value = crate::model::xml_unescape(&a.value);
+            match name {
+                "ref" => {
+                    let (first, last) = value.split_once(':').unwrap_or((&value, &value));
+                    if let (Some((r, c)), Some((r2, c2))) = (parse_a1(first), parse_a1(last)) {
+                        if r2 >= r && c2 >= c {
+                            anchor = Some((r, c));
+                            link.span = (r2 - r, c2 - c);
+                        }
+                    }
+                }
+                "location" => link.location = Some(value),
+                "tooltip" => link.tooltip = Some(value),
+                n if n == "r:id" || n.strip_suffix(":id").and_then(|p| bindings.get(p))
+                    .is_some_and(|ns| ns.ends_with("/relationships")) => link.rid = Some(value),
+                n if n.starts_with("xmlns:") => {}
+                n => {
+                    if let Some((prefix, _)) = n.split_once(':') {
+                        if let Some(uri) = bindings.get(prefix) {
+                            let declaration = (format!("xmlns:{prefix}"), uri.clone());
+                            if !link.attributes.contains(&declaration) { link.attributes.push(declaration); }
+                        }
+                    }
+                    link.attributes.push((n.to_owned(), value));
+                }
+            }
         }
-        from = gt + 1;
-    }
+        if let Some((r, c)) = anchor {
+            (link.r, link.c) = (r, c);
+            out.push(link);
+        }
+    });
     out
+}
+
+/// umya expects one cell per hyperlink and panics on rectangular references.
+pub(crate) fn remove_range_links(xml: &mut String) -> bool {
+    let mut ranges = Vec::new();
+    visit_links(xml, |start, end, tag, _| {
+        if tag.attributes().flatten().any(|a| a.key.as_ref() == "ref" && a.value.contains(':')) {
+            ranges.push(start..end);
+        }
+    });
+    let changed = !ranges.is_empty();
+    for range in ranges.into_iter().rev() { xml.replace_range(range, ""); }
+    changed
 }
 
 fn parse_a1(s: &str) -> Option<(u32, u32)> {
     let mut c = 0u32;
     let mut i = 0usize;
+    let s = s.strip_prefix('$').unwrap_or(s);
     let b = s.as_bytes();
     while i < b.len() && b[i].is_ascii_alphabetic() {
-        c = c * 26 + (b[i].to_ascii_uppercase() - b'A' + 1) as u32;
+        c = c.checked_mul(26)?.checked_add((b[i].to_ascii_uppercase() - b'A' + 1) as u32)?;
         i += 1;
     }
     if i == 0 || i == b.len() {
         return None;
     }
-    let r = s[i..].parse::<u32>().ok()?;
+    let digits = s[i..].strip_prefix('$').unwrap_or(&s[i..]);
+    let r = digits.parse::<u32>().ok()?;
     if r == 0 {
         return None;
     }
@@ -77,31 +152,18 @@ fn parse_a1(s: &str) -> Option<(u32, u32)> {
 /// 读工作表 rels：rId → (Target, 是否外部)
 pub fn read_rels(path: &Path, sheet_part: &str) -> HashMap<String, (String, bool)> {
     let mut map = HashMap::new();
-    let Some(body) = crate::fixups::read_part_file(path, &rels_part(sheet_part)) else {
+    let Some(body) = crate::fixups::read_part(path, &rels_part(sheet_part)) else {
         return map;
     };
     let Ok(xml) = String::from_utf8(body) else {
         return map;
     };
-    let mut from = 0usize;
-    while let Some(i) = xml[from..].find("<Relationship ") {
-        let i = from + i;
-        let Some(gt) = xml[i..].find('>').map(|e| i + e) else {
-            break;
-        };
-        let tag = &xml[i..=gt];
-        let attr = |name: &str| -> Option<String> {
-            let pat = format!("{name}=\"");
-            let p = tag.find(&pat)? + pat.len();
-            let rest = &tag[p..];
-            let q = rest.find('"')?;
-            Some(rest[..q].to_string())
-        };
-        if let (Some(id), Some(target)) = (attr("Id"), attr("Target")) {
-            let external = attr("TargetMode").as_deref() == Some("External");
-            map.insert(id, (target, external));
+    if let Ok(doc) = roxmltree::Document::parse(&xml) {
+        for tag in doc.root_element().children().filter(|tag| tag.tag_name().name() == "Relationship") {
+            if let (Some(id), Some(target)) = (tag.attribute("Id"), tag.attribute("Target")) {
+                map.insert(id.to_owned(), (target.to_owned(), tag.attribute("TargetMode") == Some("External")));
+            }
         }
-        from = gt + 1;
     }
     map
 }
@@ -113,52 +175,79 @@ pub fn rels_part(sheet_part: &str) -> String {
     }
 }
 
+pub(crate) fn load_sheet(path: &Path, part: &str, xml: &str) -> HashMap<(u32, u32), Hyperlink> {
+    let raw = parse_sheet(xml);
+    let rels = if raw.iter().any(|link| link.rid.is_some()) {
+        read_rels(path, part)
+    } else { HashMap::new() };
+    raw.into_iter().filter_map(|link| {
+        let (target, external) = link.rid.as_ref().and_then(|id| rels.get(id))
+            .cloned().unwrap_or_default();
+        let location = link.location.unwrap_or_default();
+        (!target.is_empty() || !location.is_empty()).then(|| ((link.r, link.c), Hyperlink {
+            target, location, external, tooltip: link.tooltip.unwrap_or_default(),
+            span: link.span, attributes: link.attributes,
+        }))
+    }).collect()
+}
+
 /// 把模型里的链接写回工作表（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
-    if !wb.sheets.iter().any(|s| s.hyperlinks_dirty) {
+    apply_after_save(path, wb, false)
+}
+
+pub(crate) fn apply_after_save(
+    path: &Path, wb: &crate::model::Workbook, rebuilt: bool,
+) -> anyhow::Result<()> {
+    // A rebuilt sheet may have lost its original relationship IDs. Check only
+    // those sheets before deciding whether a repair is actually necessary.
+    let needs_check = |s: &crate::model::Sheet| s.hyperlinks_dirty
+        || (rebuilt && !s.hyperlinks.is_empty() && !crate::fixups::can_restore_sheet_xml(s));
+    if !wb.sheets.iter().any(&needs_check) {
         return Ok(());
     }
     let targets = crate::patch::sheet_targets(path)?;
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     for sheet in &wb.sheets {
-        if !sheet.hyperlinks_dirty {
+        if !needs_check(sheet) {
             continue;
         }
         let Some(part) = targets.get(&sheet.name) else {
             continue;
         };
-        let Some(xml) = crate::fixups::read_part_file(path, part).and_then(|b| String::from_utf8(b).ok())
+        let Some(xml) = crate::fixups::read_part(path, part).and_then(|b| String::from_utf8(b).ok())
         else {
             continue;
         };
+        if !sheet.hyperlinks_dirty && load_sheet(path, part, &xml) == sheet.hyperlinks {
+            continue;
+        }
         let rels_name = rels_part(part);
-        let rels_xml = crate::fixups::read_part_file(path, &rels_name)
+        let rels_xml = crate::fixups::read_part(path, &rels_name)
             .and_then(|b| String::from_utf8(b).ok())
             .unwrap_or_else(|| "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>".into());
         // 去掉旧的 hyperlink 关系，保留根元素、图片/图表等
-        let mut kept = String::new();
-        {
-            let mut rest = rels_xml.as_str();
-            while let Some(i) = rest.find("<Relationship ") {
-                kept.push_str(&rest[..i]);
-                let Some(gt) = rest[i..].find('>').map(|e| i + e + 1) else {
-                    kept.push_str(&rest[i..]);
-                    rest = "";
-                    break;
-                };
-                let tag = &rest[i..gt];
-                if !tag.contains("/hyperlink\"") {
-                    kept.push_str(tag);
-                }
-                rest = &rest[gt..];
+        let doc = roxmltree::Document::parse(&rels_xml)?;
+        let root = doc.root_element();
+        let mut kept = rels_xml.clone();
+        let mut taken_ids = std::collections::HashSet::new();
+        let mut remove = Vec::new();
+        for rel in root.children().filter(|rel| rel.tag_name().name() == "Relationship") {
+            if rel.attribute("Type").is_some_and(|ty| ty.ends_with("/hyperlink")) {
+                remove.push(rel.range());
+            } else if let Some(id) = rel.attribute("Id") {
+                taken_ids.insert(id);
             }
-            kept.push_str(rest);
         }
-        if !kept.contains("</Relationships>") {
-            kept = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{}</Relationships>",
-                kept
-            );
+        for range in remove.into_iter().rev() { kept.replace_range(range, ""); }
+        let root_name = root.tag_name().name();
+        let root_qname = root.tag_name().namespace().and_then(|uri| root.lookup_prefix(uri))
+            .map_or_else(|| root_name.to_owned(), |prefix| format!("{prefix}:{root_name}"));
+        let rel_qname = root_qname.rsplit_once(':')
+            .map_or_else(|| "Relationship".to_owned(), |(prefix, _)| format!("{prefix}:Relationship"));
+        if !kept.contains(&format!("</{root_qname}>")) {
+            let pos = kept.rfind("/>").ok_or_else(|| anyhow::anyhow!("超链接关系缺少根元素"))?;
+            kept.replace_range(pos..pos + 2, &format!("></{root_qname}>"));
         }
         let mut links_xml = String::new();
         let mut rels_add = String::new();
@@ -170,43 +259,48 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
         items.sort_by_key(|(k, _)| *k);
         let mut n = 0usize;
         for ((r, c), link) in items {
-            let a1 = crate::model::cell_name(r, c);
+            let mut reference = crate::model::cell_name(r, c);
+            if link.span != (0, 0) {
+                reference.push(':');
+                reference.push_str(&crate::model::cell_name(r.saturating_add(link.span.0), c.saturating_add(link.span.1)));
+            }
+            links_xml.push_str(&format!("<hyperlink ref=\"{reference}\""));
             if !link.target.is_empty() {
-                n += 1;
-                let rid = format!("rIdHk{n}");
-                links_xml.push_str(&format!(
-                    "<hyperlink ref=\"{a1}\" r:id=\"{rid}\"{} />",
-                    if link.tooltip.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" tooltip=\"{}\"", esc(&link.tooltip))
-                    }
-                ));
+                let rid = loop {
+                    n += 1;
+                    let rid = format!("rIdHk{n}");
+                    if !taken_ids.contains(rid.as_str()) { break rid; }
+                };
+                links_xml.push_str(&format!(" r:id=\"{rid}\""));
                 rels_add.push_str(&format!(
-                    "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
-                    esc(&link.target)
-                ));
-            } else if !link.location.is_empty() {
-                links_xml.push_str(&format!(
-                    "<hyperlink ref=\"{a1}\" location=\"{}\"{} />",
-                    esc(&link.location),
-                    if link.tooltip.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" tooltip=\"{}\"", esc(&link.tooltip))
-                    }
+                    "<{rel_qname} Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\"{}/>",
+                    esc(&link.target), if link.external { " TargetMode=\"External\"" } else { "" }
                 ));
             }
+            if !link.location.is_empty() {
+                links_xml.push_str(&format!(" location=\"{}\"", esc(&link.location)));
+            }
+            if !link.tooltip.is_empty() {
+                links_xml.push_str(&format!(" tooltip=\"{}\"", esc(&link.tooltip)));
+            }
+            for (name, value) in &link.attributes {
+                links_xml.push_str(&format!(" {name}=\"{}\"", esc(value)));
+            }
+            links_xml.push_str("/>");
         }
         let mut new_xml = strip_links(&xml);
         if !links_xml.is_empty() {
-            let block = format!("<hyperlinks>{links_xml}</hyperlinks>");
+            let ns = if !rels_add.is_empty() {
+                " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\""
+            } else { "" };
+            let block = format!("<hyperlinks{ns}>{links_xml}</hyperlinks>");
             let at = find_insert(&new_xml);
             new_xml.insert_str(at, &block);
         }
         pending.push((part.clone(), new_xml.into_bytes()));
         if !rels_add.is_empty() || rels_xml != kept {
-            let new_rels = kept.replace("</Relationships>", &format!("{rels_add}</Relationships>"));
+            let end_tag = format!("</{root_qname}>");
+            let new_rels = kept.replace(&end_tag, &format!("{rels_add}{end_tag}"));
             pending.push((rels_name, new_rels.into_bytes()));
         }
     }

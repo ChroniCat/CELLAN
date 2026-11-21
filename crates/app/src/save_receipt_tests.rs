@@ -3,10 +3,33 @@ use sheetcore::{Cell, Sheet, Value};
 use std::time::Duration;
 
 #[test]
+fn saving_with_pending_calculation_uses_the_same_random_sample_on_disk_and_screen() {
+    let env = crate::test_env::TestEnv::new("pending-volatile-save");
+    let path = env.path("cached.xlsx");
+    let mut tasks = DocumentTasks::default();
+    tasks.needs_full = true;
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 0, Cell { value: Value::Empty, formula: Some("=RAND()".into()) });
+    tasks.start_save(&mut wb, path.clone());
+    let started = Instant::now();
+    loop {
+        if let Some(result) = tasks.poll_save(&mut wb) {
+            assert!(result.unwrap().1);
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!tasks.recalc_pending());
+    let live = wb.sheets[0].value(0, 0);
+    assert!(matches!(live, Value::Number(_)));
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), live);
+}
+
+#[test]
 fn saving_during_pivot_replacement_preserves_only_the_live_pending_attachment() {
-    let dir = std::env::temp_dir().join(format!("native_async_pivot_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("pivot.xlsx");
+    let env = crate::test_env::TestEnv::new("async-pivot");
+    let path = env.path("pivot.xlsx");
     let mut tasks = DocumentTasks::default();
     let mut wb = Workbook::new_blank();
     wb.sheets.push(Sheet::new("Keep"));
@@ -54,14 +77,12 @@ fn saving_during_pivot_replacement_preserves_only_the_live_pending_attachment() 
         let workbook = String::from_utf8(sheetcore::fixups::read_part_file(&path, "xl/workbook.xml").unwrap()).unwrap();
         assert!(workbook.contains("<pivotCache "), "registration must survive the complete pipeline");
     }
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn background_save_acknowledges_only_snapshot_sheets_without_losing_new_edits() {
-    let dir = std::env::temp_dir().join(format!("native_async_receipt_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("snapshot.xlsx");
+    let env = crate::test_env::TestEnv::new("async-receipt");
+    let path = env.path("snapshot.xlsx");
     let mut tasks = DocumentTasks::default();
     let mut wb = Workbook::new_blank();
     wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.), formula: None });
@@ -71,7 +92,7 @@ fn background_save_acknowledges_only_snapshot_sheets_without_losing_new_edits() 
     wb.sheets[1].set(0, 0, Cell::default());
     let started = Instant::now();
     loop {
-        if let Some(result) = tasks.poll_save(&mut wb) { assert_eq!(result.unwrap(), path); break; }
+        if let Some(result) = tasks.poll_save(&mut wb) { assert_eq!(result.unwrap().0, path); break; }
         assert!(started.elapsed() < Duration::from_secs(20));
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -91,5 +112,4 @@ fn background_save_acknowledges_only_snapshot_sheets_without_losing_new_edits() 
     let back = sheetcore::xlsx::load(&path).unwrap();
     assert_eq!(back.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Sheet1", "Renamed"]);
     assert_eq!(back.sheets[1].value(0, 0), Value::Empty);
-    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -1,5 +1,9 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+#[cfg(all(windows, not(debug_assertions)))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod files;
 mod document_tasks;
 mod fill_seq;
@@ -9,7 +13,7 @@ mod wps_dialogs;
 mod wps_tools;
 mod wps_menus;
 
-use document_tasks::DocumentTasks;
+use document_tasks::{CalculatedSnapshot, DocumentTasks};
 use error_opts::ErrorCheckOptions;
 
 #[cfg(test)]
@@ -2170,19 +2174,19 @@ struct SheetApp {
     bg_beat_rx: Option<std::sync::mpsc::Receiver<(Option<session_lock::LockInfo>, Option<String>)>>,
     bg_editor_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     /// 依赖图：编辑后只重算受影响的公式
-    deps: sheetcore::formula::deps::Deps,
+    deps: std::sync::Arc<sheetcore::formula::deps::Deps>,
     /// 当前文档的依赖图是否已经构建完毕（避免无公式大表每次删除/粘贴重复全表扫描）
     deps_built: bool,
     /// 后台异步依赖图构建通道：(doc_uid, Deps)，不阻塞前台编辑
-    bg_deps_rx: Option<std::sync::mpsc::Receiver<(u64, Box<sheetcore::formula::deps::Deps>)>>,
+    bg_deps_rx: Option<std::sync::mpsc::Receiver<(u64, u64, u64, Box<sheetcore::formula::deps::Deps>)>>,
     /// 静默无遮罩后台公式补算通道：(doc_uid, wb_epoch, doc_gen, wb, deps)
     bg_recalc_rx: Option<
         std::sync::mpsc::Receiver<(
             u64,
             u64,
             u64,
-            Box<Workbook>,
-            Box<sheetcore::formula::deps::Deps>,
+            CalculatedSnapshot,
+            Option<Box<sheetcore::formula::deps::Deps>>,
         )>,
     >,
     bg_recalc_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -2253,7 +2257,8 @@ struct ParkedDoc {
     load_diag: Option<sheetcore::xlsx::LoadDiag>,
     wb: Workbook,
     undo: sheetcore::undo::UndoStack,
-    deps: sheetcore::formula::deps::Deps,
+    deps: std::sync::Arc<sheetcore::formula::deps::Deps>,
+    deps_built: bool,
     sel: (u32, u32),
     sel_end: (u32, u32),
     sheet_idx: usize,
@@ -2347,7 +2352,7 @@ enum OpenMsg {
     /// 大文件只把依赖图备好，不阻塞打开（缓存值先显示）
     DepsReady(Box<sheetcore::formula::deps::Deps>),
     /// 手动“重算全部”的后台结果（带上发起时的 wb_epoch 与 doc_gen）
-    RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64, u64),
+    RecalcedWb(Box<Workbook>, Box<sheetcore::formula::deps::Deps>, u64, u64, bool),
     /// 后台重算被取消（未写回，模型保持原值）
     RecalcCancelled,
     Failed(String),
@@ -3389,7 +3394,7 @@ impl SheetApp {
             fw_blocked_peer: None,
             bg_beat_rx: None,
             bg_editor_rx: None,
-            deps: sheetcore::formula::deps::Deps::empty(),
+            deps: sheetcore::formula::deps::Deps::empty().into(),
             deps_built: true,
             bg_deps_rx: None,
             bg_recalc_rx: None,
@@ -3813,7 +3818,7 @@ impl SheetApp {
             wb.calc_manual = manual;
             // 单表重算只清该表；全量重算由 recalc_all_force 清空。
             let deps = sheetcore::formula::deps::Deps::build(&wb);
-            let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch, doc_gen));
+            let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch, doc_gen, sheet.is_none()));
         });
     }
 
@@ -4064,7 +4069,7 @@ impl SheetApp {
                     self.wb.calc_pending = false;
                     self.wb_epoch += 1;
                     self.doc_uid = next_doc_uid();
-                    self.deps = sheetcore::formula::deps::Deps::empty();
+                    self.deps = sheetcore::formula::deps::Deps::empty().into();
                     self.sheet_idx = 0;
                     // 调试：SC_SEL=r,c 时保留启动时的选区，便于无界面验证
                     if std::env::var("SC_SEL").is_err() && std::env::var("SC_SEL_STEP").is_err() {
@@ -5140,7 +5145,7 @@ impl SheetApp {
                     finished = true;
                     continue;
                 }
-                OpenMsg::RecalcedWb(wb, deps, epoch, doc_gen) => {
+                OpenMsg::RecalcedWb(wb, deps, epoch, doc_gen, full) => {
                     self.deps_pending = false;
                     self.tasks.recalc_cancel = None;
                     self.tasks.recalc_done = None;
@@ -5150,9 +5155,14 @@ impl SheetApp {
                     // 否则「A 文档的重算结果」可能落到 epoch 恰好相同的 B 文档上。
                     if epoch == self.wb_epoch && doc_gen == self.doc_gen {
                         self.apply_recalculated_workbook(*wb);
+                        self.cancel_silent_recalc();
+                        if full {
+                            self.tasks.needs_full = false;
+                            self.tasks.dirty_recalc_seeds.clear();
+                        }
                         self.manual_calc = self.wb.calc_manual;
                         self.wb_epoch += 1;
-                        self.deps = *deps;
+                        self.deps = deps.into();
                         self.deps_built = true;
                         self.cf_stats_gen = u64::MAX;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -5169,8 +5179,8 @@ impl SheetApp {
                     continue;
                 }
                 OpenMsg::DepsReady(deps) => {
-                    if !self.joined_doc && !self.in_snapshot {
-                        self.deps = *deps;
+                    if !self.joined_doc && !self.in_snapshot && self.doc_gen == 0 {
+                        self.deps = deps.into();
                         self.deps_built = true;
                     }
                     self.deps_pending = false;
@@ -5196,7 +5206,7 @@ impl SheetApp {
                                     d.update_cell(&self.wb, (si, r, c));
                                 }
                             }
-                            self.deps = d;
+                            self.deps = d.into();
                             self.deps_built = true;
                             self.bg_deps_rx = None;
                         }
@@ -5206,11 +5216,9 @@ impl SheetApp {
                         continue;
                     }
                     if self.doc_gen != 0 {
-                        // 期间用户改过：直接复用后台已建好的依赖图并补增量更新，避免在 UI 线程全表重建依赖图
-                        self.tasks.needs_full = true;
+                        self.request_silent_bg_recalc();
                         self.tasks.busy = false;
-                        self.deps = *deps;
-                        self.deps_built = true;
+                        self.deps_built = false;
                         self.status = "已打开；因期间有编辑，稍后会自动补算一次".into();
                         eprintln!("[open] 丢弃后台结果（期间有编辑），等空闲补算");
                         finished = true;
@@ -5225,7 +5233,7 @@ impl SheetApp {
                     self.apply_recalculated_workbook(*wb);
                     self.xlink_last_check = None;
                     self.manual_calc = self.wb.calc_manual;
-                    self.deps = *deps;
+                    self.deps = deps.into();
                     self.deps_built = true;
                     self.tasks.busy = false;
                     self.tasks.needs_full = false;
@@ -5257,7 +5265,7 @@ impl SheetApp {
                     self.tasks.busy = false;
                     // A failed replacement leaves the previous workbook visible; only rebuild deps if missing.
                     if !self.deps_built {
-                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                         self.deps_built = true;
                     }
                     finished = true;
@@ -5420,7 +5428,13 @@ impl SheetApp {
         let mut close_after_save: Option<u64> = None;
         if let Some(result) = self.tasks.poll_save(&mut self.wb) {
             self.status = match result {
-                Ok(path) => {
+                Ok((path, applied)) => {
+                    if applied {
+                        self.cancel_silent_recalc();
+                        self.deps_built = false;
+                        self.cf_stats_gen = u64::MAX;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
                     recent::touch(&path);
                     self.recent_cache = None;
                     // 另存成功后新文件是按当前已知内容完整写出的；诊断清掉，
@@ -5462,7 +5476,12 @@ impl SheetApp {
             let TabSlot::Parked(doc) = tab else { continue };
             if let Some(result) = doc.tasks.poll_save(&mut doc.wb) {
                 match result {
-                    Ok(path) => {
+                    Ok((path, applied)) => {
+                        if applied {
+                            doc.deps_built = false;
+                            doc.doc_gen = doc.doc_gen.wrapping_add(1);
+                            doc.cf_stats_gen = u64::MAX;
+                        }
                         doc.title = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                         // 挂起的文档保存成功同样要解除旧诊断：否则切回来还会拿
                         // 已经修好的旧缺口挡住保存。
@@ -5526,9 +5545,6 @@ impl SheetApp {
         {
             return;
         }
-        if self.foreign_host_save_conflict().is_some() {
-            return;
-        }
         let idle_ms: u64 = if collab_host_active { 3_500 } else { 5_000 };
         let edit_settled = self
             .tasks
@@ -5543,8 +5559,14 @@ impl SheetApp {
             }
             return;
         }
-        let other_paths = self.other_document_paths(self.active_tab);
         self.last_autosave_attempt = Some(std::time::Instant::now());
+        if self.foreign_host_save_conflict().is_some() {
+            if let Some(ctx) = ctx {
+                ctx.request_repaint_after(std::time::Duration::from_secs(12));
+            }
+            return;
+        }
+        let other_paths = self.other_document_paths(self.active_tab);
         self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
         match Self::start_document_save(
             &mut self.wb,
@@ -7557,7 +7579,7 @@ impl SheetApp {
                     .iter()
                     .any(|s| s.iter().any(|(_, c)| c.formula.is_some()));
                 if has_formula {
-                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                 }
                 self.deps_built = true;
                 self.bg_deps_rx = None;
@@ -7573,29 +7595,134 @@ impl SheetApp {
             .iter()
             .any(|s| s.iter().any(|(_, c)| c.formula.is_some()));
         if !has_any_formula {
-            self.deps = sheetcore::formula::deps::Deps::empty();
+            self.deps = sheetcore::formula::deps::Deps::empty().into();
             self.deps_built = true;
             self.bg_deps_rx = None;
             return;
         }
         if self.bg_deps_rx.is_none() {
-            let sk = formula_skeleton(&self.wb);
+            let sk = self.wb.clone();
             let uid = self.doc_uid;
+            let epoch = self.wb_epoch;
+            let generation = self.doc_gen;
             let (tx, rx) = std::sync::mpsc::channel();
             self.bg_deps_rx = Some(rx);
             std::thread::spawn(move || {
                 let deps = sheetcore::formula::deps::Deps::build(&sk);
-                let _ = tx.send((uid, Box::new(deps)));
+                let _ = tx.send((uid, epoch, generation, Box::new(deps)));
             });
         }
     }
 
     fn request_silent_bg_recalc(&mut self) {
         self.tasks.needs_full = true;
+        self.tasks.dirty_recalc_seeds.clear();
+        self.cancel_silent_recalc();
+    }
+
+    fn update_dependency(&mut self, key: sheetcore::formula::deps::CellKey) {
+        if self.deps.cell_needs_update(&self.wb, key) {
+            std::sync::Arc::make_mut(&mut self.deps).update_cell(&self.wb, key);
+        }
+    }
+
+    fn cancel_silent_recalc(&mut self) {
         if let Some(c) = self.bg_recalc_cancel.take() {
             c.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.bg_recalc_rx = None;
+    }
+
+    fn poll_silent_recalc(&mut self) {
+        if self.tasks.saving.is_some() && self.tasks.recalc_pending() {
+            self.cancel_silent_recalc();
+        }
+        if let Some(rx) = &self.bg_deps_rx {
+            if let Ok((uid, epoch, generation, deps)) = rx.try_recv() {
+                if uid == self.doc_uid && epoch == self.wb_epoch && generation == self.doc_gen {
+                    self.deps = deps.into();
+                    self.deps_built = true;
+                }
+                self.bg_deps_rx = None;
+            }
+        }
+        if let Some(rx) = &self.bg_recalc_rx {
+            match rx.try_recv() {
+                Ok((uid, epoch, gen_at, calculated, d)) => {
+                    self.bg_recalc_rx = None;
+                    self.bg_recalc_cancel = None;
+                    if uid == self.doc_uid && epoch == self.wb_epoch && gen_at == self.doc_gen {
+                        if !calculated.apply(&mut self.wb) {
+                            self.deps_built = false;
+                            self.request_silent_bg_recalc();
+                            return;
+                        }
+                        self.tasks.needs_full = false;
+                        self.tasks.dirty_recalc_seeds.clear();
+                        if let Some(d) = d {
+                            self.deps = d.into();
+                        }
+                        self.deps_built = true;
+                        self.cf_stats_gen = u64::MAX;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.bg_recalc_rx = None;
+                    self.bg_recalc_cancel = None;
+                }
+            }
+        }
+    }
+
+    fn start_silent_recalc(&mut self, ctx: &egui::Context) {
+        let pending_recalc = !self.wb.calc_manual && self.tasks.recalc_pending();
+        if pending_recalc
+            && self.bg_recalc_rx.is_none()
+            && !self.tasks.busy
+            && self.tasks.saving.is_none()
+            && self
+                .tasks
+                .last_edit
+                .map(|t| t.elapsed().as_millis() >= 250)
+                .unwrap_or(true)
+        {
+            let wb_now = self.wb.clone();
+            let revisions = wb_now.sheets.iter().map(|sh| sh.cell_revision()).collect();
+            let incremental = (!self.tasks.needs_full && self.deps_built).then(|| {
+                let seeds: Vec<_> = self.tasks.dirty_recalc_seeds.iter().copied().collect();
+                (self.deps.clone(), seeds)
+            });
+            let uid = self.doc_uid;
+            let epoch = self.wb_epoch;
+            let doc_gen = self.doc_gen;
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.bg_recalc_cancel = Some(cancel.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.bg_recalc_rx = Some(rx);
+            let wake = ctx.clone();
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut wb2 = wb_now;
+                let rebuilt = if let Some((deps, seeds)) = incremental {
+                    if !sheetcore::formula::recalc_dirty_cancelable(&mut wb2, &deps, &seeds, &cancel) {
+                        return;
+                    }
+                    None
+                } else {
+                    if !sheetcore::formula::recalc_all_force_impl(&mut wb2, Some(&cancel), None)
+                        || cancel.load(Ordering::Relaxed) { return; }
+                    Some(Box::new(sheetcore::formula::deps::Deps::build(&wb2)))
+                };
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send((uid, epoch, doc_gen, CalculatedSnapshot { revisions, workbook: Box::new(wb2) }, rebuilt));
+                    wake.request_repaint();
+                }
+            });
+        } else if pending_recalc && self.bg_recalc_rx.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(260));
+        }
     }
 
     fn fast_recalc_cells(&mut self, keys: &[(usize, u32, u32)]) {
@@ -7605,23 +7732,34 @@ impl SheetApp {
         self.ensure_deps_ready_or_bg();
         if self.deps_built {
             for k in keys {
-                self.deps.update_cell(&self.wb, *k);
+                self.update_dependency(*k);
             }
         }
         if self.manual_calc {
             self.wb.calc_manual = true;
-            sheetcore::formula::mark_pending(&mut self.wb, &self.deps, keys);
+            if self.deps_built {
+                sheetcore::formula::mark_pending(&mut self.wb, &self.deps, keys);
+            } else {
+                self.wb.calc_pending = true;
+                self.wb.calc_pending_sheets.extend(0..self.wb.sheets.len());
+            }
             self.status = "手动计算：已标记待计算（按 F9 或“开始计算”重算）".into();
             return;
         }
-        let complete = sheetcore::formula::recalc_interactive(
+        let plan = sheetcore::formula::recalc_interactive_plan(
             &mut self.wb,
             &self.deps,
             keys,
             self.deps_built,
         );
-        if !complete {
-            self.request_silent_bg_recalc();
+        use sheetcore::formula::InteractiveRecalc;
+        match plan {
+            InteractiveRecalc::BackgroundFull => self.request_silent_bg_recalc(),
+            InteractiveRecalc::BackgroundDirty if !self.tasks.needs_full => {
+                self.tasks.dirty_recalc_seeds.extend(keys.iter().copied());
+                self.cancel_silent_recalc();
+            }
+            _ => {}
         }
     }
 
@@ -7788,7 +7926,7 @@ impl SheetApp {
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.txn_end("选择验证下拉值", txn);
-        self.deps.update_cell(&self.wb, key);
+        self.update_dependency(key);
         sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
             let op = peer.local_set(self.sheet_idx, dr, dc, &cell);
@@ -9429,7 +9567,7 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             .collect();
         if !fkeys.is_empty() {
             for k in &fkeys {
-                self.deps.update_cell(&self.wb, *k);
+                self.update_dependency(*k);
             }
             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
         }
@@ -10808,6 +10946,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     /// 自适应全量重算 + 依赖图更新：中小工作簿（<= 2000 个公式）毫秒级同步完成；
     /// 大型工作簿（> 2000 个公式）无缝派发到静默后台线程，彻底告别主线程多秒卡死。
     fn recalc_all_and_deps_adaptive(&mut self) {
+        self.cancel_silent_recalc();
+        self.bg_deps_rx = None;
+        self.tasks.dirty_recalc_seeds.clear();
+        self.tasks.needs_full = false;
         let mut formulas = 0usize;
         'cnt: for sh in &self.wb.sheets {
             for (_, cell) in sh.iter() {
@@ -10821,14 +10963,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         if formulas <= 2_000 {
             sheetcore::formula::recalc_all(&mut self.wb);
-            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
             self.deps_built = true;
         } else if self.wb.calc_manual {
             self.wb.calc_pending = true;
+            self.wb.calc_pending_sheets.extend(0..self.wb.sheets.len());
             self.deps_built = false;
         } else {
             self.deps_built = false;
-            self.tasks.last_edit = None;
             self.request_silent_bg_recalc();
         }
     }
@@ -11041,11 +11183,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         keys.sort();
         keys.dedup();
         if applied.structural {
-            sheetcore::formula::recalc_all(&mut self.wb);
-            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+            self.recalc_all_and_deps_adaptive();
         } else {
             for k in keys.iter() {
-                self.deps.update_cell(&self.wb, *k);
+                self.update_dependency(*k);
             }
             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &keys);
         }
@@ -13479,11 +13620,10 @@ fn clear_values(&mut self) {
                     }
                 }
             }
-            sheetcore::formula::recalc_all(&mut self.wb);
             self.status = "已加汇总行（SUBTOTAL 109，忽略筛选掉的行）".into();
         }
+        self.recalc_all_and_deps_adaptive();
         self.txn_end("表格汇总行", txn);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
     }
@@ -13741,8 +13881,7 @@ fn clear_values(&mut self) {
             self.undo
                 .push_structure(label.to_string(), before, after, (idx, self.sel.0, self.sel.1));
         }
-        sheetcore::formula::recalc_all(&mut self.wb);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.recalc_all_and_deps_adaptive();
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
         self.sel = (nr1, nc1);
@@ -13951,9 +14090,7 @@ fn clear_values(&mut self) {
         }
         sheetcore::structural::apply_cell_shift_wb(&mut self.wb, self.sheet_idx, rect, horizontal, insert);
         self.txn_end(if insert { "插入单元格" } else { "删除单元格" }, txn);
-        sheetcore::formula::recalc_all(&mut self.wb);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
-        self.deps_built = true;
+        self.recalc_all_and_deps_adaptive();
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
@@ -15396,6 +15533,7 @@ let txn = self.txn_begin(&keys);
                             target: url.clone(),
                             location: String::new(),
                             tooltip: String::new(),
+                            ..Default::default()
                         },
                     );
                     sh.hyperlinks_dirty = true;
@@ -15892,7 +16030,7 @@ let txn = self.txn_begin(&keys);
                     }
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                     sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[]);
                     sheetcore::formula::recalc_all(&mut self.wb);
                     self.scen_msg = format!("已显示方案「{}」", sc.name);
@@ -17207,7 +17345,8 @@ let txn = self.txn_begin(&keys);
                 self.wb.names.remove(i);
                 self.wb.names_dirty = true;
                 self.wb.dirty = true;
-                sheetcore::formula::recalc_all(&mut self.wb);
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.recalc_all_and_deps_adaptive();
                 self.status = "已删除名称".into();
             }
         }
@@ -17247,7 +17386,8 @@ let txn = self.txn_begin(&keys);
                 self.wb.dirty = true;
                 self.name_new.clear();
                 self.name_refers.clear();
-                sheetcore::formula::recalc_all(&mut self.wb);
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.recalc_all_and_deps_adaptive();
                 self.status = "名称已保存".into();
             }
         }
@@ -18875,7 +19015,7 @@ let txn = self.txn_begin(&keys);
             return Err("选区内没有可分组的行".into());
         }
         sheetcore::formula::recalc_all(&mut self.wb);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
         let after = before.capture_after(&self.wb);
         self.undo.push_structure("分类汇总", before, after, (idx, self.sel.0, self.sel.1));
         self.wb.dirty = true;
@@ -23250,7 +23390,7 @@ let txn = self.txn_begin(&keys);
         }
         // 整表重算（结构变了，依赖图也得重建）
         sheetcore::formula::recalc_all(&mut self.wb);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
         self.shift_collab_coordinates(idx, &op);
         if let Some(net) = self.net.as_ref() {
             net.broadcast_structural(idx, &op);
@@ -23480,7 +23620,7 @@ let txn = self.txn_begin(&keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         let fkeys: Vec<(usize, u32, u32)> = keys.iter().map(|(r, c)| (si, *r, *c)).collect();
         for k in &fkeys {
-            self.deps.update_cell(&self.wb, *k);
+            self.update_dependency(*k);
         }
         sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
         self.status = format!("已撤回 {} 的「{}」", e.who, e.label);
@@ -24229,7 +24369,7 @@ let txn = self.txn_begin(&keys);
                 let converted = sheetcore::xlinks::break_link(&mut self.wb, i);
                 self.xlink_stamps.remove(&(uid, link_idx));
                 self.xlink_resolved.remove(&(uid, link_idx));
-                self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                 self.deps_built = true;
                 self.wb.dirty = true;
                 self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -30036,7 +30176,7 @@ let txn = self.txn_begin(&keys);
                             );
                         }
                         sheetcore::formula::recalc_all(&mut self.wb);
-                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         self.wb.dirty = true;
                         self.status = if is_rows {
@@ -32566,7 +32706,7 @@ let txn = self.txn_begin(&keys);
                 let mut c2 = c;
                 c2.value = Value::Number(5.0);
                 self.wb.sheet_mut(self.sheet_idx).set(0, 0, c2);
-                self.deps.update_cell(&self.wb, key);
+                self.update_dependency(key);
                 sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[key]);
                 let b1 = self
                     .wb
@@ -32718,7 +32858,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             self.sel = (6, 0);
             self.sel_end = (6, 0);
         }
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
         self.doc_uid = next_doc_uid();
         self.has_open_workbook = true;
@@ -33912,7 +34052,8 @@ fn elide(s: &str, max_chars: usize) -> String {
             load_diag: self.load_diag.take(),
             wb: std::mem::replace(&mut self.wb, Workbook::new_blank()),
             undo: std::mem::replace(&mut self.undo, sheetcore::undo::UndoStack::new()),
-            deps: std::mem::replace(&mut self.deps, sheetcore::formula::deps::Deps::empty()),
+            deps: std::mem::take(&mut self.deps),
+            deps_built: self.deps_built,
             sel: self.sel,
             sel_end: self.sel_end,
             sheet_idx: self.sheet_idx,
@@ -33944,6 +34085,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.load_diag = doc.load_diag;
         self.undo = doc.undo;
         self.deps = doc.deps;
+        self.deps_built = doc.deps_built;
         self.sel = doc.sel;
         self.sel_end = doc.sel_end;
         self.nav_rect = None;
@@ -34218,7 +34360,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
         self.undo = sheetcore::undo::UndoStack::new();
-        self.deps = sheetcore::formula::deps::Deps::empty();
+        self.deps = sheetcore::formula::deps::Deps::empty().into();
         self.deps_built = true;
         self.bg_deps_rx = None;
         if let Some(c) = self.bg_recalc_cancel.take() {
@@ -34354,7 +34496,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         sheetcore::formula::recalc_all(&mut self.wb);
-                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
                         let who = self.peer_display_name(site);
                         self.status = if site != 0 {
@@ -34468,7 +34610,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 peer.apply_list_to_workbook(&mut self.wb, &seeds);
                             }
                             for k in &seeds {
-                                self.deps.update_cell(&self.wb, *k);
+                                self.update_dependency(*k);
                             }
                             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &seeds);
                         }
@@ -34573,12 +34715,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                             .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count())
                             .sum();
                         if total_formulas == 0 {
-                            self.deps = sheetcore::formula::deps::Deps::empty();
+                            self.deps = sheetcore::formula::deps::Deps::empty().into();
                             self.deps_built = true;
                             self.bg_deps_rx = None;
                         } else if total_cells <= 1_200 && total_formulas <= 600 {
                             sheetcore::formula::recalc_all(&mut self.wb);
-                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                             self.deps_built = true;
                             self.bg_deps_rx = None;
                         } else {
@@ -34679,7 +34821,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 peer.apply_all_to_workbook(&mut self.wb);
                             }
                             sheetcore::formula::recalc_all(&mut self.wb);
-                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb);
+                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
                             self.doc_gen = self.doc_gen.wrapping_add(1);
                         }
                     } else if !touched.is_empty() {
@@ -35711,40 +35853,7 @@ impl eframe::App for SheetApp {
         if let Some(net) = self.net.as_ref() {
             net.set_wake_ctx(ctx);
         }
-        if let Some(rx) = &self.bg_deps_rx {
-            if let Ok((uid, deps)) = rx.try_recv() {
-                if uid == self.doc_uid {
-                    self.deps = *deps;
-                    self.deps_built = true;
-                }
-                self.bg_deps_rx = None;
-            }
-        }
-        if let Some(rx) = &self.bg_recalc_rx {
-            match rx.try_recv() {
-                Ok((uid, epoch, gen_at, wb2, d)) => {
-                    self.bg_recalc_rx = None;
-                    self.bg_recalc_cancel = None;
-                    if uid == self.doc_uid && epoch == self.wb_epoch {
-                        if gen_at == self.doc_gen {
-                            self.apply_recalculated_workbook(*wb2);
-                            self.deps = *d;
-                            self.deps_built = true;
-                            self.cf_stats_gen = u64::MAX;
-                            self.doc_gen = self.doc_gen.wrapping_add(1);
-                        } else if !self.deps_built {
-                            self.deps = *d;
-                            self.deps_built = true;
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.bg_recalc_rx = None;
-                    self.bg_recalc_cancel = None;
-                }
-            }
-        }
+        self.poll_silent_recalc();
         // 背景错误检查与循环引用检测：大表在连续输入期间防抖延后，彻底消除每次回车后的整表扫描卡顿
         let sheet_cells = self.wb.sheet(self.sheet_idx).len();
         let edit_idle = sheet_cells <= 1_500
@@ -35784,43 +35893,7 @@ impl eframe::App for SheetApp {
         self.poll_auto_xlinks(ctx);
         // 动态引用或大范围下游公式：停手 250ms 后在独立后台静默线程中无感补算，
         // 绝不占用 tasks.busy / open_rx，彻底杜绝弹出「正在重算」模态遮罩打断连续输入！
-        if self.tasks.needs_full
-            && self.bg_recalc_rx.is_none()
-            && !self.tasks.busy
-            && self.tasks.saving.is_none()
-            && self
-                .tasks
-                .last_edit
-                .map(|t| t.elapsed().as_millis() >= 250)
-                .unwrap_or(true)
-        {
-            let wb_now = self.wb.clone();
-            let uid = self.doc_uid;
-            let epoch = self.wb_epoch;
-            let doc_gen = self.doc_gen;
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.bg_recalc_cancel = Some(cancel.clone());
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.bg_recalc_rx = Some(rx);
-            self.tasks.needs_full = false;
-            let wake = ctx.clone();
-            std::thread::spawn(move || {
-                use std::sync::atomic::Ordering;
-                let mut wb2 = wb_now;
-                if !wb2.calc_manual
-                    && sheetcore::formula::recalc_all_force_impl(&mut wb2, Some(&cancel), None)
-                    && !cancel.load(Ordering::Relaxed)
-                {
-                    let d = sheetcore::formula::deps::Deps::build(&wb2);
-                    if !cancel.load(Ordering::Relaxed) {
-                        let _ = tx.send((uid, epoch, doc_gen, Box::new(wb2), Box::new(d)));
-                        wake.request_repaint();
-                    }
-                }
-            });
-        } else if self.tasks.needs_full && self.bg_recalc_rx.is_none() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(260));
-        }
+        self.start_silent_recalc(ctx);
         // 有 dump 待写时也要保持刷新，否则窗口静止就永远等不到那一帧
         if std::env::var("SC_DUMP").is_ok() && self.dump_once {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -37894,13 +37967,16 @@ fn formula_skeleton(wb: &Workbook) -> Workbook {
                     cref.row,
                     cref.col,
                     sheetcore::model::Cell {
-                        value: sheetcore::model::Value::Empty,
+                        value: if sheetcore::formula::is_cached_spill_error(&cell.value) {
+                            cell.value.clone()
+                        } else { sheetcore::model::Value::Empty },
                         formula: Some(f.clone()),
                     },
                 );
             }
         }
         s.arrays = sh.arrays.clone();
+        s.tables = sh.tables.clone();
         sk.sheets.push(s);
     }
     sk.names = wb.names.clone();
@@ -38082,15 +38158,13 @@ fn install_ui_system_fonts(fonts: &mut egui::FontDefinitions) {
     }
     static CACHE: OnceLock<UiSysFonts> = OnceLock::new();
     let cached = CACHE.get_or_init(|| {
-        let win = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-        let dir = std::path::Path::new(&win).join("Fonts");
-        let load_ttf = |file: &str, idx: u32| -> Option<Arc<egui::FontData>> {
-            let bytes = std::fs::read(dir.join(file)).ok()?;
-            let n = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        let load_ttf = |file: &'static str, idx: u32| -> Option<Arc<egui::FontData>> {
+            let bytes = system_fonts::file_bytes(file)?;
+            let n = ttf_parser::fonts_in_collection(bytes).unwrap_or(1);
             let index = if idx < n { idx } else { 0 };
-            ttf_parser::Face::parse(&bytes, index).ok()?;
+            ttf_parser::Face::parse(bytes, index).ok()?;
             Some(Arc::new(egui::FontData {
-                font: std::borrow::Cow::Owned(bytes),
+                font: std::borrow::Cow::Borrowed(bytes),
                 index,
                 tweak: Default::default(),
             }))
@@ -38658,7 +38732,7 @@ fn run_app(
                 app.has_open_workbook = initial.is_some();
                 if std::env::var("SC_SHOW_HOME").is_ok() {
                     app.wb = templates::build(0);
-                    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+                    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
                     app.has_open_workbook = true;
                     app.show_start = true;
                 }

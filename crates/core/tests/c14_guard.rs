@@ -477,6 +477,7 @@ fn editing_an_existing_external_link_persists_the_new_target() {
             location: String::new(),
             tooltip: "旧".into(),
             external: true,
+            ..Default::default()
         },
     );
     wb.sheets[0].hyperlinks_dirty = true;

@@ -23,6 +23,21 @@ fn seed() -> Workbook {
 }
 
 #[test]
+fn bottom_row_insertion_records_only_vacated_cells() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..1024 {
+        wb.sheets[0].set(r, 0, number(r.into()));
+    }
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 1022, n: 1 });
+    assert_eq!(wb.sheets[0].cleared.len(), 1);
+    assert!(wb.sheets[0].cleared.contains(&CellRef::new(1022, 0)));
+    let restored = undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert_eq!(restored.touched, vec![(0, 1022, 0), (0, 1023, 0), (0, 1024, 0)]);
+    assert_eq!(wb.sheets[0].value(1023, 0), Value::Number(1023.0));
+}
+
+#[test]
 fn structure_undo_restores_foreign_formulas_and_names_without_replacing_other_cells() {
     let mut wb = seed();
     let mut undo = UndoStack::new();

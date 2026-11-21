@@ -125,7 +125,7 @@ pub struct Sheet {
     /// 行高
     pub rows: crate::layout::Axis,
     /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
-    pub styles: HashMap<CellRef, u16>,
+    pub styles: crate::store::CellStyles,
     /// 整列默认样式（列号 -> 样式表索引，稀疏）
     pub col_styles: HashMap<u32, u16>,
     /// 整行默认样式（行号 -> 样式表索引，稀疏）
@@ -241,7 +241,7 @@ impl Sheet {
             merges: Vec::new(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
-            styles: HashMap::new(),
+            styles: crate::store::CellStyles::default(),
             col_styles: HashMap::new(),
             row_styles: HashMap::new(),
             style_edits: std::collections::HashSet::new(),
@@ -369,6 +369,21 @@ impl Sheet {
     /// 按行、列升序遍历所有单元格
     pub(crate) fn cells_mut(&mut self) -> &mut Store {
         &mut self.cells
+    }
+
+    pub(crate) fn changed_cells(&self, other: &Sheet) -> impl Iterator<Item = CellRef> {
+        self.cells.changed_keys(&other.cells)
+    }
+
+    pub fn cell_revision(&self) -> u64 { self.cells.revision() }
+
+    /// Install only the fields written by formula evaluation. UI metadata and
+    /// save receipts belong to the live sheet even if calculation was in flight.
+    pub fn take_calculation(&mut self, result: &mut Sheet) {
+        std::mem::swap(&mut self.cells, &mut result.cells);
+        std::mem::swap(&mut self.cleared, &mut result.cleared);
+        std::mem::swap(&mut self.spilled, &mut result.spilled);
+        std::mem::swap(&mut self.spill_shapes, &mut result.spill_shapes);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {

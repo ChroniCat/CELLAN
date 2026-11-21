@@ -541,6 +541,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staged_edits_and_raw_copies_preserve_compressed_bytes_and_last_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.zip");
+        let output = dir.path().join("output.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1));
+        zip.start_file("source", opts).unwrap();
+        zip.write_all(&vec![b'a'; 64 * 1024]).unwrap();
+        zip.finish().unwrap();
+        std::fs::copy(&source, &output).unwrap();
+
+        begin_stage_for(&output);
+        stage_raw_copy("source", "renamed");
+        stage_raw_copy("source", "patched");
+        append_entry(&output, "patched", b"latest").unwrap();
+        stage_raw_copy("source", "removed");
+        remove_entry(&output, "removed").unwrap();
+        commit_stage_with_raw_copies(&output, &source).unwrap();
+
+        let compressed = |path: &Path, name: &str| {
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+            let mut bytes = Vec::new();
+            zip.by_index_raw(zip.index_for_name(name).unwrap()).unwrap().read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(compressed(&output, "renamed"), compressed(&source, "source"));
+        assert_eq!(crate::fixups::read_part_file(&output, "patched").unwrap(), b"latest");
+        assert!(crate::fixups::read_part_file(&output, "removed").is_none());
+    }
+
+    #[test]
     fn strips_and_reinserts_cf() {
         let xml = r#"<worksheet><sheetData/><mergeCells count="1"><mergeCell ref="A1:B2"/></mergeCells><conditionalFormatting sqref="A1"><cfRule type="cellIs" priority="1"/></conditionalFormatting><pageMargins/></worksheet>"#;
         let out = insert_cf(xml, "<conditionalFormatting sqref=\"C1\"><cfRule type=\"cellIs\" priority=\"1\"/></conditionalFormatting>");
@@ -1529,51 +1561,88 @@ pub fn clear_stage() {
 
 /// 一次性落盘：写入/替换/删除都在这一遍里完成
 pub fn commit_stage(path: &Path) -> Result<usize> {
-    use std::io::Write;
-    let Some((_, map)) = STAGE.with(|s| s.borrow_mut().take()) else {
-        return Ok(0);
+    commit_package(path, None, true)
+}
+
+pub(crate) fn commit_stage_with_raw_copies(path: &Path, src: &Path) -> Result<usize> {
+    commit_package(path, Some(src), true)
+}
+
+/// Combine replacements, removals and baseline compressed entries in one ZIP pass.
+/// A replacement staged after a raw copy takes precedence over that copy.
+fn commit_package(path: &Path, raw_source: Option<&Path>, take_stage: bool) -> Result<usize> {
+    use std::collections::{hash_map::Entry, HashMap};
+
+    enum Part {
+        Write(Vec<u8>),
+        Remove,
+        Copy(usize),
+    }
+
+    let mut pending = HashMap::new();
+    if take_stage {
+        if let Some((_, map)) = STAGE.with(|s| s.borrow_mut().take()) {
+            pending.extend(map.into_iter().map(|(name, body)|
+                (name, body.map_or(Part::Remove, Part::Write))));
+        }
+    }
+    let mut source = None;
+    if let Some(src) = raw_source {
+        let copies = RAW_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
+        if !copies.is_empty() {
+            let zip = zip::ZipArchive::new(std::fs::File::open(src)?)?;
+            for (from, to) in copies.into_iter().rev() {
+                if let Entry::Vacant(dest) = pending.entry(to) {
+                    let index = zip.index_for_name(&from)
+                        .with_context(|| format!("源包里没有 {from}"))?;
+                    dest.insert(Part::Copy(index));
+                }
+            }
+            source = Some(zip);
+        }
+    }
+    let count = pending.len();
+    if count == 0 { return Ok(0); }
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let temp = tempfile::NamedTempFile::new_in(path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+    let (file, temp) = temp.into_parts();
+    let mut out = zip::ZipWriter::new(file);
+    let mut write = |out: &mut zip::ZipWriter<std::fs::File>, name: String, part: Part| -> Result<()> {
+        match part {
+            Part::Write(body) => {
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(4));
+                out.start_file(name, opts)?;
+                out.write_all(&body)?;
+            }
+            Part::Remove => {}
+            Part::Copy(index) => {
+                let src = source.as_mut().context("缺少原样搬运的基准包")?;
+                out.raw_copy_file_rename(src.by_index_raw(index)?, name)?;
+            }
+        }
+        Ok(())
     };
-    if map.is_empty() {
-        return Ok(0);
-    }
-    let mut left = map;
-    let n = left.len();
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let tmp = path.with_extension("stgtmp");
-    {
-        let out = std::fs::File::create(&tmp)?;
-        let mut zw = zip::ZipWriter::new(out);
-        let opts = || {
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
-                .compression_level(Some(4))
-        };
-        for i in 0..zip.len() {
-            let name = zip.by_index_raw(i)?.name().to_string();
-            match left.remove(name.as_str()) {
-                Some(Some(body)) => {
-                    let _ = zip.by_index_raw(i)?;
-                    zw.start_file(name, opts())?;
-                    zw.write_all(&body)?;
-                }
-                Some(None) => { /* 删除：跳过不写 */ }
-                None => {
-                    let e = zip.by_index_raw(i)?;
-                    zw.raw_copy_file(e)?;
-                }
-            }
+    for i in 0..zip.len() {
+        let name = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
+        if let Some(part) = pending.remove(&name) {
+            write(&mut out, name, part)?;
+        } else {
+            out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
-        for (name, body) in left.into_iter() {
-            if let Some(body) = body {
-                zw.start_file(name, opts())?;
-                zw.write_all(&body)?;
-            }
-        }
-        zw.finish()?;
     }
+    for (name, part) in pending {
+        write(&mut out, name, part)?;
+    }
+    out.finish()?;
     drop(zip);
-    std::fs::rename(&tmp, path)?;
-    Ok(n)
+    drop(source);
+    #[cfg(unix)]
+    std::fs::set_permissions(&temp, std::fs::metadata(path)?.permissions())?;
+    temp.persist(path)?;
+    Ok(count)
 }
 
 
@@ -1602,62 +1671,7 @@ pub fn raw_pending() -> bool {
 
 /// 一次性把排队的部件从 `src` 搬到 `dst`（只重写一次 dst）
 pub fn apply_raw_copies(dst: &Path, src: &Path) -> Result<usize> {
-    let items: Vec<(String, String)> = RAW_QUEUE.with(|q| q.borrow_mut().drain(..).collect());
-    if items.is_empty() {
-        return Ok(0);
-    }
-    let map: std::collections::HashMap<String, String> =
-        items.iter().map(|(s, d)| (d.clone(), s.clone())).collect();
-    let mut src_zip = zip::ZipArchive::new(std::fs::File::open(src)?)?;
-    // 先建名字 → 序号索引（zip 只提供按序号的原样读）
-    let mut src_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for i in 0..src_zip.len() {
-        if let Ok(e) = src_zip.by_index_raw(i) {
-            src_index.insert(e.name().to_string(), i);
-        }
-    }
-    let dst_file = std::fs::File::open(dst)?;
-    let mut dst_zip = zip::ZipArchive::new(dst_file)?;
-    let tmp = dst.with_extension("rawtmp");
-    {
-        let out = std::fs::File::create(&tmp)?;
-        let mut zw = zip::ZipWriter::new(out);
-        let opts = || {
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
-                .compression_level(Some(4))
-        };
-        for i in 0..dst_zip.len() {
-            let name = dst_zip.by_index_raw(i)?.name().to_string();
-            if let Some(src_name) = map.get(&name) {
-                let idx = *src_index.get(src_name.as_str()).ok_or_else(|| {
-                    anyhow::anyhow!("源包里没有 {src_name}")
-                })?;
-                let e = src_zip.by_index_raw(idx)?;
-                zw.raw_copy_file_rename(e, name.clone())?;
-            } else {
-                let e = dst_zip.by_index_raw(i)?;
-                zw.raw_copy_file(e)?;
-            }
-        }
-        // 目标包里没有的，补在末尾
-        let existing: std::collections::HashSet<String> =
-            (0..dst_zip.len()).filter_map(|i| dst_zip.by_index_raw(i).ok().map(|e| e.name().to_string())).collect();
-        for (_, d) in items.iter() {
-            if existing.contains(d) {
-                continue;
-            }
-            if let Some(idx) = src_index.get(d.as_str()).copied() {
-                if let Ok(e) = src_zip.by_index_raw(idx) {
-                    zw.raw_copy_file_rename(e, d.clone())?;
-                }
-            }
-        }
-        zw.finish()?;
-    }
-    drop(dst_zip);
-    drop(src_zip);
-    std::fs::rename(&tmp, dst)?;
-    Ok(items.len())
+    commit_package(dst, Some(src), false)
 }
 
 pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
@@ -1863,7 +1877,7 @@ pub fn read_defined_names(path: &Path) -> Vec<(String, Option<usize>, String)> {
 /// 覆盖写全部自定义名称，保留 _xlnm.* 内置打印/筛选名称。
 pub fn write_user_names(path: &Path, names: &[(String, Option<usize>, String)]) -> Result<()> {
     let previous = read_defined_names(path);
-    rewrite_zip(path, |n, buf| {
+    rewrite_zip_where(path, |n| n == "xl/workbook.xml", |n, buf| {
         if n != "xl/workbook.xml" {
             return buf;
         }
@@ -2892,11 +2906,20 @@ pub fn apply_tab_colors(path: &std::path::Path, wb: &crate::model::Workbook) -> 
 pub fn rewrite_zip_skip<F>(
     path: &Path,
     skip: &std::collections::HashSet<String>,
-    mut f: F,
+    f: F,
 ) -> Result<()>
 where
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
+    rewrite_zip_skip_where(path, skip, |_| true, f)
+}
+
+pub(crate) fn rewrite_zip_skip_where(
+    path: &Path,
+    skip: &std::collections::HashSet<String>,
+    pred: impl Fn(&str) -> bool,
+    mut f: impl FnMut(&str, Vec<u8>) -> Vec<u8>,
+) -> Result<()> {
     let file = std::fs::File::open(path).with_context(|| format!("打开 {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file)?;
     let tmp = path.with_extension("patchtmp");
@@ -2904,22 +2927,26 @@ where
         let out = std::fs::File::create(&tmp)?;
         let mut zw = zip::ZipWriter::new(out);
         for i in 0..zip.len() {
-            let (name, mut buf) = {
-                let mut e = zip.by_index(i)?;
-                let name = e.name().to_string();
-                let mut buf = Vec::new();
-                e.read_to_end(&mut buf)?;
-                (name, buf)
-            };
+            let name = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
             if skip.contains(&name) {
                 continue;
             }
-            buf = f(&name, buf);
+            if !pred(&name) {
+                zw.raw_copy_file(zip.by_index_raw(i)?)?;
+                continue;
+            }
+            let mut buf = Vec::new();
+            zip.by_index(i)?.read_to_end(&mut buf)?;
+            let updated = f(&name, buf.clone());
+            if updated == buf {
+                zw.raw_copy_file(zip.by_index_raw(i)?)?;
+                continue;
+            }
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .compression_level(Some(4));
             zw.start_file(name, opts)?;
-            zw.write_all(&buf)?;
+            zw.write_all(&updated)?;
         }
         zw.finish()?;
     }

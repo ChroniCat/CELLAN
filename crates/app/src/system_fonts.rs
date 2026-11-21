@@ -92,20 +92,32 @@ fn face_index(data: &[u8], want: &str) -> Option<u32> {
     if n > 0 { Some(0) } else { None }
 }
 
-pub fn load(name: &str) -> Option<(Vec<u8>, u32)> {
+// epaint retains borrowed bytes for the lifetime of its font faces. Cache by
+// filename so aliases, TTC faces and the UI fallback all share one allocation.
+pub(super) fn file_bytes(file: &'static str) -> Option<&'static [u8]> {
+    static FILES: OnceLock<Mutex<HashMap<&'static str, &'static [u8]>>> = OnceLock::new();
+    let mut files = FILES.get_or_init(Default::default).lock().ok()?;
+    if let Some(&bytes) = files.get(file) {
+        return Some(bytes);
+    }
+    let bytes = std::fs::read(fonts_dir().join(file)).ok()?;
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    files.insert(file, bytes);
+    Some(bytes)
+}
+
+pub fn load(name: &str) -> Option<(&'static [u8], u32)> {
     load_from(&file_candidates(name), name)
 }
 
-pub fn load_bold(name: &str) -> Option<(Vec<u8>, u32)> {
+pub fn load_bold(name: &str) -> Option<(&'static [u8], u32)> {
     load_from(&bold_file_candidates(name), name)
 }
 
-fn load_from(files: &[&str], name: &str) -> Option<(Vec<u8>, u32)> {
-    let dir = fonts_dir();
-    for f in files {
-        let p = dir.join(f);
-        if let Ok(data) = std::fs::read(&p) {
-            let idx = face_index(&data, name).unwrap_or(0);
+fn load_from(files: &[&'static str], name: &str) -> Option<(&'static [u8], u32)> {
+    for &file in files {
+        if let Some(data) = file_bytes(file) {
+            let idx = face_index(data, name).unwrap_or(0);
             return Some((data, idx));
         }
     }
@@ -113,7 +125,7 @@ fn load_from(files: &[&str], name: &str) -> Option<(Vec<u8>, u32)> {
 }
 
 struct Loaded {
-    data: std::sync::Arc<[u8]>,
+    data: &'static [u8],
     index: u32,
 }
 
@@ -181,13 +193,13 @@ pub fn ensure(names: &[String]) -> bool {
             if std::env::var("SC_FONT_LOG").is_ok() {
                 eprintln!("[fonts] insert {} face {}", n, index);
             }
-            map.insert(key, Loaded { data: data.into(), index });
+            map.insert(key, Loaded { data, index });
             changed = true;
         }
         if let Some((data, index)) = load_bold(n) {
             if let Ok(mut b) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
                 if !b.contains_key(&norm(n)) {
-                    b.insert(norm(n), Loaded { data: data.into(), index });
+                    b.insert(norm(n), Loaded { data, index });
                     changed = true;
                     pending().lock().map(|mut p| p.insert(format!("bold:{}", norm(n))));
                 }
@@ -214,7 +226,7 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
         let key = format!("sys:{name}");
         fonts.font_data.insert(
             key.clone(),
-            FontData { font: std::borrow::Cow::Owned(f.data.to_vec()), index: f.index, tweak: Default::default() }.into(),
+            FontData { font: std::borrow::Cow::Borrowed(f.data), index: f.index, tweak: Default::default() }.into(),
         );
         if std::env::var("SC_FONT_LOG").is_ok() {
             eprintln!("[fonts] apply {:?} index={}", key, f.index);
@@ -235,7 +247,7 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
             let key = format!("sysbold:{name}");
             fonts.font_data.insert(
                 key.clone(),
-                FontData { font: std::borrow::Cow::Owned(f.data.to_vec()), index: f.index, tweak: Default::default() }.into(),
+                FontData { font: std::borrow::Cow::Borrowed(f.data), index: f.index, tweak: Default::default() }.into(),
             );
             let mut chain = vec![key.clone()];
             for fb in ["sys-ui-msyh-b", "noto-sans-bold", "sys-ui-msyh", "noto-sans"] {

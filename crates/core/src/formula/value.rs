@@ -208,38 +208,31 @@ impl FValue {
                 FValue::Lambda(_) => 6,
             }
         }
-        fn blank_like(v: &FValue) -> FValue {
-            match v {
-                FValue::Number(_) => FValue::Number(0.0),
-                FValue::Text(_) => FValue::Text("".into()),
-                FValue::Bool(_) => FValue::Bool(false),
-                other => other.clone(),
-            }
-        }
-        if let (FValue::Error(e), _) = (self, other) {
-            return Err(*e);
-        }
-        if let (_, FValue::Error(e)) = (self, other) {
-            return Err(*e);
-        }
-        if matches!(self, FValue::Empty) && matches!(other, FValue::Empty) {
-            return Ok(Ordering::Equal);
-        }
-        let (a, b): (FValue, FValue) = match (self, other) {
-            (FValue::Empty, o) => (blank_like(o), o.clone()),
-            (o, FValue::Empty) => (o.clone(), blank_like(o)),
-            _ => (self.clone(), other.clone()),
-        };
-        let (ra, rb) = (rank(&a), rank(&b));
-        if ra != rb {
-            return Ok(ra.cmp(&rb));
-        }
-        Ok(match (&a, &b) {
+        Ok(match (self, other) {
+            (FValue::Error(e), _) | (_, FValue::Error(e)) => return Err(*e),
             (FValue::Number(x), FValue::Number(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (FValue::Text(x), FValue::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+            (FValue::Text(x), FValue::Text(y)) => compare_text(x, y),
             (FValue::Bool(x), FValue::Bool(y)) => x.cmp(y),
-            _ => Ordering::Equal,
+            (FValue::Empty, FValue::Number(n)) => 0.0_f64.partial_cmp(n).unwrap_or(Ordering::Equal),
+            (FValue::Empty, FValue::Text(s)) => "".cmp(s.as_str()),
+            (FValue::Empty, FValue::Bool(b)) => false.cmp(b),
+            (_, FValue::Empty) if !matches!(self, FValue::Empty) => return other.compare(self).map(Ordering::reverse),
+            (FValue::Empty, _) => Ordering::Equal,
+            _ => rank(self).cmp(&rank(other)),
         })
+    }
+}
+
+/// Preserve Unicode lowercase ordering (including context-sensitive final sigma).
+/// The common ASCII path compares borrowed bytes with no temporary strings.
+pub(super) fn compare_text(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    } else if a.contains('Σ') || b.contains('Σ') {
+        // Rust's string-level casing handles contextual Greek final sigma.
+        a.to_lowercase().cmp(&b.to_lowercase())
+    } else {
+        a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
     }
 }
 

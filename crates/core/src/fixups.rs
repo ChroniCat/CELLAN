@@ -163,6 +163,25 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 
 
 
+pub(crate) const RAW_SHEET_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(crate) fn can_restore_sheet_xml(sheet: &crate::model::Sheet) -> bool {
+    !(sheet.edited
+        || sheet.styles_dirty
+        || sheet.row_styles_dirty
+        || sheet.col_styles_dirty
+        || !sheet.style_edits.is_empty()
+        || !sheet.cleared.is_empty()
+        || sheet.merges_dirty
+        || sheet.cf_dirty
+        || sheet.dv_dirty
+        || sheet.notes_dirty
+        || sheet.freeze_dirty
+        || sheet.filter_dirty
+        || sheet.page_dirty
+        || sheet.charts_dirty || !sheet.spilled.is_empty())
+}
+
 /// 没被编辑过的表：整段沿用原文件的 XML 和它引用的部件。
 ///
 /// umya 重写工作表时会丢三落四（表对象、批注、绘图、图形属性…），
@@ -181,27 +200,13 @@ pub fn restore_unedited_sheets(
     let mut log = Vec::new();
 
     for sheet in wb.sheets.iter() {
-        let dirty = sheet.edited
-            || sheet.styles_dirty
-            || sheet.row_styles_dirty
-            || sheet.col_styles_dirty
-            || !sheet.style_edits.is_empty()
-            || !sheet.cleared.is_empty()
-            || sheet.merges_dirty
-            || sheet.cf_dirty
-            || sheet.dv_dirty
-            || sheet.notes_dirty
-            || sheet.freeze_dirty
-            || sheet.filter_dirty
-            || sheet.page_dirty
-            || sheet.charts_dirty;
-        if dirty {
+        if !can_restore_sheet_xml(sheet) {
             continue;
         }
         let Some(base_part) = base_targets.get(&sheet.name) else { continue };
         let Some(new_part) = new_targets.get(&sheet.name) else { continue };
 
-        if base_part == new_part && crate::patch::entry_size(base, base_part) > 4 * 1024 * 1024 {
+        if base_part == new_part && crate::patch::entry_size(base, base_part) > RAW_SHEET_MIN_BYTES {
             // 大表直接搬压缩后的字节，省掉解压 + 重压缩（215 MB 的表很值）
             crate::patch::stage_raw_copy(base_part, new_part);
             log.push(sheet.name.clone());

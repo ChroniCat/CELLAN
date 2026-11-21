@@ -1,7 +1,6 @@
 //! 插入 / 删除行列：整行整列搬移，并同步调整合并、批注、条件格式、数据验证、冻结、筛选。
 //!
-//! 存储是「分页列式」，没有真正的行插入原语：这里把受影响的格子整体搬到新位置，
-//! 再重建存储。对 40 万格的表是一次性 O(n)，实测在百毫秒级。
+//! 分页列式存储仅搬移插删位置之后的格子，未受影响的列页仍可与撤销快照共享。
 //!
 //! 工作簿级入口同时改写本表、跨表公式和名称引用。
 
@@ -55,21 +54,15 @@ struct TableRowFill {
 impl Sheet {
     /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
     pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
-        let keys: Vec<crate::model::CellRef> = self
-            .iter()
-            .filter(|(_, c)| c.formula.is_some())
-            .map(|(k, _)| k)
-            .collect();
-        let mut formulas_changed = false;
-        for k in keys {
-            let Some(cell) = self.get_mut(k.row, k.col) else { continue };
-            if let Some(f) = cell.formula.as_mut() {
-                let rewritten = crate::refs::rewrite(f, shift).into_boxed_str();
-                formulas_changed |= *f != rewritten;
-                *f = rewritten;
-            }
+        let changes: Vec<_> = self.iter().filter_map(|(key, cell)| {
+            let old = cell.formula.as_deref()?;
+            let new = crate::refs::rewrite(old, shift);
+            (new != old).then(|| (key, new.into_boxed_str()))
+        }).collect();
+        self.edited |= !changes.is_empty();
+        for (key, formula) in changes {
+            self.get_mut(key.row, key.col).unwrap().formula = Some(formula);
         }
-        self.edited |= formulas_changed;
         for blk in self.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
                 if let crate::cf::CfKind::Expr { formula, .. } = &mut rule.kind {
@@ -96,7 +89,7 @@ impl Sheet {
             Structural::InsertCols { at, n } => (false, at, n, false),
             Structural::DeleteCols { at, n } => (false, at, n, true),
         };
-        self.shift_array_metadata(rows, at, n, delete);
+        self.shift_array_and_hyperlink_ranges(rows, at, n, delete);
         match op {
             Structural::InsertRows { at, n } => {
                 self.merges = self
@@ -184,7 +177,7 @@ impl Sheet {
 
     /// 数组元数据与单元格使用同一坐标变换。旧溢出尾格仍需登记，
     /// 后续重算才能清除它们，而不会把它们误当成用户输入的阻塞项。
-    fn shift_array_metadata(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
+    fn shift_array_and_hyperlink_ranges(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
         if n == 0 {
             return;
         }
@@ -215,6 +208,21 @@ impl Sheet {
             row_filter: None,
             col_filter: None,
         };
+        self.hyperlinks = std::mem::take(&mut self.hyperlinks).into_iter().filter_map(|((r, c), mut link)| {
+            let (start, span) = if rows { (r, link.span.0) } else { (c, link.span.1) };
+            let end = start.saturating_add(span);
+            let moved = shift.map_range(start, end);
+            self.hyperlinks_dirty |= moved != Some((start, end));
+            let (first, last) = moved?;
+            let anchor = if rows {
+                link.span.0 = last - first;
+                (first, c)
+            } else {
+                link.span.1 = last - first;
+                (r, first)
+            };
+            Some((anchor, link))
+        }).collect();
         self.arrays = self.arrays.iter().filter_map(|&(anchor, (r1, c1, r2, c2))| {
             if rows {
                 let row = shift.map(anchor.row)?;
@@ -228,30 +236,35 @@ impl Sheet {
         }).collect();
     }
 
-    fn rebuild(&mut self, map: impl Fn(u32, u32) -> Option<(u32, u32)>) {
-        let mut items: Vec<(u32, u32, Cell)> = Vec::new();
-        let old_keys: Vec<CellRef> = self.iter().map(|(key, _)| key).collect();
-        for (cref, cell) in self.iter() {
-            if let Some((r, c)) = map(cref.row, cref.col) {
-                items.push((r, c, cell.clone()));
+    fn shift_cells(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
+        let destination = |key: CellRef| {
+            if rows {
+                shift_axis(key.row, at, n, delete).map(|r| CellRef::new(r, key.col))
+            } else {
+                shift_axis(key.col, at, n, delete).map(|c| CellRef::new(key.row, c))
+            }
+        };
+        let keys = self.cells_mut().keys_from(rows, at);
+        let mut moved = Vec::with_capacity(keys.len());
+        for key in keys {
+            let cell = self.cells_mut().remove(key.row, key.col).unwrap();
+            self.cleared.insert(key);
+            if let Some(target) = destination(key) {
+                moved.push((target, cell));
             }
         }
-        {
-            let cells = self.cells_mut();
-            cells.clear();
-            for (r, c, cell) in items {
-                cells.set(r, c, cell);
-            }
+        for (target, cell) in moved {
+            self.cells_mut().set(target.row, target.col, cell);
+            self.cleared.remove(&target);
         }
-        // Save overlays the original package. Remember every old coordinate;
-        // writing the moved cells below will repopulate coordinates still used.
-        self.cleared.extend(old_keys);
-        let styles = std::mem::take(&mut self.styles);
-        self.style_edits.extend(styles.keys().copied());
-        for (key, style) in styles {
-            if let Some((r, c)) = map(key.row, key.col) {
-                let target = CellRef::new(r, c);
-                self.styles.insert(target, style);
+        let styles: Vec<_> = self.styles.iter_from(rows, at).map(|(key, &id)| (key, id)).collect();
+        for (key, _) in &styles {
+            self.styles.remove(key);
+            self.style_edits.insert(*key);
+        }
+        for (key, id) in styles {
+            if let Some(target) = destination(key) {
+                self.styles.insert(target, id);
                 self.style_edits.insert(target);
             }
         }
@@ -528,8 +541,8 @@ impl Sheet {
             return;
         }
         let fills = self.capture_table_row_fills(at, n);
-        self.shift_array_metadata(true, at, n, false);
-        self.rebuild(|r, c| Some((if r >= at { r + n } else { r }, c)));
+        self.shift_array_and_hyperlink_ranges(true, at, n, false);
+        self.shift_cells(true, at, n, false);
         self.merges = self
             .merges
             .iter()
@@ -562,8 +575,8 @@ impl Sheet {
         if n == 0 {
             return;
         }
-        self.shift_array_metadata(true, at, n, true);
-        self.rebuild(|r, c| shift_axis(r, at, n, true).map(|nr| (nr, c)));
+        self.shift_array_and_hyperlink_ranges(true, at, n, true);
+        self.shift_cells(true, at, n, true);
         self.merges = self
             .merges
             .iter()
@@ -591,8 +604,8 @@ impl Sheet {
         if n == 0 {
             return;
         }
-        self.shift_array_metadata(false, at, n, false);
-        self.rebuild(|r, c| Some((r, if c >= at { c + n } else { c })));
+        self.shift_array_and_hyperlink_ranges(false, at, n, false);
+        self.shift_cells(false, at, n, false);
         self.merges = self
             .merges
             .iter()
@@ -621,8 +634,8 @@ impl Sheet {
         if n == 0 {
             return;
         }
-        self.shift_array_metadata(false, at, n, true);
-        self.rebuild(|r, c| shift_axis(c, at, n, true).map(|nc| (r, nc)));
+        self.shift_array_and_hyperlink_ranges(false, at, n, true);
+        self.shift_cells(false, at, n, true);
         self.merges = self
             .merges
             .iter()

@@ -374,90 +374,70 @@ impl Crit {
             _ => eq,
         }
     }
-}
-
-/// 大小写不敏感的通配符匹配，不分配字符串
-fn wildcard_ci(s: &str, pat: &str) -> bool {
-    let sc: Vec<char> = s.chars().flat_map(|c| c.to_lowercase()).collect();
-    let pc: Vec<char> = pat.chars().collect();
-    fn helper(s: &[char], p: &[char]) -> bool {
-        if p.is_empty() {
-            return s.is_empty();
-        }
-        match p[0] {
-            '*' => helper(s, &p[1..]) || (!s.is_empty() && helper(&s[1..], p)),
-            '?' => !s.is_empty() && helper(&s[1..], &p[1..]),
-            c => !s.is_empty() && s[0] == c && helper(&s[1..], &p[1..]),
-        }
-    }
-    helper(&sc, &pc)
-}
-
-pub(crate) fn match_criteria(v: &FValue, crit: &str) -> bool {
-    let c = crit.trim();
-    let (op, rest) = if let Some(x) = c.strip_prefix(">=") {
-        (">=", x)
-    } else if let Some(x) = c.strip_prefix("<=") {
-        ("<=", x)
-    } else if let Some(x) = c.strip_prefix("<>") {
-        ("<>", x)
-    } else if let Some(x) = c.strip_prefix('>') {
-        (">", x)
-    } else if let Some(x) = c.strip_prefix('<') {
-        ("<", x)
-    } else if let Some(x) = c.strip_prefix('=') {
-        ("=", x)
-    } else {
-        ("=", c)
-    };
-
-    let rest = rest.trim();
-    // 数值比较
-    if let Ok(target) = rest.parse::<f64>() {
-        if let Ok(n) = v.to_number() {
-            return match op {
-                ">=" => n >= target,
-                "<=" => n <= target,
-                ">" => n > target,
-                "<" => n < target,
+    /// Legacy multi-condition functions coerce numeric text, blanks and booleans through
+    /// to_number. Retain those rules when sharing the compiled criterion.
+    pub(super) fn matches_coerced(&self, v: &FValue) -> bool {
+        if let Some(target) = self.num {
+            let Ok(n) = v.to_number() else { return self.op == "<>" };
+            return match self.op {
+                ">=" => n >= target, "<=" => n <= target, ">" => n > target, "<" => n < target,
                 "<>" => (n - target).abs() > f64::EPSILON,
                 _ => (n - target).abs() <= f64::EPSILON,
             };
         }
-        return op == "<>";
+        let display;
+        let text = match v {
+            FValue::Text(s) => s.as_str(), FValue::Empty => "",
+            FValue::Bool(true) => "true", FValue::Bool(false) => "false",
+            _ => { display = v.display(); &display }
+        };
+        if self.wild && matches!(self.op, "=" | "<>") {
+            let matched = if text.contains('Σ') {
+                wildcard_ci(&text.to_lowercase(), &self.text)
+            } else {
+                wildcard_ci(text, &self.text)
+            };
+            return matched == (self.op == "=");
+        }
+        let order = super::value::compare_text(text, &self.text);
+        match self.op {
+            "<>" => !order.is_eq(), ">" => order.is_gt(), "<" => order.is_lt(),
+            ">=" => !order.is_lt(), "<=" => !order.is_gt(), _ => order.is_eq(),
+        }
     }
 
-    let text_v = v.display().to_lowercase();
-    let pat = rest.to_lowercase();
-    let eq = if pat.contains('*') || pat.contains('?') {
-        wildcard_match(&text_v, &pat)
-    } else {
-        text_v == pat
-    };
-    match op {
-        "<>" => !eq,
-        ">" => text_v > pat,
-        "<" => text_v < pat,
-        ">=" => text_v >= pat,
-        "<=" => text_v <= pat,
-        _ => eq,
+}
+
+/// 大小写不敏感的通配符匹配，不分配字符串
+fn wildcard_ci(s: &str, pat: &str) -> bool {
+    let mut text = s.chars().flat_map(char::to_lowercase);
+    let mut pattern = pat.chars();
+    let mut star = None;
+    loop {
+        let next = text.clone().next();
+        match pattern.next() {
+            Some('*') => { star = Some((text.clone(), pattern.clone())); }
+            Some(c) if next.is_some_and(|ch| c == '?' || ch == c) => { text.next(); }
+            None if next.is_none() => return true,
+            _ => {
+                let Some((retry_text, retry_pattern)) = star.as_mut() else { return false };
+                if retry_text.next().is_none() { return false; }
+                text = retry_text.clone();
+                pattern = retry_pattern.clone();
+            }
+        }
     }
 }
 
-fn wildcard_match(s: &str, pat: &str) -> bool {
-    fn helper(s: &[char], p: &[char]) -> bool {
-        if p.is_empty() {
-            return s.is_empty();
-        }
-        match p[0] {
-            '*' => helper(s, &p[1..]) || (!s.is_empty() && helper(&s[1..], p)),
-            '?' => !s.is_empty() && helper(&s[1..], &p[1..]),
-            c => !s.is_empty() && s[0] == c && helper(&s[1..], &p[1..]),
-        }
-    }
-    let sc: Vec<char> = s.chars().collect();
-    let pc: Vec<char> = pat.chars().collect();
-    helper(&sc, &pc)
+pub(crate) fn match_criteria(v: &FValue, crit: &str) -> bool {
+    Crit::parse(crit).matches_coerced(v)
+}
+
+pub(super) fn criteria_pairs(args: &[Arg]) -> Vec<(&[FValue], Crit)> {
+    args.chunks_exact(2).filter_map(|pair| {
+        let text = pair[1].first().to_text().ok()?;
+        Some((pair[0].slice(), Crit::parse(&text)))
+    }).collect()
 }
 
 // ---------------------------------------------------------------- 1-based 行列参数
@@ -476,6 +456,69 @@ pub(crate) fn range_dims(a: &Arg) -> (usize, usize) {
         Arg::Val(FValue::Array(arr)) => (arr.rows, arr.cols),
         Arg::Val(_) => (1, 1),
     }
+}
+
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub(super) enum LookupKind {
+    Number,
+    Text,
+    Bool,
+}
+
+impl LookupKind {
+    pub(super) fn of(key: &FValue) -> Option<Self> {
+        match key {
+            FValue::Empty | FValue::Number(_) => Some(Self::Number),
+            FValue::Text(_) => Some(Self::Text),
+            FValue::Bool(_) => Some(Self::Bool),
+            _ => None,
+        }
+    }
+
+    /// Empty table cells, errors and other types have no position in this
+    /// ordered sequence. A blank lookup key itself is numeric zero.
+    pub(super) fn positions(self, data: &[FValue], len: usize, stride: usize) -> Option<Vec<usize>> {
+        let mut positions = None;
+        for i in 0..len {
+            let eligible = data.get(i * stride)
+                .is_some_and(|v| !matches!(v, FValue::Empty) && Self::of(v) == Some(self));
+            match &mut positions {
+                Some(indices) if eligible => Vec::push(indices, i),
+                None if !eligible => positions = Some((0..i).collect()),
+                _ => {}
+            }
+        }
+        positions
+    }
+}
+
+pub(super) fn search_sorted(
+    data: &[FValue], len: usize, stride: usize, positions: Option<&[usize]>, needle: &FValue, ascending: bool,
+) -> Option<usize> {
+    let needle = if matches!(needle, FValue::Empty) { &FValue::Number(0.0) } else { needle };
+    let index = |i| positions.map_or(i, |p| p[i]);
+    let count = positions.map_or(len, |p| p.len());
+    let (mut lo, mut hi) = (0, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let order = data[index(mid) * stride].compare(needle).ok()?;
+        if (ascending && !order.is_gt()) || (!ascending && order.is_gt()) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // MATCH(...,-1) returns the first exact duplicate. For a missing key it
+    // returns the last entry at the next greater value.
+    if !ascending && lo < count && data[index(lo) * stride].compare(needle).ok()?.is_eq() {
+        return Some(index(lo));
+    }
+    lo.checked_sub(1).map(index)
+}
+
+fn approximate_match(data: &[FValue], len: usize, stride: usize, needle: &FValue, ascending: bool) -> Option<usize> {
+    let positions = LookupKind::of(needle)?.positions(data, len, stride);
+    search_sorted(data, len, stride, positions.as_deref(), needle, ascending)
 }
 
 pub(crate) fn range_get(a: &Arg, r: usize, c: usize) -> FValue {
@@ -793,16 +836,9 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         "SUMIFS" => r(|| {
             let sum_range = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let mut s = 0.0;
-            let pairs: Vec<(&[FValue], String)> = (1..args.len())
-                .step_by(2)
-                .filter_map(|i| {
-                    let rg = args.get(i)?.slice();
-                    let crit = args.get(i + 1)?.first().to_text().ok()?;
-                    Some((rg, crit))
-                })
-                .collect();
+            let pairs = criteria_pairs(args.get(1..).unwrap_or_default());
             for (i, v) in sum_range.iter().enumerate() {
-                if pairs.iter().all(|(rg, c)| rg.get(i).map(|x| match_criteria(x, c)).unwrap_or(false)) {
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
                     if let Ok(n) = v.to_number() {
                         s += n;
                     }
@@ -917,30 +953,23 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "COUNTIFS" => r(|| {
             let mut count = 0usize;
-            let pairs: Vec<(&[FValue], String)> = (0..args.len())
-                .step_by(2)
-                .filter_map(|i| {
-                    let rg = args.get(i)?.slice();
-                    let c = args.get(i + 1)?.first().to_text().ok()?;
-                    Some((rg, c))
-                })
-                .collect();
+            let pairs = criteria_pairs(args);
             let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0);
             for i in 0..len {
-                if pairs.iter().all(|(rg, c)| rg.get(i).map(|x| match_criteria(x, c)).unwrap_or(false)) {
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
                     count += 1;
                 }
             }
             Ok(FValue::number(count as f64))
         }),
         "AVERAGEIF" => r(|| {
-            let crit = text(args, 1)?;
+            let crit = Crit::parse(&text(args, 1)?);
             let target = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let vals = args.get(2).map(|a| a.slice()).unwrap_or(target);
             let mut s = 0.0;
             let mut n = 0.0;
             for (i, v) in target.iter().enumerate() {
-                if match_criteria(v, &crit) {
+                if crit.matches_coerced(v) {
                     if let Some(Ok(x)) = vals.get(i).map(|x| x.to_number()) {
                         s += x;
                         n += 1.0;
@@ -1502,33 +1531,16 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             if idx >= limit {
                 return Err(ErrKind::Ref);
             }
-            let mut best: Option<usize> = None;
-            for i in 0..n {
-                let cell = if name == "VLOOKUP" {
-                    range_get(table, i, 0)
-                } else {
-                    range_get(table, 0, i)
-                };
-                // 精确匹配支持通配符（查找键是文本且含 * ? ~ 时按模式匹配）
-                let exact_hit = match (&cell, &needle) {
-                    (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => {
-                        wildcard_match_ci(b, a)
-                    }
-                    _ => matches!(cell.compare(&needle), Ok(std::cmp::Ordering::Equal)),
-                };
-                if !approx {
-                    if exact_hit {
-                        best = Some(i);
-                        break;
-                    }
-                } else if let Ok(o) = cell.compare(&needle) {
-                    // 近似匹配：取最后一个 <= 查找值的位置（重复值时 Excel 取最后一个）
-                    if o == std::cmp::Ordering::Greater {
-                        break;
-                    }
-                    best = Some(i);
-                }
-            }
+            let stride = if name == "VLOOKUP" { cols } else { 1 };
+            let data = table.slice();
+            let best = if approx {
+                approximate_match(data, n, stride, &needle, true)
+            } else {
+                (0..n).find(|&i| match (data.get(i * stride).unwrap_or(&FValue::Empty), &needle) {
+                    (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => wildcard_match_ci(b, a),
+                    (cell, key) => matches!(cell.compare(key), Ok(std::cmp::Ordering::Equal)),
+                })
+            };
             match best {
                 Some(i) => Ok(if name == "VLOOKUP" {
                     range_get(table, i, idx)
@@ -1544,8 +1556,8 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                 return Err(e);
             }
             let lookup = args.get(1).ok_or(ErrKind::Value)?;
-            let match_type = opt_num(args, 2, 1.0)?;
-            let vals = lookup.values();
+            let match_type = opt_num(args, 2, if name == "MATCH" { 1.0 } else { 0.0 })?;
+            let vals = lookup.slice();
             if match_type == 0.0 {
                 for (i, v) in vals.iter().enumerate() {
                     let hit = match (v, &needle) {
@@ -1559,6 +1571,10 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                     }
                 }
                 return Err(ErrKind::Na);
+            }
+            if name == "MATCH" {
+                return approximate_match(vals, vals.len(), 1, &needle, match_type > 0.0)
+                    .map(|i| FValue::number((i + 1) as f64)).ok_or(ErrKind::Na);
             }
             let mut last: Option<usize> = None;
             for (i, v) in vals.iter().enumerate() {

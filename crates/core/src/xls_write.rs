@@ -595,7 +595,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     }
     for sheet in &wb.sheets {
         let coordinates = sheet.iter().map(|(pos, _)| (pos.row, pos.col))
-            .chain(sheet.styles.keys().chain(sheet.notes.keys()).map(|pos| (pos.row, pos.col)))
+            .chain(sheet.styles.keys().chain(sheet.notes.keys().copied()).map(|pos| (pos.row, pos.col)))
             .chain(sheet.rows.custom_pairs().into_iter().map(|(row, _)| (row, 0)))
             .chain(sheet.cols.custom_pairs().into_iter().map(|(col, _)| (0, col)))
             .chain(sheet.row_styles.keys().map(|&row| (row, 0)))

@@ -484,6 +484,11 @@ pub fn parse_styles_with_palette(
 /// 每张工作表里 `<c r="A1" s="12">`（或省略 `r=` / 带命名空间前缀 `<x:c>`）的 xf 序号
 pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
     let mut out = HashMap::new();
+    let _ = visit_cell_styles(xml, |r, c, id| { out.insert((r, c), id); });
+    out
+}
+
+pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) -> quick_xml::Result<()> {
     let mut r = Reader::from_str(xml);
     let mut cur_row = 0u32;
     let mut next_col = 0u32;
@@ -512,7 +517,7 @@ pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
                     for a in e.attributes().flatten() {
                         let k = local_name(a.key.as_ref());
                         if k == "r" {
-                            coord = a1(&a.value.to_string());
+                            coord = a1(&a.value);
                         } else if k == "s" {
                             if let Ok(v) = a.value.trim().parse::<u32>() {
                                 s_idx = Some(v.min(u16::MAX as u32) as u16);
@@ -523,7 +528,7 @@ pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
                     cur_row = row;
                     next_col = col + 1;
                     if let Some(s) = s_idx {
-                        out.insert((row, col), s);
+                        cell(row, col, s);
                     }
                 }
             }
@@ -533,11 +538,12 @@ pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
                     next_col = 0;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(e),
             _ => {}
         }
     }
-    out
+    Ok(())
 }
 
 fn a1(s: &str) -> Option<(u32, u32)> {

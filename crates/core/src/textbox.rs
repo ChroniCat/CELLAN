@@ -905,7 +905,9 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     if additions.is_empty() && patch_rels.is_empty() && patch_sheet.is_empty() {
         return Ok(());
     }
-    crate::chart_write::rewrite_with_additions_pub(path, additions, move |part, buf| {
+    let targets: Vec<_> = patch_rels.iter().chain(&patch_sheet).map(|(name, _)| name.as_str())
+        .chain(std::iter::once("[Content_Types].xml")).collect();
+    crate::chart_write::rewrite_with_additions_pub(path, additions, &targets, |part, buf| {
         for (name, body) in &patch_rels {
             if part == name {
                 return body.clone().into_bytes();
@@ -973,7 +975,11 @@ pub fn load(path: &Path, sheet_part: &str) -> Vec<TextBox> {
     else {
         return Vec::new();
     };
-    let Some(tag) = find_tag(&xml, "drawing") else {
+    load_from_sheet(path, sheet_part, &xml)
+}
+
+pub(crate) fn load_from_sheet(path: &Path, sheet_part: &str, xml: &str) -> Vec<TextBox> {
+    let Some(tag) = find_tag(xml, "drawing") else {
         return Vec::new();
     };
     let Some(rid) = attr(&tag, "r:id") else {

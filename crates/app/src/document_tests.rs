@@ -14,6 +14,64 @@ fn put(wb: &mut Workbook, number: f64) {
 }
 
 #[test]
+fn overlapping_background_edits_keep_both_closures_and_reuse_the_index() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    for r in 1..=650 {
+        for (col, formula) in ["=$A$1", "=$B$1"].into_iter().enumerate() {
+            app.wb.sheets[0].set(r, col as u32, Cell {
+                value: Value::Number(0.0), formula: Some(formula.into()),
+            });
+        }
+    }
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
+    app.deps_built = true;
+    let original = app.deps.clone();
+    for (col, value) in [11.0, 22.0].into_iter().enumerate() {
+        app.wb.sheets[0].set(0, col as u32, Cell { value: Value::Number(value), formula: None });
+        app.doc_gen += 1;
+        app.fast_recalc_cells(&[(0, 0, col as u32)]);
+        assert!(!app.tasks.needs_full);
+        assert_eq!(app.tasks.dirty_recalc_seeds.len(), col + 1);
+        app.start_silent_recalc(&ctx);
+        assert!(app.bg_recalc_rx.is_some());
+    }
+    app.add_cf(sheetcore::cf::CfKind::Expr { formula: "A1>0".into(), dxf: 0 });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.tasks.recalc_pending() && Instant::now() < deadline {
+        app.poll_silent_recalc();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.tasks.recalc_pending());
+    assert!(std::sync::Arc::ptr_eq(&original, &app.deps));
+    assert!(!app.wb.sheets[0].cf.blocks.is_empty());
+    assert_eq!(app.wb.sheets[0].value(650, 0), Value::Number(11.0));
+    assert_eq!(app.wb.sheets[0].value(650, 1), Value::Number(22.0));
+}
+
+#[test]
+fn autosave_probes_a_foreign_host_only_after_idle_and_backoff() {
+    let env = crate::test_env::TestEnv::new("autosave-probe");
+    let path = env.path("shared.xlsx");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut app = app();
+    app.autosave = true;
+    app.wb.path = Some(path.clone());
+    app.wb.dirty = true;
+    session_lock::write_session(&path, &listener.local_addr().unwrap().to_string(), "other", "other-session", 1).unwrap();
+    app.tasks.last_edit = Some(Instant::now());
+    app.tick_autosave(None);
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    app.tasks.last_edit = Some(Instant::now() - Duration::from_secs(6));
+    app.tick_autosave(None);
+    assert!(listener.accept().is_ok());
+    assert!(app.tasks.saving.is_none() && app.wb.dirty);
+    app.tick_autosave(None);
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
 fn private_workbook_revisions_stay_in_this_session() {
     let env = crate::test_env::TestEnv::new("private-revisions");
     let mut app = app();
@@ -140,7 +198,7 @@ fn book(number: f64) -> Workbook {
     wb
 }
 
-fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<sheetcore::xlsx::SaveReceipt, String>> {
+fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<(sheetcore::xlsx::SaveReceipt, Option<CalculatedSnapshot>), String>> {
     let (tx, rx) = mpsc::channel();
     app.tasks.saving = Some(document_tasks::PendingSave {
         target: target.into(),
@@ -165,7 +223,7 @@ fn save_completion_updates_its_parked_document_only() {
     let tx = delayed_save(&mut app, "a-saved.xlsx");
     app.open_in_new_tab(PathBuf::new());
     put(&mut app.wb, 22.0);
-    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    tx.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
 
     assert_eq!(app.wb.path, None, "A must not assign its save path to B");
@@ -184,12 +242,12 @@ fn saves_completing_out_of_order_keep_their_own_paths() {
     let a = delayed_save(&mut app, "a.xlsx");
     app.open_in_new_tab(PathBuf::new());
     let b = delayed_save(&mut app, "b.xlsx");
-    b.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    b.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, Some(PathBuf::from("b.xlsx")));
     assert!(parked(&app, 0).tasks.saving.is_some());
     app.switch_tab(0);
-    a.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    a.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, Some(PathBuf::from("a.xlsx")));
     assert_eq!(parked(&app, 1).wb.path, Some(PathBuf::from("b.xlsx")));
@@ -293,7 +351,7 @@ fn recalculation_cannot_restore_the_path_from_before_save_as() {
     app.wb.dirty = true;
     let old_snapshot = app.wb.clone();
     let save = delayed_save(&mut app, "new.xlsx");
-    save.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    save.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
     let (tx, rx) = mpsc::channel();
     app.tasks.open_rx = Some(rx);
@@ -322,7 +380,7 @@ fn recalculation_preserves_current_input_and_output_passwords() {
             let wb = Box::new(snapshot);
             let deps = Box::new(sheetcore::formula::deps::Deps::empty());
             let msg = if manual {
-                OpenMsg::RecalcedWb(wb, deps, app.wb_epoch, app.doc_gen)
+                OpenMsg::RecalcedWb(wb, deps, app.wb_epoch, app.doc_gen, true)
             } else {
                 OpenMsg::Recalced(wb, deps)
             };
@@ -342,7 +400,7 @@ fn opening_another_file_while_saving_preserves_the_saving_tab() {
     app.open_path(std::env::temp_dir().join("sheetflow-no-such-doc-for-save-test.xlsx"));
     assert_eq!(app.tabs.len(), 2);
     assert_eq!(app.active_tab, 1);
-    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    tx.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
     assert_eq!(app.wb.path, None);
     assert_eq!(parked(&app, 0).wb.path, Some(PathBuf::from("a.xlsx")));
@@ -358,7 +416,7 @@ fn closing_a_saving_tab_waits_for_its_result() {
     app.switch_tab(0);
     app.close_tab(0);
     assert_eq!(app.tabs.len(), 2);
-    tx.send(Ok(sheetcore::xlsx::SaveReceipt::default())).unwrap();
+    tx.send(Ok((sheetcore::xlsx::SaveReceipt::default(), None))).unwrap();
     app.poll_save();
     app.close_tab(0);
     assert_eq!(app.tabs.len(), 1);

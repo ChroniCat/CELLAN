@@ -791,6 +791,7 @@ https://github.com/ChroniCat/finance-collab-site 的 `native-rust-sheets` 分支
 2. `Arg::Range` 改为 `Rc<Vec<FValue>>`，同一区域一轮重算只物化一次
 3. 区域缓存加 LRU（上限 1600 万格 ≈ 400 MB），避免逐行累积区间把内存吃穿
    - 无上限时：23 s / 4.6 GB；加上限后：19 s / 481 MB
+   - 上述数字是当时的基准。当前通用区域缓存按最近使用顺序淘汰，容量为 400 万个值。共享起点的单行、单列累计 SUM 单独缓存前缀和，上限为 1,048,576 项。
 4. 条件聚合（SUMIF/COUNTIF）的 criteria 预编译，逐格比较不再 `display().to_lowercase()`
 5. 精确匹配的 VLOOKUP/MATCH 建哈希索引，O(n) → O(1)
 6. 区域聚合结果缓存（SUM/SUMIF/COUNTIF/COUNTA/AVERAGE/MAX/MIN）

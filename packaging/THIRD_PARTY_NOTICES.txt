@@ -123,7 +123,7 @@ OpenCC 以 Apache License 2.0 发布，许可证全文见本文件末尾「Apach
 
 三、Rust / 系统依赖
 ------------------
-共 387 个（含仅在其他平台使用的条件依赖）。逐项许可证如下：
+共 389 个（含仅在其他平台使用的条件依赖）。逐项许可证如下：
 
 ab_glyph 0.2.32 — Apache-2.0
 ab_glyph_rasterizer 0.1.10 — Apache-2.0
@@ -283,6 +283,7 @@ khronos-egl 6.0.0 — MIT/Apache-2.0
 khronos_api 3.1.0 — Apache-2.0
 libc 0.2.191 — MIT OR Apache-2.0
 libloading 0.8.9 — ISC
+libmimalloc-sys 0.1.49 — MIT (Rust binding copyright 2019 Octavian Oncescu)
 libredox 0.1.25 — MIT
 linux-raw-sys 0.12.1 — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 linux-raw-sys 0.4.15 — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
@@ -294,6 +295,8 @@ md-5 0.11.0 — MIT OR Apache-2.0
 memchr 2.8.3 — Unlicense OR MIT
 memmap2 0.9.12 — MIT OR Apache-2.0
 memoffset 0.9.1 — MIT
+mimalloc 0.1.52 — MIT (Rust binding copyright 2019 Octavian Oncescu;
+    native mimalloc copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen)
 miniz_oxide 0.8.9 — MIT OR Zlib OR Apache-2.0
 miniz_oxide 0.9.1 — MIT OR Zlib OR Apache-2.0
 moxcms 0.8.1 — BSD-3-Clause OR Apache-2.0

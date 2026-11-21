@@ -375,7 +375,7 @@ fn cross_sheet_cut_undo_restores_both_sides_styles_and_dependencies() {
     let bold = app.wb.styles.intern(style);
     app.wb.sheets[0].set_style(0, 0, bold);
     sheetcore::formula::recalc_all(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.clip_copy(true, &egui::Context::default());
     app.sheet_idx = 1;
     app.clip_paste(false, None);
@@ -724,7 +724,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.wb.sheets[0].set(0, 1, formula("=A1*10"));
         app.wb.sheets[0].set(1, 1, formula("=A2*10"));
         sheetcore::formula::recalc_all(&mut app.wb);
-        app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+        app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
         app.sel_end = (1, 1);
         if multi {
             app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new() });
@@ -6077,7 +6077,7 @@ fn manual_calc_edit_marks_pending_and_f9_forces_recalculation() {
     app.wb.sheet_mut(0).set(0, 0, number(1.0));
     app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
     sheetcore::formula::recalc_all_force(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(2.0));
 
     app.ribbon_action("CalcManual", &ctx);
@@ -6119,7 +6119,7 @@ fn calculate_sheet_command_keeps_unrelated_volatile_sheet_cached() {
     let mut other = sheetcore::Sheet::new("易失表");
     other.set(0, 0, Cell { value: Value::Number(999.0), formula: Some("=RAND()".into()) });
     app.wb.sheets.push(other);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.ribbon_action("CalcManual", &ctx);
     app.sheet_idx = 0;
     app.sel = (0, 0);
@@ -6239,7 +6239,7 @@ fn calculate_sheet_keeps_other_sheet_pending_until_full_recalc() {
     second.set(0, 1, formula("=A1*2"));
     app.wb.sheets.push(second);
     sheetcore::formula::recalc_all_force(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.ribbon_action("CalcManual", &ctx);
 
     app.sheet_idx = 0;
@@ -6290,7 +6290,7 @@ fn manual_mode_delete_keeps_cached_dependents_until_f9() {
     app.wb.sheet_mut(0).set(0, 0, number(1.0));
     app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
     sheetcore::formula::recalc_all_force(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.ribbon_action("CalcManual", &ctx);
     app.sel = (0, 0);
     app.sel_end = (0, 0);
@@ -6311,7 +6311,7 @@ fn manual_mode_sort_marks_pending_without_recalculating() {
     app.wb.sheet_mut(0).set(0, 1, formula("=A1*10"));
     app.wb.sheet_mut(0).set(1, 1, formula("=A2*10"));
     sheetcore::formula::recalc_all_force(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.ribbon_action("CalcManual", &ctx);
     app.sel = (0, 0);
     app.sel_end = (0, 0);
@@ -6331,7 +6331,7 @@ fn manual_mode_dv_and_paste_keep_cached_values() {
     app.wb.sheet_mut(0).set(0, 0, number(1.0));
     app.wb.sheet_mut(0).set(0, 1, formula("=A1*2"));
     sheetcore::formula::recalc_all_force(&mut app.wb);
-    app.deps = sheetcore::formula::deps::Deps::build(&app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
     app.ribbon_action("CalcManual", &ctx);
 
     assert!(app.dv_pick_apply(0, 0, "5"));
@@ -9571,7 +9571,7 @@ fn recalc_result_from_another_document_is_discarded_even_if_epoch_matches() {
     let epoch_now = app.wb_epoch;
     let (tx, rx) = std::sync::mpsc::channel();
     app.tasks.open_rx = Some(rx);
-    tx.send(OpenMsg::RecalcedWb(Box::new(foreign), Box::new(deps), epoch_now, doc1_gen))
+    tx.send(OpenMsg::RecalcedWb(Box::new(foreign), Box::new(deps), epoch_now, doc1_gen, true))
         .unwrap();
     app.poll_open();
     assert_eq!(
@@ -9591,6 +9591,7 @@ fn recalc_result_from_another_document_is_discarded_even_if_epoch_matches() {
         Box::new(deps2),
         app.wb_epoch,
         app.doc_gen,
+        true,
     ))
     .unwrap();
     app.poll_open();

@@ -476,25 +476,34 @@ pub fn attach2_for_session(
     write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
 
+fn pivot_field_part(name: &str) -> bool {
+    name.ends_with(".xml") && (name.contains("pivotCacheDefinition") || name.starts_with("xl/pivotTables/"))
+}
+
+fn read_selected_parts(
+    path: &Path,
+    select: impl Fn(&str) -> bool,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let names: Vec<_> = zip.file_names().filter(|name| select(name)).map(str::to_owned).collect();
+    let mut parts = Vec::new();
+    for name in names {
+        let mut body = Vec::new();
+        zip.by_name(&name)?.read_to_end(&mut body)?;
+        parts.push((name, body));
+    }
+    Ok(parts)
+}
+
 /// 切换透视表布局（压缩 compact / 大纲 outline），只改 pivotTable*.xml 的四个属性。
 ///
 /// Excel 的「压缩形式」= `compact="1" compactData="1" outline="0" outlineData="0"`；
 /// 「大纲形式」= 我们生成时用的默认组合。实测 Excel 对两种组合都能正常打开并读回字段。
 pub fn set_pivot_layout(path: &std::path::Path, compact: bool) -> anyhow::Result<usize> {
-    use std::io::{Read, Write};
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let mut e = zip.by_index(i)?;
-        let name = e.name().to_string();
-        let mut buf = Vec::with_capacity(e.size() as usize);
-        e.read_to_end(&mut buf)?;
-        entries.push((name, buf));
-    }
-    drop(zip);
-    let mut changed = 0usize;
-    for (name, buf) in entries.iter_mut() {
+    let entries = read_selected_parts(path, |name| name.starts_with("xl/pivotTables/") && name.ends_with(".xml"))?;
+    let mut changed = Vec::new();
+    for (name, buf) in &entries {
         if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
             continue;
         }
@@ -517,22 +526,11 @@ pub fn set_pivot_layout(path: &std::path::Path, compact: bool) -> anyhow::Result
             out = set_attr(&out, attr, val);
         }
         if out != *text {
-            *buf = out.into_bytes();
-            changed += 1;
+            changed.push((name.clone(), out.into_bytes()));
         }
     }
-    let tmp = path.with_extension("layout.tmp");
-    {
-        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
-        for (name, buf) in &entries {
-            let opts = zip::write::SimpleFileOptions::default();
-            w.start_file(name.clone(), opts)?;
-            w.write_all(buf)?;
-        }
-        w.finish()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(changed)
+    crate::patch::append_entries(path, &changed)?;
+    Ok(changed.len())
 }
 
 /// 计算字段（Excel：cacheField 带 formula + databaseField="0"）
@@ -663,24 +661,13 @@ fn add_calculated_fields_inner(
     sheet: Option<&str>,
     calc: &[(&str, &str)],
 ) -> anyhow::Result<usize> {
-    use std::io::{Read, Write};
     if calc.is_empty() {
         return Ok(0);
     }
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let mut e = zip.by_index(i)?;
-        let name = e.name().to_string();
-        let mut buf = Vec::with_capacity(e.size() as usize);
-        e.read_to_end(&mut buf)?;
-        entries.push((name, buf));
-    }
-    drop(zip);
+    let entries = read_selected_parts(path, |name| pivot_field_part(name) || (sheet.is_some() && (name == "xl/workbook.xml" || name.ends_with(".rels"))))?;
     let targets = sheet.map(|sh| sheet_cache_targets(&entries, sh));
-    let mut changed = 0usize;
-    for (name, buf) in entries.iter_mut() {
+    let mut changed = Vec::new();
+    for (name, buf) in &entries {
         if !name.contains("pivotCacheDefinition") || !name.ends_with(".xml") {
             continue;
         }
@@ -709,11 +696,10 @@ fn add_calculated_fields_inner(
         out.push_str(&text[count_start + count_len..close]);
         out.push_str(&add);
         out.push_str(&text[close..]);
-        *buf = out.into_bytes();
-        changed += 1;
+        changed.push((name.clone(), out.into_bytes()));
     }
     // 透视表定义里的 pivotFields 条数必须与缓存字段数一致，否则 Excel 打不开（报「不能取得 Open 属性」）
-    for (name, buf) in entries.iter_mut() {
+    for (name, buf) in &entries {
         if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
             continue;
         }
@@ -738,25 +724,11 @@ fn add_calculated_fields_inner(
         out.push_str(&text[cs + cl..close]);
         out.push_str(&ins);
         out.push_str(&text[close..]);
-        *buf = out.into_bytes();
-        changed += 1;
+        changed.push((name.clone(), out.into_bytes()));
     }
 
-    if changed == 0 {
-        return Ok(0);
-    }
-    let tmp = path.with_extension("calc.tmp");
-    {
-        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
-        for (name, buf) in &entries {
-            let opts = zip::write::SimpleFileOptions::default();
-            w.start_file(name.clone(), opts)?;
-            w.write_all(buf)?;
-        }
-        w.finish()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(changed)
+    crate::patch::append_entries(path, &changed)?;
+    Ok(changed.len())
 }
 
 /// 计算项（Excel：缓存 sharedItems 里加 `<s v="名字" f="1"/>`，再写 `<calculatedItems>`）
@@ -772,21 +744,10 @@ pub fn add_calculated_item(
     item_idx: usize,
     pivot_field_idx: usize,
 ) -> anyhow::Result<usize> {
-    use std::io::{Read, Write};
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let mut e = zip.by_index(i)?;
-        let name = e.name().to_string();
-        let mut buf = Vec::with_capacity(e.size() as usize);
-        e.read_to_end(&mut buf)?;
-        entries.push((name, buf));
-    }
-    drop(zip);
-    let mut changed = 0usize;
+    let entries = read_selected_parts(path, pivot_field_part)?;
+    let mut changed = Vec::new();
 
-    for (name, buf) in entries.iter_mut() {
+    for (name, buf) in &entries {
         if !name.contains("pivotCacheDefinition") || !name.ends_with(".xml") {
             continue;
         }
@@ -819,11 +780,10 @@ pub fn add_calculated_item(
             esc(formula), field_idx, field_idx, item_idx
         );
         out.insert_str(anchor, &block);
-        *buf = out.into_bytes();
-        changed += 1;
+        changed.push((name.clone(), out.into_bytes()));
     }
 
-    for (name, buf) in entries.iter_mut() {
+    for (name, buf) in &entries {
         if !name.starts_with("xl/pivotTables/") || !name.ends_with(".xml") {
             continue;
         }
@@ -858,25 +818,11 @@ pub fn add_calculated_item(
                 out.replace_range(cs..cs + cl, &(old + 1).to_string());
             }
         }
-        *buf = out.into_bytes();
-        changed += 1;
+        changed.push((name.clone(), out.into_bytes()));
     }
 
-    if changed == 0 {
-        return Ok(0);
-    }
-    let tmp = path.with_extension("item.tmp");
-    {
-        let mut w = zip::ZipWriter::new(std::fs::File::create(&tmp)?);
-        for (name, buf) in &entries {
-            let opts = zip::write::SimpleFileOptions::default();
-            w.start_file(name.clone(), opts)?;
-            w.write_all(buf)?;
-        }
-        w.finish()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(changed)
+    crate::patch::append_entries(path, &changed)?;
+    Ok(changed.len())
 }
 
 fn set_attr(xml: &str, name: &str, val: &str) -> String {

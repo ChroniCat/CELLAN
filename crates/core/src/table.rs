@@ -317,9 +317,7 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
             "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table{id}.xml\"/>"
         ));
     }
-    for (name, body) in parts.iter() {
-        crate::patch::append_entry(path, name, body.as_bytes())?;
-    }
+    crate::patch::append_entries(path, &parts.iter().map(|(name, xml)| (name.clone(), xml.as_bytes().to_vec())).collect::<Vec<_>>())?;
     // 工作表原本没有 rels 的话要新建，否则 Excel 找不到表格部件
     let rels_exists = {
         let mut has = false;
@@ -347,7 +345,7 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
     let table_parts = format!("<tableParts count=\"{count}\">{parts_xml}</tableParts>");
     let rels_add = refs.clone();
     let part_c = part.clone();
-    crate::patch::rewrite_zip(path, |name, buf| {
+    crate::patch::rewrite_zip_where(path, |n| n == part || n == rels_path || n == "[Content_Types].xml", |name, buf| {
         if name == part_c {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 if !xml.contains("<tableParts") {
@@ -1506,7 +1504,7 @@ pub fn sync(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result<(
     }
     let skip: std::collections::HashSet<String> = old_parts.iter().cloned().collect();
     let originals = old_parts.clone();
-    crate::patch::rewrite_zip_skip(path, &skip, |name, buf| {
+    crate::patch::rewrite_zip_skip_where(path, &skip, |n| n == part || n == rels_path || n == "[Content_Types].xml", |name, buf| {
         if name == rels_path {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut out = String::with_capacity(xml.len());

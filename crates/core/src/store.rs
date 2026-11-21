@@ -16,6 +16,106 @@ use crate::model::{Cell, CellRef, Value};
 
 pub const PAGE_ROWS: u32 = 256;
 
+/// Explicit styles, including style zero overriding a row or column default.
+/// Each column page packs its u16 IDs in row order. The bitmap distinguishes
+/// absent entries without reserving a style ID or allocating up to a distant row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellStyles {
+    pages: std::sync::Arc<std::collections::HashMap<(u32, u32), std::sync::Arc<StyleColumn>>>,
+    len: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StyleColumn {
+    rows: [u64; 4],
+    ids: Vec<u16>,
+}
+
+impl StyleColumn {
+    fn position(&self, offset: u32) -> (usize, u64, usize) {
+        let word = (offset / 64) as usize;
+        let bit = 1u64 << (offset % 64);
+        let rank = self.rows[..word].iter().map(|w| w.count_ones()).sum::<u32>()
+            + (self.rows[word] & (bit - 1)).count_ones();
+        (word, bit, rank as usize)
+    }
+}
+
+impl CellStyles {
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    pub fn get(&self, key: &CellRef) -> Option<&u16> {
+        let page = self.pages.get(&(key.row / PAGE_ROWS, key.col))?;
+        let (word, bit, rank) = page.position(key.row % PAGE_ROWS);
+        (page.rows[word] & bit != 0).then(|| &page.ids[rank])
+    }
+
+    pub fn insert(&mut self, key: CellRef, id: u16) -> Option<u16> {
+        let page = std::sync::Arc::make_mut(&mut self.pages)
+            .entry((key.row / PAGE_ROWS, key.col)).or_default();
+        let page = std::sync::Arc::make_mut(page);
+        let (word, bit, rank) = page.position(key.row % PAGE_ROWS);
+        if page.rows[word] & bit != 0 {
+            return Some(std::mem::replace(&mut page.ids[rank], id));
+        }
+        page.rows[word] |= bit;
+        page.ids.insert(rank, id);
+        self.len += 1;
+        None
+    }
+
+    pub fn remove(&mut self, key: &CellRef) -> Option<u16> {
+        self.get(key)?;
+        let page_key = (key.row / PAGE_ROWS, key.col);
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        let page = std::sync::Arc::make_mut(pages.get_mut(&page_key)?);
+        let (word, bit, rank) = page.position(key.row % PAGE_ROWS);
+        page.rows[word] &= !bit;
+        let old = page.ids.remove(rank);
+        if page.ids.is_empty() { pages.remove(&page_key); }
+        self.len -= 1;
+        Some(old)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (CellRef, &u16)> {
+        self.iter_from(true, 0)
+    }
+
+    pub(crate) fn iter_from(&self, rows: bool, at: u32) -> impl Iterator<Item = (CellRef, &u16)> {
+        self.pages.iter().filter(move |&(&(p, col), _)| {
+            if rows { p >= at / PAGE_ROWS } else { col >= at }
+        }).flat_map(move |(&(p, col), page)| {
+            let keys = page.rows.iter().enumerate().flat_map(move |(word, &bits)| {
+                let mut bits = bits;
+                std::iter::from_fn(move || {
+                    if bits == 0 { return None; }
+                    let row = p * PAGE_ROWS + word as u32 * 64 + bits.trailing_zeros();
+                    bits &= bits - 1;
+                    Some(CellRef::new(row, col))
+                })
+            });
+            keys.zip(&page.ids).filter(move |(key, _)| !rows || key.row >= at)
+        })
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = CellRef> {
+        self.iter().map(|(key, _)| key)
+    }
+
+    pub(crate) fn changed_keys(&self, other: &Self) -> impl Iterator<Item = CellRef> {
+        self.pages.iter().filter(move |(key, page)| {
+            other.pages.get(key).is_none_or(|old| !std::sync::Arc::ptr_eq(old, page))
+        }).flat_map(move |(&(p, col), page)| {
+            (0..PAGE_ROWS).filter_map(move |row| {
+                let key = CellRef::new(p * PAGE_ROWS + row, col);
+                let (word, bit, rank) = page.position(row);
+                (page.rows[word] & bit != 0 && other.get(&key) != Some(&page.ids[rank])).then_some(key)
+            })
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Page {
     /// 本页实际分配的行数（≤ PAGE_ROWS）
@@ -68,6 +168,7 @@ impl Page {
 #[derive(Clone, Debug, Default)]
 pub struct Store {
     pages: std::collections::HashMap<u32, Page>,
+    revision: u64,
     len: usize,
     max_row: u32,
     max_col: u32,
@@ -75,6 +176,7 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) fn revision(&self) -> u64 { self.revision }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -96,6 +198,7 @@ impl Store {
     }
 
     pub fn clear(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.pages.clear();
         self.len = 0;
         self.max_row = 0;
@@ -115,7 +218,9 @@ impl Store {
 
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
         let (pi, ro) = Self::split(r);
-        self.pages.get_mut(&pi)?.get_mut(ro, c)
+        let cell = self.pages.get_mut(&pi)?.get_mut(ro, c)?;
+        self.revision = self.revision.wrapping_add(1);
+        Some(cell)
     }
 
     pub fn contains(&self, r: u32, c: u32) -> bool {
@@ -124,6 +229,7 @@ impl Store {
 
     /// 写入单元格；cell 为空白时等价于删除
     pub fn set(&mut self, r: u32, c: u32, cell: Cell) {
+        self.revision = self.revision.wrapping_add(1);
         let (pi, ro) = Self::split(r);
         let blank = cell.is_blank();
         if blank {
@@ -171,6 +277,7 @@ impl Store {
             return None;
         }
         let old = std::mem::take(slot);
+        self.revision = self.revision.wrapping_add(1);
         self.len -= 1;
         if self.len == 0 {
             self.clear();
@@ -225,6 +332,41 @@ impl Store {
 
     pub fn iter_values(&self) -> impl Iterator<Item = &Cell> {
         self.iter().map(|(_, c)| c)
+    }
+
+    /// Occupied cells in this snapshot that differ from the other snapshot.
+    pub(crate) fn changed_keys(&self, other: &Self) -> impl Iterator<Item = CellRef> {
+        self.pages.iter().flat_map(move |(&p, page)| {
+            page.cols.iter().enumerate().flat_map(move |(col, cells)| {
+                let old = other.pages.get(&p).and_then(|page| page.cols.get(col));
+                let shared = old.is_some_and(|old| std::sync::Arc::ptr_eq(old, cells));
+                (!shared).then_some(cells).into_iter().flat_map(move |cells| {
+                    cells.iter().enumerate().filter_map(move |(row, cell)| {
+                        (!cell.is_blank() && old.and_then(|c| c.get(row)) != Some(cell))
+                            .then_some(CellRef::new(p * PAGE_ROWS + row as u32, col as u32))
+                    })
+                })
+            })
+        })
+    }
+
+    /// Only enumerate occupied cells in the bands affected by a row/column shift.
+    pub(crate) fn keys_from(&self, rows: bool, at: u32) -> Vec<CellRef> {
+        let mut keys = Vec::new();
+        for (&index, page) in &self.pages {
+            if rows && index < at / PAGE_ROWS { continue; }
+            let base = index * PAGE_ROWS;
+            let row_start = if rows { at.saturating_sub(base) as usize } else { 0 };
+            let col_start = if rows { 0 } else { at as usize };
+            for (col, cells) in page.cols.iter().enumerate().skip(col_start) {
+                for (offset, cell) in cells.iter().enumerate().skip(row_start) {
+                    if !cell.is_blank() {
+                        keys.push(CellRef::new(base + offset as u32, col as u32));
+                    }
+                }
+            }
+        }
+        keys
     }
 
     pub fn used_bounds(&self) -> Option<(u32, u32, u32, u32)> {
@@ -309,6 +451,24 @@ mod tests {
 
     fn num(v: f64) -> Cell {
         Cell { value: Value::Number(v), formula: None }
+    }
+
+    #[test]
+    fn packed_style_pages_keep_explicit_defaults_and_snapshot_isolation() {
+        let mut styles = CellStyles::default();
+        for row in [513, 255, 63, 64, 0, 128, 127, 192] {
+            styles.insert(CellRef::new(row, 80), row as u16);
+        }
+        let saved = styles.clone();
+        let key = CellRef::new(64, 80);
+        assert_eq!(styles.remove(&key), Some(64));
+        assert_eq!(styles.insert(key, u16::MAX), None);
+        assert_eq!(styles.get(&key), Some(&u16::MAX));
+        assert_eq!(saved.get(&key), Some(&64));
+        assert_eq!(styles.get(&CellRef::new(0, 80)), Some(&0));
+        assert_eq!(styles.changed_keys(&saved).collect::<Vec<_>>(), vec![key]);
+        assert_eq!(styles.iter().count(), styles.len());
+        assert!(std::sync::Arc::ptr_eq(&styles.pages[&(2, 80)], &saved.pages[&(2, 80)]));
     }
 
     #[test]

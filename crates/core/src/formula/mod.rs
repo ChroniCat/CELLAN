@@ -4,6 +4,10 @@
 //!   比较(= <> < > <= >=) < 连接(&) < 加减 < 乘除 < 乘方 < 一元负号 < 百分号 < 区间(:)
 
 pub mod array;
+mod compiled;
+#[cfg(test)]
+mod performance_tests;
+use compiled::compile_at;
 pub mod deps;
 pub mod dist;
 pub mod extra;
@@ -778,43 +782,21 @@ fn split_book_sheet(name: &str) -> (Option<String>, String) {
 
 /// "A1" / "$B$12" → RefExpr
 pub fn parse_a1(s: &str) -> Option<RefExpr> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    let mut col_abs = false;
-    if i < chars.len() && chars[i] == '$' {
-        col_abs = true;
+    let bytes = s.as_bytes();
+    let col_abs = bytes.first() == Some(&b'$');
+    let mut i = usize::from(col_abs);
+    let mut col = 0_i64;
+    while let Some(c) = bytes.get(i).filter(|c| c.is_ascii_alphabetic()) {
+        col = col.checked_mul(26)?.checked_add((c.to_ascii_uppercase() - b'A' + 1) as i64)?;
         i += 1;
     }
-    let start = i;
-    while i < chars.len() && chars[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    let col_str: String = chars[start..i].iter().collect();
-    let mut col: i64 = 0;
-    for ch in col_str.to_ascii_uppercase().chars() {
-        col = col * 26 + (ch as i64 - 'A' as i64 + 1);
-    }
-    col -= 1;
-
-    let mut row_abs = false;
-    if i < chars.len() && chars[i] == '$' {
-        row_abs = true;
-        i += 1;
-    }
-    let rstart = i;
-    while i < chars.len() && chars[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == rstart || i != chars.len() {
-        return None;
-    }
-    let row: i64 = chars[rstart..i].iter().collect::<String>().parse::<i64>().ok()? - 1;
-    if row < 0 {
-        return None;
-    }
+    if col == 0 { return None; }
+    let col = col - 1;
+    let row_abs = bytes.get(i) == Some(&b'$');
+    i += usize::from(row_abs);
+    if !bytes.get(i)?.is_ascii_digit() { return None; }
+    let row = s[i..].parse::<i64>().ok()?.checked_sub(1)?;
+    if row < 0 { return None; }
     Some(RefExpr { book: None, sheet: None, sheet2: None, row, col, row_abs, col_abs })
 }
 
@@ -831,12 +813,45 @@ pub fn take_cycle_cells() -> HashSet<(usize, u32, u32)> {
     CYCLE_CELLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+type RangeKey = (usize, i64, i64, i64, i64);
+type EvalEnvironment = Vec<HashMap<String, FValue>>;
+type EvalFrame = (deps::CellKey, EvalEnvironment);
+
+struct RangeRemainder {
+    range: RangeKey,
+    offsets: std::ops::Range<usize>,
+}
+
+impl Iterator for RangeRemainder {
+    type Item = deps::CellKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (si, r1, c1, _, c2) = self.range;
+        let width = (c2 - c1 + 1) as usize;
+        let i = self.offsets.next()?;
+        Some((si, r1 as u32 + (i / width) as u32, c1 as u32 + (i % width) as u32))
+    }
+}
+type PrefixKey = (usize, i64, i64, bool);
+type SumPrefixes = Vec<Result<f64, ErrKind>>;
+
+#[derive(Hash, PartialEq, Eq)]
+struct CriteriaKey {
+    function: u8,
+    ranges: Vec<RangeKey>,
+    criteria: Vec<String>,
+}
+
 pub struct Calc<'a> {
     wb: &'a Workbook,
     memo: HashMap<(usize, u32, u32), FValue>,
     visiting: HashSet<(usize, u32, u32)>,
     /// LET 绑定的名字（大写）
-    env_stack: Vec<HashMap<String, FValue>>,
+    env_stack: EvalEnvironment,
+    active_names: HashSet<(usize, deps::CellKey, usize)>,
+    scheduling: bool,
+    requested: Option<EvalFrame>,
+    range_remainder: Option<RangeRemainder>,
     /// 正在求值的单元格（供 ROW()/COLUMN() 用）
     cur: (u32, u32),
     cur_sheet: usize,
@@ -848,12 +863,14 @@ pub struct Calc<'a> {
     /// 进入时外层的 NOW 快照，Drop 时恢复
     prev_now: Option<f64>,
     /// 区域内容缓存：同一轮重算里同一块区域只物化一次
-    range_cache: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<Vec<FValue>>>,
+    range_cache: HashMap<RangeKey, (std::rc::Rc<Vec<FValue>>, u64)>,
     /// 每张表的实际使用范围（最大行、最大列）
     bounds: HashMap<usize, (u32, u32)>,
     /// 递归深度：整列引用会把循环引用放大成深递归，超过就返回错误而不是爆栈
     depth: usize,
     /// 精确匹配用的哈希索引：key → 首次出现的行下标
+    approx_positions: HashMap<(RangeKey, usize, functions::LookupKind), Option<Vec<usize>>>,
+    position_count: usize,
     lookup_index: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<HashMap<String, usize>>>,
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
     scope: Option<std::collections::HashSet<self::deps::CellKey>>,
@@ -863,7 +880,12 @@ pub struct Calc<'a> {
     agg_cache: HashMap<(usize, i64, i64, i64, i64, u8, String), FValue>,
     /// 区域缓存已占用的值数量，防止把逐行累积的区间全缓存下来
     cache_vals: usize,
-    cache_order: std::collections::VecDeque<((usize, i64, i64, i64, i64), usize)>,
+    cache_order: std::collections::BTreeSet<(u64, RangeKey)>,
+    cache_clock: u64,
+    criteria_cache: HashMap<CriteriaKey, FValue>,
+    sum_prefixes: HashMap<PrefixKey, SumPrefixes>,
+    sum_ends: HashMap<PrefixKey, i64>,
+    prefix_values: usize,
     pub agg_hits: u64,
     pub agg_miss: u64,
 }
@@ -962,10 +984,11 @@ impl<'a> Calc<'a> {
             let now = functions::now_serial();
             functions::set_now_snapshot(Some(now));
         }
-        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), scope: None,
+        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(),
             agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
             range_reads: 0,
-            cache_order: std::collections::VecDeque::new(), agg_hits: 0, agg_miss: 0,
+            cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
+            sum_prefixes: HashMap::new(), sum_ends: HashMap::new(), prefix_values: 0, agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
             prev_system, prev_now }
     }
@@ -1195,6 +1218,26 @@ impl<'a> Calc<'a> {
         ))))
     }
 
+    fn eval_defined_name(&mut self, name: &str, si: usize, scoped: bool) -> FValue {
+        let mut found = None;
+        for (index, (nm, scope, _)) in self.wb.names.iter().enumerate() {
+            if !nm.eq_ignore_ascii_case(name) { continue; }
+            if *scope == Some(si) { found = Some(index); break; }
+            if scope.is_none() && (!scoped || found.is_none()) { found = Some(index); }
+        }
+        let Some(index) = found else { return FValue::Error(ErrKind::Name); };
+        let key = (index, (self.cur_sheet, self.cur.0, self.cur.1), si);
+        if !self.active_names.insert(key) { return FValue::Error(ErrKind::Name); }
+        let body = self.wb.names[index].2.trim_start_matches('=');
+        let expanded = crate::table::expand_structured_at(self.wb, si, Some(self.cur.0), Some(self.cur.1), body);
+        let value = match compile_at(expanded.as_deref().unwrap_or(body), self.cur.0, self.cur.1) {
+            Ok(node) => self.eval_node(&node, si),
+            Err(_) => FValue::Error(ErrKind::Name),
+        };
+        self.active_names.remove(&key);
+        value
+    }
+
     fn eval_ext_defined_name(
         &mut self,
         li: usize,
@@ -1252,25 +1295,76 @@ impl<'a> Calc<'a> {
     }
 
     pub fn cell_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
-        if self.depth >= 200 {
-            CYCLE_CELLS.with(|cells| {
-                cells.borrow_mut().insert((si, r, c));
-            });
-            return FValue::Error(ErrKind::Ref);
+        if self.scheduling {
+            return self.cell_value_inner(si, r, c, false);
+        }
+        if self.depth >= 2 {
+            return self.evaluate_stack((si, r, c));
         }
         self.depth += 1;
-        let out = self.cell_value_inner(si, r, c);
+        let out = self.cell_value_inner(si, r, c, true);
         self.depth -= 1;
         out
     }
 
-    fn cell_value_inner(&mut self, si: usize, r: u32, c: u32) -> FValue {
+    /// Resolve deep formula chains on a heap stack. A frame suspends only when it
+    /// actually reads an unevaluated formula, so IF/IFERROR and dynamic references
+    /// keep their normal evaluation order. Only completed values enter the caches.
+    fn evaluate_stack(&mut self, root: deps::CellKey) -> FValue {
+        // Constants and already resolved formulas are common when reading ranges.
+        self.scheduling = true;
+        let (si, r, c) = root;
+        let ready = self.cell_value_inner(si, r, c, false);
+        let Some(frame) = self.requested.take() else {
+            self.scheduling = false;
+            return ready;
+        };
+        let outer = std::mem::take(&mut self.env_stack);
+        let mut stack = vec![(frame, None::<(RangeRemainder, EvalEnvironment)>)];
+        let result = loop {
+            let ((key, env), remainder) = stack.last_mut().unwrap();
+            if let Some((cells, bindings)) = remainder {
+                let next = cells.find(|key| {
+                    let (si, row, col) = *key;
+                    !self.memo.contains_key(key)
+                        && !self.visiting.contains(key)
+                        && self.scope.as_ref().is_none_or(|scope| scope.contains(key))
+                        && self.wb.sheets[si].get(row, col).is_some_and(|c| c.formula.is_some())
+                });
+                if let Some(key) = next {
+                    let frame = (key, bindings.clone());
+                    stack.push((frame, None));
+                    continue;
+                }
+                *remainder = None;
+            }
+            self.visiting.remove(key);
+            self.env_stack = std::mem::take(env);
+            let (si, r, c) = *key;
+            let value = self.cell_value_inner(si, r, c, true);
+            *env = std::mem::take(&mut self.env_stack);
+            if let Some(dependency) = self.requested.take() {
+                self.visiting.insert(*key);
+                *remainder = self.range_remainder.take().map(|cells| (cells, dependency.1.clone()));
+                stack.push((dependency, None));
+                continue;
+            }
+            stack.pop();
+            if stack.is_empty() { break value; }
+        };
+        self.env_stack = outer;
+        self.scheduling = false;
+        result
+    }
+
+    fn cell_value_inner(&mut self, si: usize, r: u32, c: u32, evaluate: bool) -> FValue {
+        if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
         let key = (si, r, c);
         if let Some(v) = self.memo.get(&key) {
             return v.clone();
         }
         let cell = match self.wb.sheets.get(si).and_then(|s| s.get(r, c)) {
-            Some(c) if !c.is_blank() => c.clone(),
+            Some(c) if !c.is_blank() => c,
             _ => return FValue::Empty,
         };
         if let Some(f) = cell.formula.as_deref() {
@@ -1278,20 +1372,6 @@ impl<'a> Calc<'a> {
             if let Some(scope) = &self.scope {
                 if !scope.contains(&key) {
                     return to_fvalue(&cell.value);
-                }
-            }
-            let raw = f.strip_prefix('=').unwrap_or(f).to_string();
-            // 结构化引用：Table1[列] → A1 区域
-            let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), Some(c), &raw).unwrap_or(raw);
-            let normalized = crate::normalize_formula(&expanded);
-            let body = normalized.as_str();
-            // 合法但尚未实现的引用组合：保留文件里的缓存，不让 parse 失败把
-            // 已知结果写成 #REF!/#VALUE!。只对明确的组合生效，真正的运算错误
-            //（包括本来就缓存为错误的格）仍走正常求值。
-            if let Some(_reason) = unsupported_reference_combo(body) {
-                let cached = to_fvalue(&cell.value);
-                if !matches!(cached, FValue::Error(_)) {
-                    return cached;
                 }
             }
             if !self.visiting.insert(key) {
@@ -1309,11 +1389,25 @@ impl<'a> Calc<'a> {
                 }
                 return FValue::Error(ErrKind::Circular);
             }
+            if !evaluate {
+                self.visiting.remove(&key);
+                self.requested = Some((key, self.env_stack.clone()));
+                return FValue::Error(ErrKind::Ref);
+            }
+            let raw = f.strip_prefix('=').unwrap_or(f);
+            let expanded = crate::table::expand_structured_at(self.wb, si, Some(r), Some(c), raw);
+            let body = expanded.as_deref().unwrap_or(raw);
+            if unsupported_reference_combo(body).is_some() {
+                let cached = to_fvalue(&cell.value);
+                if !matches!(cached, FValue::Error(_)) { self.visiting.remove(&key); self.memo.insert(key, cached.clone()); return cached; }
+            }
             let previous = (self.cur_sheet, self.cur);
             self.cur_sheet = si;
             self.cur = (r, c);
-            self.volatile_counts.insert(key, 0);
-            let mut v = match parse(body) {
+            // Only volatile formulas need a counter. A suspended frame restarts
+            // from its first sample and replays values already collected.
+            self.volatile_counts.remove(&key);
+            let mut v = match compile_at(body, r, c) {
                 Ok(node) => self.eval_node(&node, si),
                 Err(e) => FValue::Error(e),
             };
@@ -1324,7 +1418,7 @@ impl<'a> Calc<'a> {
             }
             (self.cur_sheet, self.cur) = previous;
             self.visiting.remove(&key);
-            self.memo.insert(key, v.clone());
+            if self.requested.is_none() { self.memo.insert(key, v.clone()); }
             v
         } else {
             to_fvalue(&cell.value)
@@ -1446,6 +1540,24 @@ impl<'a> Calc<'a> {
         }
     }
 
+    fn materialize_range(&mut self, key: RangeKey, length: usize) -> Result<std::rc::Rc<Vec<FValue>>, ErrKind> {
+        if self.requested.is_some() { return Err(ErrKind::Ref); }
+        if let Some(values) = self.cache_get(key) { return Ok(values); }
+        let mut values = Vec::with_capacity(length);
+        let (si, r1, c1, r2, c2) = key;
+        for row in r1..=r2 {
+            for col in c1..=c2 {
+                self.range_reads += 1;
+                values.push(self.cell_value(si, row as u32, col as u32).scalar());
+                if self.requested.is_some() {
+                    self.range_remainder = Some(RangeRemainder { range: key, offsets: values.len()..length });
+                    return Err(ErrKind::Ref);
+                }
+            }
+        }
+        Ok(self.cache_put(key, std::rc::Rc::new(values)))
+    }
+
     fn range_values(&mut self, a: &RefExpr, b: &RefExpr, cur: usize) -> Result<Arg, ErrKind> {
         if a.book.is_some() || b.book.is_some() {
             return self.link_range(a, b);
@@ -1488,23 +1600,12 @@ impl<'a> Calc<'a> {
         let cols = (c2 - c1 + 1) as usize;
         // 同一轮重算里同一块区域只展开一次
         let key = (si, r1 as i64, c1 as i64, r2 as i64, c2 as i64);
-        let values = match self.range_cache.get(&key) {
-            Some(v) => v.clone(),
-            None => {
-                let mut vals = Vec::with_capacity(rows * cols);
-                for r in r1..=r2 {
-                    for c in c1..=c2 {
-                        self.range_reads += 1;
-                        vals.push(self.cell_value(si, r, c).scalar());
-                    }
-                }
-                self.cache_put(key, std::rc::Rc::new(vals))
-            }
-        };
+        let values = self.materialize_range(key, rows * cols)?;
         Ok(Arg::Range { values, rows, cols })
     }
 
     pub fn eval_node(&mut self, node: &Node, si: usize) -> FValue {
+        if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
         match node {
             Node::Empty => FValue::Empty,
             Node::Name(n) => {
@@ -1513,36 +1614,7 @@ impl<'a> Calc<'a> {
                 }
                 // 工作簿定义名称：底层存的是定义式（区域、常量或公式）
                 // 作用域：当前表的局部名称优先于工作簿名称（Excel 同名规则）
-                let hit = {
-                    let mut local = None;
-                    let mut global = None;
-                    for (nm, sh, body) in self.wb.names.iter() {
-                        if !nm.eq_ignore_ascii_case(n) {
-                            continue;
-                        }
-                        match *sh {
-                            Some(s) if s == si => {
-                                local = Some((*sh, body.clone()));
-                                break;
-                            }
-                            Some(_) => {}
-                            None => global = Some((*sh, body.clone())),
-                        }
-                    }
-                    local.or(global)
-                };
-                if let Some((sh, body)) = hit {
-                    let si2 = sh.unwrap_or(si);
-                    let text = body.trim_start_matches('=').to_string();
-                    if !text.is_empty() && !text.eq_ignore_ascii_case(n) {
-                        let expanded =
-                            crate::table::expand_structured_at(self.wb, si2, Some(self.cur.0), Some(self.cur.1), &text).unwrap_or(text);
-                        if let Ok(node) = parse(&expanded) {
-                            return self.eval_node(&node, si2);
-                        }
-                    }
-                }
-                FValue::Error(ErrKind::Name)
+                self.eval_defined_name(n, si, false)
             }
             Node::ScopedName { book, sheet, name } => {
                 if let Some(bk) = book.as_deref() {
@@ -1553,38 +1625,7 @@ impl<'a> Calc<'a> {
                 }
                 if let Some(sh) = sheet.as_deref() {
                     if let Ok(si2) = self.sheet_index(Some(sh), si) {
-                        let hit = self
-                            .wb
-                            .names
-                            .iter()
-                            .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && *s == Some(si2))
-                            .or_else(|| {
-                                self.wb
-                                    .names
-                                    .iter()
-                                    .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && s.is_none())
-                            })
-                            .map(|(_, _, body)| body.clone());
-                        if let Some(body) = hit {
-                            let text = body.trim_start_matches('=').to_string();
-                            if !text.is_empty() && self.depth < 200 {
-                                let expanded = crate::table::expand_structured_at(
-                                    self.wb,
-                                    si2,
-                                    Some(self.cur.0),
-                                    Some(self.cur.1),
-                                    &text,
-                                )
-                                .unwrap_or(text);
-                                if let Ok(node) = parse(&expanded) {
-                                    self.depth += 1;
-                                    let v = self.eval_node(&node, si2);
-                                    self.depth -= 1;
-                                    return v;
-                                }
-                            }
-                        }
-                        return FValue::Error(ErrKind::Name);
+                        return self.eval_defined_name(name, si2, true);
                     }
                     if let Some(li) = crate::xlinks::resolve_book(self.wb, sh) {
                         return self.eval_ext_defined_name(li, None, name, si);
@@ -2333,22 +2374,12 @@ impl<'a> Calc<'a> {
                     if n == 0 {
                         return FValue::Error(ErrKind::Na);
                     }
-                    let mut best: Option<usize> = None;
-                    if !approx {
-                        let ix = self.lookup_hash(idx, &sa, &sb, s_cols, s_rows, vertical);
-                        best = ix.get(&key_norm(&key)).copied();
+                    let best = if approx {
+                        self.approximate_match((idx, sa.row.min(sb.row), sa.col.min(sb.col), sa.row.max(sb.row), sa.col.max(sb.col)), &data, n, 1, &key, true)
                     } else {
-                        for i in 0..n {
-                            let cell = &data[i];
-                            match cell.compare(&key) {
-                                // 重复值：Excel 取最后一个相等的行，不能遇到就停
-                                Ok(std::cmp::Ordering::Equal) => best = Some(i),
-                                Ok(std::cmp::Ordering::Less) => best = Some(i),
-                                Ok(std::cmp::Ordering::Greater) => break,
-                                _ => {}
-                            }
-                        }
-                    }
+                        let ix = self.lookup_hash(idx, &sa, &sb, s_cols, s_rows, vertical);
+                        ix.get(&key_norm(&key)).copied()
+                    };
                     return match best {
                         Some(i) => {
                             let (r, c) = if vertical {
@@ -2372,8 +2403,15 @@ impl<'a> Calc<'a> {
                 // MATCH / XMATCH / XLOOKUP：在查找区里找位置
                 let mode = match nodes.get(2) {
                     Some(n) => self.eval_node(n, si).to_number().unwrap_or(0.0),
+                    None if name == "MATCH" => 1.0,
                     None => 0.0,
                 };
+                if name == "MATCH" && mode != 0.0 {
+                    let stride = if vertical { cols } else { 1 };
+                    return self.approximate_match((idx, la.row.min(lb.row), la.col.min(lb.col), la.row.max(lb.row), la.col.max(lb.col)), &data, n, stride, &key, mode > 0.0)
+                        .map(|i| FValue::number((i + 1) as f64))
+                        .unwrap_or(FValue::Error(ErrKind::Na));
+                }
                 let mut hit: Option<usize> = None;
                 if mode == 0.0 {
                     let ix = self.lookup_hash(idx, &la, &lb, cols, rows, vertical);
@@ -2473,6 +2511,14 @@ impl<'a> Calc<'a> {
                             Ok(i) => i,
                             Err(e) => return FValue::Error(e),
                         };
+                        if name == "SUM" && matches!(nodes[0], Node::Range(..))
+                            && let Some((key, end)) = self.prefix_range(si2, &ra, &rb)
+                        {
+                            let start = profile_enabled().then(std::time::Instant::now);
+                            let result = self.prefix_sum(key, end);
+                            if let Some(t) = start { prof_record("SUM#prefix", t.elapsed().as_secs_f64()); }
+                            return result;
+                        }
                         let crit = if simple {
                             String::new()
                         } else {
@@ -2537,7 +2583,7 @@ impl<'a> Calc<'a> {
                             return v.clone();
                         }
                         self.agg_miss += 1;
-                        let t0 = std::time::Instant::now();
+                        let t0 = profile_enabled().then(std::time::Instant::now);
                         let (rows, cols, data) = self.cached_grid(si2, &ra, &rb);
                         let out = match name.as_str() {
                             "SUM" | "COUNTA" | "AVERAGE" | "MAX" | "MIN" => {
@@ -2574,8 +2620,8 @@ impl<'a> Calc<'a> {
                                 FValue::number(t)
                             }
                         };
-                        prof_record(&format!("{name}#agg"), t0.elapsed().as_secs_f64());
-                        self.agg_cache.insert(key, out.clone());
+                        if let Some(start) = t0 { prof_record(&format!("{name}#agg"), start.elapsed().as_secs_f64()); }
+                        if self.requested.is_none() { self.agg_cache.insert(key, out.clone()); }
                         return out;
                     }
                 }
@@ -2602,7 +2648,13 @@ impl<'a> Calc<'a> {
                     return self.apply_lambda_val(&lam, vals, si);
                 }
                 let args = self.function_args(name, nodes, si);
-                let t0 = std::time::Instant::now();
+                if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
+                let t0 = profile_enabled().then(std::time::Instant::now);
+                let criteria_key = self.criteria_key(name, nodes, &args, si);
+                if let Some(value) = criteria_key.as_ref().and_then(|key| self.criteria_cache.get(key)) {
+                    self.agg_hits += 1;
+                    return value.clone();
+                }
                 let out = if matches!(name.as_str(), "RAND" | "RANDBETWEEN" | "RANDARRAY" | "NOW" | "TODAY") {
                     let cell = (self.cur_sheet, self.cur.0, self.cur.1);
                     let count = self.volatile_counts.entry(cell).or_default();
@@ -2618,37 +2670,121 @@ impl<'a> Calc<'a> {
                 } else {
                     functions::call(name, &args)
                 };
-                prof_record(name, t0.elapsed().as_secs_f64());
+                if let Some(key) = criteria_key {
+                    if self.criteria_cache.len() >= 16_384 { self.criteria_cache.clear(); }
+                    self.criteria_cache.insert(key, out.clone());
+                    self.agg_miss += 1;
+                }
+                if let Some(start) = t0 { prof_record(name, start.elapsed().as_secs_f64()); }
                 out
             }
         }
     }
 
-    /// 取一个节点可能产生的所有值（区域 → 多值），用于数组广播
-    /// 把任意节点求值成 (行, 列, 数据) 网格
-    /// 写入区域缓存，超出预算时按先进先出淘汰
-    fn cache_put(
-        &mut self,
-        key: (usize, i64, i64, i64, i64),
-        vals: std::rc::Rc<Vec<FValue>>,
-    ) -> std::rc::Rc<Vec<FValue>> {
-        const LIMIT: usize = 4_000_000; // 约 128 MB 上限，抑制大表重算内存峰值
-        if self.range_cache.contains_key(&key) {
-            return self.range_cache.get(&key).unwrap().clone();
+    fn cache_get(&mut self, key: RangeKey) -> Option<std::rc::Rc<Vec<FValue>>> {
+        let (values, last) = self.range_cache.get_mut(&key)?;
+        self.cache_order.remove(&(*last, key));
+        self.cache_clock += 1;
+        *last = self.cache_clock;
+        self.cache_order.insert((*last, key));
+        Some(values.clone())
+    }
+
+    fn cache_put(&mut self, key: RangeKey, vals: std::rc::Rc<Vec<FValue>>) -> std::rc::Rc<Vec<FValue>> {
+        const LIMIT: usize = 4_000_000;
+        if self.requested.is_some() || vals.len() > LIMIT { return vals; }
+        if let Some(existing) = self.cache_get(key) { return existing; }
+        while self.cache_vals + vals.len() > LIMIT {
+            let Some((_, oldest)) = self.cache_order.pop_first() else { break };
+            self.cache_vals -= self.range_cache.remove(&oldest).unwrap().0.len();
         }
+        self.cache_clock += 1;
         self.cache_vals += vals.len();
-        self.cache_order.push_back((key, vals.len()));
-        self.range_cache.insert(key, vals.clone());
-        while self.cache_vals > LIMIT {
-            match self.cache_order.pop_front() {
-                Some((k, n)) => {
-                    self.range_cache.remove(&k);
-                    self.cache_vals -= n;
-                }
-                None => break,
-            }
-        }
+        self.cache_order.insert((self.cache_clock, key));
+        self.range_cache.insert(key, (vals.clone(), self.cache_clock));
         vals
+    }
+
+    fn prefix_range(&mut self, si: usize, a: &RefExpr, b: &RefExpr) -> Option<(PrefixKey, i64)> {
+        if a.row < 0 || a.col < 0 { return None; }
+        let (vertical, start, end, anchored) = if a.col == b.col && a.row <= b.row {
+            (true, a.row, b.row, a.row_abs && !b.row_abs)
+        } else if a.row == b.row && a.col <= b.col {
+            (false, a.col, b.col, a.col_abs && !b.col_abs)
+        } else {
+            return None;
+        };
+        let key = (si, a.row, a.col, vertical);
+        if !anchored && !self.sum_prefixes.contains_key(&key) {
+            if self.sum_ends.len() >= 1024 { self.sum_ends.clear(); }
+            let previous = self.sum_ends.insert(key, end);
+            if previous.is_none_or(|last| last == end) { return None; }
+        }
+        let whole_axis = if vertical { 1_048_575 } else { 16_383 };
+        if (start == 0 && end == whole_axis) || end - start >= 200_000 {
+            let (max_row, max_col) = self.sheet_bounds(si);
+            if (vertical && a.col > i64::from(max_col)) || (!vertical && a.row > i64::from(max_row)) {
+                return None;
+            }
+            return Some((key, end.min(i64::from(if vertical { max_row } else { max_col }))));
+        }
+        Some((key, end))
+    }
+
+    fn prefix_sum(&mut self, key: PrefixKey, end: i64) -> FValue {
+        let (si, row, col, vertical) = key;
+        let start = if vertical { row } else { col };
+        if end < start { return FValue::number(0.0); }
+        let range = if vertical { (si, row, col, end, col) } else { (si, row, col, row, end) };
+        let length = (end - start + 1) as usize;
+        let mut prefix = self.sum_prefixes.remove(&key).unwrap_or_default();
+        self.prefix_values -= prefix.len();
+        let mut sum = prefix.last().copied().unwrap_or(Ok(0.0));
+        let mut cells = RangeRemainder { range, offsets: prefix.len()..length };
+        while let Some((si,r,c)) = cells.next() {
+            self.range_reads += 1;
+            let value = self.cell_value(si, r, c).scalar();
+            if self.requested.is_some() {
+                self.range_remainder = Some(cells);
+                return FValue::Error(ErrKind::Ref);
+            }
+            if let Ok(n) = sum {
+                sum = match value {
+                    FValue::Number(v) => Ok(n + v), FValue::Error(e) => Err(e), _ => Ok(n),
+                };
+            }
+            prefix.push(sum);
+        }
+        let result = prefix[length - 1];
+        if self.prefix_values + prefix.len() > 1_048_576 {
+            self.sum_prefixes.clear();
+            self.prefix_values = 0;
+        }
+        if let Some(nested) = self.sum_prefixes.insert(key, prefix) {
+            self.prefix_values -= nested.len();
+        }
+        self.prefix_values += self.sum_prefixes[&key].len();
+        result.map(FValue::number).unwrap_or_else(FValue::Error)
+    }
+
+    fn criteria_key(&self, name: &str, nodes: &[Node], args: &[Arg], si: usize) -> Option<CriteriaKey> {
+        let function = match name {
+            "SUMIFS" => 0, "COUNTIFS" => 1, "AVERAGEIF" => 2, "AVERAGEIFS" => 3,
+            "MINIFS" => 4, "MAXIFS" => 5, _ => return None,
+        };
+        let mut key = CriteriaKey { function, ranges: Vec::new(), criteria: Vec::new() };
+        for (i, (node, arg)) in nodes.iter().zip(args).enumerate() {
+            let criterion = match name { "COUNTIFS" => i % 2 == 1, "AVERAGEIF" => i == 1, _ => i > 0 && i % 2 == 0 };
+            if criterion {
+                key.criteria.push(arg.first().to_text().ok()?);
+                continue;
+            }
+            let (a, b) = match node { Node::Range(a,b) => (a,b), Node::Ref(a) => (a,a), _ => return None };
+            if a.book.is_some() || b.book.is_some() || a.sheet2.is_some() || b.sheet2.is_some() { return None; }
+            let sheet = self.sheet_index(a.sheet.as_deref(), si).ok()?;
+            key.ranges.push((sheet, a.row.min(b.row), a.col.min(b.col), a.row.max(b.row), a.col.max(b.col)));
+        }
+        Some(key)
     }
 
     /// 表的实际使用范围（通过 Store 页索引 O(pages) 获取，避免全表逐格遍历或 A:A 展开 104 万格）
@@ -2665,6 +2801,29 @@ impl<'a> Calc<'a> {
             .unwrap_or((0, 0));
         self.bounds.insert(si, b);
         b
+    }
+
+    fn approximate_match(
+        &mut self, range: RangeKey, data: &[FValue], n: usize, stride: usize, key: &FValue, ascending: bool,
+    ) -> Option<usize> {
+        const MAX_POSITIONS: usize = 1_048_576;
+        let kind = functions::LookupKind::of(key)?;
+        let index = (range, stride, kind);
+        if let Some(pos) = self.approx_positions.get(&index) {
+            return functions::search_sorted(data, n, stride, pos.as_deref(), key, ascending);
+        }
+        let pos = kind.positions(data, n, stride);
+        let hit = functions::search_sorted(data, n, stride, pos.as_deref(), key, ascending);
+        let count = pos.as_ref().map_or(0, Vec::len);
+        if count <= MAX_POSITIONS && self.requested.is_none() {
+            if self.position_count + count > MAX_POSITIONS || self.approx_positions.len() >= 4096 {
+                self.approx_positions.clear();
+                self.position_count = 0;
+            }
+            self.position_count += count;
+            self.approx_positions.insert(index, pos);
+        }
+        hit
     }
 
     /// 精确匹配索引：key 归一化后 → 第一次出现的行下标
@@ -2701,7 +2860,7 @@ impl<'a> Calc<'a> {
             }
         }
         let rc = std::rc::Rc::new(map);
-        self.lookup_index.insert(key, rc.clone());
+        if self.requested.is_none() { self.lookup_index.insert(key, rc.clone()); }
         rc
     }
 
@@ -2734,22 +2893,12 @@ impl<'a> Calc<'a> {
             return (0, 0, std::rc::Rc::new(Vec::new()));
         }
         let key = (si, r1, c1, br, bc);
-        if let Some(v) = self.range_cache.get(&key) {
-            let rows = (key.3 - key.1 + 1) as usize;
-            let cols = (key.4 - key.2 + 1) as usize;
-            return (rows, cols, v.clone());
+        let rows = (br - r1 + 1) as usize;
+        let cols = (bc - c1 + 1) as usize;
+        match self.materialize_range(key, rows * cols) {
+            Ok(values) => (rows, cols, values),
+            Err(_) => (0, 0, Default::default()),
         }
-        let rows = (key.3 - key.1 + 1).max(0) as usize;
-        let cols = (key.4 - key.2 + 1).max(0) as usize;
-        let mut vals = Vec::with_capacity(rows * cols);
-        for r in key.1..=key.3 {
-            for c in key.2..=key.4 {
-                self.range_reads += 1;
-                vals.push(self.cell_value(si, r as u32, c as u32).scalar());
-            }
-        }
-        let rc = self.cache_put(key, std::rc::Rc::new(vals));
-        (rows, cols, rc)
     }
 
     fn drop_hidden_rows(&self, arg: Arg, r1: u32, si: usize, skip_manual: bool) -> Arg {
@@ -3094,6 +3243,11 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+fn profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SC_PROFILE").is_some())
+}
+
 pub fn prof_reset() {
     FN_PROF.with(|p| p.borrow_mut().clear());
 }
@@ -3200,6 +3354,12 @@ pub fn unsupported_reference_combo(src: &str) -> Option<&'static str> {
     None
 }
 
+/// Early file caches can contain a text error written by an older application.
+pub fn is_cached_spill_error(value: &crate::Value) -> bool {
+    matches!(value, crate::Value::Error(ErrKind::Spill))
+        || matches!(value, crate::Value::Text(text) if text.as_ref() == "#SPILL!")
+}
+
 fn array_blocked(wb: &Workbook, si: usize, r: u32, c: u32, a: &value::Array, ignore_old_spills: bool) -> bool {
     if r as u64 + a.rows as u64 > 1_048_576 || c as u64 + a.cols as u64 > 16_384 {
         return true;
@@ -3225,7 +3385,9 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                 FValue::Array(a) => {
                     // 检查溢出区域是否被别的数据占着
                     if array_blocked(wb, si, r, c, &a, false) {
-                        wb.sheets[si].spill_shapes.remove(&CellRef::new(r, c));
+                        // Track the blocked anchor even when no tail cells exist.
+                        // A later edit may clear the obstruction anywhere in its footprint.
+                        wb.sheets[si].spill_shapes.insert(CellRef::new(r, c), (0, 0));
                         if let Some(cell) = wb.sheets[si].get_mut(r, c) {
                             cell.value = from_fvalue(&FValue::Error(ErrKind::Spill));
                         }
@@ -3250,6 +3412,12 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                     }
                 }
                 other => {
+                    let anchor = CellRef::new(r, c);
+                    if matches!(other, FValue::Error(ErrKind::Spill)) {
+                        wb.sheets[si].spill_shapes.insert(anchor, (0, 0));
+                    } else {
+                        wb.sheets[si].spill_shapes.remove(&anchor);
+                    }
                     if let Some(cell) = wb.sheets[si].get_mut(r, c) {
                         cell.value = from_fvalue(&other);
                     }
@@ -3263,7 +3431,7 @@ pub fn mark_pending(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
     let mut sheets: std::collections::BTreeSet<usize> =
         seeds.iter().map(|(si, _, _)| *si).collect();
     if !deps.is_empty() {
-        for (si, _, _) in deps.closure(seeds) {
+        for (si, _, _) in deps.edit_closure(seeds) {
             sheets.insert(si);
         }
     }
@@ -3274,26 +3442,40 @@ pub fn mark_pending(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
 /// 增量重算：只算受影响的公式单元格，其余用缓存值。
 /// 返回实际重算的格子数。
 pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey]) -> usize {
+    recalc_dirty_impl(wb, deps, seeds, None).unwrap_or_default()
+}
+
+/// A cancelled worker snapshot must be discarded; a completed snapshot is ready to publish.
+pub fn recalc_dirty_cancelable(
+    wb: &mut Workbook,
+    deps: &deps::Deps,
+    seeds: &[deps::CellKey],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    recalc_dirty_impl(wb, deps, seeds, Some(cancel)).is_some()
+}
+
+fn recalc_dirty_impl(
+    wb: &mut Workbook,
+    deps: &deps::Deps,
+    seeds: &[deps::CellKey],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<usize> {
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    if cancelled() { return None; }
     if wb.calc_manual {
         mark_pending(wb, deps, seeds);
-        return 0;
+        return Some(0);
     }
-    if std::env::var("SC_PROFILE").is_ok() {
+    if profile_enabled() {
         prof_reset();
     }
     if seeds.is_empty() {
-        return 0;
+        return Some(0);
     }
-    let has_spills = wb.sheets.iter().any(|s| !s.spilled.is_empty() || !s.arrays.is_empty()
-        || s.iter().any(|(_, c)| {
-            // 错误值现在是类型；老的 Text("#SPILL!") 仍然认，兼容旧文件与旧缓存
-            c.formula.is_some()
-                && match &c.value {
-                    crate::Value::Error(ErrKind::Spill) => true,
-                    crate::Value::Text(t) => t.as_ref() == "#SPILL!",
-                    _ => false,
-                }
-        }));
+    let has_spills = wb.sheets.iter().any(|s| {
+        !s.spilled.is_empty() || !s.arrays.is_empty() || !s.spill_shapes.is_empty()
+    });
     if deps.requires_full_recalc() || has_spills {
         // 用户覆盖溢出格时保留输入，让数组按正常冲突规则处理。
         for &(si, r, c) in seeds {
@@ -3302,10 +3484,9 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
             }
         }
         let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
-        recalc_all_force(wb);
-        return count;
+        return recalc_all_force_impl(wb, cancel, None).then_some(count);
     }
-    let mut dirty = deps.closure(seeds);
+    let mut dirty = deps.edit_closure_cancelable(seeds, cancel)?;
     // 修改的公式也必须计算，不能只算它的下游。
     for &key in seeds {
         if wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
@@ -3314,7 +3495,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
         }
     }
     if dirty.is_empty() {
-        return 0;
+        return Some(0);
     }
     // 不需要拓扑排序：Calc 求值时递归拉取依赖，memo 保证每个格子只算一次
     let mut order: Vec<deps::CellKey> = dirty.iter().cloned().collect();
@@ -3333,6 +3514,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
             let mut calc = Calc::new(wb);
             calc.scope = Some(dirty.clone());
             for (si, r, c) in &order {
+                if cancelled() { return None; }
                 let v = calc.cell_value(*si, *r, *c);
                 results.push((*si, *r, *c, v));
             }
@@ -3340,8 +3522,7 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
         // 新公式可能第一次产生数组，此时尚无 spilled 标记。
         if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
             let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
-            recalc_all_force(wb);
-            return count;
+            return recalc_all_force_impl(wb, cancel, None).then_some(count);
         }
         write_back(wb, results);
         last_count = order.len();
@@ -3365,12 +3546,12 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
             break;
         }
     }
-    if std::env::var("SC_PROFILE").is_ok() {
+    if profile_enabled() {
         for (n, c, t) in prof_dump().into_iter().take(6) {
             eprintln!("  [edit] {n:<12} {c:>7} 次  {t:>7.3}s");
         }
     }
-    last_count
+    Some(last_count)
 }
 
 /// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
@@ -3411,27 +3592,41 @@ pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) 
     true
 }
 
-/// 交互式增量重算（专供 UI 编辑提交与实时协作帧调用）：
-/// - 小型工作簿（≤ 1,200 格）直接走完整同步 `recalc_dirty`；
-/// - 中大型工作簿先即时算出当前编辑公式格，再对静态依赖闭包施加严格数量与 12ms 时间预算，
-///   超出预算或含全局动态引用/数组溢出时返回 `false`，由静默后台线程异步补齐，确保 UI 永不掉帧。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractiveRecalc {
+    Complete,
+    BackgroundDirty,
+    BackgroundFull,
+}
+
 pub fn recalc_interactive(
     wb: &mut Workbook,
     deps: &deps::Deps,
     seeds: &[deps::CellKey],
     deps_ready: bool,
 ) -> bool {
+    recalc_interactive_plan(wb, deps, seeds, deps_ready) == InteractiveRecalc::Complete
+}
+
+/// Determine the smallest safe follow-up job for an interactive edit.
+pub fn recalc_interactive_plan(
+    wb: &mut Workbook,
+    deps: &deps::Deps,
+    seeds: &[deps::CellKey],
+    deps_ready: bool,
+) -> InteractiveRecalc {
+    use InteractiveRecalc::*;
     if wb.calc_manual {
         mark_pending(wb, deps, seeds);
-        return true;
+        return Complete;
     }
     if seeds.is_empty() {
-        return true;
+        return Complete;
     }
     let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
-    if total_cells <= 1_200 {
+    if deps_ready && total_cells <= 1_200 {
         recalc_dirty(wb, deps, seeds);
-        return true;
+        return Complete;
     }
     for &(si, r, c) in seeds {
         if let Some(sheet) = wb.sheets.get_mut(si) {
@@ -3439,21 +3634,18 @@ pub fn recalc_interactive(
         }
     }
     if !eval_formula_seeds_immediate(wb, seeds) {
-        return false;
+        return BackgroundFull;
     }
     let has_spills_or_arrays = wb
         .sheets
         .iter()
-        .any(|s| !s.spilled.is_empty() || !s.arrays.is_empty());
+        .any(|s| !s.spilled.is_empty() || !s.spill_shapes.is_empty() || !s.arrays.is_empty());
     if !deps_ready || deps.requires_full_recalc() || has_spills_or_arrays || wb.calc_iterate {
-        return false;
+        return BackgroundFull;
     }
-    let dirty = deps.closure(seeds);
+    let Some(dirty) = deps.edit_closure_limited(seeds, 96) else { return BackgroundDirty; };
     if dirty.is_empty() {
-        return true;
-    }
-    if dirty.len() > 96 {
-        return false;
+        return Complete;
     }
     let mut order: Vec<deps::CellKey> = dirty.iter().copied().collect();
     order.sort_unstable();
@@ -3471,7 +3663,7 @@ pub fn recalc_interactive(
             }
             let v = calc.cell_value(si, r, c);
             if matches!(v, FValue::Array(_)) {
-                return false;
+                return BackgroundFull;
             }
             results.push((si, r, c, v));
         }
@@ -3479,7 +3671,7 @@ pub fn recalc_interactive(
     if !results.is_empty() {
         write_back(wb, results);
     }
-    !timed_out
+    if timed_out { BackgroundDirty } else { Complete }
 }
 
 fn clear_spills(wb: &mut Workbook) {
@@ -3528,6 +3720,7 @@ pub fn recalc_all_force_impl(
     progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
 ) -> bool {
     use std::sync::atomic::Ordering;
+    if profile_enabled() { prof_reset(); }
     let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     // 重算不是用户编辑：记下 edited，写回后再恢复。否则未改过的表
     // （尤其是动态数组表）会被当成 dirty，保存时整表重写，_xlfn 前缀
@@ -3602,7 +3795,7 @@ pub fn recalc_all_force_impl(
         {
             let mut calc = Calc::new(wb);
             calc.volatile_values = std::mem::take(&mut volatile_values);
-            let profile = std::env::var("SC_PROFILE").is_ok();
+            let profile = profile_enabled();
             let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
             for (i, (si, r, c)) in formulas.into_iter().enumerate() {
                 if let Some(flag) = cancel {
@@ -3620,11 +3813,11 @@ pub fn recalc_all_force_impl(
                 if let Some((done, _)) = progress {
                     done.store(i, Ordering::Relaxed);
                 }
-                let t0 = std::time::Instant::now();
+                let t0 = profile.then(std::time::Instant::now);
                 let v = calc.cell_value(si, r, c);
-                if profile {
+                if let Some(start) = t0 {
                     slow.push((
-                        t0.elapsed().as_secs_f64(),
+                        start.elapsed().as_secs_f64(),
                         si,
                         r,
                         c,
@@ -3752,11 +3945,9 @@ pub fn eval_cell(wb: &Workbook, si: usize, r: u32, c: u32) -> FValue {
 
 /// 直接求一段公式文本（测试用）
 pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
-    let raw = formula.strip_prefix('=').unwrap_or(formula).to_string();
-    let expanded = crate::table::expand_structured(wb, si, &raw).unwrap_or(raw);
-    let normalized = crate::normalize_formula(&expanded);
-    let body = normalized.as_str();
-    match parse(body) {
+    let raw = formula.strip_prefix('=').unwrap_or(formula);
+    let expanded = crate::table::expand_structured(wb, si, raw);
+    match compile_at(expanded.as_deref().unwrap_or(raw), 0, 0) {
         Ok(node) => {
             let mut calc = Calc::new(wb);
             calc.eval_node(&node, si)
@@ -3767,10 +3958,9 @@ pub fn eval_formula(wb: &Workbook, si: usize, formula: &str) -> FValue {
 
 /// 与 `eval_formula` 相同，但返回区域物化实际读取的格数，供性能回归使用。
 pub fn eval_formula_reads(wb: &Workbook, si: usize, formula: &str) -> (FValue, usize) {
-    let raw = formula.strip_prefix('=').unwrap_or(formula).to_string();
-    let expanded = crate::table::expand_structured(wb, si, &raw).unwrap_or(raw);
-    let normalized = crate::normalize_formula(&expanded);
-    match parse(&normalized) {
+    let raw = formula.strip_prefix('=').unwrap_or(formula);
+    let expanded = crate::table::expand_structured(wb, si, raw);
+    match compile_at(expanded.as_deref().unwrap_or(raw), 0, 0) {
         Ok(node) => {
             let mut calc = Calc::new(wb);
             let v = calc.eval_node(&node, si);

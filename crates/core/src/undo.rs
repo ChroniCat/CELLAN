@@ -345,18 +345,29 @@ fn restored_charts(current: &[crate::charts::Chart], desired: &[crate::charts::C
 
 fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot) -> Vec<(usize, u32, u32)> {
     let Some(current) = wb.sheets.get(snap.sheet) else { return Vec::new() };
-    let mut touched: HashSet<_> = current.iter().map(|(key, _)| (snap.sheet, key.row, key.col)).collect();
-    touched.extend(snap.target.iter().map(|(key, _)| (snap.sheet, key.row, key.col)));
     let mut target = snap.target.clone();
+    let mut touched = HashSet::new();
     // Saving may have assigned a part to a previously new sheet. Undo changes
     // its content, not its identity or the current save baseline.
     target.identity = current.identity;
     target.source_part = current.source_part.clone();
     target.cleared.extend(current.cleared.iter().copied());
-    target.cleared.extend(current.iter().filter(|(key, _)| !target.contains(key.row, key.col)).map(|(key, _)| key).collect::<Vec<_>>());
+    for key in current.changed_cells(&snap.target) {
+        touched.insert((snap.sheet, key.row, key.col));
+        if !target.contains(key.row, key.col) {
+            target.cleared.insert(key);
+        }
+    }
+    touched.extend(target.changed_cells(current).map(|k| (snap.sheet, k.row, k.col)));
     target.style_edits.extend(current.style_edits.iter().copied());
-    target.style_edits.extend(current.styles.keys().copied());
-    target.style_edits.extend(target.styles.keys().copied());
+    for k in current.styles.changed_keys(&target.styles).chain(target.styles.changed_keys(&current.styles)) {
+        touched.insert((snap.sheet, k.row, k.col));
+        target.style_edits.insert(k);
+    }
+    if current.row_styles != target.row_styles || current.col_styles != target.col_styles {
+        touched.extend(target.iter().filter(|(k, _)| target.style_of(k.row, k.col) != current.style_of(k.row, k.col))
+            .map(|(k, _)| (snap.sheet, k.row, k.col)));
+    }
     target.charts = restored_charts(&current.charts, &target.charts);
     target.loading = false;
     target.edited = true;

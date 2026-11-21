@@ -160,7 +160,7 @@ pub fn insert_picture(
     let sheet_path2 = sheet_path.clone();
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
-    crate::chart_write::rewrite_with_additions_pub(path, additions, move |name, buf| {
+    crate::chart_write::rewrite_with_additions_pub(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
         if name == sheet_rels2 {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 if !xml.contains(&drawing_name) {
@@ -422,7 +422,9 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
     if !touched {
         return Ok(());
     }
-    crate::chart_write::rewrite_with_additions_pub(path, additions, move |part, buf| {
+    let targets: Vec<_> = patch.iter().map(|(name, _)| name.as_str())
+        .chain(std::iter::once("[Content_Types].xml")).collect();
+    crate::chart_write::rewrite_with_additions_pub(path, additions, &targets, |part, buf| {
         if let Some((_, body)) = patch.iter().find(|(n, _)| n == part) {
             return body.clone().into_bytes();
         }

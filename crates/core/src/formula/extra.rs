@@ -426,17 +426,10 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "MINIFS" | "MAXIFS" => r(|| {
             let target = args.first().ok_or(ErrKind::Value)?.slice();
-            let pairs: Vec<(&[FValue], String)> = (1..args.len())
-                .step_by(2)
-                .filter_map(|i| {
-                    let rg = args.get(i)?.slice();
-                    let c = args.get(i + 1)?.first().to_text().ok()?;
-                    Some((rg, c))
-                })
-                .collect();
+            let pairs = super::functions::criteria_pairs(&args[1..]);
             let mut best: Option<f64> = None;
             for (i, v) in target.iter().enumerate() {
-                if !pairs.iter().all(|(rg, c)| rg.get(i).map(|x| match_criteria(x, c)).unwrap_or(false)) {
+                if !pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
                     continue;
                 }
                 if let Ok(n) = v.to_number() {
@@ -1315,19 +1308,12 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         // ============================ 条件聚合补充
         "AVERAGEIFS" => r(|| {
             let avg = args.first().ok_or(ErrKind::Value)?.slice();
-            let pairs: Vec<(&[FValue], String)> = (1..args.len())
-                .step_by(2)
-                .filter_map(|i| {
-                    let rg = args.get(i)?.slice();
-                    let c = args.get(i + 1)?.first().to_text().ok()?;
-                    Some((rg, c))
-                })
-                .collect();
+            let pairs = super::functions::criteria_pairs(&args[1..]);
             let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0).min(avg.len());
             let mut sum = 0.0;
             let mut n = 0;
             for i in 0..len {
-                if pairs.iter().all(|(rg, c)| rg.get(i).map(|x| match_criteria(x, c)).unwrap_or(false)) {
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
                     if let Ok(v) = avg[i].to_number() {
                         sum += v;
                         n += 1;

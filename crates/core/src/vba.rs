@@ -26,7 +26,7 @@ pub fn read_vba(path: &Path) -> Option<Vec<u8>> {
 /// 保存后把宏塞回文件
 pub fn restore_vba(path: &Path, vba: &[u8]) -> Result<()> {
     // 1) 补内容类型与关系
-    crate::patch::rewrite_zip(path, |name, buf| {
+    crate::patch::rewrite_zip_where(path, |name| matches!(name, "[Content_Types].xml" | "xl/_rels/workbook.xml.rels"), |name, buf| {
         if name == "[Content_Types].xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
                 let mut x = xml;
@@ -60,7 +60,8 @@ pub fn restore_vba(path: &Path, vba: &[u8]) -> Result<()> {
 
 /// 文件里是否含宏
 pub fn has_macros(path: &Path) -> bool {
-    read_vba(path).is_some()
+    std::fs::File::open(path).ok().and_then(|f| zip::ZipArchive::new(f).ok())
+        .is_some_and(|zip| zip.index_for_name(VBA_PART).is_some())
 }
 
 #[cfg(test)]
