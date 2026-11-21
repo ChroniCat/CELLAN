@@ -98,3 +98,21 @@ fn deleting_entire_first_range_returns_ref_but_partial_ranges_shrink() {
     assert_eq!(refs::rewrite("=SUM(A1:A2)+SUM($A:$A)", &cols), "=SUM(#REF!)+SUM(#REF!)");
     assert_eq!(refs::rewrite("=SUM(A1:C2)+SUM(A:C)", &cols), "=SUM(A1:B2)+SUM(A:B)");
 }
+
+#[test]
+fn reusable_fill_translation_matches_legacy_spelling_and_range_errors() {
+    let mut fills = sheetcore::refs::FillFormulas::default();
+    let samples = [
+        "a01+$b1+c$2+$d$03", "=a01+$B1+c$2+$d$03", "=SUM(A1:B$3,LOG10(XFD1048576))", "=sum($B2:A2)*1.02",
+        "='Sheet 1'!$A1+[1]Sheet2!B$2", "=IF(A1=\"B2\",2,3)", "=A:A+3:5",
+        "=SUM(Table1[Amount])+offset_A1", "=SUM($C1:B3)+XFD1", "=1E3+B1", "=A1:BAD",
+        "=SUM( A1 : B2 )", "=A1# + @A2", "=A1:B2:C3", "=A1048577+C2", "=B2+$B$1",
+    ];
+    for f in samples {
+        for dr in [-1_048_576, -3, -1, 0, 1, 100_000, 1_048_575, i64::MAX] {
+            for dc in [-16_384, -1, 0, 5, 16_383, i64::MIN] {
+                assert_eq!(fills.translate(f, dr, dc), sheetcore::refs::translate(f, dr, dc, "S"), "{f} ({dr}, {dc})");
+            }
+        }
+    }
+}

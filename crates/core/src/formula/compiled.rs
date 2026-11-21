@@ -141,7 +141,30 @@ fn relative_key(src: &str, row: u32, col: u32) -> Option<Vec<u8>> {
     (saw_ref && !need_ref).then_some(out)
 }
 
-fn relocate(node: &mut Node, dr: i64, dc: i64) {
+/// Reuse the parsed template for relative A1 rules. Extended references and strings
+/// retain the text translator's handling of whole axes, sheet names and bounds.
+#[derive(Default)]
+pub struct RuleFormulas {
+    templates: HashMap<String, Option<Node>>,
+}
+
+impl RuleFormulas {
+    pub fn shifted(&mut self, src: &str, dr: u32, dc: u32) -> Result<Node, ErrKind> {
+        let src = src.trim_start_matches('=');
+        if !self.templates.contains_key(src) {
+            let parsed = relative_key(src, 0, 0).and_then(|_| parse(src).ok());
+            self.templates.insert(src.to_owned(), parsed);
+        }
+        if let Some(mut node) = self.templates.get(src).and_then(Option::as_ref).cloned() {
+            if relocate(&mut node, i64::from(dr), i64::from(dc)) {
+                return Ok(node);
+            }
+        }
+        parse(&crate::cf::shift_formula(src, dr, dc))
+    }
+}
+
+fn relocate(node: &mut Node, dr: i64, dc: i64) -> bool {
     let shift = |r: &mut super::RefExpr| {
         if !r.row_abs {
             r.row += dr;
@@ -149,19 +172,18 @@ fn relocate(node: &mut Node, dr: i64, dc: i64) {
         if !r.col_abs {
             r.col += dc;
         }
+        (0..1_048_576).contains(&r.row) && (0..16_384).contains(&r.col)
     };
     match node {
         Node::Ref(r) | Node::Spill(r) => shift(r),
         Node::Range(a, b) => {
-            shift(a);
-            shift(b);
+            shift(a) & shift(b)
         }
-        Node::Func(_, args) => args.iter_mut().for_each(|a| relocate(a, dr, dc)),
+        Node::Func(_, args) => args.iter_mut().fold(true, |valid, a| relocate(a, dr, dc) && valid),
         Node::Implicit(n) | Node::Percent(n) | Node::Unary(_, n) => relocate(n, dr, dc),
         Node::Binary(_, a, b) => {
-            relocate(a, dr, dc);
-            relocate(b, dr, dc);
+            relocate(a, dr, dc) & relocate(b, dr, dc)
         }
-        _ => {}
+        _ => true
     }
 }

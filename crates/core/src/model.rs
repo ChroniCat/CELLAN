@@ -100,6 +100,8 @@ pub struct Sheet {
     /// Cell storage revision represented by the current OOXML source part.
     /// Recalculation can change formula caches without marking a user edit.
     pub(crate) saved_cells: Option<crate::store::CellVersion>,
+    /// Copy-on-write value snapshot matching a verified worksheet ZIP entry.
+    pub(crate) source_cells: Option<crate::xlsx::SourceCells>,
     display_style_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: std::collections::HashSet<CellRef>,
@@ -233,6 +235,7 @@ impl Sheet {
             source_part: None,
             cells: Store::default(),
             saved_cells: None,
+            source_cells: None,
             display_style_revision: 0,
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
@@ -305,6 +308,7 @@ impl Sheet {
         self.identity = next_sheet_identity();
         self.source_part = None;
         self.saved_cells = None;
+        self.source_cells = None;
     }
 
     pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {
@@ -391,8 +395,26 @@ impl Sheet {
     }
 
     /// 按行、列升序遍历所有单元格
-    pub(crate) fn cells_mut(&mut self) -> &mut Store {
-        &mut self.cells
+    pub(crate) fn cells(&self) -> &Store { &self.cells }
+
+    pub(crate) fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.cells.formula_cells()
+    }
+
+    pub(crate) fn remap_cell_axis(&mut self, rows: bool, at: u32, map: impl Fn(u32) -> Option<u32> + Copy) {
+        self.cells.remap_axis(rows, at, map, &mut self.cleared);
+        let old_styles = self.styles.clone();
+        self.styles.remap_axis(rows, at, map);
+        self.style_edits.extend(old_styles.changed_keys(&self.styles));
+        self.style_edits.extend(self.styles.changed_keys(&old_styles));
+        // Removing an old cell on disk also removes its format. Reapply any
+        // explicitly styled blank which now occupies that same position.
+        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()).copied());
+        if !self.style_edits.is_empty() {
+            self.styles_dirty = true;
+            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        }
+        self.edited = true;
     }
 
     pub(crate) fn changed_cells(&self, other: &Sheet) -> impl Iterator<Item = CellRef> {
@@ -440,6 +462,52 @@ impl Sheet {
         snapshot.row_styles = self.row_styles.clone();
         snapshot.col_styles = self.col_styles.clone();
         snapshot
+    }
+
+    /// Only copy the fields read by the row/column reorder planner. The
+    /// worker journals its own changes separately from concurrent save receipts.
+    pub fn reorder_snapshot(&self) -> Self {
+        let mut snapshot = self.search_snapshot();
+        snapshot.identity = self.identity;
+        snapshot.merges = self.merges.clone();
+        snapshot.arrays = self.arrays.clone();
+        snapshot.spilled = self.spilled.clone();
+        snapshot
+    }
+
+    pub fn matches_reorder_source(&self, source: &Self) -> bool {
+        self.identity == source.identity && self.cell_version() == source.cell_version()
+            && self.name == source.name && self.styles == source.styles
+            && self.row_styles == source.row_styles && self.col_styles == source.col_styles
+            && self.merges == source.merges && self.arrays == source.arrays && self.spilled == source.spilled
+    }
+
+    /// Install a validated reorder and merge just the worker's new edits into
+    /// the live save journals, which may have been acknowledged in the meantime.
+    pub fn take_row_changes(&mut self, result: &mut Self) {
+        std::mem::swap(&mut self.cells, &mut result.cells);
+        std::mem::swap(&mut self.spilled, &mut result.spilled);
+        self.cleared.retain(|key| !self.cells.contains(key.row, key.col));
+        if self.cleared.is_empty() {
+            self.cleared = std::mem::take(&mut result.cleared);
+        } else {
+            self.cleared.extend(result.cleared.drain());
+        }
+        if result.styles_dirty {
+            std::mem::swap(&mut self.styles, &mut result.styles);
+            self.styles_dirty = true;
+            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+            if self.style_edits.is_empty() {
+                self.style_edits = std::mem::take(&mut result.style_edits);
+            } else {
+                self.style_edits.extend(result.style_edits.drain());
+            }
+        }
+        self.edited = true;
+    }
+
+    pub(crate) fn cf_pages(&self, rect: (u32, u32, u32, u32)) -> Vec<crate::cf::PageSlice> {
+        self.cells.cf_pages(rect)
     }
 
     pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<Vec<Cell>>)> {
@@ -517,20 +585,18 @@ impl Sheet {
 
     /// 用户改样式（标记脏，保存时回写）
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
+        let explicit = (id != 0 || self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c)).then_some(id);
+        if self.explicit_style_of(r, c) == explicit { return; }
         self.display_style_revision = self.display_style_revision.wrapping_add(1);
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
         }
         let key = CellRef::new(r, c);
-        if id == 0 {
-            if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
-                self.styles.insert(key, 0);
-            } else {
-                self.styles.remove(&key);
-            }
-        } else {
+        if let Some(id) = explicit {
             self.styles.insert(key, id);
+        } else {
+            self.styles.remove(&key);
         }
         self.style_edits.insert(key);
     }

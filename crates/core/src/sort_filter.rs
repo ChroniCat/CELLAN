@@ -19,19 +19,6 @@ fn key_of(v: &Value) -> Option<(u8, f64, String)> {
     }
 }
 
-/// 排序中的相对引用随记录移动，绝对行列保持固定。
-pub(crate) fn sorted_cell(cell: &Cell, source_row: u32, target_row: u32, sheet: &str) -> Cell {
-    let mut out = cell.clone();
-    if source_row != target_row {
-        if let Some(formula) = cell.formula.as_deref() {
-            out.formula = Some(crate::refs::translate(
-                formula, target_row as i64 - source_row as i64, 0, sheet,
-            ).into_boxed_str());
-        }
-    }
-    out
-}
-
 /// 排序不能拆开合并格或数组。动态数组目前没有独立的锚点索引，
 /// 因此也保护选区中紧邻已登记溢出尾格的公式，避免只搬走锚点。
 pub fn validate_sort_region(sheet: &Sheet, region: (u32, u32, u32, u32)) -> Result<(), String> {
@@ -42,7 +29,7 @@ pub fn validate_sort_region(sheet: &Sheet, region: (u32, u32, u32, u32)) -> Resu
     }
     let array_range = sheet.arrays.iter().any(|&(_, (a, b, c, d))| a <= r2 && c >= r1 && b <= c2 && d >= c1);
     let spill_tail = sheet.spilled.iter().any(|key| inside(key.row, key.col));
-    let spill_anchor = sheet.iter().any(|(key, cell)| inside(key.row, key.col) && cell.formula.is_some()
+    let spill_anchor = !sheet.spilled.is_empty() && sheet.formula_cells().any(|(key, _)| inside(key.row, key.col)
         && (sheet.spilled.contains(&crate::CellRef::new(key.row.saturating_add(1), key.col))
             || sheet.spilled.contains(&crate::CellRef::new(key.row, key.col.saturating_add(1)))));
     if array_range || spill_tail || spill_anchor {
@@ -53,73 +40,21 @@ pub fn validate_sort_region(sheet: &Sheet, region: (u32, u32, u32, u32)) -> Resu
 
 /// 在一个矩形区域里按 `col` 列排序（col 必须是区域内的一列）。
 /// 调用方须在完成后重建工作簿依赖图并重算，更新移动公式的缓存及跨表下游。
-pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u32, asc: bool) -> Result<(), String> {
-    if r2 <= r1 {
-        return Ok(());
-    }
-    if col < c1 || col > c2 {
-        return Err("排序列不在选区里".into());
-    }
-    validate_sort_region(sheet, (r1, c1, r2, c2))?;
-
-    // 取每行的键与整行内容
-    let mut rows: Vec<(Option<(u8, f64, String)>, u32)> = Vec::new();
-    for r in r1..=r2 {
-        let k = sheet.get(r, col).and_then(|c| key_of(&c.value));
-        rows.push((k, r));
-    }
-    rows.sort_by(|a, b| match (&a.0, &b.0) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater, // 空格永远在最后
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(x), Some(y)) => {
-            let ord = x
-                .0
-                .cmp(&y.0)
-                .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| x.2.cmp(&y.2));
-            if asc {
-                ord
-            } else {
-                ord.reverse()
-            }
-        }
-    });
-
-    // 先把原区域整块拍下来（按原始行序），再按排序结果落到新位置
-    let width = (c2 - c1 + 1) as usize;
-    let mut base: Vec<(Vec<Option<Cell>>, Vec<u16>)> = Vec::with_capacity(rows.len());
-    for r in r1..=r2 {
-        let mut line = Vec::with_capacity(width);
-        let mut st = Vec::with_capacity(width);
-        for c in c1..=c2 {
-            line.push(sheet.get(r, c).cloned());
-            st.push(sheet.style_of(r, c));
-        }
-        base.push((line, st));
-    }
-
-    for (i, (_, src)) in rows.iter().enumerate() {
-        let dst = r1 + i as u32;
-        let (line, st) = &base[(*src - r1) as usize];
-        for (j, c) in (c1..=c2).enumerate() {
-            match &line[j] {
-                Some(cell) => sheet.set(dst, c, sorted_cell(cell, *src, dst, &sheet.name)),
-                None => {
-                    if sheet.get(dst, c).is_some() {
-                        sheet.set(dst, c, Cell::default());
-                    }
-                }
-            }
-            sheet.set_style(dst, c, st[j]);
-        }
-    }
+pub fn sort_range(
+    sheet: &mut Sheet,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    col: u32,
+    asc: bool,
+) -> Result<(), String> {
+    let changes = plan_sort_axis(sheet, 0, (r1, c1, r2, c2), col, asc, false)?;
+    changes.apply(sheet);
     Ok(())
 }
 
-/// 按行排序：以 `row` 这一行的值为关键字，重排区域内的**列**（Excel 的「按行排序」）。
-///
-/// 与按列排序对称：调用方负责决定 `row` 落在数据行还是表头行。
+/// 按行排序，以 `row` 为关键字重排区域内的列。
 pub fn sort_range_by_row(
     sheet: &mut Sheet,
     r1: u32,
@@ -129,74 +64,55 @@ pub fn sort_range_by_row(
     row: u32,
     asc: bool,
 ) -> Result<(), String> {
-    if c2 <= c1 {
-        return Ok(());
-    }
-    if row < r1 || row > r2 {
-        return Err("排序关键字行不在选区里".into());
-    }
-    validate_sort_region(sheet, (r1, c1, r2, c2))?;
+    let changes = plan_sort_axis(sheet, 0, (r1, c1, r2, c2), row, asc, true)?;
+    changes.apply(sheet);
+    Ok(())
+}
 
-    let mut cols: Vec<(Option<(u8, f64, String)>, u32)> = Vec::new();
-    for c in c1..=c2 {
-        let k = sheet.get(row, c).and_then(|x| key_of(&x.value));
-        cols.push((k, c));
+pub fn plan_sort_axis(
+    sheet: &Sheet,
+    sheet_idx: usize,
+    region: (u32, u32, u32, u32),
+    key: u32,
+    asc: bool,
+    horizontal: bool,
+) -> Result<crate::data_tools::RowChanges, String> {
+    let (r1, c1, r2, c2) = region;
+    let (first, last, lo, hi) = if horizontal { (c1, c2, r1, r2) } else { (r1, r2, c1, c2) };
+    if last <= first {
+        return Ok(Default::default());
     }
-    cols.sort_by(|a, b| match (&a.0, &b.0) {
+    if !(lo..=hi).contains(&key) {
+        return Err(if horizontal {
+            "排序关键字行不在选区里"
+        } else {
+            "排序列不在选区里"
+        }
+        .into());
+    }
+    validate_sort_region(sheet, region)?;
+    let mut lines: Vec<_> = (first..=last)
+        .map(|line| {
+            let (r, c) = if horizontal { (key, line) } else { (line, key) };
+            (sheet.get(r, c).and_then(|cell| key_of(&cell.value)), line)
+        })
+        .collect();
+    lines.sort_by(|a, b| match (&a.0, &b.0) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
         (Some(x), Some(y)) => {
-            let ord = x
-                .0
-                .cmp(&y.0)
-                .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| x.2.cmp(&y.2));
+            let ord =
+                x.0.cmp(&y.0)
+                    .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| x.2.cmp(&y.2));
             if asc { ord } else { ord.reverse() }
         }
     });
-
-    let height = (r2 - r1 + 1) as usize;
-    let mut base: Vec<(Vec<Option<Cell>>, Vec<u16>)> = Vec::with_capacity(height);
-    for c in c1..=c2 {
-        let mut col = Vec::with_capacity(height);
-        let mut st = Vec::with_capacity(height);
-        for r in r1..=r2 {
-            col.push(sheet.get(r, c).cloned());
-            st.push(sheet.style_of(r, c));
-        }
-        base.push((col, st));
-    }
-
-    for (i, (_, src)) in cols.iter().enumerate() {
-        let dst = c1 + i as u32;
-        let (col, st) = &base[(*src - c1) as usize];
-        for (j, r) in (r1..=r2).enumerate() {
-            match &col[j] {
-                Some(cell) => {
-                    let mut out = cell.clone();
-                    if *src != dst {
-                        if let Some(f) = cell.formula.as_deref() {
-                            out.formula = Some(crate::refs::translate(
-                                f,
-                                0,
-                                dst as i64 - *src as i64,
-                                &sheet.name,
-                            ).into_boxed_str());
-                        }
-                    }
-                    sheet.set(r, dst, out);
-                }
-                None => {
-                    if sheet.get(r, dst).is_some() {
-                        sheet.set(r, dst, Cell::default());
-                    }
-                }
-            }
-            sheet.set_style(r, dst, st[j]);
-        }
-    }
-    Ok(())
+    let order: Vec<_> = lines.into_iter().map(|(_, line)| line).collect();
+    Ok(crate::data_tools::reorder_lines(
+        sheet, sheet_idx, region, &order, horizontal, false,
+    ))
 }
 
 /// 区域第一列是不是表头列：整列都是非空文本，且右侧出现过数字（按行排序时跳过它）
@@ -213,7 +129,7 @@ pub fn has_header_col(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool
     if !all_text {
         return false;
     }
-    (c1 + 1..=c2).any(|c| (r1..=r2).any(|r| matches!(sheet.get(r, c).map(|x| &x.value), Some(Value::Number(_)))))
+    has_numeric(sheet, (r1, c1 + 1, r2, c2))
 }
 
 /// 带表头列判断的按行排序
@@ -245,7 +161,19 @@ pub fn has_header(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
     if !all_text {
         return false;
     }
-    (r1 + 1..=r2).any(|r| (c1..=c2).any(|c| matches!(sheet.get(r, c).map(|x| &x.value), Some(Value::Number(_)))))
+    has_numeric(sheet, (r1 + 1, c1, r2, c2))
+}
+
+fn has_numeric(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> bool {
+    let (r1, c1, r2, c2) = rect;
+    if r2 < r1 || c2 < c1 { return false; }
+    let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+    if area > 4096 && area > sheet.len() as u64 * 4 {
+        sheet.stored_cells().any(|(k, cell)| (r1..=r2).contains(&k.row)
+            && (c1..=c2).contains(&k.col) && matches!(cell.value, Value::Number(_)))
+    } else {
+        (r1..=r2).any(|r| (c1..=c2).any(|c| matches!(sheet.get(r, c).map(|x| &x.value), Some(Value::Number(_)))))
+    }
 }
 
 /// 带表头判断的排序：有表头就只排序下面的数据行

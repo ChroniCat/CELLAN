@@ -323,6 +323,7 @@ impl Overlay {
 /// 每个色阶/数据条块的取值范围（按需计算并缓存）
 #[derive(Clone, Debug, Default)]
 pub struct CfStats {
+    inputs: Option<Vec<BlockInputs>>,
     /// block 序号 → (min, max)
     pub ranges: HashMap<usize, (f64, f64)>,
     /// 平均/计数用于 avg、top 规则
@@ -334,7 +335,76 @@ pub struct CfStats {
     pub dup_counts: HashMap<usize, HashMap<String, usize>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PageSlice {
+    pub page: u32,
+    pub col: u32,
+    pub start: usize,
+    pub end: usize,
+    pub cells: std::sync::Arc<Vec<crate::Cell>>,
+}
+
+impl PartialEq for PageSlice {
+    fn eq(&self, other: &Self) -> bool {
+        (self.page, self.col, self.start, self.end) == (other.page, other.col, other.start, other.end)
+            && (std::sync::Arc::ptr_eq(&self.cells, &other.cells)
+                || self.cells[self.start..self.end] == other.cells[other.start..other.end])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BlockInputs {
+    numeric: bool,
+    sort: bool,
+    duplicates: bool,
+    ranges: Vec<((u32, u32, u32, u32), Vec<PageSlice>)>,
+}
+
+fn requirements(block: &CfBlock) -> (bool, bool, bool) {
+    let mut numeric = false;
+    let mut sort = false;
+    let mut duplicates = false;
+    for rule in &block.rules {
+        match &rule.kind {
+            CfKind::Top { .. } => { numeric = true; sort = true; }
+            CfKind::Avg { .. } => numeric = true,
+            CfKind::Scale { points } => {
+                numeric = true;
+                sort |= points.iter().any(|(t, _)| t.kind == CfvoKind::Percentile);
+            }
+            CfKind::IconSet { thresholds, .. } => {
+                numeric = true;
+                sort |= thresholds.iter().any(|t| t.kind == CfvoKind::Percentile);
+            }
+            CfKind::Bar { min, max, .. } => {
+                numeric = true;
+                sort |= min.kind == CfvoKind::Percentile || max.kind == CfvoKind::Percentile;
+            }
+            CfKind::Dup { .. } => duplicates = true,
+            _ => {}
+        }
+    }
+    (numeric, sort, duplicates)
+}
+
+/// Compare only the stored pages touched by statistical rules. Most edits can be
+/// dismissed by identity; a change outside a partial page compares at most 256 cells.
+pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
+    let inputs: Vec<_> = sheet.cf.blocks.iter().map(|block| {
+        let (numeric, sort, duplicates) = requirements(block);
+        let ranges = if numeric || duplicates {
+            block.ranges.iter().map(|&rect| (rect, sheet.cf_pages(rect))).collect()
+        } else { Vec::new() };
+        BlockInputs { numeric, sort, duplicates, ranges }
+    }).collect();
+    if into.inputs.as_ref() == Some(&inputs) { return false; }
+    compute_stats(&sheet.cf, sheet, into);
+    into.inputs = Some(inputs);
+    true
+}
+
 pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
+    into.inputs = None;
     into.ranges.clear();
     into.averages.clear();
     into.counts.clear();
@@ -346,29 +416,7 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
     let bounds = sheet.used_bounds();
     let sheet_len = sheet.len();
     for (i, block) in cf.blocks.iter().enumerate() {
-        let needs_num = block.rules.iter().any(|r| {
-            matches!(
-                r.kind,
-                CfKind::Top { .. }
-                    | CfKind::Avg { .. }
-                    | CfKind::Scale { .. }
-                    | CfKind::IconSet { .. }
-                    | CfKind::Bar { .. }
-            )
-        });
-        let needs_sort = block.rules.iter().any(|r| {
-            matches!(
-                r.kind,
-                CfKind::Top { .. }
-                    | CfKind::Scale { .. }
-                    | CfKind::IconSet { .. }
-                    | CfKind::Bar { .. }
-            )
-        });
-        let needs_dup = block
-            .rules
-            .iter()
-            .any(|r| matches!(r.kind, CfKind::Dup { .. }));
+        let (needs_num, needs_sort, needs_dup) = requirements(block);
         if !needs_num && !needs_dup {
             continue;
         }
@@ -410,7 +458,7 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
                         max = max.max(*v);
                         sum += *v;
                         n += 1;
-                        if needs_sort && vals.len() < 200_000 {
+                        if needs_sort {
                             vals.push(*v);
                         }
                     }
@@ -1003,6 +1051,28 @@ mod tests {
         compute_stats(&cf, &sh, &mut st);
         assert_eq!(overlay_at(&cf, &st, &sh, 0, 0, |_, _, _| false).fill, Some([255, 235, 156]));
         assert!(overlay_at(&cf, &st, &sh, 1, 0, |_, _, _| false).fill.is_none());
+    }
+
+    #[test]
+    fn stats_reuse_pages_outside_rule_and_rebuild_for_changed_input_or_rule() {
+        let mut sh = sheet_with(&[(10, 0, 5.0), (20, 0, 25.0)]);
+        sh.cf.blocks.push(CfBlock {
+            ranges: vec![(10, 0, 20, 0)],
+            rules: vec![CfRule { kind: CfKind::Bar { color: [0; 3], min: Cfvo::min(), max: Cfvo::max() }, stop: false, priority: 1 }],
+        });
+        let mut st = CfStats::default();
+        assert!(refresh_stats(&sh, &mut st));
+        assert!(st.sorted.is_empty());
+        for (row, col) in [(11, 1), (4, 0), (1000, 0)] {
+            sh.set(row, col, Cell { value: Value::Number(99.0), formula: None });
+            assert!(!refresh_stats(&sh, &mut st));
+        }
+        sh.set(15, 0, Cell { value: Value::Number(80.0), formula: None });
+        assert!(refresh_stats(&sh, &mut st));
+        assert_eq!(st.ranges[&0], (5.0, 80.0));
+        sh.cf.blocks[0].rules[0].kind = CfKind::Top { top: true, n: 1, percent: false, dxf: 0 };
+        assert!(refresh_stats(&sh, &mut st));
+        assert_eq!(st.sorted[&0], [5.0, 25.0, 80.0]);
     }
 
     #[test]

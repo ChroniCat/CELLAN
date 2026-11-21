@@ -367,12 +367,15 @@ pub enum Msg {
         #[serde(default)]
         delta_sync: bool,
         #[serde(default)]
+        batch_ops: bool,
+        #[serde(default)]
         clock: u64,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
     SnapshotChunk { ops: Vec<Op>, #[serde(default)] last: bool },
     Op(Op),
+    Ops { ops: Vec<Op> },
     CursorMsg(Cursor),
     /// 格式变更（一批格子 + 每个格子的样式内容）
     StyleOp {
@@ -452,6 +455,7 @@ pub const MAX_SHEET_INDEX: usize = 4_096;
 pub const MAX_LOGICAL_TS: u64 = 1 << 48;
 /// 单条报文里批量条目（样式、快照、回滚）的上限
 pub const MAX_BATCH_ITEMS: usize = 2_000_000;
+pub const LIVE_OP_BATCH: usize = 512;
 /// 名字、文档名等短文本的长度上限（字节）
 pub const MAX_SHORT_TEXT: usize = 256;
 
@@ -494,6 +498,7 @@ impl Msg {
                 ops.len() <= MAX_BATCH_ITEMS && ops.iter().all(Op::is_valid)
             }
             Msg::Op(op) => op.is_valid(),
+            Msg::Ops { ops } => !ops.is_empty() && ops.len() <= LIVE_OP_BATCH && ops.iter().all(Op::is_valid),
             Msg::CursorMsg(c) => cell_in_bounds(c.sheet, c.row, c.col) && c.name.len() <= MAX_SHORT_TEXT,
             Msg::StyleOp { sheet, ts, items, .. } => {
                 *sheet < MAX_SHEET_INDEX

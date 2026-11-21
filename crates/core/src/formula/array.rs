@@ -67,60 +67,36 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
             let by_col = args.get(1).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
             let once = args.get(2).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
-            let get = |i: usize, j: usize| data[i * cols + j].clone();
-
-            if by_col {
-                let mut keep: Vec<usize> = Vec::new();
-                for c in 0..cols {
-                    let mut dup = false;
-                    for &k in &keep {
-                        let same = (0..rows).all(|i| get(i, c).display() == get(i, k).display());
-                        if same {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if !dup {
-                        let count = (0..cols)
-                            .filter(|&k2| (0..rows).all(|i| get(i, k2).display() == get(i, c).display()))
-                            .count();
-                        if !once || count == 1 {
-                            keep.push(c);
-                        }
-                    }
+            let (lines, width) = if by_col { (cols, rows) } else { (rows, cols) };
+            let index = |line: usize, offset: usize| {
+                if by_col { offset * cols + line } else { line * cols + offset }
+            };
+            // Preserve the first original row/column (including its value types).
+            // A vector key keeps boundaries distinct even when a cell contains separators.
+            let mut first = std::collections::HashMap::new();
+            let mut keep = Vec::with_capacity(lines);
+            let mut repeated = vec![false; if once { lines } else { 0 }];
+            for line in 0..lines {
+                let key: Vec<_> = (0..width).map(|offset| data[index(line, offset)].display()).collect();
+                let first_line = *first.entry(key).or_insert(line);
+                if first_line == line {
+                    keep.push(line);
+                } else if once {
+                    repeated[first_line] = true;
                 }
-                let mut out = Vec::new();
-                for i in 0..rows {
-                    for &c in &keep {
-                        out.push(get(i, c));
-                    }
+            }
+            if once {
+                keep.retain(|&line| !repeated[line]);
+            }
+            let mut out = Vec::with_capacity(keep.len() * width);
+            if by_col {
+                for row in 0..rows {
+                    out.extend(keep.iter().map(|&col| data[row * cols + col].clone()));
                 }
                 Ok(arr(Array::new(rows, keep.len(), out)))
             } else {
-                let mut keep: Vec<usize> = Vec::new();
-                for row in 0..rows {
-                    let mut dup = false;
-                    for &k in &keep {
-                        let same = (0..cols).all(|j| get(row, j).display() == get(k, j).display());
-                        if same {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if !dup {
-                        let count = (0..rows)
-                            .filter(|&r2| (0..cols).all(|j| get(r2, j).display() == get(row, j).display()))
-                            .count();
-                        if !once || count == 1 {
-                            keep.push(row);
-                        }
-                    }
-                }
-                let mut out = Vec::new();
                 for &row in &keep {
-                    for j in 0..cols {
-                        out.push(get(row, j));
-                    }
+                    out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
                 }
                 Ok(arr(Array::new(keep.len(), cols, out)))
             }

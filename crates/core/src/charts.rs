@@ -881,10 +881,14 @@ pub fn parse_chart(xml: &str) -> Option<Chart> {
 impl Chart {
     /// 插删行列后改写系列引用
     pub fn rewrite_refs(&mut self, shift: &crate::refs::Shift) -> bool {
+        self.rewrite_mapped_refs(&crate::refs::MappedShift { shift, insertions: &[] })
+    }
+
+    pub(crate) fn rewrite_mapped_refs(&mut self, shift: &crate::refs::MappedShift) -> bool {
         let mut changed = false;
         for s in self.series.iter_mut() {
             for r in [&mut s.name_ref, &mut s.cat_ref, &mut s.val_ref] {
-                let nf = crate::refs::rewrite(r, shift);
+                let nf = crate::refs::rewrite_mapped(r, shift);
                 if nf != *r {
                     self.ref_fixes.push((r.clone(), nf.clone()));
                     *r = nf;

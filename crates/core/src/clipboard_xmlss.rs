@@ -11,6 +11,9 @@
 //!
 //! 所以"带公式的粘贴"不需要解 OLE/BIFF：把 R1C1 折成 A1 就够了。
 
+mod columns;
+pub use columns::sparse_column_xmlss;
+
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -100,6 +103,56 @@ impl Block {
     }
 }
 
+/// Bound allocations by the actual addressed rectangle. Rejecting an oversized
+/// block must never change an ss:Index into a different address.
+#[derive(Default)]
+struct DenseExtent {
+    rows: usize,
+    cols: usize,
+}
+
+impl DenseExtent {
+    fn include(&mut self, rows: usize, cols: usize) -> Option<()> {
+        self.rows = self.rows.max(rows);
+        self.cols = self.cols.max(cols);
+        (self.rows <= 1_048_576 && self.cols <= 16_384
+            && self.rows.max(1).checked_mul(self.cols.max(1))? <= crate::undo::MAX_DENSE_RECT_KEYS).then_some(())
+    }
+}
+
+fn index_attr(e: &quick_xml::events::BytesStart<'_>, key: &str, default: usize) -> Option<usize> {
+    match attr(e, key) { Some(s) => s.parse().ok(), None => Some(default) }
+}
+
+fn prepare_row(
+    e: &quick_xml::events::BytesStart<'_>, block: &mut Block, extent: &mut DenseExtent,
+) -> Option<(usize, usize)> {
+    let row = index_attr(e, "Index", block.rows.len() + 1)?.checked_sub(1)?;
+    let span = index_attr(e, "Span", 0)?.checked_add(1)?;
+    if row < block.rows.len() { return None; }
+    extent.include(row.checked_add(span)?, 1)?;
+    block.rows.resize_with(row, Vec::new);
+    Some((row, span))
+}
+
+fn prepare_cell(
+    e: &quick_xml::events::BytesStart<'_>, row: &mut Vec<Cell>, r: usize, next_col: &mut usize,
+    extent: &mut DenseExtent, styles: &std::collections::HashMap<String, Style>,
+) -> Option<Cell> {
+    let col = index_attr(e, "Index", *next_col + 1)?.checked_sub(1)?;
+    let across = index_attr(e, "MergeAcross", 0)?.checked_add(1)?;
+    let down = index_attr(e, "MergeDown", 0)?.checked_add(1)?;
+    if col < *next_col { return None; }
+    extent.include(r.checked_add(down)?, col.checked_add(across)?)?;
+    row.resize_with(row.len() + (col - *next_col), Cell::default);
+    *next_col = col + across;
+    Some(Cell {
+        style: attr(e, "StyleID").and_then(|id| styles.get(&id).cloned()).unwrap_or_default(),
+        formula: attr(e, "Formula").map(|f| r1c1_to_a1(&f, r as u32, col as u32)),
+        colspan: across as u32, rowspan: down as u32, ..Default::default()
+    })
+}
+
 /// 解析整份 XML Spreadsheet；不是这个格式（没有 Workbook/Worksheet）就返回空
 pub fn parse(xml: &str) -> Block {
     let mut styles: std::collections::HashMap<String, Style> = std::collections::HashMap::new();
@@ -117,8 +170,8 @@ pub fn parse(xml: &str) -> Block {
     let mut data_type = Kind::Number;
     let mut in_data = false;
     let mut text = String::new();
-    let mut skip_sheet = false;
-    let mut row_index: usize = 0;
+    let mut extent = DenseExtent::default();
+    let (mut row_index, mut row_span, mut next_col) = (0, 1, 0);
 
     loop {
         match r.read_event() {
@@ -167,50 +220,18 @@ pub fn parse(xml: &str) -> Block {
                             _ => 0,
                         };
                     }
-                    "Worksheet" => {
-                        // 只取第一张表（Excel 复制区域只给一张）
-                        skip_sheet = !block.is_empty();
+                    "Table" => {
+                        let dims = index_attr(&e, "ExpandedRowCount", 0).zip(index_attr(&e, "ExpandedColumnCount", 0));
+                        if dims.and_then(|(rows, cols)| extent.include(rows, cols)).is_none() { return Block::default(); }
                     }
                     "Row" => {
-                        if let Some(i) = attr(&e, "Index").and_then(|s| s.parse::<usize>().ok()) {
-                            // Index 是 1 起；补空行（限制稠密空行膨胀上限，防止 ss:Index="1048576" 导致 OOM）
-                            let capped = i.min(row_index.saturating_add(10_000)).min(200_000);
-                            while row_index + 1 < capped {
-                                block.rows.push(Vec::new());
-                                row_index += 1;
-                            }
-                        }
-                        row = Vec::new();
+                        let Some((r, span)) = prepare_row(&e, &mut block, &mut extent) else { return Block::default() };
+                        (row_index, row_span, next_col) = (r, span, 0);
+                        row.clear();
                     }
                     "Cell" => {
-                        skip_sheet = false;
-                        // ss:Index 是 1 起的列号，中间缺的格要补空（限制上限 <= 16384 列）
-                        if let Some(idx) = attr(&e, "Index").and_then(|s| s.parse::<usize>().ok()) {
-                            let capped = idx.min(16_384);
-                            while row.len() + 1 < capped {
-                                row.push(Cell::default());
-                            }
-                        }
-                        let mut c = Cell::default();
-                        if let Some(id) = attr(&e, "StyleID") {
-                            if let Some(s) = styles.get(&id) {
-                                c.style = s.clone();
-                            }
-                        }
-                        c.colspan = attr(&e, "MergeAcross")
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .map(|n| n + 1)
-                            .unwrap_or(1);
-                        c.rowspan = attr(&e, "MergeDown")
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .map(|n| n + 1)
-                            .unwrap_or(1);
-                        if let Some(f) = attr(&e, "Formula") {
-                            let (r0, c0) = (row_index as u32, row.len() as u32);
-                            let a1 = r1c1_to_a1(&f, r0, c0);
-                            c.formula = Some(a1);
-                        }
-                        cur = Some(c);
+                        cur = prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &styles);
+                        if cur.is_none() { return Block::default(); }
                     }
                     "Data" => {
                         data_type = match attr(&e, "Type").as_deref() {
@@ -266,27 +287,12 @@ pub fn parse(xml: &str) -> Block {
                         _ => {}
                     }
                 } else if n == "Cell" {
-                    // 空格子（有样式、无 Data）
-                    if let Some(idx) = attr(&e, "Index").and_then(|s| s.parse::<usize>().ok()) {
-                        while row.len() + 1 < idx {
-                            row.push(Cell::default());
-                        }
-                    }
-                    let mut c = Cell::default();
-                    if let Some(id) = attr(&e, "StyleID") {
-                        if let Some(s) = styles.get(&id) {
-                            c.style = s.clone();
-                        }
-                    }
-                    c.colspan = attr(&e, "MergeAcross")
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .map(|n| n + 1)
-                        .unwrap_or(1);
-                    c.rowspan = attr(&e, "MergeDown")
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .map(|n| n + 1)
-                        .unwrap_or(1);
-                    row.push(c);
+                    let Some(cell) = prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &styles)
+                    else { return Block::default() };
+                    row.push(cell);
+                } else if n == "Row" {
+                    let Some((r, span)) = prepare_row(&e, &mut block, &mut extent) else { return Block::default() };
+                    block.rows.resize_with(r + span, Vec::new);
                 }
             }
             Ok(Event::GeneralRef(r)) => {
@@ -331,18 +337,16 @@ pub fn parse(xml: &str) -> Block {
                         }
                     }
                     "Row" => {
-                        if !skip_sheet {
-                            block.rows.push(std::mem::take(&mut row));
-                            row_index += 1;
-                        }
+                        block.rows.push(std::mem::take(&mut row));
+                        block.rows.resize_with(row_index + row_span, Vec::new);
                     }
-                    "Worksheet" => skip_sheet = false,
+                    "Worksheet" => break,
                     "Workbook" => in_workbook = false,
                     _ => {}
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(_) => return Block::default(),
             _ => {}
         }
     }
@@ -681,8 +685,8 @@ mod tests {
         assert_eq!(b.rows[0][0].rowspan, 2);
         assert_eq!(b.rows[0][0].kind, Kind::Text);
         assert_eq!(b.rows[0][0].text, "合计");
-        assert_eq!(b.rows[0].len(), 4, "ss:Index=4 要补两格空");
-        assert_eq!(b.rows[0][3].kind, Kind::Bool);
+        assert_eq!(b.rows[0].len(), 3, "合并格占两列，D 列之前只补 C 列空格");
+        assert_eq!(b.rows[0][2].kind, Kind::Bool);
     }
 
     #[test]
@@ -692,6 +696,22 @@ mod tests {
 </Table></Worksheet></Workbook>"##;
         let b = parse(xml);
         assert_eq!(b.rows[0][0].text, "第一行\n第二行 & 结束");
+    }
+
+    #[test]
+    fn sparse_indices_are_exact_or_the_whole_block_is_rejected() {
+        let xml = |table: &str, rows: &str| format!(
+            "<Workbook xmlns:ss='urn:schemas-microsoft-com:office:spreadsheet'><Worksheet><Table {table}>{rows}</Table></Worksheet></Workbook>"
+        );
+        let row = "<Row ss:Index='20001'><Cell ss:Index='3' ss:Formula='=RC[-1]'/></Row>";
+        let block = parse(&xml("", row));
+        assert_eq!(block.rows.len(), 20001);
+        assert_eq!(block.rows[20000][2].formula.as_deref(), Some("=B20001"));
+        assert!(parse(&xml("ss:ExpandedRowCount='1048576' ss:ExpandedColumnCount='3'", row)).is_empty());
+        for bad in ["<Row ss:Index='1048576'><Cell/></Row>", "<Row><Cell ss:Index='16385'/></Row>",
+            "<Row><Cell ss:MergeDown='4294967295'/></Row>", "<Row ss:Index='0'/>"] {
+            assert!(parse(&xml("", &format!("<Row><Cell/></Row>{bad}"))).is_empty(), "{bad}");
+        }
     }
 
     #[test]

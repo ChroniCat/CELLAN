@@ -6,6 +6,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod files;
 mod document_tasks;
+mod column_clip;
+mod data_reorder;
 mod validation;
 mod find_navigation;
 mod filter_choices;
@@ -119,6 +121,7 @@ fn replace_ignore_case(hay: &str, needle: &str, repl: &str, case_sensitive: bool
 /// 内部剪贴板：整块格子 + 样式号
 #[derive(Clone)]
 struct Clip {
+    deferred: Option<std::sync::Arc<office_clipboard::delayed::Range>>,
     sheet: usize,
     rect: (u32, u32, u32, u32),
     cells: Vec<Vec<(sheetcore::model::Cell, u16)>>,
@@ -130,6 +133,19 @@ struct Clip {
 }
 
 impl Clip {
+    fn cells(&self) -> &[Vec<(Cell, u16)>] {
+        self.deferred.as_ref().map_or(self.cells.as_slice(), |s| s.cells())
+    }
+
+    fn live_sheet_index(&self, wb: &Workbook) -> Option<usize> {
+        if let Some(range) = &self.deferred {
+            let id = range.book().sheet(0).identity;
+            wb.sheets.iter().position(|sheet| sheet.identity == id)
+        } else {
+            wb.sheets.get(self.sheet).map(|_| self.sheet)
+        }
+    }
+
     fn source_row(&self, index: usize) -> u32 {
         self.source_rows.as_ref().map_or_else(|| self.rect.0 + index as u32, |rows| rows[index])
     }
@@ -148,16 +164,19 @@ struct SysClip {
 #[cfg(test)]
 std::thread_local! {
     /// 单测专用剪贴板：按线程隔离，避免并行用例互相污染。
+    static TEST_CLIP_GEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_CLIP: std::cell::RefCell<Option<SysClip>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_test_clipboard(text: &str) {
+    TEST_CLIP_GEN.with(|seq| seq.set(seq.get().wrapping_add(1)));
     TEST_CLIP.with(|c| *c.borrow_mut() = Some(SysClip { text: text.to_string() }));
 }
 
 #[cfg(test)]
 pub(crate) fn clear_test_clipboard() {
+    TEST_CLIP_GEN.with(|seq| seq.set(seq.get().wrapping_add(1)));
     TEST_CLIP.with(|c| *c.borrow_mut() = None);
 }
 
@@ -196,14 +215,15 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-#[derive(Clone)]
 struct DedupDlg {
+    owner: (u64, u64),
     rect: (u32, u32, u32, u32),
     header: bool,
     /// 与区域列一一对应
     cols: Vec<bool>,
     /// 缓存去重预览计数 ((header, cols, doc_gen), dup_count)，避免对话框打开期间每帧重复全表扫描
-    cached_dup: Option<((bool, Vec<bool>, u64), usize)>,
+    cached_dup: Option<((bool, Vec<bool>, u64, u64), usize)>,
+    preview: Option<std::sync::mpsc::Receiver<((bool, Vec<bool>, u64, u64), usize)>>,
 }
 
 #[derive(Clone)]
@@ -1667,6 +1687,7 @@ struct SheetApp {
     a11y_step: Option<A11yStep>,
     /// 条件格式统计缓存（按 doc_gen 失效）
     cf_stats: sheetcore::cf::CfStats,
+    paint_merges: sheetcore::merges::MergeIndex,
     cf_stats_gen: u64,
     /// 条件格式对话框输入
     cf_v1: String,
@@ -1847,6 +1868,7 @@ struct SheetApp {
     painter_double: bool,
     /// 最近一次 app 复制时写入系统剪贴板的文本；用于识别之后的外部复制
     clip_stamp: Option<String>,
+    clipboard_owner: Option<office_clipboard::delayed::Owner>,
     /// 合并会丢内容时的二次确认；再次点同一文档/表/矩形且内容未变才执行
     merge_pending: Option<MergePending>,
     /// 格式对话框里的“合并/取消合并”：确定后才执行，取消不改
@@ -3006,6 +3028,7 @@ impl SheetApp {
             dump_accum: String::new(),
             a11y_step: None,
             cf_stats: sheetcore::cf::CfStats::default(),
+            paint_merges: Default::default(),
             cf_stats_gen: u64::MAX,
             cf_v1: "100".into(),
             cf_v2: "0".into(),
@@ -3153,6 +3176,7 @@ impl SheetApp {
             format_painter: None,
             painter_double: false,
             clip_stamp: None,
+            clipboard_owner: None,
             merge_pending: None,
             fmt_merge_pending: None,
             color_popup: None,
@@ -5680,8 +5704,8 @@ impl SheetApp {
         let headless_exit = ["SC_SHOT", "SC_DUMP", "SC_EXIT_AFTER_SHOT", "SC_FRAME_EXIT",
             "SC_SAVE_EXIT", "SC_RECALC_EXIT", "SC_NO_CLOSE_PROMPT", "SC_LOCK", "SC_LOCK_TRY"]
             .iter().any(|key| std::env::var_os(key).is_some());
-        let dirty = self.has_open_workbook && (self.wb.dirty || self.tabs.iter().any(
-            |t| matches!(t, TabSlot::Parked(doc) if doc.wb.dirty)));
+        let dirty = self.has_open_workbook && (self.wb.dirty || self.tasks.reorder.is_some() || self.tabs.iter().any(
+            |t| matches!(t, TabSlot::Parked(doc) if doc.wb.dirty || doc.tasks.reorder.is_some())));
         if !headless_exit && (dirty || self.has_pending_save() || self.tab_close_confirm.is_some()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.tab_close_confirm.is_some() {
@@ -5766,10 +5790,10 @@ impl SheetApp {
                 self.save_all_before_exit = false;
                 return;
             }
-            let owner = if self.wb.dirty {
+            let owner = if self.wb.dirty || self.tasks.reorder.is_some() {
                 Some(self.active_tab)
             } else {
-                self.tabs.iter().position(|tab| matches!(tab, TabSlot::Parked(doc) if doc.wb.dirty))
+                self.tabs.iter().position(|tab| matches!(tab, TabSlot::Parked(doc) if doc.wb.dirty || doc.tasks.reorder.is_some()))
             };
             if let Some(owner) = owner {
                 self.save_closing_document(owner, false);
@@ -5799,6 +5823,11 @@ impl SheetApp {
             TabSlot::Active => (&self.wb, &self.tasks, self.doc_uid),
             TabSlot::Parked(doc) => (&doc.wb, &doc.tasks, doc.doc_uid),
         };
+        if tasks.reorder.is_some() {
+            if idx != self.active_tab { self.switch_tab(idx); }
+            self.poll_reorder();
+            return;
+        }
         if tasks.saving.is_some() { return; }
         if !wb.dirty {
             self.pending_tab_closes.retain(|&pending| pending != uid);
@@ -6374,7 +6403,7 @@ impl SheetApp {
                     }
                     cells.push(row);
                 }
-                self.clip = Some(Clip {
+                self.clip = Some(Clip { deferred: None,
                     sheet: self.sheet_idx,
                     source_rows: None,
                     rect: (0, 0, 1, 1),
@@ -6703,6 +6732,7 @@ impl SheetApp {
                 return false;
             }
         }
+        if self.locks.is_empty() { return true; }
         for (r, c) in keys {
             if let Some(holder) = self.lock_holder_on(sheet, *r, *c) {
                 self.status = format!("{holder} 正在编辑 {}，不能{what}", cell_name(*r, *c));
@@ -6840,14 +6870,22 @@ impl SheetApp {
 
     fn txn_end(&mut self, label: &str, before: Vec<sheetcore::undo::CellDelta>) {
         let deltas = sheetcore::undo::finish(before, self.wb.sheet(self.sheet_idx));
-        if deltas.is_empty() {
+        self.record_deltas(label, deltas);
+    }
+
+    fn record_deltas(&mut self, label: &str, deltas: Vec<sheetcore::undo::CellDelta>) {
+        self.record_deltas_and_merges(label, deltas, None);
+    }
+
+    fn record_deltas_and_merges(&mut self, label: &str, deltas: Vec<sheetcore::undo::CellDelta>, merges: Option<sheetcore::undo::MergeEdit>) {
+        if deltas.is_empty() && merges.is_none() {
             return;
         }
         self.record_revision(label, &deltas);
         let focus = (self.sheet_idx, self.sel.0, self.sel.1);
         self.undo.push(sheetcore::undo::Action {
             label: label.to_string(),
-            merges: None,
+            merges,
             deltas,
             focus,
             snap_before: None,
@@ -7026,8 +7064,12 @@ impl SheetApp {
     // ===== 剪贴板 =====
     /// 选区 → Excel/WPS 可粘贴的 HTML 表格（含合并、字体、填充、边框、对齐、公式）。
     fn selection_html(&self, si: usize, rect: (u32, u32, u32, u32)) -> String {
+        Self::clipboard_html(&self.wb, si, rect)
+    }
+
+    fn clipboard_html(wb: &Workbook, si: usize, rect: (u32, u32, u32, u32)) -> String {
         let (r1, c1, r2, c2) = rect;
-        let sh = self.wb.sheet(si);
+        let sh = wb.sheet(si);
         let merges: Vec<(u32, u32, u32, u32)> = sh
             .merges
             .iter()
@@ -7060,7 +7102,7 @@ impl SheetApp {
                 };
                 let cell = sh.get(r, c).cloned().unwrap_or_default();
                 let sid = sh.style_of(r, c);
-                let st = self.wb.styles.get(sid);
+                let st = wb.styles.get(sid);
                 let mut css = String::new();
                 if !st.font.is_empty() {
                     css.push_str(&format!("font-family:{};", st.font.replace('"', "")));
@@ -7104,7 +7146,7 @@ impl SheetApp {
                     _ => {}
                 }
                 if st.wrap
-                    || sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
+                    || sheetcore::style::format_value_in(wb.date_system, &cell.value, &st.format)
                         .contains('\n')
                 {
                     css.push_str("white-space:pre-wrap;");
@@ -7140,7 +7182,7 @@ impl SheetApp {
                     attrs.push_str(&format!(" x:num=\"{n}\""));
                 }
                 let text = html_escape(&sheetcore::style::format_value_in(
-                    self.wb.date_system,
+                    wb.date_system,
                     &cell.value,
                     &st.format,
                 ));
@@ -7154,23 +7196,62 @@ impl SheetApp {
 
     fn clip_copy(&mut self, cut: bool, ctx: &egui::Context) {
         let (r1, c1, r2, c2) = self.sel_rect();
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
-            self.status = "选区太大（超过 20 万格），不复制".into();
+        let rect = (r1, c1, r2, c2);
+        let full_columns = !cut && office_clipboard::delayed::is_full_columns(rect);
+        let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+        if !full_columns && area > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "选区太大（超过 50 万格），请缩小区域或使用整列复制".into();
             return;
         }
         let si = self.sheet_idx;
         // Excel 的筛选复制只带走可见行；hidden_rows 是被筛选/分级折叠掉的行，
         // hidden_rows_user 是用户手动隐藏的行，Excel 仍会复制后者。
         let filter_hidden = &self.wb.sheet(si).hidden_rows;
+        let filtered = filter_hidden.iter().any(|row| (r1..=r2).contains(row));
+        if full_columns && column_clip::intersects_array(self.wb.sheet(si), c1, c2) {
+            self.status = "整列包含数组公式或溢出区域，请选中具体数据区域后复制".into();
+            return;
+        }
+        if full_columns && self.wb.sheet(si).merges.iter().any(|&(_, left, _, right)| {
+            left <= c2 && right >= c1 && (left < c1 || right > c2)
+        }) {
+            self.status = "整列选区截断了合并单元格，请选中合并区涉及的全部列".into();
+            return;
+        }
+        if full_columns && filtered {
+            self.status = "整列包含筛选隐藏行，请选中要复制的数据区域".into();
+            return;
+        }
+        if full_columns || (area > 1_024 && !filtered
+            && std::env::var_os("SC_CLIP_LOG").is_none() && std::env::var_os("SC_CLIP_DUMP").is_none())
+        {
+            let range = std::sync::Arc::new(office_clipboard::delayed::Range::new(&self.wb, si, rect));
+            let owner = office_clipboard::delayed::Owner::publish(range.clone());
+            if full_columns && owner.is_none() {
+                self.status = "系统剪贴板正忙，请重新复制整列".into();
+                return;
+            }
+            self.clip_stamp = if owner.is_none() {
+                let plain = range.text();
+                ctx.copy_text(plain.clone());
+                Some(plain)
+            } else { None };
+            self.clipboard_owner = owner;
+            let merges = self.wb.sheet(si).merges.iter().copied()
+                .filter(|&(a,b,c,d)| a >= r1 && b >= c1 && c <= r2 && d <= c2).collect();
+            self.clip_pic = None;
+            self.clip = Some(Clip { sheet: si, rect, deferred: Some(range), cells: Vec::new(), merges, source_rows: None, cut });
+            self.status = format!("已{} {} 行 × {} 列", if cut { "剪切" } else { "复制" }, r2 - r1 + 1, c2 - c1 + 1);
+            return;
+        }
         let visible_rows: Vec<u32> = (r1..=r2)
             .filter(|r| !filter_hidden.contains(r))
             .collect();
         let filtered_copy = visible_rows.len() != (r2 - r1 + 1) as usize;
-        let mut cells = Vec::new();
+        let mut cells = Vec::with_capacity(visible_rows.len());
         let mut tsv = String::new();
         for &r in &visible_rows {
-            let mut row = Vec::new();
-            let mut line = Vec::new();
+            let mut row = Vec::with_capacity((c2 - c1 + 1) as usize);
             for c in c1..=c2 {
                 let cell = self.wb.sheet(si).get(r, c).cloned().unwrap_or(sheetcore::model::Cell {
                     value: sheetcore::model::Value::Empty,
@@ -7178,14 +7259,10 @@ impl SheetApp {
                 });
                 let st = self.wb.sheet(si).style_of(r, c);
                 let style = self.wb.styles.get(st);
-                line.push(sheetcore::style::format_value_in(
-                    self.wb.date_system,
-                    &cell.value,
-                    &style.format,
-                ));
+                if c != c1 { tsv.push('\t'); }
+                tsv.push_str(&sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &style.format));
                 row.push((cell, st));
             }
-            tsv.push_str(&line.join("\t"));
             tsv.push('\n');
             cells.push(row);
         }
@@ -7196,7 +7273,7 @@ impl SheetApp {
             self.clip_stamp = Some(tsv);
             let visible_count = visible_rows.len();
             self.clip_pic = None;
-            self.clip = Some(Clip {
+            self.clip = Some(Clip { deferred: None,
                 sheet: si,
                 rect: (r1, c1, r2, c2),
                 source_rows: Some(visible_rows),
@@ -7213,37 +7290,22 @@ impl SheetApp {
             );
             return;
         }
-        let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-        if area > 15_000 && std::env::var("SC_CLIP_LOG").is_err() && std::env::var("SC_CLIP_DUMP").is_err() {
-            // 超大选区复制：跳过昂贵的 HTML + XMLSS 百万字符串拼接（避免 250~350MB 内存峰值与数秒卡顿），
-            // 应用内通过 `self.clip` 保留完整公式/样式/合并，跨应用提供高速 TSV 纯文本。
+        let html = self.selection_html(si, (r1, c1, r2, c2));
+        if std::env::var("SC_CLIP_LOG").is_ok() {
+            eprintln!("[clip-html] {html}");
+        }
+        let xmlss = office_clipboard::selection_xmlss(&self.wb, si, (r1, c1, r2, c2));
+        if let Ok(path) = std::env::var("SC_CLIP_DUMP") {
+            if let Err(e) = std::fs::write(&path, &xmlss) {
+                eprintln!("[clip] dump failed: {e}");
+            }
+        }
+        if std::env::var("SC_CLIP_LOG").is_ok() {
+            eprintln!("[clip-xmlss] {}", &xmlss[..xmlss.len().min(400)]);
+        }
+        let html_ok = office_clipboard::write_office_clipboard(&xmlss, &html, &tsv);
+        if !html_ok {
             ctx.copy_text(tsv.clone());
-        } else {
-            let html = self.selection_html(si, (r1, c1, r2, c2));
-            if std::env::var("SC_CLIP_LOG").is_ok() {
-                eprintln!("[clip-html] {html}");
-            }
-            // 三种 flavor 一起写：XMLSS 带公式/类型/数字格式，HTML 带底色/合并，纯文本兜底。
-            // 只写 HTML 时 Excel 粘到的公式会退化成值（D1 变成 3），三方互通会丢公式。
-            let style_key = |st: &sheetcore::style::CellStyle| {
-                format!(
-                    "{}|{}|{}|{}|{:?}|{:?}|{}",
-                    st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format
-                )
-            };
-            let xmlss = office_clipboard::build_xmlss(&self.wb, si, (r1, c1, r2, c2), &style_key);
-            if let Ok(path) = std::env::var("SC_CLIP_DUMP") {
-                if let Err(e) = std::fs::write(&path, &xmlss) {
-                    eprintln!("[clip] dump failed: {e}");
-                }
-            }
-            if std::env::var("SC_CLIP_LOG").is_ok() {
-                eprintln!("[clip-xmlss] {}", &xmlss[..xmlss.len().min(400)]);
-            }
-            let html_ok = office_clipboard::write_office_clipboard(&xmlss, &html, &tsv);
-            if !html_ok {
-                ctx.copy_text(tsv.clone());
-            }
         }
         self.clip_stamp = Some(tsv);
         let merges = self.wb.sheet(si).merges.iter()
@@ -7251,7 +7313,7 @@ impl SheetApp {
             .copied()
             .collect();
         self.clip_pic = None;
-        self.clip = Some(Clip { sheet: si, rect: (r1, c1, r2, c2), source_rows: None, cells, merges, cut });
+        self.clip = Some(Clip { deferred: None, sheet: si, rect: (r1, c1, r2, c2), source_rows: None, cells, merges, cut });
         self.status = format!(
             "已{} {:?}（{} 行 × {} 列）",
             if cut { "剪切" } else { "复制" },
@@ -7261,13 +7323,43 @@ impl SheetApp {
         );
     }
 
+    // A native delayed owner identifies the source even if another program later
+    // copies identical plain text or publishes an Office-only clipboard.
+    fn deferred_clip_current(&self) -> Option<bool> {
+        self.clip.as_ref()?.deferred.as_ref()?;
+        self.clipboard_owner.as_ref().map(|owner| owner.is_current())
+    }
+
+    fn system_paste_text(&self) -> Option<String> {
+        (self.deferred_clip_current() != Some(true)).then(Self::read_clipboard_text).flatten()
+    }
+
+    fn internal_clip_for(&self, text: Option<&str>, trust_unstamped: bool) -> Option<&Clip> {
+        let clip = self.clip.as_ref()?;
+        let current = self.deferred_clip_current().unwrap_or_else(|| {
+            text.is_none_or(|text| match &self.clip_stamp {
+                Some(stamp) => copied_text_matches(stamp, text),
+                None => trust_unstamped || self.clip_matches(text, clip),
+            })
+        });
+        current.then_some(clip)
+    }
+
     /// values_only=true 时只贴值（不贴公式和格式）
     fn clip_paste(&mut self, values_only: bool, text: Option<String>) {
+        let owns_range = self.deferred_clip_current() == Some(true);
+        if let Some(clip) = self.clip.as_ref().filter(|clip| owns_range && office_clipboard::delayed::is_full_columns(clip.rect)) {
+            if let Some(range) = clip.deferred.clone() {
+                self.paste_full_columns(range.book(), clip.rect.1, clip.rect.3, values_only);
+                return;
+            }
+        }
         if self.edit_blocked() {
             return;
         }
         // 所有入口共用同一份“最新系统剪贴板”：Ribbon/右键没传文本时主动读。
         let text = text.filter(|text| !text.is_empty()).or_else(|| {
+            if owns_range { return None; }
             let sys = read_system_clip();
             (!sys.text.is_empty()).then_some(sys.text)
         });
@@ -7275,14 +7367,7 @@ impl SheetApp {
         let si = self.sheet_idx;
         // 三个入口（Ribbon/右键/Ctrl+V）共用这一份判断：系统剪贴板比内部 clip 新时，
         // 富格式走 Office XMLSS/HTML，纯文本才退回 TSV。
-        let use_internal = match (&self.clip, &text) {
-            (Some(clip), Some(text)) => match &self.clip_stamp {
-                Some(copied_text) => copied_text_matches(copied_text, text),
-                None => self.clip_matches(text, clip),
-            },
-            (Some(_), None) => true,
-            _ => false,
-        };
+        let use_internal = self.internal_clip_for(text.as_deref(), false).is_some();
         if !use_internal && !values_only {
             if let Some(block) = office_clipboard::read_table() {
                 if std::env::var("SC_CLIP_LOG").is_ok() {
@@ -7301,11 +7386,17 @@ impl SheetApp {
         // Borrow the previous block only when it will actually be pasted. External plain
         // text must not copy or reformat the last internal selection.
         if let Some(clip) = self.clip.as_ref().filter(|_| use_internal) {
+            if clip.cut && clip.deferred.as_ref().is_some_and(|range| {
+                !self.wb.sheets.get(clip.sheet).is_some_and(|sh| range.matches_cut_source(sh))
+            }) {
+                self.status = "剪切源已更改，请重新剪切".into();
+                return;
+            }
             let (sr1, sc1, _, _) = clip.rect;
             let dr = r as i64 - sr1 as i64;
             let dc = c as i64 - sc1 as i64;
             let target_sheet_name = &self.wb.sheet(si).name;
-            for (index, row) in clip.cells.iter().enumerate() {
+            for (index, row) in clip.cells().iter().enumerate() {
                 let row_shift = r as i64 + index as i64 - clip.source_row(index) as i64;
                 let mut out = Vec::new();
                 for (cell, st) in row {
@@ -7337,7 +7428,7 @@ impl SheetApp {
                     .collect();
             }
             if clip.cut {
-                let keys = (0..clip.cells.len()).flat_map(|index| {
+                let keys = (0..clip.cells().len()).flat_map(|index| {
                     let rr = clip.source_row(index);
                     (sc1..=clip.rect.3).map(move |cc| (rr, cc))
                 }).collect();
@@ -7347,7 +7438,11 @@ impl SheetApp {
             rows = Self::parse_tsv(&t);
             tsv_paste = true;
         } else {
-            self.status = "剪贴板是空的".into();
+            self.status = if office_clipboard::has_xml_spreadsheet() {
+                "无法导入剪贴板中的表格范围，请在源程序中选中具体数据区域后再复制"
+            } else {
+                "剪贴板是空的"
+            }.into();
             return;
         }
         if rows.is_empty() {
@@ -7357,22 +7452,22 @@ impl SheetApp {
         // One transaction covers both sides of a cut, including overlapping cells.
         let h = rows.len() as u32;
         let w = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
-        if (h as u64) * (w as u64) > 200_000 {
-            self.status = "粘贴内容过大（单次最多支持 20 万个单元格）".into();
+        if (h as u64) * (w as u64) > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "粘贴内容过大（单次最多支持 50 万个单元格）".into();
             return;
         }
         if h > 0 && w > 0 && (r.saturating_add(h - 1) > 1_048_575 || c.saturating_add(w - 1) > 16_383) {
             self.status = "粘贴区域超出工作表行列边界".into();
             return;
         }
-        let mut touched = std::collections::BTreeSet::new();
+        let mut touched = Vec::with_capacity(rows.iter().map(Vec::len).sum());
         for (i, row) in rows.iter().enumerate() {
-            for j in 0..row.len() {
-                touched.insert((si, r + i as u32, c + j as u32));
-            }
+            touched.extend((0..row.len()).map(|j| (si, r + i as u32, c + j as u32)));
         }
         if let Some((source, keys)) = &cut_src {
             touched.extend(keys.iter().map(|&(rr, cc)| (*source, rr, cc)));
+            touched.sort_unstable();
+            touched.dedup();
         }
         // 目标区或剪切源里任何一格被别人锁着 → 整批都不写
         let target_keys: Vec<(u32, u32)> = touched
@@ -7392,35 +7487,38 @@ impl SheetApp {
         for &(sheet, rr, cc) in &touched {
             transactions.entry(sheet).or_insert_with(Vec::new).push((rr, cc));
         }
-        let paste_before: Vec<(u32, u32, Option<sheetcore::model::Cell>, u16)> = target_keys
-            .iter()
-            .map(|&(rr, cc)| {
-                let sh = self.wb.sheet(si);
-                (rr, cc, sh.get(rr, cc).cloned(), sh.style_of(rr, cc))
-            })
-            .collect();
+        let merge_edit = if values_only || tsv_paste {
+            None
+        } else {
+            let source = self.clip.as_ref().filter(|_| cut_src.is_some());
+            match self.paste_merge_edit((r, c, r + h - 1, c + w - 1), &pasted_merges, source) {
+                Ok(edit) => edit,
+                Err(message) => { self.status = message.into(); return; }
+            }
+        };
+        let merge_changes = if let Some(edit) = &merge_edit {
+            let Some(changes) = edit.apply(&mut self.wb.sheets, true) else {
+                self.status = "粘贴区域中的合并单元格相互冲突".into();
+                return;
+            };
+            changes
+        } else { Vec::new() };
         let before: Vec<_> = transactions.into_iter().map(|(sheet, keys)| {
             (sheet, sheetcore::undo::capture(self.wb.sheet(sheet), sheet, &keys))
         }).collect();
+        let paste_before = if cut_src.is_some() {
+            Vec::new()
+        } else {
+            before.iter().flat_map(|(_, captured)| captured.iter()).map(|d| {
+                (d.row, d.col, (!d.before.is_blank()).then(|| d.before.clone()), d.before_style)
+            }).collect()
+        };
         // Clear before writing: the clipboard already holds a source snapshot.
         if let Some((source, keys)) = &cut_src {
             for &(rr, cc) in keys {
                 self.wb.sheet_mut(*source).set(rr, cc, Cell::default());
                 self.wb.sheet_mut(*source).set_style(rr, cc, 0);
             }
-        }
-        if !values_only && !tsv_paste && !pasted_merges.is_empty() {
-            let sh = self.wb.sheet_mut(si);
-            let (dr1, dc1, dr2, dc2) = (r, c, r + h - 1, c + w - 1);
-            sh.merges.retain(|(a, b, c2, d)| {
-                !(*a <= dr2 && *c2 >= dr1 && *b <= dc2 && *d >= dc1)
-            });
-            for (a, b, c2, d) in &pasted_merges {
-                if *c2 > *a || *d > *b {
-                    sh.merges.push((*a, *b, *c2, *d));
-                }
-            }
-            sh.merges_dirty = true;
         }
         for (i, row) in rows.iter().enumerate() {
             for (j, (cell, st)) in row.iter().enumerate() {
@@ -7441,9 +7539,15 @@ impl SheetApp {
                 deltas.extend(changes);
             }
         }
+        if let Some(net) = &self.net {
+            let styles: Vec<_> = deltas.iter().filter(|d| d.before_style != d.after_style)
+                .map(|d| (d.sheet, d.row, d.col)).collect();
+            self.broadcast_cell_styles(&styles);
+            for (sheet, rect, on) in merge_changes { net.broadcast_merge(sheet, rect, on); }
+        }
         self.undo.push(sheetcore::undo::Action {
             label: label.into(), deltas, focus: (si, r, c),
-            merges: None,
+            merges: merge_edit,
             snap_before: None, snap_after: None, by_site: 0,
             pictures: None,
             shapes: None,
@@ -7453,7 +7557,6 @@ impl SheetApp {
             self.clip = None;
         }
         // 重算 + 广播
-        let touched: Vec<_> = touched.into_iter().collect();
         self.recalc_and_broadcast(&touched);
         if cut_src.is_none() && h > 0 && w > 0 {
             self.last_paste = Some(LastPasteState {
@@ -7473,9 +7576,46 @@ impl SheetApp {
         self.status = format!("已粘贴 {h} 行 × {w} 列");
     }
 
+    fn paste_merge_edit(
+        &self,
+        target: (u32, u32, u32, u32),
+        incoming: &[(u32, u32, u32, u32)],
+        cut: Option<&Clip>,
+    ) -> Result<Option<sheetcore::undo::MergeEdit>, &'static str> {
+        let overlaps = |a: (u32,u32,u32,u32), b: (u32,u32,u32,u32)| a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3;
+        let contains = |a: (u32,u32,u32,u32), b: (u32,u32,u32,u32)| a.0 <= b.0 && a.1 <= b.1 && a.2 >= b.2 && a.3 >= b.3;
+        let mut affected = vec![self.sheet_idx];
+        if let Some(clip) = cut.filter(|c| c.sheet != self.sheet_idx) {
+            affected.push(clip.sheet);
+        }
+        let mut edits = Vec::new();
+        for sheet in affected {
+            let mut removed = Vec::new();
+            for &rect in &self.wb.sheet(sheet).merges {
+                if let Some(clip) = cut.filter(|c| c.sheet == sheet && overlaps(c.rect, rect)) {
+                    if !contains(clip.rect, rect) || clip.source_rows.is_some() {
+                        return Err("剪切区域包含部分合并单元格，请选择完整区域");
+                    }
+                    removed.push(rect);
+                } else if sheet == self.sheet_idx && overlaps(target, rect) {
+                    if !contains(target, rect) {
+                        return Err("粘贴区域包含部分合并单元格，请选择完整区域");
+                    }
+                    removed.push(rect);
+                }
+            }
+            let added = if sheet == self.sheet_idx { incoming } else { &[] };
+            if let Some(edit) = sheetcore::undo::MergeEdit::between(sheet, &removed, added) {
+                edits.push(edit);
+            }
+        }
+        Ok(sheetcore::undo::MergeEdit::join(edits))
+    }
+
     fn clip_matches(&self, text: &str, clip: &Clip) -> bool {
+        if let Some(range) = &clip.deferred { return copied_text_matches(&range.text(), text); }
         let mut expect = String::new();
-        for row in clip.cells.iter() {
+        for row in clip.cells().iter() {
             let mut line = Vec::new();
             for (cell, st) in row.iter() {
                 let style = self.wb.styles.get(*st);
@@ -7765,10 +7905,26 @@ impl SheetApp {
 
     fn broadcast_cells(&mut self, keys: &[(usize, u32, u32)]) {
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
-            for (si, r, c) in keys.iter() {
-                let cell = self.wb.sheet(*si).get(*r, *c).cloned().unwrap_or_default();
-                let op = peer.local_set(*si, *r, *c, &cell);
-                net.broadcast_op(op);
+            let blank = sheetcore::Cell::default();
+            for chunk in keys.chunks(sheetcore::sync::LIVE_OP_BATCH) {
+                let ops = chunk.iter().map(|&(si, r, c)| {
+                    peer.local_set(si, r, c, self.wb.sheet(si).get(r, c).unwrap_or(&blank))
+                }).collect();
+                net.broadcast_ops(ops);
+            }
+        }
+    }
+
+    fn broadcast_cell_styles(&self, keys: &[(usize, u32, u32)]) {
+        let Some(net) = &self.net else { return };
+        for chunk in keys.chunks(128) {
+            for group in chunk.chunk_by(|a, b| a.0 == b.0) {
+                let sheet = group[0].0;
+                let Some(sh) = self.wb.sheets.get(sheet) else { continue };
+                let items = group.iter().map(|&(_, r, c)| {
+                    (r, c, self.wb.styles.get(sh.style_of(r, c)).clone())
+                }).collect();
+                net.broadcast_style(sheet, items);
             }
         }
     }
@@ -7813,8 +7969,8 @@ impl SheetApp {
             return;
         }
         let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-        if area > 200_000 {
-            self.status = "填充范围过大（单次最多支持 20 万个单元格）".into();
+        if area > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "填充范围过大（单次最多支持 50 万个单元格）".into();
             return;
         }
         // 实际被写的是尾端目标区（首行/首列只是源），门禁按真实写入范围收集
@@ -7829,44 +7985,28 @@ impl SheetApp {
         ) {
             return;
         }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        let txn = self.txn_begin(&keys);
-        if down {
-            for c in c1..=c2 {
-                let Some(src) = self.wb.sheet(self.sheet_idx).get(r1, c).cloned() else {
-                    continue;
-                };
-                for r in (r1 + 1)..=r2 {
-                    let mut cell = src.clone();
-                    if let Some(f) = &src.formula {
-
-                        cell.formula = Some(sheetcore::cf::shift_formula(f, r - r1, 0).into());
-                    }
-                    self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
-                }
-            }
-        } else {
-            for r in r1..=r2 {
-                let Some(src) = self.wb.sheet(self.sheet_idx).get(r, c1).cloned() else {
-                    continue;
-                };
-                for c in (c1 + 1)..=c2 {
-                    let mut cell = src.clone();
-                    if let Some(f) = &src.formula {
-
-                        cell.formula = Some(sheetcore::cf::shift_formula(f, 0, c - c1).into());
-                    }
-                    self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
-                }
-            }
-        }
-        self.txn_end(if down { "向下填充" } else { "向右填充" }, txn);
         let si = self.sheet_idx;
-        let filled_keys: Vec<(usize, u32, u32)> = if down {
-            ((r1 + 1)..=r2).flat_map(|r| (c1..=c2).map(move |c| (si, r, c))).collect()
-        } else {
-            (r1..=r2).flat_map(|r| ((c1 + 1)..=c2).map(move |c| (si, r, c))).collect()
-        };
+        let mut formulas = sheetcore::refs::FillFormulas::default();
+        let mut changes = Vec::new();
+        let mut filled_keys = Vec::new();
+        let sh = self.wb.sheet_mut(si);
+        for &(row, col) in &gate {
+            let (sr, sc) = if down { (r1, col) } else { (row, c1) };
+            let Some(source) = sh.get(sr, sc) else { continue };
+            let after = Cell {
+                value: source.value.clone(),
+                formula: source.formula.as_deref().map(|f| formulas.translate(f, i64::from(row - sr), i64::from(col - sc)).into()),
+            };
+            if sh.get(row, col) == Some(&after) { continue; }
+            let style = sh.style_of(row, col);
+            let before = sh.get(row, col).cloned().unwrap_or_default();
+            sh.set(row, col, after.clone());
+            changes.push(sheetcore::undo::CellDelta {
+                sheet: si, row, col, before, after, before_style: style, after_style: style,
+            });
+            filled_keys.push((si, row, col));
+        }
+        self.record_deltas(if down { "向下填充" } else { "向右填充" }, changes);
         self.recalc_and_broadcast(&filled_keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
@@ -8156,43 +8296,11 @@ impl SheetApp {
             self.status = "选区内没有可排序的数据".into();
             return;
         };
-        let undo_keys = sheetcore::undo::sparse_rect_keys(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
-        if !self.write_preflight(&undo_keys, "排序") {
-            return;
-        }
-        if let Err(error) = sheetcore::sort_filter::validate_sort_region(
-            self.wb.sheet(self.sheet_idx), (r1, c1, r2, c2),
-        ) {
-            self.status = error;
-            return;
-        }
+        let rect = (r1, c1, r2, c2);
         if dlg.sort_by_row {
-            if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
-                self.status = "按行排序区域超过 20 万格，请缩小选区范围".into();
-                return;
-            }
-            let key_row = self.sel.0.clamp(r1, r2.max(r1));
+            let row = self.sel.0.clamp(r1, r2);
             let asc = dlg.keys.first().map(|(_, a, _)| *a).unwrap_or(true);
-            let txn = self.txn_begin(&undo_keys);
-            let res = sheetcore::sort_filter::sort_region_by_row(
-                self.wb.sheet_mut(self.sheet_idx),
-                (r1, c1, r2, c2),
-                key_row,
-                asc,
-            );
-            match res {
-                Ok(()) => {
-                    self.txn_end("按行排序", txn);
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.recalc_all_and_deps_adaptive();
-                    self.status = format!("已按第 {} 行排序（重排列）", key_row + 1);
-                }
-                Err(e) => {
-                    self.undo.clear();
-                    self.status = e;
-                }
-            }
+            self.run_reorder(rect, data_reorder::Operation::Columns { row, asc });
             return;
         }
         let keys: Vec<sheetcore::data_tools::SortKey> = dlg
@@ -8221,22 +8329,7 @@ impl SheetApp {
             self.status = "至少选一列排序".into();
             return;
         }
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 500_000 {
-            self.status = "排序数据量超过 50 万格，请缩小列范围后再排序".into();
-            return;
-        }
-        let txn = self.txn_begin(&undo_keys);
-        let moved = sheetcore::data_tools::sort_multi(
-            self.wb.sheet_mut(self.sheet_idx),
-            (r1, c1, r2, c2),
-            &keys,
-            dlg.header,
-        );
-        self.txn_end("多级排序", txn);
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.recalc_all_and_deps_adaptive();
-        self.status = format!("已按 {} 个键排序（{} 行移动）", keys.len(), moved);
+        self.run_reorder(rect, data_reorder::Operation::Multi { keys, header: dlg.header });
     }
 
     /// 删除重复（旧入口/探针用）：全列比较、无对话框。
@@ -8266,6 +8359,8 @@ impl SheetApp {
         );
         let cols = vec![true; (rect.3 - rect.1 + 1) as usize];
         self.dedup_dlg = Some(DedupDlg {
+            owner: (self.doc_uid, self.wb.sheet(self.sheet_idx).identity),
+            preview: None,
             rect,
             header,
             cols,
@@ -8278,33 +8373,7 @@ impl SheetApp {
             self.status = "没有重复行".into();
             return;
         };
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 500_000 {
-            self.status = "去重区域超过 50 万格，请缩小列范围".into();
-            return;
-        }
-        // Moving rows can write into previously empty or protected destination cells.
-        let undo_keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        if !self.write_preflight(&undo_keys, "删除重复") {
-            return;
-        }
-        let txn = self.txn_begin(&undo_keys);
-        let removed = sheetcore::data_tools::remove_duplicates(
-            self.wb.sheet_mut(self.sheet_idx),
-            (r1, c1, r2, c2),
-            cols,
-            header,
-        );
-        self.txn_end("删除重复", txn);
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        if removed != 0 {
-            self.recalc_all_and_deps_adaptive();
-        }
-        self.status = if removed == 0 {
-            "没有重复行".into()
-        } else {
-            format!("删除了 {removed} 行重复")
-        };
+        self.run_reorder((r1, c1, r2, c2), data_reorder::Operation::Dedup { cols: cols.to_vec(), header });
     }
 
     /// UI-22：Ctrl+Q 命令搜索（数据来自 ribbon 控件，执行走同一 ribbon_action）。
@@ -8555,28 +8624,38 @@ impl SheetApp {
         let chosen: Vec<u32> = (c1..=c2)
             .filter(|c| dlg.cols.get((c - c1) as usize).copied().unwrap_or(true))
             .collect();
-        let cache_hit = dlg
-            .cached_dup
-            .as_ref()
-            .filter(|((h, cs, dg), _)| *h == dlg.header && cs == &dlg.cols && *dg == self.doc_gen)
-            .map(|(_, v)| *v);
-        let dup = match cache_hit {
-            Some(v) => v,
-            None => {
-                let v = if chosen.is_empty() {
-                    0
-                } else {
-                    sheetcore::data_tools::count_duplicates(
-                        self.wb.sheet(self.sheet_idx),
-                        dlg.rect,
-                        &chosen,
-                        dlg.header,
-                    )
-                };
-                dlg.cached_dup = Some(((dlg.header, dlg.cols.clone(), self.doc_gen), v));
-                v
+        let sheet = self.wb.sheet(self.sheet_idx);
+        if dlg.owner != (self.doc_uid, sheet.identity) { return; }
+        if let Some(preview) = &dlg.preview {
+            match preview.try_recv() {
+                Ok(result) => { dlg.cached_dup = Some(result); dlg.preview = None; }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => dlg.preview = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-        };
+        }
+        let config = (dlg.header, dlg.cols.clone(), self.doc_gen, sheet.cell_revision());
+        let mut dup = dlg.cached_dup.as_ref().filter(|(key, _)| key == &config).map(|(_, count)| *count);
+        if dup.is_none() && !chosen.is_empty() && dlg.preview.is_none() {
+            let rect = dlg.rect;
+            let header = dlg.header;
+            let area = u64::from(rect.2 - rect.0 + 1) * u64::from(rect.3 - rect.1 + 1);
+            if area > 100_000 {
+                let snapshot = sheet.search_snapshot();
+                let columns = chosen.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let repaint = ctx.clone();
+                std::thread::spawn(move || {
+                    let count = sheetcore::data_tools::count_duplicates(&snapshot, rect, &columns, header);
+                    let _ = tx.send((config, count));
+                    repaint.request_repaint();
+                });
+                dlg.preview = Some(rx);
+            } else {
+                let count = sheetcore::data_tools::count_duplicates(sheet, rect, &chosen, header);
+                dlg.cached_dup = Some((config, count));
+                dup = Some(count);
+            }
+        }
         let mut open = true;
         let mut run = false;
         ui_kit::window(ctx, "删除重复", 360.0)
@@ -8614,10 +8693,12 @@ impl SheetApp {
                 ui.separator();
                 ui.label(if chosen.is_empty() {
                     "至少要选一列".to_string()
-                } else if dup == 0 {
-                    "没有重复行".to_string()
                 } else {
-                    format!("预览：将删除 {dup} 行重复")
+                    match dup {
+                        Some(0) => "没有重复行".to_string(),
+                        Some(count) => format!("预览：将删除 {count} 行重复"),
+                        None => "正在计算重复行数…".to_string(),
+                    }
                 });
                 ui.separator();
                 ui_kit::footer(ui, |ui| {
@@ -9420,18 +9501,46 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             return false;
         }
         let (r0, c0) = self.sel;
-        let cols = block.cols() as u32;
-        let rows = block.rows.len() as u32;
-        if (rows as u64) * (cols as u64) > 200_000 {
-            self.status = "粘贴区域太大（超过 20 万格），改用纯文本粘贴".into();
-            return false;
+        // Spans count toward the write footprint, including otherwise empty merged cells.
+        let cols = block.rows.iter().map(|row| row.iter().map(|c| u64::from(c.colspan.max(1))).sum::<u64>()).max().unwrap_or(0);
+        let rows = block.rows.iter().enumerate().map(|(i, row)| {
+            i as u64 + u64::from(row.iter().map(|c| c.rowspan.max(1)).max().unwrap_or(1))
+        }).max().unwrap_or(0);
+        if rows.saturating_mul(cols) > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64
+            || u64::from(r0) + rows > 1_048_576 || u64::from(c0) + cols > 16_384
+        {
+            self.status = "粘贴区域超过工作表边界或单次 50 万格上限".into();
+            return true;
         }
-
+        let (rows, cols) = (rows as u32, cols as u32);
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
-        let txn = self.txn_begin(&keys);
-        let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
+        if !self.write_preflight(&keys, "从 Excel 粘贴") { return true; }
         let si = self.sheet_idx;
-
+        let mut incoming = Vec::new();
+        for (ri, row) in block.rows.iter().enumerate() {
+            let r = r0 + ri as u32;
+            let mut c = c0;
+            for cell in row {
+                if cell.colspan > 1 || cell.rowspan > 1 {
+                    incoming.push((r, c, r + cell.rowspan.max(1) - 1, c + cell.colspan.max(1) - 1));
+                }
+                c += cell.colspan.max(1);
+            }
+        }
+        let merge_edit = match self.paste_merge_edit((r0, c0, r0 + rows - 1, c0 + cols - 1), &incoming, None) {
+            Ok(edit) => edit,
+            Err(message) => { self.status = message.into(); return true; }
+        };
+        if let Some(edit) = &merge_edit {
+            let Some(changes) = edit.apply(&mut self.wb.sheets, true) else {
+                self.status = "粘贴区域中的合并单元格相互冲突".into();
+                return true;
+            };
+            if let Some(net) = &self.net {
+                for (sheet, rect, on) in changes { net.broadcast_merge(sheet, rect, on); }
+            }
+        }
+        let txn = self.txn_begin(&keys);
         for (ri, row) in block.rows.iter().enumerate() {
             let mut ci: u32 = 0;
             for cell in row {
@@ -9567,22 +9676,8 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                     self.wb.sheet_mut(si).set_style(r, c, id);
                 }
 
-                // 合并
-                if cell.colspan > 1 || cell.rowspan > 1 {
-                    merges.push((r, c, r + cell.rowspan - 1, c + cell.colspan - 1));
-                }
                 ci += cell.colspan.max(1);
             }
-        }
-
-        if !merges.is_empty() {
-            let sheet = self.wb.sheet_mut(si);
-            for m in merges {
-                if !sheet.merges.iter().any(|x| x.0 == m.0 && x.1 == m.1 && x.2 == m.2 && x.3 == m.3) {
-                    sheet.merges.push(m);
-                }
-            }
-            sheet.merges_dirty = true;
         }
 
         // 公式要立刻算出来（Excel 复制过来的是 R1C1 折算后的 A1）
@@ -9604,26 +9699,17 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &fkeys);
         }
 
-        self.txn_end("从 Excel 粘贴", txn);
+        let deltas = sheetcore::undo::finish(txn, self.wb.sheet(si));
+        if self.net.is_some() {
+            let style_keys: Vec<_> = deltas.iter().filter(|d| d.before_style != d.after_style)
+                .map(|d| (d.sheet, d.row, d.col)).collect();
+            self.broadcast_cell_styles(&style_keys);
+        }
+        self.record_deltas_and_merges("从 Excel 粘贴", deltas, merge_edit);
         let all_pasted: Vec<(usize, u32, u32)> = (0..rows)
             .flat_map(|ri| (0..cols).map(move |ci| (si, r0 + ri, c0 + ci)))
             .collect();
         self.broadcast_cells(&all_pasted);
-        if let Some(net) = self.net.as_ref() {
-            let mut wire_styles = Vec::new();
-            for ri in 0..rows {
-                for ci in 0..cols {
-                    let (rr, cc) = (r0 + ri, c0 + ci);
-                    let sid = self.wb.sheet(si).style_of(rr, cc);
-                    if sid != 0 {
-                        wire_styles.push((rr, cc, self.wb.styles.get(sid).clone()));
-                    }
-                }
-            }
-            if !wire_styles.is_empty() {
-                net.broadcast_style(si, wire_styles);
-            }
-        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.sel_end = (r0 + rows - 1, c0 + cols - 1);
@@ -11070,7 +11156,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         };
         if applied.merge_conflict {
             self.status = format!(
-                "{}：合并结构与当前表冲突，已整体放弃（结构、内容和广播均未改动）",
+                "{}：合并结构与当前表冲突或区域内有他人改动，已整体放弃（结构、内容和广播均未改动）",
                 if redo { "重做" } else { "撤销" }
             );
             return false;
@@ -11102,28 +11188,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.invalid_gen = u64::MAX;
         self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
-        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
-            for (sheet, row, col) in applied.touched.iter() {
-                let cell = self.wb.sheet(*sheet).get(*row, *col).cloned().unwrap_or_default();
-                let op = peer.local_set(*sheet, *row, *col, &cell);
-                net.broadcast_op(op);
-            }
-            // 撤销/重做也会改样式（清除全部、格式操作）；只发内容会让对端留下默认格式，
-            // 必须把每格撤销后的真实样式再同步一遍。
-            let mut by_sheet: std::collections::BTreeMap<
-                usize,
-                Vec<(u32, u32, sheetcore::style::CellStyle)>,
-            > = std::collections::BTreeMap::new();
-            for (sheet, row, col) in applied.touched.iter() {
-                if *sheet < self.wb.sheets.len() {
-                    let id = self.wb.sheet(*sheet).style_of(*row, *col);
-                    let st = self.wb.styles.get(id).clone();
-                    by_sheet.entry(*sheet).or_default().push((*row, *col, st));
-                }
-            }
-            for (sheet, items) in by_sheet {
-                net.broadcast_style(sheet, items);
-            }
+        self.broadcast_cells(&applied.touched);
+        let changed_styles = if applied.structural { &applied.touched } else { &applied.style_changes };
+        self.broadcast_cell_styles(changed_styles);
+        if let Some(net) = &self.net {
             // 合并结构也要同步；只发内容/样式会让对端留下旧的合并轮廓。
             for (sheet, rect, on) in applied.merge_changes.iter() {
                 net.broadcast_merge(*sheet, *rect, *on);
@@ -12971,14 +13039,6 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         if paste_k || paste_v_k || paste_evt {
-            // 从 Excel 复制过来的块：HTML 里有格式与合并，优先走这条
-            if paste_k && !paste_v_k {
-                if let Some(block) = office_clipboard::read_table() {
-                    if self.paste_office_block(&block) {
-                        return;
-                    }
-                }
-            }
             let text = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
                     egui::Event::Paste(t) => Some(t.clone()),
@@ -15213,8 +15273,8 @@ let txn = self.txn_begin(&keys);
         }
         let (tr1, tc1, tr2, tc2) = self.sel_rect();
         let area = (tr2 - tr1 + 1) as u64 * (tc2 - tc1 + 1) as u64;
-        if area > 200_000 {
-            self.status = "目标区域太大（超过 20 万格），格式刷不执行".into();
+        if area > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "目标区域太大（超过 50 万格），格式刷不执行".into();
             return;
         }
         let (sr1, sc1, sr2, sc2) = p.rect;
@@ -15228,28 +15288,27 @@ let txn = self.txn_begin(&keys);
         if !self.write_preflight(&keys, "格式刷") {
             return;
         }
-        let txn = self.txn_begin(&keys);
-        let has_net = self.net.is_some();
-        let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = if has_net {
-            Vec::with_capacity(keys.len())
-        } else {
-            Vec::new()
-        };
-        for r in tr1..=tr2 {
-            for c in tc1..=tc2 {
-                let i = ((r - tr1) % sh) as usize;
-                let j = ((c - tc1) % sw) as usize;
-                let sid = p.styles[i][j];
-                self.wb.sheet_mut(self.sheet_idx).set_style(r, c, sid);
-                if has_net {
-                    wire.push((r, c, self.wb.styles.get(sid).clone()));
-                }
+        let si = self.sheet_idx;
+        let mut changes = Vec::new();
+        let mut wire = Vec::new();
+        let sheet = &mut self.wb.sheets[si];
+        for (row, col) in keys {
+            let sid = p.styles[((row - tr1) % sh) as usize][((col - tc1) % sw) as usize];
+            let before_style = sheet.style_of(row, col);
+            if before_style != sid {
+                let value = sheet.get(row, col).cloned().unwrap_or_default();
+                changes.push(sheetcore::undo::CellDelta { sheet: si, row, col,
+                    before: value.clone(), after: value, before_style, after_style: sid });
+            }
+            sheet.set_style(row, col, sid);
+            if self.net.is_some() && before_style != sid {
+                wire.push((row, col, self.wb.styles.get(sid).clone()));
             }
         }
         if let Some(net) = self.net.as_ref() {
-            net.broadcast_style(self.sheet_idx, wire);
+            net.broadcast_style(si, wire);
         }
-        self.txn_end("格式刷", txn);
+        self.record_deltas("格式刷", changes);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         if p.continuous {
@@ -16841,7 +16900,7 @@ let txn = self.txn_begin(&keys);
 
     /// 执行选择性粘贴：内部剪贴板优先，其次系统剪贴板文本
     fn paste_special_apply(&mut self, ctx: &egui::Context) {
-        let text = Self::read_clipboard_text();
+        let text = self.system_paste_text();
         self.paste_special_apply_text(ctx, text);
     }
 
@@ -16849,7 +16908,8 @@ let txn = self.txn_begin(&keys);
     fn read_clipboard_text() -> Option<String> {
         static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = IO.lock().ok()?;
-        arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+        let text = read_system_clip().text;
+        (!text.is_empty()).then_some(text)
     }
 
     /// text 是系统剪贴板文本；None/空 表示没有可粘贴的外部文本。
@@ -16863,32 +16923,30 @@ let txn = self.txn_begin(&keys);
         // 内部剪贴板：matrix 是要粘贴的格子，coords 记录每格在源表里的绝对坐标。
         // 外部文本没有源坐标，公式只能按原文粘贴（不偏移）。
         // 关键：内部 Clip 不能遮盖后复制到系统剪贴板的新内容——与普通粘贴同一判定。
-        let internal: Option<&Clip> = match (&self.clip, &ext_text) {
-            (Some(clip), Some(t)) => {
-                let same = match &self.clip_stamp {
-                    Some(stamp) => copied_text_matches(stamp, t),
-                    // 程序内构造的 Clip（测试/导入）没有 stamp，按内部剪贴板处理
-                    None => true,
-                };
-                if same { Some(clip) } else { None }
+        let internal = self.internal_clip_for(ext_text.as_deref(), true);
+        if internal.is_some_and(|clip| office_clipboard::delayed::is_full_columns(clip.rect)) {
+            if self.ps_op == 0 && !self.ps_transpose && !self.ps_skip_blanks && matches!(self.ps_kind, 0 | 1) {
+                self.clip_paste(self.ps_kind == 1, ext_text);
+            } else {
+                self.status = "整列支持普通粘贴和粘贴数值，其他选项请先选中数据区域".into();
             }
-            (Some(clip), _) => Some(clip),
-            (None, _) => None,
-        };
-        let src_sheet_idx = internal.as_ref().map(|c| c.sheet);
+            return;
+        }
+        let src_sheet_idx = internal.and_then(|clip| clip.live_sheet_index(&self.wb));
         let mut src_sheet_name: Option<String> = None;
         let (mut matrix, mut coords) = if let Some(clip) = internal {
             let sc1 = clip.rect.1;
-            src_sheet_name = Some(self.wb.sheet(clip.sheet).name.clone());
+            src_sheet_name = clip.deferred.as_ref().map(|range| range.book().sheet(0).name.clone())
+                .or_else(|| self.wb.sheets.get(clip.sheet).map(|sh| sh.name.clone()));
             let mut coords: Vec<Vec<(u32, u32)>> = Vec::new();
-            for (i, row) in clip.cells.iter().enumerate() {
+            for (i, row) in clip.cells().iter().enumerate() {
                 coords.push(
                     (0..row.len())
                         .map(|j| (clip.source_row(i), sc1 + j as u32))
                         .collect(),
                 );
             }
-            (clip.cells.clone(), Some(coords))
+            (clip.cells().to_vec(), Some(coords))
         } else {
             let text = ext_text.unwrap_or_default();
             if text.is_empty() {
@@ -16904,8 +16962,8 @@ let txn = self.txn_begin(&keys);
         }
         let init_h = matrix.len() as u64;
         let init_w = matrix.iter().map(|r| r.len()).max().unwrap_or(0) as u64;
-        if init_h * init_w > 200_000 {
-            self.status = "选择性粘贴范围过大（单次最多支持 20 万个单元格）".into();
+        if init_h * init_w > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "选择性粘贴范围过大（单次最多支持 50 万个单元格）".into();
             return;
         }
         if self.ps_transpose {
@@ -16945,8 +17003,8 @@ let txn = self.txn_begin(&keys);
         if rows == 0 || cols == 0 {
             return;
         }
-        if (rows as u64) * (cols as u64) > 200_000 {
-            self.status = "选择性粘贴范围过大（单次最多支持 20 万个单元格）".into();
+        if (rows as u64) * (cols as u64) > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "选择性粘贴范围过大（单次最多支持 50 万个单元格）".into();
             return;
         }
         if r0.saturating_add(rows - 1) > 1_048_575 || c0.saturating_add(cols - 1) > 16_383 {
@@ -18883,9 +18941,6 @@ let txn = self.txn_begin(&keys);
         let Some(rect) = self.clamp_rect_to_used(raw_rect) else {
             return Err("选区内没有可分组的行".into());
         };
-        if rect.2.saturating_sub(rect.0) > 20_000 {
-            return Err("分类汇总单次最多支持 20000 行数据，请缩小选区范围".into());
-        }
         let key_col = Self::parse_col(key)
             .ok_or_else(|| format!("分组列「{key}」看不懂，写成 A 或 1"))?;
         let mut cols: Vec<u32> = Vec::new();
@@ -18911,7 +18966,7 @@ let txn = self.txn_begin(&keys);
         // union of reference locations that any of the insertions could change.
         let earliest = sheetcore::structural::Structural::InsertRows { at: rect.0 + 2, n: 1 };
         let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &earliest);
-        let rep = sheetcore::subtotal::subtotal_workbook(&mut self.wb, idx, rect, key_col, &cols, f);
+        let rep = sheetcore::subtotal::try_subtotal_workbook(&mut self.wb, idx, rect, key_col, &cols, f)?;
         if rep.groups == 0 {
             return Err("选区内没有可分组的行".into());
         }
@@ -21301,17 +21356,24 @@ let txn = self.txn_begin(&keys);
     /// Excel 的文本溢出规则：常规/左对齐向右延伸，右对齐向左延伸，居中两侧；
     /// 遇到第一个非空单元格、别的合并区或隐藏列就停在边界上。
     /// 裁剪区永远从本格左边界开始（左对齐时文字起点始终可见）。
+    #[cfg(test)]
     fn spill_clip(&self, r: u32, c: u32, rect: Rect, align: egui::Align2) -> Rect {
+        let mut merges = sheetcore::merges::MergeIndex::default();
+        merges.refresh(&self.wb.sheet(self.sheet_idx).merges);
+        self.spill_clip_indexed(r, c, rect, align, &merges)
+    }
+
+    fn spill_clip_indexed(&self, r: u32, c: u32, rect: Rect, align: egui::Align2, merges: &sheetcore::merges::MergeIndex) -> Rect {
         let sh = self.wb.sheet(self.sheet_idx);
         let scale = self.paint_scale;
-        let (mr1, mc1, mr2, mc2) = sh.merge_at(r, c).unwrap_or((r, c, r, c));
+        let (mr1, mc1, mr2, mc2) = merges.at(r, c).unwrap_or((r, c, r, c));
         let zoom_scale = self.zoom * scale;
         let blocked_right = |cc: u32| -> bool {
             if sh.hidden_cols.contains(&cc) {
                 return true;
             }
             for rr in mr1..=mr2 {
-                if let Some((_, a, _, b)) = sh.merge_at(rr, cc) {
+                if let Some((_, a, _, b)) = merges.at(rr, cc) {
                     // 本格右侧的合并区（锚点不在本格）会挡住溢出
                     if !(a == mc1 && b == mc2) {
                         return true;
@@ -21328,7 +21390,7 @@ let txn = self.txn_begin(&keys);
                 return true;
             }
             for rr in mr1..=mr2 {
-                if let Some((_, a, _, b)) = sh.merge_at(rr, cc) {
+                if let Some((_, a, _, b)) = merges.at(rr, cc) {
                     if !(a == mc1 && b == mc2) {
                         return true;
                     }
@@ -21610,7 +21672,7 @@ let txn = self.txn_begin(&keys);
                     _ => rect.min.x + 6.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                     };
                     let spill = if self.text_spill {
-                        self.spill_clip(r, c, rect, align)
+                        self.spill_clip_indexed(r, c, rect, align, &self.paint_merges)
                     } else {
                         rect
                     };
@@ -21740,7 +21802,7 @@ let txn = self.txn_begin(&keys);
                     let clip = if st.halign == 4 {
                         span_rect
                     } else if self.text_spill {
-                        self.spill_clip(r, c, rect, align)
+                        self.spill_clip_indexed(r, c, rect, align, &self.paint_merges)
                     } else {
                         rect
                     };
@@ -22215,32 +22277,7 @@ let txn = self.txn_begin(&keys);
     }
 
     fn sort_region(&mut self, region: (u32, u32, u32, u32), col: u32, asc: bool) {
-        let (r1, c1, r2, c2) = region;
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 500_000 {
-            self.status = "当前连续区域超过 50 万格，请选中具体列范围后再排序".into();
-            return;
-        }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        if !self.write_preflight_op(&keys, "排序", sheetcore::protection::ProtOp::Sort) {
-            return;
-        }
-        let txn = self.txn_begin(&keys);
-        let res = sheetcore::sort_filter::sort_region(
-            self.wb.sheet_mut(self.sheet_idx),
-            (r1, c1, r2, c2),
-            col,
-            asc,
-        );
-        match res {
-            Ok(()) => {
-                self.txn_end("排序", txn);
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.recalc_all_and_deps_adaptive();
-                self.status = format!("已按 {} 列{}排序", cell_name(0, col), if asc { "升序" } else { "降序" });
-            }
-            Err(e) => self.status = e,
-        }
+        self.run_reorder(region, data_reorder::Operation::Rows { col, asc });
     }
 
     /// 只清除筛选条件：保留筛选器（表头箭头仍在），恢复被筛选隐藏的行；
@@ -22746,15 +22783,7 @@ let txn = self.txn_begin(&keys);
         // -------- 应用
         if let Some(asc) = sort_req {
             if let Some((r1, c1, r2, c2)) = filter_range {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                match sheetcore::sort_filter::sort_region(sh, (r1, c1, r2, c2), col, asc) {
-                    Ok(_) => {
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.status = format!("已按 {} {}排序", cell_name(0, col), if asc { "升序" } else { "降序" });
-                    }
-                    Err(e) => self.status = format!("排序失败：{e}"),
-                }
+                self.sort_region((r1, c1, r2, c2), col, asc);
             }
             self.filter_popup = None;
             return;
@@ -27928,18 +27957,14 @@ let txn = self.txn_begin(&keys);
         if !self.wb.sheet(si).cf.blocks.is_empty() {
             let want_cf_gen = self.doc_gen ^ ((si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             if self.cf_stats_gen != want_cf_gen {
-                let mut st = sheetcore::cf::CfStats::default();
-                {
-                    let sheet = self.wb.sheet(si);
-                    sheetcore::cf::compute_stats(&sheet.cf, sheet, &mut st);
-                }
-                self.cf_stats = st;
+                sheetcore::cf::refresh_stats(self.wb.sheet(si), &mut self.cf_stats);
                 self.cf_stats_gen = want_cf_gen;
             }
         }
         let intersects = |indices: &[u32], start, end| {
             indices.get(indices.partition_point(|&i| i < start)).is_some_and(|&i| i <= end)
         };
+        self.paint_merges.refresh(&self.wb.sheet(si).merges);
         let vis_merges: Vec<_> = self.wb.sheet(si).merges.iter().copied()
             .filter(|&(r1, c1, r2, c2)| {
                 (intersects(&body_rows, r1, r2) || intersects(&frozen_rows, r1, r2))
@@ -27960,6 +27985,7 @@ let txn = self.txn_begin(&keys);
                     let mut overlays = std::collections::HashMap::new();
                     let sheet = self.wb.sheet(si);
                     let mut calc = sheetcore::formula::Calc::new(&self.wb);
+                    let mut formulas = sheetcore::formula::RuleFormulas::default();
                     let cells = frozen_rows.iter().chain(&body_rows).flat_map(|&r| {
                         frozen_cols.iter().chain(&body_cols).map(move |&c| (r, c))
                     });
@@ -27970,8 +27996,7 @@ let txn = self.txn_begin(&keys);
                     });
                     for (r, c) in cells.chain(extra_anchors) {
                         let ov = sheetcore::cf::overlay_at(&sheet.cf, &self.cf_stats, sheet, r, c, |f, r0, c0| {
-                            let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), r0, c0);
-                            sheetcore::formula::parse(&shifted).is_ok_and(|node| {
+                            formulas.shifted(f, r0, c0).is_ok_and(|node| {
                                 matches!(calc.eval_node(&node, si), sheetcore::formula::FValue::Bool(true))
                             })
                         });
@@ -35542,6 +35567,7 @@ impl eframe::App for SheetApp {
         self.commit_edit_before_close(ctx);
         self.poll_net();
         self.poll_open();
+        self.poll_reorder();
         self.sync_history();
         self.poll_save();
         self.tick_autosave(Some(ctx));
@@ -37050,6 +37076,7 @@ impl eframe::App for SheetApp {
         // 空闲唤醒分层节流：仅在局域网协同或后台算表/存盘时保持 120ms 高频轮询，
         // 本地纯浏览/静止态降至 1.5s（有落盘锁文件）或 5s，避免白烧 GPU/CPU。
         let busy_ui = self.net.is_some()
+            || self.tasks.reorder.is_some()
             || self.tasks.busy
             || self.tasks.saving.is_some()
             || self.tasks.open_rx.is_some()

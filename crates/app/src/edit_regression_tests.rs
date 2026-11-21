@@ -3,8 +3,7 @@
 use super::*;
 
 fn app() -> SheetApp {
-    // 单测共享真实系统剪贴板：每个用例先清空，避免上一个用例留下的文本/HTML
-    // 被当前用例当成“用户在外部复制的新内容”。
+    // Start with an empty thread-local clipboard for each case.
     crate::clear_test_clipboard();
     SheetApp::new_with_context(&egui::Context::default(), None)
 }
@@ -115,6 +114,87 @@ fn external_plain_text_does_not_reuse_a_large_cut_selection() {
     app.clip_paste(false, Some("\t\n".into()));
     assert_eq!(app.wb.sheets[0].value(0, 1), Value::Empty);
     assert_eq!(app.wb.sheets[0].value(15_999, 0), Value::Number(15_999.0));
+}
+
+#[test]
+fn deferred_clipboard_snapshot_preserves_values_formulas_and_format_exports() {
+    let _env = crate::test_env::TestEnv::new("deferred-clipboard-snapshot");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.wb.sheets[0].set(0, 0, number(12.0));
+    app.wb.sheets[0].set(1, 0, formula("=A1+5"));
+    app.wb.sheets[0].set(1024, 0, text("end"));
+    app.sel = (0, 0);
+    app.sel_end = (1024, 0);
+    app.clip_copy(false, &ctx);
+    assert_eq!(app.deferred_clip_current(), Some(true));
+    let range = app.clip.as_ref().unwrap().deferred.clone().unwrap();
+    assert!(app.clip.as_ref().unwrap().cells.is_empty());
+    app.wb.sheets[0].set(0, 0, number(99.0));
+    let xml = office_clipboard::selection_xmlss(range.book(), 0, (0, 0, 1024, 0));
+    assert!(xml.contains("ss:Formula="));
+    assert!(xml.contains(">12</Data>"));
+    assert!(range.text().starts_with("12\n"));
+    app.sel = (0, 2);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(12.0));
+    assert_eq!(app.wb.sheets[0].get(1, 2).unwrap().formula.as_deref(), Some("=C1+5"));
+    assert_eq!(app.wb.sheets[0].value(1024, 2).display(), "end");
+}
+
+#[test]
+fn deferred_clipboard_cut_requires_unchanged_source_and_current_owner() {
+    let _env = crate::test_env::TestEnv::new("deferred-clipboard-cut");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.wb.sheets[0].set(0, 0, number(12.0));
+    app.wb.sheets[0].set(1, 0, formula("=A1+5"));
+    app.sel = (0, 0);
+    app.sel_end = (1024, 0);
+    app.clip_copy(true, &ctx);
+    let identical = app.clip.as_ref().unwrap().deferred.as_ref().unwrap().text();
+    app.wb.sheets[0].set(0, 0, number(99.0));
+    app.sel = (0, 2);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(99.0));
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Empty);
+    assert!(app.status.contains("重新剪切"));
+    crate::set_test_clipboard("");
+    app.clip_paste(false, None);
+    assert_eq!(app.deferred_clip_current(), Some(false));
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Empty);
+    crate::set_test_clipboard(&identical);
+    app.paste_link();
+    assert!(app.wb.sheets[0].get(0, 2).is_none());
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(12.0));
+    assert!(app.wb.sheets[0].get(1, 2).is_none_or(|cell| cell.formula.is_none()));
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(99.0));
+    app.sel = (0, 0);
+    app.sel_end = (1024, 0);
+    app.clip_copy(true, &ctx);
+    app.sel = (0, 4);
+    app.clip_paste(false, None);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
+    assert_eq!(app.wb.sheets[0].value(0, 4), Value::Number(99.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(99.0));
+    assert_eq!(app.wb.sheets[0].value(0, 4), Value::Empty);
+}
+
+#[test]
+fn deferred_clipboard_rejects_cutting_three_entire_columns_without_truncating() {
+    let _env = crate::test_env::TestEnv::new("deferred-clipboard-column-limit");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.sel = (0, 0);
+    app.sel_end = (1024, 0);
+    app.clip_copy(false, &ctx);
+    app.sel_end = (1_048_575, 2);
+    app.clip_copy(true, &ctx);
+    assert!(app.status.contains("超过 50 万格"));
+    assert_eq!(app.deferred_clip_current(), Some(true));
+    assert_eq!(app.clip.as_ref().unwrap().rect, (0, 0, 1024, 0));
 }
 
 #[test]
@@ -342,8 +422,8 @@ fn creating_a_refreshable_pivot_prevents_older_structure_undo_from_erasing_it() 
 
 #[test]
 fn chart_save_acknowledges_a_new_sheet_before_the_next_save() {
-    let dir = std::env::temp_dir().join(format!("native_chart_receipt_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let env = crate::test_env::TestEnv::new("chart-receipt");
+    let dir = env.root();
     let path = dir.join("chart.xlsx");
     let mut app = app();
     sheetcore::xlsx::save_atomic_with_receipt(&path, &app.wb).unwrap().apply_to(&mut app.wb);
@@ -363,7 +443,6 @@ fn chart_save_acknowledges_a_new_sheet_before_the_next_save() {
         sheetcore::xlsx::save_atomic_with_receipt(&path, &app.wb).unwrap().apply_to(&mut app.wb);
         assert_eq!(sheetcore::charts::load_charts(&path, "New").unwrap().len(), 1);
     }
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -384,6 +463,54 @@ fn overlapping_cut_is_one_reversible_transaction() {
     assert_eq!(values(&app), vec![Value::Number(1.0), Value::Number(2.0), Value::Empty]);
     app.do_undo(true);
     assert_eq!(values(&app), vec![Value::Empty, Value::Number(1.0), Value::Number(2.0)]);
+}
+
+#[test]
+fn clipboard_cross_sheet_merge_move_undo_checks_both_sides_before_changing_either() {
+    let _env = crate::test_env::TestEnv::new("clipboard-cross-sheet-merges");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    let horizontal = (0, 0, 0, 1);
+    let vertical = (0, 0, 1, 0);
+    app.wb.sheets[0].merges.push(horizontal);
+    app.wb.sheets[1].merges.push(vertical);
+    app.wb.sheets[0].set(0, 0, number(33.0));
+    app.wb.sheets[1].set(0, 0, number(88.0));
+    app.sel_end = (1, 1);
+    app.clip_copy(true, &ctx);
+    app.sheet_idx = 1;
+    app.clip_paste(false, None);
+    assert!(app.wb.sheets[0].merges.is_empty());
+    assert_eq!(app.wb.sheets[1].merges, [horizontal]);
+    app.wb.sheets[0].merges.push((0, 1, 1, 1));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[1].merges, [horizontal]);
+    assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(33.0));
+    app.wb.sheets[0].merges.clear();
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].merges, [horizontal]);
+    assert_eq!(app.wb.sheets[1].merges, [vertical]);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(33.0));
+    assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(88.0));
+    app.do_undo(true);
+    assert!(app.wb.sheets[0].merges.is_empty());
+    assert_eq!(app.wb.sheets[1].merges, [horizontal]);
+}
+
+#[test]
+fn clipboard_office_merge_and_its_values_undo_and_redo_together() {
+    let _env = crate::test_env::TestEnv::new("clipboard-office-merge-undo");
+    let mut app = app();
+    let block = office_clipboard::parse_html("<table><tr><td colspan='2'>73</td></tr></table>");
+    assert!(app.paste_office_block(&block));
+    assert_eq!(app.wb.sheets[0].merges, [(0, 0, 0, 1)]);
+    app.do_undo(false);
+    assert!(app.wb.sheets[0].merges.is_empty());
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
+    app.do_undo(true);
+    assert_eq!(app.wb.sheets[0].merges, [(0, 0, 0, 1)]);
+    assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(73.0));
 }
 
 #[test]
@@ -2238,6 +2365,23 @@ fn ctrl_d_fills_down_and_ctrl_r_fills_right() {
 }
 
 #[test]
+fn fill_shortcut_and_handle_preserve_reference_spelling_and_errors() {
+    let _env = crate::test_env::TestEnv::new("fill-reference-template");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(4, 4, formula("=sum($a5:B$2)+A1"));
+    app.wb.sheet_mut(0).set(4, 5, formula("=IF(B2=\"a1\",1,0)"));
+    app.sel = (4, 4);
+    app.sel_end = (8, 5);
+    app.fill_cmd(true);
+    assert_eq!(app.wb.sheet(0).get(8, 4).unwrap().formula.as_deref(), Some("=sum($A9:B$2)+A5"));
+    assert_eq!(app.wb.sheet(0).get(8, 5).unwrap().formula.as_deref(), Some("=IF(B6=\"a1\",1,0)"));
+    app.sel = (4, 4);
+    app.sel_end = (4, 4);
+    app.smart_fill_to_mode(2, true, crate::fill_seq::FillMode::CopyCells, false);
+    assert_eq!(app.wb.sheet(0).get(2, 4).unwrap().formula.as_deref(), Some("=sum($A3:B$2)+#REF!"));
+}
+
+#[test]
 fn fill_down_limit_follows_neighbour_column() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
@@ -2365,7 +2509,7 @@ fn cut_from_a_protected_sheet_cannot_be_pasted() {
     second.protection = Some(sheetcore::protection::SheetProtection::default());
     app.wb.sheets.push(second);
     let cells = vec![vec![(Cell { value: sheetcore::model::Value::Number(7.0), formula: None }, 0)]];
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
     app.sheet_idx = 0;
     app.sel = (2, 2);
     let before = snapshot(&app);
@@ -2388,7 +2532,7 @@ fn paste_special_values_transpose_and_operations() {
         vec![(num(1.0), 0), (num(2.0), 0)],
         vec![(num(3.0), 0), (num(4.0), 0)],
     ];
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells,
@@ -2427,7 +2571,7 @@ fn paste_special_formula_shifts_relative_and_keeps_absolute() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     let src = Cell { value: Value::Number(5.0), formula: Some("=A1+$B$1".into()) };
-    let clip = |rect: (u32, u32, u32, u32)| Clip { source_rows: None, merges: Vec::new(),
+    let clip = |rect: (u32, u32, u32, u32)| Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect,
         cells: vec![vec![(src.clone(), 0)]],
@@ -2470,7 +2614,7 @@ fn paste_special_all_carries_font_and_fill_and_undoes_once() {
         ..Default::default()
     });
     let cell = Cell { value: Value::Number(9.0), formula: None };
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(cell, sid as u16)]],
@@ -2502,7 +2646,7 @@ fn paste_special_transpose_keeps_source_coordinates() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     // 源 A1:B1，两个公式分别为 =A1 与 =B1
     let f = |t: &str| (Cell { value: Value::Empty, formula: Some(t.into()) }, 0u16);
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 1),
         cells: vec![vec![f("=A1"), f("=B1")]],
@@ -2544,7 +2688,7 @@ fn paste_special_divide_by_zero_reports_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(8.0), formula: None });
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (5, 5, 5, 5),
         cells: vec![vec![(Cell { value: Value::Number(0.0), formula: None }, 0)]],
@@ -3211,6 +3355,7 @@ fn one_undo_restores_previous_value_and_redo_reapplies() {
 
 #[test]
 fn committed_value_survives_save_and_reload() {
+    let _env = crate::test_env::TestEnv::new("typed-save-reload");
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     ui_frame(&mut app, &ctx, vec![]);
@@ -4606,7 +4751,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
         let depth = app.undo.depth();
         // 2×2 剪贴板：选择性粘贴的目标区域是锚点 + 剪贴板尺寸，这样才会覆盖被锁的 B2
         let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-        let clip = Clip { source_rows: None, merges: Vec::new(),
+        let clip = Clip { deferred: None, source_rows: None, merges: Vec::new(),
             sheet: 0,
             rect: (0, 0, 1, 1),
             cells: vec![vec![cell("粘贴"), cell("粘贴")], vec![cell("粘贴"), cell("粘贴")]],
@@ -4641,7 +4786,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
 
     // 普通粘贴：2×2 内部剪贴板 → 目标覆盖 B2
     let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("P"), cell("P")], vec![cell("P"), cell("P")]],
@@ -4652,7 +4797,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
     assert!(app.status.contains("戊"), "粘贴应指出锁持有人：{}", app.status);
 
     // 剪切粘贴：源块里就有被锁格
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("C"), cell("C")], vec![cell("C"), cell("C")]],
@@ -5379,6 +5524,22 @@ fn find_dialog_and_results_window_render() {
 /// UI-10：Ctrl+F/Ctrl+H 必须分别落到“查找/替换”页签，不能总是查找页。
 /// UI-18：清除条件保留筛选器/箭头，关闭筛选才移除；手动隐藏行走独立集合。
 #[test]
+fn subtotal_command_accepts_more_than_twenty_thousand_details() {
+    let _env = crate::test_env::TestEnv::new("large-subtotal");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0, 0, text("Group"));
+    sheet.set(0, 1, text("Amount"));
+    for row in 1..=20_001 {
+        sheet.set(row, 0, text("A"));
+        sheet.set(row, 1, number(1.0));
+    }
+    app.subtotal_run("A1:B20002", "A", "B", sheetcore::subtotal::SubFn::Sum).unwrap();
+    assert_eq!(app.wb.sheet(0).value(20_003, 1), Value::Number(20_001.0));
+}
+
+#[test]
 fn filter_clear_keeps_filter_and_manual_hidden_rows() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
@@ -5641,7 +5802,7 @@ fn paste_special_formula_translates_negative_and_positive_offsets() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     let f = |s: &str| Cell { value: Value::Number(3.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(2, 2, f("=A1+$B$1")); // C3
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
@@ -5681,7 +5842,7 @@ fn paste_special_transpose_keeps_original_source_coordinates() {
     let f = |s: &str| Cell { value: Value::Number(1.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(0, 0, f("=A2")); // A1
     app.wb.sheet_mut(0).set(1, 0, f("=A3")); // A2
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 0),
         cells: vec![
@@ -5719,7 +5880,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: Some("=3+4".into()) });
     app.wb.sheet_mut(0).set_style(0, 0, sid);
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), sid)]],
@@ -5737,7 +5898,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     // 除以 0：显示 #DIV/0!，不能静默保留原值
     app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Number(5.0), formula: None });
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(0.0), formula: None });
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)]],
@@ -5768,6 +5929,7 @@ fn tsv_parsing_keeps_blank_rows_between_values() {
 /// UI-27.1：合并先提示丢内容；取消不动；确认后只保留锚点、可撤销/重做并保存。
 #[test]
 fn merge_warns_cancel_keeps_data_and_confirm_is_undoable() {
+    let _env = crate::test_env::TestEnv::new("merge-save-undo");
     use sheetcore::model::Value;
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
@@ -5906,7 +6068,7 @@ fn paste_special_all_translates_formula_offsets() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$1".into()) });
     app.wb.sheet_mut(0).set_style(2, 2, sid);
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), sid)]],
@@ -5938,7 +6100,7 @@ fn paste_special_transpose_negative_offset_is_ref_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(1.0), formula: Some("=A1".into()) }); // C3
-    app.clip = Some(Clip { source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
@@ -7490,6 +7652,39 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
     assert_eq!(order, vec!["2", "4", "1", "3"], "先组后编号");
     assert_eq!(app.wb.sheet(0).get(5, 0).unwrap().value.display(), "99", "选区外不动");
     assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "编号", "标题保留");
+}
+
+#[test]
+fn large_sparse_sort_undo_covers_new_destinations_and_concurrent_edits() {
+    let env = crate::test_env::TestEnv::new("large_sort_undo");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(2.0));
+    app.wb.sheet_mut(0).set(30_000, 0, number(1.0));
+    app.wb.sheet_mut(0).set(30_000, 20, text("moved"));
+    let rect = (0, 0, 30_000, 20);
+    let wait = |app: &mut SheetApp| {
+        let start = std::time::Instant::now();
+        while app.tasks.reorder.is_some() {
+            app.poll_reorder();
+            assert!(start.elapsed().as_secs() < 20);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    app.sort_region(rect, 0, true);
+    assert!(app.tasks.reorder.is_some());
+    wait(&mut app);
+    assert_eq!(app.wb.sheet(0).value(0, 20).display(), "moved");
+    assert!(app.wb.sheet(0).style_edits.is_empty());
+    app.do_undo(false);
+    assert!(app.wb.sheet(0).get(0, 20).is_none());
+    assert_eq!(app.wb.sheet(0).value(30_000, 20).display(), "moved");
+    assert!(app.wb.sheet(0).style_edits.is_empty());
+    app.sort_region(rect, 0, true);
+    app.wb.sheet_mut(0).set(30_000, 20, text("newer edit"));
+    wait(&mut app);
+    assert_eq!(app.wb.sheet(0).value(30_000, 20).display(), "newer edit");
+    assert!(app.wb.sheet(0).get(0, 20).is_none());
+    drop(env);
 }
 
 /// UI-13.3：对话框宽度在小窗口内收缩，大屏保持原宽。
@@ -9569,8 +9764,8 @@ fn undo_history_belongs_to_its_own_document() {
 
 #[test]
 fn background_save_finishes_in_its_own_tab_after_switching() {
-    let dir = std::env::temp_dir().join(format!("sc_qa043_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let env = crate::test_env::TestEnv::new("background-save-tabs");
+    let dir = env.root();
     let path1 = dir.join("doc1.xlsx");
     sheetcore::xlsx::save(&path1, &sheetcore::model::Workbook::new_blank()).expect("造空文件");
 
@@ -9620,7 +9815,6 @@ fn background_save_finishes_in_its_own_tab_after_switching() {
         Some("dirty2".to_string())
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -10945,4 +11139,22 @@ fn visible_axes_reuse_geometry_and_refresh_for_same_size_visibility_edits() {
     let (_, rows) = app.view_axes();
     assert_eq!(rows.size(1), 45.0);
     assert_eq!(rows.size(2), 0.0);
+}
+
+
+#[test]
+fn large_fill_down_records_the_last_destination_and_can_undo_it() {
+    let _env = crate::test_env::TestEnv::new("large-fill-undo");
+    let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: None });
+    app.sel = (0, 0);
+    app.sel_end = (100_000, 2);
+    let start = std::time::Instant::now();
+    app.fill_cmd(true);
+    eprintln!("Ctrl+D, 300,003 selected cells: {:?}", start.elapsed());
+    assert_eq!(app.wb.sheet(0).value(100_000, 0), Value::Number(7.0));
+    assert!(app.wb.sheet(0).get(100_000, 2).is_none());
+    app.do_undo(false);
+    assert!(app.wb.sheet(0).get(100_000, 0).is_none());
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(7.0));
 }

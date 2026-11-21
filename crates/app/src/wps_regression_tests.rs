@@ -172,6 +172,13 @@ fn cat1_four_way_smart_fill_and_reapply_fill_mode() {
     assert_eq!(app.wb.sheet(0).value(2, 0).display(), "星期一");
     assert_eq!(app.wb.sheet(0).value(3, 0).display(), "星期一");
 
+    // A lease acquired after the first fill must leave the filled cells intact.
+    let now = app.lock_now();
+    app.locks.request(0, 0, 0, 93, "协作者", now);
+    app.reapply_last_fill(fill_seq::FillMode::Smart);
+    assert_eq!(app.wb.sheet(0).value(3, 0).display(), "星期一");
+    assert!(app.status.contains("协作者"));
+
     // Upward fill reverse sequence: row 5="第2组", row 6="第3组" -> fill up to row 3
     app.wb.sheet_mut(0).set(5, 1, Cell { value: Value::Text("第2组".into()), formula: None });
     app.wb.sheet_mut(0).set(6, 1, Cell { value: Value::Text("第3组".into()), formula: None });
@@ -652,7 +659,7 @@ fn menu_enrichment_paste_suite() {
     // 复制 A1
     app.sel = (0, 0);
     app.sel_end = (0, 0);
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { deferred: None,
         source_rows: None,
         sheet: 0,
         rect: (0, 0, 0, 0),
@@ -718,7 +725,7 @@ fn menu_enrichment_paste_suite() {
     // 7. 跳过空单元格（ps_skip_blanks）
     app.switch_sheet_view(0);
     app.wb.sheet_mut(0).set(2, 0, Cell { value: Value::Text("保留原字".into()), formula: None });
-    app.clip = Some(Clip {
+    app.clip = Some(Clip { deferred: None,
         source_rows: None,
         sheet: 0,
         rect: (0, 0, 0, 0),

@@ -1,9 +1,12 @@
 //! 数据工具：多级排序、删除重复、分列。
 //!
-//! 和 Excel 一样：排序前整块备份（按原始行序），落位后写回；删除重复保留第一次出现；
+//! 排序和去重先生成实际变更，再一次提交；删除重复保留第一次出现；
 //! 分列把一格按分隔符拆到右边相邻的列，右边的原有内容会被推开。
 
 use crate::model::{Cell, Sheet, Value};
+use crate::undo::CellDelta;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 /// 文本排序方式（Excel 的“排序依据”）
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -41,254 +44,389 @@ impl SortKey {
     }
 }
 
-/// 比较两个格子引用（空值永远排最后；零克隆比较避免 O(N log N) 重复深拷贝 Cell）
-fn cmp_cell_ref(
-    a: &Cell,
-    b: &Cell,
-    ignore_case: bool,
-    mode: &SortMode,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (&a.value, &b.value) {
-        (Value::Empty, Value::Empty) => Ordering::Equal,
-        (Value::Empty, _) => Ordering::Greater,
-        (_, Value::Empty) => Ordering::Less,
-        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Number(_), _) => Ordering::Less,
-        (_, Value::Number(_)) => Ordering::Greater,
-        (av, bv) => {
-            let (x, y) = (av.display(), bv.display());
-            let (x, y) = if ignore_case {
-                (x.to_lowercase(), y.to_lowercase())
-            } else {
-                (x, y)
-            };
-            match mode {
-                SortMode::Default => x.cmp(&y),
-                SortMode::Pinyin => crate::collate::cmp_pinyin(&x, &y),
-                SortMode::Stroke => crate::collate::cmp_stroke(&x, &y),
-                SortMode::Custom(list) => {
-                    let rank = |v: &str| -> Option<usize> {
-                        let t = v.trim();
-                        list.iter().position(|it| it.trim().eq_ignore_ascii_case(t))
-                    };
-                    match (rank(&x), rank(&y)) {
-                        (Some(i), Some(j)) => i.cmp(&j),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => crate::collate::cmp_pinyin(&x, &y),
+/// Precompute the display, locale and stroke keys once per row and sort level.
+struct PreparedKey {
+    number: Option<f64>,
+    boolean: Option<bool>,
+    empty: bool,
+    text: Vec<u8>,
+    custom: Option<usize>,
+    strokes: Vec<Option<u16>>,
+}
+
+impl PreparedKey {
+    fn new(value: &Value, spec: &SortKey, ranks: &HashMap<String, usize>) -> Self {
+        let mut result = Self {
+            number: None,
+            boolean: None,
+            empty: false,
+            text: Vec::new(),
+            custom: None,
+            strokes: Vec::new(),
+        };
+        match value {
+            Value::Number(n) => {
+                result.number = Some(*n);
+                return result;
+            }
+            Value::Empty => {
+                result.empty = true;
+                return result;
+            }
+            Value::Bool(b) => result.boolean = Some(*b),
+            _ => {}
+        }
+        let mut text = value.display();
+        if spec.ignore_case {
+            text = text.to_lowercase();
+        }
+        if matches!(spec.mode, SortMode::Stroke) {
+            result.strokes = text.chars().map(crate::collate::stroke_rank).collect();
+        }
+        if matches!(spec.mode, SortMode::Custom(_)) {
+            result.custom = ranks.get(&text.trim().to_ascii_lowercase()).copied();
+        }
+        result.text = if matches!(spec.mode, SortMode::Default) {
+            text.into_bytes()
+        } else {
+            crate::collate::sort_key(&text)
+        };
+        result
+    }
+
+    fn compare(&self, other: &Self, ascending: bool) -> Ordering {
+        if self.empty || other.empty {
+            return self.empty.cmp(&other.empty);
+        }
+        let order = match (self.number, other.number) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            _ => match (self.boolean, other.boolean) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => match (self.custom, other.custom) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => self.compare_text(other),
+                },
+            },
+        };
+        if ascending { order } else { order.reverse() }
+    }
+
+    fn compare_text(&self, other: &Self) -> Ordering {
+        for (a, b) in self.strokes.iter().zip(&other.strokes) {
+            match (a, b) {
+                (Some(x), Some(y)) if x != y => return x.cmp(y),
+                (Some(_), Some(_)) => {}
+                _ => return self.text.cmp(&other.text),
+            }
+        }
+        self.strokes
+            .len()
+            .cmp(&other.strokes.len())
+            .then_with(|| self.text.cmp(&other.text))
+    }
+}
+
+/// Ordered cells to change, suitable for one undo action. Every value is read
+/// before mutation, including destinations that were empty before the operation.
+#[derive(Debug, Default)]
+pub struct RowChanges {
+    pub deltas: Vec<CellDelta>,
+    pub count: usize,
+}
+
+impl RowChanges {
+    pub fn apply(&self, sheet: &mut Sheet) {
+        for d in &self.deltas {
+            if d.before != d.after {
+                sheet.set(d.row, d.col, d.after.clone());
+            }
+            if d.before_style != d.after_style {
+                sheet.set_style(d.row, d.col, d.after_style);
+            }
+        }
+    }
+}
+
+/// `order` contains source lines in destination order. Fewer lines than the
+/// region means deduplication: clear the tail's contents but retain its styles.
+pub(crate) fn reorder_lines(
+    sheet: &Sheet,
+    sheet_idx: usize,
+    rect: (u32, u32, u32, u32),
+    order: &[u32],
+    horizontal: bool,
+    dedup: bool,
+) -> RowChanges {
+    let (r1, c1, r2, c2) = rect;
+    let (first, last, start, end) = if horizontal { (c1, c2, r1, r2) } else { (r1, r2, c1, c2) };
+    let lines = (last - first + 1) as usize;
+    let mut changes = RowChanges::default();
+    changes.count = if dedup {
+        lines - order.len()
+    } else {
+        order
+            .iter()
+            .enumerate()
+            .filter(|&(i, &src)| src != first + i as u32)
+            .count()
+    };
+    if changes.count == 0 {
+        return changes;
+    }
+
+    let mut collect = |dst: u32, offset: u32| {
+        let src = order.get((dst - first) as usize).copied();
+        if src == Some(dst) {
+            return;
+        }
+        let coords = |line| if horizontal { (offset, line) } else { (line, offset) };
+        let (row, col) = coords(dst);
+        let before = sheet.get(row, col);
+        let before_style = sheet.style_of(row, col);
+        let (source, after_style) = match src.map(coords) {
+            Some((r, c)) => (sheet.get(r, c), sheet.style_of(r, c)),
+            None => (None, before_style),
+        };
+        let translated = source
+            .and_then(|cell| cell.formula.as_deref())
+            .filter(|_| !dedup)
+            .map(|formula| {
+                let shift = i64::from(dst) - i64::from(src.unwrap());
+                crate::refs::translate(
+                    formula,
+                    if horizontal { 0 } else { shift },
+                    if horizontal { shift } else { 0 },
+                    &sheet.name,
+                )
+                .into_boxed_str()
+            });
+        if translated.is_none() && before == source && before_style == after_style {
+            return;
+        }
+        let mut after = source.cloned().unwrap_or_default();
+        if let Some(f) = translated {
+            after.formula = Some(f);
+        }
+        let before = before.cloned().unwrap_or_default();
+        if before != after || before_style != after_style {
+            changes.deltas.push(CellDelta {
+                sheet: sheet_idx,
+                row,
+                col,
+                before,
+                after,
+                before_style,
+                after_style,
+            });
+        }
+    };
+
+    // Dense data: one linear pass without a rectangle-sized source snapshot.
+    // Sparse data: only the union of occupied source/destination coordinates
+    // can change, except where different inherited line styles cross.
+    let area = lines as u64 * (end - start + 1) as u64;
+    if area <= 4096 || area <= (sheet.len() + sheet.styles.len()) as u64 * 4 {
+        for dst in first..=last {
+            if order.get((dst - first) as usize) == Some(&dst) {
+                continue;
+            }
+            for offset in start..=end {
+                collect(dst, offset);
+            }
+        }
+    } else {
+        let mut inverse = vec![None; lines];
+        for (i, &src) in order.iter().enumerate() {
+            inverse[(src - first) as usize] = Some(first + i as u32);
+        }
+        let mut candidates = Vec::new();
+        for k in sheet.stored_cells().map(|(k, _)| k).chain(sheet.styles.keys()) {
+            if k.row < r1 || k.row > r2 || k.col < c1 || k.col > c2 {
+                continue;
+            }
+            let (line, offset) = if horizontal { (k.col, k.row) } else { (k.row, k.col) };
+            if order.get((line - first) as usize) != Some(&line) {
+                candidates.push((line, offset));
+            }
+            if let Some(dst) = inverse[(line - first) as usize] {
+                if dst != line {
+                    candidates.push((dst, offset));
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let inherited = if horizontal {
+            &sheet.col_styles
+        } else {
+            &sheet.row_styles
+        };
+        let different_style = |dst: u32| {
+            order
+                .get((dst - first) as usize)
+                .is_some_and(|src| inherited.get(src) != inherited.get(&dst))
+        };
+        for (dst, offset) in candidates {
+            if !different_style(dst) {
+                collect(dst, offset);
+            }
+        }
+        if !inherited.is_empty() {
+            for dst in first..=last {
+                if different_style(dst) {
+                    for offset in start..=end {
+                        collect(dst, offset);
                     }
                 }
             }
         }
     }
+    changes
 }
 
-/// 多级排序；返回实际移动的行数。调用方须重建依赖图并重算工作簿。
-/// 不可排序的数组/合并区保持原样并返回 0；UI 可先调用 validate_sort_region 显示原因。
-pub fn sort_multi(
-    sheet: &mut Sheet,
+pub fn plan_sort_multi(
+    sheet: &Sheet,
+    sheet_idx: usize,
     region: (u32, u32, u32, u32),
     keys: &[SortKey],
     header: bool,
-) -> usize {
-    let (r1, c1, mut r2, mut c2) = region;
-    let r1 = if header { r1 + 1 } else { r1 };
-    if r2 <= r1 || keys.is_empty() {
-        return 0;
+) -> Result<RowChanges, String> {
+    let (mut r1, c1, mut r2, mut c2) = region;
+    if header {
+        r1 = r1.saturating_add(1);
+    }
+    if r2 <= r1 || c2 < c1 || keys.is_empty() {
+        return Ok(RowChanges::default());
     }
     if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
-        if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
-            r2 = r2.min(ur2);
-            c2 = c2.min(uc2.max(keys.iter().map(|k| k.col).max().unwrap_or(c1)));
-        } else {
-            return 0;
-        }
+        let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
+            return Ok(RowChanges::default());
+        };
+        r2 = r2.min(ur2);
+        c2 = c2.min(uc2.max(keys.iter().map(|k| k.col).max().unwrap_or(c1)));
         if r2 <= r1 || c2 < c1 {
-            return 0;
+            return Ok(RowChanges::default());
         }
     }
-    if crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2)).is_err() {
-        return 0;
+    crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
+    let mut order: Vec<_> = (r1..=r2).collect();
+    for key in keys.iter().rev().filter(|k| (c1..=c2).contains(&k.col)) {
+        let mut ranks = HashMap::new();
+        if let SortMode::Custom(values) = &key.mode {
+            for (idx, value) in values.iter().enumerate() {
+                ranks.entry(value.trim().to_ascii_lowercase()).or_insert(idx);
+            }
+        }
+        let values: Vec<_> = (r1..=r2)
+            .map(|r| {
+                let value = sheet.get(r, key.col).map(|cell| &cell.value).unwrap_or(&Value::Empty);
+                PreparedKey::new(value, key, &ranks)
+            })
+            .collect();
+        // Stable passes keep ties in the order established by lower priorities.
+        order.sort_by(|&a, &b| values[(a - r1) as usize].compare(&values[(b - r1) as usize], key.asc));
     }
-    let width = (c2 - c1 + 1) as usize;
-    // 整块备份（原样，含样式，只保留一份快照）
-    let mut rows: Vec<(u32, Vec<(Cell, u16)>)> = Vec::with_capacity((r2 - r1 + 1) as usize);
-    for r in r1..=r2 {
-        let mut line = Vec::with_capacity(width);
-        for c in c1..=c2 {
-            let cell = sheet.get(r, c).cloned().unwrap_or(Cell {
-                value: Value::Empty,
-                formula: None,
-            });
-            line.push((cell, sheet.style_of(r, c)));
-        }
-        rows.push((r, line));
-    }
-    let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by(|&i, &j| {
-        for k in keys {
-            if k.col < c1 {
-                continue;
-            }
-            let ci = (k.col - c1) as usize;
-            if ci >= rows[i].1.len() {
-                continue;
-            }
-            let a = &rows[i].1[ci].0;
-            let b = &rows[j].1[ci].0;
-            let mut ord = cmp_cell_ref(a, b, k.ignore_case, &k.mode);
-            if !k.asc {
-                ord = ord.reverse();
-            }
-            // 空值不参与反向：空永远最后
-            let a_empty = matches!(a.value, Value::Empty);
-            let b_empty = matches!(b.value, Value::Empty);
-            if a_empty != b_empty {
-                ord = if a_empty {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
-                };
-            }
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-    let mut moved = 0;
-    for (target_r, &src_i) in order.iter().enumerate() {
-        let r = r1 + target_r as u32;
-        for (k, (cell, st)) in rows[src_i].1.iter().enumerate() {
-            let c = c1 + k as u32;
-            if !cell.is_blank() || sheet.get(r, c).is_some() {
-                sheet.set(r, c, crate::sort_filter::sorted_cell(cell, rows[src_i].0, r, &sheet.name));
-            }
-            sheet.set_style(r, c, *st);
-        }
-        if order[target_r] != target_r {
-            moved += 1;
-        }
-    }
-    moved
+    Ok(reorder_lines(sheet, sheet_idx, (r1, c1, r2, c2), &order, false, false))
 }
 
-/// 删除重复行（按指定列判断），保留第一次出现；返回删除的行数
-/// 只统计重复行数，不改表（去重预览）。
-pub fn count_duplicates(
+pub fn sort_multi(sheet: &mut Sheet, region: (u32, u32, u32, u32), keys: &[SortKey], header: bool) -> usize {
+    let changes = plan_sort_multi(sheet, 0, region, keys, header).unwrap_or_default();
+    changes.apply(sheet);
+    changes.count
+}
+
+fn distinct_rows(
     sheet: &Sheet,
     region: (u32, u32, u32, u32),
     cols: &[u32],
     header: bool,
-) -> usize {
+) -> Option<((u32, u32, u32, u32), Vec<u32>)> {
     let (mut r1, c1, mut r2, mut c2) = region;
     if header && r2 > r1 {
         r1 += 1;
     }
-    if r2 < r1 {
-        return 0;
+    if r2 < r1 || c2 < c1 {
+        return None;
     }
     if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
-        let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
-            return 0;
-        };
+        let (_, _, ur2, uc2) = sheet.used_bounds()?;
         r2 = r2.min(ur2);
         c2 = c2.min(uc2);
         if r2 < r1 || c2 < c1 {
-            return 0;
+            return None;
         }
     }
-    let use_cols: Vec<u32> = if cols.is_empty() {
+    let use_cols = if cols.is_empty() {
         (c1..=c2).collect()
     } else {
         cols.to_vec()
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut dup = 0usize;
-    for r in r1..=r2 {
-        let key: String = use_cols
-            .iter()
-            .map(|c| sheet.get(r, *c).map(|x| x.value.display()).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\u{1}");
-        if !seen.insert(key) {
-            dup += 1;
+    // Sparse signatures omit empty strings and retain the field position,
+    // so embedded delimiters cannot collide with a different column layout.
+    let mut seen = HashSet::new();
+    let mut keep = Vec::new();
+    let area = (r2 - r1 + 1) as u64 * use_cols.len() as u64;
+    if area > 4096 && area > sheet.len() as u64 * 4 {
+        let selected: HashSet<_> = use_cols.iter().copied().collect();
+        let mut by_row: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        for (k, cell) in sheet.stored_cells() {
+            if (r1..=r2).contains(&k.row) && selected.contains(&k.col) {
+                let text = cell.value.display();
+                if !text.is_empty() {
+                    by_row.entry(k.row).or_default().push((k.col, text));
+                }
+            }
+        }
+        for row in r1..=r2 {
+            let mut signature = by_row.remove(&row).unwrap_or_default();
+            signature.sort_unstable_by_key(|(c, _)| *c);
+            if seen.insert(signature) {
+                keep.push(row);
+            }
+        }
+    } else {
+        for row in r1..=r2 {
+            let signature: Vec<_> = use_cols
+                .iter()
+                .filter_map(|&c| {
+                    let text = sheet.get(row, c)?.value.display();
+                    (!text.is_empty()).then_some((c, text))
+                })
+                .collect();
+            if seen.insert(signature) {
+                keep.push(row);
+            }
         }
     }
-    dup
+    Some(((r1, c1, r2, c2), keep))
 }
 
-pub fn remove_duplicates(
-    sheet: &mut Sheet,
+pub fn count_duplicates(sheet: &Sheet, region: (u32, u32, u32, u32), cols: &[u32], header: bool) -> usize {
+    distinct_rows(sheet, region, cols, header)
+        .map_or(0, |((r1, _, r2, _), keep)| (r2 - r1 + 1) as usize - keep.len())
+}
+
+pub fn plan_remove_duplicates(
+    sheet: &Sheet,
+    sheet_idx: usize,
     region: (u32, u32, u32, u32),
     cols: &[u32],
     header: bool,
-) -> usize {
-    let (r1, c1, mut r2, mut c2) = region;
-    let r1 = if header && r2 > r1 { r1 + 1 } else { r1 };
-    if r2 < r1 {
-        return 0;
-    }
-    if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
-        let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
-            return 0;
-        };
-        r2 = r2.min(ur2);
-        c2 = c2.min(uc2);
-        if r2 < r1 || c2 < c1 {
-            return 0;
-        }
-    }
-    let use_cols: Vec<u32> = if cols.is_empty() {
-        (c1..=c2).collect()
-    } else {
-        cols.to_vec()
+) -> RowChanges {
+    let Some((region, keep)) = distinct_rows(sheet, region, cols, header) else {
+        return RowChanges::default();
     };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut keep: Vec<u32> = Vec::new();
-    for r in r1..=r2 {
-        let key: String = use_cols
-            .iter()
-            .map(|c| sheet.get(r, *c).map(|x| x.value.display()).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\u{1}");
-        if seen.insert(key) {
-            keep.push(r);
-        }
-    }
-    let removed = (r2 - r1 + 1) as usize - keep.len();
-    if removed == 0 {
-        return 0;
-    }
-    // 把保留的行依次搬到顶部，再清掉尾部
-    let mut snapshot: Vec<Vec<(Cell, u16)>> = Vec::new();
-    for r in keep.iter() {
-        let mut line = Vec::new();
-        for c in c1..=c2 {
-            let cell = sheet.get(*r, c).cloned().unwrap_or(Cell {
-                value: Value::Empty,
-                formula: None,
-            });
-            line.push((cell, sheet.style_of(*r, c)));
-        }
-        snapshot.push(line);
-    }
-    for (i, line) in snapshot.iter().enumerate() {
-        let r = r1 + i as u32;
-        for (k, (cell, st)) in line.iter().enumerate() {
-            let c = c1 + k as u32;
-            sheet.set(r, c, cell.clone());
-            sheet.set_style(r, c, *st);
-        }
-    }
-    for r in r1 + snapshot.len() as u32..=r2 {
-        for c in c1..=c2 {
-            sheet.set(r, c, Cell { value: Value::Empty, formula: None });
-        }
-    }
-    removed
+    reorder_lines(sheet, sheet_idx, region, &keep, false, true)
+}
+
+pub fn remove_duplicates(sheet: &mut Sheet, region: (u32, u32, u32, u32), cols: &[u32], header: bool) -> usize {
+    let changes = plan_remove_duplicates(sheet, 0, region, cols, header);
+    changes.apply(sheet);
+    changes.count
 }
 
 /// 分列：按分隔符把每格拆到右边相邻列（右侧内容整体右移腾位置）

@@ -95,6 +95,19 @@ pub fn view_at_value_fit(
     value_override: Option<&Value>,
     cap: Option<usize>,
 ) -> Option<CellView> {
+    view_with_merge(wb, sheet, r, c, overlay, value_override, cap, merge_span(sheet, r, c))
+}
+
+pub(crate) fn view_with_merge(
+    wb: &Workbook,
+    sheet: &Sheet,
+    r: u32,
+    c: u32,
+    overlay: Option<&Overlay>,
+    value_override: Option<&Value>,
+    cap: Option<usize>,
+    merge: Option<(u32, u32, u32, u32)>,
+) -> Option<CellView> {
     let cell = sheet.get(r, c);
     let st: &CellStyle = wb.styles.get(sheet.style_of(r, c));
     let has_style = st.fill.is_some()
@@ -160,7 +173,7 @@ pub fn view_at_value_fit(
         wrap: st.wrap,
         rotation: st.rotation,
         indent: st.indent,
-        merge: merge_span(sheet, r, c),
+        merge,
         fill,
         bar,
     })

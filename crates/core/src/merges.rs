@@ -145,13 +145,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         let Ok(mut f) = zip.by_name(&entry) else { continue };
         let mut xml = String::new();
         let _ = f.read_to_string(&mut xml);
-        let mut lay = parse_layout(&xml);
-        lay.scenarios = crate::scenarios::parse(&xml);
-        lay.cf = crate::cf::parse_cf_blocks(&xml);
-        lay.cf_ext = crate::cf::xml_has_cf_ext(&xml);
-        lay.dxfs = dxfs.clone();
-        lay.dxf_ext = crate::cf::dxfs_unsupported(&styles_xml);
-        lay.dv = crate::dv::parse_validations(&xml);
+        let lay = sheet_layout(&xml, &dxfs, crate::cf::dxfs_unsupported(&styles_xml));
         if !lay.merges.is_empty()
             || lay.col_default.is_some()
             || !lay.col_widths.is_empty()
@@ -177,6 +171,17 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
         }
     }
     Ok(out)
+}
+
+pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) -> SheetLayout {
+    let mut layout = parse_layout(xml);
+    layout.scenarios = crate::scenarios::parse(xml);
+    layout.cf = crate::cf::parse_cf_blocks(xml);
+    layout.cf_ext = crate::cf::xml_has_cf_ext(xml);
+    layout.dxfs = dxfs.to_vec();
+    layout.dxf_ext = dxf_ext;
+    layout.dv = crate::dv::parse_validations(xml);
+    layout
 }
 
 /// 一次扫描拿到合并区域、列宽、行高、冻结窗格
@@ -560,5 +565,43 @@ mod tests {
         let xml = r#"<worksheet><mergeCells count="2"><mergeCell ref="A1:B2"/><mergeCell ref="D5:F9"/></mergeCells></worksheet>"#;
         let m = parse_merges(xml);
         assert_eq!(m, vec![(0, 0, 1, 1), (4, 3, 8, 5)]);
+    }
+}
+
+
+type MergeRect = (u32, u32, u32, u32);
+
+/// Row intervals ordered by their first row, with prefix maxima for the last row.
+/// Retain source indices so overlapping imported merges keep their original precedence.
+#[derive(Default)]
+pub struct MergeIndex {
+    source: Vec<MergeRect>,
+    order: Vec<usize>,
+    ends: Vec<u32>,
+}
+
+impl MergeIndex {
+    pub fn refresh(&mut self, merges: &[MergeRect]) {
+        if self.source == merges { return; }
+        self.source.clear();
+        self.source.extend_from_slice(merges);
+        self.order.clear();
+        self.order.extend(0..merges.len());
+        self.order.sort_unstable_by_key(|&i| merges[i].0);
+        let mut bottom = 0;
+        self.ends.clear();
+        self.ends.extend(self.order.iter().map(|&i| {
+            bottom = bottom.max(merges[i].2);
+            bottom
+        }));
+    }
+
+    pub fn at(&self, r: u32, c: u32) -> Option<MergeRect> {
+        let start = self.ends.partition_point(|&end| end < r);
+        let end = self.order.partition_point(|&i| self.source[i].0 <= r);
+        self.order.get(start..end)?.iter().copied().filter(|&i| {
+            let (_, left, bottom, right) = self.source[i];
+            r <= bottom && left <= c && c <= right
+        }).min().map(|i| self.source[i])
     }
 }

@@ -8,6 +8,7 @@ mod compiled;
 #[cfg(test)]
 mod performance_tests;
 use compiled::compile_at;
+pub use compiled::RuleFormulas;
 pub mod deps;
 pub mod dist;
 pub mod extra;
@@ -78,6 +79,23 @@ pub enum Node {
     Binary(BinOp, Box<Node>, Box<Node>),
     /// 数组常量 {1,2;3,4}
     Array(usize, usize, Vec<FValue>),
+}
+
+/// Excel omits referenced cells containing a nested SUBTOTAL. Check the AST
+/// only for possible calls, so text literals and similarly named identifiers count normally.
+fn contains_subtotal(wb: &Workbook, sheet: usize, src: &str, row: u32, col: u32) -> bool {
+    fn has_call(n: &Node) -> bool {
+        match n {
+            Node::Func(name, args) => name.eq_ignore_ascii_case("SUBTOTAL") || args.iter().any(has_call),
+            Node::Unary(_, n) | Node::Implicit(n) | Node::Percent(n) => has_call(n),
+            Node::Binary(_, left, right) => has_call(left) || has_call(right),
+            _ => false,
+        }
+    }
+    if !src.as_bytes().windows(8).any(|w| w.eq_ignore_ascii_case(b"SUBTOTAL")) { return false; }
+    let raw = src.strip_prefix('=').unwrap_or(src);
+    let expanded = crate::table::expand_structured_at(wb, sheet, Some(row), Some(col), raw);
+    compile_at(expanded.as_deref().unwrap_or(raw), row, col).is_ok_and(|node| has_call(&node))
 }
 
 /// A SUMIF amount reference supplies the top-left cell. Dependency indexing and
@@ -880,6 +898,8 @@ pub struct Calc<'a> {
     agg_cache: HashMap<(usize, i64, i64, i64, i64, u8, String), FValue>,
     /// 区域缓存已占用的值数量，防止把逐行累积的区间全缓存下来
     cache_vals: usize,
+    last_count_range: Option<RangeKey>,
+    count_index: Option<(RangeKey, functions::CountIndex)>,
     cache_order: std::collections::BTreeSet<(u64, RangeKey)>,
     cache_clock: u64,
     criteria_cache: HashMap<CriteriaKey, FValue>,
@@ -985,7 +1005,7 @@ impl<'a> Calc<'a> {
             functions::set_now_snapshot(Some(now));
         }
         Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(),
-            agg_cache: HashMap::new(), cache_vals: 0, depth: 0,
+            agg_cache: HashMap::new(), cache_vals: 0, last_count_range: None, count_index: None, depth: 0,
             range_reads: 0,
             cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
             sum_prefixes: HashMap::new(), sum_ends: HashMap::new(), prefix_values: 0, agg_hits: 0, agg_miss: 0,
@@ -2592,7 +2612,17 @@ impl<'a> Calc<'a> {
                             }
                             "COUNTIF" => {
                                 let c = functions::Crit::parse(&crit);
-                                let n = data.iter().filter(|v| c.matches(v)).count();
+                                let range = (key.0, key.1, key.2, key.3, key.4);
+                                let n = if self.requested.is_none() && c.indexable() && data.len() >= 256
+                                    && self.last_count_range.replace(range) == Some(range)
+                                {
+                                    if self.count_index.as_ref().is_none_or(|(k, _)| *k != range) {
+                                        self.count_index = Some((range, functions::CountIndex::new(&data)));
+                                    }
+                                    self.count_index.as_ref().unwrap().1.count(&c)
+                                } else {
+                                    data.iter().filter(|v| c.matches(v)).count()
+                                };
                                 FValue::number(n as f64)
                             }
                             _ => {
@@ -2901,23 +2931,37 @@ impl<'a> Calc<'a> {
         }
     }
 
-    fn drop_hidden_rows(&self, arg: Arg, r1: u32, si: usize, skip_manual: bool) -> Arg {
+    fn visible_summary_values(
+        &self, arg: Arg, origin: (u32, u32), si: usize, skip_manual: bool, skip_subtotals: bool,
+    ) -> Arg {
         let Arg::Range { values, rows, cols } = arg else { return arg };
         let sheet = &self.wb.sheets[si];
-        if sheet.hidden_rows.is_empty() && (!skip_manual || sheet.hidden_rows_user.is_empty()) {
+        if !skip_subtotals && sheet.hidden_rows.is_empty() && (!skip_manual || sheet.hidden_rows_user.is_empty()) {
             return Arg::Range { values, rows, cols };
         }
-        let mut out = Vec::with_capacity(values.len());
-        let mut kept = 0;
+        let mut out: Option<Vec<FValue>> = None;
+        let mut kept_rows = 0;
         for i in 0..rows {
-            let row = r1 + i as u32;
-            if sheet.hidden_rows.contains(&row) || (skip_manual && sheet.hidden_rows_user.contains(&row)) {
-                continue;
+            let row = origin.0 + i as u32;
+            let hidden = sheet.hidden_rows.contains(&row) || (skip_manual && sheet.hidden_rows_user.contains(&row));
+            if !hidden { kept_rows += 1; }
+            for j in 0..cols {
+                let col = origin.1 + j as u32;
+                let index = i * cols + j;
+                if hidden || (skip_subtotals && sheet.get(row, col).and_then(|c| c.formula.as_deref())
+                    .is_some_and(|src| contains_subtotal(self.wb, si, src, row, col))) {
+                    // Preserve shared materialized ranges until a value is actually omitted.
+                    out.get_or_insert_with(|| values[..index].to_vec());
+                } else if let Some(out) = &mut out {
+                    out.push(values[index].clone());
+                }
             }
-            out.extend_from_slice(&values[i * cols..(i + 1) * cols]);
-            kept += 1;
         }
-        Arg::Range { values: std::rc::Rc::new(out), rows: kept, cols }
+        match out {
+            Some(out) if skip_subtotals => Arg::Range { rows: out.len(), cols: 1, values: out.into() },
+            Some(out) => Arg::Range { rows: kept_rows, cols, values: out.into() },
+            None => Arg::Range { rows, cols, values },
+        }
     }
 
     fn function_args(&mut self, name: &str, nodes: &[Node], si: usize) -> Vec<Arg> {
@@ -2943,7 +2987,8 @@ impl<'a> Calc<'a> {
                             && a.book.is_none() && b.book.is_none()
                             && let Ok(source) = self.sheet_index(a.sheet.as_deref(), si)
                         {
-                            arg = self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, source, skip_manual);
+                            let origin = (a.row.min(b.row).max(0) as u32, a.col.min(b.col).max(0) as u32);
+                            arg = self.visible_summary_values(arg, origin, source, skip_manual, name == "SUBTOTAL");
                         }
                         args.push(arg);
                     }

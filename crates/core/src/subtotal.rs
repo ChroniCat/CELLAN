@@ -8,7 +8,8 @@
 //! - 插入行复用 `Sheet::insert_rows`，所以条件格式/数据验证/批注会跟着一起移动
 
 use crate::model::{Cell, Sheet, Value, Workbook};
-use crate::structural::{Structural, apply_structural_wb};
+#[cfg(test)]
+use crate::structural::Structural;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubFn {
@@ -53,9 +54,7 @@ pub struct SubtotalReport {
 /// `region` 含表头行；`key_col` 分组列；`value_cols` 要汇总的列。
 /// 返回插入的组数与行数。
 ///
-/// 做法分两趟：先按原始坐标找出所有组，从下往上插空行（这样插入点以上的引用不会被推乱），
-/// 再按「最终坐标」写小计与总计的 SUBTOTAL。总计**只引用各组的明细段**（多区域参数），
-/// 不把上一条小计算进去——我们的公式引擎里 SUBTOTAL 目前不会跳过嵌套小计，这样写两边结果一致。
+/// Find group ends in original coordinates and move details and references together.
 pub fn subtotal(
     sheet: &mut Sheet,
     region: (u32, u32, u32, u32),
@@ -79,11 +78,21 @@ pub fn subtotal_workbook(
     value_cols: &[u32],
     f: SubFn,
 ) -> SubtotalReport {
-    let Some(sheet) = wb.sheets.get(sheet_idx) else { return SubtotalReport::default() };
+    try_subtotal_workbook(wb, sheet_idx, region, key_col, value_cols, f).unwrap_or_default()
+}
+
+pub fn try_subtotal_workbook(
+    wb: &mut Workbook, sheet_idx: usize, region: (u32, u32, u32, u32),
+    key_col: u32, value_cols: &[u32], f: SubFn,
+) -> Result<SubtotalReport, &'static str> {
+    let Some(sheet) = wb.sheets.get(sheet_idx) else { return Ok(SubtotalReport::default()) };
     let (r1, c1, r2, c2) = region;
     if r2 <= r1 || key_col < c1 || key_col > c2 {
-        return SubtotalReport::default();
+        return Ok(SubtotalReport::default());
     }
+    const LAST_ROW: u32 = 1_048_575;
+    const OVERFLOW: &str = "分类汇总会将数据或格式移出工作表的最后一行";
+    if r2 >= LAST_ROW { return Err(OVERFLOW); }
     // 扫描分组（原始坐标）
     let mut groups: Vec<(u32, u32)> = Vec::new();
     let mut start = r1 + 1;
@@ -98,23 +107,21 @@ pub fn subtotal_workbook(
     }
     groups.push((start, r2));
     let n = groups.len();
-    if n == 0 {
-        return SubtotalReport::default();
+    let mut insertions: Vec<_> = groups.iter().map(|&(_, end)| end + 1).collect();
+    insertions.push(r2 + 1);
+    let total_at = r2 + n as u32 + 1;
+    if total_at > LAST_ROW { return Err(OVERFLOW); }
+    let last_safe = LAST_ROW - insertions.len() as u32;
+    if tail_occupied(sheet, last_safe)
+        || wb.sheets.iter().flat_map(|s| &s.sparklines)
+            .any(|sp| sp.source_sheet.as_deref() == Some(&sheet.name) && sp.rect.2 > last_safe)
+        || wb.pivots_pending.iter().any(|(index, spec, _, output, _)|
+            *index == sheet_idx && (spec.source.2 > last_safe || output.2 > last_safe))
+    {
+        return Err(OVERFLOW);
     }
-    // 第一趟：从下往上插空行
-    let mut inserted = 0u32;
-    for i in (0..n).rev() {
-        // 插在「本组最后一条明细」的下一行；下面那些插入都在更靠下的位置，不影响这个下标
-        let at = groups[i].1 + 1;
-        apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at, n: 1 });
-        inserted += 1;
-    }
-    let total_at = r2 + inserted + 1;
-    apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at: total_at, n: 1 });
-    inserted += 1;
+    crate::structural::insert_subtotal_rows(wb, sheet_idx, &insertions);
     let sheet = &mut wb.sheets[sheet_idx];
-    // 第二趟：按最终坐标写内容（组 i 上方有 i 行插入）
-    let mut total_ranges: Vec<String> = Vec::new();
     for (i, (gs, ge)) in groups.iter().enumerate() {
         let shift = i as u32;
         let fgs = gs + shift;
@@ -153,9 +160,6 @@ pub fn subtotal_workbook(
                     formula: Some(formula.into()),
                 },
             );
-            if c == *value_cols.first().unwrap_or(&c) {
-                total_ranges.push(range);
-            }
         }
         // 明细打 1 级（Excel 的 summaryBelow 约定：汇总行在明细下方）
         for r in fgs..=fge {
@@ -171,33 +175,12 @@ pub fn subtotal_workbook(
             formula: None,
         },
     );
-    let first_val_col = value_cols.first().copied();
     for c in value_cols.iter().copied() {
         if c < c1 || c > c2 {
             continue;
         }
-        let args: Vec<String> = if Some(c) == first_val_col {
-            // 第一汇总列：只算各组的明细段
-            total_ranges.clone()
-        } else {
-            // 其余列用同一批行号换成自己的列
-            total_ranges
-                .iter()
-                .map(|r| {
-                    let (a, b) = r.split_once(':').unwrap_or((r.as_str(), r.as_str()));
-                    let row_a: String = a.chars().filter(|ch| ch.is_ascii_digit()).collect();
-                    let row_b: String = b.chars().filter(|ch| ch.is_ascii_digit()).collect();
-                    format!(
-                        "{}{}:{}{}",
-                        crate::model::col_label(c),
-                        row_a,
-                        crate::model::col_label(c),
-                        row_b
-                    )
-                })
-                .collect()
-        };
-        let formula = format!("=SUBTOTAL({},{})", f.code(), args.join(","));
+        let col = crate::model::col_label(c);
+        let formula = format!("=SUBTOTAL({},{col}{}:{col}{total_at})", f.code(), r1 + 2);
         sheet.set(
             total_at,
             c,
@@ -208,10 +191,41 @@ pub fn subtotal_workbook(
         );
     }
     sheet.edited = true;
-    SubtotalReport {
+    sheet.layout_dirty = true;
+    Ok(SubtotalReport {
         groups: n,
-        rows: inserted as usize,
-    }
+        rows: insertions.len(),
+    })
+}
+
+// An empty-looking tail may still contain formatting, a drawing anchor or a
+// validation range. Check it before the first mutation, including style-only cells.
+fn tail_occupied(s: &Sheet, last: u32) -> bool {
+    let past = |r: u32| r > last;
+    s.used_bounds().is_some_and(|b| past(b.2))
+        || s.styles.iter_from(true, last + 1).next().is_some()
+        || s.rows.entries().any(|(&r, _)| past(r))
+        || s.row_styles.keys().chain(s.row_levels.keys()).copied().any(past)
+        || s.hidden_rows.iter().chain(s.hidden_rows_user.iter()).copied().any(past)
+        || s.notes.keys().chain(s.spilled.iter()).any(|k| past(k.row))
+        || s.spill_shapes.iter().any(|(k, shape)| past(k.row.saturating_add(shape.0.saturating_sub(1))))
+        || s.arrays.iter().any(|(k, r)| past(k.row) || past(r.2))
+        || s.rich.keys().chain(s.ignored_errors.iter()).any(|&(r, _)| past(r))
+        || s.hyperlinks.iter().any(|(&(r, _), h)| past(r.saturating_add(h.span.0)))
+        || s.merges.iter().any(|r| past(r.2))
+        || s.cf.blocks.iter().flat_map(|b| &b.ranges).chain(s.dv.iter().flat_map(|d| &d.ranges))
+            .any(|r| past(r.2) && (r.0, r.2) != (0, 1_048_575))
+        || s.tables.iter().any(|t| past(t.range.2))
+        || s.filter.as_ref().is_some_and(|f| past(f.range.2))
+        || s.freeze.is_some_and(|(r, _)| past(r))
+        || s.pictures.iter().any(|p| past(p.rect.2))
+        || s.charts.iter().any(|c| past(c.anchor.2))
+        || s.textboxes.iter().any(|t| past(t.from.2) || past(t.to.2))
+        || s.sparklines.iter().any(|sp| past(sp.r) || (sp.source_sheet.is_none() && past(sp.rect.2)))
+        || s.page.print_area.is_some_and(|r| past(r.2))
+        || s.page.title_rows.is_some_and(|r| past(r.1))
+        || s.page.row_breaks.iter().copied().any(past)
+        || s.scenarios.iter().flat_map(|s| &s.cells).any(|((r, _), _)| past(*r))
 }
 
 #[cfg(test)]
@@ -271,11 +285,83 @@ mod tests {
         assert_eq!(&*f, "=SUBTOTAL(9,B2:B3)");
         let f2 = sh.get(5, 1).and_then(|c| c.formula.clone()).unwrap_or_default();
         assert_eq!(&*f2, "=SUBTOTAL(9,B5:B5)", "乙的明细被推到第 5 行");
-        // 总计只引用两组明细段，不含上一条小计
+        // 总计引用连续区域；求值器跳过其中的小计。
         let ft = sh.get(6, 1).and_then(|c| c.formula.clone()).unwrap_or_default();
-        assert_eq!(&*ft, "=SUBTOTAL(9,B2:B3,B5:B5)");
+        assert_eq!(&*ft, "=SUBTOTAL(9,B2:B6)");
         // 明细行变成 1 级
         assert_eq!(sh.row_levels.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn thousands_of_groups_use_one_grand_total_range() {
+        let mut wb = Workbook::new_blank();
+        for row in 1..=30_000 {
+            let s = &mut wb.sheets[0];
+            s.set(row, 0, Cell { value: Value::Number(((row - 1) / 10) as f64), formula: None });
+            s.set(row, 1, Cell { value: Value::Number(1.0), formula: None });
+            s.set_style_loaded(row, 1, 1);
+        }
+        let started = std::time::Instant::now();
+        let report = try_subtotal_workbook(&mut wb, 0, (0, 0, 30_000, 1), 0, &[1], SubFn::Sum).unwrap();
+        eprintln!("30k details / 3k groups insertion: {:?}", started.elapsed());
+        assert_eq!((report.groups, report.rows), (3000, 3001));
+        assert_eq!(wb.sheets[0].get(33_001, 1).unwrap().formula.as_deref(), Some("=SUBTOTAL(9,B2:B33001)"));
+        crate::formula::recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].value(33_001, 1), Value::Number(30_000.0));
+    }
+
+    #[test]
+    fn grand_total_respects_filtered_rows_and_nested_subtotal_calls() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0] = sheet_with(&[("A", 4.0), ("B", 9.0), ("B", 3.0)]);
+        let sheet = &mut wb.sheets[0];
+        sheet.hidden_rows.insert(2);
+        sheet.dv.push(crate::dv::DataValidation { ranges: vec![(0, 1, 1_048_575, 1)], ..Default::default() });
+        sheet.set(3, 1, Cell { value: Value::Empty, formula: Some("=1+SUBTOTAL(9,B2:B2)".into()) });
+        try_subtotal_workbook(&mut wb, 0, (0, 0, 3, 1), 0, &[1], SubFn::Sum).unwrap();
+        crate::formula::recalc_all(&mut wb);
+        assert!(wb.sheets[0].hidden_rows.contains(&3));
+        assert_eq!(wb.sheets[0].dv[0].ranges, [(0, 1, 1_048_575, 1)]);
+        assert_eq!(wb.sheets[0].value(6, 1), Value::Number(4.0));
+    }
+
+    #[test]
+    fn table_calculated_column_formulas_match_ordered_insertions() {
+        let mut batch = Workbook::new_blank();
+        let sh = &mut batch.sheets[0];
+        sh.tables.push(crate::table::Table { range: (0, 0, 5, 2), header_row: true, ..Default::default() });
+        for row in 1..=5 {
+            sh.set(row, 2, Cell {
+                value: Value::Empty,
+                formula: Some(format!("=SUM(B{}:B{})+$B$6", row + 1, row + 3).into()),
+            });
+            sh.set_style_loaded(row, 2, 4);
+        }
+        let mut serial = batch.clone();
+        let positions = [2, 4, 6, 6];
+        for at in [6, 4, 2, 9] {
+            crate::structural::apply_structural_wb(&mut serial, 0, &Structural::InsertRows { at, n: 1 });
+        }
+        crate::structural::insert_subtotal_rows(&mut batch, 0, &positions);
+        assert_eq!(batch.sheets[0].tables, serial.sheets[0].tables);
+        for r in 0..12 {
+            assert_eq!(batch.sheets[0].get(r, 2), serial.sheets[0].get(r, 2), "row {r}");
+            assert_eq!(batch.sheets[0].style_of(r, 2), serial.sheets[0].style_of(r, 2));
+        }
+    }
+
+    #[test]
+    fn rejects_subtotals_that_would_displace_formatting_off_the_sheet() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0] = sheet_with(&[("A", 1.0), ("B", 2.0)]);
+        wb.sheets[0].rows.set(1_048_574, 40.0);
+        let version = wb.sheets[0].cell_revision();
+        assert!(try_subtotal_workbook(&mut wb, 0, (0, 0, 2, 1), 0, &[1], SubFn::Sum).is_err());
+        assert_eq!(wb.sheets[0].cell_revision(), version);
+        wb.sheets[0].rows.clear_custom();
+        wb.sheets[0].set_style_loaded(1_048_574, 3, 2);
+        assert!(try_subtotal_workbook(&mut wb, 0, (0, 0, 2, 1), 0, &[1], SubFn::Sum).is_err());
+        assert!(wb.pivot_shifts.is_empty());
     }
 
     #[test]

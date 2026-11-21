@@ -123,6 +123,23 @@ fn filter_sort_unique() {
 }
 
 #[test]
+fn unique_preserves_column_order_and_counts_whole_tuples() {
+    let mut wb = Workbook::new_blank();
+    for (c, (label, n)) in [("x", 2.0), ("x", 1.0), ("x", 2.0), ("y", 1.0)].into_iter().enumerate() {
+        wb.sheets[0].set(0, c as u32, text(label));
+        wb.sheets[0].set(1, c as u32, num(n));
+    }
+    let FValue::Array(once) = run(&mut wb, "=UNIQUE(A1:D2,TRUE,TRUE)") else { panic!() };
+    assert_eq!((once.rows, once.cols), (2, 2));
+    assert_eq!(once.get(0, 0), FValue::Text("x".into()));
+    assert_eq!(once.get(0, 1), FValue::Text("y".into()));
+    let FValue::Array(all) = run(&mut wb, "=UNIQUE(TRANSPOSE(A1:D2))") else { panic!() };
+    assert_eq!((all.rows, all.cols), (3, 2));
+    assert_eq!(all.get(0, 1), FValue::Number(2.0));
+    assert_eq!(all.get(2, 0), FValue::Text("y".into()));
+}
+
+#[test]
 fn take_drop_stack() {
     let mut wb = Workbook::new_blank();
     for i in 0..4u32 {

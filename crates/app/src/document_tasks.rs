@@ -11,6 +11,7 @@ use super::{egui, OpenMsg};
 #[derive(Default)]
 pub(crate) struct DocumentTasks {
     pub open_rx: Option<Receiver<OpenMsg>>,
+    pub reorder: Option<super::data_reorder::Pending>,
     pub busy: bool,
     pub needs_full: bool,
     /// Retain pending edits until a result for this document generation is applied.

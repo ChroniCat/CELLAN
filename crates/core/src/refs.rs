@@ -97,6 +97,42 @@ impl Shift {
     }
 }
 
+/// A sorted list of insertions is expressed in the original row coordinates.
+pub(crate) struct MappedShift<'a> {
+    pub shift: &'a Shift,
+    pub insertions: &'a [u32],
+}
+
+impl std::ops::Deref for MappedShift<'_> {
+    type Target = Shift;
+    fn deref(&self) -> &Shift { self.shift }
+}
+
+impl MappedShift<'_> {
+    pub fn map(&self, pos: u32) -> Option<u32> {
+        if self.insertions.is_empty() { return self.shift.map(pos); }
+        pos.checked_add(self.insertions.partition_point(|&at| at <= pos) as u32)
+    }
+
+    pub fn map_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        if self.insertions.is_empty() { return self.shift.map_range(a, b); }
+        Some((self.map(a.min(b))?, self.map(a.max(b))?))
+    }
+    fn last_index(&self) -> u32 {
+        match self.axis { Axis::Row => 1_048_575, Axis::Col => 16_383 }
+    }
+
+    fn map_reference(&self, index: u32) -> Option<u32> {
+        self.map(index).filter(|&r| r <= self.last_index())
+    }
+
+    fn map_reference_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let (first, last) = self.map_range(a, b)?;
+        (first <= self.last_index()).then_some((first, last.min(self.last_index())))
+    }
+
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b >= 0x80
 }
@@ -142,7 +178,7 @@ fn translated_axis(value: u32, offset: i64, absolute: bool, limit: i64) -> Optio
 }
 
 /// 整行引用也保留每一端自己的锁定标记；列方向偏移不影响它。
-fn parse_row_ref(b: &[u8], start: usize, sh: &Shift, qualified: Option<&str>) -> Option<Ref> {
+fn parse_row_ref(b: &[u8], start: usize, sh: &MappedShift, qualified: Option<&str>) -> Option<Ref> {
     let mut i = start;
     let abs1 = b.get(i) == Some(&b'$');
     i += usize::from(abs1);
@@ -171,7 +207,7 @@ fn parse_row_ref(b: &[u8], start: usize, sh: &Shift, qualified: Option<&str>) ->
     let mapped = match sh.translate {
         Some((dr, _)) => translated_axis(r1, dr, abs1, 1_048_576)
             .zip(translated_axis(r2, dr, abs2, 1_048_576)),
-        None => sh.map_range(r1, r2),
+        None => sh.map_reference_range(r1, r2),
     };
     let text = match mapped {
         Some((r1, r2)) => format!(
@@ -184,7 +220,7 @@ fn parse_row_ref(b: &[u8], start: usize, sh: &Shift, qualified: Option<&str>) ->
 }
 
 /// 解析一个单元格引用或区域；识别但不需改动的引用也返回原文，以消费表名限定符。
-fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) -> Option<Ref> {
+fn parse_ref(b: &[u8], start: usize, sh: &MappedShift, qualified_sheet: Option<&str>) -> Option<Ref> {
     let mut i = start;
     let d1 = if b.get(i) == Some(&b'$') {
         i += 1;
@@ -238,7 +274,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                     let mapped = match sh.translate {
                         Some((_, dc)) => translated_axis(c1, dc, d1, 16_384)
                             .zip(translated_axis(c2, dc, d3, 16_384)),
-                        None => sh.map_range(c1, c2),
+                        None => sh.map_reference_range(c1, c2),
                     };
                     let text = match mapped {
                         Some((x, y)) => format!(
@@ -305,12 +341,12 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                     (apply(sh, r1, c1, d2, d1), apply(sh, r2, c2, d4, d3))
                 } else if sh.axis == Axis::Row {
                     // 已经 map 过了，不能再走 apply（否则平移两次）
-                    match sh.map_range(r1, r2) {
+                    match sh.map_reference_range(r1, r2) {
                         Some((x, y)) => ((Some(x), Some(c1)), (Some(y), Some(c2))),
                         None => (none2, none2),
                     }
                 } else {
-                    match sh.map_range(c1, c2) {
+                    match sh.map_reference_range(c1, c2) {
                         Some((x, y)) => ((Some(r1), Some(x)), (Some(r2), Some(y))),
                         None => (none2, none2),
                     }
@@ -358,7 +394,7 @@ fn allowed(sh: &Shift, r: u32, c: u32) -> bool {
         && sh.col_filter.is_none_or(|(a, b)| c >= a && c <= b)
 }
 
-fn apply(sh: &Shift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
+fn apply(sh: &MappedShift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
     if let Some((dr, dc)) = sh.translate {
         return (
             translated_axis(r, dr, row_absolute, 1_048_576),
@@ -366,8 +402,8 @@ fn apply(sh: &Shift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> 
         );
     }
     match sh.axis {
-        Axis::Row => (sh.map(r), Some(c)),
-        Axis::Col => (Some(r), sh.map(c)),
+        Axis::Row => (sh.map_reference(r), Some(c)),
+        Axis::Col => (Some(r), sh.map_reference(c)),
     }
 }
 
@@ -383,19 +419,98 @@ fn shift_applies(sh: &Shift, qualified: Option<&str>) -> bool {
 }
 
 /// 复制粘贴时按 (dr, dc) 平移相对引用，分别保留被 `$` 锁定的行和列。
-pub fn translate(formula: &str, dr: i64, dc: i64, sheet: &str) -> String {
-    let sh = Shift {
-        axis: Axis::Row,
-        at: 0,
-        n: 0,
-        delete: false,
-        target_sheet: sheet.to_string(),
-        own_sheet: sheet.to_string(),
-        translate: Some((dr, dc)),
-        row_filter: None,
-        col_filter: None,
-    };
+pub fn translate(formula: &str, dr: i64, dc: i64, _sheet: &str) -> String {
+    // Copy shifts apply equally to qualified references, regardless of sheet name.
+    let sh = Shift { translate: Some((dr, dc)), ..Default::default() };
     rewrite(formula, &sh)
+}
+
+struct CopyReference {
+    span: std::ops::Range<usize>,
+    row: u32,
+    col: u32,
+    row_abs: bool,
+    col_abs: bool,
+}
+
+/// Pre-tokenize ordinary A1 expressions for a fill operation. Keep literal
+/// slices verbatim, including function names, operators and number spelling.
+fn copy_references(src: &str) -> Option<Vec<CopyReference>> {
+    let b = src.as_bytes();
+    let (mut i, mut last_ref, mut need_ref) = (0, false, false);
+    let mut refs = Vec::new();
+    while i < b.len() {
+        let start = i;
+        if b[i].is_ascii_alphanumeric() || matches!(b[i], b'$' | b'_' | b'.') {
+            i += 1;
+            while b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b'.')) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            if b.get(i) != Some(&b'(') && let Some(r) = crate::formula::parse_a1(word) {
+                if r.row >= 1_048_576 || r.col >= 16_384 { return None; }
+                refs.push(CopyReference {
+                    span: start..i, row: r.row as u32, col: r.col as u32,
+                    row_abs: r.row_abs, col_abs: r.col_abs,
+                });
+                last_ref = true;
+                need_ref = false;
+                continue;
+            }
+            let function = b.get(i) == Some(&b'(') && !word.contains('$') && b[start].is_ascii_alphabetic();
+            if need_ref || (!function && !word.bytes().all(|c| c.is_ascii_digit() || c == b'.')) {
+                return None;
+            }
+        } else {
+            if need_ref { return None; }
+            match b[i] {
+                b':' if last_ref => need_ref = true,
+                b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'%' | b'=' | b'>' | b'<' | b',' | b'(' | b')' => {}
+                _ => return None,
+            }
+            i += 1;
+        }
+        last_ref = false;
+    }
+    (!need_ref).then_some(refs)
+}
+
+fn append_copy_column(out: &mut String, col: u32) {
+    if col >= 26 { append_copy_column(out, col / 26 - 1); }
+    out.push((b'A' + (col % 26) as u8) as char);
+}
+
+/// Reuse the source reference locations across destinations of one fill. The
+/// cache is bounded even when the user fills a column from many distinct formulas.
+#[derive(Default)]
+pub struct FillFormulas {
+    sources: std::collections::HashMap<Box<str>, Option<Vec<CopyReference>>>,
+}
+
+impl FillFormulas {
+    pub fn translate(&mut self, src: &str, dr: i64, dc: i64) -> String {
+        use std::fmt::Write;
+        let refs = match self.sources.get(src) {
+            Some(cached) => cached,
+            None if self.sources.len() >= 1024 => return translate(src, dr, dc, ""),
+            None => self.sources.entry(src.into()).or_insert_with(|| copy_references(src)),
+        };
+        let Some(refs) = refs else { return translate(src, dr, dc, ""); };
+        let mut out = String::with_capacity(src.len() + refs.len() * 3);
+        let mut end = 0;
+        for r in refs {
+            let Some(row) = translated_axis(r.row, dr, r.row_abs, 1_048_576) else { return translate(src, dr, dc, ""); };
+            let Some(col) = translated_axis(r.col, dc, r.col_abs, 16_384) else { return translate(src, dr, dc, ""); };
+            out.push_str(&src[end..r.span.start]);
+            if r.col_abs { out.push('$'); }
+            append_copy_column(&mut out, col);
+            if r.row_abs { out.push('$'); }
+            write!(out, "{}", row + 1).unwrap();
+            end = r.span.end;
+        }
+        out.push_str(&src[end..]);
+        out
+    }
 }
 
 /// 跳过 `[Book]...` 外部限定符（含 `[1]!`、`[1]Sheet!`、`[1]First:Third!`、`[1]'First':'Third'!`），
@@ -474,6 +589,10 @@ fn consume_quoted_ext_qualifier(b: &[u8], formula: &str, i: usize) -> Option<usi
 
 /// 改写一条公式（不带前导 `=` 也可以）
 pub fn rewrite(formula: &str, sh: &Shift) -> String {
+    rewrite_mapped(formula, &MappedShift { shift: sh, insertions: &[] })
+}
+
+pub(crate) fn rewrite_mapped(formula: &str, sh: &MappedShift) -> String {
     let b = formula.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(formula.len() + 8);
     let mut i = 0usize;
@@ -762,12 +881,12 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
                 let mut j = after_bang;
                 if b[j..].starts_with(b"#REF!") {
                     j += 5;
-                } else if let Some(reference) = parse_ref(b, j, &identity, None) {
+                } else if let Some(reference) = parse_ref(b, j, &MappedShift { shift: &identity, insertions: &[] }, None) {
                     j = reference.end;
                     // 三维引用也可能是 A1:B2/整行区间；吞掉第二个端点，
                     // 否则会留下 `#REF!:B2` 这种不可解析的残片。
                     if b.get(j) == Some(&b':') {
-                        if let Some(second) = parse_ref(b, j + 1, &identity, None) {
+                        if let Some(second) = parse_ref(b, j + 1, &MappedShift { shift: &identity, insertions: &[] }, None) {
                             j = second.end;
                         }
                     }
@@ -818,7 +937,7 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
                 // and columns), or a sheet-scoped name after the qualifier.
                 if b[i..].starts_with(b"#REF!") {
                     i += 5;
-                } else if let Some(reference) = parse_ref(b, i, &identity, None) {
+                } else if let Some(reference) = parse_ref(b, i, &MappedShift { shift: &identity, insertions: &[] }, None) {
                     i = reference.end;
                 } else {
                     while b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$') { i += 1; }
@@ -1003,10 +1122,10 @@ fn consume_ref_after(b: &[u8], mut j: usize, identity: &Shift) -> usize {
     if b[j..].starts_with(b"#REF!") {
         return j + 5;
     }
-    if let Some(reference) = parse_ref(b, j, identity, None) {
+    if let Some(reference) = parse_ref(b, j, &MappedShift { shift: identity, insertions: &[] }, None) {
         j = reference.end;
         if b.get(j) == Some(&b':') {
-            if let Some(second) = parse_ref(b, j + 1, identity, None) {
+            if let Some(second) = parse_ref(b, j + 1, &MappedShift { shift: identity, insertions: &[] }, None) {
                 j = second.end;
             }
         }

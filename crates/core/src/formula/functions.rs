@@ -288,7 +288,72 @@ pub(crate) struct Crit {
     wild: bool,
 }
 
+/// Equality counts reused when many cells query the same COUNTIF range.
+#[derive(Default)]
+pub(super) struct CountIndex {
+    numbers: Vec<f64>,
+    text: std::collections::HashMap<String, usize>,
+}
+
+#[test]
+fn count_index_agrees_with_single_criterion_scan() {
+    let data = vec![
+        FValue::Empty, FValue::Text(String::new()), FValue::Number(0.0), FValue::Number(-0.0),
+        FValue::Number(f64::EPSILON), FValue::Number(-f64::EPSILON), FValue::Number(1.5),
+        FValue::Text(" 1.50 ".into()), FValue::Text("HELLO".into()), FValue::Text("Ä".into()),
+        FValue::Text("ä".into()), FValue::Bool(true), FValue::Text("true".into()), FValue::Error(ErrKind::Value),
+    ];
+    let index = CountIndex::new(&data);
+    for query in ["0","1.50","HELLO","ä","Ä","true","","NaN","inf","0.00000000000000022"] {
+        let crit = Crit::parse(query);
+        assert_eq!(index.count(&crit), data.iter().filter(|v| crit.matches(v)).count(), "{query}");
+    }
+    for query in ["a*", "a?", ">0", "<>x"] { assert!(!Crit::parse(query).indexable()); }
+}
+
+impl CountIndex {
+    pub(super) fn new(data: &[FValue]) -> Self {
+        let mut index = Self::default();
+        for value in data {
+            let text = match value {
+                FValue::Number(n) => {
+                    if n.is_finite() { index.numbers.push(*n); }
+                    continue;
+                }
+                FValue::Text(s) => {
+                    if let Ok(n) = s.trim().parse::<f64>() {
+                        if n.is_finite() { index.numbers.push(n); }
+                    }
+                    if s.is_ascii() { s.to_ascii_lowercase() } else { s.clone() }
+                }
+                FValue::Bool(b) => b.to_string(),
+                FValue::Empty => String::new(),
+                _ => continue,
+            };
+            *index.text.entry(text).or_default() += 1;
+        }
+        index.numbers.sort_unstable_by(f64::total_cmp);
+        index
+    }
+
+    pub(super) fn count(&self, crit: &Crit) -> usize {
+        if let Some(n) = crit.num {
+            if !n.is_finite() { return 0; }
+            // Use the same subtraction as Crit::matches, including near zero and signed zero.
+            let start = self.numbers.partition_point(|v| v - n < -f64::EPSILON);
+            let end = self.numbers.partition_point(|v| v - n <= f64::EPSILON);
+            end - start
+        } else {
+            self.text.get(&crit.text).copied().unwrap_or(0)
+        }
+    }
+}
+
 impl Crit {
+    pub(super) fn indexable(&self) -> bool {
+        self.op == "=" && !self.wild
+    }
+
     pub(crate) fn parse(crit: &str) -> Crit {
         let c = crit.trim();
         let (op, rest) = if let Some(x) = c.strip_prefix(">=") {

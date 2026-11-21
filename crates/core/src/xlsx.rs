@@ -85,6 +85,9 @@ fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
         }
     }
 }
+#[path = "xlsx_delta.rs"]
+mod delta;
+pub(crate) use delta::SourceCells;
 #[path = "xlsx_structure.rs"]
 mod structure;
 #[path = "xlsx_pivots.rs"]
@@ -186,137 +189,99 @@ impl LoadDiag {
     }
 }
 
-/// 并行解析的中间结果：只存原始数据，样式留给主线程 intern
-struct RawSheet {
-    name: String,
-    cells: Vec<((u32, u32), Cell)>,
-    styles: Vec<((u32, u32), crate::style::CellStyle)>,
-    formulas: Vec<((u32, u32), String)>,
-    sparse: bool,
-}
-
-/// 一个线程负责一组工作表：自己开 reader，避免共享状态
-fn load_chunk(
-    path: &Path,
-    names: &[String],
-    targets: &std::collections::HashMap<String, String>,
-    shared: &[String],
-    limit: u64,
-) -> (Vec<RawSheet>, Vec<LoadProblem>) {
-    let mut out = Vec::new();
-    let mut problems = Vec::new();
-    let mut reader = match crate::xlsx::open_workbook_auto(path) {
-        Ok(r) => r,
-        Err(e) => {
-            for n in names {
-                problems.push(LoadProblem {
-                    sheet: Some(n.clone()),
-                    part: "workbook".into(),
-                    what: "整张工作表".into(),
-                    detail: format!("无法打开工作簿：{e:#}"),
-                    fatal: true,
-                });
-            }
-            return (out, problems);
-        }
-    };
-    for name in names {
-        let mut raw = RawSheet {
-            name: name.clone(),
-            cells: Vec::new(),
-            styles: Vec::new(),
-            formulas: Vec::new(),
-            sparse: false,
-        };
-        let sparse_part = targets
-            .get(name)
-            .filter(|p| crate::sparse::declared_area_of(path, p) > limit);
-        if let Some(part) = sparse_part {
-            match crate::sparse::read_sheet(path, part, shared) {
-                Ok(cells) => {
-                    raw.cells = cells.into_iter().collect();
-                    raw.sparse = true;
-                    out.push(raw);
-                    continue;
-                }
-                Err(e) => {
-                    // 稀疏解析失败说明这份表 XML 读不完整：退回 calamine 只补数据，
-                    // 不能当成"完整打开"，必须标致命（覆盖保存会丢没读到的格）。
-                    eprintln!("[load] {name} 稀疏读取失败，退回 calamine: {e:#}");
-                    problems.push(LoadProblem {
-                        sheet: Some(name.clone()),
-                        part: part.clone(),
-                        what: "大表稀疏读取".into(),
-                        detail: format!("{e:#}"),
-                        fatal: true,
-                    });
-                }
-            }
-        }
-        match reader.worksheet_range(name) {
-            Err(e) => problems.push(LoadProblem {
-                sheet: Some(name.clone()),
-                part: targets.get(name).cloned().unwrap_or_else(|| format!("{name} 的工作表部件")),
-                what: "全部单元格数据".into(),
-                detail: format!("{e:#}"),
-                fatal: true,
-            }),
-            Ok(range) => {
+/// XLS/ODS readers expose values, styles and formulas as separate ranges.
+fn load_legacy_sheet(
+    reader: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
+    sheet: &mut Sheet,
+    styles: &mut crate::style::StyleTable,
+    diag: &mut LoadDiag,
+) {
+    let name = sheet.name.clone();
+    let part = sheet.source_part.clone().unwrap_or_default();
+    match reader.worksheet_range(&name) {
+        Ok(range) => {
             let (r0, c0) = range.start().unwrap_or((0, 0));
             for (row, col, data) in range.cells() {
-                let v = data_to_value(data);
-                if !v.is_empty() {
-                    raw.cells.push((
-                        (r0 + row as u32, c0 + col as u32),
-                        Cell { value: v, formula: None },
-                    ));
-                }
-            }
-            }
-        }
-        // OOXML cell style indices are read with the worksheet metadata below.
-        // Expanding calamine's StyleRange would also visit every unstyled gap.
-        if !matches!(reader, calamine::Sheets::Xlsx(_)) || !targets.contains_key(name) {
-            match reader.worksheet_style(name) {
-                Err(e) => problems.push(LoadProblem {
-                    sheet: Some(name.clone()),
-                    part: targets.get(name).cloned().unwrap_or_default(),
-                    what: "单元格样式".into(),
-                    detail: format!("{e:#}"),
-                    fatal: true,
-                }),
-                Ok(st) => {
-                    for (row, col, style) in st.cells() {
-                        raw.styles.push(((row, col), convert_style(style)));
-                    }
+                let value = data_to_value(data);
+                if !value.is_empty() {
+                    sheet.set(r0 + row as u32, c0 + col as u32, Cell { value, formula: None });
                 }
             }
         }
-        match reader.worksheet_formula(name) {
-            Err(e) => problems.push(LoadProblem {
-                sheet: Some(name.clone()),
-                part: targets.get(name).cloned().unwrap_or_default(),
-                what: "全部公式".into(),
-                detail: format!("{e:#}"),
-                fatal: true,
-            }),
-            Ok(forms) => {
-                let (fr0, fc0) = forms.start().unwrap_or((0, 0));
-                for (row, col, f) in forms.cells() {
-                    if f.is_empty() {
-                        continue;
-                    }
-                    let text = {
-                        let raw = if f.starts_with('=') { f.to_string() } else { format!("={}", f) };
-                        crate::normalize_formula(&raw)
-                    };
-                    raw.formulas.push(((fr0 + row as u32, fc0 + col as u32), text));
-                }
-            }
-        }
-        out.push(raw);
+        Err(e) => diag.push(Some(&name), &part, "全部单元格数据", format!("{e:#}"), true),
     }
-    (out, problems)
+    match reader.worksheet_style(&name) {
+        Ok(range) => {
+            for (row, col, style) in range.cells() {
+                let id = styles.intern(convert_style(style));
+                if id != 0 { sheet.set_style_loaded(row, col, id); }
+            }
+        }
+        Err(e) => diag.push(Some(&name), &part, "单元格样式", format!("{e:#}"), true),
+    }
+    match reader.worksheet_formula(&name) {
+        Ok(range) => {
+            let (r0, c0) = range.start().unwrap_or((0, 0));
+            for (row, col, f) in range.cells().filter(|(_, _, f)| !f.is_empty()) {
+                let r = r0 + row as u32;
+                let c = c0 + col as u32;
+                let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
+                let f = f.strip_prefix('=').unwrap_or(f);
+                cell.formula = Some(crate::normalize_formula(&format!("={f}")).into());
+                sheet.set(r, c, cell);
+            }
+        }
+        Err(e) => diag.push(Some(&name), &part, "全部公式", format!("{e:#}"), true),
+    }
+}
+
+/// Read values, cached results and shared-formula placements together. This
+/// iterator visits physical cells even when the declared dimension is absent.
+fn load_xlsx_cells(
+    book: &mut calamine::Xlsx<std::io::BufReader<std::fs::File>>,
+    sheet: &mut Sheet,
+) -> Result<()> {
+    use calamine::XlsxFormulaMetadata as F;
+    let mut reader = match book.worksheet_cells_reader(&sheet.name) {
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(()),
+        result => result?,
+    };
+    let mut masters = std::collections::HashMap::<usize, ((u32, u32), String)>::new();
+    let mut children = Vec::new();
+    while let Some(record) = reader.next_cell_with_formula_metadata()? {
+        let (row, col) = record.pos;
+        let formula = match record.formula {
+            Some(F::Shared { shared_index, formula, .. }) => {
+                masters.insert(shared_index, (record.pos, formula.clone()));
+                Some(formula)
+            }
+            Some(F::SharedDerived { shared_index }) => {
+                children.push((row, col, shared_index));
+                None
+            }
+            Some(F::Normal { formula }) => Some(formula),
+            Some(_) => anyhow::bail!("无法读取的公式类型"),
+            None => None,
+        };
+        let value = match record.value {
+            calamine::DataRef::SharedString(text) => Value::Text(text.into()),
+            calamine::DataRef::String(text) => Value::Text(text.into_boxed_str()),
+            other => data_to_value(&other.into()),
+        };
+        let formula = formula.filter(|f| !f.is_empty()).map(|f| {
+            crate::normalize_formula(&format!("={}", f.trim_start_matches('='))).into()
+        });
+        let cell = Cell { value, formula };
+        if !cell.is_blank() { sheet.set(row, col, cell); }
+    }
+    for (row, col, index) in children {
+        let ((r, c), master) = masters.get(&index).context("共享公式缺少主单元格")?;
+        let translated = crate::refs::translate(master, i64::from(row) - i64::from(*r), i64::from(col) - i64::from(*c), &sheet.name);
+        let mut cell = sheet.get(row, col).cloned().unwrap_or_default();
+        cell.formula = Some(crate::normalize_formula(&format!("={translated}")).into());
+        sheet.set(row, col, cell);
+    }
+    Ok(())
 }
 
 /// Office 加密文件是 CFB 容器，里面有一个叫 EncryptedPackage 的流。
@@ -486,41 +451,13 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         chart_edits: Vec::new(),
     };
 
-    // 稀疏表旁路：声明区域大到离谱的表（有人在 A1048576/XFD1048576 留了格子），
-    // calamine 会按稠密网格分配内存，直接 OOM
     let targets = crate::patch::sheet_targets(path).unwrap_or_default();
-    let t_shared = std::time::Instant::now();
-    // 先判断容器格式：BIFF(.xls) 不是 zip，下面所有 OOXML 扫描器都不能跑
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
     set_load_kind(if is_ooxml { LOAD_KIND_OOXML } else { LOAD_KIND_BIFF_CALAMINE });
-    let shared = match if is_ooxml {
-        crate::sparse::shared_strings_checked(path)
-    } else {
-        Ok(Vec::new())
-    } {
-        Ok(v) => v,
-        Err(e) => {
-            // 缺 SST 只在真的有人引用 `t="s"` 时才算问题；没人引用时是正常的。
-            if crate::sparse::any_sheet_uses_shared_strings(path) {
-                diag.push(
-                    None,
-                    "xl/sharedStrings.xml",
-                    "共享字符串表",
-                    format!("{e:#}（有单元格按共享字符串引用）"),
-                    true,
-                );
-            }
-            Vec::new()
-        }
-    };
-    if std::env::var("SC_LOAD_PROF").is_ok() {
-        eprintln!("[load] 共享字符串 {} 条 {:.2}s", shared.len(), t_shared.elapsed().as_secs_f64());
-    }
 
     let prof_load = std::env::var("SC_LOAD_PROF").is_ok();
     let t_all_load = std::time::Instant::now();
-    // 版面/合并/数组公式/图片/表格这几趟扫描跟单元格数据无关，
-    // 和下面的逐表解析并行跑，省掉串行等待
+    // 图片和表格对象从独立部件读取，与工作表 XML 的流式解析并行。
     let (side_tx, side_rx) = std::sync::mpsc::channel();
     if is_ooxml {
         let p = path.to_path_buf();
@@ -529,8 +466,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 panic!("注入：旁路扫描线程 panic");
             }
             let out = (
-                crate::arr::scan(&p),
-                crate::merges::load_layout(&p),
                 crate::pic::load(&p),
                 crate::table::load(&p),
             );
@@ -538,69 +473,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         });
     }
     let t_all = std::time::Instant::now();
-    // 逐表解析并行：每线程自己开一个 reader，样式回主线程再 intern
-    let limit = std::env::var("SC_DENSE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(crate::sparse::DENSE_LIMIT);
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 6)
-        .min(names.len().max(1));
-    let chunk = names.len().div_ceil(nthreads).max(1);
-    let (raws, chunked): (Vec<RawSheet>, Vec<LoadProblem>) = std::thread::scope(|sc| {
-        let mut handles = Vec::new();
-        for t in 0..nthreads {
-            let lo = t * chunk;
-            let hi = ((t + 1) * chunk).min(names.len());
-            if lo >= hi {
-                continue;
-            }
-            let slice = &names[lo..hi];
-            let p = path.to_path_buf();
-            let targets_ref = &targets;
-            let shared_ref = &shared;
-            handles.push(sc.spawn(move || load_chunk(&p, slice, targets_ref, shared_ref, limit)));
-        }
-        let mut all = Vec::new();
-        let mut probs = Vec::new();
-        for h in handles {
-            match h.join() {
-                Ok((v, p)) => {
-                    all.extend(v);
-                    probs.extend(p);
-                }
-                Err(_) => {
-                    eprintln!("[load] 并行解析线程异常退出");
-                    probs.push(LoadProblem {
-                        sheet: None,
-                        part: "xl/worksheets".into(),
-                        what: "一组工作表的全部内容".into(),
-                        detail: "解析线程异常退出（panic）".into(),
-                        fatal: true,
-                    });
-                }
-            }
-        }
-        (all, probs)
-    });
-    diag.problems.extend(chunked);
-    // 声明了但没解析出来的表：宁可报错，也不能当空表打开
-    for name in &names {
-        if !raws.iter().any(|r| &r.name == name) {
-            diag.problems.push(LoadProblem {
-                sheet: Some(name.clone()),
-                part: targets.get(name).cloned().unwrap_or_default(),
-                what: "整张工作表".into(),
-                detail: "workbook.xml 里声明了，但没有解析结果".into(),
-                fatal: true,
-            });
-        }
-    }
-
-    // .xls 不是 zip：这条只给 ooXML 用
-    let is_ooxml = crate::crypto::has_magic(path, b"PK");
     let mut shared_zip = if is_ooxml {
         Some(zip::ZipArchive::new(std::fs::File::open(path)?)?)
     } else {
@@ -647,55 +519,55 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         })
     };
     let page_names = crate::page::load_defined_names(path);
-    for raw in raws {
+    let mut layouts = std::collections::HashMap::new();
+    let styles_xml = shared_zip.as_mut().and_then(|zip| read_zip_text(zip, "xl/styles.xml").ok()).unwrap_or_default();
+    let dxfs = crate::cf::parse_dxfs(&styles_xml);
+    let dxf_ext = crate::cf::dxfs_unsupported(&styles_xml);
+    for name in &names {
         let t_sheet = std::time::Instant::now();
-        let mut sheet = Sheet::new(raw.name.clone());
-        sheet.source_part = targets.get(&raw.name).cloned();
+        let mut sheet = Sheet::new(name.clone());
+        sheet.source_part = targets.get(name).cloned();
         sheet.loading = true;
-        for ((r, c), cell) in raw.cells {
-            sheet.set(r, c, cell);
-        }
-        for ((r, c), cs) in raw.styles {
-            let id = wb.styles.intern(cs);
-            if id != 0 {
-                sheet.set_style_loaded(r, c, id);
+        if let calamine::Sheets::Xlsx(book) = &mut reader {
+            if let Err(err) = load_xlsx_cells(book, &mut sheet) {
+                diag.push(Some(name), sheet.source_part.as_deref().unwrap_or("xl/worksheets"),
+                    "稀疏单元格数据和公式", format!("{err:#}"), true);
             }
+        } else {
+            load_legacy_sheet(&mut reader, &mut sheet, &mut wb.styles, &mut diag);
         }
-        for ((r, c), text) in raw.formulas {
-            let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
-            cell.formula = Some(text.into());
-            sheet.set(r, c, cell);
-        }
-        if let (Some(zip), Some(part)) = (shared_zip.as_mut(), targets.get(&raw.name)) {
+        if let (Some(zip), Some(part)) = (shared_zip.as_mut(), targets.get(name)) {
             match read_zip_text(zip, part) {
                 Ok(xml) => {
-                    if let Err(e) = crate::style_theme::visit_cell_styles(&xml, |r, c, xf| {
+                    let shell = crate::style_theme::visit_cell_styles(&xml, |r, c, xf| {
                         let id = loaded_style_id(xf, &mut wb.styles);
                         if id != 0 {
                             sheet.set_style_loaded(r, c, id);
                         }
-                    }) {
-                        diag.push(Some(&raw.name), part, "单元格样式", format!("{e:#}"), true);
-                    }
-                    if !raw.sparse && xml.contains("shared") {
-                        for (r, c, text) in crate::sparse::fix_shared_children(&xml) {
-                            let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
-                            cell.formula = Some(crate::normalize_formula(&text).into());
-                            sheet.set(r, c, cell);
+                    });
+                    match shell {
+                        Ok(shell) => {
+                            layouts.insert(name.clone(), crate::merges::sheet_layout(&shell, &dxfs, dxf_ext));
+                            sheet.page = crate::page::parse_page_setup(&shell);
+                            sheet.textboxes = crate::textbox::load_from_sheet(path, part, &shell);
+                            sheet.hyperlinks = crate::hyperlinks::load_sheet(path, part, &shell);
+                            if shell.contains("sparkline") {
+                                sheet.sparklines = crate::sparkline::parse_sheet(&shell);
+                                sheet.sparklines.sort_by_key(|s| (s.c, s.r));
+                            }
                         }
+                        Err(e) => diag.push(Some(name), part, "单元格样式和版面", format!("{e:#}"), true),
                     }
-                    sheet.page = crate::page::parse_page_setup(&xml);
-                    sheet.textboxes = crate::textbox::load_from_sheet(path, part, &xml);
-                    sheet.hyperlinks = crate::hyperlinks::load_sheet(path, part, &xml);
-                    if xml.contains("sparkline") {
-                        sheet.sparklines = crate::sparkline::parse_sheet(&xml);
-                        sheet.sparklines.sort_by_key(|s| (s.c, s.r));
+                    if xml.contains("array") {
+                        sheet.arrays = crate::arr::scan_xml(&xml).into_iter().map(|a| (
+                            crate::model::CellRef::new(a.anchor.0, a.anchor.1), a.range,
+                        )).collect();
                     }
-                    if xml.contains("inlineStr") {
+                    if xml.contains("inlineStr") && (xml.contains("<r>") || xml.contains("<r ")) {
                         sheet.rich = crate::richtext::inline_cells(&xml);
                     }
                 }
-                Err(e) => diag.push(Some(&raw.name), part, "工作表属性和样式", format!("{e:#}"), true),
+                Err(e) => diag.push(Some(name), part, "工作表属性和样式", format!("{e:#}"), true),
             }
             if let Some((a, r, c)) = page_names.get(&(wb.sheets.len() as u32)) {
                 sheet.page.print_area = *a;
@@ -706,52 +578,22 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         sheet.loading = false;
         sheet.edited = false;
         if prof_load {
-            eprintln!(
-                "[load] {:<16} {:>7} 格  {}{}",
-                sheet.name,
-                sheet.iter().count(),
-                "",
-                if raw.sparse { "（稀疏）" } else { "" }
-            );
-        }
-        if prof_load {
-            eprintln!("[load]   {} 物化 {:.2}s", sheet.name, t_sheet.elapsed().as_secs_f64());
+            eprintln!("[load] {:<16} {:>7} 格  {:.2}s", sheet.name, sheet.len(), t_sheet.elapsed().as_secs_f64());
         }
         wb.sheets.push(sheet);
     }
     if prof_load {
-        eprintln!("[load] 物化合计 {:.2}s（并行解析已完成）", t_all.elapsed().as_secs_f64());
+        eprintln!("[load] 逐表读取合计 {:.2}s", t_all.elapsed().as_secs_f64());
     }
 
     let t_side = std::time::Instant::now();
-    let (found, layouts_raw, pics, tables) = if !is_ooxml {
-        (Default::default(), Ok(Default::default()), Default::default(), Default::default())
-    } else { match side_rx.recv() {
-        Ok(v) => v,
-        Err(_) => {
-            diag.push(
-                None,
-                "xl/worksheets（版面扫描）",
-                "合并单元格/数组公式/图片/表格",
-                "旁路扫描线程异常退出，这些结构没有加载".to_string(),
-                true,
-            );
-            (Default::default(), Ok(Default::default()), Default::default(), Default::default())
-        }
-    } };
-    let layouts = match layouts_raw {
-        Ok(v) => v,
-        Err(e) => {
-            diag.push(
-                None,
-                "xl/worksheets（版面扫描）",
-                "合并单元格/版面/数组公式",
-                format!("{e:#}"),
-                true,
-            );
+    let (pics, tables) = if is_ooxml {
+        side_rx.recv().unwrap_or_else(|_| {
+            diag.push(None, "xl/worksheets（版面扫描）", "图片/表格",
+                "旁路扫描线程异常退出，这些结构没有加载".into(), true);
             Default::default()
-        }
-    };
+        })
+    } else { Default::default() };
     if prof_load {
         eprintln!("[load] 旁路扫描等待 {:.2}s", t_side.elapsed().as_secs_f64());
     }
@@ -787,27 +629,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             }
         }
     }
-    // 数组公式：calamine 只给公式文本，t="array"/ref 得从原始 XML 拿（已并行取到）
-    {
-        {
-            for sheet in wb.sheets.iter_mut() {
-                if let Some(list) = found.get(&sheet.name) {
-                    for a in list {
-                        sheet.arrays.push((
-                            crate::model::CellRef::new(a.anchor.0, a.anchor.1),
-                            a.range,
-                        ));
-                    }
-                }
-            }
-        }
-    }
     apply_xls_meta(path, &mut wb);
     if is_cfb {
         wb.calc_manual = crate::xls_read::read_calc_manual(path);
     }
 
-    // 合并单元格（已并行取到）
+    // 还原工作表布局和合并区域
     {
         let wb_sheets = &mut wb.sheets;
         let wb_styles = &mut wb.styles;
@@ -937,7 +764,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         // Excel 写在 sharedStrings.xml 里的富文本：按整段文字回填
         if let Some(bytes) = crate::fixups::read_part_file(path, "xl/sharedStrings.xml") {
             if let Ok(xml) = String::from_utf8(bytes) {
-                let table = crate::richtext::sst_runs(&xml);
+                let table = if xml.contains("<r>") || xml.contains("<r ") { crate::richtext::sst_runs(&xml) } else { Vec::new() };
                 if !table.is_empty() {
                     let mut map: std::collections::HashMap<String, Vec<crate::richtext::RichRun>> =
                         std::collections::HashMap::new();
@@ -974,6 +801,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 sheet.hidden = hide;
             }
             sheet.saved_cells = Some(sheet.cell_version().clone());
+            if let (Some(zip), Some(part)) = (shared_zip.as_mut(), sheet.source_part.as_deref()) {
+                sheet.source_cells = SourceCells::capture(zip, part, sheet);
+            }
         }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
             definitions: pivot_definitions(path),
@@ -987,7 +817,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // C11：合法但引擎尚未实现的引用组合，必须在打开时就给出可见诊断；
     // 重算会保留文件缓存，读入后不把已知结果覆盖成错误。
     for sheet in &wb.sheets {
-        for (cref, cell) in sheet.iter() {
+        for (cref, cell) in sheet.formula_cells() {
             let Some(formula) = cell.formula.as_deref() else {
                 continue;
             };
@@ -1029,6 +859,7 @@ pub struct SaveReceipt {
 struct SavedSheet {
     part: String,
     cells: crate::store::CellVersion,
+    source_cells: Option<SourceCells>,
     cleared: std::collections::HashSet<crate::model::CellRef>,
 }
 
@@ -1083,6 +914,7 @@ impl SaveReceipt {
         for sheet in &mut wb.sheets {
             let Some(saved) = self.sheets.get(&sheet.identity) else { continue };
             sheet.saved_cells = Some(saved.cells.clone());
+            sheet.source_cells.clone_from(&saved.source_cells);
             if sheet.cell_version() != &saved.cells {
                 continue;
             }
@@ -1117,11 +949,13 @@ impl SaveReceipt {
 
 fn package_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
     let targets = crate::patch::sheet_targets(path).context("读取已保存的工作表身份失败")?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let sheets = wb.sheets.iter().map(|sheet| {
         let part = targets.get(&sheet.name)
             .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
         Ok((sheet.identity, SavedSheet {
             part: part.clone(),
+            source_cells: SourceCells::capture(&mut zip, part, sheet),
             cells: sheet.cell_version().clone(),
             cleared: sheet.cleared.clone(),
         }))
@@ -2167,11 +2001,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             || s.notes_dirty
             || !s.style_edits.is_empty()
     };
-    let can_bypass_umya = !fresh_base
+    let reusable_package = !fresh_base
         && base.exists()
         && has_restore_base
         && std::env::var("SC_FAIL_SAVE_STEP").is_err()
-        && !wb.sheets.iter().any(&sheet_needs_umya)
         && crate::patch::read_date1904(&base) == wb.date_system.is_1904()
         && {
             let bt = crate::patch::sheet_targets(&base).unwrap_or_default();
@@ -2182,14 +2015,18 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
+    let unchanged_cells = !wb.sheets.iter().any(&sheet_needs_umya);
+    let patched = reusable_package && !unchanged_cells
+        && delta::write_if_supported(&restore_base, path, wb)?;
+    let can_bypass_umya = reusable_package && (unchanged_cells || patched);
     let mut omitted_sheets = Vec::new();
     if can_bypass_umya {
-        if base != path {
+        if !patched && base != path {
             std::fs::copy(&base, path).with_context(|| format!("写入失败 {}", path.display()))?;
         }
         if prof {
             eprintln!(
-                "  [save] 零单元格改动直通复制基准 {:.3}s rss {:.0}MB",
+                "  [save] 沿用基准包写回 {:.3}s rss {:.0}MB",
                 t_read.elapsed().as_secs_f64(),
                 crate::mem::rss_mb()
             );
@@ -2248,7 +2085,13 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 .with_context(|| format!("找不到表 {}", sheet.name))?;
 
             for cref in sheet.cleared.iter() {
-                ws.remove_cell((cref.col + 1, cref.row + 1));
+                let coord = (cref.col + 1, cref.row + 1);
+                if sheet.explicit_style_of(cref.row, cref.col).is_some() {
+                    // Keep the original XF (including unmodeled fields) on a formatted blank.
+                    *ws.get_cell_mut(coord).cell_value_mut() = Default::default();
+                } else {
+                    ws.remove_cell(coord);
+                }
             }
 
             // 样式：正常保存只回写用户改过的格子（整表重写样式在 10 万格级别会拖慢保存）；

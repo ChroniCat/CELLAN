@@ -7,6 +7,8 @@
 //!
 //! 直接调 Win32：项目里没有 windows crate，也不该为了几十行 API 引一整套。
 
+pub mod delayed;
+
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -151,6 +153,16 @@ pub fn has_pasteable() -> bool {
         }
         *g = Some((Instant::now(), ok));
         ok
+    }
+}
+
+pub fn has_xml_spreadsheet() -> bool {
+    #[cfg(test)]
+    { false }
+    #[cfg(not(test))]
+    unsafe {
+        let format = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
+        format != 0 && IsClipboardFormatAvailable(format) != 0
     }
 }
 
@@ -680,6 +692,8 @@ fn alloc_global(bytes: &[u8]) -> *mut c_void {
 /// arboard 只能写 HTML/文本，没有 XMLSS flavor；Excel 粘 HTML 时公式会退化成值，
 /// 所以这里直接走 Win32，三种格式同一时刻落到剪贴板上。
 pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
+    // GUI tests keep all clipboard I/O within the harness.
+    if cfg!(test) { return false; }
     let mut xmlss_bytes = xmlss.as_bytes().to_vec();
     xmlss_bytes.push(0);
     let mut text_utf16: Vec<u8> = Vec::with_capacity(text.len() * 2 + 2);
@@ -740,6 +754,13 @@ pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
 }
 
 /// 把选区写成 XML Spreadsheet 文本（公式转 R1C1，日期写 DateTime，文本保前导零）。
+pub fn selection_xmlss(wb: &sheetcore::Workbook, si: usize, rect: (u32, u32, u32, u32)) -> String {
+    build_xmlss(wb, si, rect, &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
+        st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format))
+}
+
+pub(crate) use sheetcore::clipboard_xmlss::sparse_column_xmlss;
+
 pub fn build_xmlss(
     wb: &sheetcore::Workbook,
     si: usize,
@@ -789,28 +810,28 @@ pub fn build_xmlss(
         format!("sc{i}")
     };
 
-    let merges: Vec<(u32, u32, u32, u32)> = sh.merges.clone();
-    let covered = |r: u32, c: u32| {
-        merges
-            .iter()
-            .any(|(a, b, cc, dd)| r >= *a && c >= *b && r <= *cc && c <= *dd && (r, c) != (*a, *b))
-    };
-    let anchor_merge = |r: u32, c: u32| merges.iter().find(|(a, b, _, _)| *a == r && *b == c).copied();
-
+    let mut style_ids = HashMap::new();
+    let merges: Vec<_> = sh.merges.iter().copied()
+        .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2).collect();
+    let mut merge_index = sheetcore::merges::MergeIndex::default();
+    merge_index.refresh(&merges);
+    let blank = sheetcore::Cell::default();
     let mut body = String::new();
     for r in r1..=r2 {
         body.push_str("<Row>");
         for c in c1..=c2 {
-            if covered(r, c) {
+            let merge = merge_index.at(r, c);
+            if merge.is_some_and(|(a, b, _, _)| (r, c) != (a, b)) {
                 continue;
             }
-            let cell = sh.get(r, c).cloned().unwrap_or_default();
-            let st = wb.styles.get(sh.style_of(r, c));
-            let sid = id_of(&st, &mut ids);
+            let cell = sh.get(r, c).unwrap_or(&blank);
+            let style = sh.style_of(r, c);
+            let st = wb.styles.get(style);
+            let sid = style_ids.entry(style).or_insert_with(|| id_of(st, &mut ids));
             let mut attrs = format!(" ss:StyleID=\"{sid}\"");
             // merges 里是 (r1, c1, r2, c2)：横向跨列写 MergeAcross，纵向跨行写 MergeDown。
             // 写反了 Excel 会直接拒绝整个 XML Spreadsheet（连值都粘不进来）。
-            if let Some((a, b, cc, dd)) = anchor_merge(r, c) {
+            if let Some((a, b, cc, dd)) = merge {
                 if dd > b {
                     let _ = write!(attrs, " ss:MergeAcross=\"{}\"", dd - b);
                 }

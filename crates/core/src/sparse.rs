@@ -26,7 +26,7 @@ fn col_of(letters: &str) -> Option<u32> {
         if !d.is_ascii_uppercase() {
             return None;
         }
-        n = n * 26 + (d as u32 - 'A' as u32 + 1);
+        n = n.checked_mul(26)?.checked_add(d as u32 - 'A' as u32 + 1)?;
         any = true;
     }
     if any {
@@ -38,23 +38,10 @@ fn col_of(letters: &str) -> Option<u32> {
 
 /// "B12" → (11, 1)
 pub fn parse_ref(s: &str) -> Option<(u32, u32)> {
-    let letters: String = s.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-    let digits: String = s.chars().skip(letters.len()).collect();
-    if letters.is_empty() || digits.is_empty() {
-        return None;
-    }
-    let col = col_of(&letters)?;
+    let i = s.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let (letters, digits) = s.split_at(i);
     let row: u32 = digits.parse().ok()?;
-    Some((row.saturating_sub(1), col))
-}
-
-
-fn tag_start(e: &quick_xml::events::BytesStart<'_>) -> String {
-    e.name().as_ref().to_string()
-}
-
-fn tag_end(e: &quick_xml::events::BytesEnd<'_>) -> String {
-    e.name().as_ref().to_string()
+    Some((row.checked_sub(1)?, col_of(letters)?))
 }
 
 /// 直接从 zip 里读某个部件的声明区域（只读开头一小段）
@@ -113,13 +100,13 @@ pub fn shared_strings_checked(path: &Path) -> Result<Vec<String>> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                if tag_start(&e) == "si" {
+                if e.local_name().as_ref() == "si" {
                     in_si = true;
                     cur.clear();
                 }
             }
             Ok(Event::End(e)) => {
-                if tag_end(&e) == "si" {
+                if e.local_name().as_ref() == "si" {
                     out.push(std::mem::take(&mut cur));
                     in_si = false;
                 }
@@ -259,7 +246,7 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
     let mut in_f = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match tag_start(&e).as_str() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
                 "c" => {
                     cell_ref = None;
                     for a in e.attributes().flatten() {
@@ -281,7 +268,7 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
                 _ => {}
             },
             Ok(Event::End(e)) => {
-                if tag_end(&e).as_str() == "f" {
+                if e.local_name().as_ref() == "f" {
                     in_f = false;
                     if let (Some(si), Some(pos)) = (si.clone(), cell_ref) {
                         let text = body.trim().to_string();
@@ -296,7 +283,7 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
                 }
             }
             Ok(Event::Empty(e)) => {
-                if tag_start(&e) == "f" {
+                if e.local_name().as_ref() == "f" {
                     let mut si2: Option<String> = None;
                     for a in e.attributes().flatten() {
                         if a.key.as_ref() == "si" {
@@ -410,7 +397,7 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), C
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match tag_start(&e).as_str() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
                 "row" => {
                     if let Some(a) = e.attributes().flatten().find(|a| a.key.as_ref() == "r") {
                         row = a.value.as_ref()
@@ -478,19 +465,19 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), C
                 }
             }
             Ok(Event::Text(t)) => {
-                let s = t.as_ref().to_string();
+                let s = t.as_ref();
                 if in_v {
-                    val.push_str(&s);
+                    val.push_str(s);
                 } else if in_t {
-                    val.push_str(&s);
+                    val.push_str(s);
                 } else if formula.is_some() {
                     if let Some(f) = formula.as_mut() {
-                        f.push_str(&s);
+                        f.push_str(s);
                     }
                 }
             }
             Ok(Event::Empty(e)) => {
-                if tag_start(&e) == "f" {
+                if e.local_name().as_ref() == "f" {
                     let mut shared = false;
                     let mut si = String::new();
                     for a in e.attributes().flatten() {
@@ -511,7 +498,7 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), C
                     }
                 }
             }
-            Ok(Event::End(e)) => match tag_end(&e).as_str() {
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
                 "v" => in_v = false,
                 "t" => in_t = false,
                 "is" => in_is = false,

@@ -699,10 +699,13 @@ impl SheetApp {
     }
 
     fn render_clip_cells_to_rgba(&self, clip: &Clip) -> (u32, u32, Vec<u8>) {
-        if clip.source_rows.is_none() && clip.sheet < self.wb.sheets.len() && !clip.cells.is_empty() {
+        if let Some(range) = &clip.deferred {
+            return render_sheet_rect_to_rgba(range.book(), 0, clip.rect);
+        }
+        if clip.source_rows.is_none() && clip.sheet < self.wb.sheets.len() && !clip.cells().is_empty() {
             return self.render_range_to_rgba(clip.sheet, clip.rect);
         }
-        self.render_matrix_to_rgba(&clip.cells)
+        self.render_matrix_to_rgba(clip.cells())
     }
 
     pub(crate) fn copy_selection_as_picture(&mut self, _ctx: &egui::Context) {
@@ -766,7 +769,7 @@ impl SheetApp {
         }
         self.clip_pic = None;
         self.clip_stamp = Some(tsv);
-        self.clip = Some(Clip {
+        self.clip = Some(Clip { deferred: None,
             source_rows: None,
             sheet: self.sheet_idx,
             rect: (r1, c1, r2, c2),
@@ -784,8 +787,12 @@ impl SheetApp {
         let mut decoded: Option<(u32, u32, Vec<u8>)> = None;
         if let Some((w, h, png)) = self.clip_pic.clone() {
             decoded = Some((w, h, png));
-        } else if let Some(clip) = self.clip.clone() {
-            let (w, h, rgba) = self.render_clip_cells_to_rgba(&clip);
+        } else if let Some(clip) = self.internal_clip_for(self.system_paste_text().as_deref(), true) {
+            if crate::office_clipboard::delayed::is_full_columns(clip.rect) {
+                self.status = "请先选中要粘贴为图片的数据区域".into();
+                return;
+            }
+            let (w, h, rgba) = self.render_clip_cells_to_rgba(clip);
             let png = encode_rgba_png(w, h, &rgba);
             decoded = Some((w, h, png));
         }
@@ -874,31 +881,30 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
-        let sys = crate::read_system_clip();
-        let ext_text = if sys.text.is_empty() { None } else { Some(sys.text) };
-        let internal: Option<Clip> = match (&self.clip, &ext_text) {
-            (Some(clip), Some(t)) => {
-                let same = match &self.clip_stamp {
-                    Some(stamp) => crate::copied_text_matches(stamp, t),
-                    None => true,
-                };
-                if same { Some(clip.clone()) } else { None }
-            }
-            (Some(clip), _) => Some(clip.clone()),
-            (None, _) => None,
-        };
+        let ext_text = self.system_paste_text();
+        let internal = self.internal_clip_for(ext_text.as_deref(), true).cloned();
         let (matrix, coords, src_sheet_idx, src_rect, src_col_widths) = if let Some(clip) = internal {
+            if crate::office_clipboard::delayed::is_full_columns(clip.rect) {
+                if matches!(mode, PasteMode::Values) {
+                    self.clip_paste(true, ext_text);
+                } else {
+                    self.status = "整列支持普通粘贴和粘贴数值，其他选项请先选中数据区域".into();
+                }
+                return;
+            }
             let (_, sc1, _, sc2) = clip.rect;
-            let mut coords = Vec::with_capacity(clip.cells.len());
-            for (i, row) in clip.cells.iter().enumerate() {
+            let mut coords = Vec::with_capacity(clip.cells().len());
+            for (i, row) in clip.cells().iter().enumerate() {
                 coords.push((0..row.len()).map(|j| (clip.source_row(i), sc1 + j as u32)).collect());
             }
-            let widths: Vec<f32> = if clip.sheet < self.wb.sheets.len() {
-                (sc1..=sc2).map(|c| self.wb.sheet(clip.sheet).cols.size(c)).collect()
+            let source = clip.deferred.as_ref().map(|range| range.book().sheet(0))
+                .or_else(|| self.wb.sheets.get(clip.sheet));
+            let widths: Vec<f32> = if let Some(source) = source {
+                (sc1..=sc2).map(|c| source.cols.size(c)).collect()
             } else {
                 Vec::new()
             };
-            (clip.cells, Some(coords), Some(clip.sheet), Some(clip.rect), widths)
+            (clip.cells().to_vec(), Some(coords), Some(clip.sheet), Some(clip.rect), widths)
         } else if let Some(t) = ext_text {
             (Self::parse_clip_text(&t), None, None, None, Vec::new())
         } else {
@@ -1092,16 +1098,16 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
-        let Some(clip) = self.clip.clone() else {
+        let Some(clip) = self.internal_clip_for(self.system_paste_text().as_deref(), true).cloned() else {
             self.status = "请先在工作簿内复制单元格区域，再使用「粘贴链接」".into();
             return;
         };
-        if clip.sheet >= self.wb.sheets.len() {
+        let Some(source_sheet) = clip.live_sheet_index(&self.wb) else {
             self.status = "源工作表已不存在".into();
             return;
-        }
+        };
         let (_, sc1, _, sc2) = clip.rect;
-        let rows = clip.cells.len() as u32;
+        let rows = if clip.deferred.is_some() { clip.rect.2 - clip.rect.0 + 1 } else { clip.cells.len() as u32 };
         if rows == 0 { return; }
         let cols = sc2 - sc1 + 1;
         if (rows as u64) * (cols as u64) > 200_000 {
@@ -1114,7 +1120,7 @@ impl SheetApp {
             return;
         }
         let si = self.sheet_idx;
-        let src_sheet_name = self.wb.sheet(clip.sheet).name.clone();
+        let src_sheet_name = self.wb.sheet(source_sheet).name.clone();
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
         if !self.write_preflight(&keys, "粘贴链接") {
             return;
@@ -1125,14 +1131,14 @@ impl SheetApp {
             for j in 0..cols {
                 let (sr, sc) = (clip.source_row(i as usize), sc1 + j);
                 let (dr, dc) = (r0 + i, c0 + j);
-                let target_ref = if clip.sheet == si {
+                let target_ref = if source_sheet == si {
                     format!("={}", cell_name(sr, sc))
                 } else {
                     format!("={}!{}", quote_sheet_name(&src_sheet_name), cell_name(sr, sc))
                 };
                 let src_val = self
                     .wb
-                    .sheet(clip.sheet)
+                    .sheet(source_sheet)
                     .get(sr, sc)
                     .map(|c| c.value.clone())
                     .unwrap_or(Value::Number(0.0));

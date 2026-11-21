@@ -77,6 +77,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_circles_include_rows_beyond_fifty_thousand() {
+        let mut wb = Workbook::new_blank();
+        let sh = &mut wb.sheets[0];
+        for row in 0..50_002 {
+            sh.set(row, 0, Cell { value: Value::Number(row as f64), formula: None });
+        }
+        sh.set(50_001, 0, text("0001"));
+        sh.dv.push(dv::DataValidation {
+            ranges: vec![(0, 0, 50_001, 0)], kind: dv::DvKind::Custom,
+            f1: "=COUNTIF($A$1:$A$50002,A1)<=1".into(), ..Default::default()
+        });
+        let start = std::time::Instant::now();
+        let circles = find_invalid(&wb, 0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(circles.cells, [(1, 0), (50_001, 0)].into_iter().collect());
+        eprintln!("50,002 COUNTIF validation cells: {:?}", start.elapsed());
+    }
+
+    #[test]
     fn named_relative_list_membership_uses_each_targets_actual_source() {
         let mut wb = Workbook::new_blank();
         wb.sheets[0].set(0, 0, text("first"));
@@ -141,8 +159,8 @@ mod tests {
 fn find_invalid(wb: &Workbook, si: usize, cancel: &AtomicBool) -> Option<Circles> {
     let sheet = wb.sheet(si);
     let mut result = Circles::default();
-    let mut remaining = 50_000;
     let mut calc = formula::Calc::new(wb);
+    let mut formulas = formula::RuleFormulas::default();
     for rule in &sheet.dv {
         let mut membership = (rule.kind == dv::DvKind::List)
             .then(|| dv::ListMembership::new(wb, si, rule));
@@ -165,8 +183,7 @@ fn find_invalid(wb: &Workbook, si: usize, cancel: &AtomicBool) -> Option<Circles
                 } else {
                     dv::validate_wb(wb, si, rule, &cell.value, r, c, |src, rr, cc| {
                         let (ar, ac) = dv::range_anchor(rule, rr, cc);
-                        let shifted = sheetcore::cf::shift_formula(src.trim_start_matches('='), rr - ar, cc - ac);
-                        match formula::parse(&shifted) {
+                        match formulas.shifted(src, rr - ar, cc - ac) {
                             Ok(node) => calc.eval_node(&node, si),
                             Err(e) => {
                                 result.config_error = Some(format!("公式阈值无法解析：{src}（{e}）"));
@@ -176,8 +193,6 @@ fn find_invalid(wb: &Workbook, si: usize, cancel: &AtomicBool) -> Option<Circles
                     })
                 };
                 if !valid { result.cells.insert((r, c)); }
-                remaining -= 1;
-                if remaining == 0 { return Some(result); }
             }
         }
     }

@@ -67,26 +67,73 @@ pub struct PictureEdit {
     pub after: Vec<crate::pic::Picture>,
 }
 
+type MergeRect = (u32, u32, u32, u32);
+
 /// 合并/取消合并：只记差异，不整表快照。撤销/重做按差异增删，
 /// 因此动作之后别人新增的无关合并不会被旧的整表列表覆盖。
 #[derive(Clone, Debug)]
 pub struct MergeEdit {
-    pub sheet: usize,
-    /// 这个动作新增的合并矩形
-    pub added: Vec<(u32, u32, u32, u32)>,
-    /// 这个动作拆掉的既有合并矩形（撤销时恢复）
-    pub removed: Vec<(u32, u32, u32, u32)>,
+    sheets: Vec<SheetMergeDiff>,
+}
+
+#[derive(Clone, Debug)]
+struct SheetMergeDiff {
+    sheet: usize,
+    added: Vec<MergeRect>,
+    removed: Vec<MergeRect>,
 }
 
 impl MergeEdit {
     pub fn between(
         sheet: usize,
-        before: &[(u32, u32, u32, u32)],
-        after: &[(u32, u32, u32, u32)],
+        before: &[MergeRect],
+        after: &[MergeRect],
     ) -> Option<Self> {
-        let added: Vec<_> = after.iter().copied().filter(|r| !before.contains(r)).collect();
-        let removed: Vec<_> = before.iter().copied().filter(|r| !after.contains(r)).collect();
-        (!added.is_empty() || !removed.is_empty()).then_some(Self { sheet, added, removed })
+        let previous: std::collections::HashSet<_> = before.iter().collect();
+        let next: std::collections::HashSet<_> = after.iter().collect();
+        let added: Vec<_> = after.iter().copied().filter(|r| !previous.contains(r)).collect();
+        let removed: Vec<_> = before.iter().copied().filter(|r| !next.contains(r)).collect();
+        (!added.is_empty() || !removed.is_empty()).then(|| Self {
+            sheets: vec![SheetMergeDiff { sheet, added, removed }],
+        })
+    }
+
+    /// Group diffs from distinct sheets into one reversible clipboard operation.
+    pub fn join(edits: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let sheets: Vec<_> = edits.into_iter().flat_map(|edit| edit.sheets).collect();
+        (!sheets.is_empty()).then_some(Self { sheets })
+    }
+
+    fn apply_to_owned_cells(
+        &self,
+        sheets: &mut [Sheet],
+        deltas: &[CellDelta],
+        guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
+        forward: bool,
+    ) -> Option<Vec<(usize, MergeRect, bool)>> {
+        let blank = Cell::default();
+        for d in deltas {
+            let current = sheets.get(d.sheet)?.get(d.row, d.col).unwrap_or(&blank);
+            if !guard(d.sheet, d.row, d.col, current) { return None; }
+        }
+        self.apply(sheets, forward)
+    }
+
+    /// Validate every affected sheet before installing any side of a cut.
+    pub fn apply(&self, sheets: &mut [Sheet], forward: bool) -> Option<Vec<(usize, MergeRect, bool)>> {
+        let mut plans = Vec::new();
+        for diff in &self.sheets {
+            let (add, remove) = if forward { (&diff.added, &diff.removed) } else { (&diff.removed, &diff.added) };
+            let (next, changes) = plan_merge_diff(sheets.get(diff.sheet)?, add, remove)?;
+            plans.push((diff.sheet, next, changes));
+        }
+        let mut applied = Vec::new();
+        for (idx, next, changes) in plans {
+            sheets[idx].merges = next;
+            sheets[idx].merges_dirty = true;
+            applied.extend(changes.into_iter().map(|(rect, on)| (idx, rect, on)));
+        }
+        Some(applied)
     }
 }
 
@@ -181,6 +228,8 @@ pub struct UndoStack {
 pub struct Applied {
     /// 每个表里被改动的格子（用于重算与协作广播）
     pub touched: Vec<(usize, u32, u32)>,
+    /// Cell deltas that actually changed a format and must broadcast it to peers.
+    pub style_changes: Vec<(usize, u32, u32)>,
     pub label: String,
     pub focus: (usize, u32, u32),
     /// 因为别人改过而跳过的格子数
@@ -288,7 +337,7 @@ impl SheetTabAction {
         wb.dirty = true;
         Some(Applied {
             touched: Vec::new(), label: self.label.clone(), focus, skipped: 0,
-            structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
+            structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false,
         })
     }
 }
@@ -643,7 +692,7 @@ impl UndoStack {
         }
         let Entry::Structure(id, action) = self.done.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.before);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
         self.undone.push(Entry::Structure(id, action));
         Some(applied)
     }
@@ -658,7 +707,7 @@ impl UndoStack {
         }
         let Entry::Structure(id, action) = self.undone.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.after);
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false };
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
         self.done.push(Entry::Structure(id, action));
         Some(applied)
     }
@@ -683,6 +732,7 @@ impl UndoStack {
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
+        let mut style_changes = Vec::new();
         if let Some(p) = action.pictures.clone() {
             if let Some(sheet) = sheets.get_mut(p.sheet) {
                 sheet.pictures = p.before;
@@ -695,7 +745,7 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: None,
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.undone.push(Entry::Cells(id, action));
@@ -713,32 +763,22 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: None,
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.undone.push(Entry::Cells(id, action));
             return Some(applied);
         }
-        let mut merge_conflict = false;
-        if let Some(m) = action.merges.as_ref() {
-            if let Some(sheet) = sheets.get_mut(m.sheet) {
-                match plan_merge_diff(sheet, &m.removed, &m.added) {
-                    Some((next, changes)) => {
-                        sheet.merges = next;
-                        sheet.merges_dirty = true;
-                        for (rect, added) in changes {
-                            merge_changes.push((m.sheet, rect, added));
-                        }
-                    }
-                    None => merge_conflict = true,
-                }
-            }
-        }
+        let merged = action.merges.as_ref().map(|edit| {
+            edit.apply_to_owned_cells(sheets, &action.deltas, &mut guard, false)
+        });
+        let merge_conflict = matches!(merged, Some(None));
+        if let Some(Some(changes)) = merged { merge_changes = changes; }
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
             self.done.push(Entry::Cells(id, action));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, merge_changes, merge_conflict: true });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
         }
         if let Some(snap) = action.snap_before.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
@@ -752,7 +792,7 @@ impl UndoStack {
                 skipped,
                 structural: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.undone.push(Entry::Cells(id, action));
@@ -764,12 +804,15 @@ impl UndoStack {
                 value: crate::model::Value::Empty,
                 formula: None,
             });
-            if !guard(d.sheet, d.row, d.col, &cur) {
+            if action.merges.is_none() && !guard(d.sheet, d.row, d.col, &cur) {
                 skipped += 1;
                 continue;
             }
             sheet.set(d.row, d.col, d.before.clone());
-            sheet.set_style(d.row, d.col, d.before_style);
+            if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != d.before_style {
+                sheet.set_style(d.row, d.col, d.before_style);
+                style_changes.push((d.sheet, d.row, d.col));
+            }
             touched.push((d.sheet, d.row, d.col));
         }
         let applied = Applied {
@@ -779,7 +822,7 @@ impl UndoStack {
             skipped,
             structural: false,
             refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
-            merge_changes,
+            style_changes, merge_changes,
             merge_conflict: false,
         };
         self.undone.push(Entry::Cells(id, action));
@@ -805,6 +848,7 @@ impl UndoStack {
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
+        let mut style_changes = Vec::new();
         if let Some(p) = action.pictures.clone() {
             if let Some(sheet) = sheets.get_mut(p.sheet) {
                 sheet.pictures = p.after;
@@ -817,7 +861,7 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.done.push(Entry::Cells(id, action));
@@ -835,32 +879,22 @@ impl UndoStack {
                 skipped: 0,
                 structural: false,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.done.push(Entry::Cells(id, action));
             return Some(applied);
         }
-        let mut merge_conflict = false;
-        if let Some(m) = action.merges.as_ref() {
-            if let Some(sheet) = sheets.get_mut(m.sheet) {
-                match plan_merge_diff(sheet, &m.added, &m.removed) {
-                    Some((next, changes)) => {
-                        sheet.merges = next;
-                        sheet.merges_dirty = true;
-                        for (rect, added) in changes {
-                            merge_changes.push((m.sheet, rect, added));
-                        }
-                    }
-                    None => merge_conflict = true,
-                }
-            }
-        }
+        let merged = action.merges.as_ref().map(|edit| {
+            edit.apply_to_owned_cells(sheets, &action.deltas, &mut guard, true)
+        });
+        let merge_conflict = matches!(merged, Some(None));
+        if let Some(Some(changes)) = merged { merge_changes = changes; }
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
             self.undone.push(Entry::Cells(id, action));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, merge_changes, merge_conflict: true });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
         }
         if let Some(snap) = action.snap_after.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
@@ -874,7 +908,7 @@ impl UndoStack {
                 skipped,
                 structural: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
-                merge_changes,
+                style_changes, merge_changes,
                 merge_conflict: false,
             };
             self.done.push(Entry::Cells(id, action));
@@ -886,12 +920,15 @@ impl UndoStack {
                 value: crate::model::Value::Empty,
                 formula: None,
             });
-            if !guard(d.sheet, d.row, d.col, &cur) {
+            if action.merges.is_none() && !guard(d.sheet, d.row, d.col, &cur) {
                 skipped += 1;
                 continue;
             }
             sheet.set(d.row, d.col, d.after.clone());
-            sheet.set_style(d.row, d.col, d.after_style);
+            if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != d.after_style {
+                sheet.set_style(d.row, d.col, d.after_style);
+                style_changes.push((d.sheet, d.row, d.col));
+            }
             touched.push((d.sheet, d.row, d.col));
         }
         let applied = Applied {
@@ -901,7 +938,7 @@ impl UndoStack {
             skipped,
             structural: false,
             refresh_sizes: None,
-            merge_changes,
+            style_changes, merge_changes,
             merge_conflict: false,
         };
         self.done.push(Entry::Cells(id, action));
@@ -987,6 +1024,22 @@ mod tests {
         assert!(st.can_redo());
         st.redo(&mut wb.sheets, |_, _, _, _| true).unwrap();
         assert_eq!(wb.sheets[0].get(0, 0).unwrap().value.display(), "42");
+    }
+
+    #[test]
+    fn value_only_undo_keeps_changed_inherited_format_and_omits_style_broadcast() {
+        let mut wb = wb();
+        let mut st = UndoStack::new();
+        wb.sheets[0].col_styles.insert(0, 1);
+        st.push(edit(&mut wb, 0, 0, 42.0));
+        wb.sheets[0].col_styles.insert(0, 2);
+        let undone = st.undo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        assert_eq!(undone.touched, [(0, 0, 0)]);
+        assert!(undone.style_changes.is_empty());
+        let redone = st.redo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        assert!(redone.style_changes.is_empty());
+        assert_eq!(wb.sheets[0].style_of(0, 0), 2);
+        assert_eq!(wb.sheets[0].explicit_style_of(0, 0), None);
     }
 
     #[test]

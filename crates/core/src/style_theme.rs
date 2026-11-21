@@ -488,12 +488,18 @@ pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
     out
 }
 
-pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) -> quick_xml::Result<()> {
+pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) -> anyhow::Result<String> {
     let mut r = Reader::from_str(xml);
     let mut cur_row = 0u32;
     let mut next_col = 0u32;
+    let mut in_data = false;
+    let mut closed = false;
+    let mut root = None;
 
+    let mut shell = String::new();
+    let mut copied = 0;
     loop {
+        let start = r.buffer_position() as usize;
         match r.read_event() {
             ev @ (Ok(Event::Start(_)) | Ok(Event::Empty(_))) => {
                 let e = match &ev {
@@ -502,7 +508,13 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
                 };
                 let nm = e.name();
                 let lname = local_name(nm.as_ref());
-                if lname == "row" {
+                if root.is_none() {
+                    root = Some(lname.to_owned());
+                    closed = matches!(&ev, Ok(Event::Empty(_)));
+                }
+                if lname == "sheetData" {
+                    in_data = matches!(&ev, Ok(Event::Start(_)));
+                } else if in_data && lname == "row" {
                     next_col = 0;
                     for a in e.attributes().flatten() {
                         if local_name(a.key.as_ref()) == "r" {
@@ -511,7 +523,7 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
                             }
                         }
                     }
-                } else if lname == "c" {
+                } else if in_data && lname == "c" {
                     let mut coord: Option<(u32, u32)> = None;
                     let mut s_idx: Option<u16> = None;
                     for a in e.attributes().flatten() {
@@ -530,20 +542,29 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
                     if let Some(s) = s_idx {
                         cell(row, col, s);
                     }
+                    shell.push_str(&xml[copied..start]);
+                    if matches!(&ev, Ok(Event::Start(_))) { r.read_to_end(e.name())?; }
+                    copied = r.buffer_position() as usize;
                 }
             }
             Ok(Event::End(e)) => {
-                if local_name(e.name().as_ref()) == "row" {
+                let tag = e.name();
+                let name = local_name(tag.as_ref());
+                if root.as_deref() == Some(name) { closed = true; }
+                if name == "sheetData" { in_data = false; }
+                if in_data && name == "row" {
                     cur_row += 1;
                     next_col = 0;
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
             _ => {}
         }
     }
-    Ok(())
+    anyhow::ensure!(closed, "工作表 XML 未正常结束");
+    shell.push_str(&xml[copied..]);
+    Ok(shell)
 }
 
 fn a1(s: &str) -> Option<(u32, u32)> {

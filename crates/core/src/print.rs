@@ -291,9 +291,25 @@ pub struct TextOp {
 }
 
 /// 每张表算一次条件格式的统计量，供逐格 overlay 使用
-struct CfState {
-    cf: crate::cf::CfSheet,
-    stats: crate::cf::CfStats,
+struct PageState<'a> {
+    stats: Option<crate::cf::CfStats>,
+    merges: crate::merges::MergeIndex,
+    formulas: crate::formula::RuleFormulas,
+    calc: crate::formula::Calc<'a>,
+}
+
+impl<'a> PageState<'a> {
+    fn new(wb: &'a Workbook, sheet_idx: usize) -> Self {
+        let sheet = wb.sheet(sheet_idx);
+        let stats = (!sheet.cf.blocks.is_empty()).then(|| {
+            let mut stats = crate::cf::CfStats::default();
+            crate::cf::compute_stats(&sheet.cf, sheet, &mut stats);
+            stats
+        });
+        let mut merges = crate::merges::MergeIndex::default();
+        merges.refresh(&sheet.merges);
+        Self { stats, merges, formulas: Default::default(), calc: crate::formula::Calc::new(wb) }
+    }
 }
 
 /// 单元格首行基线的位置（PDF 坐标，y 向上；`top` 是下边、`top + ch` 是上边）。
@@ -323,8 +339,7 @@ fn draw_cell(
     wb: &Workbook,
     sheet: &Sheet,
     si: usize,
-    cf: Option<&CfState>,
-    calc: &mut crate::formula::Calc,
+    state: &mut PageState,
     r: u32,
     c: u32,
     x: f32,
@@ -335,15 +350,15 @@ fn draw_cell(
     scale: f32,
     out: &mut Out,
 ) {
-    if display::merge_covered(sheet, r, c) {
+    let merge = state.merges.at(r, c);
+    if merge.is_some_and(|(top, left, _, _)| (top, left) != (r, c)) {
         return;
     }
-    let overlay = cf.map(|st| {
-        crate::cf::overlay_at(&st.cf, &st.stats, sheet, r, c, |f, r0, c0| {
-            let shifted = crate::cf::shift_formula(f.trim_start_matches('='), r0, c0);
-            match crate::formula::parse(&shifted) {
+    let overlay = state.stats.as_ref().map(|st| {
+        crate::cf::overlay_at(&sheet.cf, st, sheet, r, c, |f, r0, c0| {
+            match state.formulas.shifted(f, r0, c0) {
                 Ok(node) => matches!(
-                    calc.eval_node(&node, si),
+                    state.calc.eval_node(&node, si),
                     crate::formula::FValue::Bool(true)
                 ),
                 Err(_) => false,
@@ -354,20 +369,19 @@ fn draw_cell(
     let mut eff: Option<crate::model::Value> = None;
     if let Some(cell) = sheet.get(r, c) {
         if cell.value.is_empty() {
-            if let Some(f) = cell.formula.as_deref() {
-                eff = Some(fvalue_to_value(crate::formula::eval_formula(wb, si, f)));
+            if cell.formula.is_some() {
+                eff = Some(fvalue_to_value(state.calc.cell_value(si, r, c)));
             }
         }
     }
     let cap = {
-        let c2 = sheet
-            .merge_at(r, c)
+        let c2 = merge
             .map(|(_, _, _, c2)| c2)
             .unwrap_or(c);
         let px: f32 = (c..=c2).map(|cc| col_w(sheet, cc)).sum();
         (((px - 5.0) / 8.0).floor().max(1.0)) as usize
     };
-    let Some(view) = display::view_at_value_fit(
+    let Some(view) = display::view_with_merge(
         wb,
         sheet,
         r,
@@ -375,6 +389,7 @@ fn draw_cell(
         overlay.as_ref(),
         eff.as_ref(),
         Some(cap),
+        merge,
     ) else {
         return;
     };
@@ -907,6 +922,20 @@ pub fn page_ops_metrics(
     metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
     vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
 ) -> Out {
+    let mut state = PageState::new(wb, sheet_idx);
+    render_page(wb, sheet_idx, layout, page_index, source, metric, vmetric, &mut state)
+}
+
+fn render_page(
+    wb: &Workbook,
+    sheet_idx: usize,
+    layout: &Layout,
+    page_index: usize,
+    source: Option<&Path>,
+    metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+    vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
+    state: &mut PageState,
+) -> Out {
     let sheet = &wb.sheets[sheet_idx];
     let setup = &layout.setup;
     let (pw, ph) = layout.page_size;
@@ -916,14 +945,6 @@ pub fn page_ops_metrics(
     let mut out = Out::default();
     out.metric = metric;
     out.vmetric = vmetric;
-
-    let mut cf_state: Option<CfState> = None;
-    if !sheet.cf.blocks.is_empty() {
-        let mut stats = crate::cf::CfStats::default();
-        crate::cf::compute_stats(&sheet.cf, sheet, &mut stats);
-        cf_state = Some(CfState { cf: sheet.cf.clone(), stats });
-    }
-    let mut calc = crate::formula::Calc::new(wb);
 
     // 页眉
     if !setup.header.is_empty() {
@@ -964,7 +985,7 @@ pub fn page_ops_metrics(
                 if w <= 0.0 {
                     continue;
                 }
-                draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, y - h, w, h, px, layout.scale, &mut out);
+                draw_cell(wb, sheet, sheet_idx, state, r, c, x, y - h, w, h, px, layout.scale, &mut out);
                 x += w;
             }
             y -= h;
@@ -984,7 +1005,7 @@ pub fn page_ops_metrics(
                     if h <= 0.0 {
                         continue;
                     }
-                    draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, yy - h, w, h, px, layout.scale, &mut out);
+                    draw_cell(wb, sheet, sheet_idx, state, r, c, x, yy - h, w, h, px, layout.scale, &mut out);
                     yy -= h;
                 }
                 x += w;
@@ -1008,7 +1029,7 @@ pub fn page_ops_metrics(
             if w <= 0.0 {
                 continue;
             }
-            draw_cell(wb, sheet, sheet_idx, cf_state.as_ref(), &mut calc, r, c, x, cursor_y - h, w, h, px, layout.scale, &mut out);
+            draw_cell(wb, sheet, sheet_idx, state, r, c, x, cursor_y - h, w, h, px, layout.scale, &mut out);
             x += w;
         }
         cursor_y -= h;
@@ -1099,15 +1120,6 @@ pub fn export_pdf_pages_from(
     source: Option<&Path>,
     pages: Option<(usize, usize)>,
 ) -> Result<usize> {
-    let Some(sheet) = wb.sheets.get(sheet_idx) else {
-        anyhow::bail!("没有第 {sheet_idx} 张表");
-    };
-    let layout = paginate(sheet, &sheet.page);
-    let total = layout.pages.len();
-    let (first, last) = match pages {
-        Some((a, b)) => (a.min(total.saturating_sub(1)), b.min(total.saturating_sub(1))),
-        None => (0, total.saturating_sub(1)),
-    };
     let font = Font::load(font_path)?;
     export_pdf_pages_with_fonts(wb, sheet_idx, path, font, None, source, pages)
 }
@@ -1141,6 +1153,7 @@ pub fn export_pdf_pages_with_fonts(
     if let Some(b) = bold {
         doc.set_bold_font(b);
     }
+    let mut state = PageState::new(wb, sheet_idx);
     let mut exported = 0usize;
     for pi in first..=last {
         if pi >= total {
@@ -1149,7 +1162,7 @@ pub fn export_pdf_pages_with_fonts(
         exported += 1;
         let (pw, ph) = layout.page_size;
         doc.add_page(pw, ph);
-        let out = page_ops_metrics(
+        let out = render_page(
             wb,
             sheet_idx,
             &layout,
@@ -1157,6 +1170,7 @@ pub fn export_pdf_pages_with_fonts(
             source,
             metric.clone(),
             vmetric.clone(),
+            &mut state,
         );
         for (x, y, w, h, color) in out.rects {
             doc.page_mut().rect_fill(x, y, w, h, color);

@@ -99,13 +99,54 @@ impl CellStyles {
         })
     }
 
+    /// Re-key complete style pages when possible. Repack split pages in ascending
+    /// row order so a run of equal styles never shifts the packed vector per cell.
+    pub(crate) fn remap_axis(&mut self, rows: bool, at: u32, map: impl Fn(u32) -> Option<u32>) {
+        if self.pages.keys().all(|&(p, c)| if rows { p < at / PAGE_ROWS } else { c < at }) {
+            return;
+        }
+        let old = std::mem::take(self);
+        let mut pages: Vec<_> = old.pages.iter().collect();
+        pages.sort_unstable_by_key(|&(&key, _)| key);
+        let mut out = CellStyles::default();
+        for (&(p, c), page) in pages {
+            let base = p * PAGE_ROWS;
+            let same_page = if !rows {
+                map(c).map(|col| (p, col))
+            } else if base + PAGE_ROWS <= at {
+                Some((p, c))
+            } else {
+                map(base).filter(|r| r % PAGE_ROWS == 0 && map(base + PAGE_ROWS - 1) == Some(r + PAGE_ROWS - 1))
+                    .map(|r| (r / PAGE_ROWS, c))
+            };
+            if let Some(key) = same_page {
+                std::sync::Arc::make_mut(&mut out.pages).insert(key, page.clone());
+                out.len += page.ids.len();
+            } else if rows {
+                let mut ids = page.ids.iter();
+                for (word, &bits) in page.rows.iter().enumerate() {
+                    let mut bits = bits;
+                    while bits != 0 {
+                        let row = base + word as u32 * 64 + bits.trailing_zeros();
+                        let id = *ids.next().unwrap();
+                        if let Some(target) = map(row) { out.insert(CellRef::new(target, c), id); }
+                        bits &= bits - 1;
+                    }
+                }
+            }
+        }
+        *self = out;
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = CellRef> {
         self.iter().map(|(key, _)| key)
     }
 
     pub(crate) fn changed_keys(&self, other: &Self) -> impl Iterator<Item = CellRef> {
         self.pages.iter().filter(move |(key, page)| {
-            other.pages.get(key).is_none_or(|old| !std::sync::Arc::ptr_eq(old, page))
+            // Uniform table formatting often yields identical pages at the same
+            // coordinates after a row shift, even if the page had to be repacked.
+            other.pages.get(key).is_none_or(|old| !std::sync::Arc::ptr_eq(old, page) && old != *page)
         }).flat_map(move |(&(p, col), page)| {
             (0..PAGE_ROWS).filter_map(move |row| {
                 let key = CellRef::new(p * PAGE_ROWS + row, col);
@@ -276,6 +317,15 @@ impl Store {
         })
     }
 
+    pub(crate) fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.pages.iter().filter(|(_, p)| p.may_have_formula).flat_map(|(&pi, p)| {
+            p.cols.iter().enumerate().flat_map(move |(c, col)| {
+                col.iter().enumerate().filter_map(move |(row, cell)| cell.formula.is_some()
+                    .then_some((CellRef::new(pi * PAGE_ROWS + row as u32, c as u32), cell)))
+            })
+        })
+    }
+
     pub(crate) fn has_formulas(&self) -> bool {
         self.pages.values().any(|page| page.may_have_formula
             && page.cols.iter().any(|col| col.iter().any(|cell| cell.formula.is_some())))
@@ -354,6 +404,24 @@ impl Store {
         out
     }
 
+    pub(crate) fn cf_pages(&self, (r1, c1, r2, c2): (u32, u32, u32, u32)) -> Vec<crate::cf::PageSlice> {
+        let mut result = Vec::new();
+        for (&page, data) in &self.pages {
+            let base = page * PAGE_ROWS;
+            if base > r2 || base + PAGE_ROWS - 1 < r1 { continue; }
+            let start = r1.saturating_sub(base) as usize;
+            let cols_end = data.cols.len().min(c2 as usize + 1);
+            for (offset, cells) in data.cols.get(c1 as usize..cols_end).unwrap_or_default().iter().enumerate() {
+                let end = cells.len().min((r2 - base) as usize + 1);
+                if start < end {
+                    result.push(crate::cf::PageSlice { page, col: c1 + offset as u32, start, end, cells: cells.clone() });
+                }
+            }
+        }
+        result.sort_unstable_by_key(|s| (s.page, s.col));
+        result
+    }
+
     /// A read-only view of one column's allocated pages, shared until either side writes.
     pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<Vec<Cell>>)> {
         self.pages.iter().filter_map(|(&page, data)| {
@@ -418,23 +486,108 @@ impl Store {
         })
     }
 
-    /// Only enumerate occupied cells in the bands affected by a row/column shift.
-    pub(crate) fn keys_from(&self, rows: bool, at: u32) -> Vec<CellRef> {
-        let mut keys = Vec::new();
-        for (&index, page) in &self.pages {
-            if rows && index < at / PAGE_ROWS { continue; }
-            let base = index * PAGE_ROWS;
-            let row_start = if rows { at.saturating_sub(base) as usize } else { 0 };
-            let col_start = if rows { 0 } else { at as usize };
-            for (col, cells) in page.cols.iter().enumerate().skip(col_start) {
-                for (offset, cell) in cells.iter().enumerate().skip(row_start) {
-                    if !cell.is_blank() {
-                        keys.push(CellRef::new(base + offset as u32, col as u32));
+    /// Rebuild the affected page band once. Column edits move whole COW slabs.
+    /// Row edits map each old row once per page, then move owned cells directly.
+    pub(crate) fn remap_axis(
+        &mut self, rows: bool, at: u32, map: impl Fn(u32) -> Option<u32>,
+        cleared: &mut std::collections::HashSet<CellRef>,
+    ) {
+        // Keep one bit per occupied source slot to find holes in the final store.
+        // This avoids a temporary coordinate pair or hash-set entry per cell.
+        let mut occupied = Vec::<(u32, usize, [u64; 4])>::new();
+        let old_pages = std::mem::take(&mut self.pages);
+        self.bounds.take();
+        self.version.advance();
+        for (pi, mut page) in old_pages {
+            let base = pi * PAGE_ROWS;
+            if (rows && base + PAGE_ROWS <= at) || (!rows && page.cols.len() <= at as usize) {
+                self.pages.insert(pi, page);
+                continue;
+            }
+            if !rows {
+                let mut columns = Vec::with_capacity(page.cols.len());
+                for (c, slab) in std::mem::take(&mut page.cols).into_iter().enumerate() {
+                    if c >= at as usize {
+                        let mut bits = [0; 4];
+                        for (r, cell) in slab.iter().enumerate() {
+                            if !cell.is_blank() { bits[r / 64] |= 1 << (r % 64); }
+                        }
+                        occupied.push((pi, c, bits));
                     }
+                    if let Some(c) = map(c as u32) {
+                        columns.resize_with(c as usize, Default::default);
+                        columns.push(slab);
+                    } else {
+                        self.len -= slab.iter().filter(|cell| !cell.is_blank()).count();
+                    }
+                }
+                page.cols = columns;
+                self.pages.insert(pi, page);
+                continue;
+            }
+
+            // Each span maps a consecutive source slice into one destination page.
+            let mut spans: Vec<(std::ops::Range<usize>, u32, u32)> = Vec::new();
+            for r in 0..page.n_rows {
+                let Some(target) = map(base + r) else { continue };
+                let (dest, offset) = Self::split(target);
+                if let Some((source, pid, start)) = spans.last_mut()
+                    && *pid == dest && source.end == r as usize && *start + source.len() as u32 == offset {
+                    source.end += 1;
+                } else {
+                    spans.push((r as usize..r as usize + 1, dest, offset));
+                }
+            }
+            for (col, cells) in page.cols.into_iter().enumerate() {
+                if cells.is_empty() { continue; }
+                let mut bits = [0; 4];
+                let begin = at.saturating_sub(base) as usize;
+                for (r, cell) in cells.iter().enumerate().skip(begin) {
+                    if !cell.is_blank() { bits[r / 64] |= 1 << (r % 64); }
+                }
+                occupied.push((pi, col, bits));
+                if let [(source, dest, 0)] = spans.as_slice()
+                    && source.start == 0 && source.end >= cells.len()
+                    && map(base + PAGE_ROWS - 1) == Some(*dest * PAGE_ROWS + PAGE_ROWS - 1)
+                {
+                    // Page-aligned insertion/deletion: transfer this slab's Arc.
+                    let p = self.pages.entry(*dest).or_default();
+                    p.n_rows = p.n_rows.max(cells.len() as u32);
+                    if p.cols.len() <= col { p.cols.resize_with(col + 1, Default::default); }
+                    p.cols[col] = cells;
+                    p.may_have_formula |= page.may_have_formula;
+                    p.may_have_qualified_formula |= page.may_have_qualified_formula;
+                    continue;
+                }
+                let mut cells = std::sync::Arc::unwrap_or_clone(cells);
+                for (source, dest, offset) in &spans {
+                    let end = source.end.min(cells.len());
+                    if source.start >= end { break; }
+                    let src = &mut cells[source.start..end];
+                    let dest = self.pages.entry(*dest).or_default();
+                    dest.may_have_formula |= page.may_have_formula;
+                    dest.may_have_qualified_formula |= page.may_have_qualified_formula;
+                    dest.ensure(*offset + src.len() as u32 - 1, col as u32);
+                    let dst = std::sync::Arc::make_mut(&mut dest.cols[col]);
+                    src.swap_with_slice(&mut dst[*offset as usize..*offset as usize + src.len()]);
+                }
+                // Slots not transferred are precisely the deleted rows.
+                self.len -= cells.iter().filter(|cell| !cell.is_blank()).count();
+            }
+        }
+        cleared.retain(|k| (if rows { k.row } else { k.col }) < at || !self.contains(k.row, k.col));
+        for (pi, col, words) in occupied {
+            let dest = self.pages.get(&pi).and_then(|p| p.cols.get(col));
+            for (word, mut bits) in words.into_iter().enumerate() {
+                while bits != 0 {
+                    let r = word * 64 + bits.trailing_zeros() as usize;
+                    if dest.and_then(|cells| cells.get(r)).is_none_or(Cell::is_blank) {
+                        cleared.insert(CellRef::new(pi * PAGE_ROWS + r as u32, col as u32));
+                    }
+                    bits &= bits - 1;
                 }
             }
         }
-        keys
     }
 
     fn invalidate_boundary(cache: &mut std::sync::OnceLock<Option<(u32, u32, u32, u32)>>, r: u32, c: u32) {

@@ -6,7 +6,7 @@
 //! pivotCacheDefinition + pivotTableDefinition 两套部件，投入产出不划算。
 
 use crate::model::{Cell, Sheet, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agg {
@@ -144,22 +144,21 @@ pub fn group_key(v: &Value, g: &GroupBy) -> String {
 /// 行字段的去重取值（按 spec.group 归一后的标签，与 compute 里的 key 一致）。
 /// 切片器用它列出可勾选项；exclude 里的项也照样返回（勾选状态由调用方决定）。
 pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
-    let (r1, c1, r2, _c2) = spec.source;
-    let mut out: Vec<String> = Vec::new();
+    let (r1, _, r2, _) = spec.source;
+    let mut labels = HashSet::new();
     for r in (r1 + 1)..=r2 {
         let raw = sheet
             .get(r, spec.row_field)
-            .map(|x| x.value.clone())
-            .unwrap_or(Value::Empty);
-        let key = group_key(&raw, &spec.group);
+            .map(|x| &x.value)
+            .unwrap_or(&Value::Empty);
+        let key = group_key(raw, &spec.group);
         if key.is_empty() {
             continue;
         }
-        if !out.iter().any(|k| *k == key) {
-            out.push(key);
-        }
+        labels.insert(key);
     }
-    out.sort();
+    let mut out: Vec<_> = labels.into_iter().collect();
+    out.sort_unstable();
     out
 }
 
@@ -167,7 +166,7 @@ pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
 struct PivotVal { n: Option<f64> }
 
 pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
-    let (r1, c1, r2, c2) = spec.source;
+    let (r1, _, r2, _) = spec.source;
     let header = |c: u32| {
         sheet
             .get(r1, c)
@@ -185,16 +184,18 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     // Excel 透视表默认按「源表出现顺序」排列行/列标签，不排序
     let mut row_order: Vec<String> = Vec::new();
     let mut col_order: Vec<String> = Vec::new();
+    let mut known_cols = HashSet::new();
+    let excluded: HashSet<_> = spec.exclude.iter().map(String::as_str).collect();
     for r in (r1 + 1)..=r2 {
         let raw = sheet
             .get(r, spec.row_field)
-            .map(|x| x.value.clone())
-            .unwrap_or(Value::Empty);
-        let key = group_key(&raw, &spec.group);
+            .map(|x| &x.value)
+            .unwrap_or(&Value::Empty);
+        let key = group_key(raw, &spec.group);
         if key.is_empty() {
             continue;
         }
-        if spec.exclude.iter().any(|e| e == &key) {
+        if excluded.contains(key.as_str()) {
             continue;
         }
         let col_key = match spec.col_field {
@@ -209,13 +210,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         };
         // 先建立分组标签，再决定是否纳值。否则某个标签下的值全为空时，
         // 整行/整列会从结果里消失（Excel 仍保留标签，全空组的 Count 显示空白）。
-        if !row_order.iter().any(|k| k == &key) {
+        let row = data.entry(key).or_insert_with_key(|key| {
             row_order.push(key.clone());
-        }
-        if !col_order.iter().any(|k| k == &col_key) {
+            BTreeMap::new()
+        });
+        if !known_cols.contains(&col_key) {
+            known_cols.insert(col_key.clone());
             col_order.push(col_key.clone());
         }
-        let entry = data.entry(key).or_default().entry(col_key).or_default();
+        let entry = row.entry(col_key).or_default();
         if spec.agg == Agg::Count {
             if nonempty {
                 entry.push(PivotVal { n });

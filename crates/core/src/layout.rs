@@ -102,6 +102,13 @@ impl Axis {
         }
     }
 
+    pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) {
+        if self.sizes.is_empty() { return; }
+        self.sizes = std::mem::take(&mut self.sizes).into_iter()
+            .filter_map(|(index, size)| map(index).map(|new| (new, size))).collect();
+        self.rebuild();
+    }
+
     fn rebuild(&mut self) {
         self.revision = layout_revision();
         self.prefix.clear();

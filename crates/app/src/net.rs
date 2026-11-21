@@ -78,7 +78,35 @@ pub enum NetEvent {
 
 enum Cmd {
     Broadcast(String),
+    Cells(Vec<Op>),
     Stop,
+}
+
+fn cell_frames(ops: Vec<Op>, to_host: bool, batch: bool, mut send: impl FnMut(String)) {
+    use sheetcore::sync::ValueWire;
+    let mut pending = Vec::new();
+    let mut bytes = 0usize;
+    let mut flush = |mut chunk: Vec<Op>| {
+        let msg = if chunk.len() == 1 {
+            Msg::Op(chunk.pop().unwrap())
+        } else if to_host {
+            Msg::Ops { ops: chunk }
+        } else {
+            Msg::SnapshotChunk { ops: chunk, last: false }
+        };
+        send(serde_json::to_string(&msg).unwrap());
+    };
+    for op in ops {
+        let text_len = match &op.value { ValueWire::Text(s) | ValueWire::Error(s) => s.len(), _ => 0 };
+        let size = text_len + op.formula.as_ref().map_or(0, String::len) + 128;
+        if !pending.is_empty() && (!batch || pending.len() == sheetcore::sync::LIVE_OP_BATCH || bytes + size > 256 * 1024) {
+            flush(std::mem::take(&mut pending));
+            bytes = 0;
+        }
+        bytes += size;
+        pending.push(op);
+    }
+    if !pending.is_empty() { flush(pending); }
 }
 
 struct RoomRoster {
@@ -619,36 +647,34 @@ impl Net {
         let _ = self.evt_tx.send(ev);
     }
 
-    pub fn broadcast_op(&self, mut op: Op) {
-        op.site = self.site;
-        if let Some((holder, holder_name, row, col)) =
-            self.host_lock_conflict_cells(op.sheet, &[(op.row, op.col)])
-        {
-            let prev = self
-                .state
-                .as_ref()
-                .and_then(|st| latest_cell_op(st, op.sheet, op.row, op.col));
-            let _ = self.evt_tx.send(NetEvent::WriteRejected {
-                holder,
-                holder_name,
-                sheet: op.sheet,
-                row,
-                col,
-                revert_ops: vec![(op.row, op.col, prev)],
-                revert_styles: Vec::new(),
-                revert_merge: None,
-            });
-            return;
+    pub fn broadcast_op(&self, op: Op) {
+        self.broadcast_ops(vec![op]);
+    }
+
+    pub fn broadcast_ops(&self, mut ops: Vec<Op>) {
+        self.expire_host_locks();
+        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
+        let now = self.host_now_ms();
+        ops.retain_mut(|op| {
+            op.site = self.site;
+            if let Some(holder) = locks.as_ref().and_then(|lt| lt.holder_other(op.sheet, op.row, op.col, self.site, now)) {
+                let prev = self.state.as_ref().and_then(|st| latest_cell_op(st, op.sheet, op.row, op.col));
+                let _ = self.evt_tx.send(NetEvent::WriteRejected {
+                    holder: holder.site, holder_name: holder.name.clone(),
+                    sheet: op.sheet, row: op.row, col: op.col,
+                    revert_ops: vec![(op.row, op.col, prev)], revert_styles: Vec::new(), revert_merge: None,
+                });
+                return false;
+            }
+            true
+        });
+        drop(locks);
+        if ops.is_empty() { return; }
+        for map in [&self.state, &self.delta_ops].into_iter().flatten() {
+            let mut map = map.lock().unwrap();
+            for op in &ops { upsert_lww_op(&mut map, op.clone()); }
         }
-        if let Some(st) = &self.state {
-            upsert_lww_op(&mut st.lock().unwrap(), op.clone());
-        }
-        if let Some(d) = &self.delta_ops {
-            upsert_lww_op(&mut d.lock().unwrap(), op.clone());
-        }
-        if let Ok(s) = serde_json::to_string(&Msg::Op(op)) {
-            let _ = self.cmd.send(Cmd::Broadcast(s));
-        }
+        let _ = self.cmd.send(Cmd::Cells(ops));
     }
 
     /// 请求编辑某格
@@ -1084,6 +1110,14 @@ pub fn host_on_with_session(
                     break;
                 }
                 match cmd {
+                    Cmd::Cells(ops) => {
+                        let senders = roster.lock().unwrap().all_senders();
+                        if !senders.is_empty() {
+                            cell_frames(ops, false, true, |s| {
+                                for tx in &senders { let _ = tx.send(s.clone()); }
+                            });
+                        }
+                    }
                     Cmd::Broadcast(s) => {
                         let senders = roster.lock().unwrap().all_senders();
                         for tx in senders {
@@ -1352,6 +1386,7 @@ pub fn host_on_with_session(
                                         peers: known,
                                         delta_sync: can_delta,
                                         clock: host_clock,
+                                        batch_ops: true,
                                     })
                                     .unwrap(),
                                 );
@@ -1491,43 +1526,42 @@ pub fn host_on_with_session(
                                     let _ = ptx.send(hello.clone());
                                 }
                             }
-                            Msg::Op(mut op) => {
+                            message @ (Msg::Op(_) | Msg::Ops { .. }) => {
                                 let Some(conn_site) = hello_site else { break };
-                                // 严格绑定连接已认证的站点号，拒绝伪造他人署名的操作帧
-                                if op.site != conn_site {
-                                    continue;
-                                }
-                                op.site = conn_site;
+                                let mut ops = match message {
+                                    Msg::Op(op) => vec![op],
+                                    Msg::Ops { ops } => ops,
+                                    _ => unreachable!(),
+                                };
+                                if ops.iter().any(|op| op.site != conn_site) { continue; }
                                 expire_and_broadcast();
-                                let conflict = locks
-                                    .lock()
-                                    .unwrap()
-                                    .holder_other(op.sheet, op.row, op.col, conn_site, now_ms())
-                                    .map(|h| (h.site, h.name.clone()));
-                                if let Some((holder, holder_name)) = conflict {
+                                let lt = locks.lock().unwrap();
+                                let now = now_ms();
+                                ops.retain(|op| {
+                                    let Some(h) = lt.holder_other(op.sheet, op.row, op.col, conn_site, now) else { return true };
                                     let prev = latest_cell_op(&state, op.sheet, op.row, op.col);
-                                    let deny = serde_json::to_string(&Msg::WriteDeny {
-                                        holder,
-                                        holder_name,
-                                        sheet: op.sheet,
-                                        row: op.row,
-                                        col: op.col,
+                                    let deny = Msg::WriteDeny {
+                                        holder: h.site, holder_name: h.name.clone(),
+                                        sheet: op.sheet, row: op.row, col: op.col,
                                         revert_ops: vec![(op.row, op.col, prev)],
-                                        revert_styles: Vec::new(),
-                                        revert_merge: None,
-                                    })
-                                    .unwrap();
-                                    let _ = tx.send(deny);
-                                    continue;
+                                        revert_styles: Vec::new(), revert_merge: None,
+                                    };
+                                    let _ = tx.send(serde_json::to_string(&deny).unwrap());
+                                    false
+                                });
+                                drop(lt);
+                                if ops.is_empty() { continue; }
+                                for map in [&state, &delta_ops] {
+                                    let mut map = map.lock().unwrap();
+                                    for op in &ops { upsert_lww_op(&mut map, op.clone()); }
                                 }
-                                upsert_lww_op(&mut state.lock().unwrap(), op.clone());
-                                upsert_lww_op(&mut delta_ops.lock().unwrap(), op.clone());
-                                let line = serde_json::to_string(&Msg::Op(op.clone())).unwrap();
                                 let others = roster.lock().unwrap().other_senders(Some(conn_site));
-                                for ptx in others {
-                                    let _ = ptx.send(line.clone());
+                                if !others.is_empty() {
+                                    cell_frames(ops.clone(), false, true, |line| {
+                                        for ptx in &others { let _ = ptx.send(line.clone()); }
+                                    });
                                 }
-                                let _ = evt_tx.send(NetEvent::Ops(vec![op]));
+                                let _ = evt_tx.send(NetEvent::Ops(ops));
                             }
                             Msg::CursorMsg(mut c) => {
                                 let Some(conn_site) = hello_site else { break };
@@ -2102,7 +2136,7 @@ fn join_session(
     let connected_for_net = connected_flag.clone();
     let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     // 发送端加密会话单独归写线程持有，读线程使用栈上独立解密会话（彻底消灭大快照解密期间读写锁争用！）
-    let send_sess: Arc<Mutex<Option<sheetcore::wire::Session>>> = Arc::new(Mutex::new(None));
+    let send_sess: Arc<Mutex<Option<(sheetcore::wire::Session, bool)>>> = Arc::new(Mutex::new(None));
     // 本客户端实例专属重连凭据：断线重连可继续沿用自身 site，其他客户端不能冒领该 site
     let client_auth = crate::session_lock::new_session_id();
 
@@ -2117,9 +2151,15 @@ fn join_session(
                     break;
                 }
                 match cmd {
+                    Cmd::Cells(ops) => {
+                        let mut session = send_sess.lock().unwrap();
+                        if let (Some((se, batch)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            cell_frames(ops, true, *batch, |line| { let _ = write_line(w, &se.seal(&line)); });
+                        }
+                    }
                     Cmd::Broadcast(s) => {
                         let mut session = send_sess.lock().unwrap();
-                        if let (Some(se), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                        if let (Some((se, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
                             let _ = write_line(w, &se.seal(&s));
                         }
                     }
@@ -2246,7 +2286,7 @@ fn join_session(
                             denied = true;
                             break;
                         }
-                        Msg::Welcome { peers, doc: remote_doc, delta_sync, clock, .. } if !got_welcome => {
+                        Msg::Welcome { peers, doc: remote_doc, delta_sync, clock, batch_ops, .. } if !got_welcome => {
                             if require_same_document && remote_doc != doc {
                                 let _ = evt_tx.send(NetEvent::Denied("共享地址已属于另一工作簿，请刷新协作会话".into()));
                                 denied = true;
@@ -2255,7 +2295,7 @@ fn join_session(
                             got_welcome = true;
                             ever_welcomed = true;
                             if let Some(se) = pending_sender.take() {
-                                *send_sess.lock().unwrap() = Some(se);
+                                *send_sess.lock().unwrap() = Some((se, batch_ops));
                             }
                             if let Ok(clone) = write_half.try_clone() {
                                 *writer.lock().unwrap() = Some(clone);
@@ -2954,6 +2994,55 @@ mod integrity_tests {
             }
         }
         assert!(saw_valid, "越界报文之后的合法编辑应正常送达");
+    }
+
+    #[test]
+    fn hundred_thousand_numeric_edits_keep_order_across_frame_boundaries() {
+        let count = 100_000;
+        let ops = (0..count).map(|row| Op {
+            sheet: 0, row, col: 0, value: ValueWire::Number(row as f64),
+            formula: None, ts: u64::from(row) + 1, site: 2,
+        }).collect();
+        let mut next = 0;
+        let mut frames = 0;
+        cell_frames(ops, true, true, |line| {
+            let Msg::Ops { ops } = serde_json::from_str(&line).unwrap() else { panic!("expected batch") };
+            assert!(ops.len() <= sheetcore::sync::LIVE_OP_BATCH);
+            for op in ops {
+                assert_eq!(op.row, next);
+                next += 1;
+            }
+            frames += 1;
+        });
+        assert_eq!(next, count);
+        assert_eq!(frames, (count as usize).div_ceil(sheetcore::sync::LIVE_OP_BATCH));
+    }
+
+    #[test]
+    fn negotiated_batch_reaches_host_and_peer_in_order_and_preserves_locked_cell() {
+        let (host, port) = host_for_test(1, "host", "doc", "room-pw");
+        let addr = format!("127.0.0.1:{port}");
+        let a = join(2, "writer".into(), "doc".into(), &addr, "room-pw".into()).unwrap();
+        let b = join(3, "reader".into(), "doc".into(), &addr, "room-pw".into()).unwrap();
+        for peer in [&a, &b] {
+            assert!(wait_event(peer, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        }
+        b.request_lock(0, 4, 0, "reader");
+        assert!(wait_event(&host, 5000, |e| matches!(e, NetEvent::LockOk { site: 3, row: 4, .. })).is_some());
+        let ops: Vec<_> = (0..10).map(|row| Op {
+            sheet: 0, row, col: 0, value: ValueWire::Number(row as f64), formula: None,
+            ts: u64::from(row) + 1, site: 2,
+        }).collect();
+        let mut legacy = Vec::new();
+        cell_frames(ops.clone(), true, false, |line| legacy.push(serde_json::from_str::<Msg>(&line).unwrap()));
+        assert!(legacy.len() == 10 && legacy.iter().all(|m| matches!(m, Msg::Op(_))));
+        a.broadcast_ops(ops);
+        for net in [&host, &b] {
+            let Some(NetEvent::Ops(ops)) = wait_event(net, 5000, |e| matches!(e, NetEvent::Ops(_))) else { panic!("missing batch"); };
+            assert_eq!(ops.iter().map(|op| op.row).collect::<Vec<_>>(), [0,1,2,3,5,6,7,8,9]);
+            assert!(ops.iter().all(|op| op.site == 2));
+        }
+        assert!(wait_event(&a, 5000, |e| matches!(e, NetEvent::WriteRejected { row: 4, holder: 3, .. })).is_some());
     }
 
     #[test]

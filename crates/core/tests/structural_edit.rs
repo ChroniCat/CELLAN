@@ -26,6 +26,26 @@ fn insert_row_shifts_down() {
 }
 
 #[test]
+fn dense_shift_journals_only_real_style_changes_and_vacancies() {
+    use sheetcore::model::{CellRef, Sheet};
+    let mut sheet = Sheet::new("S");
+    for row in 0..1024 {
+        sheet.set(row, 1, Cell { value: Value::Number(row as f64), formula: None });
+        sheet.set_style_loaded(row, 1, 3);
+    }
+    // The tail contains a style-only blank with the same style as the old value.
+    sheet.set_style_loaded(1024, 1, 3);
+    sheet.apply_structural(&Structural::DeleteRows { at: 0, n: 1 });
+    assert_eq!(sheet.style_edits, [CellRef::new(1023, 1), CellRef::new(1024, 1)].into());
+    assert_eq!(sheet.cleared, [CellRef::new(1023, 1)].into());
+    assert_eq!(sheet.style_of(1023, 1), 3);
+    assert_eq!(sheet.get(1022, 1).unwrap().value, Value::Number(1023.0));
+    sheet.apply_structural(&Structural::InsertCols { at: 0, n: 2 });
+    assert_eq!(sheet.style_of(1023, 3), 3);
+    assert_eq!(sheet.get(1022, 3).unwrap().value, Value::Number(1023.0));
+}
+
+#[test]
 fn delete_row_removes_and_pulls_up() {
     let mut s = sheet_with_data();
     s.apply_structural(&Structural::DeleteRows { at: 1, n: 1 });

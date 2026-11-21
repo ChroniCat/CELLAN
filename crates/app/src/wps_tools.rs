@@ -353,10 +353,15 @@ impl SheetApp {
         let txn = self.txn_begin(&keys);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            for (mr1, mc1, mr2, mc2) in &to_merge {
-                // 清掉原有与此段重叠的合并并清理非锚点单元格的值（对齐 Excel/WPS 合并行为）
-                sh.merges.retain(|m| !(m.0 <= *mr2 && m.2 >= *mr1 && m.1 <= *mc2 && m.3 >= *mc1));
-                sh.merges.push((*mr1, *mc1, *mr2, *mc2));
+            // New runs are disjoint and sorted by (column, row). Test each old merge once.
+            sh.merges.retain(|&(top, left, bottom, right)| {
+                !(left.max(c1)..=right.min(c2)).any(|col| {
+                    let i = to_merge.partition_point(|m| (m.1, m.2) < (col, top));
+                    to_merge.get(i).is_some_and(|m| m.1 == col && m.0 <= bottom)
+                })
+            });
+            sh.merges.extend_from_slice(&to_merge);
+            for (mr1, mc1, mr2, _) in &to_merge {
                 for rr in (*mr1 + 1)..=*mr2 {
                     sh.remove(rr, *mc1);
                 }
@@ -532,6 +537,24 @@ impl SheetApp {
         }
     }
 
+    fn fill_source_available(&mut self, rect: (u32, u32, u32, u32)) -> bool {
+        let (r1, c1, r2, c2) = rect;
+        if self.wb.sheet(self.sheet_idx).protection.is_some() && self.rects_have_locked(&[rect]) {
+            self.status = "工作表受保护：填充源含锁定单元格".into();
+            return false;
+        }
+        let site = self.net.as_ref().map_or(0, |net| net.site);
+        let conflict = self.net.as_ref().and_then(|net| net.host_lock_conflict_rect(self.sheet_idx, (r1, c1, r2, c2)))
+            .map(|(_, name, r, c)| (name, r, c))
+            .or_else(|| self.locks.conflicts_rect(self.sheet_idx, r1, c1, r2, c2, site, self.lock_now())
+                .map(|((r, c), holder)| (holder.name.clone(), r, c)));
+        if let Some((name, r, c)) = conflict {
+            self.status = format!("{name} 正在编辑 {}，不能智能填充", super::cell_name(r, c));
+            return false;
+        }
+        true
+    }
+
     /// 4 向智能填充：支持向下 / 向上 / 向右 / 向左拖拽填充，保留 `$` 引用、样式、日期及中文序列。
     pub(crate) fn smart_fill_to_mode(
         &mut self,
@@ -561,40 +584,21 @@ impl SheetApp {
         };
 
         let (fr1, fc1, fr2, fc2) = fill_rect;
-        if (fr2 - fr1 + 1) as u64 * (fc2 - fc1 + 1) as u64 > 200_000 {
-            self.status = "填充区域超过 20 万格，请缩小拖拽范围".into();
+        if (fr2 - fr1 + 1) as u64 * (fc2 - fc1 + 1) as u64 > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
+            self.status = "填充区域超过 50 万格，请缩小拖拽范围".into();
             return;
         }
-        // 协同编辑下，若源选区正在被远端用户编辑锁定，禁止外拖填充以免读到未提交状态
-        let src_area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-        if src_area <= 200_000 {
-            for sr in r1..=r2 {
-                for sc in c1..=c2 {
-                    if let Some(holder) = self.lock_holder_on(self.sheet_idx, sr, sc) {
-                        self.status = format!(
-                            "{holder} 正在编辑 {}，不能智能填充",
-                            super::cell_name(sr, sc)
-                        );
-                        return;
-                    }
-                }
-            }
-        }
+        if !self.fill_source_available((r1, c1, r2, c2)) { return; }
         let keys = sheetcore::undo::rect_keys(fr1, fc1, fr2, fc2);
         if !self.write_preflight(&keys, "智能填充") {
             return;
         }
 
-        let before_snap: Vec<(u32, u32, Option<Cell>, u16)> = keys
-            .iter()
-            .map(|&(rr, cc)| {
-                let sh = self.wb.sheet(self.sheet_idx);
-                (rr, cc, sh.get(rr, cc).cloned(), sh.style_of(rr, cc))
-            })
-            .collect();
-
-        let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+        let mut formulas = sheetcore::refs::FillFormulas::default();
         let txn = self.txn_begin(&keys);
+        let before_snap = if record_last {
+            txn.iter().map(|d| (d.row, d.col, (!d.before.is_blank()).then(|| d.before.clone()), d.before_style)).collect()
+        } else { Vec::new() };
         let mut touched_cells = Vec::with_capacity(keys.len());
 
         let mut apply_cell = |app: &mut SheetApp,
@@ -609,7 +613,7 @@ impl SheetApp {
             if mode != FillMode::FormatsOnly {
                 if let Some(mut nc) = new_cell {
                     if let Some(f) = &nc.formula {
-                        let nf = sheetcore::refs::translate(f, dr, dc, &sheet_name);
+                        let nf = formulas.translate(f, dr, dc);
                         nc.formula = Some(nf.into_boxed_str());
                         nc.value = Value::Empty;
                     }
@@ -663,6 +667,7 @@ impl SheetApp {
                         _ => None,
                     })
                     .collect();
+                let text_samples = texts.as_ref().map(|v| v.iter().map(String::as_str).collect::<Vec<_>>());
                 let first_fmt = src_ordered
                     .last()
                     .map(|(_, _, sid)| self.wb.styles.get(*sid).format.clone())
@@ -686,9 +691,8 @@ impl SheetApp {
                             nv[0]
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
-                    } else if let Some(ref tv) = texts {
-                        let refs: Vec<&str> = tv.iter().map(|s| s.as_str()).collect();
-                        if let Some(next_txt) = fill_seq::next_text_sequence(&refs, dir_sign, step_k) {
+                    } else if let Some(refs) = &text_samples {
+                        if let Some(next_txt) = fill_seq::next_text_sequence(refs, dir_sign, step_k) {
                             Some(Cell { value: Value::Text(next_txt.into()), formula: None })
                         } else {
                             scell.clone()
@@ -738,6 +742,7 @@ impl SheetApp {
                         _ => None,
                     })
                     .collect();
+                let text_samples = texts.as_ref().map(|v| v.iter().map(String::as_str).collect::<Vec<_>>());
                 let first_fmt = src_ordered
                     .last()
                     .map(|(_, _, sid)| self.wb.styles.get(*sid).format.clone())
@@ -761,9 +766,8 @@ impl SheetApp {
                             nv[0]
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
-                    } else if let Some(ref tv) = texts {
-                        let refs: Vec<&str> = tv.iter().map(|s| s.as_str()).collect();
-                        if let Some(next_txt) = fill_seq::next_text_sequence(&refs, dir_sign, step_k) {
+                    } else if let Some(refs) = &text_samples {
+                        if let Some(next_txt) = fill_seq::next_text_sequence(refs, dir_sign, step_k) {
                             Some(Cell { value: Value::Text(next_txt.into()), formula: None })
                         } else {
                             scell.clone()
@@ -808,8 +812,13 @@ impl SheetApp {
         if lf.sheet_idx != self.sheet_idx {
             return;
         }
+        if !self.fill_source_available(lf.src_rect) {
+            self.last_fill = Some(lf);
+            return;
+        }
+        let restore_keys: Vec<_> = lf.before.iter().map(|&(r, c, _, _)| (r, c)).collect();
+        if !self.write_preflight(&restore_keys, "填充选项") { self.last_fill = Some(lf); return; }
         // 恢复目标格原始快照后再重填
-        let before_copy = lf.before.clone();
         for (rr, cc, cell, sid) in &lf.before {
             match cell {
                 Some(c) => self.wb.sheet_mut(self.sheet_idx).set(*rr, *cc, c.clone()),
@@ -829,7 +838,7 @@ impl SheetApp {
             vertical: lf.vertical,
             mode,
             sheet_idx: lf.sheet_idx,
-            before: before_copy,
+            before: lf.before,
             popup_open: false,
         });
     }
@@ -844,20 +853,10 @@ impl SheetApp {
         }
         let si = lp.sheet_idx;
         let (r0, c0, _, _) = lp.rect;
-        // 先恢复粘前原貌
-        for (rr, cc, cell, sid) in &lp.before {
-            match cell {
-                Some(c) => self.wb.sheet_mut(si).set(*rr, *cc, c.clone()),
-                None => {
-                    let _ = self.wb.sheet_mut(si).remove(*rr, *cc);
-                }
-            }
-            self.wb.sheet_mut(si).set_style(*rr, *cc, *sid);
-        }
         let orig_h = lp.cells.len();
         let orig_w = lp.cells.iter().map(|r| r.len()).max().unwrap_or(0);
         let (h, w) = if mode == 4 { (orig_w, orig_h) } else { (orig_h, orig_w) };
-        if h == 0 || w == 0 || (h as u64) * (w as u64) > 200_000 {
+        if h == 0 || w == 0 || (h as u64) * (w as u64) > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64 {
             return;
         }
         if r0.saturating_add(h as u32 - 1) > 1_048_575 || c0.saturating_add(w as u32 - 1) > 16_383 {
@@ -867,6 +866,18 @@ impl SheetApp {
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + h as u32 - 1, c0 + w as u32 - 1);
         if !self.write_preflight(&keys, "粘贴选项") {
             return;
+        }
+        let old_keys: Vec<_> = lp.before.iter().map(|&(r, c, _, _)| (r, c)).collect();
+        if !self.write_preflight(&old_keys, "恢复粘贴区域") { self.last_paste = Some(lp); return; }
+        // 先恢复粘前原貌
+        for (rr, cc, cell, sid) in &lp.before {
+            match cell {
+                Some(c) => self.wb.sheet_mut(si).set(*rr, *cc, c.clone()),
+                None => {
+                    let _ = self.wb.sheet_mut(si).remove(*rr, *cc);
+                }
+            }
+            self.wb.sheet_mut(si).set_style(*rr, *cc, *sid);
         }
         let new_before: Vec<_> = keys
             .iter()
