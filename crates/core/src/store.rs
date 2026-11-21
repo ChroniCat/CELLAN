@@ -118,6 +118,10 @@ impl CellStyles {
 
 #[derive(Clone, Debug, Default)]
 struct Page {
+    /// Unrestricted cell mutation may introduce a qualified reference. Merely
+    /// writing a formula's cached result does not invalidate this fast path.
+    may_have_qualified_formula: bool,
+    may_have_formula: bool,
     /// 本页实际分配的行数（≤ PAGE_ROWS）
     n_rows: u32,
     /// 按列存放：cols[c][r]，r 是页内行偏移。
@@ -165,18 +169,40 @@ impl Page {
     }
 }
 
+/// Snapshots share an identity until a writer forks. The counter alone can
+/// coincide on independently edited copies (for example after undo).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CellVersion {
+    lineage: std::sync::Arc<()>,
+    revision: u64,
+}
+
+impl PartialEq for CellVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision && std::sync::Arc::ptr_eq(&self.lineage, &other.lineage)
+    }
+}
+
+impl CellVersion {
+    fn advance(&mut self) {
+        if std::sync::Arc::strong_count(&self.lineage) > 1 {
+            self.lineage = std::sync::Arc::new(());
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Store {
     pages: std::collections::HashMap<u32, Page>,
-    revision: u64,
+    pub(crate) version: CellVersion,
     len: usize,
-    max_row: u32,
-    max_col: u32,
-    bounds_dirty: bool,
+    // Valid for this snapshot. Removing a boundary cell invalidates it until the next read.
+    bounds: std::sync::OnceLock<Option<(u32, u32, u32, u32)>>,
 }
 
 impl Store {
-    pub(crate) fn revision(&self) -> u64 { self.revision }
+    pub(crate) fn revision(&self) -> u64 { self.version.revision }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -198,12 +224,10 @@ impl Store {
     }
 
     pub fn clear(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.version.advance();
         self.pages.clear();
         self.len = 0;
-        self.max_row = 0;
-        self.max_col = 0;
-        self.bounds_dirty = false;
+        self.bounds.take();
     }
 
     #[inline]
@@ -218,8 +242,13 @@ impl Store {
 
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
         let (pi, ro) = Self::split(r);
-        let cell = self.pages.get_mut(&pi)?.get_mut(ro, c)?;
-        self.revision = self.revision.wrapping_add(1);
+        let page = self.pages.get_mut(&pi)?;
+        page.may_have_qualified_formula = true;
+        page.may_have_formula = true;
+        let cell = page.get_mut(ro, c)?;
+        // A caller holding &mut Cell may turn an occupied boundary cell into a blank.
+        Self::invalidate_boundary(&mut self.bounds, r, c);
+        self.version.advance();
         Some(cell)
     }
 
@@ -227,44 +256,57 @@ impl Store {
         self.get(r, c).is_some()
     }
 
+    pub(crate) fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
+        let (pi, ro) = Self::split(r);
+        if let Some(cell) = self.pages.get_mut(&pi).and_then(|p| p.get_mut(ro, c)) {
+            cell.value = value;
+            if cell.is_blank() { Self::invalidate_boundary(&mut self.bounds, r, c); }
+            self.version.advance();
+        }
+    }
+
+    pub(crate) fn foreign_formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.pages.iter().filter(|(_, page)| page.may_have_qualified_formula).flat_map(|(&pi, page)| {
+            page.cols.iter().enumerate().flat_map(move |(col, cells)| {
+                cells.iter().enumerate().filter_map(move |(row, cell)| {
+                    cell.formula.as_deref().is_some_and(|f| f.contains('!'))
+                        .then_some((CellRef::new(pi * PAGE_ROWS + row as u32, col as u32), cell))
+                })
+            })
+        })
+    }
+
+    pub(crate) fn has_formulas(&self) -> bool {
+        self.pages.values().any(|page| page.may_have_formula
+            && page.cols.iter().any(|col| col.iter().any(|cell| cell.formula.is_some())))
+    }
+
     /// 写入单元格；cell 为空白时等价于删除
     pub fn set(&mut self, r: u32, c: u32, cell: Cell) {
-        self.revision = self.revision.wrapping_add(1);
-        let (pi, ro) = Self::split(r);
-        let blank = cell.is_blank();
-        if blank {
-            if let Some(page) = self.pages.get_mut(&pi) {
-                if let Some(col) = page.cols.get_mut(c as usize).map(std::sync::Arc::make_mut) {
-                    if let Some(slot) = col.get_mut(ro as usize) {
-                        if !slot.is_blank() {
-                            *slot = Cell::default();
-                            self.len -= 1;
-                            if self.len == 0 {
-                                self.clear();
-                            } else if r >= self.max_row || c >= self.max_col {
-                                self.bounds_dirty = true;
-                            }
-                        }
-                    }
-                }
+        if cell.is_blank() {
+            if self.remove(r, c).is_none() {
+                self.version.advance();
             }
             return;
         }
+        self.version.advance();
+        let (pi, ro) = Self::split(r);
         let existed = self.get(r, c).is_some();
         let page = self.pages.entry(pi).or_default();
+        page.may_have_qualified_formula |= cell.formula.as_deref().is_some_and(|f| f.contains('!'));
+        page.may_have_formula |= cell.formula.is_some();
         page.ensure(ro, c);
         std::sync::Arc::make_mut(&mut page.cols[c as usize])[ro as usize] = cell;
         if !existed {
             self.len += 1;
-        }
-        if r > self.max_row {
-            self.max_row = r;
-        }
-        if c > self.max_col {
-            self.max_col = c;
-        }
-        if r >= self.max_row && c >= self.max_col {
-            self.bounds_dirty = false;
+            if self.len == 1 {
+                self.bounds = Some((r, c, r, c)).into();
+            } else if let Some(bounds) = self.bounds.get_mut() {
+                *bounds = Some(match *bounds {
+                    Some((r1, c1, r2, c2)) => (r1.min(r), c1.min(c), r2.max(r), c2.max(c)),
+                    None => (r, c, r, c),
+                });
+            }
         }
     }
 
@@ -277,12 +319,12 @@ impl Store {
             return None;
         }
         let old = std::mem::take(slot);
-        self.revision = self.revision.wrapping_add(1);
+        self.version.advance();
         self.len -= 1;
         if self.len == 0 {
             self.clear();
-        } else if r >= self.max_row || c >= self.max_col {
-            self.bounds_dirty = true;
+        } else {
+            Self::invalidate_boundary(&mut self.bounds, r, c);
         }
         Some(old)
     }
@@ -312,19 +354,35 @@ impl Store {
         out
     }
 
+    /// A read-only view of one column's allocated pages, shared until either side writes.
+    pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<Vec<Cell>>)> {
+        self.pages.iter().filter_map(|(&page, data)| {
+            let cells = data.cols.get(col as usize)?;
+            (!cells.is_empty()).then(|| (page * PAGE_ROWS, cells.clone()))
+        }).collect()
+    }
+
     /// 按行列升序遍历（页 → 行 → 列）
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        let mut keys: Vec<u32> = self.pages.keys().copied().collect();
+        self.iter_rect((0, 0, u32::MAX, u32::MAX))
+    }
+
+    pub(crate) fn iter_rect(&self, (r1, c1, r2, c2): (u32, u32, u32, u32)) -> impl Iterator<Item = (CellRef, &Cell)> {
+        let mut keys: Vec<_> = self.pages.keys().copied()
+            .filter(|&pi| pi >= r1 / PAGE_ROWS && pi <= r2 / PAGE_ROWS).collect();
         keys.sort_unstable();
         keys.into_iter().flat_map(move |pi| {
             let page = self.pages.get(&pi).unwrap();
-            let n_rows = page.n_rows;
-            (0..n_rows).flat_map(move |ro| {
-                let base = pi * PAGE_ROWS + ro;
-                page.cols.iter().enumerate().filter_map(move |(c, col)| {
+            let base = pi * PAGE_ROWS;
+            let start = r1.saturating_sub(base);
+            let end = page.n_rows.min((r2 - base).saturating_add(1));
+            let end_col = page.cols.len().min((c2 as usize).saturating_add(1));
+            let columns = page.cols.get(c1 as usize..end_col).unwrap_or_default();
+            (start..end).flat_map(move |ro| {
+                columns.iter().enumerate().filter_map(move |(c, col)| {
                     col.get(ro as usize)
                         .filter(|cell| !cell.is_blank())
-                        .map(|cell| (CellRef::new(base, c as u32), cell))
+                        .map(|cell| (CellRef::new(base + ro, c1 + c as u32), cell))
                 })
             })
         })
@@ -332,6 +390,16 @@ impl Store {
 
     pub fn iter_values(&self) -> impl Iterator<Item = &Cell> {
         self.iter().map(|(_, c)| c)
+    }
+
+    pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.pages.iter().flat_map(|(&p, page)| {
+            page.cols.iter().enumerate().flat_map(move |(c, col)| {
+                col.iter().enumerate().filter_map(move |(r, cell)| {
+                    (!cell.is_blank()).then_some((CellRef::new(p * PAGE_ROWS + r as u32, c as u32), cell))
+                })
+            })
+        })
     }
 
     /// Occupied cells in this snapshot that differ from the other snapshot.
@@ -369,46 +437,23 @@ impl Store {
         keys
     }
 
+    fn invalidate_boundary(cache: &mut std::sync::OnceLock<Option<(u32, u32, u32, u32)>>, r: u32, c: u32) {
+        if cache.get().copied().flatten().is_some_and(|(r1, c1, r2, c2)| {
+            r == r1 || r == r2 || c == c1 || c == c2
+        }) {
+            cache.take();
+        }
+    }
+
     pub fn used_bounds(&self) -> Option<(u32, u32, u32, u32)> {
-        if self.len == 0 {
-            return None;
-        }
-        if self.bounds_dirty {
-            let mut r1 = u32::MAX;
-            let mut c1 = u32::MAX;
-            let mut r2 = 0u32;
-            let mut c2 = 0u32;
-            for (&pi, page) in &self.pages {
-                let base = pi * PAGE_ROWS;
-                for (ci, col) in page.cols.iter().enumerate() {
-                    for (ro, cell) in col.iter().enumerate() {
-                        if !cell.is_blank() {
-                            let r = base + ro as u32;
-                            let c = ci as u32;
-                            r1 = r1.min(r);
-                            c1 = c1.min(c);
-                            r2 = r2.max(r);
-                            c2 = c2.max(c);
-                        }
-                    }
-                }
-            }
-            if r1 == u32::MAX {
-                return None;
-            }
-            return Some((r1, c1, r2, c2));
-        }
-        // 左上角要真的找一次（右下角有 max_row/max_col 缓存）
-        let mut r1 = u32::MAX;
-        let mut c1 = u32::MAX;
-        for (cref, _) in self.iter() {
-            r1 = r1.min(cref.row);
-            c1 = c1.min(cref.col);
-            if r1 == 0 && c1 == 0 {
-                break;
-            }
-        }
-        Some((r1, c1, self.max_row, self.max_col))
+        if self.len == 0 { return None; }
+        *self.bounds.get_or_init(|| {
+            let mut cells = self.iter().map(|(key, _)| key);
+            let first = cells.next()?;
+            Some(cells.fold((first.row, first.col, first.row, first.col), |(r1, c1, r2, c2), k| {
+                (r1.min(k.row), c1.min(k.col), r2.max(k.row), c2.max(k.col))
+            }))
+        })
     }
 
     /// 实际占用的字节数（调试用）
@@ -533,6 +578,28 @@ mod tests {
             &s.pages[&0u32].cols[0],
             &clone.pages[&0u32].cols[0]
         ));
+    }
+
+    #[test]
+    fn occupied_bounds_stay_cached_across_reads_and_independent_snapshots() {
+        let mut store = Store::default();
+        store.set(300, 3, num(1.0));
+        store.set(4, 8, num(2.0));
+        store.set(140, 5, num(3.0));
+        let saved = store.clone();
+        assert_eq!(store.bounds.get(), Some(&Some((4, 3, 300, 8))));
+        store.remove(4, 8);
+        store.set(350, 1, num(4.0));
+        assert!(store.bounds.get().is_none());
+        assert_eq!(store.used_bounds(), Some((140, 1, 350, 5)));
+        assert_eq!(store.bounds.get(), Some(&store.used_bounds()));
+        assert_eq!(saved.used_bounds(), Some((4, 3, 300, 8)));
+        *store.get_mut(350, 1).unwrap() = Cell::default();
+        assert_eq!(store.used_bounds(), Some((140, 3, 300, 5)));
+        store.set(140, 5, Cell::default());
+        assert_eq!(store.used_bounds(), Some((300, 3, 300, 3)));
+        store.clear();
+        assert_eq!(store.used_bounds(), None);
     }
 
     #[test]

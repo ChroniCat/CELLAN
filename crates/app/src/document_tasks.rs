@@ -172,13 +172,13 @@ impl DocumentTasks {
                 {
                     self.autosave_after_detach = None;
                 }
+                let calculated_on_save = calculated.is_some();
                 let applied = !wb.dirty && calculated.is_some_and(|result| result.apply(wb));
                 if applied {
                     self.needs_full = false;
                     self.dirty_recalc_seeds.clear();
                 }
-                receipt.apply_to(wb);
-                wb.path = Some(pending.target.clone());
+                receipt.adopt_document(wb, &pending.target, !calculated_on_save || applied);
                 Ok((pending.target, applied))
             }
             Err(error) => {

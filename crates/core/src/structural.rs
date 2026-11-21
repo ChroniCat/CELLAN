@@ -54,21 +54,36 @@ struct TableRowFill {
 impl Sheet {
     /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
     pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
-        let changes: Vec<_> = self.iter().filter_map(|(key, cell)| {
+        let rewrite = |(key, cell): (crate::model::CellRef, &crate::model::Cell)| {
             let old = cell.formula.as_deref()?;
             let new = crate::refs::rewrite(old, shift);
             (new != old).then(|| (key, new.into_boxed_str()))
-        }).collect();
+        };
+        let changes: Vec<_> = if shift.translate.is_none() && !shift.own_sheet.eq_ignore_ascii_case(&shift.target_sheet) {
+            self.foreign_formula_cells(&shift.target_sheet).filter_map(rewrite).collect()
+        } else {
+            self.iter().filter_map(rewrite).collect()
+        };
         self.edited |= !changes.is_empty();
         for (key, formula) in changes {
             self.get_mut(key.row, key.col).unwrap().formula = Some(formula);
         }
         for blk in self.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
-                if let crate::cf::CfKind::Expr { formula, .. } = &mut rule.kind {
+                let mut rewrite_threshold = |formula: &mut String| {
                     let rewritten = crate::refs::rewrite(formula, shift);
-                    self.cf_dirty |= *formula != rewritten;
-                    *formula = rewritten;
+                    if *formula != rewritten {
+                        *formula = rewritten;
+                        self.cf_dirty = true;
+                    }
+                };
+                match &mut rule.kind {
+                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
+                    crate::cf::CfKind::CellIs { a, b, .. } => {
+                        rewrite_threshold(a);
+                        rewrite_threshold(b);
+                    }
+                    _ => {}
                 }
             }
         }

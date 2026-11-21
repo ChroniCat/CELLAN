@@ -5,7 +5,7 @@
 
 use crate::model::{Cell, Workbook};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchOpts {
     /// 区分大小写
     pub match_case: bool,
@@ -28,6 +28,33 @@ fn ordered_key(h: &Hit, order: SearchOrder) -> (usize, u32, u32) {
         SearchOrder::RowMajor => (h.sheet, h.row, h.col),
         SearchOrder::ColumnMajor => (h.sheet, h.col, h.row),
     }
+}
+
+/// A snapshot search can stop when its query or document has been superseded.
+/// Overlapping selection rectangles are tested in one pass, so a cell is counted once.
+pub fn scoped_hits(
+    wb: &Workbook, sheet: Option<usize>, rects: &[(u32, u32, u32, u32)],
+    needle: &str, opts: &SearchOpts, order: SearchOrder,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        if sheet.is_some_and(|only| only != si) { continue; }
+        for (i, (key, cell)) in sh.stored_cells().enumerate() {
+            if i % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if !rects.is_empty() && !rects.iter().any(|&(r1, c1, r2, c2)|
+                r1 <= key.row && key.row <= r2 && c1 <= key.col && key.col <= c2) {
+                continue;
+            }
+            if matches_at(wb, si, key.row, key.col, cell, needle, opts) {
+                hits.push(Hit { sheet: si, row: key.row, col: key.col });
+            }
+        }
+    }
+    hits.sort_unstable_by_key(|h| ordered_key(h, order));
+    hits
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,6 +114,11 @@ pub fn cell_matches(
     let Some(cell) = wb.sheets.get(sheet).and_then(|sh| sh.get(row, col)) else {
         return false;
     };
+    matches_at(wb, sheet, row, col, cell, needle, opts)
+}
+
+fn matches_at(wb: &Workbook, sheet: usize, row: u32, col: u32, cell: &Cell,
+              needle: &str, opts: &SearchOpts) -> bool {
     let Some(text) = cell_text_at(wb, sheet, row, col, cell, opts.in_formula) else {
         return false;
     };
@@ -180,21 +212,25 @@ pub fn next_hit(
     forward: bool,
     order: SearchOrder,
 ) -> Option<(Hit, bool)> {
+    next_index(hits, cur, forward, order).map(|(i, wrapped)| (hits[i], wrapped))
+}
+
+pub fn next_index(hits: &[Hit], cur: Hit, forward: bool, order: SearchOrder) -> Option<(usize, bool)> {
     if hits.is_empty() {
         return None;
     }
     let cur_key = ordered_key(&cur, order);
     if forward {
-        if let Some(h) = hits.iter().find(|h| ordered_key(h, order) > cur_key) {
-            return Some((*h, false));
-        }
-        Some((hits[0], true))
+        let i = hits.partition_point(|h| ordered_key(h, order) <= cur_key);
+        Some(if i == hits.len() { (0, true) } else { (i, false) })
     } else {
-        if let Some(h) = hits.iter().rev().find(|h| ordered_key(h, order) < cur_key) {
-            return Some((*h, false));
-        }
-        Some((hits[hits.len() - 1], true))
+        let i = hits.partition_point(|h| ordered_key(h, order) < cur_key);
+        Some(if i == 0 { (hits.len() - 1, true) } else { (i - 1, false) })
     }
+}
+
+pub fn position(hits: &[Hit], hit: Hit, order: SearchOrder) -> Option<usize> {
+    hits.binary_search_by_key(&ordered_key(&hit, order), |h| ordered_key(h, order)).ok()
 }
 
 /// 小写文本 + 每个小写字节位置对应的原串字节位置。

@@ -3388,9 +3388,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                         // Track the blocked anchor even when no tail cells exist.
                         // A later edit may clear the obstruction anywhere in its footprint.
                         wb.sheets[si].spill_shapes.insert(CellRef::new(r, c), (0, 0));
-                        if let Some(cell) = wb.sheets[si].get_mut(r, c) {
-                            cell.value = from_fvalue(&FValue::Error(ErrKind::Spill));
-                        }
+                        wb.sheets[si].set_formula_cache(r, c, from_fvalue(&FValue::Error(ErrKind::Spill)));
                         continue;
                     }
                     wb.sheets[si]
@@ -3401,9 +3399,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                             let key = CellRef::new(r + i as u32, c + j as u32);
                             let val = from_fvalue(&a.get(i, j));
                             if i == 0 && j == 0 {
-                                if let Some(cell) = wb.sheets[si].get_mut(key.row, key.col) {
-                                    cell.value = val;
-                                }
+                                wb.sheets[si].set_formula_cache(key.row, key.col, val);
                             } else {
                                 wb.sheets[si].set(key.row, key.col, Cell { value: val, formula: None });
                                 wb.sheets[si].spilled.insert(key);
@@ -3418,9 +3414,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                     } else {
                         wb.sheets[si].spill_shapes.remove(&anchor);
                     }
-                    if let Some(cell) = wb.sheets[si].get_mut(r, c) {
-                        cell.value = from_fvalue(&other);
-                    }
+                    wb.sheets[si].set_formula_cache(r, c, from_fvalue(&other));
                 }
             }
         }
@@ -3698,7 +3692,7 @@ fn spill_values(wb: &Workbook) -> HashMap<deps::CellKey, crate::Value> {
 pub fn recalc_all(wb: &mut Workbook) {
     if wb.calc_manual {
         wb.calc_pending_sheets = wb.sheets.iter().enumerate()
-            .filter(|(_, s)| s.iter().any(|(_, c)| c.formula.is_some()))
+            .filter(|(_, s)| s.has_formulas())
             .map(|(i, _)| i)
             .collect();
         wb.calc_pending = !wb.calc_pending_sheets.is_empty();

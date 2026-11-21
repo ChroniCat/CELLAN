@@ -418,22 +418,16 @@ fn collect_rect(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> Vec<String> {
         }
         out
     } else {
-        let mut hits: Vec<(u32, u32, String)> = sheet
-            .iter()
-            .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
-            .map(|(k, v)| (k.row, k.col, v.value.display()))
-            .filter(|(_, _, t)| !t.is_empty())
-            .collect();
-        hits.sort_by_key(|(r, c, _)| (*r, *c));
-        hits.into_iter().map(|(_, _, t)| t).collect()
+        sheet.iter_rect(rect)
+            .map(|(_, cell)| cell.value.display())
+            .filter(|text| !text.is_empty())
+            .collect()
     }
 }
 
 fn count_rect(sheet: &Sheet, rect: (u32, u32, u32, u32), numeric_only: bool) -> f64 {
-    let (r1, c1, r2, c2) = rect;
     sheet
-        .iter()
-        .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+        .iter_rect(rect)
         .filter(|(_, v)| {
             if numeric_only {
                 matches!(v.value, Value::Number(_))
@@ -723,20 +717,20 @@ fn dynamic_source(wb: &crate::model::Workbook, si: usize, expr: &str) -> Option<
     None
 }
 
-fn lookup_name(wb: &crate::model::Workbook, si: usize, name: &str) -> Option<String> {
+fn lookup_name<'a>(wb: &'a crate::model::Workbook, si: usize, name: &str) -> Option<&'a str> {
     let mut global: Option<&str> = None;
     for (n, scope, target) in wb.names.iter().rev() {
         if !n.eq_ignore_ascii_case(name) {
             continue;
         }
         if *scope == Some(si) {
-            return Some(target.clone());
+            return Some(target);
         }
         if scope.is_none() && global.is_none() {
             global = Some(target);
         }
     }
-    global.map(|s| s.to_string())
+    global
 }
 
 /// 从工作簿上下文解析列表来源：内联、区域引用、名称、INDIRECT/OFFSET 动态来源。
@@ -751,33 +745,62 @@ pub fn list_items_wb(
     r: u32,
     c: u32,
 ) -> Option<Vec<String>> {
-    let src = dv.f1.trim();
-    if src.is_empty() {
-        return Some(Vec::new());
-    }
-    if let Some(items) = inline_items(src) {
-        return Some(items);
-    }
-    let mut expr = src.strip_prefix('=').unwrap_or(src).trim().to_string();
+    let expr = list_expression(wb, si, dv);
+    let (ar, ac) = range_anchor(dv, r, c);
+    let shifted = crate::cf::shift_formula(expr, r - ar, c - ac);
+    resolve_list(wb, si, &shifted)
+}
+
+fn list_expression<'a>(wb: &'a crate::Workbook, si: usize, dv: &'a DataValidation) -> &'a str {
+    let mut expr = dv.f1.trim().trim_start_matches('=').trim();
     for _ in 0..8 {
         // 裸名称才查名称表；带 ! 或 : 的是引用，带括号的是公式
-        if expr.contains('!') || expr.contains(':') || expr.contains('(') {
+        if expr.starts_with('"') || expr.contains('!') || expr.contains(':') || expr.contains('(') {
             break;
         }
-        let Some(target) = lookup_name(wb, si, &expr) else {
+        let Some(target) = lookup_name(wb, si, expr) else {
             break;
         };
-        expr = target.trim().trim_start_matches('=').trim().to_string();
-        if let Some(items) = inline_items(&expr) {
-            return Some(items);
-        }
+        expr = target.trim().trim_start_matches('=').trim();
     }
-    let (ar, ac) = range_anchor(dv, r, c);
-    let shifted = crate::cf::shift_formula(&expr, r - ar, c - ac);
-    match static_source(wb, si, &shifted) {
-        ListSrc::Items(v) => Some(v),
-        ListSrc::Invalid => None,
-        ListSrc::NotRef => dynamic_source(wb, si, &shifted),
+    expr
+}
+
+fn resolve_list(wb: &crate::Workbook, si: usize, expr: &str) -> Option<Vec<String>> {
+    if expr.is_empty() {
+        return Some(Vec::new());
+    }
+    inline_items(expr).or_else(|| resolve_any(wb, si, expr))
+}
+
+/// Membership for a single rule during a read-only validation pass. Compare the
+/// actual shifted expression so mixed, named and dynamic sources retain their anchors.
+pub struct ListMembership<'a> {
+    wb: &'a crate::Workbook,
+    sheet: usize,
+    rule: &'a DataValidation,
+    expr: &'a str,
+    last_expression: Option<String>,
+    items: Option<std::collections::HashSet<String>>,
+}
+
+impl<'a> ListMembership<'a> {
+    pub fn new(wb: &'a crate::Workbook, si: usize, dv: &'a DataValidation) -> Self {
+        Self { wb, sheet: si, rule: dv, expr: list_expression(wb, si, dv), last_expression: None, items: None }
+    }
+
+    pub fn contains(&mut self, value: &Value, r: u32, c: u32) -> Option<bool> {
+        let (ar, ac) = range_anchor(self.rule, r, c);
+        let expr = crate::cf::shift_formula(self.expr, r - ar, c - ac);
+        if self.last_expression.as_ref() != Some(&expr) {
+            self.items = resolve_list(self.wb, self.sheet, &expr).map(|items| items.into_iter().collect());
+            self.last_expression = Some(expr);
+        }
+        self.items.as_ref().map(|items| match value {
+            Value::Empty => self.rule.allow_blank,
+            Value::Text(s) => items.contains(s.as_ref()),
+            _ => items.contains(&value.display()),
+        })
     }
 }
 
@@ -926,9 +949,10 @@ where
     match dv.kind {
         DvKind::Any => true,
         DvKind::List => {
+            let local;
             let items = match resolved_list {
-                Some(v) => v.to_vec(),
-                None => list_items(dv, sheet),
+                Some(v) => v,
+                None => { local = list_items(dv, sheet); &local }
             };
             // 带工作簿上下文时，空列表意味着来源无法解析或确实没有候选；
             // 不能像旧逻辑那样把非法值全部放行。

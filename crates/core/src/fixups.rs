@@ -166,12 +166,11 @@ pub fn fix_drawing_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
 pub(crate) const RAW_SHEET_MIN_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) fn can_restore_sheet_xml(sheet: &crate::model::Sheet) -> bool {
-    !(sheet.edited
+    !(sheet.cell_data_needs_save()
         || sheet.styles_dirty
         || sheet.row_styles_dirty
         || sheet.col_styles_dirty
         || !sheet.style_edits.is_empty()
-        || !sheet.cleared.is_empty()
         || sheet.merges_dirty
         || sheet.cf_dirty
         || sheet.dv_dirty
@@ -179,7 +178,7 @@ pub(crate) fn can_restore_sheet_xml(sheet: &crate::model::Sheet) -> bool {
         || sheet.freeze_dirty
         || sheet.filter_dirty
         || sheet.page_dirty
-        || sheet.charts_dirty || !sheet.spilled.is_empty())
+        || sheet.charts_dirty)
 }
 
 /// 没被编辑过的表：整段沿用原文件的 XML 和它引用的部件。
@@ -642,7 +641,7 @@ pub fn merge_sheet_data(path: &Path, base: &Path, wb: &crate::model::Workbook) -
     for sheet in wb.sheets.iter() {
         // 只处理"单纯改了单元格"的表；批注/条件格式/合并等改动由各自的补丁负责，
         // 混在一起会被基准骨架覆盖掉
-        let plain_edit = sheet.edited
+        let plain_edit = sheet.cell_data_needs_save()
             && !sheet.notes_dirty
             && !sheet.cf_dirty
             && !sheet.dv_dirty

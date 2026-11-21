@@ -41,7 +41,7 @@ fn filter_and_save() {
     let mut allow = HashSet::new();
     allow.insert("研发".to_string());
     f.allows.insert(1, allow);
-    wb.sheets[0].hidden_rows = f.hidden_rows(wb.sheet(0));
+    wb.sheets[0].hidden_rows = f.hidden_rows(wb.sheet(0)).into();
     wb.sheets[0].filter = Some(f);
     wb.sheets[0].filter_dirty = true;
     assert_eq!(wb.sheets[0].hidden_rows.len(), 3, "销售2 + 行政1 应被隐藏");

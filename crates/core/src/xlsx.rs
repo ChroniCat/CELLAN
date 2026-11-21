@@ -891,12 +891,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     for r in &fh {
                         sheet.hidden_rows_user.remove(r);
                     }
-                    sheet.hidden_rows = fh;
+                    sheet.hidden_rows = fh.into();
                 }
                 if let Some(map) = &manual_hidden {
                     // 本应用保存的手动隐藏行来源：它明确区分了
                     // 筛选隐藏与手动隐藏，包括两者重叠的行，不再靠猜 hidden 。
-                    sheet.hidden_rows_user = map.get(&sheet.name).cloned().unwrap_or_default();
+                    sheet.hidden_rows_user = map.get(&sheet.name).cloned().unwrap_or_default().into();
                 }
             }
         }
@@ -973,6 +973,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             if let Some(&hide) = states.get(&sheet.name) {
                 sheet.hidden = hide;
             }
+            sheet.saved_cells = Some(sheet.cell_version().clone());
         }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
             definitions: pivot_definitions(path),
@@ -1019,9 +1020,16 @@ fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
 /// applied to a newer live document without resetting edits made during save.
 #[derive(Debug, Default)]
 pub struct SaveReceipt {
-    sheets: Vec<(u64, String)>,
+    sheets: std::collections::HashMap<u64, SavedSheet>,
     source_encryption: Option<crate::crypto::EncryptionSettings>,
     committed_charts: std::collections::HashMap<u64, Vec<SavedChart>>,
+}
+
+#[derive(Debug)]
+struct SavedSheet {
+    part: String,
+    cells: crate::store::CellVersion,
+    cleared: std::collections::HashSet<crate::model::CellRef>,
 }
 
 #[derive(Debug)]
@@ -1043,8 +1051,8 @@ impl SaveReceipt {
     pub fn apply_to(&self, wb: &mut Workbook) {
         wb.source_encryption.clone_from(&self.source_encryption);
         for sheet in &mut wb.sheets {
-            if let Some((_, part)) = self.sheets.iter().find(|(id, _)| *id == sheet.identity) {
-                sheet.source_part = Some(part.clone());
+            if let Some(saved) = self.sheets.get(&sheet.identity) {
+                sheet.source_part = Some(saved.part.clone());
             }
             if let Some(saved) = self.committed_charts.get(&sheet.identity) {
                 let mut dirty = saved.len() != sheet.charts.len();
@@ -1066,6 +1074,45 @@ impl SaveReceipt {
             }
         }
     }
+
+    /// Adopt a completed save as the document's new source file. Exports and
+    /// stale in-flight snapshots must not retire the live document's journals.
+    pub fn adopt_document(&self, wb: &mut Workbook, target: &Path, calculation_matches: bool) {
+        self.apply_to(wb);
+        wb.path = Some(target.to_owned());
+        for sheet in &mut wb.sheets {
+            let Some(saved) = self.sheets.get(&sheet.identity) else { continue };
+            sheet.saved_cells = Some(saved.cells.clone());
+            if sheet.cell_version() != &saved.cells {
+                continue;
+            }
+            if wb.dirty || !calculation_matches {
+                // Another sheet can be edited during this write. A matching
+                // cell version confirms this sheet even across snapshot forks;
+                // its live metadata and any newer deletion journal still win.
+                if !sheet.has_pending_sheet_metadata() {
+                    sheet.edited = false;
+                }
+                sheet.cleared.retain(|key| !saved.cleared.contains(key));
+                continue;
+            }
+            // These fields caused the OOXML writer to serialize the sheet.
+            // Its committed source part now includes those edits and deletions.
+            sheet.edited = false;
+            sheet.cleared.clear();
+            sheet.style_edits.clear();
+            sheet.styles_dirty = false;
+            sheet.row_styles_dirty = false;
+            sheet.col_styles_dirty = false;
+            sheet.merges_dirty = false;
+            sheet.notes_dirty = false;
+            sheet.cf_dirty = false;
+            sheet.dv_dirty = false;
+            sheet.freeze_dirty = false;
+            sheet.filter_dirty = false;
+            sheet.page_dirty = false;
+        }
+    }
 }
 
 fn package_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
@@ -1073,8 +1120,12 @@ fn package_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
     let sheets = wb.sheets.iter().map(|sheet| {
         let part = targets.get(&sheet.name)
             .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
-        Ok((sheet.identity, part.clone()))
-    }).collect::<Result<Vec<_>>>()?;
+        Ok((sheet.identity, SavedSheet {
+            part: part.clone(),
+            cells: sheet.cell_version().clone(),
+            cleared: sheet.cleared.clone(),
+        }))
+    }).collect::<Result<_>>()?;
     Ok(SaveReceipt {
         sheets,
         source_encryption: wb.encryption.clone(),
@@ -2108,15 +2159,13 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     let external_rels = crate::notes::capture_external_rels(if base.exists() { &base } else { path });
     let sheet_needs_umya = |s: &crate::model::Sheet| -> bool {
         fresh_base
-            || s.edited
+            || s.cell_data_needs_save()
             || s.styles_dirty
             || s.row_styles_dirty
             || s.col_styles_dirty
             || s.merges_dirty
             || s.notes_dirty
             || !s.style_edits.is_empty()
-            || !s.cleared.is_empty()
-            || !s.spilled.is_empty()
     };
     let can_bypass_umya = !fresh_base
         && base.exists()
@@ -2972,7 +3021,7 @@ fn apply_cf_patch(
                             // 屏蔽行两种来源必须合并：筛选条件命中的 hidden_rows
                             // 和用户手动隐藏的 hidden_rows_user。关闭筛选时只清 hidden_rows，
                             // 不能把手动隐藏的行一起抹掉。
-                            let mut hidden = sheet.hidden_rows.clone();
+                            let mut hidden = (*sheet.hidden_rows).clone();
                             hidden.extend(sheet.hidden_rows_user.iter().copied());
                             hidden
                         },
@@ -3160,7 +3209,7 @@ mod tests {
                 1,
                 crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "15"),
             );
-            sh.hidden_rows = f.hidden_rows(sh);
+            sh.hidden_rows = f.hidden_rows(sh).into();
             sh.hidden_rows_user.insert(2);
             sh.filter = Some(f);
             sh.filter_dirty = true;
@@ -3244,7 +3293,7 @@ mod tests {
                 1,
                 crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "15"),
             );
-            sh.hidden_rows = f.hidden_rows(sh);
+            sh.hidden_rows = f.hidden_rows(sh).into();
             sh.hidden_rows_user.insert(2);
             sh.filter = Some(f);
             sh.filter_dirty = true;
@@ -3345,7 +3394,7 @@ mod tests {
                 1,
                 crate::sort_filter::Criterion::new(crate::sort_filter::CmpOp::Gt, "150"),
             );
-            sh.hidden_rows = f.hidden_rows(sh);
+            sh.hidden_rows = f.hidden_rows(sh).into();
             // row1 既手动隐藏又被筛选隐藏（overlap），row2 只手动隐藏，row4 只筛选隐藏。
             sh.hidden_rows_user.insert(1);
             sh.hidden_rows_user.insert(2);
@@ -3552,6 +3601,61 @@ mod tests {
         loaded.sheets[0].hyperlinks_dirty = true;
         save_atomic(&copy, &loaded).unwrap();
         assert!(load(&copy).unwrap().sheets[0].hyperlinks.is_empty());
+    }
+
+    #[test]
+    fn receipt_distinguishes_two_cell_snapshots_with_equal_revision_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branch.xlsx");
+        let mut live = Workbook::new_blank();
+        let mut worker = live.clone();
+        live.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        worker.sheets[0].set(0, 0, Cell { value: Value::Number(2.0), formula: None });
+        assert_eq!(live.sheets[0].cell_revision(), worker.sheets[0].cell_revision());
+        assert_ne!(live.sheets[0].cell_version(), worker.sheets[0].cell_version());
+        let receipt = save_atomic_with_receipt(&path, &worker).unwrap();
+        receipt.adopt_document(&mut live, &path, false);
+        assert!(!crate::fixups::can_restore_sheet_xml(&live.sheets[0]));
+        save_atomic(&path, &live).unwrap();
+        assert_eq!(load(&path).unwrap().sheets[0].value(0, 0), Value::Number(1.0));
+    }
+
+    #[test]
+    fn second_save_reuses_committed_sheet_and_rewrites_a_changed_formula_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.xlsx");
+        let copy = dir.path().join("copy.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets.push(Sheet::new("Summary"));
+        let number = |value| Cell { value: Value::Number(value), formula: None };
+        for row in 0..2_000 {
+            wb.sheets[0].set(row, 0, number(row as f64));
+        }
+        wb.sheets[1].set(0, 0, number(5.0));
+        wb.sheets[0].set(0, 1, Cell { value: Value::Empty, formula: Some("=Summary!A1+1".into()) });
+        crate::formula::recalc_all(&mut wb);
+        let receipt = save_atomic_with_receipt(&original, &wb).unwrap();
+        receipt.adopt_document(&mut wb, &original, true);
+        assert!(crate::fixups::can_restore_sheet_xml(&wb.sheets[0]));
+        let part = wb.sheets[0].source_part.clone().unwrap();
+        let baseline = read_part(&original, &part).unwrap();
+
+        // Editing only an unrelated summary cell must keep the saved detail
+        // sheet eligible for XML reuse even if a full calculation runs.
+        wb.sheets[1].set(1, 0, number(7.0));
+        crate::formula::recalc_all(&mut wb);
+        assert!(crate::fixups::can_restore_sheet_xml(&wb.sheets[0]));
+        let receipt = save_atomic_with_receipt(&copy, &wb).unwrap();
+        receipt.adopt_document(&mut wb, &copy, true);
+        assert_eq!(read_part(&copy, &part).unwrap(), baseline);
+
+        wb.sheets[1].set(0, 0, number(9.0));
+        crate::formula::recalc_all(&mut wb);
+        assert!(!wb.sheets[0].edited);
+        assert!(!crate::fixups::can_restore_sheet_xml(&wb.sheets[0]));
+        save_atomic(&copy, &wb).unwrap();
+        assert_eq!(load(&copy).unwrap().sheets[0].value(0, 1), Value::Number(10.0));
+        assert_eq!(load(&original).unwrap().sheets[0].value(0, 1), Value::Number(6.0));
     }
 
     #[test]
