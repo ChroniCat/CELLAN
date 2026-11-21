@@ -19,7 +19,6 @@ impl Conversation {
         listener.set_nonblocking(true).unwrap();
         app.ai.cfg.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         app.ai.cfg.api_key = "local-test".into();
-        app.ai.cfg.data_consent = true;
         Self {
             ctx,
             app,
@@ -429,4 +428,39 @@ fn ai_text_only_gateway_can_resume_an_existing_tool_round() {
     chat.poll_until(|app| !app.ai.busy);
     assert_eq!(chat.app.ai.messages.last().unwrap().undo_ids, ids);
     assert_eq!(chat.app.ai.messages.last().unwrap().content, "已核对");
+}
+
+#[test]
+fn ai_executes_multi_step_workflow_beyond_eight_rounds() {
+    assert_eq!(MAX_TOOL_ROUNDS, 64);
+    let mut chat = Conversation::new();
+    chat.app.start_ai_prompt("分 12 步依次写入单元格".into());
+    for step in 0..12u32 {
+        let (stream, _) = chat.request();
+        let addr = cell_name(step, 0);
+        respond(
+            stream,
+            tool_event("set_cells", json!({"edits":[{"cell":addr,"value":step + 1}]})),
+        );
+    }
+    let (final_stream, _) = chat.request();
+    respond(
+        final_stream,
+        json!({"choices":[{"delta":{"content":"12 步全部完成"}}]}),
+    );
+    chat.poll_until(|app| !app.ai.busy);
+    let last = chat.app.ai.messages.last().unwrap();
+    assert!(last.error.is_none(), "error: {:?}", last.error);
+    assert_eq!(last.content, "12 步全部完成");
+    assert_eq!(last.tool_logs.len(), 12);
+    for step in 0..12u32 {
+        assert_eq!(
+            chat.app.wb.sheet(0).value(step, 0),
+            Value::Number(f64::from(step + 1))
+        );
+    }
+    chat.app.undo_last_ai_change();
+    for step in 0..12u32 {
+        assert_eq!(chat.app.wb.sheet(0).value(step, 0), Value::Empty);
+    }
 }

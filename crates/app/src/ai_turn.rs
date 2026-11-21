@@ -236,11 +236,6 @@ impl SheetApp {
             }
             return;
         }
-        if !self.ai.cfg.data_consent {
-            self.ai.pending_consent_prompt = Some(prompt);
-            self.ai.status_hint = "发送前请先确认数据外发说明".into();
-            return;
-        }
         if self.ai.bound_doc_uid != Some(self.doc_uid) {
             self.ai.wire_history.clear();
         }
@@ -930,7 +925,7 @@ impl SheetApp {
 
     fn next_ai_round(&mut self) {
         self.ai.round += 1;
-        self.ai.status_hint = format!("第 {} 轮推理中…", self.ai.round);
+        self.ai.status_hint = format!("第 {} / {MAX_TOOL_ROUNDS} 轮推理中…", self.ai.round);
         self.launch_ai_round();
     }
 }

@@ -65,7 +65,8 @@ fn tool_definitions() -> Vec<JsonValue> {
     let string = json!({"type": "string"});
     let boolean = json!({"type": "boolean"});
     let edits = json!({"type":"array","items":{"type":"object","properties":{
-        "cell":string,"value":{},"formula":string,"format":string
+        "cell":string,"value":{},"formula":string,"format":string,
+        "fill_hex":string,"font_hex":string,"bold":boolean
     },"required":["cell"]}});
     let functions = [
         (
@@ -94,7 +95,7 @@ fn tool_definitions() -> Vec<JsonValue> {
         ),
         (
             "set_cells",
-            "写入单元格值、公式或格式",
+            "批量写入单元格的值、公式、数字格式或填充/字体颜色",
             json!({"sheet":string,"edits":edits}),
             vec!["edits"],
         ),

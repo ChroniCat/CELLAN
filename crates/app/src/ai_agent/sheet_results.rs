@@ -336,15 +336,44 @@ impl WorkbookToolView<'_> {
                 break;
             }
         }
+        let default_col_w = sh.cols.default_size().round() as i64;
+        let default_row_h = sh.rows.default_size().round() as i64;
+        let mut col_widths = serde_json::Map::new();
+        for cc in c1..=c2 {
+            let w = sh.cols.size(cc);
+            if (w - sh.cols.default_size()).abs() >= 0.5 {
+                let col_lbl = cell_name(0, cc);
+                col_widths.insert(
+                    col_lbl.trim_end_matches('1').to_string(),
+                    json!(w.round() as i64),
+                );
+            }
+        }
+        let mut row_heights = serde_json::Map::new();
+        for rr in r1..=r2 {
+            let h = sh.rows.size(rr);
+            if (h - sh.rows.default_size()).abs() >= 0.5 {
+                row_heights.insert((rr + 1).to_string(), json!(h.round() as i64));
+            }
+        }
         let span = range_label((r1, c1), (r2, c2));
+        let mut payload = json!({
+            "ok": true,
+            "sheet": sh.name,
+            "range": span,
+            "default_col_width_px": default_col_w,
+            "default_row_height_px": default_row_h,
+            "cells": cells
+        });
+        if !col_widths.is_empty() {
+            payload["col_widths_px"] = JsonValue::Object(col_widths);
+        }
+        if !row_heights.is_empty() {
+            payload["row_heights_px"] = JsonValue::Object(row_heights);
+        }
         (
             format!("查看 {}!{span}（{} 项）", sh.name, cells.len()),
-            json!({
-                "ok": true,
-                "sheet": sh.name,
-                "range": span,
-                "cells": cells
-            }),
+            payload,
         )
     }
 
