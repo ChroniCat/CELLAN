@@ -2009,7 +2009,7 @@ fn frozen_corner_and_cross_freeze_merge_never_overlap_scrolled_rows() {
 }
 
 #[test]
-fn top_left_home_and_tab_close_preserve_unsaved_edits_and_prompt_save() {
+fn top_left_home_and_tab_close_preserve_edits_and_save_silently() {
     let env = crate::test_env::TestEnv::new("top_left_tab_close_save_prompt");
     let path = env.path("愉悦定金.xlsx");
     {
@@ -2083,28 +2083,10 @@ fn top_left_home_and_tab_close_preserve_unsaved_edits_and_prompt_save() {
         "回到已打开文档后未保存的内存修改必须完好无损"
     );
 
-    // 3) 点标签页上的 ×（request_close_tab）：不得无提示直接关闭，必须弹出保存确认框！
+    // 点击已命名文档的 × 后等待后台写完，无需再按确认或 Ctrl+S。
     app.request_close_tab(0);
     assert!(app.has_open_workbook, "有未保存修改时点击标签 × 不得直接关闭文件");
-    assert_eq!(
-        app.tab_close_confirm,
-        Some(app.doc_uid),
-        "必须打开标签页关闭保存确认弹窗"
-    );
-
-    // 4) 在弹窗中按 Enter 选择「保存」：自动把 777 存回原文件并干净关闭标签页，重开后修改仍在！
-    wps_frame(
-        &mut app,
-        &ctx,
-        vec![egui::Event::Key {
-            key: egui::Key::Enter,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
-        egui::Modifiers::NONE,
-    );
+    assert!(app.tab_close_confirm.is_none() && app.tasks.saving.is_some());
     for _ in 0..80 {
         wps_frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
         if !app.has_open_workbook && app.tasks.saving.is_none() {

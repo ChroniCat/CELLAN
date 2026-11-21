@@ -840,6 +840,7 @@ impl SheetApp {
                 self.wb.calc_pending = false;
                 self.wb.calc_pending_sheets.clear();
                 self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.recalc_all_async();
                 self.status = "计算选项：自动".into();
             }
@@ -852,6 +853,7 @@ impl SheetApp {
                 self.manual_calc = true;
                 self.wb.calc_manual = true;
                 self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.status = "计算选项：手动（按 F9 或“开始计算”重算）".into();
             }
             "WatchWindow" => self.watch_open = true,
@@ -1231,6 +1233,7 @@ impl SheetApp {
                 }
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.page.print_area = Some((r1, c1, r2, c2));
+                sh.page_dirty = true;
                 self.wb.dirty = true;
                 self.status = format!(
                     "打印区域设为 {}-{}",
@@ -1241,6 +1244,7 @@ impl SheetApp {
             "PrintAreaClear" => {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.page.print_area = None;
+                sh.page_dirty = true;
                 self.wb.dirty = true;
                 self.status = "已取消打印区域".into();
             }
@@ -1258,6 +1262,7 @@ impl SheetApp {
                     sh.page.col_breaks.sort_unstable();
                     sh.page.col_breaks.dedup();
                 }
+                sh.page_dirty = true;
                 self.wb.dirty = true;
                 self.status = format!("已在第 {} 行、第 {} 列前插入分页符", r + 1, c + 1);
             }
@@ -1266,6 +1271,7 @@ impl SheetApp {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.page.row_breaks.retain(|x| *x != r);
                 sh.page.col_breaks.retain(|x| *x != c);
+                sh.page_dirty = true;
                 self.wb.dirty = true;
                 self.status = format!("已删除第 {} 行、第 {} 列的分页符", r + 1, c + 1);
             }

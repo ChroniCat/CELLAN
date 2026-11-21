@@ -1,12 +1,12 @@
 //! Background work belongs to one document and moves with its tab.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sheetcore::{Workbook, xlsx::SaveReceipt};
 
-use super::OpenMsg;
+use super::{egui, OpenMsg};
 
 #[derive(Default)]
 pub(crate) struct DocumentTasks {
@@ -16,6 +16,13 @@ pub(crate) struct DocumentTasks {
     /// Retain pending edits until a result for this document generation is applied.
     pub dirty_recalc_seeds: std::collections::BTreeSet<sheetcore::formula::deps::CellKey>,
     pub last_edit: Option<Instant>,
+    pub autosave_dirty_since: Option<Instant>,
+    pub autosave_retry_at: Option<Instant>,
+    /// Ctrl+S requested a second snapshot while the previous one was being written.
+    pub manual_save_queued: bool,
+    /// Preserve save authority when a tab leaves its collaboration session.
+    /// A former guest must not automatically overwrite a shared workbook.
+    pub autosave_after_detach: Option<bool>,
     pub saving: Option<PendingSave>,
     pub pending_host: bool,
     pub pending_join: Option<String>,
@@ -32,8 +39,9 @@ pub(crate) struct DocumentTasks {
 pub(crate) struct PendingSave {
     pub target: PathBuf,
     pub rx: Receiver<Result<(SaveReceipt, Option<CalculatedSnapshot>), String>>,
-    /// 开始保存的时刻，状态栏据此显示已用时间（QA-07.3 进度反馈）
-    pub started: Instant,
+    pub quiet: bool,
+    /// Host session and collaboration clock represented by this original-file snapshot.
+    pub host: Option<(String, u64)>,
 }
 
 #[derive(Debug)]
@@ -74,21 +82,59 @@ impl CalculatedSnapshot {
 }
 
 impl DocumentTasks {
+    /// Save a quiet edit promptly, or snapshot an ongoing stream of committed edits.
+    pub fn autosave_due(&mut self, wb: &Workbook, ctx: Option<&egui::Context>) -> bool {
+        if !wb.dirty || wb.load_incomplete || wb.path.as_deref().is_none_or(|p| !sheetcore::xlsx::can_save_to(p)) {
+            self.autosave_dirty_since = None;
+            return false;
+        }
+        let now = Instant::now();
+        let first = *self.autosave_dirty_since.get_or_insert(now);
+        if self.saving.is_some() || self.open_rx.is_some() || self.busy {
+            return false;
+        }
+        if self.manual_save_queued {
+            return true;
+        }
+        let quiet = self.last_edit.unwrap_or(first) + Duration::from_millis(400);
+        let mut due = quiet.min(first + Duration::from_secs(2));
+        if let Some(retry) = self.autosave_retry_at {
+            due = due.max(retry);
+        }
+        if due <= now {
+            return true;
+        }
+        if let Some(ctx) = ctx {
+            ctx.request_repaint_after(due.duration_since(now));
+        }
+        false
+    }
+
     pub fn recalc_pending(&self) -> bool {
         self.needs_full || !self.dirty_recalc_seeds.is_empty()
     }
 
     pub fn start_save(&mut self, wb: &mut Workbook, target: PathBuf) {
+        self.start_save_checked(wb, target, |_| None);
+    }
+
+    pub fn start_save_checked(
+        &mut self,
+        wb: &mut Workbook,
+        target: PathBuf,
+        check_target: impl FnOnce(&Path) -> Option<String> + Send + 'static,
+    ) {
         debug_assert!(self.saving.is_none());
         let mut snapshot = wb.clone();
-        // Save As must still inherit parts from the file that was opened.
-        snapshot.path = wb.path.clone().filter(|p| p.exists());
         let (tx, rx) = mpsc::channel();
-        self.saving = Some(PendingSave { target: target.clone(), rx, started: Instant::now() });
+        self.saving = Some(PendingSave { target: target.clone(), rx, quiet: false, host: None });
         // Subsequent edits set this back to true. Completion never clears it.
         wb.dirty = false;
+        self.autosave_dirty_since = None;
         let recalc = self.recalc_pending() && !snapshot.calc_manual;
         std::thread::spawn(move || {
+            // A missing original has no package to inherit on Save As.
+            snapshot.path = snapshot.path.take().filter(|p| p.exists());
             // Saving or closing can beat the editor's debounce. Finish the
             // captured generation before serializing its formula caches.
             let revisions = recalc.then(|| {
@@ -97,6 +143,10 @@ impl DocumentTasks {
                 revisions
             });
             // The core owns the temporary write, history, and atomic replacement.
+            if let Some(error) = check_target(&target) {
+                let _ = tx.send(Err(error));
+                return;
+            }
             let result = sheetcore::xlsx::save_atomic_with_receipt(&target, &snapshot)
                 .map(|receipt| (receipt, revisions.map(|revisions| CalculatedSnapshot {
                     revisions, workbook: Box::new(snapshot),
@@ -116,6 +166,12 @@ impl DocumentTasks {
         let pending = self.saving.take().unwrap();
         Some(match result {
             Ok((receipt, calculated)) => {
+                self.autosave_retry_at = None;
+                if wb.path.as_ref() != Some(&pending.target)
+                    || (self.autosave_after_detach == Some(true) && !wb.dirty)
+                {
+                    self.autosave_after_detach = None;
+                }
                 let applied = !wb.dirty && calculated.is_some_and(|result| result.apply(wb));
                 if applied {
                     self.needs_full = false;
@@ -127,6 +183,8 @@ impl DocumentTasks {
             }
             Err(error) => {
                 wb.dirty = true;
+                self.manual_save_queued = false;
+                self.autosave_retry_at = Some(Instant::now() + Duration::from_secs(12));
                 Err(error)
             }
         })

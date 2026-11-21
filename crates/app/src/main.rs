@@ -1719,10 +1719,10 @@ struct SheetApp {
     /// 没带文件启动时显示最近文件
     show_start: bool,
     confirm_close_target: Option<(usize, u64)>,
-    close_confirm_open: bool,
+    resume_exit_after_close_choice: bool,
     tab_close_confirm: Option<u64>,
-    tab_save_and_close: Option<u64>,
-    discard_on_close: bool,
+    pending_tab_closes: Vec<u64>,
+    close_save_error: Option<String>,
     save_all_before_exit: bool,
     tabs_done: bool,
     paste_done: bool,
@@ -1734,9 +1734,11 @@ struct SheetApp {
     show_pages: bool,
     /// 自动保存开关与协作保存协同状态
     autosave: bool,
-    last_autosave_attempt: Option<std::time::Instant>,
-    saving_peer_clock: Option<u64>,
-    delegated_save_pending: Option<std::time::Instant>,
+    delegated_save_pending: Option<(u64, std::time::Instant)>,
+    /// The source and tab identified by the host's lock card when joining.
+    shared_client_source: Option<(u64, PathBuf)>,
+    /// Latest document generation reached exclusively through replicated cell edits.
+    shared_cell_generation: Option<(u64, u64)>,
     /// 标题栏搜索框
     search: String,
     /// 缩放对话框（百分比）
@@ -2088,8 +2090,8 @@ struct SheetApp {
     /// 页面设置对话框（UI-26）
     page_setup_open: bool,
     page_setup_draft: sheetcore::page::PageSetup,
-    /// 打开前的页面设置、page_dirty、wb.dirty；取消时原样恢复
-    page_setup_orig: Option<(sheetcore::page::PageSetup, bool, bool)>,
+    /// Sheet identity that owns the uncommitted preview.
+    page_setup_sheet: u64,
     page_setup_printers: Vec<String>,
     page_setup_printer: String,
     print_copies: u32,
@@ -3048,10 +3050,10 @@ impl SheetApp {
             show_start: false,
             text_spill: true,
             confirm_close_target: None,
-            close_confirm_open: false,
+            resume_exit_after_close_choice: false,
             tab_close_confirm: None,
-            tab_save_and_close: None,
-            discard_on_close: false,
+            pending_tab_closes: Vec::new(),
+            close_save_error: None,
             save_all_before_exit: false,
             tabs_done: false,
             paste_done: false,
@@ -3061,9 +3063,9 @@ impl SheetApp {
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
             autosave: false,
-            last_autosave_attempt: None,
-            saving_peer_clock: None,
             delegated_save_pending: None,
+            shared_client_source: None,
+            shared_cell_generation: None,
             search: String::new(),
             zoom_dlg: None,
             manual_calc: false,
@@ -3298,7 +3300,7 @@ impl SheetApp {
             rejoin_outbox: None,
             page_setup_open: false,
             page_setup_draft: sheetcore::page::PageSetup::default(),
-            page_setup_orig: None,
+            page_setup_sheet: 0,
             page_setup_printers: Vec::new(),
             page_setup_printer: String::new(),
             print_copies: 1,
@@ -3431,7 +3433,8 @@ impl SheetApp {
                     app.members_open = true;
                 }
                 "close_confirm" => {
-                    app.close_confirm_open = true;
+                    app.resume_exit_after_close_choice = true;
+                    app.tab_close_confirm = Some(app.doc_uid);
                 }
                 "print" => {
                     app.show_start = false;
@@ -5286,56 +5289,108 @@ impl SheetApp {
         if net.hosting || self.room_lost || !self.joined_doc {
             return false;
         }
-        let Some(path) = self.wb.path.as_ref() else { return false };
-        session_lock::read(path).is_some_and(|info| info.matches_addr(&net.addr))
+        self.is_shared_client_source()
+    }
+
+    fn is_shared_client_source(&self) -> bool {
+        self.shared_client_source.as_ref().is_some_and(|(uid, source)|
+            *uid == self.doc_uid && self.wb.path.as_ref() == Some(source))
+    }
+
+    fn shared_source_requires_host(&self) -> bool {
+        self.net.as_ref().is_none_or(|n| !n.hosting)
+            && (self.tasks.autosave_after_detach == Some(false) || self.is_shared_client_source())
+    }
+
+    fn only_shared_cell_edits(&self) -> bool {
+        !self.wb.dirty || self.shared_cell_generation == Some((self.doc_uid, self.doc_gen))
+    }
+
+    // The legacy room protocol acknowledges cell clocks. Other workbook edits can
+    // coexist with a cell generation, including metadata handlers which don't bump it.
+    fn host_receipt_covers_workbook(&self) -> bool {
+        let wb = &self.wb;
+        !wb.dirty || (self.only_shared_cell_edits() && !wb.names_dirty
+            && wb.pivots_pending.is_empty() && wb.pivots_pending2.is_empty()
+            && wb.pivot_calc_fields.is_empty() && wb.pivot_shifts.is_empty()
+            && wb.chart_edits.is_empty() && !wb.links.iter().any(|l| l.refreshed)
+            && wb.encryption.as_ref().map(|e| (&e.password, e.spin))
+                == wb.source_encryption.as_ref().map(|e| (&e.password, e.spin))
+            && !wb.sheets.iter().any(|sh| sh.page_dirty || sh.notes_dirty || sh.pictures_dirty
+                || sh.col_styles_dirty || sh.row_styles_dirty || sh.cf_dirty || sh.dv_dirty
+                || sh.freeze_dirty || sh.layout_dirty || sh.scenarios_dirty || sh.ignored_errors_dirty
+                || sh.outline_pr_dirty || sh.filter_dirty || sh.charts_dirty || sh.tab_color_dirty
+                || sh.tables_dirty || sh.protect_dirty || sh.rich_dirty || sh.hyperlinks_dirty
+                || sh.sparklines_dirty || sh.textboxes_dirty || sh.hidden_dirty))
+    }
+
+    fn receive_host_save(&mut self, clock: u64) {
+        let was_waiting = self.delegated_save_pending.is_some_and(|(uid, _)| uid == self.doc_uid);
+        if self.is_delegated_collab_client()
+            && self.host_receipt_covers_workbook()
+            && self.tasks.saving.is_none()
+            && self.peer.as_ref().is_some_and(|p| p.clock <= clock)
+            && (self.wb.dirty || was_waiting)
+        {
+            self.wb.dirty = false;
+            self.shared_cell_generation = None;
+            if was_waiting {
+                self.delegated_save_pending = None;
+                self.status = "原文件已同步保存".into();
+            }
+        }
     }
 
     fn save(&mut self, force_dialog: bool) {
         if !self.finish_pending_edit() {
             return;
         }
+        if !force_dialog && self.tasks.saving.is_some() {
+            self.tasks.manual_save_queued |= self.wb.dirty;
+            return;
+        }
+        let force_dialog = force_dialog
+            || self.wb.path.as_deref().is_some_and(|p| !sheetcore::xlsx::can_save_to(p));
         if !force_dialog {
             if self.is_delegated_collab_client() {
+                if !self.host_receipt_covers_workbook() {
+                    self.status = "当前工作簿含有宿主无法确认的本地改动，请使用「另存为」保留副本。".into();
+                    return;
+                }
                 if let Some(net) = self.net.as_ref() {
                     net.request_save();
-                    self.delegated_save_pending = Some(std::time::Instant::now());
-                    self.status = "已请求协作宿主同步保存原文件…".into();
+                    self.tasks.autosave_after_detach = Some(false);
+                    self.delegated_save_pending = Some((self.doc_uid, std::time::Instant::now()));
+                    self.status = "正在保存…".into();
                     return;
                 }
             }
-            if let Some(conflict) = self.foreign_host_save_conflict() {
-                self.status = conflict;
+        }
+        let mut other_paths = self.other_document_paths(self.active_tab);
+        if self.shared_source_requires_host() {
+            if !force_dialog {
+                self.status = "请重新连接协作宿主后保存，或另存为副本。".into();
                 return;
             }
+            other_paths.extend(self.wb.path.clone());
         }
-        let other_paths = self.other_document_paths(self.active_tab);
-        if !force_dialog {
-            self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
-        }
+        let host = self.save_host();
         self.status = Self::start_document_save(
             &mut self.wb, &mut self.tasks, self.load_diag.as_ref(), force_dialog, &other_paths,
-        ).unwrap_or_else(|message| {
-            self.saving_peer_clock = None;
-            message
-        });
+            host,
+        ).unwrap_or_else(|message| message);
     }
 
-    /// 若共享目录上已有另一位活跃宿主在主持当前文件，阻止离线或已降级副本直接覆盖原文件。
-    fn foreign_host_save_conflict(&self) -> Option<String> {
-        let path = self.wb.path.as_ref()?;
+    fn save_host(&self) -> Option<(String, u64)> {
+        self.net.as_ref().filter(|n| n.hosting).map(|n| {
+            (n.session_id.clone(), self.peer.as_ref().map_or(0, |p| p.clock))
+        })
+    }
+
+    fn check_save_host(path: &std::path::Path, my_session: Option<&str>) -> Option<String> {
         let info = session_lock::read(path)?;
-        let my_session = self
-            .net
-            .as_ref()
-            .filter(|n| n.hosting)
-            .map(|n| n.session_id.as_str());
         if session_lock::is_owned_by_session(&info, my_session) {
             return None;
-        }
-        if let Some(net) = self.net.as_ref() {
-            if !net.hosting && !self.room_lost && self.joined_doc && info.matches_addr(&net.addr) {
-                return None;
-            }
         }
         match session_lock::probe_host(&info) {
             session_lock::HostLiveness::Dead => None,
@@ -5374,6 +5429,7 @@ impl SheetApp {
         diagnostic: Option<&sheetcore::xlsx::LoadDiag>,
         force_dialog: bool,
         other_paths: &[PathBuf],
+        host: Option<(String, u64)>,
     ) -> Result<String, String> {
         if !force_dialog && wb.path.is_some() {
             if let Some(d) = diagnostic.filter(|d| d.has_fatal()) {
@@ -5396,15 +5452,17 @@ impl SheetApp {
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .add_filter("Excel 启用宏的工作簿", &["xlsm"])
                 .add_filter("Excel 97-2003 工作簿", &["xls"])
-                    .set_file_name(if wb.has_vba {
-                        format!("{}.xlsm", wb.title())
-                    } else {
-                        format!("{}.xlsx", wb.title())
+                    .set_file_name({
+                        let stem = wb.path.as_deref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("未命名");
+                        format!("{stem}.{}", if wb.has_vba { "xlsm" } else { "xlsx" })
                     })
                     .save_file(),
             },
         };
         let path = path.ok_or_else(|| "已取消保存".to_string())?;
+        if !sheetcore::xlsx::can_save_to(&path) {
+            return Err("此格式仅支持导入，请另存为 .xlsx、.xlsm 或 .xls 工作簿".into());
+        }
 
         let ext = path
             .extension()
@@ -5415,19 +5473,42 @@ impl SheetApp {
         } else {
             path
         };
-        if other_paths.iter().any(|p| single_instance::same_file_path(p, &path)) {
+        if other_paths.contains(&path) {
             return Err(format!("{} 已由其他标签页打开或正在保存，请选择其他目标", path.display()));
         }
-        let message = format!("正在保存 {}…", path.display());
-        tasks.start_save(wb, path);
-        Ok(message)
+        let original = !force_dialog && wb.path.as_ref() == Some(&path);
+        let session = host.as_ref().map(|(session, _)| session.clone());
+        let others = other_paths.to_vec();
+        tasks.start_save_checked(wb, path, move |target| {
+            if others.iter().any(|p| single_instance::same_file_path(p, target)) {
+                return Some(format!("{} 已由其他标签页打开或正在保存，请选择其他目标", target.display()));
+            }
+            Self::check_save_host(target, session.as_deref())
+        });
+        if original {
+            if let Some(pending) = &mut tasks.saving {
+                pending.host = host;
+            }
+        }
+        Ok("正在保存…".into())
     }
 
     /// Poll each save against the workbook that owns its channel, even off-screen.
     fn poll_save(&mut self) {
-        let mut close_after_save: Option<u64> = None;
+        let mut close_failure = None;
+        let quiet = self.tasks.saving.as_ref().is_some_and(|s| s.quiet)
+            && self.tasks.autosave_retry_at.is_none();
+        let saved_clock = self.tasks.saving.as_ref().and_then(|s| s.host.as_ref())
+            .filter(|(id, _)| self.net.as_ref().is_some_and(|n| n.hosting && n.session_id == *id))
+            .map(|(_, clock)| *clock);
+        let new_path = self.tasks.saving.as_ref().is_some_and(|s| Some(&s.target) != self.wb.path.as_ref());
+        let previous_host_path = if new_path && self.net.as_ref().is_some_and(|n| n.hosting) {
+            self.wb.path.clone()
+        } else {
+            None
+        };
         if let Some(result) = self.tasks.poll_save(&mut self.wb) {
-            self.status = match result {
+            match result {
                 Ok((path, applied)) => {
                     if applied {
                         self.cancel_silent_recalc();
@@ -5435,48 +5516,50 @@ impl SheetApp {
                         self.cf_stats_gen = u64::MAX;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                     }
-                    recent::touch(&path);
-                    self.recent_cache = None;
+                    if new_path {
+                        // A room hosts a particular file. Future saves of this
+                        // copy must never acknowledge a write to the old path.
+                        if let Some(source) = previous_host_path.as_deref() {
+                            self.leave_session_at(Some(source));
+                        }
+                        recent::touch(&path);
+                        self.recent_cache = None;
+                    }
                     // 另存成功后新文件是按当前已知内容完整写出的；诊断清掉，
                     // 后续对这份新文件的覆盖保存不再被旧文件的缺口挡住。
                     if self.wb.path.as_deref() == Some(path.as_path()) {
                         self.load_diag = None;
                         self.wb.load_incomplete = false;
-                        if let Some(net) = self.net.as_ref().filter(|n| n.hosting) {
-                            let clk = self
-                                .saving_peer_clock
-                                .take()
-                                .or_else(|| self.peer.as_ref().map(|p| p.clock))
-                                .unwrap_or(0);
-                            net.broadcast_saved(clk);
+                        if let (Some(net), Some(clock)) = (&self.net, saved_clock) {
+                            net.broadcast_saved(clock);
                         }
                     }
-                    self.saving_peer_clock = None;
-                    if self.tab_save_and_close == Some(self.doc_uid) {
-                        self.tab_save_and_close = None;
-                        if !self.wb.dirty {
-                            close_after_save = Some(self.doc_uid);
-                        }
+                    if !quiet {
+                        self.status = if self.wb.dirty {
+                            "仍有新改动待保存".into()
+                        } else {
+                            "已保存".into()
+                        };
                     }
-                    format!("已保存 {}", path.display())
                 }
                 Err(error) => {
-                    self.saving_peer_clock = None;
-                    self.last_autosave_attempt = Some(std::time::Instant::now());
-                    self.save_all_before_exit = false;
-                    if self.tab_save_and_close == Some(self.doc_uid) {
-                        self.tab_save_and_close = None;
+                    if self.save_all_before_exit || self.pending_tab_closes.contains(&self.doc_uid) {
+                        close_failure = Some((self.doc_uid, error.clone()));
                     }
-                    error
+                    self.status = error;
                 }
             };
-            eprintln!("[save] {}", self.status);
         }
         for tab in &mut self.tabs {
             let TabSlot::Parked(doc) = tab else { continue };
+            let new_path = doc.tasks.saving.as_ref().is_some_and(|s| Some(&s.target) != doc.wb.path.as_ref());
             if let Some(result) = doc.tasks.poll_save(&mut doc.wb) {
                 match result {
                     Ok((path, applied)) => {
+                        if new_path {
+                            recent::touch(&path);
+                            self.recent_cache = None;
+                        }
                         if applied {
                             doc.deps_built = false;
                             doc.doc_gen = doc.doc_gen.wrapping_add(1);
@@ -5489,29 +5572,18 @@ impl SheetApp {
                             doc.load_diag = None;
                             doc.wb.load_incomplete = false;
                         }
-                        if self.tab_save_and_close == Some(doc.doc_uid) {
-                            self.tab_save_and_close = None;
-                            if !doc.wb.dirty {
-                                close_after_save = Some(doc.doc_uid);
-                            }
-                        }
-                        self.status = format!("已保存 {}", path.display());
                     }
                     Err(error) => {
-                        self.save_all_before_exit = false;
-                        if self.tab_save_and_close == Some(doc.doc_uid) {
-                            self.tab_save_and_close = None;
+                        if self.save_all_before_exit || self.pending_tab_closes.contains(&doc.doc_uid) {
+                            close_failure.get_or_insert((doc.doc_uid, error.clone()));
                         }
                         self.status = format!("{}：{error}", doc.title);
                     }
                 }
-                eprintln!("[save] {}", self.status);
             }
         }
-        if let Some(uid) = close_after_save {
-            if let Some(idx) = self.find_tab_by_uid(uid) {
-                self.force_close_tab(idx);
-            }
+        if let Some((uid, error)) = close_failure.filter(|_| self.tab_close_confirm.is_none()) {
+            self.pause_close(uid, Some(error));
         }
     }
 
@@ -5521,71 +5593,75 @@ impl SheetApp {
         })
     }
 
-    /// 非侵入式空闲自动保存：
-    /// - 多人实时协作（`hosting && peers_list.len() > 1`）时，宿主在编辑停手 3.5 秒后自动把权威状态写回原文件并广播完成；
-    /// - 单人开启「自动保存」时，在编辑停手 5 秒后自动写回原文件；
-    /// - 绝不在单元格编辑中途（`editing` / `pending_edit`）打断用户焦点；若原文件被外部独占锁住则自动退避 12 秒，且零残留副文件。
+    fn guest_can_save_local_copy(&self) -> bool {
+        self.joined_doc && !self.room_lost && self.tasks.autosave_after_detach != Some(false)
+            && !self.is_delegated_collab_client()
+    }
+
+    /// Write committed edits from every eligible workbook. An in-cell draft remains
+    /// in the editor until committed, including while its workbook is saving.
     pub(crate) fn tick_autosave(&mut self, ctx: Option<&egui::Context>) {
-        let collab_host_active =
-            self.net.as_ref().is_some_and(|n| n.hosting) && self.peers_list.len() > 1;
-        let single_autosave_active =
-            self.autosave && self.net.as_ref().is_none_or(|n| n.hosting);
-        if (!collab_host_active && !single_autosave_active)
-            || !self.wb.dirty
-            || self.wb.path.is_none()
-            || self.wb.load_incomplete
-        {
-            return;
+        if self.net.as_ref().is_some_and(|n| n.hosting) {
+            self.tasks.autosave_after_detach = None;
         }
-        if self.editing.is_some()
-            || self.pending_edit.is_some()
-            || self.tasks.saving.is_some()
-            || self.tasks.open_rx.is_some()
-            || self.tasks.busy
-        {
-            return;
-        }
-        let idle_ms: u64 = if collab_host_active { 3_500 } else { 5_000 };
-        let edit_settled = self
-            .tasks
-            .last_edit
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(idle_ms));
-        let retry_settled = self
-            .last_autosave_attempt
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(12));
-        if !edit_settled || !retry_settled {
-            if let Some(ctx) = ctx {
-                ctx.request_repaint_after(std::time::Duration::from_millis(900));
+        for index in 0..self.tabs.len() {
+            let active = index == self.active_tab;
+            let (uid, enabled) = match &self.tabs[index] {
+                TabSlot::Active => {
+                    let enabled = self.autosave || self.tasks.manual_save_queued;
+                    let allowed = match &self.net {
+                        Some(n) if n.hosting => enabled || self.peers_list.len() > 1,
+                        Some(_) => enabled && self.wb.dirty && self.guest_can_save_local_copy(),
+                        None => self.tasks.autosave_after_detach.unwrap_or(enabled),
+                    };
+                    (self.doc_uid, allowed)
+                }
+                TabSlot::Parked(doc) => (
+                    doc.doc_uid,
+                    doc.tasks.autosave_after_detach.unwrap_or(self.autosave || doc.tasks.manual_save_queued),
+                ),
+            };
+            if !enabled || self.closing_document(uid) {
+                continue;
             }
-            return;
-        }
-        self.last_autosave_attempt = Some(std::time::Instant::now());
-        if self.foreign_host_save_conflict().is_some() {
-            if let Some(ctx) = ctx {
-                ctx.request_repaint_after(std::time::Duration::from_secs(12));
+            let due = match &mut self.tabs[index] {
+                TabSlot::Active => self.tasks.autosave_due(&self.wb, ctx),
+                TabSlot::Parked(doc) => doc.tasks.autosave_due(&doc.wb, ctx),
+            };
+            if !due {
+                continue;
             }
-            return;
-        }
-        let other_paths = self.other_document_paths(self.active_tab);
-        self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
-        match Self::start_document_save(
-            &mut self.wb,
-            &mut self.tasks,
-            self.load_diag.as_ref(),
-            false,
-            &other_paths,
-        ) {
-            Ok(msg) => {
-                self.status = msg;
-            }
-            Err(err) => {
-                self.saving_peer_clock = None;
-                self.status = err;
+            let other_paths = self.other_document_paths(index);
+            let host = if active { self.save_host() } else { None };
+            let (wb, tasks, diagnostic) = match &mut self.tabs[index] {
+                TabSlot::Active => (&mut self.wb, &mut self.tasks, self.load_diag.as_ref()),
+                TabSlot::Parked(doc) => (&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref()),
+            };
+            match Self::start_document_save(wb, tasks, diagnostic, false, &other_paths, host)
+            {
+                Ok(_) => {
+                    if let Some(pending) = &mut tasks.saving {
+                        pending.quiet = !tasks.manual_save_queued;
+                    }
+                    tasks.manual_save_queued = false;
+                }
+                Err(error) => {
+                    tasks.manual_save_queued = false;
+                    let delay = std::time::Duration::from_secs(12);
+                    tasks.autosave_retry_at = Some(std::time::Instant::now() + delay);
+                    self.status = error;
+                    if let Some(ctx) = ctx {
+                        ctx.request_repaint_after(delay);
+                    }
+                }
             }
         }
     }
 
-    /// 窗口关闭前把编辑缓冲落进模型；若有未保存改动则弹出对标 Excel/WPS 的保存确认框。
+    fn closing_document(&self, uid: u64) -> bool {
+        self.save_all_before_exit || self.tab_close_confirm == Some(uid) || self.pending_tab_closes.contains(&uid)
+    }
+
     fn commit_edit_before_close(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
@@ -5594,268 +5670,196 @@ impl SheetApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
         }
-        if std::mem::take(&mut self.discard_on_close) {
-            return;
-        }
-        let headless_exit = std::env::var("SC_SHOT").is_ok()
-            || std::env::var("SC_DUMP").is_ok()
-            || std::env::var("SC_EXIT_AFTER_SHOT").is_ok()
-            || std::env::var("SC_FRAME_EXIT").is_ok()
-            || std::env::var("SC_SAVE_EXIT").is_ok()
-            || std::env::var("SC_RECALC_EXIT").is_ok()
-            || std::env::var("SC_NO_CLOSE_PROMPT").is_ok()
-            || std::env::var("SC_LOCK").is_ok()
-            || std::env::var("SC_LOCK_TRY").is_ok();
-        let any_dirty = self.has_open_workbook
-            && (self.wb.dirty
-                || self
-                    .tabs
-                    .iter()
-                    .any(|t| matches!(t, TabSlot::Parked(d) if d.wb.dirty)));
-        if !headless_exit && any_dirty && !self.save_all_before_exit {
+        let headless_exit = ["SC_SHOT", "SC_DUMP", "SC_EXIT_AFTER_SHOT", "SC_FRAME_EXIT",
+            "SC_SAVE_EXIT", "SC_RECALC_EXIT", "SC_NO_CLOSE_PROMPT", "SC_LOCK", "SC_LOCK_TRY"]
+            .iter().any(|key| std::env::var_os(key).is_some());
+        let dirty = self.has_open_workbook && (self.wb.dirty || self.tabs.iter().any(
+            |t| matches!(t, TabSlot::Parked(doc) if doc.wb.dirty)));
+        if !headless_exit && (dirty || self.has_pending_save() || self.tab_close_confirm.is_some()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_confirm_open = true;
+            if self.tab_close_confirm.is_some() {
+                self.resume_exit_after_close_choice = true;
+            } else {
+                self.save_all_before_exit = true;
+            }
+            ctx.request_repaint();
         }
     }
 
-    fn close_confirm_dialog(&mut self, ctx: &egui::Context) {
-        if !self.close_confirm_open {
-            return;
+    // A missing path or failed write pauses the close on its owning document.
+    // The same decision UI serves Ctrl+W, a tab's × and a whole-window close.
+    fn pause_close(&mut self, uid: u64, error: Option<String>) {
+        self.resume_exit_after_close_choice |= self.save_all_before_exit;
+        self.save_all_before_exit = false;
+        self.pending_tab_closes.retain(|&pending| pending != uid);
+        self.tab_close_confirm = Some(uid);
+        if let Some(message) = &error {
+            self.status = message.clone();
         }
-        let mut open = true;
-        let mut action = 0u8; // 1=save&quit, 2=discard&quit, 3=cancel
-        let names: Vec<_> = self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-            let dirty = match tab { TabSlot::Active => self.wb.dirty, TabSlot::Parked(d) => d.wb.dirty };
-            dirty.then(|| format!("「{}」", self.tab_title(i)))
-        }).collect();
-        let doc_title = names.join("、");
-        ui_kit::window(ctx, "保存更改", 420.0)
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui_kit::state_banner(
-                    ui,
-                    ui_kit::StateKind::Warn,
-                    &format!("是否保存对{doc_title}的更改？"),
-                    "如果不保存，最近所做的编辑与格式修改将会丢失。",
-                );
-                ui.add_space(12.0);
-                ui_kit::footer(ui, |ui| {
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        action = 3;
-                    }
-                    if ui_kit::secondary_button(ui, "不保存").clicked() {
-                        action = 2;
-                    }
-                    if ui_kit::primary_button(ui, "保存并退出").clicked() {
-                        action = 1;
-                    }
-                });
-            });
-        match action {
-            1 => {
-                self.close_confirm_open = false;
-                self.save_all_before_exit = true;
-                self.advance_save_and_exit(ctx);
-            }
-            2 => {
-                self.close_confirm_open = false;
-                self.save_all_before_exit = false;
-                self.discard_on_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            3 => {
-                self.close_confirm_open = false;
-            }
-            _ => {
-                self.close_confirm_open = open;
-            }
-        }
+        self.close_save_error = error;
     }
 
     fn tab_close_confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(uid) = self.tab_close_confirm else {
-            return;
-        };
+        let Some(uid) = self.tab_close_confirm else { return };
         let Some(idx) = self.find_tab_by_uid(uid) else {
             self.tab_close_confirm = None;
+            self.save_all_before_exit = std::mem::take(&mut self.resume_exit_after_close_choice);
+            self.close_save_error = None;
             return;
         };
         let mut open = true;
-        let mut action = 0u8; // 1=save&close, 2=discard&close, 3=cancel
-        let doc_title = format!("「{}」", self.tab_title(idx));
+        let mut action = 0;
+        let title = self.tab_title(idx);
+        let retry = self.close_save_error.is_some();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             action = 3;
-        } else if ctx.input(|i| {
-            i.key_pressed(egui::Key::Enter) && !i.modifiers.shift && !i.modifiers.alt
-        }) {
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift && !i.modifiers.alt) {
             action = 1;
         }
-        ui_kit::window(ctx, "保存更改 — 关闭标签页", 420.0)
+        ui_kit::window(ctx, "保存更改", 460.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                ui_kit::state_banner(
-                    ui,
-                    ui_kit::StateKind::Warn,
-                    &format!("是否保存对{doc_title}的更改？"),
-                    "如果不保存，最近所做的编辑与格式修改将会丢失。",
-                );
+                ui_kit::state_banner(ui, ui_kit::StateKind::Warn,
+                    &format!("是否保存对「{title}」的更改？"),
+                    self.close_save_error.as_deref().unwrap_or("请选择此工作簿的保存位置。"));
                 ui.add_space(12.0);
                 ui_kit::footer(ui, |ui| {
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        action = 3;
-                    }
-                    if ui_kit::secondary_button(ui, "不保存").clicked() {
-                        action = 2;
-                    }
-                    if ui_kit::primary_button(ui, "保存").clicked() {
-                        action = 1;
-                    }
+                    if ui_kit::secondary_button(ui, "取消").clicked() { action = 3; }
+                    if ui_kit::secondary_button(ui, "不保存").clicked() { action = 2; }
+                    if retry && ui_kit::secondary_button(ui, "另存为").clicked() { action = 4; }
+                    if ui_kit::primary_button(ui, if retry { "重试" } else { "保存" }).clicked() { action = 1; }
                 });
             });
-        match action {
-            1 => {
-                self.tab_close_confirm = None;
-                self.start_save_and_close_tab(idx, uid);
-            }
-            2 => {
-                self.tab_close_confirm = None;
-                self.force_close_tab(idx);
-            }
-            3 => {
-                self.tab_close_confirm = None;
-            }
-            _ => {
-                if !open {
-                    self.tab_close_confirm = None;
-                }
-            }
-        }
-    }
-
-    fn start_save_and_close_tab(&mut self, idx: usize, uid: u64) {
-        if idx == self.active_tab {
-            if !self.finish_pending_edit() {
-                return;
-            }
-            if self.is_delegated_collab_client() {
-                if let Some(net) = self.net.as_ref() {
-                    net.request_save();
-                    self.delegated_save_pending = Some(std::time::Instant::now());
-                    self.tab_save_and_close = Some(uid);
-                    self.status = "正在由协作宿主同步保存原文件，保存完成后将自动关闭标签…".into();
-                    return;
-                }
-            }
-            if let Some(conflict) = self.foreign_host_save_conflict() {
-                self.status = conflict;
-                return;
-            }
-            let other_paths = self.other_document_paths(idx);
-            self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
-            match Self::start_document_save(
-                &mut self.wb,
-                &mut self.tasks,
-                self.load_diag.as_ref(),
-                false,
-                &other_paths,
-            ) {
-                Ok(msg) => {
-                    self.tab_save_and_close = Some(uid);
-                    self.status = msg;
-                }
-                Err(err) => {
-                    self.saving_peer_clock = None;
-                    self.status = err;
-                }
-            }
+        if !open { action = 3; }
+        if action == 0 { return; }
+        let exiting = std::mem::take(&mut self.resume_exit_after_close_choice);
+        self.tab_close_confirm = None;
+        self.close_save_error = None;
+        if action == 3 { return; }
+        self.save_all_before_exit = exiting;
+        if action == 2 {
+            self.force_close_tab(idx);
         } else {
-            let other_paths = self.other_document_paths(idx);
-            if let Some(TabSlot::Parked(doc)) = self.tabs.get_mut(idx) {
-                match Self::start_document_save(
-                    &mut doc.wb,
-                    &mut doc.tasks,
-                    doc.load_diag.as_ref(),
-                    false,
-                    &other_paths,
-                ) {
-                    Ok(msg) => {
-                        self.tab_save_and_close = Some(uid);
-                        self.status = msg;
-                    }
-                    Err(err) => {
-                        self.status = format!("{}：{err}", doc.title);
-                    }
-                }
+            if !exiting && !self.pending_tab_closes.contains(&uid) {
+                self.pending_tab_closes.push(uid);
             }
-        }
-    }
-
-    // Save one document per receipt. A failed write or cancelled Save As leaves
-    // every remaining document open, including tabs edited after their snapshot.
-    fn advance_save_and_exit(&mut self, ctx: &egui::Context) {
-        if !self.save_all_before_exit || self.has_pending_save() {
-            return;
-        }
-        if !self.finish_pending_edit() {
-            self.save_all_before_exit = false;
-            return;
-        }
-        let owner = if self.wb.dirty {
-            Some(self.active_tab)
-        } else {
-            self.tabs.iter().position(|t| matches!(t, TabSlot::Parked(d) if d.wb.dirty))
-        };
-        let Some(owner) = owner else {
-            self.save_all_before_exit = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        };
-        if owner == self.active_tab && self.is_delegated_collab_client() {
-            if self.delegated_save_pending.is_none() {
-                if let Some(net) = self.net.as_ref() {
-                    net.request_save();
-                    self.delegated_save_pending = Some(std::time::Instant::now());
-                    self.status = "正在由协作宿主同步保存原文件…".into();
-                }
-            }
-            if self
-                .delegated_save_pending
-                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(8))
-            {
-                ctx.request_repaint_after(std::time::Duration::from_millis(60));
-                return;
-            }
-            self.delegated_save_pending = None;
-        }
-        let paths = self.other_document_paths(owner);
-        if owner == self.active_tab {
-            self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
-        }
-        let result = match &mut self.tabs[owner] {
-            TabSlot::Active => Self::start_document_save(&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), false, &paths),
-            TabSlot::Parked(doc) => Self::start_document_save(&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), false, &paths)
-                .map_err(|message| format!("{}：{message}", doc.title)),
-        };
-        match result {
-            Ok(message) => self.status = message,
-            Err(message) => {
-                self.save_all_before_exit = false;
-                self.status = message;
-            }
+            self.save_closing_document(idx, action == 4 || !retry);
         }
         ctx.request_repaint();
     }
 
-    fn defer_close_while_saving(&mut self, ctx: &egui::Context, was_saving: bool) {
-        if (was_saving || self.has_pending_save())
-            && ctx.input(|input| input.viewport().close_requested())
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            // A failed save may have completed in this frame. Keep its error.
-            if self.has_pending_save() {
-                self.status = "文件仍在保存，完成后再关闭窗口".into();
+    // An entire window saves one document per receipt. Later edits, including
+    // edits made during serialization, remain dirty and get their own receipt.
+    fn advance_save_and_exit(&mut self, ctx: &egui::Context) {
+        if self.tab_close_confirm.is_some() { return; }
+        if self.save_all_before_exit {
+            if self.has_pending_save() { return; }
+            if !self.finish_pending_edit() {
+                self.save_all_before_exit = false;
+                return;
+            }
+            let owner = if self.wb.dirty {
+                Some(self.active_tab)
+            } else {
+                self.tabs.iter().position(|tab| matches!(tab, TabSlot::Parked(doc) if doc.wb.dirty))
+            };
+            if let Some(owner) = owner {
+                self.save_closing_document(owner, false);
+            } else {
+                self.save_all_before_exit = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        } else if let Some(&uid) = self.pending_tab_closes.first() {
+            if let Some(idx) = self.find_tab_by_uid(uid) {
+                self.save_closing_document(idx, false);
+            } else {
+                self.pending_tab_closes.remove(0);
+            }
+        }
+        if self.save_all_before_exit || !self.pending_tab_closes.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    }
+
+    fn save_closing_document(&mut self, idx: usize, choose_path: bool) {
+        if idx == self.active_tab && !self.finish_pending_edit() {
+            self.save_all_before_exit = false;
+            self.pending_tab_closes.retain(|&uid| uid != self.doc_uid);
+            return;
+        }
+        let (wb, tasks, uid) = match &self.tabs[idx] {
+            TabSlot::Active => (&self.wb, &self.tasks, self.doc_uid),
+            TabSlot::Parked(doc) => (&doc.wb, &doc.tasks, doc.doc_uid),
+        };
+        if tasks.saving.is_some() { return; }
+        if !wb.dirty {
+            self.pending_tab_closes.retain(|&pending| pending != uid);
+            if !self.save_all_before_exit {
+                self.force_close_tab(idx);
+            }
+            return;
+        }
+        let original = wb.path.clone();
+        if !choose_path {
+            if original.as_deref().is_none_or(|path| !sheetcore::xlsx::can_save_to(path)) {
+                self.pause_close(uid, None);
+                return;
+            }
+            if let Some((_, started)) = self.delegated_save_pending.filter(|&(owner, _)| owner == uid) {
+                if started.elapsed() >= std::time::Duration::from_secs(8) {
+                    self.delegated_save_pending = None;
+                    self.pause_close(uid, Some("协作宿主尚未确认保存。请重试或另存副本。".into()));
+                }
+                return;
+            }
+            if idx == self.active_tab && self.is_delegated_collab_client() {
+                if !self.host_receipt_covers_workbook() {
+                    self.pause_close(uid, Some("本地改动超出了宿主可确认的单元格内容，请另存副本。".into()));
+                    return;
+                }
+                if let Some(net) = &self.net {
+                    net.request_save();
+                    self.tasks.autosave_after_detach = Some(false);
+                    self.delegated_save_pending = Some((uid, std::time::Instant::now()));
+                    return;
+                }
+            }
+            let requires_host = if idx == self.active_tab {
+                self.shared_source_requires_host()
+            } else {
+                tasks.autosave_after_detach == Some(false)
+            };
+            if requires_host {
+                self.pause_close(uid, Some("请重新连接协作宿主后保存，或另存为副本。".into()));
+                return;
+            }
+        }
+        let mut paths = self.other_document_paths(idx);
+        // Choosing a rescue copy must never grant permission to overwrite the source.
+        if choose_path {
+            paths.extend(original);
+        }
+        let host = if idx == self.active_tab { self.save_host() } else { None };
+        let result = match &mut self.tabs[idx] {
+            TabSlot::Active => {
+                Self::start_document_save(&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), choose_path, &paths, host)
+            }
+            TabSlot::Parked(doc) => Self::start_document_save(
+                &mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), choose_path, &paths, host),
+        };
+        match result {
+            Ok(_) => {
+                let tasks = match &mut self.tabs[idx] {
+                    TabSlot::Active => &mut self.tasks,
+                    TabSlot::Parked(doc) => &mut doc.tasks,
+                };
+                if let Some(pending) = &mut tasks.saving {
+                    pending.quiet = true;
+                }
+            }
+            Err(error) => {
+                self.pause_close(uid, Some(error));
             }
         }
     }
@@ -11868,6 +11872,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     fn commit_edit(&mut self, advance: Option<(i32, i32)>) -> bool {
         let mut wrote = false;
+        let shared_cells_only = self.only_shared_cell_edits() && self.net.as_ref().is_some_and(|n| !n.hosting)
+            && !self.cse_pending;
+        let link_count = self.wb.links.len();
         // UI-11.6：跨表取引用时视图停在别的表上，提交前先回到编辑所属表与原格
         self.return_to_edit_origin();
         // 编辑结束（或退回重试）都清掉点选引用的细框
@@ -12055,6 +12062,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     .unwrap_or(cell_clone);
                 let op = peer.local_set(self.sheet_idx, r, c, &live_cell);
                 net.broadcast_op(op);
+                if shared_cells_only && self.wb.links.len() == link_count {
+                    self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
+                }
             }
             self.release_lock();
             self.fast_recalc_cells(&[key]);
@@ -17537,8 +17547,7 @@ let txn = self.txn_begin(&keys);
             return;
         }
         let page = self.wb.sheet(self.sheet_idx).page.clone();
-        let dirty = self.wb.sheet(self.sheet_idx).page_dirty;
-        self.page_setup_orig = Some((page.clone(), dirty, self.wb.dirty));
+        self.page_setup_sheet = self.wb.sheet(self.sheet_idx).identity;
         if std::env::var("SC_PAGE_LOG").is_ok() {
             eprintln!(
                 "[page] landscape={} paper={} fit={} w={} h={} scale={} titles={:?} margins={:?}",
@@ -17563,7 +17572,7 @@ let txn = self.txn_begin(&keys);
         }
     }
 
-    /// 把 draft 应用到当前表（预览实时看到）。
+    /// Only an accepted page setup becomes eligible for saving.
     fn apply_page_setup_draft(&mut self) {
         let draft = self.page_setup_draft.clone();
         if self.wb.sheet(self.sheet_idx).page == draft {
@@ -17575,15 +17584,7 @@ let txn = self.txn_begin(&keys);
         self.wb.dirty = true;
     }
 
-    /// 取消页面设置：恢复打开前的 page、page_dirty 和 wb.dirty。
     fn cancel_page_setup(&mut self) {
-        if let Some((page, dirty, wb_dirty)) = self.page_setup_orig.take() {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.page = page;
-            sh.page_dirty = dirty;
-            self.wb.dirty = wb_dirty;
-        }
-        self.page_setup_draft = self.wb.sheet(self.sheet_idx).page.clone();
         self.page_setup_open = false;
         self.status = "已取消页面设置".into();
     }
@@ -17620,16 +17621,14 @@ let txn = self.txn_begin(&keys);
         }
     }
 
-    /// 页面设置对话框：所有控件改 draft；预览每帧用 draft 重算；取消恢复快照。
+    /// Preview the draft while the workbook continues saving committed edits.
     fn page_setup_dialog(&mut self, ctx: &egui::Context) {
         if !self.page_setup_open {
             return;
         }
-        if self.page_setup_orig.is_none() {
-            let page = self.wb.sheet(self.sheet_idx).page.clone();
-            let dirty = self.wb.sheet(self.sheet_idx).page_dirty;
-            self.page_setup_orig = Some((page.clone(), dirty, self.wb.dirty));
-            self.page_setup_draft = page;
+        if self.wb.sheet(self.sheet_idx).identity != self.page_setup_sheet {
+            self.page_setup_open = false;
+            return;
         }
         let sel = self.sel;
         let sel_rect = self.sel_rect();
@@ -17637,7 +17636,7 @@ let txn = self.txn_begin(&keys);
         let printer_cur = self.page_setup_printer.clone();
         let total_pages = sheetcore::print::paginate(
             self.wb.sheet(self.sheet_idx),
-            &self.wb.sheet(self.sheet_idx).page,
+            &self.page_setup_draft,
         )
         .pages
         .len()
@@ -17899,18 +17898,15 @@ let txn = self.txn_begin(&keys);
                 });
             });
 
-        if draft != self.page_setup_draft {
-            self.page_setup_draft = draft.clone();
-            self.apply_page_setup_draft();
-        }
+        self.page_setup_draft = draft;
         self.page_setup_printer = printer;
         self.print_copies = copies;
         self.print_range = range;
         self.print_from = from;
         self.print_to = to;
         if ok {
+            self.apply_page_setup_draft();
             self.page_setup_open = false;
-            self.page_setup_orig = None;
             self.status = "页面设置已应用".into();
             if do_export {
                 self.export_pdf_dialog();
@@ -17965,6 +17961,7 @@ let txn = self.txn_begin(&keys);
             let sh = self.wb.sheet_mut(self.sheet_idx);
             sh.page.header = header;
             sh.page.footer = footer;
+            sh.page_dirty = true;
             self.wb.dirty = true;
             self.hf_dlg = false;
             self.status = "已更新页眉页脚".into();
@@ -31662,6 +31659,15 @@ let txn = self.txn_begin(&keys);
         if self.net.is_none() && self.auto_probe.is_none() {
             return;
         }
+        if let Some(net) = &self.net {
+            self.tasks.autosave_after_detach = if net.hosting {
+                (self.peers_list.len() > 1 && self.wb.dirty).then_some(true)
+            } else if self.guest_can_save_local_copy() {
+                None
+            } else {
+                Some(false)
+            };
+        }
         self.auto_probe = None;
         self.collab_ui_cache = None;
         self.release_lock();
@@ -31749,6 +31755,11 @@ let txn = self.txn_begin(&keys);
     }
 
     fn leave_session(&mut self) {
+        let source = self.wb.path.clone();
+        self.leave_session_at(source.as_deref());
+    }
+
+    fn leave_session_at(&mut self, source: Option<&std::path::Path>) {
         self.auto_share = false;
         self.collab_ui_cache = None;
         self.auto_probe = None;
@@ -31763,11 +31774,9 @@ let txn = self.txn_begin(&keys);
         if let Some(n) = self.net.take() {
             n.shutdown();
         }
-        if let Some(sess) = host_session {
-            if let Some(p) = self.wb.path.clone() {
-                session_lock::remove_for_session(&p, &sess);
-                session_lock::release_election_for(&p, &sess);
-            }
+        if let (Some(sess), Some(path)) = (host_session, source) {
+            session_lock::remove_for_session(path, &sess);
+            session_lock::release_election_for(path, &sess);
         }
         self.peer = None;
         self.remote.clear();
@@ -32218,6 +32227,7 @@ let txn = self.txn_begin(&keys);
             base_hash,
         ) {
             Ok(n) => {
+                self.shared_client_source = self.wb.path.clone().map(|path| (self.doc_uid, path));
                 self.joined_doc = false;
                 self.in_snapshot = false;
                 self.snapshot_is_delta = false;
@@ -32451,7 +32461,7 @@ let txn = self.txn_begin(&keys);
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "未命名.xlsx".into());
         let mut title = name;
-        if self.wb.dirty {
+        if self.wb.dirty || self.tasks.saving.is_some() {
             title.push_str(" *");
         }
         let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
@@ -34227,32 +34237,24 @@ fn elide(s: &str, max_chars: usize) -> String {
     }
 
     /// UI 入口（顶栏文档标签 ×、Ctrl+W、文件菜单/功能区关闭）调用的标签关闭请求：
-    /// 有未保存修改时立即弹出标准「保存 / 不保存 / 取消」确认对话框，绝不无提示直接关掉文档。
+    /// 已命名的工作簿在后台保存成功后关闭，首次选路径和写入失败时保留选择框。
     pub(crate) fn request_close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
         }
-        let saving = if idx == self.active_tab {
-            self.tasks.saving.is_some()
-        } else {
-            matches!(&self.tabs[idx], TabSlot::Parked(doc) if doc.tasks.saving.is_some())
+        let uid = match &self.tabs[idx] {
+            TabSlot::Active => self.doc_uid,
+            TabSlot::Parked(doc) => doc.doc_uid,
         };
-        if saving {
-            self.status = "此文件仍在保存，完成后再关闭标签".into();
+        if self.tab_close_confirm == Some(uid) {
             return;
         }
-        if idx == self.active_tab && !self.finish_pending_edit() {
-            return;
+        if !self.pending_tab_closes.contains(&uid) {
+            self.pending_tab_closes.push(uid);
         }
-        let (dirty, uid) = match &self.tabs[idx] {
-            TabSlot::Active => (self.wb.dirty, self.doc_uid),
-            TabSlot::Parked(doc) => (doc.wb.dirty, doc.doc_uid),
-        };
-        if dirty {
-            self.tab_close_confirm = Some(uid);
-            return;
+        if self.tab_close_confirm.is_none() && self.pending_tab_closes.first() == Some(&uid) {
+            self.save_closing_document(idx, false);
         }
-        self.force_close_tab(idx);
     }
 
     /// 关掉某个标签（供底层测试钩子与二次确认复用）
@@ -34306,7 +34308,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             self.show_start = true;
             self.confirm_close_target = None;
             self.tab_close_confirm = None;
-            self.tab_save_and_close = None;
+            self.pending_tab_closes.clear();
             self.status = "已关闭工作簿".into();
             return;
         }
@@ -34408,6 +34410,9 @@ fn elide(s: &str, max_chars: usize) -> String {
             base_hash,
         ) {
             Ok(n) => {
+                self.shared_client_source = self.wb.path.clone().filter(|_| {
+                    lock.as_ref().is_some_and(|info| info.matches_addr(&n.addr))
+                }).map(|path| (self.doc_uid, path));
                 self.joined_doc = false;
                 self.in_snapshot = false;
                 self.snapshot_is_delta = false;
@@ -34698,6 +34703,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.status = format!("已加入，在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::SnapshotDone => {
+                    let shared_cells_only = self.only_shared_cell_edits();
                     self.in_snapshot = false;
                     self.joined_doc = true;
                     self.deps_pending = false;
@@ -34744,6 +34750,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                     }
                     self.replay_rejoin_outbox();
+                    if shared_cells_only {
+                        self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
+                    }
                 }
                 net::NetEvent::PeerJoined(site, name, color) => {
                     eprintln!("[net] peer joined: {name}#{site}");
@@ -34793,6 +34802,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.status = format!("成员离开，当前在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::Ops(ops) => {
+                    let shared_cells_only = self.only_shared_cell_edits();
                     eprintln!("[net] ops: {}", ops.len());
                     let hosting = self.net.as_ref().map(|n| n.hosting).unwrap_or(false);
                     let is_snapshot = !hosting && (self.in_snapshot || !self.joined_doc);
@@ -34854,6 +34864,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.fast_recalc_cells(&seeds);
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
+                        if !hosting && shared_cells_only {
+                            self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
+                        }
                     }
                 }
                 net::NetEvent::Cursor(c) => {
@@ -34867,7 +34880,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 net::NetEvent::Disconnected(msg) => {
                     eprintln!("[net] disconnected: {msg}");
-                    self.delegated_save_pending = None;
+                    if let Some((uid, _)) = self.delegated_save_pending.take() {
+                        if uid == self.doc_uid { self.tasks.autosave_after_detach = Some(false); }
+                        if self.closing_document(uid) {
+                            self.pause_close(uid, Some("与协作宿主的连接中断，尚未确认保存。请重试或另存副本。".into()));
+                        }
+                    }
                     if !self.joined_doc {
                         // 首次握手即未连通（例如对端防火墙尚未放行）：立即恢复单机无感可编辑态，并向宿主投递防火墙提示
                         if let Some(p) = self.wb.path.clone() {
@@ -34897,7 +34915,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 net::NetEvent::Denied(reason) => {
                     eprintln!("[net] denied: {reason}");
-                    self.delegated_save_pending = None;
+                    if let Some((uid, _)) = self.delegated_save_pending.take() {
+                        if uid == self.doc_uid { self.tasks.autosave_after_detach = Some(false); }
+                        if self.closing_document(uid) {
+                            self.pause_close(uid, Some("与协作宿主的连接中断，尚未确认保存。请重试或另存副本。".into()));
+                        }
+                    }
                     self.status = format!("加入失败：{reason}");
                     // 重连被拒（例如宿主还挂着旧连接的同一站点号）后，自动发现会换新站点重新加入；
                     // 丢掉副本前先把自己的编辑暂存，新会话快照落定后补发
@@ -34910,26 +34933,28 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.joined_doc = false;
                     self.in_snapshot = false;
                 }
-                net::NetEvent::SaveRequested { site: _, name } => {
+                net::NetEvent::SaveRequested { .. } => {
                     if self.net.as_ref().is_some_and(|n| n.hosting) && self.wb.path.is_some() {
                         if self.wb.dirty
                             && self.tasks.saving.is_none()
                             && self.tasks.open_rx.is_none()
                         {
                             let other_paths = self.other_document_paths(self.active_tab);
-                            self.saving_peer_clock = self.peer.as_ref().map(|p| p.clock);
+                            let host = self.save_host();
                             match Self::start_document_save(
                                 &mut self.wb,
                                 &mut self.tasks,
                                 self.load_diag.as_ref(),
                                 false,
                                 &other_paths,
+                                host,
                             ) {
                                 Ok(_) => {
-                                    self.status = format!("正在响应 {name} 同步保存原文件…");
+                                    if let Some(pending) = &mut self.tasks.saving {
+                                        pending.quiet = true;
+                                    }
                                 }
                                 Err(msg) => {
-                                    self.saving_peer_clock = None;
                                     self.status = msg;
                                 }
                             }
@@ -34941,22 +34966,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                     }
                 }
-                net::NetEvent::Saved { clock } => {
-                    let was_waiting = self.delegated_save_pending.take().is_some();
-                    if self.joined_doc
-                        && self.editing.is_none()
-                        && self.pending_edit.is_none()
-                        && self.peer.as_ref().is_none_or(|p| p.clock <= clock)
-                        && (self.wb.dirty || was_waiting)
-                    {
-                        self.wb.dirty = false;
-                        self.status = "原文件已同步保存".into();
-                        if self.tab_save_and_close == Some(self.doc_uid) {
-                            self.tab_save_and_close = None;
-                            self.force_close_tab(self.active_tab);
-                        }
-                    }
-                }
+                net::NetEvent::Saved { clock } => self.receive_host_save(clock),
                 net::NetEvent::Error(msg) => self.status = msg,
             }
         }
@@ -35234,7 +35244,7 @@ impl eframe::App for SheetApp {
         if ctx.cumulative_pass_nr() == 1 && std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[boot] first_frame {:.3}s", since_start());
         }
-        // QA-07.3：后台重算的进度与 Esc 取消；保存中的已用时间
+        // 后台重算显示进度，并支持 Esc 取消。
         {
             use std::sync::atomic::Ordering;
             if let (Some(cancel), Some(done), Some(total)) = (
@@ -35267,15 +35277,6 @@ impl eframe::App for SheetApp {
                         }
                     }
                 }
-            } else if let Some(p) = self.tasks.saving.as_ref() {
-                self.status = format!(
-                    "正在保存到 {}… {:.1}s（窗口可继续操作）",
-                    p.target
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    p.started.elapsed().as_secs_f32()
-                );
             }
         }
         // QA-07.2：滚动帧时延探针（SC_SCROLL_PROBE=1）
@@ -35483,7 +35484,6 @@ impl eframe::App for SheetApp {
             || self.fmt_dlg
             || self.profile_open
             || self.about_open
-            || self.close_confirm_open
             || self.tab_close_confirm.is_some()
             || self.show_load_diag
             || self.xlink_dlg
@@ -35899,7 +35899,7 @@ impl eframe::App for SheetApp {
             self.cycles = sheetcore::errors::find_cycles(&self.wb, self.sheet_idx);
             self.cycles_key = cur_diag_key;
         }
-        let was_saving = self.has_pending_save();
+        self.commit_edit_before_close(ctx);
         self.poll_net();
         self.poll_open();
         self.sync_history();
@@ -35983,7 +35983,6 @@ impl eframe::App for SheetApp {
         self.draw_cf_rule_dlg(ctx);
         self.account_window(ctx);
         self.about_window(ctx);
-        self.close_confirm_dialog(ctx);
         self.tab_close_confirm_dialog(ctx);
         self.zoom_dialog(ctx);
         self.watch_window(ctx);
@@ -36091,9 +36090,9 @@ impl eframe::App for SheetApp {
                     );
                 }
                 let hover_tip = if collab_autosave {
-                    "多人实时协作中：原文件将在停手后自动同步保存，也可随时按 Ctrl+S 立即保存"
+                    "协作编辑由宿主后台保存。Ctrl+S 可立即请求保存。"
                 } else {
-                    "开启后在停止编辑数秒后自动保存原文件（不生成副文件）"
+                    "开启后在后台保存已提交的修改。关闭时仍可按 Ctrl+S 保存，关闭工作簿也会保存。"
                 };
                 if as_resp.on_hover_text(hover_tip).clicked() {
                     self.autosave = !self.autosave;
@@ -37640,7 +37639,6 @@ impl eframe::App for SheetApp {
             }
         }
         self.commit_edit_before_close(ctx);
-        self.defer_close_while_saving(ctx, was_saving);
         self.advance_save_and_exit(ctx);
         // 无系统装饰，自绘 1 物理像素外边框
         let ppp = ctx.pixels_per_point();

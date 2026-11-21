@@ -631,8 +631,8 @@ impl SheetApp {
             for i in 0..self.tabs.len() {
                 let title = self.tab_title(i);
                 let dirty = match &self.tabs[i] {
-                    TabSlot::Active => self.wb.dirty || (i == self.active_tab && self.editing.is_some()),
-                    TabSlot::Parked(d) => d.wb.dirty,
+                    TabSlot::Active => self.wb.dirty || self.tasks.saving.is_some() || self.editing.is_some(),
+                    TabSlot::Parked(d) => d.wb.dirty || d.tasks.saving.is_some(),
                 };
                 tab_metas.push((title, dirty, !self.show_start && i == self.active_tab));
             }

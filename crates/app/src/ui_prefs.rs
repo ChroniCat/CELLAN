@@ -32,7 +32,7 @@ pub struct UiPrefs {
     pub user_name: String,
     /// WPS 聚光灯（阅读模式）开关
     pub spotlight: bool,
-    /// 自动保存开关（开启后文件有改动空闲数秒即自动写回原文件）
+    /// 自动将已提交的编辑写回已有文件。
     pub autosave: bool,
 }
 

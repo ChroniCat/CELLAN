@@ -36,6 +36,7 @@ pub struct PageSpan {
 /// 分页结果
 #[derive(Clone, Debug)]
 pub struct Layout {
+    setup: PageSetup,
     pub pages: Vec<PageSpan>,
     /// 实际缩放（1.0 = 100%）
     pub scale: f32,
@@ -175,7 +176,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     if pages.is_empty() {
         pages.push(PageSpan { rows: (r1, r2), cols: (c1, c2) });
     }
-    Layout { pages, scale, printable, page_size: (pw, ph) }
+    Layout { setup: setup.clone(), pages, scale, printable, page_size: (pw, ph) }
 }
 
 /// 页眉/页脚：`&L &C &R` 分左中右，`&P` 页码、`&N` 总页数、`&&` 一个 &。
@@ -907,7 +908,7 @@ pub fn page_ops_metrics(
     vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
 ) -> Out {
     let sheet = &wb.sheets[sheet_idx];
-    let setup = &sheet.page;
+    let setup = &layout.setup;
     let (pw, ph) = layout.page_size;
     let (ml, mr, mt, mb) = margins_pt(setup);
     let px = layout.scale * 0.75;

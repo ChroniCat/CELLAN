@@ -74,7 +74,7 @@ impl Command {
 // ---------------------------------------------------------------- 谓词
 
 fn can_save(app: &SheetApp) -> bool {
-    !app.show_start && app.tasks.saving.is_none() && app.tasks.open_rx.is_none()
+    !app.show_start && app.tasks.open_rx.is_none()
 }
 
 fn can_shell(app: &SheetApp) -> bool {
@@ -111,7 +111,7 @@ pub const COMMANDS: &[Command] = &[
         shift: true,
         on_start: false,
         in_cell_edit: true,
-        enabled: can_save,
+        enabled: |app| can_save(app) && app.tasks.saving.is_none(),
     },
     Command {
         action: "FileOpen",
@@ -219,7 +219,7 @@ impl SheetApp {
             return None;
         }
         match action {
-            "FileSave" | "FileSaveAs" | "CloseTab" if self.tasks.saving.is_some() => {
+            "FileSaveAs" if self.tasks.saving.is_some() => {
                 Some("正在保存，完成后再试")
             }
             "FileSave" | "FileSaveAs" | "CloseTab" if self.tasks.open_rx.is_some() => {

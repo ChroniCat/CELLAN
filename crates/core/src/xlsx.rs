@@ -1758,6 +1758,9 @@ fn keep_rescue_copy(rollback: &Path, name: &str) -> Option<std::path::PathBuf> {
 /// 保存：原文件带打开密码时，先写明文到临时文件，再加密回目标路径。
 pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     refuse_overwrite_of_source(wb, path)?;
+    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xls")) {
+        return save_atomic(path, wb);
+    }
     write_ooxml(path, wb).map(|_| ())
 }
 
@@ -1900,10 +1903,24 @@ macro_rules! must_save {
     }};
 }
 
+/// The workbook writers can produce OOXML and BIFF8. Other readable formats
+/// must keep their original bytes and be exported to a supported target.
+pub fn can_save_to(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ["xlsx", "xlsm", "xls"].iter().any(|format| ext.eq_ignore_ascii_case(format))
+    })
+}
+
 /// 打开不完整的簿子不许把结果写回它的来源文件。
 /// 放在每个公开保存入口的最前面：另存/原子保存都会先写临时文件，
 /// 只在底层比较临时路径会被整条绕过。
 fn refuse_overwrite_of_source(wb: &Workbook, target: &Path) -> Result<()> {
+    if !can_save_to(target) {
+        anyhow::bail!("无法写入此格式：{}。请另存为 .xlsx、.xlsm 或 .xls 工作簿", target.display());
+    }
+    if wb.path.as_deref().is_some_and(|source| !can_save_to(source) && same_file(source, target)) {
+        anyhow::bail!("请为导入的工作簿另选文件，保留来源文件");
+    }
     if wb.load_incomplete {
         if let Some(orig) = wb.path.as_ref().filter(|p| same_file(p, target)) {
             anyhow::bail!(

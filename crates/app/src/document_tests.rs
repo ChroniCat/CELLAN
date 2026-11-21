@@ -65,10 +65,174 @@ fn autosave_probes_a_foreign_host_only_after_idle_and_backoff() {
     assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     app.tasks.last_edit = Some(Instant::now() - Duration::from_secs(6));
     app.tick_autosave(None);
+    wait_for_background_saves(&mut app);
     assert!(listener.accept().is_ok());
     assert!(app.tasks.saving.is_none() && app.wb.dirty);
+    assert!(app.status.contains("阻止直接覆盖"));
     app.tick_autosave(None);
+    assert!(app.tasks.saving.is_none());
     assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    // A retry delay belongs only to the workbook whose save failed.
+    app.has_open_workbook = true;
+    app.open_in_new_tab(PathBuf::new());
+    let second = env.path("second.xlsx");
+    app.wb.path = Some(second.clone());
+    put(&mut app.wb, 22.0);
+    app.tasks.last_edit = Some(Instant::now() - Duration::from_secs(1));
+    app.tick_autosave(None);
+    wait_for_background_saves(&mut app);
+    assert_eq!(sheetcore::xlsx::load(&second).unwrap().sheets[0].value(0, 0), Value::Number(22.0));
+    drop(listener);
+    session_lock::remove(&path);
+    app.switch_tab(0);
+    app.tasks.autosave_retry_at = Some(Instant::now());
+    app.tick_autosave(None);
+    wait_for_background_saves(&mut app);
+    assert!(path.is_file() && !app.wb.dirty);
+}
+
+fn wait_for_background_saves(app: &mut SheetApp) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.has_pending_save() && Instant::now() < deadline {
+        app.poll_save();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.has_pending_save(), "save worker did not finish");
+}
+
+#[test]
+fn imported_ods_stays_intact_through_autosave_and_manual_save_as() {
+    let env = crate::test_env::TestEnv::new("autosave-ods");
+    let source = env.path("budget.ods");
+    let original = include_bytes!("../../core/tests/fixtures/import-budget.ods");
+    std::fs::write(&source, original).unwrap();
+    let mut app = app();
+    app.autosave = true;
+    app.open_path(source.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+        app.poll_open();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.tasks.busy && !app.wb.load_incomplete);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(25.0));
+    app.begin_edit(Some("80".into()));
+    assert!(app.commit_edit(None));
+    app.tasks.last_edit = Some(Instant::now() - Duration::from_secs(1));
+    app.tick_autosave(None);
+    assert!(app.wb.dirty && !app.has_pending_save());
+    assert!(sheetcore::xlsx::save_atomic(&source, &app.wb).is_err());
+    assert!(sheetcore::xlsx::save(&source, &app.wb).is_err());
+    let copy = env.path("budget.xlsx");
+    env.sc("SC_SAVE_AS", copy.to_str().unwrap());
+    app.save(false);
+    wait_for_background_saves(&mut app);
+    assert_eq!(app.wb.path.as_ref(), Some(&copy));
+    assert_eq!(sheetcore::xlsx::load(&copy).unwrap().sheet(0).value(0, 0), Value::Number(80.0));
+    assert_eq!(sheetcore::xlsx::load(&source).unwrap().sheet(0).value(0, 0), Value::Number(25.0));
+    assert_eq!(std::fs::read(&source).unwrap().as_slice(), original);
+}
+
+#[test]
+fn autosave_guest_writes_its_local_copy_without_writing_host_original() {
+    let env = crate::test_env::TestEnv::new("autosave-local-guest");
+    env.sc("SC_HOST_ADDR", "127.0.0.1");
+    let original = env.path("host.xlsx");
+    let local = env.path("local.xlsx");
+    sheetcore::xlsx::save_atomic(&original, &book(1.0)).unwrap();
+    std::fs::copy(&original, &local).unwrap();
+    let mut host = app();
+    host.wb = sheetcore::xlsx::load(&original).unwrap();
+    host.room_password = "room".into();
+    host.start_host();
+    let address = session_lock::read(&original).unwrap().host;
+    let mut guest = app();
+    guest.autosave = true;
+    guest.wb = sheetcore::xlsx::load(&local).unwrap();
+    guest.room_password = "room".into();
+    guest.join_addr = address;
+    guest.join_shared();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !guest.joined_doc && Instant::now() < deadline {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(guest.joined_doc && !guest.is_delegated_collab_client());
+    guest.begin_edit(Some("99".into()));
+    assert!(guest.commit_edit(None));
+    guest.tasks.last_edit = Some(Instant::now() - Duration::from_secs(1));
+    guest.tick_autosave(None);
+    wait_for_background_saves(&mut guest);
+    assert_eq!(sheetcore::xlsx::load(&local).unwrap().sheet(0).value(0, 0), Value::Number(99.0));
+    assert_eq!(sheetcore::xlsx::load(&original).unwrap().sheet(0).value(0, 0), Value::Number(1.0));
+    guest.leave_session();
+    host.leave_session();
+}
+
+#[test]
+fn autosave_two_successive_cell_commits_reach_disk_promptly() {
+    let env = crate::test_env::TestEnv::new("autosave-wallclock");
+    let path = env.path("budget.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &book(0.0)).unwrap();
+    let mut app = app();
+    app.autosave = true;
+    app.has_open_workbook = true;
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    for (row, amount) in [(0, 125.0), (1, 248.0)] {
+        app.sel = (row, 0);
+        app.sel_end = app.sel;
+        app.begin_edit(Some(amount.to_string()));
+        let started = Instant::now();
+        assert!(app.commit_edit(None));
+        assert!(app.wb.dirty);
+        while app.wb.dirty || app.has_pending_save() {
+            assert!(started.elapsed() < Duration::from_secs(8), "a small workbook took too long to autosave");
+            app.tick_autosave(None);
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let disk = sheetcore::xlsx::load(&path).unwrap();
+        assert_eq!(disk.sheet(0).value(0, 0), Value::Number(125.0));
+        assert_eq!(disk.sheet(0).value(row, 0), Value::Number(amount));
+        eprintln!("autosave A{} commit to disk readback: {} ms", row + 1, started.elapsed().as_millis());
+    }
+}
+
+#[test]
+fn autosave_writes_committed_edits_while_typing_and_after_switching_tabs() {
+    let env = crate::test_env::TestEnv::new("autosave-edit-tabs");
+    let mut app = app();
+    app.autosave = true;
+    app.has_open_workbook = true;
+    let a = env.path("a.xlsx");
+    app.wb.path = Some(a.clone());
+    put(&mut app.wb, 11.0);
+    app.tasks.last_edit = Some(Instant::now());
+    app.tick_autosave(None);
+    assert!(app.tasks.saving.is_none());
+    app.open_in_new_tab(PathBuf::new());
+    let b = env.path("b.xlsx");
+    app.wb.path = Some(b.clone());
+    put(&mut app.wb, 22.0);
+    app.sel = (1, 0);
+    app.sel_end = app.sel;
+    app.begin_edit(Some("uncommitted".into()));
+    // The user keeps committing other edits, so the short debounce never expires.
+    app.tasks.last_edit = Some(Instant::now());
+    app.tasks.autosave_dirty_since = Some(Instant::now() - Duration::from_secs(3));
+    if let TabSlot::Parked(first) = &mut app.tabs[0] {
+        first.tasks.last_edit = Some(Instant::now() - Duration::from_secs(1));
+    }
+    app.tick_autosave(None);
+    assert!(parked(&app, 0).tasks.saving.as_ref().is_some_and(|s| s.quiet));
+    assert!(app.tasks.saving.as_ref().is_some_and(|s| s.quiet));
+    wait_for_background_saves(&mut app);
+    assert_eq!(app.editing.as_ref().unwrap().buf, "uncommitted");
+    assert_eq!(sheetcore::xlsx::load(&a).unwrap().sheets[0].value(0, 0), Value::Number(11.0));
+    let saved = sheetcore::xlsx::load(&b).unwrap();
+    assert_eq!(saved.sheets[0].value(0, 0), Value::Number(22.0));
+    assert!(saved.sheets[0].get(1, 0).is_none());
 }
 
 #[test]
@@ -203,7 +367,8 @@ fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<(sheetcore::x
     app.tasks.saving = Some(document_tasks::PendingSave {
         target: target.into(),
         rx,
-        started: std::time::Instant::now(),
+        quiet: false,
+        host: None,
     });
     app.wb.dirty = false;
     tx
@@ -450,18 +615,22 @@ fn rejected_edit_survives_tab_switch_new_tab_and_save() {
 
 #[test]
 fn failed_save_in_the_close_frame_keeps_the_window_open() {
+    let _env = crate::test_env::TestEnv::new("failed-save-close-frame");
     let mut app = app();
     let tx = delayed_save(&mut app, "a.xlsx");
     app.open_in_new_tab(PathBuf::new());
-    let was_saving = app.has_pending_save();
     tx.send(Err("disk full".into())).unwrap();
-    app.poll_save();
-    assert!(!app.has_pending_save());
     let ctx = egui::Context::default();
     let mut input = egui::RawInput::default();
     input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap()
         .events.push(egui::ViewportEvent::Close);
-    let output = ctx.run(input, |ctx| app.defer_close_while_saving(ctx, was_saving));
+    let output = ctx.run(input, |ctx| {
+        app.commit_edit_before_close(ctx);
+        app.poll_save();
+        app.advance_save_and_exit(ctx);
+    });
+    assert!(!app.has_pending_save());
+    assert_eq!(app.tab_close_confirm, Some(parked(&app, 0).doc_uid));
     assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
         .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
     assert!(parked(&app, 0).wb.dirty);
@@ -508,6 +677,109 @@ fn save_and_exit_refuses_to_overwrite_another_open_document() {
     assert!(!app.has_pending_save() && !app.save_all_before_exit);
     assert!(app.wb.dirty && !path.exists());
     assert!(app.status.contains("其他标签页"));
+}
+
+#[test]
+fn close_named_tab_during_a_save_flushes_later_edits_without_another_click() {
+    let env = crate::test_env::TestEnv::new("close-tab-later-edit");
+    let path = env.path("changing.xlsx");
+    let mut app = app();
+    app.autosave = false;
+    app.wb.path = Some(path.clone());
+    let tx = delayed_save(&mut app, path.to_str().unwrap());
+    app.request_close_tab(0);
+    assert!(app.has_open_workbook && app.tab_close_confirm.is_none());
+    put(&mut app.wb, 45.0);
+    tx.send(Ok((Default::default(), None))).unwrap();
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.has_open_workbook && Instant::now() < deadline {
+        app.poll_save();
+        app.advance_save_and_exit(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.has_open_workbook);
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(45.0));
+}
+
+#[test]
+fn close_window_with_expired_host_request_requires_a_decision_and_keeps_original() {
+    let env = crate::test_env::TestEnv::new("close-host-timeout");
+    let path = env.path("shared.xlsx");
+    sheetcore::xlsx::save_atomic(&path, &book(12.0)).unwrap();
+    let mut app = app();
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    put(&mut app.wb, 99.0);
+    app.shared_client_source = Some((app.doc_uid, path.clone()));
+    app.delegated_save_pending = Some((app.doc_uid, Instant::now() - Duration::from_secs(9)));
+    app.save_all_before_exit = true;
+    app.advance_save_and_exit(&egui::Context::default());
+    assert!(app.wb.dirty && !app.has_pending_save() && !app.save_all_before_exit);
+    assert_eq!(app.tab_close_confirm, Some(app.doc_uid));
+    assert!(app.close_save_error.as_deref().unwrap().contains("宿主"));
+    app.save(false);
+    assert!(app.wb.dirty && !app.has_pending_save() && app.status.contains("宿主"));
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(12.0));
+}
+
+#[test]
+fn native_window_close_commits_the_edit_and_flushes_the_named_file_without_a_prompt() {
+    let env = crate::test_env::TestEnv::new("window-event-close");
+    for autosave in [false, true] {
+        let path = env.path(&format!("auto-{autosave}.xlsx"));
+        let mut app = app();
+        app.autosave = autosave;
+        app.wb.path = Some(path.clone());
+        app.editing = Some(EditState::new("52".into()));
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
+        let closing = ctx.run(raw, |ctx| {
+            app.commit_edit_before_close(ctx);
+            app.advance_save_and_exit(ctx);
+        });
+        assert!(closing.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(app.has_pending_save() && app.tab_close_confirm.is_none());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut closed = false;
+        while !closed && Instant::now() < deadline {
+            app.poll_save();
+            let frame = ctx.run(Default::default(), |ctx| app.advance_save_and_exit(ctx));
+            closed = frame.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(closed && app.tab_close_confirm.is_none());
+        assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(52.0));
+    }
+}
+
+#[test]
+fn close_unnamed_tab_waits_for_its_first_path() {
+    let env = crate::test_env::TestEnv::new("close-new-tab");
+    let path = env.path("first.xlsx");
+    let mut app = app();
+    put(&mut app.wb, 78.0);
+    app.request_close_tab(0);
+    assert_eq!(app.tab_close_confirm, Some(app.doc_uid));
+    assert!(app.wb.dirty && !app.has_pending_save());
+    env.sc("SC_SAVE_AS", path.to_str().unwrap());
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| app.tab_close_confirm_dialog(ctx));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.has_open_workbook && Instant::now() < deadline {
+        app.poll_save();
+        app.advance_save_and_exit(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!app.has_open_workbook);
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(78.0));
 }
 
 #[test]
@@ -1020,6 +1292,12 @@ fn dual_host_guards_block_duplicate_manual_host_resolve_split_brain_and_converge
 
     // 丁在未加入乙会话的情况下直接点保存，必须被拦截以免覆盖乙正在主持的原文件
     rogue_d.save(false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rogue_d.has_pending_save() && Instant::now() < deadline {
+        rogue_d.poll_save();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rogue_d.wb.dirty, "拒绝覆盖后应保留所有未保存的编辑");
     assert!(rogue_d.tasks.saving.is_none(), "离线/已降级实例不得直接覆盖活跃宿主的共享原文件");
     assert!(rogue_d.status.contains("另存为"), "状态栏应提示另存为或先加入会话：{}", rogue_d.status);
 
@@ -1389,7 +1667,7 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
         Value::Number(520.0)
     );
 
-    // 2. 协作者乙继续编辑 A2 且双方均不按 Ctrl+S：停手超过 3.5 秒后宿主自动将新值写回原文件
+    // 2. 协作者乙继续编辑 A2 且双方均不按 Ctrl+S：宿主自动将新值写回原文件
     peer_b.sel = (1, 0);
     peer_b.sel_end = (1, 0);
     peer_b.begin_edit(Some("880".into()));
@@ -1404,7 +1682,6 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
     }
     assert!(host_a.wb.dirty && peer_b.wb.dirty);
     host_a.tasks.last_edit = Some(Instant::now() - Duration::from_secs(4));
-    host_a.last_autosave_attempt = None;
     host_a.tick_autosave(None);
     assert!(host_a.tasks.saving.is_some(), "协作宿主停手后应自动启动后台保存");
 
@@ -1422,8 +1699,82 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
     assert_eq!(reloaded.sheets[0].value(0, 0), Value::Number(520.0));
     assert_eq!(reloaded.sheets[0].value(1, 0), Value::Number(880.0));
 
-    peer_b.leave_session();
-    host_a.leave_session();
+    // A host receipt can acknowledge committed cells while the next input is still a draft.
+    peer_b.sel = (2, 0);
+    peer_b.sel_end = (2, 0);
+    peer_b.begin_edit(Some("42".into()));
+    assert!(peer_b.commit_edit(None));
+    peer_b.sel = (3, 0);
+    peer_b.sel_end = (3, 0);
+    peer_b.begin_edit(Some("73".into()));
+    peer_b.receive_host_save(peer_b.peer.as_ref().unwrap().clock);
+    assert!(!peer_b.wb.dirty && peer_b.editing.as_ref().unwrap().buf == "73");
+    assert_eq!(peer_b.wb.sheet(0).value(3, 0), Value::Empty);
+    peer_b.cancel_edit();
+
+    // The room never transmits page headers. A cell clock cannot acknowledge a header,
+    // even when the same workbook also has a later cell which the room did transmit.
+    peer_b.wb.sheets[0].page.header = "本地页眉".into();
+    peer_b.wb.sheets[0].page_dirty = true;
+    peer_b.wb.dirty = true;
+    peer_b.receive_host_save(u64::MAX);
+    assert!(peer_b.wb.dirty);
+    peer_b.save(false);
+    assert!(peer_b.delegated_save_pending.is_none() && !peer_b.has_pending_save());
+    assert!(peer_b.status.contains("另存为"));
+    peer_b.begin_edit(Some("73".into()));
+    assert!(peer_b.commit_edit(None));
+    peer_b.receive_host_save(u64::MAX);
+    peer_b.request_close_tab(0);
+    assert!(peer_b.wb.dirty && peer_b.has_open_workbook);
+    assert_eq!(peer_b.tab_close_confirm, Some(peer_b.doc_uid));
+    assert!(peer_b.close_save_error.as_ref().unwrap().contains("另存"));
+
+    // The rescue copy now owns its own path. Future receipts for the room must leave it alone.
+    let copy = env.path("client-copy.xlsx");
+    env.sc("SC_SAVE_AS", copy.to_str().unwrap());
+    peer_b.save_closing_document(0, true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while peer_b.has_pending_save() && Instant::now() < deadline {
+        peer_b.poll_save();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(peer_b.wb.path.as_ref(), Some(&copy));
+    assert_eq!(sheetcore::xlsx::load(&copy).unwrap().sheet(0).page.header, "本地页眉");
+    assert!(!peer_b.is_delegated_collab_client());
+    peer_b.wb.dirty = true;
+    peer_b.receive_host_save(u64::MAX);
+    assert!(peer_b.wb.dirty);
+
+    // A guest's parked copy never writes the original after its host leaves,
+    // even if the owner card is gone and local autosave is enabled.
+    let mut parked_guest = app();
+    parked_guest.autosave = true;
+    parked_guest.has_open_workbook = true;
+    parked_guest.wb = sheetcore::xlsx::load(&shared_path).unwrap();
+    parked_guest.try_auto_join();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !parked_guest.joined_doc && Instant::now() < deadline {
+        host_a.poll_net();
+        parked_guest.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(parked_guest.is_delegated_collab_client());
+    put(&mut parked_guest.wb, 777.0);
+    parked_guest.tasks.last_edit = Some(Instant::now() - Duration::from_secs(1));
+    parked_guest.open_in_new_tab(PathBuf::new());
+
+    let host_copy = env.path("host-copy.xlsx");
+    env.sc("SC_SAVE_AS", host_copy.to_str().unwrap());
+    put(&mut host_a.wb, 444.0);
+    host_a.save(true);
+    wait_for_background_saves(&mut host_a);
+    assert!(host_a.net.is_none(), "a different file cannot confirm saves for the original room");
+    assert_eq!(sheetcore::xlsx::load(&host_copy).unwrap().sheet(0).value(0, 0), Value::Number(444.0));
+    assert!(!session_lock::lock_path(&shared_path).exists());
+    parked_guest.tick_autosave(None);
+    assert!(parked(&parked_guest, 0).wb.dirty && !parked_guest.has_pending_save());
+    assert_eq!(sheetcore::xlsx::load(&shared_path).unwrap().sheet(0).value(0, 0), Value::Number(520.0));
 
     // 3. 原文件目录下绝不能残留 .~sheetflow-history、.saving-*、.lock 等副文件
     let names: Vec<String> = std::fs::read_dir(&shared_dir)

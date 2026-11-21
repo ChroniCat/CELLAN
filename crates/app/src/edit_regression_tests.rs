@@ -7860,7 +7860,10 @@ fn sheet_list_search_finds_one_of_many_sheets() {
 /// UI-26：页面设置先作用于预览，取消必须恢复 page/page_dirty/wb.dirty。
 #[test]
 fn page_setup_cancel_restores_everything() {
+    let env = crate::test_env::TestEnv::new("page-preview-save");
     let mut app = app();
+    let path = env.path("preview.xlsx");
+    app.wb.path = Some(path.clone());
     app.wb.dirty = false;
     app.wb.sheet_mut(0).page_dirty = false;
     let before = app.wb.sheet(0).page.clone();
@@ -7875,15 +7878,20 @@ fn page_setup_cancel_restores_everything() {
     app.page_setup_draft.fit_height = 0;
     app.page_setup_draft.row_breaks = vec![8];
     app.page_setup_draft.col_breaks = vec![2];
-    app.apply_page_setup_draft();
-    assert_eq!(app.wb.sheet(0).page.paper, 8, "draft 已进入预览");
-    assert!(app.wb.dirty);
+    assert_eq!(app.wb.sheet(0).page, before);
+    app.wb.sheet_mut(0).set(0, 0, number(128.0));
+    app.wb.dirty = true;
+    app.save(false);
+    wait_save(&mut app);
+    let reloaded = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(reloaded.sheet(0).value(0, 0), Value::Number(128.0));
+    assert_eq!(reloaded.sheet(0).page.landscape, before.landscape);
+    app.wb.dirty = true;
     app.cancel_page_setup();
     assert_eq!(app.wb.sheet(0).page, before, "取消后页面设置完全恢复");
-    assert!(!app.wb.dirty, "取消不能把文档标脏");
+    assert!(app.wb.dirty, "取消草稿不会清除其间发生的其他改动");
     assert!(!app.wb.sheet(0).page_dirty);
     assert!(!app.page_setup_open);
-    assert!(app.page_setup_orig.is_none());
 }
 
 /// UI-26：A4 横向、左右 10mm、首行重复、宽 1 页高自动 + 横纵分页符能一起生效。
@@ -7902,7 +7910,6 @@ fn page_setup_accepts_excel_style_fields() {
     app.page_setup_draft.col_breaks = vec![6];
     app.apply_page_setup_draft();
     app.page_setup_open = false;
-    app.page_setup_orig = None;
     let ps = &app.wb.sheet(0).page;
     assert!(ps.landscape);
     assert_eq!(ps.paper, 9);
@@ -8882,28 +8889,27 @@ fn background_recalc_exposes_progress_and_honours_cancel() {
 }
 
 #[test]
-fn save_progress_carries_a_start_instant() {
+fn ctrl_s_during_a_write_saves_the_next_edit_with_autosave_off() {
+    let (_env, path) = saved_copy("manual-save-again", 1.0);
     let mut app = app();
-    let target = std::env::temp_dir().join(format!(
-        "sc_save_progress_{}.xlsx",
-        std::process::id()
-    ));
-    app.tasks.start_save(&mut app.wb, target.clone());
-    let started = app.tasks.saving.as_ref().map(|p| p.started);
-    assert!(started.is_some(), "保存任务没有开始时间，状态栏算不出已用时间");
-    // 等保存收尾，避免临时文件与线程泄漏到其它测试
-    for _ in 0..400 {
-        if app.tasks.saving.is_none() {
-            break;
-        }
-        if let Some(p) = app.tasks.saving.as_ref() {
-            if p.rx.try_recv().is_ok() {
-                app.tasks.saving = None;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    let _ = std::fs::remove_file(&target);
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.show_start = false;
+    app.autosave = false;
+    let ctx = egui::Context::default();
+    app.wb.sheet_mut(0).set(0, 0, number(2.0));
+    app.wb.dirty = true;
+    assert!(app.command_exec("FileSave", &ctx));
+    assert_eq!(app.status, "正在保存…");
+    app.wb.sheet_mut(0).set(0, 0, number(3.0));
+    app.wb.dirty = true;
+    assert!(app.command_enabled("CloseTab"));
+    assert!(app.command_exec("FileSave", &ctx));
+    assert!(app.tasks.manual_save_queued);
+    wait_save(&mut app);
+    app.tick_autosave(None);
+    wait_save(&mut app);
+    assert_eq!(app.status, "已保存");
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheet(0).value(0, 0), Value::Number(3.0));
 }
 
 fn run_frame(

@@ -1052,11 +1052,16 @@ impl SheetApp {
 
         let (layout, ops, page_no, total, cur_page) = {
             let sheet = self.wb.sheet(self.sheet_idx);
-            let layout = sheetcore::print::paginate(sheet, &sheet.page);
+            let setup = if self.page_setup_open && self.page_setup_sheet == sheet.identity {
+                &self.page_setup_draft
+            } else {
+                &sheet.page
+            };
+            let layout = sheetcore::print::paginate(sheet, setup);
             let total = layout.pages.len().max(1);
             let page_no = self.preview_page.min(total - 1);
             let ops = sheetcore::print::page_ops_with(&self.wb, self.sheet_idx, &layout, page_no, self.wb.path.as_deref());
-            (layout, ops, page_no, total, sheet.page.clone())
+            (layout, ops, page_no, total, setup.clone())
         };
 
         let (pw, ph) = layout.page_size;

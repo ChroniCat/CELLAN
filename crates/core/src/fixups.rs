@@ -681,23 +681,18 @@ pub fn merge_sheet_data(path: &Path, base: &Path, wb: &crate::model::Workbook) -
             }
         }
         // dimension 用新算出来的（行列范围可能变了）
-        if let (Some(ns), Some(ne)) = (nxml.find("<dimension"), nxml.find("/>").filter(|_| false)) {
-            let _ = (ns, ne);
-        }
-        if let Some(nd) = nxml[n_start.saturating_sub(200)..n_start].rfind("<dimension") {
-            let abs = n_start.saturating_sub(200) + nd;
-            let tag_end = nxml[abs..].find("/>").map(|i| abs + i + 2);
-            if let Some(te) = tag_end {
-                if let Some(hs) = head.find("<dimension") {
-                    let he = head[hs..].find("/>").map(|i| hs + i + 2);
-                    if let Some(he) = he {
-                        head.replace_range(hs..he, &nxml[abs..te]);
-                    }
-                }
+        let new_head = &nxml[..n_start];
+        if let (Some(ns), Some(hs)) = (new_head.find("<dimension"), head.find("<dimension")) {
+            if let (Some(ne), Some(he)) = (new_head[ns..].find("/>"), head[hs..].find("/>")) {
+                head.replace_range(hs..hs + he + 2, &new_head[ns..ns + ne + 2]);
             }
         }
-        let merged = format!("{}{}{}", head, &nxml[n_start..n_end], &bxml[b_end..]);
-        pending.push((npart.clone(), merged.into_bytes()));
+        // The writer already produced the right worksheet when only cell data
+        // changed and the surrounding XML matches. Keep that compressed entry.
+        if head != new_head || bxml[b_end..] != nxml[n_end..] {
+            let merged = format!("{}{}{}", head, &nxml[n_start..n_end], &bxml[b_end..]);
+            pending.push((npart.clone(), merged.into_bytes()));
+        }
         done.push(sheet.name.clone());
     }
 
