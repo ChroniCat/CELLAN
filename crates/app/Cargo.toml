@@ -20,6 +20,7 @@ ttf-parser = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = "0.1.52"
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinHttp"] }
 
 [features]
 default = ["wgpu"]

@@ -203,6 +203,7 @@ dependencies = [
  "sha2",
  "sheetcore",
  "ttf-parser",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

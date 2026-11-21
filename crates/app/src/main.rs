@@ -7665,6 +7665,7 @@ impl SheetApp {
                         self.deps_built = true;
                         self.cf_stats_gen = u64::MAX;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.ai_recalculated(gen_at);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -7677,7 +7678,8 @@ impl SheetApp {
     }
 
     fn start_silent_recalc(&mut self, ctx: &egui::Context) {
-        let pending_recalc = !self.wb.calc_manual && self.tasks.recalc_pending();
+        let pending_recalc = !self.wb.calc_manual && self.tasks.recalc_pending()
+            && !self.ai_calculation_in_progress();
         if pending_recalc
             && self.bg_recalc_rx.is_none()
             && !self.tasks.busy
@@ -8254,7 +8256,8 @@ impl SheetApp {
             self.status = "去重区域超过 50 万格，请缩小列范围".into();
             return;
         }
-        let undo_keys = sheetcore::undo::sparse_rect_keys(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
+        // Moving rows can write into previously empty or protected destination cells.
+        let undo_keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         if !self.write_preflight(&undo_keys, "删除重复") {
             return;
         }
@@ -8268,6 +8271,9 @@ impl SheetApp {
         self.txn_end("删除重复", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        if removed != 0 {
+            self.recalc_all_and_deps_adaptive();
+        }
         self.status = if removed == 0 {
             "没有重复行".into()
         } else {
@@ -10976,11 +10982,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     fn finish_sheet_change(&mut self) {
+        // Operations without an inverse can invalidate indices and old formula qualifiers.
+        self.undo = sheetcore::undo::UndoStack::new();
+        self.refresh_after_sheet_change();
+    }
+
+    fn refresh_after_sheet_change(&mut self) {
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.tasks.last_edit = Some(std::time::Instant::now());
-        // These records contain sheet indices or old formula qualifiers.
-        self.undo = sheetcore::undo::UndoStack::new();
         self.clip = None;
         self.recalc_all_and_deps_adaptive();
         self.cf_stats_gen = u64::MAX;
@@ -22334,12 +22344,17 @@ let txn = self.txn_begin(&keys);
 
     fn do_sort(&mut self, col: u32, asc: bool) {
         let (r, c) = self.sel;
-        let (r1, c1, r2, c2) = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+        let region = sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
+        self.sort_region(region, col, asc);
+    }
+
+    fn sort_region(&mut self, region: (u32, u32, u32, u32), col: u32, asc: bool) {
+        let (r1, c1, r2, c2) = region;
         if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 500_000 {
             self.status = "当前连续区域超过 50 万格，请选中具体列范围后再排序".into();
             return;
         }
-        let keys = sheetcore::undo::sparse_rect_keys(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2);
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         if !self.write_preflight_op(&keys, "排序", sheetcore::protection::ProtOp::Sort) {
             return;
         }

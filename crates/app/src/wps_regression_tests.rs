@@ -485,18 +485,14 @@ fn ai_config_defaults_and_roundtrip() {
     assert_eq!(def.display_name, "DeepSeek Local H200");
     assert_eq!(def.base_url, "https://deepseek.hollantex.net/v1");
     assert_eq!(def.model, "deepseek-v4.1-flash");
-    assert_eq!(def.api_key, ai_agent::builtin_api_key());
+    assert!(def.native_tools);
+    assert!(def.api_key.is_empty());
     assert!(!def.data_consent, "默认未确认数据外发");
 
     let dir = crate::test_env::scratch("ai-cfg-test");
-    if ai_agent::has_builtin_key() {
-        let builtin_file = dir.join("builtin_ai.ini");
-        def.save_to(&builtin_file);
-        let raw_ini = std::fs::read_to_string(&builtin_file).unwrap();
-        assert!(raw_ini.contains("api_key=@builtin"), "内置密钥落盘应只写占位符：{raw_ini}");
-        assert!(!raw_ini.contains(ai_agent::builtin_api_key()), "内置密钥不得明文落入 ai.ini");
-        assert_eq!(ai_agent::AiConfig::load_from(&builtin_file), def);
-    }
+    let builtin_file = dir.join("builtin_ai.ini");
+    std::fs::write(&builtin_file, "api_key=@builtin\n").unwrap();
+    assert_eq!(ai_agent::AiConfig::load_from(&builtin_file), def);
 
     let file = dir.join("ai.ini");
     let custom = ai_agent::AiConfig {
@@ -505,6 +501,7 @@ fn ai_config_defaults_and_roundtrip() {
         base_url: "http://127.0.0.1:8080/v1".into(),
         api_key: "secret-key".into(),
         model: "deepseek-v4".into(),
+        native_tools: false,
         data_consent: true,
     };
     custom.save_to(&file);
@@ -559,7 +556,14 @@ fn ai_micro_harness_executes_multi_turn_sse_tool_loop_and_supports_undo() {
                 .map(|hend| String::from_utf8_lossy(&raw[hend..]).to_string())
                 .unwrap_or_default();
             if round_idx == 1 {
-                assert!(body_txt.contains("[工具执行返回]"), "第二轮请求应回传工具观察：{body_txt}");
+                let body: serde_json::Value = serde_json::from_str(&body_txt).unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                let observation = messages.last().unwrap();
+                let call = &messages[messages.len() - 2]["tool_calls"][0];
+                assert_eq!(observation["role"], "tool");
+                assert_eq!(call["function"]["name"], "fill_formula_range");
+                assert_eq!(observation["tool_call_id"], call["id"]);
+                assert!(body["tools"].as_array().is_some_and(|tools| !tools.is_empty()));
                 assert!(body_txt.contains("120"), "工具返回应包含 C3 重算结果 120：{body_txt}");
             }
             let sse_payload = if round_idx == 0 {
@@ -890,10 +894,12 @@ fn ai_aborts_tool_calls_if_user_switches_tab_mid_round() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().unwrap().port();
+    let (accepted, request_arrived) = std::sync::mpsc::channel();
     let srv = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
+        accepted.send(()).unwrap();
         let sse = format!(
             "data: {}\n\ndata: [DONE]\n\n",
             serde_json::json!({
@@ -922,6 +928,7 @@ fn ai_aborts_tool_calls_if_user_switches_tab_mid_round() {
     app.start_ai_prompt("把 A1 改成 999".into());
 
     // 在模型推理尚未返回工具执行阶段前切换到新标签页
+    request_arrived.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     app.open_in_new_tab(PathBuf::new());
 
     let start = std::time::Instant::now();

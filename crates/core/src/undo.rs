@@ -205,11 +205,12 @@ fn next_entry() -> u64 {
 enum Entry {
     Cells(u64, Action),
     Structure(u64, StructureAction),
+    SheetTab(u64, SheetTabAction),
 }
 
 impl Entry {
     fn id(&self) -> u64 {
-        match self { Self::Cells(id, _) | Self::Structure(id, _) => *id }
+        match self { Self::Cells(id, _) | Self::Structure(id, _) | Self::SheetTab(id, _) => *id }
     }
 
     fn simple_deltas(&self) -> Option<&[CellDelta]> {
@@ -222,10 +223,73 @@ impl Entry {
     }
 
     fn label(&self) -> &str {
-        match self { Self::Cells(_, a) => &a.label, Self::Structure(_, a) => &a.label }
+        match self {
+            Self::Cells(_, a) => &a.label,
+            Self::Structure(_, a) => &a.label,
+            Self::SheetTab(_, a) => &a.label,
+        }
     }
     fn by_site(&self) -> u32 {
-        match self { Self::Cells(_, a) => a.by_site, Self::Structure(_, a) => a.by_site }
+        match self {
+            Self::Cells(_, a) => a.by_site,
+            Self::Structure(_, a) => a.by_site,
+            Self::SheetTab(_, a) => a.by_site,
+        }
+    }
+}
+
+struct SheetTabAction {
+    label: String,
+    index: usize,
+    identity: u64,
+    previous_focus: (usize, u32, u32),
+    change: SheetTabChange,
+    by_site: u32,
+}
+
+enum SheetTabChange {
+    Append { removed: Option<Box<Sheet>> },
+    Rename { before: String, after: String, references: crate::sheet_ops::RenameReferences },
+}
+
+impl SheetTabAction {
+    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Option<Applied> {
+        let mut focus = self.previous_focus;
+        match &mut self.change {
+            SheetTabChange::Rename { before, after, references } => {
+                let (expected, restored) = if redo { (before, after) } else { (after, before) };
+                let sheet = wb.sheets.get(self.index)?;
+                if sheet.identity != self.identity || sheet.name != *expected
+                    || !references.restore(wb, self.index, restored, redo)
+                {
+                    return None;
+                }
+            }
+            SheetTabChange::Append { removed } if redo => {
+                if wb.sheets.len() != self.index || wb.sheets.iter().any(|s| {
+                    s.identity == self.identity || removed.as_ref().is_some_and(|r| r.name.eq_ignore_ascii_case(&s.name))
+                }) { return None; }
+                wb.sheets.push(*removed.take()?);
+                focus = (self.index, 0, 0);
+            }
+            SheetTabChange::Append { removed } => {
+                if self.index == 0 || wb.sheets.len() != self.index + 1
+                    || wb.sheets[self.index].identity != self.identity
+                    || wb.names.iter().any(|(_, scope, _)| *scope == Some(self.index))
+                    || wb.pivots_pending.iter().any(|(sheet, ..)| *sheet == self.index)
+                    || wb.pivots_pending2.iter().any(|(sheet, ..)| *sheet == self.index)
+                { return None; }
+                // Pop only the appended sheet. A normal delete rewrites formulas in other
+                // sheets, including unresolved references that existed before this append.
+                *removed = wb.sheets.pop().map(Box::new);
+                wb.calc_pending_sheets.remove(&self.index);
+            }
+        }
+        wb.dirty = true;
+        Some(Applied {
+            touched: Vec::new(), label: self.label.clone(), focus, skipped: 0,
+            structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
+        })
     }
 }
 
@@ -529,11 +593,37 @@ impl UndoStack {
     }
 
     pub fn undo_is_structure(&self) -> bool {
-        matches!(self.done.last(), Some(Entry::Structure(..)))
+        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..)))
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        matches!(self.undone.last(), Some(Entry::Structure(..)))
+        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..)))
+    }
+
+    pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
+        let index = wb.sheets.len() - 1;
+        self.push_sheet_tab(index, wb.sheets[index].identity, previous_focus, "新建工作表",
+            SheetTabChange::Append { removed: None });
+    }
+
+    pub fn rename_sheet(&mut self, wb: &mut Workbook, index: usize, name: &str, focus: (usize, u32, u32)) -> bool {
+        let Some(sheet) = wb.sheets.get(index) else { return false };
+        let before = sheet.name.clone();
+        let identity = sheet.identity;
+        let Some(references) = crate::sheet_ops::rename_with_history(wb, index, name) else { return false };
+        self.push_sheet_tab(index, identity, focus, "重命名工作表",
+            SheetTabChange::Rename { before, after: wb.sheets[index].name.clone(), references });
+        true
+    }
+
+    fn push_sheet_tab(&mut self, index: usize, identity: u64, previous_focus: (usize, u32, u32),
+                      label: &str, change: SheetTabChange) {
+        self.done.push(Entry::SheetTab(next_entry(), SheetTabAction {
+            label: label.into(), index, identity, previous_focus, change, by_site: self.site,
+        }));
+        self.undone.clear();
+        let limit = if self.limit == 0 { 200 } else { self.limit };
+        if self.done.len() > limit { self.done.remove(0); }
     }
 
     pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
@@ -546,6 +636,11 @@ impl UndoStack {
     pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         if !self.undo_is_structure() { return self.undo(&mut wb.sheets, guard); }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
+        if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
+            let applied = action.apply(wb, false)?;
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
+        }
         let Entry::Structure(id, action) = self.done.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.before);
         let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false };
@@ -556,6 +651,11 @@ impl UndoStack {
     pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         if !self.redo_is_structure() { return self.redo(&mut wb.sheets, guard); }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
+        if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
+            let applied = action.apply(wb, true)?;
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
+        }
         let Entry::Structure(id, action) = self.undone.pop()? else { unreachable!() };
         let touched = restore_structure(wb, &action.after);
         let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false };

@@ -2,7 +2,7 @@
 /target/
 /dist/
 
-# Local build-time secrets (compiled into local dist exe, never uploaded to GitHub)
+# Keep legacy local distribution keys out of source control
 /.cellan-ai-key.local
 *.local.key
 
