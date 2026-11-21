@@ -94,6 +94,14 @@ fn external_link_cache_keeps_error_type() {
     let path = dir("xlink").join("book.xlsx");
     let mut wb = Workbook::new_blank();
     wb.links.push(link);
+    wb.sheets[0].set(
+        0,
+        0,
+        Cell {
+            value: Value::Error(ErrKind::Div0),
+            formula: Some("=SUM([1]明细!A1:A2)".into()),
+        },
+    );
     sheetcore::xlsx::save_atomic(&path, &wb).expect("保存失败");
     let back = sheetcore::xlsx::load(&path).expect("载入失败");
     let b = back.links.first().expect("没有读回外链");

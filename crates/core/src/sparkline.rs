@@ -448,6 +448,9 @@ fn esc(s: &str) -> String {
 
 /// 保存收尾：把迷你图写回各表（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.sparklines_dirty) {
+        return Ok(());
+    }
     let targets = crate::patch::sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, (Vec<Sparkline>, String)> =
         std::collections::HashMap::new();
@@ -462,14 +465,18 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     if map.is_empty() {
         return Ok(());
     }
-    crate::patch::rewrite_zip(path, |name, buf| {
-        if let Some((list, sheet_name)) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_sparklines(&xml, list, sheet_name).into_bytes();
+    crate::patch::rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some((list, sheet_name)) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_sparklines(&xml, list, sheet_name).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 #[cfg(test)]

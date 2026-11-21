@@ -7837,7 +7837,7 @@ impl SheetApp {
                     rect: (r, c, r + rows, c + cols),
                     off: [0; 4],
                     part: sheetcore::pic_write::memory_part(&bytes, &ext),
-                    data: Some(bytes),
+                    data: Some(std::sync::Arc::new(bytes)),
                     ext,
                     name,
                 });

@@ -14,43 +14,88 @@ pub enum Shift {
     Horizontal,
 }
 
-fn used(sheet: &Sheet) -> (u32, u32) {
-    sheet
-        .used_bounds()
-        .map(|(_, _, r2, c2)| (r2, c2))
-        .unwrap_or((0, 0))
+fn used(sheet: &Sheet) -> Option<(u32, u32)> {
+    let mut max_r: Option<u32> = None;
+    let mut max_c: Option<u32> = None;
+    let mut bump = |r: u32, c: u32| {
+        max_r = Some(max_r.map_or(r, |m| m.max(r)));
+        max_c = Some(max_c.map_or(c, |m| m.max(c)));
+    };
+    if let Some((_, _, r2, c2)) = sheet.used_bounds() {
+        bump(r2, c2);
+    }
+    for k in sheet.styles.keys() {
+        bump(k.row, k.col);
+    }
+    for k in sheet.notes.keys() {
+        bump(k.row, k.col);
+    }
+    for &(r, c) in sheet.rich.keys() {
+        bump(r, c);
+    }
+    for &(r, c) in sheet.hyperlinks.keys() {
+        bump(r, c);
+    }
+    for &(_, _, r2, c2) in &sheet.merges {
+        bump(r2, c2);
+    }
+    max_r.zip(max_c)
 }
 
-fn take_cell(sheet: &mut Sheet, r: u32, c: u32) -> Option<(crate::model::Cell, Option<u16>)> {
-    let cell = sheet.get(r, c).cloned()?;
-    let st = sheet.styles.get(&CellRef::new(r, c)).copied();
-    Some((cell, st))
-}
-
-fn put_cell(sheet: &mut Sheet, r: u32, c: u32, cell: &crate::model::Cell, st: Option<u16>) {
-    sheet.set(r, c, cell.clone());
-    match st {
-        Some(id) => {
-            sheet.set_style(r, c, id);
-        }
-        None => {
-            sheet.styles.remove(&CellRef::new(r, c));
-        }
+fn clear_slot(sheet: &mut Sheet, pos: (u32, u32)) {
+    sheet.remove(pos.0, pos.1);
+    let k = CellRef::new(pos.0, pos.1);
+    sheet.styles.remove(&k);
+    if sheet.notes.remove(&k).is_some() {
+        sheet.notes_dirty = true;
+    }
+    if sheet.rich.remove(&pos).is_some() {
+        sheet.rich_dirty = true;
+    }
+    if sheet.hyperlinks.remove(&pos).is_some() {
+        sheet.hyperlinks_dirty = true;
     }
 }
 
-fn move_side_maps(sheet: &mut Sheet, from: (u32, u32), to: (u32, u32)) {
-    let k1 = CellRef::new(from.0, from.1);
-    let k2 = CellRef::new(to.0, to.1);
-    if let Some(n) = sheet.notes.remove(&k1) {
-        sheet.notes.insert(k2, n);
+fn move_slot(sheet: &mut Sheet, from: (u32, u32), to: (u32, u32)) {
+    if from == to {
+        return;
     }
+    if let Some(cell) = sheet.get(from.0, from.1).cloned() {
+        sheet.remove(from.0, from.1);
+        sheet.set(to.0, to.1, cell);
+    } else {
+        sheet.remove(to.0, to.1);
+    }
+
+    let k_from = CellRef::new(from.0, from.1);
+    let k_to = CellRef::new(to.0, to.1);
+    if let Some(st) = sheet.styles.remove(&k_from) {
+        sheet.set_style(to.0, to.1, st);
+    } else {
+        sheet.styles.remove(&k_to);
+    }
+
+    if let Some(mut n) = sheet.notes.remove(&k_from) {
+        n.r = to.0;
+        n.c = to.1;
+        sheet.notes.insert(k_to, n);
+        sheet.notes_dirty = true;
+    } else if sheet.notes.remove(&k_to).is_some() {
+        sheet.notes_dirty = true;
+    }
+
     if let Some(v) = sheet.rich.remove(&from) {
         sheet.rich.insert(to, v);
         sheet.rich_dirty = true;
+    } else if sheet.rich.remove(&to).is_some() {
+        sheet.rich_dirty = true;
     }
+
     if let Some(v) = sheet.hyperlinks.remove(&from) {
         sheet.hyperlinks.insert(to, v);
+        sheet.hyperlinks_dirty = true;
+    } else if sheet.hyperlinks.remove(&to).is_some() {
         sheet.hyperlinks_dirty = true;
     }
 }
@@ -60,85 +105,81 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
     if n == 0 {
         return;
     }
-    let (used_r2, used_c2) = used(sheet);
+    let Some((used_r2, used_c2)) = used(sheet) else {
+        return;
+    };
     let (r1, c1, r2, c2) = rect;
     match shift {
         Shift::Vertical => {
-            let c1 = c1.min(used_c2);
-            let c2 = c2.min(used_c2);
-            if c1 > c2 {
+            if c1 > used_c2 {
                 return;
             }
-            for c in c1..=c2 {
-                let mut r = used_r2;
-                loop {
-                    if let Some((cell, st)) = take_cell(sheet, r, c) {
-                        let (cell, st) = (cell.clone(), st);
-                        sheet.remove(r, c);
-                        put_cell(sheet, r + n, c, &cell, st);
-                        move_side_maps(sheet, (r, c), (r + n, c));
+            let c2_eff = c2.min(used_c2);
+            if c1 > c2_eff {
+                return;
+            }
+            for c in c1..=c2_eff {
+                if used_r2 >= r1 {
+                    let mut r = used_r2;
+                    loop {
+                        move_slot(sheet, (r, c), (r + n, c));
+                        if r == r1 {
+                            break;
+                        }
+                        r -= 1;
                     }
-                    if r == r1 {
-                        break;
-                    }
-                    if r == 0 {
-                        break;
-                    }
-                    r -= 1;
                 }
                 // 清出插入的空白带
                 for rr in r1..(r1 + n) {
-                    sheet.remove(rr, c);
-                    sheet.styles.remove(&CellRef::new(rr, c));
-                    sheet.notes.remove(&CellRef::new(rr, c));
-                    sheet.rich.remove(&(rr, c));
-                    sheet.hyperlinks.remove(&(rr, c));
+                    clear_slot(sheet, (rr, c));
                 }
             }
+            let mut merges_changed = false;
             for m in sheet.merges.iter_mut() {
                 if m.0 >= r1 && m.1 >= c1 && m.3 <= c2 {
                     m.0 += n;
                     m.2 += n;
+                    merges_changed = true;
                 }
+            }
+            if merges_changed {
+                sheet.merges_dirty = true;
             }
             let _ = r2;
         }
         Shift::Horizontal => {
-            let r1 = r1.min(used_r2);
-            let r2 = r2.min(used_r2);
-            if r1 > r2 {
+            if r1 > used_r2 {
                 return;
             }
-            for r in r1..=r2 {
-                let mut c = used_c2;
-                loop {
-                    if let Some((cell, st)) = take_cell(sheet, r, c) {
-                        let (cell, st) = (cell.clone(), st);
-                        sheet.remove(r, c);
-                        put_cell(sheet, r, c + n, &cell, st);
-                        move_side_maps(sheet, (r, c), (r, c + n));
+            let r2_eff = r2.min(used_r2);
+            if r1 > r2_eff {
+                return;
+            }
+            for r in r1..=r2_eff {
+                if used_c2 >= c1 {
+                    let mut c = used_c2;
+                    loop {
+                        move_slot(sheet, (r, c), (r, c + n));
+                        if c == c1 {
+                            break;
+                        }
+                        c -= 1;
                     }
-                    if c == c1 {
-                        break;
-                    }
-                    if c == 0 {
-                        break;
-                    }
-                    c -= 1;
                 }
                 for cc in c1..(c1 + n) {
-                    sheet.remove(r, cc);
-                    sheet.styles.remove(&CellRef::new(r, cc));
-                    sheet.notes.remove(&CellRef::new(r, cc));
-                    sheet.rich.remove(&(r, cc));
-                    sheet.hyperlinks.remove(&(r, cc));
+                    clear_slot(sheet, (r, cc));
                 }
             }
+            let mut merges_changed = false;
             for m in sheet.merges.iter_mut() {
                 if m.0 >= r1 && m.2 <= r2 && m.1 >= c1 {
                     m.1 += n;
                     m.3 += n;
+                    merges_changed = true;
                 }
+            }
+            if merges_changed {
+                sheet.merges_dirty = true;
             }
             let _ = c2;
         }
@@ -151,86 +192,78 @@ pub fn delete(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
     if n == 0 {
         return;
     }
-    let (used_r2, used_c2) = used(sheet);
+    let Some((used_r2, used_c2)) = used(sheet) else {
+        return;
+    };
     let (r1, c1, r2, c2) = rect;
     match shift {
         Shift::Vertical => {
-            let c1 = c1.min(used_c2);
-            let c2 = c2.min(used_c2);
-            for c in c1..=c2 {
-                let mut r = r1;
-                while r <= used_r2 {
+            if c1 > used_c2 || r1 > used_r2 {
+                return;
+            }
+            let c2_eff = c2.min(used_c2);
+            for c in c1..=c2_eff {
+                for r in r1..=used_r2 {
                     let src = r + n;
                     if src <= used_r2 {
-                        if let Some((cell, st)) = take_cell(sheet, src, c) {
-                            put_cell(sheet, r, c, &cell, st);
-                            move_side_maps(sheet, (src, c), (r, c));
-                        } else {
-                            sheet.remove(r, c);
-                            sheet.styles.remove(&CellRef::new(r, c));
-                        }
+                        move_slot(sheet, (src, c), (r, c));
                     } else {
-                        sheet.remove(r, c);
-                        sheet.styles.remove(&CellRef::new(r, c));
-                        sheet.notes.remove(&CellRef::new(r, c));
-                        sheet.rich.remove(&(r, c));
-                        sheet.hyperlinks.remove(&(r, c));
+                        clear_slot(sheet, (r, c));
                     }
-                    r += 1;
-                }
-                for rr in (used_r2.saturating_sub(n) + 1)..=used_r2 {
-                    sheet.remove(rr, c);
-                    sheet.styles.remove(&CellRef::new(rr, c));
-                    sheet.notes.remove(&CellRef::new(rr, c));
-                    sheet.rich.remove(&(rr, c));
-                    sheet.hyperlinks.remove(&(rr, c));
                 }
             }
-            for m in sheet.merges.iter_mut() {
-                if m.0 >= r1 && m.1 >= c1 && m.3 <= c2 {
-                    m.0 = m.0.saturating_sub(n);
-                    m.2 = m.2.saturating_sub(n);
+            let before_len = sheet.merges.len();
+            let mut merges_changed = false;
+            sheet.merges.retain_mut(|m| {
+                if m.1 >= c1 && m.3 <= c2 {
+                    if m.0 >= r1 && m.2 < r1 + n {
+                        return false;
+                    }
+                    if m.0 >= r1 + n {
+                        m.0 -= n;
+                        m.2 -= n;
+                        merges_changed = true;
+                    }
                 }
+                true
+            });
+            if merges_changed || sheet.merges.len() != before_len {
+                sheet.merges_dirty = true;
             }
             let _ = r2;
         }
         Shift::Horizontal => {
-            let r1 = r1.min(used_r2);
-            let r2 = r2.min(used_r2);
-            for r in r1..=r2 {
-                let mut c = c1;
-                while c <= used_c2 {
+            if r1 > used_r2 || c1 > used_c2 {
+                return;
+            }
+            let r2_eff = r2.min(used_r2);
+            for r in r1..=r2_eff {
+                for c in c1..=used_c2 {
                     let src = c + n;
                     if src <= used_c2 {
-                        if let Some((cell, st)) = take_cell(sheet, r, src) {
-                            put_cell(sheet, r, c, &cell, st);
-                            move_side_maps(sheet, (r, src), (r, c));
-                        } else {
-                            sheet.remove(r, c);
-                            sheet.styles.remove(&CellRef::new(r, c));
-                        }
+                        move_slot(sheet, (r, src), (r, c));
                     } else {
-                        sheet.remove(r, c);
-                        sheet.styles.remove(&CellRef::new(r, c));
-                        sheet.notes.remove(&CellRef::new(r, c));
-                        sheet.rich.remove(&(r, c));
-                        sheet.hyperlinks.remove(&(r, c));
+                        clear_slot(sheet, (r, c));
                     }
-                    c += 1;
-                }
-                for cc in (used_c2.saturating_sub(n) + 1)..=used_c2 {
-                    sheet.remove(r, cc);
-                    sheet.styles.remove(&CellRef::new(r, cc));
-                    sheet.notes.remove(&CellRef::new(r, cc));
-                    sheet.rich.remove(&(r, cc));
-                    sheet.hyperlinks.remove(&(r, cc));
                 }
             }
-            for m in sheet.merges.iter_mut() {
-                if m.0 >= r1 && m.2 <= r2 && m.1 >= c1 {
-                    m.1 = m.1.saturating_sub(n);
-                    m.3 = m.3.saturating_sub(n);
+            let before_len = sheet.merges.len();
+            let mut merges_changed = false;
+            sheet.merges.retain_mut(|m| {
+                if m.0 >= r1 && m.2 <= r2 {
+                    if m.1 >= c1 && m.3 < c1 + n {
+                        return false;
+                    }
+                    if m.1 >= c1 + n {
+                        m.1 -= n;
+                        m.3 -= n;
+                        merges_changed = true;
+                    }
                 }
+                true
+            });
+            if merges_changed || sheet.merges.len() != before_len {
+                sheet.merges_dirty = true;
             }
             let _ = c2;
         }
@@ -280,5 +313,39 @@ mod tests {
         assert_eq!(sh.value(0, 1), Value::Empty);
         assert_eq!(sh.value(0, 2), Value::Number(1.0));
         assert_eq!(sh.value(0, 3), Value::Number(2.0));
+    }
+
+    #[test]
+    fn insert_and_delete_preserve_notes_on_empty_cells_and_sync_coords() {
+        let mut sh = Sheet::new("t");
+        sh.notes.insert(
+            CellRef::new(1, 0),
+            crate::notes::Note {
+                r: 1,
+                c: 0,
+                text: "空单元格批注".into(),
+                author: "测试员".into(),
+            },
+        );
+        sh.notes_dirty = false;
+
+        insert(&mut sh, (1, 0, 1, 0), Shift::Vertical, 2);
+        assert!(!sh.notes.contains_key(&CellRef::new(1, 0)));
+        let moved = sh.notes.get(&CellRef::new(3, 0)).expect("空单元格上的批注必须随插入下移");
+        assert_eq!((moved.r, moved.c), (3, 0), "Note 内部坐标必须同步更新");
+        assert!(sh.notes_dirty);
+
+        sh.notes_dirty = false;
+        delete(&mut sh, (1, 0, 1, 0), Shift::Vertical, 2);
+        let back = sh.notes.get(&CellRef::new(1, 0)).expect("删除空白带后批注应上移归位");
+        assert_eq!((back.r, back.c), (1, 0));
+        assert!(!sh.notes.contains_key(&CellRef::new(3, 0)));
+        assert!(sh.notes_dirty);
+
+        // 直接删除含批注的空格（下方为空格时）：旧批注必须清除干净，不得残留
+        sh.notes_dirty = false;
+        delete(&mut sh, (1, 0, 1, 0), Shift::Vertical, 1);
+        assert!(sh.notes.is_empty(), "删除含批注单元格后批注不得残留");
+        assert!(sh.notes_dirty);
     }
 }

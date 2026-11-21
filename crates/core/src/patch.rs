@@ -40,13 +40,35 @@ pub fn read_date1904(path: &Path) -> bool {
 
 /// 表名 → zip 内的 worksheet 路径
 pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
+    let staged_here = stage_active_for(path);
+    let (wb_xml_opt, rels_xml_opt) = if staged_here {
+        (
+            crate::fixups::read_part(path, "xl/workbook.xml")
+                .and_then(|b| String::from_utf8(b).ok()),
+            crate::fixups::read_part(path, "xl/_rels/workbook.xml.rels")
+                .and_then(|b| String::from_utf8(b).ok()),
+        )
+    } else {
+        let file = std::fs::File::open(path)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        let wb_xml = zip.by_name("xl/workbook.xml").ok().and_then(|mut f| {
+            let mut s = String::new();
+            let _ = f.read_to_string(&mut s);
+            Some(s)
+        });
+        let rels_xml = zip
+            .by_name("xl/_rels/workbook.xml.rels")
+            .ok()
+            .and_then(|mut f| {
+                let mut s = String::new();
+                let _ = f.read_to_string(&mut s);
+                Some(s)
+            });
+        (wb_xml, rels_xml)
+    };
 
     let mut order: Vec<(String, String)> = Vec::new();
-    if let Ok(mut f) = zip.by_name("xl/workbook.xml") {
-        let mut xml = String::new();
-        let _ = f.read_to_string(&mut xml);
+    if let Some(xml) = wb_xml_opt {
         let mut r = Reader::from_str(&xml);
         loop {
             match r.read_event() {
@@ -73,9 +95,7 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
         }
     }
     let mut targets: HashMap<String, String> = HashMap::new();
-    if let Ok(mut f) = zip.by_name("xl/_rels/workbook.xml.rels") {
-        let mut xml = String::new();
-        let _ = f.read_to_string(&mut xml);
+    if let Some(xml) = rels_xml_opt {
         let mut r = Reader::from_str(&xml);
         loop {
             match r.read_event() {
@@ -113,25 +133,59 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
-/// 重写 zip：对每个 entry 调用 f，返回新内容
-pub fn rewrite_zip<F>(path: &Path, mut f: F) -> Result<()>
+/// 按谓词筛选后重写 zip：不命中的部件直接 raw_copy（零解压、零克隆）；在暂存模式下直接改内存暂存表
+pub fn rewrite_zip_where<P, F>(path: &Path, mut pred: P, mut f: F) -> Result<()>
 where
+    P: FnMut(&str) -> bool,
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
+    if stage_active_for(path) {
+        let names = crate::fixups::entries_of(path);
+        for name in names {
+            if !pred(&name) {
+                continue;
+            }
+            let Some(buf) = crate::fixups::read_part(path, &name) else {
+                continue;
+            };
+            let orig = buf.clone();
+            let updated = f(&name, buf);
+            if updated != orig {
+                stage_put(&name, updated);
+            }
+        }
+        return Ok(());
+    }
     let file = std::fs::File::open(path).with_context(|| format!("打开 {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file)?;
+    let mut any_match = false;
+    for i in 0..zip.len() {
+        let name = zip.by_index_raw(i)?.name().to_string();
+        if pred(&name) {
+            any_match = true;
+            break;
+        }
+    }
+    if !any_match {
+        return Ok(());
+    }
     let tmp = path.with_extension("patchtmp");
+    let mut any_changed = false;
     {
         let out = std::fs::File::create(&tmp)?;
         let mut zw = zip::ZipWriter::new(out);
         for i in 0..zip.len() {
-            let (name, mut buf) = {
+            let name = zip.by_index_raw(i)?.name().to_string();
+            if !pred(&name) {
+                let e = zip.by_index_raw(i)?;
+                zw.raw_copy_file(e)?;
+                continue;
+            }
+            let mut buf = Vec::new();
+            {
                 let mut e = zip.by_index(i)?;
-                let name = e.name().to_string();
-                let mut buf = Vec::new();
                 e.read_to_end(&mut buf)?;
-                (name, buf)
-            };
+            }
             let orig = buf.clone();
             buf = f(&name, buf);
             if buf == orig {
@@ -139,6 +193,7 @@ where
                 let e = zip.by_index_raw(i)?;
                 zw.raw_copy_file(e)?;
             } else {
+                any_changed = true;
                 let opts = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated)
                     .compression_level(Some(4));
@@ -149,11 +204,23 @@ where
         zw.finish()?;
     }
     drop(zip);
+    if !any_changed {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(());
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     Ok(())
+}
+
+/// 重写 zip：对每个 entry 调用 f，返回新内容
+pub fn rewrite_zip<F>(path: &Path, f: F) -> Result<()>
+where
+    F: FnMut(&str, Vec<u8>) -> Vec<u8>,
+{
+    rewrite_zip_where(path, |_| true, f)
 }
 
 // ---------------------------------------------------------------------------
@@ -953,12 +1020,15 @@ pub fn write_manual_hidden(
         let bytes = serde_json::to_vec(map)?;
         format!("\"SCMH1:{}\"", hex_encode(&bytes))
     };
-    rewrite_zip(path, |n, buf| {
-        if n != "xl/workbook.xml" {
-            return buf;
-        }
-        let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
-        let mut out = String::with_capacity(xml.len() + text.len() + 80);
+    rewrite_zip_where(
+        path,
+        |n| n == "xl/workbook.xml",
+        |_, buf| {
+            let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+            if text.is_empty() && !xml.contains(MANUAL_HIDDEN_NAME) {
+                return xml.into_bytes();
+            }
+            let mut out = String::with_capacity(xml.len() + text.len() + 80);
         let mut rest = xml.as_str();
         while let Some(i) = rest.find("<definedName ") {
             out.push_str(&rest[..i]);
@@ -1004,14 +1074,17 @@ pub fn write_manual_hidden(
 pub fn remove_filter_database(path: &Path, sheet_name: &str) -> Result<()> {
     let quoted = format!("'{}'!", sheet_name.replace('\'', "''"));
     let plain = format!("{}!", sheet_name);
-    rewrite_zip(path, |n, buf| {
-        if n != "xl/workbook.xml" {
-            return buf;
-        }
-        let Ok(xml) = String::from_utf8(buf.clone()) else {
-            return buf;
-        };
-        let mut out = String::with_capacity(xml.len());
+    rewrite_zip_where(
+        path,
+        |n| n == "xl/workbook.xml",
+        |_, buf| {
+            let Ok(xml) = String::from_utf8(buf.clone()) else {
+                return buf;
+            };
+            if !xml.contains("_xlnm._FilterDatabase") {
+                return xml.into_bytes();
+            }
+            let mut out = String::with_capacity(xml.len());
         let mut rest = xml.as_str();
         while let Some(i) = rest.find("<definedName ") {
             out.push_str(&rest[..i]);
@@ -1329,8 +1402,13 @@ mod page_tests {
 // 暂存模式：把一批部件改动攒在内存里，最后一次重写打包。
 // 100 MB 的包每重写一次要解压+压缩几十万行 XML，八次就是上百秒。
 // ---------------------------------------------------------------------------
+type StageState = (
+    Option<std::path::PathBuf>,
+    std::collections::HashMap<String, Option<Vec<u8>>>,
+);
+
 thread_local! {
-    static STAGE: std::cell::RefCell<Option<std::collections::HashMap<String, Option<Vec<u8>>>>> =
+    static STAGE: std::cell::RefCell<Option<StageState>> =
         std::cell::RefCell::new(None);
 }
 
@@ -1339,7 +1417,17 @@ pub fn begin_stage() {
     STAGE.with(|s| {
         let mut b = s.borrow_mut();
         if b.is_none() {
-            *b = Some(std::collections::HashMap::new());
+            *b = Some((None, std::collections::HashMap::new()));
+        }
+    });
+}
+
+/// 针对指定目标包开始攒改动：读取其他包（如基准包）时绝不会误命中暂存表
+pub fn begin_stage_for(path: &Path) {
+    STAGE.with(|s| {
+        let mut b = s.borrow_mut();
+        if b.is_none() {
+            *b = Some((Some(path.to_path_buf()), std::collections::HashMap::new()));
         }
     });
 }
@@ -1348,9 +1436,17 @@ pub fn stage_active() -> bool {
     STAGE.with(|s| s.borrow().is_some())
 }
 
+pub fn stage_active_for(path: &Path) -> bool {
+    STAGE.with(|s| match s.borrow().as_ref() {
+        Some((None, _)) => true,
+        Some((Some(p), _)) => p == path,
+        None => false,
+    })
+}
+
 fn stage_put(name: &str, body: Vec<u8>) {
     STAGE.with(|s| {
-        if let Some(m) = s.borrow_mut().as_mut() {
+        if let Some((_, m)) = s.borrow_mut().as_mut() {
             m.insert(name.to_string(), Some(body));
         }
     });
@@ -1358,7 +1454,7 @@ fn stage_put(name: &str, body: Vec<u8>) {
 
 fn stage_del(name: &str) {
     STAGE.with(|s| {
-        if let Some(m) = s.borrow_mut().as_mut() {
+        if let Some((_, m)) = s.borrow_mut().as_mut() {
             m.insert(name.to_string(), None);
         }
     });
@@ -1366,22 +1462,75 @@ fn stage_del(name: &str) {
 
 /// 暂存里有没有这个部件（读的时候要先看这里，否则读到旧内容）
 pub fn staged(name: &str) -> Option<Option<Vec<u8>>> {
-    STAGE.with(|s| s.borrow().as_ref().and_then(|m| m.get(name).cloned()))
+    STAGE.with(|s| s.borrow().as_ref().and_then(|(_, m)| m.get(name).cloned()))
+}
+
+pub fn staged_at(path: &Path, name: &str) -> Option<Option<Vec<u8>>> {
+    STAGE.with(|s| {
+        s.borrow().as_ref().and_then(|(p, m)| match p {
+            Some(target) if target != path => None,
+            _ => m.get(name).cloned(),
+        })
+    })
 }
 
 pub fn staged_names() -> Vec<String> {
     STAGE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|m| m.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).collect())
+            .map(|(_, m)| m.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
     })
+}
+
+pub fn staged_names_at(path: &Path) -> Vec<String> {
+    STAGE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|(p, m)| match p {
+                Some(target) if target != path => None,
+                _ => Some(
+                    m.iter()
+                        .filter(|(_, v)| v.is_some())
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                ),
+            })
+            .unwrap_or_default()
+    })
+}
+
+pub fn staged_deleted_at(path: &Path) -> std::collections::HashSet<String> {
+    STAGE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|(p, m)| match p {
+                Some(target) if target != path => None,
+                _ => Some(
+                    m.iter()
+                        .filter(|(_, v)| v.is_none())
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                ),
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// 异常中断或错误退出时清空线程局部暂存与原样搬运队列，防止污染同线程后续保存
+pub fn clear_stage() {
+    STAGE.with(|s| {
+        let _ = s.borrow_mut().take();
+    });
+    RAW_QUEUE.with(|q| {
+        q.borrow_mut().clear();
+    });
 }
 
 /// 一次性落盘：写入/替换/删除都在这一遍里完成
 pub fn commit_stage(path: &Path) -> Result<usize> {
     use std::io::Write;
-    let Some(map) = STAGE.with(|s| s.borrow_mut().take()) else {
+    let Some((_, map)) = STAGE.with(|s| s.borrow_mut().take()) else {
         return Ok(0);
     };
     if map.is_empty() {
@@ -1439,6 +1588,11 @@ thread_local! {
 
 /// 记一条「从 src 的 A 部件搬到 dst 的 B 部件」
 pub fn stage_raw_copy(src_name: &str, dst_name: &str) {
+    STAGE.with(|s| {
+        if let Some((_, m)) = s.borrow_mut().as_mut() {
+            m.remove(dst_name);
+        }
+    });
     RAW_QUEUE.with(|q| q.borrow_mut().push((src_name.to_string(), dst_name.to_string())));
 }
 
@@ -1452,7 +1606,6 @@ pub fn apply_raw_copies(dst: &Path, src: &Path) -> Result<usize> {
     if items.is_empty() {
         return Ok(0);
     }
-    use std::io::Write;
     let map: std::collections::HashMap<String, String> =
         items.iter().map(|(s, d)| (d.clone(), s.clone())).collect();
     let mut src_zip = zip::ZipArchive::new(std::fs::File::open(src)?)?;
@@ -1508,7 +1661,7 @@ pub fn apply_raw_copies(dst: &Path, src: &Path) -> Result<usize> {
 }
 
 pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
-    if stage_active() {
+    if stage_active_for(path) {
         stage_put(name, body.to_vec());
         return Ok(());
     }
@@ -1551,7 +1704,10 @@ pub fn append_entry(path: &Path, name: &str, body: &[u8]) -> Result<()> {
 
 /// 一次重写搞定「写入/替换多个部件」——逐条 append_entry 会把整个包重写 N 遍
 pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
-    if stage_active() {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if stage_active_for(path) {
         for (n, b) in items {
             stage_put(n, b.clone());
         }
@@ -1599,34 +1755,40 @@ pub fn append_entries(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
 
 /// 一次重写删掉多个条目
 pub fn remove_entries(path: &Path, names: &[String]) -> Result<()> {
-    use std::io::{Read, Write};
     if names.is_empty() {
+        return Ok(());
+    }
+    if stage_active_for(path) {
+        for n in names {
+            stage_del(n);
+        }
         return Ok(());
     }
     let to_drop: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
+    let mut any_found = false;
+    for i in 0..zip.len() {
+        let n = zip.by_index_raw(i)?.name().to_string();
+        if to_drop.contains(n.as_str()) {
+            any_found = true;
+            break;
+        }
+    }
+    if !any_found {
+        return Ok(());
+    }
     let tmp = path.with_extension("rmtmp");
     {
         let out = std::fs::File::create(&tmp)?;
         let mut zw = zip::ZipWriter::new(out);
-        let opts = || {
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
-                .compression_level(Some(4))
-        };
         for i in 0..zip.len() {
-            let (n, buf) = {
-                let mut e = zip.by_index(i)?;
-                let n = e.name().to_string();
-                let mut b = Vec::new();
-                e.read_to_end(&mut b)?;
-                (n, b)
-            };
+            let n = zip.by_index_raw(i)?.name().to_string();
             if to_drop.contains(n.as_str()) {
                 continue;
             }
-            zw.start_file(n.clone(), opts())?;
-            zw.write_all(&buf)?;
+            let e = zip.by_index_raw(i)?;
+            zw.raw_copy_file(e)?;
         }
         zw.finish()?;
     }
@@ -1652,40 +1814,7 @@ pub fn has_entry(path: &Path, name: &str) -> bool {
 }
 
 pub fn remove_entry(path: &Path, name: &str) -> Result<()> {
-    if stage_active() {
-        stage_del(name);
-        return Ok(());
-    }
-    use std::io::{Read, Write};
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let tmp = path.with_extension("rmtmp");
-    {
-        let out = std::fs::File::create(&tmp)?;
-        let mut zw = zip::ZipWriter::new(out);
-        let opts = || {
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
-                .compression_level(Some(4))
-        };
-        for i in 0..zip.len() {
-            let (n, buf) = {
-                let mut e = zip.by_index(i)?;
-                let n = e.name().to_string();
-                if n == name {
-                    continue;
-                }
-                let mut b = Vec::new();
-                e.read_to_end(&mut b)?;
-                (n, b)
-            };
-            zw.start_file(n, opts())?;
-            zw.write_all(&buf)?;
-        }
-        zw.finish()?;
-    }
-    drop(zip);
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    remove_entries(path, &[name.to_string()])
 }
 
 /// 读 workbook.xml 里的自定义名称（不含 _xlnm.* 这些内置名）
@@ -2009,24 +2138,25 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
     }
     append_entries(path, &pending)?;
     if !ct_additions.is_empty() {
-        rewrite_zip(path, |n, buf| {
-            if n != "[Content_Types].xml" {
-                return buf;
-            }
-            let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
-            let mut x = xml;
-            for (part, ct) in ct_additions.iter() {
-                let marker = format!("/{part}");
-                if x.contains(&marker) {
-                    continue;
+        rewrite_zip_where(
+            path,
+            |n| n == "[Content_Types].xml",
+            |_, buf| {
+                let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
+                let mut x = xml;
+                for (part, ct) in ct_additions.iter() {
+                    let marker = format!("/{part}");
+                    if x.contains(&marker) {
+                        continue;
+                    }
+                    let line = format!("<Override PartName=\"{marker}\" ContentType=\"{ct}\"/>");
+                    if let Some(i) = x.rfind("</Types>") {
+                        x.insert_str(i, &line);
+                    }
                 }
-                let line = format!("<Override PartName=\"{marker}\" ContentType=\"{ct}\"/>");
-                if let Some(i) = x.rfind("</Types>") {
-                    x.insert_str(i, &line);
-                }
-            }
-            x.into_bytes()
-        })?;
+                x.into_bytes()
+            },
+        )?;
     }
     Ok(restored)
 }
@@ -2236,6 +2366,12 @@ pub fn set_row_sizes(xml: &str, wanted: &[(u32, Option<f32>, bool)]) -> String {
     }
     let mut pending: Vec<(u32, Option<f32>, bool)> = wanted.to_vec();
     pending.sort_by_key(|x| x.0);
+    let mut by_row1: std::collections::HashMap<u32, (Option<f32>, bool)> =
+        std::collections::HashMap::with_capacity(pending.len());
+    for &(r, ht, hid) in &pending {
+        by_row1.insert(r + 1, (ht, hid));
+    }
+    let mut idx = 0usize;
     let mut out = String::with_capacity(xml.len() + wanted.len() * 48);
     let mut rest = xml;
     while let Some(i) = rest.find("<row ") {
@@ -2253,18 +2389,22 @@ pub fn set_row_sizes(xml: &str, wanted: &[(u32, Option<f32>, bool)]) -> String {
             }
         }
         out.push_str(&rest[..i]);
-        // 这一行之前的缺行先补上（按行号顺序）
-        while let Some(front) = pending.first().cloned() {
+        // 这一行之前的缺行先补上（按行号顺序，游标单向推进 O(1)）
+        while idx < pending.len() {
+            let front = pending[idx];
             if front.0 + 1 < row_no {
-                out.push_str(&stub(front.0, front.1, front.2));
-                pending.remove(0);
+                if by_row1.remove(&(front.0 + 1)).is_some() {
+                    out.push_str(&stub(front.0, front.1, front.2));
+                }
+                idx += 1;
             } else {
                 break;
             }
         }
-        let hit = pending.iter().position(|(r, _, _)| r + 1 == row_no);
-        if let Some(p) = hit {
-            let (_, ht, hidden) = pending.remove(p);
+        while idx < pending.len() && pending[idx].0 + 1 == row_no {
+            idx += 1;
+        }
+        if let Some((ht, hidden)) = by_row1.remove(&row_no) {
             let mut set: Vec<(&str, String)> = Vec::new();
             if let Some(h) = ht {
                 set.push(("ht", format!("{:.2}", h * 72.0 / 96.0)));
@@ -2298,42 +2438,71 @@ pub fn set_row_sizes(xml: &str, wanted: &[(u32, Option<f32>, bool)]) -> String {
     // 剩下的缺行插在 </sheetData> 前
     if let Some(i) = rest.find("</sheetData>") {
         out.push_str(&rest[..i]);
-        for (r, ht, hidden) in &pending {
-            out.push_str(&stub(*r, *ht, *hidden));
+        for &(r, ht, hidden) in &pending[idx..] {
+            if by_row1.remove(&(r + 1)).is_some() {
+                out.push_str(&stub(r, ht, hidden));
+            }
         }
         out.push_str(&rest[i..]);
     } else {
         out.push_str(rest);
-        for (r, ht, hidden) in &pending {
-            out.push_str(&stub(*r, *ht, *hidden));
+        for &(r, ht, hidden) in &pending[idx..] {
+            if by_row1.remove(&(r + 1)).is_some() {
+                out.push_str(&stub(r, ht, hidden));
+            }
         }
     }
     out
 }
 
-/// 给 <row>/<col> 补 outlineLevel（分级显示）。只加属性，不改已有内容。
+/// 给 <row>/<col> 补 outlineLevel（分级显示）。单遍流式扫描，避免几千行分级时二次方 memmove。
 pub fn apply_outline(xml: &str, rows: &[(u32, u8)], cols: &[(u32, u8)]) -> String {
-    let mut x = xml.to_string();
-    for (r, lv) in rows {
-        if *lv == 0 {
-            continue;
-        }
-        let needle = format!("<row r=\"{}\"", r + 1);
-        if let Some(i) = x.find(&needle) {
-            if let Some(gt) = x[i..].find('>') {
-                let end = i + gt;
-                if !x[i..end].contains("outlineLevel=") {
-                    // 自闭合标签要插在 "/>" 之前，否则会写出 `.../> outlineLevel="1">` 这种坏 XML
-                    let at = if x[i..end].trim_end().ends_with('/') {
-                        end - 1
+    let row_map: std::collections::HashMap<u32, u8> = rows
+        .iter()
+        .filter(|(_, lv)| *lv > 0)
+        .map(|(r, lv)| (r + 1, *lv))
+        .collect();
+    let mut x = if row_map.is_empty() {
+        xml.to_string()
+    } else {
+        let mut out = String::with_capacity(xml.len() + row_map.len() * 18);
+        let mut rest = xml;
+        while let Some(i) = rest.find("<row ") {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            let Some(gt) = tail.find('>') else {
+                out.push_str(tail);
+                rest = "";
+                break;
+            };
+            let tag = &tail[..=gt];
+            let r_num = tag.find(" r=\"").and_then(|p| {
+                let after = &tag[p + 4..];
+                let q = after.find('"')?;
+                after[..q].parse::<u32>().ok()
+            });
+            if let Some(lv) = r_num.and_then(|rn| row_map.get(&rn).copied()) {
+                if !tag.contains("outlineLevel=") {
+                    let inner = &tag[..gt];
+                    if inner.trim_end().ends_with('/') {
+                        let slash = inner.rfind('/').unwrap_or(gt);
+                        out.push_str(&tag[..slash]);
+                        out.push_str(&format!(" outlineLevel=\"{lv}\"/>"));
                     } else {
-                        end
-                    };
-                    x.insert_str(at, &format!(" outlineLevel=\"{lv}\""));
+                        out.push_str(inner);
+                        out.push_str(&format!(" outlineLevel=\"{lv}\">"));
+                    }
+                } else {
+                    out.push_str(tag);
                 }
+            } else {
+                out.push_str(tag);
             }
+            rest = &tail[gt + 1..];
         }
-    }
+        out.push_str(rest);
+        out
+    };
     for (c, lv) in cols {
         if *lv == 0 {
             continue;
@@ -2464,6 +2633,9 @@ pub fn set_outline_pr(xml: &str, below: bool, right: bool, symbols: bool) -> Str
 
 /// 保存收尾：把分级设置写回各表
 pub fn apply_outline_pr(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.outline_pr_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, (bool, bool, bool)> =
         std::collections::HashMap::new();
@@ -2485,18 +2657,25 @@ pub fn apply_outline_pr(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some((b, r, sym)) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_outline_pr(&xml, *b, *r, *sym).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some((b, r, sym)) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_outline_pr(&xml, *b, *r, *sym).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 保存收尾：把方案列表写回各表（`<scenarios>`）
 pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.scenarios_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, Vec<crate::scenarios::Scenario>> =
         std::collections::HashMap::new();
@@ -2511,18 +2690,25 @@ pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> a
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(list) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return crate::scenarios::set_scenarios(&xml, list).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(list) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return crate::scenarios::set_scenarios(&xml, list).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 保存收尾：把忽略错误列表写回各表
 pub fn apply_ignored_errors(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.ignored_errors_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, Vec<(u32, u32)>> = std::collections::HashMap::new();
     for s in &wb.sheets {
@@ -2538,18 +2724,25 @@ pub fn apply_ignored_errors(path: &std::path::Path, wb: &crate::model::Workbook)
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(cells) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_ignored_errors(&xml, cells).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(cells) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_ignored_errors(&xml, cells).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 保存收尾：把列宽/行高/隐藏状态补进 sheet XML
 pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.layout_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, (Vec<(u32, f32, bool)>, Vec<(u32, Option<f32>, bool)>)> =
         std::collections::HashMap::new();
@@ -2599,19 +2792,23 @@ pub fn apply_layout(path: &std::path::Path, wb: &crate::model::Workbook) -> anyh
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some((cols, rows)) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                let mut x = set_cols_xml(&xml, cols);
-                x = set_row_sizes(&x, rows);
-                if let Some((cl, rl)) = outline.get(name) {
-                    x = apply_outline(&x, rl, cl);
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some((cols, rows)) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    let mut x = set_cols_xml(&xml, cols);
+                    x = set_row_sizes(&x, rows);
+                    if let Some((cl, rl)) = outline.get(name) {
+                        x = apply_outline(&x, rl, cl);
+                    }
+                    return x.into_bytes();
                 }
-                return x.into_bytes();
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 写工作表标签颜色；None 表示删除颜色
@@ -2662,6 +2859,9 @@ pub fn set_tab_color(xml: &str, rgb: Option<[u8; 3]>) -> String {
 
 /// 保存收尾：只给改过颜色的表写 <sheetPr><tabColor>
 pub fn apply_tab_colors(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.tab_color_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, Option<[u8; 3]>> = std::collections::HashMap::new();
     for s in &wb.sheets {
@@ -2674,14 +2874,18 @@ pub fn apply_tab_colors(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(c) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_tab_color(&xml, *c).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(c) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_tab_color(&xml, *c).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 和 rewrite_zip 一样，但可以丢弃指定的部件（删除表格/图片等用）
@@ -2754,6 +2958,9 @@ pub fn set_sheet_protection(
 
 /// 保存收尾：只给改过保护状态的表写 <sheetProtection>
 pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.protect_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<
         String,
@@ -2769,14 +2976,18 @@ pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(p) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_sheet_protection(&xml, p.as_ref()).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(p) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_sheet_protection(&xml, p.as_ref()).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 页面设置写回：printOptions / pageMargins / pageSetup 三个元素
@@ -2933,6 +3144,9 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
 
 /// 保存收尾：只给改过页面设置的表写回
 pub fn apply_page_setup(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.page_dirty) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<String, crate::page::PageSetup> =
         std::collections::HashMap::new();
@@ -2946,18 +3160,25 @@ pub fn apply_page_setup(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(p) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return set_page_setup(&xml, p).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(p) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return set_page_setup(&xml, p).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 保存收尾：把改过的富文本单元格写成 inlineStr
 pub fn apply_rich(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.rich_dirty && !s.rich.is_empty()) {
+        return Ok(());
+    }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<
         String,
@@ -2973,14 +3194,18 @@ pub fn apply_rich(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip(path, |name, buf| {
-        if let Some(cells) = map.get(name) {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return crate::richtext::patch_sheet_rich(&xml, cells).into_bytes();
+    rewrite_zip_where(
+        path,
+        |name| map.contains_key(name),
+        |name, buf| {
+            if let Some(cells) = map.get(name) {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    return crate::richtext::patch_sheet_rich(&xml, cells).into_bytes();
+                }
             }
-        }
-        buf
-    })
+            buf
+        },
+    )
 }
 
 /// 读 workbook.xml 里每张表的可见性：true = hidden
@@ -3022,7 +3247,7 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
     if want.is_empty() {
         return Ok(());
     }
-    let Some(xml) = crate::fixups::read_part_file(path, "xl/workbook.xml")
+    let Some(xml) = crate::fixups::read_part(path, "xl/workbook.xml")
         .and_then(|b| String::from_utf8(b).ok())
     else {
         return Ok(());

@@ -12,7 +12,7 @@ fn wb_with(off: [i64; 4]) -> Workbook {
         rect: (1, 1, 3, 4),
         off,
         part: "xl/media/image1.png".into(),
-        data: Some(b"not-a-real-png".to_vec()),
+        data: Some(std::sync::Arc::new(b"not-a-real-png".to_vec())),
         ext: "png".into(),
         name: "图片 1".into(),
     });

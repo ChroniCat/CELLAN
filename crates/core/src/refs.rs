@@ -162,7 +162,7 @@ fn parse_row_ref(b: &[u8], start: usize, sh: &Shift, qualified: Option<&str>) ->
         i += 1;
     }
     let r2 = row_index(&b[second..i])?;
-    if b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+    if b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$' || *c == b'!') {
         return None;
     }
     if !shift_applies(sh, qualified) || (sh.translate.is_none() && sh.axis != Axis::Row) {
@@ -226,7 +226,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &Shift, qualified_sheet: Option<&str>) 
                 j += 1;
             }
             if j > ls2 && j - ls2 <= 3 {
-                if b.get(j).is_some_and(|c| is_ident_byte(*c) || *c == b'$') {
+                if b.get(j).is_some_and(|c| is_ident_byte(*c) || *c == b'$' || *c == b'!') {
                     return None;
                 }
                 if let (Some(c1), Some(c2)) = (col_index(letters), col_index(&b[ls2..j])) {
@@ -398,6 +398,80 @@ pub fn translate(formula: &str, dr: i64, dc: i64, sheet: &str) -> String {
     rewrite(formula, &sh)
 }
 
+/// 跳过 `[Book]...` 外部限定符（含 `[1]!`、`[1]Sheet!`、`[1]First:Third!`、`[1]'First':'Third'!`），
+/// 只有结尾确实跟 `!` 才返回 bang 后的位置；否则可能是结构化表列引用（`Table1[Col]`），返回 `None`。
+fn consume_ext_qualifier(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i;
+    let mut depth = 0usize;
+    while j < b.len() {
+        if b[j] == b'[' {
+            depth += 1;
+        } else if b[j] == b']' {
+            depth -= 1;
+        }
+        j += 1;
+        if depth == 0 {
+            break;
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    if b.get(j) == Some(&b'!') {
+        return Some(j + 1);
+    }
+    let skip_sheet = |idx: usize| -> usize {
+        if b.get(idx) == Some(&b'\'') {
+            quoted_end(b, idx, b'\'')
+        } else {
+            let mut k = idx;
+            while b.get(k).is_some_and(|c| is_ident_byte(*c)) {
+                k += 1;
+            }
+            k
+        }
+    };
+    j = skip_sheet(j);
+    if b.get(j) == Some(&b':') {
+        j = skip_sheet(j + 1);
+    }
+    (b.get(j) == Some(&b'!')).then_some(j + 1)
+}
+
+/// 跳过单引号包住书名/表名的外部限定符（如 `'[1]First:Third'!` 或 `'[1]First 1':'Third 3'!`）。
+fn consume_quoted_ext_qualifier(b: &[u8], formula: &str, i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'\'') {
+        return None;
+    }
+    let qe = quoted_end(b, i, b'\'');
+    if qe <= i + 1 || b.get(qe - 1) != Some(&b'\'') {
+        return None;
+    }
+    if !formula[i + 1..qe - 1].contains('[') {
+        return None;
+    }
+    if b.get(qe) == Some(&b'!') {
+        return Some(qe + 1);
+    }
+    if b.get(qe) == Some(&b':') {
+        let mut j = qe + 1;
+        if b.get(j) == Some(&b'\'') {
+            j = quoted_end(b, j, b'\'');
+        } else {
+            while b.get(j).is_some_and(|c| is_ident_byte(*c)) {
+                j += 1;
+            }
+        }
+        if b.get(j) == Some(&b'!') {
+            return Some(j + 1);
+        }
+    }
+    None
+}
+
 /// 改写一条公式（不带前导 `=` 也可以）
 pub fn rewrite(formula: &str, sh: &Shift) -> String {
     let b = formula.as_bytes();
@@ -422,6 +496,13 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
                 i += 1;
             }
             out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        // 带引号的外部限定符：'[1]Sheet1'! / '[1]First:Third'!
+        if let Some(after_bang) = consume_quoted_ext_qualifier(b, formula, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            qual = Some("\0EXT".into());
+            i = after_bang;
             continue;
         }
         // 带引号的表名：'Sheet 1'!
@@ -451,6 +532,13 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
                 out.push(b'!');
                 i += 1;
             }
+            continue;
+        }
+        // 外部限定符 `[1]First:Third!` / `[1]Sheet1!`：复制粘贴平移其后的 A1，结构 edits 不动外部引用。
+        if let Some(after_bang) = consume_ext_qualifier(b, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            qual = Some("\0EXT".into());
+            i = after_bang;
             continue;
         }
         // 表格列名和外部工作簿名中的 A1 等字样不是单元格引用。
@@ -601,6 +689,16 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
         if b[i] == b'"' {
             i = quoted_end(b, i, b'"');
             out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        if let Some(after_bang) = consume_quoted_ext_qualifier(b, formula, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            i = after_bang;
+            continue;
+        }
+        if let Some(after_bang) = consume_ext_qualifier(b, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            i = after_bang;
             continue;
         }
         if b[i] == b'[' {
@@ -758,6 +856,16 @@ pub fn retarget_3d_endpoint(formula: &str, old: &str, order: &[String]) -> Strin
         if b[i] == b'"' {
             i = quoted_end(b, i, b'"');
             out.extend_from_slice(&b[start..i]);
+            continue;
+        }
+        if let Some(after_bang) = consume_quoted_ext_qualifier(b, formula, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            i = after_bang;
+            continue;
+        }
+        if let Some(after_bang) = consume_ext_qualifier(b, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            i = after_bang;
             continue;
         }
         if let Some((after_bang, a, z, _qe)) = scan_quoted_3d(b, formula, i) {

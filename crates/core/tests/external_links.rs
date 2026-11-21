@@ -300,3 +300,174 @@ fn typed_formula_creates_link_and_parts() {
     );
 }
 
+#[test]
+fn external_three_d_range_lookup_defined_names_refresh_and_break_link() {
+    let dir = tmpdir("ext3d_all");
+    let src_path = dir.join("预算.xlsx");
+    let aux_path = dir.join("汇率.xlsx");
+
+    // 源工作簿 1：三张连续表 First / Second / Third，含区域、查找表与自定义名称
+    let mut src = Workbook::new_blank();
+    src.sheets[0].name = "First".into();
+    src.sheets.push(sheetcore::model::Sheet::new("Second"));
+    src.sheets.push(sheetcore::model::Sheet::new("Third"));
+    src.sheets[0].set(0, 0, cell(Value::Number(10.0), None));
+    src.sheets[0].set(0, 1, cell(Value::Number(5.0), None));
+    src.sheets[0].set(1, 0, cell(Value::Text("A100".into()), None));
+    src.sheets[0].set(1, 1, cell(Value::Number(88.0), None));
+    src.sheets[1].set(0, 0, cell(Value::Number(20.0), None));
+    src.sheets[1].set(0, 1, cell(Value::Number(15.0), None));
+    src.sheets[2].set(0, 0, cell(Value::Number(30.0), None));
+    src.sheets[2].set(0, 1, cell(Value::Number(25.0), None));
+    src.names.push(("TaxRate".into(), None, "=0.15".into()));
+    src.names.push(("LocalVal".into(), Some(0), "=First!$A$1".into()));
+    src.names_dirty = true;
+    sheetcore::xlsx::save(&src_path, &src).expect("写多表源工作簿");
+
+    // 源工作簿 2：辅助链接，验证断开第一个链接后 [2] 重排为 [1]
+    let mut aux = Workbook::new_blank();
+    aux.sheets[0].name = "Rate".into();
+    aux.sheets[0].set(0, 0, cell(Value::Number(7.2), None));
+    sheetcore::xlsx::save(&aux_path, &aux).expect("写第二个源工作簿");
+
+    let main_path = dir.join("总表.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.path = Some(main_path.clone());
+    wb.sheets[0].name = "汇总".into();
+    wb.links.push(sheetcore::xlinks::ExternalBook {
+        index: 1,
+        target: "预算.xlsx".into(),
+        ..Default::default()
+    });
+    wb.links.push(sheetcore::xlinks::ExternalBook {
+        index: 2,
+        target: "汇率.xlsx".into(),
+        ..Default::default()
+    });
+    let rep = sheetcore::xlinks::refresh(&mut wb);
+    assert_eq!(rep.ok, 2, "刷新失败: {:?}", rep.failed);
+    assert_eq!(wb.links[0].sheets, vec!["First", "Second", "Third"]);
+
+    wb.sheets[0].set(0, 0, cell(Value::Empty, Some("=SUM([1]First:Third!A1)")));
+    wb.sheets[0].set(1, 0, cell(Value::Empty, Some("=SUM([1]First:Third!A1:B1)")));
+    wb.sheets[0].set(2, 0, cell(Value::Empty, Some("=AVERAGE([1]First:Third!A1:B1)")));
+    wb.sheets[0].set(3, 0, cell(Value::Empty, Some("=VLOOKUP(\"A100\",[1]First!A2:B2,2,FALSE)")));
+    wb.sheets[0].set(4, 0, cell(Value::Empty, Some("=[1]!TaxRate*100")));
+    wb.sheets[0].set(5, 0, cell(Value::Empty, Some("=[1]First!LocalVal+1")));
+    wb.sheets[0].set(6, 0, cell(Value::Empty, Some("=SHEETS([1]First:Third!A1)")));
+    wb.sheets[0].set(7, 0, cell(Value::Empty, Some("=[2]Rate!A1")));
+    wb.sheets[0].set(8, 0, cell(Value::Empty, Some("=\"[1]First:Third!A1\"")));
+    sheetcore::formula::recalc_all(&mut wb);
+
+    assert_eq!(value(&wb, 0), "60");
+    assert_eq!(value(&wb, 1), "105"); // (10+5) + (20+15) + (30+25)
+    assert_eq!(value(&wb, 2), "17.5"); // 105 / 6
+    assert_eq!(value(&wb, 3), "88");
+    assert_eq!(value(&wb, 4), "15");
+    assert_eq!(value(&wb, 5), "11");
+    assert_eq!(value(&wb, 6), "3");
+    assert_eq!(value(&wb, 7), "7.2");
+    assert_eq!(value(&wb, 8), "[1]First:Third!A1");
+
+    // 源文件 First 和 Third 中间插入一张新表 Mid（A1=40），刷新后三维求和变 100、表数变 4
+    let mut src2 = Workbook::new_blank();
+    src2.sheets[0].name = "First".into();
+    src2.sheets.push(sheetcore::model::Sheet::new("Mid"));
+    src2.sheets.push(sheetcore::model::Sheet::new("Second"));
+    src2.sheets.push(sheetcore::model::Sheet::new("Third"));
+    src2.sheets[0].set(0, 0, cell(Value::Number(10.0), None));
+    src2.sheets[1].set(0, 0, cell(Value::Number(40.0), None));
+    src2.sheets[2].set(0, 0, cell(Value::Number(20.0), None));
+    src2.sheets[3].set(0, 0, cell(Value::Number(30.0), None));
+    src2.names.push(("TaxRate".into(), None, "=0.2".into()));
+    src2.names.push(("LocalVal".into(), Some(0), "=First!$A$1".into()));
+    src2.names_dirty = true;
+    sheetcore::xlsx::save(&src_path, &src2).expect("重写插入 Mid 的源文件");
+
+    let rep2 = sheetcore::xlinks::refresh(&mut wb);
+    assert_eq!(rep2.ok, 2);
+    sheetcore::formula::recalc_all(&mut wb);
+    assert_eq!(value(&wb, 0), "100");
+    assert_eq!(value(&wb, 4), "20");
+    assert_eq!(value(&wb, 6), "4");
+
+    // 保存重开：<sheetNames> 和 <definedNames> 都必须持久化进 externalLink1.xml
+    sheetcore::xlsx::save(&main_path, &wb).expect("保存含外部三维与名称的总表");
+    let link1_xml = part(&main_path, "xl/externalLinks/externalLink1.xml");
+    assert!(link1_xml.contains("<sheetName val=\"Mid\"/>"), "{link1_xml}");
+    assert!(link1_xml.contains("TaxRate"), "{link1_xml}");
+
+    let mut back = sheetcore::xlsx::load(&main_path).expect("重开总表");
+    let _ = std::fs::remove_file(&src_path); // 删掉源文件验证仍可用内嵌缓存算出相同结果
+    sheetcore::formula::recalc_all_force(&mut back);
+    assert_eq!(value(&back, 0), "100");
+    assert_eq!(value(&back, 4), "20");
+
+    // 断开第一个链接：引用 [1] 的 7 条公式转为静态当前值，引用 [2] 重排为 [1]，文本字面量保持不动
+    let converted = sheetcore::xlinks::break_link(&mut back, 0);
+    assert_eq!(converted, 7);
+    assert_eq!(back.links.len(), 1);
+    assert_eq!(back.links[0].index, 1);
+    assert!(back.sheets[0].get(0, 0).unwrap().formula.is_none());
+    assert_eq!(value(&back, 0), "100");
+    assert_eq!(
+        back.sheets[0].get(7, 0).unwrap().formula.as_deref(),
+        Some("=[1]Rate!A1")
+    );
+    assert_eq!(
+        back.sheets[0].get(8, 0).unwrap().formula.as_deref(),
+        Some("=\"[1]First:Third!A1\"")
+    );
+}
+
+#[test]
+fn large_external_source_only_persists_referenced_cells_and_never_bloats_or_false_dirties() {
+    let dir = tmpdir("no_bloat");
+    let src_path = dir.join("大型底表.xlsx");
+    let mut src = Workbook::new_blank();
+    src.sheets[0].name = "汇总".into();
+    src.sheets.push(sheetcore::model::Sheet::new("无关海量明细"));
+    src.sheets[0].set(0, 0, cell(Value::Number(123.0), None));
+    src.sheets[0].set(1, 0, cell(Value::Number(456.0), None));
+    for r in 0..2000u32 {
+        src.sheets[0].set(
+            r + 10,
+            5,
+            cell(Value::Text(format!("未被引用的长文本明细记录_{r}_0123456789").into()), None),
+        );
+        src.sheets[1].set(
+            r,
+            0,
+            cell(Value::Text(format!("无关表大段数据_{r}_ABCDEFGHIJKLMNOP").into()), None),
+        );
+    }
+    sheetcore::xlsx::save(&src_path, &src).expect("保存大型底表");
+
+    let main_path = dir.join("引用表.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.path = Some(main_path.clone());
+    wb.sheets[0].name = "结果".into();
+    wb.links.push(sheetcore::xlinks::ExternalBook {
+        index: 1,
+        target: "大型底表.xlsx".into(),
+        ..Default::default()
+    });
+    wb.sheets[0].set(0, 0, cell(Value::Empty, Some("=SUM([1]汇总!A1:A2)")));
+    let (_, changed) = sheetcore::xlinks::refresh_with_hints(&mut wb, &[]);
+    assert_eq!(changed, vec!["大型底表.xlsx".to_string()]);
+    assert_eq!(wb.links[0].cache.len(), 2, "内存缓存只应保留被引用的 2 个单元格");
+    sheetcore::formula::recalc_all(&mut wb);
+    assert_eq!(value(&wb, 0), "579");
+
+    sheetcore::xlsx::save_atomic(&main_path, &wb).expect("首次保存");
+    let link_xml = part(&main_path, "xl/externalLinks/externalLink1.xml");
+    assert!(!link_xml.contains("未被引用的长文本明细记录"), "未引用行不得写进 externalLink 部件");
+    assert!(!link_xml.contains("无关表大段数据"), "未引用工作表不得写进 externalLink 部件");
+    assert!(link_xml.len() < 2048, "externalLink1.xml 应保持精简，实际 {} 字节", link_xml.len());
+
+    // 重新打开后若底表未发生被引用区域的变化，refresh_with_hints 不得误报变化
+    let mut reopened = sheetcore::xlsx::load(&main_path).expect("重新打开");
+    let (_, changed_again) = sheetcore::xlinks::refresh_with_hints(&mut reopened, &[]);
+    assert!(changed_again.is_empty(), "底表未变时打开文件不得误判外部链接已变化");
+    assert!(!reopened.links[0].refreshed);
+}

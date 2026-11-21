@@ -71,6 +71,7 @@ pub struct Store {
     len: usize,
     max_row: u32,
     max_col: u32,
+    bounds_dirty: bool,
 }
 
 impl Store {
@@ -99,6 +100,7 @@ impl Store {
         self.len = 0;
         self.max_row = 0;
         self.max_col = 0;
+        self.bounds_dirty = false;
     }
 
     #[inline]
@@ -131,6 +133,11 @@ impl Store {
                         if !slot.is_blank() {
                             *slot = Cell::default();
                             self.len -= 1;
+                            if self.len == 0 {
+                                self.clear();
+                            } else if r >= self.max_row || c >= self.max_col {
+                                self.bounds_dirty = true;
+                            }
                         }
                     }
                 }
@@ -150,6 +157,9 @@ impl Store {
         if c > self.max_col {
             self.max_col = c;
         }
+        if r >= self.max_row && c >= self.max_col {
+            self.bounds_dirty = false;
+        }
     }
 
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
@@ -162,6 +172,11 @@ impl Store {
         }
         let old = std::mem::take(slot);
         self.len -= 1;
+        if self.len == 0 {
+            self.clear();
+        } else if r >= self.max_row || c >= self.max_col {
+            self.bounds_dirty = true;
+        }
         Some(old)
     }
 
@@ -215,6 +230,31 @@ impl Store {
     pub fn used_bounds(&self) -> Option<(u32, u32, u32, u32)> {
         if self.len == 0 {
             return None;
+        }
+        if self.bounds_dirty {
+            let mut r1 = u32::MAX;
+            let mut c1 = u32::MAX;
+            let mut r2 = 0u32;
+            let mut c2 = 0u32;
+            for (&pi, page) in &self.pages {
+                let base = pi * PAGE_ROWS;
+                for (ci, col) in page.cols.iter().enumerate() {
+                    for (ro, cell) in col.iter().enumerate() {
+                        if !cell.is_blank() {
+                            let r = base + ro as u32;
+                            let c = ci as u32;
+                            r1 = r1.min(r);
+                            c1 = c1.min(c);
+                            r2 = r2.max(r);
+                            c2 = c2.max(c);
+                        }
+                    }
+                }
+            }
+            if r1 == u32::MAX {
+                return None;
+            }
+            return Some((r1, c1, r2, c2));
         }
         // 左上角要真的找一次（右下角有 max_row/max_col 缓存）
         let mut r1 = u32::MAX;

@@ -115,6 +115,7 @@ impl Sheet {
                 self.shift_cf(*at, *n, true, false);
                 self.shift_dv(*at, *n, true, false);
                 self.rows.insert_at(*at, *n);
+                self.shift_axis_styles(*at, *n, true, false);
             }
             Structural::DeleteRows { at, n } => {
                 self.merges = self
@@ -130,6 +131,7 @@ impl Sheet {
                 self.shift_cf(*at, *n, true, true);
                 self.shift_dv(*at, *n, true, true);
                 self.rows.delete_at(*at, *n);
+                self.shift_axis_styles(*at, *n, true, true);
             }
             Structural::InsertCols { at, n } => {
                 self.merges = self
@@ -148,6 +150,7 @@ impl Sheet {
                 self.shift_cf(*at, *n, false, false);
                 self.shift_dv(*at, *n, false, false);
                 self.cols.insert_at(*at, *n);
+                self.shift_axis_styles(*at, *n, false, false);
             }
             Structural::DeleteCols { at, n } => {
                 self.merges = self
@@ -163,6 +166,7 @@ impl Sheet {
                 self.shift_cf(*at, *n, false, true);
                 self.shift_dv(*at, *n, false, true);
                 self.cols.delete_at(*at, *n);
+                self.shift_axis_styles(*at, *n, false, true);
             }
         }
         self.merges_dirty = true;
@@ -300,6 +304,9 @@ impl Sheet {
         let levels: Vec<u8> = (from..=r2)
             .map(|r| self.row_levels.get(&r).copied().unwrap_or(0))
             .collect();
+        let row_styles: Vec<u16> = (from..=r2)
+            .map(|r| self.row_styles.get(&r).copied().unwrap_or(0))
+            .collect();
 
         self.delete_rows(from, n);
         let at = if to > from { to - n } else { to };
@@ -336,6 +343,11 @@ impl Sheet {
             let i = i as u32;
             if lv > 0 {
                 self.row_levels.insert(at + i, lv);
+            }
+        }
+        for (i, st) in row_styles.into_iter().enumerate() {
+            if st != 0 {
+                self.set_row_style(at + i as u32, st);
             }
         }
         self.layout_dirty = true;
@@ -384,6 +396,9 @@ impl Sheet {
         let levels: Vec<u8> = (from..=c2)
             .map(|c| self.col_levels.get(&c).copied().unwrap_or(0))
             .collect();
+        let col_styles: Vec<u16> = (from..=c2)
+            .map(|c| self.col_styles.get(&c).copied().unwrap_or(0))
+            .collect();
 
         self.delete_cols(from, n);
         let at = if to > from { to - n } else { to };
@@ -420,6 +435,11 @@ impl Sheet {
             let i = i as u32;
             if lv > 0 {
                 self.col_levels.insert(at + i, lv);
+            }
+        }
+        for (i, st) in col_styles.into_iter().enumerate() {
+            if st != 0 {
+                self.set_col_style(at + i as u32, st);
             }
         }
         self.layout_dirty = true;
@@ -531,6 +551,7 @@ impl Sheet {
             }
         }
         self.rows.insert_at(at, n);
+        self.shift_axis_styles(at, n, true, false);
         self.adjust_tables_for_row_insert(at, n);
         self.apply_table_row_fills(fills);
         self.merges_dirty = true;
@@ -561,6 +582,7 @@ impl Sheet {
             self.freeze = Some((nf, fc));
         }
         self.rows.delete_at(at, n);
+        self.shift_axis_styles(at, n, true, true);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -590,6 +612,7 @@ impl Sheet {
             }
         }
         self.cols.insert_at(at, n);
+        self.shift_axis_styles(at, n, false, false);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -618,8 +641,34 @@ impl Sheet {
             self.freeze = Some((fr, nf));
         }
         self.cols.delete_at(at, n);
+        self.shift_axis_styles(at, n, false, true);
         self.merges_dirty = true;
         self.freeze_dirty = true;
+    }
+
+    fn shift_axis_styles(&mut self, at: u32, n: u32, rows: bool, del: bool) {
+        if n == 0 {
+            return;
+        }
+        let map = if rows { &mut self.row_styles } else { &mut self.col_styles };
+        if map.is_empty() {
+            return;
+        }
+        let old = std::mem::take(map);
+        let mut out = std::collections::HashMap::with_capacity(old.len());
+        for (idx, st) in old {
+            if let Some(nidx) = shift_axis(idx, at, n, del) {
+                out.insert(nidx, st);
+            }
+        }
+        if rows {
+            self.row_styles = out;
+            self.row_styles_dirty = true;
+        } else {
+            self.col_styles = out;
+            self.col_styles_dirty = true;
+        }
+        self.styles_dirty = true;
     }
 
     fn shift_notes(&mut self, at: u32, n: u32, rows: bool, del: bool) {

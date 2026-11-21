@@ -8,6 +8,7 @@ description = "CELLAN Desktop — Concurrent Engine for Local-first, Lock-free A
 anyhow = "1.0.104"
 arboard = "3.7"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "accesskit"] }
+getrandom = "0.3.4"
 hex = "0.4.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
 quick-xml = "0.42"

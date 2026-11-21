@@ -1,23 +1,33 @@
-//! 保存前的历史版本：每次覆盖前把旧文件留一份。
-//!
-//! 放在工作簿旁边的 `.~sheetflow-history/<文件名>/` 里，时间戳命名。
-//! 保留最近 N 份（默认 10），超出就删最旧的——共享盘上不能无限长胖。
-//!
-//! 之所以放在同一目录：用户用的是网盘（Z: 之类），历史留本机就跟着机器走了，
-//! 换个人打开就看不到；放同目录则跟文件在一起，谁都能翻。
+//! 历史版本辅助存储（仅在显式调用时写入系统本机临时目录，绝不在原文件目录生成 `.~sheetflow-history`）。
 
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// 默认保留几份
 pub const KEEP: usize = 10;
+
+fn dir_bucket(file: &Path) -> String {
+    let parent = file
+        .parent()
+        .and_then(|p| p.canonicalize().ok().or_else(|| Some(p.to_path_buf())))
+        .unwrap_or_default();
+    let norm = parent.to_string_lossy().replace('\\', "/");
+    let norm = if cfg!(windows) { norm.to_lowercase() } else { norm };
+    let mut h = Sha256::new();
+    h.update(norm.as_bytes());
+    let digest = h.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 pub fn history_dir(file: &Path) -> PathBuf {
     let name = file
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook".into());
-    let dir = file.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(".~sheetflow-history").join(name)
+    std::env::temp_dir()
+        .join("cellan-history-cache")
+        .join(dir_bucket(file))
+        .join(name)
 }
 
 fn stamp() -> String {
@@ -87,6 +97,13 @@ pub struct Version {
 ///
 /// 目标还不存在（第一次保存）时什么都不做。
 pub fn keep_previous(file: &Path) -> std::io::Result<Option<PathBuf>> {
+    keep_previous_for_save(file, None)
+}
+
+pub(crate) fn keep_previous_for_save(
+    file: &Path,
+    encryption: Option<&crate::crypto::EncryptionSettings>,
+) -> std::io::Result<Option<PathBuf>> {
     if !file.exists() {
         return Ok(None);
     }
@@ -110,7 +127,29 @@ pub fn keep_previous(file: &Path) -> std::io::Result<Option<PathBuf>> {
         n += 1;
         target = target_for(n);
     }
-    std::fs::copy(file, &target)?;
+    let staged = tempfile::Builder::new().prefix(".~history-").tempfile_in(&dir)?.into_temp_path();
+    if let Some(settings) = encryption {
+        let bytes = std::fs::read(file)?;
+        if crate::crypto::needs_password_bytes(&bytes) {
+            std::fs::write(&staged, bytes)?;
+        } else {
+            crate::crypto::encrypt(&staged, &bytes, settings).map_err(std::io::Error::other)?;
+        }
+    } else {
+        std::fs::copy(file, &staged)?;
+    }
+    let mut staged = staged;
+    loop {
+        match staged.persist_noclobber(&target) {
+            Ok(()) => break,
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                staged = e.path;
+                n += 1;
+                target = target_for(n);
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
     let _ = prune(file, KEEP);
     Ok(Some(target))
 }
@@ -211,19 +250,25 @@ mod tests {
     }
 
     #[test]
-    fn atomic_save_leaves_history() {
+    fn atomic_save_does_not_create_sidecar_history() {
         let d = tmp_dir("atomic");
         let f = d.join("book.xlsx");
         let mut wb = crate::model::Workbook::new_blank();
         crate::xlsx::save_atomic(&f, &wb).expect("第一次保存");
-        assert!(list(&f).is_empty(), "第一次保存没有旧版本可留");
         wb.sheets[0].set(
             0,
             0,
             crate::model::Cell { value: crate::model::Value::Text("改过".into()), formula: None },
         );
         crate::xlsx::save_atomic(&f, &wb).expect("第二次保存");
-        assert_eq!(list(&f).len(), 1, "第二次保存应留下一份历史");
+        assert!(list(&f).is_empty(), "正常保存不应自动复制历史备份占空间");
+        assert!(!d.join(".~sheetflow-history").exists(), "原文件目录不得生成 .~sheetflow-history");
+        let entries: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["book.xlsx"]);
         std::fs::remove_dir_all(&d).ok();
     }
 

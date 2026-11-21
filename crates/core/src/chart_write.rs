@@ -42,7 +42,7 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// 选区坐标 → 图表（首行表头、首列分类）
+/// 选区坐标 → 图表（首行表头、首列分类；自动裁剪全选/整列空尾并限制系列与数据点上限防止 OOM）
 pub fn chart_from_selection(
     sheet: &crate::model::Sheet,
     sheet_name: &str,
@@ -50,7 +50,18 @@ pub fn chart_from_selection(
     title: &str,
     kind: crate::charts::ChartKind,
 ) -> crate::charts::Chart {
-    let (r1, c1, r2, c2) = rect;
+    let (r1, c1, mut r2, mut c2) = rect;
+    if (r2.saturating_sub(r1) as u64 + 1) * (c2.saturating_sub(c1) as u64 + 1) > 100_000 {
+        if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
+            r2 = r2.min(ur2.max(r1));
+            c2 = c2.min(uc2.max(c1));
+        } else {
+            r2 = r1;
+            c2 = c1;
+        }
+    }
+    c2 = c2.min(c1.saturating_add(255));
+    r2 = r2.min(r1.saturating_add(50_000));
     let mut series = Vec::new();
     for c in (c1 + 1)..=c2 {
         let name = sheet
@@ -1063,13 +1074,14 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
         return xml.to_string();
     };
     let old = &xml[s0..s1];
-    let rid = old
-        .find("chart r:id=\"")
-        .and_then(|i| {
-            let rest = &old[i + "chart r:id=\"".len()..];
-            rest.find('"').map(|e| rest[..e].to_string())
-        })
-        .unwrap_or_else(|| "rId1".into());
+    // Use the same cell coordinates as the loader, including its one-cell EMU conversion.
+    // Keeping an unchanged anchor preserves its original offsets and exact extents.
+    let Some((cells, rid)) = crate::charts::parse_drawing_anchors(old).into_iter().next() else {
+        return xml.to_string();
+    };
+    if cells == anchor {
+        return xml.to_string();
+    }
     let name = old
         .find("name=\"")
         .and_then(|i| {
@@ -1096,25 +1108,6 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
 }
 
 /// 把某张表第 ordinal 个图表的锚点写回 drawing 部件
-fn anchor_cells(xml: &str) -> (Vec<u32>, Vec<u32>) {
-    fn nums(xml: &str, tag: &str) -> Vec<u32> {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        let mut out = Vec::new();
-        let mut from = 0usize;
-        while let Some(i) = xml[from..].find(&open) {
-            let s = from + i + open.len();
-            let Some(j) = xml[s..].find(&close) else { break };
-            if let Ok(v) = xml[s..s + j].trim().parse::<u32>() {
-                out.push(v);
-            }
-            from = s + j + close.len();
-        }
-        out
-    }
-    (nums(xml, "col"), nums(xml, "row"))
-}
-
 pub fn write_anchor(
     path: &Path,
     drawing_part: &str,
@@ -1129,11 +1122,6 @@ pub fn write_anchor(
         f.read_to_string(&mut xml)?;
     }
     let edited = rewrite_anchor_xml(&xml, ordinal, anchor);
-    // 锚点单元格没变就别重写：重写会把原来的 xdr:ext（精确尺寸）换成按单元格推的尺寸，
-    // WPS 侧会读成 191 -> 202 这种高度漂移（chart-ext resave 实测）。
-    if !edited.is_empty() && anchor_cells(&edited) == anchor_cells(&xml) {
-        return Ok(());
-    }
     if edited != xml {
         crate::patch::rewrite_zip(path, |name, buf| {
             if name == drawing_part {
@@ -1148,6 +1136,21 @@ pub fn write_anchor(
 #[cfg(test)]
 mod anchor_tests {
     use super::*;
+
+    #[test]
+    fn moving_the_second_native_chart_preserves_its_relationship() {
+        let sheet = crate::model::Sheet::new("Data");
+        let chart = chart_from_selection(&sheet, "Data", (0, 0, 2, 1), "Sales",
+            crate::charts::ChartKind::Column);
+        let first = anchor_xml(&chart, "rId1", 2);
+        let second = anchor_xml(&chart, "rId7", 3);
+        let xml = format!("<xdr:wsDr xmlns:xdr=\"urn:drawing\">{first}{second}</xdr:wsDr>");
+        let moved = (2, 1, 12, 8);
+        let after = rewrite_anchor_xml(&xml, 1, moved);
+        assert!(after.contains(&first));
+        let anchors = crate::charts::parse_drawing_anchors(&after);
+        assert_eq!(anchors[1], (moved, "rId7".to_owned()));
+    }
 
     #[test]
     fn rewrites_chart_anchor_and_keeps_rid() {

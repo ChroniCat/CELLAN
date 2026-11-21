@@ -140,9 +140,11 @@ fn walk(node: &Node, si: usize, wb: &crate::Workbook, out: &mut Vec<Rect>) {
                 });
             }
         }
-        Node::Func(_, args) => {
-            for a in args {
-                walk(a, si, wb, out);
+        Node::Func(name, args) => {
+            let amounts = if name == "SUMIF" { super::sumif_amount_range(args) } else { None };
+            for (i, a) in args.iter().enumerate() {
+                let reference = if i == 2 { amounts.as_ref().unwrap_or(a) } else { a };
+                walk(reference, si, wb, out);
             }
         }
         Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => walk(x, si, wb, out),
@@ -161,6 +163,7 @@ pub fn refs_of(wb: &crate::Workbook, si: usize, formula: &str) -> Vec<Rect> {
 fn dynamic(node: &Node, include_volatile: bool) -> bool {
     match node {
         Node::Name(_) => true,
+        Node::ScopedName { book, .. } => book.is_none(),
         Node::Spill(_) => true,
         Node::Func(name, args) => matches!(name.as_str(), "INDIRECT" | "OFFSET")
             || (include_volatile && matches!(name.as_str(), "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"))

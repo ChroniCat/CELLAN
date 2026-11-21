@@ -173,8 +173,9 @@ pub fn parse(xml: &str) -> Block {
                     }
                     "Row" => {
                         if let Some(i) = attr(&e, "Index").and_then(|s| s.parse::<usize>().ok()) {
-                            // Index 是 1 起；补空行
-                            while row_index + 1 < i {
+                            // Index 是 1 起；补空行（限制稠密空行膨胀上限，防止 ss:Index="1048576" 导致 OOM）
+                            let capped = i.min(row_index.saturating_add(10_000)).min(200_000);
+                            while row_index + 1 < capped {
                                 block.rows.push(Vec::new());
                                 row_index += 1;
                             }
@@ -183,9 +184,10 @@ pub fn parse(xml: &str) -> Block {
                     }
                     "Cell" => {
                         skip_sheet = false;
-                        // ss:Index 是 1 起的列号，中间缺的格要补空
+                        // ss:Index 是 1 起的列号，中间缺的格要补空（限制上限 <= 16384 列）
                         if let Some(idx) = attr(&e, "Index").and_then(|s| s.parse::<usize>().ok()) {
-                            while row.len() + 1 < idx {
+                            let capped = idx.min(16_384);
+                            while row.len() + 1 < capped {
                                 row.push(Cell::default());
                             }
                         }

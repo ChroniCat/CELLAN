@@ -197,14 +197,20 @@ pub fn find_cycles(wb: &crate::model::Workbook, si: usize) -> Vec<(u32, u32)> {
             }
             let (r1, c1) = (rect.r1.max(0) as u32, rect.c1.max(0) as u32);
             let (r2, c2) = (rect.r2.max(0) as u32, rect.c2.max(0) as u32);
-            // 整列/整行引用会扫到几十万格，只在合理范围内枚举
-            if (r2 - r1) as u64 * (c2 - c1) as u64 > 100_000 {
-                continue;
-            }
-            for rr in r1..=r2 {
-                for cc in c1..=c2 {
-                    if let Some(j) = idx.get(&(rr, cc)) {
-                        adj[i].push(*j);
+            let area = (r2.saturating_sub(r1) as u64 + 1) * (c2.saturating_sub(c1) as u64 + 1);
+            if area <= 64 {
+                for rr in r1..=r2 {
+                    for cc in c1..=c2 {
+                        if let Some(j) = idx.get(&(rr, cc)) {
+                            adj[i].push(*j);
+                        }
+                    }
+                }
+            } else {
+                // 大范围或整列引用：按公式列表测试矩形包含（O(formulas)），避免 20000 × 100000 = 20 亿次内层循环卡死主线程
+                for (j, &(fr, fc)) in formulas.iter().enumerate() {
+                    if fr >= r1 && fr <= r2 && fc >= c1 && fc <= c2 {
+                        adj[i].push(j);
                     }
                 }
             }

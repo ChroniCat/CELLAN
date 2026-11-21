@@ -829,6 +829,9 @@ fn resolve(sheet_part: &str, target: &str) -> String {
 
 /// 保存收尾：把文本框写回各表（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.textboxes_dirty) {
+        return Ok(());
+    }
     let targets = crate::patch::sheet_targets(path)?;
     let mut additions: Vec<(String, Vec<u8>)> = Vec::new();
     // 需要回填的已有部件

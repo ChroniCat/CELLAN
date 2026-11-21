@@ -367,7 +367,7 @@ fn find_rel_target(xml: &str, type_suffix: &str) -> Option<String> {
 }
 
 /// twoCellAnchor / oneCellAnchor：取 from 的 col/row、to 的 col/row 与内部 chart 的 r:id
-fn parse_drawing_anchors(xml: &str) -> Vec<((u32, u32, u32, u32), String)> {
+pub(crate) fn parse_drawing_anchors(xml: &str) -> Vec<((u32, u32, u32, u32), String)> {
     let mut out = Vec::new();
     let mut rest = xml;
     loop {

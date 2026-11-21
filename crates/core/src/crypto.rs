@@ -50,12 +50,63 @@ impl EncryptionSettings {
     }
 }
 
-/// 是否是 CFB 容器里的 Office 加密文件
-pub fn needs_password(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
+/// 只读取文件头前 `magic.len()` 字节做魔数判断，避免将上百 MB 的工作簿整包读入内存。
+pub fn has_magic(path: &Path, magic: &[u8]) -> bool {
+    if magic.is_empty() {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
-    needs_password_bytes(&bytes)
+    let mut stack = [0u8; 16];
+    if magic.len() <= stack.len() {
+        let buf = &mut stack[..magic.len()];
+        return f.read_exact(buf).is_ok() && buf == magic;
+    }
+    let mut buf = vec![0u8; magic.len()];
+    f.read_exact(&mut buf).is_ok() && buf.as_slice() == magic
+}
+
+/// 是否是 CFB 容器里的 Office 加密文件（流式扫描，绝不整包分配大文件内存）
+pub fn needs_password(path: &Path) -> bool {
+    const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    if f.read_exact(&mut magic).is_err() || magic != CFB_MAGIC {
+        return false;
+    }
+    if f.seek(std::io::SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    // CFB 目录项名是 UTF-16LE "EncryptedPackage"（32 字节）
+    let needle: [u8; 32] = [
+        b'E', 0, b'n', 0, b'c', 0, b'r', 0, b'y', 0, b'p', 0, b't', 0, b'e', 0,
+        b'd', 0, b'P', 0, b'a', 0, b'c', 0, b'k', 0, b'a', 0, b'g', 0, b'e', 0,
+    ];
+    let overlap = needle.len() - 1;
+    let mut buf = [0u8; 65536];
+    let mut carry = 0usize;
+    loop {
+        let n = match f.read(&mut buf[carry..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        let total = carry + n;
+        if find_bytes(&buf[..total], &needle).is_some() {
+            return true;
+        }
+        if total >= overlap {
+            buf.copy_within(total - overlap..total, 0);
+            carry = overlap;
+        } else {
+            carry = total;
+        }
+    }
+    false
 }
 
 pub fn needs_password_bytes(bytes: &[u8]) -> bool {
@@ -412,13 +463,12 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
     let mut info = vec![0x04u8, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00];
     info.extend_from_slice(xml.as_bytes());
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
-    let tmp = path.with_extension(format!("enc-{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut staged = tempfile::Builder::new().prefix(".~cipher-").tempfile_in(dir)?;
     {
-        let mut cf = cfb::create(&tmp).map_err(|e| anyhow!("创建 CFB 失败：{e}"))?;
+        let mut cf = cfb::CompoundFile::create(staged.as_file_mut())
+            .map_err(|e| anyhow!("创建 CFB 失败：{e}"))?;
         // DataSpaces：Excel 打开强加密文件必需
         let dec = |v: &str| b64(v).unwrap_or_default();
         cf.create_storage_all("\u{6}DataSpaces")?;
@@ -456,7 +506,7 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
         }
         cf.flush()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("写入 {} 失败", path.display()))?;
+    staged.persist(path).with_context(|| format!("写入 {} 失败", path.display()))?;
     Ok(())
 }
 

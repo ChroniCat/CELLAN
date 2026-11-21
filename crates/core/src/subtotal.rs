@@ -7,7 +7,8 @@
 //! - 明细行打上分级显示级别 1，小计行是级别 2 的父级位置（汇总行在下方）
 //! - 插入行复用 `Sheet::insert_rows`，所以条件格式/数据验证/批注会跟着一起移动
 
-use crate::model::{Cell, Sheet, Value};
+use crate::model::{Cell, Sheet, Value, Workbook};
+use crate::structural::{Structural, apply_structural_wb};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubFn {
@@ -62,6 +63,23 @@ pub fn subtotal(
     value_cols: &[u32],
     f: SubFn,
 ) -> SubtotalReport {
+    let mut book = Workbook::new_blank();
+    std::mem::swap(sheet, &mut book.sheets[0]);
+    let report = subtotal_workbook(&mut book, 0, region, key_col, value_cols, f);
+    std::mem::swap(sheet, &mut book.sheets[0]);
+    report
+}
+
+/// Insert summary rows and update all workbook references to the moved details.
+pub fn subtotal_workbook(
+    wb: &mut Workbook,
+    sheet_idx: usize,
+    region: (u32, u32, u32, u32),
+    key_col: u32,
+    value_cols: &[u32],
+    f: SubFn,
+) -> SubtotalReport {
+    let Some(sheet) = wb.sheets.get(sheet_idx) else { return SubtotalReport::default() };
     let (r1, c1, r2, c2) = region;
     if r2 <= r1 || key_col < c1 || key_col > c2 {
         return SubtotalReport::default();
@@ -88,9 +106,13 @@ pub fn subtotal(
     for i in (0..n).rev() {
         // 插在「本组最后一条明细」的下一行；下面那些插入都在更靠下的位置，不影响这个下标
         let at = groups[i].1 + 1;
-        sheet.insert_rows(at, 1);
+        apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at, n: 1 });
         inserted += 1;
     }
+    let total_at = r2 + inserted + 1;
+    apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at: total_at, n: 1 });
+    inserted += 1;
+    let sheet = &mut wb.sheets[sheet_idx];
     // 第二趟：按最终坐标写内容（组 i 上方有 i 行插入）
     let mut total_ranges: Vec<String> = Vec::new();
     for (i, (gs, ge)) in groups.iter().enumerate() {
@@ -141,9 +163,6 @@ pub fn subtotal(
         }
     }
     // 总计行
-    let total_at = r2 + inserted + 1;
-    sheet.insert_rows(total_at, 1);
-    inserted += 1;
     sheet.set(
         total_at,
         c1,
@@ -209,6 +228,33 @@ mod tests {
             sh.set(r, 1, Cell { value: Value::Number(*v), formula: None });
         }
         sh
+    }
+
+    #[test]
+    fn workbook_subtotals_keep_report_references_through_undo_and_redo() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0] = sheet_with(&[("甲", 100.0), ("乙", 200.0)]);
+        wb.sheets.push(Sheet::new("Report"));
+        wb.sheets[1].set(0, 0, Cell { value: Value::Number(200.0), formula: Some("=S!B3".into()) });
+        wb.names.push(("SecondAmount".into(), None, "S!$B$3".into()));
+        let before = crate::undo::snapshot_structure(&wb, 0, &Structural::InsertRows { at: 2, n: 1 });
+        let report = subtotal_workbook(&mut wb, 0, (0, 0, 2, 1), 0, &[1], SubFn::Sum);
+        assert_eq!(report.rows, 3);
+        let after = before.capture_after(&wb);
+        let mut undo = crate::undo::UndoStack::default();
+        undo.push_structure("分类汇总", before, after, (0, 0, 0));
+        for (step, row) in [4, 3, 4].into_iter().enumerate() {
+            match step {
+                1 => { undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap(); }
+                2 => { undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap(); }
+                _ => {}
+            }
+            crate::formula::recalc_all(&mut wb);
+            assert_eq!(wb.sheets[1].get(0, 0).unwrap().formula.as_deref(), Some(format!("=S!B{row}").as_str()));
+            assert_eq!(wb.sheets[1].value(0, 0), Value::Number(200.0));
+            assert_eq!(wb.names[0].2, format!("S!$B${row}"));
+            assert_eq!(wb.sheets[0].row_levels.contains_key(&1), step != 1);
+        }
     }
 
     #[test]

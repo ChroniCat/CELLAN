@@ -106,7 +106,9 @@ pub fn sort_range(sheet: &mut Sheet, r1: u32, c1: u32, r2: u32, c2: u32, col: u3
             match &line[j] {
                 Some(cell) => sheet.set(dst, c, sorted_cell(cell, *src, dst, &sheet.name)),
                 None => {
-                    sheet.set(dst, c, Cell::default());
+                    if sheet.get(dst, c).is_some() {
+                        sheet.set(dst, c, Cell::default());
+                    }
                 }
             }
             sheet.set_style(dst, c, st[j]);
@@ -186,7 +188,9 @@ pub fn sort_range_by_row(
                     sheet.set(r, dst, out);
                 }
                 None => {
-                    sheet.set(r, dst, Cell::default());
+                    if sheet.get(r, dst).is_some() {
+                        sheet.set(r, dst, Cell::default());
+                    }
                 }
             }
             sheet.set_style(r, dst, st[j]);
@@ -457,12 +461,18 @@ impl Filter {
         }
     }
 
-    /// 按当前规则算出要隐藏的行（不含表头行）
+    /// 按当前规则算出要隐藏的行（不含表头行）。
+    /// 对整列自动筛选（如 `A1:D1048576`），裁剪到工作表实际数据边界（保留 1 行尾部空行语义），
+    /// 避免遍历 104 万空行并往 `hidden_rows` 塞入百万条无效行号。
     pub fn hidden_rows(&self, sheet: &Sheet) -> HashSet<u32> {
-        let (r1, c1, r2, c2) = self.range;
+        let (r1, c1, mut r2, c2) = self.range;
         let mut out = HashSet::new();
         if self.allows.is_empty() && self.criteria.is_empty() {
             return out;
+        }
+        let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+        if r2 > used_max_r.saturating_add(64) {
+            r2 = used_max_r.saturating_add(1).min(r2);
         }
         for r in (r1 + 1)..=r2 {
             for (col, allowed) in self.allows.iter() {
@@ -501,7 +511,11 @@ impl Filter {
 
 /// 某列在筛选区域里的去重值（按显示文本，排序后返回）
 pub fn unique_values(sheet: &Sheet, range: (u32, u32, u32, u32), col: u32) -> Vec<String> {
-    let (r1, _, r2, _) = range;
+    let (r1, _, mut r2, _) = range;
+    let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+    if r2 > used_max_r.saturating_add(64) {
+        r2 = used_max_r.saturating_add(1).min(r2);
+    }
     let mut set: HashSet<String> = HashSet::new();
     for r in (r1 + 1)..=r2 {
         let v = sheet.get(r, col).map(|c| c.value.display()).unwrap_or_default();

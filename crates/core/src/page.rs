@@ -176,7 +176,17 @@ pub fn page_breaks(sheet: &Sheet) -> (Vec<f32>, Vec<f32>) {
     let usable_h = ph / scale;
 
     let (r1, c1, r2, c2) = match ps.print_area.or_else(|| sheet.used_bounds()) {
-        Some(v) => v,
+        Some((ar1, ac1, ar2, ac2)) => {
+            if (ar2.saturating_sub(ar1) as u64 + 1) * (ac2.saturating_sub(ac1) as u64 + 1) > 500_000 {
+                if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
+                    (ar1, ac1, ar2.min(ur2.max(ar1)), ac2.min(uc2.max(ac1)))
+                } else {
+                    return (Vec::new(), Vec::new());
+                }
+            } else {
+                (ar1, ac1, ar2, ac2)
+            }
+        }
         None => return (Vec::new(), Vec::new()),
     };
 

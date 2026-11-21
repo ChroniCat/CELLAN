@@ -330,6 +330,8 @@ pub struct CfStats {
     pub counts: HashMap<usize, usize>,
     /// 每个块的数值升序（前 N 项规则要用；超大块不存）
     pub sorted: HashMap<usize, Vec<f64>>,
+    /// 重复值/唯一值规则预聚合频次表（block 序号 → 显示文本 → 频次），避免逐格整列扫描
+    pub dup_counts: HashMap<usize, HashMap<String, usize>>,
 }
 
 pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
@@ -337,37 +339,124 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
     into.averages.clear();
     into.counts.clear();
     into.sorted.clear();
+    into.dup_counts.clear();
+    if cf.blocks.is_empty() {
+        return;
+    }
+    let bounds = sheet.used_bounds();
+    let sheet_len = sheet.len();
     for (i, block) in cf.blocks.iter().enumerate() {
+        let needs_num = block.rules.iter().any(|r| {
+            matches!(
+                r.kind,
+                CfKind::Top { .. }
+                    | CfKind::Avg { .. }
+                    | CfKind::Scale { .. }
+                    | CfKind::IconSet { .. }
+                    | CfKind::Bar { .. }
+            )
+        });
+        let needs_sort = block.rules.iter().any(|r| {
+            matches!(
+                r.kind,
+                CfKind::Top { .. }
+                    | CfKind::Scale { .. }
+                    | CfKind::IconSet { .. }
+                    | CfKind::Bar { .. }
+            )
+        });
+        let needs_dup = block
+            .rules
+            .iter()
+            .any(|r| matches!(r.kind, CfKind::Dup { .. }));
+        if !needs_num && !needs_dup {
+            continue;
+        }
+        let Some((ur1, uc1, ur2, uc2)) = bounds else {
+            if needs_num {
+                into.counts.insert(i, 0);
+            }
+            if needs_dup {
+                into.dup_counts.insert(i, HashMap::new());
+            }
+            continue;
+        };
+        let mut clamped: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(block.ranges.len());
+        let mut total_area: u64 = 0;
+        for &(r1, c1, r2, c2) in &block.ranges {
+            let cr1 = r1.max(ur1);
+            let cr2 = r2.min(ur2);
+            let cc1 = c1.max(uc1);
+            let cc2 = c2.min(uc2);
+            if cr1 <= cr2 && cc1 <= cc2 {
+                clamped.push((cr1, cc1, cr2, cc2));
+                total_area = total_area.saturating_add(
+                    (cr2 - cr1 + 1) as u64 * (cc2 - cc1 + 1) as u64,
+                );
+            }
+        }
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut sum = 0.0;
         let mut n = 0usize;
         let mut vals: Vec<f64> = Vec::new();
-        for (r1, c1, r2, c2) in block.ranges.iter() {
-            for r in *r1..=*r2 {
-                for c in *c1..=*c2 {
-                    if let Some(Value::Number(v)) = sheet.get(r, c).map(|x| x.value.clone()) {
-                        if v.is_finite() {
-                            min = min.min(v);
-                            max = max.max(v);
-                            sum += v;
-                            n += 1;
-                            if vals.len() < 200_000 {
-                                vals.push(v);
-                            }
+        let mut dups: HashMap<String, usize> = HashMap::new();
+
+        let mut visit = |cell: &crate::model::Cell| {
+            if needs_num {
+                if let Value::Number(v) = &cell.value {
+                    if v.is_finite() {
+                        min = min.min(*v);
+                        max = max.max(*v);
+                        sum += *v;
+                        n += 1;
+                        if needs_sort && vals.len() < 200_000 {
+                            vals.push(*v);
                         }
                     }
                 }
             }
+            if needs_dup {
+                let key = cell.value.display();
+                if !key.is_empty() {
+                    *dups.entry(key).or_insert(0) += 1;
+                }
+            }
+        };
+
+        if clamped.is_empty() {
+            // 块范围完全落在非空区之外
+        } else if total_area > (sheet_len as u64).saturating_mul(2).max(256)
+            || clamped.len() > 1
+        {
+            for (cref, cell) in sheet.iter() {
+                if in_block(block, cref.row, cref.col) {
+                    visit(cell);
+                }
+            }
+        } else {
+            let (cr1, cc1, cr2, cc2) = clamped[0];
+            for r in cr1..=cr2 {
+                for c in cc1..=cc2 {
+                    if let Some(cell) = sheet.get(r, c) {
+                        visit(cell);
+                    }
+                }
+            }
         }
-        if n > 0 {
-            into.ranges.insert(i, (min, max));
-            into.averages.insert(i, sum / n as f64);
+        if needs_num {
+            if n > 0 {
+                into.ranges.insert(i, (min, max));
+                into.averages.insert(i, sum / n as f64);
+            }
+            into.counts.insert(i, n);
+            if !vals.is_empty() {
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                into.sorted.insert(i, vals);
+            }
         }
-        into.counts.insert(i, n);
-        if !vals.is_empty() {
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            into.sorted.insert(i, vals);
+        if needs_dup {
+            into.dup_counts.insert(i, dups);
         }
     }
 }
@@ -448,10 +537,16 @@ where
     F: FnMut(&str, u32, u32) -> bool,
 {
     let mut out = Overlay::default();
+    if cf.blocks.is_empty() || !cf.blocks.iter().any(|b| in_block(b, r, c)) {
+        return out;
+    }
     let raw = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
-    // Excel 按 priority 求值，与 XML 里的先后无关；同优先级按出现顺序
+    // Excel 按 priority 求值，与 XML 里的先后无关；同优先级按出现顺序（仅收集覆盖当前格的块）
     let mut order: Vec<(u32, usize, usize)> = Vec::new();
     for (bi, block) in cf.blocks.iter().enumerate() {
+        if !in_block(block, r, c) {
+            continue;
+        }
         for (ri, rule) in block.rules.iter().enumerate() {
             order.push((rule.priority, bi, ri));
         }
@@ -460,9 +555,6 @@ where
     for (_, bi, ri) in order {
         let block = &cf.blocks[bi];
         let rule = &block.rules[ri];
-        if !in_block(block, r, c) {
-            continue;
-        }
         let (ar, ac) = block
             .ranges
             .first()
@@ -495,23 +587,21 @@ where
                     }
                 }
                 CfKind::Dup { unique, dxf } => {
-                    // 只对文本/数字做重复计数（范围一般不大）
                     let key = raw.display();
                     if key.is_empty() {
                         continue;
                     }
-                    let mut n = 0;
-                    for (r1, c1, r2, c2) in block.ranges.iter() {
-                        for rr in *r1..=*r2 {
-                            for cc in *c1..=*c2 {
-                                if let Some(v) = sheet.get(rr, cc) {
-                                    if v.value.display() == key {
-                                        n += 1;
-                                    }
-                                }
+                    let n = if let Some(dups) = stats.dup_counts.get(&bi) {
+                        dups.get(&key).copied().unwrap_or(0)
+                    } else {
+                        let mut cnt = 0usize;
+                        for (cref, cell) in sheet.iter() {
+                            if in_block(block, cref.row, cref.col) && cell.value.display() == key {
+                                cnt += 1;
                             }
                         }
-                    }
+                        cnt
+                    };
                     let want = if *unique { n == 1 } else { n > 1 };
                     if want {
                         apply_dxf(cf, *dxf, &mut out);

@@ -20,6 +20,55 @@ use quick_xml::Reader;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+/// 引用计数写时复制的外部工作簿单元格缓存，使 `Workbook::clone()`（后台重算、自动保存）为 O(1)。
+#[derive(Clone, Debug, Default)]
+pub struct ExternalCache(pub std::sync::Arc<BTreeMap<(usize, u32, u32), Value>>);
+
+impl ExternalCache {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(BTreeMap::new()))
+    }
+
+    pub fn from_map(map: BTreeMap<(usize, u32, u32), Value>) -> Self {
+        Self(std::sync::Arc::new(map))
+    }
+
+    pub fn insert(&mut self, k: (usize, u32, u32), v: Value) -> Option<Value> {
+        std::sync::Arc::make_mut(&mut self.0).insert(k, v)
+    }
+
+    pub fn clear(&mut self) {
+        if !self.0.is_empty() {
+            self.0 = std::sync::Arc::new(BTreeMap::new());
+        }
+    }
+}
+
+impl std::ops::Deref for ExternalCache {
+    type Target = BTreeMap<(usize, u32, u32), Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<BTreeMap<(usize, u32, u32), Value>> for ExternalCache {
+    fn from(map: BTreeMap<(usize, u32, u32), Value>) -> Self {
+        Self::from_map(map)
+    }
+}
+
+impl PartialEq for ExternalCache {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl PartialEq<BTreeMap<(usize, u32, u32), Value>> for ExternalCache {
+    fn eq(&self, other: &BTreeMap<(usize, u32, u32), Value>) -> bool {
+        &*self.0 == other
+    }
+}
+
 /// 一个外部工作簿（对应 `xl/externalLinks/externalLinkN.xml`）
 #[derive(Clone, Debug, Default)]
 pub struct ExternalBook {
@@ -33,8 +82,10 @@ pub struct ExternalBook {
     pub abs: Option<String>,
     /// 被引用表的名字，按 sheetId 顺序
     pub sheets: Vec<String>,
-    /// (sheetId, row, col) → 缓存值
-    pub cache: BTreeMap<(usize, u32, u32), Value>,
+    /// 外部工作簿定义名称：(name, sheetId_0based, refersTo)
+    pub defined_names: Vec<(String, Option<usize>, String)>,
+    /// (sheetId, row, col) → 缓存值（Arc CoW，O(1) 克隆）
+    pub cache: ExternalCache,
     /// 本轮是否从磁盘重读过（决定存盘要不要重写 sheetDataSet）
     pub refreshed: bool,
 }
@@ -98,7 +149,8 @@ pub fn read(path: &Path) -> Vec<ExternalBook> {
             target,
             abs,
             sheets: parsed.sheets,
-            cache: parsed.cache,
+            defined_names: parsed.defined_names,
+            cache: ExternalCache::from_map(parsed.cache),
             refreshed: false,
         });
     }
@@ -107,6 +159,7 @@ pub fn read(path: &Path) -> Vec<ExternalBook> {
 
 struct ParsedPart {
     sheets: Vec<String>,
+    defined_names: Vec<(String, Option<usize>, String)>,
     book_rid: Option<String>,
     abs_rid: Option<String>,
     cache: BTreeMap<(usize, u32, u32), Value>,
@@ -115,6 +168,7 @@ struct ParsedPart {
 fn parse_link_part(xml: &str) -> ParsedPart {
     let mut out = ParsedPart {
         sheets: Vec::new(),
+        defined_names: Vec::new(),
         book_rid: None,
         abs_rid: None,
         cache: BTreeMap::new(),
@@ -145,6 +199,13 @@ fn parse_link_part(xml: &str) -> ParsedPart {
                             out.sheets.push(v);
                         }
                     }
+                    "definedName" => {
+                        if let Some(nm) = attr(&e, "name").filter(|s| !s.is_empty()) {
+                            let refers = attr(&e, "refersTo").unwrap_or_default();
+                            let sid = attr(&e, "sheetId").and_then(|s| s.parse::<usize>().ok());
+                            out.defined_names.push((nm, sid, refers));
+                        }
+                    }
                     "sheetData" => {
                         sheet_id = attr(&e, "sheetId")
                             .and_then(|s| s.parse::<usize>().ok())
@@ -166,6 +227,12 @@ fn parse_link_part(xml: &str) -> ParsedPart {
                 if n == "sheetName" {
                     if let Some(v) = attr(&e, "val") {
                         out.sheets.push(v);
+                    }
+                } else if n == "definedName" {
+                    if let Some(nm) = attr(&e, "name").filter(|s| !s.is_empty()) {
+                        let refers = attr(&e, "refersTo").unwrap_or_default();
+                        let sid = attr(&e, "sheetId").and_then(|s| s.parse::<usize>().ok());
+                        out.defined_names.push((nm, sid, refers));
                     }
                 } else if n == "externalBook" {
                     if let Some(v) = attr(&e, "id") {
@@ -310,12 +377,518 @@ fn part_rels(part: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------- 引用区域过滤（防止整本外部表落盘膨胀与内存暴涨）
+
+/// 单个外部链接在当前工作簿中被公式/名称实际引用的区域集合。
+#[derive(Clone, Debug, Default)]
+pub struct BookFilter {
+    /// 表名（小写；`""` 表示未显式指定表名，默认第 0 张表）→ 闭区间矩形列表 `(r1, c1, r2, c2)`
+    pub by_sheet: HashMap<String, Vec<(u32, u32, u32, u32)>>,
+    /// 三维引用 `(起始表小写, 结束表小写, (r1, c1, r2, c2))`
+    pub three_d: Vec<(String, String, (u32, u32, u32, u32))>,
+    /// 被引用的外部定义名称 `(限定表名小写, 名称小写)`
+    pub names: Vec<(Option<String>, String)>,
+    /// 当前工作簿是否有任何公式引用此链接
+    pub any_ref: bool,
+    /// 存在无法静态解析的引用形态时的兜底标记
+    pub fallback_all: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedFilter {
+    pub by_slot: HashMap<usize, Vec<(u32, u32, u32, u32)>>,
+    pub fallback_all: bool,
+}
+
+fn clean_sheet_key(name: Option<&str>) -> String {
+    match name {
+        None => String::new(),
+        Some(s) => s.trim().trim_matches('\'').to_lowercase(),
+    }
+}
+
+fn push_dedup_rect(list: &mut Vec<(u32, u32, u32, u32)>, rect: (u32, u32, u32, u32)) {
+    for cur in list.iter_mut() {
+        if rect.0 >= cur.0 && rect.1 >= cur.1 && rect.2 <= cur.2 && rect.3 <= cur.3 {
+            return;
+        }
+        if cur.0 >= rect.0 && cur.1 >= rect.1 && cur.2 <= rect.2 && cur.3 <= rect.3 {
+            *cur = rect;
+            return;
+        }
+        // 同列相邻或重叠区间直接合并，防止数千行逐行 VLOOKUP 产生数千个矩形
+        if cur.1 == rect.1 && cur.3 == rect.3 && rect.0 <= cur.2.saturating_add(1) && cur.0 <= rect.2.saturating_add(1) {
+            cur.0 = cur.0.min(rect.0);
+            cur.2 = cur.2.max(rect.2);
+            return;
+        }
+    }
+    if list.len() >= 256 {
+        // 散点过多时合并到最后一个包络矩形，保证包含判定 O(1)
+        if let Some(last) = list.last_mut() {
+            last.0 = last.0.min(rect.0);
+            last.1 = last.1.min(rect.1);
+            last.2 = last.2.max(rect.2);
+            last.3 = last.3.max(rect.3);
+            return;
+        }
+    }
+    list.push(rect);
+}
+
+impl BookFilter {
+    fn add_sheet_rect(&mut self, sheet: Option<&str>, rect: (u32, u32, u32, u32)) {
+        self.any_ref = true;
+        let key = clean_sheet_key(sheet);
+        push_dedup_rect(self.by_sheet.entry(key).or_default(), rect);
+    }
+
+    fn add_three_d(&mut self, s1: &str, s2: &str, rect: (u32, u32, u32, u32)) {
+        self.any_ref = true;
+        let k1 = clean_sheet_key(Some(s1));
+        let k2 = clean_sheet_key(Some(s2));
+        if !self.three_d.iter().any(|(a, b, r)| a == &k1 && b == &k2 && *r == rect) {
+            self.three_d.push((k1, k2, rect));
+        }
+    }
+
+    fn add_name(&mut self, sheet: Option<&str>, name: &str) {
+        self.any_ref = true;
+        let sk = sheet.map(|s| clean_sheet_key(Some(s)));
+        let nk = name.trim().to_lowercase();
+        if !self.names.iter().any(|(s, n)| s == &sk && n == &nk) {
+            self.names.push((sk, nk));
+        }
+    }
+
+    pub fn resolve(
+        &self,
+        sheets: &[String],
+        defined_names: &[(String, Option<usize>, String)],
+    ) -> ResolvedFilter {
+        if self.fallback_all {
+            return ResolvedFilter {
+                by_slot: HashMap::new(),
+                fallback_all: true,
+            };
+        }
+        let mut expanded = self.clone();
+        // 展开被引用的外部定义名称（最多递归 6 层）
+        let mut idx = 0usize;
+        let mut guard = 0usize;
+        while idx < expanded.names.len() && guard < 64 {
+            let (scope_sh, nm_lower) = expanded.names[idx].clone();
+            idx += 1;
+            guard += 1;
+            let want_slot = scope_sh.as_deref().and_then(|sh| {
+                if sheets.is_empty() {
+                    Some(0)
+                } else {
+                    sheets.iter().position(|s| s.eq_ignore_ascii_case(sh))
+                }
+            });
+            let found = if let Some(slot) = want_slot {
+                defined_names
+                    .iter()
+                    .find(|(nm, s, _)| nm.eq_ignore_ascii_case(&nm_lower) && *s == Some(slot))
+                    .or_else(|| {
+                        defined_names
+                            .iter()
+                            .find(|(nm, s, _)| nm.eq_ignore_ascii_case(&nm_lower) && s.is_none())
+                    })
+            } else {
+                defined_names
+                    .iter()
+                    .find(|(nm, s, _)| nm.eq_ignore_ascii_case(&nm_lower) && s.is_none())
+            };
+            if let Some((_, def_slot, refers)) = found {
+                let body = refers.trim().trim_start_matches('=');
+                if !body.is_empty() {
+                    let norm = crate::normalize_formula(body);
+                    if let Ok(mut node) = crate::formula::parse(&norm) {
+                        let default_sh = scope_sh
+                            .as_deref()
+                            .or_else(|| def_slot.and_then(|s| sheets.get(s).map(String::as_str)))
+                            .or_else(|| sheets.first().map(String::as_str));
+                        crate::formula::qualify_ext_node(&mut node, "1", default_sh);
+                        collect_single_link_node(&node, &mut expanded);
+                    }
+                }
+            }
+        }
+
+        let mut by_slot: HashMap<usize, Vec<(u32, u32, u32, u32)>> = HashMap::new();
+        for (sh_lower, rects) in &expanded.by_sheet {
+            let slot_opt = if sh_lower.is_empty() || sheets.is_empty() {
+                Some(0)
+            } else {
+                sheets.iter().position(|s| s.eq_ignore_ascii_case(sh_lower))
+            };
+            if let Some(slot) = slot_opt {
+                let dst = by_slot.entry(slot).or_default();
+                for &r in rects {
+                    push_dedup_rect(dst, r);
+                }
+            }
+        }
+        for (s1, s2, rect) in &expanded.three_d {
+            let a = sheets.iter().position(|s| s.eq_ignore_ascii_case(s1));
+            let b = sheets.iter().position(|s| s.eq_ignore_ascii_case(s2));
+            if let (Some(ia), Some(ib)) = (a, b) {
+                let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
+                for slot in lo..=hi {
+                    push_dedup_rect(by_slot.entry(slot).or_default(), *rect);
+                }
+            }
+        }
+        ResolvedFilter {
+            by_slot,
+            fallback_all: false,
+        }
+    }
+}
+
+impl ResolvedFilter {
+    #[inline]
+    pub fn includes_sheet(&self, sid: usize) -> bool {
+        self.fallback_all || self.by_slot.contains_key(&sid)
+    }
+
+    #[inline]
+    pub fn includes_cell(&self, sid: usize, r: u32, c: u32) -> bool {
+        if self.fallback_all {
+            return true;
+        }
+        let Some(rects) = self.by_slot.get(&sid) else {
+            return false;
+        };
+        rects
+            .iter()
+            .any(|&(r1, c1, r2, c2)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+    }
+}
+
+fn collect_single_link_node(node: &crate::formula::Node, bf: &mut BookFilter) {
+    use crate::formula::Node;
+    match node {
+        Node::Ref(re) => {
+            if re.book.is_some() && re.row >= 0 && re.col >= 0 {
+                let (r, c) = (re.row as u32, re.col as u32);
+                if let (Some(s1), Some(s2)) = (&re.sheet, &re.sheet2) {
+                    bf.add_three_d(s1, s2, (r, c, r, c));
+                } else {
+                    bf.add_sheet_rect(re.sheet.as_deref(), (r, c, r, c));
+                }
+            }
+        }
+        Node::Spill(re) => {
+            if re.book.is_some() && re.row >= 0 && re.col >= 0 {
+                bf.add_sheet_rect(re.sheet.as_deref(), (re.row as u32, re.col as u32, 1_048_575, 16_383));
+            }
+        }
+        Node::Range(a, b) => {
+            if a.book.is_some() || b.book.is_some() {
+                let rect = (
+                    a.row.min(b.row).max(0) as u32,
+                    a.col.min(b.col).max(0) as u32,
+                    a.row.max(b.row).max(0) as u32,
+                    a.col.max(b.col).max(0) as u32,
+                );
+                let rep = if a.sheet2.is_some() { a } else { b };
+                if let (Some(s1), Some(s2)) = (&rep.sheet, &rep.sheet2) {
+                    bf.add_three_d(s1, s2, rect);
+                } else {
+                    let sh = a.sheet.as_deref().or(b.sheet.as_deref());
+                    bf.add_sheet_rect(sh, rect);
+                }
+            }
+        }
+        Node::ScopedName { book: Some(_), sheet, name } => {
+            bf.add_name(sheet.as_deref(), name);
+        }
+        Node::Func(name, args) => {
+            let amounts = if name == "SUMIF" {
+                crate::formula::sumif_amount_range(args)
+            } else {
+                None
+            };
+            if name == "OFFSET" {
+                if let Some(Node::Ref(re) | Node::Range(re, _)) = args.first() {
+                    if re.book.is_some() {
+                        bf.add_sheet_rect(re.sheet.as_deref(), (0, 0, 1_048_575, 16_383));
+                    }
+                }
+            }
+            for (i, a) in args.iter().enumerate() {
+                let r = if i == 2 { amounts.as_ref().unwrap_or(a) } else { a };
+                collect_single_link_node(r, bf);
+            }
+        }
+        Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => collect_single_link_node(x, bf),
+        Node::Binary(_, l, r) => {
+            collect_single_link_node(l, bf);
+            collect_single_link_node(r, bf);
+        }
+        _ => {}
+    }
+}
+
+fn walk_wb_ext_node(wb: &Workbook, node: &crate::formula::Node, filters: &mut [BookFilter]) {
+    use crate::formula::Node;
+    match node {
+        Node::Ref(re) => {
+            if let Some(bk) = re.book.as_deref() {
+                if let Some(li) = resolve_book(wb, bk) {
+                    if re.row >= 0 && re.col >= 0 {
+                        let (r, c) = (re.row as u32, re.col as u32);
+                        if let (Some(s1), Some(s2)) = (&re.sheet, &re.sheet2) {
+                            filters[li].add_three_d(s1, s2, (r, c, r, c));
+                        } else {
+                            filters[li].add_sheet_rect(re.sheet.as_deref(), (r, c, r, c));
+                        }
+                    }
+                }
+            }
+        }
+        Node::Spill(re) => {
+            if let Some(bk) = re.book.as_deref() {
+                if let Some(li) = resolve_book(wb, bk) {
+                    let r = re.row.max(0) as u32;
+                    let c = re.col.max(0) as u32;
+                    filters[li].add_sheet_rect(re.sheet.as_deref(), (r, c, 1_048_575, 16_383));
+                }
+            }
+        }
+        Node::Range(a, b) => {
+            if let Some(bk) = a.book.as_deref().or(b.book.as_deref()) {
+                if let Some(li) = resolve_book(wb, bk) {
+                    let rect = (
+                        a.row.min(b.row).max(0) as u32,
+                        a.col.min(b.col).max(0) as u32,
+                        a.row.max(b.row).max(0) as u32,
+                        a.col.max(b.col).max(0) as u32,
+                    );
+                    let rep = if a.sheet2.is_some() { a } else { b };
+                    if let (Some(s1), Some(s2)) = (&rep.sheet, &rep.sheet2) {
+                        filters[li].add_three_d(s1, s2, rect);
+                    } else {
+                        let sh = a.sheet.as_deref().or(b.sheet.as_deref());
+                        filters[li].add_sheet_rect(sh, rect);
+                    }
+                }
+            }
+        }
+        Node::ScopedName { book: Some(bk), sheet, name } => {
+            if let Some(li) = resolve_book(wb, bk) {
+                filters[li].add_name(sheet.as_deref(), name);
+            }
+        }
+        Node::Func(name, args) => {
+            let amounts = if name == "SUMIF" {
+                crate::formula::sumif_amount_range(args)
+            } else {
+                None
+            };
+            if name == "OFFSET" {
+                if let Some(Node::Ref(re) | Node::Range(re, _)) = args.first() {
+                    if let Some(bk) = re.book.as_deref() {
+                        if let Some(li) = resolve_book(wb, bk) {
+                            filters[li].add_sheet_rect(re.sheet.as_deref(), (0, 0, 1_048_575, 16_383));
+                        }
+                    }
+                }
+            }
+            for (i, a) in args.iter().enumerate() {
+                let r = if i == 2 { amounts.as_ref().unwrap_or(a) } else { a };
+                walk_wb_ext_node(wb, r, filters);
+            }
+        }
+        Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => walk_wb_ext_node(wb, x, filters),
+        Node::Binary(_, l, r) => {
+            walk_wb_ext_node(wb, l, filters);
+            walk_wb_ext_node(wb, r, filters);
+        }
+        _ => {}
+    }
+}
+
+fn scan_formula_for_links(wb: &Workbook, f: &str, filters: &mut [BookFilter]) {
+    if !f.contains('[') && !f.contains('!') {
+        return;
+    }
+    // 普通表内公式（如 `=Sheet2!A1`）不含 `[`，若链接文件名也未出现在公式中则快速跳过
+    if !f.contains('[')
+        && !wb.links.iter().any(|l| {
+            let fnm = l.file_name();
+            !fnm.is_empty() && f.to_lowercase().contains(&fnm.to_lowercase())
+        })
+    {
+        return;
+    }
+    let raw = f.strip_prefix('=').unwrap_or(f);
+    let norm = crate::normalize_formula(raw);
+    match crate::formula::parse(&norm) {
+        Ok(node) => walk_wb_ext_node(wb, &node, filters),
+        Err(_) => {
+            for tok in books_in_formula(f) {
+                if let Some(li) = resolve_book(wb, &tok) {
+                    filters[li].any_ref = true;
+                    filters[li].fallback_all = true;
+                }
+            }
+        }
+    }
+}
+
+/// 扫描工作簿内全部公式与名称，提取每个外部链接实际被引用的工作表与单元格范围。
+pub fn build_book_filters(wb: &Workbook) -> Vec<BookFilter> {
+    let mut filters = vec![BookFilter::default(); wb.links.len()];
+    if filters.is_empty() {
+        return filters;
+    }
+    for sheet in &wb.sheets {
+        for (_, cell) in sheet.iter() {
+            if let Some(f) = cell.formula.as_deref() {
+                scan_formula_for_links(wb, f, &mut filters);
+            }
+        }
+        for dv in &sheet.dv {
+            if dv.f1.starts_with('=') {
+                scan_formula_for_links(wb, &dv.f1, &mut filters);
+            }
+            if dv.f2.starts_with('=') {
+                scan_formula_for_links(wb, &dv.f2, &mut filters);
+            }
+        }
+        for block in &sheet.cf.blocks {
+            for rule in &block.rules {
+                match &rule.kind {
+                    crate::cf::CfKind::CellIs { a, b, .. } => {
+                        if a.starts_with('=') {
+                            scan_formula_for_links(wb, a, &mut filters);
+                        }
+                        if b.starts_with('=') {
+                            scan_formula_for_links(wb, b, &mut filters);
+                        }
+                    }
+                    crate::cf::CfKind::Expr { formula, .. } => {
+                        scan_formula_for_links(wb, formula, &mut filters);
+                    }
+                    crate::cf::CfKind::Scale { points } => {
+                        for (c, _) in points {
+                            if !c.formula.is_empty() {
+                                scan_formula_for_links(wb, &c.formula, &mut filters);
+                            }
+                        }
+                    }
+                    crate::cf::CfKind::Bar { min, max, .. } => {
+                        if !min.formula.is_empty() {
+                            scan_formula_for_links(wb, &min.formula, &mut filters);
+                        }
+                        if !max.formula.is_empty() {
+                            scan_formula_for_links(wb, &max.formula, &mut filters);
+                        }
+                    }
+                    crate::cf::CfKind::IconSet { thresholds, .. } => {
+                        for c in thresholds {
+                            if !c.formula.is_empty() {
+                                scan_formula_for_links(wb, &c.formula, &mut filters);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (_, _, refers) in &wb.names {
+        scan_formula_for_links(wb, refers, &mut filters);
+    }
+    filters
+}
+
+/// 判断新读取的受限缓存与现有 `link` 在被引用区域、三维表区间及被引用名称上是否确实发生变化。
+pub fn link_differs_on_filter(
+    link: &ExternalBook,
+    bf: &BookFilter,
+    new_sheets: &[String],
+    new_vals: &BTreeMap<(usize, u32, u32), Value>,
+    new_dnames: &[(String, Option<usize>, String)],
+) -> bool {
+    if !bf.any_ref {
+        return false;
+    }
+    let effective_dnames = if new_dnames.is_empty() {
+        link.defined_names.as_slice()
+    } else {
+        new_dnames
+    };
+    // 检查被引用的外部名称定义是否变化
+    if !bf.names.is_empty() && !new_dnames.is_empty() {
+        for (_, nm_lower) in &bf.names {
+            let old_def = link
+                .defined_names
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(nm_lower));
+            let new_def = new_dnames
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(nm_lower));
+            if old_def != new_def {
+                return true;
+            }
+        }
+    }
+    // 三维引用需要感知首尾之间工作表增删或重排（如 SHEETS([1]First:Third!A1)）
+    for (s1, s2, _) in &bf.three_d {
+        let span_of = |list: &[String]| -> Option<Vec<String>> {
+            let a = list.iter().position(|s| s.eq_ignore_ascii_case(s1))?;
+            let b = list.iter().position(|s| s.eq_ignore_ascii_case(s2))?;
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            Some(list[lo..=hi].to_vec())
+        };
+        if span_of(&link.sheets) != span_of(new_sheets) {
+            return true;
+        }
+    }
+    let old_resolved = bf.resolve(&link.sheets, &link.defined_names);
+    let new_resolved = bf.resolve(new_sheets, effective_dnames);
+    // 若被引用的表在外部工作簿中的槽位序号变了（如前面插入了新表），需要同步重写
+    if old_resolved.by_slot != new_resolved.by_slot {
+        return true;
+    }
+    for (&k, v) in new_vals.iter() {
+        if new_resolved.includes_cell(k.0, k.1, k.2) && link.cache.get(&k) != Some(v) {
+            return true;
+        }
+    }
+    for (&k, _) in link.cache.iter() {
+        if old_resolved.includes_cell(k.0, k.1, k.2) && !new_vals.contains_key(&k) {
+            return true;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------- 写缓存
+
+/// 把刷新过的链接缓存写回 externalLink 部件（仅写入本工作簿实际引用的单元格，对标 Excel/WPS 杜绝体积暴涨）
+pub fn write_cache_for_wb(path: &Path, wb: &Workbook) -> Result<usize> {
+    let filters = build_book_filters(wb);
+    write_cache_inner(path, &wb.links, Some(&filters))
+}
 
 /// 把刷新过的链接缓存写回 externalLink 部件（没刷新的一个字节都不动）
 pub fn write_cache(path: &Path, links: &[ExternalBook]) -> Result<usize> {
+    write_cache_inner(path, links, None)
+}
+
+fn write_cache_inner(
+    path: &Path,
+    links: &[ExternalBook],
+    filters: Option<&[BookFilter]>,
+) -> Result<usize> {
     let mut n = 0;
-    for l in links.iter() {
+    for (i, l) in links.iter().enumerate() {
         if !l.refreshed || l.part.is_empty() {
             continue;
         }
@@ -323,7 +896,10 @@ pub fn write_cache(path: &Path, links: &[ExternalBook]) -> Result<usize> {
             continue;
         };
         let xml = String::from_utf8_lossy(&bytes).to_string();
-        let new = replace_sheet_data(&xml, l);
+        let resolved = filters
+            .and_then(|fs| fs.get(i))
+            .map(|bf| bf.resolve(&l.sheets, &l.defined_names));
+        let new = replace_sheet_data_filtered(&xml, l, resolved.as_ref());
         if new != xml {
             crate::patch::append_entry(path, &l.part, new.as_bytes())
                 .with_context(|| format!("写回 {} 失败", l.part))?;
@@ -334,67 +910,204 @@ pub fn write_cache(path: &Path, links: &[ExternalBook]) -> Result<usize> {
 }
 
 pub fn replace_sheet_data(xml: &str, link: &ExternalBook) -> String {
-    let body = sheet_data_xml(link);
-    // 整段替换；自闭合 `<sheetDataSet/>` 也按段处理
-    if let Some(start) = xml.find("<sheetDataSet") {
+    replace_sheet_data_filtered(xml, link, None)
+}
+
+fn replace_sheet_data_filtered(
+    xml: &str,
+    link: &ExternalBook,
+    filter: Option<&ResolvedFilter>,
+) -> String {
+    let mut out_xml = xml.to_string();
+    if !link.sheets.is_empty() && out_xml.contains("<sheetNames") {
+        let names: String = link
+            .sheets
+            .iter()
+            .map(|s| format!("<sheetName val=\"{}\"/>", xml_escape(s)))
+            .collect();
+        out_xml = replace_or_insert_block(
+            &out_xml,
+            "sheetNames",
+            &format!("<sheetNames>{names}</sheetNames>"),
+            &["<definedNames", "<sheetDataSet", "</externalBook>"],
+        );
+    }
+    let dnames = defined_names_xml(link);
+    if !dnames.is_empty() || out_xml.contains("<definedNames") {
+        out_xml = replace_or_insert_block(
+            &out_xml,
+            "definedNames",
+            &dnames,
+            &["<sheetDataSet", "</externalBook>"],
+        );
+    }
+    let body = sheet_data_xml_filtered(link, filter);
+    replace_or_insert_block(&out_xml, "sheetDataSet", &body, &["</externalBook>"])
+}
+
+fn replace_or_insert_block(xml: &str, tag: &str, replacement: &str, anchors: &[&str]) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    if let Some(start) = xml.find(&open) {
         let after = &xml[start..];
-        let end = if let Some(i) = after.find("</sheetDataSet>") {
-            Some(start + i + "</sheetDataSet>".len())
+        let end = if let Some(i) = after.find(&close) {
+            Some(start + i + close.len())
         } else {
             after.find("/>").map(|i| start + i + 2)
         };
         if let Some(end) = end {
-            let mut out = String::with_capacity(xml.len() + body.len());
+            let mut out = String::with_capacity(xml.len() + replacement.len());
             out.push_str(&xml[..start]);
-            out.push_str(&body);
+            out.push_str(replacement);
             out.push_str(&xml[end..]);
             return out;
         }
     }
-    if let Some(i) = xml.find("</externalBook>") {
-        let mut out = String::with_capacity(xml.len() + body.len());
-        out.push_str(&xml[..i]);
-        out.push_str(&body);
-        out.push_str(&xml[i..]);
-        return out;
+    if replacement.is_empty() {
+        return xml.to_string();
+    }
+    for anc in anchors {
+        if let Some(i) = xml.find(anc) {
+            let mut out = String::with_capacity(xml.len() + replacement.len());
+            out.push_str(&xml[..i]);
+            out.push_str(replacement);
+            out.push_str(&xml[i..]);
+            return out;
+        }
     }
     xml.to_string()
 }
 
-fn sheet_data_xml(link: &ExternalBook) -> String {
-    // sheetId → row → cells
-    let mut by_sheet: BTreeMap<usize, BTreeMap<u32, Vec<(u32, &Value)>>> = BTreeMap::new();
-    for ((sid, r, c), v) in link.cache.iter() {
-        by_sheet.entry(*sid).or_default().entry(*r).or_default().push((*c, v));
+fn defined_names_xml(link: &ExternalBook) -> String {
+    if link.defined_names.is_empty() {
+        return String::new();
     }
-    let mut out = String::from("<sheetDataSet>");
-    for (sid, rows) in by_sheet {
-        out.push_str(&format!("<sheetData sheetId=\"{sid}\">"));
-        for (r, mut cells) in rows {
-            cells.sort_by_key(|(c, _)| *c);
-            out.push_str(&format!("<row r=\"{}\">", r + 1));
-            for (c, v) in cells {
-                out.push_str(&cell_xml(r, c, v));
-            }
-            out.push_str("</row>");
+    let mut out = String::from("<definedNames>");
+    for (nm, sid, refers) in &link.defined_names {
+        out.push_str("<definedName name=\"");
+        out.push_str(&xml_escape(nm));
+        out.push('"');
+        if !refers.is_empty() {
+            out.push_str(" refersTo=\"");
+            out.push_str(&xml_escape(refers));
+            out.push('"');
         }
+        if let Some(id) = sid {
+            out.push_str(&format!(" sheetId=\"{id}\""));
+        }
+        out.push_str("/>");
+    }
+    out.push_str("</definedNames>");
+    out
+}
+
+fn sheet_data_xml_filtered(link: &ExternalBook, filter: Option<&ResolvedFilter>) -> String {
+    // link.cache 本身已是 BTreeMap<(usize, u32, u32), Value>，天然按 (sheetId, row, col) 严格升序排列：
+    // 落盘时仅输出当前工作簿实际引用的单元格，对标 Excel/WPS 行为，彻底杜绝将数万行未引用外部数据内嵌进包内。
+    let est = match filter {
+        Some(f) if !f.fallback_all => link.cache.len().min(512),
+        _ => link.cache.len().min(4096),
+    };
+    let mut out = String::with_capacity(32 + est * 36);
+    out.push_str("<sheetDataSet>");
+    let mut cur_sid: Option<usize> = None;
+    let mut cur_row: Option<u32> = None;
+    for (&(sid, r, c), v) in link.cache.iter() {
+        if matches!(v, Value::Empty) {
+            continue;
+        }
+        if let Some(rf) = filter {
+            if !rf.includes_cell(sid, r, c) {
+                continue;
+            }
+        }
+        if cur_sid != Some(sid) {
+            if cur_row.take().is_some() {
+                out.push_str("</row>");
+            }
+            if cur_sid.is_some() {
+                out.push_str("</sheetData>");
+            }
+            use std::fmt::Write as _;
+            let _ = write!(out, "<sheetData sheetId=\"{sid}\">");
+            cur_sid = Some(sid);
+        }
+        if cur_row != Some(r) {
+            if cur_row.is_some() {
+                out.push_str("</row>");
+            }
+            use std::fmt::Write as _;
+            let _ = write!(out, "<row r=\"{}\">", r + 1);
+            cur_row = Some(r);
+        }
+        push_cell_xml(&mut out, r, c, v);
+    }
+    if cur_row.is_some() {
+        out.push_str("</row>");
+    }
+    if cur_sid.is_some() {
         out.push_str("</sheetData>");
     }
     out.push_str("</sheetDataSet>");
     out
 }
 
-fn cell_xml(r: u32, c: u32, v: &Value) -> String {
-    let name = format!("{}{}", crate::model::col_label(c), r + 1);
+fn push_col_letters(out: &mut String, c: u32) {
+    let mut buf = [0u8; 8];
+    let mut idx = 8usize;
+    let mut n = c + 1;
+    while n > 0 {
+        idx -= 1;
+        buf[idx] = b'A' + ((n - 1) % 26) as u8;
+        n = (n - 1) / 26;
+    }
+    if let Ok(s) = std::str::from_utf8(&buf[idx..]) {
+        out.push_str(s);
+    }
+}
+
+fn push_xml_escaped(out: &mut String, s: &str) {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        out.push_str(s);
+        return;
+    }
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn push_cell_xml(out: &mut String, r: u32, c: u32, v: &Value) {
+    use std::fmt::Write as _;
     match v {
-        Value::Number(n) => format!("<cell r=\"{name}\"><v>{}</v></cell>", crate::model::format_number(*n)),
-        Value::Text(t) => format!(
-            "<cell r=\"{name}\" t=\"str\"><v>{}</v></cell>",
-            xml_escape(t)
-        ),
-        Value::Bool(b) => format!("<cell r=\"{name}\" t=\"b\"><v>{}</v></cell>", if *b { 1 } else { 0 }),
-        Value::Error(e) => format!("<cell r=\"{name}\" t=\"e\"><v>{}</v></cell>", e.text()),
-        Value::Empty => String::new(),
+        Value::Number(n) => {
+            out.push_str("<cell r=\"");
+            push_col_letters(out, c);
+            let _ = write!(out, "{}\"><v>{}</v></cell>", r + 1, crate::model::format_number(*n));
+        }
+        Value::Text(t) => {
+            out.push_str("<cell r=\"");
+            push_col_letters(out, c);
+            let _ = write!(out, "{}\" t=\"str\"><v>", r + 1);
+            push_xml_escaped(out, t);
+            out.push_str("</v></cell>");
+        }
+        Value::Bool(b) => {
+            out.push_str("<cell r=\"");
+            push_col_letters(out, c);
+            let _ = write!(out, "{}\" t=\"b\"><v>{}</v></cell>", r + 1, if *b { 1 } else { 0 });
+        }
+        Value::Error(e) => {
+            out.push_str("<cell r=\"");
+            push_col_letters(out, c);
+            let _ = write!(out, "{}\" t=\"e\"><v>{}</v></cell>", r + 1, e.text());
+        }
+        Value::Empty => {}
     }
 }
 
@@ -407,11 +1120,25 @@ fn xml_escape(s: &str) -> String {
 
 // ---------------------------------------------------------------- 补部件
 
+/// 按工作簿实际引用的范围补齐新建的 externalLink 部件。
+pub fn ensure_parts_for_wb(path: &Path, wb: &Workbook) -> Result<usize> {
+    let filters = build_book_filters(wb);
+    ensure_parts_inner(path, &wb.links, Some(&filters))
+}
+
 /// 让包里的 externalLink 部件与 `wb.links` 对齐（用户手输新工作簿、或界面上加了链接）。
 ///
 /// 只补缺的：已有部件、已有关系、已有 Override 都不动；`<externalReferences>`
 /// 只在条目数/顺序对不上时才整段重写。
 pub fn ensure_parts(path: &Path, links: &[ExternalBook]) -> Result<usize> {
+    ensure_parts_inner(path, links, None)
+}
+
+fn ensure_parts_inner(
+    path: &Path,
+    links: &[ExternalBook],
+    filters: Option<&[BookFilter]>,
+) -> Result<usize> {
     if links.is_empty() {
         return Ok(0);
     }
@@ -433,9 +1160,12 @@ pub fn ensure_parts(path: &Path, links: &[ExternalBook]) -> Result<usize> {
         } else {
             link.part.clone()
         };
-        // 部件不存在就写一份（含当前缓存）
+        // 部件不存在就写一份（含当前被引用缓存）
         if crate::fixups::read_part(path, &part).is_none() {
-            crate::patch::append_entry(path, &part, link_xml(link).as_bytes())
+            let resolved = filters
+                .and_then(|fs| fs.get(i))
+                .map(|bf| bf.resolve(&link.sheets, &link.defined_names));
+            crate::patch::append_entry(path, &part, link_xml(link, resolved.as_ref()).as_bytes())
                 .with_context(|| format!("写 {part} 失败"))?;
             let rels_name = part_rels(&part);
             crate::patch::append_entry(path, &rels_name, link_rels_xml(link).as_bytes())
@@ -506,22 +1236,22 @@ pub fn ensure_parts(path: &Path, links: &[ExternalBook]) -> Result<usize> {
     Ok(changed_parts)
 }
 
-fn link_xml(link: &ExternalBook) -> String {
+fn link_xml(link: &ExternalBook, filter: Option<&ResolvedFilter>) -> String {
     let names: String = link
         .sheets
         .iter()
         .map(|s| format!("<sheetName val=\"{}\"/>", xml_escape(s)))
         .collect();
+    let dnames = defined_names_xml(link);
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>         <externalLink xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"          xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">         <externalBook r:id=\"rId1\"><sheetNames>{names}</sheetNames>{}
-</externalBook></externalLink>",
-        sheet_data_xml(link)
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><externalLink xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><externalBook r:id=\"rId1\"><sheetNames>{names}</sheetNames>{dnames}{}</externalBook></externalLink>",
+        sheet_data_xml_filtered(link, filter)
     )
 }
 
 fn link_rels_xml(link: &ExternalBook) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">         <Relationship Id=\"rId1\"          Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath\"          Target=\"{}\" TargetMode=\"External\"/></Relationships>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath\" Target=\"{}\" TargetMode=\"External\"/></Relationships>",
         xml_escape(&link.target)
     )
 }
@@ -574,7 +1304,7 @@ pub struct RefreshReport {
     pub failed: Vec<(String, String)>,
 }
 
-/// 按链接里的 target 去磁盘上找文件，重读被引用表的已用区域填进缓存
+/// 按链接里的 target 去磁盘上找文件，重读被引用表的区域填进缓存
 pub fn refresh(wb: &mut Workbook) -> RefreshReport {
     let base = wb
         .path
@@ -582,15 +1312,20 @@ pub fn refresh(wb: &mut Workbook) -> RefreshReport {
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
+    let filters = build_book_filters(wb);
     let mut rep = RefreshReport { ok: 0, failed: Vec::new() };
-    for link in wb.links.iter_mut() {
+    for (i, link) in wb.links.iter_mut().enumerate() {
         let Some(path) = resolve_path(link, &base) else {
             rep.failed.push((label(link), "找不到文件".into()));
             continue;
         };
-        match load_sheet_values(&path, &mut link.sheets) {
-            Ok(vals) => {
-                link.cache = vals;
+        let bf_opt = filters.get(i).filter(|bf| bf.any_ref);
+        match load_sheet_values_filtered(&path, &mut link.sheets, bf_opt) {
+            Ok((vals, dnames)) => {
+                link.cache = ExternalCache::from_map(vals);
+                if !dnames.is_empty() {
+                    link.defined_names = dnames;
+                }
                 link.refreshed = true;
                 rep.ok += 1;
             }
@@ -598,6 +1333,265 @@ pub fn refresh(wb: &mut Workbook) -> RefreshReport {
         }
     }
     rep
+}
+
+/// 在磁盘上查找外部链接对应的真实文件路径（相对路径 → 绝对路径 → 同目录同名文件）。
+pub fn resolve_link_path(wb: &Workbook, link: &ExternalBook) -> Option<PathBuf> {
+    let base = wb
+        .path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    resolve_path(link, &base)
+}
+
+/// 带候选目录/最近文件提示的路径解析（用于桌面端全自动发现与刷新）：
+/// 优先级：原相对路径 → 原绝对路径 → 同目录同名 → 当前目录下一级子目录（上限 40 个） → 最近打开文件及所在目录。
+pub fn resolve_link_path_with_hints(
+    wb: &Workbook,
+    link: &ExternalBook,
+    hints: &[PathBuf],
+) -> Option<PathBuf> {
+    let base = wb
+        .path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    resolve_path_with_hints(link, &base, hints)
+}
+
+pub fn resolve_path_with_hints(
+    link: &ExternalBook,
+    base: &Path,
+    hints: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(p) = resolve_path(link, base) {
+        return Some(p);
+    }
+    let fname = link.file_name();
+    if fname.is_empty() {
+        return None;
+    }
+    let fname_lower = fname.to_lowercase();
+
+    // 1) 当前工作簿目录的一级子文件夹（如 `./分表/xxx.xlsx`），排除盘符根目录以防扫全盘
+    if !base.as_os_str().is_empty() && base.parent().is_some() {
+        if let Ok(rd) = std::fs::read_dir(base) {
+            for entry in rd.flatten().take(40) {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let cand = entry.path().join(&fname);
+                    if cand.exists() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) 最近打开或同窗口已打开标签页中的精确同名文件
+    for hp in hints {
+        if hp
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase() == fname_lower)
+            .unwrap_or(false)
+            && hp.exists()
+        {
+            return Some(hp.clone());
+        }
+    }
+
+    // 3) 最近打开文件所在的工作目录中存在同名源文件
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    for hp in hints {
+        let Some(dir) = hp.parent() else { continue };
+        if dir.parent().is_none() || seen_dirs.iter().any(|d| d == dir) {
+            continue;
+        }
+        seen_dirs.push(dir.to_path_buf());
+        let cand = dir.join(&fname);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+/// 读取指定磁盘工作簿生成外部链接快照（供后台文件监控线程无锁调用）
+pub fn load_link_snapshot(
+    path: &Path,
+    prev_sheets: &[String],
+) -> Result<(
+    Vec<String>,
+    BTreeMap<(usize, u32, u32), Value>,
+    Vec<(String, Option<usize>, String)>,
+)> {
+    load_link_snapshot_filtered(path, prev_sheets, None)
+}
+
+/// 按被引用范围读取外部链接快照：跳过未引用的工作表与单元格，大幅降低内存占用与 I/O。
+pub fn load_link_snapshot_filtered(
+    path: &Path,
+    prev_sheets: &[String],
+    filter: Option<&BookFilter>,
+) -> Result<(
+    Vec<String>,
+    BTreeMap<(usize, u32, u32), Value>,
+    Vec<(String, Option<usize>, String)>,
+)> {
+    let mut sheets = prev_sheets.to_vec();
+    let (vals, dnames) = load_sheet_values_filtered(path, &mut sheets, filter)?;
+    Ok((sheets, vals, dnames))
+}
+
+/// 带候选提示刷新外部链接，并返回 `(报告, 实际数据发生变化的链接名列表)`。
+/// 仅对比当前工作簿实际引用的单元格/表名/名称：若被引用内容与现有内嵌缓存完全一致，
+/// 则不置 `refreshed = true`，避免误标脏数据或将整本外部工作簿塞进包内。
+pub fn refresh_with_hints(wb: &mut Workbook, hints: &[PathBuf]) -> (RefreshReport, Vec<String>) {
+    let base = wb
+        .path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let filters = build_book_filters(wb);
+    let mut rep = RefreshReport {
+        ok: 0,
+        failed: Vec::new(),
+    };
+    let mut changed = Vec::new();
+    for (i, link) in wb.links.iter_mut().enumerate() {
+        let Some(bf) = filters.get(i) else { continue };
+        // 当前工作簿没有任何公式引用此外部链接时，跳过扫描，绝不读取大文件占内存
+        if !bf.any_ref {
+            continue;
+        }
+        let Some(path) = resolve_path_with_hints(link, &base, hints) else {
+            rep.failed.push((label(link), "找不到文件".into()));
+            continue;
+        };
+        let mut new_sheets = link.sheets.clone();
+        match load_sheet_values_filtered(&path, &mut new_sheets, Some(bf)) {
+            Ok((vals, dnames)) => {
+                let diff = link_differs_on_filter(link, bf, &new_sheets, &vals, &dnames);
+                link.sheets = new_sheets;
+                if diff {
+                    let lbl = label(link);
+                    link.cache = ExternalCache::from_map(vals);
+                    if !dnames.is_empty() {
+                        link.defined_names = dnames;
+                    }
+                    link.refreshed = true;
+                    changed.push(lbl);
+                } else {
+                    // 被引用值完全一致：顺手收敛内存缓存到被引用子集，不标 refreshed
+                    if link.cache.len() > vals.len() {
+                        link.cache = ExternalCache::from_map(vals);
+                    }
+                    if link.defined_names.is_empty() && !dnames.is_empty() {
+                        link.defined_names = dnames;
+                    }
+                }
+                rep.ok += 1;
+            }
+            Err(e) => rep.failed.push((label(link), format!("{e:#}"))),
+        }
+    }
+    (rep, changed)
+}
+
+/// 直接从同进程已打开的内存 `Workbook` 实时同步外部链接缓存（无需等源标签页落盘保存！）。
+pub fn sync_link_from_workbook(link: &mut ExternalBook, src_wb: &Workbook) -> bool {
+    sync_link_from_workbook_filtered(link, src_wb, None)
+}
+
+/// 按当前工作簿实际引用的范围，从同进程已打开的内存 `Workbook` 同步外部链接缓存。
+pub fn sync_link_from_workbook_filtered(
+    link: &mut ExternalBook,
+    src_wb: &Workbook,
+    filter: Option<&BookFilter>,
+) -> bool {
+    if src_wb.sheets.is_empty() {
+        return false;
+    }
+    if let Some(bf) = filter {
+        if !bf.any_ref {
+            return false;
+        }
+    }
+    let live_sheets: Vec<String> = src_wb.sheets.iter().map(|s| s.name.clone()).collect();
+    let effective_dnames = if src_wb.names.is_empty() {
+        link.defined_names.as_slice()
+    } else {
+        src_wb.names.as_slice()
+    };
+    let resolved = filter.map(|bf| bf.resolve(&live_sheets, effective_dnames));
+
+    let sheets_same = link.sheets == live_sheets;
+    let dnames_diff = !src_wb.names.is_empty() && link.defined_names != src_wb.names;
+    if sheets_same && !dnames_diff {
+        let mut non_empty = 0usize;
+        let mut all_match = true;
+        'scan: for (sid, sh) in src_wb.sheets.iter().enumerate() {
+            if let Some(ref rf) = resolved {
+                if !rf.includes_sheet(sid) {
+                    continue;
+                }
+            }
+            for (cref, cell) in sh.iter() {
+                if !cell.value.is_empty() {
+                    if let Some(ref rf) = resolved {
+                        if !rf.includes_cell(sid, cref.row, cref.col) {
+                            continue;
+                        }
+                    }
+                    non_empty += 1;
+                    if link.cache.get(&(sid, cref.row, cref.col)) != Some(&cell.value) {
+                        all_match = false;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let expected_existing = match &resolved {
+            Some(rf) => link
+                .cache
+                .keys()
+                .filter(|&&(sid, r, c)| rf.includes_cell(sid, r, c))
+                .count(),
+            None => link.cache.len(),
+        };
+        if all_match && non_empty == expected_existing {
+            return false;
+        }
+    }
+    let mut live_cache: BTreeMap<(usize, u32, u32), Value> = BTreeMap::new();
+    for (sid, sh) in src_wb.sheets.iter().enumerate() {
+        if let Some(ref rf) = resolved {
+            if !rf.includes_sheet(sid) {
+                continue;
+            }
+        }
+        for (cref, cell) in sh.iter() {
+            if !cell.value.is_empty() {
+                if let Some(ref rf) = resolved {
+                    if !rf.includes_cell(sid, cref.row, cref.col) {
+                        continue;
+                    }
+                }
+                live_cache.insert((sid, cref.row, cref.col), cell.value.clone());
+            }
+        }
+    }
+    link.sheets = live_sheets;
+    link.cache = ExternalCache::from_map(live_cache);
+    if !src_wb.names.is_empty() {
+        link.defined_names = src_wb.names.clone();
+    }
+    link.refreshed = true;
+    true
 }
 
 fn resolve_path(link: &ExternalBook, base: &Path) -> Option<PathBuf> {
@@ -650,34 +1644,89 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn load_sheet_values(
+fn load_sheet_values_filtered(
     path: &Path,
     sheets: &mut Vec<String>,
-) -> Result<BTreeMap<(usize, u32, u32), Value>> {
+    filter: Option<&BookFilter>,
+) -> Result<(BTreeMap<(usize, u32, u32), Value>, Vec<(String, Option<usize>, String)>)> {
     use calamine::{open_workbook_auto, Reader};
     let mut book = open_workbook_auto(path)?;
-    if sheets.is_empty() {
-        *sheets = book.sheet_names().to_owned();
+    // 总是与源文件最新工作表顺序同步，保证外部三维区间 `First:Third` 能感知插入/重排的中间表。
+    let live_names = book.sheet_names().to_owned();
+    if !live_names.is_empty() {
+        *sheets = live_names.clone();
     }
-    let names = book.sheet_names().to_owned();
+    let mut dnames = crate::patch::read_defined_names(path);
+    if dnames.is_empty() {
+        for (nm, formula) in book.defined_names() {
+            if !nm.starts_with("_xlnm.") {
+                dnames.push((nm.clone(), None, formula.clone()));
+            }
+        }
+    }
+    if let Some(bf) = filter {
+        if !bf.any_ref {
+            return Ok((BTreeMap::new(), dnames));
+        }
+    }
+    let resolved = filter.map(|bf| bf.resolve(sheets, &dnames));
+    let is_ooxml = crate::crypto::has_magic(path, b"PK");
+    let targets = if is_ooxml {
+        crate::patch::sheet_targets(path).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut shared_ss: Option<Vec<String>> = None;
     let mut out = BTreeMap::new();
     for (sid, want) in sheets.iter().enumerate() {
-        let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(want)) else {
+        if let Some(ref rf) = resolved {
+            if !rf.includes_sheet(sid) {
+                continue;
+            }
+        }
+        let Some(name) = live_names.iter().find(|n| n.eq_ignore_ascii_case(want)) else {
             continue;
         };
+        // 防止外部工作簿因角落残留格式/单元格（如 XFD1048576）触发 calamine 稠密网格数 GB OOM
+        if is_ooxml {
+            if let Some(part) = targets.get(name) {
+                if crate::sparse::declared_area_of(path, part) > crate::sparse::DENSE_LIMIT {
+                    let ss = shared_ss.get_or_insert_with(|| crate::sparse::shared_strings(path));
+                    if let Ok(cells) = crate::sparse::read_sheet(path, part, ss) {
+                        for ((r, c), cell) in cells {
+                            if !cell.value.is_empty()
+                                && resolved
+                                    .as_ref()
+                                    .is_none_or(|rf| rf.includes_cell(sid, r, c))
+                            {
+                                out.insert((sid, r, c), cell.value);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
         let range = match book.worksheet_range(name) {
             Ok(r) => r,
             Err(_) => continue,
         };
         let (r0, c0) = range.start().unwrap_or((0, 0));
         for (row, col, data) in range.cells() {
+            let rr = r0 + row as u32;
+            let cc = c0 + col as u32;
+            if let Some(ref rf) = resolved {
+                if !rf.includes_cell(sid, rr, cc) {
+                    continue;
+                }
+            }
             let v = data_to_value(data);
             if !v.is_empty() {
-                out.insert((sid, r0 + row as u32, c0 + col as u32), v);
+                out.insert((sid, rr, cc), v);
             }
         }
     }
-    Ok(out)
+    Ok((out, dnames))
 }
 
 fn data_to_value(d: &calamine::Data) -> Value {
@@ -733,15 +1782,19 @@ fn file_part(s: &str) -> String {
     t.rsplit('/').next().unwrap_or(&t).to_string()
 }
 
-/// 表名 → sheetId（0 基）。没给表名时用第 0 张
+/// 表名 → sheetId（0 基）。没给表名或链接未带表名列表时用第 0 张；
+/// 若链接已声明表名清单且找不到该表，返回 None（公式求值阶段会给 #REF!）。
 pub fn sheet_slot(link: &ExternalBook, name: Option<&str>) -> Option<usize> {
     match name {
         None => Some(0),
-        Some(n) => link
-            .sheets
-            .iter()
-            .position(|s| s.eq_ignore_ascii_case(n.trim().trim_matches('\'')))
-            .or(Some(0)),
+        Some(n) => {
+            let want = n.trim().trim_matches('\'');
+            if link.sheets.is_empty() {
+                Some(0)
+            } else {
+                link.sheets.iter().position(|s| s.eq_ignore_ascii_case(want))
+            }
+        }
     }
 }
 
@@ -765,11 +1818,166 @@ pub fn raw_formula(wb: &Workbook, f: &str) -> String {
     })
 }
 
+/// 断开第 `link_idx`（0 基）个外部链接：
+/// 把本簿内所有引用该外部工作簿的公式静态化为当前缓存值（保留 `cell.value`、清除 `formula`），
+/// 同时把后续链接序号 `[k]`（k > link_idx + 1）重排为 `[k - 1]`，并移除链接条目。
+/// 返回转换为静态数值的单元格数量。
+pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
+    if link_idx >= wb.links.len() {
+        return 0;
+    }
+    let broken_num = link_idx + 1;
+    let broken_target = wb.links[link_idx].target.clone();
+    let broken_fname = wb.links[link_idx].file_name();
+    let broken_abs = wb.links[link_idx].abs.clone();
+    let matches_broken = |tok: &str| -> bool {
+        let t = tok.trim();
+        if let Ok(i) = t.parse::<usize>() {
+            return i == broken_num;
+        }
+        let want = file_part(t);
+        broken_target.eq_ignore_ascii_case(t)
+            || (!broken_fname.is_empty()
+                && (broken_fname.eq_ignore_ascii_case(&want)
+                    || broken_fname.eq_ignore_ascii_case(t)))
+            || broken_abs
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(t))
+    };
+
+    let mut converted = 0usize;
+    for sheet in wb.sheets.iter_mut() {
+        let coords: Vec<crate::model::CellRef> = sheet
+            .iter()
+            .filter_map(|(c, cell)| cell.formula.as_ref().map(|_| c))
+            .collect();
+        for cref in coords {
+            let Some(orig) = sheet.get(cref.row, cref.col).and_then(|c| c.formula.clone()) else {
+                continue;
+            };
+            let b: Vec<char> = orig.chars().collect();
+            let mut out = String::with_capacity(orig.len());
+            let mut uses_broken = false;
+            let mut changed = false;
+            let mut i = 0usize;
+            while i < b.len() {
+                if b[i] == '"' {
+                    out.push('"');
+                    i += 1;
+                    while i < b.len() {
+                        out.push(b[i]);
+                        if b[i] == '"' {
+                            if i + 1 < b.len() && b[i + 1] == '"' {
+                                out.push('"');
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b[i] == '[' {
+                    if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
+                        let inner: String = b[i + 1..i + 1 + close].iter().collect();
+                        let starts_in_sq = i > 0 && b[i - 1] == '\'';
+                        let looks_like_book = inner.chars().all(|c| c.is_ascii_digit())
+                            || has_bang_after(&b, i + close + 2, starts_in_sq);
+                        if looks_like_book {
+                            if matches_broken(&inner) {
+                                uses_broken = true;
+                                break;
+                            }
+                            if let Ok(n) = inner.trim().parse::<usize>() {
+                                if n > broken_num {
+                                    out.push('[');
+                                    out.push_str(&(n - 1).to_string());
+                                    out.push(']');
+                                    changed = true;
+                                    i += close + 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                if b[i] == '\'' {
+                    let start_q = i;
+                    let mut j = i + 1;
+                    let mut qname = String::new();
+                    while j < b.len() {
+                        if b[j] == '\'' {
+                            if j + 1 < b.len() && b[j + 1] == '\'' {
+                                qname.push('\'');
+                                j += 2;
+                                continue;
+                            }
+                            j += 1;
+                            break;
+                        }
+                        qname.push(b[j]);
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&'!') && !qname.contains('[') && matches_broken(&qname) {
+                        uses_broken = true;
+                        break;
+                    }
+                    if b.get(j) == Some(&'!') && !qname.contains('[') {
+                        for k in start_q..=j {
+                            out.push(b[k]);
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            if uses_broken {
+                if let Some(cell) = sheet.get_mut(cref.row, cref.col) {
+                    cell.formula = None;
+                    converted += 1;
+                }
+            } else if changed {
+                if let Some(cell) = sheet.get_mut(cref.row, cref.col) {
+                    cell.formula = Some(out.into());
+                }
+            }
+        }
+    }
+    wb.links.remove(link_idx);
+    for (k, l) in wb.links.iter_mut().enumerate() {
+        l.index = k + 1;
+    }
+    converted
+}
+
 fn map_books<F: Fn(&str) -> String>(f: &str, map: F) -> String {
     let b: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
     while i < b.len() {
+        // 双引号字符串字面量里的 `[1]` 只是普通文本，不能被重写。
+        if b[i] == '"' {
+            out.push('"');
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '"' {
+                    if i + 1 < b.len() && b[i + 1] == '"' {
+                        out.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if b[i] == '[' {
             if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
                 let inner: String = b[i + 1..i + 1 + close].iter().collect();
@@ -828,14 +2036,31 @@ pub fn books_in_formula(f: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < b.len() {
+        if b[i] == '"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == '"' {
+                    if i + 1 < b.len() && b[i + 1] == '"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if b[i] == '[' {
             if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
                 let inner: String = b[i + 1..i + 1 + close].iter().collect();
                 let after = b.get(i + 1 + close + 1).copied();
-                // 书名的特征是 `]` 后面还有表名和 `!`（`[1]预算!A1`），
-                // 或者是纯数字序号；`表[列]` 后面不会有 `!`
+                let starts_in_sq = i > 0 && b[i - 1] == '\'';
+                // 书名的特征是 `]` 后面跟表名（可选三维 `First:Third` / 带引号）与 `!`，
+                // 或直接跟 `!`（工作簿级外部名称 `[1]!Rate`），或纯数字序号；`表[列]` 后面不会有 `!`。
                 if !inner.is_empty()
-                    && (inner.chars().all(|c| c.is_ascii_digit()) || has_bang_after(&b, i + close + 2))
+                    && (inner.chars().all(|c| c.is_ascii_digit())
+                        || has_bang_after(&b, i + close + 2, starts_in_sq))
                     && after.is_some()
                 {
                     if !out.iter().any(|x| x.eq_ignore_ascii_case(&inner)) {
@@ -851,15 +2076,31 @@ pub fn books_in_formula(f: &str) -> Vec<String> {
     out
 }
 
-fn has_bang_after(b: &[char], from: usize) -> bool {
+fn has_bang_after(b: &[char], from: usize, starts_in_sq: bool) -> bool {
     let mut i = from;
-    while i < b.len() && i < from + 80 {
-        match b[i] {
-            '!' => return true,
-            '[' | ']' | ',' | '(' | ')' | '+' | '-' | '*' | '/' | '&' | '=' => return false,
-            c if c.is_whitespace() => return false,
-            _ => i += 1,
+    let mut in_sq = starts_in_sq;
+    let limit = (from + 160).min(b.len());
+    while i < limit {
+        let c = b[i];
+        if in_sq {
+            if c == '\'' {
+                if b.get(i + 1) == Some(&'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+            i += 1;
+            continue;
         }
+        match c {
+            '!' => return true,
+            '\'' => in_sq = true,
+            '[' | ']' | ',' | '(' | ')' | '+' | '-' | '*' | '/' | '&' | '=' => return false,
+            ch if ch.is_whitespace() => return false,
+            _ => {}
+        }
+        i += 1;
     }
     false
 }

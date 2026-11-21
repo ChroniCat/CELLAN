@@ -52,6 +52,12 @@ pub enum Node {
     /// 省略的实参：`VLOOKUP(x, r, 3, )` 里的空位
     Empty,
     Name(String),
+    /// 限定作用域的名称：工作簿级 `[1]!TaxRate` 或工作表级 `Sheet1!Rate` / `[1]Sheet1!Rate`
+    ScopedName {
+        book: Option<String>,
+        sheet: Option<String>,
+        name: String,
+    },
     Number(f64),
     Text(String),
     Bool(bool),
@@ -68,6 +74,28 @@ pub enum Node {
     Binary(BinOp, Box<Node>, Box<Node>),
     /// 数组常量 {1,2;3,4}
     Array(usize, usize, Vec<FValue>),
+}
+
+/// A SUMIF amount reference supplies the top-left cell. Dependency indexing and
+/// evaluation share this rectangle, while export keeps the user's original formula.
+pub(crate) fn sumif_amount_range(args: &[Node]) -> Option<Node> {
+    let [criteria, _, amounts] = args else { return None };
+    let (height, width) = match criteria {
+        Node::Range(a, b) => ((a.row - b.row).abs(), (a.col - b.col).abs()),
+        Node::Ref(_) => (0, 0),
+        _ => return None,
+    };
+    let start = match amounts {
+        Node::Ref(a) => a.clone(),
+        Node::Range(a, b) => RefExpr { row: a.row.min(b.row), col: a.col.min(b.col), ..a.clone() },
+        _ => return None,
+    };
+    let end = RefExpr {
+        row: (start.row + height).min(1_048_575),
+        col: (start.col + width).min(16_383),
+        ..start.clone()
+    };
+    Some(Node::Range(start, end))
 }
 
 // ---------------------------------------------------------------- 词法
@@ -506,51 +534,42 @@ impl Parser {
                 Ok(Node::Array(nrows, cols, data))
             }
             Some(Tok::Book(book)) => {
-                // [1]预算!A1 / [1]预算!A1:B2 / [预算.xlsx]Sheet1!A1
+                // [1]!TaxRate（外部工作簿级命名范围）
+                if self.eat(&Tok::Bang) {
+                    return self.parse_bang_target(Some(book), String::new(), None);
+                }
+                // [1]预算!A1 / [1]First:Third!A1 / [1]'First 1':'Third 3'!A1:B2 / [1]Sheet1!LocalName
                 let Some(Tok::Ident(sheet)) = self.next() else {
                     return Err(ErrKind::Ref);
                 };
+                if self.eat(&Tok::Colon) {
+                    let Some(Tok::Ident(end_sheet)) = self.next() else {
+                        return Err(ErrKind::Ref);
+                    };
+                    if !self.eat(&Tok::Bang) {
+                        return Err(ErrKind::Ref);
+                    }
+                    return self.parse_bang_target(Some(book), sheet, Some(end_sheet));
+                }
                 if !self.eat(&Tok::Bang) {
                     return Err(ErrKind::Ref);
                 }
-                let Some(Tok::Ident(cell)) = self.next() else {
-                    return Err(ErrKind::Ref);
-                };
-                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
-                start.book = Some(book);
-                start.sheet = Some(sheet);
-                if self.eat(&Tok::Colon) {
-                    let Some(Tok::Ident(cell2)) = self.next() else {
+                if let Some((first, last)) = sheet.split_once(':') {
+                    if first.is_empty() || last.is_empty() {
                         return Err(ErrKind::Ref);
-                    };
-                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
-                    end.book = start.book.clone();
-                    end.sheet = start.sheet.clone();
-                    return Ok(Node::Range(start, end));
+                    }
+                    return self.parse_bang_target(
+                        Some(book),
+                        first.to_string(),
+                        Some(last.to_string()),
+                    );
                 }
-                if self.eat(&Tok::Hash) {
-                    return Ok(Node::Spill(start));
-                }
-                if self.eats_intersection() {
-                    return Ok(Node::Err(ErrKind::Null));
-                }
-                return Ok(Node::Ref(start));
+                return self.parse_bang_target(Some(book), sheet, None);
             }
             Some(Tok::Ident(name)) => {
                 // 错误字面量
-                if let Some(rest) = name.strip_prefix('\u{0}') {
-                    if let Some(code) = rest.strip_prefix("ERR") {
-                        let code = code.trim_end_matches('=').parse::<u8>().map_err(|_| ErrKind::Name)?;
-                        return Ok(Node::Err(match code {
-                            0 => ErrKind::Null,
-                            1 => ErrKind::Div0,
-                            2 => ErrKind::Value,
-                            3 => ErrKind::Ref,
-                            4 => ErrKind::Name,
-                            5 => ErrKind::Num,
-                            _ => ErrKind::Na,
-                        }));
-                    }
+                if let Some(e) = decode_err_ident(&name) {
+                    return Ok(Node::Err(e));
                 }
                 // 函数调用
                 if matches!(self.peek(), Some(Tok::LParen)) {
@@ -614,9 +633,70 @@ impl Parser {
         }
     }
 
-    /// name 可能是 "A1"、"$A$1"、"Sheet1"（后面跟 !）
+    fn parse_bang_target(
+        &mut self,
+        book: Option<String>,
+        sheet: String,
+        sheet2: Option<String>,
+    ) -> Result<Node, ErrKind> {
+        let Some(Tok::Ident(target)) = self.next() else {
+            return Err(ErrKind::Ref);
+        };
+        if let Some(e) = decode_err_ident(&target) {
+            if self.eat(&Tok::Colon) {
+                let _ = self.next();
+            }
+            return Ok(Node::Err(e));
+        }
+        if sheet.is_empty() {
+            if book.is_some() {
+                return Ok(Node::ScopedName {
+                    book,
+                    sheet: None,
+                    name: target,
+                });
+            }
+            return Err(ErrKind::Ref);
+        }
+        let mut start = match parse_a1(&target) {
+            Some(r) => r,
+            None if sheet2.is_none() => {
+                return Ok(Node::ScopedName {
+                    book,
+                    sheet: Some(sheet),
+                    name: target,
+                });
+            }
+            None => return Err(ErrKind::Ref),
+        };
+        start.book = book;
+        start.sheet = Some(sheet);
+        start.sheet2 = sheet2;
+        if self.eat(&Tok::Colon) {
+            let Some(Tok::Ident(cell2)) = self.next() else {
+                return Err(ErrKind::Ref);
+            };
+            if let Some(e) = decode_err_ident(&cell2) {
+                return Ok(Node::Err(e));
+            }
+            let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
+            end.book = start.book.clone();
+            end.sheet = start.sheet.clone();
+            end.sheet2 = start.sheet2.clone();
+            return Ok(Node::Range(start, end));
+        }
+        if self.eat(&Tok::Hash) {
+            return Ok(Node::Spill(start));
+        }
+        if start.sheet2.is_none() && self.eats_intersection() {
+            return Ok(Node::Err(ErrKind::Null));
+        }
+        Ok(Node::Ref(start))
+    }
+
+    /// name 可能是 "A1"、"$A$1"、"Sheet1"（后面跟 !）或 `'[1]First:Third'`
     fn parse_ref_from(&mut self, name: String) -> Result<Node, ErrKind> {
-        // 三维引用：Sheet1:Sheet3!A1 / Sheet1:Sheet3!A1:B2。
+        // 三维引用：Sheet1:Sheet3!A1 / Sheet1:Sheet3!A1:B2 / '[1]First 1':'Third 3'!A1。
         // 必须在普通 A1 区域的冒号分支之前识别，否则 Sheet3! 会被当成
         // 普通单元格区域的一部分。
         if self.peek() == Some(&Tok::Colon) {
@@ -624,78 +704,21 @@ impl Parser {
                 (self.toks.get(self.pos + 1).cloned(), self.toks.get(self.pos + 2))
             {
                 self.pos += 3; // ':' end_sheet '!'
-                let Some(Tok::Ident(cell)) = self.next() else {
-                    return Err(ErrKind::Ref);
-                };
-                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
-                start.sheet = Some(name);
-                start.sheet2 = Some(end_sheet.clone());
-                if self.eat(&Tok::Colon) {
-                    let Some(Tok::Ident(cell2)) = self.next() else {
-                        return Err(ErrKind::Ref);
-                    };
-                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
-                    end.sheet = start.sheet.clone();
-                    end.sheet2 = start.sheet2.clone();
-                    end.book = start.book.clone();
-                    return Ok(Node::Range(start, end));
-                }
-                if self.eat(&Tok::Hash) {
-                    return Ok(Node::Spill(start));
-                }
-                return Ok(Node::Ref(start));
+                let (book, first_sheet) = split_book_sheet(&name);
+                return self.parse_bang_target(book, first_sheet, Some(end_sheet));
             }
         }
-        // 整段引号的三维区间：`'Start 1:End 3'!A1`。lexer 会把
-        // 引号内整段内容作为一个 Ident 交到这里；Excel 允许这种写法，
-        // 且表名不能包含冒号，所以可以安全拆分。
-        if matches!(self.peek(), Some(Tok::Bang)) && name.contains(':') && !name.contains('[') {
-            if let Some((first, last)) = name.split_once(':') {
-                self.pos += 1;
-                let Some(Tok::Ident(cell)) = self.next() else {
-                    return Err(ErrKind::Ref);
-                };
-                let mut start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
-                start.sheet = Some(first.to_owned());
-                start.sheet2 = Some(last.to_owned());
-                if self.eat(&Tok::Colon) {
-                    let Some(Tok::Ident(cell2)) = self.next() else {
-                        return Err(ErrKind::Ref);
-                    };
-                    let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
-                    end.sheet = start.sheet.clone();
-                    end.sheet2 = start.sheet2.clone();
-                    return Ok(Node::Range(start, end));
-                }
-                return Ok(Node::Ref(start));
-            }
-        }
+        // 带 ! 限定符的引用：本簿表/三维、外部工作簿单表/三维、作用域限定名称。
         if matches!(self.peek(), Some(Tok::Bang)) {
             self.pos += 1;
-            let Some(Tok::Ident(cell)) = self.next() else {
-                return Err(ErrKind::Ref);
-            };
-            let start = parse_a1(&cell).ok_or(ErrKind::Ref)?;
-            let mut re = start;
             let (book, sheet) = split_book_sheet(&name);
-            re.book = book;
-            re.sheet = Some(sheet);
-            if self.eat(&Tok::Colon) {
-                let Some(Tok::Ident(cell2)) = self.next() else {
+            if let Some((first, last)) = sheet.split_once(':') {
+                if first.is_empty() || last.is_empty() {
                     return Err(ErrKind::Ref);
-                };
-                let mut end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
-                end.sheet = re.sheet.clone();
-                end.book = re.book.clone();
-                return Ok(Node::Range(re, end));
+                }
+                return self.parse_bang_target(book, first.to_owned(), Some(last.to_owned()));
             }
-            if self.eat(&Tok::Hash) {
-                return Ok(Node::Spill(re));
-            }
-            if self.eats_intersection() {
-                return Ok(Node::Err(ErrKind::Null));
-            }
-            return Ok(Node::Ref(re));
+            return self.parse_bang_target(book, sheet, None);
         }
 
         let start = match parse_a1(&name) {
@@ -707,6 +730,9 @@ impl Parser {
             let Some(Tok::Ident(cell2)) = self.next() else {
                 return Err(ErrKind::Ref);
             };
+            if let Some(e) = decode_err_ident(&cell2) {
+                return Ok(Node::Err(e));
+            }
             let end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
             if self.eats_intersection() {
                 return Ok(Node::Err(ErrKind::Null));
@@ -723,13 +749,26 @@ impl Parser {
     }
 }
 
-/// `'[预算.xlsx]Sheet1'` → (Some("预算.xlsx"), "Sheet1")；没有书名就原样返回
+fn decode_err_ident(name: &str) -> Option<ErrKind> {
+    let code = name.strip_prefix("\u{0}ERR")?.trim_end_matches('=').parse::<u8>().ok()?;
+    Some(match code {
+        0 => ErrKind::Null,
+        1 => ErrKind::Div0,
+        2 => ErrKind::Value,
+        3 => ErrKind::Ref,
+        4 => ErrKind::Name,
+        5 => ErrKind::Num,
+        _ => ErrKind::Na,
+    })
+}
+
+/// `'[预算.xlsx]Sheet1'` → `(Some("预算.xlsx"), "Sheet1")`；`'[1]'` → `(Some("1"), "")`；没有书名就原样返回
 fn split_book_sheet(name: &str) -> (Option<String>, String) {
     if let Some(close) = name.rfind(']') {
         if let Some(open) = name[..close].rfind('[') {
             let book = name[open + 1..close].to_string();
             let sheet = name[close + 1..].to_string();
-            if !book.is_empty() && !sheet.is_empty() {
+            if !book.is_empty() {
                 return (Some(book), sheet);
             }
         }
@@ -819,7 +858,7 @@ pub struct Calc<'a> {
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
     scope: Option<std::collections::HashSet<self::deps::CellKey>>,
     /// 区域物化实际读取的单元格数（测试/诊断用）
-    range_reads: usize,
+    pub range_reads: usize,
     /// 区域聚合结果缓存：(sheet, r1, c1, r2, c2, 函数, 条件)
     agg_cache: HashMap<(usize, i64, i64, i64, i64, u8, String), FValue>,
     /// 区域缓存已占用的值数量，防止把逐行累积的区间全缓存下来
@@ -1040,6 +1079,176 @@ impl<'a> Calc<'a> {
             rows,
             cols,
         })
+    }
+
+    /// 外部工作簿三维区间 `[1]First:Third!A1` 的 `sheetId` 范围（按 `link.sheets` 顺序）。
+    fn link_three_d_slots(
+        &self,
+        link: &crate::xlinks::ExternalBook,
+        r: &RefExpr,
+    ) -> Result<Vec<usize>, ErrKind> {
+        let start = r.sheet.as_deref().ok_or(ErrKind::Ref)?.trim().trim_matches('\'');
+        let end = r.sheet2.as_deref().ok_or(ErrKind::Ref)?.trim().trim_matches('\'');
+        let a = link
+            .sheets
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(start))
+            .ok_or(ErrKind::Ref)?;
+        let b = link
+            .sheets
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(end))
+            .ok_or(ErrKind::Ref)?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        Ok((lo..=hi).collect())
+    }
+
+    /// 外部工作簿三维单格 `[1]First:Third!A1` → 纵向数组，供 SUM / AVERAGE / MAX / MIN 等聚合函数统一消费。
+    fn link_three_d_cell(&self, r: &RefExpr) -> FValue {
+        if r.row < 0 || r.col < 0 {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let Some(li) = crate::xlinks::resolve_book(self.wb, r.book.as_deref().unwrap_or("")) else {
+            return FValue::Error(ErrKind::Ref);
+        };
+        let link = &self.wb.links[li];
+        if link.cache.is_empty() && !link.refreshed {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let slots = match self.link_three_d_slots(link, r) {
+            Ok(v) => v,
+            Err(e) => return FValue::Error(e),
+        };
+        let mut vals = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let v = match link.cache.get(&(slot, r.row as u32, r.col as u32)) {
+                Some(v) => to_fvalue(v),
+                None => FValue::Empty,
+            };
+            vals.push(v);
+        }
+        FValue::Array(std::rc::Rc::new(value::Array::new(vals.len().max(1), 1, vals)))
+    }
+
+    /// 外部工作簿三维区域 `[1]First:Third!A1:B2` → 纵向拼接的多表二维网格。
+    fn link_three_d_range(&self, a: &RefExpr, b: &RefExpr) -> Result<FValue, ErrKind> {
+        let book = a.book.as_deref().or(b.book.as_deref()).unwrap_or("");
+        let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+            return Err(ErrKind::Ref);
+        };
+        let link = &self.wb.links[li];
+        if link.cache.is_empty() && !link.refreshed {
+            return Err(ErrKind::Ref);
+        }
+        let rep = if a.sheet2.is_some() { a } else { b };
+        let slots = self.link_three_d_slots(link, rep)?;
+        let mut r1 = a.row.min(b.row).max(0) as u32;
+        let mut c1 = a.col.min(b.col).max(0) as u32;
+        let mut r2 = a.row.max(b.row).max(0) as u32;
+        let mut c2 = a.col.max(b.col).max(0) as u32;
+        let full_cols = c1 == 0 && c2 == 16_383;
+        let full_rows = r1 == 0 && r2 == 1_048_575;
+        let huge = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1) > 200_000;
+        if full_cols || full_rows || huge {
+            let max_r = link
+                .cache
+                .keys()
+                .filter(|(s, _, _)| slots.contains(s))
+                .map(|(_, r, _)| *r)
+                .max()
+                .unwrap_or(0);
+            let max_c = link
+                .cache
+                .keys()
+                .filter(|(s, _, _)| slots.contains(s))
+                .map(|(_, _, c)| *c)
+                .max()
+                .unwrap_or(0);
+            if full_rows || huge {
+                r2 = r2.min(max_r);
+            }
+            if full_cols || huge {
+                c2 = c2.min(max_c);
+            }
+            if r1 > r2 || c1 > c2 {
+                return Ok(FValue::Array(std::rc::Rc::new(value::Array::new(1, 1, vec![FValue::Empty]))));
+            }
+        }
+        let rows_per = (r2 - r1 + 1) as usize;
+        let cols = (c2 - c1 + 1) as usize;
+        let mut vals = Vec::with_capacity(slots.len() * rows_per * cols);
+        for slot in &slots {
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let v = match link.cache.get(&(*slot, r, c)) {
+                        Some(v) => to_fvalue(v),
+                        None => FValue::Empty,
+                    };
+                    vals.push(v);
+                }
+            }
+        }
+        Ok(FValue::Array(std::rc::Rc::new(value::Array::new(
+            (slots.len() * rows_per).max(1),
+            cols.max(1),
+            vals,
+        ))))
+    }
+
+    fn eval_ext_defined_name(
+        &mut self,
+        li: usize,
+        sheet: Option<&str>,
+        name: &str,
+        si: usize,
+    ) -> FValue {
+        if self.depth >= 200 {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let Some(link) = self.wb.links.get(li) else {
+            return FValue::Error(ErrKind::Ref);
+        };
+        let want_slot = sheet.and_then(|sh| crate::xlinks::sheet_slot(link, Some(sh)));
+        if sheet.is_some() && want_slot.is_none() {
+            return FValue::Error(ErrKind::Ref);
+        }
+        let found = if let Some(slot) = want_slot {
+            link.defined_names
+                .iter()
+                .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && *s == Some(slot))
+                .or_else(|| {
+                    link.defined_names
+                        .iter()
+                        .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && s.is_none())
+                })
+        } else {
+            link.defined_names
+                .iter()
+                .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && s.is_none())
+        };
+        let Some((_, _, refers)) = found.cloned() else {
+            return FValue::Error(ErrKind::Name);
+        };
+        let body = refers.trim().trim_start_matches('=');
+        if body.is_empty() {
+            return FValue::Error(ErrKind::Name);
+        }
+        let normalized = crate::normalize_formula(body);
+        let Ok(mut node) = parse(&normalized) else {
+            return FValue::Error(ErrKind::Value);
+        };
+        let book_str = (li + 1).to_string();
+        let default_sh = sheet.or_else(|| {
+            self.wb
+                .links
+                .get(li)
+                .and_then(|l| l.sheets.first().map(|s| s.as_str()))
+        });
+        qualify_ext_node(&mut node, &book_str, default_sh);
+        self.depth += 1;
+        let out = self.eval_node(&node, si);
+        self.depth -= 1;
+        out
     }
 
     pub fn cell_value(&mut self, si: usize, r: u32, c: u32) -> FValue {
@@ -1335,6 +1544,54 @@ impl<'a> Calc<'a> {
                 }
                 FValue::Error(ErrKind::Name)
             }
+            Node::ScopedName { book, sheet, name } => {
+                if let Some(bk) = book.as_deref() {
+                    let Some(li) = crate::xlinks::resolve_book(self.wb, bk) else {
+                        return FValue::Error(ErrKind::Ref);
+                    };
+                    return self.eval_ext_defined_name(li, sheet.as_deref(), name, si);
+                }
+                if let Some(sh) = sheet.as_deref() {
+                    if let Ok(si2) = self.sheet_index(Some(sh), si) {
+                        let hit = self
+                            .wb
+                            .names
+                            .iter()
+                            .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && *s == Some(si2))
+                            .or_else(|| {
+                                self.wb
+                                    .names
+                                    .iter()
+                                    .find(|(nm, s, _)| nm.eq_ignore_ascii_case(name) && s.is_none())
+                            })
+                            .map(|(_, _, body)| body.clone());
+                        if let Some(body) = hit {
+                            let text = body.trim_start_matches('=').to_string();
+                            if !text.is_empty() && self.depth < 200 {
+                                let expanded = crate::table::expand_structured_at(
+                                    self.wb,
+                                    si2,
+                                    Some(self.cur.0),
+                                    Some(self.cur.1),
+                                    &text,
+                                )
+                                .unwrap_or(text);
+                                if let Ok(node) = parse(&expanded) {
+                                    self.depth += 1;
+                                    let v = self.eval_node(&node, si2);
+                                    self.depth -= 1;
+                                    return v;
+                                }
+                            }
+                        }
+                        return FValue::Error(ErrKind::Name);
+                    }
+                    if let Some(li) = crate::xlinks::resolve_book(self.wb, sh) {
+                        return self.eval_ext_defined_name(li, None, name, si);
+                    }
+                }
+                FValue::Error(ErrKind::Name)
+            }
             Node::Number(n) => FValue::Number(*n),
             Node::Text(s) => FValue::Text(s.as_str().into()),
             Node::Bool(b) => FValue::Bool(*b),
@@ -1342,6 +1599,9 @@ impl<'a> Calc<'a> {
             Node::Implicit(e) => self.implicit_value(e, si),
             Node::Ref(r) => {
                 if r.sheet2.is_some() {
+                    if r.book.is_some() {
+                        return self.link_three_d_cell(r);
+                    }
                     let idxs = match self.three_d_indices(r) {
                         Ok(v) => v,
                         Err(e) => return FValue::Error(e),
@@ -1375,6 +1635,12 @@ impl<'a> Calc<'a> {
             }
             Node::Range(a, b) => {
                 if a.sheet2.is_some() || b.sheet2.is_some() {
+                    if a.book.is_some() || b.book.is_some() {
+                        return match self.link_three_d_range(a, b) {
+                            Ok(v) => v,
+                            Err(e) => FValue::Error(e),
+                        };
+                    }
                     let rep = if a.sheet2.is_some() { a } else { b };
                     let idxs = match self.three_d_indices(rep) {
                         Ok(v) => v,
@@ -1533,14 +1799,96 @@ impl<'a> Calc<'a> {
                 }
             }
             Node::Func(name, nodes) if name == "SHEET" => {
-                let idx = match nodes.first() {
-                    Some(Node::Ref(re)) => self.sheet_index(re.sheet.as_deref(), si).unwrap_or(si),
-                    _ => si,
-                };
-                FValue::number((idx + 1) as f64)
+                match nodes.first() {
+                    Some(Node::Ref(re)) | Some(Node::Range(re, _)) => {
+                        if let Some(book) = re.book.as_deref() {
+                            let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+                                return FValue::Error(ErrKind::Ref);
+                            };
+                            let link = &self.wb.links[li];
+                            let Some(slot) = crate::xlinks::sheet_slot(link, re.sheet.as_deref()) else {
+                                return FValue::Error(ErrKind::Ref);
+                            };
+                            return FValue::number((slot + 1) as f64);
+                        }
+                        match self.sheet_index(re.sheet.as_deref(), si) {
+                            Ok(idx) => FValue::number((idx + 1) as f64),
+                            Err(e) => FValue::Error(e),
+                        }
+                    }
+                    None => FValue::number((si + 1) as f64),
+                    Some(_) => FValue::number((si + 1) as f64),
+                }
             }
-            Node::Func(name, nodes) if name == "SHEETS" && nodes.is_empty() => {
-                FValue::number(self.wb.sheets.len() as f64)
+            Node::Func(name, nodes) if name == "SHEETS" => {
+                if nodes.is_empty() {
+                    return FValue::number(self.wb.sheets.len() as f64);
+                }
+                match nodes.first() {
+                    Some(Node::Ref(re)) => {
+                        if re.sheet2.is_some() {
+                            if let Some(book) = re.book.as_deref() {
+                                let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+                                    return FValue::Error(ErrKind::Ref);
+                                };
+                                return match self.link_three_d_slots(&self.wb.links[li], re) {
+                                    Ok(slots) => FValue::number(slots.len() as f64),
+                                    Err(e) => FValue::Error(e),
+                                };
+                            }
+                            return match self.three_d_indices(re) {
+                                Ok(idxs) => FValue::number(idxs.len() as f64),
+                                Err(e) => FValue::Error(e),
+                            };
+                        }
+                        if let Some(book) = re.book.as_deref() {
+                            let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+                                return FValue::Error(ErrKind::Ref);
+                            };
+                            return match crate::xlinks::sheet_slot(&self.wb.links[li], re.sheet.as_deref()) {
+                                Some(_) => FValue::number(1.0),
+                                None => FValue::Error(ErrKind::Ref),
+                            };
+                        }
+                        match self.sheet_index(re.sheet.as_deref(), si) {
+                            Ok(_) => FValue::number(1.0),
+                            Err(e) => FValue::Error(e),
+                        }
+                    }
+                    Some(Node::Range(a, b)) => {
+                        if a.sheet2.is_some() || b.sheet2.is_some() {
+                            let rep = if a.sheet2.is_some() { a } else { b };
+                            if let Some(book) = rep.book.as_deref() {
+                                let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+                                    return FValue::Error(ErrKind::Ref);
+                                };
+                                return match self.link_three_d_slots(&self.wb.links[li], rep) {
+                                    Ok(slots) => FValue::number(slots.len() as f64),
+                                    Err(e) => FValue::Error(e),
+                                };
+                            }
+                            return match self.three_d_indices(rep) {
+                                Ok(idxs) => FValue::number(idxs.len() as f64),
+                                Err(e) => FValue::Error(e),
+                            };
+                        }
+                        if let Some(book) = a.book.as_deref().or(b.book.as_deref()) {
+                            let Some(li) = crate::xlinks::resolve_book(self.wb, book) else {
+                                return FValue::Error(ErrKind::Ref);
+                            };
+                            let sh = a.sheet.as_deref().or(b.sheet.as_deref());
+                            return match crate::xlinks::sheet_slot(&self.wb.links[li], sh) {
+                                Some(_) => FValue::number(1.0),
+                                None => FValue::Error(ErrKind::Ref),
+                            };
+                        }
+                        match self.sheet_index(a.sheet.as_deref(), si) {
+                            Ok(_) => FValue::number(1.0),
+                            Err(e) => FValue::Error(e),
+                        }
+                    }
+                    _ => FValue::Error(ErrKind::Value),
+                }
             }
             // ============ LAMBDA 家族（需要把函数当值传递，走特殊形式）
             Node::Func(name, nodes)
@@ -1916,8 +2264,17 @@ impl<'a> Calc<'a> {
                 }
                 let literal = |n: &Node| -> Option<(RefExpr, RefExpr)> {
                     match n {
-                        Node::Range(a, b) => Some((a.clone(), b.clone())),
-                        Node::Ref(a) => Some((a.clone(), a.clone())),
+                        Node::Range(a, b)
+                            if a.book.is_none()
+                                && b.book.is_none()
+                                && a.sheet2.is_none()
+                                && b.sheet2.is_none() =>
+                        {
+                            Some((a.clone(), b.clone()))
+                        }
+                        Node::Ref(a) if a.book.is_none() && a.sheet2.is_none() => {
+                            Some((a.clone(), a.clone()))
+                        }
                         _ => None,
                     }
                 };
@@ -1928,25 +2285,8 @@ impl<'a> Calc<'a> {
                     Ok(i) => i,
                     Err(e) => return FValue::Error(e),
                 };
-                let (rows, cols, data) = self.cached_grid(idx, &la, &lb);
-                if rows == 0 || cols == 0 {
-                    return FValue::Error(ErrKind::Ref);
-                }
-                let vertical = name != "HLOOKUP";
-                let n = if vertical { rows } else { cols };
-                let at = |i: usize| -> FValue {
-                    let (r, c) = if vertical {
-                        (la.row.max(lb.row) as usize + i, la.col.min(lb.col) as usize)
-                    } else {
-                        (la.row.min(lb.row) as usize, la.col.max(lb.col) as usize + i)
-                    };
-                    let rr = (r as i64 - la.row.min(lb.row)) as usize;
-                    let cc = (c as i64 - la.col.min(lb.col)) as usize;
-                    data.get(rr * cols + cc).cloned().unwrap_or(FValue::Empty)
-                };
-                let _ = at;
-
                 if name == "VLOOKUP" || name == "HLOOKUP" {
+                    let vertical = name == "VLOOKUP";
                     let col_idx = match nodes.get(2) {
                         Some(n) => self.eval_node(n, si).to_number().unwrap_or(0.0) as usize,
                         None => return FValue::Error(ErrKind::Value),
@@ -1955,21 +2295,51 @@ impl<'a> Calc<'a> {
                         Some(n) => self.eval_node(n, si).to_bool().unwrap_or(true),
                         None => true,
                     };
-                    let limit = if vertical { cols } else { rows };
+                    let (max_r, max_c) = self.sheet_bounds(idx);
+                    let (r1, c1) = (la.row.min(lb.row), la.col.min(lb.col));
+                    let mut br = la.row.max(lb.row);
+                    let mut bc = la.col.max(lb.col);
+                    if c1 == 0 && bc == 16_383 {
+                        bc = bc.min(max_c as i64);
+                    }
+                    if r1 == 0 && br == 1_048_575 {
+                        br = br.min(max_r as i64);
+                    }
+                    if br < r1 || bc < c1 {
+                        return FValue::Error(ErrKind::Ref);
+                    }
+                    let limit = if vertical {
+                        (bc - c1 + 1) as usize
+                    } else {
+                        (br - r1 + 1) as usize
+                    };
                     if col_idx == 0 || col_idx > limit {
                         return FValue::Error(ErrKind::Ref);
                     }
+                    // 关键内存优化：VLOOKUP 只在首列查找、HLOOKUP 只在首行查找，目标返回值由 `cell_value`
+                    // 单格按需读取；只物化并索引首列/首行（而非整张 26 列大表），内存峰值降低 N_cols 倍，
+                    // 且 `VLOOKUP(..., A:B, 2, 0)`..`VLOOKUP(..., A:Z, 26, 0)` 共享同一份哈希索引与列缓存！
+                    let mut sa = la.clone();
+                    let mut sb = lb.clone();
+                    if vertical {
+                        sa.col = c1;
+                        sb.col = c1;
+                    } else {
+                        sa.row = r1;
+                        sb.row = r1;
+                    }
+                    let (s_rows, s_cols, data) = self.cached_grid(idx, &sa, &sb);
+                    let n = if vertical { s_rows } else { s_cols };
+                    if n == 0 {
+                        return FValue::Error(ErrKind::Na);
+                    }
                     let mut best: Option<usize> = None;
                     if !approx {
-                        let ix = self.lookup_hash(idx, &la, &lb, cols, rows, vertical);
+                        let ix = self.lookup_hash(idx, &sa, &sb, s_cols, s_rows, vertical);
                         best = ix.get(&key_norm(&key)).copied();
                     } else {
                         for i in 0..n {
-                            let cell = if vertical {
-                                &data[i * cols]
-                            } else {
-                                &data[i]
-                            };
+                            let cell = &data[i];
                             match cell.compare(&key) {
                                 // 重复值：Excel 取最后一个相等的行，不能遇到就停
                                 Ok(std::cmp::Ordering::Equal) => best = Some(i),
@@ -1982,15 +2352,22 @@ impl<'a> Calc<'a> {
                     return match best {
                         Some(i) => {
                             let (r, c) = if vertical {
-                                (la.row.min(lb.row) + i as i64, la.col.min(lb.col) + col_idx as i64 - 1)
+                                (r1 + i as i64, c1 + col_idx as i64 - 1)
                             } else {
-                                (la.row.min(lb.row) + col_idx as i64 - 1, la.col.min(lb.col) + i as i64)
+                                (r1 + col_idx as i64 - 1, c1 + i as i64)
                             };
                             self.cell_value(idx, r as u32, c as u32).scalar()
                         }
                         None => FValue::Error(ErrKind::Na),
                     };
                 }
+
+                let (rows, cols, data) = self.cached_grid(idx, &la, &lb);
+                if rows == 0 || cols == 0 {
+                    return FValue::Error(ErrKind::Ref);
+                }
+                let vertical = !(rows == 1 && cols > 1);
+                let n = if vertical { rows } else { cols };
 
                 // MATCH / XMATCH / XLOOKUP：在查找区里找位置
                 let mode = match nodes.get(2) {
@@ -2066,8 +2443,17 @@ impl<'a> Calc<'a> {
             {
                 let literal = |n: &Node| -> Option<(RefExpr, RefExpr)> {
                     match n {
-                        Node::Range(a, b) => Some((a.clone(), b.clone())),
-                        Node::Ref(a) => Some((a.clone(), a.clone())),
+                        Node::Range(a, b)
+                            if a.book.is_none()
+                                && b.book.is_none()
+                                && a.sheet2.is_none()
+                                && b.sheet2.is_none() =>
+                        {
+                            Some((a.clone(), b.clone()))
+                        }
+                        Node::Ref(a) if a.book.is_none() && a.sheet2.is_none() => {
+                            Some((a.clone(), a.clone()))
+                        }
                         _ => None,
                     }
                 };
@@ -2091,10 +2477,14 @@ impl<'a> Calc<'a> {
                             String::new()
                         } else {
                             // 条件表达式（如 A5）的默认工作表必须是公式所在的当前表 si，绝不能误落到被聚合表 si2！
-                            self.eval_node(&nodes[1], si).to_text().unwrap_or_default()
+                            match self.eval_node(&nodes[1], si).to_text() {
+                                Ok(value) => value,
+                                Err(error) => return FValue::Error(error),
+                            }
                         };
                         let sum_spec = if name == "SUMIF" {
-                            match nodes.get(2) {
+                            let effective = sumif_amount_range(nodes);
+                            match effective.as_ref().or(nodes.get(2)) {
                                 None => None,
                                 Some(n2) => match literal(n2) {
                                     Some((sa, sb))
@@ -2125,10 +2515,6 @@ impl<'a> Calc<'a> {
                         } else {
                             crit.clone()
                         };
-                        let (rows, cols) = (
-                            (ra.row.max(rb.row) - ra.row.min(rb.row) + 1).max(0),
-                            (ra.col.max(rb.col) - ra.col.min(rb.col) + 1).max(0),
-                        );
                         let key = (
                             si2,
                             ra.row.min(rb.row),
@@ -2152,62 +2538,11 @@ impl<'a> Calc<'a> {
                         }
                         self.agg_miss += 1;
                         let t0 = std::time::Instant::now();
-                        let (r_, c_, data) = self.cached_grid(si2, &ra, &rb);
-                        let mut out = match name.as_str() {
-                            "SUM" => {
-                                let mut t = 0.0;
-                                let mut err = None;
-                                for v in data.iter() {
-                                    match v {
-                                        FValue::Number(n) => t += n,
-                                        FValue::Error(e) => {
-                                            err = Some(*e);
-                                            break;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                match err {
-                                    Some(e) => FValue::Error(e),
-                                    None => FValue::number(t),
-                                }
-                            }
-                            "COUNTA" => {
-                                let n = data.iter().filter(|v| **v != FValue::Empty).count();
-                                FValue::number(n as f64)
-                            }
-                            "AVERAGE" => {
-                                let mut t = 0.0;
-                                let mut n = 0usize;
-                                for v in data.iter() {
-                                    if let FValue::Number(x) = v {
-                                        t += x;
-                                        n += 1;
-                                    }
-                                }
-                                if n == 0 {
-                                    FValue::Error(ErrKind::Div0)
-                                } else {
-                                    FValue::number(t / n as f64)
-                                }
-                            }
-                            "MAX" | "MIN" => {
-                                let mut best: Option<f64> = None;
-                                for v in data.iter() {
-                                    if let FValue::Number(x) = v {
-                                        best = Some(match best {
-                                            None => *x,
-                                            Some(b) => {
-                                                if name == "MAX" {
-                                                    b.max(*x)
-                                                } else {
-                                                    b.min(*x)
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                FValue::number(best.unwrap_or(0.0))
+                        let (rows, cols, data) = self.cached_grid(si2, &ra, &rb);
+                        let out = match name.as_str() {
+                            "SUM" | "COUNTA" | "AVERAGE" | "MAX" | "MIN" => {
+                                let range = Arg::Range { values: data.clone(), rows, cols };
+                                functions::call(name, &[range])
                             }
                             "COUNTIF" => {
                                 let c = functions::Crit::parse(&crit);
@@ -2217,27 +2552,28 @@ impl<'a> Calc<'a> {
                             _ => {
                                 // SUMIF：第三个参数是和区域，可能跨表
                                 let c = functions::Crit::parse(&crit);
-                                let sum_vals: Option<std::rc::Rc<Vec<FValue>>> =
-                                    sum_spec.map(|(sidx, sa, sb)| {
-                                        let (_sr, _sc, sd) = self.cached_grid(sidx, &sa, &sb);
-                                        sd
-                                    });
+                                let amounts = sum_spec.map(|(sidx, sa, sb)| self.cached_grid(sidx, &sa, &sb));
                                 let mut t = 0.0;
                                 for (i, v) in data.iter().enumerate() {
                                     if c.matches(v) {
-                                        let sv = match &sum_vals {
-                                            Some(sd) => sd.get(i).cloned(),
-                                            None => Some(v.clone()),
+                                        let amount = match &amounts {
+                                            Some((amount_rows, amount_cols, values)) => {
+                                                let (row, col) = (i / cols, i % cols);
+                                                if row >= *amount_rows || col >= *amount_cols { continue; }
+                                                &values[row * amount_cols + col]
+                                            }
+                                            None => v,
                                         };
-                                        if let Some(FValue::Number(n)) = sv {
-                                            t += n;
+                                        match amount {
+                                            FValue::Number(n) => t += n,
+                                            FValue::Error(e) => return FValue::Error(*e),
+                                            _ => {}
                                         }
                                     }
                                 }
                                 FValue::number(t)
                             }
                         };
-                        let _ = (rows, cols, r_, c_);
                         prof_record(&format!("{name}#agg"), t0.elapsed().as_secs_f64());
                         self.agg_cache.insert(key, out.clone());
                         return out;
@@ -2265,46 +2601,7 @@ impl<'a> Calc<'a> {
                     }
                     return self.apply_lambda_val(&lam, vals, si);
                 }
-                // SUBTOTAL 100+ / AGGREGATE option 5|6 先按隐藏行过滤，再打包实参
-                let skip_hidden = if name == "SUBTOTAL" {
-                    nodes
-                        .first()
-                        .map(|n| self.eval_node(n, si).to_number().unwrap_or(0.0) >= 100.0)
-                        .unwrap_or(false)
-                } else if name == "AGGREGATE" {
-                    nodes
-                        .get(1)
-                        .map(|n| {
-                            let o = self.eval_node(n, si).to_number().unwrap_or(0.0);
-                            o == 5.0 || o == 6.0
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                let mut args = Vec::with_capacity(nodes.len());
-                for n in nodes {
-                    // 区域参数保留结构（SUM/COUNTIF 等需要）
-                    if let Node::Range(a, b) = n {
-                        if a.sheet2.is_some() || b.sheet2.is_some() {
-                            args.push(Arg::Val(self.eval_node(n, si)));
-                            continue;
-                        }
-                        match self.range_values(a, b, si) {
-                            Ok(arg) => {
-                                let arg = if skip_hidden {
-                                    self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, si)
-                                } else {
-                                    arg
-                                };
-                                args.push(arg)
-                            }
-                            Err(e) => args.push(Arg::Val(FValue::Error(e))),
-                        }
-                    } else {
-                        args.push(Arg::Val(self.eval_node(n, si)));
-                    }
-                }
+                let args = self.function_args(name, nodes, si);
                 let t0 = std::time::Instant::now();
                 let out = if matches!(name.as_str(), "RAND" | "RANDBETWEEN" | "RANDARRAY" | "NOW" | "TODAY") {
                     let cell = (self.cur_sheet, self.cur.0, self.cur.1);
@@ -2335,7 +2632,7 @@ impl<'a> Calc<'a> {
         key: (usize, i64, i64, i64, i64),
         vals: std::rc::Rc<Vec<FValue>>,
     ) -> std::rc::Rc<Vec<FValue>> {
-        const LIMIT: usize = 16_000_000; // 约 400 MB
+        const LIMIT: usize = 4_000_000; // 约 128 MB 上限，抑制大表重算内存峰值
         if self.range_cache.contains_key(&key) {
             return self.range_cache.get(&key).unwrap().clone();
         }
@@ -2354,25 +2651,20 @@ impl<'a> Calc<'a> {
         vals
     }
 
-    /// 表的实际使用范围，避免 A:A 这种整列引用被展开成 104 万格
+    /// 表的实际使用范围（通过 Store 页索引 O(pages) 获取，避免全表逐格遍历或 A:A 展开 104 万格）
     fn sheet_bounds(&mut self, si: usize) -> (u32, u32) {
         if let Some(b) = self.bounds.get(&si) {
             return *b;
         }
-        let mut mr = 0u32;
-        let mut mc = 0u32;
-        if let Some(sheet) = self.wb.sheets.get(si) {
-            for cref in sheet.iter().map(|(k, _)| k) {
-                if cref.row > mr {
-                    mr = cref.row;
-                }
-                if cref.col > mc {
-                    mc = cref.col;
-                }
-            }
-        }
-        self.bounds.insert(si, (mr, mc));
-        (mr, mc)
+        let b = self
+            .wb
+            .sheets
+            .get(si)
+            .and_then(|sheet| sheet.used_bounds())
+            .map(|(_, _, mr, mc)| (mr, mc))
+            .unwrap_or((0, 0));
+        self.bounds.insert(si, b);
+        b
     }
 
     /// 精确匹配索引：key 归一化后 → 第一次出现的行下标
@@ -2437,15 +2729,11 @@ impl<'a> Calc<'a> {
             br = br.min(max_r as i64);
             bc = bc.min(max_c as i64);
         }
-        let a = &RefExpr { book: None, sheet: a.sheet.clone(), sheet2: None, row: a.row.min(b.row), col: a.col.min(b.col), row_abs: false, col_abs: false };
-        let b = &RefExpr { book: None, sheet: b.sheet.clone(), sheet2: None, row: br, col: bc, row_abs: false, col_abs: false };
-        let key = (
-            si,
-            a.row.min(b.row),
-            a.col.min(b.col),
-            a.row.max(b.row),
-            a.col.max(b.col),
-        );
+        let (r1, c1) = (a.row.min(b.row), a.col.min(b.col));
+        if br < r1 || bc < c1 {
+            return (0, 0, std::rc::Rc::new(Vec::new()));
+        }
+        let key = (si, r1, c1, br, bc);
         if let Some(v) = self.range_cache.get(&key) {
             let rows = (key.3 - key.1 + 1) as usize;
             let cols = (key.4 - key.2 + 1) as usize;
@@ -2464,81 +2752,73 @@ impl<'a> Calc<'a> {
         (rows, cols, rc)
     }
 
-    /// 去掉区域里被手动隐藏的行（hidden_rows / hidden_rows_user）。
-    /// 供 SUBTOTAL 100+ 与 AGGREGATE option 5/6 使用；返回的新 Arg 行数会相应减少。
-    fn drop_hidden_rows(&self, arg: Arg, r1: u32, si: usize) -> Arg {
-        let Arg::Range { values, rows, cols } = arg else {
-            return arg;
-        };
-        let Some(sheet) = self.wb.sheets.get(si) else {
+    fn drop_hidden_rows(&self, arg: Arg, r1: u32, si: usize, skip_manual: bool) -> Arg {
+        let Arg::Range { values, rows, cols } = arg else { return arg };
+        let sheet = &self.wb.sheets[si];
+        if sheet.hidden_rows.is_empty() && (!skip_manual || sheet.hidden_rows_user.is_empty()) {
             return Arg::Range { values, rows, cols };
-        };
-        let mut out: Vec<FValue> = Vec::with_capacity(values.len());
-        let mut kept = 0usize;
+        }
+        let mut out = Vec::with_capacity(values.len());
+        let mut kept = 0;
         for i in 0..rows {
-            let r = r1 + i as u32;
-            let hidden = sheet.hidden_rows.contains(&r) || sheet.hidden_rows_user.contains(&r);
-            if !hidden {
-                out.extend(values[i * cols..(i + 1) * cols].iter().cloned());
-                kept += 1;
+            let row = r1 + i as u32;
+            if sheet.hidden_rows.contains(&row) || (skip_manual && sheet.hidden_rows_user.contains(&row)) {
+                continue;
             }
+            out.extend_from_slice(&values[i * cols..(i + 1) * cols]);
+            kept += 1;
         }
         Arg::Range { values: std::rc::Rc::new(out), rows: kept, cols }
     }
 
-    /// 查找参数不是字面区域时，退回通用求值路径
-    fn call_generic(&mut self, name: &str, nodes: &[Node], si: usize) -> FValue {
-        let mut args = Vec::with_capacity(nodes.len());
-        // SUBTOTAL 100+ 与 AGGREGATE option 5/6 要跳过手动隐藏行，
-        // 而 Arg 里只有扁平值，所以必须在打包实参时就按行剔除。
-        let skip_hidden = if name == "SUBTOTAL" {
-            nodes
-                .first()
-                .map(|n| self.eval_node(n, si).to_number().unwrap_or(0.0) >= 100.0)
-                .unwrap_or(false)
-        } else if name == "AGGREGATE" {
-            nodes
-                .get(1)
-                .map(|n| {
-                    let o = self.eval_node(n, si).to_number().unwrap_or(0.0);
-                    o == 5.0 || o == 6.0
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        for n in nodes {
-            if let Node::Range(a, b) = n {
-                if a.sheet2.is_some() || b.sheet2.is_some() {
-                    args.push(Arg::Val(self.eval_node(n, si)));
-                    continue;
-                }
+    fn function_args(&mut self, name: &str, nodes: &[Node], si: usize) -> Vec<Arg> {
+        let mut args: Vec<Arg> = Vec::with_capacity(nodes.len());
+        let amounts = if name == "SUMIF" { sumif_amount_range(nodes) } else { None };
+        for (i, n) in nodes.iter().enumerate() {
+            let n = if i == 2 { amounts.as_ref().unwrap_or(n) } else { n };
+            // Every SUBTOTAL excludes filtered rows. Codes 101..111 also exclude manual hiding.
+            let visibility = match name {
+                "SUBTOTAL" if i > 0 => Some(args[0].first().to_number().unwrap_or(0.0) >= 100.0),
+                "AGGREGATE" if i > 1 && matches!(args[1].first().to_number(), Ok(5.0 | 6.0)) => Some(true),
+                _ => None,
+            };
+            let refs = match n {
+                Node::Range(a, b) => Some((a, b)),
+                Node::Ref(a) if visibility.is_some() => Some((a, a)),
+                _ => None,
+            };
+            if let Some((a, b)) = refs.filter(|(a, b)| a.sheet2.is_none() && b.sheet2.is_none()) {
                 match self.range_values(a, b, si) {
-                    Ok(arg) => {
-                        let arg = if skip_hidden {
-                            self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, si)
-                        } else {
-                            arg
-                        };
-                        args.push(arg)
+                    Ok(mut arg) => {
+                        if let Some(skip_manual) = visibility
+                            && a.book.is_none() && b.book.is_none()
+                            && let Ok(source) = self.sheet_index(a.sheet.as_deref(), si)
+                        {
+                            arg = self.drop_hidden_rows(arg, a.row.min(b.row).max(0) as u32, source, skip_manual);
+                        }
+                        args.push(arg);
                     }
-                    Err(e) => args.push(Arg::Val(FValue::Error(e))),
+                    Err(error) => args.push(Arg::Val(FValue::Error(error))),
                 }
             } else {
                 args.push(Arg::Val(self.eval_node(n, si)));
             }
         }
-        functions::call(name, &args)
+        args
+    }
+
+    fn call_generic(&mut self, name: &str, nodes: &[Node], si: usize) -> FValue {
+        functions::call(name, &self.function_args(name, nodes, si))
     }
 
     fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
         match n {
             Node::Ref(re) => {
-                if re.sheet2.is_some() {
+                if re.sheet2.is_some() || re.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
+                        v => (1, 1, vec![v]),
                     };
                 }
                 match self.sheet_index(re.sheet.as_deref(), si) {
@@ -2563,7 +2843,7 @@ impl<'a> Calc<'a> {
                 }
             },
             Node::Range(a, b) => {
-                if a.sheet2.is_some() || b.sheet2.is_some() {
+                if a.sheet2.is_some() || b.sheet2.is_some() || a.book.is_some() || b.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
                         FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
@@ -2637,8 +2917,10 @@ impl<'a> Calc<'a> {
 
     fn operand_values(&mut self, n: &Node, si: usize) -> Vec<FValue> {
         if let Node::Range(a, b) = n {
-            if let Ok(Arg::Range { values, .. }) = self.range_values(a, b, si) {
-                return (*values).clone();
+            if a.sheet2.is_none() && b.sheet2.is_none() {
+                if let Ok(Arg::Range { values, .. }) = self.range_values(a, b, si) {
+                    return (*values).clone();
+                }
             }
         }
         let v = self.eval_node(n, si);
@@ -2851,9 +3133,9 @@ pub fn serial_to_date_pub(serial: f64) -> Option<(i32, u32, u32)> {
 }
 
 pub fn parse(src: &str) -> Result<Node, ErrKind> {
-    // 整行引用只在这里展开，模型/文件里的公式保持 `1:3`，复制和结构编辑才能
-    // 按整行语义处理；求值阶段仍按实际使用区裁剪。
-    let src = crate::expand_whole_rows(src);
+    // 整行/整列引用在这里统一展开（兼容未经过 normalize_formula 的直接调用方如条件格式/数据验证），
+    // 模型/文件里的原公式保持不变，求值阶段按实际使用区裁剪。
+    let src = crate::expand_whole_cols(&crate::expand_whole_rows(src));
     let toks = lex(&src)?;
     let mut p = Parser { toks, pos: 0 };
     let node = p.parse_expr()?;
@@ -2863,59 +3145,58 @@ pub fn parse(src: &str) -> Result<Node, ErrKind> {
     Ok(node)
 }
 
+/// 把外部工作簿定义名称展开后的 AST 节点全部绑定到 `[book]`，使其求值走外链缓存路径。
+pub(crate) fn qualify_ext_node(node: &mut Node, book: &str, default_sheet: Option<&str>) {
+    let bind_ref = |r: &mut RefExpr| {
+        if r.book.is_none() {
+            r.book = Some(book.to_string());
+            if r.sheet.is_none() {
+                if let Some(ds) = default_sheet {
+                    r.sheet = Some(ds.to_string());
+                }
+            }
+        }
+    };
+    match node {
+        Node::Ref(r) | Node::Spill(r) => bind_ref(r),
+        Node::Range(a, b) => {
+            bind_ref(a);
+            bind_ref(b);
+        }
+        Node::Name(n) => {
+            let nm = std::mem::take(n);
+            *node = Node::ScopedName {
+                book: Some(book.to_string()),
+                sheet: default_sheet.map(str::to_string),
+                name: nm,
+            };
+        }
+        Node::ScopedName { book: bk, .. } => {
+            if bk.is_none() {
+                *bk = Some(book.to_string());
+            }
+        }
+        Node::Implicit(inner) | Node::Unary(_, inner) | Node::Percent(inner) => {
+            qualify_ext_node(inner, book, default_sheet);
+        }
+        Node::Binary(_, l, r) => {
+            qualify_ext_node(l, book, default_sheet);
+            qualify_ext_node(r, book, default_sheet);
+        }
+        Node::Func(_, args) => {
+            for a in args {
+                qualify_ext_node(a, book, default_sheet);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 识别 C11 引用范围内、当前求值器尚未实现的合法组合。
 ///
-/// 这里只列明确支持的兼容场景，不能把普通 parse 失败都算进来：真正的
-/// `#REF!`/`#VALUE!` 仍必须由运算产生。当前明确未实现的是**外部工作簿的
-/// 三维引用**（例如 `[1]First:Third!A1`）；它和普通外部单表引用不同，
-/// 需要跨外部链接的所有端点表展开，现阶段无法可靠求值。返回的说明会带进
-/// 加载诊断，并让重算保留文件里的缓存值。
+/// 外部工作簿三维引用现已在原生公式解析与求值中完整实现，此函数保留用于兼容外部调用接口，始终返回 `None`。
 pub fn unsupported_reference_combo(src: &str) -> Option<&'static str> {
-    let bytes = src.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        // 双引号字符串里的 `[1]Sheet:Sheet!A1` 只是文本，不是引用。
-        // Excel 用连续两个双引号表示字符串内的一个双引号，必须成对跳过，
-        // 否则字符串结尾前的内容会被误当成外部工作簿三维引用。
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] != b'[' {
-            i += 1;
-            continue;
-        }
-        let Some(rel) = src[i + 1..].find(']') else {
-            return None;
-        };
-        let after = i + 1 + rel + 1;
-        let mut j = after;
-        while j < bytes.len() {
-            match bytes[j] {
-                b'!' => {
-                    if src[after..j].contains(':') {
-                        return Some("外部工作簿三维引用");
-                    }
-                    break;
-                }
-                // 括号/逗号/另一个方括号说明这里不是单一限定符，交给后续扫描。
-                b'(' | b')' | b',' | b'[' | b']' => break,
-                _ => j += 1,
-            }
-        }
-        i = after;
-    }
+    let _ = src;
     None
 }
 
@@ -3090,6 +3371,115 @@ pub fn recalc_dirty(wb: &mut Workbook, deps: &deps::Deps, seeds: &[deps::CellKey
         }
     }
     last_count
+}
+
+/// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
+/// 若遇到需整表物化的动态数组溢出返回 `false`，普通标量公式写回后返回 `true`。
+pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) -> bool {
+    if wb.calc_manual || seeds.is_empty() {
+        return true;
+    }
+    let mut formula_seeds: Vec<deps::CellKey> = seeds
+        .iter()
+        .copied()
+        .filter(|&(si, r, c)| {
+            wb.sheets
+                .get(si)
+                .and_then(|s| s.get(r, c))
+                .is_some_and(|cell| cell.formula.is_some())
+        })
+        .collect();
+    if formula_seeds.is_empty() {
+        return true;
+    }
+    formula_seeds.sort_unstable();
+    formula_seeds.dedup();
+    let scope: HashSet<deps::CellKey> = formula_seeds.iter().copied().collect();
+    let mut results = Vec::with_capacity(formula_seeds.len());
+    {
+        let mut calc = Calc::new(wb);
+        calc.scope = Some(scope);
+        for &(si, r, c) in &formula_seeds {
+            let v = calc.cell_value(si, r, c);
+            if matches!(v, FValue::Array(_)) {
+                return false;
+            }
+            results.push((si, r, c, v));
+        }
+    }
+    write_back(wb, results);
+    true
+}
+
+/// 交互式增量重算（专供 UI 编辑提交与实时协作帧调用）：
+/// - 小型工作簿（≤ 1,200 格）直接走完整同步 `recalc_dirty`；
+/// - 中大型工作簿先即时算出当前编辑公式格，再对静态依赖闭包施加严格数量与 12ms 时间预算，
+///   超出预算或含全局动态引用/数组溢出时返回 `false`，由静默后台线程异步补齐，确保 UI 永不掉帧。
+pub fn recalc_interactive(
+    wb: &mut Workbook,
+    deps: &deps::Deps,
+    seeds: &[deps::CellKey],
+    deps_ready: bool,
+) -> bool {
+    if wb.calc_manual {
+        mark_pending(wb, deps, seeds);
+        return true;
+    }
+    if seeds.is_empty() {
+        return true;
+    }
+    let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
+    if total_cells <= 1_200 {
+        recalc_dirty(wb, deps, seeds);
+        return true;
+    }
+    for &(si, r, c) in seeds {
+        if let Some(sheet) = wb.sheets.get_mut(si) {
+            sheet.spilled.remove(&CellRef::new(r, c));
+        }
+    }
+    if !eval_formula_seeds_immediate(wb, seeds) {
+        return false;
+    }
+    let has_spills_or_arrays = wb
+        .sheets
+        .iter()
+        .any(|s| !s.spilled.is_empty() || !s.arrays.is_empty());
+    if !deps_ready || deps.requires_full_recalc() || has_spills_or_arrays || wb.calc_iterate {
+        return false;
+    }
+    let dirty = deps.closure(seeds);
+    if dirty.is_empty() {
+        return true;
+    }
+    if dirty.len() > 96 {
+        return false;
+    }
+    let mut order: Vec<deps::CellKey> = dirty.iter().copied().collect();
+    order.sort_unstable();
+    let t0 = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(12);
+    let mut results = Vec::with_capacity(order.len());
+    let mut timed_out = false;
+    {
+        let mut calc = Calc::new(wb);
+        calc.scope = Some(dirty);
+        for (idx, &(si, r, c)) in order.iter().enumerate() {
+            if idx >= 4 && t0.elapsed() > budget {
+                timed_out = true;
+                break;
+            }
+            let v = calc.cell_value(si, r, c);
+            if matches!(v, FValue::Array(_)) {
+                return false;
+            }
+            results.push((si, r, c, v));
+        }
+    }
+    if !results.is_empty() {
+        write_back(wb, results);
+    }
+    !timed_out
 }
 
 fn clear_spills(wb: &mut Workbook) {

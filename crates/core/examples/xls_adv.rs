@@ -56,6 +56,7 @@ fn main() -> anyhow::Result<()> {
         target: "book_b.xls".into(),
         abs: None,
         sheets: vec!["Sheet1".into()],
+        defined_names: Default::default(),
         cache: Default::default(),
         refreshed: false,
     }];

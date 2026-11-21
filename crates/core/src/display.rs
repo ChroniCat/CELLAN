@@ -124,7 +124,7 @@ pub fn view_at_value_fit(
     };
     let halign = match st.halign {
         1 => 0,
-        2 => 1,
+        2 | 4 | 5 => 1,
         3 => 2,
         _ => general_halign(&value),
     };

@@ -339,7 +339,7 @@ fn font_record(f: &FontKey) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&f.size.to_le_bytes());
     b.extend_from_slice(&(((f.bold as u16) | ((f.italic as u16) << 1)) as u16).to_le_bytes());
-    b.extend_from_slice(&w16(0x7FFF)); // icv = 自动
+    b.extend_from_slice(&w16(if f.color == 0 { 0x7FFF } else { f.color as u16 })); // icv
     b.extend_from_slice(&w16(if f.bold { 700 } else { 400 }));
     b.extend_from_slice(&w16(0)); // sss
     b.push(0); // uls
@@ -438,7 +438,7 @@ fn sheet_stream(
     dim.extend_from_slice(&w32(0));
     dim.extend_from_slice(&w32(rmax + 1));
     dim.extend_from_slice(&w16(0));
-    dim.extend_from_slice(&w16((cmax + 1).min(255) as u16));
+    dim.extend_from_slice(&w16((cmax + 1) as u16));
     dim.extend_from_slice(&w16(0));
     rec(&mut out, DIMENSIONS, &dim);
 
@@ -461,7 +461,7 @@ fn sheet_stream(
         let mut b = Vec::new();
         b.extend_from_slice(&w16(r as u16));
         b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16((cmax + 1).min(255) as u16));
+        b.extend_from_slice(&w16((cmax + 1) as u16));
         b.extend_from_slice(&w16((h * 15.0).round().min(65535.0) as u16)); // px → twips (px*15 = pt*20)
         b.extend_from_slice(&w16(0));
         b.extend_from_slice(&w16(0));
@@ -556,10 +556,10 @@ fn sheet_stream(
     }
 
     // 合并区
-    if !sheet.merges.is_empty() {
+    for merges in sheet.merges.chunks(1027) {
         let mut b = Vec::new();
-        b.extend_from_slice(&w16(sheet.merges.len().min(1027) as u16));
-        for (r1, c1, r2, c2) in sheet.merges.iter().take(1027) {
+        b.extend_from_slice(&w16(merges.len() as u16));
+        for (r1, c1, r2, c2) in merges {
             b.extend_from_slice(&w16(*r1 as u16));
             b.extend_from_slice(&w16(*r2 as u16));
             b.extend_from_slice(&w16(*c1 as u16));
@@ -584,8 +584,29 @@ fn sheet_stream(
 }
 
 pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
+    if wb.encryption.is_some() {
+        bail!("当前 .xls 写入器无法保留打开密码，请另存为 .xlsx 或 .xlsm");
+    }
+    if wb.has_vba {
+        bail!("当前 .xls 写入器无法保留 VBA 宏，请另存为 .xlsm");
+    }
     if wb.sheets.len() > 255 {
         bail!(".xls 最多 255 张工作表");
+    }
+    for sheet in &wb.sheets {
+        let coordinates = sheet.iter().map(|(pos, _)| (pos.row, pos.col))
+            .chain(sheet.styles.keys().chain(sheet.notes.keys()).map(|pos| (pos.row, pos.col)))
+            .chain(sheet.rows.custom_pairs().into_iter().map(|(row, _)| (row, 0)))
+            .chain(sheet.cols.custom_pairs().into_iter().map(|(col, _)| (0, col)))
+            .chain(sheet.row_styles.keys().map(|&row| (row, 0)))
+            .chain(sheet.col_styles.keys().map(|&col| (0, col)))
+            .chain(sheet.merges.iter().flat_map(|&(r1, c1, r2, c2)| [(r1, c1), (r2, c2)]));
+        for (r, c) in coordinates {
+            if r > u16::MAX as u32 || c > u8::MAX as u32 {
+                bail!("工作表 {} 的第 {} 行、第 {} 列超出 .xls 的 65536 行、256 列范围，请另存为 .xlsx",
+                    sheet.name, u64::from(r) + 1, u64::from(c) + 1);
+            }
+        }
     }
 
     let mut tables = Tables::new();

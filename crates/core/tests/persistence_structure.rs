@@ -164,16 +164,19 @@ fn shifted_styles_and_notes_use_new_coordinates_after_reopen() {
 }
 
 #[test]
-fn backup_failure_preserves_original_and_reports_error() {
+fn saving_never_creates_history_or_sidecar_files_next_to_workbook() {
     let fixture = Fixture::new();
-    let path = fixture.file("backup.xlsx");
+    let path = fixture.file("clean_dir.xlsx");
     seed(&path);
-    let original = std::fs::read(&path).unwrap();
-    std::fs::write(fixture.file(".~sheetflow-history"), b"not a directory").unwrap();
     let mut wb = xlsx::load(&path).unwrap();
     wb.sheets[0].set(0, 0, number(999.0));
-    assert!(xlsx::save_atomic(&path, &wb).is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), original);
+    xlsx::save_atomic(&path, &wb).unwrap();
+    let entries: Vec<String> = std::fs::read_dir(&fixture.0)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["clean_dir.xlsx"], "原文件目录不得残留 .~sheetflow-history 或 .saving-* 附加文件");
 }
 
 #[test]

@@ -425,11 +425,11 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             ))
         }),
         "MINIFS" | "MAXIFS" => r(|| {
-            let target = args.first().ok_or(ErrKind::Value)?.values();
-            let pairs: Vec<(Vec<FValue>, String)> = (1..args.len())
+            let target = args.first().ok_or(ErrKind::Value)?.slice();
+            let pairs: Vec<(&[FValue], String)> = (1..args.len())
                 .step_by(2)
                 .filter_map(|i| {
-                    let rg = args.get(i)?.values();
+                    let rg = args.get(i)?.slice();
                     let c = args.get(i + 1)?.first().to_text().ok()?;
                     Some((rg, c))
                 })
@@ -1314,11 +1314,11 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
 
         // ============================ 条件聚合补充
         "AVERAGEIFS" => r(|| {
-            let avg = args.first().ok_or(ErrKind::Value)?.values();
-            let pairs: Vec<(Vec<FValue>, String)> = (1..args.len())
+            let avg = args.first().ok_or(ErrKind::Value)?.slice();
+            let pairs: Vec<(&[FValue], String)> = (1..args.len())
                 .step_by(2)
                 .filter_map(|i| {
-                    let rg = args.get(i)?.values();
+                    let rg = args.get(i)?.slice();
                     let c = args.get(i + 1)?.first().to_text().ok()?;
                     Some((rg, c))
                 })

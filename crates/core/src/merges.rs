@@ -33,6 +33,9 @@ pub struct SheetLayout {
     /// 分级显示级别（0-based 行列 → 1..=7）
     pub row_levels: Vec<(u32, u8)>,
     pub col_levels: Vec<(u32, u8)>,
+    /// 整列 / 整行样式索引（0-based 行列 → xl/styles.xml cellXfs 索引）
+    pub col_xfs: Vec<(u32, u32)>,
+    pub row_xfs: Vec<(u32, u32)>,
     /// 条件格式
     pub cf: Vec<crate::cf::CfBlock>,
     /// 是否有未建模的 x14 扩展条件格式
@@ -161,6 +164,8 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || !lay.col_levels.is_empty()
             || !lay.hidden_rows.is_empty()
             || !lay.hidden_cols.is_empty()
+            || !lay.col_xfs.is_empty()
+            || !lay.row_xfs.is_empty()
             || !lay.cf.is_empty()
             || !lay.dv.is_empty()
             || lay.freeze.is_some()
@@ -249,6 +254,8 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let mut width = 0f32;
                     let mut custom = false;
                     let mut hidden = false;
+                    let mut style_xf = 0u32;
+                    let mut outline_lv = 0u8;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
                         let val = crate::model::xml_unescape(&a.value.to_string());
@@ -258,15 +265,19 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             k if k.ends_with("width") => width = val.parse().unwrap_or(0.0),
                             k if k.ends_with("customWidth") => custom = val == "1" || val == "true",
                             "hidden" => hidden = val == "1" || val == "true",
-                            "outlineLevel" => {
-                                let lv = val.parse::<u8>().unwrap_or(0);
-                                if lv > 0 && min >= 1 && max >= min && (max - min) < 1024 {
-                                    for c in (min - 1)..max {
-                                        out.col_levels.push((c, lv));
-                                    }
-                                }
-                            }
+                            "style" => style_xf = val.parse().unwrap_or(0),
+                            "outlineLevel" => outline_lv = val.parse::<u8>().unwrap_or(0),
                             _ => {}
+                        }
+                    }
+                    if outline_lv > 0 && min >= 1 && max >= min && (max - min) < 1024 {
+                        for c in (min - 1)..max {
+                            out.col_levels.push((c, outline_lv));
+                        }
+                    }
+                    if style_xf > 0 && min >= 1 && max >= min {
+                        for c in (min - 1)..max.min(16_384) {
+                            out.col_xfs.push((c, style_xf));
                         }
                     }
                     if hidden && min >= 1 && max >= min && (max - min) < 1024 {
@@ -303,6 +314,8 @@ fn parse_layout(xml: &str) -> SheetLayout {
                     let mut ht = 0f32;
                     let mut custom = false;
                     let mut hidden = false;
+                    let mut row_s = 0u32;
+                    let mut row_lv = 0u8;
                     for a in e.attributes().flatten() {
                         let key = a.key.as_ref();
                         let val = crate::model::xml_unescape(&a.value.to_string());
@@ -311,14 +324,16 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             "ht" => ht = val.parse().unwrap_or(0.0),
                             "customHeight" => custom = val == "1" || val == "true",
                             "hidden" => hidden = val == "1" || val == "true",
-                            "outlineLevel" => {
-                                let lv = val.parse::<u8>().unwrap_or(0);
-                                if lv > 0 && idx >= 1 {
-                                    out.row_levels.push((idx - 1, lv));
-                                }
-                            }
+                            "s" => row_s = val.parse().unwrap_or(0),
+                            "outlineLevel" => row_lv = val.parse::<u8>().unwrap_or(0),
                             _ => {}
                         }
+                    }
+                    if row_lv > 0 && idx >= 1 {
+                        out.row_levels.push((idx - 1, row_lv));
+                    }
+                    if row_s > 0 && idx >= 1 {
+                        out.row_xfs.push((idx - 1, row_s));
                     }
                     if hidden && idx >= 1 {
                         out.hidden_rows.push(idx - 1);

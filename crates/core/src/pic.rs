@@ -15,8 +15,9 @@ pub struct Picture {
     pub off: [i64; 4],
     /// zip 里的部件名，例如 xl/media/image1.jpeg；新插入的图在保存前就有稳定名字
     pub part: String,
-    /// 内存里的原始字节（新插入的图；从文件读出来的图这里为空，按 part 读）
-    pub data: Option<Vec<u8>>,
+    /// 内存里的原始字节（新插入的图；从文件读出来的图这里为空，按 part 读）。
+    /// 使用 `Arc` 引用计数共享，避免每帧绘制、`wb.clone()` 与撤销快照重复拷贝数 MB 图片字节。
+    pub data: Option<std::sync::Arc<Vec<u8>>>,
     /// png / jpeg / gif / bmp
     pub ext: String,
     /// 可读名字（“图片 1”），写进 cNvPr

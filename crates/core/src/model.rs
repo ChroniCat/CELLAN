@@ -126,8 +126,16 @@ pub struct Sheet {
     pub rows: crate::layout::Axis,
     /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
     pub styles: HashMap<CellRef, u16>,
+    /// 整列默认样式（列号 -> 样式表索引，稀疏）
+    pub col_styles: HashMap<u32, u16>,
+    /// 整行默认样式（行号 -> 样式表索引，稀疏）
+    pub row_styles: HashMap<u32, u16>,
     /// 用户改过样式的格子（保存时只需要回写这些，不必重写整表样式）
     pub style_edits: std::collections::HashSet<CellRef>,
+    /// 整列样式被改过
+    pub col_styles_dirty: bool,
+    /// 整行样式被改过
+    pub row_styles_dirty: bool,
     /// 合并区域被改过，保存时要同步
     pub merges_dirty: bool,
     /// 条件格式
@@ -234,7 +242,11 @@ impl Sheet {
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
             styles: HashMap::new(),
+            col_styles: HashMap::new(),
+            row_styles: HashMap::new(),
             style_edits: std::collections::HashSet::new(),
+            col_styles_dirty: false,
+            row_styles_dirty: false,
             merges_dirty: false,
             cf: crate::cf::CfSheet::default(),
             cf_dirty: false,
@@ -371,6 +383,8 @@ impl Sheet {
     /// 让布局/保护/页面设置/批注/图表等补丁把它们重新写出来。
     pub fn mark_all_dirty(&mut self) {
         self.styles_dirty = true;
+        self.col_styles_dirty = true;
+        self.row_styles_dirty = true;
         self.merges_dirty = true;
         self.cf_dirty = true;
         self.dv_dirty = true;
@@ -390,7 +404,21 @@ impl Sheet {
     }
 
     pub fn style_of(&self, r: u32, c: u32) -> u16 {
-        self.styles.get(&CellRef::new(r, c)).copied().unwrap_or(0)
+        if let Some(&id) = self.styles.get(&CellRef::new(r, c)) {
+            return id;
+        }
+        if let Some(&id) = self.row_styles.get(&r) {
+            return id;
+        }
+        if let Some(&id) = self.col_styles.get(&c) {
+            return id;
+        }
+        0
+    }
+
+    /// 显式写在单元格上的样式索引（不回退到整行/整列）
+    pub fn explicit_style_of(&self, r: u32, c: u32) -> Option<u16> {
+        self.styles.get(&CellRef::new(r, c)).copied()
     }
 
     /// 用户改样式（标记脏，保存时回写）
@@ -401,7 +429,11 @@ impl Sheet {
         }
         let key = CellRef::new(r, c);
         if id == 0 {
-            self.styles.remove(&key);
+            if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
+                self.styles.insert(key, 0);
+            } else {
+                self.styles.remove(&key);
+            }
         } else {
             self.styles.insert(key, id);
         }
@@ -412,9 +444,59 @@ impl Sheet {
     pub fn set_style_loaded(&mut self, r: u32, c: u32, id: u16) {
         let key = CellRef::new(r, c);
         if id == 0 {
-            self.styles.remove(&key);
+            if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
+                self.styles.insert(key, 0);
+            } else {
+                self.styles.remove(&key);
+            }
         } else {
             self.styles.insert(key, id);
+        }
+    }
+
+    /// 用户设置整列样式（稀疏）
+    pub fn set_col_style(&mut self, c: u32, id: u16) {
+        if !self.loading {
+            self.edited = true;
+            self.styles_dirty = true;
+            self.col_styles_dirty = true;
+        }
+        if id == 0 {
+            self.col_styles.remove(&c);
+        } else {
+            self.col_styles.insert(c, id);
+        }
+    }
+
+    /// 从文件载入整列样式（不算用户修改）
+    pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
+        if id == 0 {
+            self.col_styles.remove(&c);
+        } else {
+            self.col_styles.insert(c, id);
+        }
+    }
+
+    /// 用户设置整行样式（稀疏）
+    pub fn set_row_style(&mut self, r: u32, id: u16) {
+        if !self.loading {
+            self.edited = true;
+            self.styles_dirty = true;
+            self.row_styles_dirty = true;
+        }
+        if id == 0 {
+            self.row_styles.remove(&r);
+        } else {
+            self.row_styles.insert(r, id);
+        }
+    }
+
+    /// 从文件载入整行样式（不算用户修改）
+    pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
+        if id == 0 {
+            self.row_styles.remove(&r);
+        } else {
+            self.row_styles.insert(r, id);
         }
     }
 
@@ -588,6 +670,8 @@ pub struct Workbook {
     pub calc_pending_sheets: std::collections::BTreeSet<usize>,
     /// 打开密码设置；另存时继续加密
     pub encryption: Option<crate::crypto::EncryptionSettings>,
+    /// Credentials for the package at `path`, independent of the next save's password.
+    pub source_encryption: Option<crate::crypto::EncryptionSettings>,
     pub dirty: bool,
     /// 用户在应用里改过图表的部件名（保存时不要按基准还原这些部件）
     pub chart_edits: Vec<String>,
@@ -612,6 +696,7 @@ impl Workbook {
             path: None,
             decrypted: None,
             encryption: None,
+            source_encryption: None,
             date_system: DateSystem::D1900,
             calc_manual: false,
             calc_iterate: false,

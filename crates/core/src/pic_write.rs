@@ -330,6 +330,9 @@ fn empty_rels() -> String {
 
 /// 保存收尾：把内存里的图片写回各表 drawing（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.pictures_dirty) {
+        return Ok(());
+    }
     let targets = crate::patch::sheet_targets(path)?;
     let mut additions: Vec<(String, Vec<u8>)> = Vec::new();
     let mut patch: Vec<(String, String)> = Vec::new();
@@ -365,7 +368,7 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             if let Some(data) = pic.data.as_ref() {
                 let part = memory_part(data, &pic.ext);
                 if !crate::textbox::has_part(path, &part) {
-                    additions.push((part.clone(), data.clone()));
+                    additions.push((part.clone(), data.as_ref().clone()));
                 }
             }
             let fname = pic.part.rsplit('/').next().unwrap_or("image1.png").to_string();

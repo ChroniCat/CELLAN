@@ -2441,7 +2441,7 @@ fn deleting_a_picture_is_one_undo_step_and_restores_its_anchor() {
         rect: (2, 2, 6, 5),
         off: [0; 4],
         part: "xl/media/sc0000000000000001.png".into(),
-        data: Some(png),
+        data: Some(std::sync::Arc::new(png)),
         ext: "png".into(),
         name: "图片 1".into(),
     });
@@ -2468,7 +2468,7 @@ fn moving_a_picture_is_undoable() {
         rect: (0, 0, 3, 3),
         off: [0; 4],
         part: "xl/media/sc0000000000000002.png".into(),
-        data: Some(vec![1, 2, 3]),
+        data: Some(std::sync::Arc::new(vec![1, 2, 3])),
         ext: "png".into(),
         name: "图片 1".into(),
     });

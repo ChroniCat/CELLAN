@@ -70,6 +70,8 @@ pub fn consolidate(
     }
     // 收集每个源的数值网格
     struct Grid {
+        row_map: std::collections::HashMap<String, usize>,
+        col_map: std::collections::HashMap<String, usize>,
         row_labels: Vec<String>,
         col_labels: Vec<String>,
         vals: Vec<Vec<Vec<f64>>>,
@@ -79,7 +81,14 @@ pub fn consolidate(
         let Some(sh) = wb.sheets.iter().find(|x| x.name == s.sheet) else {
             return Err(format!("没有工作表「{}」", s.sheet));
         };
-        let (r1, c1, r2, c2) = s.rect;
+        let (r1, c1, mut r2, mut c2) = s.rect;
+        if (r2.saturating_sub(r1) as u64 + 1) * (c2.saturating_sub(c1) as u64 + 1) > 200_000 {
+            let Some((_, _, ur2, uc2)) = sh.used_bounds() else {
+                return Err(format!("区域 {} 没有有效数据", s.sheet));
+            };
+            r2 = r2.min(ur2);
+            c2 = c2.min(uc2);
+        }
         let (dr, dc) = (
             if row_labels { r1 + 1 } else { r1 },
             if col_labels { c1 + 1 } else { c1 },
@@ -92,48 +101,64 @@ pub fn consolidate(
                 s.sheet
             ));
         }
+        if (rows as u64) * (cols as u64) > 500_000 {
+            return Err(format!("区域 {} 过大（超过 50 万单元格），请缩小选区范围", s.sheet));
+        }
         let mut g = Grid {
-            row_labels: Vec::new(),
-            col_labels: Vec::new(),
+            row_map: std::collections::HashMap::with_capacity(rows as usize),
+            col_map: std::collections::HashMap::with_capacity(cols as usize),
+            row_labels: Vec::with_capacity(rows as usize),
+            col_labels: Vec::with_capacity(cols as usize),
             vals: vec![vec![Vec::new(); cols as usize]; rows as usize],
         };
         for i in 0..rows {
-            g.row_labels.push(if row_labels {
+            let lbl = if row_labels {
                 sh.value(dr + i, c1).display()
             } else {
                 format!("第{}行", i + 1)
-            });
+            };
+            g.row_map.entry(lbl.clone()).or_insert(i as usize);
+            g.row_labels.push(lbl);
         }
         for j in 0..cols {
-            g.col_labels.push(if col_labels {
+            let lbl = if col_labels {
                 sh.value(r1, dc + j).display()
             } else {
                 format!("第{}列", j + 1)
-            });
+            };
+            g.col_map.entry(lbl.clone()).or_insert(j as usize);
+            g.col_labels.push(lbl);
         }
         for i in 0..rows {
             for j in 0..cols {
                 if let Value::Number(n) = sh.value(dr + i, dc + j) {
-                    g.vals[i as usize][j as usize].push(n);
+                    let ri = *g.row_map.get(&g.row_labels[i as usize]).unwrap_or(&(i as usize));
+                    let cj = *g.col_map.get(&g.col_labels[j as usize]).unwrap_or(&(j as usize));
+                    g.vals[ri][cj].push(n);
                 }
             }
         }
         grids.push(g);
     }
-    // 汇总标签（保持出现顺序）
+    // 汇总标签（保持出现顺序，O(1) 哈希去重替代 O(N^2) Vec::contains）
     let mut rows: Vec<String> = Vec::new();
     let mut cols: Vec<String> = Vec::new();
+    let mut seen_rows: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
     for g in &grids {
         for r in &g.row_labels {
-            if !rows.contains(r) {
+            if seen_rows.insert(r.clone()) {
                 rows.push(r.clone());
             }
         }
         for c in &g.col_labels {
-            if !cols.contains(c) {
+            if seen_cols.insert(c.clone()) {
                 cols.push(c.clone());
             }
         }
+    }
+    if (rows.len() as u64) * (cols.len() as u64) > 500_000 {
+        return Err("合并计算结果矩阵超过 50 万单元格上限".into());
     }
     // 写结果：左上角标签 + 表头 + 数据
     let (ar, ac) = at;
@@ -173,10 +198,10 @@ pub fn consolidate(
         for (j, c) in cols.iter().enumerate() {
             let mut vals: Vec<f64> = Vec::new();
             for g in &grids {
-                let Some(ri) = g.row_labels.iter().position(|x| x == r) else {
+                let Some(&ri) = g.row_map.get(r) else {
                     continue;
                 };
-                let Some(cj) = g.col_labels.iter().position(|x| x == c) else {
+                let Some(&cj) = g.col_map.get(c) else {
                     continue;
                 };
                 vals.extend(g.vals[ri][cj].iter().copied());

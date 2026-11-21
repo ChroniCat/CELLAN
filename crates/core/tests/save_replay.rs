@@ -47,6 +47,52 @@ fn first_save_receipt_preserves_a_picture_inserted_before_later_saves() {
 }
 
 #[test]
+fn chart_receipt_keeps_changes_made_after_the_save_snapshot() {
+    use sheetcore::{chart_write, charts, Sheet};
+    let f = Fixture::new();
+    let path = f.file("in-flight-charts.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(Sheet::new("Forecast"));
+    for sheet in &mut wb.sheets {
+        sheet.set(1, 0, number(1.));
+        sheet.set(1, 1, number(10.));
+        sheet.set(2, 1, number(20.));
+    }
+    save(&path, &mut wb);
+    for sheet in &wb.sheets {
+        let chart = chart_write::chart_from_selection(
+            sheet, &sheet.name, (0, 0, 2, 1), "Income", charts::ChartKind::Column,
+        );
+        chart_write::insert_chart(&path, &sheet.name, &chart).unwrap();
+    }
+    let mut live = xlsx::load(&path).unwrap();
+    let insert = Structural::InsertRows { at: 1, n: 1 };
+    apply_structural_wb(&mut live, 0, &insert);
+    let snapshot = live.clone();
+    apply_structural_wb(&mut live, 0, &insert);
+    apply_structural_wb(&mut live, 1, &insert);
+    live.sheets[0].charts[0].anchor.0 += 1;
+    let expected: Vec<_> = live.sheets.iter().map(|sheet| {
+        let chart = &sheet.charts[0];
+        (chart.series[0].val_ref.clone(), chart.anchor)
+    }).collect();
+    let receipt = xlsx::save_atomic_with_receipt(&path, &snapshot).unwrap();
+    receipt.apply_to(&mut live);
+    for sheet in &live.sheets {
+        assert!(sheet.charts_dirty);
+        assert!(!sheet.charts[0].ref_fixes.is_empty());
+    }
+    save(&path, &mut live);
+    let back = xlsx::load(&path).unwrap();
+    for (sheet, (reference, anchor)) in back.sheets.iter().zip(&expected) {
+        let chart = &sheet.charts[0];
+        assert_eq!(chart.series[0].val_ref.replace('\'', ""), reference.replace('\'', ""));
+        assert_eq!(&chart.anchor, anchor);
+    }
+    assert!(live.sheets.iter().all(|s| !s.charts_dirty && s.charts[0].ref_fixes.is_empty()));
+}
+
+#[test]
 fn receipt_matches_identity_after_rename_reorder_delete_and_edits() {
     let f = Fixture::new();
     let path = f.file("in-flight.xlsx");
@@ -189,4 +235,100 @@ fn new_default_and_duplicated_sheets_have_distinct_identities() {
     assert!(sheetcore::sheet_ops::insert_sheet(&mut wb, 1, copy));
     assert_ne!(wb.sheets[1].identity, id);
     assert!(wb.sheets[1].source_part.is_none());
+}
+
+#[test]
+fn large_multi_sheet_quote_prefix_and_shrink_save_is_fast() {
+    let f = Fixture::new();
+    let path = f.file("汇总附表_回归.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "货柜".into();
+    let mut sh_vendor = Sheet::new("按供应商");
+    let mut sh_cust = Sheet::new("客户清单");
+
+    let mut st_quote_shrink = wb.styles.get(0).clone();
+    st_quote_shrink.shrink_to_fit = true;
+    let sid_qs = wb.styles.intern(st_quote_shrink);
+    wb.styles.set_quote(sid_qs, true);
+
+    for r in 0..3_500u32 {
+        let sh = &mut wb.sheets[0];
+        sh.set(
+            r,
+            1,
+            Cell {
+                value: Value::Text(format!("愉悦-YK{r:04}").into()),
+                formula: None,
+            },
+        );
+        sh.set(
+            r,
+            2,
+            Cell {
+                value: Value::Text(format!("28526{r:04}").into()),
+                formula: None,
+            },
+        );
+        sh.set_style(r, 2, sid_qs);
+        sh.row_levels.insert(r, 1);
+    }
+    wb.sheets[0].layout_dirty = true;
+
+    for r in 0..2_000u32 {
+        sh_vendor.set(
+            r,
+            1,
+            Cell {
+                value: Value::Text(format!("供应商-{r}").into()),
+                formula: None,
+            },
+        );
+        sh_vendor.set(r, 3, number(r as f64 * 10.0));
+        sh_cust.set(
+            r,
+            0,
+            Cell {
+                value: Value::Text(format!("客户-{r}").into()),
+                formula: None,
+            },
+        );
+    }
+    wb.sheets.push(sh_vendor);
+    wb.sheets.push(sh_cust);
+
+    // 首次落盘建立基准包
+    save(&path, &mut wb);
+
+    // 重新加载后仅改冻结窗格/列宽（零单元格编辑直通路径）
+    let mut wb = xlsx::load(&path).unwrap();
+    wb.sheets[0].freeze = Some((11, 2));
+    wb.sheets[0].freeze_dirty = true;
+    let t_fast = std::time::Instant::now();
+    save(&path, &mut wb);
+    let fast_elapsed = t_fast.elapsed();
+    assert!(
+        fast_elapsed.as_millis() < 2_500,
+        "零单元格改动的保存应走直通基准快路径，实际耗时 {fast_elapsed:?}"
+    );
+
+    // 重新加载后修改单张表单元格并保存（含未改大表跳过 + O(N) quotePrefix/shrinkToFit/outline）
+    let mut wb = xlsx::load(&path).unwrap();
+    wb.sheets[0].set(202, 2, Cell { value: Value::Text("999888777".into()), formula: None });
+    wb.sheets[0].set_style(202, 2, sid_qs);
+    wb.sheets[0].layout_dirty = true;
+    let t_edit = std::time::Instant::now();
+    save(&path, &mut wb);
+    let edit_elapsed = t_edit.elapsed();
+    assert!(
+        edit_elapsed.as_secs_f64() < 8.0,
+        "多表数千行带 quotePrefix/shrinkToFit/分级 的保存应在秒级完成（Debug 模式），实际耗时 {edit_elapsed:?}"
+    );
+
+    let reopened = xlsx::load(&path).unwrap();
+    assert_eq!(reopened.sheets[0].freeze, Some((11, 2)));
+    assert_eq!(reopened.sheets[0].value(202, 2).display(), "999888777");
+    assert_eq!(reopened.sheets[1].value(1999, 3), Value::Number(19990.0));
+    let re_sid = reopened.sheets[0].style_of(100, 2);
+    assert!(reopened.styles.quote_of(re_sid), "quotePrefix 必须完整保真");
+    assert!(reopened.styles.get(re_sid).shrink_to_fit, "shrinkToFit 必须完整保真");
 }

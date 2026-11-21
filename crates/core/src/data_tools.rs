@@ -41,17 +41,15 @@ impl SortKey {
     }
 }
 
-/// 比较两个格子（空值永远排最后）
-fn cmp_cell(
-    a: &Option<Cell>,
-    b: &Option<Cell>,
+/// 比较两个格子引用（空值永远排最后；零克隆比较避免 O(N log N) 重复深拷贝 Cell）
+fn cmp_cell_ref(
+    a: &Cell,
+    b: &Cell,
     ignore_case: bool,
     mode: &SortMode,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let av = a.as_ref().map(|c| c.value.clone()).unwrap_or(Value::Empty);
-    let bv = b.as_ref().map(|c| c.value.clone()).unwrap_or(Value::Empty);
-    match (&av, &bv) {
+    match (&a.value, &b.value) {
         (Value::Empty, Value::Empty) => Ordering::Equal,
         (Value::Empty, _) => Ordering::Greater,
         (_, Value::Empty) => Ordering::Less,
@@ -59,7 +57,7 @@ fn cmp_cell(
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Number(_), _) => Ordering::Less,
         (_, Value::Number(_)) => Ordering::Greater,
-        _ => {
+        (av, bv) => {
             let (x, y) = (av.display(), bv.display());
             let (x, y) = if ignore_case {
                 (x.to_lowercase(), y.to_lowercase())
@@ -95,18 +93,30 @@ pub fn sort_multi(
     keys: &[SortKey],
     header: bool,
 ) -> usize {
-    let (r1, c1, r2, c2) = region;
+    let (r1, c1, mut r2, mut c2) = region;
     let r1 = if header { r1 + 1 } else { r1 };
     if r2 <= r1 || keys.is_empty() {
         return 0;
     }
+    if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+        if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
+            r2 = r2.min(ur2);
+            c2 = c2.min(uc2.max(keys.iter().map(|k| k.col).max().unwrap_or(c1)));
+        } else {
+            return 0;
+        }
+        if r2 <= r1 || c2 < c1 {
+            return 0;
+        }
+    }
     if crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2)).is_err() {
         return 0;
     }
-    // 整块备份（原样，含样式）
-    let mut rows: Vec<(u32, Vec<(Cell, u16)>)> = Vec::new();
+    let width = (c2 - c1 + 1) as usize;
+    // 整块备份（原样，含样式，只保留一份快照）
+    let mut rows: Vec<(u32, Vec<(Cell, u16)>)> = Vec::with_capacity((r2 - r1 + 1) as usize);
     for r in r1..=r2 {
-        let mut line = Vec::new();
+        let mut line = Vec::with_capacity(width);
         for c in c1..=c2 {
             let cell = sheet.get(r, c).cloned().unwrap_or(Cell {
                 value: Value::Empty,
@@ -116,23 +126,25 @@ pub fn sort_multi(
         }
         rows.push((r, line));
     }
-    let before: Vec<Vec<(Cell, u16)>> = rows.iter().map(|(_, l)| l.clone()).collect();
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&i, &j| {
         for k in keys {
-            let ci = (k.col - c1) as usize;
-            if ci >= before[i].len() {
+            if k.col < c1 {
                 continue;
             }
-            let a = Some(before[i][ci].0.clone());
-            let b = Some(before[j][ci].0.clone());
-            let mut ord = cmp_cell(&a, &b, k.ignore_case, &k.mode);
+            let ci = (k.col - c1) as usize;
+            if ci >= rows[i].1.len() {
+                continue;
+            }
+            let a = &rows[i].1[ci].0;
+            let b = &rows[j].1[ci].0;
+            let mut ord = cmp_cell_ref(a, b, k.ignore_case, &k.mode);
             if !k.asc {
                 ord = ord.reverse();
             }
             // 空值不参与反向：空永远最后
-            let a_empty = matches!(before[i][ci].0.value, Value::Empty);
-            let b_empty = matches!(before[j][ci].0.value, Value::Empty);
+            let a_empty = matches!(a.value, Value::Empty);
+            let b_empty = matches!(b.value, Value::Empty);
             if a_empty != b_empty {
                 ord = if a_empty {
                     std::cmp::Ordering::Greater
@@ -149,16 +161,17 @@ pub fn sort_multi(
     let mut moved = 0;
     for (target_r, &src_i) in order.iter().enumerate() {
         let r = r1 + target_r as u32;
-        for (k, (cell, st)) in before[src_i].iter().enumerate() {
+        for (k, (cell, st)) in rows[src_i].1.iter().enumerate() {
             let c = c1 + k as u32;
-            sheet.set(r, c, crate::sort_filter::sorted_cell(cell, rows[src_i].0, r, &sheet.name));
+            if !cell.is_blank() || sheet.get(r, c).is_some() {
+                sheet.set(r, c, crate::sort_filter::sorted_cell(cell, rows[src_i].0, r, &sheet.name));
+            }
             sheet.set_style(r, c, *st);
         }
         if order[target_r] != target_r {
             moved += 1;
         }
     }
-    let _ = c2;
     moved
 }
 
@@ -170,12 +183,22 @@ pub fn count_duplicates(
     cols: &[u32],
     header: bool,
 ) -> usize {
-    let (mut r1, c1, r2, c2) = region;
+    let (mut r1, c1, mut r2, mut c2) = region;
     if header && r2 > r1 {
         r1 += 1;
     }
     if r2 < r1 {
         return 0;
+    }
+    if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+        let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
+            return 0;
+        };
+        r2 = r2.min(ur2);
+        c2 = c2.min(uc2);
+        if r2 < r1 || c2 < c1 {
+            return 0;
+        }
     }
     let use_cols: Vec<u32> = if cols.is_empty() {
         (c1..=c2).collect()
@@ -203,10 +226,20 @@ pub fn remove_duplicates(
     cols: &[u32],
     header: bool,
 ) -> usize {
-    let (r1, c1, r2, c2) = region;
+    let (r1, c1, mut r2, mut c2) = region;
     let r1 = if header && r2 > r1 { r1 + 1 } else { r1 };
     if r2 < r1 {
         return 0;
+    }
+    if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+        let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
+            return 0;
+        };
+        r2 = r2.min(ur2);
+        c2 = c2.min(uc2);
+        if r2 < r1 || c2 < c1 {
+            return 0;
+        }
     }
     let use_cols: Vec<u32> = if cols.is_empty() {
         (c1..=c2).collect()

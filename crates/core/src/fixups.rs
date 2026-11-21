@@ -31,7 +31,7 @@ pub fn read_part_file(path: &Path, name: &str) -> Option<Vec<u8>> {
 }
 
 pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
-    if let Some(v) = crate::patch::staged(name) {
+    if let Some(v) = crate::patch::staged_at(path, name) {
         return v;
     }
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
@@ -47,17 +47,16 @@ pub fn entries_of(path: &Path) -> Vec<String> {
 }
 
 fn entries(path: &Path) -> Vec<String> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
+    let deleted = crate::patch::staged_deleted_at(path);
+    let mut list: Vec<String> = match std::fs::File::open(path).ok().and_then(|f| zip::ZipArchive::new(f).ok()) {
+        Some(mut zip) => (0..zip.len())
+            .filter_map(|i| zip.by_index_raw(i).ok().map(|e| e.name().to_string()))
+            .filter(|n| !deleted.contains(n))
+            .collect(),
+        None => Vec::new(),
     };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else {
-        return Vec::new();
-    };
-    let mut list: Vec<String> = (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
-        .collect();
     // 暂存里的改动还没落盘，这里要一并算上
-    for n in crate::patch::staged_names() {
+    for n in crate::patch::staged_names_at(path) {
         if !list.contains(&n) {
             list.push(n);
         }
@@ -183,6 +182,11 @@ pub fn restore_unedited_sheets(
 
     for sheet in wb.sheets.iter() {
         let dirty = sheet.edited
+            || sheet.styles_dirty
+            || sheet.row_styles_dirty
+            || sheet.col_styles_dirty
+            || !sheet.style_edits.is_empty()
+            || !sheet.cleared.is_empty()
             || sheet.merges_dirty
             || sheet.cf_dirty
             || sheet.dv_dirty
@@ -661,6 +665,16 @@ pub fn merge_sheet_data(path: &Path, base: &Path, wb: &crate::model::Workbook) -
         let b_end = b_end + "</sheetData>".len();
         let n_end = n_end + "</sheetData>".len();
         let mut head = bxml[..b_start].to_string();
+        if sheet.col_styles_dirty {
+            if let (Some(ns_c), Some(ne_c)) = (nxml[..n_start].find("<cols"), nxml[..n_start].find("</cols>")) {
+                let ncol = &nxml[ns_c..ne_c + "</cols>".len()];
+                if let (Some(hs_c), Some(he_c)) = (head.find("<cols"), head.find("</cols>")) {
+                    head.replace_range(hs_c..he_c + "</cols>".len(), ncol);
+                } else {
+                    head.push_str(ncol);
+                }
+            }
+        }
         // dimension 用新算出来的（行列范围可能变了）
         if let (Some(ns), Some(ne)) = (nxml.find("<dimension"), nxml.find("/>").filter(|_| false)) {
             let _ = (ns, ne);
@@ -1331,8 +1345,36 @@ pub fn migrate_sheet_rels(path: &Path, base: &Path) -> Result<Vec<String>> {
     Ok(log)
 }
 
+fn parse_a1_coord(s: &str) -> Option<(u32, u32)> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut col = 0u32;
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        col = col
+            .checked_mul(26)?
+            .checked_add((b[i].to_ascii_uppercase() - b'A' + 1) as u32)?;
+        i += 1;
+    }
+    if i == 0 || i == b.len() {
+        return None;
+    }
+    let mut row = 0u32;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            return None;
+        }
+        row = row.checked_mul(10)?.checked_add((b[i] - b'0') as u32)?;
+        i += 1;
+    }
+    if row == 0 || col == 0 {
+        return None;
+    }
+    Some((row - 1, col - 1))
+}
+
 /// quotePrefix 是 xf 上的未建模属性，umya 不认它：一旦保存时重建样式表就会丢。
 /// 保存后按「哪些格需要它」补一条带 quotePrefix="1" 的 xf，并把格的 s= 指过去。
+/// 采用单遍 O(XML_LEN) 线性扫描与一次性批量回写，彻底消除万格表的二次方查找与 memmove。
 pub fn ensure_quote_prefix(path: &Path, sheets: &[(String, Vec<(u32, u32)>)]) -> Result<usize> {
     if sheets.iter().all(|(_, cells)| cells.is_empty()) {
         return Ok(0);
@@ -1344,68 +1386,382 @@ pub fn ensure_quote_prefix(path: &Path, sheets: &[(String, Vec<(u32, u32)>)]) ->
     let Some(gt) = xml[start..].find('>').map(|i| start + i) else { return Ok(0) };
     let Some(end) = xml[start..].find("</cellXfs>").map(|i| start + i) else { return Ok(0) };
     let block = &xml[gt + 1..end];
+    let orig_xf_count = split_xf(block).len();
     let mut xfs = split_xf(block);
     let mut added = HashMap::<usize, usize>::new();
     let mut total = 0usize;
+    let mut modified_parts: Vec<(String, Vec<u8>)> = Vec::new();
+
+    let mut get_quote_xf = |old: usize| -> usize {
+        if let Some(&idx) = added.get(&old) {
+            return idx;
+        }
+        if let Some(existing) = xfs.get(old) {
+            if existing.contains("quotePrefix=\"1\"") || existing.contains("quotePrefix=\"true\"") {
+                added.insert(old, old);
+                return old;
+            }
+        }
+        let mut base = xfs.get(old).cloned().unwrap_or_else(|| {
+            "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>".to_string()
+        });
+        if !base.contains("quotePrefix=") {
+            if let Some(g) = base.find('>') {
+                // 自闭合 <xf .../> 要把属性插在 / 前面
+                let at = if base[..g].ends_with('/') { g - 1 } else { g };
+                base.insert_str(at, " quotePrefix=\"1\"");
+            }
+        }
+        xfs.push(base);
+        let idx = xfs.len() - 1;
+        added.insert(old, idx);
+        idx
+    };
+
     for (part, cells) in sheets {
         if cells.is_empty() {
             continue;
         }
-        let Some(bytes) = read_part_file(path, part) else { continue };
-        let Ok(mut sheet) = String::from_utf8(bytes) else { continue };
+        let Some(bytes) = read_part(path, part) else { continue };
+        let Ok(sheet) = String::from_utf8(bytes) else { continue };
+        let want: HashSet<(u32, u32)> = cells.iter().copied().collect();
+        let mut out = String::new();
+        let mut emit = 0usize;
+        let mut cursor = 0usize;
         let mut touched = false;
-        for (r, c) in cells {
-            let name = cell_name(*r, *c);
-            let pat = format!("<c r=\"{name}\"");
-            let Some(pos) = sheet.find(&pat) else { continue };
-            let Some(tag_end) = sheet[pos..].find('>').map(|i| pos + i) else { continue };
-            let tag = sheet[pos..=tag_end].to_string();
-            // 保存时默认样式不写 s：这类格没有 s 属性，样式号按 0 处理
-            let had_s = tag.contains(" s=\"");
-            let old = attr_num(&tag, "s").unwrap_or(0);
-            let new_idx = *added.entry(old).or_insert_with(|| {
-                let mut base = xfs.get(old).cloned().unwrap_or_else(|| "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>".to_string());
-                if !base.contains("quotePrefix=") {
-                    if let Some(g) = base.find('>') {
-                        // 自闭合 <xf .../> 要把属性插在 / 前面
-                        let at = if base[..g].ends_with('/') { g - 1 } else { g };
-                        base.insert_str(at, " quotePrefix=\"1\"");
+
+        while let Some(rel) = sheet[cursor..].find("<c r=\"") {
+            let pos = cursor + rel;
+            let coord_start = pos + 6;
+            let Some(q_rel) = sheet[coord_start..].find('"') else {
+                break;
+            };
+            let coord_end = coord_start + q_rel;
+            let Some(gt_rel) = sheet[coord_end..].find('>') else {
+                break;
+            };
+            let tag_end = coord_end + gt_rel;
+            let coord_str = &sheet[coord_start..coord_end];
+            if let Some(rc) = parse_a1_coord(coord_str) {
+                if want.contains(&rc) {
+                    let tag = &sheet[pos..=tag_end];
+                    let had_s = tag.contains(" s=\"");
+                    let old = attr_num(tag, "s").unwrap_or(0);
+                    let new_idx = get_quote_xf(old);
+                    if new_idx != old || !had_s {
+                        if !touched {
+                            out.reserve(sheet.len() + want.len() * 10);
+                            touched = true;
+                        }
+                        out.push_str(&sheet[emit..pos]);
+                        if had_s {
+                            out.push_str(&tag.replacen(
+                                &format!(" s=\"{old}\""),
+                                &format!(" s=\"{new_idx}\""),
+                                1,
+                            ));
+                        } else {
+                            out.push_str(&sheet[pos..=coord_end]);
+                            out.push_str(&format!(" s=\"{new_idx}\""));
+                            out.push_str(&sheet[coord_end + 1..=tag_end]);
+                        }
+                        emit = tag_end + 1;
+                        total += 1;
                     }
                 }
-                xfs.push(base);
-                xfs.len() - 1
-            });
-            if new_idx != old || !had_s {
-                let new_tag = if had_s {
-                    tag.replacen(&format!(" s=\"{old}\""), &format!(" s=\"{new_idx}\""), 1)
-                } else {
-                    tag.replacen(&format!("<c r=\"{name}\""), &format!("<c r=\"{name}\" s=\"{new_idx}\""), 1)
+            }
+            cursor = tag_end + 1;
+        }
+        if touched {
+            out.push_str(&sheet[emit..]);
+            modified_parts.push((part.clone(), out.into_bytes()));
+        }
+    }
+    if modified_parts.is_empty() && xfs.len() == orig_xf_count {
+        return Ok(0);
+    }
+    if xfs.len() != orig_xf_count {
+        let mut joined = String::new();
+        for xf in &xfs {
+            joined.push_str(xf);
+        }
+        let mut new_open = xml[start..=gt].to_string();
+        if let Some(cpos) = new_open.find("count=\"") {
+            let rest = &new_open[cpos + 7..];
+            if let Some(q) = rest.find('"') {
+                new_open.replace_range(cpos..cpos + 7 + q + 1, &format!("count=\"{}\"", xfs.len()));
+            }
+        }
+        let rebuilt = format!("{}{}{}{}", &xml[..start], new_open, joined, &xml[end..]);
+        modified_parts.push(("xl/styles.xml".to_string(), rebuilt.into_bytes()));
+    }
+    if !modified_parts.is_empty() {
+        write_parts(path, &modified_parts)?;
+    }
+    Ok(total)
+}
+
+
+/// 保存后按「哪些格/行/列需要缩小字体填充」补一条带 shrinkToFit="1" 的 xf，并更新 s= / style= 索引。
+/// 单遍 O(XML_LEN) 线性扫描替换，避免大表逐格 sheet.find + replace_range 造成数十秒卡顿。
+pub fn ensure_shrink_to_fit(
+    path: &Path,
+    targets: &[(String, Vec<(u32, u32)>, Vec<u32>, Vec<u32>)],
+) -> Result<usize> {
+    if targets
+        .iter()
+        .all(|(_, cells, rows, cols)| cells.is_empty() && rows.is_empty() && cols.is_empty())
+    {
+        return Ok(0);
+    }
+    let Some(xml) = read_part(path, "xl/styles.xml").and_then(|b| String::from_utf8(b).ok()) else {
+        return Ok(0);
+    };
+    let Some(start) = xml.find("<cellXfs") else { return Ok(0) };
+    let Some(gt) = xml[start..].find('>').map(|i| start + i) else { return Ok(0) };
+    let Some(end) = xml[start..].find("</cellXfs>").map(|i| start + i) else { return Ok(0) };
+    let block = &xml[gt + 1..end];
+    let orig_xf_count = split_xf(block).len();
+    let mut xfs = split_xf(block);
+    let mut added = HashMap::<usize, usize>::new();
+    let mut total = 0usize;
+    let sheet_map = crate::patch::sheet_targets(path).unwrap_or_default();
+
+    let sp_attr_num = |tag: &str, key: &str| -> Option<usize> {
+        let pat = format!(" {key}=\"");
+        let i = tag.find(&pat)? + pat.len();
+        let rest = &tag[i..];
+        let e = rest.find('"')?;
+        rest[..e].parse().ok()
+    };
+
+    let set_sp_attr = |tag: &mut String, key: &str, val: &str| {
+        let pat = format!(" {key}=\"");
+        if let Some(p) = tag.find(&pat) {
+            let vstart = p + pat.len();
+            if let Some(vend) = tag[vstart..].find('"') {
+                tag.replace_range(vstart..vstart + vend, val);
+                return;
+            }
+        }
+        let g = tag.len() - 1;
+        let at = if g > 0 && tag.as_bytes()[g - 1] == b'/' { g - 1 } else { g };
+        tag.insert_str(at, &format!(" {key}=\"{val}\""));
+    };
+
+    let mut get_shrink_xf = |old: usize| -> usize {
+        if let Some(&idx) = added.get(&old) {
+            return idx;
+        }
+        if let Some(existing) = xfs.get(old) {
+            if existing.contains("shrinkToFit=\"1\"") || existing.contains("shrinkToFit=\"true\"") {
+                added.insert(old, old);
+                return old;
+            }
+        }
+        let mut base = xfs.get(old).cloned().unwrap_or_else(|| {
+            "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>".to_string()
+        });
+        if !base.contains(" applyAlignment=") {
+            if let Some(g) = base.find('>') {
+                let at = if g > 0 && base.as_bytes()[g - 1] == b'/' { g - 1 } else { g };
+                base.insert_str(at, " applyAlignment=\"1\"");
+            }
+        }
+        if base.ends_with("/>") {
+            base.truncate(base.len() - 2);
+            base.push_str("><alignment shrinkToFit=\"1\"/></xf>");
+        } else if let Some(ap) = base.find("<alignment") {
+            let ins = ap + "<alignment".len();
+            base.insert_str(ins, " shrinkToFit=\"1\"");
+        } else if let Some(ce) = base.rfind("</xf>") {
+            base.insert_str(ce, "<alignment shrinkToFit=\"1\"/>");
+        }
+        xfs.push(base);
+        let idx = xfs.len() - 1;
+        added.insert(old, idx);
+        idx
+    };
+
+    let mut modified_parts: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, cells, rows, cols) in targets {
+        if cells.is_empty() && rows.is_empty() && cols.is_empty() {
+            continue;
+        }
+        let Some(part) = sheet_map.get(name) else { continue };
+        let Some(bytes) = read_part(path, part) else { continue };
+        let Ok(mut sheet) = String::from_utf8(bytes) else { continue };
+        let mut touched = false;
+
+        if !cells.is_empty() {
+            let want_cells: HashSet<(u32, u32)> = cells.iter().copied().collect();
+            let mut out = String::new();
+            let mut emit = 0usize;
+            let mut cursor = 0usize;
+            let mut cell_touched = false;
+
+            while let Some(rel) = sheet[cursor..].find("<c r=\"") {
+                let pos = cursor + rel;
+                let coord_start = pos + 6;
+                let Some(q_rel) = sheet[coord_start..].find('"') else {
+                    break;
                 };
-                sheet.replace_range(pos..=tag_end, &new_tag);
+                let coord_end = coord_start + q_rel;
+                let Some(gt_rel) = sheet[coord_end..].find('>') else {
+                    break;
+                };
+                let tag_end = coord_end + gt_rel;
+                if let Some(rc) = parse_a1_coord(&sheet[coord_start..coord_end]) {
+                    if want_cells.contains(&rc) {
+                        let orig_tag = &sheet[pos..=tag_end];
+                        let old_opt = sp_attr_num(orig_tag, "s");
+                        let old = old_opt.unwrap_or(0);
+                        let new_idx = get_shrink_xf(old);
+                        if new_idx != old || old_opt.is_none() {
+                            if !cell_touched {
+                                out.reserve(sheet.len() + want_cells.len() * 10);
+                                cell_touched = true;
+                            }
+                            out.push_str(&sheet[emit..pos]);
+                            let mut tag = orig_tag.to_string();
+                            set_sp_attr(&mut tag, "s", &new_idx.to_string());
+                            out.push_str(&tag);
+                            emit = tag_end + 1;
+                            total += 1;
+                        }
+                    }
+                }
+                cursor = tag_end + 1;
+            }
+            if cell_touched {
+                out.push_str(&sheet[emit..]);
+                sheet = out;
+                touched = true;
+            }
+        }
+
+        if !rows.is_empty() {
+            let want_rows1: HashSet<u32> = rows.iter().map(|r| *r + 1).collect();
+            let mut out = String::new();
+            let mut emit = 0usize;
+            let mut cursor = 0usize;
+            let mut row_touched = false;
+
+            while let Some(rel) = sheet[cursor..].find("<row ") {
+                let pos = cursor + rel;
+                let Some(gt_rel) = sheet[pos..].find('>') else {
+                    break;
+                };
+                let tag_end = pos + gt_rel;
+                let orig_tag = &sheet[pos..=tag_end];
+                let r1 = orig_tag.find(" r=\"").and_then(|p| {
+                    let after = &orig_tag[p + 4..];
+                    let q = after.find('"')?;
+                    after[..q].parse::<u32>().ok()
+                });
+                if let Some(r1) = r1 {
+                    if want_rows1.contains(&r1) {
+                        let old_opt = sp_attr_num(orig_tag, "s");
+                        let old = old_opt.unwrap_or(0);
+                        let new_idx = get_shrink_xf(old);
+                        if new_idx != old || old_opt.is_none() {
+                            if !row_touched {
+                                out.reserve(sheet.len() + want_rows1.len() * 24);
+                                row_touched = true;
+                            }
+                            out.push_str(&sheet[emit..pos]);
+                            let mut tag = orig_tag.to_string();
+                            set_sp_attr(&mut tag, "s", &new_idx.to_string());
+                            if !tag.contains(" customFormat=") {
+                                set_sp_attr(&mut tag, "customFormat", "1");
+                            }
+                            out.push_str(&tag);
+                            emit = tag_end + 1;
+                            total += 1;
+                        }
+                    }
+                }
+                cursor = tag_end + 1;
+            }
+            if row_touched {
+                out.push_str(&sheet[emit..]);
+                sheet = out;
+                touched = true;
+            }
+        }
+
+        for &c in cols {
+            let col1 = (c + 1) as usize;
+            let Some(cs) = sheet.find("<cols") else { break };
+            let Some(ce) = sheet[cs..].find("</cols>").map(|i| cs + i) else { break };
+            let cols_inner = &sheet[cs..ce];
+            let mut scan = 0;
+            let mut rep: Option<(usize, usize, String)> = None;
+            while let Some(rel) = cols_inner[scan..].find("<col ") {
+                let abs = cs + scan + rel;
+                let Some(end_rel) = sheet[abs..].find("/>").map(|i| abs + i + 2) else { break };
+                let tag = &sheet[abs..end_rel];
+                let min_v = sp_attr_num(tag, "min").unwrap_or(0);
+                let max_v = sp_attr_num(tag, "max").unwrap_or(0);
+                if min_v <= col1 && col1 <= max_v {
+                    let old = sp_attr_num(tag, "style").unwrap_or(0);
+                    let new_idx = get_shrink_xf(old);
+                    if new_idx != old || sp_attr_num(tag, "style").is_none() {
+                        let mut rebuilt = String::new();
+                        if min_v < col1 {
+                            let mut left = tag.to_string();
+                            set_sp_attr(&mut left, "max", &(col1 - 1).to_string());
+                            rebuilt.push_str(&left);
+                        }
+                        let mut mid = tag.to_string();
+                        set_sp_attr(&mut mid, "min", &col1.to_string());
+                        set_sp_attr(&mut mid, "max", &col1.to_string());
+                        set_sp_attr(&mut mid, "style", &new_idx.to_string());
+                        rebuilt.push_str(&mid);
+                        if col1 < max_v {
+                            let mut right = tag.to_string();
+                            set_sp_attr(&mut right, "min", &(col1 + 1).to_string());
+                            rebuilt.push_str(&right);
+                        }
+                        rep = Some((abs, end_rel, rebuilt));
+                    }
+                    break;
+                }
+                scan += rel + 5;
+            }
+            if let Some((a, b, rtxt)) = rep {
+                sheet.replace_range(a..b, &rtxt);
                 touched = true;
                 total += 1;
             }
         }
+
         if touched {
-            write_parts(path, &[(part.clone(), sheet.into_bytes())])?;
+            modified_parts.push((part.clone(), sheet.into_bytes()));
         }
     }
-    if added.is_empty() {
+
+    if total == 0 && xfs.len() == orig_xf_count && modified_parts.is_empty() {
         return Ok(0);
     }
-    let mut joined = String::new();
-    for xf in &xfs {
-        joined.push_str(xf);
-    }
-    let mut new_open = xml[start..=gt].to_string();
-    if let Some(cpos) = new_open.find("count=\"") {
-        let rest = &new_open[cpos + 7..];
-        if let Some(q) = rest.find('"') {
-            new_open.replace_range(cpos..cpos + 7 + q + 1, &format!("count=\"{}\"", xfs.len()));
+    if xfs.len() != orig_xf_count {
+        let mut joined = String::new();
+        for xf in &xfs {
+            joined.push_str(xf);
         }
+        let mut new_open = xml[start..=gt].to_string();
+        if let Some(cpos) = new_open.find("count=\"") {
+            let rest = &new_open[cpos + 7..];
+            if let Some(q) = rest.find('"') {
+                new_open.replace_range(cpos..cpos + 7 + q + 1, &format!("count=\"{}\"", xfs.len()));
+            }
+        }
+        let rebuilt = format!("{}{}{}{}", &xml[..start], new_open, joined, &xml[end..]);
+        modified_parts.push(("xl/styles.xml".to_string(), rebuilt.into_bytes()));
     }
-    let rebuilt = format!("{}{}{}{}", &xml[..start], new_open, joined, &xml[end..]);
-    write_parts(path, &[("xl/styles.xml".to_string(), rebuilt.into_bytes())])?;
+    if !modified_parts.is_empty() {
+        write_parts(path, &modified_parts)?;
+    }
     Ok(total)
 }
 
@@ -1460,7 +1816,7 @@ pub fn restore_threaded_parts(path: &Path, base: &Path) -> Result<usize> {
     if std::env::var("SC_NO_FIXUPS").is_ok() {
         return Ok(0);
     }
-    let mut restored = 0;
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     let names = parts(base);
     let has_threaded = names.iter().any(|n| n.starts_with("xl/threadedComments/"));
     for name in names {
@@ -1474,11 +1830,14 @@ pub fn restore_threaded_parts(path: &Path, base: &Path) -> Result<usize> {
             continue;
         }
         let Some(body) = read_part_file(base, &name) else { continue };
-        if read_part_file(path, &name).as_deref() == Some(body.as_slice()) {
+        if read_part(path, &name).as_deref() == Some(body.as_slice()) {
             continue;
         }
-        write_parts(path, &[(name, body)])?;
-        restored += 1;
+        pending.push((name, body));
+    }
+    let restored = pending.len();
+    if !pending.is_empty() {
+        write_parts(path, &pending)?;
     }
     Ok(restored)
 }
@@ -1492,18 +1851,21 @@ pub fn restore_chart_parts(path: &Path, base: &Path, edited: &[String]) -> Resul
     let keep: Vec<String> = edited.to_vec();
     let base_names = parts(base);
     let saved_names = parts(path);
-    let mut restored = 0;
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     for name in base_names.iter().filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml")) {
         if keep.iter().any(|k| k == name) || !saved_names.contains(name) {
             continue;
         }
-        let want = read_part(base, name)
+        let want = read_part_file(base, name)
             .ok_or_else(|| anyhow::anyhow!("缺部件 {name}"))?;
         let have = read_part(path, name).unwrap_or_default();
         if want != have {
-            write_parts(path, &[(name.to_string(), want)])?;
-            restored += 1;
+            pending.push((name.to_string(), want));
         }
+    }
+    let restored = pending.len();
+    if !pending.is_empty() {
+        write_parts(path, &pending)?;
     }
     Ok(restored)
 }
@@ -1513,7 +1875,7 @@ pub fn restore_chart_parts(path: &Path, base: &Path, edited: &[String]) -> Resul
 /// Excel 认扩展名：`.xlsx` 里声明 `macroEnabled.main+xml`（或反过来）会报
 /// 「文件格式或文件扩展名无效」，哪怕包本身结构完整。
 pub fn normalise_workbook_ct(path: &std::path::Path, macro_enabled: bool) -> anyhow::Result<()> {
-    let Some(bytes) = read_part_file(path, "[Content_Types].xml") else {
+    let Some(bytes) = read_part(path, "[Content_Types].xml") else {
         return Ok(());
     };
     let Ok(xml) = String::from_utf8(bytes) else {

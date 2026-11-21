@@ -357,6 +357,7 @@ impl Compiler<'_> {
             Node::Implicit(_) => bail!("隐式交集 @ 不能写入 .xls"),
             Node::Range(a, b) => self.emit_area(a, b, out)?,
             Node::Array(rows, cols, vals) => self.emit_array(*rows, *cols, vals, out)?,
+            Node::ScopedName { .. } => bail!("作用域限定名称暂不支持写入 .xls"),
             Node::Name(n) => {
                 let Some(idx) = self.names.lookup(n) else {
                     bail!("名称「{n}」没有定义，写不进 .xls");
@@ -468,7 +469,10 @@ impl Compiler<'_> {
     fn emit_ref(&mut self, r: &RefExpr, out: &mut Vec<u8>) -> Result<()> {
         let (row, col) = self.check_coords(r)?;
         if let (Some(first), Some(last)) = (r.sheet.as_deref(), r.sheet2.as_deref()) {
-            let ixti = self.ixti_span(first, last)?;
+            let ixti = match r.book.as_deref() {
+                Some(book) => self.book_ixti_span(book, first, last)?,
+                None => self.ixti_span(first, last)?,
+            };
             out.push(0x3A);
             out.extend_from_slice(&ixti.to_le_bytes());
             out.extend_from_slice(&row.to_le_bytes());
@@ -505,8 +509,12 @@ impl Compiler<'_> {
         let (r2, c2) = self.check_coords(b)?;
         let book = a.book.clone().or_else(|| b.book.clone());
         let sheet = a.sheet.clone().or_else(|| b.sheet.clone());
-        if let (Some(first), Some(last)) = (a.sheet.as_deref(), b.sheet2.as_deref()) {
-            let ixti = self.ixti_span(first, last)?;
+        let end_sheet = b.sheet2.as_deref().or(a.sheet2.as_deref());
+        if let (Some(first), Some(last)) = (sheet.as_deref(), end_sheet) {
+            let ixti = match book.as_deref() {
+                Some(bk) => self.book_ixti_span(bk, first, last)?,
+                None => self.ixti_span(first, last)?,
+            };
             out.push(0x3B);
             out.extend_from_slice(&ixti.to_le_bytes());
         } else if let Some(book) = book {
@@ -575,6 +583,37 @@ impl Compiler<'_> {
             bail!("引用了不存在的工作表 {sheet}");
         };
         Ok(self.externs.add(0, i as u16, i as u16))
+    }
+
+    /// 跨簿三维引用：`[1]First:Third!A1` → 外部 supbook + 首尾表索引。
+    fn book_ixti_span(&mut self, book: &str, first: &str, last: &str) -> Result<u16> {
+        let idx: Option<usize> = if let Ok(n) = book.parse::<usize>() {
+            Some(n.saturating_sub(1))
+        } else {
+            self.books.iter().position(|b| {
+                b.file.eq_ignore_ascii_case(book)
+                    || b.file.eq_ignore_ascii_case(&format!("{book}.xls"))
+                    || b.file.eq_ignore_ascii_case(&format!("{book}.xlsx"))
+            })
+        };
+        let Some(i) = idx else {
+            bail!("跨工作簿引用 [{book}] 找不到对应的外部链接");
+        };
+        let entry = self.books.get(i).cloned().unwrap_or_default();
+        let find = |s: &str| -> Result<usize> {
+            entry
+                .sheets
+                .iter()
+                .position(|x| x.eq_ignore_ascii_case(s))
+                .ok_or_else(|| anyhow::anyhow!("外部工作簿 [{}] 找不到工作表 {s}", entry.file))
+        };
+        let mut a = find(first)?;
+        let mut b = find(last)?;
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let sup = self.externs.book(&entry.file, entry.sheets.clone());
+        Ok(self.externs.add(sup, a as u16, b as u16))
     }
 
     /// 跨簿引用：book 可能是 `[1]` 这样的序号，也可能是文件名
@@ -778,6 +817,20 @@ mod tests {
         assert_eq!(t[0], 0x3A);
         assert_eq!(u16::from_le_bytes([t[1], t[2]]), 1, "第一条外部簿");
         assert_eq!(f.externs.books.len(), 1);
+
+        let mut f2 = Fix::new();
+        f2.books.push(BookSheets {
+            file: "book_b.xls".into(),
+            sheets: vec!["First".into(), "Second".into(), "Third".into()],
+        });
+        let t = f2.go("SUM([book_b.xls]First:Third!A1)").unwrap();
+        assert_eq!(t[0], 0x3A);
+        let ixti = u16::from_le_bytes([t[1], t[2]]) as usize;
+        assert_eq!(f2.externs.entries[ixti], (1, 0, 2), "外部三维引用必须覆盖 First..Third");
+        let t = f2.go("SUM([book_b.xls]First:Third!A1:B2)").unwrap();
+        assert_eq!(t[0], 0x3B);
+        let ixti = u16::from_le_bytes([t[1], t[2]]) as usize;
+        assert_eq!(f2.externs.entries[ixti], (1, 0, 2), "外部三维区域同样覆盖 First..Third");
     }
 
     #[test]

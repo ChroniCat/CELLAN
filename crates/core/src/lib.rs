@@ -1,5 +1,6 @@
 pub mod font_subset;
 pub mod formula;
+pub mod dbnum;
 pub mod mem;
 pub mod errors;
 pub mod scenarios;
@@ -106,10 +107,199 @@ fn match_cols(chars: &[char], i: usize) -> Option<(usize, String, String)> {
         return None;
     }
     let second: String = chars[ls2..j].iter().collect();
-    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(') {
+    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(' || chars[j] == '!') {
         return None;
     }
     Some((j, first, second))
+}
+
+/// Excel 2010 之后新增、在 OOXML 文件里必须写成 `_xlfn.名字` 的函数。
+/// 加载时这些前缀被剥掉（见 `normalize_formula`），保存时必须加回去：
+/// 不带前缀的 `XLOOKUP(...)` 在 Excel 里打开就是 `#NAME?`。
+/// 名单取自微软「_xlfn 前缀」文档列出的函数，按字母序，便于二分查找。
+const XLFN_FUNCTIONS: &[&str] = &[
+    "ACOT", "ACOTH", "AGGREGATE", "ANCHORARRAY", "ARABIC", "ARRAYTOTEXT", "BASE", "BETA.DIST",
+    "BETA.INV", "BINOM.DIST", "BINOM.DIST.RANGE", "BINOM.INV", "BITAND", "BITLSHIFT", "BITOR",
+    "BITRSHIFT", "BITXOR", "BYCOL", "BYROW", "CEILING.MATH", "CEILING.PRECISE", "CHISQ.DIST",
+    "CHISQ.DIST.RT", "CHISQ.INV", "CHISQ.INV.RT", "CHISQ.TEST", "CHOOSECOLS", "CHOOSEROWS",
+    "COMBINA", "CONCAT", "CONFIDENCE.NORM", "CONFIDENCE.T", "COT", "COTH", "COVARIANCE.P",
+    "COVARIANCE.S", "CSC", "CSCH", "DAYS", "DECIMAL", "DROP", "ENCODEURL", "ERF.PRECISE",
+    "ERFC.PRECISE", "EXPAND", "EXPON.DIST", "F.DIST", "F.DIST.RT", "F.INV", "F.INV.RT", "F.TEST",
+    "FIELDVALUE", "FILTER", "FILTERXML", "FLOOR.MATH", "FLOOR.PRECISE", "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT", "FORECAST.ETS.SEASONALITY", "FORECAST.ETS.STAT", "FORECAST.LINEAR",
+    "FORMULATEXT", "GAMMA", "GAMMA.DIST", "GAMMA.INV", "GAMMALN.PRECISE", "GAUSS", "GROUPBY",
+    "HSTACK", "HYPGEOM.DIST", "IFNA", "IFS", "IMAGE", "IMCOSH", "IMCOT", "IMCSC", "IMCSCH",
+    "IMSEC", "IMSECH", "IMSINH", "IMTAN", "ISFORMULA", "ISOMITTED", "ISOWEEKNUM", "LAMBDA", "LET",
+    "LOGNORM.DIST", "LOGNORM.INV", "MAKEARRAY", "MAP", "MAXIFS", "MINIFS", "MODE.MULT",
+    "MODE.SNGL", "MUNIT", "NEGBINOM.DIST", "NETWORKDAYS.INTL", "NORM.DIST", "NORM.INV",
+    "NORM.S.DIST", "NORM.S.INV", "NUMBERVALUE", "PDURATION", "PERCENTILE.EXC", "PERCENTILE.INC",
+    "PERCENTOF", "PERCENTRANK.EXC", "PERCENTRANK.INC", "PERMUTATIONA", "PHI", "PIVOTBY",
+    "POISSON.DIST", "QUARTILE.EXC", "QUARTILE.INC", "QUERYSTRING", "RANDARRAY", "RANK.AVG",
+    "RANK.EQ", "REDUCE", "REGEXEXTRACT", "REGEXREPLACE", "REGEXTEST", "RRI", "SCAN", "SEC", "SECH",
+    "SEQUENCE", "SHEET", "SHEETS", "SINGLE", "SKEW.P", "SORT", "SORTBY", "STDEV.P", "STDEV.S",
+    "STOCKHISTORY", "SWITCH", "T.DIST", "T.DIST.2T", "T.DIST.RT", "T.INV", "T.INV.2T", "T.TEST",
+    "TAKE", "TEXTAFTER", "TEXTBEFORE", "TEXTJOIN", "TEXTSPLIT", "TOCOL", "TOROW", "TRIMRANGE",
+    "UNICHAR", "UNICODE", "UNIQUE", "VALUETOTEXT", "VAR.P", "VAR.S", "VSTACK", "WEBSERVICE",
+    "WEIBULL.DIST", "WORKDAY.INTL", "WRAPCOLS", "WRAPROWS", "XLOOKUP", "XMATCH", "XOR", "Z.TEST",
+];
+
+/// 这两个函数在文件里是 `_xlfn._xlws.名字`
+const XLWS_FUNCTIONS: &[&str] = &["FILTER", "SORT"];
+
+fn formula_id_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || c > '\u{7f}'
+}
+
+fn formula_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c > '\u{7f}'
+}
+
+/// 引号外、方括号外的字符位置（`[`…`]` 是结构化引用里的列名）
+fn formula_code_mask(chars: &[char]) -> Vec<bool> {
+    let mut mask = vec![false; chars.len()];
+    let mut quote: Option<char> = None;
+    let mut bracket = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    if chars.get(i + 1) == Some(&q) {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '[' => bracket += 1,
+            None if c == ']' => bracket = bracket.saturating_sub(1),
+            None => mask[i] = bracket == 0,
+        }
+        i += 1;
+    }
+    mask
+}
+
+/// 从 `open`（左括号）开始，按顶层逗号切出各参数的 [起, 止) 位置
+fn formula_call_args(chars: &[char], mask: &[bool], open: usize) -> Vec<(usize, usize)> {
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut i = open;
+    while i < chars.len() {
+        if mask[i] {
+            match chars[i] {
+                '(' | '{' => depth += 1,
+                ')' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        args.push((start, i));
+                        return args;
+                    }
+                }
+                ',' if depth == 1 => {
+                    args.push((start, i));
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    args.push((start, chars.len()));
+    args
+}
+
+/// 保存前把公式写回 OOXML 的函数名形式（`normalize_formula` 剥前缀的逆操作）：
+/// 新函数加 `_xlfn.`（FILTER/SORT 是 `_xlfn._xlws.`），LET/LAMBDA 的参数名加 `_xlpm.`。
+/// 只改引号与结构化引用方括号之外的标识符；已带前缀的不再重复加。传入的公式不带开头的 `=`。
+pub fn add_fn_prefixes(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mask = formula_code_mask(&chars);
+    let at_boundary = |i: usize| {
+        i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || matches!(chars[i - 1], '_' | '.' | '$'))
+    };
+    // 标识符 [i, j) 及其后（跳过空白）是否紧跟左括号
+    let ident_end = |i: usize| {
+        let mut j = i;
+        while j < chars.len() && mask[j] && formula_id_char(chars[j]) {
+            j += 1;
+        }
+        j
+    };
+    let next_non_space = |mut k: usize| {
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        k
+    };
+
+    // 1. 收集 LET / LAMBDA 的参数名
+    let mut params: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if mask[i] && formula_id_start(chars[i]) && at_boundary(i) {
+            let j = ident_end(i);
+            let name: String = chars[i..j].iter().collect::<String>().to_ascii_uppercase();
+            let k = next_non_space(j);
+            if k < chars.len() && chars[k] == '(' && (name == "LET" || name == "LAMBDA") {
+                let args = formula_call_args(&chars, &mask, k);
+                let n = args.len();
+                for (idx, (s, e)) in args.iter().enumerate() {
+                    let is_param = if name == "LET" { idx % 2 == 0 && idx + 1 < n } else { idx + 1 < n };
+                    if !is_param {
+                        continue;
+                    }
+                    let p: String = chars[*s..*e].iter().collect::<String>().trim().to_string();
+                    let valid = p.chars().next().is_some_and(formula_id_start)
+                        && p.chars().all(formula_id_char)
+                        && !p.starts_with("_xlpm.");
+                    if valid && !params.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+                        params.push(p);
+                    }
+                }
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
+    // 2. 重写
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        if mask[i] && formula_id_start(chars[i]) && at_boundary(i) {
+            let j = ident_end(i);
+            let name: String = chars[i..j].iter().collect();
+            let upper = name.to_ascii_uppercase();
+            let k = next_non_space(j);
+            let is_call = k < chars.len() && chars[k] == '(';
+            // `Sheet!A1` 的表名、`A:C` 整列引用里的列字母都不是参数名
+            let before_sheet_bang = chars.get(j) == Some(&'!');
+            let in_col_range = chars.get(j) == Some(&':') || (i > 0 && chars[i - 1] == ':');
+            let is_param = !before_sheet_bang
+                && !in_col_range
+                && params.iter().any(|p| p.eq_ignore_ascii_case(&name));
+            if upper.starts_with("_XL") {
+                // 已经是文件形式
+            } else if is_param {
+                out.push_str("_xlpm.");
+            } else if is_call && XLWS_FUNCTIONS.contains(&upper.as_str()) {
+                out.push_str("_xlfn._xlws.");
+            } else if is_call && XLFN_FUNCTIONS.binary_search(&upper.as_str()).is_ok() {
+                out.push_str("_xlfn.");
+            }
+            out.push_str(&name);
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// 把公式按引号切成 `(是否在引号内, 片段)`。
@@ -156,7 +346,7 @@ pub fn split_quoted(text: &str) -> Vec<(bool, &str)> {
 
 /// 整列引用 `A:C`（可带表名前缀）在 OOXML 里不带行号，
 /// 加载时改写成 `$A$1:$C$1048576`，求值时再按实际使用范围裁剪。
-fn expand_whole_cols(text: &str) -> String {
+pub(crate) fn expand_whole_cols(text: &str) -> String {
     if !text.contains(':') {
         return text.to_string();
     }
@@ -226,8 +416,8 @@ fn match_rows(chars: &[char], i: usize) -> Option<(usize, u32, u32, bool, bool)>
         return None;
     }
     let second: u32 = chars[start2..j].iter().collect::<String>().parse().ok()?;
-    // `1:3` 后面不能紧跟字母/数字/`$`/`(`，否则不是完整的整行引用。
-    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(') {
+    // `1:3` 后面不能紧跟字母/数字/`$`/`(`/`!`，否则不是完整的整行引用（如数字表名三维区间 1:3!A1）。
+    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(' || chars[j] == '!') {
         return None;
     }
     if first == 0 || second == 0 {
@@ -381,4 +571,15 @@ fn strip_fn_prefixes(seg: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod xlfn_table_tests {
+    #[test]
+    fn xlfn_table_is_strictly_sorted() {
+        // add_fn_prefixes 对这张表做二分查找：顺序错了会漏加前缀
+        for w in super::XLFN_FUNCTIONS.windows(2) {
+            assert!(w[0] < w[1], "{} 应排在 {} 之前", w[0], w[1]);
+        }
+    }
 }

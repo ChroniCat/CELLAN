@@ -769,14 +769,21 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "SUMIF" => r(|| {
             let crit = Crit::parse(&text(args, 1)?);
+            for reference in [args.first(), args.get(2)].into_iter().flatten() {
+                if let Arg::Val(FValue::Error(error)) = reference {
+                    return Err(*error);
+                }
+            }
             let target = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let sum_range = args.get(2).map(|a| a.slice()).unwrap_or(target);
             let mut s = 0.0;
             for (i, v) in target.iter().enumerate() {
                 if crit.matches(v) {
                     if let Some(sv) = sum_range.get(i) {
-                        if let Ok(n) = sv.to_number() {
-                            s += n;
+                        match sv {
+                            FValue::Number(n) => s += n,
+                            FValue::Error(e) => return Err(*e),
+                            _ => {}
                         }
                     }
                 }
@@ -784,12 +791,12 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             Ok(FValue::number(s))
         }),
         "SUMIFS" => r(|| {
-            let sum_range = args.first().map(|a| a.values()).unwrap_or_default();
+            let sum_range = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let mut s = 0.0;
-            let pairs: Vec<(Vec<FValue>, String)> = (1..args.len())
+            let pairs: Vec<(&[FValue], String)> = (1..args.len())
                 .step_by(2)
                 .filter_map(|i| {
-                    let rg = args.get(i)?.values();
+                    let rg = args.get(i)?.slice();
                     let crit = args.get(i + 1)?.first().to_text().ok()?;
                     Some((rg, crit))
                 })
@@ -879,7 +886,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         "COUNTA" => r(|| {
             let n = args
                 .iter()
-                .flat_map(|a| a.values())
+                .flat_map(|a| a.slice())
                 .filter(|v| !matches!(v, FValue::Empty))
                 .count();
             Ok(FValue::number(n as f64))
@@ -887,7 +894,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         "COUNTBLANK" => r(|| {
             let n = args
                 .iter()
-                .flat_map(|a| a.values())
+                .flat_map(|a| a.slice())
                 .filter(|v| match v {
                     FValue::Empty => true,
                     FValue::Text(s) => s.is_empty(),
@@ -910,10 +917,10 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "COUNTIFS" => r(|| {
             let mut count = 0usize;
-            let pairs: Vec<(Vec<FValue>, String)> = (0..args.len())
+            let pairs: Vec<(&[FValue], String)> = (0..args.len())
                 .step_by(2)
                 .filter_map(|i| {
-                    let rg = args.get(i)?.values();
+                    let rg = args.get(i)?.slice();
                     let c = args.get(i + 1)?.first().to_text().ok()?;
                     Some((rg, c))
                 })
@@ -928,8 +935,8 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         }),
         "AVERAGEIF" => r(|| {
             let crit = text(args, 1)?;
-            let target = args.first().map(|a| a.values()).unwrap_or_default();
-            let vals = args.get(2).map(|a| a.values()).unwrap_or_else(|| target.clone());
+            let target = args.first().map(|a| a.slice()).unwrap_or(&[]);
+            let vals = args.get(2).map(|a| a.slice()).unwrap_or(target);
             let mut s = 0.0;
             let mut n = 0.0;
             for (i, v) in target.iter().enumerate() {
@@ -1775,9 +1782,10 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
             Ok(FValue::number(d as f64))
         }),
         "YEARFRAC" => r(|| {
-            let a = num(args, 0)?.floor();
-            let b = num(args, 1)?.floor();
-            Ok(FValue::number((b - a) / 365.25))
+            let start = num(args, 0)?.floor();
+            let end = num(args, 1)?.floor();
+            let basis = opt_num(args, 2, 0.0)?.trunc() as i32;
+            year_fraction(start.min(end), start.max(end), basis).map(FValue::number)
         }),
 
         // ---------------- 财务
@@ -1973,6 +1981,54 @@ fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
     }
     let p = (1.0 + rate).powf(nper);
     -(rate * (pv * p + fv)) / ((1.0 + rate * t) * (p - 1.0))
+}
+
+fn year_fraction(start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
+    if start < 0.0 || end > date_to_serial(9999, 12, 31).ok_or(ErrKind::Num)? {
+        return Err(ErrKind::Num);
+    }
+    let calendar = |serial| {
+        if serial == 0.0 && !current_date_system().is_1904() {
+            Ok((1900, 1, 0))
+        } else {
+            serial_to_date(serial).ok_or(ErrKind::Num)
+        }
+    };
+    let (y1, m1, d1) = calendar(start)?;
+    let (y2, m2, d2) = calendar(end)?;
+    let actual = end - start;
+    match basis {
+        0 | 4 => {
+            let last_feb = |year, month, day| month == 2 && days_in_month(year, 2) == day;
+            let (from, to) = if basis == 4 {
+                (d1.min(30), d2.min(30))
+            } else if last_feb(y1, m1, d1) {
+                (30, if last_feb(y2, m2, d2) { 30 } else { d2 })
+            } else {
+                (d1.min(30), if d1 >= 30 { d2.min(30) } else { d2 })
+            };
+            let days = 360 * (y2 - y1) + 30 * (m2 as i32 - m1 as i32) + to as i32 - from as i32;
+            Ok(days as f64 / 360.0)
+        }
+        1 => {
+            // For periods longer than a year, Excel averages the lengths of all
+            // calendar years touched, including the first and last.
+            let longer = y2 > y1 + 1 || (y2 == y1 + 1 && (m2, d2) > (m1, d1));
+            let denominator = if longer {
+                let days = days_from_civil(y2 + 1, 1, 1) - days_from_civil(y1, 1, 1);
+                days as f64 / f64::from(y2 - y1 + 1)
+            } else {
+                let leap = |year| days_in_month(year, 2) == 29;
+                let includes_leap = (leap(y1) && (y1 == y2 || m1 <= 2))
+                    || (leap(y2) && (m2, d2) >= (2, 29));
+                if includes_leap { 366.0 } else { 365.0 }
+            };
+            Ok(actual / denominator)
+        }
+        2 => Ok(actual / 360.0),
+        3 => Ok(actual / 365.0),
+        _ => Err(ErrKind::Num),
+    }
 }
 
 fn fv(rate: f64, nper: f64, pmt_v: f64, pv: f64, t: f64) -> f64 {

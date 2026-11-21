@@ -277,8 +277,9 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
 
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = output.parent().unwrap_or_else(|| Path::new(".")).join(format!(
-        ".~sheetflow-base-{}-{seq}.xlsx", std::process::id()));
+    let _ = output;
+    let path = std::env::temp_dir().join(format!(
+        "cellan-base-{}-{seq}.xlsx", std::process::id()));
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     let prepared = PreparedBase { path, temporary: true };
     let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;

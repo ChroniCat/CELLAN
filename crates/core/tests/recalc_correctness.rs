@@ -1,6 +1,82 @@
 use sheetcore::{Cell, CellRef, Sheet, Value, Workbook};
 use sheetcore::formula::{self, deps::Deps};
 
+#[test]
+fn clipped_large_range_does_not_reverse_into_used_rows_or_columns() {
+    let mut wb = Workbook::new_blank();
+    set(&mut wb, 0, 0, 100.0);
+    for expression in ["=SUM(A100:A300100)", "=SUM(Z1:ZZ10000)"] {
+        assert_eq!(formula::eval_formula(&wb, 0, expression), formula::value::FValue::Number(0.0));
+    }
+}
+
+#[test]
+fn sumif_uses_criteria_dimensions_for_amounts_and_dependencies() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(Sheet::new("Amounts"));
+    for r in 0..2 {
+        for c in 0..2 {
+            set(&mut wb, r, c, 1.0);
+            wb.sheets[1].set(r, c, Cell { value: Value::Number(10.0), formula: None });
+        }
+    }
+    setf(&mut wb, 0, 3, "=SUMIF(A1:B2,1,Amounts!A1)");
+    formula::recalc_all(&mut wb);
+    assert_eq!(cached(&wb, 0, 3), 40.0);
+    let deps = Deps::build(&wb);
+    wb.sheets[1].set(1, 1, Cell { value: Value::Number(20.0), formula: None });
+    formula::recalc_dirty(&mut wb, &deps, &[(1, 1, 1)]);
+    assert_eq!(cached(&wb, 0, 3), 50.0);
+    wb.sheets[1].set(1_048_575, 0, Cell { value: Value::Number(8.0), formula: None });
+    assert_eq!(formula::eval_formula(&wb, 0, "=SUMIF(A1:A2,1,Amounts!A1048576)"),
+               formula::FValue::Number(8.0));
+}
+
+#[test]
+fn range_averages_and_extrema_propagate_cell_errors() {
+    let mut wb = Workbook::new_blank();
+    set(&mut wb, 0, 0, 100.0);
+    setf(&mut wb, 1, 0, "=1/0");
+    for name in ["AVERAGE", "MAX", "MIN"] {
+        assert_eq!(formula::eval_formula(&wb, 0, &format!("={name}(A1:A2)")),
+                   formula::value::FValue::Error(formula::ErrKind::Div0));
+    }
+}
+
+#[test]
+fn subtotals_use_visibility_of_the_source_sheet() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets.push(Sheet::new("Report"));
+    for (r, n) in [100.0, 200.0, 300.0].into_iter().enumerate() { set(&mut wb, r as u32, 0, n); }
+    wb.sheets[0].hidden_rows.insert(1);
+    wb.sheets[0].hidden_rows_user.insert(2);
+    for (expression, expected) in [("=SUBTOTAL(9,Data!A1:A3)", 400.0),
+        ("=SUBTOTAL(109,Data!A1:A3)", 100.0), ("=SUBTOTAL(9,Data!A2)", 0.0)] {
+        assert_eq!(formula::eval_formula(&wb, 1, expression), formula::value::FValue::Number(expected));
+    }
+}
+
+#[test]
+fn yearfrac_uses_the_selected_day_count_basis() {
+    let wb = Workbook::new_blank();
+    for (basis, expected) in [(0, 1.0), (1, 1.0), (2, 366.0 / 360.0), (3, 366.0 / 365.0), (4, 1.0)] {
+        let expr = format!("=YEARFRAC(DATE(2024,1,1),DATE(2025,1,1),{basis})");
+        let actual = formula::eval_formula(&wb, 0, &expr).to_number().unwrap();
+        assert!((actual - expected).abs() < 1e-12, "{expr} = {actual}");
+    }
+    for (basis, expected_days) in [(0, 31.0), (4, 32.0)] {
+        let expr = format!("=YEARFRAC(DATE(2023,2,28),DATE(2023,3,31),{basis})");
+        let actual = formula::eval_formula(&wb, 0, &expr).to_number().unwrap();
+        assert!((actual * 360.0 - expected_days).abs() < 1e-10);
+    }
+    assert_eq!(formula::eval_formula(&wb, 0, "=YEARFRAC(1,2,5)"),
+               formula::value::FValue::Error(formula::ErrKind::Num));
+    // Excel 1900 serial 60 affects elapsed days, while 1900 has a 365-day basis.
+    let actual = formula::eval_formula(&wb, 0, "=YEARFRAC(59,61,1)").to_number().unwrap();
+    assert!((actual - 2.0 / 365.0).abs() < 1e-12);
+}
+
 fn set(wb: &mut Workbook, r: u32, c: u32, value: f64) {
     wb.sheets[0].set(r, c, Cell { value: Value::Number(value), formula: None });
 }

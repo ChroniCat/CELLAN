@@ -77,7 +77,7 @@ fn picture_inserted_in_memory_only_is_not_written_until_save() {
         rect: (1, 1, 5, 4),
         off: [0; 4],
         part: sheetcore::pic_write::memory_part(&png, "png"),
-        data: Some(png.clone()),
+        data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
     });
@@ -104,7 +104,7 @@ fn saved_picture_has_anchor_and_media_and_survives_a_second_save() {
         rect: (2, 3, 7, 6),
         off: [0; 4],
         part: sheetcore::pic_write::memory_part(&png, "png"),
-        data: Some(png.clone()),
+        data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
     });
@@ -159,7 +159,7 @@ fn moved_picture_rewrites_anchor_and_deleting_it_removes_anchor() {
         rect: (1, 1, 3, 3),
         off: [0; 4],
         part: sheetcore::pic_write::memory_part(&png, "png"),
-        data: Some(png.clone()),
+        data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
     });

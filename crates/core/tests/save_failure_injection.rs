@@ -332,25 +332,19 @@ fn readonly_target_is_not_silently_replaced() {
         "{:#}",
         sheetcore::xlsx::save_atomic(&path, &wb).expect_err("只读目标必须报错")
     );
-    assert!(err.contains("替换"), "错误要说明替换失败并给出临时文件位置：{err}");
+    assert!(err.contains("替换"), "错误要说明替换失败：{err}");
     assert_eq!(hash(&path), before, "原文件不得被改写");
     let leftover = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .find(|e| e.file_name().to_string_lossy().contains(".saving-"));
     assert!(
-        leftover.is_some(),
-        "替换失败时半成品必须留在临时文件里，不能删掉后假装没发生"
+        leftover.is_none(),
+        "替换失败时不得在原文件目录遗留 .saving-* 大体积临时文件"
     );
 
     perms.set_readonly(false);
     std::fs::set_permissions(&path, perms).unwrap();
-    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-        let n = entry.file_name().to_string_lossy().to_string();
-        if n.contains(".saving-") {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
     sheetcore::xlsx::save_atomic(&path, &wb).expect("清掉只读后应能重试成功");
     assert_eq!(
         sheetcore::xlsx::load(&path).unwrap().sheets[0].value(1, 0),
@@ -479,15 +473,57 @@ mod occupancy {
             .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
             .filter(|n| n.contains(".saving-"))
             .collect();
-        assert_eq!(stray.len(), 1, "失败后应保留一份新内容供人工抢救：{stray:?}");
+        assert!(stray.is_empty(), "被独占保存失败后不得在原目录残留 .saving-* 垃圾文件：{stray:?}");
 
         drop(hold);
-        for n in &stray {
-            let _ = std::fs::remove_file(dir.join(n));
-        }
         sheetcore::xlsx::save_atomic(&path, &wb).expect("解除占用后应能保存");
         let back = sheetcore::xlsx::load(&path).expect("读回");
         assert_eq!(back.sheet(0).get(3, 0).unwrap().value.display(), "5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 共享盘常见的「能改内容、不能删除/重命名」：rename 被拒后走原地流式覆写。
+    /// 覆写前会在本机临时目录留一份回滚副本；成功路径上它不能影响结果，也不能在原目录留下任何文件。
+    #[test]
+    fn delete_denied_target_is_overwritten_in_place_and_verified() {
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("delete-denied");
+        let path = dir.join("shared.xlsx");
+        let mut wb = book();
+        sheetcore::xlsx::save_atomic(&path, &wb).expect("先写一份");
+
+        // 别的句柄允许读写共享、但不允许删除：rename 覆盖目标会被拒（os error 5）
+        let hold = {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let h = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(!h.is_null() && h as isize != -1, "打开失败");
+            Exclusive(h)
+        };
+        wb.sheets[0].set(4, 0, Cell { value: Value::Number(7.0), formula: None });
+        let res = sheetcore::xlsx::save_atomic(&path, &wb);
+        drop(hold);
+        res.expect("目标只拦删除/重命名时应原地覆写成功");
+
+        let back = sheetcore::xlsx::load(&path).expect("覆写后的文件必须能正常打开");
+        assert_eq!(back.sheet(0).get(4, 0).unwrap().value.display(), "7");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
+            .filter(|n| n != "shared.xlsx")
+            .collect();
+        assert!(leftovers.is_empty(), "原目录不得残留任何中间文件：{leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

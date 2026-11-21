@@ -64,13 +64,17 @@ pub fn apply_value(text: &str) -> Value {
     }
 }
 
-/// 从选中的格子里抓一套方案
+/// 从选中的格子里抓一套方案（对可变单元格数设安全上限，避免误在全选状态添加方案导致 OOM）
 pub fn capture(sheet: &Sheet, name: &str, comment: &str, rect: (u32, u32, u32, u32)) -> Scenario {
     let (r1, c1, r2, c2) = rect;
     let mut sc = Scenario::new(name);
     sc.comment = comment.to_string();
-    for r in r1..=r2 {
+    const MAX_SCENARIO_CELLS: usize = 512;
+    'outer: for r in r1..=r2 {
         for c in c1..=c2 {
+            if sc.cells.len() >= MAX_SCENARIO_CELLS {
+                break 'outer;
+            }
             let v = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or_default();
             sc.cells.push(((r, c), value_text(&v)));
         }

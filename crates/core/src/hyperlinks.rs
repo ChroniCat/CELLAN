@@ -115,6 +115,9 @@ pub fn rels_part(sheet_part: &str) -> String {
 
 /// 把模型里的链接写回工作表（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.hyperlinks_dirty) {
+        return Ok(());
+    }
     let targets = crate::patch::sheet_targets(path)?;
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     for sheet in &wb.sheets {

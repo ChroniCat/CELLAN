@@ -76,18 +76,26 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     let (left, right, top, bottom) = margins_pt(setup);
     let printable = ((pw - left - right).max(72.0), (ph - top - bottom).max(72.0));
 
-    let (r1, c1, r2, c2) = match setup.print_area {
-        Some(a) => a,
-        None => {
-            let mut max_r = 0;
-            let mut max_c = 0;
-            for (cref, _) in sheet.iter() {
-                max_r = max_r.max(cref.row);
-                max_c = max_c.max(cref.col);
+    let (r1, c1, mut r2, mut c2) = match setup.print_area {
+        Some((ar1, ac1, ar2, ac2)) => {
+            // 防止全选 Ctrl+A 后点击“设置打印区域”将 print_area 设为 1048576×16384，导致生成 5300 万个分页块（~860 MB）卡死
+            if (ar2.saturating_sub(ar1) as u64 + 1) * (ac2.saturating_sub(ac1) as u64 + 1) > 500_000 {
+                if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
+                    (ar1, ac1, ar2.min(ur2.max(ar1)), ac2.min(uc2.max(ac1)))
+                } else {
+                    (ar1, ac1, ar1, ac1)
+                }
+            } else {
+                (ar1, ac1, ar2, ac2)
             }
-            (0, 0, max_r, max_c)
         }
+        None => sheet
+            .used_bounds()
+            .map(|(_, _, max_r, max_c)| (0, 0, max_r, max_c))
+            .unwrap_or((0, 0, 0, 0)),
     };
+    r2 = r2.max(r1);
+    c2 = c2.max(c1);
 
     let mut scale = if setup.fit_to_page {
         let target_w = printable.0 * setup.fit_width.max(1) as f32;
@@ -796,7 +804,7 @@ fn draw_objects(
             continue;
         }
         let bytes = match &pic.data {
-            Some(d) => Some(d.clone()),
+            Some(d) => Some(d.as_ref().clone()),
             None => source.and_then(|p| crate::pic::read_part(p, &pic.part)),
         };
         let Some(bytes) = bytes else { continue };

@@ -1,17 +1,11 @@
 //! 单元格级修订日志：谁、什么时候、改了哪格、改之前是什么。
 //!
-//! 不做 Excel 那套「共享工作簿 + revisions 部件」（365 已弃用，LibreOffice 也不认），
-//! 改成随文件走的一份 JSONL：
-//!
-//! ```text
-//! <工作簿目录>/.~sheetflow-history/<文件名>/revisions.jsonl
-//! ```
-//!
-//! 每行一条动作（一次编辑/粘贴/格式刷/结构改动），只存受影响的格子，不存整表快照。
-//! 放同目录的理由和版本备份一样：共享盘上换个人打开也能看到历史。
+//! 修订记录默认仅保留在当前会话内存中，绝不在原文件目录生成 `.~sheetflow-history` 等附属文件；
+//! 若显式调用落盘辅助函数（如单测），也统一写入系统临时目录而非原工作簿所在文件夹。
 
 use crate::model::{Cell, Value};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -203,14 +197,25 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `<工作簿目录>/.~sheetflow-history/<文件名>/`
+/// 系统临时目录下的隔离修订缓存路径（绝不污染工作簿原目录）
 pub fn dir_for(file: &Path) -> PathBuf {
-    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let parent = file
+        .parent()
+        .and_then(|p| p.canonicalize().ok().or_else(|| Some(p.to_path_buf())))
+        .unwrap_or_default();
+    let norm = parent.to_string_lossy().replace('\\', "/");
+    let norm = if cfg!(windows) { norm.to_lowercase() } else { norm };
+    let mut h = Sha256::new();
+    h.update(norm.as_bytes());
+    let bucket: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
     let name = file
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook".into());
-    dir.join(".~sheetflow-history").join(name)
+    let root = std::env::var_os("SC_REV_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("cellan-revisions-cache"));
+    root.join(bucket).join(name)
 }
 
 pub fn log_path(file: &Path) -> PathBuf {
@@ -259,7 +264,9 @@ mod tests {
         let dir = std::env::temp_dir().join("sheet_revision").join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("账.xlsx")
+        let p = dir.join("账.xlsx");
+        let _ = std::fs::remove_file(log_path(&p));
+        p
     }
 
     #[test]
@@ -310,10 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn log_lives_next_to_workbook() {
+    fn log_never_pollutes_workbook_directory() {
         let f = tmp("dir");
         let p = log_path(&f);
-        assert!(p.ends_with(".~sheetflow-history/账.xlsx/revisions.jsonl"), "{p:?}");
+        assert!(p.starts_with(std::env::temp_dir()), "{p:?}");
+        assert!(!f.parent().unwrap().join(".~sheetflow-history").exists());
     }
 
     #[test]

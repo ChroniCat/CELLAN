@@ -148,11 +148,14 @@ pub struct CellStyle {
     pub color: [u8; 3],
     /// 底色，None 表示无填充
     pub fill: Option<[u8; 3]>,
-    /// 0 常规 1 左 2 中 3 右
+    /// 0 常规 1 左 2 中 3 右 4 跨列居中 5 分散对齐
     pub halign: u8,
     /// 0 常规 1 上 2 中 3 下
     pub valign: u8,
     pub wrap: bool,
+    /// 缩小字体填充（Excel/WPS ShrinkToFit）
+    #[serde(default)]
+    pub shrink_to_fit: bool,
     /// 缩进级数（Excel 的 IndentLevel，1 级约 3 个字符宽）
     #[serde(default)]
     pub indent: u8,
@@ -189,6 +192,7 @@ impl Default for CellStyle {
             halign: 0,
             valign: 0,
             wrap: false,
+            shrink_to_fit: false,
             indent: 0,
             format: String::new(),
             border: [Border::default(); 4],
@@ -258,6 +262,7 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.halign.hash(&mut h);
     s.valign.hash(&mut h);
     s.wrap.hash(&mut h);
+    s.shrink_to_fit.hash(&mut h);
     s.indent.hash(&mut h);
     s.format.hash(&mut h);
     s.border.hash(&mut h);
@@ -503,7 +508,13 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
             // Excel 单段格式对负数：先取绝对值套格式，再在最前面补一个负号
             // （`(#,##0.00)` → `-(1,234.50)`；`[Red]-#,##0.00` → `--987.65`）
             if need_minus {
-                out.insert(0, '-');
+                if crate::dbnum::detect_dbnum(sec).is_some() {
+                    if !out.starts_with('负') {
+                        out.insert(0, '负');
+                    }
+                } else {
+                    out.insert(0, '-');
+                }
             }
             out
         }
@@ -737,9 +748,18 @@ fn render_section(val: f64, sec: &str) -> String {
     if raw.is_empty() || raw.eq_ignore_ascii_case("general") {
         return general_number(val);
     }
+    let dbnum = crate::dbnum::detect_dbnum(raw);
     // 日期判断要用原始格式（[h] 这类耗时令牌不能被清掉）
     if is_date_format(raw) {
         if let Some(s) = format_date(val, raw) {
+            return match dbnum {
+                Some(kind) => crate::dbnum::map_digits_for_date(&s, kind),
+                None => s,
+            };
+        }
+    }
+    if let Some(kind) = dbnum {
+        if let Some(s) = crate::dbnum::format_dbnum(val, kind, raw) {
             return s;
         }
     }

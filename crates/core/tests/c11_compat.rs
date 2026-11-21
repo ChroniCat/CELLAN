@@ -11,27 +11,35 @@ fn fixture() -> PathBuf {
 }
 
 #[test]
-fn external_three_d_reference_keeps_formula_and_cache_after_open_recalc_save_reload() {
+fn external_three_d_reference_keeps_formula_and_recalculates_after_open_save_reload() {
     let (mut wb, diag) = xlsx::load_diag(&fixture()).unwrap();
     let cell = wb.sheets[0].get(0, 0).expect("fixture A1");
     assert_eq!(cell.formula.as_deref(), Some("=SUM([1]First:Third!A1)"));
     assert_eq!(cell.value, Value::Number(60.0));
 
-    let compat: Vec<_> = diag
-        .problems
-        .iter()
-        .filter(|p| p.what == "兼容提示")
-        .collect();
-    assert_eq!(compat.len(), 1, "必须给出一条兼容诊断：{diag:?}");
-    assert!(!compat[0].fatal);
-    assert!(compat[0].detail.contains("外部工作簿三维引用"));
-    assert!(compat[0].detail.contains("缓存"));
+    // 原生已支持外部三维引用，不应再弹出任何兼容告警
+    assert!(
+        diag.is_complete(),
+        "外部工作簿三维引用已原生支持，不应产生诊断告警：{diag:?}"
+    );
 
-    // 打开后的全量重算不能把已知缓存覆盖成 #REF!。
+    // 清空缓存重算：必须依靠外部链接三维求和主动算回 60
+    if let Some(c) = wb.sheets[0].get_mut(0, 0) {
+        c.value = Value::Number(0.0);
+    }
     recalc_all_force(&mut wb);
     let cell = wb.sheets[0].get(0, 0).unwrap();
     assert_eq!(cell.formula.as_deref(), Some("=SUM([1]First:Third!A1)"));
-    assert_eq!(cell.value, Value::Number(60.0), "重算必须保留原缓存");
+    assert_eq!(cell.value, Value::Number(60.0), "主动重算必须算出 10+20+30=60");
+
+    // 外部链接缓存变化时，重算必须算出新和值（例如 100+200+300=600），且标记已刷新+编辑后存盘重开保持 600
+    wb.links[0].cache.insert((0, 0, 0), Value::Number(100.0));
+    wb.links[0].cache.insert((1, 0, 0), Value::Number(200.0));
+    wb.links[0].cache.insert((2, 0, 0), Value::Number(300.0));
+    wb.links[0].refreshed = true;
+    wb.sheets[0].edited = true;
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Number(600.0));
 
     let dir = std::env::temp_dir().join(format!(
         "sc_c11_external3d_{}_{}",
@@ -47,13 +55,10 @@ fn external_three_d_reference_keeps_formula_and_cache_after_open_recalc_save_rel
     let (wb2, diag2) = xlsx::load_diag(&out).unwrap();
     let cell2 = wb2.sheets[0].get(0, 0).unwrap();
     assert_eq!(cell2.formula.as_deref(), Some("=SUM([1]First:Third!A1)"));
-    assert_eq!(cell2.value, Value::Number(60.0));
+    assert_eq!(cell2.value, Value::Number(600.0));
     assert!(
-        diag2
-            .problems
-            .iter()
-            .any(|p| p.what == "兼容提示" && !p.fatal),
-        "保存重开后兼容诊断仍应可见：{diag2:?}"
+        diag2.is_complete(),
+        "保存重开后仍无兼容告警：{diag2:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -127,20 +132,14 @@ fn external_three_d_text_inside_strings_is_not_cache_preserved() {
 }
 
 #[test]
-fn compatibility_detector_is_limited_to_external_three_d() {
-    assert!(sheetcore::formula::unsupported_reference_combo("=SUM([1]First:Third!A1)").is_some());
-    assert!(sheetcore::formula::unsupported_reference_combo("=SUM('[b.xlsx]First:Third'!A1)").is_some());
-    assert!(sheetcore::formula::unsupported_reference_combo("=SUM([1]First!A1)").is_none());
-    assert!(sheetcore::formula::unsupported_reference_combo("=SUM(First:Third!A1)").is_none());
-    assert!(sheetcore::formula::unsupported_reference_combo("=FOO(1)").is_none());
-    assert!(sheetcore::formula::unsupported_reference_combo("=\"[1]First:Third!A1\"").is_none());
-    assert!(
-        sheetcore::formula::unsupported_reference_combo("=IF(TRUE,1/0,\"[1]First:Third!A1\")")
-            .is_none()
-    );
-    assert!(
-        sheetcore::formula::unsupported_reference_combo("=\"a\"\"[1]First:Third!A1\"\"b\"")
-            .is_none(),
-        "双写双引号是字符串内的转义引号，不能把后面文本当引用"
-    );
+fn external_three_d_is_natively_supported_across_syntax_variants() {
+    let (wb, _) = xlsx::load_diag(&fixture()).unwrap();
+    assert!(sheetcore::formula::unsupported_reference_combo("=SUM([1]First:Third!A1)").is_none());
+    assert!(sheetcore::formula::unsupported_reference_combo("=SUM('[b.xlsx]First:Third'!A1)").is_none());
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=SUM([1]First:Third!A1)").display(), "60");
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=SUM('[1]First:Third'!A1)").display(), "60");
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=SUM([1]Third:First!A1)").display(), "60");
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=AVERAGE([1]First:Third!A1)").display(), "20");
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=SHEETS([1]First:Third!A1)").display(), "3");
+    assert_eq!(sheetcore::formula::eval_formula(&wb, 0, "=SHEET([1]Second!A1)").display(), "2");
 }
