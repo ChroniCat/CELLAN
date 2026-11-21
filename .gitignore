@@ -22,6 +22,15 @@
 .~*
 
 # Checked-in synthetic test fixtures
+!/crates/core/tests/fixtures/c15/protected.xlsx
+!/crates/core/tests/fixtures/c17/borders.xlsx
+!/crates/core/tests/fixtures/c17/priority.xlsx
+!/crates/core/tests/fixtures/c17/x14bar.xlsx
+!/crates/core/tests/fixtures/c18/pattern.xlsx
+!/crates/core/tests/fixtures/c18/theme.xlsx
+!/crates/core/tests/fixtures/c18/unknown.xlsx
+!/crates/core/tests/fixtures/c21/threaded_real.xlsx
+!/crates/core/tests/fixtures/ui15/style.xlsx
 !crates/core/tests/data/compat_in.xlsx
 !crates/core/tests/data/two_sheets.xlsx
 !crates/core/tests/data/sparklines.xlsx
