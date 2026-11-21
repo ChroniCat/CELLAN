@@ -37,6 +37,50 @@ fn edit_in_another_sheet_during_save_retires_the_committed_detail() {
 }
 
 #[test]
+fn f9_completing_after_save_keeps_the_receipt_and_persists_changed_formula_caches() {
+    let env = crate::test_env::TestEnv::new("f9-during-save");
+    let path = env.path("ledger.xlsx");
+    let mut app = crate::SheetApp::new_with_context(&egui::Context::default(), None);
+    let number = |n| Cell { value: Value::Number(n), formula: None };
+    app.wb.sheets.push(Sheet::new("Summary"));
+    app.wb.sheet_mut(0).set(0, 0, number(5.0));
+    app.wb.sheet_mut(0).set(1, 0, number(8.0));
+    app.wb.sheet_mut(0).remove(1, 0);
+    app.wb.sheet_mut(1).set(0, 0, Cell { value: Value::Number(1.0), formula: Some("=Sheet1!A1+2".into()) });
+
+    // Both workers capture the deletion. Consume the save first, while the F9
+    // result remains in its channel, independent of worker scheduling.
+    app.tasks.start_save(&mut app.wb, path.clone());
+    app.recalc_all_async();
+    assert!(app.tasks.busy);
+    wait_for_document_save(&mut app.tasks, &mut app.wb).unwrap();
+    assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheet(1).value(0, 0), Value::Number(1.0));
+    assert!(!app.wb.sheet(0).edited && app.wb.sheet(0).cleared.is_empty());
+
+    let start = Instant::now();
+    while app.tasks.busy {
+        app.poll_open();
+        assert!(start.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(app.wb.path.as_deref(), Some(path.as_path()));
+    assert!(!app.wb.sheet(0).edited && app.wb.sheet(0).cleared.is_empty());
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(7.0));
+
+    // A third sheet is the only user edit in this save. The new cache on
+    // Summary still needs writing, while the committed detail can be reused.
+    app.wb.sheets.push(Sheet::new("Notes"));
+    app.wb.sheet_mut(2).set(0, 0, number(12.0));
+    app.wb.dirty = true;
+    app.tasks.start_save(&mut app.wb, path.clone());
+    wait_for_document_save(&mut app.tasks, &mut app.wb).unwrap();
+    let back = sheetcore::xlsx::load(&path).unwrap();
+    assert_eq!(back.sheet(0).value(1, 0), Value::Empty);
+    assert_eq!(back.sheet(1).value(0, 0), Value::Number(7.0));
+    assert_eq!(back.sheet(2).value(0, 0), Value::Number(12.0));
+}
+
+#[test]
 fn repeated_save_preserves_new_style_and_deletion_across_a_failed_retry() {
     let env = crate::test_env::TestEnv::new("repeat-save-edits");
     let path = env.path("ledger.xlsx");

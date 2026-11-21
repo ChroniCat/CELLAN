@@ -1940,7 +1940,7 @@ struct SheetApp {
     recent_cache: Option<Vec<HomeRecentEntry>>,
     /// 视口条件格式叠加缓存：静止/悬停/点击选区时不重复解析与求值公式规则
     cf_cache: Option<(
-        (usize, u64, u64, u32, u32, u32, u32, u32, u32),
+        (usize, u64, u64, u32, Option<u32>, u32, Option<u32>, u32, u32, (u64, Option<u32>), (u64, Option<u32>)),
         std::sync::Arc<std::collections::HashMap<(u32, u32), sheetcore::cf::Overlay>>,
     )>,
     /// 状态栏选区统计文本缓存：避免中小选区每帧重扫单元格
@@ -6865,20 +6865,19 @@ impl SheetApp {
     }
 
     fn apply_recalculated_workbook(&mut self, mut calculated: Workbook) {
-        // A save or password change may have completed since the worker took its snapshot.
-        calculated.path = self.wb.path.take();
-        calculated.dirty = self.wb.dirty;
-        calculated.encryption = self.wb.encryption.take();
-        calculated.source_encryption = self.wb.source_encryption.take();
-        calculated.load_incomplete = self.wb.load_incomplete;
-        for (result, live) in calculated.sheets.iter_mut().zip(&mut self.wb.sheets) {
-            if result.identity == live.identity {
-                result.source_part = live.source_part.take();
-                std::mem::swap(&mut result.charts, &mut live.charts);
-                result.charts_dirty = live.charts_dirty;
+        // The callers have checked the document generation. A save can still
+        // acknowledge sheet edits and adopt a new path during that generation.
+        for (live, result) in self.wb.sheets.iter_mut().zip(&mut calculated.sheets) {
+            if live.identity == result.identity {
+                live.take_calculation(result);
+                std::mem::swap(live, result);
             }
         }
-        self.wb = calculated;
+        self.wb.sheets = calculated.sheets;
+        // The open worker also refreshes external link caches before evaluation.
+        self.wb.links = calculated.links;
+        self.wb.calc_pending = calculated.calc_pending;
+        self.wb.calc_pending_sheets = calculated.calc_pending_sheets;
     }
 
     fn set_workbook_open_password(&mut self, password: String) {
@@ -27322,6 +27321,17 @@ let txn = self.txn_begin(&keys);
                 rows.index_at(frozen_h + off_y + (y - body_y))
             }
         };
+        // 冻结区、标题、正文及覆盖层共用同一组可见行列。页面视图滚动后也从当前页开始。
+        let first_row = if pg.is_some() { first_row.max(row_at(body_y)) } else { first_row };
+        let first_col = if pg.is_some() { first_col.max(col_at(body_x)) } else { first_col };
+        let body_rows: Vec<_> = rows.visible_indices(first_row..1_048_576)
+            .take_while(|&r| gy(r) < resp.rect.bottom()).take(8192).collect();
+        let body_cols: Vec<_> = cols.visible_indices(first_col..16_384)
+            .take_while(|&c| gx(c) < resp.rect.right()).take(4096).collect();
+        let frozen_rows: Vec<_> = rows.visible_indices(0..fy)
+            .take_while(|&r| py_of(r) < resp.rect.bottom()).collect();
+        let frozen_cols: Vec<_> = cols.visible_indices(0..fx)
+            .take_while(|&c| px_of(c) < resp.rect.right()).collect();
         // 无界面验收：SC_HIT="x,y" 走一遍和鼠标点击一样的命中测试，打印命中的格子
         if let Ok(spec) = std::env::var("SC_HIT") {
             static ONCE: std::sync::atomic::AtomicBool =
@@ -27494,7 +27504,7 @@ let txn = self.txn_begin(&keys);
             head_bg,
         );
         // 冻结列的标题（固定不动）
-        for c in 0..fx {
+        for &c in &frozen_cols {
             let x = origin.x + head_w + cols.pos(c);
             let w = cols.size(c);
             if c >= sc1 && c <= sc2 {
@@ -27536,16 +27546,13 @@ let txn = self.txn_begin(&keys);
                 grid_stroke,
             );
         }
-        let mut c = first_col;
-        let mut guard = 0;
         // 列标带：冻结列右边的部分才画（半列滚出去时它的列标会被裁掉，和 Excel 一致）
         let colhead_clip = Rect::from_min_max(
             egui::pos2(origin.x + head_w + frozen_w, origin.y),
             egui::pos2(resp.rect.max.x, origin.y + hh),
         );
         let colhead = painter.with_clip_rect(colhead_clip.intersect(painter.clip_rect()));
-        while gx(c) < origin.x + avail.x && guard < 4096 {
-            guard += 1;
+        for &c in &body_cols {
             let x = gx(c);
             let w = cols.size(c);
             if self.show_headings {
@@ -27605,10 +27612,9 @@ let txn = self.txn_begin(&keys);
                     grid_stroke,
                 );
             }
-            c += 1;
         }
         // 行标题
-        for r in 0..fy {
+        for &r in &frozen_rows {
             let y = origin.y + hh + rows.pos(r);
             let h = rows.size(r);
             if h < 1.0 {
@@ -27713,7 +27719,6 @@ let txn = self.txn_begin(&keys);
                 Stroke::NONE,
             ));
         }
-        let mut r = first_row;
         let groups = self.row_groups();
         let mut pending_toggle: Vec<(u32, u32)> = Vec::new();
         // 行号栏的裁剪：冻结带以下的才画（不然半个滚出去的行号会压在冻结行上）
@@ -27722,9 +27727,7 @@ let txn = self.txn_begin(&keys);
             egui::pos2(origin.x + head_w, resp.rect.max.y),
         );
         let gutter = painter.with_clip_rect(gutter_clip.intersect(painter.clip_rect()));
-        guard = 0;
-        while gy(r) < origin.y + avail.y && guard < 8192 {
-            guard += 1;
+        for &r in &body_rows {
             let y = gy(r);
             let h = rows.size(r);
             if self.show_headings && h >= 1.0 {
@@ -27745,7 +27748,6 @@ let txn = self.txn_begin(&keys);
                 );
             }
             if h < 1.0 {
-                r += 1;
                 continue;
             }
             if y + h > origin.y + hh + frozen_h {
@@ -27838,7 +27840,6 @@ let txn = self.txn_begin(&keys);
                     grid_stroke,
                 );
             }
-            r += 1;
         }
         // 行号列与表格之间的分界线（Excel 实测 #ABABAB，比控件边框深）
         painter.line_segment(
@@ -27923,8 +27924,6 @@ let txn = self.txn_begin(&keys);
 
         // 条件格式叠加：精确收敛到当前可视行列（含冻结区）并按 (doc_gen, 视口边界) 缓存，
         // 告别原先每帧无条件硬算 200×60=12000 格公式造成的悬停/点击卡顿。
-        let last_vis_col = c.saturating_add(2);
-        let last_vis_r = r.saturating_add(2);
         let si = self.sheet_idx;
         if !self.wb.sheet(si).cf.blocks.is_empty() {
             let want_cf_gen = self.doc_gen ^ ((si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -27938,80 +27937,49 @@ let txn = self.txn_begin(&keys);
                 self.cf_stats_gen = want_cf_gen;
             }
         }
+        let intersects = |indices: &[u32], start, end| {
+            indices.get(indices.partition_point(|&i| i < start)).is_some_and(|&i| i <= end)
+        };
+        let vis_merges: Vec<_> = self.wb.sheet(si).merges.iter().copied()
+            .filter(|&(r1, c1, r2, c2)| {
+                (intersects(&body_rows, r1, r2) || intersects(&frozen_rows, r1, r2))
+                    && (intersects(&body_cols, c1, c2) || intersects(&frozen_cols, c1, c2))
+            }).collect();
         let cf_map: std::sync::Arc<std::collections::HashMap<(u32, u32), sheetcore::cf::Overlay>> =
             if self.wb.sheet(si).cf.blocks.is_empty() {
                 std::sync::Arc::new(std::collections::HashMap::new())
             } else {
                 let cf_key = (
-                    si,
-                    self.doc_gen,
-                    self.wb_epoch,
-                    first_row,
-                    last_vis_r,
-                    first_col,
-                    last_vis_col,
-                    fy,
-                    fx,
+                    si, self.doc_gen, self.wb_epoch, first_row, body_rows.last().copied(), first_col, body_cols.last().copied(),
+                    fy, fx, (rows.revision(), frozen_rows.last().copied()),
+                    (cols.revision(), frozen_cols.last().copied()),
                 );
-                if let Some((k, cached)) = &self.cf_cache {
-                    if *k == cf_key {
-                        cached.clone()
-                    } else {
-                        let mut m = std::collections::HashMap::new();
-                        let sheet = self.wb.sheet(si);
-                        let stats = &self.cf_stats;
-                        let cf = &sheet.cf;
-                        let mut calc = sheetcore::formula::Calc::new(&self.wb);
-                        for rr in (0..fy).chain(first_row..=last_vis_r) {
-                            for cc in (0..fx).chain(first_col..=last_vis_col) {
-                                let ov = sheetcore::cf::overlay_at(cf, stats, sheet, rr, cc, |f, r0, c0| {
-                                    let shifted = sheetcore::cf::shift_formula(
-                                        f.trim_start_matches('='),
-                                        r0,
-                                        c0,
-                                    );
-                                    match sheetcore::formula::parse(&shifted) {
-                                        Ok(node) => matches!(
-                                            calc.eval_node(&node, si),
-                                            sheetcore::formula::FValue::Bool(true)
-                                        ),
-                                        Err(_) => false,
-                                    }
-                                });
-                                if !ov.is_empty() {
-                                    m.insert((rr, cc), ov);
-                                }
-                            }
-                        }
-                        let arc = std::sync::Arc::new(m);
-                        self.cf_cache = Some((cf_key, arc.clone()));
-                        arc
-                    }
+                if let Some((_, cached)) = self.cf_cache.as_ref().filter(|(key, _)| *key == cf_key) {
+                    cached.clone()
                 } else {
-                    let mut m = std::collections::HashMap::new();
+                    let mut overlays = std::collections::HashMap::new();
                     let sheet = self.wb.sheet(si);
-                    let stats = &self.cf_stats;
-                    let cf = &sheet.cf;
                     let mut calc = sheetcore::formula::Calc::new(&self.wb);
-                    for rr in (0..fy).chain(first_row..=last_vis_r) {
-                        for cc in (0..fx).chain(first_col..=last_vis_col) {
-                            let ov = sheetcore::cf::overlay_at(cf, stats, sheet, rr, cc, |f, r0, c0| {
-                                let shifted =
-                                    sheetcore::cf::shift_formula(f.trim_start_matches('='), r0, c0);
-                                match sheetcore::formula::parse(&shifted) {
-                                    Ok(node) => matches!(
-                                        calc.eval_node(&node, si),
-                                        sheetcore::formula::FValue::Bool(true)
-                                    ),
-                                    Err(_) => false,
-                                }
-                            });
-                            if !ov.is_empty() {
-                                m.insert((rr, cc), ov);
-                            }
+                    let cells = frozen_rows.iter().chain(&body_rows).flat_map(|&r| {
+                        frozen_cols.iter().chain(&body_cols).map(move |&c| (r, c))
+                    });
+                    // 可见的合并格要使用锚点的格式，即使锚点位于隐藏区或视口边缘之外。
+                    let extra_anchors = vis_merges.iter().map(|&(r, c, _, _)| (r, c)).filter(|(r, c)| {
+                        (body_rows.binary_search(r).is_err() && frozen_rows.binary_search(r).is_err())
+                            || (body_cols.binary_search(c).is_err() && frozen_cols.binary_search(c).is_err())
+                    });
+                    for (r, c) in cells.chain(extra_anchors) {
+                        let ov = sheetcore::cf::overlay_at(&sheet.cf, &self.cf_stats, sheet, r, c, |f, r0, c0| {
+                            let shifted = sheetcore::cf::shift_formula(f.trim_start_matches('='), r0, c0);
+                            sheetcore::formula::parse(&shifted).is_ok_and(|node| {
+                                matches!(calc.eval_node(&node, si), sheetcore::formula::FValue::Bool(true))
+                            })
+                        });
+                        if !ov.is_empty() {
+                            overlays.insert((r, c), ov);
                         }
                     }
-                    let arc = std::sync::Arc::new(m);
+                    let arc = std::sync::Arc::new(overlays);
                     self.cf_cache = Some((cf_key, arc.clone()));
                     arc
                 }
@@ -28020,20 +27988,6 @@ let txn = self.txn_begin(&keys);
         if dumping {
             dump.push(format!("cfmap {} 项", cf_map.len()));
         }
-
-        // 仅保留与当前可视窗口（含冻结区）相交的合并单元格，将内层循环扫描从 O(全表合并数) 压到常数级
-        let vis_merges: Vec<(u32, u32, u32, u32)> = self
-            .wb
-            .sheet(self.sheet_idx)
-            .merges
-            .iter()
-            .copied()
-            .filter(|&(mr1, mc1, mr2, mc2)| {
-                let row_hit = mr1 < fy || (mr1 <= last_vis_r && mr2 >= first_row);
-                let col_hit = mc1 < fx || (mc1 <= last_vis_col && mc2 >= first_col);
-                row_hit && col_hit
-            })
-            .collect();
         // 合并区内部的网格线要抹掉（Excel 只画合并块外沿）
         for (mr1, mc1, mr2, mc2) in vis_merges.iter() {
             let x = px_of(*mc1);
@@ -28147,7 +28101,8 @@ let txn = self.txn_begin(&keys);
         let body_painter = painter.with_clip_rect(body_area.intersect(painter.clip_rect()));
         // 锚点滚出 first_row/first_col 但右下部分仍在可视区的合并块先补画，避免滚过半格时整块消失
         for &(mr1, mc1, mr2, mc2) in vis_merges.iter() {
-            if (mr1 < first_row || mc1 < first_col) && mr2 >= first_row && mc2 >= first_col {
+            if (mr1 < first_row || mc1 < first_col || rows.size(mr1) == 0.0 || cols.size(mc1) == 0.0)
+                && mr2 >= first_row && mc2 >= first_col {
                 let x = gx(mc1);
                 let y = gy(mr1);
                 let w = (cols.pos(mc2 + 1) - cols.pos(mc1)).max(cols.size(mc1));
@@ -28175,28 +28130,19 @@ let txn = self.txn_begin(&keys);
                 }
             }
         }
-        let mut r = first_row;
-        guard = 0;
-        while gy(r) < origin.y + avail.y && guard < 8192 {
-            guard += 1;
+        for &r in &body_rows {
             let y = gy(r);
             let rh = rows.size(r);
             if rh < 1.0 {
-                r += 1;
                 continue;
             }
             if y + rh < origin.y + hh {
-                r += 1;
                 continue;
             }
-            let mut c = first_col;
-            let mut cguard = 0;
-            while gx(c) < origin.x + avail.x && cguard < 4096 {
-                cguard += 1;
+            for &c in &body_cols {
                 let x = gx(c);
                 let cw = cols.size(c);
                 if x + cw < origin.x + head_w {
-                    c += 1;
                     continue;
                 }
                 let mut rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(cw, rh));
@@ -28208,7 +28154,6 @@ let txn = self.txn_begin(&keys);
                         .copied()
                     {
                         if (r, c) != (mr1, mc1) {
-                            c += 1;
                             continue;
                         }
                         rect.set_width((cols.pos(mc2 + 1) - cols.pos(mc1)).max(cw));
@@ -28279,9 +28224,7 @@ let txn = self.txn_begin(&keys);
                         }
                     }
                 }
-                c += 1;
             }
-            r += 1;
         }
 
         // 表格外框：借用只读范围，不克隆整份 Vec<Table>
@@ -28446,7 +28389,7 @@ let txn = self.txn_begin(&keys);
             if fx > 0 && clip_left.width() > 0.0 && clip_left.height() > 0.0 {
                 let p2 = painter.with_clip_rect(clip_left);
                 p2.rect_filled(clip_left, 0.0, Color32::WHITE);
-                for cc in 0..=fx {
+                for cc in frozen_cols.iter().copied().chain(std::iter::once(fx)) {
                     let vx = origin.x + head_w + cols.pos(cc);
                     p2.line_segment(
                         [egui::pos2(vx, body_y), egui::pos2(vx, origin.y + avail.y)],
@@ -28454,10 +28397,7 @@ let txn = self.txn_begin(&keys);
                     );
                 }
                 {
-                    let mut gr = first_row;
-                    let mut gg = 0;
-                    while gy(gr) < origin.y + avail.y && gg < 4000 {
-                        gg += 1;
+                    for &gr in &body_rows {
                         let y = gy(gr);
                         let h = rows.size(gr);
                         if h >= 1.0 && y + h > body_y {
@@ -28467,7 +28407,6 @@ let txn = self.txn_begin(&keys);
                                 grid_stroke,
                             );
                         }
-                        gr += 1;
                     }
                 }
                 for &(mr1, mc1, mr2, mc2) in vis_merges.iter() {
@@ -28487,7 +28426,8 @@ let txn = self.txn_begin(&keys);
                 }
                 // 顶部锚点在 first_row 之上（含跨越水平冻结线或半滚出上沿）的合并块补画
                 for &(mr1, mc1, mr2, mc2) in vis_merges.iter() {
-                    if mc1 < fx && mr1 < first_row && mr2 >= first_row {
+                    if mc1 < fx && mr2 >= first_row
+                        && (mr1 < first_row || rows.size(mr1) == 0.0 || cols.size(mc1) == 0.0) {
                         let mx = origin.x + head_w + cols.pos(mc1);
                         let my = gy(mr1);
                         let mw = (cols.pos(mc2 + 1) - cols.pos(mc1)).max(cols.size(mc1));
@@ -28515,14 +28455,11 @@ let txn = self.txn_begin(&keys);
                         }
                     }
                 }
-                let mut rr = first_row;
-                let mut g = 0;
-                while gy(rr) < origin.y + avail.y && g < 4000 {
-                    g += 1;
+                for &rr in &body_rows {
                     let y = gy(rr);
                     let h = rows.size(rr);
                     if h >= 1.0 && y + h > body_y {
-                        for cc in 0..fx {
+                        for &cc in &frozen_cols {
                             let mut rect = Rect::from_min_size(
                                 egui::pos2(origin.x + head_w + cols.pos(cc), y),
                                 Vec2::new(cols.size(cc), h),
@@ -28562,13 +28499,12 @@ let txn = self.txn_begin(&keys);
                             );
                         }
                     }
-                    rr += 1;
                 }
             }
             if fy > 0 && clip_top.width() > 0.0 && clip_top.height() > 0.0 {
                 let p2 = painter.with_clip_rect(clip_top);
                 p2.rect_filled(clip_top, 0.0, Color32::WHITE);
-                for rr in 0..=fy {
+                for rr in frozen_rows.iter().copied().chain(std::iter::once(fy)) {
                     let hy = origin.y + hh + rows.pos(rr);
                     p2.line_segment(
                         [egui::pos2(body_x, hy), egui::pos2(origin.x + avail.x, hy)],
@@ -28576,10 +28512,7 @@ let txn = self.txn_begin(&keys);
                     );
                 }
                 {
-                    let mut gc = first_col;
-                    let mut gg = 0;
-                    while gx(gc) < origin.x + avail.x && gg < 2000 {
-                        gg += 1;
+                    for &gc in &body_cols {
                         let x = gx(gc);
                         let w = cols.size(gc);
                         if w >= 1.0 && x + w > body_x {
@@ -28589,7 +28522,6 @@ let txn = self.txn_begin(&keys);
                                 grid_stroke,
                             );
                         }
-                        gc += 1;
                     }
                 }
                 for &(mr1, mc1, mr2, mc2) in vis_merges.iter() {
@@ -28609,7 +28541,8 @@ let txn = self.txn_begin(&keys);
                 }
                 // 左端锚点在 first_col 左侧（如从左上冻结角横跨竖向冻结线进入 C:E 列的标题合并格）补画右半段
                 for &(mr1, mc1, mr2, mc2) in vis_merges.iter() {
-                    if mr1 < fy && mc1 < first_col && mc2 >= first_col {
+                    if mr1 < fy && mc2 >= first_col
+                        && (mc1 < first_col || rows.size(mr1) == 0.0 || cols.size(mc1) == 0.0) {
                         let mx = gx(mc1);
                         let my = origin.y + hh + rows.pos(mr1);
                         let mw = (cols.pos(mc2 + 1) - cols.pos(mc1)).max(cols.size(mc1));
@@ -28637,14 +28570,11 @@ let txn = self.txn_begin(&keys);
                         }
                     }
                 }
-                let mut cc = first_col;
-                let mut g = 0;
-                while gx(cc) < origin.x + avail.x && g < 2000 {
-                    g += 1;
+                for &cc in &body_cols {
                     let x = gx(cc);
                     let w = cols.size(cc);
                     if w >= 1.0 && x + w > body_x {
-                        for rr in 0..fy {
+                        for &rr in &frozen_rows {
                             let mut rect = Rect::from_min_size(
                                 egui::pos2(x, origin.y + hh + rows.pos(rr)),
                                 Vec2::new(w, rows.size(rr)),
@@ -28677,21 +28607,20 @@ let txn = self.txn_begin(&keys);
                             );
                         }
                     }
-                    cc += 1;
                 }
             }
             if fx > 0 && fy > 0 && clip_corner.width() > 0.0 && clip_corner.height() > 0.0 {
                 let p3 = painter.with_clip_rect(clip_corner);
                 let p3_spill = painter.with_clip_rect(clip_corner_spill);
                 p3.rect_filled(clip_corner, 0.0, Color32::WHITE);
-                for rr in 0..=fy {
+                for rr in frozen_rows.iter().copied().chain(std::iter::once(fy)) {
                     let hy = origin.y + hh + rows.pos(rr);
                     p3.line_segment(
                         [egui::pos2(origin.x + head_w, hy), egui::pos2(body_x, hy)],
                         grid_stroke,
                     );
                 }
-                for cc in 0..=fx {
+                for cc in frozen_cols.iter().copied().chain(std::iter::once(fx)) {
                     let vx = origin.x + head_w + cols.pos(cc);
                     p3.line_segment(
                         [egui::pos2(vx, origin.y + hh), egui::pos2(vx, body_y)],
@@ -28705,16 +28634,18 @@ let txn = self.txn_begin(&keys);
                         let mw = cols.pos(mc2 + 1) - cols.pos(mc1);
                         let mh = rows.pos(mr2 + 1) - rows.pos(mr1);
                         if mw >= 1.0 && mh >= 1.0 {
-                            p3.rect_filled(
-                                Rect::from_min_size(egui::pos2(mx, my), Vec2::new(mw, mh)),
-                                0.0,
-                                Color32::WHITE,
-                            );
+                            let rect = Rect::from_min_size(egui::pos2(mx, my), Vec2::new(mw, mh));
+                            p3.rect_filled(rect, 0.0, Color32::WHITE);
+                            if rows.size(mr1) == 0.0 || cols.size(mc1) == 0.0 {
+                                let note = self.wb.sheet(si).notes.get(&sheetcore::model::CellRef::new(mr1, mc1));
+                                let target = if mc2 >= fx { &p3 } else { &p3_spill };
+                                self.paint_cell(target, rect, mr1, mc1, note, cf_map.get(&(mr1, mc1)), dumping, &mut dump);
+                            }
                         }
                     }
                 }
-                for rr in 0..fy {
-                    for cc in 0..fx {
+                for &rr in &frozen_rows {
+                    for &cc in &frozen_cols {
                         let mut rect = Rect::from_min_size(
                             egui::pos2(
                                 origin.x + head_w + cols.pos(cc),
@@ -29422,23 +29353,12 @@ let txn = self.txn_begin(&keys);
 
         // 圈释无效数据：红椭圆
         if self.circle_invalid && !self.invalid_cells.is_empty() {
-            let cells: Vec<(u32, u32)> = self
-                .invalid_cells
-                .range(..(fy, 0))
-                .chain(self.invalid_cells.range((fy.max(first_row), 0)..=(last_vis_r.max(fy.max(first_row)), u32::MAX)))
-                .copied()
-                .filter(|(r, c)| {
-                    let x = gx(*c);
-                    let y = gy(*r);
-                    x + cols.size(*c) > origin.x + head_w
-                        && y + rows.size(*r) > origin.y + hh
-                        && x < origin.x + avail.x
-                        && y < origin.y + avail.y
-                })
-                .collect();
+            let cells = frozen_rows.iter().chain(&body_rows).flat_map(|&r| {
+                frozen_cols.iter().chain(&body_cols).map(move |&c| (r, c))
+            }).filter(|rc| self.invalid_cells.contains(rc));
             for (r, c) in cells {
                 let rect = Rect::from_min_size(
-                    egui::pos2(gx(c) + 1.0, gy(r) + 1.0),
+                    egui::pos2(px_of(c) + 1.0, py_of(r) + 1.0),
                     Vec2::new(cols.size(c) - 2.0, rows.size(r) - 2.0),
                 );
                 let center = rect.center();

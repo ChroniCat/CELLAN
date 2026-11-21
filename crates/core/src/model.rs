@@ -449,8 +449,13 @@ impl Sheet {
     /// Install only the fields written by formula evaluation. UI metadata and
     /// save receipts belong to the live sheet even if calculation was in flight.
     pub fn take_calculation(&mut self, result: &mut Sheet) {
-        std::mem::swap(&mut self.cells, &mut result.cells);
-        std::mem::swap(&mut self.cleared, &mut result.cleared);
+        if self.cell_version() != result.cell_version() {
+            // Evaluation can remove old spill cells. Their deletion journal
+            // belongs to the new cell version. For an unchanged version, the
+            // live journal may already have been acknowledged by a save.
+            std::mem::swap(&mut self.cells, &mut result.cells);
+            std::mem::swap(&mut self.cleared, &mut result.cleared);
+        }
         std::mem::swap(&mut self.spilled, &mut result.spilled);
         std::mem::swap(&mut self.spill_shapes, &mut result.spill_shapes);
     }

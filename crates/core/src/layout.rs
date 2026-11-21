@@ -62,8 +62,8 @@ pub struct Axis {
     revision: u64,
     default: f32,
     sizes: BTreeMap<u32, f32>,
-    /// 与 sizes 同序的累计偏移：(索引, 该索引之前的额外偏移)
-    prefix: Vec<(u32, f32)>,
+    /// 自定义项的索引和结束位置。连续隐藏项的结束位置完全相同，可二分跳过。
+    prefix: Vec<(u32, f64)>,
 }
 
 impl Default for Axis {
@@ -106,31 +106,57 @@ impl Axis {
         self.revision = layout_revision();
         self.prefix.clear();
         self.prefix.reserve(self.sizes.len());
-        let mut extra = 0.0;
-        for (i, w) in self.sizes.iter() {
-            extra += *w - self.default;
-            self.prefix.push((*i, extra));
+        let mut next = 0u64;
+        let mut end = 0.0;
+        for (&i, &size) in &self.sizes {
+            end += (u64::from(i) - next) as f64 * f64::from(self.default) + f64::from(size);
+            self.prefix.push((i, end));
+            next = u64::from(i) + 1;
         }
     }
 
     /// 第 i 项的起点（相对内容原点）
     #[inline]
     pub fn pos(&self, i: u32) -> f32 {
-        i as f32 * self.default + self.extra_before(i)
+        self.start_position(i) as f32
     }
 
     #[inline]
-    fn extra_before(&self, i: u32) -> f32 {
-        if self.prefix.is_empty() {
-            return 0.0;
+    fn start_position(&self, i: u32) -> f64 {
+        let preceding = self.prefix.partition_point(|&(idx, _)| idx < i);
+        match self.prefix[..preceding].last() {
+            Some(&(idx, end)) => end + f64::from(i - idx - 1) * f64::from(self.default),
+            None => f64::from(i) * f64::from(self.default),
         }
-        // 找最后一个 < i 的自定义项；prefix 直接保存「含该项在内的累计额外偏移」，省掉二次 BTreeMap 查找
-        let idx = self.prefix.partition_point(|(k, _)| *k < i);
-        if idx == 0 {
-            0.0
+    }
+
+    /// 从 i（含）直达第一个有尺寸的行/列。跳过整段隐藏项只需一次二分。
+    pub fn next_visible(&self, i: u32) -> Option<u32> {
+        if self.size(i) > 0.0 {
+            return Some(i);
+        }
+        let start = self.start_position(i);
+        let after = self.prefix.partition_point(|&(_, end)| end <= start);
+        if self.default > 0.0 {
+            self.prefix[..after].last()?.0.checked_add(1)
         } else {
-            self.prefix[idx - 1].1
+            self.prefix.get(after).map(|&(idx, _)| idx)
         }
+    }
+
+    pub fn visible_indices(&self, range: std::ops::Range<u32>) -> impl Iterator<Item = u32> + '_ {
+        let mut next = range.start;
+        std::iter::from_fn(move || {
+            if next >= range.end {
+                return None;
+            }
+            let i = self.next_visible(next)?;
+            if i >= range.end {
+                return None;
+            }
+            next = i + 1;
+            Some(i)
+        })
     }
 
     pub fn size(&self, i: u32) -> f32 {
@@ -140,13 +166,17 @@ impl Axis {
     /// 像素位置落在哪一项（用于点击命中、滚动定位）
     pub fn index_at(&self, px: f32) -> u32 {
         if px <= 0.0 {
-            return 0;
+            return self.next_visible(0).unwrap_or(0);
         }
         // pos() 单调递增，二分即可；上界按「全默认」估计再加自定义项数
-        let mut hi = (px / self.default).ceil() as u32 + self.sizes.len() as u32 + 2;
+        let mut hi = if self.default > 0.0 {
+            ((px / self.default).ceil() as u32).saturating_add(self.sizes.len() as u32).saturating_add(2)
+        } else {
+            self.prefix.last().map_or(0, |&(idx, _)| idx)
+        };
         let mut lo = 0u32;
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = lo + (hi - lo).div_ceil(2);
             if self.pos(mid) <= px {
                 lo = mid;
             } else {
@@ -278,6 +308,31 @@ mod tests {
         a.set(2, 100.0);
         assert_eq!(a.len(), 0);
         assert_eq!(a.pos(3), 300.0);
+    }
+
+    #[test]
+    fn viewport_skips_twenty_thousand_hidden_rows_at_fractional_zoom() {
+        let mut axis = Axis::new(18.0);
+        axis.hide_many(2..20_002);
+        axis.set(20_003, 30.0);
+        let axis = axis.scaled(0.73);
+        let edge = axis.pos(2);
+        assert_eq!(axis.pos(20_002), edge);
+        assert_eq!(axis.index_at(edge), 20_002);
+        assert_eq!(axis.index_at(edge - 0.05), 1);
+        assert_eq!(axis.next_visible(2), Some(20_002));
+        assert_eq!(axis.next_visible(19_999), Some(20_002));
+        assert_eq!(axis.visible_indices(1..20_005).collect::<Vec<_>>(), [1, 20_002, 20_003, 20_004]);
+        assert_eq!(axis.visible_indices(2..19_999).next(), None);
+    }
+
+    #[test]
+    fn visible_indices_on_hidden_default_axis_find_only_sized_entries() {
+        let mut axis = Axis::new(0.0);
+        axis.set(20_000, 18.0);
+        axis.set(20_004, 18.0);
+        assert_eq!(axis.index_at(0.0), 20_000);
+        assert_eq!(axis.visible_indices(0..30_000).collect::<Vec<_>>(), [20_000, 20_004]);
     }
 
     #[test]

@@ -870,6 +870,61 @@ fn run_grid_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Eve
 }
 
 #[test]
+fn filtered_grid_paints_first_screen_across_hidden_runs_with_frozen_panes_and_cf() {
+    use sheetcore::cf::{CfBlock, CfKind, CfRule, Dxf};
+    let _env = crate::test_env::TestEnv::new("filtered-grid-paint");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.set_zoom(0.73);
+    let sh = app.wb.sheet_mut(0);
+    sh.freeze = Some((1, 1));
+    sh.hidden_rows.extend(2..20_002);
+    sh.hidden_cols.extend(2..9_000);
+    for (r, c, label) in [
+        (0, 0, "!COR"), (0, 9_000, "!TOP"), (20_002, 0, "!LEFT"),
+        (20_002, 9_000, "!BODY"), (333, 9_000, "!ALT"), (20_003, 8_999, "!MERGE"),
+    ] {
+        sh.set(r, c, text(label));
+    }
+    sh.merges.push((20_003, 8_999, 20_003, 9_000));
+    sh.cf.dxfs.push(Dxf { bold: true, ..Default::default() });
+    sh.cf.blocks.push(CfBlock {
+        ranges: vec![(0, 8_999, 20_003, 9_000)],
+        rules: vec![CfRule {
+            kind: CfKind::Text { contains: "!".into(), dxf: 0 }, priority: 1, stop: false,
+        }],
+    });
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 280.0))),
+        ..Default::default()
+    };
+    let paint = |app: &mut SheetApp| {
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE)
+                .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+        });
+        let shapes: Vec<_> = output.shapes.into_iter().map(|clipped| clipped.shape).collect();
+        collect_texts(&shapes).into_iter().map(|(s, _)| s).collect::<Vec<_>>()
+    };
+    let labels = paint(&mut app);
+    for expected in ["!COR", "!TOP", "!LEFT", "!BODY", "!MERGE", "20003"] {
+        assert!(labels.iter().any(|s| s == expected), "首屏缺少 {expected}");
+    }
+    let overlays = &app.cf_cache.as_ref().unwrap().1;
+    assert!(overlays.contains_key(&(20_002, 9_000)));
+    assert!(overlays.contains_key(&(20_003, 8_999)));
+    assert!(!overlays.contains_key(&(333, 9_000)));
+    let sh = app.wb.sheet_mut(0);
+    sh.hidden_rows.remove(&333);
+    sh.hidden_rows.insert(20_002);
+    let labels = paint(&mut app);
+    assert!(labels.iter().any(|s| s == "!ALT"));
+    let overlays = &app.cf_cache.as_ref().unwrap().1;
+    assert!(overlays.contains_key(&(333, 9_000)));
+    assert!(!overlays.contains_key(&(20_002, 9_000)));
+}
+
+#[test]
 fn dragging_the_column_header_border_resizes_the_column() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
