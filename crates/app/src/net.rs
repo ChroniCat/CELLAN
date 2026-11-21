@@ -71,6 +71,21 @@ pub enum NetEvent {
     SaveRequested { site: u32, name: String },
     /// 宿主已完成原文件保存，通知在线成员清除脏状态
     Saved { clock: u64 },
+    /// 房间内有成员持有经过官方公钥校验的新版本可执行文件
+    PeerUpdateOffer {
+        peer_site: u32,
+        peer_name: String,
+        manifest: crate::update::SignedManifest,
+    },
+    /// 正在从协作成员拉取新版进度
+    PeerUpdateProgress { received: u64, total: u64 },
+    /// 协作成员传来的新版安装包已完成 SHA-256 与官方签名双重核验
+    PeerUpdateReady {
+        version: String,
+        verified_exe: std::path::PathBuf,
+    },
+    /// 协作接力更新中断或校验未通过
+    PeerUpdateFailed(String),
     Disconnected(String),
     Denied(String),
     Error(String),
@@ -79,6 +94,7 @@ pub enum NetEvent {
 enum Cmd {
     Broadcast(String),
     Cells(Vec<Op>),
+    SendTo(u32, String),
     Stop,
 }
 
@@ -257,6 +273,217 @@ impl RoomRoster {
     fn all_senders(&self) -> Vec<Sender<String>> {
         self.peers.values().cloned().collect()
     }
+
+    fn sender_of(&self, site: u32) -> Option<Sender<String>> {
+        self.peers.get(&site).cloned()
+    }
+}
+
+struct ActivePeerDownload {
+    peer_site: u32,
+    manifest: crate::update::SignedManifest,
+    file: std::fs::File,
+    part_path: std::path::PathBuf,
+    written: u64,
+    last_pct: u64,
+}
+
+type SharedUpdateSeed =
+    Arc<Mutex<Option<(std::path::PathBuf, crate::update::SignedManifest)>>>;
+
+fn resolve_local_seed(
+    override_seed: &SharedUpdateSeed,
+) -> Option<(std::path::PathBuf, crate::update::SignedManifest)> {
+    if let Ok(g) = override_seed.lock() {
+        if let Some(pair) = g.clone() {
+            return Some(pair);
+        }
+    }
+    crate::update::local_signed_bundle()
+}
+
+const UPDATE_SLICE_RAW_BYTES: usize = 192 * 1024;
+
+fn spawn_peer_update_stream(
+    my_site: u32,
+    to_site: u32,
+    req_version: String,
+    seed_override: SharedUpdateSeed,
+    serving_guard: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    send_frame: impl Fn(String) -> bool + Send + 'static,
+) {
+    if serving_guard
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _g = Guard(serving_guard);
+
+        let Some((exe_path, manifest)) = resolve_local_seed(&seed_override) else {
+            return;
+        };
+        if manifest.version != req_version || !crate::update::verify_manifest_sig(&manifest) {
+            return;
+        }
+        let Ok(mut f) = std::fs::File::open(&exe_path) else {
+            return;
+        };
+        let Ok(md) = f.metadata() else {
+            return;
+        };
+        let total = md.len();
+        if total == 0 || total > 256 * 1024 * 1024 {
+            return;
+        }
+        let mut buf = vec![0u8; UPDATE_SLICE_RAW_BYTES];
+        let mut offset = 0u64;
+        while alive.load(Ordering::Acquire) {
+            let n = match std::io::Read::read(&mut f, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let next_off = offset + n as u64;
+            let done = next_off >= total;
+            let msg = Msg::UpdateSlice {
+                from_site: my_site,
+                to_site,
+                version: manifest.version.clone(),
+                offset,
+                total,
+                data_b64: sheetcore::wire::b64_encode(&buf[..n]),
+                done,
+            };
+            let Ok(json) = serde_json::to_string(&msg) else {
+                break;
+            };
+            if !send_frame(json) {
+                break;
+            }
+            offset = next_off;
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+}
+
+fn accept_incoming_update_slice(
+    dl_slot: &Arc<Mutex<Option<ActivePeerDownload>>>,
+    evt_tx: &EvtTx,
+    from_site: u32,
+    version: &str,
+    offset: u64,
+    total: u64,
+    data_b64: &str,
+    done: bool,
+) {
+    let Some(chunk) = sheetcore::wire::b64_decode(data_b64) else {
+        let mut g = dl_slot.lock().unwrap();
+        if let Some(dl) = g.take() {
+            let _ = std::fs::remove_file(&dl.part_path);
+            let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新分片解码失败".into()));
+        }
+        return;
+    };
+
+    let finished = {
+        let mut g = dl_slot.lock().unwrap();
+        let Some(dl) = g.as_mut() else {
+            return;
+        };
+        if dl.peer_site != from_site || dl.manifest.version != version {
+            return;
+        }
+        if offset != dl.written
+            || total < dl.manifest.size
+            || total > 256 * 1024 * 1024 + 16_384
+            || dl.written.saturating_add(chunk.len() as u64) > total
+        {
+            let bad = g.take().unwrap();
+            drop(bad.file);
+            let _ = std::fs::remove_file(&bad.part_path);
+            let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新数据偏移或大小异常".into()));
+            return;
+        }
+        if dl.file.write_all(&chunk).is_err() {
+            let bad = g.take().unwrap();
+            drop(bad.file);
+            let _ = std::fs::remove_file(&bad.part_path);
+            let _ = evt_tx.send(NetEvent::PeerUpdateFailed("写入本地更新缓存失败".into()));
+            return;
+        }
+        dl.written += chunk.len() as u64;
+        let pct = (dl.written.saturating_mul(100)) / total.max(1);
+        if done || pct >= dl.last_pct.saturating_add(2) {
+            dl.last_pct = pct;
+            let _ = evt_tx.send(NetEvent::PeerUpdateProgress {
+                received: dl.written,
+                total,
+            });
+        }
+        if done {
+            if dl.written != total {
+                let bad = g.take().unwrap();
+                drop(bad.file);
+                let _ = std::fs::remove_file(&bad.part_path);
+                let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新包未完整接收".into()));
+                return;
+            }
+            g.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(mut completed) = finished {
+        let _ = completed.file.flush();
+        drop(completed.file);
+        let evt_tx = evt_tx.clone();
+        std::thread::spawn(move || {
+            match crate::update::verify_and_finalize_staged_exe(
+                &completed.part_path,
+                &completed.manifest,
+            ) {
+                Ok(()) => {
+                    let verified_path = crate::update::staging_file_path(
+                        &completed.manifest.version,
+                        "peer.verified.exe",
+                    )
+                    .unwrap_or_else(|_| completed.part_path.with_extension("verified.exe"));
+                    let _ = std::fs::remove_file(&verified_path);
+                    match std::fs::rename(&completed.part_path, &verified_path) {
+                        Ok(()) => {
+                            let _ = evt_tx.send(NetEvent::PeerUpdateReady {
+                                version: completed.manifest.version,
+                                verified_exe: verified_path,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&completed.part_path);
+                            let _ = evt_tx.send(NetEvent::PeerUpdateFailed(format!(
+                                "保存已验证更新包失败：{e}"
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&completed.part_path);
+                    let _ = evt_tx.send(NetEvent::PeerUpdateFailed(e));
+                }
+            }
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -313,6 +540,8 @@ pub struct Net {
         Option<Arc<Mutex<std::collections::HashMap<(usize, u32, u32), sheetcore::style::CellStyle>>>>,
     delta_merges: Option<Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
+    peer_update_dl: Arc<Mutex<Option<ActivePeerDownload>>>,
+    update_seed_override: SharedUpdateSeed,
     evt_tx: EvtTx,
     t0: std::time::Instant,
 }
@@ -944,6 +1173,101 @@ impl Net {
         let _ = self.evt_tx.send(NetEvent::PeerRenamed(self.site, canonical));
     }
 
+    /// 向房间成员宣告本机持有经过官方数字签名的版本（若本机为正式签名包）
+    pub fn announce_local_signed_update(&self) {
+        let Some((_, manifest)) = resolve_local_seed(&self.update_seed_override) else {
+            return;
+        };
+        self.announce_update(&manifest);
+    }
+
+    /// 向指定新加入成员单播本机的签名版本宣告（宿主在新成员入房后调用）
+    pub fn announce_local_signed_update_to(&self, target_site: u32) {
+        let Some((_, manifest)) = resolve_local_seed(&self.update_seed_override) else {
+            return;
+        };
+        let msg = Msg::UpdateAnnounce {
+            site: self.site,
+            version: manifest.version,
+            size: manifest.size,
+            sha256: manifest.sha256,
+            sig: manifest.sig,
+            notes: manifest.notes,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::SendTo(target_site, s));
+        }
+    }
+
+    pub fn announce_update(&self, manifest: &crate::update::SignedManifest) {
+        if !crate::update::verify_manifest_sig(manifest) {
+            return;
+        }
+        let msg = Msg::UpdateAnnounce {
+            site: self.site,
+            version: manifest.version.clone(),
+            size: manifest.size,
+            sha256: manifest.sha256.clone(),
+            sig: manifest.sig.clone(),
+            notes: manifest.notes.clone(),
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
+    /// 向房间中持有新版签名包的成员发起拉取请求（无需对方额外监听新端口，不触发防火墙弹窗）
+    pub fn request_peer_update(
+        &self,
+        peer_site: u32,
+        manifest: &crate::update::SignedManifest,
+    ) -> Result<(), String> {
+        if peer_site == 0 || peer_site == self.site {
+            return Err("无效的协作更新节点".into());
+        }
+        if !crate::update::verify_manifest_sig(manifest) {
+            return Err("更新清单签名无效，已拒绝请求".into());
+        }
+        let part_path = crate::update::staging_file_path(&manifest.version, "peer.part")
+            .map_err(|e| format!("无法创建更新缓存目录：{e}"))?;
+        let _ = std::fs::remove_file(&part_path);
+        let file = std::fs::File::create(&part_path)
+            .map_err(|e| format!("无法创建临时更新文件：{e}"))?;
+        {
+            let mut g = self.peer_update_dl.lock().unwrap();
+            if let Some(prev) = g.take() {
+                drop(prev.file);
+                let _ = std::fs::remove_file(&prev.part_path);
+            }
+            *g = Some(ActivePeerDownload {
+                peer_site,
+                manifest: manifest.clone(),
+                file,
+                part_path,
+                written: 0,
+                last_pct: 0,
+            });
+        }
+        let req = Msg::UpdatePull {
+            from_site: self.site,
+            to_site: peer_site,
+            version: manifest.version.clone(),
+        };
+        let s = serde_json::to_string(&req).map_err(|e| format!("序列化更新请求失败：{e}"))?;
+        self.cmd
+            .send(Cmd::SendTo(peer_site, s))
+            .map_err(|_| "协作连接已关闭".to_string())
+    }
+
+    #[cfg(test)]
+    pub fn set_update_bundle_for_test(
+        &self,
+        exe_path: std::path::PathBuf,
+        manifest: crate::update::SignedManifest,
+    ) {
+        *self.update_seed_override.lock().unwrap() = Some((exe_path, manifest));
+    }
+
     pub fn shutdown(&self) {
         if !self.alive.swap(false, Ordering::SeqCst) {
             return;
@@ -1100,7 +1424,7 @@ pub fn host_on_with_session(
     let delta_ops: Arc<Mutex<HashMap<(usize, u32, u32), Op>>> = Arc::new(Mutex::new(HashMap::new()));
     let host_base_hash: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
-    // 广播分发
+    // 广播与定向单播分发
     {
         let roster = roster.clone();
         let alive = alive.clone();
@@ -1122,6 +1446,12 @@ pub fn host_on_with_session(
                         let senders = roster.lock().unwrap().all_senders();
                         for tx in senders {
                             let _ = tx.send(s.clone());
+                        }
+                    }
+                    Cmd::SendTo(target_site, s) => {
+                        let target = roster.lock().unwrap().sender_of(target_site);
+                        if let Some(tx) = target {
+                            let _ = tx.send(s);
                         }
                     }
                     Cmd::Stop => break,
@@ -1187,6 +1517,13 @@ pub fn host_on_with_session(
         });
     }
 
+    let host_update_dl: Arc<Mutex<Option<ActivePeerDownload>>> = Arc::new(Mutex::new(None));
+    let host_update_dl_for_self = host_update_dl.clone();
+    let host_seed_override: SharedUpdateSeed = Arc::new(Mutex::new(None));
+    let host_seed_override_for_self = host_seed_override.clone();
+    let host_serving_update = Arc::new(AtomicBool::new(false));
+    let host_site_id = site;
+
     // accept 循环
     {
         let sockets = sockets.clone();
@@ -1204,6 +1541,9 @@ pub fn host_on_with_session(
         let delta_styles_outer = delta_styles.clone();
         let delta_merges_outer = delta_merges.clone();
         let structs_outer = structs.clone();
+        let update_dl_outer = host_update_dl.clone();
+        let seed_override_outer = host_seed_override.clone();
+        let serving_update_outer = host_serving_update.clone();
         let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1239,6 +1579,10 @@ pub fn host_on_with_session(
                 let delta_styles = delta_styles_outer.clone();
                 let delta_merges = delta_merges_outer.clone();
                 let structs = structs_outer.clone();
+                let update_dl = update_dl_outer.clone();
+                let seed_override = seed_override_outer.clone();
+                let serving_update = serving_update_outer.clone();
+                let alive_conn = alive.clone();
                 let now_ms = now_ms_outer;
                 std::thread::spawn(move || {
                     let _slot = slot;
@@ -1887,6 +2231,127 @@ pub fn host_on_with_session(
                                     name: who,
                                 });
                             }
+                            Msg::UpdateAnnounce {
+                                site: ann_site,
+                                version,
+                                size,
+                                sha256,
+                                sig,
+                                notes,
+                            } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if ann_site != conn_site {
+                                    continue;
+                                }
+                                let manifest = crate::update::SignedManifest {
+                                    version: version.clone(),
+                                    exe: "CELLAN.exe".into(),
+                                    size,
+                                    sha256: sha256.clone(),
+                                    sig: sig.clone(),
+                                    notes: notes.clone(),
+                                };
+                                // 宿主先做官方公钥验签：伪造签名直接丢弃，既不提示自己也不转发给其他成员
+                                if !crate::update::verify_manifest_sig(&manifest) {
+                                    continue;
+                                }
+                                let (who, others) = {
+                                    let r = roster.lock().unwrap();
+                                    (r.name_of(conn_site), r.other_senders(Some(conn_site)))
+                                };
+                                let fwd = serde_json::to_string(&Msg::UpdateAnnounce {
+                                    site: conn_site,
+                                    version,
+                                    size,
+                                    sha256,
+                                    sig,
+                                    notes,
+                                })
+                                .unwrap();
+                                for ptx in others {
+                                    let _ = ptx.send(fwd.clone());
+                                }
+                                if crate::update::is_newer(&manifest.version, crate::update::VERSION)
+                                {
+                                    let _ = evt_tx.send(NetEvent::PeerUpdateOffer {
+                                        peer_site: conn_site,
+                                        peer_name: who,
+                                        manifest,
+                                    });
+                                }
+                            }
+                            Msg::UpdatePull {
+                                from_site,
+                                to_site,
+                                version,
+                            } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if from_site != conn_site || to_site == conn_site {
+                                    continue;
+                                }
+                                if to_site == host_site_id {
+                                    let peer_tx = tx.clone();
+                                    spawn_peer_update_stream(
+                                        host_site_id,
+                                        conn_site,
+                                        version,
+                                        seed_override.clone(),
+                                        serving_update.clone(),
+                                        alive_conn.clone(),
+                                        move |json| peer_tx.send(json).is_ok(),
+                                    );
+                                } else if let Some(target_tx) =
+                                    roster.lock().unwrap().sender_of(to_site)
+                                {
+                                    if let Ok(fwd) = serde_json::to_string(&Msg::UpdatePull {
+                                        from_site: conn_site,
+                                        to_site,
+                                        version,
+                                    }) {
+                                        let _ = target_tx.send(fwd);
+                                    }
+                                }
+                            }
+                            Msg::UpdateSlice {
+                                from_site,
+                                to_site,
+                                version,
+                                offset,
+                                total,
+                                data_b64,
+                                done,
+                            } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if from_site != conn_site || to_site == conn_site {
+                                    continue;
+                                }
+                                if to_site == host_site_id {
+                                    accept_incoming_update_slice(
+                                        &update_dl,
+                                        &evt_tx,
+                                        conn_site,
+                                        &version,
+                                        offset,
+                                        total,
+                                        &data_b64,
+                                        done,
+                                    );
+                                } else if let Some(target_tx) =
+                                    roster.lock().unwrap().sender_of(to_site)
+                                {
+                                    if let Ok(fwd) = serde_json::to_string(&Msg::UpdateSlice {
+                                        from_site: conn_site,
+                                        to_site,
+                                        version,
+                                        offset,
+                                        total,
+                                        data_b64,
+                                        done,
+                                    }) {
+                                        let _ = target_tx.send(fwd);
+                                    }
+                                }
+                            }
                             Msg::Bye { site } => {
                                 let Some(conn_site) = hello_site else { break };
                                 if site == conn_site {
@@ -1953,6 +2418,8 @@ pub fn host_on_with_session(
         delta_styles: Some(delta_styles_for_self),
         delta_merges: Some(delta_merges_for_self),
         host_structs: Some(structs_for_self),
+        peer_update_dl: host_update_dl_for_self,
+        update_seed_override: host_seed_override_for_self,
         evt_tx: evt_tx_self,
         t0,
     })
@@ -2139,6 +2606,12 @@ fn join_session(
     let send_sess: Arc<Mutex<Option<(sheetcore::wire::Session, bool)>>> = Arc::new(Mutex::new(None));
     // 本客户端实例专属重连凭据：断线重连可继续沿用自身 site，其他客户端不能冒领该 site
     let client_auth = crate::session_lock::new_session_id();
+    let client_update_dl: Arc<Mutex<Option<ActivePeerDownload>>> = Arc::new(Mutex::new(None));
+    let client_update_dl_for_net = client_update_dl.clone();
+    let client_seed_override: SharedUpdateSeed = Arc::new(Mutex::new(None));
+    let client_seed_override_for_net = client_seed_override.clone();
+    let client_serving_update = Arc::new(AtomicBool::new(false));
+    let cmd_tx_for_stream = cmd_tx.clone();
 
     // 写线程
     {
@@ -2157,7 +2630,7 @@ fn join_session(
                             cell_frames(ops, true, *batch, |line| { let _ = write_line(w, &se.seal(&line)); });
                         }
                     }
-                    Cmd::Broadcast(s) => {
+                    Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
                         let mut session = send_sess.lock().unwrap();
                         if let (Some((se, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
                             let _ = write_line(w, &se.seal(&s));
@@ -2400,6 +2873,77 @@ fn join_session(
                         Msg::Rename { site: s, name: n } => {
                             let _ = evt_tx.send(NetEvent::PeerRenamed(s, n));
                         }
+                        Msg::UpdateAnnounce {
+                            site: peer_site,
+                            version,
+                            size,
+                            sha256,
+                            sig,
+                            notes,
+                        } => {
+                            if peer_site != site {
+                                let manifest = crate::update::SignedManifest {
+                                    version,
+                                    exe: "CELLAN.exe".into(),
+                                    size,
+                                    sha256,
+                                    sig,
+                                    notes,
+                                };
+                                if crate::update::verify_manifest_sig(&manifest)
+                                    && crate::update::is_newer(
+                                        &manifest.version,
+                                        crate::update::VERSION,
+                                    )
+                                {
+                                    let _ = evt_tx.send(NetEvent::PeerUpdateOffer {
+                                        peer_site,
+                                        peer_name: String::new(),
+                                        manifest,
+                                    });
+                                }
+                            }
+                        }
+                        Msg::UpdatePull {
+                            from_site,
+                            to_site,
+                            version,
+                        } => {
+                            if to_site == site && from_site != site {
+                                let out_tx = cmd_tx_for_stream.clone();
+                                spawn_peer_update_stream(
+                                    site,
+                                    from_site,
+                                    version,
+                                    client_seed_override.clone(),
+                                    client_serving_update.clone(),
+                                    alive.clone(),
+                                    move |json| out_tx.send(Cmd::SendTo(from_site, json)).is_ok(),
+                                );
+                            }
+                        }
+                        Msg::UpdateSlice {
+                            from_site,
+                            to_site,
+                            version,
+                            offset,
+                            total,
+                            data_b64,
+                            done,
+                        } => {
+                            if to_site == site && from_site != site {
+                                accept_incoming_update_slice(
+                                    &client_update_dl,
+                                    &evt_tx,
+                                    from_site,
+                                    &version,
+                                    offset,
+                                    total,
+                                    &data_b64,
+                                    done,
+                                );
+                            }
+                        }
                         Msg::Bye { site: s } => {
                             let _ = evt_tx.send(NetEvent::PeerLeft(s));
                         }
@@ -2451,6 +2995,8 @@ fn join_session(
         delta_styles: None,
         delta_merges: None,
         host_structs: None,
+        peer_update_dl: client_update_dl_for_net,
+        update_seed_override: client_seed_override_for_net,
         evt_tx: evt_tx_clone,
         t0: std::time::Instant::now(),
     })
@@ -3141,5 +3687,92 @@ mod integrity_tests {
             wait_event(&host, 3000, |e| matches!(e, NetEvent::Ops(v) if v.iter().any(|o| o.value == ValueWire::Number(250.0)))).is_some(),
             "持锁人自身写入必须成功生效"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collab_peer_relay_transfers_signed_update_across_multiple_slices_and_blocks_forged_sig() {
+        let env = crate::test_env::TestEnv::new("collab-peer-update");
+        let official_kp = crate::update::cng::TestKeyPair::generate();
+        let forged_kp = crate::update::cng::TestKeyPair::generate();
+        env.sc("SC_UPDATE_PUBKEY", &official_kp.pubkey_hex);
+
+        // 构造跨越多个 192KB 分片的测试安装包（~420 KB）验证流式重组与尾部完整性校验
+        let raw_exe: Vec<u8> = (0..(420 * 1024)).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+        let (manifest, full_exe) = crate::update::make_test_signed_release(
+            &official_kp,
+            "99.2",
+            &raw_exe,
+            "协作无感接力更新",
+        );
+        let seed_exe = env.path("seed-CELLAN.exe");
+        std::fs::write(&seed_exe, &full_exe).unwrap();
+
+        let (host, port) = host_for_test(1, "宿主旧版", "budget.xlsx", "pw");
+        let client_new = join(
+            2,
+            "已升级成员".into(),
+            "budget.xlsx".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+        let client_old = join(
+            3,
+            "待升级成员".into(),
+            "budget.xlsx".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+
+        assert!(wait_event(&client_new, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        assert!(wait_event(&client_old, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+
+        // 伪造签名的通告必须被宿主静默拦截，不会产生任何 PeerUpdateOffer
+        let (evil_manifest, _) =
+            crate::update::make_test_signed_release(&forged_kp, "99.9", b"fake", "evil");
+        let forged_wire = serde_json::to_string(&Msg::UpdateAnnounce {
+            site: 2,
+            version: evil_manifest.version,
+            size: evil_manifest.size,
+            sha256: evil_manifest.sha256,
+            sig: evil_manifest.sig,
+            notes: evil_manifest.notes,
+        })
+        .unwrap();
+        let _ = client_new.cmd.send(Cmd::Broadcast(forged_wire));
+
+        // 合法签名的新版成员（site=2）宣告更新 → 宿主（site=1）与另一旧版客户端（site=3）均收到通告
+        client_new.set_update_bundle_for_test(seed_exe.clone(), manifest.clone());
+        client_new.announce_local_signed_update();
+
+        let host_offer = wait_event(&host, 5000, |e| {
+            matches!(e, NetEvent::PeerUpdateOffer { peer_site: 2, manifest: m, .. } if m.version == "99.2")
+        });
+        assert!(host_offer.is_some(), "宿主应收到合法签名的 99.2 更新通告");
+
+        let peer_offer = wait_event(&client_old, 5000, |e| {
+            matches!(e, NetEvent::PeerUpdateOffer { peer_site: 2, manifest: m, .. } if m.version == "99.2")
+        });
+        assert!(peer_offer.is_some(), "同房间的旧版客户端也应经宿主转发收到 99.2 更新通告");
+
+        // 客户端 3 经宿主路由从客户端 2 拉取完整签名包并完成双重校验
+        client_old.request_peer_update(2, &manifest).unwrap();
+        let ready = wait_event(&client_old, 8000, |e| {
+            matches!(e, NetEvent::PeerUpdateReady { .. } | NetEvent::PeerUpdateFailed(_))
+        })
+        .expect("应在时限内收到更新完成事件");
+        match ready {
+            NetEvent::PeerUpdateReady {
+                version,
+                verified_exe,
+            } => {
+                assert_eq!(version, "99.2");
+                assert_eq!(std::fs::read(&verified_exe).unwrap(), full_exe);
+                assert!(crate::update::inspect_signed_exe(&verified_exe).is_some());
+            }
+            other => panic!("预期 PeerUpdateReady，实际收到：{other:?}"),
+        }
     }
 }

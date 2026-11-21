@@ -4,7 +4,9 @@
 
 # Keep legacy local distribution keys out of source control
 /.cellan-ai-key.local
+/.cellan-release*
 *.local.key
+*.blob
 
 # Local workbooks, generated test data, logs, and backups
 /work/
