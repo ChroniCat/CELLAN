@@ -290,16 +290,16 @@ pub const HOVER: Color32 = Color32::from_rgb(239, 243, 249);
 pub const PRESSED: Color32 = Color32::from_rgb(228, 234, 243);
 pub const STATUS_BG: Color32 = Color32::from_rgb(245, 247, 250);
 
-/// 标题栏（自绘，含快速访问工具栏和窗口按钮）
-pub const TITLE_H: f32 = 46.0;
+/// 标题栏（自绘，含文档标签与窗口按钮）
+pub const TITLE_H: f32 = 38.0;
 /// 页签行（直接铺在 PAGE_BG 上）
-pub const TAB_H: f32 = 28.0;
+pub const TAB_H: f32 = 30.0;
 /// 功能区纯白悬浮卡片高度（含顶部 6px 与底部 8px 呼吸留白，杜绝组名贴底边）
 pub const RIBBON_BODY_H: f32 = 110.0;
 /// 功能区总高
 pub const RIBBON_H: f32 = TAB_H + RIBBON_BODY_H;
 /// 编辑栏（名称框 + fx + 输入行）
-pub const FX_H: f32 = 42.0;
+pub const FX_H: f32 = 34.0;
 /// 命令区高度：大按钮 76 高
 pub const GROUP_BODY_H: f32 = 76.0;
 /// 分组名行高（居中绘制，下方仍留 8px 卡片呼吸边距）
@@ -307,11 +307,17 @@ pub const GROUP_LABEL_H: f32 = 16.0;
 
 thread_local! {
     static GROUP_FIRST: Cell<bool> = const { Cell::new(true) };
+    static GROUP_PAD: Cell<f32> = const { Cell::new(8.0) };
 }
 
 /// 每组 ribbon 内容开始前调用：第一组不画左侧分隔线
 pub fn reset_groups() {
     GROUP_FIRST.with(|c| c.set(true));
+}
+
+/// 设置当前功能区每组左右内边距
+pub fn set_group_pad(pad: f32) {
+    GROUP_PAD.with(|c| c.set(pad));
 }
 
 pub fn accent(_v: &egui::Visuals) -> Color32 {
@@ -389,6 +395,7 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.widgets.open = v.widgets.active;
         v.selection.bg_fill = Color32::from_rgb(204, 228, 215);
         v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.text_cursor.stroke = Stroke::new(1.25, TEXT);
         v.hyperlink_color = Color32::from_rgb(5, 99, 193);
         v
     };
@@ -415,6 +422,7 @@ pub fn apply_theme(ctx: &egui::Context) {
         v.widgets.open = v.widgets.active;
         v.selection.bg_fill = Color32::from_rgb(45, 74, 112);
         v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
+        v.text_cursor.stroke = Stroke::new(1.25, Color32::from_rgb(228, 231, 236));
         v.hyperlink_color = Color32::from_rgb(96, 165, 250);
         v
     };
@@ -501,11 +509,12 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
             ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
             // 顶部留 6px 呼吸间距，使首行下拉框/大按钮不贴卡片上边线
             ui.add_space(6.0);
+            let pad = GROUP_PAD.with(|c| c.get());
             let row = ui.horizontal_top(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(pad);
                 ui.set_height(GROUP_BODY_H);
                 add(ui);
-                ui.allocate_exact_size(Vec2::new(8.0, 0.0), Sense::hover());
+                ui.allocate_exact_size(Vec2::new(pad, 0.0), Sense::hover());
             });
             let w = row.response.rect.width().max(crate::tokens::space::XXXL);
             // 6(顶) + 76(命令) + 4(间隙) + 16(组名居中行) = 102，距 110 高卡片底边留足 8px 白边！
@@ -1521,6 +1530,7 @@ pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
 
 /// 紧凑文字按钮（组里放"插入行"这种短命令）
 pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
+    let enabled = ui.is_enabled();
     let v = ui.visuals().clone();
     let font = FontId::proportional(crate::tokens::text::BODY);
     let galley = ui
@@ -1530,8 +1540,10 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
         galley.size().x + crate::tokens::space::XL,
         crate::tokens::size::BTN_H,
     );
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let bg = if resp.is_pointer_button_down_on() {
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    let bg = if !enabled {
+        Color32::TRANSPARENT
+    } else if resp.is_pointer_button_down_on() {
         if v.dark_mode { v.selection.bg_fill } else { PRESSED }
     } else if resp.hovered() {
         if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER }
@@ -1544,9 +1556,9 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
         Align2::CENTER_CENTER,
         label,
         font,
-        text_color(&v),
+        if enabled { text_color(&v) } else { DISABLED },
     );
-    a11y_name(&resp, if tip.is_empty() { label } else { tip }, true, None);
+    a11y_name(&resp, if tip.is_empty() { label } else { tip }, enabled, None);
     if std::env::var("SC_UI_LOG").map(|v| v == "2").unwrap_or(false) {
         eprintln!("[ui]   pill {} w={:.1} x={:.1}", label, rect.width(), rect.min.x);
     }
@@ -1597,27 +1609,53 @@ pub fn sheet_tab(
         return resp;
     }
     if active {
-        // 活动页：白卡 + 1px 卡片边 + 底部内缩的 2px 绿线（Excel 的活动标记保留）
-        ui.painter()
-            .rect(chip, rad, Color32::WHITE, Stroke::new(1.0, CARD_BORDER), egui::StrokeKind::Inside);
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(chip.left() + 8.0, chip.bottom() - 3.0),
-            Vec2::new((chip.width() - 16.0).max(4.0), 2.0),
+        // 活动页：白底上缘与上方表格底栏无缝衔接，底部以 2.5px 主题绿横条清晰标出当前表
+        let chip = Rect::from_min_max(
+            egui::pos2(rect.left() + 1.0, rect.top()),
+            egui::pos2(rect.right() - 1.0, rect.bottom() - 3.0),
         );
-        ui.painter().rect_filled(bar, 1.0, ACCENT);
+        let active_rad = egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
+        ui.painter().rect_filled(chip, active_rad, Color32::WHITE);
+        ui.painter().line_segment(
+            [chip.left_top(), chip.left_bottom() - Vec2::new(0.0, 4.0)],
+            Stroke::new(1.0, CARD_BORDER),
+        );
+        ui.painter().line_segment(
+            [chip.right_top(), chip.right_bottom() - Vec2::new(0.0, 4.0)],
+            Stroke::new(1.0, CARD_BORDER),
+        );
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(chip.left() + 8.0, chip.bottom() - 2.5),
+            Vec2::new((chip.width() - 16.0).max(4.0), 2.5),
+        );
+        ui.painter().rect_filled(bar, 1.25, ACCENT);
+        paint_medium(
+            ui.painter(),
+            rect.center(),
+            Align2::CENTER_CENTER,
+            name,
+            crate::tokens::text::BODY,
+            ACCENT,
+        );
+        return resp;
     } else if resp.hovered() {
         let hover = if v.dark_mode { v.widgets.hovered.weak_bg_fill } else { HOVER_ON_PAGE };
-        ui.painter().rect_filled(chip, rad, hover);
+        ui.painter().rect_filled(rect.shrink2(Vec2::new(2.0, 4.0)), 5.0, hover);
     }
-    let color = if active {
-        TEXT
-    } else if v.dark_mode {
+    let color = if v.dark_mode {
         v.weak_text_color()
     } else {
-        Color32::from_rgb(68, 68, 68)
+        Color32::from_rgb(71, 85, 105)
     };
     ui.painter()
         .text(rect.center(), Align2::CENTER_CENTER, name, font, color);
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.right(), rect.center().y - 6.0),
+            egui::pos2(rect.right(), rect.center().y + 6.0),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(214, 220, 230)),
+    );
     resp
 }
 
@@ -1626,14 +1664,31 @@ pub fn sheet_tab(
 /// 本帧是否画过 ui_kit 模态对话框。命令层用它判断「模态对话框是否占着键盘」，
 /// 不用逐个枚举 50 个对话框字段——只要对话框还开着，`Dlg::show` 每帧都会打标。
 const DIALOG_SHOWN: &str = "ui_kit_dialog_shown";
+const DIALOG_BLOCKING: &str = "ui_kit_dialog_blocking";
 
 fn dialog_mark() -> egui::Id {
     egui::Id::new(DIALOG_SHOWN)
 }
 
+fn dialog_blocking_mark() -> egui::Id {
+    egui::Id::new(DIALOG_BLOCKING)
+}
+
 /// 读一次即清：对话框关掉后标记不会残留到下一帧。
 pub fn take_dialog_shown(ctx: &egui::Context) -> bool {
     ctx.data_mut(|d| d.remove_temp::<bool>(dialog_mark()).unwrap_or(false))
+}
+
+/// 每帧起始清空一次；本帧任意 `block_background == true` 的 `Dlg::show` 执行后置 `true`，
+/// 供后续 `CentralPanel`（`handle_keys` / `draw_grid_pane`）非破坏性读取，避免漏加 `dialog_modal` 布尔位导致穿透。
+pub fn reset_dialog_blocking(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove_temp::<bool>(dialog_blocking_mark());
+    });
+}
+
+pub fn is_dialog_blocking(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(dialog_blocking_mark()).unwrap_or(false))
 }
 
 pub struct Dlg {
@@ -1706,6 +1761,11 @@ impl Dlg {
         ctx: &egui::Context,
         add: impl FnOnce(&mut egui::Ui) -> R,
     ) -> Option<egui::InnerResponse<R>> {
+        if let Some(p) = self.open {
+            if unsafe { !*p } {
+                return None;
+            }
+        }
         let id = egui::Id::new(("dlgwin", &self.title));
         // UI-24.1：记住打开前的焦点，关闭时还回去
         let now0 = ctx.input(|i| i.time);
@@ -1726,7 +1786,12 @@ impl Dlg {
             node.set_role(egui::accesskit::Role::Dialog);
             node.set_label(title);
         });
-        ctx.data_mut(|d| d.insert_temp(dialog_mark(), true));
+        ctx.data_mut(|d| {
+            d.insert_temp(dialog_mark(), true);
+            if self.block_background {
+                d.insert_temp(dialog_blocking_mark(), true);
+            }
+        });
         let screen = ctx.screen_rect();
         let mut pos = ctx
             .data(|d| d.get_temp::<egui::Pos2>(id.with("pos")))
@@ -1734,8 +1799,13 @@ impl Dlg {
                 let (a, off) = self
                     .anchor
                     .unwrap_or((egui::Align2::CENTER_CENTER, [0.0, 0.0]));
+                let est_h = if self.height > 0.0 {
+                    (self.height + 80.0).min(screen.height() - 16.0)
+                } else {
+                    420.0
+                };
                 let p = a.align_size_within_rect(
-                    egui::vec2(self.width, 240.0),
+                    egui::vec2(self.width, est_h),
                     screen,
                 );
                 p.min + egui::vec2(off[0], off[1])
@@ -1782,9 +1852,15 @@ impl Dlg {
                     let _ = resp;
                 });
         }
+        let area_h = if h > 0.0 {
+            h + 80.0
+        } else {
+            (screen.height() - 24.0).max(420.0)
+        };
         let out = egui::Area::new(id.with("area"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
+            .default_size([w, area_h])
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(Color32::WHITE)
@@ -1935,7 +2011,8 @@ impl Dlg {
                 // UI-24.1：Tab/Shift+Tab 只在对话框这一层里转，不会跑到背景网格。
                 // 关闭这一帧要把模态层降回背景，否则下一帧背景控件仍被判“被模态挡住”，
                 // 会把刚还回去的焦点又 surrender 掉。
-                let closing = closed || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                let caller_closed = self.open.is_some_and(|p| unsafe { !*p });
+                let closing = closed || caller_closed || ctx.input(|i| i.key_pressed(egui::Key::Escape));
                 let layer = ui.layer_id();
                 ui.memory_mut(|m| {
                     if closing {
@@ -1946,7 +2023,8 @@ impl Dlg {
                 });
                 fr.inner
             });
-        if closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let caller_closed = self.open.is_some_and(|p| unsafe { !*p });
+        if closed || caller_closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if let Some(p) = self.open {
                 unsafe { *p = false; }
             }

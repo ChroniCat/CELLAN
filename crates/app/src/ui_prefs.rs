@@ -30,6 +30,10 @@ pub struct UiPrefs {
     pub stat_mask: u8,
     /// 本机在协作/修订里显示的名字；空表示用系统默认名
     pub user_name: String,
+    /// WPS 聚光灯（阅读模式）开关
+    pub spotlight: bool,
+    /// 自动保存开关（开启后文件有改动空闲数秒即自动写回原文件）
+    pub autosave: bool,
 }
 
 impl Default for UiPrefs {
@@ -39,6 +43,8 @@ impl Default for UiPrefs {
             proof_group: true,
             stat_mask: 0b00_1011,
             user_name: String::new(),
+            spotlight: false,
+            autosave: false,
         }
     }
 }
@@ -72,6 +78,8 @@ impl UiPrefs {
                     }
                 }
                 "user_name" => me.user_name = v.to_string(),
+                "spotlight" => me.spotlight = v == "1",
+                "autosave" => me.autosave = v == "1",
                 _ => {}
             }
         }
@@ -91,11 +99,13 @@ impl UiPrefs {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "zh_variant={}\nproof_group={}\nstat_mask={}\nuser_name={}\n",
+            "zh_variant={}\nproof_group={}\nstat_mask={}\nuser_name={}\nspotlight={}\nautosave={}\n",
             self.zh_variant,
             self.proof_group as u8,
             self.stat_mask,
-            self.user_name.chars().filter(|c| !c.is_control()).collect::<String>()
+            self.user_name.chars().filter(|c| !c.is_control()).collect::<String>(),
+            self.spotlight as u8,
+            self.autosave as u8
         );
         let _ = std::fs::write(p, text);
     }
@@ -129,6 +139,8 @@ mod tests {
             proof_group: false,
             stat_mask: 0b10_1000,
             user_name: "张三".into(),
+            spotlight: true,
+            autosave: true,
         };
         p.save_to(&file);
         let got = UiPrefs::load_from(&file);
@@ -137,6 +149,8 @@ mod tests {
         assert!(!got.proof_group);
         assert_eq!(got.stat_mask, 0b10_1000);
         assert_eq!(got.user_name, "张三");
+        assert!(got.spotlight);
+        assert!(got.autosave);
     }
 }
 

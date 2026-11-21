@@ -261,7 +261,7 @@ impl SheetApp {
             "NewTab" => self.new_document(),
             "CloseTab" => {
                 let idx = self.active_tab;
-                self.close_tab(idx);
+                self.request_close_tab(idx);
             }
             "PrintPreview" => {
                 self.preview_page = 0;
@@ -281,16 +281,27 @@ impl SheetApp {
         let layer = self.key_layer(ctx);
         for cmd in COMMANDS {
             let hit = ctx.input(|i| {
-                i.modifiers.command
+                let f12 = cmd.action == "FileSaveAs"
+                    && !i.modifiers.command
+                    && !i.modifiers.alt
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::F12);
+                f12 || (i.modifiers.command
                     && !i.modifiers.alt
                     && i.key_pressed(cmd.key)
-                    && i.modifiers.shift == cmd.shift
+                    && i.modifiers.shift == cmd.shift)
             });
             if !hit {
                 continue;
             }
             if !self.command_allowed(cmd, layer) {
                 return true;
+            }
+            if layer == Layer::Grid
+                && ctx.wants_keyboard_input()
+                && matches!(cmd.action, "Undo" | "Redo")
+            {
+                return false;
             }
             self.command_exec(cmd.action, ctx);
             return true;

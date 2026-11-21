@@ -675,19 +675,30 @@ fn revision_revert_restores_font() {
         before_style: Some(before_style),
         after_style: Some(after_style),
     });
+    let rev_cache = run_dir().join("rev_cache");
+    let _ = std::fs::remove_dir_all(&rev_cache);
+    unsafe {
+        std::env::set_var("SC_REV_CACHE_DIR", &rev_cache);
+    }
     sheetcore::revision::append(&p, &e).unwrap();
 
     let dump = dump_for(
         p.to_str().unwrap(),
-        &[("SC_REV_REVERT", "1")],
+        &[
+            ("SC_REV_REVERT", "1"),
+            ("SC_REV_CACHE_DIR", rev_cache.to_str().unwrap()),
+        ],
         Duration::from_secs(30),
     )
     .expect("dump revert");
     let line = cell_line(&dump, 0, 0);
     assert!(line.contains("family=cjk-sans"), "撤回后应回到黑体：{line}");
 
-    // 日志里应多一条"撤回修订"，且能重开读到两条
     let log = sheetcore::revision::load(&p, 10);
+    unsafe {
+        std::env::remove_var("SC_REV_CACHE_DIR");
+    }
+    assert!(!dir.join(".~sheetflow-history").exists());
     assert_eq!(log.len(), 2, "撤回本身也要记一条");
     assert_eq!(log[1].label, "撤回修订");
 }
@@ -783,9 +794,9 @@ fn ribbon_groups_aligned_and_fit() {
             "样式",
             "单元格",
             "编辑",
-            "加载项"
+            "冻结"
         ],
-        "开始页应显示 8 个分组（照 Excel 365 排）"
+        "开始页应显示 8 个分组（WPS 排布：编辑后接冻结）"
     );
     let y0 = groups[0].2;
     let h0 = groups[0].4;

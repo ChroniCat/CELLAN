@@ -182,6 +182,40 @@ pub enum Icon {
     SyncScroll,
     /// 标识无效数据：红圈 + 感叹号
     InvalidCircle,
+    /// 粘贴仅数值（123 矢量符号）
+    PasteValues123,
+    /// 删除线（S + 横线）
+    StrikeThrough,
+    /// 聚光灯（阅读模式）
+    Spotlight,
+    /// 拆分窗格
+    SplitPanes,
+    /// 高亮重复项
+    HighlightDup,
+    /// 拒绝录入重复项
+    RejectDup,
+    /// 合并相同单元格
+    MergeSame,
+    /// AI 助手（双四角星）
+    AiSparkle,
+    /// 插入单元格/行列
+    InsertCell,
+    /// 删除单元格/行列
+    DeleteCell,
+    /// 单元格样式卡片
+    CellStyle,
+    /// 函数分类手册
+    FnBook,
+    /// 转置粘贴（行列互换）
+    Transpose,
+    /// 粘贴链接（剪贴板 + 链接环）
+    PasteLink,
+    /// 粘贴/复制为图片
+    PastePic,
+    /// 无边框粘贴
+    NoBorder,
+    /// 保留源列宽
+    ColWidth,
 }
 
 // ---------------------------------------------------------------- 色板
@@ -438,7 +472,7 @@ pub fn draw(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 }
 
 /// 全部图标（由枚举顺序生成；新增图标后同步这里，测试会数个数）
-pub const ALL_ICONS: [Icon; 146] = [
+pub const ALL_ICONS: [Icon; 163] = [
     Icon::Open, Icon::Save, Icon::SaveAs, Icon::Print, Icon::Undo, Icon::Redo,
     Icon::Paste, Icon::Cut, Icon::Copy, Icon::Brush, Icon::Fill, Icon::FontColor,
     Icon::AlignL, Icon::AlignC, Icon::AlignR, Icon::Top, Icon::Middle, Icon::Bottom,
@@ -463,7 +497,11 @@ pub const ALL_ICONS: [Icon; 146] = [
     Icon::ClearFmt, Icon::IndentInc, Icon::IndentDec, Icon::Symbol, Icon::ZhS, Icon::ZhT,
     Icon::TraceIn, Icon::TraceOut, Icon::SparkLine, Icon::SparkColumn, Icon::SparkLoss, Icon::TextBox,
     Icon::NewFile, Icon::Macro, Icon::MacroRun, Icon::Code, Icon::Compare, Icon::SyncScroll,
-    Icon::InvalidCircle, Icon::Home,
+    Icon::InvalidCircle, Icon::Home, Icon::PasteValues123, Icon::StrikeThrough,
+    Icon::Spotlight, Icon::SplitPanes, Icon::HighlightDup, Icon::RejectDup,
+    Icon::MergeSame, Icon::AiSparkle, Icon::InsertCell, Icon::DeleteCell,
+    Icon::CellStyle, Icon::FnBook, Icon::Transpose, Icon::PasteLink,
+    Icon::PastePic, Icon::NoBorder, Icon::ColWidth,
 ];
 
 /// 图标总表：给「对照表」和自检用（位图 vs 矢量并排看）
@@ -1741,6 +1779,158 @@ fn draw_one(pen: &Pen<'_>, icon: Icon) {
             pen.ring(12.0, 12.0, 7.6, 1.8, RED);
             pen.bar(11.2, 7.8, 1.6, 6.0, RED);
             pen.dot(12.0, 16.2, 1.1, RED);
+        }
+        PasteValues123 => {
+            pen.rrs(3.2, 4.2, 17.6, 15.6, 1.0, BLUE_L, BLUE_D, 1.2);
+            // 1
+            pen.ln(6.8, 8.2, 6.8, 15.8, 1.6, BLUE_D);
+            pen.ln(5.5, 9.5, 6.8, 8.2, 1.4, BLUE_D);
+            // 2
+            pen.polyline(&[(9.8, 9.2), (10.8, 8.0), (12.8, 8.0), (13.4, 9.6), (9.8, 15.6), (13.6, 15.6)], 1.5, GREEN_D);
+            // 3
+            pen.polyline(&[(15.6, 8.2), (18.4, 8.2), (16.8, 11.6), (18.6, 12.6), (18.4, 15.6), (15.5, 15.6)], 1.5, INK);
+        }
+        StrikeThrough => {
+            pen.polyline(
+                &[(16.2, 6.4), (10.4, 5.4), (7.8, 7.8), (9.6, 11.0), (14.8, 12.6), (16.4, 15.8), (13.2, 18.4), (7.6, 17.6)],
+                1.7,
+                INK,
+            );
+            pen.ln(4.2, 12.0, 19.8, 12.0, 1.6, RED);
+        }
+        Spotlight => {
+            pen.rro(3.5, 3.5, 17.0, 17.0, 1.0, BLUE_D, 1.2);
+            pen.bar(4.2, 9.8, 15.6, 4.4, CREAM);
+            pen.bar(9.8, 4.2, 4.4, 15.6, CREAM);
+            pen.rro(9.4, 9.4, 5.2, 5.2, 0.5, GREEN_D, 1.5);
+        }
+        SplitPanes => {
+            pen.rro(3.4, 4.0, 17.2, 16.0, 1.0, GRAY_D, 1.2);
+            pen.bar(11.2, 4.2, 1.6, 15.6, BLUE);
+            pen.bar(3.6, 11.2, 16.8, 1.6, BLUE);
+        }
+        HighlightDup => {
+            pen.rrs(4.0, 4.8, 10.0, 7.0, 0.8, CREAM, ORANGE_D, 1.3);
+            pen.rrs(10.0, 12.2, 10.0, 7.0, 0.8, CREAM, RED, 1.3);
+            pen.bar(6.2, 7.6, 5.6, 1.6, ORANGE_D);
+            pen.bar(12.2, 15.0, 5.6, 1.6, RED);
+        }
+        RejectDup => {
+            pen.rro(3.6, 4.2, 11.6, 15.4, 0.8, GRAY_D, 1.2);
+            pen.bar(5.6, 7.4, 7.4, 1.5, GRAY);
+            pen.bar(5.6, 11.2, 5.4, 1.5, GRAY);
+            pen.ring(16.0, 15.4, 4.5, 1.6, RED);
+            pen.ln(13.2, 12.6, 18.8, 18.2, 1.6, RED);
+        }
+        MergeSame => {
+            pen.rrs(3.8, 4.4, 7.2, 15.2, 0.6, BLUE_L, BLUE_D, 1.2);
+            pen.rrs(13.0, 4.4, 7.2, 6.4, 0.6, GREEN_L, GREEN_D, 1.2);
+            pen.rrs(13.0, 13.2, 7.2, 6.4, 0.6, GREEN_L, GREEN_D, 1.2);
+        }
+        AiSparkle => {
+            pen.poly(
+                &[
+                    (10.5, 4.0),
+                    (12.6, 9.4),
+                    (18.0, 11.5),
+                    (12.6, 13.6),
+                    (10.5, 19.0),
+                    (8.4, 13.6),
+                    (3.0, 11.5),
+                    (8.4, 9.4),
+                ],
+                BLUE_L,
+                BLUE_D,
+                1.2,
+            );
+            pen.poly(
+                &[
+                    (18.2, 3.6),
+                    (19.0, 5.6),
+                    (21.0, 6.4),
+                    (19.0, 7.2),
+                    (18.2, 9.2),
+                    (17.4, 7.2),
+                    (15.4, 6.4),
+                    (17.4, 5.6),
+                ],
+                CREAM,
+                GOLD_D,
+                0.9,
+            );
+        }
+        InsertCell => {
+            pen.rrs(3.6, 4.2, 13.4, 14.6, 0.8, WHITE, GRAY_D, 1.2);
+            pen.rrs(3.6, 9.0, 13.4, 4.8, 0.0, GREEN_L, GREEN_D, 1.15);
+            pen.ln(10.3, 4.2, 10.3, 18.8, 1.15, GRAY);
+            pen.ln(17.6, 13.8, 17.6, 19.6, 1.7, GREEN_D);
+            pen.ln(14.7, 16.7, 20.3, 16.7, 1.7, GREEN_D);
+        }
+        DeleteCell => {
+            pen.rrs(3.6, 4.2, 13.4, 14.6, 0.8, WHITE, GRAY_D, 1.2);
+            pen.rrs(3.6, 9.0, 13.4, 4.8, 0.0, Color32::from_rgb(254, 226, 226), RED, 1.15);
+            pen.ln(10.3, 4.2, 10.3, 18.8, 1.15, GRAY);
+            pen.ln(15.2, 14.4, 19.8, 19.0, 1.65, RED);
+            pen.ln(19.8, 14.4, 15.2, 19.0, 1.65, RED);
+        }
+        CellStyle => {
+            pen.rrs(3.6, 4.2, 16.8, 15.6, 1.2, WHITE, BLUE_D, 1.2);
+            pen.rrs(3.6, 4.2, 16.8, 5.0, 1.0, BLUE_L, BLUE_D, 1.15);
+            pen.rrs(12.2, 12.0, 6.6, 5.8, 0.8, GREEN_L, GREEN_D, 1.15);
+            pen.polyline(&[(5.8, 17.6), (8.2, 11.4), (10.6, 17.6)], 1.5, INK);
+            pen.ln(6.5, 15.6, 9.9, 15.6, 1.3, INK);
+        }
+        FnBook => {
+            pen.rrs(4.6, 3.8, 14.4, 16.4, 1.2, BLUE_L, BLUE_D, 1.2);
+            pen.rrs(4.6, 3.8, 3.6, 16.4, 0.8, BLUE, BLUE_D, 1.15);
+            pen.bar(10.4, 7.6, 6.2, 1.5, ORANGE_D);
+            pen.bar(10.4, 11.2, 6.2, 1.5, BLUE_D);
+            pen.bar(10.4, 14.8, 4.4, 1.5, BLUE_D);
+        }
+        Transpose => {
+            pen.rrs(3.8, 4.0, 9.4, 4.6, 0.8, BLUE_L, BLUE_D, 1.15);
+            pen.bar(5.6, 5.6, 5.8, 1.5, BLUE_D);
+            pen.rrs(15.2, 10.6, 4.8, 9.4, 0.8, GREEN_L, GREEN_D, 1.15);
+            pen.ln(14.8, 6.2, 17.8, 6.2, 1.2, INK);
+            pen.ln(17.8, 6.2, 17.8, 9.0, 1.2, INK);
+            pen.polyline(&[(15.8, 4.8), (17.8, 6.2), (16.4, 8.2)], 1.15, INK);
+            pen.ln(5.4, 11.0, 5.4, 16.8, 1.2, ORANGE_D);
+            pen.ln(5.4, 16.8, 12.6, 16.8, 1.2, ORANGE_D);
+            pen.polyline(&[(10.6, 14.8), (12.6, 16.8), (10.6, 18.8)], 1.2, ORANGE_D);
+        }
+        PasteLink => {
+            pen.rrs(4.2, 4.0, 11.2, 14.4, 1.0, Color32::from_rgb(248, 219, 143), ORANGE_D, 1.15);
+            pen.rrs(6.4, 6.8, 6.8, 8.8, 0.5, WHITE, GRAY_D, 1.0);
+            pen.rrs(8.0, 2.8, 3.6, 2.6, 0.7, CREAM, GRAY_D, 1.0);
+            pen.rrs(11.4, 13.8, 5.4, 3.6, 1.4, BLUE_L, BLUE_D, 1.25);
+            pen.rrs(14.8, 15.8, 5.4, 3.6, 1.4, GREEN_L, GREEN_D, 1.25);
+        }
+        PastePic => {
+            pen.rrs(4.0, 4.0, 11.2, 14.2, 1.0, Color32::from_rgb(248, 219, 143), ORANGE_D, 1.15);
+            pen.rrs(7.4, 2.8, 4.0, 2.6, 0.7, CREAM, GRAY_D, 1.0);
+            pen.rrs(9.8, 10.2, 10.2, 9.4, 1.0, BLUE_L, BLUE_D, 1.2);
+            pen.dot(17.4, 12.6, 1.1, GOLD);
+            pen.poly(&[(10.6, 18.8), (13.6, 13.8), (16.4, 18.8)], GREEN, GREEN_D, 1.1);
+            pen.poly(&[(14.4, 18.8), (16.8, 15.2), (19.2, 18.8)], GREEN_L, GREEN_D, 1.1);
+        }
+        NoBorder => {
+            pen.rrs(4.2, 4.2, 15.2, 15.2, 0.8, WHITE, GRAY, 1.15);
+            pen.ln(11.8, 5.2, 11.8, 18.4, 1.15, GRAY);
+            pen.ln(5.2, 11.8, 18.4, 11.8, 1.15, GRAY);
+            pen.bar(6.2, 7.2, 4.0, 1.8, BLUE);
+            pen.bar(13.4, 7.2, 4.0, 1.8, BLUE);
+            pen.bar(6.2, 14.4, 4.0, 1.8, BLUE);
+            pen.ln(14.8, 14.8, 19.6, 19.6, 1.5, RED);
+            pen.ln(19.6, 14.8, 14.8, 19.6, 1.5, RED);
+        }
+        ColWidth => {
+            pen.rrs(8.0, 3.8, 8.0, 16.4, 0.8, BLUE_L, BLUE_D, 1.2);
+            pen.ln(8.0, 9.2, 16.0, 9.2, 1.1, BLUE);
+            pen.ln(8.0, 14.8, 16.0, 14.8, 1.1, BLUE);
+            pen.ln(3.8, 12.0, 7.4, 12.0, 1.3, ORANGE_D);
+            pen.polyline(&[(5.6, 10.2), (3.8, 12.0), (5.6, 13.8)], 1.25, ORANGE_D);
+            pen.ln(16.6, 12.0, 20.2, 12.0, 1.3, ORANGE_D);
+            pen.polyline(&[(18.4, 10.2), (20.2, 12.0), (18.4, 13.8)], 1.25, ORANGE_D);
         }
     }
 }

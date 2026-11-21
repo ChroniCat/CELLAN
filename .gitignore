@@ -2,6 +2,10 @@
 /target/
 /dist/
 
+# Local build-time secrets (compiled into local dist exe, never uploaded to GitHub)
+/.cellan-ai-key.local
+*.local.key
+
 # Local workbooks, generated test data, logs, and backups
 /work/
 **/tests/test-work/

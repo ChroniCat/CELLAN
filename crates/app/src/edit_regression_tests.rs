@@ -2608,9 +2608,10 @@ fn ctx_menu_rows_match_excel_cell_menu() {
         labels,
         [
             "剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容",
-            "筛选", "排序", "设置单元格格式…", "超链接…"
+            "筛选", "排序", "合并单元格", "取消合并", "插入/编辑批注", "删除批注",
+            "设置单元格格式…", "超链接…"
         ],
-        "条目与顺序照 Excel 365 的单元格右键菜单"
+        "条目与顺序按 WPS 单元格右键菜单（含合并与批注）"
     );
     // 四个子菜单
     let parents: Vec<&str> = rows.iter().filter(|r| !r.children.is_empty()).map(|r| r.label).collect();
@@ -2721,11 +2722,14 @@ fn ctx_head_menu_rows_are_excel_like() {
     let labels: Vec<&str> = rows.iter().filter(|r| !r.is_sep() && !r.strip).map(|r| r.label).collect();
     assert_eq!(
         labels,
-        ["剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容", "列宽…", "隐藏", "取消隐藏", "设置单元格格式…"]
+        [
+            "剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容",
+            "列宽…", "最适合的列宽", "隐藏", "取消隐藏", "设置单元格格式…"
+        ]
     );
-    // 列标用「列宽…」，行号用「行高…」
+    // 列标用「列宽…/最适合的列宽」，行号用「行高…/最适合的行高」
     let row_labels: Vec<&str> = ctx_head_rows(false).iter().map(|r| r.label).collect();
-    assert!(row_labels.contains(&"行高…") && !row_labels.contains(&"列宽…"));
+    assert!(row_labels.contains(&"行高…") && row_labels.contains(&"最适合的行高") && !row_labels.contains(&"列宽…"));
 }
 
 #[test]
@@ -2753,7 +2757,7 @@ fn ctx_tab_menu_sets_and_clears_tab_color() {
             "取消隐藏…",
             "工作表列表…",
             "工作表标签颜色",
-            "设置单元格格式…",
+            "保护工作表…",
         ]
     );
 }
@@ -3868,7 +3872,7 @@ fn opening_a_damaged_document_reports_it_immediately_and_diag_follows_the_tab() 
     // 走真实的打开消息路径：打开 A 后状态栏必须立刻是"读取问题"
     let (tx, rx) = std::sync::mpsc::channel();
     app.tasks.open_rx = Some(rx);
-    tx.send(crate::OpenMsg::Loaded(Box::new(wb_bad), false, Box::new(diag.clone()))).unwrap();
+    tx.send(crate::OpenMsg::Loaded(Box::new(wb_bad), false, Box::new(diag.clone()), String::new())).unwrap();
     drop(tx);
     app.poll_open();
     assert!(app.status.contains("读取问题"), "打开当时就要报：{}", app.status);
@@ -3879,7 +3883,7 @@ fn opening_a_damaged_document_reports_it_immediately_and_diag_follows_the_tab() 
     let parked_a = app.park_current();
     let (tx2, rx2) = std::sync::mpsc::channel();
     app.tasks.open_rx = Some(rx2);
-    tx2.send(crate::OpenMsg::Loaded(Box::new(wb_good), false, Box::new(diag_good.clone()))).unwrap();
+    tx2.send(crate::OpenMsg::Loaded(Box::new(wb_good), false, Box::new(diag_good.clone()), String::new())).unwrap();
     drop(tx2);
     app.poll_open();
     assert!(
@@ -5262,6 +5266,7 @@ fn filter_clear_keeps_filter_and_manual_hidden_rows() {
     sh.filter = Some(f.clone());
     sh.hidden_rows = f.hidden_rows(sh);
     sh.hidden_rows_user.insert(5);
+    sh.set(0, 3, sheetcore::Cell { value: Value::Number(50.0), formula: Some("=SUBTOTAL(9,B2:B4)".into()) });
     assert!(sh.hidden_rows.contains(&1), "10 应被条件隐藏");
 
     app.ribbon_action("FilterClear", &ctx);
@@ -5271,6 +5276,7 @@ fn filter_clear_keeps_filter_and_manual_hidden_rows() {
     assert!(f.allows.is_empty() && f.criteria.is_empty());
     assert!(sh.hidden_rows.is_empty(), "符合条件的所有行都必须恢复");
     assert!(sh.hidden_rows_user.contains(&5), "手动隐藏行不能被误取消");
+    assert_eq!(sh.value(0, 3), Value::Number(60.0));
     assert!(app.status.contains("筛选条件"));
 
     // 重新加条件并用 Ribbon 重新应用；筛选范围含表头，A1 在内。
@@ -5279,11 +5285,13 @@ fn filter_clear_keeps_filter_and_manual_hidden_rows() {
         sheetcore::sort_filter::Criterion::new(sheetcore::sort_filter::CmpOp::Gt, "15"));
     app.ribbon_action("FilterReapply", &ctx);
     assert!(app.wb.sheet(0).hidden_rows.contains(&1));
+    assert_eq!(app.wb.sheet(0).value(0, 3), Value::Number(50.0));
     assert!(app.wb.sheet(0).hidden_rows_user.contains(&5));
 
     app.sel = (0, 0);
     app.start_filter();
     assert!(app.wb.sheet(0).filter.is_none(), "再次点筛选必须关闭并移除箭头");
+    assert_eq!(app.wb.sheet(0).value(0, 3), Value::Number(60.0));
     assert!(app.wb.sheet(0).hidden_rows.is_empty());
     assert!(app.wb.sheet(0).hidden_rows_user.contains(&5));
 }

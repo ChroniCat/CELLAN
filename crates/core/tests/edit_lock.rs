@@ -86,3 +86,34 @@ fn style_and_merge_messages_round_trip() {
     let line = serde_json::to_string(&c).unwrap();
     assert!(serde_json::from_str::<Msg>(&line).is_ok());
 }
+
+#[test]
+fn default_lock_table_keeps_nonzero_ttl_and_shifts_on_structural_ops() {
+    use sheetcore::structural::Structural;
+    use sheetcore::sync::{DEFAULT_LEASE_TTL_MS, Peer};
+    use sheetcore::model::{Cell, Value};
+
+    let mut t = LockTable::default();
+    assert_eq!(t.ttl_ms, DEFAULT_LEASE_TTL_MS);
+    assert_eq!(t.request(0, 4, 2, 10, "甲", 100), LockOutcome::Granted);
+    // 非零默认 TTL：后续他人请求不能因 ttl_ms=0 而直接顶掉已有租约
+    assert!(matches!(
+        t.request(0, 4, 2, 20, "乙", 200),
+        LockOutcome::Denied { holder: 10, .. }
+    ));
+    // 插入点在第 2 行（<= 4）会影响甲在 (4,2) 的活跃租约，乙的结构改动应判定冲突
+    assert!(t.conflicts_structural(0, &Structural::InsertRows { at: 2, n: 1 }, 20, 300).is_some());
+    // 插入点在第 6 行（> 4）不影响甲的租约，允许执行
+    assert!(t.conflicts_structural(0, &Structural::InsertRows { at: 6, n: 1 }, 20, 300).is_none());
+
+    // 持锁者自身在上方插入 2 行后，租约表与副本状态坐标应同步下移到 (6, 2)
+    let mut peer = Peer::new(10);
+    peer.local_set(0, 4, 2, &Cell { value: Value::Number(88.0), formula: None });
+    let ins = Structural::InsertRows { at: 1, n: 2 };
+    t.shift_structural(0, &ins);
+    peer.shift_structural(0, &ins);
+    assert!(t.holder(0, 4, 2).is_none());
+    assert_eq!(t.holder(0, 6, 2).map(|h| h.site), Some(10));
+    assert!(peer.cells.get(&(0, 4, 2)).is_none());
+    assert_eq!(peer.cells.get(&(0, 6, 2)).map(|o| o.row), Some(6));
+}

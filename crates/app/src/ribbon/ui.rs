@@ -26,17 +26,45 @@ pub struct Popup {
     pub opened_at: f64,
 }
 
-/// 页签行（文件…帮助）。上下文页签由调用方按需追加。
+/// 第 2 排「文件 ▾」绿色下拉胶囊按钮（独立渲染以接入自动保存与快速访问栏）。
+pub fn tab_file(app: &mut SheetApp, ui: &mut egui::Ui) {
+    let Some(t) = app.ribbon.tabs.first() else { return };
+    let label = format!("{}   ", t.label);
+    let keytip = t.keytip.clone();
+    let resp = ui_kit::tab_ex(ui, &label, false, true);
+    ui_kit::caret(
+        ui,
+        egui::pos2(resp.rect.right() - 11.0, resp.rect.center().y + 0.5),
+        ui_kit::ACCENT,
+    );
+    if app.keytips && app.keytip_tab.is_none() {
+        if let Some(ch) = keytip.chars().next() {
+            let r = resp.rect;
+            let b = Rect::from_center_size(egui::pos2(r.center().x, r.top() + 6.0), Vec2::new(13.0, 11.0));
+            ui.painter().rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
+            ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.to_string(), FontId::proportional(8.5), Color32::WHITE);
+        }
+    }
+    if resp.clicked() {
+        app.file_menu_anchor = Some(resp.rect.left_bottom());
+        app.file_menu_open = !app.file_menu_open;
+        app.ribbon_popup = None;
+        app.ribbon_sub = None;
+    }
+}
+
+/// 页签行（开始…帮助）。上下文页签由调用方按需追加。
 pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     let tabs: Vec<(usize, String, String)> = app
         .ribbon
         .tabs
         .iter()
         .enumerate()
+        .skip(1)
         .map(|(i, t)| (i, t.label.clone(), t.keytip.clone()))
         .collect();
     for (i, label, keytip) in tabs {
-        let resp = ui_kit::tab_ex(ui, &label, app.ribbon_tab == i && i != 0, i == 0);
+        let resp = ui_kit::tab_ex(ui, &label, app.ribbon_tab == i, false);
         if app.keytips && app.keytip_tab.is_none() {
             if let Some(ch) = keytip.chars().next() {
                 let r = resp.rect;
@@ -58,16 +86,14 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         if resp.double_clicked() {
             app.ribbon_collapsed = !app.ribbon_collapsed;
             app.ribbon_popup = None;
+            app.ribbon_sub = None;
         }
         if resp.clicked() {
-            if i == 0 {
-                app.backstage = true;
-                app.backstage_page = 0;
-            } else {
-                app.ribbon_tab = i;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
+            app.file_menu_open = false;
+            app.ribbon_tab = i;
+            app.ribbon_collapsed = false;
+            app.ribbon_popup = None;
+            app.ribbon_sub = None;
         }
     }
 }
@@ -183,16 +209,23 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
     // UI-13.2：窄窗口把放不下的分组折叠成「组名 ▾」按钮，点开仍能执行全部命令。
     // 宽度取上一帧实测值；首帧先完整画一遍，第二帧起稳定。
     let avail = (ui.clip_rect().width() - 24.0).max(200.0);
-    // Excel 在 1440 宽会把常规按钮收成纯图标、把样式库收成下拉；
-    // 我们原来是把最后一组直接裁掉，观感像「没做完」。1720 以下统一紧凑。
-    app.ribbon_compact = avail < 1720.0;
+    // WPS 两级响应式布局：
+    // - >= 1720px：完整展开（含完整样式库、长中文标签）
+    // - 1280..1720px（标准 1440px 屏）：折叠样式库、关键命令展示精简 2 字中文标签、保持全部 8 组可见
+    // - < 1280px：纯图标紧凑模式
+    let mid_tier = avail >= 1280.0 && avail < 1720.0;
+    app.ribbon_compact = avail < 1280.0;
+    RIBBON_MID.with(|c| c.set(mid_tier));
+    ui_kit::set_group_pad(if mid_tier { 5.0 } else { 8.0 });
     let mut used = 0.0f32;
     let mut i = 0usize;
     while i < tab.groups.len() {
         let g = &tab.groups[i];
-        // 紧凑/完整两种布局的组宽分开缓存，否则来回变宽时会拿错上一帧的值
+        // 完整/中档/紧凑三种布局的组宽分开缓存，避免切窗宽时复用错宽度
         let cache_key = if app.ribbon_compact {
             format!("{}#c", g.id)
+        } else if mid_tier {
+            format!("{}#m", g.id)
         } else {
             g.id.clone()
         };
@@ -299,15 +332,122 @@ fn nodes(app: &mut SheetApp, ui: &mut egui::Ui, list: &[Node]) {
     }
 }
 
-/// 功能区组专用：紧凑模式下把常规按钮压成「纯图标 24px」，
-/// 弹层里的菜单仍走 `nodes`，不受影响。
+thread_local! {
+    static RIBBON_MID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mid_short_label(raw: &str) -> Option<&'static str> {
+    Some(match raw {
+        "自动换行" => "换行",
+        "合并后居中" => "合并",
+        "自动求和" => "求和",
+        "条件格式" => "条件",
+        "套用表格格式" => "表样",
+        "排序和筛选" => "筛选",
+        "查找和选择" => "查找",
+        "冻结窗格" => "冻结",
+        "格式刷" => "格式刷",
+        _ => return None,
+    })
+}
+
+/// 功能区组专用：支持 full / mid(1280..1720 精简中文标签) / narrow(<1280 纯图标)
 fn nodes_auto(app: &mut SheetApp, ui: &mut egui::Ui, list: &[Node]) {
+    let mid = !app.ribbon_compact && RIBBON_MID.with(|c| c.get());
     for n in list {
         if app.ribbon_compact {
             node_narrow(app, ui, n);
+        } else if mid {
+            node_mid(app, ui, n);
         } else {
             node(app, ui, n);
         }
+    }
+}
+
+fn node_mid(app: &mut SheetApp, ui: &mut egui::Ui, n: &Node) {
+    let shorten_ctl = |c: &Ctl| -> (Ctl, Option<String>) {
+        let mut c2 = c.clone();
+        let mut full = None;
+        if let Some(lbl) = c2.label.as_deref() {
+            if let Some(short) = mid_short_label(lbl) {
+                full = Some(lbl.to_string());
+                if c2.screentip.is_none() {
+                    c2.screentip = Some(lbl.to_string());
+                }
+                c2.label = Some(short.to_string());
+                c2.width = None;
+            }
+        }
+        (c2, full)
+    };
+    match n {
+        Node::Button(c) => {
+            let (mut c2, full) = shorten_ctl(c);
+            if matches!(c2.id.as_str(), "TextDirection") {
+                c2.width = None;
+            }
+            button_a11y(app, ui, &c2, false, full.as_deref());
+        }
+        Node::Toggle(c) => {
+            let (c2, full) = shorten_ctl(c);
+            button_a11y(app, ui, &c2, true, full.as_deref());
+        }
+        Node::Split { ctl, menu: m } => {
+            let (mut c2, full) = shorten_ctl(ctl);
+            if ctl.id == "AutoSum" {
+                c2.width = None;
+                c2.arrow = Some(15.0);
+            }
+            split_a11y(app, ui, &c2, m, full.as_deref());
+        }
+        Node::Menu(m) => {
+            let (mut c2, full) = shorten_ctl(&m.ctl);
+            if matches!(c2.id.as_str(), "FillMenu" | "ClearMenu" | "TextDirection") {
+                c2.width = None;
+            }
+            let mut m2 = m.clone();
+            m2.ctl = c2;
+            menu_a11y(app, ui, &m2, full.as_deref());
+        }
+        Node::Gallery { ctl, items, .. } => gallery_compact(app, ui, ctl, items),
+        Node::ComboBox { ctl, items, width } => {
+            let w2 = if ctl.id == "Font" {
+                (*width).min(106.0)
+            } else if ctl.id == "FontSize" {
+                (*width).min(46.0)
+            } else {
+                *width
+            };
+            combo(app, ui, ctl, items, w2);
+        }
+        Node::DropDown { ctl, items } => {
+            let mut c2 = ctl.clone();
+            if c2.id == "NumberFormat" {
+                c2.width = Some(106.0);
+            }
+            dropdown(app, ui, &c2, items);
+        }
+        Node::Spacer(w) => {
+            ui.add_space((*w * 0.35).max(1.0));
+        }
+        Node::Box { vertical, top, gap, children } => {
+            if *vertical {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = *gap;
+                    if *top > 0.0 {
+                        ui.add_space(*top);
+                    }
+                    nodes_auto(app, ui, children);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    nodes_auto(app, ui, children);
+                });
+            }
+        }
+        _ => node(app, ui, n),
     }
 }
 
@@ -675,6 +815,16 @@ fn draw_keytip(ui: &egui::Ui, key: &str, rect: Rect) {
 }
 
 fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
+    button_a11y(app, ui, c, toggle, None);
+}
+
+fn button_a11y(
+    app: &mut SheetApp,
+    ui: &mut egui::Ui,
+    c: &Ctl,
+    toggle: bool,
+    a11y_full: Option<&str>,
+) {
     let st = app.ctl_state(&c.id);
     if !st.visible {
         return;
@@ -739,7 +889,11 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
     });
     // UI-24.2：功能区按钮在 UIA 里要有名字/角色/禁用状态
     {
-        let name = if tip_a11y.is_empty() { label.clone() } else { tip_a11y };
+        let name = if tip_a11y.is_empty() {
+            a11y_full.unwrap_or(&label).to_string()
+        } else {
+            tip_a11y
+        };
         ui_kit::a11y_name(
             &resp.inner,
             &name,
@@ -764,6 +918,16 @@ fn button(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, toggle: bool) {
 }
 
 fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
+    split_a11y(app, ui, ctl, menu_def, None);
+}
+
+fn split_a11y(
+    app: &mut SheetApp,
+    ui: &mut egui::Ui,
+    ctl: &Ctl,
+    menu_def: &Menu,
+    a11y_full: Option<&str>,
+) {
     let st = app.ctl_state(&ctl.id);
     if !st.visible {
         return;
@@ -784,12 +948,13 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
             let w = ctl.width.unwrap_or(44.0).max(tw + 14.0);
             let (r, ar) = ui_kit::big_sized_split(ui, icon, &label, Vec2::new(w, 76.0));
             // UI-24.2：大号拆分按钮的主体和箭头是两个点击区，各自要有名字
-            if !label.is_empty() {
+            let a11y_lbl = a11y_full.unwrap_or(&label);
+            if !a11y_lbl.is_empty() {
                 let mut main = r.rect;
                 main.max.y = main.max.y.min(ar.rect.top());
-                ui_kit::a11y_name_rect(&r, &label, enabled, main, ui.ctx());
+                ui_kit::a11y_name_rect(&r, a11y_lbl, enabled, main, ui.ctx());
             }
-            ui_kit::a11y_name(&ar, &format!("{label} 选项"), enabled, None);
+            ui_kit::a11y_name(&ar, &format!("{a11y_lbl} 选项"), enabled, None);
             keytip_rect = Some(r.rect);
             main_clicked = enabled && r.clicked();
             if ar.clicked() && enabled {
@@ -864,34 +1029,49 @@ fn split(app: &mut SheetApp, ui: &mut egui::Ui, ctl: &Ctl, menu_def: &Menu) {
         app.ribbon_action(&action, ui.ctx());
     }
     if open {
-        app.ribbon_popup = Some(Popup {
-            kind: PopupKind::Menu(menu_def.clone()),
-            pos,
-            opened_at: ui.input(|i| i.time),
-        });
+        app.ribbon_sub = None;
+        if ctl.id == "FillColor" || ctl.id == "FontColor" {
+            let want_font = ctl.id == "FontColor";
+            app.color_popup_pos = Some(pos);
+            app.color_popup = if app.color_popup == Some(want_font) { None } else { Some(want_font) };
+            app.ribbon_popup = None;
+        } else {
+            app.ribbon_popup = Some(Popup {
+                kind: PopupKind::Menu(menu_def.clone()),
+                pos,
+                opened_at: ui.input(|i| i.time),
+            });
+        }
     }
 }
 
 fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
+    menu_a11y(app, ui, m, None);
+}
+
+fn menu_a11y(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu, a11y_full: Option<&str>) {
     let st = app.ctl_state(&m.ctl.id);
     if !st.visible {
         return;
     }
     let label = st.label.clone().or_else(|| m.ctl.label.clone()).unwrap_or_default();
+    let a11y_lbl = a11y_full.unwrap_or(&label);
     let tip = tip_of(&m.ctl);
     let icon = m.ctl.image.as_deref().and_then(icon_of);
     if m.ctl.size == Size::Large {
         let tw = if label.is_empty() { 0.0 } else { measure(ui, &label, 12.0) };
-        let w = m.ctl.width.unwrap_or(62.0).max(tw + 14.0);
+        let min_large = if a11y_full.is_some() { 46.0 } else { 62.0 };
+        let w = m.ctl.width.unwrap_or(min_large).max(tw + 14.0);
         let ic = m.ctl.image.as_deref().and_then(icon_of).unwrap_or(Icon::Grid);
         let (r, ar) = ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0));
         {
             let mut main = r.rect;
             main.max.y = main.max.y.min(ar.rect.top());
-            ui_kit::a11y_name_rect(&r, &label, on_enabled(&m.ctl, &st), main, ui.ctx());
+            ui_kit::a11y_name_rect(&r, a11y_lbl, on_enabled(&m.ctl, &st), main, ui.ctx());
         }
-        ui_kit::a11y_name(&ar, &format!("{label} 选项"), on_enabled(&m.ctl, &st), None);
+        ui_kit::a11y_name(&ar, &format!("{a11y_lbl} 选项"), on_enabled(&m.ctl, &st), None);
         if (r.clicked() || ar.clicked()) && on_enabled(&m.ctl, &st) {
+            app.ribbon_sub = None;
             app.ribbon_popup = Some(Popup {
                 kind: PopupKind::Menu(m.clone()),
                 pos: egui::pos2(ar.rect.left(), ar.rect.bottom()),
@@ -901,24 +1081,54 @@ fn menu(app: &mut SheetApp, ui: &mut egui::Ui, m: &Menu) {
         return;
     }
     let clicked = ui.add_enabled_ui(on_enabled(&m.ctl, &st), |ui| {
+        let enabled = on_enabled(&m.ctl, &st);
         let min_w = if label.is_empty() {
-            24.0
+            28.0
         } else if icon.is_some() {
-            (16.0 + 5.0 + measure(ui, &label, 12.0) + 14.0).max(24.0)
+            (16.0 + 5.0 + measure(ui, &label, 12.0) + 22.0).max(28.0)
         } else {
-            (measure(ui, &label, 12.0) + 24.0).max(24.0)
+            (measure(ui, &label, 12.0) + 24.0).max(28.0)
         };
         let w = m.ctl.width.unwrap_or(min_w).max(min_w);
         if let Some(ic) = icon {
-            ui_kit::labeled_w(ui, ic, &label, w, &tip)
+            let r = ui_kit::labeled_w(ui, ic, &label, w, &tip);
+            ui_kit::caret(
+                ui,
+                egui::pos2(r.rect.right() - 7.0, r.rect.center().y + 0.5),
+                if enabled { Color32::from_rgb(100, 116, 139) } else { ui_kit::DISABLED },
+            );
+            r
         } else {
-            ui.add(
-                egui::Button::new(egui::RichText::new(&label).size(12.0))
-                    .min_size(Vec2::new(w, 24.0)),
-            )
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
+            let bg = ui_kit::state_bg(
+                enabled,
+                false,
+                resp.hovered(),
+                resp.is_pointer_button_down_on(),
+                ui.visuals().dark_mode,
+            );
+            if bg != Color32::TRANSPARENT {
+                ui.painter().rect_filled(rect, 4.0, bg);
+            }
+            let fg = if enabled { ui_kit::TEXT } else { ui_kit::DISABLED };
+            ui.painter().text(
+                egui::pos2(rect.left() + 8.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                FontId::proportional(12.0),
+                fg,
+            );
+            ui_kit::caret(
+                ui,
+                egui::pos2(rect.right() - 8.0, rect.center().y + 0.5),
+                if enabled { Color32::from_rgb(100, 116, 139) } else { ui_kit::DISABLED },
+            );
+            ui_kit::a11y_name(&resp, if tip.is_empty() { &label } else { &tip }, enabled, None);
+            resp.on_hover_text(&tip)
         }
     });
     if clicked.inner.clicked() {
+        app.ribbon_sub = None;
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Menu(m.clone()),
             pos: clicked.inner.rect.left_bottom(),
@@ -932,33 +1142,6 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     if !st.visible {
         return;
     }
-    // Excel 的数字格式是「可输入的下拉」，原来用 egui ComboBox 调过对齐，别再自绘
-    if c.id == "NumberFormat" {
-        let cur = st
-            .text
-            .clone()
-            .or_else(|| items.first().map(|i| i.label.clone()))
-            .unwrap_or_default();
-        let mut picked: Option<String> = None;
-        ui.add_enabled_ui(st.enabled, |ui| {
-            ui.spacing_mut().interact_size.y = 21.0;
-            egui::ComboBox::from_id_salt("numfmt")
-                .selected_text(cur)
-                .width(c.width.unwrap_or(96.0))
-                .height(24.0)
-                .show_ui(ui, |ui| {
-                    for it in items {
-                        if ui.selectable_label(false, &it.label).clicked() {
-                            picked = Some(it.id.clone());
-                        }
-                    }
-                });
-        });
-        if let Some(p) = picked {
-            app.ribbon_action(&p, ui.ctx());
-        }
-        return;
-    }
     let text = st
         .text
         .clone()
@@ -966,12 +1149,6 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         .or_else(|| items.first().map(|i| i.label.clone()))
         .unwrap_or_default();
     let tip = tip_of(c);
-    let w = c
-        .label
-        .as_ref()
-        .map(|_| 0.0)
-        .unwrap_or(0.0);
-    let _ = w;
     let clicked = ui.add_enabled_ui(on_enabled(c, &st), |ui| {
         let width = c
             .width
@@ -1025,6 +1202,7 @@ fn dropdown(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         ui_kit::a11y_name(&clicked.inner, &name, on_enabled(c, &st), None);
     }
     if clicked.inner.clicked() {
+        app.ribbon_sub = None;
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
             pos: clicked.inner.rect.left_bottom(),
@@ -1049,21 +1227,61 @@ fn combo(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item], width: 
         .clone()
         .or_else(|| items.first().map(|i| i.label.clone()))
         .unwrap_or_default();
-    let mut picked: Option<String> = None;
-    ui.add_enabled_ui(on_enabled(c, &st), |ui| {
-        egui::ComboBox::from_id_salt(&c.id)
-            .selected_text(cur)
-            .width(width)
-            .show_ui(ui, |ui| {
-                for it in items {
-                    if ui.selectable_label(false, &it.label).clicked() {
-                        picked = Some(it.id.clone());
-                    }
-                }
-            });
+    let tip = tip_of(c);
+    let enabled = on_enabled(c, &st);
+    let clicked = ui.add_enabled_ui(enabled, |ui| {
+        let w = c.width.unwrap_or(width).max(52.0);
+        let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::click());
+        let hover = r.hovered() && enabled;
+        ui.painter().rect(
+            rect,
+            5.0,
+            if !enabled {
+                ui_kit::HOVER
+            } else if hover {
+                Color32::from_rgb(244, 247, 251)
+            } else {
+                Color32::from_rgb(250, 251, 253)
+            },
+            egui::Stroke::new(
+                1.0,
+                if !enabled {
+                    Color32::from_rgb(226, 232, 240)
+                } else if hover {
+                    Color32::from_rgb(176, 188, 204)
+                } else {
+                    ui_kit::CARD_BORDER
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 7.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            &cur,
+            FontId::proportional(12.0),
+            if enabled { ui_kit::TEXT } else { ui_kit::DISABLED },
+        );
+        ui_kit::caret(
+            ui,
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+            if enabled { Color32::from_rgb(68, 68, 68) } else { ui_kit::DISABLED },
+        );
+        r.on_hover_text(tip.clone())
     });
-    if let Some(p) = picked {
-        app.ribbon_action(&p, ui.ctx());
+    let name = if tip.is_empty() {
+        format!("{cur}（下拉）")
+    } else {
+        format!("{cur}，{tip}")
+    };
+    ui_kit::a11y_name(&clicked.inner, &name, enabled, None);
+    if clicked.inner.clicked() {
+        app.ribbon_sub = None;
+        app.ribbon_popup = Some(Popup {
+            kind: PopupKind::Items(items.to_vec()),
+            pos: clicked.inner.rect.left_bottom(),
+            opened_at: ui.input(|i| i.time),
+        });
     }
 }
 
@@ -1086,7 +1304,7 @@ fn edit(
             "RoomPassword" => &mut app.room_password,
             _ => return,
         };
-        ui.add(
+        let _ = ui.add(
             egui::TextEdit::singleline(buf)
                 .hint_text(hint)
                 .desired_width(width)
@@ -1130,6 +1348,34 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, l: &LabelCtl) {
         return;
     }
 
+    if l.id == "AreaLabel" {
+        ui.add_space(12.0);
+        let cw = 76.0_f32.max(measure(ui, &text, 12.0) + 18.0);
+        let (cr, _) = ui.allocate_exact_size(Vec2::new(cw, 46.0), Sense::hover());
+        ui.painter().rect(
+            cr,
+            6.0,
+            Color32::from_rgb(248, 250, 252),
+            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            egui::pos2(cr.center().x, cr.top() + 13.0),
+            Align2::CENTER_CENTER,
+            "当前区域",
+            FontId::proportional(10.0),
+            ui_kit::TEXT_WEAK,
+        );
+        ui.painter().text(
+            egui::pos2(cr.center().x, cr.bottom() - 13.0),
+            Align2::CENTER_CENTER,
+            &text,
+            FontId::monospace(12.0),
+            ui_kit::BRAND_NAVY,
+        );
+        return;
+    }
+
     if let Some(w) = l.width {
         // 页面布局那三行「宽度:/高度:/缩放:」是定宽标签 + 定宽下拉
         ui.add_sized(
@@ -1151,120 +1397,602 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, l: &LabelCtl) {
 
 // ---------------------------------------------------------------- 弹出层
 
+fn menu_shortcut(action: &str) -> &'static str {
+    match action {
+        "Paste" => "Ctrl+V",
+        "PasteValues" => "Ctrl+Shift+V",
+        "PasteSpecial" => "Ctrl+Alt+V",
+        "Copy" => "Ctrl+C",
+        "Cut" => "Ctrl+X",
+        "FillDown" => "Ctrl+D",
+        "FillRight" => "Ctrl+R",
+        "FlashFill" => "Ctrl+E",
+        "FindOpen" => "Ctrl+F",
+        "ReplaceOpen" => "Ctrl+H",
+        "GotoOpen" => "Ctrl+G",
+        "FormatCellsDialog" => "Ctrl+1",
+        "Filter" => "Ctrl+Shift+L",
+        "AutoSum" => "Alt+=",
+        "InsertTable" | "FormatAsTable" => "Ctrl+T",
+        "Hyperlink" => "Ctrl+K",
+        _ => "",
+    }
+}
+
+fn menu_swatch(action: &str) -> Option<Color32> {
+    Some(match action {
+        "CfBarBlue" => Color32::from_rgb(99, 142, 198),
+        "CfBarGreen" => Color32::from_rgb(99, 190, 123),
+        "CfBarRed" => Color32::from_rgb(248, 105, 107),
+        "CfBarOrange" => Color32::from_rgb(255, 166, 76),
+        "CfBarPurple" => Color32::from_rgb(147, 112, 219),
+        "CfBarTeal" => Color32::from_rgb(45, 178, 160),
+        "TabColorNone" => Color32::WHITE,
+        "TabColorRed" => Color32::from_rgb(192, 0, 0),
+        "TabColorOrange" => Color32::from_rgb(237, 125, 49),
+        "TabColorYellow" => Color32::from_rgb(255, 192, 0),
+        "TabColorGreen" => Color32::from_rgb(112, 173, 71),
+        "TabColorTeal" => Color32::from_rgb(0, 176, 176),
+        "TabColorBlue" => Color32::from_rgb(68, 114, 196),
+        "TabColorPurple" => Color32::from_rgb(112, 48, 160),
+        "TabColorGray" => Color32::from_rgb(128, 128, 128),
+        _ => return None,
+    })
+}
+
+fn menu_has_gutter(m: &Menu) -> bool {
+    m.items.iter().any(|it| match it {
+        MenuNode::Button(c) => c.image.is_some() || menu_swatch(c.action()).is_some(),
+        MenuNode::Menu(sub) => sub.ctl.image.is_some(),
+        _ => false,
+    })
+}
+
+fn measure_menu_width(app: &SheetApp, ui: &egui::Ui, m: &Menu, min_w: f32) -> f32 {
+    let gutter = menu_has_gutter(m);
+    let left_pad = if gutter { 30.0 } else { 10.0 };
+    let mut max_w = if m.ctl.id == "PasteMenu" {
+        min_w.max(216.0)
+    } else {
+        min_w
+    };
+    if m.ctl.id == "RecentFnMenu" {
+        for name in crate::fnrecent::menu_items() {
+            max_w = max_w.max(left_pad + measure(ui, &name, 12.0) + 14.0);
+        }
+        return max_w.clamp(min_w, 340.0);
+    }
+    for it in &m.items {
+        match it {
+            MenuNode::Separator => {}
+            MenuNode::Button(c) => {
+                let st = app.ctl_state(&c.id);
+                if !st.visible {
+                    continue;
+                }
+                let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
+                let sc = menu_shortcut(c.action());
+                let sc_w = if sc.is_empty() {
+                    0.0
+                } else {
+                    measure(ui, sc, 11.0) + 18.0
+                };
+                max_w = max_w.max(left_pad + measure(ui, &label, 12.0) + sc_w + 14.0);
+            }
+            MenuNode::Toggle(c) => {
+                let st = app.ctl_state(&c.id);
+                if !st.visible {
+                    continue;
+                }
+                let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
+                max_w = max_w.max(28.0 + measure(ui, &label, 12.0) + 16.0);
+            }
+            MenuNode::Menu(sub) => {
+                let label = sub.ctl.label.as_deref().unwrap_or("");
+                max_w = max_w.max(left_pad + measure(ui, label, 12.0) + 26.0);
+            }
+        }
+    }
+    max_w.clamp(min_w, 340.0)
+}
+
+fn measure_items_width(ui: &egui::Ui, items: &[Item]) -> f32 {
+    let is_styles = items.first().is_some_and(|i| i.id.starts_with("Style"));
+    let mut max_w: f32 = 188.0;
+    for it in items {
+        let w = if is_styles {
+            40.0 + measure(ui, &it.label, 12.0) + 18.0
+        } else {
+            24.0 + measure(ui, &it.label, 12.0)
+        };
+        max_w = max_w.max(w);
+    }
+    max_w.clamp(188.0, 320.0)
+}
+
+fn popup_menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: Option<Icon>,
+    swatch: Option<Color32>,
+    shortcut: &str,
+    has_sub: bool,
+    active_sub: bool,
+    enabled: bool,
+    row_w: f32,
+    icon_gutter: bool,
+) -> egui::Response {
+    let text_w = measure(ui, label, 12.0);
+    let sc_w = if shortcut.is_empty() {
+        0.0
+    } else {
+        measure(ui, shortcut, 11.0) + 16.0
+    };
+    let left_pad = if icon_gutter { 30.0 } else { 10.0 };
+    let right_pad = if has_sub { 24.0 } else { 12.0 };
+    let w = (left_pad + text_w + sc_w + right_pad).max(row_w);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
+    if enabled && resp.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 5.0, ui_kit::PRESSED);
+    } else if enabled && (resp.hovered() || active_sub) {
+        ui.painter().rect_filled(rect, 5.0, ui_kit::HOVER);
+    }
+    let col = if !enabled {
+        ui_kit::DISABLED
+    } else {
+        ui.visuals().text_color()
+    };
+    if icon_gutter {
+        if let Some(rgb) = swatch {
+            let sw = Rect::from_center_size(
+                egui::pos2(rect.left() + 15.0, rect.center().y),
+                Vec2::new(13.0, 13.0),
+            );
+            ui.painter().rect_filled(sw, 2.5, rgb);
+            ui.painter().rect_stroke(
+                sw,
+                2.5,
+                egui::Stroke::new(1.0, Color32::from_rgb(160, 170, 184)),
+                egui::StrokeKind::Inside,
+            );
+        } else if let Some(ic) = icon {
+            let ir = Rect::from_center_size(
+                egui::pos2(rect.left() + 15.0, rect.center().y),
+                Vec2::splat(16.0),
+            );
+            crate::ui_icons::draw_excel(ui.painter(), ir, ic, ui_kit::DISABLED, enabled);
+        }
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + left_pad, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        col,
+    );
+    if has_sub {
+        ui_kit::caret_right(
+            ui,
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            Color32::from_rgb(100, 116, 139),
+        );
+    } else if !shortcut.is_empty() {
+        ui.painter().text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            FontId::proportional(11.0),
+            Color32::from_rgb(130, 142, 158),
+        );
+    }
+    ui_kit::a11y_name(&resp, label, enabled, None);
+    resp
+}
+
+fn paste_visual_grid(
+    app: &SheetApp,
+    ui: &mut egui::Ui,
+    row_w: f32,
+    fire: &mut Option<String>,
+    close: &mut bool,
+) {
+    let paste_on = app.ctl_state("Paste").enabled;
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("粘贴选项")
+                .size(11.0)
+                .color(ui_kit::TEXT_WEAK),
+        );
+    });
+    ui.add_space(3.0);
+    let rows: [[(Icon, &str, &str); 5]; 2] = [
+        [
+            (Icon::Paste, "Paste", "粘贴 (Ctrl+V)"),
+            (Icon::PasteValues123, "PasteValues", "粘贴为数值 (Ctrl+Shift+V)"),
+            (Icon::Fx, "PasteFormulas", "仅粘贴公式"),
+            (Icon::Transpose, "PasteTranspose", "转置粘贴 (行列互换)"),
+            (Icon::Brush, "PasteFormats", "仅粘贴格式"),
+        ],
+        [
+            (Icon::Percent, "PasteValuesNumFmt", "值和数字格式"),
+            (Icon::CellStyle, "PasteValuesSourceFmt", "值和源格式"),
+            (Icon::NoBorder, "PasteNoBorders", "无边框粘贴"),
+            (Icon::ColWidth, "PasteColWidths", "保留源列宽"),
+            (Icon::PasteLink, "PasteLink", "粘贴链接"),
+        ],
+    ];
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (ic, act, tip) in row {
+                let (tr, resp) = ui.allocate_exact_size(
+                    Vec2::new(38.0, 32.0),
+                    if paste_on { Sense::click() } else { Sense::hover() },
+                );
+                let fill = if paste_on && resp.is_pointer_button_down_on() {
+                    ui_kit::PRESSED
+                } else if paste_on && resp.hovered() {
+                    ui_kit::HOVER
+                } else {
+                    Color32::from_rgb(248, 250, 252)
+                };
+                let stroke_col = if paste_on && resp.hovered() {
+                    ui_kit::ACCENT
+                } else {
+                    Color32::from_rgb(226, 232, 240)
+                };
+                ui.painter().rect(
+                    tr,
+                    5.0,
+                    fill,
+                    egui::Stroke::new(1.0, stroke_col),
+                    egui::StrokeKind::Inside,
+                );
+                crate::ui_icons::draw_excel(
+                    ui.painter(),
+                    Rect::from_center_size(tr.center(), Vec2::splat(19.0)),
+                    ic,
+                    ui_kit::DISABLED,
+                    paste_on,
+                );
+                ui_kit::a11y_name(&resp, &format!("快捷：{tip}"), paste_on, None);
+                if resp.on_hover_text(tip).clicked() && paste_on {
+                    *fire = Some(act.to_string());
+                    *close = true;
+                }
+            }
+        });
+        ui.add_space(3.0);
+    }
+    ui.add_space(2.0);
+    let (sr, _) = ui.allocate_exact_size(Vec2::new(row_w.max(206.0), 1.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(sr.left() + 6.0, sr.center().y),
+            egui::pos2(sr.right() - 6.0, sr.center().y),
+        ],
+        egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+    );
+    ui.add_space(2.0);
+}
+
+fn draw_menu_nodes(
+    app: &mut SheetApp,
+    ui: &mut egui::Ui,
+    menu_id: &str,
+    items: &[MenuNode],
+    min_w: f32,
+    icon_gutter: bool,
+    active_sub_id: Option<&str>,
+    fire: &mut Option<String>,
+    close: &mut bool,
+    want_sub: &mut Option<(String, Menu, egui::Pos2)>,
+    hover_non_sub: &mut bool,
+) {
+    if menu_id == "RecentFnMenu" {
+        for name in crate::fnrecent::menu_items() {
+            let r = popup_menu_row(ui, &name, None, None, "", false, false, true, min_w, icon_gutter);
+            if r.hovered() {
+                *hover_non_sub = true;
+            }
+            if r.clicked() {
+                *fire = Some(format!("InsertFn:{name}"));
+                *close = true;
+            }
+        }
+        return;
+    }
+    for it in items {
+        match it {
+            MenuNode::Separator => {
+                ui.add_space(2.0);
+                let (sr, _) = ui.allocate_exact_size(Vec2::new(min_w, 1.0), Sense::hover());
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(sr.left() + 6.0, sr.center().y),
+                        egui::pos2(sr.right() - 6.0, sr.center().y),
+                    ],
+                    egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+                );
+                ui.add_space(2.0);
+            }
+            MenuNode::Button(c) => {
+                let st = app.ctl_state(&c.id);
+                if !st.visible {
+                    continue;
+                }
+                let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
+                let icon = c.image.as_deref().and_then(icon_of);
+                let sw = menu_swatch(c.action());
+                let sc = menu_shortcut(c.action());
+                let r = popup_menu_row(ui, &label, icon, sw, sc, false, false, st.enabled, min_w, icon_gutter);
+                if r.hovered() {
+                    *hover_non_sub = true;
+                }
+                if r.clicked() && st.enabled {
+                    *fire = Some(c.action().to_string());
+                    *close = true;
+                }
+            }
+            MenuNode::Toggle(c) => {
+                let st = app.ctl_state(&c.id);
+                if !st.visible {
+                    continue;
+                }
+                let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
+                let r = ui_kit::check_row(ui, &label, st.checked, st.enabled, min_w);
+                if r.hovered() {
+                    *hover_non_sub = true;
+                }
+                if r.clicked() && st.enabled {
+                    *fire = Some(c.action().to_string());
+                    *close = true;
+                }
+            }
+            MenuNode::Menu(sub) => {
+                let label = sub.ctl.label.clone().unwrap_or_default();
+                let icon = sub.ctl.image.as_deref().and_then(icon_of);
+                let is_open = active_sub_id == Some(sub.ctl.id.as_str());
+                let r = popup_menu_row(ui, &label, icon, None, "", true, is_open, true, min_w, icon_gutter);
+                if r.hovered() || r.clicked() {
+                    *want_sub = Some((
+                        menu_id.to_string(),
+                        sub.clone(),
+                        egui::pos2(r.rect.right() + 6.0, r.rect.top() - 4.0),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(p) = app.ribbon_popup.clone() else {
+        app.ribbon_sub = None;
         return;
     };
     let ctx = ui.ctx().clone();
+    let screen = ctx.screen_rect();
+    let mut pos = p.pos;
+    let (inner_w, has_scroll, est_h) = match &p.kind {
+        PopupKind::Menu(m) => {
+            let gutter = menu_has_gutter(m);
+            let min_w = if m.ctl.id == "PasteMenu" {
+                216.0
+            } else if gutter {
+                192.0
+            } else {
+                176.0
+            };
+            let w = measure_menu_width(app, ui, m, min_w);
+            let scroll = m.items.len() > 13;
+            let extra = if m.ctl.id == "PasteMenu" { 104.0 } else { 0.0 };
+            let h = (m.items.len() as f32 * 28.0 + 18.0 + extra).min(460.0);
+            (w, scroll, h)
+        }
+        PopupKind::Items(items) => {
+            let w = measure_items_width(ui, items);
+            let scroll = items.len() > 10;
+            let h = (items.len() as f32 * 28.0 + 16.0).min(360.0);
+            (w, scroll, h)
+        }
+    };
+    let frame_inner_w = inner_w + if has_scroll { 14.0 } else { 0.0 };
+    let est_w = frame_inner_w + 12.0;
+    pos.x = pos.x.clamp(4.0, (screen.right() - est_w - 6.0).max(4.0));
+    pos.y = pos.y.clamp(28.0, (screen.bottom() - est_h - 6.0).max(28.0));
+
     let mut close = false;
     let mut fire: Option<String> = None;
+    let mut want_sub: Option<(String, Menu, egui::Pos2)> = None;
+    let mut hover_non_sub = false;
+    let active_sub_id = app.ribbon_sub.as_ref().map(|(_, s, _)| s.ctl.id.clone());
+
     let area = egui::Area::new(egui::Id::new("ribbon_popup"))
-        .fixed_pos(p.pos)
+        .fixed_pos(pos)
         .order(egui::Order::Foreground)
         .show(&ctx, |ui| {
             ui_kit::popup_frame(ui.style()).show(ui, |ui| {
-                ui.set_min_width(188.0);
+                ui.set_min_width(frame_inner_w);
+                ui.set_max_width(frame_inner_w);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 match &p.kind {
                     PopupKind::Menu(m) => {
-                        // UI-11.4：「最近使用的函数」按真实调用记录生成，不再用 XML 里写死的五项
-                        if m.ctl.id == "RecentFnMenu" {
-                            for name in crate::fnrecent::menu_items() {
-                                let r = ui_kit::popup_item(ui, &name, true, 176.0);
-                                if r.clicked() {
-                                    fire = Some(format!("InsertFn:{name}"));
-                                    close = true;
-                                }
-                            }
+                        let gutter = menu_has_gutter(m);
+                        if m.ctl.id == "PasteMenu" {
+                            paste_visual_grid(app, ui, inner_w, &mut fire, &mut close);
                         }
-                        for it in m.items.iter().filter(|_| m.ctl.id != "RecentFnMenu") {
-                            match it {
-                                MenuNode::Separator => {
-                                    ui.add_space(2.0);
-                                    let w = ui.available_width().max(176.0);
-                                    let (sr, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(sr.left() + 6.0, sr.center().y),
-                                            egui::pos2(sr.right() - 6.0, sr.center().y),
-                                        ],
-                                        egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
-                                    );
-                                    ui.add_space(2.0);
-                                }
-                                MenuNode::Button(c) => {
-                                    let st = app.ctl_state(&c.id);
-                                    if !st.visible {
-                                        continue;
-                                    }
-                                    let label =
-                                        st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
-                                    let r = ui_kit::popup_item(ui, &label, st.enabled, 176.0);
-                                    if r.clicked() {
-                                        fire = Some(c.action().to_string());
-                                        close = true;
-                                    }
-                                }
-                                MenuNode::Toggle(c) => {
-                                    let st = app.ctl_state(&c.id);
-                                    if !st.visible {
-                                        continue;
-                                    }
-                                    let label =
-                                        st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
-                                    let r = ui_kit::check_row(ui, &label, st.checked, st.enabled, 200.0);
-                                    if r.clicked() {
-                                        fire = Some(c.action().to_string());
-                                        close = true;
-                                    }
-                                }
-                                MenuNode::Menu(sub) => {
-                                    let label = sub.ctl.label.clone().unwrap_or_default();
-                                    let r = ui_kit::popup_item(ui, &label, true, 176.0);
-                                    ui_kit::caret_right(
-                                        ui,
-                                        egui::pos2(r.rect.right() - 10.0, r.rect.center().y),
-                                        Color32::from_rgb(100, 116, 139),
-                                    );
-                                    if r.clicked() {
-                                        app.ribbon_popup = Some(Popup {
-                                            kind: PopupKind::Menu(sub.clone()),
-                                            pos: egui::pos2(r.rect.right() + 2.0, r.rect.top()),
-                                            opened_at: ui.input(|i| i.time),
-                                        });
-                                    }
-                                }
-                            }
+                        let mut show_rows = |ui: &mut egui::Ui| {
+                            draw_menu_nodes(
+                                app,
+                                ui,
+                                &m.ctl.id,
+                                &m.items,
+                                inner_w,
+                                gutter,
+                                active_sub_id.as_deref(),
+                                &mut fire,
+                                &mut close,
+                                &mut want_sub,
+                                &mut hover_non_sub,
+                            );
+                        };
+                        if has_scroll {
+                            egui::ScrollArea::vertical().max_height(390.0).show(ui, show_rows);
+                        } else {
+                            show_rows(ui);
                         }
                     }
                     PopupKind::Items(items) => {
-                        for it in items {
-                            let r = ui_kit::popup_item(ui, &it.label, true, 176.0);
-                            if r.clicked() {
-                                fire = Some(it.id.clone());
-                                close = true;
+                        let is_styles = items.first().is_some_and(|i| i.id.starts_with("Style"));
+                        let mut show_items = |ui: &mut egui::Ui| {
+                            for it in items {
+                                if is_styles {
+                                    let (bg, fg, bold) = style_preview(&it.id);
+                                    let (rect, r) =
+                                        ui.allocate_exact_size(Vec2::new(inner_w, 27.0), Sense::click());
+                                    if r.is_pointer_button_down_on() {
+                                        ui.painter().rect_filled(rect, 5.0, ui_kit::PRESSED);
+                                    } else if r.hovered() {
+                                        ui.painter().rect_filled(rect, 5.0, ui_kit::HOVER);
+                                    }
+                                    let sw = Rect::from_center_size(
+                                        egui::pos2(rect.left() + 20.0, rect.center().y),
+                                        Vec2::new(26.0, 18.0),
+                                    );
+                                    ui.painter().rect(
+                                        sw,
+                                        3.0,
+                                        bg,
+                                        egui::Stroke::new(1.0, Color32::from_rgb(198, 206, 218)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    ui.painter().text(
+                                        sw.center(),
+                                        Align2::CENTER_CENTER,
+                                        "Aa",
+                                        FontId::proportional(if bold { 11.0 } else { 10.5 }),
+                                        fg,
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(rect.left() + 40.0, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &it.label,
+                                        FontId::proportional(12.0),
+                                        ui.visuals().text_color(),
+                                    );
+                                    ui_kit::a11y_name(&r, &it.label, true, None);
+                                    if r.clicked() {
+                                        fire = Some(it.id.clone());
+                                        close = true;
+                                    }
+                                } else {
+                                    let r = ui_kit::popup_item(ui, &it.label, true, inner_w);
+                                    if r.clicked() {
+                                        fire = Some(it.id.clone());
+                                        close = true;
+                                    }
+                                }
                             }
+                        };
+                        if has_scroll {
+                            egui::ScrollArea::vertical().max_height(340.0).show(ui, show_items);
+                        } else {
+                            show_items(ui);
                         }
                     }
                 }
             });
         });
     let rect = area.response.rect;
+
+    if let Some((pid, sub, spos)) = want_sub {
+        app.ribbon_sub = Some((pid, sub, spos));
+    }
+
+    let mut sub_rect: Option<Rect> = None;
+    if let Some((pid, sub, mut spos)) = app.ribbon_sub.clone() {
+        let sub_gutter = menu_has_gutter(&sub);
+        let sub_inner_w = measure_menu_width(app, ui, &sub, if sub_gutter { 186.0 } else { 170.0 });
+        let sub_scroll = sub.items.len() > 13;
+        let sub_frame_w = sub_inner_w + if sub_scroll { 14.0 } else { 0.0 };
+        let sub_outer_w = sub_frame_w + 12.0;
+        let sub_h = (sub.items.len() as f32 * 28.0 + 16.0).min(390.0);
+        if p.opened_at == 0.0 {
+            spos = egui::pos2(rect.right() + 2.0, rect.top() + 58.0);
+        }
+        if spos.x < rect.right() && spos.x + sub_outer_w > rect.left() {
+            spos.x = if rect.right() + sub_outer_w <= screen.right() - 6.0 {
+                rect.right() + 2.0
+            } else {
+                (rect.left() - sub_outer_w - 2.0).max(4.0)
+            };
+        } else if spos.x + sub_outer_w > screen.right() - 6.0 {
+            spos.x = (rect.left() - sub_outer_w - 2.0).max(4.0);
+        }
+        spos.x = spos.x.clamp(4.0, (screen.right() - sub_outer_w - 4.0).max(4.0));
+        spos.y = spos.y.clamp(28.0, (screen.bottom() - sub_h - 6.0).max(28.0));
+        let mut dummy_sub: Option<(String, Menu, egui::Pos2)> = None;
+        let mut dummy_hover = false;
+        let sub_area = egui::Area::new(egui::Id::new("ribbon_sub_popup"))
+            .fixed_pos(spos)
+            .order(egui::Order::Foreground)
+            .show(&ctx, |ui| {
+                ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(sub_frame_w);
+                    ui.set_max_width(sub_frame_w);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let mut show_sub = |ui: &mut egui::Ui| {
+                        draw_menu_nodes(
+                            app,
+                            ui,
+                            &sub.ctl.id,
+                            &sub.items,
+                            sub_inner_w,
+                            sub_gutter,
+                            None,
+                            &mut fire,
+                            &mut close,
+                            &mut dummy_sub,
+                            &mut dummy_hover,
+                        );
+                    };
+                    if sub_scroll {
+                        egui::ScrollArea::vertical().max_height(370.0).show(ui, show_sub);
+                    } else {
+                        show_sub(ui);
+                    }
+                });
+            });
+        sub_rect = Some(sub_area.response.rect);
+        let ptr_pos = ctx.input(|i| i.pointer.hover_pos());
+        if hover_non_sub
+            && !ptr_pos.is_some_and(|pt| sub_area.response.rect.contains(pt))
+            && matches!(&p.kind, PopupKind::Menu(m) if m.ctl.id == pid)
+        {
+            app.ribbon_sub = None;
+        }
+    }
+
     if let Some(a) = fire {
         app.ribbon_action(&a, &ctx);
     }
     let now = ctx.input(|i| i.time);
     let fresh = now - p.opened_at < 0.08;
+    let in_popup = ctx
+        .input(|i| i.pointer.interact_pos())
+        .map(|pt| rect.contains(pt) || sub_rect.is_some_and(|sr| sr.contains(pt)))
+        .unwrap_or(false);
     if close
         || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        || (!fresh
-            && ctx.input(|i| i.pointer.any_click())
-            && !ctx
-                .input(|i| i.pointer.interact_pos())
-                .map(|p| rect.contains(p))
-                .unwrap_or(false))
+        || (!fresh && ctx.input(|i| i.pointer.any_click()) && !in_popup)
     {
         app.ribbon_popup = None;
+        app.ribbon_sub = None;
     }
 }
 
@@ -1533,10 +2261,11 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 65.0), Sense::hover());
     let arrow_w = 24.0;
     let area = Rect::from_min_max(rect.min, egui::pos2(rect.right() - arrow_w, rect.bottom()));
-    let n = items.len().max(1) as f32;
+    let inline_items = &items[..items.len().min(5)];
+    let n = inline_items.len().max(1) as f32;
     let tw = area.width() / n;
     let mut fire: Option<String> = None;
-    for (i, it) in items.iter().enumerate() {
+    for (i, it) in inline_items.iter().enumerate() {
         let r = Rect::from_min_size(
             egui::pos2(area.left() + i as f32 * tw + 1.0, area.top() + 1.0),
             Vec2::new(tw - 2.0, 63.0),
@@ -1614,6 +2343,7 @@ fn gallery(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item]) {
         ui.visuals().text_color(),
     );
     if ar.clicked() && enabled {
+        app.ribbon_sub = None;
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
             pos: egui::pos2(rect.right() - arrow_w, rect.top()),
@@ -1647,26 +2377,32 @@ fn gallery_compact(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item
     if !st.visible {
         return;
     }
-    let label = c
+    let full_label = c
         .label
         .clone()
         .or_else(|| st.label.clone())
         .filter(|l| !l.is_empty())
         .unwrap_or_else(|| "单元格样式".to_string());
+    let vis_label = if RIBBON_MID.with(|m| m.get()) && full_label == "单元格样式" {
+        "样式".to_string()
+    } else {
+        full_label.clone()
+    };
     let enabled = on_enabled(c, &st);
-    let tw = measure(ui, &label, 12.0);
-    let w = (tw + 14.0).max(62.0);
-    let ic = c.image.as_deref().and_then(icon_of).unwrap_or(Icon::FormatCells);
+    let tw = measure(ui, &vis_label, 12.0);
+    let w = (tw + 14.0).max(if vis_label != full_label { 46.0 } else { 62.0 });
+    let ic = c.image.as_deref().and_then(icon_of).unwrap_or(Icon::CellStyle);
     let (r, ar) = ui.add_enabled_ui(enabled, |ui| {
-        ui_kit::big_sized_split(ui, ic, &label, Vec2::new(w, 76.0))
+        ui_kit::big_sized_split(ui, ic, &vis_label, Vec2::new(w, 76.0))
     }).inner;
     {
         let mut main = r.rect;
         main.max.y = main.max.y.min(ar.rect.top());
-        ui_kit::a11y_name_rect(&r, &label, enabled, main, ui.ctx());
+        ui_kit::a11y_name_rect(&r, &full_label, enabled, main, ui.ctx());
     }
-    ui_kit::a11y_name(&ar, &format!("{label} 展开"), enabled, None);
+    ui_kit::a11y_name(&ar, &format!("{full_label} 展开"), enabled, None);
     if (r.clicked() || ar.clicked()) && enabled {
+        app.ribbon_sub = None;
         app.ribbon_popup = Some(Popup {
             kind: PopupKind::Items(items.to_vec()),
             pos: egui::pos2(r.rect.left(), ar.rect.bottom()),
@@ -1676,17 +2412,7 @@ fn gallery_compact(app: &mut SheetApp, ui: &mut egui::Ui, c: &Ctl, items: &[Item
 }
 
 fn style_preview(id: &str) -> (Color32, Color32, bool) {
-    match id {
-        "StyleTitle" => (Color32::WHITE, Color32::from_rgb(31, 78, 121), true),
-        "StyleHeading" => (
-            Color32::from_rgb(217, 226, 243),
-            Color32::from_rgb(31, 56, 100),
-            true,
-        ),
-        "StyleGood" => (Color32::from_rgb(198, 239, 206), Color32::from_rgb(0, 97, 0), false),
-        "StyleBad" => (Color32::from_rgb(255, 199, 206), Color32::from_rgb(156, 0, 6), false),
-        _ => (Color32::WHITE, ui_kit::TEXT, false),
-    }
+    crate::wps_menus::style_preset_visuals(id)
 }
 
 pub fn icon_of(name: &str) -> Option<Icon> {
@@ -1841,6 +2567,22 @@ pub fn icon_of(name: &str) -> Option<Icon> {
         "SparkColumn" => Icon::SparkColumn,
         "SparkLoss" => Icon::SparkLoss,
         "TextBox" => Icon::TextBox,
+        "PasteValues123" => Icon::PasteValues123,
+        "StrikeThrough" => Icon::StrikeThrough,
+        "Spotlight" => Icon::Spotlight,
+        "SplitPanes" => Icon::SplitPanes,
+        "HighlightDup" => Icon::HighlightDup,
+        "RejectDup" => Icon::RejectDup,
+        "MergeSame" => Icon::MergeSame,
+        "InsertCell" => Icon::InsertCell,
+        "DeleteCell" => Icon::DeleteCell,
+        "CellStyle" => Icon::CellStyle,
+        "FnBook" => Icon::FnBook,
+        "Transpose" => Icon::Transpose,
+        "PasteLink" => Icon::PasteLink,
+        "PastePic" => Icon::PastePic,
+        "NoBorder" => Icon::NoBorder,
+        "ColWidth" => Icon::ColWidth,
         _ => return None,
     })
 }

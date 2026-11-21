@@ -24,6 +24,7 @@ pub(crate) struct DocumentTasks {
     /// UI-29.3：加载遮罩上显示的文件名与起始时刻（打开完成即清空）
     pub open_label: Option<String>,
     pub open_started: Option<Instant>,
+    pub open_path: Option<PathBuf>,
 }
 
 pub(crate) struct PendingSave {

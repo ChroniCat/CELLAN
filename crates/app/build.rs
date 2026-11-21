@@ -9,6 +9,9 @@ use std::process::Command;
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    emit_embedded_ai_key(&manifest, &out);
+
     let ico = manifest.join("../../assets/app.ico");
     println!("cargo:rerun-if-changed={}", ico.display());
     if !ico.exists() {
@@ -22,7 +25,6 @@ fn main() {
         println!("cargo:warning=没找到 rc.exe（Windows SDK），exe 图标不打包");
         return;
     };
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let rc_file = out.join("app.rc");
     let res_file = out.join("app.res");
     // rc 的路径里反斜杠要转义，用正斜杠最稳；同时打入 VERSIONINFO，让资源管理器与任务管理器显示 CELLAN 与统一版本号
@@ -119,4 +121,46 @@ fn find_rc() -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// 编译期注入本地分发密钥（源码仓库不提交任何硬编码密钥）：
+/// - 优先读取环境变量 `CELLAN_AI_KEY`；
+/// - 其次读取工作区根目录下已被 `.gitignore` 忽略的 `.cellan-ai-key.local`；
+/// - GitHub 克隆/CI 环境两者皆无时生成空切片，程序正常编译并提示用户自行配置密钥；
+/// - 本地打包 `CELLAN.exe` 时自动掩码编码打进二进制，无需附带外部密钥文件即可开箱使用。
+fn emit_embedded_ai_key(manifest: &Path, out: &Path) {
+    let key_file = manifest.join("../../.cellan-ai-key.local");
+    println!("cargo:rerun-if-env-changed=CELLAN_AI_KEY");
+    println!("cargo:rerun-if-changed={}", key_file.display());
+
+    let from_env = std::env::var("CELLAN_AI_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let raw_key = from_env.unwrap_or_else(|| {
+        std::fs::read_to_string(&key_file)
+            .ok()
+            .and_then(|txt| {
+                txt.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    });
+
+    let masked: Vec<String> = raw_key
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let mask = 0xA7u8.wrapping_add((i as u8).wrapping_mul(0x3D)) ^ 0x5C;
+            format!("0x{:02X}", b ^ mask)
+        })
+        .collect();
+    let code = format!(
+        "const EMBEDDED_AI_KEY_MASKED: &[u8] = &[{}];\n",
+        masked.join(", ")
+    );
+    let _ = std::fs::write(out.join("builtin_ai_key.rs"), code);
 }

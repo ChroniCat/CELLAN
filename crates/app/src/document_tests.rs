@@ -2,7 +2,7 @@
 
 use super::*;
 use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 fn app() -> SheetApp {
     SheetApp::new_with_context(&egui::Context::default(), None)
@@ -11,6 +11,126 @@ fn app() -> SheetApp {
 fn put(wb: &mut Workbook, number: f64) {
     wb.sheets[0].set(0, 0, Cell { value: Value::Number(number), formula: None });
     wb.dirty = true;
+}
+
+#[test]
+fn private_workbook_revisions_stay_in_this_session() {
+    let env = crate::test_env::TestEnv::new("private-revisions");
+    let mut app = app();
+    let path = env.path("private.xlsx");
+    app.wb.path = Some(path.clone());
+    let before = Cell { value: Value::Number(21.0), formula: None };
+    let after = Cell { value: Value::Number(42.0), formula: Some("21*2".into()) };
+    let delta = sheetcore::undo::CellDelta {
+        sheet: 0, row: 0, col: 0, before: before.clone(), after: after.clone(),
+        before_style: 0, after_style: 0,
+    };
+    app.wb.sheets[0].set(0, 0, after);
+    let enc = sheetcore::crypto::EncryptionSettings::new("test-open-password");
+    for (source, output) in [(false, true), (true, true), (true, false)] {
+        app.wb.source_encryption = source.then(|| enc.clone());
+        app.wb.encryption = output.then(|| enc.clone());
+        app.rev.clear();
+        app.record_revision("local", std::slice::from_ref(&delta));
+        app.record_remote_ops(&[sheetcore::sync::Op {
+            sheet: 0, row: 0, col: 0, value: sheetcore::sync::ValueWire::Number(42.0),
+            formula: Some("21*2".into()), ts: 1, site: 7,
+        }], vec![Some(before.clone())]);
+        app.reload_revisions();
+        assert_eq!(app.rev.len(), 2);
+        assert!(app.rev[1].remote);
+        assert!(!sheetcore::revision::dir_for(&path).exists());
+        assert!(!env.path(".~sheetflow-history").exists());
+    }
+    app.wb.encryption = None;
+    app.wb.source_encryption = None;
+    app.rev.clear();
+    app.record_revision("in_memory_only", &[delta]);
+    app.reload_revisions();
+    assert_eq!(app.rev.len(), 1);
+    assert_eq!(app.rev[0].label, "in_memory_only");
+    assert!(!sheetcore::revision::dir_for(&path).exists());
+    assert!(!env.path(".~sheetflow-history").exists());
+}
+
+#[test]
+fn shared_directory_auto_hosts_and_peers_auto_join_silently_without_passwords() {
+    let env = crate::test_env::TestEnv::new("silent-auto-collaboration");
+    unsafe {
+        std::env::set_var("SC_HOST_ADDR", "127.0.0.1");
+    }
+
+    // 1. 普通私有未共享目录：无他人占用卡时不主动监听端口
+    let local_dir = env.path("private-local");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local_path = local_dir.join("draft.xlsx");
+    sheetcore::xlsx::save(&local_path, &book(1.0)).unwrap();
+    let mut local_app = app();
+    local_app.wb.path = Some(local_path.clone());
+    local_app.try_auto_join();
+    local_app.auto_discovery_tick();
+    assert!(local_app.net.is_none());
+    assert!(!session_lock::lock_path(&local_path).exists());
+
+    // 2. 共享目录：甲和乙零口令、零手工点击，打开同一文件即自动建房并连入实时同步
+    let shared_dir = env.path("team-shared");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let shared_path = shared_dir.join("book.xlsx");
+    sheetcore::xlsx::save(&shared_path, &book(10.0)).unwrap();
+    session_lock::set_dir_marked_shared(&shared_path, true).unwrap();
+
+    let mut host_a = app();
+    host_a.my_name = "甲".into();
+    host_a.wb = book(25.0);
+    host_a.wb.path = Some(shared_path.clone());
+    assert!(host_a.room_password.is_empty() && host_a.auto_share);
+    host_a.try_auto_join();
+    assert!(
+        host_a.net.as_ref().is_some_and(|n| n.hosting),
+        "甲打开共享目录文件应静默自动开启宿主"
+    );
+
+    let mut peer_b = app();
+    peer_b.my_name = "乙".into();
+    peer_b.wb = book(10.0);
+    peer_b.wb.path = Some(shared_path.clone());
+    assert!(peer_b.room_password.is_empty() && peer_b.auto_share);
+    peer_b.try_auto_join();
+    assert!(
+        peer_b.net.as_ref().is_some_and(|n| !n.hosting),
+        "乙打开同一文件应静默自动加入甲的会话"
+    );
+
+    for _ in 0..40 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(peer_b.joined_doc, "乙应无阻塞完成快照同步");
+    assert_eq!(peer_b.wb.sheets[0].value(0, 0), Value::Number(25.0));
+    assert_eq!(host_a.peers_list.len(), 2, "甲应立即看到在线 2 人");
+    assert_eq!(peer_b.peers_list.len(), 2, "乙应立即看到在线 2 人");
+
+    peer_b.leave_session();
+    host_a.leave_session();
+    unsafe {
+        std::env::remove_var("SC_HOST_ADDR");
+    }
+}
+
+#[test]
+fn room_password_belongs_to_its_workbook_tab() {
+    let _env = crate::test_env::TestEnv::new("room-password-tabs");
+    let mut app = app();
+    app.has_open_workbook = true;
+    app.room_password = "first-room".into();
+    app.open_in_new_tab(PathBuf::new());
+    assert!(app.room_password.is_empty());
+    app.room_password = "second-room".into();
+    app.switch_tab(0);
+    assert_eq!(app.room_password, "first-room");
+    app.switch_tab(1);
+    assert_eq!(app.room_password, "second-room");
 }
 
 fn book(number: f64) -> Workbook {
@@ -95,12 +215,7 @@ fn failed_or_disconnected_save_keeps_owner_dirty() {
 
 #[test]
 fn unsupported_xls_save_keeps_formula_and_shows_compatibility_warning() {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("sc_app_xls_compat_{}_{}", std::process::id(), stamp));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_env::scratch("sc_app_xls_compat");
     let target = dir.join("keep.xls");
     std::fs::write(&target, b"ORIGINAL").unwrap();
     let mut app = app();
@@ -137,7 +252,7 @@ fn loading_and_recalculation_follow_the_tab_that_started_them() {
     app.tasks.busy = true;
     app.open_in_new_tab(PathBuf::new());
     put(&mut app.wb, 99.0);
-    tx.send(OpenMsg::Loaded(Box::new(book(10.0)), false, Box::new(sheetcore::xlsx::LoadDiag::default()))).unwrap();
+    tx.send(OpenMsg::Loaded(Box::new(book(10.0)), false, Box::new(sheetcore::xlsx::LoadDiag::default()), String::new())).unwrap();
     tx.send(OpenMsg::Recalced(
         Box::new(book(20.0)), Box::new(sheetcore::formula::deps::Deps::empty()),
     )).unwrap();
@@ -188,6 +303,35 @@ fn recalculation_cannot_restore_the_path_from_before_save_as() {
     app.poll_open();
     assert_eq!(app.wb.path, Some(PathBuf::from("new.xlsx")));
     assert!(!app.wb.dirty, "old calculation must not restore old save state");
+}
+
+#[test]
+fn recalculation_preserves_current_input_and_output_passwords() {
+    let _env = crate::test_env::TestEnv::new("recalc-passwords");
+    for manual in [false, true] {
+        for removing in [false, true] {
+            let mut app = app();
+            let previous = sheetcore::crypto::EncryptionSettings::new("earlier");
+            app.wb.encryption = Some(previous.clone());
+            app.wb.source_encryption = Some(previous);
+            let snapshot = app.wb.clone();
+            app.wb.encryption = (!removing).then(|| sheetcore::crypto::EncryptionSettings::new("chosen"));
+            app.wb.source_encryption = Some(sheetcore::crypto::EncryptionSettings::new("saved"));
+            let (tx, rx) = mpsc::channel();
+            app.tasks.open_rx = Some(rx);
+            let wb = Box::new(snapshot);
+            let deps = Box::new(sheetcore::formula::deps::Deps::empty());
+            let msg = if manual {
+                OpenMsg::RecalcedWb(wb, deps, app.wb_epoch, app.doc_gen)
+            } else {
+                OpenMsg::Recalced(wb, deps)
+            };
+            tx.send(msg).unwrap();
+            app.poll_open();
+            assert!(app.wb.encryption.as_ref().map(|e| e.password.as_str()) == (!removing).then_some("chosen"));
+            assert!(app.wb.source_encryption.as_ref().is_some_and(|e| e.password == "saved"));
+        }
+    }
 }
 
 #[test]
@@ -264,6 +408,95 @@ fn failed_save_in_the_close_frame_keeps_the_window_open() {
         .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
     assert!(parked(&app, 0).wb.dirty);
     assert!(app.status.contains("disk full"));
+}
+
+#[test]
+fn pending_validation_input_survives_close_save_tab_switch_and_ai() {
+    for style in [sheetcore::dv::DvStyle::Warning, sheetcore::dv::DvStyle::Information] {
+        let mut app = app();
+        app.open_in_new_tab(PathBuf::new());
+        app.wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(0, 0, 0, 0)], kind: sheetcore::dv::DvKind::Whole,
+            f1: "1".into(), f2: "10".into(), error_style: style, ..Default::default()
+        });
+        app.editing = Some(EditState::new("99".into()));
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| app.commit_edit_before_close(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+            .any(|cmd| matches!(cmd, egui::ViewportCommand::CancelClose)));
+        app.save(false);
+        app.switch_tab(0);
+        app.toggle_ai_assistant(Some(true));
+        app.start_ai_prompt("查看金额".into());
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.dv_alert.as_ref().unwrap().buf, "99");
+        assert!(!app.ai.busy && !app.has_pending_save());
+    }
+}
+
+#[test]
+fn save_and_exit_refuses_to_overwrite_another_open_document() {
+    let env = crate::test_env::TestEnv::new("close-path-conflict");
+    let path = env.path("shared-name.xlsx");
+    let mut app = app();
+    app.wb.path = Some(path.clone());
+    app.open_in_new_tab(PathBuf::new());
+    put(&mut app.wb, 22.0);
+    app.wb.path = Some(path.clone());
+    app.save_all_before_exit = true;
+    app.advance_save_and_exit(&egui::Context::default());
+    assert!(!app.has_pending_save() && !app.save_all_before_exit);
+    assert!(app.wb.dirty && !path.exists());
+    assert!(app.status.contains("其他标签页"));
+}
+
+#[test]
+fn save_and_exit_waits_for_dirty_background_documents_and_newer_edits() {
+    let env = crate::test_env::TestEnv::new("save-all-close");
+    let mut app = app();
+    let a = env.path("a.xlsx");
+    let b = env.path("b.xlsx");
+    app.wb.path = Some(a.clone());
+    put(&mut app.wb, 11.0);
+    app.open_in_new_tab(PathBuf::new());
+    app.wb.path = Some(b.clone());
+    put(&mut app.wb, 22.0);
+    let ctx = egui::Context::default();
+    app.save_all_before_exit = true;
+    app.advance_save_and_exit(&ctx);
+    assert!(app.has_pending_save());
+    put(&mut app.wb, 23.0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    while app.save_all_before_exit && Instant::now() < deadline {
+        app.poll_save();
+        let output = ctx.run(Default::default(), |ctx| app.advance_save_and_exit(ctx));
+        closed |= output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+            .any(|cmd| matches!(cmd, egui::ViewportCommand::Close));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(closed && !app.has_pending_save());
+    assert_eq!(sheetcore::xlsx::load(&a).unwrap().sheets[0].value(0, 0), Value::Number(11.0));
+    assert_eq!(sheetcore::xlsx::load(&b).unwrap().sheets[0].value(0, 0), Value::Number(23.0));
+}
+
+#[test]
+fn save_and_exit_stops_on_background_failure_and_preserves_dirty_workbook() {
+    let mut app = app();
+    let tx = delayed_save(&mut app, "background.xlsx");
+    app.open_in_new_tab(PathBuf::new());
+    app.save_all_before_exit = true;
+    tx.send(Err("disk full".into())).unwrap();
+    app.poll_save();
+    let ctx = egui::Context::default();
+    let output = ctx.run(Default::default(), |ctx| app.advance_save_and_exit(ctx));
+    assert!(!app.save_all_before_exit);
+    assert!(parked(&app, 0).wb.dirty);
+    assert!(app.status.contains("disk full"));
+    assert!(!output.viewport_output[&egui::ViewportId::ROOT].commands.iter()
+        .any(|cmd| matches!(cmd, egui::ViewportCommand::Close)));
 }
 
 #[test]
@@ -346,14 +579,9 @@ fn duplicate_insertion_keeps_existing_local_name_scopes() {
 
 #[test]
 fn ordinary_app_save_keeps_real_file_history_and_later_edits() {
-    let dir = std::env::temp_dir().join(format!(
-        "sheetflow-app-save-{}-{}", std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_env::scratch("sheetflow-app-save");
     let path = dir.join("book.xlsx");
     sheetcore::xlsx::save_atomic(&path, &book(11.0)).unwrap();
-    let original = std::fs::read(&path).unwrap();
     let mut app = app();
     app.wb = sheetcore::xlsx::load(&path).unwrap();
     put(&mut app.wb, 22.0);
@@ -369,24 +597,18 @@ fn ordinary_app_save_keeps_real_file_history_and_later_edits() {
     assert!(app.wb.dirty, "edits after the snapshot must remain unsaved");
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(33.0));
     assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(22.0));
-    let history = sheetcore::backup::list(&path);
-    assert_eq!(history.len(), 1, "Ctrl+S must back up the actual target");
-    assert_eq!(std::fs::read(&history[0].path).unwrap(), original);
+    assert!(sheetcore::backup::list(&path).is_empty(), "Ctrl+S must not create automatic backup copies");
+    assert!(!dir.join(".~sheetflow-history").exists());
     assert!(sheetcore::backup::list(&path.with_extension("xlsx.tmp")).is_empty());
 }
 
 #[test]
 fn xls_save_as_uses_native_format_history_and_its_owning_tab() {
-    let dir = std::env::temp_dir().join(format!(
-        "sheetflow-app-xls-save-{}-{}", std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_env::scratch("sheetflow-app-xls-save");
     let source = dir.join("source.xlsx");
     let target = dir.join("book.XLS");
     sheetcore::xlsx::save_atomic(&source, &book(11.0)).unwrap();
     sheetcore::xls_write::write(&target, &book(10.0)).unwrap();
-    let original = std::fs::read(&target).unwrap();
     let mut app = app();
     app.wb = sheetcore::xlsx::load(&source).unwrap();
     put(&mut app.wb, 22.0);
@@ -409,19 +631,13 @@ fn xls_save_as_uses_native_format_history_and_its_owning_tab() {
     assert!(std::fs::read(&target).unwrap().starts_with(&[0xD0, 0xCF, 0x11, 0xE0]));
     assert_eq!(sheetcore::xlsx::load(&target).unwrap().sheets[0].value(0, 0), Value::Number(22.0));
     assert_eq!(sheetcore::xlsx::load(&source).unwrap().sheets[0].value(0, 0), Value::Number(11.0));
-    let history = sheetcore::backup::list(&target);
-    assert_eq!(history.len(), 1);
-    assert_eq!(std::fs::read(&history[0].path).unwrap(), original);
+    assert!(sheetcore::backup::list(&target).is_empty());
+    assert!(!dir.join(".~sheetflow-history").exists());
 }
 
 #[test]
 fn xls_save_with_formula_succeeds() {
-    let dir = std::env::temp_dir().join(format!(
-        "sheetflow-app-xls-formula-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_env::scratch("sheetflow-app-xls-formula");
     let target = dir.join("book.xls");
     sheetcore::xls_write::write(&target, &book(11.0)).unwrap();
     let mut app = app();
@@ -468,7 +684,7 @@ fn compatibility_warning_is_visible_on_open() {
         "外部工作簿三维引用暂不参与重算；保留文件缓存".into(),
         false,
     );
-    tx.send(OpenMsg::Loaded(Box::new(book(1.0)), false, Box::new(diag))).unwrap();
+    tx.send(OpenMsg::Loaded(Box::new(book(1.0)), false, Box::new(diag), String::new())).unwrap();
     app.switch_tab(0);
     app.poll_open();
     assert!(app.show_load_diag, "兼容诊断必须可见，不能只在状态栏一闪而过");
@@ -478,7 +694,88 @@ fn compatibility_warning_is_visible_on_open() {
 
 
 #[test]
-fn actual_external_3d_fixture_opens_with_visible_compatibility_warning() {
+fn load_diag_close_button_and_window_open_dismiss_modal() {
+    let mut app = app();
+    let mut diag = sheetcore::xlsx::LoadDiag::default();
+    diag.push(
+        Some("Sheet1"),
+        "xl/worksheets/sheet1.xml",
+        "读取警告",
+        "示例非致命诊断".into(),
+        false,
+    );
+    app.load_diag = Some(diag);
+    app.show_load_diag = true;
+
+    let ctx = egui::Context::default();
+    fn run_diag_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 720.0),
+        ));
+        raw.events = events;
+        ctx.run(raw, |ctx| {
+            app.load_diag_ui(ctx);
+        });
+    }
+
+    // 第 1 帧：弹窗可见且打上对话框标记
+    run_diag_frame(&mut app, &ctx, vec![]);
+    assert!(ui_kit::take_dialog_shown(&ctx), "第 1 帧应渲染工作簿加载诊断");
+
+    // Escape 关闭后，下一帧不应再渲染窗口（即使 self.load_diag 仍保留供状态栏重开）
+    run_diag_frame(&mut app, &ctx, vec![egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    assert!(!app.show_load_diag, "Escape 应关闭诊断弹窗");
+    let _ = ui_kit::take_dialog_shown(&ctx);
+    run_diag_frame(&mut app, &ctx, vec![]);
+    assert!(!ui_kit::take_dialog_shown(&ctx), "关闭后的下一帧不得继续渲染弹窗");
+    assert!(app.load_diag.is_some(), "保留 diag 以便状态栏再次查看");
+
+    // 通过 ui_kit::window(.open(&mut false)) 验证即使直接传 false 也不渲染
+    let mut forced_closed = false;
+    let mut raw = egui::RawInput::default();
+    raw.screen_rect = Some(egui::Rect::from_min_size(
+        egui::pos2(0.0, 0.0),
+        egui::vec2(1000.0, 720.0),
+    ));
+    let mut body_ran = false;
+    ctx.run(raw, |ctx| {
+        ui_kit::window(ctx, "工作簿加载诊断", 560.0)
+            .open(&mut forced_closed)
+            .show(ctx, |_| {
+                body_ran = true;
+            });
+    });
+    assert!(!body_ran, "open=false 时 Dlg::show 必须直接返回且不渲染窗口");
+    assert!(!ui_kit::take_dialog_shown(&ctx));
+
+    // 点击底部「关闭」按钮（Tab / Enter 命中主按钮「关闭」）同样必须关闭弹窗并清模态
+    app.show_load_diag = true;
+    run_diag_frame(&mut app, &ctx, vec![]);
+    assert!(ui_kit::take_dialog_shown(&ctx));
+    run_diag_frame(&mut app, &ctx, vec![egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    assert!(!app.show_load_diag, "点击/触发「关闭」主按钮必须关闭工作簿加载诊断");
+    let _ = ui_kit::take_dialog_shown(&ctx);
+    run_diag_frame(&mut app, &ctx, vec![]);
+    assert!(!ui_kit::take_dialog_shown(&ctx), "点击关闭后不得残留对话框");
+}
+
+
+#[test]
+fn actual_external_3d_fixture_opens_cleanly_without_compatibility_warning() {
     let mut app = app();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../core/tests/fixtures/c11_external_3d.xlsx");
@@ -489,9 +786,680 @@ fn actual_external_3d_fixture_opens_with_visible_compatibility_warning() {
         std::thread::sleep(Duration::from_millis(20));
     }
     app.poll_open();
-    assert!(app.show_load_diag, "真实导入的兼容诊断必须可见");
+    assert!(!app.show_load_diag, "原生支持外部三维引用后不应再弹加载诊断警告");
+    assert!(app.load_diag.is_none(), "c11_external_3d.xlsx 应完整加载无警告：{:?}", app.load_diag);
     let cell = app.wb.sheets[0].get(0, 0).expect("fixture A1");
     assert_eq!(cell.formula.as_deref(), Some("=SUM([1]First:Third!A1)"));
     assert_eq!(cell.value, Value::Number(60.0));
-    assert!(app.load_diag.as_ref().is_some_and(|d| d.problems.iter().any(|p| p.what == "兼容提示")));
+}
+
+
+#[test]
+fn poll_open_requests_opens_distinct_file_in_new_tab_and_switches_to_parked_duplicate() {
+    let env = crate::test_env::TestEnv::new("single_inst_tabs");
+    let dir = env.path("docs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.xlsx");
+    let b = dir.join("b.xlsx");
+    let c = dir.join("c.xlsx");
+    sheetcore::xlsx::save(&a, &book(11.0)).unwrap();
+    sheetcore::xlsx::save(&b, &book(22.0)).unwrap();
+    sheetcore::xlsx::save(&c, &book(33.0)).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = app();
+    let drain_open = |app: &mut SheetApp| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && (app.tasks.busy || app.tasks.open_rx.is_some()) {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        app.poll_open();
+    };
+
+    app.open_path(a.clone());
+    drain_open(&mut app);
+    app.open_in_new_tab(b.clone());
+    drain_open(&mut app);
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active_tab, 1);
+
+    let (tx, rx) = mpsc::channel();
+    app.open_requests = Some(rx);
+
+    // 1. 重复双击已在后台标签页 0 打开的 a.xlsx：切回标签 0，不得再开新标签
+    tx.send(a.clone()).unwrap();
+    app.poll_open_requests(&ctx);
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active_tab, 0);
+    assert_eq!(app.wb.path.as_ref(), Some(&a));
+
+    // 2. 双击全新文件 c.xlsx：自动并入第 3 个标签页并激活
+    tx.send(c.clone()).unwrap();
+    app.poll_open_requests(&ctx);
+    drain_open(&mut app);
+    assert_eq!(app.tabs.len(), 3);
+    assert_eq!(app.active_tab, 2);
+    assert_eq!(app.wb.path.as_ref(), Some(&c));
+}
+
+
+#[test]
+fn append_crash_log_writes_version_and_diagnostic_to_app_dir() {
+    let _env = crate::test_env::TestEnv::new("crash_log");
+    let path = crate::append_crash_log("STARTUP_ERROR", "mock gl error")
+        .expect("crash.log path");
+    assert!(path.is_file());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(crate::update::APP_NAME));
+    assert!(text.contains(crate::update::VERSION));
+    assert!(text.contains("STARTUP_ERROR"));
+    assert!(text.contains("mock gl error"));
+}
+
+#[test]
+fn dual_host_guards_block_duplicate_manual_host_resolve_split_brain_and_converge_on_promote() {
+    let env = crate::test_env::TestEnv::new("dual-host-guards");
+    // 强制使用本机回环地址写入占用卡，确保测试在任何网卡环境下可确定性连入
+    unsafe {
+        std::env::set_var("SC_HOST_ADDR", "127.0.0.1");
+    }
+    let path = env.path("team-budget.xlsx");
+    sheetcore::xlsx::save(&path, &book(10.0)).unwrap();
+
+    // 1. 甲开启共享后，乙在同一文件上手动点「开启共享」不得再起第二个宿主，且不会覆盖甲的占用卡
+    let mut host_a = app();
+    host_a.my_name = "甲".into();
+    host_a.wb.path = Some(path.clone());
+    host_a.room_password = "room-secret".into();
+    host_a.start_host();
+    assert!(host_a.net.as_ref().is_some_and(|n| n.hosting), "甲应当成功开房");
+    let lock_a = session_lock::read(&path).expect("甲应写出占用卡");
+    assert!(!lock_a.session.is_empty());
+
+    let mut peer_b = app();
+    peer_b.my_name = "乙".into();
+    peer_b.wb.path = Some(path.clone());
+    peer_b.room_password = "room-secret".into();
+    peer_b.start_host();
+    assert!(peer_b.net.is_none(), "已有活跃宿主时乙手动开启共享必须被阻止");
+    assert_eq!(peer_b.join_addr, lock_a.host, "应自动为乙填入现有宿主地址");
+    assert_eq!(
+        session_lock::read(&path).unwrap().session,
+        lock_a.session,
+        "甲的占用卡不得被乙改写或删除"
+    );
+
+    // 乙与丙正常加入甲的房间
+    peer_b.join_shared();
+    let mut peer_c = app();
+    peer_c.my_name = "丙".into();
+    peer_c.wb.path = Some(path.clone());
+    peer_c.room_password = "room-secret".into();
+    peer_c.join_addr = lock_a.host.clone();
+    peer_c.join_shared();
+    for _ in 0..40 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        peer_c.poll_net();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(peer_b.joined_doc && peer_c.joined_doc, "乙和丙应完成入房同步");
+
+    // 2. 模拟甲突然崩溃（监听端口立即关闭，但磁盘上的占用卡仍在 20s 新鲜期内）：
+    //    乙和丙先后触发 promote_to_host，乙接任新宿主，丙探测到乙已接任后自动转连乙而非双开宿主！
+    let dead_net = host_a.net.take().unwrap();
+    dead_net.shutdown();
+    drop(dead_net);
+    std::thread::sleep(Duration::from_millis(80));
+
+    peer_b.promote_to_host();
+    assert!(peer_b.net.as_ref().is_some_and(|n| n.hosting), "乙应成功接任新宿主");
+    let lock_b = session_lock::read(&path).expect("乙应写出新占用卡");
+    assert_ne!(lock_b.session, lock_a.session);
+
+    peer_c.promote_to_host();
+    assert!(
+        peer_c.net.as_ref().is_some_and(|n| !n.hosting),
+        "丙在乙已接任后调用 promote_to_host 应自动加入乙，不能形成双宿主"
+    );
+    assert_eq!(peer_c.join_addr, lock_b.host);
+
+    // 3. 模拟网络分区恢复后的双宿主脑裂：强制构造一个晚启动的冲突宿主丁，验证心跳裁决与覆盖保存拦截
+    let listener_d = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let rogue_session = session_lock::new_session_id();
+    let rogue_started = lock_b.started_ms.saturating_add(5_000);
+    let rogue_net = crate::net::host_on_with_session(
+        listener_d,
+        77,
+        "丁".into(),
+        "team-budget.xlsx".into(),
+        "room-secret".into(),
+        rogue_session,
+        rogue_started,
+    )
+    .unwrap();
+    let mut rogue_d = app();
+    rogue_d.my_name = "丁".into();
+    rogue_d.wb = book(999.0);
+    rogue_d.wb.path = Some(path.clone());
+    rogue_d.wb.dirty = true;
+    rogue_d.net = Some(rogue_net);
+    rogue_d.lock_beat = None;
+
+    rogue_d.beat_lock();
+    assert!(rogue_d.net.is_none(), "晚启动的冲突宿主丁在心跳巡检时必须自动降级退出");
+    assert_eq!(
+        rogue_d.wb.sheets[0].value(0, 0),
+        Value::Number(999.0),
+        "降级后丁的本地未保存修改必须完好保留在内存中"
+    );
+    assert_eq!(
+        session_lock::read(&path).unwrap().session,
+        lock_b.session,
+        "丁降级或销毁时绝不能覆盖或删除主宿主乙的占用卡"
+    );
+
+    // 丁在未加入乙会话的情况下直接点保存，必须被拦截以免覆盖乙正在主持的原文件
+    rogue_d.save(false);
+    assert!(rogue_d.tasks.saving.is_none(), "离线/已降级实例不得直接覆盖活跃宿主的共享原文件");
+    assert!(rogue_d.status.contains("另存为"), "状态栏应提示另存为或先加入会话：{}", rogue_d.status);
+
+    peer_c.leave_session();
+    peer_b.leave_session();
+    unsafe {
+        std::env::remove_var("SC_HOST_ADDR");
+    }
+}
+
+#[test]
+fn large_workbook_syncs_editable_immediately_and_rapid_back_to_back_edits_propagate_live() {
+    let env = crate::test_env::TestEnv::new("large-wb-realtime-edits");
+    unsafe {
+        std::env::set_var("SC_HOST_ADDR", "127.0.0.1");
+    }
+    let dir = env.path("shared-large");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("large.xlsx");
+
+    let mut wb = Workbook::new_blank();
+    for r in 0..1_000u32 {
+        for c in 0..10u32 {
+            wb.sheets[0].set(
+                r,
+                c,
+                Cell {
+                    value: Value::Number((r * 10 + c) as f64),
+                    formula: None,
+                },
+            );
+        }
+    }
+    wb.dirty = false;
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+    session_lock::set_dir_marked_shared(&path, true).unwrap();
+
+    let mut host_a = app();
+    host_a.my_name = "甲".into();
+    host_a.wb = wb.clone();
+    host_a.wb.path = Some(path.clone());
+    host_a.try_auto_join();
+    assert!(host_a.net.as_ref().is_some_and(|n| n.hosting));
+
+    let mut peer_b = app();
+    peer_b.my_name = "乙".into();
+    peer_b.wb = Workbook::new_blank();
+    peer_b.wb.path = Some(path.clone());
+    peer_b.try_auto_join();
+
+    for _ in 0..60 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(peer_b.joined_doc, "10,000 格大表应完成入房快照同步");
+    assert!(
+        !peer_b.deps_pending && !host_a.deps_pending,
+        "两台机器均不得被 deps_pending 锁死编辑"
+    );
+
+    // 乙在同一帧内连续编辑 A1、回车跳到 A2 立即编辑、再回车跳到 A3 写公式 =A1+A2（0 网络等待延迟）
+    peer_b.sel = (0, 0);
+    peer_b.sel_end = (0, 0);
+    peer_b.begin_edit(Some("120".into()));
+    assert!(peer_b.editing.is_some(), "第 1 格应零延迟进入编辑态");
+    assert!(peer_b.commit_edit(Some((1, 0))));
+    assert_eq!(peer_b.sel, (1, 0));
+
+    peer_b.begin_edit(Some("80".into()));
+    assert!(peer_b.editing.is_some(), "编辑完上一格后下一格应无需等待直接进入编辑态");
+    assert!(peer_b.commit_edit(Some((1, 0))));
+    assert_eq!(peer_b.sel, (2, 0));
+
+    peer_b.begin_edit(Some("=A1+A2".into()));
+    assert!(peer_b.editing.is_some(), "第 3 格公式也应零延迟进入编辑态");
+    assert!(peer_b.commit_edit(Some((1, 0))));
+    assert_eq!(peer_b.wb.sheets[0].value(2, 0), Value::Number(200.0));
+
+    for _ in 0..40 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(host_a.wb.sheets[0].value(0, 0), Value::Number(120.0));
+    assert_eq!(host_a.wb.sheets[0].value(1, 0), Value::Number(80.0));
+    assert_eq!(
+        host_a.wb.sheets[0].value(2, 0),
+        Value::Number(200.0),
+        "甲应实时看到乙连续编辑的数值与公式计算结果"
+    );
+
+    // 甲反过来连续编辑 B1、B2，乙也应实时收到
+    host_a.sel = (0, 1);
+    host_a.sel_end = (0, 1);
+    host_a.begin_edit(Some("555".into()));
+    assert!(host_a.editing.is_some());
+    assert!(host_a.commit_edit(Some((1, 0))));
+    host_a.begin_edit(Some("666".into()));
+    assert!(host_a.editing.is_some());
+    assert!(host_a.commit_edit(Some((1, 0))));
+
+    for _ in 0..40 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(peer_b.wb.sheets[0].value(0, 1), Value::Number(555.0));
+    assert_eq!(peer_b.wb.sheets[0].value(1, 1), Value::Number(666.0));
+
+    peer_b.leave_session();
+    host_a.leave_session();
+    unsafe {
+        std::env::remove_var("SC_HOST_ADDR");
+    }
+}
+
+#[test]
+fn real_world_heavy_cf_and_formulas_delta_sync_and_sub_15ms_live_edits() {
+    let env = crate::test_env::TestEnv::new("heavy-cf-formula-delta");
+    unsafe {
+        std::env::set_var("SC_HOST_ADDR", "127.0.0.1");
+    }
+    let dir = env.path("lan-heavy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("heavy_ledger.xlsx");
+
+    let mut wb = Workbook::new_blank();
+    wb.names.push(("TAX_RATE".into(), None, "0.13".into()));
+    {
+        let sh = wb.sheet_mut(0);
+        for r in 0..3_000u32 {
+            sh.set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(format!("DEPT-{}", r % 40).into()),
+                    formula: None,
+                },
+            );
+            sh.set(
+                r,
+                1,
+                Cell {
+                    value: Value::Number((r + 1) as f64 * 10.0),
+                    formula: None,
+                },
+            );
+            sh.set(
+                r,
+                2,
+                Cell {
+                    value: Value::Number((r + 1) as f64 * 1.3),
+                    formula: Some(format!("=B{}*TAX_RATE", r + 1).into()),
+                },
+            );
+            sh.set(
+                r,
+                3,
+                Cell {
+                    value: Value::Number((r + 1) as f64 * 11.3),
+                    formula: Some(format!("=B{}+C{}", r + 1, r + 1).into()),
+                },
+            );
+        }
+        // 整列百万行条件格式（重复值高亮 + 三色阶）：复现真实财务表最重卡顿源
+        sh.cf.dxfs.push(sheetcore::cf::Dxf {
+            fill: Some([255, 199, 206]),
+            color: Some([156, 0, 6]),
+            ..Default::default()
+        });
+        sh.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(0, 0, 1_048_575, 0)],
+            rules: vec![sheetcore::cf::CfRule {
+                kind: sheetcore::cf::CfKind::Dup {
+                    unique: false,
+                    dxf: 0,
+                },
+                stop: false,
+                priority: 1,
+            }],
+        });
+        sh.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(0, 1, 1_048_575, 3)],
+            rules: vec![sheetcore::cf::CfRule {
+                kind: sheetcore::cf::CfKind::Scale {
+                    points: vec![
+                        (sheetcore::cf::Cfvo::min(), [248, 105, 107]),
+                        (sheetcore::cf::Cfvo::max(), [99, 190, 123]),
+                    ],
+                },
+                stop: false,
+                priority: 2,
+            }],
+        });
+        sh.cf_dirty = true;
+    }
+    wb.dirty = false;
+    sheetcore::xlsx::save(&path, &wb).unwrap();
+    session_lock::set_dir_marked_shared(&path, true).unwrap();
+
+    // 1. 甲通过真实 open_path 打开大表：Loaded 一到达即解除 busy 遮罩，无需等待后台全表重算
+    let mut host_a = app();
+    host_a.my_name = "甲".into();
+    host_a.open_path(path.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while host_a.wb.sheet(0).len() == 0 && std::time::Instant::now() < deadline {
+        host_a.poll_open();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(host_a.wb.sheet(0).len(), 12_000);
+    assert!(
+        !host_a.tasks.busy && host_a.tasks.open_label.is_none(),
+        "Loaded 到达后必须立即解除正在打开遮罩"
+    );
+    assert!(!host_a.wb_base_hash.is_empty(), "应记录磁盘基准文件指纹");
+    assert!(host_a.net.as_ref().is_some_and(|n| n.hosting));
+
+    // 2. 乙同样通过真实 open_path 打开同一共享文件：应命中同文件 0 冗余增量握手，不清空已读 12,000 格
+    let mut peer_b = app();
+    peer_b.my_name = "乙".into();
+    peer_b.open_path(path.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while peer_b.wb.sheet(0).len() == 0 && std::time::Instant::now() < deadline {
+        peer_b.poll_open();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(peer_b.wb.sheet(0).len(), 12_000);
+    assert!(!peer_b.tasks.busy && peer_b.tasks.open_label.is_none());
+
+    let t_sync = std::time::Instant::now();
+    while !peer_b.joined_doc && t_sync.elapsed() < Duration::from_secs(2) {
+        host_a.poll_net();
+        peer_b.poll_net();
+        assert_eq!(
+            peer_b.wb.sheet(0).len(),
+            12_000,
+            "同文件增量握手期间不得把乙的工作表清空闪白"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(peer_b.joined_doc && peer_b.snapshot_is_delta, "应通过增量握手极速入房");
+
+    // 3. 验证百万行整列条件格式 compute_stats + 视口 600 格 overlay_at 耗时远低于单帧阈值
+    let t_cf = std::time::Instant::now();
+    let mut st = sheetcore::cf::CfStats::default();
+    {
+        let sh = host_a.wb.sheet(0);
+        sheetcore::cf::compute_stats(&sh.cf, sh, &mut st);
+        for rr in 0..50u32 {
+            for cc in 0..12u32 {
+                let _ = sheetcore::cf::overlay_at(&sh.cf, &st, sh, rr, cc, |_, _, _| false);
+            }
+        }
+    }
+    let cf_ms = t_cf.elapsed().as_millis();
+    assert!(
+        cf_ms < 80,
+        "整列百万行条件格式统计+视口叠加必须在毫秒级完成，实际耗时 {cf_ms}ms"
+    );
+
+    // 4. 连续快速编辑多格（含定义名称工作簿）：本地单次 commit 必须极速完成且不置 tasks.busy，对端实时可见且无孤儿锁残留
+    peer_b.sel = (0, 1);
+    peer_b.sel_end = (0, 1);
+    for step in 0..5u32 {
+        let t_edit = std::time::Instant::now();
+        peer_b.begin_edit(Some(format!("{}", (step + 1) * 1000)));
+        assert_eq!(
+            peer_b.editing.as_ref().and_then(|e| e.caret_override),
+            Some(4),
+            "新开启编辑框必须将光标定位于末尾"
+        );
+        assert!(peer_b.commit_edit(Some((1, 0))));
+        let edit_ms = t_edit.elapsed().as_millis();
+        assert!(
+            edit_ms < 50,
+            "含全局名称与 6000 公式工作簿上的单格提交必须毫秒级返回，第 {step} 步耗时 {edit_ms}ms"
+        );
+        assert!(!peer_b.tasks.busy, "连续编辑绝不能触发模态重算遮罩");
+    }
+
+    let t_prop = std::time::Instant::now();
+    while host_a.wb.sheet(0).value(4, 1) != Value::Number(5000.0)
+        && t_prop.elapsed() < Duration::from_millis(500)
+    {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(host_a.wb.sheet(0).value(0, 1), Value::Number(1000.0));
+    assert_eq!(host_a.wb.sheet(0).value(4, 1), Value::Number(5000.0));
+    // 确保迟到 LockOk 被立即自动退还，甲的锁表里不得残留乙已经离开的旧单元格锁
+    for _ in 0..10 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        host_a.locks.is_empty() && peer_b.my_lock.is_none(),
+        "快速连续回车切格后不得残留任何孤儿单元格编辑锁"
+    );
+
+    peer_b.leave_session();
+    host_a.leave_session();
+    unsafe {
+        std::env::remove_var("SC_HOST_ADDR");
+    }
+}
+
+#[test]
+fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollution() {
+    let env = crate::test_env::TestEnv::new("collab-prompt-save-no-sidecar");
+    unsafe {
+        std::env::set_var("SC_HOST_ADDR", "127.0.0.1");
+    }
+    let shared_dir = env.path("shared-folder");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let shared_path = shared_dir.join("愉悦定金确认明细表-20261120.xlsx");
+    sheetcore::xlsx::save_atomic(&shared_path, &book(100.0)).unwrap();
+    session_lock::set_dir_marked_shared(&shared_path, true).unwrap();
+
+    let mut host_a = app();
+    host_a.my_name = "甲".into();
+    host_a.wb = sheetcore::xlsx::load(&shared_path).unwrap();
+    host_a.try_auto_join();
+    assert!(host_a.net.as_ref().is_some_and(|n| n.hosting));
+
+    let mut peer_b = app();
+    peer_b.my_name = "乙".into();
+    peer_b.wb = sheetcore::xlsx::load(&shared_path).unwrap();
+    peer_b.try_auto_join();
+
+    for _ in 0..50 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        if peer_b.joined_doc {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(peer_b.joined_doc);
+
+    // 1. 协作者乙编辑 A1 并按 Ctrl+S（save(false)），委托宿主甲立即落盘原文件并同步清除双方 dirty
+    peer_b.sel = (0, 0);
+    peer_b.sel_end = (0, 0);
+    peer_b.begin_edit(Some("520".into()));
+    assert!(peer_b.commit_edit(None));
+    assert!(peer_b.wb.dirty);
+    peer_b.save(false);
+    assert!(
+        peer_b.tasks.saving.is_none(),
+        "客户端不应直接并发抢写共享原文件，而应委托宿主统一保存"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (host_a.wb.dirty || peer_b.wb.dirty || host_a.tasks.saving.is_some())
+        && Instant::now() < deadline
+    {
+        host_a.poll_net();
+        host_a.poll_save();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(!host_a.wb.dirty && !peer_b.wb.dirty, "宿主落盘广播后双方 dirty 均应归零");
+    assert_eq!(
+        sheetcore::xlsx::load(&shared_path).unwrap().sheets[0].value(0, 0),
+        Value::Number(520.0)
+    );
+
+    // 2. 协作者乙继续编辑 A2 且双方均不按 Ctrl+S：停手超过 3.5 秒后宿主自动将新值写回原文件
+    peer_b.sel = (1, 0);
+    peer_b.sel_end = (1, 0);
+    peer_b.begin_edit(Some("880".into()));
+    assert!(peer_b.commit_edit(None));
+    for _ in 0..30 {
+        host_a.poll_net();
+        peer_b.poll_net();
+        if host_a.wb.sheets[0].value(1, 0) == Value::Number(880.0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(host_a.wb.dirty && peer_b.wb.dirty);
+    host_a.tasks.last_edit = Some(Instant::now() - Duration::from_secs(4));
+    host_a.last_autosave_attempt = None;
+    host_a.tick_autosave(None);
+    assert!(host_a.tasks.saving.is_some(), "协作宿主停手后应自动启动后台保存");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (host_a.wb.dirty || peer_b.wb.dirty || host_a.tasks.saving.is_some())
+        && Instant::now() < deadline
+    {
+        host_a.poll_net();
+        host_a.poll_save();
+        peer_b.poll_net();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(!host_a.wb.dirty && !peer_b.wb.dirty);
+    let reloaded = sheetcore::xlsx::load(&shared_path).unwrap();
+    assert_eq!(reloaded.sheets[0].value(0, 0), Value::Number(520.0));
+    assert_eq!(reloaded.sheets[0].value(1, 0), Value::Number(880.0));
+
+    peer_b.leave_session();
+    host_a.leave_session();
+
+    // 3. 原文件目录下绝不能残留 .~sheetflow-history、.saving-*、.lock 等副文件
+    let names: Vec<String> = std::fs::read_dir(&shared_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.iter().any(|n| n == ".~sheetflow-history"), "unexpected history dir: {names:?}");
+    assert!(!names.iter().any(|n| n.contains(".saving-")), "unexpected saving file: {names:?}");
+    assert!(!names.iter().any(|n| n.starts_with(".~")), "unexpected sidecar file: {names:?}");
+
+    unsafe {
+        std::env::remove_var("SC_HOST_ADDR");
+    }
+}
+
+#[test]
+fn edits_made_while_disconnected_survive_the_rejoin_snapshot_and_reach_the_host() {
+    let _env = crate::test_env::TestEnv::new("collab-rejoin-outbox");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = crate::net::host_on(listener, 1, "甲".into(), "doc".into(), "room-pw".into()).unwrap();
+
+    let mut b = app();
+    b.my_name = "乙".into();
+    b.room_password = "room-pw".into();
+    b.join_addr = format!("127.0.0.1:{port}");
+    b.join_shared();
+    let t = Instant::now();
+    while !b.joined_doc && t.elapsed() < Duration::from_secs(5) {
+        b.poll_net();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(b.joined_doc, "乙应完成入房");
+    while host.events.try_recv().is_ok() {}
+
+    // 断线期间的编辑：本地副本与表格里有，但报文没送到宿主（等同于断线时被丢弃的帧）
+    let cell = Cell { value: Value::Number(77.0), formula: None };
+    let offline = b.peer.as_mut().unwrap().local_set(0, 5, 5, &cell);
+    b.wb.sheet_mut(0).set(5, 5, cell);
+
+    // 重连成功：宿主发来新的 Welcome 与完整快照（快照里没有这格）
+    let net = b.net.as_ref().unwrap();
+    net.inject_event_for_test(crate::net::NetEvent::Welcome {
+        peers: vec![(1, "甲".into(), 1)],
+        delta_sync: false,
+        clock: 0,
+    });
+    net.inject_event_for_test(crate::net::NetEvent::SnapshotDone);
+    b.poll_net();
+
+    assert_eq!(
+        b.wb.sheet(0).value(5, 5),
+        Value::Number(77.0),
+        "重连快照不得静默抹掉断线期间的编辑"
+    );
+    assert!(b.rejoin_outbox.is_none(), "补发后暂存应清空");
+
+    // 宿主必须收到补发的这条编辑
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut got = false;
+    while Instant::now() < deadline && !got {
+        if let Ok(crate::net::NetEvent::Ops(ops)) = host.events.recv_timeout(Duration::from_millis(50)) {
+            got = ops.iter().any(|o| {
+                o.row == 5 && o.col == 5 && o.ts == offline.ts && o.value == sheetcore::sync::ValueWire::Number(77.0)
+            });
+        }
+    }
+    assert!(got, "断线期间的编辑应在重连后补发给宿主");
+
+    // 宿主上更新的版本（别人断线期间改过同一格）必须胜出，不能被补发覆盖
+    let stale = sheetcore::sync::Op {
+        sheet: 0,
+        row: 6,
+        col: 6,
+        value: sheetcore::sync::ValueWire::Number(1.0),
+        formula: None,
+        ts: 2,
+        site: b.peer.as_ref().unwrap().site,
+    };
+    b.rejoin_outbox = Some((b.doc_uid, vec![stale]));
+    b.peer.as_mut().unwrap().apply(sheetcore::sync::Op {
+        sheet: 0,
+        row: 6,
+        col: 6,
+        value: sheetcore::sync::ValueWire::Number(2.0),
+        formula: None,
+        ts: 1_000,
+        site: 1,
+    });
+    b.wb.sheet_mut(0).set(6, 6, Cell { value: Value::Number(2.0), formula: None });
+    b.replay_rejoin_outbox();
+    assert_eq!(b.wb.sheet(0).value(6, 6), Value::Number(2.0), "宿主上更新的版本应胜出");
+
+    b.leave_session();
+    host.shutdown();
 }

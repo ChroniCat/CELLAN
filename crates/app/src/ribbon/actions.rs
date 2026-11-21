@@ -13,7 +13,11 @@ fn fmt_label(code: &str) -> &str {
         "" => "常规",
         "#,##0.00" => "数值",
         "¥#,##0.00" => "货币",
-        "0.0%" => "百分比",
+        "0%" => "百分比",
+        "0.0%" => "百分比 (0.0%)",
+        "[DBNum2][$¥-804]#,##0.00" => "人民币大写",
+        "[DBNum2]G/通用格式" => "中文大写数字",
+        "[DBNum1]G/通用格式" => "中文小写数字",
         "yyyy-mm-dd" => "日期",
         "_-* ¥#,##0.00_-;-* ¥#,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计",
         "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-" => "会计（无符号）",
@@ -40,12 +44,18 @@ impl SheetApp {
         match id {
             // 按钮的可用性与快捷键共用命令表里的同一个谓词
             // 剪贴板空着时「粘贴」系列灰掉（Excel 行为）；剪切/复制对空单元格也有效，保持可用
-            "Paste" | "PasteMenu" | "PasteSpecial" | "PasteSplit" => {
-                st.enabled = crate::office_clipboard::has_pasteable();
+            "Paste" | "PasteMenu" | "PasteSpecial" | "PasteSplit" | "PasteDirectItem"
+            | "PasteValuesItem" | "PasteFormulasItem" | "PasteTransposeItem"
+            | "PasteFormatsItem" | "PasteNoBordersItem" | "PasteColWidthsItem"
+            | "PasteLinkItem" | "PasteAsPicItem" => {
+                st.enabled = self.clip.is_some()
+                    || self.clip_pic.is_some()
+                    || crate::office_clipboard::has_pasteable();
                 if !st.enabled {
                     st.tip = Some("剪贴板里没有可粘贴的内容".into());
                 }
             }
+            "FmtLockCells" => st.checked = cur.locked,
             "Undo" => st.enabled = self.command_enabled("Undo"),
             "Redo" => st.enabled = self.command_enabled("Redo"),
             "FileSave" | "FileSaveAs" | "FileOpen" | "NewTab" | "FilePrintPreview"
@@ -74,6 +84,7 @@ impl SheetApp {
             "Bold" => st.checked = cur.bold,
             "Italic" => st.checked = cur.italic,
             "Underline" => st.checked = cur.underline,
+            "StrikeThrough" => st.checked = cur.strikethrough,
             "AlignTop" => st.checked = cur.valign == 1,
             "AlignMiddle" => st.checked = cur.valign == 2,
             "AlignBottom" => st.checked = cur.valign == 3,
@@ -83,19 +94,61 @@ impl SheetApp {
             "WrapText" => st.checked = cur.wrap,
             "MergeCenter" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
-                st.checked = self
-                    .wb
-                    .sheet(self.sheet_idx)
+                let sh = self.wb.sheet(self.sheet_idx);
+                st.checked = sh
                     .merges
                     .iter()
-                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2);
+                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2)
+                    || (r1 == r2 && c1 == c2 && sh.merge_at(r1, c1).is_some());
+                st.enabled = !self.is_edit_blocked();
+            }
+            "MergeCenterItem" => {
+                let (r1, c1, r2, c2) = self.sel_rect();
+                let sh = self.wb.sheet(self.sheet_idx);
+                st.checked = sh
+                    .merges
+                    .iter()
+                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2)
+                    || (r1 == r2 && c1 == c2 && sh.merge_at(r1, c1).is_some());
+                st.enabled = (st.checked || !(r1 == r2 && c1 == c2)) && !self.is_edit_blocked();
+                if !st.enabled && r1 == r2 && c1 == c2 {
+                    st.tip = Some("请选择两个以上单元格再合并".into());
+                }
+            }
+            "MergeCellsItem" | "MergeCells" => {
+                st.enabled = self.can_merge_selection() && !self.is_edit_blocked();
+                if !st.enabled {
+                    st.tip = Some("请选择两个以上未整块合并的单元格".into());
+                }
+            }
+            "UnmergeCellsItem" | "UnmergeCells" => {
+                st.enabled = self.selection_has_merge() && !self.is_edit_blocked();
+                if !st.enabled {
+                    st.tip = Some("所选区域没有合并单元格".into());
+                }
+            }
+            "InsertComment" | "NewComment" => {
+                st.enabled = !self.is_edit_blocked();
+            }
+            "ClearCommentsItem" | "ClearComments" => {
+                st.enabled = self.selection_has_comment() && !self.is_edit_blocked();
+                if !st.enabled {
+                    st.tip = Some("所选区域没有批注".into());
+                }
+            }
+            "PrevComment" | "NextComment" | "ShowShowCommentBtn" | "ShowComment"
+            | "SelectComments" => {
+                st.enabled = !self.wb.sheet(self.sheet_idx).notes.is_empty();
+                if !st.enabled {
+                    st.tip = Some("当前工作表没有批注".into());
+                }
             }
             "FillColor" => {
-                let f = cur.fill.unwrap_or([255, 255, 255]);
+                let f = cur.fill.unwrap_or(self.last_fill_color);
                 st.swatch = Some(egui::Color32::from_rgb(f[0], f[1], f[2]));
             }
             "FontColor" => {
-                let c = cur.color;
+                let c = self.last_font_color;
                 st.swatch = Some(egui::Color32::from_rgb(c[0], c[1], c[2]));
             }
             "NumberFormat" => st.text = Some(fmt_label(&cur.format).to_string()),
@@ -120,6 +173,8 @@ impl SheetApp {
             "NormalView" => st.checked = self.view_mode == 0,
             "PageLayoutView" => st.checked = self.view_mode == 1,
             "PageBreakPreview" => st.checked = self.view_mode == 2,
+            "ToggleSpotlight" => st.checked = self.prefs.spotlight,
+            "SplitPanes" | "ViewSplitPanes" => st.checked = self.split_panes.is_some(),
             "TableTotals" => {
                 if let Some(t) = self.table_at_sel() {
                     st.checked = t.totals_row;
@@ -302,8 +357,7 @@ impl SheetApp {
         }
         if let Some(v) = action.strip_prefix("zoom:") {
             if let Ok(z) = v.parse::<f32>() {
-                self.zoom = z.clamp(0.5, 2.5);
-                ctx.set_zoom_factor(self.zoom);
+                self.set_zoom(z);
             }
             return;
         }
@@ -350,13 +404,6 @@ impl SheetApp {
                 self.print_preview = true;
             }
             "ExportPdf" => self.export_pdf_dialog(),
-            "VersionHistory" => {
-                if let Some(p) = self.wb.path.clone() {
-                    self.history_view = Some((p.clone(), sheetcore::backup::list(&p)));
-                } else {
-                    self.status = "先保存文件，才有历史版本".into();
-                }
-            }
             "Undo" => self.do_undo(false),
             "Redo" => self.do_undo(true),
             "NewTab" => self.open_in_new_tab(std::path::PathBuf::new()),
@@ -365,12 +412,12 @@ impl SheetApp {
                     .add_filter("Excel 工作簿", &["xlsx", "xlsm", "csv"])
                     .pick_file()
                 {
-                    self.open_in_new_tab(p);
+                    self.open_any(p);
                 }
             }
             "CloseTab" => {
                 let idx = self.active_tab;
-                self.close_tab(idx);
+                self.request_close_tab(idx);
             }
             "Share" => {
                 if self.net.is_none() {
@@ -388,16 +435,42 @@ impl SheetApp {
 
             // ---------------------------------------------------- 开始
             "Paste" => self.clip_paste(false, None),
+            "PasteValues" => self.paste_mode_exec(crate::wps_menus::PasteMode::Values, ctx),
+            "PasteValuesNumFmt" => self.paste_mode_exec(crate::wps_menus::PasteMode::ValuesNumFmt, ctx),
+            "PasteValuesSourceFmt" => self.paste_mode_exec(crate::wps_menus::PasteMode::ValuesSourceFmt, ctx),
+            "PasteFormulas" => self.paste_mode_exec(crate::wps_menus::PasteMode::Formulas, ctx),
+            "PasteFormulasNumFmt" => self.paste_mode_exec(crate::wps_menus::PasteMode::FormulasNumFmt, ctx),
+            "PasteFormats" => self.paste_mode_exec(crate::wps_menus::PasteMode::Formats, ctx),
+            "PasteNoBorders" => self.paste_mode_exec(crate::wps_menus::PasteMode::NoBorders, ctx),
+            "PasteColWidths" => self.paste_mode_exec(crate::wps_menus::PasteMode::ColWidths, ctx),
+            "PasteTranspose" => self.paste_mode_exec(crate::wps_menus::PasteMode::Transpose, ctx),
+            "PasteLink" => self.paste_mode_exec(crate::wps_menus::PasteMode::Link, ctx),
+            "PasteAsPicture" => self.paste_mode_exec(crate::wps_menus::PasteMode::AsPicture, ctx),
             "PasteSpecial" => self.paste_special = true,
             "Cut" => self.clip_copy(true, ctx),
             "Copy" => self.clip_copy(false, ctx),
+            "CopyValuesText" => self.copy_values_text_only(ctx),
+            "CopyAsPicture" => self.copy_selection_as_picture(ctx),
             "FormatPainter" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
-                let mut styles = Vec::new();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1));
+                        c2 = c2.min(uc2.max(c1));
+                    } else {
+                        r2 = r1;
+                        c2 = c1;
+                    }
+                }
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+                    self.status = "源区域太大（超过 20 万格），请缩小选区后再用格式刷".into();
+                    return;
+                }
+                let mut styles = Vec::with_capacity((r2 - r1 + 1) as usize);
                 {
                     let sheet = self.wb.sheet(self.sheet_idx);
                     for r in r1..=r2 {
-                        let mut row = Vec::new();
+                        let mut row = Vec::with_capacity((c2 - c1 + 1) as usize);
                         for c in c1..=c2 {
                             row.push(sheet.style_of(r, c));
                         }
@@ -441,75 +514,121 @@ impl SheetApp {
                 let v = !self.current_style().underline;
                 self.apply_style(move |s| s.underline = v);
             }
-            "BordersAll" => self.apply_style(|s| s.set_all_borders(1, [128, 128, 128])),
-            "BorderBottom" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                    style: 1,
-                    color: [128, 128, 128],
-                }
-            }),
-            "BorderTop" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
-                    style: 1,
-                    color: [128, 128, 128],
-                }
-            }),
-            "BorderLeft" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
-                    style: 1,
-                    color: [128, 128, 128],
-                }
-            }),
-            "BorderRight" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
-                    style: 1,
-                    color: [128, 128, 128],
-                }
-            }),
-            "BorderOuter" => self.border_outer(1),
-            "BorderThickOuter" => self.border_outer(2),
-            "BorderThickBottom" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                    style: 2,
-                    color: [128, 128, 128],
-                }
-            }),
-            "BorderDoubleBottom" => self.apply_style(|s| {
-                s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                    style: 4,
-                    color: [128, 128, 128],
-                }
-            }),
+            "StrikeThrough" => {
+                let v = !self.current_style().strikethrough;
+                self.apply_style(move |s| s.strikethrough = v);
+            }
+            "BordersDefault" => {
+                let act = self.last_border_action.clone();
+                self.ribbon_action(&act, ctx);
+            }
+            "BordersAll" => {
+                self.last_border_action = "BordersAll".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| s.set_all_borders(1, bc));
+            }
+            "BorderBottom" => {
+                self.last_border_action = "BorderBottom".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
+                        style: 1,
+                        color: bc,
+                    }
+                });
+            }
+            "BorderTop" => {
+                self.last_border_action = "BorderTop".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
+                        style: 1,
+                        color: bc,
+                    }
+                });
+            }
+            "BorderLeft" => {
+                self.last_border_action = "BorderLeft".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
+                        style: 1,
+                        color: bc,
+                    }
+                });
+            }
+            "BorderRight" => {
+                self.last_border_action = "BorderRight".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
+                        style: 1,
+                        color: bc,
+                    }
+                });
+            }
+            "BorderOuter" => {
+                self.last_border_action = "BorderOuter".into();
+                self.border_outer(1);
+            }
+            "BorderThickOuter" => {
+                self.last_border_action = "BorderThickOuter".into();
+                self.border_outer(2);
+            }
+            "BorderThickBottom" => {
+                self.last_border_action = "BorderThickBottom".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
+                        style: 2,
+                        color: bc,
+                    }
+                });
+            }
+            "BorderDoubleBottom" => {
+                self.last_border_action = "BorderDoubleBottom".into();
+                let bc = self.last_border_color;
+                self.apply_style(move |s| {
+                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
+                        style: 4,
+                        color: bc,
+                    }
+                });
+            }
             "BorderInsideH" => {
+                self.last_border_action = "BorderInsideH".into();
                 let (r1, _c1, r2, _c2) = self.sel_rect();
-                self.apply_style_xy(|s, r, _c| {
+                let bc = self.last_border_color;
+                self.apply_style_xy(move |s, r, _c| {
                     if r > r1 && r <= r2 {
                         s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
                             style: 1,
-                            color: [128, 128, 128],
+                            color: bc,
                         };
                     }
                     if r >= r1 && r < r2 {
                         s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
                             style: 1,
-                            color: [128, 128, 128],
+                            color: bc,
                         };
                     }
                 });
             }
             "BorderInsideV" => {
+                self.last_border_action = "BorderInsideV".into();
                 let (_r1, c1, _r2, c2) = self.sel_rect();
-                self.apply_style_xy(|s, _r, c| {
+                let bc = self.last_border_color;
+                self.apply_style_xy(move |s, _r, c| {
                     if c > c1 && c <= c2 {
                         s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
                             style: 1,
-                            color: [128, 128, 128],
+                            color: bc,
                         };
                     }
                     if c >= c1 && c < c2 {
                         s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
                             style: 1,
-                            color: [128, 128, 128],
+                            color: bc,
                         };
                     }
                 });
@@ -517,8 +636,8 @@ impl SheetApp {
             "BorderNone" => {
                 self.apply_style(|s| s.border = [sheetcore::style::Border::default(); 4])
             }
-            "FillColor" => self.color_popup = Some(false),
-            "FontColor" => self.color_popup = Some(true),
+            "FillColor" => self.apply_fill_color(Some(self.last_fill_color)),
+            "FontColor" => self.apply_font_color(self.last_font_color),
             "ClearFormat" => self.clear_formats(),
             "AlignTop" => self.apply_style(|s| s.valign = 1),
             "AlignMiddle" => self.apply_style(|s| s.valign = 2),
@@ -533,18 +652,19 @@ impl SheetApp {
                 self.apply_style(move |s| s.wrap = v);
             }
             "MergeCenter" => {
-                let on = !self.ctl_state("MergeCenter").checked;
+                let was_merged = self.ctl_state("MergeCenter").checked;
+                let on = !was_merged;
                 self.toggle_merge(on);
-                if on {
+                if on && self.merge_pending.is_none() && self.ctl_state("MergeCenter").checked {
                     self.apply_style(|s| s.halign = 2);
                 }
             }
             "MergeCells" => self.toggle_merge(true),
             "UnmergeCells" => self.toggle_merge(false),
-            "CenterAcross" => self.apply_style(|s| s.halign = 2),
+            "CenterAcross" => self.apply_style(|s| s.halign = 4),
             "NumberFormatApply" => {}
             "CurrencyStyle" => self.apply_style(|s| s.format = "¥#,##0.00".into()),
-            "PercentStyle" => self.apply_style(|s| s.format = "0.0%".into()),
+            "PercentStyle" => self.apply_style(|s| s.format = "0%".into()),
             "CommaStyle" => self.apply_style(|s| s.format = "#,##0.00".into()),
             "IncreaseDecimal" => self.decimals(1),
             "DecreaseDecimal" => self.decimals(-1),
@@ -561,8 +681,8 @@ impl SheetApp {
                 });
             }
             "InsertColumn" => {
-                let (_r1, c1, _r2, _c2) = self.sel_rect();
-                self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: 1 });
+                let (_r1, c1, _r2, c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: c2 - c1 + 1 });
             }
             "InsertCellsDown" => self.shift_cells(true, false),
             "InsertCellsRight" => self.shift_cells(true, true),
@@ -574,8 +694,8 @@ impl SheetApp {
                 });
             }
             "DeleteColumn" => {
-                let (_r1, c1, _r2, _c2) = self.sel_rect();
-                self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: 1 });
+                let (_r1, c1, _r2, c2) = self.sel_rect();
+                self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: c2 - c1 + 1 });
             }
             "DeleteCellsUp" => self.shift_cells(false, false),
             "DeleteCellsLeft" => self.shift_cells(false, true),
@@ -592,10 +712,36 @@ impl SheetApp {
                 ))
             }
             "AutoSum" => self.auto_sum(),
-            "FillDown" => self.fill_down(),
+            "AutofitRowHeight" => self.autofit_sel_rows(ctx),
+            "AutofitColWidth" => self.autofit_sel_cols(ctx),
+            "FillDown" => self.fill_cmd(true),
+            "FillUp" => self.fill_up(),
+            "FillLeft" => self.fill_left(),
+            "FillSeriesDialog" => self.open_fill_series_dlg(),
+            "FillSeqLinear" => self.fill_quick_series(crate::wps_menus::SeriesPreset::Linear),
+            "FillSeqWeekday" => self.fill_quick_series(crate::wps_menus::SeriesPreset::Weekday),
+            "FillSeqMonth" => self.fill_quick_series(crate::wps_menus::SeriesPreset::Month),
+            "FillSeqYear" => self.fill_quick_series(crate::wps_menus::SeriesPreset::Year),
+            "InsertToday" => self.insert_current_datetime(false),
+            "InsertNow" => self.insert_current_datetime(true),
             "ClearContent" => self.clear_all(),
+            "ClearComments" => self.clear_comments_in_sel(),
+            "ClearHyperlinks" => self.clear_hyperlinks_in_sel(),
+            "ClearCfAndDv" => { self.clear_cf(); self.clear_dv_in_sel(); }
             "SortFilter" => self.start_filter(),
+            "FilterByCell" => self.filter_by_cell_value(),
             "FindReplace" => self.find_open_new_session(),
+            "FindOpen" => { self.find.tab = 0; self.find_open_new_session(); }
+            "ReplaceOpen" => { self.find.tab = 1; self.find_open_new_session(); }
+            "GotoOpen" => self.open_goto_dlg(0),
+            "GotoSpecialOpen" => self.open_goto_dlg(1),
+            "SelectFormulas" => self.select_special(crate::wps_menus::SpecialTarget::Formulas),
+            "SelectConstants" => self.select_special(crate::wps_menus::SpecialTarget::Constants),
+            "SelectBlanks" => self.select_special(crate::wps_menus::SpecialTarget::Blanks),
+            "SelectErrors" => self.select_special(crate::wps_menus::SpecialTarget::Errors),
+            "SelectComments" => self.select_special(crate::wps_menus::SpecialTarget::Comments),
+            "SelectCondFormats" => self.select_special(crate::wps_menus::SpecialTarget::CondFormats),
+            "SelectDataValidation" => self.select_special(crate::wps_menus::SpecialTarget::DataValidation),
 
             // ---------------------------------------------------- 插入
             "Hyperlink" => {
@@ -604,6 +750,15 @@ impl SheetApp {
                 self.hyper_dlg = Some((String::new(), text));
             }
             "ColumnChart" => self.insert_chart_from_selection(),
+            "LineChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Line),
+            "PieChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Pie),
+            "BarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Bar),
+            "BarStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BarStacked),
+            "AreaChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Area),
+            "DoughnutChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Doughnut),
+            "ScatterChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Scatter),
+            "RadarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Radar),
+            "ComboChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Combo),
             "ChartManager" => {
                 self.chart_mgr = true;
                 self.reload_charts();
@@ -636,15 +791,7 @@ impl SheetApp {
             }
             "InsertTable" => self.make_table(),
             "InsertComment" | "NewComment" => {
-                let (r, c) = self.sel;
-                let cur = self
-                    .wb
-                    .sheet(self.sheet_idx)
-                    .notes
-                    .get(&sheetcore::model::CellRef::new(r, c))
-                    .map(|n| n.text.clone())
-                    .unwrap_or_default();
-                self.note_edit = Some((r, c, cur));
+                self.open_note_editor(Some(ctx));
             }
             "InsertSymbol" => self.symbol_dlg = true,
             "RefreshPivot" => self.refresh_pivot(),
@@ -787,7 +934,16 @@ impl SheetApp {
                 self.dtable_dlg = true;
             }
             "ScenarioManager" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 512 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1)).min(r1 + 31);
+                        c2 = c2.min(uc2.max(c1)).min(c1 + 15);
+                    } else {
+                        r2 = r1;
+                        c2 = c1;
+                    }
+                }
                 self.scen_range = if r1 == r2 && c1 == c2 {
                     cell_name(r1, c1)
                 } else {
@@ -823,7 +979,13 @@ impl SheetApp {
             "RemoveDuplicates" => self.open_dedup_dialog(),
             // ---------------------------------------------------- 数据分析四件套
             "ForecastSheet" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1));
+                        c2 = c2.min(uc2.max(c1));
+                    }
+                }
                 let range = if r1 == r2 && c1 == c2 {
                     // 单格：取当前区域
                     let (a, b) = (self.sel.0, self.sel.1);
@@ -843,7 +1005,13 @@ impl SheetApp {
                 });
             }
             "Subtotal" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1));
+                        c2 = c2.min(uc2.max(c1));
+                    }
+                }
                 let range = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
                 self.st_dlg = Some(crate::SubtotalDlg {
                     range,
@@ -858,7 +1026,13 @@ impl SheetApp {
                 });
             }
             "FlashFill" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 > 200_000 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1));
+                        c2 = c2.min(uc2.max(c1));
+                    }
+                }
                 self.ff_dlg = Some(crate::FlashDlg {
                     range: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
                     src_col: col_label(c1),
@@ -966,20 +1140,13 @@ impl SheetApp {
             "ShowHeadings" => self.show_headings = !self.show_headings,
             "ShowFormulaBar" => self.show_formula_bar = !self.show_formula_bar,
             "TextSpill" => self.text_spill = !self.text_spill,
-            "Zoom100" => {
-                self.zoom = 1.0;
-                ctx.set_zoom_factor(1.0);
-            }
+            "Zoom100" => self.set_zoom(1.0),
             "ToggleFileTree" => self.tree_open = !self.tree_open,
-            "ZoomIn" => {
-                self.zoom = (self.zoom + 0.1).min(2.5);
-                ctx.set_zoom_factor(self.zoom);
-            }
-            "ZoomOut" => {
-                self.zoom = (self.zoom - 0.1).max(0.5);
-                ctx.set_zoom_factor(self.zoom);
-            }
+            "ZoomIn" => self.set_zoom(self.zoom + 0.1),
+            "ZoomOut" => self.set_zoom(self.zoom - 0.1),
             "FreezeTopRow" => {
+                self.split_panes = None;
+                self.split_scroll = egui::Vec2::ZERO;
                 let on = self.wb.sheet(self.sheet_idx).freeze == Some((1, 0));
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.freeze = if on { None } else { Some((1, 0)) };
@@ -987,6 +1154,8 @@ impl SheetApp {
                 self.wb.dirty = true;
             }
             "FreezeFirstColumn" => {
+                self.split_panes = None;
+                self.split_scroll = egui::Vec2::ZERO;
                 let on = self.wb.sheet(self.sheet_idx).freeze == Some((0, 1));
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.freeze = if on { None } else { Some((0, 1)) };
@@ -1014,7 +1183,9 @@ impl SheetApp {
             "HideSheet" => self.hide_current_sheet(),
             "UnhideSheet" => self.unhide_open = true,
             "FreezePanes" => {
-                // 冻结当前单元格上方的行与左侧的列（和 Excel 的「冻结窗格」一致）
+                // 冻结当前单元格上方的行与左侧的列（和 Excel 的「冻结窗格」一致，与拆分互斥）
+                self.split_panes = None;
+                self.split_scroll = egui::Vec2::ZERO;
                 let (r, c) = self.sel;
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.freeze = if r == 0 && c == 0 { None } else { Some((r, c)) };
@@ -1043,7 +1214,16 @@ impl SheetApp {
                 self.wb.dirty = true;
             }
             "PrintAreaSet" => {
-                let (r1, c1, r2, c2) = self.sel_rect();
+                let (r1, c1, mut r2, mut c2) = self.sel_rect();
+                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 500_000 {
+                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                        r2 = r2.min(ur2.max(r1));
+                        c2 = c2.min(uc2.max(c1));
+                    } else {
+                        r2 = r1;
+                        c2 = c1;
+                    }
+                }
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 sh.page.print_area = Some((r1, c1, r2, c2));
                 self.wb.dirty = true;
@@ -1087,14 +1267,13 @@ impl SheetApp {
             "ZoomToSelection" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
                 let sh = self.wb.sheet(self.sheet_idx);
-                let w: f32 = (c1..=c2).map(|c| sh.cols.size(c)).sum();
-                let h: f32 = (r1..=r2).map(|r| sh.rows.size(r)).sum();
+                let w: f32 = sh.cols.pos(c2.saturating_add(1)) - sh.cols.pos(c1);
+                let h: f32 = sh.rows.pos(r2.saturating_add(1)) - sh.rows.pos(r1);
                 let view = self.last_view;
                 if w > 1.0 && h > 1.0 && view.x > 10.0 && view.y > 10.0 {
                     let z = ((view.x - 40.0) / w).min((view.y - 40.0) / h).clamp(0.5, 2.5);
-                    self.zoom = z;
+                    self.set_zoom(z);
                     self.scroll = egui::Vec2::new(c1 as f32 * 8.0, r1 as f32 * 4.0);
-                    ctx.set_zoom_factor(z);
                     self.status = format!("缩放到选定区域：{:.0}%", z * 100.0);
                 }
             }
@@ -1168,9 +1347,23 @@ impl SheetApp {
                 }
             }
 
-            "Noop" | "PhoneticGuide" | "AddIns" => {}
-            "DoubleUnderline" => self.apply_style(|s| s.underline = true),
-            "TextVertical" => self.apply_style(|s| s.rotation = 90),
+            "Noop" => {}
+            "DoubleUnderline" => {
+                let on = !self.current_style().double_underline;
+                self.apply_style(move |s| {
+                    s.double_underline = on;
+                    s.underline = on;
+                });
+            }
+            "TextVertical" => {
+                let on = !self.current_style().vertical_text;
+                self.apply_style(move |s| s.vertical_text = on);
+            }
+            "HighlightDuplicates" => self.highlight_duplicates(),
+            "RejectDuplicates" => self.reject_duplicates(),
+            "MergeSameCells" => self.merge_same_cells(),
+            "ToggleSpotlight" => self.toggle_spotlight(),
+            "SplitPanes" => self.toggle_split_panes(),
             "TextRotateUp" => self.apply_style(|s| s.rotation = 45),
             "TextRotateDown" => self.apply_style(|s| s.rotation = -45),
             "AccountingStyle" => self.apply_style(|s| {
@@ -1178,13 +1371,74 @@ impl SheetApp {
             }),
             "AutoAverage" => self.auto_func("AVERAGE"),
             "AutoCount" => self.auto_func("COUNT"),
+            "AutoMax" => self.auto_func("MAX"),
+            "AutoMin" => self.auto_func("MIN"),
             "FillRight" => self.fill_cmd(false),
             "ClearValues" => self.clear_values(),
-            "StyleNormal" => self.apply_style_preset("normal"),
-            "StyleTitle" => self.apply_style_preset("title"),
-            "StyleHeading" => self.apply_style_preset("heading"),
-            "StyleGood" => self.apply_style_preset("good"),
-            "StyleBad" => self.apply_style_preset("bad"),
+            "StyleNormal" => self.apply_wps_cell_style("StyleNormal"),
+            "StyleTitle" => self.apply_wps_cell_style("StyleTitle"),
+            "StyleHeading" => self.apply_wps_cell_style("StyleHeading"),
+            "StyleGood" => self.apply_wps_cell_style("StyleGood"),
+            "StyleBad" => self.apply_wps_cell_style("StyleBad"),
+            "StyleNeutral" => self.apply_wps_cell_style("StyleNeutral"),
+            "StyleInput" => self.apply_wps_cell_style("StyleInput"),
+            "StyleOutput" => self.apply_wps_cell_style("StyleOutput"),
+            "StyleCalc" => self.apply_wps_cell_style("StyleCalc"),
+            "StyleWarning" => self.apply_wps_cell_style("StyleWarning"),
+            "StyleNote" => self.apply_wps_cell_style("StyleNote"),
+            "StyleH1" => self.apply_wps_cell_style("StyleH1"),
+            "StyleH2" => self.apply_wps_cell_style("StyleH2"),
+            "StyleH3" => self.apply_wps_cell_style("StyleH3"),
+            "StyleTotal" => self.apply_wps_cell_style("StyleTotal"),
+            "StyleAccentBlue20" => self.apply_wps_cell_style("StyleAccentBlue20"),
+            "StyleAccentGreen20" => self.apply_wps_cell_style("StyleAccentGreen20"),
+            "StyleAccentOrange20" => self.apply_wps_cell_style("StyleAccentOrange20"),
+            "StyleComma0" => self.apply_wps_cell_style("StyleComma0"),
+            "StyleCurrency0" => self.apply_wps_cell_style("StyleCurrency0"),
+            "TableThemeBlue" => self.apply_table_theme("TableThemeBlue"),
+            "TableThemeGreen" => self.apply_table_theme("TableThemeGreen"),
+            "TableThemeForest" => self.apply_table_theme("TableThemeForest"),
+            "TableThemeOrange" => self.apply_table_theme("TableThemeOrange"),
+            "TableThemeNavy" => self.apply_table_theme("TableThemeNavy"),
+            "TableThemeGray" => self.apply_table_theme("TableThemeGray"),
+            "CfGreater" => self.open_cf_rule_dlg(crate::wps_menus::CfRuleOp::Greater),
+            "CfLess" => self.open_cf_rule_dlg(crate::wps_menus::CfRuleOp::Less),
+            "CfBetween" => self.open_cf_rule_dlg(crate::wps_menus::CfRuleOp::Between),
+            "CfEqual" => self.open_cf_rule_dlg(crate::wps_menus::CfRuleOp::Equal),
+            "CfTextContains" => self.open_cf_rule_dlg(crate::wps_menus::CfRuleOp::TextContains),
+            "CfDuplicate" | "CfUnique" | "CfTop10" | "CfTop10Pct" | "CfBottom10" | "CfBottom10Pct" | "CfAboveAvg" | "CfBelowAvg" | "CfBarBlue" | "CfBarGreen" | "CfBarRed" | "CfBarOrange" | "CfBarPurple" | "CfBarTeal" | "CfScaleGYR" | "CfScaleRYG" | "CfScaleBWR" | "CfScaleRWB" | "CfScaleGW" | "CfScaleWG" | "CfIconTraffic" | "CfIcon3Arrows" | "CfIcon5Arrows" | "CfIcon3Flags" | "CfIcon3Symbols" | "CfIcon4Rating" | "CfIcon5Quarters" | "CfClearSel" | "CfClearSheet" => self.apply_cf_preset(action),
+            "InsertSheet" => self.add_sheet(),
+            "DeleteCurrentSheet" => { let idx = self.sheet_idx; self.delete_sheet(idx); }
+            "HideRows" => self.ctx_menu_run(crate::CtxAct::HideRows, 0, ctx),
+            "UnhideRows" => self.ctx_menu_run(crate::CtxAct::UnhideRows, 0, ctx),
+            "HideCols" => self.ctx_menu_run(crate::CtxAct::HideCols, 0, ctx),
+            "UnhideCols" => self.ctx_menu_run(crate::CtxAct::UnhideCols, 0, ctx),
+            "RenameCurrentSheet" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::RenameSheet, idx, ctx); }
+            "MoveCurrentSheet" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::MoveSheet, idx, ctx); }
+            "DuplicateCurrentSheet" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::CopySheet, idx, ctx); }
+            "TabColorNone" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(None), idx, ctx); }
+            "TabColorRed" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([192, 0, 0])), idx, ctx); }
+            "TabColorOrange" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([237, 125, 49])), idx, ctx); }
+            "TabColorYellow" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([255, 192, 0])), idx, ctx); }
+            "TabColorGreen" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([112, 173, 71])), idx, ctx); }
+            "TabColorTeal" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([0, 176, 176])), idx, ctx); }
+            "TabColorBlue" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([68, 114, 196])), idx, ctx); }
+            "TabColorPurple" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([112, 48, 160])), idx, ctx); }
+            "TabColorGray" => { let idx = self.sheet_idx; self.ctx_menu_run(crate::CtxAct::TabColor(Some([128, 128, 128])), idx, ctx); }
+            "ToggleLockCells" => { let v = !self.current_style().locked; self.apply_style(move |s| s.locked = v); }
+            "SymRmb" => self.insert_quick_symbol('¥'),
+            "SymUsd" => self.insert_quick_symbol('$'),
+            "SymEur" => self.insert_quick_symbol('€'),
+            "SymCheck" => self.insert_quick_symbol('√'),
+            "SymCross" => self.insert_quick_symbol('×'),
+            "SymPlusMinus" => self.insert_quick_symbol('±'),
+            "SymPermille" => self.insert_quick_symbol('‰'),
+            "SymDegreeC" => self.insert_quick_symbol('℃'),
+            "SymStar" => self.insert_quick_symbol('★'),
+            "SymCircle1" => self.insert_quick_symbol('①'),
+            "DvCircleInvalid" => { self.circle_invalid = true; self.invalid_gen = u64::MAX; self.compute_invalid(); self.status = format!("已圈出 {} 个不合规单元格", self.invalid_cells.len()); }
+            "DvClearCircles" => { self.circle_invalid = false; self.invalid_cells.clear(); self.status = "已清除无效数据圈释".into(); }
+            "DvClearValidation" => self.clear_dv_in_sel(),
 
             // UI-11.4：函数库「最近使用的函数」菜单项（InsertFn:NAME）
             _ if action.starts_with("InsertFn:") => {

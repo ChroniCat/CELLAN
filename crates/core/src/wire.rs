@@ -3,8 +3,12 @@
 //! 为什么自己写：本机离线，拿不到 rustls / ring。但 ChaCha20 与 HMAC 都有公开的
 //! 标准测试向量，实现对不对可以当场证明，不需要「看起来能跑」。
 //!
-//! 密钥派生：口令 + 宿主随机 salt → `SHA256("sheetcore-v1" || salt || 口令)`，
-//! 再各自展开出加密钥与认证钥（不同前缀，互不相关）。
+//! 密钥派生分两层（协议 v2）：
+//! 1. 房间密钥：`PBKDF2-HMAC-SHA256(口令, 房间 salt, ROOM_KDF_ITERS)`。宿主开房时
+//!    随机生成房间 salt 并只算一次；客户端连上时从挑战里拿到同一个 salt 再算一次。
+//!    这一步是故意做慢的——旁听者想离线穷举口令，每猜一次都要付出同样的代价。
+//! 2. 连接密钥：`SHA256("sheetcore-wire-v2" || 连接 salt || 房间密钥)`，再各自展开出
+//!    加密钥与认证钥（不同前缀，互不相关）。每条连接 salt 不同，密钥互不复用。
 //! 每帧独立计数器作为 nonce，接收端要求严格递增（防重放/重排）。
 
 use sha2::{Digest, Sha256};
@@ -71,6 +75,98 @@ pub fn apply_keystream(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mu
             block = chacha20_block(key, counter.wrapping_add((i / 64) as u32), nonce);
         }
         *b ^= block[i % 64];
+    }
+}
+
+/// 房间口令拉伸的迭代次数（PBKDF2-HMAC-SHA256）
+pub const ROOM_KDF_ITERS: u32 = 200_000;
+
+/// PBKDF2-HMAC-SHA256，只输出一个 32 字节块（dkLen = 32）。
+///
+/// 热循环里每轮的消息都是上一轮的 32 字节结果，所以直接对 SHA-256 压缩函数操作：
+/// ipad/opad 两个状态各压缩一次后缓存，每轮只做两次压缩，不走通用 Digest 包装
+/// （调试构建里通用包装比压缩本身还慢）。第一轮的消息是任意长度的 salt，走 HMAC。
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
+    use sha2::block_api::compress256;
+    const IV: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut k = [0u8; 64];
+    if password.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(password));
+    } else {
+        k[..password.len()].copy_from_slice(password);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut istate = IV;
+    compress256(&mut istate, &[ipad]);
+    let mut ostate = IV;
+    compress256(&mut ostate, &[opad]);
+
+    // 一个已填好 SHA-256 尾部填充的块：前 32 字节放消息，总长 = 64（pad 块）+ 32 字节
+    let mut block = [0u8; 64];
+    block[32] = 0x80;
+    block[56..].copy_from_slice(&((64u64 + 32) * 8).to_be_bytes());
+    let state_bytes = |st: &[u32; 8], out: &mut [u8]| {
+        for (i, w) in st.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+    };
+    let mut first = Vec::with_capacity(salt.len() + 4);
+    first.extend_from_slice(salt);
+    first.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &first);
+    let mut out = u;
+    for _ in 1..iters.max(1) {
+        block[..32].copy_from_slice(&u);
+        let mut st = istate;
+        compress256(&mut st, &[block]);
+        state_bytes(&st, &mut block[..32]);
+        let mut st = ostate;
+        compress256(&mut st, &[block]);
+        state_bytes(&st, &mut u);
+        for i in 0..32 {
+            out[i] ^= u[i];
+        }
+    }
+    out
+}
+
+/// 长期房间密钥：口令经 PBKDF2 拉伸后的结果。宿主每次开房只算一次。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RoomKey([u8; 32]);
+
+impl std::fmt::Debug for RoomKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoomKey(..)")
+    }
+}
+
+impl RoomKey {
+    /// 由口令与房间 salt 派生（慢：ROOM_KDF_ITERS 轮）
+    pub fn derive(password: &str, room_salt: &[u8]) -> Self {
+        Self::derive_with_iters(password, room_salt, ROOM_KDF_ITERS)
+    }
+
+    pub fn derive_with_iters(password: &str, room_salt: &[u8], iters: u32) -> Self {
+        let mut salt = Vec::with_capacity(room_salt.len() + 16);
+        salt.extend_from_slice(b"cellan-room-v2:");
+        salt.extend_from_slice(room_salt);
+        Self(pbkdf2_hmac_sha256(password.as_bytes(), &salt, iters))
+    }
+
+    /// 入房证明：HMAC(房间密钥, "proof" || nonce)，十六进制
+    pub fn proof(&self, nonce: u64) -> String {
+        let mut msg = Vec::with_capacity(13);
+        msg.extend_from_slice(b"proof");
+        msg.extend_from_slice(&nonce.to_le_bytes());
+        hmac_sha256(&self.0, &msg).iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -180,16 +276,16 @@ pub struct Session {
 
 impl Session {
     /// 宿主持有的会话：发给客户端用方向 1，收客户端用方向 2
-    pub fn host_side(password: &str, salt: &[u8]) -> Self {
-        let mut s = Self::derive(password, salt);
+    pub fn host_side(room: &RoomKey, salt: &[u8]) -> Self {
+        let mut s = Self::derive(room, salt);
         s.send_dir = 1;
         s.recv_dir = 2;
         s
     }
 
     /// 客户端持有：方向相反
-    pub fn client_side(password: &str, salt: &[u8]) -> Self {
-        let mut s = Self::derive(password, salt);
+    pub fn client_side(room: &RoomKey, salt: &[u8]) -> Self {
+        let mut s = Self::derive(room, salt);
         s.send_dir = 2;
         s.recv_dir = 1;
         s
@@ -207,12 +303,12 @@ impl Session {
         }
     }
 
-    /// 由口令与 salt 派生
-    pub fn derive(password: &str, salt: &[u8]) -> Self {
+    /// 由房间密钥与本连接的 salt 派生
+    pub fn derive(room: &RoomKey, salt: &[u8]) -> Self {
         let mut h = Sha256::new();
-        h.update(b"sheetcore-wire-v1");
+        h.update(b"sheetcore-wire-v2");
         h.update(salt);
-        h.update(password.as_bytes());
+        h.update(room.0);
         let base = h.finalize();
         let mut enc = Sha256::new();
         enc.update(b"enc");
@@ -348,8 +444,9 @@ mod tests {
 
     #[test]
     fn session_round_trip_and_tamper() {
-        let mut a = Session::host_side("口令123", b"salt");
-        let mut b = Session::client_side("口令123", b"salt");
+        let room = RoomKey::derive_with_iters("口令123", b"room", 10);
+        let mut a = Session::host_side(&room, b"salt");
+        let mut b = Session::client_side(&room, b"salt");
         let frame = a.seal("{\"t\":\"Hello\",\"site\":7}");
         let out = b.open(&frame).expect("应能解开");
         assert_eq!(out, "{\"t\":\"Hello\",\"site\":7}");
@@ -361,10 +458,51 @@ mod tests {
         // 重放
         assert!(b.open(&frame).is_none(), "重放同一帧必须拒绝");
         // 口令不对
-        let mut c = Session::client_side("错口令", b"salt");
+        let wrong = RoomKey::derive_with_iters("错口令", b"room", 10);
+        let mut c = Session::client_side(&wrong, b"salt");
         let f2 = a.seal("{}");
         assert!(c.open(&f2).is_none());
+        // 同口令、不同房间 salt：密钥不同
+        let other_room = RoomKey::derive_with_iters("口令123", b"other", 10);
+        let mut d = Session::client_side(&other_room, b"salt");
+        assert!(d.open(&a.seal("{}")).is_none());
+        assert_ne!(room.proof(42), other_room.proof(42));
+        assert_ne!(room.proof(42), room.proof(43));
     }
+
+    /// RFC 7914 §11 / 通用 PBKDF2-HMAC-SHA256 测试向量（已用 Python hashlib 复核）
+    #[test]
+    fn pbkdf2_hmac_sha256_vectors() {
+        let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            hex(pbkdf2_hmac_sha256(b"password", b"salt", 1)),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+        assert_eq!(
+            hex(pbkdf2_hmac_sha256(b"password", b"salt", 2)),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
+        assert_eq!(
+            hex(pbkdf2_hmac_sha256(b"password", b"salt", 4096)),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+        assert_eq!(
+            hex(pbkdf2_hmac_sha256(
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096
+            )),
+            "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1"
+        );
+        // 超过一个块（64 字节）的口令要先哈希成 HMAC 密钥
+        let long_pw = [b'k'; 100];
+        assert_eq!(
+            hex(pbkdf2_hmac_sha256(&long_pw, b"salt", 3)),
+            LONG_PW_VECTOR
+        );
+    }
+
+    const LONG_PW_VECTOR: &str = "219c68bb88f1010f4a763b7c8fd58639c2280baf6820814c6d404891fcd85c3d";
 
     #[test]
     fn base64_round_trip() {

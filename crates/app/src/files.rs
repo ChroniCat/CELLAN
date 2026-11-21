@@ -59,7 +59,12 @@ fn read_dir_entries(path: &Path) -> Option<Vec<Entry>> {
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('$') || name == "System Volume Information" {
+            if name.starts_with('$')
+                || name.starts_with(".~")
+                || name.starts_with("~$")
+                || name == ".cellan-share"
+                || name == "System Volume Information"
+            {
                 continue;
             }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);

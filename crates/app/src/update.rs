@@ -1,19 +1,17 @@
-//! 从共享目录发版：检查更新、暂存、退出时替换并重启。
+//! 从共享目录发版：只检查、只提示，不自动安装。
 //!
-//! 没有服务器的好处在这里体现：把新版 exe 和一份 manifest.txt 丢进内网共享目录
-//! （比如 `Z:\软件\Sheets`），大家启动时比对版本号，比本机新就悄悄下到本地，
-//! 关窗时替换。
-//!
-//! manifest.txt 只有三行：
+//! 发版目录（比如 `Z:\软件\Sheets`）里放新版 exe 和一份 manifest.txt：
 //! ```text
 //! version=1.70
 //! exe=CELLAN-1.70.exe
 //! sha256=<64 位十六进制>
 //! ```
 //!
-//! 校验用 SHA-256：共享盘上文件被占、被半截复制的情况很常见，哈希不对就不装。
+//! 为什么不自动安装：manifest 和 exe 放在同一个可写共享目录里，SHA-256 只能发现
+//! 「复制了半截」，发现不了「有人连 exe 带 manifest 一起换掉」——任何能写这个目录的人
+//! 都能借自动更新在每台电脑上运行任意程序。在发版带上签名校验之前，这里只告诉用户
+//! 「有新版本」，安装交给管理员的正式安装包。
 
-use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +28,6 @@ pub const VERSION: &str = "1.70";
 pub struct Remote {
     pub version: String,
     pub exe: PathBuf,
-    pub sha256: String,
 }
 
 /// 应用级配置目录 `%LOCALAPPDATA%\CELLAN`。
@@ -116,7 +113,19 @@ fn parse_manifest(text: &str) -> Option<(String, String, String)> {
             sha = Some(v.trim().to_lowercase());
         }
     }
-    Some((version?, exe?, sha?))
+    let (version, exe, sha) = (version?, exe?, sha?);
+    // manifest 来自共享盘，不可信：版本号只能是数字和点；exe 只能是发版目录里的一个 .exe 文件名，
+    // 不能带路径分隔符、盘符或 `..` 指到目录外面；哈希必须是 64 位十六进制
+    let version_ok = !version.is_empty()
+        && version.len() <= 32
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let exe_ok = !exe.is_empty()
+        && exe.len() <= 128
+        && !exe.contains(['/', '\\', ':'])
+        && !exe.contains("..")
+        && exe.to_ascii_lowercase().ends_with(".exe");
+    let sha_ok = sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    (version_ok && exe_ok && sha_ok).then_some((version, exe, sha))
 }
 
 /// 版本号比较：按点分段，数值比大小（"1.10" 比 "1.9" 新）
@@ -136,8 +145,10 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
 /// 看一眼共享目录，有比本机新的就返回
 pub fn check(dir: &Path) -> std::io::Result<Option<Remote>> {
     let text = std::fs::read_to_string(dir.join("manifest.txt"))?;
-    let Some((version, exe, sha256)) = parse_manifest(&text) else {
-        return Err(std::io::Error::other("manifest.txt 格式不对"));
+    let Some((version, exe, _sha256)) = parse_manifest(&text) else {
+        return Err(std::io::Error::other(
+            "manifest.txt 格式不对（version 只能是数字与点，exe 只能是发版目录里的 .exe 文件名，sha256 须为 64 位十六进制）",
+        ));
     };
     if !is_newer(&version, VERSION) {
         return Ok(None);
@@ -149,66 +160,9 @@ pub fn check(dir: &Path) -> std::io::Result<Option<Remote>> {
             exe_path.display()
         )));
     }
-    Ok(Some(Remote { version, exe: exe_path, sha256 }))
+    Ok(Some(Remote { version, exe: exe_path }))
 }
 
-fn sha256_of(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    use std::io::Read;
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// 把新版复制到本地并校验哈希；校验不过就删掉，绝不安装坏文件
-pub fn stage(remote: &Remote) -> std::io::Result<PathBuf> {
-    let dir = app_dir().join("updates");
-    std::fs::create_dir_all(&dir)?;
-    let target = dir.join(format!("pending-{}.exe", remote.version));
-    std::fs::copy(&remote.exe, &target)?;
-    let actual = sha256_of(&target)?;
-    if actual != remote.sha256 {
-        let _ = std::fs::remove_file(&target);
-        return Err(std::io::Error::other(format!(
-            "哈希不符（期望 {}，实际 {}），已丢弃",
-            &remote.sha256[..8.min(remote.sha256.len())],
-            &actual[..8]
-        )));
-    }
-    Ok(target)
-}
-
-/// 关窗后替换并重启：写一个批处理等本进程退出，再搬运文件
-pub fn apply_on_exit(staged: &Path) -> std::io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let pid = std::process::id();
-    let script = app_dir().join("apply-update.cmd");
-    let body = format!(
-        "@echo off\r\n\
-         :wait\r\n\
-         tasklist /FI \"PID eq {pid}\" | find \"{pid}\" >nul\r\n\
-         if not errorlevel 1 (\r\n\
-           timeout /t 1 /nobreak >nul\r\n\
-           goto wait\r\n\
-         )\r\n\
-         copy /y \"{staged}\" \"{exe}\" >nul\r\n\
-         start \"\" \"{exe}\"\r\n\
-         del \"%~f0\"\r\n",
-        pid = pid,
-        staged = staged.display(),
-        exe = exe.display()
-    );
-    let mut f = std::fs::File::create(&script)?;
-    f.write_all(body.as_bytes())?;
-    Ok(script)
-}
 
 #[cfg(test)]
 mod tests {
@@ -224,10 +178,43 @@ mod tests {
 
     #[test]
     fn manifest_parsing() {
-        let text = "version=1.38\nexe=a.exe\nsha256=ABC123\n";
-        let (v, e, s) = parse_manifest(text).unwrap();
-        assert_eq!((v.as_str(), e.as_str(), s.as_str()), ("1.38", "a.exe", "abc123"));
+        let sha = "AB".repeat(32);
+        let text = format!("version=1.38\nexe=a.exe\nsha256={sha}\n");
+        let (v, e, s) = parse_manifest(&text).unwrap();
+        assert_eq!((v.as_str(), e.as_str(), s.as_str()), ("1.38", "a.exe", "ab".repeat(32).as_str()));
         assert!(parse_manifest("version=1.0").is_none(), "缺字段应当拒绝");
+    }
+
+    #[test]
+    fn manifest_from_the_share_cannot_point_outside_the_release_folder() {
+        let sha = "0".repeat(64);
+        let bad = [
+            format!("version=1.99\nexe=..\\..\\Windows\\evil.exe\nsha256={sha}"),
+            format!("version=1.99\nexe=C:\\evil.exe\nsha256={sha}"),
+            format!("version=1.99\nexe=\\\\host\\share\\evil.exe\nsha256={sha}"),
+            format!("version=1.99\nexe=sub/evil.exe\nsha256={sha}"),
+            format!("version=1.99\nexe=evil.cmd\nsha256={sha}"),
+            format!("version=1.99;calc\nexe=a.exe\nsha256={sha}"),
+            "version=1.99\nexe=a.exe\nsha256=短".to_string(),
+        ];
+        for text in bad {
+            assert!(parse_manifest(&text).is_none(), "应拒绝：{text}");
+        }
+    }
+
+    #[test]
+    fn newer_version_is_reported_but_nothing_is_installed() {
+        let dir = crate::test_env::scratch("update-notice-only");
+        std::fs::write(dir.join("CELLAN-9.0.exe"), b"not really an exe").unwrap();
+        std::fs::write(
+            dir.join("manifest.txt"),
+            format!("version=9.0\nexe=CELLAN-9.0.exe\nsha256={}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let remote = check(&dir).unwrap().expect("应发现新版本");
+        assert_eq!(remote.version, "9.0");
+        assert_eq!(remote.exe, dir.join("CELLAN-9.0.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
