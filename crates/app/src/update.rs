@@ -261,6 +261,7 @@ pub fn candidate_http_urls() -> Vec<String> {
 
 /// 当前生效的发版公钥（128 位十六进制）
 pub fn active_pubkey_hex() -> Option<String> {
+    #[cfg(any(test, debug_assertions))]
     if let Ok(v) = std::env::var("SC_UPDATE_PUBKEY") {
         let t = v.trim().to_ascii_lowercase();
         if is_valid_hex(&t, 128) {
