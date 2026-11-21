@@ -374,6 +374,34 @@ fn delayed_save(app: &mut SheetApp, target: &str) -> Sender<Result<(sheetcore::x
     tx
 }
 
+#[test]
+fn update_restart_waits_for_local_edits_collaboration_and_background_writes() {
+    let _env = crate::test_env::TestEnv::new("restart-pending-work");
+    let mut app = app();
+    app.has_open_workbook = true;
+    assert!(app.safe_to_restart_after_update());
+
+    app.editing = Some(EditState::new("pending value".into()));
+    assert!(!app.safe_to_restart_after_update());
+    app.editing = None;
+    app.pending_edit = Some("waiting for cell lock".into());
+    assert!(!app.safe_to_restart_after_update());
+    app.pending_edit = None;
+    app.delegated_save_pending = Some((app.doc_uid, Instant::now()));
+    assert!(!app.safe_to_restart_after_update());
+    app.delegated_save_pending = None;
+    put(&mut app.wb, 23.0);
+    assert!(!app.safe_to_restart_after_update());
+
+    let _pending_write = delayed_save(&mut app, "pending.xlsx");
+    assert!(!app.safe_to_restart_after_update());
+    app.open_in_new_tab(PathBuf::new());
+    assert!(!app.safe_to_restart_after_update());
+    app.switch_tab(0);
+    app.tasks.saving = None;
+    assert!(app.safe_to_restart_after_update());
+}
+
 fn parked(app: &SheetApp, index: usize) -> &ParkedDoc {
     match &app.tabs[index] {
         TabSlot::Parked(doc) => doc,

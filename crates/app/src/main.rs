@@ -1641,6 +1641,34 @@ struct ViewAxesCache {
     rows: std::sync::Arc<sheetcore::layout::Axis>,
 }
 
+enum UpdateWorkerMsg {
+    CheckDone {
+        manual: bool,
+        result: Result<Option<update::AvailableUpdate>, String>,
+    },
+    Progress {
+        received: u64,
+        total: u64,
+    },
+    InstalledInPlace {
+        version: String,
+    },
+    Failed(String),
+}
+
+#[derive(Default)]
+struct UpdateUiState {
+    rx: Option<std::sync::mpsc::Receiver<UpdateWorkerMsg>>,
+    checking: bool,
+    downloading: bool,
+    progress: Option<(u64, u64)>,
+    available: Option<update::AvailableUpdate>,
+    installed_ready_version: Option<String>,
+    error: Option<String>,
+    dialog_open: bool,
+    dismissed_version: Option<String>,
+}
+
 struct SheetApp {
     view_axes_cache: std::cell::RefCell<Option<ViewAxesCache>>,
     wb: Workbook,
@@ -1753,6 +1781,7 @@ struct SheetApp {
     paste_done: bool,
     pending_tab_switch: Option<usize>,
     update_done: bool,
+    update_ui: UpdateUiState,
     /// 筛选下拉（Excel 那个带搜索框的面板）
     filter_popup: Option<FilterPopup>,
     /// 显示分页虚线
@@ -3094,6 +3123,7 @@ impl SheetApp {
             paste_done: false,
             pending_tab_switch: None,
             update_done: false,
+            update_ui: UpdateUiState::default(),
             filter_popup: None,
             show_pages: false,
             undo: sheetcore::undo::UndoStack::new(),
@@ -16758,6 +16788,14 @@ let txn = self.txn_begin(&keys);
                     format!("v{}", update::VERSION),
                     ui_kit::medium_in(ctx, 11.0),
                     ui_kit::BRAND_NAVY,
+                );
+
+                p.text(
+                    egui::pos2(vpill.right() + 12.0, vpill.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("Git {}", env!("CELLAN_GIT_REV")),
+                    ui_kit::medium_in(ctx, 11.0),
+                    Color32::from_rgb(71, 85, 105),
                 );
 
                 ui.add_space(6.0);
@@ -33663,48 +33701,356 @@ fn elide(s: &str, max_chars: usize) -> String {
         Self::paint_home_quick_card(p, idx, card, t.name, hovered);
     }
 
-    /// 从共享目录检查更新：有新版就下到本地，关窗时替换
+    /// 检查更新（手动点击入口）：零弹窗选目录，后台异步探测发版源，发现签名新版则打开一键更新面板
     fn check_update(&mut self) {
-        let dir = match update::dir() {
-            Some(d) => d,
-            None => {
-                let Some(p) = rfd::FileDialog::new()
-                    .set_title("选择发版目录（放 manifest.txt 和新版 exe）")
-                    .pick_folder()
-                else {
-                    return;
-                };
-                if let Err(e) = update::set_dir(&p) {
-                    self.status = format!("记住发版目录失败：{e}");
-                    return;
-                }
-                p
-            }
-        };
-        // 只检查、只提示，不从共享盘自动安装：manifest 与 exe 在同一个可写目录里，
-        // 哈希只能防「复制了半截」，防不了「有人把 exe 换掉」。等发版带上签名校验再恢复自动安装。
-        match update::check(&dir) {
-            Ok(None) => self.status = format!("已是最新版本（{}）", update::VERSION),
-            Ok(Some(remote)) => {
-                self.status = format!(
-                    "发现新版本 {}（{}）。当前版本不会从共享盘自动安装，请向管理员索取正式安装包后手动更新",
-                    remote.version,
-                    remote.exe.display()
-                );
-            }
-            Err(e) => self.status = format!("检查更新失败：{e}"),
-        }
-        eprintln!("[update] {}", self.status);
-    }
-
-
-    /// 自检：启动后跑一次检查更新
-    fn update_probe(&mut self) {
-        if std::env::var("SC_UPDATE_CHECK").is_err() || self.update_done {
+        if self.update_ui.installed_ready_version.is_some()
+            || self.update_ui.downloading
+            || self.update_ui.available.is_some()
+        {
+            self.update_ui.dialog_open = true;
             return;
         }
-        self.update_done = true;
-        self.check_update();
+        if self.update_ui.checking {
+            self.status = "正在检查更新…".into();
+            return;
+        }
+        self.status = "正在检查更新…".into();
+        self.spawn_update_check(true, None);
+    }
+
+    fn spawn_update_check(&mut self, manual: bool, wake: Option<egui::Context>) {
+        self.update_ui.checking = true;
+        self.update_ui.error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_ui.rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = update::probe_all_sources();
+            let _ = tx.send(UpdateWorkerMsg::CheckDone { manual, result });
+            if let Some(ctx) = wake {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn start_update_install(&mut self, ctx: &egui::Context) {
+        if self.update_ui.downloading {
+            return;
+        }
+        let Some(avail) = self.update_ui.available.clone() else {
+            return;
+        };
+        if !avail.can_auto_install() {
+            return;
+        }
+        self.update_ui.error = None;
+        self.update_ui.downloading = true;
+        self.update_ui.progress = Some((0, avail.manifest.size.max(1)));
+
+        if let update::UpdateSource::CollabPeer { peer_site, .. } = &avail.source {
+            let Some(net) = &self.net else {
+                self.update_ui.downloading = false;
+                self.update_ui.error = Some("当前已离开协作会话，无法从协作成员拉取更新".into());
+                return;
+            };
+            if let Err(e) = net.request_peer_update(*peer_site, &avail.manifest) {
+                self.update_ui.downloading = false;
+                self.update_ui.error = Some(e);
+            } else {
+                self.status = format!("正在从协作成员同步 v{} 更新包…", avail.manifest.version);
+            }
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_ui.rx = Some(rx);
+        let wake = ctx.clone();
+        let ver = avail.manifest.version.clone();
+        self.status = format!("正在下载并校验 v{ver} 更新包…");
+        std::thread::spawn(move || {
+            let tx_prog = tx.clone();
+            let wake_prog = wake.clone();
+            let mut last_pct = 0u64;
+            let res = update::download_and_verify(&avail, |done, total| {
+                let pct = (done.saturating_mul(100)) / total.max(1);
+                if done == total || pct >= last_pct.saturating_add(2) {
+                    last_pct = pct;
+                    let _ = tx_prog.send(UpdateWorkerMsg::Progress {
+                        received: done,
+                        total,
+                    });
+                    wake_prog.request_repaint();
+                }
+            })
+            .and_then(|verified_path| update::install_in_place(&verified_path));
+
+            match res {
+                Ok(_) => {
+                    let _ = tx.send(UpdateWorkerMsg::InstalledInPlace { version: ver });
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdateWorkerMsg::Failed(e));
+                }
+            }
+            wake.request_repaint();
+        });
+    }
+
+    fn safe_to_restart_after_update(&self) -> bool {
+        self.editing.is_none()
+            && self.pending_edit.is_none()
+            && self.delegated_save_pending.is_none()
+            && self.dv_alert.is_none()
+            && !self.has_pending_save()
+            && (!self.has_open_workbook
+                || (!self.wb.dirty
+                    && !self.tabs.iter().any(|t| matches!(t, TabSlot::Parked(d) if d.wb.dirty))))
+    }
+
+    fn trigger_restart_into_updated_exe(&mut self, ctx: &egui::Context) {
+        if !self.safe_to_restart_after_update() {
+            return;
+        }
+        match update::spawn_restarted_process(self.wb.path.as_deref()) {
+            Ok(()) => {
+                if let Some(net) = self.net.take() {
+                    net.shutdown();
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.update_ui.error = Some(format!(
+                    "自动重启失败（{e}）。新版本已完成替换，请手动关闭并重新打开 CELLAN 即可生效。"
+                ));
+            }
+        }
+    }
+
+    /// 启动后后台静默检查一次更新（绝不阻塞首帧、离线静默不报错）并轮询更新任务结果
+    fn update_probe(&mut self, ctx: &egui::Context) {
+        if !self.update_done {
+            let force_probe = std::env::var("SC_UPDATE_CHECK").is_ok();
+            if force_probe || (!is_headless_probe_env() && !cfg!(test)) {
+                self.update_done = true;
+                std::thread::spawn(update::cleanup_old_exe);
+                if force_probe || !update::candidate_http_urls().is_empty() || update::dir().is_some()
+                {
+                    self.spawn_update_check(force_probe, Some(ctx.clone()));
+                }
+            } else {
+                self.update_done = true;
+            }
+        }
+
+        let mut msgs = Vec::new();
+        if let Some(rx) = &self.update_ui.rx {
+            while let Ok(m) = rx.try_recv() {
+                msgs.push(m);
+            }
+        }
+        for msg in msgs {
+            match msg {
+                UpdateWorkerMsg::CheckDone { manual, result } => {
+                    self.update_ui.checking = false;
+                    match result {
+                        Ok(None) => {
+                            if manual {
+                                self.status = format!("已是最新版本（v{}）", update::VERSION);
+                            }
+                        }
+                        Ok(Some(avail)) => match &avail.source {
+                            update::UpdateSource::LegacyNoticeOnly { exe_path } => {
+                                self.status = format!(
+                                    "发现新版本 {}（{}）。该共享目录包未附带数字签名，请使用签名发版脚本重新发布",
+                                    avail.manifest.version,
+                                    exe_path.display()
+                                );
+                            }
+                            _ => {
+                                let dismissed = self.update_ui.dismissed_version.as_deref()
+                                    == Some(avail.manifest.version.as_str());
+                                self.status = format!(
+                                    "发现新版本 v{}，可在「检查更新」中一键升级",
+                                    avail.manifest.version
+                                );
+                                self.update_ui.available = Some(avail);
+                                if manual || !dismissed {
+                                    self.update_ui.dialog_open = true;
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            if manual {
+                                self.status = format!("暂未发现可用更新（{e}）");
+                            }
+                        }
+                    }
+                }
+                UpdateWorkerMsg::Progress { received, total } => {
+                    self.update_ui.progress = Some((received, total));
+                }
+                UpdateWorkerMsg::InstalledInPlace { version } => {
+                    self.update_ui.downloading = false;
+                    self.update_ui.progress = None;
+                    self.update_ui.installed_ready_version = Some(version.clone());
+                    if self.safe_to_restart_after_update() && !is_headless_probe_env() {
+                        self.status = format!("v{version} 更新已完成，正在自动重启…");
+                        self.trigger_restart_into_updated_exe(ctx);
+                    } else {
+                        self.status =
+                            format!("新版本 v{version} 已就地安装完成，保存工作簿后重启即生效");
+                        self.update_ui.dialog_open = true;
+                    }
+                }
+                UpdateWorkerMsg::Failed(err) => {
+                    self.update_ui.downloading = false;
+                    self.update_ui.progress = None;
+                    self.status = format!("更新失败：{err}");
+                    self.update_ui.error = Some(err);
+                    self.update_ui.dialog_open = true;
+                }
+            }
+        }
+    }
+
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        if !self.update_ui.dialog_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_install = false;
+        let mut do_restart = false;
+        let mut do_dismiss = false;
+
+        ui_kit::window(ctx, "软件更新", 456.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if let Some(ready_ver) = self.update_ui.installed_ready_version.clone() {
+                    ui_kit::state_banner(
+                        ui,
+                        ui_kit::StateKind::Info,
+                        &format!("{} v{ready_ver} 已安装就绪", update::APP_NAME),
+                        "完成编辑并保存所有工作簿后，即可点击「立即重启生效」。也可以稍后重新打开软件使用新版本。",
+                    );
+                    if let Some(err) = &self.update_ui.error {
+                        ui.add_space(8.0);
+                        ui_kit::state_banner(ui, ui_kit::StateKind::Error, "重启提示", err);
+                    }
+                    ui.add_space(12.0);
+                    ui_kit::footer(ui, |ui| {
+                        if ui_kit::secondary_button(ui, "稍后手动重启").clicked() {
+                            do_dismiss = true;
+                        }
+                        ui.add_enabled_ui(self.safe_to_restart_after_update(), |ui| {
+                            if ui_kit::primary_button(ui, "立即重启生效").clicked() {
+                                do_restart = true;
+                            }
+                        });
+                    });
+                    return;
+                }
+
+                let Some(avail) = self.update_ui.available.clone() else {
+                    do_dismiss = true;
+                    return;
+                };
+
+                let detail = format!(
+                    "当前版本：v{}   →   最新版本：v{}\n更新来源：{}\n安全状态：已通过官方公钥数字签名校验",
+                    update::VERSION,
+                    avail.manifest.version,
+                    avail.source_label()
+                );
+                ui_kit::state_banner(
+                    ui,
+                    ui_kit::StateKind::Info,
+                    &format!("发现新版本 v{}", avail.manifest.version),
+                    &detail,
+                );
+
+                if !avail.manifest.notes.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("更新内容")
+                            .font(ui_kit::medium_in(ctx, 12.5))
+                            .color(ui_kit::TEXT),
+                    );
+                    ui.add_space(3.0);
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(248, 250, 252))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&avail.manifest.notes)
+                                        .size(12.5)
+                                        .color(Color32::from_rgb(51, 65, 85)),
+                                )
+                                .wrap(),
+                            );
+                        });
+                }
+
+                if self.update_ui.downloading {
+                    ui.add_space(10.0);
+                    let (done, total) = self
+                        .update_ui
+                        .progress
+                        .unwrap_or((0, avail.manifest.size.max(1)));
+                    let frac = (done as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+                    let mb_done = done as f64 / (1024.0 * 1024.0);
+                    let mb_total = total as f64 / (1024.0 * 1024.0);
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!(
+                                "正在下载并校验… {:.0}%（{:.1} / {:.1} MB）",
+                                frac * 100.0,
+                                mb_done,
+                                mb_total
+                            ))
+                            .animate(true),
+                    );
+                }
+
+                if let Some(err) = &self.update_ui.error {
+                    ui.add_space(8.0);
+                    ui_kit::state_banner(ui, ui_kit::StateKind::Error, "更新遇到问题", err);
+                }
+
+                ui.add_space(12.0);
+                ui_kit::footer(ui, |ui| {
+                    if !self.update_ui.downloading {
+                        if ui_kit::secondary_button(ui, "稍后提醒").clicked() {
+                            self.update_ui.dismissed_version =
+                                Some(avail.manifest.version.clone());
+                            do_dismiss = true;
+                        }
+                        if ui_kit::primary_button(ui, "立即更新").clicked() {
+                            do_install = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("更新过程中仍可继续查看当前表格，完成后将自动应用")
+                                .size(11.5)
+                                .color(ui_kit::TEXT_WEAK),
+                        );
+                    }
+                });
+            });
+
+        if do_install {
+            self.start_update_install(ctx);
+        } else if do_restart {
+            self.update_ui.dialog_open = false;
+            self.trigger_restart_into_updated_exe(ctx);
+        } else if do_dismiss || !open {
+            if !self.update_ui.downloading {
+                self.update_ui.dialog_open = false;
+            }
+        }
     }
 
 
@@ -34408,6 +34754,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if shared_cells_only {
                         self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
                     }
+                    if let Some(net) = &self.net {
+                        if !net.hosting {
+                            net.announce_local_signed_update();
+                        }
+                    }
                 }
                 net::NetEvent::PeerJoined(site, name, color) => {
                     eprintln!("[net] peer joined: {name}#{site}");
@@ -34420,6 +34771,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.peers_list.retain(|(s, _, _)| *s != site);
                     self.peers_list.push((site, name, color));
                     self.status = format!("在线 {} 人", self.peers_list.len());
+                    if let Some(net) = &self.net {
+                        if net.hosting {
+                            net.announce_local_signed_update_to(site);
+                        }
+                    }
                 }
                 net::NetEvent::PeerRenamed(site, name) => {
                     eprintln!("[net] peer renamed: {name}#{site}");
@@ -34622,6 +34978,75 @@ fn elide(s: &str, max_chars: usize) -> String {
                     }
                 }
                 net::NetEvent::Saved { clock } => self.receive_host_save(clock),
+                net::NetEvent::PeerUpdateOffer {
+                    peer_site,
+                    peer_name,
+                    manifest,
+                } => {
+                    if !self.update_ui.downloading
+                        && self.update_ui.installed_ready_version.is_none()
+                    {
+                        let should_adopt = self
+                            .update_ui
+                            .available
+                            .as_ref()
+                            .is_none_or(|cur| update::is_newer(&manifest.version, &cur.manifest.version));
+                        if should_adopt {
+                            let resolved_name = if !peer_name.is_empty() {
+                                peer_name
+                            } else {
+                                self.peers_list
+                                    .iter()
+                                    .find(|(s, _, _)| *s == peer_site)
+                                    .map(|(_, n, _)| n.clone())
+                                    .unwrap_or_else(|| format!("成员#{peer_site}"))
+                            };
+                            let dismissed = self.update_ui.dismissed_version.as_deref()
+                                == Some(manifest.version.as_str());
+                            self.status = format!(
+                                "协作成员「{resolved_name}」正在使用新版本 v{}，可一键同步升级",
+                                manifest.version
+                            );
+                            self.update_ui.available = Some(update::AvailableUpdate {
+                                manifest,
+                                source: update::UpdateSource::CollabPeer {
+                                    peer_site,
+                                    peer_name: resolved_name,
+                                },
+                            });
+                            if !dismissed && !is_headless_probe_env() {
+                                self.update_ui.dialog_open = true;
+                            }
+                        }
+                    }
+                }
+                net::NetEvent::PeerUpdateProgress { received, total } => {
+                    self.update_ui.progress = Some((received, total));
+                }
+                net::NetEvent::PeerUpdateReady {
+                    version,
+                    verified_exe,
+                } => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.update_ui.rx = Some(rx);
+                    std::thread::spawn(move || {
+                        match update::install_in_place(&verified_exe) {
+                            Ok(_) => {
+                                let _ = tx.send(UpdateWorkerMsg::InstalledInPlace { version });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(UpdateWorkerMsg::Failed(e));
+                            }
+                        }
+                    });
+                }
+                net::NetEvent::PeerUpdateFailed(err) => {
+                    self.update_ui.downloading = false;
+                    self.update_ui.progress = None;
+                    self.status = format!("协作同步更新失败：{err}");
+                    self.update_ui.error = Some(err);
+                    self.update_ui.dialog_open = true;
+                }
                 net::NetEvent::Error(msg) => self.status = msg,
             }
         }
@@ -35587,7 +36012,8 @@ impl eframe::App for SheetApp {
         self.poll_open_requests(ctx);
         self.tabs_probe();
         self.paste_probe();
-        self.update_probe();
+        self.update_probe(ctx);
+        self.update_dialog(ctx);
         self.update_window_title(ctx);
         self.filter_dialog(ctx);
         self.pivot_dialog(ctx);
@@ -38199,21 +38625,49 @@ fn main() -> eframe::Result<()> {
     // QA-07：进程起点，用于量「冷启动 → 首帧」「打开 → 可编辑」
     let _ = START.set(std::time::Instant::now());
     install_crash_hook();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial: Option<PathBuf> = None;
     let mut auto_host = false;
     let mut auto_join: Option<String> = None;
     let mut auto_pass: Option<String> = None;
-    for a in args {
+    let mut serve_updates_dir: Option<PathBuf> = None;
+    let mut serve_updates_port: u16 = update::DEFAULT_UPDATE_PORT;
+    let mut after_update_pid: Option<u32> = None;
+    let mut i = 0usize;
+    while i < raw_args.len() {
+        let a = &raw_args[i];
         if a == "--host" {
             auto_host = true;
         } else if let Some(addr) = a.strip_prefix("--join=") {
             auto_join = Some(addr.to_string());
         } else if let Some(pw) = a.strip_prefix("--pass=") {
             auto_pass = Some(pw.to_string());
+        } else if let Some(d) = a.strip_prefix("--serve-updates=") {
+            serve_updates_dir = Some(PathBuf::from(d));
+        } else if a == "--serve-updates" {
+            if let Some(next) = raw_args.get(i + 1) {
+                serve_updates_dir = Some(PathBuf::from(next));
+                i += 1;
+            }
+        } else if let Some(p) = a.strip_prefix("--port=") {
+            if let Ok(port_num) = p.trim().parse::<u16>() {
+                if port_num > 0 {
+                    serve_updates_port = port_num;
+                }
+            }
+        } else if let Some(pid_s) = a.strip_prefix("--after-update=") {
+            after_update_pid = pid_s.trim().parse::<u32>().ok();
         } else if !a.starts_with("--") {
             initial = Some(PathBuf::from(a));
         }
+        i += 1;
+    }
+    if let Some(dir) = serve_updates_dir {
+        let _ = update::serve_updates_blocking(&dir, serve_updates_port);
+        return Ok(());
+    }
+    if after_update_pid.is_some() {
+        update::wait_for_old_process_and_cleanup(after_update_pid);
     }
     // 命令行注册关联：打包脚本/安装器可以直接调用
     if std::env::args().any(|a| a == "--register-assoc") {

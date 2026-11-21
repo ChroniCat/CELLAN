@@ -430,6 +430,32 @@ pub enum Msg {
     SaveReq { site: u32 },
     /// 宿主已将权威状态保存到共享原文件，通知全员清除未保存标记
     Saved { site: u32, #[serde(default)] clock: u64 },
+    /// 协作成员宣告自己持有经过官方公钥签名的新版可执行文件（供房间内旧版成员无感接力更新）
+    UpdateAnnounce {
+        site: u32,
+        version: String,
+        size: u64,
+        sha256: String,
+        sig: String,
+        #[serde(default)]
+        notes: String,
+    },
+    /// 旧版本成员向房间内持有新版签名包的指定站点请求拉取二进制分片
+    UpdatePull {
+        from_site: u32,
+        to_site: u32,
+        version: String,
+    },
+    /// 定向转发的新版二进制分片（宿主按 `to_site` 单播路由，不向无关成员广播）
+    UpdateSlice {
+        from_site: u32,
+        to_site: u32,
+        version: String,
+        offset: u64,
+        total: u64,
+        data_b64: String,
+        done: bool,
+    },
     Bye { site: u32 },
 }
 
@@ -535,6 +561,37 @@ impl Msg {
                     })
             }
             Msg::Saved { clock, .. } => ts_ok(*clock),
+            Msg::UpdateAnnounce {
+                version,
+                size,
+                sha256,
+                sig,
+                notes,
+                ..
+            } => {
+                !version.is_empty()
+                    && version.len() <= 32
+                    && *size > 0
+                    && *size <= 256 * 1024 * 1024
+                    && sha256.len() == 64
+                    && sig.len() == 128
+                    && notes.len() <= 1024
+            }
+            Msg::UpdatePull { version, .. } => !version.is_empty() && version.len() <= 32,
+            Msg::UpdateSlice {
+                version,
+                offset,
+                total,
+                data_b64,
+                ..
+            } => {
+                !version.is_empty()
+                    && version.len() <= 32
+                    && *total > 0
+                    && *total <= 256 * 1024 * 1024
+                    && *offset <= *total
+                    && data_b64.len() <= 512 * 1024
+            }
             Msg::Challenge { .. }
             | Msg::ChallengeSalt { .. }
             | Msg::Denied { .. }
