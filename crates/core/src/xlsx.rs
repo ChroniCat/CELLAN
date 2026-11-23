@@ -398,6 +398,41 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     //（我们自己写出的容器就属于后一种）。
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
     let (mut shared_zip, package_stamp) = is_ooxml.then(|| sheets::open_stamped(path)).transpose()?.unzip();
+    let (
+        zip_has_vba,
+        zip_has_xlinks,
+        zip_has_drawing,
+        zip_has_table,
+        zip_has_chart,
+        zip_has_comments,
+        zip_has_styles,
+        zip_has_theme,
+    ) = if let Some(zip) = shared_zip.as_ref() {
+        let (mut vba, mut xlinks, mut drawing, mut table, mut chart, mut comments, mut styles, mut theme) =
+            (false, false, false, false, false, false, false, false);
+        for name in zip.file_names() {
+            if name == "xl/vbaProject.bin" {
+                vba = true;
+            } else if name == "xl/styles.xml" {
+                styles = true;
+            } else if name.starts_with("xl/theme/") {
+                theme = true;
+            } else if name.contains("externalLink") {
+                xlinks = true;
+            } else if name.contains("drawing") {
+                drawing = true;
+            } else if name.contains("tables/table") {
+                table = true;
+            } else if name.contains("charts/chart") {
+                chart = true;
+            } else if name.contains("comments") || name.contains("threadedComment") {
+                comments = true;
+            }
+        }
+        (vba, xlinks, drawing, table, chart, comments, styles, theme)
+    } else {
+        (false, false, false, false, false, false, false, false)
+    };
     let sheets::WorkbookMetadata { xml: workbook_xml, targets, header } = shared_zip.as_mut()
         .map(sheets::workbook_metadata).transpose()
         .with_context(|| format!("无法打开 {} 的工作簿元数据和样式", path.display()))?
@@ -424,23 +459,33 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         None => reader.as_ref().unwrap().sheet_names(),
     };
 
-    let is_cfb = crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
+    let is_cfb = !is_ooxml && crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
     let mut defined_names = crate::patch::defined_names_xml(&workbook_xml);
     let manual_hidden = crate::patch::manual_hidden_from_names(&defined_names);
     defined_names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
+    let has_source_names = defined_names.iter().any(|(n, _, _)| n.starts_with("_sc_src_"))
+        || workbook_xml.contains("_sc_src_");
     let (calc_iterate, calc_max_iterations, calc_max_change) =
         crate::patch::calc_iteration_xml(&workbook_xml).unwrap_or((false, 100, 0.001));
     let mut wb = Workbook {
         load_incomplete: false,
         names: defined_names,
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
-        sources: crate::external::read_sources(path),
-        links: crate::xlinks::read(path),
+        sources: if !is_ooxml || has_source_names {
+            crate::external::read_sources(path)
+        } else {
+            Vec::new()
+        },
+        links: if !is_ooxml || zip_has_xlinks {
+            crate::xlinks::read(path)
+        } else {
+            Vec::new()
+        },
         names_dirty: false,
         pivot_shifts: Vec::new(),
         pivot_cache_base: Default::default(),
         pivot_session: Default::default(),
-        has_vba: crate::vba::has_macros(path),
+        has_vba: if is_ooxml { zip_has_vba } else { crate::vba::has_macros(path) },
         date_system: if crate::patch::date1904_xml(&workbook_xml) {
             crate::model::DateSystem::D1904
         } else {
@@ -479,22 +524,30 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 panic!("注入：旁路扫描线程 panic");
             }
             let out = (
-                crate::pic::load(&p),
-                crate::table::load(&p),
+                if zip_has_drawing { crate::pic::load(&p) } else { Default::default() },
+                if zip_has_table { crate::table::load(&p) } else { Default::default() },
             );
             let _ = side_tx.send(out);
         });
     }
     let t_all = std::time::Instant::now();
+    let styles_xml = if is_ooxml && zip_has_styles {
+        shared_zip
+            .as_mut()
+            .and_then(|zip| read_zip_text(zip, "xl/styles.xml").ok())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // 主题色：Excel 的 <color theme tint> 不能只当 RGB，读盘时记下索引与 tint
-    let theme_book = if is_ooxml {
+    let theme_book = if is_ooxml && (zip_has_styles || zip_has_theme) {
         crate::style_theme::load(path, &[])
     } else {
         Default::default()
     };
     // 图案填充 / 对角线：不进 CellStyle，按 fillId/borderId 挂到样式表
-    let ext_book = if is_ooxml {
-        crate::style_ext::load(path)
+    let ext_book = if is_ooxml && !styles_xml.is_empty() {
+        crate::style_ext::parse(&styles_xml)
     } else {
         Default::default()
     };
@@ -513,23 +566,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         Vec::new()
     };
     let mut style_ids = std::collections::HashMap::<u16, u16>::new();
-    let mut loaded_style_id = |idx: u16, styles: &mut crate::style::StyleTable| {
-        *style_ids.entry(idx).or_insert_with(|| {
-            let mut cs = ooxml_styles.get(idx as usize).map(convert_style)
-                .unwrap_or_else(|| crate::style::CellStyle { size: 11.0, color: [0, 0, 0], ..Default::default() });
-            let xf = theme_book.xfs.get(idx as usize);
-            let resolved = theme_book.resolved.get(idx as usize);
-            crate::style_theme::apply_resolved(&mut cs, xf, resolved, &theme_book.palette);
-            cs.diagonal = ext_book.xf_border.get(idx as usize)
-                .and_then(|id| ext_book.diags.get(*id as usize)).cloned().flatten();
-            let id = styles.intern(cs);
-            if let Some(xf) = xf {
-                styles.set_theme(id, *xf);
-            }
-            crate::style_ext::attach(styles, &ext_book, id, idx);
-            id
-        })
-    };
     let mut page_names = std::collections::HashMap::new();
     if workbook_xml.contains("definedName") {
         for i in 0..names.len() as u32 {
@@ -542,18 +578,32 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     let states = crate::patch::sheet_states_xml(&workbook_xml);
     drop(workbook_xml);
     let mut layouts = std::collections::HashMap::new();
-    let styles_xml = shared_zip.as_mut().and_then(|zip| read_zip_text(zip, "xl/styles.xml").ok()).unwrap_or_default();
     let dxfs = crate::cf::parse_dxfs(&styles_xml);
     let dxf_ext = crate::cf::dxfs_unsupported(&styles_xml);
+    drop(styles_xml);
     if let Some(header) = &header {
-        let loaded = sheets::worksheets(
-            path, shared_zip.as_mut().unwrap(), header, &targets, &dxfs, dxf_ext,
-        )?;
+        let style_lookup = sheets::StyleLookup::new(
+            std::mem::replace(&mut wb.styles, crate::style::StyleTable::new()),
+            style_ids,
+            &ooxml_styles,
+            &theme_book,
+            &ext_book,
+        );
+        let loaded_res = sheets::worksheets(
+            path,
+            shared_zip.as_mut().unwrap(),
+            header,
+            &targets,
+            &style_lookup,
+            &dxfs,
+            dxf_ext,
+            zip_has_drawing,
+        );
+        let (styles_back, ids_back) = style_lookup.into_inner();
+        wb.styles = styles_back;
+        style_ids = ids_back;
+        let loaded = loaded_res?;
         for mut part in loaded {
-            for (r, c, xf) in part.xfs {
-                let id = loaded_style_id(xf, &mut wb.styles);
-                part.sheet.styles.insert(crate::CellRef::new(r, c), id);
-            }
             if let Some(layout) = part.layout {
                 layouts.insert(part.sheet.name.clone(), layout);
             }
@@ -568,6 +618,23 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             wb.sheets.push(part.sheet);
         }
     } else if let Some(reader) = &mut reader {
+        let mut intern_xf = |idx: u16, styles: &mut crate::style::StyleTable| {
+            *style_ids.entry(idx).or_insert_with(|| {
+                let mut cs = ooxml_styles.get(idx as usize).map(convert_style)
+                    .unwrap_or_else(|| crate::style::CellStyle { size: 11.0, color: [0, 0, 0], ..Default::default() });
+                let xf = theme_book.xfs.get(idx as usize);
+                let resolved = theme_book.resolved.get(idx as usize);
+                crate::style_theme::apply_resolved(&mut cs, xf, resolved, &theme_book.palette);
+                cs.diagonal = ext_book.xf_border.get(idx as usize)
+                    .and_then(|id| ext_book.diags.get(*id as usize)).cloned().flatten();
+                let id = styles.intern(cs);
+                if let Some(xf) = xf {
+                    styles.set_theme(id, *xf);
+                }
+                crate::style_ext::attach(styles, &ext_book, id, idx);
+                id
+            })
+        };
         for name in &names {
             let t_sheet = std::time::Instant::now();
             let mut sheet = Sheet::new(name.clone());
@@ -585,7 +652,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 match read_zip_text(zip, part) {
                     Ok(xml) => {
                         let shell = crate::style_theme::visit_cell_styles(&xml, |r, c, xf| {
-                            let id = loaded_style_id(xf, &mut wb.styles);
+                            let id = intern_xf(xf, &mut wb.styles);
                             sheet.styles.insert(crate::CellRef::new(r, c), id);
                         });
                         match shell {
@@ -683,6 +750,23 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     {
         let wb_sheets = &mut wb.sheets;
         let wb_styles = &mut wb.styles;
+        let mut loaded_style_id = |idx: u16, styles: &mut crate::style::StyleTable| {
+            *style_ids.entry(idx).or_insert_with(|| {
+                let mut cs = ooxml_styles.get(idx as usize).map(convert_style)
+                    .unwrap_or_else(|| crate::style::CellStyle { size: 11.0, color: [0, 0, 0], ..Default::default() });
+                let xf = theme_book.xfs.get(idx as usize);
+                let resolved = theme_book.resolved.get(idx as usize);
+                crate::style_theme::apply_resolved(&mut cs, xf, resolved, &theme_book.palette);
+                cs.diagonal = ext_book.xf_border.get(idx as usize)
+                    .and_then(|id| ext_book.diags.get(*id as usize)).cloned().flatten();
+                let id = styles.intern(cs);
+                if let Some(xf) = xf {
+                    styles.set_theme(id, *xf);
+                }
+                crate::style_ext::attach(styles, &ext_book, id, idx);
+                id
+            })
+        };
         for sheet in wb_sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
                 sheet.source_needs_dom_repair |= lay.invalid_column_bounds;
@@ -756,15 +840,17 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     sheet.filter = lay.filter.clone();
                 }
                 if let Some(f) = &sheet.filter {
-                    let fh = f.hidden_rows(sheet);
-                    // 文件里 row hidden 既可能来自手动隐藏，也可能来自筛选。
-                    // 先把筛选能解释的行从手动集合移出，否则关闭筛选时
-                    // union 会把它们永久当成手动隐藏。同时存在手动和筛选重叠的行
-                    // 无法从 OOXML 区分，这里按筛选隐藏处理；清除/关闭筛选时该行恢复。
-                    for r in &fh {
-                        sheet.hidden_rows_user.remove(r);
+                    if !f.allows.is_empty() || !f.criteria.is_empty() {
+                        let fh = f.hidden_rows(sheet);
+                        // 文件里 row hidden 既可能来自手动隐藏，也可能来自筛选。
+                        // 先把筛选能解释的行从手动集合移出，否则关闭筛选时
+                        // union 会把它们永久当成手动隐藏。同时存在手动和筛选重叠的行
+                        // 无法从 OOXML 区分，这里按筛选隐藏处理；清除/关闭筛选时该行恢复。
+                        for r in &fh {
+                            sheet.hidden_rows_user.remove(r);
+                        }
+                        sheet.hidden_rows = fh.into();
                     }
-                    sheet.hidden_rows = fh.into();
                 }
                 if let Some(map) = &manual_hidden {
                     // 本应用保存的手动隐藏行来源：它明确区分了
@@ -779,7 +865,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
     }
     // 图表：drawing 是 OOXML 结构，BIFF(.xls) 没有，别拿 zip 扫描器去读
-    let charts_res = if is_ooxml {
+    let charts_res = if is_ooxml && zip_has_chart {
         crate::charts::load_charts_all_in(path, &wb.sheets, Some(&wb.styles), wb.date_system)
     } else {
         Ok(Default::default())
@@ -796,11 +882,13 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     }
 
     // 批注
-    if let Ok(all) = crate::notes::load_notes(path) {
-        for sheet in wb.sheets.iter_mut() {
-            if let Some(list) = all.get(&sheet.name) {
-                for n in list.iter() {
-                    sheet.notes.insert(crate::model::CellRef::new(n.r, n.c), n.clone());
+    if !is_ooxml || zip_has_comments {
+        if let Ok(all) = crate::notes::load_notes(path) {
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(list) = all.get(&sheet.name) {
+                    for n in list.iter() {
+                        sheet.notes.insert(crate::model::CellRef::new(n.r, n.c), n.clone());
+                    }
                 }
             }
         }
@@ -853,7 +941,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             }
         }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
-            definitions: pivot_definitions(path),
+            definitions: pivot_definitions_with_zip(shared_zip.as_mut(), path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
         });
         if std::env::var("SC_LOAD_PROF").is_ok() {
@@ -890,10 +978,86 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
 }
 
 fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
-    crate::fixups::parts(path).into_iter()
+    pivot_definitions_with_zip(None, path)
+}
+
+fn pivot_definitions_with_zip(
+    shared_zip: Option<&mut zip::ZipArchive<std::fs::File>>,
+    path: &Path,
+) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+    if let Some(zip) = shared_zip {
+        let names: Vec<String> = zip
+            .file_names()
+            .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
+            .map(str::to_owned)
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            if let Ok(mut entry) = zip.by_name(&name) {
+                let mut body = Vec::new();
+                if entry.read_to_end(&mut body).is_ok() {
+                    out.push((name, body));
+                }
+            }
+        }
+        return out;
+    }
+    crate::fixups::parts(path)
+        .into_iter()
         .filter(|name| name.contains("pivotCacheDefinition") && name.ends_with(".xml"))
         .filter_map(|name| crate::fixups::read_part_file(path, &name).map(|body| (name, body)))
         .collect()
+}
+
+/// Sparse formula count across all sheets, visiting only pages flagged `may_have_formula`.
+pub fn workbook_formula_count(wb: &Workbook) -> usize {
+    wb.sheets.iter().map(|s| s.formula_cells().count()).sum()
+}
+
+/// Build a lightweight formula-only skeleton workbook using sparse `formula_cells()`
+/// instead of scanning millions of data cells.
+pub fn formula_skeleton(wb: &Workbook) -> Workbook {
+    let mut sk = Workbook::new_blank();
+    sk.sheets.clear();
+    for sh in &wb.sheets {
+        let mut s = Sheet::new(sh.name.clone());
+        for (cref, cell) in sh.formula_cells() {
+            if let Some(f) = &cell.formula {
+                s.set(
+                    cref.row,
+                    cref.col,
+                    crate::model::Cell {
+                        value: if crate::formula::is_cached_spill_error(&cell.value) {
+                            cell.value.clone()
+                        } else {
+                            crate::model::Value::Empty
+                        },
+                        formula: Some(f.clone()),
+                    },
+                );
+            }
+        }
+        s.arrays = sh.arrays.clone();
+        s.tables = sh.tables.clone();
+        sk.sheets.push(s);
+    }
+    sk.names = wb.names.clone();
+    sk.links = wb
+        .links
+        .iter()
+        .map(|l| crate::xlinks::ExternalBook {
+            index: l.index,
+            part: l.part.clone(),
+            target: l.target.clone(),
+            abs: l.abs.clone(),
+            sheets: l.sheets.clone(),
+            defined_names: l.defined_names.clone(),
+            cache: crate::xlinks::ExternalCache::default(),
+            refreshed: l.refreshed,
+        })
+        .collect();
+    sk
 }
 
 /// Metadata produced by one successfully replaced OOXML package. It can be

@@ -718,6 +718,13 @@ impl SheetApp {
     }
 
     pub(super) fn csv_job_ui(&mut self, ctx: &egui::Context) {
+        if let Some(hash) = self.tasks.poll_base_hash(&self.wb, &mut self.wb_base_hash) {
+            if let Some(n) = &self.net {
+                if n.hosting && !self.wb.dirty {
+                    n.set_base_hash(hash);
+                }
+            }
+        }
         if self.csv_job.is_none() {
             return;
         }

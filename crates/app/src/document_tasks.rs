@@ -58,6 +58,10 @@ pub(crate) struct DocumentTasks {
     pub open_label: Option<String>,
     pub open_started: Option<Instant>,
     pub open_path: Option<PathBuf>,
+    /// 大文件快速解锁首屏后，异步补齐的磁盘 SHA-256 基准指纹
+    pub base_hash_rx: Option<Receiver<(PathBuf, String)>>,
+    /// 大表后台 PDF 导出通道
+    pub pdf_export: Option<Receiver<Result<(PathBuf, usize), String>>>,
 }
 
 pub(crate) struct PendingSave {
@@ -107,6 +111,25 @@ impl CalculatedSnapshot {
 }
 
 impl DocumentTasks {
+    pub fn poll_base_hash(&mut self, wb: &Workbook, wb_base_hash: &mut String) -> Option<String> {
+        let rx = self.base_hash_rx.as_ref()?;
+        match rx.try_recv() {
+            Ok((path, hash)) => {
+                self.base_hash_rx = None;
+                if !wb.dirty && wb.path.as_deref() == Some(path.as_path()) && !hash.is_empty() {
+                    *wb_base_hash = hash.clone();
+                    return Some(hash);
+                }
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.base_hash_rx = None;
+                None
+            }
+        }
+    }
+
     /// Save a quiet edit promptly, or snapshot an ongoing stream of committed edits.
     pub fn autosave_due(&mut self, wb: &Workbook, ctx: Option<&egui::Context>) -> bool {
         if !wb.dirty || wb.load_incomplete || wb.path.as_deref().is_none_or(|p| !sheetcore::xlsx::can_save_to(p)) {

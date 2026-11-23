@@ -3771,7 +3771,7 @@ impl SheetApp {
         let picked = match std::env::var("SC_OPEN_PATH") {
             Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
             _ => rfd::FileDialog::new()
-                .add_filter("Excel 工作簿", &["xlsx", "xlsm", "xls", "csv"])
+                .add_filter("Excel 工作簿", &["xlsx", "xlsm", "xls", "csv", "tsv"])
                 .pick_file(),
         };
         if let Some(p) = picked {
@@ -3892,10 +3892,39 @@ impl SheetApp {
             self.open_in_new_tab(path);
             return;
         }
+        let is_delimited_text = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("csv") || e.eq_ignore_ascii_case("tsv"))
+            && !sheetcore::crypto::has_magic(&path, b"PK")
+            && !sheetcore::crypto::has_magic(&path, &[0xD0, 0xCF, 0x11, 0xE0]);
+        if is_delimited_text {
+            self.reset_editor_state();
+            self.tasks = DocumentTasks::default();
+            self.wb = Workbook::new_blank();
+            if let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.trim().is_empty())
+            {
+                self.wb.sheet_mut(0).name = stem.chars().take(31).collect();
+            }
+            self.manual_calc = false;
+            self.wb_epoch = self.wb_epoch.wrapping_add(1);
+            self.doc_uid = next_doc_uid();
+            recent::touch(&path);
+            self.recent_cache = None;
+            self.open_csv_dialog(&path);
+            self.status = format!("请选择导入选项：{}", path.display());
+            return;
+        }
         self.reset_editor_state();
         self.tasks = DocumentTasks::default();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (hash_tx, hash_rx) = std::sync::mpsc::channel();
+        let wait_hash_for_share = self.auto_share;
         self.tasks.open_rx = Some(rx);
+        self.tasks.base_hash_rx = Some(hash_rx);
         self.tasks.busy = true;
         self.tasks.open_label = Some(path.display().to_string());
         self.tasks.open_started = Some(std::time::Instant::now());
@@ -3906,17 +3935,15 @@ impl SheetApp {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let prof = std::env::var("SC_LOAD_PROF").is_ok();
             let t0 = std::time::Instant::now();
+            let hash_path = path.clone();
+            let hash_job = std::thread::spawn(move || session_lock::file_base_hash(&hash_path));
             match sheetcore::xlsx::load_diag(&path) {
                 Ok((wb, diag)) => {
                     if prof {
                         eprintln!("[open] load {:.2}s", t0.elapsed().as_secs_f64());
                     }
                     let cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
-                    let formulas: usize = wb
-                        .sheets
-                        .iter()
-                        .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count())
-                        .sum();
+                    let formulas = sheetcore::xlsx::workbook_formula_count(&wb);
                     let big_cells = std::env::var("SC_BIG_CELLS")
                         .ok()
                         .and_then(|v| v.parse().ok())
@@ -3927,16 +3954,35 @@ impl SheetApp {
                         .unwrap_or(30_000usize);
                     let big = std::env::var("SC_FORCE_RECALC").is_err()
                         && (cells > big_cells || formulas > big_formulas);
-                    let base_hash = if diag.is_complete() && !wb.load_incomplete {
-                        session_lock::file_base_hash(&path)
-                    } else {
+                    let need_hash = diag.is_complete() && !wb.load_incomplete;
+                    let resolve_hash = |block: bool,
+                                        job: std::thread::JoinHandle<String>,
+                                        p: &std::path::Path,
+                                        htx: std::sync::mpsc::Sender<(PathBuf, String)>|
+                     -> String {
+                        if !need_hash {
+                            return String::new();
+                        }
+                        if block || job.is_finished() {
+                            return job.join().unwrap_or_default();
+                        }
+                        let p = p.to_path_buf();
+                        std::thread::spawn(move || {
+                            let h = job.join().unwrap_or_default();
+                            if !h.is_empty() {
+                                let _ = htx.send((p, h));
+                            }
+                        });
                         String::new()
                     };
                     if big {
-                        // 大文件：缓存值是 Excel 上次算好的，先不重算。
-                        // 依赖图只需要公式文本，用轻量骨架算，避免整份 clone 把内存翻倍。
+                        // 大文件：缓存值是 Excel 上次算好的，立即解锁首屏可编辑，再在后台建依赖图。
+                        let base_hash = resolve_hash(wait_hash_for_share, hash_job, &path, hash_tx);
+                        let wb_for_deps = wb.clone();
+                        let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true, Box::new(diag.clone()), base_hash));
                         let t = std::time::Instant::now();
-                        let skeleton = formula_skeleton(&wb);
+                        let skeleton = formula_skeleton(&wb_for_deps);
+                        drop(wb_for_deps);
                         if prof {
                             eprintln!(
                                 "[open] 骨架 {:.2}s（{} 个公式）",
@@ -3944,7 +3990,6 @@ impl SheetApp {
                                 skeleton.sheets.iter().map(|s| s.len()).sum::<usize>()
                             );
                         }
-                        let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true, Box::new(diag.clone()), base_hash));
                         let t = std::time::Instant::now();
                         let deps = sheetcore::formula::deps::Deps::build(&skeleton);
                         drop(skeleton);
@@ -3955,6 +4000,7 @@ impl SheetApp {
                         return;
                     }
                     // 小文件：克隆一份给界面先画，原份留在后台重算
+                    let base_hash = resolve_hash(wait_hash_for_share, hash_job, &path, hash_tx);
                     let t = std::time::Instant::now();
                     let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(diag.clone()), base_hash));
                     if prof {
@@ -37902,45 +37948,7 @@ fn style_visual_eq(a: &sheetcore::style::CellStyle, b: &sheetcore::style::CellSt
 
 /// 大文件打开时只保留公式文本的轻量工作簿：依赖图只需要它，省掉整份 clone
 fn formula_skeleton(wb: &Workbook) -> Workbook {
-    let mut sk = Workbook::new_blank();
-    sk.sheets.clear();
-    for sh in &wb.sheets {
-        let mut s = sheetcore::model::Sheet::new(sh.name.clone());
-        for (cref, cell) in sh.iter() {
-            if let Some(f) = &cell.formula {
-                s.set(
-                    cref.row,
-                    cref.col,
-                    sheetcore::model::Cell {
-                        value: if sheetcore::formula::is_cached_spill_error(&cell.value) {
-                            cell.value.clone()
-                        } else { sheetcore::model::Value::Empty },
-                        formula: Some(f.clone()),
-                    },
-                );
-            }
-        }
-        s.arrays = sh.arrays.clone();
-        s.tables = sh.tables.clone();
-        sk.sheets.push(s);
-    }
-    sk.names = wb.names.clone();
-    // 依赖图构建只需要外部工作簿名、表名清单与定义名称，不需要保留单元格缓存
-    sk.links = wb
-        .links
-        .iter()
-        .map(|l| sheetcore::xlinks::ExternalBook {
-            index: l.index,
-            part: l.part.clone(),
-            target: l.target.clone(),
-            abs: l.abs.clone(),
-            sheets: l.sheets.clone(),
-            defined_names: l.defined_names.clone(),
-            cache: sheetcore::xlinks::ExternalCache::default(),
-            refreshed: l.refreshed,
-        })
-        .collect();
-    sk
+    sheetcore::xlsx::formula_skeleton(wb)
 }
 
 fn plain_path(p: &std::path::Path) -> std::path::PathBuf {
