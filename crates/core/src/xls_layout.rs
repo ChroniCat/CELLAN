@@ -33,6 +33,14 @@ fn u16le(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]))
 }
 
+/// COLINFO uses 0x0100 for the default formatting of future columns.
+pub(crate) fn physical_columns(body: &[u8]) -> Option<(u32, u32)> {
+    let first = u16le(body, 0)?;
+    let last = u16le(body, 2)?;
+    (first <= last && first < 256 && last <= 256)
+        .then_some((u32::from(first), u32::from(last.min(255))))
+}
+
 fn u32le(b: &[u8], at: usize) -> Option<u32> {
     let mut v = [0u8; 4];
     for i in 0..4 {
@@ -93,10 +101,8 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
         if let Some(si) = cur {
             match typ {
                 COLINFO if body.len() >= 6 => {
-                    let first = u16le(body, 0).unwrap() as u32;
-                    let last = u16le(body, 2).unwrap() as u32;
                     let chars = u16le(body, 4).unwrap() as f32 / 256.0;
-                    if last >= first && chars > 0.0 {
+                    if let Some((first, last)) = physical_columns(body).filter(|_| chars > 0.0) {
                         let px = crate::layout::col_width_to_px(chars);
                         if (px - crate::layout::DEFAULT_COL_W).abs() > 0.5 {
                             out.sheets[si].cols.push((first, last, px));

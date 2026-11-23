@@ -104,3 +104,31 @@ fn biff_rejects_passwords_and_out_of_grid_coordinates_without_overwrite() {
     let back = sheetcore::xls_read::load(&path).unwrap();
     assert_eq!(back.sheets[0].value(65_535, 255), Value::Number(7.0));
 }
+
+#[test]
+fn xls_with_colinfo_default_marker_can_be_edited_and_saved_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.xls");
+    let mut bytes = include_bytes!("fixtures/real_excel.xls").to_vec();
+    // The Excel fixture has one COLINFO for column A, 2976/256 characters wide.
+    // Extend this layout record through the default-column marker (Col256U).
+    let colinfo = [0x7d, 0, 12, 0, 0, 0, 0, 0, 0xa0, 0x0b, 15, 0, 6, 0, 0, 0];
+    let mut matches = bytes.windows(colinfo.len()).enumerate().filter(|(_, rec)| *rec == colinfo);
+    let (offset, _) = matches.next().unwrap();
+    assert!(matches.next().is_none());
+    bytes[offset + 6..offset + 8].copy_from_slice(&256u16.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut wb = xlsx::load(&path).unwrap();
+    let sheet = wb.sheets.iter_mut().find(|s| s.name == "第二").unwrap();
+    let expected_width = sheetcore::layout::col_width_to_px(2976.0 / 256.0);
+    assert_eq!(sheet.cols.size(255), expected_width);
+    sheet.set(0, 0, Cell { value: Value::Number(23.0), formula: None });
+    xlsx::save_atomic(&path, &wb).unwrap();
+
+    let saved = xlsx::load(&path).unwrap();
+    let sheet = saved.sheets.iter().find(|s| s.name == "第二").unwrap();
+    assert_eq!(sheet.value(0, 0), Value::Number(23.0));
+    assert_eq!(sheet.cols.size(0), expected_width);
+    assert_eq!(sheet.cols.size(255), expected_width);
+}

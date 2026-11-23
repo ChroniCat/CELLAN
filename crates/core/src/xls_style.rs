@@ -365,10 +365,8 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
             };
             match typ {
                 COLINFO if body.len() >= 8 => {
-                    let c1 = u16le(body, 0).unwrap_or(0) as u32;
-                    let c2 = u16le(body, 2).unwrap_or(0).min(16_383) as u32;
                     let ixfe = u16le(body, 6).unwrap_or(15);
-                    if ixfe != 0 && ixfe != 15 && c1 <= c2 && (c2 - c1) < 1024 {
+                    if let Some((c1, c2)) = crate::xls_layout::physical_columns(body).filter(|_| ixfe != 0 && ixfe != 15) {
                         if let Some(st) = build_cell_style(ixfe) {
                             for col in c1..=c2 {
                                 out.sheets[si].cols.push((col, st.clone()));
@@ -677,12 +675,24 @@ mod tests {
         c.extend_from_slice(&0u16.to_le_bytes());
         c.extend_from_slice(&1u16.to_le_bytes());
         c.extend_from_slice(&0u16.to_le_bytes());
+        let mut ci = [0u8; 12];
+        ci[..2].copy_from_slice(&254u16.to_le_bytes());
+        ci[2..4].copy_from_slice(&256u16.to_le_bytes());
+        ci[4..6].copy_from_slice(&(16u16 * 256).to_le_bytes());
+        ci[6..8].copy_from_slice(&1u16.to_le_bytes());
+        s.extend(rec(COLINFO, &ci));
+        ci[..2].copy_from_slice(&256u16.to_le_bytes());
+        s.extend(rec(COLINFO, &ci));
         s.extend(rec(0x00FD, &c));
         s.extend(rec(0x000A, &[]));
 
         let out = parse(&s);
         assert_eq!(out.sheets.len(), 1);
         assert_eq!(out.sheets[0].cells.len(), 1, "应解析出一个带样式的格子");
+        let cols = &out.sheets[0].cols;
+        assert_eq!(cols.iter().map(|(c, _)| *c).collect::<Vec<_>>(), [254, 255]);
+        let layout = crate::xls_layout::parse(&s);
+        assert_eq!(layout.sheets[0].cols.iter().map(|&(a,b,_)| (a,b)).collect::<Vec<_>>(), [(254,255)]);
         let (r, c, st) = &out.sheets[0].cells[0];
         assert_eq!((*r, *c), (0, 0));
         assert!(st.bold, "22pt 的那个字体是粗体");
