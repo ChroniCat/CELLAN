@@ -8,6 +8,38 @@ use eframe::egui;
 use super::CtlState;
 use crate::{cell_name, col_label, ui_prefs, FormatPainter, SheetApp};
 
+/// Border entries are ordered left, right, top, bottom. None preserves the original edge.
+pub(super) fn preset_edges(action: &str, outside: [bool; 4], pen: u8) -> [Option<u8>; 4] {
+    let [left, right, top, bottom] = outside;
+    let mut edges = [None; 4];
+    match action {
+        "BorderNone" => return [Some(0); 4],
+        "BordersAll" => return [Some(pen); 4],
+        "BorderOuter" | "BorderThickOuter" => {
+            let style = if action == "BorderThickOuter" { 3 } else { pen };
+            return outside.map(|on| on.then_some(style));
+        }
+        "BorderLeft" => edges[0] = left.then_some(pen),
+        "BorderRight" => edges[1] = right.then_some(pen),
+        "BorderTop" => edges[2] = top.then_some(pen),
+        "BorderBottom" => edges[3] = bottom.then_some(pen),
+        "BorderThickBottom" => edges[3] = bottom.then_some(3),
+        "BorderDoubleBottom" => edges[3] = bottom.then_some(4),
+        "BorderTopBottom" | "BorderTopThickBottom" | "BorderTopDoubleBottom" => {
+            edges[2] = top.then_some(pen);
+            edges[3] = bottom.then_some(match action {
+                "BorderTopThickBottom" => 3,
+                "BorderTopDoubleBottom" => 4,
+                _ => pen,
+            });
+        }
+        "BorderInsideH" => { edges[2] = (!top).then_some(pen); edges[3] = (!bottom).then_some(pen); }
+        "BorderInsideV" => { edges[0] = (!left).then_some(pen); edges[1] = (!right).then_some(pen); }
+        _ => {}
+    }
+    edges
+}
+
 fn fmt_label(code: &str) -> &str {
     match code {
         "" => "常规",
@@ -522,120 +554,30 @@ impl SheetApp {
                 let act = self.last_border_action.clone();
                 self.ribbon_action(&act, ctx);
             }
-            "BordersAll" => {
-                self.last_border_action = "BordersAll".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| s.set_all_borders(1, bc));
-            }
-            "BorderBottom" => {
-                self.last_border_action = "BorderBottom".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                        style: 1,
-                        color: bc,
+            "BordersAll" | "BorderBottom" | "BorderTop" | "BorderLeft" | "BorderRight" | "BorderOuter" | "BorderThickOuter" | "BorderDoubleBottom" | "BorderThickBottom" | "BorderTopBottom" | "BorderTopThickBottom" | "BorderTopDoubleBottom" | "BorderInsideH" | "BorderInsideV" | "BorderNone" => {
+                self.last_border_action = action.into();
+                self.border_brush = None;
+                self.border_brush_start = None;
+                let ranges = self.sel_rects();
+                let color = self.last_border_color;
+                let pen = self.border_brush_style;
+                self.apply_style_xy(|s, r, c| {
+                    let Some(&(top, left, bottom, right)) = ranges.iter().find(|&&(t, l, b, rr)| {
+                        (t..=b).contains(&r) && (l..=rr).contains(&c)
+                    }) else { return };
+                    let edges = preset_edges(action, [c == left, c == right, r == top, r == bottom], pen);
+                    for (edge, style) in s.border.iter_mut().zip(edges) {
+                        if let Some(style) = style {
+                            *edge = if style == 0 { Default::default() } else { sheetcore::style::Border { style, color } };
+                        }
                     }
+                    if action == "BorderNone" { s.diagonal = None; }
                 });
             }
-            "BorderTop" => {
-                self.last_border_action = "BorderTop".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
-                        style: 1,
-                        color: bc,
-                    }
-                });
-            }
-            "BorderLeft" => {
-                self.last_border_action = "BorderLeft".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
-                        style: 1,
-                        color: bc,
-                    }
-                });
-            }
-            "BorderRight" => {
-                self.last_border_action = "BorderRight".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
-                        style: 1,
-                        color: bc,
-                    }
-                });
-            }
-            "BorderOuter" => {
-                self.last_border_action = "BorderOuter".into();
-                self.border_outer(1);
-            }
-            "BorderThickOuter" => {
-                self.last_border_action = "BorderThickOuter".into();
-                self.border_outer(2);
-            }
-            "BorderThickBottom" => {
-                self.last_border_action = "BorderThickBottom".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                        style: 2,
-                        color: bc,
-                    }
-                });
-            }
-            "BorderDoubleBottom" => {
-                self.last_border_action = "BorderDoubleBottom".into();
-                let bc = self.last_border_color;
-                self.apply_style(move |s| {
-                    s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                        style: 4,
-                        color: bc,
-                    }
-                });
-            }
-            "BorderInsideH" => {
-                self.last_border_action = "BorderInsideH".into();
-                let (r1, _c1, r2, _c2) = self.sel_rect();
-                let bc = self.last_border_color;
-                self.apply_style_xy(move |s, r, _c| {
-                    if r > r1 && r <= r2 {
-                        s.border[sheetcore::style::BorderSide::Top.idx()] = sheetcore::style::Border {
-                            style: 1,
-                            color: bc,
-                        };
-                    }
-                    if r >= r1 && r < r2 {
-                        s.border[sheetcore::style::BorderSide::Bottom.idx()] = sheetcore::style::Border {
-                            style: 1,
-                            color: bc,
-                        };
-                    }
-                });
-            }
-            "BorderInsideV" => {
-                self.last_border_action = "BorderInsideV".into();
-                let (_r1, c1, _r2, c2) = self.sel_rect();
-                let bc = self.last_border_color;
-                self.apply_style_xy(move |s, _r, c| {
-                    if c > c1 && c <= c2 {
-                        s.border[sheetcore::style::BorderSide::Left.idx()] = sheetcore::style::Border {
-                            style: 1,
-                            color: bc,
-                        };
-                    }
-                    if c >= c1 && c < c2 {
-                        s.border[sheetcore::style::BorderSide::Right.idx()] = sheetcore::style::Border {
-                            style: 1,
-                            color: bc,
-                        };
-                    }
-                });
-            }
-            "BorderNone" => {
-                self.apply_style(|s| s.border = [sheetcore::style::Border::default(); 4])
-            }
+            "BorderDraw" => self.set_border_brush(crate::BorderBrush::Outline),
+            "BorderDrawGrid" => self.set_border_brush(crate::BorderBrush::Grid),
+            "BorderErase" => self.set_border_brush(crate::BorderBrush::Erase),
+            "MoreBorders" => { self.open_format_dialog(); self.fmt_tab = 3; }
             "FillColor" => self.apply_fill_color(Some(self.last_fill_color)),
             "FontColor" => self.apply_font_color(self.last_font_color),
             "ClearFormat" => self.clear_formats(),

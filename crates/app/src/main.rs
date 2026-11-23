@@ -10,6 +10,8 @@ mod sheet_edit_target;
 use csv_import::CsvDlg;
 mod document_tasks;
 mod column_clip;
+mod border_brush;
+use border_brush::{BorderBrush, BorderHit};
 mod data_reorder;
 mod validation;
 mod find_navigation;
@@ -20,6 +22,7 @@ mod fill_seq;
 mod ai_agent;
 mod wps_chrome;
 mod wps_dialogs;
+mod format_borders;
 mod wps_tools;
 mod wps_menus;
 
@@ -64,6 +67,7 @@ mod icons;
 mod ui_icons;
 mod tokens;
 mod ui_kit;
+mod border_lines;
 mod ui_png;
 
 use ui_icons::Icon;
@@ -2309,6 +2313,9 @@ struct SheetApp {
     last_font_color: [u8; 3],
     recent_colors: Vec<[u8; 3]>,
     color_popup_pos: Option<egui::Pos2>,
+    border_brush: Option<BorderBrush>,
+    border_brush_style: u8,
+    border_brush_start: Option<BorderHit>,
     last_border_action: String,
     last_border_color: [u8; 3],
     last_fill: Option<LastFillState>,
@@ -2322,6 +2329,8 @@ struct SheetApp {
     fmt_num_sep: bool,
     fmt_num_neg: u8,
     fmt_num_sym: u8,
+    fmt_lines: [sheetcore::style::Border; 8],
+    fmt_line_edits: [bool; 8],
     fmt_border_style: u8,
     fmt_border_color: [u8; 3],
     preview_zoom: f32,
@@ -3604,6 +3613,9 @@ impl SheetApp {
             last_font_color: [216, 59, 1],
             recent_colors: Vec::new(),
             color_popup_pos: None,
+            border_brush: None,
+            border_brush_style: 1,
+            border_brush_start: None,
             last_border_action: "BordersAll".into(),
             last_border_color: [0, 0, 0],
             last_fill: None,
@@ -3617,6 +3629,8 @@ impl SheetApp {
             fmt_num_sep: false,
             fmt_num_neg: 0,
             fmt_num_sym: 0,
+            fmt_lines: [Default::default(); 8],
+            fmt_line_edits: [false; 8],
             fmt_border_style: 1,
             fmt_border_color: [0, 0, 0],
             preview_zoom: 1.0,
@@ -3680,6 +3694,11 @@ impl SheetApp {
                 "format" => {
                     app.show_start = false;
                     app.open_format_dialog();
+                }
+                "format_border" => {
+                    app.show_start = false;
+                    app.open_format_dialog();
+                    app.fmt_tab = 3;
                 }
                 "find" => {
                     app.find.open = true;
@@ -11162,6 +11181,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         };
         self.fmt_border_style = 1;
         self.fmt_border_color = [0, 0, 0];
+        self.read_border_draft();
         self.fmt_orig = self.fmt_state.clone();
         self.fmt_touched = FmtTouched::default();
         let (r1, c1, r2, c2) = self.sel_rect();
@@ -11259,7 +11279,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let want_hidden = st.hidden != orig.hidden || touched.hidden;
         let inside_h_changed = touched.border_inside_h;
         let inside_v_changed = touched.border_inside_v;
-        let style_changed = border_changed
+        let style_changed = self.fmt_line_edits[6] || self.fmt_line_edits[7] || border_changed
             || inside_h_changed
             || inside_v_changed
             || want_font
@@ -11290,43 +11310,70 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 st.border[2] != orig.border[2] || touched.border[2],
                 st.border[3] != orig.border[3] || touched.border[3],
             ];
-            let all_sides_changed = side_changed.iter().all(|x| *x);
-            let b_style = self.fmt_border_style.max(1);
-            let b_col = self.fmt_border_color;
-            let inside_h_on = st.border_inside_h;
-            let inside_v_on = st.border_inside_v;
+            let edited = self.fmt_line_edits;
+            let mut lines = self.fmt_lines;
+            let pen = sheetcore::style::Border {
+                style: self.fmt_border_style,
+                color: self.fmt_border_color,
+            };
+            for (i, on) in borders
+                .into_iter()
+                .chain([st.border_inside_h, st.border_inside_v])
+                .enumerate()
+            {
+                if !edited[i] {
+                    lines[i] = if on { pen } else { Default::default() };
+                }
+            }
             let font = st.font.clone();
             let format = st.format.clone();
-            let (r1, c1, r2, c2) = self.sel_rect();
-            self.apply_style_xy(move |s, r, c| {
-                if border_changed {
-                    // 只改用户真正切换过的边；其余边的粗细/颜色原样保留。
-                    for (i, on) in borders.iter().enumerate() {
-                        if side_changed[i] {
-                            s.border[i] = if *on {
-                                sheetcore::style::Border { style: b_style, color: b_col }
-                            } else {
-                                sheetcore::style::Border::default()
-                            };
+            let rects = self.sel_rects();
+            let applied = self.apply_style_xy(move |s, r, c| {
+                if let Some(&(t, l, b, right)) = rects
+                    .iter()
+                    .find(|&&(t, l, b, right)| r >= t && r <= b && c >= l && c <= right)
+                {
+                    for (i, at_edge) in [c == l, c == right, r == t, r == b].into_iter().enumerate() {
+                        if at_edge && side_changed[i] {
+                            s.border[i] = lines[i];
+                        }
+                        if !at_edge && i < 2 && inside_v_changed {
+                            s.border[i] = lines[5];
+                        }
+                        if !at_edge && i >= 2 && inside_h_changed {
+                            s.border[i] = lines[4];
                         }
                     }
-                    // 四边同时由无到有且未显式勾内部边时，内部边不画；否则同步应用内部边
-                    if all_sides_changed && borders.iter().all(|x| *x) && !inside_h_changed && !inside_v_changed {
-                        if c > c1 { s.border[0].style = 0; }
-                        if c < c2 { s.border[1].style = 0; }
-                        if r > r1 { s.border[2].style = 0; }
-                        if r < r2 { s.border[3].style = 0; }
+                }
+                if edited[6] || edited[7] {
+                    let old = s.diagonal.as_ref();
+                    let up = if edited[6] {
+                        lines[6].style != 0
+                    } else {
+                        old.is_some_and(|d| d.up)
+                    };
+                    let down = if edited[7] {
+                        lines[7].style != 0
+                    } else {
+                        old.is_some_and(|d| d.down)
+                    };
+                    if !up && !down {
+                        s.diagonal = None;
+                    } else if let Some(i) = [6, 7]
+                        .into_iter()
+                        .find(|&i| edited[i] && lines[i].style != 0)
+                    {
+                        s.diagonal = Some(sheetcore::style_ext::DiagBorder {
+                            style: sheetcore::style::Border::ooxml_name(lines[i].style).into(),
+                            color: lines[i].color,
+                            color_theme: None,
+                            up,
+                            down,
+                        });
+                    } else if let Some(d) = &mut s.diagonal {
+                        d.up = up;
+                        d.down = down;
                     }
-                }
-                if inside_h_changed {
-                    let b = if inside_h_on { sheetcore::style::Border { style: b_style, color: b_col } } else { sheetcore::style::Border::default() };
-                    if r > r1 && r <= r2 { s.border[2] = b; }
-                    if r >= r1 && r < r2 { s.border[3] = b; }
-                }
-                if inside_v_changed {
-                    let b = if inside_v_on { sheetcore::style::Border { style: b_style, color: b_col } } else { sheetcore::style::Border::default() };
-                    if c > c1 && c <= c2 { s.border[0] = b; }
-                    if c >= c1 && c < c2 { s.border[1] = b; }
                 }
                 if want_font { s.font = font.clone(); }
                 if want_bold { s.bold = st.bold; }
@@ -11348,6 +11395,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 if want_locked { s.locked = st.locked; }
                 if want_hidden { s.hidden = st.hidden; }
             });
+            if !applied {
+                return;
+            }
             self.status = "已应用格式".into();
         } else {
             self.status = "格式未修改".into();
@@ -13888,19 +13938,6 @@ fn clear_values(&mut self) {
         };
     }
 
-    /// 只给选区外沿加边框（style: 1=细线 2=粗线，默认纯黑）
-    fn border_outer(&mut self, style: u8) {
-        let (r1, c1, r2, c2) = self.sel_rect();
-        let color = self.last_border_color;
-        self.apply_style_xy(move |s, r, c| {
-            let b = sheetcore::style::Border { style, color };
-            if r == r1 { s.border[sheetcore::style::BorderSide::Top.idx()] = b; }
-            if c == c2 { s.border[sheetcore::style::BorderSide::Right.idx()] = b; }
-            if r == r2 { s.border[sheetcore::style::BorderSide::Bottom.idx()] = b; }
-            if c == c1 { s.border[sheetcore::style::BorderSide::Left.idx()] = b; }
-        });
-    }
-
     /// 算一遍简转繁的差异（不动数据），供预览对话框显示
     fn zh_preview_scan(&mut self) {
         let v = self.zh_preview_variant;
@@ -14634,10 +14671,10 @@ fn clear_selection(&mut self) {
     }
 
     /// 同上，但闭包能拿到格子坐标（画边框要用）
-    fn apply_style_xy<F: Fn(&mut sheetcore::style::CellStyle, u32, u32)>(&mut self, f: F) {
+    fn apply_style_xy<F: Fn(&mut sheetcore::style::CellStyle, u32, u32)>(&mut self, f: F) -> bool {
         if self.deps_pending {
             self.status = "大型工作簿正在后台构建依赖图，请稍候再编辑".into();
-            return;
+            return false;
         }
         if self.wb.sheet(self.sheet_idx).protection.is_some()
             && !self.prot_can(sheetcore::protection::ProtOp::FormatCells)
@@ -14645,7 +14682,7 @@ fn clear_selection(&mut self) {
         {
             self.status =
                 "工作表受保护：选区含锁定单元格，且未授予「设置单元格格式」权限".into();
-            return;
+            return false;
         }
         let rects = self.sel_rects();
         let is_axis_rect = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
@@ -14688,7 +14725,7 @@ fn clear_selection(&mut self) {
                 sparse_keys.extend(set);
             }
             if !self.write_preflight_op(&sparse_keys, "设置格式", sheetcore::protection::ProtOp::FormatCells) {
-                return;
+                return false;
             }
             let txn = self.txn_begin(&sparse_keys);
             if full_sheet {
@@ -14737,7 +14774,7 @@ fn clear_selection(&mut self) {
             self.txn_end("设置格式", txn);
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
-            return;
+            return true;
         }
         let total: u64 = rects
             .iter()
@@ -14745,7 +14782,7 @@ fn clear_selection(&mut self) {
             .sum();
         if total > 200_000 {
             self.status = "选区太大（超过 20 万格），不给整块刷格式".into();
-            return;
+            return false;
         }
         let mut keys: Vec<(u32, u32)> = Vec::new();
         for (r1, c1, r2, c2) in rects.iter() {
@@ -14763,7 +14800,7 @@ fn clear_selection(&mut self) {
             self.write_preflight(&keys, "设置格式")
         };
         if !ok {
-            return;
+            return false;
         }
 let txn = self.txn_begin(&keys);
         let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
@@ -14785,6 +14822,7 @@ let txn = self.txn_begin(&keys);
         self.txn_end("设置格式", txn);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        true
     }
 
     /// 只给选区外沿加边框（内部各格不重复画）
@@ -16937,7 +16975,7 @@ let txn = self.txn_begin(&keys);
                             cell.formula = None;
                         }
                         let mut st = self.wb.styles.get(*sid).clone();
-                        st.border = [sheetcore::style::Border::default(); 4];
+                        st.clear_borders();
                         style = self.wb.styles.intern(st) as u16;
                     }
                     6 => {
@@ -21270,23 +21308,6 @@ let txn = self.txn_begin(&keys);
                 dump.push(format!("fill ({},{}) rect=({:.0},{:.0},{:.0},{:.0}) rgb={:?}", r, c, rect.min.x, rect.min.y, rect.max.x, rect.max.y, fill));
             }
         }
-        // 边框：在填充之上、文字之下。每格画自己四条边，相邻格共享边重画一次也无妨。
-        for (i, b) in st.border.iter().enumerate() {
-            if b.is_none() {
-                continue;
-            }
-            let col = Color32::from_rgb(b.color[0], b.color[1], b.color[2]);
-            let (a, z) = match i {
-                0 => (rect.left_top(), rect.left_bottom()),
-                1 => (rect.right_top(), rect.right_bottom()),
-                2 => (rect.left_top(), rect.right_top()),
-                _ => (rect.left_bottom(), rect.right_bottom()),
-            };
-            painter.line_segment([a, z], Stroke::new(b.px(), col));
-            if dumping {
-                dump.push(format!("border ({},{}) i={} w={:.1} rgb={:?}", r, c, i, b.px(), b.color));
-            }
-        }
         if let Some(ov) = ov {
             if let Some(f) = ov.fill {
                 painter.rect_filled(rect, 0.0, Color32::from_rgb(f[0], f[1], f[2]));
@@ -21332,6 +21353,12 @@ let txn = self.txn_begin(&keys);
                     }
                 }
             }
+        }
+        if let Some(d) = &st.diagonal {
+            let color = Color32::from_rgb(d.color[0], d.color[1], d.color[2]);
+            let kind = sheetcore::style::Border::from_ooxml_name(&d.style);
+            if d.up { border_lines::paint(painter, rect.left_bottom(), rect.right_top(), kind, color, 1.0); }
+            if d.down { border_lines::paint(painter, rect.left_top(), rect.right_bottom(), kind, color, 1.0); }
         }
         if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c) {
             // UI-14.3：常规格式按当前列宽决定显示（放不下就科学计数），
@@ -26861,6 +26888,8 @@ let txn = self.txn_begin(&keys);
         if self.dialog_modal {
             self.grid_press = None;
         }
+        let active_brush = self.border_brush.filter(|_| !readonly);
+        let readonly = readonly || active_brush.is_some();
         let pane_sense = if self.dialog_modal {
             egui::Sense::hover()
         } else {
@@ -28043,7 +28072,7 @@ let txn = self.txn_begin(&keys);
                         if dumping {
                             dump.push(format!("filter-arrow ({},{})", r, c));
                         }
-                        if resp.clicked() {
+                        if active_brush.is_none() && resp.clicked() {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 if btn.contains(pos) {
                                     let sheet = self.wb.sheet(self.sheet_idx);
@@ -29125,7 +29154,7 @@ let txn = self.txn_begin(&keys);
         // 格内浮层编辑器激活时由编辑器自身统一绘制锐角边框，避免与选区边框叠加碰撞。
         let (mut er1, mut ec1, mut er2, mut ec2) = self.sel_rect();
         if er1 == er2 && ec1 == ec2 {
-            let sh_m = if readonly {
+            let sh_m = if readonly && active_brush.is_none() {
                 self.compare.as_ref().map(|(w, s, _)| w.sheet(*s))
             } else {
                 Some(self.wb.sheet(self.sheet_idx))
@@ -29483,6 +29512,82 @@ let txn = self.txn_begin(&keys);
                     );
                 }
             }
+        }
+
+        if let Some(mode) = active_brush {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) || resp.secondary_clicked() {
+                self.border_brush = None;
+                self.border_brush_start = None;
+                return;
+            }
+            let hit = ctx
+                .pointer_interact_pos()
+                .filter(|&p| {
+                    resp.contains_pointer()
+                        && !self.dialog_modal
+                        && p.x > origin.x + head_w
+                        && p.y > origin.y + hh
+                        && !self.ctx_rects.iter().any(|r| r.contains(p))
+                })
+                .map(|p| {
+                    let row = row_at(p.y).min(1_048_575);
+                    let col = col_at(p.x).min(16_383);
+                    let distances = [
+                        p.x - px_of(col),
+                        px_of(col + 1) - p.x,
+                        p.y - py_of(row),
+                        py_of(row + 1) - p.y,
+                    ];
+                    let side = distances
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                        .filter(|(_, d)| d.abs() <= 5.0)
+                        .map(|(i, _)| i);
+                    BorderHit { row, col, side }
+                });
+            if hit.is_some() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                self.border_brush_start = hit;
+            }
+            if let (Some(start), Some(end)) = (self.border_brush_start, hit) {
+                let rect = Rect::from_min_max(
+                    egui::pos2(px_of(start.col.min(end.col)), py_of(start.row.min(end.row))),
+                    egui::pos2(
+                        px_of(start.col.max(end.col) + 1),
+                        py_of(start.row.max(end.row) + 1),
+                    ),
+                );
+                let preview = Stroke::new(1.5, Color32::from_rgb(32, 120, 83));
+                match start.side.filter(|&s| {
+                    mode != BorderBrush::Grid
+                        && ((s < 2 && start.col == end.col) || (s >= 2 && start.row == end.row))
+                }) {
+                    Some(0) => {
+                        painter.line_segment([rect.left_top(), rect.left_bottom()], preview);
+                    }
+                    Some(1) => {
+                        painter.line_segment([rect.right_top(), rect.right_bottom()], preview);
+                    }
+                    Some(2) => {
+                        painter.line_segment([rect.left_top(), rect.right_top()], preview);
+                    }
+                    Some(3) => {
+                        painter.line_segment([rect.left_bottom(), rect.right_bottom()], preview);
+                    }
+                    _ => {
+                        painter.rect_stroke(rect, 0.0, preview, egui::StrokeKind::Inside);
+                    }
+                }
+            }
+            if ctx.input(|i| i.pointer.primary_released()) {
+                if let (Some(start), Some(end)) = (self.border_brush_start.take(), hit) {
+                    self.paint_border_drag(start, end, mode);
+                }
+            }
+            return;
         }
 
         // UI-11.5：编辑公式时按行号/列标 = 整行/整列引用（A:A / 1:1）。
@@ -37776,6 +37881,7 @@ fn style_visual_eq(a: &sheetcore::style::CellStyle, b: &sheetcore::style::CellSt
         && a.wrap == b.wrap
         && a.format == b.format
         && a.border == b.border
+        && a.diagonal == b.diagonal
 }
 
 /// 大文件打开时只保留公式文本的轻量工作簿：依赖图只需要它，省掉整份 clone
@@ -38650,37 +38756,7 @@ fn run_app(
 
 /// 画一条边框线（支持双线/虚线/点线）
 fn draw_edge(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, bd: &sheetcore::style::Border) {
-    if bd.style == 0 {
-        return;
-    }
-    let color = egui::Color32::from_rgb(bd.color[0], bd.color[1], bd.color[2]);
-    let w = bd.px().max(0.8);
-    let len = (b - a).length();
-    if len < 0.5 {
-        return;
-    }
-    match bd.style {
-        4 => {
-            // 双线：两条细线
-            let off = egui::vec2(0.0, 1.2);
-            painter.line_segment([a - off, b - off], egui::Stroke::new(1.0, color));
-            painter.line_segment([a + off, b + off], egui::Stroke::new(1.0, color));
-        }
-        5 | 6 => {
-            // 虚线/点线：等距短段（返回 ()，与其它分支一致）
-            let (dash, gap) = if bd.style == 5 { (4.0, 3.0) } else { (1.5, 2.5) };
-            let dir = (b - a) / len;
-            let mut t = 0.0;
-            while t < len {
-                let e = (t + dash).min(len);
-                painter.line_segment([a + dir * t, a + dir * e], egui::Stroke::new(w, color));
-                t = e + gap;
-            }
-        }
-        _ => {
-            painter.line_segment([a, b], egui::Stroke::new(w, color));
-        }
-    }
+    border_lines::paint(painter, a, b, bd.style, egui::Color32::from_rgb(bd.color[0], bd.color[1], bd.color[2]), 1.0);
 }
 
 /// 把 "alt+down" / "ctrl+s" 这类写法转成（修饰键，按键）（验收探针用）。

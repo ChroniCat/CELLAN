@@ -98,33 +98,73 @@ fn tpl_counts() -> (u16, u16) {
     (fonts, xfs)
 }
 
-/// Excel 默认调色板（BIFF8 索引 0..55）
-const PALETTE: [[u8; 3]; 56] = [
-    [0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-    [255, 0, 255], [0, 255, 255], [0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0],
-    [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255], [128, 0, 0], [0, 128, 0],
-    [0, 0, 128], [128, 128, 0], [128, 0, 128], [0, 128, 128], [192, 192, 192], [128, 128, 128],
-    [153, 153, 255], [153, 51, 102], [255, 255, 204], [204, 255, 255], [102, 0, 102], [255, 128, 128],
-    [0, 102, 204], [204, 204, 255], [0, 0, 128], [255, 0, 255], [255, 255, 0], [0, 255, 255],
-    [128, 0, 128], [128, 0, 0], [0, 128, 128], [0, 0, 255], [0, 204, 255], [204, 255, 255],
-    [204, 255, 204], [255, 255, 153], [153, 204, 255], [255, 153, 204], [204, 153, 255], [255, 204, 153],
-    [51, 102, 255], [51, 204, 204], [153, 204, 0], [255, 204, 0], [255, 153, 0], [255, 102, 0],
-    [102, 102, 153], [150, 150, 150],
-];
+struct Palette {
+    colors: [[u8; 3]; 64],
+    used: [bool; 64],
+}
 
-fn near_index(rgb: [u8; 3]) -> u8 {
-    let mut best = 0usize;
-    let mut bd = i32::MAX;
-    for (i, p) in PALETTE.iter().enumerate() {
-        let d = (p[0] as i32 - rgb[0] as i32).pow(2)
-            + (p[1] as i32 - rgb[1] as i32).pow(2)
-            + (p[2] as i32 - rgb[2] as i32).pow(2);
-        if d < bd {
-            bd = d;
-            best = i;
+impl Palette {
+    fn new() -> Self {
+        let mut palette = Self {
+            colors: crate::xls_style::DEFAULT_PALETTE,
+            used: [false; 64],
+        };
+        // Retain palette entries referenced by the embedded Excel font and XF templates.
+        let mut records = TPL_FONTS_XFS;
+        while records.len() >= 4 {
+            let kind = u16::from_le_bytes([records[0], records[1]]);
+            let n = usize::from(u16::from_le_bytes([records[2], records[3]]));
+            let (data, rest) = records[4..].split_at(n);
+            let mut reserve = |index: u32| {
+                if let Some(slot) = palette.used.get_mut(index as usize) {
+                    *slot = true;
+                }
+            };
+            if kind == FONT && n >= 6 {
+                reserve(u32::from(u16::from_le_bytes([data[4], data[5]])));
+            } else if kind == XF && n == 20 {
+                let a = u32::from_le_bytes(data[10..14].try_into().unwrap());
+                let b = u32::from_le_bytes(data[14..18].try_into().unwrap());
+                for (edge, index) in [a >> 16, a >> 23, b, b >> 7].into_iter().enumerate() {
+                    if (a >> (edge * 4)) & 15 != 0 {
+                        reserve(index & 127);
+                    }
+                }
+                if (b >> 21) & 15 != 0 {
+                    reserve((b >> 14) & 127);
+                }
+                if b >> 26 != 0 {
+                    let fill = u32::from(u16::from_le_bytes([data[18], data[19]]));
+                    reserve(fill & 127);
+                    reserve((fill >> 7) & 127);
+                }
+            }
+            records = rest;
         }
+        palette
     }
-    best as u8
+
+    fn index(&mut self, rgb: [u8; 3]) -> u8 {
+        let slot = (8..64)
+            .find(|&i| self.colors[i] == rgb)
+            .or_else(|| (8..64).rev().find(|&i| !self.used[i]))
+            .unwrap_or_else(|| {
+                (8..64)
+                    .min_by_key(|&i| {
+                        self.colors[i]
+                            .iter()
+                            .zip(rgb)
+                            .map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2))
+                            .sum::<i32>()
+                    })
+                    .unwrap()
+            });
+        if !self.used[slot] {
+            self.colors[slot] = rgb;
+        }
+        self.used[slot] = true;
+        slot as u8
+    }
 }
 
 fn rec(out: &mut Vec<u8>, typ: u16, body: &[u8]) {
@@ -168,6 +208,9 @@ struct XfKey {
     halign: u8,
     wrap: bool,
     borders: [u8; 4],
+    border_colors: [u8; 4],
+    // Down/up flags, BIFF8 line style and palette index.
+    diagonal: (u8, u8, u8),
     fill: Option<u8>,
     /// UI-15.2：XF 的保护位 bit0=locked（受保护表里未锁定的格子要能编辑）
     locked: bool,
@@ -255,11 +298,17 @@ fn biff_border(style: u8) -> u8 {
         4 => 6,
         5 => 3,
         6 => 4,
+        7 | 12 | 13 => style,
+        8 => 9,
+        9 => 11,
+        10 => 8,
+        11 => 10,
         _ => 0,
     }
 }
 
 struct Tables {
+    palette: Palette,
     fonts: Vec<FontKey>,
     font_ids: HashMap<FontKey, u16>,
     formats: Vec<(u16, String)>,
@@ -270,6 +319,7 @@ struct Tables {
 impl Tables {
     fn new() -> Self {
         Self {
+            palette: Palette::new(),
             fonts: Vec::new(),
             font_ids: HashMap::new(),
             formats: Vec::new(),
@@ -284,7 +334,7 @@ impl Tables {
             size: (st.size * 20.0).round().max(20.0) as u16,
             bold: st.bold,
             italic: st.italic,
-            color: near_index(st.color),
+            color: self.palette.index(st.color),
         };
         if let Some(id) = self.font_ids.get(&key) {
             return *id;
@@ -322,7 +372,21 @@ impl Tables {
                 biff_border(st.border[2].style),
                 biff_border(st.border[3].style),
             ],
-            fill: st.fill.map(near_index),
+            border_colors: st.border.map(|edge| {
+                if edge.style == 0 {
+                    0x40
+                } else {
+                    self.palette.index(edge.color)
+                }
+            }),
+            diagonal: st.diagonal.as_ref().map_or((0, 0, 0), |d| {
+                (
+                    u8::from(d.down) | (u8::from(d.up) << 1),
+                    biff_border(crate::style::Border::from_ooxml_name(&d.style)),
+                    self.palette.index(d.color),
+                )
+            }),
+            fill: st.fill.map(|rgb| self.palette.index(rgb)),
             locked: st.locked,
         };
         if let Some(id) = self.xf_ids.get(&key) {
@@ -333,6 +397,7 @@ impl Tables {
         self.xf_ids.insert(key, id);
         id
     }
+
 }
 
 fn font_record(f: &FontKey) -> Vec<u8> {
@@ -379,27 +444,25 @@ fn xf_record(x: &XfKey) -> Vec<u8> {
     b[4..6].copy_from_slice(&w16(if x.locked { 1 } else { 0 })); // bit0 locked
     b[6] = (x.halign & 0x07) | if x.wrap { 0x08 } else { 0 };
     b[9] = 0x20;
-    // 线型：byte10 低四位=左、高四位=下；byte11 低四位=右、高四位=上
-    b[10] = (x.borders[0] & 0x0F) | ((x.borders[3] & 0x0F) << 4);
-    b[11] = (x.borders[1] & 0x0F) | ((x.borders[2] & 0x0F) << 4);
-    // 边框颜色：Excel 的"自动"色是 40/20 交替（照它自己的样）
-    b[12] = 0x40;
-    b[13] = 0x20;
-    b[14] = 0x40;
-    b[15] = 0x20;
-    // 填充：Excel 用 17=0x06 表示实心、0x02 表示无填充（实测字节，不是教科书）
-    b[16] = 0x00;
-    match x.fill {
-        Some(idx) => {
-            b[17] = 0x06;
-            b[18] = idx;
-        }
-        None => {
-            b[17] = 0x02;
-            b[18] = 0xC0;
-        }
-    }
-    b[19] = 0x20;
+    let [left, right, top, bottom] = x.borders.map(u32::from);
+    let [lc, rc, tc, bc] = x.border_colors.map(u32::from);
+    let (flags, diag, dc) = x.diagonal;
+    let edges = left
+        | (right << 4)
+        | (top << 8)
+        | (bottom << 12)
+        | (lc << 16)
+        | (rc << 23)
+        | (u32::from(flags) << 30);
+    let border_fill = tc
+        | (bc << 7)
+        | (u32::from(dc) << 14)
+        | (u32::from(diag) << 21)
+        | (u32::from(x.fill.is_some()) << 26);
+    b[10..14].copy_from_slice(&edges.to_le_bytes());
+    b[14..18].copy_from_slice(&border_fill.to_le_bytes());
+    let fill_colors = u16::from(x.fill.unwrap_or(0x40)) | (0x41 << 7);
+    b[18..20].copy_from_slice(&fill_colors.to_le_bytes());
     rec_body(XF, b)
 }
 
@@ -688,6 +751,14 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     let mut prefix = TPL_PREFIX.to_vec();
     set_datemode(&mut prefix, wb.date_system.is_1904());
     g.extend_from_slice(&prefix);
+    if tables.palette.colors != crate::xls_style::DEFAULT_PALETTE {
+        let mut colors = 56u16.to_le_bytes().to_vec();
+        for rgb in &tables.palette.colors[8..] {
+            colors.extend_from_slice(rgb);
+            colors.push(0);
+        }
+        rec(&mut g, 0x0092, &colors);
+    }
     g.extend_from_slice(TPL_FONTS_XFS);
 
     let (base_fonts, base_xfs) = tpl_counts();
@@ -839,6 +910,53 @@ mod tests {
         }
         assert_eq!(sh.merges, vec![(0, 0, 0, 1)], "合并区应保留");
         assert!((sh.cols.size(0) - 140.0).abs() < 1.5, "列宽 {}", sh.cols.size(0));
+    }
+
+    #[test]
+    fn preserves_asymmetric_colored_borders_and_both_diagonals_in_xls() {
+        use crate::style::Border;
+        use crate::style_ext::DiagBorder;
+
+        let mut wb = sample();
+        wb.sheets[0].merges.clear();
+        let edges = [
+            Border {
+                style: 1,
+                color: [33, 55, 77],
+            },
+            Border {
+                style: 4,
+                color: [12, 82, 151],
+            },
+            Border {
+                style: 8,
+                color: [113, 22, 50],
+            },
+            Border {
+                style: 6,
+                color: [151, 81, 3],
+            },
+        ];
+        let diagonal = DiagBorder {
+            style: "dashed".into(),
+            color: [46, 109, 85],
+            color_theme: None,
+            up: true,
+            down: true,
+        };
+        let id = wb.styles.intern(CellStyle {
+            border: edges,
+            diagonal: Some(diagonal.clone()),
+            ..Default::default()
+        });
+        wb.sheets[0].set_style(0, 0, id);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("colored_borders.xls");
+        write(&path, &wb).unwrap();
+        let back = crate::xlsx::load(&path).unwrap();
+        let style = back.styles.get(back.sheets[0].style_of(0, 0));
+        assert_eq!(style.border, edges);
+        assert_eq!(style.diagonal.as_ref(), Some(&diagonal));
     }
 
     #[test]

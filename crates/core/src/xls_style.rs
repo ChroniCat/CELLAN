@@ -77,7 +77,7 @@ pub fn builtin_format(id: u16) -> Option<&'static str> {
 }
 
 /// BIFF8 标准 64 项调色板（0..7 为基础 8 色，8..63 为可由 PALETTE 记录重定义的 56 色）
-const DEFAULT_PALETTE: [[u8; 3]; 64] = [
+pub(super) const DEFAULT_PALETTE: [[u8; 3]; 64] = [
     [0, 0, 0],       [255, 255, 255], [255, 0, 0],     [0, 255, 0],
     [0, 0, 255],     [255, 255, 0],   [255, 0, 255],   [0, 255, 255],
     [0, 0, 0],       [255, 255, 255], [255, 0, 0],     [0, 255, 0],
@@ -130,6 +130,7 @@ struct XfRec {
     borders: [u8; 4],
     /// 四条边的颜色（RGB），顺序同上
     border_colors: [[u8; 3]; 4],
+    diagonal: Option<crate::style_ext::DiagBorder>,
     /// 单元格背景填充色
     fill: Option<[u8; 3]>,
     /// XF 保护位 bit0（true=锁定）
@@ -144,9 +145,14 @@ fn map_border(code: u8) -> u8 {
         2 => 2,
         5 => 3,
         6 => 4,
-        3 | 8 | 9 | 10 | 11 | 12 | 13 => 5,
+        3 => 5,
+        8 => 10,
+        9 => 8,
+        10 => 11,
+        11 => 9,
+        12 | 13 => code,
         4 => 6,
-        7 => 1,
+        7 => 7,
         _ => 1,
     }
 }
@@ -302,6 +308,7 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
             locked: xf.locked,
             ..Default::default()
         };
+        st.diagonal = xf.diagonal.clone();
         for (idx, code) in xf.borders.iter().enumerate() {
             st.border[idx].style = *code;
             if *code != 0 {
@@ -334,6 +341,7 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
                 && st.format.is_empty()
                 && st.locked
                 && st.fill.is_none()
+                && st.diagonal.is_none()
                 && st.border.iter().all(|b| b.style == 0);
             if same {
                 return None;
@@ -488,7 +496,6 @@ fn parse_xf(b: &[u8], palette: &[[u8; 3]; 64]) -> Option<XfRec> {
     let b_u32_10 = u32le(b, 10).unwrap_or(0);
     let b_u32_14 = if b.len() >= 18 { u32le(b, 14).unwrap_or(0) } else { 0 };
     // MS-XLS 标准位：bits 0..3=左, 4..7=右, 8..11=上, 12..15=下；
-    // 注意本仓库 xls_write 把 b[10] 高四位写成了下、b[11] 低四位写成了右，四边均解析成对应样式
     let borders = [
         map_border((b_u32_10 & 0x0F) as u8),
         map_border(((b_u32_10 >> 4) & 0x0F) as u8),
@@ -544,6 +551,17 @@ fn parse_xf(b: &[u8], palette: &[[u8; 3]; 64]) -> Option<XfRec> {
         indent,
         borders,
         border_colors,
+        diagonal: {
+            let flags = b_u32_10 >> 30;
+            let kind = ((b_u32_14 >> 21) & 15) as u8;
+            (kind != 0 && flags != 0).then(|| crate::style_ext::DiagBorder {
+                up: flags & 2 != 0,
+                down: flags & 1 != 0,
+                style: crate::style::Border::ooxml_name(map_border(kind)).into(),
+                color: lookup_palette(palette, ((b_u32_14 >> 14) & 127) as u16),
+                color_theme: None,
+            })
+        },
         fill,
         locked,
     })

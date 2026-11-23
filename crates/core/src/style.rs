@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// 一条边：0 无，1 细，2 中，3 粗，4 双线，5 虚线，6 点线
+/// 单条边的线型和 RGB 颜色。线型编号与 OOXML 名称的映射见 BORDER_NAMES。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 pub struct Border {
     pub style: u8,
@@ -30,7 +30,20 @@ impl BorderSide {
     }
 }
 
+const BORDER_NAMES: [&str; 14] = [
+    "none", "thin", "medium", "thick", "double", "dashed", "dotted", "hair",
+    "dashDot", "dashDotDot", "mediumDashed", "mediumDashDot", "mediumDashDotDot", "slantDashDot",
+];
+
 impl Border {
+    pub fn ooxml_name(style: u8) -> &'static str {
+        BORDER_NAMES.get(usize::from(style)).copied().unwrap_or("thin")
+    }
+
+    pub fn from_ooxml_name(name: &str) -> u8 {
+        BORDER_NAMES.iter().position(|&s| s == name).map_or(1, |i| i as u8)
+    }
+
     pub fn is_none(&self) -> bool {
         self.style == 0
     }
@@ -40,8 +53,9 @@ impl Border {
             2 => 1.6,
             3 => 2.4,
             4 => 1.0,
-            5 => 1.0,
-            6 => 1.0,
+            5 | 6 | 8 | 9 => 1.0,
+            7 => 0.65,
+            10..=13 => 1.6,
             _ => 0.0,
         }
     }
@@ -163,6 +177,8 @@ pub struct CellStyle {
     pub format: String,
     /// 左、右、上、下
     pub border: [Border; 4],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagonal: Option<crate::style_ext::DiagBorder>,
     /// 单元格保护：Excel 默认锁定
     #[serde(default = "default_locked")]
     pub locked: bool,
@@ -196,6 +212,7 @@ impl Default for CellStyle {
             indent: 0,
             format: String::new(),
             border: [Border::default(); 4],
+            diagonal: None,
             locked: true,
             hidden: false,
         }
@@ -215,6 +232,7 @@ impl CellStyle {
         }
     }
     pub fn clear_borders(&mut self) {
+        self.diagonal = None;
         for b in self.border.iter_mut() {
             *b = Border::default();
         }
@@ -229,8 +247,6 @@ pub struct StyleTable {
     themes: Vec<crate::style_theme::XfTheme>,
     /// 与 styles 同长：图案填充（未进 CellStyle，保存时按原 patternType 写回）
     patterns: Vec<Option<crate::style_ext::FillPattern>>,
-    /// 与 styles 同长：对角线边框
-    diags: Vec<Option<crate::style_ext::DiagBorder>>,
     /// 与 styles 同长：该样式是否带 quotePrefix（未建模属性，保存后单独补）
     quotes: Vec<bool>,
 }
@@ -266,6 +282,9 @@ fn hash_of(s: &CellStyle) -> u64 {
     s.indent.hash(&mut h);
     s.format.hash(&mut h);
     s.border.hash(&mut h);
+    if let Some(d) = &s.diagonal {
+        (d.up, d.down, &d.style, d.color, d.color_theme.map(|(id, tint)| (id, tint.to_bits()))).hash(&mut h);
+    }
     s.locked.hash(&mut h);
     s.hidden.hash(&mut h);
     h.finish()
@@ -293,7 +312,6 @@ impl StyleTable {
         self.styles.push(s);
         self.themes.push(crate::style_theme::XfTheme::default());
         self.patterns.push(None);
-        self.diags.push(None);
         self.quotes.push(false);
         self.index.insert(k, id);
         id
@@ -321,8 +339,11 @@ impl StyleTable {
     }
 
     pub fn set_diag(&mut self, id: u16, d: crate::style_ext::DiagBorder) {
-        if let Some(slot) = self.diags.get_mut(id as usize) {
-            *slot = Some(d);
+        if let Some(style) = self.styles.get_mut(id as usize) {
+            let old = hash_of(style);
+            if self.index.get(&old) == Some(&id) { self.index.remove(&old); }
+            style.diagonal = Some(d);
+            self.index.insert(hash_of(style), id);
         }
     }
 
@@ -337,7 +358,7 @@ impl StyleTable {
     }
 
     pub fn diag_of(&self, id: u16) -> Option<&crate::style_ext::DiagBorder> {
-        self.diags.get(id as usize).and_then(|d| d.as_ref())
+        self.styles.get(id as usize)?.diagonal.as_ref()
     }
 
     pub fn get(&self, id: u16) -> &CellStyle {

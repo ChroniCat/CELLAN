@@ -520,6 +520,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             let xf = theme_book.xfs.get(idx as usize);
             let resolved = theme_book.resolved.get(idx as usize);
             crate::style_theme::apply_resolved(&mut cs, xf, resolved, &theme_book.palette);
+            cs.diagonal = ext_book.xf_border.get(idx as usize)
+                .and_then(|id| ext_book.diags.get(*id as usize)).cloned().flatten();
             let id = styles.intern(cs);
             if let Some(xf) = xf {
                 styles.set_theme(id, *xf);
@@ -1058,6 +1060,7 @@ fn committed_style_map(
             .get(index)
             .and_then(|&n| ext.diags.get(n as usize))
             .and_then(Option::as_ref);
+        cell.diagonal = diagonal.cloned();
         let quoted = ext.xf_quote.get(index).copied().unwrap_or(false);
         let matching_id = |candidate: &crate::style::CellStyle| {
             let id = wb.styles.find_style(candidate)?;
@@ -3577,6 +3580,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_border_patterns_and_diagonal_directions_survive_save_and_reopen() {
+        use crate::style::{Border, CellStyle};
+        let mut book = Workbook::new_blank();
+        for kind in 1u8..=13 {
+            let color = [40, 60, 90];
+            let side = Border { style: kind, color };
+            for row in 0..2 {
+                let sid = book.styles.intern(CellStyle {
+                    border: [side; 4],
+                    diagonal: (row == 1).then(|| crate::style_ext::DiagBorder {
+                        up: true, down: true, color, color_theme: None,
+                        style: Border::ooxml_name(kind).to_owned(),
+                    }),
+                    ..CellStyle::default_dark()
+                });
+                book.sheets[0].set_style(row, u32::from(kind), sid);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borders.xlsx");
+        save_atomic(&path, &book).unwrap();
+        let saved = load(&path).unwrap();
+        for kind in 1u8..=13 {
+            for row in 0..2 {
+                let col = u32::from(kind);
+                let actual = saved.styles.get(saved.sheets[0].style_of(row, col));
+                let expected = book.styles.get(book.sheets[0].style_of(row, col));
+                assert_eq!(actual.border, expected.border, "row {row}, style {kind}");
+                assert_eq!(actual.diagonal, expected.diagonal, "row {row}, style {kind}");
+            }
+        }
+    }
+
+    #[test]
     fn owned_save_restores_edit_flags_and_keeps_the_workers_sheet_storage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot.xlsx");
@@ -4690,7 +4727,14 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         let map = |b: &calamine::Border| crate::style::Border {
             style: match b.style {
                 calamine::BorderStyle::None => 0,
-                calamine::BorderStyle::Thin | calamine::BorderStyle::Hair => 1,
+                calamine::BorderStyle::Thin => 1,
+                calamine::BorderStyle::Hair => 7,
+                calamine::BorderStyle::DashDot => 8,
+                calamine::BorderStyle::DashDotDot => 9,
+                calamine::BorderStyle::MediumDashed => 10,
+                calamine::BorderStyle::MediumDashDot => 11,
+                calamine::BorderStyle::MediumDashDotDot => 12,
+                calamine::BorderStyle::SlantDashDot => 13,
                 calamine::BorderStyle::Medium => 2,
                 calamine::BorderStyle::Thick => 3,
                 calamine::BorderStyle::Double => 4,
@@ -4836,14 +4880,13 @@ fn write_umya_style(wb: &Workbook, sid: u16, s: &mut umya_spreadsheet::Style) {
         s.set_number_format(nf);
     }
     // 边框：四个边逐条写
-    let sides = ["thin", "medium", "thick", "double", "dashed", "dotted"];
     let bs = s.get_borders_mut();
     let make = |b: &crate::style::Border| {
         let mut ub = umya_spreadsheet::Border::default();
         if b.style == 0 {
             ub.set_border_style("none");
         } else {
-            ub.set_border_style(*sides.get(b.style as usize - 1).unwrap_or(&"thin"));
+            ub.set_border_style(crate::style::Border::ooxml_name(b.style));
             let mut col = umya_spreadsheet::Color::default();
             col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", b.color[0], b.color[1], b.color[2]));
             ub.set_color(col);

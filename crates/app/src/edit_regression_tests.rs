@@ -2416,6 +2416,37 @@ fn ribbon_border_commands_follow_left_right_top_bottom_order() {
 }
 
 #[test]
+fn combined_border_preset_styles_each_selected_block_and_undoes_once() {
+    use sheetcore::style::BorderSide::{Bottom, Top};
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    app.border_brush_style = 6;
+    app.last_border_color = [191, 19, 30];
+    let edge = |app: &SheetApp, r, c, side: sheetcore::style::BorderSide| {
+        app.wb.styles.get(app.wb.sheet(0).style_of(r, c)).border[side.idx()]
+    };
+    for (cmd, lower) in [
+        ("BorderTopBottom", 6),
+        ("BorderTopThickBottom", 3),
+        ("BorderTopDoubleBottom", 4),
+    ] {
+        app.sel = (0, 0);
+        app.sel_end = (2, 1);
+        app.extra_sel = vec![(5, 3, 7, 3)];
+        app.ribbon_action(cmd, &ctx);
+        for (row, col) in [(0, 0), (5, 3)] {
+            assert_eq!(edge(&app, row, col, Top).style, 6);
+            assert_eq!(edge(&app, row, col, Top).color, app.last_border_color);
+            assert_eq!(edge(&app, row + 2, col, Bottom).style, lower);
+            assert_eq!(edge(&app, row + 1, col, Bottom).style, 0);
+        }
+        app.ribbon_action("Undo", &ctx);
+        assert_eq!(edge(&app, 2, 0, Bottom).style, 0);
+        assert_eq!(edge(&app, 5, 3, Top).style, 0);
+    }
+}
+
+#[test]
 fn tab_enter_cycle_inside_selection_and_stop_at_sheet_edges() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);

@@ -292,8 +292,9 @@ fn border_variant(
         "vertical",
         "horizontal",
     ];
-    const STYLES: [&str; 7] = [
-        "none", "thin", "medium", "thick", "double", "dashed", "dotted",
+    const STYLES: [&str; 14] = [
+        "none", "thin", "medium", "thick", "double", "dashed", "dotted", "hair",
+        "dashDot", "dashDotDot", "mediumDashed", "mediumDashDot", "mediumDashDotDot", "slantDashDot",
     ];
     if border.default_namespace() != Some(NS) {
         return None;
