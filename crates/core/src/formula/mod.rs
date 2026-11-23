@@ -4691,7 +4691,7 @@ pub fn to_fvalue(v: &crate::model::Value) -> FValue {
     match v {
         V::Empty => FValue::Empty,
         V::Number(n) => FValue::Number(*n),
-        V::Text(s) => FValue::Text(s.as_ref().into()),
+        V::Text(s) => FValue::Text(std::sync::Arc::clone(s)),
         V::Bool(b) => FValue::Bool(*b),
         V::Error(e) => FValue::Error(*e),
     }
@@ -4702,7 +4702,7 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
     match v {
         FValue::Empty => V::Empty,
         FValue::Number(n) => V::Number(*n),
-        FValue::Text(s) => V::Text(s.as_ref().into()),
+        FValue::Text(s) => V::Text(std::sync::Arc::clone(s)),
         FValue::Bool(b) => V::Bool(*b),
         FValue::Error(e) => V::Error(*e),
         FValue::Array(a) => from_fvalue(&a.get(0, 0)),

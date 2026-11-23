@@ -991,6 +991,10 @@ pub fn workbook_formula_count(wb: &Workbook) -> usize {
 /// instead of scanning millions of data cells.
 pub fn formula_skeleton(wb: &Workbook) -> Workbook {
     let mut sk = Workbook::new_blank();
+    sk.calc_manual = wb.calc_manual;
+    sk.calc_pending = wb.calc_pending;
+    sk.calc_iterate = wb.calc_iterate;
+    sk.load_incomplete = wb.load_incomplete;
     sk.sheets.clear();
     for sh in &wb.sheets {
         let mut s = Sheet::new(sh.name.clone());
@@ -1000,16 +1004,14 @@ pub fn formula_skeleton(wb: &Workbook) -> Workbook {
                     cref.row,
                     cref.col,
                     crate::model::Cell {
-                        value: if crate::formula::is_cached_spill_error(&cell.value) {
-                            cell.value.clone()
-                        } else {
-                            crate::model::Value::Empty
-                        },
+                        value: cell.value.clone(),
                         formula: Some(f.clone()),
                     },
                 );
             }
         }
+        s.spilled = sh.spilled.clone();
+        s.spill_shapes = sh.spill_shapes.clone();
         s.arrays = sh.arrays.clone();
         s.tables = sh.tables.clone();
         sk.sheets.push(s);

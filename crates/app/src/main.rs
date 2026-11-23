@@ -3984,25 +3984,22 @@ impl SheetApp {
                         String::new()
                     };
                     if big {
-                        // 大文件：缓存值是 Excel 上次算好的，立即解锁首屏可编辑，再在后台建依赖图。
+                        // 大文件：缓存值是 Excel 上次算好的，立即解锁首屏可编辑；
+                        // 直接复用 `wb` 的 O(页数) `Arc` CoW 快照构建依赖图并校验 `<v>` 缓存基线（`[跨层-2]`），
+                        // 使开表后首次插删行列命中局部结构重算而非全簿重算。
+                        let trust_cached =
+                            diag.is_complete() && !wb.load_incomplete && wb.links.is_empty();
                         let base_hash = resolve_hash(wait_hash_for_share, hash_job, &path, hash_tx);
                         let wb_for_deps = wb.clone();
                         let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true, Box::new(diag.clone()), base_hash));
                         let t = std::time::Instant::now();
-                        let skeleton = formula_skeleton(&wb_for_deps);
+                        let deps = sheetcore::formula::deps::Deps::build_with_cached_baseline(
+                            &wb_for_deps,
+                            trust_cached,
+                        );
                         drop(wb_for_deps);
                         if prof {
-                            eprintln!(
-                                "[open] 骨架 {:.2}s（{} 个公式）",
-                                t.elapsed().as_secs_f64(),
-                                skeleton.sheets.iter().map(|s| s.len()).sum::<usize>()
-                            );
-                        }
-                        let t = std::time::Instant::now();
-                        let deps = sheetcore::formula::deps::Deps::build(&skeleton);
-                        drop(skeleton);
-                        if prof {
-                            eprintln!("[open] deps {:.2}s（大文件，跳过重算）", t.elapsed().as_secs_f64());
+                            eprintln!("[open] deps {:.2}s（大文件，跳过重算，baseline={}）", t.elapsed().as_secs_f64(), trust_cached);
                         }
                         let _ = tx.send(OpenMsg::DepsReady(Box::new(deps)));
                         return;
@@ -4065,11 +4062,7 @@ impl SheetApp {
             match sheetcore::xlsx::load_with_password_diag(&path, &pw) {
                 Ok((wb, diag)) => {
                     let cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
-                    let formulas: usize = wb
-                        .sheets
-                        .iter()
-                        .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count())
-                        .sum();
+                    let formulas = sheetcore::xlsx::workbook_formula_count(&wb);
                     let big = std::env::var("SC_FORCE_RECALC").is_err()
                         && (cells > 100_000 || formulas > 30_000);
                     let base_hash = if diag.is_complete() && !wb.load_incomplete {
@@ -4078,10 +4071,15 @@ impl SheetApp {
                         String::new()
                     };
                     if big {
-                        let skeleton = formula_skeleton(&wb);
+                        let trust_cached =
+                            diag.is_complete() && !wb.load_incomplete && wb.links.is_empty();
+                        let wb_for_deps = wb.clone();
                         let _ = tx.send(OpenMsg::Loaded(Box::new(wb), true, Box::new(diag), base_hash));
-                        let deps = sheetcore::formula::deps::Deps::build(&skeleton);
-                        drop(skeleton);
+                        let deps = sheetcore::formula::deps::Deps::build_with_cached_baseline(
+                            &wb_for_deps,
+                            trust_cached,
+                        );
+                        drop(wb_for_deps);
                         let _ = tx.send(OpenMsg::DepsReady(Box::new(deps)));
                         return;
                     }
@@ -40351,11 +40349,6 @@ fn style_visual_eq(a: &sheetcore::style::CellStyle, b: &sheetcore::style::CellSt
         && a.format == b.format
         && a.border == b.border
         && a.diagonal == b.diagonal
-}
-
-/// 大文件打开时只保留公式文本的轻量工作簿：依赖图只需要它，省掉整份 clone
-fn formula_skeleton(wb: &Workbook) -> Workbook {
-    sheetcore::xlsx::formula_skeleton(wb)
 }
 
 fn plain_path(p: &std::path::Path) -> std::path::PathBuf {

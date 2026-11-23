@@ -33,7 +33,7 @@ impl LookupKey {
             Value::Empty => Self::Empty,
             Value::Number(n) => Self::Number(if *n == 0.0 { 0 } else { n.to_bits() }),
             Value::Bool(b) => Self::Bool(*b),
-            Value::Text(s) => Self::Text(lowercase_str(s.as_ref())),
+            Value::Text(s) => Self::Text(lowercase_arc(s)),
             Value::Error(e) => Self::Error(*e as u8),
         }
     }
@@ -449,7 +449,7 @@ fn value_to_coerced_number(v: &Value) -> Result<f64, ErrKind> {
 fn value_to_coerced_lower_text(v: &Value) -> Arc<str> {
     match v {
         Value::Empty => "".into(),
-        Value::Text(s) => lowercase_str(s.as_ref()),
+        Value::Text(s) => lowercase_arc(s),
         Value::Bool(true) => "true".into(),
         Value::Bool(false) => "false".into(),
         Value::Number(n) => crate::model::format_number(*n).into(),
