@@ -395,10 +395,11 @@ fn write_sheet(
             }
         }
     }
-    let xf_for = |key: CellRef| -> Result<Option<u16>> {
-        sheet.explicit_style_of(key.row, key.col)
-            .or_else(|| sheet.row_styles.get(&key.row).or_else(||sheet.col_styles.get(&key.col)).copied())
-            .map(|id| formats.get(&id).copied().context("模板缺少单元格样式")).transpose()
+    let xf_for = |key: CellRef, explicit: Option<u16>| -> Result<Option<u16>> {
+        explicit
+            .or_else(|| sheet.row_styles.get(&key.row).or_else(|| sheet.col_styles.get(&key.col)).copied())
+            .map(|id| formats.get(&id).copied().context("模板缺少单元格样式"))
+            .transpose()
     };
     let first = crate::model::cell_name(top, left);
     let end = crate::model::cell_name(bottom, right);
@@ -407,10 +408,10 @@ fn write_sheet(
     let dim = dimension.range_value();
     write!(out, "{}{reference}{}<sheetData>", &shell[..dim.start], &shell[dim.end..data.range().start])?;
 
-    let mut cells = sheet.iter().peekable();
+    let mut cells = sheet.iter_cells_with_explicit_style().peekable();
     let mut rows = data.children().filter(|n| n.is_element()).peekable();
     while cells.peek().is_some() || rows.peek().is_some() {
-        let model_row = cells.peek().map_or(u32::MAX, |(key, _)| key.row);
+        let model_row = cells.peek().map_or(u32::MAX, |(key, _, _)| key.row);
         let template_row = match rows.peek() {
             Some(n) if n.has_tag_name((namespace, "row")) => n.attribute("r")
                 .and_then(|r| r.parse::<u32>().ok()?.checked_sub(1)).context("无效的模板行号")?,
@@ -445,20 +446,20 @@ fn write_sheet(
             let (sr, sc) = stub.attribute("r").and_then(crate::sparse::parse_ref)
                 .context("无效的模板单元格")?;
             ensure!(sr == r, "模板单元格行号不一致");
-            while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col < sc) {
-                write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key)?)?;
+            while let Some((key, cell, explicit)) = cells.next_if(|(k, _, _)| k.row == r && k.col < sc) {
+                write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key, explicit)?)?;
             }
-            if let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col == sc) {
+            if let Some((key, cell, explicit)) = cells.next_if(|(k, _, _)| k.row == r && k.col == sc) {
                 let xf = stub.attribute("s").map(str::parse::<u16>).transpose()?;
-                write_value(&mut out, sheet, &arrays, sst, key, cell, xf.or(xf_for(key)?))?;
+                write_value(&mut out, sheet, &arrays, sst, key, cell, xf.or(xf_for(key, explicit)?))?;
             } else if stub.attribute("s").is_none() && sheet.explicit_style_of(sr, sc) == Some(0) {
                 write_value(&mut out, sheet, &arrays, sst, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
             } else {
                 out.write_all(shell[stub.range()].as_bytes())?;
             }
         }
-        while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r) {
-            write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key)?)?;
+        while let Some((key, cell, explicit)) = cells.next_if(|(k, _, _)| k.row == r) {
+            write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key, explicit)?)?;
         }
         out.write_all(b"</row>")?;
     }

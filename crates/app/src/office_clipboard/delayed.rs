@@ -142,8 +142,8 @@ impl Range {
                 return false;
             }
         }
-        for (k, _) in source.styles.iter().chain(live.styles.iter()) {
-            if k.col >= c1 && k.col <= c2 && row_in_scope(k.row) && !same_cell(k.row, k.col) {
+        for (k, _) in source.styles.iter_rect(self.rect).chain(live.styles.iter_rect(self.rect)) {
+            if row_in_scope(k.row) && !same_cell(k.row, k.col) {
                 return false;
             }
         }
@@ -186,13 +186,11 @@ impl Range {
                 }
             }
         }
-        for (k, _) in sh.styles.iter() {
-            if k.col >= c1 && k.col <= c2 {
-                if let Some(rr) = map_row(k.row) {
-                    coords.insert((rr, k.col - c1, k.row));
-                    if coords.len() > max_keys {
-                        return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
-                    }
+        for (k, _) in sh.styles.iter_rect(self.rect) {
+            if let Some(rr) = map_row(k.row) {
+                coords.insert((rr, k.col - c1, k.row));
+                if coords.len() > max_keys {
+                    return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                 }
             }
         }
@@ -264,8 +262,8 @@ impl Range {
                 }
             }
         }
-        for (k, _) in sh.styles.iter() {
-            if k.col >= c1 && k.col <= c2 && row_ok(k.row) {
+        for (k, _) in sh.styles.iter_rect(self.rect) {
+            if row_ok(k.row) {
                 keys.insert((k.row, k.col));
                 if keys.len() > max_keys {
                     return Err("剪切源带格式单元格超过 50 万个，请分批操作");

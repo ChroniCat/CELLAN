@@ -795,25 +795,13 @@ fn parse_csv_slice_chunk<'a>(
     at: (u32, u32),
     keep_going: &(dyn Fn() -> bool + Sync),
 ) -> Result<(usize, u32, Vec<Vec<(u32, Cell)>>, Vec<(u32, u32)>), String> {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     let bytes = slice.as_bytes();
     let db = delim as u8;
     let qb = quote as u8;
-    let mut intern: HashMap<String, Arc<str>> = HashMap::new();
-    // Bridge for `@integrator` (`#19 跨层-1`): once `Value::Text` switches from `Box<str>` to
-    // `Arc<str>` / `CompactText`, change `arc.as_ref().into()` to `Arc::clone(&arc)` here.
+    let mut pool = crate::model::StringPool::with_capacity(1024);
     let mut text_value = |s: &str| -> Value {
-        if s.len() <= 64 {
-            if let Some(existing) = intern.get(s) {
-                return Value::Text(existing.as_ref().into());
-            }
-            let arc: Arc<str> = Arc::from(s);
-            if intern.len() < 16_384 {
-                intern.insert(s.to_owned(), Arc::clone(&arc));
-            }
-            Value::Text(arc.as_ref().into())
+        if s.len() <= 64 && pool.len() < 16_384 {
+            Value::Text(pool.intern(s))
         } else {
             Value::Text(s.into())
         }

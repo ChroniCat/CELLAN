@@ -10184,55 +10184,14 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
         true
     }
 
-    /// 稀疏校验受保护工作表矩形区域内是否存在被锁定单元格（`O(row_styles + col_styles + explicit_styles)`）。
+    /// 稀疏校验受保护工作表矩形区域内是否存在被锁定单元格（直接委托 `column_clip::rect_has_any_locked`）。
+    #[inline]
     fn rect_has_protected_locked_cell(
         wb: &Workbook,
         sheet: &sheetcore::model::Sheet,
         rect: (u32, u32, u32, u32),
     ) -> bool {
-        if sheet.protection.is_none() {
-            return false;
-        }
-        let (r1, c1, r2, c2) = rect;
-        if r1 > r2 || c1 > c2 {
-            return false;
-        }
-        let n_rows = i64::from(r2 - r1 + 1);
-        let is_locked = |id: u16| wb.styles.get(id).locked;
-        let locked_rows = sheet
-            .row_styles
-            .iter()
-            .filter(|(r, id)| **r >= r1 && **r <= r2 && is_locked(**id))
-            .count() as i64;
-        let inherited_rows = sheet
-            .row_styles
-            .keys()
-            .filter(|&&r| r >= r1 && r <= r2)
-            .count() as i64;
-        let mut locked: Vec<i64> = (c1..=c2)
-            .map(|c| {
-                let col_sid = sheet.col_styles.get(&c).copied().unwrap_or(0);
-                locked_rows
-                    + if is_locked(col_sid) {
-                        n_rows - inherited_rows
-                    } else {
-                        0
-                    }
-            })
-            .collect();
-        for (key, &explicit) in sheet.styles.iter() {
-            if key.row >= r1 && key.row <= r2 && key.col >= c1 && key.col <= c2 {
-                let base = sheet
-                    .row_styles
-                    .get(&key.row)
-                    .or_else(|| sheet.col_styles.get(&key.col))
-                    .copied()
-                    .unwrap_or(0);
-                locked[(key.col - c1) as usize] +=
-                    i64::from(is_locked(explicit)) - i64::from(is_locked(base));
-            }
-        }
-        locked.iter().any(|&n| n > 0)
+        sheet.protection.is_some() && crate::column_clip::rect_has_any_locked(wb, sheet, rect)
     }
 
     fn rect_overlaps_partial_array(
@@ -10361,17 +10320,11 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                 }
             }
             if !values_only {
-                for (k, _) in target_sh.styles.iter() {
-                    if k.row >= target_rect.0
-                        && k.row <= target_rect.2
-                        && k.col >= target_rect.1
-                        && k.col <= target_rect.3
-                    {
-                        target_coord_set.insert((k.row, k.col));
-                        if target_coord_set.len() > max_keys {
-                            self.status = "粘贴内容过大（单次实际变更最多支持 50 万个单元格）".into();
-                            return;
-                        }
+                for (k, _) in target_sh.styles.iter_rect(target_rect) {
+                    target_coord_set.insert((k.row, k.col));
+                    if target_coord_set.len() > max_keys {
+                        self.status = "粘贴内容过大（单次实际变更最多支持 50 万个单元格）".into();
+                        return;
                     }
                 }
             }
@@ -10594,17 +10547,11 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                     return true;
                 }
             }
-            for (k, _) in target_sh.styles.iter() {
-                if k.row >= target_rect.0
-                    && k.row <= target_rect.2
-                    && k.col >= target_rect.1
-                    && k.col <= target_rect.3
-                {
-                    coord_set.insert((k.row, k.col));
-                    if coord_set.len() > max_keys {
-                        self.status = "粘贴区域实际变更超过 50 万格，请分批粘贴".into();
-                        return true;
-                    }
+            for (k, _) in target_sh.styles.iter_rect(target_rect) {
+                coord_set.insert((k.row, k.col));
+                if coord_set.len() > max_keys {
+                    self.status = "粘贴区域实际变更超过 50 万格，请分批粘贴".into();
+                    return true;
                 }
             }
             for &k in &target_sh.spilled {

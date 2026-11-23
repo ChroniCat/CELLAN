@@ -915,8 +915,8 @@ pub fn build_xmlss_rows(
         for (key, _) in sh.iter_rect(rect) {
             set.insert(key.row);
         }
-        for (key, &sid) in sh.styles.iter() {
-            if sid != 0 && key.row >= r1 && key.row <= r2 && key.col >= c1 && key.col <= c2 {
+        for (key, sid) in sh.styles.iter_rect(rect) {
+            if sid != 0 {
                 set.insert(key.row);
             }
         }

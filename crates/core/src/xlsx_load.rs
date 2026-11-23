@@ -23,11 +23,10 @@ use std::{
     },
 };
 
-/// Cross-layer-1 bridge: once `Value::Text(Arc<str>)` is merged from `codex/perf-storage`,
-/// `Value::Text(s.clone())` makes every `t="s"` cell O(1) zero-heap-allocation.
+/// Cross-layer-1 bridge: `Value::Text(Arc::clone(s))` makes every `t="s"` SST cell O(1) zero-heap-allocation.
 #[inline]
 fn shared_text_value(s: &Arc<str>) -> Value {
-    Value::Text(s.as_ref().into())
+    Value::Text(Arc::clone(s))
 }
 
 /// Fast-path parser for `<= 15`-digit ASCII integers (exact in IEEE-754 `f64`),

@@ -141,7 +141,7 @@ pub fn read_date1904(stream: &[u8]) -> bool {
 pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
     // 表名 + BOF 偏移
     let mut bounds: Vec<(u32, String)> = Vec::new();
-    let mut sst: Vec<String> = Vec::new();
+    let mut sst: Vec<std::sync::Arc<str>> = Vec::new();
     let mut i = 0usize;
     while i + 4 <= stream.len() {
         let t = u16le(stream, i).unwrap();
@@ -164,7 +164,10 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
             bounds.push((pos, name));
         }
         if t == SST {
-            sst = parse_sst(stream, i + 4, l);
+            sst = parse_sst(stream, i + 4, l)
+                .into_iter()
+                .map(std::sync::Arc::from)
+                .collect();
         }
         let n = (i + 4 + l).min(stream.len());
         if n <= i {
@@ -270,7 +273,7 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
                     let c = u16le(body, 2).unwrap() as u32;
                     let idx = u32le(body, 6).unwrap() as usize;
                     if let Some(s) = sst.get(idx) {
-                        push(r, c, Value::Text(s.clone().into()));
+                        push(r, c, Value::Text(std::sync::Arc::clone(s)));
                     }
                 }
                 STRING if body.len() >= 2 => {
