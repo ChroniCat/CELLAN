@@ -37,43 +37,10 @@ impl CellView {
     }
 }
 
-/// 合并区锚点：返回 (r1,c1,r2,c2)；不在合并区返回 None
+/// 合并区锚点：返回 (r1,c1,r2,c2)；不在合并区返回 None（直接复用 `Sheet::merges` 内置惰性区间索引）
+#[inline]
 pub fn merge_span(sheet: &Sheet, r: u32, c: u32) -> Option<(u32, u32, u32, u32)> {
-    let merges = &sheet.merges;
-    if merges.len() <= 8 {
-        return merges
-            .iter()
-            .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
-            .copied();
-    }
-    type Key = (
-        u64,
-        u64,
-        usize,
-        usize,
-        Option<(u32, u32, u32, u32)>,
-        Option<(u32, u32, u32, u32)>,
-    );
-    thread_local! {
-        static MERGE_TLS: std::cell::RefCell<(Option<Key>, crate::merges::MergeIndex)> =
-            std::cell::RefCell::new((None, crate::merges::MergeIndex::default()));
-    }
-    let key: Key = (
-        sheet.identity,
-        sheet.coordinate_revision(),
-        merges.as_ptr() as usize,
-        merges.len(),
-        merges.first().copied(),
-        merges.last().copied(),
-    );
-    MERGE_TLS.with(|slot| {
-        let mut guard = slot.borrow_mut();
-        if guard.0 != Some(key) {
-            guard.1.refresh(merges);
-            guard.0 = Some(key);
-        }
-        guard.1.at(r, c)
-    })
+    sheet.merge_at(r, c)
 }
 
 /// 该格是否是合并区里被盖住的那部分（打印时跳过，只画锚点）

@@ -13,8 +13,9 @@ use std::sync::{mpsc, Arc};
 
 pub(crate) type MergeRect = (u32, u32, u32, u32);
 
-/// 缓存未乘 `zoom`（`z = 1.0`）但已合入隐藏行列的基础坐标轴，以及有序隐藏行列表：
-/// - 连续滚轮缩放仅对已有 `Axis` 做线性缩放，不再重复遍历百万级 `HashSet` 执行 `hide_many`；
+/// 缓存未乘 `zoom`（`z = 1.0`）但已合入隐藏行列的基础坐标轴：
+/// - 隐藏行列直接通过区间段表 `Axis::hide_hidden` 在 `O(spans + intervals)` 内归并，零 `Vec<u32>` 展开；
+/// - 连续滚轮缩放仅对已有 `Axis` 段表做 `O(spans)` 线性缩放；
 /// - 拖拽单行行高（`hidden_rows` 版本未变）且该行非隐藏时，直接在缓存轴上增量更新该行。
 pub(crate) struct BaseAxesCache {
     pub sheet_id: u64,
@@ -22,8 +23,6 @@ pub(crate) struct BaseAxesCache {
     pub rows_rev: u64,
     pub hidden_cols_rev: u64,
     pub hidden_rows_rev: (u64, u64),
-    pub sorted_hidden_rows: Arc<Vec<u32>>,
-    pub sorted_hidden_cols: Arc<Vec<u32>>,
     pub base_cols: Arc<sheetcore::layout::Axis>,
     pub base_rows: Arc<sheetcore::layout::Axis>,
 }
@@ -93,16 +92,7 @@ impl PageBreaks {
 
 // ===== 合并单元格 O(1) 版本门控 + O(log M) 区间查询与缓存最大合并行 =====
 
-type MergeKey = (
-    u64,
-    u64,
-    u64,
-    u64,
-    usize,
-    usize,
-    Option<MergeRect>,
-    Option<MergeRect>,
-);
+type MergeKey = (u64, u64);
 
 #[derive(Default)]
 pub(crate) struct MergeCache {
@@ -114,22 +104,13 @@ pub(crate) struct MergeCache {
 }
 
 impl MergeCache {
-    pub fn ensure(&mut self, sheet: &Sheet, doc_gen: u64, wb_epoch: u64) {
+    pub fn ensure(&mut self, sheet: &Sheet, _doc_gen: u64, _wb_epoch: u64) {
         let merges = &sheet.merges;
-        let k: MergeKey = (
-            sheet.identity,
-            sheet.coordinate_revision(),
-            doc_gen,
-            wb_epoch,
-            merges.as_ptr() as usize,
-            merges.len(),
-            merges.first().copied(),
-            merges.last().copied(),
-        );
+        let k: MergeKey = (sheet.identity, sheet.merges_revision());
         if self.key == Some(k) {
             return;
         }
-        self.index.refresh(merges);
+        self.index.refresh_merges(merges);
         self.sorted_by_top.clear();
         self.sorted_by_top.extend_from_slice(merges);
         self.sorted_by_top.sort_unstable_by_key(|m| m.0);

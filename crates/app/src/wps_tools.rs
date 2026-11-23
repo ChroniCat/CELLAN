@@ -163,70 +163,15 @@ impl SheetApp {
         self.status = format!("已按所选值 \"{disp}\" 筛选");
     }
 
-    /// 稀疏页感知的「当前区域」探测：与 `sheetcore::sort_filter::current_region` 语义完全一致，
-    /// 但优先探测锚点列/行并在大表上通过单遍稀疏 `iter_rect` 构建非空行列位图，消除百万行千万次 `sheet.get` 阻塞。
+    /// 稀疏页感知的「当前区域」探测：直接委托底层 `Store` 页级 `row_mask` / `col_nonempty` 位图实现，
+    /// 无需逐格探测或遍历非空单元格即可在微秒级跳过百万空行。
+    #[inline]
     pub(crate) fn current_region_fast(
         sheet: &sheetcore::Sheet,
         r: u32,
         c: u32,
     ) -> (u32, u32, u32, u32) {
-        let (rr2, cc2) = sheet
-            .used_bounds()
-            .map(|(_, _, r2, c2)| (r2 + 1, c2 + 1))
-            .unwrap_or((r + 1, c + 1));
-        let rows = rr2.max(r + 1);
-        let cols = cc2.max(c + 1);
-        if u64::from(rows) * u64::from(cols) <= 16_384 {
-            return sheetcore::sort_filter::current_region(sheet, r, c);
-        }
-        // 懒加载全表非空行/列位图（仅当锚点列/行自身出现空洞需要跨列/跨行确认整行/整列全空时构建一次）
-        let bitmaps: std::cell::OnceCell<(Vec<u64>, Vec<u64>)> = std::cell::OnceCell::new();
-        let get_bitmaps = || {
-            bitmaps.get_or_init(|| {
-                let mut rb = vec![0u64; (rows as usize).div_ceil(64)];
-                let mut cb = vec![0u64; (cols as usize).div_ceil(64)];
-                for (key, _) in sheet.iter_rect((0, 0, rows - 1, cols - 1)) {
-                    rb[(key.row / 64) as usize] |= 1u64 << (key.row % 64);
-                    cb[(key.col / 64) as usize] |= 1u64 << (key.col % 64);
-                }
-                (rb, cb)
-            })
-        };
-        let row_non_empty = |rr: u32| -> bool {
-            if sheet.get(rr, c).is_some()
-                || (c != 0 && sheet.get(rr, 0).is_some())
-                || (c > 0 && sheet.get(rr, c - 1).is_some())
-                || (c + 1 < cols && sheet.get(rr, c + 1).is_some())
-            {
-                return true;
-            }
-            let (rb, _) = get_bitmaps();
-            (rb[(rr / 64) as usize] & (1u64 << (rr % 64))) != 0
-        };
-        let mut r1 = r;
-        while r1 > 0 && row_non_empty(r1 - 1) {
-            r1 -= 1;
-        }
-        let mut r2 = r;
-        while r2 + 1 < rows && row_non_empty(r2 + 1) {
-            r2 += 1;
-        }
-        let col_non_empty = |cc: u32| -> bool {
-            if sheet.get(r, cc).is_some() || sheet.get(r1, cc).is_some() {
-                return true;
-            }
-            let (_, cb) = get_bitmaps();
-            (cb[(cc / 64) as usize] & (1u64 << (cc % 64))) != 0
-        };
-        let mut c1 = c;
-        while c1 > 0 && col_non_empty(c1 - 1) {
-            c1 -= 1;
-        }
-        let mut c2 = c;
-        while c2 + 1 < cols && col_non_empty(c2 + 1) {
-            c2 += 1;
-        }
-        (r1, c1, r2, c2)
+        sheetcore::sort_filter::current_region(sheet, r, c)
     }
 
     /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建）

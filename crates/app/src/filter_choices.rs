@@ -709,11 +709,14 @@ impl<'a> CompiledFilter<'a> {
     }
 }
 
-/// 高性能筛选隐藏行求值：零 `Value::display()` 堆分配 + 空行带短路 + 大范围多核并行分块。
-pub(crate) fn compute_filter_hidden_fast(sheet: &Sheet, f: &Filter) -> HashSet<u32> {
+/// 高性能筛选隐藏行求值：零 `Value::display()` 堆分配 + 空行带短路 + 大范围多核并行分块，直接输出合并闭区间 `HiddenIndices`（零百万级 `HashSet` 分配）。
+pub(crate) fn compute_filter_hidden_fast(
+    sheet: &Sheet,
+    f: &Filter,
+) -> sheetcore::layout::HiddenIndices {
     let compiled = CompiledFilter::new(f);
     if !compiled.is_active() || f.range.2 <= f.range.0 {
-        return HashSet::new();
+        return sheetcore::layout::HiddenIndices::default();
     }
     let start_r = f.range.0 + 1;
     let mut end_r = f.range.2;
@@ -722,17 +725,28 @@ pub(crate) fn compute_filter_hidden_fast(sheet: &Sheet, f: &Filter) -> HashSet<u
         end_r = used_max_r.saturating_add(1).min(end_r);
     }
     if start_r > end_r {
-        return HashSet::new();
+        return sheetcore::layout::HiddenIndices::default();
     }
     let scan_end = end_r.min(used_max_r);
 
-    let mut hidden_vec: Vec<u32> = if start_r > scan_end {
+    #[inline]
+    fn push_run(runs: &mut Vec<(u32, u32)>, r: u32) {
+        if let Some(last) = runs.last_mut()
+            && r == last.1 + 1
+        {
+            last.1 = r;
+        } else {
+            runs.push((r, r));
+        }
+    }
+
+    let mut runs: Vec<(u32, u32)> = if start_r > scan_end {
         Vec::new()
     } else if scan_end - start_r < 32_768 {
         let mut v = Vec::new();
         for r in start_r..=scan_end {
             if compiled.row_hidden(sheet, r) {
-                v.push(r);
+                push_run(&mut v, r);
             }
         }
         v
@@ -742,7 +756,7 @@ pub(crate) fn compute_filter_hidden_fast(sheet: &Sheet, f: &Filter) -> HashSet<u
             .unwrap_or(4);
         let total = (scan_end - start_r + 1) as usize;
         let chunk = total.div_ceil(workers);
-        let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let parts: Vec<Vec<(u32, u32)>> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(workers);
             for w in 0..workers {
                 let lo = start_r + (w * chunk) as u32;
@@ -755,7 +769,7 @@ pub(crate) fn compute_filter_hidden_fast(sheet: &Sheet, f: &Filter) -> HashSet<u
                     let mut local = Vec::new();
                     for r in lo..=hi {
                         if comp.row_hidden(sheet, r) {
-                            local.push(r);
+                            push_run(&mut local, r);
                         }
                     }
                     local
@@ -767,29 +781,32 @@ pub(crate) fn compute_filter_hidden_fast(sheet: &Sheet, f: &Filter) -> HashSet<u
                 .collect()
         });
         let cap: usize = parts.iter().map(|p| p.len()).sum();
-        let mut merged = Vec::with_capacity(cap);
-        for mut p in parts {
-            merged.append(&mut p);
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(cap + 1);
+        for p in parts {
+            for (lo, hi) in p {
+                if let Some(last) = merged.last_mut()
+                    && lo == last.1 + 1
+                {
+                    last.1 = hi;
+                } else {
+                    merged.push((lo, hi));
+                }
+            }
         }
         merged
     };
 
     let tail_start = scan_end.saturating_add(1).max(start_r);
-    let tail_count = if compiled.blank_row_hidden && tail_start <= end_r {
-        (end_r - tail_start + 1) as usize
-    } else {
-        0
-    };
-    let mut out = HashSet::with_capacity(hidden_vec.len() + tail_count);
-    for r in hidden_vec.drain(..) {
-        out.insert(r);
-    }
-    if tail_count > 0 {
-        for r in tail_start..=end_r {
-            out.insert(r);
+    if compiled.blank_row_hidden && tail_start <= end_r {
+        if let Some(last) = runs.last_mut()
+            && tail_start == last.1 + 1
+        {
+            last.1 = end_r;
+        } else {
+            runs.push((tail_start, end_r));
         }
     }
-    out
+    sheetcore::layout::HiddenIndices::from_intervals(runs)
 }
 
 #[cfg(test)]

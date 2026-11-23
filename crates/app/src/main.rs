@@ -2997,20 +2997,35 @@ impl StatsKey {
         let visibility = (live.hidden_rows.revision(), live.hidden_rows_user.revision());
         if self.rows != rows || self.visibility != visibility {
             let Some(old) = source else { return false; };
-            let covered = |r: u32| rects.iter().any(|&(r1,_,r2,_)| r1 <= r && r <= r2);
-            if self.rows != rows {
-                if (live.rows.default_size() <= 0.0) != (old.rows.default_size() <= 0.0)
-                    || live.rows.len().saturating_add(old.rows.len()) > 2048
-                    || live.rows.entries().chain(old.rows.entries()).any(|(&r,_)| covered(r)
-                        && (live.rows.size(r) <= 0.0) != (old.rows.size(r) <= 0.0))
-                {
+            let overlaps = |lo: u32, hi: u32| rects.iter().any(|&(r1, _, r2, _)| lo <= r2 && hi >= r1);
+            if self.rows != rows && live.rows.zero_size_revision() != old.rows.zero_size_revision() {
+                if (live.rows.default_size() <= 0.0) != (old.rows.default_size() <= 0.0) {
                     return false;
+                }
+                for s in live
+                    .rows
+                    .spans()
+                    .iter()
+                    .filter(|s| s.size <= 0.0)
+                    .chain(old.rows.spans().iter().filter(|s| s.size <= 0.0))
+                {
+                    if overlaps(s.start, s.end) {
+                        for r in s.start..=s.end {
+                            if rects.iter().any(|&(r1, _, r2, _)| r1 <= r && r <= r2)
+                                && (live.rows.size(r) <= 0.0) != (old.rows.size(r) <= 0.0)
+                            {
+                                return false;
+                            }
+                        }
+                    }
                 }
             }
             for (before, after) in [(&old.hidden_rows, &live.hidden_rows), (&old.hidden_rows_user, &live.hidden_rows_user)] {
                 if before.revision() != after.revision()
-                    && (before.len().saturating_add(after.len()) > 2048
-                        || before.symmetric_difference(after).any(|&r| covered(r)))
+                    && before
+                        .symmetric_difference_intervals(after)
+                        .into_iter()
+                        .any(|(lo, hi)| overlaps(lo, hi))
                 {
                     return false;
                 }
@@ -12302,30 +12317,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
     }
 
-    /// O(log N) 查找 `< from` 的最近可见行/列（跳过整段隐藏区间，兼容百万行 f32 精度舍入）。
+    /// O(log spans) 查找 `< from` 的最近可见行/列（直接调用区间段表 `Axis::prev_visible`）。
     #[inline]
     pub(crate) fn axis_prev_visible(axis: &sheetcore::layout::Axis, from: u32) -> Option<u32> {
         if from == 0 {
-            return None;
+            None
+        } else {
+            axis.prev_visible(from - 1)
         }
-        if axis.size(from - 1) > 0.0 {
-            return Some(from - 1);
-        }
-        let p = axis.pos(from);
-        if p <= 0.0 && axis.next_visible(0).is_none_or(|i| i >= from) {
-            return None;
-        }
-        let mut lo = 0u32;
-        let mut hi = from;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if axis.pos(mid) >= p {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        axis.visible_indices(lo.saturating_sub(1)..from).last()
     }
 
     #[inline]
@@ -21458,7 +21457,7 @@ let txn = self.txn_begin(&keys);
     #[cfg(test)]
     fn spill_clip(&self, r: u32, c: u32, rect: Rect, align: egui::Align2) -> Rect {
         let mut merges = sheetcore::merges::MergeIndex::default();
-        merges.refresh(&self.wb.sheet(self.sheet_idx).merges);
+        merges.refresh_merges(&self.wb.sheet(self.sheet_idx).merges);
         self.spill_clip_indexed(r, c, rect, align, &merges, Rect::EVERYTHING)
     }
 
@@ -23721,9 +23720,9 @@ impl SheetApp {
                 .unwrap_or_default()
         };
         let sh = self.wb.sheet_mut(self.sheet_idx);
-        let visibility_changed = *sh.hidden_rows != hidden;
+        let visibility_changed = sh.hidden_rows != hidden;
         if visibility_changed {
-            sh.hidden_rows = hidden.into();
+            sh.hidden_rows = hidden;
         }
         sh.filter_dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -26857,40 +26856,19 @@ impl SheetApp {
             let cols_rev = s.cols.revision();
             let rows_rev = s.rows.revision();
             let same_sheet = slot.as_ref().is_some_and(|b| b.sheet_id == s.identity);
-            let sorted_hidden_rows = match slot.as_ref().filter(|b| same_sheet && b.hidden_rows_rev == hid_r_rev) {
-                Some(b) => b.sorted_hidden_rows.clone(),
-                None => {
-                    let mut v: Vec<u32> = Vec::with_capacity(s.hidden_rows.len() + s.hidden_rows_user.len());
-                    v.extend(s.hidden_rows.iter().copied());
-                    v.extend(s.hidden_rows_user.iter().copied());
-                    v.sort_unstable();
-                    v.dedup();
-                    std::sync::Arc::new(v)
-                }
-            };
-            let sorted_hidden_cols = match slot.as_ref().filter(|b| same_sheet && b.hidden_cols_rev == hid_c_rev) {
-                Some(b) => b.sorted_hidden_cols.clone(),
-                None => {
-                    let mut v: Vec<u32> = s.hidden_cols.iter().copied().collect();
-                    v.sort_unstable();
-                    std::sync::Arc::new(v)
-                }
-            };
             let base_cols = match slot.as_ref().filter(|b| same_sheet && b.hidden_cols_rev == hid_c_rev) {
                 Some(b) if b.cols_rev == cols_rev => b.base_cols.clone(),
                 Some(b) if self.col_drag.is_some() => {
                     let (drag_c, _, _) = self.col_drag.unwrap();
                     let mut next = (*b.base_cols).clone();
-                    if sorted_hidden_cols.binary_search(&drag_c).is_err() {
+                    if !s.hidden_cols.contains(&drag_c) {
                         next.set(drag_c, s.cols.size(drag_c));
                     }
                     std::sync::Arc::new(next)
                 }
                 _ => {
                     let mut c_axis = s.cols.clone();
-                    if !sorted_hidden_cols.is_empty() {
-                        c_axis.hide_many(sorted_hidden_cols.iter().copied());
-                    }
+                    c_axis.hide_hidden(&s.hidden_cols);
                     std::sync::Arc::new(c_axis)
                 }
             };
@@ -26899,16 +26877,15 @@ impl SheetApp {
                 Some(b) if self.row_drag.is_some() => {
                     let (drag_r, _, _) = self.row_drag.unwrap();
                     let mut next = (*b.base_rows).clone();
-                    if sorted_hidden_rows.binary_search(&drag_r).is_err() {
+                    if !s.hidden_rows.contains(&drag_r) && !s.hidden_rows_user.contains(&drag_r) {
                         next.set(drag_r, s.rows.size(drag_r));
                     }
                     std::sync::Arc::new(next)
                 }
                 _ => {
                     let mut r_axis = s.rows.clone();
-                    if !sorted_hidden_rows.is_empty() {
-                        r_axis.hide_many(sorted_hidden_rows.iter().copied());
-                    }
+                    r_axis.hide_hidden(&s.hidden_rows);
+                    r_axis.hide_hidden(&s.hidden_rows_user);
                     std::sync::Arc::new(r_axis)
                 }
             };
@@ -26918,8 +26895,6 @@ impl SheetApp {
                 rows_rev,
                 hidden_cols_rev: hid_c_rev,
                 hidden_rows_rev: hid_r_rev,
-                sorted_hidden_rows,
-                sorted_hidden_cols,
                 base_cols: base_cols.clone(),
                 base_rows: base_rows.clone(),
             });
@@ -28859,7 +28834,7 @@ impl SheetApp {
             .merges
             .ensure(self.wb.sheet(si), self.doc_gen, self.wb_epoch);
         if dumping {
-            self.paint_merges.refresh(&self.wb.sheet(si).merges);
+            self.paint_merges.refresh_merges(&self.wb.sheet(si).merges);
         }
         let mut vis_merges: Vec<_> = Vec::new();
         self.cf_inputs.merges.collect_visible(
