@@ -740,19 +740,505 @@ pub fn import_csv_opts(
     at: (u32, u32),
 ) -> std::io::Result<(u32, u32, crate::csv::Encoding)> {
     let bytes = std::fs::read(path)?;
-    let (text, used, had_errors) = crate::csv::decode(&bytes, encoding);
+    let (text, used, had_errors) = crate::csv::decode_cow(&bytes, encoding);
     if had_errors {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "CSV 编码无法完整解码（文件可能不是声明的编码）",
         ));
     }
-    // 严格解析：引号不闭合/闭引号后有多余字符都算失败，失败时一个格都不写
-    let records = crate::csv::records_strict_q(&text, delim, quote).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
-    let (rows, cols) = import_csv_records(sheet, records, header, text_cols, old, at);
+    let (rows, cols, _keys) =
+        import_csv_str_parallel(sheet, &text, delim, quote, header, text_cols, old, at, &|| true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok((rows, cols, used))
+}
+
+#[inline]
+fn fast_parse_csv_number(t: &str) -> Option<f64> {
+    let bytes = t.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let (neg, digits) = match bytes[0] {
+        b'-' => (true, &bytes[1..]),
+        b'+' => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    if digits.len() <= 15 && digits.iter().all(|b| b.is_ascii_digit()) {
+        let mut acc: u64 = 0;
+        for &b in digits {
+            acc = acc * 10 + u64::from(b - b'0');
+        }
+        let val = acc as f64;
+        return Some(if neg { -val } else { val });
+    }
+    if bytes
+        .iter()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+    {
+        return t.parse::<f64>().ok().filter(|n| n.is_finite());
+    }
+    None
+}
+
+fn parse_csv_slice_chunk<'a>(
+    slice: &'a str,
+    start_row: usize,
+    delim: char,
+    quote: char,
+    header: bool,
+    text_cols_mask: &[bool],
+    text_cols_extra: &[u32],
+    at: (u32, u32),
+    keep_going: &(dyn Fn() -> bool + Sync),
+) -> Result<(usize, u32, Vec<Vec<(u32, Cell)>>, Vec<(u32, u32)>), String> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let bytes = slice.as_bytes();
+    let db = delim as u8;
+    let qb = quote as u8;
+    let mut intern: HashMap<String, Arc<str>> = HashMap::new();
+    // Bridge for `@integrator` (`#19 跨层-1`): once `Value::Text` switches from `Box<str>` to
+    // `Arc<str>` / `CompactText`, change `arc.as_ref().into()` to `Arc::clone(&arc)` here.
+    let mut text_value = |s: &str| -> Value {
+        if s.len() <= 64 {
+            if let Some(existing) = intern.get(s) {
+                return Value::Text(existing.as_ref().into());
+            }
+            let arc: Arc<str> = Arc::from(s);
+            if intern.len() < 16_384 {
+                intern.insert(s.to_owned(), Arc::clone(&arc));
+            }
+            Value::Text(arc.as_ref().into())
+        } else {
+            Value::Text(s.into())
+        }
+    };
+
+    let is_text_col = |ci: usize| -> bool {
+        if ci < text_cols_mask.len() {
+            text_cols_mask[ci]
+        } else {
+            text_cols_extra.contains(&(ci as u32))
+        }
+    };
+
+    let mut col_batches: Vec<Vec<(u32, Cell)>> = Vec::new();
+    let mut keys: Vec<(u32, u32)> = Vec::new();
+    let mut row_cells: Vec<Cell> = Vec::with_capacity(16);
+    let mut unescaped = String::new();
+
+    let mut ri = start_row;
+    let mut max_cols = 0u32;
+    let mut in_quotes = false;
+    let mut quoted_field = false;
+    let mut had_escaped_quote = false;
+    let mut closed = false;
+    let mut line = 1usize;
+    let mut i = 0usize;
+    let mut field_start = 0usize;
+    let mut field_end = 0usize;
+
+    let mut finish_field = |raw: &str,
+                            was_quoted: bool,
+                            ci: usize,
+                            ri: usize,
+                            row_cells: &mut Vec<Cell>| {
+        let cell = if header && ri == 0 {
+            Cell {
+                value: text_value(raw),
+                formula: None,
+            }
+        } else if is_text_col(ci) && !raw.is_empty() {
+            Cell {
+                value: text_value(raw),
+                formula: None,
+            }
+        } else {
+            let t = raw.trim();
+            if t.is_empty() {
+                Cell::default()
+            } else if let Some(n) = fast_parse_csv_number(t) {
+                Cell {
+                    value: Value::Number(n),
+                    formula: None,
+                }
+            } else {
+                let _ = was_quoted;
+                Cell {
+                    value: text_value(t),
+                    formula: None,
+                }
+            }
+        };
+        row_cells.push(cell);
+    };
+
+    let mut flush_row = |ri: &mut usize,
+                         first_was_quoted: bool,
+                         first_raw_ws_only: bool,
+                         row_cells: &mut Vec<Cell>|
+     -> Result<(), String> {
+        let skip = row_cells.len() == 1 && !first_was_quoted && first_raw_ws_only;
+        if skip {
+            row_cells.clear();
+            return Ok(());
+        }
+        let r_abs = at
+            .0
+            .checked_add(*ri as u32)
+            .filter(|&r| r < crate::sync::MAX_ROWS)
+            .ok_or_else(|| String::from("数据超出工作表边界"))?;
+        let row_len = row_cells.len() as u32;
+        if at.1.saturating_add(row_len) > crate::sync::MAX_COLS {
+            return Err("数据超出工作表边界".into());
+        }
+        max_cols = max_cols.max(row_len);
+        if col_batches.len() < row_cells.len() {
+            col_batches.resize_with(row_cells.len(), Vec::new);
+        }
+        for (ci, cell) in row_cells.drain(..).enumerate() {
+            let c_abs = at.1 + ci as u32;
+            keys.push((r_abs, c_abs));
+            col_batches[ci].push((r_abs, cell));
+        }
+        *ri += 1;
+        Ok(())
+    };
+
+    let mut first_was_quoted = false;
+    let mut first_raw_ws_only = true;
+
+    while i < bytes.len() {
+        if (i & 8191) == 0 && !keep_going() {
+            return Err("CSV 读取已取消".into());
+        }
+        let b = bytes[i];
+        if in_quotes {
+            if b == qb {
+                if bytes.get(i + 1) == Some(&qb) {
+                    if !had_escaped_quote {
+                        unescaped.clear();
+                        unescaped.push_str(&slice[field_start..i]);
+                        had_escaped_quote = true;
+                    } else {
+                        unescaped.push_str(&slice[field_end..i]);
+                    }
+                    unescaped.push(quote);
+                    i += 2;
+                    field_end = i;
+                    continue;
+                }
+                if had_escaped_quote {
+                    unescaped.push_str(&slice[field_end..i]);
+                } else {
+                    field_end = i;
+                }
+                in_quotes = false;
+                closed = true;
+                i += 1;
+                continue;
+            }
+            if b == b'\n' {
+                line += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if closed && b != db && b != b'\r' && b != b'\n' {
+            return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+        }
+        if b == qb && i == field_start && !quoted_field {
+            in_quotes = true;
+            quoted_field = true;
+            had_escaped_quote = false;
+            i += 1;
+            field_start = i;
+            field_end = i;
+            continue;
+        }
+        if b == qb && quoted_field {
+            return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+        }
+        if b == db {
+            let raw = if quoted_field {
+                if had_escaped_quote {
+                    unescaped.as_str()
+                } else {
+                    &slice[field_start..field_end]
+                }
+            } else {
+                let s = &slice[field_start..i];
+                s.strip_suffix('\r').unwrap_or(s)
+            };
+            let ci = row_cells.len();
+            if ci == 0 {
+                first_was_quoted = quoted_field;
+                first_raw_ws_only = !quoted_field && raw.trim().is_empty();
+            }
+            finish_field(raw, quoted_field, ci, ri, &mut row_cells);
+            quoted_field = false;
+            had_escaped_quote = false;
+            closed = false;
+            i += 1;
+            field_start = i;
+            field_end = i;
+            continue;
+        }
+        if b == b'\r' {
+            if !quoted_field && bytes.get(i + 1) != Some(&b'\n') {
+                if !had_escaped_quote {
+                    unescaped.clear();
+                    unescaped.push_str(&slice[field_start..i]);
+                    had_escaped_quote = true;
+                } else {
+                    unescaped.push_str(&slice[field_end..i]);
+                }
+                i += 1;
+                field_end = i;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\n' {
+            let end_unquoted = if i > field_start && bytes[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            let raw = if quoted_field {
+                if had_escaped_quote {
+                    unescaped.as_str()
+                } else {
+                    &slice[field_start..field_end]
+                }
+            } else if had_escaped_quote {
+                unescaped.push_str(&slice[field_end..end_unquoted]);
+                unescaped.as_str()
+            } else {
+                &slice[field_start..end_unquoted]
+            };
+            let ci = row_cells.len();
+            if ci == 0 {
+                first_was_quoted = quoted_field;
+                first_raw_ws_only = !quoted_field && raw.trim().is_empty();
+            }
+            finish_field(raw, quoted_field, ci, ri, &mut row_cells);
+            flush_row(&mut ri, first_was_quoted, first_raw_ws_only, &mut row_cells)?;
+            quoted_field = false;
+            had_escaped_quote = false;
+            closed = false;
+            first_was_quoted = false;
+            first_raw_ws_only = true;
+            line += 1;
+            i += 1;
+            field_start = i;
+            field_end = i;
+            continue;
+        }
+        i += 1;
+    }
+    if in_quotes {
+        return Err(format!("第 {line} 行：引号没有闭合"));
+    }
+    if field_start < bytes.len() || quoted_field || !row_cells.is_empty() {
+        let end_unquoted = if bytes.ends_with(b"\r") {
+            bytes.len() - 1
+        } else {
+            bytes.len()
+        };
+        let raw = if quoted_field {
+            if had_escaped_quote {
+                unescaped.as_str()
+            } else {
+                &slice[field_start..field_end]
+            }
+        } else if had_escaped_quote {
+            unescaped.push_str(&slice[field_end..end_unquoted]);
+            unescaped.as_str()
+        } else {
+            &slice[field_start..end_unquoted]
+        };
+        let ci = row_cells.len();
+        if ci == 0 {
+            first_was_quoted = quoted_field;
+            first_raw_ws_only = !quoted_field && raw.trim().is_empty();
+        }
+        finish_field(raw, quoted_field, ci, ri, &mut row_cells);
+        flush_row(&mut ri, first_was_quoted, first_raw_ws_only, &mut row_cells)?;
+    }
+
+    Ok((ri - start_row, max_cols, col_batches, keys))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn import_csv_str_parallel(
+    sheet: &mut Sheet,
+    text: &str,
+    delim: char,
+    quote: char,
+    header: bool,
+    text_cols: &[u32],
+    old: (u32, u32),
+    at: (u32, u32),
+    keep_going: &(dyn Fn() -> bool + Sync),
+) -> Result<(u32, u32, Vec<(u32, u32)>), String> {
+    if !delim.is_ascii()
+        || !quote.is_ascii()
+        || delim == '\r'
+        || delim == '\n'
+        || quote == '\r'
+        || quote == '\n'
+    {
+        let records = crate::csv::records_strict_while(text, delim, quote, || keep_going())?;
+        let mut keys = Vec::new();
+        let (rows, cols) = visit_csv_records(records, header, text_cols, old, at, |r, c, cell| {
+            if keys.len() % 1024 == 0 && !keep_going() {
+                return Err(String::from("已取消"));
+            }
+            keys.push((r, c));
+            sheet.set(r, c, cell);
+            Ok(())
+        })?;
+        return Ok((rows, cols, keys));
+    }
+
+    let mut mask = vec![false; 256];
+    let mut extra = Vec::new();
+    for &c in text_cols {
+        if (c as usize) < mask.len() {
+            mask[c as usize] = true;
+        } else {
+            extra.push(c);
+        }
+    }
+
+    let workers = if text.len() >= 512 * 1024 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(8)
+    } else {
+        1
+    };
+
+    let chunks = if workers > 1 {
+        crate::csv::partition_csv_chunks(text, delim, quote, workers)
+            .unwrap_or_else(|| vec![(0, text.len(), 0)])
+    } else if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![(0, text.len(), 0)]
+    };
+
+    let chunk_results: Vec<Result<(usize, u32, Vec<Vec<(u32, Cell)>>, Vec<(u32, u32)>), String>> =
+        if chunks.len() <= 1 {
+            chunks
+                .into_iter()
+                .map(|(s, e, r0)| {
+                    parse_csv_slice_chunk(
+                        &text[s..e],
+                        r0,
+                        delim,
+                        quote,
+                        header,
+                        &mask,
+                        &extra,
+                        at,
+                        keep_going,
+                    )
+                })
+                .collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|&(s, e, r0)| {
+                        let mask_ref = &mask;
+                        let extra_ref = &extra;
+                        scope.spawn(move || {
+                            parse_csv_slice_chunk(
+                                &text[s..e],
+                                r0,
+                                delim,
+                                quote,
+                                header,
+                                mask_ref,
+                                extra_ref,
+                                at,
+                                keep_going,
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        };
+
+    let mut total_rows = 0u32;
+    let mut max_cols = 0u32;
+    let mut total_keys = 0usize;
+    let mut unpacked = Vec::with_capacity(chunk_results.len());
+    for res in chunk_results {
+        let (rc, mc, batches, k) = res?;
+        total_rows = total_rows.saturating_add(rc as u32);
+        max_cols = max_cols.max(mc);
+        total_keys += k.len();
+        unpacked.push((batches, k));
+    }
+
+    let mut all_keys = Vec::with_capacity(total_keys);
+    for r in 0..old.0 {
+        for c in (if r >= total_rows { 0 } else { max_cols.min(old.1) })..old.1 {
+            sheet.set(at.0 + r, at.1 + c, Cell::default());
+            all_keys.push((at.0 + r, at.1 + c));
+        }
+    }
+
+    if old.0 > 0 {
+        let mut row_lens = vec![0u32; (total_rows.min(old.0)) as usize];
+        for (batches, _) in &unpacked {
+            for (ci, col_vec) in batches.iter().enumerate() {
+                for &(r_abs, _) in col_vec {
+                    let rel_r = (r_abs - at.0) as usize;
+                    if rel_r < row_lens.len() {
+                        row_lens[rel_r] = row_lens[rel_r].max((ci + 1) as u32);
+                    }
+                }
+            }
+        }
+        for (ri, &rlen) in row_lens.iter().enumerate() {
+            for ci in rlen..max_cols.min(old.1) {
+                sheet.set(at.0 + ri as u32, at.1 + ci, Cell::default());
+                all_keys.push((at.0 + ri as u32, at.1 + ci));
+            }
+        }
+    }
+
+    for ci in 0..(max_cols as usize) {
+        if !keep_going() {
+            return Err("已取消".into());
+        }
+        let c_abs = at.1 + ci as u32;
+        for (batches, _) in &mut unpacked {
+            if let Some(col_vec) = batches.get_mut(ci) {
+                for (r_abs, cell) in col_vec.drain(..) {
+                    sheet.set(r_abs, c_abs, cell);
+                }
+            }
+        }
+    }
+
+    for (_, mut k) in unpacked {
+        all_keys.append(&mut k);
+    }
+
+    Ok((total_rows, max_cols, all_keys))
 }
 
 /// Apply fully validated CSV records, including the shorter rows of a refreshed source.
@@ -812,10 +1298,8 @@ fn parse_field(f: &str) -> Cell {
     if t.is_empty() {
         return Cell::default();
     }
-    if let Ok(n) = t.parse::<f64>() {
-        if t.chars().all(|c| c.is_ascii_digit() || "+-.eE".contains(c)) {
-            return Cell { value: Value::Number(n), formula: None };
-        }
+    if let Some(n) = fast_parse_csv_number(t) {
+        return Cell { value: Value::Number(n), formula: None };
     }
     Cell { value: Value::Text(t.into()), formula: None }
 }

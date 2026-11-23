@@ -73,17 +73,19 @@ fn rk_value(rk: u32) -> f64 {
 /// Excel/WPS 会把该记录写在工作表 BOF 之后；本函数按记录流顺序扫描，不要求
 /// 它出现在全局流里。
 pub fn read_calc_manual(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else { return false };
-    let Ok(cf) = crate::cfb::Compound::open(bytes) else { return false };
-    let Some(stream) = cf.stream_by_path("Workbook").or_else(|| cf.stream_by_path("Book")) else {
+    let Some(stream) = crate::cfb::read_workbook_stream_file(path) else {
         return false;
     };
+    read_calc_manual_stream(&stream)
+}
+
+pub fn read_calc_manual_stream(stream: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 4 <= stream.len() {
-        let t = u16le(&stream, i).unwrap();
-        let l = u16le(&stream, i + 2).unwrap() as usize;
+        let t = u16le(stream, i).unwrap();
+        let l = u16le(stream, i + 2).unwrap() as usize;
         if t == CALCMODE && l >= 2 {
-            return u16le(&stream, i + 4) == Some(0);
+            return u16le(stream, i + 4) == Some(0);
         }
         let n = (i + 4 + l).min(stream.len());
         if n <= i {
@@ -376,15 +378,22 @@ fn parse_sst(stream: &[u8], start: usize, len: usize) -> Vec<String> {
 
 /// 读一个 .xls 文件（CFB → Workbook 流 → BIFF）
 pub fn load(path: &Path) -> Result<Workbook> {
-    let bytes = std::fs::read(path)?;
-    let cf = crate::cfb::Compound::open(bytes)?;
-    let stream = cf
-        .stream_by_path("Workbook")
-        .or_else(|| cf.stream_by_path("Book"))
-        .ok_or_else(|| anyhow::anyhow!("没有 Workbook 流"))?;
-    let parsed = read_stream(&stream)?;
-    let date1904 = read_date1904(&stream);
-    let calc_manual = read_calc_manual(path);
+    let stream = if let Some(s) = crate::cfb::read_workbook_stream_file(path) {
+        s
+    } else {
+        let bytes = std::fs::read(path)?;
+        let cf = crate::cfb::Compound::open(bytes)?;
+        cf.stream_by_path("Workbook")
+            .or_else(|| cf.stream_by_path("Book"))
+            .ok_or_else(|| anyhow::anyhow!("没有 Workbook 流"))?
+    };
+    load_from_stream(path, &stream)
+}
+
+pub fn load_from_stream(path: &Path, stream: &[u8]) -> Result<Workbook> {
+    let parsed = read_stream(stream)?;
+    let date1904 = read_date1904(stream);
+    let calc_manual = read_calc_manual_stream(stream);
 
     let mut wb = Workbook::new_blank();
     wb.calc_manual = calc_manual;
@@ -395,9 +404,12 @@ pub fn load(path: &Path) -> Result<Workbook> {
     wb.sheets.clear();
     for sd in parsed {
         let mut sh = Sheet::new(sd.name);
+        sh.loading = true;
         for (r, c, cell) in sd.cells {
             sh.set(r, c, cell);
         }
+        sh.loading = false;
+        sh.edited = false;
         sh.merges = sd.merges.into();
         sh.protection = sd.protection;
         wb.sheets.push(sh);

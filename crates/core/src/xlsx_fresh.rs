@@ -42,15 +42,254 @@ pub(super) fn supported(sheet: &Sheet) -> bool {
     })
 }
 
+const SST_PART: &str = "xl/sharedStrings.xml";
+const SST_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
+const SST_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml";
+
+#[inline]
+fn format_a1_buf(row: u32, col: u32, buf: &mut [u8; 16]) -> &str {
+    let mut c = col + 1;
+    let mut col_tmp = [0u8; 4];
+    let mut clen = 0usize;
+    while c > 0 {
+        let rem = ((c - 1) % 26) as u8;
+        col_tmp[clen] = b'A' + rem;
+        clen += 1;
+        c = (c - 1) / 26;
+    }
+    let mut pos = 0usize;
+    for i in (0..clen).rev() {
+        buf[pos] = col_tmp[i];
+        pos += 1;
+    }
+    let mut r = row + 1;
+    let mut row_tmp = [0u8; 10];
+    let mut rlen = 0usize;
+    while r > 0 {
+        row_tmp[rlen] = b'0' + (r % 10) as u8;
+        rlen += 1;
+        r /= 10;
+    }
+    for i in (0..rlen).rev() {
+        buf[pos] = row_tmp[i];
+        pos += 1;
+    }
+    // SAFETY: only ASCII uppercase letters and digits were written.
+    unsafe { std::str::from_utf8_unchecked(&buf[..pos]) }
+}
+
+fn declare_sst(xml: &mut String, part: &str) -> Result<()> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let root = doc.root_element();
+    let (closing, record) = if part == super::dynamic::RELS {
+        if root.children().any(|r| r.attribute("Type") == Some(SST_REL)) {
+            return Ok(());
+        }
+        let mut n = 1usize;
+        let id = loop {
+            let candidate = format!("rId{n}");
+            if !root.children().any(|r| r.attribute("Id") == Some(&candidate)) {
+                break candidate;
+            }
+            n += 1;
+        };
+        (
+            "</Relationships>",
+            format!("<Relationship Id=\"{id}\" Type=\"{SST_REL}\" Target=\"sharedStrings.xml\"/>"),
+        )
+    } else {
+        if root
+            .children()
+            .any(|r| r.attribute("PartName") == Some("/xl/sharedStrings.xml"))
+        {
+            return Ok(());
+        }
+        (
+            "</Types>",
+            format!("<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"{SST_CONTENT_TYPE}\"/>"),
+        )
+    };
+    let index = xml[..root.range().end]
+        .rfind(closing)
+        .context("共享字符串清单无效")?;
+    xml.insert_str(index, &record);
+    Ok(())
+}
+
+struct FreshSst<'a> {
+    indices: HashMap<&'a str, u32>,
+    xml: Vec<u8>,
+    existed_in_zip: bool,
+}
+
+impl<'a> FreshSst<'a> {
+    fn build(zip: &mut ZipArchive<File>, ordered_sheets: &[(&str, &'a Sheet)]) -> Result<Option<Self>> {
+        let mut counts: HashMap<&'a str, u32> = HashMap::new();
+        let mut repeated_in_order: Vec<&'a str> = Vec::new();
+        for &(_, sheet) in ordered_sheets {
+            for (key, cell) in sheet.iter() {
+                if sheet.spilled.contains(&key) || cell.formula.is_some() {
+                    continue;
+                }
+                if sheet
+                    .rich
+                    .get(&(key.row, key.col))
+                    .is_some_and(|runs| !runs.is_empty())
+                {
+                    continue;
+                }
+                if let Value::Text(s) = &cell.value {
+                    let text: &str = s.as_ref();
+                    let entry = counts.entry(text).or_insert(0);
+                    *entry += 1;
+                    if *entry == 2 {
+                        repeated_in_order.push(text);
+                    }
+                }
+            }
+        }
+        if repeated_in_order.is_empty() {
+            return Ok(None);
+        }
+
+        let existed_in_zip = zip.index_for_name(SST_PART).is_some();
+        let mut xml = String::new();
+        let mut next_idx: u32 = 0;
+        if existed_in_zip {
+            let existing = super::read_zip_text(zip, SST_PART)?;
+            let doc = roxmltree::Document::parse(&existing)?;
+            let root = doc.root_element();
+            ensure!(root.tag_name().name() == "sst", "共享字符串根节点无效");
+            next_idx = u32::try_from(
+                root.children()
+                    .filter(|n| n.is_element() && n.tag_name().name() == "si")
+                    .count(),
+            )?;
+            let mut reader = quick_xml::Reader::from_str(&existing);
+            let mut buf = Vec::new();
+            let (root_end, empty_root, clean_open) = loop {
+                buf.clear();
+                let ev = reader.read_event_into(&mut buf)?;
+                match ev {
+                    quick_xml::events::Event::Start(ref e) | quick_xml::events::Event::Empty(ref e)
+                        if e.local_name().as_ref() == "sst" =>
+                    {
+                        let empty_root = matches!(ev, quick_xml::events::Event::Empty(_));
+                        let root_end = reader.buffer_position() as usize;
+                        let mut tag = quick_xml::events::BytesStart::new(e.name().as_ref().to_owned());
+                        for a in e.attributes() {
+                            let a = a?;
+                            if !matches!(a.key.as_ref(), "count" | "uniqueCount") {
+                                tag.push_attribute(a);
+                            }
+                        }
+                        let mut w = quick_xml::Writer::new(Vec::new());
+                        w.write_event(quick_xml::events::Event::Start(tag))?;
+                        break (root_end, empty_root, String::from_utf8(w.into_inner())?);
+                    }
+                    quick_xml::events::Event::Eof => anyhow::bail!("共享字符串缺少根标签"),
+                    _ => {}
+                }
+            };
+            xml.reserve(existing.len() + repeated_in_order.len() * 32);
+            xml.push_str(&clean_open);
+            if !empty_root {
+                let close_pos = existing[..root.range().end]
+                    .rfind("</")
+                    .context("共享字符串缺少闭合标签")?;
+                xml.push_str(&existing[root_end..close_pos]);
+            }
+        } else {
+            xml.reserve(160 + repeated_in_order.len() * 32);
+            xml.push_str(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
+            );
+        }
+
+        let mut indices = HashMap::with_capacity(repeated_in_order.len());
+        for s in repeated_in_order {
+            let idx = next_idx;
+            next_idx = next_idx.checked_add(1).context("共享字符串索引溢出")?;
+            indices.insert(s, idx);
+            let preserve = s.starts_with(char::is_whitespace)
+                || s.ends_with(char::is_whitespace)
+                || s.bytes().any(|b| matches!(b, b'\t' | b'\r' | b'\n'));
+            if preserve {
+                xml.push_str("<si><t xml:space=\"preserve\">");
+            } else {
+                xml.push_str("<si><t>");
+            }
+            xml.push_str(&quick_xml::escape::escape(s));
+            xml.push_str("</t></si>");
+        }
+        xml.push_str("</sst>");
+        Ok(Some(Self {
+            indices,
+            xml: xml.into_bytes(),
+            existed_in_zip,
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_value(
     out: &mut impl Write,
     sheet: &Sheet,
     arrays: &HashMap<CellRef, (u32, u32, u32, u32)>,
+    sst: Option<&HashMap<&str, u32>>,
     key: CellRef,
     cell: &Cell,
     xf: Option<u16>,
 ) -> Result<()> {
-    let reference = crate::model::cell_name(key.row, key.col);
+    let mut a1_buf = [0u8; 16];
+    let reference = format_a1_buf(key.row, key.col, &mut a1_buf);
+    let runs = sheet.rich.get(&(key.row, key.col)).map(Vec::as_slice);
+    let has_runs = runs.is_some_and(|r| !r.is_empty());
+
+    // Zero-allocation fast path for ordinary scalar numbers, booleans, blanks, and repeated SST strings.
+    if cell.formula.is_none() && !has_runs && !sheet.spill_shapes.contains_key(&key) {
+        match &cell.value {
+            Value::Empty => {
+                if let Some(xf) = xf {
+                    write!(out, "<c r=\"{reference}\" s=\"{xf}\"/>")?;
+                }
+                return Ok(());
+            }
+            Value::Number(n) if n.is_finite() => {
+                let n = if *n == 0.0 { 0.0 } else { *n };
+                if let Some(xf) = xf {
+                    write!(out, "<c r=\"{reference}\" s=\"{xf}\"><v>{n}</v></c>")?;
+                } else {
+                    write!(out, "<c r=\"{reference}\"><v>{n}</v></c>")?;
+                }
+                return Ok(());
+            }
+            Value::Bool(b) => {
+                let v = u8::from(*b);
+                if let Some(xf) = xf {
+                    write!(out, "<c r=\"{reference}\" s=\"{xf}\" t=\"b\"><v>{v}</v></c>")?;
+                } else {
+                    write!(out, "<c r=\"{reference}\" t=\"b\"><v>{v}</v></c>")?;
+                }
+                return Ok(());
+            }
+            Value::Text(s) => {
+                let text: &str = s.as_ref();
+                if let Some(&sst_idx) = sst.and_then(|m| m.get(text)) {
+                    if let Some(xf) = xf {
+                        write!(out, "<c r=\"{reference}\" s=\"{xf}\" t=\"s\"><v>{sst_idx}</v></c>")?;
+                    } else {
+                        write!(out, "<c r=\"{reference}\" t=\"s\"><v>{sst_idx}</v></c>")?;
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut start = format!("<c r=\"{reference}\"");
     if let Some(xf) = xf {
         start.push_str(&format!(" s=\"{xf}\""));
@@ -104,7 +343,7 @@ fn write_value(
             start,
             cell,
             definition.as_deref(),
-            sheet.rich.get(&(key.row, key.col)).map(Vec::as_slice),
+            runs,
         )
         .context("无效的工作表单元格")?
     };
@@ -112,10 +351,15 @@ fn write_value(
     Ok(())
 }
 
-fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
+fn write_sheet(
+    out: impl Write,
+    shell: &str,
+    sheet: &Sheet,
+    sst: Option<&HashMap<&str, u32>>,
+) -> Result<()> {
     // Only the sparse, freshly generated template is parsed. Values are merged
     // from the ordered model iterator without materializing a second cell store.
-    let doc = roxmltree::Document::parse(&shell)?;
+    let doc = roxmltree::Document::parse(shell)?;
     let root = doc.root_element();
     let namespace = root.tag_name().namespace().context("新建工作表缺少命名空间")?;
     let dimension = root.children().find(|n| n.has_tag_name((namespace, "dimension")))
@@ -159,7 +403,7 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
     let first = crate::model::cell_name(top, left);
     let end = crate::model::cell_name(bottom, right);
     let reference = if first == end { first } else { format!("{first}:{end}") };
-    let mut out = BufWriter::new(out);
+    let mut out = BufWriter::with_capacity(256 * 1024, out);
     let dim = dimension.range_value();
     write!(out, "{}{reference}{}<sheetData>", &shell[..dim.start], &shell[dim.end..data.range().start])?;
 
@@ -202,19 +446,19 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
                 .context("无效的模板单元格")?;
             ensure!(sr == r, "模板单元格行号不一致");
             while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col < sc) {
-                write_value(&mut out, sheet, &arrays, key, cell, xf_for(key)?)?;
+                write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key)?)?;
             }
             if let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col == sc) {
                 let xf = stub.attribute("s").map(str::parse::<u16>).transpose()?;
-                write_value(&mut out, sheet, &arrays, key, cell, xf.or(xf_for(key)?))?;
+                write_value(&mut out, sheet, &arrays, sst, key, cell, xf.or(xf_for(key)?))?;
             } else if stub.attribute("s").is_none() && sheet.explicit_style_of(sr, sc) == Some(0) {
-                write_value(&mut out, sheet, &arrays, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
+                write_value(&mut out, sheet, &arrays, sst, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
             } else {
                 out.write_all(shell[stub.range()].as_bytes())?;
             }
         }
         while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r) {
-            write_value(&mut out, sheet, &arrays, key, cell, xf_for(key)?)?;
+            write_value(&mut out, sheet, &arrays, sst, key, cell, xf_for(key)?)?;
         }
         out.write_all(b"</row>")?;
     }
@@ -231,6 +475,7 @@ pub(super) fn has_dynamic(sheet: &Sheet) -> bool {
 
 pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
+    let mut ordered_sheets: Vec<(&str, &Sheet)> = Vec::new();
     let mut sheets = HashMap::new();
     for (sheet, &streamed) in wb.sheets.iter().zip(selected) {
         if streamed {
@@ -239,40 +484,131 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
                 sheets.insert(part.as_str(), sheet).is_none(),
                 "工作表部件重复"
             );
+            ordered_sheets.push((part.as_str(), sheet));
         }
     }
     let mut zip = ZipArchive::new(File::open(path)?)?;
-    let dynamic = sheets.values().any(|s| {
-        has_dynamic(s)
-    });
+    let dynamic = sheets.values().any(|s| has_dynamic(s));
     ensure!(!dynamic || zip.index_for_name(super::dynamic::PART).is_none(),"新建模板的元数据部件已占用");
+    let fresh_sst = FreshSst::build(&mut zip, &ordered_sheets)?;
+    let need_sst_decl = fresh_sst.as_ref().is_some_and(|s| !s.existed_in_zip);
+    let sst_map = fresh_sst.as_ref().map(|s| &s.indices);
+
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+
+    // Pre-compress multiple streamed worksheets across cores into single-entry temp ZIPs,
+    // then splice via O(1) `raw_copy_file`.
+    let mut parallel_parts: HashMap<String, tempfile::TempPath> = HashMap::new();
+    if ordered_sheets.len() >= 2 {
+        let mut jobs: Vec<(String, String, &Sheet)> = Vec::with_capacity(ordered_sheets.len());
+        for &(part, sheet) in &ordered_sheets {
+            let shell = super::read_zip_text(&mut zip, part)?;
+            jobs.push((part.to_owned(), shell, sheet));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(8)
+            .min(jobs.len());
+        let next_job = std::sync::atomic::AtomicUsize::new(0);
+        let results: std::sync::Mutex<Vec<Result<(String, tempfile::TempPath)>>> =
+            std::sync::Mutex::new(Vec::with_capacity(jobs.len()));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let jobs_ref = &jobs;
+                let next_ref = &next_job;
+                let res_ref = &results;
+                scope.spawn(move || {
+                    loop {
+                        let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((part, shell, sheet)) = jobs_ref.get(idx) else {
+                            break;
+                        };
+                        let one = (|| -> Result<(String, tempfile::TempPath)> {
+                            let (f, tp) = tempfile::NamedTempFile::new_in(dir)?.into_parts();
+                            let mut zw = ZipWriter::new(BufWriter::with_capacity(128 * 1024, f));
+                            zw.start_file(
+                                part.as_str(),
+                                SimpleFileOptions::default()
+                                    .compression_method(CompressionMethod::Deflated)
+                                    .compression_level(Some(2)),
+                            )?;
+                            write_sheet(&mut zw, shell, sheet, sst_map)?;
+                            zw.finish()?.flush()?;
+                            Ok((part.clone(), tp))
+                        })();
+                        res_ref.lock().unwrap().push(one);
+                    }
+                });
+            }
+        });
+        for item in results.into_inner().unwrap() {
+            let (part, tp) = item?;
+            parallel_parts.insert(part, tp);
+        }
+    }
+
     let (file, temp) = tempfile::NamedTempFile::new_in(dir)?.into_parts();
-    let mut out = ZipWriter::new(BufWriter::new(file));
+    let mut out = ZipWriter::new(BufWriter::with_capacity(256 * 1024, file));
     for i in 0..zip.len() {
         let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
         if let Some(sheet) = sheets.remove(part.as_str()) {
-            let shell = super::read_zip_text(&mut zip, &part)?;
+            if let Some(tp) = parallel_parts.remove(&part) {
+                let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
+                out.raw_copy_file(part_zip.by_index_raw(0)?)?;
+            } else {
+                let shell = super::read_zip_text(&mut zip, &part)?;
+                out.start_file(
+                    part,
+                    SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Deflated)
+                        .compression_level(Some(2)),
+                )?;
+                write_sheet(&mut out, &shell, sheet, sst_map)?;
+            }
+        } else if part == SST_PART && fresh_sst.is_some() {
+            let sst = fresh_sst.as_ref().unwrap();
             out.start_file(
-                part,
+                SST_PART,
                 SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Deflated)
-                    .compression_level(Some(4)),
+                    .compression_level(Some(2)),
             )?;
-            write_sheet(&mut out, shell, sheet)?;
-        } else if dynamic && matches!(part.as_str(), super::dynamic::RELS | super::dynamic::TYPES) {
-            let mut xml = super::read_zip_text(&mut zip,&part)?;
-            super::dynamic::declare(&mut xml,&part)?;
-            out.start_file(part,SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))?;
+            out.write_all(&sst.xml)?;
+        } else if (dynamic || need_sst_decl)
+            && matches!(part.as_str(), super::dynamic::RELS | super::dynamic::TYPES)
+        {
+            let mut xml = super::read_zip_text(&mut zip, &part)?;
+            if dynamic {
+                super::dynamic::declare(&mut xml, &part)?;
+            }
+            if need_sst_decl {
+                declare_sst(&mut xml, &part)?;
+            }
+            out.start_file(
+                part,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )?;
             out.write_all(xml.as_bytes())?;
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
     ensure!(sheets.is_empty(), "缺少流式工作表部件");
+    if let Some(sst) = &fresh_sst {
+        if !sst.existed_in_zip {
+            out.start_file(
+                SST_PART,
+                SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated)
+                    .compression_level(Some(2)),
+            )?;
+            out.write_all(&sst.xml)?;
+        }
+    }
     if dynamic {
         out.start_file(super::dynamic::PART,SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))?;
         out.write_all(super::dynamic::METADATA.as_bytes())?;
@@ -642,5 +978,64 @@ mod tests {
             crate::xlsx::load(&path).unwrap().sheets[0].get(16_383, 2),
             Some(&formula)
         );
+    }
+
+    #[test]
+    fn parallel_multisheet_fresh_save_deduplicates_repeated_strings_into_sst() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multisheet-sst.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "DeptA".into();
+        let mut s2 = Sheet::new("DeptB");
+        for r in 0..16_384 {
+            wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(if r % 2 == 0 { "研发部 ".into() } else { "财务部<&>".into() }),
+                    formula: None,
+                },
+            );
+            s2.set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(if r % 3 == 0 { "研发部 ".into() } else { "运营部".into() }),
+                    formula: None,
+                },
+            );
+        }
+        wb.sheets[0].set(
+            0,
+            1,
+            Cell {
+                value: Value::Text("唯一字符串".into()),
+                formula: None,
+            },
+        );
+        let mut dom_sibling = Sheet::new("SmallDom");
+        dom_sibling.set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("DOM专属字符串".into()),
+                formula: None,
+            },
+        );
+        wb.sheets.push(s2);
+        wb.sheets.push(dom_sibling);
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+
+        let targets = crate::patch::sheet_targets(&path).unwrap();
+        let xml_a = String::from_utf8(crate::fixups::read_part_file(&path, &targets["DeptA"]).unwrap()).unwrap();
+        assert!(xml_a.contains("t=\"s\""), "repeated strings must use SST");
+        assert!(xml_a.contains("t=\"inlineStr\""), "1-off unique string stays inline");
+
+        let reopened = crate::xlsx::load(&path).unwrap();
+        assert_eq!(reopened.sheets[0].value(0, 0), Value::Text("研发部 ".into()));
+        assert_eq!(reopened.sheets[0].value(1, 0), Value::Text("财务部<&>".into()));
+        assert_eq!(reopened.sheets[0].value(0, 1), Value::Text("唯一字符串".into()));
+        assert_eq!(reopened.sheets[1].value(1, 0), Value::Text("运营部".into()));
+        assert_eq!(reopened.sheets[2].value(0, 0), Value::Text("DOM专属字符串".into()));
     }
 }

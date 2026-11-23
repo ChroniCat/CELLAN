@@ -212,3 +212,279 @@ fn read_chain(data: &[u8], sector_size: usize, fat: &[u32], start: u32) -> Vec<u
     }
     out
 }
+
+fn read_sector_at(
+    f: &mut std::fs::File,
+    file_len: u64,
+    sector_size: usize,
+    sid: u32,
+    buf: &mut [u8],
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(off) = (sid as u64).checked_add(1).and_then(|n| n.checked_mul(sector_size as u64)) else {
+        return false;
+    };
+    if off + sector_size as u64 > file_len {
+        return false;
+    }
+    f.seek(SeekFrom::Start(off)).is_ok() && f.read_exact(&mut buf[..sector_size]).is_ok()
+}
+
+fn read_difat_sectors(
+    f: &mut std::fs::File,
+    file_len: u64,
+    sector_size: usize,
+    head: &[u8; 512],
+) -> Result<Vec<u32>, ()> {
+    let difat_start = u32le(head, 68);
+    let n_difat = u32le(head, 72) as usize;
+    let mut difat = Vec::with_capacity(109 + n_difat * (sector_size / 4));
+    for i in 0..109 {
+        let v = u32le(head, 76 + i * 4);
+        if v == FREE {
+            break;
+        }
+        difat.push(v);
+    }
+    let mut next = difat_start;
+    let mut sec_buf = vec![0u8; sector_size];
+    let n = (sector_size / 4) - 1;
+    for _ in 0..n_difat.min(16_384) {
+        if next == FREE || next == END {
+            break;
+        }
+        if !read_sector_at(f, file_len, sector_size, next, &mut sec_buf) {
+            return Err(());
+        }
+        for i in 0..n {
+            let v = u32le(&sec_buf, i * 4);
+            if v != FREE {
+                difat.push(v);
+            }
+        }
+        next = u32le(&sec_buf, n * 4);
+    }
+    Ok(difat)
+}
+
+/// 按需跳转只读 CFB 头与目录扇区（~1.5KB），判断是否存在 `EncryptedPackage` 流，
+/// 避免打开 200MB `.xls` 时全盘逐兆字节扫描。仅在小型损坏/合成桩文件上回退字节扫描。
+pub fn has_encrypted_package_file(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    let file_len = meta.len();
+    if file_len < 8 {
+        return false;
+    }
+    let check_dir = |f: &mut std::fs::File| -> Result<bool, ()> {
+        if file_len < 512 {
+            return Err(());
+        }
+        let mut head = [0u8; 512];
+        f.read_exact(&mut head).map_err(|_| ())?;
+        if head[0..8] != SIGNATURE {
+            return Ok(false);
+        }
+        let sector_shift = u16le(&head, 30) as usize;
+        if sector_shift != 9 && sector_shift != 12 {
+            return Err(());
+        }
+        let sector_size = 1usize << sector_shift;
+        let dir_start = u32le(&head, 48);
+        if dir_start == FREE || dir_start == END {
+            return Err(());
+        }
+        let difat = read_difat_sectors(f, file_len, sector_size, &head)?;
+        let per_fat = sector_size / 4;
+        let mut fat_cache: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut sec_buf = vec![0u8; sector_size];
+        let mut dir_buf = vec![0u8; sector_size];
+        let mut cur = dir_start;
+        let mut guard = 0usize;
+        while cur != END && cur != FREE {
+            if guard >= 65_536 || !read_sector_at(f, file_len, sector_size, cur, &mut dir_buf) {
+                return Err(());
+            }
+            for i in 0..(sector_size / 128) {
+                let b = &dir_buf[i * 128..(i + 1) * 128];
+                let name_len = u16le(b, 64) as usize;
+                let kind = b[66];
+                if kind != 0 && (2..=64).contains(&name_len) {
+                    let chars = name_len / 2 - 1;
+                    if chars == "EncryptedPackage".len() {
+                        let matched = "EncryptedPackage"
+                            .bytes()
+                            .enumerate()
+                            .all(|(k, ch)| {
+                                let u = u16le(b, k * 2);
+                                u <= 0x7F && (u as u8).eq_ignore_ascii_case(&ch)
+                            });
+                        if matched {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            let fat_idx = (cur as usize) / per_fat;
+            let fat_off = (cur as usize) % per_fat;
+            let fat_sec = if let Some(v) = fat_cache.get(&fat_idx) {
+                v
+            } else {
+                let &fat_sid = difat.get(fat_idx).ok_or(())?;
+                if !read_sector_at(f, file_len, sector_size, fat_sid, &mut sec_buf) {
+                    return Err(());
+                }
+                let words: Vec<u32> = (0..per_fat).map(|k| u32le(&sec_buf, k * 4)).collect();
+                fat_cache.entry(fat_idx).or_insert(words)
+            };
+            cur = fat_sec[fat_off];
+            guard += 1;
+        }
+        Ok(false)
+    };
+
+    match check_dir(&mut f) {
+        Ok(ans) => ans,
+        Err(()) => {
+            if file_len > 64 * 1024 || f.seek(SeekFrom::Start(0)).is_err() {
+                return false;
+            }
+            let mut raw = Vec::with_capacity(file_len as usize);
+            if f.read_to_end(&mut raw).is_err() || raw.len() < 8 || raw[0..8] != SIGNATURE {
+                return false;
+            }
+            const NEEDLE: [u8; 32] = [
+                b'E', 0, b'n', 0, b'c', 0, b'r', 0, b'y', 0, b'p', 0, b't', 0, b'e', 0,
+                b'd', 0, b'P', 0, b'a', 0, b'c', 0, b'k', 0, b'a', 0, b'g', 0, b'e', 0,
+            ];
+            raw.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+        }
+    }
+}
+
+/// 按扇区链直接从文件流式读取 `Workbook`（或 `Book`）流，避免先把整个 `.xls` 读入内存再拷贝一份。
+pub fn read_workbook_stream_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    if file_len < 512 {
+        return None;
+    }
+    let mut head = [0u8; 512];
+    f.read_exact(&mut head).ok()?;
+    if head[0..8] != SIGNATURE {
+        return None;
+    }
+    let sector_shift = u16le(&head, 30) as usize;
+    let mini_shift = u16le(&head, 32) as usize;
+    if (sector_shift != 9 && sector_shift != 12) || mini_shift > sector_shift {
+        return None;
+    }
+    let sector_size = 1usize << sector_shift;
+    let mini_size = 1usize << mini_shift;
+    let n_fat = u32le(&head, 44) as usize;
+    let dir_start = u32le(&head, 48);
+    let mini_cutoff = u32le(&head, 56);
+    let minifat_start = u32le(&head, 60);
+    let n_minifat = u32le(&head, 64) as usize;
+
+    let difat = read_difat_sectors(&mut f, file_len, sector_size, &head).ok()?;
+    let per_fat = sector_size / 4;
+    let mut fat = Vec::with_capacity(difat.len() * per_fat);
+    let mut sec_buf = vec![0u8; sector_size];
+    for &s in difat.iter().take(n_fat.max(difat.len())) {
+        if !read_sector_at(&mut f, file_len, sector_size, s, &mut sec_buf) {
+            continue;
+        }
+        for i in 0..per_fat {
+            fat.push(u32le(&sec_buf, i * 4));
+        }
+    }
+
+    let read_file_chain = |f: &mut std::fs::File, start: u32, expected: Option<usize>| -> Vec<u8> {
+        let mut out = Vec::with_capacity(expected.unwrap_or(sector_size * 4));
+        let mut buf = vec![0u8; sector_size];
+        let mut cur = start;
+        let mut guard = 0usize;
+        while cur != END && cur != FREE && guard < 200_000 {
+            if let Some(lim) = expected {
+                if out.len() >= lim {
+                    break;
+                }
+            }
+            if !read_sector_at(f, file_len, sector_size, cur, &mut buf) {
+                break;
+            }
+            out.extend_from_slice(&buf);
+            cur = *fat.get(cur as usize).unwrap_or(&END);
+            guard += 1;
+        }
+        if let Some(lim) = expected {
+            out.truncate(lim);
+        }
+        out
+    };
+
+    let dir_bytes = read_file_chain(&mut f, dir_start, None);
+    let mut root_entry: Option<Entry> = None;
+    let mut wb_entry: Option<Entry> = None;
+    let mut book_entry: Option<Entry> = None;
+    for i in 0..(dir_bytes.len() / 128) {
+        let b = &dir_bytes[i * 128..(i + 1) * 128];
+        let name_len = u16le(b, 64) as usize;
+        if !(2..=64).contains(&name_len) {
+            continue;
+        }
+        let raw: Vec<u16> = (0..(name_len / 2 - 1)).map(|k| u16le(b, k * 2)).collect();
+        let name = String::from_utf16_lossy(&raw);
+        let kind = b[66];
+        let start = u32le(b, 116);
+        let size = if sector_shift == 12 {
+            u32le(b, 120) as u64 | ((u32le(b, 124) as u64) << 32)
+        } else {
+            u32le(b, 120) as u64
+        };
+        if kind == 5 && root_entry.is_none() {
+            root_entry = Some(Entry { name, kind, start, size });
+        } else if kind == 2 && name.eq_ignore_ascii_case("Workbook") && wb_entry.is_none() {
+            wb_entry = Some(Entry { name, kind, start, size });
+        } else if kind == 2 && name.eq_ignore_ascii_case("Book") && book_entry.is_none() {
+            book_entry = Some(Entry { name, kind, start, size });
+        }
+    }
+
+    let target = wb_entry.or(book_entry)?;
+    if target.size >= mini_cutoff as u64 {
+        Some(read_file_chain(&mut f, target.start, usize::try_from(target.size).ok()))
+    } else {
+        let root = root_entry?;
+        let mini_stream = read_file_chain(&mut f, root.start, None);
+        let mut minifat = Vec::new();
+        if n_minifat > 0 && minifat_start != FREE {
+            let mf = read_file_chain(&mut f, minifat_start, None);
+            for i in 0..(mf.len() / 4) {
+                minifat.push(u32le(&mf, i * 4));
+            }
+        }
+        let target_len = usize::try_from(target.size).ok()?;
+        let mut out = Vec::with_capacity(target_len);
+        let mut cur = target.start;
+        let mut guard = 0usize;
+        while cur != END && cur != FREE && out.len() < target_len && guard < 100_000 {
+            let base = cur as usize * mini_size;
+            if base + mini_size > mini_stream.len() {
+                break;
+            }
+            out.extend_from_slice(&mini_stream[base..base + mini_size]);
+            cur = *minifat.get(cur as usize).unwrap_or(&END);
+            guard += 1;
+        }
+        out.truncate(target_len);
+        Some(out)
+    }
+}

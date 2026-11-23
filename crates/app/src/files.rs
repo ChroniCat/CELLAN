@@ -541,7 +541,7 @@ impl FileTree {
             }
         } else {
             let ext = ext_of(path);
-            let editable = matches!(ext.as_str(), "xlsx" | "xlsm" | "xls" | "ods" | "csv");
+            let editable = matches!(ext.as_str(), "xlsx" | "xlsm" | "xls" | "ods" | "csv" | "tsv");
             if !editable {
                 return; // 文件树只列能打开的表
             }
@@ -714,7 +714,7 @@ fn file_icon(p: &egui::Painter, c: Pos2, ext: &str) {
     let (fill, ink, letter) = match ext {
         "xlsx" | "xlsm" => (Color32::from_rgb(33, 115, 70), Color32::WHITE, "X"),
         "xls" => (Color32::from_rgb(46, 125, 82), Color32::WHITE, "X"),
-        "csv" => (Color32::from_rgb(70, 110, 90), Color32::WHITE, "C"),
+        "csv" | "tsv" => (Color32::from_rgb(70, 110, 90), Color32::WHITE, "C"),
         _ => (Color32::from_rgb(120, 128, 140), Color32::WHITE, "?"),
     };
     let r = Rect::from_center_size(c, Vec2::new(13.0, 15.0));

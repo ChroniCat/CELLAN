@@ -135,14 +135,7 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
 
 /// 读一个 .xls 文件的行列尺寸；不是 CFB（也就是新格式）就返回 None
 pub fn read(path: &Path) -> Option<XlsSizes> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.starts_with(b"PK") || bytes.len() < 512 {
-        return None;
-    }
-    let c = crate::cfb::Compound::open(bytes).ok()?;
-    let stream = c
-        .stream_by_path("Workbook")
-        .or_else(|| c.stream_by_path("Book"))?;
+    let stream = crate::cfb::read_workbook_stream_file(path)?;
     Some(parse(&stream))
 }
 

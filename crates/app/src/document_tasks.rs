@@ -58,6 +58,10 @@ pub(crate) struct DocumentTasks {
     pub open_label: Option<String>,
     pub open_started: Option<Instant>,
     pub open_path: Option<PathBuf>,
+    /// 大文件快速解锁首屏后，异步补齐的磁盘 SHA-256 基准指纹
+    pub base_hash_rx: Option<Receiver<(PathBuf, String)>>,
+    /// 大表后台 PDF 导出通道
+    pub pdf_export: Option<Receiver<Result<(PathBuf, usize), String>>>,
 }
 
 pub(crate) struct PendingSave {
@@ -107,6 +111,78 @@ impl CalculatedSnapshot {
 }
 
 impl DocumentTasks {
+    pub fn start_pdf_export(
+        &mut self,
+        wb: Workbook,
+        sheet_idx: usize,
+        out_path: PathBuf,
+        regular: sheetcore::pdf::Font,
+        bold: Option<sheetcore::pdf::Font>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.pdf_export = Some(rx);
+        std::thread::spawn(move || {
+            let wb_path = wb.path.clone();
+            let res = sheetcore::print::export_pdf_pages_with_fonts(
+                &wb,
+                sheet_idx,
+                &out_path,
+                regular,
+                bold,
+                wb_path.as_deref(),
+                None,
+            )
+            .map(|n| (out_path, n))
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn poll_pdf_export(&mut self, status: &mut String, ctx: &egui::Context) {
+        let Some(rx) = self.pdf_export.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok((path, n))) => {
+                self.pdf_export = None;
+                *status = format!("已导出 {}", path.display());
+                eprintln!("[pdf] 已导出 {} 页 {}", n, path.display());
+                ctx.request_repaint();
+            }
+            Ok(Err(e)) => {
+                self.pdf_export = None;
+                *status = format!("导出失败：{e}");
+                eprintln!("[pdf] 导出失败 {e}");
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pdf_export = None;
+                *status = "导出失败：后台 PDF 导出线程异常中止".into();
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    pub fn poll_base_hash(&mut self, wb: &Workbook, wb_base_hash: &mut String) -> Option<String> {
+        let rx = self.base_hash_rx.as_ref()?;
+        match rx.try_recv() {
+            Ok((path, hash)) => {
+                self.base_hash_rx = None;
+                if !wb.dirty && wb.path.as_deref() == Some(path.as_path()) && !hash.is_empty() {
+                    *wb_base_hash = hash.clone();
+                    return Some(hash);
+                }
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.base_hash_rx = None;
+                None
+            }
+        }
+    }
+
     /// Save a quiet edit promptly, or snapshot an ongoing stream of committed edits.
     pub fn autosave_due(&mut self, wb: &Workbook, ctx: Option<&egui::Context>) -> bool {
         if !wb.dirty || wb.load_incomplete || wb.path.as_deref().is_none_or(|p| !sheetcore::xlsx::can_save_to(p)) {

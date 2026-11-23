@@ -1,7 +1,8 @@
 //! Stream source XML directly into the private output ZIP. Keep only the bytes
 //! of the current row so unedited markup can be copied with its original spelling.
 use super::{
-    Changes, StyleChanges, attr, expanded_tag, merge_edit, new_cell, row_edits, write_spans,
+    Changes, SharedFormulaState, StyleChanges, attr, expanded_tag, merge_edit, new_cell, row_edits,
+    write_spans,
 };
 use crate::{CellRef, Sheet, store::Store};
 use anyhow::{Context, Result};
@@ -231,26 +232,60 @@ fn rebind(xml: &str, from: &str, to: &str) -> Option<String> {
     Some(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn missing_rows(
     out: &mut impl Write,
     prefix: &str,
     before: u32,
     keys: &mut BTreeSet<CellRef>,
-    rows: &mut BTreeMap<u32,Option<u16>>,
+    rows: &mut BTreeMap<u32, Option<u16>>,
+    layout_rows: &mut BTreeMap<u32, crate::patch::layout_xml::Change>,
     sheet: &Sheet,
     base: &Store,
     styles: &StyleChanges,
+    shared_state: &SharedFormulaState,
 ) -> Result<bool> {
     loop {
-        let row = keys.first().map_or(u32::MAX, |k| k.row)
-            .min(rows.first_key_value().map_or(u32::MAX, |(&r,_)| r));
-        if row >= before { break; }
-        let style = rows.remove(&row).flatten();
-        if style.is_none() && keys.first().is_none_or(|k| k.row != row) { continue; }
-        write!(out, "<{prefix}row r=\"{}\"", row+1)?;
-        if let Some(xf) = style { write!(out," s=\"{xf}\" customFormat=\"1\"")?; }
+        let row = keys
+            .first()
+            .map_or(u32::MAX, |k| k.row)
+            .min(rows.first_key_value().map_or(u32::MAX, |(&r, _)| r))
+            .min(layout_rows.first_key_value().map_or(u32::MAX, |(&r, _)| r));
+        if row >= before {
+            break;
+        }
+        let style = rows.remove(&row);
+        let mut lchg = layout_rows.remove(&row);
+        if let Some(s) = style {
+            lchg.get_or_insert_with(Default::default).style = Some(s);
+        }
+        let has_cells = keys.first().is_some_and(|k| k.row == row);
+        if !has_cells {
+            if let Some(ch) = lchg {
+                if ch.needs_record() {
+                    let row_name = format!("{prefix}row");
+                    let rec = crate::patch::layout_xml::new_row_record(&row_name, row, &ch)?;
+                    out.write_all(rec.as_bytes())?;
+                }
+            }
+            continue;
+        }
+        let mut tag = format!("<{prefix}row r=\"{}\"/>", row + 1);
+        if let Some(ch) = lchg {
+            let Ok(updated) = crate::patch::layout_xml::update_row_tag(&tag, &ch) else {
+                return Ok(false);
+            };
+            tag = updated;
+        }
+        let Some(open) = tag.strip_suffix("/>") else {
+            return Ok(false);
+        };
+        out.write_all(open.as_bytes())?;
         out.write_all(b">")?;
         while let Some(k) = keys.first().copied().filter(|k| k.row == row) {
+            if shared_state.promote_master.contains_key(&k) || shared_state.unshare.contains(&k) {
+                return Ok(false);
+            }
             let Some(cell) = new_cell(k, sheet, base, styles) else {
                 return Ok(false);
             };
@@ -258,12 +293,61 @@ fn missing_rows(
                 out.write_all(cell.as_bytes())?;
             } else if let Some(tagged) = rebind(&cell, "", prefix) {
                 out.write_all(tagged.as_bytes())?;
-            } else { return Ok(false); }
+            } else {
+                return Ok(false);
+            }
             keys.pop_first();
         }
         write!(out, "</{prefix}row>")?;
     }
     Ok(true)
+}
+
+/// Fast-forward raw worksheet bytes from inside `<sheetData>` up through `</sheetData>`,
+/// writing everything through `</sheetData>` to `out` and appending the remaining suffix
+/// bytes after `</sheetData>` into `suffix_out`. Declines (`Ok(false)`) if comments/CDATA
+/// or non-canonical closing tags appear inside `<sheetData>`.
+fn fast_forward_sheet_data_end<R: Read>(
+    mut win: Window<R>,
+    out: &mut impl Write,
+    suffix_out: &mut Vec<u8>,
+) -> Result<bool> {
+    const NEEDLE: &[u8] = b"</sheetData>";
+    let mut carry = Vec::with_capacity(64);
+    carry.extend_from_slice(&win.bytes[win.first..]);
+    win.bytes.clear();
+    win.first = 0;
+
+    loop {
+        let chunk = win.input.fill_buf()?;
+        let eof = chunk.is_empty();
+        carry.extend_from_slice(chunk);
+        let consumed = chunk.len();
+        win.input.consume(consumed);
+
+        if carry.windows(4).any(|w| w == b"<!--" || w == b"<![C") {
+            return Ok(false);
+        }
+        if let Some(pos) = carry.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+            let end_sd = pos + NEEDLE.len();
+            out.write_all(&carry[..end_sd])?;
+            suffix_out.extend_from_slice(&carry[end_sd..]);
+            io::copy(&mut win.input, suffix_out)?;
+            return Ok(true);
+        }
+        if carry.windows(11).any(|w| w == b"</sheetData") && eof {
+            return Ok(false);
+        }
+        if eof {
+            return Ok(false);
+        }
+        let keep = carry.len().min(NEEDLE.len() + 4);
+        let flush_len = carry.len() - keep;
+        if flush_len > 0 {
+            out.write_all(&carry[..flush_len])?;
+            carry.drain(..flush_len);
+        }
+    }
 }
 
 /// Removing indexed references changes only two optional root attributes. All
@@ -412,10 +496,24 @@ pub(super) fn worksheet(
     changed_sst: &mut bool,
 ) -> Result<bool> {
     let Changes {
-        mut keys, mut styles, ..
+        mut keys,
+        mut styles,
+        layout,
+        freeze_edit,
+        filter_xml,
+        page_edit,
+        ..
     } = changes;
+    let mut shared_state = SharedFormulaState::default();
     let mut axis_rows = std::mem::take(&mut styles.rows);
-    let mut header = (!styles.cols.is_empty()).then(Vec::new);
+    let (mut layout_rows, layout_cols) = match layout {
+        Some(l) => (l.rows, l.cols),
+        None => (BTreeMap::new(), BTreeMap::new()),
+    };
+    let need_header_patch =
+        !styles.cols.is_empty() || !layout_cols.is_empty() || freeze_edit || page_edit;
+    let need_suffix_patch = sheet.merges_dirty || filter_xml.is_some() || page_edit;
+    let mut header = need_header_patch.then(Vec::new);
     let mut additions: Option<(u32, u32, u32, u32)> = None;
     let merge_corners = sheet
         .merges
@@ -441,6 +539,7 @@ pub(super) fn worksheet(
     let mut buf = Vec::new();
     let mut skip = Vec::new();
     let mut in_data = false;
+    let mut fast_forward_suffix = false;
     let mut prefix = String::new();
     let mut binding = String::from("xmlns");
     let mut root_uri = String::new();
@@ -460,7 +559,15 @@ pub(super) fn worksheet(
                 if let Some((p,_)) = e.name().as_ref().split_once(':') {
                     prefix = format!("{p}:");
                     binding = format!("xmlns:{p}");
-                    if !styles.cols.is_empty() || !axis_rows.is_empty() || sheet.merges_dirty {
+                    if !styles.cols.is_empty()
+                        || !axis_rows.is_empty()
+                        || !layout_rows.is_empty()
+                        || !layout_cols.is_empty()
+                        || sheet.merges_dirty
+                        || freeze_edit
+                        || filter_xml.is_some()
+                        || page_edit
+                    {
                         return Ok(false);
                     }
                 }
@@ -507,18 +614,56 @@ pub(super) fn worksheet(
                 if depth == 1 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("sheetData") =>
             {
                 if attr(e,&binding).is_some_and(|uri| uri != root_uri) { return Ok(false); }
-                if let Some(header) = header.take() {
-                    let Ok(styled) = crate::patch::layout_xml::styled_columns(std::str::from_utf8(&header)?, &styles.cols) else {
-                        return Ok(false);
-                    };
-                    out.write_all(styled.as_bytes())?;
+                if let Some(header_bytes) = header.take() {
+                    let mut hdr = std::str::from_utf8(&header_bytes)?.to_owned();
+                    if !styles.cols.is_empty() {
+                        let Ok(styled) = crate::patch::layout_xml::styled_columns(&hdr, &styles.cols) else {
+                            return Ok(false);
+                        };
+                        hdr = styled;
+                    }
+                    if !layout_cols.is_empty() {
+                        let Ok(updated) = crate::patch::layout_xml::apply_header(&hdr, &layout_cols) else {
+                            return Ok(false);
+                        };
+                        hdr = updated;
+                    }
+                    if freeze_edit {
+                        let sentinel = "<sheetData/></worksheet>";
+                        let wrapped = format!("{hdr}{sentinel}");
+                        let updated = crate::patch::set_freeze_xml(&wrapped, sheet.freeze);
+                        let Some(stripped) = updated.strip_suffix(sentinel) else {
+                            return Ok(false);
+                        };
+                        hdr = stripped.to_owned();
+                    }
+                    if page_edit {
+                        let wrapped = format!("{hdr}<sheetData/></worksheet>");
+                        let updated = crate::patch::set_page_setup(&wrapped, &sheet.page);
+                        let Some(pos) = updated.find("<sheetData/>") else {
+                            return Ok(false);
+                        };
+                        hdr = updated[..pos].to_owned();
+                    }
+                    out.write_all(hdr.as_bytes())?;
                 }
                 if empty {
                     let Some(tag) = expanded_tag(e, "") else {
                         return Ok(false);
                     };
                     out.write_all(tag.as_bytes())?;
-                    if !missing_rows(out, &prefix, u32::MAX, &mut keys, &mut axis_rows, sheet, base, &styles)? {
+                    if !missing_rows(
+                        out,
+                        &prefix,
+                        u32::MAX,
+                        &mut keys,
+                        &mut axis_rows,
+                        &mut layout_rows,
+                        sheet,
+                        base,
+                        &styles,
+                        &shared_state,
+                    )? {
                         return Ok(false);
                     }
                     write!(out, "</{prefix}sheetData>")?;
@@ -527,6 +672,21 @@ pub(super) fn worksheet(
                     break;
                 }
                 in_data = true;
+                if keys.is_empty()
+                    && axis_rows.is_empty()
+                    && layout_rows.is_empty()
+                    && shared_state.promote_master.is_empty()
+                    && shared_state.unshare.is_empty()
+                {
+                    let end = reader.buffer_position();
+                    out.write_all(reader.get_mut().through(end)?)?;
+                    if !need_suffix_patch {
+                        break;
+                    } else if prefix.is_empty() {
+                        fast_forward_suffix = true;
+                        break;
+                    }
+                }
             }
             Event::Start(ref e) | Event::Empty(ref e)
                 if in_data && depth == 2 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("row") =>
@@ -536,7 +696,18 @@ pub(super) fn worksheet(
                     return Ok(false);
                 };
                 if last_row.is_some_and(|p| p >= r)
-                    || !missing_rows(out, &prefix, r, &mut keys, &mut axis_rows, sheet, base, &styles)?
+                    || !missing_rows(
+                        out,
+                        &prefix,
+                        r,
+                        &mut keys,
+                        &mut axis_rows,
+                        &mut layout_rows,
+                        sheet,
+                        base,
+                        &styles,
+                        &shared_state,
+                    )?
                 {
                     return Ok(false);
                 }
@@ -548,17 +719,26 @@ pub(super) fn worksheet(
                 }
                 let end = reader.buffer_position();
                 let raw = reader.get_mut().through(end)?;
+                let axis_xf = axis_rows.remove(&r);
+                let mut lchg = layout_rows.remove(&r);
+                if let Some(xf) = axis_xf {
+                    lchg.get_or_insert_with(Default::default).style = Some(xf);
+                }
                 let styled;
-                let raw = if let Some(xf) = axis_rows.remove(&r) {
-                    let (tag,body) = raw.split_at(tag_len);
-                    let Ok(styled_tag) = crate::patch::layout_xml::styled_row(std::str::from_utf8(tag)?, xf) else {
+                let raw = if let Some(ch) = lchg {
+                    let (tag, body) = raw.split_at(tag_len);
+                    let Ok(styled_tag) =
+                        crate::patch::layout_xml::update_row_tag(std::str::from_utf8(tag)?, &ch)
+                    else {
                         return Ok(false);
                     };
                     let mut bytes = styled_tag.into_bytes();
                     bytes.extend_from_slice(body);
                     styled = bytes;
                     styled.as_slice()
-                } else { raw };
+                } else {
+                    raw
+                };
                 if keys.first().is_some_and(|k| k.row == r) {
                     let mut row_keys = BTreeSet::new();
                     while keys.first().is_some_and(|k| k.row == r) {
@@ -573,7 +753,16 @@ pub(super) fn worksheet(
                         normalized = adapted;
                         &normalized
                     };
-                    let Some(edits) = row_edits(xml, sheet, base, row_keys, &styles, changed_sst)
+                    let Some(edits) = row_edits(
+                        xml,
+                        sheet,
+                        base,
+                        row_keys,
+                        &styles,
+                        changed_sst,
+                        &mut shared_state,
+                        &mut keys,
+                    )
                     else {
                         return Ok(false);
                     };
@@ -588,14 +777,35 @@ pub(super) fn worksheet(
                 } else {
                     out.write_all(raw)?;
                 }
-                if keys.is_empty() && axis_rows.is_empty() && !sheet.merges_dirty {
-                    break;
+                if keys.is_empty()
+                    && axis_rows.is_empty()
+                    && layout_rows.is_empty()
+                    && shared_state.promote_master.is_empty()
+                    && shared_state.unshare.is_empty()
+                {
+                    if !need_suffix_patch {
+                        break;
+                    } else if prefix.is_empty() {
+                        fast_forward_suffix = true;
+                        break;
+                    }
                 }
                 continue;
             }
             Event::Start(_) | Event::Empty(_) if in_data => return Ok(false),
             Event::End(ref e) if in_data && depth == 2 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("sheetData") => {
-                if !missing_rows(out, &prefix, u32::MAX, &mut keys, &mut axis_rows, sheet, base, &styles)? {
+                if !missing_rows(
+                    out,
+                    &prefix,
+                    u32::MAX,
+                    &mut keys,
+                    &mut axis_rows,
+                    &mut layout_rows,
+                    sheet,
+                    base,
+                    &styles,
+                    &shared_state,
+                )? {
                     return Ok(false);
                 }
                 let end = reader.buffer_position();
@@ -612,19 +822,43 @@ pub(super) fn worksheet(
         if let Some(bytes) = &mut header { bytes.extend_from_slice(raw); }
         else { out.write_all(raw)?; }
     }
-    if sheet.merges_dirty {
-        // Merges are ordered among worksheet-level metadata after sheetData.
-        // Run the same schema/order checks on that suffix without retaining the grid.
-        let prefix = b"<worksheet><sheetData/>";
-        let mut suffix = prefix.to_vec();
-        reader.into_inner().copy_rest(&mut suffix)?;
-        let xml = std::str::from_utf8(&suffix)?;
-        let Some(edit) = merge_edit(xml, sheet) else {
+    if !shared_state.promote_master.is_empty() || !shared_state.unshare.is_empty() {
+        return Ok(false);
+    }
+    if need_suffix_patch {
+        // Metadata elements after sheetData are ordered by schema; run the same
+        // schema/order checks on that small suffix without retaining the grid.
+        let wrapper_prefix = b"<worksheet><sheetPr/><sheetData/>";
+        let mut suffix = wrapper_prefix.to_vec();
+        if fast_forward_suffix {
+            if !fast_forward_sheet_data_end(reader.into_inner(), out, &mut suffix)? {
+                return Ok(false);
+            }
+        } else {
+            reader.into_inner().copy_rest(&mut suffix)?;
+        }
+        let mut xml = std::str::from_utf8(&suffix)?.to_owned();
+        if let Some(ref af) = filter_xml {
+            xml = crate::patch::insert_auto_filter(&xml, af);
+        }
+        if sheet.merges_dirty {
+            let Some(edit) = merge_edit(&xml, sheet) else {
+                return Ok(false);
+            };
+            let mut next = String::with_capacity(xml.len() + edit.text.len());
+            next.push_str(&xml[..edit.from]);
+            next.push_str(&edit.text);
+            next.push_str(&xml[edit.to..]);
+            xml = next;
+        }
+        if page_edit {
+            xml = crate::patch::set_page_xml(&xml, &sheet.page);
+            xml = crate::patch::set_page_setup(&xml, &sheet.page);
+        }
+        let Some(sd_pos) = xml.find("<sheetData/>") else {
             return Ok(false);
         };
-        out.write_all(&suffix[prefix.len()..edit.from])?;
-        out.write_all(edit.text.as_bytes())?;
-        out.write_all(&suffix[edit.to..])?;
+        out.write_all(&xml.as_bytes()[sd_pos + "<sheetData/>".len()..])?;
     } else {
         reader.into_inner().copy_rest(out)?;
     }
@@ -701,8 +935,7 @@ mod tests {
         );
         let changes = Changes {
             keys: BTreeSet::from([CellRef::new(0, 0)]),
-            styles: Default::default(),
-            formula_changed: false,
+            ..Default::default()
         };
         let read = Counter::new(0);
         let mut sink = Sink {

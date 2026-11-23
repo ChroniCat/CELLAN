@@ -34,16 +34,16 @@ impl Baseline {
 }
 
 #[derive(Clone, Default, PartialEq)]
-struct Change {
-    size: Option<Option<f32>>,
-    hidden: Option<bool>,
-    level: Option<u8>,
-    style: Option<Option<u16>>,
+pub(crate) struct Change {
+    pub(crate) size: Option<Option<f32>>,
+    pub(crate) hidden: Option<bool>,
+    pub(crate) level: Option<u8>,
+    pub(crate) style: Option<Option<u16>>,
 }
 type Attrs = Vec<(&'static str, Option<String>)>;
 
 impl Change {
-    fn attrs(&self, row: bool) -> Attrs {
+    pub(crate) fn attrs(&self, row: bool) -> Attrs {
         let mut out = Vec::new();
         if let Some(size) = self.size {
             let value = size.map(|px| {
@@ -76,7 +76,7 @@ impl Change {
         }
         out
     }
-    fn needs_record(&self) -> bool {
+    pub(crate) fn needs_record(&self) -> bool {
         self.size.flatten().is_some()
             || self.hidden == Some(true)
             || self.level.is_some_and(|l| l > 0)
@@ -85,13 +85,13 @@ impl Change {
 }
 
 #[derive(Default)]
-pub(super) struct Changes {
-    rows: BTreeMap<u32, Change>,
-    cols: BTreeMap<u32, Change>,
+pub(crate) struct Changes {
+    pub(crate) rows: BTreeMap<u32, Change>,
+    pub(crate) cols: BTreeMap<u32, Change>,
 }
 
 impl Changes {
-    pub(super) fn from_sheet(s: &Sheet, base: Option<&Baseline>) -> Self {
+    pub(crate) fn from_sheet(s: &Sheet, base: Option<&Baseline>) -> Self {
         let mut out = Self::default();
         if let Some(old) = base {
             for &r in &old.row_levels {
@@ -135,6 +135,69 @@ impl Changes {
         }
         for (&c, &lv) in &s.col_levels {
             out.cols.entry(c).or_default().level = Some(lv);
+        }
+        out
+    }
+
+    /// Compute minimal layout diffs against `old` so streaming delta saves only touch
+    /// rows/columns whose dimensions, visibility, or outline levels actually changed.
+    pub(crate) fn diff_from_sheet(s: &Sheet, old: &Baseline) -> Self {
+        let cols_changed = s.cols.default_size() != old.cols.default_size()
+            || !s.cols.entries().eq(old.cols.entries())
+            || s.hidden_cols != old.hidden_cols
+            || !s.col_levels.is_empty()
+            || !old.col_levels.is_empty();
+        let mut out = Self {
+            rows: BTreeMap::new(),
+            cols: if cols_changed {
+                Self::from_sheet(s, Some(old)).cols
+            } else {
+                BTreeMap::new()
+            },
+        };
+        let mut old_it = old.rows.entries().peekable();
+        let mut new_it = s.rows.entries().peekable();
+        while old_it.peek().is_some() || new_it.peek().is_some() {
+            match (old_it.peek().copied(), new_it.peek().copied()) {
+                (Some((&or, &oh)), Some((&nr, &nh))) if or == nr => {
+                    old_it.next();
+                    new_it.next();
+                    if (nh - oh).abs() > 1e-4 {
+                        out.rows.entry(or).or_default().size = Some(Some(nh));
+                    }
+                }
+                (Some((&or, _)), None) => {
+                    old_it.next();
+                    out.rows.entry(or).or_default().size = Some(None);
+                }
+                (Some((&or, _)), Some((&nr, _))) if or < nr => {
+                    old_it.next();
+                    out.rows.entry(or).or_default().size = Some(None);
+                }
+                (_, Some((&nr, &nh))) => {
+                    new_it.next();
+                    out.rows.entry(nr).or_default().size = Some(Some(nh));
+                }
+                (None, None) => break,
+            }
+        }
+        for &r in old.manual.iter().chain(old.hidden.iter()) {
+            if !s.hidden_rows_user.contains(&r) && !s.hidden_rows.contains(&r) {
+                out.rows.entry(r).or_default().hidden = Some(false);
+            }
+        }
+        for &r in s.hidden_rows_user.iter().chain(s.hidden_rows.iter()) {
+            if !old.manual.contains(&r) && !old.hidden.contains(&r) {
+                out.rows.entry(r).or_default().hidden = Some(true);
+            }
+        }
+        for &r in &old.row_levels {
+            if !s.row_levels.contains_key(&r) {
+                out.rows.entry(r).or_default().level = Some(0);
+            }
+        }
+        for (&r, &lv) in &s.row_levels {
+            out.rows.entry(r).or_default().level = Some(lv);
         }
         out
     }
@@ -509,6 +572,18 @@ fn patch_columns(
     render(header, edits)
 }
 
+pub(crate) fn apply_header(header: &str, changes: &BTreeMap<u32, Change>) -> Result<String> {
+    columns(header, "worksheet", changes)
+}
+
+pub(crate) fn update_row_tag(tag: &str, change: &Change) -> Result<String> {
+    update_tag(tag, &change.attrs(true))
+}
+
+pub(crate) fn new_row_record(row_name: &str, r: u32, change: &Change) -> Result<String> {
+    new_record(row_name, true, r, r, change)
+}
+
 pub(super) fn apply(xml: &str, changes: &Changes) -> Result<String> {
     patch_rows(xml, changes, false)
 }
@@ -682,6 +757,31 @@ pub(super) fn apply_bytes(raw: &[u8], changes: &Changes) -> Result<Option<Vec<u8
     } else {
         (&raw[..0], raw)
     };
+    if changes.rows.is_empty() && changes.cols.is_empty() {
+        return Ok(None);
+    }
+    // Fast header-only path when only columns changed: never allocate or re-scan a 200MB sheetData body!
+    if changes.rows.is_empty() {
+        if let Some(rel) = bytes.windows(10).position(|w| w == b"<sheetData") {
+            if matches!(bytes.get(rel + 10), Some(b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')) {
+                if let Ok(header_str) = std::str::from_utf8(&bytes[..rel]) {
+                    if header_str.starts_with("<?xml") || header_str.trim_start().starts_with("<worksheet") {
+                        if let Ok(new_header) = columns(header_str, "worksheet", &changes.cols) {
+                            if new_header == header_str {
+                                return Ok(None);
+                            }
+                            let tail = &bytes[rel..];
+                            let mut out = Vec::with_capacity(bom.len() + new_header.len() + tail.len());
+                            out.extend_from_slice(bom);
+                            out.extend_from_slice(new_header.as_bytes());
+                            out.extend_from_slice(tail);
+                            return Ok(Some(out));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let xml = std::str::from_utf8(bytes)?;
     let updated = apply(xml, changes)?;
     if updated == xml {

@@ -1,5 +1,5 @@
-//! XLSX workers share one decoded string table. Large worksheet entries are
-//! inflated once and decoded in batches of complete rows.
+//! XLSX workers share one decoded string table and lock-free style lookup.
+//! Large worksheet entries stream via byte-sliced row chunks into persistent workers.
 #[path = "xlsx_read_stream.rs"]
 mod stream;
 use super::LoadDiag;
@@ -17,7 +17,49 @@ use std::{
     fs::File,
     io::{Cursor, Write},
     path::Path,
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicU16, Ordering},
+    },
 };
+
+/// Cross-layer-1 bridge: once `Value::Text(Arc<str>)` is merged from `codex/perf-storage`,
+/// `Value::Text(s.clone())` makes every `t="s"` cell O(1) zero-heap-allocation.
+#[inline]
+fn shared_text_value(s: &Arc<str>) -> Value {
+    Value::Text(s.as_ref().into())
+}
+
+/// Fast-path parser for `<= 15`-digit ASCII integers (exact in IEEE-754 `f64`),
+/// falling back to `core::num::dec2flt` (`str::parse::<f64>()`) for decimals/exponents.
+#[inline]
+pub(super) fn fast_parse_f64(s: &str) -> Result<f64, std::num::ParseFloatError> {
+    let bytes = s.as_bytes();
+    if !bytes.is_empty() && bytes.len() <= 16 {
+        let (neg, digits) = match bytes[0] {
+            b'-' => (true, &bytes[1..]),
+            b'+' => (false, &bytes[1..]),
+            _ => (false, bytes),
+        };
+        if !digits.is_empty() && digits.len() <= 15 {
+            let mut acc = 0u64;
+            let mut all_digits = true;
+            for &b in digits {
+                let d = b.wrapping_sub(b'0');
+                if d <= 9 {
+                    acc = acc * 10 + u64::from(d);
+                } else {
+                    all_digits = false;
+                    break;
+                }
+            }
+            if all_digits {
+                return Ok(if neg { -(acc as f64) } else { acc as f64 });
+            }
+        }
+    }
+    s.parse::<f64>()
+}
 
 fn signature(zip: &mut zip::ZipArchive<File>, part: &str) -> Option<(u32, u64)> {
     let e = zip.by_index_raw(zip.index_for_name(part)?).ok()?;
@@ -89,7 +131,8 @@ pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<Workb
     let xml = String::from_utf8(bytes).unwrap_or_default();
     let rels = read(src, "xl/_rels/workbook.xml.rels")?;
     let targets = crate::patch::sheet_targets_xml(
-        Some(&xml), rels.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
+        Some(&xml),
+        rels.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
     );
     let header = header(src, &targets, &xml, rels.as_deref())?;
     Ok(WorkbookMetadata { xml, targets, header })
@@ -140,11 +183,113 @@ pub(super) fn header(
         .context("工作表关系无效")?;
     let styles = book.worksheet_cells_reader(name)?.styles().to_vec();
     Ok(Some(Header {
-        dynamic: if let Some(rels) = rels { super::dynamic::indices(src, rels)? } else { Default::default() },
+        dynamic: if let Some(rels) = rels {
+            super::dynamic::indices(src, rels)?
+        } else {
+            Default::default()
+        },
         names,
         types,
         styles,
     }))
+}
+
+/// Concurrent lock-free XF -> StyleTable ID resolver.
+/// Only interns XFs actually referenced by worksheet cells/rows/cols, preserving
+/// exact `StyleTable` and `StyleMap` uniqueness semantics while eliminating `Loaded::xfs`.
+pub(super) struct StyleLookup<'a> {
+    cache: Vec<AtomicU16>,
+    inner: Mutex<(crate::style::StyleTable, HashMap<u16, u16>)>,
+    ooxml_styles: &'a [calamine::Style],
+    theme_book: &'a crate::style_theme::ThemeBook,
+    ext_book: &'a crate::style_ext::StyleExt,
+}
+
+impl<'a> StyleLookup<'a> {
+    pub(super) fn new(
+        styles: crate::style::StyleTable,
+        ids: HashMap<u16, u16>,
+        ooxml_styles: &'a [calamine::Style],
+        theme_book: &'a crate::style_theme::ThemeBook,
+        ext_book: &'a crate::style_ext::StyleExt,
+    ) -> Self {
+        let cap = ooxml_styles
+            .len()
+            .max(theme_book.xfs.len())
+            .max(ext_book.xf_border.len())
+            .saturating_add(16)
+            .max(64);
+        let cache: Vec<AtomicU16> = (0..cap).map(|_| AtomicU16::new(u16::MAX)).collect();
+        for (&xf, &id) in &ids {
+            if let Some(slot) = cache.get(xf as usize) {
+                slot.store(id, Ordering::Relaxed);
+            }
+        }
+        Self {
+            cache,
+            inner: Mutex::new((styles, ids)),
+            ooxml_styles,
+            theme_book,
+            ext_book,
+        }
+    }
+
+    #[inline]
+    pub(super) fn resolve(&self, xf: u16) -> u16 {
+        if let Some(slot) = self.cache.get(xf as usize) {
+            let id = slot.load(Ordering::Acquire);
+            if id != u16::MAX {
+                return id;
+            }
+        }
+        self.resolve_slow(xf)
+    }
+
+    #[cold]
+    fn resolve_slow(&self, xf: u16) -> u16 {
+        let mut guard = self.inner.lock().unwrap();
+        let (styles, ids) = &mut *guard;
+        let id = *ids.entry(xf).or_insert_with(|| {
+            let mut cs = self
+                .ooxml_styles
+                .get(xf as usize)
+                .map(super::convert_style)
+                .unwrap_or_else(|| crate::style::CellStyle {
+                    size: 11.0,
+                    color: [0, 0, 0],
+                    ..Default::default()
+                });
+            let theme_xf = self.theme_book.xfs.get(xf as usize);
+            let resolved = self.theme_book.resolved.get(xf as usize);
+            crate::style_theme::apply_resolved(
+                &mut cs,
+                theme_xf,
+                resolved,
+                &self.theme_book.palette,
+            );
+            cs.diagonal = self
+                .ext_book
+                .xf_border
+                .get(xf as usize)
+                .and_then(|id| self.ext_book.diags.get(*id as usize))
+                .cloned()
+                .flatten();
+            let id = styles.intern(cs);
+            if let Some(txf) = theme_xf {
+                styles.set_theme(id, *txf);
+            }
+            crate::style_ext::attach(styles, self.ext_book, id, xf);
+            id
+        });
+        if let Some(slot) = self.cache.get(xf as usize) {
+            slot.store(id, Ordering::Release);
+        }
+        id
+    }
+
+    pub(super) fn into_inner(self) -> (crate::style::StyleTable, HashMap<u16, u16>) {
+        self.inner.into_inner().unwrap()
+    }
 }
 
 #[derive(Default)]
@@ -155,30 +300,74 @@ struct Strings {
 }
 
 // Values are retrieved by SST index while sheets decode concurrently. Pack short
-// strings into slabs to avoid a String allocation per item. Growing the table
-// never reallocates/copies all previously decoded UTF-8 text.
+// strings into slabs to avoid a String allocation per item, and cache shared `Arc<str>`
+// handles lazily on demand for referenced SST slots.
 #[derive(Default)]
 struct TextPool {
     slabs: Vec<String>,
-    ends: Vec<(usize,usize)>,
+    ends: Vec<(usize, usize)>,
+    shared: OnceLock<Vec<OnceLock<Arc<str>>>>,
 }
 
 impl TextPool {
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
     fn push(&mut self, text: String) {
         const BYTES: usize = 64 * 1024;
-        if self.slabs.last().is_none_or(|s| s.len().saturating_add(text.len()) > BYTES) {
+        if self
+            .slabs
+            .last()
+            .is_none_or(|s| s.len().saturating_add(text.len()) > BYTES)
+        {
             self.slabs.push(text);
         } else {
             self.slabs.last_mut().unwrap().push_str(&text);
         }
-        self.ends.push((self.slabs.len()-1,self.slabs.last().unwrap().len()));
+        self.ends
+            .push((self.slabs.len() - 1, self.slabs.last().unwrap().len()));
+    }
+
+    fn push_str(&mut self, text: &str) {
+        const BYTES: usize = 64 * 1024;
+        if self
+            .slabs
+            .last()
+            .is_none_or(|s| s.len().saturating_add(text.len()) > BYTES)
+        {
+            let mut slab = String::with_capacity(text.len().max(BYTES));
+            slab.push_str(text);
+            self.slabs.push(slab);
+        } else {
+            self.slabs.last_mut().unwrap().push_str(text);
+        }
+        self.ends
+            .push((self.slabs.len() - 1, self.slabs.last().unwrap().len()));
+    }
+
+    fn prepare_shared(&mut self) {
+        let slots = (0..self.ends.len()).map(|_| OnceLock::new()).collect();
+        let _ = self.shared.set(slots);
     }
 
     fn get(&self, id: usize) -> Option<&str> {
-        let &(page,end) = self.ends.get(id)?;
-        let start = id.checked_sub(1).and_then(|prev| self.ends.get(prev))
-            .filter(|(old,_)| *old == page).map_or(0,|(_,end)| *end);
+        let &(page, end) = self.ends.get(id)?;
+        let start = id
+            .checked_sub(1)
+            .and_then(|prev| self.ends.get(prev))
+            .filter(|(old, _)| *old == page)
+            .map_or(0, |(_, end)| *end);
         Some(&self.slabs[page][start..end])
+    }
+
+    fn get_arc(&self, id: usize) -> Option<&Arc<str>> {
+        let raw = self.get(id)?;
+        let slots = self.shared.get_or_init(|| {
+            (0..self.ends.len()).map(|_| OnceLock::new()).collect()
+        });
+        let slot = slots.get(id)?;
+        Some(slot.get_or_init(|| Arc::from(raw)))
     }
 }
 
@@ -380,32 +569,95 @@ fn strings(zip: &mut zip::ZipArchive<File>) -> Result<Strings> {
         return Ok(table);
     }
     let part = "xl/sharedStrings.xml";
-    super::delta::stream::xml_input(zip.by_name(part)?,part,|input| stream::string_table(input,&mut table))?;
+    super::delta::stream::xml_input(zip.by_name(part)?, part, |input| {
+        stream::string_table(input, &mut table)
+    })?;
+    table.text.prepare_shared();
     Ok(table)
+}
+
+#[derive(Default)]
+pub(super) struct RowLayout {
+    pub row_heights: Vec<(u32, f32)>,
+    pub hidden_rows: Vec<u32>,
+    pub row_levels: Vec<(u32, u8)>,
+    pub row_xfs: Vec<(u32, u32)>,
+}
+
+impl RowLayout {
+    pub(super) fn extend(&mut self, other: Self) {
+        self.row_heights.extend(other.row_heights);
+        self.hidden_rows.extend(other.hidden_rows);
+        self.row_levels.extend(other.row_levels);
+        self.row_xfs.extend(other.row_xfs);
+    }
+
+    fn apply_to(&mut self, layout: &mut crate::merges::SheetLayout) {
+        layout.row_heights.append(&mut self.row_heights);
+        layout.hidden_rows.append(&mut self.hidden_rows);
+        layout.row_levels.append(&mut self.row_levels);
+        layout.row_xfs.append(&mut self.row_xfs);
+    }
 }
 
 pub(super) struct Loaded {
     pub sheet: Sheet,
     pub xfs: Vec<(u32, u32, u16)>,
+    pub row_layout: RowLayout,
     pub layout: Option<crate::merges::SheetLayout>,
     pub diag: LoadDiag,
 }
 
+type MasterSpec = ((u32, u32), (u32, u32, u32, u32), String);
+
+#[derive(Default)]
+pub(super) struct SharedMasters {
+    map: HashMap<u32, MasterSpec>,
+}
+
 #[derive(Default)]
 struct Formulas {
-    masters: HashMap<u32, ((u32, u32), (u32, u32, u32, u32), String)>,
+    masters: HashMap<u32, MasterSpec>,
     children: Vec<((u32, u32), u32)>,
 }
 
 fn formula_range(s: &str) -> Result<(u32, u32, u32, u32)> {
     let (a, b) = s.split_once(':').unwrap_or((s, s));
     let coord = |s: &str| {
-        crate::sparse::parse_ref(&s.replace('$', ""))
-            .filter(|&(r, c)| r < crate::sync::MAX_ROWS && c < crate::sync::MAX_COLS)
+        if s.contains('$') {
+            crate::sparse::parse_ref(&s.replace('$', ""))
+        } else {
+            crate::sparse::parse_ref(s)
+        }
+        .filter(|&(r, c)| r < crate::sync::MAX_ROWS && c < crate::sync::MAX_COLS)
     };
     let (r, c) = coord(a).context("公式区域起点无效")?;
     let (rr, cc) = coord(b).context("公式区域终点无效")?;
     Ok((r.min(rr), c.min(cc), r.max(rr), c.max(cc)))
+}
+
+#[inline]
+fn translate_shared_child(
+    master_entry: &MasterSpec,
+    pos: (u32, u32),
+    sheet_name: &str,
+) -> Result<Arc<str>> {
+    let ((mr, mc), rect, master) = master_entry;
+    ensure!(
+        (rect.0..=rect.2).contains(&pos.0) && (rect.1..=rect.3).contains(&pos.1),
+        "共享公式子单元格在声明范围外"
+    );
+    let translated = crate::refs::translate(
+        master,
+        i64::from(pos.0) - i64::from(*mr),
+        i64::from(pos.1) - i64::from(*mc),
+        sheet_name,
+    );
+    let body = translated.trim_start_matches('=');
+    let mut with_eq = String::with_capacity(body.len() + 1);
+    with_eq.push('=');
+    with_eq.push_str(body);
+    Ok(crate::normalize_formula(&with_eq).into())
 }
 
 fn cell(
@@ -413,6 +665,7 @@ fn cell(
     dst: &mut Loaded,
     table: &Strings,
     formulas: &mut Formulas,
+    shared_masters: Option<&RwLock<SharedMasters>>,
     pos: (u32, u32),
     typ: &str,
     dynamic: bool,
@@ -437,13 +690,8 @@ fn cell(
                                 if let Some(runs) = table.rich.get(&id) {
                                     dst.sheet.rich.insert(pos, runs.clone());
                                 }
-                                Value::Text(
-                                    table
-                                        .text
-                                        .get(id)
-                                        .context("缺少共享字符串")?
-                                        .into(),
-                                )
+                                let arc = table.text.get_arc(id).context("缺少共享字符串")?;
+                                shared_text_value(arc)
                             }
                             "inlineStr" | "is" => continue,
                             "str" => Value::Text(office_text(&v).as_ref().into()),
@@ -468,11 +716,10 @@ fn cell(
                                     ))
                                 }
                             }
-                            "" => v
-                                .parse()
+                            "" => fast_parse_f64(&v)
                                 .map(Value::Number)
                                 .unwrap_or_else(|_| Value::Text(v.as_ref().into())),
-                            "n" => Value::Number(v.parse()?),
+                            "n" => Value::Number(fast_parse_f64(&v)?),
                             _ => anyhow::bail!("无法识别的单元格类型 {typ}"),
                         };
                     }
@@ -504,14 +751,33 @@ fn cell(
                                             && (rect.1..=rect.3).contains(&pos.1),
                                         "共享公式主单元格无效"
                                     );
+                                    let spec = (pos, rect, f.to_string());
+                                    if let Some(global) = shared_masters {
+                                        global.write().unwrap().map.entry(si).or_insert_with(|| spec.clone());
+                                    }
                                     ensure!(
-                                        formulas
-                                            .masters
-                                            .insert(si, (pos, rect, f.to_string()))
-                                            .is_none(),
+                                        formulas.masters.insert(si, spec).is_none(),
                                         "共享公式序号重复"
                                     );
                                 } else {
+                                    if let Some(master_entry) = formulas.masters.get(&si) {
+                                        formula = Some(translate_shared_child(
+                                            master_entry,
+                                            pos,
+                                            &dst.sheet.name,
+                                        )?);
+                                        continue;
+                                    }
+                                    if let Some(global) = shared_masters {
+                                        if let Some(master_entry) = global.read().unwrap().map.get(&si) {
+                                            formula = Some(translate_shared_child(
+                                                master_entry,
+                                                pos,
+                                                &dst.sheet.name,
+                                            )?);
+                                            continue;
+                                        }
+                                    }
                                     formulas.children.push((pos, si));
                                     continue;
                                 }
@@ -521,8 +787,10 @@ fn cell(
                                 let rect = formula_range(&range)?;
                                 let anchor = CellRef::new(pos.0, pos.1);
                                 if dynamic {
-                                    ensure!((rect.0,rect.1) == pos,"动态数组锚点与范围不一致");
-                                    dst.sheet.spill_shapes.insert(anchor,(rect.2-rect.0+1,rect.3-rect.1+1));
+                                    ensure!((rect.0, rect.1) == pos, "动态数组锚点与范围不一致");
+                                    dst.sheet
+                                        .spill_shapes
+                                        .insert(anchor, (rect.2 - rect.0 + 1, rect.3 - rect.1 + 1));
                                 } else {
                                     dst.sheet.arrays.push((anchor, rect));
                                 }
@@ -546,13 +814,11 @@ fn cell(
                             Some(typ) => anyhow::bail!("未知公式类型 {typ}"),
                         }
                         if !f.is_empty() {
-                            formula = Some(
-                                crate::normalize_formula(&format!(
-                                    "={}",
-                                    f.trim_start_matches('=')
-                                ))
-                                .into(),
-                            );
+                            let body = f.trim_start_matches('=');
+                            let mut with_eq = String::with_capacity(body.len() + 1);
+                            with_eq.push('=');
+                            with_eq.push_str(body);
+                            formula = Some(crate::normalize_formula(&with_eq).into());
                         }
                     }
                     _ if !empty => {
@@ -569,22 +835,41 @@ fn cell(
     Ok(Cell { value, formula })
 }
 
-fn parse(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::SheetType) -> Result<String> {
+fn parse(
+    xml: &str,
+    table: &Strings,
+    style_lookup: Option<&StyleLookup<'_>>,
+    dst: &mut Loaded,
+    typ: calamine::SheetType,
+) -> Result<String> {
     let mut f = Formulas::default();
-    let shell = parse_section(xml, table, dst, typ, &mut f, None, 0)?;
+    let shell = parse_section(xml, table, style_lookup, &[], None, dst, typ, &mut f, None, 0)?;
     expand_shared(dst, f)?;
     Ok(shell)
 }
 
 type RowCells = Vec<((u32, u32), Cell)>;
+type RowStyles = Vec<(CellRef, u16)>;
 
-fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::SheetType,
-    f: &mut Formulas, mut rows: Option<&mut RowCells>, first_row: u32) -> Result<String> {
+#[allow(clippy::too_many_arguments)]
+fn parse_section(
+    xml: &str,
+    table: &Strings,
+    style_lookup: Option<&StyleLookup<'_>>,
+    col_has_xf_hint: &[bool],
+    shared_masters: Option<&RwLock<SharedMasters>>,
+    dst: &mut Loaded,
+    typ: calamine::SheetType,
+    f: &mut Formulas,
+    mut batch_out: Option<(&mut RowCells, &mut RowStyles)>,
+    first_row: u32,
+) -> Result<String> {
     let mut r = Reader::from_str(xml);
     let mut pos = (first_row, 0u32);
-    let fragment = rows.is_some();
+    let fragment = batch_out.is_some();
     let mut in_data = fragment;
-    let mut keep_row = false;
+    let mut local_col_has_xf: Vec<bool> = Vec::new();
+    let mut row_has_xf = false;
     let expected_root = match typ {
         calamine::SheetType::WorkSheet => "worksheet",
         calamine::SheetType::ChartSheet => "chartsheet",
@@ -606,7 +891,9 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                 let empty = matches!(event, Event::Empty(_));
                 let tag = e.local_name();
                 let level = depth;
-                if fragment && level == initial_depth { ensure!(tag.as_ref() == "row", "行块含其他元素"); }
+                if fragment && level == initial_depth {
+                    ensure!(tag.as_ref() == "row", "行块含其他元素");
+                }
                 if level == 0 {
                     ensure!(
                         !closed && tag.as_ref() == expected_root,
@@ -618,6 +905,28 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                     depth += 1;
                 }
                 match tag.as_ref() {
+                    "col" if !in_data => {
+                        let mut min = 0u32;
+                        let mut max = 0u32;
+                        let mut style_xf = 0u32;
+                        for a in e.attributes().flatten() {
+                            match a.key.as_ref() {
+                                k if k.ends_with("min") => min = a.value.parse().unwrap_or(0),
+                                k if k.ends_with("max") => max = a.value.parse().unwrap_or(0),
+                                "style" => style_xf = a.value.parse().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                        if style_xf > 0 && min >= 1 && max >= min {
+                            let end = max.min(16_384) as usize;
+                            if local_col_has_xf.len() < end {
+                                local_col_has_xf.resize(end, false);
+                            }
+                            for c in (min as usize - 1)..end {
+                                local_col_has_xf[c] = true;
+                            }
+                        }
+                    }
                     "sheetData" if level == 1 => {
                         ensure!(!saw_data, "重复的 sheetData");
                         saw_data = true;
@@ -625,7 +934,11 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                     }
                     "row" if in_data && level == 2 => {
                         let mut explicit_row = false;
-                        keep_row = false;
+                        let mut ht = 0f32;
+                        let mut custom_ht = false;
+                        let mut hidden = false;
+                        let mut row_s = 0u32;
+                        let mut row_lv = 0u8;
                         for a in e.attributes() {
                             let a = a?;
                             match a.key.as_ref() {
@@ -637,21 +950,39 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                                         .context("行号为零")?;
                                     explicit_row = true;
                                 }
-                                "s" | "ht" | "hidden" | "outlineLevel" => keep_row = true,
+                                "ht" => ht = a.value.parse().unwrap_or(0.0),
+                                "customHeight" => {
+                                    custom_ht = a.value == "1" || a.value == "true";
+                                }
+                                "hidden" => {
+                                    hidden = a.value == "1" || a.value == "true";
+                                }
+                                "s" => row_s = a.value.parse().unwrap_or(0),
+                                "outlineLevel" => row_lv = a.value.parse::<u8>().unwrap_or(0),
                                 _ => {}
                             }
                         }
-                        dst.sheet.source_needs_dom_repair |= !explicit_row;
-                        if !keep_row {
-                            shell.push_str(&xml[copied..start]);
-                            copied = r.buffer_position() as usize;
-                        } else if !explicit_row {
-                            let end = r.buffer_position() as usize - if empty { 2 } else { 1 };
-                            shell.push_str(&xml[copied..end]);
-                            use std::fmt::Write;
-                            write!(shell, " r=\"{}\"", pos.0 + 1)?;
-                            copied = end;
+                        row_has_xf = row_s > 0;
+                        if row_lv > 0 {
+                            dst.row_layout.row_levels.push((pos.0, row_lv));
                         }
+                        if row_s > 0 {
+                            dst.row_layout.row_xfs.push((pos.0, row_s));
+                        }
+                        if hidden {
+                            dst.row_layout.hidden_rows.push(pos.0);
+                        }
+                        if ht > 0.0 && custom_ht {
+                            let px = crate::layout::pt_to_px(ht);
+                            if (px - crate::layout::DEFAULT_ROW_H).abs() > 0.5 {
+                                dst.row_layout.row_heights.push((pos.0, px));
+                            }
+                        }
+                        dst.sheet.source_needs_dom_repair |= !explicit_row;
+                        // Extract row metadata in-flight and omit `<row>` tags from `shell`
+                        // so downstream layout/CF/DV/page scanners never re-parse millions of rows.
+                        shell.push_str(&xml[copied..start]);
+                        copied = r.buffer_position() as usize;
                         pos.1 = 0;
                         if empty {
                             pos.0 = pos.0.saturating_add(1);
@@ -682,14 +1013,46 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                             here.0 < crate::sync::MAX_ROWS && here.1 < crate::sync::MAX_COLS,
                             "单元格坐标越界"
                         );
-                        if let Some(id) = xf {
-                            dst.xfs.push((here.0, here.1, id));
+                        if let Some(raw_xf) = xf {
+                            if let Some(lookup) = style_lookup {
+                                let id = lookup.resolve(raw_xf);
+                                let col_styled = col_has_xf_hint
+                                    .get(here.1 as usize)
+                                    .copied()
+                                    .unwrap_or(false)
+                                    || local_col_has_xf
+                                        .get(here.1 as usize)
+                                        .copied()
+                                        .unwrap_or(false);
+                                if raw_xf != 0 || id != 0 || row_has_xf || col_styled {
+                                    let key = CellRef::new(here.0, here.1);
+                                    if let Some((_, ref mut styles)) = batch_out {
+                                        styles.push((key, id));
+                                    } else {
+                                        dst.sheet.styles.insert(key, id);
+                                    }
+                                }
+                            } else {
+                                dst.xfs.push((here.0, here.1, raw_xf));
+                            }
                         }
                         if !empty {
-                            let cell = cell(&mut r, dst, table, f, here, &typ, dynamic)?;
+                            let cell = cell(
+                                &mut r,
+                                dst,
+                                table,
+                                f,
+                                shared_masters,
+                                here,
+                                &typ,
+                                dynamic,
+                            )?;
                             if !cell.is_blank() {
-                                if let Some(cells) = rows.as_deref_mut() { cells.push((here, cell)); }
-                                else { dst.sheet.set(here.0, here.1, cell); }
+                                if let Some((ref mut cells, _)) = batch_out {
+                                    cells.push((here, cell));
+                                } else {
+                                    dst.sheet.set(here.0, here.1, cell);
+                                }
                             }
                             depth -= 1;
                         }
@@ -710,12 +1073,11 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                     in_data = false;
                 }
                 if depth == 2 && in_data && tag.as_ref() == "row" {
-                    if !keep_row {
-                        shell.push_str(&xml[copied..start]);
-                        copied = r.buffer_position() as usize;
-                    }
+                    shell.push_str(&xml[copied..start]);
+                    copied = r.buffer_position() as usize;
                     pos.0 = pos.0.saturating_add(1);
                     pos.1 = 0;
+                    row_has_xf = false;
                 }
             }
             Event::Eof => break,
@@ -733,21 +1095,20 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
 
 fn expand_shared(dst: &mut Loaded, f: Formulas) -> Result<()> {
     for ((r, c), si) in f.children {
-        let ((mr, mc), rect, master) = f.masters.get(&si).context("共享公式缺少主单元格")?;
-        ensure!(
-            (rect.0..=rect.2).contains(&r) && (rect.1..=rect.3).contains(&c),
-            "共享公式子单元格在声明范围外"
-        );
-        let f = crate::refs::translate(
-            master,
-            i64::from(r) - i64::from(*mr),
-            i64::from(c) - i64::from(*mc),
-            &dst.sheet.name,
-        );
-        let mut cc = dst.sheet.get(r, c).cloned().unwrap_or_default();
-        cc.formula =
-            Some(crate::normalize_formula(&format!("={}", f.trim_start_matches('='))).into());
-        dst.sheet.set(r, c, cc);
+        let master_entry = f.masters.get(&si).context("共享公式缺少主单元格")?;
+        let formula = translate_shared_child(master_entry, (r, c), &dst.sheet.name)?;
+        if let Some(existing) = dst.sheet.get_mut(r, c) {
+            existing.formula = Some(formula);
+        } else {
+            dst.sheet.set(
+                r,
+                c,
+                Cell {
+                    value: Value::Empty,
+                    formula: Some(formula),
+                },
+            );
+        }
     }
     Ok(())
 }
@@ -757,17 +1118,26 @@ impl Loaded {
         let mut sheet = Sheet::new(name);
         sheet.source_part = Some(part.to_owned());
         sheet.loading = true;
-        Self { sheet, xfs: Vec::new(), layout: None, diag: Default::default() }
+        Self {
+            sheet,
+            xfs: Vec::new(),
+            row_layout: RowLayout::default(),
+            layout: None,
+            diag: Default::default(),
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn worksheets(
     path: &Path,
     zip: &mut zip::ZipArchive<File>,
     header: &Header,
     targets: &HashMap<String, String>,
+    style_lookup: &StyleLookup<'_>,
     dxfs: &[crate::cf::Dxf],
     dxf_ext: bool,
+    has_drawing: bool,
 ) -> Result<Vec<Loaded>> {
     let names = &header.names;
     let mut shared = strings(zip).context("读取 xl/sharedStrings.xml 失败")?;
@@ -776,23 +1146,32 @@ pub(super) fn worksheets(
         .iter()
         .map(|n| targets.get(n).and_then(|p| signature(zip, p)))
         .collect();
-    let largest = signatures
+    // Streaming worksheets (>= 1 MiB) use bounded row chunks rather than whole-sheet buffers,
+    // so only buffered sheets (< 1 MiB) count toward the uncompressed memory cap.
+    let largest_buffered = signatures
         .iter()
-        .flatten()
-        .map(|(_, size)| *size)
+        .enumerate()
+        .filter_map(|(idx, sig)| {
+            let (_, size) = (*sig)?;
+            let streamed = header.types.get(idx) == Some(&calamine::SheetType::WorkSheet)
+                && size >= 1024 * 1024;
+            (!streamed).then_some(size)
+        })
         .max()
         .unwrap_or(1)
         .max(1);
-    // Limit simultaneous uncompressed worksheet buffers, independently of selected CPU count.
-    let cores = std::thread::available_parallelism().map_or(1, usize::from).min(4);
-    let workers = cores.min(names.len())
-        .min((128_000_000 / largest).max(1) as usize)
+    let cores = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8);
+    let workers = cores
+        .min(names.len())
+        .min((128_000_000 / largest_buffered).max(1) as usize)
         .max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let run = |zip: &mut zip::ZipArchive<File>| -> Result<Vec<(usize, Loaded)>> {
         let mut sheets = Vec::new();
         loop {
-            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let index = next.fetch_add(1, Ordering::Relaxed);
             let Some(name) = names.get(index) else { break };
             let part = targets.get(name).context("工作表缺少部件路径")?;
             ensure!(
@@ -801,32 +1180,62 @@ pub(super) fn worksheets(
             );
             let mut loaded = Loaded::empty(name, part);
             let typ = header.types[index];
-            let parsed = if typ == calamine::SheetType::WorkSheet
-                && signatures[index].is_some_and(|(_, size)| size >= 1024 * 1024) {
+            let sheet_size = signatures[index].map_or(0, |(_, sz)| sz);
+            let parsed = if typ == calamine::SheetType::WorkSheet && sheet_size >= 1024 * 1024 {
                 let entry = zip.by_name(part)?;
-                super::delta::stream::xml_input(entry, part, |input|
-                    stream::worksheet(input, &shared, &mut loaded, cores / workers, 256 * 1024))
+                let mut stream_workers = (cores / workers).max(1);
+                if stream_workers == 1 && cores >= 2 && sheet_size >= 4 * 1024 * 1024 {
+                    stream_workers = 2;
+                }
+                super::delta::stream::xml_input(entry, part, |input| {
+                    stream::worksheet_with_styles(
+                        input,
+                        &shared,
+                        Some(style_lookup),
+                        &mut loaded,
+                        stream_workers,
+                        256 * 1024,
+                    )
+                })
             } else {
-                xml_part(zip, part).and_then(|xml| parse(&xml, &shared, &mut loaded, typ))
+                xml_part(zip, part)
+                    .and_then(|xml| parse(&xml, &shared, Some(style_lookup), &mut loaded, typ))
             };
             match parsed {
                 Ok(shell) => {
-                    for (anchor,(h,w)) in loaded.sheet.spill_shapes.clone() {
-                        if loaded.sheet.value(anchor.row,anchor.col) == Value::Error(crate::formula::ErrKind::Spill) {
-                            loaded.sheet.spill_shapes.insert(anchor,(0,0));
+                    for (anchor, (h, w)) in loaded.sheet.spill_shapes.clone() {
+                        if loaded.sheet.value(anchor.row, anchor.col)
+                            == Value::Error(crate::formula::ErrKind::Spill)
+                        {
+                            loaded.sheet.spill_shapes.insert(anchor, (0, 0));
                         } else {
-                            let tails: Vec<_> = loaded.sheet.iter_rect((anchor.row,anchor.col,anchor.row+h-1,anchor.col+w-1))
-                                .filter_map(|(k,c)| (k != anchor && c.formula.is_none()).then_some(k)).collect();
+                            let tails: Vec<_> = loaded
+                                .sheet
+                                .iter_rect((
+                                    anchor.row,
+                                    anchor.col,
+                                    anchor.row + h - 1,
+                                    anchor.col + w - 1,
+                                ))
+                                .filter_map(|(k, c)| {
+                                    (k != anchor && c.formula.is_none()).then_some(k)
+                                })
+                                .collect();
                             loaded.sheet.spilled.extend(tails);
                         }
                     }
-                    loaded.layout =
-                        Some(crate::merges::sheet_layout(&shell, dxfs, dxf_ext));
+                    let mut layout = crate::merges::sheet_layout(&shell, dxfs, dxf_ext);
+                    loaded.row_layout.apply_to(&mut layout);
+                    loaded.layout = Some(layout);
                     loaded.sheet.page = crate::page::parse_page_setup(&shell);
-                    loaded.sheet.textboxes =
-                        crate::textbox::load_from_sheet(path, part, &shell);
-                    loaded.sheet.hyperlinks =
-                        crate::hyperlinks::load_sheet(path, part, &shell).into();
+                    if has_drawing && shell.contains("drawing") {
+                        loaded.sheet.textboxes =
+                            crate::textbox::load_from_sheet(path, part, &shell);
+                    }
+                    if shell.contains("hyperlink") {
+                        loaded.sheet.hyperlinks =
+                            crate::hyperlinks::load_sheet(path, part, &shell).into();
+                    }
                     if shell.contains("sparkline") {
                         loaded.sheet.sparklines = crate::sparkline::parse_sheet(&shell);
                         loaded.sheet.sparklines.sort_by_key(|s| (s.c, s.r));
@@ -870,53 +1279,74 @@ mod tests {
     fn parallel_row_chunks_match_serial_layout_shared_formulas_rich_text_and_caches() {
         let mut xml = String::from("<worksheet><sheetPr/><sheetData>");
         for row in 1..=80 {
-            let f = if row == 1 { r#"<f t="shared" si="1" ref="B1:B80">A1+2</f>"# }
-                else { r#"<f t="shared" si="1"/>"# };
-            xml.push_str(&format!(r#"<row r="{row}" ht="24"><c r="A{row}" s="2"><v>{row}</v></c><c r="B{row}">{f}<v>9</v></c><c t="inlineStr"><is><r><rPr><b/></rPr><t>字</t></r></is></c></row>"#));
+            let f = if row == 1 {
+                r#"<f t="shared" si="1" ref="B1:B80">A1+2</f>"#
+            } else {
+                r#"<f t="shared" si="1"/>"#
+            };
+            xml.push_str(&format!(
+                r#"<row r="{row}" ht="24" customHeight="1"><c r="A{row}" s="2"><v>{row}</v></c><c r="B{row}">{f}<v>9</v></c><c t="inlineStr"><is><r><rPr><b/></rPr><t>字</t></r></is></c></row>"#
+            ));
         }
         xml.push_str("</sheetData><extLst/></worksheet>");
         let table = Strings::default();
         let typ = calamine::SheetType::WorkSheet;
         let mut serial = Loaded::empty("Data", "sheet");
-        let shell = parse(&xml, &table, &mut serial, typ).unwrap();
-        let mut parallel = Loaded::empty("Data","sheet");
+        let shell = parse(&xml, &table, None, &mut serial, typ).unwrap();
+        let mut parallel = Loaded::empty("Data", "sheet");
         let row_shell = stream::worksheet(xml.as_bytes(), &table, &mut parallel, 3, 1100).unwrap();
         assert_eq!(row_shell, shell);
         assert_eq!(parallel.xfs, serial.xfs);
+        assert_eq!(parallel.row_layout.row_heights, serial.row_layout.row_heights);
+        assert_eq!(parallel.row_layout.row_heights.len(), 80);
         assert_eq!(parallel.sheet.rich, serial.sheet.rich);
-        assert_eq!(parallel.sheet.iter().collect::<Vec<_>>(), serial.sheet.iter().collect::<Vec<_>>());
+        assert_eq!(
+            parallel.sheet.iter().collect::<Vec<_>>(),
+            serial.sheet.iter().collect::<Vec<_>>()
+        );
         assert_eq!(parallel.sheet.get(79, 1).unwrap().formula.as_deref(), Some("=A80+2"));
         let commented = xml.replace("<sheetData>", "<sheetData><!-- <row r='200'> -->");
-        let mut comments = Loaded::empty("Data","sheet");
+        let mut comments = Loaded::empty("Data", "sheet");
         let kept = stream::worksheet(commented.as_bytes(), &table, &mut comments, 3, 1100).unwrap();
         assert!(kept.contains("<!-- <row r='200'> -->"));
         let broken = xml.replace("ref=\"B1:B80\"", "ref=\"B1:B3\"");
-        assert!(stream::worksheet(broken.as_bytes(), &table, &mut Loaded::empty("Data","sheet"), 3, 1100).is_err());
-        assert!(parse(&broken, &table, &mut Loaded::empty("Data", "sheet"), typ).is_err());
+        assert!(stream::worksheet(broken.as_bytes(), &table, &mut Loaded::empty("Data", "sheet"), 3, 1100).is_err());
+        assert!(parse(&broken, &table, None, &mut Loaded::empty("Data", "sheet"), typ).is_err());
     }
 
     #[test]
     fn opened_utf16_sheet_streams_implicit_rows_across_batches_and_resolves_late_masters() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rows.xlsx");
-        super::super::save_atomic(&path,&Workbook::new_blank()).unwrap();
+        super::super::save_atomic(&path, &Workbook::new_blank()).unwrap();
         let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-16"?><s:worksheet xmlns:s="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><s:sheetData>"#);
         let filler = "文".repeat(1100);
         for row in 1..=550 {
-            let f = if row == 550 { r#"<s:f t="shared" si="3" ref="B1:B550">A550+1</s:f>"# }
-                else { r#"<s:f t="shared" si="3"/>"# };
-            xml.push_str(&format!(r#"<s:row ht="23"><s:c><s:v>{row}</s:v></s:c><s:c>{f}<s:v>1</s:v></s:c><s:c t="inlineStr"><s:is><s:t>{filler}</s:t></s:is></s:c></s:row>"#));
+            let f = if row == 550 {
+                r#"<s:f t="shared" si="3" ref="B1:B550">A550+1</s:f>"#
+            } else {
+                r#"<s:f t="shared" si="3"/>"#
+            };
+            xml.push_str(&format!(
+                r#"<s:row ht="23"><s:c><s:v>{row}</s:v></s:c><s:c>{f}<s:v>1</s:v></s:c><s:c t="inlineStr"><s:is><s:t>{filler}</s:t></s:is></s:c></s:row>"#
+            ));
         }
         xml.push_str("</s:sheetData></s:worksheet>");
-        let bytes: Vec<_> = [0xfe,0xff].into_iter().chain(xml.encode_utf16().flat_map(u16::to_be_bytes)).collect();
-        crate::fixups::write_parts(&path,&[("xl/worksheets/sheet1.xml".into(),bytes)]).unwrap();
-        let (wb,diag) = super::super::load_diag(&path).unwrap();
-        assert!(!diag.has_fatal(),"{:?}",diag.problems);
+        let bytes: Vec<_> = [0xfe, 0xff]
+            .into_iter()
+            .chain(xml.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        crate::fixups::write_parts(&path, &[("xl/worksheets/sheet1.xml".into(), bytes)]).unwrap();
+        let (wb, diag) = super::super::load_diag(&path).unwrap();
+        assert!(!diag.has_fatal(), "{:?}", diag.problems);
         let sheet = wb.sheet(0);
-        for row in [0,202,549] {
-            assert_eq!(sheet.value(row,0),Value::Number((row+1) as f64));
-            assert_eq!(sheet.get(row,1).unwrap().formula.as_deref().unwrap(),format!("=A{}+1",row+1));
-            assert_eq!(sheet.value(row,2), Value::Text(filler.as_str().into()));
+        for row in [0, 202, 549] {
+            assert_eq!(sheet.value(row, 0), Value::Number((row + 1) as f64));
+            assert_eq!(
+                sheet.get(row, 1).unwrap().formula.as_deref().unwrap(),
+                format!("=A{}+1", row + 1)
+            );
+            assert_eq!(sheet.value(row, 2), Value::Text(filler.as_str().into()));
         }
     }
 

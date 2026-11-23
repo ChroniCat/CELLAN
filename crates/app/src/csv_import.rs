@@ -57,24 +57,20 @@ fn check_cancelled(cancel: &AtomicBool) -> Result<(), String> {
 }
 
 pub(super) struct ParsedCsv {
-    pub rows: Vec<Vec<String>>,
+    pub preview_rows: Vec<Vec<String>>,
+    pub row_count: usize,
     pub cols: usize,
     pub delim: char,
     pub encoding: Encoding,
+    pub raw_bytes: Option<Arc<Vec<u8>>>,
 }
 
-fn read_csv(
-    path: &Path,
-    delim: Option<char>,
-    encoding: Option<Encoding>,
-    quote: char,
-    sniff_comma: bool,
-    cancel: &AtomicBool,
-) -> Result<ParsedCsv, String> {
+fn read_csv_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
     let read_err = |e| format!("读不了 {}：{e}", path.display());
     let mut file = std::fs::File::open(path).map_err(read_err)?;
-    let mut bytes = Vec::new();
-    let mut chunk = vec![0; 128 * 1024];
+    let cap = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
+    let mut chunk = vec![0; 256 * 1024];
     loop {
         check_cancelled(cancel)?;
         let n = file.read(&mut chunk).map_err(read_err)?;
@@ -83,8 +79,19 @@ fn read_csv(
         }
         bytes.extend_from_slice(&chunk[..n]);
     }
-    let (text, encoding, bad) = csv::decode(&bytes, encoding);
-    drop(bytes);
+    Ok(bytes)
+}
+
+fn read_csv_summary(
+    path: &Path,
+    delim: Option<char>,
+    encoding: Option<Encoding>,
+    quote: char,
+    sniff_comma: bool,
+    cancel: &AtomicBool,
+) -> Result<ParsedCsv, String> {
+    let bytes = read_csv_bytes(path, cancel)?;
+    let (text, encoding, bad) = csv::decode_cow(&bytes, encoding);
     check_cancelled(cancel)?;
     if bad {
         return Err("所选编码无法完整解码这个文件".into());
@@ -96,16 +103,23 @@ fn read_csv(
         }
         Some(ch) => ch,
     };
-    let rows = csv::records_strict_while(&text, delim, quote, || !cancel.load(Ordering::Relaxed))?;
-    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    if !within_grid((0, 0), rows.len(), cols) {
+    let summary = csv::scan_summary_while(&text, delim, quote, encoding, 8, || {
+        !cancel.load(Ordering::Relaxed)
+    })?;
+    if !within_grid((0, 0), summary.row_count, summary.cols) {
         return Err("数据超出工作表边界".into());
     }
+    drop(text);
+    // Retain raw file bytes up to 64 MiB so confirming the wizard avoids re-reading disk,
+    // without holding hundreds of megabytes of per-cell String objects in memory.
+    let raw_bytes = (bytes.len() <= 64 * 1024 * 1024).then(|| Arc::new(bytes));
     Ok(ParsedCsv {
-        rows,
-        cols,
-        delim,
-        encoding,
+        preview_rows: summary.preview_rows,
+        row_count: summary.row_count,
+        cols: summary.cols,
+        delim: summary.delim,
+        encoding: summary.encoding,
+        raw_bytes,
     })
 }
 
@@ -117,6 +131,7 @@ pub(super) struct CsvDlg {
     pub used_encoding: Encoding,
     pub quote: char,
     pub text_cols: std::collections::BTreeSet<u32>,
+    fast_preview: Vec<Vec<String>>,
     records: Option<ParsedCsv>,
     pub cols: usize,
     pub err: Option<String>,
@@ -135,6 +150,7 @@ impl CsvDlg {
             used_encoding: Encoding::Utf8,
             quote: '"',
             text_cols: Default::default(),
+            fast_preview: Vec::new(),
             records: None,
             cols: 0,
             err: None,
@@ -148,13 +164,26 @@ impl CsvDlg {
 
     pub fn reload(&mut self) {
         self.discard_records();
+        self.fast_preview.clear();
         self.cols = 0;
         self.err = None;
+        // For files > 64 KiB, sample the first 64 KiB immediately (< 1ms) so the wizard
+        // shows the 8-row preview right away while background tail validation completes.
+        if self.path.metadata().is_ok_and(|m| m.len() > 64 * 1024) {
+            if let Some((rows, cols, delim, enc)) =
+                csv::read_preview_head(&self.path, self.enc, self.quote, 8)
+            {
+                self.fast_preview = rows;
+                self.cols = cols;
+                self.delim = delim;
+                self.used_encoding = enc;
+            }
+        }
         let path = self.path.clone();
         let encoding = self.enc;
         let quote = self.quote;
         self.pending = Some(Worker::start(move |cancel| {
-            read_csv(&path, None, encoding, quote, true, cancel)
+            read_csv_summary(&path, None, encoding, quote, true, cancel)
         }));
     }
 
@@ -169,6 +198,7 @@ impl CsvDlg {
     }
 
     fn apply(&mut self, result: Result<ParsedCsv, String>) {
+        self.fast_preview.clear();
         match result {
             Ok(data) => {
                 self.cols = data.cols;
@@ -176,19 +206,24 @@ impl CsvDlg {
                 self.used_encoding = data.encoding;
                 self.records = Some(data);
             }
-            Err(err) => self.err = Some(err),
+            Err(err) => {
+                self.cols = 0;
+                self.err = Some(err);
+            }
         }
     }
 
     pub(super) fn preview(&self) -> &[Vec<String>] {
-        self.records
-            .as_ref()
-            .map_or(&[], |data| &data.rows[..data.rows.len().min(8)])
+        if let Some(data) = &self.records {
+            &data.preview_rows[..data.preview_rows.len().min(8)]
+        } else {
+            &self.fast_preview[..self.fast_preview.len().min(8)]
+        }
     }
 
     fn discard_records(&mut self) {
         if let Some(data) = self.records.take() {
-            if data.rows.len() > 4096 {
+            if data.raw_bytes.as_ref().is_some_and(|b| b.len() > 1024 * 1024) {
                 std::thread::spawn(move || drop(data));
             }
         }
@@ -306,14 +341,6 @@ fn prepare(
 ) -> Result<PreparedImport, String> {
     let mut result = before.reorder_snapshot();
     let mut keys = Vec::new();
-    let mut write = |r, c, cell| {
-        if keys.len() % 1024 == 0 {
-            check_cancelled(cancel)?;
-        }
-        keys.push((r, c));
-        result.set(r, c, cell);
-        Ok::<_, String>(())
-    };
     let mut location = Workbook::new_blank();
     location.path = path;
     let sizes = |sources: &[Source]| {
@@ -332,30 +359,64 @@ fn prepare(
             mut opts,
             parsed,
         } => {
-            let data = match parsed {
-                Some(data) => data,
-                None => read_csv(&path, Some(delim), opts.encoding, opts.quote, true, cancel)?,
+            let owned_bytes;
+            let (raw_slice, actual_delim, actual_enc) = if let Some(ref data) = parsed {
+                if data.row_count == 0 {
+                    return Err("这个文件里没有可导入的内容".into());
+                }
+                if !within_grid(target.at, data.row_count, data.cols) {
+                    return Err("数据超出工作表边界".into());
+                }
+                let slice: &[u8] = if let Some(ref arc) = data.raw_bytes {
+                    arc.as_slice()
+                } else {
+                    owned_bytes = read_csv_bytes(&path, cancel)?;
+                    owned_bytes.as_slice()
+                };
+                (slice, delim, data.encoding)
+            } else {
+                owned_bytes = read_csv_bytes(&path, cancel)?;
+                let (probe, enc, bad) = csv::decode_cow(&owned_bytes, opts.encoding);
+                if bad {
+                    return Err("所选编码无法完整解码这个文件".into());
+                }
+                let d = if delim == ',' && !probe.lines().next().unwrap_or("").contains(',') {
+                    csv::sniff(&probe)
+                } else {
+                    delim
+                };
+                (owned_bytes.as_slice(), d, enc)
             };
-            if data.rows.is_empty() {
-                return Err("这个文件里没有可导入的内容".into());
+            let (text, used_enc, bad) = csv::decode_cow(raw_slice, Some(actual_enc));
+            check_cancelled(cancel)?;
+            if bad {
+                return Err("所选编码无法完整解码这个文件".into());
             }
-            if !within_grid(target.at, data.rows.len(), data.cols) {
-                return Err("数据超出工作表边界".into());
-            }
-            opts.encoding = Some(data.encoding);
-            let size = external::visit_csv_records(
-                data.rows,
+            opts.encoding = Some(used_enc);
+            let (rows, cols, imported_keys) = external::import_csv_str_parallel(
+                &mut result,
+                &text,
+                actual_delim,
+                opts.quote,
                 header,
                 &opts.text_cols,
                 (0, 0),
                 target.at,
-                &mut write,
+                &|| !cancel.load(Ordering::Relaxed),
             )?;
+            if rows == 0 {
+                return Err("这个文件里没有可导入的内容".into());
+            }
+            if !within_grid(target.at, rows as usize, cols as usize) {
+                return Err("数据超出工作表边界".into());
+            }
+            keys = imported_keys;
+            let size = (rows, cols);
             registration = Some(Registration {
                 file: path,
                 at: target.at,
                 size,
-                delim: data.delim,
+                delim: actual_delim,
                 header,
                 opts,
             });
@@ -375,29 +436,34 @@ fn prepare(
                     } => {
                         let opts = src.csv_opts.clone().unwrap_or_default();
                         let real = external::resolve_path(&location, path);
-                        let data = read_csv(
-                            &real,
-                            Some(*delim),
-                            opts.encoding,
-                            opts.quote,
-                            false,
-                            cancel,
-                        )?;
-                        if !within_grid(
-                            src.at,
-                            data.rows.len().max(src.rows as usize),
-                            data.cols.max(src.cols as usize),
-                        ) {
-                            return Err("数据超出工作表边界".into());
+                        let raw_bytes = read_csv_bytes(&real, cancel)?;
+                        let (text, _enc, bad) = csv::decode_cow(&raw_bytes, opts.encoding);
+                        check_cancelled(cancel)?;
+                        if bad {
+                            return Err("所选编码无法完整解码这个文件".into());
                         }
-                        external::visit_csv_records(
-                            data.rows,
+                        let mut scratch_sheet = result.clone();
+                        let (rows, cols, mut src_keys) = external::import_csv_str_parallel(
+                            &mut scratch_sheet,
+                            &text,
+                            *delim,
+                            opts.quote,
                             *header,
                             &opts.text_cols,
                             (src.rows, src.cols),
                             src.at,
-                            &mut write,
-                        )
+                            &|| !cancel.load(Ordering::Relaxed),
+                        )?;
+                        if !within_grid(
+                            src.at,
+                            (rows as usize).max(src.rows as usize),
+                            (cols as usize).max(src.cols as usize),
+                        ) {
+                            return Err("数据超出工作表边界".into());
+                        }
+                        result = scratch_sheet;
+                        keys.append(&mut src_keys);
+                        Ok((rows, cols))
                     }
                     Kind::Internal {
                         sheet,
@@ -419,12 +485,24 @@ fn prepare(
                         {
                             return Err("来源区域超出工作表边界".into());
                         }
-                        external::visit_source_sheet(
+                        let mut scratch_sheet = result.clone();
+                        let mut src_keys = Vec::new();
+                        let res = external::visit_source_sheet(
                             sh,
                             (*r, *c, *end_r, *end_c),
                             src.at,
-                            &mut write,
-                        )
+                            &mut |r, c, cell| {
+                                if src_keys.len() % 1024 == 0 {
+                                    check_cancelled(cancel)?;
+                                }
+                                src_keys.push((r, c));
+                                scratch_sheet.set(r, c, cell);
+                                Ok::<_, String>(())
+                            },
+                        )?;
+                        result = scratch_sheet;
+                        keys.append(&mut src_keys);
+                        Ok(res)
                     }
                 })();
                 check_cancelled(cancel)?;
@@ -467,15 +545,50 @@ fn prepare(
             )
         }
     };
-    keys.sort_unstable();
-    keys.dedup();
-    let mut deltas = Vec::new();
-    for chunk in keys.chunks(4096) {
-        check_cancelled(cancel)?;
-        deltas.extend(undo::finish(
-            undo::capture(&before, target.sheet, chunk),
-            &result,
-        ));
+    if !keys.windows(2).all(|w| w[0] < w[1]) {
+        keys.sort_unstable();
+        keys.dedup();
+    }
+    let mut deltas = Vec::with_capacity(keys.len().min(65_536));
+    if before.is_empty() {
+        let sheet_idx = target.sheet;
+        for (i, &(r, c)) in keys.iter().enumerate() {
+            if (i & 4095) == 0 {
+                check_cancelled(cancel)?;
+            }
+            let after_style = result.style_of(r, c);
+            if let Some(after) = result.get(r, c) {
+                if !after.is_blank() || after_style != 0 {
+                    deltas.push(undo::CellDelta {
+                        sheet: sheet_idx,
+                        row: r,
+                        col: c,
+                        before: sheetcore::Cell::default(),
+                        after: after.clone(),
+                        before_style: 0,
+                        after_style,
+                    });
+                }
+            } else if after_style != 0 {
+                deltas.push(undo::CellDelta {
+                    sheet: sheet_idx,
+                    row: r,
+                    col: c,
+                    before: sheetcore::Cell::default(),
+                    after: sheetcore::Cell::default(),
+                    before_style: 0,
+                    after_style,
+                });
+            }
+        }
+    } else {
+        for chunk in keys.chunks(4096) {
+            check_cancelled(cancel)?;
+            deltas.extend(undo::finish(
+                undo::capture(&before, target.sheet, chunk),
+                &result,
+            ));
+        }
     }
     let changed = deltas.len();
     let broadcast = if target.room.is_some() {
@@ -718,6 +831,14 @@ impl SheetApp {
     }
 
     pub(super) fn csv_job_ui(&mut self, ctx: &egui::Context) {
+        if let Some(hash) = self.tasks.poll_base_hash(&self.wb, &mut self.wb_base_hash) {
+            if let Some(n) = &self.net {
+                if n.hosting && !self.wb.dirty {
+                    n.set_base_hash(hash);
+                }
+            }
+        }
+        self.tasks.poll_pdf_export(&mut self.status, ctx);
         if self.csv_job.is_none() {
             return;
         }
@@ -1064,7 +1185,7 @@ mod tests {
         dialog.wait_preview();
         assert_eq!(dialog.cols, 3);
         assert_eq!(dialog.preview().len(), 8);
-        assert_eq!(dialog.records.as_ref().unwrap().rows.len(), 34_001);
+        assert_eq!(dialog.records.as_ref().unwrap().row_count, 34_001);
         csv.push_str("\"unterminated");
         std::fs::write(&path, csv).unwrap();
         dialog.reload();
