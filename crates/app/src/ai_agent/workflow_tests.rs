@@ -464,3 +464,185 @@ fn ai_executes_multi_step_workflow_beyond_eight_rounds() {
         assert_eq!(chat.app.wb.sheet(0).value(step, 0), Value::Empty);
     }
 }
+
+#[test]
+fn ai_large_data_operation_completes_asynchronously_without_false_conflict_and_supports_undo() {
+    let mut chat = Conversation::new();
+    // 6,000 × 4 = 24,000 cells (> ASYNC_REORDER_CELLS = 20,000), triggering background run_reorder!
+    let sh = chat.app.wb.sheet_mut(0);
+    for row in 0..6_000u32 {
+        let v = f64::from(6_000 - row);
+        for col in 0..4u32 {
+            sh.set(
+                row,
+                col,
+                Cell {
+                    value: Value::Number(v + f64::from(col)),
+                    formula: None,
+                },
+            );
+        }
+    }
+
+    chat.app.start_ai_prompt("先查看顶部数据再对 A1:D6000 升序排序".into());
+    let (first, _) = chat.request();
+    respond(first, tool_event("inspect_sheet", json!({"range": "A1:D5"})));
+
+    let (second, _) = chat.request();
+    respond(
+        second,
+        tool_event(
+            "data_operation",
+            json!({"op": "sort_asc", "range": "A1:D6000"}),
+        ),
+    );
+    // Large sort on populated cells stages a confirmation card; approve it, then await async reorder!
+    chat.poll_until(|app| app.ai.confirmation_label.is_some());
+    chat.app.answer_ai_confirmation(true, &chat.ctx);
+
+    let (third, followup) = chat.request();
+    let tool_msg = followup["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(tool_msg["role"], "tool");
+    let parsed: JsonValue = serde_json::from_str(tool_msg["content"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed["ok"], true, "async reorder must report ok=true: {parsed}");
+    assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+    assert_eq!(chat.app.wb.sheet(0).value(5_999, 0), Value::Number(6_000.0));
+
+    respond(
+        third,
+        json!({"choices":[{"delta":{"content":"已完成 6000 行升序排序"}}]}),
+    );
+    chat.poll_until(|app| !app.ai.busy);
+    let last = chat.app.ai.messages.last().unwrap();
+    assert!(last.error.is_none(), "unexpected conflict error: {:?}", last.error);
+    assert_eq!(last.undo_ids.len(), 1);
+
+    chat.app.undo_last_ai_change();
+    assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Number(6_000.0));
+}
+
+#[test]
+fn ai_manual_large_workbook_reuses_calc_base_deps_and_broadcasts_fill_formula_styles() {
+    let mut chat = Conversation::new();
+    chat.app.manual_calc = true;
+    chat.app.wb.calc_manual = true;
+    chat.app.wb.calc_pending = true;
+    chat.app.deps_built = false;
+
+    // Pair with a LAN Guest so we also verify tool_fill_formula_range broadcasts number formats!
+    let (net_host, port) = crate::net::host_for_test(1, "Host", "ai-fill-doc", "pw");
+    let mut peer_host = sheetcore::sync::Peer::new(1);
+    for row in 0..3_000u32 {
+        chat.app.wb.sheet_mut(0).set(
+            row,
+            0,
+            Cell {
+                value: Value::Number(f64::from(row + 1)),
+                formula: None,
+            },
+        );
+    }
+    peer_host.seed_workbook(&chat.app.wb);
+    net_host.seed_snapshot(
+        &peer_host,
+        &chat.app.wb,
+        sheetcore::sync::Cursor {
+            site: 1,
+            name: "Host".into(),
+            color: 1,
+            sheet: 0,
+            row: 0,
+            col: 0,
+        },
+    );
+    chat.app.peer = Some(peer_host);
+    chat.app.net = Some(net_host);
+    chat.app.undo.set_site(1);
+
+    let mut guest = SheetApp::new_with_context(&chat.ctx, None);
+    guest.net = Some(
+        crate::net::join(
+            2,
+            "Guest".into(),
+            "ai-fill-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap(),
+    );
+    guest.peer = Some(sheetcore::sync::Peer::new(2));
+    let sync_deadline = Instant::now() + Duration::from_secs(8);
+    while guest.in_snapshot || guest.wb.sheet(0).value(2_999, 0) != Value::Number(3_000.0) {
+        chat.app.poll_net();
+        guest.poll_net();
+        assert!(Instant::now() < sync_deadline, "guest sync timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    chat.app.start_ai_prompt("在手动重算大表上填充公式并设置格式".into());
+    let (first, _) = chat.request();
+    respond(
+        first,
+        tool_event(
+            "fill_formula_range",
+            json!({
+                "range": "B1:B50",
+                "top_left_formula": "=A1*2",
+                "format": "0.00"
+            }),
+        ),
+    );
+    let (second, req2) = chat.request();
+    assert!(!chat.app.deps_built, "manual mode must not force live deps_built");
+    assert!(
+        chat.app
+            .ai
+            .calc_base
+            .as_ref()
+            .is_some_and(|b| b.has_deps()),
+        "AiCalcBase must retain built Deps after initial manual snapshot calc"
+    );
+    let obs1: JsonValue = serde_json::from_str(
+        req2["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(obs1["ok"], true);
+    assert_eq!(obs1["samples"][0]["value"], "2");
+
+    // Round 2 write overwrites A1 (approving confirmation) and reuses AiCalcBase.deps incrementally!
+    respond(
+        second,
+        tool_event("set_cells", json!({"edits": [{"cell": "A1", "value": 10}]})),
+    );
+    chat.poll_until(|app| app.ai.confirmation_label.is_some());
+    chat.app.answer_ai_confirmation(true, &chat.ctx);
+    let (third, _) = chat.request();
+    respond(third, tool_event("inspect_sheet", json!({"range": "B1:B2"})));
+    let (fourth, req4) = chat.request();
+    let obs3: JsonValue = serde_json::from_str(
+        req4["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(obs3["cells"][0]["value"], "20.00");
+    assert_eq!(obs3["cells"][1]["value"], "4.00");
+
+    respond(fourth, json!({"choices":[{"delta":{"content":"已验证"}}]}));
+    chat.poll_until(|app| !app.ai.busy);
+
+    // Verify LAN Guest received both translated formulas AND the "0.00" format broadcast!
+    let style_deadline = Instant::now() + Duration::from_secs(8);
+    while guest.wb.styles.get(guest.wb.sheet(0).style_of(49, 1)).format != "0.00" {
+        chat.app.poll_net();
+        guest.poll_net();
+        assert!(Instant::now() < style_deadline, "guest did not receive fill_formula_range format");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        guest.wb.sheet(0).get(49, 1).unwrap().formula.as_deref(),
+        Some("A50*2")
+    );
+}

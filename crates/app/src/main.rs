@@ -5367,6 +5367,17 @@ impl SheetApp {
                     } else if let Some(addr) = self.tasks.pending_join.take() {
                         self.join_addr = addr;
                         self.join_shared();
+                    } else if self
+                        .wb
+                        .path
+                        .as_ref()
+                        .is_some_and(|p| {
+                            let s = p.to_string_lossy();
+                            s.starts_with(r"\\") || s.starts_with("//")
+                        })
+                    {
+                        // UNC 网络共享路径推迟至首帧渲染后的自动发现轮询，避免 SMB 元数据读取阻塞开表首帧
+                        self.auto_tick = None;
                     } else {
                         // 没指定角色：看看文件旁边有没有同事留下的占用卡
                         self.try_auto_join();
@@ -7175,7 +7186,8 @@ impl SheetApp {
         }
         self.rev.push(entry);
         if self.rev.len() > 200 {
-            self.rev.remove(0);
+            let overflow = self.rev.len() - 200;
+            self.rev.drain(0..overflow);
         }
     }
 
@@ -7187,7 +7199,7 @@ impl SheetApp {
             .unwrap_or_else(|| format!("用户#{site}"))
     }
 
-    /// 远端改动也进日志（只展示，不给撤回）
+    /// 远端改动也进日志（按站点+工作表合并为单条日志并采样封顶 `MAX_CELLS = 200`，消除十万格逐条分配与头部搬移）
     fn record_remote_ops(
         &mut self,
         ops: &[sheetcore::sync::Op],
@@ -7196,28 +7208,59 @@ impl SheetApp {
         let Some(path) = self.wb.path.clone() else {
             return;
         };
-        for (op, before) in ops.iter().zip(befores.into_iter()) {
-            let Some(sheet) = self.wb.sheets.get(op.sheet) else {
-                continue;
-            };
-            let sheet_name = sheet.name.clone();
-            let b = before.unwrap_or_default();
-            let a = sheet.get(op.row, op.col).cloned().unwrap_or_default();
-            if b.value == a.value && b.formula == a.formula {
+        let mut befores_iter = befores.into_iter();
+        let mut current_group: Option<(u32, usize, sheetcore::revision::Entry, usize)> = None;
+        for op in ops {
+            let before_opt = befores_iter.next().flatten();
+            if op.sheet >= self.wb.sheets.len() {
                 continue;
             }
-            let who = self.peer_display_name(op.site);
-            let mut e = sheetcore::revision::Entry::new(&who, op.site, "远端编辑", &sheet_name);
-            e.remote = true;
-            e.cells.push(sheetcore::revision::Change {
-                r: op.row,
-                c: op.col,
-                before: sheetcore::revision::Snap::from_cell(&b),
-                after: sheetcore::revision::Snap::from_cell(&a),
-                before_style: None,
-                after_style: None,
-            });
-            self.add_revision(&path, e);
+            let need_new_group = current_group
+                .as_ref()
+                .is_none_or(|(s, sh, _, _)| *s != op.site || *sh != op.sheet);
+            if need_new_group {
+                if let Some((_, _, mut entry, total)) = current_group.take() {
+                    if total > 0 {
+                        if total > sheetcore::revision::MAX_CELLS {
+                            entry.note = format!("共修改 {total} 个单元格");
+                        }
+                        self.add_revision(&path, entry);
+                    }
+                }
+                let who = self.peer_display_name(op.site);
+                let sheet_name = self.wb.sheets[op.sheet].name.clone();
+                let mut e = sheetcore::revision::Entry::new(&who, op.site, "远端编辑", &sheet_name);
+                e.remote = true;
+                current_group = Some((op.site, op.sheet, e, 0));
+            }
+            let (_, _, entry, total) = current_group.as_mut().unwrap();
+            if entry.cells.len() < sheetcore::revision::MAX_CELLS {
+                let b = before_opt.unwrap_or_default();
+                let a = self.wb.sheets[op.sheet]
+                    .get(op.row, op.col)
+                    .cloned()
+                    .unwrap_or_default();
+                if b.value == a.value && b.formula == a.formula {
+                    continue;
+                }
+                entry.cells.push(sheetcore::revision::Change {
+                    r: op.row,
+                    c: op.col,
+                    before: sheetcore::revision::Snap::from_cell(&b),
+                    after: sheetcore::revision::Snap::from_cell(&a),
+                    before_style: None,
+                    after_style: None,
+                });
+            }
+            *total += 1;
+        }
+        if let Some((_, _, mut entry, total)) = current_group {
+            if total > 0 {
+                if total > sheetcore::revision::MAX_CELLS {
+                    entry.note = format!("共修改 {total} 个单元格");
+                }
+                self.add_revision(&path, entry);
+            }
         }
     }
 
@@ -8192,13 +8235,23 @@ impl SheetApp {
 
     fn broadcast_cell_styles(&self, keys: &[(usize, u32, u32)]) {
         let Some(net) = &self.net else { return };
-        for chunk in keys.chunks(128) {
+        for chunk in keys.chunks(sheetcore::sync::STYLE_PALETTE_CHUNK_ITEMS) {
             for group in chunk.chunk_by(|a, b| a.0 == b.0) {
                 let sheet = group[0].0;
                 let Some(sh) = self.wb.sheets.get(sheet) else { continue };
-                let items = group.iter().map(|&(_, r, c)| {
-                    (r, c, self.wb.styles.get(sh.style_of(r, c)).clone())
-                }).collect();
+                let mut cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
+                    std::collections::HashMap::new();
+                let items = group
+                    .iter()
+                    .map(|&(_, r, c)| {
+                        let sid = sh.style_of(r, c);
+                        let st = cache
+                            .entry(sid)
+                            .or_insert_with(|| self.wb.styles.get(sid).clone())
+                            .clone();
+                        (r, c, st)
+                    })
+                    .collect();
                 net.broadcast_style(sheet, items);
             }
         }
@@ -14744,21 +14797,26 @@ fn clear_selection(&mut self) {
                 return false;
             }
             let txn = self.txn_begin(&sparse_keys);
+            let mut axis_patch = sheetcore::sync::AxisStylePatch::default();
+            let mut sparse_wire: Vec<(u32, u32, sheetcore::style::CellStyle)> =
+                Vec::with_capacity(sparse_keys.len());
             if full_sheet {
                 let row_keys: Vec<u32> = self.wb.sheet(self.sheet_idx).row_styles.keys().copied().collect();
                 for r in row_keys {
                     let old = self.wb.sheet(self.sheet_idx).row_styles.get(&r).copied().unwrap_or(0);
                     let mut st = self.wb.styles.get(old).clone();
                     f(&mut st, r, 0);
-                    let id = self.wb.styles.intern(st);
+                    let id = self.wb.styles.intern(st.clone());
                     self.wb.sheet_mut(self.sheet_idx).set_row_style(r, id);
+                    axis_patch.rows.push((r, (id != 0).then_some(st)));
                 }
                 for c in 0..16_384u32 {
                     let old = self.wb.sheet(self.sheet_idx).col_styles.get(&c).copied().unwrap_or(0);
                     let mut st = self.wb.styles.get(old).clone();
                     f(&mut st, 0, c);
-                    let id = self.wb.styles.intern(st);
+                    let id = self.wb.styles.intern(st.clone());
                     self.wb.sheet_mut(self.sheet_idx).set_col_style(c, id);
+                    axis_patch.cols.push((c, (id != 0).then_some(st)));
                 }
             } else {
                 for (c1, c2) in full_cols {
@@ -14766,8 +14824,9 @@ fn clear_selection(&mut self) {
                         let old = self.wb.sheet(self.sheet_idx).col_styles.get(&c).copied().unwrap_or(0);
                         let mut st = self.wb.styles.get(old).clone();
                         f(&mut st, 0, c);
-                        let id = self.wb.styles.intern(st);
+                        let id = self.wb.styles.intern(st.clone());
                         self.wb.sheet_mut(self.sheet_idx).set_col_style(c, id);
+                        axis_patch.cols.push((c, (id != 0).then_some(st)));
                     }
                 }
                 for (r1, r2) in full_rows {
@@ -14775,8 +14834,9 @@ fn clear_selection(&mut self) {
                         let old = self.wb.sheet(self.sheet_idx).row_styles.get(&r).copied().unwrap_or(0);
                         let mut st = self.wb.styles.get(old).clone();
                         f(&mut st, r, 0);
-                        let id = self.wb.styles.intern(st);
+                        let id = self.wb.styles.intern(st.clone());
                         self.wb.sheet_mut(self.sheet_idx).set_row_style(r, id);
+                        axis_patch.rows.push((r, (id != 0).then_some(st)));
                     }
                 }
             }
@@ -14784,8 +14844,17 @@ fn clear_selection(&mut self) {
                 let old = self.wb.sheet(self.sheet_idx).style_of(r, c);
                 let mut st = self.wb.styles.get(old).clone();
                 f(&mut st, r, c);
-                let id = self.wb.styles.intern(st);
+                let id = self.wb.styles.intern(st.clone());
                 self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
+                sparse_wire.push((r, c, st));
+            }
+            if let Some(net) = self.net.as_ref() {
+                if !axis_patch.is_empty() {
+                    net.broadcast_axis_styles(self.sheet_idx, axis_patch);
+                }
+                if !sparse_wire.is_empty() {
+                    net.broadcast_style(self.sheet_idx, sparse_wire);
+                }
             }
             self.txn_end("设置格式", txn);
             self.wb.dirty = true;
@@ -14818,19 +14887,15 @@ fn clear_selection(&mut self) {
         if !ok {
             return false;
         }
-let txn = self.txn_begin(&keys);
-        let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
-        for (r1, c1, r2, c2) in rects.iter().copied() {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    let old = self.wb.sheet(self.sheet_idx).style_of(r, c);
-                    let mut st = self.wb.styles.get(old).clone();
-                    f(&mut st, r, c);
-                    let id = self.wb.styles.intern(st.clone());
-                    self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
-                    wire.push((r, c, st));
-                }
-            }
+        let txn = self.txn_begin(&keys);
+        let mut wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::with_capacity(keys.len());
+        for &(r, c) in &keys {
+            let old = self.wb.sheet(self.sheet_idx).style_of(r, c);
+            let mut st = self.wb.styles.get(old).clone();
+            f(&mut st, r, c);
+            let id = self.wb.styles.intern(st.clone());
+            self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
+            wire.push((r, c, st));
         }
         if let Some(net) = self.net.as_ref() {
             net.broadcast_style(self.sheet_idx, wire);
@@ -31109,14 +31174,8 @@ let txn = self.txn_begin(&keys);
     ) {
         self.locks.shift_structural(sheet, op);
         if let Some(peer) = self.peer.as_mut() {
-            peer.shift_structural(sheet, op);
             let names: Vec<_> = self.wb.sheets.iter().map(|sheet| sheet.name.clone()).collect();
-            let shifts = sheetcore::sync::structural_reference_shifts(&names,sheet,op);
-            for cell in peer.cells.values_mut() {
-                if let Some(formula) = cell.shifted_formula(&shifts) {
-                    std::sync::Arc::make_mut(cell).formula = Some(formula);
-                }
-            }
+            peer.shift_structural_with_formulas(&names, sheet, op);
         }
         if let Some((ls, lr, lc)) = self.my_lock {
             if ls == sheet {
@@ -31177,16 +31236,43 @@ let txn = self.txn_begin(&keys);
         let uid = self.doc_uid;
         match self.rejoin_outbox.as_mut() {
             Some((owner, ops)) if *owner == uid => {
+                // O(M log M) BTreeMap 去重合并，消除断线期间数万格编辑触发的 O(M²) 线性查找卡死
+                let mut by_key: std::collections::BTreeMap<
+                    (usize, u32, u32),
+                    sheetcore::sync::Op,
+                > = std::mem::take(ops)
+                    .into_iter()
+                    .map(|o| ((o.sheet, o.row, o.col), o))
+                    .collect();
                 for op in mine {
                     let key = (op.sheet, op.row, op.col);
-                    match ops.iter_mut().find(|o| (o.sheet, o.row, o.col) == key) {
+                    match by_key.get_mut(&key) {
                         Some(cur) if (cur.ts, cur.site) >= (op.ts, op.site) => {}
                         Some(cur) => *cur = op,
-                        None => ops.push(op),
+                        None => {
+                            by_key.insert(key, op);
+                        }
                     }
                 }
+                *ops = by_key.into_values().collect();
             }
-            _ => self.rejoin_outbox = Some((uid, mine)),
+            _ => {
+                let mut by_key: std::collections::BTreeMap<
+                    (usize, u32, u32),
+                    sheetcore::sync::Op,
+                > = std::collections::BTreeMap::new();
+                for op in mine {
+                    let key = (op.sheet, op.row, op.col);
+                    match by_key.get_mut(&key) {
+                        Some(cur) if (cur.ts, cur.site) >= (op.ts, op.site) => {}
+                        Some(cur) => *cur = op,
+                        None => {
+                            by_key.insert(key, op);
+                        }
+                    }
+                }
+                self.rejoin_outbox = Some((uid, by_key.into_values().collect()));
+            }
         }
     }
 
@@ -31220,8 +31306,8 @@ let txn = self.txn_begin(&keys);
             peer.apply_list_to_workbook(&mut self.wb, &keys);
         }
         if let Some(net) = self.net.as_ref() {
-            for op in to_send {
-                net.broadcast_op(op);
+            for chunk in to_send.chunks(sheetcore::sync::LIVE_OP_BATCH) {
+                net.broadcast_ops(chunk.to_vec());
             }
         }
         self.fast_recalc_cells(&keys);
@@ -31517,6 +31603,12 @@ let txn = self.txn_begin(&keys);
         if self.net.as_ref().is_some_and(|n| n.hosting) {
             return;
         }
+        let is_loopback_spec = |spec: &str| {
+            spec.split(',').all(|part| {
+                let p = part.trim();
+                p.starts_with("127.") || p.starts_with("localhost:") || p.starts_with("[::1]:")
+            })
+        };
         let session_id = session_lock::new_session_id();
         let started_ms = session_lock::now_ms();
         if let Some(path) = self.wb.path.clone() {
@@ -31525,28 +31617,42 @@ let txn = self.txn_begin(&keys);
                     let expected_dead = takeover_from
                         .filter(|s| !s.is_empty())
                         .is_some_and(|prev| info.session == prev);
-                    match session_lock::probe_host(&info) {
-                        session_lock::HostLiveness::Reachable => {
-                            self.defer_to_existing_host(&info, allow_auto_join);
+                    let fresh = session_lock::is_fresh(&info);
+                    // 已过期的死会话（expected_dead && !fresh）在非回环地址上不再同步等待 450ms TCP 超时阻塞 UI
+                    if !(expected_dead && !fresh && !is_loopback_spec(&info.join_spec())) {
+                        if allow_auto_join && fresh && !is_loopback_spec(&info.join_spec()) {
+                            let spec = info.join_spec();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let probe = spec.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(session_lock::probe_addr(&probe));
+                            });
+                            self.auto_probe = Some((spec, rx));
                             return;
                         }
-                        session_lock::HostLiveness::UnreachableButFresh if !expected_dead => {
-                            let who = if info.user.is_empty() {
-                                info.machine.as_str()
-                            } else {
-                                info.user.as_str()
-                            };
-                            self.join_addr = info.host.clone();
-                            if !allow_auto_join {
-                                self.members_open = true;
+                        match session_lock::probe_host(&info) {
+                            session_lock::HostLiveness::Reachable => {
+                                self.defer_to_existing_host(&info, allow_auto_join);
+                                return;
                             }
-                            self.status = format!(
-                                "检测到 {who}（{}）正在打开此文件（对方防火墙可能未放行协作端口）",
-                                info.host
-                            );
-                            return;
+                            session_lock::HostLiveness::UnreachableButFresh if !expected_dead => {
+                                let who = if info.user.is_empty() {
+                                    info.machine.as_str()
+                                } else {
+                                    info.user.as_str()
+                                };
+                                self.join_addr = info.host.clone();
+                                if !allow_auto_join {
+                                    self.members_open = true;
+                                }
+                                self.status = format!(
+                                    "检测到 {who}（{}）正在打开此文件（对方防火墙可能未放行协作端口）",
+                                    info.host
+                                );
+                                return;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -31575,7 +31681,8 @@ let txn = self.txn_begin(&keys);
                 if self.is_foreign_lock(&info)
                     && superseded
                     && session_lock::is_fresh(&info)
-                    && session_lock::probe_host(&info) != session_lock::HostLiveness::Dead
+                    && (!is_loopback_spec(&info.join_spec())
+                        || session_lock::probe_host(&info) != session_lock::HostLiveness::Dead)
                 {
                     session_lock::release_election_for(&path, &session_id);
                     self.defer_to_existing_host(&info, allow_auto_join);
@@ -31615,12 +31722,8 @@ let txn = self.txn_begin(&keys);
             session_id.clone(),
             started_ms,
             |n| {
-                // 把所有工作表的初始基准内容放入快照（统一 ts=1，保证新成员首次编辑严格胜出）
-                for (si, sheet) in self.wb.sheets.iter().enumerate() {
-                    for (k, v) in sheet.iter() {
-                        peer.seed_cell(si, k.row, k.col, v);
-                    }
-                }
+                // O(页数) CoW 快照建立只读基准（零百万格逐格建树与零字符串深拷贝）
+                peer.seed_workbook(&self.wb);
                 n.seed_snapshot(
                     &peer,
                     &self.wb,
@@ -31653,19 +31756,34 @@ let txn = self.txn_begin(&keys);
                 self.undo.set_site(site);
                 let ips = session_lock::local_lan_ips();
                 let primary_addr = format!("{}:{port}", ips[0]);
-                // 在文件旁边放占用卡（附带本机全部局域网网卡地址）：同事打开同一文件即可自动找到我
+                // 在文件旁边放占用卡：UNC 网络共享路径走后台线程避免 SMB 元数据 I/O 阻塞主线程
                 if let Some(p) = self.wb.path.clone() {
                     let hosts: Vec<String> = ips.iter().map(|ip| format!("{ip}:{port}")).collect();
-                    let _ = session_lock::write_session_with_hosts(
-                        &p,
-                        &primary_addr,
-                        &hosts,
-                        &self.my_name,
-                        &session_id,
-                        started_ms,
-                        &lock_secret,
-                    );
-                    session_lock::refresh_election(&p, &session_id);
+                    let raw_p = p.to_string_lossy();
+                    let is_unc = raw_p.starts_with(r"\\") || raw_p.starts_with("//");
+                    if is_unc {
+                        let my_name = self.my_name.clone();
+                        let primary = primary_addr.clone();
+                        let sid = session_id.clone();
+                        let lsec = lock_secret.clone();
+                        std::thread::spawn(move || {
+                            let _ = session_lock::write_session_with_hosts(
+                                &p, &primary, &hosts, &my_name, &sid, started_ms, &lsec,
+                            );
+                            session_lock::refresh_election(&p, &sid);
+                        });
+                    } else {
+                        let _ = session_lock::write_session_with_hosts(
+                            &p,
+                            &primary_addr,
+                            &hosts,
+                            &self.my_name,
+                            &session_id,
+                            started_ms,
+                            &lock_secret,
+                        );
+                        session_lock::refresh_election(&p, &session_id);
+                    }
                     self.lock_beat = Some(std::time::Instant::now());
                 }
                 if !allow_auto_join {
@@ -34332,14 +34450,45 @@ fn elide(s: &str, max_chars: usize) -> String {
     }
 
     fn poll_net(&mut self) {
-        let mut events = Vec::new();
+        let mut raw_events = Vec::new();
         if let Some(n) = self.net.as_ref() {
             while let Ok(e) = n.events.try_recv() {
-                events.push(e);
+                raw_events.push(e);
             }
         }
-        if events.is_empty() {
+        if raw_events.is_empty() {
             return;
+        }
+        // 合并同一轮通道中连续的实时 Ops / Styles / ConfirmedStyles 分片，
+        // 使 10 万格粘贴/刷格式一次性落表并触发单次后台批量重算，根治 196×12ms 主线程重算风暴！
+        let mut events: Vec<net::NetEvent> = Vec::with_capacity(raw_events.len());
+        for ev in raw_events {
+            match (events.last_mut(), ev) {
+                (Some(net::NetEvent::Ops(prev)), net::NetEvent::Ops(more)) => {
+                    prev.extend(more);
+                }
+                (
+                    Some(net::NetEvent::Styles {
+                        site: s1,
+                        items: prev,
+                        snapshot: snap1,
+                    }),
+                    net::NetEvent::Styles {
+                        site: s2,
+                        items: more,
+                        snapshot: snap2,
+                    },
+                ) if *snap1 == snap2 && (*snap1 || *s1 == s2) => {
+                    prev.extend(more);
+                }
+                (
+                    Some(net::NetEvent::ConfirmedStyles(prev)),
+                    net::NetEvent::ConfirmedStyles(more),
+                ) => {
+                    prev.extend(more);
+                }
+                (_, other) => events.push(other),
+            }
         }
         for e in events {
             match e {
@@ -34480,11 +34629,23 @@ fn elide(s: &str, max_chars: usize) -> String {
                 crate::net::NetEvent::Styles { site, items, snapshot } => {
                     let count = items.len();
                     let first_sheet = items.first().map(|(sh, _, _, _)| *sh);
+                    let mut intern_cache: std::collections::HashMap<
+                        u64,
+                        Vec<(sheetcore::style::CellStyle, u16)>,
+                    > = std::collections::HashMap::new();
                     for (sheet, row, col, st) in items {
                         if sheet >= self.wb.sheets.len() {
                             continue;
                         }
-                        let id = self.wb.styles.intern(st);
+                        let h = sheetcore::sync::cell_style_hash(&st);
+                        let bucket = intern_cache.entry(h).or_default();
+                        let id = if let Some(&(_, id)) = bucket.iter().find(|(s, _)| s == &st) {
+                            id
+                        } else {
+                            let id = self.wb.styles.intern(st.clone());
+                            bucket.push((st, id));
+                            id
+                        };
                         self.wb.sheet_mut(sheet).set_style(row, col, id);
                     }
                     if !snapshot {
@@ -34500,6 +34661,41 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                     }
                     self.doc_gen = self.doc_gen.wrapping_add(1);
+                }
+                crate::net::NetEvent::AxisStyles {
+                    site,
+                    sheet,
+                    patch,
+                    snapshot,
+                } => {
+                    if sheet < self.wb.sheets.len() {
+                        let axis_count = patch.rows.len() + patch.cols.len();
+                        for (r, st_opt) in patch.rows {
+                            let id = match st_opt {
+                                Some(st) => self.wb.styles.intern(st),
+                                None => 0,
+                            };
+                            self.wb.sheet_mut(sheet).set_row_style(r, id);
+                        }
+                        for (c, st_opt) in patch.cols {
+                            let id = match st_opt {
+                                Some(st) => self.wb.styles.intern(st),
+                                None => 0,
+                            };
+                            self.wb.sheet_mut(sheet).set_col_style(c, id);
+                        }
+                        if !snapshot {
+                            self.tasks.last_edit = Some(std::time::Instant::now());
+                            self.wb.dirty = true;
+                            self.record_remote_note_revision(
+                                site,
+                                "远端格式变更",
+                                sheet,
+                                format!("整行/整列格式变更（{axis_count} 项）"),
+                            );
+                        }
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                    }
                 }
                 crate::net::NetEvent::Merge { site, sheet, rect, on } => {
                     if sheet < self.wb.sheets.len() {
@@ -34781,25 +34977,52 @@ fn elide(s: &str, max_chars: usize) -> String {
                             peer.cells.clear();
                         }
                     }
-                    let before_ops: Vec<Option<sheetcore::model::Cell>> = if is_snapshot {
-                        Vec::new()
-                    } else {
-                        ops.iter()
-                            .map(|op| {
-                                self.wb
-                                    .sheets
-                                    .get(op.sheet)
-                                    .and_then(|s| s.get(op.row, op.col))
-                                    .cloned()
-                            })
-                            .collect()
-                    };
-                    let ops_snapshot = if is_snapshot { Vec::new() } else { ops.clone() };
                     let mut touched: Vec<(usize, u32, u32)> = Vec::new();
+                    let mut applied_ops: Vec<sheetcore::sync::Op> = Vec::new();
+                    let mut before_ops: Vec<Option<sheetcore::model::Cell>> = Vec::new();
+                    let want_rev = !is_snapshot && self.wb.path.is_some();
+                    let mut group_key: Option<(u32, usize)> = None;
+                    let mut group_sampled = 0usize;
                     if let Some(peer) = self.peer.as_mut() {
                         for op in ops {
                             let key = (op.sheet, op.row, op.col);
-                            if peer.apply(op) {
+                            if is_snapshot {
+                                if peer.apply(op) {
+                                    touched.push(key);
+                                }
+                            } else if peer.apply(op.clone()) {
+                                let new_cell = sheetcore::model::Cell {
+                                    value: sheetcore::model::Value::from(&op.value),
+                                    formula: op.formula.clone(),
+                                };
+                                if let Some(sheet) = self.wb.sheets.get_mut(op.sheet) {
+                                    if want_rev {
+                                        let cur = sheet.get(op.row, op.col);
+                                        let changed = match cur {
+                                            Some(b) => {
+                                                b.value != new_cell.value
+                                                    || b.formula != new_cell.formula
+                                            }
+                                            None => !new_cell.is_blank(),
+                                        };
+                                        if changed {
+                                            if group_key != Some((op.site, op.sheet)) {
+                                                group_key = Some((op.site, op.sheet));
+                                                group_sampled = 0;
+                                            }
+                                            let before =
+                                                if group_sampled < sheetcore::revision::MAX_CELLS {
+                                                    group_sampled += 1;
+                                                    cur.cloned()
+                                                } else {
+                                                    None
+                                                };
+                                            before_ops.push(before);
+                                            applied_ops.push(op);
+                                        }
+                                    }
+                                    sheet.set(key.1, key.2, new_cell);
+                                }
                                 touched.push(key);
                             }
                         }
@@ -34816,18 +35039,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                             self.doc_gen = self.doc_gen.wrapping_add(1);
                         }
                     } else if !touched.is_empty() {
-                        if let Some(peer) = self.peer.as_ref() {
-                            let keys: Vec<(usize, u32, u32)> =
-                                touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
-                            peer.apply_list_to_workbook(&mut self.wb, &keys);
+                        if !applied_ops.is_empty() {
+                            self.record_remote_ops(&applied_ops, before_ops);
                         }
-                        if !ops_snapshot.is_empty() {
-                            self.record_remote_ops(&ops_snapshot, before_ops);
-                        }
-                        let seeds: Vec<sheetcore::formula::deps::CellKey> =
-                            touched.iter().map(|(si, r, c)| (*si, *r, *c)).collect();
                         self.tasks.last_edit = Some(std::time::Instant::now());
-                        self.fast_recalc_cells(&seeds);
+                        self.fast_recalc_cells(&touched);
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         if !hosting && shared_cells_only {

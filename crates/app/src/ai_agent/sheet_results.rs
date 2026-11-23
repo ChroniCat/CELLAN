@@ -7,6 +7,13 @@ use std::sync::{mpsc, Arc};
 pub(super) enum AiToolOutput {
     Ready(String, JsonValue),
     Calculating(AiToolCalculation),
+    Reordering {
+        sheet_id: u64,
+        op_desc: String,
+        range_lbl: String,
+        undo_checkpoint: u64,
+        before_gen: u64,
+    },
 }
 
 impl From<(String, JsonValue)> for AiToolOutput {
@@ -16,14 +23,34 @@ impl From<(String, JsonValue)> for AiToolOutput {
 }
 
 type ToolRead = Box<dyn Fn(WorkbookToolView<'_>) -> (String, JsonValue) + Send>;
-type SnapshotDone = ((String, JsonValue), Arc<Workbook>, ToolRead);
+type SnapshotDone = (
+    (String, JsonValue),
+    Arc<Workbook>,
+    Option<Arc<formula::deps::Deps>>,
+    ToolRead,
+);
 
 /// A calculated copy kept while manual calculation prevents updating the visible workbook.
 /// `replay` lists cells the assistant wrote after the copy was calculated.
 pub(super) struct AiCalcBase {
     revision: (u64, u64, u64),
     wb: Arc<Workbook>,
+    deps: Option<Arc<formula::deps::Deps>>,
     replay: Vec<(usize, u32, u32)>,
+}
+
+impl AiCalcBase {
+    #[cfg(test)]
+    pub(super) fn has_deps(&self) -> bool {
+        self.deps.is_some()
+    }
+}
+
+fn workbook_supports_incremental_ai_calc(wb: &Workbook) -> bool {
+    !wb.calc_iterate
+        && !wb.sheets.iter().any(|s| {
+            !s.spilled.is_empty() || !s.spill_shapes.is_empty() || !s.arrays.is_empty()
+        })
 }
 
 pub(super) struct AiToolCalculation {
@@ -79,10 +106,7 @@ impl SheetApp {
     fn ai_incremental_safe(&self) -> bool {
         self.deps_built
             && !self.deps.requires_full_recalc()
-            && !self.wb.calc_iterate
-            && !self.wb.sheets.iter().any(|s| {
-                !s.spilled.is_empty() || !s.spill_shapes.is_empty() || !s.arrays.is_empty()
-            })
+            && workbook_supports_incremental_ai_calc(&self.wb)
     }
 
     pub(super) fn with_calculated_ai_view(
@@ -107,22 +131,33 @@ impl SheetApp {
         }
         let revision = self.ai_calc_revision();
         let base = self.ai.calc_base.take().filter(|b| b.revision == revision);
-        let incremental = base.filter(|_| self.ai_incremental_safe()).map(|base| {
-            let mut copy = (*base.wb).clone();
-            copy.styles = self.wb.styles.clone();
-            for &(si, r, c) in &base.replay {
-                let live = self.wb.sheet(si);
-                let target = copy.sheet_mut(si);
-                match live.get(r, c) {
-                    Some(cell) => target.set(r, c, cell.clone()),
-                    None => {
-                        let _ = target.remove(r, c);
-                    }
+        let incremental = base
+            .and_then(|base| {
+                let live_safe = self.ai_incremental_safe();
+                let base_safe = base.deps.is_some() && workbook_supports_incremental_ai_calc(&self.wb);
+                if !live_safe && !base_safe {
+                    return None;
                 }
-                target.set_style(r, c, live.style_of(r, c));
-            }
-            (copy, self.deps.clone(), base.replay)
-        });
+                let mut copy = Arc::unwrap_or_clone(base.wb);
+                copy.styles = self.wb.styles.clone();
+                for &(si, r, c) in &base.replay {
+                    let live = self.wb.sheet(si);
+                    let target = copy.sheet_mut(si);
+                    match live.get(r, c) {
+                        Some(cell) => target.set(r, c, cell.clone()),
+                        None => {
+                            let _ = target.remove(r, c);
+                        }
+                    }
+                    target.set_style(r, c, live.style_of(r, c));
+                }
+                let deps_source = if live_safe {
+                    (self.deps.clone(), false)
+                } else {
+                    (base.deps?, true)
+                };
+                Some((copy, deps_source, base.replay))
+            });
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
         let (worker_cancel, worker_progress) = (cancel.clone(), progress.clone());
@@ -131,23 +166,61 @@ impl SheetApp {
         let wake = ctx.clone();
         std::thread::spawn(move || {
             let calculated = match (incremental, full) {
-                (Some((mut copy, deps, seeds)), _) => {
-                    // The copy mirrors manual mode; calculate only the written cells' closure.
-                    copy.calc_manual = false;
-                    let ok = formula::recalc_dirty_cancelable(&mut copy, &deps, &seeds, &worker_cancel);
-                    copy.calc_manual = true;
-                    ok.then_some(copy)
+                (Some((mut copy, (mut deps, needs_seed_sync), seeds)), _) => {
+                    if needs_seed_sync {
+                        for &key in &seeds {
+                            if deps.cell_needs_update(&copy, key) {
+                                Arc::make_mut(&mut deps).update_cell(&copy, key);
+                            }
+                        }
+                    }
+                    if deps.requires_full_recalc() {
+                        let (done, total) = (&worker_progress.0, &worker_progress.1);
+                        let ok = formula::recalc_all_force_impl(
+                            &mut copy,
+                            Some(&worker_cancel),
+                            Some((done, total)),
+                        );
+                        let rebuilt = ok
+                            .then(|| {
+                                workbook_supports_incremental_ai_calc(&copy)
+                                    .then(|| Arc::new(formula::deps::Deps::build(&copy)))
+                            })
+                            .flatten();
+                        ok.then_some((copy, rebuilt))
+                    } else {
+                        // The copy mirrors manual mode; calculate only the written cells' closure.
+                        copy.calc_manual = false;
+                        let ok =
+                            formula::recalc_dirty_cancelable(&mut copy, &deps, &seeds, &worker_cancel);
+                        copy.calc_manual = true;
+                        let kept_deps =
+                            workbook_supports_incremental_ai_calc(&copy).then_some(deps);
+                        ok.then_some((copy, kept_deps))
+                    }
                 }
                 (None, Some(mut copy)) => {
                     let (done, total) = (&worker_progress.0, &worker_progress.1);
-                    formula::recalc_all_force_impl(&mut copy, Some(&worker_cancel), Some((done, total)))
-                        .then_some(copy)
+                    let ok = formula::recalc_all_force_impl(
+                        &mut copy,
+                        Some(&worker_cancel),
+                        Some((done, total)),
+                    );
+                    let built_deps = ok
+                        .then(|| {
+                            workbook_supports_incremental_ai_calc(&copy)
+                                .then(|| Arc::new(formula::deps::Deps::build(&copy)))
+                        })
+                        .flatten();
+                    ok.then_some((copy, built_deps))
                 }
                 (None, None) => None,
             };
-            if let Some(copy) = calculated.filter(|_| !worker_cancel.load(Ordering::Relaxed)) {
+            if let Some((copy, deps)) =
+                calculated.filter(|_| !worker_cancel.load(Ordering::Relaxed))
+            {
                 let result = read(WorkbookToolView { wb: &copy, sheet_idx });
-                let _ = tx.send((result, Arc::new(copy), read));
+                let _ = tx.send((result, Arc::new(copy), deps, read));
             }
             wake.request_repaint();
         });
@@ -202,7 +275,7 @@ impl SheetApp {
                 CalcPoll::Ready(label, result)
             }
             CalcKind::Snapshot { rx, progress, revision, .. } => match rx.try_recv() {
-                Ok(((label, result), wb, read)) => {
+                Ok(((label, result), wb, deps, read)) => {
                     let current = self.ai_calc_revision();
                     if revision.0 != current.0 || revision.2 != current.2 {
                         return CalcPoll::Failed("核对表格期间工作簿已切换或重新载入".into());
@@ -215,9 +288,17 @@ impl SheetApp {
                                 *job = next;
                                 CalcPoll::Pending(None)
                             }
+                            AiToolOutput::Reordering { .. } => {
+                                CalcPoll::Failed("核对结果时不能触发新的重排任务".into())
+                            }
                         };
                     }
-                    self.ai.calc_base = Some(AiCalcBase { revision: *revision, wb, replay: Vec::new() });
+                    self.ai.calc_base = Some(AiCalcBase {
+                        revision: *revision,
+                        wb,
+                        deps,
+                        replay: Vec::new(),
+                    });
                     CalcPoll::Ready(label, result)
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -269,6 +350,92 @@ impl WrittenCells {
 pub(super) struct WorkbookToolView<'a> {
     pub wb: &'a Workbook,
     pub sheet_idx: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PreparedSearchQuery {
+    pub q_low: String,
+    pub q_ascii: bool,
+    pub q_caseless_cjk: bool,
+    pub can_match_num: bool,
+    pub can_match_true: bool,
+    pub can_match_false: bool,
+}
+
+impl PreparedSearchQuery {
+    pub(super) fn new(query: &str) -> Self {
+        let q_low = query.to_lowercase();
+        let q_ascii = q_low.is_ascii();
+        let q_caseless_cjk = !q_low.is_empty()
+            && q_low
+                .chars()
+                .all(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+        let can_match_num = q_ascii
+            && q_low
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'-' | b'+' | b'e'));
+        let can_match_true = "true".contains(&q_low);
+        let can_match_false = "false".contains(&q_low);
+        Self {
+            q_low,
+            q_ascii,
+            q_caseless_cjk,
+            can_match_num,
+            can_match_true,
+            can_match_false,
+        }
+    }
+
+    #[inline]
+    pub(super) fn matches_str(&self, s: &str) -> bool {
+        if s.is_ascii() {
+            if !self.q_ascii || s.len() < self.q_low.len() {
+                return false;
+            }
+            let needle = self.q_low.as_bytes();
+            if needle.is_empty() {
+                return true;
+            }
+            return s
+                .as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle));
+        }
+        if self.q_caseless_cjk {
+            return s.contains(&self.q_low);
+        }
+        s.to_lowercase().contains(&self.q_low)
+    }
+
+    #[inline]
+    pub(super) fn matches_cell(&self, cell: &sheetcore::model::Cell) -> bool {
+        let val_hit = match &cell.value {
+            Value::Empty => false,
+            Value::Number(n) => {
+                if !self.can_match_num && n.is_finite() {
+                    false
+                } else {
+                    self.matches_str(&cell.value.display())
+                }
+            }
+            Value::Bool(b) => {
+                if *b {
+                    self.can_match_true
+                } else {
+                    self.can_match_false
+                }
+            }
+            Value::Text(s) => self.matches_str(s),
+            Value::Error(e) => self.matches_str(e.text()),
+        };
+        if val_hit {
+            return true;
+        }
+        match cell.formula.as_deref() {
+            Some(f) if !f.is_empty() => self.matches_str(f),
+            _ => false,
+        }
+    }
 }
 
 impl WorkbookToolView<'_> {
@@ -383,7 +550,7 @@ impl WorkbookToolView<'_> {
         if query.is_empty() {
             return ("搜索为空".into(), json!({"ok": false, "error": "query 不能为空"}));
         }
-        let q_low = query.to_lowercase();
+        let prepared = PreparedSearchQuery::new(query);
         let sheets: Vec<usize> = match args.get("sheet").and_then(|v| v.as_str()) {
             Some(name) => match self.resolve_sheet_index(Some(name)) {
                 Some(i) => vec![i],
@@ -395,10 +562,8 @@ impl WorkbookToolView<'_> {
         let mut has_more = false;
         'search: for si in sheets {
             let sh = self.wb.sheet(si);
-            for (cr, cell) in sh.iter() {
-                let val = cell.value.display();
-                let f = cell.formula.as_deref().unwrap_or("");
-                if val.to_lowercase().contains(&q_low) || f.to_lowercase().contains(&q_low) {
+            for (cr, cell) in sheetcore::sync::iter_sheet_rect(sh, (0, 0, u32::MAX, u32::MAX)) {
+                if prepared.matches_cell(cell) {
                     if hits.len() == HIT_LIMIT {
                         has_more = true;
                         break 'search;
@@ -406,7 +571,7 @@ impl WorkbookToolView<'_> {
                     hits.push(json!({
                         "sheet": sh.name,
                         "cell": cell_name(cr.row, cr.col),
-                        "value": val,
+                        "value": cell.value.display(),
                         "formula": cell.formula.as_deref().map(|s| format!("={s}"))
                     }));
                 }
@@ -596,5 +761,60 @@ mod tests {
         ) else { panic!() };
         assert_eq!(result["ok"], false);
         assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(1.0));
+    }
+
+    #[test]
+    fn prepared_search_query_handles_ascii_cjk_numbers_booleans_and_formulas_zero_alloc() {
+        let _env = crate::test_env::TestEnv::new("ai_prepared_search");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        let sh = app.wb.sheet_mut(0);
+        for row in 0..600u32 {
+            sh.set(
+                row,
+                0,
+                Cell {
+                    value: Value::Number(f64::from(row) * 1.5),
+                    formula: None,
+                },
+            );
+        }
+        sh.set(
+            12,
+            1,
+            Cell {
+                value: Value::Text("InVoIcE-2026-Alpha".into()),
+                formula: None,
+            },
+        );
+        sh.set(
+            310,
+            2,
+            Cell {
+                value: Value::Text("华东大区应收账款明细".into()),
+                formula: None,
+            },
+        );
+        sh.set(
+            520,
+            3,
+            Cell {
+                value: Value::Bool(true),
+                formula: Some("SUM(A1:A10)>0".into()),
+            },
+        );
+
+        let view = WorkbookToolView { wb: &app.wb, sheet_idx: 0 };
+        let (_, ascii_res) = view.tool_search_cells(&json!({"query": "invoice-2026"}));
+        assert_eq!(ascii_res["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(ascii_res["hits"][0]["cell"], "B13");
+
+        let (_, cjk_res) = view.tool_search_cells(&json!({"query": "应收账款"}));
+        assert_eq!(cjk_res["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(cjk_res["hits"][0]["cell"], "C311");
+
+        let (_, formula_res) = view.tool_search_cells(&json!({"query": "sum(a1:a10)"}));
+        assert_eq!(formula_res["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(formula_res["hits"][0]["cell"], "D521");
     }
 }

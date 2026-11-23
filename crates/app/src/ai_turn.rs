@@ -18,6 +18,13 @@ pub(super) struct AiView {
     rect: Rect,
 }
 
+struct FootprintSnap {
+    sheet: sheetcore::model::Sheet,
+    styles: sheetcore::style::StyleTable,
+    calculated: bool,
+    date_1904: bool,
+}
+
 /// A confirmation protects the inputs. Once a tool reports values, its calculated
 /// values and number formats also belong to the observation.
 struct Footprint {
@@ -25,17 +32,50 @@ struct Footprint {
     rect: Rect,
     values: bool,
     hash: Option<u64>,
+    snap: std::cell::RefCell<Option<(Option<u64>, FootprintSnap)>>,
+}
+
+struct SheetBandSearchCache {
+    identity: u64,
+    snapshot: sheetcore::model::Sheet,
+    scanned_bands: u32,
+    bands: std::collections::BTreeMap<u32, Vec<(u32, u32, String, Option<String>)>>,
+}
+
+enum ReadCache {
+    None,
+    Search {
+        prepared: super::sheet_results::PreparedSearchQuery,
+        sheets: Vec<SheetBandSearchCache>,
+    },
+    Overview {
+        wb_path: Option<std::path::PathBuf>,
+        date_1904: bool,
+        calc_pending: bool,
+        default_format: String,
+        sheet_revs: Vec<(u64, String, sheetcore::store::CellVersion, u64, u32, u32)>,
+        hash: u64,
+    },
 }
 
 struct ReadObservation {
     call: ToolCallSpec,
     sheet: Option<u64>,
     hash: Option<u64>,
+    cache: std::cell::RefCell<ReadCache>,
 }
 
 enum PendingCalculation {
     Tool { call: WireToolCall, sheet: Option<u64>, job: AiToolCalculation },
     Validate { action: TurnAction, job: AiToolCalculation },
+    Reorder {
+        call: WireToolCall,
+        sheet_id: u64,
+        op_desc: String,
+        range_lbl: String,
+        undo_checkpoint: u64,
+        before_gen: u64,
+    },
 }
 
 enum TurnAction {
@@ -60,6 +100,13 @@ pub(super) struct ActiveTurn {
     // On retry, replace just the streamed text from the failed completion.
     content_start: usize,
     reasoning_start: usize,
+}
+
+impl ActiveTurn {
+    #[cfg(test)]
+    pub(super) fn has_pending_calculation(&self) -> bool {
+        self.calculation.is_some()
+    }
 }
 
 fn bounded(mut text: String, bytes: usize) -> String {
@@ -148,10 +195,8 @@ fn region_hash(
             }
         }
     } else {
-        for (at, cell) in sheet.iter() {
-            if (r1..=r2).contains(&at.row) && (c1..=c2).contains(&at.col) && !cell.is_blank() {
-                sum = sum.wrapping_add(cell_hash(at.row, at.col, cell));
-            }
+        for (at, cell) in sheetcore::sync::iter_sheet_rect(sheet, (r1, c1, r2, c2)) {
+            sum = sum.wrapping_add(cell_hash(at.row, at.col, cell));
         }
     }
     (calculated || !needs_calculation).then_some(sum)
@@ -258,7 +303,10 @@ impl SheetApp {
             reasoning_start: 0,
         });
         let discard = (self.ai.messages.len() + 2).saturating_sub(2 * DISPLAY_TURNS);
-        self.ai.messages.drain(..discard);
+        if discard > 0 {
+            self.ai.messages.drain(..discard);
+            self.ai.card_heights.clear();
+        }
         for (role, content) in [(AiRole::User, prompt), (AiRole::Assistant, String::new())] {
             self.ai.messages.push(AiMessage {
                 role,
@@ -337,6 +385,34 @@ impl SheetApp {
             })
     }
 
+    pub(super) fn can_retry_ai_round_ui(&self) -> bool {
+        !self.ai.busy
+            && self.ai.bound_doc_uid == Some(self.doc_uid)
+            && self.ai.active_round.as_ref().is_some_and(|turn| {
+                if turn.cfg != self.ai.cfg || turn.revision.1 != self.wb_epoch {
+                    return false;
+                }
+                if self.ai_sheet_by_identity(turn.view.sheet).is_none() {
+                    return false;
+                }
+                let revision = (self.doc_gen, self.wb_epoch);
+                if turn.revision == revision {
+                    return true;
+                }
+                if let Some((checked, valid)) = turn.retry_check.get()
+                    && checked == revision
+                {
+                    return valid;
+                }
+                let has_heavy_preview = turn.reads.iter().any(|r| r.call.name == "eval_preview")
+                    && self.wb.sheets.iter().map(|s| s.len()).sum::<usize>() > 10_000;
+                if has_heavy_preview {
+                    return true;
+                }
+                self.can_retry_ai_round()
+            })
+    }
+
     pub(super) fn retry_failed_ai_round(&mut self) {
         if !self.can_retry_ai_round() {
             return;
@@ -404,6 +480,85 @@ impl SheetApp {
         }
         let calculation = self.ai.active_round.as_mut().and_then(|t| t.calculation.take());
         if let Some(mut calculation) = calculation {
+            if let PendingCalculation::Reorder {
+                call,
+                sheet_id,
+                op_desc,
+                range_lbl,
+                undo_checkpoint,
+                before_gen,
+            } = calculation
+            {
+                if self.ai_sheet_by_identity(sheet_id).is_none() {
+                    self.fail_ai_round("数据操作期间目标工作表已删除，本轮已终止。".into(), false);
+                    return;
+                }
+                self.poll_reorder();
+                if self.tasks.reorder.is_some() {
+                    self.ai.status_hint = format!("正在执行{op_desc}…");
+                    if let Some(turn) = self.ai.active_round.as_mut() {
+                        turn.calculation = Some(PendingCalculation::Reorder {
+                            call,
+                            sheet_id,
+                            op_desc,
+                            range_lbl,
+                            undo_checkpoint,
+                            before_gen,
+                        });
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
+                if let Some(last) = self.ai.messages.last_mut() {
+                    last.undo_ids.extend(self.undo.ids_since(undo_checkpoint));
+                }
+                let changed = self.doc_gen != before_gen;
+                if changed {
+                    self.ai.calc_base = None;
+                }
+                let noop_ok = !changed
+                    && (self.status.starts_with("已按") || self.status == "没有重复行");
+                let (label, result) = if changed || noop_ok {
+                    (
+                        format!("{op_desc} {range_lbl}"),
+                        json!({"ok": true, "status": self.status}),
+                    )
+                } else {
+                    (
+                        format!("{op_desc} {range_lbl} 未执行"),
+                        json!({"ok": false, "status": self.status}),
+                    )
+                };
+                let needs_calc = changed
+                    && self.ai_calculated_workbook().is_none()
+                    && self.ai.active_round.as_ref().is_some_and(|turn| {
+                        turn.reads.iter().any(|r| r.call.name != "inspect_workbook")
+                            || turn.footprint.iter().any(|f| f.values)
+                    });
+                if needs_calc {
+                    let (c_label, c_result) = (label.clone(), result.clone());
+                    if let AiToolOutput::Calculating(job) = self.with_calculated_ai_view(
+                        ctx,
+                        Box::new(move |_| (c_label.clone(), c_result.clone())),
+                    ) {
+                        self.note_ai_footprint(&call.spec, &JsonValue::Null);
+                        self.refresh_ai_baseline();
+                        if let Some(turn) = self.ai.active_round.as_mut() {
+                            turn.awaiting_write_results = true;
+                            turn.calculation = Some(PendingCalculation::Tool {
+                                call,
+                                sheet: Some(sheet_id),
+                                job,
+                            });
+                        }
+                        self.ai.status_hint = "正在核对表格计算结果…".into();
+                        return;
+                    }
+                }
+                self.record_ai_tool_result(&call, label, result);
+                self.continue_ai_tools(ctx, false);
+                return;
+            }
             let job = match &mut calculation {
                 PendingCalculation::Tool { call, sheet, job } => {
                     if self.ai_read_sheet(&call.spec) != *sheet {
@@ -413,6 +568,7 @@ impl SheetApp {
                     job
                 }
                 PendingCalculation::Validate { job, .. } => job,
+                PendingCalculation::Reorder { .. } => unreachable!(),
             };
             match self.poll_ai_calculation(job, ctx) {
                 CalcPoll::Pending(progress) => {
@@ -439,6 +595,7 @@ impl SheetApp {
                             self.continue_ai_tools(ctx, false);
                         }
                     }
+                    PendingCalculation::Reorder { .. } => unreachable!(),
                 },
             }
             return;
@@ -662,6 +819,30 @@ impl SheetApp {
                     self.ai.status_hint = "正在核对表格计算结果…".into();
                     return;
                 }
+                AiToolOutput::Reordering {
+                    sheet_id,
+                    op_desc,
+                    range_lbl,
+                    undo_checkpoint,
+                    before_gen,
+                } => {
+                    // Guard observed footprint prior to reorder; poll_ai will refresh baseline once poll_reorder finishes.
+                    self.note_ai_footprint(&call.spec, &JsonValue::Null);
+                    self.refresh_ai_baseline();
+                    if let Some(turn) = self.ai.active_round.as_mut() {
+                        turn.calculation = Some(PendingCalculation::Reorder {
+                            call,
+                            sheet_id,
+                            op_desc: op_desc.clone(),
+                            range_lbl,
+                            undo_checkpoint,
+                            before_gen,
+                        });
+                    }
+                    self.ai.status_hint = format!("正在执行{op_desc}…");
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
             }
         }
     }
@@ -761,7 +942,13 @@ impl SheetApp {
         let mut known: HashSet<_> = turn.footprint.iter().map(|f| (f.sheet, f.rect, f.values)).collect();
         for (sheet, rect) in regions {
             if known.insert((sheet, rect, values)) {
-                turn.footprint.push(Footprint { sheet, rect, values, hash: None });
+                turn.footprint.push(Footprint {
+                    sheet,
+                    rect,
+                    values,
+                    hash: None,
+                    snap: std::cell::RefCell::new(None),
+                });
             }
         }
     }
@@ -770,7 +957,34 @@ impl SheetApp {
         let calculated = self.ai_calculated_workbook();
         let wb = if f.values { calculated.unwrap_or(&self.wb) } else { &self.wb };
         let index = wb.sheets.iter().position(|s| s.identity == f.sheet)?;
-        region_hash(wb, index, f.rect, f.values, calculated.is_some())
+        let sh = wb.sheet(index);
+        let calc_flag = calculated.is_some();
+        let date_1904 = wb.date_system.is_1904();
+        if let Some((cached_hash, ref prior)) = *f.snap.borrow()
+            && prior.sheet.name == sh.name
+            && prior.calculated == calc_flag
+            && (!f.values || prior.date_1904 == date_1904)
+            && (!f.values || calc_flag || sh.spilled.is_empty())
+            && sh.same_cells_in(&prior.sheet, &[f.rect], true)
+            && sh.same_cells_in(&prior.sheet, &[f.rect], false)
+            && (!f.values
+                || ((sh.display_style_revision() == prior.sheet.display_style_revision()
+                    && wb.styles.get(0).format == prior.styles.get(0).format)
+                    || sh.same_display_styles_in(&prior.sheet, &[f.rect], &wb.styles, &prior.styles)))
+        {
+            return cached_hash;
+        }
+        let computed = region_hash(wb, index, f.rect, f.values, calc_flag);
+        *f.snap.borrow_mut() = Some((
+            computed,
+            FootprintSnap {
+                sheet: sh.search_snapshot(),
+                styles: wb.styles.clone(),
+                calculated: calc_flag,
+                date_1904,
+            },
+        ));
+        computed
     }
 
     fn ai_read_sheet(&self, call: &ToolCallSpec) -> Option<u64> {
@@ -778,23 +992,236 @@ impl SheetApp {
         self.resolve_sheet_index(Some(name)).map(|index| self.wb.sheet(index).identity)
     }
 
+    fn ai_search_hash_incremental(
+        &self,
+        read: &ReadObservation,
+        wb: &sheetcore::Workbook,
+    ) -> Option<u64> {
+        const HIT_LIMIT: usize = 30;
+        const BAND_ROWS: u32 = sheetcore::store::PAGE_ROWS;
+        let query = read
+            .call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if query.is_empty() {
+            let view = WorkbookToolView { wb, sheet_idx: self.sheet_idx };
+            let (_, result) = view.tool_search_cells(&read.call.arguments);
+            return Some(read_hash(&result));
+        }
+        let target_sheets: Vec<usize> =
+            match read.call.arguments.get("sheet").and_then(|v| v.as_str()) {
+                Some(name) => {
+                    match (WorkbookToolView { wb, sheet_idx: self.sheet_idx })
+                        .resolve_sheet_index(Some(name))
+                    {
+                        Some(i) => vec![i],
+                        None => {
+                            return Some(read_hash(
+                                &json!({"ok": false, "error": "未找到工作表"}),
+                            ));
+                        }
+                    }
+                }
+                None => (0..wb.sheets.len()).collect(),
+            };
+        let mut cache_ref = read.cache.borrow_mut();
+        if !matches!(&*cache_ref, ReadCache::Search { .. }) {
+            *cache_ref = ReadCache::Search {
+                prepared: super::sheet_results::PreparedSearchQuery::new(query),
+                sheets: Vec::new(),
+            };
+        }
+        let ReadCache::Search { prepared, sheets: cached_sheets } = &mut *cache_ref else {
+            unreachable!()
+        };
+        let mut old_sheets = std::mem::take(cached_sheets);
+        let mut next_sheets = Vec::with_capacity(target_sheets.len().max(old_sheets.len()));
+        let mut hits = Vec::with_capacity(HIT_LIMIT);
+        let mut has_more = false;
+
+        'sheets: for si in target_sheets {
+            let sh = wb.sheet(si);
+            let mut entry = match old_sheets.iter().position(|c| c.identity == sh.identity) {
+                Some(pos) => old_sheets.swap_remove(pos),
+                None => SheetBandSearchCache {
+                    identity: sh.identity,
+                    snapshot: sh.search_snapshot(),
+                    scanned_bands: 0,
+                    bands: std::collections::BTreeMap::new(),
+                },
+            };
+            let sh_max = sh.used_bounds().map(|(_, _, r2, _)| r2 / BAND_ROWS);
+            let cached_max = entry.bands.keys().next_back().copied();
+            let max_band = match (sh_max, cached_max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(last_band) = max_band else {
+                entry.snapshot = sh.search_snapshot();
+                entry.scanned_bands = u32::MAX;
+                entry.bands.clear();
+                next_sheets.push(entry);
+                continue;
+            };
+            let same_ver = sh.cell_version() == entry.snapshot.cell_version();
+            if same_ver && entry.scanned_bands > last_band {
+                for band_vec in entry.bands.values() {
+                    for (r, c, val, form) in band_vec {
+                        if hits.len() == HIT_LIMIT {
+                            has_more = true;
+                            next_sheets.push(entry);
+                            break 'sheets;
+                        }
+                        hits.push(json!({
+                            "sheet": sh.name,
+                            "cell": cell_name(*r, *c),
+                            "value": val,
+                            "formula": form,
+                        }));
+                    }
+                }
+                next_sheets.push(entry);
+                continue;
+            }
+            let mut stopped_early = false;
+            let mut b = 0u32;
+            while b <= last_band {
+                let band_start = b * BAND_ROWS;
+                let band_end = band_start.saturating_add(BAND_ROWS - 1);
+                let rect = [(band_start, 0, band_end, u32::MAX)];
+                let reuse_band = b < entry.scanned_bands
+                    && (same_ver
+                        || (sh.same_cells_in(&entry.snapshot, &rect, false)
+                            && sh.same_cells_in(&entry.snapshot, &rect, true)));
+                if !reuse_band {
+                    let mut band_hits = Vec::new();
+                    for (cr, cell) in
+                        sheetcore::sync::iter_sheet_rect(sh, (band_start, 0, band_end, u32::MAX))
+                    {
+                        if prepared.matches_cell(cell) {
+                            band_hits.push((
+                                cr.row,
+                                cr.col,
+                                cell.value.display(),
+                                cell.formula.as_deref().map(|s| format!("={s}")),
+                            ));
+                            if band_hits.len() > HIT_LIMIT {
+                                break;
+                            }
+                        }
+                    }
+                    if band_hits.is_empty() {
+                        entry.bands.remove(&b);
+                    } else {
+                        entry.bands.insert(b, band_hits);
+                    }
+                }
+                if let Some(band_vec) = entry.bands.get(&b) {
+                    for (r, c, val, form) in band_vec {
+                        if hits.len() == HIT_LIMIT {
+                            has_more = true;
+                            stopped_early = true;
+                            break;
+                        }
+                        hits.push(json!({
+                            "sheet": sh.name,
+                            "cell": cell_name(*r, *c),
+                            "value": val,
+                            "formula": form,
+                        }));
+                    }
+                }
+                b += 1;
+                if stopped_early {
+                    break;
+                }
+            }
+            if stopped_early {
+                if !same_ver {
+                    let _ = entry.bands.split_off(&b);
+                    entry.scanned_bands = b;
+                    entry.snapshot = sh.search_snapshot();
+                } else {
+                    entry.scanned_bands = entry.scanned_bands.max(b);
+                }
+                next_sheets.push(entry);
+                break 'sheets;
+            }
+            let _ = entry.bands.split_off(&(last_band.saturating_add(1)));
+            entry.scanned_bands = u32::MAX;
+            entry.snapshot = sh.search_snapshot();
+            next_sheets.push(entry);
+        }
+        next_sheets.extend(old_sheets);
+        *cached_sheets = next_sheets;
+        Some(read_hash(&json!({"ok": true, "has_more": has_more, "hits": hits})))
+    }
+
     // Re-run a read against a current calculated view. The complete search result
     // includes absence of matches, and a preview may use dynamic or cross-sheet references.
-    fn ai_read_hash(&self, call: &ToolCallSpec) -> Option<u64> {
-        if call.name == "inspect_workbook" {
-            let index = self.resolve_sheet_index(call.arguments["sheet"].as_str())?;
-            let rect = call.arguments["selection"].as_str().and_then(checked_ai_range)?;
+    fn ai_read_hash_obs(&self, read: &ReadObservation) -> Option<u64> {
+        if read.call.name == "inspect_workbook" {
+            let index = self.resolve_sheet_index(read.call.arguments["sheet"].as_str())?;
+            let rect = read.call.arguments["selection"].as_str().and_then(checked_ai_range)?;
+            let calc_pending = self.wb.calc_pending || self.tasks.recalc_pending();
+            let date_1904 = self.wb.date_system.is_1904();
+            let default_format = self.wb.styles.get(0).format.clone();
+            let cur_revs: Vec<_> = self
+                .wb
+                .sheets
+                .iter()
+                .map(|s| {
+                    (
+                        s.identity,
+                        s.name.clone(),
+                        s.cell_version().clone(),
+                        s.display_style_revision(),
+                        s.cols.default_size().to_bits(),
+                        s.rows.default_size().to_bits(),
+                    )
+                })
+                .collect();
+            if let ReadCache::Overview {
+                ref wb_path,
+                date_1904: prev_1904,
+                calc_pending: prev_pending,
+                default_format: ref prev_fmt,
+                ref sheet_revs,
+                hash,
+            } = *read.cache.borrow()
+                && *wb_path == self.wb.path
+                && prev_1904 == date_1904
+                && prev_pending == calc_pending
+                && *prev_fmt == default_format
+                && *sheet_revs == cur_revs
+            {
+                return Some(hash);
+            }
             let overview = build_workbook_context(self, index, rect);
-            return Some(read_hash(&json!({"ok":true, "overview":overview})));
+            let h = read_hash(&json!({"ok":true, "overview":overview}));
+            *read.cache.borrow_mut() = ReadCache::Overview {
+                wb_path: self.wb.path.clone(),
+                date_1904,
+                calc_pending,
+                default_format,
+                sheet_revs: cur_revs,
+                hash: h,
+            };
+            return Some(h);
         }
         let wb = self.ai_calculated_workbook()?;
-        let view = WorkbookToolView { wb, sheet_idx: self.sheet_idx };
-        let (_, result) = match call.name.as_str() {
-            "search_cells" => view.tool_search_cells(&call.arguments),
-            "eval_preview" => view.tool_eval_preview(&call.arguments),
-            _ => return None,
-        };
-        Some(read_hash(&result))
+        match read.call.name.as_str() {
+            "search_cells" => self.ai_search_hash_incremental(read, wb),
+            "eval_preview" => {
+                let view = WorkbookToolView { wb, sheet_idx: self.sheet_idx };
+                let (_, result) = view.tool_eval_preview(&read.call.arguments);
+                Some(read_hash(&result))
+            }
+            _ => None,
+        }
     }
 
     /// The assistant itself changed the workbook (or it was verified): take a new baseline.
@@ -811,7 +1238,7 @@ impl SheetApp {
             .collect();
         let reads: Vec<_> = turn.reads.iter().map(|read| {
             if updated || read.hash.is_none() {
-                self.ai_read_hash(&read.call)
+                self.ai_read_hash_obs(read)
             } else {
                 read.hash
             }
@@ -842,7 +1269,7 @@ impl SheetApp {
         for read in &turn.reads {
             if self.ai_read_sheet(&read.call) != read.sheet
                 || read.hash.is_none()
-                || self.ai_read_hash(&read.call) != read.hash
+                || self.ai_read_hash_obs(read) != read.hash
             {
                 let what = match read.call.name.as_str() {
                     "search_cells" => "搜索结果",
@@ -901,7 +1328,12 @@ impl SheetApp {
                     read.hash = hash;
                     read.sheet = sheet;
                 } else {
-                    turn.reads.push(ReadObservation { call: call.spec.clone(), sheet, hash });
+                    turn.reads.push(ReadObservation {
+                        call: call.spec.clone(),
+                        sheet,
+                        hash,
+                        cache: std::cell::RefCell::new(ReadCache::None),
+                    });
                 }
             }
         }

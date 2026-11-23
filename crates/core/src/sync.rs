@@ -8,16 +8,48 @@
 
 use crate::model::{Cell, Sheet, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+mod arc_str_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(v: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Arc::from(s))
+    }
+}
+
+mod opt_arc_str_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(v: &Option<Arc<str>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(text) => s.serialize_some(&**text),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Arc<str>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        Ok(opt.map(Arc::from))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ValueWire {
     Empty,
     Number(f64),
-    Text(String),
+    Text(#[serde(with = "arc_str_serde")] Arc<str>),
     Bool(bool),
     /// 错误值单独一类：不能被当成文本同步过去
-    Error(String),
+    Error(#[serde(with = "arc_str_serde")] Arc<str>),
 }
 
 impl From<&Value> for ValueWire {
@@ -25,9 +57,9 @@ impl From<&Value> for ValueWire {
         match v {
             Value::Empty => ValueWire::Empty,
             Value::Number(n) => ValueWire::Number(*n),
-            Value::Text(s) => ValueWire::Text(s.to_string()),
+            Value::Text(s) => ValueWire::Text(Arc::<str>::from(s.clone())),
             Value::Bool(b) => ValueWire::Bool(*b),
-            Value::Error(e) => ValueWire::Error(e.text().to_string()),
+            Value::Error(e) => ValueWire::Error(Arc::from(e.text())),
         }
     }
 }
@@ -37,11 +69,11 @@ impl From<&ValueWire> for Value {
         match v {
             ValueWire::Empty => Value::Empty,
             ValueWire::Number(n) => Value::Number(*n),
-            ValueWire::Text(s) => Value::Text(s.as_str().into()),
+            ValueWire::Text(s) => Value::Text(s.as_ref().into()),
             ValueWire::Bool(b) => Value::Bool(*b),
             ValueWire::Error(t) => crate::formula::ErrKind::from_text(t)
                 .map(Value::Error)
-                .unwrap_or_else(|| Value::Text(t.as_str().into())),
+                .unwrap_or_else(|| Value::Text(t.as_ref().into())),
         }
     }
 }
@@ -55,7 +87,8 @@ pub struct Op {
     pub row: u32,
     pub col: u32,
     pub value: ValueWire,
-    pub formula: Option<String>,
+    #[serde(default, with = "opt_arc_str_serde")]
+    pub formula: Option<Arc<str>>,
     pub ts: u64,
     pub site: u32,
 }
@@ -383,6 +416,42 @@ pub struct SortRepair {
     pub style: Option<(crate::style::CellStyle, Option<crate::style::CellStyle>)>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AxisStylePatch {
+    #[serde(default)]
+    pub rows: Vec<(u32, Option<crate::style::CellStyle>)>,
+    #[serde(default)]
+    pub cols: Vec<(u32, Option<crate::style::CellStyle>)>,
+}
+
+impl AxisStylePatch {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.cols.is_empty()
+    }
+
+    pub fn is_within_limits(&self) -> bool {
+        self.rows.len() <= MAX_BATCH_ITEMS
+            && self.cols.len() <= MAX_BATCH_ITEMS
+            && self.rows.iter().all(|(r, _)| *r < MAX_ROWS)
+            && self.cols.iter().all(|(c, _)| *c < MAX_COLS)
+    }
+}
+
+/// 零深拷贝序列化快照分片（直接借用 `&Op` 引用避免 `Arc::unwrap_or_clone` 复制百万节点）
+#[derive(Serialize)]
+pub struct SnapshotRef<'a> {
+    pub t: &'static str,
+    pub ops: &'a [&'a Op],
+}
+
+#[derive(Serialize)]
+pub struct SnapshotChunkRef<'a> {
+    pub t: &'static str,
+    pub ops: &'a [&'a Op],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub last: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -409,6 +478,14 @@ pub enum Msg {
         base_hash: String,
         #[serde(default)]
         sort_permutation: bool,
+        #[serde(default)]
+        palette_styles: bool,
+        #[serde(default)]
+        resume_room: String,
+        #[serde(default)]
+        resume_watermark: u64,
+        #[serde(default)]
+        resume_struct_rev: usize,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -426,6 +503,14 @@ pub enum Msg {
         structural_ack: bool,
         #[serde(default)]
         clock: u64,
+        #[serde(default)]
+        palette_styles: bool,
+        #[serde(default)]
+        room_id: String,
+        #[serde(default)]
+        watermark: u64,
+        #[serde(default)]
+        structure_revision: usize,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -447,6 +532,21 @@ pub enum Msg {
         ts: u64,
         items: Vec<(u32, u32, crate::style::CellStyle)>,
     },
+    /// 字典去重格式变更（避免 20 万格重复序列化相同 CellStyle）
+    StylePaletteOp {
+        site: u32,
+        sheet: usize,
+        ts: u64,
+        palette: Vec<crate::style::CellStyle>,
+        items: Vec<(u32, u32, u16)>,
+    },
+    /// 整行 / 整列默认样式变更
+    AxisStyleOp {
+        site: u32,
+        sheet: usize,
+        ts: u64,
+        patch: AxisStylePatch,
+    },
     /// 合并 / 取消合并
     MergeOp {
         site: u32,
@@ -461,6 +561,22 @@ pub enum Msg {
     /// 加入后补一份现有样式（key: (sheet,row,col)）
     StyleSnapshot {
         items: Vec<(usize, u32, u32, crate::style::CellStyle)>,
+    },
+    /// 字典去重样式快照分片
+    StylePaletteSnapshot {
+        palette: Vec<crate::style::CellStyle>,
+        items: Vec<(usize, u32, u32, u16)>,
+    },
+    /// 加入或重连时同步整行/整列样式
+    AxisStyleSnapshot {
+        sheet: usize,
+        patch: AxisStylePatch,
+    },
+    /// 宿主单调进度水位（供客户端闪断重连增量恢复）
+    Watermark {
+        seq: u64,
+        #[serde(default)]
+        structure_revision: usize,
     },
     /// 新加入的人先收到结构改动历史，把本地表格挪到位再收快照
     StructuralLog { items: Vec<(usize, crate::structural::Structural)> },
@@ -549,8 +665,116 @@ pub const MAX_LOGICAL_TS: u64 = 1 << 48;
 /// 单条报文里批量条目（样式、快照、回滚）的上限
 pub const MAX_BATCH_ITEMS: usize = 2_000_000;
 pub const LIVE_OP_BATCH: usize = 512;
+pub const SNAPSHOT_CHUNK_OPS: usize = 2_000;
+pub const STYLE_PALETTE_CHUNK_ITEMS: usize = 4_096;
 /// 名字、文档名等短文本的长度上限（字节）
 pub const MAX_SHORT_TEXT: usize = 256;
+
+pub fn cell_style_hash(s: &crate::style::CellStyle) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.bold.hash(&mut h);
+    s.italic.hash(&mut h);
+    s.underline.hash(&mut h);
+    s.double_underline.hash(&mut h);
+    s.vertical_text.hash(&mut h);
+    s.strikethrough.hash(&mut h);
+    s.rotation.hash(&mut h);
+    s.font.hash(&mut h);
+    s.size.to_bits().hash(&mut h);
+    s.color.hash(&mut h);
+    s.fill.hash(&mut h);
+    s.halign.hash(&mut h);
+    s.valign.hash(&mut h);
+    s.wrap.hash(&mut h);
+    s.shrink_to_fit.hash(&mut h);
+    s.indent.hash(&mut h);
+    s.format.hash(&mut h);
+    s.border.hash(&mut h);
+    if let Some(d) = &s.diagonal {
+        1u8.hash(&mut h);
+        d.down.hash(&mut h);
+        d.up.hash(&mut h);
+        d.style.hash(&mut h);
+        d.color.hash(&mut h);
+    } else {
+        0u8.hash(&mut h);
+    }
+    s.locked.hash(&mut h);
+    s.hidden.hash(&mut h);
+    h.finish()
+}
+
+fn intern_palette_style(
+    palette: &mut Vec<crate::style::CellStyle>,
+    buckets: &mut HashMap<u64, Vec<u16>>,
+    st: &crate::style::CellStyle,
+) -> u16 {
+    let h = cell_style_hash(st);
+    if let Some(cands) = buckets.get(&h) {
+        for &id in cands {
+            if &palette[id as usize] == st {
+                return id;
+            }
+        }
+    }
+    let id = u16::try_from(palette.len()).unwrap_or(u16::MAX);
+    if (id as usize) == palette.len() {
+        palette.push(st.clone());
+        buckets.entry(h).or_default().push(id);
+    }
+    id
+}
+
+pub fn encode_style_palette(
+    items: &[(u32, u32, crate::style::CellStyle)],
+) -> (Vec<crate::style::CellStyle>, Vec<(u32, u32, u16)>) {
+    let mut palette: Vec<crate::style::CellStyle> = Vec::new();
+    let mut buckets: HashMap<u64, Vec<u16>> = HashMap::new();
+    let mut encoded = Vec::with_capacity(items.len());
+    for (r, c, st) in items {
+        let idx = intern_palette_style(&mut palette, &mut buckets, st);
+        encoded.push((*r, *c, idx));
+    }
+    (palette, encoded)
+}
+
+pub fn decode_style_palette(
+    palette: &[crate::style::CellStyle],
+    items: &[(u32, u32, u16)],
+) -> Option<Vec<(u32, u32, crate::style::CellStyle)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for &(r, c, idx) in items {
+        let st = palette.get(idx as usize)?.clone();
+        out.push((r, c, st));
+    }
+    Some(out)
+}
+
+pub fn encode_style_snapshot_palette(
+    items: &[(usize, u32, u32, crate::style::CellStyle)],
+) -> (Vec<crate::style::CellStyle>, Vec<(usize, u32, u32, u16)>) {
+    let mut palette: Vec<crate::style::CellStyle> = Vec::new();
+    let mut buckets: HashMap<u64, Vec<u16>> = HashMap::new();
+    let mut encoded = Vec::with_capacity(items.len());
+    for (s, r, c, st) in items {
+        let idx = intern_palette_style(&mut palette, &mut buckets, st);
+        encoded.push((*s, *r, *c, idx));
+    }
+    (palette, encoded)
+}
+
+pub fn decode_style_snapshot_palette(
+    palette: &[crate::style::CellStyle],
+    items: &[(usize, u32, u32, u16)],
+) -> Option<Vec<(usize, u32, u32, crate::style::CellStyle)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for &(s, r, c, idx) in items {
+        let st = palette.get(idx as usize)?.clone();
+        out.push((s, r, c, st));
+    }
+    Some(out)
+}
 
 /// 单元格坐标是否在工作表范围内
 pub fn cell_in_bounds(sheet: usize, row: u32, col: u32) -> bool {
@@ -584,9 +808,19 @@ impl Msg {
     /// 报文里的坐标、数量、时间戳是否都在合理范围内。越界报文应整条丢弃。
     pub fn is_within_limits(&self) -> bool {
         match self {
-            Msg::Hello { name, doc, .. } => name.len() <= MAX_SHORT_TEXT && doc.len() <= 4 * MAX_SHORT_TEXT,
+            Msg::Hello { name, doc, resume_room, resume_watermark, .. } => {
+                name.len() <= MAX_SHORT_TEXT
+                    && doc.len() <= 4 * MAX_SHORT_TEXT
+                    && resume_room.len() <= MAX_SHORT_TEXT
+                    && ts_ok(*resume_watermark)
+            }
             Msg::Rename { name, .. } => name.len() <= MAX_SHORT_TEXT,
-            Msg::Welcome { clock, peers, .. } => ts_ok(*clock) && peers.len() <= 1_024,
+            Msg::Welcome { clock, peers, room_id, watermark, .. } => {
+                ts_ok(*clock)
+                    && ts_ok(*watermark)
+                    && room_id.len() <= MAX_SHORT_TEXT
+                    && peers.len() <= 1_024
+            }
             Msg::Snapshot { ops } | Msg::SnapshotChunk { ops, .. } => {
                 ops.len() <= MAX_BATCH_ITEMS && ops.iter().all(Op::is_valid)
             }
@@ -613,6 +847,18 @@ impl Msg {
                     && items.len() <= MAX_BATCH_ITEMS
                     && items.iter().all(|(r, c, _)| cell_in_bounds(*sheet, *r, *c))
             }
+            Msg::StylePaletteOp { sheet, ts, palette, items, .. } => {
+                *sheet < MAX_SHEET_INDEX
+                    && ts_ok(*ts)
+                    && palette.len() <= u16::MAX as usize + 1
+                    && items.len() <= MAX_BATCH_ITEMS
+                    && items.iter().all(|(r, c, idx)| {
+                        cell_in_bounds(*sheet, *r, *c) && (*idx as usize) < palette.len()
+                    })
+            }
+            Msg::AxisStyleOp { sheet, ts, patch, .. } => {
+                *sheet < MAX_SHEET_INDEX && ts_ok(*ts) && patch.is_within_limits()
+            }
             Msg::MergeOp { sheet, ts, r1, c1, r2, c2, .. } => {
                 cell_in_bounds(*sheet, *r1, *c1)
                     && cell_in_bounds(*sheet, *r2, *c2)
@@ -623,6 +869,19 @@ impl Msg {
             Msg::StyleSnapshot { items } => {
                 items.len() <= MAX_BATCH_ITEMS
                     && items.iter().all(|(s, r, c, _)| cell_in_bounds(*s, *r, *c))
+            }
+            Msg::StylePaletteSnapshot { palette, items } => {
+                palette.len() <= u16::MAX as usize + 1
+                    && items.len() <= MAX_BATCH_ITEMS
+                    && items.iter().all(|(s, r, c, idx)| {
+                        cell_in_bounds(*s, *r, *c) && (*idx as usize) < palette.len()
+                    })
+            }
+            Msg::AxisStyleSnapshot { sheet, patch } => {
+                *sheet < MAX_SHEET_INDEX && patch.is_within_limits()
+            }
+            Msg::Watermark { seq, structure_revision } => {
+                ts_ok(*seq) && u64::try_from(*structure_revision).is_ok_and(ts_ok)
             }
             Msg::StructuralLog { items } => {
                 items.len() <= MAX_BATCH_ITEMS && items.iter().all(|(s, op)| structural_ok(*s, op))
@@ -689,6 +948,155 @@ impl Msg {
     }
 }
 
+/// 按矩形范围稀疏遍历工作表非空单元格（跳过空白页与空白列块）
+pub fn iter_sheet_rect(
+    sheet: &Sheet,
+    rect: (u32, u32, u32, u32),
+) -> impl Iterator<Item = (crate::model::CellRef, &Cell)> {
+    sheet.cells().iter_rect(rect)
+}
+
+/// 宿主开房时的零拷贝 CoW 基准工作簿快照（基于 `Sheet::search_snapshot` 列块共享）
+#[derive(Clone, Debug)]
+pub struct BaselineBook {
+    pub site: u32,
+    pub sheets: Vec<Sheet>,
+    pub styles: Arc<crate::style::StyleTable>,
+}
+
+impl BaselineBook {
+    pub fn from_workbook(site: u32, wb: &crate::model::Workbook) -> Self {
+        Self {
+            site,
+            sheets: wb.sheets.iter().map(Sheet::search_snapshot).collect(),
+            styles: Arc::new(wb.styles.clone()),
+        }
+    }
+
+    pub fn has_cell(&self, sheet: usize, row: u32, col: u32) -> bool {
+        self.sheets
+            .get(sheet)
+            .and_then(|sh| sh.get(row, col))
+            .is_some()
+    }
+
+    pub fn cell_op(&self, sheet: usize, row: u32, col: u32) -> Option<Op> {
+        let cell = self.sheets.get(sheet)?.get(row, col)?;
+        Some(Op {
+            sheet,
+            row,
+            col,
+            value: ValueWire::from(&cell.value),
+            formula: cell.formula.clone(),
+            ts: 1,
+            site: self.site,
+        })
+    }
+
+    pub fn cell_style(&self, sheet: usize, row: u32, col: u32) -> Option<crate::style::CellStyle> {
+        let sh = self.sheets.get(sheet)?;
+        let sid = *sh.styles.get(&crate::model::CellRef::new(row, col))?;
+        (sid != 0).then(|| self.styles.get(sid).clone())
+    }
+
+    pub fn for_each_cell_in_rect(
+        &self,
+        sheet: usize,
+        rect: (u32, u32, u32, u32),
+        mut f: impl FnMut(u32, u32, &Cell),
+    ) {
+        let Some(sh) = self.sheets.get(sheet) else { return };
+        for (k, cell) in sh.cells().iter_rect(rect) {
+            f(k.row, k.col, cell);
+        }
+    }
+
+    pub fn for_each_style_in_rect(
+        &self,
+        sheet: usize,
+        (r1, c1, r2, c2): (u32, u32, u32, u32),
+        mut f: impl FnMut(u32, u32, &crate::style::CellStyle),
+    ) {
+        let Some(sh) = self.sheets.get(sheet) else { return };
+        for (k, &sid) in sh.styles.iter_from(true, r1) {
+            if k.row <= r2 && (c1..=c2).contains(&k.col) && sid != 0 {
+                f(k.row, k.col, self.styles.get(sid));
+            }
+        }
+    }
+
+    pub fn shift_structural(&mut self, target_sheet: usize, op: &crate::structural::Structural) {
+        let names: Vec<String> = self.sheets.iter().map(|s| s.name.clone()).collect();
+        let shifts = structural_reference_shifts(&names, target_sheet, op);
+        if let Some(sh) = self.sheets.get_mut(target_sheet) {
+            use crate::structural::Structural as S;
+            match *op {
+                S::InsertRows { at, n } => {
+                    sh.remap_cell_axis(true, at, |r| {
+                        Some(if r >= at { r.saturating_add(n) } else { r })
+                    });
+                    let moved: Vec<_> = sh
+                        .row_styles
+                        .extract_if(|&r, _| r >= at)
+                        .map(|(r, id)| (r.saturating_add(n), id))
+                        .collect();
+                    sh.row_styles.extend(moved);
+                }
+                S::DeleteRows { at, n } => {
+                    sh.remap_cell_axis(true, at, |r| {
+                        if r < at {
+                            Some(r)
+                        } else if r < at.saturating_add(n) {
+                            None
+                        } else {
+                            Some(r - n)
+                        }
+                    });
+                    let moved: Vec<_> = sh
+                        .row_styles
+                        .extract_if(|&r, _| r >= at)
+                        .filter_map(|(r, id)| (r >= at.saturating_add(n)).then_some((r - n, id)))
+                        .collect();
+                    sh.row_styles.extend(moved);
+                }
+                S::InsertCols { at, n } => {
+                    sh.remap_cell_axis(false, at, |c| {
+                        Some(if c >= at { c.saturating_add(n) } else { c })
+                    });
+                    let moved: Vec<_> = sh
+                        .col_styles
+                        .extract_if(|&c, _| c >= at)
+                        .map(|(c, id)| (c.saturating_add(n), id))
+                        .collect();
+                    sh.col_styles.extend(moved);
+                }
+                S::DeleteCols { at, n } => {
+                    sh.remap_cell_axis(false, at, |c| {
+                        if c < at {
+                            Some(c)
+                        } else if c < at.saturating_add(n) {
+                            None
+                        } else {
+                            Some(c - n)
+                        }
+                    });
+                    let moved: Vec<_> = sh
+                        .col_styles
+                        .extract_if(|&c, _| c >= at)
+                        .filter_map(|(c, id)| (c >= at.saturating_add(n)).then_some((c - n, id)))
+                        .collect();
+                    sh.col_styles.extend(moved);
+                }
+            }
+        }
+        for (si, sh) in self.sheets.iter_mut().enumerate() {
+            if let Some(shift) = shifts.get(si) {
+                sh.rewrite_references(shift);
+            }
+        }
+    }
+}
+
 /// 一个副本的状态机（与网络无关，便于单元测试）
 pub struct Peer {
     pub site: u32,
@@ -733,6 +1141,41 @@ pub fn shift_cell_map<V>(cells: &mut std::collections::BTreeMap<(usize, u32, u32
     cells.extend(moved);
 }
 
+pub fn shift_coord_set(
+    coords: &mut BTreeSet<(usize, u32, u32)>,
+    sheet: usize,
+    op: &crate::structural::Structural,
+) {
+    let mut moved = Vec::new();
+    use crate::structural::Structural::*;
+    let mut extract = |set: &mut BTreeSet<(usize, u32, u32)>, first, last| {
+        for (_, r, c) in set.extract_if(first..=last, |_| true) {
+            if let Some((row, col)) = shift_structural_coord(r, c, op) {
+                moved.push((sheet, row, col));
+            }
+        }
+    };
+    match *op {
+        InsertRows { at, .. } | DeleteRows { at, .. } => {
+            extract(coords, (sheet, at, 0), (sheet, u32::MAX, u32::MAX));
+        }
+        InsertCols { at: 0, .. } | DeleteCols { at: 0, .. } => {
+            extract(coords, (sheet, 0, 0), (sheet, u32::MAX, u32::MAX));
+        }
+        InsertCols { at, .. } | DeleteCols { at, .. } => {
+            let mut start = 0;
+            while let Some(&(_, row, _)) =
+                coords.range((sheet, start, 0)..=(sheet, u32::MAX, u32::MAX)).next()
+            {
+                extract(coords, (sheet, row, at), (sheet, row, u32::MAX));
+                let Some(next) = row.checked_add(1) else { break };
+                start = next;
+            }
+        }
+    }
+    coords.extend(moved);
+}
+
 #[test]
 fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     let mut sort = SortPermutation { structural_revision: 0, sheet: 1, name: "one".into(), region: (3,7,6,9),
@@ -746,7 +1189,7 @@ fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     sort.horizontal = false;
     assert!(!sort.valid());
     let hello: Msg = serde_json::from_str(r#"{"t":"Hello","site":1,"name":"a","doc":"d","proof":"p"}"#).unwrap();
-    assert!(matches!(hello,Msg::Hello { sort_permutation: false, .. }));
+    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, .. }));
 }
 
 #[test]
@@ -766,7 +1209,157 @@ fn shifting_sparse_column_suffixes_preserves_other_rows_and_sheets() {
         [(0,0,19),(1,0,5),(1,0,12),(1,64,3),(1,999_999,14),(2,0,10)]);
 }
 
-pub type CellOps = std::collections::BTreeMap<(usize, u32, u32), std::sync::Arc<Op>>;
+pub type CellOpMap = BTreeMap<(usize, u32, u32), Arc<Op>>;
+
+#[derive(Clone, Debug)]
+pub enum OpView<'a> {
+    Shared(&'a Arc<Op>),
+    Owned(Op),
+}
+
+impl std::ops::Deref for OpView<'_> {
+    type Target = Op;
+    fn deref(&self) -> &Op {
+        match self {
+            Self::Shared(arc) => arc,
+            Self::Owned(op) => op,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CellOps {
+    overlay: CellOpMap,
+    formula_keys: BTreeSet<(usize, u32, u32)>,
+    removed_baseline: BTreeSet<(usize, u32, u32)>,
+    baseline: Option<BaselineBook>,
+}
+
+impl CellOps {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_baseline(&mut self, baseline: BaselineBook) {
+        self.overlay.clear();
+        self.formula_keys.clear();
+        self.removed_baseline.clear();
+        self.baseline = Some(baseline);
+    }
+
+    pub fn baseline(&self) -> Option<&BaselineBook> {
+        self.baseline.as_ref()
+    }
+
+    pub fn clear(&mut self) {
+        self.overlay.clear();
+        self.formula_keys.clear();
+        self.removed_baseline.clear();
+        self.baseline = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        if !self.overlay.is_empty() {
+            return false;
+        }
+        match &self.baseline {
+            None => true,
+            Some(base) => base.sheets.iter().enumerate().all(|(si, sh)| {
+                sh.iter()
+                    .all(|(k, _)| self.removed_baseline.contains(&(si, k.row, k.col)))
+            }),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.baseline {
+            None => self.overlay.len(),
+            Some(base) => {
+                let mut count = self.overlay.len();
+                for (si, sh) in base.sheets.iter().enumerate() {
+                    for (k, _) in sh.iter() {
+                        let key = (si, k.row, k.col);
+                        if !self.overlay.contains_key(&key)
+                            && !self.removed_baseline.contains(&key)
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            }
+        }
+    }
+
+    pub fn get(&self, key: &(usize, u32, u32)) -> Option<OpView<'_>> {
+        if let Some(op) = self.overlay.get(key) {
+            return Some(OpView::Shared(op));
+        }
+        if self.removed_baseline.contains(key) {
+            return None;
+        }
+        let base = self.baseline.as_ref()?;
+        base.cell_op(key.0, key.1, key.2).map(OpView::Owned)
+    }
+
+    pub fn get_overlay(&self, key: &(usize, u32, u32)) -> Option<&Arc<Op>> {
+        self.overlay.get(key)
+    }
+
+    pub fn insert(&mut self, key: (usize, u32, u32), op: Arc<Op>) -> Option<Arc<Op>> {
+        self.removed_baseline.remove(&key);
+        if op.formula.is_some() {
+            self.formula_keys.insert(key);
+        } else {
+            self.formula_keys.remove(&key);
+        }
+        self.overlay.insert(key, op)
+    }
+
+    pub fn remove(&mut self, key: &(usize, u32, u32)) -> Option<Arc<Op>> {
+        self.formula_keys.remove(key);
+        if self.baseline.is_some() {
+            self.removed_baseline.insert(*key);
+        }
+        self.overlay.remove(key)
+    }
+
+    pub fn keys(&self) -> std::collections::btree_map::Keys<'_, (usize, u32, u32), Arc<Op>> {
+        self.overlay.keys()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, (usize, u32, u32), Arc<Op>> {
+        self.overlay.iter()
+    }
+
+    pub fn values(&self) -> std::collections::btree_map::Values<'_, (usize, u32, u32), Arc<Op>> {
+        self.overlay.values()
+    }
+
+    pub fn values_mut(
+        &mut self,
+    ) -> std::collections::btree_map::ValuesMut<'_, (usize, u32, u32), Arc<Op>> {
+        self.overlay.values_mut()
+    }
+
+    /// 仅对实际含公式的覆盖单元格执行引用改写，跳过全部纯数值/文本格
+    pub fn rewrite_formulas(&mut self, shifts: &[crate::refs::Shift]) {
+        for &key in &self.formula_keys {
+            if let Some(cell) = self.overlay.get_mut(&key) {
+                if let Some(formula) = cell.shifted_formula(shifts) {
+                    Arc::make_mut(cell).formula = Some(Arc::from(formula));
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Index<&(usize, u32, u32)> for CellOps {
+    type Output = Arc<Op>;
+    fn index(&self, key: &(usize, u32, u32)) -> &Self::Output {
+        &self.overlay[key]
+    }
+}
 
 /// Use the same per-sheet reference context as the workbook's structural edit.
 pub fn structural_reference_shifts(names: &[String], target: usize, op: &crate::structural::Structural)
@@ -780,23 +1373,38 @@ pub fn structural_reference_shifts(names: &[String], target: usize, op: &crate::
 
 impl Op {
     pub fn shifted_formula(&self, shifts: &[crate::refs::Shift]) -> Option<String> {
-        let formula = self.formula.as_ref()?;
+        let formula = self.formula.as_deref()?;
         let rewritten = crate::refs::rewrite(formula,shifts.get(self.sheet)?);
-        (rewritten != *formula).then_some(rewritten)
+        (rewritten != formula).then_some(rewritten)
     }
 }
 
 pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
-    shift_cell_map(cells, sheet, op, |op, row, col| {
-        let cell = std::sync::Arc::make_mut(op);
+    shift_cell_map(&mut cells.overlay, sheet, op, |op, row, col| {
+        let cell = Arc::make_mut(op);
         cell.row = row;
         cell.col = col;
     });
+    shift_coord_set(&mut cells.formula_keys, sheet, op);
+    if cells.baseline.is_some() {
+        shift_coord_set(&mut cells.removed_baseline, sheet, op);
+        if let Some(base) = &mut cells.baseline {
+            base.shift_structural(sheet, op);
+        }
+    }
 }
 
 impl Peer {
     pub fn new(site: u32) -> Self {
         Self { site, clock: 0, cells: CellOps::new(), peers: HashMap::new() }
+    }
+
+    /// 宿主启动时以 O(页数) CoW 快照建立只读基准（零逐格分配、零字符串克隆）
+    pub fn seed_workbook(&mut self, wb: &crate::model::Workbook) -> BaselineBook {
+        self.clock = self.clock.max(1);
+        let base = BaselineBook::from_workbook(self.site, wb);
+        self.cells.set_baseline(base.clone());
+        base
     }
 
     /// 宿主启动时将磁盘基准单元格放入初始快照：所有未改基准格统一赋 `ts = 1`，
@@ -808,7 +1416,7 @@ impl Peer {
             row,
             col,
             value: ValueWire::from(&cell.value),
-            formula: cell.formula.as_deref().map(|f| f.to_string()),
+            formula: cell.formula.clone(),
             ts: 1,
             site: self.site,
         };
@@ -820,18 +1428,18 @@ impl Peer {
         (*self.local_set_shared(sheet, row, col, cell)).clone()
     }
 
-    pub fn local_set_shared(&mut self, sheet: usize, row: u32, col: u32, cell: &Cell) -> std::sync::Arc<Op> {
+    pub fn local_set_shared(&mut self, sheet: usize, row: u32, col: u32, cell: &Cell) -> Arc<Op> {
         self.clock = self.clock.saturating_add(1);
         let op = Op {
             sheet,
             row,
             col,
             value: ValueWire::from(&cell.value),
-            formula: cell.formula.as_deref().map(|f| f.to_string()),
+            formula: cell.formula.clone(),
             ts: self.clock,
             site: self.site,
         };
-        let op = std::sync::Arc::new(op);
+        let op = Arc::new(op);
         self.cells.insert((sheet, row, col), op.clone());
         op
     }
@@ -841,19 +1449,25 @@ impl Peer {
         self.apply_shared(op.into())
     }
 
-    pub fn apply_shared(&mut self, op: std::sync::Arc<Op>) -> bool {
+    pub fn apply_shared(&mut self, op: Arc<Op>) -> bool {
         if !op.is_valid() {
             return false; // 越界坐标或离谱时间戳：不进副本，也不推高时钟
         }
         self.clock = self.clock.max(op.ts);
         let key = (op.sheet, op.row, op.col);
-        match self.cells.get(&key) {
-            Some(cur) if !op.newer_than(cur) => false,
-            _ => {
-                self.cells.insert(key, op);
-                true
+        if let Some(cur) = self.cells.get_overlay(&key) {
+            if !op.newer_than(cur) {
+                return false;
+            }
+        } else if !self.cells.removed_baseline.contains(&key) {
+            if let Some(base) = self.cells.baseline() {
+                if base.has_cell(op.sheet, op.row, op.col) && (op.ts, op.site) <= (1, base.site) {
+                    return false;
+                }
             }
         }
+        self.cells.insert(key, op);
+        true
     }
 
     /// 强制以宿主权威版本覆盖单格状态（用于租约冲突被宿主驳回后的本地回滚）
@@ -876,8 +1490,46 @@ impl Peer {
         shift_cell_ops(&mut self.cells, sheet, op);
     }
 
+    /// 平移副本坐标并仅针对实际含公式的单元格改写引用（跳过百万纯数值格）
+    pub fn shift_structural_with_formulas(
+        &mut self,
+        names: &[String],
+        sheet: usize,
+        op: &crate::structural::Structural,
+    ) {
+        shift_cell_ops(&mut self.cells, sheet, op);
+        let shifts = structural_reference_shifts(names, sheet, op);
+        self.cells.rewrite_formulas(&shifts);
+    }
+
     pub fn snapshot(&self) -> Vec<Op> {
-        self.cells.values().map(|op| op.as_ref().clone()).collect()
+        let Some(base) = self.cells.baseline() else {
+            return self.cells.values().map(|op| op.as_ref().clone()).collect();
+        };
+        let mut merged: BTreeMap<(usize, u32, u32), Op> = BTreeMap::new();
+        for (si, sh) in base.sheets.iter().enumerate() {
+            for (k, cell) in sh.iter() {
+                let key = (si, k.row, k.col);
+                if !self.cells.removed_baseline.contains(&key) {
+                    merged.insert(
+                        key,
+                        Op {
+                            sheet: si,
+                            row: k.row,
+                            col: k.col,
+                            value: ValueWire::from(&cell.value),
+                            formula: cell.formula.clone(),
+                            ts: 1,
+                            site: base.site,
+                        },
+                    );
+                }
+            }
+        }
+        for (&key, op) in self.cells.iter() {
+            merged.insert(key, op.as_ref().clone());
+        }
+        merged.into_values().collect()
     }
 
     pub fn merge_snapshot(&mut self, ops: Vec<Op>) -> Vec<Op> {
@@ -896,7 +1548,7 @@ impl Peer {
         for (si, r, c) in keys {
             if let Some(op) = self.cells.get(&(*si, *r, *c)) {
                 if let Some(sheet) = wb.sheets.get_mut(*si) {
-                    let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
+                    let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
                     sheet.set(*r, *c, cell);
                 }
             } else if let Some(sheet) = wb.sheets.get_mut(*si) {
@@ -907,9 +1559,20 @@ impl Peer {
 
     /// 整本工作簿写回（加入房间时用）
     pub fn apply_all_to_workbook(&self, wb: &mut crate::model::Workbook) {
+        if let Some(base) = self.cells.baseline() {
+            for (si, sh) in base.sheets.iter().enumerate() {
+                if let Some(dst) = wb.sheets.get_mut(si) {
+                    for (k, cell) in sh.iter() {
+                        if !self.cells.removed_baseline.contains(&(si, k.row, k.col)) {
+                            dst.set(k.row, k.col, cell.clone());
+                        }
+                    }
+                }
+            }
+        }
         for ((si, r, c), op) in self.cells.iter() {
             if let Some(sheet) = wb.sheets.get_mut(*si) {
-                let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
+                let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
                 sheet.set(*r, *c, cell);
             }
         }
@@ -917,18 +1580,27 @@ impl Peer {
 
     /// 兼容旧调用：只写第 0 张表
     pub fn apply_to_sheet(&self, sheet: &mut Sheet) {
+        if let Some(base) = self.cells.baseline() {
+            if let Some(src) = base.sheets.first() {
+                for (k, cell) in src.iter() {
+                    if !self.cells.removed_baseline.contains(&(0, k.row, k.col)) {
+                        sheet.set(k.row, k.col, cell.clone());
+                    }
+                }
+            }
+        }
         for ((si, r, c), op) in self.cells.iter() {
             if *si != 0 {
                 continue;
             }
-            let cell = Cell { value: Value::from(&op.value), formula: op.formula.as_deref().map(|f| f.into()) };
+            let cell = Cell { value: Value::from(&op.value), formula: op.formula.clone() };
             sheet.set(*r, *c, cell);
         }
     }
 }
 
-/// 新加入者需要的完整快照大小上限（防止误传超大文档）
-pub const MAX_SNAPSHOT_OPS: usize = 200_000;
+/// 新加入者单批次上限保护（全量快照按 `SNAPSHOT_CHUNK_OPS` 流式分片传输）
+pub const MAX_SNAPSHOT_OPS: usize = MAX_BATCH_ITEMS;
 
 #[cfg(test)]
 mod tests {
@@ -1044,5 +1716,79 @@ mod tests {
         let mut b = Peer::new(2);
         b.apply(del);
         assert_eq!(b.cells[&(0, 0, 0)].value, ValueWire::Empty);
+    }
+
+    #[test]
+    fn seed_workbook_cow_baseline_and_palette_encoding_preserve_semantics() {
+        let mut wb = crate::model::Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("共享文本".into()), formula: None });
+        wb.sheets[0].set(1, 0, Cell { value: Value::Number(10.0), formula: Some("=A1".into()) });
+
+        let mut host_peer = Peer::new(5);
+        let base = host_peer.seed_workbook(&wb);
+        assert_eq!(base.sheets.len(), 1);
+        assert_eq!(host_peer.cells.len(), 2);
+        assert_eq!(
+            host_peer.cells.get(&(0, 0, 0)).unwrap().value,
+            ValueWire::Text("共享文本".into())
+        );
+
+        // Stale remote write at ts=1 with lower site loses to baseline (ts=1, site=5)
+        assert!(!host_peer.apply(Op {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: ValueWire::Number(99.0),
+            formula: None,
+            ts: 1,
+            site: 2,
+        }));
+        // Newer write at ts=2 wins over baseline
+        assert!(host_peer.apply(Op {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            value: ValueWire::Number(42.0),
+            formula: None,
+            ts: 2,
+            site: 2,
+        }));
+
+        // Structural insert shifts both baseline formula cell and overlay cell
+        host_peer.shift_structural_with_formulas(
+            &["Sheet1".to_string()],
+            0,
+            &crate::structural::Structural::InsertRows { at: 0, n: 2 },
+        );
+        assert_eq!(
+            host_peer.cells.get(&(0, 2, 0)).unwrap().value,
+            ValueWire::Number(42.0)
+        );
+        assert_eq!(
+            host_peer.cells.get(&(0, 3, 0)).unwrap().formula.as_deref(),
+            Some("=A3")
+        );
+
+        let mut st_a = crate::style::CellStyle::default();
+        st_a.bold = true;
+        let mut st_b = crate::style::CellStyle::default();
+        st_b.italic = true;
+        let raw_items = vec![
+            (0, 0, st_a.clone()),
+            (0, 1, st_b.clone()),
+            (0, 2, st_a.clone()),
+        ];
+        let (palette, items) = encode_style_palette(&raw_items);
+        assert_eq!(palette.len(), 2);
+        assert_eq!(items, vec![(0, 0, 0), (0, 1, 1), (0, 2, 0)]);
+        assert!(Msg::StylePaletteOp {
+            site: 5,
+            sheet: 0,
+            ts: 3,
+            palette: palette.clone(),
+            items: items.clone(),
+        }
+        .is_within_limits());
+        assert_eq!(decode_style_palette(&palette, &items).unwrap(), raw_items);
     }
 }

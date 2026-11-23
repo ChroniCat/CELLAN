@@ -168,6 +168,7 @@ enum TextState {
 
 pub(super) struct StreamAssembler {
     line_buf: Vec<u8>,
+    line_pos: usize,
     event: String,
     has_event_fields: bool,
     data: String,
@@ -181,12 +182,14 @@ pub(super) struct StreamAssembler {
     saw_done: bool,
     finish_reason: Option<String>,
     wake_ctx: Option<egui::Context>,
+    last_wake: Option<std::time::Instant>,
 }
 
 impl StreamAssembler {
     pub(super) fn new(wake_ctx: Option<egui::Context>) -> Self {
         Self {
             line_buf: Vec::new(),
+            line_pos: 0,
             event: String::new(),
             has_event_fields: false,
             data: String::new(),
@@ -200,6 +203,24 @@ impl StreamAssembler {
             saw_done: false,
             finish_reason: None,
             wake_ctx,
+            last_wake: None,
+        }
+    }
+
+    fn send_delta(&mut self, tx: &Sender<StreamMsg>, msg: StreamMsg) {
+        let _ = tx.send(msg);
+        if let Some(ctx) = self.wake_ctx.as_ref() {
+            let now = std::time::Instant::now();
+            let min_gap = std::time::Duration::from_millis(16);
+            match self.last_wake {
+                Some(prev) if now.saturating_duration_since(prev) < min_gap => {
+                    ctx.request_repaint_after(min_gap - now.saturating_duration_since(prev));
+                }
+                _ => {
+                    self.last_wake = Some(now);
+                    ctx.request_repaint();
+                }
+            }
         }
     }
 
@@ -209,13 +230,39 @@ impl StreamAssembler {
         tx: &Sender<StreamMsg>,
     ) -> Result<bool, String> {
         self.line_buf.extend_from_slice(chunk);
-        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-            let raw: Vec<_> = self.line_buf.drain(..=pos).collect();
-            let line = std::str::from_utf8(&raw).map_err(|_| "模型流包含无效 UTF-8")?;
-            self.read_line(line.trim_end_matches(['\n', '\r']), tx)?;
-            if self.saw_done {
-                return Ok(true);
+        let mut buf = std::mem::take(&mut self.line_buf);
+        let mut pos = self.line_pos;
+        let mut outcome: Result<bool, String> = Ok(false);
+        while let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
+            let end = pos + rel;
+            let line = match std::str::from_utf8(&buf[pos..end]) {
+                Ok(s) => s.trim_end_matches('\r'),
+                Err(_) => {
+                    outcome = Err("模型流包含无效 UTF-8".into());
+                    break;
+                }
+            };
+            pos = end + 1;
+            if let Err(err) = self.read_line(line, tx) {
+                outcome = Err(err);
+                break;
             }
+            if self.saw_done {
+                outcome = Ok(true);
+                break;
+            }
+        }
+        if pos == buf.len() {
+            buf.clear();
+            pos = 0;
+        } else if pos >= 4096 {
+            buf.drain(..pos);
+            pos = 0;
+        }
+        self.line_buf = buf;
+        self.line_pos = pos;
+        if outcome? {
+            return Ok(true);
         }
         // A gateway may omit [DONE]. Process any following complete events already in
         // this read so an actual marker or error after the final choice is still observed.
@@ -223,7 +270,7 @@ impl StreamAssembler {
         // in that case, so a later service error can still discard the whole tool batch.
         Ok(self.finish_reason.is_some()
             && !self.has_tool_call()
-            && self.line_buf.is_empty()
+            && self.line_pos == self.line_buf.len()
             && self.data.is_empty()
             && !self.has_event_fields)
     }
@@ -247,7 +294,7 @@ impl StreamAssembler {
     /// case may be closed after an idle grace period. Tools require [DONE] or clean EOF.
     pub(super) fn has_unframed_terminal(&self) -> bool {
         if self.has_event_fields
-            || !self.line_buf.is_empty()
+            || self.line_pos < self.line_buf.len()
             || self.data.is_empty()
             || self.state != TextState::Visible
             || !self.pending.is_empty()
@@ -345,11 +392,7 @@ impl StreamAssembler {
                     .get_or_insert_with(String::new)
                     .push_str(reasoning);
                 if !reasoning.is_empty() {
-                    send_wake(
-                        tx,
-                        StreamMsg::ReasoningDelta(reasoning.to_owned()),
-                        self.wake_ctx.as_ref(),
-                    );
+                    self.send_delta(tx, StreamMsg::ReasoningDelta(reasoning.to_owned()));
                 }
             }
             if let Some(content) = delta["content"].as_str() {
@@ -385,6 +428,7 @@ impl StreamAssembler {
     // across deltas, including nested think sections and tag fragments split inside UTF-8 frames.
     fn scan(&mut self, flush: bool, tx: &Sender<StreamMsg>) {
         let mut consumed = 0;
+        let mut out_deltas: Vec<(bool, String)> = Vec::new();
         while consumed < self.pending.len() {
             let rest = &self.pending[consumed..];
             let tags: &[&str] = match self.state {
@@ -411,17 +455,11 @@ impl StreamAssembler {
                 match self.state {
                     TextState::Visible => {
                         self.visible.push_str(piece);
-                        send_wake(
-                            tx,
-                            StreamMsg::ContentDelta(piece.to_owned()),
-                            self.wake_ctx.as_ref(),
-                        );
+                        out_deltas.push((true, piece.to_owned()));
                     }
-                    TextState::Thinking(_) => send_wake(
-                        tx,
-                        StreamMsg::ReasoningDelta(piece.to_owned()),
-                        self.wake_ctx.as_ref(),
-                    ),
+                    TextState::Thinking(_) => {
+                        out_deltas.push((false, piece.to_owned()));
+                    }
                     TextState::Tool => self.tool_text.push_str(piece),
                 }
             }
@@ -443,13 +481,26 @@ impl StreamAssembler {
                 _ => TextState::Visible,
             };
         }
-        self.pending.drain(..consumed);
+        if consumed >= self.pending.len() {
+            self.pending.clear();
+        } else if consumed > 0 {
+            self.pending.drain(..consumed);
+        }
+        for (is_visible, text) in out_deltas {
+            let msg = if is_visible {
+                StreamMsg::ContentDelta(text)
+            } else {
+                StreamMsg::ReasoningDelta(text)
+            };
+            self.send_delta(tx, msg);
+        }
     }
 
     pub(super) fn finish(&mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
         if !self.saw_done {
             let bytes = std::mem::take(&mut self.line_buf);
-            let line = std::str::from_utf8(&bytes).map_err(|_| "模型流包含无效 UTF-8")?;
+            let pos = std::mem::replace(&mut self.line_pos, 0);
+            let line = std::str::from_utf8(&bytes[pos..]).map_err(|_| "模型流包含无效 UTF-8")?;
             if !line.is_empty() {
                 self.read_line(line.trim_end_matches('\r'), tx)?;
             }
