@@ -587,6 +587,8 @@ impl<'a> Styles<'a> {
         expected.vertical_text = new.vertical_text;
         expected.font.clone_from(&new.font);
         expected.border = new.border;
+        expected.locked = new.locked;
+        expected.hidden = new.hidden;
         let was_theme = styles.theme_of(old_id);
         let want_theme = styles.theme_of(id);
         let fill_changed = old.fill != new.fill
@@ -1007,6 +1009,94 @@ impl<'a> Styles<'a> {
         Some(edits)
     }
 
+    fn protection_applied(&self, xf: Node<'_, '_>, old: &CellStyle) -> Option<()> {
+        match xf.attribute("applyProtection") {
+            Some("1" | "true") => {}
+            None | Some("0" | "false") => {
+                let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
+                let record = self.node("cellStyleXfs", parent);
+                if record.is_none()
+                    && (parent != 0
+                        || self
+                            .doc
+                            .root_element()
+                            .children()
+                            .any(|n| n.has_tag_name((NS, "cellStyleXfs"))))
+                    || record
+                        .is_some_and(|p| p.children().any(|n| n.has_tag_name((NS, "protection"))))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        let mut children = xf.children().filter(|n| n.has_tag_name((NS, "protection")));
+        let prot = children.next();
+        if children.next().is_some() {
+            return None;
+        }
+        if let Some(p) = prot {
+            if p.children().any(|n| n.is_element())
+                || p.attributes()
+                    .any(|a| a.namespace().is_some() || !matches!(a.name(), "locked" | "hidden"))
+            {
+                return None;
+            }
+        }
+        let bool_attr = |name: &str, default: bool| -> Option<bool> {
+            match prot.and_then(|p| p.attribute(name)) {
+                None => Some(default),
+                Some("1" | "true") => Some(true),
+                Some("0" | "false") => Some(false),
+                _ => None,
+            }
+        };
+        if bool_attr("locked", true)? != old.locked || bool_attr("hidden", false)? != old.hidden {
+            return None;
+        }
+        Some(())
+    }
+
+    fn apply_protection_tag(raw_xf: &str, new: &CellStyle) -> Option<String> {
+        let wrapped = format!("<styleSheet xmlns=\"{NS}\">{raw_xf}</styleSheet>");
+        let doc = Document::parse(&wrapped).ok()?;
+        let xf = doc.root_element().first_element_child()?;
+        let base = "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">".len();
+        let tag = format!(
+            "<protection locked=\"{}\" hidden=\"{}\"/>",
+            u8::from(new.locked),
+            u8::from(new.hidden)
+        );
+        if let Some(existing) = xf.children().find(|n| n.has_tag_name((NS, "protection"))) {
+            let r = existing.range();
+            let mut out = String::with_capacity(raw_xf.len() + tag.len());
+            out.push_str(&raw_xf[..r.start - base]);
+            out.push_str(&tag);
+            out.push_str(&raw_xf[r.end - base..]);
+            return Some(out);
+        }
+        if raw_xf.ends_with("/>") {
+            let mut out = String::with_capacity(raw_xf.len() + tag.len() + 6);
+            out.push_str(&raw_xf[..raw_xf.len() - 2]);
+            out.push('>');
+            out.push_str(&tag);
+            out.push_str("</xf>");
+            return Some(out);
+        }
+        let at = if let Some(align) = xf.children().find(|n| n.has_tag_name((NS, "alignment"))) {
+            align.range().end - base
+        } else if let Some(ext) = xf.children().find(|n| n.has_tag_name((NS, "extLst"))) {
+            ext.range().start - base
+        } else {
+            raw_xf.rfind("</xf>")?
+        };
+        let mut out = String::with_capacity(raw_xf.len() + tag.len());
+        out.push_str(&raw_xf[..at]);
+        out.push_str(&tag);
+        out.push_str(&raw_xf[at..]);
+        Some(out)
+    }
+
     fn with_fields(
         &mut self,
         base: u16,
@@ -1037,6 +1127,11 @@ impl<'a> Styles<'a> {
             edits.extend(self.alignment_edits(xf, old, new)?);
             fields.push(("applyAlignment", 1));
         }
+        let protection_changed = (old.locked, old.hidden) != (new.locked, new.hidden);
+        if protection_changed {
+            self.protection_applied(xf, old)?;
+            fields.push(("applyProtection", 1));
+        }
         let mut attrs = String::new();
         for (name, value) in fields {
             if let Some(attr) = xf.attribute_node(name) {
@@ -1054,7 +1149,10 @@ impl<'a> Styles<'a> {
             // offset. Emit the new attributes before that replacement.
             edits.insert(0, (name_end..name_end, attrs));
         }
-        let raw_xf = apply_edits(&self.xml[range.clone()], range.start, edits);
+        let mut raw_xf = apply_edits(&self.xml[range.clone()], range.start, edits);
+        if protection_changed {
+            raw_xf = Self::apply_protection_tag(&raw_xf, new)?;
+        }
         self.xfs.intern(self.xml, raw_xf)
     }
 

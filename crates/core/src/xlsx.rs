@@ -1329,6 +1329,61 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
 /// 覆盖：ZIP 能打开、每个条目 CRC 读通、必需部件齐全、[Content_Types].xml 声明的部件全在、
 /// workbook.xml.rels 里的工作表目标全在、这几个关键 XML 良构。XLS 走对应的 CFB 读取路径。
 pub fn verify_saved_package(path: &Path) -> Result<()> {
+    verify_saved_package_against(path, None)
+}
+
+fn collect_trusted_signatures(wb: &Workbook) -> std::collections::HashMap<String, (u32, u64)> {
+    let mut trusted = std::collections::HashMap::new();
+    if wb.load_incomplete {
+        return trusted;
+    }
+    for sheet in &wb.sheets {
+        if let (Some(part), Some(src)) = (&sheet.source_part, &sheet.source_cells) {
+            // Only trust a worksheet's baseline signature when none of its XML-altering flags changed.
+            let untouched_sheet = !sheet.cell_data_needs_save()
+                && !sheet.styles_dirty
+                && !sheet.row_styles_dirty
+                && !sheet.col_styles_dirty
+                && sheet.style_edits.is_empty()
+                && !sheet.merges_dirty
+                && !sheet.notes_dirty
+                && !sheet.rich_dirty
+                && !sheet.layout_dirty
+                && !sheet.freeze_dirty
+                && !sheet.filter_dirty
+                && !sheet.page_dirty
+                && !sheet.cf_dirty
+                && !sheet.dv_dirty
+                && !sheet.charts_dirty
+                && !sheet.tables_dirty
+                && !sheet.protect_dirty
+                && !sheet.tab_color_dirty
+                && !sheet.outline_pr_dirty
+                && !sheet.scenarios_dirty
+                && !sheet.ignored_errors_dirty
+                && !sheet.sparklines_dirty
+                && !sheet.textboxes_dirty
+                && !sheet.pictures_dirty
+                && !sheet.hyperlinks_dirty;
+            let (sheet_sig, sst_sig, style_sig) = src.trusted_signatures();
+            if untouched_sheet {
+                trusted.insert(part.clone(), sheet_sig);
+            }
+            if let Some(sst_sig) = sst_sig {
+                trusted.insert("xl/sharedStrings.xml".to_owned(), sst_sig);
+            }
+            if let Some(style_sig) = style_sig {
+                trusted.insert("xl/styles.xml".to_owned(), style_sig);
+            }
+        }
+    }
+    trusted
+}
+
+fn verify_saved_package_against(
+    path: &Path,
+    trusted: Option<&std::collections::HashMap<String, (u32, u64)>>,
+) -> Result<()> {
     use std::io::{Read, Seek};
     // 不能靠扩展名判断类型：调用方传进来的常常是临时文件（.~a.xls.saving-1234），
     // 它的扩展名是 saving-1234。按文件头判断才可靠。
@@ -1386,13 +1441,34 @@ pub fn verify_saved_package(path: &Path) -> Result<()> {
     }
     let mut seen_critical = std::collections::HashSet::new();
     for i in 0..zip.len() {
-        let mut e = zip.by_index(i).with_context(|| format!("读取保存产物第 {i} 个条目失败"))?;
-        let name = e.name().to_owned();
+        let name = zip
+            .name_for_index(i)
+            .with_context(|| format!("读取保存产物第 {i} 个条目名失败"))?
+            .to_owned();
         if critical.contains_key(name.as_str()) {
             anyhow::ensure!(seen_critical.insert(name.clone()), "保存产物关键部件重复：{name}");
-        } else if worksheets.contains(&name) {
+            continue;
+        }
+        if let Some(trusted_map) = trusted {
+            if let Some(&want_sig) = trusted_map.get(&name) {
+                let raw = zip
+                    .by_index_raw(i)
+                    .with_context(|| format!("读取保存产物第 {i} 个条目头失败"))?;
+                if (raw.crc32(), raw.size()) == want_sig
+                    && (raw.size() == 0 || raw.compressed_size() > 0)
+                {
+                    continue;
+                }
+            }
+        }
+        let mut e = zip.by_index(i).with_context(|| format!("读取保存产物第 {i} 个条目失败"))?;
+        if worksheets.contains(&name) {
             delta::stream::xml_input(&mut e, &name, |source| {
-                check_xml_reader(&name, std::io::BufReader::new(source), Some("worksheet"))?;
+                check_xml_reader(
+                    &name,
+                    std::io::BufReader::with_capacity(128 * 1024, source),
+                    Some("worksheet"),
+                )?;
                 Ok(true)
             }).with_context(|| format!("保存产物条目损坏：{name}"))?;
         } else {
@@ -1780,6 +1856,18 @@ fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) 
             continue;
         }
         let fname = entry.file_name().to_string_lossy().to_string();
+        if fname.starts_with(".~cellan-stage-") {
+            let age = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .unwrap_or_default();
+            if age >= std::time::Duration::from_secs(30) {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+            continue;
+        }
         let Some(rest) = fname.strip_prefix(&prefix) else { continue };
         let age = entry
             .metadata()
@@ -1793,6 +1881,26 @@ fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) 
             let _ = std::fs::remove_file(&p);
         }
     }
+}
+
+fn staging_workbook_dir(target_dir: &Path) -> Result<tempfile::TempDir> {
+    let raw = target_dir.to_string_lossy();
+    let is_unc = raw.starts_with("\\\\") || raw.starts_with("//");
+    if !is_unc {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".~cellan-stage-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        if let Ok(td) = builder.tempdir_in(target_dir) {
+            #[cfg(windows)]
+            set_win_file_attrs(td.path(), 0x02); // FILE_ATTRIBUTE_HIDDEN
+            return Ok(td);
+        }
+    }
+    private_workbook_dir()
 }
 
 /// Build the receipt from the staged OOXML before committing the replacement.
@@ -1824,21 +1932,29 @@ fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveRece
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook.xlsx".into());
 
-    // 先在本机私有临时目录内完成全部序列化、XML 补丁与完整性校验，不在用户原文件目录产生中间碎片文件
-    let build_scratch = private_workbook_dir()?;
+    // 优先在目标所在本地卷上的隐藏暂存目录内完成序列化与校验，使后续 rename(&staged, &tmp) 为 O(1) 同卷移动；
+    // 若目标位于远程共享盘或目录不可建子目录，则自动回退至本机私有临时目录。
+    let build_scratch = staging_workbook_dir(dir)?;
     let staged = build_scratch.path().join(&name);
     let _logical_guard = LogicalSaveTargetGuard::set(path);
     let is_xls = path
         .extension()
         .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("xls"));
+    let trusted_sigs = (!is_xls && std::env::var("SC_CORRUPT_TMP").is_err())
+        .then(|| collect_trusted_signatures(wb));
     let receipt = if is_xls {
         crate::xls_write::write(&staged, wb).map(|_| SaveReceipt::default())?
     } else {
         write_ooxml(&staged, wb)?
     };
-    // 写成功 ≠ 产物完整：临时文件先过完整性门禁，不通过绝不触碰原文件目录
+    // 写成功 ≠ 产物完整：临时文件先过完整性门禁，不通过绝不触碰原文件
     corrupt_tmp_for_test(&staged);
-    if let Err(e) = verify_saved_package(&staged) {
+    let verify_trusted = if std::env::var("SC_CORRUPT_TMP").is_ok() {
+        None
+    } else {
+        trusted_sigs.as_ref()
+    };
+    if let Err(e) = verify_saved_package_against(&staged, verify_trusted) {
         return Err(e.context(format!("保存产物完整性校验失败，未覆盖 {}", path.display())));
     }
 
@@ -1860,6 +1976,8 @@ fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveRece
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e).context(format!("写入 {} 失败", path.display())));
     }
+    // 立即清理隐藏暂存目录，保证进入替换窗口（含 SC_SAVE_PAUSE_MS）及函数退出前零残留
+    drop(build_scratch);
     #[cfg(windows)]
     set_win_file_attrs(&tmp, 0x02); // FILE_ATTRIBUTE_HIDDEN：写入与等待期间对资源管理器隐藏
 
@@ -1922,14 +2040,14 @@ fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveRece
                 // 流式覆写不是原子的：写到一半断网、共享盘掉线或进程被杀，唯一的原文件就成了半截。
                 // 所以先把原文件拷进本机私有临时目录（不进工作簿所在目录），写完再整包校验；
                 // 写失败或校验不过，就用这份副本把原文件写回去。拷不出副本就不冒这个险。
-                let rollback = build_scratch.path().join(format!("rollback-{name}"));
+                let rollback_scratch = private_workbook_dir()?;
+                let rollback = rollback_scratch.path().join(format!("rollback-{name}"));
                 let have_rollback = std::fs::copy(path, &rollback).is_ok();
                 match std::fs::OpenOptions::new().write(true).open(path) {
                     Ok(mut dst_f) if have_rollback => {
                         original_state = OriginalState::Overwritten;
                         let copy_res = (|| -> std::io::Result<()> {
-                            let src_path = if tmp.exists() { tmp.as_path() } else { staged.as_path() };
-                            let mut src_f = std::fs::File::open(src_path)?;
+                            let mut src_f = std::fs::File::open(tmp.as_path())?;
                             let written_len = std::io::copy(&mut src_f, &mut dst_f)?;
                             dst_f.set_len(written_len)?;
                             dst_f.sync_all()?;
@@ -2257,11 +2375,11 @@ fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
     });
     let mut omitted = Vec::new();
     let mut grids = std::collections::HashMap::new();
-    for (idx, sheet) in wb.sheets.iter().enumerate() {
+    for sheet in &wb.sheets {
         let Some(part) = targets.get(&sheet.name) else {
             continue;
         };
-        let large = *part == format!("xl/worksheets/sheet{}.xml", idx + 1)
+        let large = sheet.source_part.as_deref() == Some(part.as_str())
             && zip.by_name(part)?.size() > crate::fixups::RAW_SHEET_MIN_BYTES;
         let omit = large && crate::fixups::can_restore_sheet_xml(sheet);
         let keep_grid = large
@@ -2679,9 +2797,17 @@ fn save_plain_at(
         let _ = std::fs::create_dir_all(parent);
     }
     let unchanged_cells = !wb.sheets.iter().any(&sheet_needs_umya);
+    let any_delta_aux = wb
+        .sheets
+        .iter()
+        .any(|s| s.layout_dirty || s.freeze_dirty || s.filter_dirty || s.page_dirty);
     let mut saved_styles = None;
-    let patched = reusable_package && !unchanged_cells
-        && delta::write_with_style_receipt(&restore_base, path, wb, &mut saved_styles)?;
+    let delta_summary = if reusable_package && (!unchanged_cells || any_delta_aux) {
+        delta::write_with_style_receipt(&restore_base, path, wb, &mut saved_styles)?
+    } else {
+        delta::DeltaSummary::default()
+    };
+    let patched = delta_summary.patched;
     let can_bypass_umya = reusable_package && (unchanged_cells || patched);
     let untouched = wb.sheets.iter().all(|s| !s.styles_dirty && !s.col_styles_dirty && !s.row_styles_dirty);
     let base_styles = if has_restore_base && !can_bypass_umya && untouched {
@@ -3111,9 +3237,9 @@ fn save_plain_at(
     // 若走直通复制基准（can_bypass_umya），则仅在真正有 dirty 改动时改写。
     let any_cf = wb.sheets.iter().any(|s| s.cf_dirty || (!can_bypass_umya && !s.cf.blocks.is_empty()));
     let any_dv = wb.sheets.iter().any(|s| s.dv_dirty || (!can_bypass_umya && !s.dv.is_empty()));
-    let any_freeze = wb.sheets.iter().any(|s| s.freeze_dirty);
-    let any_filter = wb.sheets.iter().any(|s| s.filter_dirty);
-    let any_page = wb.sheets.iter().any(|s| s.page_dirty);
+    let any_freeze = !delta_summary.handled_freeze && wb.sheets.iter().any(|s| s.freeze_dirty);
+    let any_filter = !delta_summary.handled_filter && wb.sheets.iter().any(|s| s.filter_dirty);
+    let any_page = !delta_summary.handled_page && wb.sheets.iter().any(|s| s.page_dirty);
     let any_arr = !can_bypass_umya && wb.sheets.iter().any(|s| !s.arrays.is_empty());
     if any_cf || any_dv || any_freeze || any_filter || any_page || any_arr {
         must_save!(
@@ -3317,8 +3443,10 @@ fn save_plain_at(
     // 第三批内存暂存合并：将布局、隐藏行、分级、标签色、保护、迷你图、页面设置、shrinkToFit 与收尾校验合并一次落盘
     crate::patch::begin_stage_for(path);
 
-    // 列宽/行高/手动隐藏的行列：只改 <cols> 和 row 属性，最后单独落一遍
-    must_save!("layout", crate::patch::apply_layout(path, wb));
+    // 列宽/行高/手动隐藏的行列：流式 delta 已顺手改写时直接跳过整包重扫
+    if !delta_summary.handled_layout && !(delta_summary.handled_filter && !wb.sheets.iter().any(|s| s.layout_dirty)) {
+        must_save!("layout", crate::patch::apply_layout(path, wb));
+    }
     // 手动隐藏行来源写成隐藏 definedName，同时被筛选
     // 遮蔽的 overlap 行也能在重开后继续保留手动身份。
     let manual_hidden: std::collections::BTreeMap<String, Vec<u32>> = wb
@@ -3372,12 +3500,24 @@ fn save_plain_at(
             } else {
                 std::borrow::Cow::Owned(crate::patch::set_calc_mode(&wb_xml, wb.calc_manual))
             };
-            let next_xml = crate::patch::set_calc_iteration(
+            let mut next_xml = crate::patch::set_calc_iteration(
                 &mode_xml,
                 wb.calc_iterate,
                 wb.calc_max_iterations,
                 wb.calc_max_change,
             );
+            if delta_summary.handled_page {
+                for (idx, sheet) in wb.sheets.iter().enumerate() {
+                    if sheet.page_dirty {
+                        next_xml = crate::patch::set_print_names(
+                            &next_xml,
+                            idx as u32,
+                            &sheet.name,
+                            &sheet.page,
+                        );
+                    }
+                }
+            }
             let updated = if !wb.calc_manual && wb.sheets.iter().any(|s| s.has_formulas())
                 && (fresh_base || wb.names_dirty || wb.sheets.iter().any(|s| s.cell_data_needs_save())) {
                 delta::recalc_on_open(&next_xml,false)?.context("workbook.xml: invalid calculation properties")?
@@ -3390,7 +3530,9 @@ fn save_plain_at(
     if !can_bypass_umya {
         must_save!("rich", crate::patch::apply_rich(path, wb));
     }
-    must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
+    if !delta_summary.handled_page {
+        must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
+    }
     if !can_bypass_umya {
         let shrink_parts: Vec<(String, Vec<(u32, u32)>, Vec<u32>, Vec<u32>)> = wb
             .sheets

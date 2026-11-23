@@ -257,6 +257,30 @@ pub(crate) fn transform_worksheet(
     transform: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Option<Vec<u8>>> {
     fn contents(xml: &str) -> Result<Option<std::ops::Range<usize>>> {
+        // Fast O(header + footer) boundary scan for standard unprefixed `<sheetData>...</sheetData>`
+        // when the suffix contains no comments or CDATA, avoiding a 200MB full-sheet XML lex pass.
+        if xml.len() >= 64 * 1024 {
+            let b = xml.as_bytes();
+            if let Some(open_pos) = b.windows(10).position(|w| w == b"<sheetData") {
+                if !b[..open_pos].windows(4).any(|w| w == b"<!--") {
+                    let after_name = open_pos + 10;
+                    if let Some(gt_rel) = b[after_name..].iter().position(|&c| c == b'>') {
+                        let gt = after_name + gt_rel;
+                        if b[gt - 1] == b'/' {
+                            return Ok(Some((gt + 1)..(gt + 1)));
+                        }
+                        if let Some(close_pos) = xml.rfind("</sheetData>") {
+                            if close_pos > gt
+                                && !b[close_pos + 12..].windows(4).any(|w| w == b"<!--")
+                                && !b[close_pos + 12..].windows(10).any(|w| w == b"<sheetData")
+                            {
+                                return Ok(Some((gt + 1)..close_pos));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         use quick_xml::events::Event;
         let mut reader = quick_xml::Reader::from_str(xml);
         let mut depth = 0usize;
