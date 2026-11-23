@@ -1554,6 +1554,7 @@ mod tests {
         let mut style = wb.styles.get(wb.sheets[0].style_of(0, 0)).clone();
         style.bold = true;
         style.italic = true;
+        style.underline = true;
         style.size = 15.0;
         let first = wb.styles.intern(style.clone());
         wb.sheets[0].set_style(0, 0, first);
@@ -1562,6 +1563,7 @@ mod tests {
             if pass == 2 {
                 wb.sheets[0].set_style(100, 2, first);
                 style.italic = false;
+                style.double_underline = true;
                 style.size = 16.0;
                 let second = wb.styles.intern(style.clone());
                 wb.sheets[0].set_style(0, 0, second);
@@ -1580,8 +1582,10 @@ mod tests {
             let (loaded, diag) = load_diag(&file).unwrap();
             assert!(diag.is_complete(), "{:?}", diag.problems);
             let view = &loaded.sheets[0];
-            assert_eq!(view.value(0, 0), Value::Number(42.0));
             let saved = loaded.styles.get(view.style_of(0, 0));
+            assert!(saved.underline);
+            assert_eq!(saved.double_underline, pass == 2);
+            assert_eq!(view.value(0, 0), Value::Number(42.0));
             assert!(saved.bold);
             assert_eq!(saved.italic, pass == 1);
             assert_eq!(saved.size, style.size);

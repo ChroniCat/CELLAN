@@ -213,6 +213,122 @@ impl NumericSort {
     }
 }
 
+/// Numeric regions use packed f64s. Other dense regions share the original cell
+/// slabs and translate each affected formula when its delta is requested.
+pub enum CompactSort {
+    Numeric(NumericSort),
+    Mixed { source: Box<Sheet>, index: usize, region: (u32,u32,u32,u32), order: Vec<u32>, horizontal: bool, bytes: usize },
+}
+
+impl CompactSort {
+    pub fn plan(source: &Sheet, index: usize, region: (u32,u32,u32,u32), key: u32, asc: bool,
+                horizontal: bool) -> Result<Option<Self>, String> {
+        let (r1,c1,r2,c2) = region;
+        if r1 > r2 || c1 > c2 { return Ok(None); }
+        let area = u64::from(r2-r1+1) * u64::from(c2-c1+1);
+        if area <= 100_000 { return Ok(None); }
+        if !horizontal && let Some(n) = NumericSort::plan(source,index,region,key,asc)? {
+            return Ok(Some(Self::Numeric(n)));
+        }
+        // Keep sparse far-away selections on the occupied-coordinate planner.
+        // Also avoid retaining a large unrelated sheet for a small subrange.
+        let stored = (source.len() + source.styles.len()) as u64;
+        if area > stored.saturating_mul(4) || stored > area.saturating_mul(4) { return Ok(None); }
+        let order = crate::sort_filter::sort_order(source,region,key,asc,horizontal)?;
+        if order.is_empty() { return Ok(None); }
+        let source = Box::new(source.search_snapshot());
+        // This snapshot outlives the worker as undo history. Account for heap text
+        // and styles as well as the page buffers before handing it to the UI.
+        let bytes = source.allocated_bytes() + order.capacity()*size_of::<u32>()
+            + source.styles.len() * size_of::<(crate::CellRef,u16)>()
+            + (source.row_styles.capacity() + source.col_styles.capacity()) * size_of::<(u32,u16)>()
+            + source.iter().map(|(_,c)| crate::undo::cell_heap_bytes(c)).sum::<usize>();
+        Ok(Some(Self::Mixed { source, index, region, order, horizontal, bytes }))
+    }
+
+    pub fn moved_lines(&self) -> usize {
+        match self {
+            Self::Numeric(n) => n.moved_rows(),
+            Self::Mixed { order, region, horizontal, .. } => {
+                let first = if *horizontal { region.1 } else { region.0 };
+                order.iter().enumerate().filter(|&(i,k)| first+i as u32 != *k).count()
+            }
+        }
+    }
+
+    pub(crate) fn sheet(&self) -> usize {
+        match self { Self::Numeric(n) => n.sheet, Self::Mixed { index,.. } => *index }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Self::Numeric(n) => n.bytes(),
+            Self::Mixed { bytes,.. } => *bytes,
+        }
+    }
+
+    pub fn deltas(&self) -> Box<dyn DoubleEndedIterator<Item=CellDelta> + '_> {
+        match self {
+            Self::Numeric(n) => Box::new(n.deltas()),
+            Self::Mixed { source,index,region,order,horizontal,.. } => {
+                let (r1,c1,r2,c2) = *region;
+                let (first, start, end) = if *horizontal { (c1,r1,r2) } else { (r1,c1,c2) };
+                Box::new(order.iter().copied().enumerate().filter(move |&(dst,src)| first+dst as u32 != src)
+                    .flat_map(move |(dst,src)| (start..=end).filter_map(move |offset|
+                        reorder_delta(source,*index,first+dst as u32,Some(src),offset,*horizontal,false))))
+            }
+        }
+    }
+}
+
+fn reorder_delta(sheet: &Sheet, sheet_idx: usize, dst: u32, src: Option<u32>, offset: u32,
+                 horizontal: bool, dedup: bool) -> Option<CellDelta> {
+    if src == Some(dst) {
+        return None;
+    }
+    let coords = |line| if horizontal { (offset, line) } else { (line, offset) };
+    let (row, col) = coords(dst);
+    let before = sheet.get(row, col);
+    let before_style = sheet.style_of(row, col);
+    let (source, after_style) = match src.map(coords) {
+        Some((r, c)) => (sheet.get(r, c), sheet.style_of(r, c)),
+        None => (None, before_style),
+    };
+    let translated = source
+        .and_then(|cell| cell.formula.as_deref())
+        .filter(|_| !dedup)
+        .map(|formula| {
+            let shift = i64::from(dst) - i64::from(src.unwrap());
+            crate::refs::translate(
+                formula,
+                if horizontal { 0 } else { shift },
+                if horizontal { shift } else { 0 },
+                &sheet.name,
+            )
+            .into()
+        });
+    if translated.is_none() && before == source && before_style == after_style {
+        return None;
+    }
+    let mut after = source.cloned().unwrap_or_default();
+    if let Some(f) = translated {
+        after.formula = Some(f);
+    }
+    let before = before.cloned().unwrap_or_default();
+    if before != after || before_style != after_style {
+        return Some(CellDelta {
+            sheet: sheet_idx,
+            row,
+            col,
+            before,
+            after,
+            before_style,
+            after_style,
+        });
+    }
+    None
+}
+
 impl RowChanges {
     pub fn apply(&self, sheet: &mut Sheet) {
         for d in &self.deltas {
@@ -255,48 +371,8 @@ pub(crate) fn reorder_lines(
 
     let mut collect = |dst: u32, offset: u32| {
         let src = order.get((dst - first) as usize).copied();
-        if src == Some(dst) {
-            return;
-        }
-        let coords = |line| if horizontal { (offset, line) } else { (line, offset) };
-        let (row, col) = coords(dst);
-        let before = sheet.get(row, col);
-        let before_style = sheet.style_of(row, col);
-        let (source, after_style) = match src.map(coords) {
-            Some((r, c)) => (sheet.get(r, c), sheet.style_of(r, c)),
-            None => (None, before_style),
-        };
-        let translated = source
-            .and_then(|cell| cell.formula.as_deref())
-            .filter(|_| !dedup)
-            .map(|formula| {
-                let shift = i64::from(dst) - i64::from(src.unwrap());
-                crate::refs::translate(
-                    formula,
-                    if horizontal { 0 } else { shift },
-                    if horizontal { shift } else { 0 },
-                    &sheet.name,
-                )
-                .into()
-            });
-        if translated.is_none() && before == source && before_style == after_style {
-            return;
-        }
-        let mut after = source.cloned().unwrap_or_default();
-        if let Some(f) = translated {
-            after.formula = Some(f);
-        }
-        let before = before.cloned().unwrap_or_default();
-        if before != after || before_style != after_style {
-            changes.deltas.push(CellDelta {
-                sheet: sheet_idx,
-                row,
-                col,
-                before,
-                after,
-                before_style,
-                after_style,
-            });
+        if let Some(d) = reorder_delta(sheet, sheet_idx, dst, src, offset, horizontal, dedup) {
+            changes.deltas.push(d);
         }
     };
 
@@ -741,6 +817,32 @@ pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_mixed_sort_matches_formula_and_style_deltas_in_both_directions() {
+        let mut sheet = Sheet::new("Mixed");
+        for row in 0..321 {
+            for col in 0..320 {
+                let n = f64::from(321-row + 320-col);
+                sheet.set(row,col,Cell { value: Value::Number(n), formula: None });
+            }
+        }
+        sheet.set(1,1, Cell { value: Value::Text("mixed".into()), formula: None });
+        sheet.set(4,7, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$2".into()) });
+        sheet.set_style(1,1,8);
+        let region = (0,0,320,319);
+        for horizontal in [false,true] {
+            let compact = CompactSort::plan(&sheet,0,region,0,true,horizontal).unwrap().unwrap();
+            let full = crate::sort_filter::plan_sort_axis(&sheet,0,region,0,true,horizontal).unwrap();
+            let mut iter = compact.deltas();
+            for expected in full.deltas {
+                let d = iter.next().unwrap();
+                assert_eq!((d.row,d.col,d.before,d.after,d.before_style,d.after_style),
+                    (expected.row,expected.col,expected.before,expected.after,expected.before_style,expected.after_style));
+            }
+            assert!(iter.next().is_none());
+        }
+    }
 
     #[test]
     fn dense_numeric_sort_replays_style_and_value_deltas_under_undo_guard() {

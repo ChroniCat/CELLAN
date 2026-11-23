@@ -525,7 +525,7 @@ impl EvtTx {
     }
 }
 
-type SharedStyles = Arc<Mutex<HashMap<(usize, u32, u32), Arc<sheetcore::style::CellStyle>>>>;
+type SharedStyles = Arc<Mutex<std::collections::BTreeMap<(usize, u32, u32), Arc<sheetcore::style::CellStyle>>>>;
 
 pub struct Net {
     pub site: u32,
@@ -1484,8 +1484,8 @@ fn host_initialized(
     let room_order = Arc::new(Mutex::new(()));
     #[cfg(test)]
     let after_snapshot: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Default::default();
-    let state: Arc<Mutex<sheetcore::sync::CellOps>> = Arc::new(Mutex::new(HashMap::new()));
-    let delta_ops: Arc<Mutex<sheetcore::sync::CellOps>> = Arc::new(Mutex::new(HashMap::new()));
+    let state: Arc<Mutex<sheetcore::sync::CellOps>> = Default::default();
+    let delta_ops: Arc<Mutex<sheetcore::sync::CellOps>> = Default::default();
     let host_base_hash: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
     // 广播与定向单播分发
@@ -1541,10 +1541,8 @@ fn host_initialized(
 
     // 编辑租约（宿主仲裁，同一格只批一个）
     // 样式表：新加入的人要靠它补齐格式（Op 里只有值）
-    let styles: SharedStyles =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let delta_styles: SharedStyles =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let styles: SharedStyles = Default::default();
+    let delta_styles: SharedStyles = Default::default();
     let delta_merges: Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let structs: Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>> =

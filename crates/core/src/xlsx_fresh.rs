@@ -12,19 +12,12 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub(super) fn supported(sheet: &Sheet) -> bool {
     if sheet.len() < 16_384
-        // The template contains only the formatted cells; keep the DOM path for
-        // densely formatted sheets where the template would already be large.
-        || sheet.styles.len() > sheet.len() / 8
-        || !sheet.row_styles.is_empty()
-        || !sheet.col_styles.is_empty()
         || !sheet.arrays.is_empty()
         || !sheet.spill_shapes.is_empty()
         || !sheet.spilled.is_empty()
         || !sheet.tables.is_empty()
         || !sheet.notes.is_empty()
         || !sheet.rich.is_empty()
-        || !sheet.hyperlinks.is_empty()
-        || sheet.filter.is_some()
         || !sheet.sparklines.is_empty()
         || !sheet.charts.is_empty()
         || !sheet.pictures.is_empty()
@@ -71,13 +64,26 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
         .and_then(|n| n.attribute_node("ref")).context("新建工作表的 dimension 无效")?;
     let data = root.children().find(|n| n.has_tag_name((namespace, "sheetData")))
         .context("新建工作表缺少 sheetData")?;
-    let (_, _, bottom, right) = sheet.used_bounds().context("流式工作表缺少单元格")?;
-    let (_, _, shell_bottom, shell_right) = crate::arr::parse_a1_range(dimension.value())
-        .context("新建工作表的 dimension 坐标无效")?;
-    let end = crate::model::cell_name(bottom.max(shell_bottom), right.max(shell_right));
+    let (mut top, mut left, mut bottom, mut right) = sheet.used_bounds().context("流式工作表缺少单元格")?;
+    let mut formats = std::collections::HashMap::from([(0u16, 0u16)]);
+    for stub in data.descendants().filter(|n| n.has_tag_name((namespace, "c"))) {
+        let (r,c) = stub.attribute("r").and_then(crate::sparse::parse_ref).context("无效的模板单元格")?;
+        top = top.min(r); left = left.min(c); bottom = bottom.max(r); right = right.max(c);
+        if sheet.contains(r, c) && let Some(id) = sheet.explicit_style_of(r, c) {
+            let xf = stub.attribute("s").map(str::parse::<u16>).transpose()?.unwrap_or(0);
+            formats.insert(id, xf);
+        }
+    }
+    let xf_for = |key: CellRef| -> Result<Option<u16>> {
+        sheet.explicit_style_of(key.row, key.col).map(|id| formats.get(&id).copied()
+            .context("模板缺少单元格样式")).transpose()
+    };
+    let first = crate::model::cell_name(top, left);
+    let end = crate::model::cell_name(bottom, right);
+    let reference = if first == end { first } else { format!("{first}:{end}") };
     let mut out = BufWriter::new(out);
     let dim = dimension.range_value();
-    write!(out, "{}A1:{end}{}<sheetData>", &shell[..dim.start], &shell[dim.end..data.range().start])?;
+    write!(out, "{}{reference}{}<sheetData>", &shell[..dim.start], &shell[dim.end..data.range().start])?;
 
     let mut cells = sheet.iter().peekable();
     let mut rows = data.children().filter(|n| n.is_element()).peekable();
@@ -118,17 +124,19 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
                 .context("无效的模板单元格")?;
             ensure!(sr == r, "模板单元格行号不一致");
             while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col < sc) {
-                write_value(&mut out, key, cell, None)?;
+                write_value(&mut out, key, cell, xf_for(key)?)?;
             }
             if let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col == sc) {
                 let xf = stub.attribute("s").map(str::parse::<u16>).transpose()?;
-                write_value(&mut out, key, cell, xf)?;
+                write_value(&mut out, key, cell, xf.or(xf_for(key)?))?;
+            } else if stub.attribute("s").is_none() && sheet.explicit_style_of(sr, sc) == Some(0) {
+                write_value(&mut out, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
             } else {
                 out.write_all(shell[stub.range()].as_bytes())?;
             }
         }
         while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r) {
-            write_value(&mut out, key, cell, None)?;
+            write_value(&mut out, key, cell, xf_for(key)?)?;
         }
         out.write_all(b"</row>")?;
     }
@@ -182,6 +190,50 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
 mod tests {
     use super::*;
     use crate::model::Cell;
+
+    #[test]
+    fn streamed_dense_styles_inherited_defaults_filter_and_hyperlink_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("styles.xlsx");
+        let mut wb = Workbook::new_blank();
+        let bold = wb.styles.intern(crate::style::CellStyle { bold: true, ..Default::default() });
+        let italic = wb.styles.intern(crate::style::CellStyle { italic: true, ..Default::default() });
+        let quoted = wb.styles.intern(crate::style::CellStyle { strikethrough: true, ..Default::default() });
+        wb.styles.set_quote(quoted, true);
+        let sheet = wb.sheet_mut(0);
+        for r in 5..16_389 {
+            sheet.set(r, 3, Cell { value: Value::Number(r as f64), formula: None });
+            sheet.set_style(r, 3, bold);
+        }
+        sheet.set_col_style(5, italic);
+        sheet.set_row_style(7, italic);
+        sheet.set(10, 5, Cell { value: Value::Bool(true), formula: None });
+        sheet.set(11, 5, Cell { value: Value::Bool(false), formula: None });
+        sheet.set_style(11, 5, 0);
+        sheet.set_style(12, 5, 0);
+        sheet.set(14, 4, Cell { value: Value::Text("0123".into()), formula: None });
+        sheet.set_style(14, 4, quoted);
+        sheet.set_style(15, 4, quoted);
+        sheet.filter = Some(crate::sort_filter::Filter::new(5, 3, 100, 3));
+        sheet.hyperlinks.insert((9,3), crate::hyperlinks::Hyperlink { location: "Sheet1!D6".into(), ..Default::default() });
+        assert!(supported(sheet));
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+        let back = crate::xlsx::load(&path).unwrap();
+        let sh = back.sheet(0);
+        assert!(back.styles.get(sh.style_of(16_388, 3)).bold);
+        assert!(back.styles.get(sh.style_of(10, 5)).italic);
+        assert!(back.styles.get(sh.style_of(7, 10)).italic);
+        assert!(!back.styles.get(sh.style_of(11, 5)).italic);
+        assert!(!back.styles.get(sh.style_of(12, 5)).italic);
+        assert_eq!(sh.filter.as_ref().unwrap().range, (5, 3, 100, 3));
+        assert_eq!(sh.hyperlinks[&(9,3)].location, "Sheet1!D6");
+        let xml = String::from_utf8(crate::fixups::read_part_file(&path, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(xml.contains(r#"ref="D6:F16389""#), "incorrect used range");
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let xf = |address| doc.descendants().find(|n| n.attribute("r") == Some(address)).unwrap().attribute("s").unwrap();
+        assert_eq!(xf("E15"), xf("E16"));
+        assert!(back.styles.quote_of(sh.style_of(15, 4)));
+    }
 
     #[test]
     fn streaming_keeps_sparse_xfs_formatted_blanks_and_layout() {

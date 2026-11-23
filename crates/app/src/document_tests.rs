@@ -1711,11 +1711,15 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
     }
     assert!(host_a.wb.dirty && peer_b.wb.dirty);
     host_a.tasks.last_edit = Some(Instant::now() - Duration::from_secs(4));
-    host_a.tasks.shared_autosave_paused = true;
+    host_a.tasks.shared_autosave = Some(false);
     host_a.tick_autosave(None);
     assert!(host_a.tasks.saving.is_none() && host_a.wb.dirty);
     assert_eq!(sheetcore::xlsx::load(&shared_path).unwrap().sheet(0).value(1, 0), Value::Empty);
-    host_a.tasks.shared_autosave_paused = false;
+    host_a.autosave = false;
+    host_a.tasks.shared_autosave = None;
+    host_a.tick_autosave(None);
+    assert!(host_a.tasks.saving.is_none(), "joining peers must respect the host preference");
+    host_a.tasks.shared_autosave = Some(true);
     host_a.tick_autosave(None);
     assert!(host_a.tasks.saving.is_some(), "协作宿主停手后应自动启动后台保存");
 
@@ -1801,11 +1805,11 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
     let host_copy = env.path("host-copy.xlsx");
     env.sc("SC_SAVE_AS", host_copy.to_str().unwrap());
     put(&mut host_a.wb, 444.0);
-    host_a.tasks.shared_autosave_paused = true;
+    host_a.tasks.shared_autosave = Some(false);
     host_a.save(true);
     wait_for_background_saves(&mut host_a);
     assert_ne!(host_a.tasks.autosave_after_detach, Some(false));
-    assert!(!host_a.tasks.shared_autosave_paused, "leaving this room restores local autosave policy");
+    assert!(host_a.tasks.shared_autosave.is_none(), "leaving this room restores local autosave policy");
     assert!(host_a.net.is_none(), "a different file cannot confirm saves for the original room");
     assert_eq!(sheetcore::xlsx::load(&host_copy).unwrap().sheet(0).value(0, 0), Value::Number(444.0));
     assert!(!session_lock::lock_path(&shared_path).exists());

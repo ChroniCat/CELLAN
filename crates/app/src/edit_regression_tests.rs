@@ -7826,6 +7826,51 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
 }
 
 #[test]
+fn broad_structural_worker_publishes_relocated_edges_and_position_sensitive_values() {
+    let _env = crate::test_env::TestEnv::new("broad_structure");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx,None);
+    for row in 0..2100 {
+        app.wb.sheets[0].set(row,0,number(f64::from(row)));
+        app.wb.sheets[0].set(row,1,formula(&format!("=A{}+1",row+1)));
+    }
+    app.wb.sheets[0].set(0,2,formula("=ROW()+B1"));
+    sheetcore::formula::recalc_all(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build_after_recalc(&app.wb).into();
+    app.deps_built = true;
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert!(app.tasks.structural_recalc.is_some());
+    app.tasks.last_edit = None;
+    app.start_silent_recalc(&ctx);
+    let start = std::time::Instant::now();
+    while app.bg_recalc_rx.is_some() {
+        app.poll_silent_recalc();
+        assert!(start.elapsed().as_secs() < 30);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.deps_built && !app.tasks.recalc_pending());
+    assert_eq!(app.wb.sheets[0].value(1,2),sheetcore::Value::Number(3.));
+    let downstream = app.deps.edit_closure(&[(0,1,0)]);
+    assert!(downstream.contains(&(0,1,1)) && downstream.contains(&(0,1,2)));
+}
+
+#[test]
+fn structural_edit_validates_fast_open_formula_caches_before_reusing_them() {
+    let _env = crate::test_env::TestEnv::new("structure_fast_open_cache");
+    let mut app = app();
+    app.wb.sheets[0].set(0,0,number(3.0));
+    app.wb.sheets[0].set(0,1,sheetcore::Cell { value: sheetcore::Value::Number(999.0),
+        formula: Some("=A1+1".into()) });
+    // Fast-open explicitly builds the graph without recalculating imported caches.
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
+    app.deps_built = true;
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.wb.sheets[0].value(1,1),sheetcore::Value::Number(4.0));
+    app.structural(sheetcore::structural::Structural::InsertCols { at: 0, n: 1 });
+    assert_eq!(app.wb.sheets[0].value(1,2),sheetcore::Value::Number(4.0));
+}
+
+#[test]
 fn large_sparse_sort_undo_covers_new_destinations_and_concurrent_edits() {
     let env = crate::test_env::TestEnv::new("large_sort_undo");
     let mut app = app();

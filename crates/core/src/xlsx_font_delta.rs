@@ -355,6 +355,8 @@ impl<'a> Styles<'a> {
         let mut expected = old.clone();
         expected.bold = new.bold;
         expected.italic = new.italic;
+        expected.underline = new.underline;
+        expected.double_underline = new.double_underline;
         expected.size = new.size;
         expected.strikethrough = new.strikethrough;
         expected.color = new.color;
@@ -366,6 +368,7 @@ impl<'a> Styles<'a> {
         let mut fields = Vec::new();
         if old.bold != new.bold
             || old.italic != new.italic
+            || (old.underline, old.double_underline) != (new.underline, new.double_underline)
             || old.size != new.size
             || old.color != new.color
             || old.strikethrough != new.strikethrough
@@ -490,6 +493,31 @@ impl<'a> Styles<'a> {
                 ));
             } else if want {
                 prefix.push_str(&format!("<{name}/>"));
+            }
+        }
+        if (old.underline, old.double_underline) != (new.underline, new.double_underline) {
+            let mut props = font.children().filter(|n| n.has_tag_name((NS, "u")));
+            let prop = props.next();
+            let source = match prop.map(|p| p.attribute("val").unwrap_or("single")) {
+                None | Some("none") => (false, false),
+                Some("single") => (true, false),
+                Some("double") => (true, true),
+                _ => return None, // Accounting underlines are not represented by CellStyle.
+            };
+            if props.next().is_some() || source != (old.underline, old.double_underline)
+                || (!new.underline && new.double_underline) { return None; }
+            let replacement = match (new.underline, new.double_underline) {
+                (true, true) => r#"<u val="double"/>"#,
+                (true, false) => "<u/>",
+                _ => "",
+            };
+            if let Some(prop) = prop {
+                if prop.children().any(|n| n.is_element()) || prop.attributes().any(|a| a.namespace().is_some() || a.name() != "val") {
+                    return None;
+                }
+                edits.push((prop.range(), replacement.to_owned()));
+            } else {
+                prefix.push_str(replacement);
             }
         }
         let mut sizes = font.children().filter(|n| n.has_tag_name((NS, "sz")));

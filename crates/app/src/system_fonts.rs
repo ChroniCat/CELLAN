@@ -165,13 +165,17 @@ fn pending() -> &'static Mutex<HashSet<String>> {
     PENDING.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+static ACTIVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn generation() -> u64 { ACTIVE_GENERATION.load(std::sync::atomic::Ordering::Acquire) }
+
 pub fn begin_frame() {
     let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
     let pending = PENDING.get_or_init(|| Mutex::new(HashSet::new()));
     let (Ok(mut a), Ok(mut p)) = (active.lock(), pending.lock()) else { return };
-    for k in p.drain() {
-        a.insert(k);
-    }
+    let mut changed = false;
+    for k in p.drain() { changed |= a.insert(k); }
+    if changed { ACTIVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release); }
 }
 
 /// 返回是否新增了字体（调用方需要重设 FontDefinitions）。

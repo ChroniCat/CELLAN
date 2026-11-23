@@ -618,11 +618,17 @@ pub struct Peer {
 
 /// Discard deleted coordinates and relocate only keys affected by the edit.
 /// Reinsert moved entries after extraction so shifted keys cannot collide with old ones.
-pub fn shift_cell_map<V>(cells: &mut HashMap<(usize, u32, u32), V>, sheet: usize,
+pub fn shift_cell_map<V>(cells: &mut std::collections::BTreeMap<(usize, u32, u32), V>, sheet: usize,
                          op: &crate::structural::Structural, mut relocate: impl FnMut(&mut V, u32, u32)) {
     let mut moved = Vec::new();
-    for ((_, r, c), mut value) in cells.extract_if(|&(sh, r, c), _|
-        sh == sheet && shift_structural_coord(r, c, op) != Some((r, c))) {
+    use crate::structural::Structural::*;
+    let first = match *op {
+        InsertRows { at, .. } | DeleteRows { at, .. } => (sheet, at, 0),
+        InsertCols { at, .. } | DeleteCols { at, .. } => (sheet, 0, at),
+    };
+    let range = first..=(sheet, u32::MAX, u32::MAX);
+    for ((_, r, c), mut value) in cells.extract_if(range, |&(_, r, c), _|
+        shift_structural_coord(r, c, op) != Some((r, c))) {
         if let Some((row, col)) = shift_structural_coord(r, c, op) {
             relocate(&mut value, row, col);
             moved.push(((sheet, row, col), value));
@@ -631,7 +637,7 @@ pub fn shift_cell_map<V>(cells: &mut HashMap<(usize, u32, u32), V>, sheet: usize
     cells.extend(moved);
 }
 
-pub type CellOps = HashMap<(usize, u32, u32), std::sync::Arc<Op>>;
+pub type CellOps = std::collections::BTreeMap<(usize, u32, u32), std::sync::Arc<Op>>;
 
 pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
     shift_cell_map(cells, sheet, op, |op, row, col| {
@@ -643,7 +649,7 @@ pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural:
 
 impl Peer {
     pub fn new(site: u32) -> Self {
-        Self { site, clock: 0, cells: HashMap::new(), peers: HashMap::new() }
+        Self { site, clock: 0, cells: CellOps::new(), peers: HashMap::new() }
     }
 
     /// 宿主启动时将磁盘基准单元格放入初始快照：所有未改基准格统一赋 `ts = 1`，

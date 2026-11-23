@@ -35,6 +35,32 @@ fn dense_numeric_sort_keeps_revision_count_and_replays_through_app() {
     assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1.0));
 }
 
+#[test]
+fn pending_sort_does_not_cross_room_boundaries() {
+    let _env = crate::test_env::TestEnv::new("sort_room_change");
+    let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    let number = |n| sheetcore::Cell { value: sheetcore::Value::Number(n), formula: None };
+    app.wb.sheets[0].set(0,0,number(2.));
+    app.wb.sheets[0].set(1,0,number(1.));
+    for joining in [true,false] {
+        app.sort_region((0,0,20_000,5),0,true);
+        assert!(app.tasks.reorder.is_some());
+        if joining {
+            app.net = Some(crate::net::host_for_test(91,"test","sort-room","test").0);
+        } else {
+            app.leave_session_at(None);
+        }
+        let start = std::time::Instant::now();
+        while app.tasks.reorder.is_some() {
+            app.poll_reorder();
+            assert!(start.elapsed().as_secs() < 30);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.wb.sheets[0].get(0,0),Some(&number(2.)));
+        assert_eq!(app.undo.depth(),(0,0));
+    }
+}
+
 type Rect = (u32, u32, u32, u32);
 
 pub(super) enum Operation {
@@ -124,8 +150,7 @@ impl Operation {
 
 pub(crate) struct Pending {
     sheet: usize,
-    doc_gen: u64,
-    doc_uid: u64,
+    target: super::sheet_edit_target::SheetEditTarget,
     rect: Rect,
     operation: std::sync::Arc<Operation>,
     rx: Receiver<Result<(Sheet, Sheet, PreparedChanges), String>>,
@@ -133,8 +158,8 @@ pub(crate) struct Pending {
 
 enum PreparedChanges {
     Cells(data_tools::RowChanges),
-    Numbers {
-        order: data_tools::NumericSort,
+    Permutation {
+        order: data_tools::CompactSort,
         total: usize,
         sample: Vec<sheetcore::undo::CellDelta>,
     },
@@ -217,7 +242,6 @@ impl SheetApp {
             return;
         }
         let snapshot = sheet.reorder_snapshot();
-        let offline = self.net.is_none();
         let index = self.sheet_idx;
         self.status = format!("正在计算{}…", operation.label());
         let (tx, rx) = mpsc::channel();
@@ -226,11 +250,22 @@ impl SheetApp {
         std::thread::spawn(move || {
             let result = (|| {
                 let mut prepared = snapshot.clone();
-                if offline && let Operation::Rows { col, asc } = worker_op.as_ref() {
-                    let (r1, c1, r2, c2) = rect;
-                    let header = sort_filter::has_header(&snapshot, r1, c1, r2, c2);
-                    let data = (r1 + u32::from(header), c1, r2, c2);
-                    if let Some(order) = data_tools::NumericSort::plan(&snapshot, index, data, *col, *asc)? {
+                let sort = match worker_op.as_ref() {
+                    Operation::Rows { col, asc } => {
+                        let (r1,c1,r2,c2) = rect;
+                        let header = sort_filter::has_header(&snapshot,r1,c1,r2,c2);
+                        Some(((r1 + u32::from(header),c1,r2,c2),*col,*asc,false))
+                    }
+                    Operation::Columns { row, asc } => {
+                        sort_filter::validate_sort_region(&snapshot,rect)?;
+                        let (r1,c1,r2,c2) = rect;
+                        let header = sort_filter::has_header_col(&snapshot,r1,c1,r2,c2);
+                        Some(((r1,c1 + u32::from(header),r2,c2),*row,*asc,true))
+                    }
+                    _ => None,
+                };
+                if let Some((data,key,asc,horizontal)) = sort {
+                    if let Some(order) = data_tools::CompactSort::plan(&snapshot,index,data,key,asc,horizontal)? {
                         let mut total = 0;
                         let mut sample = Vec::new();
                         for d in order.deltas() {
@@ -239,7 +274,7 @@ impl SheetApp {
                             if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
                             total += 1;
                         }
-                        return Ok((snapshot, prepared, PreparedChanges::Numbers { order, total, sample }));
+                        return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample }));
                     }
                 }
                 let changes = worker_op.plan(&snapshot, index, rect)?;
@@ -250,8 +285,7 @@ impl SheetApp {
         });
         self.tasks.reorder = Some(Pending {
             sheet: index,
-            doc_gen: self.doc_gen,
-            doc_uid: self.doc_uid,
+            target: super::sheet_edit_target::SheetEditTarget::current(self,self.sel),
             rect,
             operation: op,
             rx,
@@ -279,9 +313,7 @@ impl SheetApp {
             }
         };
         let current = self.wb.sheet(self.sheet_idx);
-        if self.sheet_idx != pending.sheet
-            || self.doc_gen != pending.doc_gen
-            || self.doc_uid != pending.doc_uid
+        if !pending.target.valid(self)
             || !current.matches_reorder_source(&source)
         {
             self.status = "工作表已变更，请重新执行数据操作".into();
@@ -292,15 +324,14 @@ impl SheetApp {
                 PreparedChanges::Cells(changes) => {
                     self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared));
                 }
-                PreparedChanges::Numbers { order, total, sample } => {
+                PreparedChanges::Permutation { order, total, sample } => {
                     let operation = &pending.operation;
-                    self.status = operation.completed(order.moved_rows());
+                    self.status = operation.completed(order.moved_lines());
                     if total == 0 { return; }
                     self.wb.sheet_mut(pending.sheet).take_row_changes(&mut prepared);
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.recalc_all_and_deps_adaptive();
-                    // A room may have been joined while the offline plan was in flight.
                     if self.net.is_some() {
                         let mut rows = order.deltas();
                         loop {
@@ -310,7 +341,7 @@ impl SheetApp {
                         }
                     }
                     self.record_revision_sample(operation.label(), &sample, total);
-                    self.undo.push_numeric_sort(operation.label(), order, (pending.sheet, self.sel.0, self.sel.1));
+                    self.undo.push_compact_sort(operation.label(), order, (pending.sheet, self.sel.0, self.sel.1));
                     self.tasks.last_edit = Some(std::time::Instant::now());
                 }
             }

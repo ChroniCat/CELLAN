@@ -504,6 +504,11 @@ impl CountIndexes {
 }
 
 impl Crit {
+    pub(super) fn numeric_bounds(&self) -> Option<(&'static str, f64)> {
+        let n = self.num?;
+        (n.is_finite() && matches!(self.op, ">" | "<" | ">=" | "<=" | "<>")).then_some((self.op, n))
+    }
+
     pub(super) fn indexable(&self) -> bool {
         self.op == "=" && !self.wild
     }

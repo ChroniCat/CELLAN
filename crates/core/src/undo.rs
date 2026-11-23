@@ -263,7 +263,7 @@ fn next_entry(payload_bytes: usize) -> EntryStamp {
     EntryStamp { id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
 }
 
-fn cell_heap_bytes(cell: &Cell) -> usize {
+pub(crate) fn cell_heap_bytes(cell: &Cell) -> usize {
     cell.formula.as_deref().map_or(0, str::len) + match &cell.value {
         crate::Value::Text(text) => text.len(),
         _ => 0,
@@ -272,6 +272,24 @@ fn cell_heap_bytes(cell: &Cell) -> usize {
 
 /// Includes the retained heap size, which can be measured on a worker.
 pub struct PreparedAction(Action, usize);
+
+impl PreparedAction {
+    /// Remove late replacement conflicts from a coordinate-sorted journal.
+    /// Look up every index before swap-removing so surviving order is irrelevant.
+    pub fn skip_sorted_cells(&mut self, conflicts: &[(usize,u32,u32)]) -> &[CellDelta] {
+        let deltas = &mut self.0.deltas;
+        let mut indices: Vec<_> = conflicts.iter().filter_map(|key|
+            deltas.binary_search_by_key(key, |d| (d.sheet,d.row,d.col)).ok()).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        for i in indices.into_iter().rev() {
+            let d = deltas.swap_remove(i);
+            self.1 = self.1.saturating_sub(cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after));
+        }
+        if let Some(d) = deltas.first() { self.0.focus = (d.sheet,d.row,d.col); }
+        deltas
+    }
+}
 
 impl Action {
     pub fn prepare(self) -> PreparedAction {
@@ -359,7 +377,7 @@ struct SheetTabAction {
 }
 
 struct NumericSortAction {
-    sort: crate::data_tools::NumericSort,
+    sort: crate::data_tools::CompactSort,
     label: String,
     focus: (usize, u32, u32),
     by_site: u32,
@@ -371,7 +389,7 @@ impl NumericSortAction {
             touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
             skipped: 0, structural: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
         };
-        if let Some(sheet) = sheets.get_mut(self.sort.sheet) {
+        if let Some(sheet) = sheets.get_mut(self.sort.sheet()) {
             let mut apply = |d: CellDelta| {
                 if !guard(d.sheet, d.row, d.col, sheet.get(d.row, d.col).unwrap_or(&Cell::default())) {
                     applied.skipped += 1;
@@ -922,7 +940,7 @@ impl UndoStack {
     }
 
     pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
-        let bytes = before.target.allocated_bytes() + after.target.allocated_bytes()
+        let bytes = before.target.pair_allocated_bytes(&after.target)
             + before.reference_uses.bytes() + after.reference_uses.bytes()
             + before.foreign.iter().chain(&after.foreign).map(|f| std::mem::size_of_val(f.cells.as_slice())
                 + f.cells.iter().map(|(_, c)| cell_heap_bytes(c)).sum::<usize>()).sum::<usize>();
@@ -931,6 +949,10 @@ impl UndoStack {
     }
 
     pub fn push_numeric_sort(&mut self, label: &str, sort: crate::data_tools::NumericSort, focus: (usize, u32, u32)) {
+        self.push_compact_sort(label, crate::data_tools::CompactSort::Numeric(sort), focus);
+    }
+
+    pub fn push_compact_sort(&mut self, label: &str, sort: crate::data_tools::CompactSort, focus: (usize, u32, u32)) {
         let stamp = next_entry(sort.bytes());
         self.done.push(Entry::NumericSort(stamp, NumericSortAction {
             sort, label: label.into(), focus, by_site: self.site,

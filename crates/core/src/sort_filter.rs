@@ -77,6 +77,14 @@ pub fn plan_sort_axis(
     asc: bool,
     horizontal: bool,
 ) -> Result<crate::data_tools::RowChanges, String> {
+    let order = sort_order(sheet, region, key, asc, horizontal)?;
+    if order.is_empty() { return Ok(Default::default()); }
+    Ok(crate::data_tools::reorder_lines(sheet, sheet_idx, region, &order, horizontal, false))
+}
+
+pub(crate) fn sort_order(
+    sheet: &Sheet, region: (u32, u32, u32, u32), key: u32, asc: bool, horizontal: bool,
+) -> Result<Vec<u32>, String> {
     let (r1, c1, r2, c2) = region;
     let (first, last, lo, hi) = if horizontal { (c1, c2, r1, r2) } else { (r1, r2, c1, c2) };
     if last <= first {
@@ -109,10 +117,7 @@ pub fn plan_sort_axis(
             if asc { ord } else { ord.reverse() }
         }
     });
-    let order: Vec<_> = lines.into_iter().map(|(_, line)| line).collect();
-    Ok(crate::data_tools::reorder_lines(
-        sheet, sheet_idx, region, &order, horizontal, false,
-    ))
+    Ok(lines.into_iter().map(|(_, line)| line).collect())
 }
 
 /// 区域第一列是不是表头列：整列都是非空文本，且右侧出现过数字（按行排序时跳过它）

@@ -1,6 +1,6 @@
 //! Independent numeric expressions can be split across cores without duplicating
 //! Calc's memoized dependencies, volatile values or lookup indexes.
-use super::{bin_scalar, compile_at, deps::CellKey, BinOp, FValue, Node, Workbook};
+use super::{bin_scalar, compile_at, deps::CellKey, BinOp, Calc, FValue, Node, RefExpr, Workbook};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn literal(wb: &Workbook, sheet: usize, node: &Node) -> Option<f64> {
@@ -18,11 +18,9 @@ fn literal(wb: &Workbook, sheet: usize, node: &Node) -> Option<f64> {
     }
 }
 
-fn numeric(wb: &Workbook, (sheet, row, col): CellKey) -> Option<Result<f64, super::ErrKind>> {
-    let formula = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
-    let node = compile_at(formula.strip_prefix('=').unwrap_or(formula), row, col).ok()?;
+fn numeric_binary(wb: &Workbook, sheet: usize, node: &Node) -> Option<Result<f64, super::ErrKind>> {
     let Node::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow),
-                     lhs, rhs) = node.as_ref() else { return None };
+                     lhs, rhs) = node else { return None };
     let lhs = FValue::Number(literal(wb, sheet, lhs)?);
     let rhs = FValue::Number(literal(wb, sheet, rhs)?);
     match bin_scalar(*op, &lhs, &rhs) {
@@ -30,6 +28,55 @@ fn numeric(wb: &Workbook, (sheet, row, col): CellKey) -> Option<Result<f64, supe
         FValue::Error(e) => Some(Err(e)),
         _ => None,
     }
+}
+
+fn literal_area(wb: &Workbook, sheet: usize, a: &RefExpr, b: &RefExpr) -> bool {
+    if a.book.is_some() || b.book.is_some() || a.sheet2.is_some() || b.sheet2.is_some()
+        || a.row.min(b.row) < 0 || a.col.min(b.col) < 0
+        || a.row.max(b.row) >= 1_048_576 || a.col.max(b.col) >= 16_384 { return false; }
+    if let (Some(first), Some(last)) = (&a.sheet, &b.sheet)
+        && !first.eq_ignore_ascii_case(last) { return false; }
+    let sheet = match a.sheet.as_deref().or(b.sheet.as_deref()) {
+        Some(name) => match wb.sheets.iter().find(|s| s.name.eq_ignore_ascii_case(name)) {
+            Some(found) => found, None => return false,
+        },
+        None => wb.sheet(sheet),
+    };
+    let (top, bottom) = (a.row.min(b.row) as u32, a.row.max(b.row) as u32);
+    let (left, right) = (a.col.min(b.col) as u32, a.col.max(b.col) as u32);
+    // Wide ranges are better served by the main Calc's shared aggregate/lookup indexes.
+    u64::from(bottom - top + 1) * u64::from(right - left + 1) <= 16
+        && (top..=bottom).all(|r| (left..=right).all(|c| sheet.get(r,c).is_none_or(|v| v.formula.is_none())))
+}
+
+fn independent(wb: &Workbook, sheet: usize, node: &Node) -> bool {
+    match node {
+        Node::Number(_) | Node::Text(_) | Node::Bool(_) | Node::Empty | Node::Err(_) => true,
+        Node::Ref(a) => literal_area(wb, sheet, a, a),
+        Node::Range(a,b) => literal_area(wb, sheet, a, b),
+        Node::Unary(_, v) | Node::Percent(v) => independent(wb, sheet, v),
+        Node::Binary(_, a,b) => independent(wb, sheet, a) && independent(wb, sheet, b),
+        Node::Func(name, args) if matches!(name.as_str(), "IF" | "IFERROR" | "ABS" | "ROUND" |
+            "ROUNDUP" | "ROUNDDOWN" | "INT" | "MOD" | "TRUNC" | "SIGN" | "SQRT" |
+            "SUM" | "MIN" | "MAX" | "AVERAGE" | "COUNT" | "COUNTA") =>
+            args.iter().all(|v| independent(wb, sheet, v)),
+        _ => false,
+    }
+}
+
+fn evaluate_cell<'a>(wb: &'a Workbook, (sheet,row,col): CellKey, worker: &mut Option<Calc<'a>>) -> Option<crate::Value> {
+    let formula = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
+    let node = compile_at(formula.strip_prefix('=').unwrap_or(formula), row, col).ok()?;
+    if let Some(value) = numeric_binary(wb, sheet, &node) {
+        return Some(value.map_or_else(crate::Value::Error, crate::Value::Number));
+    }
+    if !independent(wb, sheet, &node) { return None; }
+    let calc = worker.get_or_insert_with(|| Calc::new(wb));
+    calc.cur = (row,col);
+    calc.cur_sheet = sheet;
+    let value = calc.eval_node(&node, sheet);
+    if matches!(value, FValue::Array(_) | FValue::Lambda(_)) { return None; }
+    Some(super::from_fvalue(&value))
 }
 
 pub(super) struct Batch {
@@ -48,19 +95,21 @@ pub(super) fn evaluate(wb: &Workbook, keys: &[CellKey], cancel: Option<&AtomicBo
     // Vary the offset inside each stratum so a repeating column pattern isn't sampled at one phase.
     const SAMPLES: usize = 16;
     let stride = keys.len() / SAMPLES;
+    let mut probe = None;
     let eligible = (0..SAMPLES).filter(|&i| {
         let slot = i * stride + (i * 37 + 17) % stride;
-        numeric(wb, keys[slot]).is_some()
+        evaluate_cell(wb, keys[slot], &mut probe).is_some()
     }).count();
     if eligible < SAMPLES / 2 { return None; }
     let batches = std::thread::scope(|scope| {
         let jobs: Vec<_> = keys.chunks(keys.len().div_ceil(workers)).map(|chunk| {
             scope.spawn(move || {
+                let mut worker = None;
                 let mut values = Vec::with_capacity(chunk.len());
                 let mut completed = 0;
                 for (i, &key) in chunk.iter().enumerate() {
                     if i % 256 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
-                    let value = numeric(wb, key);
+                    let value = evaluate_cell(wb, key, &mut worker);
                     completed += usize::from(value.is_some());
                     values.push(value);
                     if (i + 1) % 256 == 0 {
@@ -77,7 +126,7 @@ pub(super) fn evaluate(wb: &Workbook, keys: &[CellKey], cancel: Option<&AtomicBo
     let mut pending = Vec::new();
     let values = keys.iter().zip(batches.into_iter().flatten()).enumerate().map(|(i, (&(s, r, c), value))| {
         let value = match value {
-            Some(result) => result.map_or_else(FValue::Error, FValue::Number),
+            Some(result) => super::to_fvalue(&result),
             None => { pending.push(i); FValue::Empty }
         };
         (s, r, c, value)
@@ -89,6 +138,12 @@ pub(super) fn evaluate(wb: &Workbook, keys: &[CellKey], cancel: Option<&AtomicBo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numeric(wb: &Workbook, (sheet,row,col): CellKey) -> Option<Result<f64, crate::formula::ErrKind>> {
+        let src = wb.sheet(sheet).get(row,col)?.formula.as_deref()?;
+        let node = compile_at(src.trim_start_matches('='),row,col).ok()?;
+        numeric_binary(wb,sheet,&node)
+    }
 
     #[test]
     fn supported_arithmetic_matches_calc_and_qualified_inputs_fall_back() {
@@ -106,6 +161,27 @@ mod tests {
                     "=A1#+1", "=NamedRate+1", "=OFFSET(A1,0,0)+1", "=B1+1", "=A1&1"] {
             wb.sheet_mut(0).set(0, 1, Cell { value: Value::Empty, formula: Some(src.into()) });
             assert!(numeric(&wb, (0, 0, 1)).is_none(), "{src} must use Calc");
+        }
+    }
+
+    #[test]
+    fn compound_parallel_expressions_match_calc_and_reject_computed_inputs() {
+        use crate::{Cell, Sheet, Value};
+        let mut wb = Workbook::new_blank();
+        wb.sheet_mut(0).set(0,0,Cell { value: Value::Number(5.),formula: None });
+        wb.sheets.push(Sheet::new("Data"));
+        wb.sheet_mut(1).set(0,1,Cell { value: Value::Number(4.), formula: None });
+        for source in ["=IF(A1>0,ROUND((A1+2)*1.5,0),0)","=SUM(Data!A1:B1)*2", "=IFERROR(1/0,17)",
+                       "=IF(FALSE,1/0,3)", "=A1>2", "=IF(FALSE,1,\"hi\")","=@A1"] {
+            wb.sheet_mut(0).set(2,0,Cell { value: Value::Empty,formula: Some(source.into()) });
+            let actual = evaluate_cell(&wb,(0,2,0),&mut None);
+            if source == "=@A1" { assert!(actual.is_none()); }
+            else { assert_eq!(actual,Some(super::super::from_fvalue(&super::super::eval_cell(&wb,0,2,0))),"{source}"); }
+        }
+        wb.sheet_mut(1).set(0,1,Cell { value: Value::Number(999.),formula: Some("=RAND()".into()) });
+        for source in ["=SUM(Data!A1:B1)*2","=IF(TRUE,A1,RAND())","=SUM(A1:A300)","=INDIRECT(\"A1\")"] {
+            wb.sheet_mut(0).set(2,0,Cell { value: Value::Empty,formula: Some(source.into()) });
+            assert!(evaluate_cell(&wb,(0,2,0),&mut None).is_none(),"{source}");
         }
     }
 

@@ -6,6 +6,8 @@
 pub mod array;
 mod compiled;
 mod scalar_batch;
+pub(crate) mod lookup_cache;
+mod conditional_index;
 #[cfg(test)]
 mod performance_tests;
 use compiled::compile_at;
@@ -906,7 +908,7 @@ pub struct Calc<'a> {
     /// 精确匹配用的哈希索引：key → 首次出现的行下标
     approx_positions: HashMap<(RangeKey, usize, functions::LookupKind), Option<Vec<usize>>>,
     position_count: usize,
-    lookup_index: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<HashMap<String, usize>>>,
+    lookup_index: HashMap<(RangeKey, bool), lookup_cache::Index>,
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
     scope: Option<&'a std::collections::HashSet<self::deps::CellKey>>,
     /// 区域物化实际读取的单元格数（测试/诊断用）
@@ -920,6 +922,7 @@ pub struct Calc<'a> {
     cache_clock: u64,
     criteria_cache: HashMap<CriteriaKey, FValue>,
     grouped_criteria: [functions::GroupedCriteria; 2],
+    ordered_criteria: conditional_index::OrderedCriteria,
     sum_prefixes: HashMap<PrefixKey, SumPrefixes>,
     sum_ends: HashMap<PrefixKey, i64>,
     prefix_values: usize,
@@ -945,7 +948,7 @@ impl Arg {
 
     pub fn values(&self) -> Vec<FValue> {
         match self {
-            Arg::Val(FValue::Array(a)) => a.data.clone(),
+            Arg::Val(FValue::Array(a)) => a.data.as_ref().clone(),
             Arg::Val(v) => vec![v.clone()],
             Arg::Range { values, .. } => (**values).clone(),
         }
@@ -959,7 +962,7 @@ impl Arg {
     /// 统一成 (行, 列, 数据) 网格，供数组函数使用
     pub fn grid(&self) -> (usize, usize, Vec<FValue>) {
         match self {
-            Arg::Val(FValue::Array(a)) => (a.rows, a.cols, a.data.clone()),
+            Arg::Val(FValue::Array(a)) => (a.rows, a.cols, a.data.as_ref().clone()),
             Arg::Val(v) => (1, 1, vec![v.scalar()]),
             Arg::Range { values, rows, cols } => (*rows, *cols, (**values).clone()),
         }
@@ -969,7 +972,7 @@ impl Arg {
         let mut out = Vec::new();
         match self {
             Arg::Val(FValue::Array(a)) => {
-                for v in &a.data {
+                for v in a.data.iter() {
                     match v {
                         FValue::Number(n) => out.push(*n),
                         FValue::Error(e) => return Err(*e),
@@ -1026,6 +1029,7 @@ impl<'a> Calc<'a> {
             range_reads: 0,
             cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
             grouped_criteria: Default::default(),
+            ordered_criteria: Default::default(),
             sum_prefixes: HashMap::new(), sum_ends: HashMap::new(), prefix_values: 0, agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
             prev_system, prev_now }
@@ -1286,7 +1290,7 @@ impl<'a> Calc<'a> {
             Arg::Val(v) => v.clone(),
             Arg::Range { rows: 1, cols: 1, .. } => arg.first(),
             Arg::Range { rows, cols, values } => FValue::Array(std::rc::Rc::new(
-                value::Array::new(*rows, *cols, (**values).clone()),
+                value::Array::from_shared(*rows, *cols, values.clone()),
             )),
         }).collect();
         let cell = (self.cur_sheet, self.cur.0, self.cur.1);
@@ -1795,10 +1799,10 @@ impl<'a> Calc<'a> {
                             if rows == 1 && cols == 1 {
                                 values.first().cloned().unwrap_or(FValue::Empty)
                             } else {
-                                FValue::Array(std::rc::Rc::new(value::Array::new(
+                                FValue::Array(std::rc::Rc::new(value::Array::from_shared(
                                     rows,
                                     cols,
-                                    (*values).clone(),
+                                    values,
                                 )))
                             }
                         }
@@ -1852,7 +1856,7 @@ impl<'a> Calc<'a> {
                         let v = match &nodes[i + 1] {
                             Node::Range(a, b) => match self.range_values(a, b, si) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                                    std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                                    std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                                 ),
                                 Ok(Arg::Val(v)) => v,
                                 Err(e) => FValue::Error(e),
@@ -1988,7 +1992,8 @@ impl<'a> Calc<'a> {
                 let lam = nodes.last().unwrap();
                 match name.as_str() {
                     "MAP" => {
-                        let vals = self.operand_values(&nodes[0], si);
+                        let input = self.operand_block(&nodes[0], si);
+                        let vals = input.slice();
                         let lam_val = match self.eval_node(lam, si) {
                             FValue::Lambda(l) => Some(l),
                             _ => None,
@@ -2004,25 +2009,21 @@ impl<'a> Calc<'a> {
                     }
                     "REDUCE" => {
                         let mut acc = self.eval_node(&nodes[0], si);
-                        let vals = match nodes.get(1) {
-                            Some(n) => self.operand_values(n, si),
-                            None => vec![],
-                        };
+                        let input = self.operand_block(&nodes[1], si);
+                        let vals = input.slice();
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v], si);
+                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
                         }
                         acc
                     }
                     "SCAN" => {
                         let init = self.eval_node(&nodes[0], si);
-                        let vals = match nodes.get(1) {
-                            Some(n) => self.operand_values(n, si),
-                            None => vec![],
-                        };
+                        let input = self.operand_block(&nodes[1], si);
+                        let vals = input.slice();
                         let mut acc = init;
                         let mut out = Vec::with_capacity(vals.len());
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v], si);
+                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
                             out.push(acc.clone());
                         }
                         FValue::Array(std::rc::Rc::new(value::Array::new(1, out.len(), out)))
@@ -2048,7 +2049,7 @@ impl<'a> Calc<'a> {
                     "BYROW" => {
                         let (rows, cols, data) = match nodes.first() {
                             Some(n) => self.grid_of(n, si),
-                            None => (0, 0, vec![]),
+                            None => (0, 0, Default::default()),
                         };
                         if data.len() == 1 {
                             if let FValue::Error(e) = data[0] {
@@ -2067,7 +2068,7 @@ impl<'a> Calc<'a> {
                         // BYCOL
                         let (rows, cols, data) = match nodes.first() {
                             Some(n) => self.grid_of(n, si),
-                            None => (0, 0, vec![]),
+                            None => (0, 0, Default::default()),
                         };
                         if data.len() == 1 {
                             if let FValue::Error(e) = data[0] {
@@ -2224,7 +2225,7 @@ impl<'a> Calc<'a> {
                             rb.sheet = sheet.clone();
                             match self.range_values(&ra, &rb, si) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                                    std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                                    std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                                 ),
                                 Ok(_) => FValue::Error(ErrKind::Value),
                                 Err(e) => FValue::Error(e),
@@ -2289,7 +2290,7 @@ impl<'a> Calc<'a> {
                 };
                 match self.range_values(&a, &b, si) {
                     Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                        std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                        std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                     ),
                     _ => FValue::Error(ErrKind::Ref),
                 }
@@ -2418,15 +2419,13 @@ impl<'a> Calc<'a> {
                         sa.row = r1;
                         sb.row = r1;
                     }
-                    let (s_rows, s_cols, data) = self.cached_grid(idx, &sa, &sb);
-                    let n = if vertical { s_rows } else { s_cols };
-                    if n == 0 {
-                        return FValue::Error(ErrKind::Na);
-                    }
                     let best = if approx {
+                        let (s_rows, s_cols, data) = self.cached_grid(idx, &sa, &sb);
+                        let n = if vertical { s_rows } else { s_cols };
+                        if n == 0 { return FValue::Error(ErrKind::Na); }
                         self.approximate_match((idx, sa.row.min(sb.row), sa.col.min(sb.col), sa.row.max(sb.row), sa.col.max(sb.col)), &data, n, 1, &key, true)
                     } else {
-                        let ix = self.lookup_hash(idx, &sa, &sb, s_cols, s_rows, vertical);
+                        let ix = self.lookup_hash(idx, &sa, &sb, vertical);
                         ix.get(&key_norm(&key)).copied()
                     };
                     return match best {
@@ -2463,7 +2462,7 @@ impl<'a> Calc<'a> {
                 }
                 let mut hit: Option<usize> = None;
                 if mode == 0.0 {
-                    let ix = self.lookup_hash(idx, &la, &lb, cols, rows, vertical);
+                    let ix = self.lookup_hash(idx, &la, &lb, vertical);
                     hit = ix.get(&key_norm(&key)).copied();
                 } else {
                     for i in 0..n {
@@ -2697,7 +2696,8 @@ impl<'a> Calc<'a> {
                     return value.clone();
                 }
                 let grouped = criteria_key.as_ref().and_then(|k| {
-                    self.grouped_criteria.get_mut(k.function as usize)?.lookup(k, &args)
+                    self.ordered_criteria.lookup(k, &args).or_else(||
+                        self.grouped_criteria.get_mut(k.function as usize)?.lookup(k, &args))
                 });
                 let out = if let Some(value) = grouped {
                     value
@@ -2881,10 +2881,8 @@ impl<'a> Calc<'a> {
         si: usize,
         a: &RefExpr,
         b: &RefExpr,
-        cols: usize,
-        rows: usize,
         vertical: bool,
-    ) -> std::rc::Rc<HashMap<String, usize>> {
+    ) -> lookup_cache::Index {
         let key = (
             si,
             a.row.min(b.row),
@@ -2892,10 +2890,17 @@ impl<'a> Calc<'a> {
             a.row.max(b.row),
             a.col.max(b.col),
         );
-        if let Some(ix) = self.lookup_index.get(&key) {
+        let local = (key, vertical);
+        if let Some(ix) = self.lookup_index.get(&local) {
             return ix.clone();
         }
-        let (_rows, _c, data) = self.cached_grid(si, a, b);
+        let sheet = &self.wb.sheets[si];
+        let span = if vertical { key.3 - key.1 } else { key.4 - key.2 };
+        if span >= 255 && let Some(ix) = sheet.shared_lookup.get(sheet.cell_version(), local) {
+            self.lookup_index.insert(local, ix.clone());
+            return ix;
+        }
+        let (rows, cols, data) = self.cached_grid(si, a, b);
         let count = if vertical { rows } else { cols };
         let mut map: HashMap<String, usize> = HashMap::with_capacity(count);
         for i in 0..count {
@@ -2908,9 +2913,20 @@ impl<'a> Calc<'a> {
                 map.entry(key_norm(v)).or_insert(i);
             }
         }
-        let rc = std::rc::Rc::new(map);
-        if self.requested.is_none() { self.lookup_index.insert(key, rc.clone()); }
-        rc
+        let index = std::sync::Arc::new(map);
+        if self.requested.is_none() {
+            if count >= 256 {
+                let sheet = &self.wb.sheets[si];
+                let (_, r1, c1, _, _) = key;
+                let rect = (r1 as u32, c1 as u32, r1 as u32 + if vertical { rows.saturating_sub(1) as u32 } else { 0 },
+                    c1 as u32 + if vertical { 0 } else { cols.saturating_sub(1) as u32 });
+                if !sheet.iter_rect(rect).any(|(_,c)| c.formula.is_some()) {
+                    sheet.shared_lookup.insert(sheet.cell_version(), local, index.clone());
+                }
+            }
+            self.lookup_index.insert(local, index.clone());
+        }
+        index
     }
 
     /// 同一轮重算里，同一块区域只物化一次
@@ -3024,54 +3040,54 @@ impl<'a> Calc<'a> {
         functions::call(name, &self.function_args(name, nodes, si))
     }
 
-    fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
+    fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, std::rc::Rc<Vec<FValue>>) {
         match n {
             Node::Ref(re) => {
                 if re.sheet2.is_some() || re.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
-                        v => (1, 1, vec![v]),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)].into()),
+                        v => (1, 1, vec![v].into()),
                     };
                 }
                 match self.sheet_index(re.sheet.as_deref(), si) {
                     Ok(idx) => {
                         let v = self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32).scalar();
-                        (1, 1, vec![v])
+                        (1, 1, vec![v].into())
                     }
-                    Err(_) => (0, 0, vec![]),
+                    Err(_) => (0, 0, vec![].into()),
                 }
             }
             Node::Spill(re) => {
                 if re.book.is_some() {
-                    return (1, 1, vec![FValue::Error(ErrKind::Ref)]);
+                    return (1, 1, vec![FValue::Error(ErrKind::Ref)].into());
                 }
                 match self.sheet_index(re.sheet.as_deref(), si) {
                     Ok(idx) => match self.spill_value(idx, re.row.max(0) as u32, re.col.max(0) as u32) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
-                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)].into()),
+                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)].into()),
                     },
-                    Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                    Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)].into()),
                 }
             },
             Node::Range(a, b) => {
                 if a.sheet2.is_some() || b.sheet2.is_some() || a.book.is_some() || b.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                        _ => (0, 0, vec![]),
+                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)].into()),
+                        _ => (0, 0, vec![].into()),
                     };
                 }
                 match self.range_values(a, b, si) {
-                    Ok(Arg::Range { values, rows, cols }) => (rows, cols, (*values).clone()),
-                    _ => (0, 0, vec![]),
+                    Ok(Arg::Range { values, rows, cols }) => (rows, cols, values),
+                    _ => (0, 0, vec![].into()),
                 }
             }
             _ => match self.eval_node(n, si) {
                 FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                v => (1, 1, vec![v]),
+                FValue::Error(e) => (0, 0, vec![FValue::Error(e)].into()),
+                v => (1, 1, vec![v].into()),
             },
         }
     }
@@ -3126,22 +3142,6 @@ impl<'a> Calc<'a> {
             }
         }
         FValue::Error(ErrKind::Value)
-    }
-
-    fn operand_values(&mut self, n: &Node, si: usize) -> Vec<FValue> {
-        if let Node::Range(a, b) = n {
-            if a.sheet2.is_none() && b.sheet2.is_none() {
-                if let Ok(Arg::Range { values, .. }) = self.range_values(a, b, si) {
-                    return (*values).clone();
-                }
-            }
-        }
-        let v = self.eval_node(n, si);
-        // MAP/BYROW 这类返回数组的函数，聚合时需要摊平
-        if let FValue::Array(a) = &v {
-            return a.data.clone();
-        }
-        vec![v]
     }
 
     /// 二元运算的操作数一律当成二维块：区域/数组保留 rows×cols，标量是 1×1。

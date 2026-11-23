@@ -692,10 +692,10 @@ impl Sheet {
             }
         }
         if rows {
-            self.row_styles = out;
+            self.row_styles = out.into();
             self.row_styles_dirty = true;
         } else {
-            self.col_styles = out;
+            self.col_styles = out.into();
             self.col_styles_dirty = true;
         }
         self.styles_dirty = true;

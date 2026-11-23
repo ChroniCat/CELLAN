@@ -143,11 +143,11 @@ fn build_sparse(filled: usize) -> Workbook {
     wb
 }
 
-fn build_mixed(rows: usize) -> Workbook {
+fn build_mixed(rows: usize, source_rows: u32) -> Workbook {
     let mut wb = Workbook::new_blank();
     let mut report = sheetcore::Sheet::new("Report");
     let mut sums = [0.0; 16];
-    for r in 0..256 {
+    for r in 0..source_rows {
         let source = &mut wb.sheets[0];
         let amount = 1.0 + (r % 19) as f64;
         sums[(r % 16) as usize] += amount;
@@ -157,9 +157,9 @@ fn build_mixed(rows: usize) -> Workbook {
     }
     for r in 0..rows as u32 {
         let (formula, cache) = if r % 2 == 0 {
-            (format!("=VLOOKUP({},Sheet1!$A$1:$C$256,3,FALSE)", r % 256), 1.0 + (r % 256 % 19) as f64)
+            (format!("=VLOOKUP({},Sheet1!$A$1:$C${source_rows},3,FALSE)", r % source_rows), 1.0 + (r % source_rows % 19) as f64)
         } else {
-            (format!("=SUMIFS(Sheet1!$C$1:$C$256,Sheet1!$B$1:$B$256,\"组{}\")", r % 16), sums[(r % 16) as usize])
+            (format!("=SUMIFS(Sheet1!$C$1:$C${source_rows},Sheet1!$B$1:$B${source_rows},\"组{}\")", r % 16), sums[(r % 16) as usize])
         };
         report.set(r, 0, Cell { value: Value::Number(cache), formula: Some(formula.into()) });
     }
@@ -172,11 +172,16 @@ fn suite_one(kind: &str, cells: usize, dir: &std::path::Path) -> String {
     let scratch = tempfile::tempdir_in(dir).expect("创建计算样本临时目录失败");
     let path = scratch.path().join(&filename);
     let t = Instant::now();
+    let source_rows = if kind == "mixed" {
+        let n: u32 = std::env::var("SC_PERF_SOURCE_ROWS").unwrap_or_else(|_| "256".into()).parse().expect("SC_PERF_SOURCE_ROWS must be numeric");
+        assert!((1..=1_048_576).contains(&n), "source size exceeds Excel limits");
+        n
+    } else { 0 };
     let built = match kind {
         "values" => build_values(cells),
         "chain" => build_formulas(cells, true),
         "independent" => build_formulas(cells, false),
-        "mixed" => build_mixed(cells),
+        "mixed" => build_mixed(cells, source_rows),
         "spill" => {
             let mut wb = build_formulas(cells, false);
             wb.sheets[0].set(0, 5, Cell { value: Value::Empty, formula: Some("=SEQUENCE(3,1)".into()) });
@@ -266,7 +271,7 @@ fn suite_one(kind: &str, cells: usize, dir: &std::path::Path) -> String {
     let size = std::fs::metadata(&pristine).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
 
     format!(
-        "{{\"kind\":\"{kind}\",\"cells\":{cells},\"nonempty_cells\":{nonempty_cells},\"build_ms\":{build_ms:.1},\"save_ms\":{save_ms:.1},\
+        "{{\"kind\":\"{kind}\",\"cells\":{cells},\"source_rows\":{source_rows},\"nonempty_cells\":{nonempty_cells},\"build_ms\":{build_ms:.1},\"save_ms\":{save_ms:.1},\
          \"load_ms\":{load_ms:.1},\"recalc_ms\":{recalc_ms:.1},\"deps_ms\":{deps_ms:.1},\
          \"edit_ms\":{edit_ms:.3},\"edit_formulas\":{edit_formulas},\
          \"save_used_delta\":{save_used_delta},\"save2_used_delta\":{save2_used_delta},\"peak_save2_mb\":{peak_save2:.0},\
@@ -276,12 +281,74 @@ fn suite_one(kind: &str, cells: usize, dir: &std::path::Path) -> String {
     )
 }
 
+/// Two numeric columns with a header. The pristine file is also the Excel COM input.
+fn measure_operations(rows: u32, dir: &std::path::Path) {
+    use sheetcore::{data_tools::CompactSort, sort_filter::Filter, structural::{Structural, apply_structural_wb}};
+    assert!((50_001..=1_048_574).contains(&rows));
+    let mut wb = Workbook::new_blank();
+    for (col, title) in ["Key", "Group"].into_iter().enumerate() {
+        wb.sheets[0].set(0, col as u32, Cell { value: Value::Text(title.into()), formula: None });
+    }
+    for row in 1..=rows {
+        let key = rows+1-row;
+        for (col, value) in [key,key % 2].into_iter().enumerate() {
+            wb.sheets[0].set(row,col as u32,Cell { value: Value::Number(f64::from(value)), formula: None });
+        }
+    }
+    let path = dir.join(format!("qa07-operations-{rows}.xlsx"));
+    let t = Instant::now();
+    sheetcore::xlsx::save_atomic_with_receipt(&path,&wb).unwrap();
+    let first_save_ms = ms(t.elapsed());
+    drop(wb);
+    let t = Instant::now();
+    let mut wb = sheetcore::xlsx::load(&path).unwrap();
+    let open_ms = ms(t.elapsed());
+    let sampler = PeakSampler::start();
+    let t = Instant::now();
+    let sort = CompactSort::plan(&wb.sheets[0],0,(1,0,rows,1),0,true,false).unwrap().unwrap();
+    let mut count = 0;
+    for d in sort.deltas() {
+        wb.sheets[0].set(d.row,d.col,d.after);
+        count += 1;
+    }
+    let sort_ms = ms(t.elapsed());
+    let sort_peak_mb = sampler.finish();
+    assert_eq!(wb.sheets[0].value(1,0),Value::Number(1.0));
+    assert_eq!(wb.sheets[0].value(rows,0),Value::Number(f64::from(rows)));
+    let at = rows/2+1;
+    let op = Structural::InsertRows { at, n: 1 };
+    let t = Instant::now();
+    let before = sheetcore::undo::snapshot_structure(&wb,0,&op);
+    apply_structural_wb(&mut wb,0,&op);
+    let after = before.capture_after(&wb);
+    let mut undo = sheetcore::undo::UndoStack::new();
+    undo.push_structure(op.label(),before,after,(0,at,0));
+    let insert_ms = ms(t.elapsed());
+    assert!(wb.sheets[0].get(at,0).is_none());
+    let t = Instant::now();
+    let mut filter = Filter::new(0,0,rows+1,1);
+    filter.allows.insert(1,["1".to_owned()].into_iter().collect());
+    let hidden = filter.hidden_rows(&wb.sheets[0]);
+    let visible = rows+1-hidden.len() as u32;
+    assert_eq!(visible,rows.div_ceil(2));
+    wb.sheets[0].hidden_rows = hidden.into();
+    wb.sheets[0].filter = Some(filter);
+    let filter_ms = ms(t.elapsed());
+    println!("{}", serde_json::json!({ "kind":"operations", "rows":rows, "file":path,
+        "first_save_ms":first_save_ms, "open_ms":open_ms, "sort_ms":sort_ms, "sort_peak_mb":sort_peak_mb,
+        "changed_cells":count, "insert_with_undo_ms":insert_ms, "filter_ms":filter_ms,"visible_data_rows":visible }));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = std::env::var("SC_PERF_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
     std::fs::create_dir_all(&dir).ok();
+    if args.first().is_some_and(|s| s == "--operations") {
+        measure_operations(args.get(1).map_or(1_000_000, |n| n.parse().expect("invalid row count")), &dir);
+        return;
+    }
     if args.first().map(|s| s.as_str()) == Some("--one") {
         let cells: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(10_000);
         let kind = args.get(2).map(|s| s.as_str()).unwrap_or("values");

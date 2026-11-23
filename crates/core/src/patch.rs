@@ -42,6 +42,10 @@ pub(crate) fn date1904_xml(xml: &str) -> bool {
 /// 表名 → zip 内的 worksheet 路径
 pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
     let staged_here = stage_active_for(path);
+    if staged_here && let Some(cached) = STAGE_TARGETS.with(|cache| cache.borrow().as_ref()
+        .filter(|(owner, _)| owner == path).map(|(_, targets)| targets.clone())) {
+        return Ok(cached);
+    }
     let (wb_xml_opt, rels_xml_opt) = if staged_here {
         (
             crate::fixups::read_part(path, "xl/workbook.xml")
@@ -68,7 +72,11 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
         (wb_xml, rels_xml)
     };
 
-    Ok(sheet_targets_xml(wb_xml_opt.as_deref(), rels_xml_opt.as_deref()))
+    let targets = sheet_targets_xml(wb_xml_opt.as_deref(), rels_xml_opt.as_deref());
+    if staged_here && wb_xml_opt.is_some() && rels_xml_opt.is_some() {
+        STAGE_TARGETS.with(|cache| *cache.borrow_mut() = Some((path.to_owned(), targets.clone())));
+    }
+    Ok(targets)
 }
 
 pub(crate) fn sheet_targets_xml(wb_xml_opt: Option<&str>, rels_xml_opt: Option<&str>) -> HashMap<String, String> {
@@ -564,6 +572,28 @@ pub fn replace_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_sheet_targets_follow_metadata_replacements_deletions_and_new_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheets.xlsx");
+        crate::xlsx::save(&path, &crate::Workbook::new_blank()).unwrap();
+        let workbook = "xl/workbook.xml";
+        let rels = "xl/_rels/workbook.xml.rels";
+        begin_stage_for(&path);
+        let original = sheet_targets(&path).unwrap();
+        let w = String::from_utf8(crate::fixups::read_part(&path, workbook).unwrap()).unwrap();
+        stage_put(workbook, w.replace("Sheet1", "Renamed").into_bytes());
+        let renamed = sheet_targets(&path).unwrap();
+        assert_eq!(renamed.get("Renamed"), original.get("Sheet1"));
+        let r = String::from_utf8(crate::fixups::read_part(&path, rels).unwrap()).unwrap();
+        stage_put(rels, r.replace("sheet1.xml", "changed.xml").into_bytes());
+        assert!(sheet_targets(&path).unwrap()["Renamed"].ends_with("/changed.xml"));
+        stage_del(workbook);
+        assert!(sheet_targets(&path).unwrap().is_empty());
+        clear_stage();
+        assert_eq!(sheet_targets(&path).unwrap(), original);
+    }
 
     #[test]
     fn staged_edits_and_raw_copies_preserve_compressed_bytes_and_last_write() {
@@ -1472,6 +1502,8 @@ type StageState = (
 thread_local! {
     static STAGE: std::cell::RefCell<Option<StageState>> =
         std::cell::RefCell::new(None);
+    static STAGE_TARGETS: std::cell::RefCell<Option<(std::path::PathBuf, HashMap<String, String>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 开始攒改动（嵌套调用只认最外层）
@@ -1507,6 +1539,7 @@ pub fn stage_active_for(path: &Path) -> bool {
 }
 
 fn stage_put(name: &str, body: Vec<u8>) {
+    invalidate_target_cache(name);
     STAGE.with(|s| {
         if let Some((_, m)) = s.borrow_mut().as_mut() {
             m.insert(name.to_string(), Some(std::rc::Rc::new(body)));
@@ -1515,11 +1548,18 @@ fn stage_put(name: &str, body: Vec<u8>) {
 }
 
 fn stage_del(name: &str) {
+    invalidate_target_cache(name);
     STAGE.with(|s| {
         if let Some((_, m)) = s.borrow_mut().as_mut() {
             m.insert(name.to_string(), None);
         }
     });
+}
+
+fn invalidate_target_cache(name: &str) {
+    if matches!(name, "xl/workbook.xml" | "xl/_rels/workbook.xml.rels") {
+        STAGE_TARGETS.with(|cache| cache.borrow_mut().take());
+    }
 }
 
 /// 暂存里有没有这个部件（读的时候要先看这里，否则读到旧内容）
@@ -1587,6 +1627,7 @@ pub fn staged_deleted_at(path: &Path) -> std::collections::HashSet<String> {
 
 /// 异常中断或错误退出时清空线程局部暂存与原样搬运队列，防止污染同线程后续保存
 pub fn clear_stage() {
+    STAGE_TARGETS.with(|cache| cache.borrow_mut().take());
     STAGE.with(|s| {
         let _ = s.borrow_mut().take();
     });
@@ -1617,6 +1658,7 @@ fn commit_package(path: &Path, raw_source: Option<&Path>, take_stage: bool) -> R
 
     let mut pending = HashMap::new();
     if take_stage {
+        STAGE_TARGETS.with(|cache| cache.borrow_mut().take());
         if let Some((_, map)) = STAGE.with(|s| s.borrow_mut().take()) {
             pending.extend(map.into_iter().map(|(name, body)|
                 (name, body.map_or(Part::Remove, Part::Write))));

@@ -587,6 +587,37 @@ where
     RowRules::new(cf, r).overlay_at(stats, sheet, c, expr)
 }
 
+/// Sparse row interval lookup for all ranges in the active rule definitions.
+#[derive(Default)]
+pub struct RuleIndex {
+    ranges: Vec<(u32, u32, usize)>,
+    ends: Vec<u32>,
+}
+
+impl RuleIndex {
+    pub fn new(cf: &CfSheet) -> Self {
+        let mut ranges: Vec<_> = cf.blocks.iter().enumerate().flat_map(|(i, b)|
+            b.ranges.iter().filter_map(move |&(top, _, bottom, _)| (top <= bottom).then_some((top, bottom, i)))).collect();
+        ranges.sort_unstable();
+        let mut last = 0;
+        let ends = ranges.iter().map(|&(_, bottom, _)| { last = last.max(bottom); last }).collect();
+        Self { ranges, ends }
+    }
+
+    pub fn row<'a>(&self, cf: &'a CfSheet, row: u32) -> RowRules<'a> {
+        let start = self.ends.partition_point(|&end| end < row);
+        let end = self.ranges.partition_point(|&(top, _, _)| top <= row);
+        let mut blocks: Vec<_> = self.ranges[start..end].iter()
+            .filter_map(|&(_, bottom, i)| (bottom >= row).then_some(i)).collect();
+        blocks.sort_unstable();
+        blocks.dedup(); // two ranges of a block can intersect the same row
+        let mut order: Vec<_> = blocks.into_iter().flat_map(|bi| cf.blocks[bi].rules.iter().enumerate()
+            .map(move |(ri, rule)| (rule.priority, bi, ri))).collect();
+        order.sort_unstable();
+        RowRules { cf, row, order }
+    }
+}
+
 /// Visible cells on the same row share rule priority and the set of candidate blocks.
 pub struct RowRules<'a> {
     cf: &'a CfSheet,

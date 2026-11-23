@@ -59,11 +59,14 @@ impl fmt::Display for ErrKind {
 pub struct Array {
     pub rows: usize,
     pub cols: usize,
-    pub data: Vec<FValue>,
+    pub data: std::rc::Rc<Vec<FValue>>,
 }
 
 impl Array {
     pub fn new(rows: usize, cols: usize, data: Vec<FValue>) -> Self {
+        Self::from_shared(rows, cols, std::rc::Rc::new(data))
+    }
+    pub(super) fn from_shared(rows: usize, cols: usize, data: std::rc::Rc<Vec<FValue>>) -> Self {
         Self { rows, cols, data }
     }
     pub fn get(&self, r: usize, c: usize) -> FValue {

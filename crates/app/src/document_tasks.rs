@@ -14,6 +14,7 @@ pub(crate) struct DocumentTasks {
     pub reorder: Option<super::data_reorder::Pending>,
     pub busy: bool,
     pub needs_full: bool,
+    pub structural_recalc: Option<(u64, usize, sheetcore::structural::Structural, std::sync::Arc<sheetcore::formula::deps::Deps>)>,
     /// Retain pending edits until a result for this document generation is applied.
     pub dirty_recalc_seeds: std::collections::BTreeSet<sheetcore::formula::deps::CellKey>,
     pub last_edit: Option<Instant>,
@@ -21,8 +22,8 @@ pub(crate) struct DocumentTasks {
     pub autosave_retry_at: Option<Instant>,
     /// Ctrl+S requested a second snapshot while the previous one was being written.
     pub manual_save_queued: bool,
-    /// The host can pause automatic writes for this document while peers remain connected.
-    pub shared_autosave_paused: bool,
+    /// A shared document inherits the host preference until the room switch is changed.
+    pub shared_autosave: Option<bool>,
     /// Preserve save authority when a tab leaves its collaboration session.
     /// A former guest must not automatically overwrite a shared workbook.
     pub autosave_after_detach: Option<bool>,

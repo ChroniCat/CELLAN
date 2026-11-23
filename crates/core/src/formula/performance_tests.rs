@@ -78,6 +78,27 @@ fn shared_prefix_reads_each_cell_once_in_any_order_and_preserves_errors() {
 }
 
 #[test]
+fn ordered_range_criteria_match_fresh_scans_when_mixed_with_fractional_sums() {
+    let mut wb = Workbook::new_blank();
+    for row in 0..640 {
+        number(&mut wb, row, 0, (row % 71) as f64 - 30.0);
+        number(&mut wb, row, 1, (row % 3) as f64 - 1.0);
+        number(&mut wb, row, 2, (row % 7) as f64 / 10.0);
+    }
+    let mut warm = Calc::new(&wb);
+    for condition in [">7", "<4", "<>2", ">=19", "<=-12"] {
+        for query in [
+            format!("COUNTIFS(A1:A640,\"{condition}\")"),
+            format!("SUMIFS(B1:B640,A1:A640,\"{condition}\")"),
+            format!("SUMIFS(C1:C640,A1:A640,\"{condition}\")"),
+        ] {
+            let node = parse(&query).unwrap();
+            assert_eq!(warm.eval_node(&node, 0), Calc::new(&wb).eval_node(&node, 0), "{query}");
+        }
+    }
+}
+
+#[test]
 fn conditional_aggregates_reuse_only_matching_ranges_and_criteria() {
     let mut wb = Workbook::new_blank();
     for row in 0..5 {
@@ -604,6 +625,48 @@ fn filter_visibility_seeds_include_cross_sheet_summary_and_its_dependents() {
     wb.sheets[0].hidden_rows.insert(1);
     assert_eq!(recalc_dirty(&mut wb, &deps, &seeds), 2);
     assert_eq!(wb.sheets[1].value(0, 1), Value::Number(4.0));
+}
+
+#[test]
+fn repeated_exact_lookup_shares_only_literal_keys_and_rejects_divergent_snapshots() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets.push(Sheet::new("Report"));
+    for r in 0..1200 { number(&mut wb,r,0,f64::from(r)); number(&mut wb,r,1,f64::from(r + 7)); }
+    set_formula(&mut wb.sheets[1], 0, 0, "=VLOOKUP(750,Data!A1:B1200,2,FALSE)", FValue::Empty);
+    let read = |wb: &Workbook| {
+        let mut calc = Calc::new(wb);
+        let value = calc.cell_value(1,0,0);
+        (value.to_number(), calc.range_reads)
+    };
+    assert_eq!(read(&wb), (Ok(757.0),1200));
+    assert_eq!(std::thread::scope(|s| s.spawn(|| read(&wb)).join().unwrap()), (Ok(757.0),0));
+    let mut first = wb.clone();
+    let mut second = wb.clone();
+    number(&mut first,0,0,750.0);
+    number(&mut second,1,0,750.0);
+    assert_eq!(read(&first), (Ok(7.0),1200));
+    assert_eq!(read(&second), (Ok(8.0),1200));
+    assert_eq!(read(&first), (Ok(7.0),0));
+    formula(&mut first,0,0,"=749+1");
+    assert_eq!(read(&first), (Ok(7.0),1200));
+    assert_eq!(read(&first), (Ok(7.0),1200));
+}
+
+#[test]
+fn range_bindings_and_array_values_share_materialized_storage() {
+    let mut wb = Workbook::new_blank();
+    wb.names.push(("RangeName".into(), None, "A1:A300".into()));
+    for r in 0..300 { number(&mut wb,r,0,r as f64); }
+    let mut calc = Calc::new(&wb);
+    let mut results = Vec::new();
+    for src in ["A1:A300", "LET(x,A1:A300,x)", "RangeName", "INDIRECT(\"A1:A300\")"] {
+        let FValue::Array(array) = calc.eval_node(&parse(src).unwrap(),0) else { panic!("{src}"); };
+        assert_eq!(array.get(299,0),FValue::Number(299.0));
+        results.push(array.data.clone());
+    }
+    assert!(results[1..].iter().all(|r| std::rc::Rc::ptr_eq(&results[0],r)));
+    assert_eq!(calc.range_reads,300);
 }
 
 #[test]

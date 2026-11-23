@@ -6,12 +6,14 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod files;
 mod csv_import;
+mod sheet_edit_target;
 use csv_import::CsvDlg;
 mod document_tasks;
 mod column_clip;
 mod data_reorder;
 mod validation;
 mod find_navigation;
+mod grid_render_cache;
 mod diagnostic_cache;
 mod filter_choices;
 mod fill_seq;
@@ -1693,6 +1695,12 @@ struct UpdateUiState {
     dismissed_version: Option<String>,
 }
 
+enum StructuralRecalc {
+    Full,
+    Local(Vec<sheetcore::formula::deps::CellKey>),
+    Background(usize, sheetcore::structural::Structural),
+}
+
 struct SheetApp {
     view_axes_cache: std::cell::RefCell<Option<ViewAxesCache>>,
     wb: Workbook,
@@ -1996,6 +2004,8 @@ struct SheetApp {
     /// 开始页/后台页最近文件内存缓存（避免每帧读盘与 UNC 网络路径阻塞 UI 线程）
     recent_cache: Option<Vec<HomeRecentEntry>>,
     frame_probe: Option<FrameProbe>,
+    normal_page_breaks: grid_render_cache::PageBreaks,
+    cf_inputs: grid_render_cache::Rules,
     outline_cache: Option<((u64, u64, u64), std::sync::Arc<OutlineGroups>)>,
     page_geometry: Option<((u64, u64, u64, u64, u8), sheetcore::page::PageSetup, std::sync::Arc<PageGeo>)>,
     /// Evaluated cells and matching overlays for the last viewport.
@@ -3030,23 +3040,27 @@ struct FrameProbe {
     previous_start: Option<std::time::Instant>,
     builds: Vec<f64>,
     intervals: Vec<f64>,
+    backend: Vec<f64>,
 }
 
 impl FrameProbe {
     fn from_env() -> Option<Self> {
         let limit = std::env::var("SC_FRAME_LOG").ok()?.parse().ok()?;
-        (limit > 0).then(|| Self { limit, previous_start: None, builds: Vec::new(), intervals: Vec::new() })
+        (limit > 0).then(|| Self { limit, previous_start: None, builds: Vec::new(), intervals: Vec::new(), backend: Vec::new() })
     }
 
-    fn sample(&mut self, start: std::time::Instant) -> bool {
+    fn sample(&mut self, start: std::time::Instant, backend_seconds: Option<f32>) -> bool {
         let Some(previous) = self.previous_start.replace(start) else { return false };
+        if let Some(elapsed) = backend_seconds { self.backend.push(f64::from(elapsed) * 1000.0); }
         self.intervals.push((start - previous).as_secs_f64() * 1000.0);
         self.builds.push(start.elapsed().as_secs_f64() * 1000.0);
         if self.builds.len() < self.limit { return false; }
         for (tag, label, samples) in [
             ("cpu", "帧 update() 耗时", &mut self.builds),
             ("frame", "帧相邻 update() 开始间隔", &mut self.intervals),
+            ("backend", "eframe 帧 CPU 耗时（含三角化和渲染提交，排除 vsync 等待）", &mut self.backend),
         ] {
+            if samples.is_empty() { continue; }
             let avg = samples.iter().sum::<f64>() / samples.len() as f64;
             let (n, p50, p95, max) = probe_stats(samples);
             eprintln!("[{tag}] {n} {label}：avg={avg:.2}ms p50={p50:.2}ms p95={p95:.2}ms max={max:.2}ms");
@@ -3416,6 +3430,7 @@ impl SheetApp {
             recent_cache: None,
             cf_cache: None,
             frame_probe: FrameProbe::from_env(),
+            normal_page_breaks: Default::default(), cf_inputs: Default::default(),
             outline_cache: None,
             page_geometry: None,
             stat_cache: None,
@@ -3935,7 +3950,7 @@ impl SheetApp {
                         eprintln!("[open] recalc {:.2}s", t.elapsed().as_secs_f64());
                     }
                     let t = std::time::Instant::now();
-                    let deps = sheetcore::formula::deps::Deps::build(&wb2);
+                    let deps = sheetcore::formula::deps::Deps::build_after_recalc(&wb2);
                     if prof {
                         eprintln!("[open] deps {:.2}s", t.elapsed().as_secs_f64());
                     }
@@ -4002,7 +4017,7 @@ impl SheetApp {
                     if !wb2.calc_manual {
                         sheetcore::formula::recalc_all(&mut wb2);
                     }
-                    let deps = sheetcore::formula::deps::Deps::build(&wb2);
+                    let deps = sheetcore::formula::deps::Deps::build_after_recalc(&wb2);
                     let _ = tx.send(OpenMsg::Recalced(Box::new(wb2), Box::new(deps)));
                 }
                 Err(e) => {
@@ -4063,7 +4078,8 @@ impl SheetApp {
             }
             wb.calc_manual = manual;
             // 单表重算只清该表；全量重算由 recalc_all_force 清空。
-            let deps = sheetcore::formula::deps::Deps::build(&wb);
+            let deps = if sheet.is_none() { sheetcore::formula::deps::Deps::build_after_recalc(&wb) }
+                else { sheetcore::formula::deps::Deps::build(&wb) };
             let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch, doc_gen, sheet.is_none()));
         });
     }
@@ -5821,17 +5837,16 @@ impl SheetApp {
                 TabSlot::Active => {
                     let enabled = self.autosave || self.tasks.manual_save_queued;
                     let allowed = match &self.net {
-                        Some(n) if n.hosting && self.peers_list.len() > 1 => !self.tasks.shared_autosave_paused || self.tasks.manual_save_queued,
-                        Some(n) if n.hosting => self.tasks.manual_save_queued || self.autosave && !self.tasks.shared_autosave_paused,
+                        Some(n) if n.hosting => self.tasks.manual_save_queued || self.tasks.shared_autosave.unwrap_or(self.autosave),
                         Some(_) => enabled && self.wb.dirty && self.guest_can_save_local_copy(),
                         None => self.tasks.autosave_after_detach.unwrap_or(self.tasks.manual_save_queued
-                            || self.autosave && !self.tasks.shared_autosave_paused),
+                            || self.tasks.shared_autosave.unwrap_or(self.autosave)),
                     };
                     (self.doc_uid, allowed)
                 }
                 TabSlot::Parked(doc) => (
                     doc.doc_uid,
-                    doc.tasks.autosave_after_detach.unwrap_or(doc.tasks.manual_save_queued || self.autosave && !doc.tasks.shared_autosave_paused),
+                    doc.tasks.autosave_after_detach.unwrap_or(doc.tasks.manual_save_queued || doc.tasks.shared_autosave.unwrap_or(self.autosave)),
                 ),
             };
             if !enabled || self.closing_document(uid) {
@@ -7949,6 +7964,7 @@ impl SheetApp {
     }
 
     fn request_silent_bg_recalc(&mut self) {
+        self.tasks.structural_recalc = None;
         self.tasks.needs_full = true;
         self.tasks.dirty_recalc_seeds.clear();
         self.cancel_silent_recalc();
@@ -8030,6 +8046,7 @@ impl SheetApp {
                 let seeds: Vec<_> = self.tasks.dirty_recalc_seeds.iter().copied().collect();
                 (self.deps.clone(), seeds)
             });
+            let structure = self.tasks.structural_recalc.take().filter(|(generation,..)| *generation == self.doc_gen);
             let uid = self.doc_uid;
             let epoch = self.wb_epoch;
             let doc_gen = self.doc_gen;
@@ -8046,10 +8063,19 @@ impl SheetApp {
                         return;
                     }
                     None
+                } else if let Some((_,sheet,op,old)) = structure {
+                    match old.recalc_structural(&mut wb2,sheet,&op,&cancel) {
+                        Some(index) => Some(Box::new(index)),
+                        None if cancel.load(Ordering::Relaxed) => return,
+                        None => {
+                            if !sheetcore::formula::recalc_all_force_impl(&mut wb2,Some(&cancel),None) { return; }
+                            Some(Box::new(sheetcore::formula::deps::Deps::build_after_recalc(&wb2)))
+                        }
+                    }
                 } else {
                     if !sheetcore::formula::recalc_all_force_impl(&mut wb2, Some(&cancel), None)
                         || cancel.load(Ordering::Relaxed) { return; }
-                    Some(Box::new(sheetcore::formula::deps::Deps::build(&wb2)))
+                    Some(Box::new(sheetcore::formula::deps::Deps::build_after_recalc(&wb2)))
                 };
                 if !cancel.load(Ordering::Relaxed) {
                     let _ = tx.send((uid, epoch, doc_gen, CalculatedSnapshot { revisions, workbook: Box::new(wb2) }, rebuilt));
@@ -9340,7 +9366,7 @@ impl SheetApp {
     /// C09：选文件后先打开选项对话框（编码/引号/表头/文本列 + 真实预览）
     fn open_csv_dialog(&mut self, path: &std::path::Path) {
         self.csv_job = None;
-        self.csv_dlg = Some(CsvDlg::new(path, csv_import::Target::current(self, self.sel)));
+        self.csv_dlg = Some(CsvDlg::new(path, sheet_edit_target::SheetEditTarget::current(self, self.sel)));
     }
 
     fn csv_dlg_ui(&mut self, ctx: &egui::Context) {
@@ -10601,58 +10627,8 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         c: u32,
         cell: &sheetcore::model::Cell,
     ) -> Option<sheetcore::model::Cell> {
-        let opts = self.search_opts();
-        let needle = sheetcore::search::normalize_needle(&self.find.find, &opts);
-        if !sheetcore::search::cell_matches(&self.wb, sheet, r, c, &needle, &opts) {
-            return None;
-        }
-        if !opts.in_formula && cell.formula.is_some() && !self.find.replace_formula_results {
-            return None;
-        }
-        let text = sheetcore::search::cell_text_at(
-            &self.wb,
-            sheet,
-            r,
-            c,
-            cell,
-            opts.in_formula,
-        )?;
-        if opts.in_formula {
-            let formula = cell.formula.as_deref()?;
-            let next = if opts.whole_cell {
-                self.find.replace.clone()
-            } else {
-                sheetcore::search::replace_in_text(
-                    formula,
-                    &self.find.find,
-                    &self.find.replace,
-                    self.find.match_case,
-                )
-            };
-            if next == formula {
-                return None;
-            }
-            let mut out = cell.clone();
-            out.formula = Some(next.into());
-            return Some(out);
-        }
-        let next = if opts.whole_cell {
-            self.find.replace.clone()
-        } else {
-            sheetcore::search::replace_in_text(
-                &text,
-                &self.find.find,
-                &self.find.replace,
-                self.find.match_case,
-            )
-        };
-        if next == text {
-            return None;
-        }
-        Some(sheetcore::model::Cell {
-            value: sheetcore::model::Value::parse_input(&next),
-            formula: None,
-        })
+        find_navigation::replacement(&self.wb, sheet, r, c, cell, &self.find.find,
+            &self.search_opts(), &self.find.replace, self.find.replace_formula_results)
     }
 
 
@@ -10698,123 +10674,6 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.start_scan(1);
     }
 
-    fn apply_replace_hits(&mut self, hits: &[sheetcore::search::Hit], baseline: &Workbook) {
-        if hits.is_empty() {
-            self.status = "没找到可替换的内容".into();
-            return;
-        }
-        // 先算差异，再统一提交：命中数与实改数可对账
-        let mut diffs: Vec<(usize, u32, u32, sheetcore::model::Cell)> = Vec::new();
-        let mut conflicts = 0;
-        let mut formula_skips = 0;
-        for h in hits {
-            let live = self.wb.sheet(h.sheet);
-            let prior = baseline.sheet(h.sheet);
-            let Some(cell) = live.get(h.row, h.col) else { conflicts += 1; continue };
-            let before = prior.get(h.row, h.col);
-            let changed = if self.find.in_formula {
-                before.and_then(|c| c.formula.as_ref()) != cell.formula.as_ref()
-            } else {
-                before != Some(cell) || self.wb.styles.get(live.style_of(h.row, h.col)).format
-                    != baseline.styles.get(prior.style_of(h.row, h.col)).format
-            };
-            if changed {
-                conflicts += 1;
-                continue;
-            }
-            if !self.find.in_formula && !self.find.replace_formula_results && cell.formula.is_some() {
-                formula_skips += 1;
-                continue;
-            }
-            if let Some(new_cell) = self.replacement_at(h.sheet, h.row, h.col, cell) {
-                diffs.push((h.sheet, h.row, h.col, new_cell));
-            }
-        }
-        if diffs.is_empty() {
-            self.status = if formula_skips > 0 {
-                format!(
-                    "找到 {} 处，其中 {} 处是公式结果（未替换；勾选“替换公式结果”或切到公式模式）",
-                    hits.len(),
-                    formula_skips
-                )
-            } else if conflicts != 0 {
-                format!("找到 {} 处，替换 0 处", hits.len())
-            } else {
-                format!("找到 {} 处，替换后没有变化", hits.len())
-            };
-            if conflicts != 0 { self.status.push_str(&format!("；跳过扫描后已更改的 {conflicts} 处")); }
-            return;
-        }
-        // 按表分组做保护/锁检查；任何一格不可写就整批拒绝
-        let mut groups: std::collections::BTreeMap<usize, Vec<(u32, u32)>> =
-            std::collections::BTreeMap::new();
-        for (si, r, c, _) in diffs.iter() {
-            groups.entry(*si).or_default().push((*r, *c));
-        }
-        for (si, keys) in groups.iter() {
-            let mut keys = keys.clone();
-            keys.sort_unstable();
-            keys.dedup();
-            if !self.write_preflight_on(*si, &keys, "全部替换") {
-                return;
-            }
-        }
-        // 多表单事务：逐表捕获，合并成一次撤销
-        let mut before: std::collections::BTreeMap<usize, Vec<sheetcore::undo::CellDelta>> =
-            std::collections::BTreeMap::new();
-        for (si, keys) in groups.iter() {
-            let mut keys = keys.clone();
-            keys.sort_unstable();
-            keys.dedup();
-            before.insert(*si, sheetcore::undo::capture(self.wb.sheet(*si), *si, &keys));
-        }
-        for (si, r, c, cell) in diffs.iter() {
-            self.wb.sheet_mut(*si).set(*r, *c, cell.clone());
-        }
-        let mut deltas: Vec<sheetcore::undo::CellDelta> = Vec::new();
-        for (si, caps) in before.into_iter() {
-            deltas.extend(sheetcore::undo::finish(caps, self.wb.sheet(si)));
-        }
-        if !deltas.is_empty() {
-            self.record_revision("全部替换", &deltas);
-            self.undo.push(sheetcore::undo::Action {
-                label: "全部替换".into(),
-                merges: None,
-                deltas,
-                focus: (diffs[0].0, diffs[0].1, diffs[0].2),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
-        }
-        let keys: Vec<(usize, u32, u32)> =
-            diffs.iter().map(|(si, r, c, _)| (*si, *r, *c)).collect();
-        self.recalc_and_broadcast(&keys);
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = if formula_skips > 0 {
-            format!(
-                "找到 {} 处，替换 {} 处，跳过 {} 处公式结果（可勾选“替换公式结果”）",
-                hits.len(),
-                diffs.len(),
-                formula_skips
-            )
-        } else if conflicts != 0 {
-            format!("找到 {} 处，替换 {} 处", hits.len(), diffs.len())
-        } else {
-            format!(
-                "找到 {} 处，替换 {} 处（{}）",
-                hits.len(),
-                diffs.len(),
-                if diffs.len() < hits.len() { "其余替换后无变化" } else { "全部成功" }
-            )
-        };
-        if conflicts != 0 { self.status.push_str(&format!("；跳过扫描后已更改的 {conflicts} 处")); }
-    }
-
     // ===== 工作表 =====
     fn can_change_sheets(&mut self) -> bool {
         if self.net.is_some() {
@@ -10828,8 +10687,45 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.finish_pending_edit()
     }
 
+    fn structural_updates(&self, sheet: usize, op: &sheetcore::structural::Structural) -> StructuralRecalc {
+        if !self.deps_built || self.deps_pending || self.tasks.recalc_pending() || self.wb.calc_pending
+            || self.deps.is_empty() && self.wb.sheets.iter().any(|s| s.has_formulas())
+            || !self.deps.supports_structural(&self.wb) {
+            return StructuralRecalc::Full;
+        }
+        match self.deps.structural_updates(&self.wb,sheet,op,2_000) {
+            Some(keys) => StructuralRecalc::Local(keys),
+            None if self.wb.calc_manual || self.manual_calc => StructuralRecalc::Full,
+            None => StructuralRecalc::Background(sheet,op.clone()),
+        }
+    }
+
+    fn recalc_after_structural(&mut self, updates: StructuralRecalc) {
+        let keys = match updates {
+            StructuralRecalc::Local(keys) => keys,
+            StructuralRecalc::Full => { self.recalc_all_and_deps_adaptive(); return; }
+            StructuralRecalc::Background(sheet, op) => {
+                self.request_silent_bg_recalc();
+                self.tasks.structural_recalc = Some((self.doc_gen,sheet,op,self.deps.clone()));
+                self.deps_built = false;
+                return;
+            }
+        };
+        if keys.is_empty() { return; }
+        for &key in &keys { self.update_dependency(key); }
+        if self.wb.calc_manual || self.manual_calc {
+            self.wb.calc_manual = true;
+            sheetcore::formula::mark_pending(&mut self.wb, &self.deps, &keys);
+        } else if self.wb.sheets.iter().map(|s| s.len()).sum::<usize>() <= 2_000 {
+            sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &keys);
+        } else {
+            self.tasks.dirty_recalc_seeds.extend(keys);
+        }
+    }
+
     /// Choosing synchronous or background recalculation only reads per-sheet counts.
     fn recalc_all_and_deps_adaptive(&mut self) {
+        self.tasks.structural_recalc = None;
         self.cancel_silent_recalc();
         self.bg_deps_rx = None;
         self.tasks.dirty_recalc_seeds.clear();
@@ -10844,7 +10740,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         if self.wb.sheets.iter().map(|sh| sh.len()).sum::<usize>() <= 2_000 {
             sheetcore::formula::recalc_all(&mut self.wb);
-            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
+            self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
             self.deps_built = true;
         } else if self.wb.calc_manual {
             sheetcore::formula::recalc_all(&mut self.wb); // Manual mode only marks sheets that contain formulas.
@@ -16827,6 +16723,42 @@ let txn = self.txn_begin(&keys);
         // 外部文本没有源坐标，公式只能按原文粘贴（不偏移）。
         // 关键：内部 Clip 不能遮盖后复制到系统剪贴板的新内容——与普通粘贴同一判定。
         let internal = self.internal_clip_for(ext_text.as_deref(), true);
+        if self.ps_kind == 5 {
+            let Some(clip) = internal else { self.status = "外部剪贴板不含源列宽信息".into(); return };
+            let (first_row, first_col, last_row, last_col) = clip.rect;
+            let source = if let Some(range) = &clip.deferred { range.book().sheet(0) }
+                else if let Some(sh) = self.wb.sheets.get(clip.sheet) { sh }
+                else { self.status = "找不到复制列宽的工作表".into(); return };
+            let height = clip.source_rows.as_ref().map_or(last_row - first_row + 1, |rows| rows.len() as u32);
+            let width = if self.ps_transpose { height } else { last_col - first_col + 1 };
+            if width == 0 || c0.saturating_add(width) > sheetcore::sync::MAX_COLS {
+                self.status = "选择性粘贴超出工作表行列边界".into(); return;
+            }
+            // Paste Widths changes the entire columns, independent of selected row
+            // count. Check column-format permission and all leases on these columns.
+            let widths: Vec<_> = (0..width).map(|j| source.cols.size(if self.ps_transpose { first_col } else { first_col+j })).collect();
+            let si = self.sheet_idx;
+            if !self.write_preflight_op(&[], "粘贴列宽", sheetcore::protection::ProtOp::FormatColumns) { return; }
+            let rect = (0,c0,sheetcore::sync::MAX_ROWS-1,c0+width-1);
+            let holder = self.net.as_ref().and_then(|n| n.host_lock_conflict_rect(si,rect))
+                .map(|(_,name,r,c)| (name,r,c)).or_else(|| {
+                    let site = self.net.as_ref().map_or(0, |n| n.site);
+                    self.locks.conflicts_rect(si,rect.0,rect.1,rect.2,rect.3,site,self.lock_now())
+                        .map(|((r,c),h)| (h.name.clone(),r,c))
+                });
+            if let Some((name,r,c)) = holder { self.status = format!("{name} 正在编辑 {}，不能粘贴列宽",cell_name(r,c)); return; }
+            let sh = self.wb.sheet_mut(si);
+            let prior_revision = sh.cols.revision();
+            sh.cols.set_many((c0..).zip(widths));
+            if prior_revision != sh.cols.revision() {
+                sh.layout_dirty = true;
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.tasks.last_edit = Some(std::time::Instant::now());
+            }
+            self.status = format!("已粘贴 {width} 列宽");
+            return;
+        }
         if internal.is_some_and(|clip| office_clipboard::delayed::is_full_columns(clip.rect)) {
             if self.ps_op == 0 && !self.ps_transpose && !self.ps_skip_blanks && matches!(self.ps_kind, 0 | 1) {
                 self.clip_paste(self.ps_kind == 1, ext_text);
@@ -16916,27 +16848,6 @@ let txn = self.txn_begin(&keys);
         }
         let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
         if !self.write_preflight(&keys, "选择性粘贴") {
-            return;
-        }
-        if self.ps_kind == 5 {
-            if let (Some(co), Some(ssi)) = (&coords, src_sheet_idx) {
-                if let Some(first_row) = co.first() {
-                    let widths: Vec<f32> = first_row
-                        .iter()
-                        .map(|&(_sr, sc)| self.wb.sheet(ssi).cols.size(sc))
-                        .collect();
-                    let sh = self.wb.sheet_mut(self.sheet_idx);
-                    for (j, w) in widths.iter().enumerate() {
-                        sh.cols.set(c0 + j as u32, *w);
-                    }
-                    sh.layout_dirty = true;
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.status = format!("已粘贴 {} 列宽", widths.len());
-                    return;
-                }
-            }
-            self.status = "外部剪贴板不含源列宽信息".into();
             return;
         }
         let txn = self.txn_begin(&keys);
@@ -18874,7 +18785,7 @@ let txn = self.txn_begin(&keys);
             return Err("选区内没有可分组的行".into());
         }
         sheetcore::formula::recalc_all(&mut self.wb);
-        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
+        self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
         let after = before.capture_after(&self.wb);
         self.undo.push_structure("分类汇总", before, after, (idx, self.sel.0, self.sel.1));
         self.wb.dirty = true;
@@ -21627,7 +21538,10 @@ let txn = self.txn_begin(&keys);
                         Align2::RIGHT_CENTER => rect.max.x - 6.0 - galley.size().x,
                         _ => rect.min.x + 6.0 + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
                     };
-                    let clipped = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+                    let fits = !dumping && !st.underline && !st.strikethrough &&
+                        rect.shrink(1.0).contains_rect(galley.mesh_bounds.translate(egui::vec2(x, top)));
+                    let clip = if fits { painter.clip_rect() } else { rect.intersect(painter.clip_rect()) };
+                    let clipped = painter.with_clip_rect(clip);
                     let uw = galley.size().x;
                     let uh = galley.size().y;
                     clipped.galley(egui::pos2(x, top), galley.clone(), color);
@@ -22906,6 +22820,7 @@ let txn = self.txn_begin(&keys);
         let saved_cf_gen = self.cf_stats_gen;
         let saved_cf_stats = std::mem::take(&mut self.cf_stats);
         let saved_cf_cache = self.cf_cache.take();
+        let saved_cf_inputs = std::mem::take(&mut self.cf_inputs);
         self.cf_stats_gen = u64::MAX;
         self.sheet_idx = cmp_sheet;
         self.scroll = cmp_scroll;
@@ -22925,6 +22840,7 @@ let txn = self.txn_begin(&keys);
         self.cf_stats_gen = saved_cf_gen;
         self.cf_stats = saved_cf_stats;
         self.cf_cache = saved_cf_cache;
+        self.cf_inputs = saved_cf_inputs;
         self.compare = Some(cmp);
     }
 
@@ -23063,6 +22979,7 @@ let txn = self.txn_begin(&keys);
                 return;
             }
         }
+        let updates = self.structural_updates(idx, &op);
         let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &op);
         let pending_pivots_before = self.wb.pivots_pending.len();
         sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
@@ -23072,7 +22989,7 @@ let txn = self.txn_begin(&keys);
         let after = before.capture_after(&self.wb);
         let label = op.label();
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
-        self.recalc_all_and_deps_adaptive();
+        self.recalc_after_structural(updates);
         self.shift_collab_coordinates(idx, &op);
         self.status = if self.net.is_some() {
             format!("{label}（已提交协作队列）")
@@ -27823,12 +27740,11 @@ let txn = self.txn_begin(&keys);
         // 告别原先每帧无条件硬算 200×60=12000 格公式造成的悬停/点击卡顿。
         let si = self.sheet_idx;
         if !self.wb.sheet(si).cf.blocks.is_empty() {
-            let want_cf_gen = self.doc_gen ^ ((si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            if self.cf_stats_gen != want_cf_gen {
+            if self.cf_inputs.refresh(self.wb.sheet(si), self.wb.date_system, (self.doc_gen, self.wb_epoch),
+                self.cf_stats_gen == u64::MAX, &mut self.cf_stats) {
                 self.cf_cache = None;
-                sheetcore::cf::refresh_stats(self.wb.sheet(si), &mut self.cf_stats);
-                self.cf_stats_gen = want_cf_gen;
             }
+            self.cf_stats_gen = self.cf_inputs.generation;
         }
         let intersects = |indices: &[u32], start, end| {
             indices.get(indices.partition_point(|&i| i < start)).is_some_and(|&i| i <= end)
@@ -27844,7 +27760,7 @@ let txn = self.txn_begin(&keys);
                 std::sync::Arc::new(std::collections::HashMap::new())
             } else {
                 let cf_key = (
-                    si, self.doc_gen, self.wb_epoch, first_row, body_rows.last().copied(), first_col, body_cols.last().copied(),
+                    si, self.cf_inputs.generation, self.wb.sheet(si).identity, first_row, body_rows.last().copied(), first_col, body_cols.last().copied(),
                     fy, fx, (rows.revision(), frozen_rows.last().copied()),
                     (cols.revision(), frozen_cols.last().copied()),
                 );
@@ -27854,7 +27770,7 @@ let txn = self.txn_begin(&keys);
                     // Keep exactly one viewport of results, including cells where
                     // no rule applied. A one-row scroll evaluates only the newly exposed strip.
                     let previous = self.cf_cache.take().filter(|(key, _, _)| {
-                        (key.0, key.1, key.2) == (si, self.doc_gen, self.wb_epoch)
+                        (key.0, key.1, key.2) == (si, self.cf_inputs.generation, self.wb.sheet(si).identity)
                             && key.9.0 == rows.revision() && key.10.0 == cols.revision()
                     });
                     let mut overlays = std::collections::HashMap::new();
@@ -27879,7 +27795,7 @@ let txn = self.txn_begin(&keys);
                         }
                         let rules = match &mut row_rules {
                             Some(rules) if rules.row == r => rules,
-                            slot => slot.insert(sheetcore::cf::RowRules::new(&sheet.cf, r)),
+                            slot => slot.insert(self.cf_inputs.index.row(&sheet.cf, r)),
                         };
                         let ov = rules.overlay_at(&self.cf_stats, sheet, c, |f, r0, c0| {
                             formulas.shifted(f, r0, c0).is_ok_and(|node| {
@@ -29050,7 +28966,8 @@ let txn = self.txn_begin(&keys);
 
         // 分页虚线（打印预览用）；页面布局/分页预览自己画页框
         if self.show_pages && !page_mode {
-            let (xs, ys) = sheetcore::page::page_breaks(self.wb.sheet(self.sheet_idx));
+            let lines = self.normal_page_breaks.get(self.wb.sheet(self.sheet_idx));
+            let (xs, ys) = lines.as_ref();
             let dash = Color32::from_rgb(120, 140, 180);
             let (r0, c0) = (first_row, first_col);
             let (pr1, pc1, pr2, pc2) = self
@@ -29736,7 +29653,7 @@ let txn = self.txn_begin(&keys);
                             );
                         }
                         sheetcore::formula::recalc_all(&mut self.wb);
-                        self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
+                        self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         self.wb.dirty = true;
                         self.status = if is_rows {
@@ -31210,14 +31127,14 @@ let txn = self.txn_begin(&keys);
         }
         if let Some(net) = &self.net {
             self.tasks.autosave_after_detach = if net.hosting {
-                (self.peers_list.len() > 1 && self.wb.dirty && !self.tasks.shared_autosave_paused).then_some(true)
+                (self.peers_list.len() > 1 && self.wb.dirty && self.tasks.shared_autosave.unwrap_or(self.autosave)).then_some(true)
             } else if self.guest_can_save_local_copy() {
                 None
             } else {
                 Some(false)
             };
         }
-        self.tasks.shared_autosave_paused = false;
+        self.tasks.shared_autosave = None;
         self.auto_probe = None;
         self.collab_ui_cache = None;
         self.release_lock();
@@ -31256,7 +31173,7 @@ let txn = self.txn_begin(&keys);
 
     fn demote_conflicting_host(&mut self, winner: &session_lock::LockInfo) {
         let can_auto_rejoin = self.auto_share && !self.wb.dirty;
-        self.tasks.shared_autosave_paused = false;
+        self.tasks.shared_autosave = None;
         self.auto_probe = None;
         self.collab_ui_cache = None;
         self.release_lock();
@@ -31311,7 +31228,7 @@ let txn = self.txn_begin(&keys);
     }
 
     fn leave_session_at(&mut self, source: Option<&std::path::Path>) {
-        self.tasks.shared_autosave_paused = false;
+        self.tasks.shared_autosave = None;
         self.auto_share = false;
         self.collab_ui_cache = None;
         self.auto_probe = None;
@@ -34357,13 +34274,14 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 crate::net::NetEvent::Structural { site, sheet, op } => {
                     if sheet < self.wb.sheets.len() {
+                        let updates = self.structural_updates(sheet, &op);
                         let label = op.label();
                         sheetcore::structural::apply_structural_wb(&mut self.wb, sheet, &op);
                         self.shift_collab_coordinates(sheet, &op);
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.recalc_all_and_deps_adaptive();
+                        self.recalc_after_structural(updates);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
                         let who = self.peer_display_name(site);
                         self.status = if site != 0 {
@@ -34588,7 +34506,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                             self.bg_deps_rx = None;
                         } else if total_cells <= 1_200 && total_formulas <= 600 {
                             sheetcore::formula::recalc_all(&mut self.wb);
-                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
+                            self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
                             self.deps_built = true;
                             self.bg_deps_rx = None;
                         } else {
@@ -34703,7 +34621,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 peer.apply_all_to_workbook(&mut self.wb);
                             }
                             sheetcore::formula::recalc_all(&mut self.wb);
-                            self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
+                            self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
                             self.doc_gen = self.doc_gen.wrapping_add(1);
                         }
                     } else if !touched.is_empty() {
@@ -35973,7 +35891,7 @@ impl eframe::App for SheetApp {
                 // 自动保存开关 + QAT（保存/撤销/重做）移入第 2 排
                 let shared_host = self.net.as_ref().is_some_and(|n| n.hosting) && self.peers_list.len() > 1;
                 let delegated = self.is_delegated_collab_client();
-                let pill_on = delegated || (!self.tasks.shared_autosave_paused && (self.autosave || shared_host));
+                let pill_on = delegated || self.tasks.shared_autosave.unwrap_or(self.autosave);
                 let (as_r, as_resp) = tab_ui.allocate_exact_size(Vec2::new(if full.width() >= 1120.0 { 78.0 } else { 34.0 }, 20.0), Sense::click());
                 let as_pill = Rect::from_min_size(egui::pos2(as_r.left(), as_r.center().y - 8.0), Vec2::new(28.0, 16.0));
                 tab_ui.painter().rect_filled(
@@ -36007,9 +35925,9 @@ impl eframe::App for SheetApp {
                 };
                 if as_resp.on_hover_text(hover_tip).clicked() && !delegated {
                     if shared_host {
-                        self.tasks.shared_autosave_paused = pill_on;
+                        self.tasks.shared_autosave = Some(!pill_on);
                     } else {
-                        self.tasks.shared_autosave_paused = false;
+                        self.tasks.shared_autosave = None;
                         self.autosave = !pill_on;
                         self.prefs.autosave = self.autosave;
                         self.prefs.save();
@@ -37577,7 +37495,7 @@ impl eframe::App for SheetApp {
         if let Some(probe) = self.frame_probe.as_mut() {
             if self.tasks.open_rx.is_some() && std::env::var_os("SC_FRAME_ALL").is_none() {
                 probe.previous_start = None;
-            } else if probe.sample(frame_start) {
+            } else if probe.sample(frame_start, _frame.info().cpu_usage) {
                 self.frame_probe = None;
                 if std::env::var_os("SC_FRAME_EXIT").is_some() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -37919,7 +37837,32 @@ fn family_named(key: &str) -> egui::FontFamily {
 }
 
 /// 单元格字体族：按 style.font 选内嵌 family，未知字体回退默认
-fn cell_family(name: &str) -> egui::FontFamily {
+fn resolved_family(name: &str, bold: bool) -> egui::FontFamily {
+    type Families = std::collections::HashMap<String, [Option<egui::FontFamily>; 2]>;
+    thread_local! { static CACHE: std::cell::RefCell<(u64, Families)> = Default::default(); }
+    CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let generation = system_fonts::generation();
+        if slot.0 != generation {
+            slot.0 = generation;
+            slot.1.clear();
+        }
+        let idx = usize::from(bold);
+        if let Some(family) = slot.1.get(name).and_then(|f| f[idx].as_ref()) { return family.clone(); }
+        let family = if bold && system_fonts::is_bold_loaded(name) {
+            family_named(&system_fonts::bold_family_key(name))
+        } else if bold {
+            family_named(&format!("{}-bold",sheetcore::style::font_class(name).key()))
+        } else { regular_family(name) };
+        if slot.1.len() >= 256 { slot.1.clear(); }
+        slot.1.entry(name.to_owned()).or_default()[idx] = Some(family.clone());
+        family
+    })
+}
+
+fn cell_family(name: &str) -> egui::FontFamily { resolved_family(name, false) }
+
+fn regular_family(name: &str) -> egui::FontFamily {
     // UI-14.1：工作簿用到且本机装了的字体走真实字形，否则按四族回退。
     static FONT_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *FONT_LOG.get_or_init(|| std::env::var_os("SC_FONT_LOG").is_some()) {
@@ -37945,13 +37888,7 @@ fn cell_family(name: &str) -> egui::FontFamily {
 /// 优先级与用户口径一致：系统有真 bold → 用它；系统根本没这个字体 → 内嵌 700 字面；
 /// 系统只有常规字面 → 同族 + 合成加粗（Excel 对宋体/黑体也是这么干的）。
 fn bold_font(name: &str, size: f32) -> (egui::FontFamily, f32, bool) {
-    if system_fonts::is_bold_loaded(name) {
-        return (family_named(&system_fonts::bold_family_key(name)), size, false);
-    }
-    // 没有真 bold 字面时一律用内嵌 700 字面（宋体/黑体也一样）：
-    // 不把常规字面放大冒充，也不依赖 egui 并不提供的合成加粗。
-    let class = sheetcore::style::font_class(name).key();
-    (family_named(&format!("{class}-bold")), size, false)
+    (resolved_family(name, true), size, false)
 }
 
 

@@ -115,12 +115,47 @@ impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq for CellMetadata<K, V> {
     fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0 }
 }
 
+/// Save receipts, background jobs and undo snapshots share the edit journals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellJournal(std::sync::Arc<std::collections::HashSet<CellRef>>);
+
+impl<const N: usize> From<[CellRef; N]> for CellJournal {
+    fn from(keys: [CellRef; N]) -> Self { Self(std::sync::Arc::new(keys.into())) }
+}
+
+impl std::ops::Deref for CellJournal {
+    type Target = std::collections::HashSet<CellRef>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::DerefMut for CellJournal {
+    fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
+}
+
+impl CellJournal {
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) { unique.clear(); }
+        else { *self = Self::default(); }
+    }
+    fn remove_if_present(&mut self, key: &CellRef) {
+        if self.contains(key) { self.remove(key); }
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a CellMetadata<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::hash_map::Iter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
+}
+
 #[derive(Clone, Debug)]
 pub struct Sheet {
     pub name: String,
     /// Runtime identity survives snapshots, renames and reordering. Save
     /// acknowledgements must never identify a sheet by its current index/name.
     pub identity: u64,
+    /// Immutable exact-match indexes shared by calculation snapshots of this sheet.
+    pub(crate) shared_lookup: crate::formula::lookup_cache::SharedLookup,
     /// Stable worksheet part in the loaded OOXML package. Renaming/reordering a
     /// sheet must retain its original relationships and other unmodeled content.
     /// A duplicated/new sheet has no source part.
@@ -135,7 +170,7 @@ pub struct Sheet {
     display_style_revision: u64,
     coordinate_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
-    pub cleared: std::collections::HashSet<CellRef>,
+    pub cleared: CellJournal,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
     pub spilled: std::collections::HashSet<CellRef>,
     /// 动态数组锚点 → 本次重算写回的精确形状 (rows, cols)。1×1 也记录；
@@ -164,11 +199,11 @@ pub struct Sheet {
     /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
     pub styles: crate::store::CellStyles,
     /// 整列默认样式（列号 -> 样式表索引，稀疏）
-    pub col_styles: HashMap<u32, u16>,
+    pub col_styles: CellMetadata<u32, u16>,
     /// 整行默认样式（行号 -> 样式表索引，稀疏）
-    pub row_styles: HashMap<u32, u16>,
+    pub row_styles: CellMetadata<u32, u16>,
     /// 用户改过样式的格子（保存时只需要回写这些，不必重写整表样式）
-    pub style_edits: std::collections::HashSet<CellRef>,
+    pub style_edits: CellJournal,
     /// 整列样式被改过
     pub col_styles_dirty: bool,
     /// 整行样式被改过
@@ -263,13 +298,14 @@ impl Sheet {
         Self {
             name: name.into(),
             identity: next_sheet_identity(),
+            shared_lookup: Default::default(),
             source_part: None,
             cells: Store::default(),
             saved_cells: None,
             source_cells: None,
             display_style_revision: 0,
             coordinate_revision: 0,
-            cleared: std::collections::HashSet::new(),
+            cleared: CellJournal::default(),
             spilled: std::collections::HashSet::new(),
             spill_shapes: std::collections::HashMap::new(),
             arrays: Vec::new(),
@@ -283,9 +319,9 @@ impl Sheet {
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
             styles: crate::store::CellStyles::default(),
-            col_styles: HashMap::new(),
-            row_styles: HashMap::new(),
-            style_edits: std::collections::HashSet::new(),
+            col_styles: Default::default(),
+            row_styles: Default::default(),
+            style_edits: CellJournal::default(),
             col_styles_dirty: false,
             row_styles_dirty: false,
             merges_dirty: false,
@@ -391,7 +427,7 @@ impl Sheet {
             }
             return;
         }
-        self.cleared.remove(&key);
+        self.cleared.remove_if_present(&key);
         self.cells.set(r, c, cell);
     }
 
@@ -521,6 +557,7 @@ impl Sheet {
     pub fn search_snapshot(&self) -> Self {
         let mut snapshot = Self::new(&self.name);
         snapshot.cells = self.cells.clone();
+        snapshot.display_style_revision = self.display_style_revision;
         snapshot.styles = self.styles.clone();
         snapshot.row_styles = self.row_styles.clone();
         snapshot.col_styles = self.col_styles.clone();
@@ -561,6 +598,45 @@ impl Sheet {
             && self.name == source.name && self.styles == source.styles
             && self.row_styles == source.row_styles && self.col_styles == source.col_styles
             && self.merges == source.merges && self.arrays == source.arrays && self.spilled == source.spilled
+    }
+
+    /// Merge concurrent edits into staged replacement pages. Changed target values
+    /// survive and are excluded from the undo/broadcast transaction. A whole-row
+    /// format change or a large intervening edit is cheaper to restage off-thread.
+    pub fn rebase_replacement(&self, before: &Sheet, result: &mut Sheet,
+        targets: &[(u32, u32)], value_mode: bool, live_styles: &crate::style::StyleTable,
+        old_styles: &crate::style::StyleTable) -> Option<Vec<(u32,u32)>> {
+        let hit = |k: CellRef| targets.binary_search(&(k.row, k.col)).is_ok();
+        let mut conflicts = Vec::new();
+        if value_mode && self.display_style_revision != before.display_style_revision {
+            if self.row_styles != before.row_styles || self.col_styles != before.col_styles { return None; }
+            for k in self.styles.changed_keys(&before.styles).chain(before.styles.changed_keys(&self.styles)) {
+                if hit(k) && live_styles.get(self.style_of(k.row,k.col)).format != old_styles.get(before.style_of(k.row,k.col)).format {
+                    conflicts.push((k.row,k.col));
+                    result.set(k.row,k.col,self.get(k.row,k.col).cloned().unwrap_or_default());
+                }
+            }
+        }
+        if self.cell_version() != before.cell_version() {
+            let changes = self.changed_cells(before).chain(before.changed_cells(self)
+                .filter(|k| self.get(k.row, k.col).is_none()));
+            for (n, k) in changes.enumerate() {
+                if n >= 4096 { return None; }
+                if hit(k) {
+                    // A changed formula cache is still the same formula-mode hit. Restage
+                    // to capture its new cached value in both sides of the undo record.
+                    if !value_mode && self.get(k.row,k.col).and_then(|cell| cell.formula.as_ref())
+                        == before.get(k.row,k.col).and_then(|cell| cell.formula.as_ref()) { return None; }
+                    conflicts.push((k.row,k.col));
+                }
+                result.set(k.row, k.col, self.get(k.row, k.col).cloned().unwrap_or_default());
+            }
+        }
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        result.spilled = self.spilled.iter().copied().filter(|k|
+            !hit(*k) || conflicts.binary_search(&(k.row,k.col)).is_ok()).collect();
+        Some(conflicts)
     }
 
     /// Install a validated reorder and merge just the worker's new edits into
@@ -793,6 +869,10 @@ impl Sheet {
     }
 
     /// 存储层实际占用字节（调试用）
+    pub(crate) fn pair_allocated_bytes(&self, other: &Sheet) -> usize {
+        self.cells.pair_allocated_bytes(&other.cells)
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         self.cells.allocated_bytes()
     }

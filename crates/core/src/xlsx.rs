@@ -394,12 +394,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
     //（我们自己写出的容器就属于后一种）。
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
-    let package_stamp = is_ooxml.then(|| sheets::package_stamp(path)).transpose()?;
-    let mut shared_zip = if is_ooxml {
-        Some(zip::ZipArchive::new(std::fs::File::open(path)?)?)
-    } else {
-        None
-    };
+    let (mut shared_zip, package_stamp) = is_ooxml.then(|| sheets::open_stamped(path)).transpose()?.unzip();
     let sheets::WorkbookMetadata { xml: workbook_xml, targets, header } = shared_zip.as_mut()
         .map(sheets::workbook_metadata).transpose()
         .with_context(|| format!("无法打开 {} 的工作簿元数据和样式", path.display()))?
@@ -910,7 +905,7 @@ struct SavedSheet {
     part: String,
     cells: crate::store::CellVersion,
     source_cells: Option<SourceCells>,
-    cleared: std::collections::HashSet<crate::model::CellRef>,
+    cleared: crate::model::CellJournal,
 }
 
 #[derive(Debug)]
@@ -1004,8 +999,9 @@ struct CellWrite {
 }
 
 fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveReceipt> {
-    let targets = crate::patch::sheet_targets(path).context("读取已保存的工作表身份失败")?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let targets = crate::patch::sheet_targets_xml(Some(&read_zip_text(&mut zip, "xl/workbook.xml")?),
+        Some(&read_zip_text(&mut zip, "xl/_rels/workbook.xml.rels")?));
     let unstyled_map = std::cell::OnceCell::new();
     let sheets = wb.sheets.iter().map(|sheet| {
         let part = targets.get(&sheet.name)
@@ -1054,16 +1050,14 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
 /// 覆盖：ZIP 能打开、每个条目 CRC 读通、必需部件齐全、[Content_Types].xml 声明的部件全在、
 /// workbook.xml.rels 里的工作表目标全在、这几个关键 XML 良构。XLS 走对应的 CFB 读取路径。
 pub fn verify_saved_package(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek};
     // 不能靠扩展名判断类型：调用方传进来的常常是临时文件（.~a.xls.saving-1234），
     // 它的扩展名是 saving-1234。按文件头判断才可靠。
     let mut head = [0u8; 8];
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
-        let n = f.read(&mut head).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
-        if n < 8 {
-            anyhow::bail!("保存产物只有 {n} 字节，明显被截断");
-        }
+    let mut file = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+    let n = file.read(&mut head).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
+    if n < 8 {
+        anyhow::bail!("保存产物只有 {n} 字节，明显被截断");
     }
     let is_zip = head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08");
     let is_cfb = head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -1089,7 +1083,7 @@ pub fn verify_saved_package(path: &Path) -> Result<()> {
     if !is_zip {
         anyhow::bail!("保存产物开头不是 ZIP/CFB 签名，格式无法识别");
     }
-    let file = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+    file.rewind()?;
     let mut zip = zip::ZipArchive::new(file).context("保存产物不是有效的 ZIP（中央目录缺失或文件被截断）")?;
     const CRITICAL_XML: [&str; 4] = ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"];
     let mut critical = std::collections::HashMap::new();
@@ -2054,7 +2048,8 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         && wb.links.is_empty() && wb.pivots_pending.is_empty() && wb.pivots_pending2.is_empty()
         && wb.pivot_calc_fields.is_empty();
     let streamed: Vec<_> = wb.sheets.iter()
-        .map(|s| fresh_streaming && s.source_part.is_none() && fresh::supported(s))
+        .map(|s| fresh_streaming && s.source_part.is_none() && fresh::supported(s)
+            && !s.row_styles.values().chain(s.col_styles.values()).any(|&id| wb.styles.quote_of(id)))
         .collect();
     // A fresh umya sheet has no previous user metadata to remove. Rebuild all
     // populated features (including unedited rescue data) and keep our page defaults.
@@ -2200,6 +2195,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             let style_targets: Vec<(u32, u32)> = if fresh_base {
                 // 从样式表枚举：空白但有填充/边框的格不在 sheet.iter() 里，漏了就丢格式；
                 // 同时保留对整行/整列样式的显式默认(0)覆盖
+                let mut examples = std::collections::HashSet::new();
                 sheet
                     .styles
                     .iter()
@@ -2208,6 +2204,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                             || sheet.row_styles.contains_key(&c.row)
                             || sheet.col_styles.contains_key(&c.col)
                     })
+                    // The streamed values need only one raw XF example per model style.
+                    // Style-only blanks must still appear at their original coordinates.
+                    .filter(|(c, id)| !streamed[idx] || !sheet.contains(c.row, c.col) || examples.insert(**id))
                     .map(|(c, _)| (c.row, c.col))
                     .collect()
             } else {
@@ -2217,6 +2216,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 let sid = sheet.style_of(row, col);
                 let cell = ws.get_cell_mut((col + 1, row + 1));
                 write_umya_style(wb, sid, cell.get_style_mut());
+                if streamed[idx] && sheet.contains(row, col) { cell.set_value_number(0.0); }
             }
             if fresh_base || sheet.row_styles_dirty || sheet.styles_dirty {
                 for (&r, &sid) in &sheet.row_styles {
@@ -2555,7 +2555,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         );
     }
     // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
-    if !can_bypass_umya {
+    if !can_bypass_umya && (0..wb.styles.len()).any(|i| wb.styles.quote_of(i as u16)) {
         let live_targets = crate::patch::sheet_targets(path).unwrap_or_default();
         let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb
             .sheets
@@ -2573,11 +2573,14 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     .get(&sh.name)
                     .cloned()
                     .or_else(|| sh.source_part.clone())?;
-                let cells: Vec<(u32, u32)> = sh
+                let mut cells: Vec<(u32, u32)> = sh
                     .iter()
                     .filter(|(r, _)| wb.styles.quote_of(sh.style_of(r.row, r.col)))
                     .map(|(r, _)| (r.row, r.col))
                     .collect();
+                cells.extend(sh.styles.iter().filter_map(|(pos, &id)| {
+                    (wb.styles.quote_of(id) && !sh.contains(pos.row, pos.col)).then_some((pos.row, pos.col))
+                }));
                 if cells.is_empty() {
                     None
                 } else {

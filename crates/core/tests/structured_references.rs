@@ -60,7 +60,7 @@ fn audit_two_row_samples_calculate_as_excel() {
     match eval_formula(&wb, 0, "=Sales[Amount]") {
         FValue::Array(a) => {
             assert_eq!((a.rows, a.cols), (2, 1));
-            assert_eq!(a.data, vec![FValue::Number(10.0), FValue::Number(20.0)]);
+            assert_eq!(a.data.as_slice(), &[FValue::Number(10.0), FValue::Number(20.0)]);
         }
         other => panic!("expected 2x1 array, got {other:?}"),
     }

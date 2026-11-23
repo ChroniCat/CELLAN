@@ -677,6 +677,19 @@ impl Store {
         n
     }
 
+    /// Count both page directories, but charge the cell buffer only once when
+    /// a structural edit preserves or moves its Arc to another row or column.
+    pub(crate) fn pair_allocated_bytes(&self, other: &Self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        self.pages.values().chain(other.pages.values()).map(|page| {
+            let directory = std::mem::size_of::<Page>() +
+                page.cols.capacity() * std::mem::size_of::<std::sync::Arc<Vec<Cell>>>();
+            directory + page.cols.iter().filter(|col| seen.insert(std::sync::Arc::as_ptr(col)))
+                .map(|col| std::mem::size_of::<Vec<Cell>>() + col.capacity()*std::mem::size_of::<Cell>())
+                .sum::<usize>()
+        }).sum()
+    }
+
     /// 稀疏保护：某页实际使用的格子占比过低时报告出来（调参用）
     pub fn dense_stats(&self) -> (usize, usize) {
         let mut used = 0usize;
