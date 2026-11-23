@@ -103,6 +103,31 @@ impl Block {
     }
 }
 
+/// 稀疏 XML Spreadsheet 单元格（保留原始 R1C1 公式以便按目标粘贴锚点 `(r0 + row, c0 + col)` 精算 A1 引用）。
+#[derive(Clone, Debug, Default)]
+pub struct SparseCell {
+    pub row: u32,
+    pub col: u32,
+    pub text: String,
+    pub kind: Kind,
+    pub r1c1_formula: Option<String>,
+    pub style_idx: u32,
+    pub has_explicit_style: bool,
+    pub colspan: u32,
+    pub rowspan: u32,
+}
+
+/// 支持百万行整列（`ExpandedRowCount="1048576"`）与超 50 万格大选区的稀疏 XML Spreadsheet 块。
+#[derive(Clone, Debug, Default)]
+pub struct SparseBlock {
+    pub rows: u32,
+    pub cols: u32,
+    pub full_columns: bool,
+    pub date1904: bool,
+    pub styles: Vec<Style>,
+    pub cells: Vec<SparseCell>,
+}
+
 /// Bound allocations by the actual addressed rectangle. Rejecting an oversized
 /// block must never change an ss:Index into a different address.
 #[derive(Default)]
@@ -442,6 +467,323 @@ pub fn parse(xml: &str) -> Block {
         })
         .collect();
     Block { rows }
+}
+
+/// 稀疏解析 XML Spreadsheet：允许 `rows <= 1_048_576`、`cols <= 16_384`（含外部 Excel / 跨实例整列与超 50 万格稀疏区域），
+/// 严格校验 `ss:Index` 单调不回退且不越界，并限制实际显式非空/带样式/合并单元格总数 `<= MAX_DENSE_RECT_KEYS`。
+pub fn parse_sparse(xml: &str) -> Option<SparseBlock> {
+    const MAX_R: usize = 1_048_576;
+    const MAX_C: usize = 16_384;
+
+    let mut styles: Vec<Style> = vec![Style::default()];
+    let mut style_lookup: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut col_styles: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut cells: Vec<SparseCell> = Vec::new();
+
+    let mut r = Reader::from_str(xml);
+    r.config_mut().trim_text(false);
+
+    let mut style_id = String::new();
+    let mut cur_style = Style::default();
+    let mut in_style = false;
+
+    let mut saw_table = false;
+    let mut full_columns = false;
+    let mut date1904 = false;
+    let mut max_rows = 0usize;
+    let mut max_cols = 0usize;
+    let mut col_cursor = 0usize;
+    let mut row_cursor = 0usize;
+    let mut row_index = 0usize;
+    let mut row_span = 1usize;
+    let mut row_style_idx: Option<u32> = None;
+    let mut next_col = 0usize;
+
+    let mut cur: Option<(SparseCell, bool)> = None;
+    let mut data_type = Kind::Number;
+    let mut in_data = false;
+    let mut text = String::new();
+
+    let include_bounds = |rows: usize, cols: usize, mr: &mut usize, mc: &mut usize| -> Option<()> {
+        *mr = (*mr).max(rows);
+        *mc = (*mc).max(cols);
+        (*mr <= MAX_R && *mc <= MAX_C).then_some(())
+    };
+
+    let parse_sparse_cell = |e: &quick_xml::events::BytesStart<'_>,
+                             r_idx: usize,
+                             next_col: &mut usize,
+                             mr: &mut usize,
+                             mc: &mut usize,
+                             row_sty: Option<u32>,
+                             col_styles: &std::collections::HashMap<u32, u32>,
+                             style_lookup: &std::collections::HashMap<String, u32>|
+     -> Option<SparseCell> {
+        let col = index_attr(e, b"Index", *next_col + 1)?.checked_sub(1)?;
+        let across = index_attr(e, b"MergeAcross", 0)?.checked_add(1)?;
+        let down = index_attr(e, b"MergeDown", 0)?.checked_add(1)?;
+        if col < *next_col {
+            return None;
+        }
+        include_bounds(r_idx.checked_add(down)?, col.checked_add(across)?, mr, mc)?;
+        *next_col = col + across;
+        let raw_style = attr_cow(e, b"StyleID");
+        let has_explicit_style = raw_style.is_some();
+        let style_idx = raw_style
+            .and_then(|id| style_lookup.get(id.as_ref()).copied())
+            .or(row_sty)
+            .or_else(|| col_styles.get(&(col as u32)).copied())
+            .unwrap_or(0);
+        Some(SparseCell {
+            row: r_idx as u32,
+            col: col as u32,
+            r1c1_formula: attr_cow(e, b"Formula").map(|f| f.into_owned()),
+            style_idx,
+            has_explicit_style: has_explicit_style || style_idx != 0,
+            colspan: across as u32,
+            rowspan: down as u32,
+            ..Default::default()
+        })
+    };
+
+    let push_if_meaningful = |cells: &mut Vec<SparseCell>, cell: SparseCell, had_data: bool| -> Option<()> {
+        let meaningful = had_data
+            || !cell.text.is_empty()
+            || cell.r1c1_formula.is_some()
+            || cell.has_explicit_style
+            || cell.colspan > 1
+            || cell.rowspan > 1;
+        if meaningful {
+            if cells.len() >= crate::undo::MAX_DENSE_RECT_KEYS {
+                return None;
+            }
+            cells.push(cell);
+        }
+        Some(())
+    };
+
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                match n {
+                    b"Date1904" => date1904 = true,
+                    b"Style" => {
+                        in_style = true;
+                        style_id = attr_cow(&e, b"ID").map(|c| c.into_owned()).unwrap_or_default();
+                        cur_style = Style::default();
+                    }
+                    b"Font" | b"Interior" | b"Border" | b"NumberFormat" | b"Alignment" if in_style => {
+                        apply_style_tag(n, &e, &mut cur_style);
+                    }
+                    b"Table" => {
+                        saw_table = true;
+                        let dims = index_attr(&e, b"ExpandedRowCount", 0)
+                            .zip(index_attr(&e, b"ExpandedColumnCount", 0));
+                        let (er, ec) = dims?;
+                        include_bounds(er, ec, &mut max_rows, &mut max_cols)?;
+                        if attr_cow(&e, b"FullColumns").as_deref() == Some("1") || er == MAX_R {
+                            full_columns = true;
+                        }
+                    }
+                    b"Column" => {
+                        let c_idx = index_attr(&e, b"Index", col_cursor + 1)?.checked_sub(1)?;
+                        let c_span = index_attr(&e, b"Span", 0)?.checked_add(1)?;
+                        if c_idx < col_cursor {
+                            return None;
+                        }
+                        include_bounds(0, c_idx.checked_add(c_span)?, &mut max_rows, &mut max_cols)?;
+                        if let Some(sid) = attr_cow(&e, b"StyleID").and_then(|id| style_lookup.get(id.as_ref()).copied()) {
+                            if sid != 0 {
+                                for cc in c_idx..(c_idx + c_span) {
+                                    col_styles.insert(cc as u32, sid);
+                                }
+                            }
+                        }
+                        col_cursor = c_idx + c_span;
+                    }
+                    b"Row" => {
+                        let ri = index_attr(&e, b"Index", row_cursor + 1)?.checked_sub(1)?;
+                        let span = index_attr(&e, b"Span", 0)?.checked_add(1)?;
+                        if ri < row_cursor {
+                            return None;
+                        }
+                        include_bounds(ri.checked_add(span)?, 1, &mut max_rows, &mut max_cols)?;
+                        row_index = ri;
+                        row_span = span;
+                        row_style_idx = attr_cow(&e, b"StyleID")
+                            .and_then(|id| style_lookup.get(id.as_ref()).copied())
+                            .filter(|&id| id != 0);
+                        next_col = 0;
+                    }
+                    b"Cell" => {
+                        let cell = parse_sparse_cell(
+                            &e,
+                            row_index,
+                            &mut next_col,
+                            &mut max_rows,
+                            &mut max_cols,
+                            row_style_idx,
+                            &col_styles,
+                            &style_lookup,
+                        )?;
+                        cur = Some((cell, false));
+                    }
+                    b"Data" => {
+                        data_type = match attr_cow(&e, b"Type").as_deref() {
+                            Some("String") => Kind::Text,
+                            Some("Boolean") => Kind::Bool,
+                            Some("DateTime") => Kind::DateTime,
+                            Some("Error") => Kind::Error,
+                            _ => Kind::Number,
+                        };
+                        in_data = true;
+                        text.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                if in_style {
+                    apply_style_tag(n, &e, &mut cur_style);
+                } else {
+                    match n {
+                        b"Date1904" => date1904 = true,
+                        b"Table" => {
+                            saw_table = true;
+                            let (er, ec) = index_attr(&e, b"ExpandedRowCount", 0)
+                                .zip(index_attr(&e, b"ExpandedColumnCount", 0))?;
+                            include_bounds(er, ec, &mut max_rows, &mut max_cols)?;
+                            if attr_cow(&e, b"FullColumns").as_deref() == Some("1") || er == MAX_R {
+                                full_columns = true;
+                            }
+                        }
+                        b"Column" => {
+                            let c_idx = index_attr(&e, b"Index", col_cursor + 1)?.checked_sub(1)?;
+                            let c_span = index_attr(&e, b"Span", 0)?.checked_add(1)?;
+                            if c_idx < col_cursor {
+                                return None;
+                            }
+                            include_bounds(0, c_idx.checked_add(c_span)?, &mut max_rows, &mut max_cols)?;
+                            if let Some(sid) = attr_cow(&e, b"StyleID").and_then(|id| style_lookup.get(id.as_ref()).copied()) {
+                                if sid != 0 {
+                                    for cc in c_idx..(c_idx + c_span) {
+                                        col_styles.insert(cc as u32, sid);
+                                    }
+                                }
+                            }
+                            col_cursor = c_idx + c_span;
+                        }
+                        b"Row" => {
+                            let ri = index_attr(&e, b"Index", row_cursor + 1)?.checked_sub(1)?;
+                            let span = index_attr(&e, b"Span", 0)?.checked_add(1)?;
+                            if ri < row_cursor {
+                                return None;
+                            }
+                            include_bounds(ri.checked_add(span)?, 1, &mut max_rows, &mut max_cols)?;
+                            row_cursor = ri + span;
+                        }
+                        b"Cell" => {
+                            let cell = parse_sparse_cell(
+                                &e,
+                                row_index,
+                                &mut next_col,
+                                &mut max_rows,
+                                &mut max_cols,
+                                row_style_idx,
+                                &col_styles,
+                                &style_lookup,
+                            )?;
+                            push_if_meaningful(&mut cells, cell, false)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(r_ref)) => {
+                if in_data {
+                    if let Ok(Some(ch)) = r_ref.resolve_char_ref() {
+                        text.push(ch);
+                    } else {
+                        match r_ref.as_ref() {
+                            "amp" => text.push('&'),
+                            "lt" => text.push('<'),
+                            "gt" => text.push('>'),
+                            "quot" => text.push('"'),
+                            "apos" => text.push('\''),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_data {
+                    let raw = t.as_ref();
+                    if raw.contains('&') {
+                        match quick_xml::escape::unescape(raw) {
+                            Ok(c) => text.push_str(&c),
+                            Err(_) => text.push_str(raw),
+                        }
+                    } else {
+                        text.push_str(raw);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                match n {
+                    b"Style" => {
+                        in_style = false;
+                        if cur_style == Style::default() {
+                            style_lookup.insert(std::mem::take(&mut style_id), 0);
+                        } else {
+                            let idx = styles.len() as u32;
+                            styles.push(std::mem::take(&mut cur_style));
+                            style_lookup.insert(std::mem::take(&mut style_id), idx);
+                        }
+                    }
+                    b"Data" => {
+                        in_data = false;
+                        if let Some((c, had_data)) = cur.as_mut() {
+                            c.text = std::mem::take(&mut text);
+                            c.kind = data_type;
+                            *had_data = true;
+                        }
+                    }
+                    b"Cell" => {
+                        if let Some((c, had_data)) = cur.take() {
+                            push_if_meaningful(&mut cells, c, had_data)?;
+                        }
+                    }
+                    b"Row" => {
+                        row_cursor = row_index + row_span;
+                        row_style_idx = None;
+                    }
+                    b"Worksheet" => break,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    if !saw_table || max_rows == 0 || max_cols == 0 {
+        return None;
+    }
+    Some(SparseBlock {
+        rows: max_rows as u32,
+        cols: max_cols as u32,
+        full_columns,
+        date1904,
+        styles,
+        cells,
+    })
 }
 
 fn hex_rgb(s: &str) -> Option<[u8; 3]> {
@@ -824,5 +1166,47 @@ mod tests {
         // 字符串里的 A1 不动；A1:B2 两个端点都转
         assert_eq!(a1_to_r1c1("=\"A1\"&A1", 0, 0), "=\"A1\"&RC");
         assert_eq!(a1_to_r1c1("=A1:B2", 0, 0), "=RC:R[1]C[1]");
+    }
+
+    #[test]
+    fn parse_sparse_handles_full_columns_and_million_cell_sparse_blocks() {
+        let mut wb = crate::model::Workbook::new_blank();
+        let bold = wb.styles.intern(crate::style::CellStyle {
+            bold: true,
+            fill: Some([255, 255, 0]),
+            ..Default::default()
+        });
+        let sh = &mut wb.sheets[0];
+        sh.set(0, 0, crate::model::Cell {
+            value: crate::model::Value::Number(10.0),
+            formula: None,
+        });
+        sh.set_style(0, 0, bold);
+        sh.set(900_000, 1, crate::model::Cell {
+            value: crate::model::Value::Number(20.0),
+            formula: Some("=A$1*2".into()),
+        });
+        let xml = sparse_column_xmlss(&wb, 0, (0, 0, 1_048_575, 2)).unwrap();
+        // Dense `parse` still rejects >500k extent per existing contract
+        assert!(parse(&xml).is_empty());
+        // Sparse `parse_sparse` parses full-column XMLSS without dense allocation
+        let sp = parse_sparse(&xml).expect("parse_sparse should accept 1,048,576-row full columns");
+        assert_eq!(sp.rows, 1_048_576);
+        assert_eq!(sp.cols, 3);
+        assert!(sp.full_columns);
+        assert_eq!(sp.cells.len(), 2);
+        assert_eq!((sp.cells[0].row, sp.cells[0].col), (0, 0));
+        assert!(sp.styles[sp.cells[0].style_idx as usize].bold);
+        assert_eq!((sp.cells[1].row, sp.cells[1].col), (900_000, 1));
+        assert_eq!(sp.cells[1].r1c1_formula.as_deref(), Some("=R1C[-1]*2"));
+
+        // Invalid / backward / out-of-bounds indices are still strictly rejected
+        for bad in [
+            "<Workbook xmlns:ss='urn:schemas-microsoft-com:office:spreadsheet'><Worksheet><Table><Row ss:Index='1048577'><Cell/></Row></Table></Worksheet></Workbook>",
+            "<Workbook xmlns:ss='urn:schemas-microsoft-com:office:spreadsheet'><Worksheet><Table><Row><Cell ss:Index='16385'/></Row></Table></Worksheet></Workbook>",
+            "<Workbook xmlns:ss='urn:schemas-microsoft-com:office:spreadsheet'><Worksheet><Table><Row ss:Index='5'><Cell/></Row><Row ss:Index='3'><Cell/></Row></Table></Worksheet></Workbook>",
+        ] {
+            assert!(parse_sparse(bad).is_none(), "should reject {bad}");
+        }
     }
 }

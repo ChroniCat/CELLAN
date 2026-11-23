@@ -178,6 +178,26 @@ pub fn has_rich_table_format() -> bool {
     }
 }
 
+/// 读取超 50 万格或外部 Excel 整列（`ExpandedRowCount="1048576"`）的稀疏 XML Spreadsheet。
+pub fn read_sparse_xmlss() -> Option<sheetcore::clipboard_xmlss::SparseBlock> {
+    #[cfg(test)]
+    {
+        return None;
+    }
+    #[cfg(not(test))]
+    unsafe {
+        let name = wide("XML Spreadsheet");
+        let fmt = RegisterClipboardFormatW(name.as_ptr());
+        if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
+            return None;
+        }
+        let raw = read_format_raw(fmt)?;
+        let text = String::from_utf8_lossy(&raw);
+        let xml = text.trim_end_matches('\0');
+        sheetcore::clipboard_xmlss::parse_sparse(xml)
+    }
+}
+
 /// 从系统剪贴板读 Excel 区域。
 ///
 /// 优先 **XML Spreadsheet**：它带公式（R1C1）、值类型、字体名/字号/数字格式；
@@ -785,7 +805,18 @@ fn write_office_clipboard_native(xmlss: &str, html: &str, text: &str) -> bool {
 
 /// 把选区写成 XML Spreadsheet 文本（公式转 R1C1，日期写 DateTime，文本保前导零）。
 pub fn selection_xmlss(wb: &sheetcore::Workbook, si: usize, rect: (u32, u32, u32, u32)) -> String {
-    build_xmlss(wb, si, rect, &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
+    build_xmlss_rows(wb, si, rect, None, &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
+        st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format))
+}
+
+/// 把筛选态可见行压紧写成稀疏 XML Spreadsheet 文本（保留公式、样式、数字格式与前导零）。
+pub fn selection_xmlss_filtered(
+    wb: &sheetcore::Workbook,
+    si: usize,
+    rect: (u32, u32, u32, u32),
+    visible_rows: &[u32],
+) -> String {
+    build_xmlss_rows(wb, si, rect, Some(visible_rows), &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
         st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format))
 }
 
@@ -797,19 +828,32 @@ pub fn build_xmlss(
     rect: (u32, u32, u32, u32),
     style_key: &dyn Fn(&sheetcore::style::CellStyle) -> String,
 ) -> String {
-    use std::collections::BTreeMap;
+    build_xmlss_rows(wb, si, rect, None, style_key)
+}
+
+pub fn build_xmlss_rows(
+    wb: &sheetcore::Workbook,
+    si: usize,
+    rect: (u32, u32, u32, u32),
+    visible_rows: Option<&[u32]>,
+    style_key: &dyn Fn(&sheetcore::style::CellStyle) -> String,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
     let (r1, c1, r2, c2) = rect;
     let sh = wb.sheet(si);
     let mut ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut style_xml = String::new();
     let mut style_ids: HashMap<u16, usize> = HashMap::new();
-    let merges: Vec<_> = sh
-        .merges
-        .iter()
-        .copied()
-        .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2)
-        .collect();
+    let merges: Vec<_> = if visible_rows.is_some() {
+        Vec::new()
+    } else {
+        sh.merges
+            .iter()
+            .copied()
+            .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2)
+            .collect()
+    };
     let mut merge_index = sheetcore::merges::MergeIndex::default();
     merge_index.refresh(&merges);
 
@@ -864,10 +908,40 @@ pub fn build_xmlss(
         })
     };
 
+    let has_col_style = (c1..=c2).any(|c| sh.col_styles.get(&c).copied().unwrap_or(0) != 0);
+    let area = u64::from(r2.saturating_sub(r1) + 1) * u64::from(c2.saturating_sub(c1) + 1);
+    let sparse_active_rows: Option<BTreeSet<u32>> = if !has_col_style && area > 8_192 {
+        let mut set = BTreeSet::new();
+        for (key, _) in sh.iter_rect(rect) {
+            set.insert(key.row);
+        }
+        for (key, &sid) in sh.styles.iter() {
+            if sid != 0 && key.row >= r1 && key.row <= r2 && key.col >= c1 && key.col <= c2 {
+                set.insert(key.row);
+            }
+        }
+        for (&r, &sid) in &sh.row_styles {
+            if sid != 0 && r >= r1 && r <= r2 {
+                set.insert(r);
+            }
+        }
+        for &(a, _, _, _) in &merges {
+            set.insert(a);
+        }
+        Some(set)
+    } else {
+        None
+    };
+
     let mut body = String::with_capacity(1024);
-    let mut expected_row = r1;
-    for r in r1..=r2 {
-        // Quick skip for completely blank unstyled unmerged rows in sparse large selections.
+    let mut expected_out_row: usize = 0;
+
+    let mut emit_one_row = |out_row: usize, r: u32| {
+        if let Some(ref active) = sparse_active_rows {
+            if !active.contains(&r) {
+                return;
+            }
+        }
         let mut row_started = false;
         let mut expected_col = c1;
         for c in c1..=c2 {
@@ -883,10 +957,10 @@ pub fn build_xmlss(
                 continue;
             }
             if !row_started {
-                if r == expected_row {
+                if out_row == expected_out_row {
                     body.push_str("<Row>");
                 } else {
-                    let _ = write!(body, "<Row ss:Index=\"{}\">", r - r1 + 1);
+                    let _ = write!(body, "<Row ss:Index=\"{}\">", out_row + 1);
                 }
                 row_started = true;
             }
@@ -958,9 +1032,27 @@ pub fn build_xmlss(
         }
         if row_started {
             body.push_str("</Row>");
-            expected_row = r + 1;
+            expected_out_row = out_row + 1;
         }
-    }
+    };
+
+    let out_row_count = if let Some(rows) = visible_rows {
+        for (out_row, &r) in rows.iter().enumerate() {
+            emit_one_row(out_row, r);
+        }
+        rows.len()
+    } else if let Some(ref active) = sparse_active_rows {
+        for &r in active {
+            emit_one_row((r - r1) as usize, r);
+        }
+        (r2 - r1 + 1) as usize
+    } else {
+        for r in r1..=r2 {
+            emit_one_row((r - r1) as usize, r);
+        }
+        (r2 - r1 + 1) as usize
+    };
+
     format!(
         "<?xml version=\"1.0\"?>
 <?mso-application progid=\"Excel.Sheet\"?>
@@ -974,7 +1066,7 @@ pub fn build_xmlss(
 </Workbook>",
         xml_escape(&sh.name),
         cols = c2 - c1 + 1,
-        rows = r2 - r1 + 1
+        rows = out_row_count
     )
 }
 
