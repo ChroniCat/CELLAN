@@ -3,7 +3,7 @@
 //! 所有会话使用房间口令和随机盐建立带认证的加密通道；完成握手后才交换工作簿数据。
 
 use sha2::{Digest, Sha256};
-use crate::net_sort::{Grid, RoomGrids, SharedBaseline, SharedGrid, SortBatch, shift_grid, upsert};
+use crate::net_sort::{AxisStylesMap, Grid, RoomGrids, SharedBaseline, SharedGrid, SheetAxisStyles, SortBatch, shift_grid, upsert};
 use sheetcore::sync::{AxisStylePatch, BaselineBook, Cursor, Msg, Op, SortResponse};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -238,17 +238,25 @@ fn sort_repair_keys(batch: &SortBatch, mut emit: impl FnMut(u64,RepairKeys) -> b
 pub(crate) struct SortCorrection {
     batch: Arc<SortBatch>,
     baseline: Option<Arc<BaselineBook>>,
+    axis_styles: AxisStylesMap,
     cells: Arc<Grid<Op>>,
     styles: Arc<Grid<sheetcore::style::CellStyle>>,
     edits: Vec<(usize,sheetcore::structural::Structural)>,
 }
 
 impl SortCorrection {
-    fn capture(batch: Arc<SortBatch>, baseline: &SharedBaseline, cells: &SharedGrid<Op>, styles: &SharedStyles,
-               edits: &[(usize,sheetcore::structural::Structural)]) -> Arc<Self> {
+    fn capture(
+        batch: Arc<SortBatch>,
+        baseline: &SharedBaseline,
+        axis_styles: AxisStylesMap,
+        cells: &SharedGrid<Op>,
+        styles: &SharedStyles,
+        edits: &[(usize, sheetcore::structural::Structural)],
+    ) -> Arc<Self> {
         Arc::new(Self {
             batch,
             baseline: baseline.lock().unwrap().clone(),
+            axis_styles,
             cells: cells.lock().unwrap().clone(),
             styles: styles.lock().unwrap().clone(),
             edits: edits.to_vec(),
@@ -258,13 +266,34 @@ impl SortCorrection {
     pub fn chunks(&self, mut send: impl FnMut(usize,u64,Vec<sheetcore::sync::SortRepair>) -> bool) -> bool {
         let sheet = self.batch.plan.sheet;
         sort_repair_keys(&self.batch, |first,keys| {
-            send(sheet,first,sort_repairs(self.baseline.as_deref(),&self.cells,&self.styles,sheet,first,keys,&self.edits))
+            send(
+                sheet,
+                first,
+                sort_repairs(
+                    self.baseline.as_deref(),
+                    &self.axis_styles,
+                    &self.cells,
+                    &self.styles,
+                    sheet,
+                    first,
+                    keys,
+                    &self.edits,
+                ),
+            )
         })
     }
 }
 
-fn sort_repairs(baseline: Option<&BaselineBook>, cells: &Grid<Op>, styles: &Grid<sheetcore::style::CellStyle>, sheet: usize,
-                first_ts:u64, keys: RepairKeys, edits: &[(usize,sheetcore::structural::Structural)]) -> Vec<sheetcore::sync::SortRepair> {
+fn sort_repairs(
+    baseline: Option<&BaselineBook>,
+    axis_styles: &AxisStylesMap,
+    cells: &Grid<Op>,
+    styles: &Grid<sheetcore::style::CellStyle>,
+    sheet: usize,
+    first_ts: u64,
+    keys: RepairKeys,
+    edits: &[(usize, sheetcore::structural::Structural)],
+) -> Vec<sheetcore::sync::SortRepair> {
     keys.into_iter().enumerate().filter_map(|(index,(row,col,expected))| {
         // Structural frames preceding this correction have already relocated the
         // optimistic operation on the reader. Deleted slots need no value repair.
@@ -278,7 +307,13 @@ fn sort_repairs(baseline: Option<&BaselineBook>, cells: &Grid<Op>, styles: &Grid
         let cur_style = styles
             .get(&key)
             .map(|s| (**s).clone())
-            .or_else(|| baseline.and_then(|b| b.cell_style(sheet, row, col)));
+            .or_else(|| baseline.and_then(|b| b.cell_style(sheet, row, col)))
+            .or_else(|| {
+                axis_styles
+                    .get(&sheet)
+                    .and_then(|ax| ax.get(row, col))
+                    .map(|s| (**s).clone())
+            });
         Some(sheetcore::sync::SortRepair {
             rejected_ts: first_ts + index as u64,
             row,
@@ -731,6 +766,7 @@ struct HostWatermark {
     style_seqs: BTreeMap<(usize, u32, u32), u64>,
     axis_rows: HashMap<usize, BTreeMap<u32, (Option<sheetcore::style::CellStyle>, u64)>>,
     axis_cols: HashMap<usize, BTreeMap<u32, (Option<sheetcore::style::CellStyle>, u64)>>,
+    cached_axis: Option<AxisStylesMap>,
     merges: Vec<(u64, usize, u32, u32, u32, u32, bool)>,
 }
 
@@ -742,6 +778,7 @@ impl Default for HostWatermark {
             style_seqs: BTreeMap::new(),
             axis_rows: HashMap::new(),
             axis_cols: HashMap::new(),
+            cached_axis: None,
             merges: Vec::new(),
         }
     }
@@ -750,6 +787,42 @@ impl Default for HostWatermark {
 impl HostWatermark {
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn axis_styles_snapshot(&mut self) -> AxisStylesMap {
+        if let Some(cached) = &self.cached_axis {
+            return cached.clone();
+        }
+        let mut map = HashMap::new();
+        let all_sheets: BTreeSet<usize> = self
+            .axis_rows
+            .keys()
+            .chain(self.axis_cols.keys())
+            .copied()
+            .collect();
+        for si in all_sheets {
+            let mut sa = SheetAxisStyles::default();
+            if let Some(rm) = self.axis_rows.get(&si) {
+                for (&r, (st_opt, _)) in rm {
+                    if let Some(st) = st_opt {
+                        sa.rows.insert(r, Arc::new(st.clone()));
+                    }
+                }
+            }
+            if let Some(cm) = self.axis_cols.get(&si) {
+                for (&c, (st_opt, _)) in cm {
+                    if let Some(st) = st_opt {
+                        sa.cols.insert(c, Arc::new(st.clone()));
+                    }
+                }
+            }
+            if !sa.rows.is_empty() || !sa.cols.is_empty() {
+                map.insert(si, sa);
+            }
+        }
+        let shared = Arc::new(map);
+        self.cached_axis = Some(shared.clone());
+        shared
     }
 
     fn bump(&mut self) -> u64 {
@@ -790,6 +863,7 @@ impl HostWatermark {
 
     fn record_axis(&mut self, sheet: usize, patch: &AxisStylePatch) -> u64 {
         let seq = self.bump();
+        self.cached_axis = None;
         if !patch.rows.is_empty() {
             let rm = self.axis_rows.entry(sheet).or_default();
             for (r, st) in &patch.rows {
@@ -813,6 +887,7 @@ impl HostWatermark {
     }
 
     fn shift_structural(&mut self, sheet: usize, op: &sheetcore::structural::Structural) -> u64 {
+        self.cached_axis = None;
         sheetcore::sync::shift_cell_map(&mut self.op_seqs, sheet, op, |_, _, _| {});
         sheetcore::sync::shift_cell_map(&mut self.style_seqs, sheet, op, |_, _, _| {});
         use sheetcore::structural::Structural as S;
@@ -866,6 +941,8 @@ pub struct Net {
     palette_styles_cap: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
     pending_structure: Arc<AtomicBool>,
+    #[cfg(test)]
+    unconfirmed_styles: Arc<AtomicU64>,
     pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>>,
     local_sort_ranges: Mutex<Vec<(u64,u64)>>,
     cmd: Sender<Cmd>,
@@ -1193,7 +1270,9 @@ fn stream_snapshot_styles(
         Vec::with_capacity(SNAPSHOT_STYLE_CHUNK);
     if let Some(base) = baseline {
         for (si, sh) in base.sheets.iter().enumerate() {
-            for (pos, &id) in sh.styles.iter().filter(|(_, id)| **id != 0) {
+            // Preserve explicit `sid == 0` entries as well: `sh.styles` only stores `0` when
+            // masking a row/column default style (e.g. an unbolded cell inside a bold column).
+            for (pos, &id) in sh.styles.iter() {
                 let key = (si, pos.row, pos.col);
                 if overlay.get(&key).is_some() {
                     continue;
@@ -1438,6 +1517,7 @@ fn latest_cell_op(
 
 fn latest_cell_style(
     baseline: Option<&SharedBaseline>,
+    axis_styles: Option<&AxisStylesMap>,
     styles: &SharedStyles,
     sheet: usize,
     row: u32,
@@ -1446,9 +1526,16 @@ fn latest_cell_style(
     if let Some(st) = styles.lock().unwrap().get(&(sheet, row, col)) {
         return Some(st.as_ref().clone());
     }
-    baseline
+    if let Some(st) = baseline
         .and_then(|b| b.lock().unwrap().clone())
         .and_then(|b| b.cell_style(sheet, row, col))
+    {
+        return Some(st);
+    }
+    axis_styles
+        .and_then(|m| m.get(&sheet))
+        .and_then(|ax| ax.get(row, col))
+        .map(|s| (**s).clone())
 }
 
 fn emit_room_watermark(
@@ -1790,7 +1877,8 @@ impl Net {
                                     site: u32,
                                     t0: std::time::Instant| {
                 for attempt in 0..3 {
-                    let current = RoomGrids::capture(baseline, state, delta, styles, delta_styles);
+                    let axis_snap = wm.lock().unwrap().axis_styles_snapshot();
+                    let current = RoomGrids::capture(baseline, axis_snap, state, delta, styles, delta_styles);
                     let next = current.apply(&batch);
                     let _order = order.lock().unwrap();
                     let leases = host_locks.lock().unwrap();
@@ -1815,9 +1903,11 @@ impl Net {
                         return;
                     }
                     if !allowed || attempt == 2 {
+                        let axis_now = wm.lock().unwrap().axis_styles_snapshot();
                         let correction = SortCorrection::capture(
                             batch,
                             baseline,
+                            axis_now,
                             state,
                             styles,
                             later.unwrap_or_default(),
@@ -2023,13 +2113,24 @@ impl Net {
         }
         let keys: Vec<(u32, u32)> = items.iter().map(|(r, c, _)| (*r, *c)).collect();
         if let Some((holder, holder_name, row, col)) = self.host_lock_conflict_cells(sheet, &keys) {
+            let axis_snap = self
+                .host_watermark
+                .as_ref()
+                .map(|wm| wm.lock().unwrap().axis_styles_snapshot());
             let revert_styles = if let Some(st) = &self.host_styles {
                 keys.iter()
                     .map(|(r, c)| {
                         (
                             *r,
                             *c,
-                            latest_cell_style(self.host_baseline.as_ref(), st, sheet, *r, *c),
+                            latest_cell_style(
+                                self.host_baseline.as_ref(),
+                                axis_snap.as_ref(),
+                                st,
+                                sheet,
+                                *r,
+                                *c,
+                            ),
                         )
                     })
                     .collect()
@@ -3298,7 +3399,8 @@ fn host_initialized(
                                 if batch.offer().digest != batch.plan.digest { break; }
                                 let batch = Arc::new(batch);
                                 for attempt in 0..3 {
-                                    let current = RoomGrids::capture(&host_baseline,&state,&delta_ops,&styles,&delta_styles);
+                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                    let current = RoomGrids::capture(&host_baseline,axis_snap,&state,&delta_ops,&styles,&delta_styles);
                                     let next = current.apply(&batch);
                                     let _order = room_order.lock().unwrap();
                                     let history = structs.lock().unwrap();
@@ -3312,7 +3414,8 @@ fn host_initialized(
                                         break;
                                     }
                                     if !allowed || attempt == 2 {
-                                        let correction = SortCorrection::capture(batch.clone(),&host_baseline,&state,&styles,later.unwrap_or_default());
+                                        let axis_now = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                        let correction = SortCorrection::capture(batch.clone(),&host_baseline,axis_now,&state,&styles,later.unwrap_or_default());
                                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Correction(correction)));
                                         break;
                                     }
@@ -3327,14 +3430,16 @@ fn host_initialized(
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
                                 }
                                 let base_arc = host_baseline.lock().unwrap().clone();
-                                let items = sort_repairs(base_arc.as_deref(),&state.lock().unwrap(),&styles.lock().unwrap(),sheet,first_ts,keys,edits);
+                                let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                let items = sort_repairs(base_arc.as_deref(),&axis_snap,&state.lock().unwrap(),&styles.lock().unwrap(),sheet,first_ts,keys,edits);
                                 let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairs {sheet,first_ts,items})));
                             }
                             Msg::SortPermutation(plan) if can_sort.load(Ordering::Acquire) => {
                                 let Some(site) = hello_site else { break };
                                 if plan.site != site { break; }
                                 let (r1,c1,r2,c2) = plan.region;
-                                let current = RoomGrids::capture(&host_baseline,&state,&delta_ops,&styles,&delta_styles);
+                                let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                let current = RoomGrids::capture(&host_baseline,axis_snap,&state,&delta_ops,&styles,&delta_styles);
                                 let same_frame = structs.lock().unwrap().get(plan.structural_revision..)
                                     .is_some_and(|later| later.iter().all(|(s,_)| *s != plan.sheet));
                                 let permitted = same_frame && locks.lock().unwrap()
@@ -3554,6 +3659,7 @@ fn host_initialized(
                                     }
                                 };
                                 if let Some((holder, holder_name, row, col)) = conflict {
+                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
                                     let revert_styles: Vec<_> = items
                                         .iter()
                                         .map(|(r, c, _)| {
@@ -3562,6 +3668,7 @@ fn host_initialized(
                                                 *c,
                                                 latest_cell_style(
                                                     Some(&host_baseline),
+                                                    Some(&axis_snap),
                                                     &styles,
                                                     sheet,
                                                     *r,
@@ -3649,10 +3756,11 @@ fn host_initialized(
                                 }
                                 let seq = host_watermark.lock().unwrap().record_axis(sheet, &patch);
                                 let struct_rev = structs.lock().unwrap().len();
+                                let exclude = (!can_sort.load(Ordering::Acquire)).then_some(conn_site);
                                 queue_room_change(
                                     &cmd,
                                     &roster,
-                                    Some(conn_site),
+                                    exclude,
                                     RoomChange::Message(Msg::AxisStyleOp {
                                         site: conn_site,
                                         sheet,
@@ -4040,6 +4148,8 @@ fn host_initialized(
         delta_styles: Some(delta_styles_for_self),
         delta_merges: Some(delta_merges_for_self),
         pending_structure: Default::default(),
+        #[cfg(test)]
+        unconfirmed_styles: Default::default(),
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         connection_generation: Default::default(),
@@ -4902,6 +5012,8 @@ fn join_session(
         sheet_names: Default::default(),
         structure_seen: Default::default(),
         pending_structure,
+        #[cfg(test)]
+        unconfirmed_styles,
         structural_ack,
         palette_styles_cap,
         connection_generation,
@@ -6196,6 +6308,31 @@ mod integrity_tests {
         );
         assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
 
+        // Guest sends an AxisStyleOp before transient disconnect; Host echoes it back so
+        // `unconfirmed_styles` returns to 0 and watermark incremental resume stays enabled.
+        let mut bold_col = sheetcore::style::CellStyle::default();
+        bold_col.bold = true;
+        guest.broadcast_axis_styles(
+            0,
+            AxisStylePatch {
+                rows: Vec::new(),
+                cols: vec![(2, Some(bold_col))],
+            },
+        );
+        assert!(
+            wait_event(&host, 5000, |e| matches!(e, NetEvent::AxisStyles { sheet: 0, .. }))
+                .is_some(),
+            "host must receive guest AxisStyleOp"
+        );
+        let echo_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while guest.unconfirmed_styles.load(Ordering::Acquire) != 0 {
+            assert!(
+                std::time::Instant::now() < echo_deadline,
+                "guest unconfirmed_styles did not drain after Host AxisStyleOp echo"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
         // Drop Guest's TCP socket transiently while Host writes a new cell.
         guest.disconnect_socket_for_test();
         assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::Disconnected(_))).is_some());
@@ -6219,5 +6356,185 @@ mod integrity_tests {
             matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 5 && o.col == 3 && o.value == sheetcore::sync::ValueWire::Number(9876.0)))
         });
         assert!(delta_op.is_some(), "missed incremental op during transient disconnect");
+    }
+
+    #[test]
+    fn baseline_explicit_zero_mask_and_session_axis_styles_converge_across_join_and_sort() {
+        use sheetcore::{Cell, Value};
+        use std::time::Instant;
+
+        let env = crate::test_env::TestEnv::new("net_axis_zero_mask_sort");
+        let ctx = eframe::egui::Context::default();
+        let mut host = crate::SheetApp::new_with_context(&ctx, None);
+        let mut guest = crate::SheetApp::new_with_context(&ctx, None);
+        host.wb.path = Some(env.path("host_axis_sort.xlsx"));
+        guest.wb.path = Some(env.path("guest_axis_sort.xlsx"));
+
+        // Baseline setup on Host:
+        // - Column 0 has whole-column bold style (`bold_id != 0`).
+        // - Cell (0, 0) = 20.0 has an explicit `sid == 0` mask (unbolded override inside bold col).
+        // - Cells (1, 0) = 10.0 and (2, 0) = 30.0 inherit bold from column 0.
+        // - Column 1 has values [200.0, 100.0, 300.0] with default style initially.
+        let mut bold_fmt = host.wb.styles.get(0).clone();
+        bold_fmt.bold = true;
+        let bold_id = host.wb.styles.intern(bold_fmt);
+        host.wb.sheet_mut(0).set_col_style(0, bold_id);
+
+        for (r, v0, v1) in [(0u32, 20.0, 200.0), (1, 10.0, 100.0), (2, 30.0, 300.0)] {
+            host.wb.sheet_mut(0).set(
+                r,
+                0,
+                Cell {
+                    value: Value::Number(v0),
+                    formula: None,
+                },
+            );
+            host.wb.sheet_mut(0).set(
+                r,
+                1,
+                Cell {
+                    value: Value::Number(v1),
+                    formula: None,
+                },
+            );
+        }
+        host.wb.sheet_mut(0).set_style(0, 0, 0);
+        assert_eq!(host.wb.sheet(0).explicit_style_of(0, 0), Some(0));
+        assert!(!host.wb.styles.get(host.wb.sheet(0).style_of(0, 0)).bold);
+        assert!(host.wb.styles.get(host.wb.sheet(0).style_of(1, 0)).bold);
+
+        let (net_host, port) = host_for_test(1, "Host", "axis-sort-doc", "pw");
+        let mut peer_host = sheetcore::sync::Peer::new(1);
+        peer_host.seed_workbook(&host.wb);
+        net_host.seed_snapshot(
+            &peer_host,
+            &host.wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        );
+        host.peer = Some(peer_host);
+        host.net = Some(net_host);
+        host.undo.set_site(1);
+
+        guest.net = Some(
+            join(
+                2,
+                "Guest".into(),
+                "axis-sort-doc".into(),
+                &format!("127.0.0.1:{port}"),
+                "pw".into(),
+            )
+            .unwrap(),
+        );
+        guest.peer = Some(sheetcore::sync::Peer::new(2));
+        guest.undo.set_site(2);
+
+        fn poll_until(
+            h: &mut crate::SheetApp,
+            g: &mut crate::SheetApp,
+            label: &str,
+            mut pred: impl FnMut(&crate::SheetApp, &crate::SheetApp) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !pred(h, g) {
+                h.poll_net();
+                g.poll_net();
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {label}: H={} G={}",
+                    h.status,
+                    g.status
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        poll_until(&mut host, &mut guest, "initial snapshot", |_, g| {
+            !g.in_snapshot
+                && g.net.as_ref().unwrap().connected.load(Ordering::Relaxed)
+                && g.wb.sheet(0).value(2, 0) == Value::Number(30.0)
+        });
+
+        // 1. Full snapshot must preserve BOTH col 0 bold AND cell (0, 0)'s explicit `sid == 0` mask.
+        assert!(guest.wb.styles.get(guest.wb.sheet(0).style_of(1, 0)).bold);
+        assert!(guest.wb.styles.get(guest.wb.sheet(0).style_of(500_000, 0)).bold);
+        assert!(
+            !guest.wb.styles.get(guest.wb.sheet(0).style_of(0, 0)).bold,
+            "explicit sid==0 mask at (0,0) must survive full snapshot over bold col 0"
+        );
+
+        // 2. Mid-session: Guest sets whole-column italic on column 1 via AxisStyleOp.
+        guest.sheet_idx = 0;
+        guest.sel = (0, 1);
+        guest.sel_end = (1_048_575, 1);
+        guest.extra_sel.clear();
+        assert!(guest.apply_style_xy(|st, _, _| st.italic = true));
+        poll_until(&mut host, &mut guest, "live AxisStyleOp on col 1", |h, g| {
+            h.wb.styles.get(h.wb.sheet(0).style_of(500_000, 1)).italic
+                && g.net.as_ref().unwrap().unconfirmed_styles.load(Ordering::Acquire) == 0
+        });
+
+        // 3. Guest sorts (0, 0, 2, 1) ascending by col 0: [10.0, 20.0, 30.0].
+        //    RoomGrids::expand on Host must match Guest's digest (preserving both the moved `sid == 0`
+        //    mask on 20.0 -> row 1 and live `axis_cols[1]` italic style).
+        guest.sort_region((0, 0, 2, 1), 0, true);
+        poll_until(&mut host, &mut guest, "ascending sort convergence", |h, g| {
+            h.wb.sheet(0).value(0, 0) == Value::Number(10.0)
+                && g.net.as_ref().unwrap().pending_sort_ranges().is_empty()
+        });
+        for app in [&host, &guest] {
+            assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(10.0));
+            assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(20.0));
+            assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(30.0));
+            assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).bold);
+            assert!(
+                !app.wb.styles.get(app.wb.sheet(0).style_of(1, 0)).bold,
+                "unbolded sid==0 mask must move with 20.0 to (1, 0)"
+            );
+            assert!(app.wb.styles.get(app.wb.sheet(0).style_of(2, 0)).bold);
+            for r in 0..=2 {
+                assert!(
+                    app.wb.styles.get(app.wb.sheet(0).style_of(r, 1)).italic,
+                    "live col 1 italic style must remain intact at ({r}, 1)"
+                );
+            }
+        }
+
+        // 4. Add an explicit underline+italic style on (0, 1), then trigger a rejected sort on Guest
+        //    while Host locks (0, 0): SortCorrection/sort_repairs must restore (2, 1) to col 1's live
+        //    italic style rather than clobbering it with default un-italicized style.
+        let mut ul_italic = guest.wb.styles.get(guest.wb.sheet(0).style_of(0, 1)).clone();
+        ul_italic.underline = true;
+        let ul_id = guest.wb.styles.intern(ul_italic);
+        guest.wb.sheet_mut(0).set_style(0, 1, ul_id);
+        guest.broadcast_cell_styles(&[(0, 0, 1)]);
+        poll_until(&mut host, &mut guest, "explicit underline on (0, 1)", |h, g| {
+            h.wb.styles.get(h.wb.sheet(0).style_of(0, 1)).underline
+                && g.net.as_ref().unwrap().unconfirmed_styles.load(Ordering::Acquire) == 0
+        });
+
+        host.editing = Some(crate::EditState::new("10".into()));
+        host.edit_sheet = Some(0);
+        host.edit_sel = Some((0, 0));
+        host.net.as_ref().unwrap().request_lock(0, 0, 0, "Host");
+        // Guest has not polled Host's lock yet -> attempts descending sort optimistically.
+        guest.sort_region((0, 0, 2, 1), 0, false);
+        poll_until(&mut host, &mut guest, "rejected sort repair", |_, g| {
+            g.wb.sheet(0).value(0, 0) == Value::Number(10.0)
+                && g.net.as_ref().unwrap().pending_sort_ranges().is_empty()
+        });
+        assert!(guest.wb.styles.get(guest.wb.sheet(0).style_of(0, 1)).underline);
+        assert!(guest.wb.styles.get(guest.wb.sheet(0).style_of(0, 1)).italic);
+        assert!(!guest.wb.styles.get(guest.wb.sheet(0).style_of(2, 1)).underline);
+        assert!(
+            guest.wb.styles.get(guest.wb.sheet(0).style_of(2, 1)).italic,
+            "sort_repairs must preserve live axis italic on (2, 1)"
+        );
     }
 }

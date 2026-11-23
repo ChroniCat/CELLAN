@@ -237,9 +237,25 @@ pub(crate) type Grid<V> = immutable_chunkmap::map::MapM<Key, Arc<V>>;
 pub(crate) type SharedGrid<V> = Arc<std::sync::Mutex<Arc<Grid<V>>>>;
 pub(crate) type SharedBaseline = Arc<std::sync::Mutex<Option<Arc<sheetcore::sync::BaselineBook>>>>;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SheetAxisStyles {
+    pub rows: std::collections::BTreeMap<u32, Arc<CellStyle>>,
+    pub cols: std::collections::BTreeMap<u32, Arc<CellStyle>>,
+}
+
+impl SheetAxisStyles {
+    #[inline]
+    pub fn get(&self, row: u32, col: u32) -> Option<&Arc<CellStyle>> {
+        self.rows.get(&row).or_else(|| self.cols.get(&col))
+    }
+}
+
+pub(crate) type AxisStylesMap = Arc<std::collections::HashMap<usize, SheetAxisStyles>>;
+
 #[derive(Clone)]
 pub(crate) struct RoomGrids {
     pub baseline: Option<Arc<sheetcore::sync::BaselineBook>>,
+    pub axis_styles: AxisStylesMap,
     pub cells: Arc<Grid<Op>>,
     pub delta: Arc<Grid<Op>>,
     pub styles: Arc<Grid<CellStyle>>,
@@ -249,6 +265,7 @@ pub(crate) struct RoomGrids {
 impl RoomGrids {
     pub fn capture(
         baseline: &SharedBaseline,
+        axis_styles: AxisStylesMap,
         cells: &SharedGrid<Op>,
         delta: &SharedGrid<Op>,
         styles: &SharedGrid<CellStyle>,
@@ -256,6 +273,7 @@ impl RoomGrids {
     ) -> Self {
         Self {
             baseline: baseline.lock().unwrap().clone(),
+            axis_styles,
             cells: cells.lock().unwrap().clone(),
             delta: delta.lock().unwrap().clone(),
             styles: styles.lock().unwrap().clone(),
@@ -268,7 +286,10 @@ impl RoomGrids {
             return None;
         }
         let (r1, c1, r2, c2) = plan.region;
-        let default = Arc::new(CellStyle::default_dark());
+        let default = self.baseline.as_ref().map_or_else(
+            || Arc::new(CellStyle::default_dark()),
+            |b| Arc::new(b.styles.get(0).clone()),
+        );
         let (offset_start, offset_end) = if plan.horizontal { (r1, r2) } else { (c1, c2) };
         let offset_len = (offset_end - offset_start + 1) as usize;
         let mut occupied_offset = vec![false; offset_len];
@@ -302,24 +323,24 @@ impl RoomGrids {
                 };
                 style_map.insert((r, c), shared);
             });
-            if let Some(sh) = base.sheets.get(plan.sheet) {
-                for (&r, &sid) in &sh.row_styles {
-                    if (r1..=r2).contains(&r) && sid != 0 {
-                        let st = Arc::new(base.styles.get(sid).clone());
-                        for c in c1..=c2 {
-                            mark(r, c);
-                            style_map.entry((r, c)).or_insert_with(|| st.clone());
-                        }
+        }
+
+        let sheet_axis = self.axis_styles.get(&plan.sheet);
+        let mut fill_all_offsets = false;
+        if let Some(ax) = sheet_axis {
+            if plan.horizontal {
+                if ax.cols.range(c1..=c2).next().is_some() {
+                    fill_all_offsets = true;
+                } else {
+                    for (&r, _) in ax.rows.range(r1..=r2) {
+                        mark(r, c1);
                     }
                 }
-                for (&c, &sid) in &sh.col_styles {
-                    if (c1..=c2).contains(&c) && sid != 0 {
-                        let st = Arc::new(base.styles.get(sid).clone());
-                        for r in r1..=r2 {
-                            mark(r, c);
-                            style_map.entry((r, c)).or_insert_with(|| st.clone());
-                        }
-                    }
+            } else if ax.rows.range(r1..=r2).next().is_some() {
+                fill_all_offsets = true;
+            } else {
+                for (&c, _) in ax.cols.range(c1..=c2) {
+                    mark(r1, c);
                 }
             }
         }
@@ -346,6 +367,9 @@ impl RoomGrids {
                 style_map.insert((r, c), st.clone());
             }
         }
+        if fill_all_offsets {
+            occupied_offset.fill(true);
+        }
 
         let active_offsets: Vec<u32> = occupied_offset
             .into_iter()
@@ -361,10 +385,13 @@ impl RoomGrids {
                     .get(&(r, c))
                     .cloned()
                     .unwrap_or((ValueWire::Empty, None));
-                let st = style_map
-                    .get(&(r, c))
-                    .cloned()
-                    .unwrap_or_else(|| default.clone());
+                let st = if let Some(explicit) = style_map.get(&(r, c)) {
+                    explicit.clone()
+                } else if let Some(axis_st) = sheet_axis.and_then(|ax| ax.get(r, c)) {
+                    axis_st.clone()
+                } else {
+                    default.clone()
+                };
                 (val, formula, st)
             },
             || true,

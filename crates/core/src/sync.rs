@@ -996,7 +996,7 @@ impl BaselineBook {
     pub fn cell_style(&self, sheet: usize, row: u32, col: u32) -> Option<crate::style::CellStyle> {
         let sh = self.sheets.get(sheet)?;
         let sid = *sh.styles.get(&crate::model::CellRef::new(row, col))?;
-        (sid != 0).then(|| self.styles.get(sid).clone())
+        Some(self.styles.get(sid).clone())
     }
 
     pub fn for_each_cell_in_rect(
@@ -1019,7 +1019,7 @@ impl BaselineBook {
     ) {
         let Some(sh) = self.sheets.get(sheet) else { return };
         for (k, &sid) in sh.styles.iter_from(true, r1) {
-            if k.row <= r2 && (c1..=c2).contains(&k.col) && sid != 0 {
+            if k.row <= r2 && (c1..=c2).contains(&k.col) {
                 f(k.row, k.col, self.styles.get(sid));
             }
         }
