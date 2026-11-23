@@ -188,7 +188,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "1.71.0"
+version = "1.72.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "sheetcore"
-version = "1.71.0"
+version = "1.72.0"
 dependencies = [
  "aes",
  "anyhow",
